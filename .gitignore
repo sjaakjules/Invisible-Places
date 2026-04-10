@@ -1,0 +1,51 @@
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# macOS / Finder
+.Spotlight-V100
+.Trashes
+
+# Build outputs
+/build/
+/out/
+/dist/
+/bin/
+/lib/
+/external/vcpkg/
+/vcpkg_installed/
+
+# CMake / CTest
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+
+# Generated binaries and debug artifacts
+*.app
+*.dSYM/
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.dylib
+*.exe
+*.pdb
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Local project runtime state
+imgui.ini
+
+# Local-only CMake presets
+CMakeUserPresets.json
