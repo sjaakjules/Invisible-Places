@@ -15,6 +15,7 @@
 /lib/
 /external/vcpkg/
 /vcpkg_installed/
+/Data/
 
 # CMake / CTest
 CMakeCache.txt
