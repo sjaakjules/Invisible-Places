@@ -1,0 +1,84 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "configure-debug",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--preset",
+        "macos-debug-home-vcpkg"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "build-debug",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "--preset",
+        "build-macos-debug-home-vcpkg"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "configure-debug"
+      ],
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "run-app",
+      "type": "shell",
+      "command": "./build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places",
+      "args": [
+        "${workspaceFolder}/Data"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "OS_ACTIVITY_MODE": "disable"
+        }
+      },
+      "dependsOn": [
+        "build-debug"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "run-tests",
+      "type": "shell",
+      "command": "ctest",
+      "args": [
+        "--test-dir",
+        "build/macos-debug",
+        "--output-on-failure"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "OS_ACTIVITY_MODE": "disable"
+        }
+      },
+      "dependsOn": [
+        "build-debug"
+      ],
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": "test"
+    }
+  ]
+}

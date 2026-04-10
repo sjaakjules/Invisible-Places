@@ -1,0 +1,54 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Invisible Places App",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places",
+      "args": [
+        "${workspaceFolder}/Data"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "OS_ACTIVITY_MODE": "disable"
+      },
+      "preLaunchTask": "build-debug",
+      "sourceLanguages": [
+        "cpp"
+      ]
+    },
+    {
+      "name": "Debug Invisible Places Tests",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/macos-debug/invisible_places_tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "OS_ACTIVITY_MODE": "disable"
+      },
+      "preLaunchTask": "build-debug",
+      "sourceLanguages": [
+        "cpp"
+      ]
+    },
+    {
+      "name": "Debug Asset Discovery Test Only",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/macos-debug/invisible_places_tests",
+      "args": [
+        "Data discovery finds both point clouds and gaussian splats"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "OS_ACTIVITY_MODE": "disable"
+      },
+      "preLaunchTask": "build-debug",
+      "sourceLanguages": [
+        "cpp"
+      ]
+    }
+  ]
+}

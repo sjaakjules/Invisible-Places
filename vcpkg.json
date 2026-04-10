@@ -1,0 +1,24 @@
+{
+  "name": "invisible-places",
+  "version-string": "0.1.0",
+  "description": "Field-driven point cloud and Gaussian splat renderer for macOS and Windows.",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "dependencies": [
+    "catch2",
+    "fmt",
+    "glfw3",
+    "glm",
+    {
+      "name": "imgui",
+      "default-features": false,
+      "features": [
+        "docking-experimental",
+        "glfw-binding",
+        "vulkan-binding"
+      ]
+    },
+    "nlohmann-json",
+    "spdlog"
+  ]
+}
+

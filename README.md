@@ -1,0 +1,113 @@
+# Invisible Places
+
+Invisible Places is a desktop renderer and shot-authoring tool for combining very large point clouds and Gaussian splats in the same scene. The early priority is responsive look-development on Apple Silicon M1 using Vulkan through MoltenVK, while keeping the same rendering model portable to stronger Windows GPUs for final output.
+
+## Bootstrap status
+
+This repository is currently in bootstrap mode:
+
+- the architecture matches the planning docs,
+- the build is wired for `CMake + vcpkg manifest mode`,
+- the codebase can already discover local point-cloud and gSplat assets from the `Data/` folder,
+- the app now opens a GLFW window and presents a minimal Vulkan clear-color viewport shell on macOS,
+- real Gaussian splat rendering and point-cloud drawing are the next renderer steps.
+
+## Current repository shape
+
+```text
+/src
+  /app
+  /camera
+  /io
+  /motion
+  /output
+  /renderer
+    /core
+    /gsplat
+    /pointcloud
+  /scene
+  /serialization
+  /style
+  /ui
+/tests
+/docs
+/Data
+```
+
+## Build strategy
+
+- Default package strategy: `vcpkg` manifest mode
+- CMake package style: `find_package()`
+- Allowed exception path: `FetchContent` only for a GS dependency that is missing from vcpkg or requires a pinned fork
+- Shared render path goal: Vulkan on both macOS and Windows, with MoltenVK only acting as the macOS portability layer
+
+## Recommended dependencies
+
+The `vcpkg.json` manifest is set up for these first-step dependencies:
+
+- `glfw3`
+- `imgui`
+- `glm`
+- `fmt`
+- `spdlog`
+- `nlohmann-json`
+- `catch2`
+
+## Local build flow
+
+1. Install and configure a working Vulkan SDK on macOS. A complete LunarG SDK is the cleanest path because the current machine state is still missing `glslc`, and the older Homebrew MoltenVK path was not enough on its own to validate runtime setup.
+2. Install `vcpkg`, clone the repo root, and either:
+   - export `VCPKG_ROOT="$HOME/vcpkg"`, or
+   - use the preset that points at `~/vcpkg` directly.
+3. Configure:
+
+```bash
+cmake --preset macos-debug-home-vcpkg
+```
+
+4. Build:
+
+```bash
+cmake --build --preset build-macos-debug-home-vcpkg
+```
+
+5. Run the bootstrap app:
+
+```bash
+./build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places ./Data
+```
+
+## Debugging
+
+Debugger setup is included for macOS LLDB and VS Code in:
+
+- [.vscode/launch.json](/Users/juju/Documents/Repositories/Invisible%20Places/.vscode/launch.json)
+- [.vscode/tasks.json](/Users/juju/Documents/Repositories/Invisible%20Places/.vscode/tasks.json)
+- [docs/debugging.md](/Users/juju/Documents/Repositories/Invisible%20Places/docs/debugging.md)
+
+The simplest path is `Debug Invisible Places App`, which builds first and runs against the local `Data/` folder automatically.
+
+## Data assumptions currently encoded
+
+- Point-cloud PLY files are standard CloudCompare exports with RGB and optional `scalar_*` properties.
+- Gaussian splat files are PLY files whose filename starts with `gSplat-` and whose header exposes Gaussian attributes such as `f_dc_0`, `opacity`, `scale_0`, and `rot_0`.
+- Each gSplat file is paired with a same-stem `.txt` file containing a 4x4 transform matrix.
+
+## Immediate next milestone
+
+The next implementation slice should be:
+
+1. RGB point-cloud rendering by default,
+2. camera navigation inside the Vulkan viewport,
+3. side-panel style controls for source RGB, solid color, and scalar-field-to-colormap modes,
+4. real Gaussian splat runtime integration against the chosen external GS codebase.
+
+## Validated on this machine
+
+The following setup path was validated in this workspace on April 10, 2026:
+
+- Homebrew `vcpkg` executable installed at `/opt/homebrew/bin/vcpkg`
+- cloned `vcpkg` root at `~/vcpkg`
+- `cmake --preset macos-debug-vcpkg` configured successfully when `VCPKG_ROOT="$HOME/vcpkg"` was set
+- the bootstrap executable built and discovered 6 point-cloud layers plus 10 gSplat layers from `Data/`
+- `ctest --test-dir build/macos-debug --output-on-failure` passed

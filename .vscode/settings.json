@@ -1,0 +1,12 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": false,
+  "cmake.configurePreset": "macos-debug-home-vcpkg",
+  "cmake.buildPreset": "build-macos-debug-home-vcpkg",
+  "cmake.ctest.allowParallelJobs": true,
+  "files.associations": {
+    "*.tpp": "cpp",
+    "*.ipp": "cpp"
+  }
+}
+
