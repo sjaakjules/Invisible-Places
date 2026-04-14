@@ -1,6 +1,7 @@
 #pragma once
 
 #include "io/PointCloudData.hpp"
+#include "style/RenderParameterBinding.hpp"
 
 #include <array>
 #include <cstdint>
@@ -25,24 +26,18 @@ enum class PointCloudColormapId {
     Turbo
 };
 
-struct ScalarRangeState {
-    bool useAutoRange = true;
-    float minimum = 0.0F;
-    float maximum = 1.0F;
-    bool clamp = true;
-};
-
 struct PointCloudStyleState {
+    PointCloudStyleState();
+
     PointCloudColorMode colorMode = PointCloudColorMode::SourceRgb;
     PointCloudColormapId colormap = PointCloudColormapId::Viridis;
-    std::uint32_t selectedScalarField = 0;
-    ScalarRangeState scalarRange{};
     std::array<float, 4> solidColor{0.93F, 0.88F, 0.72F, 1.0F};
-    float pointSize = 2.0F;
-    float opacity = 1.0F;
-    float emissiveStrength = 0.0F;
-    float xrayStrength = 0.0F;
-    float depthFade = 0.0F;
+    invisible_places::style::RenderParameterBinding pointSize;
+    invisible_places::style::RenderParameterBinding opacity;
+    invisible_places::style::RenderParameterBinding emissiveStrength;
+    invisible_places::style::RenderParameterBinding xrayStrength;
+    invisible_places::style::RenderParameterBinding depthFade;
+    invisible_places::style::RenderParameterBinding colormapPosition;
 };
 
 struct PointBudgetState {

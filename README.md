@@ -9,8 +9,9 @@ This repository is currently in bootstrap mode:
 - the architecture matches the planning docs,
 - the build is wired for `CMake + vcpkg manifest mode`,
 - the codebase can already discover local point-cloud and gSplat assets from the `Data/` folder,
-- the app now opens a GLFW window and presents a minimal Vulkan clear-color viewport shell on macOS,
-- real Gaussian splat rendering and point-cloud drawing are the next renderer steps.
+- the app now renders point clouds and Gaussian splats together in a Vulkan viewport on macOS,
+- point-cloud lookdev supports constant and field-mapped bindings for major scalar parameters,
+- project state and point-cloud style presets can be saved to JSON and loaded back into the session.
 
 ## Current repository shape
 
@@ -97,10 +98,10 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 
 The next implementation slice should be:
 
-1. RGB point-cloud rendering by default,
-2. camera navigation inside the Vulkan viewport,
-3. side-panel style controls for source RGB, solid color, and scalar-field-to-colormap modes,
-4. real Gaussian splat runtime integration against the chosen external GS codebase.
+1. shot save/load and interpolated camera playback,
+2. surface-inferred pivot picking for more CloudCompare-like navigation,
+3. offline render presets and first AOV export passes,
+4. field-driven procedural motion for point-cloud layers.
 
 ## Validated on this machine
 

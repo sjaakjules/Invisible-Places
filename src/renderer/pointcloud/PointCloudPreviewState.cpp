@@ -32,6 +32,15 @@ std::uint64_t MakeRelativelyPrimeStep(std::uint64_t totalPoints) {
 
 }  // namespace
 
+PointCloudStyleState::PointCloudStyleState() {
+    invisible_places::style::SetScalarConstant(&pointSize, 2.0F);
+    invisible_places::style::SetScalarConstant(&opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&emissiveStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&depthFade, 0.0F);
+    invisible_places::style::SetScalarConstant(&colormapPosition, 0.5F);
+}
+
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints) {
     if (totalPoints == 0) {
         return 0;

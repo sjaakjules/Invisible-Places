@@ -36,6 +36,12 @@ find_program(GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator REQUIRED)
 set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_preview.vert
     shaders/pointcloud_preview.frag
+    shaders/gsplat_accumulation.vert
+    shaders/gsplat_accumulation.frag
+    shaders/gsplat_high_quality.vert
+    shaders/gsplat_high_quality.frag
+    shaders/gsplat_composite.vert
+    shaders/gsplat_composite.frag
 )
 
 set(INVISIBLE_PLACES_SHADER_OUTPUTS)
@@ -72,6 +78,7 @@ add_library(
     src/app/Application.cpp
     src/camera/OrbitCamera.cpp
     src/io/AssetDiscovery.cpp
+    src/io/GaussianSplatData.cpp
     src/io/PointCloudData.cpp
     src/io/PlyHeader.cpp
     src/io/TransformMatrix.cpp
@@ -80,8 +87,11 @@ add_library(
     src/platform/Window.cpp
     src/platform/WindowTitle.cpp
     src/renderer/core/VulkanViewportShell.cpp
+    src/renderer/gsplat/HighQualityGaussianScene.cpp
     src/renderer/pointcloud/PointCloudPreviewState.cpp
     src/scene/SceneCatalog.cpp
+    src/serialization/ProjectDocument.cpp
+    src/style/RenderParameterBinding.cpp
 )
 
 add_dependencies(invisible_places_core invisible_places_shaders)
@@ -130,9 +140,10 @@ target_link_libraries(invisible_places_core PUBLIC glfw)
 if(INVISIBLE_PLACES_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
     find_package(glm CONFIG REQUIRED)
+    find_package(nlohmann_json CONFIG REQUIRED)
     message(STATUS "Vulkan found: ${Vulkan_VERSION}")
     target_compile_definitions(invisible_places_core PUBLIC INVISIBLE_PLACES_HAS_VULKAN=1)
-    target_link_libraries(invisible_places_core PUBLIC Vulkan::Vulkan glm::glm)
+    target_link_libraries(invisible_places_core PUBLIC Vulkan::Vulkan glm::glm nlohmann_json::nlohmann_json)
 
     message(STATUS "glfw3 package is available for window/bootstrap work.")
 

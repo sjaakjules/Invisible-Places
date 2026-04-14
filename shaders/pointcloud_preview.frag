@@ -1,24 +1,42 @@
 #version 450
 
 layout(location = 0) in vec4 inSourceColor;
-layout(location = 1) in float inScalarValue;
-layout(location = 2) in float inViewDepth;
+layout(location = 1) in float inColormapValue;
+layout(location = 2) in float inOpacity;
+layout(location = 3) in float inEmissive;
+layout(location = 4) in float inXray;
+layout(location = 5) in float inDepthFade;
+layout(location = 6) in float inViewDepth;
 
 layout(location = 0) out vec4 outColor;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
     mat4 view;
+    mat4 projection;
     vec4 cameraPosition;
     vec4 depthParameters;
+    vec4 viewportParameters;
 } uniforms;
 
-layout(push_constant) uniform PointCloudStyle {
-    vec4 solidColor;
-    vec4 scalarRange;
-    vec4 shading;
-    uvec4 control;
+struct RenderParameterBindingGpu {
+    vec4 constantValue;
+    vec4 range;
     vec4 extra;
+    uvec4 control;
+};
+
+layout(set = 0, binding = 2, std140) uniform PointStyleData {
+    vec4 solidColor;
+    uvec4 globalControl;
+    uvec4 pointMeta;
+    uvec4 padding;
+    RenderParameterBindingGpu pointSizeBinding;
+    RenderParameterBindingGpu opacityBinding;
+    RenderParameterBindingGpu emissiveBinding;
+    RenderParameterBindingGpu xrayBinding;
+    RenderParameterBindingGpu depthFadeBinding;
+    RenderParameterBindingGpu colormapPositionBinding;
 } styleData;
 
 vec3 Viridis(float t) {
@@ -90,22 +108,23 @@ void main() {
     }
 
     vec3 baseColor = inSourceColor.rgb;
-    if (styleData.control.x == 1u) {
+    if (styleData.globalControl.x == 1u) {
         baseColor = styleData.solidColor.rgb;
-    } else if (styleData.control.x == 2u) {
-        float rangeWidth = max(1e-5, styleData.scalarRange.y - styleData.scalarRange.x);
-        float t = (inScalarValue - styleData.scalarRange.x) / rangeWidth;
-        if (styleData.control.z != 0u) {
-            t = clamp(t, 0.0, 1.0);
-        }
-        baseColor = ApplyColormap(styleData.control.y, clamp(t, 0.0, 1.0));
+    } else if (styleData.globalControl.x == 2u) {
+        baseColor = ApplyColormap(styleData.globalControl.y, clamp(inColormapValue, 0.0, 1.0));
+    } else if (styleData.globalControl.w == 0u) {
+        baseColor = styleData.solidColor.rgb;
     }
 
-    float opacity = clamp(styleData.shading.y, 0.0, 1.0);
-    float emissive = max(0.0, styleData.shading.z);
-    float xray = clamp(styleData.shading.w, 0.0, 1.0);
-    float depthFade = clamp(styleData.extra.x, 0.0, 1.0);
-    float depthNorm = clamp((inViewDepth - uniforms.depthParameters.y) / max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y), 0.0, 1.0);
+    float opacity = clamp(inOpacity, 0.0, 1.0);
+    float emissive = max(0.0, inEmissive);
+    float xray = clamp(inXray, 0.0, 1.0);
+    float depthFade = clamp(inDepthFade, 0.0, 1.0);
+    float depthNorm = clamp(
+        (inViewDepth - uniforms.depthParameters.y) /
+        max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
+        0.0,
+        1.0);
     float fade = mix(1.0, 1.0 - (depthNorm * 0.65), depthFade);
     float edge = smoothstep(1.0, 0.55, radialDistance);
 
