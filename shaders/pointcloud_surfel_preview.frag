@@ -7,6 +7,7 @@ layout(location = 3) in float inEmissive;
 layout(location = 4) in float inXray;
 layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
+layout(location = 7) in vec2 inDiscCoord;
 
 layout(location = 0) out vec4 outColor;
 
@@ -155,8 +156,7 @@ vec3 ResolveSolidColor(vec3 baseColor) {
 }
 
 void main() {
-    vec2 centered = (gl_PointCoord * 2.0) - 1.0;
-    float radiusSquared = dot(centered, centered);
+    float radiusSquared = dot(inDiscCoord, inDiscCoord);
     if (radiusSquared > 1.0) {
         discard;
     }

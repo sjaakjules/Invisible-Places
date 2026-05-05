@@ -16,6 +16,7 @@
 /external/vcpkg/
 /vcpkg_installed/
 /Data/
+/Saved/
 
 # CMake / CTest
 CMakeCache.txt

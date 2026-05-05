@@ -36,12 +36,14 @@ struct LoadedPointCloud {
     std::filesystem::path sourcePath;
     std::string layerName;
     std::vector<Float3> positions;
+    std::vector<Float3> normals;
     std::vector<std::uint32_t> packedColors;
     std::vector<float> scalarFieldValues;
     std::vector<ScalarFieldStats> scalarFields;
     Bounds3f bounds;
     Float3 focusPoint{};
     bool hasSourceRgb = false;
+    bool hasNormals = false;
     bool hasFocusPoint = false;
 
     [[nodiscard]] std::size_t PointCount() const { return positions.size(); }

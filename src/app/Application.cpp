@@ -1,10 +1,17 @@
 #include "app/Application.hpp"
 
+#include "camera/AnimationPath.hpp"
+#include "camera/CameraPath.hpp"
+#include "camera/CameraShot.hpp"
 #include "InvisiblePlacesBuildConfig.hpp"
 #include "camera/OrbitCamera.hpp"
 #include "io/AssetDiscovery.hpp"
 #include "io/GaussianSplatData.hpp"
 #include "io/PointCloudData.hpp"
+#include "output/ExrWriter.hpp"
+#include "output/OfflinePointRenderer.hpp"
+#include "output/RenderPreset.hpp"
+#include "output/VideoWriter.hpp"
 #include "platform/VulkanRuntimeConfig.hpp"
 #include "platform/Window.hpp"
 #include "platform/WindowTitle.hpp"
@@ -22,19 +29,35 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cfloat>
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stop_token>
 #include <string_view>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
+#include <glm/geometric.hpp>
+#include <glm/matrix.hpp>
+#include <glm/vec2.hpp>
+#include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 
 namespace invisible_places::app {
 
@@ -45,21 +68,32 @@ using PointBudgetState = invisible_places::renderer::pointcloud::PointBudgetStat
 using PointCloudStyleState = invisible_places::renderer::pointcloud::PointCloudStyleState;
 using PointCloudColorMode = invisible_places::renderer::pointcloud::PointCloudColorMode;
 using PointCloudColormapId = invisible_places::renderer::pointcloud::PointCloudColormapId;
+using PointCloudFalloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
+using PointCloudRenderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode;
 using GaussianSplatStyleState = invisible_places::renderer::gsplat::GaussianSplatStyleState;
 using GaussianSplatColorMode = invisible_places::renderer::gsplat::GaussianSplatColorMode;
 using GaussianSplatDebugMode = invisible_places::renderer::gsplat::GaussianSplatDebugMode;
 using GaussianSplatQualityMode = invisible_places::renderer::gsplat::GaussianSplatQualityMode;
+using AnimationPath = invisible_places::camera::AnimationPath;
+using CameraShot = invisible_places::camera::CameraShot;
 using RenderParameterBinding = invisible_places::style::RenderParameterBinding;
 using ParameterSourceMode = invisible_places::style::ParameterSourceMode;
 using FieldMapFlags = invisible_places::style::FieldMapFlags;
 using ProjectDocument = invisible_places::serialization::ProjectDocument;
 using ProjectLayerDocument = invisible_places::serialization::ProjectLayerDocument;
 using PointCloudStylePresetDocument = invisible_places::serialization::PointCloudStylePresetDocument;
+using RenderJobSettings = invisible_places::output::RenderJobSettings;
 using LayerLoadResult = std::variant<
     invisible_places::io::PointCloudLoadResult,
     invisible_places::io::GaussianSplatLoadResult>;
 
 constexpr float kPi = 3.14159265358979323846F;
+constexpr std::size_t kMaxPivotSamples = 65536;
+constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
+constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
+constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
 
 enum class PendingLoadPhase {
     CpuLoading,
@@ -76,6 +110,8 @@ struct ProjectSettings {
     std::array<float, 4> backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
     bool showStatusOverlay = true;
     bool autoLowerGsplatQualityWhileNavigating = true;
+    PointCloudPreviewLodMode pointCloudPreviewLodMode = PointCloudPreviewLodMode::AutoCameraLod;
+    std::uint64_t interactivePointCap = kDefaultInteractivePointCap;
     float gaussianSplatFootprintBoost = 1.5F;
     GsplatTransformConvention gsplatTransformConvention = GsplatTransformConvention::AsEncoded;
 };
@@ -83,7 +119,142 @@ struct ProjectSettings {
 struct PersistenceState {
     std::string projectFilePath;
     std::string pointStylePresetPath;
+    std::string animationDirectoryPath;
     std::vector<std::size_t> queuedLoadIndices;
+};
+
+struct CameraPanelState {
+    std::string draftShotName = "Shot 1";
+    std::optional<std::size_t> selectedShotIndex;
+    std::optional<std::size_t> blendFromIndex;
+    std::optional<std::size_t> blendToIndex;
+    std::vector<std::size_t> pathShotIndices;
+    std::optional<std::size_t> selectedPathItemIndex;
+    float blendAmount = 0.0F;
+    std::uint32_t defaultDurationFrames = 90;
+    std::uint32_t pathDurationFrames = 180;
+    bool liveBlend = true;
+};
+
+struct CameraPlaybackState {
+    bool active = false;
+    std::vector<std::size_t> pathShotIndices;
+    std::uint32_t durationFrames = 180;
+    float durationSeconds = 3.0F;
+    std::chrono::steady_clock::time_point startedAt{};
+};
+
+enum class AnimationEditTarget {
+    Camera,
+    Focus
+};
+
+struct AnimationViewportDragState {
+    bool active = false;
+    AnimationEditTarget target = AnimationEditTarget::Camera;
+    std::size_t keyIndex = 0;
+    int axis = 0;
+    glm::vec3 startWorldPoint{0.0F, 0.0F, 0.0F};
+    ImVec2 startMouse{};
+    glm::vec3 axisWorld{1.0F, 0.0F, 0.0F};
+    ImVec2 axisScreenDirection{1.0F, 0.0F};
+    float pixelsPerWorldUnit = 1.0F;
+};
+
+struct AnimationPanelState {
+    std::optional<AnimationPath> currentPath;
+    std::string currentFilePath;
+    std::string draftAnimationName = "Animation 1";
+    std::string mp4OutputPath;
+    std::vector<std::filesystem::path> availableFiles;
+    std::optional<std::size_t> selectedFileIndex;
+    std::optional<std::size_t> selectedKeyIndex;
+    AnimationEditTarget editTarget = AnimationEditTarget::Camera;
+    invisible_places::output::AnimationExportMode exportMode =
+        invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    float scrubAmount = 0.0F;
+    bool liveApply = true;
+    bool dirty = false;
+    bool showSplines = true;
+    bool exportPreviewDensity = true;
+    bool exportSizeInitialized = false;
+    AnimationViewportDragState drag{};
+};
+
+struct AnimationPlaybackState {
+    bool active = false;
+    AnimationPath path{};
+    float durationSeconds = 3.0F;
+    std::chrono::steady_clock::time_point startedAt{};
+};
+
+struct AnimationExportFramePayload {
+    std::uint32_t outputFrameIndex = 0;
+    invisible_places::output::HalfRgbaExrImage image{};
+};
+
+struct AnimationExportWriterState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<AnimationExportFramePayload> pendingFrames;
+    bool acceptingFrames = true;
+    bool finishRequested = false;
+    bool cancelRequested = false;
+    bool completed = false;
+    std::uint32_t writtenFrames = 0;
+    std::filesystem::path lastOutputPath;
+    std::string statusMessage;
+    std::string errorMessage;
+};
+
+struct OfflineRenderJobState {
+    bool active = false;
+    bool cancelRequested = false;
+    invisible_places::output::AnimationExportMode mode =
+        invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    RenderJobSettings settings{};
+    std::vector<invisible_places::camera::CameraState> frames;
+    std::vector<invisible_places::output::OfflineRenderTile> tiles;
+    std::uint32_t currentFrame = 0;
+    std::uint32_t currentTile = 0;
+    invisible_places::output::ExrImage image{};
+    std::chrono::steady_clock::time_point startedAt{};
+    std::filesystem::path lastOutputPath;
+    std::filesystem::path videoOutputPath;
+    std::string errorMessage;
+    std::uint32_t setupViewportWidth = 1;
+    std::uint32_t setupViewportHeight = 1;
+    std::uint32_t writtenFrameCount = 0;
+    std::size_t pendingFrameCount = 0;
+    bool previewDensity = true;
+    bool writerFinishRequested = false;
+    glm::vec4 exportBackgroundColor{0.0F, 0.0F, 0.0F, 0.0F};
+    float exportGaussianSplatFootprintBoost = 1.5F;
+    std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportPointCloudLayers;
+    std::shared_ptr<AnimationExportWriterState> writerState;
+    std::shared_ptr<struct OfflineRenderProgressState> progressState;
+    std::jthread worker;
+};
+
+struct OfflineRenderProgressState {
+    std::mutex mutex;
+    bool cancelRequested = false;
+    bool completed = false;
+    std::uint32_t currentFrame = 0;
+    std::uint32_t currentTile = 0;
+    std::filesystem::path lastOutputPath;
+    std::string statusMessage;
+    std::string errorMessage;
+};
+
+void EnsureCameraShotSelections(CameraPanelState* panelState, std::size_t shotCount);
+void RequestAnimationExportWriterCancellation(OfflineRenderJobState* job);
+
+struct OfflinePointLayerSnapshot {
+    std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud;
+    PointCloudStyleState style{};
+    bool hasSourceRgb = false;
+    glm::mat4 localToWorld{1.0F};
 };
 
 struct PreviewLayerSession {
@@ -94,6 +265,7 @@ struct PreviewLayerSession {
     bool loaded = false;
     bool visible = false;
     bool hasSourceRgb = false;
+    bool hasNormals = false;
     bool hasFocusPoint = false;
     std::uint64_t totalPrimitives = 0;
     invisible_places::io::Bounds3f localBounds{};
@@ -103,6 +275,11 @@ struct PreviewLayerSession {
     invisible_places::io::Matrix4d localToWorld{};
     bool hasLocalFocusPoint = false;
     std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
+    std::vector<invisible_places::io::Float3> pivotSamples;
+    std::shared_ptr<invisible_places::io::LoadedPointCloud> offlinePointCloud;
+    std::vector<std::uint32_t> previewLodSampledIndices;
+    std::uint32_t previewLodRequestedDrawCount = 0;
+    std::uint32_t previewLodSampledDrawCount = 0;
     PointBudgetState pointBudget{};
     PointCloudStyleState pointStyle{};
     GaussianSplatStyleState gsplatStyle{};
@@ -117,6 +294,7 @@ struct PendingLayerLoad {
     std::size_t sessionIndex = 0;
     PendingLoadPhase phase = PendingLoadPhase::CpuLoading;
     std::shared_ptr<BackgroundLayerLoadState> backgroundState;
+    std::jthread backgroundThread;
     std::optional<LayerLoadResult> completedResult;
     bool showUploadOverlayFrame = false;
     std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
@@ -124,7 +302,19 @@ struct PendingLayerLoad {
 
 struct CameraInteractionState {
     bool navigationActive = false;
+    bool renderViewportMouseActive = false;
     std::chrono::steady_clock::time_point lastNavigationInputAt{};
+};
+
+struct PerformanceInteractionState {
+    bool active = false;
+    std::chrono::steady_clock::time_point lastUiInteractionAt{};
+};
+
+struct PivotOverlayState {
+    bool visible = true;
+    invisible_places::io::Float3 pivot{};
+    std::chrono::steady_clock::time_point lastSetAt{};
 };
 
 struct PreviewRuntimeState {
@@ -132,7 +322,17 @@ struct PreviewRuntimeState {
     std::optional<std::size_t> selectedSessionIndex;
     std::optional<PendingLayerLoad> pendingLoad;
     invisible_places::camera::OrbitCamera camera;
+    bool preserveProjectCameraOnNextLayerActivation = false;
     CameraInteractionState cameraInteraction{};
+    PerformanceInteractionState performanceInteraction{};
+    PivotOverlayState pivotOverlay{};
+    CameraPanelState cameraPanel{};
+    CameraPlaybackState cameraPlayback{};
+    AnimationPanelState animationPanel{};
+    AnimationPlaybackState animationPlayback{};
+    std::vector<CameraShot> cameraShots;
+    RenderJobSettings renderSettings{};
+    OfflineRenderJobState offlineRenderJob{};
     invisible_places::ui::SidePanelState sidePanel{};
     ProjectSettings projectSettings{};
     PersistenceState persistence{};
@@ -172,11 +372,151 @@ std::filesystem::path DefaultPointStylePresetPath(const std::filesystem::path& d
     return dataRoot.parent_path() / "Saved" / "pointcloud_style_preset.json";
 }
 
+std::filesystem::path DefaultRenderOutputDirectory(const std::filesystem::path& dataRoot) {
+    return dataRoot.parent_path() / "Saved" / "renders" / "Invisible Places";
+}
+
+std::filesystem::path DefaultAnimationDirectory(const std::filesystem::path& dataRoot) {
+    return dataRoot.parent_path() / "Saved" / "animations";
+}
+
 std::string DescribeBudget(const PointBudgetState& budget) {
     std::ostringstream output;
     output << FormatPointCount(budget.activePoints) << " / " << FormatPointCount(budget.totalPoints)
            << " points";
     return output.str();
+}
+
+invisible_places::renderer::pointcloud::PointCloudPreviewLodDecision ResolvePointCloudPreviewLodDecision(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    return invisible_places::renderer::pointcloud::ResolvePointCloudPreviewLod(
+        session.pointBudget,
+        runtimeState.projectSettings.pointCloudPreviewLodMode,
+        runtimeState.cameraInteraction.navigationActive,
+        runtimeState.cameraPlayback.active || runtimeState.animationPlayback.active,
+        kPointCloudPreviewLodTarget);
+}
+
+std::uint64_t EffectivePointDrawCount(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    const auto decision = ResolvePointCloudPreviewLodDecision(runtimeState, session);
+    if (!decision.usesPreviewLod) {
+        return decision.drawPointCount;
+    }
+
+    if (session.previewLodSampledDrawCount == 0) {
+        return session.pointBudget.activePoints;
+    }
+
+    return std::min<std::uint64_t>(
+        session.previewLodSampledDrawCount,
+        decision.drawPointCount);
+}
+
+bool PointCloudPreviewLodApplied(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    return EffectivePointDrawCount(runtimeState, session) < session.pointBudget.activePoints;
+}
+
+std::string DescribePointCloudPreviewDraw(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    std::ostringstream output;
+    output << FormatPointCount(EffectivePointDrawCount(runtimeState, session)) << " / "
+           << FormatPointCount(session.pointBudget.activePoints) << " points";
+    return output.str();
+}
+
+PointBudgetState MakePreviewPointBudgetState(
+    const PreviewLayerSession& session,
+    std::uint64_t requestedPoints) {
+    if (session.offlinePointCloud != nullptr) {
+        return invisible_places::renderer::pointcloud::MakePointBudgetState(
+            *session.offlinePointCloud,
+            requestedPoints);
+    }
+
+    return invisible_places::renderer::pointcloud::MakePointBudgetState(
+        session.totalPrimitives,
+        requestedPoints);
+}
+
+void ClearPreviewLodSampleCache(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return;
+    }
+
+    session->previewLodSampledIndices.clear();
+    session->previewLodRequestedDrawCount = 0;
+    session->previewLodSampledDrawCount = 0;
+}
+
+std::uint32_t RequestedPreviewLodSampleCount(
+    const PreviewLayerSession& session) {
+    if (session.kind != LayerKind::PointCloud ||
+        session.pointBudget.UsesSampledIndices() ||
+        session.pointBudget.activePoints == 0 ||
+        kPointCloudPreviewLodTarget >= session.pointBudget.activePoints) {
+        return 0;
+    }
+
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        kPointCloudPreviewLodTarget,
+        std::numeric_limits<std::uint32_t>::max()));
+}
+
+void PreparePreviewLodSampleCache(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::size_t sessionIndex) {
+    if (runtimeState == nullptr || viewport == nullptr || sessionIndex >= runtimeState->sessions.size()) {
+        return;
+    }
+
+    auto& session = runtimeState->sessions[sessionIndex];
+    if (!session.loaded ||
+        session.kind != LayerKind::PointCloud ||
+        session.offlinePointCloud == nullptr) {
+        ClearPreviewLodSampleCache(&session);
+        viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices);
+        return;
+    }
+
+    const auto requestedCount = RequestedPreviewLodSampleCount(session);
+    if (requestedCount == 0) {
+        ClearPreviewLodSampleCache(&session);
+        viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices);
+        return;
+    }
+
+    if (session.previewLodRequestedDrawCount == requestedCount &&
+        session.previewLodSampledDrawCount > 0) {
+        return;
+    }
+
+    session.previewLodSampledIndices =
+        invisible_places::renderer::pointcloud::GenerateDeterministicSampleIndices(
+            session.pointBudget.activePoints,
+            requestedCount);
+    session.previewLodRequestedDrawCount = requestedCount;
+    session.previewLodSampledDrawCount =
+        static_cast<std::uint32_t>(session.previewLodSampledIndices.size());
+    viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices);
+}
+
+void PreparePreviewLodSampleCaches(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+        PreparePreviewLodSampleCache(runtimeState, viewport, sessionIndex);
+    }
 }
 
 const char* LayerKindLabel(LayerKind kind) {
@@ -195,6 +535,19 @@ const char* PointCloudColorModeLabel(PointCloudColorMode mode) {
             return "Solid Color";
         case PointCloudColorMode::ScalarColormap:
             return "Scalar Colormap";
+    }
+
+    return "Unknown";
+}
+
+const char* PointCloudPreviewLodModeLabel(PointCloudPreviewLodMode mode) {
+    switch (mode) {
+        case PointCloudPreviewLodMode::FullResolution:
+            return "Full Resolution";
+        case PointCloudPreviewLodMode::AutoCameraLod:
+            return "Auto Camera LOD";
+        case PointCloudPreviewLodMode::ForceLod:
+            return "Force LOD";
     }
 
     return "Unknown";
@@ -394,7 +747,7 @@ GaussianSplatQualityMode EffectiveGaussianSplatQualityMode(
     return invisible_places::renderer::gsplat::ResolveEffectiveGaussianSplatQualityMode(
         session.gsplatStyle.qualityMode,
         runtimeState.projectSettings.autoLowerGsplatQualityWhileNavigating,
-        runtimeState.cameraInteraction.navigationActive);
+        runtimeState.performanceInteraction.active);
 }
 
 bool BoundsIntersectsViewFrustum(
@@ -503,11 +856,23 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     }
 
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.pointSize, session->scalarFields);
+    invisible_places::style::SyncBindingFieldReference(&session->pointStyle.surfelDiameter, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.opacity, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.emissiveStrength, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.xrayStrength, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.depthFade, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.colormapPosition, session->scalarFields);
+
+    session->pointStyle.exposure = std::max(0.0F, session->pointStyle.exposure);
+    session->pointStyle.innerRadius = std::clamp(session->pointStyle.innerRadius, 0.0F, 0.99F);
+    session->pointStyle.gaussianSharpness = std::max(0.001F, session->pointStyle.gaussianSharpness);
+    session->pointStyle.featherPower = std::max(0.001F, session->pointStyle.featherPower);
+    session->pointStyle.depthFalloff = std::max(0.0F, session->pointStyle.depthFalloff);
+    session->pointStyle.depthBias = std::max(0.0F, session->pointStyle.depthBias);
+    session->pointStyle.frontAlpha = std::clamp(session->pointStyle.frontAlpha, 0.0F, 1.0F);
+    session->pointStyle.hiddenAlpha = std::clamp(session->pointStyle.hiddenAlpha, 0.0F, 1.0F);
+    session->pointStyle.densityScale = std::max(0.0F, session->pointStyle.densityScale);
+    session->pointStyle.densityClamp = std::max(0.0F, session->pointStyle.densityClamp);
 
     if (session->pointStyle.colorMode == PointCloudColorMode::ScalarColormap) {
         EnsureFieldMappedBindingDefaults(
@@ -558,6 +923,8 @@ struct ScalarBindingWidgetConfig {
     float defaultOutputMax = 1.0F;
     float defaultConstant = 0.0F;
     const char* format = "%.3f";
+    bool directConstantInput = false;
+    float displayScale = 1.0F;
 };
 
 const char* FieldMapModeLabel(ParameterSourceMode mode) {
@@ -605,9 +972,23 @@ bool DrawScalarBindingWidget(
     }
 
     if (binding->mode == ParameterSourceMode::Constant || scalarFields.empty()) {
-        float constantValue = invisible_places::style::ScalarConstant(*binding);
-        if (ImGui::SliderFloat("Value", &constantValue, config.constantMin, config.constantMax, config.format)) {
-            invisible_places::style::SetScalarConstant(binding, constantValue);
+        const float displayScale = std::max(1.0e-6F, config.displayScale);
+        float constantValue = invisible_places::style::ScalarConstant(*binding) * displayScale;
+        bool valueChanged =
+            ImGui::SliderFloat(
+                "Value",
+                &constantValue,
+                config.constantMin * displayScale,
+                config.constantMax * displayScale,
+                config.format);
+        if (config.directConstantInput) {
+            ImGui::SetNextItemWidth(120.0F);
+            valueChanged |= ImGui::InputFloat("Value Input", &constantValue, 0.0F, 0.0F, config.format);
+        }
+        if (valueChanged) {
+            const float storedValue =
+                std::clamp(constantValue / displayScale, config.constantMin, config.constantMax);
+            invisible_places::style::SetScalarConstant(binding, storedValue);
             changed = true;
         }
         if (binding->mode == ParameterSourceMode::FieldMapped && scalarFields.empty()) {
@@ -663,8 +1044,17 @@ bool DrawScalarBindingWidget(
         binding->fieldMap.inputMax = fieldStats->maximum;
     }
 
-    changed |= ImGui::InputFloat("Output Min", &binding->fieldMap.outputMin, 0.0F, 0.0F, config.format);
-    changed |= ImGui::InputFloat("Output Max", &binding->fieldMap.outputMax, 0.0F, 0.0F, config.format);
+    const float displayScale = std::max(1.0e-6F, config.displayScale);
+    float outputMin = binding->fieldMap.outputMin * displayScale;
+    float outputMax = binding->fieldMap.outputMax * displayScale;
+    if (ImGui::InputFloat("Output Min", &outputMin, 0.0F, 0.0F, config.format)) {
+        binding->fieldMap.outputMin = outputMin / displayScale;
+        changed = true;
+    }
+    if (ImGui::InputFloat("Output Max", &outputMax, 0.0F, 0.0F, config.format)) {
+        binding->fieldMap.outputMax = outputMax / displayScale;
+        changed = true;
+    }
     changed |= ImGui::SliderFloat("Gamma", &binding->fieldMap.gamma, 0.05F, 4.0F, "%.2f");
 
     bool clamp = invisible_places::style::HasFieldMapFlag(
@@ -783,6 +1173,501 @@ float CurrentAspectRatio(const invisible_places::renderer::core::VulkanViewportS
     return static_cast<float>(width) / static_cast<float>(height);
 }
 
+ImVec2 CurrentUiViewportSize(const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (ImGui::GetCurrentContext() != nullptr) {
+        if (const ImGuiViewport* mainViewport = ImGui::GetMainViewport(); mainViewport != nullptr) {
+            if (mainViewport->Size.x > 1.0F && mainViewport->Size.y > 1.0F) {
+                return mainViewport->Size;
+            }
+        }
+    }
+
+    return ImVec2{
+        static_cast<float>(std::max<std::uint32_t>(1U, viewport.Width())),
+        static_cast<float>(std::max<std::uint32_t>(1U, viewport.Height())),
+    };
+}
+
+ImVec2 CurrentUiViewportOrigin() {
+    if (ImGui::GetCurrentContext() != nullptr) {
+        if (const ImGuiViewport* mainViewport = ImGui::GetMainViewport(); mainViewport != nullptr) {
+            return mainViewport->Pos;
+        }
+    }
+
+    return ImVec2{0.0F, 0.0F};
+}
+
+ImVec2 CurrentUiViewportCenter(const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const auto origin = CurrentUiViewportOrigin();
+    const auto size = CurrentUiViewportSize(viewport);
+    return ImVec2{origin.x + (size.x * 0.5F), origin.y + (size.y * 0.5F)};
+}
+
+ImVec2 ToRenderViewportLocal(
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    const auto origin = CurrentUiViewportOrigin();
+    const auto size = CurrentUiViewportSize(viewport);
+    const ImVec2 local{screenPoint.x - origin.x, screenPoint.y - origin.y};
+    return ImVec2{
+        std::clamp(local.x, 0.0F, std::max(1.0F, size.x)),
+        std::clamp(local.y, 0.0F, std::max(1.0F, size.y)),
+    };
+}
+
+bool IsInsideRenderViewport(
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    const auto origin = CurrentUiViewportOrigin();
+    const auto size = CurrentUiViewportSize(viewport);
+    return screenPoint.x >= origin.x && screenPoint.x <= origin.x + size.x &&
+           screenPoint.y >= origin.y && screenPoint.y <= origin.y + size.y;
+}
+
+bool IsMouseOverRenderViewport(const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return false;
+    }
+
+    const auto& io = ImGui::GetIO();
+    if (!ImGui::IsMousePosValid(&io.MousePos) || !IsInsideRenderViewport(viewport, io.MousePos)) {
+        return false;
+    }
+
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    return mainViewport == nullptr || io.MouseHoveredViewport == 0 || io.MouseHoveredViewport == mainViewport->ID;
+}
+
+bool IsRenderViewportFocused() {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return false;
+    }
+
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    return mainViewport != nullptr && (mainViewport->Flags & ImGuiViewportFlags_IsFocused) != 0;
+}
+
+glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
+    return {value.x, value.y, value.z};
+}
+
+invisible_places::io::Float3 FromGlm(const glm::vec3& value) {
+    return {value.x, value.y, value.z};
+}
+
+invisible_places::io::Float3 BoundsCenter(const invisible_places::io::Bounds3f& bounds) {
+    return {
+        0.5F * (bounds.minimum.x + bounds.maximum.x),
+        0.5F * (bounds.minimum.y + bounds.maximum.y),
+        0.5F * (bounds.minimum.z + bounds.maximum.z),
+    };
+}
+
+std::vector<invisible_places::io::Float3> BuildPivotSamples(
+    const std::vector<invisible_places::io::Float3>& points,
+    const invisible_places::io::Bounds3f& bounds) {
+    (void)bounds;
+    if (points.empty()) {
+        return {};
+    }
+
+    if (points.size() <= kMaxPivotSamples) {
+        return points;
+    }
+
+    std::vector<invisible_places::io::Float3> samples;
+    samples.reserve(kMaxPivotSamples);
+    const auto stride = std::max<std::size_t>(1U, (points.size() + kMaxPivotSamples - 1U) / kMaxPivotSamples);
+    for (std::size_t index = 0; index < points.size() && samples.size() < kMaxPivotSamples; index += stride) {
+        samples.push_back(points[index]);
+    }
+    return samples;
+}
+
+std::optional<invisible_places::io::Float3> FallbackPivot(const PreviewRuntimeState& runtimeState) {
+    if (runtimeState.selectedSessionIndex.has_value() &&
+        runtimeState.selectedSessionIndex.value() < runtimeState.sessions.size()) {
+        const auto& selectedSession = runtimeState.sessions[runtimeState.selectedSessionIndex.value()];
+        if (selectedSession.loaded && selectedSession.hasFocusPoint) {
+            return selectedSession.focusPoint;
+        }
+        if (selectedSession.loaded && selectedSession.bounds.valid) {
+            return BoundsCenter(selectedSession.bounds);
+        }
+    }
+
+    for (const auto& session : runtimeState.sessions) {
+        if (!session.loaded || !session.visible) {
+            continue;
+        }
+        if (session.hasFocusPoint) {
+            return session.focusPoint;
+        }
+        if (session.bounds.valid) {
+            return BoundsCenter(session.bounds);
+        }
+    }
+
+    return std::nullopt;
+}
+
+struct ScreenRay {
+    glm::vec3 origin{0.0F, 0.0F, 0.0F};
+    glm::vec3 direction{0.0F, 0.0F, -1.0F};
+};
+
+struct ProjectedPoint {
+    ImVec2 screen{};
+    float depth = 0.0F;
+};
+
+struct PivotCandidate {
+    glm::vec3 point{0.0F, 0.0F, 0.0F};
+    float rayDistance = 0.0F;
+    float alongRay = 0.0F;
+    float depth = 0.0F;
+    float screenDistance = 0.0F;
+    float pickRadiusWorld = 0.0F;
+};
+
+struct ResolvedPivot {
+    invisible_places::io::Float3 point{};
+    bool matchedSurface = false;
+    std::size_t sampleCount = 0;
+};
+
+std::optional<ProjectedPoint> ProjectWorldPoint(
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const glm::vec3& worldPoint) {
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const auto viewportOrigin = CurrentUiViewportOrigin();
+    const float viewportWidth = std::max(1.0F, viewportSize.x);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+    const glm::vec4 clip = matrices.viewProjection * glm::vec4{worldPoint, 1.0F};
+    if (clip.w <= 1.0e-6F) {
+        return std::nullopt;
+    }
+
+    const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+    if (ndc.x < -1.0F || ndc.x > 1.0F || ndc.y < -1.0F || ndc.y > 1.0F ||
+        ndc.z < -1.0F || ndc.z > 1.0F) {
+        return std::nullopt;
+    }
+
+    return ProjectedPoint{
+        .screen =
+            ImVec2{
+                viewportOrigin.x + ((ndc.x * 0.5F + 0.5F) * viewportWidth),
+                viewportOrigin.y + ((ndc.y * 0.5F + 0.5F) * viewportHeight),
+            },
+        .depth = ndc.z,
+    };
+}
+
+std::optional<ScreenRay> MakeScreenRay(
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const float viewportWidth = std::max(1.0F, viewportSize.x);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+    auto localPoint = ToRenderViewportLocal(viewport, screenPoint);
+    if (!IsInsideRenderViewport(viewport, screenPoint)) {
+        localPoint = ImVec2{viewportWidth * 0.5F, viewportHeight * 0.5F};
+    }
+
+    const float ndcX = (localPoint.x / viewportWidth) * 2.0F - 1.0F;
+    const float ndcY = (localPoint.y / viewportHeight) * 2.0F - 1.0F;
+    const glm::mat4 inverseViewProjection = glm::inverse(matrices.viewProjection);
+    glm::vec4 nearWorld = inverseViewProjection * glm::vec4{ndcX, ndcY, -1.0F, 1.0F};
+    glm::vec4 farWorld = inverseViewProjection * glm::vec4{ndcX, ndcY, 1.0F, 1.0F};
+    if (std::abs(nearWorld.w) <= 1.0e-6F || std::abs(farWorld.w) <= 1.0e-6F) {
+        return std::nullopt;
+    }
+
+    nearWorld /= nearWorld.w;
+    farWorld /= farWorld.w;
+    const glm::vec3 direction = glm::vec3{farWorld} - glm::vec3{nearWorld};
+    if (glm::length(direction) <= 1.0e-6F) {
+        return std::nullopt;
+    }
+
+    return ScreenRay{
+        .origin = matrices.position,
+        .direction = glm::normalize(direction),
+    };
+}
+
+float MedianValue(std::vector<float> values) {
+    if (values.empty()) {
+        return 0.0F;
+    }
+
+    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2U);
+    std::nth_element(values.begin(), middle, values.end());
+    if ((values.size() % 2U) != 0U) {
+        return *middle;
+    }
+
+    const auto lower = std::max_element(values.begin(), middle);
+    return 0.5F * (*lower + *middle);
+}
+
+glm::vec3 MedianPoint(const std::vector<PivotCandidate>& candidates) {
+    std::vector<float> xs;
+    std::vector<float> ys;
+    std::vector<float> zs;
+    xs.reserve(candidates.size());
+    ys.reserve(candidates.size());
+    zs.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        xs.push_back(candidate.point.x);
+        ys.push_back(candidate.point.y);
+        zs.push_back(candidate.point.z);
+    }
+
+    return {MedianValue(std::move(xs)), MedianValue(std::move(ys)), MedianValue(std::move(zs))};
+}
+
+std::vector<PivotCandidate> SelectPivotDepthCluster(std::vector<PivotCandidate> candidates) {
+    if (candidates.size() <= 3U) {
+        return candidates;
+    }
+
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const PivotCandidate& left, const PivotCandidate& right) {
+            if (std::abs(left.alongRay - right.alongRay) > 1.0e-5F) {
+                return left.alongRay < right.alongRay;
+            }
+            if (std::abs(left.screenDistance - right.screenDistance) > 0.5F) {
+                return left.screenDistance < right.screenDistance;
+            }
+            return left.rayDistance < right.rayDistance;
+        });
+
+    std::vector<double> screenPrefix(candidates.size() + 1U, 0.0);
+    std::vector<double> rayPrefix(candidates.size() + 1U, 0.0);
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        screenPrefix[index + 1U] = screenPrefix[index] + candidates[index].screenDistance;
+        rayPrefix[index + 1U] = rayPrefix[index] + candidates[index].rayDistance;
+    }
+
+    std::size_t bestStart = 0;
+    std::size_t bestEnd = 1;
+    double bestMeanScreen = std::numeric_limits<double>::max();
+    double bestMeanRay = std::numeric_limits<double>::max();
+    for (std::size_t start = 0; start < candidates.size(); ++start) {
+        const float depthWindow = std::max(
+            candidates[start].pickRadiusWorld * 6.0F,
+            std::max(0.001F, candidates[start].alongRay * 0.01F));
+        auto end = start + 1U;
+        while (end < candidates.size() &&
+               candidates[end].alongRay <= candidates[start].alongRay + depthWindow) {
+            ++end;
+        }
+
+        const auto count = end - start;
+        const double meanScreen = (screenPrefix[end] - screenPrefix[start]) / static_cast<double>(count);
+        const double meanRay = (rayPrefix[end] - rayPrefix[start]) / static_cast<double>(count);
+        const auto bestCount = bestEnd - bestStart;
+        if (count > bestCount ||
+            (count == bestCount &&
+             (meanScreen < bestMeanScreen ||
+              (std::abs(meanScreen - bestMeanScreen) <= 0.01 && meanRay < bestMeanRay)))) {
+            bestStart = start;
+            bestEnd = end;
+            bestMeanScreen = meanScreen;
+            bestMeanRay = meanRay;
+        }
+    }
+
+    return {candidates.begin() + static_cast<std::ptrdiff_t>(bestStart),
+            candidates.begin() + static_cast<std::ptrdiff_t>(bestEnd)};
+}
+
+glm::vec3 BulkCenter(const std::vector<PivotCandidate>& candidates) {
+    if (candidates.empty()) {
+        return {0.0F, 0.0F, 0.0F};
+    }
+
+    if (candidates.size() == 1U) {
+        return candidates.front().point;
+    }
+
+    const auto median = MedianPoint(candidates);
+    std::vector<std::pair<float, std::size_t>> distances;
+    distances.reserve(candidates.size());
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        distances.emplace_back(glm::length(candidates[index].point - median), index);
+    }
+    std::sort(
+        distances.begin(),
+        distances.end(),
+        [](const auto& left, const auto& right) {
+            if (std::abs(left.first - right.first) > 1.0e-6F) {
+                return left.first < right.first;
+            }
+            return left.second < right.second;
+        });
+
+    const std::size_t keepCount = std::max<std::size_t>(
+        1U,
+        static_cast<std::size_t>(std::ceil(static_cast<float>(distances.size()) * 0.8F)));
+    glm::vec3 sum{0.0F, 0.0F, 0.0F};
+    for (std::size_t index = 0; index < keepCount; ++index) {
+        sum += candidates[distances[index].second].point;
+    }
+
+    const auto center = sum / static_cast<float>(keepCount);
+    const auto nearest = std::min_element(
+        candidates.begin(),
+        candidates.end(),
+        [&center](const PivotCandidate& left, const PivotCandidate& right) {
+            const float leftDistance = glm::length(left.point - center);
+            const float rightDistance = glm::length(right.point - center);
+            if (std::abs(leftDistance - rightDistance) > 1.0e-6F) {
+                return leftDistance < rightDistance;
+            }
+            return left.screenDistance < right.screenDistance;
+        });
+    return nearest != candidates.end() ? nearest->point : center;
+}
+
+std::optional<ResolvedPivot> ResolveSurfacePivot(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (!IsInsideRenderViewport(viewport, screenPoint)) {
+        screenPoint = CurrentUiViewportCenter(viewport);
+    }
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+
+    const auto matrices = runtimeState.camera.Matrices(CurrentAspectRatio(viewport));
+    const auto screenRay = MakeScreenRay(matrices, viewport, screenPoint);
+    if (!screenRay.has_value()) {
+        if (const auto fallback = FallbackPivot(runtimeState); fallback.has_value()) {
+            return ResolvedPivot{.point = fallback.value(), .matchedSurface = false};
+        }
+        return std::nullopt;
+    }
+
+    std::vector<PivotCandidate> candidates;
+    candidates.reserve(256);
+    constexpr float pickRadiusPixels = 48.0F;
+    const float tanHalfFov = std::tan(runtimeState.camera.FovDegrees() * kPi / 360.0F);
+
+    for (const auto& session : runtimeState.sessions) {
+        if (!session.loaded || !session.visible || session.pivotSamples.empty()) {
+            continue;
+        }
+
+        const glm::mat4 localToWorld = session.kind == LayerKind::GaussianSplat
+                                           ? EffectiveGsplatLocalToWorld(runtimeState.projectSettings, session)
+                                           : glm::mat4{1.0F};
+
+        for (const auto& sample : session.pivotSamples) {
+            const glm::vec4 worldPosition =
+                localToWorld * glm::vec4{sample.x, sample.y, sample.z, 1.0F};
+            if (std::abs(worldPosition.w) <= 1.0e-6F) {
+                continue;
+            }
+
+            const glm::vec3 worldPoint = glm::vec3{worldPosition} / worldPosition.w;
+            const auto projected = ProjectWorldPoint(matrices, viewport, worldPoint);
+            if (!projected.has_value()) {
+                continue;
+            }
+
+            const glm::vec3 pointFromRayOrigin = worldPoint - screenRay->origin;
+            const float alongRay = glm::dot(pointFromRayOrigin, screenRay->direction);
+            if (alongRay <= runtimeState.camera.NearPlane()) {
+                continue;
+            }
+
+            const float dx = projected->screen.x - screenPoint.x;
+            const float dy = projected->screen.y - screenPoint.y;
+            const float screenDistance = std::sqrt((dx * dx) + (dy * dy));
+            if (screenDistance > pickRadiusPixels) {
+                continue;
+            }
+
+            const glm::vec3 closestPointOnRay = screenRay->origin + (screenRay->direction * alongRay);
+            const float rayDistance = glm::length(worldPoint - closestPointOnRay);
+            const float worldUnitsPerPixel =
+                (2.0F * std::max(0.001F, alongRay) * tanHalfFov) / viewportHeight;
+            const float pickRadiusWorld = std::max(0.0001F, worldUnitsPerPixel * pickRadiusPixels);
+            if (rayDistance > pickRadiusWorld) {
+                continue;
+            }
+
+            candidates.push_back(
+                {.point = worldPoint,
+                 .rayDistance = rayDistance,
+                 .alongRay = alongRay,
+                 .depth = projected->depth,
+                 .screenDistance = screenDistance,
+                 .pickRadiusWorld = pickRadiusWorld});
+        }
+    }
+
+    if (candidates.empty()) {
+        if (const auto fallback = FallbackPivot(runtimeState); fallback.has_value()) {
+            return ResolvedPivot{.point = fallback.value(), .matchedSurface = false};
+        }
+        return std::nullopt;
+    }
+
+    auto cluster = SelectPivotDepthCluster(std::move(candidates));
+    return ResolvedPivot{
+        .point = FromGlm(BulkCenter(cluster)),
+        .matchedSurface = true,
+        .sampleCount = cluster.size()};
+}
+
+bool SetCameraPivotFromScreenPoint(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
+    if (!pivot.has_value()) {
+        runtimeState->statusMessage = "No visible surface pivot was available.";
+        return false;
+    }
+
+    runtimeState->camera.SetOrbitCenterPreservingView(ToGlm(pivot->point));
+    runtimeState->pivotOverlay.pivot = pivot->point;
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+    runtimeState->cameraPlayback.active = false;
+    if (pivot->matchedSurface) {
+        runtimeState->statusMessage =
+            "Camera pivot set to nearby surface bulk from " +
+            FormatPointCount(static_cast<std::uint64_t>(pivot->sampleCount)) + " samples.";
+    } else {
+        runtimeState->statusMessage = "Camera pivot set to fallback focus point.";
+    }
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void SyncPivotOverlayToCamera(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    runtimeState->pivotOverlay.visible = true;
+    runtimeState->pivotOverlay.pivot = FromGlm(runtimeState->camera.OrbitCenter());
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+}
+
 PreviewLayerSession* SelectedSession(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr || !runtimeState->selectedSessionIndex.has_value()) {
         return nullptr;
@@ -807,6 +1692,16 @@ PreviewLayerSession* SelectedLoadedSession(PreviewRuntimeState* runtimeState) {
 const PreviewLayerSession* SelectedLoadedSession(const PreviewRuntimeState& runtimeState) {
     const auto* session = SelectedSession(runtimeState);
     return session != nullptr && session->loaded ? session : nullptr;
+}
+
+PreviewLayerSession* SelectedLoadedSessionOfKind(PreviewRuntimeState* runtimeState, LayerKind kind) {
+    auto* session = SelectedLoadedSession(runtimeState);
+    return session != nullptr && session->kind == kind ? session : nullptr;
+}
+
+const PreviewLayerSession* SelectedLoadedSessionOfKind(const PreviewRuntimeState& runtimeState, LayerKind kind) {
+    const auto* session = SelectedLoadedSession(runtimeState);
+    return session != nullptr && session->kind == kind ? session : nullptr;
 }
 
 std::optional<LayerLoadResult> TakeCompletedBackgroundResult(
@@ -855,6 +1750,7 @@ void FocusSessionLayer(
         effectiveFrame.bounds,
         effectiveFrame.hasFocusPoint ? effectiveFrame.focusPoint : effectiveFrame.bounds.minimum,
         CurrentAspectRatio(viewport));
+    SyncPivotOverlayToCamera(runtimeState);
 }
 
 bool ActivateLoadedPointCloud(
@@ -869,23 +1765,26 @@ bool ActivateLoadedPointCloud(
     const bool hadVisibleLayersBefore = VisibleLayerCount(*runtimeState) > 0;
     auto& session = runtimeState->sessions[sessionIndex];
     session.hasSourceRgb = cloud.hasSourceRgb;
+    session.hasNormals = cloud.hasNormals;
     session.totalPrimitives = cloud.PointCount();
     session.scalarFields = cloud.scalarFields;
     session.bounds = cloud.bounds;
     session.focusPoint = cloud.focusPoint;
     session.hasFocusPoint = cloud.hasFocusPoint;
+    session.pivotSamples = BuildPivotSamples(cloud.positions, cloud.bounds);
     session.loaded = true;
     session.visible = true;
 
     if (session.pointBudget.totalPoints != session.totalPrimitives) {
         session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
-            session.totalPrimitives,
+            cloud,
             session.totalPrimitives);
     } else {
         session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
-            session.totalPrimitives,
+            cloud,
             session.pointBudget.activePoints == 0 ? session.totalPrimitives : session.pointBudget.activePoints);
     }
+    ClearPreviewLodSampleCache(&session);
 
     SanitizePointCloudStyle(&session);
 
@@ -894,13 +1793,19 @@ bool ActivateLoadedPointCloud(
     } catch (const std::exception& error) {
         session.loaded = false;
         session.visible = false;
+        session.offlinePointCloud.reset();
         runtimeState->errorMessage = "GPU upload failed: " + std::string{error.what()};
         std::cerr << runtimeState->errorMessage << std::endl;
         return false;
     }
 
+    session.offlinePointCloud =
+        std::make_shared<invisible_places::io::LoadedPointCloud>(std::move(cloud));
     runtimeState->selectedSessionIndex = sessionIndex;
-    if (!hadVisibleLayersBefore) {
+    if (!hadVisibleLayersBefore && runtimeState->preserveProjectCameraOnNextLayerActivation) {
+        runtimeState->preserveProjectCameraOnNextLayerActivation = false;
+        SyncPivotOverlayToCamera(runtimeState);
+    } else if (!hadVisibleLayersBefore) {
         FocusSessionLayer(runtimeState, *viewport, sessionIndex);
     }
 
@@ -930,6 +1835,7 @@ bool ActivateLoadedGaussianSplats(
     session.focusPoint = splats.focusPoint;
     session.hasLocalFocusPoint = splats.hasLocalFocusPoint;
     session.hasFocusPoint = splats.hasFocusPoint;
+    session.pivotSamples = BuildPivotSamples(splats.centers, splats.localBounds);
     session.loaded = true;
     session.visible = true;
 
@@ -944,7 +1850,10 @@ bool ActivateLoadedGaussianSplats(
     }
 
     runtimeState->selectedSessionIndex = sessionIndex;
-    if (!hadVisibleLayersBefore) {
+    if (!hadVisibleLayersBefore && runtimeState->preserveProjectCameraOnNextLayerActivation) {
+        runtimeState->preserveProjectCameraOnNextLayerActivation = false;
+        SyncPivotOverlayToCamera(runtimeState);
+    } else if (!hadVisibleLayersBefore) {
         FocusSessionLayer(runtimeState, *viewport, sessionIndex);
     }
 
@@ -982,21 +1891,29 @@ void BeginLayerLoad(std::size_t sessionIndex, PreviewRuntimeState* runtimeState)
     std::cout << "Loading " << LayerKindLabel(layerKind) << ": " << filePath.filename().string() << std::endl;
 
     auto backgroundState = std::make_shared<BackgroundLayerLoadState>();
-    std::thread(
-        [backgroundState, layerKind, filePath, transformPath]() {
+    std::jthread backgroundThread{
+        [backgroundState, layerKind, filePath, transformPath](std::stop_token stopToken) {
+            if (stopToken.stop_requested()) {
+                return;
+            }
+
             LayerLoadResult result = layerKind == LayerKind::PointCloud
                                          ? LayerLoadResult{invisible_places::io::LoadPointCloud(filePath)}
                                          : LayerLoadResult{
                                                invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
+            if (stopToken.stop_requested()) {
+                return;
+            }
+
             std::scoped_lock lock(backgroundState->mutex);
             backgroundState->result = std::move(result);
-        })
-        .detach();
+        }};
 
     runtimeState->pendingLoad = PendingLayerLoad{
         .sessionIndex = sessionIndex,
         .phase = PendingLoadPhase::CpuLoading,
         .backgroundState = std::move(backgroundState),
+        .backgroundThread = std::move(backgroundThread),
         .completedResult = std::nullopt,
         .showUploadOverlayFrame = false,
         .startedAt = std::chrono::steady_clock::now(),
@@ -1096,6 +2013,9 @@ void UnloadLayerByIndex(
 
     session.loaded = false;
     session.visible = false;
+    session.pivotSamples.clear();
+    session.offlinePointCloud.reset();
+    ClearPreviewLodSampleCache(&session);
 }
 
 ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
@@ -1105,6 +2025,14 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.sidePanelPinned = runtimeState.sidePanel.pinned;
     document.autoLowerGsplatQualityWhileNavigating =
         runtimeState.projectSettings.autoLowerGsplatQualityWhileNavigating;
+    document.pointCloudPreviewLodMode = runtimeState.projectSettings.pointCloudPreviewLodMode;
+    document.interactivePointCap = runtimeState.projectSettings.interactivePointCap;
+    document.cameraState = runtimeState.camera.CaptureState();
+    document.cameraShots = runtimeState.cameraShots;
+    document.cameraPathShotIndices = runtimeState.cameraPanel.pathShotIndices;
+    document.cameraPathDurationFrames = runtimeState.cameraPanel.pathDurationFrames;
+    document.lastAnimationPath = runtimeState.animationPanel.currentFilePath;
+    document.renderJobSettings = runtimeState.renderSettings;
 
     if (runtimeState.selectedSessionIndex.has_value()) {
         document.selectedLayerPath =
@@ -1155,6 +2083,30 @@ void StartQueuedLayerLoadIfIdle(PreviewRuntimeState* runtimeState) {
     BeginLayerLoad(nextSessionIndex, runtimeState);
 }
 
+void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    runtimeState->persistence.queuedLoadIndices.clear();
+    if (runtimeState->offlineRenderJob.active) {
+        std::cout << "Requesting animation export shutdown..." << std::endl;
+        runtimeState->offlineRenderJob.cancelRequested = true;
+        RequestAnimationExportWriterCancellation(&runtimeState->offlineRenderJob);
+        if (runtimeState->offlineRenderJob.worker.joinable()) {
+            runtimeState->offlineRenderJob.worker = std::jthread{};
+        }
+    }
+
+    if (!runtimeState->pendingLoad.has_value()) {
+        return;
+    }
+
+    std::cout << "Waiting for background layer load to finish before shutdown..." << std::endl;
+    runtimeState->pendingLoad->backgroundThread.request_stop();
+    runtimeState->pendingLoad.reset();
+}
+
 bool ApplyProjectDocumentToRuntime(
     const ProjectDocument& document,
     PreviewRuntimeState* runtimeState,
@@ -1172,7 +2124,45 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
     runtimeState->projectSettings.autoLowerGsplatQualityWhileNavigating =
         document.autoLowerGsplatQualityWhileNavigating;
+    runtimeState->projectSettings.pointCloudPreviewLodMode = document.pointCloudPreviewLodMode;
+    runtimeState->projectSettings.interactivePointCap = document.interactivePointCap;
+    auto renderSettings = document.renderJobSettings;
+    if (renderSettings.outputDirectory.empty() && !runtimeState->renderSettings.outputDirectory.empty()) {
+        renderSettings.outputDirectory = runtimeState->renderSettings.outputDirectory;
+    }
+    runtimeState->renderSettings = renderSettings;
+    runtimeState->cameraShots = document.cameraShots;
+    runtimeState->cameraPanel.selectedShotIndex.reset();
+    runtimeState->cameraPanel.blendFromIndex.reset();
+    runtimeState->cameraPanel.blendToIndex.reset();
+    runtimeState->cameraPanel.pathShotIndices = document.cameraPathShotIndices;
+    runtimeState->cameraPanel.selectedPathItemIndex.reset();
+    runtimeState->cameraPanel.pathDurationFrames =
+        std::max<std::uint32_t>(1U, document.cameraPathDurationFrames);
+    runtimeState->animationPanel.currentFilePath = document.lastAnimationPath.string();
+    if (runtimeState->cameraPanel.pathShotIndices.empty() &&
+        document.schemaVersion < 9U &&
+        !runtimeState->cameraShots.empty()) {
+        runtimeState->cameraPanel.pathShotIndices.reserve(runtimeState->cameraShots.size());
+        for (std::size_t index = 0; index < runtimeState->cameraShots.size(); ++index) {
+            runtimeState->cameraPanel.pathShotIndices.push_back(index);
+        }
+        std::uint32_t legacyDurationFrames = 0U;
+        for (std::size_t index = 1; index < runtimeState->cameraShots.size(); ++index) {
+            legacyDurationFrames += std::max<std::uint32_t>(1U, runtimeState->cameraShots[index].durationFrames);
+        }
+        runtimeState->cameraPanel.pathDurationFrames = std::max<std::uint32_t>(1U, legacyDurationFrames);
+    }
+    runtimeState->cameraPlayback.active = false;
+    if (!runtimeState->cameraShots.empty()) {
+        runtimeState->cameraPanel.selectedShotIndex = 0;
+        runtimeState->cameraPanel.blendFromIndex = 0;
+        runtimeState->cameraPanel.blendToIndex = runtimeState->cameraShots.size() > 1 ? 1U : 0U;
+    }
+    EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
     runtimeState->persistence.queuedLoadIndices.clear();
+    const bool hasProjectCamera = document.cameraState.has_value();
+    bool requestedLoadedLayer = false;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
         auto& session = runtimeState->sessions[sessionIndex];
@@ -1193,9 +2183,8 @@ bool ApplyProjectDocumentToRuntime(
         }
 
         if (session.kind == LayerKind::PointCloud && layerIt->pointBudgetActivePoints > 0) {
-            session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
-                session.totalPrimitives == 0 ? layerIt->pointBudgetActivePoints : session.totalPrimitives,
-                layerIt->pointBudgetActivePoints);
+            session.pointBudget = MakePreviewPointBudgetState(session, layerIt->pointBudgetActivePoints);
+            ClearPreviewLodSampleCache(&session);
             if (session.loaded) {
                 viewport->UpdatePointBudget(sessionIndex, session.pointBudget.sampledIndices);
             }
@@ -1203,6 +2192,7 @@ bool ApplyProjectDocumentToRuntime(
 
         SanitizePointCloudStyle(&session);
 
+        requestedLoadedLayer |= layerIt->loaded;
         if (!layerIt->loaded) {
             UnloadLayerByIndex(runtimeState, viewport, sessionIndex);
             continue;
@@ -1221,10 +2211,17 @@ bool ApplyProjectDocumentToRuntime(
 
     if (runtimeState->selectedSessionIndex.has_value()) {
         const auto selectedIndex = runtimeState->selectedSessionIndex.value();
-        if (runtimeState->sessions[selectedIndex].loaded) {
+        if (runtimeState->sessions[selectedIndex].loaded && !hasProjectCamera) {
             FocusSessionLayer(runtimeState, *viewport, selectedIndex);
         }
     }
+
+    if (hasProjectCamera) {
+        runtimeState->camera.ApplyState(document.cameraState.value());
+        SyncPivotOverlayToCamera(runtimeState);
+    }
+    runtimeState->preserveProjectCameraOnNextLayerActivation =
+        hasProjectCamera && requestedLoadedLayer && VisibleLayerCount(*runtimeState) == 0;
 
     runtimeState->statusMessage =
         "Loaded project with " + FormatPointCount(document.layers.size()) + " layer settings.";
@@ -1247,6 +2244,1480 @@ void UnloadSelectedLayer(
     UnloadLayerByIndex(runtimeState, viewport, runtimeState->selectedSessionIndex.value());
     runtimeState->statusMessage = "Unloaded " + session.displayName + ".";
     runtimeState->errorMessage.clear();
+}
+
+void EnsureCameraShotSelections(CameraPanelState* panelState, std::size_t shotCount) {
+    if (panelState == nullptr) {
+        return;
+    }
+
+    const auto validIndex = [shotCount](const std::optional<std::size_t>& index) {
+        return index.has_value() && index.value() < shotCount;
+    };
+
+    if (!validIndex(panelState->selectedShotIndex)) {
+        panelState->selectedShotIndex = shotCount > 0 ? std::optional<std::size_t>{0} : std::nullopt;
+    }
+    if (!validIndex(panelState->blendFromIndex)) {
+        panelState->blendFromIndex = shotCount > 0 ? std::optional<std::size_t>{0} : std::nullopt;
+    }
+    if (!validIndex(panelState->blendToIndex)) {
+        panelState->blendToIndex =
+            shotCount > 1 ? std::optional<std::size_t>{1} : panelState->blendFromIndex;
+    }
+
+    panelState->pathShotIndices.erase(
+        std::remove_if(
+            panelState->pathShotIndices.begin(),
+            panelState->pathShotIndices.end(),
+            [shotCount](std::size_t index) {
+                return index >= shotCount;
+            }),
+        panelState->pathShotIndices.end());
+
+    if (panelState->selectedPathItemIndex.has_value() &&
+        panelState->selectedPathItemIndex.value() >= panelState->pathShotIndices.size()) {
+        panelState->selectedPathItemIndex = panelState->pathShotIndices.empty()
+                                                ? std::nullopt
+                                                : std::optional<std::size_t>{panelState->pathShotIndices.size() - 1U};
+    }
+
+    const auto minimumDurationFrames = panelState->pathShotIndices.size() > 1U
+                                           ? static_cast<std::uint32_t>(panelState->pathShotIndices.size() - 1U)
+                                           : 1U;
+    panelState->pathDurationFrames = std::max(panelState->pathDurationFrames, minimumDurationFrames);
+}
+
+void RemoveCameraShotFromPath(CameraPanelState* panelState, std::size_t deletedShotIndex) {
+    if (panelState == nullptr) {
+        return;
+    }
+
+    std::vector<std::size_t> adjustedPath;
+    adjustedPath.reserve(panelState->pathShotIndices.size());
+    for (const auto shotIndex : panelState->pathShotIndices) {
+        if (shotIndex == deletedShotIndex) {
+            continue;
+        }
+        adjustedPath.push_back(shotIndex > deletedShotIndex ? shotIndex - 1U : shotIndex);
+    }
+    panelState->pathShotIndices = std::move(adjustedPath);
+}
+
+void MoveCameraPathItem(std::vector<std::size_t>* pathShotIndices, std::size_t fromIndex, std::size_t toIndex) {
+    if (pathShotIndices == nullptr ||
+        fromIndex >= pathShotIndices->size() ||
+        toIndex >= pathShotIndices->size() ||
+        fromIndex == toIndex) {
+        return;
+    }
+
+    const auto shotIndex = (*pathShotIndices)[fromIndex];
+    pathShotIndices->erase(pathShotIndices->begin() + static_cast<std::ptrdiff_t>(fromIndex));
+    const auto insertIndex = std::min(toIndex, pathShotIndices->size());
+    pathShotIndices->insert(pathShotIndices->begin() + static_cast<std::ptrdiff_t>(insertIndex), shotIndex);
+}
+
+std::vector<CameraShot> BuildOrderedCameraPathShots(
+    const std::vector<CameraShot>& savedShots,
+    const std::vector<std::size_t>& pathShotIndices,
+    std::uint32_t totalDurationFrames) {
+    std::vector<CameraShot> orderedShots;
+    orderedShots.reserve(pathShotIndices.size());
+    for (const auto shotIndex : pathShotIndices) {
+        if (shotIndex < savedShots.size()) {
+            orderedShots.push_back(savedShots[shotIndex]);
+        }
+    }
+    return invisible_places::camera::BuildWeightedCameraPathShots(orderedShots, totalDurationFrames);
+}
+
+std::vector<CameraShot> BuildPanelCameraPathShots(const PreviewRuntimeState& runtimeState) {
+    return BuildOrderedCameraPathShots(
+        runtimeState.cameraShots,
+        runtimeState.cameraPanel.pathShotIndices,
+        runtimeState.cameraPanel.pathDurationFrames);
+}
+
+std::filesystem::path AnimationDirectory(const PreviewRuntimeState& runtimeState) {
+    return runtimeState.persistence.animationDirectoryPath.empty()
+               ? std::filesystem::path{"Saved/animations"}
+               : std::filesystem::path{runtimeState.persistence.animationDirectoryPath};
+}
+
+std::string SanitizeAnimationFileStem(std::string name) {
+    if (name.empty()) {
+        name = "Animation";
+    }
+
+    std::string stem;
+    stem.reserve(name.size());
+    bool previousWasSeparator = false;
+    for (const auto character : name) {
+        const auto unsignedCharacter = static_cast<unsigned char>(character);
+        if (std::isalnum(unsignedCharacter)) {
+            stem.push_back(character);
+            previousWasSeparator = false;
+        } else if (!previousWasSeparator) {
+            stem.push_back('_');
+            previousWasSeparator = true;
+        }
+    }
+
+    while (!stem.empty() && stem.back() == '_') {
+        stem.pop_back();
+    }
+    return stem.empty() ? std::string{"Animation"} : stem;
+}
+
+std::filesystem::path AnimationFilePathForName(
+    const PreviewRuntimeState& runtimeState,
+    const std::string& animationName) {
+    return AnimationDirectory(runtimeState) / (SanitizeAnimationFileStem(animationName) + ".ipanim.json");
+}
+
+std::filesystem::path DefaultAnimationMp4Path(const PreviewRuntimeState& runtimeState) {
+    const auto animationName =
+        runtimeState.animationPanel.currentPath.has_value()
+            ? runtimeState.animationPanel.currentPath->name
+            : runtimeState.animationPanel.draftAnimationName;
+    const auto outputDirectory = runtimeState.renderSettings.outputDirectory.empty()
+                                     ? DefaultRenderOutputDirectory(std::filesystem::path{})
+                                     : std::filesystem::path{runtimeState.renderSettings.outputDirectory};
+    return outputDirectory / (SanitizeAnimationFileStem(animationName) + ".mp4");
+}
+
+bool IsMp4Extension(const std::filesystem::path& path) {
+    auto extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return extension == ".mp4";
+}
+
+std::filesystem::path AnimationMp4OutputPath(const PreviewRuntimeState& runtimeState) {
+    const auto outputDirectory = runtimeState.renderSettings.outputDirectory.empty()
+                                     ? DefaultRenderOutputDirectory(std::filesystem::path{})
+                                     : std::filesystem::path{runtimeState.renderSettings.outputDirectory};
+    auto outputPath = DefaultAnimationMp4Path(runtimeState);
+    if (!runtimeState.animationPanel.mp4OutputPath.empty()) {
+        const auto requestedPath = std::filesystem::path{runtimeState.animationPanel.mp4OutputPath};
+        outputPath = requestedPath.is_absolute() ? requestedPath : outputDirectory / requestedPath;
+    }
+
+    if (!IsMp4Extension(outputPath)) {
+        if (outputPath.has_extension()) {
+            outputPath.replace_extension(".mp4");
+        } else {
+            outputPath += ".mp4";
+        }
+    }
+    return outputPath;
+}
+
+void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesystem::path& animationDirectory) {
+    if (panelState == nullptr) {
+        return;
+    }
+
+    panelState->availableFiles.clear();
+    std::error_code createError;
+    std::filesystem::create_directories(animationDirectory, createError);
+    if (createError) {
+        return;
+    }
+
+    std::error_code iterateError;
+    for (const auto& entry : std::filesystem::directory_iterator{animationDirectory, iterateError}) {
+        if (iterateError) {
+            break;
+        }
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const auto path = entry.path();
+        if (path.filename().string().ends_with(".ipanim.json")) {
+            panelState->availableFiles.push_back(path);
+        }
+    }
+    std::sort(panelState->availableFiles.begin(), panelState->availableFiles.end());
+    if (panelState->selectedFileIndex.has_value() &&
+        panelState->selectedFileIndex.value() >= panelState->availableFiles.size()) {
+        panelState->selectedFileIndex = panelState->availableFiles.empty()
+                                            ? std::nullopt
+                                            : std::optional<std::size_t>{panelState->availableFiles.size() - 1U};
+    }
+}
+
+float AnimationDurationSeconds(const AnimationPath& path) {
+    const auto minimumFrames = path.keys.size() > 1U
+                                   ? static_cast<std::uint32_t>(path.keys.size() - 1U)
+                                   : 1U;
+    return static_cast<float>(std::max(path.durationFrames, minimumFrames)) / 30.0F;
+}
+
+void ApplyAnimationEvaluation(PreviewRuntimeState* runtimeState, const AnimationPath& path, float amount) {
+    if (runtimeState == nullptr || path.keys.size() < 2U) {
+        return;
+    }
+
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        path,
+        AnimationDurationSeconds(path) * std::clamp(amount, 0.0F, 1.0F));
+    runtimeState->camera.ApplyState(evaluation.camera);
+    runtimeState->pivotOverlay.visible = true;
+    runtimeState->pivotOverlay.pivot = FromGlm(glm::vec3{
+        evaluation.focusPoint[0],
+        evaluation.focusPoint[1],
+        evaluation.focusPoint[2]});
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+}
+
+bool SaveAnimationPathToFile(
+    PreviewRuntimeState* runtimeState,
+    const AnimationPath& path,
+    const std::filesystem::path& outputPath) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    std::string errorMessage;
+    if (!invisible_places::serialization::SaveAnimationPath(path, outputPath, &errorMessage)) {
+        runtimeState->errorMessage = errorMessage.empty() ? "Failed to save animation path." : errorMessage;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const bool savingCurrentPath =
+        runtimeState->animationPanel.currentPath.has_value() &&
+        &path == &runtimeState->animationPanel.currentPath.value();
+    if (!savingCurrentPath) {
+        runtimeState->animationPanel.currentPath = path;
+    }
+    runtimeState->animationPanel.currentFilePath = outputPath.string();
+    runtimeState->animationPanel.draftAnimationName = path.name;
+    runtimeState->animationPanel.dirty = false;
+    RefreshAnimationFileList(&runtimeState->animationPanel, AnimationDirectory(*runtimeState));
+    runtimeState->statusMessage = "Saved animation path: " + outputPath.filename().string() + ".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::filesystem::path& inputPath) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    std::string errorMessage;
+    const auto path = invisible_places::serialization::LoadAnimationPath(inputPath, &errorMessage);
+    if (!path.has_value()) {
+        runtimeState->errorMessage = errorMessage.empty() ? "Failed to load animation path." : errorMessage;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    runtimeState->animationPanel.currentPath = path.value();
+    runtimeState->animationPanel.currentFilePath = inputPath.string();
+    runtimeState->animationPanel.draftAnimationName = path->name;
+    runtimeState->animationPanel.selectedKeyIndex = path->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
+    runtimeState->animationPanel.scrubAmount = 0.0F;
+    runtimeState->animationPanel.dirty = false;
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+    ApplyAnimationEvaluation(runtimeState, runtimeState->animationPanel.currentPath.value(), 0.0F);
+    runtimeState->statusMessage = "Loaded animation path: " + inputPath.filename().string() + ".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void SaveCurrentCameraPathAsAnimation(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    const auto pathShots = BuildPanelCameraPathShots(*runtimeState);
+    if (pathShots.size() < 2U) {
+        runtimeState->errorMessage = "Add at least two camera path entries before saving an animation.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    auto animationPath = invisible_places::camera::BuildAnimationPathFromCameraShots(
+        runtimeState->animationPanel.draftAnimationName,
+        pathShots,
+        runtimeState->cameraPanel.pathDurationFrames,
+        runtimeState->animationPanel.currentPath.has_value()
+            ? runtimeState->animationPanel.currentPath->apertureFStops
+            : 8.0F);
+    const auto outputPath = AnimationFilePathForName(*runtimeState, animationPath.name);
+    SaveAnimationPathToFile(runtimeState, animationPath, outputPath);
+}
+
+void ApplyAnimationScrub(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+
+    ApplyAnimationEvaluation(
+        runtimeState,
+        runtimeState->animationPanel.currentPath.value(),
+        runtimeState->animationPanel.scrubAmount);
+    runtimeState->animationPlayback.active = false;
+    runtimeState->cameraPlayback.active = false;
+}
+
+void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+
+    const auto& path = runtimeState->animationPanel.currentPath.value();
+    if (path.keys.size() < 2U) {
+        runtimeState->errorMessage = "Load an animation with at least two keys before playback.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    runtimeState->animationPlayback = {
+        .active = true,
+        .path = path,
+        .durationSeconds = AnimationDurationSeconds(path),
+        .startedAt = std::chrono::steady_clock::now(),
+    };
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->statusMessage = "Playing animation path.";
+    runtimeState->errorMessage.clear();
+}
+
+void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->animationPlayback.active) {
+        return;
+    }
+
+    const auto& playback = runtimeState->animationPlayback;
+    const float elapsedSeconds =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - playback.startedAt).count();
+    const float t = std::clamp(elapsedSeconds / std::max(0.001F, playback.durationSeconds), 0.0F, 1.0F);
+    runtimeState->animationPanel.scrubAmount = t;
+    ApplyAnimationEvaluation(runtimeState, playback.path, t);
+
+    if (t >= 1.0F) {
+        runtimeState->animationPlayback.active = false;
+        runtimeState->statusMessage = "Animation playback complete.";
+    }
+}
+
+std::string NextCameraShotName(const PreviewRuntimeState& runtimeState) {
+    return "Shot " + std::to_string(runtimeState.cameraShots.size() + 1U);
+}
+
+void SaveCurrentCameraShot(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    CameraShot shot;
+    shot.name = runtimeState->cameraPanel.draftShotName.empty()
+                    ? NextCameraShotName(*runtimeState)
+                    : runtimeState->cameraPanel.draftShotName;
+    shot.durationFrames = std::max<std::uint32_t>(1U, runtimeState->cameraPanel.defaultDurationFrames);
+    shot.state = runtimeState->camera.CaptureState();
+    const auto savedDurationFrames = shot.durationFrames;
+    runtimeState->cameraShots.push_back(std::move(shot));
+
+    const auto savedIndex = runtimeState->cameraShots.size() - 1U;
+    const bool appendAddsSegment = !runtimeState->cameraPanel.pathShotIndices.empty();
+    runtimeState->cameraPanel.selectedShotIndex = savedIndex;
+    runtimeState->cameraPanel.pathShotIndices.push_back(savedIndex);
+    runtimeState->cameraPanel.selectedPathItemIndex = runtimeState->cameraPanel.pathShotIndices.size() - 1U;
+    if (appendAddsSegment) {
+        runtimeState->cameraPanel.pathDurationFrames = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            std::numeric_limits<std::uint32_t>::max(),
+            static_cast<std::uint64_t>(runtimeState->cameraPanel.pathDurationFrames) + savedDurationFrames));
+    }
+    if (!runtimeState->cameraPanel.blendFromIndex.has_value()) {
+        runtimeState->cameraPanel.blendFromIndex = savedIndex;
+    } else {
+        runtimeState->cameraPanel.blendToIndex = savedIndex;
+    }
+    runtimeState->cameraPanel.draftShotName = NextCameraShotName(*runtimeState);
+    runtimeState->statusMessage = "Saved camera position.";
+    runtimeState->errorMessage.clear();
+}
+
+void ApplyCameraShot(PreviewRuntimeState* runtimeState, std::size_t shotIndex) {
+    if (runtimeState == nullptr || shotIndex >= runtimeState->cameraShots.size()) {
+        return;
+    }
+
+    runtimeState->camera.ApplyState(runtimeState->cameraShots[shotIndex].state);
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->cameraPanel.selectedShotIndex = shotIndex;
+    runtimeState->statusMessage = "Loaded camera shot " + runtimeState->cameraShots[shotIndex].name + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void ApplyCameraBlend(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    const auto pathShots = BuildPanelCameraPathShots(*runtimeState);
+    if (pathShots.size() < 2U) {
+        return;
+    }
+
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(
+        pathShots,
+        0,
+        pathShots.size() - 1U);
+    if (!timing.IsValid()) {
+        return;
+    }
+
+    const float timeSeconds =
+        timing.DurationSeconds() * std::clamp(runtimeState->cameraPanel.blendAmount, 0.0F, 1.0F);
+    runtimeState->camera.ApplyState(invisible_places::camera::EvaluateCameraPath(
+        pathShots,
+        timing,
+        timeSeconds));
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->animationPlayback.active = false;
+}
+
+void StartCameraPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    const auto pathShots = BuildPanelCameraPathShots(*runtimeState);
+    if (pathShots.size() < 2U) {
+        runtimeState->errorMessage = "Add at least two camera path entries before playback.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(pathShots, 0, pathShots.size() - 1U);
+    if (!timing.IsValid()) {
+        runtimeState->errorMessage = "Add at least two camera path entries before playback.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    runtimeState->cameraPlayback = {
+        .active = true,
+        .pathShotIndices = runtimeState->cameraPanel.pathShotIndices,
+        .durationFrames = runtimeState->cameraPanel.pathDurationFrames,
+        .durationSeconds = timing.DurationSeconds(),
+        .startedAt = std::chrono::steady_clock::now(),
+    };
+    runtimeState->animationPlayback.active = false;
+    runtimeState->statusMessage =
+        "Playing smooth camera path through " + std::to_string(pathShots.size()) + " entries.";
+    runtimeState->errorMessage.clear();
+}
+
+void UpdateCameraShotPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->cameraPlayback.active) {
+        return;
+    }
+
+    const auto& playback = runtimeState->cameraPlayback;
+    const auto pathShots = BuildOrderedCameraPathShots(
+        runtimeState->cameraShots,
+        playback.pathShotIndices,
+        playback.durationFrames);
+    if (pathShots.size() < 2U) {
+        runtimeState->cameraPlayback.active = false;
+        return;
+    }
+
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(pathShots, 0, pathShots.size() - 1U);
+    if (!timing.IsValid()) {
+        runtimeState->cameraPlayback.active = false;
+        return;
+    }
+
+    const float elapsedSeconds =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - playback.startedAt).count();
+    const float t = std::clamp(elapsedSeconds / std::max(0.001F, playback.durationSeconds), 0.0F, 1.0F);
+    runtimeState->cameraPanel.blendAmount = t;
+    runtimeState->camera.ApplyState(invisible_places::camera::EvaluateCameraPath(
+        pathShots,
+        timing,
+        timing.DurationSeconds() * t));
+
+    if (t >= 1.0F) {
+        runtimeState->cameraPlayback.active = false;
+        runtimeState->statusMessage = "Camera path playback complete.";
+    }
+}
+
+std::vector<invisible_places::camera::CameraState> BuildCurrentCameraRenderSequence(
+    const PreviewRuntimeState& runtimeState,
+    const RenderJobSettings& settings) {
+    const auto pathShots = BuildPanelCameraPathShots(runtimeState);
+    if (pathShots.size() < 2U) {
+        return {};
+    }
+
+    auto pathSettings = settings;
+    pathSettings.fromShotIndex = 0;
+    pathSettings.toShotIndex = pathShots.size() - 1U;
+    return invisible_places::output::BuildCameraRenderSequence(pathShots, pathSettings);
+}
+
+std::vector<invisible_places::camera::CameraState> BuildCurrentAnimationRenderSequence(
+    const PreviewRuntimeState& runtimeState,
+    const RenderJobSettings& settings) {
+    if (!runtimeState.animationPanel.currentPath.has_value()) {
+        return {};
+    }
+
+    return invisible_places::output::BuildAnimationRenderSequence(
+        runtimeState.animationPanel.currentPath.value(),
+        settings);
+}
+
+std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
+    const PreviewRuntimeState& runtimeState) {
+    std::vector<OfflinePointLayerSnapshot> layers;
+    for (const auto& session : runtimeState.sessions) {
+        if (!session.loaded ||
+            !session.visible ||
+            session.kind != LayerKind::PointCloud ||
+            session.offlinePointCloud == nullptr) {
+            continue;
+        }
+
+        layers.push_back(
+            {.cloud = session.offlinePointCloud,
+             .style = session.pointStyle,
+             .hasSourceRgb = session.hasSourceRgb,
+             .localToWorld = glm::mat4{1.0F}});
+    }
+    return layers;
+}
+
+std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers(
+    const std::vector<OfflinePointLayerSnapshot>& snapshots) {
+    std::vector<invisible_places::output::OfflinePointLayer> layers;
+    layers.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.cloud == nullptr || snapshot.cloud->positions.empty()) {
+            continue;
+        }
+
+        layers.push_back(
+            {.cloud = snapshot.cloud.get(),
+             .style = snapshot.style,
+             .hasSourceRgb = snapshot.hasSourceRgb,
+             .localToWorld = snapshot.localToWorld});
+    }
+    return layers;
+}
+
+bool HasOfflinePointLayers(const PreviewRuntimeState& runtimeState) {
+    return std::any_of(
+        runtimeState.sessions.begin(),
+        runtimeState.sessions.end(),
+        [](const PreviewLayerSession& session) {
+            return session.loaded &&
+                   session.visible &&
+                   session.kind == LayerKind::PointCloud &&
+                   session.offlinePointCloud != nullptr &&
+                   !session.offlinePointCloud->positions.empty();
+        });
+}
+
+std::uint64_t EffectiveAnimationExportPointDrawCount(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    bool previewDensity) {
+    if (!previewDensity) {
+        return session.totalPrimitives;
+    }
+
+    const auto decision = invisible_places::renderer::pointcloud::ResolvePointCloudPreviewLod(
+        session.pointBudget,
+        runtimeState.projectSettings.pointCloudPreviewLodMode,
+        false,
+        true,
+        kPointCloudPreviewLodTarget);
+    if (!decision.usesPreviewLod) {
+        return decision.drawPointCount;
+    }
+
+    if (session.previewLodSampledDrawCount == 0) {
+        return session.pointBudget.activePoints;
+    }
+
+    return std::min<std::uint64_t>(
+        session.previewLodSampledDrawCount,
+        decision.drawPointCount);
+}
+
+std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState>
+BuildAnimationExportPointCloudLayerSnapshot(
+    const PreviewRuntimeState& runtimeState,
+    bool previewDensity) {
+    std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> layers;
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!session.loaded ||
+            !session.visible ||
+            session.kind != LayerKind::PointCloud ||
+            session.totalPrimitives == 0) {
+            continue;
+        }
+
+        const auto drawPointCount = EffectiveAnimationExportPointDrawCount(
+            runtimeState,
+            session,
+            previewDensity);
+        layers.push_back(
+            {.layerId = sessionIndex,
+             .style = session.pointStyle,
+             .hasSourceRgb = session.hasSourceRgb,
+             .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                 drawPointCount,
+                 std::numeric_limits<std::uint32_t>::max()))});
+    }
+    return layers;
+}
+
+invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState(
+    const OfflineRenderJobState& job,
+    const invisible_places::camera::CameraState& cameraState,
+    std::uint32_t width,
+    std::uint32_t height) {
+    invisible_places::renderer::core::SceneRenderState renderState;
+    invisible_places::camera::OrbitCamera camera;
+    camera.ApplyState(cameraState);
+    const float aspectRatio =
+        static_cast<float>(std::max<std::uint32_t>(1U, width)) /
+        static_cast<float>(std::max<std::uint32_t>(1U, height));
+    const auto matrices = camera.Matrices(aspectRatio);
+
+    renderState.view = matrices.view;
+    renderState.projection = matrices.projection;
+    renderState.viewProjection = matrices.viewProjection;
+    renderState.cameraPosition = matrices.position;
+    renderState.backgroundColor = job.exportBackgroundColor;
+    renderState.nearPlane = camera.NearPlane();
+    renderState.farPlane = camera.FarPlane();
+    renderState.hasDepthOfField = cameraState.hasDepthOfField;
+    renderState.focusDistance = cameraState.focusDistance;
+    renderState.apertureFStops = cameraState.apertureFStops;
+    renderState.gaussianSplatFootprintBoost = job.exportGaussianSplatFootprintBoost;
+    renderState.pointSizeScale = invisible_places::output::ComputePointSizePixelScale(
+        width,
+        height,
+        job.setupViewportWidth,
+        job.setupViewportHeight);
+    renderState.pointCloudLayers = job.exportPointCloudLayers;
+
+    return renderState;
+}
+
+std::string FormatElapsedTime(std::chrono::steady_clock::duration elapsed) {
+    const auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    const auto minutes = totalSeconds / 60;
+    const auto seconds = totalSeconds % 60;
+    std::ostringstream output;
+    output << minutes << "m " << seconds << "s";
+    return output.str();
+}
+
+void UpdateOfflineRenderProgress(
+    const std::shared_ptr<OfflineRenderProgressState>& progress,
+    std::uint32_t frame,
+    std::uint32_t tile,
+    const std::filesystem::path& lastOutputPath = {}) {
+    if (progress == nullptr) {
+        return;
+    }
+
+    std::scoped_lock lock(progress->mutex);
+    progress->currentFrame = frame;
+    progress->currentTile = tile;
+    if (!lastOutputPath.empty()) {
+        progress->lastOutputPath = lastOutputPath;
+    }
+}
+
+bool OfflineRenderCancellationRequested(
+    const std::shared_ptr<OfflineRenderProgressState>& progress,
+    const std::stop_token& stopToken) {
+    if (stopToken.stop_requested()) {
+        return true;
+    }
+    if (progress == nullptr) {
+        return false;
+    }
+
+    std::scoped_lock lock(progress->mutex);
+    return progress->cancelRequested;
+}
+
+void CompleteOfflineRenderProgress(
+    const std::shared_ptr<OfflineRenderProgressState>& progress,
+    const std::string& statusMessage,
+    const std::string& errorMessage = {}) {
+    if (progress == nullptr) {
+        return;
+    }
+
+    std::scoped_lock lock(progress->mutex);
+    progress->completed = true;
+    progress->statusMessage = statusMessage;
+    progress->errorMessage = errorMessage;
+}
+
+void RunOfflineRenderWorker(
+    std::stop_token stopToken,
+    RenderJobSettings settings,
+    std::vector<invisible_places::camera::CameraState> frames,
+    std::vector<invisible_places::output::OfflineRenderTile> tiles,
+    std::vector<OfflinePointLayerSnapshot> layerSnapshots,
+    std::shared_ptr<OfflineRenderProgressState> progress) {
+    try {
+        const auto offlineLayers = BuildOfflinePointLayers(layerSnapshots);
+        if (offlineLayers.empty()) {
+            CompleteOfflineRenderProgress(progress, {}, "No visible loaded LiDAR layers are available for rendering.");
+            return;
+        }
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, settings.width, settings.height);
+
+        for (std::uint32_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex) {
+            for (std::uint32_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex) {
+                if (OfflineRenderCancellationRequested(progress, stopToken)) {
+                    CompleteOfflineRenderProgress(progress, "EXR render cancelled.");
+                    return;
+                }
+
+                UpdateOfflineRenderProgress(progress, frameIndex, tileIndex);
+                invisible_places::output::RenderPointCloudTile(
+                    offlineLayers,
+                    frames[frameIndex],
+                    tiles[tileIndex],
+                    &image);
+                UpdateOfflineRenderProgress(progress, frameIndex, tileIndex + 1U);
+            }
+
+            const auto outputFrameIndex = settings.startFrame + frameIndex;
+            const auto outputPath = invisible_places::output::RenderFramePath(settings, outputFrameIndex);
+            std::string errorMessage;
+            if (!invisible_places::output::WriteExrImage(image, outputPath, &errorMessage)) {
+                CompleteOfflineRenderProgress(progress, {}, errorMessage);
+                return;
+            }
+            UpdateOfflineRenderProgress(progress, frameIndex + 1U, 0U, outputPath);
+
+            if (OfflineRenderCancellationRequested(progress, stopToken)) {
+                CompleteOfflineRenderProgress(progress, "EXR render cancelled after " + outputPath.string() + ".");
+                return;
+            }
+
+            if (frameIndex + 1U < frames.size()) {
+                invisible_places::output::InitializeExrImage(&image, settings.width, settings.height);
+            }
+        }
+    } catch (const std::exception& error) {
+        CompleteOfflineRenderProgress(progress, {}, "EXR render failed: " + std::string{error.what()});
+        return;
+    }
+
+    CompleteOfflineRenderProgress(progress, "EXR stack complete: " + settings.outputDirectory + ".");
+}
+
+void CompleteAnimationExportWriter(
+    const std::shared_ptr<AnimationExportWriterState>& writerState,
+    const std::string& statusMessage,
+    const std::string& errorMessage = {}) {
+    if (writerState == nullptr) {
+        return;
+    }
+
+    {
+        std::scoped_lock lock(writerState->mutex);
+        writerState->acceptingFrames = false;
+        writerState->completed = true;
+        writerState->statusMessage = statusMessage;
+        writerState->errorMessage = errorMessage;
+    }
+    writerState->condition.notify_all();
+}
+
+void RequestAnimationExportWriterCancellation(OfflineRenderJobState* job) {
+    if (job == nullptr || job->writerState == nullptr) {
+        return;
+    }
+
+    {
+        std::scoped_lock lock(job->writerState->mutex);
+        job->writerState->cancelRequested = true;
+        job->writerState->acceptingFrames = false;
+    }
+    job->writerState->condition.notify_all();
+    if (job->worker.joinable()) {
+        job->worker.request_stop();
+    }
+}
+
+void SignalAnimationExportWriterFinish(OfflineRenderJobState* job) {
+    if (job == nullptr || job->writerState == nullptr || job->writerFinishRequested) {
+        return;
+    }
+
+    {
+        std::scoped_lock lock(job->writerState->mutex);
+        job->writerState->finishRequested = true;
+        job->writerState->acceptingFrames = false;
+    }
+    job->writerFinishRequested = true;
+    job->writerState->condition.notify_all();
+}
+
+bool AnimationExportWriterCanAcceptFrame(const OfflineRenderJobState& job) {
+    constexpr std::size_t kMaxQueuedExportFrames = 2U;
+    if (job.writerState == nullptr) {
+        return false;
+    }
+
+    std::scoped_lock lock(job.writerState->mutex);
+    return job.writerState->acceptingFrames &&
+           !job.writerState->cancelRequested &&
+           !job.writerState->completed &&
+           job.writerState->errorMessage.empty() &&
+           job.writerState->pendingFrames.size() < kMaxQueuedExportFrames;
+}
+
+bool QueueAnimationExportFrame(
+    OfflineRenderJobState* job,
+    std::uint32_t outputFrameIndex,
+    invisible_places::output::HalfRgbaExrImage image) {
+    if (job == nullptr || job->writerState == nullptr) {
+        return false;
+    }
+
+    {
+        std::scoped_lock lock(job->writerState->mutex);
+        if (!job->writerState->acceptingFrames ||
+            job->writerState->cancelRequested ||
+            job->writerState->completed ||
+            !job->writerState->errorMessage.empty()) {
+            return false;
+        }
+
+        job->writerState->pendingFrames.push_back(
+            {.outputFrameIndex = outputFrameIndex,
+             .image = std::move(image)});
+    }
+    job->writerState->condition.notify_one();
+    return true;
+}
+
+void RefreshAnimationExportWriterProgress(OfflineRenderJobState* job) {
+    if (job == nullptr || job->writerState == nullptr) {
+        return;
+    }
+
+    std::scoped_lock lock(job->writerState->mutex);
+    job->writtenFrameCount = job->writerState->writtenFrames;
+    job->pendingFrameCount = job->writerState->pendingFrames.size();
+    if (!job->writerState->lastOutputPath.empty()) {
+        job->lastOutputPath = job->writerState->lastOutputPath;
+    }
+}
+
+std::string CloseAnimationExportVideoPipe(FILE** videoPipe, const std::filesystem::path& outputPath) {
+    if (videoPipe == nullptr || *videoPipe == nullptr) {
+        return {};
+    }
+
+    const int closeStatus = ::pclose(*videoPipe);
+    *videoPipe = nullptr;
+    if (closeStatus != 0) {
+        return "ffmpeg failed while writing " + outputPath.string() +
+               " (status " + std::to_string(closeStatus) + ").";
+    }
+    return {};
+}
+
+void RunAnimationExportWriter(
+    std::stop_token stopToken,
+    invisible_places::output::AnimationExportMode mode,
+    RenderJobSettings settings,
+    std::filesystem::path videoOutputPath,
+    std::uint32_t totalFrames,
+    std::shared_ptr<AnimationExportWriterState> writerState) {
+    FILE* videoPipe = nullptr;
+    try {
+        if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+            const auto command = invisible_places::output::BuildFfmpegRawRgbaCommand(
+                invisible_places::output::DefaultFfmpegExecutablePath(),
+                settings.width,
+                settings.height,
+                settings.framesPerSecond,
+                videoOutputPath);
+            videoPipe = ::popen(command.c_str(), "w");
+            if (videoPipe == nullptr) {
+                CompleteAnimationExportWriter(
+                    writerState,
+                    {},
+                    "Failed to start ffmpeg for Fast Preview MP4 export.");
+                return;
+            }
+        }
+
+        while (true) {
+            AnimationExportFramePayload payload;
+            bool hasPayload = false;
+            {
+                std::unique_lock lock(writerState->mutex);
+                writerState->condition.wait(lock, [&]() {
+                    return stopToken.stop_requested() ||
+                           writerState->cancelRequested ||
+                           !writerState->pendingFrames.empty() ||
+                           writerState->finishRequested;
+                });
+
+                if (stopToken.stop_requested() || writerState->cancelRequested) {
+                    writerState->pendingFrames.clear();
+                    lock.unlock();
+                    const auto closeError = CloseAnimationExportVideoPipe(&videoPipe, videoOutputPath);
+                    CompleteAnimationExportWriter(
+                        writerState,
+                        closeError.empty() ? "Animation export cancelled." : std::string{},
+                        closeError);
+                    return;
+                }
+
+                if (!writerState->pendingFrames.empty()) {
+                    payload = std::move(writerState->pendingFrames.front());
+                    writerState->pendingFrames.pop_front();
+                    hasPayload = true;
+                } else if (writerState->finishRequested) {
+                    break;
+                }
+            }
+
+            if (!hasPayload) {
+                continue;
+            }
+
+            std::filesystem::path outputPath;
+            if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+                const auto frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(payload.image);
+                if (frameBytes.empty()) {
+                    CompleteAnimationExportWriter(
+                        writerState,
+                        {},
+                        "GPU readback did not produce a valid MP4 frame.");
+                    return;
+                }
+                const auto written = std::fwrite(frameBytes.data(), 1U, frameBytes.size(), videoPipe);
+                if (written != frameBytes.size()) {
+                    CompleteAnimationExportWriter(
+                        writerState,
+                        {},
+                        "Failed to write raw frame data to ffmpeg.");
+                    return;
+                }
+                outputPath = videoOutputPath;
+            } else {
+                outputPath = invisible_places::output::RenderFramePath(settings, payload.outputFrameIndex);
+                std::string errorMessage;
+                if (!invisible_places::output::WriteExrImage(payload.image, outputPath, &errorMessage)) {
+                    CompleteAnimationExportWriter(writerState, {}, errorMessage);
+                    return;
+                }
+            }
+
+            {
+                std::scoped_lock lock(writerState->mutex);
+                ++writerState->writtenFrames;
+                writerState->lastOutputPath = outputPath;
+                writerState->statusMessage =
+                    "Saved frame " + std::to_string(writerState->writtenFrames) +
+                    " / " + std::to_string(totalFrames) + ".";
+            }
+        }
+
+        const auto closeError = CloseAnimationExportVideoPipe(&videoPipe, videoOutputPath);
+        if (!closeError.empty()) {
+            CompleteAnimationExportWriter(writerState, {}, closeError);
+            return;
+        }
+
+        CompleteAnimationExportWriter(
+            writerState,
+            mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+                ? "Fast Preview MP4 complete: " + videoOutputPath.string() + "."
+                : "HQ preview-density EXR stack complete: " + settings.outputDirectory + ".");
+    } catch (const std::exception& error) {
+        const auto closeError = CloseAnimationExportVideoPipe(&videoPipe, videoOutputPath);
+        CompleteAnimationExportWriter(
+            writerState,
+            {},
+            closeError.empty()
+                ? "Animation export writer failed: " + std::string{error.what()}
+                : closeError);
+    }
+}
+
+void StartAnimationExportJob(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
+        return;
+    }
+
+    auto& settings = runtimeState->renderSettings;
+    settings.width = std::max<std::uint32_t>(1U, settings.width);
+    settings.height = std::max<std::uint32_t>(1U, settings.height);
+    settings.framesPerSecond = std::max<std::uint32_t>(1U, settings.framesPerSecond);
+    settings.tileSize = std::max<std::uint32_t>(1U, settings.tileSize);
+
+    if (settings.outputDirectory.empty()) {
+        settings.outputDirectory = DefaultRenderOutputDirectory(std::filesystem::path{}).string();
+    }
+
+    if (!HasOfflinePointLayers(*runtimeState)) {
+        runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    if (!runtimeState->animationPanel.currentPath.has_value() ||
+        runtimeState->animationPanel.currentPath->keys.size() < 2U) {
+        runtimeState->errorMessage = "Load or save an animation path with at least two keys before exporting.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const bool exportUsesPreviewDensity =
+        runtimeState->animationPanel.exportMode != invisible_places::output::AnimationExportMode::FastPreviewMp4 &&
+        runtimeState->animationPanel.exportPreviewDensity;
+    if (viewport != nullptr && exportUsesPreviewDensity) {
+        PreparePreviewLodSampleCaches(runtimeState, viewport);
+    }
+
+    auto frames = invisible_places::output::BuildAnimationRenderSequence(
+        runtimeState->animationPanel.currentPath.value(),
+        settings);
+    if (frames.empty()) {
+        runtimeState->errorMessage = "Animation path did not produce any output frames.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    std::filesystem::path videoOutputPath;
+    if (runtimeState->animationPanel.exportMode ==
+        invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
+        if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
+            runtimeState->errorMessage =
+                "Fast MP4 export requires ffmpeg at " + ffmpegPath.string() + ".";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+
+        videoOutputPath = AnimationMp4OutputPath(*runtimeState);
+        std::error_code createError;
+        if (!videoOutputPath.parent_path().empty()) {
+            std::filesystem::create_directories(videoOutputPath.parent_path(), createError);
+            if (createError) {
+                runtimeState->errorMessage = "Failed to create MP4 output directory: " + createError.message();
+                runtimeState->statusMessage.clear();
+                return;
+            }
+        }
+
+    }
+
+    auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
+        *runtimeState,
+        exportUsesPreviewDensity);
+    if (exportPointCloudLayers.empty()) {
+        runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const auto setupSize = viewport != nullptr ? CurrentUiViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
+    auto writerState = std::make_shared<AnimationExportWriterState>();
+    runtimeState->offlineRenderJob = {
+        .active = true,
+        .cancelRequested = false,
+        .mode = runtimeState->animationPanel.exportMode,
+        .settings = settings,
+        .frames = std::move(frames),
+        .tiles = {},
+        .currentFrame = 0,
+        .currentTile = 0,
+        .startedAt = std::chrono::steady_clock::now(),
+        .videoOutputPath = videoOutputPath,
+        .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
+        .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
+        .previewDensity = exportUsesPreviewDensity,
+        .exportBackgroundColor = glm::vec4{
+            runtimeState->projectSettings.backgroundColor[0],
+            runtimeState->projectSettings.backgroundColor[1],
+            runtimeState->projectSettings.backgroundColor[2],
+            0.0F,
+        },
+        .exportGaussianSplatFootprintBoost = runtimeState->projectSettings.gaussianSplatFootprintBoost,
+        .exportPointCloudLayers = std::move(exportPointCloudLayers),
+        .writerState = writerState,
+    };
+    runtimeState->offlineRenderJob.worker = std::jthread{
+        RunAnimationExportWriter,
+        runtimeState->offlineRenderJob.mode,
+        runtimeState->offlineRenderJob.settings,
+        runtimeState->offlineRenderJob.videoOutputPath,
+        static_cast<std::uint32_t>(runtimeState->offlineRenderJob.frames.size()),
+        writerState};
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->animationPlayback.active = false;
+    runtimeState->statusMessage =
+        runtimeState->animationPanel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+            ? "Encoding full-cloud Fast MP4..."
+            : "Rendering HQ preview-density EXR stack on GPU...";
+    runtimeState->errorMessage.clear();
+}
+
+void FinishOfflineRenderJob(
+    PreviewRuntimeState* runtimeState,
+    const std::string& statusMessage,
+    const std::string& errorMessage = {}) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    auto finalStatusMessage = statusMessage;
+    auto finalErrorMessage = errorMessage;
+    auto& job = runtimeState->offlineRenderJob;
+    if (job.worker.joinable()) {
+        if (job.writerState != nullptr && !job.writerState->completed) {
+            RequestAnimationExportWriterCancellation(&job);
+        }
+        job.worker = std::jthread{};
+    }
+
+    job.active = false;
+    job.cancelRequested = false;
+    job.writerFinishRequested = false;
+    job.writerState.reset();
+    runtimeState->statusMessage = finalStatusMessage;
+    runtimeState->errorMessage = finalErrorMessage;
+}
+
+void RequestOfflineRenderCancellation(OfflineRenderJobState* job) {
+    if (job == nullptr) {
+        return;
+    }
+
+    job->cancelRequested = true;
+}
+
+void ProcessOfflineRenderJobStep(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || !runtimeState->offlineRenderJob.active) {
+        return;
+    }
+    if (viewport == nullptr) {
+        FinishOfflineRenderJob(runtimeState, {}, "GPU EXR export requires an active Vulkan viewport.");
+        return;
+    }
+
+    auto& job = runtimeState->offlineRenderJob;
+    RefreshAnimationExportWriterProgress(&job);
+    if (job.writerState != nullptr) {
+        bool writerCompleted = false;
+        std::string writerStatus;
+        std::string writerError;
+        {
+            std::scoped_lock lock(job.writerState->mutex);
+            writerCompleted = job.writerState->completed;
+            writerStatus = job.writerState->statusMessage;
+            writerError = job.writerState->errorMessage;
+        }
+        if (writerCompleted) {
+            FinishOfflineRenderJob(runtimeState, writerStatus, writerError);
+            return;
+        }
+    }
+
+    if (job.cancelRequested) {
+        RequestAnimationExportWriterCancellation(&job);
+        runtimeState->statusMessage = "Cancelling animation export...";
+        return;
+    }
+
+    if (job.currentFrame >= job.frames.size()) {
+        SignalAnimationExportWriterFinish(&job);
+        runtimeState->statusMessage = "Finishing animation export writer...";
+        return;
+    }
+
+    if (!AnimationExportWriterCanAcceptFrame(job)) {
+        runtimeState->statusMessage =
+            "Animation export writer is saving queued frames (" +
+            std::to_string(job.writtenFrameCount) + " / " +
+            std::to_string(job.frames.size()) + " written).";
+        return;
+    }
+
+    const auto elapsed = FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt);
+    runtimeState->statusMessage =
+        (job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+             ? "Capturing MP4 frame "
+             : "Capturing HQ EXR frame ") +
+        std::to_string(job.currentFrame + 1U) +
+        " / " + std::to_string(job.frames.size()) + " on GPU (" + elapsed + ").";
+
+    try {
+        const auto renderState = BuildPointCloudExrRenderState(
+            job,
+            job.frames[job.currentFrame],
+            job.settings.width,
+            job.settings.height);
+        if (renderState.pointCloudLayers.empty()) {
+            FinishOfflineRenderJob(runtimeState, {}, "No visible loaded LiDAR layers are available for rendering.");
+            return;
+        }
+
+        const invisible_places::renderer::core::PointCloudExrFrameRequest request{
+            .renderState = renderState,
+            .width = job.settings.width,
+            .height = job.settings.height,
+            .previewDensity = job.previewDensity,
+        };
+        auto image = viewport->RenderPointCloudExrFrame(request);
+        const auto outputFrameIndex = job.settings.startFrame + job.currentFrame;
+        if (!QueueAnimationExportFrame(&job, outputFrameIndex, std::move(image))) {
+            FinishOfflineRenderJob(runtimeState, {}, "Animation export writer stopped accepting frames.");
+            return;
+        }
+        ++job.currentFrame;
+    } catch (const std::exception& error) {
+        FinishOfflineRenderJob(runtimeState, {}, "GPU animation export failed: " + std::string{error.what()});
+        return;
+    }
+
+    if (job.cancelRequested) {
+        RequestAnimationExportWriterCancellation(&job);
+        runtimeState->statusMessage = "Cancelling animation export...";
+        return;
+    }
+
+    if (job.currentFrame >= job.frames.size()) {
+        SignalAnimationExportWriterFinish(&job);
+        return;
+    }
+}
+
+void DrawAnimationExportSection(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    ImGui::SeparatorText("Export");
+    auto& panel = runtimeState->animationPanel;
+    auto& settings = runtimeState->renderSettings;
+    if (!panel.exportSizeInitialized && viewport != nullptr) {
+        const auto viewportSize = CurrentUiViewportSize(*viewport);
+        settings.width = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.x));
+        settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
+        settings.framesPerSecond = 30U;
+        panel.exportSizeInitialized = true;
+    }
+
+    const char* exportModeLabels[] = {
+        "Fast Preview MP4",
+        "HQ Preview-Density EXR",
+    };
+    int exportModeIndex =
+        panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ? 0 : 1;
+    if (ImGui::Combo("Export Mode", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
+        panel.exportMode = exportModeIndex == 0
+                               ? invisible_places::output::AnimationExportMode::FastPreviewMp4
+                               : invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
+    }
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        ImGui::TextDisabled("Fast MP4: full-cloud beauty export, no AOVs.");
+    } else {
+        ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
+    }
+
+    InputTextString("Output Folder", &settings.outputDirectory);
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        InputTextString("MP4 Name/File", &panel.mp4OutputPath);
+        if (panel.mp4OutputPath.empty()) {
+            ImGui::TextDisabled("Default MP4: %s", AnimationMp4OutputPath(*runtimeState).string().c_str());
+        } else {
+            ImGui::TextDisabled("MP4 output: %s", AnimationMp4OutputPath(*runtimeState).string().c_str());
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("A bare name saves inside Output Folder. Absolute paths save exactly there.");
+        }
+    }
+
+    int width = static_cast<int>(settings.width);
+    int height = static_cast<int>(settings.height);
+    int fps = static_cast<int>(settings.framesPerSecond);
+    int startFrame = static_cast<int>(settings.startFrame);
+    int endFrame = static_cast<int>(settings.endFrame);
+
+    if (ImGui::InputInt("Width", &width)) {
+        settings.width = static_cast<std::uint32_t>(std::max(1, width));
+    }
+    if (ImGui::InputInt("Height", &height)) {
+        settings.height = static_cast<std::uint32_t>(std::max(1, height));
+    }
+    if (ImGui::InputInt("Frame Rate", &fps)) {
+        settings.framesPerSecond = static_cast<std::uint32_t>(std::max(1, fps));
+    }
+    if (ImGui::InputInt("Start Frame", &startFrame)) {
+        settings.startFrame = static_cast<std::uint32_t>(std::max(0, startFrame));
+    }
+    if (ImGui::InputInt("End Frame", &endFrame)) {
+        settings.endFrame = static_cast<std::uint32_t>(std::max(0, endFrame));
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Use 0 to render through the final interpolated frame.");
+    }
+    if (viewport != nullptr && ImGui::Button("Use Viewport Size")) {
+        const auto viewportSize = CurrentUiViewportSize(*viewport);
+        settings.width = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.x));
+        settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
+    }
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        ImGui::TextDisabled("Point density: full source clouds.");
+    } else {
+        ImGui::SameLine();
+        ImGui::Checkbox("Preview Density", &panel.exportPreviewDensity);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Uses the same draw counts and interactive sample buffers as animation playback.");
+        }
+    }
+
+    if (panel.currentPath.has_value()) {
+        ImGui::TextDisabled(
+            "Export uses the active Animation path (%zu keys).",
+            panel.currentPath->keys.size());
+    } else {
+        ImGui::TextDisabled("Load or save an animation path to export.");
+    }
+
+    const auto previewFrames = BuildCurrentAnimationRenderSequence(*runtimeState, settings);
+    ImGui::TextDisabled(
+        "%s: %zu frames.",
+        panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+            ? "MP4"
+            : "EXR stack",
+        previewFrames.size());
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 &&
+        !invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath())) {
+        ImGui::TextDisabled("ffmpeg not found at %s.", invisible_places::output::DefaultFfmpegExecutablePath().string().c_str());
+    }
+
+    auto& job = runtimeState->offlineRenderJob;
+    if (job.active) {
+        RefreshAnimationExportWriterProgress(&job);
+        const float frameProgress = job.frames.empty()
+                                        ? 0.0F
+                                        : static_cast<float>(job.writtenFrameCount) /
+                                              static_cast<float>(job.frames.size());
+        ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
+        ImGui::Text(
+            "Saved %u / %zu, captured %u, queued %zu",
+            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+            job.frames.size(),
+            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+            job.pendingFrameCount);
+        ImGui::TextDisabled(
+            "Export runs in its own window; the viewport remains editable.");
+        if (!job.lastOutputPath.empty()) {
+            ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
+        }
+        if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
+            RequestOfflineRenderCancellation(&job);
+        }
+        return;
+    }
+
+    const char* exportButtonLabel =
+        panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+            ? "Export Fast MP4"
+            : "Export HQ EXR Stack";
+    if (ImGui::Button(exportButtonLabel)) {
+        StartAnimationExportJob(runtimeState, viewport);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+                ? "Captures the active animation as a full-cloud H.264 MP4."
+                : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using preview-density point draws.");
+    }
+}
+
+void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->offlineRenderJob.active) {
+        return;
+    }
+
+    auto& job = runtimeState->offlineRenderJob;
+    RefreshAnimationExportWriterProgress(&job);
+    const auto& io = ImGui::GetIO();
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize;
+    ImGui::SetNextWindowPos(
+        ImVec2{std::max(20.0F, io.DisplaySize.x - 420.0F), 24.0F},
+        ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2{340.0F, 0.0F}, ImVec2{520.0F, FLT_MAX});
+    ImGui::Begin("Animation Export", nullptr, flags);
+
+    const float frameProgress =
+        job.frames.empty()
+            ? 0.0F
+            : static_cast<float>(job.writtenFrameCount) /
+                  static_cast<float>(job.frames.size());
+    ImGui::TextUnformatted(
+        job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+            ? "Encoding Fast Preview MP4"
+            : "Rendering HQ Preview-Density EXR");
+    ImGui::ProgressBar(frameProgress, ImVec2{360.0F, 0.0F});
+    ImGui::Text(
+        "Captured: %u / %zu",
+        std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size());
+    ImGui::Text(
+        "Saved: %u / %zu",
+        std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size());
+    ImGui::Text("Queued: %zu", job.pendingFrameCount);
+    ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
+    ImGui::Text(
+        "Elapsed: %s",
+        FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
+    ImGui::TextWrapped(
+        "Output: %s",
+        job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+            ? job.videoOutputPath.string().c_str()
+            : job.settings.outputDirectory.c_str());
+    if (!job.lastOutputPath.empty()) {
+        ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
+    }
+    if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
+        RequestOfflineRenderCancellation(&job);
+    }
+    ImGui::End();
 }
 
 void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
@@ -1275,6 +3746,13 @@ void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
         ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
         if (session->kind == LayerKind::PointCloud) {
             ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
+            ImGui::Text(
+                "%s: %s",
+                PointCloudPreviewLodApplied(runtimeState, *session) ? "Preview LOD" : "Preview",
+                DescribePointCloudPreviewDraw(runtimeState, *session).c_str());
+            ImGui::Text(
+                "LOD Mode: %s",
+                PointCloudPreviewLodModeLabel(runtimeState.projectSettings.pointCloudPreviewLodMode));
             ImGui::Text("Mode: %s", PointCloudColorModeLabel(session->pointStyle.colorMode));
         } else {
             ImGui::Text("Mode: %s", GaussianSplatColorModeLabel(session->gsplatStyle.colorMode));
@@ -1283,17 +3761,335 @@ void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
             ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
             if (effectiveQuality != session->gsplatStyle.qualityMode) {
                 ImGui::Text(
-                    "Rendering: %s while navigating",
+                    "Rendering: %s while interacting",
                     GaussianSplatQualityModeLabel(effectiveQuality));
             }
             ImGui::Text(
                 "Transform: %s",
                 GsplatTransformConventionLabel(runtimeState.projectSettings.gsplatTransformConvention));
         }
-        ImGui::Text("LMB orbit  RMB/MMB pan  Wheel dolly  F focus");
+        ImGui::Text("LMB orbit  Double-click pivot  RMB/MMB pan  Wheel dolly  F focus  P set pivot  V marker");
     }
 
     ImGui::End();
+}
+
+void DrawPivotOverlay(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (VisibleLayerCount(runtimeState) == 0) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool hasRecentSet =
+        runtimeState.pivotOverlay.lastSetAt.time_since_epoch().count() != 0 &&
+        (now - runtimeState.pivotOverlay.lastSetAt) < std::chrono::milliseconds{1800};
+    if (!runtimeState.pivotOverlay.visible &&
+        !runtimeState.cameraInteraction.navigationActive &&
+        !hasRecentSet) {
+        return;
+    }
+
+    const auto matrices = runtimeState.camera.Matrices(CurrentAspectRatio(viewport));
+    const auto projected = ProjectWorldPoint(matrices, viewport, runtimeState.camera.OrbitCenter());
+    if (!projected.has_value()) {
+        return;
+    }
+
+    const float age = runtimeState.pivotOverlay.lastSetAt.time_since_epoch().count() != 0
+                          ? std::chrono::duration<float>(now - runtimeState.pivotOverlay.lastSetAt).count()
+                          : static_cast<float>(ImGui::GetTime());
+    const float pulse = 1.0F + (0.12F * std::sin((age * 5.6F) + static_cast<float>(ImGui::GetTime() * 0.5)));
+    const ImVec2 center = projected->screen;
+    constexpr float baseRadius = 9.0F;
+    const float radius = baseRadius * pulse;
+    constexpr float crosshairLength = 17.0F;
+    constexpr float innerGap = 5.5F;
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+    const ImU32 shadowColor = IM_COL32(0, 0, 0, 170);
+    const ImU32 ringColor = IM_COL32(255, 178, 54, 238);
+    const ImU32 centerColor = IM_COL32(255, 242, 212, 255);
+
+    drawList->AddCircle(center, radius + 1.5F, shadowColor, 40, 4.0F);
+    drawList->AddCircle(center, radius, ringColor, 40, 2.2F);
+    drawList->AddCircleFilled(center, 2.8F, centerColor, 16);
+    drawList->AddLine(
+        ImVec2{center.x - crosshairLength, center.y},
+        ImVec2{center.x - innerGap, center.y},
+        shadowColor,
+        4.0F);
+    drawList->AddLine(
+        ImVec2{center.x + innerGap, center.y},
+        ImVec2{center.x + crosshairLength, center.y},
+        shadowColor,
+        4.0F);
+    drawList->AddLine(
+        ImVec2{center.x, center.y - crosshairLength},
+        ImVec2{center.x, center.y - innerGap},
+        shadowColor,
+        4.0F);
+    drawList->AddLine(
+        ImVec2{center.x, center.y + innerGap},
+        ImVec2{center.x, center.y + crosshairLength},
+        shadowColor,
+        4.0F);
+    drawList->AddLine(
+        ImVec2{center.x - crosshairLength, center.y},
+        ImVec2{center.x - innerGap, center.y},
+        ringColor,
+        1.6F);
+    drawList->AddLine(
+        ImVec2{center.x + innerGap, center.y},
+        ImVec2{center.x + crosshairLength, center.y},
+        ringColor,
+        1.6F);
+    drawList->AddLine(
+        ImVec2{center.x, center.y - crosshairLength},
+        ImVec2{center.x, center.y - innerGap},
+        ringColor,
+        1.6F);
+    drawList->AddLine(
+        ImVec2{center.x, center.y + innerGap},
+        ImVec2{center.x, center.y + crosshairLength},
+        ringColor,
+        1.6F);
+}
+
+float ScreenDistance(ImVec2 left, ImVec2 right) {
+    const float dx = left.x - right.x;
+    const float dy = left.y - right.y;
+    return std::sqrt((dx * dx) + (dy * dy));
+}
+
+float DistanceToScreenSegment(ImVec2 point, ImVec2 start, ImVec2 end) {
+    const float dx = end.x - start.x;
+    const float dy = end.y - start.y;
+    const float lengthSquared = (dx * dx) + (dy * dy);
+    if (lengthSquared <= 1.0e-6F) {
+        return ScreenDistance(point, start);
+    }
+
+    const float t = std::clamp(
+        (((point.x - start.x) * dx) + ((point.y - start.y) * dy)) / lengthSquared,
+        0.0F,
+        1.0F);
+    return ScreenDistance(point, ImVec2{start.x + (dx * t), start.y + (dy * t)});
+}
+
+glm::vec3 AnimationKeyPointWorld(
+    const AnimationPath& path,
+    std::size_t keyIndex,
+    AnimationEditTarget target) {
+    if (keyIndex >= path.keys.size()) {
+        return {};
+    }
+    const auto& key = path.keys[keyIndex];
+    const auto& point = target == AnimationEditTarget::Camera ? key.cameraPosition : key.focusPoint;
+    return {point[0], point[1], point[2]};
+}
+
+void MoveAnimationKeyPoint(
+    AnimationPath* path,
+    std::size_t keyIndex,
+    AnimationEditTarget target,
+    glm::vec3 point) {
+    if (target == AnimationEditTarget::Camera) {
+        invisible_places::camera::MoveAnimationCameraKey(path, keyIndex, {point.x, point.y, point.z});
+    } else {
+        invisible_places::camera::MoveAnimationFocusKey(path, keyIndex, {point.x, point.y, point.z});
+    }
+}
+
+void DrawAnimationCurveOverlay(
+    const AnimationPath& path,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImU32 color,
+    bool drawCameraCurve) {
+    if (path.keys.size() < 2U) {
+        return;
+    }
+
+    std::optional<ImVec2> previous;
+    constexpr std::uint32_t kSampleCount = 80;
+    for (std::uint32_t sampleIndex = 0; sampleIndex <= kSampleCount; ++sampleIndex) {
+        const float amount = static_cast<float>(sampleIndex) / static_cast<float>(kSampleCount);
+        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+            path,
+            AnimationDurationSeconds(path) * amount);
+        const auto point = drawCameraCurve
+                               ? glm::vec3{
+                                     evaluation.camera.position[0],
+                                     evaluation.camera.position[1],
+                                     evaluation.camera.position[2]}
+                               : glm::vec3{
+                                     evaluation.focusPoint[0],
+                                     evaluation.focusPoint[1],
+                                     evaluation.focusPoint[2]};
+        const auto projected = ProjectWorldPoint(matrices, viewport, point);
+        if (projected.has_value() && previous.has_value()) {
+            ImGui::GetBackgroundDrawList(ImGui::GetMainViewport())->AddLine(
+                previous.value(),
+                projected->screen,
+                color,
+                2.0F);
+        }
+        previous = projected.has_value() ? std::optional<ImVec2>{projected->screen} : std::nullopt;
+    }
+}
+
+void DrawAnimationViewportOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.showSplines ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    auto& path = panel.currentPath.value();
+    if (path.keys.empty()) {
+        return;
+    }
+
+    const auto matrices = runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+    const ImU32 cameraColor = IM_COL32(80, 160, 255, 230);
+    const ImU32 focusColor = IM_COL32(88, 220, 150, 230);
+    const ImU32 selectedColor = IM_COL32(255, 232, 128, 255);
+    DrawAnimationCurveOverlay(path, matrices, viewport, cameraColor, true);
+    DrawAnimationCurveOverlay(path, matrices, viewport, focusColor, false);
+
+    const auto& io = ImGui::GetIO();
+    if (panel.drag.active) {
+        if (!io.MouseDown[0]) {
+            panel.drag.active = false;
+        } else {
+            const float mouseDeltaAlongAxis =
+                ((io.MousePos.x - panel.drag.startMouse.x) * panel.drag.axisScreenDirection.x) +
+                ((io.MousePos.y - panel.drag.startMouse.y) * panel.drag.axisScreenDirection.y);
+            const float worldDelta = mouseDeltaAlongAxis / std::max(1.0F, panel.drag.pixelsPerWorldUnit);
+            MoveAnimationKeyPoint(
+                &path,
+                panel.drag.keyIndex,
+                panel.drag.target,
+                panel.drag.startWorldPoint + (panel.drag.axisWorld * worldDelta));
+            panel.selectedKeyIndex = panel.drag.keyIndex;
+            panel.editTarget = panel.drag.target;
+            panel.dirty = true;
+            if (panel.liveApply) {
+                ApplyAnimationScrub(runtimeState);
+            }
+        }
+    }
+
+    const bool canInteractWithRenderViewport =
+        panel.drag.active || (!viewport.UiWantsMouseCapture() && IsMouseOverRenderViewport(viewport));
+
+    constexpr float kPickRadius = 10.0F;
+    bool selectedKeyThisFrame = false;
+    float bestDistance = kPickRadius;
+    std::optional<std::size_t> bestKeyIndex;
+    std::optional<AnimationEditTarget> bestTarget;
+
+    for (std::size_t keyIndex = 0; keyIndex < path.keys.size(); ++keyIndex) {
+        for (const auto target : {AnimationEditTarget::Camera, AnimationEditTarget::Focus}) {
+            const auto worldPoint = AnimationKeyPointWorld(path, keyIndex, target);
+            const auto projected = ProjectWorldPoint(matrices, viewport, worldPoint);
+            if (!projected.has_value()) {
+                continue;
+            }
+
+            const bool selected = panel.selectedKeyIndex.has_value() &&
+                                  panel.selectedKeyIndex.value() == keyIndex &&
+                                  panel.editTarget == target;
+            const ImU32 color = selected ? selectedColor : (target == AnimationEditTarget::Camera ? cameraColor : focusColor);
+            drawList->AddCircleFilled(projected->screen, selected ? 6.0F : 4.5F, color, 18);
+            drawList->AddCircle(projected->screen, selected ? 8.0F : 6.0F, IM_COL32(0, 0, 0, 170), 18, 2.0F);
+
+            if (canInteractWithRenderViewport) {
+                const float distance = ScreenDistance(io.MousePos, projected->screen);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestKeyIndex = keyIndex;
+                    bestTarget = target;
+                }
+            }
+        }
+    }
+
+    if (canInteractWithRenderViewport &&
+        !panel.drag.active &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        bestKeyIndex.has_value() &&
+        bestTarget.has_value()) {
+        panel.selectedKeyIndex = bestKeyIndex.value();
+        panel.editTarget = bestTarget.value();
+        selectedKeyThisFrame = true;
+    }
+
+    if (!panel.selectedKeyIndex.has_value() || panel.selectedKeyIndex.value() >= path.keys.size()) {
+        return;
+    }
+
+    const auto selectedPoint = AnimationKeyPointWorld(path, panel.selectedKeyIndex.value(), panel.editTarget);
+    const auto projectedSelected = ProjectWorldPoint(matrices, viewport, selectedPoint);
+    if (!projectedSelected.has_value()) {
+        return;
+    }
+
+    const float cameraDistance = glm::length(selectedPoint - matrices.position);
+    const float axisLength = std::max(0.25F, cameraDistance * 0.14F);
+    const std::array<glm::vec3, 3> axes{
+        glm::vec3{1.0F, 0.0F, 0.0F},
+        glm::vec3{0.0F, 1.0F, 0.0F},
+        glm::vec3{0.0F, 0.0F, 1.0F},
+    };
+    const std::array<ImU32, 3> axisColors{
+        IM_COL32(255, 88, 88, 245),
+        IM_COL32(88, 235, 120, 245),
+        IM_COL32(90, 150, 255, 245),
+    };
+
+    for (std::size_t axisIndex = 0; axisIndex < axes.size(); ++axisIndex) {
+        const auto axisEnd = selectedPoint + (axes[axisIndex] * axisLength);
+        const auto projectedEnd = ProjectWorldPoint(matrices, viewport, axisEnd);
+        if (!projectedEnd.has_value()) {
+            continue;
+        }
+
+        drawList->AddLine(projectedSelected->screen, projectedEnd->screen, IM_COL32(0, 0, 0, 185), 5.0F);
+        drawList->AddLine(projectedSelected->screen, projectedEnd->screen, axisColors[axisIndex], 3.0F);
+        drawList->AddCircleFilled(projectedEnd->screen, 5.0F, axisColors[axisIndex], 14);
+
+        const float handleDistance = canInteractWithRenderViewport
+                                         ? DistanceToScreenSegment(io.MousePos, projectedSelected->screen, projectedEnd->screen)
+                                         : std::numeric_limits<float>::max();
+        if (canInteractWithRenderViewport &&
+            !panel.drag.active &&
+            !selectedKeyThisFrame &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            handleDistance < 8.0F) {
+            const ImVec2 screenAxis{
+                projectedEnd->screen.x - projectedSelected->screen.x,
+                projectedEnd->screen.y - projectedSelected->screen.y,
+            };
+            const float screenAxisLength = std::max(1.0F, std::sqrt((screenAxis.x * screenAxis.x) + (screenAxis.y * screenAxis.y)));
+            panel.drag = {
+                .active = true,
+                .target = panel.editTarget,
+                .keyIndex = panel.selectedKeyIndex.value(),
+                .axis = static_cast<int>(axisIndex),
+                .startWorldPoint = selectedPoint,
+                .startMouse = io.MousePos,
+                .axisWorld = axes[axisIndex],
+                .axisScreenDirection = ImVec2{screenAxis.x / screenAxisLength, screenAxis.y / screenAxisLength},
+                .pixelsPerWorldUnit = screenAxisLength / axisLength,
+            };
+        }
+    }
 }
 
 void DrawSpinnerArc(float radius, float thickness, ImU32 color) {
@@ -1395,16 +4191,26 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
 
 void DrawLayerSection(
     PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    ImGui::SeparatorText("Layers");
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    LayerKind layerKind,
+    const char* heading) {
+    ImGui::SeparatorText(heading);
 
-    if (runtimeState->sessions.empty()) {
-        ImGui::TextUnformatted("No point clouds or gSplats were discovered.");
+    const bool hasAnyMatchingLayer = std::any_of(
+        runtimeState->sessions.begin(),
+        runtimeState->sessions.end(),
+        [layerKind](const PreviewLayerSession& session) { return session.kind == layerKind; });
+    if (!hasAnyMatchingLayer) {
+        ImGui::Text("No %s layers were discovered.", LayerKindLabel(layerKind));
         return;
     }
 
     for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
         auto& session = runtimeState->sessions[index];
+        if (session.kind != layerKind) {
+            continue;
+        }
+
         const bool isSelected = runtimeState->selectedSessionIndex.has_value() &&
                                 runtimeState->selectedSessionIndex.value() == index;
         const bool isPendingLoad = runtimeState->pendingLoad.has_value() &&
@@ -1466,6 +4272,12 @@ void DrawLayerSection(
     ImGui::TextDisabled("Single click selects. Double click loads or focuses.");
 
     if (auto* session = SelectedSession(runtimeState); session != nullptr) {
+        if (session->kind != layerKind) {
+            ImGui::Spacing();
+            ImGui::Text("Select a %s layer to edit this panel.", LayerKindLabel(layerKind));
+            return;
+        }
+
         ImGui::Spacing();
         ImGui::Text("Selected: %s", session->displayName.c_str());
         ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
@@ -1480,12 +4292,15 @@ void DrawLayerSection(
             if (session->kind == LayerKind::PointCloud) {
                 std::uint64_t requestedBudget = session->pointBudget.activePoints;
                 if (ImGui::InputScalar("Budget Points", ImGuiDataType_U64, &requestedBudget)) {
-                    session->pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
-                        session->totalPrimitives,
-                        requestedBudget);
+                    session->pointBudget = MakePreviewPointBudgetState(*session, requestedBudget);
+                    ClearPreviewLodSampleCache(session);
                     viewport->UpdatePointBudget(
                         runtimeState->selectedSessionIndex.value(),
                         session->pointBudget.sampledIndices);
+                    PreparePreviewLodSampleCache(
+                        runtimeState,
+                        viewport,
+                        runtimeState->selectedSessionIndex.value());
                 }
 
                 float requestedFraction = session->pointBudget.activeFraction;
@@ -1493,15 +4308,22 @@ void DrawLayerSection(
                     const auto requestedPoints = static_cast<std::uint64_t>(
                         requestedFraction >= 1.0F ? session->totalPrimitives
                                                   : static_cast<double>(session->totalPrimitives) * requestedFraction);
-                    session->pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
-                        session->totalPrimitives,
-                        requestedPoints);
+                    session->pointBudget = MakePreviewPointBudgetState(*session, requestedPoints);
+                    ClearPreviewLodSampleCache(session);
                     viewport->UpdatePointBudget(
                         runtimeState->selectedSessionIndex.value(),
                         session->pointBudget.sampledIndices);
+                    PreparePreviewLodSampleCache(
+                        runtimeState,
+                        viewport,
+                        runtimeState->selectedSessionIndex.value());
                 }
 
-                ImGui::Text("Drawn: %s", DescribeBudget(session->pointBudget).c_str());
+                ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
+                ImGui::TextDisabled(
+                    "%s: %s",
+                    PointCloudPreviewLodApplied(*runtimeState, *session) ? "Preview LOD" : "Preview draw",
+                    DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
             }
 
             if (ImGui::Button("Unload Selected Layer")) {
@@ -1521,6 +4343,40 @@ void DrawLayerSection(
 void DrawPointCloudStyleSection(PreviewLayerSession* session) {
     auto& style = session->pointStyle;
     bool changed = false;
+
+    int geometryModeIndex = static_cast<int>(style.geometryMode);
+    const char* geometryModes[] = {"Screen Sprites", "World Surfels"};
+    if (ImGui::Combo("Geometry", &geometryModeIndex, geometryModes, IM_ARRAYSIZE(geometryModes))) {
+        style.geometryMode = static_cast<PointCloudGeometryMode>(geometryModeIndex);
+        changed = true;
+    }
+    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels && !session->hasNormals) {
+        ImGui::TextDisabled("No normals were loaded; surfels face the camera.");
+    }
+
+    int renderModeIndex = static_cast<int>(style.renderMode);
+    const char* renderModes[] = {
+        "Solid",
+        "Emissive Hard",
+        "Emissive Feathered",
+        "Depth X-Ray",
+        "Weighted Transparent",
+        "Compute Density",
+        "Gaussian Point Sprite"};
+    if (ImGui::Combo("Render Mode", &renderModeIndex, renderModes, IM_ARRAYSIZE(renderModes))) {
+        style.renderMode = static_cast<PointCloudRenderMode>(renderModeIndex);
+        changed = true;
+    }
+    if (style.renderMode == PointCloudRenderMode::ComputeDensity) {
+        ImGui::TextDisabled("Compute density currently falls back to weighted raster accumulation.");
+    }
+
+    int falloffIndex = static_cast<int>(style.falloffProfile);
+    const char* falloffProfiles[] = {"Hard Disc", "Soft Disc", "Gaussian", "Rim"};
+    if (ImGui::Combo("Point Falloff", &falloffIndex, falloffProfiles, IM_ARRAYSIZE(falloffProfiles))) {
+        style.falloffProfile = static_cast<PointCloudFalloffProfile>(falloffIndex);
+        changed = true;
+    }
 
     int colorModeIndex = static_cast<int>(style.colorMode);
     const char* colorModes[] = {"Source RGB", "Solid Color", "Scalar Colormap"};
@@ -1570,6 +4426,20 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .defaultOutputMax = 16.0F,
          .defaultConstant = 2.0F,
          .format = "%.2f"});
+    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels) {
+        changed |= DrawScalarBindingWidget(
+            "Surfel Diameter (mm)",
+            &style.surfelDiameter,
+            session->scalarFields,
+            {.constantMin = 0.0001F,
+             .constantMax = 0.1F,
+             .defaultOutputMin = 0.0001F,
+             .defaultOutputMax = 0.1F,
+             .defaultConstant = 0.005F,
+             .format = "%.3f",
+             .directConstantInput = true,
+             .displayScale = 1000.0F});
+    }
     changed |= DrawScalarBindingWidget(
         "Opacity",
         &style.opacity,
@@ -1610,6 +4480,18 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .defaultOutputMax = 1.0F,
          .defaultConstant = 0.0F,
          .format = "%.2f"});
+
+    ImGui::SeparatorText("Mode Controls");
+    changed |= ImGui::SliderFloat("Exposure", &style.exposure, 0.0F, 8.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Inner Radius", &style.innerRadius, 0.0F, 0.99F, "%.2f");
+    changed |= ImGui::SliderFloat("Gaussian Sharpness", &style.gaussianSharpness, 0.1F, 16.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Feather Power", &style.featherPower, 0.1F, 8.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Depth Falloff", &style.depthFalloff, 0.0F, 400.0F, "%.1f");
+    changed |= ImGui::SliderFloat("Depth Bias", &style.depthBias, 0.0F, 0.01F, "%.5f");
+    changed |= ImGui::SliderFloat("Front Alpha", &style.frontAlpha, 0.0F, 1.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Hidden Alpha", &style.hiddenAlpha, 0.0F, 1.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Density Scale", &style.densityScale, 0.0F, 8.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Density Clamp", &style.densityClamp, 0.0F, 512.0F, "%.1f");
 
     if (changed) {
         SanitizePointCloudStyle(session);
@@ -1664,7 +4546,7 @@ void DrawStyleSection(PreviewRuntimeState* runtimeState) {
         const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
         if (effectiveQuality != session->gsplatStyle.qualityMode) {
             ImGui::TextDisabled(
-                "Rendering as %s while navigating.",
+                "Rendering as %s while interacting.",
                 GaussianSplatQualityModeLabel(effectiveQuality));
         }
         DrawGaussianSplatStyleSection(session);
@@ -1677,42 +4559,409 @@ void DrawCameraSection(
     ImGui::SeparatorText("Camera");
 
     auto* session = SelectedLoadedSession(runtimeState);
-    if (session == nullptr || !runtimeState->camera.HasFramedBounds()) {
-        ImGui::TextUnformatted("Select a loaded layer to frame the camera.");
-        return;
-    }
-
-    if (ImGui::Button("Focus Selected Layer")) {
-        FocusSessionLayer(runtimeState, viewport, runtimeState->selectedSessionIndex.value());
-    }
-
-    const auto effectiveFrame = ComputeEffectiveLayerFrame(*runtimeState, *session);
     const auto target = runtimeState->camera.Target();
+    const auto pivot = runtimeState->camera.OrbitCenter();
     ImGui::Text("Target: %.3f  %.3f  %.3f", target.x, target.y, target.z);
+    ImGui::Text("Pivot: %.3f  %.3f  %.3f", pivot.x, pivot.y, pivot.z);
+    bool showPivotMarker = runtimeState->pivotOverlay.visible;
+    if (ImGui::Checkbox("Show Pivot Marker", &showPivotMarker)) {
+        runtimeState->pivotOverlay.visible = showPivotMarker;
+        runtimeState->pivotOverlay.pivot = FromGlm(pivot);
+        runtimeState->pivotOverlay.lastSetAt =
+            showPivotMarker ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    }
     ImGui::Text("Distance: %.3f", runtimeState->camera.Distance());
     ImGui::Text("FOV: %.1f", runtimeState->camera.FovDegrees());
     ImGui::Text(
         "Near/Far: %.4f / %.1f",
         runtimeState->camera.NearPlane(),
         runtimeState->camera.FarPlane());
-    ImGui::Text("Bounds valid: %s", effectiveFrame.bounds.valid ? "yes" : "no");
-    if (session->kind == LayerKind::GaussianSplat) {
-        ImGui::Text(
-            "Convention: %s",
-            GsplatTransformConventionLabel(runtimeState->projectSettings.gsplatTransformConvention));
+
+    if (session == nullptr || !runtimeState->camera.HasFramedBounds()) {
+        ImGui::TextUnformatted("Select a loaded layer to frame the camera.");
+    } else {
+        if (ImGui::Button("Focus Selected Layer")) {
+            FocusSessionLayer(runtimeState, viewport, runtimeState->selectedSessionIndex.value());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Pivot Center")) {
+            SetCameraPivotFromScreenPoint(
+                runtimeState,
+                viewport,
+                CurrentUiViewportCenter(viewport));
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Infer an orbit pivot from visible samples near the screen center.");
+        }
+
+        const auto effectiveFrame = ComputeEffectiveLayerFrame(*runtimeState, *session);
+        ImGui::Text("Bounds valid: %s", effectiveFrame.bounds.valid ? "yes" : "no");
+        if (session->kind == LayerKind::GaussianSplat) {
+            ImGui::Text(
+                "Convention: %s",
+                GsplatTransformConventionLabel(runtimeState->projectSettings.gsplatTransformConvention));
+        }
+    }
+
+    ImGui::SeparatorText("Shots");
+    EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
+
+    InputTextString("Shot Name", &runtimeState->cameraPanel.draftShotName);
+    int defaultDurationFrames = static_cast<int>(runtimeState->cameraPanel.defaultDurationFrames);
+    if (ImGui::InputInt("Duration Frames", &defaultDurationFrames)) {
+        runtimeState->cameraPanel.defaultDurationFrames =
+            static_cast<std::uint32_t>(std::max(1, defaultDurationFrames));
+    }
+    ImGui::TextDisabled("Playback uses the project default 30 fps timebase.");
+
+    if (ImGui::Button("Save Camera Position")) {
+        SaveCurrentCameraShot(runtimeState);
+    }
+
+    if (runtimeState->cameraShots.empty()) {
+        ImGui::TextUnformatted("No camera shots saved yet.");
+        return;
+    }
+
+    ImGui::Spacing();
+    if (ImGui::BeginListBox("Saved Shots", ImVec2{-FLT_MIN, 128.0F})) {
+        for (std::size_t index = 0; index < runtimeState->cameraShots.size(); ++index) {
+            const bool selected = runtimeState->cameraPanel.selectedShotIndex.has_value() &&
+                                  runtimeState->cameraPanel.selectedShotIndex.value() == index;
+            if (ImGui::Selectable(runtimeState->cameraShots[index].name.c_str(), selected)) {
+                runtimeState->cameraPanel.selectedShotIndex = index;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndListBox();
+    }
+
+    if (runtimeState->cameraPanel.selectedShotIndex.has_value()) {
+        const auto selectedIndex = runtimeState->cameraPanel.selectedShotIndex.value();
+        if (selectedIndex < runtimeState->cameraShots.size()) {
+            if (ImGui::Button("Load Camera")) {
+                ApplyCameraShot(runtimeState, selectedIndex);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Add To Path")) {
+                runtimeState->cameraPanel.pathShotIndices.push_back(selectedIndex);
+                runtimeState->cameraPanel.selectedPathItemIndex =
+                    runtimeState->cameraPanel.pathShotIndices.size() - 1U;
+                runtimeState->cameraPlayback.active = false;
+                runtimeState->statusMessage =
+                    "Added " + runtimeState->cameraShots[selectedIndex].name + " to the camera path.";
+                runtimeState->errorMessage.clear();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Delete Shot")) {
+                RemoveCameraShotFromPath(&runtimeState->cameraPanel, selectedIndex);
+                runtimeState->cameraShots.erase(runtimeState->cameraShots.begin() + static_cast<std::ptrdiff_t>(selectedIndex));
+                runtimeState->cameraPlayback.active = false;
+                EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
+            }
+        }
+    }
+
+    ImGui::SeparatorText("Camera Path");
+    int pathDurationFrames = static_cast<int>(runtimeState->cameraPanel.pathDurationFrames);
+    if (ImGui::InputInt("Full Duration Frames", &pathDurationFrames)) {
+        runtimeState->cameraPanel.pathDurationFrames =
+            static_cast<std::uint32_t>(std::max(1, pathDurationFrames));
+        runtimeState->cameraPlayback.active = false;
+        EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
+    }
+    ImGui::TextDisabled(
+        "Full path duration: %.2f seconds at the 30 fps path timebase.",
+        static_cast<float>(runtimeState->cameraPanel.pathDurationFrames) / 30.0F);
+
+    if (ImGui::Button("Clear Path")) {
+        runtimeState->cameraPanel.pathShotIndices.clear();
+        runtimeState->cameraPanel.selectedPathItemIndex.reset();
+        runtimeState->cameraPlayback.active = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save Path as Animation")) {
+        SaveCurrentCameraPathAsAnimation(runtimeState);
+    }
+
+    if (ImGui::BeginListBox("Path Order", ImVec2{-FLT_MIN, 160.0F})) {
+        for (std::size_t pathItemIndex = 0; pathItemIndex < runtimeState->cameraPanel.pathShotIndices.size(); ++pathItemIndex) {
+            const auto shotIndex = runtimeState->cameraPanel.pathShotIndices[pathItemIndex];
+            const bool validShot = shotIndex < runtimeState->cameraShots.size();
+            const auto label = std::to_string(pathItemIndex + 1U) +
+                               "  " +
+                               (validShot ? runtimeState->cameraShots[shotIndex].name : std::string{"Missing Shot"});
+            const bool selected = runtimeState->cameraPanel.selectedPathItemIndex.has_value() &&
+                                  runtimeState->cameraPanel.selectedPathItemIndex.value() == pathItemIndex;
+
+            ImGui::PushID(static_cast<int>(pathItemIndex));
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                runtimeState->cameraPanel.selectedPathItemIndex = pathItemIndex;
+            }
+            if (ImGui::BeginDragDropSource()) {
+                const auto payloadIndex = pathItemIndex;
+                ImGui::SetDragDropPayload("CAMERA_PATH_ITEM", &payloadIndex, sizeof(payloadIndex));
+                ImGui::TextUnformatted(label.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::BeginDragDropTarget()) {
+                if (const auto* payload = ImGui::AcceptDragDropPayload("CAMERA_PATH_ITEM");
+                    payload != nullptr && payload->DataSize == sizeof(std::size_t)) {
+                    const auto sourceIndex = *static_cast<const std::size_t*>(payload->Data);
+                    MoveCameraPathItem(
+                        &runtimeState->cameraPanel.pathShotIndices,
+                        sourceIndex,
+                        pathItemIndex);
+                    runtimeState->cameraPanel.selectedPathItemIndex =
+                        std::min(pathItemIndex, runtimeState->cameraPanel.pathShotIndices.size() - 1U);
+                    runtimeState->cameraPlayback.active = false;
+                }
+                ImGui::EndDragDropTarget();
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndListBox();
+    }
+
+    if (runtimeState->cameraPanel.selectedPathItemIndex.has_value()) {
+        const auto pathItemIndex = runtimeState->cameraPanel.selectedPathItemIndex.value();
+        if (pathItemIndex < runtimeState->cameraPanel.pathShotIndices.size()) {
+            const auto shotIndex = runtimeState->cameraPanel.pathShotIndices[pathItemIndex];
+            if (shotIndex < runtimeState->cameraShots.size()) {
+                if (ImGui::Button("Load Path Entry")) {
+                    ApplyCameraShot(runtimeState, shotIndex);
+                    runtimeState->cameraPanel.selectedPathItemIndex = pathItemIndex;
+                }
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Remove Path Entry")) {
+                runtimeState->cameraPanel.pathShotIndices.erase(
+                    runtimeState->cameraPanel.pathShotIndices.begin() + static_cast<std::ptrdiff_t>(pathItemIndex));
+                if (runtimeState->cameraPanel.pathShotIndices.empty()) {
+                    runtimeState->cameraPanel.selectedPathItemIndex.reset();
+                } else {
+                    runtimeState->cameraPanel.selectedPathItemIndex =
+                        std::min(pathItemIndex, runtimeState->cameraPanel.pathShotIndices.size() - 1U);
+                }
+                runtimeState->cameraPlayback.active = false;
+                EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
+            }
+        }
+    }
+
+    const bool pathReady = runtimeState->cameraPanel.pathShotIndices.size() >= 2U;
+    if (!pathReady) {
+        ImGui::TextDisabled("Add at least two path entries. Duplicates are allowed.");
+    }
+
+    const bool blendChanged =
+        ImGui::SliderFloat("Path Position", &runtimeState->cameraPanel.blendAmount, 0.0F, 1.0F, "%.3f");
+    ImGui::Checkbox("Live Apply", &runtimeState->cameraPanel.liveBlend);
+    if (runtimeState->cameraPanel.liveBlend && blendChanged) {
+        ApplyCameraBlend(runtimeState);
+    }
+    if (ImGui::Button("Apply Path Position")) {
+        ApplyCameraBlend(runtimeState);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(runtimeState->cameraPlayback.active ? "Stop Playback" : "Play")) {
+        if (runtimeState->cameraPlayback.active) {
+            runtimeState->cameraPlayback.active = false;
+        } else {
+            StartCameraPlayback(runtimeState);
+        }
+    }
+
+}
+
+void DrawAnimationSection(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    ImGui::SeparatorText("Animation");
+    auto& panel = runtimeState->animationPanel;
+    if (InputTextString("Animation Name", &panel.draftAnimationName) && panel.currentPath.has_value()) {
+        panel.currentPath->name = panel.draftAnimationName;
+        panel.dirty = true;
+    }
+    if (ImGui::Button("Refresh")) {
+        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Show Splines", &panel.showSplines);
+
+    if (panel.availableFiles.empty()) {
+        ImGui::TextDisabled("No saved animation paths found.");
+    } else if (ImGui::BeginListBox("Saved Animations", ImVec2{-FLT_MIN, 128.0F})) {
+        for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
+            const bool selected = panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() == index;
+            if (ImGui::Selectable(panel.availableFiles[index].stem().string().c_str(), selected)) {
+                panel.selectedFileIndex = index;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndListBox();
+    }
+
+    if (panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() < panel.availableFiles.size()) {
+        if (ImGui::Button("Load")) {
+            LoadAnimationPathFromFile(runtimeState, panel.availableFiles[panel.selectedFileIndex.value()]);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete File")) {
+            std::error_code removeError;
+            const auto deletedPath = panel.availableFiles[panel.selectedFileIndex.value()];
+            std::filesystem::remove(deletedPath, removeError);
+            if (removeError) {
+                runtimeState->errorMessage = "Failed to delete animation: " + removeError.message();
+                runtimeState->statusMessage.clear();
+            } else {
+                runtimeState->statusMessage = "Deleted animation: " + deletedPath.filename().string() + ".";
+                runtimeState->errorMessage.clear();
+                if (panel.currentFilePath == deletedPath.string()) {
+                    panel.currentFilePath.clear();
+                    panel.currentPath.reset();
+                    panel.selectedKeyIndex.reset();
+                }
+                RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+            }
+        }
+    }
+
+    if (!panel.currentPath.has_value()) {
+        ImGui::TextDisabled("Load an animation or save the Camera path as an animation.");
+        return;
+    }
+
+    auto& animationPath = panel.currentPath.value();
+    animationPath.name = panel.draftAnimationName.empty() ? animationPath.name : panel.draftAnimationName;
+
+    ImGui::SeparatorText("Current Path");
+    ImGui::Text("File: %s", panel.currentFilePath.empty() ? "unsaved" : panel.currentFilePath.c_str());
+    ImGui::Text("Keys: %zu", animationPath.keys.size());
+
+    int durationFrames = static_cast<int>(animationPath.durationFrames);
+    if (ImGui::InputInt("Full Duration Frames", &durationFrames)) {
+        animationPath.durationFrames = static_cast<std::uint32_t>(std::max(1, durationFrames));
+        panel.dirty = true;
+    }
+    float apertureFStops = animationPath.apertureFStops;
+    if (ImGui::InputFloat("Aperture f-stop", &apertureFStops, 0.1F, 1.0F, "%.2f")) {
+        animationPath.apertureFStops = std::max(0.1F, apertureFStops);
+        panel.dirty = true;
+    }
+
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+        animationPath,
+        AnimationDurationSeconds(animationPath) * std::clamp(panel.scrubAmount, 0.0F, 1.0F));
+    ImGui::TextDisabled("Focus distance: %.3f", evaluation.focusDistance);
+
+    const bool scrubChanged = ImGui::SliderFloat("Animation Position", &panel.scrubAmount, 0.0F, 1.0F, "%.3f");
+    ImGui::Checkbox("Live Apply", &panel.liveApply);
+    if (panel.liveApply && scrubChanged) {
+        ApplyAnimationScrub(runtimeState);
+    }
+    if (ImGui::Button("Apply Position")) {
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(runtimeState->animationPlayback.active ? "Stop Playback" : "Play")) {
+        if (runtimeState->animationPlayback.active) {
+            runtimeState->animationPlayback.active = false;
+        } else {
+            StartAnimationPlayback(runtimeState);
+        }
+    }
+
+    if (ImGui::Button("Save")) {
+        const auto outputPath = panel.currentFilePath.empty()
+                                    ? AnimationFilePathForName(*runtimeState, animationPath.name)
+                                    : std::filesystem::path{panel.currentFilePath};
+        SaveAnimationPathToFile(runtimeState, animationPath, outputPath);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save As")) {
+        SaveAnimationPathToFile(
+            runtimeState,
+            animationPath,
+            AnimationFilePathForName(*runtimeState, animationPath.name));
+    }
+    if (panel.dirty) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Modified");
+    }
+
+    DrawAnimationExportSection(runtimeState, &viewport);
+
+    if (animationPath.keys.empty()) {
+        return;
+    }
+
+    ImGui::SeparatorText("Keys");
+    const char* editTargetLabels[] = {"Camera", "Focus"};
+    int editTargetIndex = panel.editTarget == AnimationEditTarget::Camera ? 0 : 1;
+    if (ImGui::Combo("Edit Target", &editTargetIndex, editTargetLabels, 2)) {
+        panel.editTarget = editTargetIndex == 0 ? AnimationEditTarget::Camera : AnimationEditTarget::Focus;
+    }
+
+    if (ImGui::BeginListBox("Animation Keys", ImVec2{-FLT_MIN, 110.0F})) {
+        for (std::size_t index = 0; index < animationPath.keys.size(); ++index) {
+            const auto label = std::to_string(index + 1U) + "  " +
+                               (animationPath.keys[index].sourceShotName.empty()
+                                    ? std::string{"Key"}
+                                    : animationPath.keys[index].sourceShotName);
+            const bool selected = panel.selectedKeyIndex.has_value() && panel.selectedKeyIndex.value() == index;
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                panel.selectedKeyIndex = index;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndListBox();
+    }
+
+    if (!panel.selectedKeyIndex.has_value() || panel.selectedKeyIndex.value() >= animationPath.keys.size()) {
+        return;
+    }
+
+    auto& key = animationPath.keys[panel.selectedKeyIndex.value()];
+    float cameraPosition[3] = {key.cameraPosition[0], key.cameraPosition[1], key.cameraPosition[2]};
+    if (ImGui::InputFloat3("Camera Key", cameraPosition, "%.3f")) {
+        invisible_places::camera::MoveAnimationCameraKey(
+            &animationPath,
+            panel.selectedKeyIndex.value(),
+            {cameraPosition[0], cameraPosition[1], cameraPosition[2]});
+        panel.dirty = true;
+    }
+    float focusPoint[3] = {key.focusPoint[0], key.focusPoint[1], key.focusPoint[2]};
+    if (ImGui::InputFloat3("Focus Key", focusPoint, "%.3f")) {
+        invisible_places::camera::MoveAnimationFocusKey(
+            &animationPath,
+            panel.selectedKeyIndex.value(),
+            {focusPoint[0], focusPoint[1], focusPoint[2]});
+        panel.dirty = true;
     }
 }
 
 void DrawSettingsSection(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
-    ImGui::SeparatorText("Settings");
+    ImGui::SeparatorText("gSplat Settings");
 
     auto& settings = runtimeState->projectSettings;
-    ImGui::ColorEdit3("Background Color", settings.backgroundColor.data());
-    ImGui::Checkbox("Show Status Overlay", &settings.showStatusOverlay);
     ImGui::Checkbox(
-        "Auto Lower gSplat Quality While Navigating",
+        "Auto Lower gSplat Quality While Interacting",
         &settings.autoLowerGsplatQualityWhileNavigating);
     ImGui::SliderFloat(
         "gSplat Footprint Boost",
@@ -1881,35 +5130,227 @@ void DrawPresetSection(PreviewRuntimeState* runtimeState) {
     }
 }
 
-void DrawSidePanel(
+void DrawLidarPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    auto& sidePanel = runtimeState->sidePanel;
-    const auto& io = ImGui::GetIO();
+    DrawLayerSection(runtimeState, viewport, LayerKind::PointCloud, "Lidar Layers");
+    ImGui::Spacing();
+    ImGui::SeparatorText("Lidar Visuals");
+    if (auto* session = SelectedLoadedSessionOfKind(runtimeState, LayerKind::PointCloud); session != nullptr) {
+        DrawPointCloudStyleSection(session);
+    } else {
+        ImGui::TextUnformatted("Select and load a lidar layer to edit its visual settings.");
+    }
+    DrawPresetSection(runtimeState);
+}
 
-    const bool nearRightEdge = io.MousePos.x >= (io.DisplaySize.x - sidePanel.handleWidth - 6.0F);
+void DrawGsplatPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    DrawLayerSection(runtimeState, viewport, LayerKind::GaussianSplat, "gSplat Layers");
+    ImGui::Spacing();
+    ImGui::SeparatorText("gSplat Visuals");
+    if (auto* session = SelectedLoadedSessionOfKind(runtimeState, LayerKind::GaussianSplat); session != nullptr) {
+        const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
+        if (effectiveQuality != session->gsplatStyle.qualityMode) {
+            ImGui::TextDisabled(
+                "Rendering as %s while navigating.",
+                GaussianSplatQualityModeLabel(effectiveQuality));
+        }
+        DrawGaussianSplatStyleSection(session);
+    } else {
+        ImGui::TextUnformatted("Select and load a gSplat layer to edit its visual settings.");
+    }
+
+    DrawSettingsSection(runtimeState, *viewport);
+}
+
+void DrawProjectPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    ImGui::SeparatorText("Project Settings");
+    auto& settings = runtimeState->projectSettings;
+    ImGui::ColorEdit3("Background Color", settings.backgroundColor.data());
+    ImGui::Checkbox("Show Status Overlay", &settings.showStatusOverlay);
+
+    int pointLodModeIndex = static_cast<int>(settings.pointCloudPreviewLodMode);
+    const char* pointLodModes[] = {"Full Resolution", "Auto Camera LOD", "Force LOD"};
+    if (ImGui::Combo(
+            "Point Preview LOD",
+            &pointLodModeIndex,
+            pointLodModes,
+            IM_ARRAYSIZE(pointLodModes))) {
+        settings.pointCloudPreviewLodMode = static_cast<PointCloudPreviewLodMode>(pointLodModeIndex);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Auto mode uses the cached 10M point LOD only while the camera is moving.");
+    }
+    ImGui::TextDisabled("Point LOD Target: %s", FormatPointCount(kPointCloudPreviewLodTarget).c_str());
+    DrawProjectSection(runtimeState, viewport);
+}
+
+ImVec2 DefaultControlsWindowPosition(ImVec2 controlsSize) {
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    if (mainViewport == nullptr) {
+        return ImVec2{60.0F, 60.0F};
+    }
+
+    ImVec2 position{mainViewport->Pos.x + mainViewport->Size.x + 24.0F, mainViewport->Pos.y + 36.0F};
+    const ImVec2 mainCenter{
+        mainViewport->Pos.x + (mainViewport->Size.x * 0.5F),
+        mainViewport->Pos.y + (mainViewport->Size.y * 0.5F),
+    };
+
+    const auto& platformIo = ImGui::GetPlatformIO();
+    for (const auto& monitor : platformIo.Monitors) {
+        const bool containsMainCenter =
+            mainCenter.x >= monitor.WorkPos.x &&
+            mainCenter.x <= monitor.WorkPos.x + monitor.WorkSize.x &&
+            mainCenter.y >= monitor.WorkPos.y &&
+            mainCenter.y <= monitor.WorkPos.y + monitor.WorkSize.y;
+        if (!containsMainCenter) {
+            continue;
+        }
+
+        const float workRight = monitor.WorkPos.x + monitor.WorkSize.x;
+        const float workBottom = monitor.WorkPos.y + monitor.WorkSize.y;
+        if (position.x + controlsSize.x > workRight) {
+            position.x = std::max(monitor.WorkPos.x + 24.0F, workRight - controlsSize.x - 24.0F);
+        }
+        if (position.y + controlsSize.y > workBottom) {
+            position.y = std::max(monitor.WorkPos.y + 24.0F, workBottom - controlsSize.y - 24.0F);
+        }
+        break;
+    }
+
+    return position;
+}
+
+void DrawRenderInfoSection(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    ImGui::SeparatorText("Render Info");
+    if (!runtimeState->errorMessage.empty()) {
+        ImGui::TextColored(ImVec4{0.74F, 0.18F, 0.14F, 1.0F}, "%s", runtimeState->errorMessage.c_str());
+    } else if (!runtimeState->statusMessage.empty()) {
+        ImGui::TextWrapped("%s", runtimeState->statusMessage.c_str());
+    } else {
+        ImGui::TextDisabled("Ready.");
+    }
+
+    const auto& diagnostics = viewport.Diagnostics();
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    ImGui::Text("Render window: %.0f x %.0f UI, %u x %u framebuffer", viewportSize.x, viewportSize.y, viewport.Width(), viewport.Height());
+    if (!diagnostics.rendererName.empty()) {
+        ImGui::Text("GPU: %s", diagnostics.rendererName.c_str());
+    }
+    if (diagnostics.pointCount > 0) {
+        ImGui::Text("Points: %s", FormatPointCount(diagnostics.pointCount).c_str());
+        ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
+        if (!diagnostics.pointRenderModes.empty()) {
+            ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Loaded layers: %s", FormatPointCount(LoadedLayerCount(*runtimeState)).c_str());
+    ImGui::Text("Visible layers: %s", FormatPointCount(VisibleLayerCount(*runtimeState)).c_str());
+    if (const auto* session = SelectedLoadedSession(*runtimeState); session != nullptr) {
+        ImGui::Text("Selected: %s", session->displayName.c_str());
+        ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
+        if (session->kind == LayerKind::PointCloud) {
+            ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
+            ImGui::Text(
+                "%s: %s",
+                PointCloudPreviewLodApplied(*runtimeState, *session) ? "Preview LOD" : "Preview",
+                DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
+            ImGui::Text(
+                "LOD Mode: %s",
+                PointCloudPreviewLodModeLabel(runtimeState->projectSettings.pointCloudPreviewLodMode));
+        } else {
+            const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
+            ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
+            if (effectiveQuality != session->gsplatStyle.qualityMode) {
+                ImGui::Text("Rendering: %s while interacting", GaussianSplatQualityModeLabel(effectiveQuality));
+            }
+            ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
+        }
+    }
+
+    if (runtimeState->pendingLoad.has_value()) {
+        const auto& pendingLoad = runtimeState->pendingLoad.value();
+        ImGui::Separator();
+        ImGui::TextUnformatted("Layer load");
+        if (pendingLoad.sessionIndex < runtimeState->sessions.size()) {
+            const auto& session = runtimeState->sessions[pendingLoad.sessionIndex];
+            ImGui::Text("%s", session.displayName.c_str());
+            ImGui::Text("%s", LayerKindLabel(session.kind));
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - pendingLoad.startedAt;
+        ImGui::Text(
+            "%s for %s",
+            pendingLoad.phase == PendingLoadPhase::CpuLoading ? "Reading source data" : "Uploading GPU buffers",
+            FormatElapsedTime(elapsed).c_str());
+    }
+
+    auto& job = runtimeState->offlineRenderJob;
+    if (job.active) {
+        RefreshAnimationExportWriterProgress(&job);
+        const float frameProgress =
+            job.frames.empty()
+                ? 0.0F
+                : static_cast<float>(job.writtenFrameCount) / static_cast<float>(job.frames.size());
+        ImGui::Separator();
+        ImGui::TextUnformatted(
+            job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+                ? "Encoding Fast Preview MP4"
+                : "Rendering HQ Preview-Density EXR");
+        ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
+        ImGui::Text(
+            "Captured %u / %zu, saved %u, queued %zu",
+            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+            job.frames.size(),
+            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+            job.pendingFrameCount);
+        ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
+        if (!job.lastOutputPath.empty()) {
+            ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
+        }
+        if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
+            RequestOfflineRenderCancellation(&job);
+        }
+    }
+}
+
+void DrawControlsWindow(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+
+    auto& sidePanel = runtimeState->sidePanel;
+    sidePanel.revealAmount = 1.0F;
+    sidePanel.mode = invisible_places::ui::SidePanelMode::Expanded;
+
+    const ImVec2 controlsSize{540.0F, 780.0F};
+    ImGuiWindowClass controlsWindowClass;
+    controlsWindowClass.ClassId = 0x49504354U;
+    controlsWindowClass.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+    controlsWindowClass.ViewportFlagsOverrideClear = ImGuiViewportFlags_NoDecoration;
+    ImGui::SetNextWindowClass(&controlsWindowClass);
+    ImGui::SetNextWindowPos(DefaultControlsWindowPosition(controlsSize), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(controlsSize, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2{460.0F, 420.0F}, ImVec2{780.0F, FLT_MAX});
+
     const bool popupOpen =
         ImGui::IsPopupOpen(static_cast<const char*>(nullptr), ImGuiPopupFlags_AnyPopupId);
-    const bool shouldReveal =
-        sidePanel.pinned || nearRightEdge || sidePanel.hovered || sidePanel.interacting || popupOpen;
-    const float targetReveal = shouldReveal ? 1.0F : 0.0F;
-    sidePanel.revealAmount += (targetReveal - sidePanel.revealAmount) * 0.18F;
-    sidePanel.revealAmount = std::clamp(sidePanel.revealAmount, 0.0F, 1.0F);
-    const float visibleWidth =
-        sidePanel.handleWidth + ((sidePanel.panelWidth - sidePanel.handleWidth) * sidePanel.revealAmount);
-
-    sidePanel.mode = sidePanel.pinned
-                         ? invisible_places::ui::SidePanelMode::Pinned
-                         : sidePanel.revealAmount > 0.02F ? invisible_places::ui::SidePanelMode::RevealOnHover
-                                                          : invisible_places::ui::SidePanelMode::Collapsed;
-
-    ImGui::SetNextWindowPos(ImVec2{io.DisplaySize.x - visibleWidth, 0.0F}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2{visibleWidth, io.DisplaySize.y}, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.94F);
-
-    constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::Begin("SceneLookdevPanel", nullptr, flags);
+    constexpr auto flags = ImGuiWindowFlags_NoCollapse;
+    ImGui::Begin("Invisible Places Controls", nullptr, flags);
 
     sidePanel.hovered = ImGui::IsWindowHovered(
         ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_RootAndChildWindows);
@@ -1917,41 +5358,33 @@ void DrawSidePanel(
         popupOpen || ImGui::IsAnyItemActive() ||
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
-    const auto windowPosition = ImGui::GetWindowPos();
-    const bool handleHovered =
-        sidePanel.hovered && io.MousePos.x <= (windowPosition.x + sidePanel.handleWidth + 2.0F);
-    if (handleHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        sidePanel.pinned = !sidePanel.pinned;
+    if (ImGui::BeginChild("RenderInfoPane", ImVec2{0.0F, 250.0F}, ImGuiChildFlags_Borders)) {
+        DrawRenderInfoSection(runtimeState, *viewport);
     }
+    ImGui::EndChild();
 
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.48F, 0.40F, 0.22F, 0.92F});
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.54F, 0.45F, 0.24F, 0.96F});
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{0.42F, 0.34F, 0.18F, 0.98F});
-
-    if (ImGui::Button(sidePanel.pinned ? "<" : ">", ImVec2{sidePanel.handleWidth - 6.0F, 28.0F})) {
-        sidePanel.pinned = !sidePanel.pinned;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(sidePanel.pinned ? "Unpin panel" : "Pin panel");
-    }
-
-    ImGui::Spacing();
-    const auto verticalLabel = MakeVerticalLabel("SCENE");
-    ImGui::SetCursorPosX(std::max(2.0F, (sidePanel.handleWidth - 10.0F) * 0.5F));
-    ImGui::TextUnformatted(verticalLabel.c_str());
-
-    ImGui::PopStyleColor(3);
-
-    if (visibleWidth > (sidePanel.handleWidth + 20.0F)) {
-        ImGui::SameLine();
-        ImGui::BeginGroup();
-        DrawLayerSection(runtimeState, viewport);
-        DrawStyleSection(runtimeState);
-        DrawCameraSection(runtimeState, *viewport);
-        DrawSettingsSection(runtimeState, *viewport);
-        DrawProjectSection(runtimeState, viewport);
-        DrawPresetSection(runtimeState);
-        ImGui::EndGroup();
+    if (ImGui::BeginTabBar("ScenePanelTabs")) {
+        if (ImGui::BeginTabItem("Lidar")) {
+            DrawLidarPanel(runtimeState, viewport);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("gSplat")) {
+            DrawGsplatPanel(runtimeState, viewport);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Camera")) {
+            DrawCameraSection(runtimeState, *viewport);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Animation")) {
+            DrawAnimationSection(runtimeState, *viewport);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Project")) {
+            DrawProjectPanel(runtimeState, viewport);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
 
     sidePanel.interacting =
@@ -1970,38 +5403,124 @@ void UpdateCameraFromInput(
 
     const auto& io = ImGui::GetIO();
     bool navigatedThisFrame = false;
-    if (!viewport.UiWantsMouseCapture()) {
-        if (io.MouseWheel != 0.0F) {
+    if (runtimeState->animationPanel.drag.active) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
+    const bool mouseButtonDown = io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2];
+    const bool renderViewportHovered = IsMouseOverRenderViewport(viewport);
+    if (!mouseButtonDown) {
+        runtimeState->cameraInteraction.renderViewportMouseActive = false;
+    } else if (renderViewportHovered && !viewport.UiWantsMouseCapture()) {
+        runtimeState->cameraInteraction.renderViewportMouseActive = true;
+    }
+
+    const bool mouseCanNavigate =
+        !viewport.UiWantsMouseCapture() &&
+        (renderViewportHovered || runtimeState->cameraInteraction.renderViewportMouseActive);
+    if (mouseCanNavigate) {
+        if (renderViewportHovered && io.MouseWheel != 0.0F) {
             runtimeState->camera.Dolly(io.MouseWheel);
             navigatedThisFrame = true;
         }
 
+        const bool doubleClickedPivot =
+            !io.KeyShift && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        const bool mouseMoved = io.MouseDelta.x != 0.0F || io.MouseDelta.y != 0.0F;
         const bool isPanning = io.MouseDown[1] || io.MouseDown[2] || (io.KeyShift && io.MouseDown[0]);
-        if (isPanning && (io.MouseDelta.x != 0.0F || io.MouseDelta.y != 0.0F)) {
-            runtimeState->camera.Pan(io.MouseDelta.x, io.MouseDelta.y, io.DisplaySize.x, io.DisplaySize.y);
+        if (doubleClickedPivot) {
+            SetCameraPivotFromScreenPoint(runtimeState, viewport, io.MousePos);
             navigatedThisFrame = true;
-        } else if (io.MouseDown[0] && (io.MouseDelta.x != 0.0F || io.MouseDelta.y != 0.0F)) {
+        } else if (isPanning && mouseMoved) {
+            const auto viewportSize = CurrentUiViewportSize(viewport);
+            runtimeState->camera.Pan(io.MouseDelta.x, io.MouseDelta.y, viewportSize.x, viewportSize.y);
+            navigatedThisFrame = true;
+        } else if (io.MouseDown[0] && mouseMoved) {
             runtimeState->camera.Orbit(io.MouseDelta.x, io.MouseDelta.y);
             navigatedThisFrame = true;
         }
     }
 
-    if (!viewport.UiWantsKeyboardCapture() && ImGui::IsKeyPressed(ImGuiKey_F)) {
+    const bool keyboardCanNavigate = !viewport.UiWantsKeyboardCapture() && IsRenderViewportFocused();
+    if (keyboardCanNavigate && ImGui::IsKeyPressed(ImGuiKey_F)) {
         if (runtimeState->selectedSessionIndex.has_value()) {
             FocusSessionLayer(runtimeState, viewport, runtimeState->selectedSessionIndex.value());
             navigatedThisFrame = true;
         }
     }
 
+    if (keyboardCanNavigate && ImGui::IsKeyPressed(ImGuiKey_P)) {
+        const ImVec2 mousePosition = io.MousePos;
+        SetCameraPivotFromScreenPoint(runtimeState, viewport, mousePosition);
+        navigatedThisFrame = true;
+    }
+
+    if (keyboardCanNavigate && ImGui::IsKeyPressed(ImGuiKey_V)) {
+        runtimeState->pivotOverlay.visible = !runtimeState->pivotOverlay.visible;
+        runtimeState->pivotOverlay.pivot = FromGlm(runtimeState->camera.OrbitCenter());
+        runtimeState->pivotOverlay.lastSetAt = runtimeState->pivotOverlay.visible
+                                                   ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+        runtimeState->statusMessage = runtimeState->pivotOverlay.visible
+                                          ? "Pivot marker pinned on."
+                                          : "Pivot marker hidden until camera navigation.";
+    }
+
     const auto now = std::chrono::steady_clock::now();
     if (navigatedThisFrame) {
         runtimeState->cameraInteraction.lastNavigationInputAt = now;
+        if (runtimeState->cameraPlayback.active) {
+            runtimeState->cameraPlayback.active = false;
+        }
+        if (runtimeState->animationPlayback.active) {
+            runtimeState->animationPlayback.active = false;
+        }
     }
     runtimeState->cameraInteraction.navigationActive =
         navigatedThisFrame ||
         (runtimeState->cameraInteraction.lastNavigationInputAt.time_since_epoch().count() != 0 &&
          (now - runtimeState->cameraInteraction.lastNavigationInputAt) <
              std::chrono::milliseconds{180});
+}
+
+void UpdatePerformanceInteractionState(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool uiInteractionActive =
+        runtimeState->sidePanel.hovered ||
+        runtimeState->sidePanel.interacting ||
+        ImGui::IsAnyItemActive() ||
+        viewport.UiWantsMouseCapture() ||
+        viewport.UiWantsKeyboardCapture();
+    if (uiInteractionActive) {
+        runtimeState->performanceInteraction.lastUiInteractionAt = now;
+    }
+
+    const bool uiInteractionRecent =
+        runtimeState->performanceInteraction.lastUiInteractionAt.time_since_epoch().count() != 0 &&
+        (now - runtimeState->performanceInteraction.lastUiInteractionAt) < kPerformanceInteractionHold;
+    runtimeState->performanceInteraction.active =
+        runtimeState->cameraInteraction.navigationActive || uiInteractionRecent;
+}
+
+void PrunePreviewLodSampleCaches(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    for (auto& session : runtimeState->sessions) {
+        if (!session.loaded ||
+            session.kind != LayerKind::PointCloud ||
+            session.offlinePointCloud == nullptr) {
+            ClearPreviewLodSampleCache(&session);
+            continue;
+        }
+    }
 }
 
 invisible_places::renderer::core::SceneRenderState BuildRenderState(
@@ -2023,6 +5542,15 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     };
     renderState.nearPlane = runtimeState.camera.NearPlane();
     renderState.farPlane = runtimeState.camera.FarPlane();
+    if (runtimeState.animationPanel.currentPath.has_value()) {
+        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+            runtimeState.animationPanel.currentPath.value(),
+            AnimationDurationSeconds(runtimeState.animationPanel.currentPath.value()) *
+                std::clamp(runtimeState.animationPanel.scrubAmount, 0.0F, 1.0F));
+        renderState.hasDepthOfField = true;
+        renderState.focusDistance = evaluation.focusDistance;
+        renderState.apertureFStops = runtimeState.animationPanel.currentPath->apertureFStops;
+    }
     renderState.gaussianSplatFootprintBoost = runtimeState.projectSettings.gaussianSplatFootprintBoost;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
@@ -2032,8 +5560,25 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         }
 
         if (session.kind == LayerKind::PointCloud) {
+            auto drawPointCount = std::min<std::uint64_t>(
+                EffectivePointDrawCount(runtimeState, session),
+                std::numeric_limits<std::uint32_t>::max());
+            const auto previewLodDrawCount = static_cast<std::uint32_t>(drawPointCount);
+            const bool previewLodSampleReady =
+                session.previewLodSampledDrawCount == previewLodDrawCount &&
+                session.previewLodSampledIndices.size() >= previewLodDrawCount;
+            if (!session.pointBudget.UsesSampledIndices() &&
+                drawPointCount < session.pointBudget.activePoints &&
+                !previewLodSampleReady) {
+                drawPointCount = std::min<std::uint64_t>(
+                    session.pointBudget.activePoints,
+                    std::numeric_limits<std::uint32_t>::max());
+            }
             renderState.pointCloudLayers.push_back(
-                {.layerId = sessionIndex, .style = session.pointStyle, .hasSourceRgb = session.hasSourceRgb});
+                {.layerId = sessionIndex,
+                 .style = session.pointStyle,
+                 .hasSourceRgb = session.hasSourceRgb,
+                 .drawPointCount = static_cast<std::uint32_t>(drawPointCount)});
         } else {
             const auto effectiveFrame = ComputeEffectiveLayerFrame(runtimeState, session);
             if (effectiveFrame.bounds.valid &&
@@ -2067,7 +5612,7 @@ int Application::Run() const {
     const auto assetCatalog = io::DiscoverAssets(dataRoot_);
     const auto sceneCatalog = scene::SceneCatalog::FromDiscoveredAssets(assetCatalog);
 
-    std::cout << "Invisible Places bootstrap" << std::endl;
+    std::cout << "Invisible Places preview/export app" << std::endl;
     std::cout << "Data root: " << dataRoot_.string() << std::endl << std::endl;
     std::cout << platform::DescribeVulkanRuntime(runtimeConfig) << std::endl << std::endl;
     std::cout << assetCatalog.Summary();
@@ -2083,7 +5628,7 @@ int Application::Run() const {
     }
 
     std::cout << std::endl
-              << "Opening bootstrap window. Press Escape or close the window to exit." << std::endl;
+              << "Opening preview window. Press Escape or close the window to exit." << std::endl;
 
     const auto windowTitle = platform::MakeBootstrapWindowTitle(assetCatalog);
     platform::Window window{
@@ -2116,9 +5661,33 @@ int Application::Run() const {
     runtimeState.sidePanel.panelWidth = 410.0F;
     runtimeState.persistence.projectFilePath = DefaultProjectFilePath(dataRoot_).string();
     runtimeState.persistence.pointStylePresetPath = DefaultPointStylePresetPath(dataRoot_).string();
+    runtimeState.persistence.animationDirectoryPath = DefaultAnimationDirectory(dataRoot_).string();
+    runtimeState.renderSettings.outputDirectory = DefaultRenderOutputDirectory(dataRoot_).string();
+    RefreshAnimationFileList(&runtimeState.animationPanel, AnimationDirectory(runtimeState));
 
     if (viewport.has_value()) {
-        if (HasAnyPointClouds(runtimeState)) {
+        bool loadedStartupProject = false;
+        const std::filesystem::path startupProjectPath{runtimeState.persistence.projectFilePath};
+        std::error_code startupProjectError;
+        if (std::filesystem::is_regular_file(startupProjectPath, startupProjectError)) {
+            std::string projectErrorMessage;
+            const auto startupProject =
+                invisible_places::serialization::LoadProjectDocument(startupProjectPath, &projectErrorMessage);
+            if (startupProject.has_value() &&
+                ApplyProjectDocumentToRuntime(startupProject.value(), &runtimeState, &viewport.value())) {
+                loadedStartupProject = true;
+                runtimeState.statusMessage =
+                    "Loaded last project from " + startupProjectPath.string() + ".";
+            } else {
+                runtimeState.errorMessage =
+                    "Could not load last project: " + projectErrorMessage + ". Loading the startup cloud instead.";
+                std::cerr << runtimeState.errorMessage << std::endl;
+            }
+        }
+
+        if (loadedStartupProject) {
+            StartQueuedLayerLoadIfIdle(&runtimeState);
+        } else if (HasAnyPointClouds(runtimeState)) {
             BeginLayerLoad(ChooseStartupCloudIndex(runtimeState.sessions), &runtimeState);
         } else if (!runtimeState.sessions.empty()) {
             runtimeState.statusMessage = "No startup point cloud is available. Use the Layers panel to load a gSplat.";
@@ -2131,15 +5700,28 @@ int Application::Run() const {
 
     while (!window.ShouldClose()) {
         window.PollEvents();
+        if (window.ShouldClose()) {
+            break;
+        }
 
         if (viewport.has_value()) {
             PollPendingLayerLoad(&runtimeState, &viewport.value());
-            StartQueuedLayerLoadIfIdle(&runtimeState);
+            if (!runtimeState.offlineRenderJob.active) {
+                StartQueuedLayerLoadIfIdle(&runtimeState);
+            }
             viewport->BeginUiFrame();
-            DrawStatusOverlay(runtimeState);
-            DrawSidePanel(&runtimeState, &viewport.value());
-            DrawLoadingOverlay(runtimeState);
+            if (runtimeState.offlineRenderJob.active) {
+                ProcessOfflineRenderJobStep(&runtimeState, &viewport.value());
+            }
+
+            DrawControlsWindow(&runtimeState, &viewport.value());
+            DrawAnimationViewportOverlay(&runtimeState, viewport.value());
             UpdateCameraFromInput(&runtimeState, viewport.value());
+            UpdateAnimationPlayback(&runtimeState);
+            UpdateCameraShotPlayback(&runtimeState);
+            UpdatePerformanceInteractionState(&runtimeState, viewport.value());
+            PrunePreviewLodSampleCaches(&runtimeState);
+            DrawPivotOverlay(runtimeState, viewport.value());
             viewport->UpdateRenderState(BuildRenderState(runtimeState, viewport.value()));
             viewport->DrawFrame();
         } else {
@@ -2147,6 +5729,7 @@ int Application::Run() const {
         }
     }
 
+    StopBackgroundWorkForShutdown(&runtimeState);
     if (viewport.has_value()) {
         viewport->WaitIdle();
     }

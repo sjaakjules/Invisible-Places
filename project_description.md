@@ -160,6 +160,7 @@ Shot data includes:
 - camera position,
 - orientation quaternion,
 - optional target point,
+- orbit pivot point,
 - FOV,
 - clip planes,
 - easing or interpolation settings,

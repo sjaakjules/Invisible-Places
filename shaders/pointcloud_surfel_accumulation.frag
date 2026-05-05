@@ -7,8 +7,11 @@ layout(location = 3) in float inEmissive;
 layout(location = 4) in float inXray;
 layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
+layout(location = 7) in vec2 inDiscCoord;
 
-layout(location = 0) out vec4 outColor;
+layout(location = 0) out vec4 outAccumulation;
+layout(location = 1) out float outRevealage;
+layout(location = 2) out vec4 outEmission;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -43,6 +46,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu surfelDiameterBinding;
 } styleData;
 
+layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInput sceneDepthInput;
+
 vec3 Viridis(float t) {
     return clamp(vec3(
         0.277727 + 0.520420 * t + 0.117231 * t * t - 0.219384 * t * t * t,
@@ -67,7 +72,7 @@ vec3 Inferno(float t) {
 vec3 Magma(float t) {
     return clamp(vec3(
         0.001462 + 1.384825 * t - 1.875795 * t * t + 0.850876 * t * t * t,
-        0.000466 - 0.251373 * t + 1.927205 * t * t - 1.035104 * t * t * t,
+        0.000466 - 0.251373 * t + 1.927205 * t * t - 1.035937 * t * t * t,
         0.013866 + 0.873807 * t + 0.143707 * t * t - 0.282206 * t * t * t), 0.0, 1.0);
 }
 
@@ -116,12 +121,11 @@ vec3 ResolveBaseColor() {
     return baseColor;
 }
 
-float ResolveFalloff(float radius, float radiusSquared) {
-    const uint renderMode = styleData.renderControl.x;
+float ResolveFalloff(float radius, float radiusSquared, uint mode) {
     uint profile = styleData.renderControl.y;
-    if (renderMode == 1u) {
+    if (mode == 1u) {
         profile = 0u;
-    } else if (renderMode == 6u) {
+    } else if (mode == 6u) {
         profile = 2u;
     }
 
@@ -137,37 +141,79 @@ float ResolveFalloff(float radius, float radiusSquared) {
     return smoothstep(1.0, clamp(styleData.renderParams0.y, 0.0, 0.99), radius);
 }
 
-vec3 ResolveSolidColor(vec3 baseColor) {
-    float emissive = max(0.0, inEmissive);
-    float xray = clamp(inXray, 0.0, 1.0);
-    float depthFade = clamp(inDepthFade, 0.0, 1.0);
-    float depthNorm = clamp(
+float WeightedAlphaWeight(float alpha) {
+    const float depthNorm = clamp(
         (inViewDepth - uniforms.depthParameters.y) /
         max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
         0.0,
         1.0);
-    float fade = mix(1.0, 1.0 - (depthNorm * 0.65), depthFade);
-
-    vec3 shadedColor = baseColor * fade;
-    shadedColor = mix(shadedColor, vec3(1.0), xray * 0.45);
-    shadedColor += emissive * 0.35 * baseColor;
-    return clamp(shadedColor, 0.0, 1.0);
+    const float opacityWeight = pow(min(1.0, alpha * 8.0) + 0.01, 3.0);
+    const float frontWeight = pow(1.0 - depthNorm, 4.0);
+    return clamp(
+        (opacityWeight * 0.5) + (opacityWeight * frontWeight * 128.0),
+        1e-3,
+        256.0);
 }
 
 void main() {
-    vec2 centered = (gl_PointCoord * 2.0) - 1.0;
-    float radiusSquared = dot(centered, centered);
+    float radiusSquared = dot(inDiscCoord, inDiscCoord);
     if (radiusSquared > 1.0) {
         discard;
     }
-    float radius = sqrt(radiusSquared);
 
-    vec3 baseColor = ResolveBaseColor();
-    float opacity = clamp(inOpacity, 0.0, 1.0);
-    float edge = ResolveFalloff(radius, radiusSquared);
-    if (opacity * edge <= 1e-5) {
+    uint mode = styleData.renderControl.x;
+    if (mode == 5u) {
+        mode = 4u;
+    }
+
+    const float radius = sqrt(radiusSquared);
+    const float falloff = ResolveFalloff(radius, radiusSquared, mode);
+    const float opacity = clamp(inOpacity, 0.0, 1.0);
+    const float alpha = clamp(opacity * falloff, 0.0, 0.995);
+    if (alpha <= 1e-5) {
         discard;
     }
 
-    outColor = vec4(ResolveSolidColor(baseColor), opacity * edge);
+    const vec3 baseColor = ResolveBaseColor();
+    outAccumulation = vec4(0.0);
+    outRevealage = 0.0;
+    outEmission = vec4(0.0);
+
+    if (mode == 4u || mode == 6u) {
+        const float densityScale = max(0.0, styleData.renderParams2.x);
+        const float densityClamp = max(0.0, styleData.renderParams2.y);
+        const float weightedAlpha = densityClamp > 0.0 ? min(alpha * max(1.0, densityScale), densityClamp) : alpha;
+        const float weight = WeightedAlphaWeight(weightedAlpha);
+        outAccumulation = vec4(baseColor * weightedAlpha * weight, weightedAlpha * weight);
+        outRevealage = weightedAlpha;
+        return;
+    }
+
+    if (mode == 3u) {
+        const float sceneDepth = subpassLoad(sceneDepthInput).r;
+        const float xrayStrength = clamp(inXray, 0.0, 1.0);
+        if (sceneDepth >= 0.999999 || xrayStrength <= 1e-5) {
+            discard;
+        }
+
+        const float depthBias = max(0.0, styleData.renderParams1.y);
+        const float behind = max(gl_FragCoord.z - sceneDepth - depthBias, 0.0);
+        const float hiddenFade = exp(-behind * max(0.0, styleData.renderParams1.x));
+        const float frontMask = gl_FragCoord.z <= sceneDepth + depthBias ? 1.0 : 0.0;
+        const float xrayAlpha =
+            alpha * xrayStrength * mix(styleData.renderParams1.w * hiddenFade, styleData.renderParams1.z, frontMask);
+        if (xrayAlpha <= 1e-5) {
+            discard;
+        }
+
+        const float gain = max(1.0, inEmissive) * max(0.0, styleData.renderParams0.x);
+        outEmission = vec4(baseColor * xrayAlpha * gain, xrayAlpha * gain);
+        return;
+    }
+
+    const float gain = max(0.0, inEmissive) * max(0.0, styleData.renderParams0.x);
+    if (gain <= 1e-5) {
+        discard;
+    }
+    outEmission = vec4(baseColor * alpha * gain, alpha * gain);
 }

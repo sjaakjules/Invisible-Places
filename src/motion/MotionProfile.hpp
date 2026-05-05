@@ -4,6 +4,8 @@
 
 namespace invisible_places::motion {
 
+// Data-only placeholder for the next motion slice; UI, shader evaluation,
+// project serialization, and export integration are still outstanding.
 struct MotionProfile {
     bool enabled = false;
     invisible_places::style::RenderParameterBinding amplitude;
@@ -11,4 +13,3 @@ struct MotionProfile {
 };
 
 }  // namespace invisible_places::motion
-

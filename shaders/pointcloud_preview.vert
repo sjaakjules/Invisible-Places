@@ -35,13 +35,17 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 solidColor;
     uvec4 globalControl;
     uvec4 pointMeta;
-    uvec4 padding;
+    uvec4 renderControl;
+    vec4 renderParams0;
+    vec4 renderParams1;
+    vec4 renderParams2;
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;
     RenderParameterBindingGpu xrayBinding;
     RenderParameterBindingGpu depthFadeBinding;
     RenderParameterBindingGpu colormapPositionBinding;
+    RenderParameterBindingGpu surfelDiameterBinding;
 } styleData;
 
 const uint kFieldMapFlagClamp = 1u;
@@ -89,7 +93,10 @@ void main() {
     vec4 worldPosition = vec4(inPosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     gl_Position = uniforms.viewProjection * worldPosition;
-    gl_PointSize = max(1.0, EvaluateBinding(styleData.pointSizeBinding));
+    gl_PointSize = clamp(
+        EvaluateBinding(styleData.pointSizeBinding),
+        max(1.0, styleData.renderParams2.z),
+        max(max(1.0, styleData.renderParams2.z), styleData.renderParams2.w));
 
     outSourceColor = inColor;
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);

@@ -36,6 +36,12 @@ find_program(GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator REQUIRED)
 set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_preview.vert
     shaders/pointcloud_preview.frag
+    shaders/pointcloud_accumulation.frag
+    shaders/pointcloud_export_depth.frag
+    shaders/pointcloud_surfel.vert
+    shaders/pointcloud_surfel_preview.frag
+    shaders/pointcloud_surfel_accumulation.frag
+    shaders/pointcloud_surfel_export_depth.frag
     shaders/gsplat_accumulation.vert
     shaders/gsplat_accumulation.frag
     shaders/gsplat_high_quality.vert
@@ -76,12 +82,18 @@ configure_file(
 add_library(
     invisible_places_core
     src/app/Application.cpp
+    src/camera/AnimationPath.cpp
+    src/camera/CameraPath.cpp
     src/camera/OrbitCamera.cpp
     src/io/AssetDiscovery.cpp
     src/io/GaussianSplatData.cpp
     src/io/PointCloudData.cpp
     src/io/PlyHeader.cpp
     src/io/TransformMatrix.cpp
+    src/output/ExrWriter.cpp
+    src/output/OfflinePointRenderer.cpp
+    src/output/RenderPreset.cpp
+    src/output/VideoWriter.cpp
     src/platform/MacWindowingRuntime.cpp
     src/platform/VulkanRuntimeConfig.cpp
     src/platform/Window.cpp
@@ -136,6 +148,9 @@ set_target_properties(
 
 find_package(glfw3 CONFIG REQUIRED)
 target_link_libraries(invisible_places_core PUBLIC glfw)
+find_package(OpenEXR CONFIG REQUIRED)
+target_compile_definitions(invisible_places_core PUBLIC INVISIBLE_PLACES_HAS_OPENEXR=1)
+target_link_libraries(invisible_places_core PUBLIC OpenEXR::OpenEXR)
 
 if(INVISIBLE_PLACES_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
@@ -145,7 +160,7 @@ if(INVISIBLE_PLACES_ENABLE_VULKAN)
     target_compile_definitions(invisible_places_core PUBLIC INVISIBLE_PLACES_HAS_VULKAN=1)
     target_link_libraries(invisible_places_core PUBLIC Vulkan::Vulkan glm::glm nlohmann_json::nlohmann_json)
 
-    message(STATUS "glfw3 package is available for window/bootstrap work.")
+    message(STATUS "glfw3 package is available for window and viewport work.")
 
     find_package(imgui CONFIG REQUIRED)
     target_link_libraries(invisible_places_core PUBLIC imgui::imgui)

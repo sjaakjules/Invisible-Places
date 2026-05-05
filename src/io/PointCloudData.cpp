@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -34,6 +35,9 @@ enum class PropertySemantic {
     ColorR,
     ColorG,
     ColorB,
+    NormalX,
+    NormalY,
+    NormalZ,
     ScalarField
 };
 
@@ -152,6 +156,7 @@ struct PointCloudLayout {
     std::vector<PropertyLayout> properties;
     std::uint32_t recordSize = 0;
     std::uint32_t scalarFieldCount = 0;
+    bool hasNormals = false;
 };
 
 constexpr std::size_t kMaxFocusSamples = 16384;
@@ -164,6 +169,11 @@ std::optional<PointCloudLayout> BuildPointCloudLayout(const PlyHeader& header, s
     bool sawX = false;
     bool sawY = false;
     bool sawZ = false;
+    const bool hasLongNormalTriplet =
+        header.HasProperty("normal_x") && header.HasProperty("normal_y") && header.HasProperty("normal_z");
+    const bool hasShortNormalTriplet =
+        !hasLongNormalTriplet && header.HasProperty("nx") && header.HasProperty("ny") && header.HasProperty("nz");
+    layout.hasNormals = hasLongNormalTriplet || hasShortNormalTriplet;
 
     for (const auto& property : header.properties) {
         const auto scalarType = ParseScalarType(property.type);
@@ -194,6 +204,18 @@ std::optional<PointCloudLayout> BuildPointCloudLayout(const PlyHeader& header, s
             layoutEntry.semantic = PropertySemantic::ColorG;
         } else if (property.name == "blue") {
             layoutEntry.semantic = PropertySemantic::ColorB;
+        } else if (hasLongNormalTriplet && property.name == "normal_x") {
+            layoutEntry.semantic = PropertySemantic::NormalX;
+        } else if (hasLongNormalTriplet && property.name == "normal_y") {
+            layoutEntry.semantic = PropertySemantic::NormalY;
+        } else if (hasLongNormalTriplet && property.name == "normal_z") {
+            layoutEntry.semantic = PropertySemantic::NormalZ;
+        } else if (hasShortNormalTriplet && property.name == "nx") {
+            layoutEntry.semantic = PropertySemantic::NormalX;
+        } else if (hasShortNormalTriplet && property.name == "ny") {
+            layoutEntry.semantic = PropertySemantic::NormalY;
+        } else if (hasShortNormalTriplet && property.name == "nz") {
+            layoutEntry.semantic = PropertySemantic::NormalZ;
         } else if (StartsWith(property.name, "scalar_")) {
             layoutEntry.semantic = PropertySemantic::ScalarField;
             layoutEntry.scalarFieldIndex = scalarFieldIndex++;
@@ -212,6 +234,24 @@ std::optional<PointCloudLayout> BuildPointCloudLayout(const PlyHeader& header, s
 
     layout.scalarFieldCount = scalarFieldIndex;
     return layout;
+}
+
+Float3 NormalizeNormal(Float3 normal) {
+    if (!std::isfinite(normal.x) || !std::isfinite(normal.y) || !std::isfinite(normal.z)) {
+        return {};
+    }
+
+    const float lengthSquared = (normal.x * normal.x) + (normal.y * normal.y) + (normal.z * normal.z);
+    if (lengthSquared <= 1.0e-12F) {
+        return {};
+    }
+
+    const float inverseLength = 1.0F / std::sqrt(lengthSquared);
+    return {
+        normal.x * inverseLength,
+        normal.y * inverseLength,
+        normal.z * inverseLength,
+    };
 }
 
 std::size_t RecommendedPointsPerChunk(std::uint32_t recordSize) {
@@ -349,9 +389,13 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
     cloud.sourcePath = filePath;
     cloud.layerName = filePath.stem().string();
     cloud.hasSourceRgb = header.HasColorRgb();
+    cloud.hasNormals = layout->hasNormals;
 
     try {
         cloud.positions.resize(static_cast<std::size_t>(header.vertexCount));
+        if (cloud.hasNormals) {
+            cloud.normals.resize(static_cast<std::size_t>(header.vertexCount));
+        }
         cloud.packedColors.resize(static_cast<std::size_t>(header.vertexCount), PackRgba8(255, 255, 255));
         cloud.scalarFields.reserve(layout->scalarFieldCount);
         for (const auto& property : header.properties) {
@@ -390,6 +434,7 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
             const auto* recordBytes = chunkBuffer.data() + (localIndex * layout->recordSize);
 
             Float3 position{};
+            Float3 normal{};
             std::uint8_t red = 255;
             std::uint8_t green = 255;
             std::uint8_t blue = 255;
@@ -416,6 +461,15 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
                     case PropertySemantic::ColorB:
                         blue = ReadScalarAsByte(propertyBytes, property.type);
                         break;
+                    case PropertySemantic::NormalX:
+                        normal.x = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::NormalY:
+                        normal.y = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::NormalZ:
+                        normal.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
                     case PropertySemantic::ScalarField: {
                         const auto scalarValue =
                             static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
@@ -430,6 +484,9 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
             }
 
             cloud.positions[globalIndex] = position;
+            if (cloud.hasNormals) {
+                cloud.normals[globalIndex] = NormalizeNormal(normal);
+            }
             cloud.packedColors[globalIndex] = PackRgba8(red, green, blue);
             cloud.bounds.Expand(position);
             if ((globalIndex % focusSampleStride) == 0 && focusSamples.size() < kMaxFocusSamples) {

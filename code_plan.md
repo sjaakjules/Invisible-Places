@@ -21,33 +21,32 @@ Suggested code layout:
 ```text
 /src
   /app
+  /camera
+  /io
+  /motion
+  /output
   /platform
   /renderer
     /core
-    /pointcloud
     /gsplat
-    /passes
-    /shaders
+    /pointcloud
   /scene
-  /camera
-  /ui
-  /io
-  /style
-  /motion
-  /rendergraph
-  /jobs
-  /output
   /serialization
+  /style
+  /ui
 /tests
-/assets
 /shaders
 /docs
+/Data
+/Saved
 ```
+
+Root-level `/shaders` is the active shader source location. Add `/src/renderer/passes`, `/src/rendergraph`, `/src/jobs`, or `/assets` only when a concrete implementation needs them.
 
 ## 3. Module Breakdown
 ### 3.1 app
 Responsibilities:
-- application bootstrap,
+- application shell lifecycle,
 - main loop,
 - subsystem init/shutdown,
 - project open/save,
@@ -515,85 +514,27 @@ Allow the user to tag specific scalar fields for output to avoid exploding pass 
 - all requested AOVs.
 
 ## 13. Implementation Milestones
-### Milestone 1 — Foundation
-Deliver:
-- Vulkan app shell,
-- window and input,
-- Dear ImGui integration,
-- basic scene load/save,
-- PLY import with scalar-field inspection.
+### Current completed / substantially implemented slices
+- Foundation app, windowing, Vulkan viewport, Dear ImGui side panel, CMake/vcpkg build, shader compilation, and Catch2 test wiring.
+- Asset discovery, binary PLY point-cloud loading, normal parsing, scalar-field statistics, gSplat asset loading, and same-stem transform pairing.
+- Multi-layer point-cloud and gSplat preview rendering in the same camera system.
+- Point-cloud style controls for screen sprites, world surfels, colour ramps, X-ray, emissive, weighted-transparent, density, falloff, point-size, opacity, emissive, X-ray, depth-fade, and colormap field bindings.
+- Deterministic point-budget sampling plus automatic preview LOD during camera movement/playback.
+- Slide-out/pinnable side panel split into Lidar, gSplat, Camera, Animation, and Project tabs.
+- Camera shot save/load, ordered camera paths, quaternion interpolation, 30 fps timing, and CPU-assisted surface pivot picking.
+- Animation paths derived from camera paths, editable camera/focus keys, playback/scrubbing, save/load, focus distance, and aperture metadata.
+- Project JSON round-trip for layer load/visibility state, point budgets, point-cloud styles, current camera, camera shots, camera path, selected layer, render settings, last animation path, side panel state, preview LOD mode, and background/gSplat quality settings.
+- Point-cloud style preset save/load.
+- GPU animation export for Fast Preview MP4 and preview-density EXR stacks, with EXR beauty/alpha/depth channels.
+- CPU/offline point tile renderer and multichannel EXR writer test coverage.
 
-Acceptance:
-- app loads PLY and lists discovered scalar fields.
-
-### Milestone 2 — Basic point-cloud rendering
-Deliver:
-- static point rendering,
-- point size and colour controls,
-- layer visibility,
-- 1080p preview navigation.
-
-Acceptance:
-- user can view and navigate a loaded point cloud.
-
-### Milestone 3 — Side panel and shared parameter widgets
-Deliver:
-- slide-out / pinnable side panel,
-- reusable `ParameterBindingWidget`,
-- constant vs field-mapped point size,
-- constant vs field-mapped opacity.
-
-Acceptance:
-- user can pin the panel and map a field to point size.
-
-### Milestone 4 — Camera and shots
-Deliver:
-- orbit and free-fly controller,
-- inferred target pivot,
-- shot save/load,
-- quaternion interpolation.
-
-Acceptance:
-- user can create at least two shots and play an interpolated move.
-
-### Milestone 5 — Style system expansion
-Deliver:
-- colour ramps,
-- X-ray mode,
-- emissive controls,
-- preset save/load,
-- shared field-mapped controls across major style parameters.
-
-Acceptance:
-- multiple parameters can be driven from scalar fields through the same widget model.
-
-### Milestone 6 — Procedural motion
-Deliver:
-- field-driven vibration,
-- amplitude and frequency bindings,
-- preview-safe motion toggle.
-
-Acceptance:
-- dynamic layer can vibrate from field values without mutating source data.
-
-### Milestone 7 — GS integration
-Deliver:
-- GS layer loading,
-- combined camera and scene rendering,
-- shared shot playback with point-cloud renderer.
-
-Acceptance:
-- point clouds and splats render together in the same shot system.
-
-### Milestone 8 — Offline rendering and AOVs
-Deliver:
-- tiled 8K render,
-- beauty, depth, alpha, layer ID,
-- selected scalar-field outputs,
-- command-line render path.
-
-Acceptance:
-- project can render a shot sequence with requested AOVs offline.
+### Active gaps / next slices
+- Field-driven procedural motion is still a data stub; amplitude/frequency bindings exist only as `MotionProfile` data and are not wired into UI, shaders, project serialization, or export.
+- AOV coverage is currently beauty, alpha, and depth. Layer ID, world position, motion vectors, selected scalar-field passes, and mapped-style passes remain to be implemented.
+- Final-output validation still needs full-density/high-resolution EXR rendering at exhibition sizes, including clear rules for when preview-density export is acceptable.
+- gSplat participation in offline/animation exports needs a final decision and implementation path; current animation export focuses on point-cloud layers.
+- Command-line/headless rendering for saved projects and animation paths is not implemented yet.
+- Large-scene paging/chunk streaming beyond deterministic sampling and preview LOD remains open.
 
 ## 14. Codex Agent Breakdown
 ### Agent A — Core app and Vulkan foundation
@@ -603,7 +544,7 @@ Owns:
 - `/src/renderer/core`
 
 Tasks:
-- bootstrap app,
+- maintain app shell,
 - wire swapchain and frame loop,
 - integrate UI backend.
 

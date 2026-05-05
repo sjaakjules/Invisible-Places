@@ -11,8 +11,17 @@ namespace invisible_places::serialization {
 namespace {
 
 using nlohmann::json;
+using invisible_places::camera::AnimationPath;
+using invisible_places::camera::AnimationPathKey;
+using invisible_places::camera::CameraShot;
+using invisible_places::camera::CameraState;
+using invisible_places::output::RenderJobSettings;
 using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
+using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
+using invisible_places::renderer::pointcloud::PointCloudRenderMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
 using invisible_places::style::FieldMapConfig;
 using invisible_places::style::ParameterSourceMode;
@@ -97,6 +106,122 @@ PointCloudColormapId ParsePointCloudColormap(const json& value) {
     return PointCloudColormapId::Viridis;
 }
 
+const char* PointCloudPreviewLodModeName(PointCloudPreviewLodMode mode) {
+    switch (mode) {
+        case PointCloudPreviewLodMode::FullResolution:
+            return "full_resolution";
+        case PointCloudPreviewLodMode::AutoCameraLod:
+            return "auto_camera_lod";
+        case PointCloudPreviewLodMode::ForceLod:
+            return "force_lod";
+    }
+
+    return "auto_camera_lod";
+}
+
+PointCloudPreviewLodMode ParsePointCloudPreviewLodMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "full_resolution") {
+        return PointCloudPreviewLodMode::FullResolution;
+    }
+    if (modeName == "force_lod") {
+        return PointCloudPreviewLodMode::ForceLod;
+    }
+    return PointCloudPreviewLodMode::AutoCameraLod;
+}
+
+const char* PointCloudGeometryModeName(PointCloudGeometryMode mode) {
+    switch (mode) {
+        case PointCloudGeometryMode::ScreenSprites:
+            return "screen_sprites";
+        case PointCloudGeometryMode::WorldSurfels:
+            return "world_surfels";
+    }
+
+    return "screen_sprites";
+}
+
+PointCloudGeometryMode ParsePointCloudGeometryMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "world_surfels") {
+        return PointCloudGeometryMode::WorldSurfels;
+    }
+    return PointCloudGeometryMode::ScreenSprites;
+}
+
+const char* PointCloudRenderModeName(PointCloudRenderMode mode) {
+    switch (mode) {
+        case PointCloudRenderMode::Solid:
+            return "solid";
+        case PointCloudRenderMode::EmissiveHard:
+            return "emissive_hard";
+        case PointCloudRenderMode::EmissiveFeathered:
+            return "emissive_feathered";
+        case PointCloudRenderMode::DepthXray:
+            return "depth_xray";
+        case PointCloudRenderMode::WeightedTransparent:
+            return "weighted_transparent";
+        case PointCloudRenderMode::ComputeDensity:
+            return "compute_density";
+        case PointCloudRenderMode::GaussianPointSprite:
+            return "gaussian_point_sprite";
+    }
+
+    return "solid";
+}
+
+PointCloudRenderMode ParsePointCloudRenderMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "emissive_hard") {
+        return PointCloudRenderMode::EmissiveHard;
+    }
+    if (modeName == "emissive_feathered") {
+        return PointCloudRenderMode::EmissiveFeathered;
+    }
+    if (modeName == "depth_xray") {
+        return PointCloudRenderMode::DepthXray;
+    }
+    if (modeName == "weighted_transparent") {
+        return PointCloudRenderMode::WeightedTransparent;
+    }
+    if (modeName == "compute_density") {
+        return PointCloudRenderMode::ComputeDensity;
+    }
+    if (modeName == "gaussian_point_sprite") {
+        return PointCloudRenderMode::GaussianPointSprite;
+    }
+    return PointCloudRenderMode::Solid;
+}
+
+const char* PointCloudFalloffProfileName(PointCloudFalloffProfile profile) {
+    switch (profile) {
+        case PointCloudFalloffProfile::HardDisc:
+            return "hard_disc";
+        case PointCloudFalloffProfile::SoftDisc:
+            return "soft_disc";
+        case PointCloudFalloffProfile::Gaussian:
+            return "gaussian";
+        case PointCloudFalloffProfile::Rim:
+            return "rim";
+    }
+
+    return "soft_disc";
+}
+
+PointCloudFalloffProfile ParsePointCloudFalloffProfile(const json& value) {
+    const auto profileName = value.get<std::string>();
+    if (profileName == "hard_disc") {
+        return PointCloudFalloffProfile::HardDisc;
+    }
+    if (profileName == "gaussian") {
+        return PointCloudFalloffProfile::Gaussian;
+    }
+    if (profileName == "rim") {
+        return PointCloudFalloffProfile::Rim;
+    }
+    return PointCloudFalloffProfile::SoftDisc;
+}
+
 const char* SerializedLayerKindName(SerializedLayerKind kind) {
     return kind == SerializedLayerKind::GaussianSplat ? "gsplat" : "point_cloud";
 }
@@ -155,10 +280,24 @@ RenderParameterBinding ParseBinding(const json& bindingJson) {
 
 json SerializePointCloudStyle(const PointCloudStyleState& style) {
     return json{
+        {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
+        {"render_mode", PointCloudRenderModeName(style.renderMode)},
+        {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
         {"color_mode", PointCloudColorModeName(style.colorMode)},
         {"colormap", PointCloudColormapName(style.colormap)},
         {"solid_color", style.solidColor},
+        {"exposure", style.exposure},
+        {"inner_radius", style.innerRadius},
+        {"gaussian_sharpness", style.gaussianSharpness},
+        {"feather_power", style.featherPower},
+        {"depth_falloff", style.depthFalloff},
+        {"depth_bias", style.depthBias},
+        {"front_alpha", style.frontAlpha},
+        {"hidden_alpha", style.hiddenAlpha},
+        {"density_scale", style.densityScale},
+        {"density_clamp", style.densityClamp},
         {"point_size", SerializeBinding(style.pointSize)},
+        {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
         {"emissive_strength", SerializeBinding(style.emissiveStrength)},
         {"xray_strength", SerializeBinding(style.xrayStrength)},
@@ -169,6 +308,15 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
 
 PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     PointCloudStyleState style;
+    if (styleJson.contains("geometry_mode")) {
+        style.geometryMode = ParsePointCloudGeometryMode(styleJson.at("geometry_mode"));
+    }
+    if (styleJson.contains("render_mode")) {
+        style.renderMode = ParsePointCloudRenderMode(styleJson.at("render_mode"));
+    }
+    if (styleJson.contains("falloff_profile")) {
+        style.falloffProfile = ParsePointCloudFalloffProfile(styleJson.at("falloff_profile"));
+    }
     if (styleJson.contains("color_mode")) {
         style.colorMode = ParsePointCloudColorMode(styleJson.at("color_mode"));
     }
@@ -178,8 +326,21 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     if (styleJson.contains("solid_color")) {
         style.solidColor = styleJson.at("solid_color").get<std::array<float, 4>>();
     }
+    style.exposure = styleJson.value("exposure", style.exposure);
+    style.innerRadius = styleJson.value("inner_radius", style.innerRadius);
+    style.gaussianSharpness = styleJson.value("gaussian_sharpness", style.gaussianSharpness);
+    style.featherPower = styleJson.value("feather_power", style.featherPower);
+    style.depthFalloff = styleJson.value("depth_falloff", style.depthFalloff);
+    style.depthBias = styleJson.value("depth_bias", style.depthBias);
+    style.frontAlpha = styleJson.value("front_alpha", style.frontAlpha);
+    style.hiddenAlpha = styleJson.value("hidden_alpha", style.hiddenAlpha);
+    style.densityScale = styleJson.value("density_scale", style.densityScale);
+    style.densityClamp = styleJson.value("density_clamp", style.densityClamp);
     if (styleJson.contains("point_size")) {
         style.pointSize = ParseBinding(styleJson.at("point_size"));
+    }
+    if (styleJson.contains("surfel_diameter")) {
+        style.surfelDiameter = ParseBinding(styleJson.at("surfel_diameter"));
     }
     if (styleJson.contains("opacity")) {
         style.opacity = ParseBinding(styleJson.at("opacity"));
@@ -224,6 +385,143 @@ ProjectLayerDocument ParseProjectLayer(const json& layerJson) {
         layer.pointStyle = ParsePointCloudStyle(layerJson.at("point_style"));
     }
     return layer;
+}
+
+json SerializeCameraState(const CameraState& state) {
+    json stateJson{
+        {"position", state.position},
+        {"orientation", state.orientation},
+        {"target", state.target},
+        {"fov_degrees", state.fovDegrees},
+        {"near_plane", state.nearPlane},
+        {"far_plane", state.farPlane},
+    };
+    if (state.hasOrbitCenter) {
+        stateJson["orbit_center"] = state.orbitCenter;
+    }
+    return stateJson;
+}
+
+CameraState ParseCameraState(const json& stateJson) {
+    CameraState state;
+    if (stateJson.contains("position")) {
+        state.position = stateJson.at("position").get<std::array<float, 3>>();
+    }
+    if (stateJson.contains("orientation")) {
+        state.orientation = stateJson.at("orientation").get<std::array<float, 4>>();
+    }
+    if (stateJson.contains("target")) {
+        state.target = stateJson.at("target").get<std::array<float, 3>>();
+    }
+    if (stateJson.contains("orbit_center")) {
+        state.orbitCenter = stateJson.at("orbit_center").get<std::array<float, 3>>();
+        state.hasOrbitCenter = true;
+    }
+    state.fovDegrees = stateJson.value("fov_degrees", 60.0F);
+    state.nearPlane = stateJson.value("near_plane", 0.01F);
+    state.farPlane = stateJson.value("far_plane", 1000.0F);
+    return state;
+}
+
+json SerializeCameraShot(const CameraShot& shot) {
+    return json{
+        {"name", shot.name},
+        {"duration_frames", shot.durationFrames},
+        {"camera", SerializeCameraState(shot.state)},
+    };
+}
+
+CameraShot ParseCameraShot(const json& shotJson) {
+    CameraShot shot;
+    shot.name = shotJson.value("name", std::string{"Camera Shot"});
+    shot.durationFrames = shotJson.value("duration_frames", 90U);
+    if (shotJson.contains("camera")) {
+        shot.state = ParseCameraState(shotJson.at("camera"));
+    }
+    return shot;
+}
+
+json SerializeAnimationPathKey(const AnimationPathKey& key) {
+    return json{
+        {"camera_position", key.cameraPosition},
+        {"focus_point", key.focusPoint},
+        {"fov_degrees", key.fovDegrees},
+        {"near_plane", key.nearPlane},
+        {"far_plane", key.farPlane},
+        {"duration_frames", key.durationFrames},
+        {"source_shot_name", key.sourceShotName},
+    };
+}
+
+AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
+    AnimationPathKey key;
+    if (keyJson.contains("camera_position")) {
+        key.cameraPosition = keyJson.at("camera_position").get<std::array<float, 3>>();
+    }
+    if (keyJson.contains("focus_point")) {
+        key.focusPoint = keyJson.at("focus_point").get<std::array<float, 3>>();
+    }
+    key.fovDegrees = keyJson.value("fov_degrees", key.fovDegrees);
+    key.nearPlane = keyJson.value("near_plane", key.nearPlane);
+    key.farPlane = keyJson.value("far_plane", key.farPlane);
+    key.durationFrames = keyJson.value("duration_frames", key.durationFrames);
+    key.sourceShotName = keyJson.value("source_shot_name", std::string{});
+    return key;
+}
+
+json SerializeAnimationPath(const AnimationPath& path) {
+    json pathJson{
+        {"schema_version", 1U},
+        {"name", path.name},
+        {"duration_frames", path.durationFrames},
+        {"aperture_f_stops", path.apertureFStops},
+        {"keys", json::array()},
+    };
+    for (const auto& key : path.keys) {
+        pathJson["keys"].push_back(SerializeAnimationPathKey(key));
+    }
+    return pathJson;
+}
+
+AnimationPath ParseAnimationPath(const json& pathJson) {
+    AnimationPath path;
+    path.name = pathJson.value("name", path.name);
+    path.durationFrames = pathJson.value("duration_frames", path.durationFrames);
+    path.apertureFStops = pathJson.value("aperture_f_stops", path.apertureFStops);
+    if (pathJson.contains("keys")) {
+        for (const auto& keyJson : pathJson.at("keys")) {
+            path.keys.push_back(ParseAnimationPathKey(keyJson));
+        }
+    }
+    return path;
+}
+
+json SerializeRenderJobSettings(const RenderJobSettings& settings) {
+    return json{
+        {"output_directory", settings.outputDirectory},
+        {"width", settings.width},
+        {"height", settings.height},
+        {"fps", settings.framesPerSecond},
+        {"tile_size", settings.tileSize},
+        {"start_frame", settings.startFrame},
+        {"end_frame", settings.endFrame},
+        {"from_shot_index", settings.fromShotIndex},
+        {"to_shot_index", settings.toShotIndex},
+    };
+}
+
+RenderJobSettings ParseRenderJobSettings(const json& settingsJson) {
+    RenderJobSettings settings;
+    settings.outputDirectory = settingsJson.value("output_directory", std::string{});
+    settings.width = settingsJson.value("width", 1920U);
+    settings.height = settingsJson.value("height", 1080U);
+    settings.framesPerSecond = settingsJson.value("fps", 30U);
+    settings.tileSize = settingsJson.value("tile_size", 512U);
+    settings.startFrame = settingsJson.value("start_frame", 0U);
+    settings.endFrame = settingsJson.value("end_frame", 0U);
+    settings.fromShotIndex = settingsJson.value("from_shot_index", static_cast<std::size_t>(0U));
+    settings.toShotIndex = settingsJson.value("to_shot_index", static_cast<std::size_t>(1U));
+    return settings;
 }
 
 template <typename TDocument>
@@ -285,15 +583,31 @@ bool SaveProjectDocument(
         {"schema_version", document.schemaVersion},
         {"project_name", document.projectName},
         {"selected_layer_path", document.selectedLayerPath.generic_string()},
+        {"last_animation_path", document.lastAnimationPath.generic_string()},
         {"background_color", document.backgroundColor},
         {"side_panel_pinned", document.sidePanelPinned},
         {"auto_lower_gsplat_quality_while_navigating", document.autoLowerGsplatQualityWhileNavigating},
+        {"point_cloud_preview_lod_mode", PointCloudPreviewLodModeName(document.pointCloudPreviewLodMode)},
+        {"interactive_point_cap", document.interactivePointCap},
+        {"render_job", SerializeRenderJobSettings(document.renderJobSettings)},
     };
+    if (document.cameraState.has_value()) {
+        projectJson["camera"] = SerializeCameraState(document.cameraState.value());
+    }
 
     projectJson["layers"] = json::array();
     for (const auto& layer : document.layers) {
         projectJson["layers"].push_back(SerializeProjectLayer(layer));
     }
+
+    projectJson["camera_shots"] = json::array();
+    for (const auto& shot : document.cameraShots) {
+        projectJson["camera_shots"].push_back(SerializeCameraShot(shot));
+    }
+    projectJson["camera_path"] = json{
+        {"shot_indices", document.cameraPathShotIndices},
+        {"duration_frames", document.cameraPathDurationFrames},
+    };
 
     return WriteJsonDocument(document, projectJson, outputPath, errorMessage);
 }
@@ -310,11 +624,23 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.schemaVersion = projectJson->value("schema_version", 1U);
     document.projectName = projectJson->value("project_name", std::string{"Invisible Places"});
     document.selectedLayerPath = projectJson->value("selected_layer_path", std::string{});
+    document.lastAnimationPath = projectJson->value("last_animation_path", std::string{});
     document.backgroundColor =
         projectJson->value("background_color", std::array<float, 4>{0.0F, 0.0F, 0.0F, 1.0F});
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
     document.autoLowerGsplatQualityWhileNavigating =
         projectJson->value("auto_lower_gsplat_quality_while_navigating", true);
+    if (projectJson->contains("point_cloud_preview_lod_mode")) {
+        document.pointCloudPreviewLodMode =
+            ParsePointCloudPreviewLodMode(projectJson->at("point_cloud_preview_lod_mode"));
+    }
+    document.interactivePointCap = projectJson->value("interactive_point_cap", 10'000'000ULL);
+    if (projectJson->contains("render_job")) {
+        document.renderJobSettings = ParseRenderJobSettings(projectJson->at("render_job"));
+    }
+    if (projectJson->contains("camera")) {
+        document.cameraState = ParseCameraState(projectJson->at("camera"));
+    }
 
     if (projectJson->contains("layers")) {
         for (const auto& layerJson : projectJson->at("layers")) {
@@ -322,7 +648,47 @@ std::optional<ProjectDocument> LoadProjectDocument(
         }
     }
 
+    if (projectJson->contains("camera_shots")) {
+        for (const auto& shotJson : projectJson->at("camera_shots")) {
+            document.cameraShots.push_back(ParseCameraShot(shotJson));
+        }
+    }
+    if (projectJson->contains("camera_path")) {
+        const auto& cameraPathJson = projectJson->at("camera_path");
+        document.cameraPathDurationFrames =
+            cameraPathJson.value("duration_frames", document.cameraPathDurationFrames);
+        if (cameraPathJson.contains("shot_indices")) {
+            document.cameraPathShotIndices =
+                cameraPathJson.at("shot_indices").get<std::vector<std::size_t>>();
+        }
+    }
+
     return document;
+}
+
+bool SaveAnimationPath(
+    const invisible_places::camera::AnimationPath& path,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage) {
+    return WriteJsonDocument(path, SerializeAnimationPath(path), outputPath, errorMessage);
+}
+
+std::optional<invisible_places::camera::AnimationPath> LoadAnimationPath(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage) {
+    const auto pathJson = ReadJsonDocument(inputPath, errorMessage);
+    if (!pathJson.has_value()) {
+        return std::nullopt;
+    }
+
+    try {
+        return ParseAnimationPath(pathJson.value());
+    } catch (const std::exception& error) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to parse animation path: " + std::string{error.what()};
+        }
+        return std::nullopt;
+    }
 }
 
 bool SavePointCloudStylePreset(

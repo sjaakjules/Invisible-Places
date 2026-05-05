@@ -67,9 +67,16 @@ Right now the debug target is most useful for:
 - PLY header parsing,
 - gSplat transform pairing,
 - asset discovery,
-- scene catalog generation.
+- scene catalog generation,
+- Vulkan viewport initialization,
+- point-cloud and gSplat preview rendering,
+- side-panel lookdev controls,
+- camera shot save/load/interpolation and CPU-assisted pivot picking,
+- animation-path save/load/scrub/edit behaviour,
+- Fast Preview MP4 and preview-density EXR animation export,
+- EXR writer and offline LiDAR tile-rendering tests.
 
-As the Vulkan shell and renderer are added, the same debug flow will keep working with the same debug preset and LLDB launch configs.
+As richer AOVs, full-density final-output validation, command-line rendering, and procedural motion are added, the same debug flow should keep working with the same debug preset and LLDB launch configs.
 
 ## Console noise on macOS
 
@@ -84,7 +91,7 @@ You may still occasionally see system-side macOS messages such as:
 These are typically OS or framework diagnostics from the debug environment rather than failures in the app itself. The signal to watch for in this project is our own renderer line:
 
 ```text
-Renderer: Apple M1 Max | 2880x1800 | clear-only Vulkan viewport
+Renderer: Apple M1 Max | 2880x1800 | Vulkan viewport
 ```
 
-That line means the Vulkan viewport shell initialized successfully.
+That line means the Vulkan viewport shell initialized successfully; loaded layers should then render through the Lidar and gSplat panels.

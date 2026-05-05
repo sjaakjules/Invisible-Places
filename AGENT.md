@@ -97,42 +97,39 @@ Use this map instead of guessing.
 ---
 
 ## 5. Repository shape expected by Codex
-Unless the repository later changes intentionally, assume this layout:
+The current repository layout is:
 
 ```text
 /src
   /app
+  /camera
+  /io
+  /motion
+  /output
   /platform
   /renderer
     /core
-    /pointcloud
     /gsplat
-    /passes
-    /shaders
+    /pointcloud
   /scene
-  /camera
-  /ui
-  /io
-  /style
-  /motion
-  /rendergraph
-  /jobs
-  /output
   /serialization
+  /style
+  /ui
 /tests
-/assets
 /shaders
 /docs
+/Data
+/Saved
 ```
 
-If the repository is still empty, create files consistent with this structure.
+Shader sources currently live in root-level `/shaders`. Do not introduce `/src/renderer/shaders`, `/src/rendergraph`, `/src/jobs`, or `/assets` just to match older plans; add those directories only when a concrete implementation slice needs them.
 
 ---
 
 ## 6. Ownership model
 Each Codex task must have a single primary owner. Cross-cutting changes are allowed only when the contract says so.
 
-### A. Bootstrap / Build Agent
+### A. App / Build Agent
 Owns:
 - `CMakeLists.txt`
 - `/cmake/**`
@@ -141,7 +138,7 @@ Owns:
 - minimal wiring in `/src/main*`
 
 May touch:
-- `/src/renderer/core/**` for bootstrapping only
+- `/src/renderer/core/**` for app-shell integration only
 
 Must not own:
 - point styling logic
@@ -375,7 +372,7 @@ These are the default vertical slices. Do not skip ahead unless dependencies are
 
 ### Milestone 1 — Foundation
 Owner sequence:
-1. Bootstrap / Build Agent
+1. App / Build Agent
 2. Renderer Core Agent
 3. QA / Validation Agent
 
@@ -471,7 +468,7 @@ Must deliver:
 ## 10. Acceptance tests by subsystem
 These are minimum checks. Add finer tests per task.
 
-### Build / bootstrap
+### Build / app shell
 - Project configures on macOS Apple Silicon.
 - App launches a window and cleanly exits.
 - No hard dependency on Windows-only APIs.

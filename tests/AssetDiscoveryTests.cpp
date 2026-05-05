@@ -1,9 +1,17 @@
 #include "InvisiblePlacesBuildConfig.hpp"
+#include "camera/AnimationPath.hpp"
+#include "camera/CameraPath.hpp"
+#include "camera/CameraShot.hpp"
+#include "camera/OrbitCamera.hpp"
 #include "io/AssetDiscovery.hpp"
 #include "io/GaussianSplatData.hpp"
 #include "io/PointCloudData.hpp"
 #include "io/PlyHeader.hpp"
 #include "io/TransformMatrix.hpp"
+#include "output/ExrWriter.hpp"
+#include "output/OfflinePointRenderer.hpp"
+#include "output/RenderPreset.hpp"
+#include "output/VideoWriter.hpp"
 #include "platform/WindowTitle.hpp"
 #include "platform/VulkanRuntimeConfig.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
@@ -15,14 +23,20 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <glm/gtc/constants.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/geometric.hpp>
+#include <glm/matrix.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -32,6 +46,23 @@ namespace {
 
 std::filesystem::path DataRoot() {
     return std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
+}
+
+void WriteLookAtOrientation(invisible_places::camera::CameraState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    const glm::vec3 position{state->position[0], state->position[1], state->position[2]};
+    const glm::vec3 target{state->target[0], state->target[1], state->target[2]};
+    if (glm::length(target - position) <= 1.0e-5F) {
+        return;
+    }
+
+    const auto view = glm::lookAtRH(position, target, glm::vec3{0.0F, 0.0F, 1.0F});
+    const auto cameraToWorld = glm::inverse(glm::mat3{view});
+    const auto orientation = glm::normalize(glm::quat_cast(cameraToWorld));
+    state->orientation = {orientation.x, orientation.y, orientation.z, orientation.w};
 }
 
 template <typename T>
@@ -87,6 +118,55 @@ std::filesystem::path WriteTinyBinaryPointCloudFixture() {
         AppendBinary(&bytes, point.b);
         AppendBinary(&bytes, point.temperature);
         AppendBinary(&bytes, point.density);
+    }
+
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    return fixturePath;
+}
+
+std::filesystem::path WriteTinyBinaryPointCloudNormalFixture(bool longNames) {
+    const auto fixturePath = std::filesystem::temp_directory_path() /
+                             (longNames ? "invisible_places_point_normals_long_fixture.ply"
+                                        : "invisible_places_point_normals_short_fixture.ply");
+    std::ofstream output{fixturePath, std::ios::binary | std::ios::trunc};
+    if (!output.is_open()) {
+        throw std::runtime_error{"Failed to create temporary normal PLY fixture."};
+    }
+
+    output << "ply\n";
+    output << "format binary_little_endian 1.0\n";
+    output << "element vertex 3\n";
+    output << "property float x\n";
+    output << "property float y\n";
+    output << "property float z\n";
+    output << "property float " << (longNames ? "normal_x" : "nx") << "\n";
+    output << "property float " << (longNames ? "normal_y" : "ny") << "\n";
+    output << "property float " << (longNames ? "normal_z" : "nz") << "\n";
+    output << "end_header\n";
+
+    const struct {
+        float x;
+        float y;
+        float z;
+        float nx;
+        float ny;
+        float nz;
+    } points[] = {
+        {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 2.0F},
+        {1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F},
+        {2.0F, 0.0F, 0.0F, 3.0F, 4.0F, 0.0F},
+    };
+
+    std::vector<std::byte> bytes;
+    bytes.reserve(3 * 6 * sizeof(float));
+    for (const auto& point : points) {
+        AppendBinary(&bytes, point.x);
+        AppendBinary(&bytes, point.y);
+        AppendBinary(&bytes, point.z);
+        AppendBinary(&bytes, point.nx);
+        AppendBinary(&bytes, point.ny);
+        AppendBinary(&bytes, point.nz);
     }
 
     output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -261,7 +341,10 @@ TEST_CASE("Bootstrap window title summarizes discovered layer counts", "[window]
     const auto catalog = invisible_places::io::DiscoverAssets(DataRoot());
     const auto title = invisible_places::platform::MakeBootstrapWindowTitle(catalog);
 
-    CHECK(title == "Invisible Places | 6 point clouds | 10 gSplats");
+    CHECK(
+        title ==
+        "Invisible Places | " + std::to_string(catalog.pointClouds.size()) +
+            " point clouds | " + std::to_string(catalog.gaussianSplats.size()) + " gSplats");
 }
 
 TEST_CASE("Vulkan runtime description includes explicit ICD when present", "[vulkan][runtime]") {
@@ -281,6 +364,7 @@ TEST_CASE("Binary point cloud loader parses payload, colors, bounds, and scalar 
     CHECK(result.cloud.PointCount() == 3);
     CHECK(result.cloud.ScalarFieldCount() == 2);
     CHECK(result.cloud.hasSourceRgb);
+    CHECK(!result.cloud.hasNormals);
 
     CHECK(result.cloud.bounds.minimum.x == Catch::Approx(-1.0F));
     CHECK(result.cloud.bounds.minimum.y == Catch::Approx(-2.0F));
@@ -300,6 +384,28 @@ TEST_CASE("Binary point cloud loader parses payload, colors, bounds, and scalar 
     CHECK(result.cloud.scalarFieldValues[result.cloud.ScalarFieldValueIndex(1, 2)] == Catch::Approx(5.0F));
 
     std::filesystem::remove(fixturePath);
+}
+
+TEST_CASE("Binary point cloud loader parses normal triplets", "[ply][loader][normals]") {
+    for (const bool longNames : {true, false}) {
+        const auto fixturePath = WriteTinyBinaryPointCloudNormalFixture(longNames);
+        const auto result = invisible_places::io::LoadPointCloud(fixturePath);
+
+        REQUIRE(result.success);
+        REQUIRE(result.cloud.hasNormals);
+        REQUIRE(result.cloud.normals.size() == 3);
+        CHECK(result.cloud.normals[0].x == Catch::Approx(0.0F));
+        CHECK(result.cloud.normals[0].y == Catch::Approx(0.0F));
+        CHECK(result.cloud.normals[0].z == Catch::Approx(1.0F));
+        CHECK(result.cloud.normals[1].x == Catch::Approx(0.0F));
+        CHECK(result.cloud.normals[1].y == Catch::Approx(0.0F));
+        CHECK(result.cloud.normals[1].z == Catch::Approx(0.0F));
+        CHECK(result.cloud.normals[2].x == Catch::Approx(0.6F));
+        CHECK(result.cloud.normals[2].y == Catch::Approx(0.8F));
+        CHECK(result.cloud.normals[2].z == Catch::Approx(0.0F));
+
+        std::filesystem::remove(fixturePath);
+    }
 }
 
 TEST_CASE("Binary gaussian splat loader parses payload, transform, and decoded parameters", "[ply][gsplat][loader]") {
@@ -363,11 +469,277 @@ TEST_CASE("Point budget sampling is deterministic and avoids first-N ordering", 
 
     REQUIRE(first.size() == 10);
     CHECK(first == second);
+    CHECK(std::is_sorted(first.begin(), first.end()));
     CHECK(first[0] != 0U);
     CHECK(budget.activePoints == 10);
     CHECK(budget.activeFraction == Catch::Approx(0.1F));
     CHECK(budget.UsesSampledIndices());
     CHECK(!full.UsesSampledIndices());
+}
+
+TEST_CASE("Surfel sampled indices encode six vertices per source point", "[budget][sampling][surfel]") {
+    const std::vector<std::uint32_t> sampledPoints{2U, 7U};
+    const auto encoded =
+        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledPoints);
+
+    REQUIRE(encoded.size() == 12);
+    CHECK(encoded[0] == 12U);
+    CHECK(encoded[5] == 17U);
+    CHECK(encoded[6] == 42U);
+    CHECK(encoded[11] == 47U);
+}
+
+TEST_CASE("Spatial point budget sampling preserves coverage across ordered clusters", "[budget][sampling]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    const std::array<invisible_places::io::Float3, 4> clusterCenters = {
+        invisible_places::io::Float3{0.0F, 0.0F, 0.0F},
+        invisible_places::io::Float3{100.0F, 0.0F, 0.0F},
+        invisible_places::io::Float3{0.0F, 100.0F, 0.0F},
+        invisible_places::io::Float3{100.0F, 100.0F, 0.0F},
+    };
+
+    for (const auto& center : clusterCenters) {
+        for (int offset = 0; offset < 6; ++offset) {
+            invisible_places::io::Float3 point{
+                center.x + static_cast<float>(offset) * 0.1F,
+                center.y + static_cast<float>(offset) * 0.1F,
+                center.z,
+            };
+            cloud.positions.push_back(point);
+            cloud.bounds.Expand(point);
+        }
+    }
+
+    const auto first = invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
+        cloud.positions,
+        cloud.bounds,
+        4);
+    const auto second = invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
+        cloud.positions,
+        cloud.bounds,
+        4);
+
+    REQUIRE(first.size() == 4);
+    CHECK(first == second);
+    CHECK(std::is_sorted(first.begin(), first.end()));
+    CHECK(first != std::vector<std::uint32_t>{0U, 1U, 2U, 3U});
+
+    std::array<bool, 4> coveredQuadrants = {false, false, false, false};
+    for (const auto pointIndex : first) {
+        REQUIRE(pointIndex < cloud.positions.size());
+        const auto& point = cloud.positions[pointIndex];
+        const auto quadrant =
+            static_cast<std::size_t>((point.x >= 50.0F ? 1U : 0U) + (point.y >= 50.0F ? 2U : 0U));
+        coveredQuadrants[quadrant] = true;
+    }
+
+    CHECK(std::all_of(coveredQuadrants.begin(), coveredQuadrants.end(), [](bool covered) { return covered; }));
+}
+
+TEST_CASE("Spatial point budget stratifies overfull octree candidates", "[budget][sampling]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSide = 102;
+    for (int y = 0; y < gridSide; ++y) {
+        for (int x = 0; x < gridSide; ++x) {
+            invisible_places::io::Float3 point{
+                static_cast<float>(x),
+                static_cast<float>(y),
+                0.0F,
+            };
+            cloud.positions.push_back(point);
+            cloud.bounds.Expand(point);
+        }
+    }
+
+    const auto first = invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
+        cloud.positions,
+        cloud.bounds,
+        10'000);
+    const auto second = invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
+        cloud.positions,
+        cloud.bounds,
+        10'000);
+
+    REQUIRE(first.size() == 10'000);
+    CHECK(first == second);
+    CHECK(std::is_sorted(first.begin(), first.end()));
+    CHECK(std::adjacent_find(first.begin(), first.end()) == first.end());
+
+    std::vector<std::uint32_t> firstN;
+    firstN.reserve(first.size());
+    for (std::uint32_t index = 0; index < first.size(); ++index) {
+        firstN.push_back(index);
+    }
+    CHECK(first != firstN);
+}
+
+TEST_CASE("Spatial point budget keeps full-resolution draws unsampled", "[budget][sampling]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    for (int index = 0; index < 8; ++index) {
+        invisible_places::io::Float3 point{
+            static_cast<float>(index),
+            static_cast<float>(index % 2),
+            0.0F,
+        };
+        cloud.positions.push_back(point);
+        cloud.bounds.Expand(point);
+    }
+
+    const auto fullBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
+        cloud,
+        cloud.PointCount());
+    CHECK(fullBudget.activePoints == cloud.PointCount());
+    CHECK(!fullBudget.UsesSampledIndices());
+
+    const auto capped = invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
+        cloud.positions,
+        cloud.bounds,
+        3);
+    REQUIRE(capped.size() == 3);
+    CHECK(fullBudget.activePoints == cloud.PointCount());
+}
+
+TEST_CASE("Orbit camera can move its pivot without changing the current view", "[camera][pivot]") {
+    invisible_places::io::Bounds3f bounds;
+    bounds.Expand({-1.0F, -1.0F, -1.0F});
+    bounds.Expand({1.0F, 1.0F, 1.0F});
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.FrameBounds(bounds, 1.0F);
+
+    const auto beforeState = camera.CaptureState();
+    const auto beforeMatrices = camera.Matrices(1.0F);
+    const glm::vec3 pivot{3.0F, 2.0F, 0.5F};
+    camera.SetOrbitCenterPreservingView(pivot);
+    const auto afterState = camera.CaptureState();
+    const auto afterMatrices = camera.Matrices(1.0F);
+    const auto projectNdc = [](const invisible_places::camera::OrbitCameraMatrices& matrices, const glm::vec3& point) {
+        const glm::vec4 clip = matrices.viewProjection * glm::vec4{point, 1.0F};
+        return glm::vec3{clip} / clip.w;
+    };
+
+    for (std::size_t component = 0; component < 3; ++component) {
+        CHECK(afterState.position[component] == Catch::Approx(beforeState.position[component]));
+    }
+    for (std::size_t component = 0; component < 4; ++component) {
+        CHECK(afterState.orientation[component] == Catch::Approx(beforeState.orientation[component]));
+    }
+    CHECK(afterState.target[0] == Catch::Approx(beforeState.target[0]));
+    CHECK(afterState.target[1] == Catch::Approx(beforeState.target[1]));
+    CHECK(afterState.target[2] == Catch::Approx(beforeState.target[2]));
+    REQUIRE(afterState.hasOrbitCenter);
+    CHECK(afterState.orbitCenter[0] == Catch::Approx(pivot.x));
+    CHECK(afterState.orbitCenter[1] == Catch::Approx(pivot.y));
+    CHECK(afterState.orbitCenter[2] == Catch::Approx(pivot.z));
+    CHECK(afterMatrices.position.x == Catch::Approx(beforeMatrices.position.x));
+    CHECK(afterMatrices.position.y == Catch::Approx(beforeMatrices.position.y));
+    CHECK(afterMatrices.position.z == Catch::Approx(beforeMatrices.position.z));
+    CHECK(camera.OrbitCenter().x == Catch::Approx(pivot.x));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(pivot.y));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(pivot.z));
+
+    const auto pivotNdcBeforePan = projectNdc(afterMatrices, pivot);
+    camera.Pan(32.0F, -18.0F, 1024.0F, 768.0F);
+    const auto pannedMatrices = camera.Matrices(1.0F);
+    const auto pivotNdcAfterPan = projectNdc(pannedMatrices, pivot);
+    CHECK(camera.OrbitCenter().x == Catch::Approx(pivot.x));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(pivot.y));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(pivot.z));
+    CHECK(glm::length(glm::vec2{pivotNdcAfterPan - pivotNdcBeforePan}) > 0.001F);
+
+    const auto pivotNdcBeforeDolly = projectNdc(pannedMatrices, pivot);
+    const float radiusBeforeDolly = glm::length(pannedMatrices.position - pivot);
+    camera.Dolly(1.0F);
+    const auto dollyMatrices = camera.Matrices(1.0F);
+    const auto pivotNdcAfterDolly = projectNdc(dollyMatrices, pivot);
+    CHECK(pivotNdcAfterDolly.x == Catch::Approx(pivotNdcBeforeDolly.x).margin(0.0001F));
+    CHECK(pivotNdcAfterDolly.y == Catch::Approx(pivotNdcBeforeDolly.y).margin(0.0001F));
+    CHECK(glm::length(dollyMatrices.position - pivot) < radiusBeforeDolly);
+
+    const float radiusBefore = glm::length(dollyMatrices.position - pivot);
+    const auto pivotNdcBeforeOrbit = projectNdc(dollyMatrices, pivot);
+    camera.Orbit(24.0F, 0.0F);
+    const auto orbitedMatrices = camera.Matrices(1.0F);
+    const auto pivotNdcAfterOrbit = projectNdc(orbitedMatrices, pivot);
+    CHECK(pivotNdcAfterOrbit.x == Catch::Approx(pivotNdcBeforeOrbit.x).margin(0.0001F));
+    CHECK(pivotNdcAfterOrbit.y == Catch::Approx(pivotNdcBeforeOrbit.y).margin(0.0001F));
+    CHECK(glm::length(orbitedMatrices.position - pivot) == Catch::Approx(radiusBefore));
+    CHECK(glm::length(orbitedMatrices.position - dollyMatrices.position) > 0.01F);
+    CHECK(camera.OrbitCenter().x == Catch::Approx(pivot.x));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(pivot.y));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(pivot.z));
+
+    const auto pivotNdcBeforePitchOrbit = projectNdc(orbitedMatrices, pivot);
+    camera.Orbit(0.0F, 18.0F);
+    const auto pitchOrbitedMatrices = camera.Matrices(1.0F);
+    const auto pivotNdcAfterPitchOrbit = projectNdc(pitchOrbitedMatrices, pivot);
+    CHECK(pivotNdcAfterPitchOrbit.x == Catch::Approx(pivotNdcBeforePitchOrbit.x).margin(0.0001F));
+    CHECK(pivotNdcAfterPitchOrbit.y == Catch::Approx(pivotNdcBeforePitchOrbit.y).margin(0.0001F));
+    CHECK(camera.OrbitCenter().x == Catch::Approx(pivot.x));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(pivot.y));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(pivot.z));
+}
+
+TEST_CASE("Point preview LOD resolver only applies automatic LOD to camera motion", "[budget][lod]") {
+    using invisible_places::renderer::pointcloud::MakePointBudgetState;
+    using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudPreviewLod;
+
+    const auto largeBudget = MakePointBudgetState(42'000'000, 42'000'000);
+    const auto panelOnly = ResolvePointCloudPreviewLod(
+        largeBudget,
+        PointCloudPreviewLodMode::AutoCameraLod,
+        false,
+        false,
+        10'000'000);
+    CHECK(panelOnly.drawPointCount == 42'000'000);
+    CHECK(!panelOnly.usesPreviewLod);
+
+    const auto cameraNavigation = ResolvePointCloudPreviewLod(
+        largeBudget,
+        PointCloudPreviewLodMode::AutoCameraLod,
+        true,
+        false,
+        10'000'000);
+    CHECK(cameraNavigation.drawPointCount == 10'000'000);
+    CHECK(cameraNavigation.usesPreviewLod);
+
+    const auto cameraPlayback = ResolvePointCloudPreviewLod(
+        largeBudget,
+        PointCloudPreviewLodMode::AutoCameraLod,
+        false,
+        true,
+        10'000'000);
+    CHECK(cameraPlayback.drawPointCount == 10'000'000);
+    CHECK(cameraPlayback.usesPreviewLod);
+
+    const auto fullOverride = ResolvePointCloudPreviewLod(
+        largeBudget,
+        PointCloudPreviewLodMode::FullResolution,
+        true,
+        true,
+        10'000'000);
+    CHECK(fullOverride.drawPointCount == 42'000'000);
+    CHECK(!fullOverride.usesPreviewLod);
+
+    const auto forceOverride = ResolvePointCloudPreviewLod(
+        largeBudget,
+        PointCloudPreviewLodMode::ForceLod,
+        false,
+        false,
+        10'000'000);
+    CHECK(forceOverride.drawPointCount == 10'000'000);
+    CHECK(forceOverride.usesPreviewLod);
+
+    const auto userCappedBudget = MakePointBudgetState(42'000'000, 4'000'000);
+    const auto manualBudget = ResolvePointCloudPreviewLod(
+        userCappedBudget,
+        PointCloudPreviewLodMode::ForceLod,
+        true,
+        true,
+        10'000'000);
+    CHECK(manualBudget.drawPointCount == 4'000'000);
+    CHECK(!manualBudget.usesPreviewLod);
 }
 
 TEST_CASE("Scalar field binding evaluation matches the mapped style rules", "[style][binding]") {
@@ -412,9 +784,44 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     invisible_places::serialization::ProjectDocument document;
     document.projectName = "Roundtrip";
     document.selectedLayerPath = "Data/Site2 -5mm.ply";
+    document.lastAnimationPath = "Saved/animations/Roundtrip.ipanim.json";
     document.backgroundColor = {0.02F, 0.04F, 0.08F, 1.0F};
     document.sidePanelPinned = true;
     document.autoLowerGsplatQualityWhileNavigating = false;
+    document.pointCloudPreviewLodMode =
+        invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod;
+    document.interactivePointCap = 12'345'678;
+    document.renderJobSettings.outputDirectory = "Saved/renders/Roundtrip";
+    document.renderJobSettings.width = 3840;
+    document.renderJobSettings.height = 2160;
+    document.renderJobSettings.framesPerSecond = 24;
+    document.renderJobSettings.tileSize = 256;
+    document.renderJobSettings.startFrame = 10;
+    document.renderJobSettings.endFrame = 42;
+    document.renderJobSettings.fromShotIndex = 0;
+    document.renderJobSettings.toShotIndex = 1;
+    document.cameraPathShotIndices = {0, 0};
+    document.cameraPathDurationFrames = 144;
+    invisible_places::camera::CameraState currentCamera;
+    currentCamera.position = {10.0F, 20.0F, 30.0F};
+    currentCamera.target = {4.0F, 5.0F, 6.0F};
+    currentCamera.orbitCenter = {7.0F, 8.0F, 9.0F};
+    currentCamera.hasOrbitCenter = true;
+    currentCamera.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+    currentCamera.fovDegrees = 42.0F;
+    currentCamera.nearPlane = 0.001F;
+    currentCamera.farPlane = 250.0F;
+    document.cameraState = currentCamera;
+
+    invisible_places::camera::CameraShot shot;
+    shot.name = "Entry";
+    shot.durationFrames = 120;
+    shot.state.position = {1.0F, 2.0F, 3.0F};
+    shot.state.target = {4.0F, 5.0F, 6.0F};
+    shot.state.orbitCenter = {7.0F, 8.0F, 9.0F};
+    shot.state.hasOrbitCenter = true;
+    shot.state.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+    document.cameraShots.push_back(shot);
 
     invisible_places::serialization::ProjectLayerDocument layer;
     layer.kind = invisible_places::serialization::SerializedLayerKind::PointCloud;
@@ -424,8 +831,21 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     layer.pointBudgetActivePoints = 2048;
 
     invisible_places::renderer::pointcloud::PointCloudStyleState pointStyle;
+    pointStyle.geometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
+    pointStyle.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray;
+    pointStyle.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
     pointStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
     pointStyle.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo;
+    pointStyle.exposure = 2.25F;
+    pointStyle.innerRadius = 0.35F;
+    pointStyle.gaussianSharpness = 5.5F;
+    pointStyle.featherPower = 2.25F;
+    pointStyle.depthFalloff = 123.0F;
+    pointStyle.depthBias = 0.003F;
+    pointStyle.frontAlpha = 0.21F;
+    pointStyle.hiddenAlpha = 0.09F;
+    pointStyle.densityScale = 1.75F;
+    pointStyle.densityClamp = 96.0F;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.pointSize,
         2,
@@ -439,6 +859,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         false);
     pointStyle.pointSize.fieldMap.inputMin = -2.0F;
     pointStyle.pointSize.fieldMap.inputMax = 5.0F;
+    invisible_places::style::SetScalarConstant(&pointStyle.surfelDiameter, 0.0125F);
     invisible_places::style::SetScalarConstant(&pointStyle.opacity, 0.55F);
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.colormapPosition,
@@ -460,8 +881,38 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->projectName == "Roundtrip");
     CHECK(loadedDocument->sidePanelPinned);
     CHECK(!loadedDocument->autoLowerGsplatQualityWhileNavigating);
+    CHECK(
+        loadedDocument->pointCloudPreviewLodMode ==
+        invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod);
+    CHECK(loadedDocument->interactivePointCap == 12'345'678);
+    CHECK(loadedDocument->renderJobSettings.outputDirectory == "Saved/renders/Roundtrip");
+    CHECK(loadedDocument->renderJobSettings.width == 3840);
+    CHECK(loadedDocument->renderJobSettings.height == 2160);
+    CHECK(loadedDocument->renderJobSettings.framesPerSecond == 24);
+    CHECK(loadedDocument->renderJobSettings.tileSize == 256);
+    CHECK(loadedDocument->renderJobSettings.startFrame == 10);
+    CHECK(loadedDocument->renderJobSettings.endFrame == 42);
+    CHECK(loadedDocument->renderJobSettings.toShotIndex == 1);
+    CHECK(loadedDocument->cameraPathShotIndices == std::vector<std::size_t>{0, 0});
+    CHECK(loadedDocument->cameraPathDurationFrames == 144);
     CHECK(loadedDocument->backgroundColor[2] == Catch::Approx(0.08F));
     CHECK(loadedDocument->selectedLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loadedDocument->lastAnimationPath == std::filesystem::path{"Saved/animations/Roundtrip.ipanim.json"});
+    REQUIRE(loadedDocument->cameraState.has_value());
+    CHECK(loadedDocument->cameraState->position[0] == Catch::Approx(10.0F));
+    CHECK(loadedDocument->cameraState->position[1] == Catch::Approx(20.0F));
+    CHECK(loadedDocument->cameraState->position[2] == Catch::Approx(30.0F));
+    REQUIRE(loadedDocument->cameraState->hasOrbitCenter);
+    CHECK(loadedDocument->cameraState->orbitCenter[0] == Catch::Approx(7.0F));
+    CHECK(loadedDocument->cameraState->fovDegrees == Catch::Approx(42.0F));
+    REQUIRE(loadedDocument->cameraShots.size() == 1);
+    CHECK(loadedDocument->cameraShots[0].name == "Entry");
+    CHECK(loadedDocument->cameraShots[0].durationFrames == 120);
+    CHECK(loadedDocument->cameraShots[0].state.position[2] == Catch::Approx(3.0F));
+    REQUIRE(loadedDocument->cameraShots[0].state.hasOrbitCenter);
+    CHECK(loadedDocument->cameraShots[0].state.orbitCenter[0] == Catch::Approx(7.0F));
+    CHECK(loadedDocument->cameraShots[0].state.orbitCenter[1] == Catch::Approx(8.0F));
+    CHECK(loadedDocument->cameraShots[0].state.orbitCenter[2] == Catch::Approx(9.0F));
 
     const auto& loadedLayer = loadedDocument->layers.front();
     REQUIRE(loadedLayer.pointStyle.has_value());
@@ -472,16 +923,854 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         loadedLayer.pointStyle->colorMode ==
         invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap);
     CHECK(
+        loadedLayer.pointStyle->geometryMode ==
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels);
+    CHECK(
+        loadedLayer.pointStyle->renderMode ==
+        invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray);
+    CHECK(
+        loadedLayer.pointStyle->falloffProfile ==
+        invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian);
+    CHECK(
         loadedLayer.pointStyle->colormap ==
         invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo);
+    CHECK(loadedLayer.pointStyle->exposure == Catch::Approx(2.25F));
+    CHECK(loadedLayer.pointStyle->innerRadius == Catch::Approx(0.35F));
+    CHECK(loadedLayer.pointStyle->gaussianSharpness == Catch::Approx(5.5F));
+    CHECK(loadedLayer.pointStyle->featherPower == Catch::Approx(2.25F));
+    CHECK(loadedLayer.pointStyle->depthFalloff == Catch::Approx(123.0F));
+    CHECK(loadedLayer.pointStyle->depthBias == Catch::Approx(0.003F));
+    CHECK(loadedLayer.pointStyle->frontAlpha == Catch::Approx(0.21F));
+    CHECK(loadedLayer.pointStyle->hiddenAlpha == Catch::Approx(0.09F));
+    CHECK(loadedLayer.pointStyle->densityScale == Catch::Approx(1.75F));
+    CHECK(loadedLayer.pointStyle->densityClamp == Catch::Approx(96.0F));
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldSlot == 2);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldName == "Height");
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.inputMin == Catch::Approx(-2.0F));
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.outputMax == Catch::Approx(8.0F));
+    CHECK(invisible_places::style::ScalarConstant(loadedLayer.pointStyle->surfelDiameter) == Catch::Approx(0.0125F));
     CHECK(invisible_places::style::ScalarConstant(loadedLayer.pointStyle->opacity) == Catch::Approx(0.55F));
     CHECK(loadedLayer.pointStyle->colormapPosition.fieldMap.fieldName == "Intensity");
 
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mode", "[serialization]") {
+    const auto presetPath = std::filesystem::temp_directory_path() / "invisible_places_legacy_point_style.json";
+    std::ofstream output{presetPath, std::ios::trunc};
+    output << R"({
+  "schema_version": 1,
+  "preset_name": "Legacy",
+  "point_style": {
+    "render_mode": "solid",
+    "point_size": {"mode": "constant", "constant_value": [3.0, 0.0, 0.0, 0.0]}
+  }
+})";
+    output.close();
+
+    std::string errorMessage;
+    const auto preset = invisible_places::serialization::LoadPointCloudStylePreset(presetPath, &errorMessage);
+    REQUIRE(preset.has_value());
+    CHECK(
+        preset->style.geometryMode ==
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::ScreenSprites);
+    CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
+
+    std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Camera shot interpolation stores quaternion slerp and linear camera values", "[camera][shots]") {
+    invisible_places::camera::CameraState start;
+    start.position = {0.0F, 0.0F, 0.0F};
+    start.target = {0.0F, 0.0F, -1.0F};
+    start.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+    start.fovDegrees = 50.0F;
+
+    invisible_places::camera::CameraState end;
+    end.position = {10.0F, 0.0F, 0.0F};
+    end.target = {10.0F, 0.0F, -1.0F};
+    const auto endOrientation =
+        glm::angleAxis(glm::half_pi<float>(), glm::vec3{0.0F, 0.0F, 1.0F});
+    end.orientation = {
+        endOrientation.x,
+        endOrientation.y,
+        endOrientation.z,
+        endOrientation.w,
+    };
+    end.fovDegrees = 70.0F;
+
+    const auto midpoint = invisible_places::camera::InterpolateCameraStates(start, end, 0.5F);
+    const auto midpointOrientation = invisible_places::camera::QuaternionFromCameraState(midpoint);
+
+    CHECK(midpoint.position[0] == Catch::Approx(5.0F));
+    CHECK(midpoint.target[0] == Catch::Approx(5.0F));
+    CHECK(midpoint.fovDegrees == Catch::Approx(60.0F));
+    CHECK(midpointOrientation.z == Catch::Approx(std::sin(glm::quarter_pi<float>() * 0.5F)));
+    CHECK(midpointOrientation.w == Catch::Approx(std::cos(glm::quarter_pi<float>() * 0.5F)));
+}
+
+TEST_CASE("Camera path splines pass through middle camera waypoints", "[camera][path]") {
+    auto writeOrientation = [](invisible_places::camera::CameraShot* shot, const glm::quat& orientation) {
+        shot->state.orientation = {orientation.x, orientation.y, orientation.z, orientation.w};
+    };
+
+    invisible_places::camera::CameraShot firstShot;
+    firstShot.state.position = {0.0F, 0.0F, 0.0F};
+    firstShot.state.target = {0.0F, 0.0F, -2.0F};
+    writeOrientation(&firstShot, glm::quat{1.0F, 0.0F, 0.0F, 0.0F});
+
+    invisible_places::camera::CameraShot middleShot;
+    middleShot.durationFrames = 30;
+    middleShot.state.position = {1.0F, 2.0F, 0.5F};
+    middleShot.state.target = {2.0F, 2.5F, -2.0F};
+    middleShot.state.fovDegrees = 48.0F;
+    const auto middleOrientation = glm::angleAxis(glm::quarter_pi<float>(), glm::vec3{0.0F, 0.0F, 1.0F});
+    writeOrientation(&middleShot, middleOrientation);
+
+    invisible_places::camera::CameraShot lastShot;
+    lastShot.durationFrames = 30;
+    lastShot.state.position = {4.0F, 0.0F, 1.0F};
+    lastShot.state.target = {4.0F, 0.0F, -2.0F};
+    writeOrientation(&lastShot, glm::angleAxis(glm::half_pi<float>(), glm::vec3{0.0F, 0.0F, 1.0F}));
+
+    const std::vector<invisible_places::camera::CameraShot> shots = {firstShot, middleShot, lastShot};
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(shots, 0, 2);
+    REQUIRE(timing.IsValid());
+    REQUIRE(timing.knotSeconds.size() == 3);
+
+    const auto evaluated = invisible_places::camera::EvaluateCameraPath(shots, timing, timing.knotSeconds[1]);
+    const auto evaluatedOrientation = invisible_places::camera::QuaternionFromCameraState(evaluated);
+
+    CHECK(evaluated.position[0] == Catch::Approx(middleShot.state.position[0]));
+    CHECK(evaluated.position[1] == Catch::Approx(middleShot.state.position[1]));
+    CHECK(evaluated.position[2] == Catch::Approx(middleShot.state.position[2]));
+    CHECK(evaluated.target[0] == Catch::Approx(middleShot.state.target[0]));
+    CHECK(evaluated.target[1] == Catch::Approx(middleShot.state.target[1]));
+    CHECK(evaluated.target[2] == Catch::Approx(middleShot.state.target[2]));
+    CHECK(evaluated.fovDegrees == Catch::Approx(middleShot.state.fovDegrees));
+    CHECK(std::abs(glm::dot(evaluatedOrientation, middleOrientation)) == Catch::Approx(1.0F).margin(0.0001F));
+}
+
+TEST_CASE("Camera path keeps velocity and acceleration smooth through middle positions", "[camera][path]") {
+    const auto makeShot = [](std::array<float, 3> position, std::uint32_t durationFrames) {
+        invisible_places::camera::CameraShot shot;
+        shot.durationFrames = durationFrames;
+        shot.state.position = position;
+        shot.state.target = {position[0], position[1], position[2] - 3.0F};
+        return shot;
+    };
+    const std::vector<invisible_places::camera::CameraShot> shots = {
+        makeShot({0.0F, 0.0F, 0.0F}, 30),
+        makeShot({1.0F, 2.0F, 0.5F}, 30),
+        makeShot({4.0F, -1.0F, 1.0F}, 45),
+        makeShot({7.0F, 1.0F, 0.0F}, 30),
+    };
+
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(shots, 0, 3);
+    REQUIRE(timing.IsValid());
+
+    const auto evaluatePosition = [&shots, &timing](float timeSeconds) {
+        const auto state = invisible_places::camera::EvaluateCameraPath(shots, timing, timeSeconds);
+        return glm::vec3{state.position[0], state.position[1], state.position[2]};
+    };
+
+    const float knotTime = timing.knotSeconds[1];
+    constexpr float h = 0.005F;
+    const auto velocityIn = (evaluatePosition(knotTime) - evaluatePosition(knotTime - h)) / h;
+    const auto velocityOut = (evaluatePosition(knotTime + h) - evaluatePosition(knotTime)) / h;
+    const auto accelerationIn =
+        (evaluatePosition(knotTime) - (2.0F * evaluatePosition(knotTime - h)) + evaluatePosition(knotTime - (2.0F * h))) /
+        (h * h);
+    const auto accelerationOut =
+        (evaluatePosition(knotTime + (2.0F * h)) - (2.0F * evaluatePosition(knotTime + h)) + evaluatePosition(knotTime)) /
+        (h * h);
+
+    CHECK(velocityOut.x == Catch::Approx(velocityIn.x).margin(0.06F));
+    CHECK(velocityOut.y == Catch::Approx(velocityIn.y).margin(0.06F));
+    CHECK(velocityOut.z == Catch::Approx(velocityIn.z).margin(0.06F));
+    CHECK(accelerationOut.x == Catch::Approx(accelerationIn.x).margin(0.5F));
+    CHECK(accelerationOut.y == Catch::Approx(accelerationIn.y).margin(0.5F));
+    CHECK(accelerationOut.z == Catch::Approx(accelerationIn.z).margin(0.5F));
+}
+
+TEST_CASE("Camera path keeps flipped quaternion inputs sign-continuous", "[camera][path]") {
+    auto writeOrientation = [](invisible_places::camera::CameraShot* shot, glm::quat orientation) {
+        shot->state.orientation = {orientation.x, orientation.y, orientation.z, orientation.w};
+    };
+    auto makeShot = [&writeOrientation](glm::quat orientation, std::uint32_t durationFrames) {
+        invisible_places::camera::CameraShot shot;
+        shot.durationFrames = durationFrames;
+        shot.state.target = {0.0F, 0.0F, -4.0F};
+        writeOrientation(&shot, orientation);
+        return shot;
+    };
+
+    const auto middleOrientation = glm::angleAxis(glm::quarter_pi<float>(), glm::vec3{0.0F, 0.0F, 1.0F});
+    const std::vector<invisible_places::camera::CameraShot> shots = {
+        makeShot(glm::quat{1.0F, 0.0F, 0.0F, 0.0F}, 30),
+        makeShot(-middleOrientation, 30),
+        makeShot(glm::angleAxis(glm::half_pi<float>(), glm::vec3{0.0F, 0.0F, 1.0F}), 30),
+    };
+
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(shots, 0, 2);
+    REQUIRE(timing.IsValid());
+
+    auto previousOrientation = invisible_places::camera::QuaternionFromCameraState(
+        invisible_places::camera::EvaluateCameraPath(shots, timing, 0.0F));
+    for (std::uint32_t sampleIndex = 1; sampleIndex <= 60; ++sampleIndex) {
+        const float timeSeconds =
+            timing.DurationSeconds() * (static_cast<float>(sampleIndex) / 60.0F);
+        const auto orientation = invisible_places::camera::QuaternionFromCameraState(
+            invisible_places::camera::EvaluateCameraPath(shots, timing, timeSeconds));
+        CHECK(glm::dot(previousOrientation, orientation) > 0.0F);
+        previousOrientation = orientation;
+    }
+
+    const auto middleState =
+        invisible_places::camera::EvaluateCameraPath(shots, timing, timing.knotSeconds[1]);
+    const auto evaluatedMiddleOrientation = invisible_places::camera::QuaternionFromCameraState(middleState);
+    CHECK(glm::dot(evaluatedMiddleOrientation, middleOrientation) == Catch::Approx(1.0F).margin(0.0001F));
+}
+
+TEST_CASE("Weighted camera paths keep duplicate entries and total duration", "[camera][path]") {
+    auto makeShot = [](const char* name, std::array<float, 3> position) {
+        invisible_places::camera::CameraShot shot;
+        shot.name = name;
+        shot.state.position = position;
+        shot.state.target = {position[0], position[1], position[2] - 2.0F};
+        return shot;
+    };
+
+    const auto firstShot = makeShot("A", {0.0F, 0.0F, 0.0F});
+    const auto duplicateShot = firstShot;
+    const auto lastShot = makeShot("B", {8.0F, 0.0F, 0.0F});
+    const auto weightedShots = invisible_places::camera::BuildWeightedCameraPathShots(
+        {firstShot, duplicateShot, lastShot},
+        12U);
+
+    REQUIRE(weightedShots.size() == 3);
+    CHECK(weightedShots[1].durationFrames >= 1U);
+    CHECK(weightedShots[2].durationFrames >= 1U);
+    CHECK(weightedShots[1].durationFrames + weightedShots[2].durationFrames == 12U);
+
+    const auto timing = invisible_places::camera::BuildCameraPathTiming(weightedShots, 0, 2);
+    REQUIRE(timing.IsValid());
+    const auto middleState =
+        invisible_places::camera::EvaluateCameraPath(weightedShots, timing, timing.knotSeconds[1]);
+    CHECK(middleState.position[0] == Catch::Approx(duplicateShot.state.position[0]));
+    CHECK(middleState.position[1] == Catch::Approx(duplicateShot.state.position[1]));
+    CHECK(middleState.position[2] == Catch::Approx(duplicateShot.state.position[2]));
+}
+
+TEST_CASE("Weighted camera paths distribute duration by movement when possible", "[camera][path]") {
+    auto makeShot = [](std::array<float, 3> position, glm::quat orientation) {
+        invisible_places::camera::CameraShot shot;
+        shot.state.position = position;
+        shot.state.target = {position[0], position[1], position[2] - 3.0F};
+        invisible_places::camera::WriteQuaternionToCameraState(orientation, &shot.state);
+        return shot;
+    };
+
+    const auto weightedShots = invisible_places::camera::BuildWeightedCameraPathShots(
+        {
+            makeShot({0.0F, 0.0F, 0.0F}, glm::quat{1.0F, 0.0F, 0.0F, 0.0F}),
+            makeShot({1.0F, 0.0F, 0.0F}, glm::quat{1.0F, 0.0F, 0.0F, 0.0F}),
+            makeShot(
+                {9.0F, 0.0F, 0.0F},
+                glm::angleAxis(glm::half_pi<float>(), glm::vec3{0.0F, 0.0F, 1.0F})),
+        },
+        18U);
+
+    REQUIRE(weightedShots.size() == 3);
+    CHECK(weightedShots[1].durationFrames + weightedShots[2].durationFrames == 18U);
+    CHECK(weightedShots[2].durationFrames > weightedShots[1].durationFrames);
+}
+
+TEST_CASE("Animation path evaluation passes through camera and focus keys", "[camera][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.name = "Pass Through";
+    path.durationFrames = 60;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 1.0F, 0.0F}, .durationFrames = 30},
+        {.cameraPosition = {1.0F, 2.0F, 0.5F}, .focusPoint = {2.0F, 2.5F, 0.5F}, .durationFrames = 30},
+        {.cameraPosition = {4.0F, 0.0F, 1.0F}, .focusPoint = {4.5F, 0.5F, 1.0F}, .durationFrames = 30},
+    };
+
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(path, 1.0F);
+    CHECK(evaluation.camera.position[0] == Catch::Approx(path.keys[1].cameraPosition[0]));
+    CHECK(evaluation.camera.position[1] == Catch::Approx(path.keys[1].cameraPosition[1]));
+    CHECK(evaluation.camera.position[2] == Catch::Approx(path.keys[1].cameraPosition[2]));
+    CHECK(evaluation.focusPoint[0] == Catch::Approx(path.keys[1].focusPoint[0]));
+    CHECK(evaluation.focusPoint[1] == Catch::Approx(path.keys[1].focusPoint[1]));
+    CHECK(evaluation.focusPoint[2] == Catch::Approx(path.keys[1].focusPoint[2]));
+}
+
+TEST_CASE("Animation path keeps camera and focus derivatives smooth through middle keys", "[camera][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.name = "Smooth";
+    path.durationFrames = 90;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 1.0F, 0.0F}, .durationFrames = 30},
+        {.cameraPosition = {1.0F, 2.0F, 0.5F}, .focusPoint = {2.0F, 2.5F, 0.5F}, .durationFrames = 30},
+        {.cameraPosition = {4.0F, -1.0F, 1.0F}, .focusPoint = {4.5F, -0.5F, 1.5F}, .durationFrames = 30},
+        {.cameraPosition = {7.0F, 1.0F, 0.0F}, .focusPoint = {7.0F, 1.0F, 1.0F}, .durationFrames = 30},
+    };
+
+    const auto evaluatePoint = [&path](float timeSeconds, bool focus) {
+        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(path, timeSeconds);
+        if (focus) {
+            return glm::vec3{evaluation.focusPoint[0], evaluation.focusPoint[1], evaluation.focusPoint[2]};
+        }
+        return glm::vec3{
+            evaluation.camera.position[0],
+            evaluation.camera.position[1],
+            evaluation.camera.position[2]};
+    };
+
+    constexpr float knotTime = 1.0F;
+    constexpr float h = 0.005F;
+    for (const bool focus : {false, true}) {
+        const auto velocityIn = (evaluatePoint(knotTime, focus) - evaluatePoint(knotTime - h, focus)) / h;
+        const auto velocityOut = (evaluatePoint(knotTime + h, focus) - evaluatePoint(knotTime, focus)) / h;
+        const auto accelerationIn =
+            (evaluatePoint(knotTime, focus) -
+             (2.0F * evaluatePoint(knotTime - h, focus)) +
+             evaluatePoint(knotTime - (2.0F * h), focus)) /
+            (h * h);
+        const auto accelerationOut =
+            (evaluatePoint(knotTime + (2.0F * h), focus) -
+             (2.0F * evaluatePoint(knotTime + h, focus)) +
+             evaluatePoint(knotTime, focus)) /
+            (h * h);
+
+        CHECK(velocityOut.x == Catch::Approx(velocityIn.x).margin(0.08F));
+        CHECK(velocityOut.y == Catch::Approx(velocityIn.y).margin(0.08F));
+        CHECK(velocityOut.z == Catch::Approx(velocityIn.z).margin(0.08F));
+        CHECK(accelerationOut.x == Catch::Approx(accelerationIn.x).margin(0.8F));
+        CHECK(accelerationOut.y == Catch::Approx(accelerationIn.y).margin(0.8F));
+        CHECK(accelerationOut.z == Catch::Approx(accelerationIn.z).margin(0.8F));
+    }
+}
+
+TEST_CASE("Animation path looks at the focal spline and stores focus distance", "[camera][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.name = "Focus";
+    path.durationFrames = 30;
+    path.apertureFStops = 4.0F;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 3.0F, 4.0F}, .durationFrames = 30},
+        {.cameraPosition = {1.0F, 0.0F, 0.0F}, .focusPoint = {1.0F, 3.0F, 4.0F}, .durationFrames = 30},
+    };
+
+    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(path, 0.0F);
+    const auto orientation = invisible_places::camera::QuaternionFromCameraState(evaluation.camera);
+    const glm::vec3 forward = orientation * glm::vec3{0.0F, 0.0F, -1.0F};
+    const glm::vec3 expectedForward = glm::normalize(glm::vec3{0.0F, 3.0F, 4.0F});
+
+    CHECK(glm::dot(forward, expectedForward) == Catch::Approx(1.0F).margin(0.0001F));
+    CHECK(evaluation.focusDistance == Catch::Approx(5.0F));
+    CHECK(evaluation.camera.hasDepthOfField);
+    CHECK(evaluation.camera.focusDistance == Catch::Approx(5.0F));
+    CHECK(evaluation.camera.apertureFStops == Catch::Approx(4.0F));
+}
+
+TEST_CASE("Animation path serialization round-trips standalone files", "[serialization][animation]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_roundtrip.ipanim.json";
+
+    invisible_places::camera::AnimationPath path;
+    path.name = "Roundtrip Animation";
+    path.durationFrames = 72;
+    path.apertureFStops = 2.8F;
+    path.keys = {
+        {
+            .cameraPosition = {1.0F, 2.0F, 3.0F},
+            .focusPoint = {4.0F, 5.0F, 6.0F},
+            .fovDegrees = 42.0F,
+            .nearPlane = 0.02F,
+            .farPlane = 900.0F,
+            .durationFrames = 24,
+            .sourceShotName = "Entry",
+        },
+        {
+            .cameraPosition = {7.0F, 8.0F, 9.0F},
+            .focusPoint = {10.0F, 11.0F, 12.0F},
+            .fovDegrees = 55.0F,
+            .nearPlane = 0.04F,
+            .farPlane = 1200.0F,
+            .durationFrames = 48,
+            .sourceShotName = "Exit",
+        },
+    };
+
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveAnimationPath(path, outputPath, &errorMessage));
+    const auto loadedPath = invisible_places::serialization::LoadAnimationPath(outputPath, &errorMessage);
+    REQUIRE(loadedPath.has_value());
+    REQUIRE(loadedPath->keys.size() == 2);
+    CHECK(loadedPath->name == "Roundtrip Animation");
+    CHECK(loadedPath->durationFrames == 72);
+    CHECK(loadedPath->apertureFStops == Catch::Approx(2.8F));
+    CHECK(loadedPath->keys[0].cameraPosition[2] == Catch::Approx(3.0F));
+    CHECK(loadedPath->keys[0].focusPoint[1] == Catch::Approx(5.0F));
+    CHECK(loadedPath->keys[0].fovDegrees == Catch::Approx(42.0F));
+    CHECK(loadedPath->keys[0].nearPlane == Catch::Approx(0.02F));
+    CHECK(loadedPath->keys[0].farPlane == Catch::Approx(900.0F));
+    CHECK(loadedPath->keys[0].sourceShotName == "Entry");
+
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Animation path loading reports invalid files without producing a path", "[serialization][animation]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_invalid.ipanim.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output << "{\"keys\": [";
+    }
+
+    std::string errorMessage;
+    const auto loadedPath = invisible_places::serialization::LoadAnimationPath(outputPath, &errorMessage);
+    CHECK(!loadedPath.has_value());
+    CHECK(!errorMessage.empty());
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Animation key edits do not mutate source camera shots", "[camera][animation]") {
+    invisible_places::camera::CameraShot shot;
+    shot.name = "Original";
+    shot.state.position = {1.0F, 2.0F, 3.0F};
+    shot.state.target = {4.0F, 5.0F, 6.0F};
+    shot.state.orbitCenter = {7.0F, 8.0F, 9.0F};
+    shot.state.hasOrbitCenter = true;
+
+    const std::vector<invisible_places::camera::CameraShot> sourceShots = {shot, shot};
+    auto animationPath = invisible_places::camera::BuildAnimationPathFromCameraShots(
+        "Editable",
+        sourceShots,
+        30U);
+
+    invisible_places::camera::MoveAnimationCameraKey(&animationPath, 0, {10.0F, 11.0F, 12.0F});
+    invisible_places::camera::MoveAnimationFocusKey(&animationPath, 0, {13.0F, 14.0F, 15.0F});
+
+    CHECK(animationPath.keys[0].cameraPosition[0] == Catch::Approx(10.0F));
+    CHECK(animationPath.keys[0].focusPoint[0] == Catch::Approx(13.0F));
+    CHECK(sourceShots[0].state.position[0] == Catch::Approx(1.0F));
+    CHECK(sourceShots[0].state.orbitCenter[0] == Catch::Approx(7.0F));
+}
+
+TEST_CASE("Orbit camera applies shot quaternion as view direction", "[camera][shots]") {
+    invisible_places::camera::CameraState state;
+    state.position = {0.0F, 0.0F, 0.0F};
+    state.target = {0.0F, 0.0F, -5.0F};
+    state.orbitCenter = {2.0F, 1.0F, 0.0F};
+    state.hasOrbitCenter = true;
+    const auto orientation = glm::angleAxis(glm::half_pi<float>(), glm::vec3{0.0F, 1.0F, 0.0F});
+    state.orientation = {orientation.x, orientation.y, orientation.z, orientation.w};
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.ApplyState(state);
+    const auto matrices = camera.Matrices(1.0F);
+    const glm::vec3 expectedForwardPoint = orientation * glm::vec3{0.0F, 0.0F, -3.0F};
+    const glm::vec4 viewPosition = matrices.view * glm::vec4{expectedForwardPoint, 1.0F};
+
+    CHECK(viewPosition.x == Catch::Approx(0.0F).margin(0.0001F));
+    CHECK(viewPosition.y == Catch::Approx(0.0F).margin(0.0001F));
+    CHECK(viewPosition.z < 0.0F);
+    CHECK(camera.OrbitCenter().x == Catch::Approx(state.orbitCenter[0]));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(state.orbitCenter[1]));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(state.orbitCenter[2]));
+}
+
+TEST_CASE("Orbit camera keeps legacy target-only shots usable", "[camera][shots]") {
+    invisible_places::camera::CameraState state;
+    state.position = {0.0F, 0.0F, 0.0F};
+    state.target = {0.0F, 0.0F, -5.0F};
+    state.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.ApplyState(state);
+
+    CHECK(camera.Target().x == Catch::Approx(state.target[0]));
+    CHECK(camera.Target().y == Catch::Approx(state.target[1]));
+    CHECK(camera.Target().z == Catch::Approx(state.target[2]));
+    CHECK(camera.OrbitCenter().x == Catch::Approx(state.target[0]));
+    CHECK(camera.OrbitCenter().y == Catch::Approx(state.target[1]));
+    CHECK(camera.OrbitCenter().z == Catch::Approx(state.target[2]));
+}
+
+TEST_CASE("Render camera sequence expands shots and frame ranges deterministically", "[output][camera]") {
+    invisible_places::camera::CameraShot firstShot;
+    firstShot.name = "A";
+    firstShot.state.position = {0.0F, 0.0F, 0.0F};
+    firstShot.state.target = {0.0F, 0.0F, -1.0F};
+
+    invisible_places::camera::CameraShot secondShot;
+    secondShot.name = "B";
+    secondShot.durationFrames = 3;
+    secondShot.state.position = {3.0F, 0.0F, 0.0F};
+    secondShot.state.target = {3.0F, 0.0F, -1.0F};
+
+    invisible_places::output::RenderJobSettings settings;
+    settings.outputDirectory = "Saved/renders/Test";
+    settings.framesPerSecond = 30;
+
+    const std::vector<invisible_places::camera::CameraShot> shots = {firstShot, secondShot};
+    const auto frames = invisible_places::output::BuildCameraRenderSequence(shots, settings);
+    REQUIRE(frames.size() == 4);
+    CHECK(frames[0].position[0] == Catch::Approx(0.0F));
+    CHECK(frames[1].position[0] == Catch::Approx(1.0F));
+    CHECK(frames[2].position[0] == Catch::Approx(2.0F));
+    CHECK(frames[3].position[0] == Catch::Approx(3.0F));
+
+    invisible_places::camera::CameraShot thirdShot;
+    thirdShot.name = "C";
+    thirdShot.durationFrames = 3;
+    thirdShot.state.position = {6.0F, 1.0F, 0.0F};
+    thirdShot.state.target = {6.0F, 1.0F, -1.0F};
+
+    settings.toShotIndex = 2;
+    const std::vector<invisible_places::camera::CameraShot> pathShots = {firstShot, secondShot, thirdShot};
+    const auto pathFrames = invisible_places::output::BuildCameraRenderSequence(pathShots, settings);
+    REQUIRE(pathFrames.size() == 7);
+    CHECK(pathFrames[0].position[0] == Catch::Approx(firstShot.state.position[0]));
+    CHECK(pathFrames[3].position[0] == Catch::Approx(secondShot.state.position[0]));
+    CHECK(pathFrames[3].position[1] == Catch::Approx(secondShot.state.position[1]));
+    CHECK(pathFrames[6].position[0] == Catch::Approx(thirdShot.state.position[0]));
+    CHECK(pathFrames[6].position[1] == Catch::Approx(thirdShot.state.position[1]));
+
+    settings.startFrame = 1;
+    settings.endFrame = 2;
+    settings.toShotIndex = 1;
+    const auto rangedFrames = invisible_places::output::BuildCameraRenderSequence(shots, settings);
+    REQUIRE(rangedFrames.size() == 2);
+    CHECK(rangedFrames[0].position[0] == Catch::Approx(1.0F));
+    CHECK(rangedFrames[1].position[0] == Catch::Approx(2.0F));
+    CHECK(
+        invisible_places::output::RenderFramePath(settings, 41).generic_string() ==
+        "Saved/renders/Test/frame_000042.exr");
+}
+
+TEST_CASE("Animation render sequence evaluates animation paths directly", "[output][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.name = "Export Path";
+    path.durationFrames = 60;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 0.0F, -1.0F}, .durationFrames = 30},
+        {.cameraPosition = {2.0F, 0.0F, 0.0F}, .focusPoint = {2.0F, 0.0F, -1.0F}, .durationFrames = 30},
+        {.cameraPosition = {6.0F, 3.0F, 0.0F}, .focusPoint = {6.0F, 3.0F, -1.0F}, .durationFrames = 30},
+    };
+
+    invisible_places::output::RenderJobSettings settings;
+    settings.framesPerSecond = 30;
+    const auto frames = invisible_places::output::BuildAnimationRenderSequence(path, settings);
+    REQUIRE(frames.size() == 61);
+
+    const auto middleEvaluation = invisible_places::camera::EvaluateAnimationPath(path, 1.0F);
+    CHECK(frames[30].position[0] == Catch::Approx(middleEvaluation.camera.position[0]));
+    CHECK(frames[30].position[1] == Catch::Approx(middleEvaluation.camera.position[1]));
+    CHECK(frames[30].target[0] == Catch::Approx(middleEvaluation.camera.target[0]));
+    CHECK(frames.back().position[0] == Catch::Approx(path.keys.back().cameraPosition[0]));
+    CHECK(frames.back().position[1] == Catch::Approx(path.keys.back().cameraPosition[1]));
+
+    settings.startFrame = 10;
+    settings.endFrame = 12;
+    const auto rangedFrames = invisible_places::output::BuildAnimationRenderSequence(path, settings);
+    REQUIRE(rangedFrames.size() == 3);
+    CHECK(rangedFrames.front().position[0] == Catch::Approx(frames[10].position[0]));
+    CHECK(rangedFrames.back().position[0] == Catch::Approx(frames[12].position[0]));
+}
+
+TEST_CASE("Preview-density export point-size scale follows output viewport ratio", "[output][animation]") {
+    CHECK(invisible_places::output::ComputePointSizePixelScale(1920, 1080, 1920, 1080) == Catch::Approx(1.0F));
+    CHECK(invisible_places::output::ComputePointSizePixelScale(3840, 2160, 1920, 1080) == Catch::Approx(2.0F));
+    CHECK(invisible_places::output::ComputePointSizePixelScale(960, 540, 1920, 1080) == Catch::Approx(0.5F));
+    CHECK(invisible_places::output::ComputePointSizePixelScale(1920, 1080, 0, 1080) == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Fast preview MP4 ffmpeg command uses raw RGBA video input", "[output][video]") {
+    const auto command = invisible_places::output::BuildFfmpegRawRgbaCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        1920,
+        1080,
+        24,
+        "/tmp/Invisible Places/it'll render.mp4");
+
+    CHECK(command.find("'/opt/homebrew/bin/ffmpeg'") != std::string::npos);
+    CHECK(command.find("-f rawvideo") != std::string::npos);
+    CHECK(command.find("-pix_fmt rgba") != std::string::npos);
+    CHECK(command.find("-s:v 1920x1080") != std::string::npos);
+    CHECK(command.find("-r 24") != std::string::npos);
+    CHECK(command.find("-i -") != std::string::npos);
+    CHECK(command.find("-c:v libx264") != std::string::npos);
+    CHECK(command.find("-pix_fmt yuv420p") != std::string::npos);
+    CHECK(command.find("'/tmp/Invisible Places/it'\\''ll render.mp4'") != std::string::npos);
+}
+
+TEST_CASE("Fast preview MP4 converts half-float beauty frames to display RGBA8", "[output][video]") {
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = 1;
+    image.height = 1;
+    image.rgbaHalf = {
+        0x3C00U,
+        0x3800U,
+        0x0000U,
+        0x3C00U,
+    };
+
+    const auto bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image);
+    REQUIRE(bytes.size() == 4);
+    CHECK(bytes[0] == 255U);
+    CHECK(bytes[1] == 188U);
+    CHECK(bytes[2] == 0U);
+    CHECK(bytes[3] == 255U);
+}
+
+TEST_CASE("EXR writer emits multichannel scanline files", "[output][exr]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_tiny.exr";
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 2, 1);
+    image.beautyR[0] = 1.0F;
+    image.beautyG[0] = 0.5F;
+    image.beautyB[0] = 0.25F;
+    image.alpha[0] = 1.0F;
+    image.depth[0] = 7.0F;
+
+    std::string errorMessage;
+    REQUIRE(invisible_places::output::WriteExrImage(image, outputPath, &errorMessage));
+
+    std::ifstream input{outputPath, std::ios::binary};
+    REQUIRE(input.is_open());
+    const std::vector<char> bytes{
+        std::istreambuf_iterator<char>{input},
+        std::istreambuf_iterator<char>{}};
+    REQUIRE(bytes.size() > 128);
+    CHECK(static_cast<unsigned char>(bytes[0]) == 0x76U);
+    CHECK(static_cast<unsigned char>(bytes[1]) == 0x2FU);
+    CHECK(static_cast<unsigned char>(bytes[2]) == 0x31U);
+    CHECK(static_cast<unsigned char>(bytes[3]) == 0x01U);
+    const std::string header{bytes.begin(), bytes.end()};
+    CHECK(header.find("beauty.R") != std::string::npos);
+    CHECK(header.find("depth.Z") != std::string::npos);
+
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("EXR writer accepts GPU half RGBA readback buffers", "[output][exr]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_gpu_half.exr";
+
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = 1;
+    image.height = 1;
+    image.rgbaHalf = {
+        0x3C00U,
+        0x3800U,
+        0x3400U,
+        0x3C00U,
+    };
+    image.depth = {5.0F};
+
+    std::string errorMessage;
+    REQUIRE(invisible_places::output::WriteExrImage(image, outputPath, &errorMessage));
+
+    std::ifstream input{outputPath, std::ios::binary};
+    REQUIRE(input.is_open());
+    const std::vector<char> bytes{
+        std::istreambuf_iterator<char>{input},
+        std::istreambuf_iterator<char>{}};
+    REQUIRE(bytes.size() > 128);
+    const std::string header{bytes.begin(), bytes.end()};
+    CHECK(header.find("beauty.R") != std::string::npos);
+    CHECK(header.find("beauty.G") != std::string::npos);
+    CHECK(header.find("beauty.B") != std::string::npos);
+    CHECK(header.find("alpha.A") != std::string::npos);
+    CHECK(header.find("depth.Z") != std::string::npos);
+
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Offline point tiles match untiled output for deterministic scenes", "[output][offline]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {
+        {0.0F, 0.0F, 0.0F},
+        {0.2F, 0.0F, 0.0F},
+        {-0.2F, 0.0F, 0.0F},
+    };
+    cloud.packedColors = {0xFF0000FFU, 0xFF00FF00U, 0xFFFF0000U};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+    invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    invisible_places::output::ExrImage tiled;
+    invisible_places::output::ExrImage untiled;
+    invisible_places::output::InitializeExrImage(&tiled, 16, 16);
+    invisible_places::output::InitializeExrImage(&untiled, 16, 16);
+
+    for (const auto& tile : invisible_places::output::BuildOfflineRenderTiles(16, 16, 5)) {
+        invisible_places::output::RenderPointCloudTile({layer}, cameraState, tile, &tiled);
+    }
+    for (const auto& tile : invisible_places::output::BuildOfflineRenderTiles(16, 16, 16)) {
+        invisible_places::output::RenderPointCloudTile({layer}, cameraState, tile, &untiled);
+    }
+
+    REQUIRE(tiled.beautyR.size() == untiled.beautyR.size());
+    for (std::size_t index = 0; index < tiled.beautyR.size(); ++index) {
+        CHECK(tiled.beautyR[index] == Catch::Approx(untiled.beautyR[index]));
+        CHECK(tiled.beautyG[index] == Catch::Approx(untiled.beautyG[index]));
+        CHECK(tiled.beautyB[index] == Catch::Approx(untiled.beautyB[index]));
+        CHECK(tiled.alpha[index] == Catch::Approx(untiled.alpha[index]));
+        if (std::isfinite(tiled.depth[index]) || std::isfinite(untiled.depth[index])) {
+            CHECK(tiled.depth[index] == Catch::Approx(untiled.depth[index]));
+        }
+    }
+}
+
+TEST_CASE("Offline world surfels use world diameter instead of pixel point size", "[output][offline][surfel]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFFFFFFFFU};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithPointSize = [&](float pointSize) {
+        invisible_places::renderer::pointcloud::PointCloudStyleState style;
+        style.geometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
+        style.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::Solid;
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+        invisible_places::style::SetScalarConstant(&style.pointSize, pointSize);
+        invisible_places::style::SetScalarConstant(&style.surfelDiameter, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 32, 32);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 32, 32},
+            &image);
+        return image;
+    };
+
+    const auto smallPointSize = renderWithPointSize(1.0F);
+    const auto largePointSize = renderWithPointSize(20.0F);
+    REQUIRE(smallPointSize.alpha.size() == largePointSize.alpha.size());
+    const auto coveredPixels =
+        std::count_if(smallPointSize.alpha.begin(), smallPointSize.alpha.end(), [](float alpha) {
+            return alpha > 0.0F;
+        });
+    CHECK(coveredPixels > 1);
+    for (std::size_t index = 0; index < smallPointSize.alpha.size(); ++index) {
+        CHECK(smallPointSize.alpha[index] == Catch::Approx(largePointSize.alpha[index]));
+        if (std::isfinite(smallPointSize.depth[index]) || std::isfinite(largePointSize.depth[index])) {
+            CHECK(smallPointSize.depth[index] == Catch::Approx(largePointSize.depth[index]));
+        }
+    }
+}
+
+TEST_CASE("Offline point renderer supports emissive and transparent point modes", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {
+        {0.0F, 0.0F, 0.0F},
+        {0.0F, 0.0F, -0.5F},
+    };
+    cloud.packedColors = {0xFF0000FFU, 0xFF00FF00U};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithStyle = [&](invisible_places::renderer::pointcloud::PointCloudStyleState style) {
+        invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9, 9);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+            &image);
+        return image;
+    };
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState emissiveHard;
+    emissiveHard.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::EmissiveHard;
+    emissiveHard.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    invisible_places::style::SetScalarConstant(&emissiveHard.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&emissiveHard.emissiveStrength, 2.0F);
+    const auto hardImage = renderWithStyle(emissiveHard);
+    const auto center = static_cast<std::size_t>(4) * 9U + 4U;
+    CHECK(hardImage.beautyR[center] > 0.1F);
+    CHECK(hardImage.alpha[center] > 0.1F);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState gaussian;
+    gaussian.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::EmissiveFeathered;
+    gaussian.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
+    gaussian.gaussianSharpness = 6.0F;
+    invisible_places::style::SetScalarConstant(&gaussian.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&gaussian.emissiveStrength, 2.0F);
+    const auto gaussianImage = renderWithStyle(gaussian);
+    const auto edge = static_cast<std::size_t>(4) * 9U + 6U;
+    CHECK(gaussianImage.beautyR[center] > gaussianImage.beautyR[edge]);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState xray;
+    xray.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray;
+    xray.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::SoftDisc;
+    xray.frontAlpha = 0.25F;
+    xray.hiddenAlpha = 0.18F;
+    xray.depthFalloff = 30.0F;
+    invisible_places::style::SetScalarConstant(&xray.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&xray.xrayStrength, 1.0F);
+    invisible_places::style::SetScalarConstant(&xray.emissiveStrength, 1.5F);
+    const auto xrayImage = renderWithStyle(xray);
+    CHECK(xrayImage.alpha[center] > 0.1F);
+    CHECK((xrayImage.beautyR[center] + xrayImage.beautyG[center]) > 0.1F);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState weighted;
+    weighted.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::WeightedTransparent;
+    weighted.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::SoftDisc;
+    invisible_places::style::SetScalarConstant(&weighted.opacity, 0.5F);
+    const auto weightedImage = renderWithStyle(weighted);
+    CHECK(weightedImage.alpha[center] > 0.1F);
+    CHECK(weightedImage.beautyR[center] > 0.01F);
+    CHECK(weightedImage.beautyG[center] > 0.01F);
 }
 
 TEST_CASE("gSplat quality resolver steps down during navigation and restores afterward", "[gsplat][quality]") {

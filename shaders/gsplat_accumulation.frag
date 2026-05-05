@@ -9,6 +9,7 @@ layout(location = 5) in float inScaleMetric;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
+layout(location = 2) out vec4 outEmission;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -167,4 +168,5 @@ void main() {
 
     outAccumulation = vec4(color * alpha * weight, alpha * weight);
     outRevealage = alpha;
+    outEmission = vec4(0.0);
 }

@@ -21,11 +21,19 @@ The following `vcpkg` setup was validated locally:
 - cloning `https://github.com/microsoft/vcpkg` to `~/vcpkg` provides the required root and `scripts/buildsystems/vcpkg.cmake`
 - the repository configured successfully with `VCPKG_ROOT="$HOME/vcpkg" cmake --preset macos-debug-vcpkg`
 
-The machine is still not ready for renderer work yet:
+The machine is now ready for the current preview renderer path:
 
-- `glslc` is not installed
-- `vulkaninfo` previously failed to create a Vulkan instance through the older Homebrew MoltenVK path
-- real render-path validation still depends on choosing and integrating the GS runtime codebase
+- shader compilation is driven by `glslangValidator` through CMake,
+- the app builds a Vulkan viewport with point-cloud and gSplat rendering,
+- OpenEXR is installed through the vcpkg manifest for EXR stack output,
+- current validation is through the local app and `ctest`.
+
+Remaining setup work is mostly about deeper diagnostics and future high-fidelity validation:
+
+- install or configure full Vulkan SDK validation layers if richer GPU debugging is needed,
+- re-check `vulkaninfo` after SDK changes,
+- install or confirm `ffmpeg` at `/opt/homebrew/bin/ffmpeg` when Fast Preview MP4 export is needed,
+- decide whether a pinned external `3dgs-vulkan-cpp` derivative is still needed beyond the current in-repo gSplat path.
 
 ## Why Vulkan parity matters here
 
@@ -44,8 +52,8 @@ That gives the M1 machine and the final Windows GPU machine the best chance of m
 2. Set `VULKAN_SDK` so CMake can resolve the SDK consistently.
 3. Install the Homebrew `vcpkg` executable, clone `~/vcpkg`, and either export `VCPKG_ROOT="$HOME/vcpkg"` or use the `macos-debug-home-vcpkg` preset.
 4. Configure with the `macos-debug-home-vcpkg` preset.
-5. Validate that `vulkaninfo` works before investing in render-path code.
+5. Validate that `vulkaninfo` works before investing in deeper GPU debugging or final-output render-path work.
 
 ## Open integration decision
 
-Real Gaussian splat integration is part of the plan, but the exact external codebase still needs to be pinned. The project docs mention `3dgs-vulkan-cpp` or a close derivative; once that repo or fork is chosen, it should be the one approved `FetchContent` exception if vcpkg does not package it.
+The current repo contains an in-repo gSplat preview path. The exact external codebase decision is still open for any future higher-fidelity adapter work. The project docs mention `3dgs-vulkan-cpp` or a close derivative; once that repo or fork is chosen, it should be the one approved `FetchContent` exception if vcpkg does not package it.

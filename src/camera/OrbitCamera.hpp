@@ -1,5 +1,6 @@
 #pragma once
 
+#include "camera/CameraState.hpp"
 #include "io/PointCloudData.hpp"
 
 #include <glm/mat4x4.hpp>
@@ -25,9 +26,14 @@ class OrbitCamera {
     void Orbit(float deltaX, float deltaY);
     void Pan(float deltaX, float deltaY, float viewportWidth, float viewportHeight);
     void Dolly(float wheelDelta);
+    void SetTargetPreservingPosition(const glm::vec3& target);
+    void SetOrbitCenterPreservingView(const glm::vec3& center);
+    void ApplyState(const CameraState& state);
 
+    [[nodiscard]] CameraState CaptureState() const;
     [[nodiscard]] OrbitCameraMatrices Matrices(float aspectRatio) const;
     [[nodiscard]] glm::vec3 Target() const { return target_; }
+    [[nodiscard]] glm::vec3 OrbitCenter() const { return orbitCenter_; }
     [[nodiscard]] float Distance() const { return distance_; }
     [[nodiscard]] float FovDegrees() const { return fovDegrees_; }
     [[nodiscard]] float NearPlane() const { return nearPlane_; }
@@ -35,6 +41,7 @@ class OrbitCamera {
     [[nodiscard]] bool HasFramedBounds() const { return framedBounds_.valid; }
 
   private:
+    void ApplyPositionTarget(glm::vec3 position, glm::vec3 target);
     [[nodiscard]] glm::vec3 WorldUp() const;
     [[nodiscard]] glm::vec3 Position() const;
     [[nodiscard]] glm::vec3 Forward() const;
@@ -46,7 +53,9 @@ class OrbitCamera {
 
     invisible_places::io::Bounds3f framedBounds_{};
     glm::vec3 framedFocusPoint_{0.0F, 0.0F, 0.0F};
+    glm::vec3 position_{-3.085F, -2.338F, 2.613F};
     glm::vec3 target_{0.0F, 0.0F, 0.0F};
+    glm::vec3 orbitCenter_{0.0F, 0.0F, 0.0F};
     float framedRadius_ = 1.0F;
     float minimumDistance_ = 0.0005F;
     float distance_ = 5.0F;
