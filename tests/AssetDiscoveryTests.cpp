@@ -1274,10 +1274,16 @@ TEST_CASE("Animation path keeps camera and focus derivatives smooth through midd
     }
 }
 
+TEST_CASE("Animation path depth of field is opt-in by default", "[camera][animation]") {
+    const invisible_places::camera::AnimationPath path;
+    CHECK_FALSE(path.depthOfFieldEnabled);
+}
+
 TEST_CASE("Animation path looks at the focal spline and stores focus distance", "[camera][animation]") {
     invisible_places::camera::AnimationPath path;
     path.name = "Focus";
     path.durationFrames = 30;
+    path.depthOfFieldEnabled = true;
     path.apertureFStops = 4.0F;
     path.keys = {
         {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 3.0F, 4.0F}, .durationFrames = 30},

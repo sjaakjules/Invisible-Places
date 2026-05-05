@@ -174,6 +174,7 @@ struct AnimationPanelState {
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
     float scrubAmount = 0.0F;
     bool liveApply = true;
+    bool previewDepthOfField = false;
     bool dirty = false;
     bool showSplines = true;
     bool exportPreviewDensity = true;
@@ -2606,14 +2607,33 @@ float AnimationDurationSeconds(const AnimationPath& path) {
     return static_cast<float>(std::max(path.durationFrames, minimumFrames)) / 30.0F;
 }
 
-void ApplyAnimationEvaluation(PreviewRuntimeState* runtimeState, const AnimationPath& path, float amount) {
+void SetCameraDepthOfFieldEnabled(PreviewRuntimeState* runtimeState, bool enabled) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    auto cameraState = runtimeState->camera.CaptureState();
+    if (cameraState.hasDepthOfField == enabled) {
+        return;
+    }
+
+    cameraState.hasDepthOfField = enabled;
+    runtimeState->camera.ApplyState(cameraState);
+}
+
+void ApplyAnimationEvaluation(
+    PreviewRuntimeState* runtimeState,
+    const AnimationPath& path,
+    float amount,
+    bool allowDepthOfField) {
     if (runtimeState == nullptr || path.keys.size() < 2U) {
         return;
     }
 
-    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
+    auto evaluation = invisible_places::camera::EvaluateAnimationPath(
         path,
         AnimationDurationSeconds(path) * std::clamp(amount, 0.0F, 1.0F));
+    evaluation.camera.hasDepthOfField = evaluation.camera.hasDepthOfField && allowDepthOfField;
     runtimeState->camera.ApplyState(evaluation.camera);
     runtimeState->pivotOverlay.visible = true;
     runtimeState->pivotOverlay.pivot = FromGlm(glm::vec3{
@@ -2671,10 +2691,11 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     runtimeState->animationPanel.draftAnimationName = path->name;
     runtimeState->animationPanel.selectedKeyIndex = path->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
     runtimeState->animationPanel.scrubAmount = 0.0F;
+    runtimeState->animationPanel.previewDepthOfField = false;
     runtimeState->animationPanel.dirty = false;
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
-    ApplyAnimationEvaluation(runtimeState, runtimeState->animationPanel.currentPath.value(), 0.0F);
+    ApplyAnimationEvaluation(runtimeState, runtimeState->animationPanel.currentPath.value(), 0.0F, false);
     runtimeState->statusMessage = "Loaded animation path: " + inputPath.filename().string() + ".";
     runtimeState->errorMessage.clear();
     return true;
@@ -2711,7 +2732,8 @@ void ApplyAnimationScrub(PreviewRuntimeState* runtimeState) {
     ApplyAnimationEvaluation(
         runtimeState,
         runtimeState->animationPanel.currentPath.value(),
-        runtimeState->animationPanel.scrubAmount);
+        runtimeState->animationPanel.scrubAmount,
+        runtimeState->animationPanel.previewDepthOfField);
     runtimeState->animationPlayback.active = false;
     runtimeState->cameraPlayback.active = false;
 }
@@ -2739,6 +2761,17 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
     runtimeState->errorMessage.clear();
 }
 
+void StopAnimationPlayback(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    runtimeState->animationPlayback.active = false;
+    if (!runtimeState->animationPanel.previewDepthOfField) {
+        SetCameraDepthOfFieldEnabled(runtimeState, false);
+    }
+}
+
 void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr || !runtimeState->animationPlayback.active) {
         return;
@@ -2749,10 +2782,10 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
         std::chrono::duration<float>(std::chrono::steady_clock::now() - playback.startedAt).count();
     const float t = std::clamp(elapsedSeconds / std::max(0.001F, playback.durationSeconds), 0.0F, 1.0F);
     runtimeState->animationPanel.scrubAmount = t;
-    ApplyAnimationEvaluation(runtimeState, playback.path, t);
+    ApplyAnimationEvaluation(runtimeState, playback.path, t, true);
 
     if (t >= 1.0F) {
-        runtimeState->animationPlayback.active = false;
+        StopAnimationPlayback(runtimeState);
         runtimeState->statusMessage = "Animation playback complete.";
     }
 }
@@ -4131,9 +4164,6 @@ void DrawAnimationViewportOverlay(
             panel.selectedKeyIndex = panel.drag.keyIndex;
             panel.editTarget = panel.drag.target;
             panel.dirty = true;
-            if (panel.liveApply) {
-                ApplyAnimationScrub(runtimeState);
-            }
         }
     }
 
@@ -4276,17 +4306,23 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
                                      std::chrono::steady_clock::now() - pendingLoad.startedAt)
                                      .count();
     const bool firstVisibleLayerLoad = VisibleLayerCount(runtimeState) == 0;
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 viewportPosition = mainViewport != nullptr ? mainViewport->Pos : ImVec2{0.0F, 0.0F};
+    const ImVec2 viewportSize = mainViewport != nullptr ? mainViewport->Size : io.DisplaySize;
 
     if (firstVisibleLayerLoad) {
-        ImGui::SetNextWindowPos(ImVec2{0.0F, 0.0F}, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+        if (mainViewport != nullptr) {
+            ImGui::SetNextWindowViewport(mainViewport->ID);
+        }
+        ImGui::SetNextWindowPos(viewportPosition, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(viewportSize, ImGuiCond_Always);
         constexpr auto fullscreenFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
         ImGui::Begin("InitialLayerLoadingOverlay", nullptr, fullscreenFlags);
         const auto& backgroundColor = runtimeState.projectSettings.backgroundColor;
         ImGui::GetWindowDrawList()->AddRectFilled(
             ImGui::GetWindowPos(),
-            ImVec2{ImGui::GetWindowPos().x + io.DisplaySize.x, ImGui::GetWindowPos().y + io.DisplaySize.y},
+            ImVec2{ImGui::GetWindowPos().x + viewportSize.x, ImGui::GetWindowPos().y + viewportSize.y},
             ImGui::ColorConvertFloat4ToU32(ImVec4{
                 backgroundColor[0],
                 backgroundColor[1],
@@ -4295,8 +4331,9 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
             }));
 
         const ImVec2 overlaySize = ImVec2{390.0F, 214.0F};
-        const ImVec2 overlayPosition =
-            ImVec2{(io.DisplaySize.x - overlaySize.x) * 0.5F, (io.DisplaySize.y - overlaySize.y) * 0.5F};
+        const ImVec2 overlayPosition = ImVec2{
+            viewportPosition.x + ((viewportSize.x - overlaySize.x) * 0.5F),
+            viewportPosition.y + ((viewportSize.y - overlaySize.y) * 0.5F)};
         ImGui::SetCursorScreenPos(overlayPosition);
         ImGui::BeginChild(
             "LoadingCard",
@@ -4324,7 +4361,10 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
         return;
     }
 
-    ImGui::SetNextWindowPos(ImVec2{24.0F, 100.0F}, ImGuiCond_Always);
+    if (mainViewport != nullptr) {
+        ImGui::SetNextWindowViewport(mainViewport->ID);
+    }
+    ImGui::SetNextWindowPos(ImVec2{viewportPosition.x + 24.0F, viewportPosition.y + 100.0F}, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.90F);
     constexpr auto cardFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
@@ -5184,10 +5224,27 @@ void DrawAnimationSection(
     }
     bool depthOfFieldEnabled = animationPath.depthOfFieldEnabled;
     bool depthOfFieldChanged = false;
+    bool depthOfFieldPreviewChanged = false;
     if (ImGui::Checkbox("Depth of Field", &depthOfFieldEnabled)) {
         animationPath.depthOfFieldEnabled = depthOfFieldEnabled;
+        panel.previewDepthOfField = depthOfFieldEnabled;
         panel.dirty = true;
         depthOfFieldChanged = true;
+        depthOfFieldPreviewChanged = true;
+    }
+    if (!animationPath.depthOfFieldEnabled) {
+        panel.previewDepthOfField = false;
+    }
+    bool previewDepthOfField = panel.previewDepthOfField && animationPath.depthOfFieldEnabled;
+    if (!animationPath.depthOfFieldEnabled) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Checkbox("Preview DoF", &previewDepthOfField)) {
+        panel.previewDepthOfField = previewDepthOfField;
+        depthOfFieldPreviewChanged = true;
+    }
+    if (!animationPath.depthOfFieldEnabled) {
+        ImGui::EndDisabled();
     }
     float apertureFStops = animationPath.apertureFStops;
     if (ImGui::InputFloat("Aperture f-stop", &apertureFStops, 0.1F, 1.0F, "%.2f")) {
@@ -5209,7 +5266,7 @@ void DrawAnimationSection(
         animationPath,
         AnimationDurationSeconds(animationPath) * std::clamp(panel.scrubAmount, 0.0F, 1.0F));
     ImGui::TextDisabled("Focus distance: %.3f", evaluation.focusDistance);
-    if (depthOfFieldChanged && panel.liveApply) {
+    if (depthOfFieldPreviewChanged || (depthOfFieldChanged && panel.liveApply)) {
         ApplyAnimationScrub(runtimeState);
     }
 
@@ -5227,7 +5284,7 @@ void DrawAnimationSection(
     ImGui::SameLine();
     if (ImGui::Button(runtimeState->animationPlayback.active ? "Stop Playback" : "Play")) {
         if (runtimeState->animationPlayback.active) {
-            runtimeState->animationPlayback.active = false;
+            StopAnimationPlayback(runtimeState);
         } else {
             StartAnimationPlayback(runtimeState);
         }
@@ -6100,6 +6157,7 @@ int Application::Run() const {
             }
 
             DrawControlsWindow(&runtimeState, &viewport.value());
+            DrawLoadingOverlay(runtimeState);
             DrawAnimationViewportOverlay(&runtimeState, viewport.value());
             UpdateCameraFromInput(&runtimeState, viewport.value());
             UpdateAnimationPlayback(&runtimeState);
