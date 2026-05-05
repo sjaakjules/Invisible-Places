@@ -553,6 +553,27 @@ const char* PointCloudPreviewLodModeLabel(PointCloudPreviewLodMode mode) {
     return "Unknown";
 }
 
+const char* PointCloudRenderModeLabel(PointCloudRenderMode mode) {
+    switch (mode) {
+        case PointCloudRenderMode::Solid:
+            return "Solid";
+        case PointCloudRenderMode::EmissiveHard:
+            return "Emissive Hard";
+        case PointCloudRenderMode::EmissiveFeathered:
+            return "Emissive Feathered";
+        case PointCloudRenderMode::DepthXray:
+            return "Depth X-Ray";
+        case PointCloudRenderMode::WeightedTransparent:
+            return "Weighted Transparent";
+        case PointCloudRenderMode::ComputeDensity:
+            return "Compute Density";
+        case PointCloudRenderMode::GaussianPointSprite:
+            return "Gaussian Point Sprite";
+    }
+
+    return "Unknown";
+}
+
 const char* GaussianSplatColorModeLabel(GaussianSplatColorMode mode) {
     switch (mode) {
         case GaussianSplatColorMode::FullSh:
@@ -880,6 +901,12 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
             session->scalarFields,
             0.0F,
             1.0F);
+        session->pointStyle.colormapPosition.constantValue[0] =
+            std::clamp(session->pointStyle.colormapPosition.constantValue[0], 0.0F, 1.0F);
+        session->pointStyle.colormapPosition.fieldMap.outputMin =
+            std::clamp(session->pointStyle.colormapPosition.fieldMap.outputMin, 0.0F, 1.0F);
+        session->pointStyle.colormapPosition.fieldMap.outputMax =
+            std::clamp(session->pointStyle.colormapPosition.fieldMap.outputMax, 0.0F, 1.0F);
     }
 }
 
@@ -916,6 +943,86 @@ bool InputTextString(const char* label, std::string* value) {
         value);
 }
 
+struct RangedFloatControlConfig {
+    float visualMin = 0.0F;
+    float visualMax = 1.0F;
+    const char* format = "%.3f";
+    float speed = 0.0F;
+    std::optional<float> hardMin = std::nullopt;
+    std::optional<float> hardMax = std::nullopt;
+};
+
+bool IsValidRangedFloatValue(float value, const RangedFloatControlConfig& config) {
+    if (!std::isfinite(value)) {
+        return false;
+    }
+    if (config.hardMin.has_value() && value < config.hardMin.value()) {
+        return false;
+    }
+    if (config.hardMax.has_value() && value > config.hardMax.value()) {
+        return false;
+    }
+    return true;
+}
+
+bool TryAssignRangedFloatValue(float* value, float candidate, const RangedFloatControlConfig& config) {
+    if (value == nullptr || !IsValidRangedFloatValue(candidate, config)) {
+        return false;
+    }
+
+    if (*value == candidate) {
+        return false;
+    }
+
+    *value = candidate;
+    return true;
+}
+
+bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatControlConfig& config) {
+    if (value == nullptr) {
+        return false;
+    }
+
+    const float visualMin = std::min(config.visualMin, config.visualMax);
+    const float visualMax = std::max(config.visualMin, config.visualMax);
+    const float visualRange = std::max(visualMax - visualMin, 1.0e-6F);
+    const float dragSpeed = config.speed > 0.0F ? config.speed : visualRange / 200.0F;
+    bool changed = false;
+
+    ImGui::PushID(label);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    constexpr float inputWidth = 116.0F;
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float dragWidth = std::max(96.0F, availableWidth - inputWidth - style.ItemSpacing.x);
+    float dragValue = std::clamp(*value, visualMin, visualMax);
+    ImGui::SetNextItemWidth(dragWidth);
+    if (ImGui::DragFloat(
+            "##range",
+            &dragValue,
+            dragSpeed,
+            visualMin,
+            visualMax,
+            config.format,
+            ImGuiSliderFlags_AlwaysClamp)) {
+        changed |= TryAssignRangedFloatValue(value, dragValue, config);
+    }
+
+    ImGui::SameLine(0.0F, style.ItemSpacing.x);
+    float inputValue = *value;
+    ImGui::SetNextItemWidth(inputWidth);
+    if (ImGui::InputFloat("##value", &inputValue, 0.0F, 0.0F, config.format)) {
+        // TODO: surface an "out of range" popup once transient validation UI is structured.
+        changed |= TryAssignRangedFloatValue(value, inputValue, config);
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
 struct ScalarBindingWidgetConfig {
     float constantMin = 0.0F;
     float constantMax = 1.0F;
@@ -923,8 +1030,9 @@ struct ScalarBindingWidgetConfig {
     float defaultOutputMax = 1.0F;
     float defaultConstant = 0.0F;
     const char* format = "%.3f";
-    bool directConstantInput = false;
     float displayScale = 1.0F;
+    std::optional<float> hardMin = std::nullopt;
+    std::optional<float> hardMax = std::nullopt;
 };
 
 const char* FieldMapModeLabel(ParameterSourceMode mode) {
@@ -974,21 +1082,20 @@ bool DrawScalarBindingWidget(
     if (binding->mode == ParameterSourceMode::Constant || scalarFields.empty()) {
         const float displayScale = std::max(1.0e-6F, config.displayScale);
         float constantValue = invisible_places::style::ScalarConstant(*binding) * displayScale;
-        bool valueChanged =
-            ImGui::SliderFloat(
-                "Value",
-                &constantValue,
-                config.constantMin * displayScale,
-                config.constantMax * displayScale,
-                config.format);
-        if (config.directConstantInput) {
-            ImGui::SetNextItemWidth(120.0F);
-            valueChanged |= ImGui::InputFloat("Value Input", &constantValue, 0.0F, 0.0F, config.format);
-        }
+        const std::optional<float> hardMin =
+            config.hardMin.has_value() ? std::optional<float>{config.hardMin.value() * displayScale} : std::nullopt;
+        const std::optional<float> hardMax =
+            config.hardMax.has_value() ? std::optional<float>{config.hardMax.value() * displayScale} : std::nullopt;
+        const bool valueChanged = DrawRangedFloatControl(
+            "Value",
+            &constantValue,
+            {.visualMin = config.constantMin * displayScale,
+             .visualMax = config.constantMax * displayScale,
+             .format = config.format,
+             .hardMin = hardMin,
+             .hardMax = hardMax});
         if (valueChanged) {
-            const float storedValue =
-                std::clamp(constantValue / displayScale, config.constantMin, config.constantMax);
-            invisible_places::style::SetScalarConstant(binding, storedValue);
+            invisible_places::style::SetScalarConstant(binding, constantValue / displayScale);
             changed = true;
         }
         if (binding->mode == ParameterSourceMode::FieldMapped && scalarFields.empty()) {
@@ -1047,15 +1154,36 @@ bool DrawScalarBindingWidget(
     const float displayScale = std::max(1.0e-6F, config.displayScale);
     float outputMin = binding->fieldMap.outputMin * displayScale;
     float outputMax = binding->fieldMap.outputMax * displayScale;
-    if (ImGui::InputFloat("Output Min", &outputMin, 0.0F, 0.0F, config.format)) {
+    const std::optional<float> hardMin =
+        config.hardMin.has_value() ? std::optional<float>{config.hardMin.value() * displayScale} : std::nullopt;
+    const std::optional<float> hardMax =
+        config.hardMax.has_value() ? std::optional<float>{config.hardMax.value() * displayScale} : std::nullopt;
+    if (DrawRangedFloatControl(
+            "Output Min",
+            &outputMin,
+            {.visualMin = config.constantMin * displayScale,
+             .visualMax = config.constantMax * displayScale,
+             .format = config.format,
+             .hardMin = hardMin,
+             .hardMax = hardMax})) {
         binding->fieldMap.outputMin = outputMin / displayScale;
         changed = true;
     }
-    if (ImGui::InputFloat("Output Max", &outputMax, 0.0F, 0.0F, config.format)) {
+    if (DrawRangedFloatControl(
+            "Output Max",
+            &outputMax,
+            {.visualMin = config.constantMin * displayScale,
+             .visualMax = config.constantMax * displayScale,
+             .format = config.format,
+             .hardMin = hardMin,
+             .hardMax = hardMax})) {
         binding->fieldMap.outputMax = outputMax / displayScale;
         changed = true;
     }
-    changed |= ImGui::SliderFloat("Gamma", &binding->fieldMap.gamma, 0.05F, 4.0F, "%.2f");
+    changed |= DrawRangedFloatControl(
+        "Gamma",
+        &binding->fieldMap.gamma,
+        {.visualMin = 0.05F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0001F});
 
     bool clamp = invisible_places::style::HasFieldMapFlag(
         binding->fieldMap,
@@ -1702,6 +1830,28 @@ PreviewLayerSession* SelectedLoadedSessionOfKind(PreviewRuntimeState* runtimeSta
 const PreviewLayerSession* SelectedLoadedSessionOfKind(const PreviewRuntimeState& runtimeState, LayerKind kind) {
     const auto* session = SelectedLoadedSession(runtimeState);
     return session != nullptr && session->kind == kind ? session : nullptr;
+}
+
+bool IsVisibleLoadedPointCloudSession(const PreviewLayerSession& session) {
+    return session.kind == LayerKind::PointCloud && session.loaded && session.visible;
+}
+
+std::optional<std::size_t> ResolveVisiblePointCloudLookdevIndex(const PreviewRuntimeState& runtimeState) {
+    if (runtimeState.selectedSessionIndex.has_value() &&
+        runtimeState.selectedSessionIndex.value() < runtimeState.sessions.size()) {
+        const auto selectedIndex = runtimeState.selectedSessionIndex.value();
+        if (IsVisibleLoadedPointCloudSession(runtimeState.sessions[selectedIndex])) {
+            return selectedIndex;
+        }
+    }
+
+    for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
+        if (IsVisibleLoadedPointCloudSession(runtimeState.sessions[index])) {
+            return index;
+        }
+    }
+
+    return std::nullopt;
 }
 
 std::optional<LayerLoadResult> TakeCompletedBackgroundResult(
@@ -2877,6 +3027,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
         layers.push_back(
             {.layerId = sessionIndex,
              .style = session.pointStyle,
+             .scalarFields = session.scalarFields,
              .hasSourceRgb = session.hasSourceRgb,
              .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                  drawPointCount,
@@ -2908,6 +3059,7 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     renderState.hasDepthOfField = cameraState.hasDepthOfField;
     renderState.focusDistance = cameraState.focusDistance;
     renderState.apertureFStops = cameraState.apertureFStops;
+    renderState.depthOfFieldMaxBlurPixels = cameraState.depthOfFieldMaxBlurPixels;
     renderState.gaussianSplatFootprintBoost = job.exportGaussianSplatFootprintBoost;
     renderState.pointSizeScale = invisible_places::output::ComputePointSizePixelScale(
         width,
@@ -4304,7 +4456,14 @@ void DrawLayerSection(
                 }
 
                 float requestedFraction = session->pointBudget.activeFraction;
-                if (ImGui::SliderFloat("Budget Fraction", &requestedFraction, 0.0F, 1.0F, "%.3f")) {
+                if (DrawRangedFloatControl(
+                        "Budget Fraction",
+                        &requestedFraction,
+                        {.visualMin = 0.0F,
+                         .visualMax = 1.0F,
+                         .format = "%.3f",
+                         .hardMin = 0.0F,
+                         .hardMax = 1.0F})) {
                     const auto requestedPoints = static_cast<std::uint64_t>(
                         requestedFraction >= 1.0F ? session->totalPrimitives
                                                   : static_cast<double>(session->totalPrimitives) * requestedFraction);
@@ -4340,6 +4499,236 @@ void DrawLayerSection(
     }
 }
 
+bool DrawPointCloudSizeControl(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels) {
+        return DrawScalarBindingWidget(
+            "Point Size (mm)",
+            &style.surfelDiameter,
+            session->scalarFields,
+            {.constantMin = 0.0001F,
+             .constantMax = 0.1F,
+             .defaultOutputMin = 0.0001F,
+             .defaultOutputMax = 0.1F,
+             .defaultConstant = 0.005F,
+             .format = "%.3f",
+             .displayScale = 1000.0F,
+             .hardMin = 0.0F});
+    }
+
+    return DrawScalarBindingWidget(
+        "Point Size (px)",
+        &style.pointSize,
+        session->scalarFields,
+        {.constantMin = 1.0F,
+         .constantMax = 16.0F,
+         .defaultOutputMin = 1.0F,
+         .defaultOutputMax = 16.0F,
+         .defaultConstant = 2.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F});
+}
+
+bool DrawPointCloudRenderModeControls(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+
+    switch (style.renderMode) {
+        case PointCloudRenderMode::Solid:
+            changed |= DrawScalarBindingWidget(
+                "Depth Fade",
+                &style.depthFade,
+                session->scalarFields,
+                {.constantMin = 0.0F,
+                 .constantMax = 1.0F,
+                 .defaultOutputMin = 0.0F,
+                 .defaultOutputMax = 1.0F,
+                 .defaultConstant = 0.0F,
+                 .format = "%.2f",
+                 .hardMin = 0.0F,
+                 .hardMax = 1.0F});
+            break;
+        case PointCloudRenderMode::EmissiveHard:
+            changed |= DrawScalarBindingWidget(
+                "Emissive",
+                &style.emissiveStrength,
+                session->scalarFields,
+                {.constantMin = 0.0F,
+                 .constantMax = 2.5F,
+                 .defaultOutputMin = 0.0F,
+                 .defaultOutputMax = 2.5F,
+                 .defaultConstant = 0.0F,
+                 .format = "%.2f",
+                 .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Exposure",
+                &style.exposure,
+                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+            break;
+        case PointCloudRenderMode::EmissiveFeathered:
+            changed |= DrawScalarBindingWidget(
+                "Emissive",
+                &style.emissiveStrength,
+                session->scalarFields,
+                {.constantMin = 0.0F,
+                 .constantMax = 2.5F,
+                 .defaultOutputMin = 0.0F,
+                 .defaultOutputMax = 2.5F,
+                 .defaultConstant = 0.0F,
+                 .format = "%.2f",
+                 .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Exposure",
+                &style.exposure,
+                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Inner Radius",
+                &style.innerRadius,
+                {.visualMin = 0.0F, .visualMax = 0.99F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 0.99F});
+            changed |= DrawRangedFloatControl(
+                "Gaussian Sharpness",
+                &style.gaussianSharpness,
+                {.visualMin = 0.1F, .visualMax = 16.0F, .format = "%.2f", .hardMin = 0.001F});
+            changed |= DrawRangedFloatControl(
+                "Feather Power",
+                &style.featherPower,
+                {.visualMin = 0.1F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.001F});
+            break;
+        case PointCloudRenderMode::DepthXray:
+            changed |= DrawScalarBindingWidget(
+                "X-Ray",
+                &style.xrayStrength,
+                session->scalarFields,
+                {.constantMin = 0.0F,
+                 .constantMax = 1.0F,
+                 .defaultOutputMin = 0.0F,
+                 .defaultOutputMax = 1.0F,
+                 .defaultConstant = 0.0F,
+                 .format = "%.2f",
+                 .hardMin = 0.0F,
+                 .hardMax = 1.0F});
+            changed |= DrawScalarBindingWidget(
+                "Emissive",
+                &style.emissiveStrength,
+                session->scalarFields,
+                {.constantMin = 0.0F,
+                 .constantMax = 2.5F,
+                 .defaultOutputMin = 0.0F,
+                 .defaultOutputMax = 2.5F,
+                 .defaultConstant = 0.0F,
+                 .format = "%.2f",
+                 .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Exposure",
+                &style.exposure,
+                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Depth Falloff",
+                &style.depthFalloff,
+                {.visualMin = 0.0F, .visualMax = 400.0F, .format = "%.1f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Depth Bias",
+                &style.depthBias,
+                {.visualMin = 0.0F, .visualMax = 0.01F, .format = "%.5f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Front Alpha",
+                &style.frontAlpha,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            changed |= DrawRangedFloatControl(
+                "Hidden Alpha",
+                &style.hiddenAlpha,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            break;
+        case PointCloudRenderMode::WeightedTransparent:
+            changed |= DrawRangedFloatControl(
+                "Density Scale",
+                &style.densityScale,
+                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Density Clamp",
+                &style.densityClamp,
+                {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
+            break;
+        case PointCloudRenderMode::ComputeDensity:
+            ImGui::TextDisabled("Compute density currently falls back to weighted raster accumulation.");
+            changed |= DrawRangedFloatControl(
+                "Density Scale",
+                &style.densityScale,
+                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Density Clamp",
+                &style.densityClamp,
+                {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
+            break;
+        case PointCloudRenderMode::GaussianPointSprite:
+            changed |= DrawRangedFloatControl(
+                "Gaussian Sharpness",
+                &style.gaussianSharpness,
+                {.visualMin = 0.1F, .visualMax = 16.0F, .format = "%.2f", .hardMin = 0.001F});
+            changed |= DrawRangedFloatControl(
+                "Density Scale",
+                &style.densityScale,
+                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+            changed |= DrawRangedFloatControl(
+                "Density Clamp",
+                &style.densityClamp,
+                {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
+            break;
+    }
+
+    return changed;
+}
+
+bool DrawPointCloudRenderModeTabs(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    constexpr std::array<PointCloudRenderMode, 7> renderModes{
+        PointCloudRenderMode::Solid,
+        PointCloudRenderMode::EmissiveHard,
+        PointCloudRenderMode::EmissiveFeathered,
+        PointCloudRenderMode::DepthXray,
+        PointCloudRenderMode::WeightedTransparent,
+        PointCloudRenderMode::ComputeDensity,
+        PointCloudRenderMode::GaussianPointSprite,
+    };
+
+    ImGui::SeparatorText("Render Mode");
+    if (ImGui::BeginTabBar("PointCloudRenderModeTabs")) {
+        for (const auto renderMode : renderModes) {
+            const auto flags =
+                style.renderMode == renderMode ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            const bool tabOpen = ImGui::BeginTabItem(PointCloudRenderModeLabel(renderMode), nullptr, flags);
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && style.renderMode != renderMode) {
+                style.renderMode = renderMode;
+                changed = true;
+            }
+            if (tabOpen) {
+                if (style.renderMode != renderMode) {
+                    style.renderMode = renderMode;
+                    changed = true;
+                }
+                changed |= DrawPointCloudRenderModeControls(session);
+                ImGui::EndTabItem();
+            }
+        }
+        ImGui::EndTabBar();
+    }
+
+    return changed;
+}
+
 void DrawPointCloudStyleSection(PreviewLayerSession* session) {
     auto& style = session->pointStyle;
     bool changed = false;
@@ -4352,23 +4741,6 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
     }
     if (style.geometryMode == PointCloudGeometryMode::WorldSurfels && !session->hasNormals) {
         ImGui::TextDisabled("No normals were loaded; surfels face the camera.");
-    }
-
-    int renderModeIndex = static_cast<int>(style.renderMode);
-    const char* renderModes[] = {
-        "Solid",
-        "Emissive Hard",
-        "Emissive Feathered",
-        "Depth X-Ray",
-        "Weighted Transparent",
-        "Compute Density",
-        "Gaussian Point Sprite"};
-    if (ImGui::Combo("Render Mode", &renderModeIndex, renderModes, IM_ARRAYSIZE(renderModes))) {
-        style.renderMode = static_cast<PointCloudRenderMode>(renderModeIndex);
-        changed = true;
-    }
-    if (style.renderMode == PointCloudRenderMode::ComputeDensity) {
-        ImGui::TextDisabled("Compute density currently falls back to weighted raster accumulation.");
     }
 
     int falloffIndex = static_cast<int>(style.falloffProfile);
@@ -4411,35 +4783,14 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
              .defaultOutputMin = 0.0F,
              .defaultOutputMax = 1.0F,
              .defaultConstant = 0.5F,
-             .format = "%.3f"});
+             .format = "%.3f",
+             .hardMin = 0.0F,
+             .hardMax = 1.0F});
     } else if (style.colorMode == PointCloudColorMode::ScalarColormap) {
         ImGui::TextDisabled("No scalar fields were discovered for this cloud.");
     }
 
-    changed |= DrawScalarBindingWidget(
-        "Point Size",
-        &style.pointSize,
-        session->scalarFields,
-        {.constantMin = 1.0F,
-         .constantMax = 16.0F,
-         .defaultOutputMin = 1.0F,
-         .defaultOutputMax = 16.0F,
-         .defaultConstant = 2.0F,
-         .format = "%.2f"});
-    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels) {
-        changed |= DrawScalarBindingWidget(
-            "Surfel Diameter (mm)",
-            &style.surfelDiameter,
-            session->scalarFields,
-            {.constantMin = 0.0001F,
-             .constantMax = 0.1F,
-             .defaultOutputMin = 0.0001F,
-             .defaultOutputMax = 0.1F,
-             .defaultConstant = 0.005F,
-             .format = "%.3f",
-             .directConstantInput = true,
-             .displayScale = 1000.0F});
-    }
+    changed |= DrawPointCloudSizeControl(session);
     changed |= DrawScalarBindingWidget(
         "Opacity",
         &style.opacity,
@@ -4449,49 +4800,10 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .defaultOutputMin = 0.0F,
          .defaultOutputMax = 1.0F,
          .defaultConstant = 1.0F,
-         .format = "%.2f"});
-    changed |= DrawScalarBindingWidget(
-        "Emissive",
-        &style.emissiveStrength,
-        session->scalarFields,
-        {.constantMin = 0.0F,
-         .constantMax = 2.5F,
-         .defaultOutputMin = 0.0F,
-         .defaultOutputMax = 2.5F,
-         .defaultConstant = 0.0F,
-         .format = "%.2f"});
-    changed |= DrawScalarBindingWidget(
-        "X-Ray",
-        &style.xrayStrength,
-        session->scalarFields,
-        {.constantMin = 0.0F,
-         .constantMax = 1.0F,
-         .defaultOutputMin = 0.0F,
-         .defaultOutputMax = 1.0F,
-         .defaultConstant = 0.0F,
-         .format = "%.2f"});
-    changed |= DrawScalarBindingWidget(
-        "Depth Fade",
-        &style.depthFade,
-        session->scalarFields,
-        {.constantMin = 0.0F,
-         .constantMax = 1.0F,
-         .defaultOutputMin = 0.0F,
-         .defaultOutputMax = 1.0F,
-         .defaultConstant = 0.0F,
-         .format = "%.2f"});
-
-    ImGui::SeparatorText("Mode Controls");
-    changed |= ImGui::SliderFloat("Exposure", &style.exposure, 0.0F, 8.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Inner Radius", &style.innerRadius, 0.0F, 0.99F, "%.2f");
-    changed |= ImGui::SliderFloat("Gaussian Sharpness", &style.gaussianSharpness, 0.1F, 16.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Feather Power", &style.featherPower, 0.1F, 8.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Depth Falloff", &style.depthFalloff, 0.0F, 400.0F, "%.1f");
-    changed |= ImGui::SliderFloat("Depth Bias", &style.depthBias, 0.0F, 0.01F, "%.5f");
-    changed |= ImGui::SliderFloat("Front Alpha", &style.frontAlpha, 0.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Hidden Alpha", &style.hiddenAlpha, 0.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Density Scale", &style.densityScale, 0.0F, 8.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Density Clamp", &style.densityClamp, 0.0F, 512.0F, "%.1f");
+         .format = "%.2f",
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+    changed |= DrawPointCloudRenderModeTabs(session);
 
     if (changed) {
         SanitizePointCloudStyle(session);
@@ -4525,10 +4837,22 @@ void DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
 
     ImGui::Checkbox("Apply Transform", &style.transformEnabled);
     ImGui::ColorEdit4("Layer Tint", style.layerTint.data());
-    ImGui::SliderFloat("Opacity Multiplier", &style.opacityMultiplier, 0.0F, 2.0F, "%.2f");
-    ImGui::SliderFloat("Scale Multiplier", &style.scaleMultiplier, 0.1F, 4.0F, "%.2f");
-    ImGui::SliderFloat("Exposure", &style.exposure, 0.0F, 4.0F, "%.2f");
-    ImGui::SliderFloat("Saturation", &style.saturation, 0.0F, 2.0F, "%.2f");
+    DrawRangedFloatControl(
+        "Opacity Multiplier",
+        &style.opacityMultiplier,
+        {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F});
+    DrawRangedFloatControl(
+        "Scale Multiplier",
+        &style.scaleMultiplier,
+        {.visualMin = 0.1F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.001F});
+    DrawRangedFloatControl(
+        "Exposure",
+        &style.exposure,
+        {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F});
+    DrawRangedFloatControl(
+        "Saturation",
+        &style.saturation,
+        {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F});
 }
 
 void DrawStyleSection(PreviewRuntimeState* runtimeState) {
@@ -4760,7 +5084,10 @@ void DrawCameraSection(
     }
 
     const bool blendChanged =
-        ImGui::SliderFloat("Path Position", &runtimeState->cameraPanel.blendAmount, 0.0F, 1.0F, "%.3f");
+        DrawRangedFloatControl(
+            "Path Position",
+            &runtimeState->cameraPanel.blendAmount,
+            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
     ImGui::Checkbox("Live Apply", &runtimeState->cameraPanel.liveBlend);
     if (runtimeState->cameraPanel.liveBlend && blendChanged) {
         ApplyCameraBlend(runtimeState);
@@ -4855,18 +5182,41 @@ void DrawAnimationSection(
         animationPath.durationFrames = static_cast<std::uint32_t>(std::max(1, durationFrames));
         panel.dirty = true;
     }
+    bool depthOfFieldEnabled = animationPath.depthOfFieldEnabled;
+    bool depthOfFieldChanged = false;
+    if (ImGui::Checkbox("Depth of Field", &depthOfFieldEnabled)) {
+        animationPath.depthOfFieldEnabled = depthOfFieldEnabled;
+        panel.dirty = true;
+        depthOfFieldChanged = true;
+    }
     float apertureFStops = animationPath.apertureFStops;
     if (ImGui::InputFloat("Aperture f-stop", &apertureFStops, 0.1F, 1.0F, "%.2f")) {
         animationPath.apertureFStops = std::max(0.1F, apertureFStops);
         panel.dirty = true;
+        depthOfFieldChanged = true;
+    }
+    float maxBlurPixels = animationPath.depthOfFieldMaxBlurPixels;
+    if (DrawRangedFloatControl(
+            "Max Blur",
+            &maxBlurPixels,
+            {.visualMin = 0.0F, .visualMax = 96.0F, .format = "%.1f px", .hardMin = 0.0F})) {
+        animationPath.depthOfFieldMaxBlurPixels = std::max(0.0F, maxBlurPixels);
+        panel.dirty = true;
+        depthOfFieldChanged = true;
     }
 
     const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
         animationPath,
         AnimationDurationSeconds(animationPath) * std::clamp(panel.scrubAmount, 0.0F, 1.0F));
     ImGui::TextDisabled("Focus distance: %.3f", evaluation.focusDistance);
+    if (depthOfFieldChanged && panel.liveApply) {
+        ApplyAnimationScrub(runtimeState);
+    }
 
-    const bool scrubChanged = ImGui::SliderFloat("Animation Position", &panel.scrubAmount, 0.0F, 1.0F, "%.3f");
+    const bool scrubChanged = DrawRangedFloatControl(
+        "Animation Position",
+        &panel.scrubAmount,
+        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
     ImGui::Checkbox("Live Apply", &panel.liveApply);
     if (panel.liveApply && scrubChanged) {
         ApplyAnimationScrub(runtimeState);
@@ -4963,12 +5313,10 @@ void DrawSettingsSection(
     ImGui::Checkbox(
         "Auto Lower gSplat Quality While Interacting",
         &settings.autoLowerGsplatQualityWhileNavigating);
-    ImGui::SliderFloat(
+    DrawRangedFloatControl(
         "gSplat Footprint Boost",
         &settings.gaussianSplatFootprintBoost,
-        0.35F,
-        3.0F,
-        "%.2f");
+        {.visualMin = 0.35F, .visualMax = 3.0F, .format = "%.2f", .hardMin = 0.001F});
 
     int conventionIndex = static_cast<int>(settings.gsplatTransformConvention);
     const char* transformConventions[] = {"As Encoded", "Swap Y/Z", "Swap Y/Z + Flip X"};
@@ -5081,12 +5429,11 @@ void DrawProjectSection(
     }
 }
 
-void DrawPresetSection(PreviewRuntimeState* runtimeState) {
+void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
     ImGui::SeparatorText("Presets");
 
     InputTextString("Point Style Preset", &runtimeState->persistence.pointStylePresetPath);
 
-    auto* session = SelectedSession(runtimeState);
     if (session == nullptr || session->kind != LayerKind::PointCloud) {
         ImGui::TextUnformatted("Select a point cloud layer to save or load a point style preset.");
         return;
@@ -5130,18 +5477,55 @@ void DrawPresetSection(PreviewRuntimeState* runtimeState) {
     }
 }
 
+PreviewLayerSession* DrawVisiblePointCloudLookdevSelector(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+
+    auto visualIndex = ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+    if (!visualIndex.has_value()) {
+        return nullptr;
+    }
+
+    const auto currentIndex = visualIndex.value();
+    if (ImGui::BeginCombo("Visible Cloud", runtimeState->sessions[currentIndex].displayName.c_str())) {
+        for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+            auto& session = runtimeState->sessions[index];
+            if (!IsVisibleLoadedPointCloudSession(session)) {
+                continue;
+            }
+
+            const bool selected = visualIndex.has_value() && visualIndex.value() == index;
+            if (ImGui::Selectable(session.displayName.c_str(), selected)) {
+                runtimeState->selectedSessionIndex = index;
+                visualIndex = index;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    return visualIndex.has_value() ? &runtimeState->sessions[visualIndex.value()] : nullptr;
+}
+
 void DrawLidarPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     DrawLayerSection(runtimeState, viewport, LayerKind::PointCloud, "Lidar Layers");
-    ImGui::Spacing();
-    ImGui::SeparatorText("Lidar Visuals");
-    if (auto* session = SelectedLoadedSessionOfKind(runtimeState, LayerKind::PointCloud); session != nullptr) {
-        DrawPointCloudStyleSection(session);
-    } else {
-        ImGui::TextUnformatted("Select and load a lidar layer to edit its visual settings.");
+}
+
+void DrawVisualsPanel(PreviewRuntimeState* runtimeState) {
+    ImGui::SeparatorText("LiDAR Visuals");
+    auto* session = DrawVisiblePointCloudLookdevSelector(runtimeState);
+    if (session == nullptr) {
+        ImGui::TextUnformatted("Load and show a lidar layer to edit its visual settings.");
+        return;
     }
-    DrawPresetSection(runtimeState);
+
+    DrawPointCloudStyleSection(session);
+    DrawPresetSection(runtimeState, session);
 }
 
 void DrawGsplatPanel(
@@ -5368,6 +5752,10 @@ void DrawControlsWindow(
             DrawLidarPanel(runtimeState, viewport);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Visuals")) {
+            DrawVisualsPanel(runtimeState);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("gSplat")) {
             DrawGsplatPanel(runtimeState, viewport);
             ImGui::EndTabItem();
@@ -5542,15 +5930,11 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     };
     renderState.nearPlane = runtimeState.camera.NearPlane();
     renderState.farPlane = runtimeState.camera.FarPlane();
-    if (runtimeState.animationPanel.currentPath.has_value()) {
-        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-            runtimeState.animationPanel.currentPath.value(),
-            AnimationDurationSeconds(runtimeState.animationPanel.currentPath.value()) *
-                std::clamp(runtimeState.animationPanel.scrubAmount, 0.0F, 1.0F));
-        renderState.hasDepthOfField = true;
-        renderState.focusDistance = evaluation.focusDistance;
-        renderState.apertureFStops = runtimeState.animationPanel.currentPath->apertureFStops;
-    }
+    const auto cameraState = runtimeState.camera.CaptureState();
+    renderState.hasDepthOfField = cameraState.hasDepthOfField;
+    renderState.focusDistance = cameraState.focusDistance;
+    renderState.apertureFStops = cameraState.apertureFStops;
+    renderState.depthOfFieldMaxBlurPixels = cameraState.depthOfFieldMaxBlurPixels;
     renderState.gaussianSplatFootprintBoost = runtimeState.projectSettings.gaussianSplatFootprintBoost;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
@@ -5577,6 +5961,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,
                  .style = session.pointStyle,
+                 .scalarFields = session.scalarFields,
                  .hasSourceRgb = session.hasSourceRgb,
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount)});
         } else {

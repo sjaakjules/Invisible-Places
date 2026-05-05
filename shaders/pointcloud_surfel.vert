@@ -16,6 +16,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 cameraPosition;
     vec4 depthParameters;
     vec4 viewportParameters;
+    vec4 depthOfFieldParameters;
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
@@ -147,6 +148,24 @@ void ResolveBasis(vec3 center, uint pointIndex, out vec3 tangent, out vec3 bitan
     bitangent = normalize(cross(normal, tangent));
 }
 
+float ResolveDepthOfFieldBlurPixels(float viewDepth) {
+    if (uniforms.depthOfFieldParameters.x <= 0.5) {
+        return 0.0;
+    }
+
+    const float focusDistance = max(0.001, uniforms.depthOfFieldParameters.y);
+    const float apertureFStops = max(0.1, uniforms.depthOfFieldParameters.z);
+    const float maxBlurPixels = max(0.0, uniforms.depthOfFieldParameters.w);
+    const float distanceFromFocus = abs(viewDepth - focusDistance) / max(max(viewDepth, focusDistance), 0.001);
+    return clamp(distanceFromFocus * (8.0 / apertureFStops) * maxBlurPixels, 0.0, maxBlurPixels);
+}
+
+float ResolveDepthOfFieldWorldRadius(float viewDepth) {
+    const float blurPixels = ResolveDepthOfFieldBlurPixels(viewDepth);
+    const float blurNdcY = blurPixels * uniforms.viewportParameters.w;
+    return max(0.0, blurNdcY * max(0.001, viewDepth) / max(abs(uniforms.projection[1][1]), 1e-5));
+}
+
 void main() {
     const uint encodedVertexIndex = uint(gl_VertexIndex);
     const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
@@ -158,7 +177,11 @@ void main() {
     vec3 bitangent;
     ResolveBasis(center, pointIndex, tangent, bitangent);
 
-    const float diameter = max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex));
+    const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
+    const float centerDepth = -centerViewPosition.z;
+    const float diameter =
+        max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex)) +
+        (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
     const vec3 offset = (tangent * corner.x + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
     const vec4 viewPosition = uniforms.view * worldPosition;

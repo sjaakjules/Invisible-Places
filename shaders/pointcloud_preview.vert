@@ -18,6 +18,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 cameraPosition;
     vec4 depthParameters;
     vec4 viewportParameters;
+    vec4 depthOfFieldParameters;
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
@@ -89,12 +90,29 @@ float EvaluateBinding(RenderParameterBindingGpu binding) {
     return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
 }
 
+float ResolveDepthOfFieldBlurPixels(float viewDepth) {
+    if (uniforms.depthOfFieldParameters.x <= 0.5) {
+        return 0.0;
+    }
+
+    const float focusDistance = max(0.001, uniforms.depthOfFieldParameters.y);
+    const float apertureFStops = max(0.1, uniforms.depthOfFieldParameters.z);
+    const float maxBlurPixels = max(0.0, uniforms.depthOfFieldParameters.w);
+    const float distanceFromFocus = abs(viewDepth - focusDistance) / max(max(viewDepth, focusDistance), 0.001);
+    return clamp(distanceFromFocus * (8.0 / apertureFStops) * maxBlurPixels, 0.0, maxBlurPixels);
+}
+
 void main() {
     vec4 worldPosition = vec4(inPosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
+    const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
-    gl_PointSize = clamp(
+    const float basePointSize = clamp(
         EvaluateBinding(styleData.pointSizeBinding),
+        max(1.0, styleData.renderParams2.z),
+        max(max(1.0, styleData.renderParams2.z), styleData.renderParams2.w));
+    gl_PointSize = clamp(
+        basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
         max(1.0, styleData.renderParams2.z),
         max(max(1.0, styleData.renderParams2.z), styleData.renderParams2.w));
 
@@ -104,5 +122,5 @@ void main() {
     outEmissive = EvaluateBinding(styleData.emissiveBinding);
     outXray = EvaluateBinding(styleData.xrayBinding);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
-    outViewDepth = -viewPosition.z;
+    outViewDepth = viewDepth;
 }

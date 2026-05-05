@@ -56,6 +56,7 @@ struct alignas(16) FrameUniforms {
     glm::vec4 cameraPosition{0.0F, 0.0F, 1.0F, 0.0F};
     glm::vec4 depthParameters{0.0F, 0.05F, 1000.0F, 0.0F};
     glm::vec4 viewportParameters{1.0F, 1.0F, 2.0F, 2.0F};
+    glm::vec4 depthOfFieldParameters{0.0F, 1.0F, 8.0F, 24.0F};
 };
 
 struct alignas(16) PointCloudBindingGpu {
@@ -322,7 +323,21 @@ void ApplyImGuiStyle() {
     colors[ImGuiCol_SliderGrabActive] = ImVec4{0.45F, 0.37F, 0.19F, 0.98F};
 }
 
-PointCloudBindingGpu MakePointCloudBindingGpu(const invisible_places::style::RenderParameterBinding& binding) {
+const invisible_places::io::ScalarFieldStats* ResolveBindingScalarFieldStats(
+    const invisible_places::style::RenderParameterBinding& binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    if (binding.fieldMap.fieldSlot < 0 ||
+        static_cast<std::size_t>(binding.fieldMap.fieldSlot) >= scalarFields.size()) {
+        return nullptr;
+    }
+
+    return &scalarFields[static_cast<std::size_t>(binding.fieldMap.fieldSlot)];
+}
+
+PointCloudBindingGpu MakePointCloudBindingGpu(
+    const invisible_places::style::RenderParameterBinding& binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    const auto* fieldStats = ResolveBindingScalarFieldStats(binding, scalarFields);
     PointCloudBindingGpu gpuBinding;
     gpuBinding.constantValue = glm::vec4{
         binding.constantValue[0],
@@ -331,8 +346,8 @@ PointCloudBindingGpu MakePointCloudBindingGpu(const invisible_places::style::Ren
         binding.constantValue[3],
     };
     gpuBinding.range = glm::vec4{
-        binding.fieldMap.inputMin,
-        binding.fieldMap.inputMax,
+        invisible_places::style::ResolveBindingInputMinimum(binding, fieldStats),
+        invisible_places::style::ResolveBindingInputMaximum(binding, fieldStats),
         binding.fieldMap.outputMin,
         binding.fieldMap.outputMax,
     };
@@ -3815,14 +3830,14 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         pointSizeRangeMin_,
         pointSizeRangeMax_,
     };
-    styleGpu.pointSize = MakePointCloudBindingGpu(layer.style.pointSize);
+    styleGpu.pointSize = MakePointCloudBindingGpu(layer.style.pointSize, layer.scalarFields);
     ScalePointCloudBindingGpu(&styleGpu.pointSize, renderState_.pointSizeScale);
-    styleGpu.opacity = MakePointCloudBindingGpu(layer.style.opacity);
-    styleGpu.emissive = MakePointCloudBindingGpu(layer.style.emissiveStrength);
-    styleGpu.xray = MakePointCloudBindingGpu(layer.style.xrayStrength);
-    styleGpu.depthFade = MakePointCloudBindingGpu(layer.style.depthFade);
-    styleGpu.colormapPosition = MakePointCloudBindingGpu(layer.style.colormapPosition);
-    styleGpu.surfelDiameter = MakePointCloudBindingGpu(layer.style.surfelDiameter);
+    styleGpu.opacity = MakePointCloudBindingGpu(layer.style.opacity, layer.scalarFields);
+    styleGpu.emissive = MakePointCloudBindingGpu(layer.style.emissiveStrength, layer.scalarFields);
+    styleGpu.xray = MakePointCloudBindingGpu(layer.style.xrayStrength, layer.scalarFields);
+    styleGpu.depthFade = MakePointCloudBindingGpu(layer.style.depthFade, layer.scalarFields);
+    styleGpu.colormapPosition = MakePointCloudBindingGpu(layer.style.colormapPosition, layer.scalarFields);
+    styleGpu.surfelDiameter = MakePointCloudBindingGpu(layer.style.surfelDiameter, layer.scalarFields);
 
     UploadBufferData(resources->styleBuffer, &styleGpu, sizeof(styleGpu));
 
@@ -4268,6 +4283,12 @@ void VulkanViewportShell::UploadFrameUniforms(std::uint32_t width, std::uint32_t
         viewportHeight,
         2.0F / viewportWidth,
         2.0F / viewportHeight,
+    };
+    uniforms.depthOfFieldParameters = glm::vec4{
+        renderState_.hasDepthOfField ? 1.0F : 0.0F,
+        std::max(0.001F, renderState_.focusDistance),
+        std::max(0.1F, renderState_.apertureFStops),
+        std::max(0.0F, renderState_.depthOfFieldMaxBlurPixels),
     };
 
     UploadBufferData(uniformBuffer_, &uniforms, sizeof(uniforms));

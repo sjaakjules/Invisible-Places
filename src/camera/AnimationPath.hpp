@@ -24,7 +24,9 @@ struct AnimationPath {
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     std::vector<AnimationPathKey> keys;
+    bool depthOfFieldEnabled = true;
     float apertureFStops = 8.0F;
+    float depthOfFieldMaxBlurPixels = 24.0F;
 };
 
 struct AnimationPathEvaluation {

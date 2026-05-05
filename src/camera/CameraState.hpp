@@ -16,6 +16,7 @@ struct CameraState {
     float farPlane = 1000.0F;
     float focusDistance = 1.0F;
     float apertureFStops = 8.0F;
+    float depthOfFieldMaxBlurPixels = 24.0F;
 };
 
 }  // namespace invisible_places::camera

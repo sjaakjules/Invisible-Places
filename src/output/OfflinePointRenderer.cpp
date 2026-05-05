@@ -1,5 +1,7 @@
 #include "output/OfflinePointRenderer.hpp"
 
+#include "renderer/pointcloud/Colormap.hpp"
+
 #include "camera/OrbitCamera.hpp"
 #include "style/RenderParameterBinding.hpp"
 
@@ -29,79 +31,6 @@ glm::vec3 ClampColor(glm::vec3 color) {
         Clamp01(color.g),
         Clamp01(color.b),
     };
-}
-
-glm::vec3 Viridis(float t) {
-    return ClampColor({
-        0.277727F + 0.520420F * t + 0.117231F * t * t - 0.219384F * t * t * t,
-        0.005407F + 1.404613F * t - 1.653928F * t * t + 0.743293F * t * t * t,
-        0.334099F + 1.384590F * t - 1.584386F * t * t + 0.630205F * t * t * t,
-    });
-}
-
-glm::vec3 Plasma(float t) {
-    return ClampColor({
-        0.058732F + 2.176514F * t - 2.689460F * t * t + 1.466006F * t * t * t,
-        0.023336F + 0.238383F * t + 1.118022F * t * t - 0.905937F * t * t * t,
-        0.543817F + 0.753960F * t - 1.308172F * t * t + 0.806940F * t * t * t,
-    });
-}
-
-glm::vec3 Inferno(float t) {
-    return ClampColor({
-        0.000218F + 1.538871F * t - 1.908164F * t * t + 0.873490F * t * t * t,
-        0.001651F - 0.117089F * t + 2.064416F * t * t - 1.277355F * t * t * t,
-        0.013866F + 0.635041F * t + 0.618582F * t * t - 0.700491F * t * t * t,
-    });
-}
-
-glm::vec3 Magma(float t) {
-    return ClampColor({
-        0.001462F + 1.384825F * t - 1.875795F * t * t + 0.850876F * t * t * t,
-        0.000466F - 0.251373F * t + 1.927205F * t * t - 1.035104F * t * t * t,
-        0.013866F + 0.873807F * t + 0.143707F * t * t - 0.282206F * t * t * t,
-    });
-}
-
-glm::vec3 Cividis(float t) {
-    return ClampColor({
-        0.000000F + 0.975500F * t - 0.676400F * t * t + 0.187000F * t * t * t,
-        0.126200F + 0.662500F * t - 0.360900F * t * t + 0.079200F * t * t * t,
-        0.301500F + 0.539600F * t - 0.540700F * t * t + 0.219900F * t * t * t,
-    });
-}
-
-glm::vec3 Turbo(float t) {
-    return ClampColor({
-        0.13572138F + 4.61539260F * t - 42.66032258F * t * t + 132.13108234F * t * t * t -
-            152.94239396F * t * t * t * t + 59.28637943F * t * t * t * t * t,
-        0.09140261F + 2.19418839F * t + 4.84296658F * t * t - 14.18503333F * t * t * t +
-            4.27729857F * t * t * t * t + 2.82956604F * t * t * t * t * t,
-        0.10667330F + 12.64194608F * t - 60.58204836F * t * t + 110.36276771F * t * t * t -
-            89.90310912F * t * t * t * t + 27.34824973F * t * t * t * t * t,
-    });
-}
-
-glm::vec3 ApplyColormap(
-    invisible_places::renderer::pointcloud::PointCloudColormapId colormap,
-    float value) {
-    const float t = Clamp01(value);
-    switch (colormap) {
-        case invisible_places::renderer::pointcloud::PointCloudColormapId::Plasma:
-            return Plasma(t);
-        case invisible_places::renderer::pointcloud::PointCloudColormapId::Inferno:
-            return Inferno(t);
-        case invisible_places::renderer::pointcloud::PointCloudColormapId::Magma:
-            return Magma(t);
-        case invisible_places::renderer::pointcloud::PointCloudColormapId::Cividis:
-            return Cividis(t);
-        case invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo:
-            return Turbo(t);
-        case invisible_places::renderer::pointcloud::PointCloudColormapId::Viridis:
-            return Viridis(t);
-    }
-
-    return Viridis(t);
 }
 
 float ScalarFieldValue(
@@ -162,9 +91,10 @@ glm::vec3 ResolvePointColor(
 
     if (layer.style.colorMode == invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap &&
         !cloud.scalarFields.empty()) {
-        return ApplyColormap(
+        const auto color = invisible_places::renderer::pointcloud::SampleColormap(
             layer.style.colormap,
             EvaluateBinding(cloud, layer.style.colormapPosition, pointIndex));
+        return {color[0], color[1], color[2]};
     }
 
     return {

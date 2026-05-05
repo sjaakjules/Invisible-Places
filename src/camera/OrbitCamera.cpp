@@ -192,6 +192,10 @@ void OrbitCamera::ApplyState(const CameraState& state) {
     ApplyPositionTarget(position, target);
     nearPlane_ = std::max(0.0001F, state.nearPlane);
     farPlane_ = std::max(nearPlane_ + 1.0F, state.farPlane);
+    hasDepthOfField_ = state.hasDepthOfField;
+    focusDistance_ = std::max(0.001F, state.focusDistance);
+    apertureFStops_ = std::max(0.1F, state.apertureFStops);
+    depthOfFieldMaxBlurPixels_ = std::max(0.0F, state.depthOfFieldMaxBlurPixels);
 }
 
 CameraState OrbitCamera::CaptureState() const {
@@ -206,9 +210,13 @@ CameraState OrbitCamera::CaptureState() const {
     state.target = {target_.x, target_.y, target_.z};
     state.orbitCenter = {orbitCenter_.x, orbitCenter_.y, orbitCenter_.z};
     state.hasOrbitCenter = true;
+    state.hasDepthOfField = hasDepthOfField_;
     state.fovDegrees = fovDegrees_;
     state.nearPlane = nearPlane_;
     state.farPlane = farPlane_;
+    state.focusDistance = focusDistance_;
+    state.apertureFStops = apertureFStops_;
+    state.depthOfFieldMaxBlurPixels = depthOfFieldMaxBlurPixels_;
     return state;
 }
 

@@ -17,6 +17,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 cameraPosition;
     vec4 depthParameters;
     vec4 viewportParameters;
+    vec4 depthOfFieldParameters;
 } uniforms;
 
 layout(set = 0, binding = 5, std430) readonly buffer ShCoefficients {

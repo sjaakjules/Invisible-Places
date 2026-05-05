@@ -395,6 +395,10 @@ json SerializeCameraState(const CameraState& state) {
         {"fov_degrees", state.fovDegrees},
         {"near_plane", state.nearPlane},
         {"far_plane", state.farPlane},
+        {"has_depth_of_field", state.hasDepthOfField},
+        {"focus_distance", state.focusDistance},
+        {"aperture_f_stops", state.apertureFStops},
+        {"depth_of_field_max_blur_px", state.depthOfFieldMaxBlurPixels},
     };
     if (state.hasOrbitCenter) {
         stateJson["orbit_center"] = state.orbitCenter;
@@ -420,6 +424,10 @@ CameraState ParseCameraState(const json& stateJson) {
     state.fovDegrees = stateJson.value("fov_degrees", 60.0F);
     state.nearPlane = stateJson.value("near_plane", 0.01F);
     state.farPlane = stateJson.value("far_plane", 1000.0F);
+    state.hasDepthOfField = stateJson.value("has_depth_of_field", false);
+    state.focusDistance = stateJson.value("focus_distance", 1.0F);
+    state.apertureFStops = stateJson.value("aperture_f_stops", 8.0F);
+    state.depthOfFieldMaxBlurPixels = stateJson.value("depth_of_field_max_blur_px", 24.0F);
     return state;
 }
 
@@ -474,7 +482,9 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"schema_version", 1U},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
+        {"depth_of_field_enabled", path.depthOfFieldEnabled},
         {"aperture_f_stops", path.apertureFStops},
+        {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
         {"keys", json::array()},
     };
     for (const auto& key : path.keys) {
@@ -487,7 +497,10 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     AnimationPath path;
     path.name = pathJson.value("name", path.name);
     path.durationFrames = pathJson.value("duration_frames", path.durationFrames);
+    path.depthOfFieldEnabled = pathJson.value("depth_of_field_enabled", path.depthOfFieldEnabled);
     path.apertureFStops = pathJson.value("aperture_f_stops", path.apertureFStops);
+    path.depthOfFieldMaxBlurPixels =
+        pathJson.value("depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels);
     if (pathJson.contains("keys")) {
         for (const auto& keyJson : pathJson.at("keys")) {
             path.keys.push_back(ParseAnimationPathKey(keyJson));

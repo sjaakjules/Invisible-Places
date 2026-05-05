@@ -43,12 +43,14 @@ struct SceneRenderState {
     bool hasDepthOfField = false;
     float focusDistance = 1.0F;
     float apertureFStops = 8.0F;
+    float depthOfFieldMaxBlurPixels = 24.0F;
     float gaussianSplatFootprintBoost = 1.5F;
     float pointSizeScale = 1.0F;
 
     struct PointCloudLayerState {
         std::size_t layerId = 0;
         renderer::pointcloud::PointCloudStyleState style{};
+        std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
         bool hasSourceRgb = true;
         std::uint32_t drawPointCount = 0;
     };

@@ -307,6 +307,7 @@ AnimationPath BuildAnimationPathFromCameraShots(
         durationFrames,
         orderedShots.size() > 1U ? static_cast<std::uint32_t>(orderedShots.size() - 1U) : 1U);
     path.apertureFStops = std::max(0.1F, apertureFStops);
+    path.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
     path.keys.reserve(orderedShots.size());
 
     for (const auto& shot : orderedShots) {
@@ -344,9 +345,10 @@ AnimationPathEvaluation EvaluateAnimationPath(
         evaluation.camera.fovDegrees = key.fovDegrees;
         evaluation.camera.nearPlane = key.nearPlane;
         evaluation.camera.farPlane = key.farPlane;
-        evaluation.camera.hasDepthOfField = true;
+        evaluation.camera.hasDepthOfField = path.depthOfFieldEnabled;
         evaluation.camera.focusDistance = evaluation.focusDistance;
         evaluation.camera.apertureFStops = std::max(0.1F, path.apertureFStops);
+        evaluation.camera.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
         return evaluation;
     }
 
@@ -378,9 +380,10 @@ AnimationPathEvaluation EvaluateAnimationPath(
     evaluation.camera.fovDegrees = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFovDegrees);
     evaluation.camera.nearPlane = EvaluateScalar(path, knots, clampedTimeSeconds, ReadNearPlane);
     evaluation.camera.farPlane = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFarPlane);
-    evaluation.camera.hasDepthOfField = true;
+    evaluation.camera.hasDepthOfField = path.depthOfFieldEnabled;
     evaluation.camera.focusDistance = evaluation.focusDistance;
     evaluation.camera.apertureFStops = std::max(0.1F, path.apertureFStops);
+    evaluation.camera.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
     return evaluation;
 }
 

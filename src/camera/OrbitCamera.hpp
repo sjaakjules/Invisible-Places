@@ -38,6 +38,10 @@ class OrbitCamera {
     [[nodiscard]] float FovDegrees() const { return fovDegrees_; }
     [[nodiscard]] float NearPlane() const { return nearPlane_; }
     [[nodiscard]] float FarPlane() const { return farPlane_; }
+    [[nodiscard]] bool HasDepthOfField() const { return hasDepthOfField_; }
+    [[nodiscard]] float FocusDistance() const { return focusDistance_; }
+    [[nodiscard]] float ApertureFStops() const { return apertureFStops_; }
+    [[nodiscard]] float DepthOfFieldMaxBlurPixels() const { return depthOfFieldMaxBlurPixels_; }
     [[nodiscard]] bool HasFramedBounds() const { return framedBounds_.valid; }
 
   private:
@@ -64,6 +68,10 @@ class OrbitCamera {
     float fovDegrees_ = 55.0F;
     float nearPlane_ = 0.05F;
     float farPlane_ = 1000.0F;
+    bool hasDepthOfField_ = false;
+    float focusDistance_ = 1.0F;
+    float apertureFStops_ = 8.0F;
+    float depthOfFieldMaxBlurPixels_ = 24.0F;
 };
 
 }  // namespace invisible_places::camera

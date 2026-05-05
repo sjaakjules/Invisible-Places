@@ -12,7 +12,7 @@ This repository is now in an interactive preview/export phase:
 - the app now renders point clouds and Gaussian splats together in a Vulkan viewport on macOS,
 - point-cloud lookdev supports screen sprites, world surfels, colour ramps, X-ray, emissive, transparent, and field-mapped bindings for major scalar parameters,
 - project state, camera shots, and point-cloud style presets can be saved to JSON and loaded back into the session,
-- the side panel is split into Lidar, gSplat, Camera, Animation, and Project work areas,
+- the side panel is split into Lidar, Visuals, gSplat, Camera, Animation, and Project work areas,
 - camera shots can be saved, loaded, interpolated at the 30 fps project timebase, and converted into editable animation paths,
 - saved animation paths can be played, scrubbed, edited, and exported as Fast Preview MP4 or preview-density EXR stacks,
 - EXR output currently writes beauty, alpha, and depth channels,
@@ -103,13 +103,16 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 
 ## Immediate next milestone
 
+The active implementation focus is LiDAR visual polish. gSplat preview remains available, but gSplat export/polish is parked until the LiDAR lookdev workflow feels settled.
+
 The next implementation slice should be:
 
 1. field-driven procedural motion for point-cloud layers,
 2. fuller AOV selection beyond beauty/alpha/depth, especially layer ID, scalar-field passes, and mapped-style passes,
-3. full-density or tiled final EXR export validation at exhibition resolutions, including gSplat participation where required,
+3. full-density or tiled final EXR export validation at exhibition resolutions for LiDAR-first output,
 4. command-line/headless render invocation for saved projects and animation paths,
-5. deeper large-scene chunking / paging beyond the current point-budget and preview-LOD path.
+5. deeper large-scene chunking / paging beyond the current point-budget and preview-LOD path,
+6. deferred gSplat participation in offline/animation exports once LiDAR polish is no longer the main priority.
 
 ## Validated on this machine
 

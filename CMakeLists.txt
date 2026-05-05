@@ -49,6 +49,9 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/gsplat_composite.vert
     shaders/gsplat_composite.frag
 )
+set(INVISIBLE_PLACES_SHADER_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
+)
 
 set(INVISIBLE_PLACES_SHADER_OUTPUTS)
 foreach(SHADER_SOURCE IN LISTS INVISIBLE_PLACES_SHADER_SOURCES)
@@ -57,8 +60,8 @@ foreach(SHADER_SOURCE IN LISTS INVISIBLE_PLACES_SHADER_SOURCES)
     add_custom_command(
         OUTPUT "${SHADER_OUTPUT}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
-        COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}"
+        COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}" ${INVISIBLE_PLACES_SHADER_INCLUDES}
         COMMENT "Compiling shader ${SHADER_SOURCE}"
         VERBATIM
     )
@@ -100,6 +103,7 @@ add_library(
     src/platform/WindowTitle.cpp
     src/renderer/core/VulkanViewportShell.cpp
     src/renderer/gsplat/HighQualityGaussianScene.cpp
+    src/renderer/pointcloud/Colormap.cpp
     src/renderer/pointcloud/PointCloudPreviewState.cpp
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp

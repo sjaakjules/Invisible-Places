@@ -15,6 +15,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 cameraPosition;
     vec4 depthParameters;
     vec4 viewportParameters;
+    vec4 depthOfFieldParameters;
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer Centers {
@@ -95,6 +96,18 @@ vec2 PrincipalEigenvector(float covXX, float covXY, float covYY, float lambda) {
     return covXX >= covYY ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
 }
 
+float ResolveDepthOfFieldBlurPixels(float viewDepth) {
+    if (uniforms.depthOfFieldParameters.x <= 0.5) {
+        return 0.0;
+    }
+
+    const float focusDistance = max(0.001, uniforms.depthOfFieldParameters.y);
+    const float apertureFStops = max(0.1, uniforms.depthOfFieldParameters.z);
+    const float maxBlurPixels = max(0.0, uniforms.depthOfFieldParameters.w);
+    const float distanceFromFocus = abs(viewDepth - focusDistance) / max(max(viewDepth, focusDistance), 0.001);
+    return clamp(distanceFromFocus * (8.0 / apertureFStops) * maxBlurPixels, 0.0, maxBlurPixels);
+}
+
 void main() {
     const uint mergedIndex = sortedIndices.values[uint(gl_InstanceIndex)];
     const uint layerStyleIndex = layerStyleIndices.values[mergedIndex];
@@ -148,8 +161,13 @@ void main() {
         dot(vec3(projectedAxis0.y, projectedAxis1.y, projectedAxis2.y),
             vec3(projectedAxis0.y, projectedAxis1.y, projectedAxis2.y));
 
-    covXX += uniforms.viewportParameters.z * uniforms.viewportParameters.z;
-    covYY += uniforms.viewportParameters.w * uniforms.viewportParameters.w;
+    const float depthOfFieldBlurPixels = ResolveDepthOfFieldBlurPixels(depth);
+    const float depthOfFieldBlurX = depthOfFieldBlurPixels * uniforms.viewportParameters.z;
+    const float depthOfFieldBlurY = depthOfFieldBlurPixels * uniforms.viewportParameters.w;
+    covXX += (uniforms.viewportParameters.z * uniforms.viewportParameters.z) +
+             (depthOfFieldBlurX * depthOfFieldBlurX);
+    covYY += (uniforms.viewportParameters.w * uniforms.viewportParameters.w) +
+             (depthOfFieldBlurY * depthOfFieldBlurY);
 
     const float trace = covXX + covYY;
     const float determinant = max((covXX * covYY) - (covXY * covXY), 1e-12);

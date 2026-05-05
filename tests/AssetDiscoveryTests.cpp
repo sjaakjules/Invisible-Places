@@ -16,6 +16,7 @@
 #include "platform/VulkanRuntimeConfig.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
+#include "renderer/pointcloud/Colormap.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
@@ -777,6 +778,27 @@ TEST_CASE("Scalar field binding evaluation matches the mapped style rules", "[st
     CHECK(invisible_places::style::EvaluateScalarBinding(mappedBinding, 15.0F, &stats) == Catch::Approx(2.0F));
 }
 
+TEST_CASE("Point-cloud colormaps sample the Matplotlib listed tables", "[style][colormap]") {
+    using invisible_places::renderer::pointcloud::PointCloudColormapId;
+    using invisible_places::renderer::pointcloud::SampleColormap;
+
+    auto checkColor = [](std::array<float, 3> color, std::array<float, 3> expected) {
+        constexpr float tolerance = 1.0F / 255.0F;
+        CHECK(color[0] == Catch::Approx(expected[0]).margin(tolerance));
+        CHECK(color[1] == Catch::Approx(expected[1]).margin(tolerance));
+        CHECK(color[2] == Catch::Approx(expected[2]).margin(tolerance));
+    };
+
+    checkColor(SampleColormap(PointCloudColormapId::Viridis, 0.0F), {0.267004F, 0.004874F, 0.329415F});
+    checkColor(SampleColormap(PointCloudColormapId::Viridis, 128.0F / 255.0F), {0.127568F, 0.566949F, 0.550556F});
+    checkColor(SampleColormap(PointCloudColormapId::Viridis, 1.0F), {0.993248F, 0.906157F, 0.143936F});
+    checkColor(SampleColormap(PointCloudColormapId::Plasma, 0.0F), {0.050383F, 0.029803F, 0.527975F});
+    checkColor(SampleColormap(PointCloudColormapId::Inferno, 128.0F / 255.0F), {0.735683F, 0.215906F, 0.330245F});
+    checkColor(SampleColormap(PointCloudColormapId::Magma, 128.0F / 255.0F), {0.716387F, 0.214982F, 0.475290F});
+    checkColor(SampleColormap(PointCloudColormapId::Cividis, 1.0F), {0.995737F, 0.909344F, 0.217772F});
+    checkColor(SampleColormap(PointCloudColormapId::Turbo, 128.0F / 255.0F), {0.643620F, 0.989990F, 0.233560F});
+}
+
 TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[serialization][project]") {
     const auto outputPath =
         std::filesystem::temp_directory_path() / "invisible_places_project_roundtrip.json";
@@ -1272,6 +1294,7 @@ TEST_CASE("Animation path looks at the focal spline and stores focus distance", 
     CHECK(evaluation.camera.hasDepthOfField);
     CHECK(evaluation.camera.focusDistance == Catch::Approx(5.0F));
     CHECK(evaluation.camera.apertureFStops == Catch::Approx(4.0F));
+    CHECK(evaluation.camera.depthOfFieldMaxBlurPixels == Catch::Approx(24.0F));
 }
 
 TEST_CASE("Animation path serialization round-trips standalone files", "[serialization][animation]") {
@@ -1280,7 +1303,9 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     invisible_places::camera::AnimationPath path;
     path.name = "Roundtrip Animation";
     path.durationFrames = 72;
+    path.depthOfFieldEnabled = false;
     path.apertureFStops = 2.8F;
+    path.depthOfFieldMaxBlurPixels = 36.0F;
     path.keys = {
         {
             .cameraPosition = {1.0F, 2.0F, 3.0F},
@@ -1309,7 +1334,9 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     REQUIRE(loadedPath->keys.size() == 2);
     CHECK(loadedPath->name == "Roundtrip Animation");
     CHECK(loadedPath->durationFrames == 72);
+    CHECK_FALSE(loadedPath->depthOfFieldEnabled);
     CHECK(loadedPath->apertureFStops == Catch::Approx(2.8F));
+    CHECK(loadedPath->depthOfFieldMaxBlurPixels == Catch::Approx(36.0F));
     CHECK(loadedPath->keys[0].cameraPosition[2] == Catch::Approx(3.0F));
     CHECK(loadedPath->keys[0].focusPoint[1] == Catch::Approx(5.0F));
     CHECK(loadedPath->keys[0].fovDegrees == Catch::Approx(42.0F));

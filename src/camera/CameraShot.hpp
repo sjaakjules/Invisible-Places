@@ -65,6 +65,11 @@ inline CameraState InterpolateCameraStates(
     result.fovDegrees = LerpFloat(from.fovDegrees, to.fovDegrees, t);
     result.nearPlane = LerpFloat(from.nearPlane, to.nearPlane, t);
     result.farPlane = LerpFloat(from.farPlane, to.farPlane, t);
+    result.hasDepthOfField = from.hasDepthOfField || to.hasDepthOfField;
+    result.focusDistance = LerpFloat(from.focusDistance, to.focusDistance, t);
+    result.apertureFStops = LerpFloat(from.apertureFStops, to.apertureFStops, t);
+    result.depthOfFieldMaxBlurPixels =
+        LerpFloat(from.depthOfFieldMaxBlurPixels, to.depthOfFieldMaxBlurPixels, t);
     return result;
 }
 
