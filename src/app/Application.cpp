@@ -66,14 +66,13 @@ namespace {
 
 using LayerKind = invisible_places::scene::LayerKind;
 using PointBudgetState = invisible_places::renderer::pointcloud::PointBudgetState;
-using PointCloudBlendMode = invisible_places::renderer::pointcloud::PointCloudBlendMode;
 using PointCloudStyleState = invisible_places::renderer::pointcloud::PointCloudStyleState;
 using PointCloudColorMode = invisible_places::renderer::pointcloud::PointCloudColorMode;
 using PointCloudColormapId = invisible_places::renderer::pointcloud::PointCloudColormapId;
+using PointCloudDepthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution;
 using PointCloudFalloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
-using PointCloudRenderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode;
 using GaussianSplatStyleState = invisible_places::renderer::gsplat::GaussianSplatStyleState;
 using GaussianSplatColorMode = invisible_places::renderer::gsplat::GaussianSplatColorMode;
 using GaussianSplatDebugMode = invisible_places::renderer::gsplat::GaussianSplatDebugMode;
@@ -556,42 +555,6 @@ const char* PointCloudPreviewLodModeLabel(PointCloudPreviewLodMode mode) {
     return "Unknown";
 }
 
-const char* PointCloudRenderModeLabel(PointCloudRenderMode mode) {
-    switch (mode) {
-        case PointCloudRenderMode::Solid:
-            return "Solid";
-        case PointCloudRenderMode::EmissiveHard:
-            return "Emissive Hard";
-        case PointCloudRenderMode::EmissiveFeathered:
-            return "Emissive Feathered";
-        case PointCloudRenderMode::DepthXray:
-            return "Depth X-Ray";
-        case PointCloudRenderMode::WeightedTransparent:
-            return "Weighted Transparent";
-        case PointCloudRenderMode::ComputeDensity:
-            return "Compute Density";
-        case PointCloudRenderMode::GaussianPointSprite:
-            return "Gaussian Point Sprite";
-    }
-
-    return "Unknown";
-}
-
-const char* PointCloudBlendModeLabel(PointCloudBlendMode mode) {
-    switch (mode) {
-        case PointCloudBlendMode::Normal:
-            return "Normal";
-        case PointCloudBlendMode::Additive:
-            return "Add";
-        case PointCloudBlendMode::Screen:
-            return "Screen";
-        case PointCloudBlendMode::Multiply:
-            return "Multiply";
-    }
-
-    return "Unknown";
-}
-
 const char* GaussianSplatColorModeLabel(GaussianSplatColorMode mode) {
     switch (mode) {
         case GaussianSplatColorMode::FullSh:
@@ -912,6 +875,7 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     session->pointStyle.hiddenAlpha = std::clamp(session->pointStyle.hiddenAlpha, 0.0F, 1.0F);
     session->pointStyle.densityScale = std::max(0.0F, session->pointStyle.densityScale);
     session->pointStyle.densityClamp = std::max(0.0F, session->pointStyle.densityClamp);
+    session->pointStyle.depthAlphaThreshold = std::clamp(session->pointStyle.depthAlphaThreshold, 0.0F, 1.0F);
 
     if (session->pointStyle.colorMode == PointCloudColorMode::ScalarColormap) {
         EnsureFieldMappedBindingDefaults(
@@ -4745,12 +4709,6 @@ RenderParameterBinding* PointSizeBinding(PreviewLayerSession* session) {
 }
 
 PointCloudFalloffProfile EffectivePointFalloffProfile(const PointCloudStyleState& style) {
-    if (style.renderMode == PointCloudRenderMode::EmissiveHard) {
-        return PointCloudFalloffProfile::HardDisc;
-    }
-    if (style.renderMode == PointCloudRenderMode::GaussianPointSprite) {
-        return PointCloudFalloffProfile::Gaussian;
-    }
     return style.falloffProfile;
 }
 
@@ -4851,12 +4809,6 @@ bool DrawPointCloudFalloffSection(PreviewLayerSession* session) {
     }
 
     const auto effectiveFalloff = EffectivePointFalloffProfile(style);
-    if (style.renderMode == PointCloudRenderMode::EmissiveHard) {
-        ImGui::TextDisabled("Emissive Hard renders with hard-disc falloff.");
-    } else if (style.renderMode == PointCloudRenderMode::GaussianPointSprite) {
-        ImGui::TextDisabled("Gaussian Point Sprite renders with gaussian falloff.");
-    }
-
     if (effectiveFalloff == PointCloudFalloffProfile::SoftDisc) {
         changed |= DrawRangedFloatControl(
             "Inner Radius",
@@ -4892,119 +4844,142 @@ bool DrawVisualBindingSection(
     return changed;
 }
 
-bool DrawPointCloudRendererSection(PreviewLayerSession* session) {
-    if (session == nullptr || !BeginPanelSection("Renderer")) {
+bool DrawPointCloudEmissionSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Emission")) {
         return false;
     }
 
     auto& style = session->pointStyle;
     bool changed = false;
-    int renderModeIndex = static_cast<int>(style.renderMode);
-    const char* renderModes[] = {
-        "Solid",
-        "Emissive Hard",
-        "Emissive Feathered",
-        "Depth X-Ray",
-        "Weighted Transparent",
-        "Compute Density",
-        "Gaussian Point Sprite",
-    };
-    if (DrawRightAlignedCombo("Mode", &renderModeIndex, renderModes, IM_ARRAYSIZE(renderModes))) {
-        style.renderMode = static_cast<PointCloudRenderMode>(renderModeIndex);
-        changed = true;
+    changed |= DrawScalarBindingBody(
+        "Emission",
+        &style.emissiveStrength,
+        session->scalarFields,
+        {.constantMin = 0.0F,
+         .constantMax = 2.5F,
+         .defaultOutputMin = 0.0F,
+         .defaultOutputMax = 2.5F,
+         .defaultConstant = 0.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F});
+    ImGui::Spacing();
+    changed |= DrawRangedFloatControl(
+        "Exposure",
+        &style.exposure,
+        {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+
+    EndPanelSection();
+    return changed;
+}
+
+bool DrawPointCloudXraySection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("X-Ray")) {
+        return false;
     }
 
-    switch (style.renderMode) {
-        case PointCloudRenderMode::Solid:
-        {
-            int blendModeIndex = static_cast<int>(style.blendMode);
-            const char* blendModes[] = {
-                PointCloudBlendModeLabel(PointCloudBlendMode::Normal),
-                PointCloudBlendModeLabel(PointCloudBlendMode::Additive),
-                PointCloudBlendModeLabel(PointCloudBlendMode::Screen),
-                PointCloudBlendModeLabel(PointCloudBlendMode::Multiply),
-            };
-            if (DrawRightAlignedCombo("Blend", &blendModeIndex, blendModes, IM_ARRAYSIZE(blendModes))) {
-                style.blendMode = static_cast<PointCloudBlendMode>(blendModeIndex);
-                changed = true;
-            }
+    auto& style = session->pointStyle;
+    bool changed = false;
+    changed |= DrawScalarBindingBody(
+        "X-Ray",
+        &style.xrayStrength,
+        session->scalarFields,
+        {.constantMin = 0.0F,
+         .constantMax = 1.0F,
+         .defaultOutputMin = 0.0F,
+         .defaultOutputMax = 1.0F,
+         .defaultConstant = 0.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+    changed |= DrawRangedFloatControl(
+        "Depth Falloff",
+        &style.depthFalloff,
+        {.visualMin = 0.0F, .visualMax = 400.0F, .format = "%.1f", .hardMin = 0.0F});
+    changed |= DrawRangedFloatControl(
+        "Depth Bias",
+        &style.depthBias,
+        {.visualMin = 0.0F, .visualMax = 0.01F, .format = "%.5f", .hardMin = 0.0F});
+    changed |= DrawRangedFloatControl(
+        "Front Alpha",
+        &style.frontAlpha,
+        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+    changed |= DrawRangedFloatControl(
+        "Hidden Alpha",
+        &style.hiddenAlpha,
+        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
 
-            ImGui::Spacing();
-            ImGui::TextUnformatted("Depth Fade");
-            changed |= DrawScalarBindingBody(
-                "Depth Fade",
-                &style.depthFade,
-                session->scalarFields,
-                {.constantMin = 0.0F,
-                 .constantMax = 1.0F,
-                 .defaultOutputMin = 0.0F,
-                 .defaultOutputMax = 1.0F,
-                 .defaultConstant = 0.0F,
-                 .format = "%.2f",
-                 .hardMin = 0.0F,
-                 .hardMax = 1.0F});
-            break;
-        }
-        case PointCloudRenderMode::EmissiveHard:
-        case PointCloudRenderMode::EmissiveFeathered:
-            changed |= DrawRangedFloatControl(
-                "Exposure",
-                &style.exposure,
-                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            break;
-        case PointCloudRenderMode::DepthXray:
-            changed |= DrawRangedFloatControl(
-                "Exposure",
-                &style.exposure,
-                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Depth Falloff",
-                &style.depthFalloff,
-                {.visualMin = 0.0F, .visualMax = 400.0F, .format = "%.1f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Depth Bias",
-                &style.depthBias,
-                {.visualMin = 0.0F, .visualMax = 0.01F, .format = "%.5f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Front Alpha",
-                &style.frontAlpha,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-            changed |= DrawRangedFloatControl(
-                "Hidden Alpha",
-                &style.hiddenAlpha,
-                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-            break;
-        case PointCloudRenderMode::WeightedTransparent:
-            changed |= DrawRangedFloatControl(
-                "Density Scale",
-                &style.densityScale,
-                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Density Clamp",
-                &style.densityClamp,
-                {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
-            break;
-        case PointCloudRenderMode::ComputeDensity:
-            ImGui::TextDisabled("Compute density currently falls back to weighted raster accumulation.");
-            changed |= DrawRangedFloatControl(
-                "Density Scale",
-                &style.densityScale,
-                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Density Clamp",
-                &style.densityClamp,
-                {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
-            break;
-        case PointCloudRenderMode::GaussianPointSprite:
-            changed |= DrawRangedFloatControl(
-                "Density Scale",
-                &style.densityScale,
-                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Density Clamp",
-                &style.densityClamp,
-                {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
-            break;
+    EndPanelSection();
+    return changed;
+}
+
+bool DrawPointCloudDepthFadeSection(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
+
+    return DrawVisualBindingSection(
+        "Depth Fade",
+        "Depth Fade",
+        &session->pointStyle.depthFade,
+        session->scalarFields,
+        {.constantMin = 0.0F,
+         .constantMax = 1.0F,
+         .defaultOutputMin = 0.0F,
+         .defaultOutputMax = 1.0F,
+         .defaultConstant = 0.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+}
+
+const char* PointCloudDepthContributionLabel(PointCloudDepthContribution contribution) {
+    switch (contribution) {
+        case PointCloudDepthContribution::None:
+            return "None";
+        case PointCloudDepthContribution::AlphaThreshold:
+            return "Alpha Threshold";
+        case PointCloudDepthContribution::Always:
+            return "Always";
+    }
+
+    return "Alpha Threshold";
+}
+
+bool DrawPointCloudCompositingSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Compositing")) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    changed |= DrawRangedFloatControl(
+        "Density Scale",
+        &style.densityScale,
+        {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
+    changed |= DrawRangedFloatControl(
+        "Density Clamp",
+        &style.densityClamp,
+        {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
+
+    int depthContributionIndex = static_cast<int>(style.depthContribution);
+    const char* depthContributionModes[] = {
+        PointCloudDepthContributionLabel(PointCloudDepthContribution::None),
+        PointCloudDepthContributionLabel(PointCloudDepthContribution::AlphaThreshold),
+        PointCloudDepthContributionLabel(PointCloudDepthContribution::Always),
+    };
+    if (DrawRightAlignedCombo(
+            "Depth Contribution",
+            &depthContributionIndex,
+            depthContributionModes,
+            IM_ARRAYSIZE(depthContributionModes))) {
+        style.depthContribution = static_cast<PointCloudDepthContribution>(depthContributionIndex);
+        changed = true;
+    }
+    if (style.depthContribution == PointCloudDepthContribution::AlphaThreshold) {
+        changed |= DrawRangedFloatControl(
+            "Depth Alpha Threshold",
+            &style.depthAlphaThreshold,
+            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
     }
 
     EndPanelSection();
@@ -5016,8 +4991,8 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
     bool changed = false;
 
     changed |= DrawPointCloudPointSettingsSection(session);
-    changed |= DrawPointCloudColourSection(session);
     changed |= DrawPointCloudFalloffSection(session);
+    changed |= DrawPointCloudColourSection(session);
     changed |= DrawVisualBindingSection(
         "Opacity",
         "Opacity",
@@ -5031,32 +5006,10 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .format = "%.2f",
          .hardMin = 0.0F,
          .hardMax = 1.0F});
-    changed |= DrawVisualBindingSection(
-        "Emission",
-        "Emission",
-        &style.emissiveStrength,
-        session->scalarFields,
-        {.constantMin = 0.0F,
-         .constantMax = 2.5F,
-         .defaultOutputMin = 0.0F,
-         .defaultOutputMax = 2.5F,
-         .defaultConstant = 0.0F,
-         .format = "%.2f",
-         .hardMin = 0.0F});
-    changed |= DrawVisualBindingSection(
-        "X-Ray",
-        "X-Ray",
-        &style.xrayStrength,
-        session->scalarFields,
-        {.constantMin = 0.0F,
-         .constantMax = 1.0F,
-         .defaultOutputMin = 0.0F,
-         .defaultOutputMax = 1.0F,
-         .defaultConstant = 0.0F,
-         .format = "%.2f",
-         .hardMin = 0.0F,
-         .hardMax = 1.0F});
-    changed |= DrawPointCloudRendererSection(session);
+    changed |= DrawPointCloudEmissionSection(session);
+    changed |= DrawPointCloudXraySection(session);
+    changed |= DrawPointCloudDepthFadeSection(session);
+    changed |= DrawPointCloudCompositingSection(session);
 
     if (changed) {
         SanitizePointCloudStyle(session);

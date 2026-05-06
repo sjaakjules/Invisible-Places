@@ -3,6 +3,7 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <fstream>
+#include <optional>
 
 #include <nlohmann/json.hpp>
 
@@ -16,17 +17,26 @@ using invisible_places::camera::AnimationPathKey;
 using invisible_places::camera::CameraShot;
 using invisible_places::camera::CameraState;
 using invisible_places::output::RenderJobSettings;
-using invisible_places::renderer::pointcloud::PointCloudBlendMode;
 using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
+using invisible_places::renderer::pointcloud::PointCloudDepthContribution;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
-using invisible_places::renderer::pointcloud::PointCloudRenderMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
 using invisible_places::style::FieldMapConfig;
 using invisible_places::style::ParameterSourceMode;
 using invisible_places::style::RenderParameterBinding;
+
+enum class LegacyPointCloudRenderMode {
+    Solid,
+    EmissiveHard,
+    EmissiveFeathered,
+    DepthXray,
+    WeightedTransparent,
+    ComputeDensity,
+    GaussianPointSprite
+};
 
 const char* ParameterSourceModeName(ParameterSourceMode mode) {
     switch (mode) {
@@ -150,77 +160,51 @@ PointCloudGeometryMode ParsePointCloudGeometryMode(const json& value) {
     return PointCloudGeometryMode::ScreenSprites;
 }
 
-const char* PointCloudRenderModeName(PointCloudRenderMode mode) {
-    switch (mode) {
-        case PointCloudRenderMode::Solid:
-            return "solid";
-        case PointCloudRenderMode::EmissiveHard:
-            return "emissive_hard";
-        case PointCloudRenderMode::EmissiveFeathered:
-            return "emissive_feathered";
-        case PointCloudRenderMode::DepthXray:
-            return "depth_xray";
-        case PointCloudRenderMode::WeightedTransparent:
-            return "weighted_transparent";
-        case PointCloudRenderMode::ComputeDensity:
-            return "compute_density";
-        case PointCloudRenderMode::GaussianPointSprite:
-            return "gaussian_point_sprite";
-    }
-
-    return "solid";
-}
-
-PointCloudRenderMode ParsePointCloudRenderMode(const json& value) {
+LegacyPointCloudRenderMode ParseLegacyPointCloudRenderMode(const json& value) {
     const auto modeName = value.get<std::string>();
     if (modeName == "emissive_hard") {
-        return PointCloudRenderMode::EmissiveHard;
+        return LegacyPointCloudRenderMode::EmissiveHard;
     }
     if (modeName == "emissive_feathered") {
-        return PointCloudRenderMode::EmissiveFeathered;
+        return LegacyPointCloudRenderMode::EmissiveFeathered;
     }
     if (modeName == "depth_xray") {
-        return PointCloudRenderMode::DepthXray;
+        return LegacyPointCloudRenderMode::DepthXray;
     }
     if (modeName == "weighted_transparent") {
-        return PointCloudRenderMode::WeightedTransparent;
+        return LegacyPointCloudRenderMode::WeightedTransparent;
     }
     if (modeName == "compute_density") {
-        return PointCloudRenderMode::ComputeDensity;
+        return LegacyPointCloudRenderMode::ComputeDensity;
     }
     if (modeName == "gaussian_point_sprite") {
-        return PointCloudRenderMode::GaussianPointSprite;
+        return LegacyPointCloudRenderMode::GaussianPointSprite;
     }
-    return PointCloudRenderMode::Solid;
+    return LegacyPointCloudRenderMode::Solid;
 }
 
-const char* PointCloudBlendModeName(PointCloudBlendMode mode) {
-    switch (mode) {
-        case PointCloudBlendMode::Normal:
-            return "normal";
-        case PointCloudBlendMode::Additive:
-            return "additive";
-        case PointCloudBlendMode::Screen:
-            return "screen";
-        case PointCloudBlendMode::Multiply:
-            return "multiply";
+const char* PointCloudDepthContributionName(PointCloudDepthContribution contribution) {
+    switch (contribution) {
+        case PointCloudDepthContribution::None:
+            return "none";
+        case PointCloudDepthContribution::AlphaThreshold:
+            return "alpha_threshold";
+        case PointCloudDepthContribution::Always:
+            return "always";
     }
 
-    return "normal";
+    return "alpha_threshold";
 }
 
-PointCloudBlendMode ParsePointCloudBlendMode(const json& value) {
-    const auto modeName = value.get<std::string>();
-    if (modeName == "additive") {
-        return PointCloudBlendMode::Additive;
+PointCloudDepthContribution ParsePointCloudDepthContribution(const json& value) {
+    const auto contributionName = value.get<std::string>();
+    if (contributionName == "none") {
+        return PointCloudDepthContribution::None;
     }
-    if (modeName == "screen") {
-        return PointCloudBlendMode::Screen;
+    if (contributionName == "always") {
+        return PointCloudDepthContribution::Always;
     }
-    if (modeName == "multiply") {
-        return PointCloudBlendMode::Multiply;
-    }
-    return PointCloudBlendMode::Normal;
+    return PointCloudDepthContribution::AlphaThreshold;
 }
 
 const char* PointCloudFalloffProfileName(PointCloudFalloffProfile profile) {
@@ -308,11 +292,49 @@ RenderParameterBinding ParseBinding(const json& bindingJson) {
     return binding;
 }
 
+void MigrateLegacyPointCloudRenderMode(
+    LegacyPointCloudRenderMode mode,
+    bool hadEmissiveStrength,
+    PointCloudStyleState* style) {
+    if (style == nullptr) {
+        return;
+    }
+
+    switch (mode) {
+        case LegacyPointCloudRenderMode::Solid:
+            style->depthContribution = PointCloudDepthContribution::AlphaThreshold;
+            break;
+        case LegacyPointCloudRenderMode::EmissiveHard:
+            style->falloffProfile = PointCloudFalloffProfile::HardDisc;
+            if (!hadEmissiveStrength && invisible_places::style::ScalarConstant(style->emissiveStrength) <= 0.0F) {
+                invisible_places::style::SetScalarConstant(&style->emissiveStrength, 1.0F);
+            }
+            break;
+        case LegacyPointCloudRenderMode::EmissiveFeathered:
+            style->falloffProfile = PointCloudFalloffProfile::Gaussian;
+            if (!hadEmissiveStrength && invisible_places::style::ScalarConstant(style->emissiveStrength) <= 0.0F) {
+                invisible_places::style::SetScalarConstant(&style->emissiveStrength, 1.0F);
+            }
+            break;
+        case LegacyPointCloudRenderMode::DepthXray:
+            style->depthContribution = PointCloudDepthContribution::Always;
+            if (invisible_places::style::ScalarConstant(style->xrayStrength) <= 0.0F) {
+                invisible_places::style::SetScalarConstant(&style->xrayStrength, 1.0F);
+            }
+            break;
+        case LegacyPointCloudRenderMode::WeightedTransparent:
+        case LegacyPointCloudRenderMode::ComputeDensity:
+            break;
+        case LegacyPointCloudRenderMode::GaussianPointSprite:
+            style->falloffProfile = PointCloudFalloffProfile::Gaussian;
+            break;
+    }
+}
+
 json SerializePointCloudStyle(const PointCloudStyleState& style) {
     return json{
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
-        {"render_mode", PointCloudRenderModeName(style.renderMode)},
-        {"blend_mode", PointCloudBlendModeName(style.blendMode)},
+        {"depth_contribution", PointCloudDepthContributionName(style.depthContribution)},
         {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
         {"color_mode", PointCloudColorModeName(style.colorMode)},
         {"colormap", PointCloudColormapName(style.colormap)},
@@ -327,6 +349,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"hidden_alpha", style.hiddenAlpha},
         {"density_scale", style.densityScale},
         {"density_clamp", style.densityClamp},
+        {"depth_alpha_threshold", style.depthAlphaThreshold},
         {"point_size", SerializeBinding(style.pointSize)},
         {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
@@ -339,14 +362,15 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
 
 PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     PointCloudStyleState style;
+    std::optional<LegacyPointCloudRenderMode> legacyRenderMode;
     if (styleJson.contains("geometry_mode")) {
         style.geometryMode = ParsePointCloudGeometryMode(styleJson.at("geometry_mode"));
     }
     if (styleJson.contains("render_mode")) {
-        style.renderMode = ParsePointCloudRenderMode(styleJson.at("render_mode"));
+        legacyRenderMode = ParseLegacyPointCloudRenderMode(styleJson.at("render_mode"));
     }
-    if (styleJson.contains("blend_mode")) {
-        style.blendMode = ParsePointCloudBlendMode(styleJson.at("blend_mode"));
+    if (styleJson.contains("depth_contribution")) {
+        style.depthContribution = ParsePointCloudDepthContribution(styleJson.at("depth_contribution"));
     }
     if (styleJson.contains("falloff_profile")) {
         style.falloffProfile = ParsePointCloudFalloffProfile(styleJson.at("falloff_profile"));
@@ -370,6 +394,7 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.hiddenAlpha = styleJson.value("hidden_alpha", style.hiddenAlpha);
     style.densityScale = styleJson.value("density_scale", style.densityScale);
     style.densityClamp = styleJson.value("density_clamp", style.densityClamp);
+    style.depthAlphaThreshold = styleJson.value("depth_alpha_threshold", style.depthAlphaThreshold);
     if (styleJson.contains("point_size")) {
         style.pointSize = ParseBinding(styleJson.at("point_size"));
     }
@@ -390,6 +415,12 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     }
     if (styleJson.contains("colormap_position")) {
         style.colormapPosition = ParseBinding(styleJson.at("colormap_position"));
+    }
+    if (legacyRenderMode.has_value()) {
+        MigrateLegacyPointCloudRenderMode(
+            legacyRenderMode.value(),
+            styleJson.contains("emissive_strength"),
+            &style);
     }
     return style;
 }

@@ -38,6 +38,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 renderParams0;
     vec4 renderParams1;
     vec4 renderParams2;
+    vec4 renderParams3;
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;

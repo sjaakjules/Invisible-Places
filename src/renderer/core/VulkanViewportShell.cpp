@@ -74,6 +74,7 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 renderParams0{1.0F, 0.55F, 4.0F, 1.6F};
     glm::vec4 renderParams1{80.0F, 0.0005F, 0.16F, 0.08F};
     glm::vec4 renderParams2{1.0F, 64.0F, 1.0F, 64.0F};
+    glm::vec4 renderParams3{0.5F, 1.0F, 64.0F, 0.0F};
     PointCloudBindingGpu pointSize{};
     PointCloudBindingGpu opacity{};
     PointCloudBindingGpu emissive{};
@@ -105,28 +106,6 @@ struct alignas(16) HighQualityGaussianPushConstants {
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
-constexpr std::size_t kPointCloudBlendPipelineCount = 4U;
-
-std::size_t PointCloudBlendPipelineIndex(renderer::pointcloud::PointCloudBlendMode mode) {
-    switch (mode) {
-        case renderer::pointcloud::PointCloudBlendMode::Normal:
-            return 0U;
-        case renderer::pointcloud::PointCloudBlendMode::Additive:
-            return 1U;
-        case renderer::pointcloud::PointCloudBlendMode::Screen:
-            return 2U;
-        case renderer::pointcloud::PointCloudBlendMode::Multiply:
-            return 3U;
-    }
-
-    return 0U;
-}
-
-VkPipeline SelectPointCloudBlendPipeline(
-    const std::array<VkPipeline, kPointCloudBlendPipelineCount>& pipelines,
-    renderer::pointcloud::PointCloudBlendMode mode) {
-    return pipelines[PointCloudBlendPipelineIndex(mode)];
-}
 
 bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, float epsilon = 1.0e-6F) {
     for (int column = 0; column < 4; ++column) {
@@ -138,27 +117,6 @@ bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, f
     }
 
     return true;
-}
-
-const char* PointRenderModeLabel(renderer::pointcloud::PointCloudRenderMode mode) {
-    switch (mode) {
-        case renderer::pointcloud::PointCloudRenderMode::Solid:
-            return "solid";
-        case renderer::pointcloud::PointCloudRenderMode::EmissiveHard:
-            return "emissive-hard";
-        case renderer::pointcloud::PointCloudRenderMode::EmissiveFeathered:
-            return "emissive-feathered";
-        case renderer::pointcloud::PointCloudRenderMode::DepthXray:
-            return "depth-xray";
-        case renderer::pointcloud::PointCloudRenderMode::WeightedTransparent:
-            return "weighted-transparent";
-        case renderer::pointcloud::PointCloudRenderMode::ComputeDensity:
-            return "compute-density-fallback";
-        case renderer::pointcloud::PointCloudRenderMode::GaussianPointSprite:
-            return "gaussian-point-sprite";
-    }
-
-    return "solid";
 }
 
 constexpr std::array<const char*, 1> kRequiredDeviceExtensions = {
@@ -460,50 +418,6 @@ VkPipelineColorBlendAttachmentState MakePremultipliedAlphaBlendAttachment() {
     return attachment;
 }
 
-VkPipelineColorBlendAttachmentState MakeScreenBlendAttachment() {
-    VkPipelineColorBlendAttachmentState attachment{};
-    attachment.colorWriteMask =
-        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    attachment.blendEnable = VK_TRUE;
-    attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-    attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-    attachment.colorBlendOp = VK_BLEND_OP_ADD;
-    attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    attachment.alphaBlendOp = VK_BLEND_OP_ADD;
-    return attachment;
-}
-
-VkPipelineColorBlendAttachmentState MakeMultiplyBlendAttachment() {
-    VkPipelineColorBlendAttachmentState attachment{};
-    attachment.colorWriteMask =
-        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    attachment.blendEnable = VK_TRUE;
-    attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-    attachment.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
-    attachment.colorBlendOp = VK_BLEND_OP_ADD;
-    attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    attachment.alphaBlendOp = VK_BLEND_OP_ADD;
-    return attachment;
-}
-
-VkPipelineColorBlendAttachmentState MakePointCloudSolidBlendAttachment(
-    renderer::pointcloud::PointCloudBlendMode mode) {
-    switch (mode) {
-        case renderer::pointcloud::PointCloudBlendMode::Normal:
-            return MakePremultipliedAlphaBlendAttachment();
-        case renderer::pointcloud::PointCloudBlendMode::Additive:
-            return MakeAdditiveBlendAttachment();
-        case renderer::pointcloud::PointCloudBlendMode::Screen:
-            return MakeScreenBlendAttachment();
-        case renderer::pointcloud::PointCloudBlendMode::Multiply:
-            return MakeMultiplyBlendAttachment();
-    }
-
-    return MakePremultipliedAlphaBlendAttachment();
-}
-
 VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code, const char* label) {
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     moduleInfo.codeSize = code.size();
@@ -605,21 +519,11 @@ VulkanViewportShell::~VulkanViewportShell() {
         commandPool_ = VK_NULL_HANDLE;
     }
 
-    for (auto pipeline : pointSolidPipelines_) {
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device_, pipeline, nullptr);
-        }
-    }
     if (pointDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointDepthPrepassPipeline_, nullptr);
     }
     if (pointAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointAccumulationPipeline_, nullptr);
-    }
-    for (auto pipeline : surfelSolidPipelines_) {
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device_, pipeline, nullptr);
-        }
     }
     if (surfelDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelDepthPrepassPipeline_, nullptr);
@@ -775,26 +679,12 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     std::uint64_t pointCount = 0;
     double pointSizeSum = 0.0;
     std::uint64_t pointSizeWeight = 0;
-    std::vector<std::string> renderModes;
     for (const auto& layer : renderState_.pointCloudLayers) {
         pointCount += layer.drawPointCount;
         pointSizeSum +=
             static_cast<double>(layer.style.pointSize.constantValue[0] * renderState_.pointSizeScale) *
             static_cast<double>(std::max<std::uint32_t>(1U, layer.drawPointCount));
         pointSizeWeight += std::max<std::uint32_t>(1U, layer.drawPointCount);
-
-        const std::string modeLabel = PointRenderModeLabel(layer.style.renderMode);
-        if (std::find(renderModes.begin(), renderModes.end(), modeLabel) == renderModes.end()) {
-            renderModes.push_back(modeLabel);
-        }
-    }
-
-    std::ostringstream modeSummary;
-    for (std::size_t index = 0; index < renderModes.size(); ++index) {
-        if (index > 0) {
-            modeSummary << ", ";
-        }
-        modeSummary << renderModes[index];
     }
 
     diagnostics_.pointCount = pointCount;
@@ -802,7 +692,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         pointSizeWeight > 0 ? static_cast<float>(pointSizeSum / static_cast<double>(pointSizeWeight)) : 0.0F;
     diagnostics_.accumulationWidth = swapchainWidth_;
     diagnostics_.accumulationHeight = swapchainHeight_;
-    diagnostics_.pointRenderModes = modeSummary.str();
+    diagnostics_.pointRenderModes = pointCount > 0 ? "unified-material" : "";
 
     std::ostringstream summary;
     summary << "Renderer: " << diagnostics_.rendererName << " | " << swapchainWidth_ << "x"
@@ -810,7 +700,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     if (pointCount > 0) {
         summary << " | points: " << pointCount << " | point px avg: " << diagnostics_.averagePointSizePx
                 << " | accumulation: " << diagnostics_.accumulationWidth << "x" << diagnostics_.accumulationHeight
-                << " | point modes: " << diagnostics_.pointRenderModes;
+                << " | point material: " << diagnostics_.pointRenderModes;
     }
     diagnostics_.summary = summary.str();
 }
@@ -1876,40 +1766,6 @@ void VulkanViewportShell::CreatePointPipelines() {
             Check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline), label);
         };
 
-    const std::array<renderer::pointcloud::PointCloudBlendMode, kPointCloudBlendPipelineCount> solidBlendModes = {
-        renderer::pointcloud::PointCloudBlendMode::Normal,
-        renderer::pointcloud::PointCloudBlendMode::Additive,
-        renderer::pointcloud::PointCloudBlendMode::Screen,
-        renderer::pointcloud::PointCloudBlendMode::Multiply,
-    };
-    const std::array<const char*, kPointCloudBlendPipelineCount> pointSolidPipelineLabels = {
-        "vkCreateGraphicsPipelines(point solid normal)",
-        "vkCreateGraphicsPipelines(point solid add)",
-        "vkCreateGraphicsPipelines(point solid screen)",
-        "vkCreateGraphicsPipelines(point solid multiply)",
-    };
-    const std::array<const char*, kPointCloudBlendPipelineCount> surfelSolidPipelineLabels = {
-        "vkCreateGraphicsPipelines(surfel solid normal)",
-        "vkCreateGraphicsPipelines(surfel solid add)",
-        "vkCreateGraphicsPipelines(surfel solid screen)",
-        "vkCreateGraphicsPipelines(surfel solid multiply)",
-    };
-    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
-        createPointPipeline(
-            vertexStage,
-            vertexInputInfo,
-            inputAssembly,
-            solidFragmentModule,
-            0,
-            std::vector<VkPipelineColorBlendAttachmentState>{
-                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
-            true,
-            true,
-            VK_COMPARE_OP_LESS,
-            pointSolidPipelineLabels[blendIndex],
-            &pointSolidPipelines_[blendIndex]);
-    }
-
     createPointPipeline(
         vertexStage,
         vertexInputInfo,
@@ -1938,22 +1794,6 @@ void VulkanViewportShell::CreatePointPipelines() {
         VK_COMPARE_OP_ALWAYS,
         "vkCreateGraphicsPipelines(point accumulation)",
         &pointAccumulationPipeline_);
-
-    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
-        createPointPipeline(
-            surfelVertexStage,
-            surfelVertexInputInfo,
-            surfelInputAssembly,
-            surfelSolidFragmentModule,
-            0,
-            std::vector<VkPipelineColorBlendAttachmentState>{
-                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
-            true,
-            true,
-            VK_COMPARE_OP_LESS,
-            surfelSolidPipelineLabels[blendIndex],
-            &surfelSolidPipelines_[blendIndex]);
-    }
 
     createPointPipeline(
         surfelVertexStage,
@@ -2182,12 +2022,6 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     depthSubpass.pColorAttachments = &linearDepthColorRef;
     depthSubpass.pDepthStencilAttachment = &depthAttachmentRef;
 
-    VkSubpassDescription solidSubpass{};
-    solidSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    solidSubpass.colorAttachmentCount = 1;
-    solidSubpass.pColorAttachments = &finalColorRef;
-    solidSubpass.pDepthStencilAttachment = &depthReadOnlyAttachmentRef;
-
     VkAttachmentReference accumulationColorRefs[3]{};
     accumulationColorRefs[0] = {2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     accumulationColorRefs[1] = {3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -2214,7 +2048,7 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     compositeSubpass.inputAttachmentCount = 3;
     compositeSubpass.pInputAttachments = compositeInputRefs;
 
-    std::array<VkSubpassDependency, 7> dependencies{};
+    std::array<VkSubpassDependency, 5> dependencies{};
     dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[0].dstSubpass = 0;
     dependencies[0].srcStageMask =
@@ -2229,51 +2063,34 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     dependencies[1].srcStageMask =
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     dependencies[1].dstStageMask =
-        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-
-    dependencies[2].srcSubpass = 0;
-    dependencies[2].dstSubpass = 2;
-    dependencies[2].srcStageMask =
-        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dependencies[2].dstStageMask =
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dependencies[2].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dependencies[2].dstAccessMask =
+    dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask =
         VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
 
-    dependencies[3].srcSubpass = 1;
-    dependencies[3].dstSubpass = 3;
-    dependencies[3].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[3].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[3].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[3].dstAccessMask =
-        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-    dependencies[4].srcSubpass = 2;
-    dependencies[4].dstSubpass = 3;
-    dependencies[4].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[4].dstStageMask =
+    dependencies[2].srcSubpass = 1;
+    dependencies[2].dstSubpass = 2;
+    dependencies[2].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[2].dstStageMask =
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[4].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[4].dstAccessMask =
+    dependencies[2].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[2].dstAccessMask =
         VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
-    dependencies[5].srcSubpass = 0;
-    dependencies[5].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[5].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[5].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    dependencies[5].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[5].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    dependencies[3].srcSubpass = 0;
+    dependencies[3].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[3].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[3].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[3].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[3].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
-    dependencies[6].srcSubpass = 3;
-    dependencies[6].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[6].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[6].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    dependencies[6].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[6].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    dependencies[4].srcSubpass = 2;
+    dependencies[4].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[4].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[4].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[4].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[4].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     const std::array<VkAttachmentDescription, 6> attachments = {
         colorAttachment,
@@ -2283,9 +2100,8 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
         emissiveAttachment,
         linearDepthAttachment,
     };
-    const std::array<VkSubpassDescription, 4> subpasses = {
+    const std::array<VkSubpassDescription, 3> subpasses = {
         depthSubpass,
-        solidSubpass,
         accumulationSubpass,
         compositeSubpass,
     };
@@ -2307,32 +2123,24 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
 
     const auto vertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.vert.spv").string());
-    const auto solidFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.frag.spv").string());
     const auto accumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_accumulation.frag.spv").string());
     const auto depthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_export_depth.frag.spv").string());
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
-    const auto surfelSolidFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_preview.frag.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_accumulation.frag.spv").string());
     const auto surfelDepthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(exr point vertex)");
-    const auto solidFragmentModule =
-        CreateShaderModule(device_, solidFragmentShaderCode, "vkCreateShaderModule(exr point solid fragment)");
     const auto accumulationFragmentModule =
         CreateShaderModule(device_, accumulationFragmentShaderCode, "vkCreateShaderModule(exr point accumulation fragment)");
     const auto depthFragmentModule =
         CreateShaderModule(device_, depthFragmentShaderCode, "vkCreateShaderModule(exr point depth fragment)");
     const auto surfelVertexModule =
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(exr surfel vertex)");
-    const auto surfelSolidFragmentModule =
-        CreateShaderModule(device_, surfelSolidFragmentShaderCode, "vkCreateShaderModule(exr surfel solid fragment)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(exr surfel accumulation fragment)");
     const auto surfelDepthFragmentModule =
@@ -2460,45 +2268,12 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         VK_COMPARE_OP_LESS,
         "vkCreateGraphicsPipelines(exr point depth)",
         &resources->pointDepthPipeline);
-    const std::array<renderer::pointcloud::PointCloudBlendMode, kPointCloudBlendPipelineCount> solidBlendModes = {
-        renderer::pointcloud::PointCloudBlendMode::Normal,
-        renderer::pointcloud::PointCloudBlendMode::Additive,
-        renderer::pointcloud::PointCloudBlendMode::Screen,
-        renderer::pointcloud::PointCloudBlendMode::Multiply,
-    };
-    const std::array<const char*, kPointCloudBlendPipelineCount> pointSolidPipelineLabels = {
-        "vkCreateGraphicsPipelines(exr point solid normal)",
-        "vkCreateGraphicsPipelines(exr point solid add)",
-        "vkCreateGraphicsPipelines(exr point solid screen)",
-        "vkCreateGraphicsPipelines(exr point solid multiply)",
-    };
-    const std::array<const char*, kPointCloudBlendPipelineCount> surfelSolidPipelineLabels = {
-        "vkCreateGraphicsPipelines(exr surfel solid normal)",
-        "vkCreateGraphicsPipelines(exr surfel solid add)",
-        "vkCreateGraphicsPipelines(exr surfel solid screen)",
-        "vkCreateGraphicsPipelines(exr surfel solid multiply)",
-    };
-    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
-        createPointPipeline(
-            vertexStage,
-            vertexInputInfo,
-            inputAssembly,
-            solidFragmentModule,
-            1,
-            std::vector<VkPipelineColorBlendAttachmentState>{
-                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
-            true,
-            false,
-            VK_COMPARE_OP_LESS_OR_EQUAL,
-            pointSolidPipelineLabels[blendIndex],
-            &resources->pointSolidPipelines[blendIndex]);
-    }
     createPointPipeline(
         vertexStage,
         vertexInputInfo,
         inputAssembly,
         accumulationFragmentModule,
-        2,
+        1,
         std::vector<VkPipelineColorBlendAttachmentState>{
             MakeAdditiveBlendAttachment(),
             MakeRevealageBlendAttachment(),
@@ -2521,27 +2296,12 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         VK_COMPARE_OP_LESS,
         "vkCreateGraphicsPipelines(exr surfel depth)",
         &resources->surfelDepthPipeline);
-    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
-        createPointPipeline(
-            surfelVertexStage,
-            surfelVertexInputInfo,
-            surfelInputAssembly,
-            surfelSolidFragmentModule,
-            1,
-            std::vector<VkPipelineColorBlendAttachmentState>{
-                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
-            true,
-            false,
-            VK_COMPARE_OP_LESS_OR_EQUAL,
-            surfelSolidPipelineLabels[blendIndex],
-            &resources->surfelSolidPipelines[blendIndex]);
-    }
     createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
         surfelAccumulationFragmentModule,
-        2,
+        1,
         std::vector<VkPipelineColorBlendAttachmentState>{
             MakeAdditiveBlendAttachment(),
             MakeRevealageBlendAttachment(),
@@ -2554,11 +2314,9 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
 
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
-    vkDestroyShaderModule(device_, surfelSolidFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, depthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, accumulationFragmentModule, nullptr);
-    vkDestroyShaderModule(device_, solidFragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 
     const auto compositeVertexShaderCode =
@@ -2611,7 +2369,7 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     compositePipelineInfo.pDynamicState = &dynamicState;
     compositePipelineInfo.layout = compositePipelineLayout_;
     compositePipelineInfo.renderPass = resources->renderPass;
-    compositePipelineInfo.subpass = 3;
+    compositePipelineInfo.subpass = 2;
     Check(
         vkCreateGraphicsPipelines(
             device_,
@@ -3771,21 +3529,11 @@ void VulkanViewportShell::CleanupExrExportResources() {
     if (resources.pointDepthPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.pointDepthPipeline, nullptr);
     }
-    for (auto pipeline : resources.pointSolidPipelines) {
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device_, pipeline, nullptr);
-        }
-    }
     if (resources.pointAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.pointAccumulationPipeline, nullptr);
     }
     if (resources.surfelDepthPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelDepthPipeline, nullptr);
-    }
-    for (auto pipeline : resources.surfelSolidPipelines) {
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device_, pipeline, nullptr);
-        }
     }
     if (resources.surfelAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelAccumulationPipeline, nullptr);
@@ -3929,10 +3677,10 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         0U,
     };
     styleGpu.renderControl = glm::uvec4{
-        static_cast<std::uint32_t>(layer.style.renderMode),
+        static_cast<std::uint32_t>(layer.style.depthContribution),
         static_cast<std::uint32_t>(layer.style.falloffProfile),
         static_cast<std::uint32_t>(layer.style.geometryMode),
-        static_cast<std::uint32_t>(layer.style.blendMode),
+        0U,
     };
     styleGpu.renderParams0 = glm::vec4{
         layer.style.exposure,
@@ -3949,8 +3697,14 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
     styleGpu.renderParams2 = glm::vec4{
         layer.style.densityScale,
         layer.style.densityClamp,
+        0.0F,
+        0.0F,
+    };
+    styleGpu.renderParams3 = glm::vec4{
+        layer.style.depthAlphaThreshold,
         pointSizeRangeMin_,
         pointSizeRangeMax_,
+        0.0F,
     };
     styleGpu.pointSize = MakePointCloudBindingGpu(layer.style.pointSize, layer.scalarFields);
     ScalePointCloudBindingGpu(&styleGpu.pointSize, renderState_.pointSizeScale);
@@ -4079,42 +3833,27 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
 
     const bool forceFullSource = !request.previewDensity;
     for (const auto& layer : request.renderState.pointCloudLayers) {
+        if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
+            RecordPointCloudLayerDraw(
+                resources.commandBuffer,
+                layer,
+                forceFullSource,
+                resources.pointDepthPipeline,
+                resources.surfelDepthPipeline);
+        }
+    }
+
+    vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
+
+    for (const auto& layer : request.renderState.pointCloudLayers) {
         RecordPointCloudLayerDraw(
             resources.commandBuffer,
             layer,
             forceFullSource,
-            resources.pointDepthPipeline,
-            resources.surfelDepthPipeline);
-    }
-
-    vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
-
-    for (const auto& layer : request.renderState.pointCloudLayers) {
-        if (layer.style.renderMode == renderer::pointcloud::PointCloudRenderMode::Solid) {
-            RecordPointCloudLayerDraw(
-                resources.commandBuffer,
-                layer,
-                forceFullSource,
-                SelectPointCloudBlendPipeline(resources.pointSolidPipelines, layer.style.blendMode),
-                SelectPointCloudBlendPipeline(resources.surfelSolidPipelines, layer.style.blendMode));
-        }
-    }
-
-    vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
-    vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
-
-    for (const auto& layer : request.renderState.pointCloudLayers) {
-        if (layer.style.renderMode != renderer::pointcloud::PointCloudRenderMode::Solid) {
-            RecordPointCloudLayerDraw(
-                resources.commandBuffer,
-                layer,
-                forceFullSource,
-                resources.pointAccumulationPipeline,
-                resources.surfelAccumulationPipeline);
-        }
+            resources.pointAccumulationPipeline,
+            resources.surfelAccumulationPipeline);
     }
 
     vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
@@ -4209,18 +3948,7 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
 
     if (!renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            if (layer.style.renderMode == renderer::pointcloud::PointCloudRenderMode::Solid) {
-                RecordPointCloudLayerDraw(
-                    commandBuffer,
-                    layer,
-                    false,
-                    SelectPointCloudBlendPipeline(pointSolidPipelines_, layer.style.blendMode),
-                    SelectPointCloudBlendPipeline(surfelSolidPipelines_, layer.style.blendMode));
-            }
-        }
-
-        for (const auto& layer : renderState_.pointCloudLayers) {
-            if (layer.style.renderMode == renderer::pointcloud::PointCloudRenderMode::DepthXray) {
+            if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
                 RecordPointCloudLayerDraw(
                     commandBuffer,
                     layer,
@@ -4237,14 +3965,12 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
 
     if (!renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            if (layer.style.renderMode != renderer::pointcloud::PointCloudRenderMode::Solid) {
-                RecordPointCloudLayerDraw(
-                    commandBuffer,
-                    layer,
-                    false,
-                    pointAccumulationPipeline_,
-                    surfelAccumulationPipeline_);
-            }
+            RecordPointCloudLayerDraw(
+                commandBuffer,
+                layer,
+                false,
+                pointAccumulationPipeline_,
+                surfelAccumulationPipeline_);
         }
     }
 

@@ -322,6 +322,20 @@ PointCloudStyleState::PointCloudStyleState() {
     invisible_places::style::SetScalarConstant(&colormapPosition, 0.5F);
 }
 
+bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style) {
+    return style.depthContribution != PointCloudDepthContribution::None;
+}
+
+bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha) {
+    if (alpha <= 1.0e-5F || !PointCloudStyleUsesDepthPrepass(style)) {
+        return false;
+    }
+    if (style.depthContribution == PointCloudDepthContribution::AlphaThreshold) {
+        return alpha >= std::clamp(style.depthAlphaThreshold, 0.0F, 1.0F);
+    }
+    return true;
+}
+
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints) {
     if (totalPoints == 0) {
         return 0;

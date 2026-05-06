@@ -40,6 +40,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 renderParams0;
     vec4 renderParams1;
     vec4 renderParams2;
+    vec4 renderParams3;
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;
@@ -109,12 +110,12 @@ void main() {
     gl_Position = uniforms.viewProjection * worldPosition;
     const float basePointSize = clamp(
         EvaluateBinding(styleData.pointSizeBinding),
-        max(1.0, styleData.renderParams2.z),
-        max(max(1.0, styleData.renderParams2.z), styleData.renderParams2.w));
+        max(1.0, styleData.renderParams3.y),
+        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
     gl_PointSize = clamp(
         basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
-        max(1.0, styleData.renderParams2.z),
-        max(max(1.0, styleData.renderParams2.z), styleData.renderParams2.w));
+        max(1.0, styleData.renderParams3.y),
+        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
 
     outSourceColor = inColor;
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);

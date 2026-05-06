@@ -194,10 +194,8 @@ class VulkanViewportShell {
         VkFence fence = VK_NULL_HANDLE;
         VkDescriptorSet compositeDescriptorSet = VK_NULL_HANDLE;
         VkPipeline pointDepthPipeline = VK_NULL_HANDLE;
-        std::array<VkPipeline, 4> pointSolidPipelines{};
         VkPipeline pointAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline surfelDepthPipeline = VK_NULL_HANDLE;
-        std::array<VkPipeline, 4> surfelSolidPipelines{};
         VkPipeline surfelAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline compositePipeline = VK_NULL_HANDLE;
         ImageAllocation colorImage{};
@@ -309,10 +307,8 @@ class VulkanViewportShell {
     VkPipelineLayout gaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout highQualityGaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
-    std::array<VkPipeline, 4> pointSolidPipelines_{};
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
-    std::array<VkPipeline, 4> surfelSolidPipelines_{};
     VkPipeline surfelDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline gaussianSplatPipeline_ = VK_NULL_HANDLE;

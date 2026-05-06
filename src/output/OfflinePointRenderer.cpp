@@ -25,14 +25,6 @@ float Clamp01(float value) {
     return std::clamp(value, 0.0F, 1.0F);
 }
 
-glm::vec3 ClampColor(glm::vec3 color) {
-    return {
-        Clamp01(color.r),
-        Clamp01(color.g),
-        Clamp01(color.b),
-    };
-}
-
 float ScalarFieldValue(
     const invisible_places::io::LoadedPointCloud& cloud,
     const invisible_places::style::RenderParameterBinding& binding,
@@ -133,35 +125,17 @@ float SmoothStep(float edge0, float edge1, float value) {
     return t * t * (3.0F - (2.0F * t));
 }
 
-invisible_places::renderer::pointcloud::PointCloudRenderMode EffectiveOfflineRenderMode(
-    invisible_places::renderer::pointcloud::PointCloudRenderMode mode) {
-    if (mode == invisible_places::renderer::pointcloud::PointCloudRenderMode::ComputeDensity ||
-        mode == invisible_places::renderer::pointcloud::PointCloudRenderMode::GaussianPointSprite) {
-        return invisible_places::renderer::pointcloud::PointCloudRenderMode::WeightedTransparent;
-    }
-
-    return mode;
-}
-
 float PointFalloff(
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
-    invisible_places::renderer::pointcloud::PointCloudRenderMode mode,
     float normalizedRadius,
     float normalizedRadiusSquared) {
     using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
-    using invisible_places::renderer::pointcloud::PointCloudRenderMode;
 
     if (normalizedRadiusSquared > 1.0F) {
         return 0.0F;
     }
 
     auto profile = style.falloffProfile;
-    if (mode == PointCloudRenderMode::EmissiveHard) {
-        profile = PointCloudFalloffProfile::HardDisc;
-    } else if (style.renderMode == PointCloudRenderMode::ComputeDensity ||
-               style.renderMode == PointCloudRenderMode::GaussianPointSprite) {
-        profile = PointCloudFalloffProfile::Gaussian;
-    }
 
     switch (profile) {
         case PointCloudFalloffProfile::HardDisc:
@@ -179,7 +153,7 @@ float PointFalloff(
     return 1.0F;
 }
 
-glm::vec3 ResolveSolidShadedColor(
+float ResolveDepthFadeAlpha(
     const OfflinePointSample& sample,
     const invisible_places::camera::CameraState& cameraState,
     float viewDepth) {
@@ -188,18 +162,10 @@ glm::vec3 ResolveSolidShadedColor(
             std::max(1.0e-5F, cameraState.farPlane - cameraState.nearPlane),
         0.0F,
         1.0F);
-    const float fade = std::lerp(
+    return std::lerp(
         1.0F,
-        1.0F - (depthNorm * 0.65F),
+        1.0F - depthNorm,
         std::clamp(sample.depthFade, 0.0F, 1.0F));
-
-    glm::vec3 shadedColor = sample.color * fade;
-    shadedColor = glm::mix(
-        shadedColor,
-        glm::vec3{1.0F, 1.0F, 1.0F},
-        std::clamp(sample.xray, 0.0F, 1.0F) * 0.45F);
-    shadedColor += std::max(0.0F, sample.emissive) * 0.35F * sample.color;
-    return ClampColor(shadedColor);
 }
 
 float WeightedAlphaWeight(
@@ -385,7 +351,6 @@ template <typename PixelCallback>
 void VisitCoveredPixels(
     const OfflinePointSample& sample,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
-    invisible_places::renderer::pointcloud::PointCloudRenderMode mode,
     const invisible_places::camera::OrbitCameraMatrices& matrices,
     const ExrImage& image,
     const OfflineRenderTile& tile,
@@ -460,7 +425,7 @@ void VisitCoveredPixels(
                 }
 
                 const float normalizedRadius = std::sqrt(normalizedRadiusSquared);
-                const float falloff = PointFalloff(style, mode, normalizedRadius, normalizedRadiusSquared);
+                const float falloff = PointFalloff(style, normalizedRadius, normalizedRadiusSquared);
                 if (falloff <= 1.0e-5F) {
                     continue;
                 }
@@ -507,7 +472,7 @@ void VisitCoveredPixels(
             }
 
             const float normalizedRadius = std::sqrt(normalizedRadiusSquared);
-            const float falloff = PointFalloff(style, mode, normalizedRadius, normalizedRadiusSquared);
+            const float falloff = PointFalloff(style, normalizedRadius, normalizedRadiusSquared);
             if (falloff <= 1.0e-5F) {
                 continue;
             }
@@ -523,26 +488,6 @@ void VisitCoveredPixels(
                 sample.viewDepth);
         }
     }
-}
-
-void WritePixelIfCloser(
-    const glm::vec3& color,
-    float alpha,
-    float viewDepth,
-    std::uint32_t x,
-    std::uint32_t y,
-    ExrImage* image) {
-    const auto pixelIndex =
-        static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) + static_cast<std::size_t>(x);
-    if (pixelIndex >= image->depth.size() || viewDepth >= image->depth[pixelIndex]) {
-        return;
-    }
-
-    image->depth[pixelIndex] = viewDepth;
-    image->beautyR[pixelIndex] = color.r;
-    image->beautyG[pixelIndex] = color.g;
-    image->beautyB[pixelIndex] = color.b;
-    image->alpha[pixelIndex] = alpha;
 }
 
 }  // namespace
@@ -589,8 +534,6 @@ void RenderPointCloudTile(
         return;
     }
 
-    using invisible_places::renderer::pointcloud::PointCloudRenderMode;
-
     invisible_places::camera::OrbitCamera camera;
     camera.ApplyState(cameraState);
     const float aspectRatio = static_cast<float>(image->width) / static_cast<float>(image->height);
@@ -615,7 +558,6 @@ void RenderPointCloudTile(
         }
 
         const auto& cloud = *layer.cloud;
-        const auto mode = EffectiveOfflineRenderMode(layer.style.renderMode);
         for (std::size_t chunkStart = 0; chunkStart < cloud.positions.size(); chunkStart += kOfflinePointChunkSize) {
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
@@ -627,16 +569,24 @@ void RenderPointCloudTile(
                 VisitCoveredPixels(
                     sample,
                     layer.style,
-                    mode,
                     matrices,
                     *image,
                     tile,
                     tileWidth,
-                    [&](std::uint32_t x, std::uint32_t y, std::size_t, float, float coveredViewDepth) {
+                    [&](std::uint32_t x, std::uint32_t y, std::size_t, float falloff, float coveredViewDepth) {
                         const auto pixelIndex =
                             static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
                             static_cast<std::size_t>(x);
-                        if (pixelIndex < image->depth.size() && coveredViewDepth < image->depth[pixelIndex]) {
+                        const float alpha =
+                            std::clamp(
+                                sample.opacity * falloff * ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth),
+                                0.0F,
+                                0.995F);
+                        if (pixelIndex < image->depth.size() &&
+                            coveredViewDepth < image->depth[pixelIndex] &&
+                            invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(
+                                layer.style,
+                                alpha)) {
                             image->depth[pixelIndex] = coveredViewDepth;
                         }
                     });
@@ -650,7 +600,6 @@ void RenderPointCloudTile(
         }
 
         const auto& cloud = *layer.cloud;
-        const auto mode = EffectiveOfflineRenderMode(layer.style.renderMode);
         for (std::size_t chunkStart = 0; chunkStart < cloud.positions.size(); chunkStart += kOfflinePointChunkSize) {
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
@@ -662,7 +611,6 @@ void RenderPointCloudTile(
                 VisitCoveredPixels(
                     sample,
                     layer.style,
-                    mode,
                     matrices,
                     *image,
                     tile,
@@ -679,25 +627,37 @@ void RenderPointCloudTile(
                             return;
                         }
 
-                        const float alpha = std::clamp(sample.opacity * falloff, 0.0F, 0.995F);
+                        const float alpha =
+                            std::clamp(
+                                sample.opacity * falloff * ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth),
+                                0.0F,
+                                0.995F);
                         if (alpha <= 1.0e-5F) {
                             return;
                         }
 
-                        if (mode == PointCloudRenderMode::Solid) {
-                            if (coveredViewDepth > image->depth[pixelIndex] + 1.0e-4F) {
-                                return;
-                            }
+                        const float densityScale = std::max(1.0F, layer.style.densityScale);
+                        const float densityClamp = std::max(0.0F, layer.style.densityClamp);
+                        const float weightedAlpha = std::clamp(
+                            densityClamp > 0.0F ? std::min(alpha * densityScale, densityClamp) : alpha,
+                            0.0F,
+                            0.995F);
+                        const float weight = WeightedAlphaWeight(weightedAlpha, coveredViewDepth, cameraState);
+                        accumR[localIndex] += sample.color.r * weightedAlpha * weight;
+                        accumG[localIndex] += sample.color.g * weightedAlpha * weight;
+                        accumB[localIndex] += sample.color.b * weightedAlpha * weight;
+                        accumA[localIndex] += weightedAlpha * weight;
+                        revealage[localIndex] *= (1.0F - weightedAlpha);
 
-                            const glm::vec3 color = ResolveSolidShadedColor(sample, cameraState, coveredViewDepth);
-                            image->beautyR[pixelIndex] = color.r;
-                            image->beautyG[pixelIndex] = color.g;
-                            image->beautyB[pixelIndex] = color.b;
-                            image->alpha[pixelIndex] = alpha;
-                            return;
+                        const float emissionGain = sample.emissive * std::max(0.0F, layer.style.exposure);
+                        if (emissionGain > 1.0e-5F) {
+                            emissionR[localIndex] += sample.color.r * alpha * emissionGain;
+                            emissionG[localIndex] += sample.color.g * alpha * emissionGain;
+                            emissionB[localIndex] += sample.color.b * alpha * emissionGain;
+                            emissionA[localIndex] += alpha * emissionGain;
                         }
 
-                        if (mode == PointCloudRenderMode::DepthXray) {
+                        if (sample.xray > 1.0e-5F) {
                             const float sceneDepth = image->depth[pixelIndex];
                             if (!std::isfinite(sceneDepth) || sample.xray <= 1.0e-5F) {
                                 return;
@@ -720,40 +680,12 @@ void RenderPointCloudTile(
                                 return;
                             }
 
-                            const float gain = std::max(1.0F, sample.emissive) * std::max(0.0F, layer.style.exposure);
+                            const float gain = std::max(0.0F, layer.style.exposure);
                             emissionR[localIndex] += sample.color.r * xrayAlpha * gain;
                             emissionG[localIndex] += sample.color.g * xrayAlpha * gain;
                             emissionB[localIndex] += sample.color.b * xrayAlpha * gain;
                             emissionA[localIndex] += xrayAlpha * gain;
-                            return;
                         }
-
-                        if (mode == PointCloudRenderMode::EmissiveHard ||
-                            mode == PointCloudRenderMode::EmissiveFeathered) {
-                            const float gain = sample.emissive * std::max(0.0F, layer.style.exposure);
-                            if (gain <= 1.0e-5F) {
-                                return;
-                            }
-
-                            emissionR[localIndex] += sample.color.r * alpha * gain;
-                            emissionG[localIndex] += sample.color.g * alpha * gain;
-                            emissionB[localIndex] += sample.color.b * alpha * gain;
-                            emissionA[localIndex] += alpha * gain;
-                            return;
-                        }
-
-                        const float densityScale = std::max(1.0F, layer.style.densityScale);
-                        const float densityClamp = std::max(0.0F, layer.style.densityClamp);
-                        const float weightedAlpha = std::clamp(
-                            densityClamp > 0.0F ? std::min(alpha * densityScale, densityClamp) : alpha,
-                            0.0F,
-                            0.995F);
-                        const float weight = WeightedAlphaWeight(weightedAlpha, coveredViewDepth, cameraState);
-                        accumR[localIndex] += sample.color.r * weightedAlpha * weight;
-                        accumG[localIndex] += sample.color.g * weightedAlpha * weight;
-                        accumB[localIndex] += sample.color.b * weightedAlpha * weight;
-                        accumA[localIndex] += weightedAlpha * weight;
-                        revealage[localIndex] *= (1.0F - weightedAlpha);
                     });
             }
         }

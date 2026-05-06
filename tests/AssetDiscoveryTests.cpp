@@ -854,8 +854,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
 
     invisible_places::renderer::pointcloud::PointCloudStyleState pointStyle;
     pointStyle.geometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
-    pointStyle.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray;
-    pointStyle.blendMode = invisible_places::renderer::pointcloud::PointCloudBlendMode::Screen;
+    pointStyle.depthContribution =
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always;
     pointStyle.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
     pointStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
     pointStyle.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo;
@@ -869,6 +869,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.hiddenAlpha = 0.09F;
     pointStyle.densityScale = 1.75F;
     pointStyle.densityClamp = 96.0F;
+    pointStyle.depthAlphaThreshold = 0.42F;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.pointSize,
         2,
@@ -896,6 +897,15 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
 
     std::string errorMessage;
     REQUIRE(invisible_places::serialization::SaveProjectDocument(document, outputPath, &errorMessage));
+    {
+        std::ifstream savedProject{outputPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{savedProject},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"render_mode\"") == std::string::npos);
+        CHECK(savedJson.find("\"blend_mode\"") == std::string::npos);
+        CHECK(savedJson.find("\"depth_contribution\"") != std::string::npos);
+    }
 
     const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
     REQUIRE(loadedDocument.has_value());
@@ -949,11 +959,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         loadedLayer.pointStyle->geometryMode ==
         invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels);
     CHECK(
-        loadedLayer.pointStyle->renderMode ==
-        invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray);
-    CHECK(
-        loadedLayer.pointStyle->blendMode ==
-        invisible_places::renderer::pointcloud::PointCloudBlendMode::Screen);
+        loadedLayer.pointStyle->depthContribution ==
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always);
     CHECK(
         loadedLayer.pointStyle->falloffProfile ==
         invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian);
@@ -970,6 +977,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->hiddenAlpha == Catch::Approx(0.09F));
     CHECK(loadedLayer.pointStyle->densityScale == Catch::Approx(1.75F));
     CHECK(loadedLayer.pointStyle->densityClamp == Catch::Approx(96.0F));
+    CHECK(loadedLayer.pointStyle->depthAlphaThreshold == Catch::Approx(0.42F));
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldSlot == 2);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldName == "Height");
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.inputMin == Catch::Approx(-2.0F));
@@ -1000,10 +1008,92 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
     CHECK(
         preset->style.geometryMode ==
         invisible_places::renderer::pointcloud::PointCloudGeometryMode::ScreenSprites);
-    CHECK(preset->style.blendMode == invisible_places::renderer::pointcloud::PointCloudBlendMode::Normal);
+    CHECK(
+        preset->style.depthContribution ==
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold);
     CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
 
     std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Legacy point render modes migrate to unified material style", "[serialization][point-style]") {
+    const auto presetPath = std::filesystem::temp_directory_path() / "invisible_places_legacy_render_mode.json";
+
+    auto loadLegacyMode = [&](const std::string& modeName) {
+        std::ofstream output{presetPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 1,
+  "preset_name": "Legacy",
+  "point_style": {
+    "render_mode": ")" << modeName << R"(",
+    "density_scale": 2.5,
+    "density_clamp": 72.0
+  }
+})";
+        output.close();
+
+        std::string errorMessage;
+        const auto preset = invisible_places::serialization::LoadPointCloudStylePreset(presetPath, &errorMessage);
+        REQUIRE(preset.has_value());
+        return preset->style;
+    };
+
+    const auto solid = loadLegacyMode("solid");
+    CHECK(
+        solid.depthContribution ==
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold);
+
+    const auto emissiveHard = loadLegacyMode("emissive_hard");
+    CHECK(
+        emissiveHard.falloffProfile ==
+        invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc);
+    CHECK(invisible_places::style::ScalarConstant(emissiveHard.emissiveStrength) == Catch::Approx(1.0F));
+
+    const auto emissiveFeathered = loadLegacyMode("emissive_feathered");
+    CHECK(
+        emissiveFeathered.falloffProfile ==
+        invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian);
+    CHECK(invisible_places::style::ScalarConstant(emissiveFeathered.emissiveStrength) == Catch::Approx(1.0F));
+
+    const auto xray = loadLegacyMode("depth_xray");
+    CHECK(
+        xray.depthContribution ==
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always);
+    CHECK(invisible_places::style::ScalarConstant(xray.xrayStrength) == Catch::Approx(1.0F));
+
+    const auto weighted = loadLegacyMode("weighted_transparent");
+    CHECK(weighted.densityScale == Catch::Approx(2.5F));
+    CHECK(weighted.densityClamp == Catch::Approx(72.0F));
+
+    const auto density = loadLegacyMode("compute_density");
+    CHECK(density.densityScale == Catch::Approx(2.5F));
+    CHECK(density.densityClamp == Catch::Approx(72.0F));
+
+    const auto gaussianSprite = loadLegacyMode("gaussian_point_sprite");
+    CHECK(
+        gaussianSprite.falloffProfile ==
+        invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian);
+
+    std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Point depth contribution policy is shared by preview and export selection", "[point-style]") {
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+
+    style.depthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution::None;
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 1.0F));
+
+    style.depthContribution =
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold;
+    style.depthAlphaThreshold = 0.5F;
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 0.49F));
+    CHECK(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 0.5F));
+
+    style.depthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always;
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
+    CHECK(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 0.01F));
 }
 
 TEST_CASE("Camera shot interpolation stores quaternion slerp and linear camera values", "[camera][shots]") {
@@ -1695,7 +1785,6 @@ TEST_CASE("Offline world surfels use world diameter instead of pixel point size"
     auto renderWithPointSize = [&](float pointSize) {
         invisible_places::renderer::pointcloud::PointCloudStyleState style;
         style.geometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
-        style.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::Solid;
         style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
         invisible_places::style::SetScalarConstant(&style.pointSize, pointSize);
         invisible_places::style::SetScalarConstant(&style.surfelDiameter, 1.0F);
@@ -1734,7 +1823,7 @@ TEST_CASE("Offline world surfels use world diameter instead of pixel point size"
     }
 }
 
-TEST_CASE("Offline point renderer supports emissive and transparent point modes", "[output][offline][point-style]") {
+TEST_CASE("Offline point renderer stacks opacity emission xray and falloff", "[output][offline][point-style]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {
         {0.0F, 0.0F, 0.0F},
@@ -1768,18 +1857,16 @@ TEST_CASE("Offline point renderer supports emissive and transparent point modes"
         return image;
     };
 
-    invisible_places::renderer::pointcloud::PointCloudStyleState emissiveHard;
-    emissiveHard.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::EmissiveHard;
-    emissiveHard.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
-    invisible_places::style::SetScalarConstant(&emissiveHard.opacity, 1.0F);
-    invisible_places::style::SetScalarConstant(&emissiveHard.emissiveStrength, 2.0F);
-    const auto hardImage = renderWithStyle(emissiveHard);
+    invisible_places::renderer::pointcloud::PointCloudStyleState hard;
+    hard.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    invisible_places::style::SetScalarConstant(&hard.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&hard.emissiveStrength, 2.0F);
+    const auto hardImage = renderWithStyle(hard);
     const auto center = static_cast<std::size_t>(4) * 9U + 4U;
     CHECK(hardImage.beautyR[center] > 0.1F);
     CHECK(hardImage.alpha[center] > 0.1F);
 
     invisible_places::renderer::pointcloud::PointCloudStyleState gaussian;
-    gaussian.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::EmissiveFeathered;
     gaussian.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
     gaussian.gaussianSharpness = 6.0F;
     invisible_places::style::SetScalarConstant(&gaussian.opacity, 1.0F);
@@ -1788,27 +1875,67 @@ TEST_CASE("Offline point renderer supports emissive and transparent point modes"
     const auto edge = static_cast<std::size_t>(4) * 9U + 6U;
     CHECK(gaussianImage.beautyR[center] > gaussianImage.beautyR[edge]);
 
-    invisible_places::renderer::pointcloud::PointCloudStyleState xray;
-    xray.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray;
-    xray.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::SoftDisc;
-    xray.frontAlpha = 0.25F;
-    xray.hiddenAlpha = 0.18F;
-    xray.depthFalloff = 30.0F;
-    invisible_places::style::SetScalarConstant(&xray.opacity, 1.0F);
-    invisible_places::style::SetScalarConstant(&xray.xrayStrength, 1.0F);
-    invisible_places::style::SetScalarConstant(&xray.emissiveStrength, 1.5F);
-    const auto xrayImage = renderWithStyle(xray);
-    CHECK(xrayImage.alpha[center] > 0.1F);
-    CHECK((xrayImage.beautyR[center] + xrayImage.beautyG[center]) > 0.1F);
+    invisible_places::renderer::pointcloud::PointCloudStyleState stacked;
+    stacked.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::SoftDisc;
+    stacked.depthContribution =
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always;
+    stacked.frontAlpha = 0.25F;
+    stacked.hiddenAlpha = 0.18F;
+    stacked.depthFalloff = 30.0F;
+    invisible_places::style::SetScalarConstant(&stacked.opacity, 0.5F);
+    invisible_places::style::SetScalarConstant(&stacked.xrayStrength, 1.0F);
+    invisible_places::style::SetScalarConstant(&stacked.emissiveStrength, 1.5F);
+    const auto stackedImage = renderWithStyle(stacked);
+    CHECK(stackedImage.alpha[center] > 0.1F);
+    CHECK(stackedImage.beautyR[center] > 0.01F);
+    CHECK(stackedImage.beautyG[center] > 0.01F);
+}
 
-    invisible_places::renderer::pointcloud::PointCloudStyleState weighted;
-    weighted.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::WeightedTransparent;
-    weighted.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::SoftDisc;
-    invisible_places::style::SetScalarConstant(&weighted.opacity, 0.5F);
-    const auto weightedImage = renderWithStyle(weighted);
-    CHECK(weightedImage.alpha[center] > 0.1F);
-    CHECK(weightedImage.beautyR[center] > 0.01F);
-    CHECK(weightedImage.beautyG[center] > 0.01F);
+TEST_CASE("Offline point depth fade reduces alpha without changing color ratio", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFF0000FFU};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithDepthFade = [&](float depthFade) {
+        invisible_places::renderer::pointcloud::PointCloudStyleState style;
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+        style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.depthFade, depthFade);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9, 9);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+            &image);
+        return image;
+    };
+
+    const auto noFade = renderWithDepthFade(0.0F);
+    const auto farFade = renderWithDepthFade(1.0F);
+    const auto center = static_cast<std::size_t>(4) * 9U + 4U;
+    REQUIRE(noFade.alpha[center] > 0.0F);
+    REQUIRE(farFade.alpha[center] > 0.0F);
+    CHECK(farFade.alpha[center] < noFade.alpha[center]);
+    CHECK((farFade.beautyR[center] / farFade.alpha[center]) ==
+          Catch::Approx(noFade.beautyR[center] / noFade.alpha[center]).margin(0.02F));
 }
 
 TEST_CASE("gSplat quality resolver steps down during navigation and restores afterward", "[gsplat][quality]") {

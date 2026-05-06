@@ -31,21 +31,10 @@ enum class PointCloudGeometryMode {
     WorldSurfels
 };
 
-enum class PointCloudRenderMode {
-    Solid,
-    EmissiveHard,
-    EmissiveFeathered,
-    DepthXray,
-    WeightedTransparent,
-    ComputeDensity,
-    GaussianPointSprite
-};
-
-enum class PointCloudBlendMode {
-    Normal,
-    Additive,
-    Screen,
-    Multiply
+enum class PointCloudDepthContribution {
+    None,
+    AlphaThreshold,
+    Always
 };
 
 enum class PointCloudFalloffProfile {
@@ -65,8 +54,7 @@ struct PointCloudStyleState {
     PointCloudStyleState();
 
     PointCloudGeometryMode geometryMode = PointCloudGeometryMode::ScreenSprites;
-    PointCloudRenderMode renderMode = PointCloudRenderMode::Solid;
-    PointCloudBlendMode blendMode = PointCloudBlendMode::Normal;
+    PointCloudDepthContribution depthContribution = PointCloudDepthContribution::AlphaThreshold;
     PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::SoftDisc;
     PointCloudColorMode colorMode = PointCloudColorMode::SourceRgb;
     PointCloudColormapId colormap = PointCloudColormapId::Viridis;
@@ -81,6 +69,7 @@ struct PointCloudStyleState {
     float hiddenAlpha = 0.08F;
     float densityScale = 1.0F;
     float densityClamp = 64.0F;
+    float depthAlphaThreshold = 0.5F;
     invisible_places::style::RenderParameterBinding pointSize;
     invisible_places::style::RenderParameterBinding surfelDiameter;
     invisible_places::style::RenderParameterBinding opacity;
@@ -120,6 +109,8 @@ struct PointCloudSessionState {
 };
 
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints);
+[[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha);
 PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 PointBudgetState MakePointBudgetState(
     const invisible_places::io::LoadedPointCloud& cloud,

@@ -1,12 +1,6 @@
 #version 450
-#extension GL_GOOGLE_include_directive : require
-#include "pointcloud_colormaps.glsl"
 
-layout(location = 0) in vec4 inSourceColor;
-layout(location = 1) in float inColormapValue;
 layout(location = 2) in float inOpacity;
-layout(location = 3) in float inEmissive;
-layout(location = 4) in float inXray;
 layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
 
@@ -37,6 +31,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 renderParams0;
     vec4 renderParams1;
     vec4 renderParams2;
+    vec4 renderParams3;
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;
@@ -46,26 +41,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu surfelDiameterBinding;
 } styleData;
 
-vec3 ResolveBaseColor() {
-    vec3 baseColor = inSourceColor.rgb;
-    if (styleData.globalControl.x == 1u) {
-        baseColor = styleData.solidColor.rgb;
-    } else if (styleData.globalControl.x == 2u) {
-        baseColor = ApplyPointCloudColormap(styleData.globalControl.y, clamp(inColormapValue, 0.0, 1.0));
-    } else if (styleData.globalControl.w == 0u) {
-        baseColor = styleData.solidColor.rgb;
-    }
-    return baseColor;
-}
-
 float ResolveFalloff(float radius, float radiusSquared) {
-    const uint renderMode = styleData.renderControl.x;
     uint profile = styleData.renderControl.y;
-    if (renderMode == 1u) {
-        profile = 0u;
-    } else if (renderMode == 6u) {
-        profile = 2u;
-    }
 
     if (profile == 0u) {
         return 1.0;
@@ -79,29 +56,13 @@ float ResolveFalloff(float radius, float radiusSquared) {
     return smoothstep(1.0, clamp(styleData.renderParams0.y, 0.0, 0.99), radius);
 }
 
-vec3 ResolveSolidColor(vec3 baseColor) {
-    float emissive = max(0.0, inEmissive);
-    float xray = clamp(inXray, 0.0, 1.0);
-    float depthFade = clamp(inDepthFade, 0.0, 1.0);
-    float depthNorm = clamp(
+float ResolveDepthFadeAlpha(float depthFade) {
+    const float depthNorm = clamp(
         (inViewDepth - uniforms.depthParameters.y) /
         max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
         0.0,
         1.0);
-    float fade = mix(1.0, 1.0 - (depthNorm * 0.65), depthFade);
-
-    vec3 shadedColor = baseColor * fade;
-    shadedColor = mix(shadedColor, vec3(1.0), xray * 0.45);
-    shadedColor += emissive * 0.35 * baseColor;
-    return clamp(shadedColor, 0.0, 1.0);
-}
-
-vec4 ResolveBlendOutput(vec3 color, float alpha) {
-    const uint blendMode = styleData.renderControl.w;
-    if (blendMode == 3u) {
-        return vec4(mix(vec3(1.0), color, alpha), alpha);
-    }
-    return vec4(color * alpha, alpha);
+    return mix(1.0, 1.0 - depthNorm, clamp(depthFade, 0.0, 1.0));
 }
 
 void main() {
@@ -112,13 +73,14 @@ void main() {
     }
     float radius = sqrt(radiusSquared);
 
-    vec3 baseColor = ResolveBaseColor();
     float opacity = clamp(inOpacity, 0.0, 1.0);
     float edge = ResolveFalloff(radius, radiusSquared);
-    if (opacity * edge <= 1e-5) {
+    float alpha = clamp(opacity * edge * ResolveDepthFadeAlpha(inDepthFade), 0.0, 0.995);
+    if (alpha <= 1e-5 ||
+        styleData.renderControl.x == 0u ||
+        (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0))) {
         discard;
     }
 
-    float alpha = opacity * edge;
-    outColor = ResolveBlendOutput(ResolveSolidColor(baseColor), alpha);
+    outColor = vec4(0.0);
 }
