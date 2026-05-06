@@ -96,6 +96,14 @@ vec3 ResolveSolidColor(vec3 baseColor) {
     return clamp(shadedColor, 0.0, 1.0);
 }
 
+vec4 ResolveBlendOutput(vec3 color, float alpha) {
+    const uint blendMode = styleData.renderControl.w;
+    if (blendMode == 3u) {
+        return vec4(mix(vec3(1.0), color, alpha), alpha);
+    }
+    return vec4(color * alpha, alpha);
+}
+
 void main() {
     vec2 centered = (gl_PointCoord * 2.0) - 1.0;
     float radiusSquared = dot(centered, centered);
@@ -111,5 +119,6 @@ void main() {
         discard;
     }
 
-    outColor = vec4(ResolveSolidColor(baseColor), opacity * edge);
+    float alpha = opacity * edge;
+    outColor = ResolveBlendOutput(ResolveSolidColor(baseColor), alpha);
 }

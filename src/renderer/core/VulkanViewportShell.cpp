@@ -105,6 +105,28 @@ struct alignas(16) HighQualityGaussianPushConstants {
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
+constexpr std::size_t kPointCloudBlendPipelineCount = 4U;
+
+std::size_t PointCloudBlendPipelineIndex(renderer::pointcloud::PointCloudBlendMode mode) {
+    switch (mode) {
+        case renderer::pointcloud::PointCloudBlendMode::Normal:
+            return 0U;
+        case renderer::pointcloud::PointCloudBlendMode::Additive:
+            return 1U;
+        case renderer::pointcloud::PointCloudBlendMode::Screen:
+            return 2U;
+        case renderer::pointcloud::PointCloudBlendMode::Multiply:
+            return 3U;
+    }
+
+    return 0U;
+}
+
+VkPipeline SelectPointCloudBlendPipeline(
+    const std::array<VkPipeline, kPointCloudBlendPipelineCount>& pipelines,
+    renderer::pointcloud::PointCloudBlendMode mode) {
+    return pipelines[PointCloudBlendPipelineIndex(mode)];
+}
 
 bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, float epsilon = 1.0e-6F) {
     for (int column = 0; column < 4; ++column) {
@@ -438,6 +460,50 @@ VkPipelineColorBlendAttachmentState MakePremultipliedAlphaBlendAttachment() {
     return attachment;
 }
 
+VkPipelineColorBlendAttachmentState MakeScreenBlendAttachment() {
+    VkPipelineColorBlendAttachmentState attachment{};
+    attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    attachment.blendEnable = VK_TRUE;
+    attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    return attachment;
+}
+
+VkPipelineColorBlendAttachmentState MakeMultiplyBlendAttachment() {
+    VkPipelineColorBlendAttachmentState attachment{};
+    attachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    attachment.blendEnable = VK_TRUE;
+    attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    attachment.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR;
+    attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    return attachment;
+}
+
+VkPipelineColorBlendAttachmentState MakePointCloudSolidBlendAttachment(
+    renderer::pointcloud::PointCloudBlendMode mode) {
+    switch (mode) {
+        case renderer::pointcloud::PointCloudBlendMode::Normal:
+            return MakePremultipliedAlphaBlendAttachment();
+        case renderer::pointcloud::PointCloudBlendMode::Additive:
+            return MakeAdditiveBlendAttachment();
+        case renderer::pointcloud::PointCloudBlendMode::Screen:
+            return MakeScreenBlendAttachment();
+        case renderer::pointcloud::PointCloudBlendMode::Multiply:
+            return MakeMultiplyBlendAttachment();
+    }
+
+    return MakePremultipliedAlphaBlendAttachment();
+}
+
 VkShaderModule CreateShaderModule(VkDevice device, const std::vector<char>& code, const char* label) {
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     moduleInfo.codeSize = code.size();
@@ -539,8 +605,10 @@ VulkanViewportShell::~VulkanViewportShell() {
         commandPool_ = VK_NULL_HANDLE;
     }
 
-    if (pointSolidPipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, pointSolidPipeline_, nullptr);
+    for (auto pipeline : pointSolidPipelines_) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device_, pipeline, nullptr);
+        }
     }
     if (pointDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointDepthPrepassPipeline_, nullptr);
@@ -548,8 +616,10 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (pointAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointAccumulationPipeline_, nullptr);
     }
-    if (surfelSolidPipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, surfelSolidPipeline_, nullptr);
+    for (auto pipeline : surfelSolidPipelines_) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device_, pipeline, nullptr);
+        }
     }
     if (surfelDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelDepthPrepassPipeline_, nullptr);
@@ -1806,18 +1876,39 @@ void VulkanViewportShell::CreatePointPipelines() {
             Check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline), label);
         };
 
-    createPointPipeline(
-        vertexStage,
-        vertexInputInfo,
-        inputAssembly,
-        solidFragmentModule,
-        0,
-        std::vector<VkPipelineColorBlendAttachmentState>{MakeAlphaBlendAttachment()},
-        true,
-        true,
-        VK_COMPARE_OP_LESS,
-        "vkCreateGraphicsPipelines(point solid)",
-        &pointSolidPipeline_);
+    const std::array<renderer::pointcloud::PointCloudBlendMode, kPointCloudBlendPipelineCount> solidBlendModes = {
+        renderer::pointcloud::PointCloudBlendMode::Normal,
+        renderer::pointcloud::PointCloudBlendMode::Additive,
+        renderer::pointcloud::PointCloudBlendMode::Screen,
+        renderer::pointcloud::PointCloudBlendMode::Multiply,
+    };
+    const std::array<const char*, kPointCloudBlendPipelineCount> pointSolidPipelineLabels = {
+        "vkCreateGraphicsPipelines(point solid normal)",
+        "vkCreateGraphicsPipelines(point solid add)",
+        "vkCreateGraphicsPipelines(point solid screen)",
+        "vkCreateGraphicsPipelines(point solid multiply)",
+    };
+    const std::array<const char*, kPointCloudBlendPipelineCount> surfelSolidPipelineLabels = {
+        "vkCreateGraphicsPipelines(surfel solid normal)",
+        "vkCreateGraphicsPipelines(surfel solid add)",
+        "vkCreateGraphicsPipelines(surfel solid screen)",
+        "vkCreateGraphicsPipelines(surfel solid multiply)",
+    };
+    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
+        createPointPipeline(
+            vertexStage,
+            vertexInputInfo,
+            inputAssembly,
+            solidFragmentModule,
+            0,
+            std::vector<VkPipelineColorBlendAttachmentState>{
+                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
+            true,
+            true,
+            VK_COMPARE_OP_LESS,
+            pointSolidPipelineLabels[blendIndex],
+            &pointSolidPipelines_[blendIndex]);
+    }
 
     createPointPipeline(
         vertexStage,
@@ -1848,18 +1939,21 @@ void VulkanViewportShell::CreatePointPipelines() {
         "vkCreateGraphicsPipelines(point accumulation)",
         &pointAccumulationPipeline_);
 
-    createPointPipeline(
-        surfelVertexStage,
-        surfelVertexInputInfo,
-        surfelInputAssembly,
-        surfelSolidFragmentModule,
-        0,
-        std::vector<VkPipelineColorBlendAttachmentState>{MakeAlphaBlendAttachment()},
-        true,
-        true,
-        VK_COMPARE_OP_LESS,
-        "vkCreateGraphicsPipelines(surfel solid)",
-        &surfelSolidPipeline_);
+    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
+        createPointPipeline(
+            surfelVertexStage,
+            surfelVertexInputInfo,
+            surfelInputAssembly,
+            surfelSolidFragmentModule,
+            0,
+            std::vector<VkPipelineColorBlendAttachmentState>{
+                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
+            true,
+            true,
+            VK_COMPARE_OP_LESS,
+            surfelSolidPipelineLabels[blendIndex],
+            &surfelSolidPipelines_[blendIndex]);
+    }
 
     createPointPipeline(
         surfelVertexStage,
@@ -2366,18 +2460,39 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         VK_COMPARE_OP_LESS,
         "vkCreateGraphicsPipelines(exr point depth)",
         &resources->pointDepthPipeline);
-    createPointPipeline(
-        vertexStage,
-        vertexInputInfo,
-        inputAssembly,
-        solidFragmentModule,
-        1,
-        std::vector<VkPipelineColorBlendAttachmentState>{MakeAlphaBlendAttachment()},
-        true,
-        false,
-        VK_COMPARE_OP_LESS_OR_EQUAL,
-        "vkCreateGraphicsPipelines(exr point solid)",
-        &resources->pointSolidPipeline);
+    const std::array<renderer::pointcloud::PointCloudBlendMode, kPointCloudBlendPipelineCount> solidBlendModes = {
+        renderer::pointcloud::PointCloudBlendMode::Normal,
+        renderer::pointcloud::PointCloudBlendMode::Additive,
+        renderer::pointcloud::PointCloudBlendMode::Screen,
+        renderer::pointcloud::PointCloudBlendMode::Multiply,
+    };
+    const std::array<const char*, kPointCloudBlendPipelineCount> pointSolidPipelineLabels = {
+        "vkCreateGraphicsPipelines(exr point solid normal)",
+        "vkCreateGraphicsPipelines(exr point solid add)",
+        "vkCreateGraphicsPipelines(exr point solid screen)",
+        "vkCreateGraphicsPipelines(exr point solid multiply)",
+    };
+    const std::array<const char*, kPointCloudBlendPipelineCount> surfelSolidPipelineLabels = {
+        "vkCreateGraphicsPipelines(exr surfel solid normal)",
+        "vkCreateGraphicsPipelines(exr surfel solid add)",
+        "vkCreateGraphicsPipelines(exr surfel solid screen)",
+        "vkCreateGraphicsPipelines(exr surfel solid multiply)",
+    };
+    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
+        createPointPipeline(
+            vertexStage,
+            vertexInputInfo,
+            inputAssembly,
+            solidFragmentModule,
+            1,
+            std::vector<VkPipelineColorBlendAttachmentState>{
+                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
+            true,
+            false,
+            VK_COMPARE_OP_LESS_OR_EQUAL,
+            pointSolidPipelineLabels[blendIndex],
+            &resources->pointSolidPipelines[blendIndex]);
+    }
     createPointPipeline(
         vertexStage,
         vertexInputInfo,
@@ -2406,18 +2521,21 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         VK_COMPARE_OP_LESS,
         "vkCreateGraphicsPipelines(exr surfel depth)",
         &resources->surfelDepthPipeline);
-    createPointPipeline(
-        surfelVertexStage,
-        surfelVertexInputInfo,
-        surfelInputAssembly,
-        surfelSolidFragmentModule,
-        1,
-        std::vector<VkPipelineColorBlendAttachmentState>{MakeAlphaBlendAttachment()},
-        true,
-        false,
-        VK_COMPARE_OP_LESS_OR_EQUAL,
-        "vkCreateGraphicsPipelines(exr surfel solid)",
-        &resources->surfelSolidPipeline);
+    for (std::size_t blendIndex = 0; blendIndex < solidBlendModes.size(); ++blendIndex) {
+        createPointPipeline(
+            surfelVertexStage,
+            surfelVertexInputInfo,
+            surfelInputAssembly,
+            surfelSolidFragmentModule,
+            1,
+            std::vector<VkPipelineColorBlendAttachmentState>{
+                MakePointCloudSolidBlendAttachment(solidBlendModes[blendIndex])},
+            true,
+            false,
+            VK_COMPARE_OP_LESS_OR_EQUAL,
+            surfelSolidPipelineLabels[blendIndex],
+            &resources->surfelSolidPipelines[blendIndex]);
+    }
     createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
@@ -3653,8 +3771,10 @@ void VulkanViewportShell::CleanupExrExportResources() {
     if (resources.pointDepthPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.pointDepthPipeline, nullptr);
     }
-    if (resources.pointSolidPipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, resources.pointSolidPipeline, nullptr);
+    for (auto pipeline : resources.pointSolidPipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device_, pipeline, nullptr);
+        }
     }
     if (resources.pointAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.pointAccumulationPipeline, nullptr);
@@ -3662,8 +3782,10 @@ void VulkanViewportShell::CleanupExrExportResources() {
     if (resources.surfelDepthPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelDepthPipeline, nullptr);
     }
-    if (resources.surfelSolidPipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, resources.surfelSolidPipeline, nullptr);
+    for (auto pipeline : resources.surfelSolidPipelines) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device_, pipeline, nullptr);
+        }
     }
     if (resources.surfelAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelAccumulationPipeline, nullptr);
@@ -3810,7 +3932,7 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         static_cast<std::uint32_t>(layer.style.renderMode),
         static_cast<std::uint32_t>(layer.style.falloffProfile),
         static_cast<std::uint32_t>(layer.style.geometryMode),
-        0U,
+        static_cast<std::uint32_t>(layer.style.blendMode),
     };
     styleGpu.renderParams0 = glm::vec4{
         layer.style.exposure,
@@ -3975,8 +4097,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                 resources.commandBuffer,
                 layer,
                 forceFullSource,
-                resources.pointSolidPipeline,
-                resources.surfelSolidPipeline);
+                SelectPointCloudBlendPipeline(resources.pointSolidPipelines, layer.style.blendMode),
+                SelectPointCloudBlendPipeline(resources.surfelSolidPipelines, layer.style.blendMode));
         }
     }
 
@@ -4092,8 +4214,8 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
                     commandBuffer,
                     layer,
                     false,
-                    pointSolidPipeline_,
-                    surfelSolidPipeline_);
+                    SelectPointCloudBlendPipeline(pointSolidPipelines_, layer.style.blendMode),
+                    SelectPointCloudBlendPipeline(surfelSolidPipelines_, layer.style.blendMode));
             }
         }
 

@@ -855,6 +855,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     invisible_places::renderer::pointcloud::PointCloudStyleState pointStyle;
     pointStyle.geometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
     pointStyle.renderMode = invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray;
+    pointStyle.blendMode = invisible_places::renderer::pointcloud::PointCloudBlendMode::Screen;
     pointStyle.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
     pointStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
     pointStyle.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo;
@@ -951,6 +952,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         loadedLayer.pointStyle->renderMode ==
         invisible_places::renderer::pointcloud::PointCloudRenderMode::DepthXray);
     CHECK(
+        loadedLayer.pointStyle->blendMode ==
+        invisible_places::renderer::pointcloud::PointCloudBlendMode::Screen);
+    CHECK(
         loadedLayer.pointStyle->falloffProfile ==
         invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian);
     CHECK(
@@ -996,6 +1000,7 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
     CHECK(
         preset->style.geometryMode ==
         invisible_places::renderer::pointcloud::PointCloudGeometryMode::ScreenSprites);
+    CHECK(preset->style.blendMode == invisible_places::renderer::pointcloud::PointCloudBlendMode::Normal);
     CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
 
     std::filesystem::remove(presetPath);

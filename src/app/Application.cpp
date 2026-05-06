@@ -48,6 +48,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -65,6 +66,7 @@ namespace {
 
 using LayerKind = invisible_places::scene::LayerKind;
 using PointBudgetState = invisible_places::renderer::pointcloud::PointBudgetState;
+using PointCloudBlendMode = invisible_places::renderer::pointcloud::PointCloudBlendMode;
 using PointCloudStyleState = invisible_places::renderer::pointcloud::PointCloudStyleState;
 using PointCloudColorMode = invisible_places::renderer::pointcloud::PointCloudColorMode;
 using PointCloudColormapId = invisible_places::renderer::pointcloud::PointCloudColormapId;
@@ -575,6 +577,21 @@ const char* PointCloudRenderModeLabel(PointCloudRenderMode mode) {
     return "Unknown";
 }
 
+const char* PointCloudBlendModeLabel(PointCloudBlendMode mode) {
+    switch (mode) {
+        case PointCloudBlendMode::Normal:
+            return "Normal";
+        case PointCloudBlendMode::Additive:
+            return "Add";
+        case PointCloudBlendMode::Screen:
+            return "Screen";
+        case PointCloudBlendMode::Multiply:
+            return "Multiply";
+    }
+
+    return "Unknown";
+}
+
 const char* GaussianSplatColorModeLabel(GaussianSplatColorMode mode) {
     switch (mode) {
         case GaussianSplatColorMode::FullSh:
@@ -944,6 +961,94 @@ bool InputTextString(const char* label, std::string* value) {
         value);
 }
 
+bool DrawSectionHeader(const char* label) {
+    static std::unordered_map<ImGuiID, bool> collapsedSections;
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImGuiID sectionId = ImGui::GetID(label);
+    bool& collapsed = collapsedSections[sectionId];
+    const bool open = !collapsed;
+    const float textHeight = ImGui::GetTextLineHeight();
+    const float rowHeight = textHeight + style.FramePadding.y * 2.0F;
+    const float toggleWidth = 22.0F;
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const ImU32 lineColor = ImGui::GetColorU32(ImGuiCol_Separator);
+    const ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+
+    ImGui::PushID(label);
+    ImGui::InvisibleButton("##section_toggle", ImVec2{toggleWidth, rowHeight});
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        collapsed = !collapsed;
+    }
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const float lineY = cursor.y + rowHeight * 0.5F;
+    const float lineStartX = cursor.x + 3.0F;
+    const float lineEndX = cursor.x + toggleWidth - 3.0F;
+    drawList->AddLine(ImVec2{lineStartX, lineY}, ImVec2{lineEndX, lineY}, lineColor, 2.0F);
+    if (collapsed) {
+        const float centerX = cursor.x + toggleWidth * 0.5F;
+        drawList->AddLine(
+            ImVec2{centerX, cursor.y + 4.0F},
+            ImVec2{centerX, cursor.y + rowHeight - 4.0F},
+            lineColor,
+            2.0F);
+    }
+
+    ImGui::SameLine(0.0F, style.ItemSpacing.x);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(textColor), "%s", label);
+
+    const ImVec2 afterText = ImGui::GetItemRectMax();
+    const float availableEndX = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    const float continuationStartX = afterText.x + style.ItemSpacing.x;
+    if (availableEndX > continuationStartX) {
+        drawList->AddLine(
+            ImVec2{continuationStartX, lineY},
+            ImVec2{availableEndX, lineY},
+            lineColor,
+            2.0F);
+    }
+
+    ImGui::PopID();
+    return open;
+}
+
+bool BeginPanelSection(const char* label) {
+    const bool open = DrawSectionHeader(label);
+    if (open) {
+        ImGui::Spacing();
+    }
+    return open;
+}
+
+void EndPanelSection() {
+    ImGui::Spacing();
+}
+
+bool DrawRightAlignedCombo(
+    const char* label,
+    int* currentItem,
+    const char* const* items,
+    int itemCount,
+    float comboWidth = 210.0F) {
+    if (currentItem == nullptr || items == nullptr || itemCount <= 0) {
+        return false;
+    }
+
+    ImGui::PushID(label);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    const float cursorX = ImGui::GetCursorPosX();
+    const float rightX = ImGui::GetWindowContentRegionMax().x;
+    ImGui::SetCursorPosX(std::max(cursorX, rightX - comboWidth));
+    ImGui::SetNextItemWidth(std::min(comboWidth, ImGui::GetContentRegionAvail().x));
+    const bool changed = ImGui::Combo("##combo", currentItem, items, itemCount);
+    ImGui::PopID();
+    return changed;
+}
+
 struct RangedFloatControlConfig {
     float visualMin = 0.0F;
     float visualMax = 1.0F;
@@ -988,37 +1093,85 @@ bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatCo
     const float visualMax = std::max(config.visualMin, config.visualMax);
     const float visualRange = std::max(visualMax - visualMin, 1.0e-6F);
     const float dragSpeed = config.speed > 0.0F ? config.speed : visualRange / 200.0F;
+    static ImGuiID editingControlId = 0;
+    static ImGuiID focusEditingControlId = 0;
+    static ImGuiID activeDragId = 0;
+    static float activeDragStartValue = 0.0F;
+    static ImVec2 activeDragStartMouse{};
     bool changed = false;
 
     ImGui::PushID(label);
+    const ImGuiID controlId = ImGui::GetID("##range");
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
     ImGui::SameLine();
 
     const ImGuiStyle& style = ImGui::GetStyle();
-    constexpr float inputWidth = 116.0F;
-    const float availableWidth = ImGui::GetContentRegionAvail().x;
-    const float dragWidth = std::max(96.0F, availableWidth - inputWidth - style.ItemSpacing.x);
-    float dragValue = std::clamp(*value, visualMin, visualMax);
-    ImGui::SetNextItemWidth(dragWidth);
-    if (ImGui::DragFloat(
-            "##range",
-            &dragValue,
-            dragSpeed,
-            visualMin,
-            visualMax,
-            config.format,
-            ImGuiSliderFlags_AlwaysClamp)) {
-        changed |= TryAssignRangedFloatValue(value, dragValue, config);
+    const float barWidth = std::max(110.0F, ImGui::GetContentRegionAvail().x);
+    const float frameHeight = ImGui::GetFrameHeight();
+
+    if (editingControlId == controlId) {
+        float inputValue = *value;
+        ImGui::SetNextItemWidth(barWidth);
+        if (focusEditingControlId == controlId) {
+            ImGui::SetKeyboardFocusHere();
+            focusEditingControlId = 0;
+        }
+        if (ImGui::InputFloat("##value", &inputValue, 0.0F, 0.0F, config.format)) {
+            // TODO: surface an "out of range" popup once transient validation UI is structured.
+            changed |= TryAssignRangedFloatValue(value, inputValue, config);
+        }
+        if (ImGui::IsItemDeactivated()) {
+            editingControlId = 0;
+        }
+        ImGui::PopID();
+        return changed;
     }
 
-    ImGui::SameLine(0.0F, style.ItemSpacing.x);
-    float inputValue = *value;
-    ImGui::SetNextItemWidth(inputWidth);
-    if (ImGui::InputFloat("##value", &inputValue, 0.0F, 0.0F, config.format)) {
-        // TODO: surface an "out of range" popup once transient validation UI is structured.
-        changed |= TryAssignRangedFloatValue(value, inputValue, config);
+    const ImVec2 barMin = ImGui::GetCursorScreenPos();
+    const ImVec2 barMax{barMin.x + barWidth, barMin.y + frameHeight};
+    ImGui::InvisibleButton("##range", ImVec2{barWidth, frameHeight});
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        editingControlId = controlId;
+        focusEditingControlId = controlId;
     }
+    if (ImGui::IsItemActivated()) {
+        activeDragId = controlId;
+        activeDragStartValue = std::clamp(*value, visualMin, visualMax);
+        activeDragStartMouse = ImGui::GetIO().MousePos;
+    }
+    if (activeDragId == controlId && ImGui::IsItemActive()) {
+        const float deltaX = ImGui::GetIO().MousePos.x - activeDragStartMouse.x;
+        if (std::abs(deltaX) > 0.0F) {
+            const float candidate = std::clamp(activeDragStartValue + deltaX * dragSpeed, visualMin, visualMax);
+            changed |= TryAssignRangedFloatValue(value, candidate, config);
+        }
+    }
+    if (activeDragId == controlId && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        activeDragId = 0;
+    }
+
+    const float fillT = std::clamp((*value - visualMin) / visualRange, 0.0F, 1.0F);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 frameColor = ImGui::GetColorU32(ImGuiCol_FrameBg);
+    const ImU32 fillColor = ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+    const ImU32 borderColor = ImGui::GetColorU32(ImGuiCol_Border);
+    const ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+    drawList->AddRectFilled(barMin, barMax, frameColor, style.FrameRounding);
+    drawList->AddRectFilled(
+        barMin,
+        ImVec2{barMin.x + barWidth * fillT, barMax.y},
+        fillColor,
+        style.FrameRounding);
+    drawList->AddRect(barMin, barMax, borderColor, style.FrameRounding);
+
+    char valueText[64]{};
+    std::snprintf(valueText, sizeof(valueText), config.format, *value);
+    const ImVec2 textSize = ImGui::CalcTextSize(valueText);
+    drawList->AddText(
+        ImVec2{barMin.x + (barWidth - textSize.x) * 0.5F, barMin.y + (frameHeight - textSize.y) * 0.5F},
+        textColor,
+        valueText);
 
     ImGui::PopID();
     return changed;
@@ -1053,8 +1206,8 @@ std::string BindingFieldLabel(
     return "Select Field";
 }
 
-bool DrawScalarBindingWidget(
-    const char* label,
+bool DrawScalarBindingBody(
+    const char* id,
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
     const ScalarBindingWidgetConfig& config) {
@@ -1063,12 +1216,11 @@ bool DrawScalarBindingWidget(
     }
 
     bool changed = false;
-    ImGui::PushID(label);
-    ImGui::SeparatorText(label);
+    ImGui::PushID(id);
 
     int modeIndex = static_cast<int>(binding->mode);
     const char* modeLabels[] = {"Constant", "Field-Mapped"};
-    if (ImGui::Combo("Mode", &modeIndex, modeLabels, IM_ARRAYSIZE(modeLabels))) {
+    if (DrawRightAlignedCombo("Mode", &modeIndex, modeLabels, IM_ARRAYSIZE(modeLabels))) {
         binding->mode = static_cast<ParameterSourceMode>(modeIndex);
         changed = true;
         if (binding->mode == ParameterSourceMode::FieldMapped) {
@@ -1215,6 +1367,20 @@ bool DrawScalarBindingWidget(
     }
 
     ImGui::PopID();
+    return changed;
+}
+
+bool DrawScalarBindingWidget(
+    const char* label,
+    RenderParameterBinding* binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    const ScalarBindingWidgetConfig& config) {
+    if (!BeginPanelSection(label)) {
+        return false;
+    }
+
+    const bool changed = DrawScalarBindingBody(label, binding, scalarFields, config);
+    EndPanelSection();
     return changed;
 }
 
@@ -3713,7 +3879,9 @@ void DrawAnimationExportSection(
         return;
     }
 
-    ImGui::SeparatorText("Export");
+    if (!BeginPanelSection("Export")) {
+        return;
+    }
     auto& panel = runtimeState->animationPanel;
     auto& settings = runtimeState->renderSettings;
     if (!panel.exportSizeInitialized && viewport != nullptr) {
@@ -3835,6 +4003,7 @@ void DrawAnimationExportSection(
         if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
             RequestOfflineRenderCancellation(&job);
         }
+        EndPanelSection();
         return;
     }
 
@@ -3851,6 +4020,7 @@ void DrawAnimationExportSection(
                 ? "Captures the active animation as a full-cloud H.264 MP4."
                 : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using preview-density point draws.");
     }
+    EndPanelSection();
 }
 
 void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
@@ -4386,7 +4556,9 @@ void DrawLayerSection(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     LayerKind layerKind,
     const char* heading) {
-    ImGui::SeparatorText(heading);
+    if (!BeginPanelSection(heading)) {
+        return;
+    }
 
     const bool hasAnyMatchingLayer = std::any_of(
         runtimeState->sessions.begin(),
@@ -4394,6 +4566,7 @@ void DrawLayerSection(
         [layerKind](const PreviewLayerSession& session) { return session.kind == layerKind; });
     if (!hasAnyMatchingLayer) {
         ImGui::Text("No %s layers were discovered.", LayerKindLabel(layerKind));
+        EndPanelSection();
         return;
     }
 
@@ -4467,6 +4640,7 @@ void DrawLayerSection(
         if (session->kind != layerKind) {
             ImGui::Spacing();
             ImGui::Text("Select a %s layer to edit this panel.", LayerKindLabel(layerKind));
+            EndPanelSection();
             return;
         }
 
@@ -4537,53 +4711,227 @@ void DrawLayerSection(
             }
         }
     }
+    EndPanelSection();
 }
 
-bool DrawPointCloudSizeControl(PreviewLayerSession* session) {
-    if (session == nullptr) {
-        return false;
+ScalarBindingWidgetConfig PointSizeBindingConfig(const PreviewLayerSession& session) {
+    if (session.pointStyle.geometryMode == PointCloudGeometryMode::WorldSurfels) {
+        return {.constantMin = 0.0001F,
+                .constantMax = 0.1F,
+                .defaultOutputMin = 0.0001F,
+                .defaultOutputMax = 0.1F,
+                .defaultConstant = 0.005F,
+                .format = "%.3f",
+                .displayScale = 1000.0F,
+                .hardMin = 0.0F};
     }
 
-    auto& style = session->pointStyle;
-    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels) {
-        return DrawScalarBindingWidget(
-            "Point Size (mm)",
-            &style.surfelDiameter,
-            session->scalarFields,
-            {.constantMin = 0.0001F,
-             .constantMax = 0.1F,
-             .defaultOutputMin = 0.0001F,
-             .defaultOutputMax = 0.1F,
-             .defaultConstant = 0.005F,
-             .format = "%.3f",
-             .displayScale = 1000.0F,
-             .hardMin = 0.0F});
-    }
-
-    return DrawScalarBindingWidget(
-        "Point Size (px)",
-        &style.pointSize,
-        session->scalarFields,
-        {.constantMin = 1.0F,
-         .constantMax = 16.0F,
-         .defaultOutputMin = 1.0F,
-         .defaultOutputMax = 16.0F,
-         .defaultConstant = 2.0F,
-         .format = "%.2f",
-         .hardMin = 0.0F});
+    return {.constantMin = 1.0F,
+            .constantMax = 16.0F,
+            .defaultOutputMin = 1.0F,
+            .defaultOutputMax = 16.0F,
+            .defaultConstant = 2.0F,
+            .format = "%.2f",
+            .hardMin = 0.0F};
 }
 
-bool DrawPointCloudRenderModeControls(PreviewLayerSession* session) {
+RenderParameterBinding* PointSizeBinding(PreviewLayerSession* session) {
     if (session == nullptr) {
+        return nullptr;
+    }
+    return session->pointStyle.geometryMode == PointCloudGeometryMode::WorldSurfels
+               ? &session->pointStyle.surfelDiameter
+               : &session->pointStyle.pointSize;
+}
+
+PointCloudFalloffProfile EffectivePointFalloffProfile(const PointCloudStyleState& style) {
+    if (style.renderMode == PointCloudRenderMode::EmissiveHard) {
+        return PointCloudFalloffProfile::HardDisc;
+    }
+    if (style.renderMode == PointCloudRenderMode::GaussianPointSprite) {
+        return PointCloudFalloffProfile::Gaussian;
+    }
+    return style.falloffProfile;
+}
+
+bool DrawPointCloudPointSettingsSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Point Settings")) {
         return false;
     }
 
     auto& style = session->pointStyle;
     bool changed = false;
+    int geometryModeIndex = static_cast<int>(style.geometryMode);
+    const char* geometryModes[] = {"Screen Sprites", "World Surfels"};
+    if (DrawRightAlignedCombo("Geometry", &geometryModeIndex, geometryModes, IM_ARRAYSIZE(geometryModes))) {
+        style.geometryMode = static_cast<PointCloudGeometryMode>(geometryModeIndex);
+        changed = true;
+    }
+    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels && !session->hasNormals) {
+        ImGui::TextDisabled("No normals were loaded; surfels face the camera.");
+    }
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted(
+        style.geometryMode == PointCloudGeometryMode::WorldSurfels ? "Point Size (mm)" : "Point Size (px)");
+    changed |= DrawScalarBindingBody(
+        "Point Size",
+        PointSizeBinding(session),
+        session->scalarFields,
+        PointSizeBindingConfig(*session));
+    EndPanelSection();
+    return changed;
+}
+
+bool DrawPointCloudColourSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Colour")) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    int colorModeIndex = static_cast<int>(style.colorMode);
+    const char* colorModes[] = {"Source RGB", "Solid Color", "Scalar Colormap"};
+    if (DrawRightAlignedCombo("Colour Source", &colorModeIndex, colorModes, IM_ARRAYSIZE(colorModes))) {
+        style.colorMode = static_cast<PointCloudColorMode>(colorModeIndex);
+        changed = true;
+        if (style.colorMode == PointCloudColorMode::ScalarColormap) {
+            EnsureFieldMappedBindingDefaults(&style.colormapPosition, session->scalarFields, 0.0F, 1.0F);
+        }
+    }
+    if (!session->hasSourceRgb && style.colorMode == PointCloudColorMode::SourceRgb) {
+        ImGui::TextDisabled("Source RGB is not available on this file.");
+    }
+
+    if (style.colorMode == PointCloudColorMode::SolidColor) {
+        changed |= ImGui::ColorEdit4("Solid Color", style.solidColor.data());
+    }
+
+    if (style.colorMode == PointCloudColorMode::ScalarColormap && !session->scalarFields.empty()) {
+        int colormapIndex = static_cast<int>(style.colormap);
+        const char* colormaps[] = {"Viridis", "Plasma", "Inferno", "Magma", "Cividis", "Turbo"};
+        if (DrawRightAlignedCombo("Colormap", &colormapIndex, colormaps, IM_ARRAYSIZE(colormaps))) {
+            style.colormap = static_cast<PointCloudColormapId>(colormapIndex);
+            changed = true;
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Colormap Position");
+        changed |= DrawScalarBindingBody(
+            "Colormap Position",
+            &style.colormapPosition,
+            session->scalarFields,
+            {.constantMin = 0.0F,
+             .constantMax = 1.0F,
+             .defaultOutputMin = 0.0F,
+             .defaultOutputMax = 1.0F,
+             .defaultConstant = 0.5F,
+             .format = "%.3f",
+             .hardMin = 0.0F,
+             .hardMax = 1.0F});
+    } else if (style.colorMode == PointCloudColorMode::ScalarColormap) {
+        ImGui::TextDisabled("No scalar fields were discovered for this cloud.");
+    }
+
+    EndPanelSection();
+    return changed;
+}
+
+bool DrawPointCloudFalloffSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Point Falloff")) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    int falloffIndex = static_cast<int>(style.falloffProfile);
+    const char* falloffProfiles[] = {"Hard Disc", "Soft Disc", "Gaussian", "Rim"};
+    if (DrawRightAlignedCombo("Profile", &falloffIndex, falloffProfiles, IM_ARRAYSIZE(falloffProfiles))) {
+        style.falloffProfile = static_cast<PointCloudFalloffProfile>(falloffIndex);
+        changed = true;
+    }
+
+    const auto effectiveFalloff = EffectivePointFalloffProfile(style);
+    if (style.renderMode == PointCloudRenderMode::EmissiveHard) {
+        ImGui::TextDisabled("Emissive Hard renders with hard-disc falloff.");
+    } else if (style.renderMode == PointCloudRenderMode::GaussianPointSprite) {
+        ImGui::TextDisabled("Gaussian Point Sprite renders with gaussian falloff.");
+    }
+
+    if (effectiveFalloff == PointCloudFalloffProfile::SoftDisc) {
+        changed |= DrawRangedFloatControl(
+            "Inner Radius",
+            &style.innerRadius,
+            {.visualMin = 0.0F, .visualMax = 0.99F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 0.99F});
+    } else if (effectiveFalloff == PointCloudFalloffProfile::Gaussian) {
+        changed |= DrawRangedFloatControl(
+            "Gaussian Sharpness",
+            &style.gaussianSharpness,
+            {.visualMin = 0.1F, .visualMax = 16.0F, .format = "%.2f", .hardMin = 0.001F});
+    } else if (effectiveFalloff == PointCloudFalloffProfile::Rim) {
+        changed |= DrawRangedFloatControl(
+            "Feather Power",
+            &style.featherPower,
+            {.visualMin = 0.1F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.001F});
+    }
+
+    EndPanelSection();
+    return changed;
+}
+
+bool DrawVisualBindingSection(
+    const char* sectionLabel,
+    const char* id,
+    RenderParameterBinding* binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    const ScalarBindingWidgetConfig& config) {
+    if (!BeginPanelSection(sectionLabel)) {
+        return false;
+    }
+    const bool changed = DrawScalarBindingBody(id, binding, scalarFields, config);
+    EndPanelSection();
+    return changed;
+}
+
+bool DrawPointCloudRendererSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Renderer")) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    int renderModeIndex = static_cast<int>(style.renderMode);
+    const char* renderModes[] = {
+        "Solid",
+        "Emissive Hard",
+        "Emissive Feathered",
+        "Depth X-Ray",
+        "Weighted Transparent",
+        "Compute Density",
+        "Gaussian Point Sprite",
+    };
+    if (DrawRightAlignedCombo("Mode", &renderModeIndex, renderModes, IM_ARRAYSIZE(renderModes))) {
+        style.renderMode = static_cast<PointCloudRenderMode>(renderModeIndex);
+        changed = true;
+    }
 
     switch (style.renderMode) {
         case PointCloudRenderMode::Solid:
-            changed |= DrawScalarBindingWidget(
+        {
+            int blendModeIndex = static_cast<int>(style.blendMode);
+            const char* blendModes[] = {
+                PointCloudBlendModeLabel(PointCloudBlendMode::Normal),
+                PointCloudBlendModeLabel(PointCloudBlendMode::Additive),
+                PointCloudBlendModeLabel(PointCloudBlendMode::Screen),
+                PointCloudBlendModeLabel(PointCloudBlendMode::Multiply),
+            };
+            if (DrawRightAlignedCombo("Blend", &blendModeIndex, blendModes, IM_ARRAYSIZE(blendModes))) {
+                style.blendMode = static_cast<PointCloudBlendMode>(blendModeIndex);
+                changed = true;
+            }
+
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Depth Fade");
+            changed |= DrawScalarBindingBody(
                 "Depth Fade",
                 &style.depthFade,
                 session->scalarFields,
@@ -4596,76 +4944,15 @@ bool DrawPointCloudRenderModeControls(PreviewLayerSession* session) {
                  .hardMin = 0.0F,
                  .hardMax = 1.0F});
             break;
+        }
         case PointCloudRenderMode::EmissiveHard:
-            changed |= DrawScalarBindingWidget(
-                "Emissive",
-                &style.emissiveStrength,
-                session->scalarFields,
-                {.constantMin = 0.0F,
-                 .constantMax = 2.5F,
-                 .defaultOutputMin = 0.0F,
-                 .defaultOutputMax = 2.5F,
-                 .defaultConstant = 0.0F,
-                 .format = "%.2f",
-                 .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Exposure",
-                &style.exposure,
-                {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            break;
         case PointCloudRenderMode::EmissiveFeathered:
-            changed |= DrawScalarBindingWidget(
-                "Emissive",
-                &style.emissiveStrength,
-                session->scalarFields,
-                {.constantMin = 0.0F,
-                 .constantMax = 2.5F,
-                 .defaultOutputMin = 0.0F,
-                 .defaultOutputMax = 2.5F,
-                 .defaultConstant = 0.0F,
-                 .format = "%.2f",
-                 .hardMin = 0.0F});
             changed |= DrawRangedFloatControl(
                 "Exposure",
                 &style.exposure,
                 {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-            changed |= DrawRangedFloatControl(
-                "Inner Radius",
-                &style.innerRadius,
-                {.visualMin = 0.0F, .visualMax = 0.99F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 0.99F});
-            changed |= DrawRangedFloatControl(
-                "Gaussian Sharpness",
-                &style.gaussianSharpness,
-                {.visualMin = 0.1F, .visualMax = 16.0F, .format = "%.2f", .hardMin = 0.001F});
-            changed |= DrawRangedFloatControl(
-                "Feather Power",
-                &style.featherPower,
-                {.visualMin = 0.1F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.001F});
             break;
         case PointCloudRenderMode::DepthXray:
-            changed |= DrawScalarBindingWidget(
-                "X-Ray",
-                &style.xrayStrength,
-                session->scalarFields,
-                {.constantMin = 0.0F,
-                 .constantMax = 1.0F,
-                 .defaultOutputMin = 0.0F,
-                 .defaultOutputMax = 1.0F,
-                 .defaultConstant = 0.0F,
-                 .format = "%.2f",
-                 .hardMin = 0.0F,
-                 .hardMax = 1.0F});
-            changed |= DrawScalarBindingWidget(
-                "Emissive",
-                &style.emissiveStrength,
-                session->scalarFields,
-                {.constantMin = 0.0F,
-                 .constantMax = 2.5F,
-                 .defaultOutputMin = 0.0F,
-                 .defaultOutputMax = 2.5F,
-                 .defaultConstant = 0.0F,
-                 .format = "%.2f",
-                 .hardMin = 0.0F});
             changed |= DrawRangedFloatControl(
                 "Exposure",
                 &style.exposure,
@@ -4710,10 +4997,6 @@ bool DrawPointCloudRenderModeControls(PreviewLayerSession* session) {
             break;
         case PointCloudRenderMode::GaussianPointSprite:
             changed |= DrawRangedFloatControl(
-                "Gaussian Sharpness",
-                &style.gaussianSharpness,
-                {.visualMin = 0.1F, .visualMax = 16.0F, .format = "%.2f", .hardMin = 0.001F});
-            changed |= DrawRangedFloatControl(
                 "Density Scale",
                 &style.densityScale,
                 {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
@@ -4724,48 +5007,7 @@ bool DrawPointCloudRenderModeControls(PreviewLayerSession* session) {
             break;
     }
 
-    return changed;
-}
-
-bool DrawPointCloudRenderModeTabs(PreviewLayerSession* session) {
-    if (session == nullptr) {
-        return false;
-    }
-
-    auto& style = session->pointStyle;
-    bool changed = false;
-    constexpr std::array<PointCloudRenderMode, 7> renderModes{
-        PointCloudRenderMode::Solid,
-        PointCloudRenderMode::EmissiveHard,
-        PointCloudRenderMode::EmissiveFeathered,
-        PointCloudRenderMode::DepthXray,
-        PointCloudRenderMode::WeightedTransparent,
-        PointCloudRenderMode::ComputeDensity,
-        PointCloudRenderMode::GaussianPointSprite,
-    };
-
-    ImGui::SeparatorText("Render Mode");
-    if (ImGui::BeginTabBar("PointCloudRenderModeTabs")) {
-        for (const auto renderMode : renderModes) {
-            const auto flags =
-                style.renderMode == renderMode ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-            const bool tabOpen = ImGui::BeginTabItem(PointCloudRenderModeLabel(renderMode), nullptr, flags);
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && style.renderMode != renderMode) {
-                style.renderMode = renderMode;
-                changed = true;
-            }
-            if (tabOpen) {
-                if (style.renderMode != renderMode) {
-                    style.renderMode = renderMode;
-                    changed = true;
-                }
-                changed |= DrawPointCloudRenderModeControls(session);
-                ImGui::EndTabItem();
-            }
-        }
-        ImGui::EndTabBar();
-    }
-
+    EndPanelSection();
     return changed;
 }
 
@@ -4773,65 +5015,11 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
     auto& style = session->pointStyle;
     bool changed = false;
 
-    int geometryModeIndex = static_cast<int>(style.geometryMode);
-    const char* geometryModes[] = {"Screen Sprites", "World Surfels"};
-    if (ImGui::Combo("Geometry", &geometryModeIndex, geometryModes, IM_ARRAYSIZE(geometryModes))) {
-        style.geometryMode = static_cast<PointCloudGeometryMode>(geometryModeIndex);
-        changed = true;
-    }
-    if (style.geometryMode == PointCloudGeometryMode::WorldSurfels && !session->hasNormals) {
-        ImGui::TextDisabled("No normals were loaded; surfels face the camera.");
-    }
-
-    int falloffIndex = static_cast<int>(style.falloffProfile);
-    const char* falloffProfiles[] = {"Hard Disc", "Soft Disc", "Gaussian", "Rim"};
-    if (ImGui::Combo("Point Falloff", &falloffIndex, falloffProfiles, IM_ARRAYSIZE(falloffProfiles))) {
-        style.falloffProfile = static_cast<PointCloudFalloffProfile>(falloffIndex);
-        changed = true;
-    }
-
-    int colorModeIndex = static_cast<int>(style.colorMode);
-    const char* colorModes[] = {"Source RGB", "Solid Color", "Scalar Colormap"};
-    if (ImGui::Combo("Color Source", &colorModeIndex, colorModes, IM_ARRAYSIZE(colorModes))) {
-        style.colorMode = static_cast<PointCloudColorMode>(colorModeIndex);
-        changed = true;
-        if (style.colorMode == PointCloudColorMode::ScalarColormap) {
-            EnsureFieldMappedBindingDefaults(&style.colormapPosition, session->scalarFields, 0.0F, 1.0F);
-        }
-    }
-    if (!session->hasSourceRgb && style.colorMode == PointCloudColorMode::SourceRgb) {
-        ImGui::TextDisabled("Source RGB is not available on this file.");
-    }
-
-    if (style.colorMode == PointCloudColorMode::SolidColor) {
-        changed |= ImGui::ColorEdit4("Solid Color", style.solidColor.data());
-    }
-
-    if (style.colorMode == PointCloudColorMode::ScalarColormap && !session->scalarFields.empty()) {
-        int colormapIndex = static_cast<int>(style.colormap);
-        const char* colormaps[] = {"Viridis", "Plasma", "Inferno", "Magma", "Cividis", "Turbo"};
-        if (ImGui::Combo("Colormap", &colormapIndex, colormaps, IM_ARRAYSIZE(colormaps))) {
-            style.colormap = static_cast<PointCloudColormapId>(colormapIndex);
-            changed = true;
-        }
-        changed |= DrawScalarBindingWidget(
-            "Colormap Position",
-            &style.colormapPosition,
-            session->scalarFields,
-            {.constantMin = 0.0F,
-             .constantMax = 1.0F,
-             .defaultOutputMin = 0.0F,
-             .defaultOutputMax = 1.0F,
-             .defaultConstant = 0.5F,
-             .format = "%.3f",
-             .hardMin = 0.0F,
-             .hardMax = 1.0F});
-    } else if (style.colorMode == PointCloudColorMode::ScalarColormap) {
-        ImGui::TextDisabled("No scalar fields were discovered for this cloud.");
-    }
-
-    changed |= DrawPointCloudSizeControl(session);
-    changed |= DrawScalarBindingWidget(
+    changed |= DrawPointCloudPointSettingsSection(session);
+    changed |= DrawPointCloudColourSection(session);
+    changed |= DrawPointCloudFalloffSection(session);
+    changed |= DrawVisualBindingSection(
+        "Opacity",
         "Opacity",
         &style.opacity,
         session->scalarFields,
@@ -4843,7 +5031,32 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .format = "%.2f",
          .hardMin = 0.0F,
          .hardMax = 1.0F});
-    changed |= DrawPointCloudRenderModeTabs(session);
+    changed |= DrawVisualBindingSection(
+        "Emission",
+        "Emission",
+        &style.emissiveStrength,
+        session->scalarFields,
+        {.constantMin = 0.0F,
+         .constantMax = 2.5F,
+         .defaultOutputMin = 0.0F,
+         .defaultOutputMax = 2.5F,
+         .defaultConstant = 0.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F});
+    changed |= DrawVisualBindingSection(
+        "X-Ray",
+        "X-Ray",
+        &style.xrayStrength,
+        session->scalarFields,
+        {.constantMin = 0.0F,
+         .constantMax = 1.0F,
+         .defaultOutputMin = 0.0F,
+         .defaultOutputMax = 1.0F,
+         .defaultConstant = 0.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+    changed |= DrawPointCloudRendererSection(session);
 
     if (changed) {
         SanitizePointCloudStyle(session);
@@ -4896,11 +5109,14 @@ void DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
 }
 
 void DrawStyleSection(PreviewRuntimeState* runtimeState) {
-    ImGui::SeparatorText("Style");
+    if (!BeginPanelSection("Style")) {
+        return;
+    }
 
     auto* session = SelectedLoadedSession(runtimeState);
     if (session == nullptr) {
         ImGui::TextUnformatted("Select a loaded layer to edit lookdev.");
+        EndPanelSection();
         return;
     }
 
@@ -4915,59 +5131,61 @@ void DrawStyleSection(PreviewRuntimeState* runtimeState) {
         }
         DrawGaussianSplatStyleSection(session);
     }
+    EndPanelSection();
 }
 
 void DrawCameraSection(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
-    ImGui::SeparatorText("Camera");
-
     auto* session = SelectedLoadedSession(runtimeState);
-    const auto target = runtimeState->camera.Target();
-    const auto pivot = runtimeState->camera.OrbitCenter();
-    ImGui::Text("Target: %.3f  %.3f  %.3f", target.x, target.y, target.z);
-    ImGui::Text("Pivot: %.3f  %.3f  %.3f", pivot.x, pivot.y, pivot.z);
-    bool showPivotMarker = runtimeState->pivotOverlay.visible;
-    if (ImGui::Checkbox("Show Pivot Marker", &showPivotMarker)) {
-        runtimeState->pivotOverlay.visible = showPivotMarker;
-        runtimeState->pivotOverlay.pivot = FromGlm(pivot);
-        runtimeState->pivotOverlay.lastSetAt =
-            showPivotMarker ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (BeginPanelSection("Camera")) {
+        const auto target = runtimeState->camera.Target();
+        const auto pivot = runtimeState->camera.OrbitCenter();
+        ImGui::Text("Target: %.3f  %.3f  %.3f", target.x, target.y, target.z);
+        ImGui::Text("Pivot: %.3f  %.3f  %.3f", pivot.x, pivot.y, pivot.z);
+        bool showPivotMarker = runtimeState->pivotOverlay.visible;
+        if (ImGui::Checkbox("Show Pivot Marker", &showPivotMarker)) {
+            runtimeState->pivotOverlay.visible = showPivotMarker;
+            runtimeState->pivotOverlay.pivot = FromGlm(pivot);
+            runtimeState->pivotOverlay.lastSetAt =
+                showPivotMarker ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        }
+        ImGui::Text("Distance: %.3f", runtimeState->camera.Distance());
+        ImGui::Text("FOV: %.1f", runtimeState->camera.FovDegrees());
+        ImGui::Text(
+            "Near/Far: %.4f / %.1f",
+            runtimeState->camera.NearPlane(),
+            runtimeState->camera.FarPlane());
+
+        if (session == nullptr || !runtimeState->camera.HasFramedBounds()) {
+            ImGui::TextUnformatted("Select a loaded layer to frame the camera.");
+        } else {
+            if (ImGui::Button("Focus Selected Layer")) {
+                FocusSessionLayer(runtimeState, viewport, runtimeState->selectedSessionIndex.value());
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pivot Center")) {
+                SetCameraPivotFromScreenPoint(
+                    runtimeState,
+                    viewport,
+                    CurrentUiViewportCenter(viewport));
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Infer an orbit pivot from visible samples near the screen center.");
+            }
+
+            const auto effectiveFrame = ComputeEffectiveLayerFrame(*runtimeState, *session);
+            ImGui::Text("Bounds valid: %s", effectiveFrame.bounds.valid ? "yes" : "no");
+            if (session->kind == LayerKind::GaussianSplat) {
+                ImGui::Text(
+                    "Convention: %s",
+                    GsplatTransformConventionLabel(runtimeState->projectSettings.gsplatTransformConvention));
+            }
+        }
+        EndPanelSection();
     }
-    ImGui::Text("Distance: %.3f", runtimeState->camera.Distance());
-    ImGui::Text("FOV: %.1f", runtimeState->camera.FovDegrees());
-    ImGui::Text(
-        "Near/Far: %.4f / %.1f",
-        runtimeState->camera.NearPlane(),
-        runtimeState->camera.FarPlane());
 
-    if (session == nullptr || !runtimeState->camera.HasFramedBounds()) {
-        ImGui::TextUnformatted("Select a loaded layer to frame the camera.");
-    } else {
-        if (ImGui::Button("Focus Selected Layer")) {
-            FocusSessionLayer(runtimeState, viewport, runtimeState->selectedSessionIndex.value());
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Pivot Center")) {
-            SetCameraPivotFromScreenPoint(
-                runtimeState,
-                viewport,
-                CurrentUiViewportCenter(viewport));
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Infer an orbit pivot from visible samples near the screen center.");
-        }
-
-        const auto effectiveFrame = ComputeEffectiveLayerFrame(*runtimeState, *session);
-        ImGui::Text("Bounds valid: %s", effectiveFrame.bounds.valid ? "yes" : "no");
-        if (session->kind == LayerKind::GaussianSplat) {
-            ImGui::Text(
-                "Convention: %s",
-                GsplatTransformConventionLabel(runtimeState->projectSettings.gsplatTransformConvention));
-        }
-    }
-
-    ImGui::SeparatorText("Shots");
+    if (BeginPanelSection("Shots")) {
     EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
 
     InputTextString("Shot Name", &runtimeState->cameraPanel.draftShotName);
@@ -4984,6 +5202,7 @@ void DrawCameraSection(
 
     if (runtimeState->cameraShots.empty()) {
         ImGui::TextUnformatted("No camera shots saved yet.");
+        EndPanelSection();
         return;
     }
 
@@ -5027,8 +5246,12 @@ void DrawCameraSection(
             }
         }
     }
+    EndPanelSection();
+    }
 
-    ImGui::SeparatorText("Camera Path");
+    if (!BeginPanelSection("Camera Path")) {
+        return;
+    }
     int pathDurationFrames = static_cast<int>(runtimeState->cameraPanel.pathDurationFrames);
     if (ImGui::InputInt("Full Duration Frames", &pathDurationFrames)) {
         runtimeState->cameraPanel.pathDurationFrames =
@@ -5144,6 +5367,7 @@ void DrawCameraSection(
         }
     }
 
+    EndPanelSection();
 }
 
 void DrawAnimationSection(
@@ -5153,8 +5377,8 @@ void DrawAnimationSection(
         return;
     }
 
-    ImGui::SeparatorText("Animation");
     auto& panel = runtimeState->animationPanel;
+    if (BeginPanelSection("Animation")) {
     if (InputTextString("Animation Name", &panel.draftAnimationName) && panel.currentPath.has_value()) {
         panel.currentPath->name = panel.draftAnimationName;
         panel.dirty = true;
@@ -5204,6 +5428,8 @@ void DrawAnimationSection(
             }
         }
     }
+    EndPanelSection();
+    }
 
     if (!panel.currentPath.has_value()) {
         ImGui::TextDisabled("Load an animation or save the Camera path as an animation.");
@@ -5213,7 +5439,7 @@ void DrawAnimationSection(
     auto& animationPath = panel.currentPath.value();
     animationPath.name = panel.draftAnimationName.empty() ? animationPath.name : panel.draftAnimationName;
 
-    ImGui::SeparatorText("Current Path");
+    if (BeginPanelSection("Current Path")) {
     ImGui::Text("File: %s", panel.currentFilePath.empty() ? "unsaved" : panel.currentFilePath.c_str());
     ImGui::Text("Keys: %zu", animationPath.keys.size());
 
@@ -5307,6 +5533,8 @@ void DrawAnimationSection(
         ImGui::SameLine();
         ImGui::TextDisabled("Modified");
     }
+    EndPanelSection();
+    }
 
     DrawAnimationExportSection(runtimeState, &viewport);
 
@@ -5314,7 +5542,9 @@ void DrawAnimationSection(
         return;
     }
 
-    ImGui::SeparatorText("Keys");
+    if (!BeginPanelSection("Keys")) {
+        return;
+    }
     const char* editTargetLabels[] = {"Camera", "Focus"};
     int editTargetIndex = panel.editTarget == AnimationEditTarget::Camera ? 0 : 1;
     if (ImGui::Combo("Edit Target", &editTargetIndex, editTargetLabels, 2)) {
@@ -5339,6 +5569,7 @@ void DrawAnimationSection(
     }
 
     if (!panel.selectedKeyIndex.has_value() || panel.selectedKeyIndex.value() >= animationPath.keys.size()) {
+        EndPanelSection();
         return;
     }
 
@@ -5359,12 +5590,15 @@ void DrawAnimationSection(
             {focusPoint[0], focusPoint[1], focusPoint[2]});
         panel.dirty = true;
     }
+    EndPanelSection();
 }
 
 void DrawSettingsSection(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
-    ImGui::SeparatorText("gSplat Settings");
+    if (!BeginPanelSection("gSplat Settings")) {
+        return;
+    }
 
     auto& settings = runtimeState->projectSettings;
     ImGui::Checkbox(
@@ -5442,12 +5676,15 @@ void DrawSettingsSection(
             session->localToWorld.At(2, 3));
         ImGui::TextDisabled("A negative determinant indicates a handedness flip.");
     }
+    EndPanelSection();
 }
 
 void DrawProjectSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    ImGui::SeparatorText("Project");
+    if (!BeginPanelSection("Project")) {
+        return;
+    }
 
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
     if (ImGui::Button("Save Project")) {
@@ -5484,15 +5721,19 @@ void DrawProjectSection(
     if (runtimeState->pendingLoad.has_value()) {
         ImGui::TextDisabled("Project load waits for the current background layer load to finish.");
     }
+    EndPanelSection();
 }
 
 void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
-    ImGui::SeparatorText("Presets");
+    if (!BeginPanelSection("Presets")) {
+        return;
+    }
 
     InputTextString("Point Style Preset", &runtimeState->persistence.pointStylePresetPath);
 
     if (session == nullptr || session->kind != LayerKind::PointCloud) {
         ImGui::TextUnformatted("Select a point cloud layer to save or load a point style preset.");
+        EndPanelSection();
         return;
     }
 
@@ -5532,6 +5773,7 @@ void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* s
             runtimeState->errorMessage.clear();
         }
     }
+    EndPanelSection();
 }
 
 PreviewLayerSession* DrawVisiblePointCloudLookdevSelector(PreviewRuntimeState* runtimeState) {
@@ -5574,8 +5816,13 @@ void DrawLidarPanel(
 }
 
 void DrawVisualsPanel(PreviewRuntimeState* runtimeState) {
-    ImGui::SeparatorText("LiDAR Visuals");
-    auto* session = DrawVisiblePointCloudLookdevSelector(runtimeState);
+    const auto visualIndex = runtimeState != nullptr ? ResolveVisiblePointCloudLookdevIndex(*runtimeState) : std::nullopt;
+    PreviewLayerSession* session =
+        visualIndex.has_value() ? &runtimeState->sessions[visualIndex.value()] : nullptr;
+    if (BeginPanelSection("Cloud Visuals")) {
+        session = DrawVisiblePointCloudLookdevSelector(runtimeState);
+        EndPanelSection();
+    }
     if (session == nullptr) {
         ImGui::TextUnformatted("Load and show a lidar layer to edit its visual settings.");
         return;
@@ -5590,8 +5837,8 @@ void DrawGsplatPanel(
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     DrawLayerSection(runtimeState, viewport, LayerKind::GaussianSplat, "gSplat Layers");
     ImGui::Spacing();
-    ImGui::SeparatorText("gSplat Visuals");
-    if (auto* session = SelectedLoadedSessionOfKind(runtimeState, LayerKind::GaussianSplat); session != nullptr) {
+    if (BeginPanelSection("gSplat Visuals")) {
+        if (auto* session = SelectedLoadedSessionOfKind(runtimeState, LayerKind::GaussianSplat); session != nullptr) {
         const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
         if (effectiveQuality != session->gsplatStyle.qualityMode) {
             ImGui::TextDisabled(
@@ -5599,8 +5846,10 @@ void DrawGsplatPanel(
                 GaussianSplatQualityModeLabel(effectiveQuality));
         }
         DrawGaussianSplatStyleSection(session);
-    } else {
+        } else {
         ImGui::TextUnformatted("Select and load a gSplat layer to edit its visual settings.");
+        }
+        EndPanelSection();
     }
 
     DrawSettingsSection(runtimeState, *viewport);
@@ -5609,7 +5858,7 @@ void DrawGsplatPanel(
 void DrawProjectPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    ImGui::SeparatorText("Project Settings");
+    if (BeginPanelSection("Project Settings")) {
     auto& settings = runtimeState->projectSettings;
     ImGui::ColorEdit3("Background Color", settings.backgroundColor.data());
     ImGui::Checkbox("Show Status Overlay", &settings.showStatusOverlay);
@@ -5627,6 +5876,8 @@ void DrawProjectPanel(
         ImGui::SetTooltip("Auto mode uses the cached 10M point LOD only while the camera is moving.");
     }
     ImGui::TextDisabled("Point LOD Target: %s", FormatPointCount(kPointCloudPreviewLodTarget).c_str());
+    EndPanelSection();
+    }
     DrawProjectSection(runtimeState, viewport);
 }
 
@@ -5674,58 +5925,68 @@ void DrawRenderInfoSection(
         return;
     }
 
-    ImGui::SeparatorText("Render Info");
-    if (!runtimeState->errorMessage.empty()) {
-        ImGui::TextColored(ImVec4{0.74F, 0.18F, 0.14F, 1.0F}, "%s", runtimeState->errorMessage.c_str());
-    } else if (!runtimeState->statusMessage.empty()) {
-        ImGui::TextWrapped("%s", runtimeState->statusMessage.c_str());
-    } else {
-        ImGui::TextDisabled("Ready.");
-    }
-
-    const auto& diagnostics = viewport.Diagnostics();
-    const auto viewportSize = CurrentUiViewportSize(viewport);
-    ImGui::Text("Render window: %.0f x %.0f UI, %u x %u framebuffer", viewportSize.x, viewportSize.y, viewport.Width(), viewport.Height());
-    if (!diagnostics.rendererName.empty()) {
-        ImGui::Text("GPU: %s", diagnostics.rendererName.c_str());
-    }
-    if (diagnostics.pointCount > 0) {
-        ImGui::Text("Points: %s", FormatPointCount(diagnostics.pointCount).c_str());
-        ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
-        if (!diagnostics.pointRenderModes.empty()) {
-            ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
-        }
-    }
-
-    ImGui::Separator();
-    ImGui::Text("Loaded layers: %s", FormatPointCount(LoadedLayerCount(*runtimeState)).c_str());
-    ImGui::Text("Visible layers: %s", FormatPointCount(VisibleLayerCount(*runtimeState)).c_str());
-    if (const auto* session = SelectedLoadedSession(*runtimeState); session != nullptr) {
-        ImGui::Text("Selected: %s", session->displayName.c_str());
-        ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
-        if (session->kind == LayerKind::PointCloud) {
-            ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
-            ImGui::Text(
-                "%s: %s",
-                PointCloudPreviewLodApplied(*runtimeState, *session) ? "Preview LOD" : "Preview",
-                DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
-            ImGui::Text(
-                "LOD Mode: %s",
-                PointCloudPreviewLodModeLabel(runtimeState->projectSettings.pointCloudPreviewLodMode));
+    if (BeginPanelSection("Render Info")) {
+        if (!runtimeState->errorMessage.empty()) {
+            ImGui::TextColored(ImVec4{0.74F, 0.18F, 0.14F, 1.0F}, "%s", runtimeState->errorMessage.c_str());
+        } else if (!runtimeState->statusMessage.empty()) {
+            ImGui::TextWrapped("%s", runtimeState->statusMessage.c_str());
         } else {
-            const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
-            ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
-            if (effectiveQuality != session->gsplatStyle.qualityMode) {
-                ImGui::Text("Rendering: %s while interacting", GaussianSplatQualityModeLabel(effectiveQuality));
-            }
-            ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
+            ImGui::TextDisabled("Ready.");
         }
+
+        const auto& diagnostics = viewport.Diagnostics();
+        const auto viewportSize = CurrentUiViewportSize(viewport);
+        ImGui::Text(
+            "Render window: %.0f x %.0f UI, %u x %u framebuffer",
+            viewportSize.x,
+            viewportSize.y,
+            viewport.Width(),
+            viewport.Height());
+        if (!diagnostics.rendererName.empty()) {
+            ImGui::Text("GPU: %s", diagnostics.rendererName.c_str());
+        }
+        if (diagnostics.pointCount > 0) {
+            ImGui::Text("Points: %s", FormatPointCount(diagnostics.pointCount).c_str());
+            ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
+            if (!diagnostics.pointRenderModes.empty()) {
+                ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
+            }
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Layers")) {
+        ImGui::Text("Loaded layers: %s", FormatPointCount(LoadedLayerCount(*runtimeState)).c_str());
+        ImGui::Text("Visible layers: %s", FormatPointCount(VisibleLayerCount(*runtimeState)).c_str());
+        if (const auto* session = SelectedLoadedSession(*runtimeState); session != nullptr) {
+            ImGui::Text("Selected: %s", session->displayName.c_str());
+            ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
+            if (session->kind == LayerKind::PointCloud) {
+                ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
+                ImGui::Text(
+                    "%s: %s",
+                    PointCloudPreviewLodApplied(*runtimeState, *session) ? "Preview LOD" : "Preview",
+                    DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
+                ImGui::Text(
+                    "LOD Mode: %s",
+                    PointCloudPreviewLodModeLabel(runtimeState->projectSettings.pointCloudPreviewLodMode));
+            } else {
+                const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
+                ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
+                if (effectiveQuality != session->gsplatStyle.qualityMode) {
+                    ImGui::Text("Rendering: %s while interacting", GaussianSplatQualityModeLabel(effectiveQuality));
+                }
+                ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
+            }
+        }
+        EndPanelSection();
     }
 
     if (runtimeState->pendingLoad.has_value()) {
         const auto& pendingLoad = runtimeState->pendingLoad.value();
-        ImGui::Separator();
-        ImGui::TextUnformatted("Layer load");
+        if (!BeginPanelSection("Layer Load")) {
+            return;
+        }
         if (pendingLoad.sessionIndex < runtimeState->sessions.size()) {
             const auto& session = runtimeState->sessions[pendingLoad.sessionIndex];
             ImGui::Text("%s", session.displayName.c_str());
@@ -5736,6 +5997,7 @@ void DrawRenderInfoSection(
             "%s for %s",
             pendingLoad.phase == PendingLoadPhase::CpuLoading ? "Reading source data" : "Uploading GPU buffers",
             FormatElapsedTime(elapsed).c_str());
+        EndPanelSection();
     }
 
     auto& job = runtimeState->offlineRenderJob;
@@ -5745,11 +6007,12 @@ void DrawRenderInfoSection(
             job.frames.empty()
                 ? 0.0F
                 : static_cast<float>(job.writtenFrameCount) / static_cast<float>(job.frames.size());
-        ImGui::Separator();
-        ImGui::TextUnformatted(
-            job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-                ? "Encoding Fast Preview MP4"
-                : "Rendering HQ Preview-Density EXR");
+        const char* sectionLabel = job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+                                       ? "Encoding Fast Preview MP4"
+                                       : "Rendering HQ Preview-Density EXR";
+        if (!BeginPanelSection(sectionLabel)) {
+            return;
+        }
         ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
         ImGui::Text(
             "Captured %u / %zu, saved %u, queued %zu",
@@ -5764,6 +6027,7 @@ void DrawRenderInfoSection(
         if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
             RequestOfflineRenderCancellation(&job);
         }
+        EndPanelSection();
     }
 }
 
@@ -5799,12 +6063,11 @@ void DrawControlsWindow(
         popupOpen || ImGui::IsAnyItemActive() ||
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
-    if (ImGui::BeginChild("RenderInfoPane", ImVec2{0.0F, 250.0F}, ImGuiChildFlags_Borders)) {
-        DrawRenderInfoSection(runtimeState, *viewport);
-    }
-    ImGui::EndChild();
-
     if (ImGui::BeginTabBar("ScenePanelTabs")) {
+        if (ImGui::BeginTabItem("Info")) {
+            DrawRenderInfoSection(runtimeState, *viewport);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Lidar")) {
             DrawLidarPanel(runtimeState, viewport);
             ImGui::EndTabItem();

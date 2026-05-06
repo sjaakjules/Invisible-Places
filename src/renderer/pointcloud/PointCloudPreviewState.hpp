@@ -41,6 +41,13 @@ enum class PointCloudRenderMode {
     GaussianPointSprite
 };
 
+enum class PointCloudBlendMode {
+    Normal,
+    Additive,
+    Screen,
+    Multiply
+};
+
 enum class PointCloudFalloffProfile {
     HardDisc,
     SoftDisc,
@@ -59,6 +66,7 @@ struct PointCloudStyleState {
 
     PointCloudGeometryMode geometryMode = PointCloudGeometryMode::ScreenSprites;
     PointCloudRenderMode renderMode = PointCloudRenderMode::Solid;
+    PointCloudBlendMode blendMode = PointCloudBlendMode::Normal;
     PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::SoftDisc;
     PointCloudColorMode colorMode = PointCloudColorMode::SourceRgb;
     PointCloudColormapId colormap = PointCloudColormapId::Viridis;

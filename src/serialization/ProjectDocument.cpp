@@ -16,6 +16,7 @@ using invisible_places::camera::AnimationPathKey;
 using invisible_places::camera::CameraShot;
 using invisible_places::camera::CameraState;
 using invisible_places::output::RenderJobSettings;
+using invisible_places::renderer::pointcloud::PointCloudBlendMode;
 using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
@@ -193,6 +194,35 @@ PointCloudRenderMode ParsePointCloudRenderMode(const json& value) {
     return PointCloudRenderMode::Solid;
 }
 
+const char* PointCloudBlendModeName(PointCloudBlendMode mode) {
+    switch (mode) {
+        case PointCloudBlendMode::Normal:
+            return "normal";
+        case PointCloudBlendMode::Additive:
+            return "additive";
+        case PointCloudBlendMode::Screen:
+            return "screen";
+        case PointCloudBlendMode::Multiply:
+            return "multiply";
+    }
+
+    return "normal";
+}
+
+PointCloudBlendMode ParsePointCloudBlendMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "additive") {
+        return PointCloudBlendMode::Additive;
+    }
+    if (modeName == "screen") {
+        return PointCloudBlendMode::Screen;
+    }
+    if (modeName == "multiply") {
+        return PointCloudBlendMode::Multiply;
+    }
+    return PointCloudBlendMode::Normal;
+}
+
 const char* PointCloudFalloffProfileName(PointCloudFalloffProfile profile) {
     switch (profile) {
         case PointCloudFalloffProfile::HardDisc:
@@ -282,6 +312,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
     return json{
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
         {"render_mode", PointCloudRenderModeName(style.renderMode)},
+        {"blend_mode", PointCloudBlendModeName(style.blendMode)},
         {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
         {"color_mode", PointCloudColorModeName(style.colorMode)},
         {"colormap", PointCloudColormapName(style.colormap)},
@@ -313,6 +344,9 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     }
     if (styleJson.contains("render_mode")) {
         style.renderMode = ParsePointCloudRenderMode(styleJson.at("render_mode"));
+    }
+    if (styleJson.contains("blend_mode")) {
+        style.blendMode = ParsePointCloudBlendMode(styleJson.at("blend_mode"));
     }
     if (styleJson.contains("falloff_profile")) {
         style.falloffProfile = ParsePointCloudFalloffProfile(styleJson.at("falloff_profile"));
