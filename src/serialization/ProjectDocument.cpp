@@ -12,6 +12,7 @@ namespace invisible_places::serialization {
 namespace {
 
 using nlohmann::json;
+using invisible_places::camera::AnimationExportSettings;
 using invisible_places::camera::AnimationPath;
 using invisible_places::camera::AnimationPathKey;
 using invisible_places::camera::CameraShot;
@@ -601,14 +602,38 @@ AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
     return key;
 }
 
+json SerializeAnimationExportSettings(const AnimationExportSettings& settings) {
+    return json{
+        {"output_directory", settings.outputDirectory},
+        {"width", settings.width},
+        {"height", settings.height},
+        {"fps", settings.framesPerSecond},
+        {"start_frame", settings.startFrame},
+        {"end_frame", settings.endFrame},
+    };
+}
+
+AnimationExportSettings ParseAnimationExportSettings(const json& settingsJson) {
+    AnimationExportSettings settings;
+    settings.outputDirectory = settingsJson.value("output_directory", std::string{});
+    settings.width = settingsJson.value("width", settings.width);
+    settings.height = settingsJson.value("height", settings.height);
+    settings.framesPerSecond = settingsJson.value("fps", settings.framesPerSecond);
+    settings.startFrame = settingsJson.value("start_frame", settings.startFrame);
+    settings.endFrame = settingsJson.value("end_frame", settings.endFrame);
+    return settings;
+}
+
 json SerializeAnimationPath(const AnimationPath& path) {
     json pathJson{
-        {"schema_version", 1U},
+        {"schema_version", 2U},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
         {"depth_of_field_enabled", path.depthOfFieldEnabled},
         {"aperture_f_stops", path.apertureFStops},
         {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
+        {"export_settings", SerializeAnimationExportSettings(path.exportSettings)},
+        {"export_visuals", path.exportVisualNames},
         {"keys", json::array()},
     };
     for (const auto& key : path.keys) {
@@ -625,6 +650,12 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     path.apertureFStops = pathJson.value("aperture_f_stops", path.apertureFStops);
     path.depthOfFieldMaxBlurPixels =
         pathJson.value("depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels);
+    if (pathJson.contains("export_settings")) {
+        path.exportSettings = ParseAnimationExportSettings(pathJson.at("export_settings"));
+    }
+    if (pathJson.contains("export_visuals") && pathJson.at("export_visuals").is_array()) {
+        path.exportVisualNames = pathJson.at("export_visuals").get<std::vector<std::string>>();
+    }
     if (pathJson.contains("keys")) {
         for (const auto& keyJson : pathJson.at("keys")) {
             path.keys.push_back(ParseAnimationPathKey(keyJson));

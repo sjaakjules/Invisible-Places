@@ -38,10 +38,14 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stop_token>
@@ -52,6 +56,12 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include <glm/mat4x4.hpp>
 #include <glm/geometric.hpp>
@@ -77,6 +87,7 @@ using GaussianSplatStyleState = invisible_places::renderer::gsplat::GaussianSpla
 using GaussianSplatColorMode = invisible_places::renderer::gsplat::GaussianSplatColorMode;
 using GaussianSplatDebugMode = invisible_places::renderer::gsplat::GaussianSplatDebugMode;
 using GaussianSplatQualityMode = invisible_places::renderer::gsplat::GaussianSplatQualityMode;
+using AnimationExportSettings = invisible_places::camera::AnimationExportSettings;
 using AnimationPath = invisible_places::camera::AnimationPath;
 using CameraShot = invisible_places::camera::CameraShot;
 using RenderParameterBinding = invisible_places::style::RenderParameterBinding;
@@ -167,12 +178,26 @@ struct AnimationViewportDragState {
     float pixelsPerWorldUnit = 1.0F;
 };
 
+struct QueuedQuickMp4Export {
+    AnimationPath animationPath{};
+    RenderJobSettings settings{};
+    std::filesystem::path animationFilePath;
+    std::string visualName;
+    std::size_t visualSessionIndex = 0;
+    PointCloudStyleState visualStyle{};
+    std::filesystem::path videoOutputPath;
+};
+
 struct AnimationPanelState {
     std::optional<AnimationPath> currentPath;
     std::string currentFilePath;
     std::string draftAnimationName = "Animation 1";
-    std::string mp4OutputPath;
     std::vector<std::filesystem::path> availableFiles;
+    std::vector<std::filesystem::path> selectedExportFiles;
+    std::deque<QueuedQuickMp4Export> quickMp4Queue;
+    std::size_t quickMp4QueueTotal = 0;
+    std::size_t quickMp4QueueCompleted = 0;
+    std::size_t quickMp4QueueSkipped = 0;
     std::optional<std::size_t> selectedFileIndex;
     std::optional<std::size_t> renamingFileIndex;
     std::string fileRenameBuffer;
@@ -217,6 +242,20 @@ struct AnimationExportWriterState {
     std::string errorMessage;
 };
 
+struct ExportLogState {
+    std::filesystem::path path;
+    std::chrono::system_clock::time_point startedWallTime{};
+    std::chrono::steady_clock::time_point startedAt{};
+    std::uint64_t startResidentMemoryBytes = 0;
+    std::uint64_t peakResidentMemoryBytes = 0;
+    std::uint64_t endResidentMemoryBytes = 0;
+    std::chrono::steady_clock::duration gpuCaptureTotal{};
+    std::chrono::steady_clock::duration gpuCaptureMin{};
+    std::chrono::steady_clock::duration gpuCaptureMax{};
+    std::uint32_t capturedFrames = 0;
+    std::size_t peakQueuedFrames = 0;
+};
+
 struct OfflineRenderJobState {
     bool active = false;
     bool cancelRequested = false;
@@ -238,6 +277,13 @@ struct OfflineRenderJobState {
     std::size_t pendingFrameCount = 0;
     bool previewDensity = true;
     bool writerFinishRequested = false;
+    bool quickMp4BatchJob = false;
+    std::size_t quickMp4BatchIndex = 0;
+    std::size_t quickMp4BatchTotal = 0;
+    std::string animationName;
+    std::filesystem::path animationFilePath;
+    std::string exportVisualName;
+    ExportLogState exportLog{};
     glm::vec4 exportBackgroundColor{0.0F, 0.0F, 0.0F, 0.0F};
     float exportGaussianSplatFootprintBoost = 1.5F;
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportPointCloudLayers;
@@ -356,6 +402,7 @@ struct PreviewRuntimeState {
     ProjectSettings projectSettings{};
     PersistenceState persistence{};
     bool showDiagnosticsPanel = false;
+    bool pauseLiveViewportDuringExport = true;
     std::string statusMessage;
     std::string errorMessage;
 };
@@ -1150,6 +1197,89 @@ void SaveCurrentPointVisual(PreviewRuntimeState* runtimeState, PreviewLayerSessi
     SyncPointVisualNameBuffer(session);
     runtimeState->statusMessage = "Saved visual " + targetName + ".";
     runtimeState->errorMessage.clear();
+}
+
+bool IsExportablePointVisualName(std::string_view name) {
+    const auto normalized = NormalizePointVisualName(name);
+    return !normalized.empty() && !IsEditedPointVisualName(normalized);
+}
+
+bool AnimationPathHasExportVisual(const AnimationPath& path, std::string_view name) {
+    const auto normalized = NormalizePointVisualName(name);
+    return std::any_of(
+        path.exportVisualNames.begin(),
+        path.exportVisualNames.end(),
+        [&normalized](const std::string& visualName) {
+            return NormalizePointVisualName(visualName) == normalized;
+        });
+}
+
+void SetAnimationPathExportVisual(AnimationPath* path, std::string_view name, bool enabled) {
+    if (path == nullptr) {
+        return;
+    }
+
+    const auto normalized = NormalizePointVisualName(name);
+    if (!IsExportablePointVisualName(normalized)) {
+        return;
+    }
+
+    auto existing = std::find_if(
+        path->exportVisualNames.begin(),
+        path->exportVisualNames.end(),
+        [&normalized](const std::string& visualName) {
+            return NormalizePointVisualName(visualName) == normalized;
+        });
+    if (enabled) {
+        if (existing == path->exportVisualNames.end()) {
+            path->exportVisualNames.push_back(normalized);
+        }
+        return;
+    }
+
+    if (existing != path->exportVisualNames.end()) {
+        path->exportVisualNames.erase(existing);
+    }
+}
+
+void RemoveUnexportableVisualNames(AnimationPath* path) {
+    if (path == nullptr) {
+        return;
+    }
+
+    for (auto& visualName : path->exportVisualNames) {
+        visualName = NormalizePointVisualName(visualName);
+    }
+    path->exportVisualNames.erase(
+        std::remove_if(
+            path->exportVisualNames.begin(),
+            path->exportVisualNames.end(),
+            [](const std::string& visualName) {
+                return !IsExportablePointVisualName(visualName);
+            }),
+        path->exportVisualNames.end());
+    std::sort(path->exportVisualNames.begin(), path->exportVisualNames.end());
+    path->exportVisualNames.erase(
+        std::unique(path->exportVisualNames.begin(), path->exportVisualNames.end()),
+        path->exportVisualNames.end());
+}
+
+const SavedPointVisualState* FindExportablePointVisual(
+    const PreviewLayerSession& session,
+    std::string_view name) {
+    const auto normalized = NormalizePointVisualName(name);
+    if (!IsExportablePointVisualName(normalized)) {
+        return nullptr;
+    }
+
+    const auto visualIt = std::find_if(
+        session.pointVisuals.begin(),
+        session.pointVisuals.end(),
+        [&normalized](const SavedPointVisualState& visual) {
+            return NormalizePointVisualName(visual.name) == normalized &&
+                   IsExportablePointVisualName(visual.name);
+        });
+    return visualIt == session.pointVisuals.end() ? nullptr : &*visualIt;
 }
 
 bool DrawSectionHeader(const char* label) {
@@ -2983,43 +3113,77 @@ std::filesystem::path AnimationFilePathForName(
     return AnimationDirectory(runtimeState) / (SanitizeAnimationFileStem(animationName) + ".ipanim.json");
 }
 
-std::filesystem::path DefaultAnimationMp4Path(const PreviewRuntimeState& runtimeState) {
-    const auto animationName =
-        runtimeState.animationPanel.currentPath.has_value()
-            ? runtimeState.animationPanel.currentPath->name
-            : runtimeState.animationPanel.draftAnimationName;
-    const auto outputDirectory = runtimeState.renderSettings.outputDirectory.empty()
-                                     ? DefaultRenderOutputDirectory(std::filesystem::path{})
-                                     : std::filesystem::path{runtimeState.renderSettings.outputDirectory};
-    return outputDirectory / (SanitizeAnimationFileStem(animationName) + ".mp4");
+RenderJobSettings RenderSettingsFromAnimationExportSettings(const AnimationExportSettings& exportSettings) {
+    RenderJobSettings settings;
+    settings.outputDirectory = exportSettings.outputDirectory;
+    settings.width = std::max<std::uint32_t>(1U, exportSettings.width);
+    settings.height = std::max<std::uint32_t>(1U, exportSettings.height);
+    settings.framesPerSecond = std::max<std::uint32_t>(1U, exportSettings.framesPerSecond);
+    settings.startFrame = exportSettings.startFrame;
+    settings.endFrame = exportSettings.endFrame;
+    return settings;
 }
 
-bool IsMp4Extension(const std::filesystem::path& path) {
-    auto extension = path.extension().string();
-    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char character) {
-        return static_cast<char>(std::tolower(character));
-    });
-    return extension == ".mp4";
+AnimationExportSettings AnimationExportSettingsFromRenderSettings(const RenderJobSettings& settings) {
+    return AnimationExportSettings{
+        .outputDirectory = settings.outputDirectory,
+        .width = std::max<std::uint32_t>(1U, settings.width),
+        .height = std::max<std::uint32_t>(1U, settings.height),
+        .framesPerSecond = std::max<std::uint32_t>(1U, settings.framesPerSecond),
+        .startFrame = settings.startFrame,
+        .endFrame = settings.endFrame,
+    };
 }
 
-std::filesystem::path AnimationMp4OutputPath(const PreviewRuntimeState& runtimeState) {
-    const auto outputDirectory = runtimeState.renderSettings.outputDirectory.empty()
-                                     ? DefaultRenderOutputDirectory(std::filesystem::path{})
-                                     : std::filesystem::path{runtimeState.renderSettings.outputDirectory};
-    auto outputPath = DefaultAnimationMp4Path(runtimeState);
-    if (!runtimeState.animationPanel.mp4OutputPath.empty()) {
-        const auto requestedPath = std::filesystem::path{runtimeState.animationPanel.mp4OutputPath};
-        outputPath = requestedPath.is_absolute() ? requestedPath : outputDirectory / requestedPath;
+void MarkCurrentAnimationExportSettingsDirty(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
     }
 
-    if (!IsMp4Extension(outputPath)) {
-        if (outputPath.has_extension()) {
-            outputPath.replace_extension(".mp4");
-        } else {
-            outputPath += ".mp4";
+    runtimeState->animationPanel.currentPath->exportSettings =
+        AnimationExportSettingsFromRenderSettings(runtimeState->renderSettings);
+    runtimeState->animationPanel.dirty = true;
+}
+
+bool PathsLexicallyEqual(const std::filesystem::path& left, const std::filesystem::path& right) {
+    return left.lexically_normal() == right.lexically_normal();
+}
+
+bool AnimationFileSelectedForExport(
+    const AnimationPanelState& panelState,
+    const std::filesystem::path& path) {
+    return std::any_of(
+        panelState.selectedExportFiles.begin(),
+        panelState.selectedExportFiles.end(),
+        [&path](const std::filesystem::path& selectedPath) {
+            return PathsLexicallyEqual(selectedPath, path);
+        });
+}
+
+void SetAnimationFileSelectedForExport(
+    AnimationPanelState* panelState,
+    const std::filesystem::path& path,
+    bool selected) {
+    if (panelState == nullptr) {
+        return;
+    }
+
+    const auto existing = std::find_if(
+        panelState->selectedExportFiles.begin(),
+        panelState->selectedExportFiles.end(),
+        [&path](const std::filesystem::path& selectedPath) {
+            return PathsLexicallyEqual(selectedPath, path);
+        });
+    if (selected) {
+        if (existing == panelState->selectedExportFiles.end()) {
+            panelState->selectedExportFiles.push_back(path);
         }
+        return;
     }
-    return outputPath;
+
+    if (existing != panelState->selectedExportFiles.end()) {
+        panelState->selectedExportFiles.erase(existing);
+    }
 }
 
 void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesystem::path& animationDirectory) {
@@ -3048,6 +3212,19 @@ void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesy
         }
     }
     std::sort(panelState->availableFiles.begin(), panelState->availableFiles.end());
+    panelState->selectedExportFiles.erase(
+        std::remove_if(
+            panelState->selectedExportFiles.begin(),
+            panelState->selectedExportFiles.end(),
+            [&](const std::filesystem::path& selectedPath) {
+                return std::none_of(
+                    panelState->availableFiles.begin(),
+                    panelState->availableFiles.end(),
+                    [&selectedPath](const std::filesystem::path& availablePath) {
+                        return PathsLexicallyEqual(selectedPath, availablePath);
+                    });
+            }),
+        panelState->selectedExportFiles.end());
     if (panelState->selectedFileIndex.has_value() &&
         panelState->selectedFileIndex.value() >= panelState->availableFiles.size()) {
         panelState->selectedFileIndex = panelState->availableFiles.empty()
@@ -3149,8 +3326,10 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     }
 
     runtimeState->animationPanel.currentPath = path.value();
+    RemoveUnexportableVisualNames(&runtimeState->animationPanel.currentPath.value());
     runtimeState->animationPanel.currentFilePath = inputPath.string();
     runtimeState->animationPanel.draftAnimationName = path->name;
+    runtimeState->renderSettings = RenderSettingsFromAnimationExportSettings(path->exportSettings);
     runtimeState->animationPanel.selectedKeyIndex = path->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
     runtimeState->animationPanel.scrubAmount = 0.0F;
     runtimeState->animationPanel.previewDepthOfField = false;
@@ -3241,6 +3420,11 @@ bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fi
     const bool renamedCurrent =
         !panel.currentFilePath.empty() &&
         PathsReferToSameFile(std::filesystem::path{panel.currentFilePath}, oldPath);
+    const bool renamedExportSelection = AnimationFileSelectedForExport(panel, oldPath);
+    if (renamedExportSelection) {
+        SetAnimationFileSelectedForExport(&panel, oldPath, false);
+        SetAnimationFileSelectedForExport(&panel, newPath, true);
+    }
     std::string saveError;
     bool savedInternalName = true;
     if (renamedCurrent && panel.currentPath.has_value()) {
@@ -3292,6 +3476,7 @@ void SaveCurrentCameraPathAsAnimation(PreviewRuntimeState* runtimeState) {
         runtimeState->animationPanel.currentPath.has_value()
             ? runtimeState->animationPanel.currentPath->apertureFStops
             : 8.0F);
+    animationPath.exportSettings = AnimationExportSettingsFromRenderSettings(runtimeState->renderSettings);
     const auto outputPath = AnimationFilePathForName(*runtimeState, animationPath.name);
     SaveAnimationPathToFile(runtimeState, animationPath, outputPath);
 }
@@ -3641,10 +3826,16 @@ std::uint64_t EffectiveAnimationExportPointDrawCount(
         decision.drawPointCount);
 }
 
+struct PointVisualExportOverride {
+    std::size_t sessionIndex = 0;
+    PointCloudStyleState style{};
+};
+
 std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState>
 BuildAnimationExportPointCloudLayerSnapshot(
     const PreviewRuntimeState& runtimeState,
-    bool previewDensity) {
+    bool previewDensity,
+    const std::optional<PointVisualExportOverride>& visualOverride = std::nullopt) {
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> layers;
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -3659,9 +3850,13 @@ BuildAnimationExportPointCloudLayerSnapshot(
             runtimeState,
             session,
             previewDensity);
+        const auto& exportStyle =
+            visualOverride.has_value() && visualOverride->sessionIndex == sessionIndex
+                ? visualOverride->style
+                : session.pointStyle;
         layers.push_back(
             {.layerId = sessionIndex,
-             .style = session.pointStyle,
+             .style = exportStyle,
              .scalarFields = session.scalarFields,
              .hasSourceRgb = session.hasSourceRgb,
              .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -3713,6 +3908,294 @@ std::string FormatElapsedTime(std::chrono::steady_clock::duration elapsed) {
     std::ostringstream output;
     output << minutes << "m " << seconds << "s";
     return output.str();
+}
+
+std::uint64_t CurrentResidentMemoryBytes() {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    const kern_return_t result = task_info(
+        mach_task_self(),
+        MACH_TASK_BASIC_INFO,
+        reinterpret_cast<task_info_t>(&info),
+        &count);
+    return result == KERN_SUCCESS ? static_cast<std::uint64_t>(info.resident_size) : 0U;
+#elif defined(__linux__)
+    std::ifstream statm{"/proc/self/statm"};
+    long totalPages = 0;
+    long residentPages = 0;
+    statm >> totalPages >> residentPages;
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (residentPages <= 0 || pageSize <= 0) {
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(residentPages) * static_cast<std::uint64_t>(pageSize);
+#else
+    return 0U;
+#endif
+}
+
+std::string FormatByteCount(std::uint64_t bytes) {
+    if (bytes == 0U) {
+        return "Unavailable";
+    }
+
+    constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = static_cast<double>(bytes);
+    std::size_t unitIndex = 0;
+    while (value >= 1024.0 && unitIndex + 1U < std::size(kUnits)) {
+        value /= 1024.0;
+        ++unitIndex;
+    }
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(unitIndex == 0U ? 0 : 1) << value << ' ' << kUnits[unitIndex];
+    return output.str();
+}
+
+std::string FormatDurationForLog(std::chrono::steady_clock::duration duration) {
+    const double seconds = std::chrono::duration<double>(duration).count();
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(seconds < 10.0 ? 3 : 2) << seconds << " s";
+    return output.str();
+}
+
+std::string FormatLocalTime(
+    std::chrono::system_clock::time_point timePoint,
+    const char* format) {
+    const std::time_t time = std::chrono::system_clock::to_time_t(timePoint);
+    std::tm localTime{};
+#if defined(_WIN32)
+    localtime_s(&localTime, &time);
+#else
+    localtime_r(&time, &localTime);
+#endif
+
+    std::ostringstream output;
+    output << std::put_time(&localTime, format);
+    return output.str();
+}
+
+const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) {
+    return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+               ? "ExportLog_MP4_"
+               : "ExportLog_EXR_";
+}
+
+const char* ExportLogTypeLabel(invisible_places::output::AnimationExportMode mode) {
+    return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+               ? "Quick MP4"
+               : "HQ Preview-Density EXR";
+}
+
+std::filesystem::path BuildUniqueExportLogPath(
+    const std::filesystem::path& outputDirectory,
+    invisible_places::output::AnimationExportMode mode,
+    std::chrono::system_clock::time_point startedAt) {
+    const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
+    const auto baseStem = std::string{ExportLogPrefix(mode)} + FormatLocalTime(startedAt, "%y%m%d-%H%M%S");
+    auto candidate = directory / (baseStem + ".txt");
+    std::error_code existsError;
+    if (!std::filesystem::exists(candidate, existsError)) {
+        return candidate;
+    }
+
+    for (std::uint32_t suffix = 1U; suffix < 10000U; ++suffix) {
+        candidate = directory / (baseStem + "_" + std::to_string(suffix) + ".txt");
+        existsError.clear();
+        if (!std::filesystem::exists(candidate, existsError)) {
+            return candidate;
+        }
+    }
+    return candidate;
+}
+
+ExportLogState MakeExportLogState(
+    const std::filesystem::path& outputDirectory,
+    invisible_places::output::AnimationExportMode mode) {
+    ExportLogState log;
+    log.startedWallTime = std::chrono::system_clock::now();
+    log.startedAt = std::chrono::steady_clock::now();
+    log.path = BuildUniqueExportLogPath(outputDirectory, mode, log.startedWallTime);
+    log.startResidentMemoryBytes = CurrentResidentMemoryBytes();
+    log.peakResidentMemoryBytes = log.startResidentMemoryBytes;
+    return log;
+}
+
+void SampleExportLogMemory(OfflineRenderJobState* job) {
+    if (job == nullptr || job->exportLog.path.empty()) {
+        return;
+    }
+
+    const auto memoryBytes = CurrentResidentMemoryBytes();
+    if (memoryBytes > job->exportLog.peakResidentMemoryBytes) {
+        job->exportLog.peakResidentMemoryBytes = memoryBytes;
+    }
+}
+
+void RecordExportGpuCaptureDuration(
+    OfflineRenderJobState* job,
+    std::chrono::steady_clock::duration duration) {
+    if (job == nullptr || job->exportLog.path.empty()) {
+        return;
+    }
+
+    auto& log = job->exportLog;
+    log.gpuCaptureTotal += duration;
+    if (log.capturedFrames == 0U || duration < log.gpuCaptureMin) {
+        log.gpuCaptureMin = duration;
+    }
+    if (log.capturedFrames == 0U || duration > log.gpuCaptureMax) {
+        log.gpuCaptureMax = duration;
+    }
+    ++log.capturedFrames;
+}
+
+std::uint64_t WrittenOutputByteCount(const OfflineRenderJobState& job) {
+    std::uint64_t bytes = 0;
+    std::error_code error;
+    if (job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        if (!job.videoOutputPath.empty() && std::filesystem::exists(job.videoOutputPath, error)) {
+            error.clear();
+            bytes = std::filesystem::file_size(job.videoOutputPath, error);
+        }
+        return error ? 0U : bytes;
+    }
+
+    for (std::uint32_t frameIndex = 0; frameIndex < job.writtenFrameCount; ++frameIndex) {
+        const auto outputPath =
+            invisible_places::output::RenderFramePath(job.settings, job.settings.startFrame + frameIndex);
+        error.clear();
+        if (!std::filesystem::exists(outputPath, error)) {
+            continue;
+        }
+        error.clear();
+        const auto fileBytes = std::filesystem::file_size(outputPath, error);
+        if (!error) {
+            bytes += fileBytes;
+        }
+    }
+    return bytes;
+}
+
+std::string WriteExportLog(
+    const OfflineRenderJobState& job,
+    const std::string& statusMessage,
+    const std::string& errorMessage) {
+    if (job.exportLog.path.empty()) {
+        return {};
+    }
+
+    std::error_code createError;
+    const auto parentDirectory = job.exportLog.path.parent_path();
+    if (!parentDirectory.empty()) {
+        std::filesystem::create_directories(parentDirectory, createError);
+        if (createError) {
+            return createError.message();
+        }
+    }
+
+    std::ofstream log{job.exportLog.path};
+    if (!log) {
+        return "Failed to open " + job.exportLog.path.string();
+    }
+
+    const auto finishedWallTime = std::chrono::system_clock::now();
+    const auto duration = std::chrono::steady_clock::now() - job.exportLog.startedAt;
+    const auto totalDrawPoints = std::accumulate(
+        job.exportPointCloudLayers.begin(),
+        job.exportPointCloudLayers.end(),
+        std::uint64_t{0},
+        [](std::uint64_t sum, const auto& layer) {
+            return sum + static_cast<std::uint64_t>(layer.drawPointCount);
+        });
+    const auto readbackBytes =
+        static_cast<std::uint64_t>(job.settings.width) *
+        static_cast<std::uint64_t>(job.settings.height) * 4U * sizeof(std::uint16_t);
+    const auto mp4RawFrameBytes =
+        static_cast<std::uint64_t>(job.settings.width) *
+        static_cast<std::uint64_t>(job.settings.height) * 4U;
+    const auto outputBytes = WrittenOutputByteCount(job);
+    const auto averageCaptureDuration =
+        job.exportLog.capturedFrames > 0U
+            ? job.exportLog.gpuCaptureTotal / job.exportLog.capturedFrames
+            : std::chrono::steady_clock::duration{};
+
+    log << "Invisible Places Export Log\n";
+    log << "Type: " << ExportLogTypeLabel(job.mode) << '\n';
+    log << "Started: " << FormatLocalTime(job.exportLog.startedWallTime, "%Y-%m-%d %H:%M:%S") << '\n';
+    log << "Finished: " << FormatLocalTime(finishedWallTime, "%Y-%m-%d %H:%M:%S") << '\n';
+    log << "Duration: " << FormatDurationForLog(duration) << '\n';
+    const bool cancelled =
+        job.cancelRequested ||
+        statusMessage.find("cancelled") != std::string::npos ||
+        statusMessage.find("Cancelling") != std::string::npos;
+    log << "Status: " << (!errorMessage.empty() ? "Failed" : (cancelled ? "Cancelled" : "Complete")) << '\n';
+    if (!statusMessage.empty()) {
+        log << "Status message: " << statusMessage << '\n';
+    }
+    if (!errorMessage.empty()) {
+        log << "Error: " << errorMessage << '\n';
+    }
+    log << '\n';
+
+    log << "Animation\n";
+    log << "Name: " << (job.animationName.empty() ? "(unnamed)" : job.animationName) << '\n';
+    if (!job.animationFilePath.empty()) {
+        log << "File: " << job.animationFilePath.string() << '\n';
+    }
+    if (!job.exportVisualName.empty()) {
+        log << "Visual: " << job.exportVisualName << '\n';
+    }
+    if (job.quickMp4BatchJob) {
+        log << "Batch item: " << job.quickMp4BatchIndex << " / " << job.quickMp4BatchTotal << '\n';
+    }
+    log << '\n';
+
+    log << "Output\n";
+    if (job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        log << "MP4: " << job.videoOutputPath.string() << '\n';
+    } else {
+        log << "EXR folder: " << job.settings.outputDirectory << '\n';
+        if (!job.lastOutputPath.empty()) {
+            log << "Last EXR: " << job.lastOutputPath.string() << '\n';
+        }
+    }
+    log << "Written bytes: " << FormatByteCount(outputBytes) << '\n';
+    log << '\n';
+
+    log << "Settings\n";
+    log << "Resolution: " << job.settings.width << " x " << job.settings.height << '\n';
+    log << "FPS: " << job.settings.framesPerSecond << '\n';
+    log << "Start frame: " << job.settings.startFrame << '\n';
+    log << "End frame setting: " << job.settings.endFrame << '\n';
+    log << "Total frames planned: " << job.frames.size() << '\n';
+    log << "Frames captured: " << job.currentFrame << '\n';
+    log << "Frames written: " << job.writtenFrameCount << '\n';
+    log << "Preview density: " << (job.previewDensity ? "yes" : "no") << '\n';
+    log << "Visible LiDAR export layers: " << job.exportPointCloudLayers.size() << '\n';
+    log << "Total export draw points: " << totalDrawPoints << '\n';
+    log << "Setup viewport: " << job.setupViewportWidth << " x " << job.setupViewportHeight << '\n';
+    log << '\n';
+
+    log << "Timing\n";
+    log << "GPU capture total: " << FormatDurationForLog(job.exportLog.gpuCaptureTotal) << '\n';
+    log << "GPU capture average: " << FormatDurationForLog(averageCaptureDuration) << '\n';
+    log << "GPU capture min: " << FormatDurationForLog(job.exportLog.gpuCaptureMin) << '\n';
+    log << "GPU capture max: " << FormatDurationForLog(job.exportLog.gpuCaptureMax) << '\n';
+    log << "Peak writer queue frames: " << job.exportLog.peakQueuedFrames << '\n';
+    log << '\n';
+
+    log << "Memory\n";
+    log << "Process resident at start: " << FormatByteCount(job.exportLog.startResidentMemoryBytes) << '\n';
+    log << "Process resident at finish: " << FormatByteCount(job.exportLog.endResidentMemoryBytes) << '\n';
+    log << "Peak sampled process resident: " << FormatByteCount(job.exportLog.peakResidentMemoryBytes) << '\n';
+    log << "GPU readback frame buffer: " << FormatByteCount(readbackBytes) << '\n';
+    if (job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        log << "MP4 raw RGBA frame bytes: " << FormatByteCount(mp4RawFrameBytes) << '\n';
+    }
+
+    return {};
 }
 
 void UpdateOfflineRenderProgress(
@@ -3922,9 +4405,11 @@ void RefreshAnimationExportWriterProgress(OfflineRenderJobState* job) {
     std::scoped_lock lock(job->writerState->mutex);
     job->writtenFrameCount = job->writerState->writtenFrames;
     job->pendingFrameCount = job->writerState->pendingFrames.size();
+    job->exportLog.peakQueuedFrames = std::max(job->exportLog.peakQueuedFrames, job->pendingFrameCount);
     if (!job->writerState->lastOutputPath.empty()) {
         job->lastOutputPath = job->writerState->lastOutputPath;
     }
+    SampleExportLogMemory(job);
 }
 
 std::string CloseAnimationExportVideoPipe(FILE** videoPipe, const std::filesystem::path& outputPath) {
@@ -4063,6 +4548,298 @@ void RunAnimationExportWriter(
     }
 }
 
+void NormalizeAnimationRenderSettings(RenderJobSettings* settings) {
+    if (settings == nullptr) {
+        return;
+    }
+
+    settings->width = std::max<std::uint32_t>(1U, settings->width);
+    settings->height = std::max<std::uint32_t>(1U, settings->height);
+    settings->framesPerSecond = std::max<std::uint32_t>(1U, settings->framesPerSecond);
+    settings->tileSize = std::max<std::uint32_t>(1U, settings->tileSize);
+    if (settings->outputDirectory.empty()) {
+        settings->outputDirectory = DefaultRenderOutputDirectory(std::filesystem::path{}).string();
+    }
+}
+
+bool StartQuickMp4ExportJob(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    QueuedQuickMp4Export request) {
+    if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
+        return false;
+    }
+
+    auto settings = request.settings;
+    NormalizeAnimationRenderSettings(&settings);
+
+    if (!HasOfflinePointLayers(*runtimeState)) {
+        runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    if (request.animationPath.keys.size() < 2U) {
+        runtimeState->errorMessage = "Animation " + request.animationPath.name +
+                                     " has fewer than two keys and cannot be exported.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    if (request.visualSessionIndex >= runtimeState->sessions.size() ||
+        !IsVisibleLoadedPointCloudSession(runtimeState->sessions[request.visualSessionIndex])) {
+        runtimeState->errorMessage = "The LiDAR layer used for the selected export visual is no longer visible.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
+    if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
+        runtimeState->errorMessage =
+            "Fast MP4 export requires ffmpeg at " + ffmpegPath.string() + ".";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::error_code createError;
+    if (!request.videoOutputPath.parent_path().empty()) {
+        std::filesystem::create_directories(request.videoOutputPath.parent_path(), createError);
+        if (createError) {
+            runtimeState->errorMessage = "Failed to create MP4 output directory: " + createError.message();
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+    }
+
+    auto frames = invisible_places::output::BuildAnimationRenderSequence(request.animationPath, settings);
+    if (frames.empty()) {
+        runtimeState->errorMessage = "Animation " + request.animationPath.name +
+                                     " did not produce any output frames.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const PointVisualExportOverride visualOverride{
+        .sessionIndex = request.visualSessionIndex,
+        .style = request.visualStyle,
+    };
+    auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
+        *runtimeState,
+        false,
+        visualOverride);
+    if (exportPointCloudLayers.empty()) {
+        runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto setupSize = viewport != nullptr ? CurrentUiViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
+    auto writerState = std::make_shared<AnimationExportWriterState>();
+    runtimeState->offlineRenderJob = {
+        .active = true,
+        .cancelRequested = false,
+        .mode = invisible_places::output::AnimationExportMode::FastPreviewMp4,
+        .settings = settings,
+        .frames = std::move(frames),
+        .tiles = {},
+        .currentFrame = 0,
+        .currentTile = 0,
+        .startedAt = std::chrono::steady_clock::now(),
+        .videoOutputPath = request.videoOutputPath,
+        .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
+        .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
+        .previewDensity = false,
+        .quickMp4BatchJob = true,
+        .quickMp4BatchIndex = runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
+        .quickMp4BatchTotal = runtimeState->animationPanel.quickMp4QueueTotal,
+        .animationName = request.animationPath.name,
+        .animationFilePath = request.animationFilePath,
+        .exportVisualName = request.visualName,
+        .exportLog = MakeExportLogState(
+            request.videoOutputPath.parent_path(),
+            invisible_places::output::AnimationExportMode::FastPreviewMp4),
+        .exportBackgroundColor = glm::vec4{
+            runtimeState->projectSettings.backgroundColor[0],
+            runtimeState->projectSettings.backgroundColor[1],
+            runtimeState->projectSettings.backgroundColor[2],
+            0.0F,
+        },
+        .exportGaussianSplatFootprintBoost = runtimeState->projectSettings.gaussianSplatFootprintBoost,
+        .exportPointCloudLayers = std::move(exportPointCloudLayers),
+        .writerState = writerState,
+    };
+    runtimeState->offlineRenderJob.worker = std::jthread{
+        RunAnimationExportWriter,
+        runtimeState->offlineRenderJob.mode,
+        runtimeState->offlineRenderJob.settings,
+        runtimeState->offlineRenderJob.videoOutputPath,
+        static_cast<std::uint32_t>(runtimeState->offlineRenderJob.frames.size()),
+        writerState};
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->animationPlayback.active = false;
+    runtimeState->statusMessage =
+        "Encoding Quick MP4 " +
+        std::to_string(runtimeState->animationPanel.quickMp4QueueCompleted + 1U) +
+        " / " + std::to_string(runtimeState->animationPanel.quickMp4QueueTotal) +
+        ": " + request.animationPath.name + " / " + request.visualName + ".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool StartNextQueuedQuickMp4Export(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
+        return false;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    if (panel.quickMp4Queue.empty()) {
+        if (panel.quickMp4QueueTotal > 0) {
+            runtimeState->statusMessage =
+                "Quick MP4 batch complete: " +
+                std::to_string(panel.quickMp4QueueCompleted) + " exported";
+            if (panel.quickMp4QueueSkipped > 0) {
+                runtimeState->statusMessage +=
+                    ", " + std::to_string(panel.quickMp4QueueSkipped) + " skipped";
+            }
+            runtimeState->statusMessage += ".";
+            runtimeState->errorMessage.clear();
+        }
+        return false;
+    }
+
+    auto request = std::move(panel.quickMp4Queue.front());
+    panel.quickMp4Queue.pop_front();
+    if (!StartQuickMp4ExportJob(runtimeState, viewport, std::move(request))) {
+        panel.quickMp4Queue.clear();
+        panel.quickMp4QueueTotal = 0;
+        panel.quickMp4QueueCompleted = 0;
+        panel.quickMp4QueueSkipped = 0;
+        return false;
+    }
+    return true;
+}
+
+void StartSelectedQuickMp4Batch(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
+        return;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    panel.quickMp4Queue.clear();
+    panel.quickMp4QueueTotal = 0;
+    panel.quickMp4QueueCompleted = 0;
+    panel.quickMp4QueueSkipped = 0;
+
+    std::vector<std::filesystem::path> selectedFiles;
+    selectedFiles.reserve(panel.availableFiles.size());
+    for (const auto& filePath : panel.availableFiles) {
+        if (AnimationFileSelectedForExport(panel, filePath)) {
+            selectedFiles.push_back(filePath);
+        }
+    }
+
+    if (selectedFiles.empty()) {
+        runtimeState->errorMessage = "Select at least one saved animation for Quick MP4 export.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const auto visualSessionIndex = ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+    if (!visualSessionIndex.has_value()) {
+        runtimeState->errorMessage = "Load and show a LiDAR layer with saved visuals before exporting Quick MP4.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    auto& visualSession = runtimeState->sessions[visualSessionIndex.value()];
+    EnsurePointVisuals(&visualSession);
+    if (!HasOfflinePointLayers(*runtimeState)) {
+        runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
+    if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
+        runtimeState->errorMessage =
+            "Fast MP4 export requires ffmpeg at " + ffmpegPath.string() + ".";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    std::vector<std::filesystem::path> reservedOutputPaths;
+    std::string loadErrorMessage;
+    for (const auto& animationFilePath : selectedFiles) {
+        std::optional<AnimationPath> loadedAnimation;
+        if (panel.currentPath.has_value() &&
+            !panel.currentFilePath.empty() &&
+            PathsLexicallyEqual(std::filesystem::path{panel.currentFilePath}, animationFilePath)) {
+            loadedAnimation = panel.currentPath.value();
+        } else {
+            loadedAnimation =
+                invisible_places::serialization::LoadAnimationPath(animationFilePath, &loadErrorMessage);
+        }
+
+        if (!loadedAnimation.has_value()) {
+            ++panel.quickMp4QueueSkipped;
+            continue;
+        }
+
+        auto animationPath = loadedAnimation.value();
+        RemoveUnexportableVisualNames(&animationPath);
+        if (animationPath.keys.size() < 2U || animationPath.exportVisualNames.empty()) {
+            ++panel.quickMp4QueueSkipped;
+            continue;
+        }
+
+        auto settings = RenderSettingsFromAnimationExportSettings(animationPath.exportSettings);
+        NormalizeAnimationRenderSettings(&settings);
+        for (const auto& visualName : animationPath.exportVisualNames) {
+            const auto* visual = FindExportablePointVisual(visualSession, visualName);
+            if (visual == nullptr) {
+                ++panel.quickMp4QueueSkipped;
+                continue;
+            }
+
+            const auto outputPath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
+                settings.outputDirectory,
+                animationPath.name,
+                visual->name,
+                reservedOutputPaths);
+            reservedOutputPaths.push_back(outputPath);
+            panel.quickMp4Queue.push_back(
+                {.animationPath = animationPath,
+                 .settings = settings,
+                 .animationFilePath = animationFilePath,
+                 .visualName = visual->name,
+                 .visualSessionIndex = visualSessionIndex.value(),
+                 .visualStyle = visual->style,
+                 .videoOutputPath = outputPath});
+        }
+    }
+
+    panel.quickMp4QueueTotal = panel.quickMp4Queue.size();
+    if (panel.quickMp4Queue.empty()) {
+        runtimeState->statusMessage =
+            "No Quick MP4 exports were queued. Select at least one saved visual on each animation.";
+        if (panel.quickMp4QueueSkipped > 0) {
+            runtimeState->statusMessage +=
+                " Skipped " + std::to_string(panel.quickMp4QueueSkipped) + " animation/visual entries.";
+        }
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
+    if (!StartNextQueuedQuickMp4Export(runtimeState, viewport)) {
+        panel.quickMp4Queue.clear();
+        panel.quickMp4QueueTotal = 0;
+    }
+}
+
 void StartAnimationExportJob(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -4070,15 +4847,14 @@ void StartAnimationExportJob(
         return;
     }
 
-    auto& settings = runtimeState->renderSettings;
-    settings.width = std::max<std::uint32_t>(1U, settings.width);
-    settings.height = std::max<std::uint32_t>(1U, settings.height);
-    settings.framesPerSecond = std::max<std::uint32_t>(1U, settings.framesPerSecond);
-    settings.tileSize = std::max<std::uint32_t>(1U, settings.tileSize);
-
-    if (settings.outputDirectory.empty()) {
-        settings.outputDirectory = DefaultRenderOutputDirectory(std::filesystem::path{}).string();
+    if (runtimeState->animationPanel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        runtimeState->errorMessage = "Use Export Selected Quick MP4 for MP4 animation exports.";
+        runtimeState->statusMessage.clear();
+        return;
     }
+
+    auto& settings = runtimeState->renderSettings;
+    NormalizeAnimationRenderSettings(&settings);
 
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
@@ -4093,9 +4869,7 @@ void StartAnimationExportJob(
         return;
     }
 
-    const bool exportUsesPreviewDensity =
-        runtimeState->animationPanel.exportMode != invisible_places::output::AnimationExportMode::FastPreviewMp4 &&
-        runtimeState->animationPanel.exportPreviewDensity;
+    const bool exportUsesPreviewDensity = runtimeState->animationPanel.exportPreviewDensity;
     if (viewport != nullptr && exportUsesPreviewDensity) {
         PreparePreviewLodSampleCaches(runtimeState, viewport);
     }
@@ -4107,30 +4881,6 @@ void StartAnimationExportJob(
         runtimeState->errorMessage = "Animation path did not produce any output frames.";
         runtimeState->statusMessage.clear();
         return;
-    }
-
-    std::filesystem::path videoOutputPath;
-    if (runtimeState->animationPanel.exportMode ==
-        invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
-        if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
-            runtimeState->errorMessage =
-                "Fast MP4 export requires ffmpeg at " + ffmpegPath.string() + ".";
-            runtimeState->statusMessage.clear();
-            return;
-        }
-
-        videoOutputPath = AnimationMp4OutputPath(*runtimeState);
-        std::error_code createError;
-        if (!videoOutputPath.parent_path().empty()) {
-            std::filesystem::create_directories(videoOutputPath.parent_path(), createError);
-            if (createError) {
-                runtimeState->errorMessage = "Failed to create MP4 output directory: " + createError.message();
-                runtimeState->statusMessage.clear();
-                return;
-            }
-        }
-
     }
 
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
@@ -4154,10 +4904,17 @@ void StartAnimationExportJob(
         .currentFrame = 0,
         .currentTile = 0,
         .startedAt = std::chrono::steady_clock::now(),
-        .videoOutputPath = videoOutputPath,
+        .videoOutputPath = {},
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
+        .animationName = runtimeState->animationPanel.currentPath->name,
+        .animationFilePath = runtimeState->animationPanel.currentFilePath.empty()
+                                  ? std::filesystem::path{}
+                                  : std::filesystem::path{runtimeState->animationPanel.currentFilePath},
+        .exportLog = MakeExportLogState(
+            settings.outputDirectory,
+            runtimeState->animationPanel.exportMode),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
             runtimeState->projectSettings.backgroundColor[1],
@@ -4177,10 +4934,7 @@ void StartAnimationExportJob(
         writerState};
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
-    runtimeState->statusMessage =
-        runtimeState->animationPanel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-            ? "Encoding full-cloud Fast MP4..."
-            : "Rendering HQ preview-density EXR stack on GPU...";
+    runtimeState->statusMessage = "Rendering HQ preview-density EXR stack on GPU...";
     runtimeState->errorMessage.clear();
 }
 
@@ -4195,17 +4949,49 @@ void FinishOfflineRenderJob(
     auto finalStatusMessage = statusMessage;
     auto finalErrorMessage = errorMessage;
     auto& job = runtimeState->offlineRenderJob;
+    const bool clearQuickMp4Queue = job.quickMp4BatchJob && !finalErrorMessage.empty();
+    RefreshAnimationExportWriterProgress(&job);
     if (job.worker.joinable()) {
         if (job.writerState != nullptr && !job.writerState->completed) {
             RequestAnimationExportWriterCancellation(&job);
         }
         job.worker = std::jthread{};
     }
+    job.exportLog.endResidentMemoryBytes = CurrentResidentMemoryBytes();
+    if (job.exportLog.endResidentMemoryBytes > job.exportLog.peakResidentMemoryBytes) {
+        job.exportLog.peakResidentMemoryBytes = job.exportLog.endResidentMemoryBytes;
+    }
+
+    const auto logPath = job.exportLog.path;
+    const auto logError = WriteExportLog(job, finalStatusMessage, finalErrorMessage);
+    if (!logPath.empty()) {
+        if (logError.empty()) {
+            if (!finalErrorMessage.empty()) {
+                finalErrorMessage += " Export log: " + logPath.string() + ".";
+            } else if (!finalStatusMessage.empty()) {
+                finalStatusMessage += " Log: " + logPath.string() + ".";
+            } else {
+                finalStatusMessage = "Export log: " + logPath.string() + ".";
+            }
+        } else if (!finalErrorMessage.empty()) {
+            finalErrorMessage += " Export log failed: " + logError + ".";
+        } else if (!finalStatusMessage.empty()) {
+            finalStatusMessage += " Export log failed: " + logError + ".";
+        } else {
+            finalStatusMessage = "Export log failed: " + logError + ".";
+        }
+    }
 
     job.active = false;
     job.cancelRequested = false;
     job.writerFinishRequested = false;
     job.writerState.reset();
+    if (clearQuickMp4Queue) {
+        runtimeState->animationPanel.quickMp4Queue.clear();
+        runtimeState->animationPanel.quickMp4QueueTotal = 0;
+        runtimeState->animationPanel.quickMp4QueueCompleted = 0;
+        runtimeState->animationPanel.quickMp4QueueSkipped = 0;
+    }
     runtimeState->statusMessage = finalStatusMessage;
     runtimeState->errorMessage = finalErrorMessage;
 }
@@ -4242,7 +5028,20 @@ void ProcessOfflineRenderJobStep(
             writerError = job.writerState->errorMessage;
         }
         if (writerCompleted) {
+            const bool wasQuickMp4BatchJob = job.quickMp4BatchJob;
+            const bool wasCancelled = job.cancelRequested;
             FinishOfflineRenderJob(runtimeState, writerStatus, writerError);
+            if (wasQuickMp4BatchJob) {
+                if (wasCancelled || !writerError.empty()) {
+                    runtimeState->animationPanel.quickMp4Queue.clear();
+                    runtimeState->animationPanel.quickMp4QueueTotal = 0;
+                    runtimeState->animationPanel.quickMp4QueueCompleted = 0;
+                    runtimeState->animationPanel.quickMp4QueueSkipped = 0;
+                    return;
+                }
+                ++runtimeState->animationPanel.quickMp4QueueCompleted;
+                StartNextQueuedQuickMp4Export(runtimeState, viewport);
+            }
             return;
         }
     }
@@ -4292,7 +5091,10 @@ void ProcessOfflineRenderJobStep(
             .height = job.settings.height,
             .previewDensity = job.previewDensity,
         };
+        const auto captureStart = std::chrono::steady_clock::now();
         auto image = viewport->RenderPointCloudExrFrame(request);
+        RecordExportGpuCaptureDuration(&job, std::chrono::steady_clock::now() - captureStart);
+        SampleExportLogMemory(&job);
         const auto outputFrameIndex = job.settings.startFrame + job.currentFrame;
         if (!QueueAnimationExportFrame(&job, outputFrameIndex, std::move(image))) {
             FinishOfflineRenderJob(runtimeState, {}, "Animation export writer stopped accepting frames.");
@@ -4353,17 +5155,10 @@ void DrawAnimationExportSection(
         ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
     }
 
-    InputTextString("Output Folder", &settings.outputDirectory);
+    bool settingsChanged = false;
+    settingsChanged |= InputTextString("Output Folder", &settings.outputDirectory);
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        InputTextString("MP4 Name/File", &panel.mp4OutputPath);
-        if (panel.mp4OutputPath.empty()) {
-            ImGui::TextDisabled("Default MP4: %s", AnimationMp4OutputPath(*runtimeState).string().c_str());
-        } else {
-            ImGui::TextDisabled("MP4 output: %s", AnimationMp4OutputPath(*runtimeState).string().c_str());
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("A bare name saves inside Output Folder. Absolute paths save exactly there.");
-        }
+        ImGui::TextDisabled("Quick MP4 names are generated as Animation_Visual.mp4.");
     }
 
     int width = static_cast<int>(settings.width);
@@ -4374,18 +5169,23 @@ void DrawAnimationExportSection(
 
     if (ImGui::InputInt("Width", &width)) {
         settings.width = static_cast<std::uint32_t>(std::max(1, width));
+        settingsChanged = true;
     }
     if (ImGui::InputInt("Height", &height)) {
         settings.height = static_cast<std::uint32_t>(std::max(1, height));
+        settingsChanged = true;
     }
     if (ImGui::InputInt("Frame Rate", &fps)) {
         settings.framesPerSecond = static_cast<std::uint32_t>(std::max(1, fps));
+        settingsChanged = true;
     }
     if (ImGui::InputInt("Start Frame", &startFrame)) {
         settings.startFrame = static_cast<std::uint32_t>(std::max(0, startFrame));
+        settingsChanged = true;
     }
     if (ImGui::InputInt("End Frame", &endFrame)) {
         settings.endFrame = static_cast<std::uint32_t>(std::max(0, endFrame));
+        settingsChanged = true;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Use 0 to render through the final interpolated frame.");
@@ -4394,6 +5194,10 @@ void DrawAnimationExportSection(
         const auto viewportSize = CurrentUiViewportSize(*viewport);
         settings.width = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.x));
         settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
+        settingsChanged = true;
+    }
+    if (settingsChanged) {
+        MarkCurrentAnimationExportSettingsDirty(runtimeState);
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Point density: full source clouds.");
@@ -4402,6 +5206,35 @@ void DrawAnimationExportSection(
         ImGui::Checkbox("Preview Density", &panel.exportPreviewDensity);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Uses the same draw counts and interactive sample buffers as animation playback.");
+        }
+    }
+
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 &&
+        panel.currentPath.has_value()) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Export Visuals");
+        const auto visualIndex = ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+        if (!visualIndex.has_value()) {
+            ImGui::TextDisabled("Load and show a LiDAR layer to choose saved visuals.");
+        } else {
+            auto& session = runtimeState->sessions[visualIndex.value()];
+            EnsurePointVisuals(&session);
+            ImGui::TextDisabled("Source: %s", session.displayName.c_str());
+            std::size_t exportableVisualCount = 0;
+            for (const auto& visual : session.pointVisuals) {
+                if (!IsExportablePointVisualName(visual.name)) {
+                    continue;
+                }
+                ++exportableVisualCount;
+                bool checked = AnimationPathHasExportVisual(panel.currentPath.value(), visual.name);
+                if (ImGui::Checkbox(visual.name.c_str(), &checked)) {
+                    SetAnimationPathExportVisual(&panel.currentPath.value(), visual.name, checked);
+                    panel.dirty = true;
+                }
+            }
+            if (exportableVisualCount == 0) {
+                ImGui::TextDisabled("No saved visuals are available for Quick MP4 export.");
+            }
         }
     }
 
@@ -4440,9 +5273,25 @@ void DrawAnimationExportSection(
             std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
             job.pendingFrameCount);
         ImGui::TextDisabled(
-            "Export runs in its own window; the viewport remains editable.");
+            runtimeState->pauseLiveViewportDuringExport
+                ? "Live 3D view is paused; export rendering continues."
+                : "Export runs in its own window; the viewport remains editable.");
+        if (job.quickMp4BatchJob) {
+            ImGui::TextDisabled(
+                "Quick MP4 %zu / %zu: %s",
+                panel.quickMp4QueueCompleted + 1U,
+                panel.quickMp4QueueTotal,
+                job.exportVisualName.c_str());
+        }
         if (!job.lastOutputPath.empty()) {
             ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
+        }
+        if (!job.exportLog.path.empty()) {
+            ImGui::TextWrapped("Log: %s", job.exportLog.path.string().c_str());
+        }
+        ImGui::Checkbox("Pause 3D View", &runtimeState->pauseLiveViewportDuringExport);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Skips live scene rendering while this export is active.");
         }
         if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
             RequestOfflineRenderCancellation(&job);
@@ -4451,18 +5300,17 @@ void DrawAnimationExportSection(
         return;
     }
 
-    const char* exportButtonLabel =
-        panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-            ? "Export Fast MP4"
-            : "Export HQ EXR Stack";
-    if (ImGui::Button(exportButtonLabel)) {
+    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        ImGui::TextDisabled("Use Export Selected Quick MP4 above to render checked saved animations.");
+        EndPanelSection();
+        return;
+    }
+
+    if (ImGui::Button("Export HQ EXR Stack")) {
         StartAnimationExportJob(runtimeState, viewport);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-            panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-                ? "Captures the active animation as a full-cloud H.264 MP4."
-                : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using preview-density point draws.");
+        ImGui::SetTooltip("Writes beauty.RGB, alpha.A, and depth.Z EXRs using preview-density point draws.");
     }
     EndPanelSection();
 }
@@ -4491,6 +5339,13 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
         job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
             ? "Encoding Fast Preview MP4"
             : "Rendering HQ Preview-Density EXR");
+    if (job.quickMp4BatchJob) {
+        ImGui::Text(
+            "Quick MP4: %zu / %zu",
+            runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
+            runtimeState->animationPanel.quickMp4QueueTotal);
+        ImGui::Text("Visual: %s", job.exportVisualName.c_str());
+    }
     ImGui::ProgressBar(frameProgress, ImVec2{360.0F, 0.0F});
     ImGui::Text(
         "Captured: %u / %zu",
@@ -5870,6 +6725,11 @@ void DrawAnimationSection(
         for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
             const bool selected = panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() == index;
             ImGui::PushID(static_cast<int>(index));
+            bool selectedForExport = AnimationFileSelectedForExport(panel, panel.availableFiles[index]);
+            if (ImGui::Checkbox("##quickMp4Export", &selectedForExport)) {
+                SetAnimationFileSelectedForExport(&panel, panel.availableFiles[index], selectedForExport);
+            }
+            ImGui::SameLine();
             if (panel.renamingFileIndex.has_value() && panel.renamingFileIndex.value() == index) {
                 if (panel.focusFileRename) {
                     ImGui::SetKeyboardFocusHere();
@@ -5893,8 +6753,13 @@ void DrawAnimationSection(
                 }
             } else {
                 const auto displayName = AnimationDisplayNameFromPath(panel.availableFiles[index]);
-                if (ImGui::Selectable(displayName.c_str(), selected)) {
+                const bool selectedForBatchExport = selectedForExport;
+                if (ImGui::Selectable(displayName.c_str(), selectedForBatchExport)) {
                     panel.selectedFileIndex = index;
+                    SetAnimationFileSelectedForExport(
+                        &panel,
+                        panel.availableFiles[index],
+                        !selectedForBatchExport);
                 }
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                     BeginAnimationFileRename(&panel, index);
@@ -5910,6 +6775,20 @@ void DrawAnimationSection(
         }
         ImGui::EndListBox();
     }
+
+    const auto selectedQuickMp4Count = panel.selectedExportFiles.size();
+    const bool exportButtonDisabled = runtimeState->offlineRenderJob.active;
+    if (exportButtonDisabled) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Export Selected Quick MP4")) {
+        StartSelectedQuickMp4Batch(runtimeState, &viewport);
+    }
+    if (exportButtonDisabled) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu selected", selectedQuickMp4Count);
 
     if (panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() < panel.availableFiles.size()) {
         if (ImGui::Button("Load")) {
@@ -5931,6 +6810,7 @@ void DrawAnimationSection(
                     panel.currentPath.reset();
                     panel.selectedKeyIndex.reset();
                 }
+                SetAnimationFileSelectedForExport(&panel, deletedPath, false);
                 RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
             }
         }
@@ -6497,6 +7377,13 @@ void DrawRenderInfoSection(
         }
         ImGui::Separator();
         ImGui::Checkbox("Diagnostics", &runtimeState->showDiagnosticsPanel);
+        ImGui::Checkbox("Pause 3D View During Export", &runtimeState->pauseLiveViewportDuringExport);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Keeps the controls responsive while skipping live scene rendering during MP4/EXR exports.");
+        }
+        if (runtimeState->offlineRenderJob.active && runtimeState->pauseLiveViewportDuringExport) {
+            ImGui::TextDisabled("3D view paused while export renders.");
+        }
         EndPanelSection();
     }
 
@@ -6569,6 +7456,10 @@ void DrawRenderInfoSection(
         if (!job.lastOutputPath.empty()) {
             ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
         }
+        if (!job.exportLog.path.empty()) {
+            ImGui::TextWrapped("Log: %s", job.exportLog.path.string().c_str());
+        }
+        ImGui::Checkbox("Pause 3D View", &runtimeState->pauseLiveViewportDuringExport);
         if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
             RequestOfflineRenderCancellation(&job);
         }
@@ -7058,19 +7949,28 @@ int Application::Run() const {
             if (runtimeState.offlineRenderJob.active) {
                 ProcessOfflineRenderJobStep(&runtimeState, &viewport.value());
             }
+            const bool pauseLiveViewport =
+                runtimeState.offlineRenderJob.active && runtimeState.pauseLiveViewportDuringExport;
 
             DrawControlsWindow(&runtimeState, &viewport.value());
             DrawDiagnosticsWindow(&runtimeState, viewport.value());
             DrawLoadingOverlay(runtimeState);
-            DrawAnimationViewportOverlay(&runtimeState, viewport.value());
-            UpdateCameraFromInput(&runtimeState, viewport.value());
-            UpdateAnimationPlayback(&runtimeState);
-            UpdateCameraShotPlayback(&runtimeState);
-            UpdatePerformanceInteractionState(&runtimeState, viewport.value());
+            if (!pauseLiveViewport) {
+                DrawAnimationViewportOverlay(&runtimeState, viewport.value());
+                UpdateCameraFromInput(&runtimeState, viewport.value());
+                UpdateAnimationPlayback(&runtimeState);
+                UpdateCameraShotPlayback(&runtimeState);
+                UpdatePerformanceInteractionState(&runtimeState, viewport.value());
+            }
             PrunePreviewLodSampleCaches(&runtimeState);
-            DrawPivotOverlay(runtimeState, viewport.value());
+            if (!pauseLiveViewport) {
+                DrawPivotOverlay(runtimeState, viewport.value());
+            }
             viewport->SetDiagnosticsEnabled(runtimeState.showDiagnosticsPanel);
-            viewport->UpdateRenderState(BuildRenderState(runtimeState, viewport.value()));
+            viewport->SetLiveSceneRenderingEnabled(!pauseLiveViewport);
+            if (!pauseLiveViewport) {
+                viewport->UpdateRenderState(BuildRenderState(runtimeState, viewport.value()));
+            }
             viewport->DrawFrame();
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds{16});

@@ -1533,6 +1533,15 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     path.depthOfFieldEnabled = false;
     path.apertureFStops = 2.8F;
     path.depthOfFieldMaxBlurPixels = 36.0F;
+    path.exportSettings = {
+        .outputDirectory = "Saved/renders/Roundtrip",
+        .width = 1280,
+        .height = 720,
+        .framesPerSecond = 24,
+        .startFrame = 5,
+        .endFrame = 42,
+    };
+    path.exportVisualNames = {"Painty", "X-Ray RGB"};
     path.keys = {
         {
             .cameraPosition = {1.0F, 2.0F, 3.0F},
@@ -1564,6 +1573,15 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     CHECK_FALSE(loadedPath->depthOfFieldEnabled);
     CHECK(loadedPath->apertureFStops == Catch::Approx(2.8F));
     CHECK(loadedPath->depthOfFieldMaxBlurPixels == Catch::Approx(36.0F));
+    CHECK(loadedPath->exportSettings.outputDirectory == "Saved/renders/Roundtrip");
+    CHECK(loadedPath->exportSettings.width == 1280);
+    CHECK(loadedPath->exportSettings.height == 720);
+    CHECK(loadedPath->exportSettings.framesPerSecond == 24);
+    CHECK(loadedPath->exportSettings.startFrame == 5);
+    CHECK(loadedPath->exportSettings.endFrame == 42);
+    REQUIRE(loadedPath->exportVisualNames.size() == 2);
+    CHECK(loadedPath->exportVisualNames[0] == "Painty");
+    CHECK(loadedPath->exportVisualNames[1] == "X-Ray RGB");
     CHECK(loadedPath->keys[0].cameraPosition[2] == Catch::Approx(3.0F));
     CHECK(loadedPath->keys[0].focusPoint[1] == Catch::Approx(5.0F));
     CHECK(loadedPath->keys[0].fovDegrees == Catch::Approx(42.0F));
@@ -1571,6 +1589,36 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     CHECK(loadedPath->keys[0].farPlane == Catch::Approx(900.0F));
     CHECK(loadedPath->keys[0].sourceShotName == "Entry");
 
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Legacy animation path files load with default export metadata", "[serialization][animation]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_legacy.ipanim.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output
+            << "{\n"
+            << "  \"schema_version\": 1,\n"
+            << "  \"name\": \"Legacy Animation\",\n"
+            << "  \"duration_frames\": 30,\n"
+            << "  \"keys\": [\n"
+            << "    {\"camera_position\": [0, 0, 0], \"focus_point\": [0, 0, -1]},\n"
+            << "    {\"camera_position\": [1, 0, 0], \"focus_point\": [1, 0, -1]}\n"
+            << "  ]\n"
+            << "}\n";
+    }
+
+    std::string errorMessage;
+    const auto loadedPath = invisible_places::serialization::LoadAnimationPath(outputPath, &errorMessage);
+    REQUIRE(loadedPath.has_value());
+    CHECK(loadedPath->name == "Legacy Animation");
+    CHECK(loadedPath->exportSettings.outputDirectory.empty());
+    CHECK(loadedPath->exportSettings.width == 1920);
+    CHECK(loadedPath->exportSettings.height == 1080);
+    CHECK(loadedPath->exportSettings.framesPerSecond == 30);
+    CHECK(loadedPath->exportSettings.startFrame == 0);
+    CHECK(loadedPath->exportSettings.endFrame == 0);
+    CHECK(loadedPath->exportVisualNames.empty());
     std::filesystem::remove(outputPath);
 }
 
@@ -1738,6 +1786,35 @@ TEST_CASE("Preview-density export point-size scale follows output viewport ratio
     CHECK(invisible_places::output::ComputePointSizePixelScale(3840, 2160, 1920, 1080) == Catch::Approx(2.0F));
     CHECK(invisible_places::output::ComputePointSizePixelScale(960, 540, 1920, 1080) == Catch::Approx(0.5F));
     CHECK(invisible_places::output::ComputePointSizePixelScale(1920, 1080, 0, 1080) == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Quick MP4 output paths append visual names and collision suffixes", "[output][video]") {
+    const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_quick_mp4_names";
+    std::filesystem::create_directories(outputDirectory);
+    const auto firstPath = outputDirectory / "Site_1_Painty.mp4";
+    const auto secondPath = outputDirectory / "Site_1_Painty_1.mp4";
+    const auto reservedPath = outputDirectory / "Site_1_Painty_2.mp4";
+
+    {
+        std::ofstream first{firstPath, std::ios::trunc};
+        first << "existing";
+    }
+    {
+        std::ofstream second{secondPath, std::ios::trunc};
+        second << "existing";
+    }
+
+    const auto uniquePath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
+        outputDirectory,
+        "Site 1",
+        "Painty",
+        {reservedPath});
+    CHECK(uniquePath == outputDirectory / "Site_1_Painty_3.mp4");
+
+    std::filesystem::remove(firstPath);
+    std::filesystem::remove(secondPath);
+    std::filesystem::remove(outputDirectory / "Site_1_Painty_3.mp4");
+    std::filesystem::remove(outputDirectory);
 }
 
 TEST_CASE("Fast preview MP4 ffmpeg command uses raw RGBA video input", "[output][video]") {

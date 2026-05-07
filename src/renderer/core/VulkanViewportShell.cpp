@@ -663,8 +663,10 @@ void VulkanViewportShell::DrawFrame() {
     vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
-    RefreshHighQualityGaussianScene(currentFrameIndex_);
-    UpdateUniformBuffer(currentFrameIndex_);
+    if (liveSceneRenderingEnabled_) {
+        RefreshHighQualityGaussianScene(currentFrameIndex_);
+        UpdateUniformBuffer(currentFrameIndex_);
+    }
     const auto prepareEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
 
@@ -4555,13 +4557,17 @@ void VulkanViewportShell::RecordCommandBuffer(
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
-    for (const auto& layer : renderState_.pointCloudLayers) {
-        PointCloudDrawPlan plan;
-        if (ResolvePointCloudDrawPlan(layer, false, &plan) &&
-            UploadPointCloudLayerStyle(layer, plan, frameIndex, false)) {
-            if (collectDiagnostics) {
-                ++pointStyleUploadCount;
-                pointSkippedInactiveBindings += InactivePointBindingCount(layer.style);
+    const bool drawLiveScene = liveSceneRenderingEnabled_;
+
+    if (drawLiveScene) {
+        for (const auto& layer : renderState_.pointCloudLayers) {
+            PointCloudDrawPlan plan;
+            if (ResolvePointCloudDrawPlan(layer, false, &plan) &&
+                UploadPointCloudLayerStyle(layer, plan, frameIndex, false)) {
+                if (collectDiagnostics) {
+                    ++pointStyleUploadCount;
+                    pointSkippedInactiveBindings += InactivePointBindingCount(layer.style);
+                }
             }
         }
     }
@@ -4601,13 +4607,15 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    const bool sceneHasActiveXray = std::any_of(
-        renderState_.pointCloudLayers.begin(),
-        renderState_.pointCloudLayers.end(),
-        [](const SceneRenderState::PointCloudLayerState& layer) {
-            return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
-        });
-    if (!renderState_.pointCloudLayers.empty()) {
+    const bool sceneHasActiveXray =
+        drawLiveScene &&
+        std::any_of(
+            renderState_.pointCloudLayers.begin(),
+            renderState_.pointCloudLayers.end(),
+            [](const SceneRenderState::PointCloudLayerState& layer) {
+                return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
+            });
+    if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             if (collectDiagnostics &&
                 !sceneHasActiveXray &&
@@ -4640,7 +4648,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (!renderState_.pointCloudLayers.empty()) {
+    if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
             VkPipeline spritePipeline = pointAccumulationPipeline_;
@@ -4674,7 +4682,7 @@ void VulkanViewportShell::RecordCommandBuffer(
         }
     }
 
-    if (!renderState_.gaussianSplatLayers.empty()) {
+    if (drawLiveScene && !renderState_.gaussianSplatLayers.empty()) {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, gaussianSplatPipeline_);
 
         for (const auto& layer : renderState_.gaussianSplatLayers) {
@@ -4752,7 +4760,8 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (imageIndex < compositeDescriptorSets_.size() &&
+    if (drawLiveScene &&
+        imageIndex < compositeDescriptorSets_.size() &&
         compositeDescriptorSets_[imageIndex] != VK_NULL_HANDLE) {
         VkDescriptorSet descriptorSet = compositeDescriptorSets_[imageIndex];
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline_);
@@ -4772,7 +4781,8 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (frameIndex < kFramesInFlight &&
+    if (drawLiveScene &&
+        frameIndex < kFramesInFlight &&
         highQualityGaussianScene_.descriptorSets[frameIndex] != VK_NULL_HANDLE &&
         highQualityGaussianScene_.splatCount > 0) {
         VkDescriptorSet descriptorSet = highQualityGaussianScene_.descriptorSets[frameIndex];

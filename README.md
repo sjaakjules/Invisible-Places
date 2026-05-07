@@ -14,7 +14,7 @@ This repository is now in an interactive preview/export phase:
 - project state, camera shots, and point-cloud style presets can be saved to JSON and loaded back into the session,
 - the side panel is split into Lidar, Visuals, gSplat, Camera, Animation, and Project work areas,
 - camera shots can be saved, loaded, interpolated at the 30 fps project timebase, and converted into editable animation paths,
-- saved animation paths can be played, scrubbed, edited, and exported as Fast Preview MP4 or preview-density EXR stacks,
+- saved animation paths can be played, scrubbed, edited, assigned saved visual export selections, and exported as batched Quick MP4s or preview-density EXR stacks,
 - EXR output currently writes beauty, alpha, and depth channels,
 - orbit pivots can be inferred from visible point/splat samples near the cursor or screen centre,
 - large point clouds have deterministic budget sampling and an automatic camera-motion preview LOD path.

@@ -141,6 +141,8 @@ class VulkanViewportShell {
     [[nodiscard]] const ViewportDiagnostics& Diagnostics() const { return diagnostics_; }
     void SetDiagnosticsEnabled(bool enabled);
     [[nodiscard]] bool DiagnosticsEnabled() const { return diagnosticsEnabled_; }
+    void SetLiveSceneRenderingEnabled(bool enabled) { liveSceneRenderingEnabled_ = enabled; }
+    [[nodiscard]] bool LiveSceneRenderingEnabled() const { return liveSceneRenderingEnabled_; }
 
   private:
     static constexpr std::size_t kFramesInFlight = 2U;
@@ -432,6 +434,7 @@ class VulkanViewportShell {
     SceneRenderState renderState_{};
     ViewportDiagnostics diagnostics_{};
     bool diagnosticsEnabled_ = false;
+    bool liveSceneRenderingEnabled_ = true;
     bool diagnosticsTimingInitialized_ = false;
     float pointSizeRangeMin_ = 1.0F;
     float pointSizeRangeMax_ = 64.0F;

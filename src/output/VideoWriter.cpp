@@ -3,6 +3,7 @@
 #include <Imath/half.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <sstream>
 #include <string_view>
@@ -45,6 +46,27 @@ std::uint8_t UnitFloatToByte(float value) {
     return static_cast<std::uint8_t>(std::clamp(std::lround(value * 255.0F), 0L, 255L));
 }
 
+std::string SanitizeFileStem(std::string_view name, std::string_view fallback) {
+    std::string stem;
+    stem.reserve(name.size());
+    bool previousWasSeparator = false;
+    for (const char character : name) {
+        const auto unsignedCharacter = static_cast<unsigned char>(character);
+        if (std::isalnum(unsignedCharacter) != 0) {
+            stem.push_back(character);
+            previousWasSeparator = false;
+        } else if (!previousWasSeparator) {
+            stem.push_back('_');
+            previousWasSeparator = true;
+        }
+    }
+
+    while (!stem.empty() && stem.back() == '_') {
+        stem.pop_back();
+    }
+    return stem.empty() ? std::string{fallback} : stem;
+}
+
 }  // namespace
 
 std::filesystem::path DefaultFfmpegExecutablePath() {
@@ -57,6 +79,36 @@ bool FfmpegExecutableAvailable(const std::filesystem::path& executablePath) {
     return !statusError &&
            std::filesystem::exists(status) &&
            (std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status));
+}
+
+std::filesystem::path BuildUniqueQuickMp4OutputPath(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    std::string_view visualName) {
+    return BuildUniqueQuickMp4OutputPath(outputDirectory, animationName, visualName, {});
+}
+
+std::filesystem::path BuildUniqueQuickMp4OutputPath(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    std::string_view visualName,
+    const std::vector<std::filesystem::path>& reservedPaths) {
+    const auto baseStem =
+        SanitizeFileStem(animationName, "Animation") + "_" + SanitizeFileStem(visualName, "Visual");
+    auto candidate = outputDirectory / (baseStem + ".mp4");
+    const auto reserved = [&reservedPaths](const std::filesystem::path& path) {
+        const auto normalized = path.lexically_normal();
+        return std::any_of(
+            reservedPaths.begin(),
+            reservedPaths.end(),
+            [&normalized](const std::filesystem::path& reservedPath) {
+                return reservedPath.lexically_normal() == normalized;
+            });
+    };
+    for (std::uint32_t suffix = 1; std::filesystem::exists(candidate) || reserved(candidate); ++suffix) {
+        candidate = outputDirectory / (baseStem + "_" + std::to_string(suffix) + ".mp4");
+    }
+    return candidate;
 }
 
 std::string BuildFfmpegRawRgbaCommand(

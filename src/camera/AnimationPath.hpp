@@ -20,6 +20,15 @@ struct AnimationPathKey {
     std::string sourceShotName;
 };
 
+struct AnimationExportSettings {
+    std::string outputDirectory;
+    std::uint32_t width = 1920;
+    std::uint32_t height = 1080;
+    std::uint32_t framesPerSecond = 30;
+    std::uint32_t startFrame = 0;
+    std::uint32_t endFrame = 0;
+};
+
 struct AnimationPath {
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
@@ -27,6 +36,8 @@ struct AnimationPath {
     bool depthOfFieldEnabled = false;
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
+    AnimationExportSettings exportSettings{};
+    std::vector<std::string> exportVisualNames;
 };
 
 struct AnimationPathEvaluation {
