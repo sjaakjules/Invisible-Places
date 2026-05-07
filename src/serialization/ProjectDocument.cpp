@@ -147,6 +147,8 @@ const char* PointCloudGeometryModeName(PointCloudGeometryMode mode) {
             return "screen_sprites";
         case PointCloudGeometryMode::WorldSurfels:
             return "world_surfels";
+        case PointCloudGeometryMode::CameraFacingWorldSprites:
+            return "camera_facing_world_sprites";
     }
 
     return "screen_sprites";
@@ -156,6 +158,11 @@ PointCloudGeometryMode ParsePointCloudGeometryMode(const json& value) {
     const auto modeName = value.get<std::string>();
     if (modeName == "world_surfels") {
         return PointCloudGeometryMode::WorldSurfels;
+    }
+    if (modeName == "camera_facing_world_sprites" ||
+        modeName == "camera_facing_world_surfels" ||
+        modeName == "world_sprites") {
+        return PointCloudGeometryMode::CameraFacingWorldSprites;
     }
     return PointCloudGeometryMode::ScreenSprites;
 }
@@ -333,6 +340,8 @@ void MigrateLegacyPointCloudRenderMode(
     }
 }
 
+PointCloudStyleState ParsePointCloudStyle(const json& styleJson);
+
 json SerializePointCloudStyle(const PointCloudStyleState& style) {
     return json{
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
@@ -354,6 +363,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"density_scale", style.densityScale},
         {"density_clamp", style.densityClamp},
         {"depth_alpha_threshold", style.depthAlphaThreshold},
+        {"solid_centers", style.solidCenters},
         {"point_size", SerializeBinding(style.pointSize)},
         {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
@@ -362,6 +372,25 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"depth_fade", SerializeBinding(style.depthFade)},
         {"colormap_position", SerializeBinding(style.colormapPosition)},
     };
+}
+
+json SerializePointCloudVisual(const ProjectLayerDocument::PointVisual& visual) {
+    return json{
+        {"name", visual.name.empty() ? std::string{"Unnamed"} : visual.name},
+        {"point_style", SerializePointCloudStyle(visual.style)},
+    };
+}
+
+ProjectLayerDocument::PointVisual ParsePointCloudVisual(const json& visualJson) {
+    ProjectLayerDocument::PointVisual visual;
+    visual.name = visualJson.value("name", std::string{"Unnamed"});
+    if (visual.name.empty()) {
+        visual.name = "Unnamed";
+    }
+    if (visualJson.contains("point_style")) {
+        visual.style = ParsePointCloudStyle(visualJson.at("point_style"));
+    }
+    return visual;
 }
 
 PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
@@ -405,6 +434,7 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.densityScale = styleJson.value("density_scale", style.densityScale);
     style.densityClamp = styleJson.value("density_clamp", style.densityClamp);
     style.depthAlphaThreshold = styleJson.value("depth_alpha_threshold", style.depthAlphaThreshold);
+    style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
     if (styleJson.contains("point_size")) {
         style.pointSize = ParseBinding(styleJson.at("point_size"));
     }
@@ -446,6 +476,15 @@ json SerializeProjectLayer(const ProjectLayerDocument& layer) {
     if (layer.pointStyle.has_value()) {
         layerJson["point_style"] = SerializePointCloudStyle(layer.pointStyle.value());
     }
+    if (!layer.pointVisuals.empty()) {
+        json visualsJson = json::array();
+        for (const auto& visual : layer.pointVisuals) {
+            visualsJson.push_back(SerializePointCloudVisual(visual));
+        }
+        layerJson["point_visuals"] = std::move(visualsJson);
+        layerJson["selected_point_visual"] =
+            layer.selectedPointVisualName.empty() ? std::string{"Unnamed"} : layer.selectedPointVisualName;
+    }
     return layerJson;
 }
 
@@ -458,6 +497,16 @@ ProjectLayerDocument ParseProjectLayer(const json& layerJson) {
     layer.pointBudgetActivePoints = layerJson.value("point_budget_active_points", 0ULL);
     if (layerJson.contains("point_style")) {
         layer.pointStyle = ParsePointCloudStyle(layerJson.at("point_style"));
+    }
+    if (layerJson.contains("point_visuals") && layerJson.at("point_visuals").is_array()) {
+        for (const auto& visualJson : layerJson.at("point_visuals")) {
+            layer.pointVisuals.push_back(ParsePointCloudVisual(visualJson));
+        }
+        layer.selectedPointVisualName =
+            layerJson.value("selected_point_visual", layer.selectedPointVisualName);
+        if (layer.selectedPointVisualName.empty()) {
+            layer.selectedPointVisualName = "Unnamed";
+        }
     }
     return layer;
 }

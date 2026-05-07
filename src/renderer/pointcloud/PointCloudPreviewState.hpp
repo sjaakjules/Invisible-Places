@@ -36,7 +36,8 @@ enum class PointCloudColormapId {
 
 enum class PointCloudGeometryMode {
     ScreenSprites,
-    WorldSurfels
+    WorldSurfels,
+    CameraFacingWorldSprites
 };
 
 enum class PointCloudDepthContribution {
@@ -85,6 +86,7 @@ struct PointCloudStyleState {
     float densityScale = 1.0F;
     float densityClamp = 64.0F;
     float depthAlphaThreshold = 0.5F;
+    bool solidCenters = true;
     invisible_places::style::RenderParameterBinding pointSize;
     invisible_places::style::RenderParameterBinding surfelDiameter;
     invisible_places::style::RenderParameterBinding opacity;

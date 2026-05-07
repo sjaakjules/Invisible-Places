@@ -872,6 +872,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.densityScale = 1.75F;
     pointStyle.densityClamp = 96.0F;
     pointStyle.depthAlphaThreshold = 0.42F;
+    pointStyle.solidCenters = false;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.pointSize,
         2,
@@ -897,6 +898,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         nullptr);
     pointStyle.colormapPosition.active = false;
     layer.pointStyle = pointStyle;
+    auto editedStyle = pointStyle;
+    editedStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+    editedStyle.solidColor = {0.1F, 0.2F, 0.3F, 1.0F};
+    layer.pointVisuals.push_back({.name = "Warm", .style = pointStyle});
+    layer.pointVisuals.push_back({.name = "Warm_Edited", .style = editedStyle});
+    layer.selectedPointVisualName = "Warm_Edited";
     document.layers.push_back(layer);
 
     std::string errorMessage;
@@ -910,6 +917,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"blend_mode\"") == std::string::npos);
         CHECK(savedJson.find("\"depth_contribution\"") != std::string::npos);
         CHECK(savedJson.find("\"active\"") != std::string::npos);
+        CHECK(savedJson.find("\"solid_centers\"") != std::string::npos);
+        CHECK(savedJson.find("\"point_visuals\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_point_visual\"") != std::string::npos);
     }
 
     const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
@@ -987,6 +997,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->densityScale == Catch::Approx(1.75F));
     CHECK(loadedLayer.pointStyle->densityClamp == Catch::Approx(96.0F));
     CHECK(loadedLayer.pointStyle->depthAlphaThreshold == Catch::Approx(0.42F));
+    CHECK(!loadedLayer.pointStyle->solidCenters);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldSlot == 2);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldName == "Height");
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.inputMin == Catch::Approx(-2.0F));
@@ -996,6 +1007,14 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(!loadedLayer.pointStyle->opacity.active);
     CHECK(loadedLayer.pointStyle->colormapPosition.fieldMap.fieldName == "Intensity");
     CHECK(!loadedLayer.pointStyle->colormapPosition.active);
+    REQUIRE(loadedLayer.pointVisuals.size() == 2);
+    CHECK(loadedLayer.selectedPointVisualName == "Warm_Edited");
+    CHECK(loadedLayer.pointVisuals[0].name == "Warm");
+    CHECK(loadedLayer.pointVisuals[1].name == "Warm_Edited");
+    CHECK(
+        loadedLayer.pointVisuals[1].style.colorMode ==
+        invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor);
+    CHECK(loadedLayer.pointVisuals[1].style.solidColor[2] == Catch::Approx(0.3F));
 
     std::filesystem::remove(outputPath);
 }
@@ -1026,6 +1045,30 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
     CHECK(preset->style.opacity.active);
     CHECK(preset->style.emissiveStrength.active);
     CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
+
+    std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Point cloud style parses camera-facing world sprite geometry", "[serialization]") {
+    const auto presetPath = std::filesystem::temp_directory_path() / "invisible_places_camera_facing_world_sprite.json";
+    std::ofstream output{presetPath, std::ios::trunc};
+    output << R"({
+  "schema_version": 2,
+  "preset_name": "Camera Facing",
+  "point_style": {
+    "geometry_mode": "camera_facing_world_sprites",
+    "solid_centers": true
+  }
+})";
+    output.close();
+
+    std::string errorMessage;
+    const auto preset = invisible_places::serialization::LoadPointCloudStylePreset(presetPath, &errorMessage);
+    REQUIRE(preset.has_value());
+    CHECK(
+        preset->style.geometryMode ==
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites);
+    CHECK(preset->style.solidCenters);
 
     std::filesystem::remove(presetPath);
 }
@@ -2068,6 +2111,50 @@ TEST_CASE("Offline point colourise recolours while preserving lightness", "[outp
     CHECK(colourised.beautyB[center] > colourised.beautyR[center]);
     CHECK((colourised.beautyB[center] / colourised.alpha[center]) ==
           Catch::Approx(unchanged.beautyR[center] / unchanged.alpha[center]).margin(0.03F));
+}
+
+TEST_CASE("Offline point solid centres can reach opaque alpha", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFFFFFFFFU};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithSolidCenters = [&](bool solidCenters) {
+        invisible_places::renderer::pointcloud::PointCloudStyleState style;
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+        style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+        style.solidCenters = solidCenters;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9, 9);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+            &image);
+        return image;
+    };
+
+    const auto feathered = renderWithSolidCenters(false);
+    const auto solid = renderWithSolidCenters(true);
+    const auto center = static_cast<std::size_t>(4) * 9U + 4U;
+    CHECK(feathered.alpha[center] < 1.0F);
+    CHECK(solid.alpha[center] == Catch::Approx(1.0F).margin(1.0e-5F));
 }
 
 TEST_CASE("Offline point renderer uses safe defaults for inactive material bindings", "[output][offline][point-style]") {

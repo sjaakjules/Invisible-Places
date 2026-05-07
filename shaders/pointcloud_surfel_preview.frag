@@ -58,6 +58,10 @@ float ResolveFalloff(float radius, float radiusSquared) {
     return smoothstep(1.0, clamp(styleData.renderParams0.y, 0.0, 0.99), radius);
 }
 
+float AlphaClampMax() {
+    return styleData.renderControl.w != 0u ? 1.0 : 0.995;
+}
+
 float ResolveDepthFadeAlpha(float depthFade) {
     const float depthNorm = clamp(
         (inViewDepth - uniforms.depthParameters.y) /
@@ -76,7 +80,7 @@ void main() {
 
     float opacity = clamp(inOpacity, 0.0, 1.0);
     float edge = ResolveFalloff(radius, radiusSquared);
-    float alpha = clamp(opacity * edge * ResolveDepthFadeAlpha(inDepthFade), 0.0, 0.995);
+    float alpha = clamp(opacity * edge * ResolveDepthFadeAlpha(inDepthFade), 0.0, AlphaClampMax());
     if (alpha <= 1e-5 ||
         styleData.renderControl.x == 0u ||
         (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0))) {

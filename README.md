@@ -1,4 +1,4 @@
-# Invisible Places
+h# Invisible Places
 
 Invisible Places is a desktop renderer and shot-authoring tool for combining very large point clouds and Gaussian splats in the same scene. The early priority is responsive look-development on Apple Silicon M1 using Vulkan through MoltenVK, while keeping the same rendering model portable to stronger Windows GPUs for final output.
 

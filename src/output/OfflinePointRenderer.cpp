@@ -275,6 +275,10 @@ float ResolveDepthFadeAlpha(
         std::clamp(sample.depthFade, 0.0F, 1.0F));
 }
 
+float AlphaClampMax(const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    return style.solidCenters ? 1.0F : 0.995F;
+}
+
 float WeightedAlphaWeight(
     float alpha,
     float viewDepth,
@@ -352,14 +356,15 @@ glm::vec3 PixelRayDirection(
 
 void ResolveSurfelBasis(
     OfflinePointSample* sample,
-    const invisible_places::camera::OrbitCameraMatrices& matrices) {
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    bool forceCameraFacing) {
     if (sample == nullptr) {
         return;
     }
 
     const glm::vec3 cameraRight = CameraRight(matrices);
     const glm::vec3 cameraUp = CameraUp(matrices);
-    if (!sample->hasNormal || glm::dot(sample->normal, sample->normal) <= 1.0e-8F) {
+    if (forceCameraFacing || !sample->hasNormal || glm::dot(sample->normal, sample->normal) <= 1.0e-8F) {
         sample->normal = matrices.position - sample->worldCenter;
         if (glm::dot(sample->normal, sample->normal) <= 1.0e-8F) {
             sample->normal = glm::normalize(glm::cross(cameraRight, cameraUp));
@@ -419,8 +424,8 @@ bool BuildOfflinePointSample(
 
     const glm::vec3 ndc = glm::vec3{clip} / clip.w;
     const bool worldSurfels =
-        layer.style.geometryMode ==
-        invisible_places::renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
+        layer.style.geometryMode !=
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::ScreenSprites;
     if (!worldSurfels &&
         (ndc.x < -1.0F || ndc.x > 1.0F || ndc.y < -1.0F || ndc.y > 1.0F ||
          ndc.z < -1.0F || ndc.z > 1.0F)) {
@@ -489,7 +494,11 @@ bool BuildOfflinePointSample(
                 sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
             }
         }
-        ResolveSurfelBasis(sample, matrices);
+        ResolveSurfelBasis(
+            sample,
+            matrices,
+            layer.style.geometryMode ==
+                invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites);
     }
     return sample->opacity > 0.0F;
 }
@@ -766,7 +775,7 @@ void RenderPointCloudTile(
                             std::clamp(
                                 sample.opacity * falloff * ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth),
                                 0.0F,
-                                0.995F);
+                                AlphaClampMax(layer.style));
                         if (pixelIndex < image->depth.size() &&
                             coveredViewDepth < image->depth[pixelIndex] &&
                             invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(
@@ -832,7 +841,7 @@ void RenderPointCloudTile(
                             std::clamp(
                                 sample.opacity * falloff * ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth),
                                 0.0F,
-                                0.995F);
+                                AlphaClampMax(layer.style));
                         if (alpha <= 1.0e-5F) {
                             return;
                         }
@@ -845,7 +854,7 @@ void RenderPointCloudTile(
                         const float weightedAlpha = std::clamp(
                             densityClamp > 0.0F ? std::min(alpha * densityScale, densityClamp) : alpha,
                             0.0F,
-                            0.995F);
+                            AlphaClampMax(layer.style));
                         const float weight = WeightedAlphaWeight(weightedAlpha, coveredViewDepth, cameraState);
                         accumR[localIndex] += sample.color.r * weightedAlpha * weight;
                         accumG[localIndex] += sample.color.g * weightedAlpha * weight;

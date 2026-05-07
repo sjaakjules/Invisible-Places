@@ -146,6 +146,10 @@ float ResolveFalloff(float radius, float radiusSquared) {
     return smoothstep(1.0, clamp(styleData.renderParams0.y, 0.0, 0.99), radius);
 }
 
+float AlphaClampMax() {
+    return styleData.renderControl.w != 0u ? 1.0 : 0.995;
+}
+
 float WeightedAlphaWeight(float alpha) {
     const float depthNorm = clamp(
         (inViewDepth - uniforms.depthParameters.y) /
@@ -181,7 +185,7 @@ void main() {
     const float radius = sqrt(radiusSquared);
     const float falloff = ResolveFalloff(radius, radiusSquared);
     const float opacity = clamp(inOpacity, 0.0, 1.0);
-    const float alpha = clamp(opacity * falloff * ResolveDepthFadeAlpha(inDepthFade), 0.0, 0.995);
+    const float alpha = clamp(opacity * falloff * ResolveDepthFadeAlpha(inDepthFade), 0.0, AlphaClampMax());
     if (alpha <= 1e-5) {
         discard;
     }
@@ -194,7 +198,7 @@ void main() {
     const float densityScale = max(0.0, styleData.renderParams2.x);
     const float densityClamp = max(0.0, styleData.renderParams2.y);
     const float densityAlpha = densityClamp > 0.0 ? min(alpha * max(1.0, densityScale), densityClamp) : alpha;
-    const float weightedAlpha = clamp(densityAlpha, 0.0, 0.995);
+    const float weightedAlpha = clamp(densityAlpha, 0.0, AlphaClampMax());
     const float weight = WeightedAlphaWeight(weightedAlpha);
     outAccumulation = vec4(baseColor * weightedAlpha * weight, weightedAlpha * weight);
     outRevealage = weightedAlpha;

@@ -27,10 +27,16 @@ struct ProjectLayerDocument {
     bool visible = false;
     std::uint64_t pointBudgetActivePoints = 0;
     std::optional<invisible_places::renderer::pointcloud::PointCloudStyleState> pointStyle;
+    struct PointVisual {
+        std::string name = "Unnamed";
+        invisible_places::renderer::pointcloud::PointCloudStyleState style{};
+    };
+    std::vector<PointVisual> pointVisuals;
+    std::string selectedPointVisualName = "Unnamed";
 };
 
 struct ProjectDocument {
-    std::uint32_t schemaVersion = 10;
+    std::uint32_t schemaVersion = 11;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;

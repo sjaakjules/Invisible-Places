@@ -4135,7 +4135,7 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
     }
 
     const bool worldSurfels =
-        layer.style.geometryMode == renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
+        layer.style.geometryMode != renderer::pointcloud::PointCloudGeometryMode::ScreenSprites;
     if (worldSurfels) {
         drawPointCount = std::min(drawPointCount, kMaxSurfelEncodedPointCount);
         if (drawPointCount == 0) {
@@ -4215,7 +4215,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         static_cast<std::uint32_t>(layer.style.depthContribution),
         static_cast<std::uint32_t>(layer.style.falloffProfile),
         static_cast<std::uint32_t>(layer.style.geometryMode),
-        0U,
+        layer.style.solidCenters ? 1U : 0U,
     };
     styleGpu.renderParams0 = glm::vec4{
         layer.style.exposure,

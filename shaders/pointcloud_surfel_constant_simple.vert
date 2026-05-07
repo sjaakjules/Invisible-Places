@@ -81,7 +81,8 @@ vec3 CameraUp() {
 void ResolveBasis(vec3 center, uint pointIndex, out vec3 tangent, out vec3 bitangent) {
     const vec3 cameraRight = CameraRight();
     const vec3 cameraUp = CameraUp();
-    bool useNormal = styleData.pointMeta.z != 0u;
+    const bool forceCameraFacing = styleData.renderControl.z == 2u;
+    bool useNormal = styleData.pointMeta.z != 0u && !forceCameraFacing;
     vec3 normal = useNormal ? surfelNormals.normals[pointIndex].xyz : vec3(0.0);
     useNormal = useNormal && dot(normal, normal) > 1e-8;
 

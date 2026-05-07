@@ -95,6 +95,8 @@ constexpr std::size_t kMaxPivotSamples = 65536;
 constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
 constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
+constexpr std::string_view kDefaultPointVisualName = "Unnamed";
+constexpr std::string_view kEditedPointVisualSuffix = "_Edited";
 
 enum class PendingLoadPhase {
     CpuLoading,
@@ -266,6 +268,11 @@ struct OfflinePointLayerSnapshot {
     glm::mat4 localToWorld{1.0F};
 };
 
+struct SavedPointVisualState {
+    std::string name = std::string{kDefaultPointVisualName};
+    PointCloudStyleState style{};
+};
+
 struct PreviewLayerSession {
     LayerKind kind = LayerKind::PointCloud;
     std::filesystem::path sourcePath;
@@ -291,6 +298,9 @@ struct PreviewLayerSession {
     std::uint32_t previewLodSampledDrawCount = 0;
     PointBudgetState pointBudget{};
     PointCloudStyleState pointStyle{};
+    std::vector<SavedPointVisualState> pointVisuals;
+    std::string selectedPointVisualName = std::string{kDefaultPointVisualName};
+    std::string pointVisualNameBuffer = std::string{kDefaultPointVisualName};
     GaussianSplatStyleState gsplatStyle{};
 };
 
@@ -979,6 +989,169 @@ bool EndsWith(std::string_view value, std::string_view suffix) {
            value.substr(value.size() - suffix.size()) == suffix;
 }
 
+std::string NormalizePointVisualName(std::string_view name) {
+    auto trimmed = TrimText(name);
+    return trimmed.empty() ? std::string{kDefaultPointVisualName} : trimmed;
+}
+
+bool IsEditedPointVisualName(std::string_view name) {
+    return EndsWith(name, kEditedPointVisualSuffix);
+}
+
+std::string BasePointVisualName(std::string_view name) {
+    if (!IsEditedPointVisualName(name)) {
+        return NormalizePointVisualName(name);
+    }
+    return NormalizePointVisualName(name.substr(0, name.size() - kEditedPointVisualSuffix.size()));
+}
+
+std::string EditedPointVisualName(std::string_view baseName) {
+    return BasePointVisualName(baseName) + std::string{kEditedPointVisualSuffix};
+}
+
+std::optional<std::size_t> FindPointVisualIndex(
+    const PreviewLayerSession& session,
+    std::string_view name) {
+    const auto normalized = NormalizePointVisualName(name);
+    for (std::size_t index = 0; index < session.pointVisuals.size(); ++index) {
+        if (session.pointVisuals[index].name == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+void UpsertPointVisual(
+    PreviewLayerSession* session,
+    std::string_view name,
+    const PointCloudStyleState& style) {
+    if (session == nullptr) {
+        return;
+    }
+
+    const auto normalized = NormalizePointVisualName(name);
+    if (const auto existingIndex = FindPointVisualIndex(*session, normalized); existingIndex.has_value()) {
+        session->pointVisuals[existingIndex.value()].style = style;
+        return;
+    }
+
+    session->pointVisuals.push_back({.name = normalized, .style = style});
+}
+
+void RemovePointVisual(PreviewLayerSession* session, std::string_view name) {
+    if (session == nullptr) {
+        return;
+    }
+
+    const auto normalized = NormalizePointVisualName(name);
+    session->pointVisuals.erase(
+        std::remove_if(
+            session->pointVisuals.begin(),
+            session->pointVisuals.end(),
+            [&normalized](const SavedPointVisualState& visual) {
+                return visual.name == normalized;
+            }),
+        session->pointVisuals.end());
+}
+
+void SyncPointVisualNameBuffer(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return;
+    }
+    session->pointVisualNameBuffer = BasePointVisualName(session->selectedPointVisualName);
+}
+
+void EnsurePointVisuals(PreviewLayerSession* session) {
+    if (session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    if (session->pointVisuals.empty()) {
+        session->pointVisuals.push_back(
+            {.name = std::string{kDefaultPointVisualName}, .style = session->pointStyle});
+    }
+
+    for (auto& visual : session->pointVisuals) {
+        visual.name = NormalizePointVisualName(visual.name);
+    }
+
+    session->selectedPointVisualName = NormalizePointVisualName(session->selectedPointVisualName);
+    if (!FindPointVisualIndex(*session, session->selectedPointVisualName).has_value()) {
+        session->selectedPointVisualName = session->pointVisuals.front().name;
+    }
+    if (session->pointVisualNameBuffer.empty()) {
+        SyncPointVisualNameBuffer(session);
+    }
+}
+
+void SelectPointVisual(PreviewLayerSession* session, std::string_view name) {
+    if (session == nullptr) {
+        return;
+    }
+
+    EnsurePointVisuals(session);
+    const auto index = FindPointVisualIndex(*session, name);
+    if (!index.has_value()) {
+        return;
+    }
+
+    session->selectedPointVisualName = session->pointVisuals[index.value()].name;
+    session->pointStyle = session->pointVisuals[index.value()].style;
+    SyncPointVisualNameBuffer(session);
+}
+
+void MarkPointVisualEdited(PreviewLayerSession* session) {
+    if (session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    EnsurePointVisuals(session);
+    const auto selectedName = NormalizePointVisualName(session->selectedPointVisualName);
+    if (IsEditedPointVisualName(selectedName)) {
+        UpsertPointVisual(session, selectedName, session->pointStyle);
+        session->selectedPointVisualName = selectedName;
+        return;
+    }
+
+    const auto editedName = EditedPointVisualName(selectedName);
+    UpsertPointVisual(session, editedName, session->pointStyle);
+    session->selectedPointVisualName = editedName;
+    SyncPointVisualNameBuffer(session);
+}
+
+void SaveCurrentPointVisual(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    EnsurePointVisuals(session);
+    const auto selectedName = NormalizePointVisualName(session->selectedPointVisualName);
+    const auto targetName = BasePointVisualName(
+        session->pointVisualNameBuffer.empty()
+            ? BasePointVisualName(selectedName)
+            : session->pointVisualNameBuffer);
+
+    UpsertPointVisual(session, targetName, session->pointStyle);
+    if (IsEditedPointVisualName(selectedName)) {
+        RemovePointVisual(session, selectedName);
+        if (BasePointVisualName(selectedName) == std::string{kDefaultPointVisualName} &&
+            targetName != std::string{kDefaultPointVisualName} &&
+            session->pointVisuals.size() > 1U) {
+            RemovePointVisual(session, kDefaultPointVisualName);
+        }
+    } else if (
+        selectedName == std::string{kDefaultPointVisualName} &&
+        targetName != selectedName &&
+        session->pointVisuals.size() > 1U) {
+        RemovePointVisual(session, selectedName);
+    }
+
+    session->selectedPointVisualName = targetName;
+    SyncPointVisualNameBuffer(session);
+    runtimeState->statusMessage = "Saved visual " + targetName + ".";
+    runtimeState->errorMessage.clear();
+}
+
 bool DrawSectionHeader(const char* label) {
     static std::unordered_map<ImGuiID, bool> collapsedSections;
 
@@ -1433,6 +1606,7 @@ std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::Asset
             asset.header.vertexCount);
         session.pointStyle.colorMode =
             session.hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
+        EnsurePointVisuals(&session);
         sessions.push_back(std::move(session));
     }
 
@@ -2137,6 +2311,10 @@ bool ActivateLoadedPointCloud(
     ClearPreviewLodSampleCache(&session);
 
     SanitizePointCloudStyle(&session);
+    if (session.kind == LayerKind::PointCloud) {
+        EnsurePointVisuals(&session);
+        UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+    }
 
     try {
         viewport->UploadPointCloud(sessionIndex, cloud, session.pointBudget.sampledIndices);
@@ -2401,6 +2579,24 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         if (session.kind == LayerKind::PointCloud) {
             layerDocument.pointBudgetActivePoints = session.pointBudget.activePoints;
             layerDocument.pointStyle = session.pointStyle;
+            layerDocument.selectedPointVisualName =
+                session.selectedPointVisualName.empty()
+                    ? std::string{kDefaultPointVisualName}
+                    : session.selectedPointVisualName;
+            if (session.pointVisuals.empty()) {
+                ProjectLayerDocument::PointVisual visual;
+                visual.name = std::string{kDefaultPointVisualName};
+                visual.style = session.pointStyle;
+                layerDocument.pointVisuals.push_back(std::move(visual));
+            } else {
+                layerDocument.pointVisuals.reserve(session.pointVisuals.size());
+                for (const auto& visual : session.pointVisuals) {
+                    ProjectLayerDocument::PointVisual visualDocument;
+                    visualDocument.name = NormalizePointVisualName(visual.name);
+                    visualDocument.style = visual.style;
+                    layerDocument.pointVisuals.push_back(std::move(visualDocument));
+                }
+            }
         }
         document.layers.push_back(std::move(layerDocument));
     }
@@ -2534,8 +2730,32 @@ bool ApplyProjectDocumentToRuntime(
             continue;
         }
 
-        if (session.kind == LayerKind::PointCloud && layerIt->pointStyle.has_value()) {
-            session.pointStyle = layerIt->pointStyle.value();
+        if (session.kind == LayerKind::PointCloud) {
+            session.pointVisuals.clear();
+            for (const auto& visualDocument : layerIt->pointVisuals) {
+                session.pointVisuals.push_back({
+                    .name = NormalizePointVisualName(visualDocument.name),
+                    .style = visualDocument.style,
+                });
+            }
+            session.selectedPointVisualName = NormalizePointVisualName(layerIt->selectedPointVisualName);
+
+            if (!session.pointVisuals.empty()) {
+                EnsurePointVisuals(&session);
+                if (const auto visualIndex = FindPointVisualIndex(session, session.selectedPointVisualName);
+                    visualIndex.has_value()) {
+                    session.pointStyle = session.pointVisuals[visualIndex.value()].style;
+                }
+                SyncPointVisualNameBuffer(&session);
+            } else if (layerIt->pointStyle.has_value()) {
+                session.pointStyle = layerIt->pointStyle.value();
+                session.pointVisuals.push_back(
+                    {.name = std::string{kDefaultPointVisualName}, .style = session.pointStyle});
+                session.selectedPointVisualName = std::string{kDefaultPointVisualName};
+                SyncPointVisualNameBuffer(&session);
+            } else {
+                EnsurePointVisuals(&session);
+            }
         }
 
         if (session.kind == LayerKind::PointCloud && layerIt->pointBudgetActivePoints > 0) {
@@ -2547,6 +2767,10 @@ bool ApplyProjectDocumentToRuntime(
         }
 
         SanitizePointCloudStyle(&session);
+        if (session.kind == LayerKind::PointCloud) {
+            EnsurePointVisuals(&session);
+            UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+        }
 
         requestedLoadedLayer |= layerIt->loaded;
         if (!layerIt->loaded) {
@@ -4935,7 +5159,7 @@ void DrawLayerSection(
 }
 
 ScalarBindingWidgetConfig PointSizeBindingConfig(const PreviewLayerSession& session) {
-    if (session.pointStyle.geometryMode == PointCloudGeometryMode::WorldSurfels) {
+    if (session.pointStyle.geometryMode != PointCloudGeometryMode::ScreenSprites) {
         return {.constantMin = 0.0001F,
                 .constantMax = 0.1F,
                 .defaultOutputMin = 0.0001F,
@@ -4959,7 +5183,7 @@ RenderParameterBinding* PointSizeBinding(PreviewLayerSession* session) {
     if (session == nullptr) {
         return nullptr;
     }
-    return session->pointStyle.geometryMode == PointCloudGeometryMode::WorldSurfels
+    return session->pointStyle.geometryMode != PointCloudGeometryMode::ScreenSprites
                ? &session->pointStyle.surfelDiameter
                : &session->pointStyle.pointSize;
 }
@@ -4976,7 +5200,7 @@ bool DrawPointCloudPointSettingsSection(PreviewLayerSession* session) {
     auto& style = session->pointStyle;
     bool changed = false;
     int geometryModeIndex = static_cast<int>(style.geometryMode);
-    const char* geometryModes[] = {"Screen Sprites", "World Surfels"};
+    const char* geometryModes[] = {"Screen Sprites", "World Surfels", "Camera-Facing World Sprites"};
     if (DrawRightAlignedCombo("Geometry", &geometryModeIndex, geometryModes, IM_ARRAYSIZE(geometryModes))) {
         style.geometryMode = static_cast<PointCloudGeometryMode>(geometryModeIndex);
         changed = true;
@@ -4987,7 +5211,7 @@ bool DrawPointCloudPointSettingsSection(PreviewLayerSession* session) {
 
     ImGui::Spacing();
     ImGui::TextUnformatted(
-        style.geometryMode == PointCloudGeometryMode::WorldSurfels ? "Point Size (mm)" : "Point Size (px)");
+        style.geometryMode == PointCloudGeometryMode::ScreenSprites ? "Point Size (px)" : "Point Size (mm)");
     changed |= DrawScalarBindingBody(
         "Point Size",
         PointSizeBinding(session),
@@ -5072,6 +5296,7 @@ bool DrawPointCloudFalloffSection(PreviewLayerSession* session) {
     }
 
     const auto effectiveFalloff = EffectivePointFalloffProfile(style);
+    changed |= ImGui::Checkbox("Solid Centres", &style.solidCenters);
     if (effectiveFalloff == PointCloudFalloffProfile::SoftDisc) {
         changed |= DrawRangedFloatControl(
             "Inner Radius",
@@ -5249,7 +5474,11 @@ bool DrawPointCloudCompositingSection(PreviewLayerSession* session) {
     return changed;
 }
 
-void DrawPointCloudStyleSection(PreviewLayerSession* session) {
+bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
+
     auto& style = session->pointStyle;
     bool changed = false;
 
@@ -5277,6 +5506,7 @@ void DrawPointCloudStyleSection(PreviewLayerSession* session) {
     if (changed) {
         SanitizePointCloudStyle(session);
     }
+    return changed;
 }
 
 void DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
@@ -5337,7 +5567,9 @@ void DrawStyleSection(PreviewRuntimeState* runtimeState) {
     }
 
     if (session->kind == LayerKind::PointCloud) {
-        DrawPointCloudStyleSection(session);
+        if (DrawPointCloudStyleSection(session)) {
+            MarkPointVisualEdited(session);
+        }
     } else {
         const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
         if (effectiveQuality != session->gsplatStyle.qualityMode) {
@@ -6043,6 +6275,7 @@ void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* s
         } else {
             session->pointStyle = presetDocument->style;
             SanitizePointCloudStyle(session);
+            MarkPointVisualEdited(session);
             runtimeState->statusMessage =
                 "Loaded point style preset from " + runtimeState->persistence.pointStylePresetPath + ".";
             runtimeState->errorMessage.clear();
@@ -6084,6 +6317,38 @@ PreviewLayerSession* DrawVisiblePointCloudLookdevSelector(PreviewRuntimeState* r
     return visualIndex.has_value() ? &runtimeState->sessions[visualIndex.value()] : nullptr;
 }
 
+void DrawSavedPointVisualSelector(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    EnsurePointVisuals(session);
+    const auto selectedName = NormalizePointVisualName(session->selectedPointVisualName);
+    if (ImGui::BeginCombo("Saved Visuals", selectedName.c_str())) {
+        for (const auto& visual : session->pointVisuals) {
+            const bool selected = visual.name == selectedName;
+            if (ImGui::Selectable(visual.name.c_str(), selected)) {
+                SelectPointVisual(session, visual.name);
+                runtimeState->statusMessage = "Loaded visual " + visual.name + ".";
+                runtimeState->errorMessage.clear();
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    InputTextString("Visual Name", &session->pointVisualNameBuffer);
+    if (ImGui::Button("Save Visual")) {
+        SaveCurrentPointVisual(runtimeState, session);
+    }
+    if (IsEditedPointVisualName(session->selectedPointVisualName)) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Editing %s", BasePointVisualName(session->selectedPointVisualName).c_str());
+    }
+}
+
 void DrawLidarPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -6096,6 +6361,7 @@ void DrawVisualsPanel(PreviewRuntimeState* runtimeState) {
         visualIndex.has_value() ? &runtimeState->sessions[visualIndex.value()] : nullptr;
     if (BeginPanelSection("Cloud Visuals")) {
         session = DrawVisiblePointCloudLookdevSelector(runtimeState);
+        DrawSavedPointVisualSelector(runtimeState, session);
         EndPanelSection();
     }
     if (session == nullptr) {
@@ -6103,7 +6369,9 @@ void DrawVisualsPanel(PreviewRuntimeState* runtimeState) {
         return;
     }
 
-    DrawPointCloudStyleSection(session);
+    if (DrawPointCloudStyleSection(session)) {
+        MarkPointVisualEdited(session);
+    }
     DrawPresetSection(runtimeState, session);
 }
 
