@@ -1,13 +1,8 @@
 #version 450
 
 layout(location = 0) out vec4 outSourceColor;
-layout(location = 1) out float outColormapValue;
-layout(location = 2) out float outOpacity;
-layout(location = 3) out float outEmissive;
-layout(location = 4) out float outXray;
-layout(location = 5) out float outDepthFade;
-layout(location = 6) out float outViewDepth;
-layout(location = 7) out vec2 outDiscCoord;
+layout(location = 1) out float outViewDepth;
+layout(location = 2) out vec2 outDiscCoord;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -18,10 +13,6 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
 } uniforms;
-
-layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
-    float values[];
-} scalarFieldValues;
 
 struct RenderParameterBindingGpu {
     vec4 constantValue;
@@ -61,8 +52,6 @@ layout(set = 0, binding = 6, std430) readonly buffer SurfelNormals {
     vec4 normals[];
 } surfelNormals;
 
-const uint kFieldMapFlagClamp = 1u;
-const uint kFieldMapFlagInvert = 2u;
 const uint kSurfelVerticesPerPoint = 6u;
 
 const vec2 kSurfelCorners[6] = vec2[](
@@ -72,40 +61,6 @@ const vec2 kSurfelCorners[6] = vec2[](
     vec2(-1.0, -1.0),
     vec2(1.0, 1.0),
     vec2(-1.0, 1.0));
-
-float LoadScalarFieldValue(uint fieldSlot, uint pointIndex) {
-    if (fieldSlot == 0xFFFFFFFFu ||
-        fieldSlot >= styleData.globalControl.z ||
-        styleData.pointMeta.x == 0u ||
-        pointIndex >= styleData.pointMeta.x) {
-        return 0.0;
-    }
-
-    const uint scalarIndex = (fieldSlot * styleData.pointMeta.x) + pointIndex;
-    return scalarFieldValues.values[scalarIndex];
-}
-
-float EvaluateBinding(RenderParameterBindingGpu binding, uint pointIndex) {
-    if (binding.control.x == 0u) {
-        return binding.constantValue.x;
-    }
-
-    float normalized =
-        (LoadScalarFieldValue(binding.control.y, pointIndex) - binding.range.x) /
-        max(1e-5, binding.range.y - binding.range.x);
-    if ((binding.control.z & kFieldMapFlagInvert) != 0u) {
-        normalized = 1.0 - normalized;
-    }
-
-    if ((binding.control.z & kFieldMapFlagClamp) != 0u) {
-        normalized = clamp(normalized, 0.0, 1.0);
-        normalized = pow(normalized, max(0.0001, binding.extra.x));
-    } else {
-        normalized = sign(normalized) * pow(abs(normalized), max(0.0001, binding.extra.x));
-    }
-
-    return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
-}
 
 vec4 UnpackRgba8(uint packedColor) {
     return vec4(
@@ -182,7 +137,7 @@ void main() {
     const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
     const float centerDepth = -centerViewPosition.z;
     const float diameter =
-        max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex)) +
+        max(0.0, styleData.surfelDiameterBinding.constantValue.x) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
     const vec3 offset = (tangent * corner.x + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
@@ -191,11 +146,6 @@ void main() {
     gl_Position = uniforms.viewProjection * worldPosition;
 
     outSourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
-    outColormapValue = EvaluateBinding(styleData.colormapPositionBinding, pointIndex);
-    outOpacity = EvaluateBinding(styleData.opacityBinding, pointIndex);
-    outEmissive = EvaluateBinding(styleData.emissiveBinding, pointIndex);
-    outXray = EvaluateBinding(styleData.xrayBinding, pointIndex);
-    outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;
     outDiscCoord = corner;
 }

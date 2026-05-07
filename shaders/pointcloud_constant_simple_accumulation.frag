@@ -1,15 +1,7 @@
 #version 450
-#extension GL_GOOGLE_include_directive : require
-#include "pointcloud_colormaps.glsl"
 
 layout(location = 0) in vec4 inSourceColor;
-layout(location = 1) in float inColormapValue;
-layout(location = 2) in float inOpacity;
-layout(location = 3) in float inEmissive;
-layout(location = 4) in float inXray;
-layout(location = 5) in float inDepthFade;
-layout(location = 6) in float inViewDepth;
-layout(location = 7) in vec2 inDiscCoord;
+layout(location = 1) in float inViewDepth;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
@@ -51,18 +43,11 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 colorize;
 } styleData;
 
-layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInput sceneDepthInput;
-
 vec3 ResolveBaseColor() {
-    vec3 baseColor = inSourceColor.rgb;
-    if (styleData.globalControl.x == 1u) {
-        baseColor = styleData.solidColor.rgb;
-    } else if (styleData.globalControl.x == 2u) {
-        baseColor = ApplyPointCloudColormap(styleData.globalControl.y, clamp(inColormapValue, 0.0, 1.0));
-    } else if (styleData.globalControl.w == 0u) {
-        baseColor = styleData.solidColor.rgb;
+    if (styleData.globalControl.x == 1u || styleData.globalControl.w == 0u) {
+        return styleData.solidColor.rgb;
     }
-    return baseColor;
+    return inSourceColor.rgb;
 }
 
 vec3 RgbToHsl(vec3 color) {
@@ -163,61 +148,35 @@ float WeightedAlphaWeight(float alpha) {
         256.0);
 }
 
-float ResolveDepthFadeAlpha(float depthFade) {
-    const float depthNorm = clamp(
-        (inViewDepth - uniforms.depthParameters.y) /
-        max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
-        0.0,
-        1.0);
-    return mix(1.0, 1.0 - depthNorm, clamp(depthFade, 0.0, 1.0));
-}
-
 void main() {
-    float radiusSquared = dot(inDiscCoord, inDiscCoord);
+    vec2 centered = (gl_PointCoord * 2.0) - 1.0;
+    float radiusSquared = dot(centered, centered);
     if (radiusSquared > 1.0) {
         discard;
     }
 
     const float radius = sqrt(radiusSquared);
     const float falloff = ResolveFalloff(radius, radiusSquared);
-    const float opacity = clamp(inOpacity, 0.0, 1.0);
-    const float alpha = clamp(opacity * falloff * ResolveDepthFadeAlpha(inDepthFade), 0.0, 0.995);
+    const float opacity = clamp(styleData.opacityBinding.constantValue.x, 0.0, 1.0);
+    const float alpha = clamp(opacity * falloff, 0.0, 0.995);
     if (alpha <= 1e-5) {
         discard;
     }
 
     const vec3 baseColor = ApplyColorize(ResolveBaseColor());
-    outAccumulation = vec4(0.0);
-    outRevealage = 0.0;
-    outEmission = vec4(0.0);
-
     const float densityScale = max(0.0, styleData.renderParams2.x);
     const float densityClamp = max(0.0, styleData.renderParams2.y);
     const float densityAlpha = densityClamp > 0.0 ? min(alpha * max(1.0, densityScale), densityClamp) : alpha;
     const float weightedAlpha = clamp(densityAlpha, 0.0, 0.995);
     const float weight = WeightedAlphaWeight(weightedAlpha);
+
     outAccumulation = vec4(baseColor * weightedAlpha * weight, weightedAlpha * weight);
     outRevealage = weightedAlpha;
+    outEmission = vec4(0.0);
 
-    const float emissionGain = max(0.0, inEmissive) * max(0.0, styleData.renderParams0.x);
+    const float emissionGain =
+        max(0.0, styleData.emissiveBinding.constantValue.x) * max(0.0, styleData.renderParams0.x);
     if (emissionGain > 1e-5) {
         outEmission += vec4(baseColor * alpha * emissionGain, alpha * emissionGain);
-    }
-
-    if (inXray > 1e-5) {
-        const float sceneDepth = subpassLoad(sceneDepthInput).r;
-        const float xrayStrength = clamp(inXray, 0.0, 1.0);
-        if (sceneDepth < 0.999999 && xrayStrength > 1e-5) {
-            const float depthBias = max(0.0, styleData.renderParams1.y);
-            const float behind = max(gl_FragCoord.z - sceneDepth - depthBias, 0.0);
-            const float hiddenFade = exp(-behind * max(0.0, styleData.renderParams1.x));
-            const float frontMask = gl_FragCoord.z <= sceneDepth + depthBias ? 1.0 : 0.0;
-            const float xrayAlpha =
-                alpha * xrayStrength * mix(styleData.renderParams1.w * hiddenFade, styleData.renderParams1.z, frontMask);
-            if (xrayAlpha > 1e-5) {
-                const float xrayGain = max(0.0, styleData.renderParams0.x);
-                outEmission += vec4(baseColor * xrayAlpha * xrayGain, xrayAlpha * xrayGain);
-            }
-        }
     }
 }

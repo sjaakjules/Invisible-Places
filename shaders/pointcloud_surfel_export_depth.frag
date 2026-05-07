@@ -40,6 +40,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu depthFadeBinding;
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
+    vec4 colorize;
 } styleData;
 
 float ResolveFalloff(float radius, float radiusSquared) {

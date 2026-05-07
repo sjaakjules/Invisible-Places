@@ -341,6 +341,8 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"color_mode", PointCloudColorModeName(style.colorMode)},
         {"colormap", PointCloudColormapName(style.colormap)},
         {"solid_color", style.solidColor},
+        {"colorize_color", style.colorizeColor},
+        {"colorize_amount", style.colorizeAmount},
         {"exposure", style.exposure},
         {"inner_radius", style.innerRadius},
         {"gaussian_sharpness", style.gaussianSharpness},
@@ -386,6 +388,12 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     if (styleJson.contains("solid_color")) {
         style.solidColor = styleJson.at("solid_color").get<std::array<float, 4>>();
     }
+    if (styleJson.contains("colorize_color")) {
+        style.colorizeColor = styleJson.at("colorize_color").get<std::array<float, 3>>();
+    } else if (styleJson.contains("colourise_color")) {
+        style.colorizeColor = styleJson.at("colourise_color").get<std::array<float, 3>>();
+    }
+    style.colorizeAmount = styleJson.value("colorize_amount", styleJson.value("colourise_amount", style.colorizeAmount));
     style.exposure = styleJson.value("exposure", style.exposure);
     style.innerRadius = styleJson.value("inner_radius", style.innerRadius);
     style.gaussianSharpness = styleJson.value("gaussian_sharpness", style.gaussianSharpness);

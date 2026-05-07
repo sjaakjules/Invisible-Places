@@ -127,6 +127,9 @@ struct PersistenceState {
 struct CameraPanelState {
     std::string draftShotName = "Shot 1";
     std::optional<std::size_t> selectedShotIndex;
+    std::optional<std::size_t> renamingShotIndex;
+    std::string shotRenameBuffer;
+    bool focusShotRename = false;
     std::optional<std::size_t> blendFromIndex;
     std::optional<std::size_t> blendToIndex;
     std::vector<std::size_t> pathShotIndices;
@@ -169,6 +172,9 @@ struct AnimationPanelState {
     std::string mp4OutputPath;
     std::vector<std::filesystem::path> availableFiles;
     std::optional<std::size_t> selectedFileIndex;
+    std::optional<std::size_t> renamingFileIndex;
+    std::string fileRenameBuffer;
+    bool focusFileRename = false;
     std::optional<std::size_t> selectedKeyIndex;
     AnimationEditTarget editTarget = AnimationEditTarget::Camera;
     invisible_places::output::AnimationExportMode exportMode =
@@ -878,6 +884,10 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     session->pointStyle.densityScale = std::max(0.0F, session->pointStyle.densityScale);
     session->pointStyle.densityClamp = std::max(0.0F, session->pointStyle.densityClamp);
     session->pointStyle.depthAlphaThreshold = std::clamp(session->pointStyle.depthAlphaThreshold, 0.0F, 1.0F);
+    session->pointStyle.colorizeAmount = std::clamp(session->pointStyle.colorizeAmount, 0.0F, 1.0F);
+    for (auto& channel : session->pointStyle.colorizeColor) {
+        channel = std::clamp(channel, 0.0F, 1.0F);
+    }
 
     if (session->pointStyle.colorMode == PointCloudColorMode::ScalarColormap) {
         EnsureFieldMappedBindingDefaults(
@@ -925,6 +935,48 @@ bool InputTextString(const char* label, std::string* value) {
         ImGuiInputTextFlags_CallbackResize,
         ResizeInputTextCallback,
         value);
+}
+
+bool InputTextStringWithFlags(
+    const char* label,
+    std::string* value,
+    ImGuiInputTextFlags flags) {
+    if (value == nullptr) {
+        return false;
+    }
+
+    if (value->capacity() < 255U) {
+        value->reserve(255U);
+    }
+
+    return ImGui::InputText(
+        label,
+        value->data(),
+        value->capacity() + 1U,
+        flags | ImGuiInputTextFlags_CallbackResize,
+        ResizeInputTextCallback,
+        value);
+}
+
+std::string TrimText(std::string_view value) {
+    std::size_t begin = 0;
+    while (begin < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
+        ++begin;
+    }
+
+    std::size_t end = value.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(value[end - 1U])) != 0) {
+        --end;
+    }
+
+    return std::string{value.substr(begin, end - begin)};
+}
+
+bool EndsWith(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() &&
+           value.substr(value.size() - suffix.size()) == suffix;
 }
 
 bool DrawSectionHeader(const char* label) {
@@ -2431,6 +2483,9 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->renderSettings = renderSettings;
     runtimeState->cameraShots = document.cameraShots;
     runtimeState->cameraPanel.selectedShotIndex.reset();
+    runtimeState->cameraPanel.renamingShotIndex.reset();
+    runtimeState->cameraPanel.shotRenameBuffer.clear();
+    runtimeState->cameraPanel.focusShotRename = false;
     runtimeState->cameraPanel.blendFromIndex.reset();
     runtimeState->cameraPanel.blendToIndex.reset();
     runtimeState->cameraPanel.pathShotIndices = document.cameraPathShotIndices;
@@ -2438,6 +2493,9 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->cameraPanel.pathDurationFrames =
         std::max<std::uint32_t>(1U, document.cameraPathDurationFrames);
     runtimeState->animationPanel.currentFilePath = document.lastAnimationPath.string();
+    runtimeState->animationPanel.renamingFileIndex.reset();
+    runtimeState->animationPanel.fileRenameBuffer.clear();
+    runtimeState->animationPanel.focusFileRename = false;
     if (runtimeState->cameraPanel.pathShotIndices.empty() &&
         document.schemaVersion < 9U &&
         !runtimeState->cameraShots.empty()) {
@@ -2556,6 +2614,11 @@ void EnsureCameraShotSelections(CameraPanelState* panelState, std::size_t shotCo
     if (!validIndex(panelState->selectedShotIndex)) {
         panelState->selectedShotIndex = shotCount > 0 ? std::optional<std::size_t>{0} : std::nullopt;
     }
+    if (!validIndex(panelState->renamingShotIndex)) {
+        panelState->renamingShotIndex.reset();
+        panelState->shotRenameBuffer.clear();
+        panelState->focusShotRename = false;
+    }
     if (!validIndex(panelState->blendFromIndex)) {
         panelState->blendFromIndex = shotCount > 0 ? std::optional<std::size_t>{0} : std::nullopt;
     }
@@ -2668,6 +2731,28 @@ std::string SanitizeAnimationFileStem(std::string name) {
     return stem.empty() ? std::string{"Animation"} : stem;
 }
 
+std::string AnimationDisplayNameFromPath(const std::filesystem::path& path) {
+    auto filename = path.filename().string();
+    if (EndsWith(filename, ".ipanim.json")) {
+        filename.resize(filename.size() - std::string_view{".json"}.size());
+        return filename;
+    }
+    return path.stem().string();
+}
+
+std::string NormalizeAnimationNameFromInput(std::string name) {
+    name = TrimText(name);
+    if (EndsWith(name, ".ipanim.json")) {
+        name.resize(name.size() - std::string_view{".ipanim.json"}.size());
+    } else if (EndsWith(name, ".ipanim")) {
+        name.resize(name.size() - std::string_view{".ipanim"}.size());
+    } else if (EndsWith(name, ".json")) {
+        name.resize(name.size() - std::string_view{".json"}.size());
+    }
+    name = TrimText(name);
+    return name.empty() ? std::string{"Animation"} : name;
+}
+
 std::filesystem::path AnimationFilePathForName(
     const PreviewRuntimeState& runtimeState,
     const std::string& animationName) {
@@ -2744,6 +2829,12 @@ void RefreshAnimationFileList(AnimationPanelState* panelState, const std::filesy
         panelState->selectedFileIndex = panelState->availableFiles.empty()
                                             ? std::nullopt
                                             : std::optional<std::size_t>{panelState->availableFiles.size() - 1U};
+    }
+    if (panelState->renamingFileIndex.has_value() &&
+        panelState->renamingFileIndex.value() >= panelState->availableFiles.size()) {
+        panelState->renamingFileIndex.reset();
+        panelState->fileRenameBuffer.clear();
+        panelState->focusFileRename = false;
     }
 }
 
@@ -2845,6 +2936,116 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     ApplyAnimationEvaluation(runtimeState, runtimeState->animationPanel.currentPath.value(), 0.0F, false);
     runtimeState->statusMessage = "Loaded animation path: " + inputPath.filename().string() + ".";
     runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool PathsReferToSameFile(const std::filesystem::path& left, const std::filesystem::path& right) {
+    if (left.empty() || right.empty()) {
+        return false;
+    }
+
+    std::error_code equivalentError;
+    if (std::filesystem::equivalent(left, right, equivalentError)) {
+        return true;
+    }
+
+    return left.lexically_normal() == right.lexically_normal();
+}
+
+std::optional<std::size_t> FindAnimationFileIndex(
+    const std::vector<std::filesystem::path>& files,
+    const std::filesystem::path& path) {
+    const auto normalized = path.lexically_normal();
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        if (files[index].lexically_normal() == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+void BeginAnimationFileRename(AnimationPanelState* panel, std::size_t fileIndex) {
+    if (panel == nullptr || fileIndex >= panel->availableFiles.size()) {
+        return;
+    }
+
+    panel->selectedFileIndex = fileIndex;
+    panel->renamingFileIndex = fileIndex;
+    panel->fileRenameBuffer = AnimationDisplayNameFromPath(panel->availableFiles[fileIndex]);
+    panel->focusFileRename = true;
+}
+
+bool CommitAnimationFileRename(PreviewRuntimeState* runtimeState, std::size_t fileIndex) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    if (fileIndex >= panel.availableFiles.size()) {
+        panel.renamingFileIndex.reset();
+        panel.fileRenameBuffer.clear();
+        panel.focusFileRename = false;
+        return false;
+    }
+
+    const auto oldPath = panel.availableFiles[fileIndex];
+    const auto cleanName = NormalizeAnimationNameFromInput(panel.fileRenameBuffer);
+    const auto newPath = oldPath.parent_path() / (SanitizeAnimationFileStem(cleanName) + ".ipanim.json");
+    panel.renamingFileIndex.reset();
+    panel.fileRenameBuffer.clear();
+    panel.focusFileRename = false;
+
+    if (newPath.lexically_normal() == oldPath.lexically_normal()) {
+        return false;
+    }
+
+    std::error_code existsError;
+    if (std::filesystem::exists(newPath, existsError)) {
+        runtimeState->errorMessage = "An animation named " + newPath.filename().string() + " already exists.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::error_code renameError;
+    std::filesystem::rename(oldPath, newPath, renameError);
+    if (renameError) {
+        runtimeState->errorMessage = "Failed to rename animation: " + renameError.message();
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const bool renamedCurrent =
+        !panel.currentFilePath.empty() &&
+        PathsReferToSameFile(std::filesystem::path{panel.currentFilePath}, oldPath);
+    std::string saveError;
+    bool savedInternalName = true;
+    if (renamedCurrent && panel.currentPath.has_value()) {
+        panel.currentPath->name = cleanName;
+        panel.currentFilePath = newPath.string();
+        panel.draftAnimationName = cleanName;
+        if (invisible_places::serialization::SaveAnimationPath(panel.currentPath.value(), newPath, &saveError)) {
+            panel.dirty = false;
+        } else {
+            savedInternalName = false;
+        }
+    } else {
+        auto renamedPath = invisible_places::serialization::LoadAnimationPath(newPath, &saveError);
+        if (renamedPath.has_value()) {
+            renamedPath->name = cleanName;
+            savedInternalName =
+                invisible_places::serialization::SaveAnimationPath(renamedPath.value(), newPath, &saveError);
+        } else {
+            savedInternalName = false;
+        }
+    }
+
+    RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+    panel.selectedFileIndex = FindAnimationFileIndex(panel.availableFiles, newPath);
+    runtimeState->statusMessage = "Renamed animation to " + newPath.filename().string() + ".";
+    runtimeState->errorMessage =
+        savedInternalName
+            ? std::string{}
+            : "Renamed the file, but could not update the animation name inside it: " + saveError;
     return true;
 }
 
@@ -2984,6 +3185,36 @@ void ApplyCameraShot(PreviewRuntimeState* runtimeState, std::size_t shotIndex) {
     runtimeState->cameraPlayback.active = false;
     runtimeState->cameraPanel.selectedShotIndex = shotIndex;
     runtimeState->statusMessage = "Loaded camera shot " + runtimeState->cameraShots[shotIndex].name + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void BeginCameraShotRename(PreviewRuntimeState* runtimeState, std::size_t shotIndex) {
+    if (runtimeState == nullptr || shotIndex >= runtimeState->cameraShots.size()) {
+        return;
+    }
+
+    runtimeState->cameraPanel.selectedShotIndex = shotIndex;
+    runtimeState->cameraPanel.renamingShotIndex = shotIndex;
+    runtimeState->cameraPanel.shotRenameBuffer = runtimeState->cameraShots[shotIndex].name;
+    runtimeState->cameraPanel.focusShotRename = true;
+}
+
+void CommitCameraShotRename(PreviewRuntimeState* runtimeState, std::size_t shotIndex) {
+    if (runtimeState == nullptr || shotIndex >= runtimeState->cameraShots.size()) {
+        return;
+    }
+
+    auto name = TrimText(runtimeState->cameraPanel.shotRenameBuffer);
+    if (name.empty()) {
+        name = "Shot " + std::to_string(shotIndex + 1U);
+    }
+
+    runtimeState->cameraShots[shotIndex].name = name;
+    runtimeState->cameraPanel.renamingShotIndex.reset();
+    runtimeState->cameraPanel.shotRenameBuffer.clear();
+    runtimeState->cameraPanel.focusShotRename = false;
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->statusMessage = "Renamed camera shot to " + name + ".";
     runtimeState->errorMessage.clear();
 }
 
@@ -4815,6 +5046,13 @@ bool DrawPointCloudColourSection(PreviewLayerSession* session) {
         ImGui::TextDisabled("No scalar fields were discovered for this cloud.");
     }
 
+    ImGui::Spacing();
+    changed |= ImGui::ColorEdit3("Colourise Colour", style.colorizeColor.data());
+    changed |= DrawRangedFloatControl(
+        "Colourise Amount",
+        &style.colorizeAmount,
+        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+
     EndPanelSection();
     return changed;
 }
@@ -5189,12 +5427,38 @@ void DrawCameraSection(
         for (std::size_t index = 0; index < runtimeState->cameraShots.size(); ++index) {
             const bool selected = runtimeState->cameraPanel.selectedShotIndex.has_value() &&
                                   runtimeState->cameraPanel.selectedShotIndex.value() == index;
-            if (ImGui::Selectable(runtimeState->cameraShots[index].name.c_str(), selected)) {
-                runtimeState->cameraPanel.selectedShotIndex = index;
+            ImGui::PushID(static_cast<int>(index));
+            if (runtimeState->cameraPanel.renamingShotIndex.has_value() &&
+                runtimeState->cameraPanel.renamingShotIndex.value() == index) {
+                if (runtimeState->cameraPanel.focusShotRename) {
+                    ImGui::SetKeyboardFocusHere();
+                    runtimeState->cameraPanel.focusShotRename = false;
+                }
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool submitted = InputTextStringWithFlags(
+                    "##shotRename",
+                    &runtimeState->cameraPanel.shotRenameBuffer,
+                    ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                const bool commit = submitted || ImGui::IsItemDeactivatedAfterEdit();
+                if (commit) {
+                    CommitCameraShotRename(runtimeState, index);
+                } else if (ImGui::IsItemDeactivated()) {
+                    runtimeState->cameraPanel.renamingShotIndex.reset();
+                    runtimeState->cameraPanel.shotRenameBuffer.clear();
+                    runtimeState->cameraPanel.focusShotRename = false;
+                }
+            } else {
+                if (ImGui::Selectable(runtimeState->cameraShots[index].name.c_str(), selected)) {
+                    runtimeState->cameraPanel.selectedShotIndex = index;
+                }
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    BeginCameraShotRename(runtimeState, index);
+                }
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
             }
+            ImGui::PopID();
         }
         ImGui::EndListBox();
     }
@@ -5370,13 +5634,46 @@ void DrawAnimationSection(
     if (panel.availableFiles.empty()) {
         ImGui::TextDisabled("No saved animation paths found.");
     } else if (ImGui::BeginListBox("Saved Animations", ImVec2{-FLT_MIN, 128.0F})) {
+        bool animationListChanged = false;
         for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
             const bool selected = panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() == index;
-            if (ImGui::Selectable(panel.availableFiles[index].stem().string().c_str(), selected)) {
-                panel.selectedFileIndex = index;
+            ImGui::PushID(static_cast<int>(index));
+            if (panel.renamingFileIndex.has_value() && panel.renamingFileIndex.value() == index) {
+                if (panel.focusFileRename) {
+                    ImGui::SetKeyboardFocusHere();
+                    panel.focusFileRename = false;
+                }
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool submitted = InputTextStringWithFlags(
+                    "##animationRename",
+                    &panel.fileRenameBuffer,
+                    ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                const bool commit = submitted || ImGui::IsItemDeactivatedAfterEdit();
+                if (commit) {
+                    animationListChanged = CommitAnimationFileRename(runtimeState, index);
+                    ImGui::PopID();
+                    break;
+                }
+                if (ImGui::IsItemDeactivated()) {
+                    panel.renamingFileIndex.reset();
+                    panel.fileRenameBuffer.clear();
+                    panel.focusFileRename = false;
+                }
+            } else {
+                const auto displayName = AnimationDisplayNameFromPath(panel.availableFiles[index]);
+                if (ImGui::Selectable(displayName.c_str(), selected)) {
+                    panel.selectedFileIndex = index;
+                }
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    BeginAnimationFileRename(&panel, index);
+                }
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
+            }
+            ImGui::PopID();
+            if (animationListChanged) {
+                break;
             }
         }
         ImGui::EndListBox();
@@ -6019,7 +6316,7 @@ void DrawDiagnosticsWindow(
     }
 
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2{420.0F, 360.0F}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2{460.0F, 520.0F}, ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Renderer Diagnostics", &open, ImGuiWindowFlags_NoCollapse)) {
         const auto& diagnostics = viewport.Diagnostics();
         const auto viewportSize = CurrentUiViewportSize(viewport);
@@ -6041,6 +6338,39 @@ void DrawDiagnosticsWindow(
                 "Accumulation: %u x %u",
                 diagnostics.accumulationWidth,
                 diagnostics.accumulationHeight);
+            if (diagnostics.framesInFlight > 0U) {
+                ImGui::Text(
+                    "Frames: %u in flight, %u swapchain images, current %u",
+                    diagnostics.framesInFlight,
+                    diagnostics.swapchainImageCount,
+                    diagnostics.currentFrameIndex);
+            }
+            EndPanelSection();
+        }
+
+        if (BeginPanelSection("Frame Timing")) {
+            ImGui::Text(
+                "Render frame: %.3f ms (%.1f FPS)",
+                diagnostics.frameRenderMs,
+                diagnostics.frameFps);
+            ImGui::Text(
+                "Rolling average: %.3f ms (%.1f FPS)",
+                diagnostics.averageFrameRenderMs,
+                diagnostics.averageFrameFps);
+            ImGui::Text(
+                "Min / max while open: %.3f / %.3f ms",
+                diagnostics.minFrameRenderMs,
+                diagnostics.maxFrameRenderMs);
+            ImGui::Separator();
+            ImGui::Text("UI render: %.3f ms", diagnostics.frameUiRenderMs);
+            ImGui::Text("Fence wait: %.3f ms", diagnostics.frameFenceWaitMs);
+            ImGui::Text("Prepare uniforms/resources: %.3f ms", diagnostics.framePrepareMs);
+            ImGui::Text("Acquire image: %.3f ms", diagnostics.frameAcquireMs);
+            ImGui::Text("Acquired image wait: %.3f ms", diagnostics.frameImageWaitMs);
+            ImGui::Text("Command buffer: %.3f ms", diagnostics.frameCommandBufferMs);
+            ImGui::Text("Queue submit: %.3f ms", diagnostics.frameSubmitMs);
+            ImGui::Text("Present: %.3f ms", diagnostics.framePresentMs);
+            ImGui::Text("Platform windows: %.3f ms", diagnostics.framePlatformWindowsMs);
             EndPanelSection();
         }
 
@@ -6055,6 +6385,13 @@ void DrawDiagnosticsWindow(
                 diagnostics.pointDrawCalls,
                 diagnostics.pointDepthLayerCount,
                 diagnostics.pointAccumulationLayerCount);
+            ImGui::Text(
+                "Material variants: %u simple, %u unified",
+                diagnostics.pointConstantSimpleDrawCalls,
+                diagnostics.pointUnifiedDrawCalls);
+            ImGui::Text(
+                "Depth prepass skipped (no X-Ray): %u",
+                diagnostics.pointDepthPrepassSkippedNoXray);
             ImGui::Text("Style uploads: %u", diagnostics.pointStyleUploadCount);
             ImGui::Text("Inactive bindings skipped: %u", diagnostics.pointSkippedInactiveBindings);
             ImGui::Text("Command record: %.3f ms", diagnostics.pointCommandRecordMs);

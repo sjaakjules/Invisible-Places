@@ -58,15 +58,22 @@ enum class PointCloudPreviewLodMode {
     ForceLod
 };
 
+enum class PointCloudMaterialVariant {
+    ConstantSimple,
+    Unified
+};
+
 struct PointCloudStyleState {
     PointCloudStyleState();
 
     PointCloudGeometryMode geometryMode = PointCloudGeometryMode::ScreenSprites;
-    PointCloudDepthContribution depthContribution = PointCloudDepthContribution::AlphaThreshold;
+    PointCloudDepthContribution depthContribution = PointCloudDepthContribution::None;
     PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::SoftDisc;
     PointCloudColorMode colorMode = PointCloudColorMode::SourceRgb;
     PointCloudColormapId colormap = PointCloudColormapId::Viridis;
     std::array<float, 4> solidColor{0.93F, 0.88F, 0.72F, 1.0F};
+    std::array<float, 3> colorizeColor{0.95F, 0.68F, 0.28F};
+    float colorizeAmount = 0.0F;
     float exposure = 1.0F;
     float innerRadius = 0.55F;
     float gaussianSharpness = 4.0F;
@@ -118,7 +125,11 @@ struct PointCloudSessionState {
 
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 [[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style, bool sceneHasActiveXray);
 [[nodiscard]] bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha);
+[[nodiscard]] bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style);
+[[nodiscard]] PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style);
+[[nodiscard]] const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant);
 PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 PointBudgetState MakePointBudgetState(
     const invisible_places::io::LoadedPointCloud& cloud,

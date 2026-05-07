@@ -11,6 +11,7 @@ namespace invisible_places::renderer::pointcloud {
 namespace {
 
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
+constexpr float kMaterialEpsilon = 1.0e-5F;
 
 void SortForCoherentDraw(std::vector<std::uint32_t>* indices) {
     if (indices == nullptr) {
@@ -326,6 +327,10 @@ bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style) {
     return style.depthContribution != PointCloudDepthContribution::None;
 }
 
+bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style, bool sceneHasActiveXray) {
+    return sceneHasActiveXray && PointCloudStyleUsesDepthPrepass(style);
+}
+
 bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha) {
     if (alpha <= 1.0e-5F || !PointCloudStyleUsesDepthPrepass(style)) {
         return false;
@@ -334,6 +339,62 @@ bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float al
         return alpha >= std::clamp(style.depthAlphaThreshold, 0.0F, 1.0F);
     }
     return true;
+}
+
+bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style) {
+    if (!style.xrayStrength.active) {
+        return false;
+    }
+    if (style.xrayStrength.mode == invisible_places::style::ParameterSourceMode::Constant) {
+        return style.xrayStrength.constantValue[0] > kMaterialEpsilon;
+    }
+    return std::max(style.xrayStrength.fieldMap.outputMin, style.xrayStrength.fieldMap.outputMax) >
+           kMaterialEpsilon;
+}
+
+PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style) {
+    const bool simpleColor =
+        style.colorMode == PointCloudColorMode::SourceRgb ||
+        style.colorMode == PointCloudColorMode::SolidColor;
+    const bool constantPointGeometry =
+        (!style.pointSize.active ||
+         style.pointSize.mode == invisible_places::style::ParameterSourceMode::Constant) &&
+        (!style.surfelDiameter.active ||
+         style.surfelDiameter.mode == invisible_places::style::ParameterSourceMode::Constant);
+    const bool constantOpacity =
+        !style.opacity.active ||
+        style.opacity.mode == invisible_places::style::ParameterSourceMode::Constant;
+    const bool constantEmission =
+        !style.emissiveStrength.active ||
+        style.emissiveStrength.mode == invisible_places::style::ParameterSourceMode::Constant;
+    const bool noColormapField =
+        !style.colormapPosition.active ||
+        style.colormapPosition.mode == invisible_places::style::ParameterSourceMode::Constant;
+    const bool noDepthFade =
+        !style.depthFade.active ||
+        (style.depthFade.mode == invisible_places::style::ParameterSourceMode::Constant &&
+         style.depthFade.constantValue[0] <= kMaterialEpsilon);
+
+    if (simpleColor &&
+        constantPointGeometry &&
+        constantOpacity &&
+        constantEmission &&
+        noColormapField &&
+        noDepthFade &&
+        !PointCloudStyleHasActiveXray(style)) {
+        return PointCloudMaterialVariant::ConstantSimple;
+    }
+    return PointCloudMaterialVariant::Unified;
+}
+
+const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant) {
+    switch (variant) {
+        case PointCloudMaterialVariant::ConstantSimple:
+            return "constant-simple";
+        case PointCloudMaterialVariant::Unified:
+            return "unified";
+    }
+    return "unified";
 }
 
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints) {

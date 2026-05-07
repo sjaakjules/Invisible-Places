@@ -4,12 +4,7 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec4 inColor;
 
 layout(location = 0) out vec4 outSourceColor;
-layout(location = 1) out float outColormapValue;
-layout(location = 2) out float outOpacity;
-layout(location = 3) out float outEmissive;
-layout(location = 4) out float outXray;
-layout(location = 5) out float outDepthFade;
-layout(location = 6) out float outViewDepth;
+layout(location = 1) out float outViewDepth;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -20,10 +15,6 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
 } uniforms;
-
-layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
-    float values[];
-} scalarFieldValues;
 
 struct RenderParameterBindingGpu {
     vec4 constantValue;
@@ -51,47 +42,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 colorize;
 } styleData;
 
-const uint kFieldMapFlagClamp = 1u;
-const uint kFieldMapFlagInvert = 2u;
-
-float LoadScalarFieldValue(uint fieldSlot) {
-    if (fieldSlot == 0xFFFFFFFFu ||
-        fieldSlot >= styleData.globalControl.z ||
-        styleData.pointMeta.x == 0u) {
-        return 0.0;
-    }
-
-    const uint pointIndex = uint(gl_VertexIndex);
-    if (pointIndex >= styleData.pointMeta.x) {
-        return 0.0;
-    }
-
-    const uint scalarIndex = (fieldSlot * styleData.pointMeta.x) + pointIndex;
-    return scalarFieldValues.values[scalarIndex];
-}
-
-float EvaluateBinding(RenderParameterBindingGpu binding) {
-    if (binding.control.x == 0u) {
-        return binding.constantValue.x;
-    }
-
-    float normalized =
-        (LoadScalarFieldValue(binding.control.y) - binding.range.x) /
-        max(1e-5, binding.range.y - binding.range.x);
-    if ((binding.control.z & kFieldMapFlagInvert) != 0u) {
-        normalized = 1.0 - normalized;
-    }
-
-    if ((binding.control.z & kFieldMapFlagClamp) != 0u) {
-        normalized = clamp(normalized, 0.0, 1.0);
-        normalized = pow(normalized, max(0.0001, binding.extra.x));
-    } else {
-        normalized = sign(normalized) * pow(abs(normalized), max(0.0001, binding.extra.x));
-    }
-
-    return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
-}
-
 float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     if (uniforms.depthOfFieldParameters.x <= 0.5) {
         return 0.0;
@@ -109,8 +59,9 @@ void main() {
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
+
     const float basePointSize = clamp(
-        EvaluateBinding(styleData.pointSizeBinding),
+        styleData.pointSizeBinding.constantValue.x,
         max(1.0, styleData.renderParams3.y),
         max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
     gl_PointSize = clamp(
@@ -119,10 +70,5 @@ void main() {
         max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
 
     outSourceColor = inColor;
-    outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);
-    outOpacity = EvaluateBinding(styleData.opacityBinding);
-    outEmissive = EvaluateBinding(styleData.emissiveBinding);
-    outXray = EvaluateBinding(styleData.xrayBinding);
-    outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;
 }

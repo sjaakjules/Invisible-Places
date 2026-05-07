@@ -859,6 +859,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
     pointStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
     pointStyle.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo;
+    pointStyle.colorizeColor = {0.2F, 0.6F, 1.0F};
+    pointStyle.colorizeAmount = 0.35F;
     pointStyle.exposure = 2.25F;
     pointStyle.innerRadius = 0.35F;
     pointStyle.gaussianSharpness = 5.5F;
@@ -970,6 +972,10 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(
         loadedLayer.pointStyle->colormap ==
         invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo);
+    CHECK(loadedLayer.pointStyle->colorizeColor[0] == Catch::Approx(0.2F));
+    CHECK(loadedLayer.pointStyle->colorizeColor[1] == Catch::Approx(0.6F));
+    CHECK(loadedLayer.pointStyle->colorizeColor[2] == Catch::Approx(1.0F));
+    CHECK(loadedLayer.pointStyle->colorizeAmount == Catch::Approx(0.35F));
     CHECK(loadedLayer.pointStyle->exposure == Catch::Approx(2.25F));
     CHECK(loadedLayer.pointStyle->innerRadius == Catch::Approx(0.35F));
     CHECK(loadedLayer.pointStyle->gaussianSharpness == Catch::Approx(5.5F));
@@ -1090,18 +1096,87 @@ TEST_CASE("Point depth contribution policy is shared by preview and export selec
 
     style.depthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution::None;
     CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style, true));
     CHECK(!invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 1.0F));
 
     style.depthContribution =
         invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold;
     style.depthAlphaThreshold = 0.5F;
     CHECK(invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style, false));
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style, true));
     CHECK(!invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 0.49F));
     CHECK(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 0.5F));
 
     style.depthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always;
     CHECK(invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
     CHECK(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(style, 0.01F));
+}
+
+TEST_CASE("New point styles default to no depth prepass", "[point-style]") {
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    CHECK(
+        style.depthContribution ==
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::None);
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style));
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(style, true));
+}
+
+TEST_CASE("Point X-Ray gates scene depth prepass selection", "[point-style]") {
+    invisible_places::renderer::pointcloud::PointCloudStyleState occluder;
+    occluder.depthContribution =
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold;
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState xray;
+    invisible_places::style::SetScalarConstant(&xray.xrayStrength, 0.0F);
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleHasActiveXray(xray));
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(occluder, false));
+
+    invisible_places::style::SetScalarConstant(&xray.xrayStrength, 0.35F);
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleHasActiveXray(xray));
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(occluder, true));
+
+    xray.xrayStrength.active = false;
+    CHECK(!invisible_places::renderer::pointcloud::PointCloudStyleHasActiveXray(xray));
+}
+
+TEST_CASE("Point material variant resolver selects simple and unified paths", "[point-style]") {
+    using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
+    using invisible_places::style::ParameterSourceMode;
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.colorMode = PointCloudColorMode::SourceRgb;
+    invisible_places::style::SetScalarConstant(&style.opacity, 0.65F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 1.25F);
+    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::ConstantSimple);
+
+    auto fieldOpacity = style;
+    fieldOpacity.opacity.mode = ParameterSourceMode::FieldMapped;
+    CHECK(ResolvePointCloudMaterialVariant(fieldOpacity) == PointCloudMaterialVariant::Unified);
+
+    auto fieldEmission = style;
+    fieldEmission.emissiveStrength.mode = ParameterSourceMode::FieldMapped;
+    CHECK(ResolvePointCloudMaterialVariant(fieldEmission) == PointCloudMaterialVariant::Unified);
+
+    auto fieldColormapPosition = style;
+    fieldColormapPosition.colormapPosition.mode = ParameterSourceMode::FieldMapped;
+    CHECK(ResolvePointCloudMaterialVariant(fieldColormapPosition) == PointCloudMaterialVariant::Unified);
+
+    auto xray = style;
+    invisible_places::style::SetScalarConstant(&xray.xrayStrength, 0.1F);
+    CHECK(ResolvePointCloudMaterialVariant(xray) == PointCloudMaterialVariant::Unified);
+
+    auto depthFade = style;
+    invisible_places::style::SetScalarConstant(&depthFade.depthFade, 0.5F);
+    CHECK(ResolvePointCloudMaterialVariant(depthFade) == PointCloudMaterialVariant::Unified);
+
+    auto colormap = style;
+    colormap.colorMode = PointCloudColorMode::ScalarColormap;
+    CHECK(ResolvePointCloudMaterialVariant(colormap) == PointCloudMaterialVariant::Unified);
 }
 
 TEST_CASE("Camera shot interpolation stores quaternion slerp and linear camera values", "[camera][shots]") {
@@ -1946,6 +2021,55 @@ TEST_CASE("Offline point depth fade reduces alpha without changing color ratio",
           Catch::Approx(noFade.beautyR[center] / noFade.alpha[center]).margin(0.02F));
 }
 
+TEST_CASE("Offline point colourise recolours while preserving lightness", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFF000080U};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithColourise = [&](float amount) {
+        invisible_places::renderer::pointcloud::PointCloudStyleState style;
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+        style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+        style.colorizeColor = {0.0F, 0.0F, 1.0F};
+        style.colorizeAmount = amount;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9, 9);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+            &image);
+        return image;
+    };
+
+    const auto unchanged = renderWithColourise(0.0F);
+    const auto colourised = renderWithColourise(1.0F);
+    const auto center = static_cast<std::size_t>(4) * 9U + 4U;
+    REQUIRE(unchanged.alpha[center] > 0.0F);
+    REQUIRE(colourised.alpha[center] > 0.0F);
+    CHECK(unchanged.beautyR[center] > unchanged.beautyB[center]);
+    CHECK(colourised.beautyB[center] > colourised.beautyR[center]);
+    CHECK((colourised.beautyB[center] / colourised.alpha[center]) ==
+          Catch::Approx(unchanged.beautyR[center] / unchanged.alpha[center]).margin(0.03F));
+}
+
 TEST_CASE("Offline point renderer uses safe defaults for inactive material bindings", "[output][offline][point-style]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {{0.0F, 0.0F, 0.0F}};
@@ -2068,6 +2192,46 @@ TEST_CASE("Offline point diagnostics skip depth pass for non-depth layers", "[ou
     CHECK(diagnostics.depthVisitedPoints == 0U);
     CHECK(diagnostics.accumulationPassLayers == 1U);
     CHECK(diagnostics.accumulationVisitedPoints == 1U);
+
+    auto explicitDepthStyle = style;
+    explicitDepthStyle.depthContribution =
+        invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always;
+    const invisible_places::output::OfflinePointLayer explicitDepthLayer{
+        .cloud = &cloud,
+        .style = explicitDepthStyle,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+    invisible_places::output::InitializeExrImage(&image, 9, 9);
+    invisible_places::output::RenderPointCloudTile(
+        {explicitDepthLayer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+        &image,
+        &diagnostics,
+        &scratch);
+
+    CHECK(diagnostics.depthPassLayers == 0U);
+    CHECK(diagnostics.depthVisitedPoints == 0U);
+
+    invisible_places::style::SetScalarConstant(&explicitDepthStyle.xrayStrength, 0.25F);
+    const invisible_places::output::OfflinePointLayer xrayDepthLayer{
+        .cloud = &cloud,
+        .style = explicitDepthStyle,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+    invisible_places::output::InitializeExrImage(&image, 9, 9);
+    invisible_places::output::RenderPointCloudTile(
+        {xrayDepthLayer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+        &image,
+        &diagnostics,
+        &scratch);
+
+    CHECK(diagnostics.depthPassLayers == 1U);
+    CHECK(diagnostics.depthVisitedPoints == 1U);
 }
 
 TEST_CASE("gSplat quality resolver steps down during navigation and restores afterward", "[gsplat][quality]") {

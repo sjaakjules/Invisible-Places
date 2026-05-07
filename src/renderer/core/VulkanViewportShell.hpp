@@ -36,7 +36,28 @@ struct ViewportDiagnostics {
     std::uint32_t pointAccumulationLayerCount = 0;
     std::uint32_t pointStyleUploadCount = 0;
     std::uint32_t pointSkippedInactiveBindings = 0;
+    std::uint32_t pointConstantSimpleDrawCalls = 0;
+    std::uint32_t pointUnifiedDrawCalls = 0;
+    std::uint32_t pointDepthPrepassSkippedNoXray = 0;
     double pointCommandRecordMs = 0.0;
+    std::uint32_t framesInFlight = 0;
+    std::uint32_t swapchainImageCount = 0;
+    std::uint32_t currentFrameIndex = 0;
+    double frameRenderMs = 0.0;
+    double averageFrameRenderMs = 0.0;
+    double minFrameRenderMs = 0.0;
+    double maxFrameRenderMs = 0.0;
+    double frameFps = 0.0;
+    double averageFrameFps = 0.0;
+    double frameUiRenderMs = 0.0;
+    double frameFenceWaitMs = 0.0;
+    double frameAcquireMs = 0.0;
+    double frameImageWaitMs = 0.0;
+    double framePrepareMs = 0.0;
+    double frameCommandBufferMs = 0.0;
+    double frameSubmitMs = 0.0;
+    double framePresentMs = 0.0;
+    double framePlatformWindowsMs = 0.0;
 };
 
 struct SceneRenderState {
@@ -118,10 +139,12 @@ class VulkanViewportShell {
     [[nodiscard]] std::uint32_t Height() const { return swapchainHeight_; }
 
     [[nodiscard]] const ViewportDiagnostics& Diagnostics() const { return diagnostics_; }
-    void SetDiagnosticsEnabled(bool enabled) { diagnosticsEnabled_ = enabled; }
+    void SetDiagnosticsEnabled(bool enabled);
     [[nodiscard]] bool DiagnosticsEnabled() const { return diagnosticsEnabled_; }
 
   private:
+    static constexpr std::size_t kFramesInFlight = 2U;
+
     struct BufferAllocation {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -143,8 +166,10 @@ class VulkanViewportShell {
         BufferAllocation colorBuffer{};
         BufferAllocation normalBuffer{};
         BufferAllocation scalarFieldBuffer{};
-        BufferAllocation styleBuffer{};
-        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
+        BufferAllocation exrStyleBuffer{};
+        std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+        VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
         BufferAllocation interactiveSampledIndexBuffer{};
@@ -178,9 +203,17 @@ class VulkanViewportShell {
         std::vector<std::array<float, 4>> cpuRotations;
         std::vector<float> cpuOpacities;
         std::vector<float> cpuShCoefficients;
-        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
         std::uint32_t splatCount = 0;
         std::uint64_t revision = 0;
+    };
+
+    struct FrameResources {
+        BufferAllocation uniformBuffer{};
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE;
+        VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
     };
 
     struct HighQualityGaussianSceneResources {
@@ -190,14 +223,15 @@ class VulkanViewportShell {
         BufferAllocation opacityBuffer{};
         BufferAllocation shBuffer{};
         BufferAllocation layerStyleIndexBuffer{};
-        BufferAllocation layerStyleBuffer{};
-        BufferAllocation sortedIndexBuffer{};
+        std::array<BufferAllocation, kFramesInFlight> layerStyleBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> sortedIndexBuffers{};
         std::vector<renderer::gsplat::HighQualityGaussianLayerSignature> layerSignatures;
         std::vector<renderer::gsplat::HighQualityGaussianLayerRange> layerRanges;
         std::vector<invisible_places::io::Float3> mergedLocalCenters;
+        std::vector<std::uint32_t> sortedIndices;
         glm::mat4 lastSortedView{1.0F};
         bool hasSortedView = false;
-        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
         std::uint32_t splatCount = 0;
         std::uint32_t layerCount = 0;
     };
@@ -212,8 +246,10 @@ class VulkanViewportShell {
         VkDescriptorSet compositeDescriptorSet = VK_NULL_HANDLE;
         VkPipeline pointDepthPipeline = VK_NULL_HANDLE;
         VkPipeline pointAccumulationPipeline = VK_NULL_HANDLE;
+        VkPipeline pointConstantSimpleAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline surfelDepthPipeline = VK_NULL_HANDLE;
         VkPipeline surfelAccumulationPipeline = VK_NULL_HANDLE;
+        VkPipeline surfelConstantSimpleAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline compositePipeline = VK_NULL_HANDLE;
         ImageAllocation colorImage{};
         ImageAllocation depthImage{};
@@ -253,24 +289,33 @@ class VulkanViewportShell {
     void CreateSyncObjects();
     void CreateImGuiResources();
     void UploadImGuiFonts();
-    void UpdatePointCloudDescriptorSet(ActivePointCloudResources* resources);
-    void UpdatePointCloudDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
+    void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);
+    void UpdatePointCloudDescriptorSet(
+        ActivePointCloudResources* resources,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
+        VkImageView sceneDepthView);
+    void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
     void CreateOrUpdateCompositeDescriptorSet();
     void CreateOrUpdateCompositeDescriptorSet(
         VkDescriptorSet* descriptorSet,
         VkImageView accumulationView,
         VkImageView revealageView,
         VkImageView emissiveView);
-    void UpdateGaussianSplatDescriptorSet(ActiveGaussianSplatResources* resources);
-    void UpdateHighQualityGaussianDescriptorSet();
-    void RefreshHighQualityGaussianScene();
+    void UpdateGaussianSplatDescriptorSets(ActiveGaussianSplatResources* resources);
+    void UpdateGaussianSplatDescriptorSet(
+        ActiveGaussianSplatResources* resources,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex);
+    void UpdateHighQualityGaussianDescriptorSet(std::size_t frameIndex);
+    void RefreshHighQualityGaussianScene(std::size_t frameIndex);
     void CleanupSwapchain();
     void CleanupPointCloudResources(ActivePointCloudResources* resources);
     void CleanupGaussianSplatResources(ActiveGaussianSplatResources* resources);
     void CleanupHighQualityGaussianScene();
     void CleanupExrExportResources();
     void RecreateSwapchain();
-    void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex);
+    void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, std::size_t frameIndex);
     void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
     [[nodiscard]] bool ResolvePointCloudDrawPlan(
         const SceneRenderState::PointCloudLayerState& layer,
@@ -278,16 +323,21 @@ class VulkanViewportShell {
         PointCloudDrawPlan* plan);
     [[nodiscard]] bool UploadPointCloudLayerStyle(
         const SceneRenderState::PointCloudLayerState& layer,
-        const PointCloudDrawPlan& plan);
+        const PointCloudDrawPlan& plan,
+        std::size_t frameIndex,
+        bool exrStyle);
     [[nodiscard]] bool RecordPointCloudLayerDraw(
         VkCommandBuffer commandBuffer,
         const SceneRenderState::PointCloudLayerState& layer,
         bool forceFullSource,
         VkPipeline spritePipeline,
         VkPipeline surfelPipeline,
-        bool uploadStyle);
-    void UpdateUniformBuffer();
-    void UploadFrameUniforms(std::uint32_t width, std::uint32_t height);
+        bool uploadStyle,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
+        bool exrStyle);
+    void UpdateUniformBuffer(std::size_t frameIndex);
+    void UploadFrameUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);
 
     [[nodiscard]] BufferAllocation CreateHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
     void UploadBufferData(const BufferAllocation& buffer, const void* data, VkDeviceSize size) const;
@@ -334,8 +384,10 @@ class VulkanViewportShell {
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelAccumulationPipeline_ = VK_NULL_HANDLE;
+    VkPipeline surfelConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline gaussianSplatPipeline_ = VK_NULL_HANDLE;
     VkPipeline highQualityGaussianSplatPipeline_ = VK_NULL_HANDLE;
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
@@ -346,11 +398,8 @@ class VulkanViewportShell {
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool gaussianSplatDescriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool imguiDescriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet compositeDescriptorSet_ = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> compositeDescriptorSets_;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
-    VkSemaphore imageAvailableSemaphore_ = VK_NULL_HANDLE;
-    VkSemaphore renderFinishedSemaphore_ = VK_NULL_HANDLE;
-    VkFence inFlightFence_ = VK_NULL_HANDLE;
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
     VkFormat accumulationFormat_ = VK_FORMAT_UNDEFINED;
     VkFormat revealageFormat_ = VK_FORMAT_UNDEFINED;
@@ -358,7 +407,7 @@ class VulkanViewportShell {
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> imageViews_;
     std::vector<VkFramebuffer> framebuffers_;
-    std::vector<VkCommandBuffer> commandBuffers_;
+    std::vector<VkFence> swapchainImagesInFlight_;
 
     std::uint32_t graphicsQueueFamily_ = 0;
     std::uint32_t presentQueueFamily_ = 0;
@@ -369,11 +418,12 @@ class VulkanViewportShell {
     bool enablePortabilitySubset_ = false;
     bool uiFrameBegun_ = false;
 
-    BufferAllocation uniformBuffer_{};
-    ImageAllocation depthImage_{};
-    ImageAllocation accumulationImage_{};
-    ImageAllocation revealageImage_{};
-    ImageAllocation emissiveImage_{};
+    std::array<FrameResources, kFramesInFlight> frameResources_{};
+    std::size_t currentFrameIndex_ = 0;
+    std::vector<ImageAllocation> depthImages_;
+    std::vector<ImageAllocation> accumulationImages_;
+    std::vector<ImageAllocation> revealageImages_;
+    std::vector<ImageAllocation> emissiveImages_;
     std::vector<ActivePointCloudResources> pointCloudResources_;
     std::vector<ActiveGaussianSplatResources> gaussianSplatResources_;
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
@@ -382,6 +432,7 @@ class VulkanViewportShell {
     SceneRenderState renderState_{};
     ViewportDiagnostics diagnostics_{};
     bool diagnosticsEnabled_ = false;
+    bool diagnosticsTimingInitialized_ = false;
     float pointSizeRangeMin_ = 1.0F;
     float pointSizeRangeMax_ = 64.0F;
 };

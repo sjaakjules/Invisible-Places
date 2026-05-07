@@ -60,6 +60,12 @@ struct alignas(16) FrameUniforms {
     glm::vec4 depthOfFieldParameters{0.0F, 1.0F, 8.0F, 24.0F};
 };
 
+double MillisecondsBetween(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 struct alignas(16) PointCloudBindingGpu {
     glm::vec4 constantValue{0.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 range{0.0F, 1.0F, 0.0F, 1.0F};
@@ -83,6 +89,7 @@ struct alignas(16) PointCloudStyleGpu {
     PointCloudBindingGpu depthFade{};
     PointCloudBindingGpu colormapPosition{};
     PointCloudBindingGpu surfelDiameter{};
+    glm::vec4 colorize{0.95F, 0.68F, 0.28F, 0.0F};
 };
 
 struct alignas(16) GaussianSplatPushConstants {
@@ -526,20 +533,22 @@ VulkanViewportShell::~VulkanViewportShell() {
     CleanupHighQualityGaussianScene();
     CleanupExrExportResources();
 
-    DestroyBuffer(&uniformBuffer_);
     CleanupSwapchain();
 
-    if (imageAvailableSemaphore_ != VK_NULL_HANDLE) {
-        vkDestroySemaphore(device_, imageAvailableSemaphore_, nullptr);
-        imageAvailableSemaphore_ = VK_NULL_HANDLE;
-    }
-    if (renderFinishedSemaphore_ != VK_NULL_HANDLE) {
-        vkDestroySemaphore(device_, renderFinishedSemaphore_, nullptr);
-        renderFinishedSemaphore_ = VK_NULL_HANDLE;
-    }
-    if (inFlightFence_ != VK_NULL_HANDLE) {
-        vkDestroyFence(device_, inFlightFence_, nullptr);
-        inFlightFence_ = VK_NULL_HANDLE;
+    for (auto& frame : frameResources_) {
+        DestroyBuffer(&frame.uniformBuffer);
+        if (frame.imageAvailableSemaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, frame.imageAvailableSemaphore, nullptr);
+            frame.imageAvailableSemaphore = VK_NULL_HANDLE;
+        }
+        if (frame.renderFinishedSemaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, frame.renderFinishedSemaphore, nullptr);
+            frame.renderFinishedSemaphore = VK_NULL_HANDLE;
+        }
+        if (frame.fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, frame.fence, nullptr);
+            frame.fence = VK_NULL_HANDLE;
+        }
     }
 
     if (commandPool_ != VK_NULL_HANDLE) {
@@ -553,11 +562,17 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (pointAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointAccumulationPipeline_, nullptr);
     }
+    if (pointConstantSimpleAccumulationPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, pointConstantSimpleAccumulationPipeline_, nullptr);
+    }
     if (surfelDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelDepthPrepassPipeline_, nullptr);
     }
     if (surfelAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelAccumulationPipeline_, nullptr);
+    }
+    if (surfelConstantSimpleAccumulationPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, surfelConstantSimpleAccumulationPipeline_, nullptr);
     }
     if (gaussianSplatPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, gaussianSplatPipeline_, nullptr);
@@ -633,18 +648,37 @@ void VulkanViewportShell::BeginUiFrame() {
 }
 
 void VulkanViewportShell::DrawFrame() {
+    const bool collectDiagnostics = diagnosticsEnabled_;
+    const auto frameStart = collectDiagnostics ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+
     if (uiFrameBegun_) {
         ImGui::Render();
         uiFrameBegun_ = false;
     }
+    const auto uiEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
 
-    vkWaitForFences(device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
-    RefreshHighQualityGaussianScene();
-    UpdateUniformBuffer();
+    auto& frame = frameResources_[currentFrameIndex_];
+    vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
+    const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+    RefreshHighQualityGaussianScene(currentFrameIndex_);
+    UpdateUniformBuffer(currentFrameIndex_);
+    const auto prepareEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
 
     std::uint32_t imageIndex = 0;
     const VkResult acquireResult =
-        vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailableSemaphore_, VK_NULL_HANDLE, &imageIndex);
+        vkAcquireNextImageKHR(
+            device_,
+            swapchain_,
+            UINT64_MAX,
+            frame.imageAvailableSemaphore,
+            VK_NULL_HANDLE,
+            &imageIndex);
+    const auto acquireEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
 
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
         UpdateImGuiPlatformWindowsIfNeeded();
@@ -655,30 +689,45 @@ void VulkanViewportShell::DrawFrame() {
         Check(acquireResult, "vkAcquireNextImageKHR");
     }
 
-    Check(vkResetFences(device_, 1, &inFlightFence_), "vkResetFences");
-    Check(vkResetCommandBuffer(commandBuffers_[imageIndex], 0), "vkResetCommandBuffer");
-    RecordCommandBuffer(commandBuffers_[imageIndex], imageIndex);
+    if (imageIndex < swapchainImagesInFlight_.size() && swapchainImagesInFlight_[imageIndex] != VK_NULL_HANDLE) {
+        vkWaitForFences(device_, 1, &swapchainImagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX);
+    }
+    const auto imageWaitEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+    if (imageIndex < swapchainImagesInFlight_.size()) {
+        swapchainImagesInFlight_[imageIndex] = frame.fence;
+    }
+
+    Check(vkResetFences(device_, 1, &frame.fence), "vkResetFences");
+    Check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
+    RecordCommandBuffer(frame.commandBuffer, imageIndex, currentFrameIndex_);
+    const auto recordEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.waitSemaphoreCount = 1;
-    submitInfo.pWaitSemaphores = &imageAvailableSemaphore_;
+    submitInfo.pWaitSemaphores = &frame.imageAvailableSemaphore;
     submitInfo.pWaitDstStageMask = &waitStage;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffers_[imageIndex];
+    submitInfo.pCommandBuffers = &frame.commandBuffer;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &renderFinishedSemaphore_;
+    submitInfo.pSignalSemaphores = &frame.renderFinishedSemaphore;
 
-    Check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, inFlightFence_), "vkQueueSubmit");
+    Check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, frame.fence), "vkQueueSubmit");
+    const auto submitEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
 
     VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = &renderFinishedSemaphore_;
+    presentInfo.pWaitSemaphores = &frame.renderFinishedSemaphore;
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &swapchain_;
     presentInfo.pImageIndices = &imageIndex;
 
     const VkResult presentResult = vkQueuePresentKHR(presentQueue_, &presentInfo);
+    const auto presentEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR || framebufferResized_) {
         framebufferResized_ = false;
         UpdateImGuiPlatformWindowsIfNeeded();
@@ -688,11 +737,73 @@ void VulkanViewportShell::DrawFrame() {
 
     Check(presentResult, "vkQueuePresentKHR");
     UpdateImGuiPlatformWindowsIfNeeded();
+    const auto frameEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+    if (collectDiagnostics) {
+        constexpr double kFrameSmoothing = 0.12;
+        diagnostics_.framesInFlight = static_cast<std::uint32_t>(kFramesInFlight);
+        diagnostics_.swapchainImageCount = static_cast<std::uint32_t>(swapchainImages_.size());
+        diagnostics_.currentFrameIndex = static_cast<std::uint32_t>(currentFrameIndex_);
+        diagnostics_.frameUiRenderMs = MillisecondsBetween(frameStart, uiEnd);
+        diagnostics_.frameFenceWaitMs = MillisecondsBetween(uiEnd, fenceEnd);
+        diagnostics_.framePrepareMs = MillisecondsBetween(fenceEnd, prepareEnd);
+        diagnostics_.frameAcquireMs = MillisecondsBetween(prepareEnd, acquireEnd);
+        diagnostics_.frameImageWaitMs = MillisecondsBetween(acquireEnd, imageWaitEnd);
+        diagnostics_.frameCommandBufferMs = MillisecondsBetween(imageWaitEnd, recordEnd);
+        diagnostics_.frameSubmitMs = MillisecondsBetween(recordEnd, submitEnd);
+        diagnostics_.framePresentMs = MillisecondsBetween(submitEnd, presentEnd);
+        diagnostics_.framePlatformWindowsMs = MillisecondsBetween(presentEnd, frameEnd);
+        diagnostics_.frameRenderMs = MillisecondsBetween(frameStart, frameEnd);
+        diagnostics_.frameFps =
+            diagnostics_.frameRenderMs > 0.0 ? 1000.0 / diagnostics_.frameRenderMs : 0.0;
+        if (!diagnosticsTimingInitialized_) {
+            diagnostics_.averageFrameRenderMs = diagnostics_.frameRenderMs;
+            diagnostics_.minFrameRenderMs = diagnostics_.frameRenderMs;
+            diagnostics_.maxFrameRenderMs = diagnostics_.frameRenderMs;
+            diagnosticsTimingInitialized_ = true;
+        } else {
+            diagnostics_.averageFrameRenderMs =
+                (diagnostics_.averageFrameRenderMs * (1.0 - kFrameSmoothing)) +
+                (diagnostics_.frameRenderMs * kFrameSmoothing);
+            diagnostics_.minFrameRenderMs =
+                std::min(diagnostics_.minFrameRenderMs, diagnostics_.frameRenderMs);
+            diagnostics_.maxFrameRenderMs =
+                std::max(diagnostics_.maxFrameRenderMs, diagnostics_.frameRenderMs);
+        }
+        diagnostics_.averageFrameFps =
+            diagnostics_.averageFrameRenderMs > 0.0 ? 1000.0 / diagnostics_.averageFrameRenderMs : 0.0;
+    }
+    currentFrameIndex_ = (currentFrameIndex_ + 1U) % kFramesInFlight;
 }
 
 void VulkanViewportShell::WaitIdle() const {
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
+    }
+}
+
+void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
+    if (diagnosticsEnabled_ == enabled) {
+        return;
+    }
+    diagnosticsEnabled_ = enabled;
+    if (enabled) {
+        diagnosticsTimingInitialized_ = false;
+        diagnostics_.frameRenderMs = 0.0;
+        diagnostics_.averageFrameRenderMs = 0.0;
+        diagnostics_.minFrameRenderMs = 0.0;
+        diagnostics_.maxFrameRenderMs = 0.0;
+        diagnostics_.frameFps = 0.0;
+        diagnostics_.averageFrameFps = 0.0;
+        diagnostics_.frameUiRenderMs = 0.0;
+        diagnostics_.frameFenceWaitMs = 0.0;
+        diagnostics_.frameAcquireMs = 0.0;
+        diagnostics_.frameImageWaitMs = 0.0;
+        diagnostics_.framePrepareMs = 0.0;
+        diagnostics_.frameCommandBufferMs = 0.0;
+        diagnostics_.frameSubmitMs = 0.0;
+        diagnostics_.framePresentMs = 0.0;
+        diagnostics_.framePlatformWindowsMs = 0.0;
     }
 }
 
@@ -819,10 +930,15 @@ void VulkanViewportShell::UploadPointCloud(
         UploadBufferData(resources.scalarFieldBuffer, &fallbackScalar, sizeof(float));
     }
 
-    resources.styleBuffer = CreateHostVisibleBuffer(
+    for (auto& styleBuffer : resources.styleBuffers) {
+        styleBuffer = CreateHostVisibleBuffer(
+            sizeof(PointCloudStyleGpu),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+    resources.exrStyleBuffer = CreateHostVisibleBuffer(
         sizeof(PointCloudStyleGpu),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    UpdatePointCloudDescriptorSet(&resources);
+    UpdatePointCloudDescriptorSets(&resources);
 
     UpdatePointBudget(layerId, sampledIndices);
 }
@@ -1009,7 +1125,7 @@ void VulkanViewportShell::UploadGaussianSplats(
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     UploadBufferData(resources.shBuffer, splats.shCoefficients.data(), resources.shBuffer.size);
 
-    UpdateGaussianSplatDescriptorSet(&resources);
+    UpdateGaussianSplatDescriptorSets(&resources);
     highQualityGaussianSceneDirty_ = true;
 }
 
@@ -1075,29 +1191,29 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         CreateExrExportResources(request.width, request.height);
     }
 
-    if (inFlightFence_ != VK_NULL_HANDLE) {
-        vkWaitForFences(device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
+    std::array<VkFence, kFramesInFlight> frameFences{};
+    std::size_t frameFenceCount = 0;
+    for (const auto& frame : frameResources_) {
+        if (frame.fence != VK_NULL_HANDLE) {
+            frameFences[frameFenceCount++] = frame.fence;
+        }
+    }
+    if (frameFenceCount > 0) {
+        vkWaitForFences(
+            device_,
+            static_cast<std::uint32_t>(frameFenceCount),
+            frameFences.data(),
+            VK_TRUE,
+            UINT64_MAX);
     }
 
     const auto previousRenderState = renderState_;
-    auto restoreLiveDescriptors = [&]() {
-        renderState_ = previousRenderState;
-        for (auto& resources : pointCloudResources_) {
-            if (resources.descriptorSet != VK_NULL_HANDLE) {
-                UpdatePointCloudDescriptorSet(&resources);
-            }
-        }
-        if (compositeDescriptorSet_ != VK_NULL_HANDLE) {
-            CreateOrUpdateCompositeDescriptorSet();
-        }
-    };
+    auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
 
     try {
         renderState_ = request.renderState;
         for (auto& resources : pointCloudResources_) {
-            if (resources.descriptorSet != VK_NULL_HANDLE) {
-                UpdatePointCloudDescriptorSet(&resources, exrExportResources_.depthImage.view);
-            }
+            UpdatePointCloudExrDescriptorSet(&resources, exrExportResources_.depthImage.view);
         }
 
         Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr)");
@@ -1105,7 +1221,7 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         Check(
             vkResetCommandBuffer(exrExportResources_.commandBuffer, 0),
             "vkResetCommandBuffer(exr)");
-        UploadFrameUniforms(request.width, request.height);
+        UploadFrameUniforms(0U, request.width, request.height);
         RecordExrExportCommandBuffer(request);
 
         VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1166,10 +1282,10 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
             vkUnmapMemory(device_, exrExportResources_.depthReadbackBuffer.memory);
         }
 
-        restoreLiveDescriptors();
+        restoreRenderState();
         return image;
     } catch (...) {
-        restoreLiveDescriptors();
+        restoreRenderState();
         throw;
     }
 }
@@ -1329,6 +1445,7 @@ void VulkanViewportShell::CreateSwapchain() {
     swapchainImageFormat_ = surfaceFormat.format;
     swapchainWidth_ = extent.width;
     swapchainHeight_ = extent.height;
+    swapchainImagesInFlight_.assign(swapchainImages_.size(), VK_NULL_HANDLE);
 
     std::ostringstream summary;
     summary << "Renderer: " << diagnostics_.rendererName << " | " << swapchainWidth_ << "x"
@@ -1629,27 +1746,27 @@ void VulkanViewportShell::CreateCompositeDescriptorSetLayout() {
 
 void VulkanViewportShell::CreateDescriptorPools() {
     const std::array<VkDescriptorPoolSize, 3> poolSizes = {
-        MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 130),
-        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256),
-        MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 130),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1024),
     };
 
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    poolInfo.maxSets = 66;
+    poolInfo.maxSets = 1024;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
     Check(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_), "vkCreateDescriptorPool");
 
     const std::array<VkDescriptorPoolSize, 3> gsplatPoolSizes = {
-        MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 65),
-        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (64 * 5) + 8),
-        MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 65),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1024),
     };
 
     VkDescriptorPoolCreateInfo gsplatPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     gsplatPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    gsplatPoolInfo.maxSets = 65;
+    gsplatPoolInfo.maxSets = 1024;
     gsplatPoolInfo.poolSizeCount = static_cast<std::uint32_t>(gsplatPoolSizes.size());
     gsplatPoolInfo.pPoolSizes = gsplatPoolSizes.data();
     Check(
@@ -1658,7 +1775,10 @@ void VulkanViewportShell::CreateDescriptorPools() {
 }
 
 void VulkanViewportShell::CreateUniformResources() {
-    uniformBuffer_ = CreateHostVisibleBuffer(sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    for (auto& frame : frameResources_) {
+        DestroyBuffer(&frame.uniformBuffer);
+        frame.uniformBuffer = CreateHostVisibleBuffer(sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
 }
 
 void VulkanViewportShell::CreatePointPipelines() {
@@ -1668,24 +1788,43 @@ void VulkanViewportShell::CreatePointPipelines() {
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.frag.spv").string());
     const auto accumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_accumulation.frag.spv").string());
+    const auto constantSimpleVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple.vert.spv").string());
+    const auto constantSimpleFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple_accumulation.frag.spv").string());
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
     const auto surfelSolidFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_preview.frag.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_accumulation.frag.spv").string());
+    const auto surfelConstantSimpleVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple.vert.spv").string());
+    const auto surfelConstantSimpleFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple_accumulation.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(point vertex)");
     const auto solidFragmentModule =
         CreateShaderModule(device_, solidFragmentShaderCode, "vkCreateShaderModule(point solid fragment)");
     const auto accumulationFragmentModule =
         CreateShaderModule(device_, accumulationFragmentShaderCode, "vkCreateShaderModule(point accumulation fragment)");
+    const auto constantSimpleVertexModule =
+        CreateShaderModule(device_, constantSimpleVertexShaderCode, "vkCreateShaderModule(point simple vertex)");
+    const auto constantSimpleFragmentModule =
+        CreateShaderModule(device_, constantSimpleFragmentShaderCode, "vkCreateShaderModule(point simple accumulation fragment)");
     const auto surfelVertexModule =
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(surfel vertex)");
     const auto surfelSolidFragmentModule =
         CreateShaderModule(device_, surfelSolidFragmentShaderCode, "vkCreateShaderModule(surfel solid fragment)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(surfel accumulation fragment)");
+    const auto surfelConstantSimpleVertexModule =
+        CreateShaderModule(device_, surfelConstantSimpleVertexShaderCode, "vkCreateShaderModule(surfel simple vertex)");
+    const auto surfelConstantSimpleFragmentModule =
+        CreateShaderModule(
+            device_,
+            surfelConstantSimpleFragmentShaderCode,
+            "vkCreateShaderModule(surfel simple accumulation fragment)");
 
     VkPipelineShaderStageCreateInfo vertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1696,6 +1835,17 @@ void VulkanViewportShell::CreatePointPipelines() {
     surfelVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     surfelVertexStage.module = surfelVertexModule;
     surfelVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo constantSimpleVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    constantSimpleVertexStage.module = constantSimpleVertexModule;
+    constantSimpleVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelConstantSimpleVertexStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelConstantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelConstantSimpleVertexStage.module = surfelConstantSimpleVertexModule;
+    surfelConstantSimpleVertexStage.pName = "main";
 
     const std::array<VkVertexInputBindingDescription, 2> bindingDescriptions = {
         VkVertexInputBindingDescription{0, sizeof(invisible_places::io::Float3), VK_VERTEX_INPUT_RATE_VERTEX},
@@ -1831,6 +1981,22 @@ void VulkanViewportShell::CreatePointPipelines() {
         &pointAccumulationPipeline_);
 
     createPointPipeline(
+        constantSimpleVertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        constantSimpleFragmentModule,
+        1,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAdditiveBlendAttachment(),
+            MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        false,
+        false,
+        VK_COMPARE_OP_ALWAYS,
+        "vkCreateGraphicsPipelines(point simple accumulation)",
+        &pointConstantSimpleAccumulationPipeline_);
+
+    createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
@@ -1859,9 +2025,29 @@ void VulkanViewportShell::CreatePointPipelines() {
         "vkCreateGraphicsPipelines(surfel accumulation)",
         &surfelAccumulationPipeline_);
 
+    createPointPipeline(
+        surfelConstantSimpleVertexStage,
+        surfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelConstantSimpleFragmentModule,
+        1,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAdditiveBlendAttachment(),
+            MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        false,
+        false,
+        VK_COMPARE_OP_ALWAYS,
+        "vkCreateGraphicsPipelines(surfel simple accumulation)",
+        &surfelConstantSimpleAccumulationPipeline_);
+
+    vkDestroyShaderModule(device_, surfelConstantSimpleFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelSolidFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
+    vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, constantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, accumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, solidFragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
@@ -2160,24 +2346,46 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.vert.spv").string());
     const auto accumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_accumulation.frag.spv").string());
+    const auto constantSimpleVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple.vert.spv").string());
+    const auto constantSimpleFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple_accumulation.frag.spv").string());
     const auto depthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_export_depth.frag.spv").string());
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_accumulation.frag.spv").string());
+    const auto surfelConstantSimpleVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple.vert.spv").string());
+    const auto surfelConstantSimpleFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple_accumulation.frag.spv").string());
     const auto surfelDepthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(exr point vertex)");
     const auto accumulationFragmentModule =
         CreateShaderModule(device_, accumulationFragmentShaderCode, "vkCreateShaderModule(exr point accumulation fragment)");
+    const auto constantSimpleVertexModule =
+        CreateShaderModule(device_, constantSimpleVertexShaderCode, "vkCreateShaderModule(exr point simple vertex)");
+    const auto constantSimpleFragmentModule =
+        CreateShaderModule(
+            device_,
+            constantSimpleFragmentShaderCode,
+            "vkCreateShaderModule(exr point simple accumulation fragment)");
     const auto depthFragmentModule =
         CreateShaderModule(device_, depthFragmentShaderCode, "vkCreateShaderModule(exr point depth fragment)");
     const auto surfelVertexModule =
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(exr surfel vertex)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(exr surfel accumulation fragment)");
+    const auto surfelConstantSimpleVertexModule =
+        CreateShaderModule(device_, surfelConstantSimpleVertexShaderCode, "vkCreateShaderModule(exr surfel simple vertex)");
+    const auto surfelConstantSimpleFragmentModule =
+        CreateShaderModule(
+            device_,
+            surfelConstantSimpleFragmentShaderCode,
+            "vkCreateShaderModule(exr surfel simple accumulation fragment)");
     const auto surfelDepthFragmentModule =
         CreateShaderModule(device_, surfelDepthFragmentShaderCode, "vkCreateShaderModule(exr surfel depth fragment)");
 
@@ -2190,6 +2398,17 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     surfelVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     surfelVertexStage.module = surfelVertexModule;
     surfelVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo constantSimpleVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    constantSimpleVertexStage.module = constantSimpleVertexModule;
+    constantSimpleVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelConstantSimpleVertexStage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelConstantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelConstantSimpleVertexStage.module = surfelConstantSimpleVertexModule;
+    surfelConstantSimpleVertexStage.pName = "main";
 
     const std::array<VkVertexInputBindingDescription, 2> bindingDescriptions = {
         VkVertexInputBindingDescription{0, sizeof(invisible_places::io::Float3), VK_VERTEX_INPUT_RATE_VERTEX},
@@ -2320,6 +2539,22 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         &resources->pointAccumulationPipeline);
 
     createPointPipeline(
+        constantSimpleVertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        constantSimpleFragmentModule,
+        1,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAdditiveBlendAttachment(),
+            MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        false,
+        false,
+        VK_COMPARE_OP_ALWAYS,
+        "vkCreateGraphicsPipelines(exr point simple accumulation)",
+        &resources->pointConstantSimpleAccumulationPipeline);
+
+    createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
@@ -2347,10 +2582,30 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         "vkCreateGraphicsPipelines(exr surfel accumulation)",
         &resources->surfelAccumulationPipeline);
 
+    createPointPipeline(
+        surfelConstantSimpleVertexStage,
+        surfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelConstantSimpleFragmentModule,
+        1,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAdditiveBlendAttachment(),
+            MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        false,
+        false,
+        VK_COMPARE_OP_ALWAYS,
+        "vkCreateGraphicsPipelines(exr surfel simple accumulation)",
+        &resources->surfelConstantSimpleAccumulationPipeline);
+
+    vkDestroyShaderModule(device_, surfelConstantSimpleFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, depthFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, constantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, accumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 
@@ -2719,13 +2974,13 @@ void VulkanViewportShell::CreateFramebuffers() {
     framebuffers_.clear();
     framebuffers_.reserve(imageViews_.size());
 
-    for (const auto& imageView : imageViews_) {
+    for (std::size_t imageIndex = 0; imageIndex < imageViews_.size(); ++imageIndex) {
         const std::array<VkImageView, 5> attachments = {
-            imageView,
-            depthImage_.view,
-            accumulationImage_.view,
-            revealageImage_.view,
-            emissiveImage_.view,
+            imageViews_[imageIndex],
+            depthImages_[imageIndex].view,
+            accumulationImages_[imageIndex].view,
+            revealageImages_[imageIndex].view,
+            emissiveImages_[imageIndex].view,
         };
 
         VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -2743,31 +2998,51 @@ void VulkanViewportShell::CreateFramebuffers() {
 }
 
 void VulkanViewportShell::CreateDepthResources() {
-    DestroyImage(&depthImage_);
+    for (auto& image : depthImages_) {
+        DestroyImage(&image);
+    }
+    depthImages_.clear();
     depthFormat_ = SelectDepthFormat();
-    depthImage_ = CreateAttachmentImage(
-        depthFormat_,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
-        VK_IMAGE_ASPECT_DEPTH_BIT);
+    depthImages_.reserve(swapchainImages_.size());
+    for (std::size_t imageIndex = 0; imageIndex < swapchainImages_.size(); ++imageIndex) {
+        depthImages_.push_back(CreateAttachmentImage(
+            depthFormat_,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT));
+    }
 }
 
 void VulkanViewportShell::CreateAccumulationResources() {
-    DestroyImage(&accumulationImage_);
-    DestroyImage(&revealageImage_);
-    DestroyImage(&emissiveImage_);
+    for (auto& image : accumulationImages_) {
+        DestroyImage(&image);
+    }
+    for (auto& image : revealageImages_) {
+        DestroyImage(&image);
+    }
+    for (auto& image : emissiveImages_) {
+        DestroyImage(&image);
+    }
+    accumulationImages_.clear();
+    revealageImages_.clear();
+    emissiveImages_.clear();
 
-    accumulationImage_ = CreateAttachmentImage(
-        accumulationFormat_,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
-        VK_IMAGE_ASPECT_COLOR_BIT);
-    revealageImage_ = CreateAttachmentImage(
-        revealageFormat_,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
-        VK_IMAGE_ASPECT_COLOR_BIT);
-    emissiveImage_ = CreateAttachmentImage(
-        accumulationFormat_,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
-        VK_IMAGE_ASPECT_COLOR_BIT);
+    accumulationImages_.reserve(swapchainImages_.size());
+    revealageImages_.reserve(swapchainImages_.size());
+    emissiveImages_.reserve(swapchainImages_.size());
+    for (std::size_t imageIndex = 0; imageIndex < swapchainImages_.size(); ++imageIndex) {
+        accumulationImages_.push_back(CreateAttachmentImage(
+            accumulationFormat_,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT));
+        revealageImages_.push_back(CreateAttachmentImage(
+            revealageFormat_,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT));
+        emissiveImages_.push_back(CreateAttachmentImage(
+            accumulationFormat_,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT));
+    }
 }
 
 void VulkanViewportShell::CreateCommandPool() {
@@ -2779,23 +3054,24 @@ void VulkanViewportShell::CreateCommandPool() {
 }
 
 void VulkanViewportShell::CreateCommandBuffers() {
-    if (!commandBuffers_.empty()) {
-        vkFreeCommandBuffers(
-            device_,
-            commandPool_,
-            static_cast<std::uint32_t>(commandBuffers_.size()),
-            commandBuffers_.data());
-        commandBuffers_.clear();
+    for (auto& frame : frameResources_) {
+        if (frame.commandBuffer != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_, commandPool_, 1, &frame.commandBuffer);
+            frame.commandBuffer = VK_NULL_HANDLE;
+        }
     }
 
-    commandBuffers_.resize(framebuffers_.size());
+    std::array<VkCommandBuffer, kFramesInFlight> commandBuffers{};
 
     VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = commandPool_;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = static_cast<std::uint32_t>(commandBuffers_.size());
+    allocInfo.commandBufferCount = static_cast<std::uint32_t>(commandBuffers.size());
 
-    Check(vkAllocateCommandBuffers(device_, &allocInfo, commandBuffers_.data()), "vkAllocateCommandBuffers");
+    Check(vkAllocateCommandBuffers(device_, &allocInfo, commandBuffers.data()), "vkAllocateCommandBuffers");
+    for (std::size_t frameIndex = 0; frameIndex < kFramesInFlight; ++frameIndex) {
+        frameResources_[frameIndex].commandBuffer = commandBuffers[frameIndex];
+    }
 }
 
 void VulkanViewportShell::CreateSyncObjects() {
@@ -2803,9 +3079,15 @@ void VulkanViewportShell::CreateSyncObjects() {
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    Check(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailableSemaphore_), "vkCreateSemaphore(imageAvailable)");
-    Check(vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &renderFinishedSemaphore_), "vkCreateSemaphore(renderFinished)");
-    Check(vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFence_), "vkCreateFence");
+    for (auto& frame : frameResources_) {
+        Check(
+            vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &frame.imageAvailableSemaphore),
+            "vkCreateSemaphore(imageAvailable)");
+        Check(
+            vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &frame.renderFinishedSemaphore),
+            "vkCreateSemaphore(renderFinished)");
+        Check(vkCreateFence(device_, &fenceInfo, nullptr, &frame.fence), "vkCreateFence");
+    }
 }
 
 void VulkanViewportShell::CreateImGuiResources() {
@@ -2862,29 +3144,40 @@ void VulkanViewportShell::CreateImGuiResources() {
 
 void VulkanViewportShell::UploadImGuiFonts() {}
 
-void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResources* resources) {
-    UpdatePointCloudDescriptorSet(resources, depthImage_.view);
+void VulkanViewportShell::UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources) {
+    if (resources == nullptr) {
+        return;
+    }
+    for (std::size_t frameIndex = 0; frameIndex < kFramesInFlight; ++frameIndex) {
+        resources->descriptorSets[frameIndex].resize(depthImages_.size(), VK_NULL_HANDLE);
+        for (std::uint32_t imageIndex = 0; imageIndex < depthImages_.size(); ++imageIndex) {
+            UpdatePointCloudDescriptorSet(resources, frameIndex, imageIndex, depthImages_[imageIndex].view);
+        }
+    }
 }
 
 void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     ActivePointCloudResources* resources,
+    std::size_t frameIndex,
+    std::uint32_t imageIndex,
     VkImageView sceneDepthView) {
-    if (resources == nullptr) {
+    if (resources == nullptr || frameIndex >= kFramesInFlight || imageIndex >= depthImages_.size()) {
         return;
     }
 
-    if (resources->descriptorSet == VK_NULL_HANDLE) {
+    auto& descriptorSet = resources->descriptorSets[frameIndex][imageIndex];
+    if (descriptorSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocInfo.descriptorPool = descriptorPool_;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &pointDescriptorSetLayout_;
         Check(
-            vkAllocateDescriptorSets(device_, &allocInfo, &resources->descriptorSet),
+            vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet),
             "vkAllocateDescriptorSets(point)");
     }
 
     VkDescriptorBufferInfo uniformInfo{};
-    uniformInfo.buffer = uniformBuffer_.buffer;
+    uniformInfo.buffer = frameResources_[frameIndex].uniformBuffer.buffer;
     uniformInfo.offset = 0;
     uniformInfo.range = sizeof(FrameUniforms);
 
@@ -2894,7 +3187,7 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     scalarInfo.range = resources->scalarFieldBuffer.size;
 
     VkDescriptorBufferInfo styleInfo{};
-    styleInfo.buffer = resources->styleBuffer.buffer;
+    styleInfo.buffer = resources->styleBuffers[frameIndex].buffer;
     styleInfo.offset = 0;
     styleInfo.range = sizeof(PointCloudStyleGpu);
 
@@ -2919,49 +3212,132 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
 
     std::array<VkWriteDescriptorSet, 7> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[0].dstSet = resources->descriptorSet;
+    writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[0].descriptorCount = 1;
     writes[0].pBufferInfo = &uniformInfo;
 
     writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[1].dstSet = resources->descriptorSet;
+    writes[1].dstSet = descriptorSet;
     writes[1].dstBinding = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[1].descriptorCount = 1;
     writes[1].pBufferInfo = &scalarInfo;
 
     writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[2].dstSet = resources->descriptorSet;
+    writes[2].dstSet = descriptorSet;
     writes[2].dstBinding = 2;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[2].descriptorCount = 1;
     writes[2].pBufferInfo = &styleInfo;
 
     writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[3].dstSet = resources->descriptorSet;
+    writes[3].dstSet = descriptorSet;
     writes[3].dstBinding = 3;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
     writes[3].descriptorCount = 1;
     writes[3].pImageInfo = &sceneDepthInfo;
 
     writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[4].dstSet = resources->descriptorSet;
+    writes[4].dstSet = descriptorSet;
     writes[4].dstBinding = 4;
     writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[4].descriptorCount = 1;
     writes[4].pBufferInfo = &positionStorageInfo;
 
     writes[5] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[5].dstSet = resources->descriptorSet;
+    writes[5].dstSet = descriptorSet;
     writes[5].dstBinding = 5;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[5].descriptorCount = 1;
     writes[5].pBufferInfo = &colorStorageInfo;
 
     writes[6] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[6].dstSet = resources->descriptorSet;
+    writes[6].dstSet = descriptorSet;
+    writes[6].dstBinding = 6;
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[6].descriptorCount = 1;
+    writes[6].pBufferInfo = &normalInfo;
+
+    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
+    ActivePointCloudResources* resources,
+    VkImageView sceneDepthView) {
+    if (resources == nullptr) {
+        return;
+    }
+
+    if (resources->exrDescriptorSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = descriptorPool_;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &pointDescriptorSetLayout_;
+        Check(
+            vkAllocateDescriptorSets(device_, &allocInfo, &resources->exrDescriptorSet),
+            "vkAllocateDescriptorSets(point exr)");
+    }
+
+    VkDescriptorBufferInfo uniformInfo{frameResources_[0].uniformBuffer.buffer, 0, sizeof(FrameUniforms)};
+    VkDescriptorBufferInfo scalarInfo{resources->scalarFieldBuffer.buffer, 0, resources->scalarFieldBuffer.size};
+    VkDescriptorBufferInfo styleInfo{resources->exrStyleBuffer.buffer, 0, sizeof(PointCloudStyleGpu)};
+    VkDescriptorBufferInfo positionStorageInfo{
+        resources->positionStorageBuffer.buffer,
+        0,
+        resources->positionStorageBuffer.size};
+    VkDescriptorBufferInfo colorStorageInfo{resources->colorBuffer.buffer, 0, resources->colorBuffer.size};
+    VkDescriptorBufferInfo normalInfo{resources->normalBuffer.buffer, 0, resources->normalBuffer.size};
+    VkDescriptorImageInfo sceneDepthInfo{};
+    sceneDepthInfo.imageView = sceneDepthView;
+    sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    std::array<VkWriteDescriptorSet, 7> writes{};
+    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[0].dstSet = resources->exrDescriptorSet;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[0].descriptorCount = 1;
+    writes[0].pBufferInfo = &uniformInfo;
+
+    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[1].dstSet = resources->exrDescriptorSet;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].descriptorCount = 1;
+    writes[1].pBufferInfo = &scalarInfo;
+
+    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[2].dstSet = resources->exrDescriptorSet;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[2].descriptorCount = 1;
+    writes[2].pBufferInfo = &styleInfo;
+
+    writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[3].dstSet = resources->exrDescriptorSet;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+    writes[3].descriptorCount = 1;
+    writes[3].pImageInfo = &sceneDepthInfo;
+
+    writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[4].dstSet = resources->exrDescriptorSet;
+    writes[4].dstBinding = 4;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[4].descriptorCount = 1;
+    writes[4].pBufferInfo = &positionStorageInfo;
+
+    writes[5] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[5].dstSet = resources->exrDescriptorSet;
+    writes[5].dstBinding = 5;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[5].descriptorCount = 1;
+    writes[5].pBufferInfo = &colorStorageInfo;
+
+    writes[6] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[6].dstSet = resources->exrDescriptorSet;
     writes[6].dstBinding = 6;
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[6].descriptorCount = 1;
@@ -2971,11 +3347,14 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
 }
 
 void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet() {
-    CreateOrUpdateCompositeDescriptorSet(
-        &compositeDescriptorSet_,
-        accumulationImage_.view,
-        revealageImage_.view,
-        emissiveImage_.view);
+    compositeDescriptorSets_.resize(accumulationImages_.size(), VK_NULL_HANDLE);
+    for (std::uint32_t imageIndex = 0; imageIndex < accumulationImages_.size(); ++imageIndex) {
+        CreateOrUpdateCompositeDescriptorSet(
+            &compositeDescriptorSets_[imageIndex],
+            accumulationImages_[imageIndex].view,
+            revealageImages_[imageIndex].view,
+            emissiveImages_[imageIndex].view);
+    }
 }
 
 void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
@@ -3032,21 +3411,37 @@ void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void VulkanViewportShell::UpdateGaussianSplatDescriptorSet(ActiveGaussianSplatResources* resources) {
+void VulkanViewportShell::UpdateGaussianSplatDescriptorSets(ActiveGaussianSplatResources* resources) {
     if (resources == nullptr) {
         return;
     }
+    for (std::size_t frameIndex = 0; frameIndex < kFramesInFlight; ++frameIndex) {
+        resources->descriptorSets[frameIndex].resize(depthImages_.size(), VK_NULL_HANDLE);
+        for (std::uint32_t imageIndex = 0; imageIndex < depthImages_.size(); ++imageIndex) {
+            UpdateGaussianSplatDescriptorSet(resources, frameIndex, imageIndex);
+        }
+    }
+}
 
-    if (resources->descriptorSet == VK_NULL_HANDLE) {
+void VulkanViewportShell::UpdateGaussianSplatDescriptorSet(
+    ActiveGaussianSplatResources* resources,
+    std::size_t frameIndex,
+    std::uint32_t imageIndex) {
+    if (resources == nullptr || frameIndex >= kFramesInFlight || imageIndex >= depthImages_.size()) {
+        return;
+    }
+
+    auto& descriptorSet = resources->descriptorSets[frameIndex][imageIndex];
+    if (descriptorSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocInfo.descriptorPool = gaussianSplatDescriptorPool_;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &gaussianSplatDescriptorSetLayout_;
-        Check(vkAllocateDescriptorSets(device_, &allocInfo, &resources->descriptorSet), "vkAllocateDescriptorSets(gsplat)");
+        Check(vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet), "vkAllocateDescriptorSets(gsplat)");
     }
 
     VkDescriptorBufferInfo uniformInfo{};
-    uniformInfo.buffer = uniformBuffer_.buffer;
+    uniformInfo.buffer = frameResources_[frameIndex].uniformBuffer.buffer;
     uniformInfo.offset = 0;
     uniformInfo.range = sizeof(FrameUniforms);
 
@@ -3056,54 +3451,54 @@ void VulkanViewportShell::UpdateGaussianSplatDescriptorSet(ActiveGaussianSplatRe
     VkDescriptorBufferInfo opacityInfo{resources->opacityBuffer.buffer, 0, resources->opacityBuffer.size};
     VkDescriptorBufferInfo shInfo{resources->shBuffer.buffer, 0, resources->shBuffer.size};
     VkDescriptorImageInfo sceneDepthInfo{};
-    sceneDepthInfo.imageView = depthImage_.view;
+    sceneDepthInfo.imageView = depthImages_[imageIndex].view;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
     std::array<VkWriteDescriptorSet, 7> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[0].dstSet = resources->descriptorSet;
+    writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[0].descriptorCount = 1;
     writes[0].pBufferInfo = &uniformInfo;
 
     writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[1].dstSet = resources->descriptorSet;
+    writes[1].dstSet = descriptorSet;
     writes[1].dstBinding = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[1].descriptorCount = 1;
     writes[1].pBufferInfo = &centerInfo;
 
     writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[2].dstSet = resources->descriptorSet;
+    writes[2].dstSet = descriptorSet;
     writes[2].dstBinding = 2;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[2].descriptorCount = 1;
     writes[2].pBufferInfo = &scaleInfo;
 
     writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[3].dstSet = resources->descriptorSet;
+    writes[3].dstSet = descriptorSet;
     writes[3].dstBinding = 3;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[3].descriptorCount = 1;
     writes[3].pBufferInfo = &rotationInfo;
 
     writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[4].dstSet = resources->descriptorSet;
+    writes[4].dstSet = descriptorSet;
     writes[4].dstBinding = 4;
     writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[4].descriptorCount = 1;
     writes[4].pBufferInfo = &opacityInfo;
 
     writes[5] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[5].dstSet = resources->descriptorSet;
+    writes[5].dstSet = descriptorSet;
     writes[5].dstBinding = 5;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[5].descriptorCount = 1;
     writes[5].pBufferInfo = &shInfo;
 
     writes[6] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[6].dstSet = resources->descriptorSet;
+    writes[6].dstSet = descriptorSet;
     writes[6].dstBinding = 6;
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
     writes[6].descriptorCount = 1;
@@ -3112,24 +3507,25 @@ void VulkanViewportShell::UpdateGaussianSplatDescriptorSet(ActiveGaussianSplatRe
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void VulkanViewportShell::UpdateHighQualityGaussianDescriptorSet() {
+void VulkanViewportShell::UpdateHighQualityGaussianDescriptorSet(std::size_t frameIndex) {
     auto& scene = highQualityGaussianScene_;
-    if (scene.splatCount == 0 || scene.layerCount == 0) {
+    if (scene.splatCount == 0 || scene.layerCount == 0 || frameIndex >= kFramesInFlight) {
         return;
     }
 
-    if (scene.descriptorSet == VK_NULL_HANDLE) {
+    auto& descriptorSet = scene.descriptorSets[frameIndex];
+    if (descriptorSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocInfo.descriptorPool = gaussianSplatDescriptorPool_;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &highQualityGaussianSplatDescriptorSetLayout_;
         Check(
-            vkAllocateDescriptorSets(device_, &allocInfo, &scene.descriptorSet),
+            vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet),
             "vkAllocateDescriptorSets(gsplat_hq)");
     }
 
     VkDescriptorBufferInfo uniformInfo{};
-    uniformInfo.buffer = uniformBuffer_.buffer;
+    uniformInfo.buffer = frameResources_[frameIndex].uniformBuffer.buffer;
     uniformInfo.offset = 0;
     uniformInfo.range = sizeof(FrameUniforms);
 
@@ -3142,68 +3538,74 @@ void VulkanViewportShell::UpdateHighQualityGaussianDescriptorSet() {
         scene.layerStyleIndexBuffer.buffer,
         0,
         scene.layerStyleIndexBuffer.size};
-    VkDescriptorBufferInfo layerStyleInfo{scene.layerStyleBuffer.buffer, 0, scene.layerStyleBuffer.size};
-    VkDescriptorBufferInfo sortedIndexInfo{scene.sortedIndexBuffer.buffer, 0, scene.sortedIndexBuffer.size};
+    VkDescriptorBufferInfo layerStyleInfo{
+        scene.layerStyleBuffers[frameIndex].buffer,
+        0,
+        scene.layerStyleBuffers[frameIndex].size};
+    VkDescriptorBufferInfo sortedIndexInfo{
+        scene.sortedIndexBuffers[frameIndex].buffer,
+        0,
+        scene.sortedIndexBuffers[frameIndex].size};
 
     std::array<VkWriteDescriptorSet, 9> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[0].dstSet = scene.descriptorSet;
+    writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[0].descriptorCount = 1;
     writes[0].pBufferInfo = &uniformInfo;
 
     writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[1].dstSet = scene.descriptorSet;
+    writes[1].dstSet = descriptorSet;
     writes[1].dstBinding = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[1].descriptorCount = 1;
     writes[1].pBufferInfo = &centerInfo;
 
     writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[2].dstSet = scene.descriptorSet;
+    writes[2].dstSet = descriptorSet;
     writes[2].dstBinding = 2;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[2].descriptorCount = 1;
     writes[2].pBufferInfo = &scaleInfo;
 
     writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[3].dstSet = scene.descriptorSet;
+    writes[3].dstSet = descriptorSet;
     writes[3].dstBinding = 3;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[3].descriptorCount = 1;
     writes[3].pBufferInfo = &rotationInfo;
 
     writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[4].dstSet = scene.descriptorSet;
+    writes[4].dstSet = descriptorSet;
     writes[4].dstBinding = 4;
     writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[4].descriptorCount = 1;
     writes[4].pBufferInfo = &opacityInfo;
 
     writes[5] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[5].dstSet = scene.descriptorSet;
+    writes[5].dstSet = descriptorSet;
     writes[5].dstBinding = 5;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[5].descriptorCount = 1;
     writes[5].pBufferInfo = &shInfo;
 
     writes[6] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[6].dstSet = scene.descriptorSet;
+    writes[6].dstSet = descriptorSet;
     writes[6].dstBinding = 6;
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[6].descriptorCount = 1;
     writes[6].pBufferInfo = &layerStyleIndexInfo;
 
     writes[7] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[7].dstSet = scene.descriptorSet;
+    writes[7].dstSet = descriptorSet;
     writes[7].dstBinding = 7;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[7].descriptorCount = 1;
     writes[7].pBufferInfo = &layerStyleInfo;
 
     writes[8] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    writes[8].dstSet = scene.descriptorSet;
+    writes[8].dstSet = descriptorSet;
     writes[8].dstBinding = 8;
     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[8].descriptorCount = 1;
@@ -3212,7 +3614,7 @@ void VulkanViewportShell::UpdateHighQualityGaussianDescriptorSet() {
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void VulkanViewportShell::RefreshHighQualityGaussianScene() {
+void VulkanViewportShell::RefreshHighQualityGaussianScene(std::size_t frameIndex) {
     struct ActiveHighLayer {
         const SceneRenderState::GaussianSplatLayerState* renderLayer = nullptr;
         const ActiveGaussianSplatResources* resources = nullptr;
@@ -3238,7 +3640,11 @@ void VulkanViewportShell::RefreshHighQualityGaussianScene() {
     }
 
     if (activeHighLayers.empty()) {
-        if (highQualityGaussianScene_.splatCount > 0 || highQualityGaussianScene_.descriptorSet != VK_NULL_HANDLE) {
+        const bool hasDescriptor = std::any_of(
+            highQualityGaussianScene_.descriptorSets.begin(),
+            highQualityGaussianScene_.descriptorSets.end(),
+            [](VkDescriptorSet descriptorSet) { return descriptorSet != VK_NULL_HANDLE; });
+        if (highQualityGaussianScene_.splatCount > 0 || hasDescriptor) {
             CleanupHighQualityGaussianScene();
         }
         highQualityGaussianSceneDirty_ = false;
@@ -3373,17 +3779,18 @@ void VulkanViewportShell::RefreshHighQualityGaussianScene() {
             mergedLayerStyleIndices.data(),
             highQualityGaussianScene_.layerStyleIndexBuffer.size);
 
-        highQualityGaussianScene_.layerStyleBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(
-                std::max<std::uint32_t>(1U, highQualityGaussianScene_.layerCount) *
-                sizeof(HighQualityGaussianLayerStyle)),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        highQualityGaussianScene_.sortedIndexBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(
-                std::max<std::uint32_t>(1U, highQualityGaussianScene_.splatCount) * sizeof(std::uint32_t)),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-        UpdateHighQualityGaussianDescriptorSet();
+        for (std::size_t resourceFrameIndex = 0; resourceFrameIndex < kFramesInFlight; ++resourceFrameIndex) {
+            highQualityGaussianScene_.layerStyleBuffers[resourceFrameIndex] = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(
+                    std::max<std::uint32_t>(1U, highQualityGaussianScene_.layerCount) *
+                    sizeof(HighQualityGaussianLayerStyle)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            highQualityGaussianScene_.sortedIndexBuffers[resourceFrameIndex] = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(
+                    std::max<std::uint32_t>(1U, highQualityGaussianScene_.splatCount) * sizeof(std::uint32_t)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UpdateHighQualityGaussianDescriptorSet(resourceFrameIndex);
+        }
         highQualityGaussianSceneDirty_ = false;
     }
 
@@ -3431,7 +3838,7 @@ void VulkanViewportShell::RefreshHighQualityGaussianScene() {
     }
 
     UploadBufferData(
-        highQualityGaussianScene_.layerStyleBuffer,
+        highQualityGaussianScene_.layerStyleBuffers[frameIndex],
         layerStyles.data(),
         static_cast<VkDeviceSize>(layerStyles.size() * sizeof(HighQualityGaussianLayerStyle)));
 
@@ -3439,29 +3846,58 @@ void VulkanViewportShell::RefreshHighQualityGaussianScene() {
         !highQualityGaussianScene_.hasSortedView ||
         !MatricesApproximatelyEqual(highQualityGaussianScene_.lastSortedView, renderState_.view);
     if (needsResort) {
-        const auto sortedIndices = renderer::gsplat::SortHighQualityGaussianIndices(
+        highQualityGaussianScene_.sortedIndices = renderer::gsplat::SortHighQualityGaussianIndices(
             highQualityGaussianScene_.mergedLocalCenters,
             hqLayerInputs,
             highQualityGaussianScene_.layerRanges,
             renderState_.view);
-
-        UploadBufferData(
-            highQualityGaussianScene_.sortedIndexBuffer,
-            sortedIndices.data(),
-            static_cast<VkDeviceSize>(sortedIndices.size() * sizeof(std::uint32_t)));
         highQualityGaussianScene_.lastSortedView = renderState_.view;
         highQualityGaussianScene_.hasSortedView = true;
     }
+    UploadBufferData(
+        highQualityGaussianScene_.sortedIndexBuffers[frameIndex],
+        highQualityGaussianScene_.sortedIndices.data(),
+        static_cast<VkDeviceSize>(highQualityGaussianScene_.sortedIndices.size() * sizeof(std::uint32_t)));
 }
 
 void VulkanViewportShell::CleanupSwapchain() {
-    if (!commandBuffers_.empty() && commandPool_ != VK_NULL_HANDLE) {
-        vkFreeCommandBuffers(
-            device_,
-            commandPool_,
-            static_cast<std::uint32_t>(commandBuffers_.size()),
-            commandBuffers_.data());
-        commandBuffers_.clear();
+    if (commandPool_ != VK_NULL_HANDLE) {
+        for (auto& frame : frameResources_) {
+            if (frame.commandBuffer != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(device_, commandPool_, 1, &frame.commandBuffer);
+                frame.commandBuffer = VK_NULL_HANDLE;
+            }
+        }
+    }
+
+    for (auto& descriptorSet : compositeDescriptorSets_) {
+        if (descriptorSet != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+        }
+    }
+    compositeDescriptorSets_.clear();
+
+    for (auto& resources : pointCloudResources_) {
+        for (auto& descriptorSets : resources.descriptorSets) {
+            for (auto& descriptorSet : descriptorSets) {
+                if (descriptorSet != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
+                    vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+                    descriptorSet = VK_NULL_HANDLE;
+                }
+            }
+            descriptorSets.clear();
+        }
+    }
+    for (auto& resources : gaussianSplatResources_) {
+        for (auto& descriptorSets : resources.descriptorSets) {
+            for (auto& descriptorSet : descriptorSets) {
+                if (descriptorSet != VK_NULL_HANDLE && gaussianSplatDescriptorPool_ != VK_NULL_HANDLE) {
+                    vkFreeDescriptorSets(device_, gaussianSplatDescriptorPool_, 1, &descriptorSet);
+                    descriptorSet = VK_NULL_HANDLE;
+                }
+            }
+            descriptorSets.clear();
+        }
     }
 
     for (const auto framebuffer : framebuffers_) {
@@ -3469,10 +3905,22 @@ void VulkanViewportShell::CleanupSwapchain() {
     }
     framebuffers_.clear();
 
-    DestroyImage(&depthImage_);
-    DestroyImage(&accumulationImage_);
-    DestroyImage(&revealageImage_);
-    DestroyImage(&emissiveImage_);
+    for (auto& image : depthImages_) {
+        DestroyImage(&image);
+    }
+    for (auto& image : accumulationImages_) {
+        DestroyImage(&image);
+    }
+    for (auto& image : revealageImages_) {
+        DestroyImage(&image);
+    }
+    for (auto& image : emissiveImages_) {
+        DestroyImage(&image);
+    }
+    depthImages_.clear();
+    accumulationImages_.clear();
+    revealageImages_.clear();
+    emissiveImages_.clear();
 
     for (const auto imageView : imageViews_) {
         vkDestroyImageView(device_, imageView, nullptr);
@@ -3485,6 +3933,7 @@ void VulkanViewportShell::CleanupSwapchain() {
     }
 
     swapchainImages_.clear();
+    swapchainImagesInFlight_.clear();
 }
 
 void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* resources) {
@@ -3497,15 +3946,28 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->colorBuffer);
     DestroyBuffer(&resources->normalBuffer);
     DestroyBuffer(&resources->scalarFieldBuffer);
-    DestroyBuffer(&resources->styleBuffer);
+    for (auto& styleBuffer : resources->styleBuffers) {
+        DestroyBuffer(&styleBuffer);
+    }
+    DestroyBuffer(&resources->exrStyleBuffer);
     DestroyBuffer(&resources->sampledIndexBuffer);
     DestroyBuffer(&resources->sampledSurfelIndexBuffer);
     DestroyBuffer(&resources->interactiveSampledIndexBuffer);
     DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
-    if (resources->descriptorSet != VK_NULL_HANDLE &&
+    for (auto& descriptorSets : resources->descriptorSets) {
+        for (auto& descriptorSet : descriptorSets) {
+            if (descriptorSet != VK_NULL_HANDLE &&
+                descriptorPool_ != VK_NULL_HANDLE &&
+                device_ != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+            }
+        }
+        descriptorSets.clear();
+    }
+    if (resources->exrDescriptorSet != VK_NULL_HANDLE &&
         descriptorPool_ != VK_NULL_HANDLE &&
         device_ != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->descriptorSet);
+        vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->exrDescriptorSet);
     }
     *resources = ActivePointCloudResources{};
 }
@@ -3521,10 +3983,15 @@ void VulkanViewportShell::CleanupGaussianSplatResources(ActiveGaussianSplatResou
     DestroyBuffer(&resources->opacityBuffer);
     DestroyBuffer(&resources->shBuffer);
 
-    if (resources->descriptorSet != VK_NULL_HANDLE &&
-        gaussianSplatDescriptorPool_ != VK_NULL_HANDLE &&
-        device_ != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(device_, gaussianSplatDescriptorPool_, 1, &resources->descriptorSet);
+    for (auto& descriptorSets : resources->descriptorSets) {
+        for (auto& descriptorSet : descriptorSets) {
+            if (descriptorSet != VK_NULL_HANDLE &&
+                gaussianSplatDescriptorPool_ != VK_NULL_HANDLE &&
+                device_ != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(device_, gaussianSplatDescriptorPool_, 1, &descriptorSet);
+            }
+        }
+        descriptorSets.clear();
     }
 
     *resources = ActiveGaussianSplatResources{};
@@ -3537,13 +4004,19 @@ void VulkanViewportShell::CleanupHighQualityGaussianScene() {
     DestroyBuffer(&highQualityGaussianScene_.opacityBuffer);
     DestroyBuffer(&highQualityGaussianScene_.shBuffer);
     DestroyBuffer(&highQualityGaussianScene_.layerStyleIndexBuffer);
-    DestroyBuffer(&highQualityGaussianScene_.layerStyleBuffer);
-    DestroyBuffer(&highQualityGaussianScene_.sortedIndexBuffer);
+    for (auto& buffer : highQualityGaussianScene_.layerStyleBuffers) {
+        DestroyBuffer(&buffer);
+    }
+    for (auto& buffer : highQualityGaussianScene_.sortedIndexBuffers) {
+        DestroyBuffer(&buffer);
+    }
 
-    if (highQualityGaussianScene_.descriptorSet != VK_NULL_HANDLE &&
-        gaussianSplatDescriptorPool_ != VK_NULL_HANDLE &&
-        device_ != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(device_, gaussianSplatDescriptorPool_, 1, &highQualityGaussianScene_.descriptorSet);
+    for (auto& descriptorSet : highQualityGaussianScene_.descriptorSets) {
+        if (descriptorSet != VK_NULL_HANDLE &&
+            gaussianSplatDescriptorPool_ != VK_NULL_HANDLE &&
+            device_ != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device_, gaussianSplatDescriptorPool_, 1, &descriptorSet);
+        }
     }
 
     highQualityGaussianScene_ = HighQualityGaussianSceneResources{};
@@ -3567,11 +4040,17 @@ void VulkanViewportShell::CleanupExrExportResources() {
     if (resources.pointAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.pointAccumulationPipeline, nullptr);
     }
+    if (resources.pointConstantSimpleAccumulationPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, resources.pointConstantSimpleAccumulationPipeline, nullptr);
+    }
     if (resources.surfelDepthPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelDepthPipeline, nullptr);
     }
     if (resources.surfelAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelAccumulationPipeline, nullptr);
+    }
+    if (resources.surfelConstantSimpleAccumulationPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, resources.surfelConstantSimpleAccumulationPipeline, nullptr);
     }
     if (resources.compositePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.compositePipeline, nullptr);
@@ -3616,14 +4095,10 @@ void VulkanViewportShell::RecreateSwapchain() {
     CreateCommandBuffers();
     CreateOrUpdateCompositeDescriptorSet();
     for (auto& resources : pointCloudResources_) {
-        if (resources.descriptorSet != VK_NULL_HANDLE) {
-            UpdatePointCloudDescriptorSet(&resources);
-        }
+        UpdatePointCloudDescriptorSets(&resources);
     }
     for (auto& resources : gaussianSplatResources_) {
-        if (resources.descriptorSet != VK_NULL_HANDLE) {
-            UpdateGaussianSplatDescriptorSet(&resources);
-        }
+        UpdateGaussianSplatDescriptorSets(&resources);
     }
 
     if (ImGui::GetCurrentContext() != nullptr) {
@@ -3643,7 +4118,7 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
     auto* resources = FindPointCloudResources(layer.layerId);
     if (resources == nullptr ||
         resources->activePointCount == 0 ||
-        resources->descriptorSet == VK_NULL_HANDLE) {
+        resources->descriptorSets[0].empty()) {
         return false;
     }
 
@@ -3703,9 +4178,11 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
 
 bool VulkanViewportShell::UploadPointCloudLayerStyle(
     const SceneRenderState::PointCloudLayerState& layer,
-    const PointCloudDrawPlan& plan) {
+    const PointCloudDrawPlan& plan,
+    std::size_t frameIndex,
+    bool exrStyle) {
     auto* resources = plan.resources;
-    if (resources == nullptr || plan.drawPointCount == 0) {
+    if (resources == nullptr || plan.drawPointCount == 0 || frameIndex >= kFramesInFlight) {
         return false;
     }
 
@@ -3715,6 +4192,12 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.solidColor[1],
         layer.style.solidColor[2],
         layer.style.solidColor[3],
+    };
+    styleGpu.colorize = glm::vec4{
+        layer.style.colorizeColor[0],
+        layer.style.colorizeColor[1],
+        layer.style.colorizeColor[2],
+        std::clamp(layer.style.colorizeAmount, 0.0F, 1.0F),
     };
     styleGpu.globalControl = glm::uvec4{
         static_cast<std::uint32_t>(layer.style.colorMode),
@@ -3788,7 +4271,10 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.scalarFields,
         renderer::pointcloud::kInactiveSurfelDiameterDefault);
 
-    UploadBufferData(resources->styleBuffer, &styleGpu, sizeof(styleGpu));
+    UploadBufferData(
+        exrStyle ? resources->exrStyleBuffer : resources->styleBuffers[frameIndex],
+        &styleGpu,
+        sizeof(styleGpu));
     return true;
 }
 
@@ -3798,7 +4284,10 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
     bool forceFullSource,
     VkPipeline spritePipeline,
     VkPipeline surfelPipeline,
-    bool uploadStyle) {
+    bool uploadStyle,
+    std::size_t frameIndex,
+    std::uint32_t imageIndex,
+    bool exrStyle) {
     PointCloudDrawPlan plan;
     if (!ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
         return false;
@@ -3813,7 +4302,7 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
     }
 
     if (uploadStyle) {
-        if (!UploadPointCloudLayerStyle(layer, plan)) {
+        if (!UploadPointCloudLayerStyle(layer, plan, frameIndex, exrStyle)) {
             return false;
         }
     }
@@ -3823,13 +4312,24 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         plan.worldSurfels ? surfelPipeline : spritePipeline);
 
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    if (exrStyle) {
+        descriptorSet = resources->exrDescriptorSet;
+    } else if (frameIndex < kFramesInFlight &&
+               imageIndex < resources->descriptorSets[frameIndex].size()) {
+        descriptorSet = resources->descriptorSets[frameIndex][imageIndex];
+    }
+    if (descriptorSet == VK_NULL_HANDLE) {
+        return false;
+    }
+
     vkCmdBindDescriptorSets(
         commandBuffer,
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         pointPipelineLayout_,
         0,
         1,
-        &resources->descriptorSet,
+        &descriptorSet,
         0,
         nullptr);
 
@@ -3915,7 +4415,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     for (const auto& layer : request.renderState.pointCloudLayers) {
         PointCloudDrawPlan plan;
         if (ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
-            static_cast<void>(UploadPointCloudLayerStyle(layer, plan));
+            static_cast<void>(UploadPointCloudLayerStyle(layer, plan, 0U, true));
         }
     }
 
@@ -3941,15 +4441,24 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
+    const bool sceneHasActiveXray = std::any_of(
+        request.renderState.pointCloudLayers.begin(),
+        request.renderState.pointCloudLayers.end(),
+        [](const SceneRenderState::PointCloudLayerState& layer) {
+            return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
+        });
     for (const auto& layer : request.renderState.pointCloudLayers) {
-        if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
+        if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray)) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
                 forceFullSource,
                 resources.pointDepthPipeline,
                 resources.surfelDepthPipeline,
-                false));
+                false,
+                0U,
+                0U,
+                true));
         }
     }
 
@@ -3958,13 +4467,23 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
     for (const auto& layer : request.renderState.pointCloudLayers) {
+        VkPipeline spritePipeline = resources.pointAccumulationPipeline;
+        VkPipeline surfelPipeline = resources.surfelAccumulationPipeline;
+        if (renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style) ==
+            renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
+            spritePipeline = resources.pointConstantSimpleAccumulationPipeline;
+            surfelPipeline = resources.surfelConstantSimpleAccumulationPipeline;
+        }
         static_cast<void>(RecordPointCloudLayerDraw(
             resources.commandBuffer,
             layer,
             forceFullSource,
-            resources.pointAccumulationPipeline,
-            resources.surfelAccumulationPipeline,
-            false));
+            spritePipeline,
+            surfelPipeline,
+            false,
+            0U,
+            0U,
+            true));
     }
 
     vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
@@ -4018,7 +4537,10 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(exr)");
 }
 
-void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex) {
+void VulkanViewportShell::RecordCommandBuffer(
+    VkCommandBuffer commandBuffer,
+    std::uint32_t imageIndex,
+    std::size_t frameIndex) {
     const bool collectDiagnostics = diagnosticsEnabled_;
     const auto recordStart = collectDiagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint32_t pointDrawCalls = 0;
@@ -4026,13 +4548,17 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
     std::uint32_t pointAccumulationLayerCount = 0;
     std::uint32_t pointStyleUploadCount = 0;
     std::uint32_t pointSkippedInactiveBindings = 0;
+    std::uint32_t pointConstantSimpleDrawCalls = 0;
+    std::uint32_t pointUnifiedDrawCalls = 0;
+    std::uint32_t pointDepthPrepassSkippedNoXray = 0;
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
     for (const auto& layer : renderState_.pointCloudLayers) {
         PointCloudDrawPlan plan;
-        if (ResolvePointCloudDrawPlan(layer, false, &plan) && UploadPointCloudLayerStyle(layer, plan)) {
+        if (ResolvePointCloudDrawPlan(layer, false, &plan) &&
+            UploadPointCloudLayerStyle(layer, plan, frameIndex, false)) {
             if (collectDiagnostics) {
                 ++pointStyleUploadCount;
                 pointSkippedInactiveBindings += InactivePointBindingCount(layer.style);
@@ -4075,9 +4601,20 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+    const bool sceneHasActiveXray = std::any_of(
+        renderState_.pointCloudLayers.begin(),
+        renderState_.pointCloudLayers.end(),
+        [](const SceneRenderState::PointCloudLayerState& layer) {
+            return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
+        });
     if (!renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
+            if (collectDiagnostics &&
+                !sceneHasActiveXray &&
+                renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
+                ++pointDepthPrepassSkippedNoXray;
+            }
+            if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray)) {
                 if (collectDiagnostics) {
                     ++pointDepthLayerCount;
                 }
@@ -4087,6 +4624,9 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
                     false,
                     pointDepthPrepassPipeline_,
                     surfelDepthPrepassPipeline_,
+                    false,
+                    frameIndex,
+                    imageIndex,
                     false)) {
                     if (collectDiagnostics) {
                         ++pointDrawCalls;
@@ -4102,6 +4642,13 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
 
     if (!renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
+            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            VkPipeline spritePipeline = pointAccumulationPipeline_;
+            VkPipeline surfelPipeline = surfelAccumulationPipeline_;
+            if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
+                spritePipeline = pointConstantSimpleAccumulationPipeline_;
+                surfelPipeline = surfelConstantSimpleAccumulationPipeline_;
+            }
             if (collectDiagnostics) {
                 ++pointAccumulationLayerCount;
             }
@@ -4109,11 +4656,19 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
                 commandBuffer,
                 layer,
                 false,
-                pointAccumulationPipeline_,
-                surfelAccumulationPipeline_,
+                spritePipeline,
+                surfelPipeline,
+                false,
+                frameIndex,
+                imageIndex,
                 false)) {
                 if (collectDiagnostics) {
                     ++pointDrawCalls;
+                    if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
+                        ++pointConstantSimpleDrawCalls;
+                    } else {
+                        ++pointUnifiedDrawCalls;
+                    }
                 }
             }
         }
@@ -4128,7 +4683,14 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
             }
 
             const auto* resources = FindGaussianSplatResources(layer.layerId);
-            if (resources == nullptr || resources->splatCount == 0 || resources->descriptorSet == VK_NULL_HANDLE) {
+            if (resources == nullptr ||
+                resources->splatCount == 0 ||
+                frameIndex >= kFramesInFlight ||
+                imageIndex >= resources->descriptorSets[frameIndex].size()) {
+                continue;
+            }
+            VkDescriptorSet descriptorSet = resources->descriptorSets[frameIndex][imageIndex];
+            if (descriptorSet == VK_NULL_HANDLE) {
                 continue;
             }
 
@@ -4172,7 +4734,7 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
                 gaussianSplatPipelineLayout_,
                 0,
                 1,
-                &resources->descriptorSet,
+                &descriptorSet,
                 0,
                 nullptr);
             vkCmdPushConstants(
@@ -4190,7 +4752,9 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (compositeDescriptorSet_ != VK_NULL_HANDLE) {
+    if (imageIndex < compositeDescriptorSets_.size() &&
+        compositeDescriptorSets_[imageIndex] != VK_NULL_HANDLE) {
+        VkDescriptorSet descriptorSet = compositeDescriptorSets_[imageIndex];
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline_);
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -4198,7 +4762,7 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
             compositePipelineLayout_,
             0,
             1,
-            &compositeDescriptorSet_,
+            &descriptorSet,
             0,
             nullptr);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
@@ -4208,8 +4772,10 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (highQualityGaussianScene_.descriptorSet != VK_NULL_HANDLE &&
+    if (frameIndex < kFramesInFlight &&
+        highQualityGaussianScene_.descriptorSets[frameIndex] != VK_NULL_HANDLE &&
         highQualityGaussianScene_.splatCount > 0) {
+        VkDescriptorSet descriptorSet = highQualityGaussianScene_.descriptorSets[frameIndex];
         HighQualityGaussianPushConstants pushConstants;
         pushConstants.extra = glm::vec4{
             renderState_.gaussianSplatFootprintBoost,
@@ -4228,7 +4794,7 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
             highQualityGaussianSplatPipelineLayout_,
             0,
             1,
-            &highQualityGaussianScene_.descriptorSet,
+            &descriptorSet,
             0,
             nullptr);
         vkCmdPushConstants(
@@ -4254,16 +4820,23 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
     diagnostics_.pointAccumulationLayerCount = pointAccumulationLayerCount;
     diagnostics_.pointStyleUploadCount = pointStyleUploadCount;
     diagnostics_.pointSkippedInactiveBindings = pointSkippedInactiveBindings;
+    diagnostics_.pointConstantSimpleDrawCalls = pointConstantSimpleDrawCalls;
+    diagnostics_.pointUnifiedDrawCalls = pointUnifiedDrawCalls;
+    diagnostics_.pointDepthPrepassSkippedNoXray = pointDepthPrepassSkippedNoXray;
     diagnostics_.pointCommandRecordMs =
         collectDiagnostics ? std::chrono::duration<double, std::milli>(recordEnd - recordStart).count() : 0.0;
 }
 
-void VulkanViewportShell::UpdateUniformBuffer() {
-    UploadFrameUniforms(swapchainWidth_, swapchainHeight_);
+void VulkanViewportShell::UpdateUniformBuffer(std::size_t frameIndex) {
+    UploadFrameUniforms(frameIndex, swapchainWidth_, swapchainHeight_);
 }
 
-void VulkanViewportShell::UploadFrameUniforms(std::uint32_t width, std::uint32_t height) {
-    if (uniformBuffer_.buffer == VK_NULL_HANDLE) {
+void VulkanViewportShell::UploadFrameUniforms(
+    std::size_t frameIndex,
+    std::uint32_t width,
+    std::uint32_t height) {
+    if (frameIndex >= kFramesInFlight ||
+        frameResources_[frameIndex].uniformBuffer.buffer == VK_NULL_HANDLE) {
         return;
     }
 
@@ -4293,7 +4866,7 @@ void VulkanViewportShell::UploadFrameUniforms(std::uint32_t width, std::uint32_t
         std::max(0.0F, renderState_.depthOfFieldMaxBlurPixels),
     };
 
-    UploadBufferData(uniformBuffer_, &uniforms, sizeof(uniforms));
+    UploadBufferData(frameResources_[frameIndex].uniformBuffer, &uniforms, sizeof(uniforms));
 }
 
 VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuffer(

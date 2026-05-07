@@ -37,10 +37,14 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_preview.vert
     shaders/pointcloud_preview.frag
     shaders/pointcloud_accumulation.frag
+    shaders/pointcloud_constant_simple.vert
+    shaders/pointcloud_constant_simple_accumulation.frag
     shaders/pointcloud_export_depth.frag
     shaders/pointcloud_surfel.vert
     shaders/pointcloud_surfel_preview.frag
     shaders/pointcloud_surfel_accumulation.frag
+    shaders/pointcloud_surfel_constant_simple.vert
+    shaders/pointcloud_surfel_constant_simple_accumulation.frag
     shaders/pointcloud_surfel_export_depth.frag
     shaders/gsplat_accumulation.vert
     shaders/gsplat_accumulation.frag

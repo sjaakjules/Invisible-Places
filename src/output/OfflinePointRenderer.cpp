@@ -11,6 +11,7 @@
 #include <cmath>
 #include <limits>
 
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <glm/matrix.hpp>
 #include <glm/vec3.hpp>
@@ -92,22 +93,103 @@ glm::vec3 SourceRgb(std::uint32_t packedColor) {
     };
 }
 
+glm::vec3 RgbToHsl(glm::vec3 color) {
+    color = glm::clamp(color, glm::vec3{0.0F}, glm::vec3{1.0F});
+    const float maxChannel = std::max(std::max(color.r, color.g), color.b);
+    const float minChannel = std::min(std::min(color.r, color.g), color.b);
+    const float delta = maxChannel - minChannel;
+    const float lightness = (maxChannel + minChannel) * 0.5F;
+    if (delta <= 1.0e-5F) {
+        return {0.0F, 0.0F, lightness};
+    }
+
+    const float saturation =
+        lightness > 0.5F
+            ? delta / std::max(1.0e-5F, 2.0F - maxChannel - minChannel)
+            : delta / std::max(1.0e-5F, maxChannel + minChannel);
+    float hue = 0.0F;
+    if (maxChannel == color.r) {
+        hue = ((color.g - color.b) / delta) + (color.g < color.b ? 6.0F : 0.0F);
+    } else if (maxChannel == color.g) {
+        hue = ((color.b - color.r) / delta) + 2.0F;
+    } else {
+        hue = ((color.r - color.g) / delta) + 4.0F;
+    }
+    return {hue / 6.0F, saturation, lightness};
+}
+
+float HueToRgb(float p, float q, float t) {
+    if (t < 0.0F) {
+        t += 1.0F;
+    }
+    if (t > 1.0F) {
+        t -= 1.0F;
+    }
+    if (t < (1.0F / 6.0F)) {
+        return p + ((q - p) * 6.0F * t);
+    }
+    if (t < 0.5F) {
+        return q;
+    }
+    if (t < (2.0F / 3.0F)) {
+        return p + ((q - p) * ((2.0F / 3.0F) - t) * 6.0F);
+    }
+    return p;
+}
+
+glm::vec3 HslToRgb(glm::vec3 hsl) {
+    if (hsl.y <= 1.0e-5F) {
+        return glm::vec3{hsl.z};
+    }
+
+    const float q = hsl.z < 0.5F
+                        ? hsl.z * (1.0F + hsl.y)
+                        : hsl.z + hsl.y - (hsl.z * hsl.y);
+    const float p = (2.0F * hsl.z) - q;
+    return {
+        HueToRgb(p, q, hsl.x + (1.0F / 3.0F)),
+        HueToRgb(p, q, hsl.x),
+        HueToRgb(p, q, hsl.x - (1.0F / 3.0F)),
+    };
+}
+
+glm::vec3 ApplyColorize(
+    glm::vec3 baseColor,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    const float amount = std::clamp(style.colorizeAmount, 0.0F, 1.0F);
+    if (amount <= 1.0e-5F) {
+        return baseColor;
+    }
+
+    const auto sourceHsl = RgbToHsl(baseColor);
+    const auto tintHsl = RgbToHsl({
+        style.colorizeColor[0],
+        style.colorizeColor[1],
+        style.colorizeColor[2],
+    });
+    const auto colorized = HslToRgb({tintHsl.x, tintHsl.y, sourceHsl.z});
+    return glm::mix(baseColor, colorized, amount);
+}
+
 glm::vec3 ResolvePointColor(
     const OfflinePointLayer& layer,
     std::size_t pointIndex) {
     if (layer.cloud == nullptr) {
-        return {1.0F, 1.0F, 1.0F};
+        return ApplyColorize({1.0F, 1.0F, 1.0F}, layer.style);
     }
 
     const auto& cloud = *layer.cloud;
+    glm::vec3 baseColor{
+        layer.style.solidColor[0],
+        layer.style.solidColor[1],
+        layer.style.solidColor[2],
+    };
     if (layer.style.colorMode == invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb &&
         layer.hasSourceRgb &&
         pointIndex < cloud.packedColors.size()) {
-        return SourceRgb(cloud.packedColors[pointIndex]);
-    }
-
-    if (layer.style.colorMode == invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap &&
-        !cloud.scalarFields.empty()) {
+        baseColor = SourceRgb(cloud.packedColors[pointIndex]);
+    } else if (layer.style.colorMode == invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap &&
+               !cloud.scalarFields.empty()) {
         const auto color = invisible_places::renderer::pointcloud::SampleColormap(
             layer.style.colormap,
             EvaluateBindingOrDefault(
@@ -115,14 +197,10 @@ glm::vec3 ResolvePointColor(
                 layer.style.colormapPosition,
                 pointIndex,
                 invisible_places::renderer::pointcloud::kInactiveColormapPositionDefault));
-        return {color[0], color[1], color[2]};
+        baseColor = {color[0], color[1], color[2]};
     }
 
-    return {
-        layer.style.solidColor[0],
-        layer.style.solidColor[1],
-        layer.style.solidColor[2],
-    };
+    return ApplyColorize(baseColor, layer.style);
 }
 
 struct OfflinePointSample {
@@ -638,11 +716,22 @@ void RenderPointCloudTile(
     auto& emissionB = activeScratch.emissionB;
     auto& emissionA = activeScratch.emissionA;
 
+    const bool sceneHasActiveXray = std::any_of(
+        layers.begin(),
+        layers.end(),
+        [](const OfflinePointLayer& layer) {
+            return layer.cloud != nullptr &&
+                   !layer.cloud->positions.empty() &&
+                   invisible_places::renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
+        });
+
     const auto depthStart = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
         if (layer.cloud == nullptr ||
             layer.cloud->positions.empty() ||
-            !invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
+            !invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(
+                layer.style,
+                sceneHasActiveXray)) {
             continue;
         }
         if (diagnostics != nullptr) {
