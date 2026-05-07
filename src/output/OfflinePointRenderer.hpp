@@ -26,6 +26,31 @@ struct OfflineRenderTile {
     std::uint32_t y1 = 0;
 };
 
+struct OfflinePointRenderDiagnostics {
+    std::uint64_t depthVisitedPoints = 0;
+    std::uint64_t accumulationVisitedPoints = 0;
+    std::uint64_t depthCoveredPixels = 0;
+    std::uint64_t accumulationCoveredPixels = 0;
+    std::uint32_t depthPassLayers = 0;
+    std::uint32_t accumulationPassLayers = 0;
+    std::uint32_t skippedInactiveBindings = 0;
+    double depthPassMs = 0.0;
+    double accumulationPassMs = 0.0;
+    double compositePassMs = 0.0;
+};
+
+struct OfflinePointRenderScratch {
+    std::vector<float> accumR;
+    std::vector<float> accumG;
+    std::vector<float> accumB;
+    std::vector<float> accumA;
+    std::vector<float> revealage;
+    std::vector<float> emissionR;
+    std::vector<float> emissionG;
+    std::vector<float> emissionB;
+    std::vector<float> emissionA;
+};
+
 void InitializeExrImage(ExrImage* image, std::uint32_t width, std::uint32_t height);
 std::vector<OfflineRenderTile> BuildOfflineRenderTiles(
     std::uint32_t width,
@@ -35,6 +60,8 @@ void RenderPointCloudTile(
     const std::vector<OfflinePointLayer>& layers,
     const invisible_places::camera::CameraState& cameraState,
     const OfflineRenderTile& tile,
-    ExrImage* image);
+    ExrImage* image,
+    OfflinePointRenderDiagnostics* diagnostics = nullptr,
+    OfflinePointRenderScratch* scratch = nullptr);
 
 }  // namespace invisible_places::output

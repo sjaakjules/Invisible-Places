@@ -245,6 +245,7 @@ struct OfflineRenderProgressState {
     std::uint32_t currentFrame = 0;
     std::uint32_t currentTile = 0;
     std::filesystem::path lastOutputPath;
+    invisible_places::output::OfflinePointRenderDiagnostics lastDiagnostics{};
     std::string statusMessage;
     std::string errorMessage;
 };
@@ -338,6 +339,7 @@ struct PreviewRuntimeState {
     invisible_places::ui::SidePanelState sidePanel{};
     ProjectSettings projectSettings{};
     PersistenceState persistence{};
+    bool showDiagnosticsPanel = false;
     std::string statusMessage;
     std::string errorMessage;
 };
@@ -1182,6 +1184,15 @@ bool DrawScalarBindingBody(
     bool changed = false;
     ImGui::PushID(id);
 
+    bool active = binding->active;
+    if (ImGui::Checkbox("Active", &active)) {
+        binding->active = active;
+        changed = true;
+    }
+    if (!binding->active) {
+        ImGui::BeginDisabled();
+    }
+
     int modeIndex = static_cast<int>(binding->mode);
     const char* modeLabels[] = {"Constant", "Field-Mapped"};
     if (DrawRightAlignedCombo("Mode", &modeIndex, modeLabels, IM_ARRAYSIZE(modeLabels))) {
@@ -1217,6 +1228,9 @@ bool DrawScalarBindingBody(
         }
         if (binding->mode == ParameterSourceMode::FieldMapped && scalarFields.empty()) {
             ImGui::TextDisabled("No scalar fields are available for this layer.");
+        }
+        if (!binding->active) {
+            ImGui::EndDisabled();
         }
         ImGui::PopID();
         return changed;
@@ -1330,6 +1344,9 @@ bool DrawScalarBindingBody(
         changed = true;
     }
 
+    if (!binding->active) {
+        ImGui::EndDisabled();
+    }
     ImGui::PopID();
     return changed;
 }
@@ -3247,7 +3264,8 @@ void UpdateOfflineRenderProgress(
     const std::shared_ptr<OfflineRenderProgressState>& progress,
     std::uint32_t frame,
     std::uint32_t tile,
-    const std::filesystem::path& lastOutputPath = {}) {
+    const std::filesystem::path& lastOutputPath = {},
+    const invisible_places::output::OfflinePointRenderDiagnostics* diagnostics = nullptr) {
     if (progress == nullptr) {
         return;
     }
@@ -3257,6 +3275,9 @@ void UpdateOfflineRenderProgress(
     progress->currentTile = tile;
     if (!lastOutputPath.empty()) {
         progress->lastOutputPath = lastOutputPath;
+    }
+    if (diagnostics != nullptr) {
+        progress->lastDiagnostics = *diagnostics;
     }
 }
 
@@ -3304,6 +3325,7 @@ void RunOfflineRenderWorker(
 
         invisible_places::output::ExrImage image;
         invisible_places::output::InitializeExrImage(&image, settings.width, settings.height);
+        invisible_places::output::OfflinePointRenderScratch scratch;
 
         for (std::uint32_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex) {
             for (std::uint32_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex) {
@@ -3313,12 +3335,15 @@ void RunOfflineRenderWorker(
                 }
 
                 UpdateOfflineRenderProgress(progress, frameIndex, tileIndex);
+                invisible_places::output::OfflinePointRenderDiagnostics diagnostics;
                 invisible_places::output::RenderPointCloudTile(
                     offlineLayers,
                     frames[frameIndex],
                     tiles[tileIndex],
-                    &image);
-                UpdateOfflineRenderProgress(progress, frameIndex, tileIndex + 1U);
+                    &image,
+                    &diagnostics,
+                    &scratch);
+                UpdateOfflineRenderProgress(progress, frameIndex, tileIndex + 1U, {}, &diagnostics);
             }
 
             const auto outputFrameIndex = settings.startFrame + frameIndex;
@@ -5905,6 +5930,8 @@ void DrawRenderInfoSection(
                 ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
             }
         }
+        ImGui::Separator();
+        ImGui::Checkbox("Diagnostics", &runtimeState->showDiagnosticsPanel);
         EndPanelSection();
     }
 
@@ -5982,6 +6009,61 @@ void DrawRenderInfoSection(
         }
         EndPanelSection();
     }
+}
+
+void DrawDiagnosticsWindow(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr || !runtimeState->showDiagnosticsPanel) {
+        return;
+    }
+
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2{420.0F, 360.0F}, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Renderer Diagnostics", &open, ImGuiWindowFlags_NoCollapse)) {
+        const auto& diagnostics = viewport.Diagnostics();
+        const auto viewportSize = CurrentUiViewportSize(viewport);
+
+        if (BeginPanelSection("Renderer")) {
+            ImGui::Text(
+                "GPU: %s",
+                diagnostics.rendererName.empty() ? "Unknown" : diagnostics.rendererName.c_str());
+            if (!diagnostics.driverName.empty()) {
+                ImGui::Text("Driver: %s", diagnostics.driverName.c_str());
+            }
+            ImGui::Text(
+                "Render window: %.0f x %.0f UI, %u x %u framebuffer",
+                viewportSize.x,
+                viewportSize.y,
+                viewport.Width(),
+                viewport.Height());
+            ImGui::Text(
+                "Accumulation: %u x %u",
+                diagnostics.accumulationWidth,
+                diagnostics.accumulationHeight);
+            EndPanelSection();
+        }
+
+        if (BeginPanelSection("Point Clouds")) {
+            ImGui::Text("Points: %s", FormatPointCount(diagnostics.pointCount).c_str());
+            ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
+            if (!diagnostics.pointRenderModes.empty()) {
+                ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
+            }
+            ImGui::Text(
+                "Point draws: %u (%u depth, %u material)",
+                diagnostics.pointDrawCalls,
+                diagnostics.pointDepthLayerCount,
+                diagnostics.pointAccumulationLayerCount);
+            ImGui::Text("Style uploads: %u", diagnostics.pointStyleUploadCount);
+            ImGui::Text("Inactive bindings skipped: %u", diagnostics.pointSkippedInactiveBindings);
+            ImGui::Text("Command record: %.3f ms", diagnostics.pointCommandRecordMs);
+            EndPanelSection();
+        }
+    }
+    ImGui::End();
+
+    runtimeState->showDiagnosticsPanel = open;
 }
 
 void DrawControlsWindow(
@@ -6373,6 +6455,7 @@ int Application::Run() const {
             }
 
             DrawControlsWindow(&runtimeState, &viewport.value());
+            DrawDiagnosticsWindow(&runtimeState, viewport.value());
             DrawLoadingOverlay(runtimeState);
             DrawAnimationViewportOverlay(&runtimeState, viewport.value());
             UpdateCameraFromInput(&runtimeState, viewport.value());
@@ -6381,6 +6464,7 @@ int Application::Run() const {
             UpdatePerformanceInteractionState(&runtimeState, viewport.value());
             PrunePreviewLodSampleCaches(&runtimeState);
             DrawPivotOverlay(runtimeState, viewport.value());
+            viewport->SetDiagnosticsEnabled(runtimeState.showDiagnosticsPanel);
             viewport->UpdateRenderState(BuildRenderState(runtimeState, viewport.value()));
             viewport->DrawFrame();
         } else {

@@ -33,6 +33,7 @@ struct FieldMapConfig {
 };
 
 struct RenderParameterBinding {
+    bool active = true;
     ParameterSourceMode mode = ParameterSourceMode::Constant;
     std::array<float, 4> constantValue{0.0F, 0.0F, 0.0F, 0.0F};
     FieldMapConfig fieldMap{};

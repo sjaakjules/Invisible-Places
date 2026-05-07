@@ -247,6 +247,7 @@ SerializedLayerKind ParseSerializedLayerKind(const json& value) {
 
 json SerializeBinding(const RenderParameterBinding& binding) {
     return json{
+        {"active", binding.active},
         {"mode", ParameterSourceModeName(binding.mode)},
         {"constant_value", binding.constantValue},
         {"field_map",
@@ -266,6 +267,7 @@ json SerializeBinding(const RenderParameterBinding& binding) {
 RenderParameterBinding ParseBinding(const json& bindingJson) {
     RenderParameterBinding binding;
 
+    binding.active = bindingJson.value("active", true);
     if (bindingJson.contains("mode")) {
         binding.mode = ParseParameterSourceMode(bindingJson.at("mode"));
     }

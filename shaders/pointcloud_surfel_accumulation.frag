@@ -85,8 +85,11 @@ float WeightedAlphaWeight(float alpha) {
         max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
         0.0,
         1.0);
-    const float opacityWeight = pow(min(1.0, alpha * 8.0) + 0.01, 3.0);
-    const float frontWeight = pow(1.0 - depthNorm, 4.0);
+    const float opacityBase = min(1.0, alpha * 8.0) + 0.01;
+    const float opacityWeight = opacityBase * opacityBase * opacityBase;
+    const float frontBase = 1.0 - depthNorm;
+    const float frontSquared = frontBase * frontBase;
+    const float frontWeight = frontSquared * frontSquared;
     return clamp(
         (opacityWeight * 0.5) + (opacityWeight * frontWeight * 128.0),
         1e-3,

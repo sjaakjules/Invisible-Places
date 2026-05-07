@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
@@ -59,6 +60,30 @@ float EvaluateBinding(
         fieldStats);
 }
 
+float EvaluateBindingOrDefault(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const invisible_places::style::RenderParameterBinding& binding,
+    std::size_t pointIndex,
+    float inactiveDefault) {
+    if (!binding.active) {
+        return inactiveDefault;
+    }
+    return EvaluateBinding(cloud, binding, pointIndex);
+}
+
+std::uint32_t InactivePointBindingCount(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    std::uint32_t count = 0;
+    count += style.pointSize.active ? 0U : 1U;
+    count += style.surfelDiameter.active ? 0U : 1U;
+    count += style.opacity.active ? 0U : 1U;
+    count += style.emissiveStrength.active ? 0U : 1U;
+    count += style.xrayStrength.active ? 0U : 1U;
+    count += style.depthFade.active ? 0U : 1U;
+    count += style.colormapPosition.active ? 0U : 1U;
+    return count;
+}
+
 glm::vec3 SourceRgb(std::uint32_t packedColor) {
     return {
         static_cast<float>(packedColor & 0xFFU) / 255.0F,
@@ -85,7 +110,11 @@ glm::vec3 ResolvePointColor(
         !cloud.scalarFields.empty()) {
         const auto color = invisible_places::renderer::pointcloud::SampleColormap(
             layer.style.colormap,
-            EvaluateBinding(cloud, layer.style.colormapPosition, pointIndex));
+            EvaluateBindingOrDefault(
+                cloud,
+                layer.style.colormapPosition,
+                pointIndex,
+                invisible_places::renderer::pointcloud::kInactiveColormapPositionDefault));
         return {color[0], color[1], color[2]};
     }
 
@@ -177,8 +206,11 @@ float WeightedAlphaWeight(
             std::max(1.0e-5F, cameraState.farPlane - cameraState.nearPlane),
         0.0F,
         1.0F);
-    const float opacityWeight = std::pow(std::min(1.0F, alpha * 8.0F) + 0.01F, 3.0F);
-    const float frontWeight = std::pow(1.0F - depthNorm, 4.0F);
+    const float opacityBase = std::min(1.0F, alpha * 8.0F) + 0.01F;
+    const float opacityWeight = opacityBase * opacityBase * opacityBase;
+    const float frontBase = 1.0F - depthNorm;
+    const float frontSquared = frontBase * frontBase;
+    const float frontWeight = frontSquared * frontSquared;
     return std::clamp((opacityWeight * 0.5F) + (opacityWeight * frontWeight * 128.0F), 1.0e-3F, 256.0F);
 }
 
@@ -281,7 +313,8 @@ bool BuildOfflinePointSample(
     const invisible_places::camera::CameraState& cameraState,
     std::size_t pointIndex,
     const ExrImage& image,
-    OfflinePointSample* sample) {
+    OfflinePointSample* sample,
+    bool resolveMaterial) {
     if (layer.cloud == nullptr || sample == nullptr) {
         return false;
     }
@@ -320,14 +353,50 @@ bool BuildOfflinePointSample(
     sample->pixelCenterY = (ndc.y * 0.5F + 0.5F) * static_cast<float>(image.height);
     sample->worldCenter = glm::vec3{normalizedWorld};
     sample->viewDepth = viewDepth;
-    sample->pointSize = std::clamp(EvaluateBinding(cloud, layer.style.pointSize, pointIndex), 1.0F, 64.0F);
+    sample->pointSize = std::clamp(
+        EvaluateBindingOrDefault(
+            cloud,
+            layer.style.pointSize,
+            pointIndex,
+            invisible_places::renderer::pointcloud::kInactivePointSizeDefault),
+        1.0F,
+        64.0F);
     sample->worldSurfels = worldSurfels;
-    sample->surfelDiameter = std::max(0.0F, EvaluateBinding(cloud, layer.style.surfelDiameter, pointIndex));
-    sample->opacity = Clamp01(EvaluateBinding(cloud, layer.style.opacity, pointIndex));
-    sample->emissive = std::max(0.0F, EvaluateBinding(cloud, layer.style.emissiveStrength, pointIndex));
-    sample->xray = Clamp01(EvaluateBinding(cloud, layer.style.xrayStrength, pointIndex));
-    sample->depthFade = Clamp01(EvaluateBinding(cloud, layer.style.depthFade, pointIndex));
-    sample->color = ResolvePointColor(layer, pointIndex);
+    sample->surfelDiameter = std::max(
+        0.0F,
+        EvaluateBindingOrDefault(
+            cloud,
+            layer.style.surfelDiameter,
+            pointIndex,
+            invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault));
+    sample->opacity = Clamp01(
+        EvaluateBindingOrDefault(
+            cloud,
+            layer.style.opacity,
+            pointIndex,
+            invisible_places::renderer::pointcloud::kInactiveOpacityDefault));
+    sample->depthFade = Clamp01(
+        EvaluateBindingOrDefault(
+            cloud,
+            layer.style.depthFade,
+            pointIndex,
+            invisible_places::renderer::pointcloud::kInactiveDepthFadeDefault));
+    if (resolveMaterial) {
+        sample->emissive = std::max(
+            0.0F,
+            EvaluateBindingOrDefault(
+                cloud,
+                layer.style.emissiveStrength,
+                pointIndex,
+                invisible_places::renderer::pointcloud::kInactiveEmissionDefault));
+        sample->xray = Clamp01(
+            EvaluateBindingOrDefault(
+                cloud,
+                layer.style.xrayStrength,
+                pointIndex,
+                invisible_places::renderer::pointcloud::kInactiveXrayDefault));
+        sample->color = ResolvePointColor(layer, pointIndex);
+    }
     if (sample->worldSurfels) {
         if (sample->surfelDiameter <= 1.0e-6F) {
             return false;
@@ -529,9 +598,14 @@ void RenderPointCloudTile(
     const std::vector<OfflinePointLayer>& layers,
     const invisible_places::camera::CameraState& cameraState,
     const OfflineRenderTile& tile,
-    ExrImage* image) {
+    ExrImage* image,
+    OfflinePointRenderDiagnostics* diagnostics,
+    OfflinePointRenderScratch* scratch) {
     if (image == nullptr || image->width == 0 || image->height == 0 || tile.x0 >= tile.x1 || tile.y0 >= tile.y1) {
         return;
+    }
+    if (diagnostics != nullptr) {
+        *diagnostics = {};
     }
 
     invisible_places::camera::OrbitCamera camera;
@@ -542,19 +616,38 @@ void RenderPointCloudTile(
     const std::uint32_t tileHeight = tile.y1 - tile.y0;
     const auto tilePixelCount = static_cast<std::size_t>(tileWidth) * static_cast<std::size_t>(tileHeight);
 
-    std::vector<float> accumR(tilePixelCount, 0.0F);
-    std::vector<float> accumG(tilePixelCount, 0.0F);
-    std::vector<float> accumB(tilePixelCount, 0.0F);
-    std::vector<float> accumA(tilePixelCount, 0.0F);
-    std::vector<float> revealage(tilePixelCount, 1.0F);
-    std::vector<float> emissionR(tilePixelCount, 0.0F);
-    std::vector<float> emissionG(tilePixelCount, 0.0F);
-    std::vector<float> emissionB(tilePixelCount, 0.0F);
-    std::vector<float> emissionA(tilePixelCount, 0.0F);
+    OfflinePointRenderScratch localScratch;
+    auto& activeScratch = scratch != nullptr ? *scratch : localScratch;
+    activeScratch.accumR.assign(tilePixelCount, 0.0F);
+    activeScratch.accumG.assign(tilePixelCount, 0.0F);
+    activeScratch.accumB.assign(tilePixelCount, 0.0F);
+    activeScratch.accumA.assign(tilePixelCount, 0.0F);
+    activeScratch.revealage.assign(tilePixelCount, 1.0F);
+    activeScratch.emissionR.assign(tilePixelCount, 0.0F);
+    activeScratch.emissionG.assign(tilePixelCount, 0.0F);
+    activeScratch.emissionB.assign(tilePixelCount, 0.0F);
+    activeScratch.emissionA.assign(tilePixelCount, 0.0F);
 
+    auto& accumR = activeScratch.accumR;
+    auto& accumG = activeScratch.accumG;
+    auto& accumB = activeScratch.accumB;
+    auto& accumA = activeScratch.accumA;
+    auto& revealage = activeScratch.revealage;
+    auto& emissionR = activeScratch.emissionR;
+    auto& emissionG = activeScratch.emissionG;
+    auto& emissionB = activeScratch.emissionB;
+    auto& emissionA = activeScratch.emissionA;
+
+    const auto depthStart = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
-        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+        if (layer.cloud == nullptr ||
+            layer.cloud->positions.empty() ||
+            !invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
             continue;
+        }
+        if (diagnostics != nullptr) {
+            ++diagnostics->depthPassLayers;
+            diagnostics->skippedInactiveBindings += InactivePointBindingCount(layer.style);
         }
 
         const auto& cloud = *layer.cloud;
@@ -562,8 +655,11 @@ void RenderPointCloudTile(
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
                 OfflinePointSample sample;
-                if (!BuildOfflinePointSample(layer, matrices, cameraState, pointIndex, *image, &sample)) {
+                if (!BuildOfflinePointSample(layer, matrices, cameraState, pointIndex, *image, &sample, false)) {
                     continue;
+                }
+                if (diagnostics != nullptr) {
+                    ++diagnostics->depthVisitedPoints;
                 }
 
                 VisitCoveredPixels(
@@ -589,14 +685,27 @@ void RenderPointCloudTile(
                                 alpha)) {
                             image->depth[pixelIndex] = coveredViewDepth;
                         }
+                        if (diagnostics != nullptr) {
+                            ++diagnostics->depthCoveredPixels;
+                        }
                     });
             }
         }
     }
 
+    const auto depthEnd = std::chrono::steady_clock::now();
+    if (diagnostics != nullptr) {
+        diagnostics->depthPassMs = std::chrono::duration<double, std::milli>(depthEnd - depthStart).count();
+    }
+
+    const auto accumulationStart = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
         if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
             continue;
+        }
+        if (diagnostics != nullptr) {
+            ++diagnostics->accumulationPassLayers;
+            diagnostics->skippedInactiveBindings += InactivePointBindingCount(layer.style);
         }
 
         const auto& cloud = *layer.cloud;
@@ -604,8 +713,11 @@ void RenderPointCloudTile(
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
                 OfflinePointSample sample;
-                if (!BuildOfflinePointSample(layer, matrices, cameraState, pointIndex, *image, &sample)) {
+                if (!BuildOfflinePointSample(layer, matrices, cameraState, pointIndex, *image, &sample, true)) {
                     continue;
+                }
+                if (diagnostics != nullptr) {
+                    ++diagnostics->accumulationVisitedPoints;
                 }
 
                 VisitCoveredPixels(
@@ -634,6 +746,9 @@ void RenderPointCloudTile(
                                 0.995F);
                         if (alpha <= 1.0e-5F) {
                             return;
+                        }
+                        if (diagnostics != nullptr) {
+                            ++diagnostics->accumulationCoveredPixels;
                         }
 
                         const float densityScale = std::max(1.0F, layer.style.densityScale);
@@ -691,6 +806,13 @@ void RenderPointCloudTile(
         }
     }
 
+    const auto accumulationEnd = std::chrono::steady_clock::now();
+    if (diagnostics != nullptr) {
+        diagnostics->accumulationPassMs =
+            std::chrono::duration<double, std::milli>(accumulationEnd - accumulationStart).count();
+    }
+
+    const auto compositeStart = std::chrono::steady_clock::now();
     for (std::uint32_t y = tile.y0; y < tile.y1; ++y) {
         for (std::uint32_t x = tile.x0; x < tile.x1; ++x) {
             const auto localIndex =
@@ -739,6 +861,10 @@ void RenderPointCloudTile(
             image->beautyB[pixelIndex] = outputColor.b;
             image->alpha[pixelIndex] = outputAlpha;
         }
+    }
+    if (diagnostics != nullptr) {
+        diagnostics->compositePassMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compositeStart).count();
     }
 }
 

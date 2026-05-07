@@ -31,6 +31,12 @@ struct ViewportDiagnostics {
     std::uint64_t pointCount = 0;
     float averagePointSizePx = 0.0F;
     std::string pointRenderModes;
+    std::uint32_t pointDrawCalls = 0;
+    std::uint32_t pointDepthLayerCount = 0;
+    std::uint32_t pointAccumulationLayerCount = 0;
+    std::uint32_t pointStyleUploadCount = 0;
+    std::uint32_t pointSkippedInactiveBindings = 0;
+    double pointCommandRecordMs = 0.0;
 };
 
 struct SceneRenderState {
@@ -112,12 +118,15 @@ class VulkanViewportShell {
     [[nodiscard]] std::uint32_t Height() const { return swapchainHeight_; }
 
     [[nodiscard]] const ViewportDiagnostics& Diagnostics() const { return diagnostics_; }
+    void SetDiagnosticsEnabled(bool enabled) { diagnosticsEnabled_ = enabled; }
+    [[nodiscard]] bool DiagnosticsEnabled() const { return diagnosticsEnabled_; }
 
   private:
     struct BufferAllocation {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkDeviceSize size = 0;
+        void* mapped = nullptr;
     };
 
     struct ImageAllocation {
@@ -147,6 +156,14 @@ class VulkanViewportShell {
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
+    };
+
+    struct PointCloudDrawPlan {
+        ActivePointCloudResources* resources = nullptr;
+        std::uint32_t drawPointCount = 0;
+        bool worldSurfels = false;
+        bool sampledBudgetReady = false;
+        bool interactiveSampleReady = false;
     };
 
     struct ActiveGaussianSplatResources {
@@ -255,12 +272,20 @@ class VulkanViewportShell {
     void RecreateSwapchain();
     void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex);
     void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
-    void RecordPointCloudLayerDraw(
+    [[nodiscard]] bool ResolvePointCloudDrawPlan(
+        const SceneRenderState::PointCloudLayerState& layer,
+        bool forceFullSource,
+        PointCloudDrawPlan* plan);
+    [[nodiscard]] bool UploadPointCloudLayerStyle(
+        const SceneRenderState::PointCloudLayerState& layer,
+        const PointCloudDrawPlan& plan);
+    [[nodiscard]] bool RecordPointCloudLayerDraw(
         VkCommandBuffer commandBuffer,
         const SceneRenderState::PointCloudLayerState& layer,
         bool forceFullSource,
         VkPipeline spritePipeline,
-        VkPipeline surfelPipeline);
+        VkPipeline surfelPipeline,
+        bool uploadStyle);
     void UpdateUniformBuffer();
     void UploadFrameUniforms(std::uint32_t width, std::uint32_t height);
 
@@ -356,6 +381,7 @@ class VulkanViewportShell {
     bool highQualityGaussianSceneDirty_ = true;
     SceneRenderState renderState_{};
     ViewportDiagnostics diagnostics_{};
+    bool diagnosticsEnabled_ = false;
     float pointSizeRangeMin_ = 1.0F;
     float pointSizeRangeMax_ = 64.0F;
 };

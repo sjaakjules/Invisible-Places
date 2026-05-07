@@ -885,6 +885,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.pointSize.fieldMap.inputMax = 5.0F;
     invisible_places::style::SetScalarConstant(&pointStyle.surfelDiameter, 0.0125F);
     invisible_places::style::SetScalarConstant(&pointStyle.opacity, 0.55F);
+    pointStyle.opacity.active = false;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.colormapPosition,
         1,
@@ -892,6 +893,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         0.0F,
         1.0F,
         nullptr);
+    pointStyle.colormapPosition.active = false;
     layer.pointStyle = pointStyle;
     document.layers.push_back(layer);
 
@@ -905,6 +907,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"render_mode\"") == std::string::npos);
         CHECK(savedJson.find("\"blend_mode\"") == std::string::npos);
         CHECK(savedJson.find("\"depth_contribution\"") != std::string::npos);
+        CHECK(savedJson.find("\"active\"") != std::string::npos);
     }
 
     const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
@@ -984,7 +987,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.outputMax == Catch::Approx(8.0F));
     CHECK(invisible_places::style::ScalarConstant(loadedLayer.pointStyle->surfelDiameter) == Catch::Approx(0.0125F));
     CHECK(invisible_places::style::ScalarConstant(loadedLayer.pointStyle->opacity) == Catch::Approx(0.55F));
+    CHECK(!loadedLayer.pointStyle->opacity.active);
     CHECK(loadedLayer.pointStyle->colormapPosition.fieldMap.fieldName == "Intensity");
+    CHECK(!loadedLayer.pointStyle->colormapPosition.active);
 
     std::filesystem::remove(outputPath);
 }
@@ -1011,6 +1016,9 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
     CHECK(
         preset->style.depthContribution ==
         invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold);
+    CHECK(preset->style.pointSize.active);
+    CHECK(preset->style.opacity.active);
+    CHECK(preset->style.emissiveStrength.active);
     CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
 
     std::filesystem::remove(presetPath);
@@ -1936,6 +1944,130 @@ TEST_CASE("Offline point depth fade reduces alpha without changing color ratio",
     CHECK(farFade.alpha[center] < noFade.alpha[center]);
     CHECK((farFade.beautyR[center] / farFade.alpha[center]) ==
           Catch::Approx(noFade.beautyR[center] / noFade.alpha[center]).margin(0.02F));
+}
+
+TEST_CASE("Offline point renderer uses safe defaults for inactive material bindings", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFF0000FFU};
+    cloud.hasSourceRgb = true;
+    cloud.scalarFields = {{"Value", 0.0F, 1.0F, 1U, true}};
+    cloud.scalarFieldValues = {1.0F};
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithStyle = [&](invisible_places::renderer::pointcloud::PointCloudStyleState style,
+                               invisible_places::output::OfflinePointRenderDiagnostics* diagnostics = nullptr) {
+        style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 9, 9);
+        invisible_places::output::OfflinePointRenderScratch scratch;
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+            &image,
+            diagnostics,
+            &scratch);
+        return image;
+    };
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState baseline;
+    invisible_places::style::SetScalarConstant(&baseline.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&baseline.emissiveStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&baseline.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&baseline.depthFade, 0.0F);
+    const auto baselineImage = renderWithStyle(baseline);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState inactive = baseline;
+    invisible_places::style::SetScalarConstant(&inactive.opacity, 0.0F);
+    invisible_places::style::SetScalarConstant(&inactive.emissiveStrength, 8.0F);
+    invisible_places::style::SetScalarConstant(&inactive.xrayStrength, 1.0F);
+    invisible_places::style::SetScalarConstant(&inactive.depthFade, 1.0F);
+    inactive.opacity.active = false;
+    inactive.emissiveStrength.active = false;
+    inactive.xrayStrength.active = false;
+    inactive.depthFade.active = false;
+    invisible_places::output::OfflinePointRenderDiagnostics diagnostics;
+    const auto inactiveImage = renderWithStyle(inactive, &diagnostics);
+
+    const auto center = static_cast<std::size_t>(4) * 9U + 4U;
+    CHECK(inactiveImage.alpha[center] == Catch::Approx(baselineImage.alpha[center]));
+    CHECK(inactiveImage.beautyR[center] == Catch::Approx(baselineImage.beautyR[center]));
+    CHECK(diagnostics.skippedInactiveBindings >= 4U);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState colormapDefault;
+    colormapDefault.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
+    invisible_places::style::SetScalarConstant(&colormapDefault.colormapPosition, 0.5F);
+    const auto defaultColormapImage = renderWithStyle(colormapDefault);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState inactiveColormap = colormapDefault;
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &inactiveColormap.colormapPosition,
+        0,
+        "Value",
+        0.0F,
+        1.0F,
+        &cloud.scalarFields.front());
+    inactiveColormap.colormapPosition.active = false;
+    const auto inactiveColormapImage = renderWithStyle(inactiveColormap);
+    CHECK(inactiveColormapImage.beautyR[center] == Catch::Approx(defaultColormapImage.beautyR[center]));
+    CHECK(inactiveColormapImage.beautyG[center] == Catch::Approx(defaultColormapImage.beautyG[center]));
+    CHECK(inactiveColormapImage.beautyB[center] == Catch::Approx(defaultColormapImage.beautyB[center]));
+}
+
+TEST_CASE("Offline point diagnostics skip depth pass for non-depth layers", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFFFFFFFFU};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.depthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution::None;
+    invisible_places::style::SetScalarConstant(&style.pointSize, 5.0F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 2.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 9, 9);
+    invisible_places::output::OfflinePointRenderDiagnostics diagnostics;
+    invisible_places::output::OfflinePointRenderScratch scratch;
+    invisible_places::output::RenderPointCloudTile(
+        {layer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 9, 9},
+        &image,
+        &diagnostics,
+        &scratch);
+
+    CHECK(diagnostics.depthPassLayers == 0U);
+    CHECK(diagnostics.depthVisitedPoints == 0U);
+    CHECK(diagnostics.accumulationPassLayers == 1U);
+    CHECK(diagnostics.accumulationVisitedPoints == 1U);
 }
 
 TEST_CASE("gSplat quality resolver steps down during navigation and restores afterward", "[gsplat][quality]") {

@@ -11,6 +11,14 @@
 
 namespace invisible_places::renderer::pointcloud {
 
+inline constexpr float kInactivePointSizeDefault = 2.0F;
+inline constexpr float kInactiveSurfelDiameterDefault = 0.005F;
+inline constexpr float kInactiveOpacityDefault = 1.0F;
+inline constexpr float kInactiveEmissionDefault = 0.0F;
+inline constexpr float kInactiveXrayDefault = 0.0F;
+inline constexpr float kInactiveDepthFadeDefault = 0.0F;
+inline constexpr float kInactiveColormapPositionDefault = 0.5F;
+
 enum class PointCloudColorMode {
     SourceRgb,
     SolidColor,

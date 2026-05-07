@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -316,11 +317,12 @@ const invisible_places::io::ScalarFieldStats* ResolveBindingScalarFieldStats(
 
 PointCloudBindingGpu MakePointCloudBindingGpu(
     const invisible_places::style::RenderParameterBinding& binding,
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    float inactiveDefault) {
     const auto* fieldStats = ResolveBindingScalarFieldStats(binding, scalarFields);
     PointCloudBindingGpu gpuBinding;
     gpuBinding.constantValue = glm::vec4{
-        binding.constantValue[0],
+        binding.active ? binding.constantValue[0] : inactiveDefault,
         binding.constantValue[1],
         binding.constantValue[2],
         binding.constantValue[3],
@@ -333,12 +335,38 @@ PointCloudBindingGpu MakePointCloudBindingGpu(
     };
     gpuBinding.extra = glm::vec4{binding.fieldMap.gamma, 0.0F, 0.0F, 0.0F};
     gpuBinding.control = glm::uvec4{
-        static_cast<std::uint32_t>(binding.mode),
-        binding.fieldMap.fieldSlot >= 0 ? static_cast<std::uint32_t>(binding.fieldMap.fieldSlot) : 0xFFFFFFFFU,
-        binding.fieldMap.flags,
-        0U,
+        binding.active ? static_cast<std::uint32_t>(binding.mode) : 0U,
+        binding.active && binding.fieldMap.fieldSlot >= 0
+            ? static_cast<std::uint32_t>(binding.fieldMap.fieldSlot)
+            : 0xFFFFFFFFU,
+        binding.active ? binding.fieldMap.flags : 0U,
+        binding.active ? 1U : 0U,
     };
     return gpuBinding;
+}
+
+std::uint32_t InactivePointBindingCount(const renderer::pointcloud::PointCloudStyleState& style) {
+    std::uint32_t count = 0;
+    count += style.pointSize.active ? 0U : 1U;
+    count += style.surfelDiameter.active ? 0U : 1U;
+    count += style.opacity.active ? 0U : 1U;
+    count += style.emissiveStrength.active ? 0U : 1U;
+    count += style.xrayStrength.active ? 0U : 1U;
+    count += style.depthFade.active ? 0U : 1U;
+    count += style.colormapPosition.active ? 0U : 1U;
+    return count;
+}
+
+void UpdateImGuiPlatformWindowsIfNeeded() {
+    if (ImGui::GetCurrentContext() == nullptr ||
+        (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0) {
+        return;
+    }
+
+    GLFWwindow* backupContext = glfwGetCurrentContext();
+    ImGui::UpdatePlatformWindows();
+    ImGui::RenderPlatformWindowsDefault();
+    glfwMakeContextCurrent(backupContext);
 }
 
 void ScalePointCloudBindingGpu(PointCloudBindingGpu* binding, float scale) {
@@ -619,6 +647,7 @@ void VulkanViewportShell::DrawFrame() {
         vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailableSemaphore_, VK_NULL_HANDLE, &imageIndex);
 
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        UpdateImGuiPlatformWindowsIfNeeded();
         RecreateSwapchain();
         return;
     }
@@ -652,19 +681,13 @@ void VulkanViewportShell::DrawFrame() {
     const VkResult presentResult = vkQueuePresentKHR(presentQueue_, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR || framebufferResized_) {
         framebufferResized_ = false;
+        UpdateImGuiPlatformWindowsIfNeeded();
         RecreateSwapchain();
         return;
     }
 
     Check(presentResult, "vkQueuePresentKHR");
-
-    if (ImGui::GetCurrentContext() != nullptr &&
-        (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
-        GLFWwindow* backupContext = glfwGetCurrentContext();
-        ImGui::UpdatePlatformWindows();
-        ImGui::RenderPlatformWindowsDefault();
-        glfwMakeContextCurrent(backupContext);
-    }
+    UpdateImGuiPlatformWindowsIfNeeded();
 }
 
 void VulkanViewportShell::WaitIdle() const {
@@ -1099,37 +1122,49 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         image.depth.resize(
             static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height));
 
-        void* mappedColor = nullptr;
-        Check(
-            vkMapMemory(
-                device_,
-                exrExportResources_.colorReadbackBuffer.memory,
-                0,
-                exrExportResources_.colorReadbackBuffer.size,
-                0,
-                &mappedColor),
-            "vkMapMemory(exr color)");
+        void* mappedColor = exrExportResources_.colorReadbackBuffer.mapped;
+        bool unmapColor = false;
+        if (mappedColor == nullptr) {
+            Check(
+                vkMapMemory(
+                    device_,
+                    exrExportResources_.colorReadbackBuffer.memory,
+                    0,
+                    exrExportResources_.colorReadbackBuffer.size,
+                    0,
+                    &mappedColor),
+                "vkMapMemory(exr color)");
+            unmapColor = true;
+        }
         std::memcpy(
             image.rgbaHalf.data(),
             mappedColor,
             image.rgbaHalf.size() * sizeof(std::uint16_t));
-        vkUnmapMemory(device_, exrExportResources_.colorReadbackBuffer.memory);
+        if (unmapColor) {
+            vkUnmapMemory(device_, exrExportResources_.colorReadbackBuffer.memory);
+        }
 
-        void* mappedDepth = nullptr;
-        Check(
-            vkMapMemory(
-                device_,
-                exrExportResources_.depthReadbackBuffer.memory,
-                0,
-                exrExportResources_.depthReadbackBuffer.size,
-                0,
-                &mappedDepth),
-            "vkMapMemory(exr depth)");
+        void* mappedDepth = exrExportResources_.depthReadbackBuffer.mapped;
+        bool unmapDepth = false;
+        if (mappedDepth == nullptr) {
+            Check(
+                vkMapMemory(
+                    device_,
+                    exrExportResources_.depthReadbackBuffer.memory,
+                    0,
+                    exrExportResources_.depthReadbackBuffer.size,
+                    0,
+                    &mappedDepth),
+                "vkMapMemory(exr depth)");
+            unmapDepth = true;
+        }
         std::memcpy(
             image.depth.data(),
             mappedDepth,
             image.depth.size() * sizeof(float));
-        vkUnmapMemory(device_, exrExportResources_.depthReadbackBuffer.memory);
+        if (unmapDepth) {
+            vkUnmapMemory(device_, exrExportResources_.depthReadbackBuffer.memory);
+        }
 
         restoreLiveDescriptors();
         return image;
@@ -3596,17 +3631,20 @@ void VulkanViewportShell::RecreateSwapchain() {
     }
 }
 
-void VulkanViewportShell::RecordPointCloudLayerDraw(
-    VkCommandBuffer commandBuffer,
+bool VulkanViewportShell::ResolvePointCloudDrawPlan(
     const SceneRenderState::PointCloudLayerState& layer,
     bool forceFullSource,
-    VkPipeline spritePipeline,
-    VkPipeline surfelPipeline) {
+    PointCloudDrawPlan* plan) {
+    if (plan == nullptr) {
+        return false;
+    }
+    *plan = {};
+
     auto* resources = FindPointCloudResources(layer.layerId);
     if (resources == nullptr ||
         resources->activePointCount == 0 ||
         resources->descriptorSet == VK_NULL_HANDLE) {
-        return;
+        return false;
     }
 
     std::uint32_t drawPointCount = 0;
@@ -3618,18 +3656,16 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
                              : resources->activePointCount;
     }
     if (drawPointCount == 0) {
-        return;
+        return false;
     }
 
     const bool worldSurfels =
         layer.style.geometryMode == renderer::pointcloud::PointCloudGeometryMode::WorldSurfels;
     if (worldSurfels) {
         drawPointCount = std::min(drawPointCount, kMaxSurfelEncodedPointCount);
-        if (drawPointCount == 0 || surfelPipeline == VK_NULL_HANDLE) {
-            return;
+        if (drawPointCount == 0) {
+            return false;
         }
-    } else if (spritePipeline == VK_NULL_HANDLE) {
-        return;
     }
 
     const bool sampledBudgetReady =
@@ -3653,8 +3689,24 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
     if (worldSurfels) {
         drawPointCount = std::min(drawPointCount, kMaxSurfelEncodedPointCount);
         if (drawPointCount == 0) {
-            return;
+            return false;
         }
+    }
+
+    plan->resources = resources;
+    plan->drawPointCount = drawPointCount;
+    plan->worldSurfels = worldSurfels;
+    plan->sampledBudgetReady = sampledBudgetReady;
+    plan->interactiveSampleReady = interactiveSampleReady;
+    return true;
+}
+
+bool VulkanViewportShell::UploadPointCloudLayerStyle(
+    const SceneRenderState::PointCloudLayerState& layer,
+    const PointCloudDrawPlan& plan) {
+    auto* resources = plan.resources;
+    if (resources == nullptr || plan.drawPointCount == 0) {
+        return false;
     }
 
     PointCloudStyleGpu styleGpu;
@@ -3672,7 +3724,7 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
     };
     styleGpu.pointMeta = glm::uvec4{
         resources->pointCount,
-        drawPointCount,
+        plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
         0U,
     };
@@ -3706,21 +3758,70 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         pointSizeRangeMax_,
         0.0F,
     };
-    styleGpu.pointSize = MakePointCloudBindingGpu(layer.style.pointSize, layer.scalarFields);
+    styleGpu.pointSize = MakePointCloudBindingGpu(
+        layer.style.pointSize,
+        layer.scalarFields,
+        renderer::pointcloud::kInactivePointSizeDefault);
     ScalePointCloudBindingGpu(&styleGpu.pointSize, renderState_.pointSizeScale);
-    styleGpu.opacity = MakePointCloudBindingGpu(layer.style.opacity, layer.scalarFields);
-    styleGpu.emissive = MakePointCloudBindingGpu(layer.style.emissiveStrength, layer.scalarFields);
-    styleGpu.xray = MakePointCloudBindingGpu(layer.style.xrayStrength, layer.scalarFields);
-    styleGpu.depthFade = MakePointCloudBindingGpu(layer.style.depthFade, layer.scalarFields);
-    styleGpu.colormapPosition = MakePointCloudBindingGpu(layer.style.colormapPosition, layer.scalarFields);
-    styleGpu.surfelDiameter = MakePointCloudBindingGpu(layer.style.surfelDiameter, layer.scalarFields);
+    styleGpu.opacity = MakePointCloudBindingGpu(
+        layer.style.opacity,
+        layer.scalarFields,
+        renderer::pointcloud::kInactiveOpacityDefault);
+    styleGpu.emissive = MakePointCloudBindingGpu(
+        layer.style.emissiveStrength,
+        layer.scalarFields,
+        renderer::pointcloud::kInactiveEmissionDefault);
+    styleGpu.xray = MakePointCloudBindingGpu(
+        layer.style.xrayStrength,
+        layer.scalarFields,
+        renderer::pointcloud::kInactiveXrayDefault);
+    styleGpu.depthFade = MakePointCloudBindingGpu(
+        layer.style.depthFade,
+        layer.scalarFields,
+        renderer::pointcloud::kInactiveDepthFadeDefault);
+    styleGpu.colormapPosition = MakePointCloudBindingGpu(
+        layer.style.colormapPosition,
+        layer.scalarFields,
+        renderer::pointcloud::kInactiveColormapPositionDefault);
+    styleGpu.surfelDiameter = MakePointCloudBindingGpu(
+        layer.style.surfelDiameter,
+        layer.scalarFields,
+        renderer::pointcloud::kInactiveSurfelDiameterDefault);
 
     UploadBufferData(resources->styleBuffer, &styleGpu, sizeof(styleGpu));
+    return true;
+}
+
+bool VulkanViewportShell::RecordPointCloudLayerDraw(
+    VkCommandBuffer commandBuffer,
+    const SceneRenderState::PointCloudLayerState& layer,
+    bool forceFullSource,
+    VkPipeline spritePipeline,
+    VkPipeline surfelPipeline,
+    bool uploadStyle) {
+    PointCloudDrawPlan plan;
+    if (!ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
+        return false;
+    }
+    auto* resources = plan.resources;
+    if (plan.worldSurfels) {
+        if (surfelPipeline == VK_NULL_HANDLE) {
+            return false;
+        }
+    } else if (spritePipeline == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    if (uploadStyle) {
+        if (!UploadPointCloudLayerStyle(layer, plan)) {
+            return false;
+        }
+    }
 
     vkCmdBindPipeline(
         commandBuffer,
         VK_PIPELINE_BIND_POINT_GRAPHICS,
-        worldSurfels ? surfelPipeline : spritePipeline);
+        plan.worldSurfels ? surfelPipeline : spritePipeline);
 
     vkCmdBindDescriptorSets(
         commandBuffer,
@@ -3732,16 +3833,16 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         0,
         nullptr);
 
-    if (worldSurfels) {
-        const std::uint32_t surfelVertexCount = drawPointCount * kSurfelVerticesPerPoint;
-        if (sampledBudgetReady) {
+    if (plan.worldSurfels) {
+        const std::uint32_t surfelVertexCount = plan.drawPointCount * kSurfelVerticesPerPoint;
+        if (plan.sampledBudgetReady) {
             vkCmdBindIndexBuffer(
                 commandBuffer,
                 resources->sampledSurfelIndexBuffer.buffer,
                 0,
                 VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(commandBuffer, surfelVertexCount, 1, 0, 0, 0);
-        } else if (interactiveSampleReady) {
+        } else if (plan.interactiveSampleReady) {
             vkCmdBindIndexBuffer(
                 commandBuffer,
                 resources->interactiveSurfelIndexBuffer.buffer,
@@ -3751,7 +3852,7 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         } else {
             vkCmdDraw(commandBuffer, surfelVertexCount, 1, 0, 0);
         }
-        return;
+        return true;
     }
 
     const std::array<VkBuffer, 2> vertexBuffers = {
@@ -3766,23 +3867,24 @@ void VulkanViewportShell::RecordPointCloudLayerDraw(
         vertexBuffers.data(),
         offsets.data());
 
-    if (sampledBudgetReady) {
+    if (plan.sampledBudgetReady) {
         vkCmdBindIndexBuffer(
             commandBuffer,
             resources->sampledIndexBuffer.buffer,
             0,
             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(commandBuffer, drawPointCount, 1, 0, 0, 0);
-    } else if (interactiveSampleReady) {
+        vkCmdDrawIndexed(commandBuffer, plan.drawPointCount, 1, 0, 0, 0);
+    } else if (plan.interactiveSampleReady) {
         vkCmdBindIndexBuffer(
             commandBuffer,
             resources->interactiveSampledIndexBuffer.buffer,
             0,
             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(commandBuffer, drawPointCount, 1, 0, 0, 0);
+        vkCmdDrawIndexed(commandBuffer, plan.drawPointCount, 1, 0, 0, 0);
     } else {
-        vkCmdDraw(commandBuffer, drawPointCount, 1, 0, 0);
+        vkCmdDraw(commandBuffer, plan.drawPointCount, 1, 0, 0);
     }
+    return true;
 }
 
 void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request) {
@@ -3809,6 +3911,14 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     clearValues[4].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[5].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
 
+    const bool forceFullSource = !request.previewDensity;
+    for (const auto& layer : request.renderState.pointCloudLayers) {
+        PointCloudDrawPlan plan;
+        if (ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
+            static_cast<void>(UploadPointCloudLayerStyle(layer, plan));
+        }
+    }
+
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderPassInfo.renderPass = resources.renderPass;
     renderPassInfo.framebuffer = resources.framebuffer;
@@ -3831,15 +3941,15 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
-    const bool forceFullSource = !request.previewDensity;
     for (const auto& layer : request.renderState.pointCloudLayers) {
         if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
-            RecordPointCloudLayerDraw(
+            static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
                 forceFullSource,
                 resources.pointDepthPipeline,
-                resources.surfelDepthPipeline);
+                resources.surfelDepthPipeline,
+                false));
         }
     }
 
@@ -3848,12 +3958,13 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
     for (const auto& layer : request.renderState.pointCloudLayers) {
-        RecordPointCloudLayerDraw(
+        static_cast<void>(RecordPointCloudLayerDraw(
             resources.commandBuffer,
             layer,
             forceFullSource,
             resources.pointAccumulationPipeline,
-            resources.surfelAccumulationPipeline);
+            resources.surfelAccumulationPipeline,
+            false));
     }
 
     vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
@@ -3908,8 +4019,26 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
 }
 
 void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex) {
+    const bool collectDiagnostics = diagnosticsEnabled_;
+    const auto recordStart = collectDiagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::uint32_t pointDrawCalls = 0;
+    std::uint32_t pointDepthLayerCount = 0;
+    std::uint32_t pointAccumulationLayerCount = 0;
+    std::uint32_t pointStyleUploadCount = 0;
+    std::uint32_t pointSkippedInactiveBindings = 0;
+
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+
+    for (const auto& layer : renderState_.pointCloudLayers) {
+        PointCloudDrawPlan plan;
+        if (ResolvePointCloudDrawPlan(layer, false, &plan) && UploadPointCloudLayerStyle(layer, plan)) {
+            if (collectDiagnostics) {
+                ++pointStyleUploadCount;
+                pointSkippedInactiveBindings += InactivePointBindingCount(layer.style);
+            }
+        }
+    }
 
     std::array<VkClearValue, 5> clearValues{};
     clearValues[0].color = {
@@ -3949,12 +4078,20 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
     if (!renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
-                RecordPointCloudLayerDraw(
+                if (collectDiagnostics) {
+                    ++pointDepthLayerCount;
+                }
+                if (RecordPointCloudLayerDraw(
                     commandBuffer,
                     layer,
                     false,
                     pointDepthPrepassPipeline_,
-                    surfelDepthPrepassPipeline_);
+                    surfelDepthPrepassPipeline_,
+                    false)) {
+                    if (collectDiagnostics) {
+                        ++pointDrawCalls;
+                    }
+                }
             }
         }
     }
@@ -3965,12 +4102,20 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
 
     if (!renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            RecordPointCloudLayerDraw(
+            if (collectDiagnostics) {
+                ++pointAccumulationLayerCount;
+            }
+            if (RecordPointCloudLayerDraw(
                 commandBuffer,
                 layer,
                 false,
                 pointAccumulationPipeline_,
-                surfelAccumulationPipeline_);
+                surfelAccumulationPipeline_,
+                false)) {
+                if (collectDiagnostics) {
+                    ++pointDrawCalls;
+                }
+            }
         }
     }
 
@@ -4102,6 +4247,15 @@ void VulkanViewportShell::RecordCommandBuffer(VkCommandBuffer commandBuffer, std
 
     vkCmdEndRenderPass(commandBuffer);
     Check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+
+    const auto recordEnd = collectDiagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    diagnostics_.pointDrawCalls = pointDrawCalls;
+    diagnostics_.pointDepthLayerCount = pointDepthLayerCount;
+    diagnostics_.pointAccumulationLayerCount = pointAccumulationLayerCount;
+    diagnostics_.pointStyleUploadCount = pointStyleUploadCount;
+    diagnostics_.pointSkippedInactiveBindings = pointSkippedInactiveBindings;
+    diagnostics_.pointCommandRecordMs =
+        collectDiagnostics ? std::chrono::duration<double, std::milli>(recordEnd - recordStart).count() : 0.0;
 }
 
 void VulkanViewportShell::UpdateUniformBuffer() {
@@ -4172,6 +4326,9 @@ VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuff
 
     Check(vkAllocateMemory(device_, &allocInfo, nullptr, &allocation.memory), "vkAllocateMemory");
     Check(vkBindBufferMemory(device_, allocation.buffer, allocation.memory, 0), "vkBindBufferMemory");
+    Check(
+        vkMapMemory(device_, allocation.memory, 0, allocation.size, 0, &allocation.mapped),
+        "vkMapMemory(persistent buffer)");
     return allocation;
 }
 
@@ -4180,6 +4337,11 @@ void VulkanViewportShell::UploadBufferData(
     const void* data,
     VkDeviceSize size) const {
     if (buffer.memory == VK_NULL_HANDLE || data == nullptr || size == 0) {
+        return;
+    }
+
+    if (buffer.mapped != nullptr) {
+        std::memcpy(buffer.mapped, data, static_cast<std::size_t>(size));
         return;
     }
 
@@ -4194,6 +4356,12 @@ void VulkanViewportShell::DestroyBuffer(BufferAllocation* buffer) {
         return;
     }
 
+    if (buffer->memory != VK_NULL_HANDLE) {
+        if (buffer->mapped != nullptr) {
+            vkUnmapMemory(device_, buffer->memory);
+            buffer->mapped = nullptr;
+        }
+    }
     if (buffer->buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, buffer->buffer, nullptr);
     }

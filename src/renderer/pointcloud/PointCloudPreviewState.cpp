@@ -313,13 +313,13 @@ std::vector<std::uint32_t> SelectStratifiedCandidateIndices(
 }  // namespace
 
 PointCloudStyleState::PointCloudStyleState() {
-    invisible_places::style::SetScalarConstant(&pointSize, 2.0F);
-    invisible_places::style::SetScalarConstant(&surfelDiameter, 0.005F);
-    invisible_places::style::SetScalarConstant(&opacity, 1.0F);
-    invisible_places::style::SetScalarConstant(&emissiveStrength, 0.0F);
-    invisible_places::style::SetScalarConstant(&xrayStrength, 0.0F);
-    invisible_places::style::SetScalarConstant(&depthFade, 0.0F);
-    invisible_places::style::SetScalarConstant(&colormapPosition, 0.5F);
+    invisible_places::style::SetScalarConstant(&pointSize, kInactivePointSizeDefault);
+    invisible_places::style::SetScalarConstant(&surfelDiameter, kInactiveSurfelDiameterDefault);
+    invisible_places::style::SetScalarConstant(&opacity, kInactiveOpacityDefault);
+    invisible_places::style::SetScalarConstant(&emissiveStrength, kInactiveEmissionDefault);
+    invisible_places::style::SetScalarConstant(&xrayStrength, kInactiveXrayDefault);
+    invisible_places::style::SetScalarConstant(&depthFade, kInactiveDepthFadeDefault);
+    invisible_places::style::SetScalarConstant(&colormapPosition, kInactiveColormapPositionDefault);
 }
 
 bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style) {
