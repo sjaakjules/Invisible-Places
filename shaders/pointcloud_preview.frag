@@ -1,8 +1,10 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(location = 2) in float inOpacity;
 layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
+layout(location = 7) flat in uint inPointIndex;
 
 layout(location = 0) out vec4 outColor;
 
@@ -40,7 +42,13 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
     vec4 colorize;
+    uvec4 stylisationControl;
+    vec4 stylisationParams0;
+    vec4 stylisationParams1;
+    vec4 stylisationParams2;
 } styleData;
+
+#include "pointcloud_stylisation.glsl"
 
 float ResolveFalloff(float radius, float radiusSquared) {
     uint profile = styleData.renderControl.y;
@@ -80,7 +88,12 @@ void main() {
 
     float opacity = clamp(inOpacity, 0.0, 1.0);
     float edge = ResolveFalloff(radius, radiusSquared);
-    float alpha = clamp(opacity * edge * ResolveDepthFadeAlpha(inDepthFade), 0.0, AlphaClampMax());
+    float alpha =
+        clamp(
+            opacity * edge * PointStylisationCoverage(centered, radius, radiusSquared, inPointIndex) *
+                ResolveDepthFadeAlpha(inDepthFade),
+            0.0,
+            AlphaClampMax());
     if (alpha <= 1e-5 ||
         styleData.renderControl.x == 0u ||
         (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0))) {

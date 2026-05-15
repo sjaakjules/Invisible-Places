@@ -352,6 +352,37 @@ bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style) {
            kMaterialEpsilon;
 }
 
+bool PointCloudStyleHasActiveStylisation(const PointCloudStyleState& style) {
+    return style.stylisationMode != PointCloudStylisationMode::Off &&
+           style.stylisationStrength > kMaterialEpsilon;
+}
+
+PointCloudStyleState MakeFastBasicPointCloudStyle(
+    const PointCloudStyleState& sourceStyle,
+    bool hasSourceRgb) {
+    PointCloudStyleState style;
+    style.geometryMode = PointCloudGeometryMode::ScreenSprites;
+    style.depthContribution = PointCloudDepthContribution::None;
+    style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+    style.stylisationMode = PointCloudStylisationMode::Off;
+    style.nprPreset = sourceStyle.nprPreset;
+    style.colorMode = hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
+    style.colormap = sourceStyle.colormap;
+    style.solidColor = sourceStyle.solidColor;
+    style.colorizeColor = sourceStyle.colorizeColor;
+    style.colorizeAmount = 0.0F;
+    style.stylisationStrength = 0.0F;
+    style.flowAnimation = false;
+    invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, kInactiveSurfelDiameterDefault);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.colormapPosition, kInactiveColormapPositionDefault);
+    return style;
+}
+
 PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style) {
     const bool simpleColor =
         style.colorMode == PointCloudColorMode::SourceRgb ||
@@ -374,6 +405,35 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
         !style.depthFade.active ||
         (style.depthFade.mode == invisible_places::style::ParameterSourceMode::Constant &&
          style.depthFade.constantValue[0] <= kMaterialEpsilon);
+    const bool opaqueOpacity =
+        !style.opacity.active ||
+        (style.opacity.mode == invisible_places::style::ParameterSourceMode::Constant &&
+         style.opacity.constantValue[0] >= 1.0F - kMaterialEpsilon);
+    const bool noEmission =
+        !style.emissiveStrength.active ||
+        (style.emissiveStrength.mode == invisible_places::style::ParameterSourceMode::Constant &&
+         style.emissiveStrength.constantValue[0] <= kMaterialEpsilon);
+    const bool noColorize = style.colorizeAmount <= kMaterialEpsilon;
+
+    if (style.flowAnimation) {
+        return PointCloudMaterialVariant::Unified;
+    }
+
+    if (PointCloudStyleHasActiveStylisation(style)) {
+        return PointCloudMaterialVariant::Unified;
+    }
+
+    if (style.falloffProfile == PointCloudFalloffProfile::HardDisc &&
+        simpleColor &&
+        constantPointGeometry &&
+        opaqueOpacity &&
+        noEmission &&
+        noColormapField &&
+        noDepthFade &&
+        noColorize &&
+        !PointCloudStyleHasActiveXray(style)) {
+        return PointCloudMaterialVariant::OpaqueHardDisc;
+    }
 
     if (simpleColor &&
         constantPointGeometry &&
@@ -389,6 +449,8 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
 
 const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant) {
     switch (variant) {
+        case PointCloudMaterialVariant::OpaqueHardDisc:
+            return "opaque-hard-disc";
         case PointCloudMaterialVariant::ConstantSimple:
             return "constant-simple";
         case PointCloudMaterialVariant::Unified:

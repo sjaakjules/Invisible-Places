@@ -90,6 +90,10 @@ struct alignas(16) PointCloudStyleGpu {
     PointCloudBindingGpu colormapPosition{};
     PointCloudBindingGpu surfelDiameter{};
     glm::vec4 colorize{0.95F, 0.68F, 0.28F, 0.0F};
+    glm::uvec4 stylisationControl{0U, 0U, 0U, 0U};
+    glm::vec4 stylisationParams0{1.0F, 5.0F, 0.35F, 0.35F};
+    glm::vec4 stylisationParams1{0.45F, 2.2F, 0.35F, 0.0F};
+    glm::vec4 stylisationParams2{0.25F, 0.0F, 0.0F, 0.0F};
 };
 
 struct alignas(16) GaussianSplatPushConstants {
@@ -109,6 +113,10 @@ struct alignas(16) HighQualityGaussianLayerStyle {
 
 struct alignas(16) HighQualityGaussianPushConstants {
     glm::vec4 extra{1.5F, 0.0F, 0.0F, 0.0F};
+};
+
+struct alignas(16) PostProcessPushConstants {
+    glm::vec4 edl{0.0F, 24.0F, 0.35F, 1.0F};
 };
 
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
@@ -391,13 +399,6 @@ VkDescriptorPoolSize MakePoolSize(VkDescriptorType type, std::uint32_t descripto
     return VkDescriptorPoolSize{type, descriptorCount};
 }
 
-VkPipelineColorBlendAttachmentState MakeDisabledBlendAttachment() {
-    VkPipelineColorBlendAttachmentState attachment{};
-    attachment.blendEnable = VK_FALSE;
-    attachment.colorWriteMask = 0;
-    return attachment;
-}
-
 VkPipelineColorBlendAttachmentState MakeAlphaBlendAttachment() {
     VkPipelineColorBlendAttachmentState attachment{};
     attachment.colorWriteMask =
@@ -489,23 +490,31 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateSwapchain();
     CreateImageViews();
     CreateRenderPass();
+    CreatePresentRenderPass();
     CreatePointDescriptorSetLayout();
     CreateGaussianSplatDescriptorSetLayout();
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
+    CreatePostProcessDescriptorSetLayout();
     CreateDescriptorPools();
+    CreatePostProcessSampler();
     CreateUniformResources();
+    CreateSceneColorResources();
     CreateDepthResources();
     CreateAccumulationResources();
+    CreateLinearDepthResources();
     CreatePointPipelines();
     CreateGaussianSplatPipeline();
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
+    CreatePostProcessPipeline();
     CreateFramebuffers();
+    CreatePresentFramebuffers();
     CreateCommandPool();
     CreateCommandBuffers();
     CreateSyncObjects();
     CreateOrUpdateCompositeDescriptorSet();
+    CreateOrUpdatePostProcessDescriptorSets();
     CreateImGuiResources();
     UploadImGuiFonts();
 }
@@ -565,6 +574,12 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (pointConstantSimpleAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointConstantSimpleAccumulationPipeline_, nullptr);
     }
+    if (pointOpaqueHardDiscPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, pointOpaqueHardDiscPipeline_, nullptr);
+    }
+    if (pointFastBasicPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, pointFastBasicPipeline_, nullptr);
+    }
     if (surfelDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelDepthPrepassPipeline_, nullptr);
     }
@@ -574,6 +589,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (surfelConstantSimpleAccumulationPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelConstantSimpleAccumulationPipeline_, nullptr);
     }
+    if (surfelOpaqueHardDiscPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, surfelOpaqueHardDiscPipeline_, nullptr);
+    }
     if (gaussianSplatPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, gaussianSplatPipeline_, nullptr);
     }
@@ -582,6 +600,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (compositePipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, compositePipeline_, nullptr);
+    }
+    if (postProcessPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, postProcessPipeline_, nullptr);
     }
     if (pointPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, pointPipelineLayout_, nullptr);
@@ -594,6 +615,12 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (compositePipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, compositePipelineLayout_, nullptr);
+    }
+    if (postProcessPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, postProcessPipelineLayout_, nullptr);
+    }
+    if (postProcessSampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, postProcessSampler_, nullptr);
     }
     if (descriptorPool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
@@ -616,10 +643,17 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (compositeDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, compositeDescriptorSetLayout_, nullptr);
     }
+    if (postProcessDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, postProcessDescriptorSetLayout_, nullptr);
+    }
 
     if (renderPass_ != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         renderPass_ = VK_NULL_HANDLE;
+    }
+    if (presentRenderPass_ != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device_, presentRenderPass_, nullptr);
+        presentRenderPass_ = VK_NULL_HANDLE;
     }
 
     if (device_ != VK_NULL_HANDLE) {
@@ -647,6 +681,33 @@ void VulkanViewportShell::BeginUiFrame() {
     uiFrameBegun_ = true;
 }
 
+bool VulkanViewportShell::SceneImageNeedsRender(std::uint32_t imageIndex) const {
+    if (!liveSceneRenderingEnabled_) {
+        return false;
+    }
+    if (!sceneCachingEnabled_) {
+        return true;
+    }
+    return imageIndex >= sceneImageRevisions_.size() ||
+           sceneImageRevisions_[imageIndex] != sceneRevision_;
+}
+
+bool VulkanViewportShell::AnySceneImageNeedsRender() const {
+    if (!liveSceneRenderingEnabled_) {
+        return false;
+    }
+    if (!sceneCachingEnabled_) {
+        return true;
+    }
+    if (sceneImageRevisions_.size() != swapchainImages_.size()) {
+        return true;
+    }
+    return std::any_of(
+        sceneImageRevisions_.begin(),
+        sceneImageRevisions_.end(),
+        [this](std::uint64_t imageRevision) { return imageRevision != sceneRevision_; });
+}
+
 void VulkanViewportShell::DrawFrame() {
     const bool collectDiagnostics = diagnosticsEnabled_;
     const auto frameStart = collectDiagnostics ? std::chrono::steady_clock::now()
@@ -663,7 +724,7 @@ void VulkanViewportShell::DrawFrame() {
     vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
-    if (liveSceneRenderingEnabled_) {
+    if (AnySceneImageNeedsRender()) {
         RefreshHighQualityGaussianScene(currentFrameIndex_);
         UpdateUniformBuffer(currentFrameIndex_);
     }
@@ -742,10 +803,11 @@ void VulkanViewportShell::DrawFrame() {
     const auto frameEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
     if (collectDiagnostics) {
-        constexpr double kFrameSmoothing = 0.12;
+        constexpr double kFrameAverageWindowMs = 500.0;
         diagnostics_.framesInFlight = static_cast<std::uint32_t>(kFramesInFlight);
         diagnostics_.swapchainImageCount = static_cast<std::uint32_t>(swapchainImages_.size());
         diagnostics_.currentFrameIndex = static_cast<std::uint32_t>(currentFrameIndex_);
+        diagnostics_.frameAverageWindowSeconds = kFrameAverageWindowMs / 1000.0;
         diagnostics_.frameUiRenderMs = MillisecondsBetween(frameStart, uiEnd);
         diagnostics_.frameFenceWaitMs = MillisecondsBetween(uiEnd, fenceEnd);
         diagnostics_.framePrepareMs = MillisecondsBetween(fenceEnd, prepareEnd);
@@ -760,20 +822,28 @@ void VulkanViewportShell::DrawFrame() {
             diagnostics_.frameRenderMs > 0.0 ? 1000.0 / diagnostics_.frameRenderMs : 0.0;
         if (!diagnosticsTimingInitialized_) {
             diagnostics_.averageFrameRenderMs = diagnostics_.frameRenderMs;
+            diagnostics_.averageFrameFps = diagnostics_.frameFps;
             diagnostics_.minFrameRenderMs = diagnostics_.frameRenderMs;
             diagnostics_.maxFrameRenderMs = diagnostics_.frameRenderMs;
             diagnosticsTimingInitialized_ = true;
         } else {
-            diagnostics_.averageFrameRenderMs =
-                (diagnostics_.averageFrameRenderMs * (1.0 - kFrameSmoothing)) +
-                (diagnostics_.frameRenderMs * kFrameSmoothing);
             diagnostics_.minFrameRenderMs =
                 std::min(diagnostics_.minFrameRenderMs, diagnostics_.frameRenderMs);
             diagnostics_.maxFrameRenderMs =
                 std::max(diagnostics_.maxFrameRenderMs, diagnostics_.frameRenderMs);
         }
-        diagnostics_.averageFrameFps =
-            diagnostics_.averageFrameRenderMs > 0.0 ? 1000.0 / diagnostics_.averageFrameRenderMs : 0.0;
+        diagnosticsFpsWindowMs_ += diagnostics_.frameRenderMs;
+        ++diagnosticsFpsWindowFrames_;
+        if (diagnosticsFpsWindowMs_ >= kFrameAverageWindowMs) {
+            diagnostics_.averageFrameRenderMs =
+                diagnosticsFpsWindowMs_ / static_cast<double>(diagnosticsFpsWindowFrames_);
+            diagnostics_.averageFrameFps =
+                diagnosticsFpsWindowMs_ > 0.0
+                    ? (1000.0 * static_cast<double>(diagnosticsFpsWindowFrames_)) / diagnosticsFpsWindowMs_
+                    : 0.0;
+            diagnosticsFpsWindowMs_ = 0.0;
+            diagnosticsFpsWindowFrames_ = 0;
+        }
     }
     currentFrameIndex_ = (currentFrameIndex_ + 1U) % kFramesInFlight;
 }
@@ -791,12 +861,15 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
     diagnosticsEnabled_ = enabled;
     if (enabled) {
         diagnosticsTimingInitialized_ = false;
+        diagnosticsFpsWindowMs_ = 0.0;
+        diagnosticsFpsWindowFrames_ = 0;
         diagnostics_.frameRenderMs = 0.0;
         diagnostics_.averageFrameRenderMs = 0.0;
         diagnostics_.minFrameRenderMs = 0.0;
         diagnostics_.maxFrameRenderMs = 0.0;
         diagnostics_.frameFps = 0.0;
         diagnostics_.averageFrameFps = 0.0;
+        diagnostics_.frameAverageWindowSeconds = 0.5;
         diagnostics_.frameUiRenderMs = 0.0;
         diagnostics_.frameFenceWaitMs = 0.0;
         diagnostics_.frameAcquireMs = 0.0;
@@ -809,8 +882,19 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
     }
 }
 
+void VulkanViewportShell::SetSceneCachingEnabled(bool enabled) {
+    if (sceneCachingEnabled_ == enabled) {
+        return;
+    }
+    sceneCachingEnabled_ = enabled;
+    if (!sceneCachingEnabled_) {
+        ++sceneRevision_;
+    }
+}
+
 void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     renderState_ = state;
+    ++sceneRevision_;
 
     std::uint64_t pointCount = 0;
     double pointSizeSum = 0.0;
@@ -824,11 +908,20 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     }
 
     diagnostics_.pointCount = pointCount;
+    if (pointCount == 0) {
+        diagnostics_.pointSubmittedCount = 0;
+        diagnostics_.pointPassSubmittedCount = 0;
+    }
     diagnostics_.averagePointSizePx =
         pointSizeWeight > 0 ? static_cast<float>(pointSizeSum / static_cast<double>(pointSizeWeight)) : 0.0F;
     diagnostics_.accumulationWidth = swapchainWidth_;
     diagnostics_.accumulationHeight = swapchainHeight_;
-    diagnostics_.pointRenderModes = pointCount > 0 ? "unified-material" : "";
+    diagnostics_.pointRenderModes =
+        pointCount == 0 ? ""
+                        : (renderState_.pointCloudRendererMode ==
+                                   renderer::pointcloud::PointCloudRendererMode::FastBasic
+                               ? "fast-basic-square"
+                               : "beauty-material");
 
     std::ostringstream summary;
     summary << "Renderer: " << diagnostics_.rendererName << " | " << swapchainWidth_ << "x"
@@ -1485,6 +1578,7 @@ void VulkanViewportShell::CreateImageViews() {
 void VulkanViewportShell::CreateRenderPass() {
     accumulationFormat_ = SelectAccumulationFormat();
     revealageFormat_ = SelectRevealageFormat();
+    linearDepthFormat_ = VK_FORMAT_R32_SFLOAT;
 
     VkAttachmentDescription colorAttachment{};
     colorAttachment.format = swapchainImageFormat_;
@@ -1494,7 +1588,7 @@ void VulkanViewportShell::CreateRenderPass() {
     colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     VkAttachmentDescription depthAttachment{};
     depthAttachment.format = SelectDepthFormat();
@@ -1536,7 +1630,17 @@ void VulkanViewportShell::CreateRenderPass() {
     emissiveAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     emissiveAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-    VkAttachmentReference subpass0ColorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentDescription linearDepthAttachment{};
+    linearDepthAttachment.format = linearDepthFormat_;
+    linearDepthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    linearDepthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    linearDepthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    linearDepthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    linearDepthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    linearDepthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    linearDepthAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference subpass0ColorRef{5, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
 
     VkAttachmentReference depthAttachmentRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkAttachmentReference depthReadOnlyAttachmentRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
@@ -1579,9 +1683,9 @@ void VulkanViewportShell::CreateRenderPass() {
     subpass3.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass3.colorAttachmentCount = 1;
     subpass3.pColorAttachments = &subpass3ColorRef;
-    subpass3.pDepthStencilAttachment = &depthReadOnlyAttachmentRef;
+    subpass3.pDepthStencilAttachment = &depthAttachmentRef;
 
-    std::array<VkSubpassDependency, 6> dependencies{};
+    std::array<VkSubpassDependency, 8> dependencies{};
     dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[0].dstSubpass = 0;
     dependencies[0].srcStageMask =
@@ -1609,7 +1713,8 @@ void VulkanViewportShell::CreateRenderPass() {
     dependencies[2].dstStageMask =
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     dependencies[2].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dependencies[2].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    dependencies[2].dstAccessMask =
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
     dependencies[3].srcSubpass = 1;
     dependencies[3].dstSubpass = 2;
@@ -1631,15 +1736,34 @@ void VulkanViewportShell::CreateRenderPass() {
     dependencies[5].srcSubpass = 3;
     dependencies[5].dstSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[5].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[5].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dependencies[5].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     dependencies[5].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[5].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-    const std::array<VkAttachmentDescription, 5> attachments = {
+    dependencies[6].srcSubpass = 0;
+    dependencies[6].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[6].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[6].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[6].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[6].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    dependencies[7].srcSubpass = 1;
+    dependencies[7].dstSubpass = 3;
+    dependencies[7].srcStageMask =
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[7].dstStageMask =
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[7].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    dependencies[7].dstAccessMask =
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    const std::array<VkAttachmentDescription, 6> attachments = {
         colorAttachment,
         depthAttachment,
         accumulationAttachment,
         revealageAttachment,
         emissiveAttachment,
+        linearDepthAttachment,
     };
     const std::array<VkSubpassDescription, 4> subpasses = {subpass0, subpass1, subpass2, subpass3};
 
@@ -1652,6 +1776,48 @@ void VulkanViewportShell::CreateRenderPass() {
     renderPassInfo.pDependencies = dependencies.data();
 
     Check(vkCreateRenderPass(device_, &renderPassInfo, nullptr, &renderPass_), "vkCreateRenderPass");
+}
+
+void VulkanViewportShell::CreatePresentRenderPass() {
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = swapchainImageFormat_;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+
+    std::array<VkSubpassDependency, 2> dependencies{};
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &colorAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = static_cast<std::uint32_t>(dependencies.size());
+    renderPassInfo.pDependencies = dependencies.data();
+
+    Check(vkCreateRenderPass(device_, &renderPassInfo, nullptr, &presentRenderPass_), "vkCreateRenderPass(present)");
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
@@ -1746,11 +1912,26 @@ void VulkanViewportShell::CreateCompositeDescriptorSetLayout() {
         "vkCreateDescriptorSetLayout(composite)");
 }
 
+void VulkanViewportShell::CreatePostProcessDescriptorSetLayout() {
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    Check(
+        vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &postProcessDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(postprocess)");
+}
+
 void VulkanViewportShell::CreateDescriptorPools() {
-    const std::array<VkDescriptorPoolSize, 3> poolSizes = {
+    const std::array<VkDescriptorPoolSize, 4> poolSizes = {
         MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024),
         MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096),
         MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1024),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024),
     };
 
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1776,6 +1957,21 @@ void VulkanViewportShell::CreateDescriptorPools() {
         "vkCreateDescriptorPool(gsplat)");
 }
 
+void VulkanViewportShell::CreatePostProcessSampler() {
+    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.minLod = 0.0F;
+    samplerInfo.maxLod = 0.0F;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+
+    Check(vkCreateSampler(device_, &samplerInfo, nullptr, &postProcessSampler_), "vkCreateSampler(postprocess)");
+}
+
 void VulkanViewportShell::CreateUniformResources() {
     for (auto& frame : frameResources_) {
         DestroyBuffer(&frame.uniformBuffer);
@@ -1786,38 +1982,52 @@ void VulkanViewportShell::CreateUniformResources() {
 void VulkanViewportShell::CreatePointPipelines() {
     const auto vertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.vert.spv").string());
-    const auto solidFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.frag.spv").string());
+    const auto depthFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_export_depth.frag.spv").string());
     const auto accumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_accumulation.frag.spv").string());
     const auto constantSimpleVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple.vert.spv").string());
     const auto constantSimpleFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple_accumulation.frag.spv").string());
+    const auto opaqueHardDiscFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_opaque_hard_disc.frag.spv").string());
+    const auto fastBasicVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic.vert.spv").string());
+    const auto fastBasicFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic.frag.spv").string());
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
-    const auto surfelSolidFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_preview.frag.spv").string());
+    const auto surfelDepthFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_accumulation.frag.spv").string());
     const auto surfelConstantSimpleVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple.vert.spv").string());
     const auto surfelConstantSimpleFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple_accumulation.frag.spv").string());
+    const auto surfelOpaqueHardDiscFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_opaque_hard_disc.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(point vertex)");
-    const auto solidFragmentModule =
-        CreateShaderModule(device_, solidFragmentShaderCode, "vkCreateShaderModule(point solid fragment)");
+    const auto depthFragmentModule =
+        CreateShaderModule(device_, depthFragmentShaderCode, "vkCreateShaderModule(point depth fragment)");
     const auto accumulationFragmentModule =
         CreateShaderModule(device_, accumulationFragmentShaderCode, "vkCreateShaderModule(point accumulation fragment)");
     const auto constantSimpleVertexModule =
         CreateShaderModule(device_, constantSimpleVertexShaderCode, "vkCreateShaderModule(point simple vertex)");
     const auto constantSimpleFragmentModule =
         CreateShaderModule(device_, constantSimpleFragmentShaderCode, "vkCreateShaderModule(point simple accumulation fragment)");
+    const auto opaqueHardDiscFragmentModule =
+        CreateShaderModule(device_, opaqueHardDiscFragmentShaderCode, "vkCreateShaderModule(point opaque hard disc fragment)");
+    const auto fastBasicVertexModule =
+        CreateShaderModule(device_, fastBasicVertexShaderCode, "vkCreateShaderModule(point fast basic vertex)");
+    const auto fastBasicFragmentModule =
+        CreateShaderModule(device_, fastBasicFragmentShaderCode, "vkCreateShaderModule(point fast basic fragment)");
     const auto surfelVertexModule =
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(surfel vertex)");
-    const auto surfelSolidFragmentModule =
-        CreateShaderModule(device_, surfelSolidFragmentShaderCode, "vkCreateShaderModule(surfel solid fragment)");
+    const auto surfelDepthFragmentModule =
+        CreateShaderModule(device_, surfelDepthFragmentShaderCode, "vkCreateShaderModule(surfel depth fragment)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(surfel accumulation fragment)");
     const auto surfelConstantSimpleVertexModule =
@@ -1827,6 +2037,11 @@ void VulkanViewportShell::CreatePointPipelines() {
             device_,
             surfelConstantSimpleFragmentShaderCode,
             "vkCreateShaderModule(surfel simple accumulation fragment)");
+    const auto surfelOpaqueHardDiscFragmentModule =
+        CreateShaderModule(
+            device_,
+            surfelOpaqueHardDiscFragmentShaderCode,
+            "vkCreateShaderModule(surfel opaque hard disc fragment)");
 
     VkPipelineShaderStageCreateInfo vertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1842,6 +2057,11 @@ void VulkanViewportShell::CreatePointPipelines() {
     constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     constantSimpleVertexStage.module = constantSimpleVertexModule;
     constantSimpleVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fastBasicVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    fastBasicVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    fastBasicVertexStage.module = fastBasicVertexModule;
+    fastBasicVertexStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo surfelConstantSimpleVertexStage{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -1953,13 +2173,22 @@ void VulkanViewportShell::CreatePointPipelines() {
             Check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline), label);
         };
 
+    VkPipelineColorBlendAttachmentState linearDepthBlend{};
+    linearDepthBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    linearDepthBlend.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState opaqueColorBlend{};
+    opaqueColorBlend.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    opaqueColorBlend.blendEnable = VK_FALSE;
+
     createPointPipeline(
         vertexStage,
         vertexInputInfo,
         inputAssembly,
-        solidFragmentModule,
+        depthFragmentModule,
         0,
-        std::vector<VkPipelineColorBlendAttachmentState>{MakeDisabledBlendAttachment()},
+        std::vector<VkPipelineColorBlendAttachmentState>{linearDepthBlend},
         true,
         true,
         VK_COMPARE_OP_LESS,
@@ -1999,12 +2228,38 @@ void VulkanViewportShell::CreatePointPipelines() {
         &pointConstantSimpleAccumulationPipeline_);
 
     createPointPipeline(
+        constantSimpleVertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        opaqueHardDiscFragmentModule,
+        3,
+        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(point opaque hard disc)",
+        &pointOpaqueHardDiscPipeline_);
+
+    createPointPipeline(
+        fastBasicVertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        fastBasicFragmentModule,
+        3,
+        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        true,
+        true,
+        VK_COMPARE_OP_LESS,
+        "vkCreateGraphicsPipelines(point fast basic)",
+        &pointFastBasicPipeline_);
+
+    createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
-        surfelSolidFragmentModule,
+        surfelDepthFragmentModule,
         0,
-        std::vector<VkPipelineColorBlendAttachmentState>{MakeDisabledBlendAttachment()},
+        std::vector<VkPipelineColorBlendAttachmentState>{linearDepthBlend},
         true,
         true,
         VK_COMPARE_OP_LESS,
@@ -2043,15 +2298,32 @@ void VulkanViewportShell::CreatePointPipelines() {
         "vkCreateGraphicsPipelines(surfel simple accumulation)",
         &surfelConstantSimpleAccumulationPipeline_);
 
+    createPointPipeline(
+        surfelConstantSimpleVertexStage,
+        surfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelOpaqueHardDiscFragmentModule,
+        3,
+        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(surfel opaque hard disc)",
+        &surfelOpaqueHardDiscPipeline_);
+
+    vkDestroyShaderModule(device_, surfelOpaqueHardDiscFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
-    vkDestroyShaderModule(device_, surfelSolidFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, fastBasicFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, fastBasicVertexModule, nullptr);
+    vkDestroyShaderModule(device_, opaqueHardDiscFragmentModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, accumulationFragmentModule, nullptr);
-    vkDestroyShaderModule(device_, solidFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, depthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 }
 
@@ -2271,7 +2543,13 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     compositeSubpass.inputAttachmentCount = 3;
     compositeSubpass.pInputAttachments = compositeInputRefs;
 
-    std::array<VkSubpassDependency, 5> dependencies{};
+    VkSubpassDescription fastBasicSubpass{};
+    fastBasicSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    fastBasicSubpass.colorAttachmentCount = 1;
+    fastBasicSubpass.pColorAttachments = &finalColorRef;
+    fastBasicSubpass.pDepthStencilAttachment = &depthReadOnlyAttachmentRef;
+
+    std::array<VkSubpassDependency, 7> dependencies{};
     dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     dependencies[0].dstSubpass = 0;
     dependencies[0].srcStageMask =
@@ -2309,11 +2587,28 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     dependencies[3].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     dependencies[4].srcSubpass = 2;
-    dependencies[4].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[4].dstSubpass = 3;
     dependencies[4].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[4].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[4].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dependencies[4].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[4].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    dependencies[4].dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    dependencies[5].srcSubpass = 0;
+    dependencies[5].dstSubpass = 3;
+    dependencies[5].srcStageMask =
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[5].dstStageMask =
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[5].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[5].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+
+    dependencies[6].srcSubpass = 3;
+    dependencies[6].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[6].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[6].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependencies[6].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[6].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
     const std::array<VkAttachmentDescription, 6> attachments = {
         colorAttachment,
@@ -2323,10 +2618,11 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
         emissiveAttachment,
         linearDepthAttachment,
     };
-    const std::array<VkSubpassDescription, 3> subpasses = {
+    const std::array<VkSubpassDescription, 4> subpasses = {
         depthSubpass,
         accumulationSubpass,
         compositeSubpass,
+        fastBasicSubpass,
     };
 
     VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
@@ -2352,6 +2648,12 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple.vert.spv").string());
     const auto constantSimpleFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple_accumulation.frag.spv").string());
+    const auto fastBasicVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic.vert.spv").string());
+    const auto fastBasicFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic.frag.spv").string());
+    const auto fastBasicDepthFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic_depth.frag.spv").string());
     const auto depthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_export_depth.frag.spv").string());
     const auto surfelVertexShaderCode =
@@ -2375,6 +2677,15 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
             device_,
             constantSimpleFragmentShaderCode,
             "vkCreateShaderModule(exr point simple accumulation fragment)");
+    const auto fastBasicVertexModule =
+        CreateShaderModule(device_, fastBasicVertexShaderCode, "vkCreateShaderModule(exr point fast basic vertex)");
+    const auto fastBasicFragmentModule =
+        CreateShaderModule(device_, fastBasicFragmentShaderCode, "vkCreateShaderModule(exr point fast basic fragment)");
+    const auto fastBasicDepthFragmentModule =
+        CreateShaderModule(
+            device_,
+            fastBasicDepthFragmentShaderCode,
+            "vkCreateShaderModule(exr point fast basic depth fragment)");
     const auto depthFragmentModule =
         CreateShaderModule(device_, depthFragmentShaderCode, "vkCreateShaderModule(exr point depth fragment)");
     const auto surfelVertexModule =
@@ -2405,6 +2716,11 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     constantSimpleVertexStage.module = constantSimpleVertexModule;
     constantSimpleVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fastBasicVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    fastBasicVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    fastBasicVertexStage.module = fastBasicVertexModule;
+    fastBasicVertexStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo surfelConstantSimpleVertexStage{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -2512,6 +2828,11 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     linearDepthBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     linearDepthBlend.blendEnable = VK_FALSE;
 
+    VkPipelineColorBlendAttachmentState opaqueColorBlend{};
+    opaqueColorBlend.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    opaqueColorBlend.blendEnable = VK_FALSE;
+
     createPointPipeline(
         vertexStage,
         vertexInputInfo,
@@ -2555,6 +2876,32 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         VK_COMPARE_OP_ALWAYS,
         "vkCreateGraphicsPipelines(exr point simple accumulation)",
         &resources->pointConstantSimpleAccumulationPipeline);
+
+    createPointPipeline(
+        fastBasicVertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        fastBasicDepthFragmentModule,
+        0,
+        std::vector<VkPipelineColorBlendAttachmentState>{linearDepthBlend},
+        true,
+        true,
+        VK_COMPARE_OP_LESS,
+        "vkCreateGraphicsPipelines(exr point fast basic depth)",
+        &resources->pointFastBasicDepthPipeline);
+
+    createPointPipeline(
+        fastBasicVertexStage,
+        vertexInputInfo,
+        inputAssembly,
+        fastBasicFragmentModule,
+        3,
+        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(exr point fast basic)",
+        &resources->pointFastBasicPipeline);
 
     createPointPipeline(
         surfelVertexStage,
@@ -2605,6 +2952,9 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
+    vkDestroyShaderModule(device_, fastBasicDepthFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, fastBasicFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, fastBasicVertexModule, nullptr);
     vkDestroyShaderModule(device_, depthFragmentModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleVertexModule, nullptr);
@@ -2972,17 +3322,120 @@ void VulkanViewportShell::CreateCompositePipeline() {
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 }
 
+void VulkanViewportShell::CreatePostProcessPipeline() {
+    const auto vertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "gsplat_composite.vert.spv").string());
+    const auto fragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "edl_postprocess.frag.spv").string());
+
+    const auto vertexModule =
+        CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(postprocess vertex)");
+    const auto fragmentModule =
+        CreateShaderModule(device_, fragmentShaderCode, "vkCreateShaderModule(postprocess fragment)");
+
+    VkPipelineShaderStageCreateInfo vertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertexStage.module = vertexModule;
+    vertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fragmentStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    fragmentStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragmentStage.module = fragmentModule;
+    fragmentStage.pName = "main";
+
+    const std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages = {vertexStage, fragmentStage};
+
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0F;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depthStencil.depthTestEnable = VK_FALSE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo colorBlending{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+
+    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamicState.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(PostProcessPushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &postProcessDescriptorSetLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+
+    Check(
+        vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &postProcessPipelineLayout_),
+        "vkCreatePipelineLayout(postprocess)");
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.stageCount = static_cast<std::uint32_t>(shaderStages.size());
+    pipelineInfo.pStages = shaderStages.data();
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = postProcessPipelineLayout_;
+    pipelineInfo.renderPass = presentRenderPass_;
+    pipelineInfo.subpass = 0;
+
+    Check(
+        vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &postProcessPipeline_),
+        "vkCreateGraphicsPipelines(postprocess)");
+
+    vkDestroyShaderModule(device_, fragmentModule, nullptr);
+    vkDestroyShaderModule(device_, vertexModule, nullptr);
+}
+
 void VulkanViewportShell::CreateFramebuffers() {
     framebuffers_.clear();
-    framebuffers_.reserve(imageViews_.size());
+    framebuffers_.reserve(sceneColorImages_.size());
 
-    for (std::size_t imageIndex = 0; imageIndex < imageViews_.size(); ++imageIndex) {
-        const std::array<VkImageView, 5> attachments = {
-            imageViews_[imageIndex],
+    for (std::size_t imageIndex = 0; imageIndex < sceneColorImages_.size(); ++imageIndex) {
+        const std::array<VkImageView, 6> attachments = {
+            sceneColorImages_[imageIndex].view,
             depthImages_[imageIndex].view,
             accumulationImages_[imageIndex].view,
             revealageImages_[imageIndex].view,
             emissiveImages_[imageIndex].view,
+            linearDepthImages_[imageIndex].view,
         };
 
         VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -2996,6 +3449,42 @@ void VulkanViewportShell::CreateFramebuffers() {
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         Check(vkCreateFramebuffer(device_, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer");
         framebuffers_.push_back(framebuffer);
+    }
+}
+
+void VulkanViewportShell::CreatePresentFramebuffers() {
+    presentFramebuffers_.clear();
+    presentFramebuffers_.reserve(imageViews_.size());
+
+    for (const auto imageView : imageViews_) {
+        VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        framebufferInfo.renderPass = presentRenderPass_;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = &imageView;
+        framebufferInfo.width = swapchainWidth_;
+        framebufferInfo.height = swapchainHeight_;
+        framebufferInfo.layers = 1;
+
+        VkFramebuffer framebuffer = VK_NULL_HANDLE;
+        Check(vkCreateFramebuffer(device_, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer(present)");
+        presentFramebuffers_.push_back(framebuffer);
+    }
+}
+
+void VulkanViewportShell::CreateSceneColorResources() {
+    for (auto& image : sceneColorImages_) {
+        DestroyImage(&image);
+    }
+    sceneColorImages_.clear();
+    sceneImageRevisions_.clear();
+    sceneColorImages_.reserve(swapchainImages_.size());
+    sceneImageRevisions_.reserve(swapchainImages_.size());
+    for (std::size_t imageIndex = 0; imageIndex < swapchainImages_.size(); ++imageIndex) {
+        sceneColorImages_.push_back(CreateAttachmentImage(
+            swapchainImageFormat_,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT));
+        sceneImageRevisions_.push_back(0);
     }
 }
 
@@ -3043,6 +3532,20 @@ void VulkanViewportShell::CreateAccumulationResources() {
         emissiveImages_.push_back(CreateAttachmentImage(
             accumulationFormat_,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT));
+    }
+}
+
+void VulkanViewportShell::CreateLinearDepthResources() {
+    for (auto& image : linearDepthImages_) {
+        DestroyImage(&image);
+    }
+    linearDepthImages_.clear();
+    linearDepthImages_.reserve(swapchainImages_.size());
+    for (std::size_t imageIndex = 0; imageIndex < swapchainImages_.size(); ++imageIndex) {
+        linearDepthImages_.push_back(CreateAttachmentImage(
+            linearDepthFormat_,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_IMAGE_ASPECT_COLOR_BIT));
     }
 }
@@ -3134,8 +3637,8 @@ void VulkanViewportShell::CreateImGuiResources() {
     initInfo.DescriptorPool = imguiDescriptorPool_;
     initInfo.MinImageCount = std::max<std::uint32_t>(2U, static_cast<std::uint32_t>(swapchainImages_.size()));
     initInfo.ImageCount = static_cast<std::uint32_t>(swapchainImages_.size());
-    initInfo.PipelineInfoMain.RenderPass = renderPass_;
-    initInfo.PipelineInfoMain.Subpass = 3;
+    initInfo.PipelineInfoMain.RenderPass = presentRenderPass_;
+    initInfo.PipelineInfoMain.Subpass = 0;
     initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     initInfo.CheckVkResultFn = &CheckImGuiResult;
 
@@ -3411,6 +3914,49 @@ void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
     writes[2].pImageInfo = &emissiveInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void VulkanViewportShell::CreateOrUpdatePostProcessDescriptorSets() {
+    postProcessDescriptorSets_.resize(sceneColorImages_.size(), VK_NULL_HANDLE);
+    for (std::uint32_t imageIndex = 0; imageIndex < sceneColorImages_.size(); ++imageIndex) {
+        auto& descriptorSet = postProcessDescriptorSets_[imageIndex];
+        if (descriptorSet == VK_NULL_HANDLE) {
+            VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocInfo.descriptorPool = descriptorPool_;
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &postProcessDescriptorSetLayout_;
+            Check(
+                vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet),
+                "vkAllocateDescriptorSets(postprocess)");
+        }
+
+        VkDescriptorImageInfo sceneColorInfo{};
+        sceneColorInfo.sampler = postProcessSampler_;
+        sceneColorInfo.imageView = sceneColorImages_[imageIndex].view;
+        sceneColorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo linearDepthInfo{};
+        linearDepthInfo.sampler = postProcessSampler_;
+        linearDepthInfo.imageView = linearDepthImages_[imageIndex].view;
+        linearDepthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[0].dstSet = descriptorSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo = &sceneColorInfo;
+
+        writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[1].dstSet = descriptorSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo = &linearDepthInfo;
+
+        vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
 }
 
 void VulkanViewportShell::UpdateGaussianSplatDescriptorSets(ActiveGaussianSplatResources* resources) {
@@ -3878,6 +4424,12 @@ void VulkanViewportShell::CleanupSwapchain() {
         }
     }
     compositeDescriptorSets_.clear();
+    for (auto& descriptorSet : postProcessDescriptorSets_) {
+        if (descriptorSet != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+        }
+    }
+    postProcessDescriptorSets_.clear();
 
     for (auto& resources : pointCloudResources_) {
         for (auto& descriptorSets : resources.descriptorSets) {
@@ -3906,7 +4458,14 @@ void VulkanViewportShell::CleanupSwapchain() {
         vkDestroyFramebuffer(device_, framebuffer, nullptr);
     }
     framebuffers_.clear();
+    for (const auto framebuffer : presentFramebuffers_) {
+        vkDestroyFramebuffer(device_, framebuffer, nullptr);
+    }
+    presentFramebuffers_.clear();
 
+    for (auto& image : sceneColorImages_) {
+        DestroyImage(&image);
+    }
     for (auto& image : depthImages_) {
         DestroyImage(&image);
     }
@@ -3919,10 +4478,15 @@ void VulkanViewportShell::CleanupSwapchain() {
     for (auto& image : emissiveImages_) {
         DestroyImage(&image);
     }
+    for (auto& image : linearDepthImages_) {
+        DestroyImage(&image);
+    }
+    sceneColorImages_.clear();
     depthImages_.clear();
     accumulationImages_.clear();
     revealageImages_.clear();
     emissiveImages_.clear();
+    linearDepthImages_.clear();
 
     for (const auto imageView : imageViews_) {
         vkDestroyImageView(device_, imageView, nullptr);
@@ -4045,6 +4609,12 @@ void VulkanViewportShell::CleanupExrExportResources() {
     if (resources.pointConstantSimpleAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.pointConstantSimpleAccumulationPipeline, nullptr);
     }
+    if (resources.pointFastBasicDepthPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, resources.pointFastBasicDepthPipeline, nullptr);
+    }
+    if (resources.pointFastBasicPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, resources.pointFastBasicPipeline, nullptr);
+    }
     if (resources.surfelDepthPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelDepthPipeline, nullptr);
     }
@@ -4091,11 +4661,15 @@ void VulkanViewportShell::RecreateSwapchain() {
     CleanupSwapchain();
     CreateSwapchain();
     CreateImageViews();
+    CreateSceneColorResources();
     CreateDepthResources();
     CreateAccumulationResources();
+    CreateLinearDepthResources();
     CreateFramebuffers();
+    CreatePresentFramebuffers();
     CreateCommandBuffers();
     CreateOrUpdateCompositeDescriptorSet();
+    CreateOrUpdatePostProcessDescriptorSets();
     for (auto& resources : pointCloudResources_) {
         UpdatePointCloudDescriptorSets(&resources);
     }
@@ -4211,10 +4785,19 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         resources->pointCount,
         plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
-        0U,
+        layer.style.flowAnimation ? 1U : 0U,
     };
+    const bool forceDepthContribution =
+        renderState_.eyeDomeLightingEnabled ||
+        renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style) ==
+            renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
+    const auto effectiveDepthContribution =
+        forceDepthContribution &&
+                layer.style.depthContribution == renderer::pointcloud::PointCloudDepthContribution::None
+            ? renderer::pointcloud::PointCloudDepthContribution::Always
+            : layer.style.depthContribution;
     styleGpu.renderControl = glm::uvec4{
-        static_cast<std::uint32_t>(layer.style.depthContribution),
+        static_cast<std::uint32_t>(effectiveDepthContribution),
         static_cast<std::uint32_t>(layer.style.falloffProfile),
         static_cast<std::uint32_t>(layer.style.geometryMode),
         layer.style.solidCenters ? 1U : 0U,
@@ -4242,6 +4825,30 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         pointSizeRangeMin_,
         pointSizeRangeMax_,
         0.0F,
+    };
+    styleGpu.stylisationControl = glm::uvec4{
+        static_cast<std::uint32_t>(layer.style.stylisationMode),
+        static_cast<std::uint32_t>(layer.style.nprPreset),
+        0U,
+        0U,
+    };
+    styleGpu.stylisationParams0 = glm::vec4{
+        std::clamp(layer.style.stylisationStrength, 0.0F, 1.0F),
+        std::clamp(layer.style.stylisationColorLevels, 2.0F, 16.0F),
+        std::clamp(layer.style.stylisationInkStrength, 0.0F, 1.0F),
+        std::clamp(layer.style.stylisationPaperGrain, 0.0F, 1.0F),
+    };
+    styleGpu.stylisationParams1 = glm::vec4{
+        std::clamp(layer.style.stylisationPigmentBleed, 0.0F, 1.0F),
+        std::clamp(layer.style.brushAspect, 0.25F, 6.0F),
+        std::clamp(layer.style.strokeJitter, 0.0F, 1.0F),
+        std::clamp(layer.style.hatchStrength, 0.0F, 1.0F),
+    };
+    styleGpu.stylisationParams2 = glm::vec4{
+        std::clamp(layer.style.strokeOpacityVariance, 0.0F, 1.0F),
+        std::clamp(layer.style.pigmentVariation, 0.0F, 1.0F),
+        std::clamp(layer.style.pigmentAnimationSpeed, 0.0F, 4.0F),
+        std::clamp(layer.style.granulationAngleStrength, 0.0F, 1.0F),
     };
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,
@@ -4289,7 +4896,11 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
     bool uploadStyle,
     std::size_t frameIndex,
     std::uint32_t imageIndex,
-    bool exrStyle) {
+    bool exrStyle,
+    std::uint32_t* recordedDrawPointCount) {
+    if (recordedDrawPointCount != nullptr) {
+        *recordedDrawPointCount = 0;
+    }
     PointCloudDrawPlan plan;
     if (!ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
         return false;
@@ -4334,6 +4945,10 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         &descriptorSet,
         0,
         nullptr);
+
+    if (recordedDrawPointCount != nullptr) {
+        *recordedDrawPointCount = plan.drawPointCount;
+    }
 
     if (plan.worldSurfels) {
         const std::uint32_t surfelVertexCount = plan.drawPointCount * kSurfelVerticesPerPoint;
@@ -4413,7 +5028,10 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     clearValues[4].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[5].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
 
-    const bool forceFullSource = !request.previewDensity;
+    const bool fastBasicPointRenderer =
+        request.renderState.pointCloudRendererMode ==
+        renderer::pointcloud::PointCloudRendererMode::FastBasic;
+    const bool forceFullSource = !request.previewDensity && !fastBasicPointRenderer;
     for (const auto& layer : request.renderState.pointCloudLayers) {
         PointCloudDrawPlan plan;
         if (ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
@@ -4443,14 +5061,28 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
-    const bool sceneHasActiveXray = std::any_of(
+    const bool sceneHasActiveXray = !fastBasicPointRenderer && std::any_of(
         request.renderState.pointCloudLayers.begin(),
         request.renderState.pointCloudLayers.end(),
         [](const SceneRenderState::PointCloudLayerState& layer) {
             return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
         });
     for (const auto& layer : request.renderState.pointCloudLayers) {
-        if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray)) {
+        if (fastBasicPointRenderer) {
+            static_cast<void>(RecordPointCloudLayerDraw(
+                resources.commandBuffer,
+                layer,
+                forceFullSource,
+                resources.pointFastBasicDepthPipeline,
+                VK_NULL_HANDLE,
+                false,
+                0U,
+                0U,
+                true));
+            continue;
+        }
+        if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray) ||
+            request.renderState.eyeDomeLightingEnabled) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
@@ -4468,6 +5100,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
+    if (!fastBasicPointRenderer) {
     for (const auto& layer : request.renderState.pointCloudLayers) {
         VkPipeline spritePipeline = resources.pointAccumulationPipeline;
         VkPipeline surfelPipeline = resources.surfelAccumulationPipeline;
@@ -4487,6 +5120,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             0U,
             true));
     }
+    }
 
     vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
@@ -4504,6 +5138,25 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             0,
             nullptr);
         vkCmdDraw(resources.commandBuffer, 3, 1, 0, 0);
+    }
+
+    vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
+
+    if (fastBasicPointRenderer) {
+        for (const auto& layer : request.renderState.pointCloudLayers) {
+            static_cast<void>(RecordPointCloudLayerDraw(
+                resources.commandBuffer,
+                layer,
+                forceFullSource,
+                resources.pointFastBasicPipeline,
+                VK_NULL_HANDLE,
+                false,
+                0U,
+                0U,
+                true));
+        }
     }
 
     vkCmdEndRenderPass(resources.commandBuffer);
@@ -4550,14 +5203,34 @@ void VulkanViewportShell::RecordCommandBuffer(
     std::uint32_t pointAccumulationLayerCount = 0;
     std::uint32_t pointStyleUploadCount = 0;
     std::uint32_t pointSkippedInactiveBindings = 0;
+    std::uint32_t pointOpaqueHardDiscDrawCalls = 0;
     std::uint32_t pointConstantSimpleDrawCalls = 0;
     std::uint32_t pointUnifiedDrawCalls = 0;
+    std::uint32_t pointFastBasicDrawCalls = 0;
+    std::uint64_t pointFastBasicDrawnPoints = 0;
+    std::uint64_t pointSubmittedCount = diagnostics_.pointSubmittedCount;
+    std::uint64_t pointPassSubmittedCount = diagnostics_.pointPassSubmittedCount;
     std::uint32_t pointDepthPrepassSkippedNoXray = 0;
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
-    const bool drawLiveScene = liveSceneRenderingEnabled_;
+    const bool drawLiveScene = SceneImageNeedsRender(imageIndex);
+    if (drawLiveScene) {
+        pointSubmittedCount = 0;
+        pointPassSubmittedCount = 0;
+    }
+    const bool fastBasicPointRenderer =
+        renderState_.pointCloudRendererMode == renderer::pointcloud::PointCloudRendererMode::FastBasic;
+    const VkViewport viewport{
+        0.0F,
+        0.0F,
+        static_cast<float>(swapchainWidth_),
+        static_cast<float>(swapchainHeight_),
+        0.0F,
+        1.0F,
+    };
+    const VkRect2D scissor{{0, 0}, {swapchainWidth_, swapchainHeight_}};
 
     if (drawLiveScene) {
         for (const auto& layer : renderState_.pointCloudLayers) {
@@ -4572,7 +5245,8 @@ void VulkanViewportShell::RecordCommandBuffer(
         }
     }
 
-    std::array<VkClearValue, 5> clearValues{};
+    if (drawLiveScene) {
+    std::array<VkClearValue, 6> clearValues{};
     clearValues[0].color = {
         {
             renderState_.backgroundColor.r,
@@ -4584,6 +5258,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     clearValues[2].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[3].color = {{1.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[4].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
+    clearValues[5].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
 
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderPassInfo.renderPass = renderPass_;
@@ -4595,15 +5270,6 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    const VkViewport viewport{
-        0.0F,
-        0.0F,
-        static_cast<float>(swapchainWidth_),
-        static_cast<float>(swapchainHeight_),
-        0.0F,
-        1.0F,
-    };
-    const VkRect2D scissor{{0, 0}, {swapchainWidth_, swapchainHeight_}};
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
@@ -4615,17 +5281,24 @@ void VulkanViewportShell::RecordCommandBuffer(
             [](const SceneRenderState::PointCloudLayerState& layer) {
                 return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
             });
-    if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
+    if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
+            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            const bool opaqueHardDisc =
+                materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
             if (collectDiagnostics &&
                 !sceneHasActiveXray &&
-                renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style)) {
+                renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style) &&
+                !opaqueHardDisc) {
                 ++pointDepthPrepassSkippedNoXray;
             }
-            if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray)) {
+            if (opaqueHardDisc ||
+                renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray) ||
+                renderState_.eyeDomeLightingEnabled) {
                 if (collectDiagnostics) {
                     ++pointDepthLayerCount;
                 }
+                std::uint32_t recordedDrawPointCount = 0;
                 if (RecordPointCloudLayerDraw(
                     commandBuffer,
                     layer,
@@ -4635,9 +5308,11 @@ void VulkanViewportShell::RecordCommandBuffer(
                     false,
                     frameIndex,
                     imageIndex,
-                    false)) {
+                    false,
+                    &recordedDrawPointCount)) {
                     if (collectDiagnostics) {
                         ++pointDrawCalls;
+                        pointPassSubmittedCount += recordedDrawPointCount;
                     }
                 }
             }
@@ -4648,9 +5323,12 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
+    if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
+                continue;
+            }
             VkPipeline spritePipeline = pointAccumulationPipeline_;
             VkPipeline surfelPipeline = surfelAccumulationPipeline_;
             if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
@@ -4660,6 +5338,7 @@ void VulkanViewportShell::RecordCommandBuffer(
             if (collectDiagnostics) {
                 ++pointAccumulationLayerCount;
             }
+            std::uint32_t recordedDrawPointCount = 0;
             if (RecordPointCloudLayerDraw(
                 commandBuffer,
                 layer,
@@ -4669,9 +5348,12 @@ void VulkanViewportShell::RecordCommandBuffer(
                 false,
                 frameIndex,
                 imageIndex,
-                false)) {
+                false,
+                &recordedDrawPointCount)) {
                 if (collectDiagnostics) {
                     ++pointDrawCalls;
+                    pointSubmittedCount += recordedDrawPointCount;
+                    pointPassSubmittedCount += recordedDrawPointCount;
                     if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
                         ++pointConstantSimpleDrawCalls;
                     } else {
@@ -4781,6 +5463,57 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+    if (drawLiveScene && fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
+        for (const auto& layer : renderState_.pointCloudLayers) {
+            std::uint32_t recordedDrawPointCount = 0;
+            if (RecordPointCloudLayerDraw(
+                commandBuffer,
+                layer,
+                false,
+                pointFastBasicPipeline_,
+                VK_NULL_HANDLE,
+                false,
+                frameIndex,
+                imageIndex,
+                false,
+                &recordedDrawPointCount)) {
+                if (collectDiagnostics) {
+                    ++pointDrawCalls;
+                    ++pointFastBasicDrawCalls;
+                    pointFastBasicDrawnPoints += recordedDrawPointCount;
+                    pointSubmittedCount += recordedDrawPointCount;
+                    pointPassSubmittedCount += recordedDrawPointCount;
+                }
+            }
+        }
+    } else if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
+        for (const auto& layer : renderState_.pointCloudLayers) {
+            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            if (materialVariant != renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
+                continue;
+            }
+            std::uint32_t recordedDrawPointCount = 0;
+            if (RecordPointCloudLayerDraw(
+                commandBuffer,
+                layer,
+                false,
+                pointOpaqueHardDiscPipeline_,
+                surfelOpaqueHardDiscPipeline_,
+                false,
+                frameIndex,
+                imageIndex,
+                false,
+                &recordedDrawPointCount)) {
+                if (collectDiagnostics) {
+                    ++pointDrawCalls;
+                    ++pointOpaqueHardDiscDrawCalls;
+                    pointSubmittedCount += recordedDrawPointCount;
+                    pointPassSubmittedCount += recordedDrawPointCount;
+                }
+            }
+        }
+    }
+
     if (drawLiveScene &&
         frameIndex < kFramesInFlight &&
         highQualityGaussianScene_.descriptorSets[frameIndex] != VK_NULL_HANDLE &&
@@ -4817,6 +5550,69 @@ void VulkanViewportShell::RecordCommandBuffer(
         vkCmdDraw(commandBuffer, 6, highQualityGaussianScene_.splatCount, 0, 0);
     }
 
+    vkCmdEndRenderPass(commandBuffer);
+        if (imageIndex < sceneImageRevisions_.size()) {
+            sceneImageRevisions_[imageIndex] = sceneRevision_;
+        }
+    }
+
+    const bool presentScene =
+        liveSceneRenderingEnabled_ &&
+        imageIndex < sceneImageRevisions_.size() &&
+        sceneImageRevisions_[imageIndex] == sceneRevision_;
+
+    std::array<VkClearValue, 1> presentClearValues{};
+    presentClearValues[0].color = {
+        {
+            renderState_.backgroundColor.r,
+            renderState_.backgroundColor.g,
+            renderState_.backgroundColor.b,
+            renderState_.backgroundColor.a,
+        }};
+
+    VkRenderPassBeginInfo presentPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    presentPassInfo.renderPass = presentRenderPass_;
+    presentPassInfo.framebuffer = presentFramebuffers_[imageIndex];
+    presentPassInfo.renderArea.offset = {0, 0};
+    presentPassInfo.renderArea.extent = {swapchainWidth_, swapchainHeight_};
+    presentPassInfo.clearValueCount = static_cast<std::uint32_t>(presentClearValues.size());
+    presentPassInfo.pClearValues = presentClearValues.data();
+
+    vkCmdBeginRenderPass(commandBuffer, &presentPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    if (presentScene &&
+        imageIndex < postProcessDescriptorSets_.size() &&
+        postProcessDescriptorSets_[imageIndex] != VK_NULL_HANDLE) {
+        VkDescriptorSet descriptorSet = postProcessDescriptorSets_[imageIndex];
+        PostProcessPushConstants pushConstants;
+        pushConstants.edl = glm::vec4{
+            renderState_.eyeDomeLightingEnabled ? 1.0F : 0.0F,
+            24.0F,
+            0.35F,
+            1.0F,
+        };
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, postProcessPipeline_);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            postProcessPipelineLayout_,
+            0,
+            1,
+            &descriptorSet,
+            0,
+            nullptr);
+        vkCmdPushConstants(
+            commandBuffer,
+            postProcessPipelineLayout_,
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(PostProcessPushConstants),
+            &pushConstants);
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    }
+
     if (ImGui::GetCurrentContext() != nullptr) {
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
     }
@@ -4830,9 +5626,16 @@ void VulkanViewportShell::RecordCommandBuffer(
     diagnostics_.pointAccumulationLayerCount = pointAccumulationLayerCount;
     diagnostics_.pointStyleUploadCount = pointStyleUploadCount;
     diagnostics_.pointSkippedInactiveBindings = pointSkippedInactiveBindings;
+    diagnostics_.pointOpaqueHardDiscDrawCalls = pointOpaqueHardDiscDrawCalls;
     diagnostics_.pointConstantSimpleDrawCalls = pointConstantSimpleDrawCalls;
     diagnostics_.pointUnifiedDrawCalls = pointUnifiedDrawCalls;
+    diagnostics_.pointFastBasicDrawCalls = pointFastBasicDrawCalls;
+    diagnostics_.pointFastBasicDrawnPoints = pointFastBasicDrawnPoints;
+    diagnostics_.pointSubmittedCount = pointSubmittedCount;
+    diagnostics_.pointPassSubmittedCount = pointPassSubmittedCount;
     diagnostics_.pointDepthPrepassSkippedNoXray = pointDepthPrepassSkippedNoXray;
+    diagnostics_.sceneRenderedThisFrame = drawLiveScene;
+    diagnostics_.sceneCacheActive = sceneCachingEnabled_;
     diagnostics_.pointCommandRecordMs =
         collectDiagnostics ? std::chrono::duration<double, std::milli>(recordEnd - recordStart).count() : 0.0;
 }
@@ -4856,7 +5659,7 @@ void VulkanViewportShell::UploadFrameUniforms(
     uniforms.projection = renderState_.projection;
     uniforms.cameraPosition = glm::vec4{renderState_.cameraPosition, 0.0F};
     uniforms.depthParameters = glm::vec4{
-        0.0F,
+        std::max(0.0F, renderState_.flowTimeSeconds),
         renderState_.nearPlane,
         renderState_.farPlane,
         0.0F,

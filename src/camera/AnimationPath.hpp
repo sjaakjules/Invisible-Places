@@ -5,12 +5,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
 namespace invisible_places::camera {
 
 struct AnimationPathKey {
+    std::string id;
     std::array<float, 3> cameraPosition{0.0F, 0.0F, 0.0F};
     std::array<float, 3> focusPoint{0.0F, 0.0F, 0.0F};
     float fovDegrees = 60.0F;
@@ -18,6 +20,8 @@ struct AnimationPathKey {
     float farPlane = 1000.0F;
     std::uint32_t durationFrames = 90;
     std::string sourceShotName;
+    std::string linkedCameraId;
+    std::string linkedCameraName;
 };
 
 struct AnimationExportSettings {
@@ -33,6 +37,7 @@ struct AnimationPath {
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     std::vector<AnimationPathKey> keys;
+    std::vector<std::filesystem::path> associatedLayerPaths;
     bool depthOfFieldEnabled = false;
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
@@ -46,11 +51,37 @@ struct AnimationPathEvaluation {
     float focusDistance = 1.0F;
 };
 
+enum class AnimationPathMotionTarget {
+    Camera,
+    Target
+};
+
+struct AnimationPathMotionStats {
+    float durationSeconds = 0.0F;
+    float cameraDistance = 0.0F;
+    float targetDistance = 0.0F;
+    float averageCameraSpeed = 0.0F;
+    float averageTargetSpeed = 0.0F;
+    float currentCameraSpeed = 0.0F;
+    float currentTargetSpeed = 0.0F;
+};
+
 AnimationPath BuildAnimationPathFromCameraShots(
     const std::string& name,
     const std::vector<CameraShot>& orderedShots,
     std::uint32_t durationFrames,
     float apertureFStops = 8.0F);
+
+[[nodiscard]] float AnimationPathDurationSeconds(const AnimationPath& path);
+[[nodiscard]] AnimationPathMotionStats MeasureAnimationPathMotion(
+    const AnimationPath& path,
+    float normalizedTime,
+    std::uint32_t sampleCount = 240U);
+[[nodiscard]] std::uint32_t AnimationDurationFramesForAverageSpeed(
+    const AnimationPath& path,
+    AnimationPathMotionTarget target,
+    float worldUnitsPerSecond,
+    std::uint32_t sampleCount = 240U);
 
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,

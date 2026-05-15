@@ -222,6 +222,59 @@ constexpr std::array<std::uint32_t, kColormapSampleCount> kTurboColormap{{
     0x920B01U, 0x8E0A01U, 0x8B0902U, 0x880802U, 0x850702U, 0x810602U, 0x7E0502U, 0x7A0403U
 }};
 
+struct ColorStop {
+    float position;
+    std::array<float, 3> color;
+};
+
+constexpr std::array<ColorStop, 8U> kTopographicColormap{{
+    {0.00F, {0.03F, 0.12F, 0.28F}},
+    {0.16F, {0.10F, 0.36F, 0.58F}},
+    {0.28F, {0.50F, 0.76F, 0.69F}},
+    {0.34F, {0.78F, 0.70F, 0.45F}},
+    {0.48F, {0.28F, 0.55F, 0.24F}},
+    {0.64F, {0.58F, 0.50F, 0.30F}},
+    {0.80F, {0.50F, 0.42F, 0.38F}},
+    {1.00F, {0.96F, 0.95F, 0.90F}},
+}};
+
+constexpr std::array<ColorStop, 7U> kLandSurfaceColormap{{
+    {0.00F, {0.10F, 0.13F, 0.06F}},
+    {0.18F, {0.23F, 0.31F, 0.12F}},
+    {0.38F, {0.38F, 0.52F, 0.20F}},
+    {0.58F, {0.65F, 0.58F, 0.32F}},
+    {0.76F, {0.72F, 0.45F, 0.25F}},
+    {0.90F, {0.55F, 0.50F, 0.45F}},
+    {1.00F, {0.86F, 0.82F, 0.72F}},
+}};
+
+constexpr std::array<ColorStop, 6U> kExponentialFireColormap{{
+    {0.00F, {0.00F, 0.00F, 0.00F}},
+    {0.30F, {0.25F, 0.00F, 0.06F}},
+    {0.55F, {0.85F, 0.10F, 0.02F}},
+    {0.76F, {1.00F, 0.48F, 0.00F}},
+    {0.92F, {1.00F, 0.92F, 0.20F}},
+    {1.00F, {1.00F, 1.00F, 0.92F}},
+}};
+
+constexpr std::array<ColorStop, 5U> kExponentialIceColormap{{
+    {0.00F, {0.00F, 0.02F, 0.08F}},
+    {0.35F, {0.02F, 0.14F, 0.36F}},
+    {0.60F, {0.04F, 0.48F, 0.78F}},
+    {0.82F, {0.38F, 0.86F, 0.95F}},
+    {1.00F, {0.96F, 1.00F, 1.00F}},
+}};
+
+constexpr std::array<ColorStop, 7U> kHighContrastColormap{{
+    {0.00F, {0.00F, 0.00F, 0.00F}},
+    {0.12F, {0.10F, 0.00F, 0.32F}},
+    {0.32F, {0.00F, 0.12F, 0.85F}},
+    {0.50F, {0.00F, 0.82F, 0.95F}},
+    {0.68F, {0.98F, 0.92F, 0.00F}},
+    {0.84F, {1.00F, 0.26F, 0.00F}},
+    {1.00F, {1.00F, 1.00F, 1.00F}},
+}};
+
 std::array<float, 3> UnpackRgb(std::uint32_t packedRgb) {
     return {
         static_cast<float>((packedRgb >> 16U) & 0xFFU) / 255.0F,
@@ -246,6 +299,33 @@ std::array<float, 3> SampleLut(const std::array<std::uint32_t, kColormapSampleCo
     return LerpColor(UnpackRgb(samples[lowerIndex]), UnpackRgb(samples[upperIndex]), mixAmount);
 }
 
+template <std::size_t StopCount>
+std::array<float, 3> SampleStops(const std::array<ColorStop, StopCount>& stops, float value) {
+    const float clamped = std::clamp(value, 0.0F, 1.0F);
+    if (clamped <= stops.front().position) {
+        return stops.front().color;
+    }
+
+    for (std::size_t i = 1U; i < StopCount; ++i) {
+        if (clamped <= stops[i].position) {
+            const float range = std::max(stops[i].position - stops[i - 1U].position, 1.0e-6F);
+            const float mixAmount = (clamped - stops[i - 1U].position) / range;
+            return LerpColor(stops[i - 1U].color, stops[i].color, mixAmount);
+        }
+    }
+
+    return stops.back().color;
+}
+
+float ExponentialCurve(float value, float exponent) {
+    const float clamped = std::clamp(value, 0.0F, 1.0F);
+    const float denominator = std::exp(exponent) - 1.0F;
+    if (denominator <= 1.0e-6F) {
+        return clamped;
+    }
+    return (std::exp(exponent * clamped) - 1.0F) / denominator;
+}
+
 }  // namespace
 
 std::array<float, 3> SampleColormap(PointCloudColormapId colormap, float value) {
@@ -260,6 +340,16 @@ std::array<float, 3> SampleColormap(PointCloudColormapId colormap, float value) 
             return SampleLut(kCividisColormap, value);
         case PointCloudColormapId::Turbo:
             return SampleLut(kTurboColormap, value);
+        case PointCloudColormapId::Topographic:
+            return SampleStops(kTopographicColormap, value);
+        case PointCloudColormapId::LandSurface:
+            return SampleStops(kLandSurfaceColormap, value);
+        case PointCloudColormapId::ExponentialFire:
+            return SampleStops(kExponentialFireColormap, ExponentialCurve(value, 3.0F));
+        case PointCloudColormapId::ExponentialIce:
+            return SampleStops(kExponentialIceColormap, ExponentialCurve(value, 2.7F));
+        case PointCloudColormapId::HighContrast:
+            return SampleStops(kHighContrastColormap, value);
         case PointCloudColormapId::Viridis:
             return SampleLut(kViridisColormap, value);
     }

@@ -9,6 +9,8 @@ layout(location = 3) in float inEmissive;
 layout(location = 4) in float inXray;
 layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
+layout(location = 7) flat in uint inPointIndex;
+layout(location = 8) in float inSurfaceAngleMask;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
@@ -48,7 +50,13 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
     vec4 colorize;
+    uvec4 stylisationControl;
+    vec4 stylisationParams0;
+    vec4 stylisationParams1;
+    vec4 stylisationParams2;
 } styleData;
+
+#include "pointcloud_stylisation.glsl"
 
 layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInput sceneDepthInput;
 
@@ -185,12 +193,15 @@ void main() {
     const float radius = sqrt(radiusSquared);
     const float falloff = ResolveFalloff(radius, radiusSquared);
     const float opacity = clamp(inOpacity, 0.0, 1.0);
-    const float alpha = clamp(opacity * falloff * ResolveDepthFadeAlpha(inDepthFade), 0.0, AlphaClampMax());
+    const float stylisedCoverage = PointStylisationCoverage(centered, radius, radiusSquared, inPointIndex);
+    const float alpha =
+        clamp(opacity * falloff * stylisedCoverage * ResolveDepthFadeAlpha(inDepthFade), 0.0, AlphaClampMax());
     if (alpha <= 1e-5) {
         discard;
     }
 
-    const vec3 baseColor = ApplyColorize(ResolveBaseColor());
+    const vec3 baseColor =
+        PointStylisationColor(ApplyColorize(ResolveBaseColor()), centered, radius, inPointIndex, inSurfaceAngleMask);
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;
     outEmission = vec4(0.0);

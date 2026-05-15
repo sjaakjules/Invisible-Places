@@ -9,6 +9,7 @@
 #include "io/PlyHeader.hpp"
 #include "io/TransformMatrix.hpp"
 #include "output/ExrWriter.hpp"
+#include "output/EyeDomeLighting.hpp"
 #include "output/OfflinePointRenderer.hpp"
 #include "output/RenderPreset.hpp"
 #include "output/VideoWriter.hpp"
@@ -20,9 +21,12 @@
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
+#include "water/WaterFlow.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+
+#include <Imath/half.h>
 
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -681,6 +685,31 @@ TEST_CASE("Orbit camera can move its pivot without changing the current view", "
     CHECK(camera.OrbitCenter().z == Catch::Approx(pivot.z));
 }
 
+TEST_CASE("Orbit camera keeps repeated zoom-out wheel steps controlled", "[camera][zoom]") {
+    invisible_places::io::Bounds3f bounds;
+    bounds.Expand({-1.0F, -1.0F, -1.0F});
+    bounds.Expand({1.0F, 1.0F, 1.0F});
+
+    invisible_places::camera::OrbitCamera camera;
+    camera.FrameBounds(bounds, 1.0F);
+
+    std::vector<float> zoomOutSteps;
+    for (int index = 0; index < 10; ++index) {
+        const float beforeDistance = camera.Distance();
+        camera.Dolly(-1.0F);
+        const float afterDistance = camera.Distance();
+        zoomOutSteps.push_back(afterDistance - beforeDistance);
+    }
+
+    REQUIRE(zoomOutSteps.size() == 10);
+    CHECK(zoomOutSteps.front() > 0.0F);
+    CHECK(zoomOutSteps.back() < zoomOutSteps.front() * 2.0F);
+
+    const float zoomedOutDistance = camera.Distance();
+    camera.Dolly(1.0F);
+    CHECK(camera.Distance() < zoomedOutDistance);
+}
+
 TEST_CASE("Point preview LOD resolver only applies automatic LOD to camera motion", "[budget][lod]") {
     using invisible_places::renderer::pointcloud::MakePointBudgetState;
     using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
@@ -778,7 +807,7 @@ TEST_CASE("Scalar field binding evaluation matches the mapped style rules", "[st
     CHECK(invisible_places::style::EvaluateScalarBinding(mappedBinding, 15.0F, &stats) == Catch::Approx(2.0F));
 }
 
-TEST_CASE("Point-cloud colormaps sample the Matplotlib listed tables", "[style][colormap]") {
+TEST_CASE("Point-cloud colormaps sample listed and procedural tables", "[style][colormap]") {
     using invisible_places::renderer::pointcloud::PointCloudColormapId;
     using invisible_places::renderer::pointcloud::SampleColormap;
 
@@ -797,6 +826,13 @@ TEST_CASE("Point-cloud colormaps sample the Matplotlib listed tables", "[style][
     checkColor(SampleColormap(PointCloudColormapId::Magma, 128.0F / 255.0F), {0.716387F, 0.214982F, 0.475290F});
     checkColor(SampleColormap(PointCloudColormapId::Cividis, 1.0F), {0.995737F, 0.909344F, 0.217772F});
     checkColor(SampleColormap(PointCloudColormapId::Turbo, 128.0F / 255.0F), {0.643620F, 0.989990F, 0.233560F});
+    checkColor(SampleColormap(PointCloudColormapId::Topographic, 0.0F), {0.03F, 0.12F, 0.28F});
+    checkColor(SampleColormap(PointCloudColormapId::Topographic, 1.0F), {0.96F, 0.95F, 0.90F});
+    checkColor(SampleColormap(PointCloudColormapId::LandSurface, 1.0F), {0.86F, 0.82F, 0.72F});
+    checkColor(SampleColormap(PointCloudColormapId::ExponentialFire, 0.0F), {0.0F, 0.0F, 0.0F});
+    checkColor(SampleColormap(PointCloudColormapId::ExponentialFire, 1.0F), {1.0F, 1.0F, 0.92F});
+    checkColor(SampleColormap(PointCloudColormapId::ExponentialIce, 1.0F), {0.96F, 1.0F, 1.0F});
+    checkColor(SampleColormap(PointCloudColormapId::HighContrast, 0.5F), {0.0F, 0.82F, 0.95F});
 }
 
 TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[serialization][project]") {
@@ -808,11 +844,16 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.selectedLayerPath = "Data/Site2 -5mm.ply";
     document.lastAnimationPath = "Saved/animations/Roundtrip.ipanim.json";
     document.backgroundColor = {0.02F, 0.04F, 0.08F, 1.0F};
+    document.eyeDomeLightingEnabled = true;
+    document.constantUpdateView = true;
+    document.liveVisualEffects = true;
     document.sidePanelPinned = true;
     document.autoLowerGsplatQualityWhileNavigating = false;
     document.pointCloudPreviewLodMode =
         invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod;
     document.interactivePointCap = 12'345'678;
+    document.pointCloudRendererMode =
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::FastBasic;
     document.renderJobSettings.outputDirectory = "Saved/renders/Roundtrip";
     document.renderJobSettings.width = 3840;
     document.renderJobSettings.height = 2160;
@@ -822,8 +863,27 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.renderJobSettings.endFrame = 42;
     document.renderJobSettings.fromShotIndex = 0;
     document.renderJobSettings.toShotIndex = 1;
+    document.waterBakeSettings = invisible_places::water::DefaultWaterBakeSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    document.waterBakeSettings.pathLength = 4.25F;
+    invisible_places::water::WaterEmitter waterEmitter;
+    waterEmitter.id = 17;
+    waterEmitter.name = "Pool seep";
+    waterEmitter.position = {1.0F, 2.0F, 3.0F};
+    waterEmitter.radius = 0.12F;
+    waterEmitter.strength = 1.4F;
+    waterEmitter.speed = 0.75F;
+    waterEmitter.scope = invisible_places::water::WaterScaleMode::Detail;
+    waterEmitter.origin = invisible_places::water::WaterEmitterOrigin::Manual;
+    waterEmitter.status = invisible_places::water::WaterEmitterStatus::Accepted;
+    waterEmitter.confidence = 0.92F;
+    document.waterEmitters.push_back(waterEmitter);
     document.cameraPathShotIndices = {0, 0};
     document.cameraPathDurationFrames = 144;
+    document.hasSavedAnimationRegistry = true;
+    document.savedAnimations.push_back(
+        {.filePath = "Saved/animations/Roundtrip.ipanim.json",
+         .associatedLayerPaths = {"Data/Site2 -5mm.ply"}});
     invisible_places::camera::CameraState currentCamera;
     currentCamera.position = {10.0F, 20.0F, 30.0F};
     currentCamera.target = {4.0F, 5.0F, 6.0F};
@@ -836,6 +896,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.cameraState = currentCamera;
 
     invisible_places::camera::CameraShot shot;
+    shot.id = "camera_entry";
     shot.name = "Entry";
     shot.durationFrames = 120;
     shot.state.position = {1.0F, 2.0F, 3.0F};
@@ -843,6 +904,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     shot.state.orbitCenter = {7.0F, 8.0F, 9.0F};
     shot.state.hasOrbitCenter = true;
     shot.state.orientation = {0.0F, 0.0F, 0.0F, 1.0F};
+    shot.associatedLayerPaths = {"Data/Site2 -5mm.ply"};
     document.cameraShots.push_back(shot);
 
     invisible_places::serialization::ProjectLayerDocument layer;
@@ -858,9 +920,24 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         invisible_places::renderer::pointcloud::PointCloudDepthContribution::Always;
     pointStyle.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
     pointStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
-    pointStyle.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo;
+    pointStyle.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::HighContrast;
     pointStyle.colorizeColor = {0.2F, 0.6F, 1.0F};
     pointStyle.colorizeAmount = 0.35F;
+    pointStyle.stylisationMode =
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::BrushParticles;
+    pointStyle.nprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset::Cartoon;
+    pointStyle.stylisationStrength = 0.8F;
+    pointStyle.stylisationColorLevels = 4.0F;
+    pointStyle.stylisationInkStrength = 0.55F;
+    pointStyle.stylisationPaperGrain = 0.45F;
+    pointStyle.stylisationPigmentBleed = 0.6F;
+    pointStyle.brushAspect = 3.0F;
+    pointStyle.strokeJitter = 0.25F;
+    pointStyle.hatchStrength = 0.2F;
+    pointStyle.strokeOpacityVariance = 0.4F;
+    pointStyle.pigmentVariation = 0.65F;
+    pointStyle.pigmentAnimationSpeed = 1.25F;
+    pointStyle.granulationAngleStrength = 0.75F;
     pointStyle.exposure = 2.25F;
     pointStyle.innerRadius = 0.35F;
     pointStyle.gaussianSharpness = 5.5F;
@@ -873,6 +950,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.densityClamp = 96.0F;
     pointStyle.depthAlphaThreshold = 0.42F;
     pointStyle.solidCenters = false;
+    pointStyle.flowAnimation = true;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.pointSize,
         2,
@@ -918,8 +996,23 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"depth_contribution\"") != std::string::npos);
         CHECK(savedJson.find("\"active\"") != std::string::npos);
         CHECK(savedJson.find("\"solid_centers\"") != std::string::npos);
+    CHECK(savedJson.find("\"stylisation_mode\"") != std::string::npos);
+    CHECK(savedJson.find("\"pigment_animation_speed\"") != std::string::npos);
+    CHECK(savedJson.find("\"brush_particles\"") != std::string::npos);
+        CHECK(savedJson.find("\"npr_preset\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_emitters\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_bake_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"eye_dome_lighting_enabled\"") != std::string::npos);
+        CHECK(savedJson.find("\"constant_update_view\"") != std::string::npos);
+        CHECK(savedJson.find("\"live_visual_effects\"") != std::string::npos);
+        CHECK(savedJson.find("\"point_cloud_renderer_mode\"") != std::string::npos);
         CHECK(savedJson.find("\"point_visuals\"") != std::string::npos);
         CHECK(savedJson.find("\"selected_point_visual\"") != std::string::npos);
+        CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
+        CHECK(savedJson.find("\"saved_animations\"") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 17") != std::string::npos);
+        CHECK(savedJson.find("\"id\": \"camera_entry\"") != std::string::npos);
+        CHECK(savedJson.find("\"duration_frames\": 120") == std::string::npos);
     }
 
     const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
@@ -933,6 +1026,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         loadedDocument->pointCloudPreviewLodMode ==
         invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod);
     CHECK(loadedDocument->interactivePointCap == 12'345'678);
+    CHECK(
+        loadedDocument->pointCloudRendererMode ==
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::FastBasic);
     CHECK(loadedDocument->renderJobSettings.outputDirectory == "Saved/renders/Roundtrip");
     CHECK(loadedDocument->renderJobSettings.width == 3840);
     CHECK(loadedDocument->renderJobSettings.height == 2160);
@@ -941,9 +1037,30 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->renderJobSettings.startFrame == 10);
     CHECK(loadedDocument->renderJobSettings.endFrame == 42);
     CHECK(loadedDocument->renderJobSettings.toShotIndex == 1);
+    CHECK(loadedDocument->waterBakeSettings.scaleMode == invisible_places::water::WaterScaleMode::Detail);
+    CHECK(loadedDocument->waterBakeSettings.pathLength == Catch::Approx(4.25F));
+    REQUIRE(loadedDocument->waterEmitters.size() == 1);
+    CHECK(loadedDocument->waterEmitters[0].id == 17U);
+    CHECK(loadedDocument->waterEmitters[0].name == "Pool seep");
+    CHECK(loadedDocument->waterEmitters[0].position.z == Catch::Approx(3.0F));
+    CHECK(loadedDocument->waterEmitters[0].radius == Catch::Approx(0.12F));
+    CHECK(loadedDocument->waterEmitters[0].strength == Catch::Approx(1.4F));
+    CHECK(loadedDocument->waterEmitters[0].speed == Catch::Approx(0.75F));
+    CHECK(loadedDocument->waterEmitters[0].scope == invisible_places::water::WaterScaleMode::Detail);
+    CHECK(loadedDocument->waterEmitters[0].origin == invisible_places::water::WaterEmitterOrigin::Manual);
+    CHECK(loadedDocument->waterEmitters[0].status == invisible_places::water::WaterEmitterStatus::Accepted);
+    CHECK(loadedDocument->waterEmitters[0].confidence == Catch::Approx(0.92F));
     CHECK(loadedDocument->cameraPathShotIndices == std::vector<std::size_t>{0, 0});
     CHECK(loadedDocument->cameraPathDurationFrames == 144);
+    REQUIRE(loadedDocument->hasSavedAnimationRegistry);
+    REQUIRE(loadedDocument->savedAnimations.size() == 1);
+    CHECK(loadedDocument->savedAnimations[0].filePath == std::filesystem::path{"Saved/animations/Roundtrip.ipanim.json"});
+    REQUIRE(loadedDocument->savedAnimations[0].associatedLayerPaths.size() == 1);
+    CHECK(loadedDocument->savedAnimations[0].associatedLayerPaths[0] == std::filesystem::path{"Data/Site2 -5mm.ply"});
     CHECK(loadedDocument->backgroundColor[2] == Catch::Approx(0.08F));
+    CHECK(loadedDocument->eyeDomeLightingEnabled);
+    CHECK(loadedDocument->constantUpdateView);
+    CHECK(loadedDocument->liveVisualEffects);
     CHECK(loadedDocument->selectedLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
     CHECK(loadedDocument->lastAnimationPath == std::filesystem::path{"Saved/animations/Roundtrip.ipanim.json"});
     REQUIRE(loadedDocument->cameraState.has_value());
@@ -954,9 +1071,11 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->cameraState->orbitCenter[0] == Catch::Approx(7.0F));
     CHECK(loadedDocument->cameraState->fovDegrees == Catch::Approx(42.0F));
     REQUIRE(loadedDocument->cameraShots.size() == 1);
+    CHECK(loadedDocument->cameraShots[0].id == "camera_entry");
     CHECK(loadedDocument->cameraShots[0].name == "Entry");
-    CHECK(loadedDocument->cameraShots[0].durationFrames == 120);
     CHECK(loadedDocument->cameraShots[0].state.position[2] == Catch::Approx(3.0F));
+    REQUIRE(loadedDocument->cameraShots[0].associatedLayerPaths.size() == 1);
+    CHECK(loadedDocument->cameraShots[0].associatedLayerPaths[0] == std::filesystem::path{"Data/Site2 -5mm.ply"});
     REQUIRE(loadedDocument->cameraShots[0].state.hasOrbitCenter);
     CHECK(loadedDocument->cameraShots[0].state.orbitCenter[0] == Catch::Approx(7.0F));
     CHECK(loadedDocument->cameraShots[0].state.orbitCenter[1] == Catch::Approx(8.0F));
@@ -981,11 +1100,29 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian);
     CHECK(
         loadedLayer.pointStyle->colormap ==
-        invisible_places::renderer::pointcloud::PointCloudColormapId::Turbo);
+        invisible_places::renderer::pointcloud::PointCloudColormapId::HighContrast);
     CHECK(loadedLayer.pointStyle->colorizeColor[0] == Catch::Approx(0.2F));
     CHECK(loadedLayer.pointStyle->colorizeColor[1] == Catch::Approx(0.6F));
     CHECK(loadedLayer.pointStyle->colorizeColor[2] == Catch::Approx(1.0F));
     CHECK(loadedLayer.pointStyle->colorizeAmount == Catch::Approx(0.35F));
+    CHECK(
+        loadedLayer.pointStyle->stylisationMode ==
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::BrushParticles);
+    CHECK(
+        loadedLayer.pointStyle->nprPreset ==
+        invisible_places::renderer::pointcloud::PointCloudNprPreset::Cartoon);
+    CHECK(loadedLayer.pointStyle->stylisationStrength == Catch::Approx(0.8F));
+    CHECK(loadedLayer.pointStyle->stylisationColorLevels == Catch::Approx(4.0F));
+    CHECK(loadedLayer.pointStyle->stylisationInkStrength == Catch::Approx(0.55F));
+    CHECK(loadedLayer.pointStyle->stylisationPaperGrain == Catch::Approx(0.45F));
+    CHECK(loadedLayer.pointStyle->stylisationPigmentBleed == Catch::Approx(0.6F));
+    CHECK(loadedLayer.pointStyle->brushAspect == Catch::Approx(3.0F));
+    CHECK(loadedLayer.pointStyle->strokeJitter == Catch::Approx(0.25F));
+    CHECK(loadedLayer.pointStyle->hatchStrength == Catch::Approx(0.2F));
+    CHECK(loadedLayer.pointStyle->strokeOpacityVariance == Catch::Approx(0.4F));
+    CHECK(loadedLayer.pointStyle->pigmentVariation == Catch::Approx(0.65F));
+    CHECK(loadedLayer.pointStyle->pigmentAnimationSpeed == Catch::Approx(1.25F));
+    CHECK(loadedLayer.pointStyle->granulationAngleStrength == Catch::Approx(0.75F));
     CHECK(loadedLayer.pointStyle->exposure == Catch::Approx(2.25F));
     CHECK(loadedLayer.pointStyle->innerRadius == Catch::Approx(0.35F));
     CHECK(loadedLayer.pointStyle->gaussianSharpness == Catch::Approx(5.5F));
@@ -998,6 +1135,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->densityClamp == Catch::Approx(96.0F));
     CHECK(loadedLayer.pointStyle->depthAlphaThreshold == Catch::Approx(0.42F));
     CHECK(!loadedLayer.pointStyle->solidCenters);
+    CHECK(loadedLayer.pointStyle->flowAnimation);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldSlot == 2);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldName == "Height");
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.inputMin == Catch::Approx(-2.0F));
@@ -1015,6 +1153,66 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         loadedLayer.pointVisuals[1].style.colorMode ==
         invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor);
     CHECK(loadedLayer.pointVisuals[1].style.solidColor[2] == Catch::Approx(0.3F));
+
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Project document defaults Fast Basic renderer mode for older projects", "[serialization][project]") {
+    const auto outputPath =
+        std::filesystem::temp_directory_path() / "invisible_places_project_legacy_renderer_defaults.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 16,
+  "project_name": "Legacy",
+  "background_color": [0.0, 0.0, 0.0, 1.0],
+  "layers": []
+})";
+    }
+
+    std::string errorMessage;
+    const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
+    REQUIRE(loadedDocument.has_value());
+    CHECK(
+        loadedDocument->pointCloudRendererMode ==
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty);
+
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Legacy project files load camera and animation associations as unregistered", "[serialization][project]") {
+    const auto outputPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_project_associations.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 12,
+  "project_name": "Legacy",
+  "camera_shots": [
+    {
+      "name": "Legacy Shot",
+      "duration_frames": 90,
+      "camera": {
+        "position": [0, 0, 1],
+        "orientation": [0, 0, 0, 1],
+        "target": [0, 0, 0],
+        "fov_degrees": 60,
+        "near_plane": 0.01,
+        "far_plane": 1000
+      }
+    }
+  ]
+})";
+    }
+
+    std::string errorMessage;
+    const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(outputPath, &errorMessage);
+    REQUIRE(loadedDocument.has_value());
+    CHECK_FALSE(loadedDocument->hasSavedAnimationRegistry);
+    REQUIRE(loadedDocument->cameraShots.size() == 1);
+    CHECK(!loadedDocument->cameraShots[0].id.empty());
+    CHECK(loadedDocument->cameraShots[0].durationFrames == 90);
+    CHECK(loadedDocument->cameraShots[0].associatedLayerPaths.empty());
 
     std::filesystem::remove(outputPath);
 }
@@ -1044,7 +1242,65 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
     CHECK(preset->style.pointSize.active);
     CHECK(preset->style.opacity.active);
     CHECK(preset->style.emissiveStrength.active);
+    CHECK(
+        preset->style.stylisationMode ==
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::Off);
+    CHECK(
+        preset->style.nprPreset ==
+        invisible_places::renderer::pointcloud::PointCloudNprPreset::Watercolor);
+    CHECK(preset->style.stylisationStrength == Catch::Approx(1.0F));
+    CHECK(preset->style.pigmentVariation == Catch::Approx(0.0F));
+    CHECK(preset->style.pigmentAnimationSpeed == Catch::Approx(0.0F));
+    CHECK(preset->style.granulationAngleStrength == Catch::Approx(0.0F));
     CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
+
+    std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Point cloud style presets round-trip stylisation controls", "[serialization][point-style]") {
+    invisible_places::serialization::PointCloudStylePresetDocument document;
+    document.presetName = "Ink Brushes";
+    document.style.stylisationMode =
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::NprStylisation;
+    document.style.nprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset::Cartoon;
+    document.style.stylisationStrength = 0.7F;
+    document.style.stylisationColorLevels = 3.0F;
+    document.style.stylisationInkStrength = 0.9F;
+    document.style.stylisationPaperGrain = 0.1F;
+    document.style.stylisationPigmentBleed = 0.2F;
+    document.style.brushAspect = 4.0F;
+    document.style.strokeJitter = 0.3F;
+    document.style.hatchStrength = 0.6F;
+    document.style.strokeOpacityVariance = 0.5F;
+    document.style.pigmentVariation = 0.45F;
+    document.style.pigmentAnimationSpeed = 1.5F;
+    document.style.granulationAngleStrength = 0.7F;
+
+    const auto presetPath =
+        std::filesystem::temp_directory_path() / "invisible_places_stylisation_style.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SavePointCloudStylePreset(document, presetPath, &errorMessage));
+    const auto loaded = invisible_places::serialization::LoadPointCloudStylePreset(presetPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->presetName == "Ink Brushes");
+    CHECK(
+        loaded->style.stylisationMode ==
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::NprStylisation);
+    CHECK(
+        loaded->style.nprPreset ==
+        invisible_places::renderer::pointcloud::PointCloudNprPreset::Cartoon);
+    CHECK(loaded->style.stylisationStrength == Catch::Approx(0.7F));
+    CHECK(loaded->style.stylisationColorLevels == Catch::Approx(3.0F));
+    CHECK(loaded->style.stylisationInkStrength == Catch::Approx(0.9F));
+    CHECK(loaded->style.stylisationPaperGrain == Catch::Approx(0.1F));
+    CHECK(loaded->style.stylisationPigmentBleed == Catch::Approx(0.2F));
+    CHECK(loaded->style.brushAspect == Catch::Approx(4.0F));
+    CHECK(loaded->style.strokeJitter == Catch::Approx(0.3F));
+    CHECK(loaded->style.hatchStrength == Catch::Approx(0.6F));
+    CHECK(loaded->style.strokeOpacityVariance == Catch::Approx(0.5F));
+    CHECK(loaded->style.pigmentVariation == Catch::Approx(0.45F));
+    CHECK(loaded->style.pigmentAnimationSpeed == Catch::Approx(1.5F));
+    CHECK(loaded->style.granulationAngleStrength == Catch::Approx(0.7F));
 
     std::filesystem::remove(presetPath);
 }
@@ -1071,6 +1327,137 @@ TEST_CASE("Point cloud style parses camera-facing world sprite geometry", "[seri
     CHECK(preset->style.solidCenters);
 
     std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][pointcloud]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-support.ply";
+    cloud.layerName = "synthetic-water-support";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    for (int index = 0; index < 24; ++index) {
+        const invisible_places::io::Float3 position{
+            0.0F,
+            0.0F,
+            1.0F - static_cast<float>(index) * 0.04F};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({1.0F, 0.0F, 0.0F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    }
+    cloud.focusPoint = cloud.positions.front();
+    cloud.hasFocusPoint = true;
+
+    auto settings = invisible_places::water::DefaultWaterBakeSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.supportVoxelSize = 0.02F;
+    settings.maxBridgeDistance = 0.09F;
+    settings.pathLength = 0.7F;
+    settings.pathDensity = 0.018F;
+    settings.maxSteps = 48;
+    settings.supportSampleLimit = 256;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 3;
+    emitter.name = "test spring";
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.04F;
+    emitter.speed = 1.2F;
+    emitter.confidence = 0.95F;
+
+    const auto overlay = invisible_places::water::GenerateWaterOverlay(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        settings,
+        false);
+    REQUIRE(overlay.points.size() > 8);
+    CHECK(overlay.points.front().emitterId == Catch::Approx(3.0F));
+    CHECK(overlay.points.back().pathDistance > overlay.points.front().pathDistance);
+    CHECK(overlay.points.back().confidence <= 1.0F);
+
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_water_overlay_test.ply";
+    std::string errorMessage;
+    REQUIRE(invisible_places::water::WriteWaterOverlayPly(overlay, outputPath, &errorMessage));
+
+    const auto header = invisible_places::io::ParsePlyHeader(outputPath);
+    REQUIRE(header.success);
+    CHECK(header.header.vertexCount == overlay.points.size());
+    CHECK(header.header.HasProperty("scalar_phase"));
+    CHECK(header.header.HasProperty("scalar_speed"));
+    CHECK(header.header.HasProperty("scalar_pooling"));
+
+    const auto loaded = invisible_places::io::LoadPointCloud(outputPath);
+    REQUIRE(loaded.success);
+    REQUIRE(loaded.cloud.ScalarFieldCount() == 9);
+    CHECK(loaded.cloud.scalarFields[3].name == "phase");
+    CHECK(loaded.cloud.scalarFields[4].name == "speed");
+    CHECK(loaded.cloud.scalarFields[8].name == "pooling");
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Water emitter suggestions stay conservative and editable", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.hasNormals = true;
+    for (int index = 0; index < 32; ++index) {
+        const invisible_places::io::Float3 position{
+            0.0F,
+            static_cast<float>(index % 2) * 0.025F,
+            2.0F - static_cast<float>(index) * 0.035F};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({1.0F, 0.0F, 0.0F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    }
+
+    auto settings = invisible_places::water::DefaultWaterBakeSettings(
+        invisible_places::water::WaterScaleMode::Mid);
+    settings.supportVoxelSize = 0.04F;
+    settings.maxBridgeDistance = 0.12F;
+    settings.supportSampleLimit = 512;
+
+    const auto suggestions = invisible_places::water::SuggestWaterEmitters(
+        cloud,
+        {},
+        settings,
+        10,
+        3);
+    REQUIRE(!suggestions.empty());
+    CHECK(suggestions.size() <= 3);
+    CHECK(suggestions.front().id == 10U);
+    CHECK(suggestions.front().origin == invisible_places::water::WaterEmitterOrigin::AutoSuggested);
+    CHECK(suggestions.front().status == invisible_places::water::WaterEmitterStatus::Candidate);
+    CHECK(suggestions.front().confidence >= 0.62F);
+}
+
+TEST_CASE("Water source documents round-trip independently from projects", "[water][serialization]") {
+    invisible_places::serialization::WaterSourcesDocument document;
+    document.bakeSettings = invisible_places::water::DefaultWaterBakeSettings(
+        invisible_places::water::WaterScaleMode::Aerial);
+    document.bakeSettings.maxBridgeDistance = 6.5F;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 42;
+    emitter.name = "cliff seep";
+    emitter.position = {10.0F, 11.0F, 12.0F};
+    emitter.scope = invisible_places::water::WaterScaleMode::Aerial;
+    emitter.origin = invisible_places::water::WaterEmitterOrigin::AutoSuggested;
+    emitter.status = invisible_places::water::WaterEmitterStatus::Candidate;
+    emitter.parentId = 7U;
+    document.emitters.push_back(emitter);
+
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_water_sources.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(document, outputPath, &errorMessage));
+    const auto loaded = invisible_places::serialization::LoadWaterSourcesDocument(outputPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->bakeSettings.scaleMode == invisible_places::water::WaterScaleMode::Aerial);
+    CHECK(loaded->bakeSettings.maxBridgeDistance == Catch::Approx(6.5F));
+    REQUIRE(loaded->emitters.size() == 1);
+    CHECK(loaded->emitters.front().id == 42U);
+    CHECK(loaded->emitters.front().origin == invisible_places::water::WaterEmitterOrigin::AutoSuggested);
+    REQUIRE(loaded->emitters.front().parentId.has_value());
+    CHECK(loaded->emitters.front().parentId.value() == 7U);
+    std::filesystem::remove(outputPath);
 }
 
 TEST_CASE("Legacy point render modes migrate to unified material style", "[serialization][point-style]") {
@@ -1220,6 +1607,16 @@ TEST_CASE("Point material variant resolver selects simple and unified paths", "[
     auto colormap = style;
     colormap.colorMode = PointCloudColorMode::ScalarColormap;
     CHECK(ResolvePointCloudMaterialVariant(colormap) == PointCloudMaterialVariant::Unified);
+
+    auto stylised = style;
+    stylised.stylisationMode =
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::NprStylisation;
+    stylised.stylisationStrength = 1.0F;
+    CHECK(ResolvePointCloudMaterialVariant(stylised) == PointCloudMaterialVariant::Unified);
+
+    auto zeroStrengthStylised = stylised;
+    zeroStrengthStylised.stylisationStrength = 0.0F;
+    CHECK(ResolvePointCloudMaterialVariant(zeroStrengthStylised) == PointCloudMaterialVariant::ConstantSimple);
 }
 
 TEST_CASE("Camera shot interpolation stores quaternion slerp and linear camera values", "[camera][shots]") {
@@ -1448,6 +1845,34 @@ TEST_CASE("Animation path evaluation passes through camera and focus keys", "[ca
     CHECK(evaluation.focusPoint[2] == Catch::Approx(path.keys[1].focusPoint[2]));
 }
 
+TEST_CASE("Animation path reports world-space speeds and retimes from average speed", "[camera][animation]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 60;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 1.0F, 0.0F}, .durationFrames = 30},
+        {.cameraPosition = {10.0F, 0.0F, 0.0F}, .focusPoint = {0.0F, 5.0F, 0.0F}, .durationFrames = 30},
+    };
+
+    const auto stats = invisible_places::camera::MeasureAnimationPathMotion(path, 0.5F, 32U);
+    CHECK(stats.durationSeconds == Catch::Approx(2.0F));
+    CHECK(stats.cameraDistance == Catch::Approx(10.0F));
+    CHECK(stats.targetDistance == Catch::Approx(4.0F));
+    CHECK(stats.averageCameraSpeed == Catch::Approx(5.0F));
+    CHECK(stats.averageTargetSpeed == Catch::Approx(2.0F));
+    CHECK(stats.currentCameraSpeed == Catch::Approx(5.0F));
+    CHECK(stats.currentTargetSpeed == Catch::Approx(2.0F));
+
+    path.durationFrames = invisible_places::camera::AnimationDurationFramesForAverageSpeed(
+        path,
+        invisible_places::camera::AnimationPathMotionTarget::Camera,
+        2.5F,
+        32U);
+    CHECK(path.durationFrames == 120U);
+    const auto retimed = invisible_places::camera::MeasureAnimationPathMotion(path, 0.5F, 32U);
+    CHECK(retimed.durationSeconds == Catch::Approx(4.0F));
+    CHECK(retimed.averageCameraSpeed == Catch::Approx(2.5F));
+}
+
 TEST_CASE("Animation path keeps camera and focus derivatives smooth through middle keys", "[camera][animation]") {
     invisible_places::camera::AnimationPath path;
     path.name = "Smooth";
@@ -1530,6 +1955,7 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     invisible_places::camera::AnimationPath path;
     path.name = "Roundtrip Animation";
     path.durationFrames = 72;
+    path.associatedLayerPaths = {"Data/Site2 -5mm.ply", "Data/Site3.ply"};
     path.depthOfFieldEnabled = false;
     path.apertureFStops = 2.8F;
     path.depthOfFieldMaxBlurPixels = 36.0F;
@@ -1544,6 +1970,7 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     path.exportVisualNames = {"Painty", "X-Ray RGB"};
     path.keys = {
         {
+            .id = "key_entry",
             .cameraPosition = {1.0F, 2.0F, 3.0F},
             .focusPoint = {4.0F, 5.0F, 6.0F},
             .fovDegrees = 42.0F,
@@ -1551,8 +1978,11 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
             .farPlane = 900.0F,
             .durationFrames = 24,
             .sourceShotName = "Entry",
+            .linkedCameraId = "camera_entry",
+            .linkedCameraName = "Entry",
         },
         {
+            .id = "key_exit",
             .cameraPosition = {7.0F, 8.0F, 9.0F},
             .focusPoint = {10.0F, 11.0F, 12.0F},
             .fovDegrees = 55.0F,
@@ -1560,16 +1990,30 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
             .farPlane = 1200.0F,
             .durationFrames = 48,
             .sourceShotName = "Exit",
+            .linkedCameraId = "camera_exit",
+            .linkedCameraName = "Exit",
         },
     };
 
     std::string errorMessage;
     REQUIRE(invisible_places::serialization::SaveAnimationPath(path, outputPath, &errorMessage));
+    {
+        std::ifstream savedAnimation{outputPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{savedAnimation},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"schema_version\": 4") != std::string::npos);
+        CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
+        CHECK(savedJson.find("\"linked_camera_id\": \"camera_entry\"") != std::string::npos);
+    }
     const auto loadedPath = invisible_places::serialization::LoadAnimationPath(outputPath, &errorMessage);
     REQUIRE(loadedPath.has_value());
     REQUIRE(loadedPath->keys.size() == 2);
     CHECK(loadedPath->name == "Roundtrip Animation");
     CHECK(loadedPath->durationFrames == 72);
+    REQUIRE(loadedPath->associatedLayerPaths.size() == 2);
+    CHECK(loadedPath->associatedLayerPaths[0] == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loadedPath->associatedLayerPaths[1] == std::filesystem::path{"Data/Site3.ply"});
     CHECK_FALSE(loadedPath->depthOfFieldEnabled);
     CHECK(loadedPath->apertureFStops == Catch::Approx(2.8F));
     CHECK(loadedPath->depthOfFieldMaxBlurPixels == Catch::Approx(36.0F));
@@ -1588,6 +2032,9 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     CHECK(loadedPath->keys[0].nearPlane == Catch::Approx(0.02F));
     CHECK(loadedPath->keys[0].farPlane == Catch::Approx(900.0F));
     CHECK(loadedPath->keys[0].sourceShotName == "Entry");
+    CHECK(loadedPath->keys[0].id == "key_entry");
+    CHECK(loadedPath->keys[0].linkedCameraId == "camera_entry");
+    CHECK(loadedPath->keys[0].linkedCameraName == "Entry");
 
     std::filesystem::remove(outputPath);
 }
@@ -1619,6 +2066,41 @@ TEST_CASE("Legacy animation path files load with default export metadata", "[ser
     CHECK(loadedPath->exportSettings.startFrame == 0);
     CHECK(loadedPath->exportSettings.endFrame == 0);
     CHECK(loadedPath->exportVisualNames.empty());
+    CHECK(loadedPath->associatedLayerPaths.empty());
+    REQUIRE(loadedPath->keys.size() == 2);
+    CHECK(!loadedPath->keys[0].id.empty());
+    CHECK(loadedPath->keys[0].linkedCameraId.empty());
+    CHECK(loadedPath->keys[0].linkedCameraName.empty());
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Pre-link animation path files load as unlinked snapshots", "[serialization][animation]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_legacy_v3.ipanim.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output
+            << "{\n"
+            << "  \"schema_version\": 3,\n"
+            << "  \"name\": \"Legacy Associated Animation\",\n"
+            << "  \"duration_frames\": 60,\n"
+            << "  \"associated_layer_paths\": [\"Data/Site2 -5mm.ply\"],\n"
+            << "  \"keys\": [\n"
+            << "    {\"camera_position\": [0, 0, 0], \"focus_point\": [0, 0, -1], \"source_shot_name\": \"Entry\"},\n"
+            << "    {\"camera_position\": [1, 0, 0], \"focus_point\": [1, 0, -1], \"source_shot_name\": \"Exit\"}\n"
+            << "  ]\n"
+            << "}\n";
+    }
+
+    std::string errorMessage;
+    const auto loadedPath = invisible_places::serialization::LoadAnimationPath(outputPath, &errorMessage);
+    REQUIRE(loadedPath.has_value());
+    REQUIRE(loadedPath->associatedLayerPaths.size() == 1);
+    CHECK(loadedPath->associatedLayerPaths[0] == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    REQUIRE(loadedPath->keys.size() == 2);
+    CHECK(!loadedPath->keys[0].id.empty());
+    CHECK(loadedPath->keys[0].sourceShotName == "Entry");
+    CHECK(loadedPath->keys[0].linkedCameraId.empty());
+    CHECK(loadedPath->keys[0].linkedCameraName.empty());
     std::filesystem::remove(outputPath);
 }
 
@@ -1636,8 +2118,91 @@ TEST_CASE("Animation path loading reports invalid files without producing a path
     std::filesystem::remove(outputPath);
 }
 
+TEST_CASE("Camera shots convert to animation focus keys from view targets", "[camera][animation]") {
+    auto makeShot = [](
+                        std::string id,
+                        std::array<float, 3> position,
+                        std::array<float, 3> target,
+                        std::array<float, 3> orbitCenter) {
+        invisible_places::camera::CameraShot shot;
+        shot.id = std::move(id);
+        shot.name = shot.id;
+        shot.state.position = position;
+        shot.state.target = target;
+        shot.state.orbitCenter = orbitCenter;
+        shot.state.hasOrbitCenter = true;
+        return shot;
+    };
+
+    const std::vector<invisible_places::camera::CameraShot> sourceShots = {
+        makeShot("camera_a", {0.0F, 1.0F, 2.0F}, {3.0F, 4.0F, 5.0F}, {30.0F, 40.0F, 50.0F}),
+        makeShot("camera_b", {6.0F, 7.0F, 8.0F}, {9.0F, 10.0F, 11.0F}, {90.0F, 100.0F, 110.0F}),
+    };
+
+    const auto animationPath = invisible_places::camera::BuildAnimationPathFromCameraShots(
+        "Target Focus",
+        sourceShots,
+        60U);
+
+    REQUIRE(animationPath.keys.size() == sourceShots.size());
+    for (std::size_t index = 0; index < sourceShots.size(); ++index) {
+        CHECK(animationPath.keys[index].focusPoint[0] == Catch::Approx(sourceShots[index].state.target[0]));
+        CHECK(animationPath.keys[index].focusPoint[1] == Catch::Approx(sourceShots[index].state.target[1]));
+        CHECK(animationPath.keys[index].focusPoint[2] == Catch::Approx(sourceShots[index].state.target[2]));
+        CHECK(animationPath.keys[index].focusPoint[0] != Catch::Approx(sourceShots[index].state.orbitCenter[0]));
+    }
+}
+
+TEST_CASE("Weighted camera path conversion does not mutate source camera shots", "[camera][animation]") {
+    auto makeShot = [](
+                        std::string name,
+                        std::array<float, 3> position,
+                        std::array<float, 3> target,
+                        std::array<float, 3> orbitCenter,
+                        std::uint32_t durationFrames) {
+        invisible_places::camera::CameraShot shot;
+        shot.id = name;
+        shot.name = std::move(name);
+        shot.durationFrames = durationFrames;
+        shot.state.position = position;
+        shot.state.target = target;
+        shot.state.orbitCenter = orbitCenter;
+        shot.state.hasOrbitCenter = true;
+        return shot;
+    };
+
+    std::vector<invisible_places::camera::CameraShot> sourceShots = {
+        makeShot("A", {0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, -4.0F}, {1.0F, 1.0F, 1.0F}, 12U),
+        makeShot("B", {4.0F, 1.0F, 0.0F}, {4.0F, 1.0F, -4.0F}, {2.0F, 2.0F, 2.0F}, 24U),
+        makeShot("C", {8.0F, 0.0F, 2.0F}, {8.0F, 0.0F, -2.0F}, {3.0F, 3.0F, 3.0F}, 36U),
+    };
+    const auto originalShots = sourceShots;
+
+    const auto weightedShots = invisible_places::camera::BuildWeightedCameraPathShots(sourceShots, 90U);
+    const auto animationPath = invisible_places::camera::BuildAnimationPathFromCameraShots(
+        "Weighted",
+        weightedShots,
+        90U);
+
+    REQUIRE(animationPath.keys.size() == sourceShots.size());
+    REQUIRE(sourceShots.size() == originalShots.size());
+    for (std::size_t index = 0; index < sourceShots.size(); ++index) {
+        CHECK(sourceShots[index].state.position[0] == Catch::Approx(originalShots[index].state.position[0]));
+        CHECK(sourceShots[index].state.position[1] == Catch::Approx(originalShots[index].state.position[1]));
+        CHECK(sourceShots[index].state.position[2] == Catch::Approx(originalShots[index].state.position[2]));
+        CHECK(sourceShots[index].state.target[0] == Catch::Approx(originalShots[index].state.target[0]));
+        CHECK(sourceShots[index].state.target[1] == Catch::Approx(originalShots[index].state.target[1]));
+        CHECK(sourceShots[index].state.target[2] == Catch::Approx(originalShots[index].state.target[2]));
+        CHECK(sourceShots[index].state.orbitCenter[0] == Catch::Approx(originalShots[index].state.orbitCenter[0]));
+        CHECK(sourceShots[index].state.orbitCenter[1] == Catch::Approx(originalShots[index].state.orbitCenter[1]));
+        CHECK(sourceShots[index].state.orbitCenter[2] == Catch::Approx(originalShots[index].state.orbitCenter[2]));
+        CHECK(sourceShots[index].state.hasOrbitCenter == originalShots[index].state.hasOrbitCenter);
+    }
+}
+
 TEST_CASE("Animation key edits do not mutate source camera shots", "[camera][animation]") {
     invisible_places::camera::CameraShot shot;
+    shot.id = "camera_original";
     shot.name = "Original";
     shot.state.position = {1.0F, 2.0F, 3.0F};
     shot.state.target = {4.0F, 5.0F, 6.0F};
@@ -1649,6 +2214,10 @@ TEST_CASE("Animation key edits do not mutate source camera shots", "[camera][ani
         "Editable",
         sourceShots,
         30U);
+    REQUIRE(animationPath.keys.size() == 2);
+    CHECK(animationPath.keys[0].linkedCameraId == "camera_original");
+    CHECK(animationPath.keys[0].linkedCameraName == "Original");
+    CHECK(!animationPath.keys[0].id.empty());
 
     invisible_places::camera::MoveAnimationCameraKey(&animationPath, 0, {10.0F, 11.0F, 12.0F});
     invisible_places::camera::MoveAnimationFocusKey(&animationPath, 0, {13.0F, 14.0F, 15.0F});
@@ -1773,6 +2342,13 @@ TEST_CASE("Animation render sequence evaluates animation paths directly", "[outp
     CHECK(frames.back().position[0] == Catch::Approx(path.keys.back().cameraPosition[0]));
     CHECK(frames.back().position[1] == Catch::Approx(path.keys.back().cameraPosition[1]));
 
+    settings.framesPerSecond = 60;
+    const auto sixtyFpsFrames = invisible_places::output::BuildAnimationRenderSequence(path, settings);
+    REQUIRE(sixtyFpsFrames.size() == 121);
+    CHECK(sixtyFpsFrames[60].position[0] == Catch::Approx(middleEvaluation.camera.position[0]));
+    CHECK(sixtyFpsFrames[60].position[1] == Catch::Approx(middleEvaluation.camera.position[1]));
+
+    settings.framesPerSecond = 30;
     settings.startFrame = 10;
     settings.endFrame = 12;
     const auto rangedFrames = invisible_places::output::BuildAnimationRenderSequence(path, settings);
@@ -1919,6 +2495,92 @@ TEST_CASE("EXR writer accepts GPU half RGBA readback buffers", "[output][exr]") 
     std::filesystem::remove(outputPath);
 }
 
+TEST_CASE("Eye-dome lighting leaves flat depth unchanged", "[output][edl]") {
+    const std::vector<float> depth(9, 4.0F);
+    const auto shade = invisible_places::output::ComputeEyeDomeLightingShade(
+        depth.data(),
+        3,
+        3,
+        1,
+        1,
+        invisible_places::output::EyeDomeLightingSettings{.enabled = true});
+    CHECK(shade == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Eye-dome lighting darkens foreground depth edges", "[output][edl]") {
+    const std::vector<float> depth{
+        8.0F,
+        8.0F,
+        8.0F,
+        8.0F,
+        2.0F,
+        8.0F,
+        8.0F,
+        8.0F,
+        8.0F,
+    };
+    const auto shade = invisible_places::output::ComputeEyeDomeLightingShade(
+        depth.data(),
+        3,
+        3,
+        1,
+        1,
+        invisible_places::output::EyeDomeLightingSettings{.enabled = true});
+    CHECK(shade < 1.0F);
+    CHECK(shade >= 0.35F);
+}
+
+TEST_CASE("Eye-dome lighting ignores invalid background center depth", "[output][edl]") {
+    const std::vector<float> depth{
+        2.0F,
+        2.0F,
+        2.0F,
+        2.0F,
+        0.0F,
+        2.0F,
+        2.0F,
+        2.0F,
+        2.0F,
+    };
+    const auto shade = invisible_places::output::ComputeEyeDomeLightingShade(
+        depth.data(),
+        3,
+        3,
+        1,
+        1,
+        invisible_places::output::EyeDomeLightingSettings{.enabled = true});
+    CHECK(shade == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Eye-dome lighting preserves alpha and depth while shading beauty", "[output][edl]") {
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = 3;
+    image.height = 3;
+    image.rgbaHalf.resize(3U * 3U * 4U, Imath::half{1.0F}.bits());
+    image.depth = {
+        8.0F,
+        8.0F,
+        8.0F,
+        8.0F,
+        2.0F,
+        8.0F,
+        8.0F,
+        8.0F,
+        8.0F,
+    };
+    const auto originalDepth = image.depth;
+    const auto originalAlpha = image.rgbaHalf[(4U * 4U) + 3U];
+    const auto originalRed = image.rgbaHalf[4U * 4U];
+
+    invisible_places::output::ApplyEyeDomeLighting(
+        &image,
+        invisible_places::output::EyeDomeLightingSettings{.enabled = true});
+
+    CHECK(image.depth == originalDepth);
+    CHECK(image.rgbaHalf[(4U * 4U) + 3U] == originalAlpha);
+    CHECK(image.rgbaHalf[4U * 4U] < originalRed);
+}
+
 TEST_CASE("Offline point tiles match untiled output for deterministic scenes", "[output][offline]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {
@@ -1969,6 +2631,108 @@ TEST_CASE("Offline point tiles match untiled output for deterministic scenes", "
         if (std::isfinite(tiled.depth[index]) || std::isfinite(untiled.depth[index])) {
             CHECK(tiled.depth[index] == Catch::Approx(untiled.depth[index]));
         }
+    }
+}
+
+TEST_CASE("Offline point stylisation modes alter color while preserving image shape", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.packedColors = {0xFF8F6734U};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderWithStyle = [&](invisible_places::renderer::pointcloud::PointCloudStyleState style,
+                               float stylisationTimeSeconds = 0.0F) {
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+        style.solidColor = {0.35F, 0.62F, 0.91F, 1.0F};
+        style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 7.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+        invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 11, 11);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 11, 11},
+            &image,
+            nullptr,
+            nullptr,
+            stylisationTimeSeconds);
+        return image;
+    };
+
+    auto imageDifference = [](const invisible_places::output::ExrImage& left,
+                              const invisible_places::output::ExrImage& right) {
+        CHECK(left.beautyR.size() == right.beautyR.size());
+        float difference = 0.0F;
+        const auto pixelCount = std::min(left.beautyR.size(), right.beautyR.size());
+        for (std::size_t index = 0; index < pixelCount; ++index) {
+            difference += std::abs(left.beautyR[index] - right.beautyR[index]);
+            difference += std::abs(left.beautyG[index] - right.beautyG[index]);
+            difference += std::abs(left.beautyB[index] - right.beautyB[index]);
+            difference += std::abs(left.alpha[index] - right.alpha[index]);
+        }
+        return difference;
+    };
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState baseStyle;
+    const auto baseImage = renderWithStyle(baseStyle);
+
+    auto nprStyle = baseStyle;
+    nprStyle.stylisationMode =
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::NprStylisation;
+    nprStyle.nprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset::Cartoon;
+    nprStyle.stylisationStrength = 1.0F;
+    nprStyle.stylisationColorLevels = 2.0F;
+    nprStyle.stylisationInkStrength = 0.75F;
+    const auto nprImage = renderWithStyle(nprStyle);
+
+    auto brushStyle = baseStyle;
+    brushStyle.stylisationMode =
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::BrushParticles;
+    brushStyle.nprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset::Watercolor;
+    brushStyle.stylisationStrength = 1.0F;
+    brushStyle.stylisationPaperGrain = 1.0F;
+    brushStyle.stylisationPigmentBleed = 0.8F;
+    brushStyle.brushAspect = 3.0F;
+    brushStyle.strokeJitter = 0.35F;
+    brushStyle.strokeOpacityVariance = 1.0F;
+    const auto brushImage = renderWithStyle(brushStyle);
+
+    auto animatedWatercolorStyle = brushStyle;
+    animatedWatercolorStyle.stylisationPaperGrain = 1.0F;
+    animatedWatercolorStyle.pigmentVariation = 1.0F;
+    animatedWatercolorStyle.pigmentAnimationSpeed = 2.0F;
+    animatedWatercolorStyle.granulationAngleStrength = 0.0F;
+    const auto animatedFrameA = renderWithStyle(animatedWatercolorStyle, 0.0F);
+    const auto animatedFrameB = renderWithStyle(animatedWatercolorStyle, 0.25F);
+
+    REQUIRE(baseImage.width == nprImage.width);
+    REQUIRE(baseImage.height == brushImage.height);
+    CHECK(imageDifference(baseImage, nprImage) > 0.01F);
+    CHECK(imageDifference(baseImage, brushImage) > 0.01F);
+    CHECK(animatedFrameA.width == animatedFrameB.width);
+    CHECK(animatedFrameA.height == animatedFrameB.height);
+    CHECK(imageDifference(animatedFrameA, animatedFrameB) > 0.001F);
+    for (const auto alpha : brushImage.alpha) {
+        CHECK(std::isfinite(alpha));
+        CHECK(alpha >= 0.0F);
+        CHECK(alpha <= 1.0F);
     }
 }
 
@@ -2510,4 +3274,101 @@ TEST_CASE("High-quality gaussian sort orders merged splats back-to-front", "[gsp
     CHECK(sorted[1] == 2U);
     CHECK(sorted[2] == 1U);
     CHECK(sorted[3] == 0U);
+}
+
+TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][style]") {
+    using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+    using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
+    using invisible_places::style::ScalarConstant;
+
+    const PointCloudStyleState style;
+
+    CHECK(style.geometryMode == PointCloudGeometryMode::ScreenSprites);
+    CHECK(style.falloffProfile == PointCloudFalloffProfile::HardDisc);
+    CHECK(style.stylisationMode == PointCloudStylisationMode::Off);
+    CHECK(ScalarConstant(style.pointSize) == Catch::Approx(1.0F));
+    CHECK(ScalarConstant(style.opacity) == Catch::Approx(1.0F));
+    CHECK(ScalarConstant(style.emissiveStrength) == Catch::Approx(0.0F));
+    CHECK(ScalarConstant(style.xrayStrength) == Catch::Approx(0.0F));
+    CHECK(ScalarConstant(style.depthFade) == Catch::Approx(0.0F));
+    CHECK(style.colorizeAmount == Catch::Approx(0.0F));
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::OpaqueHardDisc);
+}
+
+TEST_CASE("Fast Basic point-cloud style override strips expensive visual features", "[pointcloud][style]") {
+    using invisible_places::renderer::pointcloud::MakeFastBasicPointCloudStyle;
+    using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+    using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
+    using invisible_places::style::ScalarConstant;
+    using invisible_places::style::SetScalarConstant;
+
+    PointCloudStyleState style;
+    style.geometryMode = PointCloudGeometryMode::WorldSurfels;
+    style.colorMode = PointCloudColorMode::ScalarColormap;
+    style.stylisationMode = PointCloudStylisationMode::NprStylisation;
+    style.colorizeAmount = 0.8F;
+    style.flowAnimation = true;
+    SetScalarConstant(&style.pointSize, 12.0F);
+    SetScalarConstant(&style.opacity, 0.35F);
+    SetScalarConstant(&style.emissiveStrength, 2.0F);
+    SetScalarConstant(&style.xrayStrength, 0.5F);
+    SetScalarConstant(&style.depthFade, 0.5F);
+
+    const auto fast = MakeFastBasicPointCloudStyle(style, true);
+
+    CHECK(fast.geometryMode == PointCloudGeometryMode::ScreenSprites);
+    CHECK(fast.colorMode == PointCloudColorMode::SourceRgb);
+    CHECK(fast.falloffProfile == PointCloudFalloffProfile::HardDisc);
+    CHECK(fast.stylisationMode == PointCloudStylisationMode::Off);
+    CHECK_FALSE(fast.flowAnimation);
+    CHECK(ScalarConstant(fast.pointSize) == Catch::Approx(1.0F));
+    CHECK(ScalarConstant(fast.opacity) == Catch::Approx(1.0F));
+    CHECK(ScalarConstant(fast.emissiveStrength) == Catch::Approx(0.0F));
+    CHECK(ScalarConstant(fast.xrayStrength) == Catch::Approx(0.0F));
+    CHECK(ScalarConstant(fast.depthFade) == Catch::Approx(0.0F));
+    CHECK(fast.colorizeAmount == Catch::Approx(0.0F));
+    CHECK(ResolvePointCloudMaterialVariant(fast) == PointCloudMaterialVariant::OpaqueHardDisc);
+
+    const auto fastWithoutRgb = MakeFastBasicPointCloudStyle(style, false);
+    CHECK(fastWithoutRgb.colorMode == PointCloudColorMode::SolidColor);
+}
+
+TEST_CASE("Point-cloud material variant separates opaque, simple, and unified styles", "[pointcloud][style]") {
+    using invisible_places::renderer::pointcloud::PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
+    using invisible_places::style::ConfigureFieldMapFromStats;
+    using invisible_places::style::SetScalarConstant;
+
+    PointCloudStyleState style;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::OpaqueHardDisc);
+
+    style.falloffProfile = PointCloudFalloffProfile::SoftDisc;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::ConstantSimple);
+
+    style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+    SetScalarConstant(&style.emissiveStrength, 0.5F);
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::ConstantSimple);
+
+    SetScalarConstant(&style.emissiveStrength, 0.0F);
+    style.colorMode = PointCloudColorMode::ScalarColormap;
+    invisible_places::io::ScalarFieldStats scalarField;
+    scalarField.name = "height";
+    scalarField.minimum = 0.0F;
+    scalarField.maximum = 1.0F;
+    scalarField.count = 2;
+    scalarField.valid = true;
+    ConfigureFieldMapFromStats(&style.colormapPosition, 0, scalarField.name, 0.0F, 1.0F, &scalarField);
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::Unified);
 }

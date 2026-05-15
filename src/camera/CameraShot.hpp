@@ -4,16 +4,20 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include <glm/gtc/quaternion.hpp>
 
 namespace invisible_places::camera {
 
 struct CameraShot {
+    std::string id;
     std::string name;
     CameraState state;
     std::uint32_t durationFrames = 90;
+    std::vector<std::filesystem::path> associatedLayerPaths;
 };
 
 inline float LerpFloat(float left, float right, float amount) {

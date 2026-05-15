@@ -39,12 +39,17 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_accumulation.frag
     shaders/pointcloud_constant_simple.vert
     shaders/pointcloud_constant_simple_accumulation.frag
+    shaders/pointcloud_opaque_hard_disc.frag
+    shaders/pointcloud_fast_basic.vert
+    shaders/pointcloud_fast_basic.frag
+    shaders/pointcloud_fast_basic_depth.frag
     shaders/pointcloud_export_depth.frag
     shaders/pointcloud_surfel.vert
     shaders/pointcloud_surfel_preview.frag
     shaders/pointcloud_surfel_accumulation.frag
     shaders/pointcloud_surfel_constant_simple.vert
     shaders/pointcloud_surfel_constant_simple_accumulation.frag
+    shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
     shaders/gsplat_accumulation.vert
     shaders/gsplat_accumulation.frag
@@ -52,9 +57,11 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/gsplat_high_quality.frag
     shaders/gsplat_composite.vert
     shaders/gsplat_composite.frag
+    shaders/edl_postprocess.frag
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
 )
 
 set(INVISIBLE_PLACES_SHADER_OUTPUTS)
@@ -98,6 +105,7 @@ add_library(
     src/io/PlyHeader.cpp
     src/io/TransformMatrix.cpp
     src/output/ExrWriter.cpp
+    src/output/EyeDomeLighting.cpp
     src/output/OfflinePointRenderer.cpp
     src/output/RenderPreset.cpp
     src/output/VideoWriter.cpp
@@ -112,6 +120,7 @@ add_library(
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
     src/style/RenderParameterBinding.cpp
+    src/water/WaterFlow.cpp
 )
 
 add_dependencies(invisible_places_core invisible_places_shaders)

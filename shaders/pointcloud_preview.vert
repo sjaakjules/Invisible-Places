@@ -10,6 +10,8 @@ layout(location = 3) out float outEmissive;
 layout(location = 4) out float outXray;
 layout(location = 5) out float outDepthFade;
 layout(location = 6) out float outViewDepth;
+layout(location = 7) flat out uint outPointIndex;
+layout(location = 8) out float outSurfaceAngleMask;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -24,6 +26,10 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
     float values[];
 } scalarFieldValues;
+
+layout(set = 0, binding = 6, std430) readonly buffer PointNormals {
+    vec4 normals[];
+} pointNormals;
 
 struct RenderParameterBindingGpu {
     vec4 constantValue;
@@ -49,25 +55,34 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
     vec4 colorize;
+    uvec4 stylisationControl;
+    vec4 stylisationParams0;
+    vec4 stylisationParams1;
+    vec4 stylisationParams2;
 } styleData;
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
+const uint kWaterPhaseFieldSlot = 3u;
+const uint kWaterSpeedFieldSlot = 4u;
+const uint kWaterConfidenceFieldSlot = 6u;
+const uint kWaterAccumulationFieldSlot = 7u;
+const uint kWaterPoolingFieldSlot = 8u;
 
-float LoadScalarFieldValue(uint fieldSlot) {
+float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
     if (fieldSlot == 0xFFFFFFFFu ||
         fieldSlot >= styleData.globalControl.z ||
-        styleData.pointMeta.x == 0u) {
-        return 0.0;
-    }
-
-    const uint pointIndex = uint(gl_VertexIndex);
-    if (pointIndex >= styleData.pointMeta.x) {
+        styleData.pointMeta.x == 0u ||
+        pointIndex >= styleData.pointMeta.x) {
         return 0.0;
     }
 
     const uint scalarIndex = (fieldSlot * styleData.pointMeta.x) + pointIndex;
     return scalarFieldValues.values[scalarIndex];
+}
+
+float LoadScalarFieldValue(uint fieldSlot) {
+    return LoadScalarFieldValueForPoint(fieldSlot, uint(gl_VertexIndex));
 }
 
 float EvaluateBinding(RenderParameterBindingGpu binding) {
@@ -92,6 +107,33 @@ float EvaluateBinding(RenderParameterBindingGpu binding) {
     return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
 }
 
+vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
+    if (styleData.pointMeta.w == 0u || styleData.globalControl.z <= kWaterSpeedFieldSlot) {
+        return vec2(opacity, emissive);
+    }
+
+    const float phase = LoadScalarFieldValueForPoint(kWaterPhaseFieldSlot, pointIndex);
+    const float speed = max(0.02, LoadScalarFieldValueForPoint(kWaterSpeedFieldSlot, pointIndex));
+    const float confidence =
+        styleData.globalControl.z > kWaterConfidenceFieldSlot
+            ? clamp(LoadScalarFieldValueForPoint(kWaterConfidenceFieldSlot, pointIndex), 0.0, 1.0)
+            : 1.0;
+    const float accumulation =
+        styleData.globalControl.z > kWaterAccumulationFieldSlot
+            ? clamp(LoadScalarFieldValueForPoint(kWaterAccumulationFieldSlot, pointIndex), 0.0, 1.0)
+            : 0.0;
+    const float pooling =
+        styleData.globalControl.z > kWaterPoolingFieldSlot
+            ? clamp(LoadScalarFieldValueForPoint(kWaterPoolingFieldSlot, pointIndex), 0.0, 1.0)
+            : 0.0;
+    const float wave = 0.5 + (0.5 * sin((phase - uniforms.depthParameters.x * speed) * 6.28318530718));
+    const float crest = smoothstep(0.58, 1.0, wave);
+    const float alphaPulse = clamp((0.24 + crest * 0.82 + pooling * 0.24) * confidence, 0.0, 1.25);
+    const float emissivePulse =
+        clamp((0.70 + crest * 2.10 + accumulation * 1.25 + pooling * 0.55) * confidence, 0.0, 4.5);
+    return vec2(opacity * alphaPulse, emissive * emissivePulse);
+}
+
 float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     if (uniforms.depthOfFieldParameters.x <= 0.5) {
         return 0.0;
@@ -102,6 +144,21 @@ float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     const float maxBlurPixels = max(0.0, uniforms.depthOfFieldParameters.w);
     const float distanceFromFocus = abs(viewDepth - focusDistance) / max(max(viewDepth, focusDistance), 0.001);
     return clamp(distanceFromFocus * (8.0 / apertureFStops) * maxBlurPixels, 0.0, maxBlurPixels);
+}
+
+float ResolveSurfaceAngleMask(vec3 worldPosition, uint pointIndex) {
+    if (styleData.pointMeta.z == 0u || pointIndex >= styleData.pointMeta.x) {
+        return 0.0;
+    }
+
+    vec3 normal = pointNormals.normals[pointIndex].xyz;
+    if (dot(normal, normal) <= 1e-8) {
+        return 0.0;
+    }
+
+    normal = normalize(normal);
+    const vec3 viewDirection = normalize(uniforms.cameraPosition.xyz - worldPosition);
+    return clamp(1.0 - abs(dot(normal, viewDirection)), 0.0, 1.0);
 }
 
 void main() {
@@ -120,9 +177,15 @@ void main() {
 
     outSourceColor = inColor;
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);
-    outOpacity = EvaluateBinding(styleData.opacityBinding);
-    outEmissive = EvaluateBinding(styleData.emissiveBinding);
+    const vec2 animatedFlow = ApplyWaterFlowAnimation(
+        EvaluateBinding(styleData.opacityBinding),
+        EvaluateBinding(styleData.emissiveBinding),
+        uint(gl_VertexIndex));
+    outOpacity = animatedFlow.x;
+    outEmissive = animatedFlow.y;
     outXray = EvaluateBinding(styleData.xrayBinding);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;
+    outPointIndex = uint(gl_VertexIndex);
+    outSurfaceAngleMask = ResolveSurfaceAngleMask(worldPosition.xyz, uint(gl_VertexIndex));
 }

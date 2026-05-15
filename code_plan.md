@@ -233,6 +233,7 @@ The project file should store:
 - motion settings,
 - side panel state,
 - saved shots,
+- LiDAR-file associations for saved shots and project-registered animations,
 - render presets,
 - selected AOVs.
 
@@ -522,8 +523,8 @@ Allow the user to tag specific scalar fields for output to avoid exploding pass 
 - Deterministic point-budget sampling plus automatic preview LOD during camera movement/playback.
 - Slide-out/pinnable side panel split into Lidar, Visuals, gSplat, Camera, Animation, and Project tabs, with LiDAR lookdev isolated in Visuals.
 - Camera shot save/load, ordered camera paths, quaternion interpolation, 30 fps timing, and CPU-assisted surface pivot picking.
-- Animation paths derived from camera paths, editable camera/focus keys, playback/scrubbing, save/load, focus distance, aperture metadata, and per-animation Quick MP4 export settings/visual selections in `.ipanim.json` schema v2.
-- Project JSON round-trip for layer load/visibility state, point budgets, point-cloud styles, current camera, camera shots, camera path, selected layer, render settings, last animation path, side panel state, preview LOD mode, and background/gSplat quality settings.
+- Animation paths derived from camera paths, editable camera/focus keys, playback/scrubbing, save/load, focus distance, aperture metadata, LiDAR associations, and per-animation Quick MP4 export settings/visual selections in `.ipanim.json` schema v3.
+- Project JSON round-trip for layer load/visibility state, point budgets, point-cloud styles, current camera, camera shots, camera path, project-registered animations, selected layer, render settings, last animation path, side panel state, preview LOD mode, and background/gSplat quality settings.
 - Point-cloud style preset save/load.
 - GPU animation export for batched saved-animation Quick MP4s per selected saved visual and preview-density EXR stacks, with EXR beauty/alpha/depth channels.
 - CPU/offline point tile renderer and multichannel EXR writer test coverage.

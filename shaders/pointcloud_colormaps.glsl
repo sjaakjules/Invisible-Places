@@ -1,5 +1,5 @@
-// Generated from Matplotlib v3.10.8 lib/matplotlib/_cm_listed.py listed colormap data.
-// Shader table is downsampled to 32 entries for interactive point-cloud rendering.
+// Scientific palettes are generated from Matplotlib v3.10.8 lib/matplotlib/_cm_listed.py data.
+// Shader tables are downsampled to 32 entries; terrain and contrast palettes are procedural stops.
 const int kPointCloudColormapSampleCount = 32;
 
 const uint kViridisColormap[kPointCloudColormapSampleCount] = uint[](
@@ -62,6 +62,114 @@ vec3 SamplePointCloudColormapLut(const uint samples[kPointCloudColormapSampleCou
         mixAmount);
 }
 
+vec3 SamplePointCloudColormapSegment(float value, float lower, float upper, vec3 lowerColor, vec3 upperColor) {
+    const float mixAmount = clamp((value - lower) / max(upper - lower, 1.0e-6), 0.0, 1.0);
+    return mix(lowerColor, upperColor, mixAmount);
+}
+
+float PointCloudExponentialColormapCurve(float value, float exponent) {
+    const float clamped = clamp(value, 0.0, 1.0);
+    const float denominator = exp(exponent) - 1.0;
+    if (denominator <= 1.0e-6) {
+        return clamped;
+    }
+    return (exp(exponent * clamped) - 1.0) / denominator;
+}
+
+vec3 SampleTopographicColormap(float value) {
+    const float v = clamp(value, 0.0, 1.0);
+    if (v <= 0.16) {
+        return SamplePointCloudColormapSegment(v, 0.00, 0.16, vec3(0.03, 0.12, 0.28), vec3(0.10, 0.36, 0.58));
+    }
+    if (v <= 0.28) {
+        return SamplePointCloudColormapSegment(v, 0.16, 0.28, vec3(0.10, 0.36, 0.58), vec3(0.50, 0.76, 0.69));
+    }
+    if (v <= 0.34) {
+        return SamplePointCloudColormapSegment(v, 0.28, 0.34, vec3(0.50, 0.76, 0.69), vec3(0.78, 0.70, 0.45));
+    }
+    if (v <= 0.48) {
+        return SamplePointCloudColormapSegment(v, 0.34, 0.48, vec3(0.78, 0.70, 0.45), vec3(0.28, 0.55, 0.24));
+    }
+    if (v <= 0.64) {
+        return SamplePointCloudColormapSegment(v, 0.48, 0.64, vec3(0.28, 0.55, 0.24), vec3(0.58, 0.50, 0.30));
+    }
+    if (v <= 0.80) {
+        return SamplePointCloudColormapSegment(v, 0.64, 0.80, vec3(0.58, 0.50, 0.30), vec3(0.50, 0.42, 0.38));
+    }
+    return SamplePointCloudColormapSegment(v, 0.80, 1.00, vec3(0.50, 0.42, 0.38), vec3(0.96, 0.95, 0.90));
+}
+
+vec3 SampleLandSurfaceColormap(float value) {
+    const float v = clamp(value, 0.0, 1.0);
+    if (v <= 0.18) {
+        return SamplePointCloudColormapSegment(v, 0.00, 0.18, vec3(0.10, 0.13, 0.06), vec3(0.23, 0.31, 0.12));
+    }
+    if (v <= 0.38) {
+        return SamplePointCloudColormapSegment(v, 0.18, 0.38, vec3(0.23, 0.31, 0.12), vec3(0.38, 0.52, 0.20));
+    }
+    if (v <= 0.58) {
+        return SamplePointCloudColormapSegment(v, 0.38, 0.58, vec3(0.38, 0.52, 0.20), vec3(0.65, 0.58, 0.32));
+    }
+    if (v <= 0.76) {
+        return SamplePointCloudColormapSegment(v, 0.58, 0.76, vec3(0.65, 0.58, 0.32), vec3(0.72, 0.45, 0.25));
+    }
+    if (v <= 0.90) {
+        return SamplePointCloudColormapSegment(v, 0.76, 0.90, vec3(0.72, 0.45, 0.25), vec3(0.55, 0.50, 0.45));
+    }
+    return SamplePointCloudColormapSegment(v, 0.90, 1.00, vec3(0.55, 0.50, 0.45), vec3(0.86, 0.82, 0.72));
+}
+
+vec3 SampleExponentialFireColormap(float value) {
+    const float v = PointCloudExponentialColormapCurve(value, 3.0);
+    if (v <= 0.30) {
+        return SamplePointCloudColormapSegment(v, 0.00, 0.30, vec3(0.00, 0.00, 0.00), vec3(0.25, 0.00, 0.06));
+    }
+    if (v <= 0.55) {
+        return SamplePointCloudColormapSegment(v, 0.30, 0.55, vec3(0.25, 0.00, 0.06), vec3(0.85, 0.10, 0.02));
+    }
+    if (v <= 0.76) {
+        return SamplePointCloudColormapSegment(v, 0.55, 0.76, vec3(0.85, 0.10, 0.02), vec3(1.00, 0.48, 0.00));
+    }
+    if (v <= 0.92) {
+        return SamplePointCloudColormapSegment(v, 0.76, 0.92, vec3(1.00, 0.48, 0.00), vec3(1.00, 0.92, 0.20));
+    }
+    return SamplePointCloudColormapSegment(v, 0.92, 1.00, vec3(1.00, 0.92, 0.20), vec3(1.00, 1.00, 0.92));
+}
+
+vec3 SampleExponentialIceColormap(float value) {
+    const float v = PointCloudExponentialColormapCurve(value, 2.7);
+    if (v <= 0.35) {
+        return SamplePointCloudColormapSegment(v, 0.00, 0.35, vec3(0.00, 0.02, 0.08), vec3(0.02, 0.14, 0.36));
+    }
+    if (v <= 0.60) {
+        return SamplePointCloudColormapSegment(v, 0.35, 0.60, vec3(0.02, 0.14, 0.36), vec3(0.04, 0.48, 0.78));
+    }
+    if (v <= 0.82) {
+        return SamplePointCloudColormapSegment(v, 0.60, 0.82, vec3(0.04, 0.48, 0.78), vec3(0.38, 0.86, 0.95));
+    }
+    return SamplePointCloudColormapSegment(v, 0.82, 1.00, vec3(0.38, 0.86, 0.95), vec3(0.96, 1.00, 1.00));
+}
+
+vec3 SampleHighContrastColormap(float value) {
+    const float v = clamp(value, 0.0, 1.0);
+    if (v <= 0.12) {
+        return SamplePointCloudColormapSegment(v, 0.00, 0.12, vec3(0.00, 0.00, 0.00), vec3(0.10, 0.00, 0.32));
+    }
+    if (v <= 0.32) {
+        return SamplePointCloudColormapSegment(v, 0.12, 0.32, vec3(0.10, 0.00, 0.32), vec3(0.00, 0.12, 0.85));
+    }
+    if (v <= 0.50) {
+        return SamplePointCloudColormapSegment(v, 0.32, 0.50, vec3(0.00, 0.12, 0.85), vec3(0.00, 0.82, 0.95));
+    }
+    if (v <= 0.68) {
+        return SamplePointCloudColormapSegment(v, 0.50, 0.68, vec3(0.00, 0.82, 0.95), vec3(0.98, 0.92, 0.00));
+    }
+    if (v <= 0.84) {
+        return SamplePointCloudColormapSegment(v, 0.68, 0.84, vec3(0.98, 0.92, 0.00), vec3(1.00, 0.26, 0.00));
+    }
+    return SamplePointCloudColormapSegment(v, 0.84, 1.00, vec3(1.00, 0.26, 0.00), vec3(1.00, 1.00, 1.00));
+}
+
 vec3 ApplyPointCloudColormap(uint colormapId, float value) {
     if (colormapId == 1u) {
         return SamplePointCloudColormapLut(kPlasmaColormap, value);
@@ -77,6 +185,21 @@ vec3 ApplyPointCloudColormap(uint colormapId, float value) {
     }
     if (colormapId == 5u) {
         return SamplePointCloudColormapLut(kTurboColormap, value);
+    }
+    if (colormapId == 6u) {
+        return SampleTopographicColormap(value);
+    }
+    if (colormapId == 7u) {
+        return SampleLandSurfaceColormap(value);
+    }
+    if (colormapId == 8u) {
+        return SampleExponentialFireColormap(value);
+    }
+    if (colormapId == 9u) {
+        return SampleExponentialIceColormap(value);
+    }
+    if (colormapId == 10u) {
+        return SampleHighContrastColormap(value);
     }
     return SamplePointCloudColormapLut(kViridisColormap, value);
 }

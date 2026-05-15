@@ -4,6 +4,7 @@
 #include "camera/CameraShot.hpp"
 #include "output/RenderPreset.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "water/WaterFlow.hpp"
 
 #include <array>
 #include <cstddef>
@@ -36,28 +37,48 @@ struct ProjectLayerDocument {
 };
 
 struct ProjectDocument {
-    std::uint32_t schemaVersion = 11;
+    struct SavedAnimation {
+        std::filesystem::path filePath;
+        std::vector<std::filesystem::path> associatedLayerPaths;
+    };
+
+    std::uint32_t schemaVersion = 17;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
     std::vector<invisible_places::camera::CameraShot> cameraShots;
     std::vector<std::size_t> cameraPathShotIndices;
     std::uint32_t cameraPathDurationFrames = 180;
+    std::vector<SavedAnimation> savedAnimations;
+    bool hasSavedAnimationRegistry = false;
     std::filesystem::path selectedLayerPath;
     std::filesystem::path lastAnimationPath;
     std::array<float, 4> backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
+    bool eyeDomeLightingEnabled = false;
+    bool constantUpdateView = false;
+    bool liveVisualEffects = false;
     bool sidePanelPinned = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
     invisible_places::renderer::pointcloud::PointCloudPreviewLodMode pointCloudPreviewLodMode =
         invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::AutoCameraLod;
     std::uint64_t interactivePointCap = 10'000'000ULL;
+    invisible_places::renderer::pointcloud::PointCloudRendererMode pointCloudRendererMode =
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
     invisible_places::output::RenderJobSettings renderJobSettings{};
+    std::vector<invisible_places::water::WaterEmitter> waterEmitters;
+    invisible_places::water::WaterBakeSettings waterBakeSettings{};
 };
 
 struct PointCloudStylePresetDocument {
     std::uint32_t schemaVersion = 2;
     std::string presetName;
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
+};
+
+struct WaterSourcesDocument {
+    std::uint32_t schemaVersion = 1;
+    std::vector<invisible_places::water::WaterEmitter> emitters;
+    invisible_places::water::WaterBakeSettings bakeSettings{};
 };
 
 bool SaveProjectDocument(
@@ -79,6 +100,13 @@ bool SavePointCloudStylePreset(
     const std::filesystem::path& outputPath,
     std::string* errorMessage);
 std::optional<PointCloudStylePresetDocument> LoadPointCloudStylePreset(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage);
+bool SaveWaterSourcesDocument(
+    const WaterSourcesDocument& document,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage);
+std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     const std::filesystem::path& inputPath,
     std::string* errorMessage);
 

@@ -8,6 +8,8 @@ layout(location = 4) out float outXray;
 layout(location = 5) out float outDepthFade;
 layout(location = 6) out float outViewDepth;
 layout(location = 7) out vec2 outDiscCoord;
+layout(location = 8) flat out uint outPointIndex;
+layout(location = 9) out float outSurfaceAngleMask;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -47,6 +49,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
     vec4 colorize;
+    uvec4 stylisationControl;
+    vec4 stylisationParams0;
+    vec4 stylisationParams1;
+    vec4 stylisationParams2;
 } styleData;
 
 layout(set = 0, binding = 4, std430) readonly buffer SurfelPositions {
@@ -64,6 +70,11 @@ layout(set = 0, binding = 6, std430) readonly buffer SurfelNormals {
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
 const uint kSurfelVerticesPerPoint = 6u;
+const uint kWaterPhaseFieldSlot = 3u;
+const uint kWaterSpeedFieldSlot = 4u;
+const uint kWaterConfidenceFieldSlot = 6u;
+const uint kWaterAccumulationFieldSlot = 7u;
+const uint kWaterPoolingFieldSlot = 8u;
 
 const vec2 kSurfelCorners[6] = vec2[](
     vec2(-1.0, -1.0),
@@ -107,6 +118,33 @@ float EvaluateBinding(RenderParameterBindingGpu binding, uint pointIndex) {
     return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
 }
 
+vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
+    if (styleData.pointMeta.w == 0u || styleData.globalControl.z <= kWaterSpeedFieldSlot) {
+        return vec2(opacity, emissive);
+    }
+
+    const float phase = LoadScalarFieldValue(kWaterPhaseFieldSlot, pointIndex);
+    const float speed = max(0.02, LoadScalarFieldValue(kWaterSpeedFieldSlot, pointIndex));
+    const float confidence =
+        styleData.globalControl.z > kWaterConfidenceFieldSlot
+            ? clamp(LoadScalarFieldValue(kWaterConfidenceFieldSlot, pointIndex), 0.0, 1.0)
+            : 1.0;
+    const float accumulation =
+        styleData.globalControl.z > kWaterAccumulationFieldSlot
+            ? clamp(LoadScalarFieldValue(kWaterAccumulationFieldSlot, pointIndex), 0.0, 1.0)
+            : 0.0;
+    const float pooling =
+        styleData.globalControl.z > kWaterPoolingFieldSlot
+            ? clamp(LoadScalarFieldValue(kWaterPoolingFieldSlot, pointIndex), 0.0, 1.0)
+            : 0.0;
+    const float wave = 0.5 + (0.5 * sin((phase - uniforms.depthParameters.x * speed) * 6.28318530718));
+    const float crest = smoothstep(0.58, 1.0, wave);
+    const float alphaPulse = clamp((0.24 + crest * 0.82 + pooling * 0.24) * confidence, 0.0, 1.25);
+    const float emissivePulse =
+        clamp((0.70 + crest * 2.10 + accumulation * 1.25 + pooling * 0.55) * confidence, 0.0, 4.5);
+    return vec2(opacity * alphaPulse, emissive * emissivePulse);
+}
+
 vec4 UnpackRgba8(uint packedColor) {
     return vec4(
         float(packedColor & 0xFFu) / 255.0,
@@ -123,7 +161,12 @@ vec3 CameraUp() {
     return normalize(vec3(uniforms.view[0][1], uniforms.view[1][1], uniforms.view[2][1]));
 }
 
-void ResolveBasis(vec3 center, uint pointIndex, out vec3 tangent, out vec3 bitangent) {
+void ResolveBasis(
+    vec3 center,
+    uint pointIndex,
+    out vec3 tangent,
+    out vec3 bitangent,
+    out float surfaceAngleMask) {
     const vec3 cameraRight = CameraRight();
     const vec3 cameraUp = CameraUp();
     const bool forceCameraFacing = styleData.renderControl.z == 2u;
@@ -134,10 +177,12 @@ void ResolveBasis(vec3 center, uint pointIndex, out vec3 tangent, out vec3 bitan
     if (!useNormal) {
         tangent = cameraRight;
         bitangent = cameraUp;
+        surfaceAngleMask = 0.0;
         return;
     }
 
     normal = normalize(normal);
+    surfaceAngleMask = clamp(1.0 - abs(dot(normal, normalize(uniforms.cameraPosition.xyz - center))), 0.0, 1.0);
     tangent = cameraRight - (normal * dot(cameraRight, normal));
     if (dot(tangent, tangent) <= 1e-8) {
         tangent = cameraUp - (normal * dot(cameraUp, normal));
@@ -178,7 +223,8 @@ void main() {
     const vec3 center = surfelPositions.positions[pointIndex].xyz;
     vec3 tangent;
     vec3 bitangent;
-    ResolveBasis(center, pointIndex, tangent, bitangent);
+    float surfaceAngleMask;
+    ResolveBasis(center, pointIndex, tangent, bitangent, surfaceAngleMask);
 
     const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
     const float centerDepth = -centerViewPosition.z;
@@ -193,10 +239,16 @@ void main() {
 
     outSourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding, pointIndex);
-    outOpacity = EvaluateBinding(styleData.opacityBinding, pointIndex);
-    outEmissive = EvaluateBinding(styleData.emissiveBinding, pointIndex);
+    const vec2 animatedFlow = ApplyWaterFlowAnimation(
+        EvaluateBinding(styleData.opacityBinding, pointIndex),
+        EvaluateBinding(styleData.emissiveBinding, pointIndex),
+        pointIndex);
+    outOpacity = animatedFlow.x;
+    outEmissive = animatedFlow.y;
     outXray = EvaluateBinding(styleData.xrayBinding, pointIndex);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;
     outDiscCoord = corner;
+    outPointIndex = pointIndex;
+    outSurfaceAngleMask = surfaceAngleMask;
 }

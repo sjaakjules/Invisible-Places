@@ -16,6 +16,8 @@ struct OfflinePointLayer {
     const invisible_places::io::LoadedPointCloud* cloud = nullptr;
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
     bool hasSourceRgb = false;
+    bool fastBasic = false;
+    std::uint64_t drawPointCount = 0;
     glm::mat4 localToWorld{1.0F};
 };
 
@@ -62,6 +64,7 @@ void RenderPointCloudTile(
     const OfflineRenderTile& tile,
     ExrImage* image,
     OfflinePointRenderDiagnostics* diagnostics = nullptr,
-    OfflinePointRenderScratch* scratch = nullptr);
+    OfflinePointRenderScratch* scratch = nullptr,
+    float stylisationTimeSeconds = 0.0F);
 
 }  // namespace invisible_places::output

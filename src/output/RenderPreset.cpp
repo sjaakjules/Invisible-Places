@@ -100,7 +100,7 @@ std::vector<invisible_places::camera::CameraState> BuildAnimationRenderSequence(
     const auto sourceDurationFrames = std::max(path.durationFrames, minimumFrames);
     const auto outputDurationFrames =
         ScaleThirtyFpsFramesToOutputFps(sourceDurationFrames, settings.framesPerSecond);
-    const float durationSeconds = static_cast<float>(sourceDurationFrames) / 30.0F;
+    const float durationSeconds = invisible_places::camera::AnimationPathDurationSeconds(path);
 
     std::vector<invisible_places::camera::CameraState> frames;
     frames.reserve(static_cast<std::size_t>(outputDurationFrames) + 1U);

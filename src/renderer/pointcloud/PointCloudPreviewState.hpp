@@ -11,7 +11,7 @@
 
 namespace invisible_places::renderer::pointcloud {
 
-inline constexpr float kInactivePointSizeDefault = 2.0F;
+inline constexpr float kInactivePointSizeDefault = 1.0F;
 inline constexpr float kInactiveSurfelDiameterDefault = 0.005F;
 inline constexpr float kInactiveOpacityDefault = 1.0F;
 inline constexpr float kInactiveEmissionDefault = 0.0F;
@@ -31,7 +31,12 @@ enum class PointCloudColormapId {
     Inferno,
     Magma,
     Cividis,
-    Turbo
+    Turbo,
+    Topographic,
+    LandSurface,
+    ExponentialFire,
+    ExponentialIce,
+    HighContrast
 };
 
 enum class PointCloudGeometryMode {
@@ -53,13 +58,31 @@ enum class PointCloudFalloffProfile {
     Rim
 };
 
+enum class PointCloudStylisationMode {
+    Off,
+    NprStylisation,
+    BrushParticles
+};
+
+enum class PointCloudNprPreset {
+    Watercolor,
+    Cartoon
+};
+
 enum class PointCloudPreviewLodMode {
     FullResolution,
     AutoCameraLod,
     ForceLod
 };
 
+enum class PointCloudRendererMode {
+    Beauty,
+    FastBasic,
+    Raytraced
+};
+
 enum class PointCloudMaterialVariant {
+    OpaqueHardDisc,
     ConstantSimple,
     Unified
 };
@@ -69,12 +92,26 @@ struct PointCloudStyleState {
 
     PointCloudGeometryMode geometryMode = PointCloudGeometryMode::ScreenSprites;
     PointCloudDepthContribution depthContribution = PointCloudDepthContribution::None;
-    PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::SoftDisc;
+    PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::HardDisc;
+    PointCloudStylisationMode stylisationMode = PointCloudStylisationMode::Off;
+    PointCloudNprPreset nprPreset = PointCloudNprPreset::Watercolor;
     PointCloudColorMode colorMode = PointCloudColorMode::SourceRgb;
     PointCloudColormapId colormap = PointCloudColormapId::Viridis;
     std::array<float, 4> solidColor{0.93F, 0.88F, 0.72F, 1.0F};
     std::array<float, 3> colorizeColor{0.95F, 0.68F, 0.28F};
     float colorizeAmount = 0.0F;
+    float stylisationStrength = 1.0F;
+    float stylisationColorLevels = 5.0F;
+    float stylisationInkStrength = 0.35F;
+    float stylisationPaperGrain = 0.35F;
+    float stylisationPigmentBleed = 0.45F;
+    float brushAspect = 2.2F;
+    float strokeJitter = 0.35F;
+    float hatchStrength = 0.0F;
+    float strokeOpacityVariance = 0.25F;
+    float pigmentVariation = 0.0F;
+    float pigmentAnimationSpeed = 0.0F;
+    float granulationAngleStrength = 0.0F;
     float exposure = 1.0F;
     float innerRadius = 0.55F;
     float gaussianSharpness = 4.0F;
@@ -87,6 +124,7 @@ struct PointCloudStyleState {
     float densityClamp = 64.0F;
     float depthAlphaThreshold = 0.5F;
     bool solidCenters = true;
+    bool flowAnimation = false;
     invisible_places::style::RenderParameterBinding pointSize;
     invisible_places::style::RenderParameterBinding surfelDiameter;
     invisible_places::style::RenderParameterBinding opacity;
@@ -130,6 +168,9 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style, bool sceneHasActiveXray);
 [[nodiscard]] bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha);
 [[nodiscard]] bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style);
+[[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
+    const PointCloudStyleState& sourceStyle,
+    bool hasSourceRgb);
 [[nodiscard]] PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style);
 [[nodiscard]] const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant);
 PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t requestedPoints);

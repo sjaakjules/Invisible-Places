@@ -4,6 +4,7 @@
 
 #include <fstream>
 #include <optional>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -23,11 +24,19 @@ using invisible_places::renderer::pointcloud::PointCloudColormapId;
 using invisible_places::renderer::pointcloud::PointCloudDepthContribution;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+using invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
+using invisible_places::renderer::pointcloud::PointCloudRendererMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
+using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using invisible_places::style::FieldMapConfig;
 using invisible_places::style::ParameterSourceMode;
 using invisible_places::style::RenderParameterBinding;
+using invisible_places::water::WaterBakeSettings;
+using invisible_places::water::WaterEmitter;
+using invisible_places::water::WaterEmitterOrigin;
+using invisible_places::water::WaterEmitterStatus;
+using invisible_places::water::WaterScaleMode;
 
 enum class LegacyPointCloudRenderMode {
     Solid,
@@ -93,6 +102,16 @@ const char* PointCloudColormapName(PointCloudColormapId colormap) {
             return "cividis";
         case PointCloudColormapId::Turbo:
             return "turbo";
+        case PointCloudColormapId::Topographic:
+            return "topographic";
+        case PointCloudColormapId::LandSurface:
+            return "land_surface";
+        case PointCloudColormapId::ExponentialFire:
+            return "exponential_fire";
+        case PointCloudColormapId::ExponentialIce:
+            return "exponential_ice";
+        case PointCloudColormapId::HighContrast:
+            return "high_contrast";
     }
 
     return "viridis";
@@ -114,6 +133,21 @@ PointCloudColormapId ParsePointCloudColormap(const json& value) {
     }
     if (colormapName == "turbo") {
         return PointCloudColormapId::Turbo;
+    }
+    if (colormapName == "topographic" || colormapName == "topo") {
+        return PointCloudColormapId::Topographic;
+    }
+    if (colormapName == "land_surface" || colormapName == "landsurf") {
+        return PointCloudColormapId::LandSurface;
+    }
+    if (colormapName == "exponential_fire" || colormapName == "exp_fire") {
+        return PointCloudColormapId::ExponentialFire;
+    }
+    if (colormapName == "exponential_ice" || colormapName == "exp_ice") {
+        return PointCloudColormapId::ExponentialIce;
+    }
+    if (colormapName == "high_contrast") {
+        return PointCloudColormapId::HighContrast;
     }
     return PointCloudColormapId::Viridis;
 }
@@ -140,6 +174,30 @@ PointCloudPreviewLodMode ParsePointCloudPreviewLodMode(const json& value) {
         return PointCloudPreviewLodMode::ForceLod;
     }
     return PointCloudPreviewLodMode::AutoCameraLod;
+}
+
+const char* PointCloudRendererModeName(PointCloudRendererMode mode) {
+    switch (mode) {
+        case PointCloudRendererMode::Beauty:
+            return "beauty";
+        case PointCloudRendererMode::FastBasic:
+            return "fast_basic";
+        case PointCloudRendererMode::Raytraced:
+            return "raytraced";
+    }
+
+    return "beauty";
+}
+
+PointCloudRendererMode ParsePointCloudRendererMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "fast_basic") {
+        return PointCloudRendererMode::FastBasic;
+    }
+    if (modeName == "raytraced") {
+        return PointCloudRendererMode::Raytraced;
+    }
+    return PointCloudRendererMode::Beauty;
 }
 
 const char* PointCloudGeometryModeName(PointCloudGeometryMode mode) {
@@ -242,6 +300,49 @@ PointCloudFalloffProfile ParsePointCloudFalloffProfile(const json& value) {
         return PointCloudFalloffProfile::Rim;
     }
     return PointCloudFalloffProfile::SoftDisc;
+}
+
+const char* PointCloudStylisationModeName(PointCloudStylisationMode mode) {
+    switch (mode) {
+        case PointCloudStylisationMode::Off:
+            return "off";
+        case PointCloudStylisationMode::NprStylisation:
+            return "npr_stylisation";
+        case PointCloudStylisationMode::BrushParticles:
+            return "brush_particles";
+    }
+
+    return "off";
+}
+
+PointCloudStylisationMode ParsePointCloudStylisationMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "npr_stylisation" || modeName == "npr_stylization") {
+        return PointCloudStylisationMode::NprStylisation;
+    }
+    if (modeName == "brush_particles") {
+        return PointCloudStylisationMode::BrushParticles;
+    }
+    return PointCloudStylisationMode::Off;
+}
+
+const char* PointCloudNprPresetName(PointCloudNprPreset preset) {
+    switch (preset) {
+        case PointCloudNprPreset::Watercolor:
+            return "watercolor";
+        case PointCloudNprPreset::Cartoon:
+            return "cartoon";
+    }
+
+    return "watercolor";
+}
+
+PointCloudNprPreset ParsePointCloudNprPreset(const json& value) {
+    const auto presetName = value.get<std::string>();
+    if (presetName == "cartoon") {
+        return PointCloudNprPreset::Cartoon;
+    }
+    return PointCloudNprPreset::Watercolor;
 }
 
 const char* SerializedLayerKindName(SerializedLayerKind kind) {
@@ -348,11 +449,25 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
         {"depth_contribution", PointCloudDepthContributionName(style.depthContribution)},
         {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
+        {"stylisation_mode", PointCloudStylisationModeName(style.stylisationMode)},
+        {"npr_preset", PointCloudNprPresetName(style.nprPreset)},
         {"color_mode", PointCloudColorModeName(style.colorMode)},
         {"colormap", PointCloudColormapName(style.colormap)},
         {"solid_color", style.solidColor},
         {"colorize_color", style.colorizeColor},
         {"colorize_amount", style.colorizeAmount},
+        {"stylisation_strength", style.stylisationStrength},
+        {"stylisation_color_levels", style.stylisationColorLevels},
+        {"stylisation_ink_strength", style.stylisationInkStrength},
+        {"stylisation_paper_grain", style.stylisationPaperGrain},
+        {"stylisation_pigment_bleed", style.stylisationPigmentBleed},
+        {"brush_aspect", style.brushAspect},
+        {"stroke_jitter", style.strokeJitter},
+        {"hatch_strength", style.hatchStrength},
+        {"stroke_opacity_variance", style.strokeOpacityVariance},
+        {"pigment_variation", style.pigmentVariation},
+        {"pigment_animation_speed", style.pigmentAnimationSpeed},
+        {"granulation_angle_strength", style.granulationAngleStrength},
         {"exposure", style.exposure},
         {"inner_radius", style.innerRadius},
         {"gaussian_sharpness", style.gaussianSharpness},
@@ -365,6 +480,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"density_clamp", style.densityClamp},
         {"depth_alpha_threshold", style.depthAlphaThreshold},
         {"solid_centers", style.solidCenters},
+        {"flow_animation", style.flowAnimation},
         {"point_size", SerializeBinding(style.pointSize)},
         {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
@@ -409,6 +525,14 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     if (styleJson.contains("falloff_profile")) {
         style.falloffProfile = ParsePointCloudFalloffProfile(styleJson.at("falloff_profile"));
     }
+    if (styleJson.contains("stylisation_mode")) {
+        style.stylisationMode = ParsePointCloudStylisationMode(styleJson.at("stylisation_mode"));
+    } else if (styleJson.contains("stylization_mode")) {
+        style.stylisationMode = ParsePointCloudStylisationMode(styleJson.at("stylization_mode"));
+    }
+    if (styleJson.contains("npr_preset")) {
+        style.nprPreset = ParsePointCloudNprPreset(styleJson.at("npr_preset"));
+    }
     if (styleJson.contains("color_mode")) {
         style.colorMode = ParsePointCloudColorMode(styleJson.at("color_mode"));
     }
@@ -424,6 +548,40 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
         style.colorizeColor = styleJson.at("colourise_color").get<std::array<float, 3>>();
     }
     style.colorizeAmount = styleJson.value("colorize_amount", styleJson.value("colourise_amount", style.colorizeAmount));
+    style.stylisationStrength = styleJson.value(
+        "stylisation_strength",
+        styleJson.value("stylization_strength", style.stylisationStrength));
+    style.stylisationColorLevels = styleJson.value(
+        "stylisation_color_levels",
+        styleJson.value("stylization_color_levels", style.stylisationColorLevels));
+    style.stylisationInkStrength = styleJson.value(
+        "stylisation_ink_strength",
+        styleJson.value("stylization_ink_strength", style.stylisationInkStrength));
+    style.stylisationPaperGrain = styleJson.value(
+        "stylisation_paper_grain",
+        styleJson.value("stylization_paper_grain", style.stylisationPaperGrain));
+    style.stylisationPigmentBleed = styleJson.value(
+        "stylisation_pigment_bleed",
+        styleJson.value("stylization_pigment_bleed", style.stylisationPigmentBleed));
+    style.brushAspect = styleJson.value("brush_aspect", style.brushAspect);
+    style.strokeJitter = styleJson.value("stroke_jitter", style.strokeJitter);
+    style.hatchStrength = styleJson.value("hatch_strength", style.hatchStrength);
+    style.strokeOpacityVariance = styleJson.value(
+        "stroke_opacity_variance",
+        style.strokeOpacityVariance);
+    style.pigmentVariation = styleJson.value(
+        "pigment_variation",
+        styleJson.value("stylisation_pigment_variation", styleJson.value("stylization_pigment_variation", style.pigmentVariation)));
+    style.pigmentAnimationSpeed = styleJson.value(
+        "pigment_animation_speed",
+        styleJson.value(
+            "stylisation_pigment_animation_speed",
+            styleJson.value("stylization_pigment_animation_speed", style.pigmentAnimationSpeed)));
+    style.granulationAngleStrength = styleJson.value(
+        "granulation_angle_strength",
+        styleJson.value(
+            "stylisation_granulation_angle_strength",
+            styleJson.value("stylization_granulation_angle_strength", style.granulationAngleStrength)));
     style.exposure = styleJson.value("exposure", style.exposure);
     style.innerRadius = styleJson.value("inner_radius", style.innerRadius);
     style.gaussianSharpness = styleJson.value("gaussian_sharpness", style.gaussianSharpness);
@@ -436,6 +594,7 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.densityClamp = styleJson.value("density_clamp", style.densityClamp);
     style.depthAlphaThreshold = styleJson.value("depth_alpha_threshold", style.depthAlphaThreshold);
     style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
+    style.flowAnimation = styleJson.value("flow_animation", style.flowAnimation);
     if (styleJson.contains("point_size")) {
         style.pointSize = ParseBinding(styleJson.at("point_size"));
     }
@@ -556,26 +715,110 @@ CameraState ParseCameraState(const json& stateJson) {
     return state;
 }
 
+json SerializePathArray(const std::vector<std::filesystem::path>& paths) {
+    json pathsJson = json::array();
+    for (const auto& path : paths) {
+        pathsJson.push_back(path.generic_string());
+    }
+    return pathsJson;
+}
+
+std::vector<std::filesystem::path> ParsePathArray(const json& pathsJson) {
+    std::vector<std::filesystem::path> paths;
+    if (!pathsJson.is_array()) {
+        return paths;
+    }
+
+    for (const auto& pathJson : pathsJson) {
+        if (pathJson.is_string()) {
+            paths.emplace_back(pathJson.get<std::string>());
+        }
+    }
+    return paths;
+}
+
 json SerializeCameraShot(const CameraShot& shot) {
-    return json{
+    auto shotJson = json{
+        {"id", shot.id},
         {"name", shot.name},
-        {"duration_frames", shot.durationFrames},
         {"camera", SerializeCameraState(shot.state)},
+        {"associated_layer_paths", SerializePathArray(shot.associatedLayerPaths)},
     };
+    return shotJson;
 }
 
 CameraShot ParseCameraShot(const json& shotJson) {
     CameraShot shot;
+    shot.id = shotJson.value("id", std::string{});
     shot.name = shotJson.value("name", std::string{"Camera Shot"});
     shot.durationFrames = shotJson.value("duration_frames", 90U);
     if (shotJson.contains("camera")) {
         shot.state = ParseCameraState(shotJson.at("camera"));
     }
+    if (shotJson.contains("associated_layer_paths")) {
+        shot.associatedLayerPaths = ParsePathArray(shotJson.at("associated_layer_paths"));
+    }
     return shot;
+}
+
+std::string UniqueIndexedId(
+    const char* prefix,
+    std::size_t index,
+    std::unordered_set<std::string>* usedIds) {
+    if (usedIds == nullptr) {
+        return std::string{prefix} + std::to_string(index + 1U);
+    }
+
+    auto candidate = std::string{prefix} + std::to_string(index + 1U);
+    std::size_t suffix = index + 1U;
+    while (usedIds->contains(candidate)) {
+        candidate = std::string{prefix} + std::to_string(++suffix);
+    }
+    usedIds->insert(candidate);
+    return candidate;
+}
+
+void EnsureCameraShotIds(std::vector<CameraShot>* shots) {
+    if (shots == nullptr) {
+        return;
+    }
+
+    std::unordered_set<std::string> usedIds;
+    for (const auto& shot : *shots) {
+        if (!shot.id.empty()) {
+            usedIds.insert(shot.id);
+        }
+    }
+
+    for (std::size_t index = 0; index < shots->size(); ++index) {
+        if ((*shots)[index].id.empty()) {
+            (*shots)[index].id = UniqueIndexedId("camera_", index, &usedIds);
+        }
+    }
+}
+
+void EnsureAnimationPathKeyIds(AnimationPath* path) {
+    if (path == nullptr) {
+        return;
+    }
+
+    std::unordered_set<std::string> usedIds;
+    for (const auto& key : path->keys) {
+        if (!key.id.empty()) {
+            usedIds.insert(key.id);
+        }
+    }
+
+    for (std::size_t index = 0; index < path->keys.size(); ++index) {
+        if (path->keys[index].id.empty()) {
+            path->keys[index].id = UniqueIndexedId("key_", index, &usedIds);
+        }
+    }
 }
 
 json SerializeAnimationPathKey(const AnimationPathKey& key) {
     return json{
+        {"id", key.id},
         {"camera_position", key.cameraPosition},
         {"focus_point", key.focusPoint},
         {"fov_degrees", key.fovDegrees},
@@ -583,11 +826,14 @@ json SerializeAnimationPathKey(const AnimationPathKey& key) {
         {"far_plane", key.farPlane},
         {"duration_frames", key.durationFrames},
         {"source_shot_name", key.sourceShotName},
+        {"linked_camera_id", key.linkedCameraId},
+        {"linked_camera_name", key.linkedCameraName},
     };
 }
 
 AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
     AnimationPathKey key;
+    key.id = keyJson.value("id", std::string{});
     if (keyJson.contains("camera_position")) {
         key.cameraPosition = keyJson.at("camera_position").get<std::array<float, 3>>();
     }
@@ -599,6 +845,8 @@ AnimationPathKey ParseAnimationPathKey(const json& keyJson) {
     key.farPlane = keyJson.value("far_plane", key.farPlane);
     key.durationFrames = keyJson.value("duration_frames", key.durationFrames);
     key.sourceShotName = keyJson.value("source_shot_name", std::string{});
+    key.linkedCameraId = keyJson.value("linked_camera_id", std::string{});
+    key.linkedCameraName = keyJson.value("linked_camera_name", std::string{});
     return key;
 }
 
@@ -626,9 +874,10 @@ AnimationExportSettings ParseAnimationExportSettings(const json& settingsJson) {
 
 json SerializeAnimationPath(const AnimationPath& path) {
     json pathJson{
-        {"schema_version", 2U},
+        {"schema_version", 4U},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
+        {"associated_layer_paths", SerializePathArray(path.associatedLayerPaths)},
         {"depth_of_field_enabled", path.depthOfFieldEnabled},
         {"aperture_f_stops", path.apertureFStops},
         {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
@@ -646,6 +895,9 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     AnimationPath path;
     path.name = pathJson.value("name", path.name);
     path.durationFrames = pathJson.value("duration_frames", path.durationFrames);
+    if (pathJson.contains("associated_layer_paths")) {
+        path.associatedLayerPaths = ParsePathArray(pathJson.at("associated_layer_paths"));
+    }
     path.depthOfFieldEnabled = pathJson.value("depth_of_field_enabled", path.depthOfFieldEnabled);
     path.apertureFStops = pathJson.value("aperture_f_stops", path.apertureFStops);
     path.depthOfFieldMaxBlurPixels =
@@ -661,6 +913,7 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
             path.keys.push_back(ParseAnimationPathKey(keyJson));
         }
     }
+    EnsureAnimationPathKeyIds(&path);
     return path;
 }
 
@@ -689,6 +942,141 @@ RenderJobSettings ParseRenderJobSettings(const json& settingsJson) {
     settings.endFrame = settingsJson.value("end_frame", 0U);
     settings.fromShotIndex = settingsJson.value("from_shot_index", static_cast<std::size_t>(0U));
     settings.toShotIndex = settingsJson.value("to_shot_index", static_cast<std::size_t>(1U));
+    return settings;
+}
+
+json SerializeSavedAnimation(const ProjectDocument::SavedAnimation& animation) {
+    return json{
+        {"file_path", animation.filePath.generic_string()},
+        {"associated_layer_paths", SerializePathArray(animation.associatedLayerPaths)},
+    };
+}
+
+ProjectDocument::SavedAnimation ParseSavedAnimation(const json& animationJson) {
+    ProjectDocument::SavedAnimation animation;
+    animation.filePath = animationJson.value("file_path", std::string{});
+    if (animationJson.contains("associated_layer_paths")) {
+        animation.associatedLayerPaths = ParsePathArray(animationJson.at("associated_layer_paths"));
+    }
+    return animation;
+}
+
+std::string SerializedWaterScaleModeName(WaterScaleMode mode) {
+    return invisible_places::water::WaterScaleModeName(mode);
+}
+
+WaterScaleMode ParseWaterScaleMode(const json& modeJson) {
+    const auto modeName = modeJson.get<std::string>();
+    if (modeName == "aerial") {
+        return WaterScaleMode::Aerial;
+    }
+    if (modeName == "detail") {
+        return WaterScaleMode::Detail;
+    }
+    return WaterScaleMode::Mid;
+}
+
+std::string SerializedWaterEmitterOriginName(WaterEmitterOrigin origin) {
+    return invisible_places::water::WaterEmitterOriginName(origin);
+}
+
+WaterEmitterOrigin ParseWaterEmitterOrigin(const json& originJson) {
+    const auto originName = originJson.get<std::string>();
+    if (originName == "auto") {
+        return WaterEmitterOrigin::AutoSuggested;
+    }
+    if (originName == "propagated") {
+        return WaterEmitterOrigin::Propagated;
+    }
+    return WaterEmitterOrigin::Manual;
+}
+
+std::string SerializedWaterEmitterStatusName(WaterEmitterStatus status) {
+    return invisible_places::water::WaterEmitterStatusName(status);
+}
+
+WaterEmitterStatus ParseWaterEmitterStatus(const json& statusJson) {
+    const auto statusName = statusJson.get<std::string>();
+    if (statusName == "candidate") {
+        return WaterEmitterStatus::Candidate;
+    }
+    if (statusName == "disabled") {
+        return WaterEmitterStatus::Disabled;
+    }
+    return WaterEmitterStatus::Accepted;
+}
+
+json SerializeWaterEmitter(const WaterEmitter& emitter) {
+    json emitterJson{
+        {"id", emitter.id},
+        {"name", emitter.name},
+        {"position", std::array<float, 3>{emitter.position.x, emitter.position.y, emitter.position.z}},
+        {"radius", emitter.radius},
+        {"strength", emitter.strength},
+        {"speed", emitter.speed},
+        {"scope", SerializedWaterScaleModeName(emitter.scope)},
+        {"origin", SerializedWaterEmitterOriginName(emitter.origin)},
+        {"status", SerializedWaterEmitterStatusName(emitter.status)},
+        {"confidence", emitter.confidence},
+    };
+    if (emitter.parentId.has_value()) {
+        emitterJson["parent_id"] = emitter.parentId.value();
+    }
+    return emitterJson;
+}
+
+WaterEmitter ParseWaterEmitter(const json& emitterJson) {
+    WaterEmitter emitter;
+    emitter.id = emitterJson.value("id", 0U);
+    emitter.name = emitterJson.value("name", std::string{"Water Source"});
+    if (emitterJson.contains("position")) {
+        const auto position = emitterJson.at("position").get<std::array<float, 3>>();
+        emitter.position = {position[0], position[1], position[2]};
+    }
+    emitter.radius = emitterJson.value("radius", emitter.radius);
+    emitter.strength = emitterJson.value("strength", emitter.strength);
+    emitter.speed = emitterJson.value("speed", emitter.speed);
+    if (emitterJson.contains("scope")) {
+        emitter.scope = ParseWaterScaleMode(emitterJson.at("scope"));
+    }
+    if (emitterJson.contains("origin")) {
+        emitter.origin = ParseWaterEmitterOrigin(emitterJson.at("origin"));
+    }
+    if (emitterJson.contains("status")) {
+        emitter.status = ParseWaterEmitterStatus(emitterJson.at("status"));
+    }
+    emitter.confidence = emitterJson.value("confidence", emitter.confidence);
+    if (emitterJson.contains("parent_id")) {
+        emitter.parentId = emitterJson.at("parent_id").get<std::uint32_t>();
+    }
+    return emitter;
+}
+
+json SerializeWaterBakeSettings(const WaterBakeSettings& settings) {
+    return json{
+        {"scale_mode", SerializedWaterScaleModeName(settings.scaleMode)},
+        {"support_voxel_size", settings.supportVoxelSize},
+        {"max_bridge_distance", settings.maxBridgeDistance},
+        {"smoothing", settings.smoothing},
+        {"path_length", settings.pathLength},
+        {"path_density", settings.pathDensity},
+        {"max_steps", settings.maxSteps},
+        {"support_sample_limit", settings.supportSampleLimit},
+    };
+}
+
+WaterBakeSettings ParseWaterBakeSettings(const json& settingsJson) {
+    WaterBakeSettings settings;
+    if (settingsJson.contains("scale_mode")) {
+        settings.scaleMode = ParseWaterScaleMode(settingsJson.at("scale_mode"));
+    }
+    settings.supportVoxelSize = settingsJson.value("support_voxel_size", settings.supportVoxelSize);
+    settings.maxBridgeDistance = settingsJson.value("max_bridge_distance", settings.maxBridgeDistance);
+    settings.smoothing = settingsJson.value("smoothing", settings.smoothing);
+    settings.pathLength = settingsJson.value("path_length", settings.pathLength);
+    settings.pathDensity = settingsJson.value("path_density", settings.pathDensity);
+    settings.maxSteps = settingsJson.value("max_steps", settings.maxSteps);
+    settings.supportSampleLimit = settingsJson.value("support_sample_limit", settings.supportSampleLimit);
     return settings;
 }
 
@@ -753,11 +1141,16 @@ bool SaveProjectDocument(
         {"selected_layer_path", document.selectedLayerPath.generic_string()},
         {"last_animation_path", document.lastAnimationPath.generic_string()},
         {"background_color", document.backgroundColor},
+        {"eye_dome_lighting_enabled", document.eyeDomeLightingEnabled},
+        {"constant_update_view", document.constantUpdateView},
+        {"live_visual_effects", document.liveVisualEffects},
         {"side_panel_pinned", document.sidePanelPinned},
         {"auto_lower_gsplat_quality_while_navigating", document.autoLowerGsplatQualityWhileNavigating},
         {"point_cloud_preview_lod_mode", PointCloudPreviewLodModeName(document.pointCloudPreviewLodMode)},
         {"interactive_point_cap", document.interactivePointCap},
+        {"point_cloud_renderer_mode", PointCloudRendererModeName(document.pointCloudRendererMode)},
         {"render_job", SerializeRenderJobSettings(document.renderJobSettings)},
+        {"water_bake_settings", SerializeWaterBakeSettings(document.waterBakeSettings)},
     };
     if (document.cameraState.has_value()) {
         projectJson["camera"] = SerializeCameraState(document.cameraState.value());
@@ -776,6 +1169,14 @@ bool SaveProjectDocument(
         {"shot_indices", document.cameraPathShotIndices},
         {"duration_frames", document.cameraPathDurationFrames},
     };
+    projectJson["saved_animations"] = json::array();
+    for (const auto& animation : document.savedAnimations) {
+        projectJson["saved_animations"].push_back(SerializeSavedAnimation(animation));
+    }
+    projectJson["water_emitters"] = json::array();
+    for (const auto& emitter : document.waterEmitters) {
+        projectJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
+    }
 
     return WriteJsonDocument(document, projectJson, outputPath, errorMessage);
 }
@@ -795,6 +1196,9 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.lastAnimationPath = projectJson->value("last_animation_path", std::string{});
     document.backgroundColor =
         projectJson->value("background_color", std::array<float, 4>{0.0F, 0.0F, 0.0F, 1.0F});
+    document.eyeDomeLightingEnabled = projectJson->value("eye_dome_lighting_enabled", false);
+    document.constantUpdateView = projectJson->value("constant_update_view", false);
+    document.liveVisualEffects = projectJson->value("live_visual_effects", false);
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
     document.autoLowerGsplatQualityWhileNavigating =
         projectJson->value("auto_lower_gsplat_quality_while_navigating", true);
@@ -803,8 +1207,15 @@ std::optional<ProjectDocument> LoadProjectDocument(
             ParsePointCloudPreviewLodMode(projectJson->at("point_cloud_preview_lod_mode"));
     }
     document.interactivePointCap = projectJson->value("interactive_point_cap", 10'000'000ULL);
+    if (projectJson->contains("point_cloud_renderer_mode")) {
+        document.pointCloudRendererMode =
+            ParsePointCloudRendererMode(projectJson->at("point_cloud_renderer_mode"));
+    }
     if (projectJson->contains("render_job")) {
         document.renderJobSettings = ParseRenderJobSettings(projectJson->at("render_job"));
+    }
+    if (projectJson->contains("water_bake_settings")) {
+        document.waterBakeSettings = ParseWaterBakeSettings(projectJson->at("water_bake_settings"));
     }
     if (projectJson->contains("camera")) {
         document.cameraState = ParseCameraState(projectJson->at("camera"));
@@ -821,6 +1232,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
             document.cameraShots.push_back(ParseCameraShot(shotJson));
         }
     }
+    EnsureCameraShotIds(&document.cameraShots);
     if (projectJson->contains("camera_path")) {
         const auto& cameraPathJson = projectJson->at("camera_path");
         document.cameraPathDurationFrames =
@@ -830,7 +1242,54 @@ std::optional<ProjectDocument> LoadProjectDocument(
                 cameraPathJson.at("shot_indices").get<std::vector<std::size_t>>();
         }
     }
+    document.hasSavedAnimationRegistry = projectJson->contains("saved_animations");
+    if (document.hasSavedAnimationRegistry && projectJson->at("saved_animations").is_array()) {
+        for (const auto& animationJson : projectJson->at("saved_animations")) {
+            document.savedAnimations.push_back(ParseSavedAnimation(animationJson));
+        }
+    }
+    if (projectJson->contains("water_emitters") && projectJson->at("water_emitters").is_array()) {
+        for (const auto& emitterJson : projectJson->at("water_emitters")) {
+            document.waterEmitters.push_back(ParseWaterEmitter(emitterJson));
+        }
+    }
 
+    return document;
+}
+
+bool SaveWaterSourcesDocument(
+    const WaterSourcesDocument& document,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage) {
+    json sourcesJson{
+        {"schema_version", document.schemaVersion},
+        {"water_bake_settings", SerializeWaterBakeSettings(document.bakeSettings)},
+        {"water_emitters", json::array()},
+    };
+    for (const auto& emitter : document.emitters) {
+        sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
+    }
+    return WriteJsonDocument(document, sourcesJson, outputPath, errorMessage);
+}
+
+std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage) {
+    const auto sourcesJson = ReadJsonDocument(inputPath, errorMessage);
+    if (!sourcesJson.has_value()) {
+        return std::nullopt;
+    }
+
+    WaterSourcesDocument document;
+    document.schemaVersion = sourcesJson->value("schema_version", 1U);
+    if (sourcesJson->contains("water_bake_settings")) {
+        document.bakeSettings = ParseWaterBakeSettings(sourcesJson->at("water_bake_settings"));
+    }
+    if (sourcesJson->contains("water_emitters") && sourcesJson->at("water_emitters").is_array()) {
+        for (const auto& emitterJson : sourcesJson->at("water_emitters")) {
+            document.emitters.push_back(ParseWaterEmitter(emitterJson));
+        }
+    }
     return document;
 }
 

@@ -22,6 +22,11 @@ class OrbitCamera {
         const invisible_places::io::Bounds3f& bounds,
         const invisible_places::io::Float3& focusPoint,
         float aspectRatio);
+    void FrameBounds(
+        const invisible_places::io::Bounds3f& bounds,
+        const invisible_places::io::Float3& focusPoint,
+        float aspectRatio,
+        float distanceScale);
     void ResetToFramedBounds(float aspectRatio);
     void Orbit(float deltaX, float deltaY);
     void Pan(float deltaX, float deltaY, float viewportWidth, float viewportHeight);
@@ -53,7 +58,7 @@ class OrbitCamera {
     [[nodiscard]] glm::vec3 Up() const;
     [[nodiscard]] float EffectiveAspectRatio(float aspectRatio) const;
     void UpdateClippingPlanes();
-    void ApplyFramedBounds(float aspectRatio);
+    void ApplyFramedBounds(float aspectRatio, float distanceScale = 1.0F);
 
     invisible_places::io::Bounds3f framedBounds_{};
     glm::vec3 framedFocusPoint_{0.0F, 0.0F, 0.0F};

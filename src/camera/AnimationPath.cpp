@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 
 #include <glm/geometric.hpp>
@@ -129,8 +130,16 @@ std::array<float, 3> FromGlm(const glm::vec3& value) {
     return {value.x, value.y, value.z};
 }
 
+std::uint32_t MinimumAnimationDurationFrames(const AnimationPath& path) {
+    return path.keys.size() > 1U ? static_cast<std::uint32_t>(path.keys.size() - 1U) : 1U;
+}
+
+float Distance(const std::array<float, 3>& left, const std::array<float, 3>& right) {
+    return glm::length(ToGlm(right) - ToGlm(left));
+}
+
 std::array<float, 3> FocusPointFromShot(const CameraShot& shot) {
-    return shot.state.hasOrbitCenter ? shot.state.orbitCenter : shot.state.target;
+    return shot.state.target;
 }
 
 std::vector<std::uint32_t> BuildSegmentDurations(const AnimationPath& path) {
@@ -310,8 +319,10 @@ AnimationPath BuildAnimationPathFromCameraShots(
     path.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
     path.keys.reserve(orderedShots.size());
 
+    std::size_t keyIndex = 0;
     for (const auto& shot : orderedShots) {
         AnimationPathKey key;
+        key.id = "key_" + std::to_string(++keyIndex);
         key.cameraPosition = shot.state.position;
         key.focusPoint = FocusPointFromShot(shot);
         key.fovDegrees = shot.state.fovDegrees;
@@ -319,10 +330,88 @@ AnimationPath BuildAnimationPathFromCameraShots(
         key.farPlane = shot.state.farPlane;
         key.durationFrames = std::max<std::uint32_t>(1U, shot.durationFrames);
         key.sourceShotName = shot.name;
+        key.linkedCameraId = shot.id;
+        key.linkedCameraName = shot.name;
         path.keys.push_back(std::move(key));
     }
 
     return path;
+}
+
+float AnimationPathDurationSeconds(const AnimationPath& path) {
+    return static_cast<float>(std::max(path.durationFrames, MinimumAnimationDurationFrames(path))) /
+           kAnimationFramesPerSecond;
+}
+
+AnimationPathMotionStats MeasureAnimationPathMotion(
+    const AnimationPath& path,
+    float normalizedTime,
+    std::uint32_t sampleCount) {
+    AnimationPathMotionStats stats;
+    if (path.keys.empty()) {
+        return stats;
+    }
+
+    stats.durationSeconds = AnimationPathDurationSeconds(path);
+    if (stats.durationSeconds <= 1.0e-6F) {
+        return stats;
+    }
+
+    const std::uint32_t steps = std::max<std::uint32_t>(1U, sampleCount);
+    auto previous = EvaluateAnimationPath(path, 0.0F);
+    for (std::uint32_t step = 1U; step <= steps; ++step) {
+        const float timeSeconds =
+            stats.durationSeconds * (static_cast<float>(step) / static_cast<float>(steps));
+        const auto current = EvaluateAnimationPath(path, timeSeconds);
+        stats.cameraDistance += Distance(previous.camera.position, current.camera.position);
+        stats.targetDistance += Distance(previous.focusPoint, current.focusPoint);
+        previous = current;
+    }
+
+    stats.averageCameraSpeed = stats.cameraDistance / stats.durationSeconds;
+    stats.averageTargetSpeed = stats.targetDistance / stats.durationSeconds;
+
+    const float timeSeconds = stats.durationSeconds * std::clamp(normalizedTime, 0.0F, 1.0F);
+    const float deltaSeconds = std::min(
+        std::max(stats.durationSeconds / static_cast<float>(std::max<std::uint32_t>(steps, 30U)), 1.0F / 240.0F),
+        stats.durationSeconds);
+    const float leftTime = std::max(0.0F, timeSeconds - deltaSeconds);
+    const float rightTime = std::min(stats.durationSeconds, timeSeconds + deltaSeconds);
+    const float spanSeconds = rightTime - leftTime;
+    if (spanSeconds > 1.0e-6F) {
+        const auto left = EvaluateAnimationPath(path, leftTime);
+        const auto right = EvaluateAnimationPath(path, rightTime);
+        stats.currentCameraSpeed = Distance(left.camera.position, right.camera.position) / spanSeconds;
+        stats.currentTargetSpeed = Distance(left.focusPoint, right.focusPoint) / spanSeconds;
+    }
+
+    return stats;
+}
+
+std::uint32_t AnimationDurationFramesForAverageSpeed(
+    const AnimationPath& path,
+    AnimationPathMotionTarget target,
+    float worldUnitsPerSecond,
+    std::uint32_t sampleCount) {
+    const std::uint32_t minimumFrames = MinimumAnimationDurationFrames(path);
+    if (worldUnitsPerSecond <= 1.0e-5F || path.keys.empty()) {
+        return minimumFrames;
+    }
+
+    const auto stats = MeasureAnimationPathMotion(path, 0.0F, sampleCount);
+    const float distance =
+        target == AnimationPathMotionTarget::Camera ? stats.cameraDistance : stats.targetDistance;
+    if (distance <= 1.0e-5F) {
+        return minimumFrames;
+    }
+
+    const double requestedFrames =
+        std::ceil(static_cast<double>(distance) / static_cast<double>(worldUnitsPerSecond) *
+                  static_cast<double>(kAnimationFramesPerSecond));
+    if (requestedFrames >= static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+    return std::max<std::uint32_t>(minimumFrames, static_cast<std::uint32_t>(requestedFrames));
 }
 
 AnimationPathEvaluation EvaluateAnimationPath(

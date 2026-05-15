@@ -205,6 +205,7 @@ glm::vec3 ResolvePointColor(
 
 struct OfflinePointSample {
     glm::vec3 worldCenter{0.0F, 0.0F, 0.0F};
+    std::uint32_t pointIndex = 0;
     float pixelCenterX = 0.0F;
     float pixelCenterY = 0.0F;
     float viewDepth = 0.0F;
@@ -277,6 +278,209 @@ float ResolveDepthFadeAlpha(
 
 float AlphaClampMax(const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     return style.solidCenters ? 1.0F : 0.995F;
+}
+
+bool PointStylisationActive(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    return style.stylisationMode !=
+               invisible_places::renderer::pointcloud::PointCloudStylisationMode::Off &&
+           style.stylisationStrength > 1.0e-5F;
+}
+
+float PointHash01(std::uint32_t value) {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return static_cast<float>(value & 0x00ffffffU) / 16777215.0F;
+}
+
+float PointCoordNoise(glm::vec2 coord, std::uint32_t pointIndex) {
+    const auto shifted = glm::clamp(coord, glm::vec2{-2.0F}, glm::vec2{2.0F}) + glm::vec2{2.0F};
+    const auto cellX = static_cast<std::uint32_t>(std::floor(shifted.x * 31.0F));
+    const auto cellY = static_cast<std::uint32_t>(std::floor(shifted.y * 31.0F));
+    return PointHash01((cellX * 1973U) ^ (cellY * 9277U) ^ (pointIndex * 26699U));
+}
+
+float PointTemporalPigmentNoise(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    std::uint32_t pointIndex,
+    std::uint32_t salt,
+    float timeSeconds) {
+    const float speed = std::clamp(style.pigmentAnimationSpeed, 0.0F, 4.0F);
+    if (speed <= 1.0e-5F) {
+        return PointHash01((pointIndex * 747796405U) ^ salt);
+    }
+
+    const float temporal = std::max(0.0F, timeSeconds) * speed * 12.0F;
+    const auto frame = static_cast<std::uint32_t>(std::floor(temporal));
+    const float blend = SmoothStep(0.0F, 1.0F, temporal - std::floor(temporal));
+    const float current = PointHash01((pointIndex * 747796405U) ^ (frame * 2891336453U) ^ salt);
+    const float next = PointHash01((pointIndex * 747796405U) ^ ((frame + 1U) * 2891336453U) ^ salt);
+    return std::lerp(current, next, blend);
+}
+
+float PointWatercolorGranulationMask(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    glm::vec3 color,
+    float surfaceAngleMask) {
+    const float luma = glm::dot(glm::clamp(color, glm::vec3{0.0F}, glm::vec3{1.0F}), glm::vec3{0.299F, 0.587F, 0.114F});
+    const float luminanceMask = 1.0F - SmoothStep(0.18F, 0.92F, luma);
+    const float angleStrength = std::clamp(style.granulationAngleStrength, 0.0F, 1.0F);
+    const float grazingMask =
+        0.35F + (0.65F * SmoothStep(0.05F, 0.85F, std::clamp(surfaceAngleMask, 0.0F, 1.0F)));
+    return std::clamp((0.25F + (0.75F * luminanceMask)) * std::lerp(1.0F, grazingMask, angleStrength), 0.0F, 1.0F);
+}
+
+glm::vec2 PointBrushCoord(
+    glm::vec2 coord,
+    std::uint32_t pointIndex,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    const float jitter = std::clamp(style.strokeJitter, 0.0F, 1.0F);
+    const glm::vec2 jitterOffset{
+        PointHash01(pointIndex * 1664525U + 1013904223U) - 0.5F,
+        PointHash01(pointIndex * 22695477U + 1U) - 0.5F,
+    };
+    coord -= jitterOffset * (jitter * 0.38F);
+
+    const float angle = PointHash01(pointIndex * 747796405U + 2891336453U) * 6.28318530718F;
+    const float cosine = std::cos(angle);
+    const float sine = std::sin(angle);
+    return {
+        (cosine * coord.x) - (sine * coord.y),
+        (sine * coord.x) + (cosine * coord.y),
+    };
+}
+
+float PointBrushRadius(
+    glm::vec2 brushCoord,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    const float aspect = std::max(0.25F, style.brushAspect);
+    const glm::vec2 ellipse{brushCoord.x / aspect, brushCoord.y * aspect};
+    return glm::length(ellipse);
+}
+
+float PointStylisationCoverage(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    glm::vec2 coord,
+    float radius,
+    std::uint32_t pointIndex,
+    float timeSeconds) {
+    if (!PointStylisationActive(style)) {
+        return 1.0F;
+    }
+
+    const float strength = std::clamp(style.stylisationStrength, 0.0F, 1.0F);
+    const float bleed = std::clamp(style.stylisationPigmentBleed, 0.0F, 1.0F);
+    const float grainAmount = std::clamp(style.stylisationPaperGrain, 0.0F, 1.0F);
+
+    if (style.stylisationMode ==
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::NprStylisation) {
+        if (style.nprPreset == invisible_places::renderer::pointcloud::PointCloudNprPreset::Watercolor) {
+            const float edgeDryness = SmoothStep(0.58F, 1.0F, radius) * bleed;
+            const float grain = std::lerp(
+                PointCoordNoise(coord, pointIndex),
+                PointTemporalPigmentNoise(style, pointIndex, 0x9e3779b9U, timeSeconds),
+                std::clamp(style.pigmentVariation, 0.0F, 1.0F) * 0.45F);
+            const float pigmentGap = std::clamp(0.78F + (0.44F * grain), 0.0F, 1.25F);
+            return std::clamp(1.0F - (edgeDryness * pigmentGap * 0.55F * strength), 0.0F, 1.0F);
+        }
+        return 1.0F;
+    }
+
+    const auto brushCoord = PointBrushCoord(coord, pointIndex, style);
+    const float brushRadius = PointBrushRadius(brushCoord, style);
+    if (brushRadius > 1.0F) {
+        return 0.0F;
+    }
+
+    const float edgeWidth = std::max(0.04F, 0.48F * bleed);
+    float coverage = SmoothStep(1.0F, 1.0F - edgeWidth, brushRadius);
+    const float brushGrain = std::lerp(
+        PointCoordNoise(brushCoord, pointIndex + 17U),
+        PointTemporalPigmentNoise(style, pointIndex, 0x85ebca6bU, timeSeconds),
+        std::clamp(style.pigmentVariation, 0.0F, 1.0F) * 0.55F);
+    coverage *= std::lerp(
+        1.0F,
+        0.68F + (0.64F * brushGrain),
+        grainAmount * strength);
+    coverage *= 1.0F -
+                (std::clamp(style.strokeOpacityVariance, 0.0F, 1.0F) *
+                 PointTemporalPigmentNoise(style, pointIndex, 0xc2b2ae35U, timeSeconds) * 0.55F * strength);
+    return std::clamp(coverage, 0.0F, 1.0F);
+}
+
+glm::vec3 QuantizePointColor(
+    glm::vec3 color,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    const float levels = std::max(2.0F, std::floor(style.stylisationColorLevels + 0.5F));
+    color = glm::clamp(color, glm::vec3{0.0F}, glm::vec3{1.0F});
+    return glm::floor((color * levels) + glm::vec3{0.5F}) / levels;
+}
+
+glm::vec3 ApplyPointHatch(
+    glm::vec3 color,
+    glm::vec2 coord,
+    std::uint32_t pointIndex,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    float strength) {
+    const float hatchStrength = std::clamp(style.hatchStrength, 0.0F, 1.0F) * strength;
+    if (hatchStrength <= 1.0e-5F) {
+        return color;
+    }
+
+    const float phase = PointHash01(pointIndex * 374761393U + 668265263U);
+    const float stripe = std::abs(std::fmod(((coord.x + coord.y) * 8.0F) + phase, 1.0F) - 0.5F);
+    const float line = 1.0F - SmoothStep(0.035F, 0.12F, stripe);
+    return color * (1.0F - (line * hatchStrength * 0.55F));
+}
+
+glm::vec3 ApplyPointStylisationColor(
+    glm::vec3 color,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    glm::vec2 coord,
+    std::uint32_t pointIndex,
+    float surfaceAngleMask,
+    float timeSeconds) {
+    if (!PointStylisationActive(style)) {
+        return color;
+    }
+
+    const float strength = std::clamp(style.stylisationStrength, 0.0F, 1.0F);
+    glm::vec2 styleCoord = coord;
+    float styleRadius = glm::length(coord);
+    if (style.stylisationMode ==
+        invisible_places::renderer::pointcloud::PointCloudStylisationMode::BrushParticles) {
+        styleCoord = PointBrushCoord(coord, pointIndex, style);
+        styleRadius = PointBrushRadius(styleCoord, style);
+    }
+
+    glm::vec3 stylised = color;
+    if (style.nprPreset == invisible_places::renderer::pointcloud::PointCloudNprPreset::Cartoon) {
+        stylised = QuantizePointColor(color, style);
+        const float ink = SmoothStep(0.58F, 1.0F, styleRadius) *
+                          std::clamp(style.stylisationInkStrength, 0.0F, 1.0F);
+        stylised *= 1.0F - (ink * 0.78F);
+    } else {
+        const float luma = glm::dot(color, glm::vec3{0.299F, 0.587F, 0.114F});
+        stylised = glm::mix(glm::vec3{luma}, color, 0.72F);
+        stylised = glm::mix(stylised, glm::vec3{1.0F}, 0.08F);
+        const float variation = std::clamp(style.pigmentVariation, 0.0F, 1.0F);
+        const float granulationMask = PointWatercolorGranulationMask(style, color, surfaceAngleMask);
+        const float temporalGrain = PointTemporalPigmentNoise(style, pointIndex, 0x27d4eb2dU, timeSeconds);
+        const float grain = std::lerp(PointCoordNoise(styleCoord, pointIndex), temporalGrain, variation);
+        const float pigmentShift = ((temporalGrain - 0.5F) * 2.0F) * variation * granulationMask;
+        stylised *= 1.0F + (pigmentShift * 0.18F);
+        stylised *= std::lerp(
+            1.0F,
+            0.80F + (0.42F * grain),
+            std::clamp(style.stylisationPaperGrain, 0.0F, 1.0F) * granulationMask);
+    }
+
+    stylised = glm::mix(color, glm::clamp(stylised, glm::vec3{0.0F}, glm::vec3{1.0F}), strength);
+    stylised = ApplyPointHatch(stylised, styleCoord, pointIndex, style, strength);
+    return glm::clamp(stylised, glm::vec3{0.0F}, glm::vec3{1.0F});
 }
 
 float WeightedAlphaWeight(
@@ -390,6 +594,24 @@ void ResolveSurfelBasis(
     sample->bitangent = glm::normalize(glm::cross(sample->normal, sample->tangent));
 }
 
+float PointSurfaceAngleMask(
+    const OfflinePointSample& sample,
+    const invisible_places::camera::OrbitCameraMatrices& matrices) {
+    if (!sample.hasNormal || glm::dot(sample.normal, sample.normal) <= 1.0e-8F) {
+        return 0.0F;
+    }
+
+    const glm::vec3 viewDirection = matrices.position - sample.worldCenter;
+    if (glm::dot(viewDirection, viewDirection) <= 1.0e-8F) {
+        return 0.0F;
+    }
+
+    return std::clamp(
+        1.0F - std::abs(glm::dot(glm::normalize(sample.normal), glm::normalize(viewDirection))),
+        0.0F,
+        1.0F);
+}
+
 bool BuildOfflinePointSample(
     const OfflinePointLayer& layer,
     const invisible_places::camera::OrbitCameraMatrices& matrices,
@@ -435,6 +657,9 @@ bool BuildOfflinePointSample(
     sample->pixelCenterX = (ndc.x * 0.5F + 0.5F) * static_cast<float>(image.width);
     sample->pixelCenterY = (ndc.y * 0.5F + 0.5F) * static_cast<float>(image.height);
     sample->worldCenter = glm::vec3{normalizedWorld};
+    sample->pointIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+        pointIndex,
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
     sample->viewDepth = viewDepth;
     sample->pointSize = std::clamp(
         EvaluateBindingOrDefault(
@@ -480,19 +705,18 @@ bool BuildOfflinePointSample(
                 invisible_places::renderer::pointcloud::kInactiveXrayDefault));
         sample->color = ResolvePointColor(layer, pointIndex);
     }
+    sample->hasNormal = cloud.hasNormals && pointIndex < cloud.normals.size();
+    if (sample->hasNormal) {
+        const glm::vec3 localNormal = ToGlm(cloud.normals[pointIndex]);
+        sample->hasNormal = glm::dot(localNormal, localNormal) > 1.0e-8F;
+        if (sample->hasNormal) {
+            sample->normal = glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
+            sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
+        }
+    }
     if (sample->worldSurfels) {
         if (sample->surfelDiameter <= 1.0e-6F) {
             return false;
-        }
-
-        sample->hasNormal = cloud.hasNormals && pointIndex < cloud.normals.size();
-        if (sample->hasNormal) {
-            const glm::vec3 localNormal = ToGlm(cloud.normals[pointIndex]);
-            sample->hasNormal = glm::dot(localNormal, localNormal) > 1.0e-8F;
-            if (sample->hasNormal) {
-                sample->normal = glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
-                sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
-            }
         }
         ResolveSurfelBasis(
             sample,
@@ -511,6 +735,7 @@ void VisitCoveredPixels(
     const ExrImage& image,
     const OfflineRenderTile& tile,
     std::uint32_t tileWidth,
+    float stylisationTimeSeconds,
     PixelCallback callback) {
     if (sample.worldSurfels) {
         const float radiusWorld = sample.surfelDiameter * 0.5F;
@@ -581,8 +806,16 @@ void VisitCoveredPixels(
                 }
 
                 const float normalizedRadius = std::sqrt(normalizedRadiusSquared);
+                const glm::vec2 normalizedCoord{u / radiusWorld, v / radiusWorld};
                 const float falloff = PointFalloff(style, normalizedRadius, normalizedRadiusSquared);
-                if (falloff <= 1.0e-5F) {
+                const float stylisationCoverage =
+                    PointStylisationCoverage(
+                        style,
+                        normalizedCoord,
+                        normalizedRadius,
+                        sample.pointIndex,
+                        stylisationTimeSeconds);
+                if (falloff <= 1.0e-5F || stylisationCoverage <= 1.0e-5F) {
                     continue;
                 }
 
@@ -599,7 +832,8 @@ void VisitCoveredPixels(
                     static_cast<std::uint32_t>(x),
                     static_cast<std::uint32_t>(y),
                     localIndex,
-                    falloff,
+                    falloff * stylisationCoverage,
+                    normalizedCoord,
                     coveredViewDepth);
             }
         }
@@ -628,8 +862,16 @@ void VisitCoveredPixels(
             }
 
             const float normalizedRadius = std::sqrt(normalizedRadiusSquared);
+            const glm::vec2 normalizedCoord{dx / safeRadius, dy / safeRadius};
             const float falloff = PointFalloff(style, normalizedRadius, normalizedRadiusSquared);
-            if (falloff <= 1.0e-5F) {
+            const float stylisationCoverage =
+                PointStylisationCoverage(
+                    style,
+                    normalizedCoord,
+                    normalizedRadius,
+                    sample.pointIndex,
+                    stylisationTimeSeconds);
+            if (falloff <= 1.0e-5F || stylisationCoverage <= 1.0e-5F) {
                 continue;
             }
 
@@ -640,7 +882,8 @@ void VisitCoveredPixels(
                 static_cast<std::uint32_t>(x),
                 static_cast<std::uint32_t>(y),
                 localIndex,
-                falloff,
+                falloff * stylisationCoverage,
+                normalizedCoord,
                 sample.viewDepth);
         }
     }
@@ -681,13 +924,104 @@ std::vector<OfflineRenderTile> BuildOfflineRenderTiles(
     return tiles;
 }
 
+void RenderFastBasicPointCloudTile(
+    const std::vector<OfflinePointLayer>& layers,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const OfflineRenderTile& tile,
+    ExrImage* image,
+    OfflinePointRenderDiagnostics* diagnostics) {
+    if (image == nullptr) {
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    for (const auto& layer : layers) {
+        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+            continue;
+        }
+        if (diagnostics != nullptr) {
+            ++diagnostics->accumulationPassLayers;
+        }
+
+        const auto& cloud = *layer.cloud;
+        const auto sourcePointCount = cloud.positions.size();
+        const auto drawPointCount =
+            static_cast<std::size_t>(std::min<std::uint64_t>(
+                layer.drawPointCount == 0 ? static_cast<std::uint64_t>(sourcePointCount) : layer.drawPointCount,
+                static_cast<std::uint64_t>(sourcePointCount)));
+        if (drawPointCount == 0) {
+            continue;
+        }
+
+        for (std::size_t sampleIndex = 0; sampleIndex < drawPointCount; ++sampleIndex) {
+            const auto pointIndex =
+                drawPointCount < sourcePointCount
+                    ? static_cast<std::size_t>(
+                          (static_cast<std::uint64_t>(sampleIndex) *
+                           static_cast<std::uint64_t>(sourcePointCount)) /
+                          static_cast<std::uint64_t>(drawPointCount))
+                    : sampleIndex;
+            const glm::vec3 localPosition = ToGlm(cloud.positions[pointIndex]);
+            const glm::vec4 worldPosition4 = layer.localToWorld * glm::vec4{localPosition, 1.0F};
+            const glm::vec3 worldPosition{worldPosition4};
+            const glm::vec4 viewPosition = matrices.view * glm::vec4{worldPosition, 1.0F};
+            const float viewDepth = -viewPosition.z;
+            if (viewDepth <= 0.0F) {
+                continue;
+            }
+
+            float pixelX = 0.0F;
+            float pixelY = 0.0F;
+            if (!ProjectWorldToPixel(worldPosition, matrices, *image, &pixelX, &pixelY)) {
+                continue;
+            }
+
+            const int x = static_cast<int>(std::floor(pixelX));
+            const int y = static_cast<int>(std::floor(pixelY));
+            if (x < static_cast<int>(tile.x0) ||
+                y < static_cast<int>(tile.y0) ||
+                x >= static_cast<int>(tile.x1) ||
+                y >= static_cast<int>(tile.y1)) {
+                continue;
+            }
+
+            const auto pixelIndex =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
+                static_cast<std::size_t>(x);
+            if (pixelIndex >= image->depth.size() || viewDepth >= image->depth[pixelIndex]) {
+                continue;
+            }
+
+            const glm::vec3 color = ResolvePointColor(layer, pointIndex);
+            image->beautyR[pixelIndex] = color.r;
+            image->beautyG[pixelIndex] = color.g;
+            image->beautyB[pixelIndex] = color.b;
+            image->alpha[pixelIndex] = 1.0F;
+            image->depth[pixelIndex] = viewDepth;
+            if (diagnostics != nullptr) {
+                ++diagnostics->accumulationCoveredPixels;
+            }
+        }
+
+        if (diagnostics != nullptr) {
+            diagnostics->accumulationVisitedPoints += drawPointCount;
+        }
+    }
+
+    if (diagnostics != nullptr) {
+        diagnostics->accumulationPassMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+}
+
 void RenderPointCloudTile(
     const std::vector<OfflinePointLayer>& layers,
     const invisible_places::camera::CameraState& cameraState,
     const OfflineRenderTile& tile,
     ExrImage* image,
     OfflinePointRenderDiagnostics* diagnostics,
-    OfflinePointRenderScratch* scratch) {
+    OfflinePointRenderScratch* scratch,
+    float stylisationTimeSeconds) {
     if (image == nullptr || image->width == 0 || image->height == 0 || tile.x0 >= tile.x1 || tile.y0 >= tile.y1) {
         return;
     }
@@ -702,6 +1036,14 @@ void RenderPointCloudTile(
     const std::uint32_t tileWidth = tile.x1 - tile.x0;
     const std::uint32_t tileHeight = tile.y1 - tile.y0;
     const auto tilePixelCount = static_cast<std::size_t>(tileWidth) * static_cast<std::size_t>(tileHeight);
+    const bool fastBasicOnly = !layers.empty() && std::all_of(
+        layers.begin(),
+        layers.end(),
+        [](const OfflinePointLayer& layer) { return layer.fastBasic; });
+    if (fastBasicOnly) {
+        RenderFastBasicPointCloudTile(layers, matrices, tile, image, diagnostics);
+        return;
+    }
 
     OfflinePointRenderScratch localScratch;
     auto& activeScratch = scratch != nullptr ? *scratch : localScratch;
@@ -767,7 +1109,13 @@ void RenderPointCloudTile(
                     *image,
                     tile,
                     tileWidth,
-                    [&](std::uint32_t x, std::uint32_t y, std::size_t, float falloff, float coveredViewDepth) {
+                    stylisationTimeSeconds,
+                    [&](std::uint32_t x,
+                        std::uint32_t y,
+                        std::size_t,
+                        float falloff,
+                        glm::vec2,
+                        float coveredViewDepth) {
                         const auto pixelIndex =
                             static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
                             static_cast<std::size_t>(x);
@@ -817,6 +1165,7 @@ void RenderPointCloudTile(
                 if (diagnostics != nullptr) {
                     ++diagnostics->accumulationVisitedPoints;
                 }
+                const float surfaceAngleMask = PointSurfaceAngleMask(sample, matrices);
 
                 VisitCoveredPixels(
                     sample,
@@ -825,10 +1174,12 @@ void RenderPointCloudTile(
                     *image,
                     tile,
                     tileWidth,
+                    stylisationTimeSeconds,
                     [&](std::uint32_t x,
                         std::uint32_t y,
                         std::size_t localIndex,
                         float falloff,
+                        glm::vec2 stylisationCoord,
                         float coveredViewDepth) {
                         const auto pixelIndex =
                             static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
@@ -849,6 +1200,13 @@ void RenderPointCloudTile(
                             ++diagnostics->accumulationCoveredPixels;
                         }
 
+                        const glm::vec3 stylisedColor = ApplyPointStylisationColor(
+                            sample.color,
+                            layer.style,
+                            stylisationCoord,
+                            sample.pointIndex,
+                            surfaceAngleMask,
+                            stylisationTimeSeconds);
                         const float densityScale = std::max(1.0F, layer.style.densityScale);
                         const float densityClamp = std::max(0.0F, layer.style.densityClamp);
                         const float weightedAlpha = std::clamp(
@@ -856,17 +1214,17 @@ void RenderPointCloudTile(
                             0.0F,
                             AlphaClampMax(layer.style));
                         const float weight = WeightedAlphaWeight(weightedAlpha, coveredViewDepth, cameraState);
-                        accumR[localIndex] += sample.color.r * weightedAlpha * weight;
-                        accumG[localIndex] += sample.color.g * weightedAlpha * weight;
-                        accumB[localIndex] += sample.color.b * weightedAlpha * weight;
+                        accumR[localIndex] += stylisedColor.r * weightedAlpha * weight;
+                        accumG[localIndex] += stylisedColor.g * weightedAlpha * weight;
+                        accumB[localIndex] += stylisedColor.b * weightedAlpha * weight;
                         accumA[localIndex] += weightedAlpha * weight;
                         revealage[localIndex] *= (1.0F - weightedAlpha);
 
                         const float emissionGain = sample.emissive * std::max(0.0F, layer.style.exposure);
                         if (emissionGain > 1.0e-5F) {
-                            emissionR[localIndex] += sample.color.r * alpha * emissionGain;
-                            emissionG[localIndex] += sample.color.g * alpha * emissionGain;
-                            emissionB[localIndex] += sample.color.b * alpha * emissionGain;
+                            emissionR[localIndex] += stylisedColor.r * alpha * emissionGain;
+                            emissionG[localIndex] += stylisedColor.g * alpha * emissionGain;
+                            emissionB[localIndex] += stylisedColor.b * alpha * emissionGain;
                             emissionA[localIndex] += alpha * emissionGain;
                         }
 
@@ -894,9 +1252,9 @@ void RenderPointCloudTile(
                             }
 
                             const float gain = std::max(0.0F, layer.style.exposure);
-                            emissionR[localIndex] += sample.color.r * xrayAlpha * gain;
-                            emissionG[localIndex] += sample.color.g * xrayAlpha * gain;
-                            emissionB[localIndex] += sample.color.b * xrayAlpha * gain;
+                            emissionR[localIndex] += stylisedColor.r * xrayAlpha * gain;
+                            emissionG[localIndex] += stylisedColor.g * xrayAlpha * gain;
+                            emissionB[localIndex] += stylisedColor.b * xrayAlpha * gain;
                             emissionA[localIndex] += xrayAlpha * gain;
                         }
                     });

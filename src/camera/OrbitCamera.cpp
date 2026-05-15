@@ -37,13 +37,21 @@ void OrbitCamera::FrameBounds(
     const invisible_places::io::Bounds3f& bounds,
     const invisible_places::io::Float3& focusPoint,
     float aspectRatio) {
+    FrameBounds(bounds, focusPoint, aspectRatio, 1.0F);
+}
+
+void OrbitCamera::FrameBounds(
+    const invisible_places::io::Bounds3f& bounds,
+    const invisible_places::io::Float3& focusPoint,
+    float aspectRatio,
+    float distanceScale) {
     if (!bounds.valid) {
         return;
     }
 
     framedBounds_ = bounds;
     framedFocusPoint_ = ToGlm(focusPoint);
-    ApplyFramedBounds(aspectRatio);
+    ApplyFramedBounds(aspectRatio, distanceScale);
 }
 
 void OrbitCamera::ResetToFramedBounds(float aspectRatio) {
@@ -102,14 +110,16 @@ void OrbitCamera::Dolly(float wheelDelta) {
         return;
     }
 
-    const auto zoomFactor = std::pow(0.82F, wheelDelta);
     auto pivotOffset = position_ - orbitCenter_;
     if (glm::length(pivotOffset) <= 1.0e-6F) {
         pivotOffset = -Forward() * std::max(distance_, minimumDistance_);
     }
 
-    const float requestedDistance = glm::length(pivotOffset) * zoomFactor;
-    const float nextDistance = std::max(minimumDistance_, requestedDistance);
+    const float currentDistance = std::max(minimumDistance_, glm::length(pivotOffset));
+    const float clampedWheelDelta = std::clamp(wheelDelta, -8.0F, 8.0F);
+    constexpr float kZoomStep = 0.075F;
+    const float distanceScale = std::exp(-clampedWheelDelta * kZoomStep);
+    const float nextDistance = std::max(minimumDistance_, currentDistance * distanceScale);
     const auto nextPosition = orbitCenter_ + (glm::normalize(pivotOffset) * nextDistance);
     const auto translation = nextPosition - position_;
     position_ = nextPosition;
@@ -270,7 +280,7 @@ float OrbitCamera::EffectiveAspectRatio(float aspectRatio) const {
     return std::max(0.1F, aspectRatio);
 }
 
-void OrbitCamera::ApplyFramedBounds(float aspectRatio) {
+void OrbitCamera::ApplyFramedBounds(float aspectRatio, float distanceScale) {
     if (!framedBounds_.valid) {
         return;
     }
@@ -285,7 +295,8 @@ void OrbitCamera::ApplyFramedBounds(float aspectRatio) {
     const auto verticalDistance = framedRadius_ / std::tan(glm::radians(fovDegrees_) * 0.5F);
     const auto horizontalFov = 2.0F * std::atan(std::tan(glm::radians(fovDegrees_) * 0.5F) * EffectiveAspectRatio(aspectRatio));
     const auto horizontalDistance = framedRadius_ / std::tan(horizontalFov * 0.5F);
-    distance_ = std::max(verticalDistance, horizontalDistance) * 1.35F;
+    distance_ = std::max(verticalDistance, horizontalDistance) * 1.35F *
+                std::clamp(distanceScale, 0.05F, 4.0F);
     const auto cosPitch = std::cos(pitchRadians_);
     const auto offset = glm::vec3{
         std::cos(yawRadians_) * cosPitch,

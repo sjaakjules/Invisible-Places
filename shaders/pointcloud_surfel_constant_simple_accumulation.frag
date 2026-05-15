@@ -42,6 +42,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
     vec4 colorize;
+    uvec4 stylisationControl;
+    vec4 stylisationParams0;
+    vec4 stylisationParams1;
+    vec4 stylisationParams2;
 } styleData;
 
 vec3 ResolveBaseColor() {
