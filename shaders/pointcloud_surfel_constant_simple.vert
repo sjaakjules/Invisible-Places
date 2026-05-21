@@ -3,6 +3,7 @@
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outViewDepth;
 layout(location = 2) out vec2 outDiscCoord;
+layout(location = 3) out vec3 outAovNormal;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -110,6 +111,17 @@ void ResolveBasis(vec3 center, uint pointIndex, out vec3 tangent, out vec3 bitan
     bitangent = normalize(cross(normal, tangent));
 }
 
+vec3 ResolveAovNormal(uint pointIndex) {
+    if (styleData.pointMeta.z == 0u || pointIndex >= styleData.pointMeta.x) {
+        return vec3(0.0);
+    }
+    vec3 normal = surfelNormals.normals[pointIndex].xyz;
+    if (dot(normal, normal) <= 1e-8) {
+        return vec3(0.0);
+    }
+    return normalize(normal);
+}
+
 float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     if (uniforms.depthOfFieldParameters.x <= 0.5) {
         return 0.0;
@@ -153,4 +165,5 @@ void main() {
     outSourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
     outViewDepth = -viewPosition.z;
     outDiscCoord = corner;
+    outAovNormal = ResolveAovNormal(pointIndex);
 }

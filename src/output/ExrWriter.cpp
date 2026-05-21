@@ -34,6 +34,8 @@ bool ValidImage(const HalfRgbaExrImage& image) {
     return image.width > 0 &&
            image.height > 0 &&
            image.rgbaHalf.size() == pixelCount * 4U &&
+           (image.normalHalf.empty() || image.normalHalf.size() == pixelCount * 3U) &&
+           (image.albedoHalf.empty() || image.albedoHalf.size() == pixelCount * 3U) &&
            image.depth.size() == pixelCount;
 }
 
@@ -188,6 +190,8 @@ bool WriteExrImage(
 
     try {
         auto depth = MakeDepthChannel(image.depth);
+        const bool hasNormal = !image.normalHalf.empty();
+        const bool hasAlbedo = !image.albedoHalf.empty();
 
         OPENEXR_IMF_NAMESPACE::Header header{
             static_cast<int>(image.width),
@@ -197,13 +201,29 @@ bool WriteExrImage(
         header.channels().insert("beauty.B", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
         header.channels().insert("alpha.A", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
         header.channels().insert("depth.Z", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::FLOAT});
+        if (hasNormal) {
+            header.channels().insert("N.X", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
+            header.channels().insert("N.Y", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
+            header.channels().insert("N.Z", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
+        }
+        if (hasAlbedo) {
+            header.channels().insert("albedo.R", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
+            header.channels().insert("albedo.G", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
+            header.channels().insert("albedo.B", OPENEXR_IMF_NAMESPACE::Channel{OPENEXR_IMF_NAMESPACE::HALF});
+        }
 
         const auto componentStride = static_cast<std::size_t>(sizeof(std::uint16_t));
         const auto pixelStride = componentStride * 4U;
         const auto rowStride = pixelStride * static_cast<std::size_t>(image.width);
+        const auto aovPixelStride = componentStride * 3U;
+        const auto aovRowStride = aovPixelStride * static_cast<std::size_t>(image.width);
         const auto xStrideFloat = static_cast<std::size_t>(sizeof(float));
         const auto yStrideFloat = xStrideFloat * static_cast<std::size_t>(image.width);
         auto* rgbaBytes = reinterpret_cast<char*>(const_cast<std::uint16_t*>(image.rgbaHalf.data()));
+        auto* normalBytes =
+            hasNormal ? reinterpret_cast<char*>(const_cast<std::uint16_t*>(image.normalHalf.data())) : nullptr;
+        auto* albedoBytes =
+            hasAlbedo ? reinterpret_cast<char*>(const_cast<std::uint16_t*>(image.albedoHalf.data())) : nullptr;
 
         OPENEXR_IMF_NAMESPACE::FrameBuffer frameBuffer;
         frameBuffer.insert(
@@ -241,6 +261,52 @@ bool WriteExrImage(
                 reinterpret_cast<char*>(depth.data()),
                 xStrideFloat,
                 yStrideFloat});
+        if (hasNormal) {
+            frameBuffer.insert(
+                "N.X",
+                OPENEXR_IMF_NAMESPACE::Slice{
+                    OPENEXR_IMF_NAMESPACE::HALF,
+                    normalBytes,
+                    aovPixelStride,
+                    aovRowStride});
+            frameBuffer.insert(
+                "N.Y",
+                OPENEXR_IMF_NAMESPACE::Slice{
+                    OPENEXR_IMF_NAMESPACE::HALF,
+                    normalBytes + componentStride,
+                    aovPixelStride,
+                    aovRowStride});
+            frameBuffer.insert(
+                "N.Z",
+                OPENEXR_IMF_NAMESPACE::Slice{
+                    OPENEXR_IMF_NAMESPACE::HALF,
+                    normalBytes + (componentStride * 2U),
+                    aovPixelStride,
+                    aovRowStride});
+        }
+        if (hasAlbedo) {
+            frameBuffer.insert(
+                "albedo.R",
+                OPENEXR_IMF_NAMESPACE::Slice{
+                    OPENEXR_IMF_NAMESPACE::HALF,
+                    albedoBytes,
+                    aovPixelStride,
+                    aovRowStride});
+            frameBuffer.insert(
+                "albedo.G",
+                OPENEXR_IMF_NAMESPACE::Slice{
+                    OPENEXR_IMF_NAMESPACE::HALF,
+                    albedoBytes + componentStride,
+                    aovPixelStride,
+                    aovRowStride});
+            frameBuffer.insert(
+                "albedo.B",
+                OPENEXR_IMF_NAMESPACE::Slice{
+                    OPENEXR_IMF_NAMESPACE::HALF,
+                    albedoBytes + (componentStride * 2U),
+                    aovPixelStride,
+                    aovRowStride});
+        }
 
         OPENEXR_IMF_NAMESPACE::OutputFile file{outputPath.string().c_str(), header};
         file.setFrameBuffer(frameBuffer);

@@ -75,6 +75,7 @@ struct SceneRenderState {
     glm::vec3 cameraPosition{0.0F, 0.0F, 1.0F};
     glm::vec4 backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
     bool eyeDomeLightingEnabled = false;
+    float eyeDomeLightingThickness = 1.0F;
     float nearPlane = 0.05F;
     float farPlane = 1000.0F;
     bool hasDepthOfField = false;
@@ -112,6 +113,16 @@ struct PointCloudExrFrameRequest {
     bool previewDensity = true;
 };
 
+struct PointCloudRaycastFrameRequest {
+    SceneRenderState renderState{};
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    renderer::pointcloud::PointCloudRaycastPrimitiveMode primitiveMode =
+        renderer::pointcloud::PointCloudRaycastPrimitiveMode::StyleSurfels;
+    std::uint32_t samplesPerPixel = 4;
+    float maxDepth = 0.0F;
+};
+
 class VulkanViewportShell {
   public:
     explicit VulkanViewportShell(GLFWwindow* window);
@@ -142,11 +153,14 @@ class VulkanViewportShell {
     void ClearGaussianSplats();
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage RenderPointCloudExrFrame(
         const PointCloudExrFrameRequest& request);
+    [[nodiscard]] invisible_places::output::HalfRgbaExrImage RenderPointCloudRaycastFrame(
+        const PointCloudRaycastFrameRequest& request);
 
     [[nodiscard]] bool UiWantsMouseCapture() const;
     [[nodiscard]] bool UiWantsKeyboardCapture() const;
     [[nodiscard]] bool HasPointClouds() const;
     [[nodiscard]] bool HasGaussianSplats() const;
+    [[nodiscard]] bool SupportsRaycastExport() const { return graphicsQueueSupportsCompute_; }
     [[nodiscard]] std::uint32_t Width() const { return swapchainWidth_; }
     [[nodiscard]] std::uint32_t Height() const { return swapchainHeight_; }
 
@@ -182,10 +196,13 @@ class VulkanViewportShell {
         BufferAllocation colorBuffer{};
         BufferAllocation normalBuffer{};
         BufferAllocation scalarFieldBuffer{};
+        BufferAllocation raycastBvhNodeBuffer{};
+        BufferAllocation raycastBvhIndexBuffer{};
         std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
         BufferAllocation exrStyleBuffer{};
         std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
         VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
+        VkDescriptorSet raycastDescriptorSet = VK_NULL_HANDLE;
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
         BufferAllocation interactiveSampledIndexBuffer{};
@@ -197,6 +214,7 @@ class VulkanViewportShell {
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
+        std::vector<invisible_places::io::Float3> cpuPositions;
     };
 
     struct PointCloudDrawPlan {
@@ -274,9 +292,27 @@ class VulkanViewportShell {
         ImageAllocation accumulationImage{};
         ImageAllocation revealageImage{};
         ImageAllocation emissiveImage{};
+        ImageAllocation normalAccumulationImage{};
+        ImageAllocation albedoAccumulationImage{};
         ImageAllocation linearDepthImage{};
+        ImageAllocation normalImage{};
+        ImageAllocation albedoImage{};
         BufferAllocation colorReadbackBuffer{};
         BufferAllocation depthReadbackBuffer{};
+        BufferAllocation normalReadbackBuffer{};
+        BufferAllocation albedoReadbackBuffer{};
+    };
+
+    struct RaycastExportResources {
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        BufferAllocation accumulationBuffer{};
+        BufferAllocation revealageBuffer{};
+        BufferAllocation emissionBuffer{};
+        BufferAllocation depthBuffer{};
+        BufferAllocation colorBuffer{};
     };
 
     void CreateInstance();
@@ -292,6 +328,7 @@ class VulkanViewportShell {
     void CreateHighQualityGaussianSplatDescriptorSetLayout();
     void CreateCompositeDescriptorSetLayout();
     void CreatePostProcessDescriptorSetLayout();
+    void CreateRaycastDescriptorSetLayout();
     void CreateDescriptorPools();
     void CreatePostProcessSampler();
     void CreateUniformResources();
@@ -300,6 +337,7 @@ class VulkanViewportShell {
     void CreateHighQualityGaussianSplatPipeline();
     void CreateCompositePipeline();
     void CreatePostProcessPipeline();
+    void CreateRaycastPipelines();
     void CreateExrExportResources(std::uint32_t width, std::uint32_t height);
     void CreateExrExportRenderPass(ExrExportResources* resources);
     void CreateExrExportPipelines(ExrExportResources* resources);
@@ -327,6 +365,13 @@ class VulkanViewportShell {
         VkImageView accumulationView,
         VkImageView revealageView,
         VkImageView emissiveView);
+    void CreateOrUpdateCompositeDescriptorSet(
+        VkDescriptorSet* descriptorSet,
+        VkImageView accumulationView,
+        VkImageView revealageView,
+        VkImageView emissiveView,
+        VkImageView normalAccumulationView,
+        VkImageView albedoAccumulationView);
     void CreateOrUpdatePostProcessDescriptorSets();
     void UpdateGaussianSplatDescriptorSets(ActiveGaussianSplatResources* resources);
     void UpdateGaussianSplatDescriptorSet(
@@ -340,9 +385,11 @@ class VulkanViewportShell {
     void CleanupGaussianSplatResources(ActiveGaussianSplatResources* resources);
     void CleanupHighQualityGaussianScene();
     void CleanupExrExportResources();
+    void CleanupRaycastExportResources();
     void RecreateSwapchain();
     void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, std::size_t frameIndex);
     void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
+    void RecordRaycastExportCommandBuffer(const PointCloudRaycastFrameRequest& request);
     [[nodiscard]] bool SceneImageNeedsRender(std::uint32_t imageIndex) const;
     [[nodiscard]] bool AnySceneImageNeedsRender() const;
     [[nodiscard]] bool ResolvePointCloudDrawPlan(
@@ -365,6 +412,17 @@ class VulkanViewportShell {
         std::uint32_t imageIndex,
         bool exrStyle,
         std::uint32_t* recordedDrawPointCount = nullptr);
+    [[nodiscard]] bool PrepareRaycastLayerResources(
+        const SceneRenderState::PointCloudLayerState& layer,
+        const PointCloudDrawPlan& plan,
+        renderer::pointcloud::PointCloudRaycastPrimitiveMode primitiveMode,
+        std::uint32_t width,
+        std::uint32_t height,
+        float maxDepth);
+    void CreateRaycastExportResources(std::uint32_t width, std::uint32_t height);
+    void UpdateRaycastDescriptorSet(
+        ActivePointCloudResources* resources,
+        const RaycastExportResources& exportResources);
     void UpdateUniformBuffer(std::size_t frameIndex);
     void UploadFrameUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);
 
@@ -413,6 +471,7 @@ class VulkanViewportShell {
     VkPipelineLayout highQualityGaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout postProcessPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout raycastPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
@@ -426,11 +485,15 @@ class VulkanViewportShell {
     VkPipeline highQualityGaussianSplatPipeline_ = VK_NULL_HANDLE;
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
+    VkPipeline raycastClearPipeline_ = VK_NULL_HANDLE;
+    VkPipeline raycastAccumulationPipeline_ = VK_NULL_HANDLE;
+    VkPipeline raycastCompositePipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout postProcessDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout raycastDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool gaussianSplatDescriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool imguiDescriptorPool_ = VK_NULL_HANDLE;
@@ -451,6 +514,7 @@ class VulkanViewportShell {
 
     std::uint32_t graphicsQueueFamily_ = 0;
     std::uint32_t presentQueueFamily_ = 0;
+    bool graphicsQueueSupportsCompute_ = false;
     VkFormat swapchainImageFormat_ = VK_FORMAT_UNDEFINED;
     std::uint32_t swapchainWidth_ = 0;
     std::uint32_t swapchainHeight_ = 0;
@@ -470,6 +534,7 @@ class VulkanViewportShell {
     std::vector<ActiveGaussianSplatResources> gaussianSplatResources_;
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
     ExrExportResources exrExportResources_{};
+    RaycastExportResources raycastExportResources_{};
     bool highQualityGaussianSceneDirty_ = true;
     SceneRenderState renderState_{};
     ViewportDiagnostics diagnostics_{};

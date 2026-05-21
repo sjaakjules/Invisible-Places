@@ -1,0 +1,865 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pointcloud_colormaps.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform RaycastControl {
+    uvec4 control;
+    vec4 params;
+} raycast;
+
+layout(set = 0, binding = 0) uniform FrameUniforms {
+    mat4 viewProjection;
+    mat4 view;
+    mat4 projection;
+    vec4 cameraPosition;
+    vec4 depthParameters;
+    vec4 viewportParameters;
+    vec4 depthOfFieldParameters;
+    mat4 inverseViewProjection;
+} uniforms;
+
+struct RenderParameterBindingGpu {
+    vec4 constantValue;
+    vec4 range;
+    vec4 extra;
+    uvec4 control;
+};
+
+layout(set = 0, binding = 1, std140) uniform PointStyleData {
+    vec4 solidColor;
+    uvec4 globalControl;
+    uvec4 pointMeta;
+    uvec4 renderControl;
+    vec4 renderParams0;
+    vec4 renderParams1;
+    vec4 renderParams2;
+    vec4 renderParams3;
+    RenderParameterBindingGpu pointSizeBinding;
+    RenderParameterBindingGpu opacityBinding;
+    RenderParameterBindingGpu emissiveBinding;
+    RenderParameterBindingGpu xrayBinding;
+    RenderParameterBindingGpu depthFadeBinding;
+    RenderParameterBindingGpu colormapPositionBinding;
+    RenderParameterBindingGpu surfelDiameterBinding;
+    vec4 colorize;
+    uvec4 stylisationControl;
+    vec4 stylisationParams0;
+    vec4 stylisationParams1;
+    vec4 stylisationParams2;
+    vec4 surfaceMotionParams;
+    vec4 surfaceMotionStats;
+} styleData;
+
+#include "pointcloud_stylisation.glsl"
+
+layout(set = 0, binding = 2, std430) readonly buffer ScalarFieldValues {
+    float values[];
+} scalarFieldValues;
+
+layout(set = 0, binding = 3, std430) readonly buffer RaycastPositions {
+    vec4 positions[];
+} raycastPositions;
+
+layout(set = 0, binding = 4, std430) readonly buffer RaycastColors {
+    uint colors[];
+} raycastColors;
+
+layout(set = 0, binding = 5, std430) readonly buffer RaycastNormals {
+    vec4 normals[];
+} raycastNormals;
+
+struct BvhNode {
+    vec4 boundsMin;
+    vec4 boundsMax;
+    uvec4 meta;
+};
+
+layout(set = 0, binding = 6, std430) readonly buffer RaycastBvhNodes {
+    BvhNode nodes[];
+} raycastBvhNodes;
+
+layout(set = 0, binding = 7, std430) readonly buffer RaycastBvhIndices {
+    uint pointIndices[];
+} raycastBvhIndices;
+
+layout(set = 0, binding = 8, std430) buffer RaycastAccumulation {
+    vec4 accumulation[];
+} raycastAccumulation;
+
+layout(set = 0, binding = 9, std430) buffer RaycastRevealage {
+    float revealage[];
+} raycastRevealage;
+
+layout(set = 0, binding = 10, std430) buffer RaycastEmission {
+    vec4 emission[];
+} raycastEmission;
+
+layout(set = 0, binding = 11, std430) buffer RaycastDepth {
+    float depth[];
+} raycastDepth;
+
+const uint kFieldMapFlagClamp = 1u;
+const uint kFieldMapFlagInvert = 2u;
+const uint kPassDepth = 0u;
+const uint kPassAccumulation = 1u;
+const uint kPrimitiveStyleSurfels = 0u;
+const uint kPrimitiveSoftDensitySpheres = 1u;
+const uint kWaterPhaseFieldSlot = 3u;
+const uint kWaterSpeedFieldSlot = 4u;
+const uint kWaterWidthFieldSlot = 5u;
+const uint kWaterConfidenceFieldSlot = 6u;
+const uint kWaterAccumulationFieldSlot = 7u;
+const uint kWaterPoolingFieldSlot = 8u;
+const uint kWaterParticleRoleFieldSlot = 9u;
+const uint kWaterPathStartFieldSlot = 10u;
+const uint kWaterPathCountFieldSlot = 11u;
+const uint kWaterJitterSeedFieldSlot = 12u;
+const float kWaterParticleSpeedScale = 0.12;
+
+float LoadScalarFieldValue(uint fieldSlot, uint pointIndex) {
+    if (fieldSlot == 0xFFFFFFFFu ||
+        fieldSlot >= styleData.globalControl.z ||
+        styleData.pointMeta.x == 0u ||
+        pointIndex >= styleData.pointMeta.x) {
+        return 0.0;
+    }
+    return scalarFieldValues.values[(fieldSlot * styleData.pointMeta.x) + pointIndex];
+}
+
+float EvaluateBinding(RenderParameterBindingGpu binding, uint pointIndex) {
+    if (binding.control.x == 0u) {
+        return binding.constantValue.x;
+    }
+
+    float normalized =
+        (LoadScalarFieldValue(binding.control.y, pointIndex) - binding.range.x) /
+        max(1e-5, binding.range.y - binding.range.x);
+    if ((binding.control.z & kFieldMapFlagInvert) != 0u) {
+        normalized = 1.0 - normalized;
+    }
+    if ((binding.control.z & kFieldMapFlagClamp) != 0u) {
+        normalized = clamp(normalized, 0.0, 1.0);
+        normalized = pow(normalized, max(0.0001, binding.extra.x));
+    } else {
+        normalized = sign(normalized) * pow(abs(normalized), max(0.0001, binding.extra.x));
+    }
+    return binding.range.z + ((binding.range.w - binding.range.z) * normalized);
+}
+
+bool HasWaterParticleFields() {
+    return styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot;
+}
+
+float WaterParticleTravel(uint pointIndex) {
+    const float phase = LoadScalarFieldValue(kWaterPhaseFieldSlot, pointIndex);
+    const float speed = max(0.02, LoadScalarFieldValue(kWaterSpeedFieldSlot, pointIndex));
+    return fract(phase + max(0.0, uniforms.depthParameters.x) * speed * kWaterParticleSpeedScale);
+}
+
+float HashWater01(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return float(value & 0x00ffffffu) / 16777215.0;
+}
+
+float SurfaceHash13(vec3 value) {
+    return fract(sin(dot(value, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
+}
+
+float SurfaceValueNoise(vec3 value) {
+    const vec3 cell = floor(value);
+    const vec3 local = fract(value);
+    const vec3 blend = local * local * (3.0 - 2.0 * local);
+    const float c000 = SurfaceHash13(cell + vec3(0.0, 0.0, 0.0));
+    const float c100 = SurfaceHash13(cell + vec3(1.0, 0.0, 0.0));
+    const float c010 = SurfaceHash13(cell + vec3(0.0, 1.0, 0.0));
+    const float c110 = SurfaceHash13(cell + vec3(1.0, 1.0, 0.0));
+    const float c001 = SurfaceHash13(cell + vec3(0.0, 0.0, 1.0));
+    const float c101 = SurfaceHash13(cell + vec3(1.0, 0.0, 1.0));
+    const float c011 = SurfaceHash13(cell + vec3(0.0, 1.0, 1.0));
+    const float c111 = SurfaceHash13(cell + vec3(1.0, 1.0, 1.0));
+    const float x00 = mix(c000, c100, blend.x);
+    const float x10 = mix(c010, c110, blend.x);
+    const float x01 = mix(c001, c101, blend.x);
+    const float x11 = mix(c011, c111, blend.x);
+    const float y0 = mix(x00, x10, blend.y);
+    const float y1 = mix(x01, x11, blend.y);
+    return mix(y0, y1, blend.z);
+}
+
+float SurfaceFbm(vec3 value) {
+    float sum = 0.0;
+    float amplitude = 0.5;
+    float normalizer = 0.0;
+    for (int octave = 0; octave < 3; ++octave) {
+        sum += SurfaceValueNoise(value) * amplitude;
+        normalizer += amplitude;
+        value = value * 2.03 + vec3(17.1, 31.7, 11.3);
+        amplitude *= 0.5;
+    }
+    return sum / max(0.0001, normalizer);
+}
+
+vec3 SurfaceMotionNoiseVector(vec3 position, float time) {
+    return vec3(
+        SurfaceFbm(position + vec3(13.1, 0.0, time)),
+        SurfaceFbm(position + vec3(0.0, 29.7, time * 1.13)),
+        SurfaceFbm(position + vec3(41.3, 19.1, time * 0.83))) * 2.0 - 1.0;
+}
+
+float SurfaceMotionMask(uint pointIndex) {
+    if (styleData.stylisationControl.z == 0u || styleData.surfaceMotionParams.x <= 1e-5) {
+        return 0.0;
+    }
+
+    const uint roughnessSlot = styleData.stylisationControl.z - 1u;
+    const float roughness = LoadScalarFieldValue(roughnessSlot, pointIndex);
+    const float roughnessNormalized =
+        clamp((roughness - styleData.surfaceMotionStats.x) * styleData.surfaceMotionStats.y, 0.0, 1.0);
+    float mask = smoothstep(clamp(styleData.surfaceMotionParams.w, 0.0, 1.0), 1.0, roughnessNormalized);
+    if (styleData.stylisationControl.w != 0u) {
+        const uint groundSlot = styleData.stylisationControl.w - 1u;
+        const float groundId = LoadScalarFieldValue(groundSlot, pointIndex);
+        const float distanceToTarget = abs(groundId - styleData.surfaceMotionStats.z);
+        const float tolerance = max(0.001, styleData.surfaceMotionStats.w);
+        mask *= 1.0 - smoothstep(tolerance, tolerance + 0.25, distanceToTarget);
+    }
+    return mask;
+}
+
+vec3 ResolveSurfaceMotionPosition(vec3 basePosition, uint pointIndex) {
+    const float mask = SurfaceMotionMask(pointIndex);
+    if (mask <= 1e-5) {
+        return basePosition;
+    }
+
+    const float scale = max(0.01, styleData.surfaceMotionParams.y);
+    const float speed = max(0.0, styleData.surfaceMotionParams.z);
+    const float time = max(0.0, uniforms.depthParameters.x) * speed;
+    const vec3 noisePosition = basePosition * scale;
+    vec3 animatedNoise = SurfaceMotionNoiseVector(noisePosition, time);
+    vec3 restNoise = SurfaceMotionNoiseVector(noisePosition, 0.0);
+    vec3 offset = (animatedNoise - restNoise) * styleData.surfaceMotionParams.x * mask;
+    offset.z *= 0.35;
+    return basePosition + offset;
+}
+
+vec3 SafeWaterLateral(vec3 tangent, vec3 fallback) {
+    vec3 lateral = cross(tangent, vec3(0.0, 0.0, 1.0));
+    if (dot(lateral, lateral) <= 1e-8) {
+        lateral = cross(tangent, vec3(0.0, 1.0, 0.0));
+    }
+    if (dot(lateral, lateral) <= 1e-8) {
+        lateral = fallback;
+    }
+    return normalize(lateral);
+}
+
+vec3 CatmullRomWater(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float t) {
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return 0.5 * (
+        (2.0 * p1) +
+        (-p0 + p2) * t +
+        ((2.0 * p0) - (5.0 * p1) + (4.0 * p2) - p3) * t2 +
+        (-p0 + (3.0 * p1) - (3.0 * p2) + p3) * t3);
+}
+
+vec3 JitteredWaterAnchorPosition(
+    uint pathStart,
+    uint pathCount,
+    uint anchorOffset,
+    float particleSeed,
+    float pathJitter) {
+    const uint clampedOffset = min(anchorOffset, pathCount - 1u);
+    const uint anchorIndex = pathStart + clampedOffset;
+    const vec3 basePosition = raycastPositions.positions[anchorIndex].xyz;
+    if (pathJitter <= 0.0001) {
+        return basePosition;
+    }
+
+    const uint prevOffset = clampedOffset > 0u ? clampedOffset - 1u : clampedOffset;
+    const uint nextOffset = min(clampedOffset + 1u, pathCount - 1u);
+    const vec3 prevPosition = raycastPositions.positions[pathStart + prevOffset].xyz;
+    const vec3 nextPosition = raycastPositions.positions[pathStart + nextOffset].xyz;
+    vec3 tangent = nextPosition - prevPosition;
+    if (dot(tangent, tangent) <= 1e-8) {
+        return basePosition;
+    }
+
+    tangent = normalize(tangent);
+    const vec3 lateral = SafeWaterLateral(tangent, vec3(1.0, 0.0, 0.0));
+    vec3 secondary = cross(tangent, lateral);
+    if (dot(secondary, secondary) <= 1e-8) {
+        secondary = vec3(0.0, 0.0, 1.0);
+    }
+    secondary = normalize(secondary);
+
+    const uint seedBits = uint(clamp(particleSeed, 0.0, 1.0) * 16777215.0);
+    const uint hashBase = seedBits ^ (clampedOffset * 747796405u);
+    const float lateralNoise = (HashWater01(hashBase ^ 0x9e3779b9u) - 0.5) * 2.0;
+    const float secondaryNoise = (HashWater01(hashBase ^ 0x85ebca6bu) - 0.5) * 2.0;
+    const float startFade = smoothstep(0.0, 2.0, float(clampedOffset));
+    const float endFade = smoothstep(0.0, 2.0, float((pathCount - 1u) - clampedOffset));
+    const float endpointFade = min(startFade, endFade);
+    const float anchorWidth = clamp(LoadScalarFieldValue(kWaterWidthFieldSlot, anchorIndex), 0.001, 100.0);
+    const float amplitude = anchorWidth * clamp(pathJitter, 0.0, 3.0) * 0.45 * endpointFade;
+    return basePosition + (lateral * lateralNoise + secondary * secondaryNoise * 0.22) * amplitude;
+}
+
+vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
+    if (!HasWaterParticleFields()) {
+        return basePosition;
+    }
+
+    const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot, pointIndex);
+    if (role < 0.5) {
+        return basePosition;
+    }
+
+    const uint pathStart = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathStartFieldSlot, pointIndex) + 0.5)));
+    const uint pathCount = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathCountFieldSlot, pointIndex) + 0.5)));
+    if (pathCount < 2u || pathStart >= styleData.pointMeta.x || pathStart + pathCount > styleData.pointMeta.x) {
+        return basePosition;
+    }
+
+    const float pathPosition = WaterParticleTravel(pointIndex) * float(pathCount - 1u);
+    const uint anchorOffset = min(uint(floor(pathPosition)), pathCount - 1u);
+    const float t = fract(pathPosition);
+    const uint p0Offset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
+    const uint p1Offset = anchorOffset;
+    const uint p2Offset = min(anchorOffset + 1u, pathCount - 1u);
+    const uint p3Offset = min(anchorOffset + 2u, pathCount - 1u);
+    const float seed = LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex);
+    const float pathJitter = clamp(LoadScalarFieldValue(kWaterWidthFieldSlot, pointIndex), 0.0, 3.0);
+    const vec3 p0 = JitteredWaterAnchorPosition(pathStart, pathCount, p0Offset, seed, pathJitter);
+    const vec3 p1 = JitteredWaterAnchorPosition(pathStart, pathCount, p1Offset, seed, pathJitter);
+    const vec3 p2 = JitteredWaterAnchorPosition(pathStart, pathCount, p2Offset, seed, pathJitter);
+    const vec3 p3 = JitteredWaterAnchorPosition(pathStart, pathCount, p3Offset, seed, pathJitter);
+    return CatmullRomWater(p0, p1, p2, p3, t);
+}
+
+vec3 ResolveAnimatedPointPosition(vec3 basePosition, uint pointIndex) {
+    const vec3 flowPosition = ResolveWaterFlowPosition(basePosition, pointIndex);
+    return ResolveSurfaceMotionPosition(flowPosition, pointIndex);
+}
+
+vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
+    if (styleData.pointMeta.w == 0u || styleData.globalControl.z <= kWaterSpeedFieldSlot) {
+        return vec2(opacity, emissive);
+    }
+
+    if (HasWaterParticleFields()) {
+        const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot, pointIndex);
+        if (role < 0.5) {
+            return vec2(0.0);
+        }
+
+        const float travel = WaterParticleTravel(pointIndex);
+        const float seed = LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex);
+        const float endFade = smoothstep(0.0, 0.08, travel) * (1.0 - smoothstep(0.92, 1.0, travel));
+        const float shimmer = 0.78 + 0.22 * sin((travel + seed * 1.618) * 6.28318530718);
+        return vec2(opacity * endFade * shimmer, emissive * endFade * shimmer);
+    }
+
+    const float phase = LoadScalarFieldValue(kWaterPhaseFieldSlot, pointIndex);
+    const float speed = max(0.02, LoadScalarFieldValue(kWaterSpeedFieldSlot, pointIndex));
+    const float confidence =
+        styleData.globalControl.z > kWaterConfidenceFieldSlot
+            ? clamp(LoadScalarFieldValue(kWaterConfidenceFieldSlot, pointIndex), 0.0, 1.0)
+            : 1.0;
+    const float accumulation =
+        styleData.globalControl.z > kWaterAccumulationFieldSlot
+            ? clamp(LoadScalarFieldValue(kWaterAccumulationFieldSlot, pointIndex), 0.0, 1.0)
+            : 0.0;
+    const float pooling =
+        styleData.globalControl.z > kWaterPoolingFieldSlot
+            ? clamp(LoadScalarFieldValue(kWaterPoolingFieldSlot, pointIndex), 0.0, 1.0)
+            : 0.0;
+    const float wave = 0.5 + (0.5 * sin((phase - uniforms.depthParameters.x * speed) * 6.28318530718));
+    const float crest = smoothstep(0.58, 1.0, wave);
+    const float alphaPulse = clamp((0.24 + crest * 0.82 + pooling * 0.24) * confidence, 0.0, 1.25);
+    const float emissivePulse =
+        clamp((0.70 + crest * 2.10 + accumulation * 1.25 + pooling * 0.55) * confidence, 0.0, 4.5);
+    return vec2(opacity * alphaPulse, emissive * emissivePulse);
+}
+
+vec4 UnpackRgba8(uint packedColor) {
+    return vec4(
+        float(packedColor & 0xFFu) / 255.0,
+        float((packedColor >> 8u) & 0xFFu) / 255.0,
+        float((packedColor >> 16u) & 0xFFu) / 255.0,
+        float((packedColor >> 24u) & 0xFFu) / 255.0);
+}
+
+vec3 RgbToHsl(vec3 color) {
+    const float maxChannel = max(max(color.r, color.g), color.b);
+    const float minChannel = min(min(color.r, color.g), color.b);
+    const float delta = maxChannel - minChannel;
+    const float lightness = (maxChannel + minChannel) * 0.5;
+    if (delta <= 1e-5) {
+        return vec3(0.0, 0.0, lightness);
+    }
+    const float saturation =
+        lightness > 0.5 ? delta / max(1e-5, 2.0 - maxChannel - minChannel)
+                        : delta / max(1e-5, maxChannel + minChannel);
+    float hue = 0.0;
+    if (maxChannel == color.r) {
+        hue = (color.g - color.b) / delta + (color.g < color.b ? 6.0 : 0.0);
+    } else if (maxChannel == color.g) {
+        hue = ((color.b - color.r) / delta) + 2.0;
+    } else {
+        hue = ((color.r - color.g) / delta) + 4.0;
+    }
+    return vec3(hue / 6.0, saturation, lightness);
+}
+
+float HueToRgb(float p, float q, float t) {
+    if (t < 0.0) {
+        t += 1.0;
+    }
+    if (t > 1.0) {
+        t -= 1.0;
+    }
+    if (t < (1.0 / 6.0)) {
+        return p + ((q - p) * 6.0 * t);
+    }
+    if (t < 0.5) {
+        return q;
+    }
+    if (t < (2.0 / 3.0)) {
+        return p + ((q - p) * ((2.0 / 3.0) - t) * 6.0);
+    }
+    return p;
+}
+
+vec3 HslToRgb(vec3 hsl) {
+    if (hsl.y <= 1e-5) {
+        return vec3(hsl.z);
+    }
+    const float q = hsl.z < 0.5 ? hsl.z * (1.0 + hsl.y) : hsl.z + hsl.y - (hsl.z * hsl.y);
+    const float p = (2.0 * hsl.z) - q;
+    return vec3(
+        HueToRgb(p, q, hsl.x + (1.0 / 3.0)),
+        HueToRgb(p, q, hsl.x),
+        HueToRgb(p, q, hsl.x - (1.0 / 3.0)));
+}
+
+vec3 ApplyColorize(vec3 baseColor) {
+    const float amount = clamp(styleData.colorize.a, 0.0, 1.0);
+    if (amount <= 1e-5) {
+        return baseColor;
+    }
+    const vec3 sourceHsl = RgbToHsl(clamp(baseColor, 0.0, 1.0));
+    const vec3 tintHsl = RgbToHsl(clamp(styleData.colorize.rgb, 0.0, 1.0));
+    return mix(baseColor, HslToRgb(vec3(tintHsl.x, tintHsl.y, sourceHsl.z)), amount);
+}
+
+float ResolveFalloff(float radius, float radiusSquared) {
+    const uint profile = styleData.renderControl.y;
+    if (profile == 0u) {
+        return 1.0;
+    }
+    if (profile == 2u) {
+        return exp(-radiusSquared * max(0.001, styleData.renderParams0.z));
+    }
+    if (profile == 3u) {
+        return pow(max(0.0, 1.0 - radius), max(0.001, styleData.renderParams0.w));
+    }
+    return smoothstep(1.0, clamp(styleData.renderParams0.y, 0.0, 0.99), radius);
+}
+
+float AlphaClampMax() {
+    return styleData.renderControl.w != 0u ? 1.0 : 0.995;
+}
+
+float ResolveDepthFadeAlpha(float depthFade, float viewDepth) {
+    const float depthNorm = clamp(
+        (viewDepth - uniforms.depthParameters.y) /
+        max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
+        0.0,
+        1.0);
+    return mix(1.0, 1.0 - depthNorm, clamp(depthFade, 0.0, 1.0));
+}
+
+float WeightedAlphaWeight(float alpha, float viewDepth) {
+    const float depthNorm = clamp(
+        (viewDepth - uniforms.depthParameters.y) /
+        max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
+        0.0,
+        1.0);
+    const float opacityBase = min(1.0, alpha * 8.0) + 0.01;
+    const float opacityWeight = opacityBase * opacityBase * opacityBase;
+    const float frontBase = 1.0 - depthNorm;
+    const float frontSquared = frontBase * frontBase;
+    const float frontWeight = frontSquared * frontSquared;
+    return clamp((opacityWeight * 0.5) + (opacityWeight * frontWeight * 128.0), 1e-3, 256.0);
+}
+
+vec3 ResolveBaseColor(uint pointIndex) {
+    vec3 baseColor = styleData.solidColor.rgb;
+    if (styleData.globalControl.x == 0u && styleData.globalControl.w != 0u) {
+        baseColor = UnpackRgba8(raycastColors.colors[pointIndex]).rgb;
+    } else if (styleData.globalControl.x == 2u) {
+        baseColor = ApplyPointCloudColormap(
+            styleData.globalControl.y,
+            clamp(EvaluateBinding(styleData.colormapPositionBinding, pointIndex), 0.0, 1.0));
+    }
+    return ApplyColorize(baseColor);
+}
+
+vec3 CameraRight() {
+    return normalize(vec3(uniforms.view[0][0], uniforms.view[1][0], uniforms.view[2][0]));
+}
+
+vec3 CameraUp() {
+    return normalize(vec3(uniforms.view[0][1], uniforms.view[1][1], uniforms.view[2][1]));
+}
+
+float ResolveDepthOfFieldBlurPixels(float viewDepth) {
+    if (uniforms.depthOfFieldParameters.x <= 0.5) {
+        return 0.0;
+    }
+    const float focusDistance = max(0.001, uniforms.depthOfFieldParameters.y);
+    const float apertureFStops = max(0.1, uniforms.depthOfFieldParameters.z);
+    const float maxBlurPixels = max(0.0, uniforms.depthOfFieldParameters.w);
+    const float distanceFromFocus = abs(viewDepth - focusDistance) / max(max(viewDepth, focusDistance), 0.001);
+    return clamp(distanceFromFocus * (8.0 / apertureFStops) * maxBlurPixels, 0.0, maxBlurPixels);
+}
+
+float PixelRadiusToWorld(float pointSizePixels, float viewDepth) {
+    const float pixelWorld = (2.0 * max(0.001, viewDepth)) /
+                             (max(abs(uniforms.projection[1][1]), 1e-5) *
+                              max(1.0, uniforms.viewportParameters.y));
+    return max(0.0, pointSizePixels * 0.5 * pixelWorld);
+}
+
+float ResolveScreenRadiusWorld(uint pointIndex, float viewDepth) {
+    const float pointSize = clamp(
+        EvaluateBinding(styleData.pointSizeBinding, pointIndex) + ResolveDepthOfFieldBlurPixels(viewDepth),
+        max(1.0, styleData.renderParams3.y),
+        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+    return PixelRadiusToWorld(pointSize, viewDepth);
+}
+
+float ResolveSurfelRadiusWorld(uint pointIndex, float viewDepth) {
+    const float blurRadius = PixelRadiusToWorld(ResolveDepthOfFieldBlurPixels(viewDepth), viewDepth);
+    return max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex) * 0.5) + blurRadius;
+}
+
+void ResolveBasis(vec3 center, uint pointIndex, out vec3 normal, out vec3 tangent, out vec3 bitangent, out float surfaceAngleMask) {
+    const bool forceCameraFacing =
+        styleData.renderControl.z == 0u ||
+        styleData.renderControl.z == 2u ||
+        styleData.pointMeta.z == 0u ||
+        pointIndex >= styleData.pointMeta.x;
+    if (forceCameraFacing) {
+        normal = normalize(uniforms.cameraPosition.xyz - center);
+        tangent = CameraRight();
+        bitangent = CameraUp();
+        surfaceAngleMask = 0.0;
+        return;
+    }
+
+    normal = raycastNormals.normals[pointIndex].xyz;
+    if (dot(normal, normal) <= 1e-8) {
+        normal = normalize(uniforms.cameraPosition.xyz - center);
+        tangent = CameraRight();
+        bitangent = CameraUp();
+        surfaceAngleMask = 0.0;
+        return;
+    }
+
+    normal = normalize(normal);
+    surfaceAngleMask = clamp(1.0 - abs(dot(normal, normalize(uniforms.cameraPosition.xyz - center))), 0.0, 1.0);
+    tangent = CameraRight() - (normal * dot(CameraRight(), normal));
+    if (dot(tangent, tangent) <= 1e-8) {
+        tangent = CameraUp() - (normal * dot(CameraUp(), normal));
+    }
+    if (dot(tangent, tangent) <= 1e-8) {
+        tangent = abs(normal.z) < 0.999 ? cross(vec3(0.0, 0.0, 1.0), normal)
+                                        : cross(vec3(0.0, 1.0, 0.0), normal);
+    }
+    tangent = normalize(tangent);
+    bitangent = normalize(cross(normal, tangent));
+}
+
+bool IntersectAabb(vec3 origin, vec3 invDirection, vec3 boundsMin, vec3 boundsMax, float maxT) {
+    const vec3 t0 = (boundsMin - origin) * invDirection;
+    const vec3 t1 = (boundsMax - origin) * invDirection;
+    const vec3 tMin = min(t0, t1);
+    const vec3 tMax = max(t0, t1);
+    const float nearT = max(max(tMin.x, tMin.y), max(tMin.z, 0.0));
+    const float farT = min(min(tMax.x, tMax.y), min(tMax.z, maxT));
+    return farT >= nearT;
+}
+
+struct Hit {
+    bool hit;
+    float t;
+    float radius;
+    float radiusSquared;
+    float viewDepth;
+    vec2 coord;
+    float surfaceAngleMask;
+};
+
+Hit IntersectStyleSurfel(uint pointIndex, vec3 origin, vec3 direction, float maxRayT, float maxViewDepth) {
+    Hit hit;
+    hit.hit = false;
+    const vec3 center = ResolveAnimatedPointPosition(raycastPositions.positions[pointIndex].xyz, pointIndex);
+    const vec4 centerView = uniforms.view * vec4(center, 1.0);
+    const float centerDepth = -centerView.z;
+    if (centerDepth <= uniforms.depthParameters.y || centerDepth >= maxViewDepth) {
+        return hit;
+    }
+
+    vec3 normal;
+    vec3 tangent;
+    vec3 bitangent;
+    ResolveBasis(center, pointIndex, normal, tangent, bitangent, hit.surfaceAngleMask);
+    const float denominator = dot(normal, direction);
+    if (abs(denominator) <= 1e-6) {
+        return hit;
+    }
+
+    const float t = dot(center - origin, normal) / denominator;
+    if (t <= 0.0 || t >= maxRayT) {
+        return hit;
+    }
+
+    const vec3 position = origin + direction * t;
+    const vec3 local = position - center;
+    const float radiusWorld =
+        styleData.renderControl.z == 0u
+            ? ResolveScreenRadiusWorld(pointIndex, centerDepth)
+            : ResolveSurfelRadiusWorld(pointIndex, centerDepth);
+    if (radiusWorld <= 1e-6) {
+        return hit;
+    }
+
+    const float u = dot(local, tangent);
+    const float v = dot(local, bitangent);
+    const float radiusSquared = ((u * u) + (v * v)) / (radiusWorld * radiusWorld);
+    if (radiusSquared > 1.0) {
+        return hit;
+    }
+
+    const vec4 viewPosition = uniforms.view * vec4(position, 1.0);
+    hit.hit = true;
+    hit.t = t;
+    hit.radiusSquared = radiusSquared;
+    hit.radius = sqrt(radiusSquared);
+    hit.viewDepth = -viewPosition.z;
+    hit.coord = vec2(u / radiusWorld, v / radiusWorld);
+    return hit;
+}
+
+Hit IntersectSoftSphere(uint pointIndex, vec3 origin, vec3 direction, float maxRayT, float maxViewDepth) {
+    Hit hit;
+    hit.hit = false;
+    const vec3 center = ResolveAnimatedPointPosition(raycastPositions.positions[pointIndex].xyz, pointIndex);
+    const vec4 centerView = uniforms.view * vec4(center, 1.0);
+    const float centerDepth = -centerView.z;
+    if (centerDepth <= uniforms.depthParameters.y || centerDepth >= maxViewDepth) {
+        return hit;
+    }
+
+    const float radiusWorld = max(
+        ResolveScreenRadiusWorld(pointIndex, centerDepth),
+        ResolveSurfelRadiusWorld(pointIndex, centerDepth));
+    if (radiusWorld <= 1e-6) {
+        return hit;
+    }
+
+    const vec3 oc = origin - center;
+    const float b = dot(oc, direction);
+    const float c = dot(oc, oc) - (radiusWorld * radiusWorld);
+    const float discriminant = (b * b) - c;
+    if (discriminant < 0.0) {
+        return hit;
+    }
+
+    float t = -b - sqrt(discriminant);
+    if (t <= 0.0) {
+        t = -b + sqrt(discriminant);
+    }
+    if (t <= 0.0 || t >= maxRayT) {
+        return hit;
+    }
+
+    const vec3 position = origin + direction * t;
+    const vec3 local = position - center;
+    const float radiusSquared = dot(local, local) / (radiusWorld * radiusWorld);
+    if (radiusSquared > 1.0) {
+        return hit;
+    }
+
+    const vec3 tangent = CameraRight();
+    const vec3 bitangent = CameraUp();
+    const vec4 viewPosition = uniforms.view * vec4(position, 1.0);
+    hit.hit = true;
+    hit.t = t;
+    hit.radiusSquared = radiusSquared;
+    hit.radius = sqrt(radiusSquared);
+    hit.viewDepth = -viewPosition.z;
+    hit.coord = vec2(dot(local, tangent), dot(local, bitangent)) / radiusWorld;
+    hit.surfaceAngleMask = 0.0;
+    return hit;
+}
+
+bool AlphaContributesDepth(float alpha) {
+    if (styleData.renderControl.x == 2u) {
+        return true;
+    }
+    if (styleData.renderControl.x == 1u) {
+        return alpha >= clamp(styleData.renderParams3.x, 0.0, 1.0);
+    }
+    return false;
+}
+
+void AccumulateHit(uint pixelIndex, uint pointIndex, Hit hit, float sampleWeight) {
+    const float falloff = ResolveFalloff(hit.radius, hit.radiusSquared);
+    const float stylisedCoverage =
+        PointStylisationCoverage(hit.coord, hit.radius, hit.radiusSquared, pointIndex);
+    const vec2 flow = ApplyWaterFlowAnimation(
+        EvaluateBinding(styleData.opacityBinding, pointIndex),
+        EvaluateBinding(styleData.emissiveBinding, pointIndex),
+        pointIndex);
+    const float alpha = clamp(
+        clamp(flow.x, 0.0, 1.0) *
+            falloff *
+            stylisedCoverage *
+            ResolveDepthFadeAlpha(EvaluateBinding(styleData.depthFadeBinding, pointIndex), hit.viewDepth),
+        0.0,
+        AlphaClampMax());
+    if (alpha <= 1e-5) {
+        return;
+    }
+
+    if (raycast.control.z == kPassDepth) {
+        if (AlphaContributesDepth(alpha)) {
+            raycastDepth.depth[pixelIndex] = min(raycastDepth.depth[pixelIndex], hit.viewDepth);
+        }
+        return;
+    }
+
+    vec3 baseColor = PointStylisationColor(
+        ResolveBaseColor(pointIndex),
+        hit.coord,
+        hit.radius,
+        pointIndex,
+        hit.surfaceAngleMask);
+
+    const float densityScale = max(0.0, styleData.renderParams2.x);
+    const float densityClamp = max(0.0, styleData.renderParams2.y);
+    const float densityAlpha = densityClamp > 0.0 ? min(alpha * max(1.0, densityScale), densityClamp) : alpha;
+    const float weightedAlpha = clamp(densityAlpha * sampleWeight, 0.0, AlphaClampMax());
+    const float weight = WeightedAlphaWeight(weightedAlpha, hit.viewDepth);
+    raycastAccumulation.accumulation[pixelIndex] += vec4(baseColor * weightedAlpha * weight, weightedAlpha * weight);
+    raycastRevealage.revealage[pixelIndex] *= 1.0 - weightedAlpha;
+
+    const float emissionGain = max(0.0, flow.y) * max(0.0, styleData.renderParams0.x);
+    if (emissionGain > 1e-5) {
+        raycastEmission.emission[pixelIndex] +=
+            vec4(baseColor * alpha * emissionGain, alpha * emissionGain) * sampleWeight;
+    }
+
+    const float xray = clamp(EvaluateBinding(styleData.xrayBinding, pointIndex), 0.0, 1.0);
+    if (xray > 1e-5) {
+        const float sceneDepth = raycastDepth.depth[pixelIndex];
+        if (isinf(sceneDepth)) {
+            return;
+        }
+        const float depthBias = max(0.0, styleData.renderParams1.y);
+        const float behind = max(hit.viewDepth - sceneDepth - depthBias, 0.0);
+        const float hiddenFade = exp(-behind * max(0.0, styleData.renderParams1.x));
+        const float frontMask = hit.viewDepth <= sceneDepth + depthBias ? 1.0 : 0.0;
+        const float xrayAlpha =
+            alpha * xray * mix(styleData.renderParams1.w * hiddenFade, styleData.renderParams1.z, frontMask);
+        if (xrayAlpha > 1e-5) {
+            const float xrayGain = max(0.0, styleData.renderParams0.x);
+            raycastEmission.emission[pixelIndex] +=
+                vec4(baseColor * xrayAlpha * xrayGain, xrayAlpha * xrayGain) * sampleWeight;
+        }
+    }
+}
+
+void TraceSample(uint pixelIndex, vec3 origin, vec3 direction, float maxViewDepth, float sampleWeight) {
+    const vec3 invDirection = 1.0 / max(abs(direction), vec3(1e-8)) * sign(direction);
+    const vec3 viewDirection = (uniforms.view * vec4(direction, 0.0)).xyz;
+    const float maxRayT = maxViewDepth / max(1e-5, -viewDirection.z);
+    uint stack[64];
+    uint stackCount = 0u;
+    stack[stackCount++] = 0u;
+
+    while (stackCount > 0u) {
+        const uint nodeIndex = stack[--stackCount];
+        const BvhNode node = raycastBvhNodes.nodes[nodeIndex];
+        if (!IntersectAabb(origin, invDirection, node.boundsMin.xyz, node.boundsMax.xyz, maxRayT)) {
+            continue;
+        }
+
+        if (node.meta.w > 0u) {
+            for (uint offset = 0u; offset < node.meta.w; ++offset) {
+                const uint pointIndex = raycastBvhIndices.pointIndices[node.meta.z + offset];
+                const Hit hit = raycast.control.w == kPrimitiveSoftDensitySpheres
+                                    ? IntersectSoftSphere(pointIndex, origin, direction, maxRayT, maxViewDepth)
+                                    : IntersectStyleSurfel(pointIndex, origin, direction, maxRayT, maxViewDepth);
+                if (hit.hit) {
+                    AccumulateHit(pixelIndex, pointIndex, hit, sampleWeight);
+                }
+            }
+            continue;
+        }
+
+        if (stackCount + 2u < 64u) {
+            stack[stackCount++] = node.meta.y;
+            stack[stackCount++] = node.meta.x;
+        }
+    }
+}
+
+vec3 RayDirectionForSubsample(vec2 pixel, vec2 offset, uint width, uint height) {
+    const vec2 uv = (pixel + offset) / vec2(max(1u, width), max(1u, height));
+    const vec2 ndc = (uv * 2.0) - 1.0;
+    vec4 farWorld = uniforms.inverseViewProjection * vec4(ndc, 1.0, 1.0);
+    farWorld /= max(abs(farWorld.w), 1e-8);
+    return normalize(farWorld.xyz - uniforms.cameraPosition.xyz);
+}
+
+vec2 SampleOffset(uint sampleIndex, uint sampleCount) {
+    if (sampleCount <= 1u) {
+        return vec2(0.5);
+    }
+    const uint side = uint(ceil(sqrt(float(sampleCount))));
+    return (vec2(sampleIndex % side, sampleIndex / side) + vec2(0.5)) / float(side);
+}
+
+void main() {
+    const uint width = max(1u, raycast.control.x);
+    const uint height = max(1u, raycast.control.y);
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= width || pixel.y >= height || styleData.pointMeta.x == 0u) {
+        return;
+    }
+
+    const uint pixelIndex = pixel.y * width + pixel.x;
+    const uint sampleCount = clamp(uint(max(1.0, raycast.params.x)), 1u, 16u);
+    const float sampleWeight = 1.0 / float(sampleCount);
+    const float maxViewDepth = raycast.params.y > 0.0 ? raycast.params.y : uniforms.depthParameters.z;
+    const vec3 origin = uniforms.cameraPosition.xyz;
+    for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex) {
+        TraceSample(
+            pixelIndex,
+            origin,
+            RayDirectionForSubsample(vec2(pixel), SampleOffset(sampleIndex, sampleCount), width, height),
+            maxViewDepth,
+            sampleWeight);
+    }
+}

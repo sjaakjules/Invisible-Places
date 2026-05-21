@@ -42,7 +42,7 @@ struct ProjectDocument {
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 17;
+    std::uint32_t schemaVersion = 18;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
@@ -59,6 +59,7 @@ struct ProjectDocument {
     bool liveVisualEffects = false;
     bool sidePanelPinned = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
+    float eyeDomeLightingThickness = 1.0F;
     invisible_places::renderer::pointcloud::PointCloudPreviewLodMode pointCloudPreviewLodMode =
         invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::AutoCameraLod;
     std::uint64_t interactivePointCap = 10'000'000ULL;
@@ -66,7 +67,18 @@ struct ProjectDocument {
         invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
     invisible_places::output::RenderJobSettings renderJobSettings{};
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
+    invisible_places::water::WaterSourceSettings waterSourceSettings{};
+    std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
+    invisible_places::water::WaterAnimationTrailSettings waterAnimationTrailSettings{};
+    std::optional<invisible_places::water::WaterAnimationTrailSettings> tempWaterAnimationTrailSettings;
+    invisible_places::renderer::pointcloud::PointCloudStyleState waterPointVisualStyle{};
+    std::optional<invisible_places::renderer::pointcloud::PointCloudStyleState> tempWaterPointVisualStyle;
+    invisible_places::water::WaterVisualSettings waterVisualSettings{};
+    std::optional<invisible_places::water::WaterVisualSettings> tempWaterVisualSettings;
+    invisible_places::water::WaterSettingsBundle waterSettings{};
+    std::optional<invisible_places::water::WaterSettingsBundle> tempWaterSettings;
     invisible_places::water::WaterBakeSettings waterBakeSettings{};
+    invisible_places::water::WaterRenderSettings waterRenderSettings{};
 };
 
 struct PointCloudStylePresetDocument {
@@ -76,9 +88,14 @@ struct PointCloudStylePresetDocument {
 };
 
 struct WaterSourcesDocument {
-    std::uint32_t schemaVersion = 1;
+    std::uint32_t schemaVersion = 2;
     std::vector<invisible_places::water::WaterEmitter> emitters;
+    invisible_places::water::WaterSourceSettings sourceSettings{};
+    std::optional<invisible_places::water::WaterSourceSettings> tempSourceSettings;
+    invisible_places::water::WaterSettingsBundle settings{};
+    std::optional<invisible_places::water::WaterSettingsBundle> tempSettings;
     invisible_places::water::WaterBakeSettings bakeSettings{};
+    invisible_places::water::WaterRenderSettings renderSettings{};
 };
 
 bool SaveProjectDocument(

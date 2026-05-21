@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 #include <glm/common.hpp>
@@ -22,9 +23,21 @@ namespace invisible_places::output {
 namespace {
 
 constexpr std::size_t kOfflinePointChunkSize = 1'000'000U;
+constexpr std::size_t kWaterPhaseFieldSlot = 3U;
+constexpr std::size_t kWaterSpeedFieldSlot = 4U;
+constexpr std::size_t kWaterWidthFieldSlot = 5U;
+constexpr std::size_t kWaterParticleRoleFieldSlot = 9U;
+constexpr std::size_t kWaterPathStartFieldSlot = 10U;
+constexpr std::size_t kWaterPathCountFieldSlot = 11U;
+constexpr std::size_t kWaterJitterSeedFieldSlot = 12U;
+constexpr float kWaterParticleSpeedScale = 0.12F;
 
 float Clamp01(float value) {
     return std::clamp(value, 0.0F, 1.0F);
+}
+
+glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
+    return {value.x, value.y, value.z};
 }
 
 float ScalarFieldValue(
@@ -43,6 +56,162 @@ float ScalarFieldValue(
     }
 
     return cloud.scalarFieldValues[valueIndex];
+}
+
+float ScalarFieldValueBySlot(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t fieldSlot,
+    std::size_t pointIndex) {
+    if (fieldSlot >= cloud.scalarFields.size() || pointIndex >= cloud.PointCount()) {
+        return 0.0F;
+    }
+    const auto valueIndex = cloud.ScalarFieldValueIndex(fieldSlot, pointIndex);
+    if (valueIndex >= cloud.scalarFieldValues.size()) {
+        return 0.0F;
+    }
+    return cloud.scalarFieldValues[valueIndex];
+}
+
+bool HasWaterParticleFields(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    return style.flowAnimation && cloud.scalarFields.size() > kWaterJitterSeedFieldSlot;
+}
+
+float WaterParticleTravel(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float timeSeconds) {
+    const float phase = ScalarFieldValueBySlot(cloud, kWaterPhaseFieldSlot, pointIndex);
+    const float speed = std::max(0.02F, ScalarFieldValueBySlot(cloud, kWaterSpeedFieldSlot, pointIndex));
+    return std::fmod(
+        phase + std::max(0.0F, timeSeconds) * speed * kWaterParticleSpeedScale + 1.0F,
+        1.0F);
+}
+
+float WaterParticleFade(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float timeSeconds) {
+    const float travel = WaterParticleTravel(cloud, pointIndex, timeSeconds);
+    const float inFade = std::clamp(travel / 0.08F, 0.0F, 1.0F);
+    const float outFade = 1.0F - std::clamp((travel - 0.92F) / 0.08F, 0.0F, 1.0F);
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterJitterSeedFieldSlot, pointIndex);
+    const float shimmer = 0.78F + 0.22F * std::sin((travel + seed * 1.618F) * 6.28318530718F);
+    return inFade * outFade * shimmer;
+}
+
+float HashWater01(std::uint32_t value) {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return static_cast<float>(value & 0x00ffffffU) / 16777215.0F;
+}
+
+glm::vec3 SafeWaterLateral(const glm::vec3& tangent, const glm::vec3& fallback) {
+    glm::vec3 lateral = glm::cross(tangent, glm::vec3{0.0F, 0.0F, 1.0F});
+    if (glm::dot(lateral, lateral) <= 1.0e-8F) {
+        lateral = glm::cross(tangent, glm::vec3{0.0F, 1.0F, 0.0F});
+    }
+    if (glm::dot(lateral, lateral) <= 1.0e-8F) {
+        lateral = fallback;
+    }
+    return glm::normalize(lateral);
+}
+
+glm::vec3 CatmullRomWater(
+    const glm::vec3& p0,
+    const glm::vec3& p1,
+    const glm::vec3& p2,
+    const glm::vec3& p3,
+    float t) {
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return 0.5F * (
+        (2.0F * p1) +
+        (-p0 + p2) * t +
+        ((2.0F * p0) - (5.0F * p1) + (4.0F * p2) - p3) * t2 +
+        (-p0 + (3.0F * p1) - (3.0F * p2) + p3) * t3);
+}
+
+glm::vec3 JitteredWaterAnchorPosition(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pathStart,
+    std::size_t pathCount,
+    std::size_t anchorOffset,
+    float particleSeed,
+    float pathJitter) {
+    const auto clampedOffset = std::min<std::size_t>(anchorOffset, pathCount - 1U);
+    const auto anchorIndex = pathStart + clampedOffset;
+    const glm::vec3 basePosition = ToGlm(cloud.positions[anchorIndex]);
+    if (pathJitter <= 0.0001F) {
+        return basePosition;
+    }
+
+    const auto prevOffset = clampedOffset > 0U ? clampedOffset - 1U : clampedOffset;
+    const auto nextOffset = std::min<std::size_t>(clampedOffset + 1U, pathCount - 1U);
+    const glm::vec3 prevPosition = ToGlm(cloud.positions[pathStart + prevOffset]);
+    const glm::vec3 nextPosition = ToGlm(cloud.positions[pathStart + nextOffset]);
+    glm::vec3 tangent = nextPosition - prevPosition;
+    if (glm::dot(tangent, tangent) <= 1.0e-8F) {
+        return basePosition;
+    }
+
+    tangent = glm::normalize(tangent);
+    const glm::vec3 lateral = SafeWaterLateral(tangent, glm::vec3{1.0F, 0.0F, 0.0F});
+    glm::vec3 secondary = glm::cross(tangent, lateral);
+    if (glm::dot(secondary, secondary) <= 1.0e-8F) {
+        secondary = {0.0F, 0.0F, 1.0F};
+    }
+    secondary = glm::normalize(secondary);
+
+    const auto seedBits = static_cast<std::uint32_t>(std::clamp(particleSeed, 0.0F, 1.0F) * 16777215.0F);
+    const auto hashBase = seedBits ^ (static_cast<std::uint32_t>(clampedOffset) * 747796405U);
+    const float lateralNoise = (HashWater01(hashBase ^ 0x9e3779b9U) - 0.5F) * 2.0F;
+    const float secondaryNoise = (HashWater01(hashBase ^ 0x85ebca6bU) - 0.5F) * 2.0F;
+    const float startFade = glm::smoothstep(0.0F, 2.0F, static_cast<float>(clampedOffset));
+    const float endFade =
+        glm::smoothstep(0.0F, 2.0F, static_cast<float>((pathCount - 1U) - clampedOffset));
+    const float endpointFade = std::min(startFade, endFade);
+    const float anchorWidth = std::clamp(
+        ScalarFieldValueBySlot(cloud, kWaterWidthFieldSlot, anchorIndex),
+        0.001F,
+        100.0F);
+    const float amplitude = anchorWidth * std::clamp(pathJitter, 0.0F, 3.0F) * 0.45F * endpointFade;
+    return basePosition + ((lateral * lateralNoise) + (secondary * secondaryNoise * 0.22F)) * amplitude;
+}
+
+glm::vec3 ResolveWaterParticlePosition(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float timeSeconds,
+    glm::vec3 basePosition) {
+    const auto pathStart = static_cast<std::size_t>(
+        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterPathStartFieldSlot, pointIndex) + 0.5F)));
+    const auto pathCount = static_cast<std::size_t>(
+        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterPathCountFieldSlot, pointIndex) + 0.5F)));
+    if (pathCount < 2U || pathStart >= cloud.positions.size() || pathStart + pathCount > cloud.positions.size()) {
+        return basePosition;
+    }
+
+    const float pathPosition = WaterParticleTravel(cloud, pointIndex, timeSeconds) * static_cast<float>(pathCount - 1U);
+    const auto anchorOffset = std::min<std::size_t>(
+        static_cast<std::size_t>(std::floor(pathPosition)),
+        pathCount - 1U);
+    const float t = pathPosition - std::floor(pathPosition);
+    const auto p0Offset = anchorOffset > 0U ? anchorOffset - 1U : anchorOffset;
+    const auto p1Offset = anchorOffset;
+    const auto p2Offset = std::min<std::size_t>(anchorOffset + 1U, pathCount - 1U);
+    const auto p3Offset = std::min<std::size_t>(anchorOffset + 2U, pathCount - 1U);
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterJitterSeedFieldSlot, pointIndex);
+    const float pathJitter = std::clamp(ScalarFieldValueBySlot(cloud, kWaterWidthFieldSlot, pointIndex), 0.0F, 3.0F);
+    const glm::vec3 p0 = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, p0Offset, seed, pathJitter);
+    const glm::vec3 p1 = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, p1Offset, seed, pathJitter);
+    const glm::vec3 p2 = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, p2Offset, seed, pathJitter);
+    const glm::vec3 p3 = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, p3Offset, seed, pathJitter);
+    return CatmullRomWater(p0, p1, p2, p3, t);
 }
 
 float EvaluateBinding(
@@ -303,6 +472,105 @@ float PointCoordNoise(glm::vec2 coord, std::uint32_t pointIndex) {
     return PointHash01((cellX * 1973U) ^ (cellY * 9277U) ^ (pointIndex * 26699U));
 }
 
+float Fract(float value) {
+    return value - std::floor(value);
+}
+
+float SurfaceHash13(const glm::vec3& value) {
+    return Fract(std::sin(glm::dot(value, glm::vec3{127.1F, 311.7F, 74.7F})) * 43758.5453123F);
+}
+
+float SurfaceValueNoise(const glm::vec3& value) {
+    const glm::vec3 cell = glm::floor(value);
+    const glm::vec3 local = value - cell;
+    const glm::vec3 blend = local * local * (glm::vec3{3.0F} - (2.0F * local));
+    const float c000 = SurfaceHash13(cell + glm::vec3{0.0F, 0.0F, 0.0F});
+    const float c100 = SurfaceHash13(cell + glm::vec3{1.0F, 0.0F, 0.0F});
+    const float c010 = SurfaceHash13(cell + glm::vec3{0.0F, 1.0F, 0.0F});
+    const float c110 = SurfaceHash13(cell + glm::vec3{1.0F, 1.0F, 0.0F});
+    const float c001 = SurfaceHash13(cell + glm::vec3{0.0F, 0.0F, 1.0F});
+    const float c101 = SurfaceHash13(cell + glm::vec3{1.0F, 0.0F, 1.0F});
+    const float c011 = SurfaceHash13(cell + glm::vec3{0.0F, 1.0F, 1.0F});
+    const float c111 = SurfaceHash13(cell + glm::vec3{1.0F, 1.0F, 1.0F});
+    const float x00 = std::lerp(c000, c100, blend.x);
+    const float x10 = std::lerp(c010, c110, blend.x);
+    const float x01 = std::lerp(c001, c101, blend.x);
+    const float x11 = std::lerp(c011, c111, blend.x);
+    const float y0 = std::lerp(x00, x10, blend.y);
+    const float y1 = std::lerp(x01, x11, blend.y);
+    return std::lerp(y0, y1, blend.z);
+}
+
+float SurfaceFbm(glm::vec3 value) {
+    float sum = 0.0F;
+    float amplitude = 0.5F;
+    float normalizer = 0.0F;
+    for (int octave = 0; octave < 3; ++octave) {
+        sum += SurfaceValueNoise(value) * amplitude;
+        normalizer += amplitude;
+        value = value * 2.03F + glm::vec3{17.1F, 31.7F, 11.3F};
+        amplitude *= 0.5F;
+    }
+    return sum / std::max(0.0001F, normalizer);
+}
+
+glm::vec3 SurfaceMotionNoiseVector(const glm::vec3& position, float time) {
+    return (glm::vec3{
+                SurfaceFbm(position + glm::vec3{13.1F, 0.0F, time}),
+                SurfaceFbm(position + glm::vec3{0.0F, 29.7F, time * 1.13F}),
+                SurfaceFbm(position + glm::vec3{41.3F, 19.1F, time * 0.83F})} *
+            2.0F) -
+           glm::vec3{1.0F};
+}
+
+float SurfaceMotionMask(
+    const OfflinePointLayer& layer,
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex) {
+    if (layer.roughnessMotionFieldSlot >= cloud.scalarFields.size() ||
+        layer.style.roughnessMotionStrength <= 1.0e-5F) {
+        return 0.0F;
+    }
+
+    const float roughness = ScalarFieldValueBySlot(cloud, layer.roughnessMotionFieldSlot, pointIndex);
+    const float roughnessNormalized = std::clamp(
+        (roughness - layer.roughnessMotionMinimum) * layer.roughnessMotionInvRange,
+        0.0F,
+        1.0F);
+    float mask = SmoothStep(
+        std::clamp(layer.style.roughnessMotionThreshold, 0.0F, 1.0F),
+        1.0F,
+        roughnessNormalized);
+    if (layer.groundIdMotionFieldSlot < cloud.scalarFields.size()) {
+        const float groundId = ScalarFieldValueBySlot(cloud, layer.groundIdMotionFieldSlot, pointIndex);
+        const float distanceToTarget =
+            std::abs(groundId - std::clamp(layer.style.roughnessMotionGroundId, 0.0F, 1.0F));
+        mask *= 1.0F - SmoothStep(0.25F, 0.50F, distanceToTarget);
+    }
+    return mask;
+}
+
+glm::vec3 ResolveSurfaceMotionPosition(
+    const OfflinePointLayer& layer,
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    glm::vec3 basePosition,
+    float timeSeconds) {
+    const float mask = SurfaceMotionMask(layer, cloud, pointIndex);
+    if (mask <= 1.0e-5F) {
+        return basePosition;
+    }
+
+    const float scale = std::max(0.01F, layer.style.roughnessMotionScale);
+    const float speed = std::max(0.0F, layer.style.roughnessMotionSpeed);
+    const glm::vec3 noisePosition = basePosition * scale;
+    const glm::vec3 animatedNoise = SurfaceMotionNoiseVector(noisePosition, std::max(0.0F, timeSeconds) * speed);
+    const glm::vec3 restNoise = SurfaceMotionNoiseVector(noisePosition, 0.0F);
+    glm::vec3 offset = (animatedNoise - restNoise) * layer.style.roughnessMotionStrength * mask;
+    offset.z *= 0.35F;
+    return basePosition + offset;
+}
+
 float PointTemporalPigmentNoise(
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
     std::uint32_t pointIndex,
@@ -508,10 +776,6 @@ glm::vec3 CameraUp(const invisible_places::camera::OrbitCameraMatrices& matrices
     return glm::normalize(glm::vec3{matrices.view[0][1], matrices.view[1][1], matrices.view[2][1]});
 }
 
-glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
-    return {value.x, value.y, value.z};
-}
-
 bool IsFinite(glm::vec3 value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
@@ -619,15 +883,27 @@ bool BuildOfflinePointSample(
     std::size_t pointIndex,
     const ExrImage& image,
     OfflinePointSample* sample,
-    bool resolveMaterial) {
+    bool resolveMaterial,
+    float stylisationTimeSeconds) {
     if (layer.cloud == nullptr || sample == nullptr) {
         return false;
     }
 
     const auto& cloud = *layer.cloud;
+    const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
+    if (waterParticles &&
+        ScalarFieldValueBySlot(cloud, kWaterParticleRoleFieldSlot, pointIndex) < 0.5F) {
+        return false;
+    }
+
     const auto& point = cloud.positions[pointIndex];
+    glm::vec3 localPoint{point.x, point.y, point.z};
+    if (waterParticles) {
+        localPoint = ResolveWaterParticlePosition(cloud, pointIndex, stylisationTimeSeconds, localPoint);
+    }
+    localPoint = ResolveSurfaceMotionPosition(layer, cloud, pointIndex, localPoint, stylisationTimeSeconds);
     const glm::vec4 worldPosition =
-        layer.localToWorld * glm::vec4{point.x, point.y, point.z, 1.0F};
+        layer.localToWorld * glm::vec4{localPoint, 1.0F};
     if (std::abs(worldPosition.w) <= 1.0e-6F) {
         return false;
     }
@@ -683,6 +959,9 @@ bool BuildOfflinePointSample(
             layer.style.opacity,
             pointIndex,
             invisible_places::renderer::pointcloud::kInactiveOpacityDefault));
+    if (waterParticles) {
+        sample->opacity *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
+    }
     sample->depthFade = Clamp01(
         EvaluateBindingOrDefault(
             cloud,
@@ -697,6 +976,9 @@ bool BuildOfflinePointSample(
                 layer.style.emissiveStrength,
                 pointIndex,
                 invisible_places::renderer::pointcloud::kInactiveEmissionDefault));
+        if (waterParticles) {
+            sample->emissive *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
+        }
         sample->xray = Clamp01(
             EvaluateBindingOrDefault(
                 cloud,
@@ -1095,7 +1377,15 @@ void RenderPointCloudTile(
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
                 OfflinePointSample sample;
-                if (!BuildOfflinePointSample(layer, matrices, cameraState, pointIndex, *image, &sample, false)) {
+                if (!BuildOfflinePointSample(
+                        layer,
+                        matrices,
+                        cameraState,
+                        pointIndex,
+                        *image,
+                        &sample,
+                        false,
+                        stylisationTimeSeconds)) {
                     continue;
                 }
                 if (diagnostics != nullptr) {
@@ -1159,7 +1449,15 @@ void RenderPointCloudTile(
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
                 OfflinePointSample sample;
-                if (!BuildOfflinePointSample(layer, matrices, cameraState, pointIndex, *image, &sample, true)) {
+                if (!BuildOfflinePointSample(
+                        layer,
+                        matrices,
+                        cameraState,
+                        pointIndex,
+                        *image,
+                        &sample,
+                        true,
+                        stylisationTimeSeconds)) {
                     continue;
                 }
                 if (diagnostics != nullptr) {

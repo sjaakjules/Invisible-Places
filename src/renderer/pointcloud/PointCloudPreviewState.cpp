@@ -357,6 +357,11 @@ bool PointCloudStyleHasActiveStylisation(const PointCloudStyleState& style) {
            style.stylisationStrength > kMaterialEpsilon;
 }
 
+bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) {
+    return style.roughnessMotionStrength > kMaterialEpsilon &&
+           style.roughnessMotionSpeed > kMaterialEpsilon;
+}
+
 PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb) {
@@ -366,20 +371,29 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.falloffProfile = PointCloudFalloffProfile::HardDisc;
     style.stylisationMode = PointCloudStylisationMode::Off;
     style.nprPreset = sourceStyle.nprPreset;
-    style.colorMode = hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
+    style.colorMode = sourceStyle.colorMode == PointCloudColorMode::ScalarColormap
+                          ? PointCloudColorMode::ScalarColormap
+                          : (hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor);
     style.colormap = sourceStyle.colormap;
     style.solidColor = sourceStyle.solidColor;
     style.colorizeColor = sourceStyle.colorizeColor;
-    style.colorizeAmount = 0.0F;
+    style.colorizeAmount = sourceStyle.colorizeAmount;
     style.stylisationStrength = 0.0F;
+    style.roughnessMotionStrength = 0.0F;
     style.flowAnimation = false;
+    style.waterPathView = false;
     invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, kInactiveSurfelDiameterDefault);
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
-    invisible_places::style::SetScalarConstant(&style.colormapPosition, kInactiveColormapPositionDefault);
+    style.colormapPosition = sourceStyle.colorMode == PointCloudColorMode::ScalarColormap
+                                 ? sourceStyle.colormapPosition
+                                 : style.colormapPosition;
+    if (sourceStyle.colorMode != PointCloudColorMode::ScalarColormap) {
+        invisible_places::style::SetScalarConstant(&style.colormapPosition, kInactiveColormapPositionDefault);
+    }
     return style;
 }
 
@@ -420,6 +434,10 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
     }
 
     if (PointCloudStyleHasActiveStylisation(style)) {
+        return PointCloudMaterialVariant::Unified;
+    }
+
+    if (PointCloudStyleHasActiveRoughnessMotion(style)) {
         return PointCloudMaterialVariant::Unified;
     }
 

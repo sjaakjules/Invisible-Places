@@ -2,6 +2,7 @@
 
 #include "camera/AnimationPath.hpp"
 #include "camera/CameraShot.hpp"
+#include "renderer/pointcloud/PointCloudPreviewState.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -23,16 +24,22 @@ struct RenderJobSettings {
     std::uint32_t width = 1920;
     std::uint32_t height = 1080;
     std::uint32_t framesPerSecond = 30;
+    float stillCameraDurationSeconds = 5.0F;
     std::uint32_t tileSize = 512;
     std::uint32_t startFrame = 0;
     std::uint32_t endFrame = 0;
     std::size_t fromShotIndex = 0;
     std::size_t toShotIndex = 1;
+    invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode raycastPrimitiveMode =
+        invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode::StyleSurfels;
+    std::uint32_t raycastSamplesPerPixel = 4;
+    float raycastMaxDepth = 0.0F;
 };
 
 enum class AnimationExportMode {
     FastPreviewMp4,
     HqPreviewDensityExr,
+    BeautyRaycastExrMp4,
 };
 
 std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(
@@ -41,6 +48,10 @@ std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(
 
 std::vector<invisible_places::camera::CameraState> BuildAnimationRenderSequence(
     const invisible_places::camera::AnimationPath& path,
+    const RenderJobSettings& settings);
+
+std::vector<invisible_places::camera::CameraState> BuildStillCameraRenderSequence(
+    const invisible_places::camera::CameraState& cameraState,
     const RenderJobSettings& settings);
 
 float ComputePointSizePixelScale(

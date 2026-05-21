@@ -113,6 +113,18 @@ std::vector<invisible_places::camera::CameraState> BuildAnimationRenderSequence(
     return SliceFrameRange(frames, settings);
 }
 
+std::vector<invisible_places::camera::CameraState> BuildStillCameraRenderSequence(
+    const invisible_places::camera::CameraState& cameraState,
+    const RenderJobSettings& settings) {
+    const auto frameCount = std::max<std::uint32_t>(
+        1U,
+        static_cast<std::uint32_t>(
+            std::ceil(
+                std::max(0.001F, settings.stillCameraDurationSeconds) *
+                static_cast<float>(std::max<std::uint32_t>(1U, settings.framesPerSecond)))));
+    return std::vector<invisible_places::camera::CameraState>(frameCount, cameraState);
+}
+
 float ComputePointSizePixelScale(
     std::uint32_t outputWidth,
     std::uint32_t outputHeight,

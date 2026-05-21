@@ -14,6 +14,16 @@ struct WindowConfig {
     std::string title;
 };
 
+struct WindowSize {
+    int width = 1440;
+    int height = 900;
+};
+
+[[nodiscard]] WindowSize ResolveInitialWindowSizeForScreen(
+    int screenWidth,
+    int screenHeight,
+    WindowSize fallbackSize = {});
+
 class Window {
   public:
     explicit Window(const WindowConfig& config);

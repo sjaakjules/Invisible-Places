@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform RaycastControl {
+    uvec4 control;
+    vec4 params;
+} raycast;
+
+layout(set = 0, binding = 8, std430) readonly buffer RaycastAccumulation {
+    vec4 accumulation[];
+} raycastAccumulation;
+
+layout(set = 0, binding = 9, std430) readonly buffer RaycastRevealage {
+    float revealage[];
+} raycastRevealage;
+
+layout(set = 0, binding = 10, std430) readonly buffer RaycastEmission {
+    vec4 emission[];
+} raycastEmission;
+
+layout(set = 0, binding = 11, std430) readonly buffer RaycastDepth {
+    float depth[];
+} raycastDepth;
+
+layout(set = 0, binding = 12, std430) buffer RaycastColor {
+    vec4 color[];
+} raycastColor;
+
+void main() {
+    const uint width = max(1u, raycast.control.x);
+    const uint height = max(1u, raycast.control.y);
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= width || pixel.y >= height) {
+        return;
+    }
+
+    const uint index = pixel.y * width + pixel.x;
+    const vec4 accum = raycastAccumulation.accumulation[index];
+    const float transparentAlpha = clamp(1.0 - raycastRevealage.revealage[index], 0.0, 1.0);
+    const vec3 transparentColor = accum.a > 1e-5 ? accum.rgb / accum.a : vec3(0.0);
+    const vec4 emission = raycastEmission.emission[index];
+    const vec3 emissionColor = vec3(
+        1.0 - exp(-max(0.0, emission.r)),
+        1.0 - exp(-max(0.0, emission.g)),
+        1.0 - exp(-max(0.0, emission.b)));
+    const float emissionAlpha = clamp(1.0 - exp(-max(0.0, emission.a)), 0.0, 1.0);
+    const float outputAlpha = max(transparentAlpha, emissionAlpha);
+    const vec3 desiredContribution = (transparentColor * transparentAlpha) + emissionColor;
+    const vec3 outputColor = outputAlpha > 1e-5 ? desiredContribution / outputAlpha : vec3(0.0);
+    raycastColor.color[index] = vec4(max(outputColor, vec3(0.0)), outputAlpha);
+}

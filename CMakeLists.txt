@@ -37,8 +37,10 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_preview.vert
     shaders/pointcloud_preview.frag
     shaders/pointcloud_accumulation.frag
+    shaders/pointcloud_exr_accumulation.frag
     shaders/pointcloud_constant_simple.vert
     shaders/pointcloud_constant_simple_accumulation.frag
+    shaders/pointcloud_exr_constant_simple_accumulation.frag
     shaders/pointcloud_opaque_hard_disc.frag
     shaders/pointcloud_fast_basic.vert
     shaders/pointcloud_fast_basic.frag
@@ -47,8 +49,10 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_surfel.vert
     shaders/pointcloud_surfel_preview.frag
     shaders/pointcloud_surfel_accumulation.frag
+    shaders/pointcloud_surfel_exr_accumulation.frag
     shaders/pointcloud_surfel_constant_simple.vert
     shaders/pointcloud_surfel_constant_simple_accumulation.frag
+    shaders/pointcloud_surfel_exr_constant_simple_accumulation.frag
     shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
     shaders/gsplat_accumulation.vert
@@ -57,7 +61,11 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/gsplat_high_quality.frag
     shaders/gsplat_composite.vert
     shaders/gsplat_composite.frag
+    shaders/pointcloud_exr_composite.frag
     shaders/edl_postprocess.frag
+    shaders/pointcloud_raycast_clear.comp
+    shaders/pointcloud_raycast_accumulate.comp
+    shaders/pointcloud_raycast_composite.comp
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
@@ -106,6 +114,7 @@ add_library(
     src/io/TransformMatrix.cpp
     src/output/ExrWriter.cpp
     src/output/EyeDomeLighting.cpp
+    src/output/HoudiniCameraExport.cpp
     src/output/OfflinePointRenderer.cpp
     src/output/RenderPreset.cpp
     src/output/VideoWriter.cpp
@@ -117,6 +126,7 @@ add_library(
     src/renderer/gsplat/HighQualityGaussianScene.cpp
     src/renderer/pointcloud/Colormap.cpp
     src/renderer/pointcloud/PointCloudPreviewState.cpp
+    src/renderer/pointcloud/RaycastBvh.cpp
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
     src/style/RenderParameterBinding.cpp

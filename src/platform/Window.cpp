@@ -3,9 +3,26 @@
 
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace invisible_places::platform {
+
+WindowSize ResolveInitialWindowSizeForScreen(
+    int screenWidth,
+    int screenHeight,
+    WindowSize fallbackSize) {
+    constexpr int kLargeScreenWidth = 1920;
+    constexpr int kLargeScreenHeight = 1080;
+    if (screenWidth > kLargeScreenWidth && screenHeight > kLargeScreenHeight) {
+        return {.width = kLargeScreenWidth, .height = kLargeScreenHeight};
+    }
+
+    return {
+        .width = std::max(1, fallbackSize.width),
+        .height = std::max(1, fallbackSize.height),
+    };
+}
 
 Window::Window(const WindowConfig& config) {
     PrepareMacWindowingRuntime();
@@ -18,7 +35,20 @@ Window::Window(const WindowConfig& config) {
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-    window_ = glfwCreateWindow(config.width, config.height, config.title.c_str(), nullptr, nullptr);
+    WindowSize initialSize{
+        .width = std::max(1, config.width),
+        .height = std::max(1, config.height),
+    };
+    if (GLFWmonitor* primaryMonitor = glfwGetPrimaryMonitor(); primaryMonitor != nullptr) {
+        if (const GLFWvidmode* videoMode = glfwGetVideoMode(primaryMonitor); videoMode != nullptr) {
+            initialSize = ResolveInitialWindowSizeForScreen(
+                videoMode->width,
+                videoMode->height,
+                initialSize);
+        }
+    }
+
+    window_ = glfwCreateWindow(initialSize.width, initialSize.height, config.title.c_str(), nullptr, nullptr);
     if (window_ == nullptr) {
         glfwTerminate();
         throw std::runtime_error{"Window creation failed."};

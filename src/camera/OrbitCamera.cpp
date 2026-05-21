@@ -197,9 +197,21 @@ void OrbitCamera::ApplyState(const CameraState& state) {
         target = position + (glm::normalize(forward) * viewDistance);
     }
 
-    orbitCenter_ = orbitCenter;
     fovDegrees_ = std::clamp(state.fovDegrees, 1.0F, 160.0F);
-    ApplyPositionTarget(position, target);
+    position_ = position;
+    target_ = target;
+    orbitCenter_ = orbitCenter;
+    distance_ = std::max(minimumDistance_, glm::length(orbitCenter_ - position_));
+    const auto forwardForAngles = glm::normalize(target_ - position_);
+    yawRadians_ = std::atan2(forwardForAngles.y, forwardForAngles.x);
+    pitchRadians_ = std::clamp(
+        std::asin(std::clamp(forwardForAngles.z, -1.0F, 1.0F)),
+        -kPitchLimit,
+        kPitchLimit);
+    hasExplicitOrientation_ = orientationLengthSquared > 1.0e-8F;
+    if (hasExplicitOrientation_) {
+        explicitOrientation_ = glm::normalize(storedOrientation);
+    }
     nearPlane_ = std::max(0.0001F, state.nearPlane);
     farPlane_ = std::max(nearPlane_ + 1.0F, state.farPlane);
     hasDepthOfField_ = state.hasDepthOfField;
@@ -210,9 +222,12 @@ void OrbitCamera::ApplyState(const CameraState& state) {
 
 CameraState OrbitCamera::CaptureState() const {
     const auto position = Position();
-    const auto view = glm::lookAtRH(position, target_, WorldUp());
-    const auto cameraToWorld = glm::inverse(glm::mat3{view});
-    const auto orientation = glm::normalize(glm::quat_cast(cameraToWorld));
+    auto orientation = explicitOrientation_;
+    if (!hasExplicitOrientation_) {
+        const auto view = glm::lookAtRH(position, target_, WorldUp());
+        const auto cameraToWorld = glm::inverse(glm::mat3{view});
+        orientation = glm::normalize(glm::quat_cast(cameraToWorld));
+    }
 
     CameraState state;
     state.position = {position.x, position.y, position.z};
@@ -233,7 +248,13 @@ CameraState OrbitCamera::CaptureState() const {
 OrbitCameraMatrices OrbitCamera::Matrices(float aspectRatio) const {
     OrbitCameraMatrices matrices;
     matrices.position = Position();
-    matrices.view = glm::lookAtRH(matrices.position, target_, WorldUp());
+    if (hasExplicitOrientation_) {
+        const auto rotation = glm::mat4_cast(glm::conjugate(glm::normalize(explicitOrientation_)));
+        const auto translation = glm::translate(glm::mat4{1.0F}, -matrices.position);
+        matrices.view = rotation * translation;
+    } else {
+        matrices.view = glm::lookAtRH(matrices.position, target_, WorldUp());
+    }
     matrices.projection = glm::perspective(glm::radians(fovDegrees_), EffectiveAspectRatio(aspectRatio), nearPlane_, farPlane_);
     matrices.projection[1][1] *= -1.0F;
     matrices.viewProjection = matrices.projection * matrices.view;
@@ -253,6 +274,7 @@ void OrbitCamera::ApplyPositionTarget(glm::vec3 position, glm::vec3 target) {
     distance_ = std::max(minimumDistance_, glm::length(orbitCenter_ - position_));
     yawRadians_ = std::atan2(direction.y, direction.x);
     pitchRadians_ = std::clamp(std::asin(std::clamp(direction.z, -1.0F, 1.0F)), -kPitchLimit, kPitchLimit);
+    hasExplicitOrientation_ = false;
     UpdateClippingPlanes();
 }
 
@@ -265,14 +287,23 @@ glm::vec3 OrbitCamera::Position() const {
 }
 
 glm::vec3 OrbitCamera::Forward() const {
+    if (hasExplicitOrientation_) {
+        return glm::normalize(explicitOrientation_) * glm::vec3{0.0F, 0.0F, -1.0F};
+    }
     return glm::normalize(target_ - Position());
 }
 
 glm::vec3 OrbitCamera::Right() const {
+    if (hasExplicitOrientation_) {
+        return glm::normalize(explicitOrientation_) * glm::vec3{1.0F, 0.0F, 0.0F};
+    }
     return glm::normalize(glm::cross(Forward(), WorldUp()));
 }
 
 glm::vec3 OrbitCamera::Up() const {
+    if (hasExplicitOrientation_) {
+        return glm::normalize(explicitOrientation_) * glm::vec3{0.0F, 1.0F, 0.0F};
+    }
     return glm::normalize(glm::cross(Right(), Forward()));
 }
 
@@ -304,6 +335,7 @@ void OrbitCamera::ApplyFramedBounds(float aspectRatio, float distanceScale) {
         std::sin(pitchRadians_),
     };
     position_ = target_ - (glm::normalize(offset) * distance_);
+    hasExplicitOrientation_ = false;
     minimumDistance_ = std::max(0.0005F, framedRadius_ * 0.00005F);
     UpdateClippingPlanes();
 }

@@ -286,6 +286,90 @@ float ReadFarPlane(const AnimationPathKey& key) {
     return key.farPlane;
 }
 
+glm::quat LookAtOrientation(glm::vec3 cameraPosition, glm::vec3 focusPoint);
+
+float ReadFocusDistance(const AnimationPathKey& key) {
+    return key.hasFocusDistance
+               ? std::max(0.001F, key.focusDistance)
+               : std::max(0.001F, Distance(key.cameraPosition, key.focusPoint));
+}
+
+float ReadApertureFStops(const AnimationPathKey& key) {
+    return key.hasApertureFStops ? std::max(0.1F, key.apertureFStops) : 8.0F;
+}
+
+bool AnyKeyHasOrientation(const AnimationPath& path) {
+    return std::any_of(path.keys.begin(), path.keys.end(), [](const AnimationPathKey& key) {
+        return key.hasOrientation;
+    });
+}
+
+bool AnyKeyHasFocusDistance(const AnimationPath& path) {
+    return std::any_of(path.keys.begin(), path.keys.end(), [](const AnimationPathKey& key) {
+        return key.hasFocusDistance;
+    });
+}
+
+bool AnyKeyHasApertureFStops(const AnimationPath& path) {
+    return std::any_of(path.keys.begin(), path.keys.end(), [](const AnimationPathKey& key) {
+        return key.hasApertureFStops;
+    });
+}
+
+glm::quat OrientationFromKey(const AnimationPathKey& key) {
+    if (key.hasOrientation) {
+        const glm::quat orientation{
+            key.orientation[3],
+            key.orientation[0],
+            key.orientation[1],
+            key.orientation[2],
+        };
+        const float lengthSquared =
+            (orientation.w * orientation.w) +
+            (orientation.x * orientation.x) +
+            (orientation.y * orientation.y) +
+            (orientation.z * orientation.z);
+        if (lengthSquared > 1.0e-8F) {
+            return glm::normalize(orientation);
+        }
+    }
+    return LookAtOrientation(ToGlm(key.cameraPosition), ToGlm(key.focusPoint));
+}
+
+glm::quat EvaluateOrientation(
+    const AnimationPath& path,
+    const std::vector<float>& knots,
+    float timeSeconds) {
+    if (path.keys.empty()) {
+        return glm::quat{1.0F, 0.0F, 0.0F, 0.0F};
+    }
+    if (path.keys.size() == 1U || knots.size() != path.keys.size()) {
+        return OrientationFromKey(path.keys.front());
+    }
+
+    const float clampedTime = std::clamp(timeSeconds, knots.front(), knots.back());
+    if (clampedTime <= knots.front()) {
+        return OrientationFromKey(path.keys.front());
+    }
+    if (clampedTime >= knots.back()) {
+        return OrientationFromKey(path.keys.back());
+    }
+
+    const auto upper = std::upper_bound(knots.begin(), knots.end(), clampedTime);
+    const std::size_t rightIndex =
+        std::clamp<std::size_t>(static_cast<std::size_t>(upper - knots.begin()), 1U, knots.size() - 1U);
+    const std::size_t leftIndex = rightIndex - 1U;
+    const float interval = knots[rightIndex] - knots[leftIndex];
+    const float amount = interval <= 1.0e-6F ? 0.0F : (clampedTime - knots[leftIndex]) / interval;
+
+    auto left = OrientationFromKey(path.keys[leftIndex]);
+    auto right = OrientationFromKey(path.keys[rightIndex]);
+    if (glm::dot(left, right) < 0.0F) {
+        right = -right;
+    }
+    return glm::normalize(glm::slerp(left, right, std::clamp(amount, 0.0F, 1.0F)));
+}
+
 glm::quat LookAtOrientation(glm::vec3 cameraPosition, glm::vec3 focusPoint) {
     glm::vec3 forward = focusPoint - cameraPosition;
     if (glm::length(forward) <= 1.0e-5F) {
@@ -426,17 +510,22 @@ AnimationPathEvaluation EvaluateAnimationPath(
         const auto& key = path.keys.front();
         evaluation.focusPoint = key.focusPoint;
         evaluation.focusDistance = glm::length(ToGlm(key.focusPoint) - ToGlm(key.cameraPosition));
+        if (key.hasFocusDistance) {
+            evaluation.focusDistance = std::max(0.001F, key.focusDistance);
+        }
         evaluation.camera.position = key.cameraPosition;
         evaluation.camera.target = key.focusPoint;
         evaluation.camera.orbitCenter = key.focusPoint;
         evaluation.camera.hasOrbitCenter = true;
-        WriteQuaternionToCameraState(LookAtOrientation(ToGlm(key.cameraPosition), ToGlm(key.focusPoint)), &evaluation.camera);
+        WriteQuaternionToCameraState(OrientationFromKey(key), &evaluation.camera);
         evaluation.camera.fovDegrees = key.fovDegrees;
         evaluation.camera.nearPlane = key.nearPlane;
         evaluation.camera.farPlane = key.farPlane;
         evaluation.camera.hasDepthOfField = path.depthOfFieldEnabled;
         evaluation.camera.focusDistance = evaluation.focusDistance;
-        evaluation.camera.apertureFStops = std::max(0.1F, path.apertureFStops);
+        evaluation.camera.apertureFStops = key.hasApertureFStops
+                                               ? std::max(0.1F, key.apertureFStops)
+                                               : std::max(0.1F, path.apertureFStops);
         evaluation.camera.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
         return evaluation;
     }
@@ -464,14 +553,23 @@ AnimationPathEvaluation EvaluateAnimationPath(
     const auto cameraPosition = ToGlm(evaluation.camera.position);
     const auto focusPoint = ToGlm(evaluation.focusPoint);
     evaluation.focusDistance = glm::length(focusPoint - cameraPosition);
-    WriteQuaternionToCameraState(LookAtOrientation(cameraPosition, focusPoint), &evaluation.camera);
+    if (AnyKeyHasFocusDistance(path)) {
+        evaluation.focusDistance = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFocusDistance);
+    }
+    if (AnyKeyHasOrientation(path)) {
+        WriteQuaternionToCameraState(EvaluateOrientation(path, knots, clampedTimeSeconds), &evaluation.camera);
+    } else {
+        WriteQuaternionToCameraState(LookAtOrientation(cameraPosition, focusPoint), &evaluation.camera);
+    }
 
     evaluation.camera.fovDegrees = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFovDegrees);
     evaluation.camera.nearPlane = EvaluateScalar(path, knots, clampedTimeSeconds, ReadNearPlane);
     evaluation.camera.farPlane = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFarPlane);
     evaluation.camera.hasDepthOfField = path.depthOfFieldEnabled;
     evaluation.camera.focusDistance = evaluation.focusDistance;
-    evaluation.camera.apertureFStops = std::max(0.1F, path.apertureFStops);
+    evaluation.camera.apertureFStops = AnyKeyHasApertureFStops(path)
+                                           ? EvaluateScalar(path, knots, clampedTimeSeconds, ReadApertureFStops)
+                                           : std::max(0.1F, path.apertureFStops);
     evaluation.camera.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
     return evaluation;
 }

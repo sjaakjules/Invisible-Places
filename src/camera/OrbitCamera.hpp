@@ -4,6 +4,7 @@
 #include "io/PointCloudData.hpp"
 
 #include <glm/mat4x4.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
 namespace invisible_places::camera {
@@ -70,6 +71,8 @@ class OrbitCamera {
     float distance_ = 5.0F;
     float yawRadians_ = 0.65F;
     float pitchRadians_ = -0.55F;
+    bool hasExplicitOrientation_ = false;
+    glm::quat explicitOrientation_{1.0F, 0.0F, 0.0F, 0.0F};
     float fovDegrees_ = 55.0F;
     float nearPlane_ = 0.05F;
     float farPlane_ = 1000.0F;

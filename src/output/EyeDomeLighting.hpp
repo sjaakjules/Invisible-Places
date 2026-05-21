@@ -8,6 +8,7 @@ struct EyeDomeLightingSettings {
     bool enabled = false;
     float strength = 24.0F;
     float minShade = 0.35F;
+    float outlineThicknessPixels = 1.0F;
 };
 
 [[nodiscard]] float ComputeEyeDomeLightingShade(

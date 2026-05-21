@@ -1,10 +1,12 @@
 #include "renderer/core/VulkanViewportShell.hpp"
 
 #include "InvisiblePlacesBuildConfig.hpp"
+#include "renderer/pointcloud/RaycastBvh.hpp"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <Imath/half.h>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
@@ -13,18 +15,22 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
+#include <glm/matrix.hpp>
 #include <glm/vec4.hpp>
 
 namespace invisible_places::renderer::core {
@@ -38,6 +44,7 @@ namespace {
 struct QueueFamilySelection {
     std::optional<std::uint32_t> graphicsFamily;
     std::optional<std::uint32_t> presentFamily;
+    bool graphicsFamilySupportsCompute = false;
 
     [[nodiscard]] bool IsComplete() const {
         return graphicsFamily.has_value() && presentFamily.has_value();
@@ -58,6 +65,7 @@ struct alignas(16) FrameUniforms {
     glm::vec4 depthParameters{0.0F, 0.05F, 1000.0F, 0.0F};
     glm::vec4 viewportParameters{1.0F, 1.0F, 2.0F, 2.0F};
     glm::vec4 depthOfFieldParameters{0.0F, 1.0F, 8.0F, 24.0F};
+    glm::mat4 inverseViewProjection{1.0F};
 };
 
 double MillisecondsBetween(
@@ -94,6 +102,8 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 stylisationParams0{1.0F, 5.0F, 0.35F, 0.35F};
     glm::vec4 stylisationParams1{0.45F, 2.2F, 0.35F, 0.0F};
     glm::vec4 stylisationParams2{0.25F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 surfaceMotionParams{0.0F, 1.5F, 0.35F, 0.58F};
+    glm::vec4 surfaceMotionStats{0.0F, 1.0F, 1.0F, 0.25F};
 };
 
 struct alignas(16) GaussianSplatPushConstants {
@@ -118,6 +128,59 @@ struct alignas(16) HighQualityGaussianPushConstants {
 struct alignas(16) PostProcessPushConstants {
     glm::vec4 edl{0.0F, 24.0F, 0.35F, 1.0F};
 };
+
+struct alignas(16) RaycastPushConstants {
+    glm::uvec4 control{1U, 1U, 0U, 0U};
+    glm::vec4 params{1.0F, 0.0F, 0.0F, 0.0F};
+};
+
+std::string NormalizeScalarFieldName(std::string_view name) {
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (const char character : name) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(byte)));
+    }
+    return normalized;
+}
+
+std::optional<std::uint32_t> FindScalarFieldSlotByNormalizedName(
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    std::initializer_list<std::string_view> exactNames,
+    std::string_view containsName) {
+    std::optional<std::uint32_t> containsMatch;
+    for (std::size_t index = 0; index < scalarFields.size(); ++index) {
+        const auto normalized = NormalizeScalarFieldName(scalarFields[index].name);
+        for (const auto exactName : exactNames) {
+            if (normalized == exactName) {
+                return static_cast<std::uint32_t>(index);
+            }
+        }
+        if (!containsMatch.has_value() && normalized.find(containsName) != std::string::npos) {
+            containsMatch = static_cast<std::uint32_t>(index);
+        }
+    }
+    return containsMatch;
+}
+
+std::optional<std::uint32_t> FindRoughnessScalarFieldSlot(
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    return FindScalarFieldSlotByNormalizedName(
+        scalarFields,
+        {"roughness", "scalarroughness"},
+        "roughness");
+}
+
+std::optional<std::uint32_t> FindGroundIdScalarFieldSlot(
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    return FindScalarFieldSlotByNormalizedName(
+        scalarFields,
+        {"groundid", "scalargroundid"},
+        "groundid");
+}
 
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
@@ -164,8 +227,12 @@ QueueFamilySelection FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR sur
     vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
 
     for (std::uint32_t index = 0; index < queueFamilyCount; ++index) {
-        if ((queueFamilies[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+        const bool supportsGraphics = (queueFamilies[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        const bool supportsCompute = (queueFamilies[index].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+        if (supportsGraphics && (!selection.graphicsFamily.has_value() ||
+                                 (supportsCompute && !selection.graphicsFamilySupportsCompute))) {
             selection.graphicsFamily = index;
+            selection.graphicsFamilySupportsCompute = supportsCompute;
         }
 
         VkBool32 presentSupported = VK_FALSE;
@@ -174,7 +241,7 @@ QueueFamilySelection FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR sur
             selection.presentFamily = index;
         }
 
-        if (selection.IsComplete()) {
+        if (selection.IsComplete() && selection.graphicsFamilySupportsCompute) {
             break;
         }
     }
@@ -395,6 +462,54 @@ void ScalePointCloudBindingGpu(PointCloudBindingGpu* binding, float scale) {
     binding->range.w *= safeScale;
 }
 
+float BindingMaximum(
+    const invisible_places::style::RenderParameterBinding& binding,
+    float inactiveDefault) {
+    if (!binding.active) {
+        return inactiveDefault;
+    }
+    if (binding.mode == invisible_places::style::ParameterSourceMode::Constant) {
+        return binding.constantValue[0];
+    }
+    return std::max(binding.fieldMap.outputMin, binding.fieldMap.outputMax);
+}
+
+float EstimateRaycastBvhRadius(
+    const renderer::pointcloud::PointCloudStyleState& style,
+    renderer::pointcloud::PointCloudRaycastPrimitiveMode primitiveMode,
+    const SceneRenderState& renderState,
+    std::uint32_t width,
+    std::uint32_t height,
+    float maxDepth,
+    float pointSizeRangeMin,
+    float pointSizeRangeMax) {
+    const float safeHeight = std::max(1.0F, static_cast<float>(height));
+    const float exportDepth = maxDepth > 0.0F ? maxDepth : renderState.farPlane;
+    const float projectionScale = std::max(1.0e-5F, std::abs(renderState.projection[1][1]));
+    const float pixelWorldAtMaxDepth = (2.0F * std::max(0.001F, exportDepth)) / (projectionScale * safeHeight);
+    const float pointSize = std::clamp(
+        BindingMaximum(style.pointSize, renderer::pointcloud::kInactivePointSizeDefault) *
+            std::max(0.001F, renderState.pointSizeScale) +
+            (renderState.hasDepthOfField ? renderState.depthOfFieldMaxBlurPixels : 0.0F),
+        std::max(1.0F, pointSizeRangeMin),
+        std::max(std::max(1.0F, pointSizeRangeMin), pointSizeRangeMax));
+    const float screenRadius = pointSize * 0.5F * pixelWorldAtMaxDepth;
+    const float surfelRadius =
+        std::max(0.0F, BindingMaximum(style.surfelDiameter, renderer::pointcloud::kInactiveSurfelDiameterDefault)) *
+        0.5F;
+    if (primitiveMode == renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres) {
+        return std::max(screenRadius, surfelRadius);
+    }
+    if (style.geometryMode == renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
+        return screenRadius;
+    }
+    return std::max(screenRadius, surfelRadius);
+}
+
+std::uint16_t FloatToHalfBits(float value) {
+    return Imath::half{std::max(0.0F, value)}.bits();
+}
+
 VkDescriptorPoolSize MakePoolSize(VkDescriptorType type, std::uint32_t descriptorCount) {
     return VkDescriptorPoolSize{type, descriptorCount};
 }
@@ -496,6 +611,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
     CreatePostProcessDescriptorSetLayout();
+    CreateRaycastDescriptorSetLayout();
     CreateDescriptorPools();
     CreatePostProcessSampler();
     CreateUniformResources();
@@ -508,6 +624,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
     CreatePostProcessPipeline();
+    CreateRaycastPipelines();
     CreateFramebuffers();
     CreatePresentFramebuffers();
     CreateCommandPool();
@@ -541,6 +658,7 @@ VulkanViewportShell::~VulkanViewportShell() {
     gaussianSplatResources_.clear();
     CleanupHighQualityGaussianScene();
     CleanupExrExportResources();
+    CleanupRaycastExportResources();
 
     CleanupSwapchain();
 
@@ -604,6 +722,15 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (postProcessPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, postProcessPipeline_, nullptr);
     }
+    if (raycastClearPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, raycastClearPipeline_, nullptr);
+    }
+    if (raycastAccumulationPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, raycastAccumulationPipeline_, nullptr);
+    }
+    if (raycastCompositePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, raycastCompositePipeline_, nullptr);
+    }
     if (pointPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, pointPipelineLayout_, nullptr);
     }
@@ -618,6 +745,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (postProcessPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, postProcessPipelineLayout_, nullptr);
+    }
+    if (raycastPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, raycastPipelineLayout_, nullptr);
     }
     if (postProcessSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(device_, postProcessSampler_, nullptr);
@@ -645,6 +775,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (postProcessDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, postProcessDescriptorSetLayout_, nullptr);
+    }
+    if (raycastDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, raycastDescriptorSetLayout_, nullptr);
     }
 
     if (renderPass_ != VK_NULL_HANDLE) {
@@ -962,6 +1095,7 @@ void VulkanViewportShell::UploadPointCloud(
     resources.scalarFieldCount = static_cast<std::uint32_t>(cloud.ScalarFieldCount());
     resources.hasSourceRgb = cloud.hasSourceRgb;
     resources.hasNormals = cloud.hasNormals && cloud.normals.size() == cloud.positions.size();
+    resources.cpuPositions = cloud.positions;
 
     resources.positionBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(invisible_places::io::Float3)),
@@ -1328,10 +1462,12 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         invisible_places::output::HalfRgbaExrImage image;
         image.width = request.width;
         image.height = request.height;
-        image.rgbaHalf.resize(
-            static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height) * 4U);
-        image.depth.resize(
-            static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height));
+        const auto pixelCount =
+            static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height);
+        image.rgbaHalf.resize(pixelCount * 4U);
+        image.normalHalf.resize(pixelCount * 3U);
+        image.albedoHalf.resize(pixelCount * 3U);
+        image.depth.resize(pixelCount);
 
         void* mappedColor = exrExportResources_.colorReadbackBuffer.mapped;
         bool unmapColor = false;
@@ -1375,6 +1511,155 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
             image.depth.size() * sizeof(float));
         if (unmapDepth) {
             vkUnmapMemory(device_, exrExportResources_.depthReadbackBuffer.memory);
+        }
+
+        auto copyRgbHalfReadback = [&](const BufferAllocation& buffer,
+                                       std::vector<std::uint16_t>* destination,
+                                       const char* mapLabel) {
+            if (destination == nullptr || destination->size() != pixelCount * 3U) {
+                return;
+            }
+
+            void* mapped = buffer.mapped;
+            bool unmap = false;
+            if (mapped == nullptr) {
+                Check(
+                    vkMapMemory(device_, buffer.memory, 0, buffer.size, 0, &mapped),
+                    mapLabel);
+                unmap = true;
+            }
+
+            const auto* source = static_cast<const std::uint16_t*>(mapped);
+            for (std::size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex) {
+                const std::size_t sourceOffset = pixelIndex * 4U;
+                const std::size_t destinationOffset = pixelIndex * 3U;
+                (*destination)[destinationOffset + 0U] = source[sourceOffset + 0U];
+                (*destination)[destinationOffset + 1U] = source[sourceOffset + 1U];
+                (*destination)[destinationOffset + 2U] = source[sourceOffset + 2U];
+            }
+            if (unmap) {
+                vkUnmapMemory(device_, buffer.memory);
+            }
+        };
+        copyRgbHalfReadback(exrExportResources_.normalReadbackBuffer, &image.normalHalf, "vkMapMemory(exr normal)");
+        copyRgbHalfReadback(exrExportResources_.albedoReadbackBuffer, &image.albedoHalf, "vkMapMemory(exr albedo)");
+
+        restoreRenderState();
+        return image;
+    } catch (...) {
+        restoreRenderState();
+        throw;
+    }
+}
+
+invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloudRaycastFrame(
+    const PointCloudRaycastFrameRequest& request) {
+    if (!graphicsQueueSupportsCompute_) {
+        throw std::runtime_error{"Beauty Raycast export requires Vulkan compute support on the graphics queue."};
+    }
+    if (request.width == 0 || request.height == 0) {
+        throw std::runtime_error{"GPU raycast export requires a non-zero frame size."};
+    }
+    if (request.renderState.pointCloudLayers.empty()) {
+        throw std::runtime_error{"GPU raycast export requires at least one visible point-cloud layer."};
+    }
+
+    if (raycastExportResources_.commandBuffer == VK_NULL_HANDLE ||
+        raycastExportResources_.width != request.width ||
+        raycastExportResources_.height != request.height) {
+        CreateRaycastExportResources(request.width, request.height);
+    }
+
+    std::array<VkFence, kFramesInFlight> frameFences{};
+    std::size_t frameFenceCount = 0;
+    for (const auto& frame : frameResources_) {
+        if (frame.fence != VK_NULL_HANDLE) {
+            frameFences[frameFenceCount++] = frame.fence;
+        }
+    }
+    if (frameFenceCount > 0) {
+        vkWaitForFences(
+            device_,
+            static_cast<std::uint32_t>(frameFenceCount),
+            frameFences.data(),
+            VK_TRUE,
+            UINT64_MAX);
+    }
+
+    const auto previousRenderState = renderState_;
+    auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
+
+    try {
+        renderState_ = request.renderState;
+        UploadFrameUniforms(0U, request.width, request.height);
+
+        std::uint32_t preparedLayerCount = 0;
+        for (const auto& layer : request.renderState.pointCloudLayers) {
+            PointCloudDrawPlan plan;
+            if (!ResolvePointCloudDrawPlan(layer, true, &plan)) {
+                continue;
+            }
+            if (!UploadPointCloudLayerStyle(layer, plan, 0U, true)) {
+                continue;
+            }
+            if (!PrepareRaycastLayerResources(
+                    layer,
+                    plan,
+                    request.primitiveMode,
+                    request.width,
+                    request.height,
+                    request.maxDepth)) {
+                continue;
+            }
+            UpdateRaycastDescriptorSet(plan.resources, raycastExportResources_);
+            ++preparedLayerCount;
+        }
+        if (preparedLayerCount == 0) {
+            throw std::runtime_error{"GPU raycast export could not prepare any visible point layers."};
+        }
+
+        Check(
+            vkWaitForFences(device_, 1, &raycastExportResources_.fence, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(raytrace)");
+        Check(
+            vkResetFences(device_, 1, &raycastExportResources_.fence),
+            "vkResetFences(raytrace)");
+        Check(
+            vkResetCommandBuffer(raycastExportResources_.commandBuffer, 0),
+            "vkResetCommandBuffer(raytrace)");
+
+        RecordRaycastExportCommandBuffer(request);
+
+        VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &raycastExportResources_.commandBuffer;
+        Check(
+            vkQueueSubmit(graphicsQueue_, 1, &submitInfo, raycastExportResources_.fence),
+            "vkQueueSubmit(raytrace)");
+        Check(
+            vkWaitForFences(device_, 1, &raycastExportResources_.fence, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(raytrace complete)");
+
+        invisible_places::output::HalfRgbaExrImage image;
+        image.width = request.width;
+        image.height = request.height;
+        const auto pixelCount = static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height);
+        image.rgbaHalf.resize(pixelCount * 4U);
+        image.depth.resize(pixelCount);
+
+        const auto* colorPixels = static_cast<const glm::vec4*>(raycastExportResources_.colorBuffer.mapped);
+        const auto* depthPixels = static_cast<const float*>(raycastExportResources_.depthBuffer.mapped);
+        if (colorPixels == nullptr || depthPixels == nullptr) {
+            throw std::runtime_error{"GPU raycast export readback buffers are not mapped."};
+        }
+        for (std::size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex) {
+            const auto& color = colorPixels[pixelIndex];
+            const auto componentOffset = pixelIndex * 4U;
+            image.rgbaHalf[componentOffset + 0U] = FloatToHalfBits(color.r);
+            image.rgbaHalf[componentOffset + 1U] = FloatToHalfBits(color.g);
+            image.rgbaHalf[componentOffset + 2U] = FloatToHalfBits(color.b);
+            image.rgbaHalf[componentOffset + 3U] = FloatToHalfBits(std::clamp(color.a, 0.0F, 1.0F));
+            image.depth[pixelIndex] = depthPixels[pixelIndex];
         }
 
         restoreRenderState();
@@ -1457,6 +1742,7 @@ void VulkanViewportShell::PickPhysicalDevice() {
     const auto selection = FindQueueFamilies(physicalDevice_, surface_);
     graphicsQueueFamily_ = selection.graphicsFamily.value();
     presentQueueFamily_ = selection.presentFamily.value();
+    graphicsQueueSupportsCompute_ = selection.graphicsFamilySupportsCompute;
 }
 
 void VulkanViewportShell::CreateLogicalDevice() {
@@ -1898,10 +2184,15 @@ void VulkanViewportShell::CreateHighQualityGaussianSplatDescriptorSetLayout() {
 }
 
 void VulkanViewportShell::CreateCompositeDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
-    bindings[0] = {0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    bindings[1] = {1, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    bindings[2] = {2, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
+    for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+        bindings[bindingIndex] = {
+            bindingIndex,
+            VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+            1,
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+            nullptr};
+    }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -1924,6 +2215,26 @@ void VulkanViewportShell::CreatePostProcessDescriptorSetLayout() {
     Check(
         vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &postProcessDescriptorSetLayout_),
         "vkCreateDescriptorSetLayout(postprocess)");
+}
+
+void VulkanViewportShell::CreateRaycastDescriptorSetLayout() {
+    std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    for (std::uint32_t index = 2; index < bindings.size(); ++index) {
+        bindings[index].binding = index;
+        bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[index].descriptorCount = 1;
+        bindings[index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    Check(
+        vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &raycastDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(point raycast)");
 }
 
 void VulkanViewportShell::CreateDescriptorPools() {
@@ -2387,20 +2698,48 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         accumulationFormat_,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT);
+    resources.normalAccumulationImage = CreateAttachmentImage(
+        width,
+        height,
+        accumulationFormat_,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT);
+    resources.albedoAccumulationImage = CreateAttachmentImage(
+        width,
+        height,
+        accumulationFormat_,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT);
     resources.linearDepthImage = CreateAttachmentImage(
         width,
         height,
         kExportLinearDepthFormat,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT);
+    resources.normalImage = CreateAttachmentImage(
+        width,
+        height,
+        kExportColorFormat,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT);
+    resources.albedoImage = CreateAttachmentImage(
+        width,
+        height,
+        kExportColorFormat,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT);
 
-    const std::array<VkImageView, 6> attachments = {
+    const std::array<VkImageView, 10> attachments = {
         resources.colorImage.view,
         resources.depthImage.view,
         resources.accumulationImage.view,
         resources.revealageImage.view,
         resources.emissiveImage.view,
         resources.linearDepthImage.view,
+        resources.normalAccumulationImage.view,
+        resources.albedoAccumulationImage.view,
+        resources.normalImage.view,
+        resources.albedoImage.view,
     };
 
     VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -2417,6 +2756,12 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     resources.depthReadbackBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * sizeof(float),
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    resources.normalReadbackBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    resources.albedoReadbackBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
         VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -2435,7 +2780,51 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         &resources.compositeDescriptorSet,
         resources.accumulationImage.view,
         resources.revealageImage.view,
-        resources.emissiveImage.view);
+        resources.emissiveImage.view,
+        resources.normalAccumulationImage.view,
+        resources.albedoAccumulationImage.view);
+}
+
+void VulkanViewportShell::CreateRaycastExportResources(std::uint32_t width, std::uint32_t height) {
+    if (width == 0 || height == 0) {
+        throw std::runtime_error{"GPU raycast export requires a non-zero frame size."};
+    }
+
+    WaitIdle();
+    CleanupRaycastExportResources();
+
+    auto& resources = raycastExportResources_;
+    resources.width = width;
+    resources.height = height;
+    const auto pixelCount = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height);
+
+    resources.accumulationBuffer = CreateHostVisibleBuffer(
+        pixelCount * static_cast<VkDeviceSize>(sizeof(glm::vec4)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.revealageBuffer = CreateHostVisibleBuffer(
+        pixelCount * static_cast<VkDeviceSize>(sizeof(float)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.emissionBuffer = CreateHostVisibleBuffer(
+        pixelCount * static_cast<VkDeviceSize>(sizeof(glm::vec4)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.depthBuffer = CreateHostVisibleBuffer(
+        pixelCount * static_cast<VkDeviceSize>(sizeof(float)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.colorBuffer = CreateHostVisibleBuffer(
+        pixelCount * static_cast<VkDeviceSize>(sizeof(glm::vec4)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    commandBufferInfo.commandPool = commandPool_;
+    commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commandBufferInfo.commandBufferCount = 1;
+    Check(
+        vkAllocateCommandBuffers(device_, &commandBufferInfo, &resources.commandBuffer),
+        "vkAllocateCommandBuffers(raytrace)");
+
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    Check(vkCreateFence(device_, &fenceInfo, nullptr, &resources.fence), "vkCreateFence(raytrace)");
 }
 
 void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resources) {
@@ -2496,6 +2885,8 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     emissiveAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     emissiveAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    VkAttachmentDescription aovAccumulationAttachment = emissiveAttachment;
+
     VkAttachmentDescription linearDepthAttachment{};
     linearDepthAttachment.format = kExportLinearDepthFormat;
     linearDepthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -2506,8 +2897,12 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     linearDepthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     linearDepthAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
+    VkAttachmentDescription aovOutputAttachment = colorAttachment;
+
     VkAttachmentReference linearDepthColorRef{5, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference finalColorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference normalOutputRef{8, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference albedoOutputRef{9, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference depthAttachmentRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkAttachmentReference depthReadOnlyAttachmentRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
 
@@ -2517,36 +2912,50 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     depthSubpass.pColorAttachments = &linearDepthColorRef;
     depthSubpass.pDepthStencilAttachment = &depthAttachmentRef;
 
-    VkAttachmentReference accumulationColorRefs[3]{};
+    VkAttachmentReference accumulationColorRefs[5]{};
     accumulationColorRefs[0] = {2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     accumulationColorRefs[1] = {3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     accumulationColorRefs[2] = {4, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    accumulationColorRefs[3] = {6, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    accumulationColorRefs[4] = {7, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference depthInputRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
 
     VkSubpassDescription accumulationSubpass{};
     accumulationSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    accumulationSubpass.colorAttachmentCount = 3;
+    accumulationSubpass.colorAttachmentCount = 5;
     accumulationSubpass.pColorAttachments = accumulationColorRefs;
     accumulationSubpass.inputAttachmentCount = 1;
     accumulationSubpass.pInputAttachments = &depthInputRef;
     accumulationSubpass.pDepthStencilAttachment = &depthReadOnlyAttachmentRef;
 
-    VkAttachmentReference compositeInputRefs[3]{};
+    VkAttachmentReference compositeInputRefs[5]{};
     compositeInputRefs[0] = {2, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     compositeInputRefs[1] = {3, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     compositeInputRefs[2] = {4, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    compositeInputRefs[3] = {6, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    compositeInputRefs[4] = {7, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
+    VkAttachmentReference compositeColorRefs[3]{};
+    compositeColorRefs[0] = finalColorRef;
+    compositeColorRefs[1] = normalOutputRef;
+    compositeColorRefs[2] = albedoOutputRef;
 
     VkSubpassDescription compositeSubpass{};
     compositeSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    compositeSubpass.colorAttachmentCount = 1;
-    compositeSubpass.pColorAttachments = &finalColorRef;
-    compositeSubpass.inputAttachmentCount = 3;
+    compositeSubpass.colorAttachmentCount = 3;
+    compositeSubpass.pColorAttachments = compositeColorRefs;
+    compositeSubpass.inputAttachmentCount = 5;
     compositeSubpass.pInputAttachments = compositeInputRefs;
+
+    VkAttachmentReference fastBasicColorRefs[3]{};
+    fastBasicColorRefs[0] = finalColorRef;
+    fastBasicColorRefs[1] = normalOutputRef;
+    fastBasicColorRefs[2] = albedoOutputRef;
 
     VkSubpassDescription fastBasicSubpass{};
     fastBasicSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    fastBasicSubpass.colorAttachmentCount = 1;
-    fastBasicSubpass.pColorAttachments = &finalColorRef;
+    fastBasicSubpass.colorAttachmentCount = 3;
+    fastBasicSubpass.pColorAttachments = fastBasicColorRefs;
     fastBasicSubpass.pDepthStencilAttachment = &depthReadOnlyAttachmentRef;
 
     std::array<VkSubpassDependency, 7> dependencies{};
@@ -2610,13 +3019,17 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     dependencies[6].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     dependencies[6].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
-    const std::array<VkAttachmentDescription, 6> attachments = {
+    const std::array<VkAttachmentDescription, 10> attachments = {
         colorAttachment,
         depthAttachment,
         accumulationAttachment,
         revealageAttachment,
         emissiveAttachment,
         linearDepthAttachment,
+        aovAccumulationAttachment,
+        aovAccumulationAttachment,
+        aovOutputAttachment,
+        aovOutputAttachment,
     };
     const std::array<VkSubpassDescription, 4> subpasses = {
         depthSubpass,
@@ -2643,11 +3056,11 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     const auto vertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_preview.vert.spv").string());
     const auto accumulationFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_accumulation.frag.spv").string());
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_exr_accumulation.frag.spv").string());
     const auto constantSimpleVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple.vert.spv").string());
     const auto constantSimpleFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_constant_simple_accumulation.frag.spv").string());
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_exr_constant_simple_accumulation.frag.spv").string());
     const auto fastBasicVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_fast_basic.vert.spv").string());
     const auto fastBasicFragmentShaderCode =
@@ -2659,11 +3072,11 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     const auto surfelVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_accumulation.frag.spv").string());
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_exr_accumulation.frag.spv").string());
     const auto surfelConstantSimpleVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple.vert.spv").string());
     const auto surfelConstantSimpleFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple_accumulation.frag.spv").string());
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_exr_constant_simple_accumulation.frag.spv").string());
     const auto surfelDepthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
 
@@ -2854,6 +3267,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         std::vector<VkPipelineColorBlendAttachmentState>{
             MakeAdditiveBlendAttachment(),
             MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
             MakeAdditiveBlendAttachment()},
         false,
         false,
@@ -2870,6 +3285,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         std::vector<VkPipelineColorBlendAttachmentState>{
             MakeAdditiveBlendAttachment(),
             MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
             MakeAdditiveBlendAttachment()},
         false,
         false,
@@ -2896,7 +3313,10 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         inputAssembly,
         fastBasicFragmentModule,
         3,
-        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            opaqueColorBlend,
+            VkPipelineColorBlendAttachmentState{},
+            VkPipelineColorBlendAttachmentState{}},
         true,
         false,
         VK_COMPARE_OP_LESS_OR_EQUAL,
@@ -2924,6 +3344,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         std::vector<VkPipelineColorBlendAttachmentState>{
             MakeAdditiveBlendAttachment(),
             MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
             MakeAdditiveBlendAttachment()},
         false,
         false,
@@ -2940,6 +3362,8 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         std::vector<VkPipelineColorBlendAttachmentState>{
             MakeAdditiveBlendAttachment(),
             MakeRevealageBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
+            MakeAdditiveBlendAttachment(),
             MakeAdditiveBlendAttachment()},
         false,
         false,
@@ -2964,7 +3388,7 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     const auto compositeVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "gsplat_composite.vert.spv").string());
     const auto compositeFragmentShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "gsplat_composite.frag.spv").string());
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_exr_composite.frag.spv").string());
     const auto compositeVertexModule =
         CreateShaderModule(device_, compositeVertexShaderCode, "vkCreateShaderModule(exr composite vertex)");
     const auto compositeFragmentModule =
@@ -2992,11 +3416,33 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     compositeDepthStencil.depthTestEnable = VK_FALSE;
     compositeDepthStencil.depthWriteEnable = VK_FALSE;
-    const auto compositeBlendAttachment = MakeAlphaBlendAttachment();
+    const std::array<VkPipelineColorBlendAttachmentState, 3> compositeBlendAttachments = {
+        MakeAlphaBlendAttachment(),
+        VkPipelineColorBlendAttachmentState{
+            VK_FALSE,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_OP_ADD,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_OP_ADD,
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                VK_COLOR_COMPONENT_A_BIT},
+        VkPipelineColorBlendAttachmentState{
+            VK_FALSE,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_OP_ADD,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_FACTOR_ZERO,
+            VK_BLEND_OP_ADD,
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                VK_COLOR_COMPONENT_A_BIT},
+    };
     VkPipelineColorBlendStateCreateInfo compositeColorBlending{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    compositeColorBlending.attachmentCount = 1;
-    compositeColorBlending.pAttachments = &compositeBlendAttachment;
+    compositeColorBlending.attachmentCount = static_cast<std::uint32_t>(compositeBlendAttachments.size());
+    compositeColorBlending.pAttachments = compositeBlendAttachments.data();
 
     VkGraphicsPipelineCreateInfo compositePipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     compositePipelineInfo.stageCount = static_cast<std::uint32_t>(compositeStages.size());
@@ -3422,6 +3868,49 @@ void VulkanViewportShell::CreatePostProcessPipeline() {
 
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
+}
+
+void VulkanViewportShell::CreateRaycastPipelines() {
+    const std::array<std::pair<const char*, VkPipeline*>, 3> shaders = {{
+        {"pointcloud_raycast_clear.comp.spv", &raycastClearPipeline_},
+        {"pointcloud_raycast_accumulate.comp.spv", &raycastAccumulationPipeline_},
+        {"pointcloud_raycast_composite.comp.spv", &raycastCompositePipeline_},
+    }};
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(RaycastPushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &raycastDescriptorSetLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+    Check(
+        vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &raycastPipelineLayout_),
+        "vkCreatePipelineLayout(point raycast)");
+
+    for (const auto& [shaderName, pipeline] : shaders) {
+        const auto shaderCode =
+            ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / shaderName).string());
+        const auto shaderModule =
+            CreateShaderModule(device_, shaderCode, "vkCreateShaderModule(point raycast compute)");
+
+        VkPipelineShaderStageCreateInfo shaderStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        shaderStage.module = shaderModule;
+        shaderStage.pName = "main";
+
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = shaderStage;
+        pipelineInfo.layout = raycastPipelineLayout_;
+        Check(
+            vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline),
+            "vkCreateComputePipelines(point raycast)");
+
+        vkDestroyShaderModule(device_, shaderModule, nullptr);
+    }
 }
 
 void VulkanViewportShell::CreateFramebuffers() {
@@ -3851,6 +4340,91 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
+void VulkanViewportShell::UpdateRaycastDescriptorSet(
+    ActivePointCloudResources* resources,
+    const RaycastExportResources& exportResources) {
+    if (resources == nullptr) {
+        return;
+    }
+
+    if (resources->raycastDescriptorSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = descriptorPool_;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &raycastDescriptorSetLayout_;
+        Check(
+            vkAllocateDescriptorSets(device_, &allocInfo, &resources->raycastDescriptorSet),
+            "vkAllocateDescriptorSets(point raycast)");
+    }
+
+    VkDescriptorBufferInfo uniformInfo{frameResources_[0].uniformBuffer.buffer, 0, sizeof(FrameUniforms)};
+    VkDescriptorBufferInfo styleInfo{resources->exrStyleBuffer.buffer, 0, sizeof(PointCloudStyleGpu)};
+    VkDescriptorBufferInfo scalarInfo{resources->scalarFieldBuffer.buffer, 0, resources->scalarFieldBuffer.size};
+    VkDescriptorBufferInfo positionInfo{
+        resources->positionStorageBuffer.buffer,
+        0,
+        resources->positionStorageBuffer.size};
+    VkDescriptorBufferInfo colorInfo{resources->colorBuffer.buffer, 0, resources->colorBuffer.size};
+    VkDescriptorBufferInfo normalInfo{resources->normalBuffer.buffer, 0, resources->normalBuffer.size};
+    VkDescriptorBufferInfo bvhNodeInfo{
+        resources->raycastBvhNodeBuffer.buffer,
+        0,
+        resources->raycastBvhNodeBuffer.size};
+    VkDescriptorBufferInfo bvhIndexInfo{
+        resources->raycastBvhIndexBuffer.buffer,
+        0,
+        resources->raycastBvhIndexBuffer.size};
+    VkDescriptorBufferInfo accumulationInfo{
+        exportResources.accumulationBuffer.buffer,
+        0,
+        exportResources.accumulationBuffer.size};
+    VkDescriptorBufferInfo revealageInfo{
+        exportResources.revealageBuffer.buffer,
+        0,
+        exportResources.revealageBuffer.size};
+    VkDescriptorBufferInfo emissionInfo{
+        exportResources.emissionBuffer.buffer,
+        0,
+        exportResources.emissionBuffer.size};
+    VkDescriptorBufferInfo depthInfo{
+        exportResources.depthBuffer.buffer,
+        0,
+        exportResources.depthBuffer.size};
+    VkDescriptorBufferInfo outputColorInfo{
+        exportResources.colorBuffer.buffer,
+        0,
+        exportResources.colorBuffer.size};
+
+    std::array<VkWriteDescriptorSet, 13> writes{};
+    const std::array<VkDescriptorBufferInfo*, 13> infos = {
+        &uniformInfo,
+        &styleInfo,
+        &scalarInfo,
+        &positionInfo,
+        &colorInfo,
+        &normalInfo,
+        &bvhNodeInfo,
+        &bvhIndexInfo,
+        &accumulationInfo,
+        &revealageInfo,
+        &emissionInfo,
+        &depthInfo,
+        &outputColorInfo,
+    };
+
+    for (std::uint32_t index = 0; index < writes.size(); ++index) {
+        writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[index].dstSet = resources->raycastDescriptorSet;
+        writes[index].dstBinding = index;
+        writes[index].descriptorType =
+            index <= 1U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[index].descriptorCount = 1;
+        writes[index].pBufferInfo = infos[index];
+    }
+
+    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
 void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet() {
     compositeDescriptorSets_.resize(accumulationImages_.size(), VK_NULL_HANDLE);
     for (std::uint32_t imageIndex = 0; imageIndex < accumulationImages_.size(); ++imageIndex) {
@@ -3867,6 +4441,22 @@ void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
     VkImageView accumulationView,
     VkImageView revealageView,
     VkImageView emissiveView) {
+    CreateOrUpdateCompositeDescriptorSet(
+        descriptorSet,
+        accumulationView,
+        revealageView,
+        emissiveView,
+        VK_NULL_HANDLE,
+        VK_NULL_HANDLE);
+}
+
+void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
+    VkDescriptorSet* descriptorSet,
+    VkImageView accumulationView,
+    VkImageView revealageView,
+    VkImageView emissiveView,
+    VkImageView normalAccumulationView,
+    VkImageView albedoAccumulationView) {
     if (descriptorSet == nullptr) {
         return;
     }
@@ -3891,7 +4481,15 @@ void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
     emissiveInfo.imageView = emissiveView;
     emissiveInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 3> writes{};
+    VkDescriptorImageInfo normalAccumulationInfo{};
+    normalAccumulationInfo.imageView = normalAccumulationView;
+    normalAccumulationInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorImageInfo albedoAccumulationInfo{};
+    albedoAccumulationInfo.imageView = albedoAccumulationView;
+    albedoAccumulationInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    std::array<VkWriteDescriptorSet, 5> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = *descriptorSet;
     writes[0].dstBinding = 0;
@@ -3913,7 +4511,25 @@ void VulkanViewportShell::CreateOrUpdateCompositeDescriptorSet(
     writes[2].descriptorCount = 1;
     writes[2].pImageInfo = &emissiveInfo;
 
-    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    std::uint32_t writeCount = 3U;
+    if (normalAccumulationView != VK_NULL_HANDLE && albedoAccumulationView != VK_NULL_HANDLE) {
+        writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[3].dstSet = *descriptorSet;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+        writes[3].descriptorCount = 1;
+        writes[3].pImageInfo = &normalAccumulationInfo;
+
+        writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[4].dstSet = *descriptorSet;
+        writes[4].dstBinding = 4;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+        writes[4].descriptorCount = 1;
+        writes[4].pImageInfo = &albedoAccumulationInfo;
+        writeCount = 5U;
+    }
+
+    vkUpdateDescriptorSets(device_, writeCount, writes.data(), 0, nullptr);
 }
 
 void VulkanViewportShell::CreateOrUpdatePostProcessDescriptorSets() {
@@ -4512,6 +5128,8 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->colorBuffer);
     DestroyBuffer(&resources->normalBuffer);
     DestroyBuffer(&resources->scalarFieldBuffer);
+    DestroyBuffer(&resources->raycastBvhNodeBuffer);
+    DestroyBuffer(&resources->raycastBvhIndexBuffer);
     for (auto& styleBuffer : resources->styleBuffers) {
         DestroyBuffer(&styleBuffer);
     }
@@ -4534,6 +5152,11 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
         descriptorPool_ != VK_NULL_HANDLE &&
         device_ != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->exrDescriptorSet);
+    }
+    if (resources->raycastDescriptorSet != VK_NULL_HANDLE &&
+        descriptorPool_ != VK_NULL_HANDLE &&
+        device_ != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->raycastDescriptorSet);
     }
     *resources = ActivePointCloudResources{};
 }
@@ -4641,11 +5264,35 @@ void VulkanViewportShell::CleanupExrExportResources() {
     DestroyImage(&resources.accumulationImage);
     DestroyImage(&resources.revealageImage);
     DestroyImage(&resources.emissiveImage);
+    DestroyImage(&resources.normalAccumulationImage);
+    DestroyImage(&resources.albedoAccumulationImage);
     DestroyImage(&resources.linearDepthImage);
+    DestroyImage(&resources.normalImage);
+    DestroyImage(&resources.albedoImage);
     DestroyBuffer(&resources.colorReadbackBuffer);
     DestroyBuffer(&resources.depthReadbackBuffer);
+    DestroyBuffer(&resources.normalReadbackBuffer);
+    DestroyBuffer(&resources.albedoReadbackBuffer);
 
     resources = ExrExportResources{};
+}
+
+void VulkanViewportShell::CleanupRaycastExportResources() {
+    auto& resources = raycastExportResources_;
+
+    if (resources.commandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device_, commandPool_, 1, &resources.commandBuffer);
+    }
+    if (resources.fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, resources.fence, nullptr);
+    }
+    DestroyBuffer(&resources.accumulationBuffer);
+    DestroyBuffer(&resources.revealageBuffer);
+    DestroyBuffer(&resources.emissionBuffer);
+    DestroyBuffer(&resources.depthBuffer);
+    DestroyBuffer(&resources.colorBuffer);
+
+    resources = RaycastExportResources{};
 }
 
 void VulkanViewportShell::RecreateSwapchain() {
@@ -4785,7 +5432,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         resources->pointCount,
         plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
-        layer.style.flowAnimation ? 1U : 0U,
+        layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U,
     };
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled ||
@@ -4850,6 +5497,31 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         std::clamp(layer.style.pigmentAnimationSpeed, 0.0F, 4.0F),
         std::clamp(layer.style.granulationAngleStrength, 0.0F, 1.0F),
     };
+    if (layer.style.roughnessMotionStrength > 1.0e-5F) {
+        const auto roughnessSlot = FindRoughnessScalarFieldSlot(layer.scalarFields);
+        if (roughnessSlot.has_value() && roughnessSlot.value() < layer.scalarFields.size()) {
+            const auto& roughnessStats = layer.scalarFields[roughnessSlot.value()];
+            const float roughnessRange =
+                std::max(1.0e-6F, roughnessStats.maximum - roughnessStats.minimum);
+            styleGpu.stylisationControl.z = roughnessSlot.value() + 1U;
+            if (const auto groundSlot = FindGroundIdScalarFieldSlot(layer.scalarFields);
+                groundSlot.has_value() && groundSlot.value() < layer.scalarFields.size()) {
+                styleGpu.stylisationControl.w = groundSlot.value() + 1U;
+            }
+            styleGpu.surfaceMotionParams = glm::vec4{
+                std::clamp(layer.style.roughnessMotionStrength, 0.0F, 1.0F),
+                std::clamp(layer.style.roughnessMotionScale, 0.01F, 50.0F),
+                std::clamp(layer.style.roughnessMotionSpeed, 0.0F, 8.0F),
+                std::clamp(layer.style.roughnessMotionThreshold, 0.0F, 1.0F),
+            };
+            styleGpu.surfaceMotionStats = glm::vec4{
+                roughnessStats.minimum,
+                1.0F / roughnessRange,
+                std::clamp(layer.style.roughnessMotionGroundId, 0.0F, 1.0F),
+                0.25F,
+            };
+        }
+    }
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,
         layer.scalarFields,
@@ -4884,6 +5556,62 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         exrStyle ? resources->exrStyleBuffer : resources->styleBuffers[frameIndex],
         &styleGpu,
         sizeof(styleGpu));
+    return true;
+}
+
+bool VulkanViewportShell::PrepareRaycastLayerResources(
+    const SceneRenderState::PointCloudLayerState& layer,
+    const PointCloudDrawPlan& plan,
+    renderer::pointcloud::PointCloudRaycastPrimitiveMode primitiveMode,
+    std::uint32_t width,
+    std::uint32_t height,
+    float maxDepth) {
+    auto* resources = plan.resources;
+    if (resources == nullptr || resources->cpuPositions.empty() || plan.drawPointCount == 0) {
+        return false;
+    }
+
+    const auto drawPointCount = std::min<std::size_t>(plan.drawPointCount, resources->cpuPositions.size());
+    const float radius = EstimateRaycastBvhRadius(
+        layer.style,
+        primitiveMode,
+        renderState_,
+        width,
+        height,
+        maxDepth,
+        pointSizeRangeMin_,
+        pointSizeRangeMax_);
+
+    std::vector<renderer::pointcloud::RaycastBvhBuildPoint> points;
+    points.reserve(drawPointCount);
+    for (std::size_t pointIndex = 0; pointIndex < drawPointCount; ++pointIndex) {
+        points.push_back(
+            {.center = resources->cpuPositions[pointIndex],
+             .radius = radius,
+             .pointIndex = static_cast<std::uint32_t>(pointIndex)});
+    }
+
+    auto bvh = renderer::pointcloud::BuildLinearRaycastBvh(points);
+    if (bvh.Empty()) {
+        return false;
+    }
+
+    DestroyBuffer(&resources->raycastBvhNodeBuffer);
+    DestroyBuffer(&resources->raycastBvhIndexBuffer);
+    resources->raycastBvhNodeBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(bvh.nodes.size() * sizeof(renderer::pointcloud::RaycastBvhNodeGpu)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources->raycastBvhNodeBuffer,
+        bvh.nodes.data(),
+        resources->raycastBvhNodeBuffer.size);
+    resources->raycastBvhIndexBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(bvh.pointIndices.size() * sizeof(std::uint32_t)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources->raycastBvhIndexBuffer,
+        bvh.pointIndices.data(),
+        resources->raycastBvhIndexBuffer.size);
     return true;
 }
 
@@ -5015,7 +5743,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(resources.commandBuffer, &beginInfo), "vkBeginCommandBuffer(exr)");
 
-    std::array<VkClearValue, 6> clearValues{};
+    std::array<VkClearValue, 10> clearValues{};
     clearValues[0].color = {{
         request.renderState.backgroundColor.r,
         request.renderState.backgroundColor.g,
@@ -5027,6 +5755,10 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     clearValues[3].color = {{1.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[4].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[5].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
+    clearValues[6].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
+    clearValues[7].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
+    clearValues[8].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
+    clearValues[9].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
 
     const bool fastBasicPointRenderer =
         request.renderState.pointCloudRendererMode ==
@@ -5189,7 +5921,186 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         1,
         &depthCopyRegion);
 
+    VkBufferImageCopy normalCopyRegion{};
+    normalCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    normalCopyRegion.imageSubresource.mipLevel = 0;
+    normalCopyRegion.imageSubresource.baseArrayLayer = 0;
+    normalCopyRegion.imageSubresource.layerCount = 1;
+    normalCopyRegion.imageExtent = {request.width, request.height, 1};
+    vkCmdCopyImageToBuffer(
+        resources.commandBuffer,
+        resources.normalImage.image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        resources.normalReadbackBuffer.buffer,
+        1,
+        &normalCopyRegion);
+
+    VkBufferImageCopy albedoCopyRegion{};
+    albedoCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    albedoCopyRegion.imageSubresource.mipLevel = 0;
+    albedoCopyRegion.imageSubresource.baseArrayLayer = 0;
+    albedoCopyRegion.imageSubresource.layerCount = 1;
+    albedoCopyRegion.imageExtent = {request.width, request.height, 1};
+    vkCmdCopyImageToBuffer(
+        resources.commandBuffer,
+        resources.albedoImage.image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        resources.albedoReadbackBuffer.buffer,
+        1,
+        &albedoCopyRegion);
+
     Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(exr)");
+}
+
+void VulkanViewportShell::RecordRaycastExportCommandBuffer(const PointCloudRaycastFrameRequest& request) {
+    auto& resources = raycastExportResources_;
+    if (resources.commandBuffer == VK_NULL_HANDLE) {
+        throw std::runtime_error{"GPU raycast export resources are not initialized."};
+    }
+
+    ActivePointCloudResources* firstResources = nullptr;
+    for (const auto& layer : request.renderState.pointCloudLayers) {
+        PointCloudDrawPlan plan;
+        if (ResolvePointCloudDrawPlan(layer, true, &plan) &&
+            plan.resources != nullptr &&
+            plan.resources->raycastDescriptorSet != VK_NULL_HANDLE &&
+            plan.resources->raycastBvhNodeBuffer.buffer != VK_NULL_HANDLE) {
+            firstResources = plan.resources;
+            break;
+        }
+    }
+    if (firstResources == nullptr) {
+        throw std::runtime_error{"GPU raycast export has no prepared raycast point layers."};
+    }
+
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    Check(vkBeginCommandBuffer(resources.commandBuffer, &beginInfo), "vkBeginCommandBuffer(raytrace)");
+
+    const auto dispatchWidth16 = (request.width + 15U) / 16U;
+    const auto dispatchHeight16 = (request.height + 15U) / 16U;
+    const auto dispatchWidth8 = (request.width + 7U) / 8U;
+    const auto dispatchHeight8 = (request.height + 7U) / 8U;
+    const auto primitiveMode =
+        request.primitiveMode == renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres ? 1U : 0U;
+    const auto pushForPass = [&](std::uint32_t passMode) {
+        RaycastPushConstants pushConstants;
+        pushConstants.control = glm::uvec4{request.width, request.height, passMode, primitiveMode};
+        pushConstants.params = glm::vec4{
+            static_cast<float>(std::clamp<std::uint32_t>(request.samplesPerPixel, 1U, 16U)),
+            request.maxDepth,
+            0.0F,
+            0.0F};
+        return pushConstants;
+    };
+    const auto shaderBarrier = [&]() {
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            resources.commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            &barrier,
+            0,
+            nullptr,
+            0,
+            nullptr);
+    };
+
+    VkDescriptorSet descriptorSet = firstResources->raycastDescriptorSet;
+    vkCmdBindPipeline(resources.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, raycastClearPipeline_);
+    vkCmdBindDescriptorSets(
+        resources.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        raycastPipelineLayout_,
+        0,
+        1,
+        &descriptorSet,
+        0,
+        nullptr);
+    auto pushConstants = pushForPass(0U);
+    vkCmdPushConstants(
+        resources.commandBuffer,
+        raycastPipelineLayout_,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(pushConstants),
+        &pushConstants);
+    vkCmdDispatch(resources.commandBuffer, dispatchWidth16, dispatchHeight16, 1U);
+    shaderBarrier();
+
+    for (std::uint32_t passMode = 0U; passMode < 2U; ++passMode) {
+        vkCmdBindPipeline(resources.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, raycastAccumulationPipeline_);
+        pushConstants = pushForPass(passMode);
+        for (const auto& layer : request.renderState.pointCloudLayers) {
+            PointCloudDrawPlan plan;
+            if (!ResolvePointCloudDrawPlan(layer, true, &plan) ||
+                plan.resources == nullptr ||
+                plan.resources->raycastDescriptorSet == VK_NULL_HANDLE ||
+                plan.resources->raycastBvhNodeBuffer.buffer == VK_NULL_HANDLE) {
+                continue;
+            }
+            descriptorSet = plan.resources->raycastDescriptorSet;
+            vkCmdBindDescriptorSets(
+                resources.commandBuffer,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                raycastPipelineLayout_,
+                0,
+                1,
+                &descriptorSet,
+                0,
+                nullptr);
+            vkCmdPushConstants(
+                resources.commandBuffer,
+                raycastPipelineLayout_,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                sizeof(pushConstants),
+                &pushConstants);
+            vkCmdDispatch(resources.commandBuffer, dispatchWidth8, dispatchHeight8, 1U);
+        }
+        shaderBarrier();
+    }
+
+    descriptorSet = firstResources->raycastDescriptorSet;
+    vkCmdBindPipeline(resources.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, raycastCompositePipeline_);
+    vkCmdBindDescriptorSets(
+        resources.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        raycastPipelineLayout_,
+        0,
+        1,
+        &descriptorSet,
+        0,
+        nullptr);
+    pushConstants = pushForPass(0U);
+    vkCmdPushConstants(
+        resources.commandBuffer,
+        raycastPipelineLayout_,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(pushConstants),
+        &pushConstants);
+    vkCmdDispatch(resources.commandBuffer, dispatchWidth16, dispatchHeight16, 1U);
+
+    VkMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(
+        resources.commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        1,
+        &hostBarrier,
+        0,
+        nullptr,
+        0,
+        nullptr);
+
+    Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(raytrace)");
 }
 
 void VulkanViewportShell::RecordCommandBuffer(
@@ -5591,7 +6502,7 @@ void VulkanViewportShell::RecordCommandBuffer(
             renderState_.eyeDomeLightingEnabled ? 1.0F : 0.0F,
             24.0F,
             0.35F,
-            1.0F,
+            std::clamp(renderState_.eyeDomeLightingThickness, 1.0F, 24.0F),
         };
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, postProcessPipeline_);
         vkCmdBindDescriptorSets(
@@ -5662,7 +6573,7 @@ void VulkanViewportShell::UploadFrameUniforms(
         std::max(0.0F, renderState_.flowTimeSeconds),
         renderState_.nearPlane,
         renderState_.farPlane,
-        0.0F,
+        std::max(0.001F, renderState_.pointSizeScale),
     };
     const float viewportWidth = std::max(1.0F, static_cast<float>(width));
     const float viewportHeight = std::max(1.0F, static_cast<float>(height));
@@ -5678,6 +6589,7 @@ void VulkanViewportShell::UploadFrameUniforms(
         std::max(0.1F, renderState_.apertureFStops),
         std::max(0.0F, renderState_.depthOfFieldMaxBlurPixels),
     };
+    uniforms.inverseViewProjection = glm::inverse(renderState_.viewProjection);
 
     UploadBufferData(frameResources_[frameIndex].uniformBuffer, &uniforms, sizeof(uniforms));
 }

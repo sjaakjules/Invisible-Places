@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform RaycastControl {
+    uvec4 control;
+    vec4 params;
+} raycast;
+
+layout(set = 0, binding = 8, std430) buffer RaycastAccumulation {
+    vec4 accumulation[];
+} raycastAccumulation;
+
+layout(set = 0, binding = 9, std430) buffer RaycastRevealage {
+    float revealage[];
+} raycastRevealage;
+
+layout(set = 0, binding = 10, std430) buffer RaycastEmission {
+    vec4 emission[];
+} raycastEmission;
+
+layout(set = 0, binding = 11, std430) buffer RaycastDepth {
+    float depth[];
+} raycastDepth;
+
+layout(set = 0, binding = 12, std430) buffer RaycastColor {
+    vec4 color[];
+} raycastColor;
+
+void main() {
+    const uint width = max(1u, raycast.control.x);
+    const uint height = max(1u, raycast.control.y);
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= width || pixel.y >= height) {
+        return;
+    }
+
+    const uint index = pixel.y * width + pixel.x;
+    raycastAccumulation.accumulation[index] = vec4(0.0);
+    raycastRevealage.revealage[index] = 1.0;
+    raycastEmission.emission[index] = vec4(0.0);
+    raycastDepth.depth[index] = 3.402823466e+38;
+    raycastColor.color[index] = vec4(0.0);
+}

@@ -81,6 +81,11 @@ enum class PointCloudRendererMode {
     Raytraced
 };
 
+enum class PointCloudRaycastPrimitiveMode {
+    StyleSurfels,
+    SoftDensitySpheres
+};
+
 enum class PointCloudMaterialVariant {
     OpaqueHardDisc,
     ConstantSimple,
@@ -112,6 +117,11 @@ struct PointCloudStyleState {
     float pigmentVariation = 0.0F;
     float pigmentAnimationSpeed = 0.0F;
     float granulationAngleStrength = 0.0F;
+    float roughnessMotionStrength = 0.0F;
+    float roughnessMotionScale = 1.5F;
+    float roughnessMotionSpeed = 0.35F;
+    float roughnessMotionThreshold = 0.58F;
+    float roughnessMotionGroundId = 1.0F;
     float exposure = 1.0F;
     float innerRadius = 0.55F;
     float gaussianSharpness = 4.0F;
@@ -125,6 +135,7 @@ struct PointCloudStyleState {
     float depthAlphaThreshold = 0.5F;
     bool solidCenters = true;
     bool flowAnimation = false;
+    bool waterPathView = false;
     invisible_places::style::RenderParameterBinding pointSize;
     invisible_places::style::RenderParameterBinding surfelDiameter;
     invisible_places::style::RenderParameterBinding opacity;
@@ -168,6 +179,7 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style, bool sceneHasActiveXray);
 [[nodiscard]] bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha);
 [[nodiscard]] bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style);
 [[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb);

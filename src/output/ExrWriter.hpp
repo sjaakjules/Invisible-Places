@@ -21,6 +21,8 @@ struct HalfRgbaExrImage {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::vector<std::uint16_t> rgbaHalf;
+    std::vector<std::uint16_t> normalHalf;
+    std::vector<std::uint16_t> albedoHalf;
     std::vector<float> depth;
 };
 

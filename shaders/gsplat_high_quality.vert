@@ -161,12 +161,15 @@ void main() {
         dot(vec3(projectedAxis0.y, projectedAxis1.y, projectedAxis2.y),
             vec3(projectedAxis0.y, projectedAxis1.y, projectedAxis2.y));
 
+    const float screenPixelScale = max(uniforms.depthParameters.w, 0.001);
     const float depthOfFieldBlurPixels = ResolveDepthOfFieldBlurPixels(depth);
     const float depthOfFieldBlurX = depthOfFieldBlurPixels * uniforms.viewportParameters.z;
     const float depthOfFieldBlurY = depthOfFieldBlurPixels * uniforms.viewportParameters.w;
-    covXX += (uniforms.viewportParameters.z * uniforms.viewportParameters.z) +
+    const float minimumFootprintX = uniforms.viewportParameters.z * screenPixelScale;
+    const float minimumFootprintY = uniforms.viewportParameters.w * screenPixelScale;
+    covXX += (minimumFootprintX * minimumFootprintX) +
              (depthOfFieldBlurX * depthOfFieldBlurX);
-    covYY += (uniforms.viewportParameters.w * uniforms.viewportParameters.w) +
+    covYY += (minimumFootprintY * minimumFootprintY) +
              (depthOfFieldBlurY * depthOfFieldBlurY);
 
     const float trace = covXX + covYY;

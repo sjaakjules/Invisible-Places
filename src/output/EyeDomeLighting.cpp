@@ -66,30 +66,44 @@ float ComputeEyeDomeLightingShade(
 
     const float centerLogDepth = LogDepth(centerDepth);
     float response = 0.0F;
-    unsigned int sampleCount = 0U;
-    for (const auto& offset : kOffsets) {
-        const int nx = static_cast<int>(x) + offset[0];
-        const int ny = static_cast<int>(y) + offset[1];
-        if (nx < 0 || ny < 0 || nx >= static_cast<int>(width) || ny >= static_cast<int>(height)) {
+    float sampleCount = 0.0F;
+    const float radiusLimit = std::clamp(settings.outlineThicknessPixels, 0.0F, 24.0F);
+    if (radiusLimit <= 1.0e-6F) {
+        return 1.0F;
+    }
+    const int radiusPixels = std::clamp(
+        static_cast<int>(std::ceil(radiusLimit)),
+        1,
+        24);
+    for (int radius = 1; radius <= radiusPixels; ++radius) {
+        const float ringWeight = std::clamp(radiusLimit - static_cast<float>(radius - 1), 0.0F, 1.0F);
+        if (ringWeight <= 1.0e-6F) {
             continue;
         }
+        for (const auto& offset : kOffsets) {
+            const int nx = static_cast<int>(x) + (offset[0] * radius);
+            const int ny = static_cast<int>(y) + (offset[1] * radius);
+            if (nx < 0 || ny < 0 || nx >= static_cast<int>(width) || ny >= static_cast<int>(height)) {
+                continue;
+            }
 
-        const auto neighborIndex =
-            static_cast<std::size_t>(ny) * static_cast<std::size_t>(width) + static_cast<std::size_t>(nx);
-        const float neighborDepth = linearDepth[neighborIndex];
-        if (!ValidDepth(neighborDepth)) {
-            continue;
+            const auto neighborIndex =
+                static_cast<std::size_t>(ny) * static_cast<std::size_t>(width) + static_cast<std::size_t>(nx);
+            const float neighborDepth = linearDepth[neighborIndex];
+            if (!ValidDepth(neighborDepth)) {
+                continue;
+            }
+
+            response += std::max(0.0F, LogDepth(neighborDepth) - centerLogDepth) * ringWeight;
+            sampleCount += 1.0F;
         }
-
-        response += std::max(0.0F, LogDepth(neighborDepth) - centerLogDepth);
-        ++sampleCount;
     }
 
-    if (sampleCount == 0U || response <= 1.0e-6F) {
+    if (sampleCount <= 1.0e-6F || response <= 1.0e-6F) {
         return 1.0F;
     }
 
-    const float shade = std::exp(-std::max(0.0F, settings.strength) * response / static_cast<float>(sampleCount));
+    const float shade = std::exp(-std::max(0.0F, settings.strength) * response / sampleCount);
     return std::clamp(shade, std::clamp(settings.minShade, 0.0F, 1.0F), 1.0F);
 }
 

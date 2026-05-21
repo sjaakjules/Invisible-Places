@@ -42,19 +42,22 @@ float EyeDomeLightingShade(ivec2 coord, ivec2 size) {
     const float centerLogDepth = LogDepth(centerDepth);
     float response = 0.0;
     int sampleCount = 0;
-    for (int index = 0; index < 8; ++index) {
-        const ivec2 sampleCoord = coord + offsets[index];
-        if (sampleCoord.x < 0 || sampleCoord.y < 0 || sampleCoord.x >= size.x || sampleCoord.y >= size.y) {
-            continue;
-        }
+    const int radiusPixels = clamp(int(round(postProcess.edl.w)), 1, 24);
+    for (int radius = 1; radius <= radiusPixels; ++radius) {
+        for (int index = 0; index < 8; ++index) {
+            const ivec2 sampleCoord = coord + (offsets[index] * radius);
+            if (sampleCoord.x < 0 || sampleCoord.y < 0 || sampleCoord.x >= size.x || sampleCoord.y >= size.y) {
+                continue;
+            }
 
-        const float neighborDepth = texelFetch(linearDepthInput, sampleCoord, 0).r;
-        if (!ValidDepth(neighborDepth)) {
-            continue;
-        }
+            const float neighborDepth = texelFetch(linearDepthInput, sampleCoord, 0).r;
+            if (!ValidDepth(neighborDepth)) {
+                continue;
+            }
 
-        response += max(0.0, LogDepth(neighborDepth) - centerLogDepth);
-        ++sampleCount;
+            response += max(0.0, LogDepth(neighborDepth) - centerLogDepth);
+            ++sampleCount;
+        }
     }
 
     if (sampleCount == 0 || response <= 1.0e-6) {
