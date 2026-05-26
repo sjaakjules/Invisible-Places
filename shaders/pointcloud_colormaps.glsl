@@ -203,3 +203,10 @@ vec3 ApplyPointCloudColormap(uint colormapId, float value) {
     }
     return SamplePointCloudColormapLut(kViridisColormap, value);
 }
+
+vec3 ApplyPointCloudColormapOrGradient(uint colormapId, float value, vec3 gradientStart, vec3 gradientEnd) {
+    if (colormapId == 11u) {
+        return mix(gradientStart, gradientEnd, clamp(value, 0.0, 1.0));
+    }
+    return ApplyPointCloudColormap(colormapId, value);
+}

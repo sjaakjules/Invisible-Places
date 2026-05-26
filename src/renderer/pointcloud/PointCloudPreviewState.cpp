@@ -362,6 +362,15 @@ bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) 
            style.roughnessMotionSpeed > kMaterialEpsilon;
 }
 
+bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style) {
+    return style.causticAnimation &&
+           (style.causticIntensity > kMaterialEpsilon ||
+            style.causticPreviewTintAmount > kMaterialEpsilon) &&
+           style.causticMaskFieldSlot >= 0 &&
+           style.causticEdgeFieldSlot >= 0 &&
+           style.causticSeedFieldSlot >= 0;
+}
+
 PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb) {
@@ -376,12 +385,35 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
                           : (hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor);
     style.colormap = sourceStyle.colormap;
     style.solidColor = sourceStyle.solidColor;
+    style.gradientStartColor = sourceStyle.gradientStartColor;
+    style.gradientEndColor = sourceStyle.gradientEndColor;
     style.colorizeColor = sourceStyle.colorizeColor;
     style.colorizeAmount = sourceStyle.colorizeAmount;
     style.stylisationStrength = 0.0F;
     style.roughnessMotionStrength = 0.0F;
+    style.waterStreakAspect = sourceStyle.waterStreakAspect;
     style.flowAnimation = false;
     style.waterPathView = false;
+    style.causticAnimation = sourceStyle.causticAnimation;
+    style.causticIntensity = sourceStyle.causticIntensity;
+    style.causticScale = sourceStyle.causticScale;
+    style.causticSpeed = sourceStyle.causticSpeed;
+    style.causticLineSharpness = sourceStyle.causticLineSharpness;
+    style.causticWarp = sourceStyle.causticWarp;
+    style.causticCellSizeMeters = sourceStyle.causticCellSizeMeters;
+    style.causticLineWidthMeters = sourceStyle.causticLineWidthMeters;
+    style.causticFeatherMeters = sourceStyle.causticFeatherMeters;
+    style.causticSurfacePointSpacingMeters = sourceStyle.causticSurfacePointSpacingMeters;
+    style.causticWarpAmplitudeMeters = sourceStyle.causticWarpAmplitudeMeters;
+    style.causticTint = sourceStyle.causticTint;
+    style.causticEmissionBoost = sourceStyle.causticEmissionBoost;
+    style.causticOpacityBoost = sourceStyle.causticOpacityBoost;
+    style.causticPointSizeBoost = 0.0F;
+    style.causticPreviewTintAmount = sourceStyle.causticPreviewTintAmount;
+    style.causticPreviewTintRegionId = sourceStyle.causticPreviewTintRegionId;
+    style.causticMaskFieldSlot = sourceStyle.causticMaskFieldSlot;
+    style.causticEdgeFieldSlot = sourceStyle.causticEdgeFieldSlot;
+    style.causticSeedFieldSlot = sourceStyle.causticSeedFieldSlot;
     invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, kInactiveSurfelDiameterDefault);
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
@@ -438,6 +470,10 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
     }
 
     if (PointCloudStyleHasActiveRoughnessMotion(style)) {
+        return PointCloudMaterialVariant::Unified;
+    }
+
+    if (PointCloudStyleHasActiveCaustics(style)) {
         return PointCloudMaterialVariant::Unified;
     }
 

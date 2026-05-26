@@ -350,11 +350,20 @@ std::array<float, 3> SampleColormap(PointCloudColormapId colormap, float value) 
             return SampleStops(kExponentialIceColormap, ExponentialCurve(value, 2.7F));
         case PointCloudColormapId::HighContrast:
             return SampleStops(kHighContrastColormap, value);
+        case PointCloudColormapId::CustomGradient:
+            return SampleGradient({0.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 1.0F}, value);
         case PointCloudColormapId::Viridis:
             return SampleLut(kViridisColormap, value);
     }
 
     return SampleLut(kViridisColormap, value);
+}
+
+std::array<float, 3> SampleGradient(
+    const std::array<float, 3>& startColor,
+    const std::array<float, 3>& endColor,
+    float value) {
+    return LerpColor(startColor, endColor, std::clamp(value, 0.0F, 1.0F));
 }
 
 }  // namespace invisible_places::renderer::pointcloud

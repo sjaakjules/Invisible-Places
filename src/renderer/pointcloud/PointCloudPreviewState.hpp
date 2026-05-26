@@ -36,7 +36,8 @@ enum class PointCloudColormapId {
     LandSurface,
     ExponentialFire,
     ExponentialIce,
-    HighContrast
+    HighContrast,
+    CustomGradient
 };
 
 enum class PointCloudGeometryMode {
@@ -103,6 +104,8 @@ struct PointCloudStyleState {
     PointCloudColorMode colorMode = PointCloudColorMode::SourceRgb;
     PointCloudColormapId colormap = PointCloudColormapId::Viridis;
     std::array<float, 4> solidColor{0.93F, 0.88F, 0.72F, 1.0F};
+    std::array<float, 3> gradientStartColor{0.05F, 0.28F, 0.95F};
+    std::array<float, 3> gradientEndColor{0.96F, 0.94F, 0.58F};
     std::array<float, 3> colorizeColor{0.95F, 0.68F, 0.28F};
     float colorizeAmount = 0.0F;
     float stylisationStrength = 1.0F;
@@ -132,10 +135,31 @@ struct PointCloudStyleState {
     float hiddenAlpha = 0.08F;
     float densityScale = 1.0F;
     float densityClamp = 64.0F;
+    float waterStreakAspect = 1.0F;
     float depthAlphaThreshold = 0.5F;
     bool solidCenters = true;
     bool flowAnimation = false;
     bool waterPathView = false;
+    bool causticAnimation = false;
+    float causticIntensity = 0.0F;
+    float causticScale = 4.0F;
+    float causticSpeed = 0.55F;
+    float causticLineSharpness = 0.72F;
+    float causticWarp = 0.35F;
+    float causticCellSizeMeters = 0.20F;
+    float causticLineWidthMeters = 0.015F;
+    float causticFeatherMeters = 0.006F;
+    float causticSurfacePointSpacingMeters = 0.005F;
+    float causticWarpAmplitudeMeters = 0.045F;
+    std::array<float, 3> causticTint{0.62F, 0.88F, 1.0F};
+    float causticEmissionBoost = 1.15F;
+    float causticOpacityBoost = 0.08F;
+    float causticPointSizeBoost = 0.0F;
+    float causticPreviewTintAmount = 0.0F;
+    float causticPreviewTintRegionId = 0.0F;
+    std::int32_t causticMaskFieldSlot = -1;
+    std::int32_t causticEdgeFieldSlot = -1;
+    std::int32_t causticSeedFieldSlot = -1;
     invisible_places::style::RenderParameterBinding pointSize;
     invisible_places::style::RenderParameterBinding surfelDiameter;
     invisible_places::style::RenderParameterBinding opacity;
@@ -180,6 +204,7 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha);
 [[nodiscard]] bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
 [[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb);

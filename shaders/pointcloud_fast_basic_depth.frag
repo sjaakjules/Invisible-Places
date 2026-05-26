@@ -56,7 +56,7 @@ void main() {
     if (styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot) {
         const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot);
         if (styleData.pointMeta.w == 2u) {
-            if (role < 1.5) {
+            if (!((role >= 0.5 && role < 1.5) || (role >= 1.5 && role < 2.5) || (role >= 2.5 && role < 3.5))) {
                 discard;
             }
         } else if (role < 0.5 || role >= 1.5) {

@@ -6,6 +6,8 @@ layout(location = 1) in vec4 inColor;
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outViewDepth;
 layout(location = 2) flat out uint outPointIndex;
+layout(location = 3) out vec3 outWorldPosition;
+layout(location = 4) out vec3 outPointNormal;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -16,6 +18,10 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
 } uniforms;
+
+layout(set = 0, binding = 6, std430) readonly buffer PointNormals {
+    vec4 normals[];
+} pointNormals;
 
 struct RenderParameterBindingGpu {
     vec4 constantValue;
@@ -48,11 +54,17 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 } styleData;
 
 void main() {
+    const uint pointIndex = uint(gl_VertexIndex);
     vec4 worldPosition = vec4(inPosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     gl_Position = uniforms.viewProjection * worldPosition;
     gl_PointSize = max(1.0, styleData.pointSizeBinding.constantValue.x);
     outSourceColor = inColor;
     outViewDepth = -viewPosition.z;
-    outPointIndex = uint(gl_VertexIndex);
+    outPointIndex = pointIndex;
+    outWorldPosition = inPosition;
+    outPointNormal =
+        styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
+            ? pointNormals.normals[pointIndex].xyz
+            : vec3(0.0);
 }

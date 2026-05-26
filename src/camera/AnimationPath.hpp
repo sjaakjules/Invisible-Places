@@ -57,6 +57,8 @@ struct AnimationPath {
     std::optional<invisible_places::water::WaterAnimationTrailSettings> tempWaterAnimationTrailSettings;
     std::optional<invisible_places::renderer::pointcloud::PointCloudStyleState> waterPointVisualStyle;
     std::optional<invisible_places::renderer::pointcloud::PointCloudStyleState> tempWaterPointVisualStyle;
+    std::optional<invisible_places::water::WaterCausticLookSettings> waterCausticLookSettings;
+    std::optional<invisible_places::water::WaterCausticLookSettings> tempWaterCausticLookSettings;
     std::optional<invisible_places::water::WaterVisualSettings> waterVisualSettings;
     std::optional<invisible_places::water::WaterVisualSettings> tempWaterVisualSettings;
     std::optional<invisible_places::water::WaterSettingsBundle> waterSettings;

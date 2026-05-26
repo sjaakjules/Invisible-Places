@@ -104,6 +104,13 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 stylisationParams2{0.25F, 0.0F, 0.0F, 0.0F};
     glm::vec4 surfaceMotionParams{0.0F, 1.5F, 0.35F, 0.58F};
     glm::vec4 surfaceMotionStats{0.0F, 1.0F, 1.0F, 0.25F};
+    glm::uvec4 causticControl{0U, 0U, 0U, 0U};
+    glm::vec4 causticParams0{0.0F, 0.20F, 0.55F, 0.015F};
+    glm::vec4 causticParams1{0.045F, 1.15F, 0.08F, 0.0F};
+    glm::vec4 causticParams2{0.006F, 0.005F, 0.0F, 0.0F};
+    glm::vec4 causticTint{0.62F, 0.88F, 1.0F, 1.0F};
+    glm::vec4 gradientStartColor{0.05F, 0.28F, 0.95F, 1.0F};
+    glm::vec4 gradientEndColor{0.96F, 0.94F, 0.58F, 1.0F};
 };
 
 struct alignas(16) GaussianSplatPushConstants {
@@ -496,7 +503,8 @@ float EstimateRaycastBvhRadius(
     const float screenRadius = pointSize * 0.5F * pixelWorldAtMaxDepth;
     const float surfelRadius =
         std::max(0.0F, BindingMaximum(style.surfelDiameter, renderer::pointcloud::kInactiveSurfelDiameterDefault)) *
-        0.5F;
+        0.5F *
+        (style.flowAnimation ? std::clamp(style.waterStreakAspect, 1.0F, 32.0F) : 1.0F);
     if (primitiveMode == renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres) {
         return std::max(screenRadius, surfelRadius);
     }
@@ -5416,6 +5424,18 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.solidColor[2],
         layer.style.solidColor[3],
     };
+    styleGpu.gradientStartColor = glm::vec4{
+        layer.style.gradientStartColor[0],
+        layer.style.gradientStartColor[1],
+        layer.style.gradientStartColor[2],
+        1.0F,
+    };
+    styleGpu.gradientEndColor = glm::vec4{
+        layer.style.gradientEndColor[0],
+        layer.style.gradientEndColor[1],
+        layer.style.gradientEndColor[2],
+        1.0F,
+    };
     styleGpu.colorize = glm::vec4{
         layer.style.colorizeColor[0],
         layer.style.colorizeColor[1],
@@ -5464,14 +5484,14 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     styleGpu.renderParams2 = glm::vec4{
         layer.style.densityScale,
         layer.style.densityClamp,
-        0.0F,
+        std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
         0.0F,
     };
     styleGpu.renderParams3 = glm::vec4{
         layer.style.depthAlphaThreshold,
         pointSizeRangeMin_,
         pointSizeRangeMax_,
-        0.0F,
+        std::max(0.0F, renderState_.flowTimeSeconds),
     };
     styleGpu.stylisationControl = glm::uvec4{
         static_cast<std::uint32_t>(layer.style.stylisationMode),
@@ -5521,6 +5541,38 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                 0.25F,
             };
         }
+    }
+    if (renderer::pointcloud::PointCloudStyleHasActiveCaustics(layer.style)) {
+        styleGpu.causticControl = glm::uvec4{
+            1U,
+            static_cast<std::uint32_t>(layer.style.causticMaskFieldSlot + 1),
+            static_cast<std::uint32_t>(layer.style.causticEdgeFieldSlot + 1),
+            static_cast<std::uint32_t>(layer.style.causticSeedFieldSlot + 1),
+        };
+        styleGpu.causticParams0 = glm::vec4{
+            std::clamp(layer.style.causticIntensity, 0.0F, 5.0F),
+            std::clamp(layer.style.causticCellSizeMeters, 0.005F, 5.0F),
+            std::clamp(layer.style.causticSpeed, 0.0F, 10.0F),
+            std::clamp(layer.style.causticLineWidthMeters, 0.0005F, 0.50F),
+        };
+        styleGpu.causticParams1 = glm::vec4{
+            std::clamp(layer.style.causticWarpAmplitudeMeters, 0.0F, 2.0F),
+            std::clamp(layer.style.causticEmissionBoost, 0.0F, 8.0F),
+            std::clamp(layer.style.causticOpacityBoost, 0.0F, 2.0F),
+            std::clamp(layer.style.causticPointSizeBoost, 0.0F, 4.0F),
+        };
+        styleGpu.causticParams2 = glm::vec4{
+            std::clamp(layer.style.causticFeatherMeters, 0.0005F, 0.50F),
+            std::clamp(layer.style.causticSurfacePointSpacingMeters, 0.0005F, 0.10F),
+            std::clamp(layer.style.causticPreviewTintAmount, 0.0F, 1.0F),
+            std::clamp(layer.style.causticPreviewTintRegionId, 0.0F, 16777216.0F),
+        };
+        styleGpu.causticTint = glm::vec4{
+            std::clamp(layer.style.causticTint[0], 0.0F, 4.0F),
+            std::clamp(layer.style.causticTint[1], 0.0F, 4.0F),
+            std::clamp(layer.style.causticTint[2], 0.0F, 4.0F),
+            1.0F,
+        };
     }
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,

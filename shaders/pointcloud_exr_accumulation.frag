@@ -12,6 +12,7 @@ layout(location = 6) in float inViewDepth;
 layout(location = 7) flat in uint inPointIndex;
 layout(location = 8) in float inSurfaceAngleMask;
 layout(location = 9) in vec3 inAovNormal;
+layout(location = 10) in float inCaustic;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
@@ -57,6 +58,15 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams0;
     vec4 stylisationParams1;
     vec4 stylisationParams2;
+    vec4 surfaceMotionParams;
+    vec4 surfaceMotionStats;
+    uvec4 causticControl;
+    vec4 causticParams0;
+    vec4 causticParams1;
+    vec4 causticParams2;
+    vec4 causticTint;
+    vec4 gradientStartColor;
+    vec4 gradientEndColor;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"
@@ -68,7 +78,11 @@ vec3 ResolveBaseColor() {
     if (styleData.globalControl.x == 1u) {
         baseColor = styleData.solidColor.rgb;
     } else if (styleData.globalControl.x == 2u) {
-        baseColor = ApplyPointCloudColormap(styleData.globalControl.y, clamp(inColormapValue, 0.0, 1.0));
+        baseColor = ApplyPointCloudColormapOrGradient(
+            styleData.globalControl.y,
+            clamp(inColormapValue, 0.0, 1.0),
+            styleData.gradientStartColor.rgb,
+            styleData.gradientEndColor.rgb);
     } else if (styleData.globalControl.w == 0u) {
         baseColor = styleData.solidColor.rgb;
     }
@@ -211,8 +225,9 @@ void main() {
         discard;
     }
 
-    const vec3 baseColor =
+    vec3 baseColor =
         PointStylisationColor(ApplyColorize(ResolveBaseColor()), centered, radius, inPointIndex, inSurfaceAngleMask);
+    baseColor = mix(baseColor, styleData.causticTint.rgb, clamp(inCaustic * 0.55, 0.0, 1.0));
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;
     outEmission = vec4(0.0);

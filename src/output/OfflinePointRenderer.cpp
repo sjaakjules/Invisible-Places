@@ -15,6 +15,7 @@
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <glm/matrix.hpp>
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
@@ -30,11 +31,15 @@ constexpr std::size_t kWaterParticleRoleFieldSlot = 9U;
 constexpr std::size_t kWaterPathStartFieldSlot = 10U;
 constexpr std::size_t kWaterPathCountFieldSlot = 11U;
 constexpr std::size_t kWaterJitterSeedFieldSlot = 12U;
+constexpr std::size_t kWaterTrailAgeFieldSlot = 13U;
+constexpr std::size_t kWaterFeatureTypeFieldSlot = 15U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
 
 float Clamp01(float value) {
     return std::clamp(value, 0.0F, 1.0F);
 }
+
+float SmoothStep(float edge0, float edge1, float value);
 
 glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
     return {value.x, value.y, value.z};
@@ -89,16 +94,54 @@ float WaterParticleTravel(
         1.0F);
 }
 
+bool IsWaterSteam(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex) {
+    if (cloud.scalarFields.size() <= kWaterFeatureTypeFieldSlot) {
+        return false;
+    }
+    const float featureType = ScalarFieldValueBySlot(cloud, kWaterFeatureTypeFieldSlot, pointIndex);
+    return featureType > 0.5F && featureType < 1.5F;
+}
+
+float WaterTrailFade(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex) {
+    if (cloud.scalarFields.size() <= kWaterTrailAgeFieldSlot) {
+        return 1.0F;
+    }
+    const float age = Clamp01(ScalarFieldValueBySlot(cloud, kWaterTrailAgeFieldSlot, pointIndex));
+    return std::pow(1.0F - SmoothStep(0.0F, 1.0F, age), 1.35F);
+}
+
 float WaterParticleFade(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     float timeSeconds) {
     const float travel = WaterParticleTravel(cloud, pointIndex, timeSeconds);
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterJitterSeedFieldSlot, pointIndex);
+    if (IsWaterSteam(cloud, pointIndex)) {
+        const float birth = SmoothStep(0.0F, 0.10F, travel);
+        const float dissipate = 1.0F - SmoothStep(0.70F, 1.0F, travel);
+        const float turbulence = 0.82F + 0.18F * std::sin((travel + seed * 1.618F) * 6.28318530718F);
+        return birth * dissipate * turbulence * WaterTrailFade(cloud, pointIndex);
+    }
     const float inFade = std::clamp(travel / 0.08F, 0.0F, 1.0F);
     const float outFade = 1.0F - std::clamp((travel - 0.92F) / 0.08F, 0.0F, 1.0F);
-    const float seed = ScalarFieldValueBySlot(cloud, kWaterJitterSeedFieldSlot, pointIndex);
     const float shimmer = 0.78F + 0.22F * std::sin((travel + seed * 1.618F) * 6.28318530718F);
-    return inFade * outFade * shimmer;
+    return inFade * outFade * shimmer * WaterTrailFade(cloud, pointIndex);
+}
+
+float WaterParticleSizeScale(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float timeSeconds) {
+    if (!IsWaterSteam(cloud, pointIndex)) {
+        return 1.0F;
+    }
+    const float travel = WaterParticleTravel(cloud, pointIndex, timeSeconds);
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterJitterSeedFieldSlot, pointIndex);
+    return 0.72F + SmoothStep(0.0F, 1.0F, travel) * (1.43F + seed * 0.35F);
 }
 
 float HashWater01(std::uint32_t value) {
@@ -108,6 +151,183 @@ float HashWater01(std::uint32_t value) {
     value *= 0x846ca68bU;
     value ^= value >> 16U;
     return static_cast<float>(value & 0x00ffffffU) / 16777215.0F;
+}
+
+float PositiveFract(float value) {
+    return value - std::floor(value);
+}
+
+float HashCaustic01(const glm::vec2& p) {
+    const glm::vec3 p3 = glm::fract(glm::vec3{p.x, p.y, p.x} * 0.1031F);
+    const float mixed = glm::dot(p3, glm::vec3{p3.y, p3.z, p3.x} + glm::vec3{33.33F});
+    const glm::vec3 folded = p3 + glm::vec3{mixed};
+    return PositiveFract((folded.x + folded.y) * folded.z);
+}
+
+glm::vec2 HashCaustic2(const glm::vec2& p) {
+    return {HashCaustic01(p), HashCaustic01(p + glm::vec2{19.19F})};
+}
+
+float StableCausticSeed(float regionOrSeed) {
+    if (regionOrSeed >= 1.0F) {
+        return HashCaustic01(glm::vec2{std::floor(regionOrSeed + 0.5F), 401.0F});
+    }
+    return 0.38196601125F;
+}
+
+glm::vec2 CausticSurfaceUv(const glm::vec3& worldPosition, const glm::vec3& normal) {
+    if (glm::dot(normal, normal) <= 1.0e-8F) {
+        return {worldPosition.x, worldPosition.y};
+    }
+
+    glm::vec3 n = glm::normalize(normal);
+    if (n.z < 0.0F) {
+        n = -n;
+    }
+
+    const float steepness = SmoothStep(0.18F, 0.82F, 1.0F - std::clamp(n.z, 0.0F, 1.0F));
+    const glm::vec2 slope = glm::clamp(
+        glm::vec2{-n.x, -n.y} / std::max(0.35F, n.z),
+        glm::vec2{-1.75F},
+        glm::vec2{1.75F});
+    return glm::vec2{worldPosition.x, worldPosition.y} + slope * worldPosition.z * steepness * 0.32F;
+}
+
+float CausticVoronoiRidge(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    const glm::vec2& metersUv,
+    float seed,
+    float timeSeconds,
+    float edge) {
+    const float stableSeed = StableCausticSeed(seed);
+    const float cellSize = std::max(0.005F, style.causticCellSizeMeters);
+    const float lineWidth = std::max(0.0005F, style.causticLineWidthMeters);
+    const float warpAmplitude = std::clamp(style.causticWarpAmplitudeMeters, 0.0F, 2.0F);
+    const float feather = std::max(0.0005F, style.causticFeatherMeters);
+    const float pointSpacing = std::max(0.0005F, style.causticSurfacePointSpacingMeters);
+    const float edgeCore = SmoothStep(0.08F, 0.82F, Clamp01(edge));
+    const glm::vec2 warpUv = metersUv / std::max(0.001F, cellSize * 1.7F);
+    const glm::vec2 warpedMeters =
+        metersUv +
+        warpAmplitude *
+            glm::vec2{
+                std::sin(warpUv.y * 1.73F + timeSeconds * 0.71F + stableSeed * 6.28318530718F) +
+                    0.35F * std::sin(warpUv.x * 3.19F - timeSeconds * 0.23F + stableSeed * 5.31F),
+                std::cos(warpUv.x * 1.31F - timeSeconds * 0.63F + stableSeed * 4.398229715F) +
+                    0.35F * std::cos(warpUv.y * 2.17F + timeSeconds * 0.29F + stableSeed * 7.13F),
+            };
+    const glm::vec2 uv = warpedMeters / cellSize;
+    const glm::vec2 base{std::floor(uv.x), std::floor(uv.y)};
+    const glm::vec2 f{PositiveFract(uv.x), PositiveFract(uv.y)};
+    float first = 16.0F;
+    float second = 16.0F;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const glm::vec2 cell{static_cast<float>(x), static_cast<float>(y)};
+            auto feature = HashCaustic2(base + cell + glm::vec2{stableSeed * 37.0F});
+            feature = glm::vec2{0.5F} + glm::vec2{0.5F} *
+                                      glm::vec2{
+                                          std::sin((feature.x + timeSeconds * 0.17F + stableSeed) * 6.28318530718F),
+                                          std::sin((feature.y - timeSeconds * 0.13F + stableSeed) * 6.28318530718F),
+                                      };
+            const float distance = glm::length(cell + feature - f);
+            if (distance < first) {
+                second = first;
+                first = distance;
+            } else if (distance < second) {
+                second = distance;
+            }
+        }
+    }
+    const float ridgeDistanceMeters = std::max(0.0F, second - first) * cellSize;
+    const float edgeWidthScale = 0.55F + (1.0F - 0.55F) * edgeCore;
+    const float resolvedWidth = std::max(lineWidth, pointSpacing * 1.15F) * edgeWidthScale;
+    const float resolvedFeather = std::max(feather, pointSpacing * 0.5F) * (0.75F + (1.0F - 0.75F) * edgeCore);
+    const float core = 1.0F - SmoothStep(resolvedWidth, resolvedWidth + resolvedFeather, ridgeDistanceMeters);
+    const float halo = 1.0F - SmoothStep(
+        resolvedWidth + resolvedFeather * 2.0F,
+        resolvedWidth + resolvedFeather * 7.0F,
+        ridgeDistanceMeters);
+    const float dissolveNoise = HashCaustic01(
+        glm::floor((metersUv / std::max(0.001F, cellSize * 2.0F)) + glm::vec2{stableSeed * 23.0F}));
+    const float dissolve = SmoothStep(0.04F, 0.74F, edgeCore + (dissolveNoise - 0.5F) * 0.18F);
+    const float shimmer = 0.82F + 0.18F * std::sin(timeSeconds * 1.7F + stableSeed * 17.0F + first * 11.0F);
+    return std::clamp((core * 1.12F + halo * 0.32F) * shimmer * dissolve, 0.0F, 1.0F);
+}
+
+float CausticEdgeGate(const invisible_places::renderer::pointcloud::PointCloudStyleState& style, const glm::vec2& metersUv, float edge, float seed) {
+    const float stableSeed = StableCausticSeed(seed);
+    const float cellSize = std::max(0.005F, style.causticCellSizeMeters);
+    const float broadBreakup =
+        HashCaustic01(glm::floor((metersUv / std::max(0.001F, cellSize * 2.5F)) + glm::vec2{stableSeed * 11.0F}));
+    return SmoothStep(0.04F, 0.92F, edge + broadBreakup * 0.14F - 0.06F);
+}
+
+float CausticPreviewTint(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    float mask,
+    float edge,
+    float regionOrSeed) {
+    const float amount = std::clamp(style.causticPreviewTintAmount, 0.0F, 1.0F);
+    if (amount <= 1.0e-5F) {
+        return 0.0F;
+    }
+    const float targetRegion = style.causticPreviewTintRegionId;
+    if (targetRegion >= 0.5F &&
+        std::abs(std::floor(regionOrSeed + 0.5F) - std::floor(targetRegion + 0.5F)) > 0.5F) {
+        return 0.0F;
+    }
+    return std::clamp(mask * edge * amount, 0.0F, 1.0F);
+}
+
+float CausticColorMixAmount(float causticStrength, float previewTint) {
+    return std::clamp(causticStrength * 0.55F + previewTint * 0.24F, 0.0F, 1.0F);
+}
+
+float ResolveCausticStrength(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    std::size_t pointIndex,
+    const glm::vec3& worldPosition,
+    float timeSeconds,
+    float* previewTint) {
+    if (previewTint != nullptr) {
+        *previewTint = 0.0F;
+    }
+    if (!invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(style)) {
+        return 0.0F;
+    }
+    const float mask = Clamp01(ScalarFieldValueBySlot(
+        cloud,
+        static_cast<std::size_t>(style.causticMaskFieldSlot),
+        pointIndex));
+    if (mask <= 1.0e-5F) {
+        return 0.0F;
+    }
+    const float edge = Clamp01(ScalarFieldValueBySlot(
+        cloud,
+        static_cast<std::size_t>(style.causticEdgeFieldSlot),
+        pointIndex));
+    const float seed = ScalarFieldValueBySlot(
+        cloud,
+        static_cast<std::size_t>(style.causticSeedFieldSlot),
+        pointIndex);
+    if (previewTint != nullptr) {
+        *previewTint = CausticPreviewTint(style, mask, edge, seed);
+    }
+    const float temporal = std::max(0.0F, timeSeconds) * std::max(0.0F, style.causticSpeed);
+    glm::vec3 normal{0.0F};
+    if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+        normal = {
+            cloud.normals[pointIndex].x,
+            cloud.normals[pointIndex].y,
+            cloud.normals[pointIndex].z,
+        };
+    }
+    const glm::vec2 metersUv = CausticSurfaceUv(worldPosition, normal);
+    const float ridge = CausticVoronoiRidge(style, metersUv, seed, temporal, edge);
+    const float edgeGate = CausticEdgeGate(style, metersUv, edge, seed);
+    return std::clamp(ridge * mask * edgeGate * std::max(0.0F, style.causticIntensity), 0.0F, 6.0F);
 }
 
 glm::vec3 SafeWaterLateral(const glm::vec3& tangent, const glm::vec3& fallback) {
@@ -212,6 +432,37 @@ glm::vec3 ResolveWaterParticlePosition(
     const glm::vec3 p2 = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, p2Offset, seed, pathJitter);
     const glm::vec3 p3 = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, p3Offset, seed, pathJitter);
     return CatmullRomWater(p0, p1, p2, p3, t);
+}
+
+glm::vec3 ResolveWaterParticleTangent(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float timeSeconds) {
+    const auto pathStart = static_cast<std::size_t>(
+        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterPathStartFieldSlot, pointIndex) + 0.5F)));
+    const auto pathCount = static_cast<std::size_t>(
+        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterPathCountFieldSlot, pointIndex) + 0.5F)));
+    if (pathCount < 2U || pathStart >= cloud.positions.size() || pathStart + pathCount > cloud.positions.size()) {
+        return {0.0F, 0.0F, 0.0F};
+    }
+
+    const float role = ScalarFieldValueBySlot(cloud, kWaterParticleRoleFieldSlot, pointIndex);
+    auto anchorOffset = std::min<std::size_t>(pointIndex > pathStart ? pointIndex - pathStart : 0U, pathCount - 1U);
+    if (role >= 0.5F && role < 1.5F) {
+        const float pathPosition = WaterParticleTravel(cloud, pointIndex, timeSeconds) * static_cast<float>(pathCount - 1U);
+        anchorOffset = std::min<std::size_t>(
+            static_cast<std::size_t>(std::floor(pathPosition)),
+            pathCount - 1U);
+    }
+
+    const auto previousOffset = anchorOffset > 0U ? anchorOffset - 1U : anchorOffset;
+    const auto nextOffset = std::min<std::size_t>(anchorOffset + 1U, pathCount - 1U);
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterJitterSeedFieldSlot, pointIndex);
+    const float pathJitter = std::clamp(ScalarFieldValueBySlot(cloud, kWaterWidthFieldSlot, pointIndex), 0.0F, 3.0F);
+    const glm::vec3 previous = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, previousOffset, seed, pathJitter);
+    const glm::vec3 next = JitteredWaterAnchorPosition(cloud, pathStart, pathCount, nextOffset, seed, pathJitter);
+    const glm::vec3 tangent = next - previous;
+    return glm::dot(tangent, tangent) > 1.0e-8F ? glm::normalize(tangent) : glm::vec3{0.0F, 0.0F, 0.0F};
 }
 
 float EvaluateBinding(
@@ -366,7 +617,18 @@ glm::vec3 ResolvePointColor(
                 layer.style.colormapPosition,
                 pointIndex,
                 invisible_places::renderer::pointcloud::kInactiveColormapPositionDefault));
-        baseColor = {color[0], color[1], color[2]};
+        const auto customColor = layer.style.colormap ==
+                                         invisible_places::renderer::pointcloud::PointCloudColormapId::CustomGradient
+                                     ? invisible_places::renderer::pointcloud::SampleGradient(
+                                           layer.style.gradientStartColor,
+                                           layer.style.gradientEndColor,
+                                           EvaluateBindingOrDefault(
+                                               cloud,
+                                               layer.style.colormapPosition,
+                                               pointIndex,
+                                               invisible_places::renderer::pointcloud::kInactiveColormapPositionDefault))
+                                     : color;
+        baseColor = {customColor[0], customColor[1], customColor[2]};
     }
 
     return ApplyColorize(baseColor, layer.style);
@@ -387,6 +649,7 @@ struct OfflinePointSample {
     glm::vec3 color{1.0F, 1.0F, 1.0F};
     bool worldSurfels = false;
     bool hasNormal = false;
+    bool hasPreferredTangent = false;
     glm::vec3 normal{0.0F, 0.0F, 1.0F};
     glm::vec3 tangent{1.0F, 0.0F, 0.0F};
     glm::vec3 bitangent{0.0F, 1.0F, 0.0F};
@@ -839,12 +1102,30 @@ void ResolveSurfelBasis(
         } else {
             sample->normal = glm::normalize(sample->normal);
         }
+        if (sample->hasPreferredTangent) {
+            sample->tangent -= sample->normal * glm::dot(sample->tangent, sample->normal);
+            if (glm::dot(sample->tangent, sample->tangent) > 1.0e-8F) {
+                sample->tangent = glm::normalize(sample->tangent);
+                sample->bitangent = glm::normalize(glm::cross(sample->normal, sample->tangent));
+                return;
+            }
+            sample->hasPreferredTangent = false;
+        }
         sample->tangent = cameraRight;
         sample->bitangent = cameraUp;
         return;
     }
 
     sample->normal = glm::normalize(sample->normal);
+    if (sample->hasPreferredTangent) {
+        sample->tangent -= sample->normal * glm::dot(sample->tangent, sample->normal);
+        if (glm::dot(sample->tangent, sample->tangent) > 1.0e-8F) {
+            sample->tangent = glm::normalize(sample->tangent);
+            sample->bitangent = glm::normalize(glm::cross(sample->normal, sample->tangent));
+            return;
+        }
+        sample->hasPreferredTangent = false;
+    }
     sample->tangent = cameraRight - (sample->normal * glm::dot(cameraRight, sample->normal));
     if (glm::dot(sample->tangent, sample->tangent) <= 1.0e-8F) {
         sample->tangent = cameraUp - (sample->normal * glm::dot(cameraUp, sample->normal));
@@ -891,14 +1172,23 @@ bool BuildOfflinePointSample(
 
     const auto& cloud = *layer.cloud;
     const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
-    if (waterParticles &&
-        ScalarFieldValueBySlot(cloud, kWaterParticleRoleFieldSlot, pointIndex) < 0.5F) {
-        return false;
+    float waterParticleRole = 0.0F;
+    if (waterParticles) {
+        waterParticleRole = ScalarFieldValueBySlot(cloud, kWaterParticleRoleFieldSlot, pointIndex);
+        if (layer.style.waterPathView) {
+            if (!((waterParticleRole >= 0.5F && waterParticleRole < 1.5F) ||
+                  (waterParticleRole >= 1.5F && waterParticleRole < 2.5F) ||
+                  (waterParticleRole >= 2.5F && waterParticleRole < 3.5F))) {
+                return false;
+            }
+        } else if (waterParticleRole < 0.5F || waterParticleRole >= 1.5F) {
+            return false;
+        }
     }
 
     const auto& point = cloud.positions[pointIndex];
     glm::vec3 localPoint{point.x, point.y, point.z};
-    if (waterParticles) {
+    if (waterParticles && !layer.style.waterPathView && waterParticleRole >= 0.5F && waterParticleRole < 1.5F) {
         localPoint = ResolveWaterParticlePosition(cloud, pointIndex, stylisationTimeSeconds, localPoint);
     }
     localPoint = ResolveSurfaceMotionPosition(layer, cloud, pointIndex, localPoint, stylisationTimeSeconds);
@@ -937,12 +1227,24 @@ bool BuildOfflinePointSample(
         pointIndex,
         static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
     sample->viewDepth = viewDepth;
+    float causticPreviewTint = 0.0F;
+    const float caustic = ResolveCausticStrength(
+        cloud,
+        layer.style,
+        pointIndex,
+        sample->worldCenter,
+        stylisationTimeSeconds,
+        &causticPreviewTint);
+    const float waterParticleSizeScale =
+        waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
     sample->pointSize = std::clamp(
         EvaluateBindingOrDefault(
             cloud,
             layer.style.pointSize,
             pointIndex,
-            invisible_places::renderer::pointcloud::kInactivePointSizeDefault),
+            invisible_places::renderer::pointcloud::kInactivePointSizeDefault) *
+            waterParticleSizeScale *
+            (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)),
         1.0F,
         64.0F);
     sample->worldSurfels = worldSurfels;
@@ -952,13 +1254,16 @@ bool BuildOfflinePointSample(
             cloud,
             layer.style.surfelDiameter,
             pointIndex,
-            invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault));
+            invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault) *
+            waterParticleSizeScale *
+            (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)));
     sample->opacity = Clamp01(
         EvaluateBindingOrDefault(
             cloud,
             layer.style.opacity,
             pointIndex,
-            invisible_places::renderer::pointcloud::kInactiveOpacityDefault));
+            invisible_places::renderer::pointcloud::kInactiveOpacityDefault) *
+        (1.0F + caustic * std::max(0.0F, layer.style.causticOpacityBoost)));
     if (waterParticles) {
         sample->opacity *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
     }
@@ -979,6 +1284,7 @@ bool BuildOfflinePointSample(
         if (waterParticles) {
             sample->emissive *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
         }
+        sample->emissive += caustic * std::max(0.0F, layer.style.causticEmissionBoost);
         sample->xray = Clamp01(
             EvaluateBindingOrDefault(
                 cloud,
@@ -986,6 +1292,14 @@ bool BuildOfflinePointSample(
                 pointIndex,
                 invisible_places::renderer::pointcloud::kInactiveXrayDefault));
         sample->color = ResolvePointColor(layer, pointIndex);
+        sample->color = glm::mix(
+            sample->color,
+            glm::vec3{
+                layer.style.causticTint[0],
+                layer.style.causticTint[1],
+                layer.style.causticTint[2],
+            },
+            CausticColorMixAmount(caustic, causticPreviewTint));
     }
     sample->hasNormal = cloud.hasNormals && pointIndex < cloud.normals.size();
     if (sample->hasNormal) {
@@ -994,6 +1308,17 @@ bool BuildOfflinePointSample(
         if (sample->hasNormal) {
             sample->normal = glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
             sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
+        }
+    }
+    sample->hasPreferredTangent = false;
+    if (waterParticles && layer.style.waterStreakAspect > 1.0001F) {
+        const glm::vec3 localTangent = ResolveWaterParticleTangent(cloud, pointIndex, stylisationTimeSeconds);
+        if (glm::dot(localTangent, localTangent) > 1.0e-8F) {
+            const glm::vec3 worldTangent = glm::mat3{layer.localToWorld} * localTangent;
+            if (IsFinite(worldTangent) && glm::dot(worldTangent, worldTangent) > 1.0e-8F) {
+                sample->tangent = glm::normalize(worldTangent);
+                sample->hasPreferredTangent = true;
+            }
         }
     }
     if (sample->worldSurfels) {
@@ -1021,11 +1346,15 @@ void VisitCoveredPixels(
     PixelCallback callback) {
     if (sample.worldSurfels) {
         const float radiusWorld = sample.surfelDiameter * 0.5F;
+        const float waterStreakAspect =
+            style.flowAnimation ? std::clamp(style.waterStreakAspect, 1.0F, 32.0F) : 1.0F;
+        const float tangentRadiusWorld = radiusWorld * waterStreakAspect;
+        const float bitangentRadiusWorld = radiusWorld;
         const std::array<glm::vec3, 4> quadCorners = {
-            sample.worldCenter + ((-sample.tangent - sample.bitangent) * radiusWorld),
-            sample.worldCenter + ((sample.tangent - sample.bitangent) * radiusWorld),
-            sample.worldCenter + ((sample.tangent + sample.bitangent) * radiusWorld),
-            sample.worldCenter + ((-sample.tangent + sample.bitangent) * radiusWorld),
+            sample.worldCenter - (sample.tangent * tangentRadiusWorld) - (sample.bitangent * bitangentRadiusWorld),
+            sample.worldCenter + (sample.tangent * tangentRadiusWorld) - (sample.bitangent * bitangentRadiusWorld),
+            sample.worldCenter + (sample.tangent * tangentRadiusWorld) + (sample.bitangent * bitangentRadiusWorld),
+            sample.worldCenter - (sample.tangent * tangentRadiusWorld) + (sample.bitangent * bitangentRadiusWorld),
         };
 
         float minPixelX = std::numeric_limits<float>::max();
@@ -1058,7 +1387,6 @@ void VisitCoveredPixels(
         }
 
         const glm::mat4 inverseViewProjection = glm::inverse(matrices.viewProjection);
-        const float radiusSquaredWorld = radiusWorld * radiusWorld;
         for (int y = minY; y <= maxY; ++y) {
             for (int x = minX; x <= maxX; ++x) {
                 const glm::vec3 rayDirection = PixelRayDirection(
@@ -1082,13 +1410,17 @@ void VisitCoveredPixels(
                 const glm::vec3 localOffset = hitPoint - sample.worldCenter;
                 const float u = glm::dot(localOffset, sample.tangent);
                 const float v = glm::dot(localOffset, sample.bitangent);
-                const float normalizedRadiusSquared = ((u * u) + (v * v)) / radiusSquaredWorld;
+                const float normalizedRadiusSquared =
+                    ((u * u) / std::max(1.0e-8F, tangentRadiusWorld * tangentRadiusWorld)) +
+                    ((v * v) / std::max(1.0e-8F, bitangentRadiusWorld * bitangentRadiusWorld));
                 if (normalizedRadiusSquared > 1.0F) {
                     continue;
                 }
 
                 const float normalizedRadius = std::sqrt(normalizedRadiusSquared);
-                const glm::vec2 normalizedCoord{u / radiusWorld, v / radiusWorld};
+                const glm::vec2 normalizedCoord{
+                    u / std::max(1.0e-8F, tangentRadiusWorld),
+                    v / std::max(1.0e-8F, bitangentRadiusWorld)};
                 const float falloff = PointFalloff(style, normalizedRadius, normalizedRadiusSquared);
                 const float stylisationCoverage =
                     PointStylisationCoverage(

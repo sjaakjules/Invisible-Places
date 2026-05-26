@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outColormapValue;
@@ -11,6 +12,7 @@ layout(location = 7) out vec2 outDiscCoord;
 layout(location = 8) flat out uint outPointIndex;
 layout(location = 9) out float outSurfaceAngleMask;
 layout(location = 10) out vec3 outAovNormal;
+layout(location = 11) out float outCaustic;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -56,6 +58,11 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams2;
     vec4 surfaceMotionParams;
     vec4 surfaceMotionStats;
+    uvec4 causticControl;
+    vec4 causticParams0;
+    vec4 causticParams1;
+    vec4 causticParams2;
+    vec4 causticTint;
 } styleData;
 
 layout(set = 0, binding = 4, std430) readonly buffer SurfelPositions {
@@ -83,6 +90,8 @@ const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterPathStartFieldSlot = 10u;
 const uint kWaterPathCountFieldSlot = 11u;
 const uint kWaterJitterSeedFieldSlot = 12u;
+const uint kWaterTrailAgeFieldSlot = 13u;
+const uint kWaterFeatureTypeFieldSlot = 15u;
 const float kWaterParticleSpeedScale = 0.12;
 
 const vec2 kSurfelCorners[6] = vec2[](
@@ -105,18 +114,100 @@ float LoadScalarFieldValue(uint fieldSlot, uint pointIndex) {
     return scalarFieldValues.values[scalarIndex];
 }
 
+#include "pointcloud_caustics.glsl"
+
+float ResolveCausticStrength(vec3 worldPosition, uint pointIndex, out float previewTint) {
+    previewTint = 0.0;
+    if (styleData.causticControl.x == 0u ||
+        styleData.causticControl.y == 0u ||
+        styleData.causticControl.z == 0u ||
+        styleData.causticControl.w == 0u) {
+        return 0.0;
+    }
+    const uint maskSlot = styleData.causticControl.y - 1u;
+    const uint edgeSlot = styleData.causticControl.z - 1u;
+    const uint seedSlot = styleData.causticControl.w - 1u;
+    const float mask = clamp(LoadScalarFieldValue(maskSlot, pointIndex), 0.0, 1.0);
+    if (mask <= 1e-5) {
+        return 0.0;
+    }
+    const float edge = clamp(LoadScalarFieldValue(edgeSlot, pointIndex), 0.0, 1.0);
+    const float seed = LoadScalarFieldValue(seedSlot, pointIndex);
+    previewTint = CausticPreviewTint(mask, edge, seed);
+    const float time = uniforms.depthParameters.x * max(0.0, styleData.causticParams0.z);
+    const vec3 normal =
+        styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
+            ? surfelNormals.normals[pointIndex].xyz
+            : vec3(0.0);
+    const vec2 metersUv = CausticSurfaceUv(worldPosition, normal);
+    const float ridge = CausticVoronoiRidge(metersUv, seed, time, edge);
+    const float edgeGate = CausticEdgeGate(metersUv, edge, seed);
+    return clamp(ridge * mask * edgeGate * max(0.0, styleData.causticParams0.x), 0.0, 6.0);
+}
+
 bool HasWaterParticleFields() {
     return styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot;
+}
+
+float WaterFeatureType(uint pointIndex) {
+    return styleData.globalControl.z > kWaterFeatureTypeFieldSlot
+        ? LoadScalarFieldValue(kWaterFeatureTypeFieldSlot, pointIndex)
+        : 0.0;
+}
+
+float WaterTrailFade(uint pointIndex) {
+    if (styleData.globalControl.z <= kWaterTrailAgeFieldSlot) {
+        return 1.0;
+    }
+    const float age = clamp(LoadScalarFieldValue(kWaterTrailAgeFieldSlot, pointIndex), 0.0, 1.0);
+    return pow(1.0 - smoothstep(0.0, 1.0, age), 1.35);
 }
 
 bool WaterPathViewEnabled() {
     return styleData.pointMeta.w == 2u;
 }
 
+float WaterPathPointSizeScale(uint pointIndex) {
+    if (!WaterPathViewEnabled() || !HasWaterParticleFields()) {
+        return 1.0;
+    }
+    const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot, pointIndex);
+    if (role >= 2.5 && role < 3.5) {
+        return 0.48;
+    }
+    if (role >= 0.5 && role < 1.5) {
+        return 0.58;
+    }
+    return 1.0;
+}
+
 float WaterParticleTravel(uint pointIndex) {
     const float phase = LoadScalarFieldValue(kWaterPhaseFieldSlot, pointIndex);
     const float speed = max(0.02, LoadScalarFieldValue(kWaterSpeedFieldSlot, pointIndex));
     return fract(phase + max(0.0, uniforms.depthParameters.x) * speed * kWaterParticleSpeedScale);
+}
+
+bool IsWaterSteam(uint pointIndex) {
+    const float featureType = WaterFeatureType(pointIndex);
+    return featureType > 0.5 && featureType < 1.5;
+}
+
+float WaterSteamFade(uint pointIndex) {
+    const float travel = WaterParticleTravel(pointIndex);
+    const float seed = LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex);
+    const float birth = smoothstep(0.0, 0.10, travel);
+    const float dissipate = 1.0 - smoothstep(0.70, 1.0, travel);
+    const float turbulence = 0.82 + 0.18 * sin((travel + seed * 1.618) * 6.28318530718);
+    return birth * dissipate * turbulence;
+}
+
+float WaterSteamSizeScale(uint pointIndex) {
+    if (!IsWaterSteam(pointIndex)) {
+        return 1.0;
+    }
+    const float travel = WaterParticleTravel(pointIndex);
+    const float seed = LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex);
+    return mix(0.72, 2.15 + seed * 0.35, smoothstep(0.0, 1.0, travel));
 }
 
 float HashWater01(uint value) {
@@ -308,6 +399,34 @@ vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
     return CatmullRomWater(p0, p1, p2, p3, t);
 }
 
+vec3 ResolveWaterFlowTangent(uint pointIndex) {
+    if (!HasWaterParticleFields()) {
+        return vec3(0.0);
+    }
+
+    const uint pathStart = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathStartFieldSlot, pointIndex) + 0.5)));
+    const uint pathCount = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathCountFieldSlot, pointIndex) + 0.5)));
+    if (pathCount < 2u || pathStart >= styleData.pointMeta.x || pathStart + pathCount > styleData.pointMeta.x) {
+        return vec3(0.0);
+    }
+
+    const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot, pointIndex);
+    uint anchorOffset = min(pointIndex > pathStart ? pointIndex - pathStart : 0u, pathCount - 1u);
+    if (!WaterPathViewEnabled() && role >= 0.5 && role < 1.5) {
+        const float pathPosition = WaterParticleTravel(pointIndex) * float(pathCount - 1u);
+        anchorOffset = min(uint(floor(pathPosition)), pathCount - 1u);
+    }
+
+    const uint prevOffset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
+    const uint nextOffset = min(anchorOffset + 1u, pathCount - 1u);
+    const float seed = LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex);
+    const float pathJitter = clamp(LoadScalarFieldValue(kWaterWidthFieldSlot, pointIndex), 0.0, 3.0);
+    const vec3 previous = JitteredWaterAnchorPosition(pathStart, pathCount, prevOffset, seed, pathJitter);
+    const vec3 next = JitteredWaterAnchorPosition(pathStart, pathCount, nextOffset, seed, pathJitter);
+    const vec3 tangent = next - previous;
+    return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(0.0);
+}
+
 float EvaluateBinding(RenderParameterBindingGpu binding, uint pointIndex) {
     if (binding.control.x == 0u) {
         return binding.constantValue.x;
@@ -338,28 +457,53 @@ vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
     if (HasWaterParticleFields()) {
         const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot, pointIndex);
         if (WaterPathViewEnabled()) {
+            if (role >= 1.5 && role < 2.5) {
+                const float confidence =
+                    styleData.globalControl.z > kWaterConfidenceFieldSlot
+                        ? clamp(LoadScalarFieldValue(kWaterConfidenceFieldSlot, pointIndex), 0.0, 1.0)
+                        : 1.0;
+                const float accumulation =
+                    styleData.globalControl.z > kWaterAccumulationFieldSlot
+                        ? clamp(LoadScalarFieldValue(kWaterAccumulationFieldSlot, pointIndex), 0.0, 1.0)
+                        : 0.0;
+                return vec2(opacity * (0.45 + confidence * 0.55), emissive * (0.45 + accumulation * 0.75));
+            }
+            if (role >= 2.5 && role < 3.5) {
+                const float confidence =
+                    styleData.globalControl.z > kWaterConfidenceFieldSlot
+                        ? clamp(LoadScalarFieldValue(kWaterConfidenceFieldSlot, pointIndex), 0.0, 1.0)
+                        : 1.0;
+                const float shimmer =
+                    0.72 + 0.28 * sin((LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex) + uniforms.depthParameters.x * 0.12) * 6.28318530718);
+                return vec2(opacity * confidence * 0.18 * shimmer, emissive * confidence * 0.22 * shimmer);
+            }
+            if (role >= 0.5 && role < 1.5) {
+                const float trailFade = WaterTrailFade(pointIndex);
+                return vec2(opacity * 0.10 * trailFade, emissive * 0.12 * trailFade);
+            }
             if (role < 1.5) {
                 return vec2(0.0);
             }
-            const float confidence =
-                styleData.globalControl.z > kWaterConfidenceFieldSlot
-                    ? clamp(LoadScalarFieldValue(kWaterConfidenceFieldSlot, pointIndex), 0.0, 1.0)
-                    : 1.0;
-            const float accumulation =
-                styleData.globalControl.z > kWaterAccumulationFieldSlot
-                    ? clamp(LoadScalarFieldValue(kWaterAccumulationFieldSlot, pointIndex), 0.0, 1.0)
-                    : 0.0;
-            return vec2(opacity * (0.35 + confidence * 0.65), emissive * (0.35 + accumulation * 0.65));
+            return vec2(0.0);
         }
         if (role < 0.5 || role >= 1.5) {
             return vec2(0.0);
         }
 
+        const float featureType = WaterFeatureType(pointIndex);
+        const float trailFade = WaterTrailFade(pointIndex);
+        if (featureType > 0.5 && featureType < 1.5) {
+            const float steamFade = WaterSteamFade(pointIndex);
+            const float lift = WaterParticleTravel(pointIndex);
+            return vec2(
+                opacity * trailFade * steamFade,
+                emissive * trailFade * steamFade * (0.35 + (1.0 - lift) * 0.65));
+        }
         const float travel = WaterParticleTravel(pointIndex);
         const float seed = LoadScalarFieldValue(kWaterJitterSeedFieldSlot, pointIndex);
         const float endFade = smoothstep(0.0, 0.08, travel) * (1.0 - smoothstep(0.92, 1.0, travel));
         const float shimmer = 0.78 + 0.22 * sin((travel + seed * 1.618) * 6.28318530718);
-        return vec2(opacity * endFade * shimmer, emissive * endFade * shimmer);
+        return vec2(opacity * endFade * shimmer * trailFade, emissive * endFade * shimmer * trailFade);
     }
 
     const float phase = LoadScalarFieldValue(kWaterPhaseFieldSlot, pointIndex);
@@ -412,8 +556,25 @@ void ResolveBasis(
     bool useNormal = styleData.pointMeta.z != 0u && !forceCameraFacing;
     vec3 normal = useNormal ? surfelNormals.normals[pointIndex].xyz : vec3(0.0);
     useNormal = useNormal && dot(normal, normal) > 1e-8;
+    const float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
 
     if (!useNormal) {
+        normal = uniforms.cameraPosition.xyz - center;
+        if (dot(normal, normal) <= 1e-8) {
+            normal = normalize(cross(cameraRight, cameraUp));
+        } else {
+            normal = normalize(normal);
+        }
+        if (waterStreakAspect > 1.0001) {
+            tangent = ResolveWaterFlowTangent(pointIndex);
+            tangent -= normal * dot(tangent, normal);
+            if (dot(tangent, tangent) > 1e-8) {
+                tangent = normalize(tangent);
+                bitangent = normalize(cross(normal, tangent));
+                surfaceAngleMask = 0.0;
+                return;
+            }
+        }
         tangent = cameraRight;
         bitangent = cameraUp;
         surfaceAngleMask = 0.0;
@@ -422,6 +583,15 @@ void ResolveBasis(
 
     normal = normalize(normal);
     surfaceAngleMask = clamp(1.0 - abs(dot(normal, normalize(uniforms.cameraPosition.xyz - center))), 0.0, 1.0);
+    if (waterStreakAspect > 1.0001) {
+        tangent = ResolveWaterFlowTangent(pointIndex);
+        tangent -= normal * dot(tangent, normal);
+        if (dot(tangent, tangent) > 1e-8) {
+            tangent = normalize(tangent);
+            bitangent = normalize(cross(normal, tangent));
+            return;
+        }
+    }
     tangent = cameraRight - (normal * dot(cameraRight, normal));
     if (dot(tangent, tangent) <= 1e-8) {
         tangent = cameraUp - (normal * dot(cameraUp, normal));
@@ -486,23 +656,33 @@ void main() {
 
     const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
     const float centerDepth = -centerViewPosition.z;
+    float centerPreviewTint = 0.0;
+    const float centerCaustic = ResolveCausticStrength(center, pointIndex, centerPreviewTint);
     const float diameter =
-        max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex)) +
+        max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex)) *
+            WaterPathPointSizeScale(pointIndex) *
+            WaterSteamSizeScale(pointIndex) *
+            (1.0 + centerCaustic * max(0.0, styleData.causticParams1.w)) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
-    const vec3 offset = (tangent * corner.x + bitangent * corner.y) * (diameter * 0.5);
+    const float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
+    const vec3 offset = (tangent * corner.x * waterStreakAspect + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
     const vec4 viewPosition = uniforms.view * worldPosition;
+    float previewTint = 0.0;
+    const float caustic = ResolveCausticStrength(worldPosition.xyz, pointIndex, previewTint);
 
     gl_Position = uniforms.viewProjection * worldPosition;
 
-    outSourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
+    const vec4 sourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
+    outSourceColor =
+        vec4(mix(sourceColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)), sourceColor.a);
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding, pointIndex);
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
         EvaluateBinding(styleData.opacityBinding, pointIndex),
         EvaluateBinding(styleData.emissiveBinding, pointIndex),
         pointIndex);
-    outOpacity = animatedFlow.x;
-    outEmissive = animatedFlow.y;
+    outOpacity = clamp(animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)), 0.0, 4.0);
+    outEmissive = animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y);
     outXray = EvaluateBinding(styleData.xrayBinding, pointIndex);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;
@@ -510,4 +690,5 @@ void main() {
     outPointIndex = pointIndex;
     outSurfaceAngleMask = surfaceAngleMask;
     outAovNormal = ResolveAovNormal(pointIndex);
+    outCaustic = CausticColorSignal(caustic, previewTint);
 }

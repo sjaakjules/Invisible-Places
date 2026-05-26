@@ -21,13 +21,15 @@ std::string LowercaseCopy(std::string value) {
     return value;
 }
 
-std::vector<std::filesystem::path> SortedDirectoryFiles(const std::filesystem::path& root) {
+std::vector<std::filesystem::path> SortedDataFiles(const std::filesystem::path& root) {
     std::vector<std::filesystem::path> files;
     if (!std::filesystem::exists(root)) {
         return files;
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator{root}) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator{
+             root,
+             std::filesystem::directory_options::skip_permission_denied}) {
         if (!entry.is_regular_file()) {
             continue;
         }
@@ -90,12 +92,13 @@ AssetCatalog DiscoverAssets(const std::filesystem::path& dataRoot) {
         return catalog;
     }
 
-    std::map<std::string, std::filesystem::path> transformsByStem;
-    const auto files = SortedDirectoryFiles(dataRoot);
+    std::map<std::filesystem::path, std::map<std::string, std::filesystem::path>> transformsByDirectoryAndStem;
+    const auto files = SortedDataFiles(dataRoot);
 
     for (const auto& filePath : files) {
         if (filePath.extension() == ".txt") {
-            transformsByStem[LowercaseCopy(filePath.stem().string())] = filePath;
+            transformsByDirectoryAndStem[filePath.parent_path()][LowercaseCopy(filePath.stem().string())] =
+                filePath;
         }
     }
 
@@ -115,8 +118,15 @@ AssetCatalog DiscoverAssets(const std::filesystem::path& dataRoot) {
         const bool looksLikeGsplat = filenameHintsGsplat || headerResult.header.LooksLikeGaussianSplat();
 
         if (looksLikeGsplat) {
-            const auto transformIt = transformsByStem.find(LowercaseCopy(filePath.stem().string()));
-            if (transformIt == transformsByStem.end()) {
+            const auto directoryIt = transformsByDirectoryAndStem.find(filePath.parent_path());
+            if (directoryIt == transformsByDirectoryAndStem.end()) {
+                catalog.issues.push_back(
+                    {.filePath = filePath, .message = "Missing same-stem transform matrix .txt file."});
+                continue;
+            }
+
+            const auto transformIt = directoryIt->second.find(LowercaseCopy(filePath.stem().string()));
+            if (transformIt == directoryIt->second.end()) {
                 catalog.issues.push_back(
                     {.filePath = filePath, .message = "Missing same-stem transform matrix .txt file."});
                 continue;

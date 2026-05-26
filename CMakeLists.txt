@@ -68,6 +68,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_raycast_composite.comp
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_caustics.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
 )
@@ -104,6 +105,7 @@ configure_file(
 add_library(
     invisible_places_core
     src/app/Application.cpp
+    src/app/PointVisualSelection.cpp
     src/camera/AnimationPath.cpp
     src/camera/CameraPath.cpp
     src/camera/OrbitCamera.cpp

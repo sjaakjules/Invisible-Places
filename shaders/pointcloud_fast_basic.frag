@@ -4,6 +4,8 @@
 
 layout(location = 0) in vec4 inSourceColor;
 layout(location = 2) flat in uint inPointIndex;
+layout(location = 3) in vec3 inWorldPosition;
+layout(location = 4) in vec3 inPointNormal;
 
 layout(location = 0) out vec4 outColor;
 
@@ -39,12 +41,22 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams0;
     vec4 stylisationParams1;
     vec4 stylisationParams2;
+    vec4 surfaceMotionParams;
+    vec4 surfaceMotionStats;
+    uvec4 causticControl;
+    vec4 causticParams0;
+    vec4 causticParams1;
+    vec4 causticParams2;
+    vec4 causticTint;
+    vec4 gradientStartColor;
+    vec4 gradientEndColor;
 } styleData;
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
 const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterJitterSeedFieldSlot = 12u;
+const uint kWaterTrailAgeFieldSlot = 13u;
 
 float LoadScalarFieldValue(uint fieldSlot) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -54,6 +66,30 @@ float LoadScalarFieldValue(uint fieldSlot) {
         return 0.0;
     }
     return scalarFieldValues.values[(fieldSlot * styleData.pointMeta.x) + inPointIndex];
+}
+
+#include "pointcloud_caustics.glsl"
+
+float ResolveCausticStrength(out float previewTint) {
+    previewTint = 0.0;
+    if (styleData.causticControl.x == 0u ||
+        styleData.causticControl.y == 0u ||
+        styleData.causticControl.z == 0u ||
+        styleData.causticControl.w == 0u) {
+        return 0.0;
+    }
+    const float mask = clamp(LoadScalarFieldValue(styleData.causticControl.y - 1u), 0.0, 1.0);
+    if (mask <= 1e-5) {
+        return 0.0;
+    }
+    const float edge = clamp(LoadScalarFieldValue(styleData.causticControl.z - 1u), 0.0, 1.0);
+    const float seed = LoadScalarFieldValue(styleData.causticControl.w - 1u);
+    previewTint = CausticPreviewTint(mask, edge, seed);
+    const float time = styleData.renderParams3.w * max(0.0, styleData.causticParams0.z);
+    const vec2 metersUv = CausticSurfaceUv(inWorldPosition, inPointNormal);
+    const float ridge = CausticVoronoiRidge(metersUv, seed, time, edge);
+    const float edgeGate = CausticEdgeGate(metersUv, edge, seed);
+    return clamp(ridge * mask * edgeGate * max(0.0, styleData.causticParams0.x), 0.0, 6.0);
 }
 
 float EvaluateBinding(RenderParameterBindingGpu binding) {
@@ -144,23 +180,38 @@ vec3 ResolveBaseColor() {
     if (styleData.globalControl.x == 0u && styleData.globalControl.w != 0u) {
         baseColor = inSourceColor.rgb;
     } else if (styleData.globalControl.x == 2u) {
-        baseColor = ApplyPointCloudColormap(
+        baseColor = ApplyPointCloudColormapOrGradient(
             styleData.globalControl.y,
-            clamp(EvaluateBinding(styleData.colormapPositionBinding), 0.0, 1.0));
+            clamp(EvaluateBinding(styleData.colormapPositionBinding), 0.0, 1.0),
+            styleData.gradientStartColor.rgb,
+            styleData.gradientEndColor.rgb);
     }
-    return ApplyColorize(baseColor);
+    baseColor = ApplyColorize(baseColor);
+    float previewTint = 0.0;
+    const float caustic = ResolveCausticStrength(previewTint);
+    return mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint));
 }
 
 void main() {
+    float waterTrailFade = 1.0;
     if (styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot) {
         const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot);
         if (styleData.pointMeta.w == 2u) {
-            if (role < 1.5) {
+            if (!((role >= 0.5 && role < 1.5) || (role >= 1.5 && role < 2.5) || (role >= 2.5 && role < 3.5))) {
                 discard;
+            }
+            if (role >= 2.5 && role < 3.5) {
+                waterTrailFade = 0.28;
+            } else if (role >= 0.5 && role < 1.5) {
+                waterTrailFade = 0.18;
             }
         } else if (role < 0.5 || role >= 1.5) {
             discard;
         }
+        if (styleData.pointMeta.w != 2u && styleData.globalControl.z > kWaterTrailAgeFieldSlot) {
+            const float age = clamp(LoadScalarFieldValue(kWaterTrailAgeFieldSlot), 0.0, 1.0);
+            waterTrailFade = 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, age), 1.35);
+        }
     }
-    outColor = vec4(ResolveBaseColor(), 1.0);
+    outColor = vec4(ResolveBaseColor() * waterTrailFade, 1.0);
 }

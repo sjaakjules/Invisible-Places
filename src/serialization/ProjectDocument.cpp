@@ -35,15 +35,26 @@ using invisible_places::style::FieldMapConfig;
 using invisible_places::style::ParameterSourceMode;
 using invisible_places::style::RenderParameterBinding;
 using invisible_places::water::WaterBakeSettings;
+using invisible_places::water::WaterCausticLookSettings;
+using invisible_places::water::WaterCausticPreviewTintMode;
+using invisible_places::water::WaterCausticRegion;
 using invisible_places::water::WaterEmitter;
 using invisible_places::water::WaterEmitterOrigin;
 using invisible_places::water::WaterEmitterStatus;
 using invisible_places::water::WaterAnimationTrailSettings;
+using invisible_places::water::WaterBasinRegion;
 using invisible_places::water::WaterParticleTrailSettings;
 using invisible_places::water::WaterParticleTrailShapeSettings;
 using invisible_places::water::WaterParticleVisualSettings;
+using invisible_places::water::WaterPathAutoTuneDiagnostics;
+using invisible_places::water::WaterPathBranch;
+using invisible_places::water::WaterPathBranchRole;
+using invisible_places::water::WaterPathCache;
 using invisible_places::water::WaterPathGenerationSettings;
+using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
+using invisible_places::water::WaterRunoffMode;
+using invisible_places::water::WaterRunoffRegion;
 using invisible_places::water::WaterScaleMode;
 using invisible_places::water::WaterSettingsBundle;
 using invisible_places::water::WaterSourceSettingsAssignment;
@@ -56,6 +67,8 @@ json SerializeWaterSourceSettings(const WaterSourceSettings& settings);
 WaterSourceSettings ParseWaterSourceSettings(const json& settingsJson);
 json SerializeWaterAnimationTrailSettings(const WaterAnimationTrailSettings& settings);
 WaterAnimationTrailSettings ParseWaterAnimationTrailSettings(const json& settingsJson);
+json SerializeWaterCausticLookSettings(const WaterCausticLookSettings& settings);
+WaterCausticLookSettings ParseWaterCausticLookSettings(const json& settingsJson);
 json SerializeWaterVisualSettings(const WaterVisualSettings& settings);
 WaterVisualSettings ParseWaterVisualSettings(const json& settingsJson);
 PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& visualSettings);
@@ -134,6 +147,8 @@ const char* PointCloudColormapName(PointCloudColormapId colormap) {
             return "exponential_ice";
         case PointCloudColormapId::HighContrast:
             return "high_contrast";
+        case PointCloudColormapId::CustomGradient:
+            return "custom_gradient";
     }
 
     return "viridis";
@@ -170,6 +185,9 @@ PointCloudColormapId ParsePointCloudColormap(const json& value) {
     }
     if (colormapName == "high_contrast") {
         return PointCloudColormapId::HighContrast;
+    }
+    if (colormapName == "custom_gradient" || colormapName == "custom") {
+        return PointCloudColormapId::CustomGradient;
     }
     return PointCloudColormapId::Viridis;
 }
@@ -495,6 +513,8 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"color_mode", PointCloudColorModeName(style.colorMode)},
         {"colormap", PointCloudColormapName(style.colormap)},
         {"solid_color", style.solidColor},
+        {"gradient_start_color", style.gradientStartColor},
+        {"gradient_end_color", style.gradientEndColor},
         {"colorize_color", style.colorizeColor},
         {"colorize_amount", style.colorizeAmount},
         {"stylisation_strength", style.stylisationStrength},
@@ -514,6 +534,24 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"roughness_motion_speed", style.roughnessMotionSpeed},
         {"roughness_motion_threshold", style.roughnessMotionThreshold},
         {"roughness_motion_ground_id", style.roughnessMotionGroundId},
+        {"caustic_animation", style.causticAnimation},
+        {"caustic_intensity", style.causticIntensity},
+        {"caustic_scale", style.causticScale},
+        {"caustic_speed", style.causticSpeed},
+        {"caustic_line_sharpness", style.causticLineSharpness},
+        {"caustic_warp", style.causticWarp},
+        {"caustic_cell_size_meters", style.causticCellSizeMeters},
+        {"caustic_line_width_meters", style.causticLineWidthMeters},
+        {"caustic_feather_meters", style.causticFeatherMeters},
+        {"caustic_surface_point_spacing_meters", style.causticSurfacePointSpacingMeters},
+        {"caustic_warp_amplitude_meters", style.causticWarpAmplitudeMeters},
+        {"caustic_tint", style.causticTint},
+        {"caustic_emission_boost", style.causticEmissionBoost},
+        {"caustic_opacity_boost", style.causticOpacityBoost},
+        {"caustic_point_size_boost", style.causticPointSizeBoost},
+        {"caustic_mask_field_slot", style.causticMaskFieldSlot},
+        {"caustic_edge_field_slot", style.causticEdgeFieldSlot},
+        {"caustic_seed_field_slot", style.causticSeedFieldSlot},
         {"exposure", style.exposure},
         {"inner_radius", style.innerRadius},
         {"gaussian_sharpness", style.gaussianSharpness},
@@ -524,6 +562,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"hidden_alpha", style.hiddenAlpha},
         {"density_scale", style.densityScale},
         {"density_clamp", style.densityClamp},
+        {"water_streak_aspect", style.waterStreakAspect},
         {"depth_alpha_threshold", style.depthAlphaThreshold},
         {"solid_centers", style.solidCenters},
         {"flow_animation", style.flowAnimation},
@@ -589,6 +628,12 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     if (styleJson.contains("solid_color")) {
         style.solidColor = styleJson.at("solid_color").get<std::array<float, 4>>();
     }
+    if (styleJson.contains("gradient_start_color")) {
+        style.gradientStartColor = styleJson.at("gradient_start_color").get<std::array<float, 3>>();
+    }
+    if (styleJson.contains("gradient_end_color")) {
+        style.gradientEndColor = styleJson.at("gradient_end_color").get<std::array<float, 3>>();
+    }
     if (styleJson.contains("colorize_color")) {
         style.colorizeColor = styleJson.at("colorize_color").get<std::array<float, 3>>();
     } else if (styleJson.contains("colourise_color")) {
@@ -639,6 +684,62 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
         std::clamp(styleJson.value("roughness_motion_threshold", style.roughnessMotionThreshold), 0.0F, 1.0F);
     style.roughnessMotionGroundId =
         std::clamp(styleJson.value("roughness_motion_ground_id", style.roughnessMotionGroundId), 0.0F, 1.0F);
+    style.causticAnimation = styleJson.value("caustic_animation", style.causticAnimation);
+    style.causticIntensity = std::clamp(styleJson.value("caustic_intensity", style.causticIntensity), 0.0F, 5.0F);
+    style.causticScale = std::clamp(styleJson.value("caustic_scale", style.causticScale), 0.01F, 80.0F);
+    style.causticSpeed = std::clamp(styleJson.value("caustic_speed", style.causticSpeed), 0.0F, 10.0F);
+    style.causticLineSharpness =
+        std::clamp(styleJson.value("caustic_line_sharpness", style.causticLineSharpness), 0.0F, 1.0F);
+    style.causticWarp = std::clamp(styleJson.value("caustic_warp", style.causticWarp), 0.0F, 3.0F);
+    const bool hasLegacyCausticPattern =
+        styleJson.contains("caustic_scale") ||
+        styleJson.contains("caustic_line_sharpness") ||
+        styleJson.contains("caustic_warp");
+    const float legacyCausticCellSize = 1.0F / std::max(0.01F, style.causticScale);
+    const float legacyCausticLineWidth =
+        legacyCausticCellSize *
+        (0.16F + (0.025F - 0.16F) * std::clamp(style.causticLineSharpness, 0.0F, 1.0F));
+    style.causticCellSizeMeters = std::clamp(
+        styleJson.value(
+            "caustic_cell_size_meters",
+            hasLegacyCausticPattern ? legacyCausticCellSize : style.causticCellSizeMeters),
+        0.005F,
+        5.0F);
+    style.causticLineWidthMeters = std::clamp(
+        styleJson.value(
+            "caustic_line_width_meters",
+            hasLegacyCausticPattern ? legacyCausticLineWidth : style.causticLineWidthMeters),
+        0.0005F,
+        0.50F);
+    style.causticFeatherMeters = std::clamp(
+        styleJson.value(
+            "caustic_feather_meters",
+            hasLegacyCausticPattern ? style.causticLineWidthMeters * 0.4F : style.causticFeatherMeters),
+        0.0005F,
+        0.50F);
+    style.causticSurfacePointSpacingMeters = std::clamp(
+        styleJson.value("caustic_surface_point_spacing_meters", style.causticSurfacePointSpacingMeters),
+        0.0005F,
+        0.10F);
+    style.causticWarpAmplitudeMeters = std::clamp(
+        styleJson.value(
+            "caustic_warp_amplitude_meters",
+            hasLegacyCausticPattern ? legacyCausticCellSize * style.causticWarp * 0.5F
+                                    : style.causticWarpAmplitudeMeters),
+        0.0F,
+        2.0F);
+    if (styleJson.contains("caustic_tint")) {
+        style.causticTint = styleJson.at("caustic_tint").get<std::array<float, 3>>();
+    }
+    style.causticEmissionBoost =
+        std::clamp(styleJson.value("caustic_emission_boost", style.causticEmissionBoost), 0.0F, 8.0F);
+    style.causticOpacityBoost =
+        std::clamp(styleJson.value("caustic_opacity_boost", style.causticOpacityBoost), 0.0F, 2.0F);
+    style.causticPointSizeBoost =
+        std::clamp(styleJson.value("caustic_point_size_boost", style.causticPointSizeBoost), 0.0F, 4.0F);
+    style.causticMaskFieldSlot = styleJson.value("caustic_mask_field_slot", style.causticMaskFieldSlot);
+    style.causticEdgeFieldSlot = styleJson.value("caustic_edge_field_slot", style.causticEdgeFieldSlot);
+    style.causticSeedFieldSlot = styleJson.value("caustic_seed_field_slot", style.causticSeedFieldSlot);
     style.exposure = styleJson.value("exposure", style.exposure);
     style.innerRadius = styleJson.value("inner_radius", style.innerRadius);
     style.gaussianSharpness = styleJson.value("gaussian_sharpness", style.gaussianSharpness);
@@ -649,6 +750,7 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.hiddenAlpha = styleJson.value("hidden_alpha", style.hiddenAlpha);
     style.densityScale = styleJson.value("density_scale", style.densityScale);
     style.densityClamp = styleJson.value("density_clamp", style.densityClamp);
+    style.waterStreakAspect = std::clamp(styleJson.value("water_streak_aspect", style.waterStreakAspect), 1.0F, 32.0F);
     style.depthAlphaThreshold = styleJson.value("depth_alpha_threshold", style.depthAlphaThreshold);
     style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
     style.flowAnimation = styleJson.value("flow_animation", style.flowAnimation);
@@ -950,7 +1052,7 @@ AnimationExportSettings ParseAnimationExportSettings(const json& settingsJson) {
 
 json SerializeAnimationPath(const AnimationPath& path) {
     json pathJson{
-        {"schema_version", 6U},
+        {"schema_version", 7U},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
         {"associated_layer_paths", SerializePathArray(path.associatedLayerPaths)},
@@ -969,11 +1071,13 @@ json SerializeAnimationPath(const AnimationPath& path) {
         pathJson["temp_water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(path.tempWaterAnimationTrailSettings.value());
     }
-    if (path.waterPointVisualStyle.has_value()) {
-        pathJson["water_point_visual_style"] = SerializePointCloudStyle(path.waterPointVisualStyle.value());
+    if (path.waterCausticLookSettings.has_value()) {
+        pathJson["water_caustic_look_settings"] =
+            SerializeWaterCausticLookSettings(path.waterCausticLookSettings.value());
     }
-    if (path.tempWaterPointVisualStyle.has_value()) {
-        pathJson["temp_water_point_visual_style"] = SerializePointCloudStyle(path.tempWaterPointVisualStyle.value());
+    if (path.tempWaterCausticLookSettings.has_value()) {
+        pathJson["temp_water_caustic_look_settings"] =
+            SerializeWaterCausticLookSettings(path.tempWaterCausticLookSettings.value());
     }
     for (const auto& key : path.keys) {
         pathJson["keys"].push_back(SerializeAnimationPathKey(key));
@@ -1011,6 +1115,14 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     }
     if (pathJson.contains("temp_water_point_visual_style")) {
         path.tempWaterPointVisualStyle = ParsePointCloudStyle(pathJson.at("temp_water_point_visual_style"));
+    }
+    if (pathJson.contains("water_caustic_look_settings")) {
+        path.waterCausticLookSettings =
+            ParseWaterCausticLookSettings(pathJson.at("water_caustic_look_settings"));
+    }
+    if (pathJson.contains("temp_water_caustic_look_settings")) {
+        path.tempWaterCausticLookSettings =
+            ParseWaterCausticLookSettings(pathJson.at("temp_water_caustic_look_settings"));
     }
     if (pathJson.contains("water_visual_settings")) {
         path.waterVisualSettings = ParseWaterVisualSettings(pathJson.at("water_visual_settings"));
@@ -1274,13 +1386,209 @@ WaterEmitter ParseWaterEmitter(const json& emitterJson) {
     return emitter;
 }
 
+json SerializeWaterRegionVertices(const std::vector<invisible_places::io::Float3>& vertices) {
+    json verticesJson = json::array();
+    for (const auto& vertex : vertices) {
+        verticesJson.push_back(std::array<float, 3>{vertex.x, vertex.y, vertex.z});
+    }
+    return verticesJson;
+}
+
+std::vector<invisible_places::io::Float3> ParseWaterRegionVertices(const json& verticesJson) {
+    std::vector<invisible_places::io::Float3> vertices;
+    if (!verticesJson.is_array()) {
+        return vertices;
+    }
+    vertices.reserve(verticesJson.size());
+    for (const auto& vertexJson : verticesJson) {
+        const auto vertex = vertexJson.get<std::array<float, 3>>();
+        vertices.push_back({vertex[0], vertex[1], vertex[2]});
+    }
+    return vertices;
+}
+
+const char* WaterRunoffModeName(WaterRunoffMode mode) {
+    switch (mode) {
+        case WaterRunoffMode::LightRain:
+            return "light_rain";
+        case WaterRunoffMode::Dew:
+            return "dew";
+    }
+    return "dew";
+}
+
+WaterRunoffMode ParseWaterRunoffMode(const json& modeJson) {
+    const auto modeName = modeJson.get<std::string>();
+    if (modeName == "light_rain") {
+        return WaterRunoffMode::LightRain;
+    }
+    return WaterRunoffMode::Dew;
+}
+
+const char* WaterCausticPreviewTintModeName(WaterCausticPreviewTintMode mode) {
+    switch (mode) {
+        case WaterCausticPreviewTintMode::Off:
+            return "off";
+        case WaterCausticPreviewTintMode::PulseAfterRefresh:
+            return "pulse_after_refresh";
+        case WaterCausticPreviewTintMode::Always:
+            return "always";
+    }
+    return "pulse_after_refresh";
+}
+
+WaterCausticPreviewTintMode ParseWaterCausticPreviewTintMode(const json& modeJson) {
+    const auto modeName = modeJson.get<std::string>();
+    if (modeName == "off") {
+        return WaterCausticPreviewTintMode::Off;
+    }
+    if (modeName == "always") {
+        return WaterCausticPreviewTintMode::Always;
+    }
+    return WaterCausticPreviewTintMode::PulseAfterRefresh;
+}
+
+json SerializeWaterBasinRegion(const WaterBasinRegion& region) {
+    json regionJson{
+        {"id", region.id},
+        {"name", region.name},
+        {"vertices", SerializeWaterRegionVertices(region.vertices)},
+        {"hull", SerializeWaterRegionVertices(region.hull)},
+        {"base_z", region.baseZ},
+        {"height_above", region.heightAbove},
+        {"depth_below", region.depthBelow},
+        {"density", region.density},
+        {"outlet_blocked", region.outletBlocked},
+    };
+    if (region.outletEdgeIndex.has_value()) {
+        regionJson["outlet_edge_index"] = region.outletEdgeIndex.value();
+    }
+    return regionJson;
+}
+
+WaterBasinRegion ParseWaterBasinRegion(const json& regionJson) {
+    WaterBasinRegion region;
+    region.id = regionJson.value("id", 0U);
+    region.name = regionJson.value("name", region.name);
+    if (regionJson.contains("vertices")) {
+        region.vertices = ParseWaterRegionVertices(regionJson.at("vertices"));
+    }
+    if (regionJson.contains("hull")) {
+        region.hull = ParseWaterRegionVertices(regionJson.at("hull"));
+    }
+    region.baseZ = regionJson.value("base_z", invisible_places::water::AverageWaterRegionZ(region.vertices));
+    region.heightAbove = std::clamp(regionJson.value("height_above", region.heightAbove), 0.0F, 20.0F);
+    region.depthBelow = std::clamp(regionJson.value("depth_below", region.depthBelow), 0.0F, 20.0F);
+    region.density = std::clamp(regionJson.value("density", region.density), 0.01F, 20.0F);
+    if (regionJson.contains("outlet_edge_index")) {
+        region.outletEdgeIndex = regionJson.at("outlet_edge_index").get<std::uint32_t>();
+    }
+    region.outletBlocked = regionJson.value("outlet_blocked", region.outletBlocked);
+    if (region.hull.empty()) {
+        invisible_places::water::RefreshWaterBasinRegionDerivedValues(&region);
+    }
+    return region;
+}
+
+json SerializeWaterRunoffRegion(const WaterRunoffRegion& region) {
+    return json{
+        {"id", region.id},
+        {"name", region.name},
+        {"vertices", SerializeWaterRegionVertices(region.vertices)},
+        {"hull", SerializeWaterRegionVertices(region.hull)},
+        {"mode", WaterRunoffModeName(region.mode)},
+        {"ground_voxel_size", region.groundVoxelSize},
+        {"high_point_fraction", region.highPointFraction},
+        {"density", region.density},
+        {"path_length", region.pathLength},
+        {"max_steps", region.maxSteps},
+    };
+}
+
+WaterRunoffRegion ParseWaterRunoffRegion(const json& regionJson) {
+    WaterRunoffRegion region;
+    region.id = regionJson.value("id", 0U);
+    region.name = regionJson.value("name", region.name);
+    if (regionJson.contains("vertices")) {
+        region.vertices = ParseWaterRegionVertices(regionJson.at("vertices"));
+    }
+    if (regionJson.contains("hull")) {
+        region.hull = ParseWaterRegionVertices(regionJson.at("hull"));
+    }
+    if (regionJson.contains("mode")) {
+        region.mode = ParseWaterRunoffMode(regionJson.at("mode"));
+    }
+    region.groundVoxelSize = std::clamp(regionJson.value("ground_voxel_size", region.groundVoxelSize), 0.03F, 10.0F);
+    region.highPointFraction = std::clamp(regionJson.value("high_point_fraction", region.highPointFraction), 0.01F, 0.95F);
+    region.density = std::clamp(regionJson.value("density", region.density), 0.01F, 20.0F);
+    region.pathLength = std::clamp(regionJson.value("path_length", region.pathLength), 0.5F, 300.0F);
+    region.maxSteps = std::clamp(regionJson.value("max_steps", region.maxSteps), 4.0F, 500.0F);
+    if (region.hull.empty()) {
+        invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&region);
+    }
+    return region;
+}
+
+json SerializeWaterCausticRegion(const WaterCausticRegion& region) {
+    return json{
+        {"id", region.id},
+        {"name", region.name},
+        {"target_layer_source_path", region.targetLayerSourcePath.generic_string()},
+        {"vertices", SerializeWaterRegionVertices(region.vertices)},
+        {"hull", SerializeWaterRegionVertices(region.hull)},
+        {"mask_voxel_size", region.maskVoxelSize},
+        {"plane_max_residual", region.planeMaxResidual},
+        {"plane_max_slope", region.planeMaxSlope},
+        {"height_band", region.heightBand},
+        {"edge_blend_width", region.edgeBlendWidth},
+        {"preview_tint_mode", WaterCausticPreviewTintModeName(region.previewTintMode)},
+        {"enabled", region.enabled},
+        {"mask_dirty", region.maskDirty},
+        {"mask_stale", region.maskStale},
+    };
+}
+
+WaterCausticRegion ParseWaterCausticRegion(const json& regionJson) {
+    WaterCausticRegion region;
+    region.id = regionJson.value("id", 0U);
+    region.name = regionJson.value("name", region.name);
+    region.targetLayerSourcePath = regionJson.value("target_layer_source_path", std::string{});
+    if (regionJson.contains("vertices")) {
+        region.vertices = ParseWaterRegionVertices(regionJson.at("vertices"));
+    }
+    if (regionJson.contains("hull")) {
+        region.hull = ParseWaterRegionVertices(regionJson.at("hull"));
+    }
+    region.maskVoxelSize = std::clamp(regionJson.value("mask_voxel_size", region.maskVoxelSize), 0.005F, 20.0F);
+    region.planeMaxResidual =
+        std::clamp(regionJson.value("plane_max_residual", region.planeMaxResidual), 0.005F, 5.0F);
+    region.planeMaxSlope = std::clamp(regionJson.value("plane_max_slope", region.planeMaxSlope), 0.02F, 5.0F);
+    region.heightBand = std::clamp(regionJson.value("height_band", region.heightBand), 0.01F, 20.0F);
+    region.edgeBlendWidth =
+        std::clamp(regionJson.value("edge_blend_width", region.edgeBlendWidth), 0.01F, 50.0F);
+    if (regionJson.contains("preview_tint_mode")) {
+        region.previewTintMode = ParseWaterCausticPreviewTintMode(regionJson.at("preview_tint_mode"));
+    }
+    region.enabled = regionJson.value("enabled", region.enabled);
+    region.maskDirty = regionJson.value("mask_dirty", region.maskDirty);
+    region.maskStale = regionJson.value("mask_stale", region.maskStale);
+    if (region.hull.empty()) {
+        invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
+    }
+    return region;
+}
+
 json SerializeWaterPathGenerationSettings(const WaterPathGenerationSettings& settings) {
     return json{
+        {"auto_tune", settings.autoTune},
         {"support_voxel_size", settings.supportVoxelSize},
         {"max_bridge_distance", settings.maxBridgeDistance},
         {"smoothing", settings.smoothing},
         {"path_length", settings.pathLength},
         {"path_sample_spacing", settings.pathSampleSpacing},
+        {"branching", settings.branching},
+        {"coverage", settings.coverage},
+        {"gap_tolerance", settings.gapTolerance},
         {"max_steps", settings.maxSteps},
         {"support_sample_limit", settings.supportSampleLimit},
     };
@@ -1292,6 +1600,7 @@ WaterPathGenerationSettings ParseWaterPathGenerationSettings(const json& setting
         settings.legacyScaleMode = ParseWaterScaleMode(settingsJson.at("scale_mode"));
         settings = invisible_places::water::DefaultWaterPathGenerationSettings(settings.legacyScaleMode);
     }
+    settings.autoTune = settingsJson.value("auto_tune", settings.autoTune);
     settings.supportVoxelSize = settingsJson.value("support_voxel_size", settings.supportVoxelSize);
     settings.maxBridgeDistance = settingsJson.value("max_bridge_distance", settings.maxBridgeDistance);
     settings.smoothing = settingsJson.value("smoothing", settings.smoothing);
@@ -1299,6 +1608,9 @@ WaterPathGenerationSettings ParseWaterPathGenerationSettings(const json& setting
     settings.pathSampleSpacing = settingsJson.value(
         "path_sample_spacing",
         settingsJson.value("path_density", settings.pathSampleSpacing));
+    settings.branching = std::clamp(settingsJson.value("branching", settings.branching), 0.0F, 1.0F);
+    settings.coverage = std::clamp(settingsJson.value("coverage", settings.coverage), 0.0F, 1.0F);
+    settings.gapTolerance = std::clamp(settingsJson.value("gap_tolerance", settings.gapTolerance), 0.0F, 1.0F);
     settings.maxSteps = settingsJson.value("max_steps", settings.maxSteps);
     settings.supportSampleLimit = settingsJson.value("support_sample_limit", settings.supportSampleLimit);
     return settings;
@@ -1330,6 +1642,12 @@ json SerializeWaterParticleTrailShapeSettings(const WaterParticleTrailShapeSetti
     return json{
         {"particle_jitter", settings.particleJitter},
         {"spline_anchor_spacing", settings.splineAnchorSpacing},
+        {"trail_lane_count", settings.trailLaneCount},
+        {"trail_looseness", settings.trailLooseness},
+        {"trail_smoothness", settings.trailSmoothness},
+        {"trail_turbulence", settings.trailTurbulence},
+        {"trail_momentum", settings.trailMomentum},
+        {"normal_turbulence_response", settings.normalTurbulenceResponse},
     };
 }
 
@@ -1339,6 +1657,30 @@ WaterParticleTrailShapeSettings ParseWaterParticleTrailShapeSettings(const json&
         std::clamp(settingsJson.value("particle_jitter", settings.particleJitter), 0.0F, 3.0F);
     settings.splineAnchorSpacing =
         std::clamp(settingsJson.value("spline_anchor_spacing", settings.splineAnchorSpacing), 0.01F, 25.0F);
+    settings.trailLaneCount =
+        std::clamp<std::uint32_t>(settingsJson.value("trail_lane_count", settings.trailLaneCount), 0U, 32U);
+    settings.trailTurbulence =
+        std::clamp(settingsJson.value("trail_turbulence", settings.trailTurbulence), 0.0F, 3.0F);
+    settings.trailMomentum =
+        std::clamp(settingsJson.value("trail_momentum", settings.trailMomentum), 0.0F, 0.98F);
+    settings.normalTurbulenceResponse =
+        std::clamp(settingsJson.value("normal_turbulence_response", settings.normalTurbulenceResponse), 0.0F, 3.0F);
+    if (settingsJson.contains("trail_looseness")) {
+        settings.trailLooseness =
+            std::clamp(settingsJson.value("trail_looseness", settings.trailLooseness), 0.0F, 1.0F);
+    } else if (
+        settingsJson.contains("trail_turbulence") ||
+        settingsJson.contains("trail_momentum") ||
+        settingsJson.contains("normal_turbulence_response")) {
+        settings.trailLooseness = std::clamp(
+            (std::clamp(settings.trailTurbulence / 1.5F, 0.0F, 1.0F) * 0.45F) +
+                (settings.trailMomentum * 0.35F) +
+                (std::clamp(settings.normalTurbulenceResponse / 1.5F, 0.0F, 1.0F) * 0.20F),
+            0.0F,
+            1.0F);
+    }
+    settings.trailSmoothness =
+        std::clamp(settingsJson.value("trail_smoothness", settings.trailSmoothness), 0.0F, 1.0F);
     return settings;
 }
 
@@ -1347,6 +1689,8 @@ json SerializeWaterAnimationTrailSettings(const WaterAnimationTrailSettings& set
         {"particle_density", settings.particleDensity},
         {"particle_speed", settings.particleSpeed},
         {"color_variation", settings.colorVariation},
+        {"trail_length_meters", settings.trailLengthMeters},
+        {"trail_sample_spacing_meters", settings.trailSampleSpacingMeters},
     };
 }
 
@@ -1358,6 +1702,111 @@ WaterAnimationTrailSettings ParseWaterAnimationTrailSettings(const json& setting
         std::clamp(settingsJson.value("particle_speed", settings.particleSpeed), 0.05F, 8.0F);
     settings.colorVariation =
         std::clamp(settingsJson.value("color_variation", settings.colorVariation), 0.0F, 1.0F);
+    settings.trailLengthMeters =
+        std::clamp(settingsJson.value("trail_length_meters", settings.trailLengthMeters), 0.0F, 25.0F);
+    settings.trailSampleSpacingMeters =
+        std::clamp(settingsJson.value("trail_sample_spacing_meters", settings.trailSampleSpacingMeters), 0.0F, 25.0F);
+    return settings;
+}
+
+json SerializeWaterAnimationTrailProfile(const WaterAnimationTrailProfileDocument& profile) {
+    return json{
+        {"name", profile.name},
+        {"settings", SerializeWaterAnimationTrailSettings(profile.settings)},
+    };
+}
+
+WaterAnimationTrailProfileDocument ParseWaterAnimationTrailProfile(const json& profileJson) {
+    WaterAnimationTrailProfileDocument profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("settings")) {
+        profile.settings = ParseWaterAnimationTrailSettings(profileJson.at("settings"));
+    }
+    return profile;
+}
+
+json SerializeWaterCausticLookSettings(const WaterCausticLookSettings& settings) {
+    return json{
+        {"enabled", settings.enabled},
+        {"intensity", settings.intensity},
+        {"scale", settings.scale},
+        {"speed", settings.speed},
+        {"line_sharpness", settings.lineSharpness},
+        {"warp", settings.warp},
+        {"cell_size_meters", settings.cellSizeMeters},
+        {"line_width_meters", settings.lineWidthMeters},
+        {"feather_meters", settings.featherMeters},
+        {"surface_point_spacing_meters", settings.surfacePointSpacingMeters},
+        {"warp_amplitude_meters", settings.warpAmplitudeMeters},
+        {"tint", std::array<float, 3>{settings.tintRed, settings.tintGreen, settings.tintBlue}},
+        {"emission_boost", settings.emissionBoost},
+        {"opacity_boost", settings.opacityBoost},
+        {"point_size_boost", settings.pointSizeBoost},
+    };
+}
+
+WaterCausticLookSettings ParseWaterCausticLookSettings(const json& settingsJson) {
+    WaterCausticLookSettings settings;
+    settings.enabled = settingsJson.value("enabled", settings.enabled);
+    settings.intensity = std::clamp(settingsJson.value("intensity", settings.intensity), 0.0F, 5.0F);
+    settings.scale = std::clamp(settingsJson.value("scale", settings.scale), 0.01F, 80.0F);
+    settings.speed = std::clamp(settingsJson.value("speed", settings.speed), 0.0F, 10.0F);
+    settings.lineSharpness = std::clamp(settingsJson.value("line_sharpness", settings.lineSharpness), 0.0F, 1.0F);
+    settings.warp = std::clamp(settingsJson.value("warp", settings.warp), 0.0F, 3.0F);
+    const bool hasLegacyPattern =
+        settingsJson.contains("scale") ||
+        settingsJson.contains("line_sharpness") ||
+        settingsJson.contains("warp");
+    const bool hasCellSize = settingsJson.contains("cell_size_meters");
+    const bool hasLineWidth = settingsJson.contains("line_width_meters");
+    const bool hasFeather = settingsJson.contains("feather_meters");
+    const bool hasPointSpacing = settingsJson.contains("surface_point_spacing_meters");
+    const bool hasWarpAmplitude = settingsJson.contains("warp_amplitude_meters");
+    const float legacyCellSize = 1.0F / std::max(0.01F, settings.scale);
+    const float legacyLineWidth =
+        legacyCellSize * (0.16F + (0.025F - 0.16F) * std::clamp(settings.lineSharpness, 0.0F, 1.0F));
+    settings.cellSizeMeters = std::clamp(
+        settingsJson.value(
+            "cell_size_meters",
+            !hasCellSize && hasLegacyPattern ? legacyCellSize : settings.cellSizeMeters),
+        0.005F,
+        5.0F);
+    settings.lineWidthMeters = std::clamp(
+        settingsJson.value(
+            "line_width_meters",
+            !hasLineWidth && hasLegacyPattern ? legacyLineWidth : settings.lineWidthMeters),
+        0.0005F,
+        0.50F);
+    settings.featherMeters = std::clamp(
+        settingsJson.value(
+            "feather_meters",
+            !hasFeather && hasLegacyPattern ? settings.lineWidthMeters * 0.4F : settings.featherMeters),
+        0.0005F,
+        0.50F);
+    settings.surfacePointSpacingMeters = std::clamp(
+        settingsJson.value("surface_point_spacing_meters", settings.surfacePointSpacingMeters),
+        0.0005F,
+        0.10F);
+    if (!hasPointSpacing) {
+        settings.surfacePointSpacingMeters = std::clamp(settings.surfacePointSpacingMeters, 0.001F, 0.020F);
+    }
+    settings.warpAmplitudeMeters = std::clamp(
+        settingsJson.value(
+            "warp_amplitude_meters",
+            !hasWarpAmplitude && hasLegacyPattern ? legacyCellSize * settings.warp * 0.5F
+                                                  : settings.warpAmplitudeMeters),
+        0.0F,
+        2.0F);
+    if (settingsJson.contains("tint")) {
+        const auto tint = settingsJson.at("tint").get<std::array<float, 3>>();
+        settings.tintRed = std::clamp(tint[0], 0.0F, 4.0F);
+        settings.tintGreen = std::clamp(tint[1], 0.0F, 4.0F);
+        settings.tintBlue = std::clamp(tint[2], 0.0F, 4.0F);
+    }
+    settings.emissionBoost = std::clamp(settingsJson.value("emission_boost", settings.emissionBoost), 0.0F, 8.0F);
+    settings.opacityBoost = std::clamp(settingsJson.value("opacity_boost", settings.opacityBoost), 0.0F, 2.0F);
+    settings.pointSizeBoost =
+        std::clamp(settingsJson.value("point_size_boost", settings.pointSizeBoost), 0.0F, 4.0F);
     return settings;
 }
 
@@ -1522,6 +1971,256 @@ WaterRenderSettings ParseWaterRenderSettings(const json& settingsJson) {
     return ParseWaterSettingsBundle(settingsJson);
 }
 
+std::string WaterPathBranchRoleName(WaterPathBranchRole role) {
+    switch (role) {
+        case WaterPathBranchRole::Main:
+            return "main";
+        case WaterPathBranchRole::Secondary:
+            return "secondary";
+        case WaterPathBranchRole::Spread:
+            return "spread";
+    }
+    return "main";
+}
+
+WaterPathBranchRole ParseWaterPathBranchRole(const json& roleJson) {
+    const auto roleName = roleJson.get<std::string>();
+    if (roleName == "secondary") {
+        return WaterPathBranchRole::Secondary;
+    }
+    if (roleName == "spread") {
+        return WaterPathBranchRole::Spread;
+    }
+    return WaterPathBranchRole::Main;
+}
+
+std::string WaterPathTerminationReasonName(WaterPathTerminationReason reason) {
+    switch (reason) {
+        case WaterPathTerminationReason::ReachedLength:
+            return "reached_length";
+        case WaterPathTerminationReason::NoSupport:
+            return "no_support";
+        case WaterPathTerminationReason::MaxSteps:
+            return "max_steps";
+        case WaterPathTerminationReason::Loop:
+            return "loop";
+        case WaterPathTerminationReason::Duplicate:
+            return "duplicate";
+        case WaterPathTerminationReason::Empty:
+            return "empty";
+    }
+    return "empty";
+}
+
+WaterPathTerminationReason ParseWaterPathTerminationReason(const json& reasonJson) {
+    const auto reasonName = reasonJson.get<std::string>();
+    if (reasonName == "reached_length") {
+        return WaterPathTerminationReason::ReachedLength;
+    }
+    if (reasonName == "no_support") {
+        return WaterPathTerminationReason::NoSupport;
+    }
+    if (reasonName == "max_steps") {
+        return WaterPathTerminationReason::MaxSteps;
+    }
+    if (reasonName == "loop") {
+        return WaterPathTerminationReason::Loop;
+    }
+    if (reasonName == "duplicate") {
+        return WaterPathTerminationReason::Duplicate;
+    }
+    return WaterPathTerminationReason::Empty;
+}
+
+json SerializeWaterOverlayPoint(const invisible_places::water::WaterOverlayPoint& point) {
+    return json{
+        {"position", std::array<float, 3>{point.position.x, point.position.y, point.position.z}},
+        {"rgb", std::array<std::uint32_t, 3>{point.red, point.green, point.blue}},
+        {"flow_id", point.flowId},
+        {"emitter_id", point.emitterId},
+        {"path_distance", point.pathDistance},
+        {"phase", point.phase},
+        {"speed", point.speed},
+        {"width", point.width},
+        {"confidence", point.confidence},
+        {"accumulation", point.accumulation},
+        {"pooling", point.pooling},
+        {"particle_role", point.particleRole},
+        {"path_start_index", point.pathStartIndex},
+        {"path_point_count", point.pathPointCount},
+        {"jitter_seed", point.jitterSeed},
+        {"trail_age", point.trailAge},
+        {"trail_length", point.trailLength},
+        {"feature_type", point.featureType},
+        {"region_id", point.regionId},
+        {"surface_steepness", point.surfaceSteepness},
+        {"trail_lane_id", point.trailLaneId},
+        {"trail_lateral_offset", point.trailLateralOffset},
+    };
+}
+
+invisible_places::water::WaterOverlayPoint ParseWaterOverlayPoint(const json& pointJson) {
+    invisible_places::water::WaterOverlayPoint point;
+    if (pointJson.contains("position")) {
+        const auto position = pointJson.at("position").get<std::array<float, 3>>();
+        point.position = {position[0], position[1], position[2]};
+    }
+    if (pointJson.contains("rgb")) {
+        const auto rgb = pointJson.at("rgb").get<std::array<std::uint32_t, 3>>();
+        point.red = static_cast<std::uint8_t>(std::min<std::uint32_t>(255U, rgb[0]));
+        point.green = static_cast<std::uint8_t>(std::min<std::uint32_t>(255U, rgb[1]));
+        point.blue = static_cast<std::uint8_t>(std::min<std::uint32_t>(255U, rgb[2]));
+    }
+    point.flowId = pointJson.value("flow_id", point.flowId);
+    point.emitterId = pointJson.value("emitter_id", point.emitterId);
+    point.pathDistance = pointJson.value("path_distance", point.pathDistance);
+    point.phase = pointJson.value("phase", point.phase);
+    point.speed = pointJson.value("speed", point.speed);
+    point.width = pointJson.value("width", point.width);
+    point.confidence = pointJson.value("confidence", point.confidence);
+    point.accumulation = pointJson.value("accumulation", point.accumulation);
+    point.pooling = pointJson.value("pooling", point.pooling);
+    point.particleRole = pointJson.value("particle_role", point.particleRole);
+    point.pathStartIndex = pointJson.value("path_start_index", point.pathStartIndex);
+    point.pathPointCount = pointJson.value("path_point_count", point.pathPointCount);
+    point.jitterSeed = pointJson.value("jitter_seed", point.jitterSeed);
+    point.trailAge = pointJson.value("trail_age", point.trailAge);
+    point.trailLength = pointJson.value("trail_length", point.trailLength);
+    point.featureType = pointJson.value("feature_type", point.featureType);
+    point.regionId = pointJson.value("region_id", point.regionId);
+    point.surfaceSteepness = pointJson.value("surface_steepness", point.surfaceSteepness);
+    point.trailLaneId = pointJson.value("trail_lane_id", point.trailLaneId);
+    point.trailLateralOffset = pointJson.value("trail_lateral_offset", point.trailLateralOffset);
+    return point;
+}
+
+json SerializeWaterPathDiagnostics(const WaterPathAutoTuneDiagnostics& diagnostics) {
+    return json{
+        {"estimated_point_spacing", diagnostics.estimatedPointSpacing},
+        {"support_voxel_size", diagnostics.supportVoxelSize},
+        {"max_bridge_distance", diagnostics.maxBridgeDistance},
+        {"path_sample_spacing", diagnostics.pathSampleSpacing},
+        {"branch_search_radius", diagnostics.branchSearchRadius},
+        {"average_confidence", diagnostics.averageConfidence},
+        {"iteration_count", diagnostics.iterationCount},
+        {"pilot_trace_count", diagnostics.pilotTraceCount},
+        {"branch_count", diagnostics.branchCount},
+        {"low_confidence_branch_count", diagnostics.lowConfidenceBranchCount},
+        {"summary", diagnostics.summary},
+    };
+}
+
+WaterPathAutoTuneDiagnostics ParseWaterPathDiagnostics(const json& diagnosticsJson) {
+    WaterPathAutoTuneDiagnostics diagnostics;
+    diagnostics.estimatedPointSpacing =
+        diagnosticsJson.value("estimated_point_spacing", diagnostics.estimatedPointSpacing);
+    diagnostics.supportVoxelSize = diagnosticsJson.value("support_voxel_size", diagnostics.supportVoxelSize);
+    diagnostics.maxBridgeDistance = diagnosticsJson.value("max_bridge_distance", diagnostics.maxBridgeDistance);
+    diagnostics.pathSampleSpacing = diagnosticsJson.value("path_sample_spacing", diagnostics.pathSampleSpacing);
+    diagnostics.branchSearchRadius = diagnosticsJson.value("branch_search_radius", diagnostics.branchSearchRadius);
+    diagnostics.averageConfidence = diagnosticsJson.value("average_confidence", diagnostics.averageConfidence);
+    diagnostics.iterationCount = diagnosticsJson.value("iteration_count", diagnostics.iterationCount);
+    diagnostics.pilotTraceCount = diagnosticsJson.value("pilot_trace_count", diagnostics.pilotTraceCount);
+    diagnostics.branchCount = diagnosticsJson.value("branch_count", diagnostics.branchCount);
+    diagnostics.lowConfidenceBranchCount =
+        diagnosticsJson.value("low_confidence_branch_count", diagnostics.lowConfidenceBranchCount);
+    diagnostics.summary = diagnosticsJson.value("summary", diagnostics.summary);
+    return diagnostics;
+}
+
+json SerializeWaterPathBranch(const WaterPathBranch& branch) {
+    json branchJson{
+        {"id", branch.id},
+        {"emitter_id", branch.emitterId},
+        {"role", WaterPathBranchRoleName(branch.role)},
+        {"termination_reason", WaterPathTerminationReasonName(branch.terminationReason)},
+        {"confidence", branch.confidence},
+        {"length", branch.length},
+        {"flatness", branch.flatness},
+        {"gap_count", branch.gapCount},
+        {"raw_anchors", json::array()},
+    };
+    if (branch.parentId.has_value()) {
+        branchJson["parent_id"] = branch.parentId.value();
+    }
+    for (const auto& point : branch.rawAnchors) {
+        branchJson["raw_anchors"].push_back(SerializeWaterOverlayPoint(point));
+    }
+    return branchJson;
+}
+
+WaterPathBranch ParseWaterPathBranch(const json& branchJson) {
+    WaterPathBranch branch;
+    branch.id = branchJson.value("id", 0U);
+    if (branchJson.contains("parent_id")) {
+        branch.parentId = branchJson.at("parent_id").get<std::uint32_t>();
+    }
+    branch.emitterId = branchJson.value("emitter_id", 0U);
+    if (branchJson.contains("role")) {
+        branch.role = ParseWaterPathBranchRole(branchJson.at("role"));
+    }
+    if (branchJson.contains("termination_reason")) {
+        branch.terminationReason = ParseWaterPathTerminationReason(branchJson.at("termination_reason"));
+    }
+    branch.confidence = branchJson.value("confidence", branch.confidence);
+    branch.length = branchJson.value("length", branch.length);
+    branch.flatness = branchJson.value("flatness", branch.flatness);
+    branch.gapCount = branchJson.value("gap_count", branch.gapCount);
+    if (branchJson.contains("raw_anchors") && branchJson.at("raw_anchors").is_array()) {
+        for (const auto& pointJson : branchJson.at("raw_anchors")) {
+            branch.rawAnchors.push_back(ParseWaterOverlayPoint(pointJson));
+        }
+    }
+    return branch;
+}
+
+json SerializeWaterPathCache(const WaterPathCache& cache) {
+    json cacheJson{
+        {"schema_version", cache.schemaVersion},
+        {"support_layer_path", cache.supportLayerPath.generic_string()},
+        {"support_signature", cache.supportSignature},
+        {"emitter_settings_fingerprint", cache.emitterSettingsFingerprint},
+        {"requested_settings", SerializeWaterPathGenerationSettings(cache.requestedSettings)},
+        {"tuned_settings", SerializeWaterPathGenerationSettings(cache.tunedSettings)},
+        {"diagnostics", SerializeWaterPathDiagnostics(cache.diagnostics)},
+        {"hidden_branch_ids", cache.hiddenBranchIds},
+        {"stale", cache.stale},
+        {"branches", json::array()},
+    };
+    for (const auto& branch : cache.branches) {
+        cacheJson["branches"].push_back(SerializeWaterPathBranch(branch));
+    }
+    return cacheJson;
+}
+
+WaterPathCache ParseWaterPathCache(const json& cacheJson) {
+    WaterPathCache cache;
+    cache.schemaVersion = cacheJson.value("schema_version", 1U);
+    cache.supportLayerPath = cacheJson.value("support_layer_path", std::string{});
+    cache.supportSignature = cacheJson.value("support_signature", cache.supportSignature);
+    cache.emitterSettingsFingerprint =
+        cacheJson.value("emitter_settings_fingerprint", cache.emitterSettingsFingerprint);
+    if (cacheJson.contains("requested_settings")) {
+        cache.requestedSettings = ParseWaterPathGenerationSettings(cacheJson.at("requested_settings"));
+    }
+    if (cacheJson.contains("tuned_settings")) {
+        cache.tunedSettings = ParseWaterPathGenerationSettings(cacheJson.at("tuned_settings"));
+    }
+    if (cacheJson.contains("diagnostics")) {
+        cache.diagnostics = ParseWaterPathDiagnostics(cacheJson.at("diagnostics"));
+    }
+    if (cacheJson.contains("hidden_branch_ids") && cacheJson.at("hidden_branch_ids").is_array()) {
+        cache.hiddenBranchIds = cacheJson.at("hidden_branch_ids").get<std::vector<std::uint32_t>>();
+    }
+    cache.stale = cacheJson.value("stale", cache.stale);
+    if (cacheJson.contains("branches") && cacheJson.at("branches").is_array()) {
+        for (const auto& branchJson : cacheJson.at("branches")) {
+            cache.branches.push_back(ParseWaterPathBranch(branchJson));
+        }
+    }
+    return cache;
+}
+
 template <typename TDocument>
 bool WriteJsonDocument(
     const TDocument& document,
@@ -1595,8 +2294,29 @@ bool SaveProjectDocument(
         {"render_job", SerializeRenderJobSettings(document.renderJobSettings)},
         {"water_source_settings", SerializeWaterSourceSettings(document.waterSourceSettings)},
         {"water_animation_trail_settings", SerializeWaterAnimationTrailSettings(document.waterAnimationTrailSettings)},
-        {"water_point_visual_style", SerializePointCloudStyle(document.waterPointVisualStyle)},
+        {"water_animation_trail_profiles", json::array()},
+        {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
+        {"water_point_visuals", json::array()},
+        {"selected_water_point_visual", document.selectedWaterPointVisualName},
+        {"water_basin_regions", json::array()},
+        {"water_runoff_regions", json::array()},
+        {"water_caustic_regions", json::array()},
     };
+    for (const auto& region : document.waterBasinRegions) {
+        projectJson["water_basin_regions"].push_back(SerializeWaterBasinRegion(region));
+    }
+    for (const auto& region : document.waterRunoffRegions) {
+        projectJson["water_runoff_regions"].push_back(SerializeWaterRunoffRegion(region));
+    }
+    for (const auto& region : document.waterCausticRegions) {
+        projectJson["water_caustic_regions"].push_back(SerializeWaterCausticRegion(region));
+    }
+    for (const auto& profile : document.waterAnimationTrailProfiles) {
+        projectJson["water_animation_trail_profiles"].push_back(SerializeWaterAnimationTrailProfile(profile));
+    }
+    for (const auto& visual : document.waterPointVisuals) {
+        projectJson["water_point_visuals"].push_back(SerializePointCloudVisual(visual));
+    }
     if (document.tempWaterSourceSettings.has_value()) {
         projectJson["temp_water_source_settings"] =
             SerializeWaterSourceSettings(document.tempWaterSourceSettings.value());
@@ -1605,9 +2325,12 @@ bool SaveProjectDocument(
         projectJson["temp_water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(document.tempWaterAnimationTrailSettings.value());
     }
-    if (document.tempWaterPointVisualStyle.has_value()) {
-        projectJson["temp_water_point_visual_style"] =
-            SerializePointCloudStyle(document.tempWaterPointVisualStyle.value());
+    if (document.tempWaterCausticLookSettings.has_value()) {
+        projectJson["temp_water_caustic_look_settings"] =
+            SerializeWaterCausticLookSettings(document.tempWaterCausticLookSettings.value());
+    }
+    if (document.waterPathCache.has_value() && !document.waterPathCache->branches.empty()) {
+        projectJson["water_path_cache"] = SerializeWaterPathCache(document.waterPathCache.value());
     }
     if (document.cameraState.has_value()) {
         projectJson["camera"] = SerializeCameraState(document.cameraState.value());
@@ -1682,15 +2405,60 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterAnimationTrailSettings =
             ParseWaterAnimationTrailSettings(projectJson->at("water_animation_trail_settings"));
     }
+    if (projectJson->contains("water_caustic_look_settings")) {
+        document.waterCausticLookSettings =
+            ParseWaterCausticLookSettings(projectJson->at("water_caustic_look_settings"));
+    }
     if (projectJson->contains("temp_water_animation_trail_settings")) {
         document.tempWaterAnimationTrailSettings =
             ParseWaterAnimationTrailSettings(projectJson->at("temp_water_animation_trail_settings"));
+    }
+    if (projectJson->contains("water_animation_trail_profiles") &&
+        projectJson->at("water_animation_trail_profiles").is_array()) {
+        for (const auto& profileJson : projectJson->at("water_animation_trail_profiles")) {
+            document.waterAnimationTrailProfiles.push_back(ParseWaterAnimationTrailProfile(profileJson));
+        }
+    }
+    if (projectJson->contains("temp_water_caustic_look_settings")) {
+        document.tempWaterCausticLookSettings =
+            ParseWaterCausticLookSettings(projectJson->at("temp_water_caustic_look_settings"));
+    }
+    if (projectJson->contains("water_point_visuals") && projectJson->at("water_point_visuals").is_array()) {
+        for (const auto& visualJson : projectJson->at("water_point_visuals")) {
+            document.waterPointVisuals.push_back(ParsePointCloudVisual(visualJson));
+        }
+    }
+    document.selectedWaterPointVisualName =
+        projectJson->value("selected_water_point_visual", document.selectedWaterPointVisualName);
+    if (document.selectedWaterPointVisualName.empty()) {
+        document.selectedWaterPointVisualName = "Water Flow_preset";
     }
     if (projectJson->contains("water_point_visual_style")) {
         document.waterPointVisualStyle = ParsePointCloudStyle(projectJson->at("water_point_visual_style"));
     }
     if (projectJson->contains("temp_water_point_visual_style")) {
         document.tempWaterPointVisualStyle = ParsePointCloudStyle(projectJson->at("temp_water_point_visual_style"));
+    }
+    if (projectJson->contains("water_basin_regions") &&
+        projectJson->at("water_basin_regions").is_array()) {
+        for (const auto& regionJson : projectJson->at("water_basin_regions")) {
+            document.waterBasinRegions.push_back(ParseWaterBasinRegion(regionJson));
+        }
+    }
+    if (projectJson->contains("water_runoff_regions") &&
+        projectJson->at("water_runoff_regions").is_array()) {
+        for (const auto& regionJson : projectJson->at("water_runoff_regions")) {
+            document.waterRunoffRegions.push_back(ParseWaterRunoffRegion(regionJson));
+        }
+    }
+    if (projectJson->contains("water_caustic_regions") &&
+        projectJson->at("water_caustic_regions").is_array()) {
+        for (const auto& regionJson : projectJson->at("water_caustic_regions")) {
+            document.waterCausticRegions.push_back(ParseWaterCausticRegion(regionJson));
+        }
+    }
+    if (projectJson->contains("water_path_cache")) {
+        document.waterPathCache = ParseWaterPathCache(projectJson->at("water_path_cache"));
     }
     if (projectJson->contains("water_visual_settings")) {
         document.waterVisualSettings = ParseWaterVisualSettings(projectJson->at("water_visual_settings"));
@@ -1847,14 +2615,34 @@ bool SaveWaterSourcesDocument(
     json sourcesJson{
         {"schema_version", document.schemaVersion},
         {"water_source_settings", SerializeWaterSourceSettings(document.sourceSettings)},
+        {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.causticLookSettings)},
         {"water_emitters", json::array()},
+        {"water_basin_regions", json::array()},
+        {"water_runoff_regions", json::array()},
+        {"water_caustic_regions", json::array()},
     };
     if (document.tempSourceSettings.has_value()) {
         sourcesJson["temp_water_source_settings"] =
             SerializeWaterSourceSettings(document.tempSourceSettings.value());
     }
+    if (document.tempCausticLookSettings.has_value()) {
+        sourcesJson["temp_water_caustic_look_settings"] =
+            SerializeWaterCausticLookSettings(document.tempCausticLookSettings.value());
+    }
     for (const auto& emitter : document.emitters) {
         sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
+    }
+    for (const auto& region : document.basinRegions) {
+        sourcesJson["water_basin_regions"].push_back(SerializeWaterBasinRegion(region));
+    }
+    for (const auto& region : document.runoffRegions) {
+        sourcesJson["water_runoff_regions"].push_back(SerializeWaterRunoffRegion(region));
+    }
+    for (const auto& region : document.causticRegions) {
+        sourcesJson["water_caustic_regions"].push_back(SerializeWaterCausticRegion(region));
+    }
+    if (document.pathCache.has_value() && !document.pathCache->branches.empty()) {
+        sourcesJson["water_path_cache"] = SerializeWaterPathCache(document.pathCache.value());
     }
     return WriteJsonDocument(document, sourcesJson, outputPath, errorMessage);
 }
@@ -1874,6 +2662,14 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     }
     if (sourcesJson->contains("temp_water_source_settings")) {
         document.tempSourceSettings = ParseWaterSourceSettings(sourcesJson->at("temp_water_source_settings"));
+    }
+    if (sourcesJson->contains("water_caustic_look_settings")) {
+        document.causticLookSettings =
+            ParseWaterCausticLookSettings(sourcesJson->at("water_caustic_look_settings"));
+    }
+    if (sourcesJson->contains("temp_water_caustic_look_settings")) {
+        document.tempCausticLookSettings =
+            ParseWaterCausticLookSettings(sourcesJson->at("temp_water_caustic_look_settings"));
     }
     if (sourcesJson->contains("water_settings")) {
         document.settings = ParseWaterSettingsBundle(sourcesJson->at("water_settings"));
@@ -1919,6 +2715,27 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
         for (const auto& emitterJson : sourcesJson->at("water_emitters")) {
             document.emitters.push_back(ParseWaterEmitter(emitterJson));
         }
+    }
+    if (sourcesJson->contains("water_basin_regions") &&
+        sourcesJson->at("water_basin_regions").is_array()) {
+        for (const auto& regionJson : sourcesJson->at("water_basin_regions")) {
+            document.basinRegions.push_back(ParseWaterBasinRegion(regionJson));
+        }
+    }
+    if (sourcesJson->contains("water_runoff_regions") &&
+        sourcesJson->at("water_runoff_regions").is_array()) {
+        for (const auto& regionJson : sourcesJson->at("water_runoff_regions")) {
+            document.runoffRegions.push_back(ParseWaterRunoffRegion(regionJson));
+        }
+    }
+    if (sourcesJson->contains("water_caustic_regions") &&
+        sourcesJson->at("water_caustic_regions").is_array()) {
+        for (const auto& regionJson : sourcesJson->at("water_caustic_regions")) {
+            document.causticRegions.push_back(ParseWaterCausticRegion(regionJson));
+        }
+    }
+    if (sourcesJson->contains("water_path_cache")) {
+        document.pathCache = ParseWaterPathCache(sourcesJson->at("water_path_cache"));
     }
     return document;
 }
@@ -1975,6 +2792,31 @@ std::optional<PointCloudStylePresetDocument> LoadPointCloudStylePreset(
         document.style = ParsePointCloudStyle(presetJson->at("point_style"));
     }
     return document;
+}
+
+bool SaveWaterPathCacheDocument(
+    const invisible_places::water::WaterPathCache& document,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage) {
+    return WriteJsonDocument(document, SerializeWaterPathCache(document), outputPath, errorMessage);
+}
+
+std::optional<invisible_places::water::WaterPathCache> LoadWaterPathCacheDocument(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage) {
+    const auto cacheJson = ReadJsonDocument(inputPath, errorMessage);
+    if (!cacheJson.has_value()) {
+        return std::nullopt;
+    }
+
+    try {
+        return ParseWaterPathCache(cacheJson.value());
+    } catch (const std::exception& error) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to parse water path cache: " + std::string{error.what()};
+        }
+        return std::nullopt;
+    }
 }
 
 }  // namespace invisible_places::serialization

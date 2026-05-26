@@ -36,13 +36,18 @@ struct ProjectLayerDocument {
     std::string selectedPointVisualName = "Unnamed";
 };
 
+struct WaterAnimationTrailProfileDocument {
+    std::string name = "Unnamed";
+    invisible_places::water::WaterAnimationTrailSettings settings{};
+};
+
 struct ProjectDocument {
     struct SavedAnimation {
         std::filesystem::path filePath;
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 18;
+    std::uint32_t schemaVersion = 23;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
@@ -67,10 +72,18 @@ struct ProjectDocument {
         invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
     invisible_places::output::RenderJobSettings renderJobSettings{};
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
+    std::vector<invisible_places::water::WaterBasinRegion> waterBasinRegions;
+    std::vector<invisible_places::water::WaterRunoffRegion> waterRunoffRegions;
+    std::vector<invisible_places::water::WaterCausticRegion> waterCausticRegions;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
     invisible_places::water::WaterAnimationTrailSettings waterAnimationTrailSettings{};
     std::optional<invisible_places::water::WaterAnimationTrailSettings> tempWaterAnimationTrailSettings;
+    std::vector<WaterAnimationTrailProfileDocument> waterAnimationTrailProfiles;
+    invisible_places::water::WaterCausticLookSettings waterCausticLookSettings{};
+    std::optional<invisible_places::water::WaterCausticLookSettings> tempWaterCausticLookSettings;
+    std::vector<ProjectLayerDocument::PointVisual> waterPointVisuals;
+    std::string selectedWaterPointVisualName = "Water Flow_preset";
     invisible_places::renderer::pointcloud::PointCloudStyleState waterPointVisualStyle{};
     std::optional<invisible_places::renderer::pointcloud::PointCloudStyleState> tempWaterPointVisualStyle;
     invisible_places::water::WaterVisualSettings waterVisualSettings{};
@@ -79,6 +92,7 @@ struct ProjectDocument {
     std::optional<invisible_places::water::WaterSettingsBundle> tempWaterSettings;
     invisible_places::water::WaterBakeSettings waterBakeSettings{};
     invisible_places::water::WaterRenderSettings waterRenderSettings{};
+    std::optional<invisible_places::water::WaterPathCache> waterPathCache;
 };
 
 struct PointCloudStylePresetDocument {
@@ -88,14 +102,20 @@ struct PointCloudStylePresetDocument {
 };
 
 struct WaterSourcesDocument {
-    std::uint32_t schemaVersion = 2;
+    std::uint32_t schemaVersion = 6;
     std::vector<invisible_places::water::WaterEmitter> emitters;
+    std::vector<invisible_places::water::WaterBasinRegion> basinRegions;
+    std::vector<invisible_places::water::WaterRunoffRegion> runoffRegions;
+    std::vector<invisible_places::water::WaterCausticRegion> causticRegions;
     invisible_places::water::WaterSourceSettings sourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempSourceSettings;
+    invisible_places::water::WaterCausticLookSettings causticLookSettings{};
+    std::optional<invisible_places::water::WaterCausticLookSettings> tempCausticLookSettings;
     invisible_places::water::WaterSettingsBundle settings{};
     std::optional<invisible_places::water::WaterSettingsBundle> tempSettings;
     invisible_places::water::WaterBakeSettings bakeSettings{};
     invisible_places::water::WaterRenderSettings renderSettings{};
+    std::optional<invisible_places::water::WaterPathCache> pathCache;
 };
 
 bool SaveProjectDocument(
@@ -124,6 +144,13 @@ bool SaveWaterSourcesDocument(
     const std::filesystem::path& outputPath,
     std::string* errorMessage);
 std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage);
+bool SaveWaterPathCacheDocument(
+    const invisible_places::water::WaterPathCache& document,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage);
+std::optional<invisible_places::water::WaterPathCache> LoadWaterPathCacheDocument(
     const std::filesystem::path& inputPath,
     std::string* errorMessage);
 

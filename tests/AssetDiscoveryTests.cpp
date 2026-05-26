@@ -1,4 +1,5 @@
 #include "InvisiblePlacesBuildConfig.hpp"
+#include "app/PointVisualSelection.hpp"
 #include "camera/AnimationPath.hpp"
 #include "camera/CameraPath.hpp"
 #include "camera/CameraShot.hpp"
@@ -47,6 +48,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -54,6 +56,28 @@ namespace {
 
 std::filesystem::path DataRoot() {
     return std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
+}
+
+std::filesystem::path FindDataFileByName(std::string_view filename) {
+    const auto root = DataRoot();
+    const auto directPath = root / std::string{filename};
+    if (std::filesystem::exists(directPath)) {
+        return directPath;
+    }
+
+    if (!std::filesystem::exists(root)) {
+        return {};
+    }
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator{
+             root,
+             std::filesystem::directory_options::skip_permission_denied}) {
+        if (entry.is_regular_file() && entry.path().filename().string() == filename) {
+            return entry.path();
+        }
+    }
+
+    return {};
 }
 
 void WriteLookAtOrientation(invisible_places::camera::CameraState* state) {
@@ -314,7 +338,21 @@ std::pair<std::filesystem::path, std::filesystem::path> WriteTinyGaussianSplatFi
 }  // namespace
 
 TEST_CASE("CloudCompare point clouds expose RGB and scalar fields", "[ply][pointcloud]") {
-    const auto result = invisible_places::io::ParsePlyHeader(DataRoot() / "Site2 -5mm.ply");
+    const std::filesystem::path candidates[] = {
+        DataRoot() / "Site2 -5mm.ply",
+        DataRoot() / "Site3-Sample-Terrestrial.ply",
+    };
+    const auto candidateIt = std::find_if(
+        std::begin(candidates),
+        std::end(candidates),
+        [](const std::filesystem::path& path) {
+            return std::filesystem::exists(path);
+        });
+    if (candidateIt == std::end(candidates)) {
+        SKIP("No CloudCompare point-cloud fixture is available in the local Data directory.");
+    }
+
+    const auto result = invisible_places::io::ParsePlyHeader(*candidateIt);
 
     REQUIRE(result.success);
     CHECK(result.header.LooksLikePointCloud());
@@ -326,8 +364,14 @@ TEST_CASE("CloudCompare point clouds expose RGB and scalar fields", "[ply][point
 }
 
 TEST_CASE("Gaussian splat assets expose the expected transform pairing", "[ply][gsplat]") {
-    const auto headerResult = invisible_places::io::ParsePlyHeader(DataRoot() / "gSplat-Site3-1.ply");
-    const auto matrixResult = invisible_places::io::ParseMatrix4x4(DataRoot() / "gSplat-Site3-1.txt");
+    const auto plyPath = FindDataFileByName("gSplat-Site3-1.ply");
+    const auto matrixPath = FindDataFileByName("gSplat-Site3-1.txt");
+    if (plyPath.empty() || matrixPath.empty()) {
+        SKIP("No Gaussian splat fixture is available in the local Data directory.");
+    }
+
+    const auto headerResult = invisible_places::io::ParsePlyHeader(plyPath);
+    const auto matrixResult = invisible_places::io::ParseMatrix4x4(matrixPath);
 
     REQUIRE(headerResult.success);
     REQUIRE(matrixResult.success);
@@ -832,6 +876,7 @@ TEST_CASE("Scalar field binding evaluation matches the mapped style rules", "[st
 TEST_CASE("Point-cloud colormaps sample listed and procedural tables", "[style][colormap]") {
     using invisible_places::renderer::pointcloud::PointCloudColormapId;
     using invisible_places::renderer::pointcloud::SampleColormap;
+    using invisible_places::renderer::pointcloud::SampleGradient;
 
     auto checkColor = [](std::array<float, 3> color, std::array<float, 3> expected) {
         constexpr float tolerance = 1.0F / 255.0F;
@@ -855,6 +900,9 @@ TEST_CASE("Point-cloud colormaps sample listed and procedural tables", "[style][
     checkColor(SampleColormap(PointCloudColormapId::ExponentialFire, 1.0F), {1.0F, 1.0F, 0.92F});
     checkColor(SampleColormap(PointCloudColormapId::ExponentialIce, 1.0F), {0.96F, 1.0F, 1.0F});
     checkColor(SampleColormap(PointCloudColormapId::HighContrast, 0.5F), {0.0F, 0.82F, 0.95F});
+    checkColor(SampleGradient({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.0F), {1.0F, 0.0F, 0.0F});
+    checkColor(SampleGradient({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 1.0F), {0.0F, 0.0F, 1.0F});
+    checkColor(SampleGradient({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.25F), {0.75F, 0.0F, 0.25F});
 }
 
 TEST_CASE("Raycast BVH handles empty point layers", "[raycast][bvh]") {
@@ -946,17 +994,42 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.waterSourceSettings.path.pathLength = 4.25F;
     document.waterSourceSettings.trailShape.particleJitter = 0.64F;
     document.waterSourceSettings.trailShape.splineAnchorSpacing = 0.37F;
+    document.waterSourceSettings.trailShape.trailLaneCount = 11U;
+    document.waterSourceSettings.trailShape.trailLooseness = 0.73F;
+    document.waterSourceSettings.trailShape.trailSmoothness = 0.68F;
+    document.waterSourceSettings.trailShape.trailTurbulence = 0.82F;
+    document.waterSourceSettings.trailShape.trailMomentum = 0.44F;
+    document.waterSourceSettings.trailShape.normalTurbulenceResponse = 1.15F;
     document.waterAnimationTrailSettings = invisible_places::water::DefaultWaterAnimationTrailSettings();
     document.waterAnimationTrailSettings.particleDensity = 1.75F;
     document.waterAnimationTrailSettings.particleSpeed = 1.8F;
     document.waterAnimationTrailSettings.colorVariation = 0.48F;
-    invisible_places::style::SetScalarConstant(&document.waterPointVisualStyle.pointSize, 22.0F);
-    invisible_places::style::SetScalarConstant(&document.waterPointVisualStyle.opacity, 0.42F);
-    invisible_places::style::SetScalarConstant(&document.waterPointVisualStyle.emissiveStrength, 0.58F);
+    document.waterAnimationTrailSettings.trailLengthMeters = 1.35F;
+    document.waterAnimationTrailSettings.trailSampleSpacingMeters = 0.045F;
+    invisible_places::serialization::WaterAnimationTrailProfileDocument trailProfile;
+    trailProfile.name = "Custom Bright Ribbons";
+    trailProfile.settings = document.waterAnimationTrailSettings;
+    trailProfile.settings.particleDensity = 2.6F;
+    trailProfile.settings.trailLengthMeters = 2.4F;
+    trailProfile.settings.trailSampleSpacingMeters = 0.022F;
+    document.waterAnimationTrailProfiles.push_back(trailProfile);
+    invisible_places::renderer::pointcloud::PointCloudStyleState waterVisualStyle;
+    invisible_places::style::SetScalarConstant(&waterVisualStyle.pointSize, 22.0F);
+    invisible_places::style::SetScalarConstant(&waterVisualStyle.opacity, 0.42F);
+    invisible_places::style::SetScalarConstant(&waterVisualStyle.emissiveStrength, 0.58F);
+    waterVisualStyle.colorMode =
+        invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
+    waterVisualStyle.colormap =
+        invisible_places::renderer::pointcloud::PointCloudColormapId::CustomGradient;
+    waterVisualStyle.gradientStartColor = {0.10F, 0.20F, 0.30F};
+    waterVisualStyle.gradientEndColor = {0.85F, 0.75F, 0.25F};
+    document.waterPointVisuals.push_back({.name = "River Threads", .style = waterVisualStyle});
+    document.selectedWaterPointVisualName = "River Threads";
     document.tempWaterSourceSettings = document.waterSourceSettings;
     document.tempWaterAnimationTrailSettings = document.waterAnimationTrailSettings;
     document.tempWaterAnimationTrailSettings->particleSpeed = 2.1F;
-    document.tempWaterPointVisualStyle = document.waterPointVisualStyle;
+    document.tempWaterAnimationTrailSettings->trailLengthMeters = 1.85F;
+    document.tempWaterAnimationTrailSettings->trailSampleSpacingMeters = 0.030F;
     document.waterSettings.path = document.waterSourceSettings.path;
     document.waterSettings.trail.particleDensity = document.waterAnimationTrailSettings.particleDensity;
     document.waterSettings.trail.particleSpeed = document.waterAnimationTrailSettings.particleSpeed;
@@ -978,6 +1051,80 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     waterEmitter.status = invisible_places::water::WaterEmitterStatus::Accepted;
     waterEmitter.confidence = 0.92F;
     document.waterEmitters.push_back(waterEmitter);
+    invisible_places::water::WaterPathCache projectPathCache;
+    projectPathCache.supportLayerPath = "Data/Site2 -5mm.ply";
+    projectPathCache.supportSignature = "Data/Site2 -5mm.ply|points=2048";
+    projectPathCache.emitterSettingsFingerprint = "roundtrip-fingerprint";
+    projectPathCache.requestedSettings = document.waterSourceSettings.path;
+    projectPathCache.tunedSettings = document.waterSourceSettings.path;
+    invisible_places::water::WaterPathBranch projectBranch;
+    projectBranch.id = 31U;
+    projectBranch.emitterId = waterEmitter.id;
+    projectBranch.role = invisible_places::water::WaterPathBranchRole::Main;
+    projectBranch.length = 2.5F;
+    projectBranch.rawAnchors.push_back({
+        .position = {1.0F, 2.0F, 3.0F},
+        .normal = {0.0F, 0.0F, 1.0F},
+        .emitterId = static_cast<float>(waterEmitter.id),
+        .pathDistance = 0.0F,
+    });
+    projectBranch.rawAnchors.push_back({
+        .position = {1.5F, 2.2F, 2.6F},
+        .normal = {0.0F, 0.0F, 1.0F},
+        .emitterId = static_cast<float>(waterEmitter.id),
+        .pathDistance = 2.5F,
+    });
+    projectPathCache.branches.push_back(projectBranch);
+    projectPathCache.hiddenBranchIds.push_back(99U);
+    document.waterPathCache = projectPathCache;
+    invisible_places::water::WaterBasinRegion basinRegion;
+    basinRegion.id = 4;
+    basinRegion.name = "Carved basin";
+    basinRegion.vertices = {{0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 1.1F}, {0.0F, 1.0F, 0.9F}};
+    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&basinRegion);
+    basinRegion.heightAbove = 0.45F;
+    basinRegion.depthBelow = 0.32F;
+    basinRegion.density = 1.8F;
+    basinRegion.outletEdgeIndex = 1U;
+    basinRegion.outletBlocked = false;
+    document.waterBasinRegions.push_back(basinRegion);
+    invisible_places::water::WaterRunoffRegion runoffRegion;
+    runoffRegion.id = 6;
+    runoffRegion.name = "Ridge dew";
+    runoffRegion.vertices = {{2.0F, 0.0F, 2.0F}, {3.0F, 0.0F, 2.1F}, {2.0F, 1.0F, 1.9F}};
+    runoffRegion.mode = invisible_places::water::WaterRunoffMode::LightRain;
+    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&runoffRegion);
+    runoffRegion.groundVoxelSize = 0.55F;
+    runoffRegion.highPointFraction = 0.33F;
+    runoffRegion.density = 2.2F;
+    document.waterRunoffRegions.push_back(runoffRegion);
+    document.waterCausticLookSettings = invisible_places::water::DefaultWaterCausticLookSettings();
+    document.waterCausticLookSettings.enabled = true;
+    document.waterCausticLookSettings.intensity = 1.25F;
+    document.waterCausticLookSettings.scale = 5.5F;
+    document.waterCausticLookSettings.speed = 0.9F;
+    document.waterCausticLookSettings.cellSizeMeters = 0.18F;
+    document.waterCausticLookSettings.lineWidthMeters = 0.012F;
+    document.waterCausticLookSettings.featherMeters = 0.004F;
+    document.waterCausticLookSettings.surfacePointSpacingMeters = 0.003F;
+    document.waterCausticLookSettings.warpAmplitudeMeters = 0.035F;
+    document.waterCausticLookSettings.tintBlue = 1.35F;
+    document.tempWaterCausticLookSettings = document.waterCausticLookSettings;
+    document.tempWaterCausticLookSettings->warp = 0.8F;
+    document.tempWaterCausticLookSettings->warpAmplitudeMeters = 0.055F;
+    invisible_places::water::WaterCausticRegion causticRegion;
+    causticRegion.id = 8;
+    causticRegion.name = "Rock pool caustics";
+    causticRegion.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    causticRegion.vertices = {{0.0F, 0.0F, 0.2F}, {1.0F, 0.0F, 0.25F}, {0.0F, 1.0F, 0.15F}};
+    causticRegion.maskVoxelSize = 0.50F;
+    causticRegion.heightBand = 0.30F;
+    causticRegion.edgeBlendWidth = 0.70F;
+    causticRegion.previewTintMode = invisible_places::water::WaterCausticPreviewTintMode::Always;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&causticRegion);
+    causticRegion.maskDirty = false;
+    causticRegion.maskStale = false;
+    document.waterCausticRegions.push_back(causticRegion);
     document.cameraPathShotIndices = {0, 0};
     document.cameraPathDurationFrames = 144;
     document.hasSavedAnimationRegistry = true;
@@ -1053,6 +1200,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.hiddenAlpha = 0.09F;
     pointStyle.densityScale = 1.75F;
     pointStyle.densityClamp = 96.0F;
+    pointStyle.waterStreakAspect = 7.5F;
     pointStyle.depthAlphaThreshold = 0.42F;
     pointStyle.solidCenters = false;
     pointStyle.flowAnimation = true;
@@ -1084,9 +1232,10 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     auto editedStyle = pointStyle;
     editedStyle.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
     editedStyle.solidColor = {0.1F, 0.2F, 0.3F, 1.0F};
+    editedStyle.waterStreakAspect = 9.0F;
     layer.pointVisuals.push_back({.name = "Warm", .style = pointStyle});
-    layer.pointVisuals.push_back({.name = "Warm_Edited", .style = editedStyle});
-    layer.selectedPointVisualName = "Warm_Edited";
+    layer.pointVisuals.push_back({.name = "Warm_edited", .style = editedStyle});
+    layer.selectedPointVisualName = "Warm_edited";
     document.layers.push_back(layer);
 
     std::string errorMessage;
@@ -1109,9 +1258,26 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_animation_trail_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_length_meters\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_sample_spacing_meters\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_animation_trail_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"Custom Bright Ribbons\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_animation_trail_settings\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_point_visual_style\"") != std::string::npos);
-        CHECK(savedJson.find("\"temp_water_point_visual_style\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_streak_aspect\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_point_visuals\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_point_visual\"") != std::string::npos);
+        CHECK(savedJson.find("\"custom_gradient\"") != std::string::npos);
+        CHECK(savedJson.find("\"gradient_start_color\"") != std::string::npos);
+        CHECK(savedJson.find("\"gradient_end_color\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_point_visual_style\"") == std::string::npos);
+        CHECK(savedJson.find("\"temp_water_point_visual_style\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_basin_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_runoff_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"preview_tint_mode\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
         CHECK(savedJson.find("\"water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"settings_assignment\"") != std::string::npos);
@@ -1127,6 +1293,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"still_camera_duration_seconds\"") != std::string::npos);
         CHECK(savedJson.find("\"particle_speed\"") != std::string::npos);
         CHECK(savedJson.find("\"spline_anchor_spacing\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_lane_count\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_looseness\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_smoothness\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_turbulence\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_momentum\"") != std::string::npos);
+        CHECK(savedJson.find("\"normal_turbulence_response\"") != std::string::npos);
         CHECK(savedJson.find("\"eye_dome_lighting_enabled\"") != std::string::npos);
         CHECK(savedJson.find("\"eye_dome_lighting_thickness\": 4.0") != std::string::npos);
         CHECK(savedJson.find("\"constant_update_view\"") != std::string::npos);
@@ -1140,7 +1312,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"soft_density_spheres\"") != std::string::npos);
         CHECK(savedJson.find("\"raycast_samples_per_pixel\": 7") != std::string::npos);
         CHECK(savedJson.find("\"raycast_max_depth\": 123.5") != std::string::npos);
-        CHECK(savedJson.find("\"schema_version\": 18") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 23") != std::string::npos);
         CHECK(savedJson.find("\"id\": \"camera_entry\"") != std::string::npos);
         CHECK(savedJson.find("\"duration_frames\": 120") == std::string::npos);
     }
@@ -1176,22 +1348,43 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterSourceSettings.path.pathLength == Catch::Approx(4.25F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.particleJitter == Catch::Approx(0.64F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.splineAnchorSpacing == Catch::Approx(0.37F));
+    CHECK(loadedDocument->waterSourceSettings.trailShape.trailLaneCount == 11U);
+    CHECK(loadedDocument->waterSourceSettings.trailShape.trailLooseness == Catch::Approx(0.73F));
+    CHECK(loadedDocument->waterSourceSettings.trailShape.trailSmoothness == Catch::Approx(0.68F));
+    CHECK(loadedDocument->waterSourceSettings.trailShape.trailTurbulence == Catch::Approx(0.82F));
+    CHECK(loadedDocument->waterSourceSettings.trailShape.trailMomentum == Catch::Approx(0.44F));
+    CHECK(loadedDocument->waterSourceSettings.trailShape.normalTurbulenceResponse == Catch::Approx(1.15F));
     CHECK(loadedDocument->waterAnimationTrailSettings.particleDensity == Catch::Approx(1.75F));
     CHECK(loadedDocument->waterAnimationTrailSettings.particleSpeed == Catch::Approx(1.8F));
     CHECK(loadedDocument->waterAnimationTrailSettings.colorVariation == Catch::Approx(0.48F));
-    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterPointVisualStyle.pointSize) ==
+    CHECK(loadedDocument->waterAnimationTrailSettings.trailLengthMeters == Catch::Approx(1.35F));
+    CHECK(loadedDocument->waterAnimationTrailSettings.trailSampleSpacingMeters == Catch::Approx(0.045F));
+    REQUIRE(loadedDocument->waterAnimationTrailProfiles.size() == 1U);
+    CHECK(loadedDocument->waterAnimationTrailProfiles[0].name == "Custom Bright Ribbons");
+    CHECK(loadedDocument->waterAnimationTrailProfiles[0].settings.particleDensity == Catch::Approx(2.6F));
+    CHECK(loadedDocument->waterAnimationTrailProfiles[0].settings.trailLengthMeters == Catch::Approx(2.4F));
+    CHECK(loadedDocument->waterAnimationTrailProfiles[0].settings.trailSampleSpacingMeters == Catch::Approx(0.022F));
+    CHECK(loadedDocument->selectedWaterPointVisualName == "River Threads");
+    REQUIRE(loadedDocument->waterPointVisuals.size() == 1U);
+    CHECK(loadedDocument->waterPointVisuals[0].name == "River Threads");
+    CHECK(
+        loadedDocument->waterPointVisuals[0].style.colormap ==
+        invisible_places::renderer::pointcloud::PointCloudColormapId::CustomGradient);
+    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterPointVisuals[0].style.pointSize) ==
           Catch::Approx(22.0F));
-    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterPointVisualStyle.opacity) ==
+    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterPointVisuals[0].style.opacity) ==
           Catch::Approx(0.42F));
-    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterPointVisualStyle.emissiveStrength) ==
+    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterPointVisuals[0].style.emissiveStrength) ==
           Catch::Approx(0.58F));
+    CHECK(loadedDocument->waterPointVisuals[0].style.gradientStartColor[0] == Catch::Approx(0.10F));
+    CHECK(loadedDocument->waterPointVisuals[0].style.gradientEndColor[2] == Catch::Approx(0.25F));
     REQUIRE(loadedDocument->tempWaterSourceSettings.has_value());
     CHECK(loadedDocument->tempWaterSourceSettings->trailShape.particleJitter == Catch::Approx(0.64F));
+    CHECK(loadedDocument->tempWaterSourceSettings->trailShape.trailLaneCount == 11U);
     REQUIRE(loadedDocument->tempWaterAnimationTrailSettings.has_value());
     CHECK(loadedDocument->tempWaterAnimationTrailSettings->particleSpeed == Catch::Approx(2.1F));
-    REQUIRE(loadedDocument->tempWaterPointVisualStyle.has_value());
-    CHECK(invisible_places::style::ScalarConstant(loadedDocument->tempWaterPointVisualStyle->opacity) ==
-          Catch::Approx(0.42F));
+    CHECK(loadedDocument->tempWaterAnimationTrailSettings->trailLengthMeters == Catch::Approx(1.85F));
+    CHECK(loadedDocument->tempWaterAnimationTrailSettings->trailSampleSpacingMeters == Catch::Approx(0.030F));
     CHECK(loadedDocument->waterSettings.path.pathLength == Catch::Approx(4.25F));
     CHECK(loadedDocument->waterSettings.trail.particleDensity == Catch::Approx(1.75F));
     CHECK(loadedDocument->waterSettings.visual.colorVariation == Catch::Approx(0.48F));
@@ -1211,6 +1404,48 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(
         loadedDocument->waterEmitters[0].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::Default);
+    REQUIRE(loadedDocument->waterPathCache.has_value());
+    CHECK(loadedDocument->waterPathCache->supportLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loadedDocument->waterPathCache->supportSignature == "Data/Site2 -5mm.ply|points=2048");
+    CHECK(loadedDocument->waterPathCache->emitterSettingsFingerprint == "roundtrip-fingerprint");
+    REQUIRE(loadedDocument->waterPathCache->branches.size() == 1U);
+    CHECK(loadedDocument->waterPathCache->branches[0].id == 31U);
+    REQUIRE(loadedDocument->waterPathCache->branches[0].rawAnchors.size() == 2U);
+    CHECK(loadedDocument->waterPathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(2.5F));
+    CHECK(loadedDocument->waterPathCache->hiddenBranchIds == std::vector<std::uint32_t>{99U});
+    REQUIRE(loadedDocument->waterBasinRegions.size() == 1U);
+    CHECK(loadedDocument->waterBasinRegions[0].name == "Carved basin");
+    CHECK(loadedDocument->waterBasinRegions[0].heightAbove == Catch::Approx(0.45F));
+    REQUIRE(loadedDocument->waterBasinRegions[0].outletEdgeIndex.has_value());
+    CHECK(loadedDocument->waterBasinRegions[0].outletEdgeIndex.value() == 1U);
+    CHECK_FALSE(loadedDocument->waterBasinRegions[0].outletBlocked);
+    REQUIRE(loadedDocument->waterRunoffRegions.size() == 1U);
+    CHECK(loadedDocument->waterRunoffRegions[0].mode == invisible_places::water::WaterRunoffMode::LightRain);
+    CHECK(loadedDocument->waterRunoffRegions[0].groundVoxelSize == Catch::Approx(0.55F));
+    CHECK(loadedDocument->waterRunoffRegions[0].highPointFraction == Catch::Approx(0.33F));
+    CHECK(loadedDocument->waterCausticLookSettings.enabled);
+    CHECK(loadedDocument->waterCausticLookSettings.intensity == Catch::Approx(1.25F));
+    CHECK(loadedDocument->waterCausticLookSettings.scale == Catch::Approx(5.5F));
+    CHECK(loadedDocument->waterCausticLookSettings.cellSizeMeters == Catch::Approx(0.18F));
+    CHECK(loadedDocument->waterCausticLookSettings.lineWidthMeters == Catch::Approx(0.012F));
+    CHECK(loadedDocument->waterCausticLookSettings.featherMeters == Catch::Approx(0.004F));
+    CHECK(loadedDocument->waterCausticLookSettings.surfacePointSpacingMeters == Catch::Approx(0.003F));
+    CHECK(loadedDocument->waterCausticLookSettings.warpAmplitudeMeters == Catch::Approx(0.035F));
+    CHECK(loadedDocument->waterCausticLookSettings.tintBlue == Catch::Approx(1.35F));
+    REQUIRE(loadedDocument->tempWaterCausticLookSettings.has_value());
+    CHECK(loadedDocument->tempWaterCausticLookSettings->warp == Catch::Approx(0.8F));
+    CHECK(loadedDocument->tempWaterCausticLookSettings->warpAmplitudeMeters == Catch::Approx(0.055F));
+    REQUIRE(loadedDocument->waterCausticRegions.size() == 1U);
+    CHECK(loadedDocument->waterCausticRegions[0].name == "Rock pool caustics");
+    CHECK(loadedDocument->waterCausticRegions[0].targetLayerSourcePath ==
+          std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loadedDocument->waterCausticRegions[0].maskVoxelSize == Catch::Approx(0.50F));
+    CHECK(loadedDocument->waterCausticRegions[0].heightBand == Catch::Approx(0.30F));
+    CHECK(
+        loadedDocument->waterCausticRegions[0].previewTintMode ==
+        invisible_places::water::WaterCausticPreviewTintMode::Always);
+    CHECK_FALSE(loadedDocument->waterCausticRegions[0].maskDirty);
+    CHECK_FALSE(loadedDocument->waterCausticRegions[0].maskStale);
     CHECK(loadedDocument->cameraPathShotIndices == std::vector<std::size_t>{0, 0});
     CHECK(loadedDocument->cameraPathDurationFrames == 144);
     REQUIRE(loadedDocument->hasSavedAnimationRegistry);
@@ -1300,6 +1535,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->hiddenAlpha == Catch::Approx(0.09F));
     CHECK(loadedLayer.pointStyle->densityScale == Catch::Approx(1.75F));
     CHECK(loadedLayer.pointStyle->densityClamp == Catch::Approx(96.0F));
+    CHECK(loadedLayer.pointStyle->waterStreakAspect == Catch::Approx(7.5F));
     CHECK(loadedLayer.pointStyle->depthAlphaThreshold == Catch::Approx(0.42F));
     CHECK(!loadedLayer.pointStyle->solidCenters);
     CHECK(loadedLayer.pointStyle->flowAnimation);
@@ -1313,13 +1549,14 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->colormapPosition.fieldMap.fieldName == "Intensity");
     CHECK(!loadedLayer.pointStyle->colormapPosition.active);
     REQUIRE(loadedLayer.pointVisuals.size() == 2);
-    CHECK(loadedLayer.selectedPointVisualName == "Warm_Edited");
+    CHECK(loadedLayer.selectedPointVisualName == "Warm_edited");
     CHECK(loadedLayer.pointVisuals[0].name == "Warm");
-    CHECK(loadedLayer.pointVisuals[1].name == "Warm_Edited");
+    CHECK(loadedLayer.pointVisuals[1].name == "Warm_edited");
     CHECK(
         loadedLayer.pointVisuals[1].style.colorMode ==
         invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor);
     CHECK(loadedLayer.pointVisuals[1].style.solidColor[2] == Catch::Approx(0.3F));
+    CHECK(loadedLayer.pointVisuals[1].style.waterStreakAspect == Catch::Approx(9.0F));
 
     std::filesystem::remove(outputPath);
 }
@@ -1584,6 +1821,70 @@ TEST_CASE("Point cloud style parses camera-facing world sprite geometry", "[seri
     std::filesystem::remove(presetPath);
 }
 
+TEST_CASE("Point visual selection owns aliased names before normalizing storage", "[water][pointcloud]") {
+    namespace point_visual = invisible_places::app::point_visual;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+
+    CHECK(point_visual::NormalizeName(" Warm_Edited ") == "Warm_edited");
+    CHECK(point_visual::PresetName("Water Flow") == "Water Flow_preset");
+    CHECK(point_visual::BaseName("White Needle Glow_preset") == "White Needle Glow");
+    CHECK(point_visual::EditedName("White Needle Glow_preset") == "White Needle Glow_edited");
+    CHECK(point_visual::IsPresetName("Water Flow_preset"));
+    CHECK(point_visual::IsEditedName("Water Flow_Edited"));
+
+    PointCloudStyleState waterStyle;
+    waterStyle.exposure = 2.0F;
+    waterStyle.waterStreakAspect = 4.0F;
+    PointCloudStyleState customStyle;
+    customStyle.exposure = 3.0F;
+    customStyle.waterStreakAspect = 12.0F;
+
+    std::vector<point_visual::VisualState> visuals{
+        {.name = " Water Flow ", .style = waterStyle},
+        {.name = " Custom Ribbons ", .style = customStyle},
+    };
+    PointCloudStyleState activeStyle;
+    activeStyle.exposure = 1.0F;
+    std::string selectedName = " Custom Ribbons ";
+    std::string nameBuffer;
+
+    const std::string_view requestedFromSelectedName{selectedName};
+    REQUIRE(point_visual::Select(
+        &visuals,
+        &selectedName,
+        &nameBuffer,
+        &activeStyle,
+        requestedFromSelectedName,
+        activeStyle));
+    CHECK(selectedName == "Custom Ribbons");
+    CHECK(nameBuffer == "Custom Ribbons");
+    CHECK(activeStyle.exposure == Catch::Approx(3.0F));
+    CHECK(activeStyle.waterStreakAspect == Catch::Approx(12.0F));
+    CHECK(visuals[0].name == "Water Flow");
+    CHECK(visuals[1].name == "Custom Ribbons");
+
+    activeStyle = waterStyle;
+    selectedName = "Water Flow";
+    nameBuffer.clear();
+    visuals[1].name = " Custom Ribbons ";
+    const std::string_view requestedFromVisualName{visuals[1].name};
+    REQUIRE(point_visual::Select(
+        &visuals,
+        &selectedName,
+        &nameBuffer,
+        &activeStyle,
+        requestedFromVisualName,
+        activeStyle));
+    CHECK(selectedName == "Custom Ribbons");
+    CHECK(nameBuffer == "Custom Ribbons");
+    CHECK(activeStyle.exposure == Catch::Approx(3.0F));
+    CHECK(activeStyle.waterStreakAspect == Catch::Approx(12.0F));
+
+    visuals.push_back({.name = "Legacy_Edited", .style = customStyle});
+    point_visual::Remove(&visuals, "Legacy_edited");
+    CHECK_FALSE(point_visual::FindIndex(visuals, "Legacy_Edited").has_value());
+}
+
 TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][pointcloud]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.sourcePath = "synthetic-water-support.ply";
@@ -1645,13 +1946,20 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     CHECK(overlay.points.back().confidence <= 1.0F);
 
     std::size_t anchorCount = 0;
-    std::size_t pathViewAnchorCount = 0;
+    std::size_t mainGuideCount = 0;
+    std::size_t trailLaneGuideCount = 0;
     std::size_t particleCount = 0;
     float previousAnchorDistance = -1.0F;
     bool sawDifferentParticleBlue = false;
     std::uint8_t firstParticleBlue = 0;
     bool hasFirstParticleBlue = false;
     for (const auto& point : overlay.points) {
+        const glm::vec3 normal{point.normal.x, point.normal.y, point.normal.z};
+        CHECK(std::isfinite(normal.x));
+        CHECK(std::isfinite(normal.y));
+        CHECK(std::isfinite(normal.z));
+        CHECK(glm::length(normal) == Catch::Approx(1.0F).margin(0.0001F));
+        CHECK(glm::dot(normal, glm::vec3{1.0F, 0.0F, 0.0F}) > 0.99F);
         if (point.particleRole < 0.5F) {
             ++anchorCount;
             if (previousAnchorDistance >= 0.0F) {
@@ -1660,11 +1968,20 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
             previousAnchorDistance = point.pathDistance;
             continue;
         }
-        if (point.particleRole >= 1.5F) {
-            ++pathViewAnchorCount;
+        if (point.particleRole >= 1.5F && point.particleRole < 2.5F) {
+            ++mainGuideCount;
             CHECK(point.pathStartIndex >= 0.0F);
             CHECK(point.pathPointCount >= 2.0F);
             CHECK(point.pathStartIndex + point.pathPointCount <= static_cast<float>(overlay.points.size()));
+            continue;
+        }
+        if (point.particleRole >= 2.5F && point.particleRole < 3.5F) {
+            ++trailLaneGuideCount;
+            CHECK(point.pathStartIndex >= 0.0F);
+            CHECK(point.pathPointCount >= 2.0F);
+            CHECK(point.pathStartIndex + point.pathPointCount <= static_cast<float>(overlay.points.size()));
+            CHECK(point.trailLaneId >= 0.0F);
+            CHECK(std::abs(point.trailLateralOffset) <= point.width * settings.trail.particleJitter * 0.46F + 0.001F);
             continue;
         }
         ++particleCount;
@@ -1674,6 +1991,10 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
         CHECK(point.pathStartIndex >= 0.0F);
         CHECK(point.pathPointCount >= 2.0F);
         CHECK(point.pathStartIndex + point.pathPointCount <= static_cast<float>(overlay.points.size()));
+        CHECK(point.trailAge >= 0.0F);
+        CHECK(point.trailAge <= 1.0F);
+        CHECK(point.trailLength >= 0.0F);
+        CHECK(point.featureType == Catch::Approx(0.0F));
         if (!hasFirstParticleBlue) {
             firstParticleBlue = point.blue;
             hasFirstParticleBlue = true;
@@ -1682,16 +2003,48 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
         }
     }
     CHECK(anchorCount > 8);
-    CHECK(pathViewAnchorCount > 8);
+    CHECK(mainGuideCount > 8);
+    CHECK(trailLaneGuideCount > mainGuideCount);
     CHECK(particleCount > 8);
     CHECK(sawDifferentParticleBlue);
 
-    auto denserTrailSettings = settings.trail;
-    denserTrailSettings.particleDensity = 3.0F;
-    const auto denserOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
-        pathAnchors,
-        denserTrailSettings,
-        settings.visual);
+    struct LaneMetrics {
+        std::size_t count = 0;
+        std::uint32_t maxLaneId = 0;
+        double positionSignature = 0.0;
+        double absoluteOffset = 0.0;
+        double steepness = 0.0;
+    };
+    const auto laneMetricsForEmitter =
+        [](const invisible_places::water::WaterOverlay& waterOverlay, std::uint32_t emitterId) {
+            LaneMetrics metrics;
+            for (const auto& point : waterOverlay.points) {
+                if (point.particleRole < 2.5F || point.particleRole >= 3.5F) {
+                    continue;
+                }
+                const auto pointEmitterId = static_cast<std::uint32_t>(
+                    std::max(0.0F, std::floor(point.emitterId + 0.5F)));
+                if (emitterId != 0U && pointEmitterId != emitterId) {
+                    continue;
+                }
+                ++metrics.count;
+                metrics.maxLaneId = std::max(
+                    metrics.maxLaneId,
+                    static_cast<std::uint32_t>(std::max(0.0F, std::floor(point.trailLaneId + 0.5F))));
+                metrics.positionSignature +=
+                    static_cast<double>(point.position.x) * 13.0 +
+                    static_cast<double>(point.position.y) * 17.0 +
+                    static_cast<double>(point.position.z) * 19.0;
+                metrics.absoluteOffset += static_cast<double>(std::abs(point.trailLateralOffset));
+                metrics.steepness += static_cast<double>(point.surfaceSteepness);
+            }
+            return metrics;
+        };
+    const auto laneSignatureChanged = [](LaneMetrics left, LaneMetrics right) {
+        return std::abs(left.positionSignature - right.positionSignature) > 1.0e-4 ||
+               std::abs(left.absoluteOffset - right.absoluteOffset) > 1.0e-4 ||
+               std::abs(left.steepness - right.steepness) > 1.0e-4;
+    };
     const auto countRoles = [](const invisible_places::water::WaterOverlay& waterOverlay, bool particles) {
         return std::count_if(
             waterOverlay.points.begin(),
@@ -1702,6 +2055,113 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
                            : point.particleRole < 0.5F;
             });
     };
+    const auto countMovingParticleHeads = [](const invisible_places::water::WaterOverlay& waterOverlay) {
+        return std::count_if(
+            waterOverlay.points.begin(),
+            waterOverlay.points.end(),
+            [](const invisible_places::water::WaterOverlayPoint& point) {
+                return point.particleRole >= 0.5F &&
+                       point.particleRole < 1.5F &&
+                       point.trailAge <= 1.0e-5F;
+            });
+    };
+
+    invisible_places::water::WaterParticleTrailShapeSettings shapedTrail;
+    shapedTrail.particleJitter = settings.trail.particleJitter;
+    shapedTrail.splineAnchorSpacing = settings.trail.splineAnchorSpacing;
+    shapedTrail.trailLaneCount = 4U;
+    shapedTrail.trailLooseness = 0.15F;
+    invisible_places::water::WaterAnimationTrailSettings shapedAnimation;
+    shapedAnimation.particleDensity = settings.trail.particleDensity;
+    shapedAnimation.particleSpeed = settings.trail.particleSpeed;
+    shapedAnimation.colorVariation = settings.visual.colorVariation;
+    shapedAnimation.trailLengthMeters = 0.4F;
+    const auto shapedOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        shapedTrail,
+        shapedAnimation);
+    const auto shapedLaneMetrics = laneMetricsForEmitter(shapedOverlay, 0U);
+    REQUIRE(shapedLaneMetrics.count > 0U);
+    CHECK(shapedLaneMetrics.maxLaneId == shapedTrail.trailLaneCount - 1U);
+    CHECK(std::any_of(shapedOverlay.points.begin(), shapedOverlay.points.end(), [&shapedOverlay](const auto& point) {
+        if (point.particleRole < 0.5F || point.particleRole >= 1.5F) {
+            return false;
+        }
+        const auto pathStart = static_cast<std::size_t>(
+            std::max(0.0F, std::floor(point.pathStartIndex + 0.5F)));
+        return pathStart < shapedOverlay.points.size() &&
+               shapedOverlay.points[pathStart].particleRole >= 2.5F &&
+               shapedOverlay.points[pathStart].particleRole < 3.5F;
+    }));
+
+    auto fineSampleAnimation = shapedAnimation;
+    fineSampleAnimation.trailSampleSpacingMeters = shapedTrail.splineAnchorSpacing * 0.5F;
+    const auto fineSampleOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        shapedTrail,
+        fineSampleAnimation);
+    CHECK(countRoles(fineSampleOverlay, false) > countRoles(shapedOverlay, false));
+    CHECK(countMovingParticleHeads(fineSampleOverlay) == countMovingParticleHeads(shapedOverlay));
+    CHECK(countRoles(fineSampleOverlay, true) > countRoles(shapedOverlay, true));
+
+    auto wideSampleAnimation = shapedAnimation;
+    wideSampleAnimation.trailSampleSpacingMeters = shapedTrail.splineAnchorSpacing * 3.0F;
+    const auto wideSampleOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        shapedTrail,
+        wideSampleAnimation);
+    CHECK(countRoles(wideSampleOverlay, false) < countRoles(shapedOverlay, false));
+    CHECK(countMovingParticleHeads(wideSampleOverlay) == countMovingParticleHeads(shapedOverlay));
+
+    auto laneCountTrail = shapedTrail;
+    laneCountTrail.trailLaneCount = 7U;
+    const auto laneCountOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        laneCountTrail,
+        shapedAnimation);
+    const auto laneCountMetrics = laneMetricsForEmitter(laneCountOverlay, 0U);
+    CHECK(laneCountMetrics.count > shapedLaneMetrics.count);
+    CHECK(laneCountMetrics.maxLaneId == laneCountTrail.trailLaneCount - 1U);
+
+    auto jitterTrail = shapedTrail;
+    jitterTrail.particleJitter = 0.95F;
+    const auto jitterOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        jitterTrail,
+        shapedAnimation);
+    CHECK(laneMetricsForEmitter(jitterOverlay, 0U).absoluteOffset >
+          shapedLaneMetrics.absoluteOffset * 1.15);
+
+    auto anchorSpacingTrail = shapedTrail;
+    anchorSpacingTrail.splineAnchorSpacing = shapedTrail.splineAnchorSpacing * 0.5F;
+    const auto anchorSpacingOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        anchorSpacingTrail,
+        shapedAnimation);
+    CHECK(laneMetricsForEmitter(anchorSpacingOverlay, 0U).count > shapedLaneMetrics.count);
+
+    auto looseTrail = shapedTrail;
+    looseTrail.trailLooseness = 0.95F;
+    const auto looseOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        looseTrail,
+        shapedAnimation);
+    CHECK(laneSignatureChanged(laneMetricsForEmitter(looseOverlay, 0U), shapedLaneMetrics));
+
+    auto smoothTrail = shapedTrail;
+    smoothTrail.trailSmoothness = 0.98F;
+    const auto smoothOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        smoothTrail,
+        shapedAnimation);
+    CHECK(laneSignatureChanged(laneMetricsForEmitter(smoothOverlay, 0U), shapedLaneMetrics));
+
+    auto denserTrailSettings = settings.trail;
+    denserTrailSettings.particleDensity = 3.0F;
+    const auto denserOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        pathAnchors,
+        denserTrailSettings,
+        settings.visual);
     CHECK(countRoles(denserOverlay, false) == countRoles(overlay, false));
     CHECK(countRoles(denserOverlay, true) > countRoles(overlay, true));
 
@@ -1709,6 +2169,7 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     defaultSourceSettings.path = settings.path;
     defaultSourceSettings.trailShape.particleJitter = settings.trail.particleJitter;
     defaultSourceSettings.trailShape.splineAnchorSpacing = settings.trail.splineAnchorSpacing;
+    defaultSourceSettings.trailShape.trailLaneCount = 3U;
     invisible_places::water::WaterAnimationTrailSettings animationTrailSettings;
     animationTrailSettings.particleDensity = settings.trail.particleDensity;
     animationTrailSettings.particleSpeed = settings.trail.particleSpeed;
@@ -1720,6 +2181,7 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     customEmitter.sourceSettings = defaultSourceSettings;
     customEmitter.sourceSettings->path.pathLength = 0.28F;
     customEmitter.sourceSettings->trailShape.splineAnchorSpacing = 0.02F;
+    customEmitter.sourceSettings->trailShape.trailLaneCount = 6U;
     const std::vector<invisible_places::water::WaterEmitter> perSourceEmitters{emitter, customEmitter};
     const auto perSourceAnchors = invisible_places::water::GenerateWaterPathAnchors(
         cloud,
@@ -1744,6 +2206,30 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
         perSourceEmitters,
         defaultSourceSettings,
         animationTrailSettings);
+    const auto defaultEmitterLaneMetrics = laneMetricsForEmitter(perSourceOverlay, 3U);
+    const auto customEmitterLaneMetrics = laneMetricsForEmitter(perSourceOverlay, 9U);
+    REQUIRE(defaultEmitterLaneMetrics.count > 0U);
+    REQUIRE(customEmitterLaneMetrics.count > 0U);
+    CHECK(defaultEmitterLaneMetrics.maxLaneId == defaultSourceSettings.trailShape.trailLaneCount - 1U);
+    CHECK(customEmitterLaneMetrics.maxLaneId == customEmitter.sourceSettings->trailShape.trailLaneCount - 1U);
+
+    auto customLaneEmitters = perSourceEmitters;
+    REQUIRE(customLaneEmitters[1].sourceSettings.has_value());
+    customLaneEmitters[1].sourceSettings->trailShape.trailLaneCount = 8U;
+    const auto customLaneOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        perSourceAnchors,
+        customLaneEmitters,
+        defaultSourceSettings,
+        animationTrailSettings);
+    const auto unchangedDefaultLaneMetrics = laneMetricsForEmitter(customLaneOverlay, 3U);
+    const auto widerCustomLaneMetrics = laneMetricsForEmitter(customLaneOverlay, 9U);
+    CHECK(unchangedDefaultLaneMetrics.count == defaultEmitterLaneMetrics.count);
+    CHECK(unchangedDefaultLaneMetrics.maxLaneId == defaultEmitterLaneMetrics.maxLaneId);
+    CHECK(unchangedDefaultLaneMetrics.positionSignature ==
+          Catch::Approx(defaultEmitterLaneMetrics.positionSignature));
+    CHECK(widerCustomLaneMetrics.count > customEmitterLaneMetrics.count);
+    CHECK(widerCustomLaneMetrics.maxLaneId == 7U);
+
     const auto particleCountForEmitter =
         [](const invisible_places::water::WaterOverlay& waterOverlay, std::uint32_t emitterId) {
             std::size_t count = 0;
@@ -1808,10 +2294,25 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     CHECK(header.header.HasProperty("scalar_path_start_index"));
     CHECK(header.header.HasProperty("scalar_path_point_count"));
     CHECK(header.header.HasProperty("scalar_jitter_seed"));
+    CHECK(header.header.HasProperty("scalar_trail_age"));
+    CHECK(header.header.HasProperty("scalar_trail_length"));
+    CHECK(header.header.HasProperty("scalar_feature_type"));
+    CHECK(header.header.HasProperty("scalar_region_id"));
+    CHECK(header.header.HasProperty("scalar_surface_steepness"));
+    CHECK(header.header.HasProperty("scalar_trail_lane_id"));
+    CHECK(header.header.HasProperty("scalar_trail_lateral_offset"));
+    CHECK(header.header.HasProperty("normal_x"));
+    CHECK(header.header.HasProperty("normal_y"));
+    CHECK(header.header.HasProperty("normal_z"));
 
     const auto loaded = invisible_places::io::LoadPointCloud(outputPath);
     REQUIRE(loaded.success);
-    REQUIRE(loaded.cloud.ScalarFieldCount() == 13);
+    REQUIRE(loaded.cloud.ScalarFieldCount() == 20);
+    REQUIRE(loaded.cloud.hasNormals);
+    REQUIRE(loaded.cloud.normals.size() == overlay.points.size());
+    CHECK(loaded.cloud.normals.front().x == Catch::Approx(1.0F));
+    CHECK(loaded.cloud.normals.front().y == Catch::Approx(0.0F));
+    CHECK(loaded.cloud.normals.front().z == Catch::Approx(0.0F));
     CHECK(loaded.cloud.scalarFields[3].name == "phase");
     CHECK(loaded.cloud.scalarFields[4].name == "speed");
     CHECK(loaded.cloud.scalarFields[8].name == "pooling");
@@ -1819,7 +2320,756 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     CHECK(loaded.cloud.scalarFields[10].name == "path_start_index");
     CHECK(loaded.cloud.scalarFields[11].name == "path_point_count");
     CHECK(loaded.cloud.scalarFields[12].name == "jitter_seed");
+    CHECK(loaded.cloud.scalarFields[13].name == "trail_age");
+    CHECK(loaded.cloud.scalarFields[14].name == "trail_length");
+    CHECK(loaded.cloud.scalarFields[15].name == "feature_type");
+    CHECK(loaded.cloud.scalarFields[16].name == "region_id");
+    CHECK(loaded.cloud.scalarFields[17].name == "surface_steepness");
+    CHECK(loaded.cloud.scalarFields[18].name == "trail_lane_id");
+    CHECK(loaded.cloud.scalarFields[19].name == "trail_lateral_offset");
+
+    const auto liveCloud = invisible_places::water::BuildWaterOverlayPointCloud(
+        overlay,
+        outputPath,
+        "water overlay preview");
+    REQUIRE(liveCloud.PointCount() == overlay.points.size());
+    REQUIRE(liveCloud.ScalarFieldCount() == 20);
+    CHECK(liveCloud.sourcePath == outputPath);
+    CHECK(liveCloud.layerName == "water overlay preview");
+    CHECK(liveCloud.hasSourceRgb);
+    REQUIRE(liveCloud.hasNormals);
+    REQUIRE(liveCloud.normals.size() == overlay.points.size());
+    CHECK(liveCloud.normals.front().x == Catch::Approx(1.0F));
+    CHECK(liveCloud.scalarFields[16].name == "region_id");
+    CHECK(liveCloud.scalarFields[17].name == "surface_steepness");
+    CHECK(liveCloud.scalarFields[18].name == "trail_lane_id");
+    CHECK(liveCloud.scalarFields[19].name == "trail_lateral_offset");
+    const auto firstLanePoint = std::find_if(
+        overlay.points.begin(),
+        overlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.particleRole >= 2.5F && point.particleRole < 3.5F;
+        });
+    REQUIRE(firstLanePoint != overlay.points.end());
+    const auto firstLaneIndex = static_cast<std::size_t>(std::distance(overlay.points.begin(), firstLanePoint));
+    CHECK(liveCloud.scalarFieldValues[liveCloud.ScalarFieldValueIndex(17, firstLaneIndex)] ==
+          Catch::Approx(firstLanePoint->surfaceSteepness));
+    CHECK(liveCloud.scalarFieldValues[liveCloud.ScalarFieldValueIndex(18, firstLaneIndex)] ==
+          Catch::Approx(firstLanePoint->trailLaneId));
+    CHECK(liveCloud.scalarFieldValues[liveCloud.ScalarFieldValueIndex(19, firstLaneIndex)] ==
+          Catch::Approx(firstLanePoint->trailLateralOffset));
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Water trail looseness simplifies flat knotted lane guides", "[water]") {
+    auto makeAnchors = [](const std::vector<invisible_places::io::Float3>& positions) {
+        invisible_places::water::WaterOverlay overlay;
+        float distance = 0.0F;
+        for (std::size_t index = 0; index < positions.size(); ++index) {
+            if (index > 0U) {
+                const glm::vec3 previous{positions[index - 1U].x, positions[index - 1U].y, positions[index - 1U].z};
+                const glm::vec3 current{positions[index].x, positions[index].y, positions[index].z};
+                distance += glm::length(current - previous);
+            }
+            invisible_places::water::WaterOverlayPoint point;
+            point.position = positions[index];
+            point.normal = {0.0F, 0.0F, 1.0F};
+            point.flowId = 1.0F;
+            point.emitterId = 1.0F;
+            point.pathDistance = distance;
+            point.speed = 1.0F;
+            point.width = 0.24F;
+            point.confidence = 1.0F;
+            overlay.bounds.Expand(point.position);
+            overlay.points.push_back(point);
+        }
+        return overlay;
+    };
+    const auto guideMetrics = [](const invisible_places::water::WaterOverlay& overlay) {
+        struct Metrics {
+            std::size_t count = 0U;
+            double length = 0.0;
+        } metrics;
+        for (std::size_t index = 0; index < overlay.points.size(); ++index) {
+            const auto& point = overlay.points[index];
+            if (point.particleRole < 2.5F || point.particleRole >= 3.5F) {
+                continue;
+            }
+            ++metrics.count;
+            if (index == 0U) {
+                continue;
+            }
+            const auto& previous = overlay.points[index - 1U];
+            if (previous.particleRole >= 2.5F &&
+                previous.particleRole < 3.5F &&
+                previous.pathStartIndex == point.pathStartIndex) {
+                const glm::vec3 a{previous.position.x, previous.position.y, previous.position.z};
+                const glm::vec3 b{point.position.x, point.position.y, point.position.z};
+                metrics.length += glm::length(b - a);
+            }
+        }
+        return metrics;
+    };
+
+    const auto anchors = makeAnchors({
+        {0.0F, 0.0F, 0.0F},
+        {0.8F, 0.0F, 0.0F},
+        {0.8F, 0.7F, 0.0F},
+        {0.08F, 0.7F, 0.0F},
+        {0.08F, 0.14F, 0.0F},
+        {0.88F, 0.14F, 0.0F},
+        {0.88F, -0.45F, 0.0F},
+    });
+
+    invisible_places::water::WaterParticleTrailShapeSettings tightShape;
+    tightShape.particleJitter = 0.45F;
+    tightShape.splineAnchorSpacing = 0.08F;
+    tightShape.trailLaneCount = 3U;
+    tightShape.trailLooseness = 0.0F;
+    invisible_places::water::WaterAnimationTrailSettings animation;
+    animation.particleDensity = 0.8F;
+    animation.trailSampleSpacingMeters = 0.06F;
+
+    auto looseShape = tightShape;
+    looseShape.trailLooseness = 1.0F;
+    const auto tightOverlay =
+        invisible_places::water::BuildWaterOverlayFromPathAnchors(anchors, tightShape, animation);
+    const auto looseOverlay =
+        invisible_places::water::BuildWaterOverlayFromPathAnchors(anchors, looseShape, animation);
+    const auto tightMetrics = guideMetrics(tightOverlay);
+    const auto looseMetrics = guideMetrics(looseOverlay);
+    REQUIRE(tightMetrics.count > 0U);
+    REQUIRE(looseMetrics.count > 0U);
+    CHECK(looseMetrics.count < tightMetrics.count);
+    CHECK(looseMetrics.length < tightMetrics.length * 0.92);
+}
+
+TEST_CASE("Water trail looseness respects projected terrain ridges", "[water]") {
+    invisible_places::water::WaterOverlay anchors;
+    const std::vector<invisible_places::io::Float3> path{
+        {-1.0F, 0.0F, 0.0F},
+        {-1.0F, 0.8F, 0.0F},
+        {1.0F, 0.8F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+    };
+    float distance = 0.0F;
+    for (std::size_t index = 0; index < path.size(); ++index) {
+        if (index > 0U) {
+            const glm::vec3 previous{path[index - 1U].x, path[index - 1U].y, path[index - 1U].z};
+            const glm::vec3 current{path[index].x, path[index].y, path[index].z};
+            distance += glm::length(current - previous);
+        }
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = path[index];
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = 1.0F;
+        point.emitterId = 1.0F;
+        point.pathDistance = distance;
+        point.speed = 1.0F;
+        point.width = 0.22F;
+        point.confidence = 1.0F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::io::LoadedPointCloud support;
+    support.hasNormals = true;
+    for (int yi = -2; yi <= 10; ++yi) {
+        for (int xi = -12; xi <= 12; ++xi) {
+            const float x = static_cast<float>(xi) * 0.10F;
+            const float y = static_cast<float>(yi) * 0.10F;
+            const float ridge = (std::abs(x) < 0.18F && y < 0.24F) ? 0.65F : 0.0F;
+            support.positions.push_back({x, y, ridge});
+            support.normals.push_back({0.0F, 0.0F, 1.0F});
+            support.bounds.Expand(support.positions.back());
+        }
+    }
+
+    invisible_places::water::WaterParticleTrailShapeSettings shape;
+    shape.particleJitter = 0.25F;
+    shape.splineAnchorSpacing = 0.08F;
+    shape.trailLaneCount = 3U;
+    shape.trailLooseness = 1.0F;
+    invisible_places::water::WaterAnimationTrailSettings animation;
+    animation.particleDensity = 0.8F;
+    animation.trailSampleSpacingMeters = 0.06F;
+
+    const auto overlay =
+        invisible_places::water::BuildWaterOverlayFromPathAnchors(anchors, shape, animation, &support);
+    const auto highGuideIt = std::find_if(
+        overlay.points.begin(),
+        overlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.particleRole >= 2.5F && point.particleRole < 3.5F && point.position.z > 0.25F;
+        });
+    CHECK(highGuideIt == overlay.points.end());
+    bool crossedRidgeShortcut = false;
+    for (std::size_t index = 1U; index < overlay.points.size(); ++index) {
+        const auto& previous = overlay.points[index - 1U];
+        const auto& point = overlay.points[index];
+        if (previous.particleRole < 2.5F || previous.particleRole >= 3.5F ||
+            point.particleRole < 2.5F || point.particleRole >= 3.5F ||
+            previous.pathStartIndex != point.pathStartIndex) {
+            continue;
+        }
+        if (previous.position.y < 0.24F &&
+            point.position.y < 0.24F &&
+            ((previous.position.x < 0.0F && point.position.x > 0.0F) ||
+             (previous.position.x > 0.0F && point.position.x < 0.0F))) {
+            crossedRidgeShortcut = true;
+            break;
+        }
+    }
+    CHECK_FALSE(crossedRidgeShortcut);
+}
+
+TEST_CASE("Water trail projection stays close to flat support surface", "[water]") {
+    invisible_places::water::WaterOverlay anchors;
+    const std::vector<invisible_places::io::Float3> path{
+        {-1.0F, -0.2F, 0.0F},
+        {-0.45F, 0.08F, 0.0F},
+        {0.0F, -0.05F, 0.0F},
+        {0.55F, 0.12F, 0.0F},
+        {1.0F, -0.2F, 0.0F},
+    };
+    float distance = 0.0F;
+    for (std::size_t index = 0; index < path.size(); ++index) {
+        if (index > 0U) {
+            const glm::vec3 previous{path[index - 1U].x, path[index - 1U].y, path[index - 1U].z};
+            const glm::vec3 current{path[index].x, path[index].y, path[index].z};
+            distance += glm::length(current - previous);
+        }
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = path[index];
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = 1.0F;
+        point.emitterId = 1.0F;
+        point.pathDistance = distance;
+        point.speed = 1.0F;
+        point.width = 0.28F;
+        point.confidence = 1.0F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::io::LoadedPointCloud support;
+    support.hasNormals = true;
+    for (int yi = -2; yi <= 2; ++yi) {
+        for (int xi = -2; xi <= 2; ++xi) {
+            support.positions.push_back({
+                static_cast<float>(xi),
+                static_cast<float>(yi),
+                0.0F});
+            support.normals.push_back({0.0F, 0.0F, 1.0F});
+            support.bounds.Expand(support.positions.back());
+            support.positions.push_back({
+                static_cast<float>(xi),
+                static_cast<float>(yi),
+                0.80F});
+            support.normals.push_back({0.0F, 0.0F, 1.0F});
+            support.bounds.Expand(support.positions.back());
+        }
+    }
+
+    invisible_places::water::WaterParticleTrailShapeSettings shape;
+    shape.particleJitter = 0.65F;
+    shape.splineAnchorSpacing = 0.08F;
+    shape.trailLaneCount = 3U;
+    shape.trailLooseness = 0.85F;
+    shape.trailSmoothness = 0.75F;
+    invisible_places::water::WaterAnimationTrailSettings animation;
+    animation.particleDensity = 1.0F;
+    animation.trailLengthMeters = 0.18F;
+    animation.trailSampleSpacingMeters = 0.05F;
+
+    const auto overlay =
+        invisible_places::water::BuildWaterOverlayFromPathAnchors(anchors, shape, animation, &support);
+    std::size_t visibleTrailCount = 0U;
+    float maxTrailHeight = 0.0F;
+    float maxGuideHeightStep = 0.0F;
+    for (std::size_t index = 0; index < overlay.points.size(); ++index) {
+        const auto& point = overlay.points[index];
+        if (point.particleRole >= 0.5F) {
+            maxTrailHeight = std::max(maxTrailHeight, std::abs(point.position.z));
+            ++visibleTrailCount;
+        }
+        if (index == 0U || point.particleRole < 2.5F || point.particleRole >= 3.5F) {
+            continue;
+        }
+        const auto& previous = overlay.points[index - 1U];
+        if (previous.particleRole >= 2.5F &&
+            previous.particleRole < 3.5F &&
+            previous.pathStartIndex == point.pathStartIndex) {
+            maxGuideHeightStep = std::max(maxGuideHeightStep, std::abs(point.position.z - previous.position.z));
+        }
+    }
+    REQUIRE(visibleTrailCount > 0U);
+    CHECK(maxTrailHeight < 0.025F);
+    CHECK(maxGuideHeightStep < 0.010F);
+}
+
+TEST_CASE("Water trail surface index is reusable for preview and final builds", "[water]") {
+    invisible_places::water::WaterOverlay anchors;
+    const std::vector<invisible_places::io::Float3> path{
+        {-0.8F, 0.0F, 0.0F},
+        {-0.4F, 0.32F, 0.0F},
+        {0.0F, 0.20F, 0.0F},
+        {0.4F, 0.44F, 0.0F},
+        {0.8F, 0.0F, 0.0F},
+    };
+    float distance = 0.0F;
+    for (std::size_t index = 0; index < path.size(); ++index) {
+        if (index > 0U) {
+            const glm::vec3 previous{path[index - 1U].x, path[index - 1U].y, path[index - 1U].z};
+            const glm::vec3 current{path[index].x, path[index].y, path[index].z};
+            distance += glm::length(current - previous);
+        }
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = path[index];
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = 11.0F;
+        point.emitterId = 1.0F;
+        point.pathDistance = distance;
+        point.speed = 1.0F;
+        point.width = 0.20F;
+        point.confidence = 1.0F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::io::LoadedPointCloud support;
+    support.hasNormals = true;
+    for (int yi = -8; yi <= 8; ++yi) {
+        for (int xi = -12; xi <= 12; ++xi) {
+            const float x = static_cast<float>(xi) * 0.08F;
+            const float y = static_cast<float>(yi) * 0.08F;
+            const float z = std::sin(x * 2.0F) * 0.015F + std::cos(y * 1.7F) * 0.010F;
+            support.positions.push_back({x, y, z});
+            support.normals.push_back({0.0F, 0.0F, 1.0F});
+            support.bounds.Expand(support.positions.back());
+        }
+    }
+
+    const auto surfaceIndex = invisible_places::water::BuildTrailSurfaceIndex(support);
+    REQUIRE(surfaceIndex != nullptr);
+    REQUIRE(invisible_places::water::TrailSurfaceIndexSampleCount(*surfaceIndex) > 0U);
+
+    invisible_places::water::WaterParticleTrailShapeSettings shape;
+    shape.particleJitter = 0.32F;
+    shape.splineAnchorSpacing = 0.06F;
+    shape.trailLaneCount = 4U;
+    shape.trailLooseness = 0.75F;
+    shape.trailSmoothness = 0.85F;
+    invisible_places::water::WaterAnimationTrailSettings animation;
+    animation.particleDensity = 1.2F;
+    animation.trailLengthMeters = 0.18F;
+    animation.trailSampleSpacingMeters = 0.04F;
+
+    invisible_places::water::WaterTrailBuildDiagnostics previewDiagnostics;
+    const auto previewOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        anchors,
+        shape,
+        animation,
+        surfaceIndex.get(),
+        invisible_places::water::WaterTrailBuildQuality::Preview,
+        &previewDiagnostics);
+    invisible_places::water::WaterTrailBuildDiagnostics secondPreviewDiagnostics;
+    const auto secondPreviewOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        anchors,
+        shape,
+        animation,
+        surfaceIndex.get(),
+        invisible_places::water::WaterTrailBuildQuality::Preview,
+        &secondPreviewDiagnostics);
+    invisible_places::water::WaterTrailBuildDiagnostics finalDiagnostics;
+    const auto finalOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        anchors,
+        shape,
+        animation,
+        surfaceIndex.get(),
+        invisible_places::water::WaterTrailBuildQuality::Final,
+        &finalDiagnostics);
+
+    auto guideStats = [](const invisible_places::water::WaterOverlay& overlay) {
+        struct Stats {
+            std::size_t count = 0;
+            std::uint32_t maxLane = 0;
+            float length = 0.0F;
+        } stats;
+        for (std::size_t index = 0; index < overlay.points.size(); ++index) {
+            const auto& point = overlay.points[index];
+            if (point.particleRole < 2.5F || point.particleRole >= 3.5F) {
+                continue;
+            }
+            ++stats.count;
+            stats.maxLane = std::max(
+                stats.maxLane,
+                static_cast<std::uint32_t>(std::max(0.0F, std::floor(point.trailLaneId + 0.5F))));
+            if (index > 0U) {
+                const auto& previous = overlay.points[index - 1U];
+                if (previous.pathStartIndex == point.pathStartIndex &&
+                    previous.particleRole >= 2.5F &&
+                    previous.particleRole < 3.5F) {
+                    const glm::vec3 a{previous.position.x, previous.position.y, previous.position.z};
+                    const glm::vec3 b{point.position.x, point.position.y, point.position.z};
+                    stats.length += glm::length(b - a);
+                }
+            }
+        }
+        return stats;
+    };
+
+    const auto previewStats = guideStats(previewOverlay);
+    const auto secondPreviewStats = guideStats(secondPreviewOverlay);
+    const auto finalStats = guideStats(finalOverlay);
+    REQUIRE(previewStats.count > 0U);
+    CHECK(secondPreviewStats.count == previewStats.count);
+    CHECK(previewStats.maxLane == shape.trailLaneCount - 1U);
+    CHECK(finalStats.maxLane == shape.trailLaneCount - 1U);
+    CHECK(finalStats.count >= previewStats.count);
+    CHECK(finalStats.length > previewStats.length * 0.70F);
+    CHECK(finalStats.length < previewStats.length * 1.45F);
+    CHECK(previewDiagnostics.surfaceIndexBuildMs == Catch::Approx(0.0));
+    CHECK(secondPreviewDiagnostics.surfaceIndexBuildMs == Catch::Approx(0.0));
+    CHECK(secondPreviewDiagnostics.surfaceSampleCount ==
+          invisible_places::water::TrailSurfaceIndexSampleCount(*surfaceIndex));
+    CHECK(secondPreviewDiagnostics.routedPathCount == previewDiagnostics.routedPathCount);
+}
+
+TEST_CASE("Basin haze and runoff water overlays generate feature-tagged point clouds", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.hasNormals = true;
+    for (int y = 0; y <= 4; ++y) {
+        for (int x = 0; x <= 4; ++x) {
+            const float groundZ = 1.0F - static_cast<float>(x + y) * 0.08F;
+            cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ});
+            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(cloud.positions.back());
+            cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ + 0.85F});
+            cloud.normals.push_back({0.65F, 0.15F, 0.74F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(cloud.positions.back());
+        }
+    }
+
+    invisible_places::water::WaterBasinRegion basin;
+    basin.id = 11;
+    basin.vertices = {{0.0F, 0.0F, 1.0F}, {4.0F, 0.0F, 1.0F}, {4.0F, 4.0F, 0.4F}, {0.0F, 4.0F, 0.6F}};
+    basin.heightAbove = 0.55F;
+    basin.depthBelow = 0.35F;
+    basin.density = 20.0F;
+    basin.outletEdgeIndex = 1U;
+    basin.outletBlocked = false;
+    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&basin);
+
+    const auto basinOverlay = invisible_places::water::GenerateBasinHazeOverlay(cloud, {basin});
+    REQUIRE_FALSE(basinOverlay.points.empty());
+    CHECK(std::all_of(
+        basinOverlay.points.begin(),
+        basinOverlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.featureType == Catch::Approx(1.0F) &&
+                   point.regionId == Catch::Approx(11.0F);
+        }));
+    const auto basinAnchorCount = std::count_if(
+        basinOverlay.points.begin(),
+        basinOverlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.particleRole == Catch::Approx(0.0F);
+        });
+    const auto basinParticleCount = std::count_if(
+        basinOverlay.points.begin(),
+        basinOverlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.particleRole >= 0.5F && point.particleRole < 1.5F;
+        });
+    CHECK(basinAnchorCount > 0);
+    CHECK(basinParticleCount > 0);
+    for (const auto& point : basinOverlay.points) {
+        if (point.particleRole < 0.5F || point.particleRole >= 1.5F) {
+            continue;
+        }
+        const auto pathStart = static_cast<std::size_t>(std::floor(point.pathStartIndex + 0.5F));
+        const auto pathCount = static_cast<std::size_t>(std::floor(point.pathPointCount + 0.5F));
+        REQUIRE(pathCount >= 2U);
+        REQUIRE(pathStart < basinOverlay.points.size());
+        REQUIRE(pathStart + pathCount <= basinOverlay.points.size());
+        const auto& nucleation = basinOverlay.points[pathStart];
+        CHECK(nucleation.particleRole == Catch::Approx(0.0F));
+        CHECK(nucleation.position.x >= -0.001F);
+        CHECK(nucleation.position.x <= 4.001F);
+        CHECK(nucleation.position.y >= -0.001F);
+        CHECK(nucleation.position.y <= 4.001F);
+        CHECK(nucleation.position.z >= basin.baseZ - basin.depthBelow - 0.001F);
+        CHECK(nucleation.position.z <= basin.baseZ + basin.heightAbove + 0.02F);
+    }
+
+    auto unselectedBasin = basin;
+    unselectedBasin.id = 99;
+    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&unselectedBasin);
+    const float unselectedRegionId = static_cast<float>(unselectedBasin.id);
+    const auto selectedOnlyBasinOverlay = invisible_places::water::GenerateBasinHazeOverlay(cloud, {basin});
+    CHECK(std::none_of(
+        selectedOnlyBasinOverlay.points.begin(),
+        selectedOnlyBasinOverlay.points.end(),
+        [unselectedRegionId](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.regionId == Catch::Approx(unselectedRegionId);
+        }));
+
+    invisible_places::water::WaterRunoffRegion runoff;
+    runoff.id = 12;
+    runoff.vertices = basin.vertices;
+    runoff.mode = invisible_places::water::WaterRunoffMode::LightRain;
+    runoff.groundVoxelSize = 1.0F;
+    runoff.highPointFraction = 1.0F;
+    runoff.density = 20.0F;
+    runoff.pathLength = 5.0F;
+    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&runoff);
+    auto trailSettings = invisible_places::water::DefaultWaterAnimationTrailSettings();
+    trailSettings.particleDensity = 0.4F;
+    trailSettings.trailLengthMeters = 0.5F;
+    const auto runoffOverlay = invisible_places::water::GenerateRunoffOverlay(cloud, {runoff}, trailSettings);
+    REQUIRE_FALSE(runoffOverlay.points.empty());
+    CHECK(std::any_of(
+        runoffOverlay.points.begin(),
+        runoffOverlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.featureType == Catch::Approx(2.0F) &&
+                   point.regionId == Catch::Approx(12.0F) &&
+                   point.particleRole >= 0.5F &&
+                   point.particleRole < 1.5F &&
+                   point.trailAge >= 0.0F &&
+                   point.trailLength > 0.0F;
+        }));
+    CHECK(std::any_of(
+        runoffOverlay.points.begin(),
+        runoffOverlay.points.end(),
+        [](const invisible_places::water::WaterOverlayPoint& point) {
+            return point.featureType == Catch::Approx(2.0F) &&
+                   point.particleRole < 0.5F &&
+                   point.pathPointCount >= 2.0F;
+        }));
+}
+
+TEST_CASE("Painted water caustic masks select existing boundary points without changing point count", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.hasNormals = true;
+    std::vector<bool> expectedInside;
+    std::vector<bool> expectedElevated;
+    for (int y = 0; y <= 5; ++y) {
+        for (int x = 0; x <= 5; ++x) {
+            const float groundZ = 0.02F * static_cast<float>(x) - 0.015F * static_cast<float>(y);
+            cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ});
+            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(cloud.positions.back());
+            expectedInside.push_back(true);
+            expectedElevated.push_back(false);
+            if ((x == 2 && y == 2) || (x == 3 && y == 2) || (x == 2 && y == 3) || (x == 4 && y == 4)) {
+                cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ + 1.15F});
+                cloud.normals.push_back({0.7F, 0.2F, 0.68F});
+                cloud.packedColors.push_back(0xFFFFFFFFU);
+                cloud.bounds.Expand(cloud.positions.back());
+                expectedInside.push_back(true);
+                expectedElevated.push_back(true);
+            }
+        }
+    }
+    cloud.positions.push_back({6.5F, 2.5F, 0.0F});
+    cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+    cloud.packedColors.push_back(0xFFFFFFFFU);
+    cloud.bounds.Expand(cloud.positions.back());
+    expectedInside.push_back(false);
+    expectedElevated.push_back(false);
+
+    invisible_places::water::WaterCausticRegion region;
+    region.id = 21;
+    region.vertices = {{-0.5F, -0.5F, 0.0F}, {5.5F, -0.5F, 0.1F}, {5.5F, 5.5F, 0.0F}, {-0.5F, 5.5F, -0.1F}};
+    region.edgeBlendWidth = 1.0F;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
+
+    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {region});
+
+    REQUIRE(mask.mask.size() == cloud.PointCount());
+    REQUIRE(mask.edge.size() == cloud.PointCount());
+    REQUIRE(mask.regionId.size() == cloud.PointCount());
+    REQUIRE(mask.planeDistance.size() == cloud.PointCount());
+    REQUIRE(mask.seed.size() == cloud.PointCount());
+    CHECK(mask.hasAnyEnabledRegion);
+
+    REQUIRE(expectedInside.size() == cloud.PointCount());
+    REQUIRE(expectedElevated.size() == cloud.PointCount());
+
+    const auto expectedAccepted = static_cast<std::size_t>(
+        std::count(expectedInside.begin(), expectedInside.end(), true));
+    std::size_t acceptedPoints = 0U;
+    std::size_t acceptedElevated = 0U;
+    float strongestAcceptedEdge = 0.0F;
+    bool sawAcceptedSeed = false;
+    float acceptedSeed = 0.0F;
+    for (std::size_t index = 0; index < cloud.PointCount(); ++index) {
+        if (mask.mask[index] <= 0.0F) {
+            CHECK_FALSE(expectedInside[index]);
+            continue;
+        }
+        CHECK(expectedInside[index]);
+        ++acceptedPoints;
+        if (expectedElevated[index]) {
+            ++acceptedElevated;
+        }
+        strongestAcceptedEdge = std::max(strongestAcceptedEdge, mask.edge[index]);
+        CHECK(mask.regionId[index] == Catch::Approx(21.0F));
+        CHECK(mask.planeDistance[index] == Catch::Approx(0.0F));
+        CHECK(mask.seed[index] >= 0.0F);
+        CHECK(mask.seed[index] <= 1.0F);
+        if (!sawAcceptedSeed) {
+            acceptedSeed = mask.seed[index];
+            sawAcceptedSeed = true;
+        } else {
+            CHECK(mask.seed[index] == Catch::Approx(acceptedSeed));
+        }
+    }
+
+    CHECK(mask.affectedPointCount == expectedAccepted);
+    CHECK(acceptedPoints == expectedAccepted);
+    CHECK(acceptedElevated == 4U);
+    const auto cornerIndex = static_cast<std::size_t>(0);
+    CHECK(strongestAcceptedEdge > mask.edge[cornerIndex]);
+}
+
+TEST_CASE("Water caustic masks use clicked concave boundaries instead of derived hulls", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {
+        {0.5F, 2.0F, 0.0F},
+        {3.0F, 2.0F, 0.0F},
+        {3.0F, 0.9F, 0.0F},
+        {4.5F, 2.0F, 0.0F},
+    };
+    cloud.packedColors.assign(cloud.positions.size(), 0xFFFFFFFFU);
+    for (const auto& position : cloud.positions) {
+        cloud.bounds.Expand(position);
+    }
+
+    invisible_places::water::WaterCausticRegion region;
+    region.id = 23;
+    region.vertices = {
+        {0.0F, 0.0F, 0.0F},
+        {4.0F, 0.0F, 0.0F},
+        {4.0F, 1.0F, 0.0F},
+        {1.0F, 1.0F, 0.0F},
+        {1.0F, 3.0F, 0.0F},
+        {4.0F, 3.0F, 0.0F},
+        {4.0F, 4.0F, 0.0F},
+        {0.0F, 4.0F, 0.0F},
+    };
+    region.edgeBlendWidth = 1.0F;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
+    REQUIRE(region.hull.size() == 4U);
+
+    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {region});
+
+    REQUIRE(mask.mask.size() == cloud.PointCount());
+    CHECK(mask.affectedPointCount == 2U);
+    CHECK(mask.mask[0] == Catch::Approx(1.0F));
+    CHECK(mask.mask[1] == Catch::Approx(0.0F));
+    CHECK(mask.mask[2] == Catch::Approx(1.0F));
+    CHECK(mask.mask[3] == Catch::Approx(0.0F));
+    CHECK(mask.edge[2] < 0.05F);
+    CHECK(mask.regionId[2] == Catch::Approx(23.0F));
+}
+
+TEST_CASE("Water caustic masks preserve millimeter ground gaps", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.hasNormals = true;
+    constexpr float spacing = 0.005F;
+    std::size_t gapPointCount = 0U;
+    for (int y = 0; y <= 200; ++y) {
+        for (int x = 0; x <= 200; ++x) {
+            const float px = static_cast<float>(x) * spacing;
+            const float py = static_cast<float>(y) * spacing;
+            if (px > 0.43F && px < 0.57F && py > 0.43F && py < 0.57F) {
+                ++gapPointCount;
+                continue;
+            }
+            const float pz = 0.006F * px - 0.004F * py;
+            cloud.positions.push_back({px, py, pz});
+            cloud.normals.push_back({-0.006F, 0.004F, 1.0F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(cloud.positions.back());
+        }
+    }
+
+    REQUIRE(gapPointCount > 0U);
+    const auto originalPointCount = cloud.PointCount();
+
+    invisible_places::water::WaterCausticRegion region;
+    region.id = 22;
+    region.vertices = {{-0.05F, -0.05F, 0.0F}, {1.05F, -0.05F, 0.0F}, {1.05F, 1.05F, 0.0F}, {-0.05F, 1.05F, 0.0F}};
+    region.edgeBlendWidth = 0.05F;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
+
+    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {region});
+
+    CHECK(cloud.PointCount() == originalPointCount);
+    REQUIRE(mask.mask.size() == originalPointCount);
+    CHECK(mask.affectedPointCount == originalPointCount);
+
+    bool acceptedInsideGap = false;
+    bool sawAcceptedSeed = false;
+    float acceptedSeed = 0.0F;
+    std::size_t maskedPointCount = 0U;
+    for (std::size_t index = 0; index < cloud.PointCount(); ++index) {
+        CHECK(mask.mask[index] == Catch::Approx(1.0F));
+        ++maskedPointCount;
+        const auto& point = cloud.positions[index];
+        if (point.x > 0.43F && point.x < 0.57F && point.y > 0.43F && point.y < 0.57F) {
+            acceptedInsideGap = true;
+        }
+        if (!sawAcceptedSeed) {
+            acceptedSeed = mask.seed[index];
+            sawAcceptedSeed = true;
+        } else {
+            CHECK(mask.seed[index] == Catch::Approx(acceptedSeed));
+        }
+    }
+    CHECK(maskedPointCount == originalPointCount);
+    CHECK_FALSE(acceptedInsideGap);
+}
+
+TEST_CASE("Water caustic masks resolve overlaps by interior distance then region id", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.5F, 0.5F, 0.0F}, {1.1F, 1.1F, 0.0F}};
+    cloud.packedColors = {0xFFFFFFFFU, 0xFFFFFFFFU};
+    for (const auto& position : cloud.positions) {
+        cloud.bounds.Expand(position);
+    }
+
+    invisible_places::water::WaterCausticRegion outer;
+    outer.id = 31;
+    outer.vertices = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
+    outer.edgeBlendWidth = 0.5F;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&outer);
+
+    invisible_places::water::WaterCausticRegion shifted;
+    shifted.id = 32;
+    shifted.vertices = {{0.25F, 0.25F, 0.0F}, {1.25F, 0.25F, 0.0F}, {1.25F, 1.25F, 0.0F}, {0.25F, 1.25F, 0.0F}};
+    shifted.edgeBlendWidth = 0.5F;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&shifted);
+
+    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {shifted, outer});
+    REQUIRE(mask.mask.size() == cloud.PointCount());
+    CHECK(mask.affectedPointCount == 2U);
+    CHECK(mask.regionId[0] == Catch::Approx(31.0F));
+    CHECK(mask.regionId[1] == Catch::Approx(32.0F));
+
+    invisible_places::water::WaterCausticRegion lowId = outer;
+    lowId.id = 40;
+    invisible_places::water::WaterCausticRegion highId = outer;
+    highId.id = 41;
+    const auto tieMask = invisible_places::water::GenerateCausticMask(cloud, {highId, lowId});
+    REQUIRE(tieMask.regionId.size() == cloud.PointCount());
+    CHECK(tieMask.regionId[0] == Catch::Approx(40.0F));
 }
 
 TEST_CASE("Water path smoothing changes baked anchor geometry", "[water]") {
@@ -1890,6 +3140,405 @@ TEST_CASE("Water path smoothing changes baked anchor geometry", "[water]") {
     CHECK(smoothAnchors.points.back().pathDistance > smoothAnchors.points.front().pathDistance);
 }
 
+TEST_CASE("Water path smoothing refreshes cached branch anchors without rebaking", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-cache-zigzag.ply";
+    cloud.layerName = "synthetic-water-cache-zigzag";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    for (int index = 0; index < 10; ++index) {
+        const float x = (index % 2 == 0) ? -0.04F : 0.04F;
+        const invisible_places::io::Float3 position{
+            x,
+            0.0F,
+            1.0F - static_cast<float>(index) * 0.08F};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({1.0F, 0.0F, 0.0F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    }
+
+    auto sourceSettings = invisible_places::water::DefaultWaterSourceSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    sourceSettings.path.autoTune = false;
+    sourceSettings.path.supportVoxelSize = 0.02F;
+    sourceSettings.path.maxBridgeDistance = 0.13F;
+    sourceSettings.path.pathLength = 0.8F;
+    sourceSettings.path.pathSampleSpacing = 0.03F;
+    sourceSettings.path.maxSteps = 32;
+    sourceSettings.path.supportSampleLimit = 64;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 29;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.04F;
+    emitter.confidence = 1.0F;
+
+    const auto cache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        sourceSettings);
+    REQUIRE_FALSE(cache.branches.empty());
+
+    auto rawSourceSettings = sourceSettings;
+    rawSourceSettings.path.smoothing = 0.0F;
+    auto smoothSourceSettings = sourceSettings;
+    smoothSourceSettings.path.smoothing = 1.0F;
+
+    const auto rawAnchors = invisible_places::water::BuildWaterPathAnchorsFromCache(
+        cache,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        rawSourceSettings);
+    const auto smoothAnchors = invisible_places::water::BuildWaterPathAnchorsFromCache(
+        cache,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        smoothSourceSettings);
+    REQUIRE(rawAnchors.points.size() > 8U);
+    REQUIRE(smoothAnchors.points.size() == rawAnchors.points.size());
+
+    const auto meanInteriorAbsX = [](const invisible_places::water::WaterOverlay& overlay) {
+        float sum = 0.0F;
+        std::size_t count = 0;
+        for (std::size_t index = 1U; index + 1U < overlay.points.size(); ++index) {
+            sum += std::abs(overlay.points[index].position.x);
+            ++count;
+        }
+        return count == 0U ? 0.0F : sum / static_cast<float>(count);
+    };
+
+    CHECK(meanInteriorAbsX(smoothAnchors) < meanInteriorAbsX(rawAnchors) * 0.85F);
+    CHECK(invisible_places::water::WaterSourceBakeInputsEqual(rawSourceSettings, smoothSourceSettings));
+}
+
+TEST_CASE("Water path bake inputs ignore refresh-only trail and smoothing settings", "[water]") {
+    auto source = invisible_places::water::DefaultWaterSourceSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    source.path.autoTune = false;
+    source.path.supportVoxelSize = 0.02F;
+    source.path.maxBridgeDistance = 0.10F;
+    source.path.pathLength = 0.55F;
+    source.path.pathSampleSpacing = 0.025F;
+    source.path.maxSteps = 32;
+    source.path.supportSampleLimit = 128;
+    auto refreshOnly = source;
+    refreshOnly.path.smoothing = std::clamp(source.path.smoothing + 0.25F, 0.0F, 1.0F);
+    refreshOnly.trailShape.particleJitter += 0.42F;
+    refreshOnly.trailShape.splineAnchorSpacing *= 1.7F;
+    refreshOnly.trailShape.trailLaneCount += 4U;
+    refreshOnly.trailShape.trailLooseness = std::clamp(source.trailShape.trailLooseness + 0.35F, 0.0F, 1.0F);
+    refreshOnly.trailShape.trailSmoothness = std::clamp(source.trailShape.trailSmoothness + 0.28F, 0.0F, 1.0F);
+    refreshOnly.trailShape.trailTurbulence += 0.35F;
+    refreshOnly.trailShape.trailMomentum = std::clamp(source.trailShape.trailMomentum + 0.25F, 0.0F, 0.98F);
+    refreshOnly.trailShape.normalTurbulenceResponse += 0.55F;
+    CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, refreshOnly));
+
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-trail-refresh.ply";
+    cloud.layerName = "synthetic-water-trail-refresh";
+    cloud.hasNormals = true;
+    for (int index = 0; index < 16; ++index) {
+        const invisible_places::io::Float3 position{
+            static_cast<float>(index % 3) * 0.01F,
+            0.0F,
+            1.0F - static_cast<float>(index) * 0.045F};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({0.7F, 0.0F, 0.71F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    }
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 31;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.04F;
+    emitter.confidence = 1.0F;
+
+    const auto sourceCache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        source);
+    const auto refreshOnlyCache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        refreshOnly);
+    REQUIRE_FALSE(sourceCache.branches.empty());
+    REQUIRE(sourceCache.branches.size() == refreshOnlyCache.branches.size());
+    CHECK(sourceCache.requestedSettings.pathLength == Catch::Approx(refreshOnlyCache.requestedSettings.pathLength));
+    CHECK(sourceCache.tunedSettings.maxBridgeDistance ==
+          Catch::Approx(refreshOnlyCache.tunedSettings.maxBridgeDistance));
+    for (std::size_t branchIndex = 0; branchIndex < sourceCache.branches.size(); ++branchIndex) {
+        const auto& leftBranch = sourceCache.branches[branchIndex];
+        const auto& rightBranch = refreshOnlyCache.branches[branchIndex];
+        CHECK(leftBranch.id == rightBranch.id);
+        CHECK(leftBranch.emitterId == rightBranch.emitterId);
+        REQUIRE(leftBranch.rawAnchors.size() == rightBranch.rawAnchors.size());
+        for (std::size_t anchorIndex = 0; anchorIndex < leftBranch.rawAnchors.size(); ++anchorIndex) {
+            const auto& leftAnchor = leftBranch.rawAnchors[anchorIndex];
+            const auto& rightAnchor = rightBranch.rawAnchors[anchorIndex];
+            CHECK(leftAnchor.position.x == Catch::Approx(rightAnchor.position.x));
+            CHECK(leftAnchor.position.y == Catch::Approx(rightAnchor.position.y));
+            CHECK(leftAnchor.position.z == Catch::Approx(rightAnchor.position.z));
+            CHECK(leftAnchor.pathDistance == Catch::Approx(rightAnchor.pathDistance));
+            CHECK(leftAnchor.surfaceSteepness == Catch::Approx(rightAnchor.surfaceSteepness));
+        }
+    }
+
+    auto bakeChanging = source;
+    bakeChanging.path.pathLength += 0.35F;
+    CHECK_FALSE(invisible_places::water::WaterSourceBakeInputsEqual(source, bakeChanging));
+
+    bakeChanging = source;
+    bakeChanging.path.branching = std::clamp(source.path.branching + 0.2F, 0.0F, 1.0F);
+    CHECK_FALSE(invisible_places::water::WaterSourceBakeInputsEqual(source, bakeChanging));
+}
+
+TEST_CASE("Water gap tolerance controls how much bridge upper limit is used", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-gap-tolerance.ply";
+    cloud.layerName = "synthetic-water-gap-tolerance";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    const auto appendPoint = [&](float y, float z) {
+        const invisible_places::io::Float3 position{0.0F, y, z};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({0.0F, 0.45F, 0.89F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    };
+    for (int index = 0; index < 4; ++index) {
+        appendPoint(static_cast<float>(index) * 0.006F, 1.0F - static_cast<float>(index) * 0.004F);
+    }
+    for (int index = 0; index < 6; ++index) {
+        appendPoint(0.055F + static_cast<float>(index) * 0.006F, 0.982F - static_cast<float>(index) * 0.004F);
+    }
+
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.autoTune = true;
+    settings.supportVoxelSize = 0.006F;
+    settings.maxBridgeDistance = 0.060F;
+    settings.pathLength = 0.14F;
+    settings.pathSampleSpacing = 0.006F;
+    settings.maxSteps = 64;
+    settings.supportSampleLimit = 128;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 31;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.025F;
+    emitter.confidence = 1.0F;
+
+    auto lowTolerance = settings;
+    lowTolerance.gapTolerance = 0.0F;
+    const auto lowCache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        lowTolerance);
+
+    auto highTolerance = settings;
+    highTolerance.gapTolerance = 1.0F;
+    const auto highCache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        highTolerance);
+
+    REQUIRE_FALSE(lowCache.branches.empty());
+    REQUIRE_FALSE(highCache.branches.empty());
+    CHECK(lowCache.tunedSettings.maxBridgeDistance < 0.025F);
+    CHECK(highCache.tunedSettings.maxBridgeDistance > 0.050F);
+    CHECK(highCache.branches.front().length > lowCache.branches.front().length + 0.025F);
+    CHECK(highCache.branches.front().gapCount > lowCache.branches.front().gapCount);
+}
+
+TEST_CASE("Site3 terrestrial sample water sources produce cached paths", "[water][sample][.]") {
+    const auto samplePath = DataRoot() / "Site3-Sample-Terrestrial.ply";
+    if (!std::filesystem::exists(samplePath)) {
+        return;
+    }
+
+    const auto loadResult = invisible_places::io::LoadPointCloud(samplePath);
+    REQUIRE(loadResult.success);
+    REQUIRE(loadResult.cloud.PointCount() > 0U);
+
+    auto sourceSettings = invisible_places::water::DefaultWaterSourceSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    sourceSettings.path.pathLength = 4.0F;
+    sourceSettings.path.maxBridgeDistance = 0.075F;
+    sourceSettings.path.gapTolerance = 0.85F;
+    sourceSettings.path.supportSampleLimit = 900000;
+
+    std::vector<invisible_places::water::WaterEmitter> emitters;
+    invisible_places::water::WaterEmitter canopyEdge;
+    canopyEdge.id = 101;
+    canopyEdge.name = "Site3 top edge";
+    canopyEdge.position = {307.199F, 100.993F, 2.088F};
+    canopyEdge.radius = 0.035F;
+    canopyEdge.confidence = 1.0F;
+    emitters.push_back(canopyEdge);
+
+    invisible_places::water::WaterEmitter rockEdge;
+    rockEdge.id = 102;
+    rockEdge.name = "Site3 rock edge";
+    rockEdge.position = {307.641F, 102.531F, 1.889F};
+    rockEdge.radius = 0.035F;
+    rockEdge.confidence = 1.0F;
+    emitters.push_back(rockEdge);
+
+    const auto cache = invisible_places::water::GenerateWaterPathCache(
+        loadResult.cloud,
+        emitters,
+        sourceSettings);
+    REQUIRE_FALSE(cache.branches.empty());
+    CHECK(cache.tunedSettings.maxBridgeDistance <= sourceSettings.path.maxBridgeDistance);
+    CHECK(cache.diagnostics.estimatedPointSpacing > 0.0F);
+    CHECK(cache.diagnostics.pathSampleSpacing <= 0.008F);
+
+    const auto anchors = invisible_places::water::BuildWaterPathAnchorsFromCache(
+        cache,
+        emitters,
+        sourceSettings);
+    CHECK_FALSE(anchors.points.empty());
+}
+
+TEST_CASE("Water path cache branches across flat fan support", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-flat-fan.ply";
+    cloud.layerName = "synthetic-water-flat-fan";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    for (int y = 0; y <= 7; ++y) {
+        const invisible_places::io::Float3 position{
+            0.0F,
+            static_cast<float>(y) * 0.025F,
+            1.0F - static_cast<float>(y) * 0.018F};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({1.0F, 0.0F, 0.0F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    }
+    for (int y = 8; y <= 14; ++y) {
+        for (int x = -3; x <= 3; ++x) {
+            const invisible_places::io::Float3 position{
+                static_cast<float>(x) * 0.022F,
+                static_cast<float>(y) * 0.025F,
+                0.86F + static_cast<float>((x + 3) % 2) * 0.001F};
+            cloud.positions.push_back(position);
+            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(position);
+        }
+    }
+
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.autoTune = false;
+    settings.supportVoxelSize = 0.018F;
+    settings.maxBridgeDistance = 0.065F;
+    settings.pathLength = 0.45F;
+    settings.pathSampleSpacing = 0.018F;
+    settings.branching = 1.0F;
+    settings.coverage = 1.0F;
+    settings.gapTolerance = 0.8F;
+    settings.maxSteps = 96;
+    settings.supportSampleLimit = 4096;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 17;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.035F;
+    emitter.confidence = 1.0F;
+
+    const auto cache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        settings);
+    REQUIRE(cache.branches.size() >= 3U);
+    CHECK(cache.diagnostics.branchCount == cache.branches.size());
+    CHECK(cache.diagnostics.averageConfidence > 0.0F);
+    CHECK(std::any_of(cache.branches.begin(), cache.branches.end(), [](const auto& branch) {
+        return branch.role == invisible_places::water::WaterPathBranchRole::Main;
+    }));
+    CHECK(std::any_of(cache.branches.begin(), cache.branches.end(), [](const auto& branch) {
+        return branch.role == invisible_places::water::WaterPathBranchRole::Spread ||
+               branch.role == invisible_places::water::WaterPathBranchRole::Secondary;
+    }));
+
+    invisible_places::water::WaterSourceSettings sourceSettings;
+    sourceSettings.path = settings;
+    const auto visibleAnchors = invisible_places::water::BuildWaterPathAnchorsFromCache(
+        cache,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        sourceSettings);
+    REQUIRE_FALSE(visibleAnchors.points.empty());
+
+    auto hiddenCache = cache;
+    hiddenCache.hiddenBranchIds.push_back(cache.branches.front().id);
+    const auto hiddenAnchors = invisible_places::water::BuildWaterPathAnchorsFromCache(
+        hiddenCache,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        sourceSettings);
+    CHECK(hiddenAnchors.points.size() < visibleAnchors.points.size());
+}
+
+TEST_CASE("Water path cache tags bridge gaps and round-trips hidden branches", "[water][serialization]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-gap.ply";
+    cloud.layerName = "synthetic-water-gap";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    const std::array<float, 7> gapHeights{1.0F, 0.972F, 0.944F, 0.820F, 0.792F, 0.764F, 0.736F};
+    for (std::size_t index = 0; index < gapHeights.size(); ++index) {
+        const float z = gapHeights[index];
+        const invisible_places::io::Float3 position{0.0F, 0.0F, z};
+        cloud.positions.push_back(position);
+        cloud.normals.push_back({1.0F, 0.0F, 0.0F});
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    }
+
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.autoTune = false;
+    settings.supportVoxelSize = 0.015F;
+    settings.maxBridgeDistance = 0.12F;
+    settings.pathLength = 0.45F;
+    settings.pathSampleSpacing = 0.015F;
+    settings.maxSteps = 32;
+    settings.supportSampleLimit = 128;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 5;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.03F;
+
+    auto cache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        settings);
+    CHECK(cache.schemaVersion == 2U);
+    REQUIRE_FALSE(cache.branches.empty());
+    CHECK(std::any_of(cache.branches.begin(), cache.branches.end(), [](const auto& branch) {
+        return branch.gapCount > 0U || branch.confidence < 0.95F;
+    }));
+    cache.supportLayerPath = cloud.sourcePath;
+    cache.supportSignature = "points=7";
+    cache.emitterSettingsFingerprint = "emitter=5";
+    cache.hiddenBranchIds.push_back(cache.branches.front().id);
+
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_water_path_cache_test.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveWaterPathCacheDocument(cache, outputPath, &errorMessage));
+    const auto loaded = invisible_places::serialization::LoadWaterPathCacheDocument(outputPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->schemaVersion == 2U);
+    CHECK(loaded->supportLayerPath == cache.supportLayerPath);
+    CHECK(loaded->supportSignature == cache.supportSignature);
+    CHECK(loaded->emitterSettingsFingerprint == cache.emitterSettingsFingerprint);
+    REQUIRE(loaded->branches.size() == cache.branches.size());
+    CHECK(loaded->hiddenBranchIds == cache.hiddenBranchIds);
+    CHECK(loaded->branches.front().rawAnchors.size() == cache.branches.front().rawAnchors.size());
+    std::filesystem::remove(outputPath);
+}
+
 TEST_CASE("Water emitter suggestions stay conservative and editable", "[water]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.hasNormals = true;
@@ -1931,8 +3580,15 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.sourceSettings.path.maxBridgeDistance = 6.5F;
     document.sourceSettings.trailShape.particleJitter = 0.72F;
     document.sourceSettings.trailShape.splineAnchorSpacing = 1.25F;
+    document.sourceSettings.trailShape.trailLaneCount = 5U;
+    document.sourceSettings.trailShape.trailTurbulence = 0.66F;
+    document.sourceSettings.trailShape.trailMomentum = 0.72F;
+    document.sourceSettings.trailShape.normalTurbulenceResponse = 1.25F;
+    document.sourceSettings.trailShape.trailLooseness = 0.61F;
+    document.sourceSettings.trailShape.trailSmoothness = 0.82F;
     document.tempSourceSettings = document.sourceSettings;
     document.tempSourceSettings->trailShape.particleJitter = 1.05F;
+    document.tempSourceSettings->trailShape.trailLaneCount = 8U;
     document.settings.path = document.sourceSettings.path;
     document.settings.trail.particleJitter = document.sourceSettings.trailShape.particleJitter;
     document.settings.trail.splineAnchorSpacing = document.sourceSettings.trailShape.splineAnchorSpacing;
@@ -1950,8 +3606,10 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     emitter.sourceSettingsAssignment = invisible_places::water::WaterSourceSettingsAssignment::Custom;
     emitter.sourceSettings = document.sourceSettings;
     emitter.sourceSettings->trailShape.splineAnchorSpacing = 0.75F;
+    emitter.sourceSettings->trailShape.trailTurbulence = 1.40F;
     emitter.tempSourceSettings = emitter.sourceSettings;
     emitter.tempSourceSettings->trailShape.particleJitter = 1.2F;
+    emitter.tempSourceSettings->trailShape.trailMomentum = 0.31F;
     document.emitters.push_back(emitter);
 
     invisible_places::water::WaterEmitter linkedEmitter;
@@ -1967,6 +3625,67 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     defaultEmitter.name = "default seep";
     defaultEmitter.position = {30.0F, 31.0F, 32.0F};
     document.emitters.push_back(defaultEmitter);
+    invisible_places::water::WaterPathCache sourcePathCache;
+    sourcePathCache.supportLayerPath = "Data/Site2 -5mm.ply";
+    sourcePathCache.supportSignature = "Data/Site2 -5mm.ply|points=4096";
+    sourcePathCache.emitterSettingsFingerprint = "source-fingerprint";
+    sourcePathCache.requestedSettings = document.sourceSettings.path;
+    sourcePathCache.tunedSettings = document.sourceSettings.path;
+    invisible_places::water::WaterPathBranch sourceBranch;
+    sourceBranch.id = 77U;
+    sourceBranch.emitterId = emitter.id;
+    sourceBranch.role = invisible_places::water::WaterPathBranchRole::Main;
+    sourceBranch.length = 1.75F;
+    sourceBranch.rawAnchors.push_back({
+        .position = emitter.position,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .emitterId = static_cast<float>(emitter.id),
+        .pathDistance = 0.0F,
+    });
+    sourceBranch.rawAnchors.push_back({
+        .position = {10.5F, 11.1F, 11.6F},
+        .normal = {0.0F, 0.0F, 1.0F},
+        .emitterId = static_cast<float>(emitter.id),
+        .pathDistance = 1.75F,
+    });
+    sourcePathCache.branches.push_back(sourceBranch);
+    document.pathCache = sourcePathCache;
+    invisible_places::water::WaterBasinRegion basinRegion;
+    basinRegion.id = 5;
+    basinRegion.vertices = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.1F}, {0.0F, 1.0F, -0.1F}};
+    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&basinRegion);
+    basinRegion.outletEdgeIndex = 0U;
+    basinRegion.outletBlocked = false;
+    document.basinRegions.push_back(basinRegion);
+    invisible_places::water::WaterRunoffRegion runoffRegion;
+    runoffRegion.id = 7;
+    runoffRegion.vertices = {{2.0F, 0.0F, 2.0F}, {3.0F, 0.0F, 2.0F}, {2.0F, 1.0F, 2.0F}};
+    runoffRegion.mode = invisible_places::water::WaterRunoffMode::LightRain;
+    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&runoffRegion);
+    runoffRegion.density = 1.6F;
+    document.runoffRegions.push_back(runoffRegion);
+    document.causticLookSettings = invisible_places::water::DefaultWaterCausticLookSettings();
+    document.causticLookSettings.enabled = true;
+    document.causticLookSettings.intensity = 1.4F;
+    document.causticLookSettings.opacityBoost = 0.22F;
+    document.causticLookSettings.cellSizeMeters = 0.16F;
+    document.causticLookSettings.lineWidthMeters = 0.010F;
+    document.causticLookSettings.featherMeters = 0.003F;
+    document.causticLookSettings.surfacePointSpacingMeters = 0.002F;
+    document.causticLookSettings.warpAmplitudeMeters = 0.025F;
+    document.tempCausticLookSettings = document.causticLookSettings;
+    document.tempCausticLookSettings->speed = 1.3F;
+    document.tempCausticLookSettings->lineWidthMeters = 0.018F;
+    invisible_places::water::WaterCausticRegion causticRegion;
+    causticRegion.id = 9;
+    causticRegion.name = "sandstone caustics";
+    causticRegion.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    causticRegion.vertices = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
+    causticRegion.planeMaxResidual = 0.12F;
+    causticRegion.planeMaxSlope = 0.65F;
+    causticRegion.previewTintMode = invisible_places::water::WaterCausticPreviewTintMode::Off;
+    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&causticRegion);
+    document.causticRegions.push_back(causticRegion);
 
     const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_water_sources.json";
     std::string errorMessage;
@@ -1976,13 +3695,25 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedSources},
             std::istreambuf_iterator<char>{}};
-        CHECK(savedJson.find("\"schema_version\": 2") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 6") != std::string::npos);
         CHECK(savedJson.find("\"water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_source_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_lane_count\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_smoothness\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_turbulence\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_momentum\"") != std::string::npos);
+        CHECK(savedJson.find("\"normal_turbulence_response\"") != std::string::npos);
         CHECK(savedJson.find("\"settings_assignment\"") != std::string::npos);
         CHECK(savedJson.find("\"linked_settings_emitter_id\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_basin_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_runoff_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
+        CHECK(savedJson.find("\"preview_tint_mode\"") != std::string::npos);
         CHECK(savedJson.find("\"water_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"water_bake_settings\"") == std::string::npos);
@@ -1995,10 +3726,17 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->sourceSettings.path.maxBridgeDistance == Catch::Approx(6.5F));
     CHECK(loaded->sourceSettings.trailShape.particleJitter == Catch::Approx(0.72F));
     CHECK(loaded->sourceSettings.trailShape.splineAnchorSpacing == Catch::Approx(1.25F));
+    CHECK(loaded->sourceSettings.trailShape.trailLaneCount == 5U);
+    CHECK(loaded->sourceSettings.trailShape.trailTurbulence == Catch::Approx(0.66F));
+    CHECK(loaded->sourceSettings.trailShape.trailMomentum == Catch::Approx(0.72F));
+    CHECK(loaded->sourceSettings.trailShape.normalTurbulenceResponse == Catch::Approx(1.25F));
+    CHECK(loaded->sourceSettings.trailShape.trailLooseness == Catch::Approx(0.61F));
+    CHECK(loaded->sourceSettings.trailShape.trailSmoothness == Catch::Approx(0.82F));
     CHECK(loaded->settings.path.maxBridgeDistance == Catch::Approx(6.5F));
     CHECK(loaded->settings.trail.particleJitter == Catch::Approx(0.72F));
     REQUIRE(loaded->tempSourceSettings.has_value());
     CHECK(loaded->tempSourceSettings->trailShape.particleJitter == Catch::Approx(1.05F));
+    CHECK(loaded->tempSourceSettings->trailShape.trailLaneCount == 8U);
     CHECK(loaded->bakeSettings.maxBridgeDistance == Catch::Approx(6.5F));
     CHECK(loaded->renderSettings.trail.splineAnchorSpacing == Catch::Approx(1.25F));
     REQUIRE(loaded->emitters.size() == 3);
@@ -2011,8 +3749,10 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->emitters[0].parentId.value() == 7U);
     REQUIRE(loaded->emitters[0].sourceSettings.has_value());
     CHECK(loaded->emitters[0].sourceSettings->trailShape.splineAnchorSpacing == Catch::Approx(0.75F));
+    CHECK(loaded->emitters[0].sourceSettings->trailShape.trailTurbulence == Catch::Approx(1.40F));
     REQUIRE(loaded->emitters[0].tempSourceSettings.has_value());
     CHECK(loaded->emitters[0].tempSourceSettings->trailShape.particleJitter == Catch::Approx(1.2F));
+    CHECK(loaded->emitters[0].tempSourceSettings->trailShape.trailMomentum == Catch::Approx(0.31F));
     CHECK(
         loaded->emitters[1].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::LinkedEmitter);
@@ -2022,6 +3762,39 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         loaded->emitters[2].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::Default);
     CHECK_FALSE(loaded->emitters[2].sourceSettings.has_value());
+    REQUIRE(loaded->basinRegions.size() == 1U);
+    REQUIRE(loaded->basinRegions[0].outletEdgeIndex.has_value());
+    CHECK_FALSE(loaded->basinRegions[0].outletBlocked);
+    REQUIRE(loaded->runoffRegions.size() == 1U);
+    CHECK(loaded->runoffRegions[0].mode == invisible_places::water::WaterRunoffMode::LightRain);
+    CHECK(loaded->runoffRegions[0].density == Catch::Approx(1.6F));
+    CHECK(loaded->causticLookSettings.enabled);
+    CHECK(loaded->causticLookSettings.intensity == Catch::Approx(1.4F));
+    CHECK(loaded->causticLookSettings.opacityBoost == Catch::Approx(0.22F));
+    CHECK(loaded->causticLookSettings.cellSizeMeters == Catch::Approx(0.16F));
+    CHECK(loaded->causticLookSettings.lineWidthMeters == Catch::Approx(0.010F));
+    CHECK(loaded->causticLookSettings.featherMeters == Catch::Approx(0.003F));
+    CHECK(loaded->causticLookSettings.surfacePointSpacingMeters == Catch::Approx(0.002F));
+    CHECK(loaded->causticLookSettings.warpAmplitudeMeters == Catch::Approx(0.025F));
+    REQUIRE(loaded->tempCausticLookSettings.has_value());
+    CHECK(loaded->tempCausticLookSettings->speed == Catch::Approx(1.3F));
+    CHECK(loaded->tempCausticLookSettings->lineWidthMeters == Catch::Approx(0.018F));
+    REQUIRE(loaded->pathCache.has_value());
+    CHECK(loaded->pathCache->supportLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loaded->pathCache->supportSignature == "Data/Site2 -5mm.ply|points=4096");
+    CHECK(loaded->pathCache->emitterSettingsFingerprint == "source-fingerprint");
+    REQUIRE(loaded->pathCache->branches.size() == 1U);
+    CHECK(loaded->pathCache->branches[0].id == 77U);
+    REQUIRE(loaded->pathCache->branches[0].rawAnchors.size() == 2U);
+    CHECK(loaded->pathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(1.75F));
+    REQUIRE(loaded->causticRegions.size() == 1U);
+    CHECK(loaded->causticRegions[0].name == "sandstone caustics");
+    CHECK(loaded->causticRegions[0].targetLayerSourcePath == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loaded->causticRegions[0].planeMaxResidual == Catch::Approx(0.12F));
+    CHECK(loaded->causticRegions[0].planeMaxSlope == Catch::Approx(0.65F));
+    CHECK(
+        loaded->causticRegions[0].previewTintMode ==
+        invisible_places::water::WaterCausticPreviewTintMode::Off);
     const auto& linkedSettings = invisible_places::water::ResolveWaterSourceSettings(
         loaded->emitters[1],
         loaded->emitters,
@@ -2034,6 +3807,60 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         loaded->emitters,
         loaded->sourceSettings);
     CHECK(fallbackSettings.trailShape.splineAnchorSpacing == Catch::Approx(1.25F));
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Legacy water caustic look settings derive meter controls", "[water][serialization]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_legacy_caustics.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 3,
+  "water_caustic_look_settings": {
+    "enabled": true,
+    "intensity": 1.0,
+    "scale": 5.0,
+    "line_sharpness": 0.5,
+    "warp": 0.4
+  }
+})";
+    }
+
+    std::string errorMessage;
+    const auto loaded = invisible_places::serialization::LoadWaterSourcesDocument(outputPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->causticLookSettings.enabled);
+    CHECK(loaded->causticLookSettings.cellSizeMeters == Catch::Approx(0.20F));
+    CHECK(loaded->causticLookSettings.lineWidthMeters == Catch::Approx(0.0185F));
+    CHECK(loaded->causticLookSettings.featherMeters == Catch::Approx(0.0074F));
+    CHECK(loaded->causticLookSettings.warpAmplitudeMeters == Catch::Approx(0.04F));
+    std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Legacy water trail shape derives looseness", "[water][serialization]") {
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_legacy_trail_looseness.json";
+    {
+        std::ofstream output{outputPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 3,
+  "water_source_settings": {
+    "trail_shape": {
+      "particle_jitter": 0.4,
+      "spline_anchor_spacing": 0.2,
+      "trail_lane_count": 5,
+      "trail_turbulence": 0.9,
+      "trail_momentum": 0.5,
+      "normal_turbulence_response": 1.2
+    }
+  }
+})";
+    }
+
+    std::string errorMessage;
+    const auto loaded = invisible_places::serialization::LoadWaterSourcesDocument(outputPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->sourceSettings.trailShape.trailLooseness == Catch::Approx(0.605F));
+    CHECK(loaded->sourceSettings.trailShape.trailSmoothness == Catch::Approx(0.55F));
     std::filesystem::remove(outputPath);
 }
 
@@ -2260,6 +4087,25 @@ TEST_CASE("Point material variant resolver selects simple and unified paths", "[
     auto zeroStrengthStylised = stylised;
     zeroStrengthStylised.stylisationStrength = 0.0F;
     CHECK(ResolvePointCloudMaterialVariant(zeroStrengthStylised) == PointCloudMaterialVariant::ConstantSimple);
+
+    auto caustic = style;
+    caustic.causticAnimation = true;
+    caustic.causticIntensity = 0.75F;
+    caustic.causticMaskFieldSlot = 0;
+    caustic.causticEdgeFieldSlot = 1;
+    caustic.causticSeedFieldSlot = 2;
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(caustic));
+    CHECK(ResolvePointCloudMaterialVariant(caustic) == PointCloudMaterialVariant::Unified);
+
+    auto previewTintOnly = caustic;
+    previewTintOnly.causticIntensity = 0.0F;
+    previewTintOnly.causticPreviewTintAmount = 0.3F;
+    previewTintOnly.causticPreviewTintRegionId = 21.0F;
+    CHECK(invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(previewTintOnly));
+    CHECK(ResolvePointCloudMaterialVariant(previewTintOnly) == PointCloudMaterialVariant::Unified);
+
+    previewTintOnly.causticAnimation = false;
+    CHECK_FALSE(invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(previewTintOnly));
 }
 
 TEST_CASE("Camera shot interpolation stores quaternion slerp and linear camera values", "[camera][shots]") {
@@ -2900,12 +4746,29 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     path.waterAnimationTrailSettings->particleDensity = 2.25F;
     path.waterAnimationTrailSettings->particleSpeed = 1.4F;
     path.waterAnimationTrailSettings->colorVariation = 0.72F;
+    path.waterAnimationTrailSettings->trailLengthMeters = 1.6F;
+    path.waterAnimationTrailSettings->trailSampleSpacingMeters = 0.066F;
     path.tempWaterAnimationTrailSettings = path.waterAnimationTrailSettings;
     path.tempWaterAnimationTrailSettings->particleSpeed = 1.8F;
+    path.tempWaterAnimationTrailSettings->trailLengthMeters = 2.1F;
+    path.tempWaterAnimationTrailSettings->trailSampleSpacingMeters = 0.041F;
     path.waterPointVisualStyle = invisible_places::renderer::pointcloud::PointCloudStyleState{};
     invisible_places::style::SetScalarConstant(&path.waterPointVisualStyle->opacity, 0.31F);
     path.tempWaterPointVisualStyle = path.waterPointVisualStyle;
     invisible_places::style::SetScalarConstant(&path.tempWaterPointVisualStyle->opacity, 0.44F);
+    path.waterCausticLookSettings = invisible_places::water::DefaultWaterCausticLookSettings();
+    path.waterCausticLookSettings->enabled = true;
+    path.waterCausticLookSettings->intensity = 1.6F;
+    path.waterCausticLookSettings->scale = 8.0F;
+    path.waterCausticLookSettings->cellSizeMeters = 0.14F;
+    path.waterCausticLookSettings->lineWidthMeters = 0.009F;
+    path.waterCausticLookSettings->featherMeters = 0.002F;
+    path.waterCausticLookSettings->surfacePointSpacingMeters = 0.0015F;
+    path.waterCausticLookSettings->warpAmplitudeMeters = 0.022F;
+    path.waterCausticLookSettings->tintRed = 0.72F;
+    path.tempWaterCausticLookSettings = path.waterCausticLookSettings;
+    path.tempWaterCausticLookSettings->pointSizeBoost = 0.35F;
+    path.tempWaterCausticLookSettings->featherMeters = 0.011F;
     path.keys = {
         {
             .id = "key_entry",
@@ -2940,14 +4803,18 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedAnimation},
             std::istreambuf_iterator<char>{}};
-        CHECK(savedJson.find("\"schema_version\": 6") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 7") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"still_camera_duration_seconds\"") != std::string::npos);
         CHECK(savedJson.find("\"linked_camera_id\": \"camera_entry\"") != std::string::npos);
         CHECK(savedJson.find("\"water_animation_trail_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_length_meters\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_sample_spacing_meters\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_animation_trail_settings\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_point_visual_style\"") != std::string::npos);
-        CHECK(savedJson.find("\"temp_water_point_visual_style\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_point_visual_style\"") == std::string::npos);
+        CHECK(savedJson.find("\"temp_water_point_visual_style\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"water_settings\"") == std::string::npos);
@@ -2978,14 +4845,27 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     CHECK(loadedPath->waterAnimationTrailSettings->particleDensity == Catch::Approx(2.25F));
     CHECK(loadedPath->waterAnimationTrailSettings->particleSpeed == Catch::Approx(1.4F));
     CHECK(loadedPath->waterAnimationTrailSettings->colorVariation == Catch::Approx(0.72F));
+    CHECK(loadedPath->waterAnimationTrailSettings->trailLengthMeters == Catch::Approx(1.6F));
+    CHECK(loadedPath->waterAnimationTrailSettings->trailSampleSpacingMeters == Catch::Approx(0.066F));
     REQUIRE(loadedPath->tempWaterAnimationTrailSettings.has_value());
     CHECK(loadedPath->tempWaterAnimationTrailSettings->particleSpeed == Catch::Approx(1.8F));
-    REQUIRE(loadedPath->waterPointVisualStyle.has_value());
-    CHECK(invisible_places::style::ScalarConstant(loadedPath->waterPointVisualStyle->opacity) ==
-          Catch::Approx(0.31F));
-    REQUIRE(loadedPath->tempWaterPointVisualStyle.has_value());
-    CHECK(invisible_places::style::ScalarConstant(loadedPath->tempWaterPointVisualStyle->opacity) ==
-          Catch::Approx(0.44F));
+    CHECK(loadedPath->tempWaterAnimationTrailSettings->trailLengthMeters == Catch::Approx(2.1F));
+    CHECK(loadedPath->tempWaterAnimationTrailSettings->trailSampleSpacingMeters == Catch::Approx(0.041F));
+    CHECK_FALSE(loadedPath->waterPointVisualStyle.has_value());
+    CHECK_FALSE(loadedPath->tempWaterPointVisualStyle.has_value());
+    REQUIRE(loadedPath->waterCausticLookSettings.has_value());
+    CHECK(loadedPath->waterCausticLookSettings->enabled);
+    CHECK(loadedPath->waterCausticLookSettings->intensity == Catch::Approx(1.6F));
+    CHECK(loadedPath->waterCausticLookSettings->scale == Catch::Approx(8.0F));
+    CHECK(loadedPath->waterCausticLookSettings->cellSizeMeters == Catch::Approx(0.14F));
+    CHECK(loadedPath->waterCausticLookSettings->lineWidthMeters == Catch::Approx(0.009F));
+    CHECK(loadedPath->waterCausticLookSettings->featherMeters == Catch::Approx(0.002F));
+    CHECK(loadedPath->waterCausticLookSettings->surfacePointSpacingMeters == Catch::Approx(0.0015F));
+    CHECK(loadedPath->waterCausticLookSettings->warpAmplitudeMeters == Catch::Approx(0.022F));
+    CHECK(loadedPath->waterCausticLookSettings->tintRed == Catch::Approx(0.72F));
+    REQUIRE(loadedPath->tempWaterCausticLookSettings.has_value());
+    CHECK(loadedPath->tempWaterCausticLookSettings->pointSizeBoost == Catch::Approx(0.35F));
+    CHECK(loadedPath->tempWaterCausticLookSettings->featherMeters == Catch::Approx(0.011F));
     CHECK_FALSE(loadedPath->waterSettings.has_value());
     CHECK_FALSE(loadedPath->tempWaterSettings.has_value());
     CHECK(loadedPath->keys[0].cameraPosition[2] == Catch::Approx(3.0F));
@@ -2997,6 +4877,39 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     CHECK(loadedPath->keys[0].id == "key_entry");
     CHECK(loadedPath->keys[0].linkedCameraId == "camera_entry");
     CHECK(loadedPath->keys[0].linkedCameraName == "Entry");
+
+    {
+        std::ofstream legacyOutput{outputPath, std::ios::trunc};
+        legacyOutput << R"({
+  "schema_version": 7,
+  "name": "Legacy Water Visual Animation",
+  "duration_frames": 12,
+  "associated_layer_paths": [],
+  "export_settings": {},
+  "water_point_visual_style": {
+    "opacity": {"active": true, "constant_value": [0.31, 0.0, 0.0, 0.0]}
+  },
+  "temp_water_point_visual_style": {
+    "opacity": {"active": true, "constant_value": [0.44, 0.0, 0.0, 0.0]}
+  },
+  "keys": [
+    {
+      "id": "legacy_key",
+      "camera_position": [0.0, 0.0, 2.0],
+      "focus_point": [0.0, 0.0, 0.0]
+    }
+  ]
+})";
+    }
+    const auto legacyLoadedPath =
+        invisible_places::serialization::LoadAnimationPath(outputPath, &errorMessage);
+    REQUIRE(legacyLoadedPath.has_value());
+    REQUIRE(legacyLoadedPath->waterPointVisualStyle.has_value());
+    CHECK(invisible_places::style::ScalarConstant(legacyLoadedPath->waterPointVisualStyle->opacity) ==
+          Catch::Approx(0.31F));
+    REQUIRE(legacyLoadedPath->tempWaterPointVisualStyle.has_value());
+    CHECK(invisible_places::style::ScalarConstant(legacyLoadedPath->tempWaterPointVisualStyle->opacity) ==
+          Catch::Approx(0.44F));
 
     std::filesystem::remove(outputPath);
 }
@@ -4271,6 +6184,118 @@ TEST_CASE("Offline point renderer uses safe defaults for inactive material bindi
     CHECK(inactiveColormapImage.beautyR[center] == Catch::Approx(defaultColormapImage.beautyR[center]));
     CHECK(inactiveColormapImage.beautyG[center] == Catch::Approx(defaultColormapImage.beautyG[center]));
     CHECK(inactiveColormapImage.beautyB[center] == Catch::Approx(defaultColormapImage.beautyB[center]));
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState customGradient = baseline;
+    customGradient.colorMode =
+        invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
+    customGradient.colormap =
+        invisible_places::renderer::pointcloud::PointCloudColormapId::CustomGradient;
+    customGradient.gradientStartColor = {1.0F, 0.0F, 0.0F};
+    customGradient.gradientEndColor = {0.0F, 0.0F, 1.0F};
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &customGradient.colormapPosition,
+        0,
+        "Value",
+        0.0F,
+        1.0F,
+        &cloud.scalarFields.front());
+    const auto customGradientImage = renderWithStyle(customGradient);
+    CHECK(customGradientImage.beautyR[center] < 0.05F);
+    CHECK(customGradientImage.beautyG[center] < 0.05F);
+    CHECK(customGradientImage.beautyB[center] > 0.95F);
+}
+
+TEST_CASE("Offline water streaks follow projected flow tangent", "[output][offline][water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {
+        {0.0F, 0.0F, -0.25F},
+        {0.0F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 0.25F},
+        {0.0F, 0.0F, 0.0F},
+    };
+    cloud.hasSourceRgb = false;
+    constexpr std::size_t kFieldCount = 13U;
+    cloud.scalarFields.reserve(kFieldCount);
+    for (std::size_t fieldIndex = 0; fieldIndex < kFieldCount; ++fieldIndex) {
+        cloud.scalarFields.push_back({
+            .name = "Field" + std::to_string(fieldIndex),
+            .minimum = 0.0F,
+            .maximum = 1.0F,
+            .count = cloud.positions.size(),
+            .valid = true,
+        });
+    }
+    cloud.scalarFieldValues.assign(kFieldCount * cloud.positions.size(), 0.0F);
+    auto setField = [&cloud](std::size_t fieldSlot, std::size_t pointIndex, float value) {
+        cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, pointIndex)] = value;
+    };
+    setField(3U, 3U, 0.5F);
+    setField(4U, 3U, 0.02F);
+    setField(5U, 3U, 0.0F);
+    setField(9U, 3U, 1.0F);
+    setField(10U, 3U, 0.0F);
+    setField(11U, 3U, 3.0F);
+    setField(12U, 3U, 0.5F);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.geometryMode =
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+    style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
+    style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    style.flowAnimation = true;
+    style.waterStreakAspect = 8.0F;
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.08F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = false,
+        .localToWorld = glm::mat4{1.0F},
+    };
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.fovDegrees = 45.0F;
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 96, 96);
+    invisible_places::output::RenderPointCloudTile(
+        {layer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 96, 96},
+        &image);
+
+    std::uint32_t minX = image.width;
+    std::uint32_t maxX = 0;
+    std::uint32_t minY = image.height;
+    std::uint32_t maxY = 0;
+    for (std::uint32_t y = 0; y < image.height; ++y) {
+        for (std::uint32_t x = 0; x < image.width; ++x) {
+            const auto index = static_cast<std::size_t>(y) * image.width + x;
+            if (image.alpha[index] <= 0.01F) {
+                continue;
+            }
+            minX = std::min(minX, x);
+            maxX = std::max(maxX, x);
+            minY = std::min(minY, y);
+            maxY = std::max(maxY, y);
+        }
+    }
+
+    REQUIRE(minX <= maxX);
+    REQUIRE(minY <= maxY);
+    const auto width = maxX - minX + 1U;
+    const auto height = maxY - minY + 1U;
+    CHECK(height > width * 3U);
 }
 
 TEST_CASE("Offline point diagnostics skip depth pass for non-depth layers", "[output][offline][point-style]") {
