@@ -6,7 +6,8 @@
 int main(int argc, char** argv) {
     std::filesystem::path dataRoot;
     const auto firstArg = argc > 1 && argv[1] != nullptr ? std::string_view{argv[1]} : std::string_view{};
-    if (!firstArg.empty() && firstArg != "--lod-compare" && firstArg != "--lod-cache-check") {
+    if (!firstArg.empty() && firstArg != "--lod-compare" && firstArg != "--lod-cache-check" &&
+        firstArg != "--lod-stream-check") {
         dataRoot = argv[1];
     }
 
@@ -24,6 +25,13 @@ int main(int argc, char** argv) {
             pointCloudPath = argv[2];
         }
         return application.RunLodCacheCheck(pointCloudPath);
+    }
+    if (firstArg == "--lod-stream-check") {
+        std::filesystem::path pointCloudPath;
+        if (argc > 2 && argv[2] != nullptr) {
+            pointCloudPath = argv[2];
+        }
+        return application.RunLodStreamCheck(pointCloudPath);
     }
     return application.Run();
 }

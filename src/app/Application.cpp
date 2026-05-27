@@ -78,6 +78,7 @@
 
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/geometric.hpp>
 #include <glm/matrix.hpp>
 #include <glm/vec2.hpp>
@@ -162,9 +163,14 @@ using WaterStreamOverlay = invisible_places::water::WaterStreamOverlay;
 using WaterTrailBuildDiagnostics = invisible_places::water::WaterTrailBuildDiagnostics;
 using WaterTrailBuildQuality = invisible_places::water::WaterTrailBuildQuality;
 using TrailSurfaceIndex = invisible_places::water::TrailSurfaceIndex;
+struct PointCloudStreamingLoadResult {
+    bool success = true;
+    std::string errorMessage;
+};
 using LayerLoadResult = std::variant<
     invisible_places::io::PointCloudLoadResult,
-    invisible_places::io::GaussianSplatLoadResult>;
+    invisible_places::io::GaussianSplatLoadResult,
+    PointCloudStreamingLoadResult>;
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr std::size_t kMaxPivotSamples = 65536;
@@ -416,6 +422,7 @@ struct OfflineRenderProgressState {
 };
 
 struct PreviewLayerSession;
+std::uint64_t CurrentResidentMemoryBytes();
 struct PreviewRuntimeState;
 
 void EnsureCameraShotSelections(CameraPanelState* panelState, std::size_t shotCount);
@@ -661,6 +668,12 @@ struct PreviewLayerSession {
     std::string pointIpcloudPublishStatus = "not published";
     bool pointCloudPreviewActive = false;
     bool pointCloudPreviewFromPersistentCache = false;
+    bool pointIpcloudStreamingActive = false;
+    std::string pointIpcloudStreamingFallbackReason;
+    invisible_places::renderer::pointcloud::PointCloudIpcloudRawChunkCatalog pointIpcloudRawChunkCatalog;
+    invisible_places::renderer::pointcloud::PointCloudIpcloudResidencyDiagnostics pointIpcloudResidencyDiagnostics{};
+    std::uint64_t pointIpcloudStreamingRevision = 0;
+    std::uint64_t pointIpcloudPeakResidentMemoryBytes = 0;
     std::uint64_t pointIpcloudPreviewPointCount = 0;
     std::uint64_t pointIpcloudRepresentedSourceCount = 0;
     double pointIpcloudTimeToBoundsMs = 0.0;
@@ -4758,6 +4771,7 @@ bool PopulateAdaptivePointCloudLayer(
     bool allowReusePrevious,
     bool allowSynchronousTraversal,
     std::uint64_t frameCounter,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
     invisible_places::renderer::core::SceneRenderState::PointCloudLayerState* layer) {
     if (session == nullptr || layer == nullptr) {
         return false;
@@ -4848,11 +4862,78 @@ bool PopulateAdaptivePointCloudLayer(
         return false;
     }
 
+    auto adaptiveDrawItems = result.drawItems;
+    auto representativeCount = result.representativeCount;
+    auto drawItemBytes = result.drawItemBytes;
+    auto adaptiveRevision = result.revision;
+    if (session->pointIpcloudStreamingActive) {
+        if (viewport == nullptr) {
+            session->pointIpcloudStreamingFallbackReason =
+                "streaming resident upload unavailable for this render surface";
+            session->pointIpcloudResidencyDiagnostics.fallbackReason =
+                session->pointIpcloudStreamingFallbackReason;
+            layer->adaptiveDrawItems.reset();
+            layer->useAdaptiveDrawItems = false;
+            layer->drawPointCount = 0;
+            layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
+            layer->adaptiveLodFallbackState = "streaming fallback unavailable";
+            return false;
+        }
+
+        auto resident = invisible_places::renderer::pointcloud::BuildPointCloudIpcloudResidentSet(
+            session->pointIpcloudBundlePath,
+            session->pointIpcloudRawChunkCatalog,
+            result.frontierNodeIndices,
+            *result.drawItems,
+            session->scalarFields,
+            result.governorOutput.maxUploadBytesPerFrame);
+        session->pointIpcloudResidencyDiagnostics = resident.diagnostics;
+        session->pointIpcloudPeakResidentMemoryBytes =
+            std::max(session->pointIpcloudPeakResidentMemoryBytes, CurrentResidentMemoryBytes());
+        if (!resident.loaded || resident.remappedDrawItems.empty()) {
+            session->pointIpcloudStreamingFallbackReason =
+                resident.diagnostics.fallbackReason.empty() ? "visible chunks not resident"
+                                                           : resident.diagnostics.fallbackReason;
+            layer->adaptiveDrawItems.reset();
+            layer->useAdaptiveDrawItems = false;
+            layer->drawPointCount = 0;
+            layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
+            layer->adaptiveLodFallbackState = "waiting on streamed chunks";
+            return false;
+        }
+
+        try {
+            viewport->UploadPointCloudResidentSubset(layer->layerId, resident.cloud);
+            adaptiveDrawItems =
+                std::make_shared<const std::vector<PointCloudDrawItemGpu>>(std::move(resident.remappedDrawItems));
+            representativeCount = adaptiveDrawItems->size();
+            drawItemBytes = DrawItemByteCount(representativeCount);
+            session->pointIpcloudStreamingFallbackReason.clear();
+            session->pointIpcloudStreamingRevision =
+                session->pointIpcloudStreamingRevision == std::numeric_limits<std::uint64_t>::max()
+                    ? 1ULL
+                    : session->pointIpcloudStreamingRevision + 1ULL;
+            adaptiveRevision = result.revision ^
+                               (session->pointIpcloudStreamingRevision * 0x9e3779b97f4a7c15ULL);
+        } catch (const std::exception& error) {
+            session->pointIpcloudStreamingFallbackReason =
+                "resident chunk upload failed: " + std::string{error.what()};
+            session->pointIpcloudResidencyDiagnostics.fallbackReason =
+                session->pointIpcloudStreamingFallbackReason;
+            layer->adaptiveDrawItems.reset();
+            layer->useAdaptiveDrawItems = false;
+            layer->drawPointCount = 0;
+            layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
+            layer->adaptiveLodFallbackState = "streaming upload failed";
+            return false;
+        }
+    }
+
     layer->drawPointCount = static_cast<std::uint32_t>(
-        std::min<std::size_t>(result.representativeCount, std::numeric_limits<std::uint32_t>::max()));
-    layer->adaptiveDrawItems = result.drawItems;
+        std::min<std::size_t>(representativeCount, std::numeric_limits<std::uint32_t>::max()));
+    layer->adaptiveDrawItems = adaptiveDrawItems;
     layer->useAdaptiveDrawItems = true;
-    layer->adaptiveLodRevision = result.revision;
+    layer->adaptiveLodRevision = adaptiveRevision;
     layer->adaptiveRepresentedSourceCount = result.representedSourceCount;
     layer->adaptiveVisibleRepresentedSourceCount = result.visibleRepresentedSourceCount;
     layer->adaptiveEmittedRepresentedSourceCount = result.emittedRepresentedSourceCount;
@@ -4909,7 +4990,7 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveLodAsyncPendingAgeMs = result.asyncPendingAgeMs;
     layer->adaptiveLodDisplayedCacheAgeFrames = result.displayedCacheAgeFrames;
     layer->adaptiveLodStaleTraversalDiscardedCount = result.staleTraversalDiscardedCount;
-    layer->adaptiveDrawItemBytes = result.drawItemBytes;
+    layer->adaptiveDrawItemBytes = drawItemBytes;
     layer->adaptiveLodPersistentCacheStatus = result.persistentCacheStatus;
     layer->adaptiveLodRuntimeStatus = result.runtimeStatus;
     layer->adaptiveLodRequestedDensity =
@@ -6392,6 +6473,51 @@ bool ActivatePointCloudPreview(
     if (session.pointLodHierarchyGeneration == 0ULL) {
         session.pointLodHierarchyGeneration = 1ULL;
     }
+    session.pointIpcloudStreamingActive = false;
+    session.pointIpcloudStreamingFallbackReason.clear();
+    session.pointIpcloudRawChunkCatalog = {};
+    session.pointIpcloudResidencyDiagnostics = {};
+    session.pointIpcloudStreamingRevision = 0;
+    if (preview.fromPersistentBundle && !session.pointIpcloudBundlePath.empty()) {
+        std::string sourceError;
+        const auto sourceInfo =
+            invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(session.sourcePath, &sourceError);
+        if (sourceInfo.has_value()) {
+            auto hierarchyLoad = invisible_places::renderer::pointcloud::LoadPointCloudIpcloudHierarchy(
+                session.pointIpcloudBundlePath,
+                sourceInfo.value(),
+                session.pointLodBuildConfig);
+            if (hierarchyLoad.loaded) {
+                session.pointLodHierarchy =
+                    std::make_shared<invisible_places::renderer::pointcloud::PointCloudLodHierarchy>(
+                        std::move(hierarchyLoad.hierarchy));
+                session.pointLodHierarchyGeneration =
+                    session.pointLodHierarchyGeneration == std::numeric_limits<std::uint64_t>::max()
+                        ? 1ULL
+                        : session.pointLodHierarchyGeneration + 1ULL;
+                if (session.pointLodHierarchyGeneration == 0ULL) {
+                    session.pointLodHierarchyGeneration = 1ULL;
+                }
+                session.pointIpcloudRawChunkCatalog =
+                    invisible_places::renderer::pointcloud::LoadPointCloudIpcloudRawChunkCatalog(
+                        session.pointIpcloudBundlePath);
+                session.pointIpcloudStreamingActive =
+                    !session.pointIpcloudRawChunkCatalog.chunks.empty() &&
+                    !session.pointIpcloudRawChunkCatalog.nodeRanges.empty();
+                session.pointLodCacheStatus =
+                    session.pointIpcloudStreamingActive
+                        ? "Rendering coarse preview; streaming .ipcloud raw chunks"
+                        : "Rendering coarse preview; .ipcloud raw chunks unavailable";
+                session.pointIpcloudStreamingFallbackReason =
+                    session.pointIpcloudStreamingActive ? std::string{} : "raw chunk catalog missing";
+            } else {
+                session.pointIpcloudStreamingFallbackReason = hierarchyLoad.message;
+            }
+        } else {
+            session.pointIpcloudStreamingFallbackReason =
+                sourceError.empty() ? "could not inspect source for streaming" : sourceError;
+        }
+    }
 
     SanitizePointCloudStyle(&session);
     if (session.kind == LayerKind::PointCloud) {
@@ -6472,6 +6598,11 @@ bool ActivateLoadedPointCloud(
     session.pointLodHierarchyGeneration = 0;
     session.pointCloudPreviewActive = false;
     session.pointCloudPreviewFromPersistentCache = false;
+    session.pointIpcloudStreamingActive = false;
+    session.pointIpcloudStreamingFallbackReason.clear();
+    session.pointIpcloudRawChunkCatalog = {};
+    session.pointIpcloudResidencyDiagnostics = {};
+    session.pointIpcloudStreamingRevision = 0;
     session.pointIpcloudTimeToFirstRefinedFrameMs =
         replacingPreview && previewLoadStartedAt.time_since_epoch().count() != 0
             ? MillisecondsBetween(previewLoadStartedAt, std::chrono::steady_clock::now())
@@ -6709,7 +6840,12 @@ void BeginLayerLoad(std::size_t sessionIndex, PreviewRuntimeState* runtimeState)
                     }
                     if (preview.loaded && !stopToken.stop_requested()) {
                         std::scoped_lock lock(backgroundState->mutex);
+                        const bool streamingReady = preview.fromPersistentBundle;
                         backgroundState->pointCloudPreview = std::move(preview);
+                        if (streamingReady) {
+                            backgroundState->result = LayerLoadResult{PointCloudStreamingLoadResult{}};
+                            return;
+                        }
                     }
                 }
                 result = LayerLoadResult{invisible_places::io::LoadPointCloud(
@@ -6776,6 +6912,15 @@ void PollPendingLayerLoad(
             return;
         }
 
+        if (std::holds_alternative<PointCloudStreamingLoadResult>(completedResult.value())) {
+            runtimeState->statusMessage =
+                runtimeState->sessions[pendingLoad.sessionIndex].displayName +
+                ": warm .ipcloud streaming active.";
+            runtimeState->errorMessage.clear();
+            runtimeState->pendingLoad.reset();
+            return;
+        }
+
         pendingLoad.completedResult = std::move(completedResult);
         pendingLoad.phase = PendingLoadPhase::UploadPending;
         pendingLoad.showUploadOverlayFrame = true;
@@ -6813,12 +6958,14 @@ void PollPendingLayerLoad(
                     std::move(loadResult.cloud),
                     runtimeState,
                     viewport);
-            } else {
+            } else if constexpr (std::is_same_v<LoadType, invisible_places::io::GaussianSplatLoadResult>) {
                 ActivateLoadedGaussianSplats(
                     pendingLoad.sessionIndex,
                     std::move(loadResult.splats),
                     runtimeState,
                     viewport);
+            } else {
+                static_cast<void>(loadResult);
             }
         },
         std::move(completedLoad));
@@ -12246,6 +12393,7 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                 false,
                 true,
                 static_cast<std::uint64_t>(job.currentFrame) + 1ULL,
+                nullptr,
                 &layer));
         }
     }
@@ -14295,6 +14443,25 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             session.pointIpcloudTimeToBoundsMs,
             session.pointIpcloudTimeToFirstCoarseFrameMs,
             session.pointIpcloudTimeToFirstRefinedFrameMs);
+        const auto& residency = session.pointIpcloudResidencyDiagnostics;
+        ImGui::Text(
+            ".ipcloud streaming: %s | chunks %u requested, %u resident, %u missing | hit %.1f%%",
+            session.pointIpcloudStreamingActive ? "active" : "inactive",
+            residency.visibleChunkRequestCount,
+            residency.residentChunkCount,
+            residency.missingChunkCount,
+            static_cast<double>(residency.chunkHitRate) * 100.0);
+        ImGui::Text(
+            "Residency: CPU %s | GPU %s | upload %s / %s | queue %u | peak RSS %s",
+            FormatByteCount(residency.cpuResidentBytes).c_str(),
+            FormatByteCount(residency.gpuResidentBytes).c_str(),
+            FormatByteCount(residency.uploadBytesThisFrame).c_str(),
+            FormatByteCount(residency.uploadBudgetBytes).c_str(),
+            residency.uploadQueueLength,
+            FormatByteCount(session.pointIpcloudPeakResidentMemoryBytes).c_str());
+        if (!session.pointIpcloudStreamingFallbackReason.empty()) {
+            ImGui::TextWrapped("Streaming fallback: %s", session.pointIpcloudStreamingFallbackReason.c_str());
+        }
     }
 
     if (session.pointLodHierarchy != nullptr && !session.pointLodHierarchy->Empty()) {
@@ -20425,7 +20592,7 @@ void UpdatePerformanceInteractionState(
 
 invisible_places::renderer::core::SceneRenderState BuildRenderState(
     PreviewRuntimeState& runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    invisible_places::renderer::core::VulkanViewportShell& viewport,
     float flowTimeSeconds) {
     invisible_places::renderer::core::SceneRenderState renderState;
     const auto aspectRatio = CurrentAspectRatio(viewport);
@@ -20501,6 +20668,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                     true,
                     false,
                     runtimeState.previewFrameCounter,
+                    &viewport,
                     &layer));
             }
             renderState.pointCloudLayers.push_back(std::move(layer));
@@ -20607,6 +20775,7 @@ invisible_places::renderer::core::SceneRenderState BuildExactAdaptiveComparisonR
             false,
             true,
             runtimeState.previewFrameCounter,
+            nullptr,
             &layer));
         renderState.pointCloudLayers.push_back(std::move(layer));
     }
@@ -22055,6 +22224,326 @@ int Application::RunLodCacheCheck(std::filesystem::path pointCloudPath) const {
         return success ? 0 : 11;
     } catch (const std::exception& error) {
         std::cerr << ".ipcloud cache check failed: " << error.what() << "\n";
+        return 12;
+    }
+}
+
+int Application::RunLodStreamCheck(std::filesystem::path pointCloudPath) const {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    struct StreamPassMetrics {
+        std::string name;
+        std::size_t drawItems = 0;
+        std::size_t remappedDrawItems = 0;
+        std::uint32_t requestedChunks = 0;
+        std::uint32_t residentChunks = 0;
+        std::uint32_t missingChunks = 0;
+        std::uint64_t cpuResidentBytes = 0;
+        std::uint64_t gpuResidentBytes = 0;
+        std::uint64_t uploadBytes = 0;
+        std::uint64_t uploadBudgetBytes = 0;
+        std::uint32_t uploadQueueLength = 0;
+        float chunkHitRate = 0.0F;
+        std::uint32_t evictionCount = 0;
+        std::string evictionReason;
+        double traversalMs = 0.0;
+        double residencyMs = 0.0;
+        bool loaded = false;
+    };
+
+    try {
+        if (pointCloudPath.empty()) {
+            pointCloudPath = dataRoot_ / "Site3-Sample-Terrestrial.ply";
+        } else if (pointCloudPath.is_relative() && !std::filesystem::exists(pointCloudPath)) {
+            pointCloudPath = dataRoot_ / pointCloudPath;
+        }
+
+        std::cout << "Invisible Places .ipcloud stream check" << std::endl;
+        std::cout << "Data root: " << dataRoot_.string() << std::endl;
+        std::cout << "Point cloud: " << pointCloudPath.string() << std::endl << std::endl;
+
+        pc::PointCloudLodBuildConfig buildConfig{};
+        std::string sourceError;
+        const auto sourceInfo = pc::MakePointCloudIpcloudSourceInfo(pointCloudPath, &sourceError);
+        if (!sourceInfo.has_value()) {
+            std::cerr << "Could not inspect point cloud source: " << sourceError << "\n";
+            return 2;
+        }
+
+        const auto cacheDirectory = dataRoot_.parent_path() / "Saved" / "PointCloudCache";
+        const auto bundlePath = pc::BuildPointCloudIpcloudBundlePath(cacheDirectory, sourceInfo.value());
+        std::error_code createCacheError;
+        std::filesystem::create_directories(cacheDirectory, createCacheError);
+        if (createCacheError) {
+            std::cerr << "Could not create .ipcloud cache directory: " << createCacheError.message() << "\n";
+            return 3;
+        }
+
+        const auto startResidentBytes = CurrentResidentMemoryBytes();
+        auto inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), buildConfig);
+        std::uint64_t baselineFullSourceResidentBytes = 0;
+        double rebuildFullLoadMs = 0.0;
+        double rebuildHierarchyMs = 0.0;
+        double rebuildPublishMs = 0.0;
+        bool rebuilt = false;
+        if (inspection.state != pc::PointCloudIpcloudCacheState::Hit) {
+            std::cout << "Streaming cache is "
+                      << pc::PointCloudIpcloudCacheStateName(inspection.state)
+                      << " (" << inspection.reason << "); rebuilding v2 bundle.\n";
+            const auto fullLoadStart = std::chrono::steady_clock::now();
+            auto loadResult = invisible_places::io::LoadPointCloud(pointCloudPath);
+            const auto fullLoadEnd = std::chrono::steady_clock::now();
+            if (!loadResult.success) {
+                std::cerr << "Could not load full point cloud: " << loadResult.errorMessage << "\n";
+                return 4;
+            }
+            rebuildFullLoadMs = MillisecondsBetween(fullLoadStart, fullLoadEnd);
+            baselineFullSourceResidentBytes = CurrentResidentMemoryBytes();
+
+            const auto hierarchyStart = std::chrono::steady_clock::now();
+            auto hierarchy = pc::BuildPointCloudLodHierarchy(loadResult.cloud, buildConfig);
+            const auto hierarchyEnd = std::chrono::steady_clock::now();
+            if (hierarchy.Empty()) {
+                std::cerr << "LOD hierarchy build produced no nodes.\n";
+                return 5;
+            }
+            rebuildHierarchyMs = MillisecondsBetween(hierarchyStart, hierarchyEnd);
+
+            const auto publishStart = std::chrono::steady_clock::now();
+            const auto saveResult = pc::SavePointCloudIpcloudBundle(
+                bundlePath,
+                sourceInfo.value(),
+                buildConfig,
+                loadResult.cloud,
+                hierarchy);
+            const auto publishEnd = std::chrono::steady_clock::now();
+            rebuildPublishMs = MillisecondsBetween(publishStart, publishEnd);
+            if (!saveResult.saved) {
+                std::cerr << "Could not publish streaming .ipcloud bundle: " << saveResult.errorMessage << "\n";
+                return 6;
+            }
+            loadResult.cloud = {};
+            hierarchy = {};
+            rebuilt = true;
+            inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), buildConfig);
+        }
+
+        const auto warmPreviewStart = std::chrono::steady_clock::now();
+        auto warmPreview = pc::LoadPointCloudIpcloudPreview(bundlePath, sourceInfo.value(), buildConfig);
+        const auto warmPreviewEnd = std::chrono::steady_clock::now();
+        if (!warmPreview.loaded || !warmPreview.fromPersistentBundle) {
+            std::cerr << "Warm .ipcloud preview failed: " << warmPreview.reason << "\n";
+            return 7;
+        }
+        const double warmPreviewMs = MillisecondsBetween(warmPreviewStart, warmPreviewEnd);
+
+        auto hierarchyLoad = pc::LoadPointCloudIpcloudHierarchy(bundlePath, sourceInfo.value(), buildConfig);
+        if (!hierarchyLoad.loaded) {
+            std::cerr << "Could not load .ipcloud hierarchy: " << hierarchyLoad.message << "\n";
+            return 8;
+        }
+        auto catalog = pc::LoadPointCloudIpcloudRawChunkCatalog(bundlePath);
+        if (catalog.chunks.empty() || catalog.nodeRanges.empty()) {
+            std::cerr << "Streaming raw chunk catalog is empty.\n";
+            return 9;
+        }
+        if (baselineFullSourceResidentBytes == 0U) {
+            const auto cpuDenseBytes =
+                (static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(invisible_places::io::Float3)) +
+                (sourceInfo->hasRgb ? static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(std::uint32_t) : 0ULL) +
+                (sourceInfo->hasNormals ? static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(invisible_places::io::Float3) : 0ULL) +
+                (static_cast<std::uint64_t>(sourceInfo->pointCount) * sourceInfo->scalarFieldCount * sizeof(float));
+            const auto gpuDenseBytes =
+                (static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(invisible_places::io::Float3)) +
+                (static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(glm::vec4)) +
+                (static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(std::uint32_t)) +
+                (sourceInfo->hasNormals ? static_cast<std::uint64_t>(sourceInfo->pointCount) * sizeof(glm::vec4) : sizeof(glm::vec4)) +
+                (static_cast<std::uint64_t>(sourceInfo->pointCount) * sourceInfo->scalarFieldCount * sizeof(float));
+            baselineFullSourceResidentBytes = std::max<std::uint64_t>(
+                std::max(cpuDenseBytes + gpuDenseBytes, catalog.totalDecodedCpuBytes),
+                sourceInfo->sourceSizeBytes);
+        }
+
+        const auto& rootBounds = hierarchyLoad.hierarchy.nodes.front().bounds;
+        const glm::vec3 center{
+            0.5F * (rootBounds.minimum.x + rootBounds.maximum.x),
+            0.5F * (rootBounds.minimum.y + rootBounds.maximum.y),
+            0.5F * (rootBounds.minimum.z + rootBounds.maximum.z),
+        };
+        const glm::vec3 extent{
+            std::max(0.01F, rootBounds.maximum.x - rootBounds.minimum.x),
+            std::max(0.01F, rootBounds.maximum.y - rootBounds.minimum.y),
+            std::max(0.01F, rootBounds.maximum.z - rootBounds.minimum.z),
+        };
+        const float diagonal = std::max(1.0F, glm::length(extent));
+        const auto makeViewProjection = [&](float pan) {
+            const glm::vec3 target = center + glm::vec3{extent.x * pan, 0.0F, 0.0F};
+            const glm::vec3 camera = target + glm::vec3{0.0F, -diagonal * 1.35F, diagonal * 0.45F};
+            const glm::mat4 view = glm::lookAt(camera, target, glm::vec3{0.0F, 0.0F, 1.0F});
+            const glm::mat4 projection =
+                glm::perspective(glm::radians(50.0F), 16.0F / 9.0F, 0.01F, diagonal * 8.0F);
+            return std::pair{projection * view, camera};
+        };
+
+        std::vector<StreamPassMetrics> passes;
+        const std::array<std::pair<const char*, float>, 4> path = {
+            std::pair{"center", 0.0F},
+            std::pair{"pan_left", -0.25F},
+            std::pair{"pan_right", 0.25F},
+            std::pair{"center_warm_repeat", 0.0F},
+        };
+        const auto uploadBudgetBytes = pc::DefaultPointCloudGovernorUploadBudgetBytes(
+            pc::PointCloudLodRendererCostProfile::FastBasicSquare);
+        std::uint64_t peakResidentBytes = CurrentResidentMemoryBytes();
+        for (const auto& [name, pan] : path) {
+            const auto [viewProjection, cameraPosition] = makeViewProjection(pan);
+            pc::PointCloudLodTraversalParams params;
+            params.viewProjection = viewProjection;
+            params.cameraPosition = cameraPosition;
+            params.viewportWidth = 1280;
+            params.viewportHeight = 720;
+            params.maxRepresentatives = 128'000U;
+            params.maxDrawItems = 128'000U;
+            params.rendererCostProfile = pc::PointCloudLodRendererCostProfile::FastBasicSquare;
+            params.densityMode = PointCloudExportDensityMode::MatchViewportAdaptive;
+            params.targetProjectedSpacingPixels = 1.25F;
+            PointCloudLodTraversalDiagnostics traversalDiagnostics;
+            const auto traversalStart = std::chrono::steady_clock::now();
+            auto drawItems = pc::TraversePointCloudLodHierarchy(
+                hierarchyLoad.hierarchy,
+                params,
+                {},
+                &traversalDiagnostics);
+            const auto traversalEnd = std::chrono::steady_clock::now();
+
+            const auto residencyStart = std::chrono::steady_clock::now();
+            auto resident = pc::BuildPointCloudIpcloudResidentSet(
+                bundlePath,
+                catalog,
+                traversalDiagnostics.frontierNodeIndices,
+                drawItems,
+                warmPreview.cloud.scalarFields,
+                uploadBudgetBytes);
+            const auto residencyEnd = std::chrono::steady_clock::now();
+            peakResidentBytes = std::max(peakResidentBytes, CurrentResidentMemoryBytes());
+
+            passes.push_back({
+                .name = name,
+                .drawItems = drawItems.size(),
+                .remappedDrawItems = resident.remappedDrawItems.size(),
+                .requestedChunks = resident.diagnostics.visibleChunkRequestCount,
+                .residentChunks = resident.diagnostics.residentChunkCount,
+                .missingChunks = resident.diagnostics.missingChunkCount,
+                .cpuResidentBytes = resident.diagnostics.cpuResidentBytes,
+                .gpuResidentBytes = resident.diagnostics.gpuResidentBytes,
+                .uploadBytes = resident.diagnostics.uploadBytesThisFrame,
+                .uploadBudgetBytes = resident.diagnostics.uploadBudgetBytes,
+                .uploadQueueLength = resident.diagnostics.uploadQueueLength,
+                .chunkHitRate = resident.diagnostics.chunkHitRate,
+                .evictionCount = resident.diagnostics.evictionCount,
+                .evictionReason = resident.diagnostics.evictionReason,
+                .traversalMs = MillisecondsBetween(traversalStart, traversalEnd),
+                .residencyMs = MillisecondsBetween(residencyStart, residencyEnd),
+                .loaded = resident.loaded,
+            });
+        }
+
+        const auto outputDirectory = dataRoot_.parent_path() / "Saved" / "diagnostics" / "lod_stream";
+        std::error_code createOutputError;
+        std::filesystem::create_directories(outputDirectory, createOutputError);
+        if (createOutputError) {
+            std::cerr << "Could not create stream diagnostic output directory: "
+                      << createOutputError.message() << "\n";
+            return 10;
+        }
+        const auto metricsPath = outputDirectory / "lod_stream_metrics.json";
+        {
+            const auto boolLiteral = [](bool value) -> const char* { return value ? "true" : "false"; };
+            std::ofstream metrics{metricsPath, std::ios::trunc};
+            metrics << "{\n"
+                    << "  \"point_cloud\": "
+                    << JsonStringLiteral(pointCloudPath.lexically_normal().generic_string()) << ",\n"
+                    << "  \"cache_bundle\": "
+                    << JsonStringLiteral(bundlePath.lexically_normal().generic_string()) << ",\n"
+                    << "  \"cache_format_version\": " << pc::kPointCloudIpcloudCacheFormatVersion << ",\n"
+                    << "  \"raw_chunk_format_version\": " << pc::kPointCloudIpcloudRawChunkFormatVersion << ",\n"
+                    << "  \"rebuilt_streaming_bundle\": " << boolLiteral(rebuilt) << ",\n"
+                    << "  \"initial_cache_state\": "
+                    << JsonStringLiteral(pc::PointCloudIpcloudCacheStateName(inspection.state)) << ",\n"
+                    << "  \"initial_cache_reason\": " << JsonStringLiteral(inspection.reason) << ",\n"
+                    << "  \"warm_preview_points\": " << warmPreview.cloud.PointCount() << ",\n"
+                    << "  \"warm_preview_ms\": " << warmPreviewMs << ",\n"
+                    << "  \"full_source_point_count\": " << sourceInfo->pointCount << ",\n"
+                    << "  \"raw_chunk_count\": " << catalog.chunks.size() << ",\n"
+                    << "  \"raw_chunk_encoded_bytes\": " << catalog.totalEncodedBytes << ",\n"
+                    << "  \"raw_chunk_decoded_cpu_bytes\": " << catalog.totalDecodedCpuBytes << ",\n"
+                    << "  \"start_resident_memory_bytes\": " << startResidentBytes << ",\n"
+                    << "  \"baseline_full_source_resident_memory_bytes\": " << baselineFullSourceResidentBytes << ",\n"
+                    << "  \"peak_stream_check_resident_memory_bytes\": " << peakResidentBytes << ",\n"
+                    << "  \"rebuild_full_source_load_ms\": " << rebuildFullLoadMs << ",\n"
+                    << "  \"rebuild_hierarchy_ms\": " << rebuildHierarchyMs << ",\n"
+                    << "  \"rebuild_publish_ms\": " << rebuildPublishMs << ",\n"
+                    << "  \"full_source_fallback_reason\": "
+                    << JsonStringLiteral("Full Source/export/picking still use dense compatibility buffers when requested") << ",\n"
+                    << "  \"passes\": [\n";
+            for (std::size_t index = 0; index < passes.size(); ++index) {
+                const auto& pass = passes[index];
+                metrics << "    {\n"
+                        << "      \"name\": " << JsonStringLiteral(pass.name) << ",\n"
+                        << "      \"loaded\": " << boolLiteral(pass.loaded) << ",\n"
+                        << "      \"draw_items\": " << pass.drawItems << ",\n"
+                        << "      \"remapped_draw_items\": " << pass.remappedDrawItems << ",\n"
+                        << "      \"visible_chunks_requested\": " << pass.requestedChunks << ",\n"
+                        << "      \"resident_chunks\": " << pass.residentChunks << ",\n"
+                        << "      \"missing_chunks\": " << pass.missingChunks << ",\n"
+                        << "      \"cpu_resident_bytes\": " << pass.cpuResidentBytes << ",\n"
+                        << "      \"gpu_resident_bytes\": " << pass.gpuResidentBytes << ",\n"
+                        << "      \"upload_bytes\": " << pass.uploadBytes << ",\n"
+                        << "      \"upload_budget_bytes\": " << pass.uploadBudgetBytes << ",\n"
+                        << "      \"upload_queue_length\": " << pass.uploadQueueLength << ",\n"
+                        << "      \"chunk_hit_rate\": " << pass.chunkHitRate << ",\n"
+                        << "      \"eviction_count\": " << pass.evictionCount << ",\n"
+                        << "      \"eviction_reason\": " << JsonStringLiteral(pass.evictionReason) << ",\n"
+                        << "      \"traversal_ms\": " << pass.traversalMs << ",\n"
+                        << "      \"residency_ms\": " << pass.residencyMs << "\n"
+                        << "    }" << (index + 1U == passes.size() ? "\n" : ",\n");
+            }
+            metrics << "  ]\n"
+                    << "}\n";
+        }
+
+        const bool anyResident = std::any_of(passes.begin(), passes.end(), [](const StreamPassMetrics& pass) {
+            return pass.loaded && pass.remappedDrawItems > 0U && pass.residentChunks > 0U;
+        });
+        const bool uploadWithinBudget = std::all_of(passes.begin(), passes.end(), [](const StreamPassMetrics& pass) {
+            return pass.uploadBudgetBytes == 0U || pass.uploadBytes <= pass.uploadBudgetBytes;
+        });
+        const bool boundedMemory = std::all_of(passes.begin(), passes.end(), [sourceInfo](const StreamPassMetrics& pass) {
+            return pass.cpuResidentBytes < sourceInfo->sourceSizeBytes;
+        });
+        const bool success =
+            inspection.state == pc::PointCloudIpcloudCacheState::Hit &&
+            hierarchyLoad.loaded &&
+            warmPreview.loaded &&
+            anyResident &&
+            uploadWithinBudget &&
+            boundedMemory;
+
+        std::cout << "Wrote stream diagnostics: " << metricsPath.string() << "\n";
+        for (const auto& pass : passes) {
+            std::cout << "- " << pass.name
+                      << ": chunks " << pass.residentChunks << "/" << pass.requestedChunks
+                      << ", remapped " << pass.remappedDrawItems << "/" << pass.drawItems
+                      << ", CPU " << FormatByteCount(pass.cpuResidentBytes)
+                      << ", GPU " << FormatByteCount(pass.gpuResidentBytes)
+                      << ", upload " << FormatByteCount(pass.uploadBytes)
+                      << " / " << FormatByteCount(pass.uploadBudgetBytes)
+                      << ", hit " << (static_cast<double>(pass.chunkHitRate) * 100.0) << "%\n";
+        }
+        std::cout << "Stream check: " << (success ? "pass" : "fail") << std::endl;
+        return success ? 0 : 11;
+    } catch (const std::exception& error) {
+        std::cerr << ".ipcloud stream check failed: " << error.what() << "\n";
         return 12;
     }
 }

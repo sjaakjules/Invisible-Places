@@ -9,14 +9,16 @@ this audit.
 
 ## Current Build Status
 
-The current worktree builds with the Stage 07 progressive `.ipcloud` cache path:
+The current worktree builds with the Stage 08 progressive `.ipcloud` streaming path:
 hierarchy cache v4, visual node statistics, class-aware representatives,
 per-node scalar stats, CPU traversal feature triggers, Beauty optical-depth
 compensation, renderer-aware cost profiles, Vulkan timestamp diagnostics,
-EWMA-governed adaptive budgets, and a `.ipcloud` v1 representative-preview
-bundle that can render coarse point-cloud data before full source load/build
-work completes. GPU compute selection and full raw-chunk residency remain
-later-stage items.
+EWMA-governed adaptive budgets, and a `.ipcloud` v2 bundle that can render
+coarse representative data first, attach the cached exact hierarchy, and stream
+visible raw chunks into compact resident buffers without requiring a permanent
+full PLY parse/upload for normal Fast Basic or Beauty Adaptive viewport use.
+GPU compute selection, memory-mapped chunks, and fully device-local chunk
+residency remain later-stage items.
 
 Fresh runtime/performance reports now include the HUD/diagnostics values
 described below so sparse, stale, or feature-erasing adaptive output can be
@@ -41,11 +43,18 @@ sample-count cap anymore.
   canonicalized before cache hashing, so relative and absolute references reuse
   the same v4 cache.
 - Hierarchy cache writes go through a temporary file and publish by rename.
-- A second additive `.ipcloud` v1 cache bundle exists under
+- A second additive `.ipcloud` v2 cache bundle exists under
   `Saved/PointCloudCache/<stem>.<fingerprint>.ipcloud/` with `manifest.json`,
   `attribute_schema.bin`, `hierarchy.bin`, `node_pages.bin`, `node_stats.bin`,
-  `lod_representatives.bin`, `scalar_stats.bin`, `raw_chunks/`,
-  `build_status.json`, and `build_log.txt`.
+  `lod_representatives.bin`, `scalar_stats.bin`, `node_raw_chunks.bin`,
+  `raw_chunks/`, `build_status.json`, and `build_log.txt`. Stage 07 v1
+  bundles are stale for streaming and are rebuilt into v2.
+- `.ipcloud` v2 raw chunks are independently decodable spatial payloads with
+  chunk id, bounds, point/scalar counts, encoded/decoded byte counts, attribute
+  flags, original source IDs, quantized chunk-local positions, packed RGBA,
+  optional packed normals, and float32 scalar field blocks. `node_raw_chunks.bin`
+  sidecars map hierarchy nodes to intersecting chunks without changing the
+  hierarchy node struct.
 - `.ipcloud` validation fingerprints canonical source path hash, source size,
   nanosecond mtime, PLY header hash, sampled payload hash, point/scalar counts,
   RGB/normals presence, LOD build settings version, and attribute schema
@@ -145,10 +154,20 @@ sample-count cap anymore.
 - Cold point-cloud loads can parse header/schema, upload a remapped
   representative preview `LoadedPointCloud`, render that preview through the
   existing viewport upload path, and then replace it with the full source cloud
-  and exact adaptive hierarchy when ready. Warm `.ipcloud` loads validate
-  `manifest.json`, load representative payload first, upload a dense preview,
-  and hand off to the existing adaptive renderer without changing the 32-byte
-  `PointCloudDrawItemGpu` ABI.
+  and exact adaptive hierarchy when a full source path is explicitly needed.
+  Warm `.ipcloud` v2 loads validate `manifest.json`, load representative payload
+  first, upload a dense preview, attach the exact cached hierarchy plus raw chunk
+  catalog, and render normal Fast Basic / Beauty Adaptive viewports by streaming
+  compact resident chunks. The 32-byte `PointCloudDrawItemGpu` ABI is unchanged;
+  draw-item `sourcePointIndex` values are remapped into resident dense indices.
+- The viewport exposes `.ipcloud` residency diagnostics: visible chunks
+  requested/resident/missing, CPU resident bytes, GPU resident bytes, peak RSS,
+  upload bytes and upload budget, upload queue length, chunk hit rate, eviction
+  count/reason, and full-source fallback reason.
+- `--lod-stream-check <cloud>` runs a repeatable warm-cache pan path, records
+  baseline dense memory estimates, streaming resident memory, upload budget
+  use, queue/eviction state, and writes
+  `Saved/diagnostics/lod_stream/lod_stream_metrics.json`.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
   `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
   It now renders a repeatable Beauty matrix covering small opaque sprites,
@@ -217,20 +236,56 @@ sample-count cap anymore.
   Fast Basic max submitted 2,880,233 under a 4,823,449 representative budget,
   max estimated fragments 4,681,200 under a 915,702,000 fragment budget, no
   budget exceedance, and no full-source fallback.
+- Stage 08 streaming evidence on a warm `.ipcloud` v2 cache for
+  `Data/Site3-Sample-Terrestrial.ply` reports cache `hit`, 65,536 preview
+  points loaded in 364.151 ms, 2,292 visible chunks requested on each pan-path
+  pass, 589-599 chunks resident under budget, CPU residency 120.9 MiB, compact
+  GPU residency 128.0 MiB, upload 128.0 MiB / 128.0 MiB, queued/missing chunks
+  explicitly evicted for `upload budget`, and peak RSS 960.0 MiB versus a
+  1.80 GiB dense full-source CPU+GPU baseline estimate. The repeat center pass
+  remapped 16,233 / 56,537 draw items from resident chunks before the rest of
+  the visible chunks were resident.
+- Stage 08 sample `--lod-compare Data/Site3-Sample-Terrestrial.ply` reports no
+  Fast Basic or Beauty Adaptive fallback after streaming changes: coverage ratio
+  1, luminance ratio 0.802810, Beauty stress max GPU point pass 0.324792 ms with
+  no budget exceedance, and Fast Basic viewport max submitted 2,863,943 under a
+  4,823,449 representative budget with 0 large representative-jump frames.
+- Stage 08 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` confirms the
+  same path at scale. First v2 bundle construction still required the dense
+  source path: full source load 54,060.8 ms, hierarchy build 990,733 ms, and raw
+  chunk publish 83,108.9 ms. The subsequent warm-cache stream check loaded the
+  65,536-point preview in 315.787 ms, requested 1,903 chunks, kept CPU
+  residency at 120.9 MiB, compact GPU residency/upload at 128.0 MiB / 128.0 MiB,
+  and peaked at 4.57 GiB RSS versus a 14.91 GiB dense CPU+GPU baseline estimate.
+  The 100M `--lod-compare` run then reported no Fast Basic or Beauty Adaptive
+  full-source fallback, no budget exceedance, and 0 large representative-jump
+  frames; coverage ratio 1, luminance ratio 0.649889, Beauty stress max GPU
+  point pass 0.202458 ms, and Fast Basic viewport max submitted 1,084,047 under
+  a 1,810,284 representative budget.
 
 ## Partially Implemented
 
 These pieces exist, but they are not yet the ideal system described in
 `point_cloud_adaptive_lod_fast_beauty.md`.
 
-- Stage 07 `.ipcloud` `raw_chunks/` files are validated source-range metadata
-  rather than full independently streamable attribute chunks. Stage 08 must turn
-  those ranges into real raw chunk residency, memory mapping, upload scheduling,
-  and LRU behavior.
-- Warm `.ipcloud` loading currently accelerates representative preview display.
-  The exact full hierarchy handoff still relies on the existing full
-  `LoadedPointCloud` path and v4 hierarchy cache/build path once source load is
-  complete.
+- Streaming residency is a first CPU implementation: chunks are decoded into
+  compact `LoadedPointCloud` resident sets and uploaded through the existing
+  host-visible dense descriptor shape. The normal same-capacity streaming update
+  avoids a renderer `WaitIdle()`, but initial allocation/growth can still
+  synchronize.
+- The current visible request set is derived from adaptive frontier/node chunk
+  mappings. It preserves progressive coarse rendering and bounded upload, but it
+  does not yet include async prefetch, memory mapping, or fine-grained persistent
+  GPU LRU reuse across every viewport pass.
+- Beauty Full Source, Fast Basic Source, export, picking, and editing keep the
+  dense compatibility path when exact/debug semantics require it. The smallest
+  safe migration is to route these surfaces through a chunk iteration/query API
+  backed by the v2 decoder and source-ID tables before deleting the dense
+  `LoadedPointCloud` requirement.
+- First-time `.ipcloud` v2 construction still performs a full source parse and
+  monolithic hierarchy build. Warm-cache adaptive rendering avoids permanent
+  full parse/upload duplication, but cache creation progress/cancel points
+  remain limited by `BuildPointCloudLodHierarchy(...)`.
 - Hierarchy build is asynchronous and reports progress, but the build itself is
   still monolithic and not cancellable until `BuildPointCloudLodHierarchy(...)`
   returns.
@@ -249,8 +304,8 @@ These pieces exist, but they are not yet the ideal system described in
 - The LOD comparison metrics now report coverage, mean luminance, feature class
   counts, feature-triggered refinement counts, raw/EWMA GPU point-pass timing,
   governor state, Beauty stress timing, and a Fast Basic transition trace, but
-  not image error maps, peak memory, upload bandwidth, upload timing, or tile
-  overdraw budgets.
+  not image error maps or tile overdraw budgets. Streaming memory/upload
+  diagnostics are emitted by `--lod-stream-check` rather than `--lod-compare`.
 - The 100M `--lod-compare` path proves bounded replacement and deterministic
   trace metrics, but it does not automatically prove final exact idle
   refinement completion. The current 500-frame harness still ends with async
@@ -261,12 +316,10 @@ These pieces exist, but they are not yet the ideal system described in
 
 These are still target-system items from the ideal plan.
 
-- Raw chunk streaming and visible-chunk residency from `.ipcloud` bundles.
-- Direct exact-hierarchy attach from `.ipcloud` without first assembling the
-  full source cloud.
-- Memory-mapped source chunks and CPU/GPU LRU caches.
+- Memory-mapped source chunks and fully persistent async CPU/GPU LRU caches.
 - Device-local static point/chunk buffers with staging uploads as the normal
-  large-cloud path.
+  large-cloud path; current streaming uses compact resident buffers in the
+  existing descriptor shape.
 - Beauty-specific parent/child opacity crossfade transition policy.
 - Dedicated LOD style data block with explicit compensation/footprint policy.
 - Upload and render-state submission timestamp diagnostics; point/depth/
@@ -275,15 +328,16 @@ These are still target-system items from the ideal plan.
 - Tile overdraw estimates and per-tile fragment/blended-fragment budgets.
 - Conservative occlusion culling, depth proxy, or Hi-Z pyramid.
 - GPU compute traversal/culling/compaction and indirect draw submission.
-- Runtime metrics for peak resident memory and tile budget pressure.
+- Runtime tile budget pressure metrics.
 
 ## Likely Lag Sources
 
 Investigate these before adding more ideal-plan features.
 
-- First-run large-cloud loading can still spend a long time in PLY parse, GPU
-  upload, or monolithic hierarchy build. The UI now reports which phase is
-  active and provides elapsed time plus ETA when a phase has measurable progress.
+- First-run large-cloud loading can still spend a long time in PLY parse or
+  monolithic hierarchy build before the v2 bundle can publish. The UI now
+  reports loader/cache phases where available, but hierarchy construction still
+  needs deeper progress/cancel checkpoints.
 - Beauty Adaptive full-source fallback is guarded now, but this remains a
   regression risk when future density modes or loading paths bypass adaptive
   draw-item requirements.
@@ -294,10 +348,12 @@ Investigate these before adding more ideal-plan features.
   and global fragment/blended-fragment budgets.
 - Current projected spacing now uses stored node spacing and feature statistics,
   but there is still no tile-pressure model.
-- All source positions are still uploaded and retained in several forms:
-  `LoadedPointCloud`, `cpuPositions`, vertex position buffer, storage position
-  buffer, color buffer, normal buffer, scalar buffer, and hierarchy data. Large
-  clouds can therefore be memory- and bandwidth-heavy before LOD helps.
+- Dense exact/debug/export surfaces still upload and retain source data in
+  several forms: `LoadedPointCloud`, `cpuPositions`, vertex position buffer,
+  storage position buffer, color buffer, normal buffer, scalar buffer, and
+  hierarchy data. Warm `.ipcloud` v2 Fast Basic and Beauty Adaptive viewport
+  rendering bypass that permanent full-source duplication by using compact raw
+  chunk residency.
 - Static point buffers are host-visible in the current path. This is simple but
   not the ideal MoltenVK/Apple-GPU path for very large mostly-static data.
 - The manual sampled budget path calls `WaitIdle()` during point-budget updates.
@@ -429,17 +485,19 @@ Metrics to watch:
 
 ### 5. Move Toward Ideal Cache And Streaming
 
-Stage 07 started the `.ipcloud` cache after the hierarchy path was stable and
-measured. Keep this section as the Stage 08 streaming checklist.
+Stage 08 added v2 raw chunk payloads and bounded warm-cache residency after the
+hierarchy path was stable. Keep this section as the streaming regression and
+Stage 09+ migration checklist.
 
 - Preserve the additive `.ipcloud` bundle beside the v4 single-file hierarchy
-  cache until full streaming has its own validation evidence.
-- Replace Stage 07 raw range metadata with directly streamable raw attribute
-  chunks and visible-chunk residency.
-- Attach exact hierarchy/page data directly from `.ipcloud` when possible,
-  while keeping representative preview first.
-- Track upload bytes per frame, warm-cache exact handoff time, and peak resident
-  memory before and after chunking.
+  cache until export/debug paths no longer need dense compatibility fallback.
+- Keep v2 raw chunks directly streamable and keep v1 bundles stale for streaming.
+- Keep exact hierarchy/page data attached directly from `.ipcloud` while the
+  representative preview appears first.
+- Keep upload bytes per frame, warm-cache panning, resident CPU/GPU bytes, peak
+  RSS, and fallback reason diagnostics in `--lod-stream-check`.
+- Move exact/debug/export/picking to chunk iteration before deleting the dense
+  full-source path.
 
 Metrics to watch:
 
@@ -450,6 +508,7 @@ Metrics to watch:
 - visible chunk hit rate
 - upload bytes per frame
 - peak memory before and after chunking
+- full-source fallback reason
 
 ### 6. Advanced Performance Work
 

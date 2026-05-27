@@ -281,6 +281,9 @@ class VulkanViewportShell {
         std::size_t layerId,
         const invisible_places::io::LoadedPointCloud& cloud,
         const std::vector<std::uint32_t>& sampledIndices);
+    void UploadPointCloudResidentSubset(
+        std::size_t layerId,
+        const invisible_places::io::LoadedPointCloud& cloud);
     void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
     void RemovePointCloud(std::size_t layerId);
     void ClearPointClouds();

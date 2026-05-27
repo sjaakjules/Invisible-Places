@@ -1600,6 +1600,7 @@ TEST_CASE("Point-cloud .ipcloud bundle publishes atomically and validates manife
     CHECK(std::filesystem::is_regular_file(bundlePath / "attribute_schema.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "hierarchy.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "node_pages.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "node_raw_chunks.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "node_stats.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "lod_representatives.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "scalar_stats.bin"));
@@ -1622,6 +1623,53 @@ TEST_CASE("Point-cloud .ipcloud bundle publishes atomically and validates manife
         CHECK(drawItem.sourcePointIndex < preview.cloud.PointCount());
     }
 
+    auto hierarchyLoad = pc::LoadPointCloudIpcloudHierarchy(bundlePath, sourceInfo.value(), config);
+    REQUIRE(hierarchyLoad.loaded);
+    CHECK(hierarchyLoad.hierarchy.sourcePointCount == loadResult.cloud.PointCount());
+    auto catalog = pc::LoadPointCloudIpcloudRawChunkCatalog(bundlePath);
+    REQUIRE(!catalog.chunks.empty());
+    REQUIRE(catalog.nodeRanges.size() == hierarchyLoad.hierarchy.nodes.size());
+    CHECK(catalog.totalEncodedBytes > 0U);
+    CHECK(catalog.totalDecodedCpuBytes > 0U);
+    auto rawChunk = pc::LoadPointCloudIpcloudRawChunk(
+        bundlePath,
+        catalog.chunks.front().chunkIndex,
+        loadResult.cloud.scalarFields);
+    REQUIRE(!rawChunk.positions.empty());
+    REQUIRE(rawChunk.positions.size() == rawChunk.sourcePointIndices.size());
+    CHECK(rawChunk.info.bounds.valid);
+    CHECK(rawChunk.info.scalarFieldCount == loadResult.cloud.ScalarFieldCount());
+    for (const auto sourceIndex : rawChunk.sourcePointIndices) {
+        CHECK(sourceIndex < loadResult.cloud.PointCount());
+    }
+
+    pc::PointCloudLodTraversalParams streamingParams;
+    streamingParams.viewportWidth = 128;
+    streamingParams.viewportHeight = 128;
+    streamingParams.maxRepresentatives = 16U;
+    streamingParams.maxDrawItems = 16U;
+    pc::PointCloudLodTraversalDiagnostics streamingDiagnostics;
+    auto streamingDrawItems = pc::TraversePointCloudLodHierarchy(
+        hierarchyLoad.hierarchy,
+        streamingParams,
+        {},
+        &streamingDiagnostics);
+    REQUIRE(!streamingDrawItems.empty());
+    auto resident = pc::BuildPointCloudIpcloudResidentSet(
+        bundlePath,
+        catalog,
+        streamingDiagnostics.frontierNodeIndices,
+        streamingDrawItems,
+        loadResult.cloud.scalarFields,
+        64ULL * 1024ULL * 1024ULL);
+    REQUIRE(resident.loaded);
+    CHECK(!resident.remappedDrawItems.empty());
+    CHECK(resident.diagnostics.residentChunkCount > 0U);
+    CHECK(resident.diagnostics.uploadBytesThisFrame <= resident.diagnostics.uploadBudgetBytes);
+    for (const auto& drawItem : resident.remappedDrawItems) {
+        CHECK(drawItem.sourcePointIndex < resident.cloud.PointCount());
+    }
+
     const auto replaceResult =
         pc::SavePointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config, loadResult.cloud, hierarchy);
     REQUIRE(replaceResult.saved);
@@ -1633,6 +1681,27 @@ TEST_CASE("Point-cloud .ipcloud bundle publishes atomically and validates manife
     inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), wrongConfig);
     CHECK(inspection.state == pc::PointCloudIpcloudCacheState::Stale);
     CHECK(inspection.reason.find("build settings") != std::string::npos);
+
+    {
+        std::ifstream manifestInput{bundlePath / "manifest.json"};
+        std::string manifest{
+            std::istreambuf_iterator<char>{manifestInput},
+            std::istreambuf_iterator<char>{}};
+        const auto versionPos = manifest.find("\"cache_format_version\": 2");
+        REQUIRE(versionPos != std::string::npos);
+        manifest.replace(versionPos, std::string{"\"cache_format_version\": 2"}.size(), "\"cache_format_version\": 1");
+        std::ofstream manifestOutput{bundlePath / "manifest.json", std::ios::trunc};
+        manifestOutput << manifest;
+        manifestOutput.close();
+        std::filesystem::remove(bundlePath / "node_raw_chunks.bin");
+        inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config);
+        CHECK(inspection.state == pc::PointCloudIpcloudCacheState::Stale);
+        CHECK(inspection.reason.find("format version") != std::string::npos);
+    }
+
+    const auto restoredResult =
+        pc::SavePointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config, loadResult.cloud, hierarchy);
+    REQUIRE(restoredResult.saved);
 
     std::filesystem::remove(bundlePath / "lod_representatives.bin");
     inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config);

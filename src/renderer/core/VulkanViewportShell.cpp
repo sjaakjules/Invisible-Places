@@ -1453,6 +1453,93 @@ void VulkanViewportShell::UploadPointCloud(
     UpdatePointBudget(layerId, sampledIndices);
 }
 
+void VulkanViewportShell::UploadPointCloudResidentSubset(
+    std::size_t layerId,
+    const invisible_places::io::LoadedPointCloud& cloud) {
+    if (cloud.PointCount() == 0) {
+        return;
+    }
+    if (cloud.PointCount() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Resident point-cloud subset exceeds the current 32-bit draw-count limit."};
+    }
+
+    auto* resources = FindPointCloudResources(layerId);
+    const bool hasNormals = cloud.hasNormals && cloud.normals.size() == cloud.positions.size();
+    const auto positionBytes =
+        static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(invisible_places::io::Float3));
+    const auto positionStorageBytes =
+        static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(glm::vec4));
+    const auto colorBytes =
+        static_cast<VkDeviceSize>(std::max<std::size_t>(1U, cloud.packedColors.size()) * sizeof(std::uint32_t));
+    const auto normalBytes =
+        static_cast<VkDeviceSize>(std::max<std::size_t>(1U, hasNormals ? cloud.normals.size() : 1U) * sizeof(glm::vec4));
+    const auto scalarBytes =
+        static_cast<VkDeviceSize>(std::max<std::size_t>(1U, cloud.scalarFieldValues.size()) * sizeof(float));
+
+    const bool needsFullUpload =
+        resources == nullptr ||
+        resources->positionBuffer.buffer == VK_NULL_HANDLE ||
+        resources->positionStorageBuffer.buffer == VK_NULL_HANDLE ||
+        resources->colorBuffer.buffer == VK_NULL_HANDLE ||
+        resources->normalBuffer.buffer == VK_NULL_HANDLE ||
+        resources->scalarFieldBuffer.buffer == VK_NULL_HANDLE ||
+        resources->positionBuffer.size < positionBytes ||
+        resources->positionStorageBuffer.size < positionStorageBytes ||
+        resources->colorBuffer.size < colorBytes ||
+        resources->normalBuffer.size < normalBytes ||
+        resources->scalarFieldBuffer.size < scalarBytes ||
+        resources->scalarFieldCount != static_cast<std::uint32_t>(cloud.ScalarFieldCount());
+    if (needsFullUpload) {
+        UploadPointCloud(layerId, cloud, {});
+        return;
+    }
+
+    resources->pointCount = static_cast<std::uint32_t>(cloud.PointCount());
+    resources->activePointCount = resources->pointCount;
+    resources->scalarFieldCount = static_cast<std::uint32_t>(cloud.ScalarFieldCount());
+    resources->hasSourceRgb = cloud.hasSourceRgb;
+    resources->hasNormals = hasNormals;
+    resources->cpuPositions = cloud.positions;
+    resources->usingSampledIndices = false;
+
+    UploadBufferData(resources->positionBuffer, cloud.positions.data(), positionBytes);
+
+    std::vector<glm::vec4> storagePositions;
+    storagePositions.reserve(cloud.positions.size());
+    for (const auto& position : cloud.positions) {
+        storagePositions.emplace_back(position.x, position.y, position.z, 1.0F);
+    }
+    UploadBufferData(resources->positionStorageBuffer, storagePositions.data(), positionStorageBytes);
+
+    if (!cloud.packedColors.empty()) {
+        UploadBufferData(resources->colorBuffer, cloud.packedColors.data(), colorBytes);
+    } else {
+        const std::uint32_t fallbackColor = 0xffffffffU;
+        UploadBufferData(resources->colorBuffer, &fallbackColor, sizeof(fallbackColor));
+    }
+
+    std::vector<glm::vec4> storageNormals;
+    if (hasNormals) {
+        storageNormals.reserve(cloud.normals.size());
+        for (const auto& normal : cloud.normals) {
+            storageNormals.emplace_back(normal.x, normal.y, normal.z, 0.0F);
+        }
+    } else {
+        storageNormals.emplace_back(0.0F, 0.0F, 0.0F, 0.0F);
+    }
+    UploadBufferData(
+        resources->normalBuffer,
+        storageNormals.data(),
+        static_cast<VkDeviceSize>(storageNormals.size() * sizeof(glm::vec4)));
+
+    if (!cloud.scalarFieldValues.empty()) {
+        UploadBufferData(resources->scalarFieldBuffer, cloud.scalarFieldValues.data(), scalarBytes);
+    } else {
+        const float fallbackScalar = 0.0F;
+        UploadBufferData(resources->scalarFieldBuffer, &fallbackScalar, sizeof(fallbackScalar));
+    }
+}
+
 void VulkanViewportShell::UpdatePointBudget(
     std::size_t layerId,
     const std::vector<std::uint32_t>& sampledIndices) {
