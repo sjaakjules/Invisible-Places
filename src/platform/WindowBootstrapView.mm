@@ -28,6 +28,10 @@ NSString* ToNSString(const std::string& value) {
     return [NSString stringWithUTF8String:value.c_str()];
 }
 
+CGColorRef LayerColor(CGFloat red, CGFloat green, CGFloat blue, CGFloat alpha) {
+    return [[NSColor colorWithSRGBRed:red green:green blue:blue alpha:alpha] CGColor];
+}
+
 }  // namespace
 
 void InstallBootstrapWindowContent(GLFWwindow* window, const BootstrapWindowContent& content) {
@@ -51,8 +55,7 @@ void InstallBootstrapWindowContent(GLFWwindow* window, const BootstrapWindowCont
         }
 
         [rootView setWantsLayer:YES];
-        rootView.layer.backgroundColor =
-            CGColorCreateGenericRGB(0.92, 0.92, 0.89, 1.0);
+        rootView.layer.backgroundColor = LayerColor(0.92, 0.92, 0.89, 1.0);
 
         for (NSView* subview in [rootView.subviews copy]) {
             [subview removeFromSuperview];
@@ -61,10 +64,10 @@ void InstallBootstrapWindowContent(GLFWwindow* window, const BootstrapWindowCont
         NSView* canvas = [[NSView alloc] initWithFrame:rootView.bounds];
         [canvas setTranslatesAutoresizingMaskIntoConstraints:NO];
         [canvas setWantsLayer:YES];
-        canvas.layer.backgroundColor = CGColorCreateGenericRGB(0.96, 0.95, 0.91, 1.0);
+        canvas.layer.backgroundColor = LayerColor(0.96, 0.95, 0.91, 1.0);
         canvas.layer.cornerRadius = 18.0;
         canvas.layer.borderWidth = 1.0;
-        canvas.layer.borderColor = CGColorCreateGenericRGB(0.68, 0.63, 0.53, 1.0);
+        canvas.layer.borderColor = LayerColor(0.68, 0.63, 0.53, 1.0);
 
         [rootView addSubview:canvas];
 
@@ -125,4 +128,3 @@ void InstallBootstrapWindowContent(GLFWwindow* window, const BootstrapWindowCont
 }
 
 }  // namespace invisible_places::platform
-

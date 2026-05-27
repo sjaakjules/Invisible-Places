@@ -22,7 +22,6 @@
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
-#include "renderer/pointcloud/RaycastBvh.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
 #include "water/WaterFlow.hpp"
@@ -982,56 +981,6 @@ TEST_CASE("Point-cloud colormaps sample listed and procedural tables", "[style][
     checkColor(SampleGradient({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.25F), {0.75F, 0.0F, 0.25F});
 }
 
-TEST_CASE("Raycast BVH handles empty point layers", "[raycast][bvh]") {
-    const auto bvh = invisible_places::renderer::pointcloud::BuildLinearRaycastBvh({});
-    CHECK(bvh.Empty());
-    CHECK(bvh.nodes.empty());
-    CHECK(bvh.pointIndices.empty());
-}
-
-TEST_CASE("Raycast BVH expands point bounds by radius", "[raycast][bvh]") {
-    const std::vector<invisible_places::renderer::pointcloud::RaycastBvhBuildPoint> points = {
-        {.center = {1.0F, 2.0F, -3.0F}, .radius = 0.5F, .pointIndex = 42U},
-    };
-
-    const auto bvh = invisible_places::renderer::pointcloud::BuildLinearRaycastBvh(points);
-    REQUIRE(bvh.nodes.size() == 1);
-    REQUIRE(bvh.pointIndices.size() == 1);
-    CHECK(bvh.pointIndices[0] == 42U);
-    CHECK(bvh.nodes[0].boundsMin[0] == Catch::Approx(0.5F));
-    CHECK(bvh.nodes[0].boundsMin[1] == Catch::Approx(1.5F));
-    CHECK(bvh.nodes[0].boundsMin[2] == Catch::Approx(-3.5F));
-    CHECK(bvh.nodes[0].boundsMax[0] == Catch::Approx(1.5F));
-    CHECK(bvh.nodes[0].boundsMax[1] == Catch::Approx(2.5F));
-    CHECK(bvh.nodes[0].boundsMax[2] == Catch::Approx(-2.5F));
-    CHECK(bvh.nodes[0].meta[2] == 0U);
-    CHECK(bvh.nodes[0].meta[3] == 1U);
-}
-
-TEST_CASE("Raycast BVH construction is deterministic", "[raycast][bvh]") {
-    const std::vector<invisible_places::renderer::pointcloud::RaycastBvhBuildPoint> points = {
-        {.center = {3.0F, 0.0F, 0.0F}, .radius = 0.1F, .pointIndex = 30U},
-        {.center = {-1.0F, 0.5F, 0.0F}, .radius = 0.2F, .pointIndex = 10U},
-        {.center = {2.0F, -0.5F, 1.0F}, .radius = 0.3F, .pointIndex = 20U},
-        {.center = {0.0F, 0.0F, -1.0F}, .radius = 0.4F, .pointIndex = 0U},
-        {.center = {4.0F, 2.0F, 0.25F}, .radius = 0.2F, .pointIndex = 40U},
-    };
-
-    const auto first = invisible_places::renderer::pointcloud::BuildLinearRaycastBvh(points, 2U);
-    const auto second = invisible_places::renderer::pointcloud::BuildLinearRaycastBvh(points, 2U);
-
-    REQUIRE(first.nodes.size() == second.nodes.size());
-    REQUIRE(first.pointIndices.size() == second.pointIndices.size());
-    CHECK(first.pointIndices == second.pointIndices);
-    for (std::size_t index = 0; index < first.nodes.size(); ++index) {
-        CHECK(first.nodes[index].boundsMin == second.nodes[index].boundsMin);
-        CHECK(first.nodes[index].boundsMax == second.nodes[index].boundsMax);
-        CHECK(first.nodes[index].meta == second.nodes[index].meta);
-    }
-    REQUIRE_FALSE(first.nodes.empty());
-    CHECK(first.nodes[0].meta[3] == 0U);
-}
-
 TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[serialization][project]") {
     const auto outputPath =
         std::filesystem::temp_directory_path() / "invisible_places_project_roundtrip.json";
@@ -1062,10 +1011,6 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.renderJobSettings.endFrame = 42;
     document.renderJobSettings.fromShotIndex = 0;
     document.renderJobSettings.toShotIndex = 1;
-    document.renderJobSettings.raycastPrimitiveMode =
-        invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres;
-    document.renderJobSettings.raycastSamplesPerPixel = 7;
-    document.renderJobSettings.raycastMaxDepth = 123.5F;
     document.waterSourceSettings = invisible_places::water::DefaultWaterSourceSettings(
         invisible_places::water::WaterScaleMode::Detail);
     document.waterSourceSettings.path.pathLength = 4.25F;
@@ -1154,27 +1099,6 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     projectPathCache.branches.push_back(projectBranch);
     projectPathCache.hiddenBranchIds.push_back(99U);
     document.waterPathCache = projectPathCache;
-    invisible_places::water::WaterBasinRegion basinRegion;
-    basinRegion.id = 4;
-    basinRegion.name = "Carved basin";
-    basinRegion.vertices = {{0.0F, 0.0F, 1.0F}, {1.0F, 0.0F, 1.1F}, {0.0F, 1.0F, 0.9F}};
-    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&basinRegion);
-    basinRegion.heightAbove = 0.45F;
-    basinRegion.depthBelow = 0.32F;
-    basinRegion.density = 1.8F;
-    basinRegion.outletEdgeIndex = 1U;
-    basinRegion.outletBlocked = false;
-    document.waterBasinRegions.push_back(basinRegion);
-    invisible_places::water::WaterRunoffRegion runoffRegion;
-    runoffRegion.id = 6;
-    runoffRegion.name = "Ridge dew";
-    runoffRegion.vertices = {{2.0F, 0.0F, 2.0F}, {3.0F, 0.0F, 2.1F}, {2.0F, 1.0F, 1.9F}};
-    runoffRegion.mode = invisible_places::water::WaterRunoffMode::LightRain;
-    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&runoffRegion);
-    runoffRegion.groundVoxelSize = 0.55F;
-    runoffRegion.highPointFraction = 0.33F;
-    runoffRegion.density = 2.2F;
-    document.waterRunoffRegions.push_back(runoffRegion);
     document.waterCausticLookSettings = invisible_places::water::DefaultWaterCausticLookSettings();
     document.waterCausticLookSettings.enabled = true;
     document.waterCausticLookSettings.intensity = 1.25F;
@@ -1189,28 +1113,20 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.tempWaterCausticLookSettings = document.waterCausticLookSettings;
     document.tempWaterCausticLookSettings->warp = 0.8F;
     document.tempWaterCausticLookSettings->warpAmplitudeMeters = 0.055F;
-    invisible_places::water::WaterCausticRegion causticRegion;
-    causticRegion.id = 8;
-    causticRegion.name = "Rock pool caustics";
-    causticRegion.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    causticRegion.vertices = {{0.0F, 0.0F, 0.2F}, {1.0F, 0.0F, 0.25F}, {0.0F, 1.0F, 0.15F}};
-    causticRegion.maskVoxelSize = 0.50F;
-    causticRegion.heightBand = 0.30F;
-    causticRegion.edgeBlendWidth = 0.70F;
-    causticRegion.previewTintMode = invisible_places::water::WaterCausticPreviewTintMode::Always;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&causticRegion);
-    causticRegion.maskDirty = false;
-    causticRegion.maskStale = false;
-    document.waterCausticRegions.push_back(causticRegion);
+    const std::vector<invisible_places::io::Float3> causticLaceVertices{
+        {0.0F, 0.0F, 0.2F},
+        {1.0F, 0.0F, 0.25F},
+        {0.0F, 1.0F, 0.15F}};
+    constexpr float causticLaceEdgeBlend = 0.70F;
     invisible_places::water::WaterEffectLayer rippleLayer;
     rippleLayer.id = 8;
     rippleLayer.name = "Rock pool caustic lace";
     rippleLayer.featureType = invisible_places::water::WaterEffectFeatureType::Ripple;
     rippleLayer.rippleOverlayType = invisible_places::water::WaterRippleOverlayType::CausticLace;
     rippleLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    rippleLayer.vertices = causticRegion.vertices;
+    rippleLayer.vertices = causticLaceVertices;
     rippleLayer.hull = invisible_places::water::BuildWaterRegionHull(rippleLayer.vertices);
-    rippleLayer.edgeBlendWidth = causticRegion.edgeBlendWidth;
+    rippleLayer.edgeBlendWidth = causticLaceEdgeBlend;
     rippleLayer.wavelengthMeters = 0.18F;
     rippleLayer.response.emissionAdd = 1.25F;
     document.waterRippleLayers.push_back(rippleLayer);
@@ -1219,7 +1135,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     fieldLayer.name = "Rock edge field";
     fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
     fieldLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    fieldLayer.vertices = causticRegion.vertices;
+    fieldLayer.vertices = causticLaceVertices;
     fieldLayer.hull = invisible_places::water::BuildWaterRegionHull(fieldLayer.vertices);
     fieldLayer.edgeBlendWidth = 0.24F;
     fieldLayer.regionStrength = 0.82F;
@@ -1232,7 +1148,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     noFlowLayer.name = "No flow backside";
     noFlowLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldNoFlowRegion;
     noFlowLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    noFlowLayer.vertices = causticRegion.vertices;
+    noFlowLayer.vertices = causticLaceVertices;
     noFlowLayer.hull = invisible_places::water::BuildWaterRegionHull(noFlowLayer.vertices);
     document.waterFieldLayers.push_back(noFlowLayer);
     document.waterFlowStreamSettings.streamCountTotal = 321U;
@@ -1433,10 +1349,6 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"selected_point_visual\"") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"saved_animations\"") != std::string::npos);
-        CHECK(savedJson.find("\"raycast_primitive_mode\"") != std::string::npos);
-        CHECK(savedJson.find("\"soft_density_spheres\"") != std::string::npos);
-        CHECK(savedJson.find("\"raycast_samples_per_pixel\": 7") != std::string::npos);
-        CHECK(savedJson.find("\"raycast_max_depth\": 123.5") != std::string::npos);
         CHECK(savedJson.find("\"schema_version\": 24") != std::string::npos);
         CHECK(savedJson.find("\"id\": \"camera_entry\"") != std::string::npos);
         CHECK(savedJson.find("\"duration_frames\": 120") == std::string::npos);
@@ -1465,11 +1377,6 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->renderJobSettings.startFrame == 10);
     CHECK(loadedDocument->renderJobSettings.endFrame == 42);
     CHECK(loadedDocument->renderJobSettings.toShotIndex == 1);
-    CHECK(
-        loadedDocument->renderJobSettings.raycastPrimitiveMode ==
-        invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres);
-    CHECK(loadedDocument->renderJobSettings.raycastSamplesPerPixel == 7U);
-    CHECK(loadedDocument->renderJobSettings.raycastMaxDepth == Catch::Approx(123.5F));
     CHECK(loadedDocument->waterSourceSettings.path.pathLength == Catch::Approx(4.25F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.particleJitter == Catch::Approx(0.64F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.splineAnchorSpacing == Catch::Approx(0.37F));
@@ -1538,9 +1445,6 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     REQUIRE(loadedDocument->waterPathCache->branches[0].rawAnchors.size() == 2U);
     CHECK(loadedDocument->waterPathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(2.5F));
     CHECK(loadedDocument->waterPathCache->hiddenBranchIds == std::vector<std::uint32_t>{99U});
-    CHECK(loadedDocument->waterBasinRegions.empty());
-    CHECK(loadedDocument->waterRunoffRegions.empty());
-    CHECK(loadedDocument->waterCausticRegions.empty());
     REQUIRE(loadedDocument->waterRippleLayers.size() == 1U);
     CHECK(loadedDocument->waterRippleLayers[0].name == "Rock pool caustic lace");
     CHECK(
@@ -1809,9 +1713,6 @@ TEST_CASE("Legacy water region records load as v2 ripples while basin and runoff
     std::string errorMessage;
     const auto loaded = invisible_places::serialization::LoadProjectDocument(inputPath, &errorMessage);
     REQUIRE(loaded.has_value());
-    CHECK(loaded->waterBasinRegions.empty());
-    CHECK(loaded->waterRunoffRegions.empty());
-    CHECK(loaded->waterCausticRegions.empty());
     REQUIRE(loaded->waterRippleLayers.size() == 1U);
     const auto& layer = loaded->waterRippleLayers.front();
     CHECK(layer.id == 8U);
@@ -1861,12 +1762,39 @@ TEST_CASE("Project document defaults Fast Basic renderer mode for older projects
         loadedDocument->pointCloudRendererMode ==
         invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty);
     CHECK(loadedDocument->eyeDomeLightingThickness == Catch::Approx(1.0F));
-    CHECK(
-        loadedDocument->renderJobSettings.raycastPrimitiveMode ==
-        invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode::StyleSurfels);
-    CHECK(loadedDocument->renderJobSettings.raycastSamplesPerPixel == 4U);
-    CHECK(loadedDocument->renderJobSettings.raycastMaxDepth == Catch::Approx(0.0F));
+    std::filesystem::remove(outputPath);
+}
 
+TEST_CASE("Legacy Raytraced renderer mode loads as Beauty and is not re-saved", "[serialization][project]") {
+    const auto inputPath =
+        std::filesystem::temp_directory_path() / "invisible_places_project_legacy_raytraced_mode.json";
+    {
+        std::ofstream output{inputPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 24,
+  "project_name": "Legacy raytraced",
+  "point_cloud_renderer_mode": "raytraced",
+  "layers": []
+})";
+    }
+
+    std::string errorMessage;
+    const auto loadedDocument = invisible_places::serialization::LoadProjectDocument(inputPath, &errorMessage);
+    REQUIRE(loadedDocument.has_value());
+    CHECK(
+        loadedDocument->pointCloudRendererMode ==
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty);
+
+    const auto outputPath =
+        std::filesystem::temp_directory_path() / "invisible_places_project_legacy_raytraced_mode_saved.json";
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(loadedDocument.value(), outputPath, &errorMessage));
+    std::ifstream savedProject{outputPath};
+    const std::string savedJson{
+        std::istreambuf_iterator<char>{savedProject},
+        std::istreambuf_iterator<char>{}};
+    CHECK(savedJson.find("\"point_cloud_renderer_mode\": \"beauty\"") != std::string::npos);
+    CHECK(savedJson.find("\"point_cloud_renderer_mode\": \"raytraced\"") == std::string::npos);
+    std::filesystem::remove(inputPath);
     std::filesystem::remove(outputPath);
 }
 
@@ -3675,342 +3603,6 @@ TEST_CASE("Water trail surface index is reusable for preview and final builds", 
     CHECK(secondPreviewDiagnostics.routedPathCount == previewDiagnostics.routedPathCount);
 }
 
-TEST_CASE("Basin haze and runoff water overlays generate feature-tagged point clouds", "[water]") {
-    invisible_places::io::LoadedPointCloud cloud;
-    cloud.hasNormals = true;
-    for (int y = 0; y <= 4; ++y) {
-        for (int x = 0; x <= 4; ++x) {
-            const float groundZ = 1.0F - static_cast<float>(x + y) * 0.08F;
-            cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ});
-            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
-            cloud.packedColors.push_back(0xFFFFFFFFU);
-            cloud.bounds.Expand(cloud.positions.back());
-            cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ + 0.85F});
-            cloud.normals.push_back({0.65F, 0.15F, 0.74F});
-            cloud.packedColors.push_back(0xFFFFFFFFU);
-            cloud.bounds.Expand(cloud.positions.back());
-        }
-    }
-
-    invisible_places::water::WaterBasinRegion basin;
-    basin.id = 11;
-    basin.vertices = {{0.0F, 0.0F, 1.0F}, {4.0F, 0.0F, 1.0F}, {4.0F, 4.0F, 0.4F}, {0.0F, 4.0F, 0.6F}};
-    basin.heightAbove = 0.55F;
-    basin.depthBelow = 0.35F;
-    basin.density = 20.0F;
-    basin.outletEdgeIndex = 1U;
-    basin.outletBlocked = false;
-    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&basin);
-
-    const auto basinOverlay = invisible_places::water::GenerateBasinHazeOverlay(cloud, {basin});
-    REQUIRE_FALSE(basinOverlay.points.empty());
-    CHECK(std::all_of(
-        basinOverlay.points.begin(),
-        basinOverlay.points.end(),
-        [](const invisible_places::water::WaterOverlayPoint& point) {
-            return point.featureType == Catch::Approx(1.0F) &&
-                   point.regionId == Catch::Approx(11.0F);
-        }));
-    const auto basinAnchorCount = std::count_if(
-        basinOverlay.points.begin(),
-        basinOverlay.points.end(),
-        [](const invisible_places::water::WaterOverlayPoint& point) {
-            return point.particleRole == Catch::Approx(0.0F);
-        });
-    const auto basinParticleCount = std::count_if(
-        basinOverlay.points.begin(),
-        basinOverlay.points.end(),
-        [](const invisible_places::water::WaterOverlayPoint& point) {
-            return point.particleRole >= 0.5F && point.particleRole < 1.5F;
-        });
-    CHECK(basinAnchorCount > 0);
-    CHECK(basinParticleCount > 0);
-    for (const auto& point : basinOverlay.points) {
-        if (point.particleRole < 0.5F || point.particleRole >= 1.5F) {
-            continue;
-        }
-        const auto pathStart = static_cast<std::size_t>(std::floor(point.pathStartIndex + 0.5F));
-        const auto pathCount = static_cast<std::size_t>(std::floor(point.pathPointCount + 0.5F));
-        REQUIRE(pathCount >= 2U);
-        REQUIRE(pathStart < basinOverlay.points.size());
-        REQUIRE(pathStart + pathCount <= basinOverlay.points.size());
-        const auto& nucleation = basinOverlay.points[pathStart];
-        CHECK(nucleation.particleRole == Catch::Approx(0.0F));
-        CHECK(nucleation.position.x >= -0.001F);
-        CHECK(nucleation.position.x <= 4.001F);
-        CHECK(nucleation.position.y >= -0.001F);
-        CHECK(nucleation.position.y <= 4.001F);
-        CHECK(nucleation.position.z >= basin.baseZ - basin.depthBelow - 0.001F);
-        CHECK(nucleation.position.z <= basin.baseZ + basin.heightAbove + 0.02F);
-    }
-
-    auto unselectedBasin = basin;
-    unselectedBasin.id = 99;
-    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&unselectedBasin);
-    const float unselectedRegionId = static_cast<float>(unselectedBasin.id);
-    const auto selectedOnlyBasinOverlay = invisible_places::water::GenerateBasinHazeOverlay(cloud, {basin});
-    CHECK(std::none_of(
-        selectedOnlyBasinOverlay.points.begin(),
-        selectedOnlyBasinOverlay.points.end(),
-        [unselectedRegionId](const invisible_places::water::WaterOverlayPoint& point) {
-            return point.regionId == Catch::Approx(unselectedRegionId);
-        }));
-
-    invisible_places::water::WaterRunoffRegion runoff;
-    runoff.id = 12;
-    runoff.vertices = basin.vertices;
-    runoff.mode = invisible_places::water::WaterRunoffMode::LightRain;
-    runoff.groundVoxelSize = 1.0F;
-    runoff.highPointFraction = 1.0F;
-    runoff.density = 20.0F;
-    runoff.pathLength = 5.0F;
-    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&runoff);
-    auto trailSettings = invisible_places::water::DefaultWaterAnimationTrailSettings();
-    trailSettings.particleDensity = 0.4F;
-    trailSettings.trailLengthMeters = 0.5F;
-    const auto runoffOverlay = invisible_places::water::GenerateRunoffOverlay(cloud, {runoff}, trailSettings);
-    REQUIRE_FALSE(runoffOverlay.points.empty());
-    CHECK(std::any_of(
-        runoffOverlay.points.begin(),
-        runoffOverlay.points.end(),
-        [](const invisible_places::water::WaterOverlayPoint& point) {
-            return point.featureType == Catch::Approx(2.0F) &&
-                   point.regionId == Catch::Approx(12.0F) &&
-                   point.particleRole >= 0.5F &&
-                   point.particleRole < 1.5F &&
-                   point.trailAge >= 0.0F &&
-                   point.trailLength > 0.0F;
-        }));
-    CHECK(std::any_of(
-        runoffOverlay.points.begin(),
-        runoffOverlay.points.end(),
-        [](const invisible_places::water::WaterOverlayPoint& point) {
-            return point.featureType == Catch::Approx(2.0F) &&
-                   point.particleRole < 0.5F &&
-                   point.pathPointCount >= 2.0F;
-        }));
-}
-
-TEST_CASE("Painted water caustic masks select existing boundary points without changing point count", "[water]") {
-    invisible_places::io::LoadedPointCloud cloud;
-    cloud.hasNormals = true;
-    std::vector<bool> expectedInside;
-    std::vector<bool> expectedElevated;
-    for (int y = 0; y <= 5; ++y) {
-        for (int x = 0; x <= 5; ++x) {
-            const float groundZ = 0.02F * static_cast<float>(x) - 0.015F * static_cast<float>(y);
-            cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ});
-            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
-            cloud.packedColors.push_back(0xFFFFFFFFU);
-            cloud.bounds.Expand(cloud.positions.back());
-            expectedInside.push_back(true);
-            expectedElevated.push_back(false);
-            if ((x == 2 && y == 2) || (x == 3 && y == 2) || (x == 2 && y == 3) || (x == 4 && y == 4)) {
-                cloud.positions.push_back({static_cast<float>(x), static_cast<float>(y), groundZ + 1.15F});
-                cloud.normals.push_back({0.7F, 0.2F, 0.68F});
-                cloud.packedColors.push_back(0xFFFFFFFFU);
-                cloud.bounds.Expand(cloud.positions.back());
-                expectedInside.push_back(true);
-                expectedElevated.push_back(true);
-            }
-        }
-    }
-    cloud.positions.push_back({6.5F, 2.5F, 0.0F});
-    cloud.normals.push_back({0.0F, 0.0F, 1.0F});
-    cloud.packedColors.push_back(0xFFFFFFFFU);
-    cloud.bounds.Expand(cloud.positions.back());
-    expectedInside.push_back(false);
-    expectedElevated.push_back(false);
-
-    invisible_places::water::WaterCausticRegion region;
-    region.id = 21;
-    region.vertices = {{-0.5F, -0.5F, 0.0F}, {5.5F, -0.5F, 0.1F}, {5.5F, 5.5F, 0.0F}, {-0.5F, 5.5F, -0.1F}};
-    region.edgeBlendWidth = 1.0F;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-
-    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {region});
-
-    REQUIRE(mask.mask.size() == cloud.PointCount());
-    REQUIRE(mask.edge.size() == cloud.PointCount());
-    REQUIRE(mask.regionId.size() == cloud.PointCount());
-    REQUIRE(mask.planeDistance.size() == cloud.PointCount());
-    REQUIRE(mask.seed.size() == cloud.PointCount());
-    CHECK(mask.hasAnyEnabledRegion);
-
-    REQUIRE(expectedInside.size() == cloud.PointCount());
-    REQUIRE(expectedElevated.size() == cloud.PointCount());
-
-    const auto expectedAccepted = static_cast<std::size_t>(
-        std::count(expectedInside.begin(), expectedInside.end(), true));
-    std::size_t acceptedPoints = 0U;
-    std::size_t acceptedElevated = 0U;
-    float strongestAcceptedEdge = 0.0F;
-    bool sawAcceptedSeed = false;
-    float acceptedSeed = 0.0F;
-    for (std::size_t index = 0; index < cloud.PointCount(); ++index) {
-        if (mask.mask[index] <= 0.0F) {
-            CHECK_FALSE(expectedInside[index]);
-            continue;
-        }
-        CHECK(expectedInside[index]);
-        ++acceptedPoints;
-        if (expectedElevated[index]) {
-            ++acceptedElevated;
-        }
-        strongestAcceptedEdge = std::max(strongestAcceptedEdge, mask.edge[index]);
-        CHECK(mask.regionId[index] == Catch::Approx(21.0F));
-        CHECK(mask.planeDistance[index] == Catch::Approx(0.0F));
-        CHECK(mask.seed[index] >= 0.0F);
-        CHECK(mask.seed[index] <= 1.0F);
-        if (!sawAcceptedSeed) {
-            acceptedSeed = mask.seed[index];
-            sawAcceptedSeed = true;
-        } else {
-            CHECK(mask.seed[index] == Catch::Approx(acceptedSeed));
-        }
-    }
-
-    CHECK(mask.affectedPointCount == expectedAccepted);
-    CHECK(acceptedPoints == expectedAccepted);
-    CHECK(acceptedElevated == 4U);
-    const auto cornerIndex = static_cast<std::size_t>(0);
-    CHECK(strongestAcceptedEdge > mask.edge[cornerIndex]);
-}
-
-TEST_CASE("Water caustic masks use clicked concave boundaries instead of derived hulls", "[water]") {
-    invisible_places::io::LoadedPointCloud cloud;
-    cloud.positions = {
-        {0.5F, 2.0F, 0.0F},
-        {3.0F, 2.0F, 0.0F},
-        {3.0F, 0.9F, 0.0F},
-        {4.5F, 2.0F, 0.0F},
-    };
-    cloud.packedColors.assign(cloud.positions.size(), 0xFFFFFFFFU);
-    for (const auto& position : cloud.positions) {
-        cloud.bounds.Expand(position);
-    }
-
-    invisible_places::water::WaterCausticRegion region;
-    region.id = 23;
-    region.vertices = {
-        {0.0F, 0.0F, 0.0F},
-        {4.0F, 0.0F, 0.0F},
-        {4.0F, 1.0F, 0.0F},
-        {1.0F, 1.0F, 0.0F},
-        {1.0F, 3.0F, 0.0F},
-        {4.0F, 3.0F, 0.0F},
-        {4.0F, 4.0F, 0.0F},
-        {0.0F, 4.0F, 0.0F},
-    };
-    region.edgeBlendWidth = 1.0F;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-    REQUIRE(region.hull.size() == 4U);
-
-    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {region});
-
-    REQUIRE(mask.mask.size() == cloud.PointCount());
-    CHECK(mask.affectedPointCount == 2U);
-    CHECK(mask.mask[0] == Catch::Approx(1.0F));
-    CHECK(mask.mask[1] == Catch::Approx(0.0F));
-    CHECK(mask.mask[2] == Catch::Approx(1.0F));
-    CHECK(mask.mask[3] == Catch::Approx(0.0F));
-    CHECK(mask.edge[2] < 0.05F);
-    CHECK(mask.regionId[2] == Catch::Approx(23.0F));
-}
-
-TEST_CASE("Water caustic masks preserve millimeter ground gaps", "[water]") {
-    invisible_places::io::LoadedPointCloud cloud;
-    cloud.hasNormals = true;
-    constexpr float spacing = 0.005F;
-    std::size_t gapPointCount = 0U;
-    for (int y = 0; y <= 200; ++y) {
-        for (int x = 0; x <= 200; ++x) {
-            const float px = static_cast<float>(x) * spacing;
-            const float py = static_cast<float>(y) * spacing;
-            if (px > 0.43F && px < 0.57F && py > 0.43F && py < 0.57F) {
-                ++gapPointCount;
-                continue;
-            }
-            const float pz = 0.006F * px - 0.004F * py;
-            cloud.positions.push_back({px, py, pz});
-            cloud.normals.push_back({-0.006F, 0.004F, 1.0F});
-            cloud.packedColors.push_back(0xFFFFFFFFU);
-            cloud.bounds.Expand(cloud.positions.back());
-        }
-    }
-
-    REQUIRE(gapPointCount > 0U);
-    const auto originalPointCount = cloud.PointCount();
-
-    invisible_places::water::WaterCausticRegion region;
-    region.id = 22;
-    region.vertices = {{-0.05F, -0.05F, 0.0F}, {1.05F, -0.05F, 0.0F}, {1.05F, 1.05F, 0.0F}, {-0.05F, 1.05F, 0.0F}};
-    region.edgeBlendWidth = 0.05F;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-
-    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {region});
-
-    CHECK(cloud.PointCount() == originalPointCount);
-    REQUIRE(mask.mask.size() == originalPointCount);
-    CHECK(mask.affectedPointCount == originalPointCount);
-
-    bool acceptedInsideGap = false;
-    bool sawAcceptedSeed = false;
-    float acceptedSeed = 0.0F;
-    std::size_t maskedPointCount = 0U;
-    for (std::size_t index = 0; index < cloud.PointCount(); ++index) {
-        CHECK(mask.mask[index] == Catch::Approx(1.0F));
-        ++maskedPointCount;
-        const auto& point = cloud.positions[index];
-        if (point.x > 0.43F && point.x < 0.57F && point.y > 0.43F && point.y < 0.57F) {
-            acceptedInsideGap = true;
-        }
-        if (!sawAcceptedSeed) {
-            acceptedSeed = mask.seed[index];
-            sawAcceptedSeed = true;
-        } else {
-            CHECK(mask.seed[index] == Catch::Approx(acceptedSeed));
-        }
-    }
-    CHECK(maskedPointCount == originalPointCount);
-    CHECK_FALSE(acceptedInsideGap);
-}
-
-TEST_CASE("Water caustic masks resolve overlaps by interior distance then region id", "[water]") {
-    invisible_places::io::LoadedPointCloud cloud;
-    cloud.positions = {{0.5F, 0.5F, 0.0F}, {1.1F, 1.1F, 0.0F}};
-    cloud.packedColors = {0xFFFFFFFFU, 0xFFFFFFFFU};
-    for (const auto& position : cloud.positions) {
-        cloud.bounds.Expand(position);
-    }
-
-    invisible_places::water::WaterCausticRegion outer;
-    outer.id = 31;
-    outer.vertices = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
-    outer.edgeBlendWidth = 0.5F;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&outer);
-
-    invisible_places::water::WaterCausticRegion shifted;
-    shifted.id = 32;
-    shifted.vertices = {{0.25F, 0.25F, 0.0F}, {1.25F, 0.25F, 0.0F}, {1.25F, 1.25F, 0.0F}, {0.25F, 1.25F, 0.0F}};
-    shifted.edgeBlendWidth = 0.5F;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&shifted);
-
-    const auto mask = invisible_places::water::GenerateCausticMask(cloud, {shifted, outer});
-    REQUIRE(mask.mask.size() == cloud.PointCount());
-    CHECK(mask.affectedPointCount == 2U);
-    CHECK(mask.regionId[0] == Catch::Approx(31.0F));
-    CHECK(mask.regionId[1] == Catch::Approx(32.0F));
-
-    invisible_places::water::WaterCausticRegion lowId = outer;
-    lowId.id = 40;
-    invisible_places::water::WaterCausticRegion highId = outer;
-    highId.id = 41;
-    const auto tieMask = invisible_places::water::GenerateCausticMask(cloud, {highId, lowId});
-    REQUIRE(tieMask.regionId.size() == cloud.PointCount());
-    CHECK(tieMask.regionId[0] == Catch::Approx(40.0F));
-}
-
 TEST_CASE("Water path smoothing changes baked anchor geometry", "[water]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.sourcePath = "synthetic-water-zigzag.ply";
@@ -4589,20 +4181,6 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     });
     sourcePathCache.branches.push_back(sourceBranch);
     document.pathCache = sourcePathCache;
-    invisible_places::water::WaterBasinRegion basinRegion;
-    basinRegion.id = 5;
-    basinRegion.vertices = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.1F}, {0.0F, 1.0F, -0.1F}};
-    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&basinRegion);
-    basinRegion.outletEdgeIndex = 0U;
-    basinRegion.outletBlocked = false;
-    document.basinRegions.push_back(basinRegion);
-    invisible_places::water::WaterRunoffRegion runoffRegion;
-    runoffRegion.id = 7;
-    runoffRegion.vertices = {{2.0F, 0.0F, 2.0F}, {3.0F, 0.0F, 2.0F}, {2.0F, 1.0F, 2.0F}};
-    runoffRegion.mode = invisible_places::water::WaterRunoffMode::LightRain;
-    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&runoffRegion);
-    runoffRegion.density = 1.6F;
-    document.runoffRegions.push_back(runoffRegion);
     document.causticLookSettings = invisible_places::water::DefaultWaterCausticLookSettings();
     document.causticLookSettings.enabled = true;
     document.causticLookSettings.intensity = 1.4F;
@@ -4615,23 +4193,17 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.tempCausticLookSettings = document.causticLookSettings;
     document.tempCausticLookSettings->speed = 1.3F;
     document.tempCausticLookSettings->lineWidthMeters = 0.018F;
-    invisible_places::water::WaterCausticRegion causticRegion;
-    causticRegion.id = 9;
-    causticRegion.name = "sandstone caustics";
-    causticRegion.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    causticRegion.vertices = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
-    causticRegion.planeMaxResidual = 0.12F;
-    causticRegion.planeMaxSlope = 0.65F;
-    causticRegion.previewTintMode = invisible_places::water::WaterCausticPreviewTintMode::Off;
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&causticRegion);
-    document.causticRegions.push_back(causticRegion);
+    const std::vector<invisible_places::io::Float3> sourceCausticLaceVertices{
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        {0.0F, 1.0F, 0.0F}};
     invisible_places::water::WaterEffectLayer rippleLayer;
     rippleLayer.id = 9;
     rippleLayer.name = "sandstone caustic lace";
     rippleLayer.featureType = invisible_places::water::WaterEffectFeatureType::Ripple;
     rippleLayer.rippleOverlayType = invisible_places::water::WaterRippleOverlayType::CausticLace;
     rippleLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    rippleLayer.vertices = causticRegion.vertices;
+    rippleLayer.vertices = sourceCausticLaceVertices;
     rippleLayer.hull = invisible_places::water::BuildWaterRegionHull(rippleLayer.vertices);
     rippleLayer.edgeBlendWidth = 0.44F;
     rippleLayer.wavelengthMeters = 0.16F;
@@ -4641,7 +4213,7 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     fieldLayer.name = "sandstone field";
     fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
     fieldLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
-    fieldLayer.vertices = causticRegion.vertices;
+    fieldLayer.vertices = sourceCausticLaceVertices;
     fieldLayer.hull = invisible_places::water::BuildWaterRegionHull(fieldLayer.vertices);
     fieldLayer.edgeBlendWidth = 0.33F;
     fieldLayer.regionStrength = 0.77F;
@@ -4733,9 +4305,6 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         loaded->emitters[2].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::Default);
     CHECK_FALSE(loaded->emitters[2].sourceSettings.has_value());
-    CHECK(loaded->basinRegions.empty());
-    CHECK(loaded->runoffRegions.empty());
-    CHECK(loaded->causticRegions.empty());
     REQUIRE(loaded->rippleLayers.size() == 1U);
     CHECK(loaded->rippleLayers[0].name == "sandstone caustic lace");
     CHECK(loaded->rippleLayers[0].edgeBlendWidth == Catch::Approx(0.44F));

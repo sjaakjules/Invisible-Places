@@ -27,7 +27,6 @@ using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
-using invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode;
 using invisible_places::renderer::pointcloud::PointCloudRendererMode;
 using invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
@@ -37,8 +36,6 @@ using invisible_places::style::ParameterSourceMode;
 using invisible_places::style::RenderParameterBinding;
 using invisible_places::water::WaterBakeSettings;
 using invisible_places::water::WaterCausticLookSettings;
-using invisible_places::water::WaterCausticPreviewTintMode;
-using invisible_places::water::WaterCausticRegion;
 using invisible_places::water::WaterEffectBlendMode;
 using invisible_places::water::WaterEffectFeatureType;
 using invisible_places::water::WaterEffectLayer;
@@ -51,7 +48,6 @@ using invisible_places::water::WaterFieldOutputMode;
 using invisible_places::water::WaterFieldSettings;
 using invisible_places::water::WaterFieldStreamSettings;
 using invisible_places::water::WaterFlowStreamSettings;
-using invisible_places::water::WaterBasinRegion;
 using invisible_places::water::WaterParticleTrailSettings;
 using invisible_places::water::WaterParticleTrailShapeSettings;
 using invisible_places::water::WaterParticleVisualSettings;
@@ -63,8 +59,6 @@ using invisible_places::water::WaterPathGenerationSettings;
 using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
 using invisible_places::water::WaterRippleOverlayType;
-using invisible_places::water::WaterRunoffMode;
-using invisible_places::water::WaterRunoffRegion;
 using invisible_places::water::WaterScaleMode;
 using invisible_places::water::WaterSettingsBundle;
 using invisible_places::water::WaterSourceSettingsAssignment;
@@ -240,8 +234,6 @@ const char* PointCloudRendererModeName(PointCloudRendererMode mode) {
             return "beauty";
         case PointCloudRendererMode::FastBasic:
             return "fast_basic";
-        case PointCloudRendererMode::Raytraced:
-            return "raytraced";
     }
 
     return "beauty";
@@ -252,29 +244,7 @@ PointCloudRendererMode ParsePointCloudRendererMode(const json& value) {
     if (modeName == "fast_basic") {
         return PointCloudRendererMode::FastBasic;
     }
-    if (modeName == "raytraced") {
-        return PointCloudRendererMode::Raytraced;
-    }
     return PointCloudRendererMode::Beauty;
-}
-
-const char* PointCloudRaycastPrimitiveModeName(PointCloudRaycastPrimitiveMode mode) {
-    switch (mode) {
-        case PointCloudRaycastPrimitiveMode::StyleSurfels:
-            return "style_surfels";
-        case PointCloudRaycastPrimitiveMode::SoftDensitySpheres:
-            return "soft_density_spheres";
-    }
-
-    return "style_surfels";
-}
-
-PointCloudRaycastPrimitiveMode ParsePointCloudRaycastPrimitiveMode(const json& value) {
-    const auto modeName = value.get<std::string>();
-    if (modeName == "soft_density_spheres" || modeName == "spheres") {
-        return PointCloudRaycastPrimitiveMode::SoftDensitySpheres;
-    }
-    return PointCloudRaycastPrimitiveMode::StyleSurfels;
 }
 
 const char* PointCloudGeometryModeName(PointCloudGeometryMode mode) {
@@ -1242,9 +1212,6 @@ json SerializeRenderJobSettings(const RenderJobSettings& settings) {
         {"end_frame", settings.endFrame},
         {"from_shot_index", settings.fromShotIndex},
         {"to_shot_index", settings.toShotIndex},
-        {"raycast_primitive_mode", PointCloudRaycastPrimitiveModeName(settings.raycastPrimitiveMode)},
-        {"raycast_samples_per_pixel", settings.raycastSamplesPerPixel},
-        {"raycast_max_depth", settings.raycastMaxDepth},
     };
 }
 
@@ -1261,12 +1228,6 @@ RenderJobSettings ParseRenderJobSettings(const json& settingsJson) {
     settings.endFrame = settingsJson.value("end_frame", 0U);
     settings.fromShotIndex = settingsJson.value("from_shot_index", static_cast<std::size_t>(0U));
     settings.toShotIndex = settingsJson.value("to_shot_index", static_cast<std::size_t>(1U));
-    if (settingsJson.contains("raycast_primitive_mode")) {
-        settings.raycastPrimitiveMode =
-            ParsePointCloudRaycastPrimitiveMode(settingsJson.at("raycast_primitive_mode"));
-    }
-    settings.raycastSamplesPerPixel = settingsJson.value("raycast_samples_per_pixel", 4U);
-    settings.raycastMaxDepth = settingsJson.value("raycast_max_depth", 0.0F);
     return settings;
 }
 
@@ -1453,149 +1414,18 @@ std::vector<invisible_places::io::Float3> ParseWaterRegionVertices(const json& v
     return vertices;
 }
 
-const char* WaterRunoffModeName(WaterRunoffMode mode) {
-    switch (mode) {
-        case WaterRunoffMode::LightRain:
-            return "light_rain";
-        case WaterRunoffMode::Dew:
-            return "dew";
-    }
-    return "dew";
-}
+struct LegacyCausticRegion {
+    std::uint32_t id = 0;
+    std::string name = "Caustics";
+    std::filesystem::path targetLayerSourcePath;
+    std::vector<invisible_places::io::Float3> vertices;
+    std::vector<invisible_places::io::Float3> hull;
+    float edgeBlendWidth = 0.60F;
+    bool enabled = true;
+};
 
-WaterRunoffMode ParseWaterRunoffMode(const json& modeJson) {
-    const auto modeName = modeJson.get<std::string>();
-    if (modeName == "light_rain") {
-        return WaterRunoffMode::LightRain;
-    }
-    return WaterRunoffMode::Dew;
-}
-
-const char* WaterCausticPreviewTintModeName(WaterCausticPreviewTintMode mode) {
-    switch (mode) {
-        case WaterCausticPreviewTintMode::Off:
-            return "off";
-        case WaterCausticPreviewTintMode::PulseAfterRefresh:
-            return "pulse_after_refresh";
-        case WaterCausticPreviewTintMode::Always:
-            return "always";
-    }
-    return "pulse_after_refresh";
-}
-
-WaterCausticPreviewTintMode ParseWaterCausticPreviewTintMode(const json& modeJson) {
-    const auto modeName = modeJson.get<std::string>();
-    if (modeName == "off") {
-        return WaterCausticPreviewTintMode::Off;
-    }
-    if (modeName == "always") {
-        return WaterCausticPreviewTintMode::Always;
-    }
-    return WaterCausticPreviewTintMode::PulseAfterRefresh;
-}
-
-json SerializeWaterBasinRegion(const WaterBasinRegion& region) {
-    json regionJson{
-        {"id", region.id},
-        {"name", region.name},
-        {"vertices", SerializeWaterRegionVertices(region.vertices)},
-        {"hull", SerializeWaterRegionVertices(region.hull)},
-        {"base_z", region.baseZ},
-        {"height_above", region.heightAbove},
-        {"depth_below", region.depthBelow},
-        {"density", region.density},
-        {"outlet_blocked", region.outletBlocked},
-    };
-    if (region.outletEdgeIndex.has_value()) {
-        regionJson["outlet_edge_index"] = region.outletEdgeIndex.value();
-    }
-    return regionJson;
-}
-
-WaterBasinRegion ParseWaterBasinRegion(const json& regionJson) {
-    WaterBasinRegion region;
-    region.id = regionJson.value("id", 0U);
-    region.name = regionJson.value("name", region.name);
-    if (regionJson.contains("vertices")) {
-        region.vertices = ParseWaterRegionVertices(regionJson.at("vertices"));
-    }
-    if (regionJson.contains("hull")) {
-        region.hull = ParseWaterRegionVertices(regionJson.at("hull"));
-    }
-    region.baseZ = regionJson.value("base_z", invisible_places::water::AverageWaterRegionZ(region.vertices));
-    region.heightAbove = std::clamp(regionJson.value("height_above", region.heightAbove), 0.0F, 20.0F);
-    region.depthBelow = std::clamp(regionJson.value("depth_below", region.depthBelow), 0.0F, 20.0F);
-    region.density = std::clamp(regionJson.value("density", region.density), 0.01F, 20.0F);
-    if (regionJson.contains("outlet_edge_index")) {
-        region.outletEdgeIndex = regionJson.at("outlet_edge_index").get<std::uint32_t>();
-    }
-    region.outletBlocked = regionJson.value("outlet_blocked", region.outletBlocked);
-    if (region.hull.empty()) {
-        invisible_places::water::RefreshWaterBasinRegionDerivedValues(&region);
-    }
-    return region;
-}
-
-json SerializeWaterRunoffRegion(const WaterRunoffRegion& region) {
-    return json{
-        {"id", region.id},
-        {"name", region.name},
-        {"vertices", SerializeWaterRegionVertices(region.vertices)},
-        {"hull", SerializeWaterRegionVertices(region.hull)},
-        {"mode", WaterRunoffModeName(region.mode)},
-        {"ground_voxel_size", region.groundVoxelSize},
-        {"high_point_fraction", region.highPointFraction},
-        {"density", region.density},
-        {"path_length", region.pathLength},
-        {"max_steps", region.maxSteps},
-    };
-}
-
-WaterRunoffRegion ParseWaterRunoffRegion(const json& regionJson) {
-    WaterRunoffRegion region;
-    region.id = regionJson.value("id", 0U);
-    region.name = regionJson.value("name", region.name);
-    if (regionJson.contains("vertices")) {
-        region.vertices = ParseWaterRegionVertices(regionJson.at("vertices"));
-    }
-    if (regionJson.contains("hull")) {
-        region.hull = ParseWaterRegionVertices(regionJson.at("hull"));
-    }
-    if (regionJson.contains("mode")) {
-        region.mode = ParseWaterRunoffMode(regionJson.at("mode"));
-    }
-    region.groundVoxelSize = std::clamp(regionJson.value("ground_voxel_size", region.groundVoxelSize), 0.03F, 10.0F);
-    region.highPointFraction = std::clamp(regionJson.value("high_point_fraction", region.highPointFraction), 0.01F, 0.95F);
-    region.density = std::clamp(regionJson.value("density", region.density), 0.01F, 20.0F);
-    region.pathLength = std::clamp(regionJson.value("path_length", region.pathLength), 0.5F, 300.0F);
-    region.maxSteps = std::clamp(regionJson.value("max_steps", region.maxSteps), 4.0F, 500.0F);
-    if (region.hull.empty()) {
-        invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&region);
-    }
-    return region;
-}
-
-json SerializeWaterCausticRegion(const WaterCausticRegion& region) {
-    return json{
-        {"id", region.id},
-        {"name", region.name},
-        {"target_layer_source_path", region.targetLayerSourcePath.generic_string()},
-        {"vertices", SerializeWaterRegionVertices(region.vertices)},
-        {"hull", SerializeWaterRegionVertices(region.hull)},
-        {"mask_voxel_size", region.maskVoxelSize},
-        {"plane_max_residual", region.planeMaxResidual},
-        {"plane_max_slope", region.planeMaxSlope},
-        {"height_band", region.heightBand},
-        {"edge_blend_width", region.edgeBlendWidth},
-        {"preview_tint_mode", WaterCausticPreviewTintModeName(region.previewTintMode)},
-        {"enabled", region.enabled},
-        {"mask_dirty", region.maskDirty},
-        {"mask_stale", region.maskStale},
-    };
-}
-
-WaterCausticRegion ParseWaterCausticRegion(const json& regionJson) {
-    WaterCausticRegion region;
+LegacyCausticRegion ParseLegacyCausticRegion(const json& regionJson) {
+    LegacyCausticRegion region;
     region.id = regionJson.value("id", 0U);
     region.name = regionJson.value("name", region.name);
     region.targetLayerSourcePath = regionJson.value("target_layer_source_path", std::string{});
@@ -1605,21 +1435,11 @@ WaterCausticRegion ParseWaterCausticRegion(const json& regionJson) {
     if (regionJson.contains("hull")) {
         region.hull = ParseWaterRegionVertices(regionJson.at("hull"));
     }
-    region.maskVoxelSize = std::clamp(regionJson.value("mask_voxel_size", region.maskVoxelSize), 0.005F, 20.0F);
-    region.planeMaxResidual =
-        std::clamp(regionJson.value("plane_max_residual", region.planeMaxResidual), 0.005F, 5.0F);
-    region.planeMaxSlope = std::clamp(regionJson.value("plane_max_slope", region.planeMaxSlope), 0.02F, 5.0F);
-    region.heightBand = std::clamp(regionJson.value("height_band", region.heightBand), 0.01F, 20.0F);
     region.edgeBlendWidth =
         std::clamp(regionJson.value("edge_blend_width", region.edgeBlendWidth), 0.01F, 50.0F);
-    if (regionJson.contains("preview_tint_mode")) {
-        region.previewTintMode = ParseWaterCausticPreviewTintMode(regionJson.at("preview_tint_mode"));
-    }
     region.enabled = regionJson.value("enabled", region.enabled);
-    region.maskDirty = regionJson.value("mask_dirty", region.maskDirty);
-    region.maskStale = regionJson.value("mask_stale", region.maskStale);
     if (region.hull.empty()) {
-        invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
+        region.hull = invisible_places::water::BuildWaterRegionHull(region.vertices);
     }
     return region;
 }
@@ -2897,7 +2717,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (projectJson->contains("water_caustic_regions") &&
         projectJson->at("water_caustic_regions").is_array()) {
         for (const auto& regionJson : projectJson->at("water_caustic_regions")) {
-            auto region = ParseWaterCausticRegion(regionJson);
+            auto region = ParseLegacyCausticRegion(regionJson);
             if (!hasNativeRippleLayers) {
                 WaterEffectLayer layer;
                 layer.id = region.id;
@@ -3213,7 +3033,7 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_caustic_regions") &&
         sourcesJson->at("water_caustic_regions").is_array()) {
         for (const auto& regionJson : sourcesJson->at("water_caustic_regions")) {
-            auto region = ParseWaterCausticRegion(regionJson);
+            auto region = ParseLegacyCausticRegion(regionJson);
             if (!hasNativeRippleLayers) {
                 WaterEffectLayer layer;
                 layer.id = region.id;

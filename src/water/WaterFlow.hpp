@@ -38,17 +38,6 @@ enum class WaterSourceSettingsAssignment {
     LinkedEmitter
 };
 
-enum class WaterRunoffMode {
-    Dew,
-    LightRain
-};
-
-enum class WaterCausticPreviewTintMode {
-    Off,
-    PulseAfterRefresh,
-    Always
-};
-
 enum class WaterEffectFeatureType {
     Ripple,
     FieldSurfaceMotion,
@@ -529,59 +518,6 @@ struct WaterPathCache {
     bool stale = false;
 };
 
-struct WaterBasinRegion {
-    std::uint32_t id = 0;
-    std::string name = "Basin";
-    std::vector<invisible_places::io::Float3> vertices;
-    std::vector<invisible_places::io::Float3> hull;
-    float baseZ = 0.0F;
-    float heightAbove = 0.20F;
-    float depthBelow = 0.20F;
-    float density = 1.0F;
-    std::optional<std::uint32_t> outletEdgeIndex;
-    bool outletBlocked = true;
-};
-
-struct WaterRunoffRegion {
-    std::uint32_t id = 0;
-    std::string name = "Runoff";
-    std::vector<invisible_places::io::Float3> vertices;
-    std::vector<invisible_places::io::Float3> hull;
-    WaterRunoffMode mode = WaterRunoffMode::Dew;
-    float groundVoxelSize = 0.40F;
-    float highPointFraction = 0.20F;
-    float density = 1.0F;
-    float pathLength = 16.0F;
-    float maxSteps = 72.0F;
-};
-
-struct WaterCausticRegion {
-    std::uint32_t id = 0;
-    std::string name = "Caustics";
-    std::filesystem::path targetLayerSourcePath;
-    std::vector<invisible_places::io::Float3> vertices;
-    std::vector<invisible_places::io::Float3> hull;
-    float maskVoxelSize = 0.05F;
-    float planeMaxResidual = 0.08F;
-    float planeMaxSlope = 0.55F;
-    float heightBand = 0.22F;
-    float edgeBlendWidth = 0.60F;
-    WaterCausticPreviewTintMode previewTintMode = WaterCausticPreviewTintMode::PulseAfterRefresh;
-    bool enabled = true;
-    bool maskDirty = true;
-    bool maskStale = true;
-};
-
-struct WaterCausticMaskResult {
-    std::vector<float> mask;
-    std::vector<float> edge;
-    std::vector<float> regionId;
-    std::vector<float> planeDistance;
-    std::vector<float> seed;
-    std::uint64_t affectedPointCount = 0;
-    bool hasAnyEnabledRegion = false;
-};
-
 [[nodiscard]] const char* WaterScaleModeName(WaterScaleMode mode);
 [[nodiscard]] const char* WaterEmitterOriginName(WaterEmitterOrigin origin);
 [[nodiscard]] const char* WaterEmitterStatusName(WaterEmitterStatus status);
@@ -746,21 +682,6 @@ struct WaterCausticMaskResult {
     std::string_view layerName);
 [[nodiscard]] std::vector<invisible_places::io::Float3> BuildWaterRegionHull(
     const std::vector<invisible_places::io::Float3>& vertices);
-[[nodiscard]] float AverageWaterRegionZ(
-    const std::vector<invisible_places::io::Float3>& vertices);
-void RefreshWaterBasinRegionDerivedValues(WaterBasinRegion* region);
-void RefreshWaterRunoffRegionDerivedValues(WaterRunoffRegion* region);
-void RefreshWaterCausticRegionDerivedValues(WaterCausticRegion* region);
-[[nodiscard]] WaterOverlay GenerateBasinHazeOverlay(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    const std::vector<WaterBasinRegion>& regions);
-[[nodiscard]] WaterOverlay GenerateRunoffOverlay(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    const std::vector<WaterRunoffRegion>& regions,
-    const WaterAnimationTrailSettings& animationTrailSettings);
-[[nodiscard]] WaterCausticMaskResult GenerateCausticMask(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    const std::vector<WaterCausticRegion>& regions);
 
 bool WriteWaterOverlayPly(
     const WaterOverlay& overlay,

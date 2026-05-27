@@ -30,16 +30,11 @@ struct RenderJobSettings {
     std::uint32_t endFrame = 0;
     std::size_t fromShotIndex = 0;
     std::size_t toShotIndex = 1;
-    invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode raycastPrimitiveMode =
-        invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode::StyleSurfels;
-    std::uint32_t raycastSamplesPerPixel = 4;
-    float raycastMaxDepth = 0.0F;
 };
 
 enum class AnimationExportMode {
     FastPreviewMp4,
     HqPreviewDensityExr,
-    BeautyRaycastExrMp4,
 };
 
 std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(

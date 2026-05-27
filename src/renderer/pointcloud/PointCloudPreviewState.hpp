@@ -83,13 +83,7 @@ enum class PointCloudPreviewLodMode {
 
 enum class PointCloudRendererMode {
     Beauty,
-    FastBasic,
-    Raytraced
-};
-
-enum class PointCloudRaycastPrimitiveMode {
-    StyleSurfels,
-    SoftDensitySpheres
+    FastBasic
 };
 
 enum class PointCloudMaterialVariant {

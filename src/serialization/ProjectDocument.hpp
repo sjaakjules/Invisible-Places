@@ -72,9 +72,6 @@ struct ProjectDocument {
         invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
     invisible_places::output::RenderJobSettings renderJobSettings{};
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
-    std::vector<invisible_places::water::WaterBasinRegion> waterBasinRegions;
-    std::vector<invisible_places::water::WaterRunoffRegion> waterRunoffRegions;
-    std::vector<invisible_places::water::WaterCausticRegion> waterCausticRegions;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
@@ -109,9 +106,6 @@ struct PointCloudStylePresetDocument {
 struct WaterSourcesDocument {
     std::uint32_t schemaVersion = 6;
     std::vector<invisible_places::water::WaterEmitter> emitters;
-    std::vector<invisible_places::water::WaterBasinRegion> basinRegions;
-    std::vector<invisible_places::water::WaterRunoffRegion> runoffRegions;
-    std::vector<invisible_places::water::WaterCausticRegion> causticRegions;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     invisible_places::water::WaterSourceSettings sourceSettings{};

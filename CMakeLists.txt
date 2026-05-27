@@ -63,9 +63,6 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/gsplat_composite.frag
     shaders/pointcloud_exr_composite.frag
     shaders/edl_postprocess.frag
-    shaders/pointcloud_raycast_clear.comp
-    shaders/pointcloud_raycast_accumulate.comp
-    shaders/pointcloud_raycast_composite.comp
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_caustics.glsl"
@@ -128,7 +125,6 @@ add_library(
     src/renderer/gsplat/HighQualityGaussianScene.cpp
     src/renderer/pointcloud/Colormap.cpp
     src/renderer/pointcloud/PointCloudPreviewState.cpp
-    src/renderer/pointcloud/RaycastBvh.cpp
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
     src/style/RenderParameterBinding.cpp

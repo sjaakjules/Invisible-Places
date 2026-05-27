@@ -93,7 +93,6 @@ using PointCloudFalloffProfile = invisible_places::renderer::pointcloud::PointCl
 using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
-using PointCloudRaycastPrimitiveMode = invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode;
 using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointCloudRendererMode;
 using PointCloudScreenSpriteSizeMode = invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using PointCloudStylisationMode = invisible_places::renderer::pointcloud::PointCloudStylisationMode;
@@ -113,10 +112,7 @@ using PointCloudStylePresetDocument = invisible_places::serialization::PointClou
 using RenderJobSettings = invisible_places::output::RenderJobSettings;
 using WaterBakeSettings = invisible_places::water::WaterBakeSettings;
 using WaterAnimationTrailSettings = invisible_places::water::WaterAnimationTrailSettings;
-using WaterBasinRegion = invisible_places::water::WaterBasinRegion;
 using WaterCausticLookSettings = invisible_places::water::WaterCausticLookSettings;
-using WaterCausticPreviewTintMode = invisible_places::water::WaterCausticPreviewTintMode;
-using WaterCausticRegion = invisible_places::water::WaterCausticRegion;
 using WaterEffectBlendMode = invisible_places::water::WaterEffectBlendMode;
 using WaterEffectFeatureType = invisible_places::water::WaterEffectFeatureType;
 using WaterEffectLayer = invisible_places::water::WaterEffectLayer;
@@ -140,8 +136,6 @@ using WaterPathCache = invisible_places::water::WaterPathCache;
 using WaterPathGenerationSettings = invisible_places::water::WaterPathGenerationSettings;
 using WaterRenderSettings = invisible_places::water::WaterRenderSettings;
 using WaterRippleOverlayType = invisible_places::water::WaterRippleOverlayType;
-using WaterRunoffMode = invisible_places::water::WaterRunoffMode;
-using WaterRunoffRegion = invisible_places::water::WaterRunoffRegion;
 using WaterScaleMode = invisible_places::water::WaterScaleMode;
 using WaterSettingsBundle = invisible_places::water::WaterSettingsBundle;
 using WaterSourceSettingsAssignment = invisible_places::water::WaterSourceSettingsAssignment;
@@ -456,16 +450,7 @@ bool AddAnimationFileToRegistry(
 void RefreshAnimationFileList(
     AnimationPanelState* panelState,
     const std::filesystem::path& animationDirectory);
-PointCloudStyleState ApplyWaterCausticRenderStyle(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session,
-    PointCloudStyleState style,
-    bool includeEditorPreview = true);
 std::string NormalizeMotionScalarFieldName(std::string_view name);
-bool RefreshWaterCausticMaskForSession(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport,
-    std::size_t sessionIndex);
 bool SessionHasWaterEffectCompositionFields(const PreviewLayerSession& session);
 bool ApplyWaterEffectCompositionFieldsToSession(
     PreviewRuntimeState* runtimeState,
@@ -567,9 +552,6 @@ enum class WaterOverlayViewMode {
 
 enum class WaterRegionFeature {
     None,
-    Basin,
-    Runoff,
-    Caustic,
     Ripple
 };
 
@@ -607,9 +589,6 @@ struct WaterPathDebugPolyline {
 
 struct WaterWorkflowState {
     std::vector<WaterEmitter> emitters;
-    std::vector<WaterBasinRegion> basinRegions;
-    std::vector<WaterRunoffRegion> runoffRegions;
-    std::vector<WaterCausticRegion> causticRegions;
     std::vector<WaterEffectLayer> rippleLayers;
     std::vector<WaterEffectLayer> fieldLayers;
     WaterSourceSettings defaultSourceSettings = invisible_places::water::DefaultWaterSourceSettings(WaterScaleMode::Mid);
@@ -659,33 +638,21 @@ struct WaterWorkflowState {
     std::optional<std::uint32_t> hoveredPathBranchId;
     std::optional<std::uint32_t> selectedPathBranchId;
     std::vector<std::vector<std::uint32_t>> pathEditUndoHiddenBranchIds;
-    std::unordered_map<std::uint32_t, double> causticPreviewTintPulseUntilSeconds;
     WaterRegionFeature activeRegionFeature = WaterRegionFeature::None;
     WaterRegionEditorState regionEditor{};
     std::optional<std::size_t> selectedEmitterIndex;
     std::optional<std::size_t> movingEmitterIndex;
-    std::optional<std::size_t> selectedBasinRegionIndex;
-    std::optional<std::size_t> selectedRunoffRegionIndex;
-    std::optional<std::size_t> selectedCausticRegionIndex;
     std::optional<std::size_t> selectedRippleLayerIndex;
     std::optional<std::size_t> selectedFieldLayerIndex;
     std::optional<std::size_t> activeSupportSessionIndex;
     std::filesystem::path lastOverlayPath;
-    std::filesystem::path lastBasinOverlayPath;
-    std::filesystem::path lastRunoffOverlayPath;
     std::filesystem::path lastRippleOverlayPath;
     std::filesystem::path lastFieldStreamOverlayPath;
     std::filesystem::path lastFieldSurfaceOverlayPath;
     std::uint32_t nextEmitterId = 1;
-    std::uint32_t nextBasinRegionId = 1;
-    std::uint32_t nextRunoffRegionId = 1;
-    std::uint32_t nextCausticRegionId = 1;
     std::uint32_t nextRippleLayerId = 1;
     std::uint32_t nextFieldLayerId = 1;
     std::uint32_t maxAutoSuggestions = 8;
-    bool basinRegionPlacementArmed = false;
-    bool runoffRegionPlacementArmed = false;
-    bool causticRegionPlacementArmed = false;
     bool rippleRegionPlacementArmed = false;
     bool fieldRegionPlacementArmed = false;
 };
@@ -1082,22 +1049,9 @@ const char* PointCloudRendererModeLabel(PointCloudRendererMode mode) {
             return "Beauty";
         case PointCloudRendererMode::FastBasic:
             return "Fast Basic";
-        case PointCloudRendererMode::Raytraced:
-            return "Raytraced";
     }
 
     return "Beauty";
-}
-
-const char* PointCloudRaycastPrimitiveModeLabel(PointCloudRaycastPrimitiveMode mode) {
-    switch (mode) {
-        case PointCloudRaycastPrimitiveMode::StyleSurfels:
-            return "Style Surfels";
-        case PointCloudRaycastPrimitiveMode::SoftDensitySpheres:
-            return "Soft Density Spheres";
-    }
-
-    return "Style Surfels";
 }
 
 const char* GaussianSplatColorModeLabel(GaussianSplatColorMode mode) {
@@ -2259,6 +2213,25 @@ bool TryAssignRangedFloatValue(float* value, float candidate, const RangedFloatC
     return true;
 }
 
+std::string FormatRangedFloatLimit(float value, const RangedFloatControlConfig& config) {
+    std::array<char, 64> buffer{};
+    std::snprintf(buffer.data(), buffer.size(), config.format != nullptr ? config.format : "%.3f", value);
+    return buffer.data();
+}
+
+std::string RangedFloatValidationMessage(float candidate, const RangedFloatControlConfig& config) {
+    if (!std::isfinite(candidate)) {
+        return "Enter a finite value.";
+    }
+    if (config.hardMin.has_value() && candidate < config.hardMin.value()) {
+        return "Minimum " + FormatRangedFloatLimit(config.hardMin.value(), config) + ".";
+    }
+    if (config.hardMax.has_value() && candidate > config.hardMax.value()) {
+        return "Maximum " + FormatRangedFloatLimit(config.hardMax.value(), config) + ".";
+    }
+    return {};
+}
+
 bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatControlConfig& config) {
     if (value == nullptr) {
         return false;
@@ -2271,6 +2244,8 @@ bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatCo
     static ImGuiID editingControlId = 0;
     static ImGuiID focusEditingControlId = 0;
     static ImGuiID activeDragId = 0;
+    static ImGuiID invalidInputControlId = 0;
+    static std::string invalidInputMessage;
     static float activeDragStartValue = 0.0F;
     static ImVec2 activeDragStartMouse{};
     bool changed = false;
@@ -2293,11 +2268,28 @@ bool DrawRangedFloatControl(const char* label, float* value, const RangedFloatCo
             focusEditingControlId = 0;
         }
         if (ImGui::InputFloat("##value", &inputValue, 0.0F, 0.0F, config.format)) {
-            // TODO: surface an "out of range" popup once transient validation UI is structured.
-            changed |= TryAssignRangedFloatValue(value, inputValue, config);
+            if (TryAssignRangedFloatValue(value, inputValue, config)) {
+                changed = true;
+                if (invalidInputControlId == controlId) {
+                    invalidInputControlId = 0;
+                    invalidInputMessage.clear();
+                }
+            } else if (!IsValidRangedFloatValue(inputValue, config)) {
+                invalidInputControlId = controlId;
+                invalidInputMessage = RangedFloatValidationMessage(inputValue, config);
+            }
+        }
+        if (invalidInputControlId == controlId && !invalidInputMessage.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("%s", invalidInputMessage.c_str());
+            ImGui::PopStyleColor();
         }
         if (ImGui::IsItemDeactivated()) {
             editingControlId = 0;
+            if (invalidInputControlId == controlId) {
+                invalidInputControlId = 0;
+                invalidInputMessage.clear();
+            }
         }
         ImGui::PopID();
         return changed;
@@ -2761,16 +2753,12 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
            waterVisualName == "Water Flow_preset" ||
            waterVisualName == "Ripples" ||
            waterVisualName == "Field Surface" ||
-           waterVisualName == "Basin Haze" ||
-           waterVisualName == "Runoff" ||
            stem.ends_with("-WaterPreview") ||
            stem.ends_with("-WaterFlow") ||
            stem.ends_with("-WaterFlowStreams") ||
            stem.ends_with("-Ripples") ||
            stem.ends_with("-FieldStreamlines") ||
-           stem.ends_with("-FieldSurface") ||
-           stem.ends_with("-BasinHaze") ||
-           stem.ends_with("-Runoff");
+           stem.ends_with("-FieldSurface");
 }
 
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session) {
@@ -2799,16 +2787,12 @@ bool IsAssociableLidarSession(const PreviewLayerSession& session) {
     return waterVisualName != "Water Flow_preset" &&
            waterVisualName != "Ripples" &&
            waterVisualName != "Field Surface" &&
-           waterVisualName != "Basin Haze" &&
-           waterVisualName != "Runoff" &&
            !stem.ends_with("-WaterPreview") &&
            !stem.ends_with("-WaterFlow") &&
            !stem.ends_with("-WaterFlowStreams") &&
            !stem.ends_with("-Ripples") &&
            !stem.ends_with("-FieldStreamlines") &&
-           !stem.ends_with("-FieldSurface") &&
-           !stem.ends_with("-BasinHaze") &&
-           !stem.ends_with("-Runoff");
+           !stem.ends_with("-FieldSurface");
 }
 
 bool IsVisibleAssociableLidarSession(const PreviewLayerSession& session) {
@@ -3668,18 +3652,6 @@ bool ActivateLoadedPointCloud(
     if (!IsGeneratedWaterOverlaySession(session)) {
         TryLoadWaterPathCacheForSupport(runtimeState, session);
     }
-    const auto sourceKey = NormalizePathKey(session.sourcePath);
-    const bool hasCausticRegions = std::any_of(
-        runtimeState->water.causticRegions.begin(),
-        runtimeState->water.causticRegions.end(),
-        [&](const WaterCausticRegion& region) {
-            return NormalizePathKey(region.targetLayerSourcePath) == sourceKey &&
-                   region.enabled &&
-                   region.vertices.size() >= 3U;
-        });
-    if (hasCausticRegions) {
-        RefreshWaterCausticMaskForSession(runtimeState, viewport, sessionIndex);
-    }
     runtimeState->selectedSessionIndex = sessionIndex;
     if (!hadVisibleLayersBefore && runtimeState->preserveProjectCameraOnNextLayerActivation) {
         runtimeState->preserveProjectCameraOnNextLayerActivation = false;
@@ -3945,30 +3917,6 @@ std::uint32_t NextWaterEmitterId(const PreviewRuntimeState& runtimeState) {
     std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextEmitterId);
     for (const auto& emitter : runtimeState.water.emitters) {
         nextId = std::max<std::uint32_t>(nextId, emitter.id + 1U);
-    }
-    return nextId;
-}
-
-std::uint32_t NextWaterBasinRegionId(const PreviewRuntimeState& runtimeState) {
-    std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextBasinRegionId);
-    for (const auto& region : runtimeState.water.basinRegions) {
-        nextId = std::max<std::uint32_t>(nextId, region.id + 1U);
-    }
-    return nextId;
-}
-
-std::uint32_t NextWaterRunoffRegionId(const PreviewRuntimeState& runtimeState) {
-    std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextRunoffRegionId);
-    for (const auto& region : runtimeState.water.runoffRegions) {
-        nextId = std::max<std::uint32_t>(nextId, region.id + 1U);
-    }
-    return nextId;
-}
-
-std::uint32_t NextWaterCausticRegionId(const PreviewRuntimeState& runtimeState) {
-    std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextCausticRegionId);
-    for (const auto& region : runtimeState.water.causticRegions) {
-        nextId = std::max<std::uint32_t>(nextId, region.id + 1U);
     }
     return nextId;
 }
@@ -5194,45 +5142,6 @@ PointCloudStyleState MakeWaterOverlayDisplayStyle(const PreviewRuntimeState& run
     return style;
 }
 
-PointCloudStyleState MakeBasinHazeOverlayStyle() {
-    auto style = MakeWaterOverlayStyle(WaterOverlayViewMode::Trail);
-    style.geometryMode = PointCloudGeometryMode::CameraFacingWorldSprites;
-    style.solidColor = {0.68F, 0.90F, 1.0F, 1.0F};
-    style.colorizeColor = {0.72F, 0.92F, 1.0F};
-    style.exposure = 1.15F;
-    style.gaussianSharpness = 0.80F;
-    style.densityScale = 0.70F;
-    style.densityClamp = 10.0F;
-    style.solidCenters = false;
-    invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
-    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.045F);
-    ConfigureWaterFieldBinding(&style.opacity, 13, "trail_age", 0.12F, 0.02F);
-    invisible_places::style::SetFieldMapFlag(
-        &style.opacity.fieldMap,
-        invisible_places::style::FieldMapFlagUseLayerStats,
-        false);
-    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.04F);
-    style.waterPathView = false;
-    return style;
-}
-
-PointCloudStyleState MakeRunoffOverlayStyle() {
-    auto style = MakeWaterOverlayStyle(WaterOverlayViewMode::Trail);
-    invisible_places::style::SetScalarConstant(&style.pointSize, 7.0F);
-    ConfigureWaterFieldBinding(&style.opacity, 13, "trail_age", 0.32F, 0.03F);
-    invisible_places::style::SetFieldMapFlag(
-        &style.opacity.fieldMap,
-        invisible_places::style::FieldMapFlagUseLayerStats,
-        false);
-    ConfigureWaterFieldBinding(&style.emissiveStrength, 7, "accumulation", 0.05F, 0.52F);
-    invisible_places::style::SetFieldMapFlag(
-        &style.emissiveStrength.fieldMap,
-        invisible_places::style::FieldMapFlagUseLayerStats,
-        false);
-    style.waterPathView = false;
-    return style;
-}
-
 void ApplyWaterOverlayDisplayStyle(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
@@ -5783,9 +5692,6 @@ void LoadWaterSources(
     }
 
     runtimeState->water.emitters = document->emitters;
-    runtimeState->water.basinRegions.clear();
-    runtimeState->water.runoffRegions.clear();
-    runtimeState->water.causticRegions.clear();
     runtimeState->water.rippleLayers = document->rippleLayers;
     runtimeState->water.fieldLayers = document->fieldLayers;
     runtimeState->water.flowStreamSettings = document->flowStreamSettings;
@@ -5796,25 +5702,13 @@ void LoadWaterSources(
     runtimeState->water.defaultCausticLookSettings = document->causticLookSettings;
     runtimeState->water.tempDefaultCausticLookSettings = document->tempCausticLookSettings;
     runtimeState->water.nextEmitterId = NextWaterEmitterId(*runtimeState);
-    runtimeState->water.nextBasinRegionId = NextWaterBasinRegionId(*runtimeState);
-    runtimeState->water.nextRunoffRegionId = NextWaterRunoffRegionId(*runtimeState);
-    runtimeState->water.nextCausticRegionId = NextWaterCausticRegionId(*runtimeState);
     runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
     runtimeState->water.nextFieldLayerId = NextWaterFieldLayerId(*runtimeState);
-    runtimeState->water.nextFieldLayerId = NextWaterFieldLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
-    runtimeState->water.selectedBasinRegionIndex.reset();
-    runtimeState->water.selectedRunoffRegionIndex.reset();
-    runtimeState->water.selectedCausticRegionIndex.reset();
     runtimeState->water.selectedRippleLayerIndex.reset();
     runtimeState->water.selectedFieldLayerIndex.reset();
-    runtimeState->water.selectedFieldLayerIndex.reset();
     runtimeState->water.placementArmed = false;
-    runtimeState->water.basinRegionPlacementArmed = false;
-    runtimeState->water.runoffRegionPlacementArmed = false;
-    runtimeState->water.causticRegionPlacementArmed = false;
     runtimeState->water.rippleRegionPlacementArmed = false;
-    runtimeState->water.fieldRegionPlacementArmed = false;
     runtimeState->water.fieldRegionPlacementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
     if (document->pathCache.has_value() && !document->pathCache->branches.empty()) {
@@ -6272,95 +6166,6 @@ bool RefreshWaterFieldOverlays(
     return true;
 }
 
-bool BakeBasinHazeOverlayForActiveLayer(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return false;
-    }
-    if (!runtimeState->water.selectedBasinRegionIndex.has_value() ||
-        runtimeState->water.selectedBasinRegionIndex.value() >= runtimeState->water.basinRegions.size()) {
-        runtimeState->errorMessage = "Select a basin region before baking basin steam.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    const auto basinIndex = runtimeState->water.selectedBasinRegionIndex.value();
-    WaterBasinRegion selectedRegion = runtimeState->water.basinRegions[basinIndex];
-    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&selectedRegion);
-    if (selectedRegion.hull.size() < 3U) {
-        runtimeState->errorMessage = "Close the selected basin region before baking basin steam.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
-    if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
-        runtimeState->errorMessage = "Load and show a point-cloud layer before baking basin haze.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    auto& sourceSession = runtimeState->sessions[supportIndex.value()];
-    if (sourceSession.offlinePointCloud == nullptr) {
-        runtimeState->errorMessage = "The selected basin support layer is not available on CPU.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    const auto overlay = invisible_places::water::GenerateBasinHazeOverlay(
-        *sourceSession.offlinePointCloud,
-        std::vector<WaterBasinRegion>{selectedRegion});
-    const auto outputPath = BuildWaterFeatureOverlayPath(*runtimeState, sourceSession, "-BasinHaze.ply");
-    std::string errorMessage;
-    if (!invisible_places::water::WriteWaterOverlayPly(overlay, outputPath, &errorMessage)) {
-        runtimeState->errorMessage = errorMessage;
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    runtimeState->water.lastBasinOverlayPath = outputPath;
-    AddOrRefreshWaterOverlaySession(runtimeState, viewport, outputPath, "Basin Haze", MakeBasinHazeOverlayStyle());
-    runtimeState->statusMessage =
-        "Baked basin steam " + outputPath.filename().string() +
-        " with " + FormatPointCount(overlay.points.size()) + " points.";
-    runtimeState->errorMessage.clear();
-    return true;
-}
-
-bool BakeRunoffOverlayForActiveLayer(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return false;
-    }
-    const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
-    if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
-        runtimeState->errorMessage = "Load and show a point-cloud layer before baking runoff.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    auto& sourceSession = runtimeState->sessions[supportIndex.value()];
-    if (sourceSession.offlinePointCloud == nullptr) {
-        runtimeState->errorMessage = "The selected runoff support layer is not available on CPU.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    const auto overlay = invisible_places::water::GenerateRunoffOverlay(
-        *sourceSession.offlinePointCloud,
-        runtimeState->water.runoffRegions,
-        ViewedWaterAnimationTrailSettings(*runtimeState));
-    const auto outputPath = BuildWaterFeatureOverlayPath(*runtimeState, sourceSession, "-Runoff.ply");
-    std::string errorMessage;
-    if (!invisible_places::water::WriteWaterOverlayPly(overlay, outputPath, &errorMessage)) {
-        runtimeState->errorMessage = errorMessage;
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    runtimeState->water.lastRunoffOverlayPath = outputPath;
-    AddOrRefreshWaterOverlaySession(runtimeState, viewport, outputPath, "Runoff", MakeRunoffOverlayStyle());
-    runtimeState->statusMessage =
-        "Baked runoff " + outputPath.filename().string() +
-        " with " + FormatPointCount(overlay.points.size()) + " points.";
-    runtimeState->errorMessage.clear();
-    return true;
-}
-
 std::optional<std::size_t> FindScalarFieldByName(
     const std::vector<invisible_places::io::ScalarFieldStats>& fields,
     std::string_view name) {
@@ -6565,94 +6370,6 @@ bool RefreshLoadedWaterEffectOutputs(
     return attempted;
 }
 
-bool RefreshWaterCausticMaskForSession(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport,
-    std::size_t sessionIndex) {
-    if (runtimeState == nullptr || viewport == nullptr || sessionIndex >= runtimeState->sessions.size()) {
-        return false;
-    }
-    auto& session = runtimeState->sessions[sessionIndex];
-    if (!session.loaded || session.kind != LayerKind::PointCloud || session.offlinePointCloud == nullptr) {
-        runtimeState->errorMessage = "The caustic target point cloud is not loaded.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-
-    const auto targetKey = NormalizePathKey(session.sourcePath);
-    std::vector<WaterCausticRegion> targetRegions;
-    for (const auto& region : runtimeState->water.causticRegions) {
-        if (NormalizePathKey(region.targetLayerSourcePath) == targetKey) {
-            targetRegions.push_back(region);
-        }
-    }
-    if (targetRegions.empty()) {
-        runtimeState->errorMessage = "No caustic regions target " + session.displayName + ".";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-
-    auto mask = invisible_places::water::GenerateCausticMask(*session.offlinePointCloud, targetRegions);
-    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "caustic_mask", mask.mask);
-    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "caustic_edge", mask.edge);
-    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "caustic_region_id", mask.regionId);
-    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "caustic_plane_distance", mask.planeDistance);
-    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "caustic_seed", mask.seed);
-    session.scalarFields = session.offlinePointCloud->scalarFields;
-    SanitizePointCloudStyle(&session);
-    try {
-        viewport->UploadPointCloud(sessionIndex, *session.offlinePointCloud, session.pointBudget.sampledIndices);
-    } catch (const std::exception& error) {
-        runtimeState->errorMessage = "GPU upload failed while refreshing caustic mask: " + std::string{error.what()};
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-
-    for (auto& region : runtimeState->water.causticRegions) {
-        if (NormalizePathKey(region.targetLayerSourcePath) == targetKey) {
-            region.maskDirty = false;
-            region.maskStale = false;
-        }
-    }
-    if (runtimeState->water.selectedCausticRegionIndex.has_value() &&
-        runtimeState->water.selectedCausticRegionIndex.value() < runtimeState->water.causticRegions.size()) {
-        const auto& selectedRegion =
-            runtimeState->water.causticRegions[runtimeState->water.selectedCausticRegionIndex.value()];
-        if (NormalizePathKey(selectedRegion.targetLayerSourcePath) == targetKey &&
-            selectedRegion.previewTintMode == WaterCausticPreviewTintMode::PulseAfterRefresh) {
-            runtimeState->water.causticPreviewTintPulseUntilSeconds[selectedRegion.id] =
-                ImGui::GetTime() + 4.0;
-        }
-    }
-    runtimeState->statusMessage =
-        "Refreshed caustic selection mask for " + session.displayName + " with " +
-        FormatPointCount(mask.affectedPointCount) + " affected points.";
-    runtimeState->errorMessage.clear();
-    return true;
-}
-
-bool RefreshSelectedWaterCausticMask(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-    if (!runtimeState->water.selectedCausticRegionIndex.has_value() ||
-        runtimeState->water.selectedCausticRegionIndex.value() >= runtimeState->water.causticRegions.size()) {
-        runtimeState->errorMessage = "Select a caustic region before refreshing its mask.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    const auto& region = runtimeState->water.causticRegions[runtimeState->water.selectedCausticRegionIndex.value()];
-    const auto targetIndex = FindSessionIndexBySourcePath(*runtimeState, region.targetLayerSourcePath);
-    if (!targetIndex.has_value()) {
-        runtimeState->errorMessage = "The caustic target layer is not loaded.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    return RefreshWaterCausticMaskForSession(runtimeState, viewport, targetIndex.value());
-}
-
 bool PlaceWaterEmitterAtScreenPoint(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -6693,68 +6410,6 @@ bool PlaceWaterEmitterAtScreenPoint(
     return true;
 }
 
-bool AddWaterBasinVertexAtScreenPoint(
-    PreviewRuntimeState* runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    ImVec2 screenPoint) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
-    if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No visible point-cloud surface was available for basin region placement.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    if (!runtimeState->water.selectedBasinRegionIndex.has_value() ||
-        runtimeState->water.selectedBasinRegionIndex.value() >= runtimeState->water.basinRegions.size()) {
-        WaterBasinRegion region;
-        region.id = NextWaterBasinRegionId(*runtimeState);
-        region.name = "Basin " + std::to_string(region.id);
-        runtimeState->water.nextBasinRegionId = region.id + 1U;
-        runtimeState->water.basinRegions.push_back(std::move(region));
-        runtimeState->water.selectedBasinRegionIndex = runtimeState->water.basinRegions.size() - 1U;
-    }
-    auto& region = runtimeState->water.basinRegions[runtimeState->water.selectedBasinRegionIndex.value()];
-    region.vertices.push_back(pivot->point);
-    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&region);
-    runtimeState->statusMessage =
-        "Added basin vertex " + std::to_string(region.vertices.size()) + " to " + region.name + ".";
-    runtimeState->errorMessage.clear();
-    return true;
-}
-
-bool AddWaterRunoffVertexAtScreenPoint(
-    PreviewRuntimeState* runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    ImVec2 screenPoint) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
-    if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No visible point-cloud surface was available for runoff region placement.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    if (!runtimeState->water.selectedRunoffRegionIndex.has_value() ||
-        runtimeState->water.selectedRunoffRegionIndex.value() >= runtimeState->water.runoffRegions.size()) {
-        WaterRunoffRegion region;
-        region.id = NextWaterRunoffRegionId(*runtimeState);
-        region.name = "Runoff " + std::to_string(region.id);
-        runtimeState->water.nextRunoffRegionId = region.id + 1U;
-        runtimeState->water.runoffRegions.push_back(std::move(region));
-        runtimeState->water.selectedRunoffRegionIndex = runtimeState->water.runoffRegions.size() - 1U;
-    }
-    auto& region = runtimeState->water.runoffRegions[runtimeState->water.selectedRunoffRegionIndex.value()];
-    region.vertices.push_back(pivot->point);
-    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&region);
-    runtimeState->statusMessage =
-        "Added runoff vertex " + std::to_string(region.vertices.size()) + " to " + region.name + ".";
-    runtimeState->errorMessage.clear();
-    return true;
-}
-
 std::optional<std::filesystem::path> SelectedCausticTargetLayerPath(const PreviewRuntimeState& runtimeState) {
     if (runtimeState.selectedSessionIndex.has_value() &&
         runtimeState.selectedSessionIndex.value() < runtimeState.sessions.size()) {
@@ -6771,44 +6426,6 @@ std::optional<std::filesystem::path> SelectedCausticTargetLayerPath(const Previe
         }
     }
     return std::nullopt;
-}
-
-bool AddWaterCausticVertexAtScreenPoint(
-    PreviewRuntimeState* runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    ImVec2 screenPoint) {
-    if (runtimeState == nullptr) {
-        return false;
-    }
-    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
-    if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No visible point-cloud surface was available for caustic region placement.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    if (!runtimeState->water.selectedCausticRegionIndex.has_value() ||
-        runtimeState->water.selectedCausticRegionIndex.value() >= runtimeState->water.causticRegions.size()) {
-        const auto targetPath = SelectedCausticTargetLayerPath(*runtimeState);
-        if (!targetPath.has_value()) {
-            runtimeState->errorMessage = "Select a loaded LiDAR layer before creating caustics.";
-            runtimeState->statusMessage.clear();
-            return false;
-        }
-        WaterCausticRegion region;
-        region.id = NextWaterCausticRegionId(*runtimeState);
-        region.name = "Caustics " + std::to_string(region.id);
-        region.targetLayerSourcePath = targetPath.value();
-        runtimeState->water.nextCausticRegionId = region.id + 1U;
-        runtimeState->water.causticRegions.push_back(std::move(region));
-        runtimeState->water.selectedCausticRegionIndex = runtimeState->water.causticRegions.size() - 1U;
-    }
-    auto& region = runtimeState->water.causticRegions[runtimeState->water.selectedCausticRegionIndex.value()];
-    region.vertices.push_back(pivot->point);
-    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-    runtimeState->statusMessage =
-        "Added caustic vertex " + std::to_string(region.vertices.size()) + " to " + region.name + ".";
-    runtimeState->errorMessage.clear();
-    return true;
 }
 
 bool AddWaterRippleVertexAtScreenPoint(
@@ -7300,9 +6917,6 @@ bool ApplyProjectDocumentToRuntime(
     }
     runtimeState->renderSettings = renderSettings;
     runtimeState->water.emitters = document.waterEmitters;
-    runtimeState->water.basinRegions.clear();
-    runtimeState->water.runoffRegions.clear();
-    runtimeState->water.causticRegions.clear();
     runtimeState->water.rippleLayers = document.waterRippleLayers;
     runtimeState->water.fieldLayers = document.waterFieldLayers;
     runtimeState->water.flowStreamSettings = document.waterFlowStreamSettings;
@@ -7382,19 +6996,10 @@ bool ApplyProjectDocumentToRuntime(
     }
     runtimeState->water.pointVisualNameBuffer = BasePointVisualName(runtimeState->water.selectedPointVisualName);
     runtimeState->water.nextEmitterId = NextWaterEmitterId(*runtimeState);
-    runtimeState->water.nextBasinRegionId = NextWaterBasinRegionId(*runtimeState);
-    runtimeState->water.nextRunoffRegionId = NextWaterRunoffRegionId(*runtimeState);
-    runtimeState->water.nextCausticRegionId = NextWaterCausticRegionId(*runtimeState);
     runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
-    runtimeState->water.selectedBasinRegionIndex.reset();
-    runtimeState->water.selectedRunoffRegionIndex.reset();
-    runtimeState->water.selectedCausticRegionIndex.reset();
     runtimeState->water.selectedRippleLayerIndex.reset();
     runtimeState->water.placementArmed = false;
-    runtimeState->water.basinRegionPlacementArmed = false;
-    runtimeState->water.runoffRegionPlacementArmed = false;
-    runtimeState->water.causticRegionPlacementArmed = false;
     runtimeState->water.rippleRegionPlacementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
@@ -9344,7 +8949,6 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         auto style = IsGeneratedWaterOverlaySession(session)
                          ? MakeWaterTrailExportStyle(session.pointStyle)
                          : session.pointStyle;
-        style = ApplyWaterCausticRenderStyle(runtimeState, session, style, false);
         layers.push_back(
             {.cloud = session.offlinePointCloud,
              .style = FastBasicPointRendererActive(runtimeState.projectSettings)
@@ -9409,144 +9013,6 @@ std::optional<std::size_t> FindGroundIdMotionScalarFieldSlot(
         scalarFields,
         {"groundid", "scalargroundid"},
         "groundid");
-}
-
-std::optional<std::size_t> FindCausticMaskScalarFieldSlot(
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
-    return FindMotionScalarFieldSlot(
-        scalarFields,
-        {"causticmask", "scalarcausticmask"},
-        "causticmask");
-}
-
-std::optional<std::size_t> FindCausticEdgeScalarFieldSlot(
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
-    return FindMotionScalarFieldSlot(
-        scalarFields,
-        {"causticedge", "scalarcausticedge"},
-        "causticedge");
-}
-
-std::optional<std::size_t> FindCausticRegionScalarFieldSlot(
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
-    return FindMotionScalarFieldSlot(
-        scalarFields,
-        {"causticregionid", "scalarcausticregionid"},
-        "causticregionid");
-}
-
-std::optional<std::size_t> FindCausticSeedScalarFieldSlot(
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
-    return FindMotionScalarFieldSlot(
-        scalarFields,
-        {"causticseed", "scalarcausticseed"},
-        "causticseed");
-}
-
-bool HasCausticRegionForSession(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
-    if (session.kind != LayerKind::PointCloud || IsGeneratedWaterOverlaySession(session)) {
-        return false;
-    }
-    const auto sourceKey = NormalizePathKey(session.sourcePath);
-    return std::any_of(
-        runtimeState.water.causticRegions.begin(),
-        runtimeState.water.causticRegions.end(),
-        [&](const WaterCausticRegion& region) {
-            return region.enabled &&
-                   region.vertices.size() >= 3U &&
-                   NormalizePathKey(region.targetLayerSourcePath) == sourceKey;
-        });
-}
-
-struct CausticPreviewTintState {
-    float amount = 0.0F;
-    float regionId = 0.0F;
-};
-
-CausticPreviewTintState ResolveCausticPreviewTintState(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
-    if (runtimeState.water.activeRegionFeature != WaterRegionFeature::Caustic ||
-        !runtimeState.water.selectedCausticRegionIndex.has_value() ||
-        runtimeState.water.selectedCausticRegionIndex.value() >= runtimeState.water.causticRegions.size()) {
-        return {};
-    }
-
-    const auto& region = runtimeState.water.causticRegions[runtimeState.water.selectedCausticRegionIndex.value()];
-    if (!region.enabled ||
-        NormalizePathKey(region.targetLayerSourcePath) != NormalizePathKey(session.sourcePath)) {
-        return {};
-    }
-
-    constexpr float kCausticPreviewTintAmount = 0.30F;
-    constexpr double kCausticPreviewPulseSeconds = 4.0;
-    switch (region.previewTintMode) {
-        case WaterCausticPreviewTintMode::Always:
-            return {.amount = kCausticPreviewTintAmount, .regionId = static_cast<float>(region.id)};
-        case WaterCausticPreviewTintMode::PulseAfterRefresh: {
-            const auto pulseIt = runtimeState.water.causticPreviewTintPulseUntilSeconds.find(region.id);
-            if (pulseIt == runtimeState.water.causticPreviewTintPulseUntilSeconds.end()) {
-                return {};
-            }
-            const double remaining = pulseIt->second - ImGui::GetTime();
-            if (remaining <= 0.0) {
-                return {};
-            }
-            return {
-                .amount = kCausticPreviewTintAmount *
-                          std::clamp(static_cast<float>(remaining / kCausticPreviewPulseSeconds), 0.0F, 1.0F),
-                .regionId = static_cast<float>(region.id)};
-        }
-        case WaterCausticPreviewTintMode::Off:
-            return {};
-    }
-    return {};
-}
-
-PointCloudStyleState ApplyWaterCausticRenderStyle(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session,
-    PointCloudStyleState style,
-    bool includeEditorPreview) {
-    const auto& look = ViewedWaterCausticLookSettings(runtimeState);
-    const auto maskSlot = FindCausticMaskScalarFieldSlot(session.scalarFields);
-    const auto edgeSlot = FindCausticEdgeScalarFieldSlot(session.scalarFields);
-    const auto regionSlot = FindCausticRegionScalarFieldSlot(session.scalarFields);
-    const auto seedSlot = FindCausticSeedScalarFieldSlot(session.scalarFields);
-    const auto regionOrSeedSlot = regionSlot.has_value() ? regionSlot : seedSlot;
-    const auto previewTint = includeEditorPreview
-                                 ? ResolveCausticPreviewTintState(runtimeState, session)
-                                 : CausticPreviewTintState{};
-    const bool active =
-        HasCausticRegionForSession(runtimeState, session) &&
-        maskSlot.has_value() &&
-        edgeSlot.has_value() &&
-        regionOrSeedSlot.has_value() &&
-        ((look.enabled && look.intensity > 1.0e-5F) ||
-         previewTint.amount > 1.0e-5F);
-    style.causticAnimation = active;
-    style.causticIntensity = active && look.enabled ? look.intensity : 0.0F;
-    style.causticScale = look.scale;
-    style.causticSpeed = look.speed;
-    style.causticLineSharpness = look.lineSharpness;
-    style.causticWarp = look.warp;
-    style.causticCellSizeMeters = look.cellSizeMeters;
-    style.causticLineWidthMeters = look.lineWidthMeters;
-    style.causticFeatherMeters = look.featherMeters;
-    style.causticSurfacePointSpacingMeters = look.surfacePointSpacingMeters;
-    style.causticWarpAmplitudeMeters = look.warpAmplitudeMeters;
-    style.causticTint = {look.tintRed, look.tintGreen, look.tintBlue};
-    style.causticEmissionBoost = look.emissionBoost;
-    style.causticOpacityBoost = look.opacityBoost;
-    style.causticPointSizeBoost = look.pointSizeBoost;
-    style.causticPreviewTintAmount = active ? previewTint.amount : 0.0F;
-    style.causticPreviewTintRegionId = active ? previewTint.regionId : 0.0F;
-    style.causticMaskFieldSlot = active ? static_cast<std::int32_t>(maskSlot.value()) : -1;
-    style.causticEdgeFieldSlot = active ? static_cast<std::int32_t>(edgeSlot.value()) : -1;
-    style.causticSeedFieldSlot = active ? static_cast<std::int32_t>(regionOrSeedSlot.value()) : -1;
-    return style;
 }
 
 std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers(
@@ -9696,7 +9162,6 @@ BuildAnimationExportPointCloudLayerSnapshot(
         if (IsGeneratedWaterOverlaySession(session)) {
             exportStyle = MakeWaterTrailExportStyle(exportStyle);
         }
-        exportStyle = ApplyWaterCausticRenderStyle(runtimeState, session, exportStyle, false);
         const auto effectiveStyle =
             rendererMode == PointCloudRendererMode::FastBasic
                 ? MakeEffectiveFastBasicStyle(
@@ -9840,16 +9305,11 @@ std::string FormatLocalTime(
 }
 
 bool AnimationExportWritesMp4(invisible_places::output::AnimationExportMode mode) {
-    return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
-           mode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4;
+    return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4;
 }
 
 bool AnimationExportWritesExr(invisible_places::output::AnimationExportMode mode) {
     return mode != invisible_places::output::AnimationExportMode::FastPreviewMp4;
-}
-
-bool AnimationExportIsRaycast(invisible_places::output::AnimationExportMode mode) {
-    return mode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4;
 }
 
 std::uint32_t Mp4SupersampleScaleForSettings(const RenderJobSettings& settings) {
@@ -9891,8 +9351,6 @@ const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMo
             return "Quick MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "HQ Preview-Density EXR";
-        case invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4:
-            return "Beauty Raycast EXR + MP4";
     }
 
     return "Animation Export";
@@ -9904,8 +9362,6 @@ const char* AnimationExportCaptureLabel(invisible_places::output::AnimationExpor
             return "MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "HQ EXR";
-        case invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4:
-            return "Beauty Raycast";
     }
 
     return "Animation";
@@ -9917,8 +9373,6 @@ const char* AnimationExportOverlayLabel(invisible_places::output::AnimationExpor
             return "Encoding Fast Preview MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "Rendering HQ Preview-Density EXR";
-        case invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4:
-            return "Rendering Beauty Raycast";
     }
 
     return "Animation Export";
@@ -9930,8 +9384,6 @@ const char* StillCameraExportOverlayLabel(invisible_places::output::AnimationExp
             return "Exporting Still Camera MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "Exporting Still Camera EXR Stack";
-        case invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4:
-            return "Exporting Still Camera Raycast";
     }
 
     return "Still Camera Export";
@@ -9947,8 +9399,6 @@ const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) 
             return "ExportLog_MP4_";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "ExportLog_EXR_";
-        case invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4:
-            return "ExportLog_Raycast_";
     }
 
     return "ExportLog_";
@@ -10156,19 +9606,9 @@ std::string WriteExportLog(
     log << "Frames written: " << job.writtenFrameCount << '\n';
     log << "Preview density: " << (job.previewDensity ? "yes" : "no") << '\n';
     log << "Point renderer: " << PointCloudRendererModeLabel(job.pointCloudRendererMode) << '\n';
-    log << "Export renderer: "
-        << (AnimationExportIsRaycast(job.mode) ? "Beauty Raycast" : "Beauty Raster") << '\n';
+    log << "Export renderer: Beauty Raster\n";
     if (job.exportEyeDomeLightingEnabled) {
         log << "Eye-Dome Lighting thickness: " << job.exportEyeDomeLightingThickness << " px\n";
-    }
-    if (AnimationExportIsRaycast(job.mode)) {
-        log << "Raycast primitive: " << PointCloudRaycastPrimitiveModeLabel(job.settings.raycastPrimitiveMode) << '\n';
-        log << "Raycast samples per pixel: " << job.settings.raycastSamplesPerPixel << '\n';
-        if (job.settings.raycastMaxDepth > 0.0F) {
-            log << "Raycast max depth: " << job.settings.raycastMaxDepth << '\n';
-        } else {
-            log << "Raycast max depth: camera far plane\n";
-        }
     }
     if (job.writePreviewMp4) {
         log << "MP4 sparse point smoothing: yes\n";
@@ -10513,11 +9953,8 @@ void RunAnimationExportWriter(
         auto makeCompletionStatus = [&]() {
             std::string status;
             if (writesExr && writesMp4) {
-                status = mode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4
-                             ? "Beauty Raycast EXR + MP4 complete: " + settings.outputDirectory +
-                                   " and " + outputOptions.previewVideoPath.string() + "."
-                             : "EXR stack + preview MP4 complete: " + settings.outputDirectory +
-                                   " and " + outputOptions.previewVideoPath.string() + ".";
+                status = "EXR stack + preview MP4 complete: " + settings.outputDirectory +
+                         " and " + outputOptions.previewVideoPath.string() + ".";
             } else if (writesExr) {
                 status = "EXR stack complete: " + settings.outputDirectory + ".";
             } else {
@@ -10658,8 +10095,6 @@ void NormalizeAnimationRenderSettings(RenderJobSettings* settings) {
     settings->framesPerSecond = std::max<std::uint32_t>(1U, settings->framesPerSecond);
     settings->stillCameraDurationSeconds = std::clamp(settings->stillCameraDurationSeconds, 0.001F, 3600.0F);
     settings->tileSize = std::max<std::uint32_t>(1U, settings->tileSize);
-    settings->raycastSamplesPerPixel = std::clamp(settings->raycastSamplesPerPixel, 1U, 16U);
-    settings->raycastMaxDepth = std::max(0.0F, settings->raycastMaxDepth);
     if (settings->outputDirectory.empty()) {
         settings->outputDirectory = DefaultRenderOutputDirectory(std::filesystem::path{}).string();
     }
@@ -11108,14 +10543,6 @@ void StartStillCameraExportJob(
     }
 
     const auto mode = runtimeState->cameraPanel.stillExportMode;
-    const bool raycastExport =
-        mode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4;
-    if (raycastExport && viewport != nullptr && !viewport->SupportsRaycastExport()) {
-        runtimeState->errorMessage = "Beauty Raycast export requires Vulkan compute support on the active GPU.";
-        runtimeState->statusMessage.clear();
-        return;
-    }
-
     std::filesystem::path videoOutputPath;
     AnimationExportOutputOptions outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath);
     const bool exrStackPreviewMp4 =
@@ -11135,7 +10562,7 @@ void StartStillCameraExportJob(
             videoOutputPath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
                 settings.outputDirectory,
                 "StillCamera",
-                exrStackPreviewMp4 ? "EXRStackPreview" : (raycastExport ? "BeautyRaycast" : "CurrentView"));
+                exrStackPreviewMp4 ? "EXRStackPreview" : "CurrentView");
         }
         outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath, exrStackPreviewMp4);
         if (exrStackPreviewMp4) {
@@ -11188,8 +10615,7 @@ void StartStillCameraExportJob(
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
-        .pointCloudRendererMode =
-            raycastExport ? PointCloudRendererMode::Beauty : runtimeState->projectSettings.pointCloudRendererMode,
+        .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .stillCameraJob = true,
         .animationName = "Still Camera",
         .exportVisualName = "Current View",
@@ -11250,33 +10676,8 @@ void StartAnimationExportJob(
         return;
     }
 
-    const bool raycastExport =
-        runtimeState->animationPanel.exportMode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4;
-    if (raycastExport && viewport != nullptr && !viewport->SupportsRaycastExport()) {
-        runtimeState->errorMessage = "Beauty Raycast export requires Vulkan compute support on the active GPU.";
-        runtimeState->statusMessage.clear();
-        return;
-    }
     std::filesystem::path videoOutputPath;
-    if (raycastExport) {
-        if (!invisible_places::output::FfmpegExecutableAvailable(
-                invisible_places::output::DefaultFfmpegExecutablePath())) {
-            runtimeState->errorMessage =
-                "Beauty Raycast MP4 review export requires ffmpeg at " +
-                invisible_places::output::DefaultFfmpegExecutablePath().string() + ".";
-            runtimeState->statusMessage.clear();
-            return;
-        }
-        const auto animationName = runtimeState->animationPanel.currentPath.has_value()
-                                       ? runtimeState->animationPanel.currentPath->name
-                                       : std::string{"Animation"};
-        videoOutputPath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
-            settings.outputDirectory,
-            animationName,
-            "BeautyRaycast");
-    }
-
-    const bool exportUsesPreviewDensity = !raycastExport && runtimeState->animationPanel.exportPreviewDensity;
+    const bool exportUsesPreviewDensity = runtimeState->animationPanel.exportPreviewDensity;
     if (viewport != nullptr && exportUsesPreviewDensity) {
         PreparePreviewLodSampleCaches(runtimeState, viewport);
     }
@@ -11294,7 +10695,7 @@ void StartAnimationExportJob(
         *runtimeState,
         exportUsesPreviewDensity,
         std::nullopt,
-        raycastExport ? PointCloudRendererMode::Beauty : runtimeState->projectSettings.pointCloudRendererMode);
+        runtimeState->projectSettings.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
         runtimeState->statusMessage.clear();
@@ -11324,8 +10725,7 @@ void StartAnimationExportJob(
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
-        .pointCloudRendererMode =
-            raycastExport ? PointCloudRendererMode::Beauty : runtimeState->projectSettings.pointCloudRendererMode,
+        .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .animationName = runtimeState->animationPanel.currentPath->name,
         .animationFilePath = runtimeState->animationPanel.currentFilePath.empty()
                                   ? std::filesystem::path{}
@@ -11354,9 +10754,7 @@ void StartAnimationExportJob(
         writerState};
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
-    runtimeState->statusMessage = raycastExport
-                                      ? "Rendering Beauty Raycast EXR + MP4 on GPU..."
-                                      : "Rendering HQ preview-density EXR stack on GPU...";
+    runtimeState->statusMessage = "Rendering HQ EXR stack on GPU...";
     runtimeState->errorMessage.clear();
 }
 
@@ -11519,26 +10917,14 @@ void ProcessOfflineRenderJobStep(
                 throw std::runtime_error{"No visible loaded LiDAR layers are available for rendering."};
             }
 
-            invisible_places::output::HalfRgbaExrImage renderedImage;
-            if (AnimationExportIsRaycast(job.mode)) {
-                const invisible_places::renderer::core::PointCloudRaycastFrameRequest request{
-                    .renderState = renderState,
-                    .width = width,
-                    .height = height,
-                    .primitiveMode = job.settings.raycastPrimitiveMode,
-                    .samplesPerPixel = job.settings.raycastSamplesPerPixel,
-                    .maxDepth = job.settings.raycastMaxDepth,
-                };
-                renderedImage = viewport->RenderPointCloudRaycastFrame(request);
-            } else {
-                const invisible_places::renderer::core::PointCloudExrFrameRequest request{
-                    .renderState = renderState,
-                    .width = width,
-                    .height = height,
-                    .previewDensity = job.previewDensity,
-                };
-                renderedImage = viewport->RenderPointCloudExrFrame(request);
-            }
+            const invisible_places::renderer::core::PointCloudExrFrameRequest request{
+                .renderState = renderState,
+                .width = width,
+                .height = height,
+                .previewDensity = job.previewDensity,
+            };
+            invisible_places::output::HalfRgbaExrImage renderedImage =
+                viewport->RenderPointCloudExrFrame(request);
 
             if (job.exportEyeDomeLightingEnabled &&
                 job.pointCloudRendererMode != PointCloudRendererMode::FastBasic) {
@@ -11614,7 +11000,6 @@ void DrawAnimationExportSection(
     const char* exportModeLabels[] = {
         "Fast Preview MP4",
         "HQ Preview-Density EXR",
-        "Beauty Raycast EXR + MP4",
     };
     int exportModeIndex = 0;
     switch (panel.exportMode) {
@@ -11624,22 +11009,16 @@ void DrawAnimationExportSection(
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             exportModeIndex = 1;
             break;
-        case invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4:
-            exportModeIndex = 2;
-            break;
     }
     if (ImGui::Combo("Export Mode", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
         const invisible_places::output::AnimationExportMode exportModes[] = {
             invisible_places::output::AnimationExportMode::FastPreviewMp4,
             invisible_places::output::AnimationExportMode::HqPreviewDensityExr,
-            invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4,
         };
-        panel.exportMode = exportModes[std::clamp(exportModeIndex, 0, 2)];
+        panel.exportMode = exportModes[std::clamp(exportModeIndex, 0, 1)];
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Fast MP4: full-cloud beauty export, sparse-point smoothing, no AOVs.");
-    } else if (panel.exportMode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4) {
-        ImGui::TextDisabled("Beauty Raycast: full-source compute EXR plus an MP4 review, using Beauty visual settings.");
     } else {
         ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
     }
@@ -11648,8 +11027,6 @@ void DrawAnimationExportSection(
     settingsChanged |= InputTextString("Output Folder", &settings.outputDirectory);
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Quick MP4 names are generated as Animation_Visual.mp4.");
-    } else if (panel.exportMode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4) {
-        ImGui::TextDisabled("Raycast writes frame_#### EXRs and an Animation_BeautyRaycast MP4 review.");
     }
 
     int width = static_cast<int>(settings.width);
@@ -11690,46 +11067,11 @@ void DrawAnimationExportSection(
         settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
         settingsChanged = true;
     }
-    const bool raycastMode =
-        panel.exportMode == invisible_places::output::AnimationExportMode::BeautyRaycastExrMp4;
-    const bool raycastSupported = viewport == nullptr || viewport->SupportsRaycastExport();
-    if (raycastMode) {
-        const char* primitiveLabels[] = {"Style Surfels", "Soft Density Spheres"};
-        int primitiveIndex =
-            settings.raycastPrimitiveMode == PointCloudRaycastPrimitiveMode::SoftDensitySpheres ? 1 : 0;
-        if (ImGui::Combo("Raycast Primitive", &primitiveIndex, primitiveLabels, IM_ARRAYSIZE(primitiveLabels))) {
-            settings.raycastPrimitiveMode = primitiveIndex == 1
-                                                ? PointCloudRaycastPrimitiveMode::SoftDensitySpheres
-                                                : PointCloudRaycastPrimitiveMode::StyleSurfels;
-            settingsChanged = true;
-        }
-        int samplesPerPixel = static_cast<int>(settings.raycastSamplesPerPixel);
-        if (ImGui::InputInt("Samples Per Pixel", &samplesPerPixel)) {
-            settings.raycastSamplesPerPixel = static_cast<std::uint32_t>(std::clamp(samplesPerPixel, 1, 16));
-            settingsChanged = true;
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Raycast export samples per output pixel. Higher values reduce shimmer and cost more.");
-        }
-        float maxDepth = settings.raycastMaxDepth;
-        if (ImGui::InputFloat("Max Raycast Depth", &maxDepth)) {
-            settings.raycastMaxDepth = std::max(0.0F, maxDepth);
-            settingsChanged = true;
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Use 0 to use the current camera far plane.");
-        }
-        if (!raycastSupported) {
-            ImGui::TextDisabled("Beauty Raycast is unavailable: this Vulkan graphics queue has no compute support.");
-        }
-    }
     if (settingsChanged) {
         MarkCurrentAnimationExportSettingsDirty(runtimeState);
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Point density: full source clouds; MP4 smoothing fills tiny gaps during encode.");
-    } else if (raycastMode) {
-        ImGui::TextDisabled("Point density: full source clouds; BVH raycast coverage is export-only.");
     } else {
         ImGui::SameLine();
         ImGui::Checkbox("Preview Density", &panel.exportPreviewDensity);
@@ -11780,7 +11122,7 @@ void DrawAnimationExportSection(
         "%s: %zu frames.",
         panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
             ? "MP4"
-            : (raycastMode ? "Raycast EXR + MP4" : "EXR stack"),
+            : "EXR stack",
         previewFrames.size());
     if (AnimationExportWritesMp4(panel.exportMode) &&
         !invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath())) {
@@ -11844,21 +11186,18 @@ void DrawAnimationExportSection(
         return;
     }
 
-    const bool exportAvailable = !raycastMode || (raycastSupported && ffmpegAvailable);
+    const bool exportAvailable = true;
     if (!exportAvailable) {
         ImGui::BeginDisabled();
     }
-    if (ImGui::Button(raycastMode ? "Export Beauty Raycast" : "Export HQ EXR Stack")) {
+    if (ImGui::Button("Export HQ EXR Stack")) {
         StartAnimationExportJob(runtimeState, viewport);
     }
     if (!exportAvailable) {
         ImGui::EndDisabled();
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-            raycastMode
-                ? "Writes Beauty Raycast EXRs plus an MP4 review using full-source point clouds."
-                : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using preview-density point draws.");
+        ImGui::SetTooltip("Writes beauty.RGB, alpha.A, and depth.Z EXRs using the selected point-density mode.");
     }
     EndPanelSection();
 }
@@ -11922,10 +11261,7 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             job.frames.size());
         ImGui::Text("Queued: %zu", job.pendingFrameCount);
     }
-        ImGui::TextUnformatted(
-            AnimationExportIsRaycast(job.mode)
-                ? "Renderer: Beauty Raycast full source"
-                : (job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source"));
+        ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
     if (job.writePreviewMp4 && job.mp4SupersampleScale > 1U) {
         ImGui::Text(
             "MP4 supersample: %ux -> %u x %u",
@@ -12121,12 +11457,6 @@ bool SameWaterRegionVertexRef(const WaterRegionVertexRef& left, const WaterRegio
 
 const char* WaterRegionFeatureLabel(WaterRegionFeature feature) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return "basin";
-        case WaterRegionFeature::Runoff:
-            return "runoff";
-        case WaterRegionFeature::Caustic:
-            return "caustic";
         case WaterRegionFeature::Ripple:
             return "ripple";
         case WaterRegionFeature::None:
@@ -12137,12 +11467,6 @@ const char* WaterRegionFeatureLabel(WaterRegionFeature feature) {
 
 std::size_t WaterRegionCount(const WaterWorkflowState& water, WaterRegionFeature feature) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return water.basinRegions.size();
-        case WaterRegionFeature::Runoff:
-            return water.runoffRegions.size();
-        case WaterRegionFeature::Caustic:
-            return water.causticRegions.size();
         case WaterRegionFeature::Ripple:
             return water.rippleLayers.size();
         case WaterRegionFeature::None:
@@ -12153,12 +11477,6 @@ std::size_t WaterRegionCount(const WaterWorkflowState& water, WaterRegionFeature
 
 bool WaterRegionPlacementArmed(const WaterWorkflowState& water, WaterRegionFeature feature) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return water.basinRegionPlacementArmed;
-        case WaterRegionFeature::Runoff:
-            return water.runoffRegionPlacementArmed;
-        case WaterRegionFeature::Caustic:
-            return water.causticRegionPlacementArmed;
         case WaterRegionFeature::Ripple:
             return water.rippleRegionPlacementArmed;
         case WaterRegionFeature::None:
@@ -12171,12 +11489,6 @@ std::optional<std::size_t> SelectedWaterRegionIndex(
     const WaterWorkflowState& water,
     WaterRegionFeature feature) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return water.selectedBasinRegionIndex;
-        case WaterRegionFeature::Runoff:
-            return water.selectedRunoffRegionIndex;
-        case WaterRegionFeature::Caustic:
-            return water.selectedCausticRegionIndex;
         case WaterRegionFeature::Ripple:
             return water.selectedRippleLayerIndex;
         case WaterRegionFeature::None:
@@ -12193,15 +11505,6 @@ void SelectWaterRegion(
         return;
     }
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            runtimeState->water.selectedBasinRegionIndex = regionIndex;
-            break;
-        case WaterRegionFeature::Runoff:
-            runtimeState->water.selectedRunoffRegionIndex = regionIndex;
-            break;
-        case WaterRegionFeature::Caustic:
-            runtimeState->water.selectedCausticRegionIndex = regionIndex;
-            break;
         case WaterRegionFeature::Ripple:
             runtimeState->water.selectedRippleLayerIndex = regionIndex;
             break;
@@ -12218,18 +11521,6 @@ std::vector<invisible_places::io::Float3>* WaterRegionVertices(
         return nullptr;
     }
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return regionIndex < runtimeState->water.basinRegions.size()
-                       ? &runtimeState->water.basinRegions[regionIndex].vertices
-                       : nullptr;
-        case WaterRegionFeature::Runoff:
-            return regionIndex < runtimeState->water.runoffRegions.size()
-                       ? &runtimeState->water.runoffRegions[regionIndex].vertices
-                       : nullptr;
-        case WaterRegionFeature::Caustic:
-            return regionIndex < runtimeState->water.causticRegions.size()
-                       ? &runtimeState->water.causticRegions[regionIndex].vertices
-                       : nullptr;
         case WaterRegionFeature::Ripple:
             return regionIndex < runtimeState->water.rippleLayers.size()
                        ? &runtimeState->water.rippleLayers[regionIndex].vertices
@@ -12245,18 +11536,6 @@ const std::vector<invisible_places::io::Float3>* WaterRegionVertices(
     WaterRegionFeature feature,
     std::size_t regionIndex) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return regionIndex < runtimeState.water.basinRegions.size()
-                       ? &runtimeState.water.basinRegions[regionIndex].vertices
-                       : nullptr;
-        case WaterRegionFeature::Runoff:
-            return regionIndex < runtimeState.water.runoffRegions.size()
-                       ? &runtimeState.water.runoffRegions[regionIndex].vertices
-                       : nullptr;
-        case WaterRegionFeature::Caustic:
-            return regionIndex < runtimeState.water.causticRegions.size()
-                       ? &runtimeState.water.causticRegions[regionIndex].vertices
-                       : nullptr;
         case WaterRegionFeature::Ripple:
             return regionIndex < runtimeState.water.rippleLayers.size()
                        ? &runtimeState.water.rippleLayers[regionIndex].vertices
@@ -12272,18 +11551,6 @@ const std::vector<invisible_places::io::Float3>* WaterRegionHull(
     WaterRegionFeature feature,
     std::size_t regionIndex) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return regionIndex < runtimeState.water.basinRegions.size()
-                       ? &runtimeState.water.basinRegions[regionIndex].hull
-                       : nullptr;
-        case WaterRegionFeature::Runoff:
-            return regionIndex < runtimeState.water.runoffRegions.size()
-                       ? &runtimeState.water.runoffRegions[regionIndex].hull
-                       : nullptr;
-        case WaterRegionFeature::Caustic:
-            return regionIndex < runtimeState.water.causticRegions.size()
-                       ? &runtimeState.water.causticRegions[regionIndex].vertices
-                       : nullptr;
         case WaterRegionFeature::Ripple:
             return regionIndex < runtimeState.water.rippleLayers.size()
                        ? &runtimeState.water.rippleLayers[regionIndex].hull
@@ -12299,18 +11566,6 @@ std::string WaterRegionName(
     WaterRegionFeature feature,
     std::size_t regionIndex) {
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            return regionIndex < runtimeState.water.basinRegions.size()
-                       ? runtimeState.water.basinRegions[regionIndex].name
-                       : "Basin";
-        case WaterRegionFeature::Runoff:
-            return regionIndex < runtimeState.water.runoffRegions.size()
-                       ? runtimeState.water.runoffRegions[regionIndex].name
-                       : "Runoff";
-        case WaterRegionFeature::Caustic:
-            return regionIndex < runtimeState.water.causticRegions.size()
-                       ? runtimeState.water.causticRegions[regionIndex].name
-                       : "Caustics";
         case WaterRegionFeature::Ripple:
             return regionIndex < runtimeState.water.rippleLayers.size()
                        ? runtimeState.water.rippleLayers[regionIndex].name
@@ -12322,13 +11577,10 @@ std::string WaterRegionName(
 }
 
 bool WaterRegionMaskStale(
-    const PreviewRuntimeState& runtimeState,
-    WaterRegionFeature feature,
-    std::size_t regionIndex) {
-    return feature == WaterRegionFeature::Caustic &&
-           regionIndex < runtimeState.water.causticRegions.size() &&
-           (runtimeState.water.causticRegions[regionIndex].maskDirty ||
-            runtimeState.water.causticRegions[regionIndex].maskStale);
+    const PreviewRuntimeState&,
+    WaterRegionFeature,
+    std::size_t) {
+    return false;
 }
 
 bool WaterRegionVertexRefValid(
@@ -12356,24 +11608,6 @@ void RefreshWaterRegionDerivedValues(
         return;
     }
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            if (regionIndex < runtimeState->water.basinRegions.size()) {
-                invisible_places::water::RefreshWaterBasinRegionDerivedValues(
-                    &runtimeState->water.basinRegions[regionIndex]);
-            }
-            break;
-        case WaterRegionFeature::Runoff:
-            if (regionIndex < runtimeState->water.runoffRegions.size()) {
-                invisible_places::water::RefreshWaterRunoffRegionDerivedValues(
-                    &runtimeState->water.runoffRegions[regionIndex]);
-            }
-            break;
-        case WaterRegionFeature::Caustic:
-            if (regionIndex < runtimeState->water.causticRegions.size()) {
-                invisible_places::water::RefreshWaterCausticRegionDerivedValues(
-                    &runtimeState->water.causticRegions[regionIndex]);
-            }
-            break;
         case WaterRegionFeature::Ripple:
             if (regionIndex < runtimeState->water.rippleLayers.size()) {
                 auto& layer = runtimeState->water.rippleLayers[regionIndex];
@@ -12489,32 +11723,11 @@ struct WaterRegionOverlayPalette {
 WaterRegionOverlayPalette WaterRegionPalette(
     WaterRegionFeature feature,
     bool selected,
-    bool stale) {
+    bool) {
     const int alpha = selected ? 235 : 115;
     const int fillAlpha = selected ? 38 : 14;
     WaterRegionOverlayPalette palette;
     switch (feature) {
-        case WaterRegionFeature::Basin:
-            palette.line = IM_COL32(64, 218, 255, alpha);
-            palette.fill = IM_COL32(64, 218, 255, fillAlpha);
-            palette.handle = IM_COL32(214, 251, 255, selected ? 255 : 165);
-            break;
-        case WaterRegionFeature::Runoff:
-            palette.line = IM_COL32(80, 236, 162, alpha);
-            palette.fill = IM_COL32(80, 236, 162, fillAlpha);
-            palette.handle = IM_COL32(218, 255, 232, selected ? 255 : 165);
-            break;
-        case WaterRegionFeature::Caustic:
-            if (stale) {
-                palette.line = IM_COL32(255, 190, 66, alpha);
-                palette.fill = IM_COL32(255, 190, 66, selected ? 42 : 18);
-                palette.handle = IM_COL32(255, 236, 192, selected ? 255 : 175);
-            } else {
-                palette.line = IM_COL32(108, 170, 255, alpha);
-                palette.fill = IM_COL32(108, 170, 255, fillAlpha);
-                palette.handle = IM_COL32(226, 240, 255, selected ? 255 : 165);
-            }
-            break;
         case WaterRegionFeature::Ripple:
             palette.line = IM_COL32(92, 196, 255, alpha);
             palette.fill = IM_COL32(92, 196, 255, fillAlpha);
@@ -12685,12 +11898,10 @@ void DrawWaterRegionOverlay(
         const auto palette = WaterRegionPalette(feature, selected, stale);
         const auto projectedHull = ProjectWaterRegionPoints(matrices, viewport, *hull);
         if (projectedHull.size() >= 3U && projectedHull.size() == hull->size()) {
-            if (feature != WaterRegionFeature::Caustic) {
-                drawList->AddConvexPolyFilled(
-                    projectedHull.data(),
-                    static_cast<int>(projectedHull.size()),
-                    palette.fill);
-            }
+            drawList->AddConvexPolyFilled(
+                projectedHull.data(),
+                static_cast<int>(projectedHull.size()),
+                palette.fill);
             DrawWaterRegionClosedPolyline(
                 drawList,
                 projectedHull,
@@ -12815,9 +12026,6 @@ void DrawWaterEmitterOverlay(
         IsMouseOverRenderViewport(viewport) &&
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path &&
         !runtimeState->water.placementArmed &&
-        !runtimeState->water.basinRegionPlacementArmed &&
-        !runtimeState->water.runoffRegionPlacementArmed &&
-        !runtimeState->water.causticRegionPlacementArmed &&
         !runtimeState->water.rippleRegionPlacementArmed &&
         !runtimeState->water.fieldRegionPlacementArmed &&
         !runtimeState->water.movingEmitterIndex.has_value();
@@ -13162,9 +12370,6 @@ bool HandleWaterPathViewInput(
         !viewport->UiWantsMouseCapture() &&
         IsMouseOverRenderViewport(*viewport) &&
         !runtimeState->water.placementArmed &&
-        !runtimeState->water.basinRegionPlacementArmed &&
-        !runtimeState->water.runoffRegionPlacementArmed &&
-        !runtimeState->water.causticRegionPlacementArmed &&
         !runtimeState->water.rippleRegionPlacementArmed &&
         !runtimeState->water.fieldRegionPlacementArmed &&
         !runtimeState->water.movingEmitterIndex.has_value();
@@ -15886,7 +15091,7 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
     auto& settings = runtimeState->projectSettings;
     int pointRendererModeIndex =
         settings.pointCloudRendererMode == PointCloudRendererMode::FastBasic ? 1 : 0;
-    const char* pointRendererModes[] = {"Beauty", "Fast Basic", "Raytraced (later)"};
+    const char* pointRendererModes[] = {"Beauty", "Fast Basic"};
     if (ImGui::Combo(
             "Mode",
             &pointRendererModeIndex,
@@ -15896,10 +15101,6 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
             settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
         } else if (pointRendererModeIndex == 1) {
             settings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
-        } else {
-            settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
-            runtimeState->statusMessage = "Raytraced point rendering is reserved for a later implementation.";
-            runtimeState->errorMessage.clear();
         }
     }
     if (ImGui::IsItemHovered()) {
@@ -16045,491 +15246,6 @@ void DrawGsplatPanel(
     DrawSettingsSection(runtimeState, *viewport);
 }
 
-const char* WaterRunoffModeLabel(WaterRunoffMode mode) {
-    switch (mode) {
-        case WaterRunoffMode::LightRain:
-            return "Light Rain";
-        case WaterRunoffMode::Dew:
-            return "Dew";
-    }
-    return "Dew";
-}
-
-const char* WaterCausticPreviewTintModeLabel(WaterCausticPreviewTintMode mode) {
-    switch (mode) {
-        case WaterCausticPreviewTintMode::PulseAfterRefresh:
-            return "Pulse";
-        case WaterCausticPreviewTintMode::Always:
-            return "Always";
-        case WaterCausticPreviewTintMode::Off:
-            return "Off";
-    }
-    return "Pulse";
-}
-
-void DrawWaterBasinPanel(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return;
-    }
-    auto& water = runtimeState->water;
-    if (BeginPanelSection("Basin Regions")) {
-        if (ImGui::Button("New Basin Region")) {
-            WaterBasinRegion region;
-            region.id = NextWaterBasinRegionId(*runtimeState);
-            region.name = "Basin " + std::to_string(region.id);
-            water.nextBasinRegionId = region.id + 1U;
-            water.basinRegions.push_back(std::move(region));
-            water.selectedBasinRegionIndex = water.basinRegions.size() - 1U;
-            water.basinRegionPlacementArmed = true;
-            water.runoffRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
-            water.placementArmed = false;
-            water.movingEmitterIndex.reset();
-            runtimeState->statusMessage = "Click LiDAR points to add basin polygon vertices.";
-            runtimeState->errorMessage.clear();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(water.basinRegionPlacementArmed ? "Stop Adding Vertices" : "Add Vertices")) {
-            water.basinRegionPlacementArmed = !water.basinRegionPlacementArmed;
-            water.runoffRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
-            runtimeState->statusMessage = water.basinRegionPlacementArmed
-                                              ? "Click LiDAR points to add basin polygon vertices."
-                                              : "Basin vertex placement stopped.";
-            runtimeState->errorMessage.clear();
-        }
-
-        if (water.basinRegions.empty()) {
-            ImGui::TextUnformatted("No basin regions yet.");
-        } else {
-            const char* currentLabel =
-                water.selectedBasinRegionIndex.has_value() &&
-                        water.selectedBasinRegionIndex.value() < water.basinRegions.size()
-                    ? water.basinRegions[water.selectedBasinRegionIndex.value()].name.c_str()
-                    : "Select basin";
-            if (ImGui::BeginCombo("Region", currentLabel)) {
-                for (std::size_t index = 0; index < water.basinRegions.size(); ++index) {
-                    const bool selected =
-                        water.selectedBasinRegionIndex.has_value() &&
-                        water.selectedBasinRegionIndex.value() == index;
-                    if (ImGui::Selectable(water.basinRegions[index].name.c_str(), selected)) {
-                        water.selectedBasinRegionIndex = index;
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            if (water.selectedBasinRegionIndex.has_value() &&
-                water.selectedBasinRegionIndex.value() < water.basinRegions.size()) {
-                auto& region = water.basinRegions[water.selectedBasinRegionIndex.value()];
-                InputTextString("Name", &region.name);
-                ImGui::TextDisabled(
-                    "Vertices: %s, hull: %s",
-                    FormatPointCount(region.vertices.size()).c_str(),
-                    FormatPointCount(region.hull.size()).c_str());
-                if (ImGui::Button("Close Basin Region")) {
-                    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&region);
-                    water.basinRegionPlacementArmed = false;
-                    runtimeState->statusMessage =
-                        region.hull.size() >= 3U ? "Basin region closed." : "Add at least three basin vertices.";
-                    runtimeState->errorMessage.clear();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Remove Last Vertex") && !region.vertices.empty()) {
-                    region.vertices.pop_back();
-                    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&region);
-                }
-                bool changed = false;
-                changed |= ImGui::SliderFloat("Height Above", &region.heightAbove, 0.0F, 5.0F, "%.2f m");
-                changed |= ImGui::SliderFloat("Depth Below", &region.depthBelow, 0.0F, 5.0F, "%.2f m");
-                changed |= ImGui::SliderFloat("Density", &region.density, 0.01F, 6.0F, "%.2f", ImGuiSliderFlags_Logarithmic);
-                if (region.hull.size() >= 2U) {
-                    bool hasOutlet = region.outletEdgeIndex.has_value();
-                    if (ImGui::Checkbox("Outlet Edge", &hasOutlet)) {
-                        region.outletEdgeIndex = hasOutlet ? std::optional<std::uint32_t>{0U} : std::nullopt;
-                    }
-                    if (region.outletEdgeIndex.has_value()) {
-                        int outletIndex = static_cast<int>(region.outletEdgeIndex.value());
-                        if (ImGui::SliderInt(
-                                "Outlet Edge Index",
-                                &outletIndex,
-                                0,
-                                static_cast<int>(region.hull.size() - 1U))) {
-                            region.outletEdgeIndex = static_cast<std::uint32_t>(outletIndex);
-                        }
-                        ImGui::Checkbox("Outlet Blocked", &region.outletBlocked);
-                    }
-                }
-                if (changed) {
-                    invisible_places::water::RefreshWaterBasinRegionDerivedValues(&region);
-                }
-                if (ImGui::Button("Bake Basin Haze")) {
-                    BakeBasinHazeOverlayForActiveLayer(runtimeState, viewport);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Delete Basin")) {
-                    water.basinRegions.erase(
-                        water.basinRegions.begin() +
-                        static_cast<std::ptrdiff_t>(water.selectedBasinRegionIndex.value()));
-                    water.selectedBasinRegionIndex.reset();
-                    water.basinRegionPlacementArmed = false;
-                }
-            }
-        }
-        if (!water.lastBasinOverlayPath.empty()) {
-            ImGui::TextDisabled("Last overlay: %s", water.lastBasinOverlayPath.filename().string().c_str());
-        }
-        EndPanelSection();
-    }
-}
-
-void DrawWaterRunoffPanel(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return;
-    }
-    auto& water = runtimeState->water;
-    if (BeginPanelSection("Runoff Regions")) {
-        if (ImGui::Button("New Runoff Region")) {
-            WaterRunoffRegion region;
-            region.id = NextWaterRunoffRegionId(*runtimeState);
-            region.name = "Runoff " + std::to_string(region.id);
-            water.nextRunoffRegionId = region.id + 1U;
-            water.runoffRegions.push_back(std::move(region));
-            water.selectedRunoffRegionIndex = water.runoffRegions.size() - 1U;
-            water.runoffRegionPlacementArmed = true;
-            water.basinRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
-            water.placementArmed = false;
-            water.movingEmitterIndex.reset();
-            runtimeState->statusMessage = "Click LiDAR points to add runoff polygon vertices.";
-            runtimeState->errorMessage.clear();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(water.runoffRegionPlacementArmed ? "Stop Adding Vertices" : "Add Vertices")) {
-            water.runoffRegionPlacementArmed = !water.runoffRegionPlacementArmed;
-            water.basinRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
-            runtimeState->statusMessage = water.runoffRegionPlacementArmed
-                                              ? "Click LiDAR points to add runoff polygon vertices."
-                                              : "Runoff vertex placement stopped.";
-            runtimeState->errorMessage.clear();
-        }
-
-        if (water.runoffRegions.empty()) {
-            ImGui::TextUnformatted("No runoff regions yet.");
-        } else {
-            const char* currentLabel =
-                water.selectedRunoffRegionIndex.has_value() &&
-                        water.selectedRunoffRegionIndex.value() < water.runoffRegions.size()
-                    ? water.runoffRegions[water.selectedRunoffRegionIndex.value()].name.c_str()
-                    : "Select runoff";
-            if (ImGui::BeginCombo("Region", currentLabel)) {
-                for (std::size_t index = 0; index < water.runoffRegions.size(); ++index) {
-                    const bool selected =
-                        water.selectedRunoffRegionIndex.has_value() &&
-                        water.selectedRunoffRegionIndex.value() == index;
-                    if (ImGui::Selectable(water.runoffRegions[index].name.c_str(), selected)) {
-                        water.selectedRunoffRegionIndex = index;
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            if (water.selectedRunoffRegionIndex.has_value() &&
-                water.selectedRunoffRegionIndex.value() < water.runoffRegions.size()) {
-                auto& region = water.runoffRegions[water.selectedRunoffRegionIndex.value()];
-                InputTextString("Name", &region.name);
-                ImGui::TextDisabled(
-                    "Vertices: %s, hull: %s",
-                    FormatPointCount(region.vertices.size()).c_str(),
-                    FormatPointCount(region.hull.size()).c_str());
-                int modeIndex = region.mode == WaterRunoffMode::LightRain ? 1 : 0;
-                const char* modes[] = {"Dew", "Light Rain"};
-                if (ImGui::Combo("Mode", &modeIndex, modes, IM_ARRAYSIZE(modes))) {
-                    region.mode = modeIndex == 1 ? WaterRunoffMode::LightRain : WaterRunoffMode::Dew;
-                }
-                if (ImGui::Button("Close Runoff Region")) {
-                    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&region);
-                    water.runoffRegionPlacementArmed = false;
-                    runtimeState->statusMessage =
-                        region.hull.size() >= 3U ? "Runoff region closed." : "Add at least three runoff vertices.";
-                    runtimeState->errorMessage.clear();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Remove Last Vertex") && !region.vertices.empty()) {
-                    region.vertices.pop_back();
-                    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&region);
-                }
-                bool changed = false;
-                changed |= ImGui::SliderFloat("Ground Voxel", &region.groundVoxelSize, 0.03F, 4.0F, "%.2f m", ImGuiSliderFlags_Logarithmic);
-                changed |= ImGui::SliderFloat("High Point Fraction", &region.highPointFraction, 0.01F, 0.95F, "%.2f");
-                changed |= ImGui::SliderFloat("Density", &region.density, 0.01F, 6.0F, "%.2f", ImGuiSliderFlags_Logarithmic);
-                changed |= ImGui::SliderFloat("Path Length", &region.pathLength, 0.5F, 120.0F, "%.1f m", ImGuiSliderFlags_Logarithmic);
-                changed |= ImGui::SliderFloat("Max Steps", &region.maxSteps, 4.0F, 250.0F, "%.0f");
-                if (changed) {
-                    invisible_places::water::RefreshWaterRunoffRegionDerivedValues(&region);
-                }
-                if (ImGui::Button("Bake Runoff")) {
-                    BakeRunoffOverlayForActiveLayer(runtimeState, viewport);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Delete Runoff")) {
-                    water.runoffRegions.erase(
-                        water.runoffRegions.begin() +
-                        static_cast<std::ptrdiff_t>(water.selectedRunoffRegionIndex.value()));
-                    water.selectedRunoffRegionIndex.reset();
-                    water.runoffRegionPlacementArmed = false;
-                }
-            }
-        }
-        if (!water.lastRunoffOverlayPath.empty()) {
-            ImGui::TextDisabled("Last overlay: %s", water.lastRunoffOverlayPath.filename().string().c_str());
-        }
-        EndPanelSection();
-    }
-}
-
-void DrawWaterCausticsPanel(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return;
-    }
-    auto& water = runtimeState->water;
-    if (BeginPanelSection("Caustic Regions")) {
-        if (ImGui::Button("New Caustic Area")) {
-            const auto targetPath = SelectedCausticTargetLayerPath(*runtimeState);
-            if (!targetPath.has_value()) {
-                runtimeState->errorMessage = "Select a loaded LiDAR layer before creating caustics.";
-                runtimeState->statusMessage.clear();
-            } else {
-                WaterCausticRegion region;
-                region.id = NextWaterCausticRegionId(*runtimeState);
-                region.name = "Caustics " + std::to_string(region.id);
-                region.targetLayerSourcePath = targetPath.value();
-                water.nextCausticRegionId = region.id + 1U;
-                water.causticRegions.push_back(std::move(region));
-                water.selectedCausticRegionIndex = water.causticRegions.size() - 1U;
-                water.causticRegionPlacementArmed = true;
-                water.basinRegionPlacementArmed = false;
-                water.runoffRegionPlacementArmed = false;
-                water.placementArmed = false;
-                water.movingEmitterIndex.reset();
-                runtimeState->statusMessage = "Click LiDAR points to add caustic boundary vertices.";
-                runtimeState->errorMessage.clear();
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(water.causticRegionPlacementArmed ? "Stop Adding Vertices" : "Add Vertices")) {
-            water.causticRegionPlacementArmed = !water.causticRegionPlacementArmed;
-            water.basinRegionPlacementArmed = false;
-            water.runoffRegionPlacementArmed = false;
-            water.placementArmed = false;
-            runtimeState->statusMessage = water.causticRegionPlacementArmed
-                                              ? "Click LiDAR points to add caustic boundary vertices."
-                                              : "Caustic vertex placement stopped.";
-            runtimeState->errorMessage.clear();
-        }
-
-        if (water.causticRegions.empty()) {
-            ImGui::TextUnformatted("No caustic regions yet.");
-        } else {
-            const char* currentLabel =
-                water.selectedCausticRegionIndex.has_value() &&
-                        water.selectedCausticRegionIndex.value() < water.causticRegions.size()
-                    ? water.causticRegions[water.selectedCausticRegionIndex.value()].name.c_str()
-                    : "Select caustics";
-            if (ImGui::BeginCombo("Region", currentLabel)) {
-                for (std::size_t index = 0; index < water.causticRegions.size(); ++index) {
-                    const bool selected =
-                        water.selectedCausticRegionIndex.has_value() &&
-                        water.selectedCausticRegionIndex.value() == index;
-                    if (ImGui::Selectable(water.causticRegions[index].name.c_str(), selected)) {
-                        water.selectedCausticRegionIndex = index;
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            if (water.selectedCausticRegionIndex.has_value() &&
-                water.selectedCausticRegionIndex.value() < water.causticRegions.size()) {
-                auto& region = water.causticRegions[water.selectedCausticRegionIndex.value()];
-                InputTextString("Name", &region.name);
-                const auto targetIndex = FindSessionIndexBySourcePath(*runtimeState, region.targetLayerSourcePath);
-                const std::string targetLabel =
-                    targetIndex.has_value() && targetIndex.value() < runtimeState->sessions.size()
-                        ? runtimeState->sessions[targetIndex.value()].displayName
-                        : region.targetLayerSourcePath.filename().string();
-                ImGui::TextDisabled("Target: %s", targetLabel.empty() ? "Missing layer" : targetLabel.c_str());
-                ImGui::TextDisabled(
-                    "Boundary vertices: %s%s",
-                    FormatPointCount(region.vertices.size()).c_str(),
-                    (region.maskDirty || region.maskStale) ? "  | mask stale" : "");
-
-                bool enabled = region.enabled;
-                if (ImGui::Checkbox("Enabled", &enabled)) {
-                    region.enabled = enabled;
-                    region.maskDirty = true;
-                    region.maskStale = true;
-                }
-                if (ImGui::Button("Close Caustic Area")) {
-                    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-                    water.causticRegionPlacementArmed = false;
-                    runtimeState->statusMessage =
-                        region.vertices.size() >= 3U ? "Caustic boundary closed; refresh selection mask to apply."
-                                                     : "Add at least three caustic boundary vertices.";
-                    runtimeState->errorMessage.clear();
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Remove Last Vertex") && !region.vertices.empty()) {
-                    region.vertices.pop_back();
-                    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-                }
-                bool changed = false;
-                changed |= ImGui::SliderFloat("Edge Blend", &region.edgeBlendWidth, 0.01F, 5.0F, "%.2f m");
-                const std::array<WaterCausticPreviewTintMode, 3> tintModes{
-                    WaterCausticPreviewTintMode::PulseAfterRefresh,
-                    WaterCausticPreviewTintMode::Always,
-                    WaterCausticPreviewTintMode::Off};
-                int tintModeIndex = 0;
-                for (std::size_t modeIndex = 0; modeIndex < tintModes.size(); ++modeIndex) {
-                    if (region.previewTintMode == tintModes[modeIndex]) {
-                        tintModeIndex = static_cast<int>(modeIndex);
-                        break;
-                    }
-                }
-                if (ImGui::BeginCombo(
-                        "Mask Tint",
-                        WaterCausticPreviewTintModeLabel(region.previewTintMode))) {
-                    for (std::size_t modeIndex = 0; modeIndex < tintModes.size(); ++modeIndex) {
-                        const bool selected = tintModeIndex == static_cast<int>(modeIndex);
-                        if (ImGui::Selectable(
-                                WaterCausticPreviewTintModeLabel(tintModes[modeIndex]),
-                                selected)) {
-                            region.previewTintMode = tintModes[modeIndex];
-                            tintModeIndex = static_cast<int>(modeIndex);
-                        }
-                        if (selected) {
-                            ImGui::SetItemDefaultFocus();
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
-                if (changed) {
-                    invisible_places::water::RefreshWaterCausticRegionDerivedValues(&region);
-                }
-                if (ImGui::Button("Refresh Mask")) {
-                    RefreshSelectedWaterCausticMask(runtimeState, viewport);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Delete Caustics")) {
-                    water.causticPreviewTintPulseUntilSeconds.erase(region.id);
-                    water.causticRegions.erase(
-                        water.causticRegions.begin() +
-                        static_cast<std::ptrdiff_t>(water.selectedCausticRegionIndex.value()));
-                    water.selectedCausticRegionIndex.reset();
-                    water.causticRegionPlacementArmed = false;
-                }
-            }
-        }
-        EndPanelSection();
-    }
-
-    if (BeginPanelSection("Caustic Look")) {
-        auto look = ViewedWaterCausticLookSettings(*runtimeState);
-        const auto* animationPath = CurrentAnimationPath(*runtimeState);
-        const char* profileLabel = animationPath != nullptr
-                                       ? (animationPath->tempWaterCausticLookSettings.has_value()
-                                              ? "Animation Temp"
-                                              : (animationPath->waterCausticLookSettings.has_value()
-                                                     ? "Animation Saved"
-                                                     : "Project Default"))
-                                       : (water.tempDefaultCausticLookSettings.has_value()
-                                              ? "Project Temp Default"
-                                              : "Project Default");
-        ImGui::TextDisabled("Editing: %s", profileLabel);
-
-        bool changed = false;
-        changed |= ImGui::Checkbox("Enable Caustics", &look.enabled);
-        changed |= ImGui::SliderFloat("Intensity", &look.intensity, 0.0F, 2.5F, "%.2f");
-        changed |= ImGui::SliderFloat("Speed", &look.speed, 0.0F, 3.0F, "%.2f");
-        changed |= ImGui::SliderFloat(
-            "Cell Size",
-            &look.cellSizeMeters,
-            0.04F,
-            0.80F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        changed |= ImGui::SliderFloat(
-            "Line Width",
-            &look.lineWidthMeters,
-            0.003F,
-            0.050F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        changed |= ImGui::SliderFloat(
-            "Feather",
-            &look.featherMeters,
-            0.001F,
-            0.030F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        changed |= ImGui::SliderFloat(
-            "Point Spacing",
-            &look.surfacePointSpacingMeters,
-            0.001F,
-            0.020F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        changed |= ImGui::SliderFloat(
-            "Warp Amplitude",
-            &look.warpAmplitudeMeters,
-            0.0F,
-            0.20F,
-            "%.3f m");
-        float tint[3] = {look.tintRed, look.tintGreen, look.tintBlue};
-        if (ImGui::ColorEdit3("Tint", tint)) {
-            look.tintRed = tint[0];
-            look.tintGreen = tint[1];
-            look.tintBlue = tint[2];
-            changed = true;
-        }
-        changed |= ImGui::SliderFloat("Emission Boost", &look.emissionBoost, 0.0F, 4.0F, "%.2f");
-        changed |= ImGui::SliderFloat("Opacity Boost", &look.opacityBoost, 0.0F, 1.0F, "%.2f");
-        changed |= ImGui::SliderFloat("Point Size Boost", &look.pointSizeBoost, 0.0F, 2.0F, "%.2f");
-        if (changed) {
-            look.scale = 1.0F / std::max(0.001F, look.cellSizeMeters);
-            const float widthInCells = look.lineWidthMeters / std::max(0.001F, look.cellSizeMeters);
-            look.lineSharpness = std::clamp((0.16F - widthInCells) / (0.16F - 0.025F), 0.0F, 1.0F);
-            look.warp = std::clamp(
-                (look.warpAmplitudeMeters * 2.0F) / std::max(0.001F, look.cellSizeMeters),
-                0.0F,
-                3.0F);
-            if (auto* editable = EnsureEditableWaterCausticLookSettings(runtimeState); editable != nullptr) {
-                *editable = look;
-            }
-        }
-        if (ImGui::Button(animationPath != nullptr ? "Save Look To Animation" : "Save Look To Default")) {
-            SaveEditableWaterCausticLookSettings(runtimeState);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(animationPath != nullptr ? "Discard Animation Edit" : "Discard Default Edit")) {
-            DiscardEditableWaterCausticLookSettings(runtimeState);
-        }
-        EndPanelSection();
-    }
-}
-
 const char* WaterRippleOverlayTypeLabel(WaterRippleOverlayType type) {
     switch (type) {
         case WaterRippleOverlayType::CausticLace:
@@ -16648,9 +15364,6 @@ void DrawWaterRipplesPanel(
                 water.rippleRegionPlacementArmed = true;
                 water.placementArmed = false;
                 water.movingEmitterIndex.reset();
-                water.basinRegionPlacementArmed = false;
-                water.runoffRegionPlacementArmed = false;
-                water.causticRegionPlacementArmed = false;
                 water.fieldRegionPlacementArmed = false;
                 runtimeState->statusMessage = "Click LiDAR points to add ripple boundary vertices.";
                 runtimeState->errorMessage.clear();
@@ -16661,9 +15374,6 @@ void DrawWaterRipplesPanel(
             water.rippleRegionPlacementArmed = !water.rippleRegionPlacementArmed;
             water.placementArmed = false;
             water.movingEmitterIndex.reset();
-            water.basinRegionPlacementArmed = false;
-            water.runoffRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
             water.fieldRegionPlacementArmed = false;
             runtimeState->statusMessage = water.rippleRegionPlacementArmed
                                               ? "Click LiDAR points to add ripple boundary vertices."
@@ -16889,9 +15599,6 @@ void DrawWaterFieldPanel(
             water.fieldRegionPlacementArmed = true;
             water.placementArmed = false;
             water.movingEmitterIndex.reset();
-            water.basinRegionPlacementArmed = false;
-            water.runoffRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
             water.rippleRegionPlacementArmed = false;
             runtimeState->statusMessage =
                 "Click LiDAR points to add " +
@@ -16918,9 +15625,6 @@ void DrawWaterFieldPanel(
             water.fieldRegionPlacementArmed = !water.fieldRegionPlacementArmed;
             water.placementArmed = false;
             water.movingEmitterIndex.reset();
-            water.basinRegionPlacementArmed = false;
-            water.runoffRegionPlacementArmed = false;
-            water.causticRegionPlacementArmed = false;
             water.rippleRegionPlacementArmed = false;
             runtimeState->statusMessage = water.fieldRegionPlacementArmed
                                               ? "Click LiDAR points to add Field region boundary vertices."
@@ -17543,187 +16247,10 @@ void DrawWaterPanel(
             EndPanelSection();
         }
 
-        visibleSourceSettings = ViewedWaterSourceSettings(*runtimeState);
-        if (false && BeginPanelSection("Trail Shape")) {
-            auto trailShapeSettings = visibleSourceSettings.trailShape;
-            bool trailShapeChanged = false;
-            trailShapeChanged |= ImGui::SliderFloat(
-                "Trail Looseness",
-                &trailShapeSettings.trailLooseness,
-                0.0F,
-                1.0F,
-                "%.2f");
-            trailShapeChanged |= ImGui::SliderFloat(
-                "Trail Smoothness",
-                &trailShapeSettings.trailSmoothness,
-                0.0F,
-                1.0F,
-                "%.2f");
-            trailShapeChanged |= ImGui::SliderFloat(
-                "Trail Spread",
-                &trailShapeSettings.particleJitter,
-                0.0F,
-                2.0F,
-                "%.2f");
-            trailShapeChanged |= ImGui::SliderFloat(
-                "Spline Anchor Spacing",
-                &trailShapeSettings.splineAnchorSpacing,
-                0.01F,
-                10.0F,
-                "%.2f m",
-                ImGuiSliderFlags_Logarithmic);
-            int trailLaneCount = static_cast<int>(trailShapeSettings.trailLaneCount);
-            if (ImGui::SliderInt("Trail Lanes", &trailLaneCount, 0, 24)) {
-                trailShapeSettings.trailLaneCount =
-                    static_cast<std::uint32_t>(std::clamp(trailLaneCount, 0, 24));
-                trailShapeChanged = true;
-            }
-            trailShapeSettings.trailLooseness = std::clamp(trailShapeSettings.trailLooseness, 0.0F, 1.0F);
-            trailShapeSettings.trailSmoothness = std::clamp(trailShapeSettings.trailSmoothness, 0.0F, 1.0F);
-            trailShapeSettings.particleJitter = std::clamp(trailShapeSettings.particleJitter, 0.0F, 3.0F);
-            trailShapeSettings.splineAnchorSpacing =
-                std::clamp(trailShapeSettings.splineAnchorSpacing, 0.01F, 25.0F);
-            trailShapeSettings.trailLaneCount =
-                std::clamp<std::uint32_t>(trailShapeSettings.trailLaneCount, 0U, 32U);
-            trailShapeSettings.trailTurbulence =
-                std::clamp(trailShapeSettings.trailLooseness * 1.5F, 0.0F, 3.0F);
-            trailShapeSettings.trailMomentum =
-                std::clamp(0.18F + trailShapeSettings.trailLooseness * 0.72F, 0.0F, 0.98F);
-            trailShapeSettings.normalTurbulenceResponse =
-                std::clamp(trailShapeSettings.trailLooseness * 1.4F, 0.0F, 3.0F);
-            if (trailShapeChanged) {
-                if (auto* editableSettings = EnsureEditableWaterSourceSettings(runtimeState); editableSettings != nullptr) {
-                    editableSettings->trailShape = trailShapeSettings;
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
-                }
-            }
-            EndPanelSection();
-        }
-
-        if (false && BeginPanelSection("Animation Trail Playback")) {
-            EnsureWaterAnimationTrailProfiles(&water);
-            const auto selectedTrailProfile =
-                NormalizeWaterAnimationTrailProfileName(water.selectedAnimationTrailProfileName);
-            if (ImGui::BeginCombo("Trail Profile", selectedTrailProfile.c_str())) {
-                const auto addTrailProfile = [&](std::string_view name) {
-                    const auto normalized = NormalizeWaterAnimationTrailProfileName(name);
-                    const bool selected = normalized == selectedTrailProfile;
-                    if (ImGui::Selectable(normalized.c_str(), selected)) {
-                        SelectWaterAnimationTrailProfile(runtimeState, normalized);
-                        RefreshWaterOverlayFromAnchors(runtimeState, viewport);
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                };
-                addTrailProfile(kDefaultWaterTrailProfileName);
-                addTrailProfile(WaterTrailPlaybackQuickPresetName(WaterTrailPlaybackQuickPreset::FineWhiteThreads));
-                addTrailProfile(WaterTrailPlaybackQuickPresetName(WaterTrailPlaybackQuickPreset::LongWhiteVeil));
-                addTrailProfile(WaterTrailPlaybackQuickPresetName(WaterTrailPlaybackQuickPreset::SoftDistantDrift));
-                if (!water.animationTrailProfiles.empty()) {
-                    ImGui::Separator();
-                }
-                for (const auto& profile : water.animationTrailProfiles) {
-                    addTrailProfile(profile.name);
-                }
-                if (water.editedAnimationTrailProfileSettings.has_value()) {
-                    ImGui::Separator();
-                    addTrailProfile(water.selectedAnimationTrailProfileName);
-                }
-                ImGui::EndCombo();
-            }
-
-            InputTextString("Trail Profile Name", &water.animationTrailProfileNameBuffer);
-            if (ImGui::Button("Save Trail Profile")) {
-                SaveCurrentWaterAnimationTrailProfile(runtimeState);
-                RefreshWaterOverlayFromAnchors(runtimeState, viewport);
-            }
-            if (water.editedAnimationTrailProfileSettings.has_value()) {
-                ImGui::SameLine();
-                if (ImGui::Button("Discard Trail Edit")) {
-                    DiscardEditableWaterAnimationTrailSettings(runtimeState);
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
-                }
-            }
-            if (CurrentAnimationPath(*runtimeState) != nullptr) {
-                ImGui::SameLine();
-                if (ImGui::Button("Unload Animation")) {
-                    UnloadCurrentAnimationForWaterEditing(runtimeState);
-                    SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
-                }
-            }
-            if (IsProtectedWaterAnimationTrailProfileName(selectedTrailProfile)) {
-                ImGui::TextDisabled("Built-in profile. Edits are saved under a new custom name.");
-            } else if (IsEditedWaterAnimationTrailProfileName(selectedTrailProfile)) {
-                ImGui::TextDisabled(
-                    "Editing %s",
-                    BaseWaterAnimationTrailProfileName(selectedTrailProfile).c_str());
-            }
-
-            auto trailSettings = ViewedWaterAnimationTrailSettings(*runtimeState);
-            bool trailChanged = false;
-            trailChanged |= ImGui::SliderFloat(
-                "Particle Density",
-                &trailSettings.particleDensity,
-                0.05F,
-                6.0F,
-                "%.2f",
-                ImGuiSliderFlags_Logarithmic);
-            trailChanged |= ImGui::SliderFloat(
-                "Particle Speed",
-                &trailSettings.particleSpeed,
-                0.05F,
-                4.0F,
-                "%.2f",
-                ImGuiSliderFlags_Logarithmic);
-            trailChanged |= ImGui::SliderFloat(
-                "Trail Length",
-                &trailSettings.trailLengthMeters,
-                0.0F,
-                8.0F,
-                "%.2f m");
-            trailChanged |= ImGui::SliderFloat(
-                "Trail Point Spacing",
-                &trailSettings.trailSampleSpacingMeters,
-                0.0F,
-                0.25F,
-                "%.3f m");
-            trailChanged |= ImGui::SliderFloat(
-                "Colour Variation",
-                &trailSettings.colorVariation,
-                0.0F,
-                1.0F,
-                "%.2f");
-            trailSettings.particleDensity = std::clamp(trailSettings.particleDensity, 0.05F, 10.0F);
-            trailSettings.particleSpeed = std::clamp(trailSettings.particleSpeed, 0.05F, 8.0F);
-            trailSettings.trailLengthMeters = std::clamp(trailSettings.trailLengthMeters, 0.0F, 25.0F);
-            trailSettings.trailSampleSpacingMeters =
-                std::clamp(trailSettings.trailSampleSpacingMeters, 0.0F, 25.0F);
-            trailSettings.colorVariation = std::clamp(trailSettings.colorVariation, 0.0F, 1.0F);
-            if (trailChanged) {
-                if (auto* editableSettings = EnsureEditableWaterAnimationTrailSettings(runtimeState);
-                    editableSettings != nullptr) {
-                    *editableSettings = trailSettings;
-                    if (auto* animationPath = CurrentAnimationPath(runtimeState); animationPath != nullptr) {
-                        animationPath->tempWaterAnimationTrailSettings = trailSettings;
-                        runtimeState->animationPanel.dirty = true;
-                    } else {
-                        water.tempDefaultAnimationTrailSettings = trailSettings;
-                    }
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
-                }
-            }
-            EndPanelSection();
-        }
-
         if (ImGui::Button(water.placementArmed ? "Click Viewport..." : "Place Emitter")) {
             water.placementArmed = !water.placementArmed;
             if (water.placementArmed) {
                 water.movingEmitterIndex.reset();
-                water.basinRegionPlacementArmed = false;
-                water.runoffRegionPlacementArmed = false;
-                water.causticRegionPlacementArmed = false;
             }
             runtimeState->statusMessage = water.placementArmed
                                               ? "Click the point-cloud viewport to place a water source."
@@ -17791,9 +16318,6 @@ void DrawWaterPanel(
                 } else {
                     water.movingEmitterIndex = index;
                     water.placementArmed = false;
-                    water.basinRegionPlacementArmed = false;
-                    water.runoffRegionPlacementArmed = false;
-                    water.causticRegionPlacementArmed = false;
                     water.rippleRegionPlacementArmed = false;
                     SelectWaterEmitterInViewport(runtimeState, *viewport, index);
                     runtimeState->statusMessage = "Click the point-cloud viewport to move " + emitter.name + ".";
@@ -18367,30 +16891,6 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (runtimeState->water.basinRegionPlacementArmed &&
-        renderViewportHovered &&
-        !viewport.UiWantsMouseCapture() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        AddWaterBasinVertexAtScreenPoint(runtimeState, viewport, io.MousePos);
-        runtimeState->cameraInteraction.navigationActive = false;
-        return;
-    }
-    if (runtimeState->water.runoffRegionPlacementArmed &&
-        renderViewportHovered &&
-        !viewport.UiWantsMouseCapture() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        AddWaterRunoffVertexAtScreenPoint(runtimeState, viewport, io.MousePos);
-        runtimeState->cameraInteraction.navigationActive = false;
-        return;
-    }
-    if (runtimeState->water.causticRegionPlacementArmed &&
-        renderViewportHovered &&
-        !viewport.UiWantsMouseCapture() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        AddWaterCausticVertexAtScreenPoint(runtimeState, viewport, io.MousePos);
-        runtimeState->cameraInteraction.navigationActive = false;
-        return;
-    }
     if (runtimeState->water.rippleRegionPlacementArmed &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
@@ -18581,15 +17081,12 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             }
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,
-                 .style = [&]() {
-                     auto style = ApplyWaterCausticRenderStyle(runtimeState, session, session.pointStyle);
-                     return FastBasicPointRendererActive(runtimeState.projectSettings)
-                                ? MakeEffectiveFastBasicStyle(
-                                      style,
-                                      session.hasSourceRgb,
-                                      IsGeneratedWaterOverlaySession(session))
-                                : style;
-                 }(),
+                 .style = FastBasicPointRendererActive(runtimeState.projectSettings)
+                              ? MakeEffectiveFastBasicStyle(
+                                    session.pointStyle,
+                                    session.hasSourceRgb,
+                                    IsGeneratedWaterOverlaySession(session))
+                              : session.pointStyle,
                  .scalarFields = session.scalarFields,
                  .hasSourceRgb = session.hasSourceRgb,
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount)});

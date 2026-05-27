@@ -1,7 +1,6 @@
 #include "renderer/core/VulkanViewportShell.hpp"
 
 #include "InvisiblePlacesBuildConfig.hpp"
-#include "renderer/pointcloud/RaycastBvh.hpp"
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -44,7 +43,6 @@ namespace {
 struct QueueFamilySelection {
     std::optional<std::uint32_t> graphicsFamily;
     std::optional<std::uint32_t> presentFamily;
-    bool graphicsFamilySupportsCompute = false;
 
     [[nodiscard]] bool IsComplete() const {
         return graphicsFamily.has_value() && presentFamily.has_value();
@@ -137,11 +135,6 @@ struct alignas(16) HighQualityGaussianPushConstants {
 
 struct alignas(16) PostProcessPushConstants {
     glm::vec4 edl{0.0F, 24.0F, 0.35F, 1.0F};
-};
-
-struct alignas(16) RaycastPushConstants {
-    glm::uvec4 control{1U, 1U, 0U, 0U};
-    glm::vec4 params{1.0F, 0.0F, 0.0F, 0.0F};
 };
 
 std::string NormalizeScalarFieldName(std::string_view name) {
@@ -250,11 +243,8 @@ QueueFamilySelection FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR sur
 
     for (std::uint32_t index = 0; index < queueFamilyCount; ++index) {
         const bool supportsGraphics = (queueFamilies[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
-        const bool supportsCompute = (queueFamilies[index].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
-        if (supportsGraphics && (!selection.graphicsFamily.has_value() ||
-                                 (supportsCompute && !selection.graphicsFamilySupportsCompute))) {
+        if (supportsGraphics && !selection.graphicsFamily.has_value()) {
             selection.graphicsFamily = index;
-            selection.graphicsFamilySupportsCompute = supportsCompute;
         }
 
         VkBool32 presentSupported = VK_FALSE;
@@ -263,7 +253,7 @@ QueueFamilySelection FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR sur
             selection.presentFamily = index;
         }
 
-        if (selection.IsComplete() && selection.graphicsFamilySupportsCompute) {
+        if (selection.IsComplete()) {
             break;
         }
     }
@@ -484,58 +474,6 @@ void ScalePointCloudBindingGpu(PointCloudBindingGpu* binding, float scale) {
     binding->range.w *= safeScale;
 }
 
-float BindingMaximum(
-    const invisible_places::style::RenderParameterBinding& binding,
-    float inactiveDefault) {
-    if (!binding.active) {
-        return inactiveDefault;
-    }
-    if (binding.mode == invisible_places::style::ParameterSourceMode::Constant) {
-        return binding.constantValue[0];
-    }
-    return std::max(binding.fieldMap.outputMin, binding.fieldMap.outputMax);
-}
-
-float EstimateRaycastBvhRadius(
-    const renderer::pointcloud::PointCloudStyleState& style,
-    renderer::pointcloud::PointCloudRaycastPrimitiveMode primitiveMode,
-    const SceneRenderState& renderState,
-    std::uint32_t width,
-    std::uint32_t height,
-    float maxDepth,
-    float pointSizeRangeMin,
-    float pointSizeRangeMax) {
-    const float safeHeight = std::max(1.0F, static_cast<float>(height));
-    const float exportDepth = maxDepth > 0.0F ? maxDepth : renderState.farPlane;
-    const float projectionScale = std::max(1.0e-5F, std::abs(renderState.projection[1][1]));
-    const float pixelWorldAtMaxDepth = (2.0F * std::max(0.001F, exportDepth)) / (projectionScale * safeHeight);
-    const float depthOfFieldBlurPixels = renderState.hasDepthOfField ? renderState.depthOfFieldMaxBlurPixels : 0.0F;
-    const float pointSize = std::clamp(
-        BindingMaximum(style.pointSize, renderer::pointcloud::kInactivePointSizeDefault) *
-            std::max(0.001F, renderState.pointSizeScale) +
-            depthOfFieldBlurPixels,
-        std::max(1.0F, pointSizeRangeMin),
-        std::max(std::max(1.0F, pointSizeRangeMin), pointSizeRangeMax));
-    const float screenRadius = pointSize * 0.5F * pixelWorldAtMaxDepth;
-    const float worldSizedScreenRadius =
-        (std::max(0.0F, BindingMaximum(style.surfelDiameter, renderer::pointcloud::kInactiveSurfelDiameterDefault)) *
-         0.5F) +
-        (depthOfFieldBlurPixels * 0.5F * pixelWorldAtMaxDepth);
-    const float surfelRadius =
-        std::max(0.0F, BindingMaximum(style.surfelDiameter, renderer::pointcloud::kInactiveSurfelDiameterDefault)) *
-        0.5F *
-        (style.flowAnimation ? std::clamp(style.waterStreakAspect, 1.0F, 32.0F) : 1.0F);
-    if (primitiveMode == renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres) {
-        return std::max({screenRadius, worldSizedScreenRadius, surfelRadius});
-    }
-    if (style.geometryMode == renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
-        return renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(style)
-                   ? worldSizedScreenRadius
-                   : screenRadius;
-    }
-    return std::max(screenRadius, surfelRadius);
-}
-
 std::uint16_t FloatToHalfBits(float value) {
     return Imath::half{std::max(0.0F, value)}.bits();
 }
@@ -641,7 +579,6 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
     CreatePostProcessDescriptorSetLayout();
-    CreateRaycastDescriptorSetLayout();
     CreateDescriptorPools();
     CreatePostProcessSampler();
     CreateUniformResources();
@@ -654,7 +591,6 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
     CreatePostProcessPipeline();
-    CreateRaycastPipelines();
     CreateFramebuffers();
     CreatePresentFramebuffers();
     CreateCommandPool();
@@ -688,7 +624,6 @@ VulkanViewportShell::~VulkanViewportShell() {
     gaussianSplatResources_.clear();
     CleanupHighQualityGaussianScene();
     CleanupExrExportResources();
-    CleanupRaycastExportResources();
 
     CleanupSwapchain();
 
@@ -752,15 +687,6 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (postProcessPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, postProcessPipeline_, nullptr);
     }
-    if (raycastClearPipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, raycastClearPipeline_, nullptr);
-    }
-    if (raycastAccumulationPipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, raycastAccumulationPipeline_, nullptr);
-    }
-    if (raycastCompositePipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, raycastCompositePipeline_, nullptr);
-    }
     if (pointPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, pointPipelineLayout_, nullptr);
     }
@@ -775,9 +701,6 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (postProcessPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, postProcessPipelineLayout_, nullptr);
-    }
-    if (raycastPipelineLayout_ != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(device_, raycastPipelineLayout_, nullptr);
     }
     if (postProcessSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(device_, postProcessSampler_, nullptr);
@@ -806,10 +729,6 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (postProcessDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, postProcessDescriptorSetLayout_, nullptr);
     }
-    if (raycastDescriptorSetLayout_ != VK_NULL_HANDLE) {
-        vkDestroyDescriptorSetLayout(device_, raycastDescriptorSetLayout_, nullptr);
-    }
-
     if (renderPass_ != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device_, renderPass_, nullptr);
         renderPass_ = VK_NULL_HANDLE;
@@ -1582,124 +1501,6 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
     }
 }
 
-invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloudRaycastFrame(
-    const PointCloudRaycastFrameRequest& request) {
-    if (!graphicsQueueSupportsCompute_) {
-        throw std::runtime_error{"Beauty Raycast export requires Vulkan compute support on the graphics queue."};
-    }
-    if (request.width == 0 || request.height == 0) {
-        throw std::runtime_error{"GPU raycast export requires a non-zero frame size."};
-    }
-    if (request.renderState.pointCloudLayers.empty()) {
-        throw std::runtime_error{"GPU raycast export requires at least one visible point-cloud layer."};
-    }
-
-    if (raycastExportResources_.commandBuffer == VK_NULL_HANDLE ||
-        raycastExportResources_.width != request.width ||
-        raycastExportResources_.height != request.height) {
-        CreateRaycastExportResources(request.width, request.height);
-    }
-
-    std::array<VkFence, kFramesInFlight> frameFences{};
-    std::size_t frameFenceCount = 0;
-    for (const auto& frame : frameResources_) {
-        if (frame.fence != VK_NULL_HANDLE) {
-            frameFences[frameFenceCount++] = frame.fence;
-        }
-    }
-    if (frameFenceCount > 0) {
-        vkWaitForFences(
-            device_,
-            static_cast<std::uint32_t>(frameFenceCount),
-            frameFences.data(),
-            VK_TRUE,
-            UINT64_MAX);
-    }
-
-    const auto previousRenderState = renderState_;
-    auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
-
-    try {
-        renderState_ = request.renderState;
-        UploadFrameUniforms(0U, request.width, request.height);
-
-        std::uint32_t preparedLayerCount = 0;
-        for (const auto& layer : request.renderState.pointCloudLayers) {
-            PointCloudDrawPlan plan;
-            if (!ResolvePointCloudDrawPlan(layer, true, &plan)) {
-                continue;
-            }
-            if (!UploadPointCloudLayerStyle(layer, plan, 0U, true)) {
-                continue;
-            }
-            if (!PrepareRaycastLayerResources(
-                    layer,
-                    plan,
-                    request.primitiveMode,
-                    request.width,
-                    request.height,
-                    request.maxDepth)) {
-                continue;
-            }
-            UpdateRaycastDescriptorSet(plan.resources, raycastExportResources_);
-            ++preparedLayerCount;
-        }
-        if (preparedLayerCount == 0) {
-            throw std::runtime_error{"GPU raycast export could not prepare any visible point layers."};
-        }
-
-        Check(
-            vkWaitForFences(device_, 1, &raycastExportResources_.fence, VK_TRUE, UINT64_MAX),
-            "vkWaitForFences(raytrace)");
-        Check(
-            vkResetFences(device_, 1, &raycastExportResources_.fence),
-            "vkResetFences(raytrace)");
-        Check(
-            vkResetCommandBuffer(raycastExportResources_.commandBuffer, 0),
-            "vkResetCommandBuffer(raytrace)");
-
-        RecordRaycastExportCommandBuffer(request);
-
-        VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &raycastExportResources_.commandBuffer;
-        Check(
-            vkQueueSubmit(graphicsQueue_, 1, &submitInfo, raycastExportResources_.fence),
-            "vkQueueSubmit(raytrace)");
-        Check(
-            vkWaitForFences(device_, 1, &raycastExportResources_.fence, VK_TRUE, UINT64_MAX),
-            "vkWaitForFences(raytrace complete)");
-
-        invisible_places::output::HalfRgbaExrImage image;
-        image.width = request.width;
-        image.height = request.height;
-        const auto pixelCount = static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height);
-        image.rgbaHalf.resize(pixelCount * 4U);
-        image.depth.resize(pixelCount);
-
-        const auto* colorPixels = static_cast<const glm::vec4*>(raycastExportResources_.colorBuffer.mapped);
-        const auto* depthPixels = static_cast<const float*>(raycastExportResources_.depthBuffer.mapped);
-        if (colorPixels == nullptr || depthPixels == nullptr) {
-            throw std::runtime_error{"GPU raycast export readback buffers are not mapped."};
-        }
-        for (std::size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex) {
-            const auto& color = colorPixels[pixelIndex];
-            const auto componentOffset = pixelIndex * 4U;
-            image.rgbaHalf[componentOffset + 0U] = FloatToHalfBits(color.r);
-            image.rgbaHalf[componentOffset + 1U] = FloatToHalfBits(color.g);
-            image.rgbaHalf[componentOffset + 2U] = FloatToHalfBits(color.b);
-            image.rgbaHalf[componentOffset + 3U] = FloatToHalfBits(std::clamp(color.a, 0.0F, 1.0F));
-            image.depth[pixelIndex] = depthPixels[pixelIndex];
-        }
-
-        restoreRenderState();
-        return image;
-    } catch (...) {
-        restoreRenderState();
-        throw;
-    }
-}
-
 void VulkanViewportShell::CreateInstance() {
     std::uint32_t glfwExtensionCount = 0;
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
@@ -1772,7 +1573,6 @@ void VulkanViewportShell::PickPhysicalDevice() {
     const auto selection = FindQueueFamilies(physicalDevice_, surface_);
     graphicsQueueFamily_ = selection.graphicsFamily.value();
     presentQueueFamily_ = selection.presentFamily.value();
-    graphicsQueueSupportsCompute_ = selection.graphicsFamilySupportsCompute;
 }
 
 void VulkanViewportShell::CreateLogicalDevice() {
@@ -2245,26 +2045,6 @@ void VulkanViewportShell::CreatePostProcessDescriptorSetLayout() {
     Check(
         vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &postProcessDescriptorSetLayout_),
         "vkCreateDescriptorSetLayout(postprocess)");
-}
-
-void VulkanViewportShell::CreateRaycastDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
-    bindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[1] = {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    for (std::uint32_t index = 2; index < bindings.size(); ++index) {
-        bindings[index].binding = index;
-        bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[index].descriptorCount = 1;
-        bindings[index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
-    layoutInfo.pBindings = bindings.data();
-
-    Check(
-        vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &raycastDescriptorSetLayout_),
-        "vkCreateDescriptorSetLayout(point raycast)");
 }
 
 void VulkanViewportShell::CreateDescriptorPools() {
@@ -2813,48 +2593,6 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         resources.emissiveImage.view,
         resources.normalAccumulationImage.view,
         resources.albedoAccumulationImage.view);
-}
-
-void VulkanViewportShell::CreateRaycastExportResources(std::uint32_t width, std::uint32_t height) {
-    if (width == 0 || height == 0) {
-        throw std::runtime_error{"GPU raycast export requires a non-zero frame size."};
-    }
-
-    WaitIdle();
-    CleanupRaycastExportResources();
-
-    auto& resources = raycastExportResources_;
-    resources.width = width;
-    resources.height = height;
-    const auto pixelCount = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height);
-
-    resources.accumulationBuffer = CreateHostVisibleBuffer(
-        pixelCount * static_cast<VkDeviceSize>(sizeof(glm::vec4)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    resources.revealageBuffer = CreateHostVisibleBuffer(
-        pixelCount * static_cast<VkDeviceSize>(sizeof(float)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    resources.emissionBuffer = CreateHostVisibleBuffer(
-        pixelCount * static_cast<VkDeviceSize>(sizeof(glm::vec4)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    resources.depthBuffer = CreateHostVisibleBuffer(
-        pixelCount * static_cast<VkDeviceSize>(sizeof(float)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    resources.colorBuffer = CreateHostVisibleBuffer(
-        pixelCount * static_cast<VkDeviceSize>(sizeof(glm::vec4)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    commandBufferInfo.commandPool = commandPool_;
-    commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    commandBufferInfo.commandBufferCount = 1;
-    Check(
-        vkAllocateCommandBuffers(device_, &commandBufferInfo, &resources.commandBuffer),
-        "vkAllocateCommandBuffers(raytrace)");
-
-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    Check(vkCreateFence(device_, &fenceInfo, nullptr, &resources.fence), "vkCreateFence(raytrace)");
 }
 
 void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resources) {
@@ -3900,49 +3638,6 @@ void VulkanViewportShell::CreatePostProcessPipeline() {
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 }
 
-void VulkanViewportShell::CreateRaycastPipelines() {
-    const std::array<std::pair<const char*, VkPipeline*>, 3> shaders = {{
-        {"pointcloud_raycast_clear.comp.spv", &raycastClearPipeline_},
-        {"pointcloud_raycast_accumulate.comp.spv", &raycastAccumulationPipeline_},
-        {"pointcloud_raycast_composite.comp.spv", &raycastCompositePipeline_},
-    }};
-
-    VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(RaycastPushConstants);
-
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &raycastDescriptorSetLayout_;
-    pipelineLayoutInfo.pushConstantRangeCount = 1;
-    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
-    Check(
-        vkCreatePipelineLayout(device_, &pipelineLayoutInfo, nullptr, &raycastPipelineLayout_),
-        "vkCreatePipelineLayout(point raycast)");
-
-    for (const auto& [shaderName, pipeline] : shaders) {
-        const auto shaderCode =
-            ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / shaderName).string());
-        const auto shaderModule =
-            CreateShaderModule(device_, shaderCode, "vkCreateShaderModule(point raycast compute)");
-
-        VkPipelineShaderStageCreateInfo shaderStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        shaderStage.module = shaderModule;
-        shaderStage.pName = "main";
-
-        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipelineInfo.stage = shaderStage;
-        pipelineInfo.layout = raycastPipelineLayout_;
-        Check(
-            vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline),
-            "vkCreateComputePipelines(point raycast)");
-
-        vkDestroyShaderModule(device_, shaderModule, nullptr);
-    }
-}
-
 void VulkanViewportShell::CreateFramebuffers() {
     framebuffers_.clear();
     framebuffers_.reserve(sceneColorImages_.size());
@@ -4366,91 +4061,6 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[6].descriptorCount = 1;
     writes[6].pBufferInfo = &normalInfo;
-
-    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-}
-
-void VulkanViewportShell::UpdateRaycastDescriptorSet(
-    ActivePointCloudResources* resources,
-    const RaycastExportResources& exportResources) {
-    if (resources == nullptr) {
-        return;
-    }
-
-    if (resources->raycastDescriptorSet == VK_NULL_HANDLE) {
-        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        allocInfo.descriptorPool = descriptorPool_;
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &raycastDescriptorSetLayout_;
-        Check(
-            vkAllocateDescriptorSets(device_, &allocInfo, &resources->raycastDescriptorSet),
-            "vkAllocateDescriptorSets(point raycast)");
-    }
-
-    VkDescriptorBufferInfo uniformInfo{frameResources_[0].uniformBuffer.buffer, 0, sizeof(FrameUniforms)};
-    VkDescriptorBufferInfo styleInfo{resources->exrStyleBuffer.buffer, 0, sizeof(PointCloudStyleGpu)};
-    VkDescriptorBufferInfo scalarInfo{resources->scalarFieldBuffer.buffer, 0, resources->scalarFieldBuffer.size};
-    VkDescriptorBufferInfo positionInfo{
-        resources->positionStorageBuffer.buffer,
-        0,
-        resources->positionStorageBuffer.size};
-    VkDescriptorBufferInfo colorInfo{resources->colorBuffer.buffer, 0, resources->colorBuffer.size};
-    VkDescriptorBufferInfo normalInfo{resources->normalBuffer.buffer, 0, resources->normalBuffer.size};
-    VkDescriptorBufferInfo bvhNodeInfo{
-        resources->raycastBvhNodeBuffer.buffer,
-        0,
-        resources->raycastBvhNodeBuffer.size};
-    VkDescriptorBufferInfo bvhIndexInfo{
-        resources->raycastBvhIndexBuffer.buffer,
-        0,
-        resources->raycastBvhIndexBuffer.size};
-    VkDescriptorBufferInfo accumulationInfo{
-        exportResources.accumulationBuffer.buffer,
-        0,
-        exportResources.accumulationBuffer.size};
-    VkDescriptorBufferInfo revealageInfo{
-        exportResources.revealageBuffer.buffer,
-        0,
-        exportResources.revealageBuffer.size};
-    VkDescriptorBufferInfo emissionInfo{
-        exportResources.emissionBuffer.buffer,
-        0,
-        exportResources.emissionBuffer.size};
-    VkDescriptorBufferInfo depthInfo{
-        exportResources.depthBuffer.buffer,
-        0,
-        exportResources.depthBuffer.size};
-    VkDescriptorBufferInfo outputColorInfo{
-        exportResources.colorBuffer.buffer,
-        0,
-        exportResources.colorBuffer.size};
-
-    std::array<VkWriteDescriptorSet, 13> writes{};
-    const std::array<VkDescriptorBufferInfo*, 13> infos = {
-        &uniformInfo,
-        &styleInfo,
-        &scalarInfo,
-        &positionInfo,
-        &colorInfo,
-        &normalInfo,
-        &bvhNodeInfo,
-        &bvhIndexInfo,
-        &accumulationInfo,
-        &revealageInfo,
-        &emissionInfo,
-        &depthInfo,
-        &outputColorInfo,
-    };
-
-    for (std::uint32_t index = 0; index < writes.size(); ++index) {
-        writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        writes[index].dstSet = resources->raycastDescriptorSet;
-        writes[index].dstBinding = index;
-        writes[index].descriptorType =
-            index <= 1U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[index].descriptorCount = 1;
-        writes[index].pBufferInfo = infos[index];
-    }
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -5158,8 +4768,6 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->colorBuffer);
     DestroyBuffer(&resources->normalBuffer);
     DestroyBuffer(&resources->scalarFieldBuffer);
-    DestroyBuffer(&resources->raycastBvhNodeBuffer);
-    DestroyBuffer(&resources->raycastBvhIndexBuffer);
     for (auto& styleBuffer : resources->styleBuffers) {
         DestroyBuffer(&styleBuffer);
     }
@@ -5182,11 +4790,6 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
         descriptorPool_ != VK_NULL_HANDLE &&
         device_ != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->exrDescriptorSet);
-    }
-    if (resources->raycastDescriptorSet != VK_NULL_HANDLE &&
-        descriptorPool_ != VK_NULL_HANDLE &&
-        device_ != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->raycastDescriptorSet);
     }
     *resources = ActivePointCloudResources{};
 }
@@ -5305,24 +4908,6 @@ void VulkanViewportShell::CleanupExrExportResources() {
     DestroyBuffer(&resources.albedoReadbackBuffer);
 
     resources = ExrExportResources{};
-}
-
-void VulkanViewportShell::CleanupRaycastExportResources() {
-    auto& resources = raycastExportResources_;
-
-    if (resources.commandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
-        vkFreeCommandBuffers(device_, commandPool_, 1, &resources.commandBuffer);
-    }
-    if (resources.fence != VK_NULL_HANDLE) {
-        vkDestroyFence(device_, resources.fence, nullptr);
-    }
-    DestroyBuffer(&resources.accumulationBuffer);
-    DestroyBuffer(&resources.revealageBuffer);
-    DestroyBuffer(&resources.emissionBuffer);
-    DestroyBuffer(&resources.depthBuffer);
-    DestroyBuffer(&resources.colorBuffer);
-
-    resources = RaycastExportResources{};
 }
 
 void VulkanViewportShell::RecreateSwapchain() {
@@ -5673,62 +5258,6 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     return true;
 }
 
-bool VulkanViewportShell::PrepareRaycastLayerResources(
-    const SceneRenderState::PointCloudLayerState& layer,
-    const PointCloudDrawPlan& plan,
-    renderer::pointcloud::PointCloudRaycastPrimitiveMode primitiveMode,
-    std::uint32_t width,
-    std::uint32_t height,
-    float maxDepth) {
-    auto* resources = plan.resources;
-    if (resources == nullptr || resources->cpuPositions.empty() || plan.drawPointCount == 0) {
-        return false;
-    }
-
-    const auto drawPointCount = std::min<std::size_t>(plan.drawPointCount, resources->cpuPositions.size());
-    const float radius = EstimateRaycastBvhRadius(
-        layer.style,
-        primitiveMode,
-        renderState_,
-        width,
-        height,
-        maxDepth,
-        pointSizeRangeMin_,
-        pointSizeRangeMax_);
-
-    std::vector<renderer::pointcloud::RaycastBvhBuildPoint> points;
-    points.reserve(drawPointCount);
-    for (std::size_t pointIndex = 0; pointIndex < drawPointCount; ++pointIndex) {
-        points.push_back(
-            {.center = resources->cpuPositions[pointIndex],
-             .radius = radius,
-             .pointIndex = static_cast<std::uint32_t>(pointIndex)});
-    }
-
-    auto bvh = renderer::pointcloud::BuildLinearRaycastBvh(points);
-    if (bvh.Empty()) {
-        return false;
-    }
-
-    DestroyBuffer(&resources->raycastBvhNodeBuffer);
-    DestroyBuffer(&resources->raycastBvhIndexBuffer);
-    resources->raycastBvhNodeBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(bvh.nodes.size() * sizeof(renderer::pointcloud::RaycastBvhNodeGpu)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources->raycastBvhNodeBuffer,
-        bvh.nodes.data(),
-        resources->raycastBvhNodeBuffer.size);
-    resources->raycastBvhIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(bvh.pointIndices.size() * sizeof(std::uint32_t)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources->raycastBvhIndexBuffer,
-        bvh.pointIndices.data(),
-        resources->raycastBvhIndexBuffer.size);
-    return true;
-}
-
 bool VulkanViewportShell::RecordPointCloudLayerDraw(
     VkCommandBuffer commandBuffer,
     const SceneRenderState::PointCloudLayerState& layer,
@@ -6064,157 +5593,6 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         &albedoCopyRegion);
 
     Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(exr)");
-}
-
-void VulkanViewportShell::RecordRaycastExportCommandBuffer(const PointCloudRaycastFrameRequest& request) {
-    auto& resources = raycastExportResources_;
-    if (resources.commandBuffer == VK_NULL_HANDLE) {
-        throw std::runtime_error{"GPU raycast export resources are not initialized."};
-    }
-
-    ActivePointCloudResources* firstResources = nullptr;
-    for (const auto& layer : request.renderState.pointCloudLayers) {
-        PointCloudDrawPlan plan;
-        if (ResolvePointCloudDrawPlan(layer, true, &plan) &&
-            plan.resources != nullptr &&
-            plan.resources->raycastDescriptorSet != VK_NULL_HANDLE &&
-            plan.resources->raycastBvhNodeBuffer.buffer != VK_NULL_HANDLE) {
-            firstResources = plan.resources;
-            break;
-        }
-    }
-    if (firstResources == nullptr) {
-        throw std::runtime_error{"GPU raycast export has no prepared raycast point layers."};
-    }
-
-    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    Check(vkBeginCommandBuffer(resources.commandBuffer, &beginInfo), "vkBeginCommandBuffer(raytrace)");
-
-    const auto dispatchWidth16 = (request.width + 15U) / 16U;
-    const auto dispatchHeight16 = (request.height + 15U) / 16U;
-    const auto dispatchWidth8 = (request.width + 7U) / 8U;
-    const auto dispatchHeight8 = (request.height + 7U) / 8U;
-    const auto primitiveMode =
-        request.primitiveMode == renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres ? 1U : 0U;
-    const auto pushForPass = [&](std::uint32_t passMode) {
-        RaycastPushConstants pushConstants;
-        pushConstants.control = glm::uvec4{request.width, request.height, passMode, primitiveMode};
-        pushConstants.params = glm::vec4{
-            static_cast<float>(std::clamp<std::uint32_t>(request.samplesPerPixel, 1U, 16U)),
-            request.maxDepth,
-            0.0F,
-            0.0F};
-        return pushConstants;
-    };
-    const auto shaderBarrier = [&]() {
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(
-            resources.commandBuffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0,
-            1,
-            &barrier,
-            0,
-            nullptr,
-            0,
-            nullptr);
-    };
-
-    VkDescriptorSet descriptorSet = firstResources->raycastDescriptorSet;
-    vkCmdBindPipeline(resources.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, raycastClearPipeline_);
-    vkCmdBindDescriptorSets(
-        resources.commandBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        raycastPipelineLayout_,
-        0,
-        1,
-        &descriptorSet,
-        0,
-        nullptr);
-    auto pushConstants = pushForPass(0U);
-    vkCmdPushConstants(
-        resources.commandBuffer,
-        raycastPipelineLayout_,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        sizeof(pushConstants),
-        &pushConstants);
-    vkCmdDispatch(resources.commandBuffer, dispatchWidth16, dispatchHeight16, 1U);
-    shaderBarrier();
-
-    for (std::uint32_t passMode = 0U; passMode < 2U; ++passMode) {
-        vkCmdBindPipeline(resources.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, raycastAccumulationPipeline_);
-        pushConstants = pushForPass(passMode);
-        for (const auto& layer : request.renderState.pointCloudLayers) {
-            PointCloudDrawPlan plan;
-            if (!ResolvePointCloudDrawPlan(layer, true, &plan) ||
-                plan.resources == nullptr ||
-                plan.resources->raycastDescriptorSet == VK_NULL_HANDLE ||
-                plan.resources->raycastBvhNodeBuffer.buffer == VK_NULL_HANDLE) {
-                continue;
-            }
-            descriptorSet = plan.resources->raycastDescriptorSet;
-            vkCmdBindDescriptorSets(
-                resources.commandBuffer,
-                VK_PIPELINE_BIND_POINT_COMPUTE,
-                raycastPipelineLayout_,
-                0,
-                1,
-                &descriptorSet,
-                0,
-                nullptr);
-            vkCmdPushConstants(
-                resources.commandBuffer,
-                raycastPipelineLayout_,
-                VK_SHADER_STAGE_COMPUTE_BIT,
-                0,
-                sizeof(pushConstants),
-                &pushConstants);
-            vkCmdDispatch(resources.commandBuffer, dispatchWidth8, dispatchHeight8, 1U);
-        }
-        shaderBarrier();
-    }
-
-    descriptorSet = firstResources->raycastDescriptorSet;
-    vkCmdBindPipeline(resources.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, raycastCompositePipeline_);
-    vkCmdBindDescriptorSets(
-        resources.commandBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE,
-        raycastPipelineLayout_,
-        0,
-        1,
-        &descriptorSet,
-        0,
-        nullptr);
-    pushConstants = pushForPass(0U);
-    vkCmdPushConstants(
-        resources.commandBuffer,
-        raycastPipelineLayout_,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        sizeof(pushConstants),
-        &pushConstants);
-    vkCmdDispatch(resources.commandBuffer, dispatchWidth16, dispatchHeight16, 1U);
-
-    VkMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(
-        resources.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        1,
-        &hostBarrier,
-        0,
-        nullptr,
-        0,
-        nullptr);
-
-    Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(raytrace)");
 }
 
 void VulkanViewportShell::RecordCommandBuffer(
