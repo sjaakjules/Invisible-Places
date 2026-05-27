@@ -33,6 +33,16 @@ constexpr std::size_t kWaterPathCountFieldSlot = 11U;
 constexpr std::size_t kWaterJitterSeedFieldSlot = 12U;
 constexpr std::size_t kWaterTrailAgeFieldSlot = 13U;
 constexpr std::size_t kWaterFeatureTypeFieldSlot = 15U;
+constexpr std::size_t kWaterStreamPointSeedFieldSlot = 5U;
+constexpr std::size_t kWaterStreamPointAgeFieldSlot = 8U;
+constexpr std::size_t kWaterStreamSpeedFieldSlot = 10U;
+constexpr std::size_t kWaterStreamWidthFieldSlot = 11U;
+constexpr std::size_t kWaterStreamWorldLengthFieldSlot = 12U;
+constexpr std::size_t kWaterStreamConfidenceFieldSlot = 13U;
+constexpr std::size_t kWaterStreamWetnessFieldSlot = 14U;
+constexpr std::size_t kWaterStreamTangentXFieldSlot = 16U;
+constexpr std::size_t kWaterStreamTangentYFieldSlot = 17U;
+constexpr std::size_t kWaterStreamTangentZFieldSlot = 18U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
 
 float Clamp01(float value) {
@@ -77,10 +87,66 @@ float ScalarFieldValueBySlot(
     return cloud.scalarFieldValues[valueIndex];
 }
 
+float WaterEffectFieldValue(
+    const OfflinePointLayer& layer,
+    std::size_t fieldSlot,
+    std::size_t pointIndex,
+    float fallback) {
+    if (layer.cloud == nullptr || fieldSlot >= layer.cloud->scalarFields.size()) {
+        return fallback;
+    }
+    return ScalarFieldValueBySlot(*layer.cloud, fieldSlot, pointIndex);
+}
+
+bool HasWaterEffectComposition(const OfflinePointLayer& layer) {
+    return layer.cloud != nullptr &&
+           layer.waterEffectEmissionAddFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectOpacityAddFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectOpacityMultiplyFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectPointSizeAddFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectPointSizeMultiplyFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectColourRedFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectColourGreenFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectColourBlueFieldSlot < layer.cloud->scalarFields.size() &&
+           layer.waterEffectColourMixFieldSlot < layer.cloud->scalarFields.size();
+}
+
+glm::vec3 ApplyWaterEffectColour(
+    const OfflinePointLayer& layer,
+    std::size_t pointIndex,
+    glm::vec3 baseColor) {
+    if (!HasWaterEffectComposition(layer)) {
+        return baseColor;
+    }
+    const float mixAmount = Clamp01(WaterEffectFieldValue(
+        layer,
+        layer.waterEffectColourMixFieldSlot,
+        pointIndex,
+        0.0F));
+    if (mixAmount <= 1.0e-5F) {
+        return baseColor;
+    }
+    const glm::vec3 effectColor{
+        Clamp01(WaterEffectFieldValue(layer, layer.waterEffectColourRedFieldSlot, pointIndex, 0.62F)),
+        Clamp01(WaterEffectFieldValue(layer, layer.waterEffectColourGreenFieldSlot, pointIndex, 0.88F)),
+        Clamp01(WaterEffectFieldValue(layer, layer.waterEffectColourBlueFieldSlot, pointIndex, 1.0F)),
+    };
+    return glm::mix(baseColor, effectColor, mixAmount);
+}
+
 bool HasWaterParticleFields(
     const invisible_places::io::LoadedPointCloud& cloud,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
-    return style.flowAnimation && cloud.scalarFields.size() > kWaterJitterSeedFieldSlot;
+    return style.flowAnimation &&
+           !style.waterStreamOverlay &&
+           cloud.scalarFields.size() > kWaterJitterSeedFieldSlot;
+}
+
+bool HasWaterStreamFields(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    return style.waterStreamOverlay &&
+           cloud.scalarFields.size() > kWaterStreamTangentZFieldSlot;
 }
 
 float WaterParticleTravel(
@@ -112,6 +178,25 @@ float WaterTrailFade(
     }
     const float age = Clamp01(ScalarFieldValueBySlot(cloud, kWaterTrailAgeFieldSlot, pointIndex));
     return std::pow(1.0F - SmoothStep(0.0F, 1.0F, age), 1.35F);
+}
+
+float WaterStreamEnergy(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float timeSeconds) {
+    if (cloud.scalarFields.size() <= kWaterStreamWetnessFieldSlot) {
+        return 1.0F;
+    }
+    const float age = Clamp01(ScalarFieldValueBySlot(cloud, kWaterStreamPointAgeFieldSlot, pointIndex));
+    const float speed = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterStreamSpeedFieldSlot, pointIndex));
+    const float confidence = Clamp01(ScalarFieldValueBySlot(cloud, kWaterStreamConfidenceFieldSlot, pointIndex));
+    const float wetness = Clamp01(ScalarFieldValueBySlot(cloud, kWaterStreamWetnessFieldSlot, pointIndex));
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterStreamPointSeedFieldSlot, pointIndex);
+    const float animatedPhase = age - std::max(0.0F, timeSeconds) * speed * 0.18F + seed;
+    const float animatedAge = animatedPhase - std::floor(animatedPhase);
+    const float fade = 0.35F + 0.65F * std::pow(1.0F - SmoothStep(0.0F, 1.0F, animatedAge), 1.35F);
+    const float pulse = 0.78F + 0.22F * std::sin((seed + animatedAge + std::max(0.0F, timeSeconds) * speed * 0.07F) * 6.28318530718F);
+    return Clamp01(confidence * wetness * fade * pulse);
 }
 
 float WaterParticleFade(
@@ -631,7 +716,7 @@ glm::vec3 ResolvePointColor(
         baseColor = {customColor[0], customColor[1], customColor[2]};
     }
 
-    return ApplyColorize(baseColor, layer.style);
+    return ApplyWaterEffectColour(layer, pointIndex, ApplyColorize(baseColor, layer.style));
 }
 
 struct OfflinePointSample {
@@ -642,6 +727,7 @@ struct OfflinePointSample {
     float viewDepth = 0.0F;
     float pointSize = 1.0F;
     float surfelDiameter = 0.005F;
+    float surfelAspect = 1.0F;
     float opacity = 1.0F;
     float emissive = 0.0F;
     float xray = 0.0F;
@@ -1171,6 +1257,7 @@ bool BuildOfflinePointSample(
     }
 
     const auto& cloud = *layer.cloud;
+    const bool waterStreams = HasWaterStreamFields(cloud, layer.style);
     const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
     float waterParticleRole = 0.0F;
     if (waterParticles) {
@@ -1235,37 +1322,125 @@ bool BuildOfflinePointSample(
         sample->worldCenter,
         stylisationTimeSeconds,
         &causticPreviewTint);
+    const bool waterEffects = HasWaterEffectComposition(layer);
+    const float waterEffectPointSizeAdd = waterEffects
+                                              ? WaterEffectFieldValue(
+                                                    layer,
+                                                    layer.waterEffectPointSizeAddFieldSlot,
+                                                    pointIndex,
+                                                    0.0F)
+                                              : 0.0F;
+    const float waterEffectPointSizeMultiply = waterEffects
+                                                   ? std::max(
+                                                         0.0F,
+                                                         WaterEffectFieldValue(
+                                                             layer,
+                                                             layer.waterEffectPointSizeMultiplyFieldSlot,
+                                                             pointIndex,
+                                                             1.0F))
+                                                   : 1.0F;
+    const float waterEffectOpacityAdd = waterEffects
+                                            ? WaterEffectFieldValue(
+                                                  layer,
+                                                  layer.waterEffectOpacityAddFieldSlot,
+                                                  pointIndex,
+                                                  0.0F)
+                                            : 0.0F;
+    const float waterEffectOpacityMultiply = waterEffects
+                                                 ? std::max(
+                                                       0.0F,
+                                                       WaterEffectFieldValue(
+                                                           layer,
+                                                           layer.waterEffectOpacityMultiplyFieldSlot,
+                                                           pointIndex,
+                                                           1.0F))
+                                                 : 1.0F;
+    const float waterEffectEmissionAdd = waterEffects
+                                             ? std::max(
+                                                   0.0F,
+                                                   WaterEffectFieldValue(
+                                                       layer,
+                                                       layer.waterEffectEmissionAddFieldSlot,
+                                                       pointIndex,
+                                                       0.0F))
+                                             : 0.0F;
     const float waterParticleSizeScale =
         waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
-    sample->pointSize = std::clamp(
-        EvaluateBindingOrDefault(
-            cloud,
-            layer.style.pointSize,
-            pointIndex,
-            invisible_places::renderer::pointcloud::kInactivePointSizeDefault) *
-            waterParticleSizeScale *
-            (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)),
-        1.0F,
-        64.0F);
+    const bool worldSizedScreenSprites =
+        invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
+    if (worldSizedScreenSprites) {
+        const float diameterMeters =
+            (EvaluateBindingOrDefault(
+                 cloud,
+                 layer.style.surfelDiameter,
+                 pointIndex,
+                 invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault) *
+                 waterParticleSizeScale *
+                 (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
+                 waterEffectPointSizeMultiply) +
+            waterEffectPointSizeAdd;
+        sample->pointSize = std::clamp(
+            invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                diameterMeters,
+                viewDepth,
+                matrices.projection[1][1],
+                static_cast<float>(image.height)),
+            1.0F,
+            64.0F);
+    } else {
+        sample->pointSize = std::clamp(
+            (EvaluateBindingOrDefault(
+                 cloud,
+                 layer.style.pointSize,
+                 pointIndex,
+                 invisible_places::renderer::pointcloud::kInactivePointSizeDefault) *
+                 waterParticleSizeScale *
+                 (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
+                 waterEffectPointSizeMultiply) +
+                waterEffectPointSizeAdd,
+            1.0F,
+            64.0F);
+    }
     sample->worldSurfels = worldSurfels;
     sample->surfelDiameter = std::max(
         0.0F,
-        EvaluateBindingOrDefault(
-            cloud,
-            layer.style.surfelDiameter,
-            pointIndex,
-            invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault) *
-            waterParticleSizeScale *
-            (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)));
+        (EvaluateBindingOrDefault(
+             cloud,
+             layer.style.surfelDiameter,
+             pointIndex,
+             invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault) *
+             waterParticleSizeScale *
+             (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
+             waterEffectPointSizeMultiply) +
+            waterEffectPointSizeAdd);
+    sample->surfelAspect = layer.style.flowAnimation
+                                ? std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F)
+                                : 1.0F;
+    if (waterStreams) {
+        sample->surfelDiameter = std::max(
+            0.0001F,
+            ScalarFieldValueBySlot(cloud, kWaterStreamWidthFieldSlot, pointIndex));
+        const float streamWorldLength = std::max(
+            sample->surfelDiameter,
+            ScalarFieldValueBySlot(cloud, kWaterStreamWorldLengthFieldSlot, pointIndex));
+        sample->surfelAspect = std::clamp(
+            streamWorldLength / std::max(sample->surfelDiameter, 0.0001F),
+            1.0F,
+            64.0F);
+    }
     sample->opacity = Clamp01(
-        EvaluateBindingOrDefault(
-            cloud,
-            layer.style.opacity,
-            pointIndex,
-            invisible_places::renderer::pointcloud::kInactiveOpacityDefault) *
-        (1.0F + caustic * std::max(0.0F, layer.style.causticOpacityBoost)));
+        (EvaluateBindingOrDefault(
+             cloud,
+             layer.style.opacity,
+             pointIndex,
+             invisible_places::renderer::pointcloud::kInactiveOpacityDefault) *
+             (1.0F + caustic * std::max(0.0F, layer.style.causticOpacityBoost)) *
+             waterEffectOpacityMultiply) +
+        waterEffectOpacityAdd);
     if (waterParticles) {
         sample->opacity *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
+    } else if (waterStreams) {
+        sample->opacity *= WaterStreamEnergy(cloud, pointIndex, stylisationTimeSeconds);
     }
     sample->depthFade = Clamp01(
         EvaluateBindingOrDefault(
@@ -1283,8 +1458,12 @@ bool BuildOfflinePointSample(
                 invisible_places::renderer::pointcloud::kInactiveEmissionDefault));
         if (waterParticles) {
             sample->emissive *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
+        } else if (waterStreams) {
+            const float streamEnergy = WaterStreamEnergy(cloud, pointIndex, stylisationTimeSeconds);
+            sample->emissive *= 0.35F + streamEnergy * 1.65F;
         }
         sample->emissive += caustic * std::max(0.0F, layer.style.causticEmissionBoost);
+        sample->emissive += waterEffectEmissionAdd;
         sample->xray = Clamp01(
             EvaluateBindingOrDefault(
                 cloud,
@@ -1292,6 +1471,9 @@ bool BuildOfflinePointSample(
                 pointIndex,
                 invisible_places::renderer::pointcloud::kInactiveXrayDefault));
         sample->color = ResolvePointColor(layer, pointIndex);
+        if (waterStreams) {
+            sample->color *= WaterStreamEnergy(cloud, pointIndex, stylisationTimeSeconds);
+        }
         sample->color = glm::mix(
             sample->color,
             glm::vec3{
@@ -1311,7 +1493,19 @@ bool BuildOfflinePointSample(
         }
     }
     sample->hasPreferredTangent = false;
-    if (waterParticles && layer.style.waterStreakAspect > 1.0001F) {
+    if (waterStreams) {
+        const glm::vec3 localTangent{
+            ScalarFieldValueBySlot(cloud, kWaterStreamTangentXFieldSlot, pointIndex),
+            ScalarFieldValueBySlot(cloud, kWaterStreamTangentYFieldSlot, pointIndex),
+            ScalarFieldValueBySlot(cloud, kWaterStreamTangentZFieldSlot, pointIndex)};
+        if (glm::dot(localTangent, localTangent) > 1.0e-8F) {
+            const glm::vec3 worldTangent = glm::mat3{layer.localToWorld} * localTangent;
+            if (IsFinite(worldTangent) && glm::dot(worldTangent, worldTangent) > 1.0e-8F) {
+                sample->tangent = glm::normalize(worldTangent);
+                sample->hasPreferredTangent = true;
+            }
+        }
+    } else if (waterParticles && layer.style.waterStreakAspect > 1.0001F) {
         const glm::vec3 localTangent = ResolveWaterParticleTangent(cloud, pointIndex, stylisationTimeSeconds);
         if (glm::dot(localTangent, localTangent) > 1.0e-8F) {
             const glm::vec3 worldTangent = glm::mat3{layer.localToWorld} * localTangent;
@@ -1346,9 +1540,7 @@ void VisitCoveredPixels(
     PixelCallback callback) {
     if (sample.worldSurfels) {
         const float radiusWorld = sample.surfelDiameter * 0.5F;
-        const float waterStreakAspect =
-            style.flowAnimation ? std::clamp(style.waterStreakAspect, 1.0F, 32.0F) : 1.0F;
-        const float tangentRadiusWorld = radiusWorld * waterStreakAspect;
+        const float tangentRadiusWorld = radiusWorld * std::max(1.0F, sample.surfelAspect);
         const float bitangentRadiusWorld = radiusWorld;
         const std::array<glm::vec3, 4> quadCorners = {
             sample.worldCenter - (sample.tangent * tangentRadiusWorld) - (sample.bitangent * bitangentRadiusWorld),
@@ -1567,6 +1759,8 @@ void RenderFastBasicPointCloudTile(
             continue;
         }
 
+        const bool worldSizedScreenSprites =
+            invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
         for (std::size_t sampleIndex = 0; sampleIndex < drawPointCount; ++sampleIndex) {
             const auto pointIndex =
                 drawPointCount < sourcePointCount
@@ -1590,30 +1784,72 @@ void RenderFastBasicPointCloudTile(
                 continue;
             }
 
-            const int x = static_cast<int>(std::floor(pixelX));
-            const int y = static_cast<int>(std::floor(pixelY));
-            if (x < static_cast<int>(tile.x0) ||
-                y < static_cast<int>(tile.y0) ||
-                x >= static_cast<int>(tile.x1) ||
-                y >= static_cast<int>(tile.y1)) {
-                continue;
-            }
-
-            const auto pixelIndex =
-                static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
-                static_cast<std::size_t>(x);
-            if (pixelIndex >= image->depth.size() || viewDepth >= image->depth[pixelIndex]) {
-                continue;
-            }
-
             const glm::vec3 color = ResolvePointColor(layer, pointIndex);
-            image->beautyR[pixelIndex] = color.r;
-            image->beautyG[pixelIndex] = color.g;
-            image->beautyB[pixelIndex] = color.b;
-            image->alpha[pixelIndex] = 1.0F;
-            image->depth[pixelIndex] = viewDepth;
-            if (diagnostics != nullptr) {
-                ++diagnostics->accumulationCoveredPixels;
+            if (worldSizedScreenSprites) {
+                const float pointSize = std::clamp(
+                    invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                        invisible_places::style::ScalarConstant(layer.style.surfelDiameter),
+                        viewDepth,
+                        matrices.projection[1][1],
+                        static_cast<float>(image->height)),
+                    1.0F,
+                    64.0F);
+                const float safeRadius = std::max(0.5F, pointSize * 0.5F);
+                const auto radiusPixels = static_cast<int>(std::ceil(safeRadius));
+                const int centerX = static_cast<int>(std::floor(pixelX));
+                const int centerY = static_cast<int>(std::floor(pixelY));
+                const int minX = std::max<int>(static_cast<int>(tile.x0), centerX - radiusPixels);
+                const int maxX = std::min<int>(static_cast<int>(tile.x1) - 1, centerX + radiusPixels);
+                const int minY = std::max<int>(static_cast<int>(tile.y0), centerY - radiusPixels);
+                const int maxY = std::min<int>(static_cast<int>(tile.y1) - 1, centerY + radiusPixels);
+                for (int y = minY; y <= maxY; ++y) {
+                    for (int x = minX; x <= maxX; ++x) {
+                        const float dx = (static_cast<float>(x) + 0.5F) - pixelX;
+                        const float dy = (static_cast<float>(y) + 0.5F) - pixelY;
+                        if (((dx * dx) + (dy * dy)) > safeRadius * safeRadius) {
+                            continue;
+                        }
+                        const auto pixelIndex =
+                            static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
+                            static_cast<std::size_t>(x);
+                        if (pixelIndex >= image->depth.size() || viewDepth >= image->depth[pixelIndex]) {
+                            continue;
+                        }
+                        image->beautyR[pixelIndex] = color.r;
+                        image->beautyG[pixelIndex] = color.g;
+                        image->beautyB[pixelIndex] = color.b;
+                        image->alpha[pixelIndex] = 1.0F;
+                        image->depth[pixelIndex] = viewDepth;
+                        if (diagnostics != nullptr) {
+                            ++diagnostics->accumulationCoveredPixels;
+                        }
+                    }
+                }
+            } else {
+                const int x = static_cast<int>(std::floor(pixelX));
+                const int y = static_cast<int>(std::floor(pixelY));
+                if (x < static_cast<int>(tile.x0) ||
+                    y < static_cast<int>(tile.y0) ||
+                    x >= static_cast<int>(tile.x1) ||
+                    y >= static_cast<int>(tile.y1)) {
+                    continue;
+                }
+
+                const auto pixelIndex =
+                    static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
+                    static_cast<std::size_t>(x);
+                if (pixelIndex >= image->depth.size() || viewDepth >= image->depth[pixelIndex]) {
+                    continue;
+                }
+
+                image->beautyR[pixelIndex] = color.r;
+                image->beautyG[pixelIndex] = color.g;
+                image->beautyB[pixelIndex] = color.b;
+                image->alpha[pixelIndex] = 1.0F;
+                image->depth[pixelIndex] = viewDepth;
+                if (diagnostics != nullptr) {
+                    ++diagnostics->accumulationCoveredPixels;
+                }
             }
         }
 

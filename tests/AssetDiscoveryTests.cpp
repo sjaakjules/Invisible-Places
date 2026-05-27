@@ -46,6 +46,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <numeric>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -95,6 +98,80 @@ void WriteLookAtOrientation(invisible_places::camera::CameraState* state) {
     const auto cameraToWorld = glm::inverse(glm::mat3{view});
     const auto orientation = glm::normalize(glm::quat_cast(cameraToWorld));
     state->orientation = {orientation.x, orientation.y, orientation.z, orientation.w};
+}
+
+invisible_places::io::LoadedPointCloud MakeRippleFixtureCloud() {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.hasNormals = true;
+    cloud.hasSourceRgb = true;
+    constexpr std::uint32_t gridSize = 17U;
+    cloud.positions.reserve(gridSize * gridSize);
+    cloud.normals.reserve(gridSize * gridSize);
+    cloud.packedColors.reserve(gridSize * gridSize);
+    for (std::uint32_t y = 0; y < gridSize; ++y) {
+        for (std::uint32_t x = 0; x < gridSize; ++x) {
+            const float px = static_cast<float>(x) / static_cast<float>(gridSize - 1U);
+            const float py = static_cast<float>(y) / static_cast<float>(gridSize - 1U);
+            cloud.positions.push_back({px, py, 0.0F});
+            const bool sloped = px > 0.50F;
+            cloud.normals.push_back(sloped ? invisible_places::io::Float3{0.72F, 0.0F, 0.69F}
+                                           : invisible_places::io::Float3{0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xffffffffU);
+            cloud.bounds.Expand(cloud.positions.back());
+        }
+    }
+    cloud.focusPoint = {0.5F, 0.5F, 0.0F};
+    cloud.hasFocusPoint = true;
+    cloud.sourcePath = "Data/RippleFixture.ply";
+    cloud.layerName = "Ripple fixture";
+    return cloud;
+}
+
+invisible_places::water::WaterEffectLayer MakeRippleTestLayer(
+    invisible_places::water::WaterRippleOverlayType type,
+    std::uint32_t id = 1U) {
+    invisible_places::water::WaterEffectLayer layer;
+    layer.id = id;
+    layer.name = "test ripple";
+    layer.featureType = invisible_places::water::WaterEffectFeatureType::Ripple;
+    layer.rippleOverlayType = type;
+    layer.vertices = {
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        {1.0F, 1.0F, 0.0F},
+        {0.0F, 1.0F, 0.0F},
+    };
+    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+    layer.edgeBlendWidth = 0.08F;
+    layer.regionStrength = 1.0F;
+    layer.patternScale = 1.0F;
+    layer.speed = 0.55F;
+    layer.wavelengthMeters = 0.16F;
+    layer.warp = 0.45F;
+    layer.turbulence = 0.0F;
+    layer.phase = 0.125F;
+    layer.directionX = 1.0F;
+    layer.directionY = 0.0F;
+    layer.directionZ = 0.0F;
+    layer.seed = 77U;
+    layer.maxAffectedPoints = 4096U;
+    layer.response.intensity = 1.0F;
+    layer.response.emissionAdd = 1.0F;
+    layer.response.opacityAdd = 0.25F;
+    return layer;
+}
+
+std::optional<float> RippleValueAt(
+    const invisible_places::water::WaterEffectOverlay& overlay,
+    float x,
+    float y) {
+    for (const auto& point : overlay.points) {
+        if (std::abs(point.position.x - x) <= 1.0e-5F &&
+            std::abs(point.position.y - y) <= 1.0e-5F) {
+            return point.value;
+        }
+    }
+    return std::nullopt;
 }
 
 template <typename T>
@@ -1125,6 +1202,45 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     causticRegion.maskDirty = false;
     causticRegion.maskStale = false;
     document.waterCausticRegions.push_back(causticRegion);
+    invisible_places::water::WaterEffectLayer rippleLayer;
+    rippleLayer.id = 8;
+    rippleLayer.name = "Rock pool caustic lace";
+    rippleLayer.featureType = invisible_places::water::WaterEffectFeatureType::Ripple;
+    rippleLayer.rippleOverlayType = invisible_places::water::WaterRippleOverlayType::CausticLace;
+    rippleLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    rippleLayer.vertices = causticRegion.vertices;
+    rippleLayer.hull = invisible_places::water::BuildWaterRegionHull(rippleLayer.vertices);
+    rippleLayer.edgeBlendWidth = causticRegion.edgeBlendWidth;
+    rippleLayer.wavelengthMeters = 0.18F;
+    rippleLayer.response.emissionAdd = 1.25F;
+    document.waterRippleLayers.push_back(rippleLayer);
+    invisible_places::water::WaterEffectLayer fieldLayer;
+    fieldLayer.id = 12;
+    fieldLayer.name = "Rock edge field";
+    fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
+    fieldLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    fieldLayer.vertices = causticRegion.vertices;
+    fieldLayer.hull = invisible_places::water::BuildWaterRegionHull(fieldLayer.vertices);
+    fieldLayer.edgeBlendWidth = 0.24F;
+    fieldLayer.regionStrength = 0.82F;
+    fieldLayer.directionX = 0.0F;
+    fieldLayer.directionY = 1.0F;
+    fieldLayer.directionZ = 0.0F;
+    document.waterFieldLayers.push_back(fieldLayer);
+    invisible_places::water::WaterEffectLayer noFlowLayer;
+    noFlowLayer.id = 13;
+    noFlowLayer.name = "No flow backside";
+    noFlowLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldNoFlowRegion;
+    noFlowLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    noFlowLayer.vertices = causticRegion.vertices;
+    noFlowLayer.hull = invisible_places::water::BuildWaterRegionHull(noFlowLayer.vertices);
+    document.waterFieldLayers.push_back(noFlowLayer);
+    document.waterFlowStreamSettings.streamCountTotal = 321U;
+    document.waterFlowStreamSettings.streamWidthMeters = 0.014F;
+    document.waterFieldSettings.corridorRadiusMeters = 0.42F;
+    document.waterFieldSettings.outputMode = invisible_places::water::WaterFieldOutputMode::Both;
+    document.waterFieldStreamSettings.streamlineCount = 654U;
+    document.waterFieldStreamSettings.streamlineWidthMeters = 0.009F;
     document.cameraPathShotIndices = {0, 0};
     document.cameraPathDurationFrames = 144;
     document.hasSavedAnimationRegistry = true;
@@ -1204,6 +1320,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.depthAlphaThreshold = 0.42F;
     pointStyle.solidCenters = false;
     pointStyle.flowAnimation = true;
+    pointStyle.waterStreamOverlay = true;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.pointSize,
         2,
@@ -1246,7 +1363,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
             std::istreambuf_iterator<char>{savedProject},
             std::istreambuf_iterator<char>{}};
         CHECK(savedJson.find("\"render_mode\"") == std::string::npos);
-        CHECK(savedJson.find("\"blend_mode\"") == std::string::npos);
+        CHECK(savedJson.find("\"blend_mode\"") != std::string::npos);
         CHECK(savedJson.find("\"depth_contribution\"") != std::string::npos);
         CHECK(savedJson.find("\"active\"") != std::string::npos);
         CHECK(savedJson.find("\"solid_centers\"") != std::string::npos);
@@ -1271,13 +1388,21 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"gradient_end_color\"") != std::string::npos);
         CHECK(savedJson.find("\"water_point_visual_style\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_point_visual_style\"") == std::string::npos);
-        CHECK(savedJson.find("\"water_basin_regions\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_runoff_regions\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_caustic_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_basin_regions\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_runoff_regions\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_regions\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_ripple_layers\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_layers\"") != std::string::npos);
+        CHECK(savedJson.find("\"field_surface_motion\"") != std::string::npos);
+        CHECK(savedJson.find("\"caustic_lace\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_flow_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_stream_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
-        CHECK(savedJson.find("\"preview_tint_mode\"") != std::string::npos);
+        CHECK(savedJson.find("\"preview_tint_mode\"") == std::string::npos);
         CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_stream_overlay\"") != std::string::npos);
         CHECK(savedJson.find("\"water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"settings_assignment\"") != std::string::npos);
@@ -1312,7 +1437,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"soft_density_spheres\"") != std::string::npos);
         CHECK(savedJson.find("\"raycast_samples_per_pixel\": 7") != std::string::npos);
         CHECK(savedJson.find("\"raycast_max_depth\": 123.5") != std::string::npos);
-        CHECK(savedJson.find("\"schema_version\": 23") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 24") != std::string::npos);
         CHECK(savedJson.find("\"id\": \"camera_entry\"") != std::string::npos);
         CHECK(savedJson.find("\"duration_frames\": 120") == std::string::npos);
     }
@@ -1413,16 +1538,33 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     REQUIRE(loadedDocument->waterPathCache->branches[0].rawAnchors.size() == 2U);
     CHECK(loadedDocument->waterPathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(2.5F));
     CHECK(loadedDocument->waterPathCache->hiddenBranchIds == std::vector<std::uint32_t>{99U});
-    REQUIRE(loadedDocument->waterBasinRegions.size() == 1U);
-    CHECK(loadedDocument->waterBasinRegions[0].name == "Carved basin");
-    CHECK(loadedDocument->waterBasinRegions[0].heightAbove == Catch::Approx(0.45F));
-    REQUIRE(loadedDocument->waterBasinRegions[0].outletEdgeIndex.has_value());
-    CHECK(loadedDocument->waterBasinRegions[0].outletEdgeIndex.value() == 1U);
-    CHECK_FALSE(loadedDocument->waterBasinRegions[0].outletBlocked);
-    REQUIRE(loadedDocument->waterRunoffRegions.size() == 1U);
-    CHECK(loadedDocument->waterRunoffRegions[0].mode == invisible_places::water::WaterRunoffMode::LightRain);
-    CHECK(loadedDocument->waterRunoffRegions[0].groundVoxelSize == Catch::Approx(0.55F));
-    CHECK(loadedDocument->waterRunoffRegions[0].highPointFraction == Catch::Approx(0.33F));
+    CHECK(loadedDocument->waterBasinRegions.empty());
+    CHECK(loadedDocument->waterRunoffRegions.empty());
+    CHECK(loadedDocument->waterCausticRegions.empty());
+    REQUIRE(loadedDocument->waterRippleLayers.size() == 1U);
+    CHECK(loadedDocument->waterRippleLayers[0].name == "Rock pool caustic lace");
+    CHECK(
+        loadedDocument->waterRippleLayers[0].rippleOverlayType ==
+        invisible_places::water::WaterRippleOverlayType::CausticLace);
+    CHECK(loadedDocument->waterRippleLayers[0].edgeBlendWidth == Catch::Approx(0.70F));
+    CHECK(loadedDocument->waterRippleLayers[0].wavelengthMeters == Catch::Approx(0.18F));
+    REQUIRE(loadedDocument->waterFieldLayers.size() == 2U);
+    CHECK(loadedDocument->waterFieldLayers[0].name == "Rock edge field");
+    CHECK(
+        loadedDocument->waterFieldLayers[0].featureType ==
+        invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion);
+    CHECK(loadedDocument->waterFieldLayers[0].edgeBlendWidth == Catch::Approx(0.24F));
+    CHECK(loadedDocument->waterFieldLayers[0].regionStrength == Catch::Approx(0.82F));
+    CHECK(loadedDocument->waterFieldLayers[0].directionY == Catch::Approx(1.0F));
+    CHECK(loadedDocument->waterFieldLayers[1].name == "No flow backside");
+    CHECK(
+        loadedDocument->waterFieldLayers[1].featureType ==
+        invisible_places::water::WaterEffectFeatureType::FieldNoFlowRegion);
+    CHECK(loadedDocument->waterFlowStreamSettings.streamCountTotal == 321U);
+    CHECK(loadedDocument->waterFlowStreamSettings.streamWidthMeters == Catch::Approx(0.014F));
+    CHECK(loadedDocument->waterFieldSettings.corridorRadiusMeters == Catch::Approx(0.42F));
+    CHECK(loadedDocument->waterFieldStreamSettings.streamlineCount == 654U);
+    CHECK(loadedDocument->waterFieldStreamSettings.streamlineWidthMeters == Catch::Approx(0.009F));
     CHECK(loadedDocument->waterCausticLookSettings.enabled);
     CHECK(loadedDocument->waterCausticLookSettings.intensity == Catch::Approx(1.25F));
     CHECK(loadedDocument->waterCausticLookSettings.scale == Catch::Approx(5.5F));
@@ -1435,17 +1577,6 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     REQUIRE(loadedDocument->tempWaterCausticLookSettings.has_value());
     CHECK(loadedDocument->tempWaterCausticLookSettings->warp == Catch::Approx(0.8F));
     CHECK(loadedDocument->tempWaterCausticLookSettings->warpAmplitudeMeters == Catch::Approx(0.055F));
-    REQUIRE(loadedDocument->waterCausticRegions.size() == 1U);
-    CHECK(loadedDocument->waterCausticRegions[0].name == "Rock pool caustics");
-    CHECK(loadedDocument->waterCausticRegions[0].targetLayerSourcePath ==
-          std::filesystem::path{"Data/Site2 -5mm.ply"});
-    CHECK(loadedDocument->waterCausticRegions[0].maskVoxelSize == Catch::Approx(0.50F));
-    CHECK(loadedDocument->waterCausticRegions[0].heightBand == Catch::Approx(0.30F));
-    CHECK(
-        loadedDocument->waterCausticRegions[0].previewTintMode ==
-        invisible_places::water::WaterCausticPreviewTintMode::Always);
-    CHECK_FALSE(loadedDocument->waterCausticRegions[0].maskDirty);
-    CHECK_FALSE(loadedDocument->waterCausticRegions[0].maskStale);
     CHECK(loadedDocument->cameraPathShotIndices == std::vector<std::size_t>{0, 0});
     CHECK(loadedDocument->cameraPathDurationFrames == 144);
     REQUIRE(loadedDocument->hasSavedAnimationRegistry);
@@ -1539,6 +1670,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->depthAlphaThreshold == Catch::Approx(0.42F));
     CHECK(!loadedLayer.pointStyle->solidCenters);
     CHECK(loadedLayer.pointStyle->flowAnimation);
+    CHECK(loadedLayer.pointStyle->waterStreamOverlay);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldSlot == 2);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldName == "Height");
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.inputMin == Catch::Approx(-2.0F));
@@ -1633,6 +1765,82 @@ TEST_CASE("Legacy water settings migrate into split water profiles", "[serializa
     std::filesystem::remove(outputPath);
 }
 
+TEST_CASE("Legacy water region records load as v2 ripples while basin and runoff are ignored", "[serialization][water][v2]") {
+    const auto inputPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_water_regions.json";
+    {
+        std::ofstream legacyProject{inputPath};
+        legacyProject << R"json({
+  "schema_version": 23,
+  "project_name": "Legacy water",
+  "water_basin_regions": [
+    {"id": 1, "name": "legacy basin", "vertices": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]}
+  ],
+  "water_runoff_regions": [
+    {"id": 2, "name": "legacy runoff", "vertices": [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]]}
+  ],
+  "water_caustic_look_settings": {
+    "enabled": true,
+    "intensity": 1.35,
+    "speed": 0.8,
+    "cell_size_meters": 0.22,
+    "line_width_meters": 0.011,
+    "feather_meters": 0.004,
+    "warp": 0.45,
+    "emission_boost": 1.75,
+    "opacity_boost": 0.18,
+    "point_size_boost": 0.09,
+    "tint": [0.55, 0.85, 1.2]
+  },
+  "water_caustic_regions": [
+    {
+      "id": 8,
+      "name": "legacy caustics",
+      "target_layer_source_path": "Data/Site2 -5mm.ply",
+      "vertices": [[0.0, 0.0, 0.2], [1.0, 0.0, 0.25], [0.0, 1.0, 0.15]],
+      "edge_blend_width": 0.66,
+      "enabled": true,
+      "preview_tint_mode": "always"
+    }
+  ]
+})json";
+    }
+
+    std::string errorMessage;
+    const auto loaded = invisible_places::serialization::LoadProjectDocument(inputPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->waterBasinRegions.empty());
+    CHECK(loaded->waterRunoffRegions.empty());
+    CHECK(loaded->waterCausticRegions.empty());
+    REQUIRE(loaded->waterRippleLayers.size() == 1U);
+    const auto& layer = loaded->waterRippleLayers.front();
+    CHECK(layer.id == 8U);
+    CHECK(layer.name == "legacy caustics");
+    CHECK(layer.featureType == invisible_places::water::WaterEffectFeatureType::Ripple);
+    CHECK(layer.rippleOverlayType == invisible_places::water::WaterRippleOverlayType::CausticLace);
+    CHECK(layer.targetLayerSourcePath == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(layer.edgeBlendWidth == Catch::Approx(0.66F));
+    CHECK(layer.wavelengthMeters == Catch::Approx(0.22F));
+    CHECK(layer.response.emissionAdd == Catch::Approx(1.75F));
+    CHECK(layer.response.opacityAdd == Catch::Approx(0.18F));
+    CHECK(layer.response.pointSizeAdd == Catch::Approx(0.09F));
+    CHECK(layer.response.colouriseBlue == Catch::Approx(1.2F));
+
+    const auto outputPath =
+        std::filesystem::temp_directory_path() / "invisible_places_migrated_water_regions.json";
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(loaded.value(), outputPath, &errorMessage));
+    std::ifstream savedProject{outputPath};
+    const std::string savedJson{
+        std::istreambuf_iterator<char>{savedProject},
+        std::istreambuf_iterator<char>{}};
+    CHECK(savedJson.find("\"water_ripple_layers\"") != std::string::npos);
+    CHECK(savedJson.find("\"water_basin_regions\"") == std::string::npos);
+    CHECK(savedJson.find("\"water_runoff_regions\"") == std::string::npos);
+    CHECK(savedJson.find("\"water_caustic_regions\"") == std::string::npos);
+    std::filesystem::remove(inputPath);
+    std::filesystem::remove(outputPath);
+}
+
 TEST_CASE("Project document defaults Fast Basic renderer mode for older projects", "[serialization][project]") {
     const auto outputPath =
         std::filesystem::temp_directory_path() / "invisible_places_project_legacy_renderer_defaults.json";
@@ -1719,6 +1927,9 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
         preset->style.geometryMode ==
         invisible_places::renderer::pointcloud::PointCloudGeometryMode::ScreenSprites);
     CHECK(
+        preset->style.screenSpriteSizeMode ==
+        invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode::Pixels);
+    CHECK(
         preset->style.depthContribution ==
         invisible_places::renderer::pointcloud::PointCloudDepthContribution::AlphaThreshold);
     CHECK(preset->style.pointSize.active);
@@ -1737,6 +1948,43 @@ TEST_CASE("Point cloud style parsing defaults missing surfel fields to sprite mo
     CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.005F));
 
     std::filesystem::remove(presetPath);
+}
+
+TEST_CASE("Point cloud style parses and round-trips world-sized screen sprites", "[serialization][point-style]") {
+    const auto presetPath =
+        std::filesystem::temp_directory_path() / "invisible_places_world_sized_screen_sprite.json";
+    std::ofstream output{presetPath, std::ios::trunc};
+    output << R"({
+  "schema_version": 2,
+  "preset_name": "World Sized Sprites",
+  "point_style": {
+    "geometry_mode": "screen_sprites",
+    "screen_sprite_size_mode": "world_millimeters",
+    "surfel_diameter": {"mode": "constant", "constant_value": [0.012, 0.0, 0.0, 0.0]}
+  }
+})";
+    output.close();
+
+    std::string errorMessage;
+    const auto preset = invisible_places::serialization::LoadPointCloudStylePreset(presetPath, &errorMessage);
+    REQUIRE(preset.has_value());
+    CHECK(
+        preset->style.screenSpriteSizeMode ==
+        invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode::WorldMillimeters);
+    CHECK(invisible_places::style::ScalarConstant(preset->style.surfelDiameter) == Catch::Approx(0.012F));
+
+    const auto roundTripPath =
+        std::filesystem::temp_directory_path() / "invisible_places_world_sized_screen_sprite_roundtrip.json";
+    REQUIRE(invisible_places::serialization::SavePointCloudStylePreset(*preset, roundTripPath, &errorMessage));
+    const auto roundTrip = invisible_places::serialization::LoadPointCloudStylePreset(roundTripPath, &errorMessage);
+    REQUIRE(roundTrip.has_value());
+    CHECK(
+        roundTrip->style.screenSpriteSizeMode ==
+        invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode::WorldMillimeters);
+    CHECK(invisible_places::style::ScalarConstant(roundTrip->style.surfelDiameter) == Catch::Approx(0.012F));
+
+    std::filesystem::remove(presetPath);
+    std::filesystem::remove(roundTripPath);
 }
 
 TEST_CASE("Point cloud style presets round-trip stylisation controls", "[serialization][point-style]") {
@@ -2359,6 +2607,697 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     CHECK(liveCloud.scalarFieldValues[liveCloud.ScalarFieldValueIndex(19, firstLaneIndex)] ==
           Catch::Approx(firstLanePoint->trailLateralOffset));
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]") {
+    invisible_places::water::WaterOverlay anchors;
+    for (std::uint32_t index = 0; index < 6U; ++index) {
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = {static_cast<float>(index) * 0.20F, 0.05F * static_cast<float>(index % 2U), 0.0F};
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = 10.0F;
+        point.emitterId = 5.0F;
+        point.pathDistance = static_cast<float>(index) * 0.20F;
+        point.width = 0.08F;
+        point.confidence = 0.75F;
+        point.accumulation = 0.5F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::water::WaterFlowStreamSettings streamSettings;
+    streamSettings.streamCountTotal = 8U;
+    streamSettings.streamLengthMeters = 0.36F;
+    streamSettings.streamPointSpacingMeters = 0.09F;
+    streamSettings.streamWidthMeters = 0.012F;
+    streamSettings.streamWorldLengthMeters = 0.050F;
+    streamSettings.laneSpreadMeters = 0.04F;
+    streamSettings.turbulence = 0.03F;
+    streamSettings.seed = 123U;
+    const auto flowA = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, streamSettings);
+    const auto flowB = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, streamSettings);
+    REQUIRE_FALSE(flowA.samples.empty());
+    REQUIRE(flowA.samples.size() == flowB.samples.size());
+    CHECK(flowA.samples.front().position.x == Catch::Approx(flowB.samples.front().position.x));
+    CHECK(flowA.samples.front().tangent.x == Catch::Approx(flowB.samples.front().tangent.x));
+    CHECK(flowA.samples.back().pointSeed == Catch::Approx(flowB.samples.back().pointSeed));
+
+    const auto cloud = invisible_places::water::BuildWaterStreamOverlayPointCloud(
+        flowA,
+        "Saved/water/test-WaterFlowStreams.generated",
+        "flow streams");
+    const std::vector<std::string> expectedFields{
+        "stream_id",
+        "source_id",
+        "path_id",
+        "branch_id",
+        "stream_seed",
+        "point_seed",
+        "stream_distance",
+        "stream_length",
+        "point_age",
+        "stream_age",
+        "stream_speed",
+        "stream_width",
+        "stream_world_length",
+        "stream_confidence",
+        "wetness",
+        "feature_type",
+        "tangent_x",
+        "tangent_y",
+        "tangent_z"};
+    REQUIRE(cloud.ScalarFieldCount() == expectedFields.size());
+    for (std::size_t index = 0; index < expectedFields.size(); ++index) {
+        CHECK(cloud.scalarFields[index].name == expectedFields[index]);
+    }
+    REQUIRE(cloud.PointCount() == flowA.samples.size());
+    const float firstStreamWidth = cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(11, 0)];
+    const float firstStreamWorldLength = cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(12, 0)];
+    CHECK(firstStreamWidth >= streamSettings.streamWidthMeters * 0.80F);
+    CHECK(firstStreamWidth <= streamSettings.streamWidthMeters * 1.22F);
+    CHECK(firstStreamWorldLength >= std::max(streamSettings.streamWorldLengthMeters, streamSettings.streamPointSpacingMeters * 2.5F));
+    CHECK(firstStreamWorldLength >= firstStreamWidth * 2.0F);
+
+    invisible_places::water::WaterFieldSettings fieldSettings;
+    fieldSettings.corridorRadiusMeters = 0.18F;
+    fieldSettings.fieldResolutionMeters = 0.05F;
+    fieldSettings.seed = 456U;
+    const auto fieldCacheA = invisible_places::water::BuildFieldCacheFromPathAnchors(anchors, fieldSettings);
+    const auto fieldCacheB = invisible_places::water::BuildFieldCacheFromPathAnchors(anchors, fieldSettings);
+    REQUIRE_FALSE(fieldCacheA.nodes.empty());
+    REQUIRE(fieldCacheA.nodes.size() == fieldCacheB.nodes.size());
+    CHECK(fieldCacheA.nodes.front().position.x == Catch::Approx(fieldCacheB.nodes.front().position.x));
+    CHECK(fieldCacheA.nodes.front().confidence == Catch::Approx(fieldCacheB.nodes.front().confidence));
+
+    invisible_places::water::WaterFieldStreamSettings fieldStreamSettings;
+    fieldStreamSettings.streamlineCount = 7U;
+    fieldStreamSettings.streamlineLengthMeters = 0.30F;
+    fieldStreamSettings.stepLengthMeters = 0.06F;
+    fieldStreamSettings.streamlineWidthMeters = 0.008F;
+    fieldStreamSettings.streamWorldLengthMeters = 0.042F;
+    const auto fieldStreamA = invisible_places::water::BuildFieldStreamOverlay(fieldCacheA, fieldStreamSettings);
+    const auto fieldStreamB = invisible_places::water::BuildFieldStreamOverlay(fieldCacheA, fieldStreamSettings);
+    REQUIRE_FALSE(fieldStreamA.samples.empty());
+    REQUIRE(fieldStreamA.samples.size() == fieldStreamB.samples.size());
+    CHECK(fieldStreamA.samples.front().position.x == Catch::Approx(fieldStreamB.samples.front().position.x));
+    CHECK(fieldStreamA.samples.front().featureType == Catch::Approx(3.0F));
+
+    invisible_places::water::WaterEffectLayer fieldLayer;
+    fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
+    fieldLayer.maxAffectedPoints = 128U;
+    const auto surfaceMotion = invisible_places::water::GenerateFieldSurfaceEffectOverlay(fieldCacheA, fieldLayer);
+    REQUIRE_FALSE(surfaceMotion.points.empty());
+    CHECK(surfaceMotion.points.front().featureType == Catch::Approx(2.0F));
+}
+
+TEST_CASE("Water ripple overlay types generate distinct procedural effect fields", "[water][v2][ripples]") {
+    const auto cloud = MakeRippleFixtureCloud();
+    const std::array<invisible_places::water::WaterRippleOverlayType, 11> overlayTypes{
+        invisible_places::water::WaterRippleOverlayType::CausticLace,
+        invisible_places::water::WaterRippleOverlayType::LinearRipples,
+        invisible_places::water::WaterRippleOverlayType::RadialRipples,
+        invisible_places::water::WaterRippleOverlayType::RainRings,
+        invisible_places::water::WaterRippleOverlayType::TideBands,
+        invisible_places::water::WaterRippleOverlayType::WetSheen,
+        invisible_places::water::WaterRippleOverlayType::CurrentThreads,
+        invisible_places::water::WaterRippleOverlayType::DropletGlints,
+        invisible_places::water::WaterRippleOverlayType::DripTrails,
+        invisible_places::water::WaterRippleOverlayType::FoamSparkle,
+        invisible_places::water::WaterRippleOverlayType::SaltMineralShimmer,
+    };
+
+    std::set<std::string> fingerprints;
+    for (std::size_t typeIndex = 0; typeIndex < overlayTypes.size(); ++typeIndex) {
+        const auto type = overlayTypes[typeIndex];
+        INFO("Ripple overlay type index: " << typeIndex);
+        const auto layer = MakeRippleTestLayer(type, static_cast<std::uint32_t>(typeIndex + 1U));
+        const auto overlay = invisible_places::water::GenerateRippleEffectOverlay(cloud, {layer});
+        REQUIRE_FALSE(overlay.points.empty());
+
+        float sum = 0.0F;
+        float weightedX = 0.0F;
+        float weightedY = 0.0F;
+        float maxValue = 0.0F;
+        for (const auto& point : overlay.points) {
+            sum += point.value;
+            weightedX += point.value * point.position.x;
+            weightedY += point.value * point.position.y;
+            maxValue = std::max(maxValue, point.value);
+        }
+        CHECK(maxValue > 0.001F);
+        CHECK(sum > 0.001F);
+
+        std::ostringstream signature;
+        signature << std::llround(sum * 10000.0F) << ":"
+                  << std::llround(weightedX * 10000.0F) << ":"
+                  << std::llround(weightedY * 10000.0F) << ":"
+                  << std::llround(maxValue * 10000.0F);
+        CHECK(fingerprints.insert(signature.str()).second);
+    }
+    CHECK(fingerprints.size() == overlayTypes.size());
+
+    const auto linear = invisible_places::water::GenerateRippleEffectOverlay(
+        cloud,
+        {MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::LinearRipples, 20U)});
+    const auto linearTop = RippleValueAt(linear, 0.25F, 0.25F);
+    const auto linearBottom = RippleValueAt(linear, 0.25F, 0.75F);
+    REQUIRE(linearTop.has_value());
+    REQUIRE(linearBottom.has_value());
+    CHECK(linearTop.value() == Catch::Approx(linearBottom.value()).margin(1.0e-5F));
+
+    const auto radial = invisible_places::water::GenerateRippleEffectOverlay(
+        cloud,
+        {MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::RadialRipples, 21U)});
+    const auto radialLeft = RippleValueAt(radial, 0.25F, 0.5F);
+    const auto radialRight = RippleValueAt(radial, 0.75F, 0.5F);
+    REQUIRE(radialLeft.has_value());
+    REQUIRE(radialRight.has_value());
+    CHECK(radialLeft.value() == Catch::Approx(radialRight.value()).margin(1.0e-5F));
+
+    const auto wetSheen = invisible_places::water::GenerateRippleEffectOverlay(
+        cloud,
+        {MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::WetSheen, 22U)});
+    const auto flatWetSheen = RippleValueAt(wetSheen, 0.25F, 0.5F);
+    const auto slopedWetSheen = RippleValueAt(wetSheen, 0.75F, 0.5F);
+    REQUIRE(flatWetSheen.has_value());
+    REQUIRE(slopedWetSheen.has_value());
+    CHECK(slopedWetSheen.value() > flatWetSheen.value());
+}
+
+TEST_CASE("Ripple and Field effects compose onto base cloud visual evaluation", "[water][v2][effects][output]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.normals = {{0.0F, 0.0F, 1.0F}};
+    cloud.packedColors = {0xFFFFFFFFU};
+    cloud.hasNormals = true;
+    cloud.hasSourceRgb = true;
+
+    auto addScalarField = [&](std::string_view name, std::vector<float> values) -> std::size_t {
+        REQUIRE(values.size() == cloud.positions.size());
+        invisible_places::io::ScalarFieldStats stats;
+        stats.name = std::string{name};
+        for (const float value : values) {
+            stats.Include(value);
+        }
+        const auto slot = cloud.scalarFields.size();
+        cloud.scalarFields.push_back(stats);
+        cloud.scalarFieldValues.insert(cloud.scalarFieldValues.end(), values.begin(), values.end());
+        return slot;
+    };
+
+    const auto heightSlot = addScalarField("Height", {1.0F});
+    const auto intensitySlot = addScalarField("Intensity", {0.40F});
+    cloud.scalarFields[heightSlot].minimum = 0.0F;
+    cloud.scalarFields[heightSlot].maximum = 1.0F;
+    cloud.scalarFields[intensitySlot].minimum = 0.0F;
+    cloud.scalarFields[intensitySlot].maximum = 1.0F;
+
+    invisible_places::water::WaterEffectPoint ripple;
+    ripple.sourcePointIndex = 0U;
+    ripple.featureType = 1.0F;
+    ripple.value = 1.0F;
+    ripple.emissionHint = 0.35F;
+    ripple.opacityHint = 0.20F;
+    ripple.opacityMultiplyHint = 1.25F;
+    ripple.sizeMultiplyHint = 1.0F;
+    ripple.colourMixHint = 0.60F;
+    ripple.red = 24U;
+    ripple.green = 90U;
+    ripple.blue = 255U;
+
+    invisible_places::water::WaterEffectPoint field = ripple;
+    field.featureType = 2.0F;
+    field.emissionHint = 0.25F;
+    field.opacityHint = 0.08F;
+    field.opacityMultiplyHint = 1.10F;
+    field.colourMixHint = 0.25F;
+    field.red = 40U;
+    field.green = 240U;
+    field.blue = 190U;
+
+    invisible_places::water::WaterEffectOverlay rippleOverlay;
+    rippleOverlay.points.push_back(ripple);
+    invisible_places::water::WaterEffectOverlay fieldOverlay;
+    fieldOverlay.points.push_back(field);
+    const auto composition = invisible_places::water::ComposeWaterEffectFields(
+        cloud,
+        {rippleOverlay, fieldOverlay});
+    REQUIRE(composition.affectedPointCount == 1U);
+    CHECK(composition.emissionAdd[0] == Catch::Approx(0.60F));
+    CHECK(composition.opacityAdd[0] == Catch::Approx(0.28F));
+    CHECK(composition.opacityMultiply[0] == Catch::Approx(1.375F));
+    CHECK(composition.colourMix[0] == Catch::Approx(0.85F));
+
+    const auto valueSlot = addScalarField("water_effect_value", composition.value);
+    const auto emissionSlot = addScalarField("water_effect_emission_add", composition.emissionAdd);
+    const auto opacityAddSlot = addScalarField("water_effect_opacity_add", composition.opacityAdd);
+    const auto opacityMultiplySlot = addScalarField("water_effect_opacity_multiply", composition.opacityMultiply);
+    const auto pointSizeAddSlot = addScalarField("water_effect_point_size_add", composition.pointSizeAdd);
+    const auto pointSizeMultiplySlot = addScalarField("water_effect_point_size_multiply", composition.pointSizeMultiply);
+    const auto colourRedSlot = addScalarField("water_effect_colour_red", composition.colourRed);
+    const auto colourGreenSlot = addScalarField("water_effect_colour_green", composition.colourGreen);
+    const auto colourBlueSlot = addScalarField("water_effect_colour_blue", composition.colourBlue);
+    const auto colourMixSlot = addScalarField("water_effect_colour_mix", composition.colourMix);
+    CHECK(valueSlot == 2U);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap;
+    style.colormap = invisible_places::renderer::pointcloud::PointCloudColormapId::CustomGradient;
+    style.gradientStartColor = {1.0F, 0.0F, 0.0F};
+    style.gradientEndColor = {1.0F, 0.0F, 0.0F};
+    style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    invisible_places::style::SetScalarConstant(&style.pointSize, 7.0F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &style.colormapPosition,
+        static_cast<std::int32_t>(heightSlot),
+        "Height",
+        0.0F,
+        1.0F,
+        &cloud.scalarFields[heightSlot]);
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &style.opacity,
+        static_cast<std::int32_t>(intensitySlot),
+        "Intensity",
+        0.0F,
+        1.0F,
+        &cloud.scalarFields[intensitySlot]);
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto render = [&](invisible_places::output::OfflinePointLayer layer) {
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 11, 11);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 11, 11},
+            &image);
+        return image;
+    };
+
+    const invisible_places::output::OfflinePointLayer baseLayer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+    const invisible_places::output::OfflinePointLayer effectLayer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+        .waterEffectEmissionAddFieldSlot = emissionSlot,
+        .waterEffectOpacityAddFieldSlot = opacityAddSlot,
+        .waterEffectOpacityMultiplyFieldSlot = opacityMultiplySlot,
+        .waterEffectPointSizeAddFieldSlot = pointSizeAddSlot,
+        .waterEffectPointSizeMultiplyFieldSlot = pointSizeMultiplySlot,
+        .waterEffectColourRedFieldSlot = colourRedSlot,
+        .waterEffectColourGreenFieldSlot = colourGreenSlot,
+        .waterEffectColourBlueFieldSlot = colourBlueSlot,
+        .waterEffectColourMixFieldSlot = colourMixSlot,
+    };
+
+    const auto baseImage = render(baseLayer);
+    const auto effectImage = render(effectLayer);
+    const auto center = static_cast<std::size_t>(5) * 11U + 5U;
+    REQUIRE(baseImage.alpha[center] > 0.0F);
+    REQUIRE(effectImage.alpha[center] > 0.0F);
+    CHECK(style.colormapPosition.fieldMap.fieldSlot == static_cast<std::int32_t>(heightSlot));
+    CHECK(style.opacity.fieldMap.fieldSlot == static_cast<std::int32_t>(intensitySlot));
+    CHECK(effectImage.alpha[center] > baseImage.alpha[center]);
+    CHECK(baseImage.beautyR[center] > baseImage.beautyB[center]);
+    CHECK(effectImage.beautyB[center] > effectImage.beautyR[center]);
+
+    const auto exportPath =
+        std::filesystem::temp_directory_path() / "invisible_places_water_effect_composition_export.exr";
+    std::error_code removeError;
+    std::filesystem::remove(exportPath, removeError);
+    std::string errorMessage;
+    REQUIRE(invisible_places::output::WriteExrImage(effectImage, exportPath, &errorMessage));
+    CHECK(std::filesystem::exists(exportPath));
+    CHECK(std::filesystem::file_size(exportPath) > 0U);
+    std::filesystem::remove(exportPath, removeError);
+
+    auto toHalfRgba = [](const invisible_places::output::ExrImage& image) {
+        invisible_places::output::HalfRgbaExrImage halfImage;
+        halfImage.width = image.width;
+        halfImage.height = image.height;
+        halfImage.rgbaHalf.resize(static_cast<std::size_t>(image.width) * image.height * 4U);
+        for (std::size_t pixel = 0; pixel < static_cast<std::size_t>(image.width) * image.height; ++pixel) {
+            halfImage.rgbaHalf[pixel * 4U + 0U] = Imath::half{std::clamp(image.beautyR[pixel], 0.0F, 1.0F)}.bits();
+            halfImage.rgbaHalf[pixel * 4U + 1U] = Imath::half{std::clamp(image.beautyG[pixel], 0.0F, 1.0F)}.bits();
+            halfImage.rgbaHalf[pixel * 4U + 2U] = Imath::half{std::clamp(image.beautyB[pixel], 0.0F, 1.0F)}.bits();
+            halfImage.rgbaHalf[pixel * 4U + 3U] = Imath::half{std::clamp(image.alpha[pixel], 0.0F, 1.0F)}.bits();
+        }
+        return halfImage;
+    };
+    const auto baseMp4Frame = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(toHalfRgba(baseImage));
+    const auto effectMp4Frame = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(toHalfRgba(effectImage));
+    REQUIRE(baseMp4Frame.size() == effectMp4Frame.size());
+    const auto centerByte = center * 4U;
+    CHECK(effectMp4Frame[centerByte + 3U] >= baseMp4Frame[centerByte + 3U]);
+    CHECK(baseMp4Frame[centerByte + 0U] > baseMp4Frame[centerByte + 2U]);
+    CHECK(effectMp4Frame[centerByte + 2U] > effectMp4Frame[centerByte + 0U]);
+}
+
+TEST_CASE("Ripple effect generation preserves concave clicked region boundaries", "[water][v2][ripples]") {
+    const auto cloud = MakeRippleFixtureCloud();
+    auto layer = MakeRippleTestLayer(
+        invisible_places::water::WaterRippleOverlayType::LinearRipples,
+        41U);
+    layer.vertices = {
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        {1.0F, 0.25F, 0.0F},
+        {0.25F, 0.25F, 0.0F},
+        {0.25F, 0.75F, 0.0F},
+        {1.0F, 0.75F, 0.0F},
+        {1.0F, 1.0F, 0.0F},
+        {0.0F, 1.0F, 0.0F},
+    };
+    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+
+    const auto overlay = invisible_places::water::GenerateRippleEffectOverlay(cloud, {layer});
+    REQUIRE_FALSE(overlay.points.empty());
+
+    const auto leftBarPoint = RippleValueAt(overlay, 0.125F, 0.5F);
+    const auto bottomArmPoint = RippleValueAt(overlay, 0.75F, 0.125F);
+    const auto cutOutPoint = RippleValueAt(overlay, 0.75F, 0.5F);
+
+    CHECK(leftBarPoint.has_value());
+    CHECK(bottomArmPoint.has_value());
+    CHECK_FALSE(cutOutPoint.has_value());
+}
+
+TEST_CASE("Field cache builds from concave selected regions", "[water][v2][field]") {
+    const auto cloud = MakeRippleFixtureCloud();
+    auto layer = MakeRippleTestLayer(
+        invisible_places::water::WaterRippleOverlayType::LinearRipples,
+        51U);
+    layer.name = "field c region";
+    layer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
+    layer.vertices = {
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        {1.0F, 0.25F, 0.0F},
+        {0.25F, 0.25F, 0.0F},
+        {0.25F, 0.75F, 0.0F},
+        {1.0F, 0.75F, 0.0F},
+        {1.0F, 1.0F, 0.0F},
+        {0.0F, 1.0F, 0.0F},
+    };
+    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+    layer.edgeBlendWidth = 0.05F;
+    layer.maxAffectedPoints = 4096U;
+    layer.blendMode = invisible_places::water::WaterEffectBlendMode::Screen;
+    layer.response.intensity = 1.0F;
+    layer.response.emissionAdd = 0.33F;
+    layer.response.opacityAdd = 0.21F;
+    layer.response.opacityMultiply = 0.62F;
+    layer.response.pointSizeAdd = 0.07F;
+    layer.response.pointSizeMultiply = 1.80F;
+    layer.response.colouriseRed = 0.18F;
+    layer.response.colouriseGreen = 0.72F;
+    layer.response.colouriseBlue = 0.94F;
+    layer.response.colouriseAmount = 0.44F;
+    layer.speed = 1.23F;
+    layer.directionX = 1.0F;
+    layer.directionY = 0.0F;
+    layer.directionZ = 0.0F;
+    auto noFlowLayer = layer;
+    noFlowLayer.id = 52U;
+    noFlowLayer.name = "field no-flow pocket";
+    noFlowLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldNoFlowRegion;
+    noFlowLayer.vertices = {
+        {0.00F, 0.375F, 0.0F},
+        {0.25F, 0.375F, 0.0F},
+        {0.25F, 0.625F, 0.0F},
+        {0.00F, 0.625F, 0.0F},
+    };
+    noFlowLayer.hull = invisible_places::water::BuildWaterRegionHull(noFlowLayer.vertices);
+
+    invisible_places::water::WaterFieldSettings settings;
+    settings.fieldResolutionMeters = 0.0625F;
+    settings.guideWeight = 1.0F;
+    settings.downhillWeight = 0.0F;
+    settings.turbulence = 0.0F;
+    const auto cache = invisible_places::water::BuildFieldCacheFromRegions(cloud, {layer, noFlowLayer}, settings);
+    REQUIRE_FALSE(cache.nodes.empty());
+    REQUIRE(cache.regionBoundary.size() == layer.vertices.size());
+
+    auto hasNodeAt = [&cache](float x, float y) {
+        return std::any_of(
+            cache.nodes.begin(),
+            cache.nodes.end(),
+            [x, y](const invisible_places::water::WaterFieldNode& node) {
+                return std::abs(node.position.x - x) <= 1.0e-5F &&
+                       std::abs(node.position.y - y) <= 1.0e-5F;
+            });
+    };
+    CHECK(hasNodeAt(0.125F, 0.5F));
+    CHECK(hasNodeAt(0.75F, 0.125F));
+    CHECK_FALSE(hasNodeAt(0.75F, 0.5F));
+    const auto noFlowNode = std::find_if(
+        cache.nodes.begin(),
+        cache.nodes.end(),
+        [](const invisible_places::water::WaterFieldNode& node) {
+            return std::abs(node.position.x - 0.125F) <= 1.0e-5F &&
+                   std::abs(node.position.y - 0.5F) <= 1.0e-5F;
+        });
+    REQUIRE(noFlowNode != cache.nodes.end());
+    CHECK(noFlowNode->flowBlocked);
+
+    invisible_places::water::WaterFieldStreamSettings streamSettings;
+    streamSettings.streamlineCount = 24U;
+    streamSettings.streamlineLengthMeters = 0.20F;
+    streamSettings.stepLengthMeters = 0.04F;
+    streamSettings.streamlineWidthMeters = 0.008F;
+    streamSettings.streamWorldLengthMeters = 0.040F;
+    const auto streamOverlay = invisible_places::water::BuildFieldStreamOverlay(cache, streamSettings);
+    REQUIRE_FALSE(streamOverlay.samples.empty());
+    for (const auto& sample : streamOverlay.samples) {
+        const bool inCutOut = sample.position.x > 0.25F &&
+                              sample.position.y > 0.25F &&
+                              sample.position.y < 0.75F;
+        CHECK_FALSE(inCutOut);
+    }
+
+    const auto surfaceMotion = invisible_places::water::GenerateFieldSurfaceEffectOverlay(cache, layer);
+    REQUIRE_FALSE(surfaceMotion.points.empty());
+    const auto strongestPoint = std::max_element(
+        surfaceMotion.points.begin(),
+        surfaceMotion.points.end(),
+        [](const invisible_places::water::WaterEffectPoint& left,
+           const invisible_places::water::WaterEffectPoint& right) {
+            return left.value < right.value;
+        });
+    REQUIRE(strongestPoint != surfaceMotion.points.end());
+    CHECK(strongestPoint->blendMode == invisible_places::water::WaterEffectBlendMode::Screen);
+    CHECK(strongestPoint->emissionHint == Catch::Approx(strongestPoint->value * 0.33F));
+    CHECK(strongestPoint->opacityHint == Catch::Approx(strongestPoint->value * 0.21F));
+    CHECK(strongestPoint->sizeHint == Catch::Approx(strongestPoint->value * 0.07F));
+    CHECK(strongestPoint->colourMixHint == Catch::Approx(strongestPoint->value * 0.44F));
+    CHECK(strongestPoint->speed == Catch::Approx(1.23F));
+    CHECK(static_cast<float>(strongestPoint->red) / 255.0F == Catch::Approx(0.18F).margin(1.0F / 255.0F));
+    CHECK(static_cast<float>(strongestPoint->green) / 255.0F == Catch::Approx(0.72F).margin(1.0F / 255.0F));
+    CHECK(static_cast<float>(strongestPoint->blue) / 255.0F == Catch::Approx(0.94F).margin(1.0F / 255.0F));
+    for (const auto& point : surfaceMotion.points) {
+        const bool inCutOut = point.position.x > 0.25F &&
+                              point.position.y > 0.25F &&
+                              point.position.y < 0.75F;
+        CHECK_FALSE(inCutOut);
+        const bool inNoFlowPocket = std::abs(point.position.x - 0.125F) <= 1.0e-5F &&
+                                    std::abs(point.position.y - 0.5F) <= 1.0e-5F;
+        CHECK_FALSE(inNoFlowPocket);
+    }
+}
+
+TEST_CASE("Field streamlines split rejected gaps and fade low-confidence support", "[water][v2][field]") {
+    invisible_places::water::WaterFieldCache cache;
+    cache.settings.enabled = true;
+    cache.settings.fieldResolutionMeters = 0.05F;
+    cache.settings.maxBridgeDistanceMeters = 0.12F;
+    cache.settings.bridgeAggression = 0.0F;
+    cache.settings.surfaceConfidenceThreshold = 0.50F;
+
+    auto makeNode = [](float x, float confidence) {
+        invisible_places::water::WaterFieldNode node;
+        node.position = {x, 0.0F, 0.0F};
+        node.normal = {0.0F, 0.0F, 1.0F};
+        node.vector = {1.0F, 0.0F, 0.0F};
+        node.wetness = 1.0F;
+        node.confidence = confidence;
+        node.surfaceConfidence = confidence;
+        node.pathStation = x;
+        return node;
+    };
+    cache.nodes = {
+        makeNode(0.00F, 1.0F),
+        makeNode(0.10F, 1.0F),
+        makeNode(1.00F, 0.25F),
+        makeNode(1.05F, 0.25F),
+    };
+
+    invisible_places::water::WaterFieldStreamSettings streamSettings;
+    streamSettings.streamlineCount = 8U;
+    streamSettings.streamlineLengthMeters = 0.05F;
+    streamSettings.stepLengthMeters = 0.025F;
+    streamSettings.streamlineWidthMeters = 0.006F;
+    streamSettings.streamWorldLengthMeters = 0.030F;
+    streamSettings.fadeOnLowConfidence = true;
+
+    const auto streamOverlay = invisible_places::water::BuildFieldStreamOverlay(cache, streamSettings);
+    REQUIRE_FALSE(streamOverlay.samples.empty());
+
+    bool highConfidenceSeen = false;
+    bool fadedConfidenceSeen = false;
+    for (const auto& sample : streamOverlay.samples) {
+        const bool inRejectedGap = sample.position.x > 0.20F && sample.position.x < 0.80F;
+        CHECK_FALSE(inRejectedGap);
+        if (sample.position.x < 0.20F) {
+            highConfidenceSeen = highConfidenceSeen || sample.streamConfidence > 0.70F;
+        }
+        if (sample.position.x > 0.80F) {
+            fadedConfidenceSeen = fadedConfidenceSeen || sample.streamConfidence < 0.35F;
+        }
+    }
+    CHECK(highConfidenceSeen);
+    CHECK(fadedConfidenceSeen);
+    CHECK(streamOverlay.fieldDiagnostics.inputNodeCount == 4U);
+    CHECK(streamOverlay.fieldDiagnostics.emittedPathCount == 2U);
+    CHECK(streamOverlay.fieldDiagnostics.emittedSampleCount == streamOverlay.samples.size());
+    CHECK(streamOverlay.fieldDiagnostics.acceptedBridgeCount >= 1U);
+    CHECK(streamOverlay.fieldDiagnostics.rejectedGapCount == 1U);
+    CHECK(streamOverlay.fieldDiagnostics.lowConfidenceFadeCount >= 2U);
+    CHECK(streamOverlay.fieldDiagnostics.lowConfidenceTerminationCount == 0U);
+    CHECK(streamOverlay.fieldDiagnostics.maxAcceptedBridgeMeters >= 0.09F);
+    CHECK(streamOverlay.fieldDiagnostics.minRejectedGapMeters >= 0.80F);
+
+    auto allowedBridgeCache = cache;
+    allowedBridgeCache.nodes = {
+        makeNode(0.00F, 1.0F),
+        makeNode(0.10F, 1.0F),
+        makeNode(0.30F, 1.0F),
+        makeNode(0.35F, 1.0F),
+    };
+    allowedBridgeCache.nodes[1].bridgeAllowed = true;
+    allowedBridgeCache.nodes[2].bridgeAllowed = true;
+    const auto allowedOverlay = invisible_places::water::BuildFieldStreamOverlay(allowedBridgeCache, streamSettings);
+    CHECK(allowedOverlay.fieldDiagnostics.rejectedGapCount == 0U);
+    CHECK(allowedOverlay.fieldDiagnostics.manualBridgeAllowedCount == 1U);
+    CHECK(allowedOverlay.fieldDiagnostics.acceptedBridgeCount >= 1U);
+
+    auto blockedBridgeCache = cache;
+    blockedBridgeCache.nodes = {
+        makeNode(0.00F, 1.0F),
+        makeNode(0.05F, 1.0F),
+        makeNode(0.10F, 1.0F),
+    };
+    blockedBridgeCache.nodes[1].bridgeBlocked = true;
+    const auto blockedOverlay = invisible_places::water::BuildFieldStreamOverlay(blockedBridgeCache, streamSettings);
+    CHECK(blockedOverlay.fieldDiagnostics.manualBridgeBlockedCount >= 1U);
+    CHECK(blockedOverlay.fieldDiagnostics.rejectedGapCount >= 1U);
+
+    auto noFlowCache = cache;
+    noFlowCache.nodes = {
+        makeNode(0.00F, 1.0F),
+        makeNode(0.05F, 1.0F),
+        makeNode(0.10F, 1.0F),
+    };
+    noFlowCache.nodes[0].flowBlocked = true;
+    const auto noFlowOverlay = invisible_places::water::BuildFieldStreamOverlay(noFlowCache, streamSettings);
+    CHECK(noFlowOverlay.fieldDiagnostics.manualNoFlowBlockCount == 1U);
+    REQUIRE_FALSE(noFlowOverlay.samples.empty());
+    for (const auto& sample : noFlowOverlay.samples) {
+        CHECK(sample.position.x >= 0.04F);
+    }
+}
+
+TEST_CASE("Offline ripple effect overlays render from virtual effect fields", "[output][offline][water][v2][ripples]") {
+    const auto sourceCloud = MakeRippleFixtureCloud();
+    const auto overlay = invisible_places::water::GenerateRippleEffectOverlay(
+        sourceCloud,
+        {MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CausticLace, 31U)});
+    REQUIRE_FALSE(overlay.points.empty());
+
+    const auto cloud = invisible_places::water::BuildWaterEffectOverlayPointCloud(
+        overlay,
+        "Saved/water/test-Ripples.generated",
+        "ripples");
+    REQUIRE(cloud.ScalarFieldCount() >= 14U);
+    CHECK(cloud.scalarFields[0].name == "ripple_mask");
+    CHECK(cloud.scalarFields[2].name == "ripple_value");
+    CHECK(cloud.scalarFields[10].name == "ripple_emission_hint");
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.geometryMode =
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+    style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
+    style.depthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution::None;
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.040F);
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &style.opacity,
+        2,
+        "ripple_value",
+        0.0F,
+        0.65F,
+        &cloud.scalarFields[2]);
+    invisible_places::style::SetFieldMapFlag(
+        &style.opacity.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    invisible_places::style::ConfigureFieldMapFromStats(
+        &style.emissiveStrength,
+        10,
+        "ripple_emission_hint",
+        0.0F,
+        0.45F,
+        &cloud.scalarFields[10]);
+    invisible_places::style::SetFieldMapFlag(
+        &style.emissiveStrength.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.5F, -3.0F, 1.2F};
+    cameraState.target = {0.5F, 0.5F, 0.0F};
+    cameraState.fovDegrees = 45.0F;
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 128, 128);
+    invisible_places::output::RenderPointCloudTile(
+        {layer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 128, 128},
+        &image);
+
+    float alphaSum = 0.0F;
+    float beautySum = 0.0F;
+    for (std::size_t index = 0; index < image.alpha.size(); ++index) {
+        alphaSum += image.alpha[index];
+        beautySum += image.beautyR[index] + image.beautyG[index] + image.beautyB[index];
+    }
+    CHECK(alphaSum > 0.0F);
+    CHECK(beautySum > 0.0F);
 }
 
 TEST_CASE("Water trail looseness simplifies flat knotted lane guides", "[water]") {
@@ -3686,6 +4625,32 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     causticRegion.previewTintMode = invisible_places::water::WaterCausticPreviewTintMode::Off;
     invisible_places::water::RefreshWaterCausticRegionDerivedValues(&causticRegion);
     document.causticRegions.push_back(causticRegion);
+    invisible_places::water::WaterEffectLayer rippleLayer;
+    rippleLayer.id = 9;
+    rippleLayer.name = "sandstone caustic lace";
+    rippleLayer.featureType = invisible_places::water::WaterEffectFeatureType::Ripple;
+    rippleLayer.rippleOverlayType = invisible_places::water::WaterRippleOverlayType::CausticLace;
+    rippleLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    rippleLayer.vertices = causticRegion.vertices;
+    rippleLayer.hull = invisible_places::water::BuildWaterRegionHull(rippleLayer.vertices);
+    rippleLayer.edgeBlendWidth = 0.44F;
+    rippleLayer.wavelengthMeters = 0.16F;
+    document.rippleLayers.push_back(rippleLayer);
+    invisible_places::water::WaterEffectLayer fieldLayer;
+    fieldLayer.id = 10;
+    fieldLayer.name = "sandstone field";
+    fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
+    fieldLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    fieldLayer.vertices = causticRegion.vertices;
+    fieldLayer.hull = invisible_places::water::BuildWaterRegionHull(fieldLayer.vertices);
+    fieldLayer.edgeBlendWidth = 0.33F;
+    fieldLayer.regionStrength = 0.77F;
+    document.fieldLayers.push_back(fieldLayer);
+    document.flowStreamSettings.streamCountTotal = 222U;
+    document.flowStreamSettings.streamWorldLengthMeters = 0.052F;
+    document.fieldSettings.corridorRadiusMeters = 0.38F;
+    document.fieldStreamSettings.streamlineCount = 333U;
+    document.fieldStreamSettings.streamlineLengthMeters = 0.94F;
 
     const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_water_sources.json";
     std::string errorMessage;
@@ -3707,13 +4672,19 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         CHECK(savedJson.find("\"normal_turbulence_response\"") != std::string::npos);
         CHECK(savedJson.find("\"settings_assignment\"") != std::string::npos);
         CHECK(savedJson.find("\"linked_settings_emitter_id\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_basin_regions\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_runoff_regions\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_caustic_regions\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_basin_regions\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_runoff_regions\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_caustic_regions\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_ripple_layers\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_layers\"") != std::string::npos);
+        CHECK(savedJson.find("\"field_surface_motion\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_flow_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_stream_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
-        CHECK(savedJson.find("\"preview_tint_mode\"") != std::string::npos);
+        CHECK(savedJson.find("\"preview_tint_mode\"") == std::string::npos);
         CHECK(savedJson.find("\"water_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"water_bake_settings\"") == std::string::npos);
@@ -3762,12 +4733,25 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         loaded->emitters[2].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::Default);
     CHECK_FALSE(loaded->emitters[2].sourceSettings.has_value());
-    REQUIRE(loaded->basinRegions.size() == 1U);
-    REQUIRE(loaded->basinRegions[0].outletEdgeIndex.has_value());
-    CHECK_FALSE(loaded->basinRegions[0].outletBlocked);
-    REQUIRE(loaded->runoffRegions.size() == 1U);
-    CHECK(loaded->runoffRegions[0].mode == invisible_places::water::WaterRunoffMode::LightRain);
-    CHECK(loaded->runoffRegions[0].density == Catch::Approx(1.6F));
+    CHECK(loaded->basinRegions.empty());
+    CHECK(loaded->runoffRegions.empty());
+    CHECK(loaded->causticRegions.empty());
+    REQUIRE(loaded->rippleLayers.size() == 1U);
+    CHECK(loaded->rippleLayers[0].name == "sandstone caustic lace");
+    CHECK(loaded->rippleLayers[0].edgeBlendWidth == Catch::Approx(0.44F));
+    CHECK(loaded->rippleLayers[0].wavelengthMeters == Catch::Approx(0.16F));
+    REQUIRE(loaded->fieldLayers.size() == 1U);
+    CHECK(loaded->fieldLayers[0].name == "sandstone field");
+    CHECK(
+        loaded->fieldLayers[0].featureType ==
+        invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion);
+    CHECK(loaded->fieldLayers[0].edgeBlendWidth == Catch::Approx(0.33F));
+    CHECK(loaded->fieldLayers[0].regionStrength == Catch::Approx(0.77F));
+    CHECK(loaded->flowStreamSettings.streamCountTotal == 222U);
+    CHECK(loaded->flowStreamSettings.streamWorldLengthMeters == Catch::Approx(0.052F));
+    CHECK(loaded->fieldSettings.corridorRadiusMeters == Catch::Approx(0.38F));
+    CHECK(loaded->fieldStreamSettings.streamlineCount == 333U);
+    CHECK(loaded->fieldStreamSettings.streamlineLengthMeters == Catch::Approx(0.94F));
     CHECK(loaded->causticLookSettings.enabled);
     CHECK(loaded->causticLookSettings.intensity == Catch::Approx(1.4F));
     CHECK(loaded->causticLookSettings.opacityBoost == Catch::Approx(0.22F));
@@ -3787,14 +4771,6 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->pathCache->branches[0].id == 77U);
     REQUIRE(loaded->pathCache->branches[0].rawAnchors.size() == 2U);
     CHECK(loaded->pathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(1.75F));
-    REQUIRE(loaded->causticRegions.size() == 1U);
-    CHECK(loaded->causticRegions[0].name == "sandstone caustics");
-    CHECK(loaded->causticRegions[0].targetLayerSourcePath == std::filesystem::path{"Data/Site2 -5mm.ply"});
-    CHECK(loaded->causticRegions[0].planeMaxResidual == Catch::Approx(0.12F));
-    CHECK(loaded->causticRegions[0].planeMaxSlope == Catch::Approx(0.65F));
-    CHECK(
-        loaded->causticRegions[0].previewTintMode ==
-        invisible_places::water::WaterCausticPreviewTintMode::Off);
     const auto& linkedSettings = invisible_places::water::ResolveWaterSourceSettings(
         loaded->emitters[1],
         loaded->emitters,
@@ -5896,6 +6872,67 @@ TEST_CASE("Offline world surfels use world diameter instead of pixel point size"
     }
 }
 
+TEST_CASE("Offline screen sprites can use world millimeter size by camera depth", "[output][offline][point-style]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {
+        {-1.2F, -1.0F, 0.0F},
+        {1.2F, 3.0F, 0.0F},
+    };
+    cloud.packedColors = {0xFFFFFFFFU, 0xFFFFFFFFU};
+    cloud.hasSourceRgb = true;
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.fovDegrees = 45.0F;
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.geometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode::ScreenSprites;
+    style.screenSpriteSizeMode =
+        invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode::WorldMillimeters;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.5F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = true,
+        .localToWorld = glm::mat4{1.0F},
+    };
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 96, 96);
+    invisible_places::output::RenderPointCloudTile(
+        {layer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 96, 96},
+        &image);
+
+    std::size_t nearCoveredPixels = 0;
+    std::size_t farCoveredPixels = 0;
+    for (std::uint32_t y = 0; y < image.height; ++y) {
+        for (std::uint32_t x = 0; x < image.width; ++x) {
+            const auto index = static_cast<std::size_t>(y) * image.width + x;
+            if (image.alpha[index] <= 0.0F) {
+                continue;
+            }
+            if (x < image.width / 2U) {
+                ++nearCoveredPixels;
+            } else {
+                ++farCoveredPixels;
+            }
+        }
+    }
+
+    CHECK(nearCoveredPixels > 0);
+    CHECK(farCoveredPixels > 0);
+    CHECK(nearCoveredPixels > farCoveredPixels * 2U);
+}
+
 TEST_CASE("Offline point renderer stacks opacity emission xray and falloff", "[output][offline][point-style]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {
@@ -6298,6 +7335,213 @@ TEST_CASE("Offline water streaks follow projected flow tangent", "[output][offli
     CHECK(height > width * 3U);
 }
 
+TEST_CASE("Offline water stream overlays use stream tangent and world length", "[output][offline][water][v2]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.hasSourceRgb = false;
+    cloud.bounds.Expand(cloud.positions.front());
+
+    const std::vector<std::string> streamFields{
+        "stream_id",
+        "source_id",
+        "path_id",
+        "branch_id",
+        "stream_seed",
+        "point_seed",
+        "stream_distance",
+        "stream_length",
+        "point_age",
+        "stream_age",
+        "stream_speed",
+        "stream_width",
+        "stream_world_length",
+        "stream_confidence",
+        "wetness",
+        "feature_type",
+        "tangent_x",
+        "tangent_y",
+        "tangent_z"};
+    cloud.scalarFields.reserve(streamFields.size());
+    for (const auto& name : streamFields) {
+        cloud.scalarFields.push_back({
+            .name = name,
+            .minimum = 0.0F,
+            .maximum = 1.0F,
+            .count = cloud.positions.size(),
+            .valid = true,
+        });
+    }
+    cloud.scalarFieldValues.assign(streamFields.size() * cloud.positions.size(), 0.0F);
+    auto setField = [&cloud](std::size_t fieldSlot, float value) {
+        cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, 0)] = value;
+    };
+    setField(8U, 0.0F);
+    setField(11U, 0.080F);
+    setField(12U, 1.20F);
+    setField(13U, 1.0F);
+    setField(14U, 1.0F);
+    setField(16U, 1.0F);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.geometryMode =
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+    style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
+    style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    style.flowAnimation = true;
+    style.waterStreamOverlay = true;
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.01F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = false,
+        .localToWorld = glm::mat4{1.0F},
+    };
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.fovDegrees = 45.0F;
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 128, 128);
+    invisible_places::output::RenderPointCloudTile(
+        {layer},
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0, 0, 128, 128},
+        &image);
+
+    std::uint32_t minX = image.width;
+    std::uint32_t maxX = 0;
+    std::uint32_t minY = image.height;
+    std::uint32_t maxY = 0;
+    for (std::uint32_t y = 0; y < image.height; ++y) {
+        for (std::uint32_t x = 0; x < image.width; ++x) {
+            const auto index = static_cast<std::size_t>(y) * image.width + x;
+            if (image.alpha[index] <= 0.01F) {
+                continue;
+            }
+            minX = std::min(minX, x);
+            maxX = std::max(maxX, x);
+            minY = std::min(minY, y);
+            maxY = std::max(maxY, y);
+        }
+    }
+
+    REQUIRE(minX <= maxX);
+    REQUIRE(minY <= maxY);
+    const auto width = maxX - minX + 1U;
+    const auto height = maxY - minY + 1U;
+    CHECK(width > height * 3U);
+}
+
+TEST_CASE("Offline water stream overlays animate through time playback", "[output][offline][water][v2]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.positions = {{0.0F, 0.0F, 0.0F}};
+    cloud.hasSourceRgb = false;
+    cloud.bounds.Expand(cloud.positions.front());
+
+    const std::vector<std::string> streamFields{
+        "stream_id",
+        "source_id",
+        "path_id",
+        "branch_id",
+        "stream_seed",
+        "point_seed",
+        "stream_distance",
+        "stream_length",
+        "point_age",
+        "stream_age",
+        "stream_speed",
+        "stream_width",
+        "stream_world_length",
+        "stream_confidence",
+        "wetness",
+        "feature_type",
+        "tangent_x",
+        "tangent_y",
+        "tangent_z"};
+    cloud.scalarFields.reserve(streamFields.size());
+    for (const auto& name : streamFields) {
+        cloud.scalarFields.push_back({
+            .name = name,
+            .minimum = 0.0F,
+            .maximum = 1.0F,
+            .count = cloud.positions.size(),
+            .valid = true,
+        });
+    }
+    cloud.scalarFieldValues.assign(streamFields.size() * cloud.positions.size(), 0.0F);
+    auto setField = [&cloud](std::size_t fieldSlot, float value) {
+        cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, 0)] = value;
+    };
+    setField(5U, 0.0F);
+    setField(8U, 0.0F);
+    setField(10U, 6.0F);
+    setField(11U, 0.10F);
+    setField(12U, 1.10F);
+    setField(13U, 1.0F);
+    setField(14U, 1.0F);
+    setField(16U, 1.0F);
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.geometryMode =
+        invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites;
+    style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+    style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
+    style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    style.flowAnimation = true;
+    style.waterStreamOverlay = true;
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.01F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+
+    const invisible_places::output::OfflinePointLayer layer{
+        .cloud = &cloud,
+        .style = style,
+        .hasSourceRgb = false,
+        .localToWorld = glm::mat4{1.0F},
+    };
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, -5.0F, 0.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.fovDegrees = 45.0F;
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+    WriteLookAtOrientation(&cameraState);
+
+    auto renderAlphaSum = [&](float timeSeconds) {
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 128, 128);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, 128, 128},
+            &image,
+            nullptr,
+            nullptr,
+            timeSeconds);
+        return std::accumulate(image.alpha.begin(), image.alpha.end(), 0.0F);
+    };
+
+    const float frameAAlpha = renderAlphaSum(0.0F);
+    const float frameBAlpha = renderAlphaSum(0.5F);
+    CHECK(frameAAlpha > 0.0F);
+    CHECK(frameBAlpha > 0.0F);
+    CHECK(std::abs(frameAAlpha - frameBAlpha) > 0.01F);
+}
+
 TEST_CASE("Offline point diagnostics skip depth pass for non-depth layers", "[output][offline][point-style]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {{0.0F, 0.0F, 0.0F}};
@@ -6498,6 +7742,7 @@ TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][
     using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
     using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
     using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+    using invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
     using invisible_places::renderer::pointcloud::PointCloudStyleState;
     using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
     using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
@@ -6506,6 +7751,7 @@ TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][
     const PointCloudStyleState style;
 
     CHECK(style.geometryMode == PointCloudGeometryMode::ScreenSprites);
+    CHECK(style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::Pixels);
     CHECK(style.falloffProfile == PointCloudFalloffProfile::HardDisc);
     CHECK(style.stylisationMode == PointCloudStylisationMode::Off);
     CHECK(ScalarConstant(style.pointSize) == Catch::Approx(1.0F));
@@ -6521,12 +7767,25 @@ TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][
     CHECK(ResolvePointCloudMaterialVariant(movingStyle) == PointCloudMaterialVariant::Unified);
 }
 
+TEST_CASE("World sprite diameter projects to depth-adaptive point pixels", "[pointcloud][style]") {
+    using invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels;
+
+    const float nearPixels = WorldDiameterToScreenPointSizePixels(0.01F, 1.0F, 2.0F, 1000.0F);
+    const float farPixels = WorldDiameterToScreenPointSizePixels(0.01F, 10.0F, 2.0F, 1000.0F);
+    CHECK(nearPixels == Catch::Approx(10.0F));
+    CHECK(farPixels == Catch::Approx(1.0F));
+    CHECK(nearPixels > farPixels);
+    CHECK(WorldDiameterToScreenPointSizePixels(0.01F, 1.0F, -2.0F, 1000.0F) == Catch::Approx(nearPixels));
+    CHECK(WorldDiameterToScreenPointSizePixels(-0.01F, 1.0F, 2.0F, 1000.0F) == Catch::Approx(0.0F));
+}
+
 TEST_CASE("Fast Basic point-cloud style override keeps cheap colour controls", "[pointcloud][style]") {
     using invisible_places::renderer::pointcloud::MakeFastBasicPointCloudStyle;
     using invisible_places::renderer::pointcloud::PointCloudColorMode;
     using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
     using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
     using invisible_places::renderer::pointcloud::PointCloudMaterialVariant;
+    using invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
     using invisible_places::renderer::pointcloud::PointCloudStyleState;
     using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
     using invisible_places::renderer::pointcloud::ResolvePointCloudMaterialVariant;
@@ -6574,6 +7833,13 @@ TEST_CASE("Fast Basic point-cloud style override keeps cheap colour controls", "
     const auto fastWithoutRgb = MakeFastBasicPointCloudStyle(sourceRgbStyle, false);
     CHECK(fastWithoutRgb.colorMode == PointCloudColorMode::SolidColor);
     CHECK(fastWithoutRgb.colorizeAmount == Catch::Approx(0.8F));
+
+    PointCloudStyleState worldSizedScreenStyle;
+    worldSizedScreenStyle.screenSpriteSizeMode = PointCloudScreenSpriteSizeMode::WorldMillimeters;
+    SetScalarConstant(&worldSizedScreenStyle.surfelDiameter, 0.012F);
+    const auto fastWorldSized = MakeFastBasicPointCloudStyle(worldSizedScreenStyle, true);
+    CHECK(fastWorldSized.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters);
+    CHECK(ScalarConstant(fastWorldSized.surfelDiameter) == Catch::Approx(0.012F));
 }
 
 TEST_CASE("Point-cloud material variant separates opaque, simple, and unified styles", "[pointcloud][style]") {

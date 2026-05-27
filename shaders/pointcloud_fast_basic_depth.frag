@@ -41,6 +41,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 
 const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterJitterSeedFieldSlot = 12u;
+const uint kWaterStreamTangentZFieldSlot = 18u;
 
 float LoadScalarFieldValue(uint fieldSlot) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -53,6 +54,10 @@ float LoadScalarFieldValue(uint fieldSlot) {
 }
 
 void main() {
+    if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot) {
+        outLinearDepth = inViewDepth;
+        return;
+    }
     if (styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot) {
         const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot);
         if (styleData.pointMeta.w == 2u) {

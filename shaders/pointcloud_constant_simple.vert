@@ -63,6 +63,13 @@ float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     return clamp(distanceFromFocus * (8.0 / apertureFStops) * maxBlurPixels, 0.0, maxBlurPixels);
 }
 
+float WorldDiameterToScreenPointSizePixels(float diameterMeters, float viewDepth) {
+    return max(0.0, diameterMeters) *
+           abs(uniforms.projection[1][1]) *
+           max(1.0, uniforms.viewportParameters.y) /
+           (2.0 * max(0.001, viewDepth));
+}
+
 vec3 ResolveAovNormal(uint pointIndex) {
     if (styleData.pointMeta.z == 0u || pointIndex >= styleData.pointMeta.x) {
         return vec3(0.0);
@@ -81,10 +88,14 @@ void main() {
     const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
 
-    const float basePointSize = clamp(
-        styleData.pointSizeBinding.constantValue.x,
-        max(1.0, styleData.renderParams3.y),
-        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+    const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
+    const float basePointSize =
+        worldSizedScreenSprites
+            ? WorldDiameterToScreenPointSizePixels(styleData.surfelDiameterBinding.constantValue.x, viewDepth)
+            : clamp(
+                  styleData.pointSizeBinding.constantValue.x,
+                  max(1.0, styleData.renderParams3.y),
+                  max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
     gl_PointSize = clamp(
         basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
         max(1.0, styleData.renderParams3.y),

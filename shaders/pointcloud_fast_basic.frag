@@ -48,6 +48,9 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 causticParams1;
     vec4 causticParams2;
     vec4 causticTint;
+    uvec4 waterEffectControl;
+    uvec4 waterEffectSlots0;
+    uvec4 waterEffectSlots1;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
 } styleData;
@@ -57,6 +60,12 @@ const uint kFieldMapFlagInvert = 2u;
 const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterJitterSeedFieldSlot = 12u;
 const uint kWaterTrailAgeFieldSlot = 13u;
+const uint kWaterStreamPointSeedFieldSlot = 5u;
+const uint kWaterStreamPointAgeFieldSlot = 8u;
+const uint kWaterStreamSpeedFieldSlot = 10u;
+const uint kWaterStreamConfidenceFieldSlot = 13u;
+const uint kWaterStreamWetnessFieldSlot = 14u;
+const uint kWaterStreamTangentZFieldSlot = 18u;
 
 float LoadScalarFieldValue(uint fieldSlot) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -90,6 +99,33 @@ float ResolveCausticStrength(out float previewTint) {
     const float ridge = CausticVoronoiRidge(metersUv, seed, time, edge);
     const float edgeGate = CausticEdgeGate(metersUv, edge, seed);
     return clamp(ridge * mask * edgeGate * max(0.0, styleData.causticParams0.x), 0.0, 6.0);
+}
+
+bool HasWaterEffectComposition() {
+    return styleData.waterEffectControl.x != 0u &&
+           styleData.waterEffectSlots0.z != 0u &&
+           styleData.waterEffectSlots0.w != 0u &&
+           styleData.waterEffectSlots1.x != 0u &&
+           styleData.waterEffectSlots1.y != 0u;
+}
+
+float WaterEffectField(uint slotPlusOne, float fallback) {
+    if (!HasWaterEffectComposition() || slotPlusOne == 0u) {
+        return fallback;
+    }
+    return LoadScalarFieldValue(slotPlusOne - 1u);
+}
+
+vec3 ApplyWaterEffectColor(vec3 baseColor) {
+    const float mixAmount = clamp(WaterEffectField(styleData.waterEffectSlots0.z, 0.0), 0.0, 1.0);
+    if (mixAmount <= 1e-5) {
+        return baseColor;
+    }
+    const vec3 effectColor = vec3(
+        clamp(WaterEffectField(styleData.waterEffectSlots0.w, 0.62), 0.0, 1.0),
+        clamp(WaterEffectField(styleData.waterEffectSlots1.x, 0.88), 0.0, 1.0),
+        clamp(WaterEffectField(styleData.waterEffectSlots1.y, 1.0), 0.0, 1.0));
+    return mix(baseColor, effectColor, mixAmount);
 }
 
 float EvaluateBinding(RenderParameterBindingGpu binding) {
@@ -175,6 +211,19 @@ vec3 ApplyColorize(vec3 baseColor) {
     return mix(baseColor, HslToRgb(vec3(tintHsl.x, tintHsl.y, sourceHsl.z)), amount);
 }
 
+float WaterStreamEnergy() {
+    const float age = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot), 0.0, 1.0);
+    const float speed = max(0.001, LoadScalarFieldValue(kWaterStreamSpeedFieldSlot));
+    const float confidence = clamp(LoadScalarFieldValue(kWaterStreamConfidenceFieldSlot), 0.0, 1.0);
+    const float wetness = clamp(LoadScalarFieldValue(kWaterStreamWetnessFieldSlot), 0.0, 1.0);
+    const float seed = LoadScalarFieldValue(kWaterStreamPointSeedFieldSlot);
+    const float time = max(0.0, styleData.renderParams3.w);
+    const float animatedAge = fract(age - time * speed * 0.18 + seed);
+    const float fade = 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, animatedAge), 1.35);
+    const float pulse = 0.78 + 0.22 * sin((seed + animatedAge + time * speed * 0.07) * 6.28318530718);
+    return clamp(confidence * wetness * fade * pulse, 0.0, 1.0);
+}
+
 vec3 ResolveBaseColor() {
     vec3 baseColor = styleData.solidColor.rgb;
     if (styleData.globalControl.x == 0u && styleData.globalControl.w != 0u) {
@@ -189,11 +238,17 @@ vec3 ResolveBaseColor() {
     baseColor = ApplyColorize(baseColor);
     float previewTint = 0.0;
     const float caustic = ResolveCausticStrength(previewTint);
-    return mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint));
+    return ApplyWaterEffectColor(
+        mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)));
 }
 
 void main() {
     float waterTrailFade = 1.0;
+    if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot) {
+        waterTrailFade = WaterStreamEnergy();
+        outColor = vec4(ResolveBaseColor() * waterTrailFade, 1.0);
+        return;
+    }
     if (styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot) {
         const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot);
         if (styleData.pointMeta.w == 2u) {

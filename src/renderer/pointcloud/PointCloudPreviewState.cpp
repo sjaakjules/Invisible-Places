@@ -371,11 +371,32 @@ bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style) {
            style.causticSeedFieldSlot >= 0;
 }
 
+bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style) {
+    return style.geometryMode == PointCloudGeometryMode::ScreenSprites &&
+           style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters;
+}
+
+float WorldDiameterToScreenPointSizePixels(
+    float diameterMeters,
+    float viewDepth,
+    float projectionScaleY,
+    float viewportHeight) {
+    const float safeDepth = std::max(0.001F, viewDepth);
+    const float safeViewportHeight = std::max(1.0F, viewportHeight);
+    return std::max(0.0F, diameterMeters) *
+           std::abs(projectionScaleY) *
+           safeViewportHeight /
+           (2.0F * safeDepth);
+}
+
 PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb) {
     PointCloudStyleState style;
     style.geometryMode = PointCloudGeometryMode::ScreenSprites;
+    style.screenSpriteSizeMode = sourceStyle.geometryMode == PointCloudGeometryMode::ScreenSprites
+                                     ? sourceStyle.screenSpriteSizeMode
+                                     : PointCloudScreenSpriteSizeMode::Pixels;
     style.depthContribution = PointCloudDepthContribution::None;
     style.falloffProfile = PointCloudFalloffProfile::HardDisc;
     style.stylisationMode = PointCloudStylisationMode::Off;
@@ -394,6 +415,7 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.waterStreakAspect = sourceStyle.waterStreakAspect;
     style.flowAnimation = false;
     style.waterPathView = false;
+    style.waterStreamOverlay = false;
     style.causticAnimation = sourceStyle.causticAnimation;
     style.causticIntensity = sourceStyle.causticIntensity;
     style.causticScale = sourceStyle.causticScale;
@@ -414,8 +436,13 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.causticMaskFieldSlot = sourceStyle.causticMaskFieldSlot;
     style.causticEdgeFieldSlot = sourceStyle.causticEdgeFieldSlot;
     style.causticSeedFieldSlot = sourceStyle.causticSeedFieldSlot;
-    invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
-    invisible_places::style::SetScalarConstant(&style.surfelDiameter, kInactiveSurfelDiameterDefault);
+    if (style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters) {
+        invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
+        style.surfelDiameter = sourceStyle.surfelDiameter;
+    } else {
+        invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.surfelDiameter, kInactiveSurfelDiameterDefault);
+    }
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
@@ -461,7 +488,7 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
          style.emissiveStrength.constantValue[0] <= kMaterialEpsilon);
     const bool noColorize = style.colorizeAmount <= kMaterialEpsilon;
 
-    if (style.flowAnimation) {
+    if (style.flowAnimation || style.waterStreamOverlay) {
         return PointCloudMaterialVariant::Unified;
     }
 

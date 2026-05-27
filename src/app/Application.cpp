@@ -95,6 +95,7 @@ using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNp
 using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using PointCloudRaycastPrimitiveMode = invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode;
 using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointCloudRendererMode;
+using PointCloudScreenSpriteSizeMode = invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using PointCloudStylisationMode = invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using GaussianSplatStyleState = invisible_places::renderer::gsplat::GaussianSplatStyleState;
 using GaussianSplatColorMode = invisible_places::renderer::gsplat::GaussianSplatColorMode;
@@ -116,9 +117,18 @@ using WaterBasinRegion = invisible_places::water::WaterBasinRegion;
 using WaterCausticLookSettings = invisible_places::water::WaterCausticLookSettings;
 using WaterCausticPreviewTintMode = invisible_places::water::WaterCausticPreviewTintMode;
 using WaterCausticRegion = invisible_places::water::WaterCausticRegion;
+using WaterEffectBlendMode = invisible_places::water::WaterEffectBlendMode;
+using WaterEffectFeatureType = invisible_places::water::WaterEffectFeatureType;
+using WaterEffectLayer = invisible_places::water::WaterEffectLayer;
+using WaterEffectOverlay = invisible_places::water::WaterEffectOverlay;
 using WaterEmitter = invisible_places::water::WaterEmitter;
 using WaterEmitterOrigin = invisible_places::water::WaterEmitterOrigin;
 using WaterEmitterStatus = invisible_places::water::WaterEmitterStatus;
+using WaterFieldCache = invisible_places::water::WaterFieldCache;
+using WaterFieldOutputMode = invisible_places::water::WaterFieldOutputMode;
+using WaterFieldSettings = invisible_places::water::WaterFieldSettings;
+using WaterFieldStreamSettings = invisible_places::water::WaterFieldStreamSettings;
+using WaterFlowStreamSettings = invisible_places::water::WaterFlowStreamSettings;
 using WaterOverlay = invisible_places::water::WaterOverlay;
 using WaterOverlayPoint = invisible_places::water::WaterOverlayPoint;
 using WaterParticleTrailSettings = invisible_places::water::WaterParticleTrailSettings;
@@ -129,12 +139,14 @@ using WaterPathBranchRole = invisible_places::water::WaterPathBranchRole;
 using WaterPathCache = invisible_places::water::WaterPathCache;
 using WaterPathGenerationSettings = invisible_places::water::WaterPathGenerationSettings;
 using WaterRenderSettings = invisible_places::water::WaterRenderSettings;
+using WaterRippleOverlayType = invisible_places::water::WaterRippleOverlayType;
 using WaterRunoffMode = invisible_places::water::WaterRunoffMode;
 using WaterRunoffRegion = invisible_places::water::WaterRunoffRegion;
 using WaterScaleMode = invisible_places::water::WaterScaleMode;
 using WaterSettingsBundle = invisible_places::water::WaterSettingsBundle;
 using WaterSourceSettingsAssignment = invisible_places::water::WaterSourceSettingsAssignment;
 using WaterSourceSettings = invisible_places::water::WaterSourceSettings;
+using WaterStreamOverlay = invisible_places::water::WaterStreamOverlay;
 using WaterTrailBuildDiagnostics = invisible_places::water::WaterTrailBuildDiagnostics;
 using WaterTrailBuildQuality = invisible_places::water::WaterTrailBuildQuality;
 using TrailSurfaceIndex = invisible_places::water::TrailSurfaceIndex;
@@ -454,6 +466,12 @@ bool RefreshWaterCausticMaskForSession(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     std::size_t sessionIndex);
+bool SessionHasWaterEffectCompositionFields(const PreviewLayerSession& session);
+bool ApplyWaterEffectCompositionFieldsToSession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::size_t sessionIndex,
+    const std::vector<WaterEffectOverlay>& overlays);
 
 struct OfflinePointLayerSnapshot {
     std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud;
@@ -551,7 +569,8 @@ enum class WaterRegionFeature {
     None,
     Basin,
     Runoff,
-    Caustic
+    Caustic,
+    Ripple
 };
 
 struct WaterRegionVertexRef {
@@ -591,6 +610,8 @@ struct WaterWorkflowState {
     std::vector<WaterBasinRegion> basinRegions;
     std::vector<WaterRunoffRegion> runoffRegions;
     std::vector<WaterCausticRegion> causticRegions;
+    std::vector<WaterEffectLayer> rippleLayers;
+    std::vector<WaterEffectLayer> fieldLayers;
     WaterSourceSettings defaultSourceSettings = invisible_places::water::DefaultWaterSourceSettings(WaterScaleMode::Mid);
     std::optional<WaterSourceSettings> tempDefaultSourceSettings;
     WaterAnimationTrailSettings defaultAnimationTrailSettings =
@@ -610,10 +631,19 @@ struct WaterWorkflowState {
     std::string pointVisualNameBuffer = "Water Flow";
     WaterAnimationTrailProfileSource activeAnimationTrailProfileSource =
         WaterAnimationTrailProfileSource::Auto;
+    WaterFlowStreamSettings flowStreamSettings{};
+    WaterFieldSettings fieldSettings{};
+    WaterFieldStreamSettings fieldStreamSettings{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
     WaterOverlay pathAnchors{};
     WaterOverlay flowOverlay{};
+    WaterStreamOverlay flowStreamOverlay{};
+    WaterStreamOverlay fieldStreamOverlay{};
+    WaterEffectOverlay rippleEffectOverlay{};
+    WaterEffectOverlay fieldSurfaceEffectOverlay{};
+    WaterFieldCache fieldCache{};
     std::uint64_t flowOverlayRevision = 0;
+    std::uint64_t fieldCacheRevision = 0;
     std::uint64_t pathDebugCacheRevision = 0;
     std::vector<WaterPathDebugPolyline> pathDebugPolylines;
     WaterPathCache pathCache{};
@@ -637,18 +667,27 @@ struct WaterWorkflowState {
     std::optional<std::size_t> selectedBasinRegionIndex;
     std::optional<std::size_t> selectedRunoffRegionIndex;
     std::optional<std::size_t> selectedCausticRegionIndex;
+    std::optional<std::size_t> selectedRippleLayerIndex;
+    std::optional<std::size_t> selectedFieldLayerIndex;
     std::optional<std::size_t> activeSupportSessionIndex;
     std::filesystem::path lastOverlayPath;
     std::filesystem::path lastBasinOverlayPath;
     std::filesystem::path lastRunoffOverlayPath;
+    std::filesystem::path lastRippleOverlayPath;
+    std::filesystem::path lastFieldStreamOverlayPath;
+    std::filesystem::path lastFieldSurfaceOverlayPath;
     std::uint32_t nextEmitterId = 1;
     std::uint32_t nextBasinRegionId = 1;
     std::uint32_t nextRunoffRegionId = 1;
     std::uint32_t nextCausticRegionId = 1;
+    std::uint32_t nextRippleLayerId = 1;
+    std::uint32_t nextFieldLayerId = 1;
     std::uint32_t maxAutoSuggestions = 8;
     bool basinRegionPlacementArmed = false;
     bool runoffRegionPlacementArmed = false;
     bool causticRegionPlacementArmed = false;
+    bool rippleRegionPlacementArmed = false;
+    bool fieldRegionPlacementArmed = false;
 };
 
 struct PreviewRuntimeState {
@@ -1195,6 +1234,7 @@ void HashBinding(std::uint64_t* seed, const RenderParameterBinding& binding) {
 
 void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashCombine(seed, static_cast<std::uint64_t>(style.geometryMode));
+    HashCombine(seed, static_cast<std::uint64_t>(style.screenSpriteSizeMode));
     HashCombine(seed, static_cast<std::uint64_t>(style.depthContribution));
     HashCombine(seed, static_cast<std::uint64_t>(style.falloffProfile));
     HashCombine(seed, static_cast<std::uint64_t>(style.stylisationMode));
@@ -1268,6 +1308,7 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashBool(seed, style.solidCenters);
     HashBool(seed, style.flowAnimation);
     HashBool(seed, style.waterPathView);
+    HashBool(seed, style.waterStreamOverlay);
     HashBinding(seed, style.pointSize);
     HashBinding(seed, style.surfelDiameter);
     HashBinding(seed, style.opacity);
@@ -1797,6 +1838,11 @@ bool RefreshWaterOverlayFromAnchors(
 bool TryLoadWaterPathCacheForSupport(
     PreviewRuntimeState* runtimeState,
     const PreviewLayerSession& sourceSession);
+bool RefreshLoadedWaterEffectOutputs(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool preserveSuccessMessages);
+bool DrawWaterEffectContributionControls(const char* id, WaterEffectLayer* layer);
 
 std::optional<std::size_t> FindPointVisualIndex(
     const PreviewLayerSession& session,
@@ -2711,11 +2757,18 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
     const auto stem = session.sourcePath.stem().string();
     const auto waterVisualName = NormalizeWaterPointVisualName(session.selectedPointVisualName);
     return session.pointStyle.flowAnimation ||
+           session.pointStyle.waterStreamOverlay ||
            waterVisualName == "Water Flow_preset" ||
+           waterVisualName == "Ripples" ||
+           waterVisualName == "Field Surface" ||
            waterVisualName == "Basin Haze" ||
            waterVisualName == "Runoff" ||
            stem.ends_with("-WaterPreview") ||
            stem.ends_with("-WaterFlow") ||
+           stem.ends_with("-WaterFlowStreams") ||
+           stem.ends_with("-Ripples") ||
+           stem.ends_with("-FieldStreamlines") ||
+           stem.ends_with("-FieldSurface") ||
            stem.ends_with("-BasinHaze") ||
            stem.ends_with("-Runoff");
 }
@@ -2727,7 +2780,9 @@ bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session) {
     const auto stem = session.sourcePath.stem().string();
     return NormalizeWaterPointVisualName(session.selectedPointVisualName) == "Water Flow_preset" ||
            stem.ends_with("-WaterPreview") ||
-           stem.ends_with("-WaterFlow");
+           stem.ends_with("-WaterFlow") ||
+           stem.ends_with("-WaterFlowStreams") ||
+           stem.ends_with("-FieldStreamlines");
 }
 
 std::optional<std::size_t> FindSessionIndexBySourcePath(
@@ -2742,10 +2797,16 @@ bool IsAssociableLidarSession(const PreviewLayerSession& session) {
     const auto stem = session.sourcePath.stem().string();
     const auto waterVisualName = NormalizeWaterPointVisualName(session.selectedPointVisualName);
     return waterVisualName != "Water Flow_preset" &&
+           waterVisualName != "Ripples" &&
+           waterVisualName != "Field Surface" &&
            waterVisualName != "Basin Haze" &&
            waterVisualName != "Runoff" &&
            !stem.ends_with("-WaterPreview") &&
            !stem.ends_with("-WaterFlow") &&
+           !stem.ends_with("-WaterFlowStreams") &&
+           !stem.ends_with("-Ripples") &&
+           !stem.ends_with("-FieldStreamlines") &&
+           !stem.ends_with("-FieldSurface") &&
            !stem.ends_with("-BasinHaze") &&
            !stem.ends_with("-Runoff");
 }
@@ -3820,6 +3881,7 @@ void PollPendingLayerLoad(
             viewport,
             WaterOverlayRefreshPersistence::InMemoryOnly);
     }
+    RefreshLoadedWaterEffectOutputs(runtimeState, viewport, true);
 }
 
 void UnloadLayerByIndex(
@@ -3907,6 +3969,22 @@ std::uint32_t NextWaterCausticRegionId(const PreviewRuntimeState& runtimeState) 
     std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextCausticRegionId);
     for (const auto& region : runtimeState.water.causticRegions) {
         nextId = std::max<std::uint32_t>(nextId, region.id + 1U);
+    }
+    return nextId;
+}
+
+std::uint32_t NextWaterRippleLayerId(const PreviewRuntimeState& runtimeState) {
+    std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextRippleLayerId);
+    for (const auto& layer : runtimeState.water.rippleLayers) {
+        nextId = std::max<std::uint32_t>(nextId, layer.id + 1U);
+    }
+    return nextId;
+}
+
+std::uint32_t NextWaterFieldLayerId(const PreviewRuntimeState& runtimeState) {
+    std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextFieldLayerId);
+    for (const auto& layer : runtimeState.water.fieldLayers) {
+        nextId = std::max<std::uint32_t>(nextId, layer.id + 1U);
     }
     return nextId;
 }
@@ -4661,6 +4739,7 @@ PointCloudStyleState ViewedWaterPointVisualStyle(const PreviewRuntimeState& runt
 PointCloudStyleState MakeWaterTrailExportStyle(PointCloudStyleState style) {
     style.flowAnimation = true;
     style.waterPathView = false;
+    style.waterStreamOverlay = true;
     return style;
 }
 
@@ -4775,7 +4854,10 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
     style.densityClamp = 8.0F;
     style.solidCenters = true;
     style.flowAnimation = true;
+    style.waterStreamOverlay = true;
     style.waterPathView = viewMode == WaterOverlayViewMode::Path;
+    style.geometryMode = PointCloudGeometryMode::WorldSurfels;
+    style.waterStreakAspect = 7.5F;
     invisible_places::style::SetScalarConstant(
         &style.pointSize,
         style.waterPathView ? 12.0F : 14.0F);
@@ -4803,6 +4885,42 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
     invisible_places::style::SetScalarConstant(&style.colormapPosition, 0.5F);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.012F);
+    return style;
+}
+
+PointCloudStyleState MakeWaterEffectOverlayStyle(std::string_view visualName) {
+    PointCloudStyleState style;
+    style.geometryMode = PointCloudGeometryMode::WorldSurfels;
+    style.depthContribution = PointCloudDepthContribution::None;
+    style.falloffProfile = PointCloudFalloffProfile::Gaussian;
+    style.colorMode = PointCloudColorMode::SourceRgb;
+    style.solidColor = {0.50F, 0.86F, 1.0F, 1.0F};
+    style.colorizeColor = {0.62F, 0.88F, 1.0F};
+    style.colorizeAmount = 0.16F;
+    style.exposure = 1.55F;
+    style.gaussianSharpness = 1.45F;
+    style.densityScale = 0.88F;
+    style.densityClamp = 8.0F;
+    style.solidCenters = false;
+    invisible_places::style::SetScalarConstant(&style.pointSize, 3.0F);
+    invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.018F);
+    ConfigureWaterFieldBinding(&style.opacity, 2, "ripple_value", 0.0F, 0.36F);
+    invisible_places::style::SetFieldMapFlag(
+        &style.opacity.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    ConfigureWaterFieldBinding(&style.emissiveStrength, 9, "ripple_confidence", 0.08F, 0.95F);
+    invisible_places::style::SetFieldMapFlag(
+        &style.emissiveStrength.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    if (visualName == "Field Surface") {
+        style.solidColor = {0.48F, 0.95F, 0.80F, 1.0F};
+        style.colorizeColor = {0.40F, 0.95F, 0.78F};
+        invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.024F);
+        ConfigureWaterFieldBinding(&style.opacity, 15, "field_wetness", 0.0F, 0.30F);
+        ConfigureWaterFieldBinding(&style.emissiveStrength, 16, "field_surface_confidence", 0.04F, 0.52F);
+    }
     return style;
 }
 
@@ -4854,6 +4972,7 @@ const char* WaterOverlayVisualPresetName(WaterOverlayVisualPreset preset) {
 PointCloudStyleState MakeWaterOverlayVisualPreset(WaterOverlayVisualPreset preset) {
     auto style = MakeWaterOverlayStyle(WaterOverlayViewMode::Trail);
     style.flowAnimation = true;
+    style.waterStreamOverlay = true;
     style.waterPathView = false;
     style.colorMode = PointCloudColorMode::SolidColor;
     style.falloffProfile = PointCloudFalloffProfile::Gaussian;
@@ -5045,6 +5164,7 @@ void SeedWaterFlowBuiltInVisuals(PreviewRuntimeState* runtimeState, PreviewLayer
     runtimeState->water.selectedPointVisualName = session->selectedPointVisualName;
     runtimeState->water.pointVisualNameBuffer = BasePointVisualName(session->selectedPointVisualName);
     session->pointStyle.flowAnimation = true;
+    session->pointStyle.waterStreamOverlay = true;
     session->pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
 }
 
@@ -5069,6 +5189,7 @@ void ApplyWaterOverlayVisualPreset(PreviewRuntimeState* runtimeState, PreviewLay
 PointCloudStyleState MakeWaterOverlayDisplayStyle(const PreviewRuntimeState& runtimeState) {
     auto style = ViewedWaterPointVisualStyle(runtimeState);
     style.flowAnimation = true;
+    style.waterStreamOverlay = true;
     style.waterPathView = runtimeState.water.overlayViewMode == WaterOverlayViewMode::Path;
     return style;
 }
@@ -5121,6 +5242,7 @@ void ApplyWaterOverlayDisplayStyle(PreviewRuntimeState* runtimeState) {
             continue;
         }
         session.pointStyle.flowAnimation = true;
+        session.pointStyle.waterStreamOverlay = true;
         session.pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
     }
 }
@@ -5142,9 +5264,10 @@ PointCloudStyleState MakeEffectiveFastBasicStyle(
     bool hasSourceRgb,
     bool waterOverlay) {
     auto style = invisible_places::renderer::pointcloud::MakeFastBasicPointCloudStyle(sourceStyle, hasSourceRgb);
-    if (waterOverlay && sourceStyle.flowAnimation) {
+    if (waterOverlay && (sourceStyle.flowAnimation || sourceStyle.waterStreamOverlay)) {
         style.flowAnimation = true;
         style.waterPathView = sourceStyle.waterPathView;
+        style.waterStreamOverlay = sourceStyle.waterStreamOverlay;
         if (style.waterPathView) {
             style.pointSize = sourceStyle.pointSize;
         }
@@ -5197,6 +5320,7 @@ std::size_t AddOrRefreshWaterOverlaySession(
         session.pointVisuals.push_back({.name = session.selectedPointVisualName, .style = session.pointStyle});
     } else {
         session.pointStyle.flowAnimation = true;
+        session.pointStyle.waterStreamOverlay = NormalizeWaterPointVisualName(visualName) == "Water Flow_preset";
         session.pointStyle.waterPathView =
             NormalizeWaterPointVisualName(visualName) == "Water Flow_preset" &&
             runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
@@ -5253,6 +5377,7 @@ std::size_t AddOrRefreshWaterFlowOverlaySession(
         session.pointVisuals.push_back({.name = "Water Flow_preset", .style = session.pointStyle});
     } else {
         session.pointStyle.flowAnimation = true;
+        session.pointStyle.waterStreamOverlay = true;
         session.pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
         EnsurePointVisuals(&session);
     }
@@ -5268,6 +5393,115 @@ std::size_t AddOrRefreshWaterFlowOverlaySession(
     return sessionIndex;
 }
 
+void StoreLiveWaterFlowStreamOverlay(
+    PreviewRuntimeState* runtimeState,
+    WaterStreamOverlay overlay) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    runtimeState->water.flowStreamOverlay = std::move(overlay);
+    ++runtimeState->water.flowOverlayRevision;
+    runtimeState->water.pathDebugCacheRevision = 0;
+    runtimeState->water.pathDebugPolylines.clear();
+}
+
+std::size_t AddOrRefreshWaterStreamOverlaySession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const std::filesystem::path& overlayPath,
+    WaterStreamOverlay overlay,
+    std::string_view visualName,
+    bool storeAsFlowOverlay) {
+    if (runtimeState == nullptr || viewport == nullptr || overlay.samples.empty()) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+
+    if (storeAsFlowOverlay) {
+        StoreLiveWaterFlowStreamOverlay(runtimeState, overlay);
+        overlay = runtimeState->water.flowStreamOverlay;
+    }
+    const auto existingIndex = FindSessionIndexBySourcePath(*runtimeState, overlayPath);
+    const auto sessionIndex = existingIndex.value_or(runtimeState->sessions.size());
+    if (!existingIndex.has_value()) {
+        PreviewLayerSession session;
+        session.kind = LayerKind::PointCloud;
+        session.sourcePath = overlayPath;
+        session.displayName = overlayPath.stem().string();
+        runtimeState->sessions.push_back(std::move(session));
+    }
+
+    auto& session = runtimeState->sessions[sessionIndex];
+    session.kind = LayerKind::PointCloud;
+    session.sourcePath = overlayPath;
+    session.displayName = overlayPath.stem().string();
+    if (!existingIndex.has_value() || session.pointVisuals.empty()) {
+        session.pointStyle = MakeWaterOverlayDisplayStyle(*runtimeState);
+        session.selectedPointVisualName = std::string{visualName};
+        session.pointVisualNameBuffer = BasePointVisualName(session.selectedPointVisualName);
+        session.pointVisuals.clear();
+        session.pointVisuals.push_back({.name = session.selectedPointVisualName, .style = session.pointStyle});
+    } else {
+        session.pointStyle.flowAnimation = true;
+        session.pointStyle.waterStreamOverlay = true;
+        session.pointStyle.waterPathView = false;
+        EnsurePointVisuals(&session);
+    }
+    SeedWaterFlowBuiltInVisuals(runtimeState, &session);
+
+    auto cloud = invisible_places::water::BuildWaterStreamOverlayPointCloud(
+        storeAsFlowOverlay ? runtimeState->water.flowStreamOverlay : overlay,
+        overlayPath,
+        session.displayName);
+    if (!ActivateLoadedPointCloud(sessionIndex, std::move(cloud), runtimeState, viewport)) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return sessionIndex;
+}
+
+std::size_t AddOrRefreshWaterEffectOverlaySession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const std::filesystem::path& overlayPath,
+    const WaterEffectOverlay& overlay,
+    std::string_view visualName) {
+    if (runtimeState == nullptr || viewport == nullptr || overlay.points.empty()) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+
+    const auto existingIndex = FindSessionIndexBySourcePath(*runtimeState, overlayPath);
+    const auto sessionIndex = existingIndex.value_or(runtimeState->sessions.size());
+    if (!existingIndex.has_value()) {
+        PreviewLayerSession session;
+        session.kind = LayerKind::PointCloud;
+        session.sourcePath = overlayPath;
+        session.displayName = overlayPath.stem().string();
+        runtimeState->sessions.push_back(std::move(session));
+    }
+
+    auto& session = runtimeState->sessions[sessionIndex];
+    session.kind = LayerKind::PointCloud;
+    session.sourcePath = overlayPath;
+    session.displayName = overlayPath.stem().string();
+    if (!existingIndex.has_value() || session.pointVisuals.empty()) {
+        session.pointStyle = MakeWaterEffectOverlayStyle(visualName);
+        session.selectedPointVisualName = std::string{visualName};
+        session.pointVisualNameBuffer = BasePointVisualName(session.selectedPointVisualName);
+        session.pointVisuals.clear();
+        session.pointVisuals.push_back({.name = session.selectedPointVisualName, .style = session.pointStyle});
+    } else {
+        EnsurePointVisuals(&session);
+    }
+
+    auto cloud = invisible_places::water::BuildWaterEffectOverlayPointCloud(
+        overlay,
+        overlayPath,
+        session.displayName);
+    if (!ActivateLoadedPointCloud(sessionIndex, std::move(cloud), runtimeState, viewport)) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return sessionIndex;
+}
+
 std::filesystem::path BuildWaterOverlayPath(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& sourceSession) {
@@ -5275,7 +5509,7 @@ std::filesystem::path BuildWaterOverlayPath(
     const auto waterDirectory = projectPath.empty()
                                     ? std::filesystem::path{"Saved"} / "water"
                                     : projectPath.parent_path() / "water";
-    const auto suffix = "-WaterFlow.ply";
+    const auto suffix = "-WaterFlowStreams.generated";
     return waterDirectory / (sourceSession.sourcePath.stem().string() + suffix);
 }
 
@@ -5512,9 +5746,11 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     }
     invisible_places::serialization::WaterSourcesDocument document;
     document.emitters = runtimeState->water.emitters;
-    document.basinRegions = runtimeState->water.basinRegions;
-    document.runoffRegions = runtimeState->water.runoffRegions;
-    document.causticRegions = runtimeState->water.causticRegions;
+    document.rippleLayers = runtimeState->water.rippleLayers;
+    document.fieldLayers = runtimeState->water.fieldLayers;
+    document.flowStreamSettings = runtimeState->water.flowStreamSettings;
+    document.fieldSettings = runtimeState->water.fieldSettings;
+    document.fieldStreamSettings = runtimeState->water.fieldStreamSettings;
     document.sourceSettings = runtimeState->water.defaultSourceSettings;
     document.tempSourceSettings = runtimeState->water.tempDefaultSourceSettings;
     document.causticLookSettings = runtimeState->water.defaultCausticLookSettings;
@@ -5547,9 +5783,14 @@ void LoadWaterSources(
     }
 
     runtimeState->water.emitters = document->emitters;
-    runtimeState->water.basinRegions = document->basinRegions;
-    runtimeState->water.runoffRegions = document->runoffRegions;
-    runtimeState->water.causticRegions = document->causticRegions;
+    runtimeState->water.basinRegions.clear();
+    runtimeState->water.runoffRegions.clear();
+    runtimeState->water.causticRegions.clear();
+    runtimeState->water.rippleLayers = document->rippleLayers;
+    runtimeState->water.fieldLayers = document->fieldLayers;
+    runtimeState->water.flowStreamSettings = document->flowStreamSettings;
+    runtimeState->water.fieldSettings = document->fieldSettings;
+    runtimeState->water.fieldStreamSettings = document->fieldStreamSettings;
     runtimeState->water.defaultSourceSettings = document->sourceSettings;
     runtimeState->water.tempDefaultSourceSettings = document->tempSourceSettings;
     runtimeState->water.defaultCausticLookSettings = document->causticLookSettings;
@@ -5558,14 +5799,23 @@ void LoadWaterSources(
     runtimeState->water.nextBasinRegionId = NextWaterBasinRegionId(*runtimeState);
     runtimeState->water.nextRunoffRegionId = NextWaterRunoffRegionId(*runtimeState);
     runtimeState->water.nextCausticRegionId = NextWaterCausticRegionId(*runtimeState);
+    runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
+    runtimeState->water.nextFieldLayerId = NextWaterFieldLayerId(*runtimeState);
+    runtimeState->water.nextFieldLayerId = NextWaterFieldLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
     runtimeState->water.selectedBasinRegionIndex.reset();
     runtimeState->water.selectedRunoffRegionIndex.reset();
     runtimeState->water.selectedCausticRegionIndex.reset();
+    runtimeState->water.selectedRippleLayerIndex.reset();
+    runtimeState->water.selectedFieldLayerIndex.reset();
+    runtimeState->water.selectedFieldLayerIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.basinRegionPlacementArmed = false;
     runtimeState->water.runoffRegionPlacementArmed = false;
     runtimeState->water.causticRegionPlacementArmed = false;
+    runtimeState->water.rippleRegionPlacementArmed = false;
+    runtimeState->water.fieldRegionPlacementArmed = false;
+    runtimeState->water.fieldRegionPlacementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
     if (document->pathCache.has_value() && !document->pathCache->branches.empty()) {
         runtimeState->water.pathCache = document->pathCache.value();
@@ -5698,35 +5948,30 @@ bool BakeWaterOverlayForActiveLayer(
         runtimeState->water.pathCache,
         runtimeState->water.emitters,
         defaultSourceSettings);
-    WaterTrailBuildDiagnostics diagnostics;
-    const auto* surfaceIndexForTrails =
-        EnsureTrailSurfaceIndexForSupport(runtimeState, sourceSession, &diagnostics);
-    const auto overlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
         runtimeState->water.pathAnchors,
-        runtimeState->water.emitters,
-        defaultSourceSettings,
-        ViewedWaterAnimationTrailSettings(*runtimeState),
-        surfaceIndexForTrails,
-        WaterTrailBuildQuality::Final,
-        &diagnostics);
-    runtimeState->water.lastTrailBuildDiagnostics = diagnostics;
-    const auto outputPath = BuildWaterOverlayPath(*runtimeState, sourceSession);
-    std::string errorMessage;
-    if (!invisible_places::water::WriteWaterOverlayPly(overlay, outputPath, &errorMessage)) {
-        runtimeState->errorMessage = errorMessage;
+        runtimeState->water.flowStreamSettings);
+    if (overlay.samples.empty()) {
+        runtimeState->errorMessage = "Water paths baked, but no flow stream surfels were generated.";
         runtimeState->statusMessage.clear();
         return false;
     }
-
+    const auto outputPath = BuildWaterOverlayPath(*runtimeState, sourceSession);
     runtimeState->water.lastOverlayPath = outputPath;
     SaveWaterPathCacheForSupport(runtimeState, sourceSession);
-    AddOrRefreshWaterFlowOverlaySession(runtimeState, viewport, outputPath, overlay);
+    AddOrRefreshWaterStreamOverlaySession(
+        runtimeState,
+        viewport,
+        outputPath,
+        overlay,
+        "Water Flow_preset",
+        true);
     runtimeState->water.pathDirty = false;
     runtimeState->water.dirtyEmitterIds.clear();
     runtimeState->statusMessage =
-        "Baked water main paths " + outputPath.filename().string() +
+        "Baked water main paths and generated flow streams " + outputPath.filename().string() +
         " with " + FormatPointCount(runtimeState->water.pathAnchors.points.size()) + " path anchors and " +
-        FormatPointCount(overlay.points.size()) + " live trail points across " +
+        FormatPointCount(overlay.samples.size()) + " stream surfels across " +
         FormatPointCount(runtimeState->water.pathCache.branches.size()) + " branches.";
     runtimeState->errorMessage.clear();
     return true;
@@ -5737,6 +5982,7 @@ bool RefreshWaterOverlayFromAnchors(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     WaterOverlayRefreshPersistence persistence,
     WaterTrailBuildQuality quality) {
+    (void)quality;
     if (runtimeState == nullptr || viewport == nullptr) {
         return false;
     }
@@ -5763,27 +6009,265 @@ bool RefreshWaterOverlayFromAnchors(
         runtimeState->errorMessage.clear();
         return false;
     }
-    WaterTrailBuildDiagnostics diagnostics;
-    const auto* surfaceIndexForTrails = EnsureTrailSurfaceIndexForSupport(
-        runtimeState,
-        runtimeState->sessions[supportIndex.value()],
-        &diagnostics);
-    const auto overlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
         runtimeState->water.pathAnchors,
-        runtimeState->water.emitters,
-        defaultSourceSettings,
-        ViewedWaterAnimationTrailSettings(*runtimeState),
-        surfaceIndexForTrails,
-        quality,
-        &diagnostics);
-    runtimeState->water.lastTrailBuildDiagnostics = diagnostics;
+        runtimeState->water.flowStreamSettings);
+    if (overlay.samples.empty()) {
+        runtimeState->water.pathDirty = true;
+        runtimeState->errorMessage = "Water path bake exists, but no flow stream surfels were generated.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
     const auto outputPath = BuildWaterOverlayPath(*runtimeState, runtimeState->sessions[supportIndex.value()]);
     runtimeState->water.lastOverlayPath = outputPath;
     if (persistence == WaterOverlayRefreshPersistence::SavePathCache && runtimeState->water.pathCacheLoaded) {
         SaveWaterPathCacheForSupport(runtimeState, runtimeState->sessions[supportIndex.value()]);
     }
-    AddOrRefreshWaterFlowOverlaySession(runtimeState, viewport, outputPath, overlay);
-    runtimeState->statusMessage = "Water trail preview refreshed.";
+    AddOrRefreshWaterStreamOverlaySession(
+        runtimeState,
+        viewport,
+        outputPath,
+        overlay,
+        "Water Flow_preset",
+        true);
+    runtimeState->statusMessage =
+        "Water flow streams refreshed with " + FormatPointCount(overlay.samples.size()) + " surfels.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool RefreshWaterRippleEffects(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (runtimeState->pendingLoad.has_value()) {
+        runtimeState->errorMessage = "Please wait for the current layer load before refreshing ripples.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::size_t refreshedLayers = 0;
+    std::size_t refreshedPoints = 0;
+    bool refreshedComposition = false;
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+        const auto& sourceSession = runtimeState->sessions[sessionIndex];
+        if (!sourceSession.loaded || sourceSession.offlinePointCloud == nullptr ||
+            !IsAssociableLidarSession(sourceSession)) {
+            continue;
+        }
+        const auto sourceKey = NormalizePathKey(sourceSession.sourcePath);
+        std::vector<WaterEffectLayer> targetLayers;
+        for (const auto& layer : runtimeState->water.rippleLayers) {
+            if (layer.featureType == WaterEffectFeatureType::Ripple &&
+                layer.enabledInViewport &&
+                layer.vertices.size() >= 3U &&
+                NormalizePathKey(layer.targetLayerSourcePath) == sourceKey) {
+                targetLayers.push_back(layer);
+            }
+        }
+        std::vector<WaterEffectOverlay> compositionOverlays;
+        if (targetLayers.empty()) {
+            if (!runtimeState->water.fieldSurfaceEffectOverlay.points.empty()) {
+                compositionOverlays.push_back(runtimeState->water.fieldSurfaceEffectOverlay);
+            }
+            if (SessionHasWaterEffectCompositionFields(sourceSession) &&
+                ApplyWaterEffectCompositionFieldsToSession(runtimeState, viewport, sessionIndex, compositionOverlays)) {
+                refreshedComposition = true;
+            }
+        } else {
+            auto overlay = invisible_places::water::GenerateRippleEffectOverlay(
+                *sourceSession.offlinePointCloud,
+                targetLayers);
+            if (overlay.points.empty()) {
+                continue;
+            }
+            refreshedPoints += overlay.points.size();
+            ++refreshedLayers;
+            runtimeState->water.rippleEffectOverlay = overlay;
+            compositionOverlays.push_back(overlay);
+            if (!runtimeState->water.fieldSurfaceEffectOverlay.points.empty()) {
+                compositionOverlays.push_back(runtimeState->water.fieldSurfaceEffectOverlay);
+            }
+            if (!ApplyWaterEffectCompositionFieldsToSession(runtimeState, viewport, sessionIndex, compositionOverlays)) {
+                return false;
+            }
+            const auto outputPath = BuildWaterFeatureOverlayPath(
+                *runtimeState,
+                sourceSession,
+                "-Ripples.generated");
+            runtimeState->water.lastRippleOverlayPath = outputPath;
+            AddOrRefreshWaterEffectOverlaySession(runtimeState, viewport, outputPath, overlay, "Ripples");
+        }
+    }
+
+    if (refreshedLayers == 0U) {
+        bool unloadedStaleRippleSession = false;
+        for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+            auto& session = runtimeState->sessions[sessionIndex];
+            if (!session.loaded || session.kind != LayerKind::PointCloud) {
+                continue;
+            }
+            const auto stem = session.sourcePath.stem().string();
+            if (stem.ends_with("-Ripples")) {
+                UnloadLayerByIndex(runtimeState, viewport, sessionIndex);
+                unloadedStaleRippleSession = true;
+            }
+        }
+        if (unloadedStaleRippleSession) {
+            runtimeState->statusMessage = "Cleared ripple effect overlay.";
+            runtimeState->errorMessage.clear();
+            return true;
+        }
+        if (refreshedComposition) {
+            runtimeState->statusMessage = "Updated active-cloud water effect composition.";
+            runtimeState->errorMessage.clear();
+            return true;
+        }
+        runtimeState->errorMessage = "No enabled ripple layers target a loaded LiDAR layer.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    runtimeState->statusMessage =
+        "Refreshed ripples with " + FormatPointCount(refreshedPoints) + " virtual effect points.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool RefreshWaterFieldOverlays(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (runtimeState->pendingLoad.has_value()) {
+        runtimeState->errorMessage = "Please wait for the current layer load before building the water field.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+    if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
+        runtimeState->errorMessage = "Load and show a point-cloud layer before building the water field.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    auto& sourceSession = runtimeState->sessions[supportIndex.value()];
+    const auto sourceKey = NormalizePathKey(sourceSession.sourcePath);
+    std::vector<WaterEffectLayer> targetFieldLayers;
+    bool hasFieldSurfaceRegion = false;
+    for (const auto& layer : runtimeState->water.fieldLayers) {
+        const bool fieldControlLayer =
+            layer.featureType == WaterEffectFeatureType::FieldSurfaceMotion ||
+            layer.featureType == WaterEffectFeatureType::FieldNoFlowRegion ||
+            layer.featureType == WaterEffectFeatureType::FieldBridgeAllowedRegion ||
+            layer.featureType == WaterEffectFeatureType::FieldBridgeBlockedRegion;
+        if (fieldControlLayer &&
+            layer.enabledInViewport &&
+            layer.vertices.size() >= 3U &&
+            NormalizePathKey(layer.targetLayerSourcePath) == sourceKey) {
+            targetFieldLayers.push_back(layer);
+            hasFieldSurfaceRegion = hasFieldSurfaceRegion ||
+                                    layer.featureType == WaterEffectFeatureType::FieldSurfaceMotion;
+        }
+    }
+    if (hasFieldSurfaceRegion) {
+        runtimeState->water.fieldCache = invisible_places::water::BuildFieldCacheFromRegions(
+            *sourceSession.offlinePointCloud,
+            targetFieldLayers,
+            runtimeState->water.fieldSettings);
+    } else {
+        if (runtimeState->water.pathAnchors.points.empty()) {
+            if (runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCache.branches.empty()) {
+                runtimeState->water.pathAnchors = invisible_places::water::BuildWaterPathAnchorsFromCache(
+                    runtimeState->water.pathCache,
+                    runtimeState->water.emitters,
+                    ActiveDefaultWaterSourceSettings(*runtimeState));
+            }
+        }
+        if (runtimeState->water.pathAnchors.points.empty()) {
+            runtimeState->errorMessage = "Bake Flow paths or draw a Field region before building Field streamlines.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        runtimeState->water.fieldCache = invisible_places::water::BuildFieldCacheFromPathAnchors(
+            runtimeState->water.pathAnchors,
+            runtimeState->water.fieldSettings);
+    }
+    ++runtimeState->water.fieldCacheRevision;
+    if (runtimeState->water.fieldCache.nodes.empty()) {
+        runtimeState->errorMessage = "Field cache did not produce any surface-supported nodes.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::size_t outputPoints = 0;
+    if (runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::Streamlines ||
+        runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::Both) {
+        auto streamOverlay = invisible_places::water::BuildFieldStreamOverlay(
+            runtimeState->water.fieldCache,
+            runtimeState->water.fieldStreamSettings);
+        outputPoints += streamOverlay.samples.size();
+        runtimeState->water.fieldStreamOverlay = streamOverlay;
+        const auto outputPath = BuildWaterFeatureOverlayPath(
+            *runtimeState,
+            sourceSession,
+            "-FieldStreamlines.generated");
+        runtimeState->water.lastFieldStreamOverlayPath = outputPath;
+        AddOrRefreshWaterStreamOverlaySession(
+            runtimeState,
+            viewport,
+            outputPath,
+            streamOverlay,
+            "Water Flow_preset",
+            false);
+    }
+
+    if (runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::SurfaceMotion ||
+        runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::Both) {
+        WaterEffectLayer layer;
+        layer.id = 1U;
+        layer.name = "Field Surface";
+        layer.featureType = WaterEffectFeatureType::FieldSurfaceMotion;
+        layer.response.colouriseRed = 0.46F;
+        layer.response.colouriseGreen = 0.95F;
+        layer.response.colouriseBlue = 0.78F;
+        layer.regionStrength = 1.0F;
+        layer.speed = runtimeState->water.fieldStreamSettings.speedMetersPerSecond;
+        layer.maxAffectedPoints = 300000U;
+        auto effectOverlay = invisible_places::water::GenerateFieldSurfaceEffectOverlay(
+            runtimeState->water.fieldCache,
+            layer);
+        outputPoints += effectOverlay.points.size();
+        runtimeState->water.fieldSurfaceEffectOverlay = effectOverlay;
+        std::vector<WaterEffectOverlay> compositionOverlays;
+        if (!runtimeState->water.rippleEffectOverlay.points.empty()) {
+            compositionOverlays.push_back(runtimeState->water.rippleEffectOverlay);
+        }
+        compositionOverlays.push_back(effectOverlay);
+        if (!ApplyWaterEffectCompositionFieldsToSession(
+            runtimeState,
+            viewport,
+            supportIndex.value(),
+            compositionOverlays)) {
+            return false;
+        }
+        const auto outputPath = BuildWaterFeatureOverlayPath(
+            *runtimeState,
+            sourceSession,
+            "-FieldSurface.generated");
+        runtimeState->water.lastFieldSurfaceOverlayPath = outputPath;
+        AddOrRefreshWaterEffectOverlaySession(
+            runtimeState,
+            viewport,
+            outputPath,
+            effectOverlay,
+            "Field Surface");
+    }
+
+    runtimeState->statusMessage =
+        "Built water field with " + FormatPointCount(runtimeState->water.fieldCache.nodes.size()) +
+        " cache nodes and " + FormatPointCount(outputPoints) + " generated overlay points.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -5919,6 +6403,166 @@ void UpsertGeneratedScalarField(
         cloud->scalarFieldValues[cloud->ScalarFieldValueIndex(slot.value(), pointIndex)] = value;
         stats.Include(value);
     }
+}
+
+constexpr std::string_view kWaterEffectScalarFields[] = {
+    "water_effect_value",
+    "water_effect_emission_add",
+    "water_effect_opacity_add",
+    "water_effect_opacity_multiply",
+    "water_effect_point_size_add",
+    "water_effect_point_size_multiply",
+    "water_effect_colour_red",
+    "water_effect_colour_green",
+    "water_effect_colour_blue",
+    "water_effect_colour_mix",
+};
+
+bool SessionHasWaterEffectCompositionFields(const PreviewLayerSession& session) {
+    return std::any_of(
+        std::begin(kWaterEffectScalarFields),
+        std::end(kWaterEffectScalarFields),
+        [&](std::string_view name) {
+            return FindScalarFieldByName(session.scalarFields, name).has_value();
+        });
+}
+
+bool ApplyWaterEffectCompositionFieldsToSession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::size_t sessionIndex,
+    const std::vector<WaterEffectOverlay>& overlays) {
+    if (runtimeState == nullptr || viewport == nullptr || sessionIndex >= runtimeState->sessions.size()) {
+        return false;
+    }
+    auto& session = runtimeState->sessions[sessionIndex];
+    if (!session.loaded || session.kind != LayerKind::PointCloud || session.offlinePointCloud == nullptr) {
+        return false;
+    }
+    if (overlays.empty() && !SessionHasWaterEffectCompositionFields(session)) {
+        return true;
+    }
+
+    const auto composition = invisible_places::water::ComposeWaterEffectFields(
+        *session.offlinePointCloud,
+        overlays);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_value", composition.value);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_emission_add", composition.emissionAdd);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_opacity_add", composition.opacityAdd);
+    UpsertGeneratedScalarField(
+        session.offlinePointCloud.get(),
+        "water_effect_opacity_multiply",
+        composition.opacityMultiply);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_point_size_add", composition.pointSizeAdd);
+    UpsertGeneratedScalarField(
+        session.offlinePointCloud.get(),
+        "water_effect_point_size_multiply",
+        composition.pointSizeMultiply);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_colour_red", composition.colourRed);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_colour_green", composition.colourGreen);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_colour_blue", composition.colourBlue);
+    UpsertGeneratedScalarField(session.offlinePointCloud.get(), "water_effect_colour_mix", composition.colourMix);
+    session.scalarFields = session.offlinePointCloud->scalarFields;
+    try {
+        viewport->UploadPointCloud(sessionIndex, *session.offlinePointCloud, session.pointBudget.sampledIndices);
+    } catch (const std::exception& error) {
+        runtimeState->errorMessage =
+            "GPU upload failed while refreshing water effect composition: " + std::string{error.what()};
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    return true;
+}
+
+bool HasLoadedWaterEffectCompositionFields(const PreviewRuntimeState& runtimeState) {
+    return std::any_of(
+        runtimeState.sessions.begin(),
+        runtimeState.sessions.end(),
+        [](const PreviewLayerSession& session) {
+            return session.loaded &&
+                   session.kind == LayerKind::PointCloud &&
+                   IsAssociableLidarSession(session) &&
+                   SessionHasWaterEffectCompositionFields(session);
+        });
+}
+
+bool HasRefreshableWaterEffectLayerForLoadedSession(
+    const PreviewRuntimeState& runtimeState,
+    const std::vector<WaterEffectLayer>& layers,
+    WaterEffectFeatureType featureType) {
+    for (const auto& session : runtimeState.sessions) {
+        if (!session.loaded || session.offlinePointCloud == nullptr || !IsAssociableLidarSession(session)) {
+            continue;
+        }
+        const auto sourceKey = NormalizePathKey(session.sourcePath);
+        const auto layerIt = std::find_if(
+            layers.begin(),
+            layers.end(),
+            [&](const WaterEffectLayer& layer) {
+                return layer.featureType == featureType &&
+                       layer.enabledInViewport &&
+                       layer.vertices.size() >= 3U &&
+                       NormalizePathKey(layer.targetLayerSourcePath) == sourceKey;
+            });
+        if (layerIt != layers.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WaterEffectLayerTargetsSession(
+    const WaterEffectLayer& layer,
+    const PreviewLayerSession& session,
+    WaterEffectFeatureType featureType) {
+    return layer.featureType == featureType &&
+           NormalizePathKey(layer.targetLayerSourcePath) == NormalizePathKey(session.sourcePath);
+}
+
+bool RefreshLoadedWaterEffectOutputs(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool preserveSuccessMessages) {
+    if (runtimeState == nullptr || viewport == nullptr || runtimeState->pendingLoad.has_value()) {
+        return false;
+    }
+
+    const auto previousStatus = runtimeState->statusMessage;
+    const auto previousError = runtimeState->errorMessage;
+    const auto previousSelection = runtimeState->selectedSessionIndex;
+    bool attempted = false;
+
+    const bool hasRippleTargets = HasRefreshableWaterEffectLayerForLoadedSession(
+        *runtimeState,
+        runtimeState->water.rippleLayers,
+        WaterEffectFeatureType::Ripple);
+    const bool hasStaleCompositionFields = HasLoadedWaterEffectCompositionFields(*runtimeState);
+    if (hasRippleTargets || hasStaleCompositionFields) {
+        attempted = true;
+        if (!RefreshWaterRippleEffects(runtimeState, viewport)) {
+            return false;
+        }
+    }
+
+    const bool hasFieldRegionTargets = HasRefreshableWaterEffectLayerForLoadedSession(
+        *runtimeState,
+        runtimeState->water.fieldLayers,
+        WaterEffectFeatureType::FieldSurfaceMotion);
+    if (hasFieldRegionTargets) {
+        attempted = true;
+        if (!RefreshWaterFieldOverlays(runtimeState, viewport)) {
+            return false;
+        }
+    }
+
+    if (attempted && preserveSuccessMessages) {
+        runtimeState->statusMessage = previousStatus;
+        runtimeState->errorMessage = previousError;
+        if (previousSelection.has_value() && previousSelection.value() < runtimeState->sessions.size()) {
+            runtimeState->selectedSessionIndex = previousSelection;
+        }
+    }
+    return attempted;
 }
 
 bool RefreshWaterCausticMaskForSession(
@@ -6167,6 +6811,91 @@ bool AddWaterCausticVertexAtScreenPoint(
     return true;
 }
 
+bool AddWaterRippleVertexAtScreenPoint(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
+    if (!pivot.has_value()) {
+        runtimeState->errorMessage = "No visible point-cloud surface was available for ripple placement.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (!runtimeState->water.selectedRippleLayerIndex.has_value() ||
+        runtimeState->water.selectedRippleLayerIndex.value() >= runtimeState->water.rippleLayers.size()) {
+        const auto targetPath = SelectedCausticTargetLayerPath(*runtimeState);
+        if (!targetPath.has_value()) {
+            runtimeState->errorMessage = "Select a loaded LiDAR layer before creating ripples.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        WaterEffectLayer layer;
+        layer.id = NextWaterRippleLayerId(*runtimeState);
+        layer.name = "Ripple " + std::to_string(layer.id);
+        layer.targetLayerSourcePath = targetPath.value();
+        layer.featureType = WaterEffectFeatureType::Ripple;
+        layer.rippleOverlayType = WaterRippleOverlayType::CausticLace;
+        runtimeState->water.nextRippleLayerId = layer.id + 1U;
+        runtimeState->water.rippleLayers.push_back(std::move(layer));
+        runtimeState->water.selectedRippleLayerIndex = runtimeState->water.rippleLayers.size() - 1U;
+    }
+    auto& layer = runtimeState->water.rippleLayers[runtimeState->water.selectedRippleLayerIndex.value()];
+    layer.vertices.push_back(pivot->point);
+    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+    runtimeState->statusMessage =
+        "Added ripple vertex " + std::to_string(layer.vertices.size()) + " to " + layer.name + ".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool AddWaterFieldVertexAtScreenPoint(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
+    if (!pivot.has_value()) {
+        runtimeState->errorMessage = "No visible point-cloud surface was available for field region placement.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (!runtimeState->water.selectedFieldLayerIndex.has_value() ||
+        runtimeState->water.selectedFieldLayerIndex.value() >= runtimeState->water.fieldLayers.size()) {
+        const auto targetPath = SelectedCausticTargetLayerPath(*runtimeState);
+        if (!targetPath.has_value()) {
+            runtimeState->errorMessage = "Select a loaded LiDAR layer before creating a field region.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        WaterEffectLayer layer;
+        layer.id = NextWaterFieldLayerId(*runtimeState);
+        layer.name = "Field Region " + std::to_string(layer.id);
+        layer.targetLayerSourcePath = targetPath.value();
+        layer.featureType = WaterEffectFeatureType::FieldSurfaceMotion;
+        layer.response.intensity = 1.0F;
+        layer.response.emissionAdd = 0.52F;
+        layer.response.opacityAdd = 0.30F;
+        layer.response.colouriseRed = 0.46F;
+        layer.response.colouriseGreen = 0.95F;
+        layer.response.colouriseBlue = 0.78F;
+        runtimeState->water.nextFieldLayerId = layer.id + 1U;
+        runtimeState->water.fieldLayers.push_back(std::move(layer));
+        runtimeState->water.selectedFieldLayerIndex = runtimeState->water.fieldLayers.size() - 1U;
+    }
+    auto& layer = runtimeState->water.fieldLayers[runtimeState->water.selectedFieldLayerIndex.value()];
+    layer.vertices.push_back(pivot->point);
+    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+    runtimeState->statusMessage =
+        "Added field region vertex " + std::to_string(layer.vertices.size()) + " to " + layer.name + ".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
 bool MoveWaterEmitterAtScreenPoint(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -6342,9 +7071,11 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     }
     document.renderJobSettings = runtimeState.renderSettings;
     document.waterEmitters = runtimeState.water.emitters;
-    document.waterBasinRegions = runtimeState.water.basinRegions;
-    document.waterRunoffRegions = runtimeState.water.runoffRegions;
-    document.waterCausticRegions = runtimeState.water.causticRegions;
+    document.waterRippleLayers = runtimeState.water.rippleLayers;
+    document.waterFieldLayers = runtimeState.water.fieldLayers;
+    document.waterFlowStreamSettings = runtimeState.water.flowStreamSettings;
+    document.waterFieldSettings = runtimeState.water.fieldSettings;
+    document.waterFieldStreamSettings = runtimeState.water.fieldStreamSettings;
     document.waterSourceSettings = runtimeState.water.defaultSourceSettings;
     document.tempWaterSourceSettings = runtimeState.water.tempDefaultSourceSettings;
     document.waterAnimationTrailSettings = runtimeState.water.defaultAnimationTrailSettings;
@@ -6449,6 +7180,9 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
                 }
                 appendWaterProjectVisual(normalized, visual.style);
             }
+        }
+        if (IsGeneratedWaterOverlaySession(session)) {
+            continue;
         }
 
         ProjectLayerDocument layerDocument;
@@ -6566,9 +7300,21 @@ bool ApplyProjectDocumentToRuntime(
     }
     runtimeState->renderSettings = renderSettings;
     runtimeState->water.emitters = document.waterEmitters;
-    runtimeState->water.basinRegions = document.waterBasinRegions;
-    runtimeState->water.runoffRegions = document.waterRunoffRegions;
-    runtimeState->water.causticRegions = document.waterCausticRegions;
+    runtimeState->water.basinRegions.clear();
+    runtimeState->water.runoffRegions.clear();
+    runtimeState->water.causticRegions.clear();
+    runtimeState->water.rippleLayers = document.waterRippleLayers;
+    runtimeState->water.fieldLayers = document.waterFieldLayers;
+    runtimeState->water.flowStreamSettings = document.waterFlowStreamSettings;
+    runtimeState->water.fieldSettings = document.waterFieldSettings;
+    runtimeState->water.fieldStreamSettings = document.waterFieldStreamSettings;
+    runtimeState->water.flowOverlay = {};
+    runtimeState->water.flowStreamOverlay = {};
+    runtimeState->water.fieldStreamOverlay = {};
+    runtimeState->water.rippleEffectOverlay = {};
+    runtimeState->water.fieldSurfaceEffectOverlay = {};
+    runtimeState->water.fieldCache = {};
+    runtimeState->water.fieldCacheRevision = 0U;
     runtimeState->water.defaultSourceSettings = document.waterSourceSettings;
     runtimeState->water.tempDefaultSourceSettings = document.tempWaterSourceSettings;
     runtimeState->water.defaultAnimationTrailSettings = document.waterAnimationTrailSettings;
@@ -6639,14 +7385,17 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.nextBasinRegionId = NextWaterBasinRegionId(*runtimeState);
     runtimeState->water.nextRunoffRegionId = NextWaterRunoffRegionId(*runtimeState);
     runtimeState->water.nextCausticRegionId = NextWaterCausticRegionId(*runtimeState);
+    runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
     runtimeState->water.selectedBasinRegionIndex.reset();
     runtimeState->water.selectedRunoffRegionIndex.reset();
     runtimeState->water.selectedCausticRegionIndex.reset();
+    runtimeState->water.selectedRippleLayerIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.basinRegionPlacementArmed = false;
     runtimeState->water.runoffRegionPlacementArmed = false;
     runtimeState->water.causticRegionPlacementArmed = false;
+    runtimeState->water.rippleRegionPlacementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
     if (document.waterPathCache.has_value() && !document.waterPathCache->branches.empty()) {
@@ -6823,6 +7572,7 @@ bool ApplyProjectDocumentToRuntime(
             break;
         }
     }
+    RefreshLoadedWaterEffectOutputs(runtimeState, viewport, true);
     runtimeState->preserveProjectCameraOnNextLayerActivation =
         hasProjectCamera && requestedLoadedLayer && VisibleLayerCount(*runtimeState) == 0;
 
@@ -8829,6 +9579,40 @@ std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers
                 }
             }
         }
+        auto setWaterEffectSlot = [&](std::size_t invisible_places::output::OfflinePointLayer::*member,
+                                      std::string_view fieldName) {
+            if (const auto slot = FindScalarFieldByName(snapshot.cloud->scalarFields, fieldName);
+                slot.has_value() && slot.value() < snapshot.cloud->scalarFields.size()) {
+                layer.*member = slot.value();
+            }
+        };
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectEmissionAddFieldSlot,
+            "water_effect_emission_add");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectOpacityAddFieldSlot,
+            "water_effect_opacity_add");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectOpacityMultiplyFieldSlot,
+            "water_effect_opacity_multiply");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectPointSizeAddFieldSlot,
+            "water_effect_point_size_add");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectPointSizeMultiplyFieldSlot,
+            "water_effect_point_size_multiply");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectColourRedFieldSlot,
+            "water_effect_colour_red");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectColourGreenFieldSlot,
+            "water_effect_colour_green");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectColourBlueFieldSlot,
+            "water_effect_colour_blue");
+        setWaterEffectSlot(
+            &invisible_places::output::OfflinePointLayer::waterEffectColourMixFieldSlot,
+            "water_effect_colour_mix");
         layers.push_back(layer);
     }
     return layers;
@@ -11343,6 +12127,8 @@ const char* WaterRegionFeatureLabel(WaterRegionFeature feature) {
             return "runoff";
         case WaterRegionFeature::Caustic:
             return "caustic";
+        case WaterRegionFeature::Ripple:
+            return "ripple";
         case WaterRegionFeature::None:
             break;
     }
@@ -11357,6 +12143,8 @@ std::size_t WaterRegionCount(const WaterWorkflowState& water, WaterRegionFeature
             return water.runoffRegions.size();
         case WaterRegionFeature::Caustic:
             return water.causticRegions.size();
+        case WaterRegionFeature::Ripple:
+            return water.rippleLayers.size();
         case WaterRegionFeature::None:
             break;
     }
@@ -11371,6 +12159,8 @@ bool WaterRegionPlacementArmed(const WaterWorkflowState& water, WaterRegionFeatu
             return water.runoffRegionPlacementArmed;
         case WaterRegionFeature::Caustic:
             return water.causticRegionPlacementArmed;
+        case WaterRegionFeature::Ripple:
+            return water.rippleRegionPlacementArmed;
         case WaterRegionFeature::None:
             break;
     }
@@ -11387,6 +12177,8 @@ std::optional<std::size_t> SelectedWaterRegionIndex(
             return water.selectedRunoffRegionIndex;
         case WaterRegionFeature::Caustic:
             return water.selectedCausticRegionIndex;
+        case WaterRegionFeature::Ripple:
+            return water.selectedRippleLayerIndex;
         case WaterRegionFeature::None:
             break;
     }
@@ -11409,6 +12201,9 @@ void SelectWaterRegion(
             break;
         case WaterRegionFeature::Caustic:
             runtimeState->water.selectedCausticRegionIndex = regionIndex;
+            break;
+        case WaterRegionFeature::Ripple:
+            runtimeState->water.selectedRippleLayerIndex = regionIndex;
             break;
         case WaterRegionFeature::None:
             break;
@@ -11435,6 +12230,10 @@ std::vector<invisible_places::io::Float3>* WaterRegionVertices(
             return regionIndex < runtimeState->water.causticRegions.size()
                        ? &runtimeState->water.causticRegions[regionIndex].vertices
                        : nullptr;
+        case WaterRegionFeature::Ripple:
+            return regionIndex < runtimeState->water.rippleLayers.size()
+                       ? &runtimeState->water.rippleLayers[regionIndex].vertices
+                       : nullptr;
         case WaterRegionFeature::None:
             break;
     }
@@ -11457,6 +12256,10 @@ const std::vector<invisible_places::io::Float3>* WaterRegionVertices(
         case WaterRegionFeature::Caustic:
             return regionIndex < runtimeState.water.causticRegions.size()
                        ? &runtimeState.water.causticRegions[regionIndex].vertices
+                       : nullptr;
+        case WaterRegionFeature::Ripple:
+            return regionIndex < runtimeState.water.rippleLayers.size()
+                       ? &runtimeState.water.rippleLayers[regionIndex].vertices
                        : nullptr;
         case WaterRegionFeature::None:
             break;
@@ -11481,6 +12284,10 @@ const std::vector<invisible_places::io::Float3>* WaterRegionHull(
             return regionIndex < runtimeState.water.causticRegions.size()
                        ? &runtimeState.water.causticRegions[regionIndex].vertices
                        : nullptr;
+        case WaterRegionFeature::Ripple:
+            return regionIndex < runtimeState.water.rippleLayers.size()
+                       ? &runtimeState.water.rippleLayers[regionIndex].hull
+                       : nullptr;
         case WaterRegionFeature::None:
             break;
     }
@@ -11504,6 +12311,10 @@ std::string WaterRegionName(
             return regionIndex < runtimeState.water.causticRegions.size()
                        ? runtimeState.water.causticRegions[regionIndex].name
                        : "Caustics";
+        case WaterRegionFeature::Ripple:
+            return regionIndex < runtimeState.water.rippleLayers.size()
+                       ? runtimeState.water.rippleLayers[regionIndex].name
+                       : "Ripple";
         case WaterRegionFeature::None:
             break;
     }
@@ -11561,6 +12372,12 @@ void RefreshWaterRegionDerivedValues(
             if (regionIndex < runtimeState->water.causticRegions.size()) {
                 invisible_places::water::RefreshWaterCausticRegionDerivedValues(
                     &runtimeState->water.causticRegions[regionIndex]);
+            }
+            break;
+        case WaterRegionFeature::Ripple:
+            if (regionIndex < runtimeState->water.rippleLayers.size()) {
+                auto& layer = runtimeState->water.rippleLayers[regionIndex];
+                layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
             }
             break;
         case WaterRegionFeature::None:
@@ -11697,6 +12514,11 @@ WaterRegionOverlayPalette WaterRegionPalette(
                 palette.fill = IM_COL32(108, 170, 255, fillAlpha);
                 palette.handle = IM_COL32(226, 240, 255, selected ? 255 : 165);
             }
+            break;
+        case WaterRegionFeature::Ripple:
+            palette.line = IM_COL32(92, 196, 255, alpha);
+            palette.fill = IM_COL32(92, 196, 255, fillAlpha);
+            palette.handle = IM_COL32(226, 246, 255, selected ? 255 : 165);
             break;
         case WaterRegionFeature::None:
             break;
@@ -11996,6 +12818,8 @@ void DrawWaterEmitterOverlay(
         !runtimeState->water.basinRegionPlacementArmed &&
         !runtimeState->water.runoffRegionPlacementArmed &&
         !runtimeState->water.causticRegionPlacementArmed &&
+        !runtimeState->water.rippleRegionPlacementArmed &&
+        !runtimeState->water.fieldRegionPlacementArmed &&
         !runtimeState->water.movingEmitterIndex.has_value();
 
     std::optional<std::size_t> nearestEmitterIndex;
@@ -12341,6 +13165,8 @@ bool HandleWaterPathViewInput(
         !runtimeState->water.basinRegionPlacementArmed &&
         !runtimeState->water.runoffRegionPlacementArmed &&
         !runtimeState->water.causticRegionPlacementArmed &&
+        !runtimeState->water.rippleRegionPlacementArmed &&
+        !runtimeState->water.fieldRegionPlacementArmed &&
         !runtimeState->water.movingEmitterIndex.has_value();
     runtimeState->water.hoveredPathBranchId =
         mouseCanPick ? PickWaterPathBranchAtScreenPoint(runtimeState, *viewport, io.MousePos) : std::nullopt;
@@ -12963,7 +13789,8 @@ void DrawLayerSection(
 }
 
 ScalarBindingWidgetConfig PointSizeBindingConfig(const PreviewLayerSession& session) {
-    if (session.pointStyle.geometryMode != PointCloudGeometryMode::ScreenSprites) {
+    if (session.pointStyle.geometryMode != PointCloudGeometryMode::ScreenSprites ||
+        session.pointStyle.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters) {
         return {.constantMin = 0.0001F,
                 .constantMax = 0.1F,
                 .defaultOutputMin = 0.0001F,
@@ -12987,7 +13814,8 @@ RenderParameterBinding* PointSizeBinding(PreviewLayerSession* session) {
     if (session == nullptr) {
         return nullptr;
     }
-    return session->pointStyle.geometryMode != PointCloudGeometryMode::ScreenSprites
+    return session->pointStyle.geometryMode != PointCloudGeometryMode::ScreenSprites ||
+                   session->pointStyle.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters
                ? &session->pointStyle.surfelDiameter
                : &session->pointStyle.pointSize;
 }
@@ -13012,10 +13840,21 @@ bool DrawPointCloudPointSettingsSection(PreviewLayerSession* session) {
     if (style.geometryMode == PointCloudGeometryMode::WorldSurfels && !session->hasNormals) {
         ImGui::TextDisabled("No normals were loaded; surfels face the camera.");
     }
+    if (style.geometryMode == PointCloudGeometryMode::ScreenSprites) {
+        int sizeModeIndex = static_cast<int>(style.screenSpriteSizeMode);
+        const char* sizeModes[] = {"Pixels", "World Millimeters"};
+        if (DrawRightAlignedCombo("Size Units", &sizeModeIndex, sizeModes, IM_ARRAYSIZE(sizeModes))) {
+            style.screenSpriteSizeMode = static_cast<PointCloudScreenSpriteSizeMode>(sizeModeIndex);
+            changed = true;
+        }
+    }
 
     ImGui::Spacing();
     ImGui::TextUnformatted(
-        style.geometryMode == PointCloudGeometryMode::ScreenSprites ? "Point Size (px)" : "Point Size (mm)");
+        style.geometryMode == PointCloudGeometryMode::ScreenSprites &&
+                style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::Pixels
+            ? "Point Size (px)"
+            : "Point Size (mm)");
     changed |= DrawScalarBindingBody(
         "Point Size",
         PointSizeBinding(session),
@@ -15039,7 +15878,129 @@ void DrawLidarPanel(
     DrawLayerSection(runtimeState, viewport, LayerKind::PointCloud, "Lidar Layers");
 }
 
-void DrawVisualsPanel(PreviewRuntimeState* runtimeState) {
+void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !BeginPanelSection("Point Renderer")) {
+        return;
+    }
+
+    auto& settings = runtimeState->projectSettings;
+    int pointRendererModeIndex =
+        settings.pointCloudRendererMode == PointCloudRendererMode::FastBasic ? 1 : 0;
+    const char* pointRendererModes[] = {"Beauty", "Fast Basic", "Raytraced (later)"};
+    if (ImGui::Combo(
+            "Mode",
+            &pointRendererModeIndex,
+            pointRendererModes,
+            IM_ARRAYSIZE(pointRendererModes))) {
+        if (pointRendererModeIndex == 0) {
+            settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
+        } else if (pointRendererModeIndex == 1) {
+            settings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
+        } else {
+            settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
+            runtimeState->statusMessage = "Raytraced point rendering is reserved for a later implementation.";
+            runtimeState->errorMessage.clear();
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Fast Basic renders opaque 1 px square points, with source RGB, solid colour, scalar colormaps, and colourise.");
+    }
+
+    EndPanelSection();
+}
+
+void DrawWaterEffectStackVisualsSection(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewLayerSession* session) {
+    if (runtimeState == nullptr ||
+        viewport == nullptr ||
+        session == nullptr ||
+        !IsAssociableLidarSession(*session)) {
+        return;
+    }
+
+    const bool hasCompositionFields = SessionHasWaterEffectCompositionFields(*session);
+    const auto hasMatchingRipple = std::any_of(
+        runtimeState->water.rippleLayers.begin(),
+        runtimeState->water.rippleLayers.end(),
+        [&](const WaterEffectLayer& layer) {
+            return WaterEffectLayerTargetsSession(layer, *session, WaterEffectFeatureType::Ripple);
+        });
+    const auto hasMatchingField = std::any_of(
+        runtimeState->water.fieldLayers.begin(),
+        runtimeState->water.fieldLayers.end(),
+        [&](const WaterEffectLayer& layer) {
+            return WaterEffectLayerTargetsSession(layer, *session, WaterEffectFeatureType::FieldSurfaceMotion);
+        });
+    if (!hasCompositionFields && !hasMatchingRipple && !hasMatchingField) {
+        return;
+    }
+
+    if (!BeginPanelSection("Water Effect Stack")) {
+        return;
+    }
+
+    bool requestedRippleRefresh = false;
+    bool requestedFieldRefresh = false;
+    for (std::size_t index = 0; index < runtimeState->water.rippleLayers.size(); ++index) {
+        auto& layer = runtimeState->water.rippleLayers[index];
+        if (!WaterEffectLayerTargetsSession(layer, *session, WaterEffectFeatureType::Ripple)) {
+            continue;
+        }
+        ImGui::PushID(static_cast<int>(index));
+        const std::string label = layer.name + "##VisualRipple";
+        if (ImGui::CollapsingHeader(label.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            bool changed = false;
+            changed |= ImGui::Checkbox("Viewport", &layer.enabledInViewport);
+            ImGui::SameLine();
+            changed |= ImGui::Checkbox("Export", &layer.enabledInExport);
+            changed |= DrawWaterEffectContributionControls("VisualRippleContribution", &layer);
+            if (changed && layer.vertices.size() >= 3U) {
+                requestedRippleRefresh = true;
+            }
+        }
+        ImGui::PopID();
+    }
+
+    for (std::size_t index = 0; index < runtimeState->water.fieldLayers.size(); ++index) {
+        auto& layer = runtimeState->water.fieldLayers[index];
+        if (!WaterEffectLayerTargetsSession(layer, *session, WaterEffectFeatureType::FieldSurfaceMotion)) {
+            continue;
+        }
+        ImGui::PushID(static_cast<int>(index));
+        const std::string label = layer.name + "##VisualField";
+        if (ImGui::CollapsingHeader(label.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            bool changed = false;
+            changed |= ImGui::Checkbox("Viewport", &layer.enabledInViewport);
+            ImGui::SameLine();
+            changed |= ImGui::Checkbox("Export", &layer.enabledInExport);
+            changed |= DrawWaterEffectContributionControls("VisualFieldContribution", &layer);
+            if (changed && layer.vertices.size() >= 3U) {
+                requestedFieldRefresh = true;
+            }
+        }
+        ImGui::PopID();
+    }
+
+    if (hasCompositionFields) {
+        ImGui::TextDisabled("Active fields: water_effect_*");
+    }
+    EndPanelSection();
+
+    if (requestedRippleRefresh) {
+        RefreshWaterRippleEffects(runtimeState, viewport);
+    }
+    if (requestedFieldRefresh) {
+        RefreshWaterFieldOverlays(runtimeState, viewport);
+    }
+}
+
+void DrawVisualsPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    DrawPointRendererPanel(runtimeState);
+
     const auto visualIndex = runtimeState != nullptr ? ResolveLoadedPointCloudLookdevIndex(*runtimeState) : std::nullopt;
     PreviewLayerSession* session =
         visualIndex.has_value() ? &runtimeState->sessions[visualIndex.value()] : nullptr;
@@ -15053,6 +16014,7 @@ void DrawVisualsPanel(PreviewRuntimeState* runtimeState) {
         return;
     }
 
+    DrawWaterEffectStackVisualsSection(runtimeState, viewport, session);
     if (DrawPointCloudStyleSection(session)) {
         MarkPointVisualEdited(session);
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
@@ -15568,6 +16530,603 @@ void DrawWaterCausticsPanel(
     }
 }
 
+const char* WaterRippleOverlayTypeLabel(WaterRippleOverlayType type) {
+    switch (type) {
+        case WaterRippleOverlayType::CausticLace:
+            return "Caustic Lace";
+        case WaterRippleOverlayType::LinearRipples:
+            return "Linear Ripples";
+        case WaterRippleOverlayType::RadialRipples:
+            return "Radial Ripples";
+        case WaterRippleOverlayType::RainRings:
+            return "Rain Rings";
+        case WaterRippleOverlayType::TideBands:
+            return "Tide Bands";
+        case WaterRippleOverlayType::WetSheen:
+            return "Wet Sheen";
+        case WaterRippleOverlayType::CurrentThreads:
+            return "Current Threads";
+        case WaterRippleOverlayType::DropletGlints:
+            return "Droplet Glints";
+        case WaterRippleOverlayType::DripTrails:
+            return "Drip Trails";
+        case WaterRippleOverlayType::FoamSparkle:
+            return "Foam Sparkle";
+        case WaterRippleOverlayType::SaltMineralShimmer:
+            return "Salt/Mineral Shimmer";
+    }
+    return "Caustic Lace";
+}
+
+const char* WaterEffectBlendModeLabel(WaterEffectBlendMode mode) {
+    switch (mode) {
+        case WaterEffectBlendMode::Add:
+            return "Add";
+        case WaterEffectBlendMode::Max:
+            return "Max";
+        case WaterEffectBlendMode::Multiply:
+            return "Multiply";
+        case WaterEffectBlendMode::Screen:
+            return "Screen";
+        case WaterEffectBlendMode::Override:
+            return "Override";
+    }
+    return "Add";
+}
+
+bool DrawWaterEffectContributionControls(const char* id, WaterEffectLayer* layer) {
+    if (layer == nullptr) {
+        return false;
+    }
+
+    bool changed = false;
+    ImGui::PushID(id);
+    constexpr std::array<WaterEffectBlendMode, 5> blendModes{{
+        WaterEffectBlendMode::Add,
+        WaterEffectBlendMode::Max,
+        WaterEffectBlendMode::Multiply,
+        WaterEffectBlendMode::Screen,
+        WaterEffectBlendMode::Override,
+    }};
+    if (ImGui::BeginCombo("Blend", WaterEffectBlendModeLabel(layer->blendMode))) {
+        for (const auto mode : blendModes) {
+            const bool selected = layer->blendMode == mode;
+            if (ImGui::Selectable(WaterEffectBlendModeLabel(mode), selected)) {
+                layer->blendMode = mode;
+                changed = true;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    changed |= ImGui::SliderFloat("Effect Intensity", &layer->response.intensity, 0.0F, 3.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Emission Add", &layer->response.emissionAdd, 0.0F, 4.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Opacity Add", &layer->response.opacityAdd, -1.0F, 1.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Opacity Multiply", &layer->response.opacityMultiply, 0.0F, 3.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Point Size Add", &layer->response.pointSizeAdd, -2.0F, 8.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Point Size Multiply", &layer->response.pointSizeMultiply, 0.0F, 4.0F, "%.2f");
+    changed |= ImGui::SliderFloat("Colourise Amount", &layer->response.colouriseAmount, 0.0F, 1.0F, "%.2f");
+    float colour[3] = {
+        layer->response.colouriseRed,
+        layer->response.colouriseGreen,
+        layer->response.colouriseBlue};
+    if (ImGui::ColorEdit3("Colourise", colour)) {
+        layer->response.colouriseRed = colour[0];
+        layer->response.colouriseGreen = colour[1];
+        layer->response.colouriseBlue = colour[2];
+        changed = true;
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+void DrawWaterRipplesPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    if (BeginPanelSection("Ripple Layers")) {
+        if (ImGui::Button("New Ripple Layer")) {
+            const auto targetPath = SelectedCausticTargetLayerPath(*runtimeState);
+            if (!targetPath.has_value()) {
+                runtimeState->errorMessage = "Select a loaded LiDAR layer before creating ripples.";
+                runtimeState->statusMessage.clear();
+            } else {
+                WaterEffectLayer layer;
+                layer.id = NextWaterRippleLayerId(*runtimeState);
+                layer.name = "Ripple " + std::to_string(layer.id);
+                layer.featureType = WaterEffectFeatureType::Ripple;
+                layer.rippleOverlayType = WaterRippleOverlayType::CausticLace;
+                layer.targetLayerSourcePath = targetPath.value();
+                water.nextRippleLayerId = layer.id + 1U;
+                water.rippleLayers.push_back(std::move(layer));
+                water.selectedRippleLayerIndex = water.rippleLayers.size() - 1U;
+                water.rippleRegionPlacementArmed = true;
+                water.placementArmed = false;
+                water.movingEmitterIndex.reset();
+                water.basinRegionPlacementArmed = false;
+                water.runoffRegionPlacementArmed = false;
+                water.causticRegionPlacementArmed = false;
+                water.fieldRegionPlacementArmed = false;
+                runtimeState->statusMessage = "Click LiDAR points to add ripple boundary vertices.";
+                runtimeState->errorMessage.clear();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(water.rippleRegionPlacementArmed ? "Stop Adding Vertices" : "Add Vertices")) {
+            water.rippleRegionPlacementArmed = !water.rippleRegionPlacementArmed;
+            water.placementArmed = false;
+            water.movingEmitterIndex.reset();
+            water.basinRegionPlacementArmed = false;
+            water.runoffRegionPlacementArmed = false;
+            water.causticRegionPlacementArmed = false;
+            water.fieldRegionPlacementArmed = false;
+            runtimeState->statusMessage = water.rippleRegionPlacementArmed
+                                              ? "Click LiDAR points to add ripple boundary vertices."
+                                              : "Ripple vertex placement stopped.";
+            runtimeState->errorMessage.clear();
+        }
+
+        if (water.rippleLayers.empty()) {
+            ImGui::TextUnformatted("No ripple layers yet.");
+        } else {
+            const char* currentLabel =
+                water.selectedRippleLayerIndex.has_value() &&
+                        water.selectedRippleLayerIndex.value() < water.rippleLayers.size()
+                    ? water.rippleLayers[water.selectedRippleLayerIndex.value()].name.c_str()
+                    : "Select ripple";
+            if (ImGui::BeginCombo("Layer", currentLabel)) {
+                for (std::size_t index = 0; index < water.rippleLayers.size(); ++index) {
+                    const bool selected =
+                        water.selectedRippleLayerIndex.has_value() &&
+                        water.selectedRippleLayerIndex.value() == index;
+                    if (ImGui::Selectable(water.rippleLayers[index].name.c_str(), selected)) {
+                        water.selectedRippleLayerIndex = index;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (water.selectedRippleLayerIndex.has_value() &&
+                water.selectedRippleLayerIndex.value() < water.rippleLayers.size()) {
+                auto& layer = water.rippleLayers[water.selectedRippleLayerIndex.value()];
+                InputTextString("Name", &layer.name);
+                const auto targetIndex = FindSessionIndexBySourcePath(*runtimeState, layer.targetLayerSourcePath);
+                const std::string targetLabel =
+                    targetIndex.has_value() && targetIndex.value() < runtimeState->sessions.size()
+                        ? runtimeState->sessions[targetIndex.value()].displayName
+                        : layer.targetLayerSourcePath.filename().string();
+                ImGui::TextDisabled("Target: %s", targetLabel.empty() ? "Missing layer" : targetLabel.c_str());
+                ImGui::TextDisabled(
+                    "Boundary vertices: %s",
+                    FormatPointCount(layer.vertices.size()).c_str());
+                bool changed = false;
+                changed |= ImGui::Checkbox("Viewport", &layer.enabledInViewport);
+                ImGui::SameLine();
+                changed |= ImGui::Checkbox("Export", &layer.enabledInExport);
+                const std::array<WaterRippleOverlayType, 11> overlayTypes{
+                    WaterRippleOverlayType::CausticLace,
+                    WaterRippleOverlayType::LinearRipples,
+                    WaterRippleOverlayType::RadialRipples,
+                    WaterRippleOverlayType::RainRings,
+                    WaterRippleOverlayType::TideBands,
+                    WaterRippleOverlayType::WetSheen,
+                    WaterRippleOverlayType::CurrentThreads,
+                    WaterRippleOverlayType::DropletGlints,
+                    WaterRippleOverlayType::DripTrails,
+                    WaterRippleOverlayType::FoamSparkle,
+                    WaterRippleOverlayType::SaltMineralShimmer};
+                if (ImGui::BeginCombo("Overlay", WaterRippleOverlayTypeLabel(layer.rippleOverlayType))) {
+                    for (const auto type : overlayTypes) {
+                        const bool selected = layer.rippleOverlayType == type;
+                        if (ImGui::Selectable(WaterRippleOverlayTypeLabel(type), selected)) {
+                            layer.rippleOverlayType = type;
+                            changed = true;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (ImGui::Button("Close Boundary")) {
+                    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+                    water.rippleRegionPlacementArmed = false;
+                    runtimeState->statusMessage =
+                        layer.hull.size() >= 3U ? "Ripple boundary closed." : "Add at least three ripple vertices.";
+                    runtimeState->errorMessage.clear();
+                    changed = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove Last Vertex") && !layer.vertices.empty()) {
+                    layer.vertices.pop_back();
+                    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+                    changed = true;
+                }
+                changed |= ImGui::SliderFloat("Edge Blend", &layer.edgeBlendWidth, 0.01F, 5.0F, "%.2f m");
+                changed |= ImGui::SliderFloat("Strength", &layer.regionStrength, 0.0F, 3.0F, "%.2f");
+                changed |= ImGui::SliderFloat(
+                    "Wavelength",
+                    &layer.wavelengthMeters,
+                    0.01F,
+                    3.0F,
+                    "%.3f m",
+                    ImGuiSliderFlags_Logarithmic);
+                changed |= ImGui::SliderFloat("Speed", &layer.speed, 0.0F, 4.0F, "%.2f");
+                changed |= ImGui::SliderFloat("Warp", &layer.warp, 0.0F, 2.0F, "%.2f");
+                changed |= ImGui::SliderFloat("Turbulence", &layer.turbulence, 0.0F, 1.0F, "%.2f");
+                float direction[3] = {layer.directionX, layer.directionY, layer.directionZ};
+                if (ImGui::InputFloat3("Direction", direction, "%.2f")) {
+                    layer.directionX = direction[0];
+                    layer.directionY = direction[1];
+                    layer.directionZ = direction[2];
+                    changed = true;
+                }
+                changed |= DrawWaterEffectContributionControls("RippleContribution", &layer);
+                int maxAffected = static_cast<int>(layer.maxAffectedPoints);
+                if (ImGui::SliderInt("Max Points", &maxAffected, 512, 1000000)) {
+                    layer.maxAffectedPoints = static_cast<std::uint32_t>(std::max(512, maxAffected));
+                    changed = true;
+                }
+                if (changed) {
+                    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+                    if (layer.vertices.size() >= 3U) {
+                        RefreshWaterRippleEffects(runtimeState, viewport);
+                    }
+                }
+                if (ImGui::Button("Refresh Ripples")) {
+                    RefreshWaterRippleEffects(runtimeState, viewport);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Delete Layer")) {
+                    water.rippleLayers.erase(
+                        water.rippleLayers.begin() +
+                        static_cast<std::ptrdiff_t>(water.selectedRippleLayerIndex.value()));
+                    water.selectedRippleLayerIndex.reset();
+                    water.rippleRegionPlacementArmed = false;
+                    RefreshWaterRippleEffects(runtimeState, viewport);
+                }
+            }
+        }
+        if (!water.lastRippleOverlayPath.empty()) {
+            ImGui::TextDisabled("Last overlay: %s", water.lastRippleOverlayPath.filename().string().c_str());
+        }
+        EndPanelSection();
+    }
+}
+
+const char* WaterFieldOutputModeLabel(WaterFieldOutputMode mode) {
+    switch (mode) {
+        case WaterFieldOutputMode::Streamlines:
+            return "Streamlines";
+        case WaterFieldOutputMode::SurfaceMotion:
+            return "Surface Motion";
+        case WaterFieldOutputMode::Both:
+            return "Both";
+    }
+    return "Both";
+}
+
+const char* WaterFieldLayerFeatureLabel(WaterEffectFeatureType type) {
+    switch (type) {
+        case WaterEffectFeatureType::FieldBridgeAllowedRegion:
+            return "Bridge Allowed";
+        case WaterEffectFeatureType::FieldBridgeBlockedRegion:
+            return "Bridge Blocked";
+        case WaterEffectFeatureType::FieldNoFlowRegion:
+            return "No Flow";
+        case WaterEffectFeatureType::FieldSurfaceMotion:
+            return "Surface Motion";
+        case WaterEffectFeatureType::Ripple:
+            return "Ripple";
+    }
+    return "Surface Motion";
+}
+
+WaterEffectLayer MakeNewFieldLayer(
+    const PreviewRuntimeState& runtimeState,
+    WaterEffectFeatureType featureType,
+    std::string_view prefix,
+    const std::filesystem::path& targetPath) {
+    WaterEffectLayer layer;
+    layer.id = NextWaterFieldLayerId(runtimeState);
+    layer.name = std::string{prefix} + " " + std::to_string(layer.id);
+    layer.featureType = featureType;
+    layer.targetLayerSourcePath = targetPath;
+    layer.response.intensity = 1.0F;
+    layer.response.emissionAdd = featureType == WaterEffectFeatureType::FieldSurfaceMotion ? 0.52F : 0.0F;
+    layer.response.opacityAdd = featureType == WaterEffectFeatureType::FieldSurfaceMotion ? 0.30F : 0.0F;
+    layer.response.colouriseRed = 0.46F;
+    layer.response.colouriseGreen = 0.95F;
+    layer.response.colouriseBlue = 0.78F;
+    return layer;
+}
+
+void DrawWaterFieldPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    if (BeginPanelSection("Field")) {
+        bool changed = false;
+        changed |= ImGui::Checkbox("Enabled", &water.fieldSettings.enabled);
+        const std::array<WaterFieldOutputMode, 3> outputModes{
+            WaterFieldOutputMode::Both,
+            WaterFieldOutputMode::Streamlines,
+            WaterFieldOutputMode::SurfaceMotion};
+        if (ImGui::BeginCombo("Output", WaterFieldOutputModeLabel(water.fieldSettings.outputMode))) {
+            for (const auto mode : outputModes) {
+                const bool selected = water.fieldSettings.outputMode == mode;
+                if (ImGui::Selectable(WaterFieldOutputModeLabel(mode), selected)) {
+                    water.fieldSettings.outputMode = mode;
+                    changed = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        auto createFieldLayer = [&](WaterEffectFeatureType featureType, std::string_view prefix) {
+            const auto targetPath = SelectedCausticTargetLayerPath(*runtimeState);
+            if (!targetPath.has_value()) {
+                runtimeState->errorMessage = "Select a loaded LiDAR layer before creating a Field region.";
+                runtimeState->statusMessage.clear();
+                return;
+            }
+            WaterEffectLayer layer = MakeNewFieldLayer(*runtimeState, featureType, prefix, targetPath.value());
+            water.nextFieldLayerId = layer.id + 1U;
+            water.fieldLayers.push_back(std::move(layer));
+            water.selectedFieldLayerIndex = water.fieldLayers.size() - 1U;
+            water.fieldRegionPlacementArmed = true;
+            water.placementArmed = false;
+            water.movingEmitterIndex.reset();
+            water.basinRegionPlacementArmed = false;
+            water.runoffRegionPlacementArmed = false;
+            water.causticRegionPlacementArmed = false;
+            water.rippleRegionPlacementArmed = false;
+            runtimeState->statusMessage =
+                "Click LiDAR points to add " +
+                std::string{WaterFieldLayerFeatureLabel(featureType)} +
+                " boundary vertices.";
+            runtimeState->errorMessage.clear();
+        };
+        if (ImGui::Button("New Field Region")) {
+            createFieldLayer(WaterEffectFeatureType::FieldSurfaceMotion, "Field Region");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New No Flow")) {
+            createFieldLayer(WaterEffectFeatureType::FieldNoFlowRegion, "No Flow");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New Bridge Allow")) {
+            createFieldLayer(WaterEffectFeatureType::FieldBridgeAllowedRegion, "Bridge Allow");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New Bridge Block")) {
+            createFieldLayer(WaterEffectFeatureType::FieldBridgeBlockedRegion, "Bridge Block");
+        }
+        if (ImGui::Button(water.fieldRegionPlacementArmed ? "Stop Field Vertices" : "Add Field Vertices")) {
+            water.fieldRegionPlacementArmed = !water.fieldRegionPlacementArmed;
+            water.placementArmed = false;
+            water.movingEmitterIndex.reset();
+            water.basinRegionPlacementArmed = false;
+            water.runoffRegionPlacementArmed = false;
+            water.causticRegionPlacementArmed = false;
+            water.rippleRegionPlacementArmed = false;
+            runtimeState->statusMessage = water.fieldRegionPlacementArmed
+                                              ? "Click LiDAR points to add Field region boundary vertices."
+                                              : "Field region vertex placement stopped.";
+            runtimeState->errorMessage.clear();
+        }
+        if (!water.fieldLayers.empty()) {
+            const char* currentFieldLabel =
+                water.selectedFieldLayerIndex.has_value() &&
+                        water.selectedFieldLayerIndex.value() < water.fieldLayers.size()
+                    ? water.fieldLayers[water.selectedFieldLayerIndex.value()].name.c_str()
+                    : "Select Field region";
+            if (ImGui::BeginCombo("Field Region", currentFieldLabel)) {
+                for (std::size_t index = 0; index < water.fieldLayers.size(); ++index) {
+                    const bool selected =
+                        water.selectedFieldLayerIndex.has_value() &&
+                        water.selectedFieldLayerIndex.value() == index;
+                    if (ImGui::Selectable(water.fieldLayers[index].name.c_str(), selected)) {
+                        water.selectedFieldLayerIndex = index;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (water.selectedFieldLayerIndex.has_value() &&
+                water.selectedFieldLayerIndex.value() < water.fieldLayers.size()) {
+                auto& layer = water.fieldLayers[water.selectedFieldLayerIndex.value()];
+                InputTextString("Field Region Name", &layer.name);
+                const auto targetIndex = FindSessionIndexBySourcePath(*runtimeState, layer.targetLayerSourcePath);
+                const std::string targetLabel =
+                    targetIndex.has_value() && targetIndex.value() < runtimeState->sessions.size()
+                        ? runtimeState->sessions[targetIndex.value()].displayName
+                        : layer.targetLayerSourcePath.filename().string();
+                ImGui::TextDisabled("Field target: %s", targetLabel.empty() ? "Missing layer" : targetLabel.c_str());
+                ImGui::TextDisabled("Field type: %s", WaterFieldLayerFeatureLabel(layer.featureType));
+                ImGui::TextDisabled("Field vertices: %s", FormatPointCount(layer.vertices.size()).c_str());
+                bool regionChanged = false;
+                regionChanged |= ImGui::Checkbox("Field Region Viewport", &layer.enabledInViewport);
+                ImGui::SameLine();
+                regionChanged |= ImGui::Checkbox("Field Region Export", &layer.enabledInExport);
+                if (ImGui::Button("Close Field Boundary")) {
+                    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+                    water.fieldRegionPlacementArmed = false;
+                    runtimeState->statusMessage =
+                        layer.vertices.size() >= 3U ? "Field region boundary closed." : "Add at least three Field vertices.";
+                    runtimeState->errorMessage.clear();
+                    regionChanged = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove Field Vertex") && !layer.vertices.empty()) {
+                    layer.vertices.pop_back();
+                    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+                    regionChanged = true;
+                }
+                const bool surfaceLayer = layer.featureType == WaterEffectFeatureType::FieldSurfaceMotion;
+                if (surfaceLayer) {
+                    float direction[3] = {layer.directionX, layer.directionY, layer.directionZ};
+                    if (ImGui::InputFloat3("Field Direction", direction, "%.2f")) {
+                        layer.directionX = direction[0];
+                        layer.directionY = direction[1];
+                        layer.directionZ = direction[2];
+                        regionChanged = true;
+                    }
+                }
+                regionChanged |= ImGui::SliderFloat("Field Edge Blend", &layer.edgeBlendWidth, 0.01F, 5.0F, "%.2f m");
+                regionChanged |= ImGui::SliderFloat("Field Region Strength", &layer.regionStrength, 0.0F, 3.0F, "%.2f");
+                if (surfaceLayer) {
+                    regionChanged |= DrawWaterEffectContributionControls("FieldContribution", &layer);
+                    int maxAffected = static_cast<int>(layer.maxAffectedPoints);
+                    if (ImGui::SliderInt("Field Region Max Points", &maxAffected, 512, 1000000)) {
+                        layer.maxAffectedPoints = static_cast<std::uint32_t>(std::max(512, maxAffected));
+                        regionChanged = true;
+                    }
+                }
+                if (regionChanged) {
+                    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+                    if (layer.vertices.size() >= 3U) {
+                        RefreshWaterFieldOverlays(runtimeState, viewport);
+                    } else if (!water.fieldCache.nodes.empty()) {
+                        water.fieldCache.stale = true;
+                    }
+                }
+                if (ImGui::Button("Delete Field Region")) {
+                    water.fieldLayers.erase(
+                        water.fieldLayers.begin() +
+                        static_cast<std::ptrdiff_t>(water.selectedFieldLayerIndex.value()));
+                    water.selectedFieldLayerIndex.reset();
+                    water.fieldRegionPlacementArmed = false;
+                    if (!water.fieldCache.nodes.empty()) {
+                        water.fieldCache.stale = true;
+                    }
+                }
+            }
+        }
+        changed |= ImGui::SliderFloat(
+            "Corridor Radius",
+            &water.fieldSettings.corridorRadiusMeters,
+            0.02F,
+            3.0F,
+            "%.2f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat(
+            "Field Resolution",
+            &water.fieldSettings.fieldResolutionMeters,
+            0.002F,
+            0.20F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat("Guide Weight", &water.fieldSettings.guideWeight, 0.0F, 2.0F, "%.2f");
+        changed |= ImGui::SliderFloat("Downhill Weight", &water.fieldSettings.downhillWeight, 0.0F, 2.0F, "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Bridge Limit",
+            &water.fieldSettings.maxBridgeDistanceMeters,
+            0.001F,
+            0.50F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat("Bridge Aggression", &water.fieldSettings.bridgeAggression, 0.0F, 1.0F, "%.2f");
+        changed |= ImGui::SliderFloat(
+            "Confidence Fade",
+            &water.fieldSettings.surfaceConfidenceThreshold,
+            0.0F,
+            1.0F,
+            "%.2f");
+        changed |= ImGui::SliderFloat("Field Turbulence", &water.fieldSettings.turbulence, 0.0F, 1.0F, "%.2f");
+
+        int streamlineCount = static_cast<int>(water.fieldStreamSettings.streamlineCount);
+        if (ImGui::SliderInt("Streamlines", &streamlineCount, 1, 10000)) {
+            water.fieldStreamSettings.streamlineCount =
+                static_cast<std::uint32_t>(std::max(1, streamlineCount));
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "Streamline Length",
+            &water.fieldStreamSettings.streamlineLengthMeters,
+            0.03F,
+            5.0F,
+            "%.2f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat(
+            "Step Length",
+            &water.fieldStreamSettings.stepLengthMeters,
+            0.002F,
+            0.20F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat(
+            "Streamline Width",
+            &water.fieldStreamSettings.streamlineWidthMeters,
+            0.001F,
+            0.08F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat(
+            "World Length",
+            &water.fieldStreamSettings.streamWorldLengthMeters,
+            0.002F,
+            0.30F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        changed |= ImGui::SliderFloat("Momentum", &water.fieldStreamSettings.momentum, 0.0F, 1.0F, "%.2f");
+        changed |= ImGui::Checkbox("Fade Low Confidence", &water.fieldStreamSettings.fadeOnLowConfidence);
+        if (changed && !water.fieldCache.nodes.empty()) {
+            water.fieldCache.stale = true;
+        }
+        if (ImGui::Button("Build Field")) {
+            RefreshWaterFieldOverlays(runtimeState, viewport);
+        }
+        if (!water.fieldCache.nodes.empty()) {
+            ImGui::TextDisabled(
+                "Cache nodes: %s%s",
+                FormatPointCount(water.fieldCache.nodes.size()).c_str(),
+                water.fieldCache.stale ? "  | stale" : "");
+        }
+        if (!water.lastFieldStreamOverlayPath.empty()) {
+            ImGui::TextDisabled("Streamlines: %s", water.lastFieldStreamOverlayPath.filename().string().c_str());
+        }
+        if (water.fieldStreamOverlay.fieldDiagnostics.inputNodeCount > 0U) {
+            const auto& diagnostics = water.fieldStreamOverlay.fieldDiagnostics;
+            ImGui::TextDisabled(
+                "Field gaps: accepted %u  rejected %u  faded %u  stopped %u",
+                diagnostics.acceptedBridgeCount,
+                diagnostics.rejectedGapCount,
+                diagnostics.lowConfidenceFadeCount,
+                diagnostics.lowConfidenceTerminationCount);
+            ImGui::TextDisabled(
+                "Manual controls: no-flow %u  bridge allowed %u  bridge blocked %u",
+                diagnostics.manualNoFlowBlockCount,
+                diagnostics.manualBridgeAllowedCount,
+                diagnostics.manualBridgeBlockedCount);
+            ImGui::TextDisabled(
+                "Field output: paths %u  samples %u  max bridge %.3f m  min rejected %.3f m",
+                diagnostics.emittedPathCount,
+                diagnostics.emittedSampleCount,
+                diagnostics.maxAcceptedBridgeMeters,
+                diagnostics.minRejectedGapMeters);
+        }
+        if (!water.lastFieldSurfaceOverlayPath.empty()) {
+            ImGui::TextDisabled("Surface: %s", water.lastFieldSurfaceOverlayPath.filename().string().c_str());
+        }
+        EndPanelSection();
+    }
+}
+
 void DrawWaterPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -15579,7 +17138,13 @@ void DrawWaterPanel(
     if (!ImGui::BeginTabBar("WaterFeatureTabs")) {
         return;
     }
+    if (ImGui::BeginTabItem("Ripples")) {
+        water.activeRegionFeature = WaterRegionFeature::Ripple;
+        DrawWaterRipplesPanel(runtimeState, viewport);
+        ImGui::EndTabItem();
+    }
     if (ImGui::BeginTabItem("Flow")) {
+    water.activeRegionFeature = WaterRegionFeature::None;
     if (BeginPanelSection("Water Sources")) {
         auto activeSupportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
         const char* activeLabel =
@@ -15903,8 +17468,83 @@ void DrawWaterPanel(
             EndPanelSection();
         }
 
+        if (BeginPanelSection("Flow Streams")) {
+            auto streamSettings = water.flowStreamSettings;
+            bool streamChanged = false;
+            streamChanged |= ImGui::Checkbox("Enabled", &streamSettings.enabled);
+            int streamCount = static_cast<int>(streamSettings.streamCountTotal);
+            if (ImGui::SliderInt("Stream Count", &streamCount, 1, 8000)) {
+                streamSettings.streamCountTotal = static_cast<std::uint32_t>(std::max(1, streamCount));
+                streamChanged = true;
+            }
+            streamChanged |= ImGui::SliderFloat(
+                "Stream Length",
+                &streamSettings.streamLengthMeters,
+                0.03F,
+                5.0F,
+                "%.2f m",
+                ImGuiSliderFlags_Logarithmic);
+            streamChanged |= ImGui::SliderFloat(
+                "Point Spacing",
+                &streamSettings.streamPointSpacingMeters,
+                0.002F,
+                0.20F,
+                "%.3f m",
+                ImGuiSliderFlags_Logarithmic);
+            streamChanged |= ImGui::SliderFloat(
+                "Width",
+                &streamSettings.streamWidthMeters,
+                0.001F,
+                0.08F,
+                "%.3f m",
+                ImGuiSliderFlags_Logarithmic);
+            streamChanged |= ImGui::SliderFloat(
+                "World Length",
+                &streamSettings.streamWorldLengthMeters,
+                0.002F,
+                0.30F,
+                "%.3f m",
+                ImGuiSliderFlags_Logarithmic);
+            streamChanged |= ImGui::SliderFloat(
+                "Lane Spread",
+                &streamSettings.laneSpreadMeters,
+                0.0F,
+                1.0F,
+                "%.2f m");
+            streamChanged |= ImGui::SliderFloat("Turbulence", &streamSettings.turbulence, 0.0F, 1.0F, "%.2f");
+            streamChanged |= ImGui::SliderFloat(
+                "Speed",
+                &streamSettings.speedMetersPerSecond,
+                0.01F,
+                3.0F,
+                "%.2f m/s",
+                ImGuiSliderFlags_Logarithmic);
+            int seed = static_cast<int>(streamSettings.seed);
+            if (ImGui::InputInt("Seed", &seed)) {
+                streamSettings.seed = static_cast<std::uint32_t>(std::max(0, seed));
+                streamChanged = true;
+            }
+            streamSettings.streamLengthMeters = std::clamp(streamSettings.streamLengthMeters, 0.001F, 50.0F);
+            streamSettings.streamPointSpacingMeters =
+                std::clamp(streamSettings.streamPointSpacingMeters, 0.001F, 10.0F);
+            streamSettings.streamWidthMeters = std::clamp(streamSettings.streamWidthMeters, 0.0005F, 1.0F);
+            streamSettings.streamWorldLengthMeters =
+                std::clamp(streamSettings.streamWorldLengthMeters, 0.001F, 5.0F);
+            streamSettings.laneSpreadMeters = std::clamp(streamSettings.laneSpreadMeters, 0.0F, 10.0F);
+            streamSettings.turbulence = std::clamp(streamSettings.turbulence, 0.0F, 5.0F);
+            streamSettings.speedMetersPerSecond = std::clamp(streamSettings.speedMetersPerSecond, 0.001F, 10.0F);
+            if (streamChanged) {
+                water.flowStreamSettings = streamSettings;
+                RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+            }
+            if (ImGui::Button("Regenerate Streams")) {
+                RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+            }
+            EndPanelSection();
+        }
+
         visibleSourceSettings = ViewedWaterSourceSettings(*runtimeState);
-        if (BeginPanelSection("Trail Shape")) {
+        if (false && BeginPanelSection("Trail Shape")) {
             auto trailShapeSettings = visibleSourceSettings.trailShape;
             bool trailShapeChanged = false;
             trailShapeChanged |= ImGui::SliderFloat(
@@ -15960,7 +17600,7 @@ void DrawWaterPanel(
             EndPanelSection();
         }
 
-        if (BeginPanelSection("Animation Trail Playback")) {
+        if (false && BeginPanelSection("Animation Trail Playback")) {
             EnsureWaterAnimationTrailProfiles(&water);
             const auto selectedTrailProfile =
                 NormalizeWaterAnimationTrailProfileName(water.selectedAnimationTrailProfileName);
@@ -16154,6 +17794,7 @@ void DrawWaterPanel(
                     water.basinRegionPlacementArmed = false;
                     water.runoffRegionPlacementArmed = false;
                     water.causticRegionPlacementArmed = false;
+                    water.rippleRegionPlacementArmed = false;
                     SelectWaterEmitterInViewport(runtimeState, *viewport, index);
                     runtimeState->statusMessage = "Click the point-cloud viewport to move " + emitter.name + ".";
                 }
@@ -16206,19 +17847,9 @@ void DrawWaterPanel(
     ImGui::EndTabItem();
     }
 
-    if (ImGui::BeginTabItem("Basin Haze")) {
-        water.activeRegionFeature = WaterRegionFeature::Basin;
-        DrawWaterBasinPanel(runtimeState, viewport);
-        ImGui::EndTabItem();
-    }
-    if (ImGui::BeginTabItem("Runoff")) {
-        water.activeRegionFeature = WaterRegionFeature::Runoff;
-        DrawWaterRunoffPanel(runtimeState, viewport);
-        ImGui::EndTabItem();
-    }
-    if (ImGui::BeginTabItem("Caustics")) {
-        water.activeRegionFeature = WaterRegionFeature::Caustic;
-        DrawWaterCausticsPanel(runtimeState, viewport);
+    if (ImGui::BeginTabItem("Field")) {
+        water.activeRegionFeature = WaterRegionFeature::None;
+        DrawWaterFieldPanel(runtimeState, viewport);
         ImGui::EndTabItem();
     }
     ImGui::EndTabBar();
@@ -16249,28 +17880,6 @@ void DrawProjectPanel(
     ImGui::Checkbox("Live Visual Effects", &settings.liveVisualEffects);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Allows time-driven water and stylisation effects to update in preview.");
-    }
-
-    int pointRendererModeIndex =
-        settings.pointCloudRendererMode == PointCloudRendererMode::FastBasic ? 1 : 0;
-    const char* pointRendererModes[] = {"Beauty", "Fast Basic", "Raytraced (later)"};
-    if (ImGui::Combo(
-            "Point Renderer",
-            &pointRendererModeIndex,
-            pointRendererModes,
-            IM_ARRAYSIZE(pointRendererModes))) {
-        if (pointRendererModeIndex == 0) {
-            settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
-        } else if (pointRendererModeIndex == 1) {
-            settings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
-        } else {
-            settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
-            runtimeState->statusMessage = "Raytraced point rendering is reserved for a later implementation.";
-            runtimeState->errorMessage.clear();
-        }
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Fast Basic renders opaque 1 px square points, with source RGB, solid colour, scalar colormaps, and colourise.");
     }
 
     int pointLodModeIndex = static_cast<int>(settings.pointCloudPreviewLodMode);
@@ -16663,7 +18272,7 @@ void DrawControlsWindow(
         }
         if (ImGui::BeginTabItem("Visuals")) {
             if (ImGui::BeginChild("VisualsTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
-                DrawVisualsPanel(runtimeState);
+                DrawVisualsPanel(runtimeState, viewport);
             }
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -16779,6 +18388,29 @@ void UpdateCameraFromInput(
         !viewport.UiWantsMouseCapture() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         AddWaterCausticVertexAtScreenPoint(runtimeState, viewport, io.MousePos);
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
+    if (runtimeState->water.rippleRegionPlacementArmed &&
+        renderViewportHovered &&
+        !viewport.UiWantsMouseCapture() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (AddWaterRippleVertexAtScreenPoint(runtimeState, viewport, io.MousePos)) {
+            RefreshWaterRippleEffects(runtimeState, &viewport);
+        }
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
+    if (runtimeState->water.fieldRegionPlacementArmed &&
+        renderViewportHovered &&
+        !viewport.UiWantsMouseCapture() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (AddWaterFieldVertexAtScreenPoint(runtimeState, viewport, io.MousePos) &&
+            runtimeState->water.selectedFieldLayerIndex.has_value() &&
+            runtimeState->water.selectedFieldLayerIndex.value() < runtimeState->water.fieldLayers.size() &&
+            runtimeState->water.fieldLayers[runtimeState->water.selectedFieldLayerIndex.value()].vertices.size() >= 3U) {
+            RefreshWaterFieldOverlays(runtimeState, &viewport);
+        }
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }

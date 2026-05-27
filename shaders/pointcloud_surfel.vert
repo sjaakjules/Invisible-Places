@@ -63,6 +63,9 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 causticParams1;
     vec4 causticParams2;
     vec4 causticTint;
+    uvec4 waterEffectControl;
+    uvec4 waterEffectSlots0;
+    uvec4 waterEffectSlots1;
 } styleData;
 
 layout(set = 0, binding = 4, std430) readonly buffer SurfelPositions {
@@ -92,6 +95,17 @@ const uint kWaterPathCountFieldSlot = 11u;
 const uint kWaterJitterSeedFieldSlot = 12u;
 const uint kWaterTrailAgeFieldSlot = 13u;
 const uint kWaterFeatureTypeFieldSlot = 15u;
+const uint kWaterStreamPointSeedFieldSlot = 5u;
+const uint kWaterStreamPointAgeFieldSlot = 8u;
+const uint kWaterStreamSpeedFieldSlot = 10u;
+const uint kWaterStreamWidthFieldSlot = 11u;
+const uint kWaterStreamWorldLengthFieldSlot = 12u;
+const uint kWaterStreamConfidenceFieldSlot = 13u;
+const uint kWaterStreamWetnessFieldSlot = 14u;
+const uint kWaterStreamFeatureTypeFieldSlot = 15u;
+const uint kWaterStreamTangentXFieldSlot = 16u;
+const uint kWaterStreamTangentYFieldSlot = 17u;
+const uint kWaterStreamTangentZFieldSlot = 18u;
 const float kWaterParticleSpeedScale = 0.12;
 
 const vec2 kSurfelCorners[6] = vec2[](
@@ -145,17 +159,63 @@ float ResolveCausticStrength(vec3 worldPosition, uint pointIndex, out float prev
     return clamp(ridge * mask * edgeGate * max(0.0, styleData.causticParams0.x), 0.0, 6.0);
 }
 
+bool HasWaterEffectComposition() {
+    return styleData.waterEffectControl.x != 0u &&
+           styleData.waterEffectControl.y != 0u &&
+           styleData.waterEffectControl.z != 0u &&
+           styleData.waterEffectControl.w != 0u &&
+           styleData.waterEffectSlots0.x != 0u &&
+           styleData.waterEffectSlots0.y != 0u &&
+           styleData.waterEffectSlots0.z != 0u &&
+           styleData.waterEffectSlots0.w != 0u &&
+           styleData.waterEffectSlots1.x != 0u &&
+           styleData.waterEffectSlots1.y != 0u;
+}
+
+float WaterEffectField(uint slotPlusOne, uint pointIndex, float fallback) {
+    if (!HasWaterEffectComposition() || slotPlusOne == 0u) {
+        return fallback;
+    }
+    return LoadScalarFieldValue(slotPlusOne - 1u, pointIndex);
+}
+
+vec3 ApplyWaterEffectColor(vec3 baseColor, uint pointIndex) {
+    const float mixAmount = clamp(WaterEffectField(styleData.waterEffectSlots0.z, pointIndex, 0.0), 0.0, 1.0);
+    if (mixAmount <= 1e-5) {
+        return baseColor;
+    }
+    const vec3 effectColor = vec3(
+        clamp(WaterEffectField(styleData.waterEffectSlots0.w, pointIndex, 0.62), 0.0, 1.0),
+        clamp(WaterEffectField(styleData.waterEffectSlots1.x, pointIndex, 0.88), 0.0, 1.0),
+        clamp(WaterEffectField(styleData.waterEffectSlots1.y, pointIndex, 1.0), 0.0, 1.0));
+    return mix(baseColor, effectColor, mixAmount);
+}
+
 bool HasWaterParticleFields() {
+    if (styleData.pointMeta.w == 3u) {
+        return styleData.globalControl.z > kWaterStreamTangentZFieldSlot;
+    }
     return styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot;
 }
 
+bool WaterStreamOverlayEnabled() {
+    return styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot;
+}
+
 float WaterFeatureType(uint pointIndex) {
+    if (WaterStreamOverlayEnabled()) {
+        return LoadScalarFieldValue(kWaterStreamFeatureTypeFieldSlot, pointIndex);
+    }
     return styleData.globalControl.z > kWaterFeatureTypeFieldSlot
         ? LoadScalarFieldValue(kWaterFeatureTypeFieldSlot, pointIndex)
         : 0.0;
 }
 
 float WaterTrailFade(uint pointIndex) {
+    if (WaterStreamOverlayEnabled()) {
+        const float age = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot, pointIndex), 0.0, 1.0);
+        return 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, age), 1.35);
+    }
     if (styleData.globalControl.z <= kWaterTrailAgeFieldSlot) {
         return 1.0;
     }
@@ -368,6 +428,9 @@ vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
     if (!HasWaterParticleFields()) {
         return basePosition;
     }
+    if (WaterStreamOverlayEnabled()) {
+        return basePosition;
+    }
     if (WaterPathViewEnabled()) {
         return basePosition;
     }
@@ -402,6 +465,13 @@ vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
 vec3 ResolveWaterFlowTangent(uint pointIndex) {
     if (!HasWaterParticleFields()) {
         return vec3(0.0);
+    }
+    if (WaterStreamOverlayEnabled()) {
+        const vec3 tangent = vec3(
+            LoadScalarFieldValue(kWaterStreamTangentXFieldSlot, pointIndex),
+            LoadScalarFieldValue(kWaterStreamTangentYFieldSlot, pointIndex),
+            LoadScalarFieldValue(kWaterStreamTangentZFieldSlot, pointIndex));
+        return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(0.0);
     }
 
     const uint pathStart = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathStartFieldSlot, pointIndex) + 0.5)));
@@ -452,6 +522,20 @@ float EvaluateBinding(RenderParameterBindingGpu binding, uint pointIndex) {
 vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
     if (styleData.pointMeta.w == 0u || styleData.globalControl.z <= kWaterSpeedFieldSlot) {
         return vec2(opacity, emissive);
+    }
+
+    if (WaterStreamOverlayEnabled()) {
+        const float age = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot, pointIndex), 0.0, 1.0);
+        const float speed = max(0.001, LoadScalarFieldValue(kWaterStreamSpeedFieldSlot, pointIndex));
+        const float confidence = clamp(LoadScalarFieldValue(kWaterStreamConfidenceFieldSlot, pointIndex), 0.0, 1.0);
+        const float wetness = clamp(LoadScalarFieldValue(kWaterStreamWetnessFieldSlot, pointIndex), 0.0, 1.0);
+        const float seed = LoadScalarFieldValue(kWaterStreamPointSeedFieldSlot, pointIndex);
+        const float animatedAge = fract(age - max(0.0, uniforms.depthParameters.x) * speed * 0.18 + seed);
+        const float fade = 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, animatedAge), 1.35);
+        const float pulse =
+            0.78 + 0.22 * sin((seed + animatedAge + max(0.0, uniforms.depthParameters.x) * speed * 0.07) * 6.28318530718);
+        const float energy = confidence * wetness * fade * pulse;
+        return vec2(opacity * energy, emissive * (0.35 + energy * 1.65));
     }
 
     if (HasWaterParticleFields()) {
@@ -609,6 +693,9 @@ vec3 ResolveAovNormal(uint pointIndex) {
     if (styleData.pointMeta.z == 0u || pointIndex >= styleData.pointMeta.x) {
         return vec3(0.0);
     }
+    if (WaterStreamOverlayEnabled()) {
+        return vec3(0.0);
+    }
     if (HasWaterParticleFields()) {
         const float role = LoadScalarFieldValue(kWaterParticleRoleFieldSlot, pointIndex);
         if (role >= 0.5) {
@@ -658,13 +745,24 @@ void main() {
     const float centerDepth = -centerViewPosition.z;
     float centerPreviewTint = 0.0;
     const float centerCaustic = ResolveCausticStrength(center, pointIndex, centerPreviewTint);
+    const float waterEffectPointSizeAdd =
+        HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectSlots0.x, pointIndex, 0.0) : 0.0;
+    const float waterEffectPointSizeMultiply =
+        HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectSlots0.y, pointIndex, 1.0)) : 1.0;
     const float diameter =
-        max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex)) *
-            WaterPathPointSizeScale(pointIndex) *
-            WaterSteamSizeScale(pointIndex) *
-            (1.0 + centerCaustic * max(0.0, styleData.causticParams1.w)) +
+        ((WaterStreamOverlayEnabled()
+              ? max(0.0001, LoadScalarFieldValue(kWaterStreamWidthFieldSlot, pointIndex))
+              : max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex))) *
+             WaterPathPointSizeScale(pointIndex) *
+             WaterSteamSizeScale(pointIndex) *
+             (1.0 + centerCaustic * max(0.0, styleData.causticParams1.w)) *
+             waterEffectPointSizeMultiply) +
+        waterEffectPointSizeAdd +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
-    const float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
+    const float waterStreakAspect =
+        WaterStreamOverlayEnabled()
+            ? max(1.0, LoadScalarFieldValue(kWaterStreamWorldLengthFieldSlot, pointIndex) / max(diameter, 0.0001))
+            : (styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0);
     const vec3 offset = (tangent * corner.x * waterStreakAspect + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
     const vec4 viewPosition = uniforms.view * worldPosition;
@@ -674,15 +772,30 @@ void main() {
     gl_Position = uniforms.viewProjection * worldPosition;
 
     const vec4 sourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
+    const float waterEffectOpacityAdd =
+        HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectControl.z, pointIndex, 0.0) : 0.0;
+    const float waterEffectOpacityMultiply =
+        HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectControl.w, pointIndex, 1.0)) : 1.0;
+    const float waterEffectEmissionAdd =
+        HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectControl.y, pointIndex, 0.0)) : 0.0;
     outSourceColor =
-        vec4(mix(sourceColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)), sourceColor.a);
+        vec4(
+            ApplyWaterEffectColor(
+                mix(sourceColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+                pointIndex),
+            sourceColor.a);
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding, pointIndex);
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
         EvaluateBinding(styleData.opacityBinding, pointIndex),
         EvaluateBinding(styleData.emissiveBinding, pointIndex),
         pointIndex);
-    outOpacity = clamp(animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)), 0.0, 4.0);
-    outEmissive = animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y);
+    outOpacity = clamp(
+        (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
+             waterEffectOpacityMultiply) +
+            waterEffectOpacityAdd,
+        0.0,
+        4.0);
+    outEmissive = animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y) + waterEffectEmissionAdd;
     outXray = EvaluateBinding(styleData.xrayBinding, pointIndex);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;

@@ -2945,6 +2945,1508 @@ WaterOverlay GenerateWaterOverlay(
     return GenerateWaterOverlay(cloud, emitters, sourceSettings, animationTrailSettings);
 }
 
+std::vector<invisible_places::io::Float3> BuildWaterRegionBoundary(
+    const std::vector<invisible_places::io::Float3>& vertices);
+
+namespace {
+
+void IncludeStreamSample(WaterStreamOverlay* overlay, WaterStreamSample sample) {
+    if (overlay == nullptr) {
+        return;
+    }
+    sample.normal = FromGlm(SafeOverlayNormal(ToGlm(sample.normal)));
+    glm::vec3 tangent = ToGlm(sample.tangent);
+    if (!IsValidPoint(tangent) || glm::dot(tangent, tangent) <= kNormalEpsilon) {
+        tangent = {1.0F, 0.0F, 0.0F};
+    }
+    sample.tangent = FromGlm(glm::normalize(tangent));
+    overlay->bounds.Expand(sample.position);
+    overlay->samples.push_back(sample);
+}
+
+void IncludeEffectPoint(WaterEffectOverlay* overlay, WaterEffectPoint point) {
+    if (overlay == nullptr) {
+        return;
+    }
+    point.normal = FromGlm(SafeOverlayNormal(ToGlm(point.normal)));
+    glm::vec3 tangent = ToGlm(point.tangent);
+    if (!IsValidPoint(tangent) || glm::dot(tangent, tangent) <= kNormalEpsilon) {
+        tangent = {1.0F, 0.0F, 0.0F};
+    }
+    point.tangent = FromGlm(glm::normalize(tangent));
+    overlay->bounds.Expand(point.position);
+    overlay->points.push_back(point);
+}
+
+std::vector<std::vector<WaterOverlayPoint>> GroupAnchorPaths(const WaterOverlay& pathAnchors) {
+    std::vector<std::vector<WaterOverlayPoint>> paths;
+    std::vector<WaterOverlayPoint> currentPath;
+    float currentFlowId = -1.0F;
+    for (const auto& point : pathAnchors.points) {
+        if (point.particleRole >= 0.5F) {
+            continue;
+        }
+        if (!currentPath.empty() && std::abs(point.flowId - currentFlowId) > 1.0e-4F) {
+            if (currentPath.size() >= 2U) {
+                paths.push_back(std::move(currentPath));
+            }
+            currentPath.clear();
+        }
+        currentFlowId = point.flowId;
+        currentPath.push_back(point);
+    }
+    if (currentPath.size() >= 2U) {
+        paths.push_back(std::move(currentPath));
+    }
+    return paths;
+}
+
+float PathLengthMeters(const std::vector<WaterOverlayPoint>& path) {
+    if (path.size() < 2U) {
+        return 0.0F;
+    }
+    float length = 0.0F;
+    for (std::size_t index = 1U; index < path.size(); ++index) {
+        length += glm::length(ToGlm(path[index].position) - ToGlm(path[index - 1U].position));
+    }
+    return length;
+}
+
+WaterOverlayPoint InterpolatePathByArcLength(const std::vector<WaterOverlayPoint>& path, float distanceMeters) {
+    if (path.empty()) {
+        return {};
+    }
+    if (path.size() == 1U || distanceMeters <= 0.0F) {
+        return path.front();
+    }
+
+    float travelled = 0.0F;
+    for (std::size_t index = 1U; index < path.size(); ++index) {
+        const glm::vec3 previous = ToGlm(path[index - 1U].position);
+        const glm::vec3 next = ToGlm(path[index].position);
+        const float segmentLength = glm::length(next - previous);
+        if (segmentLength <= 1.0e-6F) {
+            continue;
+        }
+        if (travelled + segmentLength >= distanceMeters) {
+            const float t = std::clamp((distanceMeters - travelled) / segmentLength, 0.0F, 1.0F);
+            return BlendPathAnchor(path[index - 1U], path[index], t);
+        }
+        travelled += segmentLength;
+    }
+    return path.back();
+}
+
+glm::vec3 TangentAtPathDistance(const std::vector<WaterOverlayPoint>& path, float distanceMeters, float probeMeters) {
+    const float beforeDistance = std::max(0.0F, distanceMeters - std::max(0.005F, probeMeters));
+    const float afterDistance = distanceMeters + std::max(0.005F, probeMeters);
+    const glm::vec3 before = ToGlm(InterpolatePathByArcLength(path, beforeDistance).position);
+    const glm::vec3 after = ToGlm(InterpolatePathByArcLength(path, afterDistance).position);
+    const glm::vec3 tangent = after - before;
+    return glm::dot(tangent, tangent) > kNormalEpsilon ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
+}
+
+std::uint8_t StreamColorByte(float value) {
+    return FloatToByte(std::clamp(value, 0.0F, 1.0F));
+}
+
+float EffectPolygonEdgeDistanceXy(
+    const glm::vec3& point,
+    const std::vector<invisible_places::io::Float3>& polygon) {
+    if (polygon.size() < 2U) {
+        return 0.0F;
+    }
+    float distance = std::numeric_limits<float>::max();
+    for (std::size_t index = 0; index < polygon.size(); ++index) {
+        const auto next = (index + 1U) % polygon.size();
+        distance = std::min(distance, DistanceToSegmentXy(point, polygon[index], polygon[next]));
+    }
+    return distance == std::numeric_limits<float>::max() ? 0.0F : distance;
+}
+
+float EffectPolygonEdgeDistance3d(
+    const glm::vec3& point,
+    const std::vector<invisible_places::io::Float3>& polygon) {
+    if (polygon.size() < 2U) {
+        return 0.0F;
+    }
+    float distance = std::numeric_limits<float>::max();
+    for (std::size_t index = 0; index < polygon.size(); ++index) {
+        const auto next = (index + 1U) % polygon.size();
+        distance = std::min(distance, DistanceToSegment3d(point, polygon[index], polygon[next]));
+    }
+    return distance == std::numeric_limits<float>::max() ? 0.0F : distance;
+}
+
+constexpr float kRippleTwoPi = 6.28318530718F;
+
+float Fract01(float value) {
+    return value - std::floor(value);
+}
+
+float RippleWavePeak(float phase, float sharpness) {
+    const float wave = 0.5F + 0.5F * std::cos(phase * kRippleTwoPi);
+    return std::pow(Clamp01(wave), std::max(0.25F, sharpness));
+}
+
+float RippleLine(float distance, float width) {
+    return 1.0F - SmoothStep(0.0F, std::max(1.0e-5F, width), std::abs(distance));
+}
+
+glm::vec3 RippleRegionCentroid(const std::vector<invisible_places::io::Float3>& boundary) {
+    if (boundary.empty()) {
+        return {0.0F, 0.0F, 0.0F};
+    }
+    glm::vec3 sum{0.0F};
+    for (const auto& point : boundary) {
+        sum += ToGlm(point);
+    }
+    return sum / static_cast<float>(boundary.size());
+}
+
+std::uint32_t RippleOverlayTypeSalt(WaterRippleOverlayType type) {
+    switch (type) {
+        case WaterRippleOverlayType::CausticLace:
+            return 101U;
+        case WaterRippleOverlayType::LinearRipples:
+            return 211U;
+        case WaterRippleOverlayType::RadialRipples:
+            return 307U;
+        case WaterRippleOverlayType::RainRings:
+            return 401U;
+        case WaterRippleOverlayType::TideBands:
+            return 503U;
+        case WaterRippleOverlayType::WetSheen:
+            return 601U;
+        case WaterRippleOverlayType::CurrentThreads:
+            return 701U;
+        case WaterRippleOverlayType::DropletGlints:
+            return 809U;
+        case WaterRippleOverlayType::DripTrails:
+            return 907U;
+        case WaterRippleOverlayType::FoamSparkle:
+            return 1009U;
+        case WaterRippleOverlayType::SaltMineralShimmer:
+            return 1103U;
+    }
+    return 101U;
+}
+
+float RippleCellHash(int cellX, int cellY, std::uint32_t seed, std::uint32_t salt) {
+    const auto x = static_cast<std::uint32_t>(cellX);
+    const auto y = static_cast<std::uint32_t>(cellY);
+    return Hash01((x * 374761393U) ^ (y * 668265263U) ^ (seed * 2246822519U) ^ (salt * 3266489917U));
+}
+
+glm::vec2 RippleCellHash2(int cellX, int cellY, std::uint32_t seed, std::uint32_t salt) {
+    return {
+        RippleCellHash(cellX, cellY, seed, salt),
+        RippleCellHash(cellX, cellY, seed, salt + 17U),
+    };
+}
+
+float RippleBlockNoise(const glm::vec2& uv, float cellSize, std::uint32_t seed, std::uint32_t salt) {
+    const float safeCellSize = std::max(0.001F, cellSize);
+    const auto cellX = static_cast<int>(std::floor(uv.x / safeCellSize));
+    const auto cellY = static_cast<int>(std::floor(uv.y / safeCellSize));
+    return RippleCellHash(cellX, cellY, seed, salt);
+}
+
+float RippleCausticLaceValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
+    const float cellSize = std::max(0.005F, layer.wavelengthMeters);
+    glm::vec2 p = uv / cellSize;
+    const float warp = std::clamp(layer.warp, 0.0F, 8.0F);
+    p += glm::vec2{
+             std::sin((p.y + RegionHash01(seed, 1U, 19U)) * 2.19F),
+             std::cos((p.x + RegionHash01(seed, 2U, 23U)) * 2.41F)}
+         * warp * 0.22F;
+
+    const auto baseX = static_cast<int>(std::floor(p.x));
+    const auto baseY = static_cast<int>(std::floor(p.y));
+    float nearest = std::numeric_limits<float>::max();
+    float secondNearest = std::numeric_limits<float>::max();
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int cx = baseX + dx;
+            const int cy = baseY + dy;
+            const glm::vec2 feature = glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
+                                      RippleCellHash2(cx, cy, seed, 31U);
+            const float distance = glm::length(p - feature);
+            if (distance < nearest) {
+                secondNearest = nearest;
+                nearest = distance;
+            } else if (distance < secondNearest) {
+                secondNearest = distance;
+            }
+        }
+    }
+
+    const float ridgeDistance = secondNearest - nearest;
+    const float lineWidth = std::clamp(0.028F + layer.turbulence * 0.045F, 0.012F, 0.18F);
+    const float ridge = 1.0F - SmoothStep(lineWidth, lineWidth * 4.0F, ridgeDistance);
+    const float shimmer = 0.72F + 0.28F * RippleBlockNoise(uv, cellSize * 0.55F, seed, 43U);
+    return Clamp01(std::pow(Clamp01(ridge), 1.35F) * shimmer);
+}
+
+float RippleRainRingValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
+    const float wavelength = std::max(0.005F, layer.wavelengthMeters);
+    const float cellSize = std::max(wavelength * 2.8F, 0.025F);
+    const glm::vec2 p = uv / cellSize;
+    const int baseX = static_cast<int>(std::floor(p.x));
+    const int baseY = static_cast<int>(std::floor(p.y));
+    float best = 0.0F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int cx = baseX + dx;
+            const int cy = baseY + dy;
+            const glm::vec2 center = (glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
+                                      RippleCellHash2(cx, cy, seed, 59U)) *
+                                     cellSize;
+            const float distance = glm::length(uv - center);
+            const float ring = RippleWavePeak((distance / wavelength) - layer.phase, 8.0F);
+            const float envelope = 1.0F - SmoothStep(wavelength * 0.25F, cellSize * 0.82F, distance);
+            const float dropSeed = 0.55F + 0.45F * RippleCellHash(cx, cy, seed, 71U);
+            best = std::max(best, ring * envelope * dropSeed);
+        }
+    }
+    return Clamp01(best);
+}
+
+float RippleDropletValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
+    const float wavelength = std::max(0.005F, layer.wavelengthMeters);
+    const float cellSize = std::max(wavelength * 1.65F, 0.025F);
+    const glm::vec2 p = uv / cellSize;
+    const int cellX = static_cast<int>(std::floor(p.x));
+    const int cellY = static_cast<int>(std::floor(p.y));
+    const glm::vec2 center =
+        (glm::vec2{static_cast<float>(cellX), static_cast<float>(cellY)} +
+         RippleCellHash2(cellX, cellY, seed, 83U)) *
+        cellSize;
+    const float sparseGate = RippleCellHash(cellX, cellY, seed, 89U);
+    const float keep = SmoothStep(0.42F - std::clamp(layer.turbulence, 0.0F, 1.0F) * 0.22F, 1.0F, sparseGate);
+    const float distance = glm::length(uv - center);
+    const float glint = 1.0F - SmoothStep(0.0F, cellSize * 0.22F, distance);
+    const float pulse = 0.72F + 0.28F * RippleWavePeak(layer.phase + sparseGate, 2.0F);
+    return Clamp01(std::pow(Clamp01(glint), 2.2F) * keep * pulse);
+}
+
+float RippleCurrentThreadValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
+    const float wavelength = std::max(0.005F, layer.wavelengthMeters);
+    const float threadSpacing = std::max(wavelength * 0.42F, 0.008F);
+    const float lane = std::floor(uv.y / threadSpacing);
+    const float laneSeed = RippleCellHash(static_cast<int>(lane), 0, seed, 97U);
+    const float laneCenter = (lane + 0.18F + laneSeed * 0.64F) * threadSpacing;
+    const float line = RippleLine(uv.y - laneCenter, threadSpacing * (0.055F + layer.turbulence * 0.08F));
+    const float broken =
+        SmoothStep(0.15F, 0.92F, 0.5F + 0.5F * std::sin((uv.x / (wavelength * 2.4F)) + laneSeed * kRippleTwoPi));
+    return Clamp01(std::pow(Clamp01(line), 1.5F) * broken);
+}
+
+float RippleFoamSparkleValue(
+    const glm::vec2& uv,
+    const WaterEffectLayer& layer,
+    std::uint32_t seed,
+    float edge) {
+    const float wavelength = std::max(0.005F, layer.wavelengthMeters);
+    const float edgeBand = 1.0F - Clamp01(edge);
+    const float sparkle = RippleBlockNoise(uv, std::max(wavelength * 0.45F, 0.008F), seed, 107U);
+    const float pulse = SmoothStep(0.72F, 1.0F, sparkle);
+    return Clamp01((edgeBand * 0.75F + pulse * 0.45F) * SmoothStep(0.12F, 1.0F, edgeBand + pulse * 0.5F));
+}
+
+float RippleSaltShimmerValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
+    const float wavelength = std::max(0.005F, layer.wavelengthMeters);
+    const float coarse = RippleBlockNoise(uv, std::max(wavelength * 0.70F, 0.012F), seed, 113U);
+    const float fine = RippleBlockNoise(uv, std::max(wavelength * 0.18F, 0.004F), seed, 127U);
+    const float grain = SmoothStep(0.50F, 1.0F, fine);
+    const float slowBand = 0.45F + 0.55F * RippleWavePeak((uv.x + uv.y * 0.37F) / (wavelength * 5.0F) + layer.phase, 1.2F);
+    return Clamp01((coarse * 0.28F + grain * 0.72F) * slowBand);
+}
+
+struct RipplePatternResult {
+    float value = 0.0F;
+    float confidence = 1.0F;
+    float distance = 0.0F;
+    float linearCoord = 0.0F;
+    float angle = 0.0F;
+    glm::vec3 tangent{1.0F, 0.0F, 0.0F};
+};
+
+RipplePatternResult EvaluateRipplePattern(
+    const WaterEffectLayer& layer,
+    const glm::vec3& position,
+    const glm::vec3& normal,
+    const glm::vec3& baseTangent,
+    const glm::vec3& regionCenter,
+    float edge,
+    float edgeDistance,
+    std::uint32_t pointIndex) {
+    RipplePatternResult result;
+    result.tangent = baseTangent;
+    result.distance = edgeDistance;
+
+    glm::vec3 tangent = baseTangent - normal * glm::dot(baseTangent, normal);
+    if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
+        tangent = WaterPathLateral(normal);
+    } else {
+        tangent = glm::normalize(tangent);
+    }
+    glm::vec3 lateral = glm::cross(normal, tangent);
+    if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
+        lateral = WaterPathLateral(tangent);
+    } else {
+        lateral = glm::normalize(lateral);
+    }
+
+    const glm::vec3 relative = position - regionCenter;
+    const float scale = std::clamp(layer.patternScale, 0.05F, 100.0F);
+    const glm::vec2 uv{
+        glm::dot(relative, tangent) * scale,
+        glm::dot(relative, lateral) * scale,
+    };
+    const glm::vec2 regionUv{
+        relative.x * scale,
+        relative.y * scale,
+    };
+    const float wavelength = std::max(0.005F, layer.wavelengthMeters);
+    const float layerPhase = layer.phase + RegionHash01(layer.id + layer.seed, 0U, RippleOverlayTypeSalt(layer.rippleOverlayType));
+    const float radialDistance = glm::length(uv);
+    const float regionRadialDistance = glm::length(regionUv);
+    const float slope = Clamp01(1.0F - std::abs(normal.z));
+    const std::uint32_t seed = layer.seed ^ (layer.id * 747796405U) ^ RippleOverlayTypeSalt(layer.rippleOverlayType);
+
+    switch (layer.rippleOverlayType) {
+        case WaterRippleOverlayType::CausticLace:
+            result.value = RippleCausticLaceValue(uv, layer, seed);
+            result.confidence = 0.72F + result.value * 0.28F;
+            break;
+        case WaterRippleOverlayType::LinearRipples:
+            result.value = RippleWavePeak((uv.x / wavelength) + layerPhase, 4.0F);
+            result.confidence = 0.65F + result.value * 0.35F;
+            break;
+        case WaterRippleOverlayType::RadialRipples: {
+            result.value = RippleWavePeak((regionRadialDistance / wavelength) - layerPhase, 6.0F);
+            result.distance = regionRadialDistance;
+            if (regionRadialDistance > 1.0e-5F) {
+                glm::vec3 radialTangent{regionUv.x, regionUv.y, 0.0F};
+                radialTangent -= normal * glm::dot(radialTangent, normal);
+                result.tangent = glm::dot(radialTangent, radialTangent) > kNormalEpsilon
+                                     ? glm::normalize(radialTangent)
+                                     : tangent;
+            }
+            result.angle = std::atan2(regionUv.y, regionUv.x);
+            result.confidence = 0.60F + result.value * 0.40F;
+            break;
+        }
+        case WaterRippleOverlayType::RainRings:
+            result.value = RippleRainRingValue(regionUv, layer, seed);
+            result.distance = regionRadialDistance;
+            result.confidence = 0.58F + result.value * 0.42F;
+            break;
+        case WaterRippleOverlayType::TideBands: {
+            const float broad = RippleWavePeak((uv.x / (wavelength * 5.0F)) + layerPhase, 1.7F);
+            const float secondary = RippleWavePeak(((uv.x + uv.y * 0.22F) / (wavelength * 9.0F)) - layerPhase, 1.1F);
+            result.value = Clamp01((broad * 0.72F) + (secondary * 0.28F));
+            result.confidence = 0.70F + result.value * 0.30F;
+            break;
+        }
+        case WaterRippleOverlayType::WetSheen: {
+            const float lowNoise = RippleBlockNoise(uv, wavelength * 2.5F, seed, 131U);
+            result.value = Clamp01((0.32F + SmoothStep(0.04F, 0.75F, slope) * 0.58F) * (0.78F + lowNoise * 0.22F));
+            result.confidence = 0.50F + result.value * 0.50F;
+            break;
+        }
+        case WaterRippleOverlayType::CurrentThreads:
+            result.value = RippleCurrentThreadValue(uv, layer, seed);
+            result.confidence = 0.55F + result.value * 0.45F;
+            break;
+        case WaterRippleOverlayType::DropletGlints:
+            result.value = RippleDropletValue(uv, layer, seed);
+            result.confidence = 0.45F + result.value * 0.55F;
+            break;
+        case WaterRippleOverlayType::DripTrails: {
+            glm::vec3 dripTangent = kGravity - normal * glm::dot(kGravity, normal);
+            if (glm::dot(dripTangent, dripTangent) <= kNormalEpsilon) {
+                dripTangent = tangent;
+            } else {
+                dripTangent = glm::normalize(dripTangent);
+            }
+            glm::vec3 dripLateral = glm::cross(normal, dripTangent);
+            if (glm::dot(dripLateral, dripLateral) <= kNormalEpsilon) {
+                dripLateral = lateral;
+            } else {
+                dripLateral = glm::normalize(dripLateral);
+            }
+            const glm::vec2 dripUv{
+                glm::dot(relative, dripTangent) * scale,
+                glm::dot(relative, dripLateral) * scale,
+            };
+            const float spacing = std::max(wavelength * 0.55F, 0.010F);
+            const auto lane = static_cast<int>(std::floor(dripUv.y / spacing));
+            const float laneSeed = RippleCellHash(lane, 0, seed, 149U);
+            const float center = (static_cast<float>(lane) + 0.15F + laneSeed * 0.70F) * spacing;
+            const float line = RippleLine(dripUv.y - center, spacing * 0.10F);
+            const float trail = 1.0F - SmoothStep(0.22F, 1.0F, Fract01((dripUv.x / (wavelength * 2.6F)) + laneSeed));
+            result.value = Clamp01(line * trail * (0.25F + slope * 0.75F));
+            result.tangent = dripTangent;
+            result.linearCoord = dripUv.x;
+            result.angle = std::atan2(dripTangent.y, dripTangent.x);
+            result.confidence = 0.42F + result.value * 0.58F;
+            break;
+        }
+        case WaterRippleOverlayType::FoamSparkle:
+            result.value = RippleFoamSparkleValue(uv, layer, seed, edge);
+            result.confidence = 0.50F + result.value * 0.50F;
+            break;
+        case WaterRippleOverlayType::SaltMineralShimmer:
+            result.value = RippleSaltShimmerValue(uv, layer, seed);
+            result.confidence = 0.48F + result.value * 0.52F;
+            break;
+    }
+
+    if (result.linearCoord == 0.0F) {
+        result.linearCoord = uv.x;
+    }
+    if (result.angle == 0.0F) {
+        result.angle = std::atan2(tangent.y, tangent.x);
+    }
+    const float turbulenceNoise =
+        RippleBlockNoise(uv, std::max(wavelength * 0.75F, 0.006F), seed, 163U) - 0.5F;
+    const float turbulence = std::clamp(layer.turbulence, 0.0F, 4.0F);
+    result.value = Clamp01(result.value + turbulenceNoise * turbulence * 0.08F);
+    return result;
+}
+
+WaterStreamOverlay BuildStreamOverlayFromPaths(
+    const std::vector<std::vector<WaterOverlayPoint>>& paths,
+    std::uint32_t requestedStreamCount,
+    float streamLengthMeters,
+    float pointSpacingMeters,
+    float streamWidthMeters,
+    float streamWorldLengthMeters,
+    float surfaceOffsetMeters,
+    float laneSpreadMeters,
+    float turbulence,
+    float speedMetersPerSecond,
+    std::uint32_t seed,
+    float featureType) {
+    WaterStreamOverlay overlay;
+    if (paths.empty() || requestedStreamCount == 0U) {
+        return overlay;
+    }
+
+    std::vector<float> pathLengths;
+    pathLengths.reserve(paths.size());
+    float totalLength = 0.0F;
+    for (const auto& path : paths) {
+        const float length = PathLengthMeters(path);
+        pathLengths.push_back(length);
+        totalLength += std::max(0.0F, length);
+    }
+    if (totalLength <= 1.0e-5F) {
+        return overlay;
+    }
+
+    const float safeLength = std::clamp(streamLengthMeters, 0.02F, 100.0F);
+    const float safeSpacing = std::clamp(pointSpacingMeters, 0.001F, 5.0F);
+    const std::uint32_t samplesPerStream = std::max<std::uint32_t>(
+        2U,
+        static_cast<std::uint32_t>(std::ceil(safeLength / safeSpacing)) + 1U);
+    std::uint32_t streamId = 1U;
+
+    for (std::size_t pathIndex = 0; pathIndex < paths.size(); ++pathIndex) {
+        const auto& path = paths[pathIndex];
+        const float pathLength = pathLengths[pathIndex];
+        if (path.size() < 2U || pathLength <= 1.0e-5F) {
+            continue;
+        }
+        const std::uint32_t streamsForPath = std::max<std::uint32_t>(
+            1U,
+            static_cast<std::uint32_t>(
+                std::round(static_cast<float>(requestedStreamCount) * (pathLength / totalLength))));
+        const auto branchId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(path.front().flowId + 0.5F)));
+        const auto sourceId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(path.front().emitterId + 0.5F)));
+
+        for (std::uint32_t laneIndex = 0; laneIndex < streamsForPath && streamId <= requestedStreamCount; ++laneIndex, ++streamId) {
+            const float streamSeed = RegionHash01(seed + branchId, streamId, 7001U);
+            const float laneSeed = RegionHash01(seed + branchId, streamId, 7003U);
+            const float laneOffset = (laneSeed - 0.5F) * 2.0F * std::max(0.0F, laneSpreadMeters);
+            const float maxStart = std::max(0.0F, pathLength - safeLength);
+            const float startDistance = maxStart * RegionHash01(seed + branchId, streamId, 7009U);
+            const float speed = std::max(0.01F, speedMetersPerSecond * (0.72F + streamSeed * 0.58F));
+            for (std::uint32_t sampleIndex = 0; sampleIndex < samplesPerStream; ++sampleIndex) {
+                const float localDistance = std::min(
+                    safeLength,
+                    static_cast<float>(sampleIndex) * safeSpacing);
+                const float pathDistance = std::min(pathLength, startDistance + localDistance);
+                WaterOverlayPoint anchor = InterpolatePathByArcLength(path, pathDistance);
+                glm::vec3 position = ToGlm(anchor.position);
+                const glm::vec3 normal = SafeOverlayNormal(ToGlm(anchor.normal));
+                glm::vec3 tangent = TangentAtPathDistance(path, pathDistance, safeSpacing * 2.0F);
+                tangent -= normal * glm::dot(tangent, normal);
+                if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
+                    tangent = TangentAtPathDistance(path, pathDistance, safeSpacing * 2.0F);
+                }
+                tangent = glm::normalize(tangent);
+                glm::vec3 lateral = glm::cross(normal, tangent);
+                if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
+                    lateral = WaterPathLateral(tangent);
+                } else {
+                    lateral = glm::normalize(lateral);
+                }
+                const float wobble =
+                    std::sin((static_cast<float>(sampleIndex) * 0.43F + streamSeed * 6.28318530718F)) *
+                    std::max(0.0F, turbulence) * std::max(0.0F, laneSpreadMeters);
+                position += lateral * (laneOffset + wobble);
+                position += normal * std::max(0.0F, surfaceOffsetMeters);
+
+                const float pointAge = safeLength > 1.0e-5F ? localDistance / safeLength : 0.0F;
+                WaterStreamSample sample;
+                sample.position = FromGlm(position);
+                sample.normal = FromGlm(normal);
+                sample.tangent = FromGlm(tangent);
+                sample.red = featureType >= 3.0F ? StreamColorByte(0.06F + streamSeed * 0.10F)
+                                                  : StreamColorByte(0.04F + streamSeed * 0.12F);
+                sample.green = featureType >= 3.0F ? StreamColorByte(0.52F + pointAge * 0.26F)
+                                                    : StreamColorByte(0.68F + pointAge * 0.20F);
+                sample.blue = StreamColorByte(0.95F + streamSeed * 0.05F);
+                sample.streamId = static_cast<float>(streamId);
+                sample.sourceId = static_cast<float>(sourceId);
+                sample.pathId = static_cast<float>(pathIndex + 1U);
+                sample.branchId = static_cast<float>(branchId);
+                sample.streamSeed = streamSeed;
+                sample.pointSeed = RegionHash01(seed + branchId, streamId + sampleIndex, 7013U);
+                sample.streamDistance = localDistance;
+                sample.streamLength = safeLength;
+                sample.pointAge = pointAge;
+                sample.streamAge = RegionHash01(seed + branchId, streamId, 7019U);
+                sample.streamSpeed = speed;
+                sample.streamWidth = std::max(0.0005F, streamWidthMeters * (0.80F + streamSeed * 0.42F));
+                sample.streamWorldLength = std::max(
+                    sample.streamWidth * 2.0F,
+                    std::max(streamWorldLengthMeters, safeSpacing * 2.5F));
+                sample.streamConfidence = std::clamp(anchor.confidence * (0.72F + 0.28F * streamSeed), 0.0F, 1.0F);
+                sample.wetness = std::clamp(0.35F + anchor.accumulation * 0.65F, 0.0F, 1.0F);
+                sample.featureType = featureType;
+                IncludeStreamSample(&overlay, sample);
+            }
+        }
+    }
+
+    return overlay;
+}
+
+}  // namespace
+
+WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+    const WaterOverlay& pathAnchors,
+    const WaterFlowStreamSettings& settings) {
+    if (!settings.enabled) {
+        return {};
+    }
+    return BuildStreamOverlayFromPaths(
+        GroupAnchorPaths(pathAnchors),
+        settings.streamCountTotal,
+        settings.streamLengthMeters,
+        settings.streamPointSpacingMeters,
+        settings.streamWidthMeters,
+        settings.streamWorldLengthMeters,
+        settings.surfaceOffsetMeters,
+        settings.laneSpreadMeters,
+        settings.turbulence,
+        settings.speedMetersPerSecond,
+        settings.seed,
+        0.0F);
+}
+
+WaterFieldCache BuildFieldCacheFromPathAnchors(
+    const WaterOverlay& pathAnchors,
+    const WaterFieldSettings& settings) {
+    WaterFieldCache cache;
+    cache.settings = settings;
+    if (!settings.enabled) {
+        return cache;
+    }
+    const auto paths = GroupAnchorPaths(pathAnchors);
+    const float spacing = std::clamp(settings.fieldResolutionMeters, 0.003F, 1.0F);
+    for (const auto& path : paths) {
+        const float length = PathLengthMeters(path);
+        if (length <= 1.0e-5F) {
+            continue;
+        }
+        const std::uint32_t sampleCount = std::max<std::uint32_t>(
+            2U,
+            static_cast<std::uint32_t>(std::ceil(length / spacing)) + 1U);
+        for (std::uint32_t index = 0; index < sampleCount; ++index) {
+            const float station = std::min(length, static_cast<float>(index) * spacing);
+            WaterOverlayPoint anchor = InterpolatePathByArcLength(path, station);
+            const glm::vec3 normal = SafeOverlayNormal(ToGlm(anchor.normal));
+            glm::vec3 guide = TangentAtPathDistance(path, station, spacing * 2.0F);
+            guide -= normal * glm::dot(guide, normal);
+            if (glm::dot(guide, guide) <= kNormalEpsilon) {
+                guide = TangentAtPathDistance(path, station, spacing * 2.0F);
+            }
+            guide = glm::normalize(guide);
+            glm::vec3 downhill = kGravity - normal * glm::dot(kGravity, normal);
+            if (glm::dot(downhill, downhill) > kNormalEpsilon) {
+                downhill = glm::normalize(downhill);
+            } else {
+                downhill = guide;
+            }
+            glm::vec3 fieldVector =
+                guide * std::max(0.0F, settings.guideWeight) +
+                downhill * std::max(0.0F, settings.downhillWeight);
+            if (glm::dot(fieldVector, fieldVector) <= kNormalEpsilon) {
+                fieldVector = guide;
+            }
+            fieldVector = glm::normalize(fieldVector - normal * glm::dot(fieldVector, normal));
+
+            WaterFieldNode node;
+            node.position = anchor.position;
+            node.normal = FromGlm(normal);
+            node.vector = FromGlm(fieldVector);
+            node.wetness = std::clamp(0.30F + anchor.accumulation * 0.70F, 0.0F, 1.0F);
+            node.confidence = std::clamp(anchor.confidence, 0.0F, 1.0F);
+            node.surfaceConfidence = std::clamp(anchor.confidence, 0.0F, 1.0F);
+            node.pathStation = station;
+            node.distanceToGuide = 0.0F;
+            cache.nodes.push_back(node);
+        }
+    }
+    return cache;
+}
+
+WaterFieldCache BuildFieldCacheFromRegions(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<WaterEffectLayer>& layers,
+    const WaterFieldSettings& settings) {
+    WaterFieldCache cache;
+    cache.settings = settings;
+    if (!settings.enabled || cloud.positions.empty()) {
+        return cache;
+    }
+
+    const bool singleRegion = std::count_if(
+                                  layers.begin(),
+                                  layers.end(),
+                                  [](const WaterEffectLayer& layer) {
+                                      return layer.featureType == WaterEffectFeatureType::FieldSurfaceMotion &&
+                                             (layer.enabledInViewport || layer.enabledInExport) &&
+                                             layer.vertices.size() >= 3U;
+                                  }) == 1;
+    struct FieldControlBoundary {
+        WaterEffectFeatureType type = WaterEffectFeatureType::FieldNoFlowRegion;
+        std::vector<invisible_places::io::Float3> boundary;
+    };
+    std::vector<FieldControlBoundary> controlBoundaries;
+    for (const auto& layer : layers) {
+        if ((!layer.enabledInViewport && !layer.enabledInExport) || layer.vertices.size() < 3U) {
+            continue;
+        }
+        if (layer.featureType != WaterEffectFeatureType::FieldNoFlowRegion &&
+            layer.featureType != WaterEffectFeatureType::FieldBridgeAllowedRegion &&
+            layer.featureType != WaterEffectFeatureType::FieldBridgeBlockedRegion) {
+            continue;
+        }
+        auto boundary = BuildWaterRegionBoundary(layer.vertices);
+        if (boundary.size() >= 3U) {
+            FieldControlBoundary control;
+            control.type = layer.featureType;
+            control.boundary = std::move(boundary);
+            controlBoundaries.push_back(std::move(control));
+        }
+    }
+
+    for (auto layer : layers) {
+        if (layer.featureType != WaterEffectFeatureType::FieldSurfaceMotion ||
+            (!layer.enabledInViewport && !layer.enabledInExport)) {
+            continue;
+        }
+        const auto boundary = BuildWaterRegionBoundary(layer.vertices);
+        if (boundary.size() < 3U) {
+            continue;
+        }
+        if (singleRegion && cache.regionBoundary.empty()) {
+            cache.regionBoundary = boundary;
+        }
+
+        const glm::vec3 regionCenter = RippleRegionCentroid(boundary);
+        glm::vec3 requestedDirection{layer.directionX, layer.directionY, layer.directionZ};
+        if (glm::dot(requestedDirection, requestedDirection) <= kNormalEpsilon) {
+            requestedDirection = {1.0F, 0.0F, 0.0F};
+        }
+        requestedDirection = glm::normalize(requestedDirection);
+
+        const auto maxAffected = std::max<std::uint32_t>(1U, layer.maxAffectedPoints);
+        const auto stride = SampleStride(cloud.positions.size(), maxAffected);
+        for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); pointIndex += stride) {
+            const glm::vec3 position = ToGlm(cloud.positions[pointIndex]);
+            if (!IsValidPoint(position) || !PointInPolygonXy(position, boundary)) {
+                continue;
+            }
+
+            float edgeDistance = EffectPolygonEdgeDistance3d(position, boundary);
+            if (!std::isfinite(edgeDistance)) {
+                edgeDistance = EffectPolygonEdgeDistanceXy(position, boundary);
+            }
+            const float edge = SmoothStep(0.0F, std::max(0.001F, layer.edgeBlendWidth), edgeDistance);
+            glm::vec3 normal{0.0F, 0.0F, 1.0F};
+            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+                normal = SafeOverlayNormal(ToGlm(cloud.normals[pointIndex]));
+            }
+
+            glm::vec3 guide = requestedDirection - normal * glm::dot(requestedDirection, normal);
+            if (glm::dot(guide, guide) <= kNormalEpsilon) {
+                guide = WaterPathLateral(normal);
+            } else {
+                guide = glm::normalize(guide);
+            }
+
+            glm::vec3 downhill = kGravity - normal * glm::dot(kGravity, normal);
+            if (glm::dot(downhill, downhill) > kNormalEpsilon) {
+                downhill = glm::normalize(downhill);
+            } else {
+                downhill = guide;
+            }
+
+            glm::vec3 fieldVector =
+                guide * std::max(0.0F, settings.guideWeight) +
+                downhill * std::max(0.0F, settings.downhillWeight);
+            fieldVector -= normal * glm::dot(fieldVector, normal);
+            if (glm::dot(fieldVector, fieldVector) <= kNormalEpsilon) {
+                fieldVector = guide;
+            } else {
+                fieldVector = glm::normalize(fieldVector);
+            }
+
+            WaterFieldNode node;
+            node.position = cloud.positions[pointIndex];
+            node.normal = FromGlm(normal);
+            node.vector = FromGlm(fieldVector);
+            node.sourcePointIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+                pointIndex,
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+            node.sourceLayerId = layer.id;
+            node.blendMode = layer.blendMode;
+            node.response = layer.response;
+            node.effectSpeed = layer.speed;
+            for (const auto& control : controlBoundaries) {
+                if (!PointInPolygonXy(position, control.boundary)) {
+                    continue;
+                }
+                switch (control.type) {
+                    case WaterEffectFeatureType::FieldNoFlowRegion:
+                        node.flowBlocked = true;
+                        break;
+                    case WaterEffectFeatureType::FieldBridgeAllowedRegion:
+                        node.bridgeAllowed = true;
+                        break;
+                    case WaterEffectFeatureType::FieldBridgeBlockedRegion:
+                        node.bridgeBlocked = true;
+                        break;
+                    case WaterEffectFeatureType::FieldSurfaceMotion:
+                    case WaterEffectFeatureType::Ripple:
+                        break;
+                }
+            }
+            node.wetness = std::clamp(layer.regionStrength * edge, 0.0F, 1.0F);
+            node.confidence = std::clamp(edge * layer.response.intensity, 0.0F, 1.0F);
+            node.surfaceConfidence = node.confidence;
+            if (node.flowBlocked) {
+                node.wetness = 0.0F;
+                node.confidence = 0.0F;
+                node.surfaceConfidence = 0.0F;
+            }
+            node.pathStation = glm::dot(position - regionCenter, guide);
+            node.distanceToGuide = edgeDistance;
+            cache.nodes.push_back(node);
+        }
+    }
+
+    std::sort(
+        cache.nodes.begin(),
+        cache.nodes.end(),
+        [](const WaterFieldNode& left, const WaterFieldNode& right) {
+            if (std::abs(left.pathStation - right.pathStation) > 1.0e-5F) {
+                return left.pathStation < right.pathStation;
+            }
+            if (std::abs(left.position.y - right.position.y) > 1.0e-5F) {
+                return left.position.y < right.position.y;
+            }
+            return left.position.x < right.position.x;
+        });
+    if (!cache.nodes.empty()) {
+        const float firstStation = cache.nodes.front().pathStation;
+        for (auto& node : cache.nodes) {
+            node.pathStation -= firstStation;
+        }
+    }
+    return cache;
+}
+
+WaterStreamOverlay BuildFieldStreamOverlay(
+    const WaterFieldCache& fieldCache,
+    const WaterFieldStreamSettings& settings) {
+    if (!settings.enabled || fieldCache.nodes.size() < 2U) {
+        return {};
+    }
+    std::vector<std::vector<WaterOverlayPoint>> paths;
+    std::vector<WaterOverlayPoint> path;
+    path.reserve(fieldCache.nodes.size());
+    float distance = 0.0F;
+    WaterFieldStreamDiagnostics diagnostics;
+    diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        fieldCache.nodes.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    const float bridgeStart = std::max(0.0F, fieldCache.settings.fieldResolutionMeters * 1.25F);
+    const float maxBridgeDistance = std::max(
+        fieldCache.settings.maxBridgeDistanceMeters,
+        fieldCache.settings.fieldResolutionMeters * (1.25F + fieldCache.settings.bridgeAggression * 4.0F));
+    const float confidenceThreshold = std::clamp(fieldCache.settings.surfaceConfidenceThreshold, 0.0F, 1.0F);
+    bool lastAcceptedBridgeAllowed = false;
+    bool lastAcceptedBridgeBlocked = false;
+    auto flushPath = [&]() {
+        if (path.size() >= 2U) {
+            paths.push_back(std::move(path));
+        }
+        path = {};
+        distance = 0.0F;
+        lastAcceptedBridgeAllowed = false;
+        lastAcceptedBridgeBlocked = false;
+    };
+    for (std::size_t index = 0; index < fieldCache.nodes.size(); ++index) {
+        const auto& node = fieldCache.nodes[index];
+        if (node.flowBlocked) {
+            ++diagnostics.manualNoFlowBlockCount;
+            flushPath();
+            continue;
+        }
+        if (settings.fadeOnLowConfidence && node.surfaceConfidence < confidenceThreshold * 0.35F) {
+            ++diagnostics.lowConfidenceTerminationCount;
+            flushPath();
+            continue;
+        }
+        if (!path.empty()) {
+            const float gapDistance = glm::length(ToGlm(node.position) - ToGlm(path.back().position));
+            const bool manualBridgeAllowed = lastAcceptedBridgeAllowed || node.bridgeAllowed;
+            const bool manualBridgeBlocked = lastAcceptedBridgeBlocked || node.bridgeBlocked;
+            const float manualAllowedBridgeDistance = maxBridgeDistance * 4.0F;
+            if (manualBridgeBlocked) {
+                ++diagnostics.manualBridgeBlockedCount;
+                ++diagnostics.rejectedGapCount;
+                diagnostics.minRejectedGapMeters =
+                    diagnostics.minRejectedGapMeters <= 0.0F
+                        ? gapDistance
+                        : std::min(diagnostics.minRejectedGapMeters, gapDistance);
+                flushPath();
+            } else if (gapDistance > maxBridgeDistance &&
+                       (!manualBridgeAllowed || gapDistance > manualAllowedBridgeDistance)) {
+                ++diagnostics.rejectedGapCount;
+                diagnostics.minRejectedGapMeters =
+                    diagnostics.minRejectedGapMeters <= 0.0F
+                        ? gapDistance
+                        : std::min(diagnostics.minRejectedGapMeters, gapDistance);
+                flushPath();
+            } else {
+                if (gapDistance > bridgeStart) {
+                    ++diagnostics.acceptedBridgeCount;
+                    diagnostics.maxAcceptedBridgeMeters =
+                        std::max(diagnostics.maxAcceptedBridgeMeters, gapDistance);
+                    if (manualBridgeAllowed && gapDistance > maxBridgeDistance) {
+                        ++diagnostics.manualBridgeAllowedCount;
+                    }
+                }
+                distance += gapDistance;
+            }
+        }
+
+        WaterOverlayPoint point;
+        point.position = node.position;
+        point.normal = node.normal;
+        point.flowId = static_cast<float>(paths.size() + 1U);
+        point.emitterId = 0.0F;
+        point.pathDistance = distance;
+        point.confidence = node.confidence;
+        point.accumulation = node.wetness;
+        if (settings.fadeOnLowConfidence) {
+            const float supportFade = SmoothStep(
+                confidenceThreshold * 0.35F,
+                std::max(confidenceThreshold, confidenceThreshold * 0.35F + 1.0e-4F),
+                node.surfaceConfidence);
+            if (supportFade < 0.999F) {
+                ++diagnostics.lowConfidenceFadeCount;
+            }
+            point.confidence *= supportFade;
+            point.accumulation *= supportFade;
+        }
+        path.push_back(point);
+        lastAcceptedBridgeAllowed = node.bridgeAllowed;
+        lastAcceptedBridgeBlocked = node.bridgeBlocked;
+    }
+    flushPath();
+    diagnostics.emittedPathCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        paths.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    auto overlay = BuildStreamOverlayFromPaths(
+        paths,
+        settings.streamlineCount,
+        settings.streamlineLengthMeters,
+        settings.stepLengthMeters,
+        settings.streamlineWidthMeters,
+        settings.streamWorldLengthMeters,
+        fieldCache.settings.surfaceOffsetMeters,
+        std::max(settings.seedSpacingMeters, fieldCache.settings.corridorRadiusMeters * 0.30F),
+        fieldCache.settings.turbulence,
+        settings.speedMetersPerSecond,
+        fieldCache.settings.seed,
+        3.0F);
+    if (fieldCache.regionBoundary.size() < 3U) {
+        diagnostics.emittedSampleCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+            overlay.samples.size(),
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+        overlay.fieldDiagnostics = diagnostics;
+        return overlay;
+    }
+
+    WaterStreamOverlay clipped;
+    for (const auto& sample : overlay.samples) {
+        if (PointInPolygonXy(ToGlm(sample.position), fieldCache.regionBoundary)) {
+            IncludeStreamSample(&clipped, sample);
+        }
+    }
+    diagnostics.emittedSampleCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        clipped.samples.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    clipped.fieldDiagnostics = diagnostics;
+    return clipped;
+}
+
+WaterEffectOverlay GenerateRippleEffectOverlay(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<WaterEffectLayer>& layers) {
+    WaterEffectOverlay overlay;
+    if (cloud.positions.empty()) {
+        return overlay;
+    }
+    for (auto layer : layers) {
+        if (!layer.enabledInViewport && !layer.enabledInExport) {
+            continue;
+        }
+        const auto boundary = BuildWaterRegionBoundary(layer.vertices);
+        if (boundary.size() < 3U) {
+            continue;
+        }
+        layer.hull = BuildWaterRegionHull(layer.vertices);
+        const glm::vec3 regionCenter = RippleRegionCentroid(boundary);
+        const std::uint32_t maxAffected = std::max<std::uint32_t>(1U, layer.maxAffectedPoints);
+        const std::size_t stride = SampleStride(cloud.positions.size(), maxAffected);
+        const glm::vec3 direction = [&]() {
+            glm::vec3 value{layer.directionX, layer.directionY, layer.directionZ};
+            if (glm::dot(value, value) <= kNormalEpsilon) {
+                value = {1.0F, 0.0F, 0.0F};
+            }
+            return glm::normalize(value);
+        }();
+        for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); pointIndex += stride) {
+            const glm::vec3 position = ToGlm(cloud.positions[pointIndex]);
+            if (!IsValidPoint(position) || !PointInPolygonXy(position, boundary)) {
+                continue;
+            }
+            float edgeDistance = EffectPolygonEdgeDistance3d(position, boundary);
+            if (!std::isfinite(edgeDistance)) {
+                edgeDistance = EffectPolygonEdgeDistanceXy(position, boundary);
+            }
+            const float edge = SmoothStep(0.0F, std::max(0.001F, layer.edgeBlendWidth), edgeDistance);
+            glm::vec3 normal{0.0F, 0.0F, 1.0F};
+            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+                normal = SafeOverlayNormal(ToGlm(cloud.normals[pointIndex]));
+            }
+            glm::vec3 tangent = direction - normal * glm::dot(direction, normal);
+            if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
+                tangent = WaterPathLateral(normal);
+            } else {
+                tangent = glm::normalize(tangent);
+            }
+            const float seedValue = RegionHash01(layer.id + layer.seed, static_cast<std::uint32_t>(pointIndex), 901U);
+            const auto pattern = EvaluateRipplePattern(
+                layer,
+                position,
+                normal,
+                tangent,
+                regionCenter,
+                edge,
+                edgeDistance,
+                static_cast<std::uint32_t>(pointIndex));
+            WaterEffectPoint effect;
+            effect.position = cloud.positions[pointIndex];
+            effect.normal = FromGlm(normal);
+            effect.tangent = FromGlm(pattern.tangent);
+            effect.sourcePointIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+                pointIndex,
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+            effect.blendMode = layer.blendMode;
+            effect.red = FloatToByte(layer.response.colouriseRed);
+            effect.green = FloatToByte(layer.response.colouriseGreen);
+            effect.blue = FloatToByte(layer.response.colouriseBlue);
+            effect.mask = std::clamp(layer.regionStrength, 0.0F, 1.0F);
+            effect.edge = edge;
+            effect.value = Clamp01(pattern.value * std::max(0.0F, layer.response.intensity)) * effect.mask * edge;
+            effect.seed = seedValue;
+            effect.regionId = static_cast<float>(layer.id);
+            effect.distance = pattern.distance;
+            effect.linearCoord = pattern.linearCoord;
+            effect.angle = pattern.angle;
+            effect.speed = std::max(0.0F, layer.speed);
+            effect.confidence = Clamp01(pattern.confidence * edge);
+            effect.emissionHint = effect.value * layer.response.emissionAdd;
+            effect.opacityHint = effect.value * layer.response.opacityAdd;
+            effect.opacityMultiplyHint = std::lerp(
+                1.0F,
+                std::max(0.0F, layer.response.opacityMultiply),
+                effect.value);
+            effect.sizeHint = effect.value * layer.response.pointSizeAdd;
+            effect.sizeMultiplyHint = std::lerp(
+                1.0F,
+                std::max(0.0F, layer.response.pointSizeMultiply),
+                effect.value);
+            effect.colourMixHint = effect.value * layer.response.colouriseAmount;
+            effect.featureType = 1.0F;
+            IncludeEffectPoint(&overlay, effect);
+        }
+    }
+    return overlay;
+}
+
+WaterEffectOverlay GenerateFieldSurfaceEffectOverlay(
+    const WaterFieldCache& fieldCache,
+    const WaterEffectLayer& layer) {
+    WaterEffectOverlay overlay;
+    if (fieldCache.nodes.empty()) {
+        return overlay;
+    }
+    const std::uint32_t maxAffected = std::max<std::uint32_t>(1U, layer.maxAffectedPoints);
+    const std::size_t stride = SampleStride(fieldCache.nodes.size(), maxAffected);
+    for (std::size_t index = 0; index < fieldCache.nodes.size(); index += stride) {
+        const auto& node = fieldCache.nodes[index];
+        if (node.flowBlocked) {
+            continue;
+        }
+        const glm::vec3 position = ToGlm(node.position);
+        const glm::vec3 normal = SafeOverlayNormal(ToGlm(node.normal));
+        glm::vec3 tangent = ToGlm(node.vector);
+        tangent -= normal * glm::dot(tangent, normal);
+        if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
+            tangent = {1.0F, 0.0F, 0.0F};
+        } else {
+            tangent = glm::normalize(tangent);
+        }
+        const bool hasNodeEffectLayer = node.sourceLayerId != 0U;
+        const auto& response = hasNodeEffectLayer ? node.response : layer.response;
+        const auto blendMode = hasNodeEffectLayer ? node.blendMode : layer.blendMode;
+        const auto regionId = hasNodeEffectLayer ? node.sourceLayerId : layer.id;
+        const float effectSpeed = hasNodeEffectLayer ? node.effectSpeed : layer.speed;
+        const float seedValue = RegionHash01(regionId + layer.seed, static_cast<std::uint32_t>(index), 1301U);
+        WaterEffectPoint effect;
+        effect.position = FromGlm(position + normal * std::max(0.0F, fieldCache.settings.surfaceOffsetMeters));
+        effect.normal = FromGlm(normal);
+        effect.tangent = FromGlm(tangent);
+        effect.sourcePointIndex = node.sourcePointIndex;
+        effect.blendMode = blendMode;
+        effect.red = FloatToByte(response.colouriseRed);
+        effect.green = FloatToByte(response.colouriseGreen);
+        effect.blue = FloatToByte(response.colouriseBlue);
+        effect.mask = std::clamp(layer.regionStrength, 0.0F, 1.0F);
+        effect.edge = 1.0F;
+        effect.value = node.wetness * node.confidence * effect.mask;
+        effect.seed = seedValue;
+        effect.regionId = static_cast<float>(regionId);
+        effect.distance = node.distanceToGuide;
+        effect.linearCoord = node.pathStation;
+        effect.angle = std::atan2(tangent.y, tangent.x);
+        effect.speed = std::max(0.0F, effectSpeed);
+        effect.confidence = node.confidence;
+        effect.emissionHint = effect.value * response.emissionAdd;
+        effect.opacityHint = effect.value * response.opacityAdd;
+        effect.opacityMultiplyHint = std::lerp(
+            1.0F,
+            std::max(0.0F, response.opacityMultiply),
+            effect.value);
+        effect.sizeHint = effect.value * response.pointSizeAdd;
+        effect.sizeMultiplyHint = std::lerp(
+            1.0F,
+            std::max(0.0F, response.pointSizeMultiply),
+            effect.value);
+        effect.colourMixHint = effect.value * response.colouriseAmount;
+        effect.fieldFlowU = node.pathStation;
+        effect.fieldWetness = node.wetness;
+        effect.fieldSurfaceConfidence = node.surfaceConfidence;
+        effect.featureType = 2.0F;
+        IncludeEffectPoint(&overlay, effect);
+    }
+    return overlay;
+}
+
+WaterEffectCompositionFields ComposeWaterEffectFields(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<WaterEffectOverlay>& overlays) {
+    WaterEffectCompositionFields fields;
+    const auto pointCount = cloud.PointCount();
+    fields.value.assign(pointCount, 0.0F);
+    fields.emissionAdd.assign(pointCount, 0.0F);
+    fields.opacityAdd.assign(pointCount, 0.0F);
+    fields.opacityMultiply.assign(pointCount, 1.0F);
+    fields.pointSizeAdd.assign(pointCount, 0.0F);
+    fields.pointSizeMultiply.assign(pointCount, 1.0F);
+    fields.colourRed.assign(pointCount, 0.62F);
+    fields.colourGreen.assign(pointCount, 0.88F);
+    fields.colourBlue.assign(pointCount, 1.0F);
+    fields.colourMix.assign(pointCount, 0.0F);
+
+    if (pointCount == 0U || overlays.empty()) {
+        return fields;
+    }
+
+    std::vector<float> colourWeight(pointCount, 0.0F);
+    std::vector<float> colourRedSum(pointCount, 0.0F);
+    std::vector<float> colourGreenSum(pointCount, 0.0F);
+    std::vector<float> colourBlueSum(pointCount, 0.0F);
+    std::vector<std::uint8_t> touched(pointCount, 0U);
+    std::unordered_map<GridKey, std::vector<std::uint32_t>, GridKeyHash> pointGrid;
+    bool pointGridBuilt = false;
+
+    constexpr float kEffectMatchCellSize = 0.025F;
+    constexpr float kEffectMatchMaxDistance = 0.060F;
+    constexpr float kEffectMatchMaxDistanceSquared = kEffectMatchMaxDistance * kEffectMatchMaxDistance;
+    auto buildPointGrid = [&]() {
+        if (pointGridBuilt) {
+            return;
+        }
+        pointGrid.reserve(pointCount);
+        for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+            const glm::vec3 position = ToGlm(cloud.positions[pointIndex]);
+            if (!IsValidPoint(position)) {
+                continue;
+            }
+            pointGrid[MakeGridKey(position, kEffectMatchCellSize)].push_back(static_cast<std::uint32_t>(
+                std::min<std::size_t>(
+                    pointIndex,
+                    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))));
+        }
+        pointGridBuilt = true;
+    };
+
+    auto resolvePointIndex = [&](const WaterEffectPoint& effect) -> std::optional<std::size_t> {
+        if (effect.sourcePointIndex < pointCount) {
+            return static_cast<std::size_t>(effect.sourcePointIndex);
+        }
+        const glm::vec3 position = ToGlm(effect.position);
+        if (!IsValidPoint(position)) {
+            return std::nullopt;
+        }
+        buildPointGrid();
+        const auto baseKey = MakeGridKey(position, kEffectMatchCellSize);
+        std::optional<std::size_t> bestIndex;
+        float bestDistanceSquared = kEffectMatchMaxDistanceSquared;
+        for (int dz = -2; dz <= 2; ++dz) {
+            for (int dy = -2; dy <= 2; ++dy) {
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const GridKey key{baseKey.x + dx, baseKey.y + dy, baseKey.z + dz};
+                    const auto bucketIt = pointGrid.find(key);
+                    if (bucketIt == pointGrid.end()) {
+                        continue;
+                    }
+                    for (const auto candidateIndex : bucketIt->second) {
+                        if (candidateIndex >= pointCount) {
+                            continue;
+                        }
+                        const glm::vec3 delta = ToGlm(cloud.positions[candidateIndex]) - position;
+                        const float distanceSquared = glm::dot(delta, delta);
+                        if (distanceSquared < bestDistanceSquared) {
+                            bestDistanceSquared = distanceSquared;
+                            bestIndex = static_cast<std::size_t>(candidateIndex);
+                        }
+                    }
+                }
+            }
+        }
+        return bestIndex;
+    };
+
+    auto screen = [](float baseValue, float contribution) {
+        const float a = std::clamp(baseValue, 0.0F, 1.0F);
+        const float b = std::clamp(contribution, 0.0F, 1.0F);
+        return 1.0F - ((1.0F - a) * (1.0F - b));
+    };
+
+    auto addTint = [&](std::size_t pointIndex, const WaterEffectPoint& effect, float amount) {
+        const float weight = std::clamp(amount, 0.0F, 1.0F);
+        if (weight <= 1.0e-6F) {
+            return;
+        }
+        colourRedSum[pointIndex] += (static_cast<float>(effect.red) / 255.0F) * weight;
+        colourGreenSum[pointIndex] += (static_cast<float>(effect.green) / 255.0F) * weight;
+        colourBlueSum[pointIndex] += (static_cast<float>(effect.blue) / 255.0F) * weight;
+        colourWeight[pointIndex] += weight;
+    };
+
+    auto markTouched = [&](std::size_t pointIndex) {
+        if (touched[pointIndex] == 0U) {
+            touched[pointIndex] = 1U;
+            ++fields.affectedPointCount;
+        }
+    };
+
+    for (const auto& overlay : overlays) {
+        for (const auto& effect : overlay.points) {
+            const auto pointIndex = resolvePointIndex(effect);
+            if (!pointIndex.has_value()) {
+                continue;
+            }
+            const auto index = pointIndex.value();
+            const float value = std::clamp(effect.value, 0.0F, 1.0F);
+            if (value <= 1.0e-6F) {
+                continue;
+            }
+            markTouched(index);
+            const float emissionAdd = std::max(0.0F, effect.emissionHint);
+            const float opacityAdd = effect.opacityHint;
+            const float opacityMul = std::max(0.0F, effect.opacityMultiplyHint);
+            const float sizeAdd = effect.sizeHint;
+            const float sizeMul = std::max(0.0F, effect.sizeMultiplyHint);
+            const float colourMix = std::clamp(effect.colourMixHint, 0.0F, 1.0F);
+
+            switch (effect.blendMode) {
+                case WaterEffectBlendMode::Max:
+                    fields.value[index] = std::max(fields.value[index], value);
+                    fields.emissionAdd[index] = std::max(fields.emissionAdd[index], emissionAdd);
+                    fields.opacityAdd[index] = std::max(fields.opacityAdd[index], opacityAdd);
+                    fields.opacityMultiply[index] = std::max(fields.opacityMultiply[index], opacityMul);
+                    fields.pointSizeAdd[index] = std::max(fields.pointSizeAdd[index], sizeAdd);
+                    fields.pointSizeMultiply[index] = std::max(fields.pointSizeMultiply[index], sizeMul);
+                    if (colourMix >= fields.colourMix[index]) {
+                        fields.colourMix[index] = colourMix;
+                        fields.colourRed[index] = static_cast<float>(effect.red) / 255.0F;
+                        fields.colourGreen[index] = static_cast<float>(effect.green) / 255.0F;
+                        fields.colourBlue[index] = static_cast<float>(effect.blue) / 255.0F;
+                    }
+                    break;
+                case WaterEffectBlendMode::Multiply:
+                    fields.value[index] = std::max(fields.value[index], value);
+                    fields.opacityMultiply[index] *= opacityMul;
+                    fields.pointSizeMultiply[index] *= sizeMul;
+                    fields.emissionAdd[index] += emissionAdd;
+                    fields.opacityAdd[index] += opacityAdd;
+                    fields.pointSizeAdd[index] += sizeAdd;
+                    fields.colourMix[index] = std::clamp(fields.colourMix[index] + colourMix, 0.0F, 1.0F);
+                    addTint(index, effect, colourMix);
+                    break;
+                case WaterEffectBlendMode::Screen:
+                    fields.value[index] = screen(fields.value[index], value);
+                    fields.emissionAdd[index] = screen(fields.emissionAdd[index], emissionAdd);
+                    fields.opacityAdd[index] = screen(fields.opacityAdd[index], opacityAdd);
+                    fields.opacityMultiply[index] *= opacityMul;
+                    fields.pointSizeAdd[index] = screen(fields.pointSizeAdd[index], sizeAdd);
+                    fields.pointSizeMultiply[index] *= sizeMul;
+                    fields.colourMix[index] = screen(fields.colourMix[index], colourMix);
+                    addTint(index, effect, colourMix);
+                    break;
+                case WaterEffectBlendMode::Override:
+                    fields.value[index] = value;
+                    fields.emissionAdd[index] = emissionAdd;
+                    fields.opacityAdd[index] = opacityAdd;
+                    fields.opacityMultiply[index] = opacityMul;
+                    fields.pointSizeAdd[index] = sizeAdd;
+                    fields.pointSizeMultiply[index] = sizeMul;
+                    fields.colourMix[index] = colourMix;
+                    fields.colourRed[index] = static_cast<float>(effect.red) / 255.0F;
+                    fields.colourGreen[index] = static_cast<float>(effect.green) / 255.0F;
+                    fields.colourBlue[index] = static_cast<float>(effect.blue) / 255.0F;
+                    colourWeight[index] = 0.0F;
+                    break;
+                case WaterEffectBlendMode::Add:
+                    fields.value[index] = std::clamp(fields.value[index] + value, 0.0F, 1.0F);
+                    fields.emissionAdd[index] += emissionAdd;
+                    fields.opacityAdd[index] += opacityAdd;
+                    fields.opacityMultiply[index] *= opacityMul;
+                    fields.pointSizeAdd[index] += sizeAdd;
+                    fields.pointSizeMultiply[index] *= sizeMul;
+                    fields.colourMix[index] = std::clamp(fields.colourMix[index] + colourMix, 0.0F, 1.0F);
+                    addTint(index, effect, colourMix);
+                    break;
+            }
+        }
+    }
+
+    for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        fields.opacityMultiply[pointIndex] = std::max(0.0F, fields.opacityMultiply[pointIndex]);
+        fields.pointSizeMultiply[pointIndex] = std::max(0.0F, fields.pointSizeMultiply[pointIndex]);
+        if (colourWeight[pointIndex] > 1.0e-6F) {
+            fields.colourRed[pointIndex] = colourRedSum[pointIndex] / colourWeight[pointIndex];
+            fields.colourGreen[pointIndex] = colourGreenSum[pointIndex] / colourWeight[pointIndex];
+            fields.colourBlue[pointIndex] = colourBlueSum[pointIndex] / colourWeight[pointIndex];
+        }
+    }
+
+    return fields;
+}
+
+invisible_places::io::LoadedPointCloud BuildWaterStreamOverlayPointCloud(
+    const WaterStreamOverlay& overlay,
+    const std::filesystem::path& sourcePath,
+    std::string_view layerName) {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = sourcePath;
+    cloud.layerName = std::string{layerName};
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    cloud.positions.reserve(overlay.samples.size());
+    cloud.normals.reserve(overlay.samples.size());
+    cloud.packedColors.reserve(overlay.samples.size());
+    cloud.bounds = overlay.bounds;
+    for (const auto& sample : overlay.samples) {
+        cloud.positions.push_back(sample.position);
+        cloud.normals.push_back(sample.normal);
+        cloud.packedColors.push_back(PackRgba8(sample.red, sample.green, sample.blue));
+        if (!cloud.bounds.valid) {
+            cloud.bounds.Expand(sample.position);
+        }
+    }
+    if (!cloud.positions.empty()) {
+        cloud.focusPoint = cloud.bounds.valid
+                               ? invisible_places::io::Float3{
+                                     (cloud.bounds.minimum.x + cloud.bounds.maximum.x) * 0.5F,
+                                     (cloud.bounds.minimum.y + cloud.bounds.maximum.y) * 0.5F,
+                                     (cloud.bounds.minimum.z + cloud.bounds.maximum.z) * 0.5F}
+                               : cloud.positions.front();
+        cloud.hasFocusPoint = true;
+    }
+
+    struct StreamScalarField {
+        std::string_view name;
+        float (*value)(const WaterStreamSample&);
+    };
+    const StreamScalarField fields[] = {
+        {"stream_id", [](const WaterStreamSample& sample) { return sample.streamId; }},
+        {"source_id", [](const WaterStreamSample& sample) { return sample.sourceId; }},
+        {"path_id", [](const WaterStreamSample& sample) { return sample.pathId; }},
+        {"branch_id", [](const WaterStreamSample& sample) { return sample.branchId; }},
+        {"stream_seed", [](const WaterStreamSample& sample) { return sample.streamSeed; }},
+        {"point_seed", [](const WaterStreamSample& sample) { return sample.pointSeed; }},
+        {"stream_distance", [](const WaterStreamSample& sample) { return sample.streamDistance; }},
+        {"stream_length", [](const WaterStreamSample& sample) { return sample.streamLength; }},
+        {"point_age", [](const WaterStreamSample& sample) { return sample.pointAge; }},
+        {"stream_age", [](const WaterStreamSample& sample) { return sample.streamAge; }},
+        {"stream_speed", [](const WaterStreamSample& sample) { return sample.streamSpeed; }},
+        {"stream_width", [](const WaterStreamSample& sample) { return sample.streamWidth; }},
+        {"stream_world_length", [](const WaterStreamSample& sample) { return sample.streamWorldLength; }},
+        {"stream_confidence", [](const WaterStreamSample& sample) { return sample.streamConfidence; }},
+        {"wetness", [](const WaterStreamSample& sample) { return sample.wetness; }},
+        {"feature_type", [](const WaterStreamSample& sample) { return sample.featureType; }},
+        {"tangent_x", [](const WaterStreamSample& sample) { return sample.tangent.x; }},
+        {"tangent_y", [](const WaterStreamSample& sample) { return sample.tangent.y; }},
+        {"tangent_z", [](const WaterStreamSample& sample) { return sample.tangent.z; }},
+    };
+
+    cloud.scalarFields.reserve(std::size(fields));
+    cloud.scalarFieldValues.reserve(overlay.samples.size() * std::size(fields));
+    for (const auto& field : fields) {
+        invisible_places::io::ScalarFieldStats stats;
+        stats.name = std::string{field.name};
+        for (const auto& sample : overlay.samples) {
+            const float value = field.value(sample);
+            cloud.scalarFieldValues.push_back(value);
+            stats.Include(value);
+        }
+        cloud.scalarFields.push_back(stats);
+    }
+    return cloud;
+}
+
+invisible_places::io::LoadedPointCloud BuildWaterEffectOverlayPointCloud(
+    const WaterEffectOverlay& overlay,
+    const std::filesystem::path& sourcePath,
+    std::string_view layerName) {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = sourcePath;
+    cloud.layerName = std::string{layerName};
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    cloud.positions.reserve(overlay.points.size());
+    cloud.normals.reserve(overlay.points.size());
+    cloud.packedColors.reserve(overlay.points.size());
+    cloud.bounds = overlay.bounds;
+    for (const auto& point : overlay.points) {
+        cloud.positions.push_back(point.position);
+        cloud.normals.push_back(point.normal);
+        cloud.packedColors.push_back(PackRgba8(point.red, point.green, point.blue));
+        if (!cloud.bounds.valid) {
+            cloud.bounds.Expand(point.position);
+        }
+    }
+    if (!cloud.positions.empty()) {
+        cloud.focusPoint = cloud.bounds.valid
+                               ? invisible_places::io::Float3{
+                                     (cloud.bounds.minimum.x + cloud.bounds.maximum.x) * 0.5F,
+                                     (cloud.bounds.minimum.y + cloud.bounds.maximum.y) * 0.5F,
+                                     (cloud.bounds.minimum.z + cloud.bounds.maximum.z) * 0.5F}
+                               : cloud.positions.front();
+        cloud.hasFocusPoint = true;
+    }
+
+    struct EffectScalarField {
+        std::string_view name;
+        float (*value)(const WaterEffectPoint&);
+    };
+    const EffectScalarField fields[] = {
+        {"ripple_mask", [](const WaterEffectPoint& point) { return point.mask; }},
+        {"ripple_edge", [](const WaterEffectPoint& point) { return point.edge; }},
+        {"ripple_value", [](const WaterEffectPoint& point) { return point.value; }},
+        {"ripple_seed", [](const WaterEffectPoint& point) { return point.seed; }},
+        {"ripple_region_id", [](const WaterEffectPoint& point) { return point.regionId; }},
+        {"ripple_distance", [](const WaterEffectPoint& point) { return point.distance; }},
+        {"ripple_linear_coord", [](const WaterEffectPoint& point) { return point.linearCoord; }},
+        {"ripple_angle", [](const WaterEffectPoint& point) { return point.angle; }},
+        {"ripple_speed", [](const WaterEffectPoint& point) { return point.speed; }},
+        {"ripple_confidence", [](const WaterEffectPoint& point) { return point.confidence; }},
+        {"ripple_emission_hint", [](const WaterEffectPoint& point) { return point.emissionHint; }},
+        {"ripple_opacity_hint", [](const WaterEffectPoint& point) { return point.opacityHint; }},
+        {"ripple_size_hint", [](const WaterEffectPoint& point) { return point.sizeHint; }},
+        {"ripple_colour_mix_hint", [](const WaterEffectPoint& point) { return point.colourMixHint; }},
+        {"field_flow_u", [](const WaterEffectPoint& point) { return point.fieldFlowU; }},
+        {"field_wetness", [](const WaterEffectPoint& point) { return point.fieldWetness; }},
+        {"field_surface_confidence", [](const WaterEffectPoint& point) { return point.fieldSurfaceConfidence; }},
+        {"feature_type", [](const WaterEffectPoint& point) { return point.featureType; }},
+        {"tangent_x", [](const WaterEffectPoint& point) { return point.tangent.x; }},
+        {"tangent_y", [](const WaterEffectPoint& point) { return point.tangent.y; }},
+        {"tangent_z", [](const WaterEffectPoint& point) { return point.tangent.z; }},
+        {"source_point_index", [](const WaterEffectPoint& point) {
+             return point.sourcePointIndex == std::numeric_limits<std::uint32_t>::max()
+                        ? -1.0F
+                        : static_cast<float>(point.sourcePointIndex);
+         }},
+        {"effect_blend_mode", [](const WaterEffectPoint& point) {
+             return static_cast<float>(point.blendMode);
+         }},
+        {"ripple_opacity_multiply_hint", [](const WaterEffectPoint& point) { return point.opacityMultiplyHint; }},
+        {"ripple_size_multiply_hint", [](const WaterEffectPoint& point) { return point.sizeMultiplyHint; }},
+    };
+    cloud.scalarFields.reserve(std::size(fields));
+    cloud.scalarFieldValues.reserve(overlay.points.size() * std::size(fields));
+    for (const auto& field : fields) {
+        invisible_places::io::ScalarFieldStats stats;
+        stats.name = std::string{field.name};
+        for (const auto& point : overlay.points) {
+            const float value = field.value(point);
+            cloud.scalarFieldValues.push_back(value);
+            stats.Include(value);
+        }
+        cloud.scalarFields.push_back(stats);
+    }
+    return cloud;
+}
+
 std::vector<invisible_places::io::Float3> BuildWaterRegionHull(
     const std::vector<invisible_places::io::Float3>& vertices) {
     std::vector<invisible_places::io::Float3> points;

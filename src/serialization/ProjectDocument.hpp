@@ -47,7 +47,7 @@ struct ProjectDocument {
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 23;
+    std::uint32_t schemaVersion = 24;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
@@ -75,6 +75,7 @@ struct ProjectDocument {
     std::vector<invisible_places::water::WaterBasinRegion> waterBasinRegions;
     std::vector<invisible_places::water::WaterRunoffRegion> waterRunoffRegions;
     std::vector<invisible_places::water::WaterCausticRegion> waterCausticRegions;
+    std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
     invisible_places::water::WaterAnimationTrailSettings waterAnimationTrailSettings{};
@@ -92,6 +93,10 @@ struct ProjectDocument {
     std::optional<invisible_places::water::WaterSettingsBundle> tempWaterSettings;
     invisible_places::water::WaterBakeSettings waterBakeSettings{};
     invisible_places::water::WaterRenderSettings waterRenderSettings{};
+    invisible_places::water::WaterFlowStreamSettings waterFlowStreamSettings{};
+    invisible_places::water::WaterFieldSettings waterFieldSettings{};
+    invisible_places::water::WaterFieldStreamSettings waterFieldStreamSettings{};
+    std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
 };
 
@@ -107,6 +112,8 @@ struct WaterSourcesDocument {
     std::vector<invisible_places::water::WaterBasinRegion> basinRegions;
     std::vector<invisible_places::water::WaterRunoffRegion> runoffRegions;
     std::vector<invisible_places::water::WaterCausticRegion> causticRegions;
+    std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
+    std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     invisible_places::water::WaterSourceSettings sourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempSourceSettings;
     invisible_places::water::WaterCausticLookSettings causticLookSettings{};
@@ -115,6 +122,9 @@ struct WaterSourcesDocument {
     std::optional<invisible_places::water::WaterSettingsBundle> tempSettings;
     invisible_places::water::WaterBakeSettings bakeSettings{};
     invisible_places::water::WaterRenderSettings renderSettings{};
+    invisible_places::water::WaterFlowStreamSettings flowStreamSettings{};
+    invisible_places::water::WaterFieldSettings fieldSettings{};
+    invisible_places::water::WaterFieldStreamSettings fieldStreamSettings{};
     std::optional<invisible_places::water::WaterPathCache> pathCache;
 };
 

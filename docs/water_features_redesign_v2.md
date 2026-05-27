@@ -10,12 +10,45 @@ This document revises the water-feature system around three active features:
 
 The document also removes the legacy **Basin** and **Runoff** feature families from the redesigned workflow.
 
+## Implementation status
+
+The current implementation includes the active v2 workflow and the visual/composition
+paths covered by the acceptance log. Treat the list below as the implemented
+contract:
+
+```text
+Active Water tabs: Ripples, Flow, Field
+Project schema: 24
+New save keys: water_ripple_layers, water_flow_stream_settings, water_field_settings, water_field_stream_settings
+Preserved keys: water_emitters, water_source_settings, water_path_cache
+Removed new-save keys: water_basin_regions, water_runoff_regions, water_caustic_regions
+Legacy migration: water_caustic_regions -> Ripple / Caustic Lace
+Legacy ignore: water_basin_regions, water_runoff_regions
+Primary water output: generated/effect layers in memory, not water PLY files
+```
+
+Legacy Basin/Runoff functions can still exist in source for old compatibility tests or future reference, but they are not part of the active public v2 workflow.
+
 The main architectural rule is:
 
 ```text
 Base point cloud visuals remain the base truth.
-Water features add virtual effect layers or generated overlay points.
-They should not overwrite the user's existing roughness/colour/opacity/size scalar mappings.
+Ripples and Field Surface Motion modify the final evaluated visuals of the active/base cloud.
+Flow Streams and Field Streamlines may be generated stream overlays.
+Water features should not overwrite the user's existing roughness/colour/opacity/size scalar mappings.
+```
+
+Current status:
+
+```text
+Ripple and Field Surface Motion now also pre-compose active-cloud `water_effect_*`
+fields that the viewport, raycast, fast-basic, and offline renderers apply after
+the user's existing base mappings.
+Copied generated/effect overlay point-cloud sessions still exist as compatibility
+preview/export layers.
+Saved Ripple and Field-region projects regenerate these active-cloud fields when
+the project or target layer is loaded.
+Automated render tests cover active-cloud EXR writing and MP4 frame conversion.
 ```
 
 A second important rule is:
@@ -41,11 +74,11 @@ Flow path cache           saved as JSON or current path-cache format
 Flow stream settings      saved with project
 Flow stream cache         optional binary/JSON cache for fast reload
 Field cache               saved as vector-field node cache, probably binary + JSON metadata
-Field settigns            saved with project
+Field settings            saved with project
 Field stream cache        optional generated stream-sample cache
-Field stream settigns     saved with project
+Field stream settings     saved with project
 Ripple/Field effect cache saved as sparse virtual effect layer cache
-Ripple/field efftect settigns saved with project.
+Ripple/Field effect settings saved with project
 ```
 
 ### Renderer direction
@@ -64,20 +97,28 @@ Do not make Flow Streams or Field Streamlines screen-facing particle dots. They 
 
 ### Animation direction
 
-Generated stream points can store scalar fields such as:
+Generated stream points store the public v2 scalar contract:
 
 ```text
-stream_seed
 stream_id
+source_id
+path_id
+branch_id
+stream_seed
+point_seed
 stream_distance
-stream_speed
-stream_width
 stream_length
 point_age
 stream_age
-point_seed
-confidence
+stream_speed
+stream_width
+stream_world_length
+stream_confidence
 wetness
+feature_type
+tangent_x
+tangent_y
+tangent_z
 ```
 
 The shader should animate these fields using time uniforms wherever possible. GPU-side animation is preferred. CPU regeneration should only be used when topology changes, such as changing stream count, stream length, field resolution, path bake settings, or corridor radius.
@@ -87,6 +128,30 @@ The shader should animate these fields using time uniforms wherever possible. GP
 Ripples and Field Surface Motion should normally be **virtual effect layers** over the base point cloud rather than new scalar fields that overwrite or fight with the base cloud's existing visual mappings.
 
 The user may already map base point size, opacity, colour, and emission to fields such as roughness, height, classification, intensity, or others. Water effects should contribute to the final evaluated visual values without replacing those base mappings.
+
+These effects should be combined through the same conceptual pipeline as Visuals:
+
+```text
+base visual mapping
+    + additive water contributions
+    * multiplicative water contributions
+    max/screen/lighten water contributions where selected
+    priority/blend-mode resolution for overlapping water effects
+```
+
+Multiple Ripple and Field Surface Motion effects may overlap. Their contributions should add,
+multiply, screen, max, or otherwise compose according to effect settings instead of creating
+separate growing point patterns that visually replace the active point cloud.
+
+Implementation status:
+
+```text
+Ripple and Field Surface Motion contributions can now compose into the active/base
+cloud's final visual evaluation through generated `water_effect_*` fields.
+The Visuals tab exposes Water Effect Stack contribution controls for the selected
+base cloud. Automated render tests cover active-cloud EXR writing and MP4 frame
+conversion for that composition path.
+```
 
 ### Legacy features
 
@@ -172,7 +237,7 @@ final_emission = max(0, base_emission + water_emission_add)
 final_colour   = colour_composite(base_colour, water_colour, water_colour_mix, water_hue_shift)
 ```
 
-The water tabs should expose the parameters that define the water effect. The Visuals tab should remain the place where generic visual properties are mapped, where possible. Effects over the base cloud can have a virtual point to allow visual tab controls of how the effect is modified with saved visuals, defaults and presets, saved on project save. The user can thus select the base cloud or any water effects created and change their visuals. Saved visuals are linked to the cloud to avoid issues of a mapped field not existing in the other cloud, however if all fields are the same, they should be able to be selected in the saved visuals but not edit it until it is saved anew in the active cloud. where '_baseCloud' or '_ripple' etc are appended to the name of the saved visuals when coming from another cloud.
+The water tabs should expose the parameters that define the water effect. The Visuals tab should remain the place where generic visual properties are mapped, where possible. Ripple and Field Surface Motion layers should expose virtual/effect fields to Visuals so the user can decide how those effects add, multiply, max, screen, colourise, or otherwise combine with the active cloud. The user can select the base cloud or a water effect layer and edit its compatible visual mappings. Saved visuals are linked to the cloud/effect family to avoid references to fields that do not exist on the active target. If a saved visual from another family has the same required fields, it may be selected read-only until saved under the active family with a suffix such as `_baseCloud`, `_ripple`, `_flow`, or `_field`.
 
 Rule:
 
@@ -254,6 +319,17 @@ Copied virtual cloud mode
 ```
 
 Start with copied virtual cloud mode if it is easier. It can still be fast enough because only the affected region is copied and LOD can reduce far points.
+
+Current status:
+
+```text
+Copied virtual cloud mode remains as a compatibility preview/export output for
+Ripples and Field Surface Motion.
+The renderer/offline paths now also consume pre-composed active-cloud `water_effect_*`
+fields for final visual modification, and the Visuals tab exposes Water Effect Stack
+contribution controls for matching base-cloud Ripple and Field Surface Motion layers.
+Automated render tests cover the active-cloud EXR and MP4-frame conversion paths.
+```
 
 ---
 
@@ -391,7 +467,9 @@ Caustics becomes one overlay type inside Ripples:
 Ripples → Overlay Type → Caustic Lace
 ```
 
-Ripples are region-based animated overlays on the base point cloud. The user selects or draws a region, chooses a water-related pattern, and the renderer modifies the final visual values of affected base-cloud points.
+Ripples are region-based animated effects on the active/base point cloud. The user selects or draws a region, chooses a water-related pattern, and the renderer modifies the final visual values of affected base-cloud points.
+
+Ripples should not create an independent family of new points that slowly grows in a pattern and visually replaces the base point cloud. If copied/generated effect points are used temporarily, they should represent affected base samples and should remain visually composable with the active cloud.
 
 Ripples are best for:
 
@@ -583,6 +661,18 @@ Small bright pulses near selected edges, wet bands, or high-response regions.
 ### Salt / Mineral Shimmer
 
 Slow granular shimmer, useful for wet sand, salt traces, mineral streaks, or symbolic water residue.
+
+Implementation status:
+
+```text
+All WaterRippleOverlayType values are implemented as distinct sparse virtual/effect fields.
+The Water tab keeps Refresh Ripples as a manual recovery action, but ordinary complete-layer edits
+now rebuild the active -Ripples.generated overlay and active-cloud `water_effect_*` fields automatically.
+Disabling or deleting the final active Ripple layer unloads stale Ripple generated sessions.
+Ripple contributions now compose into the active/base cloud visual evaluation; generated/effect
+overlay sessions remain as compatibility preview layers.
+Ripple containment now preserves the clicked concave boundary for C-shaped regions.
+```
 
 ---
 
@@ -816,21 +906,23 @@ Process:
 
 Flow Streams should be much faster than the current trails because they do not need to generate dense lane guides, ghost particles, path-view particles, and full-path animated particles. They are mostly static stream samples animated by shader time.
 
+Current status:
+
+```text
+Flow Streams generate deterministic static stream surfels with the v2 animation fields.
+The viewport/offline shader paths derive animated stream age from point_age, point_seed,
+stream_speed, and render time so water motion changes without topology regeneration.
+```
+
 ---
 
 ## 3.5 Flow stream surfel schema
 
 Each generated stream sample should be a world surfel.
 
-Suggested attributes:
+Public scalar-field contract:
 
 ```text
-position
-normal
-tangent
-side_vector, optional
-colour, optional default
-
 stream_id
 source_id
 path_id
@@ -845,27 +937,14 @@ stream_speed
 stream_width
 stream_world_length
 stream_confidence
-stream_wetness
-stream_role
-water_feature_type
+wetness
+feature_type
+tangent_x
+tangent_y
+tangent_z
 ```
 
-Minimum useful set:
-
-```text
-position
-normal
-tangent
-stream_id
-stream_seed
-point_age
-stream_speed
-stream_width
-stream_world_length
-stream_confidence
-```
-
-If tangent attributes are not immediately available, tangent can be reconstructed from neighbouring samples in the same stream during generation and written into an auxiliary buffer.
+Position, normal, and colour remain point attributes rather than scalar fields. Tangent is also stored as scalar triplets because the shader and Visuals layer need it by name.
 
 ---
 
@@ -1318,6 +1397,16 @@ Option B: Field Surface Motion
 
 Field should not build over the entire 120M cloud. It should build only inside a path corridor or selected region.
 
+Current status:
+
+```text
+Field builds from Flow path anchors or user-authored Field regions. Field region creation uses
+the Ripple-style clicked polygon model, persists as WaterEffectLayer records, and clips generated
+stream/effect output to the authored boundary so concave shapes exclude their cut-out area.
+Field Streamlines expose diagnostics for accepted bridges, rejected gaps, low-confidence
+fades, and hard terminations, with Bridge Aggression and confidence controls in the Field panel.
+```
+
 ---
 
 ## 5.2 Direct answer: would Field be faster?
@@ -1431,6 +1520,10 @@ Field
         Show Rejected Gaps
         Show No Flow Regions
 ```
+
+The "Use Selected Region" path is available through Field region layers. Further work should
+improve bridge/rejection diagnostics and active-cloud effect composition, not reintroduce
+convex-hull containment.
 
 Remove any freefall or reattach controls.
 
@@ -2326,7 +2419,19 @@ The blue reference style often benefits more from good splat length, opacity pro
 
 ## 10.1 Project JSON
 
-Store user-facing settings in the project:
+Project schema `24` stores user-facing settings in the project:
+
+```text
+water_emitters
+water_source_settings
+water_path_cache
+water_ripple_layers
+water_flow_stream_settings
+water_field_settings
+water_field_stream_settings
+```
+
+These keys represent:
 
 ```text
 Ripples
@@ -2341,6 +2446,8 @@ Field
 Visuals
     water visual presets and selected mappings
 ```
+
+New saves do not write `water_basin_regions`, `water_runoff_regions`, or `water_caustic_regions`.
 
 ---
 
@@ -2429,18 +2536,11 @@ Flow paths
 
 Basin / Runoff
     do not show as active features.
-    optional: keep raw legacy records for backward file safety.
-    optional: offer one-way conversion to simple Ripple regions.
+    tolerate old records and ignore them.
+    do not write old records on new saves.
 ```
 
-Suggested conversion options:
-
-```text
-Basin → Ripple / Wet Sheen or Tide Pulse
-Runoff → Ripple / Current Threads or Drip Trails
-```
-
-But this conversion is optional. The redesigned system does not depend on Basin or Runoff.
+The redesigned system does not depend on Basin or Runoff, and there is no required legacy preservation beyond harmless old-file loading.
 
 ---
 
@@ -2540,6 +2640,7 @@ Tide Bands work over a large sand region without generating streamlines.
 Droplet Glints work on sparse foliage without requiring a clean surface.
 Ripples contribute to base visuals without destroying existing roughness/opacity/colour mappings.
 Overlapping Ripple regions can be enabled/disabled independently.
+Concave Ripple regions preserve the clicked boundary and do not fill the cut-out area.
 Viewport and export match.
 ```
 
@@ -2570,6 +2671,8 @@ Debug view shows accepted bridges, rejected gaps, and termination reasons.
 
 ```text
 Field builds only around paths/selected region, not the full 120M cloud.
+User can build a Field from a selected region, not only from Flow path anchors.
+Concave Field regions preserve the clicked boundary and do not fill the cut-out area.
 Debug vectors follow broad path direction and local downhill/graph direction.
 Streamlines fill the corridor rather than tracing exact yellow paths.
 Streamlines stay on the surface or bridge valid gaps.

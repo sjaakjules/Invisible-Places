@@ -109,6 +109,9 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 causticParams1{0.045F, 1.15F, 0.08F, 0.0F};
     glm::vec4 causticParams2{0.006F, 0.005F, 0.0F, 0.0F};
     glm::vec4 causticTint{0.62F, 0.88F, 1.0F, 1.0F};
+    glm::uvec4 waterEffectControl{0U, 0U, 0U, 0U};
+    glm::uvec4 waterEffectSlots0{0U, 0U, 0U, 0U};
+    glm::uvec4 waterEffectSlots1{0U, 0U, 0U, 0U};
     glm::vec4 gradientStartColor{0.05F, 0.28F, 0.95F, 1.0F};
     glm::vec4 gradientEndColor{0.96F, 0.94F, 0.58F, 1.0F};
 };
@@ -187,6 +190,18 @@ std::optional<std::uint32_t> FindGroundIdScalarFieldSlot(
         scalarFields,
         {"groundid", "scalargroundid"},
         "groundid");
+}
+
+std::optional<std::uint32_t> FindExactScalarFieldSlot(
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    std::string_view name) {
+    const auto normalizedName = NormalizeScalarFieldName(name);
+    for (std::size_t index = 0; index < scalarFields.size(); ++index) {
+        if (NormalizeScalarFieldName(scalarFields[index].name) == normalizedName) {
+            return static_cast<std::uint32_t>(index);
+        }
+    }
+    return std::nullopt;
 }
 
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
@@ -494,22 +509,29 @@ float EstimateRaycastBvhRadius(
     const float exportDepth = maxDepth > 0.0F ? maxDepth : renderState.farPlane;
     const float projectionScale = std::max(1.0e-5F, std::abs(renderState.projection[1][1]));
     const float pixelWorldAtMaxDepth = (2.0F * std::max(0.001F, exportDepth)) / (projectionScale * safeHeight);
+    const float depthOfFieldBlurPixels = renderState.hasDepthOfField ? renderState.depthOfFieldMaxBlurPixels : 0.0F;
     const float pointSize = std::clamp(
         BindingMaximum(style.pointSize, renderer::pointcloud::kInactivePointSizeDefault) *
             std::max(0.001F, renderState.pointSizeScale) +
-            (renderState.hasDepthOfField ? renderState.depthOfFieldMaxBlurPixels : 0.0F),
+            depthOfFieldBlurPixels,
         std::max(1.0F, pointSizeRangeMin),
         std::max(std::max(1.0F, pointSizeRangeMin), pointSizeRangeMax));
     const float screenRadius = pointSize * 0.5F * pixelWorldAtMaxDepth;
+    const float worldSizedScreenRadius =
+        (std::max(0.0F, BindingMaximum(style.surfelDiameter, renderer::pointcloud::kInactiveSurfelDiameterDefault)) *
+         0.5F) +
+        (depthOfFieldBlurPixels * 0.5F * pixelWorldAtMaxDepth);
     const float surfelRadius =
         std::max(0.0F, BindingMaximum(style.surfelDiameter, renderer::pointcloud::kInactiveSurfelDiameterDefault)) *
         0.5F *
         (style.flowAnimation ? std::clamp(style.waterStreakAspect, 1.0F, 32.0F) : 1.0F);
     if (primitiveMode == renderer::pointcloud::PointCloudRaycastPrimitiveMode::SoftDensitySpheres) {
-        return std::max(screenRadius, surfelRadius);
+        return std::max({screenRadius, worldSizedScreenRadius, surfelRadius});
     }
     if (style.geometryMode == renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
-        return screenRadius;
+        return renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(style)
+                   ? worldSizedScreenRadius
+                   : screenRadius;
     }
     return std::max(screenRadius, surfelRadius);
 }
@@ -5452,7 +5474,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         resources->pointCount,
         plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
-        layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U,
+        layer.style.waterStreamOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
     };
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled ||
@@ -5485,7 +5507,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.densityScale,
         layer.style.densityClamp,
         std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
-        0.0F,
+        renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
     };
     styleGpu.renderParams3 = glm::vec4{
         layer.style.depthAlphaThreshold,
@@ -5572,6 +5594,46 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             std::clamp(layer.style.causticTint[1], 0.0F, 4.0F),
             std::clamp(layer.style.causticTint[2], 0.0F, 4.0F),
             1.0F,
+        };
+    }
+    const auto waterEffectEmissionAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_emission_add");
+    const auto waterEffectOpacityAddSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_opacity_add");
+    const auto waterEffectOpacityMultiplySlot =
+        FindExactScalarFieldSlot(layer.scalarFields, "water_effect_opacity_multiply");
+    const auto waterEffectPointSizeAddSlot =
+        FindExactScalarFieldSlot(layer.scalarFields, "water_effect_point_size_add");
+    const auto waterEffectPointSizeMultiplySlot =
+        FindExactScalarFieldSlot(layer.scalarFields, "water_effect_point_size_multiply");
+    const auto waterEffectColourRedSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_red");
+    const auto waterEffectColourGreenSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_green");
+    const auto waterEffectColourBlueSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_blue");
+    const auto waterEffectColourMixSlot = FindExactScalarFieldSlot(layer.scalarFields, "water_effect_colour_mix");
+    if (waterEffectEmissionAddSlot.has_value() &&
+        waterEffectOpacityAddSlot.has_value() &&
+        waterEffectOpacityMultiplySlot.has_value() &&
+        waterEffectPointSizeAddSlot.has_value() &&
+        waterEffectPointSizeMultiplySlot.has_value() &&
+        waterEffectColourRedSlot.has_value() &&
+        waterEffectColourGreenSlot.has_value() &&
+        waterEffectColourBlueSlot.has_value() &&
+        waterEffectColourMixSlot.has_value()) {
+        styleGpu.waterEffectControl = glm::uvec4{
+            1U,
+            waterEffectEmissionAddSlot.value() + 1U,
+            waterEffectOpacityAddSlot.value() + 1U,
+            waterEffectOpacityMultiplySlot.value() + 1U,
+        };
+        styleGpu.waterEffectSlots0 = glm::uvec4{
+            waterEffectPointSizeAddSlot.value() + 1U,
+            waterEffectPointSizeMultiplySlot.value() + 1U,
+            waterEffectColourMixSlot.value() + 1U,
+            waterEffectColourRedSlot.value() + 1U,
+        };
+        styleGpu.waterEffectSlots1 = glm::uvec4{
+            waterEffectColourGreenSlot.value() + 1U,
+            waterEffectColourBlueSlot.value() + 1U,
+            0U,
+            0U,
         };
     }
     styleGpu.pointSize = MakePointCloudBindingGpu(

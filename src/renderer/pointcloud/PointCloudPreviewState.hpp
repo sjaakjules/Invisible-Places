@@ -46,6 +46,11 @@ enum class PointCloudGeometryMode {
     CameraFacingWorldSprites
 };
 
+enum class PointCloudScreenSpriteSizeMode {
+    Pixels,
+    WorldMillimeters
+};
+
 enum class PointCloudDepthContribution {
     None,
     AlphaThreshold,
@@ -97,6 +102,7 @@ struct PointCloudStyleState {
     PointCloudStyleState();
 
     PointCloudGeometryMode geometryMode = PointCloudGeometryMode::ScreenSprites;
+    PointCloudScreenSpriteSizeMode screenSpriteSizeMode = PointCloudScreenSpriteSizeMode::Pixels;
     PointCloudDepthContribution depthContribution = PointCloudDepthContribution::None;
     PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::HardDisc;
     PointCloudStylisationMode stylisationMode = PointCloudStylisationMode::Off;
@@ -140,6 +146,7 @@ struct PointCloudStyleState {
     bool solidCenters = true;
     bool flowAnimation = false;
     bool waterPathView = false;
+    bool waterStreamOverlay = false;
     bool causticAnimation = false;
     float causticIntensity = 0.0F;
     float causticScale = 4.0F;
@@ -205,6 +212,12 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style);
+[[nodiscard]] float WorldDiameterToScreenPointSizePixels(
+    float diameterMeters,
+    float viewDepth,
+    float projectionScaleY,
+    float viewportHeight);
 [[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb);

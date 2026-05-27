@@ -22,6 +22,15 @@ struct OfflinePointLayer {
     glm::mat4 localToWorld{1.0F};
     std::size_t roughnessMotionFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t groundIdMotionFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectEmissionAddFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectOpacityAddFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectOpacityMultiplyFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectPointSizeAddFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectPointSizeMultiplyFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectColourRedFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectColourGreenFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectColourBlueFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::size_t waterEffectColourMixFieldSlot = std::numeric_limits<std::size_t>::max();
     float roughnessMotionMinimum = 0.0F;
     float roughnessMotionInvRange = 1.0F;
 };

@@ -53,12 +53,27 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams2;
 } styleData;
 
+float WorldDiameterToScreenPointSizePixels(float diameterMeters, float viewDepth) {
+    return max(0.0, diameterMeters) *
+           abs(uniforms.projection[1][1]) *
+           max(1.0, uniforms.viewportParameters.y) /
+           (2.0 * max(0.001, viewDepth));
+}
+
 void main() {
     const uint pointIndex = uint(gl_VertexIndex);
     vec4 worldPosition = vec4(inPosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     gl_Position = uniforms.viewProjection * worldPosition;
-    gl_PointSize = max(1.0, styleData.pointSizeBinding.constantValue.x);
+    const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
+    const float basePointSize =
+        worldSizedScreenSprites
+            ? WorldDiameterToScreenPointSizePixels(styleData.surfelDiameterBinding.constantValue.x, -viewPosition.z)
+            : styleData.pointSizeBinding.constantValue.x;
+    gl_PointSize = clamp(
+        basePointSize,
+        max(1.0, styleData.renderParams3.y),
+        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
     outSourceColor = inColor;
     outViewDepth = -viewPosition.z;
     outPointIndex = pointIndex;

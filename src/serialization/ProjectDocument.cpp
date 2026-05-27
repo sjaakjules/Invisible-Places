@@ -29,6 +29,7 @@ using invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using invisible_places::renderer::pointcloud::PointCloudRaycastPrimitiveMode;
 using invisible_places::renderer::pointcloud::PointCloudRendererMode;
+using invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
 using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using invisible_places::style::FieldMapConfig;
@@ -38,10 +39,18 @@ using invisible_places::water::WaterBakeSettings;
 using invisible_places::water::WaterCausticLookSettings;
 using invisible_places::water::WaterCausticPreviewTintMode;
 using invisible_places::water::WaterCausticRegion;
+using invisible_places::water::WaterEffectBlendMode;
+using invisible_places::water::WaterEffectFeatureType;
+using invisible_places::water::WaterEffectLayer;
+using invisible_places::water::WaterEffectResponseSettings;
 using invisible_places::water::WaterEmitter;
 using invisible_places::water::WaterEmitterOrigin;
 using invisible_places::water::WaterEmitterStatus;
 using invisible_places::water::WaterAnimationTrailSettings;
+using invisible_places::water::WaterFieldOutputMode;
+using invisible_places::water::WaterFieldSettings;
+using invisible_places::water::WaterFieldStreamSettings;
+using invisible_places::water::WaterFlowStreamSettings;
 using invisible_places::water::WaterBasinRegion;
 using invisible_places::water::WaterParticleTrailSettings;
 using invisible_places::water::WaterParticleTrailShapeSettings;
@@ -53,6 +62,7 @@ using invisible_places::water::WaterPathCache;
 using invisible_places::water::WaterPathGenerationSettings;
 using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
+using invisible_places::water::WaterRippleOverlayType;
 using invisible_places::water::WaterRunoffMode;
 using invisible_places::water::WaterRunoffRegion;
 using invisible_places::water::WaterScaleMode;
@@ -69,6 +79,14 @@ json SerializeWaterAnimationTrailSettings(const WaterAnimationTrailSettings& set
 WaterAnimationTrailSettings ParseWaterAnimationTrailSettings(const json& settingsJson);
 json SerializeWaterCausticLookSettings(const WaterCausticLookSettings& settings);
 WaterCausticLookSettings ParseWaterCausticLookSettings(const json& settingsJson);
+json SerializeWaterEffectLayer(const WaterEffectLayer& layer);
+WaterEffectLayer ParseWaterEffectLayer(const json& layerJson);
+json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings);
+WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson);
+json SerializeWaterFieldSettings(const WaterFieldSettings& settings);
+WaterFieldSettings ParseWaterFieldSettings(const json& settingsJson);
+json SerializeWaterFieldStreamSettings(const WaterFieldStreamSettings& settings);
+WaterFieldStreamSettings ParseWaterFieldStreamSettings(const json& settingsJson);
 json SerializeWaterVisualSettings(const WaterVisualSettings& settings);
 WaterVisualSettings ParseWaterVisualSettings(const json& settingsJson);
 PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& visualSettings);
@@ -283,6 +301,26 @@ PointCloudGeometryMode ParsePointCloudGeometryMode(const json& value) {
         return PointCloudGeometryMode::CameraFacingWorldSprites;
     }
     return PointCloudGeometryMode::ScreenSprites;
+}
+
+const char* PointCloudScreenSpriteSizeModeName(PointCloudScreenSpriteSizeMode mode) {
+    switch (mode) {
+        case PointCloudScreenSpriteSizeMode::Pixels:
+            return "pixels";
+        case PointCloudScreenSpriteSizeMode::WorldMillimeters:
+            return "world_millimeters";
+    }
+
+    return "pixels";
+}
+
+PointCloudScreenSpriteSizeMode ParsePointCloudScreenSpriteSizeMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "world_millimeters" || modeName == "world_mm" || modeName == "millimeters" ||
+        modeName == "mm") {
+        return PointCloudScreenSpriteSizeMode::WorldMillimeters;
+    }
+    return PointCloudScreenSpriteSizeMode::Pixels;
 }
 
 LegacyPointCloudRenderMode ParseLegacyPointCloudRenderMode(const json& value) {
@@ -506,6 +544,7 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson);
 json SerializePointCloudStyle(const PointCloudStyleState& style) {
     return json{
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
+        {"screen_sprite_size_mode", PointCloudScreenSpriteSizeModeName(style.screenSpriteSizeMode)},
         {"depth_contribution", PointCloudDepthContributionName(style.depthContribution)},
         {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
         {"stylisation_mode", PointCloudStylisationModeName(style.stylisationMode)},
@@ -567,6 +606,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"solid_centers", style.solidCenters},
         {"flow_animation", style.flowAnimation},
         {"water_path_view", style.waterPathView},
+        {"water_stream_overlay", style.waterStreamOverlay},
         {"point_size", SerializeBinding(style.pointSize)},
         {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
@@ -601,6 +641,9 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     std::optional<LegacyPointCloudRenderMode> legacyRenderMode;
     if (styleJson.contains("geometry_mode")) {
         style.geometryMode = ParsePointCloudGeometryMode(styleJson.at("geometry_mode"));
+    }
+    if (styleJson.contains("screen_sprite_size_mode")) {
+        style.screenSpriteSizeMode = ParsePointCloudScreenSpriteSizeMode(styleJson.at("screen_sprite_size_mode"));
     }
     if (styleJson.contains("render_mode")) {
         legacyRenderMode = ParseLegacyPointCloudRenderMode(styleJson.at("render_mode"));
@@ -755,6 +798,9 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
     style.flowAnimation = styleJson.value("flow_animation", style.flowAnimation);
     style.waterPathView = styleJson.value("water_path_view", style.waterPathView);
+    style.waterStreamOverlay = styleJson.value(
+        "water_stream_overlay",
+        styleJson.value("water_overlay_render_mode", std::string{}) == "stream");
     if (styleJson.contains("point_size")) {
         style.pointSize = ParseBinding(styleJson.at("point_size"));
     }
@@ -1578,6 +1624,387 @@ WaterCausticRegion ParseWaterCausticRegion(const json& regionJson) {
     return region;
 }
 
+const char* WaterEffectFeatureTypeName(WaterEffectFeatureType type) {
+    switch (type) {
+        case WaterEffectFeatureType::FieldBridgeAllowedRegion:
+            return "field_bridge_allowed_region";
+        case WaterEffectFeatureType::FieldBridgeBlockedRegion:
+            return "field_bridge_blocked_region";
+        case WaterEffectFeatureType::FieldNoFlowRegion:
+            return "field_no_flow_region";
+        case WaterEffectFeatureType::FieldSurfaceMotion:
+            return "field_surface_motion";
+        case WaterEffectFeatureType::Ripple:
+            return "ripple";
+    }
+    return "ripple";
+}
+
+WaterEffectFeatureType ParseWaterEffectFeatureType(const json& typeJson) {
+    const auto name = typeJson.get<std::string>();
+    if (name == "field_bridge_allowed_region") {
+        return WaterEffectFeatureType::FieldBridgeAllowedRegion;
+    }
+    if (name == "field_bridge_blocked_region") {
+        return WaterEffectFeatureType::FieldBridgeBlockedRegion;
+    }
+    if (name == "field_no_flow_region") {
+        return WaterEffectFeatureType::FieldNoFlowRegion;
+    }
+    if (name == "field_surface_motion") {
+        return WaterEffectFeatureType::FieldSurfaceMotion;
+    }
+    return WaterEffectFeatureType::Ripple;
+}
+
+const char* WaterRippleOverlayTypeName(WaterRippleOverlayType type) {
+    switch (type) {
+        case WaterRippleOverlayType::LinearRipples:
+            return "linear_ripples";
+        case WaterRippleOverlayType::RadialRipples:
+            return "radial_ripples";
+        case WaterRippleOverlayType::RainRings:
+            return "rain_rings";
+        case WaterRippleOverlayType::TideBands:
+            return "tide_bands";
+        case WaterRippleOverlayType::WetSheen:
+            return "wet_sheen";
+        case WaterRippleOverlayType::CurrentThreads:
+            return "current_threads";
+        case WaterRippleOverlayType::DropletGlints:
+            return "droplet_glints";
+        case WaterRippleOverlayType::DripTrails:
+            return "drip_trails";
+        case WaterRippleOverlayType::FoamSparkle:
+            return "foam_sparkle";
+        case WaterRippleOverlayType::SaltMineralShimmer:
+            return "salt_mineral_shimmer";
+        case WaterRippleOverlayType::CausticLace:
+            return "caustic_lace";
+    }
+    return "caustic_lace";
+}
+
+WaterRippleOverlayType ParseWaterRippleOverlayType(const json& typeJson) {
+    const auto name = typeJson.get<std::string>();
+    if (name == "linear_ripples") {
+        return WaterRippleOverlayType::LinearRipples;
+    }
+    if (name == "radial_ripples") {
+        return WaterRippleOverlayType::RadialRipples;
+    }
+    if (name == "rain_rings") {
+        return WaterRippleOverlayType::RainRings;
+    }
+    if (name == "tide_bands") {
+        return WaterRippleOverlayType::TideBands;
+    }
+    if (name == "wet_sheen") {
+        return WaterRippleOverlayType::WetSheen;
+    }
+    if (name == "current_threads") {
+        return WaterRippleOverlayType::CurrentThreads;
+    }
+    if (name == "droplet_glints") {
+        return WaterRippleOverlayType::DropletGlints;
+    }
+    if (name == "drip_trails") {
+        return WaterRippleOverlayType::DripTrails;
+    }
+    if (name == "foam_sparkle") {
+        return WaterRippleOverlayType::FoamSparkle;
+    }
+    if (name == "salt_mineral_shimmer") {
+        return WaterRippleOverlayType::SaltMineralShimmer;
+    }
+    return WaterRippleOverlayType::CausticLace;
+}
+
+const char* WaterEffectBlendModeName(WaterEffectBlendMode mode) {
+    switch (mode) {
+        case WaterEffectBlendMode::Max:
+            return "max";
+        case WaterEffectBlendMode::Multiply:
+            return "multiply";
+        case WaterEffectBlendMode::Screen:
+            return "screen";
+        case WaterEffectBlendMode::Override:
+            return "override";
+        case WaterEffectBlendMode::Add:
+            return "add";
+    }
+    return "add";
+}
+
+WaterEffectBlendMode ParseWaterEffectBlendMode(const json& modeJson) {
+    const auto name = modeJson.get<std::string>();
+    if (name == "max") {
+        return WaterEffectBlendMode::Max;
+    }
+    if (name == "multiply") {
+        return WaterEffectBlendMode::Multiply;
+    }
+    if (name == "screen") {
+        return WaterEffectBlendMode::Screen;
+    }
+    if (name == "override") {
+        return WaterEffectBlendMode::Override;
+    }
+    return WaterEffectBlendMode::Add;
+}
+
+const char* WaterFieldOutputModeName(WaterFieldOutputMode mode) {
+    switch (mode) {
+        case WaterFieldOutputMode::Streamlines:
+            return "streamlines";
+        case WaterFieldOutputMode::SurfaceMotion:
+            return "surface_motion";
+        case WaterFieldOutputMode::Both:
+            return "both";
+    }
+    return "both";
+}
+
+WaterFieldOutputMode ParseWaterFieldOutputMode(const json& modeJson) {
+    const auto name = modeJson.get<std::string>();
+    if (name == "streamlines") {
+        return WaterFieldOutputMode::Streamlines;
+    }
+    if (name == "surface_motion") {
+        return WaterFieldOutputMode::SurfaceMotion;
+    }
+    return WaterFieldOutputMode::Both;
+}
+
+json SerializeWaterEffectResponseSettings(const WaterEffectResponseSettings& settings) {
+    return json{
+        {"intensity", settings.intensity},
+        {"emission_add", settings.emissionAdd},
+        {"opacity_add", settings.opacityAdd},
+        {"opacity_multiply", settings.opacityMultiply},
+        {"point_size_add", settings.pointSizeAdd},
+        {"point_size_multiply", settings.pointSizeMultiply},
+        {"hue_shift", settings.hueShift},
+        {"colourise", {settings.colouriseRed, settings.colouriseGreen, settings.colouriseBlue}},
+        {"colourise_amount", settings.colouriseAmount},
+        {"gaussian_sharpness_bias", settings.gaussianSharpnessBias},
+    };
+}
+
+WaterEffectResponseSettings ParseWaterEffectResponseSettings(const json& settingsJson) {
+    WaterEffectResponseSettings settings;
+    settings.intensity = settingsJson.value("intensity", settings.intensity);
+    settings.emissionAdd = settingsJson.value("emission_add", settings.emissionAdd);
+    settings.opacityAdd = settingsJson.value("opacity_add", settings.opacityAdd);
+    settings.opacityMultiply = settingsJson.value("opacity_multiply", settings.opacityMultiply);
+    settings.pointSizeAdd = settingsJson.value("point_size_add", settings.pointSizeAdd);
+    settings.pointSizeMultiply = settingsJson.value("point_size_multiply", settings.pointSizeMultiply);
+    settings.hueShift = settingsJson.value("hue_shift", settings.hueShift);
+    if (settingsJson.contains("colourise")) {
+        const auto colour = settingsJson.at("colourise").get<std::array<float, 3>>();
+        settings.colouriseRed = colour[0];
+        settings.colouriseGreen = colour[1];
+        settings.colouriseBlue = colour[2];
+    }
+    settings.colouriseAmount = settingsJson.value("colourise_amount", settings.colouriseAmount);
+    settings.gaussianSharpnessBias = settingsJson.value(
+        "gaussian_sharpness_bias",
+        settings.gaussianSharpnessBias);
+    return settings;
+}
+
+json SerializeWaterEffectLayer(const WaterEffectLayer& layer) {
+    return json{
+        {"id", layer.id},
+        {"name", layer.name},
+        {"feature_type", WaterEffectFeatureTypeName(layer.featureType)},
+        {"overlay_type", WaterRippleOverlayTypeName(layer.rippleOverlayType)},
+        {"blend_mode", WaterEffectBlendModeName(layer.blendMode)},
+        {"target_layer_source_path", layer.targetLayerSourcePath.generic_string()},
+        {"vertices", SerializeWaterRegionVertices(layer.vertices)},
+        {"hull", SerializeWaterRegionVertices(layer.hull)},
+        {"enabled_in_viewport", layer.enabledInViewport},
+        {"enabled_in_export", layer.enabledInExport},
+        {"blend_priority", layer.blendPriority},
+        {"edge_blend_width", layer.edgeBlendWidth},
+        {"region_strength", layer.regionStrength},
+        {"pattern_scale", layer.patternScale},
+        {"speed", layer.speed},
+        {"wavelength_meters", layer.wavelengthMeters},
+        {"warp", layer.warp},
+        {"turbulence", layer.turbulence},
+        {"phase", layer.phase},
+        {"direction", {layer.directionX, layer.directionY, layer.directionZ}},
+        {"seed", layer.seed},
+        {"max_affected_points", layer.maxAffectedPoints},
+        {"response", SerializeWaterEffectResponseSettings(layer.response)},
+    };
+}
+
+WaterEffectLayer ParseWaterEffectLayer(const json& layerJson) {
+    WaterEffectLayer layer;
+    layer.id = layerJson.value("id", 0U);
+    layer.name = layerJson.value("name", layer.name);
+    if (layerJson.contains("feature_type")) {
+        layer.featureType = ParseWaterEffectFeatureType(layerJson.at("feature_type"));
+    }
+    if (layerJson.contains("overlay_type")) {
+        layer.rippleOverlayType = ParseWaterRippleOverlayType(layerJson.at("overlay_type"));
+    }
+    if (layerJson.contains("blend_mode")) {
+        layer.blendMode = ParseWaterEffectBlendMode(layerJson.at("blend_mode"));
+    }
+    layer.targetLayerSourcePath = layerJson.value("target_layer_source_path", std::string{});
+    if (layerJson.contains("vertices")) {
+        layer.vertices = ParseWaterRegionVertices(layerJson.at("vertices"));
+    }
+    if (layerJson.contains("hull")) {
+        layer.hull = ParseWaterRegionVertices(layerJson.at("hull"));
+    }
+    layer.enabledInViewport = layerJson.value("enabled_in_viewport", layer.enabledInViewport);
+    layer.enabledInExport = layerJson.value("enabled_in_export", layer.enabledInExport);
+    layer.blendPriority = layerJson.value("blend_priority", layer.blendPriority);
+    layer.edgeBlendWidth = std::clamp(layerJson.value("edge_blend_width", layer.edgeBlendWidth), 0.001F, 50.0F);
+    layer.regionStrength = std::clamp(layerJson.value("region_strength", layer.regionStrength), 0.0F, 8.0F);
+    layer.patternScale = std::clamp(layerJson.value("pattern_scale", layer.patternScale), 0.001F, 100.0F);
+    layer.speed = std::clamp(layerJson.value("speed", layer.speed), 0.0F, 20.0F);
+    layer.wavelengthMeters = std::clamp(layerJson.value("wavelength_meters", layer.wavelengthMeters), 0.001F, 50.0F);
+    layer.warp = std::clamp(layerJson.value("warp", layer.warp), 0.0F, 20.0F);
+    layer.turbulence = std::clamp(layerJson.value("turbulence", layer.turbulence), 0.0F, 20.0F);
+    layer.phase = layerJson.value("phase", layer.phase);
+    if (layerJson.contains("direction")) {
+        const auto direction = layerJson.at("direction").get<std::array<float, 3>>();
+        layer.directionX = direction[0];
+        layer.directionY = direction[1];
+        layer.directionZ = direction[2];
+    }
+    layer.seed = layerJson.value("seed", layer.seed);
+    layer.maxAffectedPoints = layerJson.value("max_affected_points", layer.maxAffectedPoints);
+    if (layerJson.contains("response")) {
+        layer.response = ParseWaterEffectResponseSettings(layerJson.at("response"));
+    }
+    if (layer.hull.empty()) {
+        layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+    }
+    return layer;
+}
+
+json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings) {
+    return json{
+        {"enabled", settings.enabled},
+        {"stream_count_total", settings.streamCountTotal},
+        {"stream_length_meters", settings.streamLengthMeters},
+        {"stream_point_spacing_meters", settings.streamPointSpacingMeters},
+        {"stream_width_meters", settings.streamWidthMeters},
+        {"stream_world_length_meters", settings.streamWorldLengthMeters},
+        {"surface_offset_meters", settings.surfaceOffsetMeters},
+        {"path_attraction", settings.pathAttraction},
+        {"lane_spread_meters", settings.laneSpreadMeters},
+        {"stream_smoothness", settings.streamSmoothness},
+        {"stream_looseness", settings.streamLooseness},
+        {"turbulence", settings.turbulence},
+        {"speed_meters_per_second", settings.speedMetersPerSecond},
+        {"seed", settings.seed},
+    };
+}
+
+WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson) {
+    WaterFlowStreamSettings settings;
+    settings.enabled = settingsJson.value("enabled", settings.enabled);
+    settings.streamCountTotal = settingsJson.value("stream_count_total", settings.streamCountTotal);
+    settings.streamLengthMeters = settingsJson.value("stream_length_meters", settings.streamLengthMeters);
+    settings.streamPointSpacingMeters = settingsJson.value("stream_point_spacing_meters", settings.streamPointSpacingMeters);
+    settings.streamWidthMeters = settingsJson.value("stream_width_meters", settings.streamWidthMeters);
+    settings.streamWorldLengthMeters = settingsJson.value("stream_world_length_meters", settings.streamWorldLengthMeters);
+    settings.surfaceOffsetMeters = settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters);
+    settings.pathAttraction = settingsJson.value("path_attraction", settings.pathAttraction);
+    settings.laneSpreadMeters = settingsJson.value("lane_spread_meters", settings.laneSpreadMeters);
+    settings.streamSmoothness = settingsJson.value("stream_smoothness", settings.streamSmoothness);
+    settings.streamLooseness = settingsJson.value("stream_looseness", settings.streamLooseness);
+    settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
+    settings.speedMetersPerSecond = settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond);
+    settings.seed = settingsJson.value("seed", settings.seed);
+    return settings;
+}
+
+json SerializeWaterFieldSettings(const WaterFieldSettings& settings) {
+    return json{
+        {"enabled", settings.enabled},
+        {"output_mode", WaterFieldOutputModeName(settings.outputMode)},
+        {"corridor_radius_meters", settings.corridorRadiusMeters},
+        {"field_resolution_meters", settings.fieldResolutionMeters},
+        {"projection_resolution_meters", settings.projectionResolutionMeters},
+        {"guide_weight", settings.guideWeight},
+        {"downhill_weight", settings.downhillWeight},
+        {"graph_weight", settings.graphWeight},
+        {"lateral_weight", settings.lateralWeight},
+        {"field_smoothing", settings.fieldSmoothing},
+        {"wetness_spread", settings.wetnessSpread},
+        {"surface_offset_meters", settings.surfaceOffsetMeters},
+        {"surface_confidence_threshold", settings.surfaceConfidenceThreshold},
+        {"max_bridge_distance_meters", settings.maxBridgeDistanceMeters},
+        {"bridge_aggression", settings.bridgeAggression},
+        {"turbulence", settings.turbulence},
+        {"seed", settings.seed},
+    };
+}
+
+WaterFieldSettings ParseWaterFieldSettings(const json& settingsJson) {
+    WaterFieldSettings settings;
+    settings.enabled = settingsJson.value("enabled", settings.enabled);
+    if (settingsJson.contains("output_mode")) {
+        settings.outputMode = ParseWaterFieldOutputMode(settingsJson.at("output_mode"));
+    }
+    settings.corridorRadiusMeters = settingsJson.value("corridor_radius_meters", settings.corridorRadiusMeters);
+    settings.fieldResolutionMeters = settingsJson.value("field_resolution_meters", settings.fieldResolutionMeters);
+    settings.projectionResolutionMeters = settingsJson.value("projection_resolution_meters", settings.projectionResolutionMeters);
+    settings.guideWeight = settingsJson.value("guide_weight", settings.guideWeight);
+    settings.downhillWeight = settingsJson.value("downhill_weight", settings.downhillWeight);
+    settings.graphWeight = settingsJson.value("graph_weight", settings.graphWeight);
+    settings.lateralWeight = settingsJson.value("lateral_weight", settings.lateralWeight);
+    settings.fieldSmoothing = settingsJson.value("field_smoothing", settings.fieldSmoothing);
+    settings.wetnessSpread = settingsJson.value("wetness_spread", settings.wetnessSpread);
+    settings.surfaceOffsetMeters = settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters);
+    settings.surfaceConfidenceThreshold = settingsJson.value("surface_confidence_threshold", settings.surfaceConfidenceThreshold);
+    settings.maxBridgeDistanceMeters = settingsJson.value("max_bridge_distance_meters", settings.maxBridgeDistanceMeters);
+    settings.bridgeAggression = settingsJson.value("bridge_aggression", settings.bridgeAggression);
+    settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
+    settings.seed = settingsJson.value("seed", settings.seed);
+    return settings;
+}
+
+json SerializeWaterFieldStreamSettings(const WaterFieldStreamSettings& settings) {
+    return json{
+        {"enabled", settings.enabled},
+        {"streamline_count", settings.streamlineCount},
+        {"seed_spacing_meters", settings.seedSpacingMeters},
+        {"streamline_length_meters", settings.streamlineLengthMeters},
+        {"step_length_meters", settings.stepLengthMeters},
+        {"streamline_width_meters", settings.streamlineWidthMeters},
+        {"stream_world_length_meters", settings.streamWorldLengthMeters},
+        {"momentum", settings.momentum},
+        {"max_turn_angle_degrees", settings.maxTurnAngleDegrees},
+        {"speed_meters_per_second", settings.speedMetersPerSecond},
+        {"fade_on_low_confidence", settings.fadeOnLowConfidence},
+    };
+}
+
+WaterFieldStreamSettings ParseWaterFieldStreamSettings(const json& settingsJson) {
+    WaterFieldStreamSettings settings;
+    settings.enabled = settingsJson.value("enabled", settings.enabled);
+    settings.streamlineCount = settingsJson.value("streamline_count", settings.streamlineCount);
+    settings.seedSpacingMeters = settingsJson.value("seed_spacing_meters", settings.seedSpacingMeters);
+    settings.streamlineLengthMeters = settingsJson.value("streamline_length_meters", settings.streamlineLengthMeters);
+    settings.stepLengthMeters = settingsJson.value("step_length_meters", settings.stepLengthMeters);
+    settings.streamlineWidthMeters = settingsJson.value("streamline_width_meters", settings.streamlineWidthMeters);
+    settings.streamWorldLengthMeters = settingsJson.value("stream_world_length_meters", settings.streamWorldLengthMeters);
+    settings.momentum = settingsJson.value("momentum", settings.momentum);
+    settings.maxTurnAngleDegrees = settingsJson.value("max_turn_angle_degrees", settings.maxTurnAngleDegrees);
+    settings.speedMetersPerSecond = settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond);
+    settings.fadeOnLowConfidence = settingsJson.value("fade_on_low_confidence", settings.fadeOnLowConfidence);
+    return settings;
+}
+
 json SerializeWaterPathGenerationSettings(const WaterPathGenerationSettings& settings) {
     return json{
         {"auto_tune", settings.autoTune},
@@ -2296,20 +2723,19 @@ bool SaveProjectDocument(
         {"water_animation_trail_settings", SerializeWaterAnimationTrailSettings(document.waterAnimationTrailSettings)},
         {"water_animation_trail_profiles", json::array()},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
+        {"water_flow_stream_settings", SerializeWaterFlowStreamSettings(document.waterFlowStreamSettings)},
+        {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
+        {"water_field_stream_settings", SerializeWaterFieldStreamSettings(document.waterFieldStreamSettings)},
         {"water_point_visuals", json::array()},
         {"selected_water_point_visual", document.selectedWaterPointVisualName},
-        {"water_basin_regions", json::array()},
-        {"water_runoff_regions", json::array()},
-        {"water_caustic_regions", json::array()},
+        {"water_ripple_layers", json::array()},
+        {"water_field_layers", json::array()},
     };
-    for (const auto& region : document.waterBasinRegions) {
-        projectJson["water_basin_regions"].push_back(SerializeWaterBasinRegion(region));
+    for (const auto& layer : document.waterRippleLayers) {
+        projectJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
-    for (const auto& region : document.waterRunoffRegions) {
-        projectJson["water_runoff_regions"].push_back(SerializeWaterRunoffRegion(region));
-    }
-    for (const auto& region : document.waterCausticRegions) {
-        projectJson["water_caustic_regions"].push_back(SerializeWaterCausticRegion(region));
+    for (const auto& layer : document.waterFieldLayers) {
+        projectJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
     for (const auto& profile : document.waterAnimationTrailProfiles) {
         projectJson["water_animation_trail_profiles"].push_back(SerializeWaterAnimationTrailProfile(profile));
@@ -2409,6 +2835,17 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterCausticLookSettings =
             ParseWaterCausticLookSettings(projectJson->at("water_caustic_look_settings"));
     }
+    if (projectJson->contains("water_flow_stream_settings")) {
+        document.waterFlowStreamSettings =
+            ParseWaterFlowStreamSettings(projectJson->at("water_flow_stream_settings"));
+    }
+    if (projectJson->contains("water_field_settings")) {
+        document.waterFieldSettings = ParseWaterFieldSettings(projectJson->at("water_field_settings"));
+    }
+    if (projectJson->contains("water_field_stream_settings")) {
+        document.waterFieldStreamSettings =
+            ParseWaterFieldStreamSettings(projectJson->at("water_field_stream_settings"));
+    }
     if (projectJson->contains("temp_water_animation_trail_settings")) {
         document.tempWaterAnimationTrailSettings =
             ParseWaterAnimationTrailSettings(projectJson->at("temp_water_animation_trail_settings"));
@@ -2439,22 +2876,52 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (projectJson->contains("temp_water_point_visual_style")) {
         document.tempWaterPointVisualStyle = ParsePointCloudStyle(projectJson->at("temp_water_point_visual_style"));
     }
-    if (projectJson->contains("water_basin_regions") &&
-        projectJson->at("water_basin_regions").is_array()) {
-        for (const auto& regionJson : projectJson->at("water_basin_regions")) {
-            document.waterBasinRegions.push_back(ParseWaterBasinRegion(regionJson));
+    const bool hasNativeRippleLayers = projectJson->contains("water_ripple_layers") &&
+                                      projectJson->at("water_ripple_layers").is_array();
+    if (hasNativeRippleLayers &&
+        projectJson->at("water_ripple_layers").is_array()) {
+        for (const auto& layerJson : projectJson->at("water_ripple_layers")) {
+            document.waterRippleLayers.push_back(ParseWaterEffectLayer(layerJson));
         }
     }
-    if (projectJson->contains("water_runoff_regions") &&
-        projectJson->at("water_runoff_regions").is_array()) {
-        for (const auto& regionJson : projectJson->at("water_runoff_regions")) {
-            document.waterRunoffRegions.push_back(ParseWaterRunoffRegion(regionJson));
+    if (projectJson->contains("water_field_layers") &&
+        projectJson->at("water_field_layers").is_array()) {
+        for (const auto& layerJson : projectJson->at("water_field_layers")) {
+            auto layer = ParseWaterEffectLayer(layerJson);
+            if (!layerJson.contains("feature_type")) {
+                layer.featureType = WaterEffectFeatureType::FieldSurfaceMotion;
+            }
+            document.waterFieldLayers.push_back(std::move(layer));
         }
     }
     if (projectJson->contains("water_caustic_regions") &&
         projectJson->at("water_caustic_regions").is_array()) {
         for (const auto& regionJson : projectJson->at("water_caustic_regions")) {
-            document.waterCausticRegions.push_back(ParseWaterCausticRegion(regionJson));
+            auto region = ParseWaterCausticRegion(regionJson);
+            if (!hasNativeRippleLayers) {
+                WaterEffectLayer layer;
+                layer.id = region.id;
+                layer.name = region.name.empty() ? "Caustic Lace" : region.name;
+                layer.featureType = WaterEffectFeatureType::Ripple;
+                layer.rippleOverlayType = WaterRippleOverlayType::CausticLace;
+                layer.targetLayerSourcePath = region.targetLayerSourcePath;
+                layer.vertices = region.vertices;
+                layer.hull = region.hull;
+                layer.enabledInViewport = region.enabled;
+                layer.enabledInExport = region.enabled;
+                layer.edgeBlendWidth = region.edgeBlendWidth;
+                layer.response.intensity = document.waterCausticLookSettings.intensity;
+                layer.response.emissionAdd = document.waterCausticLookSettings.emissionBoost;
+                layer.response.opacityAdd = document.waterCausticLookSettings.opacityBoost;
+                layer.response.pointSizeAdd = document.waterCausticLookSettings.pointSizeBoost;
+                layer.response.colouriseRed = document.waterCausticLookSettings.tintRed;
+                layer.response.colouriseGreen = document.waterCausticLookSettings.tintGreen;
+                layer.response.colouriseBlue = document.waterCausticLookSettings.tintBlue;
+                layer.speed = document.waterCausticLookSettings.speed;
+                layer.wavelengthMeters = document.waterCausticLookSettings.cellSizeMeters;
+                layer.warp = document.waterCausticLookSettings.warp;
+                document.waterRippleLayers.push_back(std::move(layer));
+            }
         }
     }
     if (projectJson->contains("water_path_cache")) {
@@ -2616,10 +3083,12 @@ bool SaveWaterSourcesDocument(
         {"schema_version", document.schemaVersion},
         {"water_source_settings", SerializeWaterSourceSettings(document.sourceSettings)},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.causticLookSettings)},
+        {"water_flow_stream_settings", SerializeWaterFlowStreamSettings(document.flowStreamSettings)},
+        {"water_field_settings", SerializeWaterFieldSettings(document.fieldSettings)},
+        {"water_field_stream_settings", SerializeWaterFieldStreamSettings(document.fieldStreamSettings)},
         {"water_emitters", json::array()},
-        {"water_basin_regions", json::array()},
-        {"water_runoff_regions", json::array()},
-        {"water_caustic_regions", json::array()},
+        {"water_ripple_layers", json::array()},
+        {"water_field_layers", json::array()},
     };
     if (document.tempSourceSettings.has_value()) {
         sourcesJson["temp_water_source_settings"] =
@@ -2632,14 +3101,11 @@ bool SaveWaterSourcesDocument(
     for (const auto& emitter : document.emitters) {
         sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
     }
-    for (const auto& region : document.basinRegions) {
-        sourcesJson["water_basin_regions"].push_back(SerializeWaterBasinRegion(region));
+    for (const auto& layer : document.rippleLayers) {
+        sourcesJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
-    for (const auto& region : document.runoffRegions) {
-        sourcesJson["water_runoff_regions"].push_back(SerializeWaterRunoffRegion(region));
-    }
-    for (const auto& region : document.causticRegions) {
-        sourcesJson["water_caustic_regions"].push_back(SerializeWaterCausticRegion(region));
+    for (const auto& layer : document.fieldLayers) {
+        sourcesJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
     if (document.pathCache.has_value() && !document.pathCache->branches.empty()) {
         sourcesJson["water_path_cache"] = SerializeWaterPathCache(document.pathCache.value());
@@ -2666,6 +3132,17 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_caustic_look_settings")) {
         document.causticLookSettings =
             ParseWaterCausticLookSettings(sourcesJson->at("water_caustic_look_settings"));
+    }
+    if (sourcesJson->contains("water_flow_stream_settings")) {
+        document.flowStreamSettings =
+            ParseWaterFlowStreamSettings(sourcesJson->at("water_flow_stream_settings"));
+    }
+    if (sourcesJson->contains("water_field_settings")) {
+        document.fieldSettings = ParseWaterFieldSettings(sourcesJson->at("water_field_settings"));
+    }
+    if (sourcesJson->contains("water_field_stream_settings")) {
+        document.fieldStreamSettings =
+            ParseWaterFieldStreamSettings(sourcesJson->at("water_field_stream_settings"));
     }
     if (sourcesJson->contains("temp_water_caustic_look_settings")) {
         document.tempCausticLookSettings =
@@ -2716,22 +3193,51 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
             document.emitters.push_back(ParseWaterEmitter(emitterJson));
         }
     }
-    if (sourcesJson->contains("water_basin_regions") &&
-        sourcesJson->at("water_basin_regions").is_array()) {
-        for (const auto& regionJson : sourcesJson->at("water_basin_regions")) {
-            document.basinRegions.push_back(ParseWaterBasinRegion(regionJson));
+    const bool hasNativeRippleLayers = sourcesJson->contains("water_ripple_layers") &&
+                                      sourcesJson->at("water_ripple_layers").is_array();
+    if (hasNativeRippleLayers) {
+        for (const auto& layerJson : sourcesJson->at("water_ripple_layers")) {
+            document.rippleLayers.push_back(ParseWaterEffectLayer(layerJson));
         }
     }
-    if (sourcesJson->contains("water_runoff_regions") &&
-        sourcesJson->at("water_runoff_regions").is_array()) {
-        for (const auto& regionJson : sourcesJson->at("water_runoff_regions")) {
-            document.runoffRegions.push_back(ParseWaterRunoffRegion(regionJson));
+    if (sourcesJson->contains("water_field_layers") &&
+        sourcesJson->at("water_field_layers").is_array()) {
+        for (const auto& layerJson : sourcesJson->at("water_field_layers")) {
+            auto layer = ParseWaterEffectLayer(layerJson);
+            if (!layerJson.contains("feature_type")) {
+                layer.featureType = WaterEffectFeatureType::FieldSurfaceMotion;
+            }
+            document.fieldLayers.push_back(std::move(layer));
         }
     }
     if (sourcesJson->contains("water_caustic_regions") &&
         sourcesJson->at("water_caustic_regions").is_array()) {
         for (const auto& regionJson : sourcesJson->at("water_caustic_regions")) {
-            document.causticRegions.push_back(ParseWaterCausticRegion(regionJson));
+            auto region = ParseWaterCausticRegion(regionJson);
+            if (!hasNativeRippleLayers) {
+                WaterEffectLayer layer;
+                layer.id = region.id;
+                layer.name = region.name.empty() ? "Caustic Lace" : region.name;
+                layer.featureType = WaterEffectFeatureType::Ripple;
+                layer.rippleOverlayType = WaterRippleOverlayType::CausticLace;
+                layer.targetLayerSourcePath = region.targetLayerSourcePath;
+                layer.vertices = region.vertices;
+                layer.hull = region.hull;
+                layer.enabledInViewport = region.enabled;
+                layer.enabledInExport = region.enabled;
+                layer.edgeBlendWidth = region.edgeBlendWidth;
+                layer.response.intensity = document.causticLookSettings.intensity;
+                layer.response.emissionAdd = document.causticLookSettings.emissionBoost;
+                layer.response.opacityAdd = document.causticLookSettings.opacityBoost;
+                layer.response.pointSizeAdd = document.causticLookSettings.pointSizeBoost;
+                layer.response.colouriseRed = document.causticLookSettings.tintRed;
+                layer.response.colouriseGreen = document.causticLookSettings.tintGreen;
+                layer.response.colouriseBlue = document.causticLookSettings.tintBlue;
+                layer.speed = document.causticLookSettings.speed;
+                layer.wavelengthMeters = document.causticLookSettings.cellSizeMeters;
+                layer.warp = document.causticLookSettings.warp;
+                document.rippleLayers.push_back(std::move(layer));
+            }
         }
     }
     if (sourcesJson->contains("water_path_cache")) {

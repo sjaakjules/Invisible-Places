@@ -2,657 +2,259 @@
 
 ## Goal
 
-The water feature set turns loaded LiDAR point clouds into editable water-related overlays and render effects. It lets users place flow emitters, draw basin/runoff/caustic regions, bake or refresh feature output, save reusable source/cache data, and tune how water appears in the viewport and exports.
+Water v2 is moving loaded LiDAR point clouds toward three active water feature families:
 
-The set currently contains four feature families:
+- **Ripples**: composable visual effects on the active/base cloud. Legacy Caustics load as Ripples with overlay type `Caustic Lace`.
+- **Flow**: emitter-driven path caches plus generated world-aligned stream surfels.
+- **Field**: local corridor or region vector fields that generate Field Streamlines and Field Surface Motion.
 
-- Flow: emitter-driven downhill water paths, branch caches, animated trail particles, trail lanes, path-view debugging, and branch hiding.
-- Basin: polygon-driven basin haze/steam overlays.
-- Runoff: polygon-driven dew/light-rain trickle overlays.
-- Caustics: polygon-driven selection masks on target LiDAR layers, rendered through caustic shader parameters rather than water overlay PLY files.
+The base point cloud remains the visual source of truth. Flow and Field Streamlines may add generated stream overlay sessions. Ripples and Field Surface Motion should modify the active/base cloud's final evaluated visuals through composable effects, without injecting dense permanent scalar fields or relying on newly generated growing point patterns as the primary visual.
 
-This document describes the implementation as it exists now. It is meant to be edited alongside future changes so another agent or engineer can understand where to make changes and which saved artifacts are affected.
+Basin and Runoff are removed from the public v2 workflow. Legacy code and tests may still exist for compatibility, but Basin/Runoff tabs, runtime load state, generation, and new project saves are not part of the active water contract. Old Basin/Runoff JSON records are tolerated and ignored.
+
+## Current Status
+
+Implemented in the current repository:
+
+- Active Water tabs for Ripples, Flow, and Field.
+- Project schema `24` with v2 Ripple/Flow/Field settings and legacy Caustics-to-Ripples migration.
+- Ripple `WaterEffectLayer` records and distinct generated/effect fields for all `WaterRippleOverlayType` values.
+- Flow path cache reuse, branch hiding, and generated stream surfels with the v2 stream scalar contract.
+- Field cache, Field Streamlines, and Field Surface Motion built from Flow path anchors or user-authored Field regions.
+- Field no-flow, bridge-allowed, and bridge-blocked control regions with visible diagnostics.
+- Active-cloud `water_effect_*` composition for Ripples and Field Surface Motion, with Visuals-tab Water Effect Stack controls.
+- Viewport/offline/export rendering of water output without requiring water PLY export.
+- Legacy Basin/Runoff removal from the active public UI and new-save contract.
 
 ## Architecture Map
 
-The water feature set is implemented across a few central areas:
+- `src/water/WaterFlow.hpp` and `src/water/WaterFlow.cpp`: v2 water structs, flow path generation, stream surfel generation, Field cache/streamline generation, current Ripple/Field generated-effect overlay generation, legacy water helpers, and point-cloud conversion.
+- `src/app/Application.cpp`: Water panel UI, runtime `WaterWorkflowState`, emitter and region editing, cache/bake orchestration, in-memory overlay sessions, and project/source document wiring.
+- `src/serialization/ProjectDocument.hpp` and `src/serialization/ProjectDocument.cpp`: project schema, water source schema, v2 water settings/layers, legacy migration, and path cache persistence.
+- `src/renderer/pointcloud/PointCloudPreviewState.*`, `src/renderer/core/VulkanViewportShell.cpp`, and root `shaders/pointcloud_*`: water overlay render mode, stream tangent/width/world-length scalar handling, and stream surfel shading.
+- `tests/AssetDiscoveryTests.cpp`: serialization, legacy migration, deterministic generation, cache invalidation, and shader/style contract coverage.
 
-- `src/water/WaterFlow.hpp` and `src/water/WaterFlow.cpp`: shared water data types, flow path generation, trail expansion, basin haze, runoff, caustic masks, overlay point-cloud conversion, and PLY writing.
-- `src/app/Application.cpp`: Water panel UI, runtime state, emitter placement, region editing, bake/refresh orchestration, overlay sessions, path branch picking, caustic mask uploads, and visual preset application.
-- `src/serialization/ProjectDocument.hpp` and `src/serialization/ProjectDocument.cpp`: project JSON, water sources JSON, animation overrides, point visual styles, caustic look settings, region persistence, and path cache persistence.
-- `src/renderer/pointcloud/PointCloudPreviewState.*`, `src/renderer/core/VulkanViewportShell.cpp`, `shaders/pointcloud_fast_basic.frag`, and `shaders/pointcloud_caustics.glsl`: point-style flags, uniform packing, flow role filtering, trail fading, and animated caustic rendering.
+## Runtime Model
 
-The Water UI is one tab with subpanels for Flow, Basin, Runoff, and Caustics. Runtime state is held in `WaterWorkflowState` in `src/app/Application.cpp`; persistent state is split across the project document, `water_sources.json`, generated PLY files, and per-support-layer cache files.
+`WaterWorkflowState` in `src/app/Application.cpp` owns the live workflow state. The v2-relevant fields are:
 
-## Shared Runtime Model
+- `emitters`, `defaultSourceSettings`, `tempDefaultSourceSettings`, and per-emitter settings for Flow path generation.
+- `pathCache`, `pathAnchors`, path revisions, dirty flags, and hidden branch IDs for reusable Flow paths.
+- `flowStreamSettings` and `flowStreamOverlay` for generated Flow Streams.
+- `rippleLayers` and `rippleEffectOverlay` for current Ripple effect evaluation and compatibility preview output.
+- `fieldSettings`, `fieldStreamSettings`, `fieldCache`, `fieldStreamOverlay`, and `fieldSurfaceEffectOverlay` for Field.
+- `activeRegionFeature`, `regionEditor`, and placement flags for editable Ripple regions and legacy-safe region editing.
 
-`WaterWorkflowState` is the live app-side state for all water features. Important fields include:
+Generated water overlay sessions are excluded from support-layer discovery. They are renderable water output, not source LiDAR layers for future water bakes. For Ripples and Field Surface Motion, these sessions are compatibility preview/export outputs; the active/base cloud receives the final visual modification through composed `water_effect_*` fields.
 
-- `emitters`: sources for Flow.
-- `basinRegions`, `runoffRegions`, `causticRegions`: polygonal feature regions.
-- `defaultSourceSettings`, `tempDefaultSourceSettings`, and per-emitter settings: Flow routing/trail shape inputs.
-- `defaultAnimationTrailSettings`, animation trail profiles, and temporary animation overrides: particle playback inputs shared by Flow and Runoff, and indirectly by Basin haze generation.
-- `defaultCausticLookSettings` and temporary/animation caustic look settings: shader look inputs for Caustics.
-- `defaultPointVisualStyle`, `pointVisuals`, and selected point visual name: generated Flow visual style.
-- `pathCache`, `pathAnchors`, `flowOverlay`, `trailSurfaceIndex`, and path dirty flags: Flow cache and overlay lifecycle.
-- `activeRegionFeature`, `regionEditor`, and placement flags: shared region drawing and viewport interaction state.
-- `lastOverlayPath`, `lastBasinOverlayPath`, and `lastRunoffOverlayPath`: last written/generated overlay artifacts.
+## Active UI Contract
 
-The active support layer is resolved by `ResolveWaterSupportSessionIndex`. It must be a visible loaded point-cloud layer with CPU data available. Generated water overlay sessions are not treated as support layers.
+The active Water panel tabs are:
 
-## Shared Region Editing
+```text
+Ripples
+Flow
+Field
+```
 
-Basin, Runoff, and Caustics use the same polygon editing machinery in `src/app/Application.cpp`.
+Removed from the active public workflow:
 
-Shared concepts:
+```text
+Basin Haze
+Runoff
+Trail Shape
+Animation Trail Playback
+legacy trail particle controls
+```
 
-- `WaterRegionFeature`: `None`, `Basin`, `Runoff`, or `Caustic`.
-- `WaterRegionVertexRef`: identifies a feature, region index, and vertex index.
-- `WaterRegionEditorState`: stores hovered/dragged vertices and whether viewport input was consumed.
-- Viewport clicks add vertices when the relevant placement mode is armed.
-- Vertices can be dragged, snapped to LiDAR surface points, merged when overlapping, and removed from the selected region panel.
-- Each region type has a derived-value refresh function in `src/water/WaterFlow.cpp` that recomputes hulls and clamps settings.
+Flow still exposes path baking, branch hiding, source settings, and stream controls. Ripples exposes region/layer controls and procedural overlay settings. Field exposes field build settings, stream settings, surface-motion output controls, and user-authored Field regions.
 
-Derived refresh functions:
+## Serialization Contract
 
-- `RefreshWaterBasinRegionDerivedValues`: builds the hull, computes `baseZ`, clamps `heightAbove`, `depthBelow`, and `density`, and clears invalid outlet edge indices.
-- `RefreshWaterRunoffRegionDerivedValues`: builds the hull and clamps ground voxel, high-point fraction, density, path length, and max steps.
-- `RefreshWaterCausticRegionDerivedValues`: builds the hull, clamps mask/look selection parameters, and marks the mask dirty/stale.
+Project documents now use schema `24`. New saves write the v2 water keys:
 
-All three region types are saved in both the project document and `water_sources.json`.
+```text
+water_emitters
+water_source_settings
+water_path_cache
+water_ripple_layers
+water_flow_stream_settings
+water_field_settings
+water_field_stream_settings
+```
 
-## Shared Overlay Point Model
+`water_sources.json` mirrors the active source/layer/settings subset for reusable water setup, including the same Ripple/Flow/Field settings and the current Flow path cache when available.
 
-`WaterOverlayPoint` is the common payload for Flow, Basin, and Runoff overlay points. It stores position, normal, RGB, path identity, animation fields, quality fields, feature identity, and guide/particle metadata.
+New saves do not write:
 
-Important scalar concepts:
+```text
+water_basin_regions
+water_runoff_regions
+water_caustic_regions
+```
 
-- `flowId`: route/path/region-generated stream identifier.
-- `emitterId`: Flow source ID, or region-derived ID for feature overlays.
-- `pathDistance`: distance along the path.
-- `phase`, `speed`, `jitterSeed`, `trailAge`, `trailLength`: animation inputs.
-- `confidence`, `accumulation`, `pooling`, `surfaceSteepness`: style and diagnostics inputs.
-- `particleRole`: role used by Flow visualization and shaders.
-- `featureType`: distinguishes main Flow from Basin/Runoff and branch subtypes.
-- `regionId`: basin/runoff/caustic-style region identifier when relevant.
+Legacy loading rules:
 
-Current Flow particle roles:
+- `water_caustic_regions` migrate to `water_ripple_layers` with overlay type `Caustic Lace` when native ripple layers are absent.
+- `water_basin_regions` and `water_runoff_regions` are ignored.
+- Compatibility caustic look settings may still be parsed/written for old visual data, but caustic region geometry is no longer the active public save contract.
+- Existing `water_path_cache` records are preserved when their support/settings fingerprint matches.
 
-- `0.0`: path anchor/main sampled path point.
-- `1.0`: visible animated particle or ghost sample.
-- `2.0`: path-view guide point.
-- `3.0`: path-view trail lane guide point.
+## Ripples
 
-These role values are consumed by `shaders/pointcloud_fast_basic.frag` and by path debug/picking code. Change them only with a coordinated update across generation, style presets, shader filtering, and debug overlay logic.
+Ripples use `WaterEffectLayer` and generated `WaterEffectOverlay` data to compute composable `water_effect_*` contributions on the active/base cloud. Generated/effect overlay sessions remain as compatibility preview/export outputs, but the base cloud's final visual evaluation is modified through post-base effect fields rather than by replacing the cloud with copied growing point patterns.
 
-## Shared Saved Artifacts
+Supported overlay types are encoded with `WaterRippleOverlayType`; `Caustic Lace` is the migrated legacy Caustics behavior. Layers include:
 
-The water system saves several distinct artifact classes.
+- region vertices and derived bounds,
+- overlay type and feature type,
+- response settings for size, opacity, emission, and colour contribution,
+- viewport/export enable flags,
+- blend mode and procedural parameters.
 
-### Source And Region State
+The Visuals tab exposes Water Effect Stack controls for matching base-cloud Ripple layers, including add, multiply, max, screen, override, colourise, opacity, size, and emission contributions. Ripple virtual/effect fields also remain selectable through Visuals on the generated/effect layer for compatibility.
 
-`SaveWaterSources` writes `water_sources.json`:
+Ripple generation now evaluates containment and edge fade against the clicked polygon boundary. A C-shaped Ripple region excludes the cut-out area rather than falling back to the derived convex hull.
 
-- If no project path is active: `Saved/water_sources.json`.
-- If a project path is active: `<project-directory>/water_sources.json`.
+Each Ripple overlay type now produces a distinct sparse effect field:
 
-This file stores:
+- `Caustic Lace`: warped cellular ridge lace with bright caustic-like peaks.
+- `Linear Ripples`: parallel phase bands along the layer direction.
+- `Radial Ripples`: symmetric expanding rings around the region centre.
+- `Rain Rings`: seeded local ring impacts across the region.
+- `Tide Bands`: broad slow bands for large sand or sheet-water regions.
+- `Wet Sheen`: slope-sensitive wet highlights with low-frequency variation.
+- `Current Threads`: thin stretched directional streaks.
+- `Droplet Glints`: sparse seeded point glints and pulses.
+- `Drip Trails`: gravity/normal-guided short streaks for vertical or sparse surfaces.
+- `Foam Sparkle`: edge-biased bright pulses and speckles.
+- `Salt/Mineral Shimmer`: slow granular residue shimmer.
 
-- Default water source settings and temporary source settings.
-- Default caustic look settings and temporary caustic look settings.
-- Flow emitters.
-- Basin, runoff, and caustic regions.
-- Current Flow path cache when available and non-empty.
+Changing a complete Ripple layer in the Water tab rebuilds the generated/effect overlay immediately. Disabling or deleting the last active layer clears stale `-Ripples.generated` sessions, so the user does not need to press `Refresh Ripples` repeatedly during ordinary editing.
 
-### Project State
+## Flow
 
-The main project document, usually `Saved/invisible_places_project.json`, can store:
+Flow keeps the existing path bake model:
 
-- Flow emitters and all water regions.
-- Source settings, temporary source settings, old/legacy water settings, and bake/render compatibility fields.
-- Water animation trail settings, profiles, and animation overrides.
-- Water point visuals and selected water visual.
-- Caustic look settings and temporary/animation overrides.
-- Current Flow path cache when loaded.
+1. Emitters and source/path settings define bake inputs.
+2. `GenerateWaterPathCache` creates or refreshes `WaterPathCache`.
+3. `BuildWaterPathAnchorsFromCache` rebuilds visible anchors and applies hidden branch IDs.
+4. `BuildFlowStreamOverlayFromPathAnchors` generates deterministic stream surfels from the anchors.
+5. `BuildWaterStreamOverlayPointCloud` exposes the generated stream as an in-memory point-cloud session.
 
-Animation path JSON can also store water trail, water point visual, caustic look, and legacy water override data.
+Path-affecting changes dirty the path cache. Stream visual/settings changes, such as stream count, width, length, spacing, turbulence, and speed, refresh the stream overlay without dirtying the path cache.
 
-### Generated Overlay Files
+Flow Streams replace legacy trail particles as the primary visible water output. The old generated water PLY workflow is no longer required for viewport, EXR, or MP4 water visuals.
 
-Generated Flow/Basin/Runoff overlay files are written under the water directory:
+Flow stream geometry stays static while shader/offline playback derives animated age from `point_age`, `point_seed`, `stream_speed`, and render time. Opacity, emission, and colour energy can change over time without rebaking paths or regenerating topology.
 
-- If no project path is active: `Saved/water/`.
-- If a project path is active: `<project-directory>/water/`.
+## Field
 
-Current generated file names:
+Field is built from Flow path anchors or user-authored Field regions:
 
-- Flow overlay: `<source-stem>-WaterFlow.ply`.
-- Flow cache: `<source-stem>-WaterPathCache.json`.
-- Basin haze overlay: `<source-stem>-BasinHaze.ply`.
-- Runoff overlay: `<source-stem>-Runoff.ply`.
+1. `BuildFieldCacheFromPathAnchors` creates a local corridor-like `WaterFieldCache`.
+2. `BuildFieldCacheFromRegions` creates region-local field nodes from selected surface support and Field control regions.
+3. `BuildFieldStreamOverlay` emits Field Streamlines using the same stream surfel schema as Flow.
+4. `GenerateFieldSurfaceEffectOverlay` emits a virtual/effect overlay for Field Surface Motion.
 
-Caustics are different: they generate scalar fields on the target LiDAR layer and upload those fields to the GPU. They do not write a water overlay PLY.
+Field output should stay surface-bound. When support is weak, streams should bridge only valid gaps and otherwise fade or terminate. Field caches are local to path corridors or selected regions; never build a whole-scene field over the full point cloud.
 
-## Feature 1: Flow
+Field can now build from user-authored regions stored as `WaterEffectLayer` records with `FieldSurfaceMotion` feature type. Region containment and generated stream clipping use the clicked polygon boundary, so C-shaped Field regions exclude the cut-out area.
+Field control regions can mark local support as no-flow, bridge-allowed, or bridge-blocked. No-flow support is excluded from Field Streamlines and Field Surface Motion. Bridge-allowed regions can permit a bounded manual bridge over an otherwise over-limit gap, while bridge-blocked regions force a split.
+Field streamlines split across rejected over-limit gaps and use low surface confidence to fade stream opacity/emission through the `stream_confidence` scalar. The generated overlay records accepted bridge, rejected gap, low-confidence fade, hard termination, no-flow, bridge-allowed, and bridge-blocked counters that are shown in the Field panel.
+Ripple and Field Surface Motion now also pre-compose `water_effect_*` fields on the active/base cloud; renderers apply those fields after existing base mappings for size, opacity, emission, and colour. The Visuals tab exposes Water Effect Stack contribution controls for the selected base cloud. Saved Ripple and Field-region projects regenerate those fields when the project or target layer loads.
 
-Flow is the largest feature. It starts from point-cloud support geometry and user emitters, bakes reusable downhill branch paths, then expands those paths into animated overlay particles and guide geometry.
+## Stream Surfel Scalar Contract
 
-### Flow Data Model
+Generated Flow Streams and Field Streamlines must expose these scalar fields in this order:
 
-Core Flow types live in `src/water/WaterFlow.hpp`:
+```text
+stream_id
+source_id
+path_id
+branch_id
+stream_seed
+point_seed
+stream_distance
+stream_length
+point_age
+stream_age
+stream_speed
+stream_width
+stream_world_length
+stream_confidence
+wetness
+feature_type
+tangent_x
+tangent_y
+tangent_z
+```
 
-- `WaterEmitter`: source position, radius, strength, speed, status, origin, confidence, and source setting assignment.
-- `WaterPathGenerationSettings`: support voxel size, max bridge distance, path length, sample spacing, branching, coverage, gap tolerance, max steps, support sample cap, smoothing, auto tune, and scale mode.
-- `WaterParticleTrailShapeSettings`: particle jitter, spline anchor spacing, trail lane count, trail looseness, trail smoothness, and several persisted legacy shape controls.
-- `WaterAnimationTrailSettings`: particle density, speed, color variation, trail length, and optional trail sample spacing.
-- `WaterPathCache`: reusable branch cache with support signatures, settings fingerprint, requested/tuned settings, diagnostics, branches, hidden branch IDs, and stale state.
-- `WaterPathBranch`: branch identity, role, termination reason, confidence, length, flatness, gap count, and raw anchors.
+The renderer consumes `stream_width`, `stream_world_length`, `stream_confidence`, `wetness`, `feature_type`, and tangent fields for world-aligned elongated Gaussian surfels. Do not rename these fields without a coordinated serialization, shader, visual preset, and test update.
 
-Emitter settings can be default, custom, temporary, or linked from another emitter. `ResolveWaterSourceSettings` chooses the active settings for an emitter.
+## Rendering Contract
 
-### Flow UI And Bake Lifecycle
+Point-cloud styles now have `waterStreamOverlay` for generated stream layers. Old `flowAnimation` / `waterPathView` styles remain parseable aliases for compatibility, but new stream overlays should use the v2 water overlay path.
 
-Flow controls are in `DrawWaterPanel` in `src/app/Application.cpp`.
+Stream samples render as world-aligned elongated surfels:
 
-Typical lifecycle:
+```text
+long axis  = tangent * stream_world_length
+short axis = cross(normal, tangent) * stream_width
+normal     = local surface normal
+```
 
-1. User selects a loaded LiDAR support layer.
-2. User places, moves, suggests, accepts, disables, or edits emitters.
-3. User edits source settings, path generation settings, trail shape, animation trail playback, and point visual style.
-4. `BakeWaterOverlayForActiveLayer` runs from the `Bake Path` button.
-5. The app tries to reuse `WaterPathCache` through `TryLoadWaterPathCacheForSupport`.
-6. If no valid cache exists, `GenerateWaterPathCache` computes branches.
-7. `BuildWaterPathAnchorsFromCache` rebuilds smoothed path anchors and applies hidden-branch edits.
-8. `BuildWaterOverlayFromPathAnchors` expands anchors into guide points, lane guides, particles, and ghost samples.
-9. `WriteWaterOverlayPly` writes `<source-stem>-WaterFlow.ply`.
-10. `AddOrRefreshWaterFlowOverlaySession` creates or updates the generated water overlay point-cloud session.
-11. `SaveWaterPathCacheForSupport` writes `<source-stem>-WaterPathCache.json`.
+Generated/effect layers participate in viewport rendering and the same EXR/MP4 export path as other visible point-cloud sessions. Water streams and effect layers are not exported as PLY unless a future explicit export feature asks for it. Ripples and Field Surface Motion evaluate through active-cloud `water_effect_*` composition, while copied effect overlay points remain only as compatibility preview/export outputs.
 
-Settings that affect path routing should mark the path dirty and require a bake. Settings that affect only trail shape, trail playback, or visual style should refresh from cached anchors when possible.
+## Visuals Contract
 
-### Flow Cache Reuse
+Base cloud visuals are evaluated first. Ripple and Field Surface Motion contributions then combine with those values through Visuals-compatible `water_effect_*` fields. Generated Flow and Field Streamline overlays keep their own stream scalar fields.
 
-The Flow cache is reusable only when support and settings match. `WaterPathCacheMatchesSupportAndSettings` checks:
+Layer-linked saved visuals should keep field availability honest:
 
-- Normalized support layer path.
-- Support signature: source path, point count, normal availability, and bounds.
-- Emitter/settings fingerprint: default bake settings plus every emitter's status, position, radius, strength, speed, assignment, and resolved bake settings.
+- Base-cloud visuals can use base scalar fields.
+- Ripple visuals can use Ripple virtual/effect fields.
+- Flow visuals can use stream scalar fields.
+- Field visuals can use Field stream/effect fields.
 
-If a loaded cache does not match, it is marked stale and `pathDirty` is set. Stale caches can still be inspected, but they should not be treated as current output.
+When a visual is imported from another layer family, keep it read-only until saved under the active layer with a suffix such as `_baseCloud`, `_ripple`, `_flow`, or `_field`.
 
-### Flow Path Algorithm
+The active base-cloud Water Effect Stack supports add, multiply, max, screen, override, colourise, opacity, size, and emission contributions for overlapping Ripple and Field Surface Motion layers while preserving existing base scalar mappings.
 
-Core functions:
+## Cache And File Strategy
 
-- `TuneWaterPathSettings`
-- `BuildSupportGraph`
-- `FlowDirection`
-- `RankDownhillNeighbours`
-- `TraceWaterPathBranch`
-- `GenerateWaterPathCache`
+The current mandatory saved cache is the Flow path cache:
 
-Auto tune:
+```text
+<source-stem>-WaterPathCache.json
+```
 
-- Estimates point spacing from the support cloud.
-- Uses `legacyScaleMode` to choose working spacing behavior.
-- Adjusts support voxel size, max bridge distance, path sample spacing, and max steps.
-- Records diagnostics shown in the UI.
+Reserved v2 cache names for expensive future reloads:
 
-Support graph:
+```text
+<source-stem>-WaterFlowStreamCache.bin
+<source-stem>-WaterFieldCache.bin
+<source-stem>-WaterFieldStreamCache.bin
+<source-stem>-WaterEffectLayerCache-<layer-id>.bin
+```
 
-- Samples the point cloud up to `supportSampleLimit`.
-- Stores support point position, optional normal, confidence, and source index.
-- Uses a 3D grid for nearby support lookup.
-- Confidence can use the `Number_of_neighbors` scalar field if present.
+Cache metadata should include source layer signature, point count, bounds, normal availability, relevant scalar availability, settings fingerprint, region/path fingerprint, creation time, and cache type.
 
-Flow direction:
+## Known Gaps
 
-- Projects gravity onto the local normal's tangent plane.
-- Falls back to gravity when normals are missing or degenerate.
+- Manual site-data tuning may still be needed for Field no-flow and bridge thresholds.
+- Manual application EXR/MP4 acceptance remains useful as a final operator check, but automated tests now cover active-cloud water-effect EXR writing and MP4 frame conversion.
 
-Neighbour scoring:
-
-- Searches within `maxBridgeDistance`.
-- Scores candidates by downhill drop, alignment with projected gravity, confidence, normal coherence, bridge penalties, gap tolerance, and flatness.
-- Penalizes long bridges and uphill moves.
-- Allows more flat/spread behavior as `branching` increases.
-
-Branch tracing:
-
-- Main branches target full `pathLength`; secondary/spread branches are shorter.
-- Each segment is sampled at `pathSampleSpacing`.
-- Anchors store confidence, pooling, accumulation, width, normal, and surface steepness.
-- Confidence decays over distance and more strongly across bridge jumps.
-- Termination reasons include reached length, no support, max steps, loop, duplicate, and empty.
-
-Branch generation:
-
-- One main branch is traced per enabled emitter.
-- Main branches collect branch opportunities from alternate ranked neighbours.
-- Secondary/spread branch count is controlled by `branching` and `coverage`.
-- Occupied support points reduce duplicate secondary routes.
-- Per-emitter cache generation remaps branch IDs into a combined cache.
-
-### From Flow Cache To Anchors
-
-`BuildWaterPathAnchorsFromCache` turns cached branches into current path anchors:
-
-- Skips branches in `hiddenBranchIds`.
-- Copies each branch's raw anchors.
-- Resolves source settings for that branch's emitter.
-- Rewrites `flowId`, `emitterId`, `particleRole`, and branch `featureType`.
-- Reduces confidence for low-confidence/gappy branches.
-- Applies `SmoothWaterPath`.
-- Emits role-0 anchor points into `pathAnchors`.
-
-This is the layer that lets branch hiding and smoothing refresh without rerunning the expensive support graph path bake.
-
-### Flow Trail, Lane, And Particle Generation
-
-`BuildWaterOverlayFromPathAnchors` groups anchors by `flowId`, resolves per-emitter trail shape settings, and calls `IncludeWaterPathWithParticles`.
-
-Trail expansion includes:
-
-- `ResampleSplineAnchors`: path resampling for playback spacing.
-- `BuildSplineViewSamples`: Catmull-Rom guide sampling.
-- `IncludeWaterPathViewAnchors`: role-2 path guide points.
-- `BuildTrailSurfaceIndex`: XY surface projection grid for lane paths.
-- `ComputeTrailKnotScores`: curvature, near-return, flatness, and steepness scoring.
-- `SimplifyTrailGuidePath`: dynamic-programming simplification for looser lanes.
-- `BuildOffsetTrailLanePath`: lateral lane offsets, deterministic wander, surface projection, smoothing, and role-3 lane guide points.
-- Particle emission: role-1 particles and optional ghost samples based on density, speed, trail length, and trail age.
-
-Preview quality reduces some sample counts and horizons; final quality emits more particles and richer lane paths.
-
-### Flow Visualization And Editing
-
-Generated Flow sessions are ordinary point-cloud sessions with water-specific style state:
-
-- `flowAnimation = true`.
-- `waterPathView` switches between Trail View and Path View.
-- `MakeWaterOverlayDisplayStyle` applies the selected water point visual.
-- `SeedWaterFlowBuiltInVisuals` makes built-in and project visuals available.
-
-`shaders/pointcloud_fast_basic.frag` filters by `particle_role`:
-
-- Trail View keeps visible particles and uses `trail_age` for fade.
-- Path View keeps particles, path guides, and lane guides, with dimmer guide roles.
-
-Path editing is currently branch hiding:
-
-- Path View draws debug polylines from the live overlay or cache.
-- The user clicks to select the nearest branch.
-- Delete or Backspace hides the selected branch.
-- Ctrl-Z restores the previous hidden branch list.
-- Hidden branch IDs are saved in `WaterPathCache.hiddenBranchIds`.
-
-There is no persisted manual branch reshape/control-point edit yet.
-
-## Feature 2: Basin
-
-Basin creates soft haze/steam overlays from polygon regions. It uses the shared overlay point and PLY pipeline, but it does not use Flow emitters or Flow path caches.
-
-### Basin Data Model
-
-`WaterBasinRegion` stores:
-
-- `id` and `name`.
-- User `vertices`.
-- Derived convex-style `hull`.
-- Derived `baseZ`.
-- `heightAbove` and `depthBelow` for the vertical inclusion envelope.
-- `density`.
-- Optional `outletEdgeIndex`.
-- `outletBlocked`.
-
-`RefreshWaterBasinRegionDerivedValues` rebuilds the hull, recomputes base Z from vertices, clamps the vertical envelope/density, and clears invalid outlet edge references.
-
-### Basin UI And Bake Lifecycle
-
-`DrawWaterBasinPanel` manages Basin UI:
-
-- Create a new basin region.
-- Arm/disarm vertex placement.
-- Select and rename regions.
-- Close the region by refreshing derived values.
-- Remove the last vertex.
-- Edit height above, depth below, density, outlet edge, outlet edge index, and outlet blocked state.
-- Bake the selected basin haze.
-- Delete the selected basin.
-
-`BakeBasinHazeOverlayForActiveLayer`:
-
-- Requires a selected basin region with at least three hull points.
-- Requires a visible loaded support point cloud with CPU data.
-- Calls `GenerateBasinHazeOverlay` for the selected region only.
-- Writes `<source-stem>-BasinHaze.ply`.
-- Adds or refreshes a generated overlay session using `MakeBasinHazeOverlayStyle`.
-
-### Basin Haze Algorithm
-
-`GenerateBasinHazeOverlay`:
-
-- Refreshes each region's derived values.
-- Computes a vertical envelope from `baseZ - depthBelow` to `baseZ + heightAbove`.
-- Builds XY cells for points inside the hull and vertical envelope.
-- Keeps the lowest point per cell as a plume site.
-- Sorts plume sites by height and point index.
-- Uses density and deterministic hashing to decide which sites emit plumes.
-- Applies outlet masking if an outlet edge is configured and not blocked.
-- Builds a short rising path per plume with drift, cross-drift, swirl, rise, speed, confidence, and feature type `1.0`.
-- Recomputes path distance and expands the path through `IncludeWaterPathWithParticles`.
-
-Basin haze gets its own trail shape and animation settings internally. It does not use the project's Flow path cache.
-
-### Basin Output And Styling
-
-Basin haze writes a binary PLY overlay with the same `WaterOverlayPoint` scalar schema as Flow. Its display style comes from `MakeBasinHazeOverlayStyle`, which uses soft camera-facing/world-sprite styling, trail-age opacity mapping, low emissive strength, and no Path View.
-
-## Feature 3: Runoff
-
-Runoff creates many short trickle overlays inside polygon regions. It is designed for dew or light-rain movement across local high points and ground cells.
-
-### Runoff Data Model
-
-`WaterRunoffRegion` stores:
-
-- `id` and `name`.
-- User `vertices`.
-- Derived `hull`.
-- `mode`: `Dew` or `LightRain`.
-- `groundVoxelSize`.
-- `highPointFraction`.
-- `density`.
-- `pathLength`.
-- `maxSteps`.
-
-`RefreshWaterRunoffRegionDerivedValues` rebuilds the hull and clamps all numeric settings.
-
-### Runoff UI And Bake Lifecycle
-
-`DrawWaterRunoffPanel` manages Runoff UI:
-
-- Create a new runoff region.
-- Arm/disarm vertex placement.
-- Select and rename regions.
-- Choose Dew or Light Rain.
-- Close the region.
-- Remove the last vertex.
-- Edit ground voxel size, high point fraction, density, path length, and max steps.
-- Bake runoff.
-- Delete the selected region.
-
-`BakeRunoffOverlayForActiveLayer`:
-
-- Requires a visible loaded support point cloud with CPU data.
-- Runs all runoff regions, not just the selected region.
-- Calls `GenerateRunoffOverlay` with the active animation trail settings.
-- Writes `<source-stem>-Runoff.ply`.
-- Adds or refreshes a generated overlay session using `MakeRunoffOverlayStyle`.
-
-### Runoff Algorithm
-
-`GenerateRunoffOverlay`:
-
-- Refreshes each region.
-- Builds XY ground cells from all valid support points inside the region hull.
-- Stores Z samples, position sum, and point count per cell.
-- Chooses each cell's ground Z from the low Z percentile.
-- Finds candidate high points above the cell's ground Z.
-- Sorts candidates by height.
-- Uses `highPointFraction`, mode density, region density, and deterministic hashing to keep a subset.
-- Starts each trickle at the high point, drops along projected gravity/normal toward ground, then walks across neighbouring ground cells.
-- Scores next ground cells by local ground drop, diagonal penalty, and small deterministic hash variation.
-- Stops when no useful downhill cell exists, max steps is reached, or path length is reached.
-- Recomputes path distances and expands the path through `IncludeWaterPathWithParticles`.
-
-Runoff uses feature type `2.0`. Dew is lower density/slower; Light Rain is denser and faster.
-
-### Runoff Output And Styling
-
-Runoff writes a binary PLY overlay with the shared `WaterOverlayPoint` scalar schema. `MakeRunoffOverlayStyle` uses water overlay styling with point size, trail-age opacity, and accumulation emissive mapping. It does not use Path View.
-
-## Feature 4: Caustics
-
-Caustics are water-related render effects applied to existing LiDAR layers. They do not generate water overlay PLYs.
-
-### Caustic Data Model
-
-`WaterCausticRegion` stores:
-
-- `id` and `name`.
-- `targetLayerSourcePath`.
-- User `vertices`.
-- Derived `hull`.
-- `maskVoxelSize`.
-- `planeMaxResidual`.
-- `planeMaxSlope`.
-- `heightBand`.
-- `edgeBlendWidth`.
-- `previewTintMode`: off, pulse after refresh, or always.
-- `enabled`.
-- `maskDirty` and `maskStale`.
-
-`WaterCausticLookSettings` stores the render look:
-
-- enabled/intensity.
-- scale/speed/line sharpness/warp.
-- cell size, line width, feather, surface point spacing, warp amplitude.
-- tint, emission boost, opacity boost, and point size boost.
-
-Current implementation note: `GenerateCausticMask` currently uses polygon inclusion, edge distance, region ID, enabled state, and edge blend width. Some persisted region fields such as mask voxel size, plane residual, plane slope, and height band are clamped and saved but are not currently central to the mask algorithm.
-
-### Caustic UI And Refresh Lifecycle
-
-`DrawWaterCausticsPanel` manages region UI:
-
-- Create a new caustic area targeting the selected loaded LiDAR layer.
-- Arm/disarm boundary vertex placement.
-- Select and rename regions.
-- Toggle enabled state.
-- Close the caustic area.
-- Remove the last vertex.
-- Edit edge blend and preview tint mode.
-- Refresh mask.
-- Delete caustics.
-
-The same panel also exposes Caustic Look settings through `ViewedWaterCausticLookSettings` and editable project/animation overrides.
-
-`RefreshSelectedWaterCausticMask` finds the selected region's target layer and calls `RefreshWaterCausticMaskForSession`.
-
-`RefreshWaterCausticMaskForSession`:
-
-- Requires the target point-cloud session to be loaded with CPU data.
-- Collects all caustic regions targeting that same source path.
-- Calls `GenerateCausticMask`.
-- Upserts generated scalar fields into the target cloud:
-  - `caustic_mask`
-  - `caustic_edge`
-  - `caustic_region_id`
-  - `caustic_plane_distance`
-  - `caustic_seed`
-- Sanitizes style, uploads the point cloud to the GPU, clears mask dirty/stale flags for target regions, and optionally starts a preview tint pulse.
-
-### Caustic Mask Algorithm
-
-`GenerateCausticMask`:
-
-- Allocates mask, edge, region ID, plane distance, and seed arrays for the target point count.
-- Refreshes region derived values.
-- Builds a boundary from region vertices.
-- Skips disabled or incomplete regions.
-- Tests each valid point for XY polygon inclusion.
-- Computes 3D edge distance, falling back to XY edge distance if needed.
-- Converts edge distance into a smooth edge value using `edgeBlendWidth`.
-- Replaces existing mask values when the new region has a stronger edge value or a lower region ID tie-breaker.
-- Stores mask `1.0`, edge, region ID, plane distance `0.0`, and deterministic region seed.
-
-`affectedPointCount` records how many points enter the mask.
-
-### Caustic Rendering
-
-`ApplyWaterCausticRenderStyle` binds caustics into a target LiDAR layer's point style when:
-
-- The session has at least one caustic region targeting it.
-- The required scalar fields exist.
-- The look is enabled with nonzero intensity, or editor preview tint is active.
-
-`VulkanViewportShell` uploads caustic control slots and parameter vectors. `shaders/pointcloud_fast_basic.frag` loads mask/edge/seed scalar values, computes animated caustic strength, and mixes toward the caustic tint. `shaders/pointcloud_caustics.glsl` provides the Voronoi-ridge pattern, surface UV logic, edge gating, and preview tint.
-
-Caustics affect LiDAR rendering directly. They should be tested on the target LiDAR layer, not by looking for a generated water PLY file.
-
-## Overlay PLY Schema For Flow, Basin, And Runoff
-
-`WriteWaterOverlayPly` writes binary little-endian PLY files with one vertex per `WaterOverlayPoint`.
-
-Properties:
-
-- `x`, `y`, `z`
-- `normal_x`, `normal_y`, `normal_z`
-- `red`, `green`, `blue`
-- `scalar_flow_id`
-- `scalar_emitter_id`
-- `scalar_path_distance`
-- `scalar_phase`
-- `scalar_speed`
-- `scalar_width`
-- `scalar_confidence`
-- `scalar_accumulation`
-- `scalar_pooling`
-- `scalar_particle_role`
-- `scalar_path_start_index`
-- `scalar_path_point_count`
-- `scalar_jitter_seed`
-- `scalar_trail_age`
-- `scalar_trail_length`
-- `scalar_feature_type`
-- `scalar_region_id`
-- `scalar_surface_steepness`
-- `scalar_trail_lane_id`
-- `scalar_trail_lateral_offset`
-
-`BuildWaterOverlayPointCloud` exposes the same values as in-memory scalar fields without the `scalar_` prefix, for example `flow_id`, `particle_role`, and `trail_age`.
-
-## Change Guide
-
-### Flow Changes
-
-Routing and cache behavior:
-
-- Edit `TuneWaterPathSettings`, `BuildSupportGraph`, `FlowDirection`, `RankDownhillNeighbours`, `TraceWaterPathBranch`, and `GenerateWaterPathCache`.
-- Update `AppendWaterPathBakeSettingsFingerprint` for any new bake-affecting setting.
-- Update `WaterPathAutoTuneDiagnostics` and serialization if new diagnostics should persist or appear in UI.
-- Be careful with branch IDs because `hiddenBranchIds` persists user branch-hiding edits.
-
-Trail and particle behavior:
-
-- Edit `TrailPlaybackSampleSpacing`, `ResampleSplineAnchors`, `ComputeTrailKnotScores`, `SimplifyTrailGuidePath`, `BuildOffsetTrailLanePath`, `IncludeWaterTrailLaneGuides`, and `IncludeWaterPathWithParticles`.
-- Test both preview and final quality paths.
-- Keep `particleRole`, `pathStartIndex`, and `pathPointCount` coherent with shader and debug overlay expectations.
-
-Flow UI:
-
-- Edit `DrawWaterPanel`, `BakeWaterOverlayForActiveLayer`, `RefreshWaterOverlayFromAnchors`, emitter placement/move helpers, and source settings helpers.
-- Routing changes should mark the path dirty. Trail/visual changes should refresh from cached anchors where possible.
-
-### Basin Changes
-
-Data and persistence:
-
-- Edit `WaterBasinRegion`, `SerializeWaterBasinRegion`, and `ParseWaterBasinRegion`.
-- Keep `RefreshWaterBasinRegionDerivedValues` responsible for derived hull/base Z and clamping.
-
-Generation:
-
-- Edit `GenerateBasinHazeOverlay` for plume placement, density, outlet behavior, rise/drift/swirl, and Basin feature point styling.
-- Edit `BakeBasinHazeOverlayForActiveLayer` if bake scope changes from selected-only to all regions.
-- Edit `MakeBasinHazeOverlayStyle` for viewport style.
-
-UI:
-
-- Edit `DrawWaterBasinPanel` for controls and workflow.
-
-### Runoff Changes
-
-Data and persistence:
-
-- Edit `WaterRunoffRegion`, `SerializeWaterRunoffRegion`, and `ParseWaterRunoffRegion`.
-- Keep `RefreshWaterRunoffRegionDerivedValues` responsible for clamping.
-
-Generation:
-
-- Edit `GenerateRunoffOverlay` for ground-cell estimation, high-point filtering, mode behavior, local downhill scoring, and trickle path expansion.
-- Edit `BakeRunoffOverlayForActiveLayer` if bake scope should become selected-only or support multiple output files.
-- Edit `MakeRunoffOverlayStyle` for viewport style.
-
-UI:
-
-- Edit `DrawWaterRunoffPanel` for controls and workflow.
-
-### Caustic Changes
-
-Data and persistence:
-
-- Edit `WaterCausticRegion`, `WaterCausticLookSettings`, their serializers/parsers, and project/animation load/save paths.
-- If plane or height-band fields become algorithmically active, update this document and add acceptance checks around them.
-
-Mask generation and upload:
-
-- Edit `GenerateCausticMask` for selection-mask semantics.
-- Edit `RefreshWaterCausticMaskForSession` for scalar field names, upload behavior, and dirty/stale handling.
-- Keep scalar names aligned with `FindCaustic*ScalarFieldSlot` helpers and style binding.
-
-Rendering:
-
-- Edit `ApplyWaterCausticRenderStyle`, `VulkanViewportShell` caustic uniform packing, `shaders/pointcloud_fast_basic.frag`, and `shaders/pointcloud_caustics.glsl`.
-- Test editor preview tint modes and export/offline render paths if caustic style changes.
-
-### Cross-Cutting Changes
-
-- For new region fields, update region structs, refresh functions, UI controls, serializers, project save/load, water sources save/load, and any animation override path if relevant.
-- For new overlay scalar fields, update `WaterOverlayPoint`, `WriteWaterOverlayPly`, `BuildWaterOverlayPointCloud`, visual presets, shader constants, and style serialization if the visual uses the field.
-- For new generated files, update path builders and artifact documentation.
-- Keep Flow overlay PLYs and Caustic LiDAR scalar fields conceptually separate.
-
-## Legacy And Reassessment Notes
-
-Feature-set-wide notes:
-
-- `water_sources.json` stores sources, regions, caustic look settings, and optionally the Flow path cache, but not every project water visual or animation trail profile.
-- The project document carries additional water state, legacy water settings, point visuals, and animation-specific overrides.
-- Basin and Runoff are PLY overlay features; Caustics are target-layer scalar fields. Treating all water features as generated overlays will lead to wrong implementation choices.
-- Region editing is shared, but generation and persistence details differ by feature.
-
-Flow-specific notes:
-
-- The Flow report was previously the main water document, which made Basin/Runoff/Caustics feel secondary even though they are first-class feature panels.
-- `WaterSettingsBundle`, `WaterParticleTrailSettings`, `WaterParticleVisualSettings`, `WaterVisualSettings`, `WaterBakeSettings`, and `WaterRenderSettings` still exist for compatibility.
-- `WaterParticleTrailShapeSettings` persists `trailTurbulence`, `trailMomentum`, and `normalTurbulenceResponse`, but the current trail generation mainly uses looseness, smoothness, jitter, spline spacing, and lane count.
-- Flow overlay sessions can be refreshed in memory without rewriting the last `-WaterFlow.ply`.
-- Branch editing is hide-only; there is no persisted manual path reshape.
-- Hidden branch IDs depend on generated branch IDs, so branch-generation changes can invalidate old hide edits.
-
-Basin/Runoff notes:
-
-- Basin bake currently uses the selected basin region only.
-- Runoff bake currently uses all runoff regions.
-- Both features reuse `IncludeWaterPathWithParticles`, so changes to trail particle generation can affect Flow, Basin, and Runoff together.
-
-Caustic notes:
-
-- Several persisted caustic region fields are currently not central to `GenerateCausticMask`.
-- `caustic_plane_distance` is generated but currently written as `0.0`.
-- Caustic rendering requires the generated scalar fields to be present on the target LiDAR layer and the look to be active or preview tint to be active.
-
-## Practical Acceptance Checks
+## Change Checklist
 
 Use these checks after water feature changes:
 
-- Flow: place an emitter, bake Flow, confirm `<source-stem>-WaterFlow.ply` and `<source-stem>-WaterPathCache.json` are produced or refreshed.
-- Flow: switch Trail View and Path View and confirm particle roles are filtered differently.
-- Flow: hide a branch in Path View, undo it, save/reload, and confirm `hiddenBranchIds` behaves as expected.
-- Basin: create a basin region, close it, bake Basin Haze, and confirm `<source-stem>-BasinHaze.ply` appears and displays.
-- Runoff: create a runoff region, bake Runoff, and confirm `<source-stem>-Runoff.ply` appears and displays.
-- Caustics: create a caustic area targeting a loaded LiDAR layer, refresh the mask, and confirm the target session has `caustic_mask`, `caustic_edge`, `caustic_region_id`, `caustic_plane_distance`, and `caustic_seed` fields.
-- Persistence: save and reload `water_sources.json` and the project document, then confirm emitters, regions, selected settings, and stale/dirty states are sane.
-- Rendering: verify changed visuals in viewport and, when relevant, export/offline paths.
+- Serialization: new saves include Ripple/Flow/Field keys and omit Basin/Runoff/Caustic region keys.
+- Legacy load: old Caustic regions become Ripple `Caustic Lace`; old Basin/Runoff records are ignored.
+- Flow: path-affecting settings dirty `WaterPathCache`; stream settings only refresh stream overlays.
+- Stream schema: generated stream scalar fields match the exact order above.
+- Rendering: `waterStreamOverlay` styles compile and render tangent-aligned surfels.
+- Visuals: base-cloud scalar mappings remain intact after creating Ripples, Flow Streams, Field Streamlines, and Field Surface Motion; Ripple/Field Surface Motion effects compose through Visuals-compatible contributions instead of replacing base visuals.
+- Regions: Ripple and Field regions preserve concave clicked boundaries.
+- Motion: Flow Streams visibly animate through shader/Visuals playback, not only static generated positions.
+- Export: visible generated/effect water layers and active-cloud `water_effect_*` fields appear in viewport and camera export paths without requiring water PLY export.

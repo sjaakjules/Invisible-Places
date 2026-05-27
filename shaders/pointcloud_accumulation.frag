@@ -62,6 +62,9 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 causticParams1;
     vec4 causticParams2;
     vec4 causticTint;
+    uvec4 waterEffectControl;
+    uvec4 waterEffectSlots0;
+    uvec4 waterEffectSlots1;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
 } styleData;

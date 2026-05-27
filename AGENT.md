@@ -93,6 +93,7 @@ Use this map instead of guessing.
 - camera and shot system: `code_plan.md`, section `8`
 - point rendering and motion: `code_plan.md`, sections `9` and `10`
 - AOV/output behaviour: `code_plan.md`, sections `11` and `12`
+- water v2 public contract: `docs/water_features.md` and `docs/water_features_redesign_v2.md`
 
 ---
 
@@ -264,6 +265,22 @@ May touch:
 
 Must not own:
 - feature logic unless the owning agent explicitly delegated a seam
+
+### J. Water Feature Agent
+Owns coordinated water slices across:
+- `/src/water/**`
+- water workflow sections in `/src/app/Application.cpp`
+- water serialization in `/src/serialization/ProjectDocument.*`
+- water point/shader style hooks in `/src/renderer/**` and `/shaders/**`
+- water tests in `/tests/**`
+- `docs/water_features.md` and `docs/water_features_redesign_v2.md`
+
+Must preserve:
+- Active tabs are Ripples, Flow, and Field.
+- Base point-cloud scalar mappings remain source of truth.
+- Ripples and Field Surface Motion use virtual/effect overlays, not dense base-cloud scalar injection.
+- Flow Streams and Field Streamlines use generated stream surfels with the documented scalar-field contract.
+- New saves omit Basin/Runoff/Caustic region keys; old Basin/Runoff records are ignored and old Caustics migrate to Ripple Caustic Lace.
 
 ---
 
