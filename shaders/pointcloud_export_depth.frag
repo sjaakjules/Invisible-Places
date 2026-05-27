@@ -66,7 +66,7 @@ float ResolveFalloff(float radius, float radiusSquared) {
 }
 
 float AlphaClampMax() {
-    return styleData.renderControl.w != 0u ? 1.0 : 0.995;
+    return (styleData.renderControl.w & 1u) != 0u ? 1.0 : 0.995;
 }
 
 float ResolveDepthFadeAlpha(float depthFade) {

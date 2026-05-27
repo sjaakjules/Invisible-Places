@@ -65,11 +65,8 @@ struct ProjectDocument {
     bool sidePanelPinned = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
     float eyeDomeLightingThickness = 1.0F;
-    invisible_places::renderer::pointcloud::PointCloudPreviewLodMode pointCloudPreviewLodMode =
-        invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::AutoCameraLod;
-    std::uint64_t interactivePointCap = 10'000'000ULL;
     invisible_places::renderer::pointcloud::PointCloudRendererMode pointCloudRendererMode =
-        invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::BeautyAdaptive;
     invisible_places::output::RenderJobSettings renderJobSettings{};
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;

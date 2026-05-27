@@ -806,7 +806,27 @@ void VulkanViewportShell::DrawFrame() {
     vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
-    if (AnySceneImageNeedsRender()) {
+    std::uint32_t drawItemBufferReallocations = 0;
+    const auto drawItemUploadStart = collectDiagnostics ? std::chrono::steady_clock::now()
+                                                        : std::chrono::steady_clock::time_point{};
+    const bool sceneNeedsPrepare = AnySceneImageNeedsRender();
+    if (sceneNeedsPrepare) {
+        for (const auto& layer : renderState_.pointCloudLayers) {
+            auto* resources = FindPointCloudResources(layer.layerId);
+            if (resources == nullptr) {
+                continue;
+            }
+            const bool reallocated = UpdatePointCloudDrawItemBuffer(
+                resources,
+                currentFrameIndex_,
+                layer.useAdaptiveDrawItems ? layer.adaptiveDrawItems.get() : nullptr,
+                layer.useAdaptiveDrawItems ? layer.adaptiveLodRevision : 0ULL);
+            drawItemBufferReallocations += reallocated ? 1U : 0U;
+        }
+    }
+    const auto drawItemUploadEnd = collectDiagnostics ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+    if (sceneNeedsPrepare) {
         RefreshHighQualityGaussianScene(currentFrameIndex_);
         UpdateUniformBuffer(currentFrameIndex_);
     }
@@ -892,6 +912,9 @@ void VulkanViewportShell::DrawFrame() {
         diagnostics_.frameAverageWindowSeconds = kFrameAverageWindowMs / 1000.0;
         diagnostics_.frameUiRenderMs = MillisecondsBetween(frameStart, uiEnd);
         diagnostics_.frameFenceWaitMs = MillisecondsBetween(uiEnd, fenceEnd);
+        diagnostics_.pointDrawItemUploadMs = MillisecondsBetween(drawItemUploadStart, drawItemUploadEnd);
+        diagnostics_.pointDrawItemWaitMs = 0.0;
+        diagnostics_.pointDrawItemBufferReallocations = drawItemBufferReallocations;
         diagnostics_.framePrepareMs = MillisecondsBetween(fenceEnd, prepareEnd);
         diagnostics_.frameAcquireMs = MillisecondsBetween(prepareEnd, acquireEnd);
         diagnostics_.frameImageWaitMs = MillisecondsBetween(acquireEnd, imageWaitEnd);
@@ -979,10 +1002,75 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     ++sceneRevision_;
 
     std::uint64_t pointCount = 0;
+    std::uint64_t adaptiveRepresentativeCount = 0;
+    std::uint64_t adaptiveRepresentedSourceCount = 0;
+    std::uint64_t adaptiveVisibleRepresentedSourceCount = 0;
+    std::uint64_t adaptiveEmittedRepresentedSourceCount = 0;
+    std::uint64_t adaptiveCulledRepresentedSourceCount = 0;
+    std::uint32_t adaptiveVisibleFrontierNodeCount = 0;
+    double adaptiveEstimatedFragments = 0.0;
+    double adaptiveFragmentBudget = 0.0;
+    std::uint32_t adaptiveRepresentativeBudget = 0;
+    bool adaptiveRepresentativeBudgetReached = false;
+    bool adaptiveFragmentBudgetReached = false;
+    double adaptiveTraversalMs = 0.0;
+    bool adaptiveReusedPrevious = false;
+    bool adaptiveRuntimeCacheHit = false;
+    bool adaptiveAsyncPending = false;
+    double adaptiveAsyncPendingAgeMs = 0.0;
+    std::uint64_t adaptiveDisplayedCacheAgeFrames = 0;
+    std::uint64_t adaptiveStaleTraversalDiscardedCount = 0;
+    std::uint64_t adaptiveDrawItemBytes = 0;
+    std::string adaptivePersistentCacheStatus;
+    std::string adaptiveRuntimeStatus;
+    std::string adaptiveRequestedDensity;
+    std::string adaptiveDisplayedDensity;
+    std::string adaptiveFallbackState;
     double pointSizeSum = 0.0;
     std::uint64_t pointSizeWeight = 0;
     for (const auto& layer : renderState_.pointCloudLayers) {
         pointCount += layer.drawPointCount;
+        if (layer.useAdaptiveDrawItems) {
+            adaptiveRepresentativeCount += layer.drawPointCount;
+            adaptiveRepresentedSourceCount += layer.adaptiveRepresentedSourceCount;
+            adaptiveVisibleRepresentedSourceCount += layer.adaptiveVisibleRepresentedSourceCount;
+            adaptiveEmittedRepresentedSourceCount += layer.adaptiveEmittedRepresentedSourceCount;
+            adaptiveCulledRepresentedSourceCount += layer.adaptiveCulledRepresentedSourceCount;
+            adaptiveVisibleFrontierNodeCount += layer.adaptiveVisibleFrontierNodeCount;
+            adaptiveDrawItemBytes += layer.adaptiveDrawItemBytes;
+        }
+        adaptiveEstimatedFragments += layer.adaptiveEstimatedFragments;
+        adaptiveFragmentBudget += layer.adaptiveFragmentBudget;
+        adaptiveRepresentativeBudget += layer.adaptiveRepresentativeBudget;
+        adaptiveRepresentativeBudgetReached =
+            adaptiveRepresentativeBudgetReached || layer.adaptiveRepresentativeBudgetReached;
+        adaptiveFragmentBudgetReached = adaptiveFragmentBudgetReached || layer.adaptiveFragmentBudgetReached;
+        adaptiveTraversalMs += layer.adaptiveLodTraversalMs;
+        adaptiveReusedPrevious = adaptiveReusedPrevious || layer.adaptiveLodReusedPrevious;
+        adaptiveRuntimeCacheHit = adaptiveRuntimeCacheHit || layer.adaptiveLodRuntimeCacheHit;
+        adaptiveAsyncPending = adaptiveAsyncPending || layer.adaptiveLodAsyncPending;
+        adaptiveAsyncPendingAgeMs = std::max(adaptiveAsyncPendingAgeMs, layer.adaptiveLodAsyncPendingAgeMs);
+        adaptiveDisplayedCacheAgeFrames = std::max(
+            adaptiveDisplayedCacheAgeFrames,
+            layer.adaptiveLodDisplayedCacheAgeFrames);
+        adaptiveStaleTraversalDiscardedCount = std::max(
+            adaptiveStaleTraversalDiscardedCount,
+            layer.adaptiveLodStaleTraversalDiscardedCount);
+        if (!layer.adaptiveLodPersistentCacheStatus.empty()) {
+            adaptivePersistentCacheStatus = layer.adaptiveLodPersistentCacheStatus;
+        }
+        if (!layer.adaptiveLodRuntimeStatus.empty()) {
+            adaptiveRuntimeStatus = layer.adaptiveLodRuntimeStatus;
+        }
+        if (!layer.adaptiveLodRequestedDensity.empty()) {
+            adaptiveRequestedDensity = layer.adaptiveLodRequestedDensity;
+        }
+        if (!layer.adaptiveLodDisplayedDensity.empty()) {
+            adaptiveDisplayedDensity = layer.adaptiveLodDisplayedDensity;
+        }
+        if (!layer.adaptiveLodFallbackState.empty()) {
+            adaptiveFallbackState = layer.adaptiveLodFallbackState;
+        }
         pointSizeSum +=
             static_cast<double>(layer.style.pointSize.constantValue[0] * renderState_.pointSizeScale) *
             static_cast<double>(std::max<std::uint32_t>(1U, layer.drawPointCount));
@@ -990,6 +1078,31 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     }
 
     diagnostics_.pointCount = pointCount;
+    diagnostics_.adaptiveRepresentativeCount = adaptiveRepresentativeCount;
+    diagnostics_.adaptiveRepresentedSourceCount = adaptiveRepresentedSourceCount;
+    diagnostics_.adaptiveVisibleRepresentedSourceCount = adaptiveVisibleRepresentedSourceCount;
+    diagnostics_.adaptiveEmittedRepresentedSourceCount = adaptiveEmittedRepresentedSourceCount;
+    diagnostics_.adaptiveCulledRepresentedSourceCount = adaptiveCulledRepresentedSourceCount;
+    diagnostics_.adaptiveVisibleFrontierNodeCount = adaptiveVisibleFrontierNodeCount;
+    diagnostics_.adaptiveEstimatedFragments = adaptiveEstimatedFragments;
+    diagnostics_.adaptiveFragmentBudget = adaptiveFragmentBudget;
+    diagnostics_.adaptiveRepresentativeBudget = adaptiveRepresentativeBudget;
+    diagnostics_.adaptiveRepresentativeBudgetReached = adaptiveRepresentativeBudgetReached;
+    diagnostics_.adaptiveFragmentBudgetReached = adaptiveFragmentBudgetReached;
+    diagnostics_.adaptiveLodTraversalMs = adaptiveTraversalMs;
+    diagnostics_.adaptiveLodReusedPrevious = adaptiveReusedPrevious;
+    diagnostics_.adaptiveLodRuntimeCacheHit = adaptiveRuntimeCacheHit;
+    diagnostics_.adaptiveLodAsyncPending = adaptiveAsyncPending;
+    diagnostics_.adaptiveLodAsyncPendingAgeMs = adaptiveAsyncPendingAgeMs;
+    diagnostics_.adaptiveLodDisplayedCacheAgeFrames = adaptiveDisplayedCacheAgeFrames;
+    diagnostics_.adaptiveLodStaleTraversalDiscardedCount = adaptiveStaleTraversalDiscardedCount;
+    diagnostics_.adaptiveGpuIdleWaitCount = 0;
+    diagnostics_.adaptiveDrawItemBytes = adaptiveDrawItemBytes;
+    diagnostics_.adaptiveLodPersistentCacheStatus = std::move(adaptivePersistentCacheStatus);
+    diagnostics_.adaptiveLodRuntimeStatus = std::move(adaptiveRuntimeStatus);
+    diagnostics_.adaptiveLodRequestedDensity = std::move(adaptiveRequestedDensity);
+    diagnostics_.adaptiveLodDisplayedDensity = std::move(adaptiveDisplayedDensity);
+    diagnostics_.adaptiveLodFallbackState = std::move(adaptiveFallbackState);
     if (pointCount == 0) {
         diagnostics_.pointSubmittedCount = 0;
         diagnostics_.pointPassSubmittedCount = 0;
@@ -1000,10 +1113,19 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.accumulationHeight = swapchainHeight_;
     diagnostics_.pointRenderModes =
         pointCount == 0 ? ""
-                        : (renderState_.pointCloudRendererMode ==
-                                   renderer::pointcloud::PointCloudRendererMode::FastBasic
-                               ? "fast-basic-square"
-                               : "beauty-material");
+                        : (renderer::pointcloud::PointCloudRendererModeUsesFastBasic(
+                                   renderState_.pointCloudRendererMode)
+                               ? (renderer::pointcloud::PointCloudRendererModeUsesFullSource(
+                                      renderState_.pointCloudRendererMode)
+                                      ? "fast-basic-source"
+                                      : "fast-basic-square")
+                               : (renderer::pointcloud::PointCloudRendererModeUsesFullSource(
+                                      renderState_.pointCloudRendererMode)
+                                      ? "beauty-full-source"
+                                      : (renderer::pointcloud::PointCloudRendererModeUsesPaintedStyle(
+                                             renderState_.pointCloudRendererMode)
+                                             ? "painted-adaptive"
+                                             : "beauty-adaptive")));
 
     std::ostringstream summary;
     summary << "Renderer: " << diagnostics_.rendererName << " | " << swapchainWidth_ << "x"
@@ -1116,6 +1238,19 @@ void VulkanViewportShell::UploadPointCloud(
     resources.exrStyleBuffer = CreateHostVisibleBuffer(
         sizeof(PointCloudStyleGpu),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    const renderer::pointcloud::PointCloudDrawItemGpu fallbackDrawItem{};
+    for (std::size_t frameIndex = 0; frameIndex < resources.drawItemBuffers.size(); ++frameIndex) {
+        resources.drawItemBuffers[frameIndex] = CreateHostVisibleBuffer(
+            sizeof(fallbackDrawItem),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources.drawItemBuffers[frameIndex], &fallbackDrawItem, sizeof(fallbackDrawItem));
+        resources.drawItemCapacities[frameIndex] = 1U;
+    }
+    resources.exrDrawItemBuffer = CreateHostVisibleBuffer(
+        sizeof(fallbackDrawItem),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(resources.exrDrawItemBuffer, &fallbackDrawItem, sizeof(fallbackDrawItem));
+    resources.exrDrawItemCapacity = 1U;
     UpdatePointCloudDescriptorSets(&resources);
 
     UpdatePointBudget(layerId, sampledIndices);
@@ -1133,11 +1268,8 @@ void VulkanViewportShell::UpdatePointBudget(
 
     DestroyBuffer(&resources->sampledIndexBuffer);
     DestroyBuffer(&resources->sampledSurfelIndexBuffer);
-    DestroyBuffer(&resources->interactiveSampledIndexBuffer);
-    DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
     resources->usingSampledIndices = false;
     resources->activePointCount = resources->pointCount;
-    resources->interactiveSampledIndexCount = 0;
 
     if (resources->pointCount == 0 ||
         sampledIndices.empty() ||
@@ -1165,46 +1297,6 @@ void VulkanViewportShell::UpdatePointBudget(
             resources->sampledSurfelIndexBuffer,
             surfelIndices.data(),
             resources->sampledSurfelIndexBuffer.size);
-    }
-}
-
-void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
-    std::size_t layerId,
-    const std::vector<std::uint32_t>& sampledIndices) {
-    WaitIdle();
-
-    auto* resources = FindPointCloudResources(layerId);
-    if (resources == nullptr) {
-        return;
-    }
-
-    DestroyBuffer(&resources->interactiveSampledIndexBuffer);
-    DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
-    resources->interactiveSampledIndexCount = 0;
-
-    if (sampledIndices.empty() || sampledIndices.size() >= resources->pointCount) {
-        return;
-    }
-
-    resources->interactiveSampledIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(sampledIndices.size() * sizeof(std::uint32_t)),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    UploadBufferData(
-        resources->interactiveSampledIndexBuffer,
-        sampledIndices.data(),
-        resources->interactiveSampledIndexBuffer.size);
-    resources->interactiveSampledIndexCount = static_cast<std::uint32_t>(sampledIndices.size());
-
-    const auto surfelIndices =
-        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledIndices);
-    if (!surfelIndices.empty()) {
-        resources->interactiveSurfelIndexBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        UploadBufferData(
-            resources->interactiveSurfelIndexBuffer,
-            surfelIndices.data(),
-            resources->interactiveSurfelIndexBuffer.size);
     }
 }
 
@@ -1386,10 +1478,29 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
     }
 
     const auto previousRenderState = renderState_;
-    auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
+    auto applyDrawItemBuffers = [&](const SceneRenderState& state) {
+        std::uint32_t reallocations = 0;
+        for (const auto& layer : state.pointCloudLayers) {
+            auto* resources = FindPointCloudResources(layer.layerId);
+            if (resources == nullptr) {
+                continue;
+            }
+            const bool reallocated = UpdatePointCloudExrDrawItemBuffer(
+                resources,
+                layer.useAdaptiveDrawItems ? layer.adaptiveDrawItems.get() : nullptr,
+                layer.useAdaptiveDrawItems ? layer.adaptiveLodRevision : 0ULL);
+            reallocations += reallocated ? 1U : 0U;
+        }
+        diagnostics_.pointDrawItemBufferReallocations = reallocations;
+    };
+    auto restoreRenderState = [&]() {
+        renderState_ = previousRenderState;
+        applyDrawItemBuffers(previousRenderState);
+    };
 
     try {
         renderState_ = request.renderState;
+        applyDrawItemBuffers(request.renderState);
         for (auto& resources : pointCloudResources_) {
             UpdatePointCloudExrDescriptorSet(&resources, exrExportResources_.depthImage.view);
         }
@@ -1937,7 +2048,7 @@ void VulkanViewportShell::CreatePresentRenderPass() {
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -3875,6 +3986,115 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSets(ActivePointCloudResourc
     }
 }
 
+bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
+    ActivePointCloudResources* resources,
+    std::size_t frameIndex,
+    const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>* drawItems,
+    std::uint64_t revision) {
+    if (resources == nullptr || frameIndex >= kFramesInFlight) {
+        return false;
+    }
+
+    const auto drawItemCount = drawItems == nullptr ? 0U : static_cast<std::uint32_t>(
+        std::min<std::size_t>(drawItems->size(), std::numeric_limits<std::uint32_t>::max()));
+    if (resources->drawItemSignatures[frameIndex] == revision &&
+        resources->drawItemCounts[frameIndex] == drawItemCount &&
+        resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE) {
+        resources->drawItemSignature = revision;
+        resources->drawItemCount = drawItemCount;
+        return false;
+    }
+
+    bool reallocated = false;
+    const auto requiredCapacity = std::max<std::uint32_t>(1U, drawItemCount);
+    if (resources->drawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+        resources->drawItemCapacities[frameIndex] < requiredCapacity) {
+        DestroyBuffer(&resources->drawItemBuffers[frameIndex]);
+        const auto newCapacity = std::max(requiredCapacity, resources->drawItemCapacities[frameIndex] * 2U);
+        resources->drawItemBuffers[frameIndex] = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(newCapacity * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->drawItemCapacities[frameIndex] = newCapacity;
+        reallocated = true;
+    }
+
+    if (drawItemCount == 0) {
+        const renderer::pointcloud::PointCloudDrawItemGpu fallback{};
+        UploadBufferData(resources->drawItemBuffers[frameIndex], &fallback, sizeof(fallback));
+    } else {
+        UploadBufferData(
+            resources->drawItemBuffers[frameIndex],
+            drawItems->data(),
+            static_cast<VkDeviceSize>(drawItemCount * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)));
+    }
+
+    resources->drawItemSignatures[frameIndex] = revision;
+    resources->drawItemCounts[frameIndex] = drawItemCount;
+    resources->drawItemSignature = revision;
+    resources->drawItemCount = drawItemCount;
+    if (reallocated) {
+        for (std::uint32_t imageIndex = 0; imageIndex < depthImages_.size(); ++imageIndex) {
+            UpdatePointCloudDescriptorSet(
+                resources,
+                frameIndex,
+                imageIndex,
+                depthImages_[imageIndex].view);
+        }
+    }
+    return reallocated;
+}
+
+bool VulkanViewportShell::UpdatePointCloudExrDrawItemBuffer(
+    ActivePointCloudResources* resources,
+    const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>* drawItems,
+    std::uint64_t revision) {
+    if (resources == nullptr) {
+        return false;
+    }
+
+    const auto drawItemCount = drawItems == nullptr ? 0U : static_cast<std::uint32_t>(
+        std::min<std::size_t>(drawItems->size(), std::numeric_limits<std::uint32_t>::max()));
+    if (resources->exrDrawItemSignature == revision &&
+        resources->exrDrawItemCount == drawItemCount &&
+        resources->exrDrawItemBuffer.buffer != VK_NULL_HANDLE) {
+        resources->drawItemSignature = revision;
+        resources->drawItemCount = drawItemCount;
+        return false;
+    }
+
+    bool reallocated = false;
+    const auto requiredCapacity = std::max<std::uint32_t>(1U, drawItemCount);
+    if (resources->exrDrawItemBuffer.buffer == VK_NULL_HANDLE ||
+        resources->exrDrawItemCapacity < requiredCapacity) {
+        DestroyBuffer(&resources->exrDrawItemBuffer);
+        const auto newCapacity = std::max(requiredCapacity, resources->exrDrawItemCapacity * 2U);
+        resources->exrDrawItemBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(newCapacity * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->exrDrawItemCapacity = newCapacity;
+        reallocated = true;
+    }
+
+    if (drawItemCount == 0) {
+        const renderer::pointcloud::PointCloudDrawItemGpu fallback{};
+        UploadBufferData(resources->exrDrawItemBuffer, &fallback, sizeof(fallback));
+    } else {
+        UploadBufferData(
+            resources->exrDrawItemBuffer,
+            drawItems->data(),
+            static_cast<VkDeviceSize>(drawItemCount * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)));
+    }
+
+    resources->exrDrawItemSignature = revision;
+    resources->exrDrawItemCount = drawItemCount;
+    resources->drawItemSignature = revision;
+    resources->drawItemCount = drawItemCount;
+    if (reallocated && exrExportResources_.depthImage.view != VK_NULL_HANDLE) {
+        UpdatePointCloudExrDescriptorSet(resources, exrExportResources_.depthImage.view);
+    }
+    return reallocated;
+}
+
 void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     ActivePointCloudResources* resources,
     std::size_t frameIndex,
@@ -3925,11 +4145,16 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     normalInfo.offset = 0;
     normalInfo.range = resources->normalBuffer.size;
 
+    VkDescriptorBufferInfo drawItemInfo{};
+    drawItemInfo.buffer = resources->drawItemBuffers[frameIndex].buffer;
+    drawItemInfo.offset = 0;
+    drawItemInfo.range = resources->drawItemBuffers[frameIndex].size;
+
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 7> writes{};
+    std::array<VkWriteDescriptorSet, 8> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -3979,6 +4204,13 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     writes[6].descriptorCount = 1;
     writes[6].pBufferInfo = &normalInfo;
 
+    writes[7] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[7].dstSet = descriptorSet;
+    writes[7].dstBinding = 7;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[7].descriptorCount = 1;
+    writes[7].pBufferInfo = &drawItemInfo;
+
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -4008,11 +4240,15 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         resources->positionStorageBuffer.size};
     VkDescriptorBufferInfo colorStorageInfo{resources->colorBuffer.buffer, 0, resources->colorBuffer.size};
     VkDescriptorBufferInfo normalInfo{resources->normalBuffer.buffer, 0, resources->normalBuffer.size};
+    VkDescriptorBufferInfo drawItemInfo{
+        resources->exrDrawItemBuffer.buffer,
+        0,
+        resources->exrDrawItemBuffer.size};
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 7> writes{};
+    std::array<VkWriteDescriptorSet, 8> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = resources->exrDescriptorSet;
     writes[0].dstBinding = 0;
@@ -4061,6 +4297,13 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[6].descriptorCount = 1;
     writes[6].pBufferInfo = &normalInfo;
+
+    writes[7] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[7].dstSet = resources->exrDescriptorSet;
+    writes[7].dstBinding = 7;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[7].descriptorCount = 1;
+    writes[7].pBufferInfo = &drawItemInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -4774,8 +5017,10 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->exrStyleBuffer);
     DestroyBuffer(&resources->sampledIndexBuffer);
     DestroyBuffer(&resources->sampledSurfelIndexBuffer);
-    DestroyBuffer(&resources->interactiveSampledIndexBuffer);
-    DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
+    for (auto& drawItemBuffer : resources->drawItemBuffers) {
+        DestroyBuffer(&drawItemBuffer);
+    }
+    DestroyBuffer(&resources->exrDrawItemBuffer);
     for (auto& descriptorSets : resources->descriptorSets) {
         for (auto& descriptorSet : descriptorSets) {
             if (descriptorSet != VK_NULL_HANDLE &&
@@ -4961,6 +5206,34 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
     }
 
     std::uint32_t drawPointCount = 0;
+    const bool worldSurfels =
+        layer.style.geometryMode != renderer::pointcloud::PointCloudGeometryMode::ScreenSprites;
+    const bool adaptiveDrawItemsReady =
+        !forceFullSource &&
+        layer.useAdaptiveDrawItems &&
+        layer.drawPointCount > 0 &&
+        resources->drawItemCount == layer.drawPointCount &&
+        resources->drawItemSignature == layer.adaptiveLodRevision;
+    if (adaptiveDrawItemsReady) {
+        drawPointCount = resources->drawItemCount;
+        if (worldSurfels) {
+            drawPointCount = std::min(drawPointCount, kMaxSurfelEncodedPointCount);
+        }
+        if (drawPointCount == 0) {
+            return false;
+        }
+
+        plan->resources = resources;
+        plan->drawPointCount = drawPointCount;
+        plan->worldSurfels = worldSurfels;
+        plan->drawItemReady = true;
+        return true;
+    }
+
+    if (!forceFullSource && layer.requiresAdaptiveDrawItems) {
+        return false;
+    }
+
     if (forceFullSource) {
         drawPointCount = resources->pointCount;
     } else {
@@ -4972,8 +5245,6 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
         return false;
     }
 
-    const bool worldSurfels =
-        layer.style.geometryMode != renderer::pointcloud::PointCloudGeometryMode::ScreenSprites;
     if (worldSurfels) {
         drawPointCount = std::min(drawPointCount, kMaxSurfelEncodedPointCount);
         if (drawPointCount == 0) {
@@ -4986,17 +5257,9 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
         resources->usingSampledIndices &&
         resources->sampledIndexBuffer.buffer != VK_NULL_HANDLE &&
         (!worldSurfels || resources->sampledSurfelIndexBuffer.buffer != VK_NULL_HANDLE);
-    const bool interactiveSampleReady =
-        !forceFullSource &&
-        !sampledBudgetReady &&
-        drawPointCount < resources->activePointCount &&
-        resources->interactiveSampledIndexBuffer.buffer != VK_NULL_HANDLE &&
-        (!worldSurfels || resources->interactiveSurfelIndexBuffer.buffer != VK_NULL_HANDLE) &&
-        resources->interactiveSampledIndexCount == drawPointCount;
     if (!forceFullSource &&
         !sampledBudgetReady &&
-        drawPointCount < resources->activePointCount &&
-        !interactiveSampleReady) {
+        drawPointCount < resources->activePointCount) {
         drawPointCount = resources->activePointCount;
     }
     if (worldSurfels) {
@@ -5010,7 +5273,6 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
     plan->drawPointCount = drawPointCount;
     plan->worldSurfels = worldSurfels;
     plan->sampledBudgetReady = sampledBudgetReady;
-    plan->interactiveSampleReady = interactiveSampleReady;
     return true;
 }
 
@@ -5070,11 +5332,13 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                 layer.style.depthContribution == renderer::pointcloud::PointCloudDepthContribution::None
             ? renderer::pointcloud::PointCloudDepthContribution::Always
             : layer.style.depthContribution;
+    const std::uint32_t solidCenterFlag = layer.style.solidCenters ? 1U : 0U;
+    const std::uint32_t drawItemFlag = plan.drawItemReady ? 2U : 0U;
     styleGpu.renderControl = glm::uvec4{
         static_cast<std::uint32_t>(effectiveDepthContribution),
         static_cast<std::uint32_t>(layer.style.falloffProfile),
         static_cast<std::uint32_t>(layer.style.geometryMode),
-        layer.style.solidCenters ? 1U : 0U,
+        solidCenterFlag | drawItemFlag,
     };
     styleGpu.renderParams0 = glm::vec4{
         layer.style.exposure,
@@ -5323,17 +5587,10 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
 
     if (plan.worldSurfels) {
         const std::uint32_t surfelVertexCount = plan.drawPointCount * kSurfelVerticesPerPoint;
-        if (plan.sampledBudgetReady) {
+        if (plan.sampledBudgetReady && !plan.drawItemReady) {
             vkCmdBindIndexBuffer(
                 commandBuffer,
                 resources->sampledSurfelIndexBuffer.buffer,
-                0,
-                VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(commandBuffer, surfelVertexCount, 1, 0, 0, 0);
-        } else if (plan.interactiveSampleReady) {
-            vkCmdBindIndexBuffer(
-                commandBuffer,
-                resources->interactiveSurfelIndexBuffer.buffer,
                 0,
                 VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(commandBuffer, surfelVertexCount, 1, 0, 0, 0);
@@ -5355,17 +5612,10 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         vertexBuffers.data(),
         offsets.data());
 
-    if (plan.sampledBudgetReady) {
+    if (plan.sampledBudgetReady && !plan.drawItemReady) {
         vkCmdBindIndexBuffer(
             commandBuffer,
             resources->sampledIndexBuffer.buffer,
-            0,
-            VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(commandBuffer, plan.drawPointCount, 1, 0, 0, 0);
-    } else if (plan.interactiveSampleReady) {
-        vkCmdBindIndexBuffer(
-            commandBuffer,
-            resources->interactiveSampledIndexBuffer.buffer,
             0,
             VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(commandBuffer, plan.drawPointCount, 1, 0, 0, 0);
@@ -5403,10 +5653,11 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     clearValues[8].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[9].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
 
-    const bool fastBasicPointRenderer =
-        request.renderState.pointCloudRendererMode ==
-        renderer::pointcloud::PointCloudRendererMode::FastBasic;
-    const bool forceFullSource = !request.previewDensity && !fastBasicPointRenderer;
+    const bool fastBasicPointRenderer = renderer::pointcloud::PointCloudRendererModeUsesFastBasic(
+        request.renderState.pointCloudRendererMode);
+    const bool forceFullSource =
+        invisible_places::output::PointCloudExportDensityModeUsesFullSource(request.pointCloudDensityMode) ||
+        renderer::pointcloud::PointCloudRendererModeUsesFullSource(request.renderState.pointCloudRendererMode);
     for (const auto& layer : request.renderState.pointCloudLayers) {
         PointCloudDrawPlan plan;
         if (ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
@@ -5623,8 +5874,10 @@ void VulkanViewportShell::RecordCommandBuffer(
         pointSubmittedCount = 0;
         pointPassSubmittedCount = 0;
     }
-    const bool fastBasicPointRenderer =
-        renderState_.pointCloudRendererMode == renderer::pointcloud::PointCloudRendererMode::FastBasic;
+    const bool fastBasicPointRenderer = renderer::pointcloud::PointCloudRendererModeUsesFastBasic(
+        renderState_.pointCloudRendererMode);
+    const bool forceFullSourcePointRenderer = renderer::pointcloud::PointCloudRendererModeUsesFullSource(
+        renderState_.pointCloudRendererMode);
     const VkViewport viewport{
         0.0F,
         0.0F,
@@ -5638,7 +5891,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     if (drawLiveScene) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             PointCloudDrawPlan plan;
-            if (ResolvePointCloudDrawPlan(layer, false, &plan) &&
+            if (ResolvePointCloudDrawPlan(layer, forceFullSourcePointRenderer, &plan) &&
                 UploadPointCloudLayerStyle(layer, plan, frameIndex, false)) {
                 if (collectDiagnostics) {
                     ++pointStyleUploadCount;
@@ -5705,7 +5958,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 if (RecordPointCloudLayerDraw(
                     commandBuffer,
                     layer,
-                    false,
+                    forceFullSourcePointRenderer,
                     pointDepthPrepassPipeline_,
                     surfelDepthPrepassPipeline_,
                     false,
@@ -5745,7 +5998,7 @@ void VulkanViewportShell::RecordCommandBuffer(
             if (RecordPointCloudLayerDraw(
                 commandBuffer,
                 layer,
-                false,
+                forceFullSourcePointRenderer,
                 spritePipeline,
                 surfelPipeline,
                 false,
@@ -5899,7 +6152,7 @@ void VulkanViewportShell::RecordCommandBuffer(
             if (RecordPointCloudLayerDraw(
                 commandBuffer,
                 layer,
-                false,
+                forceFullSourcePointRenderer,
                 pointOpaqueHardDiscPipeline_,
                 surfelOpaqueHardDiscPipeline_,
                 false,

@@ -3,12 +3,15 @@
 #include "io/GaussianSplatData.hpp"
 #include "io/PointCloudData.hpp"
 #include "output/ExrWriter.hpp"
+#include "output/RenderPreset.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
+#include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,6 +47,34 @@ struct ViewportDiagnostics {
     std::uint32_t pointFastBasicDrawCalls = 0;
     std::uint64_t pointFastBasicDrawnPoints = 0;
     std::uint32_t pointDepthPrepassSkippedNoXray = 0;
+    std::uint64_t adaptiveRepresentativeCount = 0;
+    std::uint64_t adaptiveRepresentedSourceCount = 0;
+    std::uint64_t adaptiveVisibleRepresentedSourceCount = 0;
+    std::uint64_t adaptiveEmittedRepresentedSourceCount = 0;
+    std::uint64_t adaptiveCulledRepresentedSourceCount = 0;
+    std::uint32_t adaptiveVisibleFrontierNodeCount = 0;
+    double adaptiveEstimatedFragments = 0.0;
+    double adaptiveFragmentBudget = 0.0;
+    std::uint32_t adaptiveRepresentativeBudget = 0;
+    bool adaptiveRepresentativeBudgetReached = false;
+    bool adaptiveFragmentBudgetReached = false;
+    double adaptiveLodTraversalMs = 0.0;
+    bool adaptiveLodReusedPrevious = false;
+    bool adaptiveLodRuntimeCacheHit = false;
+    bool adaptiveLodAsyncPending = false;
+    double adaptiveLodAsyncPendingAgeMs = 0.0;
+    std::uint64_t adaptiveLodDisplayedCacheAgeFrames = 0;
+    std::uint64_t adaptiveLodStaleTraversalDiscardedCount = 0;
+    std::uint32_t adaptiveGpuIdleWaitCount = 0;
+    std::uint64_t adaptiveDrawItemBytes = 0;
+    std::string adaptiveLodPersistentCacheStatus;
+    std::string adaptiveLodRuntimeStatus;
+    std::string adaptiveLodRequestedDensity;
+    std::string adaptiveLodDisplayedDensity;
+    std::string adaptiveLodFallbackState;
+    double pointDrawItemUploadMs = 0.0;
+    double pointDrawItemWaitMs = 0.0;
+    std::uint32_t pointDrawItemBufferReallocations = 0;
     bool sceneRenderedThisFrame = false;
     bool sceneCacheActive = false;
     double pointCommandRecordMs = 0.0;
@@ -86,14 +117,41 @@ struct SceneRenderState {
     float pointSizeScale = 1.0F;
     float flowTimeSeconds = 0.0F;
     renderer::pointcloud::PointCloudRendererMode pointCloudRendererMode =
-        renderer::pointcloud::PointCloudRendererMode::Beauty;
+        renderer::pointcloud::PointCloudRendererMode::BeautyAdaptive;
 
     struct PointCloudLayerState {
         std::size_t layerId = 0;
         renderer::pointcloud::PointCloudStyleState style{};
         std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
+        std::shared_ptr<const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>> adaptiveDrawItems;
         bool hasSourceRgb = true;
         std::uint32_t drawPointCount = 0;
+        bool useAdaptiveDrawItems = false;
+        bool requiresAdaptiveDrawItems = false;
+        std::uint64_t adaptiveLodRevision = 0;
+        std::uint64_t adaptiveRepresentedSourceCount = 0;
+        std::uint64_t adaptiveVisibleRepresentedSourceCount = 0;
+        std::uint64_t adaptiveEmittedRepresentedSourceCount = 0;
+        std::uint64_t adaptiveCulledRepresentedSourceCount = 0;
+        std::uint32_t adaptiveVisibleFrontierNodeCount = 0;
+        float adaptiveEstimatedFragments = 0.0F;
+        float adaptiveFragmentBudget = 0.0F;
+        std::uint32_t adaptiveRepresentativeBudget = 0;
+        bool adaptiveRepresentativeBudgetReached = false;
+        bool adaptiveFragmentBudgetReached = false;
+        double adaptiveLodTraversalMs = 0.0;
+        bool adaptiveLodReusedPrevious = false;
+        bool adaptiveLodRuntimeCacheHit = false;
+        bool adaptiveLodAsyncPending = false;
+        double adaptiveLodAsyncPendingAgeMs = 0.0;
+        std::uint64_t adaptiveLodDisplayedCacheAgeFrames = 0;
+        std::uint64_t adaptiveLodStaleTraversalDiscardedCount = 0;
+        std::uint64_t adaptiveDrawItemBytes = 0;
+        std::string adaptiveLodPersistentCacheStatus;
+        std::string adaptiveLodRuntimeStatus;
+        std::string adaptiveLodRequestedDensity;
+        std::string adaptiveLodDisplayedDensity;
+        std::string adaptiveLodFallbackState;
     };
 
     struct GaussianSplatLayerState {
@@ -110,7 +168,8 @@ struct PointCloudExrFrameRequest {
     SceneRenderState renderState{};
     std::uint32_t width = 0;
     std::uint32_t height = 0;
-    bool previewDensity = true;
+    invisible_places::output::PointCloudExportDensityMode pointCloudDensityMode =
+        invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
 };
 
 class VulkanViewportShell {
@@ -133,9 +192,6 @@ class VulkanViewportShell {
         const invisible_places::io::LoadedPointCloud& cloud,
         const std::vector<std::uint32_t>& sampledIndices);
     void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
-    void UpdateInteractivePointSampleBuffer(
-        std::size_t layerId,
-        const std::vector<std::uint32_t>& sampledIndices);
     void RemovePointCloud(std::size_t layerId);
     void ClearPointClouds();
     void UploadGaussianSplats(std::size_t layerId, const invisible_places::io::LoadedGaussianSplat& splats);
@@ -189,12 +245,19 @@ class VulkanViewportShell {
         VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
-        BufferAllocation interactiveSampledIndexBuffer{};
-        BufferAllocation interactiveSurfelIndexBuffer{};
+        std::array<BufferAllocation, kFramesInFlight> drawItemBuffers{};
+        BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
         std::uint32_t activePointCount = 0;
-        std::uint32_t interactiveSampledIndexCount = 0;
+        std::uint32_t drawItemCount = 0;
+        std::array<std::uint32_t, kFramesInFlight> drawItemCounts{};
+        std::array<std::uint32_t, kFramesInFlight> drawItemCapacities{};
+        std::uint32_t exrDrawItemCount = 0;
+        std::uint32_t exrDrawItemCapacity = 0;
         std::uint32_t scalarFieldCount = 0;
+        std::uint64_t drawItemSignature = 0;
+        std::array<std::uint64_t, kFramesInFlight> drawItemSignatures{};
+        std::uint64_t exrDrawItemSignature = 0;
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
@@ -206,7 +269,7 @@ class VulkanViewportShell {
         std::uint32_t drawPointCount = 0;
         bool worldSurfels = false;
         bool sampledBudgetReady = false;
-        bool interactiveSampleReady = false;
+        bool drawItemReady = false;
     };
 
     struct ActiveGaussianSplatResources {
@@ -323,6 +386,15 @@ class VulkanViewportShell {
     void CreateImGuiResources();
     void UploadImGuiFonts();
     void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);
+    [[nodiscard]] bool UpdatePointCloudDrawItemBuffer(
+        ActivePointCloudResources* resources,
+        std::size_t frameIndex,
+        const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>* drawItems,
+        std::uint64_t revision);
+    [[nodiscard]] bool UpdatePointCloudExrDrawItemBuffer(
+        ActivePointCloudResources* resources,
+        const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>* drawItems,
+        std::uint64_t revision);
     void UpdatePointCloudDescriptorSet(
         ActivePointCloudResources* resources,
         std::size_t frameIndex,

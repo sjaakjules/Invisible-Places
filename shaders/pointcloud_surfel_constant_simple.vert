@@ -57,7 +57,17 @@ layout(set = 0, binding = 6, std430) readonly buffer SurfelNormals {
     vec4 normals[];
 } surfelNormals;
 
+struct PointDrawItemGpu {
+    uvec4 indices;
+    vec4 params;
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer PointDrawItems {
+    PointDrawItemGpu drawItems[];
+} pointDrawItems;
+
 const uint kSurfelVerticesPerPoint = 6u;
+const uint kRenderControlUseDrawItems = 2u;
 
 const vec2 kSurfelCorners[6] = vec2[](
     vec2(-1.0, -1.0),
@@ -73,6 +83,18 @@ vec4 UnpackRgba8(uint packedColor) {
         float((packedColor >> 8u) & 0xFFu) / 255.0,
         float((packedColor >> 16u) & 0xFFu) / 255.0,
         float((packedColor >> 24u) & 0xFFu) / 255.0);
+}
+
+bool UseDrawItems() {
+    return (styleData.renderControl.w & kRenderControlUseDrawItems) != 0u;
+}
+
+uint SourcePointIndex(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].indices.x : drawIndex;
+}
+
+float DrawItemFootprintDiameterPixels(uint drawIndex) {
+    return UseDrawItems() ? sqrt(max(1.0, pointDrawItems.drawItems[drawIndex].params.w)) : 1.0;
 }
 
 vec3 CameraRight() {
@@ -140,10 +162,21 @@ float ResolveDepthOfFieldWorldRadius(float viewDepth) {
     return max(0.0, blurNdcY * max(0.001, viewDepth) / max(abs(uniforms.projection[1][1]), 1e-5));
 }
 
+float ScreenPointSizePixelsToWorldDiameter(float diameterPixels, float viewDepth) {
+    return max(0.0, diameterPixels) *
+           (2.0 * max(0.001, viewDepth)) /
+           (max(abs(uniforms.projection[1][1]), 1e-5) * max(1.0, uniforms.viewportParameters.y));
+}
+
+float DrawItemFootprintWorldDiameter(uint drawIndex, float viewDepth) {
+    return ScreenPointSizePixelsToWorldDiameter(DrawItemFootprintDiameterPixels(drawIndex), viewDepth);
+}
+
 void main() {
     const uint encodedVertexIndex = uint(gl_VertexIndex);
-    const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
-    const uint cornerIndex = encodedVertexIndex - (pointIndex * kSurfelVerticesPerPoint);
+    const uint drawIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
+    const uint pointIndex = SourcePointIndex(drawIndex);
+    const uint cornerIndex = encodedVertexIndex - (drawIndex * kSurfelVerticesPerPoint);
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
     const vec3 center = surfelPositions.positions[pointIndex].xyz;
@@ -154,7 +187,8 @@ void main() {
     const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
     const float centerDepth = -centerViewPosition.z;
     const float diameter =
-        max(0.0, styleData.surfelDiameterBinding.constantValue.x) +
+        max(max(0.0, styleData.surfelDiameterBinding.constantValue.x),
+            DrawItemFootprintWorldDiameter(drawIndex, centerDepth)) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
     const vec3 offset = (tangent * corner.x + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);

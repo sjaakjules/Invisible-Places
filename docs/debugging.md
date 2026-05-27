@@ -73,7 +73,7 @@ Right now the debug target is most useful for:
 - side-panel lookdev controls,
 - camera shot save/load/interpolation and CPU-assisted pivot picking,
 - animation-path save/load/scrub/edit behaviour,
-- Fast Preview MP4 and preview-density EXR animation export,
+- Fast Preview MP4 and explicit adaptive-density EXR animation export,
 - EXR writer and offline LiDAR tile-rendering tests.
 
 As richer AOVs, full-density final-output validation, command-line rendering, and procedural motion are added, the same debug flow should keep working with the same debug preset and LLDB launch configs.

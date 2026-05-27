@@ -49,6 +49,40 @@ std::vector<invisible_places::camera::CameraState> SliceFrameRange(
 
 }  // namespace
 
+const char* PointCloudExportDensityModeName(PointCloudExportDensityMode mode) {
+    switch (mode) {
+        case PointCloudExportDensityMode::FullSource:
+            return "Full Source";
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+            return "Adaptive High Quality";
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+            return "Match Viewport Adaptive";
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            return "Fast Adaptive Preview";
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            return "Artistic As Preview";
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return "Artistic High Quality";
+    }
+
+    return "Adaptive High Quality";
+}
+
+bool PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode mode) {
+    switch (mode) {
+        case PointCloudExportDensityMode::FullSource:
+            return true;
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return false;
+    }
+
+    return false;
+}
+
 std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(
     const std::vector<invisible_places::camera::CameraShot>& shots,
     const RenderJobSettings& settings) {

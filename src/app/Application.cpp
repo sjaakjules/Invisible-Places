@@ -22,6 +22,7 @@
 #include "renderer/core/VulkanViewportShell.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
+#include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "scene/SceneCatalog.hpp"
 #include "serialization/ProjectDocument.hpp"
@@ -30,6 +31,7 @@
 #include "water/WaterFlow.hpp"
 
 #include <imgui.h>
+#include <Imath/half.h>
 
 #include <algorithm>
 #include <array>
@@ -92,10 +94,15 @@ using PointCloudDepthContribution = invisible_places::renderer::pointcloud::Poin
 using PointCloudFalloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset;
-using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointCloudRendererMode;
 using PointCloudScreenSpriteSizeMode = invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using PointCloudStylisationMode = invisible_places::renderer::pointcloud::PointCloudStylisationMode;
+using PointCloudDrawItemGpu = invisible_places::renderer::pointcloud::PointCloudDrawItemGpu;
+using PointCloudLodTraversalDiagnostics =
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics;
+using PointCloudLodBuildProgress = invisible_places::renderer::pointcloud::PointCloudLodBuildProgress;
+using PointCloudLoadProgress = invisible_places::io::PointCloudLoadProgress;
+using PointCloudExportDensityMode = invisible_places::output::PointCloudExportDensityMode;
 using GaussianSplatStyleState = invisible_places::renderer::gsplat::GaussianSplatStyleState;
 using GaussianSplatColorMode = invisible_places::renderer::gsplat::GaussianSplatColorMode;
 using GaussianSplatDebugMode = invisible_places::renderer::gsplat::GaussianSplatDebugMode;
@@ -150,8 +157,6 @@ using LayerLoadResult = std::variant<
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr std::size_t kMaxPivotSamples = 65536;
-constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
-constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
 constexpr std::string_view kDefaultPointVisualName = invisible_places::app::point_visual::kDefaultName;
 constexpr std::string_view kPresetPointVisualSuffix = invisible_places::app::point_visual::kPresetSuffix;
@@ -176,9 +181,7 @@ struct ProjectSettings {
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
-    PointCloudPreviewLodMode pointCloudPreviewLodMode = PointCloudPreviewLodMode::AutoCameraLod;
-    std::uint64_t interactivePointCap = kDefaultInteractivePointCap;
-    PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::Beauty;
+    PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
     float gaussianSplatFootprintBoost = 1.5F;
     GsplatTransformConvention gsplatTransformConvention = GsplatTransformConvention::AsEncoded;
 };
@@ -216,6 +219,8 @@ struct CameraPanelState {
     std::vector<std::string> multiEditAllowedCameraIds;
     invisible_places::output::AnimationExportMode stillExportMode =
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    invisible_places::output::PointCloudExportDensityMode stillDensityMode =
+        invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
 };
 
 struct CameraPlaybackState {
@@ -280,7 +285,8 @@ struct AnimationPanelState {
     bool previewDepthOfField = false;
     bool dirty = false;
     bool showSplines = true;
-    bool exportPreviewDensity = true;
+    invisible_places::output::PointCloudExportDensityMode exportDensityMode =
+        invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
     bool exportSizeInitialized = false;
     AssociationFilterMode associationFilterMode = AssociationFilterMode::Visible;
     std::filesystem::path associationFilterLayerPath;
@@ -326,8 +332,6 @@ struct AnimationExportWriterState {
     std::string errorMessage;
 };
 
-struct StillCameraPreparationState;
-
 struct ExportLogState {
     std::filesystem::path path;
     std::chrono::system_clock::time_point startedWallTime{};
@@ -366,8 +370,9 @@ struct OfflineRenderJobState {
     std::uint32_t setupViewportHeight = 1;
     std::uint32_t writtenFrameCount = 0;
     std::size_t pendingFrameCount = 0;
-    bool previewDensity = true;
-    PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::Beauty;
+    invisible_places::output::PointCloudExportDensityMode pointCloudDensityMode =
+        invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
+    PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
     bool writerFinishRequested = false;
     bool quickMp4BatchJob = false;
     bool stillCameraJob = false;
@@ -382,37 +387,9 @@ struct OfflineRenderJobState {
     float exportEyeDomeLightingThickness = 1.0F;
     float exportGaussianSplatFootprintBoost = 1.5F;
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportPointCloudLayers;
-    bool preparingExport = false;
-    std::shared_ptr<StillCameraPreparationState> preparationState;
     std::shared_ptr<AnimationExportWriterState> writerState;
     std::shared_ptr<struct OfflineRenderProgressState> progressState;
     std::jthread worker;
-};
-
-struct StillCameraPreviewLodPreparationRequest {
-    std::size_t sessionIndex = 0;
-    std::string displayName;
-    std::uint32_t requestedCount = 0;
-    std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud;
-};
-
-struct StillCameraPreviewLodPreparationResult {
-    std::size_t sessionIndex = 0;
-    std::uint32_t requestedCount = 0;
-    std::vector<std::uint32_t> sampledIndices;
-};
-
-struct StillCameraPreparationState {
-    std::mutex mutex;
-    bool cancelRequested = false;
-    bool cancelled = false;
-    bool completed = false;
-    std::size_t totalRequests = 0;
-    std::size_t completedRequests = 0;
-    std::size_t currentRequestIndex = 0;
-    std::string currentLayerName;
-    std::vector<StillCameraPreviewLodPreparationResult> results;
-    std::string errorMessage;
 };
 
 struct OfflineRenderProgressState {
@@ -469,6 +446,98 @@ struct OfflinePointLayerSnapshot {
 
 using SavedPointVisualState = invisible_places::app::point_visual::VisualState;
 
+struct AdaptiveLodCacheState {
+    bool valid = false;
+    bool coarseFallback = false;
+    std::uint64_t key = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t createdFrame = 0;
+    std::uint64_t lastUsedFrame = 0;
+    std::shared_ptr<const std::vector<PointCloudDrawItemGpu>> drawItems;
+    std::size_t representativeCount = 0;
+    std::uint64_t representedSourceCount = 0;
+    std::uint64_t visibleRepresentedSourceCount = 0;
+    std::uint64_t emittedRepresentedSourceCount = 0;
+    std::uint64_t culledRepresentedSourceCount = 0;
+    std::uint32_t visibleFrontierNodeCount = 0;
+    float estimatedFragments = 0.0F;
+    float fragmentBudget = 0.0F;
+    std::uint32_t representativeBudget = 0;
+    bool representativeBudgetReached = false;
+    bool fragmentBudgetReached = false;
+    double traversalMs = 0.0;
+    std::uint64_t drawItemBytes = 0;
+    float maxRenderDiameterPixels = 0.0F;
+    PointCloudExportDensityMode densityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
+};
+
+struct AdaptiveLodBuildResult {
+    bool available = false;
+    std::shared_ptr<const std::vector<PointCloudDrawItemGpu>> drawItems;
+    std::uint64_t revision = 0;
+    std::size_t representativeCount = 0;
+    std::uint64_t representedSourceCount = 0;
+    std::uint64_t visibleRepresentedSourceCount = 0;
+    std::uint64_t emittedRepresentedSourceCount = 0;
+    std::uint64_t culledRepresentedSourceCount = 0;
+    std::uint32_t visibleFrontierNodeCount = 0;
+    float estimatedFragments = 0.0F;
+    float fragmentBudget = 0.0F;
+    std::uint32_t representativeBudget = 0;
+    bool representativeBudgetReached = false;
+    bool fragmentBudgetReached = false;
+    double traversalMs = 0.0;
+    std::uint64_t drawItemBytes = 0;
+    std::uint64_t displayedCacheAgeFrames = 0;
+    bool reusedPrevious = false;
+    bool runtimeCacheHit = false;
+    bool asyncPending = false;
+    std::uint64_t staleTraversalDiscardedCount = 0;
+    double asyncPendingAgeMs = 0.0;
+    PointCloudExportDensityMode requestedDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
+    PointCloudExportDensityMode displayedDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
+    std::string runtimeStatus;
+    std::string persistentCacheStatus;
+    std::string fallbackState;
+};
+
+struct AdaptiveLodAsyncCompletion {
+    std::uint64_t key = 0;
+    std::uint64_t requestGeneration = 0;
+    PointCloudExportDensityMode densityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
+    std::vector<PointCloudDrawItemGpu> drawItems;
+    float fragmentBudget = 0.0F;
+    std::uint32_t representativeBudget = 0;
+    double traversalMs = 0.0;
+    PointCloudLodTraversalDiagnostics diagnostics{};
+};
+
+struct AdaptiveLodAsyncState {
+    std::mutex mutex;
+    bool running = false;
+    std::uint64_t inFlightKey = 0;
+    std::uint64_t inFlightGeneration = 0;
+    std::uint64_t latestRequestedKey = 0;
+    std::uint64_t latestRequestedGeneration = 0;
+    PointCloudExportDensityMode inFlightDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
+    std::chrono::steady_clock::time_point inFlightStartedAt{};
+    std::optional<AdaptiveLodAsyncCompletion> completed;
+};
+
+struct PointCloudLodBuildCompletion {
+    invisible_places::renderer::pointcloud::PointCloudLodHierarchy hierarchy;
+    bool cacheSaved = false;
+    std::string statusMessage;
+};
+
+struct PointCloudLodBuildAsyncState {
+    std::mutex mutex;
+    bool running = false;
+    PointCloudLodBuildProgress progress{};
+    std::chrono::steady_clock::time_point startedAt{};
+    std::optional<PointCloudLodBuildCompletion> completed;
+};
+
 struct SavedWaterAnimationTrailProfileState {
     std::string name = "Unnamed";
     WaterAnimationTrailSettings settings{};
@@ -494,9 +563,55 @@ struct PreviewLayerSession {
     std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
     std::vector<invisible_places::io::Float3> pivotSamples;
     std::shared_ptr<invisible_places::io::LoadedPointCloud> offlinePointCloud;
-    std::vector<std::uint32_t> previewLodSampledIndices;
-    std::uint32_t previewLodRequestedDrawCount = 0;
-    std::uint32_t previewLodSampledDrawCount = 0;
+    std::shared_ptr<invisible_places::renderer::pointcloud::PointCloudLodHierarchy> pointLodHierarchy;
+    AdaptiveLodCacheState adaptiveLodCache{};
+    AdaptiveLodCacheState adaptiveLodDisplayedBase{};
+    AdaptiveLodCacheState adaptiveLodMotionPatch{};
+    AdaptiveLodCacheState adaptiveLodIdleCandidate{};
+    std::vector<AdaptiveLodCacheState> adaptiveLodRuntimeCache;
+    std::shared_ptr<AdaptiveLodAsyncState> adaptiveLodAsyncState;
+    std::jthread adaptiveLodWorker;
+    std::uint64_t adaptiveLodRevisionCounter = 0;
+    std::uint64_t pointLodHierarchyGeneration = 0;
+    std::shared_ptr<PointCloudLodBuildAsyncState> pointLodBuildState;
+    std::jthread pointLodBuildWorker;
+    invisible_places::renderer::pointcloud::PointCloudLodCacheSource pointLodCacheSource{};
+    std::filesystem::path pointLodCachePath;
+    invisible_places::renderer::pointcloud::PointCloudLodBuildConfig pointLodBuildConfig{};
+    std::string pointLodCacheStatus = "LOD cache unavailable";
+    std::string adaptiveLodRuntimeStatus = "runtime cache empty";
+    bool rebuildPointLodCacheOnLoad = false;
+    PointCloudExportDensityMode adaptiveLodRequestedDensityMode =
+        PointCloudExportDensityMode::AdaptiveHighQuality;
+    PointCloudExportDensityMode adaptiveLodDisplayedDensityMode =
+        PointCloudExportDensityMode::AdaptiveHighQuality;
+    PointCloudExportDensityMode adaptiveMovementDensityMode =
+        PointCloudExportDensityMode::AdaptiveHighQuality;
+    std::chrono::steady_clock::time_point adaptiveQualityLastChangedAt{};
+    std::uint64_t adaptiveLodRequestGeneration = 0;
+    std::uint64_t adaptiveLodStaleTraversalDiscardedCount = 0;
+    std::chrono::steady_clock::time_point adaptiveLodLastAppliedAt{};
+    std::uint64_t adaptiveLodMotionApplyThrottleCount = 0;
+    std::uint64_t adaptiveLodMotionPatchApplyCount = 0;
+    std::uint64_t adaptiveLodCandidateDemotionBlockedCount = 0;
+    std::uint64_t adaptiveLodSkippedMotionPatchCount = 0;
+    std::size_t adaptiveLodMotionPatchRepresentativeCount = 0;
+    std::uint64_t adaptiveLodCoverageGapSourceCount = 0;
+    double adaptiveLodAsyncPendingAgeMs = 0.0;
+    float adaptiveLodEstimatedFragments = 0.0F;
+    float adaptiveLodFragmentBudget = 0.0F;
+    std::uint32_t adaptiveLodRepresentativeBudget = 0;
+    std::uint64_t adaptiveLodVisibleRepresentedSourceCount = 0;
+    std::uint64_t adaptiveLodEmittedRepresentedSourceCount = 0;
+    std::uint64_t adaptiveLodCulledRepresentedSourceCount = 0;
+    std::uint32_t adaptiveLodVisibleFrontierNodeCount = 0;
+    bool adaptiveLodRepresentativeBudgetReached = false;
+    bool adaptiveLodFragmentBudgetReached = false;
+    std::uint64_t adaptiveLodDisplayedCacheAgeFrames = 0;
+    bool adaptiveLodEmergencyDemotion = false;
+    std::string adaptiveLodFallbackState = "none";
+    bool adaptiveLodRuntimeCacheHit = false;
+    bool adaptiveLodAsyncPending = false;
     PointBudgetState pointBudget{};
     PointCloudStyleState pointStyle{};
     std::vector<SavedPointVisualState> pointVisuals;
@@ -505,9 +620,25 @@ struct PreviewLayerSession {
     GaussianSplatStyleState gsplatStyle{};
 };
 
+struct AdaptiveLodPreviewSummary {
+    bool available = false;
+    std::size_t representativeCount = 0;
+    std::uint64_t representedSourceCount = 0;
+    double traversalMs = 0.0;
+    bool reusedPrevious = false;
+};
+
+struct PointCloudLodBuildProgressSnapshot {
+    bool available = false;
+    bool running = false;
+    PointCloudLodBuildProgress progress{};
+    std::chrono::steady_clock::time_point startedAt{};
+};
+
 struct BackgroundLayerLoadState {
     std::mutex mutex;
     std::optional<LayerLoadResult> result;
+    std::optional<PointCloudLoadProgress> pointCloudProgress;
 };
 
 struct PendingLayerLoad {
@@ -681,6 +812,11 @@ struct PreviewRuntimeState {
     bool pauseLiveViewportDuringExport = true;
     bool previewRenderStateSignatureValid = false;
     std::uint64_t previewRenderStateSignature = 0;
+    double previewSceneUpdateMs = 0.0;
+    double previewSceneUpdateFps = 0.0;
+    bool previewSceneStateChanged = false;
+    bool previewAdaptiveLodReusedPrevious = false;
+    std::uint64_t previewFrameCounter = 0;
     std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
     std::string statusMessage;
     std::string errorMessage;
@@ -712,6 +848,46 @@ std::string FormatFixed(double value, int precision) {
     return output.str();
 }
 
+std::string FormatElapsedTime(std::chrono::steady_clock::duration elapsed) {
+    const auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    const auto minutes = totalSeconds / 60;
+    const auto seconds = totalSeconds % 60;
+    std::ostringstream output;
+    output << minutes << "m " << seconds << "s";
+    return output.str();
+}
+
+std::string FormatPercent(double fraction) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(fraction >= 0.995 ? 0 : 1)
+           << std::clamp(fraction, 0.0, 1.0) * 100.0 << '%';
+    return output.str();
+}
+
+std::optional<std::chrono::steady_clock::duration> EstimateRemainingTime(
+    std::uint64_t completed,
+    std::uint64_t total,
+    std::chrono::steady_clock::duration elapsed) {
+    if (completed == 0U || total == 0U || completed >= total || elapsed < std::chrono::seconds{2}) {
+        return std::nullopt;
+    }
+    const double elapsedSeconds = std::chrono::duration<double>(elapsed).count();
+    const double totalSeconds = elapsedSeconds * (static_cast<double>(total) / static_cast<double>(completed));
+    const double remainingSeconds = std::max(0.0, totalSeconds - elapsedSeconds);
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>{remainingSeconds});
+}
+
+std::string FormatEta(std::optional<std::chrono::steady_clock::duration> remaining) {
+    return remaining.has_value() ? FormatElapsedTime(remaining.value()) : std::string{"estimating"};
+}
+
+double MillisecondsBetween(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 std::string NormalizePathKey(const std::filesystem::path& path) {
     return path.lexically_normal().generic_string();
 }
@@ -732,6 +908,76 @@ std::filesystem::path DefaultAnimationDirectory(const std::filesystem::path& dat
     return dataRoot.parent_path() / "Saved" / "animations";
 }
 
+std::filesystem::path PointCloudLodCacheDirectory(const PreviewRuntimeState& runtimeState) {
+    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
+    return projectPath.empty() ? std::filesystem::path{"Saved"} / "lod" : projectPath.parent_path() / "lod";
+}
+
+std::uint32_t RemovePointCloudLodCacheFiles(
+    const std::filesystem::path& activeCachePath,
+    std::string* errorMessage = nullptr) {
+    if (activeCachePath.empty()) {
+        return 0U;
+    }
+
+    const auto directory = activeCachePath.parent_path();
+    const auto activeFilename = activeCachePath.filename().string();
+    constexpr std::string_view kCacheVersionMarker = "-PointCloudLodCache-v";
+    const auto markerPosition = activeFilename.find(kCacheVersionMarker);
+    std::uint32_t removedCount = 0U;
+
+    auto removeFile = [&](const std::filesystem::path& path) {
+        std::error_code removeError;
+        const bool removed = std::filesystem::remove(path, removeError);
+        if (removeError && errorMessage != nullptr) {
+            if (!errorMessage->empty()) {
+                errorMessage->append("; ");
+            }
+            errorMessage->append(removeError.message());
+        }
+        if (removed) {
+            ++removedCount;
+        }
+    };
+
+    if (markerPosition == std::string::npos || directory.empty()) {
+        removeFile(activeCachePath);
+        return removedCount;
+    }
+
+    std::error_code existsError;
+    if (!std::filesystem::exists(directory, existsError)) {
+        return 0U;
+    }
+
+    const std::string cachePrefix =
+        activeFilename.substr(0, markerPosition) + std::string{kCacheVersionMarker};
+    std::error_code iterationError;
+    for (const auto& entry : std::filesystem::directory_iterator{directory, iterationError}) {
+        if (iterationError) {
+            break;
+        }
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const auto candidateFilename = entry.path().filename().string();
+        const bool matchingSource =
+            candidateFilename.rfind(cachePrefix, 0U) == 0U &&
+            candidateFilename.size() > cachePrefix.size() + 4U &&
+            candidateFilename.ends_with(".bin");
+        if (matchingSource) {
+            removeFile(entry.path());
+        }
+    }
+    if (iterationError && errorMessage != nullptr) {
+        if (!errorMessage->empty()) {
+            errorMessage->append("; ");
+        }
+        errorMessage->append(iterationError.message());
+    }
+    return removedCount;
+}
+
 std::string DescribeBudget(const PointBudgetState& budget) {
     std::ostringstream output;
     output << FormatPointCount(budget.activePoints) << " / " << FormatPointCount(budget.totalPoints)
@@ -739,54 +985,35 @@ std::string DescribeBudget(const PointBudgetState& budget) {
     return output.str();
 }
 
-invisible_places::renderer::pointcloud::PointCloudPreviewLodDecision ResolvePointCloudPreviewLodDecision(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
-    return invisible_places::renderer::pointcloud::ResolvePointCloudPreviewLod(
-        session.pointBudget,
-        runtimeState.projectSettings.pointCloudPreviewLodMode,
-        runtimeState.cameraInteraction.navigationActive,
-        runtimeState.cameraPlayback.active || runtimeState.animationPlayback.active,
-        kPointCloudPreviewLodTarget);
+bool FastBasicPointRendererActive(const ProjectSettings& settings) {
+    return invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFastBasic(
+        settings.pointCloudRendererMode);
 }
 
-bool FastBasicPointRendererActive(const ProjectSettings& settings) {
-    return settings.pointCloudRendererMode == PointCloudRendererMode::FastBasic;
+bool FullSourcePointRendererActive(const ProjectSettings& settings) {
+    return invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFullSource(
+        settings.pointCloudRendererMode);
+}
+
+bool PaintedAdaptivePointRendererActive(const ProjectSettings& settings) {
+    return invisible_places::renderer::pointcloud::PointCloudRendererModeUsesPaintedStyle(
+        settings.pointCloudRendererMode);
 }
 
 std::uint64_t EffectivePointDrawCount(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
-    if (FastBasicPointRendererActive(runtimeState.projectSettings)) {
-        return session.pointBudget.activePoints;
-    }
-
-    const auto decision = ResolvePointCloudPreviewLodDecision(runtimeState, session);
-    if (!decision.usesPreviewLod) {
-        return decision.drawPointCount;
-    }
-
-    if (session.previewLodSampledDrawCount == 0) {
-        return session.pointBudget.activePoints;
-    }
-
-    return std::min<std::uint64_t>(
-        session.previewLodSampledDrawCount,
-        decision.drawPointCount);
-}
-
-bool PointCloudPreviewLodApplied(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
-    return EffectivePointDrawCount(runtimeState, session) < session.pointBudget.activePoints;
+    static_cast<void>(runtimeState);
+    return session.pointBudget.activePoints;
 }
 
 std::string DescribePointCloudPreviewDraw(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
+    static_cast<void>(runtimeState);
     std::ostringstream output;
-    output << FormatPointCount(EffectivePointDrawCount(runtimeState, session)) << " / "
-           << FormatPointCount(session.pointBudget.activePoints) << " points";
+    output << FormatPointCount(session.pointBudget.activePoints) << " / "
+           << FormatPointCount(session.pointBudget.totalPoints) << " source points";
     return output.str();
 }
 
@@ -802,180 +1029,6 @@ PointBudgetState MakePreviewPointBudgetState(
     return invisible_places::renderer::pointcloud::MakePointBudgetState(
         session.totalPrimitives,
         requestedPoints);
-}
-
-void ClearPreviewLodSampleCache(PreviewLayerSession* session) {
-    if (session == nullptr) {
-        return;
-    }
-
-    session->previewLodSampledIndices.clear();
-    session->previewLodRequestedDrawCount = 0;
-    session->previewLodSampledDrawCount = 0;
-}
-
-std::uint32_t RequestedPreviewLodSampleCount(
-    const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
-    if (FastBasicPointRendererActive(runtimeState.projectSettings)) {
-        return 0;
-    }
-
-    const std::uint64_t targetPoints = kPointCloudPreviewLodTarget;
-    if (session.kind != LayerKind::PointCloud ||
-        session.pointBudget.UsesSampledIndices() ||
-        session.pointBudget.activePoints == 0 ||
-        targetPoints >= session.pointBudget.activePoints) {
-        return 0;
-    }
-
-    return static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        std::max<std::uint64_t>(1ULL, targetPoints),
-        std::numeric_limits<std::uint32_t>::max()));
-}
-
-void PreparePreviewLodSampleCache(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport,
-    std::size_t sessionIndex) {
-    if (runtimeState == nullptr || viewport == nullptr || sessionIndex >= runtimeState->sessions.size()) {
-        return;
-    }
-
-    auto& session = runtimeState->sessions[sessionIndex];
-    if (!session.loaded ||
-        session.kind != LayerKind::PointCloud ||
-        session.offlinePointCloud == nullptr) {
-        ClearPreviewLodSampleCache(&session);
-        viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices);
-        return;
-    }
-
-    const auto requestedCount = RequestedPreviewLodSampleCount(*runtimeState, session);
-    if (requestedCount == 0) {
-        ClearPreviewLodSampleCache(&session);
-        viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices);
-        return;
-    }
-
-    if (session.previewLodRequestedDrawCount == requestedCount &&
-        session.previewLodSampledDrawCount > 0) {
-        return;
-    }
-
-    session.previewLodSampledIndices =
-        invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
-            session.offlinePointCloud->positions,
-            session.offlinePointCloud->bounds,
-            requestedCount);
-    session.previewLodRequestedDrawCount = requestedCount;
-    session.previewLodSampledDrawCount =
-        static_cast<std::uint32_t>(session.previewLodSampledIndices.size());
-    viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices);
-}
-
-void PreparePreviewLodSampleCaches(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr) {
-        return;
-    }
-
-    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
-        PreparePreviewLodSampleCache(runtimeState, viewport, sessionIndex);
-    }
-}
-
-std::vector<StillCameraPreviewLodPreparationRequest> BuildStillCameraPreviewLodPreparationRequests(
-    const PreviewRuntimeState& runtimeState) {
-    std::vector<StillCameraPreviewLodPreparationRequest> requests;
-    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
-        const auto& session = runtimeState.sessions[sessionIndex];
-        if (!session.loaded ||
-            !session.visible ||
-            session.kind != LayerKind::PointCloud ||
-            session.offlinePointCloud == nullptr) {
-            continue;
-        }
-
-        const auto requestedCount = RequestedPreviewLodSampleCount(runtimeState, session);
-        if (requestedCount == 0 ||
-            (session.previewLodRequestedDrawCount == requestedCount &&
-             session.previewLodSampledDrawCount > 0)) {
-            continue;
-        }
-
-        requests.push_back(
-            {.sessionIndex = sessionIndex,
-             .displayName = session.displayName,
-             .requestedCount = requestedCount,
-             .cloud = session.offlinePointCloud});
-    }
-    return requests;
-}
-
-void RunStillCameraPreviewLodPreparationWorker(
-    std::stop_token stopToken,
-    std::vector<StillCameraPreviewLodPreparationRequest> requests,
-    std::shared_ptr<StillCameraPreparationState> preparationState) {
-    if (preparationState == nullptr) {
-        return;
-    }
-
-    {
-        std::scoped_lock lock(preparationState->mutex);
-        preparationState->totalRequests = requests.size();
-        preparationState->completedRequests = 0;
-        preparationState->currentRequestIndex = 0;
-        preparationState->currentLayerName.clear();
-    }
-
-    try {
-        for (std::size_t requestIndex = 0; requestIndex < requests.size(); ++requestIndex) {
-            const auto& request = requests[requestIndex];
-            {
-                std::scoped_lock lock(preparationState->mutex);
-                if (preparationState->cancelRequested || stopToken.stop_requested()) {
-                    preparationState->cancelled = true;
-                    preparationState->completed = true;
-                    return;
-                }
-                preparationState->currentRequestIndex = requestIndex;
-                preparationState->currentLayerName = request.displayName;
-            }
-
-            std::vector<std::uint32_t> sampledIndices;
-            if (request.cloud != nullptr) {
-                sampledIndices =
-                    invisible_places::renderer::pointcloud::GenerateSpatialSampleIndices(
-                        request.cloud->positions,
-                        request.cloud->bounds,
-                        request.requestedCount);
-            }
-
-            {
-                std::scoped_lock lock(preparationState->mutex);
-                if (preparationState->cancelRequested || stopToken.stop_requested()) {
-                    preparationState->cancelled = true;
-                    preparationState->completed = true;
-                    return;
-                }
-                preparationState->results.push_back(
-                    {.sessionIndex = request.sessionIndex,
-                     .requestedCount = request.requestedCount,
-                     .sampledIndices = std::move(sampledIndices)});
-                preparationState->completedRequests = requestIndex + 1U;
-            }
-        }
-    } catch (const std::exception& error) {
-        std::scoped_lock lock(preparationState->mutex);
-        preparationState->errorMessage = "Still-camera EXR preparation failed: " + std::string{error.what()};
-        preparationState->completed = true;
-        return;
-    }
-
-    std::scoped_lock lock(preparationState->mutex);
-    preparationState->completed = true;
 }
 
 const char* LayerKindLabel(LayerKind kind) {
@@ -1030,28 +1083,21 @@ const char* PointCloudColormapLabel(PointCloudColormapId colormap) {
     return "Viridis";
 }
 
-const char* PointCloudPreviewLodModeLabel(PointCloudPreviewLodMode mode) {
-    switch (mode) {
-        case PointCloudPreviewLodMode::FullResolution:
-            return "Full Resolution";
-        case PointCloudPreviewLodMode::AutoCameraLod:
-            return "Auto Camera LOD";
-        case PointCloudPreviewLodMode::ForceLod:
-            return "Force LOD";
-    }
-
-    return "Unknown";
-}
-
 const char* PointCloudRendererModeLabel(PointCloudRendererMode mode) {
     switch (mode) {
-        case PointCloudRendererMode::Beauty:
-            return "Beauty";
         case PointCloudRendererMode::FastBasic:
             return "Fast Basic";
+        case PointCloudRendererMode::FastBasicSource:
+            return "Fast Basic Source";
+        case PointCloudRendererMode::BeautyAdaptive:
+            return "Beauty Adaptive";
+        case PointCloudRendererMode::BeautyFullSource:
+            return "Beauty Full Source";
+        case PointCloudRendererMode::PaintedAdaptive:
+            return "Painted Adaptive";
     }
 
-    return "Beauty";
+    return "Beauty Adaptive";
 }
 
 const char* GaussianSplatColorModeLabel(GaussianSplatColorMode mode) {
@@ -1326,6 +1372,17 @@ std::uint64_t RenderStateSignature(
         HashScalarFields(&seed, layer.scalarFields);
         HashBool(&seed, layer.hasSourceRgb);
         HashCombine(&seed, layer.drawPointCount);
+        HashBool(&seed, layer.useAdaptiveDrawItems);
+        HashBool(&seed, layer.requiresAdaptiveDrawItems);
+        if (layer.useAdaptiveDrawItems) {
+            HashCombine(&seed, layer.adaptiveLodRevision);
+            HashCombine(&seed, layer.adaptiveRepresentedSourceCount);
+            HashBool(&seed, layer.adaptiveLodReusedPrevious);
+            HashBool(&seed, layer.adaptiveLodRuntimeCacheHit);
+            HashBool(&seed, layer.adaptiveLodAsyncPending);
+            HashString(&seed, layer.adaptiveLodRequestedDensity);
+            HashString(&seed, layer.adaptiveLodDisplayedDensity);
+        }
     }
     HashCombine(&seed, renderState.gaussianSplatLayers.size());
     for (const auto& layer : renderState.gaussianSplatLayers) {
@@ -2673,6 +2730,1744 @@ ImVec2 CurrentFramebufferViewportSize(const invisible_places::renderer::core::Vu
     };
 }
 
+std::uint32_t ManualAdaptiveDrawItemCap(const PreviewLayerSession& session) {
+    if (session.pointBudget.totalPoints == 0 ||
+        session.pointBudget.activePoints == 0 ||
+        session.pointBudget.activePoints >= session.pointBudget.totalPoints) {
+        return 0U;
+    }
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(
+            session.pointBudget.activePoints,
+            std::numeric_limits<std::uint32_t>::max()));
+}
+
+std::uint64_t CountRepresentedSourcePoints(const std::vector<PointCloudDrawItemGpu>& drawItems) {
+    return std::accumulate(
+        drawItems.begin(),
+        drawItems.end(),
+        std::uint64_t{0},
+        [](std::uint64_t total, const PointCloudDrawItemGpu& drawItem) {
+            return total + drawItem.representedSourceCount;
+        });
+}
+
+float EstimateSubmittedFragments(const std::vector<PointCloudDrawItemGpu>& drawItems) {
+    return std::accumulate(
+        drawItems.begin(),
+        drawItems.end(),
+        0.0F,
+        [](float total, const PointCloudDrawItemGpu& drawItem) {
+            return total + std::max(0.0F, drawItem.footprintAreaPixels);
+        });
+}
+
+float MaxDrawItemRenderDiameterPixels(const std::vector<PointCloudDrawItemGpu>& drawItems) {
+    return std::accumulate(
+        drawItems.begin(),
+        drawItems.end(),
+        0.0F,
+        [](float maximum, const PointCloudDrawItemGpu& drawItem) {
+            return std::max(maximum, std::sqrt(std::max(1.0F, drawItem.renderAreaPixels)));
+        });
+}
+
+void HashQuantizedFloat(std::uint64_t* seed, float value, float scale) {
+    if (seed == nullptr) {
+        return;
+    }
+    const auto quantized = static_cast<std::int64_t>(std::llround(static_cast<double>(value) * scale));
+    HashCombine(seed, static_cast<std::uint64_t>(quantized) ^ 0x9e3779b97f4a7c15ULL);
+}
+
+void HashQuantizedVec3(std::uint64_t* seed, const glm::vec3& value, float scale) {
+    HashQuantizedFloat(seed, value.x, scale);
+    HashQuantizedFloat(seed, value.y, scale);
+    HashQuantizedFloat(seed, value.z, scale);
+}
+
+void HashQuantizedMat4(std::uint64_t* seed, const glm::mat4& value, float scale) {
+    for (std::size_t column = 0; column < 4; ++column) {
+        for (std::size_t row = 0; row < 4; ++row) {
+            HashQuantizedFloat(seed, value[column][row], scale);
+        }
+    }
+}
+
+std::uint64_t DrawItemByteCount(std::size_t drawItemCount) {
+    return static_cast<std::uint64_t>(drawItemCount) * sizeof(PointCloudDrawItemGpu);
+}
+
+std::uint32_t AdaptiveViewportRepresentativeBudget(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    bool fastBasicProfile,
+    std::uint64_t sourcePointCount) {
+    const auto pixelCount = static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, viewportWidth)) *
+                            static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, viewportHeight));
+    std::uint64_t budget = 0;
+    std::uint64_t cap = 8'000'000ULL;
+    switch (densityMode) {
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            budget = fastBasicProfile ? pixelCount / 8ULL : pixelCount / 96ULL;
+            cap = fastBasicProfile ? 4'000'000ULL : 8'000'000ULL;
+            break;
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            budget = fastBasicProfile ? pixelCount / 2ULL : pixelCount / 8ULL;
+            cap = fastBasicProfile ? 8'000'000ULL : 8'000'000ULL;
+            break;
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            budget = fastBasicProfile ? pixelCount : pixelCount / 3ULL;
+            cap = fastBasicProfile ? 16'000'000ULL : 8'000'000ULL;
+            break;
+        case PointCloudExportDensityMode::FullSource:
+            return 0U;
+    }
+    budget = std::clamp<std::uint64_t>(budget, 1024ULL, cap);
+    if (sourcePointCount > 0ULL) {
+        budget = std::min(budget, sourcePointCount);
+    }
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(budget, std::numeric_limits<std::uint32_t>::max()));
+}
+
+float AdaptiveViewportFragmentBudget(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    bool fastBasicProfile) {
+    const float pixelCount = static_cast<float>(std::max<std::uint32_t>(1U, viewportWidth)) *
+                             static_cast<float>(std::max<std::uint32_t>(1U, viewportHeight));
+    switch (densityMode) {
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            return pixelCount * (fastBasicProfile ? 8.0F : 1.5F);
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            return pixelCount * (fastBasicProfile ? 32.0F : 8.0F);
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return pixelCount * (fastBasicProfile ? 96.0F : 16.0F);
+        case PointCloudExportDensityMode::FullSource:
+            return 0.0F;
+    }
+    return pixelCount * 4.0F;
+}
+
+PointCloudExportDensityMode AdaptiveHighQualityMode(bool paintedAdaptive) {
+    return paintedAdaptive ? PointCloudExportDensityMode::ArtisticHighQuality
+                           : PointCloudExportDensityMode::AdaptiveHighQuality;
+}
+
+PointCloudExportDensityMode AdaptiveViewportQualityMode(bool paintedAdaptive) {
+    return paintedAdaptive ? PointCloudExportDensityMode::ArtisticAsPreview
+                           : PointCloudExportDensityMode::MatchViewportAdaptive;
+}
+
+PointCloudExportDensityMode NormalizeAdaptiveQualityMode(
+    PointCloudExportDensityMode mode,
+    bool paintedAdaptive) {
+    switch (mode) {
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return AdaptiveHighQualityMode(paintedAdaptive);
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            return AdaptiveViewportQualityMode(paintedAdaptive);
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            return PointCloudExportDensityMode::FastAdaptivePreview;
+        case PointCloudExportDensityMode::FullSource:
+            return AdaptiveHighQualityMode(paintedAdaptive);
+    }
+    return AdaptiveHighQualityMode(paintedAdaptive);
+}
+
+int AdaptiveLodDensityQualityRank(PointCloudExportDensityMode mode) {
+    switch (mode) {
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            return 1;
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            return 2;
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return 3;
+        case PointCloudExportDensityMode::FullSource:
+            return 4;
+    }
+    return 0;
+}
+
+int AdaptiveLodEntryQualityRank(const AdaptiveLodCacheState& entry) {
+    if (!entry.valid) {
+        return 0;
+    }
+    if (entry.coarseFallback) {
+        return -1;
+    }
+    return AdaptiveLodDensityQualityRank(entry.densityMode);
+}
+
+std::uint64_t AdaptiveLodCandidateVisibleSourceCount(
+    const std::vector<PointCloudDrawItemGpu>& drawItems,
+    const PointCloudLodTraversalDiagnostics& diagnostics) {
+    if (diagnostics.visibleFrontierRepresentedSourceCount > 0ULL) {
+        return diagnostics.visibleFrontierRepresentedSourceCount;
+    }
+    if (diagnostics.emittedRepresentedSourceCount > 0ULL) {
+        return diagnostics.emittedRepresentedSourceCount;
+    }
+    return CountRepresentedSourcePoints(drawItems);
+}
+
+bool AdaptiveLodCandidateWouldDemoteDisplayed(
+    const PreviewLayerSession& session,
+    PointCloudExportDensityMode candidateDensityMode,
+    bool candidateCoarseFallback) {
+    if (!session.adaptiveLodDisplayedBase.valid && !session.adaptiveLodCache.valid) {
+        return false;
+    }
+    const auto& displayed =
+        session.adaptiveLodDisplayedBase.valid ? session.adaptiveLodDisplayedBase : session.adaptiveLodCache;
+    if (!displayed.valid || displayed.coarseFallback) {
+        return false;
+    }
+    if (candidateCoarseFallback) {
+        return true;
+    }
+    return AdaptiveLodDensityQualityRank(candidateDensityMode) < AdaptiveLodEntryQualityRank(displayed);
+}
+
+const char* AdaptiveLodDisplayKind(const AdaptiveLodCacheState& entry) {
+    if (!entry.valid) {
+        return "none";
+    }
+    if (entry.coarseFallback) {
+        return "coarse fallback";
+    }
+    return "exact traversal";
+}
+
+PointCloudExportDensityMode DemoteAdaptiveQuality(
+    PointCloudExportDensityMode mode,
+    bool paintedAdaptive) {
+    mode = NormalizeAdaptiveQualityMode(mode, paintedAdaptive);
+    if (mode == AdaptiveHighQualityMode(paintedAdaptive)) {
+        return AdaptiveViewportQualityMode(paintedAdaptive);
+    }
+    if (mode == AdaptiveViewportQualityMode(paintedAdaptive)) {
+        return PointCloudExportDensityMode::FastAdaptivePreview;
+    }
+    return PointCloudExportDensityMode::FastAdaptivePreview;
+}
+
+PointCloudExportDensityMode PromoteAdaptiveQuality(
+    PointCloudExportDensityMode mode,
+    bool paintedAdaptive) {
+    mode = NormalizeAdaptiveQualityMode(mode, paintedAdaptive);
+    if (mode == PointCloudExportDensityMode::FastAdaptivePreview) {
+        return AdaptiveViewportQualityMode(paintedAdaptive);
+    }
+    if (mode == AdaptiveViewportQualityMode(paintedAdaptive)) {
+        return AdaptiveHighQualityMode(paintedAdaptive);
+    }
+    return AdaptiveHighQualityMode(paintedAdaptive);
+}
+
+double LastAdaptivePerformanceFps(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    std::vector<double> samples;
+    if (runtimeState.previewSceneUpdateFps > 0.0) {
+        samples.push_back(runtimeState.previewSceneUpdateFps);
+    }
+    const auto& diagnostics = viewport.Diagnostics();
+    if (diagnostics.averageFrameFps > 0.0) {
+        samples.push_back(diagnostics.averageFrameFps);
+    } else if (diagnostics.frameFps > 0.0) {
+        samples.push_back(diagnostics.frameFps);
+    }
+    if (samples.empty()) {
+        return 60.0;
+    }
+    return *std::min_element(samples.begin(), samples.end());
+}
+
+PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    PreviewLayerSession* session,
+    bool paintedAdaptive,
+    bool fastBasicViewport) {
+    if (session == nullptr) {
+        return AdaptiveHighQualityMode(paintedAdaptive);
+    }
+
+    const auto highQuality = AdaptiveHighQualityMode(paintedAdaptive);
+    session->adaptiveLodEmergencyDemotion = false;
+    session->adaptiveMovementDensityMode = NormalizeAdaptiveQualityMode(
+        session->adaptiveMovementDensityMode,
+        paintedAdaptive);
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto lastChanged = session->adaptiveQualityLastChangedAt;
+    const auto sinceChange =
+        lastChanged.time_since_epoch().count() == 0
+            ? std::chrono::milliseconds{1000}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(now - lastChanged);
+    constexpr double kAdaptiveDemoteFps = 15.0;
+    constexpr double kAdaptivePromoteFps = 45.0;
+    constexpr auto kMovementQualityStepDelay = std::chrono::milliseconds{350};
+    constexpr auto kIdleQualityStepDelay = std::chrono::milliseconds{280};
+    const auto movementQualityStepDelay =
+        fastBasicViewport ? std::chrono::milliseconds{120} : kMovementQualityStepDelay;
+    const auto idleQualityStepDelay =
+        fastBasicViewport ? std::chrono::milliseconds{300} : kIdleQualityStepDelay;
+
+    auto setQuality = [&](PointCloudExportDensityMode next) {
+        next = NormalizeAdaptiveQualityMode(next, paintedAdaptive);
+        if (next != session->adaptiveMovementDensityMode) {
+            session->adaptiveMovementDensityMode = next;
+            session->adaptiveQualityLastChangedAt = now;
+        }
+    };
+
+    const bool adaptiveInteractionActive =
+        fastBasicViewport ? runtimeState.cameraInteraction.navigationActive : runtimeState.performanceInteraction.active;
+
+    if (!adaptiveInteractionActive) {
+        if (session->adaptiveMovementDensityMode != highQuality &&
+            sinceChange >= idleQualityStepDelay) {
+            setQuality(PromoteAdaptiveQuality(session->adaptiveMovementDensityMode, paintedAdaptive));
+        }
+        session->adaptiveLodEmergencyDemotion =
+            fastBasicViewport &&
+            session->adaptiveMovementDensityMode == PointCloudExportDensityMode::FastAdaptivePreview;
+        return session->adaptiveMovementDensityMode;
+    }
+
+    const double measuredFps = LastAdaptivePerformanceFps(runtimeState, viewport);
+    if (measuredFps < kAdaptiveDemoteFps && sinceChange >= movementQualityStepDelay) {
+        setQuality(DemoteAdaptiveQuality(session->adaptiveMovementDensityMode, paintedAdaptive));
+    } else if (measuredFps > kAdaptivePromoteFps && sinceChange >= movementQualityStepDelay) {
+        setQuality(PromoteAdaptiveQuality(session->adaptiveMovementDensityMode, paintedAdaptive));
+    }
+    session->adaptiveLodEmergencyDemotion =
+        fastBasicViewport &&
+        session->adaptiveMovementDensityMode == PointCloudExportDensityMode::FastAdaptivePreview;
+    return session->adaptiveMovementDensityMode;
+}
+
+invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams(
+    const PreviewLayerSession& session,
+    const PointCloudStyleState& style,
+    const glm::mat4& viewProjection,
+    const glm::vec3& cameraPosition,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    bool fastBasicProfile) {
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.viewProjection = viewProjection;
+    params.cameraPosition = cameraPosition;
+    params.viewportWidth = std::max<std::uint32_t>(1U, viewportWidth);
+    params.viewportHeight = std::max<std::uint32_t>(1U, viewportHeight);
+    params.style = style;
+    params.densityMode = densityMode;
+    params.maxRepresentatives = AdaptiveViewportRepresentativeBudget(
+        params.viewportWidth,
+        params.viewportHeight,
+        densityMode,
+        fastBasicProfile,
+        session.totalPrimitives);
+    params.maxEstimatedFragments = AdaptiveViewportFragmentBudget(
+        params.viewportWidth,
+        params.viewportHeight,
+        densityMode,
+        fastBasicProfile);
+    switch (densityMode) {
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            params.maxRepresentativeDiameterPixels = fastBasicProfile ? 32.0F : 48.0F;
+            break;
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            params.maxRepresentativeDiameterPixels = fastBasicProfile ? 24.0F : 32.0F;
+            break;
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            params.maxRepresentativeDiameterPixels = fastBasicProfile ? 16.0F : 24.0F;
+            break;
+        case PointCloudExportDensityMode::FullSource:
+            params.maxRepresentativeDiameterPixels = 0.0F;
+            break;
+    }
+    const auto manualCap = ManualAdaptiveDrawItemCap(session);
+    if (manualCap > 0U) {
+        params.maxDrawItems = manualCap;
+        params.maxRepresentatives = params.maxRepresentatives == 0U
+                                        ? manualCap
+                                        : std::min(params.maxRepresentatives, manualCap);
+    }
+    return params;
+}
+
+std::uint64_t AdaptiveLodTraversalKey(
+    const PreviewLayerSession& session,
+    const PointCloudStyleState& style,
+    const glm::mat4& viewProjection,
+    const glm::vec3& cameraPosition,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode) {
+    std::uint64_t seed = 1469598103934665603ULL;
+    HashQuantizedMat4(&seed, viewProjection, 4096.0F);
+    HashQuantizedVec3(&seed, cameraPosition, 1024.0F);
+    HashCombine(&seed, std::max<std::uint32_t>(1U, viewportWidth));
+    HashCombine(&seed, std::max<std::uint32_t>(1U, viewportHeight));
+    HashCombine(&seed, static_cast<std::uint64_t>(densityMode));
+    HashCombine(&seed, ManualAdaptiveDrawItemCap(session));
+    HashCombine(
+        &seed,
+        session.pointLodHierarchy == nullptr ? 0ULL : session.pointLodHierarchy->sourcePointCount);
+    HashCombine(&seed, session.pointLodHierarchyGeneration);
+    HashPointStyle(&seed, style);
+    return seed;
+}
+
+AdaptiveLodCacheState* FindAdaptiveLodCacheEntry(
+    PreviewLayerSession* session,
+    std::uint64_t traversalKey,
+    bool requireFinished = true) {
+    if (session == nullptr) {
+        return nullptr;
+    }
+    for (auto& entry : session->adaptiveLodRuntimeCache) {
+        if (entry.valid && entry.key == traversalKey && entry.drawItems != nullptr &&
+            (!requireFinished || !entry.coarseFallback)) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+AdaptiveLodCacheState* FindReusableAdaptiveLodCacheEntry(
+    PreviewLayerSession* session,
+    PointCloudExportDensityMode requestedDensityMode,
+    std::uint64_t frameCounter,
+    std::uint64_t minimumRepresentedSourceCount,
+    std::uint64_t maxReuseAgeFrames,
+    bool skipEmergencyPreview,
+    bool allowCoarseFallback = false) {
+    if (session == nullptr) {
+        return nullptr;
+    }
+
+    AdaptiveLodCacheState* bestSameDensity = nullptr;
+    AdaptiveLodCacheState* bestFast = nullptr;
+    AdaptiveLodCacheState* bestAny = nullptr;
+    AdaptiveLodCacheState* bestCoarseFallback = nullptr;
+    for (auto& entry : session->adaptiveLodRuntimeCache) {
+        if (!entry.valid || entry.drawItems == nullptr || entry.drawItems->empty()) {
+            continue;
+        }
+        if (skipEmergencyPreview && entry.densityMode == PointCloudExportDensityMode::FastAdaptivePreview) {
+            continue;
+        }
+        const auto createdFrame = entry.createdFrame == 0ULL ? entry.lastUsedFrame : entry.createdFrame;
+        if (createdFrame > 0ULL &&
+            frameCounter > createdFrame &&
+            frameCounter - createdFrame > maxReuseAgeFrames) {
+            continue;
+        }
+        if (minimumRepresentedSourceCount > 0ULL &&
+            entry.representedSourceCount < minimumRepresentedSourceCount) {
+            continue;
+        }
+        if (entry.coarseFallback) {
+            if (allowCoarseFallback &&
+                (bestCoarseFallback == nullptr || entry.lastUsedFrame > bestCoarseFallback->lastUsedFrame)) {
+                bestCoarseFallback = &entry;
+            }
+            continue;
+        }
+        if (entry.densityMode == requestedDensityMode &&
+            (bestSameDensity == nullptr || entry.lastUsedFrame > bestSameDensity->lastUsedFrame)) {
+            bestSameDensity = &entry;
+        }
+        if (entry.densityMode == PointCloudExportDensityMode::FastAdaptivePreview &&
+            (bestFast == nullptr || entry.lastUsedFrame > bestFast->lastUsedFrame)) {
+            bestFast = &entry;
+        }
+        if (bestAny == nullptr || entry.lastUsedFrame > bestAny->lastUsedFrame) {
+            bestAny = &entry;
+        }
+    }
+
+    if (bestSameDensity != nullptr) {
+        return bestSameDensity;
+    }
+    if (bestFast != nullptr) {
+        return bestFast;
+    }
+    if (bestAny != nullptr || requestedDensityMode != PointCloudExportDensityMode::FastAdaptivePreview) {
+        return bestAny != nullptr ? bestAny : bestCoarseFallback;
+    }
+    return bestCoarseFallback;
+}
+
+std::uint64_t MinimumReusableAdaptiveRepresentedSourceCount(
+    const PreviewLayerSession& session,
+    bool denseFastBasicNavigation) {
+    if (session.pointLodHierarchy == nullptr || session.pointLodHierarchy->sourcePointCount == 0U) {
+        return 0ULL;
+    }
+    const auto sourcePointCount = static_cast<std::uint64_t>(session.pointLodHierarchy->sourcePointCount);
+    return denseFastBasicNavigation ? 0ULL : sourcePointCount / 4ULL;
+}
+
+double CurrentAdaptiveLodPendingAgeMs(const PreviewLayerSession& session) {
+    if (!session.adaptiveLodAsyncPending || session.adaptiveLodAsyncState == nullptr) {
+        return 0.0;
+    }
+    std::scoped_lock lock(session.adaptiveLodAsyncState->mutex);
+    if (session.adaptiveLodAsyncState->inFlightStartedAt.time_since_epoch().count() == 0) {
+        return 0.0;
+    }
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - session.adaptiveLodAsyncState->inFlightStartedAt)
+        .count();
+}
+
+constexpr auto kAdaptiveMotionApplyInterval = std::chrono::milliseconds{33};
+
+void ApplyAdaptiveLodCacheMetadata(
+    PreviewLayerSession* session,
+    const AdaptiveLodCacheState& entry,
+    std::uint64_t frameCounter) {
+    if (session == nullptr) {
+        return;
+    }
+    session->adaptiveLodCache = entry;
+    session->adaptiveLodEstimatedFragments = entry.estimatedFragments;
+    session->adaptiveLodFragmentBudget = entry.fragmentBudget;
+    session->adaptiveLodRepresentativeBudget = entry.representativeBudget;
+    session->adaptiveLodVisibleRepresentedSourceCount = entry.visibleRepresentedSourceCount;
+    session->adaptiveLodEmittedRepresentedSourceCount = entry.emittedRepresentedSourceCount;
+    session->adaptiveLodCulledRepresentedSourceCount = entry.culledRepresentedSourceCount;
+    session->adaptiveLodVisibleFrontierNodeCount = entry.visibleFrontierNodeCount;
+    session->adaptiveLodRepresentativeBudgetReached = entry.representativeBudgetReached;
+    session->adaptiveLodFragmentBudgetReached = entry.fragmentBudgetReached;
+    session->adaptiveLodDisplayedCacheAgeFrames =
+        frameCounter >= entry.createdFrame ? frameCounter - entry.createdFrame : 0ULL;
+    session->adaptiveLodFallbackState = entry.coarseFallback ? "coarse fallback" : "exact traversal";
+    if (!entry.coarseFallback) {
+        session->adaptiveLodDisplayedBase = entry;
+    }
+}
+
+AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
+    PreviewLayerSession* session,
+    std::uint64_t traversalKey,
+    PointCloudExportDensityMode densityMode,
+    std::vector<PointCloudDrawItemGpu> drawItems,
+    std::uint32_t representativeBudget,
+    float fragmentBudget,
+    double traversalMs,
+    std::uint64_t frameCounter,
+    bool coarseFallback,
+    const PointCloudLodTraversalDiagnostics& diagnostics = {}) {
+    AdaptiveLodCacheState entry;
+    if (session == nullptr || drawItems.empty()) {
+        return entry;
+    }
+
+    session->adaptiveLodRevisionCounter =
+        session->adaptiveLodRevisionCounter == std::numeric_limits<std::uint64_t>::max()
+            ? 1ULL
+            : session->adaptiveLodRevisionCounter + 1ULL;
+    if (session->adaptiveLodRevisionCounter == 0ULL) {
+        session->adaptiveLodRevisionCounter = 1ULL;
+    }
+
+    entry.valid = true;
+    entry.coarseFallback = coarseFallback;
+    entry.key = traversalKey;
+    entry.generation = session->adaptiveLodRevisionCounter;
+    entry.createdFrame = frameCounter;
+    entry.lastUsedFrame = frameCounter;
+    entry.representativeCount = drawItems.size();
+    entry.representedSourceCount = CountRepresentedSourcePoints(drawItems);
+    entry.visibleRepresentedSourceCount =
+        diagnostics.visibleFrontierRepresentedSourceCount > 0ULL
+            ? diagnostics.visibleFrontierRepresentedSourceCount
+            : entry.representedSourceCount;
+    entry.emittedRepresentedSourceCount =
+        diagnostics.emittedRepresentedSourceCount > 0ULL
+            ? diagnostics.emittedRepresentedSourceCount
+            : entry.representedSourceCount;
+    entry.culledRepresentedSourceCount = diagnostics.culledRepresentedSourceCount;
+    entry.visibleFrontierNodeCount = diagnostics.visibleFrontierNodeCount;
+    entry.representativeBudgetReached = diagnostics.representativeBudgetReached;
+    entry.fragmentBudgetReached = diagnostics.fragmentBudgetReached;
+    entry.estimatedFragments = EstimateSubmittedFragments(drawItems);
+    entry.maxRenderDiameterPixels = MaxDrawItemRenderDiameterPixels(drawItems);
+    entry.fragmentBudget = fragmentBudget;
+    entry.representativeBudget = representativeBudget;
+    entry.traversalMs = traversalMs;
+    entry.drawItemBytes = DrawItemByteCount(drawItems.size());
+    entry.densityMode = densityMode;
+    entry.drawItems = std::make_shared<const std::vector<PointCloudDrawItemGpu>>(std::move(drawItems));
+    session->adaptiveLodLastAppliedAt = std::chrono::steady_clock::now();
+
+    if (auto* existing = FindAdaptiveLodCacheEntry(session, traversalKey, false); existing != nullptr) {
+        *existing = entry;
+    } else {
+        session->adaptiveLodRuntimeCache.push_back(entry);
+    }
+
+    constexpr std::size_t kMaxAdaptiveRuntimeCacheEntries = 12U;
+    while (session->adaptiveLodRuntimeCache.size() > kMaxAdaptiveRuntimeCacheEntries) {
+        const auto evict = std::min_element(
+            session->adaptiveLodRuntimeCache.begin(),
+            session->adaptiveLodRuntimeCache.end(),
+            [](const AdaptiveLodCacheState& left, const AdaptiveLodCacheState& right) {
+                return left.lastUsedFrame < right.lastUsedFrame;
+            });
+        if (evict == session->adaptiveLodRuntimeCache.end()) {
+            break;
+        }
+        session->adaptiveLodRuntimeCache.erase(evict);
+    }
+
+    ApplyAdaptiveLodCacheMetadata(session, entry, frameCounter);
+    return entry;
+}
+
+std::uint32_t CoarseAdaptiveFallbackRepresentativeTarget(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight) {
+    const auto pixelCount = static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, viewportWidth)) *
+                            static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, viewportHeight));
+    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(pixelCount / 24ULL, 16'384ULL, 262'144ULL));
+}
+
+std::vector<PointCloudDrawItemGpu> BuildCoarseAdaptiveFallbackDrawItems(
+    const PreviewLayerSession& session,
+    const PointCloudStyleState& style,
+    const glm::mat4& viewProjection,
+    const glm::vec3& cameraPosition,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    std::uint32_t representativeLimit,
+    bool fastBasicProfile) {
+    if (session.pointLodHierarchy == nullptr || session.pointLodHierarchy->Empty()) {
+        return {};
+    }
+
+    auto params = MakeAdaptiveLodTraversalParams(
+        session,
+        style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        PointCloudExportDensityMode::FastAdaptivePreview,
+        fastBasicProfile);
+    params.maxRepresentatives = 0U;
+    params.maxDrawItems = 0U;
+    params.maxEstimatedFragments = 0.0F;
+    const auto fallbackTarget = CoarseAdaptiveFallbackRepresentativeTarget(viewportWidth, viewportHeight);
+    return invisible_places::renderer::pointcloud::BuildCoarsePointCloudLodFallbackDrawItems(
+        *session.pointLodHierarchy,
+        params,
+        representativeLimit == 0U ? fallbackTarget : std::min(fallbackTarget, representativeLimit));
+}
+
+bool ScheduleAdaptiveLodTraversal(
+    PreviewLayerSession* session,
+    const PointCloudStyleState& style,
+    const glm::mat4& viewProjection,
+    const glm::vec3& cameraPosition,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    std::uint64_t traversalKey,
+    bool fastBasicProfile,
+    bool throttleSupersededRequests) {
+    if (session == nullptr || session->pointLodHierarchy == nullptr || session->pointLodHierarchy->Empty()) {
+        return false;
+    }
+
+    if (session->adaptiveLodAsyncState == nullptr) {
+        session->adaptiveLodAsyncState = std::make_shared<AdaptiveLodAsyncState>();
+    }
+    auto asyncState = session->adaptiveLodAsyncState;
+    {
+        std::scoped_lock lock(asyncState->mutex);
+        if (asyncState->completed.has_value()) {
+            const bool completedMatchesRequest =
+                asyncState->completed->key == traversalKey &&
+                asyncState->completed->requestGeneration == asyncState->latestRequestedGeneration;
+            if (completedMatchesRequest) {
+                session->adaptiveLodRuntimeStatus = "async traversal ready";
+                session->adaptiveLodAsyncPending = false;
+                return false;
+            }
+            if (throttleSupersededRequests) {
+                session->adaptiveLodRuntimeStatus = "async traversal ready for motion patch";
+                session->adaptiveLodAsyncPending = true;
+                session->adaptiveLodAsyncPendingAgeMs =
+                    asyncState->inFlightStartedAt.time_since_epoch().count() == 0
+                        ? 0.0
+                        : std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - asyncState->inFlightStartedAt)
+                              .count();
+                return true;
+            }
+            asyncState->completed.reset();
+            ++session->adaptiveLodStaleTraversalDiscardedCount;
+            session->adaptiveLodRuntimeStatus = "discarded stale async traversal before scheduling";
+        }
+        if (asyncState->running) {
+            if (asyncState->latestRequestedKey != traversalKey) {
+                const auto now = std::chrono::steady_clock::now();
+                if (throttleSupersededRequests) {
+                    session->adaptiveLodRuntimeStatus =
+                        "async traversal in flight, supersede throttled for motion patch";
+                    session->adaptiveLodAsyncPending = true;
+                    session->adaptiveLodAsyncPendingAgeMs =
+                        asyncState->inFlightStartedAt.time_since_epoch().count() == 0
+                            ? 0.0
+                            : std::chrono::duration<double, std::milli>(
+                                  now - asyncState->inFlightStartedAt)
+                                  .count();
+                    return true;
+                }
+                session->adaptiveLodRequestGeneration =
+                    session->adaptiveLodRequestGeneration == std::numeric_limits<std::uint64_t>::max()
+                        ? 1ULL
+                        : session->adaptiveLodRequestGeneration + 1ULL;
+                if (session->adaptiveLodRequestGeneration == 0ULL) {
+                    session->adaptiveLodRequestGeneration = 1ULL;
+                }
+                asyncState->latestRequestedKey = traversalKey;
+                asyncState->latestRequestedGeneration = session->adaptiveLodRequestGeneration;
+                session->adaptiveLodWorker.request_stop();
+                ++session->adaptiveLodStaleTraversalDiscardedCount;
+                session->adaptiveLodRuntimeStatus = "async traversal superseded by newer request";
+            } else {
+                session->adaptiveLodRuntimeStatus =
+                    asyncState->inFlightKey == traversalKey ? "async traversal in flight" : "async traversal busy";
+            }
+            session->adaptiveLodAsyncPending = true;
+            session->adaptiveLodAsyncPendingAgeMs =
+                asyncState->inFlightStartedAt.time_since_epoch().count() == 0
+                    ? 0.0
+                    : std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - asyncState->inFlightStartedAt)
+                          .count();
+            return true;
+        }
+        session->adaptiveLodRequestGeneration =
+            session->adaptiveLodRequestGeneration == std::numeric_limits<std::uint64_t>::max()
+                ? 1ULL
+                : session->adaptiveLodRequestGeneration + 1ULL;
+        if (session->adaptiveLodRequestGeneration == 0ULL) {
+            session->adaptiveLodRequestGeneration = 1ULL;
+        }
+        asyncState->running = true;
+        asyncState->inFlightKey = traversalKey;
+        asyncState->inFlightGeneration = session->adaptiveLodRequestGeneration;
+        asyncState->latestRequestedKey = traversalKey;
+        asyncState->latestRequestedGeneration = session->adaptiveLodRequestGeneration;
+        asyncState->inFlightDensityMode = densityMode;
+        asyncState->inFlightStartedAt = std::chrono::steady_clock::now();
+        asyncState->completed.reset();
+    }
+
+    if (session->adaptiveLodWorker.joinable()) {
+        session->adaptiveLodWorker = std::jthread{};
+    }
+
+    const auto hierarchy = std::shared_ptr<const invisible_places::renderer::pointcloud::PointCloudLodHierarchy>{
+        session->pointLodHierarchy};
+    const auto params = MakeAdaptiveLodTraversalParams(
+        *session,
+        style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        densityMode,
+        fastBasicProfile);
+    session->adaptiveLodRuntimeStatus = "async traversal scheduled";
+    session->adaptiveLodAsyncPending = true;
+    session->adaptiveLodAsyncPendingAgeMs = 0.0;
+    const auto requestGeneration = session->adaptiveLodRequestGeneration;
+    session->adaptiveLodWorker = std::jthread{
+        [asyncState, hierarchy, params, traversalKey, requestGeneration, densityMode](std::stop_token stopToken) {
+            const auto traversalStart = std::chrono::steady_clock::now();
+            PointCloudLodTraversalDiagnostics traversalDiagnostics;
+            auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+                *hierarchy,
+                params,
+                stopToken,
+                &traversalDiagnostics);
+            const auto traversalEnd = std::chrono::steady_clock::now();
+            if (stopToken.stop_requested()) {
+                std::scoped_lock lock(asyncState->mutex);
+                asyncState->running = false;
+                return;
+            }
+
+            std::scoped_lock lock(asyncState->mutex);
+            asyncState->completed = AdaptiveLodAsyncCompletion{
+                .key = traversalKey,
+                .requestGeneration = requestGeneration,
+                .densityMode = densityMode,
+                .drawItems = std::move(drawItems),
+                .fragmentBudget = params.maxEstimatedFragments,
+                .representativeBudget = params.maxRepresentatives,
+                .traversalMs = MillisecondsBetween(traversalStart, traversalEnd),
+                .diagnostics = traversalDiagnostics,
+            };
+            asyncState->running = false;
+        }};
+    return true;
+}
+
+AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
+    PreviewLayerSession* session,
+    const PointCloudStyleState& style,
+    const glm::mat4& viewProjection,
+    const glm::vec3& cameraPosition,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    bool fastBasicProfile,
+    bool fastBasicNavigationActive,
+    bool allowReusePrevious,
+    bool allowSynchronousTraversal,
+    std::uint64_t frameCounter) {
+    if (session == nullptr ||
+        invisible_places::output::PointCloudExportDensityModeUsesFullSource(densityMode)) {
+        return {};
+    }
+    const auto requestedParams = MakeAdaptiveLodTraversalParams(
+        *session,
+        style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        densityMode,
+        fastBasicProfile);
+    if (session->pointLodHierarchy == nullptr || session->pointLodHierarchy->Empty()) {
+        session->adaptiveLodRequestedDensityMode = densityMode;
+        session->adaptiveLodDisplayedDensityMode = densityMode;
+        session->adaptiveLodRuntimeCacheHit = false;
+        session->adaptiveLodAsyncPending = session->pointLodBuildWorker.joinable();
+        session->adaptiveLodAsyncPendingAgeMs = 0.0;
+        session->adaptiveLodEstimatedFragments = 0.0F;
+        session->adaptiveLodFragmentBudget = requestedParams.maxEstimatedFragments;
+        session->adaptiveLodRepresentativeBudget = requestedParams.maxRepresentatives;
+        session->adaptiveLodVisibleRepresentedSourceCount = 0;
+        session->adaptiveLodEmittedRepresentedSourceCount = 0;
+        session->adaptiveLodCulledRepresentedSourceCount = 0;
+        session->adaptiveLodVisibleFrontierNodeCount = 0;
+        session->adaptiveLodRepresentativeBudgetReached = false;
+        session->adaptiveLodFragmentBudgetReached = false;
+        session->adaptiveLodDisplayedCacheAgeFrames = 0;
+        session->adaptiveLodFallbackState = "waiting";
+        session->adaptiveLodRuntimeStatus =
+            session->adaptiveLodAsyncPending ? "waiting on adaptive LOD hierarchy" : "adaptive LOD hierarchy unavailable";
+        return {
+            .available = false,
+            .fragmentBudget = requestedParams.maxEstimatedFragments,
+            .representativeBudget = requestedParams.maxRepresentatives,
+            .asyncPending = session->adaptiveLodAsyncPending,
+            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+            .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
+            .requestedDensityMode = densityMode,
+            .displayedDensityMode = densityMode,
+            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .persistentCacheStatus = session->pointLodCacheStatus,
+            .fallbackState = session->adaptiveLodFallbackState,
+        };
+    }
+
+    const auto traversalKey = AdaptiveLodTraversalKey(
+        *session,
+        style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        densityMode);
+    session->adaptiveLodRequestedDensityMode = densityMode;
+    auto makeResultFromEntry =
+        [&](const AdaptiveLodCacheState& entry,
+            bool reusedPrevious,
+            bool runtimeCacheHit,
+            bool asyncPending) -> AdaptiveLodBuildResult {
+        return {
+            .available = true,
+            .drawItems = entry.drawItems,
+            .revision = entry.generation,
+            .representativeCount = entry.representativeCount,
+            .representedSourceCount = entry.representedSourceCount,
+            .visibleRepresentedSourceCount = entry.visibleRepresentedSourceCount,
+            .emittedRepresentedSourceCount = entry.emittedRepresentedSourceCount,
+            .culledRepresentedSourceCount = entry.culledRepresentedSourceCount,
+            .visibleFrontierNodeCount = entry.visibleFrontierNodeCount,
+            .estimatedFragments = entry.estimatedFragments,
+            .fragmentBudget = entry.fragmentBudget,
+            .representativeBudget = entry.representativeBudget,
+            .representativeBudgetReached = entry.representativeBudgetReached,
+            .fragmentBudgetReached = entry.fragmentBudgetReached,
+            .traversalMs = (reusedPrevious || runtimeCacheHit) ? 0.0 : entry.traversalMs,
+            .drawItemBytes = entry.drawItemBytes,
+            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+            .reusedPrevious = reusedPrevious,
+            .runtimeCacheHit = runtimeCacheHit,
+            .asyncPending = asyncPending,
+            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+            .asyncPendingAgeMs =
+                asyncPending ? CurrentAdaptiveLodPendingAgeMs(*session) : session->adaptiveLodAsyncPendingAgeMs,
+            .requestedDensityMode = densityMode,
+            .displayedDensityMode = entry.densityMode,
+            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .persistentCacheStatus = session->pointLodCacheStatus,
+            .fallbackState = session->adaptiveLodFallbackState,
+        };
+    };
+
+    if (auto* cache = FindAdaptiveLodCacheEntry(session, traversalKey); cache != nullptr) {
+        cache->lastUsedFrame = frameCounter;
+        ApplyAdaptiveLodCacheMetadata(session, *cache, frameCounter);
+        session->adaptiveLodRuntimeCacheHit = true;
+        session->adaptiveLodAsyncPending = false;
+        session->adaptiveLodAsyncPendingAgeMs = 0.0;
+        session->adaptiveLodRuntimeStatus = "runtime cache hit";
+        session->adaptiveLodDisplayedDensityMode = cache->densityMode;
+        return {
+            .available = true,
+            .drawItems = cache->drawItems,
+            .revision = cache->generation,
+            .representativeCount = cache->representativeCount,
+            .representedSourceCount = cache->representedSourceCount,
+            .visibleRepresentedSourceCount = cache->visibleRepresentedSourceCount,
+            .emittedRepresentedSourceCount = cache->emittedRepresentedSourceCount,
+            .culledRepresentedSourceCount = cache->culledRepresentedSourceCount,
+            .visibleFrontierNodeCount = cache->visibleFrontierNodeCount,
+            .estimatedFragments = cache->estimatedFragments,
+            .fragmentBudget = cache->fragmentBudget,
+            .representativeBudget = cache->representativeBudget,
+            .representativeBudgetReached = cache->representativeBudgetReached,
+            .fragmentBudgetReached = cache->fragmentBudgetReached,
+            .traversalMs = 0.0,
+            .drawItemBytes = cache->drawItemBytes,
+            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+            .reusedPrevious = false,
+            .runtimeCacheHit = true,
+            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+            .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
+            .requestedDensityMode = densityMode,
+            .displayedDensityMode = cache->densityMode,
+            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .persistentCacheStatus = session->pointLodCacheStatus,
+            .fallbackState = session->adaptiveLodFallbackState,
+        };
+    }
+
+    if (allowSynchronousTraversal) {
+        const auto traversalStart = std::chrono::steady_clock::now();
+        PointCloudLodTraversalDiagnostics traversalDiagnostics;
+        auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+            *session->pointLodHierarchy,
+            requestedParams,
+            {},
+            &traversalDiagnostics);
+        const auto traversalEnd = std::chrono::steady_clock::now();
+        if (drawItems.empty()) {
+            return {};
+        }
+
+        auto cache = StoreAdaptiveLodCacheEntry(
+            session,
+            traversalKey,
+            densityMode,
+            std::move(drawItems),
+            requestedParams.maxRepresentatives,
+            requestedParams.maxEstimatedFragments,
+            MillisecondsBetween(traversalStart, traversalEnd),
+            frameCounter,
+            false,
+            traversalDiagnostics);
+        session->adaptiveLodRuntimeCacheHit = false;
+        session->adaptiveLodAsyncPending = false;
+        session->adaptiveLodAsyncPendingAgeMs = 0.0;
+        session->adaptiveLodRuntimeStatus = "synchronous export traversal";
+        session->adaptiveLodDisplayedDensityMode = densityMode;
+        return {
+            .available = true,
+            .drawItems = cache.drawItems,
+            .revision = cache.generation,
+            .representativeCount = cache.representativeCount,
+            .representedSourceCount = cache.representedSourceCount,
+            .visibleRepresentedSourceCount = cache.visibleRepresentedSourceCount,
+            .emittedRepresentedSourceCount = cache.emittedRepresentedSourceCount,
+            .culledRepresentedSourceCount = cache.culledRepresentedSourceCount,
+            .visibleFrontierNodeCount = cache.visibleFrontierNodeCount,
+            .estimatedFragments = cache.estimatedFragments,
+            .fragmentBudget = cache.fragmentBudget,
+            .representativeBudget = cache.representativeBudget,
+            .representativeBudgetReached = cache.representativeBudgetReached,
+            .fragmentBudgetReached = cache.fragmentBudgetReached,
+            .traversalMs = cache.traversalMs,
+            .drawItemBytes = cache.drawItemBytes,
+            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+            .reusedPrevious = false,
+            .runtimeCacheHit = false,
+            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+            .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
+            .requestedDensityMode = densityMode,
+            .displayedDensityMode = densityMode,
+            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .persistentCacheStatus = session->pointLodCacheStatus,
+            .fallbackState = session->adaptiveLodFallbackState,
+        };
+    }
+
+    const bool scheduled = ScheduleAdaptiveLodTraversal(
+        session,
+        style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        densityMode,
+        traversalKey,
+        fastBasicProfile,
+        fastBasicProfile && fastBasicNavigationActive);
+
+    if (allowReusePrevious) {
+        const bool denseFastBasicNavigation = fastBasicProfile && fastBasicNavigationActive;
+        const auto minimumRepresentedSourceCount =
+            MinimumReusableAdaptiveRepresentedSourceCount(*session, denseFastBasicNavigation);
+        const bool hasNoFlashDisplayedBase =
+            session->adaptiveLodDisplayedBase.valid && !session->adaptiveLodDisplayedBase.coarseFallback;
+        const std::uint64_t maxReuseAgeFrames =
+            (denseFastBasicNavigation || hasNoFlashDisplayedBase)
+                ? std::numeric_limits<std::uint64_t>::max()
+                : 30ULL;
+        const bool skipEmergencyPreview =
+            fastBasicProfile &&
+            densityMode != PointCloudExportDensityMode::FastAdaptivePreview &&
+            !denseFastBasicNavigation;
+        if (auto* previous = FindReusableAdaptiveLodCacheEntry(
+                session,
+                densityMode,
+                frameCounter,
+                minimumRepresentedSourceCount,
+                maxReuseAgeFrames,
+                skipEmergencyPreview,
+                denseFastBasicNavigation);
+            previous != nullptr) {
+            previous->lastUsedFrame = frameCounter;
+            ApplyAdaptiveLodCacheMetadata(session, *previous, frameCounter);
+            const bool lowerTierPrevious = previous->densityMode != densityMode;
+            const bool coarsePrevious = previous->coarseFallback;
+            session->adaptiveLodFallbackState =
+                coarsePrevious
+                    ? "motion hold reused coarse fallback"
+                    : (denseFastBasicNavigation
+                           ? (lowerTierPrevious ? "motion hold reused lower-tier exact" : "motion hold reused exact")
+                           : (lowerTierPrevious ? "reused lower-tier exact" : "reused exact"));
+            session->adaptiveLodRuntimeCacheHit = false;
+            session->adaptiveLodDisplayedDensityMode = previous->densityMode;
+            session->adaptiveLodRuntimeStatus =
+                denseFastBasicNavigation
+                    ? (scheduled
+                           ? (coarsePrevious
+                                  ? "holding previous coarse fallback during motion, async traversal pending"
+                                  : (lowerTierPrevious
+                                         ? "holding previous lower-tier set during motion, async traversal pending"
+                                         : "holding previous set during motion, async traversal pending"))
+                           : (coarsePrevious ? "holding previous coarse fallback during motion"
+                                             : "holding previous set during motion"))
+                    : (scheduled
+                           ? (lowerTierPrevious ? "showing previous lower-tier set, async traversal pending"
+                                                : "showing previous set, async traversal pending")
+                           : (lowerTierPrevious ? "showing previous lower-tier set" : "showing previous set"));
+            return {
+                .available = true,
+                .drawItems = previous->drawItems,
+                .revision = previous->generation,
+                .representativeCount = previous->representativeCount,
+                .representedSourceCount = previous->representedSourceCount,
+                .visibleRepresentedSourceCount = previous->visibleRepresentedSourceCount,
+                .emittedRepresentedSourceCount = previous->emittedRepresentedSourceCount,
+                .culledRepresentedSourceCount = previous->culledRepresentedSourceCount,
+                .visibleFrontierNodeCount = previous->visibleFrontierNodeCount,
+                .estimatedFragments = previous->estimatedFragments,
+                .fragmentBudget = previous->fragmentBudget,
+                .representativeBudget = previous->representativeBudget,
+                .representativeBudgetReached = previous->representativeBudgetReached,
+                .fragmentBudgetReached = previous->fragmentBudgetReached,
+                .traversalMs = 0.0,
+                .drawItemBytes = previous->drawItemBytes,
+                .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+                .reusedPrevious = true,
+                .runtimeCacheHit = false,
+                .asyncPending = scheduled,
+                .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+                .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
+                .requestedDensityMode = densityMode,
+                .displayedDensityMode = previous->densityMode,
+                .runtimeStatus = session->adaptiveLodRuntimeStatus,
+                .persistentCacheStatus = session->pointLodCacheStatus,
+                .fallbackState = session->adaptiveLodFallbackState,
+            };
+        }
+    }
+
+    if (allowReusePrevious &&
+        AdaptiveLodCandidateWouldDemoteDisplayed(
+            *session,
+            PointCloudExportDensityMode::FastAdaptivePreview,
+            true)) {
+        auto preserved = session->adaptiveLodDisplayedBase.valid
+                             ? session->adaptiveLodDisplayedBase
+                             : session->adaptiveLodCache;
+        preserved.lastUsedFrame = frameCounter;
+        ApplyAdaptiveLodCacheMetadata(session, preserved, frameCounter);
+        ++session->adaptiveLodCandidateDemotionBlockedCount;
+        session->adaptiveLodRuntimeCacheHit = false;
+        session->adaptiveLodDisplayedDensityMode = preserved.densityMode;
+        session->adaptiveLodFallbackState =
+            fastBasicNavigationActive ? "motion base; coarse fallback blocked" : "idle no-flash refine";
+        session->adaptiveLodRuntimeStatus =
+            scheduled
+                ? (fastBasicNavigationActive
+                       ? "holding displayed base during motion, coarse fallback blocked, async traversal pending"
+                       : "holding displayed base, coarse fallback blocked, async traversal pending")
+                : "holding displayed base, coarse fallback blocked";
+        return makeResultFromEntry(preserved, true, false, scheduled);
+    }
+
+    if (auto* fallback = FindAdaptiveLodCacheEntry(session, traversalKey, false);
+        fallback != nullptr && fallback->coarseFallback) {
+        fallback->lastUsedFrame = frameCounter;
+        ApplyAdaptiveLodCacheMetadata(session, *fallback, frameCounter);
+        session->adaptiveLodRuntimeCacheHit = false;
+        session->adaptiveLodDisplayedDensityMode = fallback->densityMode;
+        session->adaptiveLodRuntimeStatus =
+            scheduled ? "reusing coarse fallback, async traversal pending" : "reusing coarse fallback";
+        return {
+            .available = true,
+            .drawItems = fallback->drawItems,
+            .revision = fallback->generation,
+            .representativeCount = fallback->representativeCount,
+            .representedSourceCount = fallback->representedSourceCount,
+            .visibleRepresentedSourceCount = fallback->visibleRepresentedSourceCount,
+            .emittedRepresentedSourceCount = fallback->emittedRepresentedSourceCount,
+            .culledRepresentedSourceCount = fallback->culledRepresentedSourceCount,
+            .visibleFrontierNodeCount = fallback->visibleFrontierNodeCount,
+            .estimatedFragments = fallback->estimatedFragments,
+            .fragmentBudget = fallback->fragmentBudget,
+            .representativeBudget = fallback->representativeBudget,
+            .representativeBudgetReached = fallback->representativeBudgetReached,
+            .fragmentBudgetReached = fallback->fragmentBudgetReached,
+            .traversalMs = 0.0,
+            .drawItemBytes = fallback->drawItemBytes,
+            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+            .reusedPrevious = true,
+            .runtimeCacheHit = false,
+            .asyncPending = scheduled,
+            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+            .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
+            .requestedDensityMode = densityMode,
+            .displayedDensityMode = fallback->densityMode,
+            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .persistentCacheStatus = session->pointLodCacheStatus,
+            .fallbackState = session->adaptiveLodFallbackState,
+        };
+    }
+
+    auto fallbackItems = BuildCoarseAdaptiveFallbackDrawItems(
+        *session,
+        style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        requestedParams.maxRepresentatives,
+        fastBasicProfile);
+    if (fallbackItems.empty()) {
+        session->adaptiveLodRuntimeCacheHit = false;
+        session->adaptiveLodAsyncPending = scheduled;
+        session->adaptiveLodAsyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session);
+        session->adaptiveLodEstimatedFragments = 0.0F;
+        session->adaptiveLodFragmentBudget = requestedParams.maxEstimatedFragments;
+        session->adaptiveLodRepresentativeBudget = requestedParams.maxRepresentatives;
+        session->adaptiveLodVisibleRepresentedSourceCount = 0;
+        session->adaptiveLodEmittedRepresentedSourceCount = 0;
+        session->adaptiveLodCulledRepresentedSourceCount = 0;
+        session->adaptiveLodVisibleFrontierNodeCount = 0;
+        session->adaptiveLodRepresentativeBudgetReached = false;
+        session->adaptiveLodFragmentBudgetReached = false;
+        session->adaptiveLodDisplayedCacheAgeFrames = 0;
+        session->adaptiveLodFallbackState = scheduled ? "waiting" : "no visible adaptive reps";
+        session->adaptiveLodRuntimeStatus =
+            scheduled ? "waiting on async LOD" : "adaptive LOD produced no visible reps";
+        return {
+            .available = false,
+            .fragmentBudget = requestedParams.maxEstimatedFragments,
+            .representativeBudget = requestedParams.maxRepresentatives,
+            .asyncPending = scheduled,
+            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+            .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
+            .requestedDensityMode = densityMode,
+            .displayedDensityMode = densityMode,
+            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .persistentCacheStatus = session->pointLodCacheStatus,
+            .fallbackState = session->adaptiveLodFallbackState,
+        };
+    }
+    auto fallback = StoreAdaptiveLodCacheEntry(
+        session,
+        traversalKey,
+        PointCloudExportDensityMode::FastAdaptivePreview,
+        std::move(fallbackItems),
+        requestedParams.maxRepresentatives,
+        requestedParams.maxEstimatedFragments,
+        0.0,
+        frameCounter,
+        true);
+    session->adaptiveLodRuntimeCacheHit = false;
+    session->adaptiveLodDisplayedDensityMode = PointCloudExportDensityMode::FastAdaptivePreview;
+    session->adaptiveLodRuntimeStatus =
+        scheduled
+            ? std::string{"coarse fallback for "} +
+                  invisible_places::output::PointCloudExportDensityModeName(densityMode) +
+                  ", async traversal pending"
+            : std::string{"coarse fallback for "} +
+                  invisible_places::output::PointCloudExportDensityModeName(densityMode);
+
+    return {
+        .available = true,
+        .drawItems = fallback.drawItems,
+        .revision = fallback.generation,
+        .representativeCount = fallback.representativeCount,
+        .representedSourceCount = fallback.representedSourceCount,
+        .visibleRepresentedSourceCount = fallback.visibleRepresentedSourceCount,
+        .emittedRepresentedSourceCount = fallback.emittedRepresentedSourceCount,
+        .culledRepresentedSourceCount = fallback.culledRepresentedSourceCount,
+        .visibleFrontierNodeCount = fallback.visibleFrontierNodeCount,
+        .estimatedFragments = fallback.estimatedFragments,
+        .fragmentBudget = fallback.fragmentBudget,
+        .representativeBudget = fallback.representativeBudget,
+        .representativeBudgetReached = fallback.representativeBudgetReached,
+        .fragmentBudgetReached = fallback.fragmentBudgetReached,
+        .traversalMs = 0.0,
+        .drawItemBytes = fallback.drawItemBytes,
+        .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+        .reusedPrevious = true,
+        .runtimeCacheHit = false,
+        .asyncPending = scheduled,
+        .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+        .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
+        .requestedDensityMode = densityMode,
+        .displayedDensityMode = PointCloudExportDensityMode::FastAdaptivePreview,
+        .runtimeStatus = session->adaptiveLodRuntimeStatus,
+        .persistentCacheStatus = session->pointLodCacheStatus,
+        .fallbackState = session->adaptiveLodFallbackState,
+    };
+}
+
+bool PopulateAdaptivePointCloudLayer(
+    PreviewLayerSession* session,
+    const glm::mat4& viewProjection,
+    const glm::vec3& cameraPosition,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    bool fastBasicProfile,
+    bool fastBasicNavigationActive,
+    bool allowReusePrevious,
+    bool allowSynchronousTraversal,
+    std::uint64_t frameCounter,
+    invisible_places::renderer::core::SceneRenderState::PointCloudLayerState* layer) {
+    if (session == nullptr || layer == nullptr) {
+        return false;
+    }
+    layer->requiresAdaptiveDrawItems = true;
+
+    const auto result = BuildAdaptivePointCloudDrawItems(
+        session,
+        layer->style,
+        viewProjection,
+        cameraPosition,
+        viewportWidth,
+        viewportHeight,
+        densityMode,
+        fastBasicProfile,
+        fastBasicNavigationActive,
+        allowReusePrevious,
+        allowSynchronousTraversal,
+        frameCounter);
+    if (!result.available || result.drawItems == nullptr || result.drawItems->empty()) {
+        layer->adaptiveDrawItems.reset();
+        layer->useAdaptiveDrawItems = false;
+        layer->drawPointCount = 0;
+        layer->adaptiveRepresentedSourceCount = 0;
+        layer->adaptiveVisibleRepresentedSourceCount = result.visibleRepresentedSourceCount;
+        layer->adaptiveEmittedRepresentedSourceCount = result.emittedRepresentedSourceCount;
+        layer->adaptiveCulledRepresentedSourceCount = result.culledRepresentedSourceCount;
+        layer->adaptiveVisibleFrontierNodeCount = result.visibleFrontierNodeCount;
+        layer->adaptiveEstimatedFragments = result.estimatedFragments;
+        layer->adaptiveFragmentBudget = result.fragmentBudget;
+        layer->adaptiveRepresentativeBudget = result.representativeBudget;
+        layer->adaptiveRepresentativeBudgetReached = result.representativeBudgetReached;
+        layer->adaptiveFragmentBudgetReached = result.fragmentBudgetReached;
+        layer->adaptiveLodTraversalMs = 0.0;
+        layer->adaptiveLodReusedPrevious = false;
+        layer->adaptiveLodRuntimeCacheHit = result.runtimeCacheHit;
+        layer->adaptiveLodAsyncPending = result.asyncPending;
+        layer->adaptiveLodAsyncPendingAgeMs = result.asyncPendingAgeMs;
+        layer->adaptiveLodDisplayedCacheAgeFrames = result.displayedCacheAgeFrames;
+        layer->adaptiveLodStaleTraversalDiscardedCount = result.staleTraversalDiscardedCount;
+        layer->adaptiveDrawItemBytes = 0;
+        layer->adaptiveLodPersistentCacheStatus = result.persistentCacheStatus;
+        layer->adaptiveLodRuntimeStatus = result.runtimeStatus;
+        layer->adaptiveLodRequestedDensity =
+            invisible_places::output::PointCloudExportDensityModeName(result.requestedDensityMode);
+        layer->adaptiveLodDisplayedDensity =
+            invisible_places::output::PointCloudExportDensityModeName(result.displayedDensityMode);
+        layer->adaptiveLodFallbackState = result.fallbackState.empty() ? "waiting" : result.fallbackState;
+        return false;
+    }
+
+    layer->drawPointCount = static_cast<std::uint32_t>(
+        std::min<std::size_t>(result.representativeCount, std::numeric_limits<std::uint32_t>::max()));
+    layer->adaptiveDrawItems = result.drawItems;
+    layer->useAdaptiveDrawItems = true;
+    layer->adaptiveLodRevision = result.revision;
+    layer->adaptiveRepresentedSourceCount = result.representedSourceCount;
+    layer->adaptiveVisibleRepresentedSourceCount = result.visibleRepresentedSourceCount;
+    layer->adaptiveEmittedRepresentedSourceCount = result.emittedRepresentedSourceCount;
+    layer->adaptiveCulledRepresentedSourceCount = result.culledRepresentedSourceCount;
+    layer->adaptiveVisibleFrontierNodeCount = result.visibleFrontierNodeCount;
+    layer->adaptiveEstimatedFragments = result.estimatedFragments;
+    layer->adaptiveFragmentBudget = result.fragmentBudget;
+    layer->adaptiveRepresentativeBudget = result.representativeBudget;
+    layer->adaptiveRepresentativeBudgetReached = result.representativeBudgetReached;
+    layer->adaptiveFragmentBudgetReached = result.fragmentBudgetReached;
+    layer->adaptiveLodTraversalMs = result.traversalMs;
+    layer->adaptiveLodReusedPrevious = result.reusedPrevious;
+    layer->adaptiveLodRuntimeCacheHit = result.runtimeCacheHit;
+    layer->adaptiveLodAsyncPending = result.asyncPending;
+    layer->adaptiveLodAsyncPendingAgeMs = result.asyncPendingAgeMs;
+    layer->adaptiveLodDisplayedCacheAgeFrames = result.displayedCacheAgeFrames;
+    layer->adaptiveLodStaleTraversalDiscardedCount = result.staleTraversalDiscardedCount;
+    layer->adaptiveDrawItemBytes = result.drawItemBytes;
+    layer->adaptiveLodPersistentCacheStatus = result.persistentCacheStatus;
+    layer->adaptiveLodRuntimeStatus = result.runtimeStatus;
+    layer->adaptiveLodRequestedDensity =
+        invisible_places::output::PointCloudExportDensityModeName(result.requestedDensityMode);
+    layer->adaptiveLodDisplayedDensity =
+        invisible_places::output::PointCloudExportDensityModeName(result.displayedDensityMode);
+    layer->adaptiveLodFallbackState = result.fallbackState;
+    return true;
+}
+
+AdaptiveLodPreviewSummary ComputeAdaptiveLodPreviewSummary(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    static_cast<void>(runtimeState);
+    static_cast<void>(viewport);
+    if (!session.adaptiveLodCache.valid || session.adaptiveLodCache.drawItems == nullptr) {
+        return {};
+    }
+
+    AdaptiveLodPreviewSummary summary;
+    summary.available = true;
+    summary.representativeCount = session.adaptiveLodCache.representativeCount;
+    summary.representedSourceCount = session.adaptiveLodCache.representedSourceCount;
+    summary.traversalMs = session.adaptiveLodCache.traversalMs;
+    summary.reusedPrevious = runtimeState.previewAdaptiveLodReusedPrevious;
+    return summary;
+}
+
+PointCloudLodBuildProgressSnapshot CurrentPointCloudLodBuildProgress(
+    const PreviewLayerSession& session) {
+    if (session.pointLodBuildState == nullptr) {
+        return {};
+    }
+
+    std::scoped_lock lock(session.pointLodBuildState->mutex);
+    return PointCloudLodBuildProgressSnapshot{
+        .available = true,
+        .running = session.pointLodBuildState->running,
+        .progress = session.pointLodBuildState->progress,
+        .startedAt = session.pointLodBuildState->startedAt,
+    };
+}
+
+void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return;
+    }
+    session->adaptiveLodCache = {};
+    session->adaptiveLodDisplayedBase = {};
+    session->adaptiveLodMotionPatch = {};
+    session->adaptiveLodIdleCandidate = {};
+    session->adaptiveLodRuntimeCache.clear();
+    session->adaptiveLodRevisionCounter = 0;
+    session->adaptiveLodRequestGeneration = 0;
+    session->adaptiveLodStaleTraversalDiscardedCount = 0;
+    session->adaptiveLodLastAppliedAt = {};
+    session->adaptiveLodMotionApplyThrottleCount = 0;
+    session->adaptiveLodMotionPatchApplyCount = 0;
+    session->adaptiveLodCandidateDemotionBlockedCount = 0;
+    session->adaptiveLodSkippedMotionPatchCount = 0;
+    session->adaptiveLodMotionPatchRepresentativeCount = 0;
+    session->adaptiveLodCoverageGapSourceCount = 0;
+    session->adaptiveLodRuntimeStatus = "runtime cache empty";
+    session->adaptiveLodRuntimeCacheHit = false;
+    session->adaptiveLodAsyncPending = false;
+    session->adaptiveLodAsyncPendingAgeMs = 0.0;
+    session->adaptiveLodEstimatedFragments = 0.0F;
+    session->adaptiveLodFragmentBudget = 0.0F;
+    session->adaptiveLodRepresentativeBudget = 0;
+    session->adaptiveLodVisibleRepresentedSourceCount = 0;
+    session->adaptiveLodEmittedRepresentedSourceCount = 0;
+    session->adaptiveLodCulledRepresentedSourceCount = 0;
+    session->adaptiveLodVisibleFrontierNodeCount = 0;
+    session->adaptiveLodRepresentativeBudgetReached = false;
+    session->adaptiveLodFragmentBudgetReached = false;
+    session->adaptiveLodDisplayedCacheAgeFrames = 0;
+    session->adaptiveLodFallbackState = "none";
+}
+
+void StopPointCloudBackgroundLodWork(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return;
+    }
+    if (session->adaptiveLodWorker.joinable()) {
+        session->adaptiveLodWorker.request_stop();
+        session->adaptiveLodWorker = std::jthread{};
+    }
+    if (session->pointLodBuildWorker.joinable()) {
+        session->pointLodBuildWorker.request_stop();
+        session->pointLodBuildWorker = std::jthread{};
+    }
+    session->adaptiveLodAsyncState.reset();
+    session->pointLodBuildState.reset();
+    session->adaptiveLodAsyncPending = false;
+    session->adaptiveLodAsyncPendingAgeMs = 0.0;
+}
+
+void AttachPointCloudLodHierarchy(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session,
+    invisible_places::renderer::pointcloud::PointCloudLodHierarchy hierarchy,
+    std::string statusMessage) {
+    if (session == nullptr || hierarchy.Empty()) {
+        return;
+    }
+    session->pointLodHierarchy =
+        std::make_shared<invisible_places::renderer::pointcloud::PointCloudLodHierarchy>(std::move(hierarchy));
+    session->pointLodHierarchyGeneration =
+        session->pointLodHierarchyGeneration == std::numeric_limits<std::uint64_t>::max()
+            ? 1ULL
+            : session->pointLodHierarchyGeneration + 1ULL;
+    if (session->pointLodHierarchyGeneration == 0ULL) {
+        session->pointLodHierarchyGeneration = 1ULL;
+    }
+    ClearAdaptiveLodRuntimeCache(session);
+    session->pointLodCacheStatus = std::move(statusMessage);
+    if (runtimeState != nullptr) {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+}
+
+void StartPointCloudLodBuildWorker(
+    PreviewLayerSession* session,
+    std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud) {
+    if (session == nullptr || cloud == nullptr || cloud->positions.empty()) {
+        return;
+    }
+    if (session->pointLodBuildWorker.joinable()) {
+        return;
+    }
+
+    session->pointLodBuildState = std::make_shared<PointCloudLodBuildAsyncState>();
+    auto buildState = session->pointLodBuildState;
+    {
+        std::scoped_lock lock(buildState->mutex);
+        buildState->running = true;
+        buildState->startedAt = std::chrono::steady_clock::now();
+        buildState->progress = PointCloudLodBuildProgress{
+            .sourcePointCount = static_cast<std::uint64_t>(cloud->positions.size())};
+    }
+    const auto cachePath = session->pointLodCachePath;
+    const auto cacheSource = session->pointLodCacheSource;
+    const auto buildConfig = session->pointLodBuildConfig;
+    const bool writePersistentCache = !cachePath.empty() && cacheSource.sourceSizeBytes > 0ULL;
+    session->pointLodCacheStatus = writePersistentCache ? "Building LOD cache" : "Building in-memory LOD";
+    session->pointLodBuildWorker = std::jthread{
+        [buildState, cloud = std::move(cloud), cachePath, cacheSource, buildConfig, writePersistentCache](
+            std::stop_token stopToken) {
+            auto progressCallback = [buildState](const PointCloudLodBuildProgress& progress) {
+                std::scoped_lock lock(buildState->mutex);
+                buildState->progress = progress;
+            };
+            auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+                *cloud,
+                buildConfig,
+                progressCallback);
+            if (stopToken.stop_requested()) {
+                std::scoped_lock lock(buildState->mutex);
+                buildState->running = false;
+                return;
+            }
+
+            bool cacheSaved = false;
+            std::string saveError;
+            if (writePersistentCache && !hierarchy.Empty()) {
+                cacheSaved = invisible_places::renderer::pointcloud::SavePointCloudLodHierarchyCache(
+                    cachePath,
+                    cacheSource,
+                    buildConfig,
+                    hierarchy,
+                    &saveError);
+            }
+            std::string status = "LOD cache ready";
+            if (writePersistentCache && !cacheSaved) {
+                status = saveError.empty() ? "LOD cache ready, save failed" : "LOD cache ready, save failed: " + saveError;
+            } else if (!writePersistentCache) {
+                status = "In-memory LOD ready";
+            }
+
+            std::scoped_lock lock(buildState->mutex);
+            buildState->completed = PointCloudLodBuildCompletion{
+                .hierarchy = std::move(hierarchy),
+                .cacheSaved = cacheSaved,
+                .statusMessage = std::move(status),
+            };
+            buildState->running = false;
+        }};
+}
+
+bool RebuildSelectedPointCloudLodCache(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr || session->kind != LayerKind::PointCloud) {
+        return false;
+    }
+    if (!session->loaded || session->offlinePointCloud == nullptr) {
+        runtimeState->errorMessage = "Load a LiDAR layer before rebuilding its LOD cache.";
+        return false;
+    }
+    if (session->pointLodBuildWorker.joinable()) {
+        runtimeState->statusMessage = session->displayName + ": LOD cache rebuild already running.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
+
+    if (session->adaptiveLodWorker.joinable()) {
+        session->adaptiveLodWorker.request_stop();
+        session->adaptiveLodWorker = std::jthread{};
+    }
+    session->adaptiveLodAsyncState.reset();
+    session->adaptiveLodAsyncPending = false;
+
+    std::string removeError;
+    const auto removedCount = RemovePointCloudLodCacheFiles(session->pointLodCachePath, &removeError);
+    ClearAdaptiveLodRuntimeCache(session);
+    session->pointLodHierarchy.reset();
+    session->pointLodHierarchyGeneration =
+        session->pointLodHierarchyGeneration == std::numeric_limits<std::uint64_t>::max()
+            ? 1ULL
+            : session->pointLodHierarchyGeneration + 1ULL;
+    if (session->pointLodHierarchyGeneration == 0ULL) {
+        session->pointLodHierarchyGeneration = 1ULL;
+    }
+    session->pointLodCacheStatus =
+        removedCount > 0U ? "Rebuilding LOD cache" : "Rebuilding LOD cache from source";
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage =
+        session->displayName + ": rebuilding LOD cache" +
+        (removedCount > 0U ? " after removing " + FormatPointCount(removedCount) + " cache file(s)." : ".");
+    runtimeState->errorMessage = std::move(removeError);
+
+    StartPointCloudLodBuildWorker(session, session->offlinePointCloud);
+    return true;
+}
+
+void PollPointCloudLodWorkers(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    for (auto& session : runtimeState->sessions) {
+        if (session.pointLodBuildState != nullptr) {
+            std::optional<PointCloudLodBuildCompletion> completion;
+            bool running = false;
+            {
+                std::scoped_lock lock(session.pointLodBuildState->mutex);
+                running = session.pointLodBuildState->running;
+                if (session.pointLodBuildState->completed.has_value()) {
+                    completion = std::move(session.pointLodBuildState->completed);
+                    session.pointLodBuildState->completed.reset();
+                }
+            }
+            if (completion.has_value()) {
+                AttachPointCloudLodHierarchy(
+                    runtimeState,
+                    &session,
+                    std::move(completion->hierarchy),
+                    completion->statusMessage);
+                runtimeState->statusMessage = session.displayName + ": " + completion->statusMessage;
+            }
+            if (!running && session.pointLodBuildWorker.joinable()) {
+                session.pointLodBuildWorker = std::jthread{};
+                session.pointLodBuildState.reset();
+            }
+        }
+
+        if (session.adaptiveLodAsyncState == nullptr) {
+            continue;
+        }
+
+        std::optional<AdaptiveLodAsyncCompletion> completion;
+        bool completionApplyThrottled = false;
+        bool running = false;
+        std::uint64_t latestRequestedKey = 0;
+        std::uint64_t latestRequestedGeneration = 0;
+        std::chrono::steady_clock::time_point inFlightStartedAt{};
+        const auto pollNow = std::chrono::steady_clock::now();
+        {
+            std::scoped_lock lock(session.adaptiveLodAsyncState->mutex);
+            running = session.adaptiveLodAsyncState->running;
+            latestRequestedKey = session.adaptiveLodAsyncState->latestRequestedKey;
+            latestRequestedGeneration = session.adaptiveLodAsyncState->latestRequestedGeneration;
+            inFlightStartedAt = session.adaptiveLodAsyncState->inFlightStartedAt;
+            if (session.adaptiveLodAsyncState->completed.has_value()) {
+                const auto& pendingCompletion = session.adaptiveLodAsyncState->completed.value();
+                const bool staleCompletion =
+                    pendingCompletion.key != latestRequestedKey ||
+                    pendingCompletion.requestGeneration != latestRequestedGeneration;
+                const bool throttleMotionApply =
+                    !staleCompletion &&
+                    runtimeState->cameraInteraction.navigationActive &&
+                    session.adaptiveLodLastAppliedAt.time_since_epoch().count() != 0 &&
+                    pollNow - session.adaptiveLodLastAppliedAt < kAdaptiveMotionApplyInterval;
+                if (throttleMotionApply) {
+                    completionApplyThrottled = true;
+                } else {
+                    completion = std::move(session.adaptiveLodAsyncState->completed);
+                    session.adaptiveLodAsyncState->completed.reset();
+                }
+            }
+        }
+        if (completionApplyThrottled) {
+            ++session.adaptiveLodMotionApplyThrottleCount;
+            session.adaptiveLodAsyncPending = true;
+            session.adaptiveLodAsyncPendingAgeMs = 0.0;
+            session.adaptiveLodRuntimeStatus = "async traversal ready, motion apply throttled";
+            session.adaptiveLodFallbackState = "motion hold";
+        } else if (completion.has_value()) {
+            const bool staleCompletion =
+                completion->key != latestRequestedKey ||
+                completion->requestGeneration != latestRequestedGeneration;
+            if (staleCompletion) {
+                ++session.adaptiveLodStaleTraversalDiscardedCount;
+                session.adaptiveLodRuntimeStatus = "discarded stale async traversal";
+                runtimeState->previewRenderStateSignatureValid = false;
+            } else if (!completion->drawItems.empty()) {
+                const bool hadDisplayedBase =
+                    session.adaptiveLodDisplayedBase.valid && !session.adaptiveLodDisplayedBase.coarseFallback;
+                const auto displayedVisibleSourceCount =
+                    hadDisplayedBase
+                        ? session.adaptiveLodDisplayedBase.visibleRepresentedSourceCount
+                        : session.adaptiveLodVisibleRepresentedSourceCount;
+                const auto candidateVisibleSourceCount =
+                    AdaptiveLodCandidateVisibleSourceCount(completion->drawItems, completion->diagnostics);
+                if (AdaptiveLodCandidateWouldDemoteDisplayed(
+                        session,
+                        completion->densityMode,
+                        false)) {
+                    ++session.adaptiveLodCandidateDemotionBlockedCount;
+                    ++session.adaptiveLodSkippedMotionPatchCount;
+                    session.adaptiveLodRuntimeStatus =
+                        runtimeState->cameraInteraction.navigationActive
+                            ? "candidate demotion blocked during motion; holding displayed base"
+                            : "candidate demotion blocked; idle no-flash refine";
+                    session.adaptiveLodFallbackState =
+                        runtimeState->cameraInteraction.navigationActive
+                            ? "motion base; candidate demotion blocked"
+                            : "idle no-flash refine";
+                    runtimeState->previewRenderStateSignatureValid = false;
+                } else {
+                    StoreAdaptiveLodCacheEntry(
+                        &session,
+                        completion->key,
+                        completion->densityMode,
+                        std::move(completion->drawItems),
+                        completion->representativeBudget,
+                        completion->fragmentBudget,
+                        completion->traversalMs,
+                        runtimeState->previewFrameCounter,
+                        false,
+                        completion->diagnostics);
+                    if (runtimeState->cameraInteraction.navigationActive && hadDisplayedBase) {
+                        session.adaptiveLodMotionPatch = session.adaptiveLodCache;
+                        ++session.adaptiveLodMotionPatchApplyCount;
+                        session.adaptiveLodMotionPatchRepresentativeCount =
+                            completion->diagnostics.emittedRepresentativeCount > 0U
+                                ? completion->diagnostics.emittedRepresentativeCount
+                                : session.adaptiveLodCache.representativeCount;
+                        session.adaptiveLodCoverageGapSourceCount =
+                            candidateVisibleSourceCount > displayedVisibleSourceCount
+                                ? candidateVisibleSourceCount - displayedVisibleSourceCount
+                                : 0ULL;
+                        session.adaptiveLodRuntimeStatus = "motion coverage patch applied";
+                        session.adaptiveLodFallbackState = "motion patch exact";
+                    } else {
+                        session.adaptiveLodIdleCandidate = session.adaptiveLodCache;
+                        session.adaptiveLodMotionPatchRepresentativeCount = 0;
+                        session.adaptiveLodCoverageGapSourceCount = 0;
+                        session.adaptiveLodRuntimeStatus = "async traversal ready";
+                    }
+                    session.adaptiveLodDisplayedDensityMode = completion->densityMode;
+                    runtimeState->previewRenderStateSignatureValid = false;
+                }
+            } else {
+                session.adaptiveLodRuntimeStatus = "async traversal produced no visible reps";
+            }
+            session.adaptiveLodAsyncPending = false;
+            session.adaptiveLodAsyncPendingAgeMs = 0.0;
+        } else {
+            session.adaptiveLodAsyncPending = running;
+            session.adaptiveLodAsyncPendingAgeMs =
+                running && inFlightStartedAt.time_since_epoch().count() != 0
+                    ? std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - inFlightStartedAt)
+                          .count()
+                    : 0.0;
+        }
+        if (!running && session.adaptiveLodWorker.joinable()) {
+            session.adaptiveLodWorker = std::jthread{};
+        }
+    }
+}
+
 ImVec2 CurrentUiViewportOrigin() {
     if (ImGui::GetCurrentContext() != nullptr) {
         if (const ImGuiViewport* mainViewport = ImGui::GetMainViewport(); mainViewport != nullptr) {
@@ -3562,6 +5357,15 @@ std::optional<LayerLoadResult> TakeCompletedBackgroundResult(
     return completed;
 }
 
+std::optional<PointCloudLoadProgress> CurrentPointCloudLoadProgress(
+    const std::shared_ptr<BackgroundLayerLoadState>& backgroundState) {
+    if (backgroundState == nullptr) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock(backgroundState->mutex);
+    return backgroundState->pointCloudProgress;
+}
+
 bool LoadResultSucceeded(const LayerLoadResult& result) {
     return std::visit([](const auto& loadResult) { return loadResult.success; }, result);
 }
@@ -3608,6 +5412,7 @@ bool ActivateLoadedPointCloud(
 
     const bool hadVisibleLayersBefore = VisibleLayerCount(*runtimeState) > 0;
     auto& session = runtimeState->sessions[sessionIndex];
+    StopPointCloudBackgroundLodWork(&session);
     session.hasSourceRgb = cloud.hasSourceRgb;
     session.hasNormals = cloud.hasNormals;
     session.totalPrimitives = cloud.PointCount();
@@ -3628,27 +5433,66 @@ bool ActivateLoadedPointCloud(
             cloud,
             session.pointBudget.activePoints == 0 ? session.totalPrimitives : session.pointBudget.activePoints);
     }
-    ClearPreviewLodSampleCache(&session);
-
+    ClearAdaptiveLodRuntimeCache(&session);
+    session.pointLodHierarchy.reset();
+    session.pointLodHierarchyGeneration = 0;
+    const auto effectiveSourcePath = !cloud.sourcePath.empty() ? cloud.sourcePath : session.sourcePath;
+    session.pointLodCacheSource =
+        invisible_places::renderer::pointcloud::MakePointCloudLodCacheSource(effectiveSourcePath, cloud);
+    session.pointLodCachePath = invisible_places::renderer::pointcloud::BuildPointCloudLodCachePath(
+        PointCloudLodCacheDirectory(*runtimeState),
+        effectiveSourcePath);
+    session.pointLodCacheStatus = "Loading LOD cache";
+    if (session.pointLodCacheSource.sourceSizeBytes > 0ULL && session.rebuildPointLodCacheOnLoad) {
+        std::string removeError;
+        const auto removedCount = RemovePointCloudLodCacheFiles(session.pointLodCachePath, &removeError);
+        session.pointLodCacheStatus =
+            removedCount > 0U ? "LOD cache rebuild requested" : "LOD cache rebuild requested, no old cache found";
+        if (!removeError.empty()) {
+            runtimeState->errorMessage = "LOD cache cleanup warning: " + removeError;
+        }
+    } else if (session.pointLodCacheSource.sourceSizeBytes > 0ULL) {
+        auto cacheLoad = invisible_places::renderer::pointcloud::LoadPointCloudLodHierarchyCache(
+            session.pointLodCachePath,
+            session.pointLodCacheSource,
+            session.pointLodBuildConfig);
+        if (cacheLoad.loaded) {
+            AttachPointCloudLodHierarchy(
+                runtimeState,
+                &session,
+                std::move(cacheLoad.hierarchy),
+                "LOD cache ready");
+        } else {
+            session.pointLodCacheStatus = cacheLoad.stale ? "LOD cache stale" : cacheLoad.message;
+        }
+    } else {
+        session.pointLodCacheStatus = "LOD cache unavailable";
+    }
     SanitizePointCloudStyle(&session);
     if (session.kind == LayerKind::PointCloud) {
         EnsurePointVisuals(&session);
         UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
     }
 
+    auto cloudPtr =
+        std::make_shared<invisible_places::io::LoadedPointCloud>(std::move(cloud));
     try {
-        viewport->UploadPointCloud(sessionIndex, cloud, session.pointBudget.sampledIndices);
+        viewport->UploadPointCloud(sessionIndex, *cloudPtr, session.pointBudget.sampledIndices);
     } catch (const std::exception& error) {
         session.loaded = false;
         session.visible = false;
         session.offlinePointCloud.reset();
+        session.pointLodHierarchy.reset();
+        ClearAdaptiveLodRuntimeCache(&session);
         runtimeState->errorMessage = "GPU upload failed: " + std::string{error.what()};
         std::cerr << runtimeState->errorMessage << std::endl;
         return false;
     }
 
-    session.offlinePointCloud =
-        std::make_shared<invisible_places::io::LoadedPointCloud>(std::move(cloud));
+    session.offlinePointCloud = cloudPtr;
+    if (session.pointLodHierarchy == nullptr || session.pointLodHierarchy->Empty()) {
+        StartPointCloudLodBuildWorker(&session, cloudPtr);
+    }
     if (!IsGeneratedWaterOverlaySession(session)) {
         TryLoadWaterPathCacheForSupport(runtimeState, session);
     }
@@ -3750,10 +5594,16 @@ void BeginLayerLoad(std::size_t sessionIndex, PreviewRuntimeState* runtimeState)
                 return;
             }
 
-            LayerLoadResult result = layerKind == LayerKind::PointCloud
-                                         ? LayerLoadResult{invisible_places::io::LoadPointCloud(filePath)}
-                                         : LayerLoadResult{
-                                               invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
+            LayerLoadResult result =
+                layerKind == LayerKind::PointCloud
+                    ? LayerLoadResult{invisible_places::io::LoadPointCloud(
+                          filePath,
+                          [backgroundState](const PointCloudLoadProgress& progress) {
+                              std::scoped_lock lock(backgroundState->mutex);
+                              backgroundState->pointCloudProgress = progress;
+                          })}
+                    : LayerLoadResult{
+                          invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
             if (stopToken.stop_requested()) {
                 return;
             }
@@ -3868,6 +5718,7 @@ void UnloadLayerByIndex(
     if (!session.loaded) {
         return;
     }
+    StopPointCloudBackgroundLodWork(&session);
 
     if (session.kind == LayerKind::PointCloud) {
         viewport->RemovePointCloud(sessionIndex);
@@ -3879,7 +5730,10 @@ void UnloadLayerByIndex(
     session.visible = false;
     session.pivotSamples.clear();
     session.offlinePointCloud.reset();
-    ClearPreviewLodSampleCache(&session);
+    session.pointLodHierarchy.reset();
+    session.pointLodHierarchyGeneration = 0;
+    session.pointLodCacheStatus = "LOD cache unavailable";
+    ClearAdaptiveLodRuntimeCache(&session);
 }
 
 bool UnloadGeneratedWaterOverlays(
@@ -5182,6 +7036,35 @@ PointCloudStyleState MakeEffectiveFastBasicStyle(
         }
     }
     return style;
+}
+
+PointCloudStyleState MakeEffectivePaintedAdaptiveStyle(const PointCloudStyleState& sourceStyle) {
+    auto style = sourceStyle;
+    if (style.stylisationMode == PointCloudStylisationMode::Off) {
+        style.stylisationMode = PointCloudStylisationMode::BrushParticles;
+        style.stylisationStrength = 0.85F;
+        style.stylisationColorLevels = 6.0F;
+        style.stylisationInkStrength = 0.15F;
+        style.stylisationPaperGrain = 0.42F;
+        style.stylisationPigmentBleed = 0.66F;
+        style.brushAspect = 2.6F;
+        style.strokeJitter = std::max(style.strokeJitter, 0.35F);
+    }
+    return style;
+}
+
+PointCloudStyleState MakeEffectivePointRendererStyle(
+    PointCloudRendererMode mode,
+    const PointCloudStyleState& sourceStyle,
+    bool hasSourceRgb,
+    bool waterOverlay) {
+    if (invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFastBasic(mode)) {
+        return MakeEffectiveFastBasicStyle(sourceStyle, hasSourceRgb, waterOverlay);
+    }
+    if (invisible_places::renderer::pointcloud::PointCloudRendererModeUsesPaintedStyle(mode)) {
+        return MakeEffectivePaintedAdaptiveStyle(sourceStyle);
+    }
+    return sourceStyle;
 }
 
 std::size_t AddOrRefreshWaterOverlaySession(
@@ -6669,8 +8552,6 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.sidePanelPinned = runtimeState.sidePanel.pinned;
     document.autoLowerGsplatQualityWhileNavigating =
         runtimeState.projectSettings.autoLowerGsplatQualityWhileNavigating;
-    document.pointCloudPreviewLodMode = runtimeState.projectSettings.pointCloudPreviewLodMode;
-    document.interactivePointCap = runtimeState.projectSettings.interactivePointCap;
     document.pointCloudRendererMode = runtimeState.projectSettings.pointCloudRendererMode;
     document.cameraState = runtimeState.camera.CaptureState();
     document.cameraShots = runtimeState.cameraShots;
@@ -6868,6 +8749,9 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
     }
 
     runtimeState->persistence.queuedLoadIndices.clear();
+    for (auto& session : runtimeState->sessions) {
+        StopPointCloudBackgroundLodWork(&session);
+    }
     if (runtimeState->offlineRenderJob.active) {
         std::cout << "Requesting animation export shutdown..." << std::endl;
         runtimeState->offlineRenderJob.cancelRequested = true;
@@ -6908,8 +8792,6 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
     runtimeState->projectSettings.autoLowerGsplatQualityWhileNavigating =
         document.autoLowerGsplatQualityWhileNavigating;
-    runtimeState->projectSettings.pointCloudPreviewLodMode = document.pointCloudPreviewLodMode;
-    runtimeState->projectSettings.interactivePointCap = document.interactivePointCap;
     runtimeState->projectSettings.pointCloudRendererMode = document.pointCloudRendererMode;
     auto renderSettings = document.renderJobSettings;
     if (renderSettings.outputDirectory.empty() && !runtimeState->renderSettings.outputDirectory.empty()) {
@@ -7127,7 +9009,6 @@ bool ApplyProjectDocumentToRuntime(
 
         if (session.kind == LayerKind::PointCloud && layerIt->pointBudgetActivePoints > 0) {
             session.pointBudget = MakePreviewPointBudgetState(session, layerIt->pointBudgetActivePoints);
-            ClearPreviewLodSampleCache(&session);
             if (session.loaded) {
                 viewport->UpdatePointBudget(sessionIndex, session.pointBudget.sampledIndices);
             }
@@ -8949,14 +10830,14 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         auto style = IsGeneratedWaterOverlaySession(session)
                          ? MakeWaterTrailExportStyle(session.pointStyle)
                          : session.pointStyle;
+        style = MakeEffectivePointRendererStyle(
+            runtimeState.projectSettings.pointCloudRendererMode,
+            style,
+            session.hasSourceRgb,
+            IsGeneratedWaterOverlaySession(session));
         layers.push_back(
             {.cloud = session.offlinePointCloud,
-             .style = FastBasicPointRendererActive(runtimeState.projectSettings)
-                          ? MakeEffectiveFastBasicStyle(
-                                style,
-                                session.hasSourceRgb,
-                                IsGeneratedWaterOverlaySession(session))
-                          : style,
+             .style = style,
              .hasSourceRgb = session.hasSourceRgb,
              .fastBasic = FastBasicPointRendererActive(runtimeState.projectSettings),
              .drawPointCount = FastBasicPointRendererActive(runtimeState.projectSettings)
@@ -9100,33 +10981,14 @@ bool HasOfflinePointLayers(const PreviewRuntimeState& runtimeState) {
 std::uint64_t EffectiveAnimationExportPointDrawCount(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session,
-    bool previewDensity,
+    invisible_places::output::PointCloudExportDensityMode pointCloudDensityMode,
     PointCloudRendererMode rendererMode) {
-    if (rendererMode == PointCloudRendererMode::FastBasic) {
-        return session.pointBudget.activePoints;
-    }
-
-    if (!previewDensity) {
+    static_cast<void>(runtimeState);
+    if (invisible_places::output::PointCloudExportDensityModeUsesFullSource(pointCloudDensityMode) ||
+        invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFullSource(rendererMode)) {
         return session.totalPrimitives;
     }
-
-    const auto decision = invisible_places::renderer::pointcloud::ResolvePointCloudPreviewLod(
-        session.pointBudget,
-        runtimeState.projectSettings.pointCloudPreviewLodMode,
-        false,
-        true,
-        kPointCloudPreviewLodTarget);
-    if (!decision.usesPreviewLod) {
-        return decision.drawPointCount;
-    }
-
-    if (session.previewLodSampledDrawCount == 0) {
-        return session.pointBudget.activePoints;
-    }
-
-    return std::min<std::uint64_t>(
-        session.previewLodSampledDrawCount,
-        decision.drawPointCount);
+    return session.pointBudget.activePoints;
 }
 
 struct PointVisualExportOverride {
@@ -9137,7 +10999,7 @@ struct PointVisualExportOverride {
 std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState>
 BuildAnimationExportPointCloudLayerSnapshot(
     const PreviewRuntimeState& runtimeState,
-    bool previewDensity,
+    invisible_places::output::PointCloudExportDensityMode pointCloudDensityMode,
     const std::optional<PointVisualExportOverride>& visualOverride,
     PointCloudRendererMode rendererMode) {
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> layers;
@@ -9153,7 +11015,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
         const auto drawPointCount = EffectiveAnimationExportPointDrawCount(
             runtimeState,
             session,
-            previewDensity,
+            pointCloudDensityMode,
             rendererMode);
         auto exportStyle =
             visualOverride.has_value() && visualOverride->sessionIndex == sessionIndex
@@ -9162,13 +11024,11 @@ BuildAnimationExportPointCloudLayerSnapshot(
         if (IsGeneratedWaterOverlaySession(session)) {
             exportStyle = MakeWaterTrailExportStyle(exportStyle);
         }
-        const auto effectiveStyle =
-            rendererMode == PointCloudRendererMode::FastBasic
-                ? MakeEffectiveFastBasicStyle(
-                      exportStyle,
-                      session.hasSourceRgb,
-                      IsGeneratedWaterOverlaySession(session))
-                : exportStyle;
+        const auto effectiveStyle = MakeEffectivePointRendererStyle(
+            rendererMode,
+            exportStyle,
+            session.hasSourceRgb,
+            IsGeneratedWaterOverlaySession(session));
         layers.push_back(
             {.layerId = sessionIndex,
              .style = effectiveStyle,
@@ -9182,6 +11042,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
 }
 
 invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState(
+    PreviewRuntimeState& runtimeState,
     const OfflineRenderJobState& job,
     const invisible_places::camera::CameraState& cameraState,
     std::uint32_t width,
@@ -9200,8 +11061,9 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     renderState.cameraPosition = matrices.position;
     renderState.backgroundColor = job.exportBackgroundColor;
     renderState.pointCloudRendererMode = job.pointCloudRendererMode;
-    renderState.eyeDomeLightingEnabled =
-        job.exportEyeDomeLightingEnabled && job.pointCloudRendererMode != PointCloudRendererMode::FastBasic;
+    const bool fastBasicPointRenderer =
+        invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFastBasic(job.pointCloudRendererMode);
+    renderState.eyeDomeLightingEnabled = job.exportEyeDomeLightingEnabled && !fastBasicPointRenderer;
     const float screenPixelScale = invisible_places::output::ComputePointSizePixelScale(
         width,
         height,
@@ -9211,31 +11073,44 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
         std::max(0.0F, job.exportEyeDomeLightingThickness) * screenPixelScale;
     renderState.nearPlane = camera.NearPlane();
     renderState.farPlane = camera.FarPlane();
-    renderState.hasDepthOfField =
-        cameraState.hasDepthOfField && job.pointCloudRendererMode != PointCloudRendererMode::FastBasic;
+    renderState.hasDepthOfField = cameraState.hasDepthOfField && !fastBasicPointRenderer;
     renderState.focusDistance = cameraState.focusDistance;
     renderState.apertureFStops = cameraState.apertureFStops;
     renderState.depthOfFieldMaxBlurPixels =
         std::max(0.0F, cameraState.depthOfFieldMaxBlurPixels) * screenPixelScale;
     renderState.gaussianSplatFootprintBoost = job.exportGaussianSplatFootprintBoost;
     renderState.flowTimeSeconds =
-        job.pointCloudRendererMode == PointCloudRendererMode::FastBasic
+        fastBasicPointRenderer
             ? 0.0F
             : static_cast<float>(job.currentFrame) /
                   static_cast<float>(std::max<std::uint32_t>(1U, job.settings.framesPerSecond));
     renderState.pointSizeScale = screenPixelScale;
     renderState.pointCloudLayers = job.exportPointCloudLayers;
+    const bool forceFullSource =
+        invisible_places::output::PointCloudExportDensityModeUsesFullSource(job.pointCloudDensityMode) ||
+        invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFullSource(job.pointCloudRendererMode);
+    if (!forceFullSource) {
+        for (auto& layer : renderState.pointCloudLayers) {
+            if (layer.layerId >= runtimeState.sessions.size()) {
+                continue;
+            }
+            static_cast<void>(PopulateAdaptivePointCloudLayer(
+                &runtimeState.sessions[layer.layerId],
+                renderState.viewProjection,
+                renderState.cameraPosition,
+                width,
+                height,
+                job.pointCloudDensityMode,
+                fastBasicPointRenderer,
+                false,
+                false,
+                true,
+                static_cast<std::uint64_t>(job.currentFrame) + 1ULL,
+                &layer));
+        }
+    }
 
     return renderState;
-}
-
-std::string FormatElapsedTime(std::chrono::steady_clock::duration elapsed) {
-    const auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
-    const auto minutes = totalSeconds / 60;
-    const auto seconds = totalSeconds % 60;
-    std::ostringstream output;
-    output << minutes << "m " << seconds << "s";
-    return output.str();
 }
 
 std::uint64_t CurrentResidentMemoryBytes() {
@@ -9349,8 +11224,8 @@ const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMo
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Quick MP4";
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
-            return "HQ Preview-Density EXR";
+        case invisible_places::output::AnimationExportMode::HqAdaptiveExr:
+            return "HQ Adaptive EXR";
     }
 
     return "Animation Export";
@@ -9360,7 +11235,7 @@ const char* AnimationExportCaptureLabel(invisible_places::output::AnimationExpor
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "MP4";
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::HqAdaptiveExr:
             return "HQ EXR";
     }
 
@@ -9371,18 +11246,56 @@ const char* AnimationExportOverlayLabel(invisible_places::output::AnimationExpor
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Encoding Fast Preview MP4";
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
-            return "Rendering HQ Preview-Density EXR";
+        case invisible_places::output::AnimationExportMode::HqAdaptiveExr:
+            return "Rendering HQ Adaptive EXR";
     }
 
     return "Animation Export";
+}
+
+bool DrawPointCloudExportDensityCombo(
+    const char* label,
+    invisible_places::output::PointCloudExportDensityMode* densityMode) {
+    if (densityMode == nullptr) {
+        return false;
+    }
+
+    const invisible_places::output::PointCloudExportDensityMode densityModes[] = {
+        invisible_places::output::PointCloudExportDensityMode::FullSource,
+        invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality,
+        invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive,
+        invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview,
+        invisible_places::output::PointCloudExportDensityMode::ArtisticAsPreview,
+        invisible_places::output::PointCloudExportDensityMode::ArtisticHighQuality,
+    };
+    const char* densityLabels[] = {
+        invisible_places::output::PointCloudExportDensityModeName(densityModes[0]),
+        invisible_places::output::PointCloudExportDensityModeName(densityModes[1]),
+        invisible_places::output::PointCloudExportDensityModeName(densityModes[2]),
+        invisible_places::output::PointCloudExportDensityModeName(densityModes[3]),
+        invisible_places::output::PointCloudExportDensityModeName(densityModes[4]),
+        invisible_places::output::PointCloudExportDensityModeName(densityModes[5]),
+    };
+
+    int densityIndex = 1;
+    for (int index = 0; index < IM_ARRAYSIZE(densityModes); ++index) {
+        if (*densityMode == densityModes[index]) {
+            densityIndex = index;
+            break;
+        }
+    }
+    if (!ImGui::Combo(label, &densityIndex, densityLabels, IM_ARRAYSIZE(densityLabels))) {
+        return false;
+    }
+    *densityMode = densityModes[std::clamp(densityIndex, 0, IM_ARRAYSIZE(densityModes) - 1)];
+    return true;
 }
 
 const char* StillCameraExportOverlayLabel(invisible_places::output::AnimationExportMode mode) {
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Exporting Still Camera MP4";
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::HqAdaptiveExr:
             return "Exporting Still Camera EXR Stack";
     }
 
@@ -9397,7 +11310,7 @@ const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) 
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "ExportLog_MP4_";
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::HqAdaptiveExr:
             return "ExportLog_EXR_";
     }
 
@@ -9604,7 +11517,9 @@ std::string WriteExportLog(
     log << "Total frames planned: " << job.frames.size() << '\n';
     log << "Frames captured: " << job.currentFrame << '\n';
     log << "Frames written: " << job.writtenFrameCount << '\n';
-    log << "Preview density: " << (job.previewDensity ? "yes" : "no") << '\n';
+    log << "Point density mode: "
+        << invisible_places::output::PointCloudExportDensityModeName(job.pointCloudDensityMode)
+        << '\n';
     log << "Point renderer: " << PointCloudRendererModeLabel(job.pointCloudRendererMode) << '\n';
     log << "Export renderer: Beauty Raster\n";
     if (job.exportEyeDomeLightingEnabled) {
@@ -10169,7 +12084,7 @@ bool StartQuickMp4ExportJob(
     };
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
-        false,
+        invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview,
         visualOverride,
         runtimeState->projectSettings.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
@@ -10202,7 +12117,7 @@ bool StartQuickMp4ExportJob(
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
-        .previewDensity = false,
+        .pointCloudDensityMode = invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview,
         .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .quickMp4BatchJob = true,
         .quickMp4BatchIndex = runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
@@ -10405,13 +12320,9 @@ void StartStillCameraExportCapture(
     }
 
     auto& job = runtimeState->offlineRenderJob;
-    if (job.worker.joinable() && job.preparingExport) {
-        job.worker = std::jthread{};
-    }
-
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
-        job.previewDensity,
+        job.pointCloudDensityMode,
         std::nullopt,
         job.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
@@ -10420,8 +12331,6 @@ void StartStillCameraExportCapture(
     }
 
     job.exportPointCloudLayers = std::move(exportPointCloudLayers);
-    job.preparingExport = false;
-    job.preparationState.reset();
     auto writerState = std::make_shared<AnimationExportWriterState>();
     job.writerState = writerState;
     const AnimationExportOutputOptions outputOptions{
@@ -10446,86 +12355,6 @@ void StartStillCameraExportCapture(
     runtimeState->errorMessage.clear();
 }
 
-void ProcessStillCameraPreparationStep(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    if (runtimeState == nullptr || viewport == nullptr || !runtimeState->offlineRenderJob.active) {
-        return;
-    }
-
-    auto& job = runtimeState->offlineRenderJob;
-    auto preparationState = job.preparationState;
-    if (preparationState == nullptr) {
-        StartStillCameraExportCapture(runtimeState, viewport);
-        return;
-    }
-
-    if (job.cancelRequested) {
-        {
-            std::scoped_lock lock(preparationState->mutex);
-            preparationState->cancelRequested = true;
-        }
-        if (job.worker.joinable()) {
-            job.worker.request_stop();
-        }
-        runtimeState->statusMessage = "Cancelling still-camera export preparation...";
-    }
-
-    bool completed = false;
-    bool cancelled = false;
-    std::size_t completedRequests = 0;
-    std::size_t totalRequests = 0;
-    std::string currentLayerName;
-    std::string errorMessage;
-    std::vector<StillCameraPreviewLodPreparationResult> results;
-    {
-        std::scoped_lock lock(preparationState->mutex);
-        completed = preparationState->completed;
-        cancelled = preparationState->cancelled;
-        completedRequests = preparationState->completedRequests;
-        totalRequests = preparationState->totalRequests;
-        currentLayerName = preparationState->currentLayerName;
-        errorMessage = preparationState->errorMessage;
-        if (completed) {
-            results = std::move(preparationState->results);
-        }
-    }
-
-    if (!completed) {
-        runtimeState->statusMessage =
-            "Preparing still-camera EXR samples " +
-            std::to_string(std::min(completedRequests + 1U, totalRequests)) +
-            " / " + std::to_string(std::max<std::size_t>(1U, totalRequests)) +
-            (currentLayerName.empty() ? std::string{} : ": " + currentLayerName) + ".";
-        return;
-    }
-
-    if (!errorMessage.empty()) {
-        FinishOfflineRenderJob(runtimeState, {}, errorMessage);
-        return;
-    }
-    if (cancelled || job.cancelRequested) {
-        FinishOfflineRenderJob(runtimeState, "Still-camera export cancelled.");
-        return;
-    }
-
-    for (auto& result : results) {
-        if (result.sessionIndex >= runtimeState->sessions.size()) {
-            continue;
-        }
-        auto& session = runtimeState->sessions[result.sessionIndex];
-        if (!session.loaded || session.kind != LayerKind::PointCloud) {
-            continue;
-        }
-        session.previewLodRequestedDrawCount = result.requestedCount;
-        session.previewLodSampledDrawCount = static_cast<std::uint32_t>(result.sampledIndices.size());
-        session.previewLodSampledIndices = std::move(result.sampledIndices);
-        viewport->UpdateInteractivePointSampleBuffer(result.sessionIndex, session.previewLodSampledIndices);
-    }
-
-    StartStillCameraExportCapture(runtimeState, viewport);
-}
-
 void StartStillCameraExportJob(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -10546,7 +12375,7 @@ void StartStillCameraExportJob(
     std::filesystem::path videoOutputPath;
     AnimationExportOutputOptions outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath);
     const bool exrStackPreviewMp4 =
-        mode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
+        mode == invisible_places::output::AnimationExportMode::HqAdaptiveExr;
     if (AnimationExportWritesMp4(mode) || exrStackPreviewMp4) {
         const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
         const bool ffmpegAvailable = invisible_places::output::FfmpegExecutableAvailable(ffmpegPath);
@@ -10578,7 +12407,7 @@ void StartStillCameraExportJob(
         }
     }
 
-    const bool exportUsesPreviewDensity = false;
+    const auto exportDensityMode = runtimeState->cameraPanel.stillDensityMode;
 
     auto frames = BuildStillCameraRenderSequence(*runtimeState, settings);
     if (frames.empty()) {
@@ -10587,15 +12416,7 @@ void StartStillCameraExportJob(
         return;
     }
 
-    std::vector<StillCameraPreviewLodPreparationRequest> preparationRequests;
-    if (viewport != nullptr && exportUsesPreviewDensity) {
-        preparationRequests = BuildStillCameraPreviewLodPreparationRequests(*runtimeState);
-    }
-
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
-    auto preparationState = !preparationRequests.empty()
-                                ? std::make_shared<StillCameraPreparationState>()
-                                : std::shared_ptr<StillCameraPreparationState>{};
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
@@ -10614,7 +12435,7 @@ void StartStillCameraExportJob(
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
-        .previewDensity = exportUsesPreviewDensity,
+        .pointCloudDensityMode = exportDensityMode,
         .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .stillCameraJob = true,
         .animationName = "Still Camera",
@@ -10630,21 +12451,11 @@ void StartStillCameraExportJob(
         .exportEyeDomeLightingThickness = runtimeState->projectSettings.eyeDomeLightingThickness,
         .exportGaussianSplatFootprintBoost = runtimeState->projectSettings.gaussianSplatFootprintBoost,
         .exportPointCloudLayers = {},
-        .preparingExport = !preparationRequests.empty(),
-        .preparationState = preparationState,
     };
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
     runtimeState->errorMessage.clear();
-    if (!preparationRequests.empty()) {
-        runtimeState->offlineRenderJob.worker = std::jthread{
-            RunStillCameraPreviewLodPreparationWorker,
-            std::move(preparationRequests),
-            preparationState};
-        runtimeState->statusMessage = "Preparing still-camera EXR samples...";
-    } else {
-        StartStillCameraExportCapture(runtimeState, viewport);
-    }
+    StartStillCameraExportCapture(runtimeState, viewport);
 }
 
 void StartAnimationExportJob(
@@ -10677,10 +12488,7 @@ void StartAnimationExportJob(
     }
 
     std::filesystem::path videoOutputPath;
-    const bool exportUsesPreviewDensity = runtimeState->animationPanel.exportPreviewDensity;
-    if (viewport != nullptr && exportUsesPreviewDensity) {
-        PreparePreviewLodSampleCaches(runtimeState, viewport);
-    }
+    const auto exportDensityMode = runtimeState->animationPanel.exportDensityMode;
 
     auto frames = invisible_places::output::BuildAnimationRenderSequence(
         runtimeState->animationPanel.currentPath.value(),
@@ -10693,7 +12501,7 @@ void StartAnimationExportJob(
 
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
-        exportUsesPreviewDensity,
+        exportDensityMode,
         std::nullopt,
         runtimeState->projectSettings.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
@@ -10724,7 +12532,7 @@ void StartAnimationExportJob(
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
-        .previewDensity = exportUsesPreviewDensity,
+        .pointCloudDensityMode = exportDensityMode,
         .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .animationName = runtimeState->animationPanel.currentPath->name,
         .animationFilePath = runtimeState->animationPanel.currentFilePath.empty()
@@ -10805,8 +12613,6 @@ void FinishOfflineRenderJob(
     job.active = false;
     job.cancelRequested = false;
     job.writerFinishRequested = false;
-    job.preparingExport = false;
-    job.preparationState.reset();
     job.writerState.reset();
     if (clearQuickMp4Queue) {
         runtimeState->animationPanel.quickMp4Queue.clear();
@@ -10824,13 +12630,6 @@ void RequestOfflineRenderCancellation(OfflineRenderJobState* job) {
     }
 
     job->cancelRequested = true;
-    if (job->preparationState != nullptr) {
-        std::scoped_lock lock(job->preparationState->mutex);
-        job->preparationState->cancelRequested = true;
-    }
-    if (job->preparingExport && job->worker.joinable()) {
-        job->worker.request_stop();
-    }
 }
 
 void ProcessOfflineRenderJobStep(
@@ -10845,11 +12644,6 @@ void ProcessOfflineRenderJobStep(
     }
 
     auto& job = runtimeState->offlineRenderJob;
-    if (job.preparingExport) {
-        ProcessStillCameraPreparationStep(runtimeState, viewport);
-        return;
-    }
-
     RefreshAnimationExportWriterProgress(&job);
     if (job.writerState != nullptr) {
         bool writerCompleted = false;
@@ -10909,6 +12703,7 @@ void ProcessOfflineRenderJobStep(
     try {
         const auto renderFrame = [&](std::uint32_t width, std::uint32_t height) {
             const auto renderState = BuildPointCloudExrRenderState(
+                *runtimeState,
                 job,
                 job.frames[job.currentFrame],
                 width,
@@ -10921,13 +12716,14 @@ void ProcessOfflineRenderJobStep(
                 .renderState = renderState,
                 .width = width,
                 .height = height,
-                .previewDensity = job.previewDensity,
+                .pointCloudDensityMode = job.pointCloudDensityMode,
             };
             invisible_places::output::HalfRgbaExrImage renderedImage =
                 viewport->RenderPointCloudExrFrame(request);
 
             if (job.exportEyeDomeLightingEnabled &&
-                job.pointCloudRendererMode != PointCloudRendererMode::FastBasic) {
+                !invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFastBasic(
+                    job.pointCloudRendererMode)) {
                 invisible_places::output::ApplyEyeDomeLighting(
                     &renderedImage,
                     invisible_places::output::EyeDomeLightingSettings{
@@ -10999,28 +12795,28 @@ void DrawAnimationExportSection(
 
     const char* exportModeLabels[] = {
         "Fast Preview MP4",
-        "HQ Preview-Density EXR",
+        "HQ Adaptive EXR",
     };
     int exportModeIndex = 0;
     switch (panel.exportMode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             exportModeIndex = 0;
             break;
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::HqAdaptiveExr:
             exportModeIndex = 1;
             break;
     }
     if (ImGui::Combo("Export Mode", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
         const invisible_places::output::AnimationExportMode exportModes[] = {
             invisible_places::output::AnimationExportMode::FastPreviewMp4,
-            invisible_places::output::AnimationExportMode::HqPreviewDensityExr,
+            invisible_places::output::AnimationExportMode::HqAdaptiveExr,
         };
         panel.exportMode = exportModes[std::clamp(exportModeIndex, 0, 1)];
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        ImGui::TextDisabled("Fast MP4: full-cloud beauty export, sparse-point smoothing, no AOVs.");
+        ImGui::TextDisabled("Fast MP4: adaptive point density, sparse-point smoothing, no AOVs.");
     } else {
-        ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
+        ImGui::TextDisabled("HQ EXR: explicit adaptive/full-source density selection with beauty, alpha, and depth AOVs.");
     }
 
     bool settingsChanged = false;
@@ -11071,12 +12867,11 @@ void DrawAnimationExportSection(
         MarkCurrentAnimationExportSettingsDirty(runtimeState);
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        ImGui::TextDisabled("Point density: full source clouds; MP4 smoothing fills tiny gaps during encode.");
+        ImGui::TextDisabled("Point density: Fast Adaptive Preview; MP4 smoothing fills tiny gaps during encode.");
     } else {
-        ImGui::SameLine();
-        ImGui::Checkbox("Preview Density", &panel.exportPreviewDensity);
+        DrawPointCloudExportDensityCombo("Density Mode", &panel.exportDensityMode);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Uses the same draw counts and interactive sample buffers as animation playback.");
+            ImGui::SetTooltip("Selects Full Source or an adaptive density target for point-cloud export.");
         }
     }
 
@@ -11225,43 +13020,24 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             runtimeState->animationPanel.quickMp4QueueTotal);
         ImGui::Text("Visual: %s", job.exportVisualName.c_str());
     }
-    if (job.preparingExport && job.preparationState != nullptr) {
-        std::size_t completedRequests = 0;
-        std::size_t totalRequests = 0;
-        std::string currentLayerName;
-        {
-            std::scoped_lock lock(job.preparationState->mutex);
-            completedRequests = job.preparationState->completedRequests;
-            totalRequests = job.preparationState->totalRequests;
-            currentLayerName = job.preparationState->currentLayerName;
-        }
-        const float prepareProgress = totalRequests == 0
-                                          ? 0.0F
-                                          : static_cast<float>(completedRequests) /
-                                                static_cast<float>(totalRequests);
-        ImGui::ProgressBar(prepareProgress, ImVec2{360.0F, 0.0F});
-        ImGui::Text("Preparing samples: %zu / %zu", completedRequests, totalRequests);
-        if (!currentLayerName.empty()) {
-            ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-        }
-    } else {
-        const float frameProgress =
-            job.frames.empty()
-                ? 0.0F
-                : static_cast<float>(job.writtenFrameCount) /
-                      static_cast<float>(job.frames.size());
-        ImGui::ProgressBar(frameProgress, ImVec2{360.0F, 0.0F});
-        ImGui::Text(
-            "Captured: %u / %zu",
-            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-            job.frames.size());
-        ImGui::Text(
-            "Saved: %u / %zu",
-            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-            job.frames.size());
-        ImGui::Text("Queued: %zu", job.pendingFrameCount);
-    }
-        ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
+    const float frameProgress =
+        job.frames.empty()
+            ? 0.0F
+            : static_cast<float>(job.writtenFrameCount) /
+                  static_cast<float>(job.frames.size());
+    ImGui::ProgressBar(frameProgress, ImVec2{360.0F, 0.0F});
+    ImGui::Text(
+        "Captured: %u / %zu",
+        std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size());
+    ImGui::Text(
+        "Saved: %u / %zu",
+        std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+        job.frames.size());
+    ImGui::Text("Queued: %zu", job.pendingFrameCount);
+    ImGui::Text(
+        "Density: %s",
+        invisible_places::output::PointCloudExportDensityModeName(job.pointCloudDensityMode));
     if (job.writePreviewMp4 && job.mp4SupersampleScale > 1U) {
         ImGui::Text(
             "MP4 supersample: %ux -> %u x %u",
@@ -11289,6 +13065,166 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
         RequestOfflineRenderCancellation(&job);
     }
     ImGui::End();
+}
+
+double ProgressFraction(std::uint64_t completed, std::uint64_t total) {
+    if (total == 0U) {
+        return 0.0;
+    }
+    return std::clamp(static_cast<double>(completed) / static_cast<double>(total), 0.0, 1.0);
+}
+
+void DrawLoadProgressLines(
+    const PointCloudLoadProgress& progress,
+    std::chrono::steady_clock::duration elapsed) {
+    const auto fraction = ProgressFraction(progress.pointsRead, progress.totalPoints);
+    ImGui::ProgressBar(static_cast<float>(fraction), ImVec2{-FLT_MIN, 0.0F}, FormatPercent(fraction).c_str());
+    ImGui::Text(
+        "Read: %s / %s points",
+        FormatPointCount(progress.pointsRead).c_str(),
+        FormatPointCount(progress.totalPoints).c_str());
+    if (progress.totalBytes > 0U) {
+        ImGui::Text(
+            "Payload: %s / %s",
+            FormatByteCount(progress.bytesRead).c_str(),
+            FormatByteCount(progress.totalBytes).c_str());
+    }
+    ImGui::Text(
+        "Elapsed: %s | ETA: %s",
+        FormatElapsedTime(elapsed).c_str(),
+        FormatEta(EstimateRemainingTime(progress.pointsRead, progress.totalPoints, elapsed)).c_str());
+}
+
+void DrawLodBuildProgressLines(const PointCloudLodBuildProgressSnapshot& snapshot) {
+    if (!snapshot.available) {
+        return;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - snapshot.startedAt;
+    const auto completedRefs = snapshot.progress.finished
+                                   ? snapshot.progress.estimatedTotalSourceReferences
+                                   : snapshot.progress.processedSourceReferences;
+    const auto fraction = ProgressFraction(completedRefs, snapshot.progress.estimatedTotalSourceReferences);
+    ImGui::ProgressBar(static_cast<float>(fraction), ImVec2{-FLT_MIN, 0.0F}, FormatPercent(fraction).c_str());
+    ImGui::Text(
+        "%s | elapsed %s | ETA %s",
+        snapshot.running ? "Building LOD cache" : "LOD build finalizing",
+        FormatElapsedTime(elapsed).c_str(),
+        FormatEta(
+            EstimateRemainingTime(
+                completedRefs,
+                snapshot.progress.estimatedTotalSourceReferences,
+                elapsed))
+            .c_str());
+    ImGui::Text(
+        "Build refs: %s / %s approx",
+        FormatPointCount(snapshot.progress.processedSourceReferences).c_str(),
+        FormatPointCount(snapshot.progress.estimatedTotalSourceReferences).c_str());
+    ImGui::Text(
+        "Nodes: %s | reps: %s | depth: %u / %u",
+        FormatPointCount(snapshot.progress.nodesBuilt).c_str(),
+        FormatPointCount(snapshot.progress.representativesBuilt).c_str(),
+        snapshot.progress.maxDepthReached,
+        snapshot.progress.currentDepth);
+}
+
+void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
+    ImGui::Text("LOD cache: %s", session.pointLodCacheStatus.c_str());
+    if (!session.pointLodCachePath.empty()) {
+        std::error_code fileSizeError;
+        const auto fileSize = std::filesystem::file_size(session.pointLodCachePath, fileSizeError);
+        ImGui::TextWrapped(
+            "Cache file: %s%s%s",
+            session.pointLodCachePath.filename().string().c_str(),
+            fileSizeError ? "" : " | ",
+            fileSizeError ? "" : FormatByteCount(fileSize).c_str());
+    }
+
+    if (session.pointLodHierarchy != nullptr && !session.pointLodHierarchy->Empty()) {
+        ImGui::Text(
+            "Hierarchy: %s source, %s nodes, %s reps, gen %s",
+            FormatPointCount(session.pointLodHierarchy->sourcePointCount).c_str(),
+            FormatPointCount(session.pointLodHierarchy->nodes.size()).c_str(),
+            FormatPointCount(session.pointLodHierarchy->representatives.size()).c_str(),
+            FormatPointCount(session.pointLodHierarchyGeneration).c_str());
+    } else {
+        ImGui::TextDisabled("Hierarchy: not attached yet");
+    }
+
+    ImGui::Text(
+        "Build config: leaf <= %u, max depth %u, internal reps <= %u",
+        session.pointLodBuildConfig.maxLeafSourcePoints,
+        session.pointLodBuildConfig.maxDepth,
+        session.pointLodBuildConfig.maxInternalRepresentatives);
+    ImGui::Text("LOD runtime: %s", session.adaptiveLodRuntimeStatus.c_str());
+    ImGui::Text(
+        "Density requested/displayed: %s / %s",
+        invisible_places::output::PointCloudExportDensityModeName(session.adaptiveLodRequestedDensityMode),
+        invisible_places::output::PointCloudExportDensityModeName(session.adaptiveLodDisplayedDensityMode));
+    ImGui::Text(
+        "Movement tier: %s",
+        invisible_places::output::PointCloudExportDensityModeName(session.adaptiveMovementDensityMode));
+    ImGui::Text(
+        "Quality governor: %s",
+        session.adaptiveLodEmergencyDemotion ? "emergency demotion" : "normal");
+    ImGui::Text(
+        "Runtime cache: %s | async: %s | entries: %s",
+        session.adaptiveLodRuntimeCacheHit ? "hit" : "miss/reuse",
+        session.adaptiveLodAsyncPending ? "pending" : "idle",
+        FormatPointCount(session.adaptiveLodRuntimeCache.size()).c_str());
+    ImGui::Text(
+        "Async pending age: %.1f ms | stale discarded: %s | motion apply holds: %s",
+        session.adaptiveLodAsyncPendingAgeMs,
+        FormatPointCount(session.adaptiveLodStaleTraversalDiscardedCount).c_str(),
+        FormatPointCount(session.adaptiveLodMotionApplyThrottleCount).c_str());
+    ImGui::Text(
+        "Motion patches: %s applied, %s reps last, %s source gap | demotion blocks: %s",
+        FormatPointCount(session.adaptiveLodMotionPatchApplyCount).c_str(),
+        FormatPointCount(session.adaptiveLodMotionPatchRepresentativeCount).c_str(),
+        FormatPointCount(session.adaptiveLodCoverageGapSourceCount).c_str(),
+        FormatPointCount(session.adaptiveLodCandidateDemotionBlockedCount).c_str());
+    ImGui::Text(
+        "Displayed base/patch/candidate: %s / %s / %s | skipped patches: %s",
+        AdaptiveLodDisplayKind(session.adaptiveLodDisplayedBase),
+        AdaptiveLodDisplayKind(session.adaptiveLodMotionPatch),
+        AdaptiveLodDisplayKind(session.adaptiveLodIdleCandidate),
+        FormatPointCount(session.adaptiveLodSkippedMotionPatchCount).c_str());
+    if (session.adaptiveLodCache.valid) {
+        ImGui::Text(
+            "Displayed: %s | key %llx | revision %s",
+            session.adaptiveLodCache.coarseFallback ? "coarse fallback" : "exact traversal",
+            static_cast<unsigned long long>(session.adaptiveLodCache.key),
+            FormatPointCount(session.adaptiveLodCache.generation).c_str());
+        ImGui::Text(
+            "Draw items: %s reps for %s source | %s | %.2f ms | max %.1f px",
+            FormatPointCount(session.adaptiveLodCache.representativeCount).c_str(),
+            FormatPointCount(session.adaptiveLodCache.representedSourceCount).c_str(),
+            FormatByteCount(session.adaptiveLodCache.drawItemBytes).c_str(),
+            session.adaptiveLodCache.traversalMs,
+            session.adaptiveLodCache.maxRenderDiameterPixels);
+        ImGui::Text(
+            "Represented visible/emitted/culled: %s / %s / %s",
+            FormatPointCount(session.adaptiveLodCache.visibleRepresentedSourceCount).c_str(),
+            FormatPointCount(session.adaptiveLodCache.emittedRepresentedSourceCount).c_str(),
+            FormatPointCount(session.adaptiveLodCache.culledRepresentedSourceCount).c_str());
+        const char* budgetPressure =
+            session.adaptiveLodCache.representativeBudgetReached && session.adaptiveLodCache.fragmentBudgetReached
+                ? "reps+fragments"
+                : session.adaptiveLodCache.representativeBudgetReached
+                ? "reps"
+                : session.adaptiveLodCache.fragmentBudgetReached ? "fragments" : "none";
+        ImGui::Text(
+            "Frontier: %s nodes | age %s frames | budget pressure: %s",
+            FormatPointCount(session.adaptiveLodCache.visibleFrontierNodeCount).c_str(),
+            FormatPointCount(session.adaptiveLodDisplayedCacheAgeFrames).c_str(),
+            budgetPressure);
+        ImGui::Text(
+            "Budget: %s reps, %.0f fragments | estimated %.0f fragments",
+            FormatPointCount(session.adaptiveLodCache.representativeBudget).c_str(),
+            session.adaptiveLodCache.fragmentBudget,
+            session.adaptiveLodCache.estimatedFragments);
+    } else {
+        ImGui::TextDisabled("Displayed adaptive cache: none (%s)", session.adaptiveLodFallbackState.c_str());
+    }
 }
 
 void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
@@ -11319,13 +13255,33 @@ void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
         if (session->kind == LayerKind::PointCloud) {
             ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
             ImGui::Text(
-                "%s: %s",
-                PointCloudPreviewLodApplied(runtimeState, *session) ? "Preview LOD" : "Preview",
+                "Manual cap: %s",
                 DescribePointCloudPreviewDraw(runtimeState, *session).c_str());
-            ImGui::Text(
-                "LOD Mode: %s",
-                PointCloudPreviewLodModeLabel(runtimeState.projectSettings.pointCloudPreviewLodMode));
             ImGui::Text("Mode: %s", PointCloudColorModeLabel(session->pointStyle.colorMode));
+            ImGui::Text("Renderer: %s", PointCloudRendererModeLabel(runtimeState.projectSettings.pointCloudRendererMode));
+            const auto lodBuildProgress = CurrentPointCloudLodBuildProgress(*session);
+            if (lodBuildProgress.available) {
+                DrawLodBuildProgressLines(lodBuildProgress);
+            } else {
+                ImGui::Text("LOD cache: %s", session->pointLodCacheStatus.c_str());
+            }
+            ImGui::Text(
+                "LOD density: %s / %s",
+                invisible_places::output::PointCloudExportDensityModeName(session->adaptiveLodRequestedDensityMode),
+                invisible_places::output::PointCloudExportDensityModeName(session->adaptiveLodDisplayedDensityMode));
+            if (session->adaptiveLodCache.valid) {
+                ImGui::Text(
+                    "LOD reps: %s for %s source (%s)",
+                    FormatPointCount(session->adaptiveLodCache.representativeCount).c_str(),
+                    FormatPointCount(session->adaptiveLodCache.representedSourceCount).c_str(),
+                    session->adaptiveLodCache.coarseFallback ? "fallback" : "exact");
+                ImGui::Text(
+                    "LOD fragments: %.0f / %.0f",
+                    session->adaptiveLodCache.estimatedFragments,
+                    session->adaptiveLodCache.fragmentBudget);
+            } else if (!session->adaptiveLodRuntimeStatus.empty()) {
+                ImGui::Text("LOD reps: %s", session->adaptiveLodRuntimeStatus.c_str());
+            }
         } else {
             ImGui::Text("Mode: %s", GaussianSplatColorModeLabel(session->gsplatStyle.colorMode));
             ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
@@ -12751,9 +14707,8 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
     const auto& io = ImGui::GetIO();
     const auto& pendingLoad = runtimeState.pendingLoad.value();
     const auto& targetSession = runtimeState.sessions[pendingLoad.sessionIndex];
-    const float elapsedSeconds = std::chrono::duration<float>(
-                                     std::chrono::steady_clock::now() - pendingLoad.startedAt)
-                                     .count();
+    const auto elapsed = std::chrono::steady_clock::now() - pendingLoad.startedAt;
+    const auto loadProgress = CurrentPointCloudLoadProgress(pendingLoad.backgroundState);
     const bool firstVisibleLayerLoad = VisibleLayerCount(runtimeState) == 0;
     const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const ImVec2 viewportPosition = mainViewport != nullptr ? mainViewport->Pos : ImVec2{0.0F, 0.0F};
@@ -12802,7 +14757,12 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
                 ? "The window is ready. Loading the first layer from disk now."
                 : "The layer is loaded. Uploading buffers to the GPU now.");
         ImGui::Spacing();
-        ImGui::Text("Elapsed: %.1f s", elapsedSeconds);
+        if (pendingLoad.phase == PendingLoadPhase::CpuLoading && loadProgress.has_value()) {
+            DrawLoadProgressLines(loadProgress.value(), elapsed);
+        } else {
+            ImGui::Text("Elapsed: %s", FormatElapsedTime(elapsed).c_str());
+            ImGui::TextDisabled("ETA: estimating");
+        }
         ImGui::TextDisabled("The preview will appear automatically.");
         ImGui::PopTextWrapPos();
         ImGui::EndChild();
@@ -12825,7 +14785,12 @@ void DrawLoadingOverlay(const PreviewRuntimeState& runtimeState) {
     ImGui::Text("%s", LayerKindLabel(targetSession.kind));
     ImGui::TextUnformatted(
         pendingLoad.phase == PendingLoadPhase::CpuLoading ? "Loading in the background..." : "Uploading to GPU...");
-    ImGui::TextDisabled("Existing loaded layers stay visible. %.1f s", elapsedSeconds);
+    if (pendingLoad.phase == PendingLoadPhase::CpuLoading && loadProgress.has_value()) {
+        DrawLoadProgressLines(loadProgress.value(), elapsed);
+    } else {
+        ImGui::TextDisabled("Existing loaded layers stay visible. %s", FormatElapsedTime(elapsed).c_str());
+        ImGui::TextDisabled("ETA: estimating");
+    }
     ImGui::EndGroup();
     ImGui::End();
 }
@@ -12927,6 +14892,12 @@ void DrawLayerSection(
         ImGui::Text("Selected: %s", session->displayName.c_str());
         ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
         ImGui::Text("Total primitives: %s", FormatPointCount(session->totalPrimitives).c_str());
+        if (session->kind == LayerKind::PointCloud) {
+            ImGui::Checkbox("Rebuild LOD Cache On Load", &session->rebuildPointLodCacheOnLoad);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Ignores any existing persistent hierarchy cache for this LiDAR layer the next time it loads.");
+            }
+        }
 
         if (session->loaded) {
             bool visible = session->visible;
@@ -12938,14 +14909,9 @@ void DrawLayerSection(
                 std::uint64_t requestedBudget = session->pointBudget.activePoints;
                 if (ImGui::InputScalar("Budget Points", ImGuiDataType_U64, &requestedBudget)) {
                     session->pointBudget = MakePreviewPointBudgetState(*session, requestedBudget);
-                    ClearPreviewLodSampleCache(session);
                     viewport->UpdatePointBudget(
                         runtimeState->selectedSessionIndex.value(),
                         session->pointBudget.sampledIndices);
-                    PreparePreviewLodSampleCache(
-                        runtimeState,
-                        viewport,
-                        runtimeState->selectedSessionIndex.value());
                 }
 
                 float requestedFraction = session->pointBudget.activeFraction;
@@ -12961,21 +14927,46 @@ void DrawLayerSection(
                         requestedFraction >= 1.0F ? session->totalPrimitives
                                                   : static_cast<double>(session->totalPrimitives) * requestedFraction);
                     session->pointBudget = MakePreviewPointBudgetState(*session, requestedPoints);
-                    ClearPreviewLodSampleCache(session);
                     viewport->UpdatePointBudget(
                         runtimeState->selectedSessionIndex.value(),
                         session->pointBudget.sampledIndices);
-                    PreparePreviewLodSampleCache(
-                        runtimeState,
-                        viewport,
-                        runtimeState->selectedSessionIndex.value());
                 }
 
                 ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
                 ImGui::TextDisabled(
-                    "%s: %s",
-                    PointCloudPreviewLodApplied(*runtimeState, *session) ? "Preview LOD" : "Preview draw",
+                    "Manual cap: %s",
                     DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
+                ImGui::TextDisabled("LOD cache: %s", session->pointLodCacheStatus.c_str());
+                ImGui::TextDisabled("LOD runtime: %s", session->adaptiveLodRuntimeStatus.c_str());
+                const auto lodBuildProgress = CurrentPointCloudLodBuildProgress(*session);
+                if (lodBuildProgress.available) {
+                    DrawLodBuildProgressLines(lodBuildProgress);
+                }
+                const auto lodSummary = ComputeAdaptiveLodPreviewSummary(*runtimeState, *session, *viewport);
+                if (lodSummary.available) {
+                    ImGui::TextDisabled(
+                        "Adaptive reps: %s for %s source (last %.2f ms)",
+                        FormatPointCount(lodSummary.representativeCount).c_str(),
+                        FormatPointCount(lodSummary.representedSourceCount).c_str(),
+                        lodSummary.traversalMs);
+                }
+                if (ImGui::TreeNode("LOD Details")) {
+                    DrawPointCloudLodDebugLines(*session);
+                    ImGui::TreePop();
+                }
+                const bool lodBuildRunning = session->pointLodBuildWorker.joinable();
+                if (lodBuildRunning) {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::Button("Rebuild LOD Cache Now")) {
+                    RebuildSelectedPointCloudLodCache(runtimeState, session);
+                }
+                if (lodBuildRunning) {
+                    ImGui::EndDisabled();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Deletes this LiDAR layer's persistent hierarchy cache and rebuilds it in the background.");
+                }
             }
 
             if (ImGui::Button("Unload Selected Layer")) {
@@ -13861,12 +15852,12 @@ void DrawStillCameraExportSection(
         runtimeState->animationPanel.exportSizeInitialized = true;
     }
 
-    const char* stillExportLabels[] = {"Preview MP4", "EXR Stack"};
+    const char* stillExportLabels[] = {"Fast MP4", "Adaptive EXR Stack"};
     int stillExportIndex =
-        panel.stillExportMode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr ? 1 : 0;
+        panel.stillExportMode == invisible_places::output::AnimationExportMode::HqAdaptiveExr ? 1 : 0;
     if (ImGui::Combo("Format", &stillExportIndex, stillExportLabels, IM_ARRAYSIZE(stillExportLabels))) {
         panel.stillExportMode = stillExportIndex == 1
-                                    ? invisible_places::output::AnimationExportMode::HqPreviewDensityExr
+                                    ? invisible_places::output::AnimationExportMode::HqAdaptiveExr
                                     : invisible_places::output::AnimationExportMode::FastPreviewMp4;
     }
 
@@ -13906,6 +15897,10 @@ void DrawStillCameraExportSection(
         NormalizeAnimationRenderSettings(&settings);
         MarkCurrentAnimationExportSettingsDirty(runtimeState);
     }
+    DrawPointCloudExportDensityCombo("Density Mode", &panel.stillDensityMode);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Selects Full Source or an adaptive density target for the still-camera export.");
+    }
 
     const auto stillFrameCount = std::max<std::uint32_t>(
         1U,
@@ -13916,52 +15911,28 @@ void DrawStillCameraExportSection(
     ImGui::TextDisabled(
         "%s: %u frames from the current view.",
         panel.stillExportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-            ? "Preview MP4"
-            : "EXR stack",
+            ? "Fast MP4"
+            : "Adaptive EXR stack",
         stillFrameCount);
-    if (panel.stillExportMode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr) {
-        ImGui::TextDisabled("EXR stack uses full-source point density to avoid preview sampling artifacts.");
+    if (panel.stillExportMode == invisible_places::output::AnimationExportMode::HqAdaptiveExr) {
+        ImGui::TextDisabled("Beauty EXR defaults to Adaptive High Quality; Full Source remains available for exact/debug renders.");
     }
 
     auto& job = runtimeState->offlineRenderJob;
     if (job.active) {
         RefreshAnimationExportWriterProgress(&job);
         if (job.stillCameraJob) {
-            if (job.preparingExport && job.preparationState != nullptr) {
-                std::size_t completedRequests = 0;
-                std::size_t totalRequests = 0;
-                std::string currentLayerName;
-                {
-                    std::scoped_lock lock(job.preparationState->mutex);
-                    completedRequests = job.preparationState->completedRequests;
-                    totalRequests = job.preparationState->totalRequests;
-                    currentLayerName = job.preparationState->currentLayerName;
-                }
-                const float prepareProgress = totalRequests == 0
-                                                  ? 0.0F
-                                                  : static_cast<float>(completedRequests) /
-                                                        static_cast<float>(totalRequests);
-                ImGui::ProgressBar(prepareProgress, ImVec2{-FLT_MIN, 0.0F});
-                ImGui::Text(
-                    "Preparing samples %zu / %zu",
-                    completedRequests,
-                    totalRequests);
-                if (!currentLayerName.empty()) {
-                    ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-                }
-            } else {
-                const float frameProgress = job.frames.empty()
-                                                ? 0.0F
-                                                : static_cast<float>(job.writtenFrameCount) /
-                                                      static_cast<float>(job.frames.size());
-                ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
-                ImGui::Text(
-                    "Captured %u / %zu, saved %u, queued %zu",
-                    std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-                    job.frames.size(),
-                    std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-                    job.pendingFrameCount);
-            }
+            const float frameProgress = job.frames.empty()
+                                            ? 0.0F
+                                            : static_cast<float>(job.writtenFrameCount) /
+                                                  static_cast<float>(job.frames.size());
+            ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
+            ImGui::Text(
+                "Captured %u / %zu, saved %u, queued %zu",
+                std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+                job.frames.size(),
+                std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+                job.pendingFrameCount);
             ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
             if (!job.lastOutputPath.empty()) {
                 ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
@@ -15089,22 +17060,86 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
     }
 
     auto& settings = runtimeState->projectSettings;
-    int pointRendererModeIndex =
-        settings.pointCloudRendererMode == PointCloudRendererMode::FastBasic ? 1 : 0;
-    const char* pointRendererModes[] = {"Beauty", "Fast Basic"};
+    int pointRendererModeIndex = 1;
+    switch (settings.pointCloudRendererMode) {
+        case PointCloudRendererMode::FastBasic:
+            pointRendererModeIndex = 0;
+            break;
+        case PointCloudRendererMode::FastBasicSource:
+            pointRendererModeIndex = 1;
+            break;
+        case PointCloudRendererMode::BeautyAdaptive:
+            pointRendererModeIndex = 2;
+            break;
+        case PointCloudRendererMode::BeautyFullSource:
+            pointRendererModeIndex = 3;
+            break;
+        case PointCloudRendererMode::PaintedAdaptive:
+            pointRendererModeIndex = 4;
+            break;
+    }
+    const char* pointRendererModes[] = {
+        "Fast Basic",
+        "Fast Basic Source",
+        "Beauty Adaptive",
+        "Beauty Full Source",
+        "Painted Adaptive"};
     if (ImGui::Combo(
             "Mode",
             &pointRendererModeIndex,
             pointRendererModes,
             IM_ARRAYSIZE(pointRendererModes))) {
-        if (pointRendererModeIndex == 0) {
-            settings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
-        } else if (pointRendererModeIndex == 1) {
-            settings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
+        switch (pointRendererModeIndex) {
+            case 0:
+                settings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
+                break;
+            case 1:
+                settings.pointCloudRendererMode = PointCloudRendererMode::FastBasicSource;
+                break;
+            case 2:
+                settings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
+                break;
+            case 3:
+                settings.pointCloudRendererMode = PointCloudRendererMode::BeautyFullSource;
+                break;
+            case 4:
+                settings.pointCloudRendererMode = PointCloudRendererMode::PaintedAdaptive;
+                break;
+            default:
+                settings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
+                break;
         }
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Fast Basic renders opaque 1 px square points, with source RGB, solid colour, scalar colormaps, and colourise.");
+        ImGui::SetTooltip(
+            "Fast Basic uses dense adaptive draw-item LOD. Fast Basic Source draws every raw source point through the square-point path. Beauty Adaptive uses draw-item LOD. Beauty Full Source draws raw source points through the beauty path. Painted Adaptive uses the adaptive hierarchy with brush styling.");
+    }
+
+    const bool fastBasicRenderer = FastBasicPointRendererActive(settings);
+    if (fastBasicRenderer) {
+        ImGui::BeginDisabled();
+    }
+    ImGui::Checkbox("Eye-Dome Lighting", &settings.eyeDomeLightingEnabled);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Darkens point-cloud depth discontinuities in the viewport and animation exports.");
+    }
+    if (settings.eyeDomeLightingEnabled) {
+        ImGui::SliderFloat("EDL Thickness", &settings.eyeDomeLightingThickness, 1.0F, 24.0F, "%.0f px");
+        settings.eyeDomeLightingThickness = std::clamp(settings.eyeDomeLightingThickness, 1.0F, 24.0F);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Expands the eye-dome depth sampling radius for thicker, cartoon-like outlines.");
+        }
+    }
+    if (fastBasicRenderer) {
+        ImGui::EndDisabled();
+    }
+    ImGui::Checkbox("Constant Update View", &settings.constantUpdateView);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Keeps re-rendering the 3D preview even when camera and visual settings are unchanged.");
+    }
+    ImGui::Checkbox("Live Visual Effects", &settings.liveVisualEffects);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Allows time-driven water and stylisation effects to update in preview.");
     }
 
     EndPanelSection();
@@ -16385,40 +18420,8 @@ void DrawProjectPanel(
     if (BeginPanelSection("Project Settings")) {
     auto& settings = runtimeState->projectSettings;
     ImGui::ColorEdit3("Background Color", settings.backgroundColor.data());
-    ImGui::Checkbox("Eye-Dome Lighting", &settings.eyeDomeLightingEnabled);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Darkens point-cloud depth discontinuities in the viewport and animation exports.");
-    }
-    if (settings.eyeDomeLightingEnabled) {
-        ImGui::SliderFloat("EDL Thickness", &settings.eyeDomeLightingThickness, 1.0F, 24.0F, "%.0f px");
-        settings.eyeDomeLightingThickness = std::clamp(settings.eyeDomeLightingThickness, 1.0F, 24.0F);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Expands the eye-dome depth sampling radius for thicker, cartoon-like outlines.");
-        }
-    }
     ImGui::Checkbox("Show Status Overlay", &settings.showStatusOverlay);
-    ImGui::Checkbox("Constant Update View", &settings.constantUpdateView);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Keeps re-rendering the 3D preview even when camera and visual settings are unchanged.");
-    }
-    ImGui::Checkbox("Live Visual Effects", &settings.liveVisualEffects);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Allows time-driven water and stylisation effects to update in preview.");
-    }
 
-    int pointLodModeIndex = static_cast<int>(settings.pointCloudPreviewLodMode);
-    const char* pointLodModes[] = {"Full Resolution", "Auto Camera LOD", "Force LOD"};
-    if (ImGui::Combo(
-            "Point Preview LOD",
-            &pointLodModeIndex,
-            pointLodModes,
-            IM_ARRAYSIZE(pointLodModes))) {
-        settings.pointCloudPreviewLodMode = static_cast<PointCloudPreviewLodMode>(pointLodModeIndex);
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Auto mode uses the cached 10M point LOD only while the camera is moving.");
-    }
-    ImGui::TextDisabled("Point LOD Target: %s", FormatPointCount(kPointCloudPreviewLodTarget).c_str());
     EndPanelSection();
     }
     DrawProjectSection(runtimeState, viewport);
@@ -16526,12 +18529,26 @@ void DrawRenderInfoSection(
             if (session->kind == LayerKind::PointCloud) {
                 ImGui::Text("Budget: %s", DescribeBudget(session->pointBudget).c_str());
                 ImGui::Text(
-                    "%s: %s",
-                    PointCloudPreviewLodApplied(*runtimeState, *session) ? "Preview LOD" : "Preview",
+                    "Manual cap: %s",
                     DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
-                ImGui::Text(
-                    "LOD Mode: %s",
-                    PointCloudPreviewLodModeLabel(runtimeState->projectSettings.pointCloudPreviewLodMode));
+                ImGui::Text("LOD cache: %s", session->pointLodCacheStatus.c_str());
+                ImGui::Text("LOD runtime: %s", session->adaptiveLodRuntimeStatus.c_str());
+                const auto lodBuildProgress = CurrentPointCloudLodBuildProgress(*session);
+                if (lodBuildProgress.available) {
+                    DrawLodBuildProgressLines(lodBuildProgress);
+                }
+                const auto lodSummary = ComputeAdaptiveLodPreviewSummary(*runtimeState, *session, viewport);
+                if (lodSummary.available) {
+                    ImGui::Text(
+                        "Adaptive reps: %s for %s source (last %.2f ms)",
+                        FormatPointCount(lodSummary.representativeCount).c_str(),
+                        FormatPointCount(lodSummary.representedSourceCount).c_str(),
+                        lodSummary.traversalMs);
+                }
+                if (ImGui::TreeNode("LOD Debug")) {
+                    DrawPointCloudLodDebugLines(*session);
+                    ImGui::TreePop();
+                }
             } else {
                 const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
                 ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
@@ -16559,6 +18576,14 @@ void DrawRenderInfoSection(
             "%s for %s",
             pendingLoad.phase == PendingLoadPhase::CpuLoading ? "Reading source data" : "Uploading GPU buffers",
             FormatElapsedTime(elapsed).c_str());
+        if (pendingLoad.phase == PendingLoadPhase::CpuLoading) {
+            const auto loadProgress = CurrentPointCloudLoadProgress(pendingLoad.backgroundState);
+            if (loadProgress.has_value()) {
+                DrawLoadProgressLines(loadProgress.value(), elapsed);
+            } else {
+                ImGui::TextDisabled("ETA: estimating");
+            }
+        }
         EndPanelSection();
     }
 
@@ -16569,38 +18594,17 @@ void DrawRenderInfoSection(
         if (!BeginPanelSection(sectionLabel)) {
             return;
         }
-        if (job.preparingExport && job.preparationState != nullptr) {
-            std::size_t completedRequests = 0;
-            std::size_t totalRequests = 0;
-            std::string currentLayerName;
-            {
-                std::scoped_lock lock(job.preparationState->mutex);
-                completedRequests = job.preparationState->completedRequests;
-                totalRequests = job.preparationState->totalRequests;
-                currentLayerName = job.preparationState->currentLayerName;
-            }
-            const float prepareProgress = totalRequests == 0
-                                              ? 0.0F
-                                              : static_cast<float>(completedRequests) /
-                                                    static_cast<float>(totalRequests);
-            ImGui::ProgressBar(prepareProgress, ImVec2{-FLT_MIN, 0.0F});
-            ImGui::Text("Preparing samples %zu / %zu", completedRequests, totalRequests);
-            if (!currentLayerName.empty()) {
-                ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-            }
-        } else {
-            const float frameProgress =
-                job.frames.empty()
-                    ? 0.0F
-                    : static_cast<float>(job.writtenFrameCount) / static_cast<float>(job.frames.size());
-            ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
-            ImGui::Text(
-                "Captured %u / %zu, saved %u, queued %zu",
-                std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-                job.frames.size(),
-                std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-                job.pendingFrameCount);
-        }
+        const float frameProgress =
+            job.frames.empty()
+                ? 0.0F
+                : static_cast<float>(job.writtenFrameCount) / static_cast<float>(job.frames.size());
+        ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
+        ImGui::Text(
+            "Captured %u / %zu, saved %u, queued %zu",
+            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+            job.frames.size(),
+            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+            job.pendingFrameCount);
         ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
         if (!job.lastOutputPath.empty()) {
             ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
@@ -16658,14 +18662,18 @@ void DrawDiagnosticsWindow(
 
         if (BeginPanelSection("Frame Timing")) {
             ImGui::Text(
-                "Render frame: %.3f ms (%.1f FPS)",
+                "UI/present frame: %.3f ms (%.1f FPS)",
                 diagnostics.frameRenderMs,
                 diagnostics.frameFps);
             ImGui::Text(
-                "%.1fs average: %.3f ms (%.1f FPS)",
+                "UI/present %.1fs average: %.3f ms (%.1f FPS)",
                 diagnostics.frameAverageWindowSeconds,
                 diagnostics.averageFrameRenderMs,
                 diagnostics.averageFrameFps);
+            ImGui::Text(
+                "Scene update: %.3f ms (%.1f FPS)",
+                runtimeState->previewSceneUpdateMs,
+                runtimeState->previewSceneUpdateFps);
             ImGui::Text(
                 "Min / max while open: %.3f / %.3f ms",
                 diagnostics.minFrameRenderMs,
@@ -16673,6 +18681,10 @@ void DrawDiagnosticsWindow(
             ImGui::Separator();
             ImGui::Text("UI render: %.3f ms", diagnostics.frameUiRenderMs);
             ImGui::Text("Fence wait: %.3f ms", diagnostics.frameFenceWaitMs);
+            ImGui::Text("LOD traversal: %.3f ms", diagnostics.adaptiveLodTraversalMs);
+            ImGui::Text("Draw-item upload: %.3f ms", diagnostics.pointDrawItemUploadMs);
+            ImGui::Text("Draw-item GPU idle/wait: %.3f ms", diagnostics.pointDrawItemWaitMs);
+            ImGui::Text("Adaptive GPU idle waits: %u", diagnostics.adaptiveGpuIdleWaitCount);
             ImGui::Text("Prepare uniforms/resources: %.3f ms", diagnostics.framePrepareMs);
             ImGui::Text("Acquire image: %.3f ms", diagnostics.frameAcquireMs);
             ImGui::Text("Acquired image wait: %.3f ms", diagnostics.frameImageWaitMs);
@@ -16692,6 +18704,72 @@ void DrawDiagnosticsWindow(
                 "Pass submissions: %s",
                 FormatPointCount(diagnostics.pointPassSubmittedCount).c_str());
             ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
+            if (diagnostics.adaptiveRepresentativeCount > 0 ||
+                diagnostics.adaptiveRepresentedSourceCount > 0 ||
+                !diagnostics.adaptiveLodRuntimeStatus.empty()) {
+                ImGui::Text(
+                    "Adaptive reps: %s",
+                    FormatPointCount(diagnostics.adaptiveRepresentativeCount).c_str());
+                ImGui::Text(
+                    "Adaptive represented source: %s",
+                    FormatPointCount(diagnostics.adaptiveRepresentedSourceCount).c_str());
+                ImGui::Text(
+                    "Adaptive visible/emitted/culled source: %s / %s / %s",
+                    FormatPointCount(diagnostics.adaptiveVisibleRepresentedSourceCount).c_str(),
+                    FormatPointCount(diagnostics.adaptiveEmittedRepresentedSourceCount).c_str(),
+                    FormatPointCount(diagnostics.adaptiveCulledRepresentedSourceCount).c_str());
+                ImGui::Text(
+                    "Adaptive estimated fragments: %.0f / %.0f",
+                    diagnostics.adaptiveEstimatedFragments,
+                    diagnostics.adaptiveFragmentBudget);
+                ImGui::Text(
+                    "Adaptive representative budget: %s",
+                    FormatPointCount(diagnostics.adaptiveRepresentativeBudget).c_str());
+                const char* budgetPressure =
+                    diagnostics.adaptiveRepresentativeBudgetReached && diagnostics.adaptiveFragmentBudgetReached
+                        ? "reps+fragments"
+                        : diagnostics.adaptiveRepresentativeBudgetReached
+                        ? "reps"
+                        : diagnostics.adaptiveFragmentBudgetReached ? "fragments" : "none";
+                ImGui::Text(
+                    "Adaptive frontier: %s nodes | cache age %s frames | budget pressure: %s",
+                    FormatPointCount(diagnostics.adaptiveVisibleFrontierNodeCount).c_str(),
+                    FormatPointCount(diagnostics.adaptiveLodDisplayedCacheAgeFrames).c_str(),
+                    budgetPressure);
+                ImGui::Text(
+                    "Adaptive buffer: %s",
+                    !diagnostics.adaptiveLodFallbackState.empty()
+                        ? diagnostics.adaptiveLodFallbackState.c_str()
+                        : (diagnostics.adaptiveLodReusedPrevious ? "using previous adaptive buffer" : "current"));
+                ImGui::Text(
+                    "Adaptive bytes: %.2f MB",
+                    static_cast<double>(diagnostics.adaptiveDrawItemBytes) / (1024.0 * 1024.0));
+                if (!diagnostics.adaptiveLodPersistentCacheStatus.empty()) {
+                    ImGui::TextWrapped("Persistent LOD: %s", diagnostics.adaptiveLodPersistentCacheStatus.c_str());
+                }
+                if (!diagnostics.adaptiveLodRuntimeStatus.empty()) {
+                    ImGui::TextWrapped("Runtime LOD: %s", diagnostics.adaptiveLodRuntimeStatus.c_str());
+                }
+                if (!diagnostics.adaptiveLodRequestedDensity.empty() ||
+                    !diagnostics.adaptiveLodDisplayedDensity.empty()) {
+                    ImGui::Text(
+                        "Density requested/displayed: %s / %s",
+                        diagnostics.adaptiveLodRequestedDensity.empty()
+                            ? "-"
+                            : diagnostics.adaptiveLodRequestedDensity.c_str(),
+                        diagnostics.adaptiveLodDisplayedDensity.empty()
+                            ? "-"
+                            : diagnostics.adaptiveLodDisplayedDensity.c_str());
+                }
+                ImGui::Text(
+                    "Runtime cache: %s, async: %s",
+                    diagnostics.adaptiveLodRuntimeCacheHit ? "hit" : "miss/reuse",
+                    diagnostics.adaptiveLodAsyncPending ? "pending" : "idle");
+                ImGui::Text(
+                    "Async pending age: %.1f ms, stale discarded: %s",
+                    diagnostics.adaptiveLodAsyncPendingAgeMs,
+                    FormatPointCount(diagnostics.adaptiveLodStaleTraversalDiscardedCount).c_str());
+            }
             if (!diagnostics.pointRenderModes.empty()) {
                 ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
             }
@@ -16717,11 +18795,27 @@ void DrawDiagnosticsWindow(
             ImGui::Text("Style uploads: %u", diagnostics.pointStyleUploadCount);
             ImGui::Text("Inactive bindings skipped: %u", diagnostics.pointSkippedInactiveBindings);
             ImGui::Text("Command record: %.3f ms", diagnostics.pointCommandRecordMs);
+            ImGui::Text("Draw-item reallocations: %u", diagnostics.pointDrawItemBufferReallocations);
             ImGui::Text(
-                "Preview cache: %s",
-                diagnostics.sceneCacheActive
-                    ? (diagnostics.sceneRenderedThisFrame ? "refreshing" : "cached")
-                    : "off");
+                "Viewport: %s",
+                diagnostics.adaptiveLodAsyncPending
+                    ? "waiting on async LOD"
+                    : diagnostics.adaptiveLodReusedPrevious
+                    ? "using previous adaptive buffer"
+                    : (diagnostics.adaptiveLodTraversalMs > 0.0
+                           ? "export/still traversal completed"
+                           : (diagnostics.sceneCacheActive
+                                  ? (diagnostics.sceneRenderedThisFrame ? "refreshing" : "cached")
+                                  : "refreshing")));
+            if (const auto* selectedSession = SelectedLoadedSession(*runtimeState);
+                selectedSession != nullptr && selectedSession->kind == LayerKind::PointCloud) {
+                ImGui::Separator();
+                DrawPointCloudLodDebugLines(*selectedSession);
+                const auto lodBuildProgress = CurrentPointCloudLodBuildProgress(*selectedSession);
+                if (lodBuildProgress.available) {
+                    DrawLodBuildProgressLines(lodBuildProgress);
+                }
+            }
             EndPanelSection();
         }
     }
@@ -16759,13 +18853,24 @@ void DrawControlsWindow(
     ImGui::Begin("Invisible Places Controls", nullptr, flags);
 
     const auto& diagnostics = viewport->Diagnostics();
-    const double renderFps =
+    const double uiPresentFps =
         diagnostics.averageFrameFps > 0.0 ? diagnostics.averageFrameFps : diagnostics.frameFps;
-    const char* previewStatus =
-        diagnostics.sceneCacheActive && !diagnostics.sceneRenderedThisFrame ? "cached" : "rendering";
+    const char* previewStatus = "refreshing";
+    if (diagnostics.adaptiveLodAsyncPending) {
+        previewStatus = "async LOD pending";
+    } else if (diagnostics.adaptiveLodReusedPrevious || runtimeState->previewAdaptiveLodReusedPrevious) {
+        previewStatus = "using previous LOD";
+    } else if (diagnostics.adaptiveLodTraversalMs > 0.0) {
+        previewStatus = "scene LOD updated";
+    } else if (diagnostics.sceneCacheActive && !diagnostics.sceneRenderedThisFrame) {
+        previewStatus = "cached";
+    } else if (!runtimeState->previewSceneStateChanged && diagnostics.sceneCacheActive) {
+        previewStatus = "cached";
+    }
     const std::string fpsLabel =
-        "Render FPS (" + FormatFixed(diagnostics.frameAverageWindowSeconds, 1) + "s): " +
-        FormatFixed(renderFps, 1) + "  " + previewStatus;
+        "UI/present " + FormatFixed(uiPresentFps, 1) + " FPS  |  Scene " +
+        FormatFixed(runtimeState->previewSceneUpdateMs, 1) + " ms / " +
+        FormatFixed(runtimeState->previewSceneUpdateFps, 1) + " FPS  |  " + previewStatus;
     const float fpsLabelWidth = ImGui::CalcTextSize(fpsLabel.c_str()).x;
     const float fpsCursorX =
         std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - fpsLabelWidth);
@@ -17008,23 +19113,8 @@ void UpdatePerformanceInteractionState(
         runtimeState->cameraInteraction.navigationActive || uiInteractionRecent;
 }
 
-void PrunePreviewLodSampleCaches(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
-        return;
-    }
-
-    for (auto& session : runtimeState->sessions) {
-        if (!session.loaded ||
-            session.kind != LayerKind::PointCloud ||
-            session.offlinePointCloud == nullptr) {
-            ClearPreviewLodSampleCache(&session);
-            continue;
-        }
-    }
-}
-
 invisible_places::renderer::core::SceneRenderState BuildRenderState(
-    const PreviewRuntimeState& runtimeState,
+    PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     float flowTimeSeconds) {
     invisible_places::renderer::core::SceneRenderState renderState;
@@ -17042,6 +19132,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         runtimeState.projectSettings.backgroundColor[3],
     };
     renderState.pointCloudRendererMode = runtimeState.projectSettings.pointCloudRendererMode;
+    const bool fullSourcePointRenderer = FullSourcePointRendererActive(runtimeState.projectSettings);
+    const bool paintedAdaptivePointRenderer = PaintedAdaptivePointRendererActive(runtimeState.projectSettings);
     renderState.eyeDomeLightingEnabled =
         runtimeState.projectSettings.eyeDomeLightingEnabled &&
         !FastBasicPointRendererActive(runtimeState.projectSettings);
@@ -17059,37 +19151,48 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         FastBasicPointRendererActive(runtimeState.projectSettings) ? 0.0F : flowTimeSeconds;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
-        const auto& session = runtimeState.sessions[sessionIndex];
+        auto& session = runtimeState.sessions[sessionIndex];
         if (!session.loaded || !session.visible) {
             continue;
         }
 
         if (session.kind == LayerKind::PointCloud) {
             auto drawPointCount = std::min<std::uint64_t>(
-                EffectivePointDrawCount(runtimeState, session),
+                fullSourcePointRenderer ? session.totalPrimitives : EffectivePointDrawCount(runtimeState, session),
                 std::numeric_limits<std::uint32_t>::max());
-            const auto previewLodDrawCount = static_cast<std::uint32_t>(drawPointCount);
-            const bool previewLodSampleReady =
-                session.previewLodSampledDrawCount == previewLodDrawCount &&
-                session.previewLodSampledIndices.size() >= previewLodDrawCount;
-            if (!session.pointBudget.UsesSampledIndices() &&
-                drawPointCount < session.pointBudget.activePoints &&
-                !previewLodSampleReady) {
-                drawPointCount = std::min<std::uint64_t>(
-                    session.pointBudget.activePoints,
-                    std::numeric_limits<std::uint32_t>::max());
+            const auto effectiveStyle = MakeEffectivePointRendererStyle(
+                runtimeState.projectSettings.pointCloudRendererMode,
+                session.pointStyle,
+                session.hasSourceRgb,
+                IsGeneratedWaterOverlaySession(session));
+            invisible_places::renderer::core::SceneRenderState::PointCloudLayerState layer{
+                .layerId = sessionIndex,
+                .style = effectiveStyle,
+                .scalarFields = session.scalarFields,
+                .hasSourceRgb = session.hasSourceRgb,
+                .drawPointCount = static_cast<std::uint32_t>(drawPointCount)};
+            if (!fullSourcePointRenderer) {
+                const auto densityMode = SelectAdaptiveViewportDensityMode(
+                    runtimeState,
+                    viewport,
+                    &session,
+                    paintedAdaptivePointRenderer,
+                    FastBasicPointRendererActive(runtimeState.projectSettings));
+                static_cast<void>(PopulateAdaptivePointCloudLayer(
+                    &session,
+                    renderState.viewProjection,
+                    renderState.cameraPosition,
+                    std::max<std::uint32_t>(1U, viewport.Width()),
+                    std::max<std::uint32_t>(1U, viewport.Height()),
+                    densityMode,
+                    FastBasicPointRendererActive(runtimeState.projectSettings),
+                    runtimeState.cameraInteraction.navigationActive,
+                    true,
+                    false,
+                    runtimeState.previewFrameCounter,
+                    &layer));
             }
-            renderState.pointCloudLayers.push_back(
-                {.layerId = sessionIndex,
-                 .style = FastBasicPointRendererActive(runtimeState.projectSettings)
-                              ? MakeEffectiveFastBasicStyle(
-                                    session.pointStyle,
-                                    session.hasSourceRgb,
-                                    IsGeneratedWaterOverlaySession(session))
-                              : session.pointStyle,
-                 .scalarFields = session.scalarFields,
-                 .hasSourceRgb = session.hasSourceRgb,
-                 .drawPointCount = static_cast<std::uint32_t>(drawPointCount)});
+            renderState.pointCloudLayers.push_back(std::move(layer));
         } else {
             const auto effectiveFrame = ComputeEffectiveLayerFrame(runtimeState, session);
             if (effectiveFrame.bounds.valid &&
@@ -17109,6 +19212,96 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     return renderState;
 }
 
+struct LodComparisonImageMetrics {
+    std::uint64_t pixelCount = 0;
+    std::uint64_t coveredPixels = 0;
+    double luminanceSum = 0.0;
+};
+
+float HalfBitsToFloat(std::uint16_t bits) {
+    Imath::half value;
+    value.setBits(bits);
+    return static_cast<float>(value);
+}
+
+LodComparisonImageMetrics ComputeLodComparisonMetrics(
+    const invisible_places::output::HalfRgbaExrImage& image) {
+    LodComparisonImageMetrics metrics;
+    metrics.pixelCount = static_cast<std::uint64_t>(image.width) * image.height;
+    const auto availablePixels = image.rgbaHalf.size() / 4U;
+    for (std::size_t index = 0; index < availablePixels; ++index) {
+        const float r = HalfBitsToFloat(image.rgbaHalf[index * 4U + 0U]);
+        const float g = HalfBitsToFloat(image.rgbaHalf[index * 4U + 1U]);
+        const float b = HalfBitsToFloat(image.rgbaHalf[index * 4U + 2U]);
+        const float a = HalfBitsToFloat(image.rgbaHalf[index * 4U + 3U]);
+        const float luminance = (0.2126F * r) + (0.7152F * g) + (0.0722F * b);
+        metrics.luminanceSum += luminance;
+        if (a > 1.0e-4F || luminance > 1.0e-4F) {
+            ++metrics.coveredPixels;
+        }
+    }
+    return metrics;
+}
+
+invisible_places::renderer::core::SceneRenderState BuildExactAdaptiveComparisonRenderState(
+    PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    invisible_places::renderer::core::SceneRenderState renderState;
+    const auto aspectRatio = CurrentAspectRatio(viewport);
+    const auto matrices = runtimeState.camera.Matrices(aspectRatio);
+
+    renderState.view = matrices.view;
+    renderState.projection = matrices.projection;
+    renderState.viewProjection = matrices.viewProjection;
+    renderState.cameraPosition = matrices.position;
+    renderState.backgroundColor = glm::vec4{
+        runtimeState.projectSettings.backgroundColor[0],
+        runtimeState.projectSettings.backgroundColor[1],
+        runtimeState.projectSettings.backgroundColor[2],
+        runtimeState.projectSettings.backgroundColor[3],
+    };
+    renderState.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
+    renderState.eyeDomeLightingEnabled = runtimeState.projectSettings.eyeDomeLightingEnabled;
+    renderState.eyeDomeLightingThickness = runtimeState.projectSettings.eyeDomeLightingThickness;
+    renderState.nearPlane = runtimeState.camera.NearPlane();
+    renderState.farPlane = runtimeState.camera.FarPlane();
+
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        auto& session = runtimeState.sessions[sessionIndex];
+        if (!session.loaded || !session.visible || session.kind != LayerKind::PointCloud) {
+            continue;
+        }
+        const auto effectiveStyle = MakeEffectivePointRendererStyle(
+            PointCloudRendererMode::BeautyAdaptive,
+            session.pointStyle,
+            session.hasSourceRgb,
+            IsGeneratedWaterOverlaySession(session));
+        invisible_places::renderer::core::SceneRenderState::PointCloudLayerState layer{
+            .layerId = sessionIndex,
+            .style = effectiveStyle,
+            .scalarFields = session.scalarFields,
+            .hasSourceRgb = session.hasSourceRgb,
+            .drawPointCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                session.totalPrimitives,
+                std::numeric_limits<std::uint32_t>::max()))};
+        static_cast<void>(PopulateAdaptivePointCloudLayer(
+            &session,
+            renderState.viewProjection,
+            renderState.cameraPosition,
+            std::max<std::uint32_t>(1U, viewport.Width()),
+            std::max<std::uint32_t>(1U, viewport.Height()),
+            PointCloudExportDensityMode::AdaptiveHighQuality,
+            false,
+            false,
+            false,
+            true,
+            runtimeState.previewFrameCounter,
+            &layer));
+        renderState.pointCloudLayers.push_back(std::move(layer));
+    }
+    return renderState;
+}
+
 }  // namespace
 
 Application::Application(std::filesystem::path dataRoot)
@@ -17116,6 +19309,408 @@ Application::Application(std::filesystem::path dataRoot)
 
 std::filesystem::path Application::DefaultDataDirectory() {
     return std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
+}
+
+int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
+    try {
+        if (pointCloudPath.empty()) {
+            pointCloudPath = dataRoot_ / "Site3-Sample-Terrestrial.ply";
+        } else if (pointCloudPath.is_relative() && !std::filesystem::exists(pointCloudPath)) {
+            pointCloudPath = dataRoot_ / pointCloudPath;
+        }
+
+        const auto runtimeConfig = platform::PrepareVulkanRuntime();
+        std::cout << "Invisible Places LOD comparison" << std::endl;
+        std::cout << "Data root: " << dataRoot_.string() << std::endl;
+        std::cout << "Point cloud: " << pointCloudPath.string() << std::endl << std::endl;
+        std::cout << platform::DescribeVulkanRuntime(runtimeConfig) << std::endl << std::endl;
+
+        auto loadResult = invisible_places::io::LoadPointCloud(pointCloudPath);
+        if (!loadResult.success) {
+            std::cerr << "Could not load point cloud: " << loadResult.errorMessage << "\n";
+            return 2;
+        }
+
+    platform::Window window{
+        {.width = 1600, .height = 1000, .title = "Invisible Places LOD Compare"},
+    };
+    invisible_places::renderer::core::VulkanViewportShell viewport{window.NativeHandle()};
+    viewport.SetDiagnosticsEnabled(true);
+
+    PreviewRuntimeState runtimeState;
+    runtimeState.water.defaultPointVisualStyle = MakeDefaultWaterPointVisualStyle();
+    runtimeState.persistence.projectFilePath = DefaultProjectFilePath(dataRoot_).string();
+    runtimeState.persistence.pointStylePresetPath = DefaultPointStylePresetPath(dataRoot_).string();
+    runtimeState.persistence.animationDirectoryPath = DefaultAnimationDirectory(dataRoot_).string();
+    runtimeState.renderSettings.outputDirectory = DefaultRenderOutputDirectory(dataRoot_).string();
+    runtimeState.sessions.push_back({});
+    auto& session = runtimeState.sessions.front();
+    session.kind = LayerKind::PointCloud;
+    session.sourcePath = pointCloudPath;
+    session.displayName = pointCloudPath.stem().string();
+    session.hasSourceRgb = loadResult.cloud.hasSourceRgb;
+    session.pointStyle.colorMode =
+        loadResult.cloud.hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
+    session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
+        loadResult.cloud.PointCount(),
+        loadResult.cloud.PointCount());
+    EnsurePointVisuals(&session);
+
+    if (!ActivateLoadedPointCloud(0U, std::move(loadResult.cloud), &runtimeState, &viewport)) {
+        StopBackgroundWorkForShutdown(&runtimeState);
+        return 3;
+    }
+
+    const auto lodWaitStart = std::chrono::steady_clock::now();
+    while ((runtimeState.sessions.front().pointLodHierarchy == nullptr ||
+            runtimeState.sessions.front().pointLodHierarchy->Empty()) &&
+           std::chrono::steady_clock::now() - lodWaitStart < std::chrono::seconds{180}) {
+        PollPointCloudLodWorkers(&runtimeState);
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    PollPointCloudLodWorkers(&runtimeState);
+    if (runtimeState.sessions.front().pointLodHierarchy == nullptr ||
+        runtimeState.sessions.front().pointLodHierarchy->Empty()) {
+        std::cerr << "LOD hierarchy was not ready within the comparison timeout.\n";
+        StopBackgroundWorkForShutdown(&runtimeState);
+        return 4;
+    }
+
+    constexpr std::uint32_t kComparisonWidth = 1600;
+    constexpr std::uint32_t kComparisonHeight = 1000;
+    const auto outputDirectory = dataRoot_.parent_path() / "Saved" / "diagnostics" / "lod_compare";
+    std::error_code createError;
+    std::filesystem::create_directories(outputDirectory, createError);
+    if (createError) {
+        std::cerr << "Could not create comparison output directory: " << createError.message() << "\n";
+        StopBackgroundWorkForShutdown(&runtimeState);
+        return 5;
+    }
+
+    runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
+    runtimeState.projectSettings.constantUpdateView = true;
+    runtimeState.projectSettings.eyeDomeLightingEnabled = false;
+    runtimeState.performanceInteraction.active = true;
+    runtimeState.sessions.front().adaptiveMovementDensityMode = PointCloudExportDensityMode::MatchViewportAdaptive;
+    viewport.SetDiagnosticsEnabled(true);
+    viewport.SetSceneCachingEnabled(false);
+    viewport.SetLiveSceneRenderingEnabled(true);
+
+    std::uint64_t fastBasicMaxSubmittedPoints = 0;
+    std::uint64_t fastBasicMaxPassSubmittedPoints = 0;
+    std::uint64_t fastBasicMaxAdaptiveRepresentatives = 0;
+    std::uint64_t fastBasicMaxVisibleRepresentedSource = 0;
+    std::uint64_t fastBasicMaxEmittedRepresentedSource = 0;
+    std::uint64_t fastBasicMaxCulledRepresentedSource = 0;
+    double fastBasicMaxEstimatedFragments = 0.0;
+    double fastBasicMaxFragmentBudget = 0.0;
+    std::uint32_t fastBasicMaxRepresentativeBudget = 0;
+    std::uint64_t fastBasicMaxDisplayedCacheAgeFrames = 0;
+    double fastBasicMaxFrameMs = 0.0;
+    double fastBasicMaxSceneUpdateMs = 0.0;
+    double fastBasicMinFps = std::numeric_limits<double>::max();
+    std::uint64_t fastBasicStaleTraversals = 0;
+    std::string fastBasicRuntimeStatus;
+    std::string fastBasicFallbackState;
+    bool fastBasicSawAdaptiveDrawItems = false;
+    bool fastBasicSawPreviousSet = false;
+    bool fastBasicSawCoarseFallback = false;
+    bool fastBasicExceededBudget = false;
+    bool fastBasicSubmittedFullSource = false;
+    bool fastBasicZoomOutUpdated = false;
+    std::uint64_t fastBasicPreZoomOutRevision = 0;
+    std::uint64_t fastBasicPostZoomOutRevision = 0;
+    std::uint64_t fastBasicPreZoomOutRepresentedSource = 0;
+    std::uint64_t fastBasicPostZoomOutRepresentedSource = 0;
+    std::uint32_t fastBasicZoomOutSettledFrame = 0;
+    constexpr std::uint32_t kFastBasicDiagnosticFrames = 150U;
+    constexpr std::uint32_t kFastBasicZoomInFrames = 30U;
+    constexpr std::uint32_t kFastBasicZoomOutStartFrame = 60U;
+    constexpr std::uint32_t kFastBasicIdleStartFrame = 90U;
+    for (std::uint32_t frame = 0; frame < kFastBasicDiagnosticFrames; ++frame) {
+        window.PollEvents();
+        ++runtimeState.previewFrameCounter;
+        PollPointCloudLodWorkers(&runtimeState);
+
+        const bool moving =
+            frame < kFastBasicZoomInFrames ||
+            (frame >= kFastBasicZoomOutStartFrame && frame < kFastBasicIdleStartFrame);
+        if (moving) {
+            runtimeState.camera.Orbit(
+                2.0F + static_cast<float>(frame % 5U),
+                frame % 2U == 0U ? 0.8F : -0.5F);
+            if (frame < kFastBasicZoomInFrames) {
+                runtimeState.camera.Dolly(0.45F);
+            } else if (frame >= kFastBasicZoomOutStartFrame && frame < kFastBasicIdleStartFrame) {
+                runtimeState.camera.Dolly(-0.60F);
+            }
+        }
+        runtimeState.cameraInteraction.navigationActive = moving;
+        runtimeState.performanceInteraction.active = moving;
+
+        viewport.BeginUiFrame();
+        const auto sceneUpdateStart = std::chrono::steady_clock::now();
+        const auto renderState = BuildRenderState(runtimeState, viewport, 0.0F);
+        const auto sceneUpdateEnd = std::chrono::steady_clock::now();
+        viewport.UpdateRenderState(renderState);
+        std::uint64_t frameAdaptiveRevision = 0;
+        std::uint64_t frameAdaptiveRepresentedSource = 0;
+        bool frameUsedCurrentAdaptiveSet = false;
+        for (const auto& layer : renderState.pointCloudLayers) {
+            if (!layer.useAdaptiveDrawItems) {
+                continue;
+            }
+            frameAdaptiveRevision = std::max(frameAdaptiveRevision, layer.adaptiveLodRevision);
+            frameAdaptiveRepresentedSource += layer.adaptiveRepresentedSourceCount;
+            frameUsedCurrentAdaptiveSet =
+                frameUsedCurrentAdaptiveSet ||
+                (!layer.adaptiveLodReusedPrevious ||
+                 layer.adaptiveLodFallbackState == "coarse fallback" ||
+                 layer.adaptiveLodFallbackState == "exact traversal");
+        }
+        if (frame < kFastBasicZoomOutStartFrame && frameAdaptiveRevision != 0ULL) {
+            fastBasicPreZoomOutRevision = frameAdaptiveRevision;
+            fastBasicPreZoomOutRepresentedSource = frameAdaptiveRepresentedSource;
+        }
+        if (frame >= kFastBasicIdleStartFrame &&
+            frameAdaptiveRevision != 0ULL &&
+            frameUsedCurrentAdaptiveSet &&
+            (fastBasicPreZoomOutRevision == 0ULL || frameAdaptiveRevision != fastBasicPreZoomOutRevision) &&
+            frameAdaptiveRepresentedSource >=
+                (runtimeState.sessions.front().totalPrimitives / 2ULL)) {
+            fastBasicZoomOutUpdated = true;
+            fastBasicPostZoomOutRevision = frameAdaptiveRevision;
+            fastBasicPostZoomOutRepresentedSource = frameAdaptiveRepresentedSource;
+            if (fastBasicZoomOutSettledFrame == 0U) {
+                fastBasicZoomOutSettledFrame = frame;
+            }
+        }
+        runtimeState.previewSceneUpdateMs = MillisecondsBetween(sceneUpdateStart, sceneUpdateEnd);
+        runtimeState.previewSceneUpdateFps =
+            runtimeState.previewSceneUpdateMs > 0.0 ? 1000.0 / runtimeState.previewSceneUpdateMs : 0.0;
+        viewport.DrawFrame();
+        PollPointCloudLodWorkers(&runtimeState);
+
+        const auto& diagnostics = viewport.Diagnostics();
+        fastBasicMaxSubmittedPoints = std::max(
+            fastBasicMaxSubmittedPoints,
+            diagnostics.pointSubmittedCount);
+        fastBasicMaxPassSubmittedPoints = std::max(
+            fastBasicMaxPassSubmittedPoints,
+            diagnostics.pointPassSubmittedCount);
+        fastBasicMaxAdaptiveRepresentatives = std::max(
+            fastBasicMaxAdaptiveRepresentatives,
+            diagnostics.adaptiveRepresentativeCount);
+        fastBasicMaxVisibleRepresentedSource = std::max(
+            fastBasicMaxVisibleRepresentedSource,
+            diagnostics.adaptiveVisibleRepresentedSourceCount);
+        fastBasicMaxEmittedRepresentedSource = std::max(
+            fastBasicMaxEmittedRepresentedSource,
+            diagnostics.adaptiveEmittedRepresentedSourceCount);
+        fastBasicMaxCulledRepresentedSource = std::max(
+            fastBasicMaxCulledRepresentedSource,
+            diagnostics.adaptiveCulledRepresentedSourceCount);
+        fastBasicMaxEstimatedFragments = std::max(
+            fastBasicMaxEstimatedFragments,
+            diagnostics.adaptiveEstimatedFragments);
+        fastBasicMaxFragmentBudget = std::max(
+            fastBasicMaxFragmentBudget,
+            diagnostics.adaptiveFragmentBudget);
+        fastBasicMaxRepresentativeBudget = std::max(
+            fastBasicMaxRepresentativeBudget,
+            diagnostics.adaptiveRepresentativeBudget);
+        fastBasicMaxDisplayedCacheAgeFrames = std::max(
+            fastBasicMaxDisplayedCacheAgeFrames,
+            diagnostics.adaptiveLodDisplayedCacheAgeFrames);
+        fastBasicMaxFrameMs = std::max(fastBasicMaxFrameMs, diagnostics.frameRenderMs);
+        fastBasicMaxSceneUpdateMs = std::max(fastBasicMaxSceneUpdateMs, runtimeState.previewSceneUpdateMs);
+        if (diagnostics.frameFps > 0.0) {
+            fastBasicMinFps = std::min(fastBasicMinFps, diagnostics.frameFps);
+        }
+        fastBasicStaleTraversals = std::max(
+            fastBasicStaleTraversals,
+            diagnostics.adaptiveLodStaleTraversalDiscardedCount);
+        if (!diagnostics.adaptiveLodRuntimeStatus.empty()) {
+            fastBasicRuntimeStatus = diagnostics.adaptiveLodRuntimeStatus;
+        }
+        if (!diagnostics.adaptiveLodFallbackState.empty()) {
+            fastBasicFallbackState = diagnostics.adaptiveLodFallbackState;
+        }
+        fastBasicSawPreviousSet =
+            fastBasicSawPreviousSet ||
+            diagnostics.adaptiveLodFallbackState.find("reused") != std::string::npos;
+        fastBasicSawCoarseFallback =
+            fastBasicSawCoarseFallback || diagnostics.adaptiveLodFallbackState == "coarse fallback";
+        fastBasicSawAdaptiveDrawItems =
+            fastBasicSawAdaptiveDrawItems || diagnostics.adaptiveRepresentativeCount > 0;
+        fastBasicExceededBudget =
+            fastBasicExceededBudget ||
+            (diagnostics.adaptiveRepresentativeBudget > 0 &&
+             diagnostics.adaptiveRepresentativeCount > diagnostics.adaptiveRepresentativeBudget) ||
+            (diagnostics.adaptiveFragmentBudget > 0.0 &&
+             diagnostics.adaptiveEstimatedFragments > diagnostics.adaptiveFragmentBudget + 0.5);
+        fastBasicSubmittedFullSource =
+            fastBasicSubmittedFullSource ||
+            (diagnostics.pointSubmittedCount >= runtimeState.sessions.front().totalPrimitives &&
+             runtimeState.sessions.front().totalPrimitives > 0);
+        if (!moving) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{8});
+        }
+    }
+    runtimeState.cameraInteraction.navigationActive = false;
+    runtimeState.performanceInteraction.active = false;
+    if (fastBasicMinFps == std::numeric_limits<double>::max()) {
+        fastBasicMinFps = 0.0;
+    }
+
+    ++runtimeState.previewFrameCounter;
+    runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyFullSource;
+    const auto fullSourceState = BuildRenderState(runtimeState, viewport, 0.0F);
+    auto fullSourceImage = viewport.RenderPointCloudExrFrame(
+        {.renderState = fullSourceState,
+         .width = kComparisonWidth,
+         .height = kComparisonHeight,
+         .pointCloudDensityMode = PointCloudExportDensityMode::FullSource});
+
+    ++runtimeState.previewFrameCounter;
+    runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
+    const auto adaptiveState = BuildExactAdaptiveComparisonRenderState(runtimeState, viewport);
+    const auto adaptiveExact = std::any_of(
+        adaptiveState.pointCloudLayers.begin(),
+        adaptiveState.pointCloudLayers.end(),
+        [](const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState& layer) {
+            return layer.useAdaptiveDrawItems &&
+                   !layer.adaptiveLodReusedPrevious &&
+                   layer.adaptiveLodDisplayedDensity == "Adaptive High Quality";
+        });
+    if (!adaptiveExact) {
+        std::cerr << "Adaptive comparison did not produce an exact Adaptive High Quality draw-item set.\n";
+        StopBackgroundWorkForShutdown(&runtimeState);
+        return 6;
+    }
+    auto adaptiveImage = viewport.RenderPointCloudExrFrame(
+        {.renderState = adaptiveState,
+         .width = kComparisonWidth,
+         .height = kComparisonHeight,
+         .pointCloudDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality});
+
+    std::string errorMessage;
+    const auto fullPath = outputDirectory / "beauty_full_source.exr";
+    const auto adaptivePath = outputDirectory / "beauty_adaptive_hq.exr";
+    if (!invisible_places::output::WriteExrImage(fullSourceImage, fullPath, &errorMessage)) {
+        std::cerr << errorMessage << "\n";
+        StopBackgroundWorkForShutdown(&runtimeState);
+        return 7;
+    }
+    if (!invisible_places::output::WriteExrImage(adaptiveImage, adaptivePath, &errorMessage)) {
+        std::cerr << errorMessage << "\n";
+        StopBackgroundWorkForShutdown(&runtimeState);
+        return 8;
+    }
+
+    const auto fullMetrics = ComputeLodComparisonMetrics(fullSourceImage);
+    const auto adaptiveMetrics = ComputeLodComparisonMetrics(adaptiveImage);
+    const auto fullCoverage =
+        fullMetrics.pixelCount == 0 ? 0.0 : static_cast<double>(fullMetrics.coveredPixels) / fullMetrics.pixelCount;
+    const auto adaptiveCoverage =
+        adaptiveMetrics.pixelCount == 0
+            ? 0.0
+            : static_cast<double>(adaptiveMetrics.coveredPixels) / adaptiveMetrics.pixelCount;
+    const auto fullMeanLuminance =
+        fullMetrics.pixelCount == 0 ? 0.0 : fullMetrics.luminanceSum / static_cast<double>(fullMetrics.pixelCount);
+    const auto adaptiveMeanLuminance =
+        adaptiveMetrics.pixelCount == 0
+            ? 0.0
+            : adaptiveMetrics.luminanceSum / static_cast<double>(adaptiveMetrics.pixelCount);
+
+    std::uint64_t representatives = 0;
+    std::uint64_t representedSource = 0;
+    for (const auto& layer : adaptiveState.pointCloudLayers) {
+        representatives += layer.drawPointCount;
+        representedSource += layer.adaptiveRepresentedSourceCount;
+    }
+
+    const auto metricsPath = outputDirectory / "lod_compare_metrics.json";
+    {
+        std::ofstream metrics{metricsPath, std::ios::trunc};
+        metrics << "{\n"
+                << "  \"point_cloud\": \"" << pointCloudPath.lexically_normal().generic_string() << "\",\n"
+                << "  \"full_source_exr\": \"" << fullPath.lexically_normal().generic_string() << "\",\n"
+                << "  \"adaptive_exr\": \"" << adaptivePath.lexically_normal().generic_string() << "\",\n"
+                << "  \"full_source_coverage\": " << fullCoverage << ",\n"
+                << "  \"adaptive_coverage\": " << adaptiveCoverage << ",\n"
+                << "  \"coverage_ratio\": "
+                << (fullCoverage > 0.0 ? adaptiveCoverage / fullCoverage : 0.0) << ",\n"
+                << "  \"full_source_mean_luminance\": " << fullMeanLuminance << ",\n"
+                << "  \"adaptive_mean_luminance\": " << adaptiveMeanLuminance << ",\n"
+                << "  \"luminance_ratio\": "
+                << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0) << ",\n"
+                << "  \"adaptive_representatives\": " << representatives << ",\n"
+                << "  \"adaptive_represented_source\": " << representedSource << ",\n"
+                << "  \"adaptive_density\": \"Adaptive High Quality\",\n"
+                << "  \"adaptive_fallback\": false,\n"
+                << "  \"fast_basic_viewport_frames\": " << kFastBasicDiagnosticFrames << ",\n"
+                << "  \"fast_basic_max_submitted_points\": " << fastBasicMaxSubmittedPoints << ",\n"
+                << "  \"fast_basic_max_pass_submitted_points\": " << fastBasicMaxPassSubmittedPoints << ",\n"
+                << "  \"fast_basic_max_adaptive_representatives\": " << fastBasicMaxAdaptiveRepresentatives << ",\n"
+                << "  \"fast_basic_max_visible_represented_source\": " << fastBasicMaxVisibleRepresentedSource << ",\n"
+                << "  \"fast_basic_max_emitted_represented_source\": " << fastBasicMaxEmittedRepresentedSource << ",\n"
+                << "  \"fast_basic_max_culled_represented_source\": " << fastBasicMaxCulledRepresentedSource << ",\n"
+                << "  \"fast_basic_representative_budget\": " << fastBasicMaxRepresentativeBudget << ",\n"
+                << "  \"fast_basic_max_estimated_fragments\": " << fastBasicMaxEstimatedFragments << ",\n"
+                << "  \"fast_basic_fragment_budget\": " << fastBasicMaxFragmentBudget << ",\n"
+                << "  \"fast_basic_max_displayed_cache_age_frames\": " << fastBasicMaxDisplayedCacheAgeFrames << ",\n"
+                << "  \"fast_basic_max_frame_ms\": " << fastBasicMaxFrameMs << ",\n"
+                << "  \"fast_basic_min_fps\": " << fastBasicMinFps << ",\n"
+                << "  \"fast_basic_max_scene_update_ms\": " << fastBasicMaxSceneUpdateMs << ",\n"
+                << "  \"fast_basic_saw_adaptive_draw_items\": "
+                << (fastBasicSawAdaptiveDrawItems ? "true" : "false") << ",\n"
+                << "  \"fast_basic_saw_previous_set\": "
+                << (fastBasicSawPreviousSet ? "true" : "false") << ",\n"
+                << "  \"fast_basic_saw_coarse_fallback\": "
+                << (fastBasicSawCoarseFallback ? "true" : "false") << ",\n"
+                << "  \"fast_basic_zoom_out_updated\": "
+                << (fastBasicZoomOutUpdated ? "true" : "false") << ",\n"
+                << "  \"fast_basic_pre_zoom_out_revision\": " << fastBasicPreZoomOutRevision << ",\n"
+                << "  \"fast_basic_post_zoom_out_revision\": " << fastBasicPostZoomOutRevision << ",\n"
+                << "  \"fast_basic_pre_zoom_out_represented_source\": " << fastBasicPreZoomOutRepresentedSource << ",\n"
+                << "  \"fast_basic_post_zoom_out_represented_source\": " << fastBasicPostZoomOutRepresentedSource << ",\n"
+                << "  \"fast_basic_zoom_out_settled_frame\": " << fastBasicZoomOutSettledFrame << ",\n"
+                << "  \"fast_basic_exceeded_budget\": "
+                << (fastBasicExceededBudget ? "true" : "false") << ",\n"
+                << "  \"fast_basic_submitted_full_source\": "
+                << (fastBasicSubmittedFullSource ? "true" : "false") << ",\n"
+                << "  \"fast_basic_stale_traversals_discarded\": " << fastBasicStaleTraversals << ",\n"
+                << "  \"fast_basic_runtime_status\": \"" << fastBasicRuntimeStatus << "\",\n"
+                << "  \"fast_basic_fallback_state\": \"" << fastBasicFallbackState << "\"\n"
+                << "}\n";
+    }
+
+    std::cout << "Wrote LOD comparison outputs:\n"
+              << "- " << fullPath.string() << "\n"
+              << "- " << adaptivePath.string() << "\n"
+              << "- " << metricsPath.string() << "\n"
+              << "Coverage ratio: " << (fullCoverage > 0.0 ? adaptiveCoverage / fullCoverage : 0.0)
+              << " | luminance ratio: "
+              << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0)
+              << " | representatives: " << representatives
+              << " | represented source: " << representedSource << "\n"
+              << "Fast Basic viewport: max submitted " << fastBasicMaxSubmittedPoints
+              << " / rep budget " << fastBasicMaxRepresentativeBudget
+              << " | max estimated fragments " << fastBasicMaxEstimatedFragments
+              << " / fragment budget " << fastBasicMaxFragmentBudget
+              << " | min FPS " << fastBasicMinFps
+              << " | full-source fallback: " << (fastBasicSubmittedFullSource ? "yes" : "no")
+              << " | budget exceeded: " << (fastBasicExceededBudget ? "yes" : "no")
+              << std::endl;
+
+        StopBackgroundWorkForShutdown(&runtimeState);
+        viewport.WaitIdle();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "LOD comparison failed: " << error.what() << "\n";
+        return 9;
+    }
 }
 
 int Application::Run() const {
@@ -17217,7 +19812,9 @@ int Application::Run() const {
         }
 
         if (viewport.has_value()) {
+            ++runtimeState.previewFrameCounter;
             PollPendingLayerLoad(&runtimeState, &viewport.value());
+            PollPointCloudLodWorkers(&runtimeState);
             if (!runtimeState.offlineRenderJob.active) {
                 StartQueuedLayerLoadIfIdle(&runtimeState);
             }
@@ -17240,7 +19837,6 @@ int Application::Run() const {
                 UpdateCameraShotPlayback(&runtimeState);
                 UpdatePerformanceInteractionState(&runtimeState, viewport.value());
             }
-            PrunePreviewLodSampleCaches(&runtimeState);
             if (!pauseLiveViewport) {
                 DrawPivotOverlay(runtimeState, viewport.value());
                 DrawWaterPathDebugOverlay(&runtimeState, viewport.value());
@@ -17253,13 +19849,20 @@ int Application::Run() const {
                 const float previewFlowTimeSeconds =
                     runtimeState.projectSettings.liveVisualEffects
                         ? std::chrono::duration<float>(
-                              std::chrono::steady_clock::now() - runtimeState.startedAt)
-                              .count()
+	                              std::chrono::steady_clock::now() - runtimeState.startedAt)
+	                              .count()
                         : 0.0F;
+                const auto sceneUpdateStart = std::chrono::steady_clock::now();
                 const auto renderState = BuildRenderState(
                     runtimeState,
                     viewport.value(),
                     previewFlowTimeSeconds);
+                const bool adaptiveLodReusedPrevious = std::any_of(
+                    renderState.pointCloudLayers.begin(),
+                    renderState.pointCloudLayers.end(),
+                    [](const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState& layer) {
+                        return layer.useAdaptiveDrawItems && layer.adaptiveLodReusedPrevious;
+                    });
                 const bool previewLiveEffectsAffectScene =
                     runtimeState.projectSettings.liveVisualEffects &&
                     !FastBasicPointRendererActive(runtimeState.projectSettings);
@@ -17274,8 +19877,21 @@ int Application::Run() const {
                     runtimeState.previewRenderStateSignature = renderStateSignature;
                     runtimeState.previewRenderStateSignatureValid = true;
                 }
+                const auto sceneUpdateEnd = std::chrono::steady_clock::now();
+                runtimeState.previewSceneUpdateMs = MillisecondsBetween(sceneUpdateStart, sceneUpdateEnd);
+                runtimeState.previewSceneUpdateFps =
+                    runtimeState.previewSceneUpdateMs > 0.0 ? 1000.0 / runtimeState.previewSceneUpdateMs : 0.0;
+                runtimeState.previewSceneStateChanged =
+                    renderStateChanged ||
+                    runtimeState.projectSettings.constantUpdateView ||
+                    previewLiveEffectsAffectScene;
+                runtimeState.previewAdaptiveLodReusedPrevious = adaptiveLodReusedPrevious;
             } else {
                 runtimeState.previewRenderStateSignatureValid = false;
+                runtimeState.previewSceneUpdateMs = 0.0;
+                runtimeState.previewSceneUpdateFps = 0.0;
+                runtimeState.previewSceneStateChanged = false;
+                runtimeState.previewAdaptiveLodReusedPrevious = false;
             }
             viewport->DrawFrame();
         } else {

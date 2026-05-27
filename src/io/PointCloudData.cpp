@@ -358,7 +358,9 @@ std::size_t LoadedPointCloud::ScalarFieldValueIndex(std::size_t fieldIndex, std:
     return (fieldIndex * PointCount()) + pointIndex;
 }
 
-PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
+PointCloudLoadResult LoadPointCloud(
+    const std::filesystem::path& filePath,
+    const PointCloudLoadProgressCallback& progressCallback) {
     const auto headerResult = ParsePlyHeader(filePath);
     if (!headerResult.success) {
         return {.errorMessage = headerResult.errorMessage, .success = false};
@@ -413,6 +415,14 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
     }
 
     const auto pointsPerChunk = RecommendedPointsPerChunk(layout->recordSize);
+    const auto totalPayloadBytes = header.vertexCount * static_cast<std::uint64_t>(layout->recordSize);
+    if (progressCallback) {
+        progressCallback(PointCloudLoadProgress{
+            .pointsRead = 0,
+            .totalPoints = header.vertexCount,
+            .bytesRead = 0,
+            .totalBytes = totalPayloadBytes});
+    }
     const auto focusSampleStride =
         std::max<std::uint64_t>(1ULL, header.vertexCount / static_cast<std::uint64_t>(kMaxFocusSamples));
     std::vector<std::byte> chunkBuffer(pointsPerChunk * layout->recordSize);
@@ -492,6 +502,17 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
             if ((globalIndex % focusSampleStride) == 0 && focusSamples.size() < kMaxFocusSamples) {
                 focusSamples.push_back(position);
             }
+        }
+
+        if (progressCallback) {
+            const auto pointsRead = pointStart + static_cast<std::uint64_t>(pointsThisChunk);
+            progressCallback(PointCloudLoadProgress{
+                .pointsRead = pointsRead,
+                .totalPoints = header.vertexCount,
+                .bytesRead = std::min<std::uint64_t>(
+                    totalPayloadBytes,
+                    pointsRead * static_cast<std::uint64_t>(layout->recordSize)),
+                .totalBytes = totalPayloadBytes});
         }
     }
 

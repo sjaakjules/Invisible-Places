@@ -34,9 +34,22 @@ layout(set = 0, binding = 4, std430) readonly buffer PointPositions {
     vec4 positions[];
 } pointPositions;
 
+layout(set = 0, binding = 5, std430) readonly buffer PointColors {
+    uint colors[];
+} pointColors;
+
 layout(set = 0, binding = 6, std430) readonly buffer PointNormals {
     vec4 normals[];
 } pointNormals;
+
+struct PointDrawItemGpu {
+    uvec4 indices;
+    vec4 params;
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer PointDrawItems {
+    PointDrawItemGpu drawItems[];
+} pointDrawItems;
 
 struct RenderParameterBindingGpu {
     vec4 constantValue;
@@ -99,7 +112,36 @@ const uint kWaterStreamConfidenceFieldSlot = 13u;
 const uint kWaterStreamWetnessFieldSlot = 14u;
 const uint kWaterStreamFeatureTypeFieldSlot = 15u;
 const uint kWaterStreamTangentZFieldSlot = 18u;
+const uint kRenderControlUseDrawItems = 2u;
 const float kWaterParticleSpeedScale = 0.12;
+
+bool UseDrawItems() {
+    return (styleData.renderControl.w & kRenderControlUseDrawItems) != 0u;
+}
+
+uint SourcePointIndex(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].indices.x : drawIndex;
+}
+
+float DrawItemOpacityCompensation(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].params.y : 1.0;
+}
+
+float DrawItemEmissionCompensation(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].params.z : 1.0;
+}
+
+float DrawItemFootprintDiameterPixels(uint drawIndex) {
+    return UseDrawItems() ? sqrt(max(1.0, pointDrawItems.drawItems[drawIndex].params.w)) : 1.0;
+}
+
+vec4 UnpackRgba8(uint packedColor) {
+    return vec4(
+        float(packedColor & 0xFFu) / 255.0,
+        float((packedColor >> 8u) & 0xFFu) / 255.0,
+        float((packedColor >> 16u) & 0xFFu) / 255.0,
+        float((packedColor >> 24u) & 0xFFu) / 255.0);
+}
 
 float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -114,7 +156,7 @@ float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
 }
 
 float LoadScalarFieldValue(uint fieldSlot) {
-    return LoadScalarFieldValueForPoint(fieldSlot, uint(gl_VertexIndex));
+    return LoadScalarFieldValueForPoint(fieldSlot, SourcePointIndex(uint(gl_VertexIndex)));
 }
 
 #include "pointcloud_caustics.glsl"
@@ -619,8 +661,11 @@ vec3 ResolveAovNormal(uint pointIndex) {
 }
 
 void main() {
-    const uint pointIndex = uint(gl_VertexIndex);
-    const vec3 flowPosition = ResolveWaterFlowPosition(inPosition, pointIndex);
+    const uint drawIndex = uint(gl_VertexIndex);
+    const uint pointIndex = SourcePointIndex(drawIndex);
+    const vec3 sourcePosition = UseDrawItems() ? pointPositions.positions[pointIndex].xyz : inPosition;
+    const vec4 sourceColor = UseDrawItems() ? UnpackRgba8(pointColors.colors[pointIndex]) : inColor;
+    const vec3 flowPosition = ResolveWaterFlowPosition(sourcePosition, pointIndex);
     vec4 worldPosition = vec4(ResolveSurfaceMotionPosition(flowPosition, pointIndex), 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
@@ -657,8 +702,10 @@ void main() {
                     (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
                     waterEffectPointSizeMultiply) +
                    waterEffectPointSizeAdd);
+    const float pointSizeWithLodFootprint =
+        max(pointSizeBeforeDepthOfField, DrawItemFootprintDiameterPixels(drawIndex));
     gl_PointSize = clamp(
-        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth),
+        pointSizeWithLodFootprint + ResolveDepthOfFieldBlurPixels(viewDepth),
         max(1.0, styleData.renderParams3.y),
         max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
 
@@ -666,21 +713,24 @@ void main() {
     outSourceColor =
         vec4(
             ApplyWaterEffectColor(
-                mix(inColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+                mix(sourceColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
                 pointIndex),
-            inColor.a);
+            sourceColor.a);
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
         EvaluateBinding(styleData.opacityBinding),
         EvaluateBinding(styleData.emissiveBinding),
         pointIndex);
     outOpacity = clamp(
-        (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
+        ((animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
              waterEffectOpacityMultiply) +
-            waterEffectOpacityAdd,
+            waterEffectOpacityAdd) *
+            DrawItemOpacityCompensation(drawIndex),
         0.0,
         4.0);
-    outEmissive = animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y) + waterEffectEmissionAdd;
+    outEmissive =
+        (animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y) + waterEffectEmissionAdd) *
+        DrawItemEmissionCompensation(drawIndex);
     outXray = EvaluateBinding(styleData.xrayBinding);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;

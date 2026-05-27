@@ -80,6 +80,15 @@ layout(set = 0, binding = 6, std430) readonly buffer SurfelNormals {
     vec4 normals[];
 } surfelNormals;
 
+struct PointDrawItemGpu {
+    uvec4 indices;
+    vec4 params;
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer PointDrawItems {
+    PointDrawItemGpu drawItems[];
+} pointDrawItems;
+
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
 const uint kSurfelVerticesPerPoint = 6u;
@@ -106,6 +115,7 @@ const uint kWaterStreamFeatureTypeFieldSlot = 15u;
 const uint kWaterStreamTangentXFieldSlot = 16u;
 const uint kWaterStreamTangentYFieldSlot = 17u;
 const uint kWaterStreamTangentZFieldSlot = 18u;
+const uint kRenderControlUseDrawItems = 2u;
 const float kWaterParticleSpeedScale = 0.12;
 
 const vec2 kSurfelCorners[6] = vec2[](
@@ -115,6 +125,36 @@ const vec2 kSurfelCorners[6] = vec2[](
     vec2(-1.0, -1.0),
     vec2(1.0, 1.0),
     vec2(-1.0, 1.0));
+
+bool UseDrawItems() {
+    return (styleData.renderControl.w & kRenderControlUseDrawItems) != 0u;
+}
+
+uint SourcePointIndex(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].indices.x : drawIndex;
+}
+
+float DrawItemOpacityCompensation(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].params.y : 1.0;
+}
+
+float DrawItemEmissionCompensation(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].params.z : 1.0;
+}
+
+float DrawItemFootprintDiameterPixels(uint drawIndex) {
+    return UseDrawItems() ? sqrt(max(1.0, pointDrawItems.drawItems[drawIndex].params.w)) : 1.0;
+}
+
+float ScreenPointSizePixelsToWorldDiameter(float diameterPixels, float viewDepth) {
+    return max(0.0, diameterPixels) *
+           (2.0 * max(0.001, viewDepth)) /
+           (max(abs(uniforms.projection[1][1]), 1e-5) * max(1.0, uniforms.viewportParameters.y));
+}
+
+float DrawItemFootprintWorldDiameter(uint drawIndex, float viewDepth) {
+    return ScreenPointSizePixelsToWorldDiameter(DrawItemFootprintDiameterPixels(drawIndex), viewDepth);
+}
 
 float LoadScalarFieldValue(uint fieldSlot, uint pointIndex) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -730,8 +770,9 @@ float ResolveDepthOfFieldWorldRadius(float viewDepth) {
 
 void main() {
     const uint encodedVertexIndex = uint(gl_VertexIndex);
-    const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
-    const uint cornerIndex = encodedVertexIndex - (pointIndex * kSurfelVerticesPerPoint);
+    const uint drawIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
+    const uint pointIndex = SourcePointIndex(drawIndex);
+    const uint cornerIndex = encodedVertexIndex - (drawIndex * kSurfelVerticesPerPoint);
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
     const vec3 flowPosition = ResolveWaterFlowPosition(surfelPositions.positions[pointIndex].xyz, pointIndex);
@@ -749,7 +790,7 @@ void main() {
         HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectSlots0.x, pointIndex, 0.0) : 0.0;
     const float waterEffectPointSizeMultiply =
         HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectSlots0.y, pointIndex, 1.0)) : 1.0;
-    const float diameter =
+    const float baseDiameter =
         ((WaterStreamOverlayEnabled()
               ? max(0.0001, LoadScalarFieldValue(kWaterStreamWidthFieldSlot, pointIndex))
               : max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex))) *
@@ -757,7 +798,9 @@ void main() {
              WaterSteamSizeScale(pointIndex) *
              (1.0 + centerCaustic * max(0.0, styleData.causticParams1.w)) *
              waterEffectPointSizeMultiply) +
-        waterEffectPointSizeAdd +
+        waterEffectPointSizeAdd;
+    const float diameter =
+        max(baseDiameter, DrawItemFootprintWorldDiameter(drawIndex, centerDepth)) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
     const float waterStreakAspect =
         WaterStreamOverlayEnabled()
@@ -790,12 +833,15 @@ void main() {
         EvaluateBinding(styleData.emissiveBinding, pointIndex),
         pointIndex);
     outOpacity = clamp(
-        (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
+        ((animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
              waterEffectOpacityMultiply) +
-            waterEffectOpacityAdd,
+            waterEffectOpacityAdd) *
+            DrawItemOpacityCompensation(drawIndex),
         0.0,
         4.0);
-    outEmissive = animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y) + waterEffectEmissionAdd;
+    outEmissive =
+        (animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y) + waterEffectEmissionAdd) *
+        DrawItemEmissionCompensation(drawIndex);
     outXray = EvaluateBinding(styleData.xrayBinding, pointIndex);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;

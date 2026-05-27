@@ -4,10 +4,10 @@ This document describes the implemented project surface for future edits. Eviden
 
 ## Point-Cloud Rendering
 
-- Supported point-cloud renderer modes are Beauty and Fast Basic.
+- Supported point-cloud renderer modes are Fast Basic, Beauty Adaptive, Beauty Full Source, and Painted Adaptive.
 - Raycast/Raytracing is not part of the active renderer, export, shader, CMake, settings, serialization, or test surface.
-- Project files that contain `"point_cloud_renderer_mode": "raytraced"` load as Beauty and save back as `"beauty"`.
-- Beauty rendering keeps the unified material path for advanced point styling. Fast Basic keeps cheap colour and point-size controls for preview-oriented rendering.
+- Project files that contain `"point_cloud_renderer_mode": "raytraced"` load as Beauty Adaptive and save back as `"beauty_adaptive"`.
+- Beauty Adaptive keeps the unified material path with adaptive draw-item LOD. Beauty Full Source uses raw source points for exact/debug viewport rendering. Fast Basic keeps cheap colour and point-size controls for preview-oriented rendering. Painted Adaptive uses the adaptive hierarchy with brush styling.
 
 ## Water Workflow
 
@@ -55,7 +55,7 @@ ctest --test-dir build/macos-debug --output-on-failure
 
 Focused tests for this state include:
 
-- `Legacy Raytraced renderer mode loads as Beauty and is not re-saved`
+- `Legacy Raytraced renderer mode loads as Beauty Adaptive and is not re-saved`
 - `Legacy water region records load as v2 ripples while basin and runoff are ignored`
 - `Ripple and Field effects compose onto base cloud visual evaluation`
 - `Ripple effect generation preserves concave clicked region boundaries`

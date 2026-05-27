@@ -389,6 +389,20 @@ float WorldDiameterToScreenPointSizePixels(
            (2.0F * safeDepth);
 }
 
+bool PointCloudRendererModeUsesFastBasic(PointCloudRendererMode mode) {
+    return mode == PointCloudRendererMode::FastBasic ||
+           mode == PointCloudRendererMode::FastBasicSource;
+}
+
+bool PointCloudRendererModeUsesFullSource(PointCloudRendererMode mode) {
+    return mode == PointCloudRendererMode::BeautyFullSource ||
+           mode == PointCloudRendererMode::FastBasicSource;
+}
+
+bool PointCloudRendererModeUsesPaintedStyle(PointCloudRendererMode mode) {
+    return mode == PointCloudRendererMode::PaintedAdaptive;
+}
+
 PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb) {
@@ -673,51 +687,6 @@ PointBudgetState MakePointBudgetState(
 
     state.sampledIndices = GenerateSpatialSampleIndices(cloud.positions, cloud.bounds, state.activePoints);
     return state;
-}
-
-std::uint64_t ResolveInteractivePointBudget(
-    const PointBudgetState& budget,
-    bool interactionActive,
-    std::uint64_t interactivePointCap) {
-    if (!interactionActive || interactivePointCap == 0 || budget.activePoints == 0) {
-        return budget.activePoints;
-    }
-
-    return std::max<std::uint64_t>(1U, std::min(budget.activePoints, interactivePointCap));
-}
-
-PointCloudPreviewLodDecision ResolvePointCloudPreviewLod(
-    const PointBudgetState& budget,
-    PointCloudPreviewLodMode mode,
-    bool cameraNavigationActive,
-    bool cameraPlaybackActive,
-    std::uint64_t lodTargetPoints) {
-    PointCloudPreviewLodDecision decision;
-    decision.drawPointCount = budget.activePoints;
-
-    if (budget.activePoints == 0 ||
-        lodTargetPoints == 0 ||
-        budget.UsesSampledIndices() ||
-        budget.activePoints <= lodTargetPoints) {
-        return decision;
-    }
-
-    const bool cameraDriven = cameraNavigationActive || cameraPlaybackActive;
-    switch (mode) {
-        case PointCloudPreviewLodMode::FullResolution:
-            return decision;
-        case PointCloudPreviewLodMode::AutoCameraLod:
-            decision.usesPreviewLod = cameraDriven;
-            break;
-        case PointCloudPreviewLodMode::ForceLod:
-            decision.usesPreviewLod = true;
-            break;
-    }
-
-    if (decision.usesPreviewLod) {
-        decision.drawPointCount = std::max<std::uint64_t>(1U, std::min(budget.activePoints, lodTargetPoints));
-    }
-    return decision;
 }
 
 }  // namespace invisible_places::renderer::pointcloud

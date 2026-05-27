@@ -21,6 +21,7 @@
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
+#include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
@@ -39,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +53,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -58,6 +61,47 @@ namespace {
 
 std::filesystem::path DataRoot() {
     return std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
+}
+
+std::filesystem::path RepoRoot() {
+    const std::filesystem::path dataRootParent = DataRoot().parent_path();
+    if (std::filesystem::exists(dataRootParent / "src/app/Application.cpp")) {
+        return dataRootParent;
+    }
+
+    for (std::filesystem::path candidate = std::filesystem::current_path();
+         !candidate.empty();
+         candidate = candidate.parent_path()) {
+        if (std::filesystem::exists(candidate / "src/app/Application.cpp")) {
+            return candidate;
+        }
+        if (candidate == candidate.root_path()) {
+            break;
+        }
+    }
+
+    throw std::runtime_error{"Could not locate repository root for source-level regression tests."};
+}
+
+std::string ReadRepoTextFile(const std::filesystem::path& relativePath) {
+    std::ifstream input{RepoRoot() / relativePath};
+    if (!input) {
+        throw std::runtime_error{"Could not read repo file: " + relativePath.generic_string()};
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+std::string SourceSection(
+    const std::string& source,
+    std::string_view beginNeedle,
+    std::string_view endNeedle) {
+    const auto begin = source.find(beginNeedle);
+    REQUIRE(begin != std::string::npos);
+    const auto end = source.find(endNeedle, begin + beginNeedle.size());
+    REQUIRE(end != std::string::npos);
+    return source.substr(begin, end - begin);
 }
 
 std::filesystem::path FindDataFileByName(std::string_view filename) {
@@ -852,66 +896,984 @@ TEST_CASE("Orbit camera keeps repeated zoom-out wheel steps controlled", "[camer
     CHECK(camera.Distance() < zoomedOutDistance);
 }
 
-TEST_CASE("Point preview LOD resolver only applies automatic LOD to camera motion", "[budget][lod]") {
+TEST_CASE("Manual point budget sampling is an explicit draw cap", "[budget]") {
+    using invisible_places::renderer::pointcloud::ClampPointBudget;
     using invisible_places::renderer::pointcloud::MakePointBudgetState;
-    using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
-    using invisible_places::renderer::pointcloud::ResolvePointCloudPreviewLod;
 
-    const auto largeBudget = MakePointBudgetState(42'000'000, 42'000'000);
-    const auto panelOnly = ResolvePointCloudPreviewLod(
-        largeBudget,
-        PointCloudPreviewLodMode::AutoCameraLod,
-        false,
-        false,
-        10'000'000);
-    CHECK(panelOnly.drawPointCount == 42'000'000);
-    CHECK(!panelOnly.usesPreviewLod);
+    const auto fullSourceBudget = MakePointBudgetState(42'000, 42'000);
+    CHECK(fullSourceBudget.totalPoints == 42'000);
+    CHECK(fullSourceBudget.activePoints == 42'000);
+    CHECK(!fullSourceBudget.UsesSampledIndices());
+    CHECK(fullSourceBudget.sampledIndices.empty());
 
-    const auto cameraNavigation = ResolvePointCloudPreviewLod(
-        largeBudget,
-        PointCloudPreviewLodMode::AutoCameraLod,
-        true,
-        false,
-        10'000'000);
-    CHECK(cameraNavigation.drawPointCount == 10'000'000);
-    CHECK(cameraNavigation.usesPreviewLod);
+    const auto userCappedBudget = MakePointBudgetState(42'000, 4'000);
+    CHECK(userCappedBudget.totalPoints == 42'000);
+    CHECK(userCappedBudget.activePoints == 4'000);
+    CHECK(userCappedBudget.UsesSampledIndices());
+    CHECK(userCappedBudget.sampledIndices.size() == 4'000);
+    CHECK(ClampPointBudget(42'000, 99'000) == 42'000);
+}
 
-    const auto cameraPlayback = ResolvePointCloudPreviewLod(
-        largeBudget,
-        PointCloudPreviewLodMode::AutoCameraLod,
-        false,
-        true,
-        10'000'000);
-    CHECK(cameraPlayback.drawPointCount == 10'000'000);
-    CHECK(cameraPlayback.usesPreviewLod);
+TEST_CASE("Point-cloud LOD hierarchy preserves source indices for full-source traversal", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    for (int z = 0; z < 2; ++z) {
+        for (int y = 0; y < 2; ++y) {
+            for (int x = 0; x < 2; ++x) {
+                invisible_places::io::Float3 point{
+                    static_cast<float>(x) - 0.5F,
+                    static_cast<float>(y) - 0.5F,
+                    static_cast<float>(z) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
 
-    const auto fullOverride = ResolvePointCloudPreviewLod(
-        largeBudget,
-        PointCloudPreviewLodMode::FullResolution,
-        true,
-        true,
-        10'000'000);
-    CHECK(fullOverride.drawPointCount == 42'000'000);
-    CHECK(!fullOverride.usesPreviewLod);
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 4U});
+    REQUIRE(!hierarchy.Empty());
+    CHECK(hierarchy.sourcePointCount == cloud.PointCount());
 
-    const auto forceOverride = ResolvePointCloudPreviewLod(
-        largeBudget,
-        PointCloudPreviewLodMode::ForceLod,
-        false,
-        false,
-        10'000'000);
-    CHECK(forceOverride.drawPointCount == 10'000'000);
-    CHECK(forceOverride.usesPreviewLod);
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::FullSource;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    const auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
 
-    const auto userCappedBudget = MakePointBudgetState(42'000'000, 4'000'000);
-    const auto manualBudget = ResolvePointCloudPreviewLod(
-        userCappedBudget,
-        PointCloudPreviewLodMode::ForceLod,
-        true,
-        true,
-        10'000'000);
-    CHECK(manualBudget.drawPointCount == 4'000'000);
-    CHECK(!manualBudget.usesPreviewLod);
+    REQUIRE(drawItems.size() == cloud.PointCount());
+    std::set<std::uint32_t> sourceIndices;
+    std::uint32_t representedSourceCount = 0;
+    for (const auto& drawItem : drawItems) {
+        sourceIndices.insert(drawItem.sourcePointIndex);
+        representedSourceCount += drawItem.representedSourceCount;
+        CHECK(drawItem.representedSourceCount == 1U);
+    }
+    CHECK(sourceIndices.size() == cloud.PointCount());
+    CHECK(representedSourceCount == cloud.PointCount());
+}
+
+TEST_CASE("Point-cloud adaptive LOD traversal uses area-normalized compensation", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    for (int z = 0; z < 2; ++z) {
+        for (int y = 0; y < 2; ++y) {
+            for (int x = 0; x < 2; ++x) {
+                invisible_places::io::Float3 point{
+                    static_cast<float>(x) - 0.5F,
+                    static_cast<float>(y) - 0.5F,
+                    static_cast<float>(z) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 4U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxDrawItems = 1U;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+    const auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+
+    REQUIRE(drawItems.size() == 1);
+    CHECK(drawItems[0].sourcePointIndex < cloud.PointCount());
+    CHECK(drawItems[0].representedSourceCount == cloud.PointCount());
+    CHECK(drawItems[0].footprintAreaPixels > 7.0F * 7.0F);
+    CHECK(std::sqrt(drawItems[0].footprintAreaPixels) <= Catch::Approx(48.0F));
+    CHECK(drawItems[0].renderAreaPixels == Catch::Approx(7.0F * 7.0F));
+    CHECK(drawItems[0].opacityCompensation <= 1.5F);
+    CHECK(drawItems[0].emissionCompensation <= 1.0F);
+    CHECK(drawItems[0].opacityCompensation != Catch::Approx(std::sqrt(static_cast<float>(cloud.PointCount()))));
+}
+
+TEST_CASE("Point-cloud adaptive LOD visible size only grows for overlapping source density", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 10;
+    constexpr float extent = 0.15F;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    ((static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F) * extent};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxDrawItems = 1U;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 8.0F);
+
+    const auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    REQUIRE(drawItems.size() == 1U);
+    CHECK(drawItems.front().representedSourceCount == cloud.PointCount());
+    CHECK(drawItems.front().footprintAreaPixels > 8.0F * 8.0F);
+    CHECK(drawItems.front().renderAreaPixels > 8.0F * 8.0F);
+    CHECK(std::sqrt(drawItems.front().renderAreaPixels) <= Catch::Approx(8.0F * 1.35F));
+    CHECK(drawItems.front().renderAreaPixels < drawItems.front().footprintAreaPixels);
+}
+
+TEST_CASE("Point-cloud LOD internal nodes store distributed representatives", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 4;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U, .maxInternalRepresentatives = 16U});
+    REQUIRE(!hierarchy.Empty());
+    REQUIRE(!hierarchy.nodes.front().IsLeaf());
+    const auto& root = hierarchy.nodes.front();
+    CHECK(root.representativeCount > 1U);
+    CHECK(root.representativeCount <= 16U);
+
+    std::set<std::uint32_t> representativeSourceIndices;
+    std::uint32_t representedSourceCount = 0;
+    for (std::uint32_t offset = 0; offset < root.representativeCount; ++offset) {
+        const auto representativeIndex = root.firstRepresentative + offset;
+        REQUIRE(representativeIndex < hierarchy.representatives.size());
+        const auto& representative = hierarchy.representatives[representativeIndex];
+        representativeSourceIndices.insert(representative.sourcePointIndex);
+        representedSourceCount += representative.representedSourceCount;
+    }
+    CHECK(representativeSourceIndices.size() == root.representativeCount);
+    CHECK(representedSourceCount == cloud.PointCount());
+}
+
+TEST_CASE("Point-cloud adaptive LOD does not collapse large projected nodes to one tiny point", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 16U;
+    params.maxEstimatedFragments = 0.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+
+    const auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    REQUIRE(drawItems.size() > 1U);
+    CHECK(drawItems.size() <= params.maxRepresentatives);
+    const auto representedSourceCount = std::accumulate(
+        drawItems.begin(),
+        drawItems.end(),
+        std::uint64_t{0},
+        [](std::uint64_t total, const invisible_places::renderer::pointcloud::PointCloudDrawItemGpu& drawItem) {
+            return total + drawItem.representedSourceCount;
+        });
+    CHECK(representedSourceCount == cloud.PointCount());
+
+    bool foundAggregatedRepresentative = false;
+    for (const auto& drawItem : drawItems) {
+        foundAggregatedRepresentative = foundAggregatedRepresentative || drawItem.representedSourceCount > 1U;
+        CHECK(drawItem.footprintAreaPixels > 0.0F);
+        CHECK(std::sqrt(drawItem.footprintAreaPixels) <= Catch::Approx(32.0F));
+        CHECK(drawItem.renderAreaPixels == Catch::Approx(7.0F * 7.0F));
+        CHECK(drawItem.opacityCompensation <= 4.0F);
+        CHECK(drawItem.emissionCompensation <= 1.25F);
+        if (drawItem.representedSourceCount > 1U) {
+            CHECK(drawItem.footprintAreaPixels > 7.0F * 7.0F);
+            CHECK(drawItem.renderAreaPixels <= drawItem.footprintAreaPixels);
+        }
+    }
+    CHECK(foundAggregatedRepresentative);
+}
+
+TEST_CASE("Point-cloud LOD hierarchy cache round-trips and rejects stale metadata", "[pointcloud][lod][cache]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    auto cloud = MakeRippleFixtureCloud();
+    const auto tempRoot =
+        std::filesystem::temp_directory_path() /
+        ("InvisiblePlacesLodCacheTest-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(tempRoot);
+    const auto sourcePath = tempRoot / "fixture.ply";
+    {
+        std::ofstream source{sourcePath};
+        source << "ply\nformat ascii 1.0\ncomment cache fixture\nend_header\n";
+    }
+    cloud.sourcePath = sourcePath;
+
+    const pc::PointCloudLodBuildConfig config{
+        .maxLeafSourcePoints = 8U,
+        .maxDepth = 5U,
+        .maxInternalRepresentatives = 12U};
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(cloud, config);
+    REQUIRE(!hierarchy.Empty());
+
+    const auto source = pc::MakePointCloudLodCacheSource(sourcePath, cloud);
+    const auto cachePath = pc::BuildPointCloudLodCachePath(tempRoot / "lod", sourcePath);
+    CHECK(cachePath.filename().string().find("PointCloudLodCache-v3.bin") != std::string::npos);
+    std::string errorMessage;
+    REQUIRE(pc::SavePointCloudLodHierarchyCache(cachePath, source, config, hierarchy, &errorMessage));
+
+    auto loaded = pc::LoadPointCloudLodHierarchyCache(cachePath, source, config);
+    REQUIRE(loaded.loaded);
+    CHECK(!loaded.stale);
+    CHECK(loaded.hierarchy.sourcePointCount == hierarchy.sourcePointCount);
+    CHECK(loaded.hierarchy.nodes.size() == hierarchy.nodes.size());
+    CHECK(loaded.hierarchy.representatives.size() == hierarchy.representatives.size());
+    REQUIRE(!loaded.hierarchy.nodes.empty());
+    CHECK(loaded.hierarchy.nodes.front().representedSourceCount == hierarchy.nodes.front().representedSourceCount);
+
+    auto wrongPointCount = source;
+    ++wrongPointCount.pointCount;
+    auto stale = pc::LoadPointCloudLodHierarchyCache(cachePath, wrongPointCount, config);
+    CHECK(!stale.loaded);
+    CHECK(stale.stale);
+
+    auto wrongConfig = config;
+    ++wrongConfig.maxDepth;
+    stale = pc::LoadPointCloudLodHierarchyCache(cachePath, source, wrongConfig);
+    CHECK(!stale.loaded);
+    CHECK(stale.stale);
+
+    wrongConfig = config;
+    ++wrongConfig.maxInternalRepresentatives;
+    stale = pc::LoadPointCloudLodHierarchyCache(cachePath, source, wrongConfig);
+    CHECK(!stale.loaded);
+    CHECK(stale.stale);
+
+    {
+        std::fstream cache{cachePath, std::ios::binary | std::ios::in | std::ios::out};
+        REQUIRE(cache);
+        const std::uint32_t wrongVersion = 1U;
+        cache.seekp(static_cast<std::streamoff>(sizeof(std::uint64_t)));
+        cache.write(reinterpret_cast<const char*>(&wrongVersion), sizeof(wrongVersion));
+    }
+    stale = pc::LoadPointCloudLodHierarchyCache(cachePath, source, config);
+    CHECK(!stale.loaded);
+    CHECK(stale.stale);
+
+    std::filesystem::remove_all(tempRoot);
+}
+
+TEST_CASE("Point-cloud adaptive LOD traversal culls offscreen nodes and obeys budgets", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    for (int z = 0; z < 4; ++z) {
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / 3.0F) - 0.5F,
+                    (static_cast<float>(y) / 3.0F) - 0.5F,
+                    (static_cast<float>(z) / 3.0F) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 3U;
+    params.viewProjection = glm::mat4{1.0F};
+    const auto budgeted = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    REQUIRE(!budgeted.empty());
+    CHECK(budgeted.size() <= 3U);
+
+    params.viewProjection = glm::translate(glm::mat4{1.0F}, glm::vec3{4.0F, 0.0F, 0.0F});
+    const auto offscreen = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    CHECK(offscreen.empty());
+}
+
+TEST_CASE("Point-cloud adaptive LOD traversal enforces estimated fragment budget", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U, .maxInternalRepresentatives = 16U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 128U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.viewProjection = glm::mat4{1.0F};
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 8.0F);
+
+    const auto unlimited = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    REQUIRE(unlimited.size() > 8U);
+    const auto unlimitedFragments = std::accumulate(
+        unlimited.begin(),
+        unlimited.end(),
+        0.0F,
+        [](float total, const invisible_places::renderer::pointcloud::PointCloudDrawItemGpu& drawItem) {
+            return total + drawItem.footprintAreaPixels;
+        });
+    REQUIRE(unlimitedFragments > 0.0F);
+
+    params.maxEstimatedFragments = unlimited.front().footprintAreaPixels * 3.5F;
+    const auto budgeted = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    REQUIRE(!budgeted.empty());
+    CHECK(budgeted.size() < unlimited.size());
+    const auto budgetedFragments = std::accumulate(
+        budgeted.begin(),
+        budgeted.end(),
+        0.0F,
+        [](float total, const invisible_places::renderer::pointcloud::PointCloudDrawItemGpu& drawItem) {
+            return total + drawItem.footprintAreaPixels;
+        });
+    CHECK(budgetedFragments <= params.maxEstimatedFragments + 0.01F);
+}
+
+TEST_CASE("Point-cloud adaptive LOD diagnostics distinguish visible emitted and budget pressure", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U, .maxInternalRepresentatives = 16U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 4U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.viewProjection = glm::mat4{1.0F};
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 8.0F);
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics diagnostics;
+    const auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params,
+        {},
+        &diagnostics);
+    REQUIRE(!drawItems.empty());
+    CHECK(drawItems.size() <= params.maxRepresentatives);
+    CHECK(diagnostics.visibleFrontierNodeCount > 0U);
+    CHECK(diagnostics.visibleFrontierRepresentedSourceCount >= diagnostics.emittedRepresentedSourceCount);
+    CHECK(diagnostics.emittedRepresentativeCount == drawItems.size());
+    CHECK(diagnostics.representativeBudgetReached);
+}
+
+TEST_CASE("Point-cloud coarse adaptive fallback stays spatially distributed", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+
+    const auto fallback = invisible_places::renderer::pointcloud::BuildCoarsePointCloudLodFallbackDrawItems(
+        hierarchy,
+        params,
+        32U);
+    REQUIRE(fallback.size() > 1U);
+    const auto representedSourceCount = std::accumulate(
+        fallback.begin(),
+        fallback.end(),
+        std::uint64_t{0},
+        [](std::uint64_t total, const invisible_places::renderer::pointcloud::PointCloudDrawItemGpu& drawItem) {
+            return total + drawItem.representedSourceCount;
+        });
+    CHECK(representedSourceCount == cloud.PointCount());
+    CHECK(std::any_of(
+        fallback.begin(),
+        fallback.end(),
+        [](const invisible_places::renderer::pointcloud::PointCloudDrawItemGpu& drawItem) {
+            return drawItem.representedSourceCount > 1U;
+        }));
+}
+
+TEST_CASE("Point-cloud draw items use a std430-compatible GPU layout", "[pointcloud][lod]") {
+    using invisible_places::renderer::pointcloud::PointCloudDrawItemGpu;
+
+    CHECK(sizeof(PointCloudDrawItemGpu) == 32U);
+    CHECK(alignof(PointCloudDrawItemGpu) == 16U);
+    CHECK(offsetof(PointCloudDrawItemGpu, sourcePointIndex) == 0U);
+    CHECK(offsetof(PointCloudDrawItemGpu, representedSourceCount) == 4U);
+    CHECK(offsetof(PointCloudDrawItemGpu, footprintAreaPixels) == 16U);
+    CHECK(offsetof(PointCloudDrawItemGpu, opacityCompensation) == 20U);
+    CHECK(offsetof(PointCloudDrawItemGpu, emissionCompensation) == 24U);
+    CHECK(offsetof(PointCloudDrawItemGpu, renderAreaPixels) == 28U);
+}
+
+TEST_CASE("Adaptive LOD signature uses traversal metadata instead of vector hashing", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
+    const auto signatureSection = SourceSection(
+        applicationSource,
+        "std::uint64_t RenderStateSignature",
+        "glm::mat4 ToGlmMatrix");
+
+    CHECK(applicationSource.find("HashAdaptiveDrawItems") == std::string::npos);
+    CHECK(signatureSection.find("adaptiveLodRevision") != std::string::npos);
+    CHECK(signatureSection.find("adaptiveRepresentedSourceCount") != std::string::npos);
+    CHECK(signatureSection.find("requiresAdaptiveDrawItems") != std::string::npos);
+    CHECK(signatureSection.find("adaptiveLodRequestedDensity") != std::string::npos);
+    CHECK(signatureSection.find("adaptiveLodDisplayedDensity") != std::string::npos);
+    CHECK(signatureSection.find("adaptiveLodAsyncPending") != std::string::npos);
+    CHECK(signatureSection.find("adaptiveDrawItems") == std::string::npos);
+    CHECK(rendererHeader.find("bool requiresAdaptiveDrawItems") != std::string::npos);
+}
+
+TEST_CASE("Adaptive LOD traversal cache key covers render-affecting inputs", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto keySection = SourceSection(
+        applicationSource,
+        "std::uint64_t AdaptiveLodTraversalKey",
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems");
+    const auto buildSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems",
+        "bool PopulateAdaptivePointCloudLayer");
+
+    CHECK(keySection.find("HashQuantizedMat4(&seed, viewProjection") != std::string::npos);
+    CHECK(keySection.find("HashQuantizedVec3(&seed, cameraPosition") != std::string::npos);
+    CHECK(keySection.find("viewportWidth") != std::string::npos);
+    CHECK(keySection.find("viewportHeight") != std::string::npos);
+    CHECK(keySection.find("densityMode") != std::string::npos);
+    CHECK(keySection.find("ManualAdaptiveDrawItemCap") != std::string::npos);
+    CHECK(keySection.find("pointLodHierarchyGeneration") != std::string::npos);
+    CHECK(keySection.find("HashPointStyle(&seed, style)") != std::string::npos);
+    CHECK(buildSection.find("FindAdaptiveLodCacheEntry(session, traversalKey)") != std::string::npos);
+    CHECK(buildSection.find("StoreAdaptiveLodCacheEntry") != std::string::npos);
+    CHECK(buildSection.find("ScheduleAdaptiveLodTraversal") != std::string::npos);
+}
+
+TEST_CASE("Viewport adaptive LOD schedules traversal instead of running it synchronously", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto buildRenderStateSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::core::SceneRenderState BuildRenderState",
+        "int Application::Run");
+    const auto buildItemsSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems",
+        "bool PopulateAdaptivePointCloudLayer");
+
+    CHECK(buildRenderStateSection.find("TraversePointCloudLodHierarchy") == std::string::npos);
+    CHECK(buildRenderStateSection.find("SelectAdaptiveViewportDensityMode") != std::string::npos);
+    CHECK(buildRenderStateSection.find("runtimeState.previewFrameCounter") != std::string::npos);
+    CHECK(buildItemsSection.find("allowSynchronousTraversal") != std::string::npos);
+    CHECK(buildItemsSection.find("ScheduleAdaptiveLodTraversal") != std::string::npos);
+    CHECK(buildItemsSection.find("coarse fallback") != std::string::npos);
+    CHECK(buildItemsSection.find("coarseFallback") != std::string::npos);
+    CHECK(buildItemsSection.find("PointCloudExportDensityMode::FastAdaptivePreview") != std::string::npos);
+}
+
+TEST_CASE("Adaptive viewport path does not fall back to source draw count", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
+    const auto populateSection = SourceSection(
+        applicationSource,
+        "bool PopulateAdaptivePointCloudLayer",
+        "AdaptiveLodPreviewSummary ComputeAdaptiveLodPreviewSummary");
+    const auto buildRenderStateSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::core::SceneRenderState BuildRenderState",
+        "int Application::Run");
+    const auto resolveSection = SourceSection(
+        rendererSource,
+        "bool VulkanViewportShell::ResolvePointCloudDrawPlan",
+        "bool VulkanViewportShell::RecordPointCloudLayerDraw");
+
+    CHECK(populateSection.find("layer->requiresAdaptiveDrawItems = true") != std::string::npos);
+    CHECK(populateSection.find("layer->drawPointCount = 0") != std::string::npos);
+    CHECK(populateSection.find("layer->useAdaptiveDrawItems = false") != std::string::npos);
+    CHECK(populateSection.find("adaptiveLodRuntimeStatus") != std::string::npos);
+    CHECK(resolveSection.find("layer.requiresAdaptiveDrawItems") != std::string::npos);
+    CHECK(resolveSection.find("return false;") < resolveSection.find("resources->activePointCount"));
+    CHECK(buildRenderStateSection.find("fullSourcePointRenderer ? session.totalPrimitives") != std::string::npos);
+    CHECK(buildRenderStateSection.find("PopulateAdaptivePointCloudLayer") != std::string::npos);
+}
+
+TEST_CASE("Adaptive async traversal supersedes stale viewport requests", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto scheduleSection = SourceSection(
+        applicationSource,
+        "bool ScheduleAdaptiveLodTraversal",
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems");
+    const auto pollSection = SourceSection(
+        applicationSource,
+        "void PollPointCloudLodWorkers",
+        "ImVec2 CurrentUiViewportOrigin");
+    const auto lodHeader = ReadRepoTextFile("src/renderer/pointcloud/PointCloudLodHierarchy.hpp");
+    const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
+
+    CHECK(lodHeader.find("std::stop_token stopToken = {}") != std::string::npos);
+    CHECK(scheduleSection.find("latestRequestedGeneration") != std::string::npos);
+    CHECK(scheduleSection.find("request_stop()") != std::string::npos);
+    CHECK(scheduleSection.find("async traversal superseded by newer request") != std::string::npos);
+    CHECK(scheduleSection.find("discarded stale async traversal before scheduling") != std::string::npos);
+    CHECK(applicationSource.find("maxReuseAgeFrames") != std::string::npos);
+    CHECK(applicationSource.find("std::numeric_limits<std::uint64_t>::max()") != std::string::npos);
+    CHECK(applicationSource.find("skipEmergencyPreview") != std::string::npos);
+    CHECK(applicationSource.find("async traversal in flight, supersede throttled") != std::string::npos);
+    CHECK(applicationSource.find("MinimumReusableAdaptiveRepresentedSourceCount") != std::string::npos);
+    CHECK(applicationSource.find("\"reused exact\"") != std::string::npos);
+    CHECK(pollSection.find("discarded stale async traversal") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveLodStaleTraversalDiscardedCount") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveLodAsyncPendingAgeMs") != std::string::npos);
+}
+
+TEST_CASE("Beauty Adaptive quality controller demotes and promotes by measured FPS", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto controllerSection = SourceSection(
+        applicationSource,
+        "PointCloudExportDensityMode SelectAdaptiveViewportDensityMode",
+        "invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams");
+    const auto buildRenderStateSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::core::SceneRenderState BuildRenderState",
+        "int Application::Run");
+
+    CHECK(controllerSection.find("kAdaptiveDemoteFps = 15.0") != std::string::npos);
+    CHECK(controllerSection.find("kAdaptivePromoteFps = 45.0") != std::string::npos);
+    CHECK(controllerSection.find("DemoteAdaptiveQuality") != std::string::npos);
+    CHECK(controllerSection.find("PromoteAdaptiveQuality") != std::string::npos);
+    CHECK(controllerSection.find("adaptiveMovementDensityMode") != std::string::npos);
+    CHECK(controllerSection.find("AdaptiveHighQuality") != std::string::npos);
+    CHECK(buildRenderStateSection.find("SelectAdaptiveViewportDensityMode") != std::string::npos);
+}
+
+TEST_CASE("Fast Basic adaptive viewport targets high quality and reserves preview for emergency demotion", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto controllerSection = SourceSection(
+        applicationSource,
+        "PointCloudExportDensityMode SelectAdaptiveViewportDensityMode",
+        "invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams");
+    const auto buildRenderStateSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::core::SceneRenderState BuildRenderState",
+        "int Application::Run");
+
+    CHECK(controllerSection.find("fastBasicViewport") != std::string::npos);
+    CHECK(controllerSection.find("PointCloudExportDensityMode::FastAdaptivePreview") != std::string::npos);
+    CHECK(controllerSection.find("DemoteAdaptiveQuality") != std::string::npos);
+    CHECK(controllerSection.find("fastBasicIdleCeiling") == std::string::npos);
+    CHECK(controllerSection.find("next == highQuality") == std::string::npos);
+    CHECK(controllerSection.find("std::chrono::milliseconds{120}") != std::string::npos);
+    CHECK(controllerSection.find("std::chrono::milliseconds{300}") != std::string::npos);
+    CHECK(controllerSection.find("runtimeState.cameraInteraction.navigationActive") != std::string::npos);
+    CHECK(controllerSection.find("adaptiveInteractionActive") != std::string::npos);
+    CHECK(controllerSection.find("session->adaptiveLodEmergencyDemotion") != std::string::npos);
+    CHECK(controllerSection.find("session->adaptiveLodAsyncPending") == std::string::npos);
+    CHECK(controllerSection.find("session->adaptiveLodFallbackState == \"coarse fallback\"") == std::string::npos);
+    CHECK(controllerSection.find("setQuality(PointCloudExportDensityMode::FastAdaptivePreview);\n        return PointCloudExportDensityMode::FastAdaptivePreview;") == std::string::npos);
+    CHECK(buildRenderStateSection.find("FastBasicPointRendererActive(runtimeState.projectSettings)") != std::string::npos);
+}
+
+TEST_CASE("Fast Basic adaptive budgets use a dense renderer profile", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto budgetSection = SourceSection(
+        applicationSource,
+        "std::uint32_t AdaptiveViewportRepresentativeBudget",
+        "PointCloudExportDensityMode AdaptiveHighQualityMode");
+    const auto traversalSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams",
+        "std::uint64_t AdaptiveLodTraversalKey");
+
+    CHECK(budgetSection.find("fastBasicProfile ? pixelCount / 8ULL : pixelCount / 96ULL") != std::string::npos);
+    CHECK(budgetSection.find("fastBasicProfile ? pixelCount / 2ULL : pixelCount / 8ULL") != std::string::npos);
+    CHECK(budgetSection.find("fastBasicProfile ? pixelCount : pixelCount / 3ULL") != std::string::npos);
+    CHECK(budgetSection.find("4'000'000ULL") != std::string::npos);
+    CHECK(budgetSection.find("16'000'000ULL") != std::string::npos);
+    CHECK(budgetSection.find("fastBasicProfile ? 32.0F : 8.0F") != std::string::npos);
+    CHECK(budgetSection.find("fastBasicProfile ? 96.0F : 16.0F") != std::string::npos);
+    CHECK(traversalSection.find("fastBasicProfile") != std::string::npos);
+    CHECK(traversalSection.find("session.totalPrimitives") != std::string::npos);
+}
+
+TEST_CASE("Fast Basic Source mode serializes and uses full source through Fast Basic", "[pointcloud][lod][source]") {
+    using invisible_places::renderer::pointcloud::PointCloudRendererMode;
+    using invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFastBasic;
+    using invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFullSource;
+
+    CHECK(PointCloudRendererModeUsesFastBasic(PointCloudRendererMode::FastBasicSource));
+    CHECK(PointCloudRendererModeUsesFullSource(PointCloudRendererMode::FastBasicSource));
+    CHECK(PointCloudRendererModeUsesFastBasic(PointCloudRendererMode::FastBasic));
+    CHECK_FALSE(PointCloudRendererModeUsesFullSource(PointCloudRendererMode::FastBasic));
+
+    const auto appSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto projectSource = ReadRepoTextFile("src/serialization/ProjectDocument.cpp");
+    const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
+    CHECK(appSource.find("Fast Basic Source") != std::string::npos);
+    CHECK(projectSource.find("\"fast_basic_source\"") != std::string::npos);
+    CHECK(appSource.find("fullSourcePointRenderer ? session.totalPrimitives") != std::string::npos);
+    CHECK(appSource.find("PointCloudRendererModeUsesFullSource(rendererMode)") != std::string::npos);
+    CHECK(rendererSource.find("\"fast-basic-source\"") != std::string::npos);
+}
+
+TEST_CASE("Fast Basic coarse fallback is bounded but richer than emergency preview", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto fallbackSection = SourceSection(
+        applicationSource,
+        "std::uint32_t CoarseAdaptiveFallbackRepresentativeTarget",
+        "std::vector<PointCloudDrawItemGpu> BuildCoarseAdaptiveFallbackDrawItems");
+    const auto buildItemsSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems",
+        "bool PopulateAdaptivePointCloudLayer");
+
+    CHECK(fallbackSection.find("pixelCount / 24ULL") != std::string::npos);
+    CHECK(fallbackSection.find("262'144ULL") != std::string::npos);
+    CHECK(buildItemsSection.find("coarse fallback for ") != std::string::npos);
+    CHECK(buildItemsSection.find("showing previous lower-tier set") != std::string::npos);
+}
+
+TEST_CASE("Fast Basic navigation reuses adaptive LOD instead of rebuilding fallback every camera key", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto reusableSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodCacheState* FindReusableAdaptiveLodCacheEntry",
+        "double CurrentAdaptiveLodPendingAgeMs");
+    const auto buildItemsSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems",
+        "bool PopulateAdaptivePointCloudLayer");
+    const auto pollSection = SourceSection(
+        applicationSource,
+        "void PollPointCloudLodWorkers",
+        "ImVec2 CurrentUiViewportOrigin");
+
+    CHECK(reusableSection.find("allowCoarseFallback") != std::string::npos);
+    CHECK(reusableSection.find("bestCoarseFallback") != std::string::npos);
+    CHECK(reusableSection.find("denseFastBasicNavigation ? 0ULL") != std::string::npos);
+    CHECK(buildItemsSection.find("std::numeric_limits<std::uint64_t>::max()") != std::string::npos);
+    CHECK(buildItemsSection.find("motion hold reused exact") != std::string::npos);
+    CHECK(buildItemsSection.find("motion hold reused coarse fallback") != std::string::npos);
+    CHECK(pollSection.find("kAdaptiveMotionApplyInterval") != std::string::npos);
+    CHECK(pollSection.find("completionApplyThrottled") != std::string::npos);
+    CHECK(pollSection.find("adaptiveLodMotionApplyThrottleCount") != std::string::npos);
+}
+
+TEST_CASE("Adaptive LOD blocks idle demotion below the displayed base", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto buildItemsSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems",
+        "bool PopulateAdaptivePointCloudLayer");
+    const auto pollSection = SourceSection(
+        applicationSource,
+        "void PollPointCloudLodWorkers",
+        "ImVec2 CurrentUiViewportOrigin");
+
+    CHECK(applicationSource.find("AdaptiveLodCandidateWouldDemoteDisplayed") != std::string::npos);
+    CHECK(buildItemsSection.find("holding displayed base, coarse fallback blocked") != std::string::npos);
+    CHECK(buildItemsSection.find("idle no-flash refine") != std::string::npos);
+    CHECK(pollSection.find("candidate demotion blocked; idle no-flash refine") != std::string::npos);
+    CHECK(pollSection.find("adaptiveLodCandidateDemotionBlockedCount") != std::string::npos);
+}
+
+TEST_CASE("Adaptive LOD motion traversals complete as coverage patches", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto scheduleSection = SourceSection(
+        applicationSource,
+        "bool ScheduleAdaptiveLodTraversal",
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems");
+    const auto pollSection = SourceSection(
+        applicationSource,
+        "void PollPointCloudLodWorkers",
+        "ImVec2 CurrentUiViewportOrigin");
+
+    CHECK(scheduleSection.find("supersede throttled for motion patch") != std::string::npos);
+    CHECK(scheduleSection.find("return true;") < scheduleSection.find("request_stop()"));
+    CHECK(pollSection.find("motion coverage patch applied") != std::string::npos);
+    CHECK(pollSection.find("adaptiveLodMotionPatch") != std::string::npos);
+    CHECK(pollSection.find("adaptiveLodCoverageGapSourceCount") != std::string::npos);
+    CHECK(pollSection.find("candidateVisibleSourceCount > displayedVisibleSourceCount") != std::string::npos);
+}
+
+TEST_CASE("LOD comparison command writes full-source and adaptive image metrics", "[pointcloud][lod][source]") {
+    const auto applicationHeader = ReadRepoTextFile("src/app/Application.hpp");
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto mainSource = ReadRepoTextFile("src/main.cpp");
+    const auto comparisonSection = SourceSection(
+        applicationSource,
+        "int Application::RunLodComparison",
+        "int Application::Run() const");
+
+    CHECK(applicationHeader.find("RunLodComparison") != std::string::npos);
+    CHECK(mainSource.find("--lod-compare") != std::string::npos);
+    CHECK(comparisonSection.find("Site3-Sample-Terrestrial.ply") != std::string::npos);
+    CHECK(comparisonSection.find("beauty_full_source.exr") != std::string::npos);
+    CHECK(comparisonSection.find("beauty_adaptive_hq.exr") != std::string::npos);
+    CHECK(comparisonSection.find("lod_compare_metrics.json") != std::string::npos);
+    CHECK(comparisonSection.find("Adaptive High Quality") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_fallback\\\": false") != std::string::npos);
+    CHECK(comparisonSection.find("PointCloudRendererMode::FastBasic") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_max_submitted_points\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_max_estimated_fragments\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_max_visible_represented_source\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_zoom_out_updated\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("kFastBasicZoomOutStartFrame") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_submitted_full_source\\\"") != std::string::npos);
+}
+
+TEST_CASE("Adaptive LOD summary reads cached metadata without retraversal", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto summarySection = SourceSection(
+        applicationSource,
+        "AdaptiveLodPreviewSummary ComputeAdaptiveLodPreviewSummary",
+        "ImVec2 CurrentUiViewportOrigin");
+
+    CHECK(summarySection.find("adaptiveLodCache") != std::string::npos);
+    CHECK(summarySection.find("TraversePointCloudLodHierarchy") == std::string::npos);
+    CHECK(summarySection.find("BuildAdaptivePointCloudDrawItems") == std::string::npos);
+}
+
+TEST_CASE("Persistent and runtime LOD cache status is surfaced in diagnostics", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
+
+    CHECK(applicationSource.find("PointCloudLodCacheDirectory") != std::string::npos);
+    CHECK(applicationSource.find("LoadPointCloudLodHierarchyCache") != std::string::npos);
+    CHECK(applicationSource.find("SavePointCloudLodHierarchyCache") != std::string::npos);
+    CHECK(applicationSource.find("LOD cache ready") != std::string::npos);
+    CHECK(applicationSource.find("LOD cache stale") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveLodPersistentCacheStatus") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveLodRequestedDensity") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveLodDisplayedDensity") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveVisibleRepresentedSourceCount") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveCulledRepresentedSourceCount") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveLodDisplayedCacheAgeFrames") != std::string::npos);
+    CHECK(applicationSource.find("Represented visible/emitted/culled") != std::string::npos);
+}
+
+TEST_CASE("Adaptive LOD shaders apply draw-item footprint", "[pointcloud][lod][shader]") {
+    const std::array<std::filesystem::path, 5> drawItemShaders = {
+        std::filesystem::path{"shaders/pointcloud_preview.vert"},
+        std::filesystem::path{"shaders/pointcloud_fast_basic.vert"},
+        std::filesystem::path{"shaders/pointcloud_constant_simple.vert"},
+        std::filesystem::path{"shaders/pointcloud_surfel.vert"},
+        std::filesystem::path{"shaders/pointcloud_surfel_constant_simple.vert"},
+    };
+
+    for (const auto& shaderPath : drawItemShaders) {
+        const auto shaderSource = ReadRepoTextFile(shaderPath);
+        CHECK(shaderSource.find("drawItems[drawIndex].params.w") != std::string::npos);
+        CHECK(shaderSource.find("DrawItemFootprintDiameterPixels") != std::string::npos);
+        if (shaderPath.string().find("surfel") != std::string::npos) {
+            CHECK(shaderSource.find("DrawItemFootprintWorldDiameter") != std::string::npos);
+            CHECK(shaderSource.find("ScreenPointSizePixelsToWorldDiameter") != std::string::npos);
+        } else {
+            CHECK(shaderSource.find("gl_PointSize = clamp(") != std::string::npos);
+            CHECK(shaderSource.find("DrawItemFootprintDiameterPixels(drawIndex)") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("Adaptive draw-item uploads are grow-only and avoid device idle", "[pointcloud][lod][source]") {
+    const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
+    const auto updateSection = SourceSection(
+        rendererSource,
+        "bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer",
+        "bool VulkanViewportShell::UpdatePointCloudExrDrawItemBuffer");
+    const auto descriptorRewrite = updateSection.find("UpdatePointCloudDescriptorSet");
+    const auto reallocationGuard = updateSection.find("if (reallocated)");
+
+    CHECK(updateSection.find("WaitIdle") == std::string::npos);
+    CHECK(updateSection.find("vkDeviceWaitIdle") == std::string::npos);
+    CHECK(updateSection.find("drawItemCapacities") != std::string::npos);
+    REQUIRE(descriptorRewrite != std::string::npos);
+    REQUIRE(reallocationGuard != std::string::npos);
+    CHECK(reallocationGuard < descriptorRewrite);
+}
+
+TEST_CASE("Point renderer controls expose adaptive modes in the Visuals tab", "[ui][pointcloud]") {
+    const auto source = ReadRepoTextFile("src/app/Application.cpp");
+    const auto rendererSection = SourceSection(
+        source,
+        "void DrawPointRendererPanel",
+        "void DrawWaterEffectStackVisualsSection");
+    CHECK(rendererSection.find("\"Fast Basic\"") != std::string::npos);
+    CHECK(rendererSection.find("\"Fast Basic Source\"") != std::string::npos);
+    CHECK(rendererSection.find("\"Beauty Adaptive\"") != std::string::npos);
+    CHECK(rendererSection.find("\"Beauty Full Source\"") != std::string::npos);
+    CHECK(rendererSection.find("\"Painted Adaptive\"") != std::string::npos);
+    CHECK(rendererSection.find("ImGui::Checkbox(\"Eye-Dome Lighting\"") != std::string::npos);
+    CHECK(rendererSection.find("ImGui::Checkbox(\"Constant Update View\"") != std::string::npos);
+    CHECK(rendererSection.find("ImGui::Checkbox(\"Live Visual Effects\"") != std::string::npos);
+
+    const auto projectSection = SourceSection(
+        source,
+        "void DrawProjectPanel",
+        "ImVec2 DefaultControlsWindowPosition");
+    CHECK(projectSection.find("ImGui::Checkbox(\"Eye-Dome Lighting\"") == std::string::npos);
+    CHECK(projectSection.find("ImGui::Checkbox(\"Constant Update View\"") == std::string::npos);
+    CHECK(projectSection.find("ImGui::Checkbox(\"Live Visual Effects\"") == std::string::npos);
+}
+
+TEST_CASE("LiDAR panel exposes manual adaptive LOD cache rebuild controls", "[ui][pointcloud][lod]") {
+    const auto source = ReadRepoTextFile("src/app/Application.cpp");
+    CHECK(source.find("bool rebuildPointLodCacheOnLoad") != std::string::npos);
+    CHECK(source.find("RemovePointCloudLodCacheFiles") != std::string::npos);
+    CHECK(source.find("RebuildSelectedPointCloudLodCache") != std::string::npos);
+    CHECK(source.find("session.rebuildPointLodCacheOnLoad") != std::string::npos);
+    CHECK(source.find("\"Rebuild LOD Cache On Load\"") != std::string::npos);
+    CHECK(source.find("\"Rebuild LOD Cache Now\"") != std::string::npos);
+    CHECK(source.find("session.pointLodCacheSource.sourceSizeBytes > 0ULL && session.rebuildPointLodCacheOnLoad") !=
+          std::string::npos);
+}
+
+TEST_CASE("LiDAR loading and LOD cache builds expose progress and ETA", "[ui][pointcloud][lod]") {
+    const auto appSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto pointCloudHeader = ReadRepoTextFile("src/io/PointCloudData.hpp");
+    const auto lodHeader = ReadRepoTextFile("src/renderer/pointcloud/PointCloudLodHierarchy.hpp");
+    const auto lodSource = ReadRepoTextFile("src/renderer/pointcloud/PointCloudLodHierarchy.cpp");
+
+    CHECK(pointCloudHeader.find("struct PointCloudLoadProgress") != std::string::npos);
+    CHECK(pointCloudHeader.find("PointCloudLoadProgressCallback") != std::string::npos);
+    CHECK(appSource.find("pointCloudProgress") != std::string::npos);
+    CHECK(appSource.find("DrawLoadProgressLines") != std::string::npos);
+    CHECK(appSource.find("FormatEta") != std::string::npos);
+
+    CHECK(lodHeader.find("struct PointCloudLodBuildProgress") != std::string::npos);
+    CHECK(lodHeader.find("PointCloudLodBuildProgressCallback") != std::string::npos);
+    CHECK(lodSource.find("PointCloudLodBuildProgressTracker") != std::string::npos);
+    CHECK(appSource.find("DrawLodBuildProgressLines") != std::string::npos);
+    CHECK(appSource.find("CurrentPointCloudLodBuildProgress") != std::string::npos);
+    CHECK(appSource.find("BuildPointCloudLodHierarchy(\n                *cloud,\n                buildConfig,\n                progressCallback)") !=
+          std::string::npos);
+}
+
+TEST_CASE("LOD HUD reports adaptive density fallback and hierarchy details", "[ui][pointcloud][lod]") {
+    const auto source = ReadRepoTextFile("src/app/Application.cpp");
+    const auto statusOverlay = SourceSection(
+        source,
+        "void DrawStatusOverlay",
+        "void DrawPivotOverlay");
+    CHECK(statusOverlay.find("\"LOD density: %s / %s\"") != std::string::npos);
+    CHECK(statusOverlay.find("\"LOD reps: %s for %s source (%s)\"") != std::string::npos);
+    CHECK(statusOverlay.find("coarseFallback ? \"fallback\" : \"exact\"") != std::string::npos);
+
+    const auto lodDebugSection = SourceSection(
+        source,
+        "void DrawPointCloudLodDebugLines",
+        "void DrawStatusOverlay");
+    CHECK(lodDebugSection.find("\"Hierarchy: %s source, %s nodes, %s reps, gen %s\"") != std::string::npos);
+    CHECK(lodDebugSection.find("\"Density requested/displayed: %s / %s\"") != std::string::npos);
+    CHECK(lodDebugSection.find("\"Movement tier: %s\"") != std::string::npos);
+    CHECK(lodDebugSection.find("\"Displayed: %s | key %llx | revision %s\"") != std::string::npos);
+    CHECK(lodDebugSection.find("\"Budget: %s reps, %.0f fragments | estimated %.0f fragments\"") != std::string::npos);
+    CHECK(lodDebugSection.find("\"Async pending age: %.1f ms | stale discarded: %s | motion apply holds: %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"Motion patches: %s applied, %s reps last, %s source gap | demotion blocks: %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"Displayed base/patch/candidate: %s / %s / %s | skipped patches: %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"coarse fallback\"") != std::string::npos);
+    CHECK(lodDebugSection.find("\"exact traversal\"") != std::string::npos);
 }
 
 TEST_CASE("Scalar field binding evaluation matches the mapped style rules", "[style][binding]") {
@@ -996,11 +1958,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.liveVisualEffects = true;
     document.sidePanelPinned = true;
     document.autoLowerGsplatQualityWhileNavigating = false;
-    document.pointCloudPreviewLodMode =
-        invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod;
-    document.interactivePointCap = 12'345'678;
     document.pointCloudRendererMode =
-        invisible_places::renderer::pointcloud::PointCloudRendererMode::FastBasic;
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::FastBasicSource;
     document.renderJobSettings.outputDirectory = "Saved/renders/Roundtrip";
     document.renderJobSettings.width = 3840;
     document.renderJobSettings.height = 2160;
@@ -1362,12 +2321,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->sidePanelPinned);
     CHECK(!loadedDocument->autoLowerGsplatQualityWhileNavigating);
     CHECK(
-        loadedDocument->pointCloudPreviewLodMode ==
-        invisible_places::renderer::pointcloud::PointCloudPreviewLodMode::ForceLod);
-    CHECK(loadedDocument->interactivePointCap == 12'345'678);
-    CHECK(
         loadedDocument->pointCloudRendererMode ==
-        invisible_places::renderer::pointcloud::PointCloudRendererMode::FastBasic);
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::FastBasicSource);
     CHECK(loadedDocument->renderJobSettings.outputDirectory == "Saved/renders/Roundtrip");
     CHECK(loadedDocument->renderJobSettings.width == 3840);
     CHECK(loadedDocument->renderJobSettings.height == 2160);
@@ -1742,7 +2697,7 @@ TEST_CASE("Legacy water region records load as v2 ripples while basin and runoff
     std::filesystem::remove(outputPath);
 }
 
-TEST_CASE("Project document defaults Fast Basic renderer mode for older projects", "[serialization][project]") {
+TEST_CASE("Project document defaults to Beauty Adaptive renderer mode for older projects", "[serialization][project]") {
     const auto outputPath =
         std::filesystem::temp_directory_path() / "invisible_places_project_legacy_renderer_defaults.json";
     {
@@ -1760,12 +2715,12 @@ TEST_CASE("Project document defaults Fast Basic renderer mode for older projects
     REQUIRE(loadedDocument.has_value());
     CHECK(
         loadedDocument->pointCloudRendererMode ==
-        invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty);
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::BeautyAdaptive);
     CHECK(loadedDocument->eyeDomeLightingThickness == Catch::Approx(1.0F));
     std::filesystem::remove(outputPath);
 }
 
-TEST_CASE("Legacy Raytraced renderer mode loads as Beauty and is not re-saved", "[serialization][project]") {
+TEST_CASE("Legacy Raytraced renderer mode loads as Beauty Adaptive and is not re-saved", "[serialization][project]") {
     const auto inputPath =
         std::filesystem::temp_directory_path() / "invisible_places_project_legacy_raytraced_mode.json";
     {
@@ -1783,7 +2738,7 @@ TEST_CASE("Legacy Raytraced renderer mode loads as Beauty and is not re-saved", 
     REQUIRE(loadedDocument.has_value());
     CHECK(
         loadedDocument->pointCloudRendererMode ==
-        invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty);
+        invisible_places::renderer::pointcloud::PointCloudRendererMode::BeautyAdaptive);
 
     const auto outputPath =
         std::filesystem::temp_directory_path() / "invisible_places_project_legacy_raytraced_mode_saved.json";
@@ -1792,7 +2747,7 @@ TEST_CASE("Legacy Raytraced renderer mode loads as Beauty and is not re-saved", 
     const std::string savedJson{
         std::istreambuf_iterator<char>{savedProject},
         std::istreambuf_iterator<char>{}};
-    CHECK(savedJson.find("\"point_cloud_renderer_mode\": \"beauty\"") != std::string::npos);
+    CHECK(savedJson.find("\"point_cloud_renderer_mode\": \"beauty_adaptive\"") != std::string::npos);
     CHECK(savedJson.find("\"point_cloud_renderer_mode\": \"raytraced\"") == std::string::npos);
     std::filesystem::remove(inputPath);
     std::filesystem::remove(outputPath);
@@ -5793,12 +6748,29 @@ TEST_CASE("Still camera render sequence repeats one camera for duration", "[outp
     CHECK(frames.back().target[1] == Catch::Approx(2.0F));
 }
 
-TEST_CASE("Preview-density export point-size scale follows output viewport ratio", "[output][animation]") {
+TEST_CASE("Adaptive export point-size scale follows output viewport ratio", "[output][animation]") {
     CHECK(invisible_places::output::ComputePointSizePixelScale(1920, 1080, 1920, 1080) == Catch::Approx(1.0F));
     CHECK(invisible_places::output::ComputePointSizePixelScale(3840, 2160, 1920, 1080) == Catch::Approx(2.0F));
     CHECK(invisible_places::output::ComputePointSizePixelScale(960, 540, 1920, 1080) == Catch::Approx(0.5F));
     CHECK(invisible_places::output::ComputePointSizePixelScale(3840, 1080, 1920, 1080) == Catch::Approx(std::sqrt(2.0F)));
     CHECK(invisible_places::output::ComputePointSizePixelScale(1920, 1080, 0, 1080) == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Point-cloud export density modes are explicit", "[output][animation][lod]") {
+    using invisible_places::output::PointCloudExportDensityMode;
+    using invisible_places::output::PointCloudExportDensityModeName;
+    using invisible_places::output::PointCloudExportDensityModeUsesFullSource;
+
+    CHECK(PointCloudExportDensityModeName(PointCloudExportDensityMode::FullSource) == std::string{"Full Source"});
+    CHECK(
+        PointCloudExportDensityModeName(PointCloudExportDensityMode::AdaptiveHighQuality) ==
+        std::string{"Adaptive High Quality"});
+    CHECK(
+        PointCloudExportDensityModeName(PointCloudExportDensityMode::FastAdaptivePreview) ==
+        std::string{"Fast Adaptive Preview"});
+    CHECK(PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode::FullSource));
+    CHECK_FALSE(PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode::AdaptiveHighQuality));
+    CHECK_FALSE(PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode::MatchViewportAdaptive));
 }
 
 TEST_CASE("Quick MP4 output paths append visual names and collision suffixes", "[output][video]") {

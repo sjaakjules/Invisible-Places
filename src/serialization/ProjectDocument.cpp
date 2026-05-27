@@ -26,7 +26,6 @@ using invisible_places::renderer::pointcloud::PointCloudDepthContribution;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using invisible_places::renderer::pointcloud::PointCloudNprPreset;
-using invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using invisible_places::renderer::pointcloud::PointCloudRendererMode;
 using invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using invisible_places::renderer::pointcloud::PointCloudStyleState;
@@ -204,39 +203,21 @@ PointCloudColormapId ParsePointCloudColormap(const json& value) {
     return PointCloudColormapId::Viridis;
 }
 
-const char* PointCloudPreviewLodModeName(PointCloudPreviewLodMode mode) {
-    switch (mode) {
-        case PointCloudPreviewLodMode::FullResolution:
-            return "full_resolution";
-        case PointCloudPreviewLodMode::AutoCameraLod:
-            return "auto_camera_lod";
-        case PointCloudPreviewLodMode::ForceLod:
-            return "force_lod";
-    }
-
-    return "auto_camera_lod";
-}
-
-PointCloudPreviewLodMode ParsePointCloudPreviewLodMode(const json& value) {
-    const auto modeName = value.get<std::string>();
-    if (modeName == "full_resolution") {
-        return PointCloudPreviewLodMode::FullResolution;
-    }
-    if (modeName == "force_lod") {
-        return PointCloudPreviewLodMode::ForceLod;
-    }
-    return PointCloudPreviewLodMode::AutoCameraLod;
-}
-
 const char* PointCloudRendererModeName(PointCloudRendererMode mode) {
     switch (mode) {
-        case PointCloudRendererMode::Beauty:
-            return "beauty";
         case PointCloudRendererMode::FastBasic:
             return "fast_basic";
+        case PointCloudRendererMode::FastBasicSource:
+            return "fast_basic_source";
+        case PointCloudRendererMode::BeautyAdaptive:
+            return "beauty_adaptive";
+        case PointCloudRendererMode::BeautyFullSource:
+            return "beauty_full_source";
+        case PointCloudRendererMode::PaintedAdaptive:
+            return "painted_adaptive";
     }
 
-    return "beauty";
+    return "beauty_adaptive";
 }
 
 PointCloudRendererMode ParsePointCloudRendererMode(const json& value) {
@@ -244,7 +225,16 @@ PointCloudRendererMode ParsePointCloudRendererMode(const json& value) {
     if (modeName == "fast_basic") {
         return PointCloudRendererMode::FastBasic;
     }
-    return PointCloudRendererMode::Beauty;
+    if (modeName == "fast_basic_source") {
+        return PointCloudRendererMode::FastBasicSource;
+    }
+    if (modeName == "beauty_full_source" || modeName == "full_source") {
+        return PointCloudRendererMode::BeautyFullSource;
+    }
+    if (modeName == "painted_adaptive" || modeName == "painted") {
+        return PointCloudRendererMode::PaintedAdaptive;
+    }
+    return PointCloudRendererMode::BeautyAdaptive;
 }
 
 const char* PointCloudGeometryModeName(PointCloudGeometryMode mode) {
@@ -2535,8 +2525,6 @@ bool SaveProjectDocument(
         {"live_visual_effects", document.liveVisualEffects},
         {"side_panel_pinned", document.sidePanelPinned},
         {"auto_lower_gsplat_quality_while_navigating", document.autoLowerGsplatQualityWhileNavigating},
-        {"point_cloud_preview_lod_mode", PointCloudPreviewLodModeName(document.pointCloudPreviewLodMode)},
-        {"interactive_point_cap", document.interactivePointCap},
         {"point_cloud_renderer_mode", PointCloudRendererModeName(document.pointCloudRendererMode)},
         {"render_job", SerializeRenderJobSettings(document.renderJobSettings)},
         {"water_source_settings", SerializeWaterSourceSettings(document.waterSourceSettings)},
@@ -2629,11 +2617,6 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
     document.autoLowerGsplatQualityWhileNavigating =
         projectJson->value("auto_lower_gsplat_quality_while_navigating", true);
-    if (projectJson->contains("point_cloud_preview_lod_mode")) {
-        document.pointCloudPreviewLodMode =
-            ParsePointCloudPreviewLodMode(projectJson->at("point_cloud_preview_lod_mode"));
-    }
-    document.interactivePointCap = projectJson->value("interactive_point_cap", 10'000'000ULL);
     if (projectJson->contains("point_cloud_renderer_mode")) {
         document.pointCloudRendererMode =
             ParsePointCloudRendererMode(projectJson->at("point_cloud_renderer_mode"));

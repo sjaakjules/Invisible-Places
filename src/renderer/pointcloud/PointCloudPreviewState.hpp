@@ -75,15 +75,12 @@ enum class PointCloudNprPreset {
     Cartoon
 };
 
-enum class PointCloudPreviewLodMode {
-    FullResolution,
-    AutoCameraLod,
-    ForceLod
-};
-
 enum class PointCloudRendererMode {
-    Beauty,
-    FastBasic
+    FastBasic,
+    FastBasicSource,
+    BeautyAdaptive,
+    BeautyFullSource,
+    PaintedAdaptive
 };
 
 enum class PointCloudMaterialVariant {
@@ -179,11 +176,6 @@ struct PointBudgetState {
     [[nodiscard]] bool UsesSampledIndices() const { return !sampledIndices.empty(); }
 };
 
-struct PointCloudPreviewLodDecision {
-    std::uint64_t drawPointCount = 0;
-    bool usesPreviewLod = false;
-};
-
 struct PointCloudSessionState {
     std::filesystem::path sourcePath;
     std::string displayName;
@@ -212,6 +204,9 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
     float viewDepth,
     float projectionScaleY,
     float viewportHeight);
+[[nodiscard]] bool PointCloudRendererModeUsesFastBasic(PointCloudRendererMode mode);
+[[nodiscard]] bool PointCloudRendererModeUsesFullSource(PointCloudRendererMode mode);
+[[nodiscard]] bool PointCloudRendererModeUsesPaintedStyle(PointCloudRendererMode mode);
 [[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb);
@@ -221,16 +216,6 @@ PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t r
 PointBudgetState MakePointBudgetState(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::uint64_t requestedPoints);
-std::uint64_t ResolveInteractivePointBudget(
-    const PointBudgetState& budget,
-    bool interactionActive,
-    std::uint64_t interactivePointCap);
-PointCloudPreviewLodDecision ResolvePointCloudPreviewLod(
-    const PointBudgetState& budget,
-    PointCloudPreviewLodMode mode,
-    bool cameraNavigationActive,
-    bool cameraPlaybackActive,
-    std::uint64_t lodTargetPoints);
 std::vector<std::uint32_t> GenerateDeterministicSampleIndices(
     std::uint64_t totalPoints,
     std::uint64_t requestedPoints);

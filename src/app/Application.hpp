@@ -9,6 +9,7 @@ class Application {
     explicit Application(std::filesystem::path dataRoot = {});
 
     int Run() const;
+    int RunLodComparison(std::filesystem::path pointCloudPath = {}) const;
     static std::filesystem::path DefaultDataDirectory();
 
   private:
@@ -16,4 +17,3 @@ class Application {
 };
 
 }  // namespace invisible_places::app
-

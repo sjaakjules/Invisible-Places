@@ -124,6 +124,7 @@ add_library(
     src/renderer/core/VulkanViewportShell.cpp
     src/renderer/gsplat/HighQualityGaussianScene.cpp
     src/renderer/pointcloud/Colormap.cpp
+    src/renderer/pointcloud/PointCloudLodHierarchy.cpp
     src/renderer/pointcloud/PointCloudPreviewState.cpp
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,17 @@ struct PointCloudLoadResult {
     bool success = false;
 };
 
-PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath);
+struct PointCloudLoadProgress {
+    std::uint64_t pointsRead = 0;
+    std::uint64_t totalPoints = 0;
+    std::uint64_t bytesRead = 0;
+    std::uint64_t totalBytes = 0;
+};
+
+using PointCloudLoadProgressCallback = std::function<void(const PointCloudLoadProgress&)>;
+
+PointCloudLoadResult LoadPointCloud(
+    const std::filesystem::path& filePath,
+    const PointCloudLoadProgressCallback& progressCallback = {});
 
 }  // namespace invisible_places::io

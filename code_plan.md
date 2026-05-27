@@ -520,23 +520,23 @@ Allow the user to tag specific scalar fields for output to avoid exploding pass 
 - Asset discovery, binary PLY point-cloud loading, normal parsing, scalar-field statistics, gSplat asset loading, and same-stem transform pairing.
 - Multi-layer point-cloud and gSplat preview rendering in the same camera system.
 - Point-cloud style controls for screen sprites, world surfels, colour ramps, X-ray, emissive, weighted-transparent, density, falloff, point-size, opacity, emissive, X-ray, depth-fade, and colormap field bindings.
-- Deterministic point-budget sampling plus automatic preview LOD during camera movement/playback.
+- Deterministic point-budget sampling for explicit loading/debug caps, with adaptive point-cloud LOD replacing the old sampled preview path.
 - Slide-out/pinnable side panel split into Lidar, Visuals, gSplat, Camera, Animation, and Project tabs, with LiDAR lookdev isolated in Visuals.
 - Camera shot save/load, ordered camera paths, quaternion interpolation, 30 fps timing, and CPU-assisted surface pivot picking.
 - Animation paths derived from camera paths, editable camera/focus keys, playback/scrubbing, save/load, focus distance, aperture metadata, LiDAR associations, and per-animation Quick MP4 export settings/visual selections in `.ipanim.json` schema v3.
-- Project JSON round-trip for layer load/visibility state, point budgets, point-cloud styles, current camera, camera shots, camera path, project-registered animations, selected layer, render settings, last animation path, side panel state, preview LOD mode, and background/gSplat quality settings.
+- Project JSON round-trip for layer load/visibility state, point budgets, point-cloud styles, current camera, camera shots, camera path, project-registered animations, selected layer, render settings, last animation path, side panel state, and background/gSplat quality settings.
 - Point-cloud style preset save/load.
-- GPU animation export for batched saved-animation Quick MP4s per selected saved visual and preview-density EXR stacks, with EXR beauty/alpha/depth channels.
+- GPU animation export for batched saved-animation Quick MP4s per selected saved visual and adaptive-density EXR stacks, with EXR beauty/alpha/depth channels.
 - CPU/offline point tile renderer and multichannel EXR writer test coverage.
 
 ### Active gaps / next slices
 - Current focus is LiDAR visual polish; gSplat preview remains available, but deeper gSplat export/polish is deliberately less urgent for now.
 - Field-driven procedural motion is still a data stub; amplitude/frequency bindings exist only as `MotionProfile` data and are not wired into UI, shaders, project serialization, or export.
 - AOV coverage is currently beauty, alpha, and depth. Layer ID, world position, motion vectors, selected scalar-field passes, and mapped-style passes remain to be implemented.
-- Final-output validation still needs full-density/high-resolution EXR rendering at exhibition sizes, including clear rules for when preview-density export is acceptable.
+- Final-output validation still needs full-density/high-resolution EXR rendering at exhibition sizes, including clear rules for adaptive-density versus `FullSource` export.
 - gSplat participation in offline/animation exports is deferred until the LiDAR lookdev path is settled; current animation export focuses on point-cloud layers.
 - Command-line/headless rendering for saved projects and animation paths is not implemented yet.
-- Large-scene paging/chunk streaming beyond deterministic sampling and preview LOD remains open.
+- Large-scene paging/chunk streaming beyond deterministic sampling and adaptive LOD remains open.
 
 ## 14. Codex Agent Breakdown
 ### Agent A — Core app and Vulkan foundation

@@ -1,950 +1,346 @@
-# Load On Demand Implementation
+# Adaptive Point-Cloud LOD Integration Audit
 
+Date: May 27, 2026
 
-## Existing Situation:
-Right now the current preview LOD is basically:
+This document compares the ideal LOD system in
+`docs/point_cloud_adaptive_lod_fast_beauty.md` with the current project state.
+The ideal document remains the target design and should not be edited as part of
+this audit.
 
-1) loaded point cloud
-    - optional one-time spatial sample index list
-    - preview draw count target, currently 10M
-    - indexed draw if the sample buffer is ready
+## Current Build Status
 
-That is visible in:
+The current worktree builds after adding the LOD progress-callback overload:
 
-- PointCloudPreviewState(1).cpp
-    - GenerateSpatialSampleIndices(...)
-    - ResolvePointCloudPreviewLod(...)
-
-and then in:
-
-- Application.cpp
-    - kPointCloudPreviewLodTarget = 10,000,000
-    - EffectivePointDrawCount(...)
-    - PreparePreviewLodSampleCache(...)
-
-and finally:
-
-- VulkanViewportShell.cpp
-    - UpdatePointBudget(...)
-    - UpdateInteractivePointSampleBuffer(...)
-    - ResolvePointCloudDrawPlan(...)
-    - RecordPointCloudLayerDraw(...)
-
-That is a good first-generation system, but the next version should stop thinking in terms of only:
-
-__drawPointCount__
-
-and start thinking in terms of:
-
-__which representatives should be drawn for this camera, style, quality mode, and export mode?__
-
-## The big change 
-Add a new structure beside your existing point buffers:
-
-- PointCloudLodHierarchy
-- PointCloudLodNode[]
-- PointCloudLodRepresentative[]
-- PointCloudDrawItem[]
-
-Do not duplicate all 120M point attributes at every LOD. Keep your current raw source buffers:
-
-- positions
-- colors
-- normals
-- scalar fields
-
-Then let LOD representatives refer back to original source points, plus carry extra LOD metadata.
-
-Something like:
-
-```
-struct PointCloudLodNode {
-    glm::vec3 boundsMin;
-    glm::vec3 boundsMax;
-    uint32_t firstChild;
-    uint32_t childCount;
-    uint32_t firstRepresentative;
-    uint32_t representativeCount;
-    uint32_t representedPointCount;
-    float spacingMeters;
-    float density;
-    float normalVariance;
-    float colorVariance;
-    uint32_t flags;
-};
-```
-Then:
-```
-struct PointCloudLodRepresentative {
-    uint32_t sourcePointIndex;
-    float representedCount;
-    float spacingMeters;
-    float importance;
-    float blueNoiseRank;
-    float scalarMin;
-    float scalarMax;
-    float scalarMean;
-    uint32_t styleClass;
-    uint32_t nodeIndex;
-};
+```cpp
+BuildPointCloudLodHierarchy(cloud, buildConfig, progressCallback)
 ```
 
-At runtime, the camera traversal emits a compact draw list:
-```
-struct PointCloudDrawItemGpu {
-    uint32_t sourcePointIndex;
-    uint32_t nodeIndex;
-    float representedCount;
-    float spacingMeters;
-    float radiusScale;
-    float opacityCoverageScale;
-    float emissionCoverageScale;
-    float lodBlend;
-    float randomSeed;
-    uint32_t styleClass;
-};
-```
-This draw item buffer becomes the input to your advanced LOD renderers.
-
-The important part is sourcePointIndex. Your current shaders assume that the vertex index is also the point index when loading scalar fields. For example, pointcloud_preview.vert uses gl_VertexIndex as the point index, and scalar lookup is based on that point index. That works for your current indexed-draw path because the index buffer redirects gl_VertexIndex to the original source point. But for generated LOD representatives, you need the shader to distinguish:
-```
-draw item index
-source point index
-represented point count
-LOD node index
-```
-So I would create new LOD shaders rather than trying to overfit the existing pointcloud_preview.vert.
-
-### Keep the current path
-
-I would keep your current path as:
-```
-Fast Basic:
-    current raw/sequential/indexed draw path
-Beauty Raw:
-    current point/surfel path
-```
-Remove the current:
-```
-Preview Legacy LOD:
-    current 10M sampled index path
-```
-Then add the following to replace the old LOD that wasn't working with:
-```
-Beauty Adaptive LOD:
-    hierarchy traversal -> draw item buffer -> LOD-aware sprite/surfel shaders
-Painted / Sketch Renderer:
-    same hierarchy traversal -> artistic draw item buffer -> brush/surfel-stroke shaders
-```
-This lets you migrate gradually without destabilising the current renderer.
-
-### What changes in the renderer
-
-Your current draw plan is roughly:
-```
-drawPointCount
-worldSurfels
-sampledBudgetReady
-interactiveSampleReady
-```
-I would extend the concept to something more like:
-```
-enum class PointCloudDrawSource {
-    RawSequential,
-    RawSampledIndexBuffer,
-    InteractiveSampledIndexBuffer,
-    LodDrawItems,
-    PaintedDrawItems
-};
-struct PointCloudDrawPlan {
-    ActivePointCloudResources* resources = nullptr;
-    PointCloudDrawSource source = PointCloudDrawSource::RawSequential;
-    uint32_t drawPointCount = 0;
-    uint32_t drawItemCount = 0;
-    bool worldSurfels = false;
-    bool screenSprites = false;
-    bool painted = false;
-};
-```
-Then RecordPointCloudLayerDraw(...) can branch:
-```
-if (plan.source == PointCloudDrawSource::LodDrawItems) {
-    RecordPointCloudLodLayerDraw(...);
-} else if (plan.source == PointCloudDrawSource::PaintedDrawItems) {
-    RecordPaintedPointCloudLayerDraw(...);
-} else {
-    RecordCurrentPointCloudLayerDraw(...);
-}
-```
-This avoids forcing everything through vkCmdDrawIndexed against the raw point arrays.
-
-## New shader model
-
-For the LOD sprite shader, instead of:
-```
-const uint pointIndex = uint(gl_VertexIndex);
-vec4 worldPosition = vec4(inPosition, 1.0);
-```
-use:
-```
-const uint itemIndex = uint(gl_VertexIndex);
-PointCloudDrawItem item = drawItems.items[itemIndex];
-const uint pointIndex = item.sourcePointIndex;
-vec3 worldPosition = sourcePositions.positions[pointIndex].xyz;
-vec4 sourceColor = unpackColor(sourceColors.colors[pointIndex]);
-```
-Then scalar lookup stays source-correct:
-```
-float value = LoadScalarFieldValueForPoint(fieldSlot, pointIndex);
-```
-For surfels, you can keep your existing six-vertices-per-point model, but reinterpret it as six vertices per draw item:
-```
-const uint encodedVertexIndex = uint(gl_VertexIndex);
-const uint itemIndex = encodedVertexIndex / 6u;
-const uint cornerIndex = encodedVertexIndex - itemIndex * 6u;
-PointCloudDrawItem item = drawItems.items[itemIndex];
-const uint pointIndex = item.sourcePointIndex;
-```
-This is a clean extension of your existing pointcloud_surfel(1).vert, which currently does:
-```
-pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
-cornerIndex = encodedVertexIndex - pointIndex * kSurfelVerticesPerPoint;
-```
-You would simply replace “point index” with “draw item index,” then fetch the original source point from the draw item.
-
-## LOD selection should be style-aware
-
-Do not select LOD only from camera distance. Your real performance problem is:
-
-visible point count * projected splat area * overdraw
-
-For each visible LOD node, estimate:
-
-screenPxPerMeter =
-    abs(projection[1][1]) * viewportHeight / (2.0f * viewDepth);
-projectedSpacingPx =
-    node.spacingMeters * screenPxPerMeter;
-projectedNodeAreaPx =
-    ProjectBoundsToScreenArea(node.bounds);
-
-Then estimate cost differently for screen sprites and surfels.
-
-For screen sprites:
-
-radiusPx = userPointSizePx * 0.5f;
-fragmentCost = representativeCount * pi * radiusPx * radiusPx;
-
-For world surfels:
-
-diameterWorld = max(userSurfelDiameter, node.spacingMeters * fillFactor);
-radiusPx = 0.5f * diameterWorld * screenPxPerMeter;
-fragmentCost = representativeCount * pi * radiusPx * radiusPx;
-
-Then your LOD traversal decides whether to refine the node:
-
-if (projectedSpacingPx > targetSpacingPx &&
-    fragmentCostStillAcceptable &&
-    nodeHasChildren) {
-    visit children;
-} else {
-    emit representatives from this node;
-}
-
-For preview, targetSpacingPx might be around:
-
-1.0 to 2.0 px
-
-For high-quality export:
-
-0.25 to 0.75 px
-
-For full source:
-
-leaf/raw only
-
-But even in export, I would not think of LOD as automatically “lower quality.” A good adaptive LOD can be visually equivalent when raw points are far denser than pixels.
-
-## The visual compensation problem
-
-Your concern is correct: if one representative stands in for hundreds of points, opacity and emission can blow out or collapse unless you change the math.
-
-The user-facing style value should stay stable:
-
-Point Size
-Opacity
-Emission
-Falloff
-Color mode
-Scalar mappings
-
-Then the renderer applies an internal LOD compensation layer.
-
-For opacity, use optical depth rather than linear alpha.
-
-Given:
-
-alphaRaw = user opacity after scalar/style evaluation
-representedCount = number of original points represented
-rawArea = area of the original point/surfel footprint
-repArea = area of the LOD representative footprint
-
-compute:
-
-coverageMultiplier = representedCount * rawArea / max(repArea, epsilon);
-alphaLod = 1.0 - pow(1.0 - alphaRaw, coverageMultiplier);
-
-Equivalent exponential form:
-
-tauRaw = -log(max(1e-5, 1.0 - alphaRaw));
-tauLod = tauRaw * coverageMultiplier;
-alphaLod = 1.0 - exp(-tauLod);
-
-That means:
-
-fewer larger representatives do not automatically become too transparent
-fewer same-size representatives do not automatically lose density
-larger representatives do not automatically become over-opaque
-
-For emission, I would separate two modes:
-
-enum class LodEmissionMode {
-    PreserveAverageBrightness,
-    PreserveEnergy,
-    PreserveAccents
-};
-
-For normal glow/diffuse emission:
-
-emissionLod = emissionRaw * coverageMultiplier;
-
-but clamp or tone-map it:
-
-emissionLod = min(emissionLod, maxEmissionBoost);
-
-For rare emissive accents, do not average them into a grey cell. Keep separate accent representatives:
-
-normal representatives
-scalar-extreme representatives
-emissive/accent representatives
-edge/normal-variation representatives
-
-Otherwise your LOD will erase exactly the interesting artistic data.
-
-## Screen sprites and world surfels should not use the same LOD rules
-
-You are right that the new renderer will behave differently for screen sprites versus world surfels.
-
-### Screen sprites
-
-Screen sprites are style marks in image space. Their radius is not naturally connected to the real point spacing. So the LOD selector should be very conservative about automatically increasing their size.
-
-I would give screen sprites three internal policies:
-
-enum class ScreenSpriteLodFootprintMode {
-    LiteralUserSize,
-    DensityFill,
-    PerformanceClamped
-};
-
-### LiteralUserSize
-Uses exactly the user’s point size. This is best for full-quality export, but it can be extremely slow and can blow out if 120M points all overlap.
-
-### DensityFill
-Allows LOD representatives to grow enough to hide holes, but uses opacity compensation so the result does not become too bright or too opaque.
-
-### PerformanceClamped
-During navigation, clamps maximum point size and maximum accumulated density per screen region. This may not exactly match final quality, but it keeps the viewport alive.
-
-For screen sprites, I would use:
-
-lodRadiusPx =
-    clamp(
-        max(userRadiusPx, projectedSpacingPx * fillFactor),
-        minRadiusPx,
-        maxPreviewRadiusPx);
-
-Then:
-
-coverageMultiplier =
-    representedCount * userRadiusPx * userRadiusPx /
-    max(lodRadiusPx * lodRadiusPx, epsilon);
-
-During interactive preview, I would allow the renderer to say:
-
-I am not going to draw huge 20 px translucent sprites for every visible dense cell.
-I will draw representative marks and preserve approximate visual density.
-
-During export, the user can choose whether they want:
-
-literal full source
-adaptive high quality
-preview-matched density
-artistic/stochastic look
-
-### World surfels
-
-World surfels are much easier to make physically stable because the footprint can be tied to world spacing.
-
-For world surfels:
-
-lodDiameterWorld =
-    max(userSurfelDiameterWorld,
-        node.spacingMeters * fillFactor);
-
-Then project that into pixels.
-
-For opacity:
-
-rawDiameterWorld =
-    max(userSurfelDiameterWorld,
-        rawSpacingMeters * fillFactor);
-coverageMultiplier =
-    representedCount * rawDiameterWorld * rawDiameterWorld /
-    max(lodDiameterWorld * lodDiameterWorld, epsilon);
-
-This makes coarse surfels cover holes without becoming automatically over-bright.
-
-The world-surfel rule should usually be:
-
-draw enough surfels so projected spacing is around the target pixel spacing
-increase surfel diameter only enough to cover holes
-compensate opacity by represented density and area ratio
-
-This is why world surfels feel better when looking down the site: they can naturally become a coarser surface representation instead of a pile of huge screen-space circles.
-
-## New artistic renderer: use the same hierarchy
-
-The painted/sketch renderer should not use a separate LOD structure. It should use the same hierarchy, but select representatives differently.
-
-For each node, store a small palette:
-
-spatial coverage representatives
-color-contrast representatives
-scalar-extreme representatives
-emissive representatives
-edge/normal-variation representatives
-random flavour representatives
-
-Then at runtime:
-
-desiredMarks =
-    projectedNodeAreaPx * style.paintDensity;
-desiredMarks =
-    clamp(desiredMarks, minMarksPerNode, maxMarksPerNode);
-
-Pick the first desiredMarks representatives using a stable blue-noise/farthest-point order:
-
-if (rep.blueNoiseRank < desiredMarks) {
-    emit draw item;
-}
-
-The draw item becomes:
-
-struct PaintedPointDrawItemGpu {
-    uint32_t sourcePointIndex;
-    uint32_t nodeIndex;
-    float representedCount;
-    float spacingMeters;
-    float brushSizePxOrMeters;
-    float brushOpacity;
-    float brushAngle;
-    float brushSeed;
-    float lodBlend;
-    uint32_t brushClass;
-};
-
-Then you have two painted variants.
-
-### Painted screen-sprite renderer
-
-This is image-space painting.
-
-Each representative becomes a brush dab:
-
-screen-facing textured quad or point sprite
-brush radius in pixels
-brush angle from hash/scalar/normal
-opacity from style + LOD compensation
-color from source RGB/scalar style
-jitter from stable seed
-
-This mode is good for:
-
-sketch
-pastel
-pointillism
-watercolour dots
-animated stipple
-glowing accent particles
-
-But it must have a strict fragment budget, because large soft screen brushes can recreate the original overdraw problem.
-
-For this mode, use:
-
-maxBrushRadiusPreviewPx
-maxBrushRadiusExportPx
-maxMarksPerTile
-maxEstimatedFragments
-
-The artistic advantage is that you can intentionally reduce density and make it look like a style rather than a degraded point cloud.
-
-### Painted world-surfel renderer
-
-This is more surface-like.
-
-Each representative becomes a world-oriented brush stroke:
-
-quad oriented by normal/tangent
-size based on LOD spacing
-stroke length based on normal/scalar/roughness/flow
-opacity compensated by represented surface density
-
-This is better for:
-
-painted surface
-charcoal hatching
-ink wash
-architectural sketch
-scan-as-surface look
-
-For surfel painting:
-
-brushDiameterWorld = node.spacingMeters * paintFillFactor;
-brushLengthWorld = brushDiameterWorld * brushAspect;
-
-Near the camera, the hierarchy refines. Far away, a few larger strokes represent many raw points.
-
-This should perform much better than trying to draw millions of large translucent screen sprites.
-
-## Parent/child LOD blending
-
-Do not hard-switch between LOD levels.
-
-Each emitted draw item should have:
-
-lodBlend
-
-Then either multiply opacity:
-
-alpha *= lodBlend;
-emission *= lodBlend;
-
-or use stochastic dither:
-
-float n = StableBlueNoiseOrHash(pixelCoord, item.randomSeed, frameIndex);
-if (n > lodBlend) discard;
-
-For the painted renderer, the stochastic transition can become part of the look: the drawing “repaints” itself as the camera moves.
-
-But keep the randomness stable. Do not use pure per-frame random noise. Use:
-
-hash(nodeId, representativeId, cameraCellId, slowStyleFrame)
-
-where slowStyleFrame changes at maybe 6–12 Hz for live painting, not every GPU frame.
-
-## Export modes should become explicit
-
-Your current export system already has the idea of previewDensity. In Application.cpp, EffectiveAnimationExportPointDrawCount(...) uses preview density to decide whether to use the preview LOD target or full primitives. In VulkanViewportShell.cpp, raster EXR export uses:
-
-forceFullSource = !request.previewDensity && !fastBasicPointRenderer;
-
-That is a good starting point, but I would replace the boolean with an enum.
-
-Something like:
-
-enum class PointCloudExportDensityMode {
-    FullSource,
-    AdaptiveHighQuality,
-    MatchViewportPreview,
-    FastPreviewBudget,
-    ArtisticAsPreview,
-    ArtisticHighQuality
-};
-
-Then your render/export UI becomes clearer.
-
-### FullSource
-
-Draw raw source points.
-sampleWeight = 1.
-No LOD compensation.
-User point size/opacity/emission are literal.
-Slow but exact.
-
-This is the mode the user expects when they say:
-
-LOD off
-
-However, it is important to understand that this can look more blown out than preview if the preview was using LOD. That is not a bug. It means the preview was not showing all 120M overlapping translucent sprites.
-
-### AdaptiveHighQuality
-
-Use hierarchy.
-Very low screen-space error.
-Much higher point/fragment budget.
-Use visual compensation.
-Suitable for EXR/MP4.
-
-This is the mode I would recommend as the default for Beauty exports.
-
-It does not mean “low quality.” It means:
-
-do not spend minutes drawing 1 mm points that collapse below a pixel
-do preserve opacity, colour, emission, and scalar features
-
-### MatchViewportPreview
-
-Use the same LOD/visual compensation as the preview.
-Useful when the director approved the viewport look.
-Fast and predictable.
-
-### FastPreviewBudget
-
-Old preview-density behaviour.
-Useful for quick MP4s.
-
-### ArtisticAsPreview
-
-Use the painted/sketch renderer exactly as previewed.
-Same seed and same stroke cadence.
-
-### ArtisticHighQuality
-
-Same style, but more marks, lower LOD error, higher resolution brush accumulation, optional temporal accumulation.
-
-## Separate “artist settings” from “renderer compensation”
-
-This is the main design principle I would use.
-
-The user should set:
-
-Point Size
-Surfel Diameter
-Opacity
-Emission
-Falloff
-Colour/scalar style
-Stylisation
-
-Those are artistic settings.
-
-The renderer should internally derive:
-
-actual radius
-actual opacity
-actual emission
-actual representative count
-actual LOD blend
-actual brush/stroke count
-
-Those are implementation settings.
-
-So instead of changing the user’s point size when LOD changes, add a compensation layer:
-
-struct PointCloudLodCompensationGpu {
-    uint32_t enabled;
-    float representedCount;
-    float rawFootprintArea;
-    float lodFootprintArea;
-    float lodBlend;
-    float opacityCoverageScale;
-    float emissionCoverageScale;
-    float radiusScale;
-};
-
-In shader terms:
-
-float ApplyLodOpacity(float alphaRaw, float coverageScale, float lodBlend) {
-    alphaRaw = clamp(alphaRaw, 0.0, 0.999);
-    float alphaLod = 1.0 - pow(1.0 - alphaRaw, max(0.0, coverageScale));
-    return alphaLod * clamp(lodBlend, 0.0, 1.0);
-}
-
-And for emission:
-
-float ApplyLodEmission(float emissionRaw, float coverageScale, float lodBlend) {
-    float e = emissionRaw * coverageScale * clamp(lodBlend, 0.0, 1.0);
-    return min(e, styleData.maxLodEmissionBoost);
-}
-
-You may eventually want the emission clamp exposed as:
-
-Preserve glow energy
-Preserve accent brightness
-Clamp for preview
-
-because different styles want different behaviour.
-
-## How this maps to your current style system
-
-Your current PointCloudStyleGpu already has useful places for this kind of extension:
-
-pointMeta
-renderControl
-renderParams0-3
-stylisationControl
-stylisationParams0-2
-
-But I would not overpack everything into the existing fields forever. I would add a second uniform/storage block for LOD:
-
-layout(set = 0, binding = X, std140) uniform PointCloudLodStyleData {
-    uvec4 lodControl;
-    vec4 lodParams0;
-    vec4 lodParams1;
-    vec4 paintParams0;
-    vec4 paintParams1;
-} lodStyle;
-
-Example:
-
-lodControl.x = lod enabled
-lodControl.y = compensation mode
-lodControl.z = footprint mode
-lodControl.w = artistic mode
-lodParams0.x = targetSpacingPx
-lodParams0.y = maxRadiusPx
-lodParams0.z = maxEmissionBoost
-lodParams0.w = fillFactor
-paintParams0.x = paintDensity
-paintParams0.y = brushAspect
-paintParams0.z = strokeJitter
-paintParams0.w = temporalBlend
-
-This keeps your current Beauty material logic intact.
-
-## Idle refinement for still camera preview
-
-Your concern about users wanting to stop the camera and see the high-quality result is exactly right.
-
-I would add this behaviour:
-
-While navigating:
-    strict point budget
-    strict fragment budget
-    coarser LOD
-    preview compensation
-After camera idle for 300 ms:
-    progressively refine hierarchy
-    reduce target spacing
-    increase fragment budget
-    update draw item buffer over several frames
-When user requests final preview:
-    use AdaptiveHighQuality or FullSource depending on setting
-
-You already have:
-
-kPerformanceInteractionHold = 300 ms
-
-so the app already has the conceptual hook for this.
-
-In the viewport overlay, show the state clearly:
-
-Preview: Adaptive LOD, 8.2M reps, representing 120M points
-Idle refine: 34M reps, target 0.5 px
-Export: Adaptive HQ, target 0.25 px
-
-This avoids the user thinking the renderer is secretly lowering quality.
-
-## Important current pitfall: raycast export
-
-Your raster EXR path has a previewDensity/forceFullSource concept. But the raycast path currently calls:
-
-ResolvePointCloudDrawPlan(layer, true, &plan)
-
-which forces full source. Then PrepareRaycastLayerResources(...) loops over:
-
-resources->cpuPositions[pointIndex]
-
-for pointIndex < drawPointCount.
-
-That means if you want LOD-aware raycast export later, the raycast BVH builder must accept the same draw item list, not just the first N CPU positions.
-
-Eventually it should build from:
-
-drawItems[i].sourcePointIndex
-drawItems[i].representedCount
-drawItems[i].spacingMeters
-computed radius
-
-not from sequential source points.
-
-## Memory strategy
-
-For 120M points, be careful not to create full duplicate LOD attribute arrays.
-
-I would use:
-
-raw source buffers:
-    positions, colors, normals, scalar fields
-LOD hierarchy:
-    compact nodes
-representative palette:
-    sourcePointIndex + weight + spacing + style metadata
-per-frame draw items:
-    compact visible reps only
-
-So the hierarchy points back to raw data wherever possible.
-
-Only create aggregate attribute buffers when you truly need them, for example:
-
-mean scalar
-min/max scalar
-mean normal
-normal cone
-emissive maximum
-dominant class
-
-Even then, store those per representative or per node, not per original point.
-
-## A practical staged implementation
-
-I would implement this in phases.
-
-### Phase 1 — View-dependent LOD draw items, no artistic renderer yet
-
-Add:
-
-PointCloudLodHierarchy
-PointCloudDrawItemGpu
-LodDrawItemBuffer
-
-Build hierarchy once from offlinePointCloud.
-
-Use CPU traversal first. For one 120M static cloud, CPU traversal over nodes should be manageable if the tree is compact. Emit draw items each frame, upload them to a host-visible or staged GPU buffer.
-
-Add two new shaders:
-
-pointcloud_lod_preview.vert
-pointcloud_surfel_lod_preview.vert
-
-Leave your current fast/basic/raw paths alone.
-
-### Phase 2 — LOD compensation
-
-Add:
-
-representedCount
-spacingMeters
-radiusScale
-opacityCoverageScale
-emissionCoverageScale
-lodBlend
-
-Modify the LOD shaders only.
-
-Do not change the user-facing style yet. Just make adaptive LOD look close to full source.
-
-### Phase 3 — Export density modes
-
-Replace previewDensity with:
-
-PointCloudExportDensityMode
-
-Keep old behaviour as one enum value.
-
-Recommended defaults:
-
-Fast MP4: MatchViewportPreview or FastPreviewBudget
-Beauty EXR: AdaptiveHighQuality
-Debug/exact: FullSource
-Painted renderer: ArtisticHighQuality
-
-### Phase 4 — Painted/sketch renderer
-
-Use the same hierarchy and draw item infrastructure, but a different selection policy and different shaders.
-
-Add:
-
-PointCloudRendererMode::PaintedSketch
-
-or possibly:
-
-PointCloudBeautyVariant::Physical
-PointCloudBeautyVariant::Painted
-PointCloudBeautyVariant::Sketch
-
-For screen-painted mode:
-
-LOD draw item -> screen brush sprite
-
-For world-painted mode:
-
-LOD draw item -> world brush surfel/stroke
-
-### Phase 5 — GPU selection / tile budgets
-
-Once the CPU version works visually, move traversal/culling/budgeting to compute if needed.
-
-Especially useful later:
-
-frustum culling
-node screen-error calculation
-draw item compaction
-indirect draw generation
-tile overdraw budget
-
-But I would not start there. First prove the visual model.
-
-
-## Suggested UI wording
-
-This is not a LOD on/off feature. 
-Instead the user facing model should have the following:
-1) Viewport Quality:
-    - Fast Basic
-    - Beauty Adaptive
-    - Beauty Full Source
-    - Painted Adaptive
-
-2) Viewport LOD:
-    - Auto while moving
-    - Always adaptive
-    - Full source when idle
-    - Full source always
-
-3) Export Density:
-    - Full Source
-    - Adaptive HQ
-    - Match Viewport
-    - Fast Preview
-    - Artistic HQ
-
-4) Visual Matching:
-    - Preserve density/opacity across LOD
-    - Preserve literal per-point opacity
-    - Preserve emissive accents
-
-
-For advanced settings:
-```
-Target projected spacing: 0.25–2.0 px
-Max preview sprite radius
-Max export sprite radius
-Max estimated fragments
-Max marks per tile
-LOD opacity compensation
-LOD emission compensation
+Fresh runtime/performance reports should now include the HUD/diagnostics values
+described below so sparse or stale adaptive output can be diagnosed from the UI.
+
+## Implemented
+
+The project has a real first-pass adaptive LOD path. It is not just a raw
+sample-count cap anymore.
+
+- `PointCloudLodHierarchy`, `PointCloudLodNode`, `PointCloudLodRepresentative`,
+  and `PointCloudDrawItemGpu` exist.
+- LOD representatives preserve `sourcePointIndex`, so shaders can fetch source
+  positions, colors, normals, scalar fields, water fields, and material bindings
+  from the original point data.
+- A binary hierarchy cache exists under `Saved/lod/` using filenames like
+  `<source-stem>-<source-path-hash>-PointCloudLodCache-v3.bin`.
+- Cache validation checks version, source path hash, source size, mtime, point
+  count, bounds, and build config.
+- Hierarchy cache writes go through a temporary file and publish by rename.
+- Point-cloud activation attempts to load the hierarchy cache, then starts a
+  background hierarchy build when the cache is missing or stale.
+- Runtime adaptive traversal is scheduled on a background worker for viewport
+  use and cached per layer by a compact traversal key.
+- The viewport can reuse a previous adaptive draw-item set while async traversal
+  is pending.
+- Per-frame draw-item buffers and an EXR draw-item buffer exist. They grow when
+  capacity is insufficient and rewrite descriptors only on reallocation.
+- Current point, surfel, constant-simple, and Fast Basic vertex shaders can read
+  draw items through binding 7 and use `drawItem.sourcePointIndex`.
+- The renderer modes are explicit: `Fast Basic`, `Beauty Adaptive`, `Beauty Full
+  Source`, and `Painted Adaptive`.
+- Export density modes are explicit: `Full Source`, `Adaptive High Quality`,
+  `Match Viewport Adaptive`, `Fast Adaptive Preview`, `Artistic As Preview`, and
+  `Artistic High Quality`.
+- The diagnostics overlay reports scene update time/FPS, frame time/FPS,
+  adaptive representative count, represented source count, traversal time,
+  draw-item upload time, draw-item reallocations, cache status, runtime status,
+  and adaptive requested/displayed density.
+- PLY load progress reports points read, payload bytes read, elapsed time, and
+  ETA when enough samples exist.
+- LOD hierarchy/cache rebuild progress reports elapsed time, approximate ETA,
+  source references processed, nodes built, representatives built, and current
+  build depth.
+- The status HUD and diagnostics expose adaptive requested/displayed density,
+  movement quality tier, cache filename/size, hierarchy source/node/rep counts,
+  runtime cache hit/miss, async state, and whether the displayed adaptive buffer
+  is exact or coarse fallback.
+- `--lod-compare` exists and writes full-source/adaptive EXRs plus
+  `lod_compare_metrics.json`.
+
+## Partially Implemented
+
+These pieces exist, but they are not yet the ideal system described in
+`point_cloud_adaptive_lod_fast_beauty.md`.
+
+- The persistent cache stores only hierarchy nodes and representatives. It does
+  not store a `.ipcloud` manifest, raw chunks, attribute schema, node pages,
+  scalar stats, resumable build status, or source-data chunks.
+- Loading still parses and uploads the full PLY source before adaptive rendering
+  can be useful. There is no progressive first-load path that displays coarse
+  representatives before full parse/upload completes.
+- Hierarchy build is asynchronous and reports progress, but the build itself is
+  still monolithic and not cancellable until `BuildPointCloudLodHierarchy(...)`
+  returns.
+- Traversal is CPU-only. There is no GPU compute culling, compaction, indirect
+  draw generation, or GPU-driven visible-chunk selection.
+- A fragment budget is computed, but current adaptive emission does not appear
+  to enforce it. `TraversePointCloudLodHierarchy(...)` builds a budget with
+  `maxEstimatedFragments`, then emits through a separate `emitBudget` whose
+  `maxEstimatedFragments` is `0.0F`, which disables the footprint limit.
+- Quality demotion/promotion uses scene update FPS and frame/present FPS, not
+  measured GPU point-pass timings. It can react to UI/present behavior rather
+  than the actual expensive point/surfel passes.
+- Manual sampled point budgets still exist and are uploaded as sampled index
+  buffers. The adaptive path treats them mostly as a debug/loading cap, but the
+  UI still exposes a generic `Budget` control that can be confused with LOD.
+- LOD compensation exists as footprint, opacity, and emission fields, but it is
+  simplified. It lacks full optical-depth policy controls, `lodBlend`, stable
+  stochastic transitions, representative classes, and feature-preserving
+  palettes.
+- Pixel screen sprites, world-mm screen sprites, world surfels, and
+  camera-facing world sprites share too much selection logic. Their render costs
+  and failure modes are different.
+- The LOD comparison metrics are useful but minimal. They report coverage and
+  mean luminance ratios, not image error maps, timing breakdowns, peak memory,
+  upload bandwidth, or per-render-pass GPU time.
+
+## Not Implemented
+
+These are still target-system items from the ideal plan.
+
+- `.ipcloud` cache bundle with manifest, source fingerprint, attribute schema,
+  hierarchy pages, raw chunks, LOD representatives, scalar stats, build status,
+  and build log.
+- Raw chunk streaming and visible-chunk residency.
+- Progressive cache build that renders coarse upper hierarchy data while lower
+  levels are still building.
+- Memory-mapped source chunks and CPU/GPU LRU caches.
+- Device-local static point/chunk buffers with staging uploads as the normal
+  large-cloud path.
+- Representative classes for spatial coverage, color contrast, normal/edge
+  features, scalar min/max/thresholds, emissive/accent points, and blue-noise
+  fill.
+- Continuous LOD rank, parent/child crossfade, or stable stochastic transition.
+- Dedicated LOD style data block with explicit compensation/footprint policy.
+- Vulkan timestamp queries for point pass, depth prepass, accumulation,
+  EDL/composite, upload, and render-state submission.
+- EWMA performance governor driven by measured GPU point-pass time.
+- Tile overdraw estimates and per-tile fragment/blended-fragment budgets.
+- Conservative occlusion culling, depth proxy, or Hi-Z pyramid.
+- GPU compute traversal/culling/compaction and indirect draw submission.
+- Runtime metrics for cache hit load time, time to first coarse frame, peak
+  resident memory, and tile budget pressure.
+
+## Likely Lag Sources
+
+Investigate these before adding more ideal-plan features.
+
+- First-run large-cloud loading can still spend a long time in PLY parse, GPU
+  upload, or monolithic hierarchy build. The UI now reports which phase is
+  active and provides elapsed time plus ETA when a phase has measurable progress.
+- Beauty Adaptive may fall back to a raw draw count when hierarchy or draw items
+  are unavailable. If `pointBudget.activePoints` equals the full source count,
+  the app can submit the full cloud instead of a cheap adaptive placeholder.
+- The computed fragment budget is likely not active during representative
+  emission, so large translucent sprites/surfels can still overload fragment and
+  blending work.
+- Async traversal does not replace stale in-flight traversal when the camera or
+  style changes. A new request can become `async traversal busy`, causing reuse
+  of old draw items or coarse fallback for longer than expected.
+- The quality controller reacts to scene/present FPS instead of GPU pass time,
+  so it may demote too late, promote too early, or miss point-pass bottlenecks
+  hidden by cached presentation.
+- Current projected spacing is derived from projected node area divided by
+  represented source count. It does not use stored node spacing, density,
+  variance, projected radius, or tile pressure deeply enough.
+- All source positions are still uploaded and retained in several forms:
+  `LoadedPointCloud`, `cpuPositions`, vertex position buffer, storage position
+  buffer, color buffer, normal buffer, scalar buffer, and hierarchy data. Large
+  clouds can therefore be memory- and bandwidth-heavy before LOD helps.
+- Static point buffers are host-visible in the current path. This is simple but
+  not the ideal MoltenVK/Apple-GPU path for very large mostly-static data.
+- The manual sampled budget path calls `WaitIdle()` during point-budget updates.
+  That is acceptable for explicit debug/loading cap changes, but it must not be
+  part of normal adaptive updates.
+- There is no tile overdraw budget yet. Close, grazing, long-site views with
+  large translucent marks can still produce the exact overdraw problem the ideal
+  plan is designed to avoid.
+
+## Implementation Order
+
+### 1. Keep Build And Baseline Metrics Healthy
+
+Keep the LOD progress overload, UI diagnostics, and focused tests building
+before doing any performance work.
+
+Minimum checks:
+
+```text
+cmake --build --preset build-macos-debug
+./build/macos-debug/invisible_places_tests "[pointcloud][lod]"
+ctest --test-dir build/macos-debug --output-on-failure
 ```
 
-## Take away message
-One concern with implementing a LOD is that they can make export quality go down or create discrepancy between preview and render. This generally happens if it is treated as a blunt point-count reduction.
+Capture a baseline on a representative large cloud:
 
-So this will be be built so that the LOD is:
-- view-dependent hierarchy
-- style-aware representatives
-- opacity/emission compensation
-- feature-preserving palettes
-- different preview/export quality thresholds
+- scene update ms/FPS
+- frame ms/FPS
+- adaptive traversal ms
+- draw-item upload ms
+- draw-item buffer reallocations
+- adaptive representative count
+- represented source count
+- point submitted count
+- persistent cache status
+- runtime cache status
+- cache rebuild phase/progress/ETA
+- requested/displayed density
+- exact versus fallback display state
+- peak resident memory
 
-then it becomes more like a rendering acceleration structure, not merely a quality reduction.
+Done when the project builds, tests pass, and the baseline can be repeated from
+a clean app launch or after pressing `Rebuild LOD Cache Now`.
 
-For your renderer make three distinct concepts:
+### 2. Remove Immediate Lag Sources
 
-1) Preview performance LOD:
-    - allowed to deviate slightly to keep interaction smooth
-2) Adaptive beauty LOD:
-    - intended to visually match full source
-3) Painted Adaptive - Artistic stochastic LOD:
-    - intentionally uses representative marks as the style
+Prevent the current adaptive path from accidentally doing expensive raw work.
 
-That distinction solves the UX problem. The user can work interactively with LOD, stop the camera to refine, then export either the exact full source or the adaptive/high-quality equivalent. For the painted renderer, LOD is not hidden optimisation — it is the renderer’s actual artistic language.
+- When Beauty Adaptive lacks a ready hierarchy/draw-item set, use a bounded
+  coarse fallback or show an explicit `waiting on adaptive LOD` state. Do not
+  silently submit all source points.
+- Pass the estimated fragment budget through representative emission and stop
+  drawing low-priority representatives when the budget is reached.
+- Cancel, replace, or supersede stale async traversal when a newer camera/style
+  key arrives.
+- Confirm normal adaptive draw-item updates do not call `WaitIdle()` or
+  `vkDeviceWaitIdle()`.
+
+Metrics to watch:
+
+- point submitted count should not jump to full source in Beauty Adaptive
+- estimated fragments should fall when quality demotes
+- async pending time should not grow unbounded during camera movement
+- draw-item GPU idle/wait should remain zero for normal adaptive updates
+
+### 3. Improve CPU LOD Quality Selection
+
+Make the CPU selector match the visual-cost model before moving selection to
+GPU compute.
+
+- Add node spacing, density, color variance, scalar hints, normal variance, and
+  emissive/accent hints.
+- Use true projected spacing and projected mark radius for refinement decisions.
+- Separate cost rules for pixel screen sprites, world-mm screen sprites, world
+  surfels, and camera-facing world sprites.
+- Add representative classes for spatial coverage, scalar extremes,
+  emissive/accent points, color contrast, and normal/edge variation.
+- Add stable rank or blend fields to reduce popping during parent/child changes.
+
+Metrics to watch:
+
+- representative count versus represented source count
+- coverage ratio and luminance ratio from `--lod-compare`
+- visible popping while moving slowly
+- scalar/water/normal/source-color correctness in adaptive mode
+
+### 4. Add Measured Governor
+
+Replace FPS guessing with measured pass timing.
+
+- Add Vulkan timestamp queries for point pass, depth prepass, accumulation,
+  EDL/composite, and upload/submission where practical.
+- Track EWMA timings per renderer mode and geometry mode.
+- Drive adaptive density and fragment budgets from point-pass GPU ms, not
+  present FPS alone.
+- Surface an explicit `performance-limited` status when interactive quality
+  floors cannot be maintained.
+
+Metrics to watch:
+
+- GPU point-pass ms
+- GPU composite/EDL ms
+- CPU scene update ms
+- UI/present FPS
+- selected density mode
+- budget scale factor
+
+### 5. Move Toward Ideal Cache And Streaming
+
+Only start the `.ipcloud` cache after the current hierarchy path is stable and
+measured.
+
+- Add a manifest/chunk cache bundle beside or replacing the current single
+  hierarchy cache.
+- Store directly streamable raw chunks and upper LOD data.
+- Render upper hierarchy data first, then stream visible chunks and deeper LOD.
+- Track cache-hit load time, time to first coarse frame, upload bytes per frame,
+  and peak resident memory.
+
+Metrics to watch:
+
+- first launch build time
+- second launch time to first coarse frame
+- cache hit/miss/stale reason
+- visible chunk hit rate
+- upload bytes per frame
+- peak memory before and after chunking
+
+### 6. Advanced Performance Work
+
+Move to GPU-driven features after the CPU path is correct and profiled.
+
+- Add tile overdraw estimates and per-tile fragment budgets.
+- Add a conservative depth proxy or Hi-Z pyramid for occlusion culling.
+- Move culling, projected-error evaluation, compaction, and indirect draw command
+  generation to compute where it beats the CPU path.
+- Keep a CPU fallback for portability and debugging.
+
+Metrics to watch:
+
+- tiles over budget
+- culled hidden nodes
+- compute selection ms
+- indirect draw count
+- point-pass ms before/after tile and occlusion work
+
+## Checks And Metrics
+
+Use these commands and outputs when validating LOD work:
+
+```text
+cmake --build --preset build-macos-debug
+./build/macos-debug/invisible_places_tests "[pointcloud][lod]"
+ctest --test-dir build/macos-debug --output-on-failure
+./build/macos-debug/invisible_places --lod-compare <cloud>
+```
+
+Inspect:
+
+```text
+Saved/diagnostics/lod_compare/lod_compare_metrics.json
+```
+
+Initial quality targets:
+
+- Adaptive HQ coverage ratio should be near full source for the active style.
+- Luminance ratio should stay within an acceptable band for the active style.
+- Adaptive renders should not be empty or stuck on coarse fallback.
+- Scalar, water-effect, normal, source-color, depth, and AOV lookups must remain
+  source-correct through `drawItem.sourcePointIndex`.
+
+Initial performance targets:
+
+- Moving Beauty Adaptive remains responsive on the target large cloud.
+- CPU traversal does not block scene update during viewport interaction.
+- Draw-item upload stays low and grow-only after initial capacity growth.
+- Normal adaptive updates show zero draw-item GPU idle/wait.
+- Representative count and estimated fragment count correlate with measured
+  point-pass frame time.
+
+## Defaults And Assumptions
+
+- Treat the current worktree as the implementation source of truth, including
+  uncommitted LOD files.
+- Keep `docs/point_cloud_adaptive_lod_fast_beauty.md` as the ideal target plan.
+- Keep manual point budgets only as explicit debug/loading caps.
+- Keep `Beauty Full Source` / `Full Source` as exact/debug modes, not adaptive
+  fallbacks.
+- Prioritize measured lag sources before ideal architecture polish.
+- Do not present sampled-index controls as adaptive LOD.

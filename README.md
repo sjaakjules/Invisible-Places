@@ -14,12 +14,12 @@ The central idea is that data already present in the point cloud can become visu
 
 ## Why it is useful
 
-- **Fast render iteration:** the app has deterministic point budgets, automatic camera-motion preview LOD, and a Fast Basic point-render path for keeping navigation, playback, and look-development responsive.
+- **Fast render iteration:** the app has deterministic point budgets, explicit adaptive/full-source export density modes, and a Fast Basic point-render path for keeping navigation, playback, and look-development responsive.
 - **Beauty render control:** the Beauty path supports richer point-cloud styling, screen sprites, world surfels, falloff profiles, depth-aware rendering, X-ray looks, emissive accents, eye-dome lighting, stylisation, and Gaussian splat preview.
 - **Smooth camera paths:** camera shots store orientation as quaternions, use shortest-path quaternion interpolation for rotations, and evaluate saved shot paths on a 30 fps timebase. Editable animation paths spline camera and focus positions for controlled fly-throughs.
 - **Data-driven art direction:** render parameters can be constant values or field-mapped controls with input/output ranges, layer statistics, clamp, invert, and gamma shaping.
 - **Hybrid capture scenes:** point-cloud layers and Gaussian splat layers share the same camera, scene, and project workflow, so survey geometry and photogrammetric/3DGS material can be composed together.
-- **Postproduction-friendly output:** preview-density EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
+- **Postproduction-friendly output:** adaptive-density or full-source EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
 - **Portable project state:** scenes, camera shots, animation paths, style presets, render settings, and panel state are serialized to JSON so a session can be reopened and rendered consistently.
 
 ## Current capabilities
@@ -45,8 +45,7 @@ The central idea is that data already present in the point cloud can become visu
 - Includes colormaps such as Viridis, Plasma, Inferno, Magma, Cividis, Turbo, topographic, land-surface, fire, ice, and high-contrast ramps.
 - Includes point-cloud stylisation controls for watercolor, living wash, cartoon ink, brush dabs, pencil hatch, grainy pigment, and related painterly looks.
 - Supports eye-dome lighting for depth readability outside the Fast Basic path.
-- Uses deterministic point sampling and spatial sampling so large clouds can be reduced predictably.
-- Has automatic preview LOD during camera navigation or animation playback.
+- Uses deterministic point sampling and spatial sampling for explicit point-budget caps while adaptive LOD is being integrated.
 
 ### Camera and animation
 
@@ -77,7 +76,7 @@ The central idea is that data already present in the point cloud can become visu
 
 - Saves and reloads project JSON containing scene state, point-cloud styles, camera shots, animation paths, saved visuals, and export selections.
 - Exports selected saved animations and saved visuals as batched Quick MP4 files.
-- Exports preview-density EXR animation stacks.
+- Exports adaptive-density or full-source EXR animation stacks.
 - Writes EXR `beauty.RGB`, `alpha.A`, and `depth.Z` channels.
 - Includes tiled offline point-rendering support for LiDAR-first output experiments.
 

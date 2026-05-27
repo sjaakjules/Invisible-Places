@@ -34,8 +34,20 @@ struct RenderJobSettings {
 
 enum class AnimationExportMode {
     FastPreviewMp4,
-    HqPreviewDensityExr,
+    HqAdaptiveExr,
 };
+
+enum class PointCloudExportDensityMode {
+    FullSource,
+    AdaptiveHighQuality,
+    MatchViewportAdaptive,
+    FastAdaptivePreview,
+    ArtisticAsPreview,
+    ArtisticHighQuality,
+};
+
+const char* PointCloudExportDensityModeName(PointCloudExportDensityMode mode);
+bool PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode mode);
 
 std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(
     const std::vector<invisible_places::camera::CameraShot>& shots,

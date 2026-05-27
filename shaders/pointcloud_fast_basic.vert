@@ -19,9 +19,26 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthOfFieldParameters;
 } uniforms;
 
+layout(set = 0, binding = 4, std430) readonly buffer PointPositions {
+    vec4 positions[];
+} pointPositions;
+
+layout(set = 0, binding = 5, std430) readonly buffer PointColors {
+    uint colors[];
+} pointColors;
+
 layout(set = 0, binding = 6, std430) readonly buffer PointNormals {
     vec4 normals[];
 } pointNormals;
+
+struct PointDrawItemGpu {
+    uvec4 indices;
+    vec4 params;
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer PointDrawItems {
+    PointDrawItemGpu drawItems[];
+} pointDrawItems;
 
 struct RenderParameterBindingGpu {
     vec4 constantValue;
@@ -53,6 +70,28 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams2;
 } styleData;
 
+const uint kRenderControlUseDrawItems = 2u;
+
+bool UseDrawItems() {
+    return (styleData.renderControl.w & kRenderControlUseDrawItems) != 0u;
+}
+
+uint SourcePointIndex(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].indices.x : drawIndex;
+}
+
+float DrawItemFootprintDiameterPixels(uint drawIndex) {
+    return UseDrawItems() ? sqrt(max(1.0, pointDrawItems.drawItems[drawIndex].params.w)) : 1.0;
+}
+
+vec4 UnpackRgba8(uint packedColor) {
+    return vec4(
+        float(packedColor & 0xFFu) / 255.0,
+        float((packedColor >> 8u) & 0xFFu) / 255.0,
+        float((packedColor >> 16u) & 0xFFu) / 255.0,
+        float((packedColor >> 24u) & 0xFFu) / 255.0);
+}
+
 float WorldDiameterToScreenPointSizePixels(float diameterMeters, float viewDepth) {
     return max(0.0, diameterMeters) *
            abs(uniforms.projection[1][1]) *
@@ -61,8 +100,11 @@ float WorldDiameterToScreenPointSizePixels(float diameterMeters, float viewDepth
 }
 
 void main() {
-    const uint pointIndex = uint(gl_VertexIndex);
-    vec4 worldPosition = vec4(inPosition, 1.0);
+    const uint drawIndex = uint(gl_VertexIndex);
+    const uint pointIndex = SourcePointIndex(drawIndex);
+    const vec3 sourcePosition = UseDrawItems() ? pointPositions.positions[pointIndex].xyz : inPosition;
+    const vec4 sourceColor = UseDrawItems() ? UnpackRgba8(pointColors.colors[pointIndex]) : inColor;
+    vec4 worldPosition = vec4(sourcePosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     gl_Position = uniforms.viewProjection * worldPosition;
     const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
@@ -71,13 +113,13 @@ void main() {
             ? WorldDiameterToScreenPointSizePixels(styleData.surfelDiameterBinding.constantValue.x, -viewPosition.z)
             : styleData.pointSizeBinding.constantValue.x;
     gl_PointSize = clamp(
-        basePointSize,
+        max(basePointSize, DrawItemFootprintDiameterPixels(drawIndex)),
         max(1.0, styleData.renderParams3.y),
         max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
-    outSourceColor = inColor;
+    outSourceColor = sourceColor;
     outViewDepth = -viewPosition.z;
     outPointIndex = pointIndex;
-    outWorldPosition = inPosition;
+    outWorldPosition = sourcePosition;
     outPointNormal =
         styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
             ? pointNormals.normals[pointIndex].xyz

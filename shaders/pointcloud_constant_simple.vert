@@ -17,6 +17,14 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthOfFieldParameters;
 } uniforms;
 
+layout(set = 0, binding = 4, std430) readonly buffer PointPositions {
+    vec4 positions[];
+} pointPositions;
+
+layout(set = 0, binding = 5, std430) readonly buffer PointColors {
+    uint colors[];
+} pointColors;
+
 struct RenderParameterBindingGpu {
     vec4 constantValue;
     vec4 range;
@@ -51,6 +59,37 @@ layout(set = 0, binding = 6, std430) readonly buffer PointNormals {
     vec4 normals[];
 } pointNormals;
 
+struct PointDrawItemGpu {
+    uvec4 indices;
+    vec4 params;
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer PointDrawItems {
+    PointDrawItemGpu drawItems[];
+} pointDrawItems;
+
+const uint kRenderControlUseDrawItems = 2u;
+
+bool UseDrawItems() {
+    return (styleData.renderControl.w & kRenderControlUseDrawItems) != 0u;
+}
+
+uint SourcePointIndex(uint drawIndex) {
+    return UseDrawItems() ? pointDrawItems.drawItems[drawIndex].indices.x : drawIndex;
+}
+
+float DrawItemFootprintDiameterPixels(uint drawIndex) {
+    return UseDrawItems() ? sqrt(max(1.0, pointDrawItems.drawItems[drawIndex].params.w)) : 1.0;
+}
+
+vec4 UnpackRgba8(uint packedColor) {
+    return vec4(
+        float(packedColor & 0xFFu) / 255.0,
+        float((packedColor >> 8u) & 0xFFu) / 255.0,
+        float((packedColor >> 16u) & 0xFFu) / 255.0,
+        float((packedColor >> 24u) & 0xFFu) / 255.0);
+}
+
 float ResolveDepthOfFieldBlurPixels(float viewDepth) {
     if (uniforms.depthOfFieldParameters.x <= 0.5) {
         return 0.0;
@@ -82,8 +121,11 @@ vec3 ResolveAovNormal(uint pointIndex) {
 }
 
 void main() {
-    const uint pointIndex = uint(gl_VertexIndex);
-    vec4 worldPosition = vec4(inPosition, 1.0);
+    const uint drawIndex = uint(gl_VertexIndex);
+    const uint pointIndex = SourcePointIndex(drawIndex);
+    const vec3 sourcePosition = UseDrawItems() ? pointPositions.positions[pointIndex].xyz : inPosition;
+    const vec4 sourceColor = UseDrawItems() ? UnpackRgba8(pointColors.colors[pointIndex]) : inColor;
+    vec4 worldPosition = vec4(sourcePosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
@@ -97,11 +139,12 @@ void main() {
                   max(1.0, styleData.renderParams3.y),
                   max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
     gl_PointSize = clamp(
-        basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
+        max(basePointSize, DrawItemFootprintDiameterPixels(drawIndex)) +
+            ResolveDepthOfFieldBlurPixels(viewDepth),
         max(1.0, styleData.renderParams3.y),
         max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
 
-    outSourceColor = inColor;
+    outSourceColor = sourceColor;
     outViewDepth = viewDepth;
     outAovNormal = ResolveAovNormal(pointIndex);
 }
