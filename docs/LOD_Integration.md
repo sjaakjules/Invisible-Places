@@ -9,14 +9,14 @@ this audit.
 
 ## Current Build Status
 
-The current worktree builds after adding the LOD progress-callback overload:
+The current worktree builds with the Stage 04 CPU adaptive LOD quality path:
+hierarchy cache v4, visual node statistics, class-aware representatives,
+per-node scalar stats, and CPU traversal feature triggers. GPU compute
+selection remains a later-stage item.
 
-```cpp
-BuildPointCloudLodHierarchy(cloud, buildConfig, progressCallback)
-```
-
-Fresh runtime/performance reports should now include the HUD/diagnostics values
-described below so sparse or stale adaptive output can be diagnosed from the UI.
+Fresh runtime/performance reports now include the HUD/diagnostics values
+described below so sparse, stale, or feature-erasing adaptive output can be
+diagnosed from the UI and `--lod-compare` metrics.
 
 ## Implemented
 
@@ -29,10 +29,21 @@ sample-count cap anymore.
   positions, colors, normals, scalar fields, water fields, and material bindings
   from the original point data.
 - A binary hierarchy cache exists under `Saved/lod/` using filenames like
-  `<source-stem>-<source-path-hash>-PointCloudLodCache-v3.bin`.
+  `<source-stem>-<source-path-hash>-PointCloudLodCache-v4.bin`.
 - Cache validation checks version, source path hash, source size, mtime, point
-  count, bounds, and build config.
+  count, bounds, build config, scalar field count, and scalar-stat payload
+  sizing. v1-v3 files are stale and rebuild into v4 without deleting old files
+  unless the existing rebuild command is used.
 - Hierarchy cache writes go through a temporary file and publish by rename.
+- v4 hierarchy nodes store spacing, density, colour variance/contrast, normal
+  variance, scalar range/variance hints, emissive/accent hints, and feature
+  flags derived from the full `LoadedPointCloud`.
+- v4 hierarchy payloads store per-field and per-node scalar statistics sized by
+  `nodes.size() * scalarFieldCount`.
+- Representatives preserve `sourcePointIndex` and add class flags for spatial
+  coverage, colour contrast, normal/edge, scalar min, scalar max, scalar
+  threshold, emissive/accent, and blue-noise fill, plus scalar slot, importance,
+  and stored rank data.
 - Point-cloud activation attempts to load the hierarchy cache, then starts a
   background hierarchy build when the cache is missing or stale.
 - Runtime adaptive traversal is scheduled on a background worker for viewport
@@ -42,6 +53,9 @@ sample-count cap anymore.
 - Fast Basic adaptive emission uses deterministic stable-ranked representative
   prefixes, so lower budgets keep a spatially distributed subset of higher
   budgets instead of swapping unrelated samples.
+- CPU traversal refines from projected spacing/mark diameter and visible
+  feature statistics, with separate threshold/cost tuning for Fast Basic, Beauty
+  screen sprites, Beauty world-mm sprites, and Beauty world surfels.
 - Traversal accepts the previously displayed frontier, applies separate
   promote/demote hysteresis bands, and reports promoted, demoted,
   hysteresis-kept, and representative-delta diagnostics.
@@ -63,7 +77,8 @@ sample-count cap anymore.
   and adaptive requested/displayed density.
 - The diagnostics overlay also reports representative delta per frame,
   promoted/demoted frontier nodes, hysteresis-kept nodes, active transition
-  count/age, hysteresis band, and idle refinement pending/completed state.
+  count/age, hysteresis band, idle refinement pending/completed state, emitted
+  representative class counts, and feature-triggered refinement counts.
 - PLY load progress reports points read, payload bytes read, elapsed time, and
   ETA when enough samples exist.
 - LOD hierarchy/cache rebuild progress reports elapsed time, approximate ETA,
@@ -75,6 +90,20 @@ sample-count cap anymore.
   is exact or coarse fallback.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
   `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
+- `lod_compare_metrics.json` reports Adaptive HQ and Fast Basic representative
+  class counts plus colour, scalar, normal, and emissive/accent feature-triggered
+  refinement counts.
+- Stage 04 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports
+  coverage ratio 1, luminance ratio 0.966488, 1,932,759 Adaptive HQ
+  representatives covering all 12,183,742 source points, feature representatives
+  colour/scalar/normal/accent 136/1,070/65/130, Fast Basic max submitted
+  4,111,812 under an 8,294,400 representative budget, no budget exceedance, no
+  full-source fallback, zero large representative-jump frames, and
+  `fast_basic_zoom_out_updated=true`.
+- A Stage 04 cold-cache compare attempt on `Data/Site3-Mid-1mm100M.ply` loaded
+  100,743,210 points but did not build a v4 hierarchy before the comparison
+  readiness timeout. The existing v1-v3 100M cache files remain stale artifacts
+  and no v4 100M cache was published.
 - Repeated 500-frame `--lod-compare` runs on
   `Data/Site3-Mid-1mm100M.ply` report deterministic smoothness metrics for the
   scripted Fast Basic path: max absolute representative delta 5,640, 22
@@ -86,9 +115,9 @@ sample-count cap anymore.
 These pieces exist, but they are not yet the ideal system described in
 `point_cloud_adaptive_lod_fast_beauty.md`.
 
-- The persistent cache stores only hierarchy nodes and representatives. It does
-  not store a `.ipcloud` manifest, raw chunks, attribute schema, node pages,
-  scalar stats, resumable build status, or source-data chunks.
+- The persistent cache stores hierarchy nodes, representatives, and scalar
+  stats. It does not store a `.ipcloud` manifest, raw chunks, attribute schema,
+  node pages, resumable build status, or source-data chunks.
 - Loading still parses and uploads the full PLY source before adaptive rendering
   can be useful. There is no progressive first-load path that displays coarse
   representatives before full parse/upload completes.
@@ -97,10 +126,6 @@ These pieces exist, but they are not yet the ideal system described in
   returns.
 - Traversal is CPU-only. There is no GPU compute culling, compaction, indirect
   draw generation, or GPU-driven visible-chunk selection.
-- A fragment budget is computed, but current adaptive emission does not appear
-  to enforce it. `TraversePointCloudLodHierarchy(...)` builds a budget with
-  `maxEstimatedFragments`, then emits through a separate `emitBudget` whose
-  `maxEstimatedFragments` is `0.0F`, which disables the footprint limit.
 - Quality demotion/promotion uses scene update FPS and frame/present FPS, not
   measured GPU point-pass timings. It can react to UI/present behavior rather
   than the actual expensive point/surfel passes.
@@ -109,14 +134,14 @@ These pieces exist, but they are not yet the ideal system described in
   UI still exposes a generic `Budget` control that can be confused with LOD.
 - LOD compensation exists as footprint, opacity, and emission fields, but it is
   simplified. It lacks full optical-depth policy controls, Beauty-specific
-  `lodBlend`, representative classes, and feature-preserving palettes.
+  `lodBlend`, and feature-preserving palettes.
 - Pixel screen sprites, world-mm screen sprites, world surfels, and
-  camera-facing world sprites share too much selection logic. Their render costs
-  and failure modes are different.
-- The LOD comparison metrics are useful but minimal. They report coverage and
-  mean luminance ratios plus a Fast Basic transition trace, not image error
-  maps, timing breakdowns, peak memory, upload bandwidth, or per-render-pass GPU
-  time.
+  camera-facing world sprites now have separate CPU selection tuning, but they
+  still do not have independent optical-depth policies or GPU timing feedback.
+- The LOD comparison metrics now report coverage, mean luminance, feature class
+  counts, feature-triggered refinement counts, and a Fast Basic transition
+  trace, but not image error maps, timing breakdowns, peak memory, upload
+  bandwidth, or per-render-pass GPU time.
 - The 100M `--lod-compare` path proves bounded replacement and deterministic
   trace metrics, but it does not automatically prove final exact idle
   refinement completion. The current 500-frame harness still ends with async
@@ -136,9 +161,6 @@ These are still target-system items from the ideal plan.
 - Memory-mapped source chunks and CPU/GPU LRU caches.
 - Device-local static point/chunk buffers with staging uploads as the normal
   large-cloud path.
-- Representative classes for spatial coverage, color contrast, normal/edge
-  features, scalar min/max/thresholds, emissive/accent points, and blue-noise
-  fill.
 - Beauty-specific parent/child opacity crossfade or optical-depth transition
   policy.
 - Dedicated LOD style data block with explicit compensation/footprint policy.
@@ -158,21 +180,16 @@ Investigate these before adding more ideal-plan features.
 - First-run large-cloud loading can still spend a long time in PLY parse, GPU
   upload, or monolithic hierarchy build. The UI now reports which phase is
   active and provides elapsed time plus ETA when a phase has measurable progress.
-- Beauty Adaptive may fall back to a raw draw count when hierarchy or draw items
-  are unavailable. If `pointBudget.activePoints` equals the full source count,
-  the app can submit the full cloud instead of a cheap adaptive placeholder.
-- The computed fragment budget is likely not active during representative
-  emission, so large translucent sprites/surfels can still overload fragment and
-  blending work.
-- Async traversal does not replace stale in-flight traversal when the camera or
-  style changes. A new request can become `async traversal busy`, causing reuse
-  of old draw items or coarse fallback for longer than expected.
+- Beauty Adaptive full-source fallback is guarded now, but this remains a
+  regression risk when future density modes or loading paths bypass adaptive
+  draw-item requirements.
+- Async traversal discards stale completions now, but new camera/style keys can
+  still spend visible time in coarse fallback while replacement work finishes.
 - The quality controller reacts to scene/present FPS instead of GPU pass time,
   so it may demote too late, promote too early, or miss point-pass bottlenecks
   hidden by cached presentation.
-- Current projected spacing is derived from projected node area divided by
-  represented source count. It does not use stored node spacing, density,
-  variance, projected radius, or tile pressure deeply enough.
+- Current projected spacing now uses stored node spacing and feature statistics,
+  but there is still no tile-pressure model or measured GPU point-pass feedback.
 - All source positions are still uploaded and retained in several forms:
   `LoadedPointCloud`, `cpuPositions`, vertex position buffer, storage position
   buffer, color buffer, normal buffer, scalar buffer, and hierarchy data. Large
@@ -225,6 +242,11 @@ a clean app launch or after pressing `Rebuild LOD Cache Now`.
 
 Prevent the current adaptive path from accidentally doing expensive raw work.
 
+Stage 02 status: the adaptive-required path no longer silently submits full
+source points, fragment budgets are carried through representative emission,
+and stale async traversals are discarded by generation. Keep this section as a
+regression checklist.
+
 - When Beauty Adaptive lacks a ready hierarchy/draw-item set, use a bounded
   coarse fallback or show an explicit `waiting on adaptive LOD` state. Do not
   silently submit all source points.
@@ -247,15 +269,22 @@ Metrics to watch:
 Make the CPU selector match the visual-cost model before moving selection to
 GPU compute.
 
-- Add node spacing, density, color variance, scalar hints, normal variance, and
-  emissive/accent hints.
-- Use true projected spacing and projected mark radius for refinement decisions.
-- Separate cost rules for pixel screen sprites, world-mm screen sprites, world
-  surfels, and camera-facing world sprites.
-- Add representative classes for spatial coverage, scalar extremes,
-  emissive/accent points, color contrast, and normal/edge variation.
-- Improve the current deterministic rank toward blue-noise/class-aware ordering
-  if Stage 04 representatives expose better statistics.
+Stage 04 status: implemented in the CPU path with cache v4 node stats,
+per-node scalar stats, class-aware representatives, projected spacing/mark
+diameter refinement, and feature-triggered traversal diagnostics. Keep the
+items below as the regression checklist for future selector work.
+
+- Keep node spacing, density, color variance, scalar hints, normal variance, and
+  emissive/accent hints populated for rebuilt and cache-loaded hierarchies.
+- Keep projected spacing and projected mark radius active in refinement
+  decisions.
+- Keep separate cost rules for pixel screen sprites, world-mm screen sprites,
+  world surfels, and camera-facing world sprites.
+- Keep representative classes for spatial coverage, scalar extremes,
+  emissive/accent points, color contrast, and normal/edge variation present in
+  low-budget emissions.
+- Continue improving deterministic rank toward richer blue-noise/class-aware
+  ordering as new statistics become available.
 
 Metrics to watch:
 
@@ -332,7 +361,7 @@ Use these commands and outputs when validating LOD work:
 cmake --build --preset build-macos-debug
 ./build/macos-debug/invisible_places_tests "[pointcloud][lod]"
 ctest --test-dir build/macos-debug --output-on-failure
-./build/macos-debug/invisible_places --lod-compare <cloud>
+build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places --lod-compare <cloud>
 ```
 
 Inspect:
@@ -346,6 +375,11 @@ Initial quality targets:
 - Adaptive HQ coverage ratio should be near full source for the active style.
 - Luminance ratio should stay within an acceptable band for the active style.
 - Adaptive renders should not be empty or stuck on coarse fallback.
+- Fast Basic should report no full-source fallback, no representative or
+  fragment budget exceedance, zero large representative-jump frames, and
+  `fast_basic_zoom_out_updated=true`.
+- Applicable RGB/scalar/normal/emissive data should produce nonzero
+  representative class counts and nonzero feature-triggered refinement counts.
 - Scalar, water-effect, normal, source-color, depth, and AOV lookups must remain
   source-correct through `drawItem.sourcePointIndex`.
 - Stage 03 manual acceptance for the 100M Fast Basic path: slow orbit has no
@@ -366,8 +400,8 @@ Initial performance targets:
 
 ## Defaults And Assumptions
 
-- Treat the current worktree as the implementation source of truth, including
-  uncommitted LOD files.
+- Treat the current branch as the implementation source of truth for the active
+  adaptive LOD path.
 - Keep `docs/point_cloud_adaptive_lod_fast_beauty.md` as the ideal target plan.
 - Keep manual point budgets only as explicit debug/loading caps.
 - Keep `Beauty Full Source` / `Full Source` as exact/debug modes, not adaptive

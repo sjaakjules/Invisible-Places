@@ -57,6 +57,12 @@ struct ViewportDiagnostics {
     std::uint32_t adaptivePromotedNodeCount = 0;
     std::uint32_t adaptiveDemotedNodeCount = 0;
     std::uint32_t adaptiveHysteresisKeptNodeCount = 0;
+    std::array<std::uint32_t, renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        adaptiveEmittedClassCounts{};
+    std::uint32_t adaptiveColorFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveScalarFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveNormalFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveEmissiveFeatureRefinedNodeCount = 0;
     float adaptiveHysteresisPromoteScale = 1.0F;
     float adaptiveHysteresisDemoteScale = 1.0F;
     std::uint32_t adaptiveActiveTransitionCount = 0;
@@ -148,6 +154,12 @@ struct SceneRenderState {
         std::uint32_t adaptivePromotedNodeCount = 0;
         std::uint32_t adaptiveDemotedNodeCount = 0;
         std::uint32_t adaptiveHysteresisKeptNodeCount = 0;
+        std::array<std::uint32_t, renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+            adaptiveEmittedClassCounts{};
+        std::uint32_t adaptiveColorFeatureRefinedNodeCount = 0;
+        std::uint32_t adaptiveScalarFeatureRefinedNodeCount = 0;
+        std::uint32_t adaptiveNormalFeatureRefinedNodeCount = 0;
+        std::uint32_t adaptiveEmissiveFeatureRefinedNodeCount = 0;
         float adaptiveHysteresisPromoteScale = 1.0F;
         float adaptiveHysteresisDemoteScale = 1.0F;
         std::uint32_t adaptiveActiveTransitionCount = 0;

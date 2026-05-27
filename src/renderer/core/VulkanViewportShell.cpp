@@ -1012,6 +1012,11 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     std::uint32_t adaptivePromotedNodeCount = 0;
     std::uint32_t adaptiveDemotedNodeCount = 0;
     std::uint32_t adaptiveHysteresisKeptNodeCount = 0;
+    std::array<std::uint32_t, renderer::pointcloud::kPointCloudLodRepresentativeClassCount> adaptiveEmittedClassCounts{};
+    std::uint32_t adaptiveColorFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveScalarFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveNormalFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveEmissiveFeatureRefinedNodeCount = 0;
     float adaptiveHysteresisPromoteScale = 1.0F;
     float adaptiveHysteresisDemoteScale = 1.0F;
     std::uint32_t adaptiveActiveTransitionCount = 0;
@@ -1051,6 +1056,13 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
             adaptivePromotedNodeCount += layer.adaptivePromotedNodeCount;
             adaptiveDemotedNodeCount += layer.adaptiveDemotedNodeCount;
             adaptiveHysteresisKeptNodeCount += layer.adaptiveHysteresisKeptNodeCount;
+            for (std::size_t classIndex = 0; classIndex < adaptiveEmittedClassCounts.size(); ++classIndex) {
+                adaptiveEmittedClassCounts[classIndex] += layer.adaptiveEmittedClassCounts[classIndex];
+            }
+            adaptiveColorFeatureRefinedNodeCount += layer.adaptiveColorFeatureRefinedNodeCount;
+            adaptiveScalarFeatureRefinedNodeCount += layer.adaptiveScalarFeatureRefinedNodeCount;
+            adaptiveNormalFeatureRefinedNodeCount += layer.adaptiveNormalFeatureRefinedNodeCount;
+            adaptiveEmissiveFeatureRefinedNodeCount += layer.adaptiveEmissiveFeatureRefinedNodeCount;
             adaptiveHysteresisPromoteScale = std::max(
                 adaptiveHysteresisPromoteScale,
                 layer.adaptiveHysteresisPromoteScale);
@@ -1114,6 +1126,11 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptivePromotedNodeCount = adaptivePromotedNodeCount;
     diagnostics_.adaptiveDemotedNodeCount = adaptiveDemotedNodeCount;
     diagnostics_.adaptiveHysteresisKeptNodeCount = adaptiveHysteresisKeptNodeCount;
+    diagnostics_.adaptiveEmittedClassCounts = adaptiveEmittedClassCounts;
+    diagnostics_.adaptiveColorFeatureRefinedNodeCount = adaptiveColorFeatureRefinedNodeCount;
+    diagnostics_.adaptiveScalarFeatureRefinedNodeCount = adaptiveScalarFeatureRefinedNodeCount;
+    diagnostics_.adaptiveNormalFeatureRefinedNodeCount = adaptiveNormalFeatureRefinedNodeCount;
+    diagnostics_.adaptiveEmissiveFeatureRefinedNodeCount = adaptiveEmissiveFeatureRefinedNodeCount;
     diagnostics_.adaptiveHysteresisPromoteScale = adaptiveHysteresisPromoteScale;
     diagnostics_.adaptiveHysteresisDemoteScale = adaptiveHysteresisDemoteScale;
     diagnostics_.adaptiveActiveTransitionCount = adaptiveActiveTransitionCount;

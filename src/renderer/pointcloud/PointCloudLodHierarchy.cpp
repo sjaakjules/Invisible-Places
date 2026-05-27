@@ -3,6 +3,7 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -30,7 +31,7 @@ namespace invisible_places::renderer::pointcloud {
 namespace {
 
 constexpr std::uint64_t kPointCloudLodCacheMagic = 0x3145434143444f4cULL;
-constexpr std::uint32_t kPointCloudLodCacheVersion = 3U;
+constexpr std::uint32_t kPointCloudLodCacheVersion = 4U;
 constexpr std::uint32_t kMaxRepresentativeVoxelDepth = 21U;
 
 struct PointCloudLodCacheHeader {
@@ -50,10 +51,15 @@ struct PointCloudLodCacheHeader {
     std::uint32_t reserved0 = 0;
     std::uint64_t nodeCount = 0;
     std::uint64_t representativeCount = 0;
+    std::uint32_t scalarFieldCount = 0;
+    std::uint32_t reserved1 = 0;
+    std::uint64_t scalarFieldStatsCount = 0;
+    std::uint64_t nodeScalarStatsCount = 0;
 };
 
 static_assert(std::is_trivially_copyable_v<PointCloudLodNode>);
 static_assert(std::is_trivially_copyable_v<PointCloudLodRepresentative>);
+static_assert(std::is_trivially_copyable_v<PointCloudLodScalarStats>);
 static_assert(std::is_trivially_copyable_v<PointCloudLodCacheHeader>);
 
 float DistanceSquared(const invisible_places::io::Float3& left, const invisible_places::io::Float3& right) {
@@ -76,6 +82,180 @@ float BoundsDiagonal(const invisible_places::io::Bounds3f& bounds) {
         return 0.0F;
     }
     return std::sqrt(DistanceSquared(bounds.minimum, bounds.maximum));
+}
+
+float BoundsVolume(const invisible_places::io::Bounds3f& bounds) {
+    if (!bounds.valid) {
+        return 0.0F;
+    }
+    const float x = std::max(0.0F, bounds.maximum.x - bounds.minimum.x);
+    const float y = std::max(0.0F, bounds.maximum.y - bounds.minimum.y);
+    const float z = std::max(0.0F, bounds.maximum.z - bounds.minimum.z);
+    return x * y * z;
+}
+
+float SurfaceSpacingEstimate(const invisible_places::io::Bounds3f& bounds, std::uint32_t representedSourceCount) {
+    if (representedSourceCount == 0U || !bounds.valid) {
+        return 0.0F;
+    }
+    return BoundsDiagonal(bounds) /
+           std::sqrt(static_cast<float>(std::max<std::uint32_t>(1U, representedSourceCount)));
+}
+
+float DensityEstimate(const invisible_places::io::Bounds3f& bounds, std::uint32_t representedSourceCount) {
+    if (representedSourceCount == 0U || !bounds.valid) {
+        return 0.0F;
+    }
+    float volume = BoundsVolume(bounds);
+    if (volume <= 1.0e-9F) {
+        const float diagonal = BoundsDiagonal(bounds);
+        volume = diagonal > 0.0F ? diagonal * diagonal * diagonal : 1.0F;
+    }
+    return static_cast<float>(representedSourceCount) / std::max(volume, 1.0e-9F);
+}
+
+std::array<float, 3> UnpackColor(std::uint32_t packedColor) {
+    constexpr float inverse255 = 1.0F / 255.0F;
+    return {
+        static_cast<float>(packedColor & 0xffU) * inverse255,
+        static_cast<float>((packedColor >> 8U) & 0xffU) * inverse255,
+        static_cast<float>((packedColor >> 16U) & 0xffU) * inverse255,
+    };
+}
+
+float ColorLuminance(std::uint32_t packedColor) {
+    const auto color = UnpackColor(packedColor);
+    return (0.2126F * color[0]) + (0.7152F * color[1]) + (0.0722F * color[2]);
+}
+
+float ColorDistanceSquared(std::uint32_t packedColor, const std::array<float, 3>& mean) {
+    const auto color = UnpackColor(packedColor);
+    const float dr = color[0] - mean[0];
+    const float dg = color[1] - mean[1];
+    const float db = color[2] - mean[2];
+    return (dr * dr) + (dg * dg) + (db * db);
+}
+
+float NormalVariationScore(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::uint32_t pointIndex,
+    const invisible_places::io::Float3& meanNormal) {
+    if (!cloud.hasNormals || pointIndex >= cloud.normals.size()) {
+        return 0.0F;
+    }
+    const auto& normal = cloud.normals[pointIndex];
+    const float dot =
+        (normal.x * meanNormal.x) +
+        (normal.y * meanNormal.y) +
+        (normal.z * meanNormal.z);
+    return 1.0F - std::clamp(dot, -1.0F, 1.0F);
+}
+
+std::string LowercaseAscii(std::string text) {
+    for (auto& character : text) {
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    }
+    return text;
+}
+
+bool ScalarFieldLooksAccent(std::string name) {
+    name = LowercaseAscii(std::move(name));
+    return name.find("interest") != std::string::npos ||
+           name.find("intensity") != std::string::npos ||
+           name.find("emiss") != std::string::npos ||
+           name.find("accent") != std::string::npos ||
+           name.find("confidence") != std::string::npos ||
+           name.find("glow") != std::string::npos;
+}
+
+std::size_t NodeScalarStatsIndex(const PointCloudLodHierarchy& hierarchy, std::uint32_t nodeIndex, std::uint32_t fieldSlot) {
+    return (static_cast<std::size_t>(nodeIndex) * hierarchy.scalarFieldCount) + fieldSlot;
+}
+
+const PointCloudLodScalarStats* NodeScalarStatsFor(
+    const PointCloudLodHierarchy& hierarchy,
+    std::uint32_t nodeIndex,
+    std::uint32_t fieldSlot) {
+    if (fieldSlot >= hierarchy.scalarFieldCount || nodeIndex >= hierarchy.nodes.size()) {
+        return nullptr;
+    }
+    const auto statsIndex = NodeScalarStatsIndex(hierarchy, nodeIndex, fieldSlot);
+    if (statsIndex >= hierarchy.nodeScalarStats.size()) {
+        return nullptr;
+    }
+    return &hierarchy.nodeScalarStats[statsIndex];
+}
+
+const PointCloudLodScalarStats* GlobalScalarStatsFor(
+    const PointCloudLodHierarchy& hierarchy,
+    std::uint32_t fieldSlot) {
+    if (fieldSlot >= hierarchy.scalarFieldStats.size()) {
+        return nullptr;
+    }
+    return &hierarchy.scalarFieldStats[fieldSlot];
+}
+
+float ScalarRangeNormalized(const PointCloudLodScalarStats& nodeStats, const PointCloudLodScalarStats* globalStats) {
+    if (nodeStats.count == 0U) {
+        return 0.0F;
+    }
+    const float nodeRange = nodeStats.maximum - nodeStats.minimum;
+    if (globalStats == nullptr || globalStats->maximum <= globalStats->minimum) {
+        return nodeRange;
+    }
+    return nodeRange / std::max(1.0e-6F, globalStats->maximum - globalStats->minimum);
+}
+
+float ScalarValueNormalized(float value, const PointCloudLodScalarStats* globalStats) {
+    if (globalStats == nullptr || globalStats->maximum <= globalStats->minimum) {
+        return value;
+    }
+    return (value - globalStats->minimum) / std::max(1.0e-6F, globalStats->maximum - globalStats->minimum);
+}
+
+std::uint32_t ClassCountIndex(std::uint32_t representativeClassFlag) {
+    switch (representativeClassFlag) {
+        case PointCloudLodRepresentativeClassSpatialCoverage:
+            return 0U;
+        case PointCloudLodRepresentativeClassColorContrast:
+            return 1U;
+        case PointCloudLodRepresentativeClassNormalEdge:
+            return 2U;
+        case PointCloudLodRepresentativeClassScalarMin:
+            return 3U;
+        case PointCloudLodRepresentativeClassScalarMax:
+            return 4U;
+        case PointCloudLodRepresentativeClassScalarThreshold:
+            return 5U;
+        case PointCloudLodRepresentativeClassEmissiveAccent:
+            return 6U;
+        case PointCloudLodRepresentativeClassBlueNoiseFill:
+            return 7U;
+    }
+    return 0U;
+}
+
+void AccumulateRepresentativeClassCounts(
+    PointCloudLodTraversalDiagnostics* diagnostics,
+    std::uint32_t representativeClassFlags) {
+    if (diagnostics == nullptr) {
+        return;
+    }
+    constexpr std::array<std::uint32_t, kPointCloudLodRepresentativeClassCount> kClassFlags = {
+        PointCloudLodRepresentativeClassSpatialCoverage,
+        PointCloudLodRepresentativeClassColorContrast,
+        PointCloudLodRepresentativeClassNormalEdge,
+        PointCloudLodRepresentativeClassScalarMin,
+        PointCloudLodRepresentativeClassScalarMax,
+        PointCloudLodRepresentativeClassScalarThreshold,
+        PointCloudLodRepresentativeClassEmissiveAccent,
+        PointCloudLodRepresentativeClassBlueNoiseFill,
+    };
+    for (const auto classFlag : kClassFlags) {
+        if ((representativeClassFlags & classFlag) != 0U) {
+            ++diagnostics->emittedClassCounts[ClassCountIndex(classFlag)];
+        }
+    }
 }
 
 std::uint32_t NearestPointIndex(
@@ -137,6 +317,20 @@ struct RepresentativeVoxelCandidate {
     std::uint32_t sourcePointIndex = 0;
     std::uint32_t representedSourceCount = 0;
     float distanceToCenterSquared = std::numeric_limits<float>::max();
+};
+
+struct RepresentativeCandidate {
+    std::uint32_t sourcePointIndex = 0;
+    std::uint32_t classFlags = PointCloudLodRepresentativeClassSpatialCoverage;
+    std::uint32_t scalarFieldSlot = kPointCloudLodInvalidScalarFieldSlot;
+    float importance = 0.0F;
+};
+
+struct NodeBuildStats {
+    PointCloudLodNode node{};
+    std::vector<PointCloudLodScalarStats> scalarStats;
+    std::array<float, 3> meanColor{0.0F, 0.0F, 0.0F};
+    invisible_places::io::Float3 meanNormal{};
 };
 
 struct RepresentativeVoxelConfig {
@@ -263,6 +457,27 @@ std::uint32_t QuantizedRepresentativeCoordinate(float value, float minimum, floa
     return static_cast<std::uint32_t>(normalized * 1024.0);
 }
 
+std::uint32_t RepresentativeClassPriority(std::uint32_t classFlags) {
+    if ((classFlags & PointCloudLodRepresentativeClassEmissiveAccent) != 0U) {
+        return 0U;
+    }
+    if ((classFlags & (PointCloudLodRepresentativeClassScalarMin |
+                       PointCloudLodRepresentativeClassScalarMax |
+                       PointCloudLodRepresentativeClassScalarThreshold)) != 0U) {
+        return 1U;
+    }
+    if ((classFlags & PointCloudLodRepresentativeClassColorContrast) != 0U) {
+        return 2U;
+    }
+    if ((classFlags & PointCloudLodRepresentativeClassNormalEdge) != 0U) {
+        return 3U;
+    }
+    if ((classFlags & PointCloudLodRepresentativeClassSpatialCoverage) != 0U) {
+        return 4U;
+    }
+    return 5U;
+}
+
 std::uint64_t StableRepresentativeRankKey(
     const PointCloudLodNode& node,
     const PointCloudLodRepresentative& representative) {
@@ -277,7 +492,9 @@ std::uint64_t StableRepresentativeRankKey(
     const std::uint64_t tieBreak =
         MixStableLodHash((static_cast<std::uint64_t>(representative.sourcePointIndex) << 32U) ^
                          static_cast<std::uint64_t>(representative.representedSourceCount));
-    return lowDiscrepancySpatialOrder ^ (tieBreak >> 24U);
+    const std::uint64_t rankBits = (lowDiscrepancySpatialOrder ^ (tieBreak >> 24U)) & 0x0fffffffffffffffULL;
+    return (static_cast<std::uint64_t>(RepresentativeClassPriority(representative.representativeClassFlags)) << 60U) |
+           rankBits;
 }
 
 std::uint32_t StableRepresentativeSeed(
@@ -402,33 +619,230 @@ std::vector<RepresentativeVoxelCandidate> BuildRepresentativeVoxelCandidates(
     return orderedCandidates;
 }
 
-std::vector<PointCloudLodRepresentative> MakeInternalRepresentatives(
+NodeBuildStats ComputeNodeBuildStats(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<std::uint32_t>& pointIndices,
+    std::uint32_t depth,
+    const std::vector<PointCloudLodScalarStats>& globalScalarStats) {
+    NodeBuildStats result;
+    auto& node = result.node;
+    node.bounds = BoundsForIndices(cloud.positions, pointIndices);
+    node.representedSourceCount = static_cast<std::uint32_t>(
+        std::min<std::size_t>(pointIndices.size(), std::numeric_limits<std::uint32_t>::max()));
+    node.depth = depth;
+    node.spacingMeters = SurfaceSpacingEstimate(node.bounds, node.representedSourceCount);
+    node.densityPointsPerM3 = DensityEstimate(node.bounds, node.representedSourceCount);
+
+    const bool hasColor = cloud.hasSourceRgb && cloud.packedColors.size() >= cloud.positions.size();
+    double redSum = 0.0;
+    double greenSum = 0.0;
+    double blueSum = 0.0;
+    double redSquareSum = 0.0;
+    double greenSquareSum = 0.0;
+    double blueSquareSum = 0.0;
+    float minLuminance = std::numeric_limits<float>::max();
+    float maxLuminance = -std::numeric_limits<float>::max();
+    std::uint32_t colorCount = 0;
+
+    double normalXSum = 0.0;
+    double normalYSum = 0.0;
+    double normalZSum = 0.0;
+    std::uint32_t normalCount = 0;
+
+    const auto scalarFieldCount = cloud.ScalarFieldCount();
+    result.scalarStats.resize(scalarFieldCount);
+    std::vector<double> scalarMeans(scalarFieldCount, 0.0);
+    std::vector<double> scalarM2(scalarFieldCount, 0.0);
+
+    for (const auto pointIndex : pointIndices) {
+        if (pointIndex >= cloud.positions.size()) {
+            continue;
+        }
+        if (hasColor && pointIndex < cloud.packedColors.size()) {
+            const auto color = UnpackColor(cloud.packedColors[pointIndex]);
+            redSum += color[0];
+            greenSum += color[1];
+            blueSum += color[2];
+            redSquareSum += static_cast<double>(color[0]) * color[0];
+            greenSquareSum += static_cast<double>(color[1]) * color[1];
+            blueSquareSum += static_cast<double>(color[2]) * color[2];
+            const float luminance = ColorLuminance(cloud.packedColors[pointIndex]);
+            minLuminance = std::min(minLuminance, luminance);
+            maxLuminance = std::max(maxLuminance, luminance);
+            ++colorCount;
+        }
+        if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+            const auto& normal = cloud.normals[pointIndex];
+            normalXSum += normal.x;
+            normalYSum += normal.y;
+            normalZSum += normal.z;
+            ++normalCount;
+        }
+        for (std::size_t fieldSlot = 0; fieldSlot < scalarFieldCount; ++fieldSlot) {
+            const auto valueIndex = cloud.ScalarFieldValueIndex(fieldSlot, pointIndex);
+            if (valueIndex >= cloud.scalarFieldValues.size()) {
+                continue;
+            }
+            const float value = cloud.scalarFieldValues[valueIndex];
+            if (!std::isfinite(value)) {
+                continue;
+            }
+            auto& stats = result.scalarStats[fieldSlot];
+            if (stats.count == 0U) {
+                stats.minimum = value;
+                stats.maximum = value;
+            } else {
+                stats.minimum = std::min(stats.minimum, value);
+                stats.maximum = std::max(stats.maximum, value);
+            }
+            ++stats.count;
+            const double delta = static_cast<double>(value) - scalarMeans[fieldSlot];
+            scalarMeans[fieldSlot] += delta / static_cast<double>(stats.count);
+            scalarM2[fieldSlot] += delta * (static_cast<double>(value) - scalarMeans[fieldSlot]);
+        }
+    }
+
+    if (colorCount > 0U) {
+        const double inverseCount = 1.0 / static_cast<double>(colorCount);
+        result.meanColor = {
+            static_cast<float>(redSum * inverseCount),
+            static_cast<float>(greenSum * inverseCount),
+            static_cast<float>(blueSum * inverseCount),
+        };
+        const double redVariance = std::max(0.0, (redSquareSum * inverseCount) - (result.meanColor[0] * result.meanColor[0]));
+        const double greenVariance =
+            std::max(0.0, (greenSquareSum * inverseCount) - (result.meanColor[1] * result.meanColor[1]));
+        const double blueVariance =
+            std::max(0.0, (blueSquareSum * inverseCount) - (result.meanColor[2] * result.meanColor[2]));
+        node.colorVariance = static_cast<float>((redVariance + greenVariance + blueVariance) / 3.0);
+        node.colorContrast = std::max(0.0F, maxLuminance - minLuminance);
+        if (node.colorContrast > 0.18F || node.colorVariance > 0.015F) {
+            node.featureFlags |= PointCloudLodRepresentativeClassColorContrast;
+        }
+    }
+
+    if (normalCount > 0U) {
+        const float inverseCount = 1.0F / static_cast<float>(normalCount);
+        invisible_places::io::Float3 mean{
+            static_cast<float>(normalXSum) * inverseCount,
+            static_cast<float>(normalYSum) * inverseCount,
+            static_cast<float>(normalZSum) * inverseCount,
+        };
+        const float meanLength = std::sqrt((mean.x * mean.x) + (mean.y * mean.y) + (mean.z * mean.z));
+        node.normalVariance = 1.0F - std::clamp(meanLength, 0.0F, 1.0F);
+        if (meanLength > 1.0e-6F) {
+            const float inverseLength = 1.0F / meanLength;
+            result.meanNormal = {mean.x * inverseLength, mean.y * inverseLength, mean.z * inverseLength};
+        }
+        if (node.normalVariance > 0.01F) {
+            node.featureFlags |= PointCloudLodRepresentativeClassNormalEdge;
+        }
+    }
+
+    for (std::size_t fieldSlot = 0; fieldSlot < scalarFieldCount; ++fieldSlot) {
+        auto& stats = result.scalarStats[fieldSlot];
+        if (stats.count == 0U) {
+            continue;
+        }
+        stats.mean = static_cast<float>(scalarMeans[fieldSlot]);
+        stats.variance = stats.count > 1U ? static_cast<float>(scalarM2[fieldSlot] / static_cast<double>(stats.count - 1U)) : 0.0F;
+        const auto* globalStats = fieldSlot < globalScalarStats.size() ? &globalScalarStats[fieldSlot] : nullptr;
+        const float normalizedRange = ScalarRangeNormalized(stats, globalStats);
+        node.scalarRangeHint = std::max(node.scalarRangeHint, normalizedRange);
+        if (globalStats != nullptr && globalStats->maximum > globalStats->minimum) {
+            const float normalizedVariance =
+                std::sqrt(std::max(0.0F, stats.variance)) /
+                std::max(1.0e-6F, globalStats->maximum - globalStats->minimum);
+            node.scalarVarianceHint = std::max(node.scalarVarianceHint, normalizedVariance);
+            const float midpoint = 0.5F * (globalStats->minimum + globalStats->maximum);
+            if (stats.minimum <= midpoint && stats.maximum >= midpoint) {
+                stats.flags |= PointCloudLodRepresentativeClassScalarThreshold;
+            }
+        }
+        if (normalizedRange > 0.08F || stats.variance > 0.0F) {
+            stats.flags |= PointCloudLodRepresentativeClassScalarMin |
+                           PointCloudLodRepresentativeClassScalarMax;
+            node.featureFlags |= PointCloudLodRepresentativeClassScalarMin |
+                                 PointCloudLodRepresentativeClassScalarMax;
+        }
+        if (fieldSlot < cloud.scalarFields.size() && ScalarFieldLooksAccent(cloud.scalarFields[fieldSlot].name)) {
+            const float normalizedMax = ScalarValueNormalized(stats.maximum, globalStats);
+            if (normalizedMax > 0.65F || stats.maximum > stats.mean) {
+                stats.flags |= PointCloudLodRepresentativeClassEmissiveAccent;
+                node.featureFlags |= PointCloudLodRepresentativeClassEmissiveAccent;
+                node.emissiveImportanceHint = std::max(node.emissiveImportanceHint, std::clamp(normalizedMax, 0.0F, 1.0F));
+            }
+        }
+    }
+
+    if (node.scalarRangeHint > 0.08F || node.scalarVarianceHint > 0.02F) {
+        node.featureFlags |= PointCloudLodRepresentativeClassScalarMin |
+                             PointCloudLodRepresentativeClassScalarMax;
+    }
+    return result;
+}
+
+void ResizeNodeScalarStats(PointCloudLodHierarchy* hierarchy) {
+    if (hierarchy == nullptr || hierarchy->scalarFieldCount == 0U) {
+        return;
+    }
+    hierarchy->nodeScalarStats.resize(hierarchy->nodes.size() * hierarchy->scalarFieldCount);
+}
+
+void StoreNodeScalarStats(
+    PointCloudLodHierarchy* hierarchy,
+    std::uint32_t nodeIndex,
+    const std::vector<PointCloudLodScalarStats>& stats) {
+    if (hierarchy == nullptr || hierarchy->scalarFieldCount == 0U) {
+        return;
+    }
+    ResizeNodeScalarStats(hierarchy);
+    const auto copyCount = std::min<std::size_t>(stats.size(), hierarchy->scalarFieldCount);
+    for (std::size_t fieldSlot = 0; fieldSlot < copyCount; ++fieldSlot) {
+        hierarchy->nodeScalarStats[NodeScalarStatsIndex(*hierarchy, nodeIndex, static_cast<std::uint32_t>(fieldSlot))] =
+            stats[fieldSlot];
+    }
+}
+
+void AddRepresentativeCandidate(
+    std::vector<RepresentativeCandidate>* candidates,
+    std::unordered_map<std::uint32_t, std::size_t>* sourceToCandidate,
+    std::uint32_t sourcePointIndex,
+    std::uint32_t classFlags,
+    std::uint32_t scalarFieldSlot,
+    float importance,
+    std::uint32_t sourcePointCount) {
+    if (candidates == nullptr || sourceToCandidate == nullptr || sourcePointIndex >= sourcePointCount) {
+        return;
+    }
+    if (const auto existing = sourceToCandidate->find(sourcePointIndex); existing != sourceToCandidate->end()) {
+        auto& candidate = (*candidates)[existing->second];
+        candidate.classFlags |= classFlags;
+        candidate.importance = std::max(candidate.importance, importance);
+        if (candidate.scalarFieldSlot == kPointCloudLodInvalidScalarFieldSlot) {
+            candidate.scalarFieldSlot = scalarFieldSlot;
+        }
+        return;
+    }
+    if (candidates->size() >= std::numeric_limits<std::uint32_t>::max()) {
+        return;
+    }
+    sourceToCandidate->emplace(sourcePointIndex, candidates->size());
+    candidates->push_back(
+        {.sourcePointIndex = sourcePointIndex,
+         .classFlags = classFlags,
+         .scalarFieldSlot = scalarFieldSlot,
+         .importance = importance});
+}
+
+std::vector<RepresentativeVoxelCandidate> SelectSpatialVoxelCandidates(
     const std::vector<invisible_places::io::Float3>& positions,
     const std::vector<std::uint32_t>& pointIndices,
     const invisible_places::io::Bounds3f& bounds,
-    std::uint32_t maxInternalRepresentatives) {
-    const auto validPointCount = static_cast<std::uint32_t>(std::min<std::size_t>(
-        pointIndices.size(),
-        std::numeric_limits<std::uint32_t>::max()));
-    if (validPointCount == 0U) {
-        return {};
-    }
-
-    const std::uint32_t requestedRepresentatives = std::clamp<std::uint32_t>(
-        maxInternalRepresentatives,
-        1U,
-        validPointCount);
-    const float sourceSpacing = BoundsDiagonal(bounds) /
-                                std::sqrt(static_cast<float>(std::max<std::uint32_t>(1U, validPointCount)));
+    std::uint32_t requestedRepresentatives) {
     const auto config = MakeRepresentativeVoxelConfig(bounds);
-    if (config.activeDimensions == 0U) {
-        const auto center = BoundsCenter(bounds);
-        const auto pointIndex = NearestPointIndex(positions, pointIndices, center);
-        return {
-            {.sourcePointIndex = pointIndex,
-             .representedSourceCount = validPointCount,
-             .position = pointIndex < positions.size() ? positions[pointIndex] : center,
-             .sourceSpacingMeters = sourceSpacing}};
+    if (config.activeDimensions == 0U || requestedRepresentatives == 0U) {
+        return {};
     }
 
     auto depth = InitialRepresentativeVoxelDepth(requestedRepresentatives, config.activeDimensions);
@@ -444,7 +858,6 @@ std::vector<PointCloudLodRepresentative> MakeInternalRepresentatives(
         if (candidates.empty()) {
             break;
         }
-
         if (candidates.size() > bestCandidates.size()) {
             bestCandidates = std::move(candidates);
         }
@@ -455,56 +868,313 @@ std::vector<PointCloudLodRepresentative> MakeInternalRepresentatives(
         }
         ++depth;
     }
+    return bestCandidates;
+}
 
+std::vector<PointCloudLodRepresentative> MakeInternalRepresentatives(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<std::uint32_t>& pointIndices,
+    const NodeBuildStats& stats,
+    std::uint32_t maxInternalRepresentatives) {
+    const auto validPointCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        pointIndices.size(),
+        std::numeric_limits<std::uint32_t>::max()));
+    if (validPointCount == 0U) {
+        return {};
+    }
+
+    const std::uint32_t requestedRepresentatives = std::clamp<std::uint32_t>(
+        maxInternalRepresentatives,
+        1U,
+        validPointCount);
+    const float sourceSpacing = stats.node.spacingMeters;
+    const auto& bounds = stats.node.bounds;
+    const auto bestCandidates = SelectSpatialVoxelCandidates(
+        cloud.positions,
+        pointIndices,
+        bounds,
+        requestedRepresentatives);
     if (bestCandidates.empty()) {
         const auto center = BoundsCenter(bounds);
-        const auto pointIndex = NearestPointIndex(positions, pointIndices, center);
+        const auto pointIndex = NearestPointIndex(cloud.positions, pointIndices, center);
         return {
             {.sourcePointIndex = pointIndex,
              .representedSourceCount = validPointCount,
-             .position = pointIndex < positions.size() ? positions[pointIndex] : center,
-             .sourceSpacingMeters = sourceSpacing}};
+             .representativeClassFlags = PointCloudLodRepresentativeClassSpatialCoverage,
+             .scalarFieldSlot = kPointCloudLodInvalidScalarFieldSlot,
+             .position = pointIndex < cloud.positions.size() ? cloud.positions[pointIndex] : center,
+             .sourceSpacingMeters = sourceSpacing,
+             .importance = 1.0F,
+             .lodRank = 0.0F}};
     }
 
-    const auto representativeCount = static_cast<std::size_t>(
-        std::min<std::uint32_t>(requestedRepresentatives, static_cast<std::uint32_t>(bestCandidates.size())));
-    std::vector<PointCloudLodRepresentative> representatives;
-    representatives.reserve(representativeCount);
-    if (bestCandidates.size() <= representativeCount) {
+    std::vector<RepresentativeCandidate> representativeCandidates;
+    representativeCandidates.reserve(requestedRepresentatives);
+    std::unordered_map<std::uint32_t, std::size_t> sourceToCandidate;
+    sourceToCandidate.reserve(requestedRepresentatives * 2U);
+
+    const std::uint32_t spatialTarget =
+        requestedRepresentatives <= 4U
+            ? std::max<std::uint32_t>(1U, requestedRepresentatives / 2U)
+            : std::min<std::uint32_t>(requestedRepresentatives, std::max<std::uint32_t>(4U, requestedRepresentatives / 2U));
+    const auto addSpatialCandidate = [&](const RepresentativeVoxelCandidate& candidate, std::uint32_t classFlags) {
+        AddRepresentativeCandidate(
+            &representativeCandidates,
+            &sourceToCandidate,
+            candidate.sourcePointIndex,
+            classFlags,
+            kPointCloudLodInvalidScalarFieldSlot,
+            0.25F,
+            static_cast<std::uint32_t>(cloud.positions.size()));
+    };
+    if (bestCandidates.size() <= spatialTarget) {
         for (const auto& candidate : bestCandidates) {
-            representatives.push_back(
-                {.sourcePointIndex = candidate.sourcePointIndex,
-                 .representedSourceCount = candidate.representedSourceCount,
-                 .position = candidate.sourcePointIndex < positions.size()
-                                 ? positions[candidate.sourcePointIndex]
-                                 : BoundsCenter(bounds),
-                 .sourceSpacingMeters = sourceSpacing});
+            addSpatialCandidate(candidate, PointCloudLodRepresentativeClassSpatialCoverage);
         }
+    } else {
+        const auto candidateCount = static_cast<std::uint64_t>(bestCandidates.size());
+        const auto requestedCount = static_cast<std::uint64_t>(spatialTarget);
+        for (std::uint64_t representativeIndex = 0; representativeIndex < requestedCount; ++representativeIndex) {
+            const auto binBegin = (representativeIndex * candidateCount) / requestedCount;
+            const auto binEnd = ((representativeIndex + 1U) * candidateCount) / requestedCount;
+            const auto selectedIndex = std::min<std::uint64_t>(
+                candidateCount - 1U,
+                binBegin + ((std::max<std::uint64_t>(binEnd, binBegin + 1U) - binBegin) / 2U));
+            addSpatialCandidate(
+                bestCandidates[static_cast<std::size_t>(selectedIndex)],
+                PointCloudLodRepresentativeClassSpatialCoverage);
+        }
+    }
+
+    if (cloud.hasSourceRgb && cloud.packedColors.size() >= cloud.positions.size()) {
+        std::uint32_t minLuminanceIndex = pointIndices.front();
+        std::uint32_t maxLuminanceIndex = pointIndices.front();
+        std::uint32_t maxColorDistanceIndex = pointIndices.front();
+        float minLuminance = std::numeric_limits<float>::max();
+        float maxLuminance = -std::numeric_limits<float>::max();
+        float maxColorDistance = -1.0F;
+        for (const auto pointIndex : pointIndices) {
+            if (pointIndex >= cloud.packedColors.size()) {
+                continue;
+            }
+            const float luminance = ColorLuminance(cloud.packedColors[pointIndex]);
+            if (luminance < minLuminance) {
+                minLuminance = luminance;
+                minLuminanceIndex = pointIndex;
+            }
+            if (luminance > maxLuminance) {
+                maxLuminance = luminance;
+                maxLuminanceIndex = pointIndex;
+            }
+            const float distance = ColorDistanceSquared(cloud.packedColors[pointIndex], stats.meanColor);
+            if (distance > maxColorDistance) {
+                maxColorDistance = distance;
+                maxColorDistanceIndex = pointIndex;
+            }
+        }
+        const float colorImportance = std::max(stats.node.colorContrast, std::sqrt(std::max(0.0F, maxColorDistance)));
+        if (colorImportance > 0.08F) {
+            AddRepresentativeCandidate(
+                &representativeCandidates,
+                &sourceToCandidate,
+                minLuminanceIndex,
+                PointCloudLodRepresentativeClassColorContrast,
+                kPointCloudLodInvalidScalarFieldSlot,
+                colorImportance,
+                static_cast<std::uint32_t>(cloud.positions.size()));
+            AddRepresentativeCandidate(
+                &representativeCandidates,
+                &sourceToCandidate,
+                maxLuminanceIndex,
+                PointCloudLodRepresentativeClassColorContrast,
+                kPointCloudLodInvalidScalarFieldSlot,
+                colorImportance,
+                static_cast<std::uint32_t>(cloud.positions.size()));
+            AddRepresentativeCandidate(
+                &representativeCandidates,
+                &sourceToCandidate,
+                maxColorDistanceIndex,
+                PointCloudLodRepresentativeClassColorContrast,
+                kPointCloudLodInvalidScalarFieldSlot,
+                colorImportance,
+                static_cast<std::uint32_t>(cloud.positions.size()));
+        }
+    }
+
+    if (cloud.hasNormals && cloud.normals.size() >= cloud.positions.size()) {
+        std::uint32_t normalEdgeIndex = pointIndices.front();
+        float normalEdgeScore = -1.0F;
+        for (const auto pointIndex : pointIndices) {
+            const float score = NormalVariationScore(cloud, pointIndex, stats.meanNormal);
+            if (score > normalEdgeScore) {
+                normalEdgeScore = score;
+                normalEdgeIndex = pointIndex;
+            }
+        }
+        if (normalEdgeScore > 0.05F) {
+            AddRepresentativeCandidate(
+                &representativeCandidates,
+                &sourceToCandidate,
+                normalEdgeIndex,
+                PointCloudLodRepresentativeClassNormalEdge,
+                kPointCloudLodInvalidScalarFieldSlot,
+                normalEdgeScore,
+                static_cast<std::uint32_t>(cloud.positions.size()));
+        }
+    }
+
+    for (std::size_t fieldSlot = 0; fieldSlot < stats.scalarStats.size(); ++fieldSlot) {
+        const auto& scalarStats = stats.scalarStats[fieldSlot];
+        if (scalarStats.count == 0U) {
+            continue;
+        }
+        std::uint32_t minIndex = pointIndices.front();
+        std::uint32_t maxIndex = pointIndices.front();
+        std::uint32_t thresholdIndex = pointIndices.front();
+        float minValue = std::numeric_limits<float>::max();
+        float maxValue = -std::numeric_limits<float>::max();
+        float thresholdDistance = std::numeric_limits<float>::max();
+        const float thresholdValue = 0.5F * (scalarStats.minimum + scalarStats.maximum);
+        for (const auto pointIndex : pointIndices) {
+            const auto valueIndex = cloud.ScalarFieldValueIndex(fieldSlot, pointIndex);
+            if (valueIndex >= cloud.scalarFieldValues.size()) {
+                continue;
+            }
+            const float value = cloud.scalarFieldValues[valueIndex];
+            if (!std::isfinite(value)) {
+                continue;
+            }
+            if (value < minValue) {
+                minValue = value;
+                minIndex = pointIndex;
+            }
+            if (value > maxValue) {
+                maxValue = value;
+                maxIndex = pointIndex;
+            }
+            const float distance = std::abs(value - thresholdValue);
+            if (distance < thresholdDistance) {
+                thresholdDistance = distance;
+                thresholdIndex = pointIndex;
+            }
+        }
+        const float scalarImportance = std::max(0.1F, scalarStats.maximum - scalarStats.minimum);
+        AddRepresentativeCandidate(
+            &representativeCandidates,
+            &sourceToCandidate,
+            minIndex,
+            PointCloudLodRepresentativeClassScalarMin,
+            static_cast<std::uint32_t>(fieldSlot),
+            scalarImportance,
+            static_cast<std::uint32_t>(cloud.positions.size()));
+        AddRepresentativeCandidate(
+            &representativeCandidates,
+            &sourceToCandidate,
+            maxIndex,
+            PointCloudLodRepresentativeClassScalarMax,
+            static_cast<std::uint32_t>(fieldSlot),
+            scalarImportance,
+            static_cast<std::uint32_t>(cloud.positions.size()));
+        if ((scalarStats.flags & PointCloudLodRepresentativeClassScalarThreshold) != 0U) {
+            AddRepresentativeCandidate(
+                &representativeCandidates,
+                &sourceToCandidate,
+                thresholdIndex,
+                PointCloudLodRepresentativeClassScalarThreshold,
+                static_cast<std::uint32_t>(fieldSlot),
+                scalarImportance,
+                static_cast<std::uint32_t>(cloud.positions.size()));
+        }
+        if (fieldSlot < cloud.scalarFields.size() &&
+            ScalarFieldLooksAccent(cloud.scalarFields[fieldSlot].name) &&
+            maxValue > minValue) {
+            AddRepresentativeCandidate(
+                &representativeCandidates,
+                &sourceToCandidate,
+                maxIndex,
+                PointCloudLodRepresentativeClassEmissiveAccent,
+                static_cast<std::uint32_t>(fieldSlot),
+                scalarImportance,
+                static_cast<std::uint32_t>(cloud.positions.size()));
+        }
+    }
+
+    for (const auto& candidate : bestCandidates) {
+        if (representativeCandidates.size() >= requestedRepresentatives) {
+            break;
+        }
+        AddRepresentativeCandidate(
+            &representativeCandidates,
+            &sourceToCandidate,
+            candidate.sourcePointIndex,
+            PointCloudLodRepresentativeClassBlueNoiseFill,
+            kPointCloudLodInvalidScalarFieldSlot,
+            0.05F,
+            static_cast<std::uint32_t>(cloud.positions.size()));
+    }
+
+    if (representativeCandidates.size() > requestedRepresentatives) {
+        std::stable_sort(
+            representativeCandidates.begin(),
+            representativeCandidates.end(),
+            [](const RepresentativeCandidate& left, const RepresentativeCandidate& right) {
+                const auto leftPriority = RepresentativeClassPriority(left.classFlags);
+                const auto rightPriority = RepresentativeClassPriority(right.classFlags);
+                if (leftPriority != rightPriority) {
+                    return leftPriority < rightPriority;
+                }
+                if (left.importance != right.importance) {
+                    return left.importance > right.importance;
+                }
+                return left.sourcePointIndex < right.sourcePointIndex;
+            });
+        representativeCandidates.resize(requestedRepresentatives);
+    }
+
+    std::vector<PointCloudLodRepresentative> representatives;
+    representatives.reserve(representativeCandidates.size());
+    for (const auto& candidate : representativeCandidates) {
+        if (candidate.sourcePointIndex >= cloud.positions.size()) {
+            continue;
+        }
+        const auto rankHash = MixStableLodHash(
+            (static_cast<std::uint64_t>(candidate.sourcePointIndex) << 32U) ^
+            static_cast<std::uint64_t>(candidate.classFlags));
+        representatives.push_back(
+            {.sourcePointIndex = candidate.sourcePointIndex,
+             .representedSourceCount = 0U,
+             .representativeClassFlags = candidate.classFlags,
+             .scalarFieldSlot = candidate.scalarFieldSlot,
+             .position = cloud.positions[candidate.sourcePointIndex],
+             .sourceSpacingMeters = sourceSpacing,
+             .importance = candidate.importance,
+             .lodRank = static_cast<float>((rankHash >> 40U) & 0xffffffULL) / static_cast<float>(0xffffffU)});
+    }
+
+    if (representatives.empty()) {
         return representatives;
     }
 
-    const auto candidateCount = static_cast<std::uint64_t>(bestCandidates.size());
-    const auto requestedCount = static_cast<std::uint64_t>(representativeCount);
-    for (std::uint64_t representativeIndex = 0; representativeIndex < requestedCount; ++representativeIndex) {
-        const auto binBegin = (representativeIndex * candidateCount) / requestedCount;
-        const auto binEnd = ((representativeIndex + 1U) * candidateCount) / requestedCount;
-        const auto clampedBinEnd = std::max<std::uint64_t>(binEnd, binBegin + 1U);
-        const auto selectedIndex = std::min<std::uint64_t>(
-            candidateCount - 1U,
-            binBegin + ((clampedBinEnd - binBegin) / 2U));
-        std::uint32_t representedSourceCount = 0;
-        for (auto candidateIndex = binBegin; candidateIndex < clampedBinEnd && candidateIndex < candidateCount;
-             ++candidateIndex) {
-            representedSourceCount += bestCandidates[static_cast<std::size_t>(candidateIndex)].representedSourceCount;
+    for (auto& representative : representatives) {
+        representative.representedSourceCount = 0U;
+    }
+    for (const auto pointIndex : pointIndices) {
+        if (pointIndex >= cloud.positions.size()) {
+            continue;
         }
-        const auto& selected = bestCandidates[static_cast<std::size_t>(selectedIndex)];
-        representatives.push_back(
-            {.sourcePointIndex = selected.sourcePointIndex,
-             .representedSourceCount = representedSourceCount,
-             .position = selected.sourcePointIndex < positions.size()
-                             ? positions[selected.sourcePointIndex]
-                             : BoundsCenter(bounds),
-             .sourceSpacingMeters = sourceSpacing});
+        std::size_t nearestIndex = 0;
+        float nearestDistance = std::numeric_limits<float>::max();
+        for (std::size_t representativeIndex = 0; representativeIndex < representatives.size(); ++representativeIndex) {
+            const float distance = DistanceSquared(cloud.positions[pointIndex], representatives[representativeIndex].position);
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearestIndex = representativeIndex;
+            }
+        }
+        ++representatives[nearestIndex].representedSourceCount;
+    }
+    for (auto& representative : representatives) {
+        representative.representedSourceCount = std::max<std::uint32_t>(1U, representative.representedSourceCount);
     }
     return representatives;
 }
@@ -594,18 +1264,17 @@ struct PointCloudLodBuildProgressTracker {
 };
 
 std::uint32_t BuildNode(
-    const std::vector<invisible_places::io::Float3>& positions,
+    const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<std::uint32_t>& pointIndices,
     std::uint32_t depth,
     const PointCloudLodBuildConfig& config,
     PointCloudLodHierarchy* hierarchy,
     PointCloudLodBuildProgressTracker* progressTracker) {
     const auto nodeIndex = static_cast<std::uint32_t>(hierarchy->nodes.size());
-    hierarchy->nodes.push_back({});
+    const auto buildStats = ComputeNodeBuildStats(cloud, pointIndices, depth, hierarchy->scalarFieldStats);
+    hierarchy->nodes.push_back(buildStats.node);
+    StoreNodeScalarStats(hierarchy, nodeIndex, buildStats.scalarStats);
     auto& node = hierarchy->nodes.back();
-    node.bounds = BoundsForIndices(positions, pointIndices);
-    node.representedSourceCount = static_cast<std::uint32_t>(pointIndices.size());
-    node.depth = depth;
 
     const bool makeLeaf =
         pointIndices.size() <= std::max<std::uint32_t>(1U, config.maxLeafSourcePoints) ||
@@ -619,19 +1288,20 @@ std::uint32_t BuildNode(
     if (makeLeaf) {
         node.firstRepresentative = static_cast<std::uint32_t>(hierarchy->representatives.size());
         node.representativeCount = static_cast<std::uint32_t>(pointIndices.size());
-        const float sourceSpacing = pointIndices.empty()
-                                        ? 0.0F
-                                        : BoundsDiagonal(node.bounds) /
-                                              std::sqrt(static_cast<float>(std::max<std::size_t>(1U, pointIndices.size())));
         for (const auto pointIndex : pointIndices) {
-            if (pointIndex >= positions.size()) {
+            if (pointIndex >= cloud.positions.size()) {
                 continue;
             }
+            const auto rankHash = MixStableLodHash(static_cast<std::uint64_t>(pointIndex));
             hierarchy->representatives.push_back(
                 {.sourcePointIndex = pointIndex,
                  .representedSourceCount = 1U,
-                 .position = positions[pointIndex],
-                 .sourceSpacingMeters = sourceSpacing});
+                 .representativeClassFlags = PointCloudLodRepresentativeClassSpatialCoverage,
+                 .scalarFieldSlot = kPointCloudLodInvalidScalarFieldSlot,
+                 .position = cloud.positions[pointIndex],
+                 .sourceSpacingMeters = node.spacingMeters,
+                 .importance = 1.0F,
+                 .lodRank = static_cast<float>((rankHash >> 40U) & 0xffffffULL) / static_cast<float>(0xffffffU)});
         }
         node.representativeCount =
             static_cast<std::uint32_t>(hierarchy->representatives.size()) - node.firstRepresentative;
@@ -644,10 +1314,10 @@ std::uint32_t BuildNode(
     const auto center = BoundsCenter(node.bounds);
     std::array<std::vector<std::uint32_t>, 8> octants;
     for (const auto pointIndex : pointIndices) {
-        if (pointIndex >= positions.size()) {
+        if (pointIndex >= cloud.positions.size()) {
             continue;
         }
-        const auto& point = positions[pointIndex];
+        const auto& point = cloud.positions[pointIndex];
         std::uint32_t octant = 0;
         if (point.x >= center.x) {
             octant |= 1U;
@@ -671,14 +1341,15 @@ std::uint32_t BuildNode(
         auto leafConfig = config;
         leafConfig.maxDepth = depth;
         hierarchy->nodes.pop_back();
-        return BuildNode(positions, pointIndices, depth, leafConfig, hierarchy, progressTracker);
+        ResizeNodeScalarStats(hierarchy);
+        return BuildNode(cloud, pointIndices, depth, leafConfig, hierarchy, progressTracker);
     }
 
     node.firstRepresentative = static_cast<std::uint32_t>(hierarchy->representatives.size());
     auto representatives = MakeInternalRepresentatives(
-        positions,
+        cloud,
         pointIndices,
-        node.bounds,
+        buildStats,
         config.maxInternalRepresentatives);
     hierarchy->representatives.insert(
         hierarchy->representatives.end(),
@@ -694,7 +1365,7 @@ std::uint32_t BuildNode(
         if (octant.empty()) {
             continue;
         }
-        const auto childNodeIndex = BuildNode(positions, octant, depth + 1U, config, hierarchy, progressTracker);
+        const auto childNodeIndex = BuildNode(cloud, octant, depth + 1U, config, hierarchy, progressTracker);
         auto& parentNode = hierarchy->nodes[nodeIndex];
         parentNode.childIndices[parentNode.childCount] = childNodeIndex;
         ++parentNode.childCount;
@@ -1073,8 +1744,13 @@ struct AdaptiveFrontierNode {
     std::uint32_t nodeIndex = 0;
     ProjectedBoundsFootprint footprint{};
     float projectedSpacingPixels = 0.0F;
+    float featureImportance = 0.0F;
     bool violatesTargetSpacing = false;
     bool violatesRepresentativeDiameter = false;
+    bool violatesColorFeature = false;
+    bool violatesScalarFeature = false;
+    bool violatesNormalFeature = false;
+    bool violatesEmissiveFeature = false;
 };
 
 struct FrontierEmissionAllocation {
@@ -1092,6 +1768,10 @@ struct FrontierSplitCandidate {
     std::uint32_t replacementRepresentativeEstimate = 0;
     float score = 0.0F;
     bool keptByHysteresis = false;
+    bool colorFeatureRefinement = false;
+    bool scalarFeatureRefinement = false;
+    bool normalFeatureRefinement = false;
+    bool emissiveFeatureRefinement = false;
 };
 
 struct FrontierSplitCandidateCompare {
@@ -1102,6 +1782,83 @@ struct FrontierSplitCandidateCompare {
         return left.node.nodeIndex > right.node.nodeIndex;
     }
 };
+
+std::uint32_t ActiveScalarFieldSlot(const PointCloudLodTraversalParams& params) {
+    if (params.style.colorMode == PointCloudColorMode::ScalarColormap &&
+        params.style.colormapPosition.mode == invisible_places::style::ParameterSourceMode::FieldMapped &&
+        params.style.colormapPosition.fieldMap.fieldSlot >= 0) {
+        return static_cast<std::uint32_t>(params.style.colormapPosition.fieldMap.fieldSlot);
+    }
+    return kPointCloudLodInvalidScalarFieldSlot;
+}
+
+std::uint32_t ActiveEmissiveFieldSlot(const PointCloudLodTraversalParams& params) {
+    if (params.style.emissiveStrength.mode == invisible_places::style::ParameterSourceMode::FieldMapped &&
+        params.style.emissiveStrength.fieldMap.fieldSlot >= 0) {
+        return static_cast<std::uint32_t>(params.style.emissiveStrength.fieldMap.fieldSlot);
+    }
+    return kPointCloudLodInvalidScalarFieldSlot;
+}
+
+float NodePixelsPerMeter(
+    const PointCloudLodNode& node,
+    const PointCloudLodTraversalParams& params) {
+    const auto center = BoundsCenter(node.bounds);
+    const glm::vec3 centerVec{center.x, center.y, center.z};
+    const float depth = std::max(0.01F, glm::length(centerVec - params.cameraPosition));
+    return (static_cast<float>(std::max<std::uint32_t>(1U, params.viewportHeight)) *
+            std::abs(params.viewProjection[1][1])) /
+           (2.0F * depth);
+}
+
+bool TraversalUsesFastPreview(const PointCloudLodTraversalParams& params) {
+    return params.densityMode == invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview;
+}
+
+float FeatureAreaThresholdPixels(const PointCloudLodTraversalParams& params) {
+    return TraversalUsesFastPreview(params) ? 24.0F : 12.0F;
+}
+
+bool NodeScalarFeatureVisible(
+    const PointCloudLodHierarchy& hierarchy,
+    const PointCloudLodNode& node,
+    std::uint32_t nodeIndex,
+    const PointCloudLodTraversalParams& params) {
+    const std::uint32_t activeSlot = ActiveScalarFieldSlot(params);
+    if (activeSlot != kPointCloudLodInvalidScalarFieldSlot) {
+        const auto* nodeStats = NodeScalarStatsFor(hierarchy, nodeIndex, activeSlot);
+        const auto* globalStats = GlobalScalarStatsFor(hierarchy, activeSlot);
+        if (nodeStats == nullptr || nodeStats->count == 0U) {
+            return false;
+        }
+        const float normalizedRange = ScalarRangeNormalized(*nodeStats, globalStats);
+        const bool crossesMidpoint =
+            globalStats != nullptr &&
+            globalStats->maximum > globalStats->minimum &&
+            nodeStats->minimum <= 0.5F * (globalStats->minimum + globalStats->maximum) &&
+            nodeStats->maximum >= 0.5F * (globalStats->minimum + globalStats->maximum);
+        return normalizedRange > (TraversalUsesFastPreview(params) ? 0.14F : 0.08F) || crossesMidpoint;
+    }
+    return node.scalarRangeHint > (TraversalUsesFastPreview(params) ? 0.18F : 0.10F) ||
+           node.scalarVarianceHint > (TraversalUsesFastPreview(params) ? 0.08F : 0.04F);
+}
+
+bool NodeEmissiveFeatureVisible(
+    const PointCloudLodHierarchy& hierarchy,
+    const PointCloudLodNode& node,
+    std::uint32_t nodeIndex,
+    const PointCloudLodTraversalParams& params) {
+    const std::uint32_t emissiveSlot = ActiveEmissiveFieldSlot(params);
+    if (emissiveSlot != kPointCloudLodInvalidScalarFieldSlot) {
+        const auto* nodeStats = NodeScalarStatsFor(hierarchy, nodeIndex, emissiveSlot);
+        const auto* globalStats = GlobalScalarStatsFor(hierarchy, emissiveSlot);
+        if (nodeStats == nullptr || nodeStats->count == 0U) {
+            return false;
+        }
+        return ScalarValueNormalized(nodeStats->maximum, globalStats) > 0.65F;
+    }
+    return node.emissiveImportanceHint > 0.55F;
+}
 
 bool MakeAdaptiveFrontierNode(
     const PointCloudLodHierarchy& hierarchy,
@@ -1127,14 +1884,38 @@ bool MakeAdaptiveFrontierNode(
     }
 
     const float representedCount = static_cast<float>(std::max<std::uint32_t>(1U, node.representedSourceCount));
-    const float projectedSpacing = std::sqrt(std::max(1.0F, footprint.areaPixels) / representedCount);
+    const float projectedAreaSpacing = std::sqrt(std::max(1.0F, footprint.areaPixels) / representedCount);
+    const float projectedStoredSpacing = node.spacingMeters * NodePixelsPerMeter(node, params);
+    const float projectedSpacing = std::max(projectedAreaSpacing, projectedStoredSpacing);
+    const bool featureAreaVisible = footprint.areaPixels >= FeatureAreaThresholdPixels(params);
+    const bool colorFeatureVisible =
+        featureAreaVisible &&
+        (node.colorContrast > (TraversalUsesFastPreview(params) ? 0.26F : 0.18F) ||
+         node.colorVariance > (TraversalUsesFastPreview(params) ? 0.035F : 0.018F));
+    const bool scalarFeatureVisible =
+        featureAreaVisible && NodeScalarFeatureVisible(hierarchy, node, nodeIndex, params);
+    const bool normalFeatureVisible =
+        featureAreaVisible &&
+        node.normalVariance > (TraversalUsesFastPreview(params) ? 0.22F : 0.12F);
+    const bool emissiveFeatureVisible =
+        footprint.areaPixels >= 4.0F && NodeEmissiveFeatureVisible(hierarchy, node, nodeIndex, params);
+    const float featureImportance =
+        (colorFeatureVisible ? std::max(node.colorContrast, node.colorVariance * 8.0F) : 0.0F) +
+        (scalarFeatureVisible ? std::max(node.scalarRangeHint, node.scalarVarianceHint * 2.0F) : 0.0F) +
+        (normalFeatureVisible ? node.normalVariance : 0.0F) +
+        (emissiveFeatureVisible ? std::max(0.5F, node.emissiveImportanceHint) : 0.0F);
     *frontierNode = {
         .nodeIndex = nodeIndex,
         .footprint = footprint,
         .projectedSpacingPixels = projectedSpacing,
+        .featureImportance = featureImportance,
         .violatesTargetSpacing = targetSpacingPixels > 0.0F && projectedSpacing > targetSpacingPixels,
         .violatesRepresentativeDiameter = maxRepresentativeDiameterPixels > 0.0F &&
                                            footprint.DiameterPixels() > maxRepresentativeDiameterPixels,
+        .violatesColorFeature = colorFeatureVisible,
+        .violatesScalarFeature = scalarFeatureVisible,
+        .violatesNormalFeature = normalFeatureVisible,
+        .violatesEmissiveFeature = emissiveFeatureVisible,
     };
     return true;
 }
@@ -1328,7 +2109,12 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
         const bool activeDiameterViolated =
             maxRepresentativeDiameterPixels > 0.0F &&
             frontier[frontierIndex].footprint.DiameterPixels() > activeDiameterThreshold;
-        if (!activeSpacingViolated && !activeDiameterViolated) {
+        const bool activeFeatureViolated =
+            frontier[frontierIndex].violatesColorFeature ||
+            frontier[frontierIndex].violatesScalarFeature ||
+            frontier[frontierIndex].violatesNormalFeature ||
+            frontier[frontierIndex].violatesEmissiveFeature;
+        if (!activeSpacingViolated && !activeDiameterViolated && !activeFeatureViolated) {
             return;
         }
         frontier[frontierIndex].violatesTargetSpacing = activeSpacingViolated;
@@ -1338,7 +2124,7 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
             wasPreviouslyRefined &&
             !promoteSpacingViolated &&
             !promoteDiameterViolated &&
-            (activeSpacingViolated || activeDiameterViolated);
+            (activeSpacingViolated || activeDiameterViolated || activeFeatureViolated);
 
         auto visibleChildren = MakeVisibleChildFrontierNodes(
             hierarchy,
@@ -1358,6 +2144,7 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
             maxRepresentativeDiameterPixels > 0.0F
                 ? frontier[frontierIndex].footprint.DiameterPixels() / maxRepresentativeDiameterPixels
                 : frontier[frontierIndex].footprint.DiameterPixels();
+        const float featureScore = 1.0F + frontier[frontierIndex].featureImportance;
         splitQueue.push(
             FrontierSplitCandidate{
                 .frontierIndex = frontierIndex,
@@ -1365,8 +2152,12 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
                 .children = std::move(visibleChildren),
                 .oldRepresentativeEstimate = RepresentativeEstimate(hierarchy, nodeIndex),
                 .replacementRepresentativeEstimate = replacementEstimate,
-                .score = std::max(spacingScore, diameterScore),
-                .keptByHysteresis = keptByHysteresis});
+                .score = std::max({spacingScore, diameterScore, featureScore}),
+                .keptByHysteresis = keptByHysteresis,
+                .colorFeatureRefinement = frontier[frontierIndex].violatesColorFeature,
+                .scalarFeatureRefinement = frontier[frontierIndex].violatesScalarFeature,
+                .normalFeatureRefinement = frontier[frontierIndex].violatesNormalFeature,
+                .emissiveFeatureRefinement = frontier[frontierIndex].violatesEmissiveFeature});
     };
 
     enqueueSplitCandidate(0U);
@@ -1397,6 +2188,12 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
         activeFrontierNodes[candidate.frontierIndex] = false;
         if (candidate.keptByHysteresis && diagnostics != nullptr) {
             ++diagnostics->hysteresisKeptNodeCount;
+        }
+        if (diagnostics != nullptr) {
+            diagnostics->colorFeatureRefinedNodeCount += candidate.colorFeatureRefinement ? 1U : 0U;
+            diagnostics->scalarFeatureRefinedNodeCount += candidate.scalarFeatureRefinement ? 1U : 0U;
+            diagnostics->normalFeatureRefinedNodeCount += candidate.normalFeatureRefinement ? 1U : 0U;
+            diagnostics->emissiveFeatureRefinedNodeCount += candidate.emissiveFeatureRefinement ? 1U : 0U;
         }
         activeFrontierNodeCount = nextFrontierNodeCount;
         if (replacementEstimate >= oldEstimate) {
@@ -1433,6 +2230,14 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
             currentFrontier.insert(node.nodeIndex);
             if (!previousFrontier.empty() && !previousFrontier.contains(node.nodeIndex)) {
                 ++diagnostics->promotedNodeCount;
+            } else if (!previousFrontier.empty() &&
+                       (node.violatesTargetSpacing ||
+                        node.violatesRepresentativeDiameter ||
+                        node.violatesColorFeature ||
+                        node.violatesScalarFeature ||
+                        node.violatesNormalFeature ||
+                        node.violatesEmissiveFeature)) {
+                ++diagnostics->hysteresisKeptNodeCount;
             }
         }
         for (const auto previousNodeIndex : previousFrontier) {
@@ -1459,7 +2264,8 @@ void EmitRepresentatives(
     std::uint32_t nodeRepresentativeLimit,
     TraversalBudgetState* budget,
     std::vector<PointCloudDrawItemGpu>* drawItems,
-    const std::stop_token& stopToken = {}) {
+    const std::stop_token& stopToken = {},
+    PointCloudLodTraversalDiagnostics* diagnostics = nullptr) {
     if (drawItems == nullptr || budget == nullptr) {
         return;
     }
@@ -1530,6 +2336,7 @@ void EmitRepresentatives(
              .opacityCompensation = compensation.opacity,
              .emissionCompensation = compensation.emission,
              .renderAreaPixels = footprint.renderAreaPixels});
+        AccumulateRepresentativeClassCounts(diagnostics, representative.representativeClassFlags);
         budget->emittedEstimatedFragments += footprint.coverageAreaPixels;
         return true;
     };
@@ -1648,7 +2455,8 @@ void AllocateAdaptiveFrontierRepresentatives(
             {.node = frontierNode,
              .availableRepresentatives = available,
              .allocatedRepresentatives = 0U,
-             .weight = std::max(1.0F, frontierNode.footprint.areaPixels)});
+             .weight = std::max(1.0F, frontierNode.footprint.areaPixels) *
+                       (1.0F + std::min(3.0F, frontierNode.featureImportance))});
     }
     if (allocations->empty()) {
         return;
@@ -1755,6 +2563,9 @@ PointCloudLodCacheHeader MakeCacheHeader(
     header.maxInternalRepresentatives = config.maxInternalRepresentatives;
     header.nodeCount = hierarchy.nodes.size();
     header.representativeCount = hierarchy.representatives.size();
+    header.scalarFieldCount = hierarchy.scalarFieldCount;
+    header.scalarFieldStatsCount = hierarchy.scalarFieldStats.size();
+    header.nodeScalarStatsCount = hierarchy.nodeScalarStats.size();
     return header;
 }
 
@@ -1800,6 +2611,16 @@ bool HeaderMatchesSource(
         header.maxInternalRepresentatives != config.maxInternalRepresentatives) {
         return reject("LOD cache build config mismatch");
     }
+    if (header.scalarFieldStatsCount != header.scalarFieldCount) {
+        return reject("LOD cache scalar stats mismatch");
+    }
+    if (header.scalarFieldCount > 0U &&
+        header.nodeCount > std::numeric_limits<std::uint64_t>::max() / header.scalarFieldCount) {
+        return reject("LOD cache scalar stats overflow");
+    }
+    if (header.nodeScalarStatsCount != header.nodeCount * header.scalarFieldCount) {
+        return reject("LOD cache node scalar stats mismatch");
+    }
     return true;
 }
 
@@ -1815,6 +2636,17 @@ PointCloudLodHierarchy BuildPointCloudLodHierarchy(
     if (hierarchy.sourcePointCount == 0) {
         return hierarchy;
     }
+    hierarchy.scalarFieldCount = static_cast<std::uint32_t>(
+        std::min<std::size_t>(cloud.ScalarFieldCount(), std::numeric_limits<std::uint32_t>::max()));
+    hierarchy.scalarFieldStats.resize(hierarchy.scalarFieldCount);
+    for (std::uint32_t fieldSlot = 0; fieldSlot < hierarchy.scalarFieldCount; ++fieldSlot) {
+        if (fieldSlot < cloud.scalarFields.size() && cloud.scalarFields[fieldSlot].valid) {
+            hierarchy.scalarFieldStats[fieldSlot].minimum = cloud.scalarFields[fieldSlot].minimum;
+            hierarchy.scalarFieldStats[fieldSlot].maximum = cloud.scalarFields[fieldSlot].maximum;
+            hierarchy.scalarFieldStats[fieldSlot].count = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(cloud.scalarFields[fieldSlot].count, std::numeric_limits<std::uint32_t>::max()));
+        }
+    }
 
     PointCloudLodBuildProgressTracker progressTracker{
         hierarchy.sourcePointCount,
@@ -1824,7 +2656,15 @@ PointCloudLodHierarchy BuildPointCloudLodHierarchy(
 
     std::vector<std::uint32_t> pointIndices(hierarchy.sourcePointCount);
     std::iota(pointIndices.begin(), pointIndices.end(), 0U);
-    BuildNode(cloud.positions, pointIndices, 0U, config, &hierarchy, &progressTracker);
+    BuildNode(cloud, pointIndices, 0U, config, &hierarchy, &progressTracker);
+    if (!hierarchy.nodeScalarStats.empty() && hierarchy.scalarFieldCount > 0U) {
+        for (std::uint32_t fieldSlot = 0; fieldSlot < hierarchy.scalarFieldCount; ++fieldSlot) {
+            const auto statsIndex = NodeScalarStatsIndex(hierarchy, 0U, fieldSlot);
+            if (statsIndex < hierarchy.nodeScalarStats.size()) {
+                hierarchy.scalarFieldStats[fieldSlot] = hierarchy.nodeScalarStats[statsIndex];
+            }
+        }
+    }
     progressTracker.Finish();
     return hierarchy;
 }
@@ -1932,7 +2772,8 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
             allocation.allocatedRepresentatives,
             &emitBudget,
             &drawItems,
-            stopToken);
+            stopToken,
+            diagnostics);
     }
     if (diagnostics != nullptr) {
         diagnostics->emittedRepresentativeCount = static_cast<std::uint32_t>(
@@ -2084,7 +2925,7 @@ std::filesystem::path BuildPointCloudLodCachePath(
     std::ostringstream hashText;
     hashText << std::hex << std::setfill('0') << std::setw(16) << HashPointCloudLodCachePath(sourcePath);
     const auto stem = sourcePath.stem().empty() ? std::string{"PointCloud"} : sourcePath.stem().string();
-    return cacheDirectory / (stem + "-" + hashText.str() + "-PointCloudLodCache-v3.bin");
+    return cacheDirectory / (stem + "-" + hashText.str() + "-PointCloudLodCache-v4.bin");
 }
 
 PointCloudLodCacheLoadResult LoadPointCloudLodHierarchyCache(
@@ -2108,15 +2949,20 @@ PointCloudLodCacheLoadResult LoadPointCloudLodHierarchyCache(
     }
 
     if (header.nodeCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
-        header.representativeCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        header.representativeCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+        header.scalarFieldStatsCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+        header.nodeScalarStatsCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         result.stale = true;
         result.message = "LOD cache payload is too large";
         return result;
     }
 
     result.hierarchy.sourcePointCount = header.pointCount;
+    result.hierarchy.scalarFieldCount = header.scalarFieldCount;
     result.hierarchy.nodes.resize(static_cast<std::size_t>(header.nodeCount));
     result.hierarchy.representatives.resize(static_cast<std::size_t>(header.representativeCount));
+    result.hierarchy.scalarFieldStats.resize(static_cast<std::size_t>(header.scalarFieldStatsCount));
+    result.hierarchy.nodeScalarStats.resize(static_cast<std::size_t>(header.nodeScalarStatsCount));
     if (!result.hierarchy.nodes.empty()) {
         input.read(
             reinterpret_cast<char*>(result.hierarchy.nodes.data()),
@@ -2127,6 +2973,18 @@ PointCloudLodCacheLoadResult LoadPointCloudLodHierarchyCache(
             reinterpret_cast<char*>(result.hierarchy.representatives.data()),
             static_cast<std::streamsize>(
                 result.hierarchy.representatives.size() * sizeof(PointCloudLodRepresentative)));
+    }
+    if (!result.hierarchy.scalarFieldStats.empty()) {
+        input.read(
+            reinterpret_cast<char*>(result.hierarchy.scalarFieldStats.data()),
+            static_cast<std::streamsize>(
+                result.hierarchy.scalarFieldStats.size() * sizeof(PointCloudLodScalarStats)));
+    }
+    if (!result.hierarchy.nodeScalarStats.empty()) {
+        input.read(
+            reinterpret_cast<char*>(result.hierarchy.nodeScalarStats.data()),
+            static_cast<std::streamsize>(
+                result.hierarchy.nodeScalarStats.size() * sizeof(PointCloudLodScalarStats)));
     }
     if (!input) {
         result.hierarchy = {};
@@ -2180,6 +3038,18 @@ bool SavePointCloudLodHierarchyCache(
                 reinterpret_cast<const char*>(hierarchy.representatives.data()),
                 static_cast<std::streamsize>(
                     hierarchy.representatives.size() * sizeof(PointCloudLodRepresentative)));
+        }
+        if (!hierarchy.scalarFieldStats.empty()) {
+            output.write(
+                reinterpret_cast<const char*>(hierarchy.scalarFieldStats.data()),
+                static_cast<std::streamsize>(
+                    hierarchy.scalarFieldStats.size() * sizeof(PointCloudLodScalarStats)));
+        }
+        if (!hierarchy.nodeScalarStats.empty()) {
+            output.write(
+                reinterpret_cast<const char*>(hierarchy.nodeScalarStats.data()),
+                static_cast<std::streamsize>(
+                    hierarchy.nodeScalarStats.size() * sizeof(PointCloudLodScalarStats)));
         }
         if (!output) {
             return fail("Could not write LOD cache payload.");

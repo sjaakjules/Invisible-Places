@@ -17,11 +17,38 @@
 
 namespace invisible_places::renderer::pointcloud {
 
+inline constexpr std::uint32_t kPointCloudLodRepresentativeClassCount = 8U;
+inline constexpr std::uint32_t kPointCloudLodInvalidScalarFieldSlot = 0xffffffffU;
+
+enum PointCloudLodRepresentativeClass : std::uint32_t {
+    PointCloudLodRepresentativeClassSpatialCoverage = 1U << 0U,
+    PointCloudLodRepresentativeClassColorContrast = 1U << 1U,
+    PointCloudLodRepresentativeClassNormalEdge = 1U << 2U,
+    PointCloudLodRepresentativeClassScalarMin = 1U << 3U,
+    PointCloudLodRepresentativeClassScalarMax = 1U << 4U,
+    PointCloudLodRepresentativeClassScalarThreshold = 1U << 5U,
+    PointCloudLodRepresentativeClassEmissiveAccent = 1U << 6U,
+    PointCloudLodRepresentativeClassBlueNoiseFill = 1U << 7U,
+};
+
+struct PointCloudLodScalarStats {
+    float minimum = 0.0F;
+    float maximum = 0.0F;
+    float mean = 0.0F;
+    float variance = 0.0F;
+    std::uint32_t count = 0;
+    std::uint32_t flags = 0;
+};
+
 struct PointCloudLodRepresentative {
     std::uint32_t sourcePointIndex = 0;
     std::uint32_t representedSourceCount = 0;
+    std::uint32_t representativeClassFlags = PointCloudLodRepresentativeClassSpatialCoverage;
+    std::uint32_t scalarFieldSlot = kPointCloudLodInvalidScalarFieldSlot;
     invisible_places::io::Float3 position{};
     float sourceSpacingMeters = 0.0F;
+    float importance = 0.0F;
+    float lodRank = 0.0F;
 };
 
 struct PointCloudLodNode {
@@ -32,6 +59,16 @@ struct PointCloudLodNode {
     std::uint32_t representativeCount = 0;
     std::uint32_t representedSourceCount = 0;
     std::uint32_t depth = 0;
+    float spacingMeters = 0.0F;
+    float densityPointsPerM3 = 0.0F;
+    float colorVariance = 0.0F;
+    float colorContrast = 0.0F;
+    float normalVariance = 0.0F;
+    float scalarVarianceHint = 0.0F;
+    float scalarRangeHint = 0.0F;
+    float emissiveImportanceHint = 0.0F;
+    std::uint32_t featureFlags = 0;
+    std::uint32_t reserved0 = 0;
 
     [[nodiscard]] bool IsLeaf() const { return childCount == 0; }
 };
@@ -50,7 +87,10 @@ struct alignas(16) PointCloudDrawItemGpu {
 struct PointCloudLodHierarchy {
     std::vector<PointCloudLodNode> nodes;
     std::vector<PointCloudLodRepresentative> representatives;
+    std::vector<PointCloudLodScalarStats> scalarFieldStats;
+    std::vector<PointCloudLodScalarStats> nodeScalarStats;
     std::uint32_t sourcePointCount = 0;
+    std::uint32_t scalarFieldCount = 0;
 
     [[nodiscard]] bool Empty() const { return nodes.empty() || sourcePointCount == 0; }
 };
@@ -106,6 +146,11 @@ struct PointCloudLodTraversalDiagnostics {
     std::uint32_t emittedRepresentativeCount = 0;
     std::uint64_t emittedRepresentedSourceCount = 0;
     std::uint64_t culledRepresentedSourceCount = 0;
+    std::array<std::uint32_t, kPointCloudLodRepresentativeClassCount> emittedClassCounts{};
+    std::uint32_t colorFeatureRefinedNodeCount = 0;
+    std::uint32_t scalarFeatureRefinedNodeCount = 0;
+    std::uint32_t normalFeatureRefinedNodeCount = 0;
+    std::uint32_t emissiveFeatureRefinedNodeCount = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
 };

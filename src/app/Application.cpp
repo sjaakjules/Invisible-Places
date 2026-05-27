@@ -465,6 +465,12 @@ struct AdaptiveLodCacheState {
     std::uint32_t promotedNodeCount = 0;
     std::uint32_t demotedNodeCount = 0;
     std::uint32_t hysteresisKeptNodeCount = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        emittedClassCounts{};
+    std::uint32_t colorFeatureRefinedNodeCount = 0;
+    std::uint32_t scalarFeatureRefinedNodeCount = 0;
+    std::uint32_t normalFeatureRefinedNodeCount = 0;
+    std::uint32_t emissiveFeatureRefinedNodeCount = 0;
     float hysteresisPromoteScale = 1.0F;
     float hysteresisDemoteScale = 1.0F;
     float estimatedFragments = 0.0F;
@@ -493,6 +499,12 @@ struct AdaptiveLodBuildResult {
     std::uint32_t promotedNodeCount = 0;
     std::uint32_t demotedNodeCount = 0;
     std::uint32_t hysteresisKeptNodeCount = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        emittedClassCounts{};
+    std::uint32_t colorFeatureRefinedNodeCount = 0;
+    std::uint32_t scalarFeatureRefinedNodeCount = 0;
+    std::uint32_t normalFeatureRefinedNodeCount = 0;
+    std::uint32_t emissiveFeatureRefinedNodeCount = 0;
     float hysteresisPromoteScale = 1.0F;
     float hysteresisDemoteScale = 1.0F;
     std::uint32_t activeTransitionCount = 0;
@@ -633,6 +645,12 @@ struct PreviewLayerSession {
     std::uint32_t adaptiveLodPromotedNodeCount = 0;
     std::uint32_t adaptiveLodDemotedNodeCount = 0;
     std::uint32_t adaptiveLodHysteresisKeptNodeCount = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        adaptiveLodEmittedClassCounts{};
+    std::uint32_t adaptiveLodColorFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveLodScalarFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveLodNormalFeatureRefinedNodeCount = 0;
+    std::uint32_t adaptiveLodEmissiveFeatureRefinedNodeCount = 0;
     float adaptiveLodHysteresisPromoteScale = 1.0F;
     float adaptiveLodHysteresisDemoteScale = 1.0F;
     bool adaptiveLodTransitionActive = false;
@@ -3322,6 +3340,11 @@ void ApplyAdaptiveLodCacheMetadata(
     session->adaptiveLodPromotedNodeCount = entry.promotedNodeCount;
     session->adaptiveLodDemotedNodeCount = entry.demotedNodeCount;
     session->adaptiveLodHysteresisKeptNodeCount = entry.hysteresisKeptNodeCount;
+    session->adaptiveLodEmittedClassCounts = entry.emittedClassCounts;
+    session->adaptiveLodColorFeatureRefinedNodeCount = entry.colorFeatureRefinedNodeCount;
+    session->adaptiveLodScalarFeatureRefinedNodeCount = entry.scalarFeatureRefinedNodeCount;
+    session->adaptiveLodNormalFeatureRefinedNodeCount = entry.normalFeatureRefinedNodeCount;
+    session->adaptiveLodEmissiveFeatureRefinedNodeCount = entry.emissiveFeatureRefinedNodeCount;
     session->adaptiveLodHysteresisPromoteScale = entry.hysteresisPromoteScale;
     session->adaptiveLodHysteresisDemoteScale = entry.hysteresisDemoteScale;
     session->adaptiveLodRepresentativeBudgetReached = entry.representativeBudgetReached;
@@ -3381,6 +3404,11 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     entry.promotedNodeCount = diagnostics.promotedNodeCount;
     entry.demotedNodeCount = diagnostics.demotedNodeCount;
     entry.hysteresisKeptNodeCount = diagnostics.hysteresisKeptNodeCount;
+    entry.emittedClassCounts = diagnostics.emittedClassCounts;
+    entry.colorFeatureRefinedNodeCount = diagnostics.colorFeatureRefinedNodeCount;
+    entry.scalarFeatureRefinedNodeCount = diagnostics.scalarFeatureRefinedNodeCount;
+    entry.normalFeatureRefinedNodeCount = diagnostics.normalFeatureRefinedNodeCount;
+    entry.emissiveFeatureRefinedNodeCount = diagnostics.emissiveFeatureRefinedNodeCount;
     entry.hysteresisPromoteScale = diagnostics.hysteresisPromoteScale;
     entry.hysteresisDemoteScale = diagnostics.hysteresisDemoteScale;
     entry.representativeBudgetReached = diagnostics.representativeBudgetReached;
@@ -3622,6 +3650,11 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .promotedNodeCount = target.promotedNodeCount,
         .demotedNodeCount = target.demotedNodeCount,
         .hysteresisKeptNodeCount = target.hysteresisKeptNodeCount,
+        .emittedClassCounts = target.emittedClassCounts,
+        .colorFeatureRefinedNodeCount = target.colorFeatureRefinedNodeCount,
+        .scalarFeatureRefinedNodeCount = target.scalarFeatureRefinedNodeCount,
+        .normalFeatureRefinedNodeCount = target.normalFeatureRefinedNodeCount,
+        .emissiveFeatureRefinedNodeCount = target.emissiveFeatureRefinedNodeCount,
         .hysteresisPromoteScale = target.hysteresisPromoteScale,
         .hysteresisDemoteScale = target.hysteresisDemoteScale,
         .activeTransitionCount = 1U,
@@ -3931,6 +3964,11 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .promotedNodeCount = entry.promotedNodeCount,
             .demotedNodeCount = entry.demotedNodeCount,
             .hysteresisKeptNodeCount = entry.hysteresisKeptNodeCount,
+            .emittedClassCounts = entry.emittedClassCounts,
+            .colorFeatureRefinedNodeCount = entry.colorFeatureRefinedNodeCount,
+            .scalarFeatureRefinedNodeCount = entry.scalarFeatureRefinedNodeCount,
+            .normalFeatureRefinedNodeCount = entry.normalFeatureRefinedNodeCount,
+            .emissiveFeatureRefinedNodeCount = entry.emissiveFeatureRefinedNodeCount,
             .hysteresisPromoteScale = entry.hysteresisPromoteScale,
             .hysteresisDemoteScale = entry.hysteresisDemoteScale,
             .activeTransitionCount = session->adaptiveLodTransitionActive ? 1U : 0U,
@@ -4234,6 +4272,11 @@ void RememberDisplayedAdaptiveLodEntry(
     displayed.promotedNodeCount = result.promotedNodeCount;
     displayed.demotedNodeCount = result.demotedNodeCount;
     displayed.hysteresisKeptNodeCount = result.hysteresisKeptNodeCount;
+    displayed.emittedClassCounts = result.emittedClassCounts;
+    displayed.colorFeatureRefinedNodeCount = result.colorFeatureRefinedNodeCount;
+    displayed.scalarFeatureRefinedNodeCount = result.scalarFeatureRefinedNodeCount;
+    displayed.normalFeatureRefinedNodeCount = result.normalFeatureRefinedNodeCount;
+    displayed.emissiveFeatureRefinedNodeCount = result.emissiveFeatureRefinedNodeCount;
     displayed.hysteresisPromoteScale = result.hysteresisPromoteScale;
     displayed.hysteresisDemoteScale = result.hysteresisDemoteScale;
     displayed.estimatedFragments = result.estimatedFragments;
@@ -4291,6 +4334,11 @@ bool PopulateAdaptivePointCloudLayer(
         layer->adaptivePromotedNodeCount = result.promotedNodeCount;
         layer->adaptiveDemotedNodeCount = result.demotedNodeCount;
         layer->adaptiveHysteresisKeptNodeCount = result.hysteresisKeptNodeCount;
+        layer->adaptiveEmittedClassCounts = result.emittedClassCounts;
+        layer->adaptiveColorFeatureRefinedNodeCount = result.colorFeatureRefinedNodeCount;
+        layer->adaptiveScalarFeatureRefinedNodeCount = result.scalarFeatureRefinedNodeCount;
+        layer->adaptiveNormalFeatureRefinedNodeCount = result.normalFeatureRefinedNodeCount;
+        layer->adaptiveEmissiveFeatureRefinedNodeCount = result.emissiveFeatureRefinedNodeCount;
         layer->adaptiveHysteresisPromoteScale = result.hysteresisPromoteScale;
         layer->adaptiveHysteresisDemoteScale = result.hysteresisDemoteScale;
         layer->adaptiveActiveTransitionCount = result.activeTransitionCount;
@@ -4334,6 +4382,11 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptivePromotedNodeCount = result.promotedNodeCount;
     layer->adaptiveDemotedNodeCount = result.demotedNodeCount;
     layer->adaptiveHysteresisKeptNodeCount = result.hysteresisKeptNodeCount;
+    layer->adaptiveEmittedClassCounts = result.emittedClassCounts;
+    layer->adaptiveColorFeatureRefinedNodeCount = result.colorFeatureRefinedNodeCount;
+    layer->adaptiveScalarFeatureRefinedNodeCount = result.scalarFeatureRefinedNodeCount;
+    layer->adaptiveNormalFeatureRefinedNodeCount = result.normalFeatureRefinedNodeCount;
+    layer->adaptiveEmissiveFeatureRefinedNodeCount = result.emissiveFeatureRefinedNodeCount;
     layer->adaptiveHysteresisPromoteScale = result.hysteresisPromoteScale;
     layer->adaptiveHysteresisDemoteScale = result.hysteresisDemoteScale;
     layer->adaptiveActiveTransitionCount = result.activeTransitionCount;
@@ -4438,6 +4491,11 @@ void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
     session->adaptiveLodPromotedNodeCount = 0;
     session->adaptiveLodDemotedNodeCount = 0;
     session->adaptiveLodHysteresisKeptNodeCount = 0;
+    session->adaptiveLodEmittedClassCounts = {};
+    session->adaptiveLodColorFeatureRefinedNodeCount = 0;
+    session->adaptiveLodScalarFeatureRefinedNodeCount = 0;
+    session->adaptiveLodNormalFeatureRefinedNodeCount = 0;
+    session->adaptiveLodEmissiveFeatureRefinedNodeCount = 0;
     session->adaptiveLodHysteresisPromoteScale = 1.0F;
     session->adaptiveLodHysteresisDemoteScale = 1.0F;
     session->adaptiveLodTransitionActive = false;
@@ -13537,6 +13595,21 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             FormatPointCount(session.adaptiveLodDemotedNodeCount).c_str(),
             FormatPointCount(session.adaptiveLodHysteresisKeptNodeCount).c_str());
         ImGui::Text(
+            "Feature reps: spatial %s | colour %s | normal %s | scalar min/max/thresh %s/%s/%s | accent %s",
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[0]).c_str(),
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[1]).c_str(),
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[2]).c_str(),
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[3]).c_str(),
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[4]).c_str(),
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[5]).c_str(),
+            FormatPointCount(session.adaptiveLodEmittedClassCounts[6]).c_str());
+        ImGui::Text(
+            "Feature refinements: colour %s | scalar %s | normal %s | accent %s",
+            FormatPointCount(session.adaptiveLodColorFeatureRefinedNodeCount).c_str(),
+            FormatPointCount(session.adaptiveLodScalarFeatureRefinedNodeCount).c_str(),
+            FormatPointCount(session.adaptiveLodNormalFeatureRefinedNodeCount).c_str(),
+            FormatPointCount(session.adaptiveLodEmissiveFeatureRefinedNodeCount).c_str());
+        ImGui::Text(
             "Hysteresis band: promote %.2fx | demote %.2fx",
             session.adaptiveLodHysteresisPromoteScale,
             session.adaptiveLodHysteresisDemoteScale);
@@ -19741,6 +19814,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint64_t fastBasicMaxVisibleRepresentedSource = 0;
     std::uint64_t fastBasicMaxEmittedRepresentedSource = 0;
     std::uint64_t fastBasicMaxCulledRepresentedSource = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        fastBasicMaxEmittedClassCounts{};
+    std::uint32_t fastBasicMaxColorFeatureRefinements = 0;
+    std::uint32_t fastBasicMaxScalarFeatureRefinements = 0;
+    std::uint32_t fastBasicMaxNormalFeatureRefinements = 0;
+    std::uint32_t fastBasicMaxEmissiveFeatureRefinements = 0;
     double fastBasicMaxEstimatedFragments = 0.0;
     double fastBasicMaxFragmentBudget = 0.0;
     std::uint32_t fastBasicMaxRepresentativeBudget = 0;
@@ -19840,7 +19919,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 frameUsedCurrentAdaptiveSet ||
                 (!layer.adaptiveLodReusedPrevious ||
                  layer.adaptiveLodFallbackState == "coarse fallback" ||
-                 layer.adaptiveLodFallbackState == "exact traversal");
+                 layer.adaptiveLodFallbackState == "exact traversal" ||
+                 layer.adaptiveLodFallbackState == "transition" ||
+                 layer.adaptiveLodFallbackState == "idle refinement transition");
         }
         if (frame < kFastBasicZoomOutStartFrame && frameAdaptiveRevision != 0ULL) {
             fastBasicPreZoomOutRevision = frameAdaptiveRevision;
@@ -19884,6 +19965,23 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxCulledRepresentedSource = std::max(
             fastBasicMaxCulledRepresentedSource,
             diagnostics.adaptiveCulledRepresentedSourceCount);
+        for (std::size_t classIndex = 0; classIndex < fastBasicMaxEmittedClassCounts.size(); ++classIndex) {
+            fastBasicMaxEmittedClassCounts[classIndex] = std::max(
+                fastBasicMaxEmittedClassCounts[classIndex],
+                diagnostics.adaptiveEmittedClassCounts[classIndex]);
+        }
+        fastBasicMaxColorFeatureRefinements = std::max(
+            fastBasicMaxColorFeatureRefinements,
+            diagnostics.adaptiveColorFeatureRefinedNodeCount);
+        fastBasicMaxScalarFeatureRefinements = std::max(
+            fastBasicMaxScalarFeatureRefinements,
+            diagnostics.adaptiveScalarFeatureRefinedNodeCount);
+        fastBasicMaxNormalFeatureRefinements = std::max(
+            fastBasicMaxNormalFeatureRefinements,
+            diagnostics.adaptiveNormalFeatureRefinedNodeCount);
+        fastBasicMaxEmissiveFeatureRefinements = std::max(
+            fastBasicMaxEmissiveFeatureRefinements,
+            diagnostics.adaptiveEmissiveFeatureRefinedNodeCount);
         fastBasicMaxEstimatedFragments = std::max(
             fastBasicMaxEstimatedFragments,
             diagnostics.adaptiveEstimatedFragments);
@@ -19985,6 +20083,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     if (fastBasicMinFps == std::numeric_limits<double>::max()) {
         fastBasicMinFps = 0.0;
     }
+    runtimeState.sessions.front().adaptiveLodTransitionActive = false;
+    runtimeState.sessions.front().adaptiveLodIdleRefinementPending = false;
+    runtimeState.sessions.front().adaptiveLodTransitionDrawItems.reset();
 
     ++runtimeState.previewFrameCounter;
     runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyFullSource;
@@ -20048,9 +20149,22 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
 
     std::uint64_t representatives = 0;
     std::uint64_t representedSource = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        adaptiveClassCounts{};
+    std::uint32_t adaptiveColorFeatureRefinements = 0;
+    std::uint32_t adaptiveScalarFeatureRefinements = 0;
+    std::uint32_t adaptiveNormalFeatureRefinements = 0;
+    std::uint32_t adaptiveEmissiveFeatureRefinements = 0;
     for (const auto& layer : adaptiveState.pointCloudLayers) {
         representatives += layer.drawPointCount;
         representedSource += layer.adaptiveRepresentedSourceCount;
+        for (std::size_t classIndex = 0; classIndex < adaptiveClassCounts.size(); ++classIndex) {
+            adaptiveClassCounts[classIndex] += layer.adaptiveEmittedClassCounts[classIndex];
+        }
+        adaptiveColorFeatureRefinements += layer.adaptiveColorFeatureRefinedNodeCount;
+        adaptiveScalarFeatureRefinements += layer.adaptiveScalarFeatureRefinedNodeCount;
+        adaptiveNormalFeatureRefinements += layer.adaptiveNormalFeatureRefinedNodeCount;
+        adaptiveEmissiveFeatureRefinements += layer.adaptiveEmissiveFeatureRefinedNodeCount;
     }
 
     const auto fastBasicTracePath = outputDirectory / "fast_basic_transition_trace.csv";
@@ -20104,6 +20218,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0) << ",\n"
                 << "  \"adaptive_representatives\": " << representatives << ",\n"
                 << "  \"adaptive_represented_source\": " << representedSource << ",\n"
+                << "  \"adaptive_class_spatial\": " << adaptiveClassCounts[0] << ",\n"
+                << "  \"adaptive_class_colour_contrast\": " << adaptiveClassCounts[1] << ",\n"
+                << "  \"adaptive_class_normal_edge\": " << adaptiveClassCounts[2] << ",\n"
+                << "  \"adaptive_class_scalar_min\": " << adaptiveClassCounts[3] << ",\n"
+                << "  \"adaptive_class_scalar_max\": " << adaptiveClassCounts[4] << ",\n"
+                << "  \"adaptive_class_scalar_threshold\": " << adaptiveClassCounts[5] << ",\n"
+                << "  \"adaptive_class_emissive_accent\": " << adaptiveClassCounts[6] << ",\n"
+                << "  \"adaptive_class_blue_noise_fill\": " << adaptiveClassCounts[7] << ",\n"
+                << "  \"adaptive_color_feature_refinements\": " << adaptiveColorFeatureRefinements << ",\n"
+                << "  \"adaptive_scalar_feature_refinements\": " << adaptiveScalarFeatureRefinements << ",\n"
+                << "  \"adaptive_normal_feature_refinements\": " << adaptiveNormalFeatureRefinements << ",\n"
+                << "  \"adaptive_emissive_feature_refinements\": " << adaptiveEmissiveFeatureRefinements << ",\n"
                 << "  \"adaptive_density\": \"Adaptive High Quality\",\n"
                 << "  \"adaptive_fallback\": false,\n"
                 << "  \"fast_basic_viewport_frames\": " << kFastBasicDiagnosticFrames << ",\n"
@@ -20113,6 +20239,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"fast_basic_max_visible_represented_source\": " << fastBasicMaxVisibleRepresentedSource << ",\n"
                 << "  \"fast_basic_max_emitted_represented_source\": " << fastBasicMaxEmittedRepresentedSource << ",\n"
                 << "  \"fast_basic_max_culled_represented_source\": " << fastBasicMaxCulledRepresentedSource << ",\n"
+                << "  \"fast_basic_class_spatial\": " << fastBasicMaxEmittedClassCounts[0] << ",\n"
+                << "  \"fast_basic_class_colour_contrast\": " << fastBasicMaxEmittedClassCounts[1] << ",\n"
+                << "  \"fast_basic_class_normal_edge\": " << fastBasicMaxEmittedClassCounts[2] << ",\n"
+                << "  \"fast_basic_class_scalar_min\": " << fastBasicMaxEmittedClassCounts[3] << ",\n"
+                << "  \"fast_basic_class_scalar_max\": " << fastBasicMaxEmittedClassCounts[4] << ",\n"
+                << "  \"fast_basic_class_scalar_threshold\": " << fastBasicMaxEmittedClassCounts[5] << ",\n"
+                << "  \"fast_basic_class_emissive_accent\": " << fastBasicMaxEmittedClassCounts[6] << ",\n"
+                << "  \"fast_basic_class_blue_noise_fill\": " << fastBasicMaxEmittedClassCounts[7] << ",\n"
+                << "  \"fast_basic_color_feature_refinements\": " << fastBasicMaxColorFeatureRefinements << ",\n"
+                << "  \"fast_basic_scalar_feature_refinements\": " << fastBasicMaxScalarFeatureRefinements << ",\n"
+                << "  \"fast_basic_normal_feature_refinements\": " << fastBasicMaxNormalFeatureRefinements << ",\n"
+                << "  \"fast_basic_emissive_feature_refinements\": " << fastBasicMaxEmissiveFeatureRefinements << ",\n"
                 << "  \"fast_basic_representative_budget\": " << fastBasicMaxRepresentativeBudget << ",\n"
                 << "  \"fast_basic_max_estimated_fragments\": " << fastBasicMaxEstimatedFragments << ",\n"
                 << "  \"fast_basic_fragment_budget\": " << fastBasicMaxFragmentBudget << ",\n"
@@ -20160,7 +20298,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " | luminance ratio: "
               << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0)
               << " | representatives: " << representatives
-              << " | represented source: " << representedSource << "\n"
+              << " | represented source: " << representedSource
+              << " | feature reps colour/scalar/normal/accent: "
+              << adaptiveClassCounts[1] << "/"
+              << (adaptiveClassCounts[3] + adaptiveClassCounts[4] + adaptiveClassCounts[5]) << "/"
+              << adaptiveClassCounts[2] << "/"
+              << adaptiveClassCounts[6] << "\n"
               << "Fast Basic viewport: max submitted " << fastBasicMaxSubmittedPoints
               << " / rep budget " << fastBasicMaxRepresentativeBudget
               << " | max estimated fragments " << fastBasicMaxEstimatedFragments

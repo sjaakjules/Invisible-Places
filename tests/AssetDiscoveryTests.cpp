@@ -1075,6 +1075,103 @@ TEST_CASE("Point-cloud LOD internal nodes store distributed representatives", "[
     CHECK(representedSourceCount == cloud.PointCount());
 }
 
+TEST_CASE("Point-cloud LOD stores visual stats and emits feature representatives", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    auto packColor = [](std::uint8_t red, std::uint8_t green, std::uint8_t blue) {
+        return static_cast<std::uint32_t>(red) |
+               (static_cast<std::uint32_t>(green) << 8U) |
+               (static_cast<std::uint32_t>(blue) << 16U) |
+               (0xffU << 24U);
+    };
+
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    cloud.scalarFields.push_back({.name = "Interest"});
+
+    constexpr int gridSize = 4;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                const auto pointIndex = static_cast<std::uint32_t>(cloud.positions.size());
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+                cloud.packedColors.push_back(packColor(96, 96, 96));
+                cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+                float interest = 0.25F;
+                if (pointIndex == 5U) {
+                    cloud.packedColors.back() = packColor(255, 16, 16);
+                }
+                if (pointIndex == 17U) {
+                    cloud.normals.back() = {1.0F, 0.0F, 0.0F};
+                }
+                if (pointIndex == 42U) {
+                    interest = 10.0F;
+                    cloud.packedColors.back() = packColor(255, 240, 80);
+                }
+                cloud.scalarFieldValues.push_back(interest);
+                cloud.scalarFields.front().Include(interest);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U, .maxInternalRepresentatives = 12U});
+    REQUIRE(!hierarchy.Empty());
+    REQUIRE(hierarchy.scalarFieldCount == 1U);
+    REQUIRE(hierarchy.nodeScalarStats.size() == hierarchy.nodes.size());
+    const auto& root = hierarchy.nodes.front();
+    CHECK(root.spacingMeters > 0.0F);
+    CHECK(root.densityPointsPerM3 > 0.0F);
+    CHECK(root.colorContrast > 0.0F);
+    CHECK(root.normalVariance > 0.0F);
+    CHECK(root.scalarRangeHint > 0.0F);
+    CHECK(root.emissiveImportanceHint > 0.0F);
+    CHECK((root.featureFlags & pc::PointCloudLodRepresentativeClassColorContrast) != 0U);
+    CHECK((root.featureFlags & pc::PointCloudLodRepresentativeClassNormalEdge) != 0U);
+    CHECK((root.featureFlags & pc::PointCloudLodRepresentativeClassEmissiveAccent) != 0U);
+
+    pc::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 12U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 10000.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    params.style.colorMode = pc::PointCloudColorMode::ScalarColormap;
+    params.style.colormapPosition.mode = invisible_places::style::ParameterSourceMode::FieldMapped;
+    params.style.colormapPosition.fieldMap.fieldSlot = 0;
+    params.style.emissiveStrength.mode = invisible_places::style::ParameterSourceMode::FieldMapped;
+    params.style.emissiveStrength.fieldMap.fieldSlot = 0;
+
+    pc::PointCloudLodTraversalDiagnostics diagnostics;
+    const auto drawItems = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &diagnostics);
+    REQUIRE(!drawItems.empty());
+    CHECK(diagnostics.emittedClassCounts[1] > 0U);
+    CHECK(diagnostics.emittedClassCounts[2] > 0U);
+    CHECK(diagnostics.emittedClassCounts[4] > 0U);
+    CHECK(diagnostics.emittedClassCounts[6] > 0U);
+
+    std::unordered_set<std::uint32_t> emittedSourceIndices;
+    for (const auto& drawItem : drawItems) {
+        emittedSourceIndices.insert(drawItem.sourcePointIndex);
+    }
+    CHECK(emittedSourceIndices.contains(42U));
+    CHECK(std::all_of(
+        drawItems.begin(),
+        drawItems.end(),
+        [&](const pc::PointCloudDrawItemGpu& drawItem) {
+            return drawItem.sourcePointIndex < cloud.PointCount();
+        }));
+}
+
 TEST_CASE("Point-cloud adaptive LOD does not collapse large projected nodes to one tiny point", "[pointcloud][lod]") {
     invisible_places::io::LoadedPointCloud cloud;
     constexpr int gridSize = 8;
@@ -1159,7 +1256,7 @@ TEST_CASE("Point-cloud LOD hierarchy cache round-trips and rejects stale metadat
 
     const auto source = pc::MakePointCloudLodCacheSource(sourcePath, cloud);
     const auto cachePath = pc::BuildPointCloudLodCachePath(tempRoot / "lod", sourcePath);
-    CHECK(cachePath.filename().string().find("PointCloudLodCache-v3.bin") != std::string::npos);
+    CHECK(cachePath.filename().string().find("PointCloudLodCache-v4.bin") != std::string::npos);
     std::string errorMessage;
     REQUIRE(pc::SavePointCloudLodHierarchyCache(cachePath, source, config, hierarchy, &errorMessage));
 
@@ -1193,13 +1290,14 @@ TEST_CASE("Point-cloud LOD hierarchy cache round-trips and rejects stale metadat
     {
         std::fstream cache{cachePath, std::ios::binary | std::ios::in | std::ios::out};
         REQUIRE(cache);
-        const std::uint32_t wrongVersion = 1U;
+        const std::uint32_t wrongVersion = 3U;
         cache.seekp(static_cast<std::streamoff>(sizeof(std::uint64_t)));
         cache.write(reinterpret_cast<const char*>(&wrongVersion), sizeof(wrongVersion));
     }
     stale = pc::LoadPointCloudLodHierarchyCache(cachePath, source, config);
     CHECK(!stale.loaded);
     CHECK(stale.stale);
+    CHECK(stale.message.find("version mismatch") != std::string::npos);
 
     std::filesystem::remove_all(tempRoot);
 }
@@ -1938,6 +2036,11 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("\\\"fast_basic_max_submitted_points\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_max_estimated_fragments\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_max_visible_represented_source\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_class_colour_contrast\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_class_scalar_max\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_class_normal_edge\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_class_emissive_accent\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_scalar_feature_refinements\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_zoom_out_updated\\\"") != std::string::npos);
     CHECK(comparisonSection.find("kFastBasicZoomOutStartFrame") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_submitted_full_source\\\"") != std::string::npos);
@@ -2098,6 +2201,10 @@ TEST_CASE("LOD HUD reports adaptive density fallback and hierarchy details", "[u
     CHECK(lodDebugSection.find("\"Transitions: %s active, age %.1f ms, max delta/frame %s, idle refine: %s\"") !=
           std::string::npos);
     CHECK(lodDebugSection.find("\"Transition diagnostics: delta %+lld reps | promoted %s | demoted %s | hysteresis-kept %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"Feature reps: spatial %s | colour %s | normal %s | scalar min/max/thresh %s/%s/%s | accent %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"Feature refinements: colour %s | scalar %s | normal %s | accent %s\"") !=
           std::string::npos);
     CHECK(lodDebugSection.find("\"Hysteresis band: promote %.2fx | demote %.2fx\"") != std::string::npos);
     CHECK(lodDebugSection.find("\"coarse fallback\"") != std::string::npos);

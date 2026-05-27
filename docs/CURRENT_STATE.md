@@ -9,8 +9,15 @@ This document describes the implemented project surface for future edits. Eviden
 - Project files that contain `"point_cloud_renderer_mode": "raytraced"` load as Beauty Adaptive and save back as `"beauty_adaptive"`.
 - Beauty Adaptive keeps the unified material path with adaptive draw-item LOD. Beauty Full Source uses raw source points for exact/debug viewport rendering. Fast Basic keeps cheap colour and point-size controls for preview-oriented rendering. Painted Adaptive uses the adaptive hierarchy with brush styling.
 - Fast Basic adaptive LOD now uses deterministic stable-ranked representatives, traversal hysteresis, and bounded mixed draw-item transitions so representative density, parent/child replacement, and idle refinement change gradually instead of replacing the displayed set in one frame.
-- LOD diagnostics include representative delta per frame, promoted/demoted frontier nodes, hysteresis-kept nodes, active transition count/age, idle refinement pending state, and a `--lod-compare` Fast Basic transition trace CSV.
+- Adaptive hierarchy cache files use `PointCloudLodCache-v4.bin`. v1-v3 hierarchy caches are treated as stale by version validation and are rebuilt into v4 without deleting the older files unless the user explicitly runs the existing rebuild command.
+- v4 hierarchy nodes store fixed CPU visual statistics: spacing, density, colour variance/contrast, normal variance, scalar range/variance hints, emissive/accent hints, and feature flags.
+- v4 representatives preserve `sourcePointIndex` and add deterministic class flags for spatial coverage, colour contrast, normal/edge, scalar min, scalar max, scalar threshold, emissive/accent, and blue-noise fill, plus scalar-field slot, importance, and stored rank data.
+- The hierarchy stores per-field and per-node scalar statistics sized by `nodes.size() * scalarFieldCount`, so active scalar styles can refine against the field currently driving the visual.
+- CPU adaptive traversal refines nodes from projected spacing/mark diameter and visible feature statistics; Fast Basic, Beauty screen sprites, Beauty world-mm sprites, and Beauty world surfels use separate threshold/cost tuning while GPU compute selection remains out of scope.
+- LOD diagnostics include representative delta per frame, promoted/demoted frontier nodes, hysteresis-kept nodes, active transition count/age, idle refinement pending state, emitted feature-class counts, feature-triggered refinement counts, and a `--lod-compare` Fast Basic transition trace CSV.
+- Stage 04 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports coverage ratio 1, luminance ratio 0.966488, 1,932,759 Adaptive HQ representatives covering all 12,183,742 source points, feature representatives colour/scalar/normal/accent 136/1,070/65/130, Fast Basic max submitted 4,111,812 under an 8,294,400 representative budget, 0 large representative-jump frames, 0 budget-exceeded frames, 0 full-source fallback frames, and `fast_basic_zoom_out_updated=true`.
 - Stage 03 large-cloud evidence on `Data/Site3-Mid-1mm100M.ply` uses a 500-frame scripted Fast Basic path. Two repeated runs produced 500 trace rows, max absolute representative delta 5,640, 22 transition-active frames, 0 large representative-jump frames, 0 budget-exceeded frames, and 0 full-source fallback frames.
+- A Stage 04 cold-cache compare attempt on `Data/Site3-Mid-1mm100M.ply` loaded 100,743,210 points but did not build a v4 hierarchy before the comparison readiness timeout; the existing v1-v3 100M cache files remain as stale artifacts and no v4 100M cache was published.
 - The same automated 100M trace does not prove exact idle refinement completion: it ends with async refinement still pending and the displayed bounded fallback protected by the no-flash rule. Use the manual Stage 03 checklist below for final visual acceptance of idle detail completion.
 
 ## Water Workflow
@@ -71,6 +78,7 @@ Focused tests for this state include:
 - `Offline ripple effect overlays render from virtual effect fields`
 - `Project document round-trips binding-backed point-cloud styles`
 - Fast Basic adaptive LOD stable-rank, cache-loaded ordering, hysteresis, and transition diagnostic regressions
+- Point-cloud LOD cache v3 stale/v4 round-trip behavior, visual node stats, feature representative classes, source-index preservation, deterministic traversal output, and Stage 03 smoothness metrics
 
 Stage 03 manual visual checklist for the current 100M cloud:
 
@@ -79,3 +87,10 @@ Stage 03 manual visual checklist for the current 100M cloud:
 - Fast navigation then stop: detail refines over multiple frames, not as one sudden load.
 - Repeated back-and-forth path: the same areas transition consistently.
 - HUD/trace: representative deltas stay clamped, transitions age normally, idle refinement eventually completes, and Stage 02 boundedness remains intact.
+
+Stage 04 manual/compare checklist:
+
+- `lod_compare_metrics.json` should show no adaptive fallback, no full-source Fast Basic submission, no representative or fragment budget exceedance, and zero large representative-jump frames.
+- Applicable clouds should report nonzero colour contrast, scalar, normal/edge, and emissive/accent class counts in Adaptive HQ and Fast Basic.
+- Feature-triggered refinement counts should be nonzero when the active style exposes visible RGB, scalar, normal/edge, or emissive/accent variation.
+- Coverage and luminance ratios should remain close to the previous adaptive baselines while rare feature classes remain represented.
