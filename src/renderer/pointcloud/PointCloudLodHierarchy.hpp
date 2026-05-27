@@ -87,10 +87,21 @@ struct PointCloudLodTraversalParams {
     float maxEstimatedFragments = 0.0F;
     float maxRepresentativeDiameterPixels = 0.0F;
     float targetProjectedSpacingPixels = 0.0F;
+    std::vector<std::uint32_t> previousFrontierNodeIndices;
+    float hysteresisPromoteScale = 1.12F;
+    float hysteresisDemoteScale = 0.78F;
 };
 
 struct PointCloudLodTraversalDiagnostics {
     std::uint32_t visibleFrontierNodeCount = 0;
+    std::vector<std::uint32_t> frontierNodeIndices;
+    std::uint32_t previousFrontierNodeCount = 0;
+    std::uint32_t promotedNodeCount = 0;
+    std::uint32_t demotedNodeCount = 0;
+    std::uint32_t hysteresisKeptNodeCount = 0;
+    std::int64_t representativeDelta = 0;
+    float hysteresisPromoteScale = 1.0F;
+    float hysteresisDemoteScale = 1.0F;
     std::uint64_t visibleFrontierRepresentedSourceCount = 0;
     std::uint32_t emittedRepresentativeCount = 0;
     std::uint64_t emittedRepresentedSourceCount = 0;

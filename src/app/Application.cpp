@@ -460,6 +460,13 @@ struct AdaptiveLodCacheState {
     std::uint64_t emittedRepresentedSourceCount = 0;
     std::uint64_t culledRepresentedSourceCount = 0;
     std::uint32_t visibleFrontierNodeCount = 0;
+    std::vector<std::uint32_t> frontierNodeIndices;
+    std::int64_t representativeDelta = 0;
+    std::uint32_t promotedNodeCount = 0;
+    std::uint32_t demotedNodeCount = 0;
+    std::uint32_t hysteresisKeptNodeCount = 0;
+    float hysteresisPromoteScale = 1.0F;
+    float hysteresisDemoteScale = 1.0F;
     float estimatedFragments = 0.0F;
     float fragmentBudget = 0.0F;
     std::uint32_t representativeBudget = 0;
@@ -481,6 +488,17 @@ struct AdaptiveLodBuildResult {
     std::uint64_t emittedRepresentedSourceCount = 0;
     std::uint64_t culledRepresentedSourceCount = 0;
     std::uint32_t visibleFrontierNodeCount = 0;
+    std::vector<std::uint32_t> frontierNodeIndices;
+    std::int64_t representativeDelta = 0;
+    std::uint32_t promotedNodeCount = 0;
+    std::uint32_t demotedNodeCount = 0;
+    std::uint32_t hysteresisKeptNodeCount = 0;
+    float hysteresisPromoteScale = 1.0F;
+    float hysteresisDemoteScale = 1.0F;
+    std::uint32_t activeTransitionCount = 0;
+    double averageTransitionAgeMs = 0.0;
+    double maxTransitionAgeMs = 0.0;
+    bool idleRefinementPending = false;
     float estimatedFragments = 0.0F;
     float fragmentBudget = 0.0F;
     std::uint32_t representativeBudget = 0;
@@ -566,8 +584,12 @@ struct PreviewLayerSession {
     std::shared_ptr<invisible_places::renderer::pointcloud::PointCloudLodHierarchy> pointLodHierarchy;
     AdaptiveLodCacheState adaptiveLodCache{};
     AdaptiveLodCacheState adaptiveLodDisplayedBase{};
+    AdaptiveLodCacheState adaptiveLodDisplayedEntry{};
     AdaptiveLodCacheState adaptiveLodMotionPatch{};
     AdaptiveLodCacheState adaptiveLodIdleCandidate{};
+    AdaptiveLodCacheState adaptiveLodTransitionSource{};
+    AdaptiveLodCacheState adaptiveLodTransitionTarget{};
+    std::shared_ptr<const std::vector<PointCloudDrawItemGpu>> adaptiveLodTransitionDrawItems;
     std::vector<AdaptiveLodCacheState> adaptiveLodRuntimeCache;
     std::shared_ptr<AdaptiveLodAsyncState> adaptiveLodAsyncState;
     std::jthread adaptiveLodWorker;
@@ -595,6 +617,8 @@ struct PreviewLayerSession {
     std::uint64_t adaptiveLodMotionPatchApplyCount = 0;
     std::uint64_t adaptiveLodCandidateDemotionBlockedCount = 0;
     std::uint64_t adaptiveLodSkippedMotionPatchCount = 0;
+    std::uint64_t adaptiveLodTransitionApplyCount = 0;
+    std::uint64_t adaptiveLodMaxRepresentativeDeltaPerFrame = 0;
     std::size_t adaptiveLodMotionPatchRepresentativeCount = 0;
     std::uint64_t adaptiveLodCoverageGapSourceCount = 0;
     double adaptiveLodAsyncPendingAgeMs = 0.0;
@@ -605,6 +629,19 @@ struct PreviewLayerSession {
     std::uint64_t adaptiveLodEmittedRepresentedSourceCount = 0;
     std::uint64_t adaptiveLodCulledRepresentedSourceCount = 0;
     std::uint32_t adaptiveLodVisibleFrontierNodeCount = 0;
+    std::int64_t adaptiveLodRepresentativeDelta = 0;
+    std::uint32_t adaptiveLodPromotedNodeCount = 0;
+    std::uint32_t adaptiveLodDemotedNodeCount = 0;
+    std::uint32_t adaptiveLodHysteresisKeptNodeCount = 0;
+    float adaptiveLodHysteresisPromoteScale = 1.0F;
+    float adaptiveLodHysteresisDemoteScale = 1.0F;
+    bool adaptiveLodTransitionActive = false;
+    bool adaptiveLodIdleRefinementPending = false;
+    std::uint64_t adaptiveLodTransitionStartFrame = 0;
+    std::uint64_t adaptiveLodTransitionLastFrame = 0;
+    double adaptiveLodTransitionAgeMs = 0.0;
+    std::chrono::steady_clock::time_point adaptiveLodTransitionStartedAt{};
+    std::uint64_t adaptiveLodTransitionRevision = 0;
     bool adaptiveLodRepresentativeBudgetReached = false;
     bool adaptiveLodFragmentBudgetReached = false;
     std::uint64_t adaptiveLodDisplayedCacheAgeFrames = 0;
@@ -2926,11 +2963,15 @@ bool AdaptiveLodCandidateWouldDemoteDisplayed(
     const PreviewLayerSession& session,
     PointCloudExportDensityMode candidateDensityMode,
     bool candidateCoarseFallback) {
-    if (!session.adaptiveLodDisplayedBase.valid && !session.adaptiveLodCache.valid) {
+    if (!session.adaptiveLodDisplayedEntry.valid &&
+        !session.adaptiveLodDisplayedBase.valid &&
+        !session.adaptiveLodCache.valid) {
         return false;
     }
     const auto& displayed =
-        session.adaptiveLodDisplayedBase.valid ? session.adaptiveLodDisplayedBase : session.adaptiveLodCache;
+        session.adaptiveLodDisplayedEntry.valid
+            ? session.adaptiveLodDisplayedEntry
+            : (session.adaptiveLodDisplayedBase.valid ? session.adaptiveLodDisplayedBase : session.adaptiveLodCache);
     if (!displayed.valid || displayed.coarseFallback) {
         return false;
     }
@@ -2938,6 +2979,17 @@ bool AdaptiveLodCandidateWouldDemoteDisplayed(
         return true;
     }
     return AdaptiveLodDensityQualityRank(candidateDensityMode) < AdaptiveLodEntryQualityRank(displayed);
+}
+
+const AdaptiveLodCacheState& AdaptiveLodDisplayedTransitionSource(
+    const PreviewLayerSession& session) {
+    if (session.adaptiveLodDisplayedEntry.valid) {
+        return session.adaptiveLodDisplayedEntry;
+    }
+    if (session.adaptiveLodDisplayedBase.valid) {
+        return session.adaptiveLodDisplayedBase;
+    }
+    return session.adaptiveLodCache;
 }
 
 const char* AdaptiveLodDisplayKind(const AdaptiveLodCacheState& entry) {
@@ -3087,6 +3139,15 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
         params.viewportHeight,
         densityMode,
         fastBasicProfile);
+    const auto& previousFrontierSource =
+        session.adaptiveLodTransitionActive && session.adaptiveLodTransitionTarget.valid
+            ? session.adaptiveLodTransitionTarget
+            : AdaptiveLodDisplayedTransitionSource(session);
+    if (!previousFrontierSource.frontierNodeIndices.empty()) {
+        params.previousFrontierNodeIndices = previousFrontierSource.frontierNodeIndices;
+    }
+    params.hysteresisPromoteScale = fastBasicProfile ? 1.10F : 1.12F;
+    params.hysteresisDemoteScale = fastBasicProfile ? 0.76F : 0.78F;
     switch (densityMode) {
         case PointCloudExportDensityMode::FastAdaptivePreview:
             params.maxRepresentativeDiameterPixels = fastBasicProfile ? 32.0F : 48.0F;
@@ -3257,6 +3318,12 @@ void ApplyAdaptiveLodCacheMetadata(
     session->adaptiveLodEmittedRepresentedSourceCount = entry.emittedRepresentedSourceCount;
     session->adaptiveLodCulledRepresentedSourceCount = entry.culledRepresentedSourceCount;
     session->adaptiveLodVisibleFrontierNodeCount = entry.visibleFrontierNodeCount;
+    session->adaptiveLodRepresentativeDelta = entry.representativeDelta;
+    session->adaptiveLodPromotedNodeCount = entry.promotedNodeCount;
+    session->adaptiveLodDemotedNodeCount = entry.demotedNodeCount;
+    session->adaptiveLodHysteresisKeptNodeCount = entry.hysteresisKeptNodeCount;
+    session->adaptiveLodHysteresisPromoteScale = entry.hysteresisPromoteScale;
+    session->adaptiveLodHysteresisDemoteScale = entry.hysteresisDemoteScale;
     session->adaptiveLodRepresentativeBudgetReached = entry.representativeBudgetReached;
     session->adaptiveLodFragmentBudgetReached = entry.fragmentBudgetReached;
     session->adaptiveLodDisplayedCacheAgeFrames =
@@ -3309,6 +3376,13 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
             : entry.representedSourceCount;
     entry.culledRepresentedSourceCount = diagnostics.culledRepresentedSourceCount;
     entry.visibleFrontierNodeCount = diagnostics.visibleFrontierNodeCount;
+    entry.frontierNodeIndices = diagnostics.frontierNodeIndices;
+    entry.representativeDelta = diagnostics.representativeDelta;
+    entry.promotedNodeCount = diagnostics.promotedNodeCount;
+    entry.demotedNodeCount = diagnostics.demotedNodeCount;
+    entry.hysteresisKeptNodeCount = diagnostics.hysteresisKeptNodeCount;
+    entry.hysteresisPromoteScale = diagnostics.hysteresisPromoteScale;
+    entry.hysteresisDemoteScale = diagnostics.hysteresisDemoteScale;
     entry.representativeBudgetReached = diagnostics.representativeBudgetReached;
     entry.fragmentBudgetReached = diagnostics.fragmentBudgetReached;
     entry.estimatedFragments = EstimateSubmittedFragments(drawItems);
@@ -3343,6 +3417,236 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
 
     ApplyAdaptiveLodCacheMetadata(session, entry, frameCounter);
     return entry;
+}
+
+std::uint64_t StableDrawItemTransitionHash(const PointCloudDrawItemGpu& item) {
+    std::uint64_t seed = 1469598103934665603ULL;
+    HashCombine(&seed, item.reserved0);
+    HashCombine(&seed, item.reserved1);
+    HashCombine(&seed, item.sourcePointIndex);
+    seed ^= seed >> 30U;
+    seed *= 0xbf58476d1ce4e5b9ULL;
+    seed ^= seed >> 27U;
+    seed *= 0x94d049bb133111ebULL;
+    seed ^= seed >> 31U;
+    return seed;
+}
+
+double StableDrawItemTransitionUnit(const PointCloudDrawItemGpu& item) {
+    constexpr double kUnitScale = 1.0 / static_cast<double>(std::numeric_limits<std::uint64_t>::max());
+    return static_cast<double>(StableDrawItemTransitionHash(item)) * kUnitScale;
+}
+
+std::vector<PointCloudDrawItemGpu> BuildAdaptiveTransitionDrawItems(
+    const AdaptiveLodCacheState& source,
+    const AdaptiveLodCacheState& target,
+    double progress,
+    std::uint32_t representativeBudget) {
+    if (target.drawItems == nullptr || target.drawItems->empty()) {
+        return {};
+    }
+    if (source.drawItems == nullptr || source.drawItems->empty() || progress >= 1.0) {
+        auto items = *target.drawItems;
+        if (representativeBudget > 0U && items.size() > representativeBudget) {
+            items.resize(representativeBudget);
+        }
+        return items;
+    }
+
+    const auto sourceCount = source.drawItems->size();
+    const auto targetCount = target.drawItems->size();
+    const double clampedProgress = std::clamp(progress, 0.0, 1.0);
+    const auto desiredCount = static_cast<std::size_t>(std::llround(
+        static_cast<double>(sourceCount) +
+        (static_cast<double>(targetCount) - static_cast<double>(sourceCount)) * clampedProgress));
+    const auto cappedDesiredCount =
+        representativeBudget == 0U
+            ? std::max<std::size_t>(1U, desiredCount)
+            : std::min<std::size_t>(std::max<std::size_t>(1U, desiredCount), representativeBudget);
+
+    std::vector<PointCloudDrawItemGpu> mixed;
+    mixed.reserve(cappedDesiredCount);
+    for (const auto& item : *target.drawItems) {
+        if (mixed.size() >= cappedDesiredCount) {
+            break;
+        }
+        if (StableDrawItemTransitionUnit(item) <= clampedProgress) {
+            mixed.push_back(item);
+        }
+    }
+    for (const auto& item : *source.drawItems) {
+        if (mixed.size() >= cappedDesiredCount) {
+            break;
+        }
+        if (StableDrawItemTransitionUnit(item) > clampedProgress) {
+            mixed.push_back(item);
+        }
+    }
+    for (const auto& item : *target.drawItems) {
+        if (mixed.size() >= cappedDesiredCount) {
+            break;
+        }
+        mixed.push_back(item);
+    }
+    return mixed;
+}
+
+void BeginAdaptiveLodTransition(
+    PreviewLayerSession* session,
+    const AdaptiveLodCacheState& source,
+    const AdaptiveLodCacheState& target,
+    std::uint64_t frameCounter,
+    bool navigationActive,
+    bool emergencyDemotion) {
+    if (session == nullptr) {
+        return;
+    }
+    const bool emergencyDownwardCut =
+        emergencyDemotion &&
+        !source.coarseFallback &&
+        AdaptiveLodEntryQualityRank(target) < AdaptiveLodEntryQualityRank(source) &&
+        target.representativeCount < source.representativeCount;
+    if (emergencyDownwardCut ||
+        !source.valid ||
+        !target.valid ||
+        source.drawItems == nullptr ||
+        source.drawItems->empty() ||
+        target.drawItems == nullptr ||
+        target.drawItems->empty() ||
+        source.generation == target.generation) {
+        session->adaptiveLodTransitionActive = false;
+        session->adaptiveLodIdleRefinementPending = false;
+        session->adaptiveLodTransitionDrawItems.reset();
+        return;
+    }
+
+    session->adaptiveLodTransitionSource = source;
+    session->adaptiveLodTransitionTarget = target;
+    session->adaptiveLodTransitionActive = true;
+    session->adaptiveLodIdleRefinementPending = !navigationActive;
+    session->adaptiveLodTransitionStartFrame = frameCounter;
+    session->adaptiveLodTransitionLastFrame = frameCounter;
+    session->adaptiveLodTransitionStartedAt = std::chrono::steady_clock::now();
+    session->adaptiveLodTransitionAgeMs = 0.0;
+    session->adaptiveLodTransitionDrawItems.reset();
+    ++session->adaptiveLodTransitionApplyCount;
+}
+
+std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
+    PreviewLayerSession* session,
+    PointCloudExportDensityMode requestedDensityMode,
+    std::uint64_t frameCounter) {
+    if (session == nullptr || !session->adaptiveLodTransitionActive) {
+        return std::nullopt;
+    }
+    if (!session->adaptiveLodTransitionTarget.valid ||
+        session->adaptiveLodTransitionTarget.drawItems == nullptr ||
+        session->adaptiveLodTransitionTarget.drawItems->empty()) {
+        session->adaptiveLodTransitionActive = false;
+        session->adaptiveLodIdleRefinementPending = false;
+        session->adaptiveLodTransitionDrawItems.reset();
+        return std::nullopt;
+    }
+
+    constexpr double kTransitionFrames = 12.0;
+    const auto elapsedFrames =
+        frameCounter > session->adaptiveLodTransitionStartFrame
+            ? frameCounter - session->adaptiveLodTransitionStartFrame
+            : 0ULL;
+    const double progress = std::clamp((static_cast<double>(elapsedFrames) + 1.0) / kTransitionFrames, 0.0, 1.0);
+    if (progress >= 1.0) {
+        session->adaptiveLodTransitionActive = false;
+        session->adaptiveLodIdleRefinementPending = false;
+        session->adaptiveLodTransitionDrawItems.reset();
+        return std::nullopt;
+    }
+
+    auto mixed = BuildAdaptiveTransitionDrawItems(
+        session->adaptiveLodTransitionSource,
+        session->adaptiveLodTransitionTarget,
+        progress,
+        session->adaptiveLodTransitionTarget.representativeBudget);
+    if (mixed.empty()) {
+        session->adaptiveLodTransitionActive = false;
+        session->adaptiveLodIdleRefinementPending = false;
+        session->adaptiveLodTransitionDrawItems.reset();
+        return std::nullopt;
+    }
+
+    const auto previousTransitionCount =
+        session->adaptiveLodTransitionDrawItems == nullptr ? session->adaptiveLodTransitionSource.representativeCount
+                                                           : session->adaptiveLodTransitionDrawItems->size();
+    const auto currentCount = mixed.size();
+    const auto countDelta =
+        currentCount > previousTransitionCount ? currentCount - previousTransitionCount
+                                               : previousTransitionCount - currentCount;
+    session->adaptiveLodMaxRepresentativeDeltaPerFrame =
+        std::max<std::uint64_t>(session->adaptiveLodMaxRepresentativeDeltaPerFrame, countDelta);
+    session->adaptiveLodTransitionRevision =
+        session->adaptiveLodTransitionRevision == std::numeric_limits<std::uint64_t>::max()
+            ? 1ULL
+            : session->adaptiveLodTransitionRevision + 1ULL;
+    if (session->adaptiveLodTransitionRevision == 0ULL) {
+        session->adaptiveLodTransitionRevision = 1ULL;
+    }
+    session->adaptiveLodTransitionDrawItems =
+        std::make_shared<const std::vector<PointCloudDrawItemGpu>>(std::move(mixed));
+    session->adaptiveLodTransitionLastFrame = frameCounter;
+    session->adaptiveLodTransitionAgeMs =
+        session->adaptiveLodTransitionStartedAt.time_since_epoch().count() == 0
+            ? 0.0
+            : std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - session->adaptiveLodTransitionStartedAt)
+                  .count();
+    session->adaptiveLodRuntimeStatus =
+        session->adaptiveLodIdleRefinementPending ? "Refining point cloud detail..." : "adaptive LOD transition active";
+    session->adaptiveLodFallbackState =
+        session->adaptiveLodIdleRefinementPending ? "idle refinement transition" : "transition";
+
+    const auto& target = session->adaptiveLodTransitionTarget;
+    return AdaptiveLodBuildResult{
+        .available = true,
+        .drawItems = session->adaptiveLodTransitionDrawItems,
+        .revision = session->adaptiveLodTransitionRevision,
+        .representativeCount = session->adaptiveLodTransitionDrawItems->size(),
+        .representedSourceCount = std::min<std::uint64_t>(
+            CountRepresentedSourcePoints(*session->adaptiveLodTransitionDrawItems),
+            session->totalPrimitives),
+        .visibleRepresentedSourceCount = target.visibleRepresentedSourceCount,
+        .emittedRepresentedSourceCount = target.emittedRepresentedSourceCount,
+        .culledRepresentedSourceCount = target.culledRepresentedSourceCount,
+        .visibleFrontierNodeCount = target.visibleFrontierNodeCount,
+        .frontierNodeIndices = target.frontierNodeIndices,
+        .representativeDelta = static_cast<std::int64_t>(currentCount) -
+                                static_cast<std::int64_t>(previousTransitionCount),
+        .promotedNodeCount = target.promotedNodeCount,
+        .demotedNodeCount = target.demotedNodeCount,
+        .hysteresisKeptNodeCount = target.hysteresisKeptNodeCount,
+        .hysteresisPromoteScale = target.hysteresisPromoteScale,
+        .hysteresisDemoteScale = target.hysteresisDemoteScale,
+        .activeTransitionCount = 1U,
+        .averageTransitionAgeMs = session->adaptiveLodTransitionAgeMs,
+        .maxTransitionAgeMs = session->adaptiveLodTransitionAgeMs,
+        .idleRefinementPending = session->adaptiveLodIdleRefinementPending,
+        .estimatedFragments = EstimateSubmittedFragments(*session->adaptiveLodTransitionDrawItems),
+        .fragmentBudget = target.fragmentBudget,
+        .representativeBudget = target.representativeBudget,
+        .representativeBudgetReached = target.representativeBudgetReached,
+        .fragmentBudgetReached = target.fragmentBudgetReached,
+        .traversalMs = 0.0,
+        .drawItemBytes = DrawItemByteCount(session->adaptiveLodTransitionDrawItems->size()),
+        .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+        .reusedPrevious = true,
+        .runtimeCacheHit = false,
+        .asyncPending = session->adaptiveLodAsyncPending,
+        .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
+        .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
+        .requestedDensityMode = requestedDensityMode,
+        .displayedDensityMode = target.densityMode,
+        .runtimeStatus = session->adaptiveLodRuntimeStatus,
+        .persistentCacheStatus = session->pointLodCacheStatus,
+        .fallbackState = session->adaptiveLodFallbackState,
+    };
 }
 
 std::uint32_t CoarseAdaptiveFallbackRepresentativeTarget(
@@ -3622,6 +3926,19 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .emittedRepresentedSourceCount = entry.emittedRepresentedSourceCount,
             .culledRepresentedSourceCount = entry.culledRepresentedSourceCount,
             .visibleFrontierNodeCount = entry.visibleFrontierNodeCount,
+            .frontierNodeIndices = entry.frontierNodeIndices,
+            .representativeDelta = entry.representativeDelta,
+            .promotedNodeCount = entry.promotedNodeCount,
+            .demotedNodeCount = entry.demotedNodeCount,
+            .hysteresisKeptNodeCount = entry.hysteresisKeptNodeCount,
+            .hysteresisPromoteScale = entry.hysteresisPromoteScale,
+            .hysteresisDemoteScale = entry.hysteresisDemoteScale,
+            .activeTransitionCount = session->adaptiveLodTransitionActive ? 1U : 0U,
+            .averageTransitionAgeMs =
+                session->adaptiveLodTransitionActive ? session->adaptiveLodTransitionAgeMs : 0.0,
+            .maxTransitionAgeMs =
+                session->adaptiveLodTransitionActive ? session->adaptiveLodTransitionAgeMs : 0.0,
+            .idleRefinementPending = session->adaptiveLodIdleRefinementPending,
             .estimatedFragments = entry.estimatedFragments,
             .fragmentBudget = entry.fragmentBudget,
             .representativeBudget = entry.representativeBudget,
@@ -3644,7 +3961,13 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         };
     };
 
+    if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
+        transition.has_value()) {
+        return transition.value();
+    }
+
     if (auto* cache = FindAdaptiveLodCacheEntry(session, traversalKey); cache != nullptr) {
+        const auto transitionSource = AdaptiveLodDisplayedTransitionSource(*session);
         cache->lastUsedFrame = frameCounter;
         ApplyAdaptiveLodCacheMetadata(session, *cache, frameCounter);
         session->adaptiveLodRuntimeCacheHit = true;
@@ -3652,34 +3975,18 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodAsyncPendingAgeMs = 0.0;
         session->adaptiveLodRuntimeStatus = "runtime cache hit";
         session->adaptiveLodDisplayedDensityMode = cache->densityMode;
-        return {
-            .available = true,
-            .drawItems = cache->drawItems,
-            .revision = cache->generation,
-            .representativeCount = cache->representativeCount,
-            .representedSourceCount = cache->representedSourceCount,
-            .visibleRepresentedSourceCount = cache->visibleRepresentedSourceCount,
-            .emittedRepresentedSourceCount = cache->emittedRepresentedSourceCount,
-            .culledRepresentedSourceCount = cache->culledRepresentedSourceCount,
-            .visibleFrontierNodeCount = cache->visibleFrontierNodeCount,
-            .estimatedFragments = cache->estimatedFragments,
-            .fragmentBudget = cache->fragmentBudget,
-            .representativeBudget = cache->representativeBudget,
-            .representativeBudgetReached = cache->representativeBudgetReached,
-            .fragmentBudgetReached = cache->fragmentBudgetReached,
-            .traversalMs = 0.0,
-            .drawItemBytes = cache->drawItemBytes,
-            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
-            .reusedPrevious = false,
-            .runtimeCacheHit = true,
-            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
-            .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
-            .requestedDensityMode = densityMode,
-            .displayedDensityMode = cache->densityMode,
-            .runtimeStatus = session->adaptiveLodRuntimeStatus,
-            .persistentCacheStatus = session->pointLodCacheStatus,
-            .fallbackState = session->adaptiveLodFallbackState,
-        };
+        BeginAdaptiveLodTransition(
+            session,
+            transitionSource,
+            *cache,
+            frameCounter,
+            fastBasicNavigationActive,
+            session->adaptiveLodEmergencyDemotion);
+        if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
+            transition.has_value()) {
+            return transition.value();
+        }
+        return makeResultFromEntry(*cache, false, true, false);
     }
 
     if (allowSynchronousTraversal) {
@@ -3711,34 +4018,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodAsyncPendingAgeMs = 0.0;
         session->adaptiveLodRuntimeStatus = "synchronous export traversal";
         session->adaptiveLodDisplayedDensityMode = densityMode;
-        return {
-            .available = true,
-            .drawItems = cache.drawItems,
-            .revision = cache.generation,
-            .representativeCount = cache.representativeCount,
-            .representedSourceCount = cache.representedSourceCount,
-            .visibleRepresentedSourceCount = cache.visibleRepresentedSourceCount,
-            .emittedRepresentedSourceCount = cache.emittedRepresentedSourceCount,
-            .culledRepresentedSourceCount = cache.culledRepresentedSourceCount,
-            .visibleFrontierNodeCount = cache.visibleFrontierNodeCount,
-            .estimatedFragments = cache.estimatedFragments,
-            .fragmentBudget = cache.fragmentBudget,
-            .representativeBudget = cache.representativeBudget,
-            .representativeBudgetReached = cache.representativeBudgetReached,
-            .fragmentBudgetReached = cache.fragmentBudgetReached,
-            .traversalMs = cache.traversalMs,
-            .drawItemBytes = cache.drawItemBytes,
-            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
-            .reusedPrevious = false,
-            .runtimeCacheHit = false,
-            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
-            .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
-            .requestedDensityMode = densityMode,
-            .displayedDensityMode = densityMode,
-            .runtimeStatus = session->adaptiveLodRuntimeStatus,
-            .persistentCacheStatus = session->pointLodCacheStatus,
-            .fallbackState = session->adaptiveLodFallbackState,
-        };
+        return makeResultFromEntry(cache, false, false, false);
     }
 
     const bool scheduled = ScheduleAdaptiveLodTraversal(
@@ -3776,6 +4056,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
                 skipEmergencyPreview,
                 denseFastBasicNavigation);
             previous != nullptr) {
+            const auto transitionSource = AdaptiveLodDisplayedTransitionSource(*session);
             previous->lastUsedFrame = frameCounter;
             ApplyAdaptiveLodCacheMetadata(session, *previous, frameCounter);
             const bool lowerTierPrevious = previous->densityMode != densityMode;
@@ -3802,35 +4083,18 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
                            ? (lowerTierPrevious ? "showing previous lower-tier set, async traversal pending"
                                                 : "showing previous set, async traversal pending")
                            : (lowerTierPrevious ? "showing previous lower-tier set" : "showing previous set"));
-            return {
-                .available = true,
-                .drawItems = previous->drawItems,
-                .revision = previous->generation,
-                .representativeCount = previous->representativeCount,
-                .representedSourceCount = previous->representedSourceCount,
-                .visibleRepresentedSourceCount = previous->visibleRepresentedSourceCount,
-                .emittedRepresentedSourceCount = previous->emittedRepresentedSourceCount,
-                .culledRepresentedSourceCount = previous->culledRepresentedSourceCount,
-                .visibleFrontierNodeCount = previous->visibleFrontierNodeCount,
-                .estimatedFragments = previous->estimatedFragments,
-                .fragmentBudget = previous->fragmentBudget,
-                .representativeBudget = previous->representativeBudget,
-                .representativeBudgetReached = previous->representativeBudgetReached,
-                .fragmentBudgetReached = previous->fragmentBudgetReached,
-                .traversalMs = 0.0,
-                .drawItemBytes = previous->drawItemBytes,
-                .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
-                .reusedPrevious = true,
-                .runtimeCacheHit = false,
-                .asyncPending = scheduled,
-                .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
-                .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
-                .requestedDensityMode = densityMode,
-                .displayedDensityMode = previous->densityMode,
-                .runtimeStatus = session->adaptiveLodRuntimeStatus,
-                .persistentCacheStatus = session->pointLodCacheStatus,
-                .fallbackState = session->adaptiveLodFallbackState,
-            };
+            BeginAdaptiveLodTransition(
+                session,
+                transitionSource,
+                *previous,
+                frameCounter,
+                fastBasicNavigationActive,
+                session->adaptiveLodEmergencyDemotion);
+            if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
+                transition.has_value()) {
+                return transition.value();
+            }
+            return makeResultFromEntry(*previous, true, false, scheduled);
         }
     }
 
@@ -3866,35 +4130,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodDisplayedDensityMode = fallback->densityMode;
         session->adaptiveLodRuntimeStatus =
             scheduled ? "reusing coarse fallback, async traversal pending" : "reusing coarse fallback";
-        return {
-            .available = true,
-            .drawItems = fallback->drawItems,
-            .revision = fallback->generation,
-            .representativeCount = fallback->representativeCount,
-            .representedSourceCount = fallback->representedSourceCount,
-            .visibleRepresentedSourceCount = fallback->visibleRepresentedSourceCount,
-            .emittedRepresentedSourceCount = fallback->emittedRepresentedSourceCount,
-            .culledRepresentedSourceCount = fallback->culledRepresentedSourceCount,
-            .visibleFrontierNodeCount = fallback->visibleFrontierNodeCount,
-            .estimatedFragments = fallback->estimatedFragments,
-            .fragmentBudget = fallback->fragmentBudget,
-            .representativeBudget = fallback->representativeBudget,
-            .representativeBudgetReached = fallback->representativeBudgetReached,
-            .fragmentBudgetReached = fallback->fragmentBudgetReached,
-            .traversalMs = 0.0,
-            .drawItemBytes = fallback->drawItemBytes,
-            .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
-            .reusedPrevious = true,
-            .runtimeCacheHit = false,
-            .asyncPending = scheduled,
-            .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
-            .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
-            .requestedDensityMode = densityMode,
-            .displayedDensityMode = fallback->densityMode,
-            .runtimeStatus = session->adaptiveLodRuntimeStatus,
-            .persistentCacheStatus = session->pointLodCacheStatus,
-            .fallbackState = session->adaptiveLodFallbackState,
-        };
+        return makeResultFromEntry(*fallback, true, false, scheduled);
     }
 
     auto fallbackItems = BuildCoarseAdaptiveFallbackDrawItems(
@@ -3937,6 +4173,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .fallbackState = session->adaptiveLodFallbackState,
         };
     }
+    const auto transitionSource = AdaptiveLodDisplayedTransitionSource(*session);
     auto fallback = StoreAdaptiveLodCacheEntry(
         session,
         traversalKey,
@@ -3956,36 +4193,58 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
                   ", async traversal pending"
             : std::string{"coarse fallback for "} +
                   invisible_places::output::PointCloudExportDensityModeName(densityMode);
+    BeginAdaptiveLodTransition(
+        session,
+        transitionSource,
+        fallback,
+        frameCounter,
+        fastBasicNavigationActive,
+        session->adaptiveLodEmergencyDemotion);
+    if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
+        transition.has_value()) {
+        return transition.value();
+    }
 
-    return {
-        .available = true,
-        .drawItems = fallback.drawItems,
-        .revision = fallback.generation,
-        .representativeCount = fallback.representativeCount,
-        .representedSourceCount = fallback.representedSourceCount,
-        .visibleRepresentedSourceCount = fallback.visibleRepresentedSourceCount,
-        .emittedRepresentedSourceCount = fallback.emittedRepresentedSourceCount,
-        .culledRepresentedSourceCount = fallback.culledRepresentedSourceCount,
-        .visibleFrontierNodeCount = fallback.visibleFrontierNodeCount,
-        .estimatedFragments = fallback.estimatedFragments,
-        .fragmentBudget = fallback.fragmentBudget,
-        .representativeBudget = fallback.representativeBudget,
-        .representativeBudgetReached = fallback.representativeBudgetReached,
-        .fragmentBudgetReached = fallback.fragmentBudgetReached,
-        .traversalMs = 0.0,
-        .drawItemBytes = fallback.drawItemBytes,
-        .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
-        .reusedPrevious = true,
-        .runtimeCacheHit = false,
-        .asyncPending = scheduled,
-        .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
-        .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
-        .requestedDensityMode = densityMode,
-        .displayedDensityMode = PointCloudExportDensityMode::FastAdaptivePreview,
-        .runtimeStatus = session->adaptiveLodRuntimeStatus,
-        .persistentCacheStatus = session->pointLodCacheStatus,
-        .fallbackState = session->adaptiveLodFallbackState,
-    };
+    return makeResultFromEntry(fallback, true, false, scheduled);
+}
+
+void RememberDisplayedAdaptiveLodEntry(
+    PreviewLayerSession* session,
+    const AdaptiveLodBuildResult& result,
+    std::uint64_t frameCounter) {
+    if (session == nullptr || !result.available || result.drawItems == nullptr || result.drawItems->empty()) {
+        return;
+    }
+
+    AdaptiveLodCacheState displayed;
+    displayed.valid = true;
+    displayed.coarseFallback = result.fallbackState.find("coarse fallback") != std::string::npos;
+    displayed.generation = result.revision;
+    displayed.createdFrame =
+        frameCounter >= result.displayedCacheAgeFrames ? frameCounter - result.displayedCacheAgeFrames : frameCounter;
+    displayed.lastUsedFrame = frameCounter;
+    displayed.representativeCount = result.representativeCount;
+    displayed.representedSourceCount = result.representedSourceCount;
+    displayed.visibleRepresentedSourceCount = result.visibleRepresentedSourceCount;
+    displayed.emittedRepresentedSourceCount = result.emittedRepresentedSourceCount;
+    displayed.culledRepresentedSourceCount = result.culledRepresentedSourceCount;
+    displayed.visibleFrontierNodeCount = result.visibleFrontierNodeCount;
+    displayed.frontierNodeIndices = result.frontierNodeIndices;
+    displayed.representativeDelta = result.representativeDelta;
+    displayed.promotedNodeCount = result.promotedNodeCount;
+    displayed.demotedNodeCount = result.demotedNodeCount;
+    displayed.hysteresisKeptNodeCount = result.hysteresisKeptNodeCount;
+    displayed.hysteresisPromoteScale = result.hysteresisPromoteScale;
+    displayed.hysteresisDemoteScale = result.hysteresisDemoteScale;
+    displayed.estimatedFragments = result.estimatedFragments;
+    displayed.fragmentBudget = result.fragmentBudget;
+    displayed.representativeBudget = result.representativeBudget;
+    displayed.representativeBudgetReached = result.representativeBudgetReached;
+    displayed.fragmentBudgetReached = result.fragmentBudgetReached;
+    displayed.drawItemBytes = result.drawItemBytes;
+    displayed.densityMode = result.displayedDensityMode;
+    displayed.drawItems = result.drawItems;
+    session->adaptiveLodDisplayedEntry = std::move(displayed);
 }
 
 bool PopulateAdaptivePointCloudLayer(
@@ -4028,6 +4287,16 @@ bool PopulateAdaptivePointCloudLayer(
         layer->adaptiveEmittedRepresentedSourceCount = result.emittedRepresentedSourceCount;
         layer->adaptiveCulledRepresentedSourceCount = result.culledRepresentedSourceCount;
         layer->adaptiveVisibleFrontierNodeCount = result.visibleFrontierNodeCount;
+        layer->adaptiveRepresentativeDelta = result.representativeDelta;
+        layer->adaptivePromotedNodeCount = result.promotedNodeCount;
+        layer->adaptiveDemotedNodeCount = result.demotedNodeCount;
+        layer->adaptiveHysteresisKeptNodeCount = result.hysteresisKeptNodeCount;
+        layer->adaptiveHysteresisPromoteScale = result.hysteresisPromoteScale;
+        layer->adaptiveHysteresisDemoteScale = result.hysteresisDemoteScale;
+        layer->adaptiveActiveTransitionCount = result.activeTransitionCount;
+        layer->adaptiveAverageTransitionAgeMs = result.averageTransitionAgeMs;
+        layer->adaptiveMaxTransitionAgeMs = result.maxTransitionAgeMs;
+        layer->adaptiveIdleRefinementPending = result.idleRefinementPending;
         layer->adaptiveEstimatedFragments = result.estimatedFragments;
         layer->adaptiveFragmentBudget = result.fragmentBudget;
         layer->adaptiveRepresentativeBudget = result.representativeBudget;
@@ -4061,6 +4330,16 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveEmittedRepresentedSourceCount = result.emittedRepresentedSourceCount;
     layer->adaptiveCulledRepresentedSourceCount = result.culledRepresentedSourceCount;
     layer->adaptiveVisibleFrontierNodeCount = result.visibleFrontierNodeCount;
+    layer->adaptiveRepresentativeDelta = result.representativeDelta;
+    layer->adaptivePromotedNodeCount = result.promotedNodeCount;
+    layer->adaptiveDemotedNodeCount = result.demotedNodeCount;
+    layer->adaptiveHysteresisKeptNodeCount = result.hysteresisKeptNodeCount;
+    layer->adaptiveHysteresisPromoteScale = result.hysteresisPromoteScale;
+    layer->adaptiveHysteresisDemoteScale = result.hysteresisDemoteScale;
+    layer->adaptiveActiveTransitionCount = result.activeTransitionCount;
+    layer->adaptiveAverageTransitionAgeMs = result.averageTransitionAgeMs;
+    layer->adaptiveMaxTransitionAgeMs = result.maxTransitionAgeMs;
+    layer->adaptiveIdleRefinementPending = result.idleRefinementPending;
     layer->adaptiveEstimatedFragments = result.estimatedFragments;
     layer->adaptiveFragmentBudget = result.fragmentBudget;
     layer->adaptiveRepresentativeBudget = result.representativeBudget;
@@ -4081,6 +4360,7 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveLodDisplayedDensity =
         invisible_places::output::PointCloudExportDensityModeName(result.displayedDensityMode);
     layer->adaptiveLodFallbackState = result.fallbackState;
+    RememberDisplayedAdaptiveLodEntry(session, result, frameCounter);
     return true;
 }
 
@@ -4124,8 +4404,12 @@ void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
     }
     session->adaptiveLodCache = {};
     session->adaptiveLodDisplayedBase = {};
+    session->adaptiveLodDisplayedEntry = {};
     session->adaptiveLodMotionPatch = {};
     session->adaptiveLodIdleCandidate = {};
+    session->adaptiveLodTransitionSource = {};
+    session->adaptiveLodTransitionTarget = {};
+    session->adaptiveLodTransitionDrawItems.reset();
     session->adaptiveLodRuntimeCache.clear();
     session->adaptiveLodRevisionCounter = 0;
     session->adaptiveLodRequestGeneration = 0;
@@ -4135,6 +4419,8 @@ void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
     session->adaptiveLodMotionPatchApplyCount = 0;
     session->adaptiveLodCandidateDemotionBlockedCount = 0;
     session->adaptiveLodSkippedMotionPatchCount = 0;
+    session->adaptiveLodTransitionApplyCount = 0;
+    session->adaptiveLodMaxRepresentativeDeltaPerFrame = 0;
     session->adaptiveLodMotionPatchRepresentativeCount = 0;
     session->adaptiveLodCoverageGapSourceCount = 0;
     session->adaptiveLodRuntimeStatus = "runtime cache empty";
@@ -4148,6 +4434,19 @@ void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
     session->adaptiveLodEmittedRepresentedSourceCount = 0;
     session->adaptiveLodCulledRepresentedSourceCount = 0;
     session->adaptiveLodVisibleFrontierNodeCount = 0;
+    session->adaptiveLodRepresentativeDelta = 0;
+    session->adaptiveLodPromotedNodeCount = 0;
+    session->adaptiveLodDemotedNodeCount = 0;
+    session->adaptiveLodHysteresisKeptNodeCount = 0;
+    session->adaptiveLodHysteresisPromoteScale = 1.0F;
+    session->adaptiveLodHysteresisDemoteScale = 1.0F;
+    session->adaptiveLodTransitionActive = false;
+    session->adaptiveLodIdleRefinementPending = false;
+    session->adaptiveLodTransitionStartFrame = 0;
+    session->adaptiveLodTransitionLastFrame = 0;
+    session->adaptiveLodTransitionAgeMs = 0.0;
+    session->adaptiveLodTransitionStartedAt = {};
+    session->adaptiveLodTransitionRevision = 0;
     session->adaptiveLodRepresentativeBudgetReached = false;
     session->adaptiveLodFragmentBudgetReached = false;
     session->adaptiveLodDisplayedCacheAgeFrames = 0;
@@ -4415,7 +4714,8 @@ void PollPointCloudLodWorkers(PreviewRuntimeState* runtimeState) {
                             : "idle no-flash refine";
                     runtimeState->previewRenderStateSignatureValid = false;
                 } else {
-                    StoreAdaptiveLodCacheEntry(
+                    const auto transitionSource = AdaptiveLodDisplayedTransitionSource(session);
+                    auto storedEntry = StoreAdaptiveLodCacheEntry(
                         &session,
                         completion->key,
                         completion->densityMode,
@@ -4426,6 +4726,13 @@ void PollPointCloudLodWorkers(PreviewRuntimeState* runtimeState) {
                         runtimeState->previewFrameCounter,
                         false,
                         completion->diagnostics);
+                    BeginAdaptiveLodTransition(
+                        &session,
+                        transitionSource,
+                        storedEntry,
+                        runtimeState->previewFrameCounter,
+                        runtimeState->cameraInteraction.navigationActive,
+                        session.adaptiveLodEmergencyDemotion);
                     if (runtimeState->cameraInteraction.navigationActive && hadDisplayedBase) {
                         session.adaptiveLodMotionPatch = session.adaptiveLodCache;
                         ++session.adaptiveLodMotionPatchApplyCount;
@@ -13188,6 +13495,12 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
         AdaptiveLodDisplayKind(session.adaptiveLodMotionPatch),
         AdaptiveLodDisplayKind(session.adaptiveLodIdleCandidate),
         FormatPointCount(session.adaptiveLodSkippedMotionPatchCount).c_str());
+    ImGui::Text(
+        "Transitions: %s active, age %.1f ms, max delta/frame %s, idle refine: %s",
+        session.adaptiveLodTransitionActive ? "1" : "0",
+        session.adaptiveLodTransitionAgeMs,
+        FormatPointCount(session.adaptiveLodMaxRepresentativeDeltaPerFrame).c_str(),
+        session.adaptiveLodIdleRefinementPending ? "pending" : "complete");
     if (session.adaptiveLodCache.valid) {
         ImGui::Text(
             "Displayed: %s | key %llx | revision %s",
@@ -13217,6 +13530,16 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             FormatPointCount(session.adaptiveLodCache.visibleFrontierNodeCount).c_str(),
             FormatPointCount(session.adaptiveLodDisplayedCacheAgeFrames).c_str(),
             budgetPressure);
+        ImGui::Text(
+            "Transition diagnostics: delta %+lld reps | promoted %s | demoted %s | hysteresis-kept %s",
+            static_cast<long long>(session.adaptiveLodRepresentativeDelta),
+            FormatPointCount(session.adaptiveLodPromotedNodeCount).c_str(),
+            FormatPointCount(session.adaptiveLodDemotedNodeCount).c_str(),
+            FormatPointCount(session.adaptiveLodHysteresisKeptNodeCount).c_str());
+        ImGui::Text(
+            "Hysteresis band: promote %.2fx | demote %.2fx",
+            session.adaptiveLodHysteresisPromoteScale,
+            session.adaptiveLodHysteresisDemoteScale);
         ImGui::Text(
             "Budget: %s reps, %.0f fragments | estimated %.0f fragments",
             FormatPointCount(session.adaptiveLodCache.representativeBudget).c_str(),
@@ -18737,6 +19060,22 @@ void DrawDiagnosticsWindow(
                     FormatPointCount(diagnostics.adaptiveLodDisplayedCacheAgeFrames).c_str(),
                     budgetPressure);
                 ImGui::Text(
+                    "Adaptive transitions: %s active | avg/max age %.1f / %.1f ms | idle refine %s",
+                    FormatPointCount(diagnostics.adaptiveActiveTransitionCount).c_str(),
+                    diagnostics.adaptiveAverageTransitionAgeMs,
+                    diagnostics.adaptiveMaxTransitionAgeMs,
+                    diagnostics.adaptiveIdleRefinementPending ? "pending" : "complete");
+                ImGui::Text(
+                    "Adaptive node changes: %+lld reps | +%s / -%s nodes | hysteresis kept %s",
+                    static_cast<long long>(diagnostics.adaptiveRepresentativeDelta),
+                    FormatPointCount(diagnostics.adaptivePromotedNodeCount).c_str(),
+                    FormatPointCount(diagnostics.adaptiveDemotedNodeCount).c_str(),
+                    FormatPointCount(diagnostics.adaptiveHysteresisKeptNodeCount).c_str());
+                ImGui::Text(
+                    "Adaptive hysteresis band: promote %.2fx | demote %.2fx",
+                    diagnostics.adaptiveHysteresisPromoteScale,
+                    diagnostics.adaptiveHysteresisDemoteScale);
+                ImGui::Text(
                     "Adaptive buffer: %s",
                     !diagnostics.adaptiveLodFallbackState.empty()
                         ? diagnostics.adaptiveLodFallbackState.c_str()
@@ -19418,15 +19757,46 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     bool fastBasicExceededBudget = false;
     bool fastBasicSubmittedFullSource = false;
     bool fastBasicZoomOutUpdated = false;
+    std::uint64_t fastBasicPreviousRepresentativeCount = 0;
+    std::uint64_t fastBasicMaxRepresentativeDeltaPerFrame = 0;
+    std::uint32_t fastBasicLargeRepresentativeJumpFrames = 0;
+    std::uint32_t fastBasicTransitionActiveFrames = 0;
+    std::uint32_t fastBasicIdleRefinementPendingFrames = 0;
+    double fastBasicMaxTransitionAgeMs = 0.0;
     std::uint64_t fastBasicPreZoomOutRevision = 0;
     std::uint64_t fastBasicPostZoomOutRevision = 0;
     std::uint64_t fastBasicPreZoomOutRepresentedSource = 0;
     std::uint64_t fastBasicPostZoomOutRepresentedSource = 0;
     std::uint32_t fastBasicZoomOutSettledFrame = 0;
-    constexpr std::uint32_t kFastBasicDiagnosticFrames = 150U;
+    constexpr std::uint32_t kFastBasicDiagnosticFrames = 500U;
     constexpr std::uint32_t kFastBasicZoomInFrames = 30U;
     constexpr std::uint32_t kFastBasicZoomOutStartFrame = 60U;
     constexpr std::uint32_t kFastBasicIdleStartFrame = 90U;
+    struct FastBasicTraceRow {
+        std::uint32_t frame = 0;
+        bool moving = false;
+        std::uint64_t renderRepresentatives = 0;
+        std::uint32_t renderTransitions = 0;
+        bool sessionTransitionActive = false;
+        std::uint64_t sessionTransitionApplyCount = 0;
+        std::uint64_t displayedGeneration = 0;
+        std::uint64_t cacheGeneration = 0;
+        bool displayedCoarseFallback = false;
+        bool cacheCoarseFallback = false;
+        std::uint64_t representatives = 0;
+        std::uint64_t representedSource = 0;
+        std::int64_t representativeDelta = 0;
+        std::uint32_t promotedNodes = 0;
+        std::uint32_t demotedNodes = 0;
+        std::uint32_t hysteresisKeptNodes = 0;
+        std::uint32_t transitions = 0;
+        double transitionAgeMs = 0.0;
+        bool idleRefinementPending = false;
+        bool budgetExceeded = false;
+        bool fullSourceFallback = false;
+    };
+    std::vector<FastBasicTraceRow> fastBasicTrace;
+    fastBasicTrace.reserve(kFastBasicDiagnosticFrames);
     for (std::uint32_t frame = 0; frame < kFastBasicDiagnosticFrames; ++frame) {
         window.PollEvents();
         ++runtimeState.previewFrameCounter;
@@ -19455,6 +19825,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         viewport.UpdateRenderState(renderState);
         std::uint64_t frameAdaptiveRevision = 0;
         std::uint64_t frameAdaptiveRepresentedSource = 0;
+        std::uint64_t frameRenderRepresentatives = 0;
+        std::uint32_t frameRenderTransitions = 0;
         bool frameUsedCurrentAdaptiveSet = false;
         for (const auto& layer : renderState.pointCloudLayers) {
             if (!layer.useAdaptiveDrawItems) {
@@ -19462,6 +19834,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             }
             frameAdaptiveRevision = std::max(frameAdaptiveRevision, layer.adaptiveLodRevision);
             frameAdaptiveRepresentedSource += layer.adaptiveRepresentedSourceCount;
+            frameRenderRepresentatives += layer.drawPointCount;
+            frameRenderTransitions += layer.adaptiveActiveTransitionCount;
             frameUsedCurrentAdaptiveSet =
                 frameUsedCurrentAdaptiveSet ||
                 (!layer.adaptiveLodReusedPrevious ||
@@ -19536,6 +19910,27 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         if (!diagnostics.adaptiveLodFallbackState.empty()) {
             fastBasicFallbackState = diagnostics.adaptiveLodFallbackState;
         }
+        const auto representativeDelta =
+            fastBasicPreviousRepresentativeCount == 0ULL
+                ? 0ULL
+                : (diagnostics.adaptiveRepresentativeCount > fastBasicPreviousRepresentativeCount
+                       ? diagnostics.adaptiveRepresentativeCount - fastBasicPreviousRepresentativeCount
+                       : fastBasicPreviousRepresentativeCount - diagnostics.adaptiveRepresentativeCount);
+        fastBasicMaxRepresentativeDeltaPerFrame =
+            std::max(fastBasicMaxRepresentativeDeltaPerFrame, representativeDelta);
+        const auto largeJumpThreshold = std::max<std::uint64_t>(
+            8192ULL,
+            fastBasicPreviousRepresentativeCount / 6ULL);
+        if (fastBasicPreviousRepresentativeCount > 0ULL &&
+            representativeDelta > largeJumpThreshold &&
+            diagnostics.adaptiveActiveTransitionCount == 0U) {
+            ++fastBasicLargeRepresentativeJumpFrames;
+        }
+        fastBasicPreviousRepresentativeCount = diagnostics.adaptiveRepresentativeCount;
+        fastBasicTransitionActiveFrames += diagnostics.adaptiveActiveTransitionCount > 0U ? 1U : 0U;
+        fastBasicIdleRefinementPendingFrames += diagnostics.adaptiveIdleRefinementPending ? 1U : 0U;
+        fastBasicMaxTransitionAgeMs =
+            std::max(fastBasicMaxTransitionAgeMs, diagnostics.adaptiveMaxTransitionAgeMs);
         fastBasicSawPreviousSet =
             fastBasicSawPreviousSet ||
             diagnostics.adaptiveLodFallbackState.find("reused") != std::string::npos;
@@ -19553,6 +19948,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             fastBasicSubmittedFullSource ||
             (diagnostics.pointSubmittedCount >= runtimeState.sessions.front().totalPrimitives &&
              runtimeState.sessions.front().totalPrimitives > 0);
+        fastBasicTrace.push_back(
+            {.frame = frame,
+             .moving = moving,
+             .renderRepresentatives = frameRenderRepresentatives,
+             .renderTransitions = frameRenderTransitions,
+             .sessionTransitionActive = runtimeState.sessions.front().adaptiveLodTransitionActive,
+             .sessionTransitionApplyCount = runtimeState.sessions.front().adaptiveLodTransitionApplyCount,
+             .displayedGeneration = runtimeState.sessions.front().adaptiveLodDisplayedEntry.generation,
+             .cacheGeneration = runtimeState.sessions.front().adaptiveLodCache.generation,
+             .displayedCoarseFallback = runtimeState.sessions.front().adaptiveLodDisplayedEntry.coarseFallback,
+             .cacheCoarseFallback = runtimeState.sessions.front().adaptiveLodCache.coarseFallback,
+             .representatives = diagnostics.adaptiveRepresentativeCount,
+             .representedSource = diagnostics.adaptiveRepresentedSourceCount,
+             .representativeDelta = diagnostics.adaptiveRepresentativeDelta,
+             .promotedNodes = diagnostics.adaptivePromotedNodeCount,
+             .demotedNodes = diagnostics.adaptiveDemotedNodeCount,
+             .hysteresisKeptNodes = diagnostics.adaptiveHysteresisKeptNodeCount,
+             .transitions = diagnostics.adaptiveActiveTransitionCount,
+             .transitionAgeMs = diagnostics.adaptiveMaxTransitionAgeMs,
+             .idleRefinementPending = diagnostics.adaptiveIdleRefinementPending,
+             .budgetExceeded =
+                 (diagnostics.adaptiveRepresentativeBudget > 0 &&
+                  diagnostics.adaptiveRepresentativeCount > diagnostics.adaptiveRepresentativeBudget) ||
+                 (diagnostics.adaptiveFragmentBudget > 0.0 &&
+                  diagnostics.adaptiveEstimatedFragments > diagnostics.adaptiveFragmentBudget + 0.5),
+             .fullSourceFallback =
+                 diagnostics.pointSubmittedCount >= runtimeState.sessions.front().totalPrimitives &&
+                 runtimeState.sessions.front().totalPrimitives > 0});
         if (!moving) {
             std::this_thread::sleep_for(std::chrono::milliseconds{8});
         }
@@ -19630,6 +20053,39 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         representedSource += layer.adaptiveRepresentedSourceCount;
     }
 
+    const auto fastBasicTracePath = outputDirectory / "fast_basic_transition_trace.csv";
+    {
+        std::ofstream trace{fastBasicTracePath, std::ios::trunc};
+        trace << "frame,moving,representatives,represented_source,representative_delta,promoted_nodes,"
+                 "demoted_nodes,hysteresis_kept_nodes,transitions,transition_age_ms,idle_refinement_pending,"
+                 "budget_exceeded,full_source_fallback,render_representatives,render_transitions,"
+                 "session_transition_active,session_transition_apply_count,displayed_generation,cache_generation,"
+                 "displayed_coarse_fallback,cache_coarse_fallback\n";
+        for (const auto& row : fastBasicTrace) {
+            trace << row.frame << ','
+                  << (row.moving ? "true" : "false") << ','
+                  << row.representatives << ','
+                  << row.representedSource << ','
+                  << row.representativeDelta << ','
+                  << row.promotedNodes << ','
+                  << row.demotedNodes << ','
+                  << row.hysteresisKeptNodes << ','
+                  << row.transitions << ','
+                  << row.transitionAgeMs << ','
+                  << (row.idleRefinementPending ? "true" : "false") << ','
+                  << (row.budgetExceeded ? "true" : "false") << ','
+                  << (row.fullSourceFallback ? "true" : "false") << ','
+                  << row.renderRepresentatives << ','
+                  << row.renderTransitions << ','
+                  << (row.sessionTransitionActive ? "true" : "false") << ','
+                  << row.sessionTransitionApplyCount << ','
+                  << row.displayedGeneration << ','
+                  << row.cacheGeneration << ','
+                  << (row.displayedCoarseFallback ? "true" : "false") << ','
+                  << (row.cacheCoarseFallback ? "true" : "false") << '\n';
+        }
+    }
+
     const auto metricsPath = outputDirectory / "lod_compare_metrics.json";
     {
         std::ofstream metrics{metricsPath, std::ios::trunc};
@@ -19637,6 +20093,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"point_cloud\": \"" << pointCloudPath.lexically_normal().generic_string() << "\",\n"
                 << "  \"full_source_exr\": \"" << fullPath.lexically_normal().generic_string() << "\",\n"
                 << "  \"adaptive_exr\": \"" << adaptivePath.lexically_normal().generic_string() << "\",\n"
+                << "  \"fast_basic_trace_csv\": \"" << fastBasicTracePath.lexically_normal().generic_string() << "\",\n"
                 << "  \"full_source_coverage\": " << fullCoverage << ",\n"
                 << "  \"adaptive_coverage\": " << adaptiveCoverage << ",\n"
                 << "  \"coverage_ratio\": "
@@ -19676,6 +20133,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"fast_basic_pre_zoom_out_represented_source\": " << fastBasicPreZoomOutRepresentedSource << ",\n"
                 << "  \"fast_basic_post_zoom_out_represented_source\": " << fastBasicPostZoomOutRepresentedSource << ",\n"
                 << "  \"fast_basic_zoom_out_settled_frame\": " << fastBasicZoomOutSettledFrame << ",\n"
+                << "  \"fast_basic_max_representative_delta_per_frame\": "
+                << fastBasicMaxRepresentativeDeltaPerFrame << ",\n"
+                << "  \"fast_basic_large_representative_jump_frames\": "
+                << fastBasicLargeRepresentativeJumpFrames << ",\n"
+                << "  \"fast_basic_transition_active_frames\": " << fastBasicTransitionActiveFrames << ",\n"
+                << "  \"fast_basic_idle_refinement_pending_frames\": "
+                << fastBasicIdleRefinementPendingFrames << ",\n"
+                << "  \"fast_basic_max_transition_age_ms\": " << fastBasicMaxTransitionAgeMs << ",\n"
                 << "  \"fast_basic_exceeded_budget\": "
                 << (fastBasicExceededBudget ? "true" : "false") << ",\n"
                 << "  \"fast_basic_submitted_full_source\": "
@@ -19689,6 +20154,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::cout << "Wrote LOD comparison outputs:\n"
               << "- " << fullPath.string() << "\n"
               << "- " << adaptivePath.string() << "\n"
+              << "- " << fastBasicTracePath.string() << "\n"
               << "- " << metricsPath.string() << "\n"
               << "Coverage ratio: " << (fullCoverage > 0.0 ? adaptiveCoverage / fullCoverage : 0.0)
               << " | luminance ratio: "
@@ -19700,6 +20166,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " | max estimated fragments " << fastBasicMaxEstimatedFragments
               << " / fragment budget " << fastBasicMaxFragmentBudget
               << " | min FPS " << fastBasicMinFps
+              << " | max rep delta/frame " << fastBasicMaxRepresentativeDeltaPerFrame
+              << " | large jump frames " << fastBasicLargeRepresentativeJumpFrames
               << " | full-source fallback: " << (fastBasicSubmittedFullSource ? "yes" : "no")
               << " | budget exceeded: " << (fastBasicExceededBudget ? "yes" : "no")
               << std::endl;

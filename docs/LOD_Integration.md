@@ -1,6 +1,6 @@
 # Adaptive Point-Cloud LOD Integration Audit
 
-Date: May 27, 2026
+Date: May 28, 2026
 
 This document compares the ideal LOD system in
 `docs/point_cloud_adaptive_lod_fast_beauty.md` with the current project state.
@@ -39,6 +39,15 @@ sample-count cap anymore.
   use and cached per layer by a compact traversal key.
 - The viewport can reuse a previous adaptive draw-item set while async traversal
   is pending.
+- Fast Basic adaptive emission uses deterministic stable-ranked representative
+  prefixes, so lower budgets keep a spatially distributed subset of higher
+  budgets instead of swapping unrelated samples.
+- Traversal accepts the previously displayed frontier, applies separate
+  promote/demote hysteresis bands, and reports promoted, demoted,
+  hysteresis-kept, and representative-delta diagnostics.
+- Fast Basic draw-item replacement is bounded by deterministic mixed
+  transitions. Idle refinement reports `Refining point cloud detail...` while
+  detail is introduced over multiple frames.
 - Per-frame draw-item buffers and an EXR draw-item buffer exist. They grow when
   capacity is insufficient and rewrite descriptors only on reallocation.
 - Current point, surfel, constant-simple, and Fast Basic vertex shaders can read
@@ -52,6 +61,9 @@ sample-count cap anymore.
   adaptive representative count, represented source count, traversal time,
   draw-item upload time, draw-item reallocations, cache status, runtime status,
   and adaptive requested/displayed density.
+- The diagnostics overlay also reports representative delta per frame,
+  promoted/demoted frontier nodes, hysteresis-kept nodes, active transition
+  count/age, hysteresis band, and idle refinement pending/completed state.
 - PLY load progress reports points read, payload bytes read, elapsed time, and
   ETA when enough samples exist.
 - LOD hierarchy/cache rebuild progress reports elapsed time, approximate ETA,
@@ -62,7 +74,12 @@ sample-count cap anymore.
   runtime cache hit/miss, async state, and whether the displayed adaptive buffer
   is exact or coarse fallback.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
-  `lod_compare_metrics.json`.
+  `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
+- Repeated 500-frame `--lod-compare` runs on
+  `Data/Site3-Mid-1mm100M.ply` report deterministic smoothness metrics for the
+  scripted Fast Basic path: max absolute representative delta 5,640, 22
+  transition-active frames, 0 large representative-jump frames, 0
+  budget-exceeded frames, and 0 full-source fallback frames.
 
 ## Partially Implemented
 
@@ -91,15 +108,20 @@ These pieces exist, but they are not yet the ideal system described in
   buffers. The adaptive path treats them mostly as a debug/loading cap, but the
   UI still exposes a generic `Budget` control that can be confused with LOD.
 - LOD compensation exists as footprint, opacity, and emission fields, but it is
-  simplified. It lacks full optical-depth policy controls, `lodBlend`, stable
-  stochastic transitions, representative classes, and feature-preserving
-  palettes.
+  simplified. It lacks full optical-depth policy controls, Beauty-specific
+  `lodBlend`, representative classes, and feature-preserving palettes.
 - Pixel screen sprites, world-mm screen sprites, world surfels, and
   camera-facing world sprites share too much selection logic. Their render costs
   and failure modes are different.
 - The LOD comparison metrics are useful but minimal. They report coverage and
-  mean luminance ratios, not image error maps, timing breakdowns, peak memory,
-  upload bandwidth, or per-render-pass GPU time.
+  mean luminance ratios plus a Fast Basic transition trace, not image error
+  maps, timing breakdowns, peak memory, upload bandwidth, or per-render-pass GPU
+  time.
+- The 100M `--lod-compare` path proves bounded replacement and deterministic
+  trace metrics, but it does not automatically prove final exact idle
+  refinement completion. The current 500-frame harness still ends with async
+  refinement pending under the no-flash fallback guard, so final Stage 03 visual
+  smoothness acceptance still requires the manual checklist.
 
 ## Not Implemented
 
@@ -117,7 +139,8 @@ These are still target-system items from the ideal plan.
 - Representative classes for spatial coverage, color contrast, normal/edge
   features, scalar min/max/thresholds, emissive/accent points, and blue-noise
   fill.
-- Continuous LOD rank, parent/child crossfade, or stable stochastic transition.
+- Beauty-specific parent/child opacity crossfade or optical-depth transition
+  policy.
 - Dedicated LOD style data block with explicit compensation/footprint policy.
 - Vulkan timestamp queries for point pass, depth prepass, accumulation,
   EDL/composite, upload, and render-state submission.
@@ -231,7 +254,8 @@ GPU compute.
   surfels, and camera-facing world sprites.
 - Add representative classes for spatial coverage, scalar extremes,
   emissive/accent points, color contrast, and normal/edge variation.
-- Add stable rank or blend fields to reduce popping during parent/child changes.
+- Improve the current deterministic rank toward blue-noise/class-aware ordering
+  if Stage 04 representatives expose better statistics.
 
 Metrics to watch:
 
@@ -324,6 +348,12 @@ Initial quality targets:
 - Adaptive renders should not be empty or stuck on coarse fallback.
 - Scalar, water-effect, normal, source-color, depth, and AOV lookups must remain
   source-correct through `drawItem.sourcePointIndex`.
+- Stage 03 manual acceptance for the 100M Fast Basic path: slow orbit has no
+  popping/flicker/stochastic crawl; slow dolly through thresholds shows gradual
+  parent/child replacement; fast navigation then stop refines over multiple
+  frames; repeated back-and-forth motion transitions the same areas
+  consistently; HUD/trace deltas stay clamped, transitions age normally, idle
+  refinement completes, and Stage 02 boundedness remains intact.
 
 Initial performance targets:
 

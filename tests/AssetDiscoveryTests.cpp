@@ -54,6 +54,7 @@
 #include <string>
 #include <string_view>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1406,6 +1407,228 @@ TEST_CASE("Point-cloud draw items use a std430-compatible GPU layout", "[pointcl
     CHECK(offsetof(PointCloudDrawItemGpu, renderAreaPixels) == 28U);
 }
 
+TEST_CASE("Point-cloud adaptive LOD traversal emits deterministic stable-ranked draw items", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U, .maxInternalRepresentatives = 32U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 24U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 10000.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+
+    const auto first = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    const auto second = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    REQUIRE(first.size() == second.size());
+    REQUIRE(first.size() > 8U);
+    for (std::size_t index = 0; index < first.size(); ++index) {
+        CHECK(first[index].sourcePointIndex == second[index].sourcePointIndex);
+        CHECK(first[index].reserved0 == second[index].reserved0);
+        CHECK(first[index].reserved1 == second[index].reserved1);
+    }
+}
+
+TEST_CASE("Point-cloud adaptive LOD lower budgets select stable rank prefixes", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U, .maxInternalRepresentatives = 32U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 10000.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+
+    params.maxRepresentatives = 24U;
+    const auto highBudget = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+    params.maxRepresentatives = 12U;
+    const auto lowBudget = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params);
+
+    REQUIRE(highBudget.size() >= lowBudget.size());
+    REQUIRE(lowBudget.size() == 12U);
+    std::unordered_set<std::uint32_t> highSeeds;
+    for (const auto& item : highBudget) {
+        highSeeds.insert(item.reserved0);
+    }
+    for (const auto& item : lowBudget) {
+        CHECK(highSeeds.contains(item.reserved0));
+    }
+}
+
+TEST_CASE("Point-cloud LOD cache-loaded traversal preserves stable rank ordering", "[pointcloud][lod][cache]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 6;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto tempRoot =
+        std::filesystem::temp_directory_path() /
+        ("InvisiblePlacesLodRankCacheTest-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(tempRoot);
+    const auto sourcePath = tempRoot / "fixture.ply";
+    {
+        std::ofstream source{sourcePath};
+        source << "ply\nformat ascii 1.0\ncomment stable rank fixture\nend_header\n";
+    }
+    cloud.sourcePath = sourcePath;
+
+    const pc::PointCloudLodBuildConfig config{
+        .maxLeafSourcePoints = 1U,
+        .maxDepth = 8U,
+        .maxInternalRepresentatives = 24U};
+    const auto fresh = pc::BuildPointCloudLodHierarchy(cloud, config);
+    REQUIRE(!fresh.Empty());
+    const auto source = pc::MakePointCloudLodCacheSource(sourcePath, cloud);
+    const auto cachePath = pc::BuildPointCloudLodCachePath(tempRoot / "lod", sourcePath);
+    std::string errorMessage;
+    REQUIRE(pc::SavePointCloudLodHierarchyCache(cachePath, source, config, fresh, &errorMessage));
+    const auto loaded = pc::LoadPointCloudLodHierarchyCache(cachePath, source, config);
+    REQUIRE(loaded.loaded);
+
+    pc::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 12U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 10000.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+
+    const auto freshItems = pc::TraversePointCloudLodHierarchy(fresh, params);
+    const auto loadedItems = pc::TraversePointCloudLodHierarchy(loaded.hierarchy, params);
+    REQUIRE(freshItems.size() == loadedItems.size());
+    for (std::size_t index = 0; index < freshItems.size(); ++index) {
+        CHECK(freshItems[index].sourcePointIndex == loadedItems[index].sourcePointIndex);
+        CHECK(freshItems[index].reserved0 == loadedItems[index].reserved0);
+        CHECK(freshItems[index].reserved1 == loadedItems[index].reserved1);
+    }
+
+    std::filesystem::remove_all(tempRoot);
+}
+
+TEST_CASE("Point-cloud adaptive LOD hysteresis prevents threshold flip-flop", "[pointcloud][lod]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = invisible_places::renderer::pointcloud::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U, .maxInternalRepresentatives = 16U});
+    REQUIRE(!hierarchy.Empty());
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 128U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 15.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    params.hysteresisPromoteScale = 1.10F;
+    params.hysteresisDemoteScale = 0.76F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 7.0F);
+
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics firstDiagnostics;
+    const auto first = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params,
+        {},
+        &firstDiagnostics);
+    REQUIRE(!first.empty());
+    REQUIRE(!firstDiagnostics.frontierNodeIndices.empty());
+
+    params.previousFrontierNodeIndices = firstDiagnostics.frontierNodeIndices;
+    params.targetProjectedSpacingPixels = 25.0F;
+    invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics secondDiagnostics;
+    const auto second = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+        hierarchy,
+        params,
+        {},
+        &secondDiagnostics);
+    REQUIRE(!second.empty());
+    INFO("first frontier " << firstDiagnostics.frontierNodeIndices.size()
+                           << " second frontier " << secondDiagnostics.frontierNodeIndices.size()
+                           << " promoted " << secondDiagnostics.promotedNodeCount
+                           << " demoted " << secondDiagnostics.demotedNodeCount
+                           << " kept " << secondDiagnostics.hysteresisKeptNodeCount);
+    CHECK(secondDiagnostics.demotedNodeCount == 0U);
+    CHECK(secondDiagnostics.hysteresisKeptNodeCount > 0U);
+    CHECK(secondDiagnostics.frontierNodeIndices == firstDiagnostics.frontierNodeIndices);
+}
+
 TEST_CASE("Adaptive LOD signature uses traversal metadata instead of vector hashing", "[pointcloud][lod][source]") {
     const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
     const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
@@ -1872,6 +2095,11 @@ TEST_CASE("LOD HUD reports adaptive density fallback and hierarchy details", "[u
           std::string::npos);
     CHECK(lodDebugSection.find("\"Displayed base/patch/candidate: %s / %s / %s | skipped patches: %s\"") !=
           std::string::npos);
+    CHECK(lodDebugSection.find("\"Transitions: %s active, age %.1f ms, max delta/frame %s, idle refine: %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"Transition diagnostics: delta %+lld reps | promoted %s | demoted %s | hysteresis-kept %s\"") !=
+          std::string::npos);
+    CHECK(lodDebugSection.find("\"Hysteresis band: promote %.2fx | demote %.2fx\"") != std::string::npos);
     CHECK(lodDebugSection.find("\"coarse fallback\"") != std::string::npos);
     CHECK(lodDebugSection.find("\"exact traversal\"") != std::string::npos);
 }

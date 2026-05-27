@@ -18,6 +18,7 @@
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <glm/geometric.hpp>
@@ -229,6 +230,97 @@ std::uint64_t RepresentativeMortonKey(const RepresentativeVoxelKey& key, std::ui
         morton = (morton << 1U) | ((key.z >> shift) & 1U);
     }
     return morton;
+}
+
+std::uint64_t MixStableLodHash(std::uint64_t value) {
+    value ^= value >> 30U;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27U;
+    value *= 0x94d049bb133111ebULL;
+    value ^= value >> 31U;
+    return value;
+}
+
+std::uint64_t ReverseBits64(std::uint64_t value) {
+    value = ((value & 0x5555555555555555ULL) << 1U) | ((value >> 1U) & 0x5555555555555555ULL);
+    value = ((value & 0x3333333333333333ULL) << 2U) | ((value >> 2U) & 0x3333333333333333ULL);
+    value = ((value & 0x0f0f0f0f0f0f0f0fULL) << 4U) | ((value >> 4U) & 0x0f0f0f0f0f0f0f0fULL);
+    value = ((value & 0x00ff00ff00ff00ffULL) << 8U) | ((value >> 8U) & 0x00ff00ff00ff00ffULL);
+    value = ((value & 0x0000ffff0000ffffULL) << 16U) | ((value >> 16U) & 0x0000ffff0000ffffULL);
+    value = (value << 32U) | (value >> 32U);
+    return value;
+}
+
+std::uint32_t QuantizedRepresentativeCoordinate(float value, float minimum, float maximum) {
+    const float extent = maximum - minimum;
+    if (extent <= std::numeric_limits<float>::epsilon()) {
+        return 0U;
+    }
+    const auto normalized = std::clamp(
+        (static_cast<double>(value) - static_cast<double>(minimum)) / static_cast<double>(extent),
+        0.0,
+        0.999999999999);
+    return static_cast<std::uint32_t>(normalized * 1024.0);
+}
+
+std::uint64_t StableRepresentativeRankKey(
+    const PointCloudLodNode& node,
+    const PointCloudLodRepresentative& representative) {
+    RepresentativeVoxelKey key{
+        .x = QuantizedRepresentativeCoordinate(representative.position.x, node.bounds.minimum.x, node.bounds.maximum.x),
+        .y = QuantizedRepresentativeCoordinate(representative.position.y, node.bounds.minimum.y, node.bounds.maximum.y),
+        .z = QuantizedRepresentativeCoordinate(representative.position.z, node.bounds.minimum.z, node.bounds.maximum.z),
+    };
+    constexpr std::uint32_t kRankMortonDepth = 10U;
+    const std::uint64_t morton = RepresentativeMortonKey(key, kRankMortonDepth);
+    const std::uint64_t lowDiscrepancySpatialOrder = ReverseBits64(morton << (64U - (kRankMortonDepth * 3U)));
+    const std::uint64_t tieBreak =
+        MixStableLodHash((static_cast<std::uint64_t>(representative.sourcePointIndex) << 32U) ^
+                         static_cast<std::uint64_t>(representative.representedSourceCount));
+    return lowDiscrepancySpatialOrder ^ (tieBreak >> 24U);
+}
+
+std::uint32_t StableRepresentativeSeed(
+    std::uint32_t nodeIndex,
+    const PointCloudLodRepresentative& representative,
+    std::uint64_t rankKey) {
+    const auto mixed = MixStableLodHash(
+        rankKey ^
+        (static_cast<std::uint64_t>(nodeIndex) << 32U) ^
+        static_cast<std::uint64_t>(representative.sourcePointIndex));
+    return static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
+}
+
+struct RankedRepresentativeOffset {
+    std::uint32_t offset = 0;
+    std::uint64_t rankKey = 0;
+};
+
+std::vector<RankedRepresentativeOffset> RankedRepresentativeOffsets(
+    const PointCloudLodHierarchy& hierarchy,
+    const PointCloudLodNode& node,
+    std::uint32_t availableCount) {
+    std::vector<RankedRepresentativeOffset> ranked;
+    ranked.reserve(availableCount);
+    for (std::uint32_t offset = 0; offset < availableCount; ++offset) {
+        const auto representativeIndex = node.firstRepresentative + offset;
+        if (representativeIndex >= hierarchy.representatives.size()) {
+            continue;
+        }
+        ranked.push_back(
+            {.offset = offset,
+             .rankKey = StableRepresentativeRankKey(node, hierarchy.representatives[representativeIndex])});
+    }
+    std::sort(
+        ranked.begin(),
+        ranked.end(),
+        [](const RankedRepresentativeOffset& left, const RankedRepresentativeOffset& right) {
+            if (left.rankKey != right.rankKey) {
+                return left.rankKey < right.rankKey;
+            }
+            return left.offset < right.offset;
+        });
+    return ranked;
 }
 
 std::uint32_t InitialRepresentativeVoxelDepth(
@@ -999,6 +1091,7 @@ struct FrontierSplitCandidate {
     std::uint32_t oldRepresentativeEstimate = 0;
     std::uint32_t replacementRepresentativeEstimate = 0;
     float score = 0.0F;
+    bool keptByHysteresis = false;
 };
 
 struct FrontierSplitCandidateCompare {
@@ -1103,6 +1196,51 @@ std::uint64_t DrawItemRepresentedSourceCount(const std::vector<PointCloudDrawIte
     return count;
 }
 
+std::uint32_t FrontierRepresentativeEstimate(
+    const PointCloudLodHierarchy& hierarchy,
+    const std::vector<std::uint32_t>& frontierNodeIndices) {
+    std::uint32_t estimate = 0;
+    for (const auto nodeIndex : frontierNodeIndices) {
+        estimate += RepresentativeEstimate(hierarchy, nodeIndex);
+    }
+    return estimate;
+}
+
+bool ContainsPreviousFrontierDescendant(
+    const PointCloudLodHierarchy& hierarchy,
+    std::uint32_t nodeIndex,
+    const std::unordered_set<std::uint32_t>& previousFrontier,
+    std::unordered_map<std::uint32_t, bool>* cache) {
+    if (nodeIndex >= hierarchy.nodes.size()) {
+        return false;
+    }
+    if (previousFrontier.contains(nodeIndex)) {
+        return true;
+    }
+    if (cache != nullptr) {
+        if (const auto cached = cache->find(nodeIndex); cached != cache->end()) {
+            return cached->second;
+        }
+    }
+
+    const auto& node = hierarchy.nodes[nodeIndex];
+    bool contains = false;
+    for (std::uint32_t childOffset = 0; childOffset < node.childCount; ++childOffset) {
+        if (ContainsPreviousFrontierDescendant(
+                hierarchy,
+                node.childIndices[childOffset],
+                previousFrontier,
+                cache)) {
+            contains = true;
+            break;
+        }
+    }
+    if (cache != nullptr) {
+        (*cache)[nodeIndex] = contains;
+    }
+    return contains;
+}
+
 std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
     const PointCloudLodHierarchy& hierarchy,
     const PointCloudLodTraversalParams& params,
@@ -1114,6 +1252,18 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
     std::vector<AdaptiveFrontierNode> frontier;
     if (TraversalCancelled(stopToken)) {
         return frontier;
+    }
+    const float promoteScale = std::max(1.0F, params.hysteresisPromoteScale);
+    const float demoteScale = std::clamp(params.hysteresisDemoteScale, 0.05F, promoteScale);
+    std::unordered_set<std::uint32_t> previousFrontier{
+        params.previousFrontierNodeIndices.begin(),
+        params.previousFrontierNodeIndices.end()};
+    std::unordered_map<std::uint32_t, bool> previousDescendantCache;
+    if (diagnostics != nullptr) {
+        diagnostics->previousFrontierNodeCount = static_cast<std::uint32_t>(
+            std::min<std::size_t>(previousFrontier.size(), std::numeric_limits<std::uint32_t>::max()));
+        diagnostics->hysteresisPromoteScale = promoteScale;
+        diagnostics->hysteresisDemoteScale = demoteScale;
     }
     AdaptiveFrontierNode root;
     if (!MakeAdaptiveFrontierNode(
@@ -1152,11 +1302,43 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
             return;
         }
         const auto& node = hierarchy.nodes[nodeIndex];
-        if (node.IsLeaf() ||
-            (!frontier[frontierIndex].violatesTargetSpacing &&
-             !frontier[frontierIndex].violatesRepresentativeDiameter)) {
+        if (node.IsLeaf()) {
             return;
         }
+
+        const bool wasPreviouslyRefined =
+            !previousFrontier.empty() &&
+            ContainsPreviousFrontierDescendant(
+                hierarchy,
+                nodeIndex,
+                previousFrontier,
+                &previousDescendantCache);
+        const float activeScale = wasPreviouslyRefined ? demoteScale : promoteScale;
+        const float promoteSpacingThreshold = targetSpacingPixels * promoteScale;
+        const float promoteDiameterThreshold = maxRepresentativeDiameterPixels * promoteScale;
+        const float activeSpacingThreshold = targetSpacingPixels * activeScale;
+        const float activeDiameterThreshold = maxRepresentativeDiameterPixels * activeScale;
+        const bool promoteSpacingViolated =
+            targetSpacingPixels > 0.0F && frontier[frontierIndex].projectedSpacingPixels > promoteSpacingThreshold;
+        const bool promoteDiameterViolated =
+            maxRepresentativeDiameterPixels > 0.0F &&
+            frontier[frontierIndex].footprint.DiameterPixels() > promoteDiameterThreshold;
+        const bool activeSpacingViolated =
+            targetSpacingPixels > 0.0F && frontier[frontierIndex].projectedSpacingPixels > activeSpacingThreshold;
+        const bool activeDiameterViolated =
+            maxRepresentativeDiameterPixels > 0.0F &&
+            frontier[frontierIndex].footprint.DiameterPixels() > activeDiameterThreshold;
+        if (!activeSpacingViolated && !activeDiameterViolated) {
+            return;
+        }
+        frontier[frontierIndex].violatesTargetSpacing = activeSpacingViolated;
+        frontier[frontierIndex].violatesRepresentativeDiameter = activeDiameterViolated;
+
+        const bool keptByHysteresis =
+            wasPreviouslyRefined &&
+            !promoteSpacingViolated &&
+            !promoteDiameterViolated &&
+            (activeSpacingViolated || activeDiameterViolated);
 
         auto visibleChildren = MakeVisibleChildFrontierNodes(
             hierarchy,
@@ -1183,7 +1365,8 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
                 .children = std::move(visibleChildren),
                 .oldRepresentativeEstimate = RepresentativeEstimate(hierarchy, nodeIndex),
                 .replacementRepresentativeEstimate = replacementEstimate,
-                .score = std::max(spacingScore, diameterScore)});
+                .score = std::max(spacingScore, diameterScore),
+                .keptByHysteresis = keptByHysteresis});
     };
 
     enqueueSplitCandidate(0U);
@@ -1212,6 +1395,9 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
         }
 
         activeFrontierNodes[candidate.frontierIndex] = false;
+        if (candidate.keptByHysteresis && diagnostics != nullptr) {
+            ++diagnostics->hysteresisKeptNodeCount;
+        }
         activeFrontierNodeCount = nextFrontierNodeCount;
         if (replacementEstimate >= oldEstimate) {
             estimatedRepresentatives += replacementEstimate - oldEstimate;
@@ -1237,11 +1423,35 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
             compactFrontier.push_back(frontier[index]);
         }
     }
+    if (diagnostics != nullptr) {
+        diagnostics->frontierNodeIndices.clear();
+        diagnostics->frontierNodeIndices.reserve(compactFrontier.size());
+        std::unordered_set<std::uint32_t> currentFrontier;
+        currentFrontier.reserve(compactFrontier.size());
+        for (const auto& node : compactFrontier) {
+            diagnostics->frontierNodeIndices.push_back(node.nodeIndex);
+            currentFrontier.insert(node.nodeIndex);
+            if (!previousFrontier.empty() && !previousFrontier.contains(node.nodeIndex)) {
+                ++diagnostics->promotedNodeCount;
+            }
+        }
+        for (const auto previousNodeIndex : previousFrontier) {
+            if (!currentFrontier.contains(previousNodeIndex)) {
+                ++diagnostics->demotedNodeCount;
+            }
+        }
+        const auto currentRepresentativeEstimate = static_cast<std::int64_t>(
+            FrontierRepresentativeEstimate(hierarchy, compactFrontier));
+        const auto previousRepresentativeEstimate = static_cast<std::int64_t>(
+            FrontierRepresentativeEstimate(hierarchy, params.previousFrontierNodeIndices));
+        diagnostics->representativeDelta = currentRepresentativeEstimate - previousRepresentativeEstimate;
+    }
     return compactFrontier;
 }
 
 void EmitRepresentatives(
     const PointCloudLodHierarchy& hierarchy,
+    std::uint32_t nodeIndex,
     const PointCloudLodNode& node,
     const PointCloudLodTraversalParams& params,
     const ProjectedBoundsFootprint& nodeFootprint,
@@ -1280,8 +1490,15 @@ void EmitRepresentatives(
         return;
     }
 
+    const auto rankedOffsets = RankedRepresentativeOffsets(hierarchy, node, availableCount);
+    if (rankedOffsets.empty()) {
+        return;
+    }
+
     const auto pushDrawItem = [&](const PointCloudLodRepresentative& representative,
-                                  std::uint32_t representedSourceCount) {
+                                  std::uint32_t representedSourceCount,
+                                  std::uint64_t rankKey,
+                                  std::uint32_t rankOrdinal) {
         const auto footprint = EmittedRepresentativeFootprintPixels(
             representative,
             representedSourceCount,
@@ -1301,6 +1518,14 @@ void EmitRepresentatives(
         drawItems->push_back(
             {.sourcePointIndex = representative.sourcePointIndex,
              .representedSourceCount = representedSourceCount,
+             .reserved0 = StableRepresentativeSeed(nodeIndex, representative, rankKey),
+             .reserved1 =
+                 ((node.depth & 0xffU) << 24U) |
+                 (availableCount <= 1U
+                      ? 0U
+                      : static_cast<std::uint32_t>(
+                            (static_cast<std::uint64_t>(rankOrdinal) * 0x00ffffffULL) /
+                            static_cast<std::uint64_t>(availableCount - 1U))),
              .footprintAreaPixels = footprint.coverageAreaPixels,
              .opacityCompensation = compensation.opacity,
              .emissionCompensation = compensation.emission,
@@ -1310,11 +1535,12 @@ void EmitRepresentatives(
     };
 
     if (emitCount >= availableCount) {
-        const auto end = node.firstRepresentative + availableCount;
-        for (auto representativeIndex = node.firstRepresentative; representativeIndex < end; ++representativeIndex) {
+        for (std::uint32_t rankOrdinal = 0; rankOrdinal < static_cast<std::uint32_t>(rankedOffsets.size());
+             ++rankOrdinal) {
             if (TraversalCancelled(stopToken)) {
                 return;
             }
+            const auto representativeIndex = node.firstRepresentative + rankedOffsets[rankOrdinal].offset;
             if (representativeIndex >= hierarchy.representatives.size()) {
                 continue;
             }
@@ -1323,11 +1549,26 @@ void EmitRepresentatives(
                 return;
             }
             const auto& representative = hierarchy.representatives[representativeIndex];
-            if (!pushDrawItem(representative, representative.representedSourceCount)) {
+            if (!pushDrawItem(
+                    representative,
+                    representative.representedSourceCount,
+                    rankedOffsets[rankOrdinal].rankKey,
+                    rankOrdinal)) {
                 return;
             }
         }
         return;
+    }
+
+    std::vector<std::uint32_t> representedCounts(emitCount, 0U);
+    for (std::uint32_t rankOrdinal = 0; rankOrdinal < static_cast<std::uint32_t>(rankedOffsets.size());
+         ++rankOrdinal) {
+        const auto representativeIndex = node.firstRepresentative + rankedOffsets[rankOrdinal].offset;
+        if (representativeIndex >= hierarchy.representatives.size()) {
+            continue;
+        }
+        const auto bucket = rankOrdinal < emitCount ? rankOrdinal : rankOrdinal % emitCount;
+        representedCounts[bucket] += hierarchy.representatives[representativeIndex].representedSourceCount;
     }
 
     for (std::uint32_t emittedIndex = 0; emittedIndex < emitCount; ++emittedIndex) {
@@ -1338,26 +1579,15 @@ void EmitRepresentatives(
             budget->representativeBudgetReached = true;
             return;
         }
-        const auto binBegin = (static_cast<std::uint64_t>(emittedIndex) * availableCount) / emitCount;
-        const auto binEnd = (static_cast<std::uint64_t>(emittedIndex + 1U) * availableCount) / emitCount;
-        const auto clampedBinEnd = std::max<std::uint64_t>(binEnd, binBegin + 1U);
-        const auto selectedOffset = std::min<std::uint64_t>(
-            availableCount - 1U,
-            binBegin + ((clampedBinEnd - binBegin) / 2U));
-        const auto selectedRepresentativeIndex = node.firstRepresentative + static_cast<std::uint32_t>(selectedOffset);
+        const auto selectedRepresentativeIndex = node.firstRepresentative + rankedOffsets[emittedIndex].offset;
         if (selectedRepresentativeIndex >= hierarchy.representatives.size()) {
             continue;
         }
-        std::uint32_t representedSourceCount = 0;
-        for (auto offset = binBegin; offset < clampedBinEnd && offset < availableCount; ++offset) {
-            const auto representativeIndex = node.firstRepresentative + static_cast<std::uint32_t>(offset);
-            if (representativeIndex < hierarchy.representatives.size()) {
-                representedSourceCount += hierarchy.representatives[representativeIndex].representedSourceCount;
-            }
-        }
         if (!pushDrawItem(
                 hierarchy.representatives[selectedRepresentativeIndex],
-                std::max<std::uint32_t>(1U, representedSourceCount))) {
+                std::max<std::uint32_t>(1U, representedCounts[emittedIndex]),
+                rankedOffsets[emittedIndex].rankKey,
+                emittedIndex)) {
             return;
         }
     }
@@ -1378,7 +1608,7 @@ void TraverseFullSourceNode(
     }
     const auto& node = hierarchy.nodes[nodeIndex];
     if (node.IsLeaf()) {
-        EmitRepresentatives(hierarchy, node, params, {}, 0.0F, 0U, budget, drawItems, stopToken);
+        EmitRepresentatives(hierarchy, nodeIndex, node, params, {}, 0.0F, 0U, budget, drawItems, stopToken);
         return;
     }
 
@@ -1636,6 +1866,12 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
             stopToken);
         if (diagnostics != nullptr) {
             diagnostics->visibleFrontierNodeCount = 1U;
+            diagnostics->frontierNodeIndices = {0U};
+            diagnostics->hysteresisPromoteScale = std::max(1.0F, params.hysteresisPromoteScale);
+            diagnostics->hysteresisDemoteScale = std::clamp(
+                params.hysteresisDemoteScale,
+                0.05F,
+                diagnostics->hysteresisPromoteScale);
             diagnostics->visibleFrontierRepresentedSourceCount = hierarchy.sourcePointCount;
             diagnostics->emittedRepresentativeCount = static_cast<std::uint32_t>(drawItems.size());
             diagnostics->emittedRepresentedSourceCount = DrawItemRepresentedSourceCount(drawItems);
@@ -1688,6 +1924,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
         }
         EmitRepresentatives(
             hierarchy,
+            allocation.node.nodeIndex,
             hierarchy.nodes[allocation.node.nodeIndex],
             params,
             allocation.node.footprint,
@@ -1795,6 +2032,7 @@ std::vector<PointCloudDrawItemGpu> BuildCoarsePointCloudLodFallbackDrawItems(
         }
         EmitRepresentatives(
             hierarchy,
+            nodeIndex,
             node,
             params,
             footprint,

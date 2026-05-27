@@ -1008,6 +1008,16 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     std::uint64_t adaptiveEmittedRepresentedSourceCount = 0;
     std::uint64_t adaptiveCulledRepresentedSourceCount = 0;
     std::uint32_t adaptiveVisibleFrontierNodeCount = 0;
+    std::int64_t adaptiveRepresentativeDelta = 0;
+    std::uint32_t adaptivePromotedNodeCount = 0;
+    std::uint32_t adaptiveDemotedNodeCount = 0;
+    std::uint32_t adaptiveHysteresisKeptNodeCount = 0;
+    float adaptiveHysteresisPromoteScale = 1.0F;
+    float adaptiveHysteresisDemoteScale = 1.0F;
+    std::uint32_t adaptiveActiveTransitionCount = 0;
+    double adaptiveTransitionAgeMsSum = 0.0;
+    double adaptiveMaxTransitionAgeMs = 0.0;
+    bool adaptiveIdleRefinementPending = false;
     double adaptiveEstimatedFragments = 0.0;
     double adaptiveFragmentBudget = 0.0;
     std::uint32_t adaptiveRepresentativeBudget = 0;
@@ -1037,6 +1047,22 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
             adaptiveEmittedRepresentedSourceCount += layer.adaptiveEmittedRepresentedSourceCount;
             adaptiveCulledRepresentedSourceCount += layer.adaptiveCulledRepresentedSourceCount;
             adaptiveVisibleFrontierNodeCount += layer.adaptiveVisibleFrontierNodeCount;
+            adaptiveRepresentativeDelta += layer.adaptiveRepresentativeDelta;
+            adaptivePromotedNodeCount += layer.adaptivePromotedNodeCount;
+            adaptiveDemotedNodeCount += layer.adaptiveDemotedNodeCount;
+            adaptiveHysteresisKeptNodeCount += layer.adaptiveHysteresisKeptNodeCount;
+            adaptiveHysteresisPromoteScale = std::max(
+                adaptiveHysteresisPromoteScale,
+                layer.adaptiveHysteresisPromoteScale);
+            adaptiveHysteresisDemoteScale = std::min(
+                adaptiveHysteresisDemoteScale,
+                layer.adaptiveHysteresisDemoteScale);
+            adaptiveActiveTransitionCount += layer.adaptiveActiveTransitionCount;
+            adaptiveTransitionAgeMsSum +=
+                layer.adaptiveAverageTransitionAgeMs * static_cast<double>(layer.adaptiveActiveTransitionCount);
+            adaptiveMaxTransitionAgeMs = std::max(adaptiveMaxTransitionAgeMs, layer.adaptiveMaxTransitionAgeMs);
+            adaptiveIdleRefinementPending =
+                adaptiveIdleRefinementPending || layer.adaptiveIdleRefinementPending;
             adaptiveDrawItemBytes += layer.adaptiveDrawItemBytes;
         }
         adaptiveEstimatedFragments += layer.adaptiveEstimatedFragments;
@@ -1084,6 +1110,19 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveEmittedRepresentedSourceCount = adaptiveEmittedRepresentedSourceCount;
     diagnostics_.adaptiveCulledRepresentedSourceCount = adaptiveCulledRepresentedSourceCount;
     diagnostics_.adaptiveVisibleFrontierNodeCount = adaptiveVisibleFrontierNodeCount;
+    diagnostics_.adaptiveRepresentativeDelta = adaptiveRepresentativeDelta;
+    diagnostics_.adaptivePromotedNodeCount = adaptivePromotedNodeCount;
+    diagnostics_.adaptiveDemotedNodeCount = adaptiveDemotedNodeCount;
+    diagnostics_.adaptiveHysteresisKeptNodeCount = adaptiveHysteresisKeptNodeCount;
+    diagnostics_.adaptiveHysteresisPromoteScale = adaptiveHysteresisPromoteScale;
+    diagnostics_.adaptiveHysteresisDemoteScale = adaptiveHysteresisDemoteScale;
+    diagnostics_.adaptiveActiveTransitionCount = adaptiveActiveTransitionCount;
+    diagnostics_.adaptiveAverageTransitionAgeMs =
+        adaptiveActiveTransitionCount > 0U
+            ? adaptiveTransitionAgeMsSum / static_cast<double>(adaptiveActiveTransitionCount)
+            : 0.0;
+    diagnostics_.adaptiveMaxTransitionAgeMs = adaptiveMaxTransitionAgeMs;
+    diagnostics_.adaptiveIdleRefinementPending = adaptiveIdleRefinementPending;
     diagnostics_.adaptiveEstimatedFragments = adaptiveEstimatedFragments;
     diagnostics_.adaptiveFragmentBudget = adaptiveFragmentBudget;
     diagnostics_.adaptiveRepresentativeBudget = adaptiveRepresentativeBudget;
