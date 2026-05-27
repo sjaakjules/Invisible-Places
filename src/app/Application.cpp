@@ -19847,6 +19847,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint64_t fastBasicPreZoomOutRepresentedSource = 0;
     std::uint64_t fastBasicPostZoomOutRepresentedSource = 0;
     std::uint32_t fastBasicZoomOutSettledFrame = 0;
+    std::uint64_t fastBasicExactRepresentatives = 0;
+    std::uint64_t fastBasicExactRepresentedSource = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        fastBasicExactClassCounts{};
+    std::uint32_t fastBasicExactColorFeatureRefinements = 0;
+    std::uint32_t fastBasicExactScalarFeatureRefinements = 0;
+    std::uint32_t fastBasicExactNormalFeatureRefinements = 0;
+    std::uint32_t fastBasicExactEmissiveFeatureRefinements = 0;
     constexpr std::uint32_t kFastBasicDiagnosticFrames = 500U;
     constexpr std::uint32_t kFastBasicZoomInFrames = 30U;
     constexpr std::uint32_t kFastBasicZoomOutStartFrame = 60U;
@@ -20087,6 +20095,41 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     runtimeState.sessions.front().adaptiveLodIdleRefinementPending = false;
     runtimeState.sessions.front().adaptiveLodTransitionDrawItems.reset();
 
+    {
+        auto& fastBasicSession = runtimeState.sessions.front();
+        const auto aspectRatio = CurrentAspectRatio(viewport);
+        const auto matrices = runtimeState.camera.Matrices(aspectRatio);
+        const auto fastBasicStyle = MakeEffectivePointRendererStyle(
+            PointCloudRendererMode::FastBasic,
+            fastBasicSession.pointStyle,
+            fastBasicSession.hasSourceRgb,
+            IsGeneratedWaterOverlaySession(fastBasicSession));
+        auto fastBasicParams = MakeAdaptiveLodTraversalParams(
+            fastBasicSession,
+            fastBasicStyle,
+            matrices.viewProjection,
+            matrices.position,
+            std::max<std::uint32_t>(1U, viewport.Width()),
+            std::max<std::uint32_t>(1U, viewport.Height()),
+            PointCloudExportDensityMode::MatchViewportAdaptive,
+            true);
+        fastBasicParams.previousFrontierNodeIndices.clear();
+        invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics fastBasicExactDiagnostics;
+        const auto fastBasicExactDrawItems =
+            invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
+                *fastBasicSession.pointLodHierarchy,
+                fastBasicParams,
+                {},
+                &fastBasicExactDiagnostics);
+        fastBasicExactRepresentatives = fastBasicExactDrawItems.size();
+        fastBasicExactRepresentedSource = fastBasicExactDiagnostics.emittedRepresentedSourceCount;
+        fastBasicExactClassCounts = fastBasicExactDiagnostics.emittedClassCounts;
+        fastBasicExactColorFeatureRefinements = fastBasicExactDiagnostics.colorFeatureRefinedNodeCount;
+        fastBasicExactScalarFeatureRefinements = fastBasicExactDiagnostics.scalarFeatureRefinedNodeCount;
+        fastBasicExactNormalFeatureRefinements = fastBasicExactDiagnostics.normalFeatureRefinedNodeCount;
+        fastBasicExactEmissiveFeatureRefinements = fastBasicExactDiagnostics.emissiveFeatureRefinedNodeCount;
+    }
+
     ++runtimeState.previewFrameCounter;
     runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyFullSource;
     const auto fullSourceState = BuildRenderState(runtimeState, viewport, 0.0F);
@@ -20239,6 +20282,21 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"fast_basic_max_visible_represented_source\": " << fastBasicMaxVisibleRepresentedSource << ",\n"
                 << "  \"fast_basic_max_emitted_represented_source\": " << fastBasicMaxEmittedRepresentedSource << ",\n"
                 << "  \"fast_basic_max_culled_represented_source\": " << fastBasicMaxCulledRepresentedSource << ",\n"
+                << "  \"fast_basic_exact_representatives\": " << fastBasicExactRepresentatives << ",\n"
+                << "  \"fast_basic_exact_represented_source\": " << fastBasicExactRepresentedSource << ",\n"
+                << "  \"fast_basic_exact_class_spatial\": " << fastBasicExactClassCounts[0] << ",\n"
+                << "  \"fast_basic_exact_class_colour_contrast\": " << fastBasicExactClassCounts[1] << ",\n"
+                << "  \"fast_basic_exact_class_normal_edge\": " << fastBasicExactClassCounts[2] << ",\n"
+                << "  \"fast_basic_exact_class_scalar_min\": " << fastBasicExactClassCounts[3] << ",\n"
+                << "  \"fast_basic_exact_class_scalar_max\": " << fastBasicExactClassCounts[4] << ",\n"
+                << "  \"fast_basic_exact_class_scalar_threshold\": " << fastBasicExactClassCounts[5] << ",\n"
+                << "  \"fast_basic_exact_class_emissive_accent\": " << fastBasicExactClassCounts[6] << ",\n"
+                << "  \"fast_basic_exact_class_blue_noise_fill\": " << fastBasicExactClassCounts[7] << ",\n"
+                << "  \"fast_basic_exact_color_feature_refinements\": " << fastBasicExactColorFeatureRefinements << ",\n"
+                << "  \"fast_basic_exact_scalar_feature_refinements\": " << fastBasicExactScalarFeatureRefinements << ",\n"
+                << "  \"fast_basic_exact_normal_feature_refinements\": " << fastBasicExactNormalFeatureRefinements << ",\n"
+                << "  \"fast_basic_exact_emissive_feature_refinements\": "
+                << fastBasicExactEmissiveFeatureRefinements << ",\n"
                 << "  \"fast_basic_class_spatial\": " << fastBasicMaxEmittedClassCounts[0] << ",\n"
                 << "  \"fast_basic_class_colour_contrast\": " << fastBasicMaxEmittedClassCounts[1] << ",\n"
                 << "  \"fast_basic_class_normal_edge\": " << fastBasicMaxEmittedClassCounts[2] << ",\n"
@@ -20304,6 +20362,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << (adaptiveClassCounts[3] + adaptiveClassCounts[4] + adaptiveClassCounts[5]) << "/"
               << adaptiveClassCounts[2] << "/"
               << adaptiveClassCounts[6] << "\n"
+              << "Fast Basic exact CPU feature reps colour/scalar/normal/accent: "
+              << fastBasicExactClassCounts[1] << "/"
+              << (fastBasicExactClassCounts[3] + fastBasicExactClassCounts[4] + fastBasicExactClassCounts[5]) << "/"
+              << fastBasicExactClassCounts[2] << "/"
+              << fastBasicExactClassCounts[6]
+              << " | representatives: " << fastBasicExactRepresentatives
+              << " | represented source: " << fastBasicExactRepresentedSource << "\n"
               << "Fast Basic viewport: max submitted " << fastBasicMaxSubmittedPoints
               << " / rep budget " << fastBasicMaxRepresentativeBudget
               << " | max estimated fragments " << fastBasicMaxEstimatedFragments

@@ -2529,6 +2529,24 @@ std::string NormalizedCachePathString(const std::filesystem::path& path) {
     return path.lexically_normal().generic_string();
 }
 
+std::filesystem::path ResolveCacheSourcePath(const std::filesystem::path& path) {
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        auto canonical = std::filesystem::weakly_canonical(path, error);
+        if (!error && !canonical.empty()) {
+            return canonical.lexically_normal();
+        }
+    }
+
+    error.clear();
+    auto absolute = std::filesystem::absolute(path, error);
+    if (!error && !absolute.empty()) {
+        return absolute.lexically_normal();
+    }
+
+    return path.lexically_normal();
+}
+
 bool BoundsEqual(
     const invisible_places::io::Bounds3f& left,
     const invisible_places::io::Bounds3f& right) {
@@ -2888,7 +2906,7 @@ std::vector<PointCloudDrawItemGpu> BuildCoarsePointCloudLodFallbackDrawItems(
 
 std::uint64_t HashPointCloudLodCachePath(const std::filesystem::path& sourcePath) {
     std::uint64_t hash = 1469598103934665603ULL;
-    for (const char character : NormalizedCachePathString(sourcePath)) {
+    for (const char character : NormalizedCachePathString(ResolveCacheSourcePath(sourcePath))) {
         hash ^= static_cast<unsigned char>(character);
         hash *= 1099511628211ULL;
     }
@@ -2899,16 +2917,16 @@ PointCloudLodCacheSource MakePointCloudLodCacheSource(
     const std::filesystem::path& sourcePath,
     const invisible_places::io::LoadedPointCloud& cloud) {
     PointCloudLodCacheSource source;
-    source.sourcePath = sourcePath;
-    source.normalizedPathHash = HashPointCloudLodCachePath(sourcePath);
+    source.sourcePath = ResolveCacheSourcePath(sourcePath);
+    source.normalizedPathHash = HashPointCloudLodCachePath(source.sourcePath);
     source.pointCount = static_cast<std::uint32_t>(
         std::min<std::size_t>(cloud.positions.size(), std::numeric_limits<std::uint32_t>::max()));
     source.bounds = cloud.bounds;
 
     std::error_code error;
-    if (std::filesystem::exists(sourcePath, error) && std::filesystem::is_regular_file(sourcePath, error)) {
-        source.sourceSizeBytes = std::filesystem::file_size(sourcePath, error);
-        const auto writeTime = std::filesystem::last_write_time(sourcePath, error);
+    if (std::filesystem::exists(source.sourcePath, error) && std::filesystem::is_regular_file(source.sourcePath, error)) {
+        source.sourceSizeBytes = std::filesystem::file_size(source.sourcePath, error);
+        const auto writeTime = std::filesystem::last_write_time(source.sourcePath, error);
         if (!error) {
             source.sourceWriteTimeNs =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2922,9 +2940,10 @@ PointCloudLodCacheSource MakePointCloudLodCacheSource(
 std::filesystem::path BuildPointCloudLodCachePath(
     const std::filesystem::path& cacheDirectory,
     const std::filesystem::path& sourcePath) {
+    const auto resolvedSourcePath = ResolveCacheSourcePath(sourcePath);
     std::ostringstream hashText;
-    hashText << std::hex << std::setfill('0') << std::setw(16) << HashPointCloudLodCachePath(sourcePath);
-    const auto stem = sourcePath.stem().empty() ? std::string{"PointCloud"} : sourcePath.stem().string();
+    hashText << std::hex << std::setfill('0') << std::setw(16) << HashPointCloudLodCachePath(resolvedSourcePath);
+    const auto stem = resolvedSourcePath.stem().empty() ? std::string{"PointCloud"} : resolvedSourcePath.stem().string();
     return cacheDirectory / (stem + "-" + hashText.str() + "-PointCloudLodCache-v4.bin");
 }
 

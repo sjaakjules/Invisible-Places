@@ -33,7 +33,9 @@ sample-count cap anymore.
 - Cache validation checks version, source path hash, source size, mtime, point
   count, bounds, build config, scalar field count, and scalar-stat payload
   sizing. v1-v3 files are stale and rebuild into v4 without deleting old files
-  unless the existing rebuild command is used.
+  unless the existing rebuild command is used. Existing source paths are
+  canonicalized before cache hashing, so relative and absolute references reuse
+  the same v4 cache.
 - Hierarchy cache writes go through a temporary file and publish by rename.
 - v4 hierarchy nodes store spacing, density, colour variance/contrast, normal
   variance, scalar range/variance hints, emissive/accent hints, and feature
@@ -90,9 +92,10 @@ sample-count cap anymore.
   is exact or coarse fallback.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
   `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
-- `lod_compare_metrics.json` reports Adaptive HQ and Fast Basic representative
-  class counts plus colour, scalar, normal, and emissive/accent feature-triggered
-  refinement counts.
+- `lod_compare_metrics.json` reports Adaptive HQ representative class counts,
+  exact Fast Basic CPU representative class counts, viewport Fast Basic
+  boundedness/smoothness metrics, and colour, scalar, normal, and
+  emissive/accent feature-triggered refinement counts.
 - Stage 04 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports
   coverage ratio 1, luminance ratio 0.966488, 1,932,759 Adaptive HQ
   representatives covering all 12,183,742 source points, feature representatives
@@ -100,15 +103,18 @@ sample-count cap anymore.
   4,111,812 under an 8,294,400 representative budget, no budget exceedance, no
   full-source fallback, zero large representative-jump frames, and
   `fast_basic_zoom_out_updated=true`.
-- A Stage 04 cold-cache compare attempt on `Data/Site3-Mid-1mm100M.ply` loaded
-  100,743,210 points but did not build a v4 hierarchy before the comparison
-  readiness timeout. The existing v1-v3 100M cache files remain stale artifacts
-  and no v4 100M cache was published.
-- Repeated 500-frame `--lod-compare` runs on
-  `Data/Site3-Mid-1mm100M.ply` report deterministic smoothness metrics for the
-  scripted Fast Basic path: max absolute representative delta 5,640, 22
-  transition-active frames, 0 large representative-jump frames, 0
-  budget-exceeded frames, and 0 full-source fallback frames.
+- Stage 04 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` reports coverage
+  ratio 1, luminance ratio 0.814833, 1,729,641 Adaptive HQ representatives
+  covering 99,504,849 source points, Adaptive HQ feature representatives
+  colour/scalar/normal/accent 17,878/138,540/7,775/16,371, and exact Fast Basic
+  CPU feature representatives 18,484/142,172/8,085/16,761 across 2,325,565
+  representatives covering 99,503,058 source points.
+- The 100M Fast Basic viewport trace reports deterministic smoothness metrics:
+  max submitted 262,132 under an 8,294,400 representative budget, max estimated
+  fragments 1,108,920 under a 796,262,000 fragment budget, max absolute
+  representative delta 5,640, 22 transition-active frames, 0 large
+  representative-jump frames, 0 budget-exceeded frames, 0 full-source fallback
+  frames, and `fast_basic_zoom_out_updated=true`.
 
 ## Partially Implemented
 
@@ -378,8 +384,9 @@ Initial quality targets:
 - Fast Basic should report no full-source fallback, no representative or
   fragment budget exceedance, zero large representative-jump frames, and
   `fast_basic_zoom_out_updated=true`.
-- Applicable RGB/scalar/normal/emissive data should produce nonzero
-  representative class counts and nonzero feature-triggered refinement counts.
+- Applicable RGB/scalar/normal/emissive data should produce nonzero Adaptive HQ
+  and exact Fast Basic CPU representative class counts plus nonzero
+  feature-triggered refinement counts.
 - Scalar, water-effect, normal, source-color, depth, and AOV lookups must remain
   source-correct through `drawItem.sourcePointIndex`.
 - Stage 03 manual acceptance for the 100M Fast Basic path: slow orbit has no

@@ -1257,6 +1257,13 @@ TEST_CASE("Point-cloud LOD hierarchy cache round-trips and rejects stale metadat
     const auto source = pc::MakePointCloudLodCacheSource(sourcePath, cloud);
     const auto cachePath = pc::BuildPointCloudLodCachePath(tempRoot / "lod", sourcePath);
     CHECK(cachePath.filename().string().find("PointCloudLodCache-v4.bin") != std::string::npos);
+    const auto relativeSourcePath = std::filesystem::relative(sourcePath);
+    const auto relativeSource = pc::MakePointCloudLodCacheSource(relativeSourcePath, cloud);
+    const auto relativeCachePath = pc::BuildPointCloudLodCachePath(tempRoot / "lod", relativeSourcePath);
+    CHECK(relativeSource.normalizedPathHash == source.normalizedPathHash);
+    CHECK(relativeSource.sourceSizeBytes == source.sourceSizeBytes);
+    CHECK(relativeSource.sourceWriteTimeNs == source.sourceWriteTimeNs);
+    CHECK(relativeCachePath.filename() == cachePath.filename());
     std::string errorMessage;
     REQUIRE(pc::SavePointCloudLodHierarchyCache(cachePath, source, config, hierarchy, &errorMessage));
 
@@ -2040,7 +2047,12 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("\\\"adaptive_class_scalar_max\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"adaptive_class_normal_edge\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"adaptive_class_emissive_accent\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_exact_class_colour_contrast\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_exact_class_scalar_max\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_exact_class_normal_edge\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_exact_class_emissive_accent\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_scalar_feature_refinements\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"fast_basic_exact_scalar_feature_refinements\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_zoom_out_updated\\\"") != std::string::npos);
     CHECK(comparisonSection.find("kFastBasicZoomOutStartFrame") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_submitted_full_source\\\"") != std::string::npos);
