@@ -1024,6 +1024,7 @@ TEST_CASE("Point-cloud adaptive LOD visible size only grows for overlapping sour
     params.viewportWidth = 1024;
     params.viewportHeight = 1024;
     params.maxDrawItems = 1U;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
     invisible_places::style::SetScalarConstant(&params.style.pointSize, 8.0F);
 
     const auto drawItems = invisible_places::renderer::pointcloud::TraversePointCloudLodHierarchy(
@@ -1035,6 +1036,264 @@ TEST_CASE("Point-cloud adaptive LOD visible size only grows for overlapping sour
     CHECK(drawItems.front().renderAreaPixels > 8.0F * 8.0F);
     CHECK(std::sqrt(drawItems.front().renderAreaPixels) <= Catch::Approx(8.0F * 1.35F));
     CHECK(drawItems.front().renderAreaPixels < drawItems.front().footprintAreaPixels);
+}
+
+TEST_CASE("Beauty adaptive LOD opacity uses optical-depth compensation", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 6;
+    constexpr float extent = 0.02F;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    ((static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F) * extent};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxDrawItems = 1U;
+    params.maxRepresentativeDiameterPixels = 256.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 3.0F);
+    invisible_places::style::SetScalarConstant(&params.style.opacity, 0.25F);
+
+    pc::PointCloudLodTraversalDiagnostics diagnostics;
+    const auto drawItems = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &diagnostics);
+    REQUIRE(drawItems.size() == 1U);
+    const auto& drawItem = drawItems.front();
+    const float representedArea =
+        3.0F * 3.0F * static_cast<float>(drawItem.representedSourceCount);
+    const float linearAreaScale = representedArea / std::max(1.0F, drawItem.footprintAreaPixels);
+
+    CHECK(linearAreaScale > 8.0F);
+    CHECK(drawItem.opacityCompensation <= 4.05F);
+    CHECK(drawItem.opacityCompensation < linearAreaScale * 0.5F);
+    CHECK(drawItem.emissionCompensation == Catch::Approx(1.0F));
+    CHECK(diagnostics.rendererCostProfile == pc::PointCloudLodRendererCostProfile::BeautyScreenSprite);
+    CHECK(diagnostics.maxOpacityCoverageScale <= 4.05F);
+    CHECK(diagnostics.estimatedBlendedFragmentCost > 0.0F);
+}
+
+TEST_CASE("Beauty adaptive LOD footprint grows render radius in the right direction", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 10;
+    constexpr float extent = 0.15F;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    ((static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F) * extent};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxDrawItems = 1U;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 8.0F);
+
+    pc::PointCloudLodTraversalDiagnostics diagnostics;
+    const auto drawItems = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &diagnostics);
+    REQUIRE(drawItems.size() == 1U);
+    CHECK(drawItems.front().renderAreaPixels > 8.0F * 8.0F);
+    CHECK(drawItems.front().renderAreaPixels < drawItems.front().footprintAreaPixels);
+    CHECK(diagnostics.maxRadiusScale > 1.0F);
+    CHECK(diagnostics.performanceCompensationClamped == false);
+}
+
+TEST_CASE("Beauty adaptive LOD preserves ordinary emission and caps emissive accents", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.scalarFields.push_back({.name = "Interest"});
+    constexpr int gridSize = 4;
+    constexpr float extent = 0.02F;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                const auto pointIndex = static_cast<std::uint32_t>(cloud.positions.size());
+                invisible_places::io::Float3 point{
+                    ((static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F) * extent,
+                    ((static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F) * extent};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+                const float interest = pointIndex == 42U ? 10.0F : 0.25F;
+                cloud.scalarFieldValues.push_back(interest);
+                cloud.scalarFields.front().Include(interest);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U, .maxInternalRepresentatives = 12U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 12U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 10000.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    params.style.colorMode = pc::PointCloudColorMode::ScalarColormap;
+    params.style.emissiveStrength.mode = invisible_places::style::ParameterSourceMode::FieldMapped;
+    params.style.emissiveStrength.fieldMap.fieldSlot = 0;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 5.0F);
+    invisible_places::style::SetScalarConstant(&params.style.opacity, 0.45F);
+
+    pc::PointCloudLodTraversalDiagnostics diagnostics;
+    const auto drawItems = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &diagnostics);
+    REQUIRE(!drawItems.empty());
+    REQUIRE(diagnostics.emittedClassCounts[6] > 0U);
+
+    bool sawAccent = false;
+    bool sawOrdinaryAverage = false;
+    for (const auto& drawItem : drawItems) {
+        if (drawItem.sourcePointIndex == 42U) {
+            sawAccent = true;
+            CHECK(drawItem.emissionCompensation > 1.0F);
+            CHECK(drawItem.emissionCompensation <= 2.5F);
+        } else {
+            sawOrdinaryAverage = sawOrdinaryAverage || drawItem.emissionCompensation == Catch::Approx(1.0F);
+        }
+    }
+
+    CHECK(sawAccent);
+    CHECK(sawOrdinaryAverage);
+    CHECK(diagnostics.maxEmissionCoverageScale <= 2.5F);
+}
+
+TEST_CASE("Beauty adaptive LOD estimates sprite and surfel renderer costs separately", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 5;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams spriteParams;
+    spriteParams.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    spriteParams.densityMode = invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
+    spriteParams.viewportWidth = 1024;
+    spriteParams.viewportHeight = 1024;
+    spriteParams.maxDrawItems = 8U;
+    spriteParams.maxEstimatedFragments = 1.0e9F;
+    invisible_places::style::SetScalarConstant(&spriteParams.style.pointSize, 6.0F);
+
+    pc::PointCloudLodTraversalDiagnostics spriteDiagnostics;
+    const auto spriteItems =
+        pc::TraversePointCloudLodHierarchy(hierarchy, spriteParams, {}, &spriteDiagnostics);
+    REQUIRE(!spriteItems.empty());
+
+    auto surfelParams = spriteParams;
+    surfelParams.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyWorldSurfel;
+    surfelParams.style.geometryMode = pc::PointCloudGeometryMode::WorldSurfels;
+    invisible_places::style::SetScalarConstant(&surfelParams.style.surfelDiameter, 0.01F);
+
+    pc::PointCloudLodTraversalDiagnostics surfelDiagnostics;
+    const auto surfelItems =
+        pc::TraversePointCloudLodHierarchy(hierarchy, surfelParams, {}, &surfelDiagnostics);
+    REQUIRE(!surfelItems.empty());
+
+    CHECK(spriteDiagnostics.rendererCostProfile == pc::PointCloudLodRendererCostProfile::BeautyScreenSprite);
+    CHECK(surfelDiagnostics.rendererCostProfile == pc::PointCloudLodRendererCostProfile::BeautyWorldSurfel);
+    CHECK(spriteDiagnostics.estimatedVertexCost == Catch::Approx(static_cast<float>(spriteItems.size())));
+    CHECK(surfelDiagnostics.estimatedVertexCost == Catch::Approx(static_cast<float>(surfelItems.size()) * 6.0F));
+    CHECK(surfelDiagnostics.estimatedVertexCost > spriteDiagnostics.estimatedVertexCost);
+    CHECK(spriteDiagnostics.estimatedBlendedFragmentCost > 0.0F);
+    CHECK(surfelDiagnostics.estimatedBlendedFragmentCost > 0.0F);
+}
+
+TEST_CASE("Beauty adaptive LOD preserves source coverage under fragment pressure", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.targetProjectedSpacingPixels = 8.0F;
+    params.maxRepresentativeDiameterPixels = 64.0F;
+    params.maxRepresentatives = 4096U;
+    params.maxEstimatedFragments = 64.0F;
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 32.0F);
+    invisible_places::style::SetScalarConstant(&params.style.opacity, 0.25F);
+
+    pc::PointCloudLodTraversalDiagnostics diagnostics;
+    const auto drawItems = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &diagnostics);
+    REQUIRE(drawItems.size() > 1U);
+    CHECK(diagnostics.fragmentBudgetReached);
+    CHECK(diagnostics.emittedRepresentedSourceCount == cloud.PointCount());
+    CHECK(diagnostics.visibleFrontierRepresentedSourceCount == cloud.PointCount());
 }
 
 TEST_CASE("Point-cloud LOD internal nodes store distributed representatives", "[pointcloud][lod]") {
@@ -1506,10 +1765,14 @@ TEST_CASE("Point-cloud draw items use a std430-compatible GPU layout", "[pointcl
     CHECK(alignof(PointCloudDrawItemGpu) == 16U);
     CHECK(offsetof(PointCloudDrawItemGpu, sourcePointIndex) == 0U);
     CHECK(offsetof(PointCloudDrawItemGpu, representedSourceCount) == 4U);
+    CHECK(offsetof(PointCloudDrawItemGpu, reserved0) == 8U);
+    CHECK(offsetof(PointCloudDrawItemGpu, reserved1) == 12U);
     CHECK(offsetof(PointCloudDrawItemGpu, footprintAreaPixels) == 16U);
     CHECK(offsetof(PointCloudDrawItemGpu, opacityCompensation) == 20U);
     CHECK(offsetof(PointCloudDrawItemGpu, emissionCompensation) == 24U);
     CHECK(offsetof(PointCloudDrawItemGpu, renderAreaPixels) == 28U);
+    CHECK(static_cast<std::uint32_t>(
+              invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfile::BeautyWorldSurfel) == 3U);
 }
 
 TEST_CASE("Point-cloud adaptive LOD traversal emits deterministic stable-ranked draw items", "[pointcloud][lod]") {
@@ -2036,7 +2299,21 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("Site3-Sample-Terrestrial.ply") != std::string::npos);
     CHECK(comparisonSection.find("beauty_full_source.exr") != std::string::npos);
     CHECK(comparisonSection.find("beauty_adaptive_hq.exr") != std::string::npos);
+    CHECK(comparisonSection.find("BeautyLodComparisonCase") != std::string::npos);
+    CHECK(comparisonSection.find("small_opaque_sprites") != std::string::npos);
+    CHECK(comparisonSection.find("large_translucent_gaussian_sprites") != std::string::npos);
+    CHECK(comparisonSection.find("emissive_scalar_sprites") != std::string::npos);
+    CHECK(comparisonSection.find("world_sized_sprites") != std::string::npos);
+    CHECK(comparisonSection.find("world_surfels") != std::string::npos);
     CHECK(comparisonSection.find("lod_compare_metrics.json") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"beauty_matrix\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"renderer_cost_profile\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_estimated_vertices\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_estimated_blended_fragments\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_radius_scale_min\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_opacity_scale_max\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_emission_scale_max\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_performance_clamped\\\"") != std::string::npos);
     CHECK(comparisonSection.find("Adaptive High Quality") != std::string::npos);
     CHECK(comparisonSection.find("\\\"adaptive_fallback\\\": false") != std::string::npos);
     CHECK(comparisonSection.find("PointCloudRendererMode::FastBasic") != std::string::npos);
@@ -2101,9 +2378,12 @@ TEST_CASE("Adaptive LOD shaders apply draw-item footprint", "[pointcloud][lod][s
         const auto shaderSource = ReadRepoTextFile(shaderPath);
         CHECK(shaderSource.find("drawItems[drawIndex].params.w") != std::string::npos);
         CHECK(shaderSource.find("DrawItemFootprintDiameterPixels") != std::string::npos);
+        CHECK(shaderSource.find("pointDrawItems.drawItems[drawIndex].indices.x") != std::string::npos);
         if (shaderPath.string().find("surfel") != std::string::npos) {
             CHECK(shaderSource.find("DrawItemFootprintWorldDiameter") != std::string::npos);
             CHECK(shaderSource.find("ScreenPointSizePixelsToWorldDiameter") != std::string::npos);
+            CHECK(shaderSource.find("encodedVertexIndex / kSurfelVerticesPerPoint") != std::string::npos);
+            CHECK(shaderSource.find("drawIndex * kSurfelVerticesPerPoint") != std::string::npos);
         } else {
             CHECK(shaderSource.find("gl_PointSize = clamp(") != std::string::npos);
             CHECK(shaderSource.find("DrawItemFootprintDiameterPixels(drawIndex)") != std::string::npos);

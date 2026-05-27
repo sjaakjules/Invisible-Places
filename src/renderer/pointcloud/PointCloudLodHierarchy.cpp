@@ -508,6 +508,36 @@ std::uint32_t StableRepresentativeSeed(
     return static_cast<std::uint32_t>(mixed ^ (mixed >> 32U));
 }
 
+std::uint32_t PackDrawItemMetadata(
+    std::uint32_t nodeDepth,
+    std::uint32_t rankOrdinal,
+    std::uint32_t availableCount,
+    PointCloudLodRendererCostProfile profile,
+    std::uint32_t representativeClassFlags,
+    bool opacityClamped,
+    bool emissionClamped,
+    bool performanceClamped) {
+    const std::uint32_t packedDepth = std::min<std::uint32_t>(nodeDepth, 0xffU);
+    const std::uint32_t packedProfile =
+        std::min<std::uint32_t>(static_cast<std::uint32_t>(profile), 0x3U);
+    const std::uint32_t packedClass = representativeClassFlags & 0xffU;
+    const std::uint32_t packedFlags =
+        (opacityClamped ? 1U : 0U) |
+        (emissionClamped ? 2U : 0U) |
+        (performanceClamped ? 4U : 0U);
+    const std::uint32_t packedRank =
+        availableCount <= 1U
+            ? 0U
+            : static_cast<std::uint32_t>(
+                  (static_cast<std::uint64_t>(rankOrdinal) * 0x7ffULL) /
+                  static_cast<std::uint64_t>(availableCount - 1U));
+    return (packedDepth << 24U) |
+           (packedProfile << 22U) |
+           (packedClass << 14U) |
+           ((packedFlags & 0x7U) << 11U) |
+           (packedRank & 0x7ffU);
+}
+
 struct RankedRepresentativeOffset {
     std::uint32_t offset = 0;
     std::uint64_t rankKey = 0;
@@ -1467,11 +1497,22 @@ struct ProjectedBoundsFootprint {
 struct RepresentativeCompensation {
     float opacity = 1.0F;
     float emission = 1.0F;
+    float coverageScale = 1.0F;
+    bool opacityClamped = false;
+    bool emissionClamped = false;
 };
 
 struct EmittedRepresentativeFootprint {
+    float sourceAreaPixels = 1.0F;
     float coverageAreaPixels = 1.0F;
     float renderAreaPixels = 1.0F;
+    bool performanceClamped = false;
+};
+
+struct RepresentativeCostEstimate {
+    float vertexCost = 1.0F;
+    float fragmentCost = 1.0F;
+    float blendedFragmentCost = 0.0F;
 };
 
 ProjectedBoundsFootprint ProjectedBoundsFootprintPixels(
@@ -1516,20 +1557,151 @@ ProjectedBoundsFootprint ProjectedBoundsFootprintPixels(
     };
 }
 
+float ProjectedWorldDiameterPixels(
+    const PointCloudLodRepresentative& representative,
+    float diameterMeters,
+    const PointCloudLodTraversalParams& params) {
+    if (diameterMeters <= 0.0F) {
+        return 1.0F;
+    }
+
+    const glm::vec4 centerClip =
+        params.viewProjection *
+        glm::vec4{
+            representative.position.x,
+            representative.position.y,
+            representative.position.z,
+            1.0F};
+    if (std::abs(centerClip.w) <= std::numeric_limits<float>::epsilon()) {
+        return 1.0F;
+    }
+    const glm::vec3 centerNdc = glm::vec3{centerClip} / centerClip.w;
+    const glm::vec2 centerPixels{
+        (centerNdc.x * 0.5F + 0.5F) * static_cast<float>(std::max<std::uint32_t>(1U, params.viewportWidth)),
+        (centerNdc.y * 0.5F + 0.5F) * static_cast<float>(std::max<std::uint32_t>(1U, params.viewportHeight))};
+
+    const auto projectedDistance = [&](const glm::vec3& offset) {
+        const glm::vec4 offsetClip =
+            params.viewProjection *
+            glm::vec4{
+                representative.position.x + offset.x,
+                representative.position.y + offset.y,
+                representative.position.z + offset.z,
+                1.0F};
+        if (std::abs(offsetClip.w) <= std::numeric_limits<float>::epsilon()) {
+            return 0.0F;
+        }
+        const glm::vec3 offsetNdc = glm::vec3{offsetClip} / offsetClip.w;
+        const glm::vec2 offsetPixels{
+            (offsetNdc.x * 0.5F + 0.5F) * static_cast<float>(std::max<std::uint32_t>(1U, params.viewportWidth)),
+            (offsetNdc.y * 0.5F + 0.5F) * static_cast<float>(std::max<std::uint32_t>(1U, params.viewportHeight))};
+        return glm::length(offsetPixels - centerPixels);
+    };
+
+    const float xPixels = projectedDistance(glm::vec3{diameterMeters, 0.0F, 0.0F});
+    const float yPixels = projectedDistance(glm::vec3{0.0F, diameterMeters, 0.0F});
+    const float zPixels = projectedDistance(glm::vec3{0.0F, 0.0F, diameterMeters});
+    return std::max({1.0F, xPixels, yPixels, zPixels});
+}
+
+float SourceFootprintDiameterPixels(
+    const PointCloudLodRepresentative& representative,
+    const PointCloudLodTraversalParams& params) {
+    if (params.rendererCostProfile == PointCloudLodRendererCostProfile::BeautyWorldSurfel ||
+        params.rendererCostProfile == PointCloudLodRendererCostProfile::BeautyWorldScreenSprite ||
+        PointCloudStyleUsesWorldSizedScreenSprites(params.style)) {
+        return ProjectedWorldDiameterPixels(
+            representative,
+            std::max(0.0F, invisible_places::style::ScalarConstant(params.style.surfelDiameter)),
+            params);
+    }
+    return std::max(
+        {1.0F,
+         invisible_places::style::ScalarConstant(params.style.pointSize)});
+}
+
 float SourceFootprintAreaPixels(
     const PointCloudLodRepresentative& representative,
     const PointCloudLodTraversalParams& params) {
-    static_cast<void>(representative);
-    if (params.style.geometryMode == PointCloudGeometryMode::WorldSurfels) {
-        const float diameter = std::max(
-            {1.0F,
-             invisible_places::style::ScalarConstant(params.style.surfelDiameter) * 1000.0F});
-        return diameter * diameter;
+    const float diameter = SourceFootprintDiameterPixels(representative, params);
+    return diameter * diameter;
+}
+
+float CircleFragmentCostFromDiameterArea(float diameterAreaPixels) {
+    return std::max(0.0F, diameterAreaPixels) * (glm::pi<float>() * 0.25F);
+}
+
+RepresentativeCostEstimate EstimateRepresentativeCost(
+    const PointCloudLodTraversalParams& params,
+    const EmittedRepresentativeFootprint& footprint) {
+    switch (params.rendererCostProfile) {
+        case PointCloudLodRendererCostProfile::FastBasicSquare:
+            return {
+                .vertexCost = 1.0F,
+                .fragmentCost = std::max(0.0F, footprint.coverageAreaPixels),
+                .blendedFragmentCost = 0.0F};
+        case PointCloudLodRendererCostProfile::BeautyScreenSprite:
+        case PointCloudLodRendererCostProfile::BeautyWorldScreenSprite:
+            return {
+                .vertexCost = 1.0F,
+                .fragmentCost = CircleFragmentCostFromDiameterArea(footprint.renderAreaPixels),
+                .blendedFragmentCost = CircleFragmentCostFromDiameterArea(footprint.renderAreaPixels)};
+        case PointCloudLodRendererCostProfile::BeautyWorldSurfel:
+            return {
+                .vertexCost = 6.0F,
+                .fragmentCost = CircleFragmentCostFromDiameterArea(footprint.renderAreaPixels),
+                .blendedFragmentCost = CircleFragmentCostFromDiameterArea(footprint.renderAreaPixels)};
     }
-    const float pointSizePixels = std::max(
-        {1.0F,
-         invisible_places::style::ScalarConstant(params.style.pointSize)});
-    return pointSizePixels * pointSizePixels;
+    return {};
+}
+
+float ReferenceOpacityForCompensation(const PointCloudStyleState& style) {
+    if (!style.opacity.active) {
+        return kInactiveOpacityDefault;
+    }
+    if (style.opacity.mode == invisible_places::style::ParameterSourceMode::Constant) {
+        return invisible_places::style::ScalarConstant(style.opacity);
+    }
+    return 0.5F;
+}
+
+bool IsBeautyCostProfile(PointCloudLodRendererCostProfile profile) {
+    return profile == PointCloudLodRendererCostProfile::BeautyScreenSprite ||
+           profile == PointCloudLodRendererCostProfile::BeautyWorldScreenSprite ||
+           profile == PointCloudLodRendererCostProfile::BeautyWorldSurfel;
+}
+
+std::pair<float, float> CompensationLimits(
+    invisible_places::output::PointCloudExportDensityMode densityMode,
+    bool beautyProfile) {
+    if (!beautyProfile) {
+        switch (densityMode) {
+            case invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview:
+                return {1.5F, 1.0F};
+            case invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive:
+            case invisible_places::output::PointCloudExportDensityMode::ArtisticAsPreview:
+                return {4.0F, 1.25F};
+            case invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality:
+            case invisible_places::output::PointCloudExportDensityMode::ArtisticHighQuality:
+                return {8.0F, 1.5F};
+            case invisible_places::output::PointCloudExportDensityMode::FullSource:
+                return {1.0F, 1.0F};
+        }
+    }
+
+    switch (densityMode) {
+        case invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview:
+            return {1.75F, 1.0F};
+        case invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive:
+        case invisible_places::output::PointCloudExportDensityMode::ArtisticAsPreview:
+            return {5.0F, 1.75F};
+        case invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality:
+        case invisible_places::output::PointCloudExportDensityMode::ArtisticHighQuality:
+            return {8.0F, 2.5F};
+        case invisible_places::output::PointCloudExportDensityMode::FullSource:
+            return {1.0F, 1.0F};
+    }
+    return {1.0F, 1.0F};
 }
 
 EmittedRepresentativeFootprint EmittedRepresentativeFootprintPixels(
@@ -1542,10 +1714,10 @@ EmittedRepresentativeFootprint EmittedRepresentativeFootprintPixels(
     std::uint32_t emittedRepresentativeCount) {
     const float sourceArea = SourceFootprintAreaPixels(representative, params);
     if (!nodeFootprint.visible || maxRepresentativeDiameterPixels <= 0.0F) {
-        return {.coverageAreaPixels = sourceArea, .renderAreaPixels = sourceArea};
+        return {.sourceAreaPixels = sourceArea, .coverageAreaPixels = sourceArea, .renderAreaPixels = sourceArea};
     }
     if (!node.IsLeaf() && node.representativeCount <= 1U) {
-        return {.coverageAreaPixels = sourceArea, .renderAreaPixels = sourceArea};
+        return {.sourceAreaPixels = sourceArea, .coverageAreaPixels = sourceArea, .renderAreaPixels = sourceArea};
     }
 
     const float nodeDiameter = nodeFootprint.DiameterPixels();
@@ -1553,6 +1725,7 @@ EmittedRepresentativeFootprint EmittedRepresentativeFootprintPixels(
         nodeDiameter,
         1.0F,
         std::max(1.0F, maxRepresentativeDiameterPixels));
+    const bool performanceClamped = nodeDiameter > cappedDiameter + 0.5F;
     const float nodeArea = cappedDiameter * cappedDiameter;
     float coverageArea = nodeArea;
     if (node.representativeCount <= 1U) {
@@ -1583,7 +1756,11 @@ EmittedRepresentativeFootprint EmittedRepresentativeFootprintPixels(
         }
     }
 
-    return {.coverageAreaPixels = coverageArea, .renderAreaPixels = renderArea};
+    return {
+        .sourceAreaPixels = sourceArea,
+        .coverageAreaPixels = coverageArea,
+        .renderAreaPixels = renderArea,
+        .performanceClamped = performanceClamped};
 }
 
 RepresentativeCompensation RepresentativeAreaCompensation(
@@ -1598,31 +1775,35 @@ RepresentativeCompensation RepresentativeAreaCompensation(
         SourceFootprintAreaPixels(representative, params) *
         static_cast<float>(std::max<std::uint32_t>(1U, representedSourceCount));
     const float rawCompensation = std::max(0.0F, representedArea / footprintAreaPixels);
-    float opacityLimit = 1.0F;
-    float emissionLimit = 1.0F;
-    switch (params.densityMode) {
-        case invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview:
-            opacityLimit = 1.5F;
-            emissionLimit = 1.0F;
-            break;
-        case invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive:
-        case invisible_places::output::PointCloudExportDensityMode::ArtisticAsPreview:
-            opacityLimit = 4.0F;
-            emissionLimit = 1.25F;
-            break;
-        case invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality:
-        case invisible_places::output::PointCloudExportDensityMode::ArtisticHighQuality:
-            opacityLimit = 8.0F;
-            emissionLimit = 1.5F;
-            break;
-        case invisible_places::output::PointCloudExportDensityMode::FullSource:
-            opacityLimit = 1.0F;
-            emissionLimit = 1.0F;
-            break;
+    const bool beautyProfile = IsBeautyCostProfile(params.rendererCostProfile);
+    const auto [opacityLimit, emissionLimit] = CompensationLimits(params.densityMode, beautyProfile);
+    float opacityCompensation = rawCompensation;
+    float emissionCompensation = rawCompensation;
+    if (beautyProfile) {
+        const float referenceOpacity = std::clamp(
+            ReferenceOpacityForCompensation(params.style),
+            1.0e-3F,
+            0.995F);
+        const float opticalCoverage = std::clamp(rawCompensation, 0.0F, 128.0F);
+        const float compensatedAlpha = 1.0F - std::pow(1.0F - referenceOpacity, opticalCoverage);
+        opacityCompensation = compensatedAlpha / referenceOpacity;
+
+        const bool accentRepresentative =
+            (representative.representativeClassFlags & PointCloudLodRepresentativeClassEmissiveAccent) != 0U;
+        emissionCompensation =
+            accentRepresentative
+                ? std::max(1.0F, std::sqrt(std::max(1.0F, rawCompensation)))
+                : 1.0F;
     }
+
+    const float clampedOpacity = std::clamp(opacityCompensation, 0.0F, opacityLimit);
+    const float clampedEmission = std::clamp(emissionCompensation, 0.0F, emissionLimit);
     return {
-        .opacity = std::clamp(rawCompensation, 0.0F, opacityLimit),
-        .emission = std::clamp(rawCompensation, 0.0F, emissionLimit)};
+        .opacity = clampedOpacity,
+        .emission = clampedEmission,
+        .coverageScale = rawCompensation,
+        .opacityClamped = opacityCompensation > clampedOpacity + 1.0e-4F,
+        .emissionClamped = emissionCompensation > clampedEmission + 1.0e-4F};
 }
 
 std::uint32_t DefaultRepresentativeBudget(
@@ -1699,9 +1880,10 @@ struct TraversalBudgetState {
         return maxRepresentatives == 0 || drawItems.size() < maxRepresentatives;
     }
 
-    bool CanEmitFootprint(
+    bool CanEmitCost(
         const std::vector<PointCloudDrawItemGpu>& drawItems,
-        float footprintAreaPixels) {
+        float estimatedFragmentCost,
+        bool allowFragmentOverBudgetForCoverage) {
         if (!CanEmitMore(drawItems)) {
             representativeBudgetReached = true;
             return false;
@@ -1709,9 +1891,9 @@ struct TraversalBudgetState {
         if (maxEstimatedFragments <= 0.0F || drawItems.empty()) {
             return true;
         }
-        if (emittedEstimatedFragments + footprintAreaPixels > maxEstimatedFragments) {
+        if (emittedEstimatedFragments + estimatedFragmentCost > maxEstimatedFragments) {
             fragmentBudgetReached = true;
-            return false;
+            return allowFragmentOverBudgetForCoverage;
         }
         return true;
     }
@@ -2254,6 +2436,52 @@ std::vector<AdaptiveFrontierNode> BuildAdaptiveTraversalFrontier(
     return compactFrontier;
 }
 
+void AccumulateRepresentativeCostDiagnostics(
+    PointCloudLodTraversalDiagnostics* diagnostics,
+    const EmittedRepresentativeFootprint& footprint,
+    const RepresentativeCompensation& compensation,
+    const RepresentativeCostEstimate& cost) {
+    if (diagnostics == nullptr) {
+        return;
+    }
+
+    const float sourceDiameter = std::sqrt(std::max(1.0F, footprint.sourceAreaPixels));
+    const float renderDiameter = std::sqrt(std::max(1.0F, footprint.renderAreaPixels));
+    const float radiusScale = renderDiameter / std::max(1.0F, sourceDiameter);
+    const bool firstSample =
+        diagnostics->estimatedVertexCost <= 0.0F &&
+        diagnostics->estimatedFragmentCost <= 0.0F &&
+        diagnostics->estimatedBlendedFragmentCost <= 0.0F;
+    if (firstSample) {
+        diagnostics->minRadiusScale = radiusScale;
+        diagnostics->maxRadiusScale = radiusScale;
+        diagnostics->minOpacityCoverageScale = compensation.opacity;
+        diagnostics->maxOpacityCoverageScale = compensation.opacity;
+        diagnostics->minEmissionCoverageScale = compensation.emission;
+        diagnostics->maxEmissionCoverageScale = compensation.emission;
+    } else {
+        diagnostics->minRadiusScale = std::min(diagnostics->minRadiusScale, radiusScale);
+        diagnostics->maxRadiusScale = std::max(diagnostics->maxRadiusScale, radiusScale);
+        diagnostics->minOpacityCoverageScale =
+            std::min(diagnostics->minOpacityCoverageScale, compensation.opacity);
+        diagnostics->maxOpacityCoverageScale =
+            std::max(diagnostics->maxOpacityCoverageScale, compensation.opacity);
+        diagnostics->minEmissionCoverageScale =
+            std::min(diagnostics->minEmissionCoverageScale, compensation.emission);
+        diagnostics->maxEmissionCoverageScale =
+            std::max(diagnostics->maxEmissionCoverageScale, compensation.emission);
+    }
+    diagnostics->estimatedVertexCost += cost.vertexCost;
+    diagnostics->estimatedFragmentCost += cost.fragmentCost;
+    diagnostics->estimatedBlendedFragmentCost += cost.blendedFragmentCost;
+    diagnostics->opacityCompensationClamped =
+        diagnostics->opacityCompensationClamped || compensation.opacityClamped;
+    diagnostics->emissionCompensationClamped =
+        diagnostics->emissionCompensationClamped || compensation.emissionClamped;
+    diagnostics->performanceCompensationClamped =
+        diagnostics->performanceCompensationClamped || footprint.performanceClamped;
+}
+
 void EmitRepresentatives(
     const PointCloudLodHierarchy& hierarchy,
     std::uint32_t nodeIndex,
@@ -2301,6 +2529,7 @@ void EmitRepresentatives(
         return;
     }
 
+    std::uint32_t emittedForNode = 0;
     const auto pushDrawItem = [&](const PointCloudLodRepresentative& representative,
                                   std::uint32_t representedSourceCount,
                                   std::uint64_t rankKey,
@@ -2313,7 +2542,10 @@ void EmitRepresentatives(
             nodeFootprint,
             maxRepresentativeDiameterPixels,
             emitCount);
-        if (!budget->CanEmitFootprint(*drawItems, footprint.coverageAreaPixels)) {
+        const auto cost = EstimateRepresentativeCost(params, footprint);
+        const bool preserveBeautyCoverage =
+            IsBeautyCostProfile(params.rendererCostProfile) && emittedForNode == 0U;
+        if (!budget->CanEmitCost(*drawItems, cost.fragmentCost, preserveBeautyCoverage)) {
             return false;
         }
         const auto compensation = RepresentativeAreaCompensation(
@@ -2325,19 +2557,23 @@ void EmitRepresentatives(
             {.sourcePointIndex = representative.sourcePointIndex,
              .representedSourceCount = representedSourceCount,
              .reserved0 = StableRepresentativeSeed(nodeIndex, representative, rankKey),
-             .reserved1 =
-                 ((node.depth & 0xffU) << 24U) |
-                 (availableCount <= 1U
-                      ? 0U
-                      : static_cast<std::uint32_t>(
-                            (static_cast<std::uint64_t>(rankOrdinal) * 0x00ffffffULL) /
-                            static_cast<std::uint64_t>(availableCount - 1U))),
+             .reserved1 = PackDrawItemMetadata(
+                 node.depth,
+                 rankOrdinal,
+                 availableCount,
+                 params.rendererCostProfile,
+                 representative.representativeClassFlags,
+                 compensation.opacityClamped,
+                 compensation.emissionClamped,
+                 footprint.performanceClamped),
              .footprintAreaPixels = footprint.coverageAreaPixels,
              .opacityCompensation = compensation.opacity,
              .emissionCompensation = compensation.emission,
              .renderAreaPixels = footprint.renderAreaPixels});
         AccumulateRepresentativeClassCounts(diagnostics, representative.representativeClassFlags);
-        budget->emittedEstimatedFragments += footprint.coverageAreaPixels;
+        AccumulateRepresentativeCostDiagnostics(diagnostics, footprint, compensation, cost);
+        budget->emittedEstimatedFragments += cost.fragmentCost;
+        ++emittedForNode;
         return true;
     };
 
@@ -2694,6 +2930,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
     PointCloudLodTraversalDiagnostics* diagnostics) {
     if (diagnostics != nullptr) {
         *diagnostics = {};
+        diagnostics->rendererCostProfile = params.rendererCostProfile;
     }
     std::vector<PointCloudDrawItemGpu> drawItems;
     if (hierarchy.Empty() || TraversalCancelled(stopToken)) {
@@ -3090,6 +3327,20 @@ bool SavePointCloudLodHierarchyCache(
         errorMessage->clear();
     }
     return true;
+}
+
+const char* PointCloudLodRendererCostProfileName(PointCloudLodRendererCostProfile profile) {
+    switch (profile) {
+        case PointCloudLodRendererCostProfile::FastBasicSquare:
+            return "Fast Basic square";
+        case PointCloudLodRendererCostProfile::BeautyScreenSprite:
+            return "Beauty screen sprite";
+        case PointCloudLodRendererCostProfile::BeautyWorldScreenSprite:
+            return "Beauty world screen sprite";
+        case PointCloudLodRendererCostProfile::BeautyWorldSurfel:
+            return "Beauty world surfel";
+    }
+    return "Unknown";
 }
 
 }  // namespace invisible_places::renderer::pointcloud

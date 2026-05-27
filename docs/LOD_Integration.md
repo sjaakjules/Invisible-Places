@@ -9,10 +9,11 @@ this audit.
 
 ## Current Build Status
 
-The current worktree builds with the Stage 04 CPU adaptive LOD quality path:
+The current worktree builds with the Stage 05 Beauty adaptive LOD quality path:
 hierarchy cache v4, visual node statistics, class-aware representatives,
-per-node scalar stats, and CPU traversal feature triggers. GPU compute
-selection remains a later-stage item.
+per-node scalar stats, CPU traversal feature triggers, Beauty optical-depth
+compensation, and renderer-aware cost profiles. GPU compute selection remains a
+later-stage item.
 
 Fresh runtime/performance reports now include the HUD/diagnostics values
 described below so sparse, stale, or feature-erasing adaptive output can be
@@ -56,8 +57,18 @@ sample-count cap anymore.
   prefixes, so lower budgets keep a spatially distributed subset of higher
   budgets instead of swapping unrelated samples.
 - CPU traversal refines from projected spacing/mark diameter and visible
-  feature statistics, with separate threshold/cost tuning for Fast Basic, Beauty
-  screen sprites, Beauty world-mm sprites, and Beauty world surfels.
+  feature statistics, with separate renderer profiles for Fast Basic square
+  points, Beauty screen sprites, Beauty world-mm sprites, and Beauty world
+  surfels.
+- The 32-byte `PointCloudDrawItemGpu` ABI is unchanged. Existing fields carry
+  source index, represented source count, seed, packed renderer/class/clamp
+  metadata, raw footprint area, opacity scale, emission scale, and render area.
+- Beauty compensation uses optical-depth opacity scaling from represented count
+  and raw-vs-LOD footprint area. Ordinary representatives preserve average
+  emission, emissive/accent representatives receive capped coverage scaling, and
+  Beauty traversal keeps one representative per visible frontier node under
+  fragment pressure so expensive styles degrade by adapting representatives
+  instead of dropping unvisited cloud regions.
 - Traversal accepts the previously displayed frontier, applies separate
   promote/demote hysteresis bands, and reports promoted, demoted,
   hysteresis-kept, and representative-delta diagnostics.
@@ -80,7 +91,10 @@ sample-count cap anymore.
 - The diagnostics overlay also reports representative delta per frame,
   promoted/demoted frontier nodes, hysteresis-kept nodes, active transition
   count/age, hysteresis band, idle refinement pending/completed state, emitted
-  representative class counts, and feature-triggered refinement counts.
+  representative class counts, feature-triggered refinement counts, renderer
+  cost profile, radius/opacity/emission scale ranges, estimated
+  vertices/fragments/blended fragments, and opacity/emission/performance clamp
+  status.
 - PLY load progress reports points read, payload bytes read, elapsed time, and
   ETA when enough samples exist.
 - LOD hierarchy/cache rebuild progress reports elapsed time, approximate ETA,
@@ -92,23 +106,31 @@ sample-count cap anymore.
   is exact or coarse fallback.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
   `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
+  It now renders a repeatable Beauty matrix covering small opaque sprites,
+  large translucent Gaussian sprites, emissive/scalar sprites, world-sized
+  sprites, and world surfels when normals are present.
 - `lod_compare_metrics.json` reports Adaptive HQ representative class counts,
   exact Fast Basic CPU representative class counts, viewport Fast Basic
-  boundedness/smoothness metrics, and colour, scalar, normal, and
-  emissive/accent feature-triggered refinement counts.
-- Stage 04 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports
-  coverage ratio 1, luminance ratio 0.966488, 1,932,759 Adaptive HQ
-  representatives covering all 12,183,742 source points, feature representatives
-  colour/scalar/normal/accent 136/1,070/65/130, Fast Basic max submitted
-  4,111,812 under an 8,294,400 representative budget, no budget exceedance, no
-  full-source fallback, zero large representative-jump frames, and
-  `fast_basic_zoom_out_updated=true`.
-- Stage 04 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` reports coverage
-  ratio 1, luminance ratio 0.814833, 1,729,641 Adaptive HQ representatives
-  covering 99,504,849 source points, Adaptive HQ feature representatives
-  colour/scalar/normal/accent 17,878/138,540/7,775/16,371, and exact Fast Basic
-  CPU feature representatives 18,484/142,172/8,085/16,761 across 2,325,565
-  representatives covering 99,503,058 source points.
+  boundedness/smoothness metrics, Beauty matrix renderer profiles,
+  radius/opacity/emission ranges, estimated vertex/fragment/blended-fragment
+  costs, clamp flags, and colour, scalar, normal, and emissive/accent
+  feature-triggered refinement counts.
+- Stage 05 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports exact
+  Adaptive HQ Beauty matrix output with no fallback. Matrix luminance ratios:
+  small opaque 0.805370, large translucent Gaussian 0.831266,
+  emissive/scalar 0.967904, world-sized sprite 1.118410, and world surfel
+  1.139980. The measurable Stage 05 mismatch fixed during implementation was
+  the large translucent case: the first run had luminance ratio 0.503523 with
+  218,755 represented source points; after preserving Beauty frontier coverage
+  under fragment pressure it reran at 0.831266 with 535,332 represented source
+  points.
+- Stage 05 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` reports exact
+  Adaptive HQ Beauty matrix output with no fallback. Matrix luminance ratios:
+  small opaque 0.666881, large translucent Gaussian 0.754400,
+  emissive/scalar 0.950587, world-sized sprite 0.880937, and world surfel
+  0.600746. The primary small-sprite case used 1,729,641 Adaptive HQ
+  representatives covering 99,504,849 source points, with feature
+  representatives colour/scalar/normal/accent 17,878/138,540/7,775/16,371.
 - The 100M Fast Basic viewport trace reports deterministic smoothness metrics:
   max submitted 262,132 under an 8,294,400 representative budget, max estimated
   fragments 1,108,920 under a 796,262,000 fragment budget, max absolute
@@ -138,12 +160,13 @@ These pieces exist, but they are not yet the ideal system described in
 - Manual sampled point budgets still exist and are uploaded as sampled index
   buffers. The adaptive path treats them mostly as a debug/loading cap, but the
   UI still exposes a generic `Budget` control that can be confused with LOD.
-- LOD compensation exists as footprint, opacity, and emission fields, but it is
-  simplified. It lacks full optical-depth policy controls, Beauty-specific
-  `lodBlend`, and feature-preserving palettes.
+- LOD compensation exists as footprint, optical-depth opacity, and emission
+  fields, but it still lacks author-facing policy controls, Beauty-specific
+  `lodBlend`, parent/child crossfade, and feature-preserving palettes.
 - Pixel screen sprites, world-mm screen sprites, world surfels, and
-  camera-facing world sprites now have separate CPU selection tuning, but they
-  still do not have independent optical-depth policies or GPU timing feedback.
+  camera-facing world sprites now have separate CPU selection and cost tuning,
+  but they still do not have independent authorable policies or GPU timing
+  feedback.
 - The LOD comparison metrics now report coverage, mean luminance, feature class
   counts, feature-triggered refinement counts, and a Fast Basic transition
   trace, but not image error maps, timing breakdowns, peak memory, upload
@@ -167,8 +190,7 @@ These are still target-system items from the ideal plan.
 - Memory-mapped source chunks and CPU/GPU LRU caches.
 - Device-local static point/chunk buffers with staging uploads as the normal
   large-cloud path.
-- Beauty-specific parent/child opacity crossfade or optical-depth transition
-  policy.
+- Beauty-specific parent/child opacity crossfade transition policy.
 - Dedicated LOD style data block with explicit compensation/footprint policy.
 - Vulkan timestamp queries for point pass, depth prepass, accumulation,
   EDL/composite, upload, and render-state submission.
@@ -256,8 +278,10 @@ regression checklist.
 - When Beauty Adaptive lacks a ready hierarchy/draw-item set, use a bounded
   coarse fallback or show an explicit `waiting on adaptive LOD` state. Do not
   silently submit all source points.
-- Pass the estimated fragment budget through representative emission and stop
-  drawing low-priority representatives when the budget is reached.
+- Pass the estimated fragment budget through representative emission. Fast Basic
+  stops drawing low-priority representatives when the budget is reached; Beauty
+  records fragment pressure while still preserving at least one representative
+  for each visible frontier node.
 - Cancel, replace, or supersede stale async traversal when a newer camera/style
   key arrives.
 - Confirm normal adaptive draw-item updates do not call `WaitIdle()` or
@@ -275,10 +299,11 @@ Metrics to watch:
 Make the CPU selector match the visual-cost model before moving selection to
 GPU compute.
 
-Stage 04 status: implemented in the CPU path with cache v4 node stats,
+Stage 05 status: implemented in the CPU path with cache v4 node stats,
 per-node scalar stats, class-aware representatives, projected spacing/mark
-diameter refinement, and feature-triggered traversal diagnostics. Keep the
-items below as the regression checklist for future selector work.
+diameter refinement, renderer-specific cost profiles, Beauty compensation, and
+feature-triggered traversal diagnostics. Keep the items below as the regression
+checklist for future selector work.
 
 - Keep node spacing, density, color variance, scalar hints, normal variance, and
   emissive/accent hints populated for rebuilt and cache-loaded hierarchies.
@@ -286,6 +311,9 @@ items below as the regression checklist for future selector work.
   decisions.
 - Keep separate cost rules for pixel screen sprites, world-mm screen sprites,
   world surfels, and camera-facing world sprites.
+- Keep Beauty optical-depth opacity, ordinary emission averaging,
+  emissive/accent emission scaling, and performance clamp flags active without
+  widening the draw-item ABI.
 - Keep representative classes for spatial coverage, scalar extremes,
   emissive/accent points, color contrast, and normal/edge variation present in
   low-budget emissions.
@@ -380,6 +408,9 @@ Initial quality targets:
 
 - Adaptive HQ coverage ratio should be near full source for the active style.
 - Luminance ratio should stay within an acceptable band for the active style.
+- Beauty matrix coverage should remain 1, with exact/no-fallback results for
+  small opaque, large translucent Gaussian, emissive/scalar, world-sized sprite,
+  and world-surfel cases when normals are available.
 - Adaptive renders should not be empty or stuck on coarse fallback.
 - Fast Basic should report no full-source fallback, no representative or
   fragment budget exceedance, zero large representative-jump frames, and

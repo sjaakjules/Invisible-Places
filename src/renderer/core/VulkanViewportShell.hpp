@@ -74,6 +74,19 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveRepresentativeBudget = 0;
     bool adaptiveRepresentativeBudgetReached = false;
     bool adaptiveFragmentBudgetReached = false;
+    renderer::pointcloud::PointCloudLodRendererCostProfile adaptiveRendererCostProfile =
+        renderer::pointcloud::PointCloudLodRendererCostProfile::FastBasicSquare;
+    float adaptiveMinRadiusScale = 1.0F;
+    float adaptiveMaxRadiusScale = 1.0F;
+    float adaptiveMinOpacityCoverageScale = 1.0F;
+    float adaptiveMaxOpacityCoverageScale = 1.0F;
+    float adaptiveMinEmissionCoverageScale = 1.0F;
+    float adaptiveMaxEmissionCoverageScale = 1.0F;
+    double adaptiveEstimatedVertexCost = 0.0;
+    double adaptiveEstimatedBlendedFragments = 0.0;
+    bool adaptiveOpacityCompensationClamped = false;
+    bool adaptiveEmissionCompensationClamped = false;
+    bool adaptivePerformanceCompensationClamped = false;
     double adaptiveLodTraversalMs = 0.0;
     bool adaptiveLodReusedPrevious = false;
     bool adaptiveLodRuntimeCacheHit = false;
@@ -171,6 +184,19 @@ struct SceneRenderState {
         std::uint32_t adaptiveRepresentativeBudget = 0;
         bool adaptiveRepresentativeBudgetReached = false;
         bool adaptiveFragmentBudgetReached = false;
+        renderer::pointcloud::PointCloudLodRendererCostProfile adaptiveRendererCostProfile =
+            renderer::pointcloud::PointCloudLodRendererCostProfile::FastBasicSquare;
+        float adaptiveMinRadiusScale = 1.0F;
+        float adaptiveMaxRadiusScale = 1.0F;
+        float adaptiveMinOpacityCoverageScale = 1.0F;
+        float adaptiveMaxOpacityCoverageScale = 1.0F;
+        float adaptiveMinEmissionCoverageScale = 1.0F;
+        float adaptiveMaxEmissionCoverageScale = 1.0F;
+        float adaptiveEstimatedVertexCost = 0.0F;
+        float adaptiveEstimatedBlendedFragments = 0.0F;
+        bool adaptiveOpacityCompensationClamped = false;
+        bool adaptiveEmissionCompensationClamped = false;
+        bool adaptivePerformanceCompensationClamped = false;
         double adaptiveLodTraversalMs = 0.0;
         bool adaptiveLodReusedPrevious = false;
         bool adaptiveLodRuntimeCacheHit = false;

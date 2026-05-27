@@ -1028,6 +1028,20 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     std::uint32_t adaptiveRepresentativeBudget = 0;
     bool adaptiveRepresentativeBudgetReached = false;
     bool adaptiveFragmentBudgetReached = false;
+    renderer::pointcloud::PointCloudLodRendererCostProfile adaptiveRendererCostProfile =
+        renderer::pointcloud::PointCloudLodRendererCostProfile::FastBasicSquare;
+    bool adaptiveHasCostProfile = false;
+    float adaptiveMinRadiusScale = 1.0F;
+    float adaptiveMaxRadiusScale = 1.0F;
+    float adaptiveMinOpacityCoverageScale = 1.0F;
+    float adaptiveMaxOpacityCoverageScale = 1.0F;
+    float adaptiveMinEmissionCoverageScale = 1.0F;
+    float adaptiveMaxEmissionCoverageScale = 1.0F;
+    double adaptiveEstimatedVertexCost = 0.0;
+    double adaptiveEstimatedBlendedFragments = 0.0;
+    bool adaptiveOpacityCompensationClamped = false;
+    bool adaptiveEmissionCompensationClamped = false;
+    bool adaptivePerformanceCompensationClamped = false;
     double adaptiveTraversalMs = 0.0;
     bool adaptiveReusedPrevious = false;
     bool adaptiveRuntimeCacheHit = false;
@@ -1083,6 +1097,37 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         adaptiveRepresentativeBudgetReached =
             adaptiveRepresentativeBudgetReached || layer.adaptiveRepresentativeBudgetReached;
         adaptiveFragmentBudgetReached = adaptiveFragmentBudgetReached || layer.adaptiveFragmentBudgetReached;
+        if (layer.useAdaptiveDrawItems) {
+            if (!adaptiveHasCostProfile) {
+                adaptiveRendererCostProfile = layer.adaptiveRendererCostProfile;
+                adaptiveMinRadiusScale = layer.adaptiveMinRadiusScale;
+                adaptiveMaxRadiusScale = layer.adaptiveMaxRadiusScale;
+                adaptiveMinOpacityCoverageScale = layer.adaptiveMinOpacityCoverageScale;
+                adaptiveMaxOpacityCoverageScale = layer.adaptiveMaxOpacityCoverageScale;
+                adaptiveMinEmissionCoverageScale = layer.adaptiveMinEmissionCoverageScale;
+                adaptiveMaxEmissionCoverageScale = layer.adaptiveMaxEmissionCoverageScale;
+                adaptiveHasCostProfile = true;
+            } else {
+                adaptiveMinRadiusScale = std::min(adaptiveMinRadiusScale, layer.adaptiveMinRadiusScale);
+                adaptiveMaxRadiusScale = std::max(adaptiveMaxRadiusScale, layer.adaptiveMaxRadiusScale);
+                adaptiveMinOpacityCoverageScale =
+                    std::min(adaptiveMinOpacityCoverageScale, layer.adaptiveMinOpacityCoverageScale);
+                adaptiveMaxOpacityCoverageScale =
+                    std::max(adaptiveMaxOpacityCoverageScale, layer.adaptiveMaxOpacityCoverageScale);
+                adaptiveMinEmissionCoverageScale =
+                    std::min(adaptiveMinEmissionCoverageScale, layer.adaptiveMinEmissionCoverageScale);
+                adaptiveMaxEmissionCoverageScale =
+                    std::max(adaptiveMaxEmissionCoverageScale, layer.adaptiveMaxEmissionCoverageScale);
+            }
+            adaptiveEstimatedVertexCost += layer.adaptiveEstimatedVertexCost;
+            adaptiveEstimatedBlendedFragments += layer.adaptiveEstimatedBlendedFragments;
+            adaptiveOpacityCompensationClamped =
+                adaptiveOpacityCompensationClamped || layer.adaptiveOpacityCompensationClamped;
+            adaptiveEmissionCompensationClamped =
+                adaptiveEmissionCompensationClamped || layer.adaptiveEmissionCompensationClamped;
+            adaptivePerformanceCompensationClamped =
+                adaptivePerformanceCompensationClamped || layer.adaptivePerformanceCompensationClamped;
+        }
         adaptiveTraversalMs += layer.adaptiveLodTraversalMs;
         adaptiveReusedPrevious = adaptiveReusedPrevious || layer.adaptiveLodReusedPrevious;
         adaptiveRuntimeCacheHit = adaptiveRuntimeCacheHit || layer.adaptiveLodRuntimeCacheHit;
@@ -1145,6 +1190,18 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveRepresentativeBudget = adaptiveRepresentativeBudget;
     diagnostics_.adaptiveRepresentativeBudgetReached = adaptiveRepresentativeBudgetReached;
     diagnostics_.adaptiveFragmentBudgetReached = adaptiveFragmentBudgetReached;
+    diagnostics_.adaptiveRendererCostProfile = adaptiveRendererCostProfile;
+    diagnostics_.adaptiveMinRadiusScale = adaptiveMinRadiusScale;
+    diagnostics_.adaptiveMaxRadiusScale = adaptiveMaxRadiusScale;
+    diagnostics_.adaptiveMinOpacityCoverageScale = adaptiveMinOpacityCoverageScale;
+    diagnostics_.adaptiveMaxOpacityCoverageScale = adaptiveMaxOpacityCoverageScale;
+    diagnostics_.adaptiveMinEmissionCoverageScale = adaptiveMinEmissionCoverageScale;
+    diagnostics_.adaptiveMaxEmissionCoverageScale = adaptiveMaxEmissionCoverageScale;
+    diagnostics_.adaptiveEstimatedVertexCost = adaptiveEstimatedVertexCost;
+    diagnostics_.adaptiveEstimatedBlendedFragments = adaptiveEstimatedBlendedFragments;
+    diagnostics_.adaptiveOpacityCompensationClamped = adaptiveOpacityCompensationClamped;
+    diagnostics_.adaptiveEmissionCompensationClamped = adaptiveEmissionCompensationClamped;
+    diagnostics_.adaptivePerformanceCompensationClamped = adaptivePerformanceCompensationClamped;
     diagnostics_.adaptiveLodTraversalMs = adaptiveTraversalMs;
     diagnostics_.adaptiveLodReusedPrevious = adaptiveReusedPrevious;
     diagnostics_.adaptiveLodRuntimeCacheHit = adaptiveRuntimeCacheHit;

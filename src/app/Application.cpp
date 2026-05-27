@@ -75,6 +75,7 @@
 #endif
 
 #include <glm/mat4x4.hpp>
+#include <glm/gtc/constants.hpp>
 #include <glm/geometric.hpp>
 #include <glm/matrix.hpp>
 #include <glm/vec2.hpp>
@@ -98,6 +99,8 @@ using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointClou
 using PointCloudScreenSpriteSizeMode = invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
 using PointCloudStylisationMode = invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using PointCloudDrawItemGpu = invisible_places::renderer::pointcloud::PointCloudDrawItemGpu;
+using PointCloudLodRendererCostProfile =
+    invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfile;
 using PointCloudLodTraversalDiagnostics =
     invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics;
 using PointCloudLodBuildProgress = invisible_places::renderer::pointcloud::PointCloudLodBuildProgress;
@@ -481,6 +484,18 @@ struct AdaptiveLodCacheState {
     double traversalMs = 0.0;
     std::uint64_t drawItemBytes = 0;
     float maxRenderDiameterPixels = 0.0F;
+    PointCloudLodRendererCostProfile rendererCostProfile = PointCloudLodRendererCostProfile::FastBasicSquare;
+    float minRadiusScale = 1.0F;
+    float maxRadiusScale = 1.0F;
+    float minOpacityCoverageScale = 1.0F;
+    float maxOpacityCoverageScale = 1.0F;
+    float minEmissionCoverageScale = 1.0F;
+    float maxEmissionCoverageScale = 1.0F;
+    float estimatedVertexCost = 0.0F;
+    float estimatedBlendedFragments = 0.0F;
+    bool opacityCompensationClamped = false;
+    bool emissionCompensationClamped = false;
+    bool performanceCompensationClamped = false;
     PointCloudExportDensityMode densityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
 };
 
@@ -519,6 +534,18 @@ struct AdaptiveLodBuildResult {
     double traversalMs = 0.0;
     std::uint64_t drawItemBytes = 0;
     std::uint64_t displayedCacheAgeFrames = 0;
+    PointCloudLodRendererCostProfile rendererCostProfile = PointCloudLodRendererCostProfile::FastBasicSquare;
+    float minRadiusScale = 1.0F;
+    float maxRadiusScale = 1.0F;
+    float minOpacityCoverageScale = 1.0F;
+    float maxOpacityCoverageScale = 1.0F;
+    float minEmissionCoverageScale = 1.0F;
+    float maxEmissionCoverageScale = 1.0F;
+    float estimatedVertexCost = 0.0F;
+    float estimatedBlendedFragments = 0.0F;
+    bool opacityCompensationClamped = false;
+    bool emissionCompensationClamped = false;
+    bool performanceCompensationClamped = false;
     bool reusedPrevious = false;
     bool runtimeCacheHit = false;
     bool asyncPending = false;
@@ -637,6 +664,19 @@ struct PreviewLayerSession {
     float adaptiveLodEstimatedFragments = 0.0F;
     float adaptiveLodFragmentBudget = 0.0F;
     std::uint32_t adaptiveLodRepresentativeBudget = 0;
+    PointCloudLodRendererCostProfile adaptiveLodRendererCostProfile =
+        PointCloudLodRendererCostProfile::FastBasicSquare;
+    float adaptiveLodMinRadiusScale = 1.0F;
+    float adaptiveLodMaxRadiusScale = 1.0F;
+    float adaptiveLodMinOpacityCoverageScale = 1.0F;
+    float adaptiveLodMaxOpacityCoverageScale = 1.0F;
+    float adaptiveLodMinEmissionCoverageScale = 1.0F;
+    float adaptiveLodMaxEmissionCoverageScale = 1.0F;
+    float adaptiveLodEstimatedVertexCost = 0.0F;
+    float adaptiveLodEstimatedBlendedFragments = 0.0F;
+    bool adaptiveLodOpacityCompensationClamped = false;
+    bool adaptiveLodEmissionCompensationClamped = false;
+    bool adaptiveLodPerformanceCompensationClamped = false;
     std::uint64_t adaptiveLodVisibleRepresentedSourceCount = 0;
     std::uint64_t adaptiveLodEmittedRepresentedSourceCount = 0;
     std::uint64_t adaptiveLodCulledRepresentedSourceCount = 0;
@@ -2817,6 +2857,21 @@ float EstimateSubmittedFragments(const std::vector<PointCloudDrawItemGpu>& drawI
         });
 }
 
+float EstimateSubmittedFragments(
+    const std::vector<PointCloudDrawItemGpu>& drawItems,
+    PointCloudLodRendererCostProfile profile) {
+    if (profile == PointCloudLodRendererCostProfile::FastBasicSquare) {
+        return EstimateSubmittedFragments(drawItems);
+    }
+    return std::accumulate(
+        drawItems.begin(),
+        drawItems.end(),
+        0.0F,
+        [](float total, const PointCloudDrawItemGpu& drawItem) {
+            return total + (std::max(0.0F, drawItem.renderAreaPixels) * (glm::pi<float>() * 0.25F));
+        });
+}
+
 float MaxDrawItemRenderDiameterPixels(const std::vector<PointCloudDrawItemGpu>& drawItems) {
     return std::accumulate(
         drawItems.begin(),
@@ -2825,6 +2880,56 @@ float MaxDrawItemRenderDiameterPixels(const std::vector<PointCloudDrawItemGpu>& 
         [](float maximum, const PointCloudDrawItemGpu& drawItem) {
             return std::max(maximum, std::sqrt(std::max(1.0F, drawItem.renderAreaPixels)));
         });
+}
+
+struct DrawItemCompensationStats {
+    float minRadiusScale = 1.0F;
+    float maxRadiusScale = 1.0F;
+    float minOpacityCoverageScale = 1.0F;
+    float maxOpacityCoverageScale = 1.0F;
+    float minEmissionCoverageScale = 1.0F;
+    float maxEmissionCoverageScale = 1.0F;
+    float estimatedVertexCost = 0.0F;
+    float estimatedFragments = 0.0F;
+    float estimatedBlendedFragments = 0.0F;
+};
+
+DrawItemCompensationStats EstimateDrawItemCompensationStats(
+    const std::vector<PointCloudDrawItemGpu>& drawItems,
+    PointCloudLodRendererCostProfile profile) {
+    DrawItemCompensationStats stats;
+    if (drawItems.empty()) {
+        return stats;
+    }
+    bool first = true;
+    for (const auto& drawItem : drawItems) {
+        const float coverageDiameter = std::sqrt(std::max(1.0F, drawItem.footprintAreaPixels));
+        const float renderDiameter = std::sqrt(std::max(1.0F, drawItem.renderAreaPixels));
+        const float radiusScale = renderDiameter / std::max(1.0F, coverageDiameter);
+        if (first) {
+            stats.minRadiusScale = radiusScale;
+            stats.maxRadiusScale = radiusScale;
+            stats.minOpacityCoverageScale = drawItem.opacityCompensation;
+            stats.maxOpacityCoverageScale = drawItem.opacityCompensation;
+            stats.minEmissionCoverageScale = drawItem.emissionCompensation;
+            stats.maxEmissionCoverageScale = drawItem.emissionCompensation;
+            first = false;
+        } else {
+            stats.minRadiusScale = std::min(stats.minRadiusScale, radiusScale);
+            stats.maxRadiusScale = std::max(stats.maxRadiusScale, radiusScale);
+            stats.minOpacityCoverageScale = std::min(stats.minOpacityCoverageScale, drawItem.opacityCompensation);
+            stats.maxOpacityCoverageScale = std::max(stats.maxOpacityCoverageScale, drawItem.opacityCompensation);
+            stats.minEmissionCoverageScale = std::min(stats.minEmissionCoverageScale, drawItem.emissionCompensation);
+            stats.maxEmissionCoverageScale = std::max(stats.maxEmissionCoverageScale, drawItem.emissionCompensation);
+        }
+    }
+    stats.estimatedVertexCost =
+        static_cast<float>(drawItems.size()) *
+        (profile == PointCloudLodRendererCostProfile::BeautyWorldSurfel ? 6.0F : 1.0F);
+    stats.estimatedFragments = EstimateSubmittedFragments(drawItems, profile);
+    stats.estimatedBlendedFragments =
+        profile == PointCloudLodRendererCostProfile::FastBasicSquare ? 0.0F : stats.estimatedFragments;
+    return stats;
 }
 
 void HashQuantizedFloat(std::uint64_t* seed, float value, float scale) {
@@ -3130,6 +3235,20 @@ PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
     return session->adaptiveMovementDensityMode;
 }
 
+PointCloudLodRendererCostProfile ResolveAdaptiveLodRendererCostProfile(
+    const PointCloudStyleState& style,
+    bool fastBasicProfile) {
+    if (fastBasicProfile) {
+        return PointCloudLodRendererCostProfile::FastBasicSquare;
+    }
+    if (style.geometryMode == PointCloudGeometryMode::ScreenSprites) {
+        return invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(style)
+                   ? PointCloudLodRendererCostProfile::BeautyWorldScreenSprite
+                   : PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    }
+    return PointCloudLodRendererCostProfile::BeautyWorldSurfel;
+}
+
 invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams(
     const PreviewLayerSession& session,
     const PointCloudStyleState& style,
@@ -3146,6 +3265,7 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
     params.viewportHeight = std::max<std::uint32_t>(1U, viewportHeight);
     params.style = style;
     params.densityMode = densityMode;
+    params.rendererCostProfile = ResolveAdaptiveLodRendererCostProfile(style, fastBasicProfile);
     params.maxRepresentatives = AdaptiveViewportRepresentativeBudget(
         params.viewportWidth,
         params.viewportHeight,
@@ -3199,13 +3319,15 @@ std::uint64_t AdaptiveLodTraversalKey(
     const glm::vec3& cameraPosition,
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
-    PointCloudExportDensityMode densityMode) {
+    PointCloudExportDensityMode densityMode,
+    PointCloudLodRendererCostProfile rendererCostProfile) {
     std::uint64_t seed = 1469598103934665603ULL;
     HashQuantizedMat4(&seed, viewProjection, 4096.0F);
     HashQuantizedVec3(&seed, cameraPosition, 1024.0F);
     HashCombine(&seed, std::max<std::uint32_t>(1U, viewportWidth));
     HashCombine(&seed, std::max<std::uint32_t>(1U, viewportHeight));
     HashCombine(&seed, static_cast<std::uint64_t>(densityMode));
+    HashCombine(&seed, static_cast<std::uint64_t>(rendererCostProfile));
     HashCombine(&seed, ManualAdaptiveDrawItemCap(session));
     HashCombine(
         &seed,
@@ -3332,6 +3454,18 @@ void ApplyAdaptiveLodCacheMetadata(
     session->adaptiveLodEstimatedFragments = entry.estimatedFragments;
     session->adaptiveLodFragmentBudget = entry.fragmentBudget;
     session->adaptiveLodRepresentativeBudget = entry.representativeBudget;
+    session->adaptiveLodRendererCostProfile = entry.rendererCostProfile;
+    session->adaptiveLodMinRadiusScale = entry.minRadiusScale;
+    session->adaptiveLodMaxRadiusScale = entry.maxRadiusScale;
+    session->adaptiveLodMinOpacityCoverageScale = entry.minOpacityCoverageScale;
+    session->adaptiveLodMaxOpacityCoverageScale = entry.maxOpacityCoverageScale;
+    session->adaptiveLodMinEmissionCoverageScale = entry.minEmissionCoverageScale;
+    session->adaptiveLodMaxEmissionCoverageScale = entry.maxEmissionCoverageScale;
+    session->adaptiveLodEstimatedVertexCost = entry.estimatedVertexCost;
+    session->adaptiveLodEstimatedBlendedFragments = entry.estimatedBlendedFragments;
+    session->adaptiveLodOpacityCompensationClamped = entry.opacityCompensationClamped;
+    session->adaptiveLodEmissionCompensationClamped = entry.emissionCompensationClamped;
+    session->adaptiveLodPerformanceCompensationClamped = entry.performanceCompensationClamped;
     session->adaptiveLodVisibleRepresentedSourceCount = entry.visibleRepresentedSourceCount;
     session->adaptiveLodEmittedRepresentedSourceCount = entry.emittedRepresentedSourceCount;
     session->adaptiveLodCulledRepresentedSourceCount = entry.culledRepresentedSourceCount;
@@ -3413,8 +3547,30 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     entry.hysteresisDemoteScale = diagnostics.hysteresisDemoteScale;
     entry.representativeBudgetReached = diagnostics.representativeBudgetReached;
     entry.fragmentBudgetReached = diagnostics.fragmentBudgetReached;
-    entry.estimatedFragments = EstimateSubmittedFragments(drawItems);
+    const auto fallbackStats = EstimateDrawItemCompensationStats(drawItems, diagnostics.rendererCostProfile);
+    entry.estimatedFragments = diagnostics.estimatedFragmentCost > 0.0F
+                                   ? diagnostics.estimatedFragmentCost
+                                   : fallbackStats.estimatedFragments;
     entry.maxRenderDiameterPixels = MaxDrawItemRenderDiameterPixels(drawItems);
+    entry.rendererCostProfile = diagnostics.rendererCostProfile;
+    entry.minRadiusScale = diagnostics.estimatedVertexCost > 0.0F ? diagnostics.minRadiusScale : fallbackStats.minRadiusScale;
+    entry.maxRadiusScale = diagnostics.estimatedVertexCost > 0.0F ? diagnostics.maxRadiusScale : fallbackStats.maxRadiusScale;
+    entry.minOpacityCoverageScale =
+        diagnostics.estimatedVertexCost > 0.0F ? diagnostics.minOpacityCoverageScale : fallbackStats.minOpacityCoverageScale;
+    entry.maxOpacityCoverageScale =
+        diagnostics.estimatedVertexCost > 0.0F ? diagnostics.maxOpacityCoverageScale : fallbackStats.maxOpacityCoverageScale;
+    entry.minEmissionCoverageScale =
+        diagnostics.estimatedVertexCost > 0.0F ? diagnostics.minEmissionCoverageScale : fallbackStats.minEmissionCoverageScale;
+    entry.maxEmissionCoverageScale =
+        diagnostics.estimatedVertexCost > 0.0F ? diagnostics.maxEmissionCoverageScale : fallbackStats.maxEmissionCoverageScale;
+    entry.estimatedVertexCost =
+        diagnostics.estimatedVertexCost > 0.0F ? diagnostics.estimatedVertexCost : fallbackStats.estimatedVertexCost;
+    entry.estimatedBlendedFragments = diagnostics.estimatedBlendedFragmentCost > 0.0F
+                                          ? diagnostics.estimatedBlendedFragmentCost
+                                          : fallbackStats.estimatedBlendedFragments;
+    entry.opacityCompensationClamped = diagnostics.opacityCompensationClamped;
+    entry.emissionCompensationClamped = diagnostics.emissionCompensationClamped;
+    entry.performanceCompensationClamped = diagnostics.performanceCompensationClamped;
     entry.fragmentBudget = fragmentBudget;
     entry.representativeBudget = representativeBudget;
     entry.traversalMs = traversalMs;
@@ -3632,6 +3788,9 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         session->adaptiveLodIdleRefinementPending ? "idle refinement transition" : "transition";
 
     const auto& target = session->adaptiveLodTransitionTarget;
+    const auto transitionStats = EstimateDrawItemCompensationStats(
+        *session->adaptiveLodTransitionDrawItems,
+        target.rendererCostProfile);
     return AdaptiveLodBuildResult{
         .available = true,
         .drawItems = session->adaptiveLodTransitionDrawItems,
@@ -3661,7 +3820,7 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .averageTransitionAgeMs = session->adaptiveLodTransitionAgeMs,
         .maxTransitionAgeMs = session->adaptiveLodTransitionAgeMs,
         .idleRefinementPending = session->adaptiveLodIdleRefinementPending,
-        .estimatedFragments = EstimateSubmittedFragments(*session->adaptiveLodTransitionDrawItems),
+        .estimatedFragments = transitionStats.estimatedFragments,
         .fragmentBudget = target.fragmentBudget,
         .representativeBudget = target.representativeBudget,
         .representativeBudgetReached = target.representativeBudgetReached,
@@ -3669,6 +3828,18 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .traversalMs = 0.0,
         .drawItemBytes = DrawItemByteCount(session->adaptiveLodTransitionDrawItems->size()),
         .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+        .rendererCostProfile = target.rendererCostProfile,
+        .minRadiusScale = transitionStats.minRadiusScale,
+        .maxRadiusScale = transitionStats.maxRadiusScale,
+        .minOpacityCoverageScale = transitionStats.minOpacityCoverageScale,
+        .maxOpacityCoverageScale = transitionStats.maxOpacityCoverageScale,
+        .minEmissionCoverageScale = transitionStats.minEmissionCoverageScale,
+        .maxEmissionCoverageScale = transitionStats.maxEmissionCoverageScale,
+        .estimatedVertexCost = transitionStats.estimatedVertexCost,
+        .estimatedBlendedFragments = transitionStats.estimatedBlendedFragments,
+        .opacityCompensationClamped = target.opacityCompensationClamped,
+        .emissionCompensationClamped = target.emissionCompensationClamped,
+        .performanceCompensationClamped = target.performanceCompensationClamped,
         .reusedPrevious = true,
         .runtimeCacheHit = false,
         .asyncPending = session->adaptiveLodAsyncPending,
@@ -3924,6 +4095,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .available = false,
             .fragmentBudget = requestedParams.maxEstimatedFragments,
             .representativeBudget = requestedParams.maxRepresentatives,
+            .rendererCostProfile = requestedParams.rendererCostProfile,
             .asyncPending = session->adaptiveLodAsyncPending,
             .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
             .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
@@ -3942,7 +4114,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         cameraPosition,
         viewportWidth,
         viewportHeight,
-        densityMode);
+        densityMode,
+        requestedParams.rendererCostProfile);
     session->adaptiveLodRequestedDensityMode = densityMode;
     auto makeResultFromEntry =
         [&](const AdaptiveLodCacheState& entry,
@@ -3985,6 +4158,18 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .traversalMs = (reusedPrevious || runtimeCacheHit) ? 0.0 : entry.traversalMs,
             .drawItemBytes = entry.drawItemBytes,
             .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
+            .rendererCostProfile = entry.rendererCostProfile,
+            .minRadiusScale = entry.minRadiusScale,
+            .maxRadiusScale = entry.maxRadiusScale,
+            .minOpacityCoverageScale = entry.minOpacityCoverageScale,
+            .maxOpacityCoverageScale = entry.maxOpacityCoverageScale,
+            .minEmissionCoverageScale = entry.minEmissionCoverageScale,
+            .maxEmissionCoverageScale = entry.maxEmissionCoverageScale,
+            .estimatedVertexCost = entry.estimatedVertexCost,
+            .estimatedBlendedFragments = entry.estimatedBlendedFragments,
+            .opacityCompensationClamped = entry.opacityCompensationClamped,
+            .emissionCompensationClamped = entry.emissionCompensationClamped,
+            .performanceCompensationClamped = entry.performanceCompensationClamped,
             .reusedPrevious = reusedPrevious,
             .runtimeCacheHit = runtimeCacheHit,
             .asyncPending = asyncPending,
@@ -4201,6 +4386,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .available = false,
             .fragmentBudget = requestedParams.maxEstimatedFragments,
             .representativeBudget = requestedParams.maxRepresentatives,
+            .rendererCostProfile = requestedParams.rendererCostProfile,
             .asyncPending = scheduled,
             .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
             .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
@@ -4212,6 +4398,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         };
     }
     const auto transitionSource = AdaptiveLodDisplayedTransitionSource(*session);
+    PointCloudLodTraversalDiagnostics fallbackDiagnostics;
+    fallbackDiagnostics.rendererCostProfile = requestedParams.rendererCostProfile;
     auto fallback = StoreAdaptiveLodCacheEntry(
         session,
         traversalKey,
@@ -4221,7 +4409,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         requestedParams.maxEstimatedFragments,
         0.0,
         frameCounter,
-        true);
+        true,
+        fallbackDiagnostics);
     session->adaptiveLodRuntimeCacheHit = false;
     session->adaptiveLodDisplayedDensityMode = PointCloudExportDensityMode::FastAdaptivePreview;
     session->adaptiveLodRuntimeStatus =
@@ -4285,6 +4474,18 @@ void RememberDisplayedAdaptiveLodEntry(
     displayed.representativeBudgetReached = result.representativeBudgetReached;
     displayed.fragmentBudgetReached = result.fragmentBudgetReached;
     displayed.drawItemBytes = result.drawItemBytes;
+    displayed.rendererCostProfile = result.rendererCostProfile;
+    displayed.minRadiusScale = result.minRadiusScale;
+    displayed.maxRadiusScale = result.maxRadiusScale;
+    displayed.minOpacityCoverageScale = result.minOpacityCoverageScale;
+    displayed.maxOpacityCoverageScale = result.maxOpacityCoverageScale;
+    displayed.minEmissionCoverageScale = result.minEmissionCoverageScale;
+    displayed.maxEmissionCoverageScale = result.maxEmissionCoverageScale;
+    displayed.estimatedVertexCost = result.estimatedVertexCost;
+    displayed.estimatedBlendedFragments = result.estimatedBlendedFragments;
+    displayed.opacityCompensationClamped = result.opacityCompensationClamped;
+    displayed.emissionCompensationClamped = result.emissionCompensationClamped;
+    displayed.performanceCompensationClamped = result.performanceCompensationClamped;
     displayed.densityMode = result.displayedDensityMode;
     displayed.drawItems = result.drawItems;
     session->adaptiveLodDisplayedEntry = std::move(displayed);
@@ -4350,6 +4551,18 @@ bool PopulateAdaptivePointCloudLayer(
         layer->adaptiveRepresentativeBudget = result.representativeBudget;
         layer->adaptiveRepresentativeBudgetReached = result.representativeBudgetReached;
         layer->adaptiveFragmentBudgetReached = result.fragmentBudgetReached;
+        layer->adaptiveRendererCostProfile = result.rendererCostProfile;
+        layer->adaptiveMinRadiusScale = result.minRadiusScale;
+        layer->adaptiveMaxRadiusScale = result.maxRadiusScale;
+        layer->adaptiveMinOpacityCoverageScale = result.minOpacityCoverageScale;
+        layer->adaptiveMaxOpacityCoverageScale = result.maxOpacityCoverageScale;
+        layer->adaptiveMinEmissionCoverageScale = result.minEmissionCoverageScale;
+        layer->adaptiveMaxEmissionCoverageScale = result.maxEmissionCoverageScale;
+        layer->adaptiveEstimatedVertexCost = result.estimatedVertexCost;
+        layer->adaptiveEstimatedBlendedFragments = result.estimatedBlendedFragments;
+        layer->adaptiveOpacityCompensationClamped = result.opacityCompensationClamped;
+        layer->adaptiveEmissionCompensationClamped = result.emissionCompensationClamped;
+        layer->adaptivePerformanceCompensationClamped = result.performanceCompensationClamped;
         layer->adaptiveLodTraversalMs = 0.0;
         layer->adaptiveLodReusedPrevious = false;
         layer->adaptiveLodRuntimeCacheHit = result.runtimeCacheHit;
@@ -4398,6 +4611,18 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveRepresentativeBudget = result.representativeBudget;
     layer->adaptiveRepresentativeBudgetReached = result.representativeBudgetReached;
     layer->adaptiveFragmentBudgetReached = result.fragmentBudgetReached;
+    layer->adaptiveRendererCostProfile = result.rendererCostProfile;
+    layer->adaptiveMinRadiusScale = result.minRadiusScale;
+    layer->adaptiveMaxRadiusScale = result.maxRadiusScale;
+    layer->adaptiveMinOpacityCoverageScale = result.minOpacityCoverageScale;
+    layer->adaptiveMaxOpacityCoverageScale = result.maxOpacityCoverageScale;
+    layer->adaptiveMinEmissionCoverageScale = result.minEmissionCoverageScale;
+    layer->adaptiveMaxEmissionCoverageScale = result.maxEmissionCoverageScale;
+    layer->adaptiveEstimatedVertexCost = result.estimatedVertexCost;
+    layer->adaptiveEstimatedBlendedFragments = result.estimatedBlendedFragments;
+    layer->adaptiveOpacityCompensationClamped = result.opacityCompensationClamped;
+    layer->adaptiveEmissionCompensationClamped = result.emissionCompensationClamped;
+    layer->adaptivePerformanceCompensationClamped = result.performanceCompensationClamped;
     layer->adaptiveLodTraversalMs = result.traversalMs;
     layer->adaptiveLodReusedPrevious = result.reusedPrevious;
     layer->adaptiveLodRuntimeCacheHit = result.runtimeCacheHit;
@@ -13573,6 +13798,24 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             session.adaptiveLodCache.traversalMs,
             session.adaptiveLodCache.maxRenderDiameterPixels);
         ImGui::Text(
+            "Renderer cost: %s | vertices %.0f | fragments %.0f | blended %.0f",
+            invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileName(
+                session.adaptiveLodCache.rendererCostProfile),
+            session.adaptiveLodCache.estimatedVertexCost,
+            session.adaptiveLodCache.estimatedFragments,
+            session.adaptiveLodCache.estimatedBlendedFragments);
+        ImGui::Text(
+            "Compensation: radius %.2f-%.2fx | opacity %.2f-%.2fx | emission %.2f-%.2fx | clamps %s/%s/%s",
+            session.adaptiveLodCache.minRadiusScale,
+            session.adaptiveLodCache.maxRadiusScale,
+            session.adaptiveLodCache.minOpacityCoverageScale,
+            session.adaptiveLodCache.maxOpacityCoverageScale,
+            session.adaptiveLodCache.minEmissionCoverageScale,
+            session.adaptiveLodCache.maxEmissionCoverageScale,
+            session.adaptiveLodCache.opacityCompensationClamped ? "opacity" : "-",
+            session.adaptiveLodCache.emissionCompensationClamped ? "emission" : "-",
+            session.adaptiveLodCache.performanceCompensationClamped ? "footprint" : "-");
+        ImGui::Text(
             "Represented visible/emitted/culled: %s / %s / %s",
             FormatPointCount(session.adaptiveLodCache.visibleRepresentedSourceCount).c_str(),
             FormatPointCount(session.adaptiveLodCache.emittedRepresentedSourceCount).c_str(),
@@ -19119,6 +19362,25 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveEstimatedFragments,
                     diagnostics.adaptiveFragmentBudget);
                 ImGui::Text(
+                    "Adaptive cost profile: %s | vertices %.0f | blended %.0f",
+                    invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileName(
+                        diagnostics.adaptiveRendererCostProfile),
+                    diagnostics.adaptiveEstimatedVertexCost,
+                    diagnostics.adaptiveEstimatedBlendedFragments);
+                ImGui::Text(
+                    "Adaptive compensation: radius %.2f-%.2fx | opacity %.2f-%.2fx | emission %.2f-%.2fx",
+                    diagnostics.adaptiveMinRadiusScale,
+                    diagnostics.adaptiveMaxRadiusScale,
+                    diagnostics.adaptiveMinOpacityCoverageScale,
+                    diagnostics.adaptiveMaxOpacityCoverageScale,
+                    diagnostics.adaptiveMinEmissionCoverageScale,
+                    diagnostics.adaptiveMaxEmissionCoverageScale);
+                ImGui::Text(
+                    "Adaptive clamps: %s/%s/%s",
+                    diagnostics.adaptiveOpacityCompensationClamped ? "opacity" : "-",
+                    diagnostics.adaptiveEmissionCompensationClamped ? "emission" : "-",
+                    diagnostics.adaptivePerformanceCompensationClamped ? "footprint" : "-");
+                ImGui::Text(
                     "Adaptive representative budget: %s",
                     FormatPointCount(diagnostics.adaptiveRepresentativeBudget).c_str());
                 const char* budgetPressure =
@@ -19766,6 +20028,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
         loadResult.cloud.PointCount(),
         loadResult.cloud.PointCount());
+    const bool sourceCloudHasNormals =
+        loadResult.cloud.hasNormals &&
+        loadResult.cloud.normals.size() >= loadResult.cloud.PointCount();
     EnsurePointVisuals(&session);
 
     if (!ActivateLoadedPointCloud(0U, std::move(loadResult.cloud), &runtimeState, &viewport)) {
@@ -20130,85 +20395,319 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicExactEmissiveFeatureRefinements = fastBasicExactDiagnostics.emissiveFeatureRefinedNodeCount;
     }
 
-    ++runtimeState.previewFrameCounter;
-    runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyFullSource;
-    const auto fullSourceState = BuildRenderState(runtimeState, viewport, 0.0F);
-    auto fullSourceImage = viewport.RenderPointCloudExrFrame(
-        {.renderState = fullSourceState,
-         .width = kComparisonWidth,
-         .height = kComparisonHeight,
-         .pointCloudDensityMode = PointCloudExportDensityMode::FullSource});
+    struct BeautyLodComparisonCase {
+        std::string slug;
+        std::string label;
+        PointCloudStyleState style;
+    };
 
-    ++runtimeState.previewFrameCounter;
-    runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
-    const auto adaptiveState = BuildExactAdaptiveComparisonRenderState(runtimeState, viewport);
-    const auto adaptiveExact = std::any_of(
-        adaptiveState.pointCloudLayers.begin(),
-        adaptiveState.pointCloudLayers.end(),
-        [](const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState& layer) {
-            return layer.useAdaptiveDrawItems &&
-                   !layer.adaptiveLodReusedPrevious &&
-                   layer.adaptiveLodDisplayedDensity == "Adaptive High Quality";
-        });
-    if (!adaptiveExact) {
-        std::cerr << "Adaptive comparison did not produce an exact Adaptive High Quality draw-item set.\n";
+    struct BeautyLodComparisonResult {
+        std::string slug;
+        std::string label;
+        std::filesystem::path fullPath;
+        std::filesystem::path adaptivePath;
+        LodComparisonImageMetrics fullMetrics{};
+        LodComparisonImageMetrics adaptiveMetrics{};
+        double fullCoverage = 0.0;
+        double adaptiveCoverage = 0.0;
+        double coverageRatio = 0.0;
+        double fullMeanLuminance = 0.0;
+        double adaptiveMeanLuminance = 0.0;
+        double luminanceRatio = 0.0;
+        std::uint64_t representatives = 0;
+        std::uint64_t representedSource = 0;
+        std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+            adaptiveClassCounts{};
+        std::uint32_t adaptiveColorFeatureRefinements = 0;
+        std::uint32_t adaptiveScalarFeatureRefinements = 0;
+        std::uint32_t adaptiveNormalFeatureRefinements = 0;
+        std::uint32_t adaptiveEmissiveFeatureRefinements = 0;
+        PointCloudLodRendererCostProfile rendererCostProfile =
+            PointCloudLodRendererCostProfile::BeautyScreenSprite;
+        float adaptiveRadiusScaleMin = 1.0F;
+        float adaptiveRadiusScaleMax = 1.0F;
+        float adaptiveOpacityScaleMin = 1.0F;
+        float adaptiveOpacityScaleMax = 1.0F;
+        float adaptiveEmissionScaleMin = 1.0F;
+        float adaptiveEmissionScaleMax = 1.0F;
+        double adaptiveEstimatedVertices = 0.0;
+        double adaptiveEstimatedFragments = 0.0;
+        double adaptiveEstimatedBlendedFragments = 0.0;
+        bool adaptiveOpacityClamped = false;
+        bool adaptiveEmissionClamped = false;
+        bool adaptivePerformanceClamped = false;
+        bool adaptiveExact = false;
+        bool adaptiveFallback = false;
+    };
+
+    const auto metricCoverage = [](const LodComparisonImageMetrics& metrics) {
+        return metrics.pixelCount == 0
+                   ? 0.0
+                   : static_cast<double>(metrics.coveredPixels) / static_cast<double>(metrics.pixelCount);
+    };
+    const auto metricMeanLuminance = [](const LodComparisonImageMetrics& metrics) {
+        return metrics.pixelCount == 0
+                   ? 0.0
+                   : metrics.luminanceSum / static_cast<double>(metrics.pixelCount);
+    };
+
+    auto makeBaseBeautyStyle = [&runtimeState]() {
+        const auto& comparisonSession = runtimeState.sessions.front();
+        auto style = comparisonSession.pointStyle;
+        style.geometryMode = PointCloudGeometryMode::ScreenSprites;
+        style.screenSpriteSizeMode = PointCloudScreenSpriteSizeMode::Pixels;
+        style.depthContribution = PointCloudDepthContribution::None;
+        style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+        style.stylisationMode = PointCloudStylisationMode::Off;
+        style.colorMode = comparisonSession.hasSourceRgb
+                              ? PointCloudColorMode::SourceRgb
+                              : (comparisonSession.scalarFields.empty()
+                                     ? PointCloudColorMode::SolidColor
+                                     : PointCloudColorMode::ScalarColormap);
+        style.solidCenters = true;
+        style.exposure = 1.0F;
+        style.densityScale = 1.0F;
+        style.densityClamp = 32.0F;
+        style.colorizeAmount = 0.0F;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 6.0F);
+        invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.012F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+        invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
+        invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+        return style;
+    };
+
+    const auto configureScalarField = [&runtimeState](PointCloudStyleState* style) {
+        if (style == nullptr || runtimeState.sessions.front().scalarFields.empty()) {
+            return false;
+        }
+        const auto& scalarField = runtimeState.sessions.front().scalarFields.front();
+        style->colorMode = PointCloudColorMode::ScalarColormap;
+        style->colormap = PointCloudColormapId::Turbo;
+        invisible_places::style::ConfigureFieldMapFromStats(
+            &style->colormapPosition,
+            0,
+            scalarField.name,
+            0.0F,
+            1.0F,
+            &scalarField);
+        invisible_places::style::ConfigureFieldMapFromStats(
+            &style->emissiveStrength,
+            0,
+            scalarField.name,
+            0.0F,
+            1.8F,
+            &scalarField);
+        return true;
+    };
+
+    std::vector<BeautyLodComparisonCase> beautyCases;
+    {
+        auto smallOpaque = makeBaseBeautyStyle();
+        invisible_places::style::SetScalarConstant(&smallOpaque.pointSize, 4.0F);
+        invisible_places::style::SetScalarConstant(&smallOpaque.opacity, 1.0F);
+        beautyCases.push_back({"small_opaque_sprites", "Small opaque sprites", smallOpaque});
+
+        auto largeTranslucent = makeBaseBeautyStyle();
+        largeTranslucent.falloffProfile = PointCloudFalloffProfile::Gaussian;
+        largeTranslucent.solidCenters = false;
+        largeTranslucent.gaussianSharpness = 1.35F;
+        largeTranslucent.densityClamp = 10.0F;
+        invisible_places::style::SetScalarConstant(&largeTranslucent.pointSize, 28.0F);
+        invisible_places::style::SetScalarConstant(&largeTranslucent.opacity, 0.18F);
+        beautyCases.push_back(
+            {"large_translucent_gaussian_sprites", "Large translucent Gaussian sprites", largeTranslucent});
+
+        auto emissiveScalar = makeBaseBeautyStyle();
+        emissiveScalar.falloffProfile = PointCloudFalloffProfile::Gaussian;
+        emissiveScalar.solidCenters = false;
+        emissiveScalar.exposure = 1.15F;
+        invisible_places::style::SetScalarConstant(&emissiveScalar.pointSize, 9.0F);
+        invisible_places::style::SetScalarConstant(&emissiveScalar.opacity, 0.48F);
+        if (!configureScalarField(&emissiveScalar)) {
+            emissiveScalar.colorMode = PointCloudColorMode::SolidColor;
+            emissiveScalar.solidColor = {0.95F, 0.56F, 0.20F, 1.0F};
+            invisible_places::style::SetScalarConstant(&emissiveScalar.emissiveStrength, 1.35F);
+        }
+        beautyCases.push_back({"emissive_scalar_sprites", "Emissive/scalar sprites", emissiveScalar});
+
+        auto worldSizedSprites = makeBaseBeautyStyle();
+        worldSizedSprites.screenSpriteSizeMode = PointCloudScreenSpriteSizeMode::WorldMillimeters;
+        worldSizedSprites.falloffProfile = PointCloudFalloffProfile::SoftDisc;
+        worldSizedSprites.solidCenters = true;
+        invisible_places::style::SetScalarConstant(&worldSizedSprites.surfelDiameter, 0.012F);
+        invisible_places::style::SetScalarConstant(&worldSizedSprites.opacity, 0.68F);
+        beautyCases.push_back({"world_sized_sprites", "World-sized screen sprites", worldSizedSprites});
+
+        if (sourceCloudHasNormals) {
+            auto worldSurfels = makeBaseBeautyStyle();
+            worldSurfels.geometryMode = PointCloudGeometryMode::WorldSurfels;
+            worldSurfels.falloffProfile = PointCloudFalloffProfile::Gaussian;
+            worldSurfels.solidCenters = false;
+            worldSurfels.waterStreakAspect = 1.0F;
+            invisible_places::style::SetScalarConstant(&worldSurfels.surfelDiameter, 0.010F);
+            invisible_places::style::SetScalarConstant(&worldSurfels.opacity, 0.72F);
+            beautyCases.push_back({"world_surfels", "World surfels", worldSurfels});
+        }
+    }
+    const bool worldSurfelsSkippedNoNormals =
+        std::none_of(
+            beautyCases.begin(),
+            beautyCases.end(),
+            [](const BeautyLodComparisonCase& comparisonCase) {
+                return comparisonCase.slug == "world_surfels";
+            });
+
+    std::string errorMessage;
+    std::vector<BeautyLodComparisonResult> beautyResults;
+    beautyResults.reserve(beautyCases.size());
+    const auto originalBeautyStyle = runtimeState.sessions.front().pointStyle;
+    for (std::size_t caseIndex = 0; caseIndex < beautyCases.size(); ++caseIndex) {
+        auto& comparisonSession = runtimeState.sessions.front();
+        comparisonSession.pointStyle = beautyCases[caseIndex].style;
+        SanitizePointCloudStyle(&comparisonSession);
+        comparisonSession.adaptiveLodTransitionActive = false;
+        comparisonSession.adaptiveLodIdleRefinementPending = false;
+        comparisonSession.adaptiveLodTransitionDrawItems.reset();
+
+        ++runtimeState.previewFrameCounter;
+        runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyFullSource;
+        const auto fullSourceState = BuildRenderState(runtimeState, viewport, 0.0F);
+        auto fullSourceImage = viewport.RenderPointCloudExrFrame(
+            {.renderState = fullSourceState,
+             .width = kComparisonWidth,
+             .height = kComparisonHeight,
+             .pointCloudDensityMode = PointCloudExportDensityMode::FullSource});
+
+        ++runtimeState.previewFrameCounter;
+        runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
+        const auto adaptiveState = BuildExactAdaptiveComparisonRenderState(runtimeState, viewport);
+
+        BeautyLodComparisonResult result;
+        result.slug = beautyCases[caseIndex].slug;
+        result.label = beautyCases[caseIndex].label;
+        result.fullPath =
+            caseIndex == 0U
+                ? outputDirectory / "beauty_full_source.exr"
+                : outputDirectory / ("beauty_" + result.slug + "_full_source.exr");
+        result.adaptivePath =
+            caseIndex == 0U
+                ? outputDirectory / "beauty_adaptive_hq.exr"
+                : outputDirectory / ("beauty_" + result.slug + "_adaptive_hq.exr");
+
+        bool firstAdaptiveLayer = true;
+        for (const auto& layer : adaptiveState.pointCloudLayers) {
+            if (!layer.useAdaptiveDrawItems) {
+                continue;
+            }
+            result.adaptiveExact =
+                result.adaptiveExact ||
+                (!layer.adaptiveLodReusedPrevious &&
+                 layer.adaptiveLodDisplayedDensity == "Adaptive High Quality");
+            result.adaptiveFallback =
+                result.adaptiveFallback ||
+                layer.adaptiveLodFallbackState.find("fallback") != std::string::npos;
+            result.representatives += layer.drawPointCount;
+            result.representedSource += layer.adaptiveRepresentedSourceCount;
+            for (std::size_t classIndex = 0; classIndex < result.adaptiveClassCounts.size(); ++classIndex) {
+                result.adaptiveClassCounts[classIndex] += layer.adaptiveEmittedClassCounts[classIndex];
+            }
+            result.adaptiveColorFeatureRefinements += layer.adaptiveColorFeatureRefinedNodeCount;
+            result.adaptiveScalarFeatureRefinements += layer.adaptiveScalarFeatureRefinedNodeCount;
+            result.adaptiveNormalFeatureRefinements += layer.adaptiveNormalFeatureRefinedNodeCount;
+            result.adaptiveEmissiveFeatureRefinements += layer.adaptiveEmissiveFeatureRefinedNodeCount;
+            result.adaptiveEstimatedVertices += layer.adaptiveEstimatedVertexCost;
+            result.adaptiveEstimatedFragments += layer.adaptiveEstimatedFragments;
+            result.adaptiveEstimatedBlendedFragments += layer.adaptiveEstimatedBlendedFragments;
+            result.adaptiveOpacityClamped =
+                result.adaptiveOpacityClamped || layer.adaptiveOpacityCompensationClamped;
+            result.adaptiveEmissionClamped =
+                result.adaptiveEmissionClamped || layer.adaptiveEmissionCompensationClamped;
+            result.adaptivePerformanceClamped =
+                result.adaptivePerformanceClamped || layer.adaptivePerformanceCompensationClamped;
+            if (firstAdaptiveLayer) {
+                result.rendererCostProfile = layer.adaptiveRendererCostProfile;
+                result.adaptiveRadiusScaleMin = layer.adaptiveMinRadiusScale;
+                result.adaptiveRadiusScaleMax = layer.adaptiveMaxRadiusScale;
+                result.adaptiveOpacityScaleMin = layer.adaptiveMinOpacityCoverageScale;
+                result.adaptiveOpacityScaleMax = layer.adaptiveMaxOpacityCoverageScale;
+                result.adaptiveEmissionScaleMin = layer.adaptiveMinEmissionCoverageScale;
+                result.adaptiveEmissionScaleMax = layer.adaptiveMaxEmissionCoverageScale;
+                firstAdaptiveLayer = false;
+            } else {
+                result.adaptiveRadiusScaleMin =
+                    std::min(result.adaptiveRadiusScaleMin, layer.adaptiveMinRadiusScale);
+                result.adaptiveRadiusScaleMax =
+                    std::max(result.adaptiveRadiusScaleMax, layer.adaptiveMaxRadiusScale);
+                result.adaptiveOpacityScaleMin =
+                    std::min(result.adaptiveOpacityScaleMin, layer.adaptiveMinOpacityCoverageScale);
+                result.adaptiveOpacityScaleMax =
+                    std::max(result.adaptiveOpacityScaleMax, layer.adaptiveMaxOpacityCoverageScale);
+                result.adaptiveEmissionScaleMin =
+                    std::min(result.adaptiveEmissionScaleMin, layer.adaptiveMinEmissionCoverageScale);
+                result.adaptiveEmissionScaleMax =
+                    std::max(result.adaptiveEmissionScaleMax, layer.adaptiveMaxEmissionCoverageScale);
+            }
+        }
+
+        if (!result.adaptiveExact) {
+            std::cerr << "Adaptive comparison case '" << result.slug
+                      << "' did not produce an exact Adaptive High Quality draw-item set.\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 6;
+        }
+
+        auto adaptiveImage = viewport.RenderPointCloudExrFrame(
+            {.renderState = adaptiveState,
+             .width = kComparisonWidth,
+             .height = kComparisonHeight,
+             .pointCloudDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality});
+
+        if (!invisible_places::output::WriteExrImage(fullSourceImage, result.fullPath, &errorMessage)) {
+            std::cerr << errorMessage << "\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 7;
+        }
+        if (!invisible_places::output::WriteExrImage(adaptiveImage, result.adaptivePath, &errorMessage)) {
+            std::cerr << errorMessage << "\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 8;
+        }
+
+        result.fullMetrics = ComputeLodComparisonMetrics(fullSourceImage);
+        result.adaptiveMetrics = ComputeLodComparisonMetrics(adaptiveImage);
+        result.fullCoverage = metricCoverage(result.fullMetrics);
+        result.adaptiveCoverage = metricCoverage(result.adaptiveMetrics);
+        result.coverageRatio = result.fullCoverage > 0.0 ? result.adaptiveCoverage / result.fullCoverage : 0.0;
+        result.fullMeanLuminance = metricMeanLuminance(result.fullMetrics);
+        result.adaptiveMeanLuminance = metricMeanLuminance(result.adaptiveMetrics);
+        result.luminanceRatio =
+            result.fullMeanLuminance > 0.0 ? result.adaptiveMeanLuminance / result.fullMeanLuminance : 0.0;
+        beautyResults.push_back(std::move(result));
+    }
+    runtimeState.sessions.front().pointStyle = originalBeautyStyle;
+
+    if (beautyResults.empty()) {
+        std::cerr << "No Beauty LOD comparison cases were available.\n";
         StopBackgroundWorkForShutdown(&runtimeState);
         return 6;
     }
-    auto adaptiveImage = viewport.RenderPointCloudExrFrame(
-        {.renderState = adaptiveState,
-         .width = kComparisonWidth,
-         .height = kComparisonHeight,
-         .pointCloudDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality});
 
-    std::string errorMessage;
-    const auto fullPath = outputDirectory / "beauty_full_source.exr";
-    const auto adaptivePath = outputDirectory / "beauty_adaptive_hq.exr";
-    if (!invisible_places::output::WriteExrImage(fullSourceImage, fullPath, &errorMessage)) {
-        std::cerr << errorMessage << "\n";
-        StopBackgroundWorkForShutdown(&runtimeState);
-        return 7;
-    }
-    if (!invisible_places::output::WriteExrImage(adaptiveImage, adaptivePath, &errorMessage)) {
-        std::cerr << errorMessage << "\n";
-        StopBackgroundWorkForShutdown(&runtimeState);
-        return 8;
-    }
-
-    const auto fullMetrics = ComputeLodComparisonMetrics(fullSourceImage);
-    const auto adaptiveMetrics = ComputeLodComparisonMetrics(adaptiveImage);
-    const auto fullCoverage =
-        fullMetrics.pixelCount == 0 ? 0.0 : static_cast<double>(fullMetrics.coveredPixels) / fullMetrics.pixelCount;
-    const auto adaptiveCoverage =
-        adaptiveMetrics.pixelCount == 0
-            ? 0.0
-            : static_cast<double>(adaptiveMetrics.coveredPixels) / adaptiveMetrics.pixelCount;
-    const auto fullMeanLuminance =
-        fullMetrics.pixelCount == 0 ? 0.0 : fullMetrics.luminanceSum / static_cast<double>(fullMetrics.pixelCount);
-    const auto adaptiveMeanLuminance =
-        adaptiveMetrics.pixelCount == 0
-            ? 0.0
-            : adaptiveMetrics.luminanceSum / static_cast<double>(adaptiveMetrics.pixelCount);
-
-    std::uint64_t representatives = 0;
-    std::uint64_t representedSource = 0;
-    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
-        adaptiveClassCounts{};
-    std::uint32_t adaptiveColorFeatureRefinements = 0;
-    std::uint32_t adaptiveScalarFeatureRefinements = 0;
-    std::uint32_t adaptiveNormalFeatureRefinements = 0;
-    std::uint32_t adaptiveEmissiveFeatureRefinements = 0;
-    for (const auto& layer : adaptiveState.pointCloudLayers) {
-        representatives += layer.drawPointCount;
-        representedSource += layer.adaptiveRepresentedSourceCount;
-        for (std::size_t classIndex = 0; classIndex < adaptiveClassCounts.size(); ++classIndex) {
-            adaptiveClassCounts[classIndex] += layer.adaptiveEmittedClassCounts[classIndex];
-        }
-        adaptiveColorFeatureRefinements += layer.adaptiveColorFeatureRefinedNodeCount;
-        adaptiveScalarFeatureRefinements += layer.adaptiveScalarFeatureRefinedNodeCount;
-        adaptiveNormalFeatureRefinements += layer.adaptiveNormalFeatureRefinedNodeCount;
-        adaptiveEmissiveFeatureRefinements += layer.adaptiveEmissiveFeatureRefinedNodeCount;
-    }
+    const auto& primaryBeautyResult = beautyResults.front();
+    const auto& fullPath = primaryBeautyResult.fullPath;
+    const auto& adaptivePath = primaryBeautyResult.adaptivePath;
+    const auto fullCoverage = primaryBeautyResult.fullCoverage;
+    const auto adaptiveCoverage = primaryBeautyResult.adaptiveCoverage;
+    const auto fullMeanLuminance = primaryBeautyResult.fullMeanLuminance;
+    const auto adaptiveMeanLuminance = primaryBeautyResult.adaptiveMeanLuminance;
+    const auto representatives = primaryBeautyResult.representatives;
+    const auto representedSource = primaryBeautyResult.representedSource;
+    const auto adaptiveClassCounts = primaryBeautyResult.adaptiveClassCounts;
+    const auto adaptiveColorFeatureRefinements = primaryBeautyResult.adaptiveColorFeatureRefinements;
+    const auto adaptiveScalarFeatureRefinements = primaryBeautyResult.adaptiveScalarFeatureRefinements;
+    const auto adaptiveNormalFeatureRefinements = primaryBeautyResult.adaptiveNormalFeatureRefinements;
+    const auto adaptiveEmissiveFeatureRefinements = primaryBeautyResult.adaptiveEmissiveFeatureRefinements;
 
     const auto fastBasicTracePath = outputDirectory / "fast_basic_transition_trace.csv";
     {
@@ -20275,6 +20774,67 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"adaptive_emissive_feature_refinements\": " << adaptiveEmissiveFeatureRefinements << ",\n"
                 << "  \"adaptive_density\": \"Adaptive High Quality\",\n"
                 << "  \"adaptive_fallback\": false,\n"
+                << "  \"beauty_matrix\": [\n";
+        for (std::size_t resultIndex = 0; resultIndex < beautyResults.size(); ++resultIndex) {
+            const auto& result = beautyResults[resultIndex];
+            metrics << "    {\n"
+                    << "      \"slug\": \"" << result.slug << "\",\n"
+                    << "      \"label\": \"" << result.label << "\",\n"
+                    << "      \"full_source_exr\": \""
+                    << result.fullPath.lexically_normal().generic_string() << "\",\n"
+                    << "      \"adaptive_exr\": \""
+                    << result.adaptivePath.lexically_normal().generic_string() << "\",\n"
+                    << "      \"renderer_cost_profile\": \""
+                    << invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileName(
+                           result.rendererCostProfile)
+                    << "\",\n"
+                    << "      \"full_source_coverage\": " << result.fullCoverage << ",\n"
+                    << "      \"adaptive_coverage\": " << result.adaptiveCoverage << ",\n"
+                    << "      \"coverage_ratio\": " << result.coverageRatio << ",\n"
+                    << "      \"full_source_mean_luminance\": " << result.fullMeanLuminance << ",\n"
+                    << "      \"adaptive_mean_luminance\": " << result.adaptiveMeanLuminance << ",\n"
+                    << "      \"luminance_ratio\": " << result.luminanceRatio << ",\n"
+                    << "      \"adaptive_representatives\": " << result.representatives << ",\n"
+                    << "      \"adaptive_represented_source\": " << result.representedSource << ",\n"
+                    << "      \"adaptive_estimated_vertices\": " << result.adaptiveEstimatedVertices << ",\n"
+                    << "      \"adaptive_estimated_fragments\": " << result.adaptiveEstimatedFragments << ",\n"
+                    << "      \"adaptive_estimated_blended_fragments\": "
+                    << result.adaptiveEstimatedBlendedFragments << ",\n"
+                    << "      \"adaptive_radius_scale_min\": " << result.adaptiveRadiusScaleMin << ",\n"
+                    << "      \"adaptive_radius_scale_max\": " << result.adaptiveRadiusScaleMax << ",\n"
+                    << "      \"adaptive_opacity_scale_min\": " << result.adaptiveOpacityScaleMin << ",\n"
+                    << "      \"adaptive_opacity_scale_max\": " << result.adaptiveOpacityScaleMax << ",\n"
+                    << "      \"adaptive_emission_scale_min\": " << result.adaptiveEmissionScaleMin << ",\n"
+                    << "      \"adaptive_emission_scale_max\": " << result.adaptiveEmissionScaleMax << ",\n"
+                    << "      \"adaptive_opacity_clamped\": "
+                    << (result.adaptiveOpacityClamped ? "true" : "false") << ",\n"
+                    << "      \"adaptive_emission_clamped\": "
+                    << (result.adaptiveEmissionClamped ? "true" : "false") << ",\n"
+                    << "      \"adaptive_performance_clamped\": "
+                    << (result.adaptivePerformanceClamped ? "true" : "false") << ",\n"
+                    << "      \"adaptive_exact\": " << (result.adaptiveExact ? "true" : "false") << ",\n"
+                    << "      \"adaptive_fallback\": " << (result.adaptiveFallback ? "true" : "false") << ",\n"
+                    << "      \"adaptive_class_spatial\": " << result.adaptiveClassCounts[0] << ",\n"
+                    << "      \"adaptive_class_colour_contrast\": " << result.adaptiveClassCounts[1] << ",\n"
+                    << "      \"adaptive_class_normal_edge\": " << result.adaptiveClassCounts[2] << ",\n"
+                    << "      \"adaptive_class_scalar_min\": " << result.adaptiveClassCounts[3] << ",\n"
+                    << "      \"adaptive_class_scalar_max\": " << result.adaptiveClassCounts[4] << ",\n"
+                    << "      \"adaptive_class_scalar_threshold\": " << result.adaptiveClassCounts[5] << ",\n"
+                    << "      \"adaptive_class_emissive_accent\": " << result.adaptiveClassCounts[6] << ",\n"
+                    << "      \"adaptive_class_blue_noise_fill\": " << result.adaptiveClassCounts[7] << ",\n"
+                    << "      \"adaptive_color_feature_refinements\": "
+                    << result.adaptiveColorFeatureRefinements << ",\n"
+                    << "      \"adaptive_scalar_feature_refinements\": "
+                    << result.adaptiveScalarFeatureRefinements << ",\n"
+                    << "      \"adaptive_normal_feature_refinements\": "
+                    << result.adaptiveNormalFeatureRefinements << ",\n"
+                    << "      \"adaptive_emissive_feature_refinements\": "
+                    << result.adaptiveEmissiveFeatureRefinements << "\n"
+                    << "    }" << (resultIndex + 1U == beautyResults.size() ? "\n" : ",\n");
+        }
+        metrics << "  ],\n"
+                << "  \"world_surfels_skipped_no_normals\": "
+                << (worldSurfelsSkippedNoNormals ? "true" : "false") << ",\n"
                 << "  \"fast_basic_viewport_frames\": " << kFastBasicDiagnosticFrames << ",\n"
                 << "  \"fast_basic_max_submitted_points\": " << fastBasicMaxSubmittedPoints << ",\n"
                 << "  \"fast_basic_max_pass_submitted_points\": " << fastBasicMaxPassSubmittedPoints << ",\n"
@@ -20352,6 +20912,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << "- " << adaptivePath.string() << "\n"
               << "- " << fastBasicTracePath.string() << "\n"
               << "- " << metricsPath.string() << "\n"
+              << "Beauty matrix cases: " << beautyResults.size()
+              << (worldSurfelsSkippedNoNormals ? " (world surfels skipped: no normals)" : "") << "\n"
               << "Coverage ratio: " << (fullCoverage > 0.0 ? adaptiveCoverage / fullCoverage : 0.0)
               << " | luminance ratio: "
               << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0)

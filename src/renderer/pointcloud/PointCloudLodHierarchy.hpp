@@ -31,6 +31,13 @@ enum PointCloudLodRepresentativeClass : std::uint32_t {
     PointCloudLodRepresentativeClassBlueNoiseFill = 1U << 7U,
 };
 
+enum class PointCloudLodRendererCostProfile : std::uint32_t {
+    FastBasicSquare,
+    BeautyScreenSprite,
+    BeautyWorldScreenSprite,
+    BeautyWorldSurfel
+};
+
 struct PointCloudLodScalarStats {
     float minimum = 0.0F;
     float maximum = 0.0F;
@@ -122,6 +129,7 @@ struct PointCloudLodTraversalParams {
     PointCloudStyleState style{};
     invisible_places::output::PointCloudExportDensityMode densityMode =
         invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality;
+    PointCloudLodRendererCostProfile rendererCostProfile = PointCloudLodRendererCostProfile::FastBasicSquare;
     std::uint32_t maxDrawItems = 0;
     std::uint32_t maxRepresentatives = 0;
     float maxEstimatedFragments = 0.0F;
@@ -153,6 +161,19 @@ struct PointCloudLodTraversalDiagnostics {
     std::uint32_t emissiveFeatureRefinedNodeCount = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
+    PointCloudLodRendererCostProfile rendererCostProfile = PointCloudLodRendererCostProfile::FastBasicSquare;
+    float minRadiusScale = 1.0F;
+    float maxRadiusScale = 1.0F;
+    float minOpacityCoverageScale = 1.0F;
+    float maxOpacityCoverageScale = 1.0F;
+    float minEmissionCoverageScale = 1.0F;
+    float maxEmissionCoverageScale = 1.0F;
+    float estimatedVertexCost = 0.0F;
+    float estimatedFragmentCost = 0.0F;
+    float estimatedBlendedFragmentCost = 0.0F;
+    bool opacityCompensationClamped = false;
+    bool emissionCompensationClamped = false;
+    bool performanceCompensationClamped = false;
 };
 
 struct PointCloudLodCacheSource {
@@ -208,5 +229,7 @@ bool SavePointCloudLodHierarchyCache(
     const PointCloudLodBuildConfig& config,
     const PointCloudLodHierarchy& hierarchy,
     std::string* errorMessage = nullptr);
+
+[[nodiscard]] const char* PointCloudLodRendererCostProfileName(PointCloudLodRendererCostProfile profile);
 
 }  // namespace invisible_places::renderer::pointcloud
