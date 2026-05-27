@@ -55,6 +55,23 @@ struct SwapchainSupport {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+enum GpuTimestampPass : std::uint32_t {
+    kGpuTimestampFastBasicPointPass = 0U,
+    kGpuTimestampBeautyDepthPass = 1U,
+    kGpuTimestampBeautyPointPass = 2U,
+    kGpuTimestampCompositePass = 3U,
+    kGpuTimestampPostProcessPass = 4U,
+    kGpuTimestampPassCount = 5U,
+};
+
+constexpr std::uint32_t kGpuTimestampQueriesPerPass = 2U;
+constexpr std::uint32_t kGpuTimestampQueryCount = kGpuTimestampPassCount * kGpuTimestampQueriesPerPass;
+
+struct TimestampQueryResult {
+    std::uint64_t value = 0;
+    std::uint64_t available = 0;
+};
+
 struct alignas(16) FrameUniforms {
     glm::mat4 viewProjection{1.0F};
     glm::mat4 view{1.0F};
@@ -641,6 +658,10 @@ VulkanViewportShell::~VulkanViewportShell() {
             vkDestroyFence(device_, frame.fence, nullptr);
             frame.fence = VK_NULL_HANDLE;
         }
+        if (frame.timestampQueryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, frame.timestampQueryPool, nullptr);
+            frame.timestampQueryPool = VK_NULL_HANDLE;
+        }
     }
 
     if (commandPool_ != VK_NULL_HANDLE) {
@@ -804,6 +825,9 @@ void VulkanViewportShell::DrawFrame() {
 
     auto& frame = frameResources_[currentFrameIndex_];
     vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
+    if (collectDiagnostics) {
+        ReadPreviousGpuTimestampResults(&frame);
+    }
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
     std::uint32_t drawItemBufferReallocations = 0;
@@ -984,6 +1008,15 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.frameSubmitMs = 0.0;
         diagnostics_.framePresentMs = 0.0;
         diagnostics_.framePlatformWindowsMs = 0.0;
+        diagnostics_.gpuTimestampSupported = gpuTimestampsSupported_;
+        diagnostics_.gpuTimestampTimingValid = false;
+        diagnostics_.gpuTimestampState =
+            gpuTimestampsSupported_ ? "supported; waiting for first scene timing" : "unavailable";
+        diagnostics_.gpuFastBasicPointPassMs = 0.0;
+        diagnostics_.gpuBeautyDepthPassMs = 0.0;
+        diagnostics_.gpuBeautyPointPassMs = 0.0;
+        diagnostics_.gpuCompositePassMs = 0.0;
+        diagnostics_.gpuPostProcessPassMs = 0.0;
     }
 }
 
@@ -1028,6 +1061,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     std::uint32_t adaptiveRepresentativeBudget = 0;
     bool adaptiveRepresentativeBudgetReached = false;
     bool adaptiveFragmentBudgetReached = false;
+    bool adaptiveBlendedFragmentBudgetReached = false;
     renderer::pointcloud::PointCloudLodRendererCostProfile adaptiveRendererCostProfile =
         renderer::pointcloud::PointCloudLodRendererCostProfile::FastBasicSquare;
     bool adaptiveHasCostProfile = false;
@@ -1039,9 +1073,20 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     float adaptiveMaxEmissionCoverageScale = 1.0F;
     double adaptiveEstimatedVertexCost = 0.0;
     double adaptiveEstimatedBlendedFragments = 0.0;
+    double adaptiveBlendedFragmentBudget = 0.0;
     bool adaptiveOpacityCompensationClamped = false;
     bool adaptiveEmissionCompensationClamped = false;
     bool adaptivePerformanceCompensationClamped = false;
+    double adaptiveGovernorBudgetScale = 1.0;
+    double adaptiveGovernorPointPassMs = 0.0;
+    double adaptiveGovernorPointPassEwmaMs = 0.0;
+    double adaptiveGovernorCompositeMs = 0.0;
+    double adaptiveGovernorCompositeEwmaMs = 0.0;
+    double adaptiveGovernorTargetPointPassMs = 0.0;
+    std::uint64_t adaptiveGovernorUploadBudgetBytes = 0;
+    std::string adaptiveGovernorTimestampState;
+    std::string adaptiveGovernorStatus;
+    std::string adaptiveGovernorActiveLimit;
     double adaptiveTraversalMs = 0.0;
     bool adaptiveReusedPrevious = false;
     bool adaptiveRuntimeCacheHit = false;
@@ -1093,10 +1138,13 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         }
         adaptiveEstimatedFragments += layer.adaptiveEstimatedFragments;
         adaptiveFragmentBudget += layer.adaptiveFragmentBudget;
+        adaptiveBlendedFragmentBudget += layer.adaptiveBlendedFragmentBudget;
         adaptiveRepresentativeBudget += layer.adaptiveRepresentativeBudget;
         adaptiveRepresentativeBudgetReached =
             adaptiveRepresentativeBudgetReached || layer.adaptiveRepresentativeBudgetReached;
         adaptiveFragmentBudgetReached = adaptiveFragmentBudgetReached || layer.adaptiveFragmentBudgetReached;
+        adaptiveBlendedFragmentBudgetReached =
+            adaptiveBlendedFragmentBudgetReached || layer.adaptiveBlendedFragmentBudgetReached;
         if (layer.useAdaptiveDrawItems) {
             if (!adaptiveHasCostProfile) {
                 adaptiveRendererCostProfile = layer.adaptiveRendererCostProfile;
@@ -1121,6 +1169,30 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
             }
             adaptiveEstimatedVertexCost += layer.adaptiveEstimatedVertexCost;
             adaptiveEstimatedBlendedFragments += layer.adaptiveEstimatedBlendedFragments;
+            adaptiveGovernorBudgetScale = std::min(
+                adaptiveGovernorBudgetScale,
+                static_cast<double>(layer.adaptiveGovernorBudgetScale));
+            adaptiveGovernorPointPassMs =
+                std::max(adaptiveGovernorPointPassMs, layer.adaptiveGovernorPointPassMs);
+            adaptiveGovernorPointPassEwmaMs =
+                std::max(adaptiveGovernorPointPassEwmaMs, layer.adaptiveGovernorPointPassEwmaMs);
+            adaptiveGovernorCompositeMs =
+                std::max(adaptiveGovernorCompositeMs, layer.adaptiveGovernorCompositeMs);
+            adaptiveGovernorCompositeEwmaMs =
+                std::max(adaptiveGovernorCompositeEwmaMs, layer.adaptiveGovernorCompositeEwmaMs);
+            adaptiveGovernorTargetPointPassMs =
+                std::max(adaptiveGovernorTargetPointPassMs, layer.adaptiveGovernorTargetPointPassMs);
+            adaptiveGovernorUploadBudgetBytes =
+                std::max(adaptiveGovernorUploadBudgetBytes, layer.adaptiveGovernorUploadBudgetBytes);
+            if (!layer.adaptiveGovernorTimestampState.empty()) {
+                adaptiveGovernorTimestampState = layer.adaptiveGovernorTimestampState;
+            }
+            if (!layer.adaptiveGovernorStatus.empty()) {
+                adaptiveGovernorStatus = layer.adaptiveGovernorStatus;
+            }
+            if (!layer.adaptiveGovernorActiveLimit.empty()) {
+                adaptiveGovernorActiveLimit = layer.adaptiveGovernorActiveLimit;
+            }
             adaptiveOpacityCompensationClamped =
                 adaptiveOpacityCompensationClamped || layer.adaptiveOpacityCompensationClamped;
             adaptiveEmissionCompensationClamped =
@@ -1190,6 +1262,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveRepresentativeBudget = adaptiveRepresentativeBudget;
     diagnostics_.adaptiveRepresentativeBudgetReached = adaptiveRepresentativeBudgetReached;
     diagnostics_.adaptiveFragmentBudgetReached = adaptiveFragmentBudgetReached;
+    diagnostics_.adaptiveBlendedFragmentBudgetReached = adaptiveBlendedFragmentBudgetReached;
     diagnostics_.adaptiveRendererCostProfile = adaptiveRendererCostProfile;
     diagnostics_.adaptiveMinRadiusScale = adaptiveMinRadiusScale;
     diagnostics_.adaptiveMaxRadiusScale = adaptiveMaxRadiusScale;
@@ -1199,9 +1272,20 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveMaxEmissionCoverageScale = adaptiveMaxEmissionCoverageScale;
     diagnostics_.adaptiveEstimatedVertexCost = adaptiveEstimatedVertexCost;
     diagnostics_.adaptiveEstimatedBlendedFragments = adaptiveEstimatedBlendedFragments;
+    diagnostics_.adaptiveBlendedFragmentBudget = adaptiveBlendedFragmentBudget;
     diagnostics_.adaptiveOpacityCompensationClamped = adaptiveOpacityCompensationClamped;
     diagnostics_.adaptiveEmissionCompensationClamped = adaptiveEmissionCompensationClamped;
     diagnostics_.adaptivePerformanceCompensationClamped = adaptivePerformanceCompensationClamped;
+    diagnostics_.adaptiveGovernorBudgetScale = adaptiveGovernorBudgetScale;
+    diagnostics_.adaptiveGovernorPointPassMs = adaptiveGovernorPointPassMs;
+    diagnostics_.adaptiveGovernorPointPassEwmaMs = adaptiveGovernorPointPassEwmaMs;
+    diagnostics_.adaptiveGovernorCompositeMs = adaptiveGovernorCompositeMs;
+    diagnostics_.adaptiveGovernorCompositeEwmaMs = adaptiveGovernorCompositeEwmaMs;
+    diagnostics_.adaptiveGovernorTargetPointPassMs = adaptiveGovernorTargetPointPassMs;
+    diagnostics_.adaptiveGovernorUploadBudgetBytes = adaptiveGovernorUploadBudgetBytes;
+    diagnostics_.adaptiveGovernorTimestampState = std::move(adaptiveGovernorTimestampState);
+    diagnostics_.adaptiveGovernorStatus = std::move(adaptiveGovernorStatus);
+    diagnostics_.adaptiveGovernorActiveLimit = std::move(adaptiveGovernorActiveLimit);
     diagnostics_.adaptiveLodTraversalMs = adaptiveTraversalMs;
     diagnostics_.adaptiveLodReusedPrevious = adaptiveReusedPrevious;
     diagnostics_.adaptiveLodRuntimeCacheHit = adaptiveRuntimeCacheHit;
@@ -1785,6 +1869,7 @@ void VulkanViewportShell::PickPhysicalDevice() {
         vkGetPhysicalDeviceProperties(device, &properties);
         diagnostics_.rendererName = properties.deviceName;
         diagnostics_.driverName = "Vulkan";
+        gpuTimestampPeriodNs_ = properties.limits.timestampPeriod;
         pointSizeRangeMin_ = std::max(1.0F, properties.limits.pointSizeRange[0]);
         pointSizeRangeMax_ = std::max(pointSizeRangeMin_, properties.limits.pointSizeRange[1]);
         break;
@@ -1797,6 +1882,18 @@ void VulkanViewportShell::PickPhysicalDevice() {
     const auto selection = FindQueueFamilies(physicalDevice_, surface_);
     graphicsQueueFamily_ = selection.graphicsFamily.value();
     presentQueueFamily_ = selection.presentFamily.value();
+    std::uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    if (queueFamilyCount > 0) {
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &queueFamilyCount, queueFamilies.data());
+    }
+    graphicsQueueTimestampValidBits_ =
+        graphicsQueueFamily_ < queueFamilies.size() ? queueFamilies[graphicsQueueFamily_].timestampValidBits : 0U;
+    gpuTimestampsSupported_ = gpuTimestampPeriodNs_ > 0.0F && graphicsQueueTimestampValidBits_ > 0U;
+    diagnostics_.gpuTimestampSupported = gpuTimestampsSupported_;
+    diagnostics_.gpuTimestampState =
+        gpuTimestampsSupported_ ? "supported; waiting for first scene timing" : "unavailable";
 }
 
 void VulkanViewportShell::CreateLogicalDevice() {
@@ -4030,6 +4127,112 @@ void VulkanViewportShell::CreateSyncObjects() {
             vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &frame.renderFinishedSemaphore),
             "vkCreateSemaphore(renderFinished)");
         Check(vkCreateFence(device_, &fenceInfo, nullptr, &frame.fence), "vkCreateFence");
+        if (gpuTimestampsSupported_) {
+            VkQueryPoolCreateInfo queryPoolInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queryPoolInfo.queryCount = kGpuTimestampQueryCount;
+            const VkResult queryResult =
+                vkCreateQueryPool(device_, &queryPoolInfo, nullptr, &frame.timestampQueryPool);
+            if (queryResult != VK_SUCCESS) {
+                frame.timestampQueryPool = VK_NULL_HANDLE;
+                gpuTimestampsSupported_ = false;
+                diagnostics_.gpuTimestampSupported = false;
+                diagnostics_.gpuTimestampState = "query pool unavailable";
+            }
+        }
+    }
+}
+
+void VulkanViewportShell::ReadPreviousGpuTimestampResults(FrameResources* frame) {
+    diagnostics_.gpuTimestampSupported = gpuTimestampsSupported_;
+    diagnostics_.gpuTimestampTimingValid = false;
+    diagnostics_.gpuFastBasicPointPassMs = 0.0;
+    diagnostics_.gpuBeautyDepthPassMs = 0.0;
+    diagnostics_.gpuBeautyPointPassMs = 0.0;
+    diagnostics_.gpuCompositePassMs = 0.0;
+    diagnostics_.gpuPostProcessPassMs = 0.0;
+    if (!gpuTimestampsSupported_ || frame == nullptr || frame->timestampQueryPool == VK_NULL_HANDLE) {
+        diagnostics_.gpuTimestampState = "unavailable";
+        return;
+    }
+    if (!frame->timestampQueriesArmed) {
+        diagnostics_.gpuTimestampState = "warming up";
+        return;
+    }
+
+    std::array<TimestampQueryResult, kGpuTimestampQueryCount> results{};
+    const VkResult result = vkGetQueryPoolResults(
+        device_,
+        frame->timestampQueryPool,
+        0,
+        kGpuTimestampQueryCount,
+        sizeof(results),
+        results.data(),
+        sizeof(TimestampQueryResult),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS && result != VK_NOT_READY) {
+        diagnostics_.gpuTimestampState = "readback failed";
+        return;
+    }
+
+    const auto passMilliseconds = [&](GpuTimestampPass pass) {
+        const auto passIndex = static_cast<std::uint32_t>(pass);
+        if (passIndex >= frame->timestampPassWritten.size() || !frame->timestampPassWritten[passIndex]) {
+            return 0.0;
+        }
+        const auto beginIndex = passIndex * kGpuTimestampQueriesPerPass;
+        const auto endIndex = beginIndex + 1U;
+        if (results[beginIndex].available == 0U || results[endIndex].available == 0U ||
+            results[endIndex].value < results[beginIndex].value) {
+            return 0.0;
+        }
+        return static_cast<double>(results[endIndex].value - results[beginIndex].value) *
+               static_cast<double>(gpuTimestampPeriodNs_) / 1'000'000.0;
+    };
+
+    diagnostics_.gpuFastBasicPointPassMs = passMilliseconds(kGpuTimestampFastBasicPointPass);
+    diagnostics_.gpuBeautyDepthPassMs = passMilliseconds(kGpuTimestampBeautyDepthPass);
+    diagnostics_.gpuBeautyPointPassMs = passMilliseconds(kGpuTimestampBeautyPointPass);
+    diagnostics_.gpuCompositePassMs = passMilliseconds(kGpuTimestampCompositePass);
+    diagnostics_.gpuPostProcessPassMs = passMilliseconds(kGpuTimestampPostProcessPass);
+    diagnostics_.gpuTimestampTimingValid =
+        diagnostics_.gpuFastBasicPointPassMs > 0.0 ||
+        diagnostics_.gpuBeautyDepthPassMs > 0.0 ||
+        diagnostics_.gpuBeautyPointPassMs > 0.0 ||
+        diagnostics_.gpuCompositePassMs > 0.0 ||
+        diagnostics_.gpuPostProcessPassMs > 0.0;
+    diagnostics_.gpuTimestampState =
+        diagnostics_.gpuTimestampTimingValid ? "valid previous frame" : "waiting for written queries";
+}
+
+void VulkanViewportShell::ResetGpuTimestampQueries(VkCommandBuffer commandBuffer, FrameResources* frame) {
+    if (!gpuTimestampsSupported_ || frame == nullptr || frame->timestampQueryPool == VK_NULL_HANDLE) {
+        return;
+    }
+    vkCmdResetQueryPool(commandBuffer, frame->timestampQueryPool, 0, kGpuTimestampQueryCount);
+    frame->timestampQueriesArmed = true;
+    frame->timestampPassWritten.fill(false);
+}
+
+void VulkanViewportShell::WriteGpuTimestamp(
+    VkCommandBuffer commandBuffer,
+    FrameResources* frame,
+    std::uint32_t passIndex,
+    bool end) {
+    if (!gpuTimestampsSupported_ ||
+        frame == nullptr ||
+        frame->timestampQueryPool == VK_NULL_HANDLE ||
+        passIndex >= kGpuTimestampPassCount) {
+        return;
+    }
+    const auto queryIndex = passIndex * kGpuTimestampQueriesPerPass + (end ? 1U : 0U);
+    vkCmdWriteTimestamp(
+        commandBuffer,
+        end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        frame->timestampQueryPool,
+        queryIndex);
+    if (end && passIndex < frame->timestampPassWritten.size()) {
+        frame->timestampPassWritten[passIndex] = true;
     }
 }
 
@@ -5981,6 +6184,7 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+    ResetGpuTimestampQueries(commandBuffer, &frameResources_[frameIndex]);
 
     const bool drawLiveScene = SceneImageNeedsRender(imageIndex);
     if (drawLiveScene) {
@@ -6051,6 +6255,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
             });
     if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampBeautyDepthPass, false);
         for (const auto& layer : renderState_.pointCloudLayers) {
             const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
             const bool opaqueHardDisc =
@@ -6086,6 +6291,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 }
             }
         }
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampBeautyDepthPass, true);
     }
 
     vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
@@ -6093,6 +6299,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
     if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampBeautyPointPass, false);
         for (const auto& layer : renderState_.pointCloudLayers) {
             const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
             if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
@@ -6131,6 +6338,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 }
             }
         }
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampBeautyPointPass, true);
     }
 
     if (drawLiveScene && !renderState_.gaussianSplatLayers.empty()) {
@@ -6215,6 +6423,7 @@ void VulkanViewportShell::RecordCommandBuffer(
         imageIndex < compositeDescriptorSets_.size() &&
         compositeDescriptorSets_[imageIndex] != VK_NULL_HANDLE) {
         VkDescriptorSet descriptorSet = compositeDescriptorSets_[imageIndex];
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampCompositePass, false);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline_);
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -6226,6 +6435,7 @@ void VulkanViewportShell::RecordCommandBuffer(
             0,
             nullptr);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampCompositePass, true);
     }
 
     vkCmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
@@ -6233,6 +6443,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
     if (drawLiveScene && fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampFastBasicPointPass, false);
         for (const auto& layer : renderState_.pointCloudLayers) {
             std::uint32_t recordedDrawPointCount = 0;
             if (RecordPointCloudLayerDraw(
@@ -6255,6 +6466,7 @@ void VulkanViewportShell::RecordCommandBuffer(
                 }
             }
         }
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampFastBasicPointPass, true);
     } else if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
@@ -6355,6 +6567,7 @@ void VulkanViewportShell::RecordCommandBuffer(
         imageIndex < postProcessDescriptorSets_.size() &&
         postProcessDescriptorSets_[imageIndex] != VK_NULL_HANDLE) {
         VkDescriptorSet descriptorSet = postProcessDescriptorSets_[imageIndex];
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampPostProcessPass, false);
         PostProcessPushConstants pushConstants;
         pushConstants.edl = glm::vec4{
             renderState_.eyeDomeLightingEnabled ? 1.0F : 0.0F,
@@ -6380,6 +6593,7 @@ void VulkanViewportShell::RecordCommandBuffer(
             sizeof(PostProcessPushConstants),
             &pushConstants);
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        WriteGpuTimestamp(commandBuffer, &frameResources_[frameIndex], kGpuTimestampPostProcessPass, true);
     }
 
     if (ImGui::GetCurrentContext() != nullptr) {

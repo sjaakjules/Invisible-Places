@@ -74,6 +74,7 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveRepresentativeBudget = 0;
     bool adaptiveRepresentativeBudgetReached = false;
     bool adaptiveFragmentBudgetReached = false;
+    bool adaptiveBlendedFragmentBudgetReached = false;
     renderer::pointcloud::PointCloudLodRendererCostProfile adaptiveRendererCostProfile =
         renderer::pointcloud::PointCloudLodRendererCostProfile::FastBasicSquare;
     float adaptiveMinRadiusScale = 1.0F;
@@ -84,9 +85,20 @@ struct ViewportDiagnostics {
     float adaptiveMaxEmissionCoverageScale = 1.0F;
     double adaptiveEstimatedVertexCost = 0.0;
     double adaptiveEstimatedBlendedFragments = 0.0;
+    double adaptiveBlendedFragmentBudget = 0.0;
     bool adaptiveOpacityCompensationClamped = false;
     bool adaptiveEmissionCompensationClamped = false;
     bool adaptivePerformanceCompensationClamped = false;
+    double adaptiveGovernorBudgetScale = 1.0;
+    double adaptiveGovernorPointPassMs = 0.0;
+    double adaptiveGovernorPointPassEwmaMs = 0.0;
+    double adaptiveGovernorCompositeMs = 0.0;
+    double adaptiveGovernorCompositeEwmaMs = 0.0;
+    double adaptiveGovernorTargetPointPassMs = 0.0;
+    std::uint64_t adaptiveGovernorUploadBudgetBytes = 0;
+    std::string adaptiveGovernorTimestampState;
+    std::string adaptiveGovernorStatus;
+    std::string adaptiveGovernorActiveLimit;
     double adaptiveLodTraversalMs = 0.0;
     bool adaptiveLodReusedPrevious = false;
     bool adaptiveLodRuntimeCacheHit = false;
@@ -106,6 +118,14 @@ struct ViewportDiagnostics {
     std::uint32_t pointDrawItemBufferReallocations = 0;
     bool sceneRenderedThisFrame = false;
     bool sceneCacheActive = false;
+    bool gpuTimestampSupported = false;
+    bool gpuTimestampTimingValid = false;
+    std::string gpuTimestampState = "unavailable";
+    double gpuFastBasicPointPassMs = 0.0;
+    double gpuBeautyDepthPassMs = 0.0;
+    double gpuBeautyPointPassMs = 0.0;
+    double gpuCompositePassMs = 0.0;
+    double gpuPostProcessPassMs = 0.0;
     double pointCommandRecordMs = 0.0;
     std::uint32_t framesInFlight = 0;
     std::uint32_t swapchainImageCount = 0;
@@ -184,6 +204,7 @@ struct SceneRenderState {
         std::uint32_t adaptiveRepresentativeBudget = 0;
         bool adaptiveRepresentativeBudgetReached = false;
         bool adaptiveFragmentBudgetReached = false;
+        bool adaptiveBlendedFragmentBudgetReached = false;
         renderer::pointcloud::PointCloudLodRendererCostProfile adaptiveRendererCostProfile =
             renderer::pointcloud::PointCloudLodRendererCostProfile::FastBasicSquare;
         float adaptiveMinRadiusScale = 1.0F;
@@ -194,9 +215,20 @@ struct SceneRenderState {
         float adaptiveMaxEmissionCoverageScale = 1.0F;
         float adaptiveEstimatedVertexCost = 0.0F;
         float adaptiveEstimatedBlendedFragments = 0.0F;
+        float adaptiveBlendedFragmentBudget = 0.0F;
         bool adaptiveOpacityCompensationClamped = false;
         bool adaptiveEmissionCompensationClamped = false;
         bool adaptivePerformanceCompensationClamped = false;
+        float adaptiveGovernorBudgetScale = 1.0F;
+        double adaptiveGovernorPointPassMs = 0.0;
+        double adaptiveGovernorPointPassEwmaMs = 0.0;
+        double adaptiveGovernorCompositeMs = 0.0;
+        double adaptiveGovernorCompositeEwmaMs = 0.0;
+        double adaptiveGovernorTargetPointPassMs = 0.0;
+        std::uint64_t adaptiveGovernorUploadBudgetBytes = 0;
+        std::string adaptiveGovernorTimestampState;
+        std::string adaptiveGovernorStatus;
+        std::string adaptiveGovernorActiveLimit;
         double adaptiveLodTraversalMs = 0.0;
         bool adaptiveLodReusedPrevious = false;
         bool adaptiveLodRuntimeCacheHit = false;
@@ -353,6 +385,9 @@ class VulkanViewportShell {
         VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE;
         VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
+        bool timestampQueriesArmed = false;
+        std::array<bool, 5U> timestampPassWritten{};
     };
 
     struct HighQualityGaussianSceneResources {
@@ -441,6 +476,13 @@ class VulkanViewportShell {
     void CreateCommandPool();
     void CreateCommandBuffers();
     void CreateSyncObjects();
+    void ReadPreviousGpuTimestampResults(FrameResources* frame);
+    void ResetGpuTimestampQueries(VkCommandBuffer commandBuffer, FrameResources* frame);
+    void WriteGpuTimestamp(
+        VkCommandBuffer commandBuffer,
+        FrameResources* frame,
+        std::uint32_t passIndex,
+        bool end);
     void CreateImGuiResources();
     void UploadImGuiFonts();
     void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);
@@ -596,6 +638,7 @@ class VulkanViewportShell {
 
     std::uint32_t graphicsQueueFamily_ = 0;
     std::uint32_t presentQueueFamily_ = 0;
+    std::uint32_t graphicsQueueTimestampValidBits_ = 0;
     VkFormat swapchainImageFormat_ = VK_FORMAT_UNDEFINED;
     std::uint32_t swapchainWidth_ = 0;
     std::uint32_t swapchainHeight_ = 0;
@@ -626,6 +669,8 @@ class VulkanViewportShell {
     bool diagnosticsTimingInitialized_ = false;
     double diagnosticsFpsWindowMs_ = 0.0;
     std::uint32_t diagnosticsFpsWindowFrames_ = 0;
+    bool gpuTimestampsSupported_ = false;
+    float gpuTimestampPeriodNs_ = 0.0F;
     float pointSizeRangeMin_ = 1.0F;
     float pointSizeRangeMax_ = 64.0F;
 };

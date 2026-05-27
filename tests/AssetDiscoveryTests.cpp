@@ -22,6 +22,7 @@
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
 #include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
+#include "renderer/pointcloud/PointCloudPerformanceGovernor.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "style/RenderParameterBinding.hpp"
@@ -1666,6 +1667,54 @@ TEST_CASE("Point-cloud adaptive LOD traversal enforces estimated fragment budget
     CHECK(budgetedFragments <= params.maxEstimatedFragments + 0.01F);
 }
 
+TEST_CASE("Beauty adaptive LOD traversal enforces estimated blended fragment budget", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 8;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 8U, .maxInternalRepresentatives = 16U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.rendererCostProfile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    params.viewportWidth = 1024;
+    params.viewportHeight = 1024;
+    params.maxRepresentatives = 128U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.maxEstimatedBlendedFragments = 1.0e9F;
+    params.viewProjection = glm::mat4{1.0F};
+    invisible_places::style::SetScalarConstant(&params.style.pointSize, 12.0F);
+
+    pc::PointCloudLodTraversalDiagnostics unlimitedDiagnostics;
+    const auto unlimited = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &unlimitedDiagnostics);
+    REQUIRE(unlimited.size() > 8U);
+    REQUIRE(unlimitedDiagnostics.estimatedBlendedFragmentCost > 0.0F);
+
+    params.maxEstimatedBlendedFragments = unlimited.front().renderAreaPixels * 0.8F;
+    pc::PointCloudLodTraversalDiagnostics budgetedDiagnostics;
+    const auto budgeted = pc::TraversePointCloudLodHierarchy(hierarchy, params, {}, &budgetedDiagnostics);
+    REQUIRE(!budgeted.empty());
+    CHECK(budgeted.size() < unlimited.size());
+    CHECK(budgetedDiagnostics.blendedFragmentBudgetReached);
+    CHECK_FALSE(budgetedDiagnostics.fragmentBudgetReached);
+}
+
 TEST_CASE("Point-cloud adaptive LOD diagnostics distinguish visible emitted and budget pressure", "[pointcloud][lod]") {
     invisible_places::io::LoadedPointCloud cloud;
     constexpr int gridSize = 8;
@@ -2116,7 +2165,73 @@ TEST_CASE("Adaptive async traversal supersedes stale viewport requests", "[point
     CHECK(rendererHeader.find("adaptiveLodAsyncPendingAgeMs") != std::string::npos);
 }
 
-TEST_CASE("Beauty Adaptive quality controller demotes and promotes by measured FPS", "[pointcloud][lod][source]") {
+TEST_CASE("Point-cloud performance governor updates EWMA and clamps scale changes", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    pc::PointCloudPerformanceGovernor governor;
+    pc::PointCloudPerformanceGovernorSample sample;
+    sample.profile = pc::PointCloudLodRendererCostProfile::BeautyScreenSprite;
+    sample.sceneRendered = true;
+    sample.timestampSupported = true;
+    sample.timingValid = true;
+    sample.targetPointPassMs = 10.0;
+    sample.gpuPointPassMs = 30.0;
+    sample.gpuCompositeMs = 4.0;
+
+    const auto first = pc::UpdatePointCloudPerformanceGovernor(&governor, sample);
+    CHECK(first.gpuPointPassEwmaMs == Catch::Approx(30.0));
+    CHECK(first.budgetScale == Catch::Approx(0.80F));
+    CHECK(first.overTarget);
+
+    sample.gpuPointPassMs = 10.0;
+    const auto second = pc::UpdatePointCloudPerformanceGovernor(&governor, sample);
+    CHECK(second.gpuPointPassEwmaMs == Catch::Approx(26.4));
+    CHECK(second.budgetScale >= 0.64F);
+    CHECK(second.budgetScale <= 0.80F);
+}
+
+TEST_CASE("Point-cloud performance governor uses conservative fixed fallback without timestamps", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    pc::PointCloudPerformanceGovernor governor;
+    pc::PointCloudPerformanceGovernorSample sample;
+    sample.sceneRendered = true;
+    sample.timestampSupported = false;
+    sample.timingValid = false;
+    sample.gpuPointPassMs = 80.0;
+
+    const auto output = pc::UpdatePointCloudPerformanceGovernor(&governor, sample);
+    CHECK_FALSE(output.timestampSupported);
+    CHECK(output.timestampState == "unavailable");
+    CHECK(output.budgetScale == Catch::Approx(1.0F));
+    CHECK(output.status.find("conservative fixed budget") != std::string::npos);
+}
+
+TEST_CASE("Point-cloud performance governor reports performance-limited at floor", "[pointcloud][lod]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    pc::PointCloudPerformanceGovernor governor;
+    pc::PointCloudPerformanceGovernorSample sample;
+    sample.sceneRendered = true;
+    sample.timestampSupported = true;
+    sample.timingValid = true;
+    sample.targetPointPassMs = 10.0;
+    sample.gpuPointPassMs = 100.0;
+    sample.minimumBudgetScale = 0.35F;
+    sample.fragmentBudgetReached = true;
+
+    pc::PointCloudPerformanceGovernorOutput output;
+    for (int i = 0; i < 10; ++i) {
+        output = pc::UpdatePointCloudPerformanceGovernor(&governor, sample);
+    }
+
+    CHECK(output.budgetScale == Catch::Approx(0.35F));
+    CHECK(output.performanceLimited);
+    CHECK(output.status == "performance-limited");
+    CHECK(output.activeLimit == "fragments");
+}
+
+TEST_CASE("Beauty Adaptive quality controller uses measured GPU timing governor", "[pointcloud][lod][source]") {
     const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
     const auto controllerSection = SourceSection(
         applicationSource,
@@ -2127,13 +2242,34 @@ TEST_CASE("Beauty Adaptive quality controller demotes and promotes by measured F
         "invisible_places::renderer::core::SceneRenderState BuildRenderState",
         "int Application::Run");
 
-    CHECK(controllerSection.find("kAdaptiveDemoteFps = 15.0") != std::string::npos);
-    CHECK(controllerSection.find("kAdaptivePromoteFps = 45.0") != std::string::npos);
+    CHECK(controllerSection.find("LastAdaptivePerformanceFps") == std::string::npos);
+    CHECK(controllerSection.find("kAdaptiveDemoteFps") == std::string::npos);
+    CHECK(controllerSection.find("kAdaptivePromoteFps") == std::string::npos);
+    CHECK(controllerSection.find("UpdateAdaptivePerformanceGovernor") != std::string::npos);
+    CHECK(controllerSection.find("overTarget") != std::string::npos);
+    CHECK(controllerSection.find("underTarget") != std::string::npos);
     CHECK(controllerSection.find("DemoteAdaptiveQuality") != std::string::npos);
     CHECK(controllerSection.find("PromoteAdaptiveQuality") != std::string::npos);
     CHECK(controllerSection.find("adaptiveMovementDensityMode") != std::string::npos);
     CHECK(controllerSection.find("AdaptiveHighQuality") != std::string::npos);
     CHECK(buildRenderStateSection.find("SelectAdaptiveViewportDensityMode") != std::string::npos);
+}
+
+TEST_CASE("Viewport diagnostics expose Vulkan timestamp governor surfaces", "[pointcloud][lod][source]") {
+    const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
+    const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
+    const auto appSource = ReadRepoTextFile("src/app/Application.cpp");
+
+    CHECK(rendererHeader.find("gpuTimestampSupported") != std::string::npos);
+    CHECK(rendererHeader.find("gpuFastBasicPointPassMs") != std::string::npos);
+    CHECK(rendererHeader.find("gpuBeautyPointPassMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGovernorBudgetScale") != std::string::npos);
+    CHECK(rendererSource.find("vkCreateQueryPool") != std::string::npos);
+    CHECK(rendererSource.find("vkGetQueryPoolResults") != std::string::npos);
+    CHECK(rendererSource.find("VK_QUERY_RESULT_WITH_AVAILABILITY_BIT") != std::string::npos);
+    CHECK(rendererSource.find("vkCmdWriteTimestamp") != std::string::npos);
+    CHECK(appSource.find("Adaptive preview limited by GPU") != std::string::npos);
+    CHECK(appSource.find("fast_basic_max_gpu_point_pass_ms") != std::string::npos);
 }
 
 TEST_CASE("Fast Basic adaptive viewport targets high quality and reserves preview for emergency demotion", "[pointcloud][lod][source]") {

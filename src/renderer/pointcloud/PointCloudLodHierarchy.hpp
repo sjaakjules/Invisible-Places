@@ -133,6 +133,7 @@ struct PointCloudLodTraversalParams {
     std::uint32_t maxDrawItems = 0;
     std::uint32_t maxRepresentatives = 0;
     float maxEstimatedFragments = 0.0F;
+    float maxEstimatedBlendedFragments = 0.0F;
     float maxRepresentativeDiameterPixels = 0.0F;
     float targetProjectedSpacingPixels = 0.0F;
     std::vector<std::uint32_t> previousFrontierNodeIndices;
@@ -161,6 +162,7 @@ struct PointCloudLodTraversalDiagnostics {
     std::uint32_t emissiveFeatureRefinedNodeCount = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
+    bool blendedFragmentBudgetReached = false;
     PointCloudLodRendererCostProfile rendererCostProfile = PointCloudLodRendererCostProfile::FastBasicSquare;
     float minRadiusScale = 1.0F;
     float maxRadiusScale = 1.0F;

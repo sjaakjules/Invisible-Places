@@ -23,6 +23,7 @@
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
 #include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
+#include "renderer/pointcloud/PointCloudPerformanceGovernor.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "scene/SceneCatalog.hpp"
 #include "serialization/ProjectDocument.hpp"
@@ -103,6 +104,12 @@ using PointCloudLodRendererCostProfile =
     invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfile;
 using PointCloudLodTraversalDiagnostics =
     invisible_places::renderer::pointcloud::PointCloudLodTraversalDiagnostics;
+using PointCloudPerformanceGovernor =
+    invisible_places::renderer::pointcloud::PointCloudPerformanceGovernor;
+using PointCloudPerformanceGovernorOutput =
+    invisible_places::renderer::pointcloud::PointCloudPerformanceGovernorOutput;
+using PointCloudPerformanceGovernorSample =
+    invisible_places::renderer::pointcloud::PointCloudPerformanceGovernorSample;
 using PointCloudLodBuildProgress = invisible_places::renderer::pointcloud::PointCloudLodBuildProgress;
 using PointCloudLoadProgress = invisible_places::io::PointCloudLoadProgress;
 using PointCloudExportDensityMode = invisible_places::output::PointCloudExportDensityMode;
@@ -481,6 +488,7 @@ struct AdaptiveLodCacheState {
     std::uint32_t representativeBudget = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
+    bool blendedFragmentBudgetReached = false;
     double traversalMs = 0.0;
     std::uint64_t drawItemBytes = 0;
     float maxRenderDiameterPixels = 0.0F;
@@ -493,9 +501,11 @@ struct AdaptiveLodCacheState {
     float maxEmissionCoverageScale = 1.0F;
     float estimatedVertexCost = 0.0F;
     float estimatedBlendedFragments = 0.0F;
+    float blendedFragmentBudget = 0.0F;
     bool opacityCompensationClamped = false;
     bool emissionCompensationClamped = false;
     bool performanceCompensationClamped = false;
+    PointCloudPerformanceGovernorOutput governorOutput{};
     PointCloudExportDensityMode densityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
 };
 
@@ -528,9 +538,11 @@ struct AdaptiveLodBuildResult {
     bool idleRefinementPending = false;
     float estimatedFragments = 0.0F;
     float fragmentBudget = 0.0F;
+    float blendedFragmentBudget = 0.0F;
     std::uint32_t representativeBudget = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
+    bool blendedFragmentBudgetReached = false;
     double traversalMs = 0.0;
     std::uint64_t drawItemBytes = 0;
     std::uint64_t displayedCacheAgeFrames = 0;
@@ -546,6 +558,7 @@ struct AdaptiveLodBuildResult {
     bool opacityCompensationClamped = false;
     bool emissionCompensationClamped = false;
     bool performanceCompensationClamped = false;
+    PointCloudPerformanceGovernorOutput governorOutput{};
     bool reusedPrevious = false;
     bool runtimeCacheHit = false;
     bool asyncPending = false;
@@ -564,6 +577,7 @@ struct AdaptiveLodAsyncCompletion {
     PointCloudExportDensityMode densityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
     std::vector<PointCloudDrawItemGpu> drawItems;
     float fragmentBudget = 0.0F;
+    float blendedFragmentBudget = 0.0F;
     std::uint32_t representativeBudget = 0;
     double traversalMs = 0.0;
     PointCloudLodTraversalDiagnostics diagnostics{};
@@ -674,9 +688,18 @@ struct PreviewLayerSession {
     float adaptiveLodMaxEmissionCoverageScale = 1.0F;
     float adaptiveLodEstimatedVertexCost = 0.0F;
     float adaptiveLodEstimatedBlendedFragments = 0.0F;
+    float adaptiveLodBlendedFragmentBudget = 0.0F;
     bool adaptiveLodOpacityCompensationClamped = false;
     bool adaptiveLodEmissionCompensationClamped = false;
     bool adaptiveLodPerformanceCompensationClamped = false;
+    std::array<
+        PointCloudPerformanceGovernor,
+        invisible_places::renderer::pointcloud::kPointCloudLodRendererCostProfileCount>
+        adaptivePerformanceGovernors{};
+    std::array<
+        PointCloudPerformanceGovernorOutput,
+        invisible_places::renderer::pointcloud::kPointCloudLodRendererCostProfileCount>
+        adaptivePerformanceGovernorOutputs{};
     std::uint64_t adaptiveLodVisibleRepresentedSourceCount = 0;
     std::uint64_t adaptiveLodEmittedRepresentedSourceCount = 0;
     std::uint64_t adaptiveLodCulledRepresentedSourceCount = 0;
@@ -702,6 +725,7 @@ struct PreviewLayerSession {
     std::uint64_t adaptiveLodTransitionRevision = 0;
     bool adaptiveLodRepresentativeBudgetReached = false;
     bool adaptiveLodFragmentBudgetReached = false;
+    bool adaptiveLodBlendedFragmentBudgetReached = false;
     std::uint64_t adaptiveLodDisplayedCacheAgeFrames = 0;
     bool adaptiveLodEmergencyDemotion = false;
     std::string adaptiveLodFallbackState = "none";
@@ -3151,28 +3175,110 @@ PointCloudExportDensityMode PromoteAdaptiveQuality(
     return AdaptiveHighQualityMode(paintedAdaptive);
 }
 
-double LastAdaptivePerformanceFps(
-    const PreviewRuntimeState& runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
-    std::vector<double> samples;
-    if (runtimeState.previewSceneUpdateFps > 0.0) {
-        samples.push_back(runtimeState.previewSceneUpdateFps);
+PointCloudLodRendererCostProfile ResolveAdaptiveLodRendererCostProfile(
+    const PointCloudStyleState& style,
+    bool fastBasicProfile) {
+    if (fastBasicProfile) {
+        return PointCloudLodRendererCostProfile::FastBasicSquare;
     }
-    const auto& diagnostics = viewport.Diagnostics();
-    if (diagnostics.averageFrameFps > 0.0) {
-        samples.push_back(diagnostics.averageFrameFps);
-    } else if (diagnostics.frameFps > 0.0) {
-        samples.push_back(diagnostics.frameFps);
+    if (style.geometryMode == PointCloudGeometryMode::ScreenSprites) {
+        return invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(style)
+                   ? PointCloudLodRendererCostProfile::BeautyWorldScreenSprite
+                   : PointCloudLodRendererCostProfile::BeautyScreenSprite;
     }
-    if (samples.empty()) {
-        return 60.0;
+    return PointCloudLodRendererCostProfile::BeautyWorldSurfel;
+}
+
+float BaseAdaptiveTargetSpacingPixels(PointCloudExportDensityMode mode) {
+    switch (mode) {
+        case PointCloudExportDensityMode::FullSource:
+            return 0.0F;
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return 0.60F;
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            return 0.90F;
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            return 1.75F;
     }
-    return *std::min_element(samples.begin(), samples.end());
+    return 1.0F;
+}
+
+float AdaptiveViewportBlendedFragmentBudget(
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    PointCloudExportDensityMode densityMode,
+    bool fastBasicProfile) {
+    if (fastBasicProfile) {
+        return 0.0F;
+    }
+    return AdaptiveViewportFragmentBudget(viewportWidth, viewportHeight, densityMode, fastBasicProfile);
+}
+
+double GpuPointPassMillisecondsForProfile(
+    const invisible_places::renderer::core::ViewportDiagnostics& diagnostics,
+    PointCloudLodRendererCostProfile profile) {
+    if (profile == PointCloudLodRendererCostProfile::FastBasicSquare) {
+        return diagnostics.gpuFastBasicPointPassMs;
+    }
+    return diagnostics.gpuBeautyPointPassMs > 0.0
+               ? diagnostics.gpuBeautyPointPassMs
+               : diagnostics.gpuBeautyDepthPassMs;
+}
+
+double GpuCompositeMilliseconds(
+    const invisible_places::renderer::core::ViewportDiagnostics& diagnostics) {
+    return diagnostics.gpuCompositePassMs + diagnostics.gpuPostProcessPassMs;
+}
+
+PointCloudPerformanceGovernorOutput UpdateAdaptivePerformanceGovernor(
+    PreviewLayerSession* session,
+    const invisible_places::renderer::core::ViewportDiagnostics& diagnostics,
+    PointCloudLodRendererCostProfile profile,
+    bool interactive) {
+    if (session == nullptr) {
+        return {};
+    }
+    const auto profileIndex =
+        invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileIndex(profile);
+    PointCloudPerformanceGovernorSample sample;
+    sample.profile = profile;
+    sample.sceneRendered = diagnostics.sceneRenderedThisFrame;
+    sample.timestampSupported = diagnostics.gpuTimestampSupported;
+    sample.timingValid = diagnostics.gpuTimestampTimingValid;
+    sample.gpuPointPassMs = GpuPointPassMillisecondsForProfile(diagnostics, profile);
+    sample.gpuCompositeMs = GpuCompositeMilliseconds(diagnostics);
+    sample.targetPointPassMs =
+        invisible_places::renderer::pointcloud::DefaultPointCloudGovernorTargetPointPassMs(
+            profile,
+            interactive);
+    sample.targetCompositeMs =
+        invisible_places::renderer::pointcloud::DefaultPointCloudGovernorTargetCompositeMs(interactive);
+    sample.baseUploadBytesPerFrame =
+        invisible_places::renderer::pointcloud::DefaultPointCloudGovernorUploadBudgetBytes(profile);
+    sample.representativeBudgetReached = session->adaptiveLodRepresentativeBudgetReached;
+    sample.fragmentBudgetReached = session->adaptiveLodFragmentBudgetReached;
+    sample.blendedFragmentBudgetReached = session->adaptiveLodBlendedFragmentBudgetReached;
+    auto output = invisible_places::renderer::pointcloud::UpdatePointCloudPerformanceGovernor(
+        &session->adaptivePerformanceGovernors[profileIndex],
+        sample);
+    session->adaptivePerformanceGovernorOutputs[profileIndex] = output;
+    return output;
+}
+
+PointCloudPerformanceGovernorOutput CurrentAdaptivePerformanceGovernorOutput(
+    const PreviewLayerSession& session,
+    PointCloudLodRendererCostProfile profile) {
+    const auto profileIndex =
+        invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileIndex(profile);
+    return session.adaptivePerformanceGovernorOutputs[profileIndex];
 }
 
 PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const PointCloudStyleState& style,
     PreviewLayerSession* session,
     bool paintedAdaptive,
     bool fastBasicViewport) {
@@ -3192,8 +3298,6 @@ PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
         lastChanged.time_since_epoch().count() == 0
             ? std::chrono::milliseconds{1000}
             : std::chrono::duration_cast<std::chrono::milliseconds>(now - lastChanged);
-    constexpr double kAdaptiveDemoteFps = 15.0;
-    constexpr double kAdaptivePromoteFps = 45.0;
     constexpr auto kMovementQualityStepDelay = std::chrono::milliseconds{350};
     constexpr auto kIdleQualityStepDelay = std::chrono::milliseconds{280};
     const auto movementQualityStepDelay =
@@ -3211,6 +3315,12 @@ PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
 
     const bool adaptiveInteractionActive =
         fastBasicViewport ? runtimeState.cameraInteraction.navigationActive : runtimeState.performanceInteraction.active;
+    const auto rendererCostProfile = ResolveAdaptiveLodRendererCostProfile(style, fastBasicViewport);
+    const auto governorOutput = UpdateAdaptivePerformanceGovernor(
+        session,
+        viewport.Diagnostics(),
+        rendererCostProfile,
+        adaptiveInteractionActive);
 
     if (!adaptiveInteractionActive) {
         if (session->adaptiveMovementDensityMode != highQuality &&
@@ -3223,30 +3333,15 @@ PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
         return session->adaptiveMovementDensityMode;
     }
 
-    const double measuredFps = LastAdaptivePerformanceFps(runtimeState, viewport);
-    if (measuredFps < kAdaptiveDemoteFps && sinceChange >= movementQualityStepDelay) {
+    if (governorOutput.timingValid && governorOutput.overTarget && sinceChange >= movementQualityStepDelay) {
         setQuality(DemoteAdaptiveQuality(session->adaptiveMovementDensityMode, paintedAdaptive));
-    } else if (measuredFps > kAdaptivePromoteFps && sinceChange >= movementQualityStepDelay) {
+    } else if (governorOutput.timingValid && governorOutput.underTarget && sinceChange >= movementQualityStepDelay) {
         setQuality(PromoteAdaptiveQuality(session->adaptiveMovementDensityMode, paintedAdaptive));
     }
     session->adaptiveLodEmergencyDemotion =
         fastBasicViewport &&
         session->adaptiveMovementDensityMode == PointCloudExportDensityMode::FastAdaptivePreview;
     return session->adaptiveMovementDensityMode;
-}
-
-PointCloudLodRendererCostProfile ResolveAdaptiveLodRendererCostProfile(
-    const PointCloudStyleState& style,
-    bool fastBasicProfile) {
-    if (fastBasicProfile) {
-        return PointCloudLodRendererCostProfile::FastBasicSquare;
-    }
-    if (style.geometryMode == PointCloudGeometryMode::ScreenSprites) {
-        return invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(style)
-                   ? PointCloudLodRendererCostProfile::BeautyWorldScreenSprite
-                   : PointCloudLodRendererCostProfile::BeautyScreenSprite;
-    }
-    return PointCloudLodRendererCostProfile::BeautyWorldSurfel;
 }
 
 invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams(
@@ -3266,17 +3361,36 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
     params.style = style;
     params.densityMode = densityMode;
     params.rendererCostProfile = ResolveAdaptiveLodRendererCostProfile(style, fastBasicProfile);
+    const auto governorOutput = CurrentAdaptivePerformanceGovernorOutput(session, params.rendererCostProfile);
+    const float governorBudgetScale = std::clamp(governorOutput.budgetScale, 0.05F, 4.0F);
+    const auto scaleRepresentativeBudget = [](std::uint32_t budget, float scale) {
+        if (budget == 0U) {
+            return 0U;
+        }
+        const auto scaled = static_cast<std::uint64_t>(std::llround(
+            static_cast<double>(budget) * static_cast<double>(scale)));
+        return static_cast<std::uint32_t>(
+            std::clamp<std::uint64_t>(scaled, 1ULL, std::numeric_limits<std::uint32_t>::max()));
+    };
     params.maxRepresentatives = AdaptiveViewportRepresentativeBudget(
         params.viewportWidth,
         params.viewportHeight,
         densityMode,
         fastBasicProfile,
         session.totalPrimitives);
+    params.maxRepresentatives = scaleRepresentativeBudget(params.maxRepresentatives, governorBudgetScale);
     params.maxEstimatedFragments = AdaptiveViewportFragmentBudget(
         params.viewportWidth,
         params.viewportHeight,
         densityMode,
-        fastBasicProfile);
+        fastBasicProfile) * governorBudgetScale;
+    params.maxEstimatedBlendedFragments = AdaptiveViewportBlendedFragmentBudget(
+        params.viewportWidth,
+        params.viewportHeight,
+        densityMode,
+        fastBasicProfile) * governorBudgetScale;
+    params.targetProjectedSpacingPixels =
+        BaseAdaptiveTargetSpacingPixels(densityMode) * governorOutput.targetSpacingScale;
     const auto& previousFrontierSource =
         session.adaptiveLodTransitionActive && session.adaptiveLodTransitionTarget.valid
             ? session.adaptiveLodTransitionTarget
@@ -3303,6 +3417,18 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
             break;
     }
     const auto manualCap = ManualAdaptiveDrawItemCap(session);
+    if (governorOutput.maxUploadBytesPerFrame > 0ULL) {
+        const auto uploadDrawItemCap = static_cast<std::uint32_t>(
+            std::clamp<std::uint64_t>(
+                governorOutput.maxUploadBytesPerFrame /
+                    std::max<std::uint64_t>(1ULL, static_cast<std::uint64_t>(sizeof(PointCloudDrawItemGpu))),
+                1ULL,
+                std::numeric_limits<std::uint32_t>::max()));
+        params.maxDrawItems =
+            params.maxDrawItems == 0U ? uploadDrawItemCap : std::min(params.maxDrawItems, uploadDrawItemCap);
+        params.maxRepresentatives =
+            params.maxRepresentatives == 0U ? uploadDrawItemCap : std::min(params.maxRepresentatives, uploadDrawItemCap);
+    }
     if (manualCap > 0U) {
         params.maxDrawItems = manualCap;
         params.maxRepresentatives = params.maxRepresentatives == 0U
@@ -3329,6 +3455,9 @@ std::uint64_t AdaptiveLodTraversalKey(
     HashCombine(&seed, static_cast<std::uint64_t>(densityMode));
     HashCombine(&seed, static_cast<std::uint64_t>(rendererCostProfile));
     HashCombine(&seed, ManualAdaptiveDrawItemCap(session));
+    const auto governorOutput = CurrentAdaptivePerformanceGovernorOutput(session, rendererCostProfile);
+    HashQuantizedFloat(&seed, governorOutput.budgetScale, 100.0F);
+    HashCombine(&seed, governorOutput.maxUploadBytesPerFrame / 1024ULL);
     HashCombine(
         &seed,
         session.pointLodHierarchy == nullptr ? 0ULL : session.pointLodHierarchy->sourcePointCount);
@@ -3463,6 +3592,7 @@ void ApplyAdaptiveLodCacheMetadata(
     session->adaptiveLodMaxEmissionCoverageScale = entry.maxEmissionCoverageScale;
     session->adaptiveLodEstimatedVertexCost = entry.estimatedVertexCost;
     session->adaptiveLodEstimatedBlendedFragments = entry.estimatedBlendedFragments;
+    session->adaptiveLodBlendedFragmentBudget = entry.blendedFragmentBudget;
     session->adaptiveLodOpacityCompensationClamped = entry.opacityCompensationClamped;
     session->adaptiveLodEmissionCompensationClamped = entry.emissionCompensationClamped;
     session->adaptiveLodPerformanceCompensationClamped = entry.performanceCompensationClamped;
@@ -3483,6 +3613,7 @@ void ApplyAdaptiveLodCacheMetadata(
     session->adaptiveLodHysteresisDemoteScale = entry.hysteresisDemoteScale;
     session->adaptiveLodRepresentativeBudgetReached = entry.representativeBudgetReached;
     session->adaptiveLodFragmentBudgetReached = entry.fragmentBudgetReached;
+    session->adaptiveLodBlendedFragmentBudgetReached = entry.blendedFragmentBudgetReached;
     session->adaptiveLodDisplayedCacheAgeFrames =
         frameCounter >= entry.createdFrame ? frameCounter - entry.createdFrame : 0ULL;
     session->adaptiveLodFallbackState = entry.coarseFallback ? "coarse fallback" : "exact traversal";
@@ -3498,6 +3629,7 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     std::vector<PointCloudDrawItemGpu> drawItems,
     std::uint32_t representativeBudget,
     float fragmentBudget,
+    float blendedFragmentBudget,
     double traversalMs,
     std::uint64_t frameCounter,
     bool coarseFallback,
@@ -3547,6 +3679,7 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     entry.hysteresisDemoteScale = diagnostics.hysteresisDemoteScale;
     entry.representativeBudgetReached = diagnostics.representativeBudgetReached;
     entry.fragmentBudgetReached = diagnostics.fragmentBudgetReached;
+    entry.blendedFragmentBudgetReached = diagnostics.blendedFragmentBudgetReached;
     const auto fallbackStats = EstimateDrawItemCompensationStats(drawItems, diagnostics.rendererCostProfile);
     entry.estimatedFragments = diagnostics.estimatedFragmentCost > 0.0F
                                    ? diagnostics.estimatedFragmentCost
@@ -3572,7 +3705,9 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     entry.emissionCompensationClamped = diagnostics.emissionCompensationClamped;
     entry.performanceCompensationClamped = diagnostics.performanceCompensationClamped;
     entry.fragmentBudget = fragmentBudget;
+    entry.blendedFragmentBudget = blendedFragmentBudget;
     entry.representativeBudget = representativeBudget;
+    entry.governorOutput = CurrentAdaptivePerformanceGovernorOutput(*session, entry.rendererCostProfile);
     entry.traversalMs = traversalMs;
     entry.drawItemBytes = DrawItemByteCount(drawItems.size());
     entry.densityMode = densityMode;
@@ -3673,6 +3808,15 @@ std::vector<PointCloudDrawItemGpu> BuildAdaptiveTransitionDrawItems(
         mixed.push_back(item);
     }
     return mixed;
+}
+
+std::string RuntimeStatusWithGovernor(
+    std::string status,
+    const PointCloudPerformanceGovernorOutput& governorOutput) {
+    if (governorOutput.performanceLimited) {
+        return "Adaptive preview limited by GPU: " + governorOutput.activeLimit + " budget reached.";
+    }
+    return status;
 }
 
 void BeginAdaptiveLodTransition(
@@ -3822,9 +3966,11 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .idleRefinementPending = session->adaptiveLodIdleRefinementPending,
         .estimatedFragments = transitionStats.estimatedFragments,
         .fragmentBudget = target.fragmentBudget,
+        .blendedFragmentBudget = target.blendedFragmentBudget,
         .representativeBudget = target.representativeBudget,
         .representativeBudgetReached = target.representativeBudgetReached,
         .fragmentBudgetReached = target.fragmentBudgetReached,
+        .blendedFragmentBudgetReached = target.blendedFragmentBudgetReached,
         .traversalMs = 0.0,
         .drawItemBytes = DrawItemByteCount(session->adaptiveLodTransitionDrawItems->size()),
         .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
@@ -3840,6 +3986,7 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .opacityCompensationClamped = target.opacityCompensationClamped,
         .emissionCompensationClamped = target.emissionCompensationClamped,
         .performanceCompensationClamped = target.performanceCompensationClamped,
+        .governorOutput = target.governorOutput,
         .reusedPrevious = true,
         .runtimeCacheHit = false,
         .asyncPending = session->adaptiveLodAsyncPending,
@@ -3847,7 +3994,7 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .asyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session),
         .requestedDensityMode = requestedDensityMode,
         .displayedDensityMode = target.densityMode,
-        .runtimeStatus = session->adaptiveLodRuntimeStatus,
+        .runtimeStatus = RuntimeStatusWithGovernor(session->adaptiveLodRuntimeStatus, target.governorOutput),
         .persistentCacheStatus = session->pointLodCacheStatus,
         .fallbackState = session->adaptiveLodFallbackState,
     };
@@ -3886,6 +4033,7 @@ std::vector<PointCloudDrawItemGpu> BuildCoarseAdaptiveFallbackDrawItems(
     params.maxRepresentatives = 0U;
     params.maxDrawItems = 0U;
     params.maxEstimatedFragments = 0.0F;
+    params.maxEstimatedBlendedFragments = 0.0F;
     const auto fallbackTarget = CoarseAdaptiveFallbackRepresentativeTarget(viewportWidth, viewportHeight);
     return invisible_places::renderer::pointcloud::BuildCoarsePointCloudLodFallbackDrawItems(
         *session.pointLodHierarchy,
@@ -4037,6 +4185,7 @@ bool ScheduleAdaptiveLodTraversal(
                 .densityMode = densityMode,
                 .drawItems = std::move(drawItems),
                 .fragmentBudget = params.maxEstimatedFragments,
+                .blendedFragmentBudget = params.maxEstimatedBlendedFragments,
                 .representativeBudget = params.maxRepresentatives,
                 .traversalMs = MillisecondsBetween(traversalStart, traversalEnd),
                 .diagnostics = traversalDiagnostics,
@@ -4080,6 +4229,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodAsyncPendingAgeMs = 0.0;
         session->adaptiveLodEstimatedFragments = 0.0F;
         session->adaptiveLodFragmentBudget = requestedParams.maxEstimatedFragments;
+        session->adaptiveLodBlendedFragmentBudget = requestedParams.maxEstimatedBlendedFragments;
         session->adaptiveLodRepresentativeBudget = requestedParams.maxRepresentatives;
         session->adaptiveLodVisibleRepresentedSourceCount = 0;
         session->adaptiveLodEmittedRepresentedSourceCount = 0;
@@ -4087,6 +4237,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodVisibleFrontierNodeCount = 0;
         session->adaptiveLodRepresentativeBudgetReached = false;
         session->adaptiveLodFragmentBudgetReached = false;
+        session->adaptiveLodBlendedFragmentBudgetReached = false;
         session->adaptiveLodDisplayedCacheAgeFrames = 0;
         session->adaptiveLodFallbackState = "waiting";
         session->adaptiveLodRuntimeStatus =
@@ -4094,8 +4245,10 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         return {
             .available = false,
             .fragmentBudget = requestedParams.maxEstimatedFragments,
+            .blendedFragmentBudget = requestedParams.maxEstimatedBlendedFragments,
             .representativeBudget = requestedParams.maxRepresentatives,
             .rendererCostProfile = requestedParams.rendererCostProfile,
+            .governorOutput = CurrentAdaptivePerformanceGovernorOutput(*session, requestedParams.rendererCostProfile),
             .asyncPending = session->adaptiveLodAsyncPending,
             .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
             .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
@@ -4152,9 +4305,11 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .idleRefinementPending = session->adaptiveLodIdleRefinementPending,
             .estimatedFragments = entry.estimatedFragments,
             .fragmentBudget = entry.fragmentBudget,
+            .blendedFragmentBudget = entry.blendedFragmentBudget,
             .representativeBudget = entry.representativeBudget,
             .representativeBudgetReached = entry.representativeBudgetReached,
             .fragmentBudgetReached = entry.fragmentBudgetReached,
+            .blendedFragmentBudgetReached = entry.blendedFragmentBudgetReached,
             .traversalMs = (reusedPrevious || runtimeCacheHit) ? 0.0 : entry.traversalMs,
             .drawItemBytes = entry.drawItemBytes,
             .displayedCacheAgeFrames = session->adaptiveLodDisplayedCacheAgeFrames,
@@ -4170,6 +4325,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .opacityCompensationClamped = entry.opacityCompensationClamped,
             .emissionCompensationClamped = entry.emissionCompensationClamped,
             .performanceCompensationClamped = entry.performanceCompensationClamped,
+            .governorOutput = entry.governorOutput,
             .reusedPrevious = reusedPrevious,
             .runtimeCacheHit = runtimeCacheHit,
             .asyncPending = asyncPending,
@@ -4178,7 +4334,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
                 asyncPending ? CurrentAdaptiveLodPendingAgeMs(*session) : session->adaptiveLodAsyncPendingAgeMs,
             .requestedDensityMode = densityMode,
             .displayedDensityMode = entry.densityMode,
-            .runtimeStatus = session->adaptiveLodRuntimeStatus,
+            .runtimeStatus = RuntimeStatusWithGovernor(session->adaptiveLodRuntimeStatus, entry.governorOutput),
             .persistentCacheStatus = session->pointLodCacheStatus,
             .fallbackState = session->adaptiveLodFallbackState,
         };
@@ -4232,6 +4388,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             std::move(drawItems),
             requestedParams.maxRepresentatives,
             requestedParams.maxEstimatedFragments,
+            requestedParams.maxEstimatedBlendedFragments,
             MillisecondsBetween(traversalStart, traversalEnd),
             frameCounter,
             false,
@@ -4371,6 +4528,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodAsyncPendingAgeMs = CurrentAdaptiveLodPendingAgeMs(*session);
         session->adaptiveLodEstimatedFragments = 0.0F;
         session->adaptiveLodFragmentBudget = requestedParams.maxEstimatedFragments;
+        session->adaptiveLodBlendedFragmentBudget = requestedParams.maxEstimatedBlendedFragments;
         session->adaptiveLodRepresentativeBudget = requestedParams.maxRepresentatives;
         session->adaptiveLodVisibleRepresentedSourceCount = 0;
         session->adaptiveLodEmittedRepresentedSourceCount = 0;
@@ -4378,6 +4536,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodVisibleFrontierNodeCount = 0;
         session->adaptiveLodRepresentativeBudgetReached = false;
         session->adaptiveLodFragmentBudgetReached = false;
+        session->adaptiveLodBlendedFragmentBudgetReached = false;
         session->adaptiveLodDisplayedCacheAgeFrames = 0;
         session->adaptiveLodFallbackState = scheduled ? "waiting" : "no visible adaptive reps";
         session->adaptiveLodRuntimeStatus =
@@ -4385,8 +4544,10 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         return {
             .available = false,
             .fragmentBudget = requestedParams.maxEstimatedFragments,
+            .blendedFragmentBudget = requestedParams.maxEstimatedBlendedFragments,
             .representativeBudget = requestedParams.maxRepresentatives,
             .rendererCostProfile = requestedParams.rendererCostProfile,
+            .governorOutput = CurrentAdaptivePerformanceGovernorOutput(*session, requestedParams.rendererCostProfile),
             .asyncPending = scheduled,
             .staleTraversalDiscardedCount = session->adaptiveLodStaleTraversalDiscardedCount,
             .asyncPendingAgeMs = session->adaptiveLodAsyncPendingAgeMs,
@@ -4407,6 +4568,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         std::move(fallbackItems),
         requestedParams.maxRepresentatives,
         requestedParams.maxEstimatedFragments,
+        requestedParams.maxEstimatedBlendedFragments,
         0.0,
         frameCounter,
         true,
@@ -4470,9 +4632,11 @@ void RememberDisplayedAdaptiveLodEntry(
     displayed.hysteresisDemoteScale = result.hysteresisDemoteScale;
     displayed.estimatedFragments = result.estimatedFragments;
     displayed.fragmentBudget = result.fragmentBudget;
+    displayed.blendedFragmentBudget = result.blendedFragmentBudget;
     displayed.representativeBudget = result.representativeBudget;
     displayed.representativeBudgetReached = result.representativeBudgetReached;
     displayed.fragmentBudgetReached = result.fragmentBudgetReached;
+    displayed.blendedFragmentBudgetReached = result.blendedFragmentBudgetReached;
     displayed.drawItemBytes = result.drawItemBytes;
     displayed.rendererCostProfile = result.rendererCostProfile;
     displayed.minRadiusScale = result.minRadiusScale;
@@ -4483,6 +4647,7 @@ void RememberDisplayedAdaptiveLodEntry(
     displayed.maxEmissionCoverageScale = result.maxEmissionCoverageScale;
     displayed.estimatedVertexCost = result.estimatedVertexCost;
     displayed.estimatedBlendedFragments = result.estimatedBlendedFragments;
+    displayed.governorOutput = result.governorOutput;
     displayed.opacityCompensationClamped = result.opacityCompensationClamped;
     displayed.emissionCompensationClamped = result.emissionCompensationClamped;
     displayed.performanceCompensationClamped = result.performanceCompensationClamped;
@@ -4548,9 +4713,11 @@ bool PopulateAdaptivePointCloudLayer(
         layer->adaptiveIdleRefinementPending = result.idleRefinementPending;
         layer->adaptiveEstimatedFragments = result.estimatedFragments;
         layer->adaptiveFragmentBudget = result.fragmentBudget;
+        layer->adaptiveBlendedFragmentBudget = result.blendedFragmentBudget;
         layer->adaptiveRepresentativeBudget = result.representativeBudget;
         layer->adaptiveRepresentativeBudgetReached = result.representativeBudgetReached;
         layer->adaptiveFragmentBudgetReached = result.fragmentBudgetReached;
+        layer->adaptiveBlendedFragmentBudgetReached = result.blendedFragmentBudgetReached;
         layer->adaptiveRendererCostProfile = result.rendererCostProfile;
         layer->adaptiveMinRadiusScale = result.minRadiusScale;
         layer->adaptiveMaxRadiusScale = result.maxRadiusScale;
@@ -4560,6 +4727,16 @@ bool PopulateAdaptivePointCloudLayer(
         layer->adaptiveMaxEmissionCoverageScale = result.maxEmissionCoverageScale;
         layer->adaptiveEstimatedVertexCost = result.estimatedVertexCost;
         layer->adaptiveEstimatedBlendedFragments = result.estimatedBlendedFragments;
+        layer->adaptiveGovernorBudgetScale = result.governorOutput.budgetScale;
+        layer->adaptiveGovernorPointPassMs = result.governorOutput.gpuPointPassMs;
+        layer->adaptiveGovernorPointPassEwmaMs = result.governorOutput.gpuPointPassEwmaMs;
+        layer->adaptiveGovernorCompositeMs = result.governorOutput.gpuCompositeMs;
+        layer->adaptiveGovernorCompositeEwmaMs = result.governorOutput.gpuCompositeEwmaMs;
+        layer->adaptiveGovernorTargetPointPassMs = result.governorOutput.targetPointPassMs;
+        layer->adaptiveGovernorUploadBudgetBytes = result.governorOutput.maxUploadBytesPerFrame;
+        layer->adaptiveGovernorTimestampState = result.governorOutput.timestampState;
+        layer->adaptiveGovernorStatus = result.governorOutput.status;
+        layer->adaptiveGovernorActiveLimit = result.governorOutput.activeLimit;
         layer->adaptiveOpacityCompensationClamped = result.opacityCompensationClamped;
         layer->adaptiveEmissionCompensationClamped = result.emissionCompensationClamped;
         layer->adaptivePerformanceCompensationClamped = result.performanceCompensationClamped;
@@ -4608,9 +4785,11 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveIdleRefinementPending = result.idleRefinementPending;
     layer->adaptiveEstimatedFragments = result.estimatedFragments;
     layer->adaptiveFragmentBudget = result.fragmentBudget;
+    layer->adaptiveBlendedFragmentBudget = result.blendedFragmentBudget;
     layer->adaptiveRepresentativeBudget = result.representativeBudget;
     layer->adaptiveRepresentativeBudgetReached = result.representativeBudgetReached;
     layer->adaptiveFragmentBudgetReached = result.fragmentBudgetReached;
+    layer->adaptiveBlendedFragmentBudgetReached = result.blendedFragmentBudgetReached;
     layer->adaptiveRendererCostProfile = result.rendererCostProfile;
     layer->adaptiveMinRadiusScale = result.minRadiusScale;
     layer->adaptiveMaxRadiusScale = result.maxRadiusScale;
@@ -4620,6 +4799,16 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveMaxEmissionCoverageScale = result.maxEmissionCoverageScale;
     layer->adaptiveEstimatedVertexCost = result.estimatedVertexCost;
     layer->adaptiveEstimatedBlendedFragments = result.estimatedBlendedFragments;
+    layer->adaptiveGovernorBudgetScale = result.governorOutput.budgetScale;
+    layer->adaptiveGovernorPointPassMs = result.governorOutput.gpuPointPassMs;
+    layer->adaptiveGovernorPointPassEwmaMs = result.governorOutput.gpuPointPassEwmaMs;
+    layer->adaptiveGovernorCompositeMs = result.governorOutput.gpuCompositeMs;
+    layer->adaptiveGovernorCompositeEwmaMs = result.governorOutput.gpuCompositeEwmaMs;
+    layer->adaptiveGovernorTargetPointPassMs = result.governorOutput.targetPointPassMs;
+    layer->adaptiveGovernorUploadBudgetBytes = result.governorOutput.maxUploadBytesPerFrame;
+    layer->adaptiveGovernorTimestampState = result.governorOutput.timestampState;
+    layer->adaptiveGovernorStatus = result.governorOutput.status;
+    layer->adaptiveGovernorActiveLimit = result.governorOutput.activeLimit;
     layer->adaptiveOpacityCompensationClamped = result.opacityCompensationClamped;
     layer->adaptiveEmissionCompensationClamped = result.emissionCompensationClamped;
     layer->adaptivePerformanceCompensationClamped = result.performanceCompensationClamped;
@@ -4707,6 +4896,7 @@ void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
     session->adaptiveLodAsyncPendingAgeMs = 0.0;
     session->adaptiveLodEstimatedFragments = 0.0F;
     session->adaptiveLodFragmentBudget = 0.0F;
+    session->adaptiveLodBlendedFragmentBudget = 0.0F;
     session->adaptiveLodRepresentativeBudget = 0;
     session->adaptiveLodVisibleRepresentedSourceCount = 0;
     session->adaptiveLodEmittedRepresentedSourceCount = 0;
@@ -4732,8 +4922,15 @@ void ClearAdaptiveLodRuntimeCache(PreviewLayerSession* session) {
     session->adaptiveLodTransitionRevision = 0;
     session->adaptiveLodRepresentativeBudgetReached = false;
     session->adaptiveLodFragmentBudgetReached = false;
+    session->adaptiveLodBlendedFragmentBudgetReached = false;
     session->adaptiveLodDisplayedCacheAgeFrames = 0;
     session->adaptiveLodFallbackState = "none";
+    if (session->adaptiveLodAsyncState != nullptr) {
+        std::scoped_lock lock(session->adaptiveLodAsyncState->mutex);
+        session->adaptiveLodAsyncState->latestRequestedKey = 0;
+        session->adaptiveLodAsyncState->latestRequestedGeneration = 0;
+        session->adaptiveLodAsyncState->completed.reset();
+    }
 }
 
 void StopPointCloudBackgroundLodWork(PreviewLayerSession* session) {
@@ -5005,6 +5202,7 @@ void PollPointCloudLodWorkers(PreviewRuntimeState* runtimeState) {
                         std::move(completion->drawItems),
                         completion->representativeBudget,
                         completion->fragmentBudget,
+                        completion->blendedFragmentBudget,
                         completion->traversalMs,
                         runtimeState->previewFrameCounter,
                         false,
@@ -13756,6 +13954,22 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
     ImGui::Text(
         "Quality governor: %s",
         session.adaptiveLodEmergencyDemotion ? "emergency demotion" : "normal");
+    const auto activeProfile = invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileIndex(
+        session.adaptiveLodRendererCostProfile);
+    if (activeProfile < session.adaptivePerformanceGovernorOutputs.size()) {
+        const auto& governor = session.adaptivePerformanceGovernorOutputs[activeProfile];
+        ImGui::Text(
+            "GPU governor: %s | scale %.2fx | point %.3f / %.3f ms EWMA",
+            governor.status.c_str(),
+            governor.budgetScale,
+            governor.gpuPointPassMs,
+            governor.gpuPointPassEwmaMs);
+        ImGui::Text(
+            "Governor limit: %s | timestamps %s | upload %.2f MB",
+            governor.activeLimit.c_str(),
+            governor.timestampState.c_str(),
+            static_cast<double>(governor.maxUploadBytesPerFrame) / (1024.0 * 1024.0));
+    }
     ImGui::Text(
         "Runtime cache: %s | async: %s | entries: %s",
         session.adaptiveLodRuntimeCacheHit ? "hit" : "miss/reuse",
@@ -13798,12 +14012,14 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             session.adaptiveLodCache.traversalMs,
             session.adaptiveLodCache.maxRenderDiameterPixels);
         ImGui::Text(
-            "Renderer cost: %s | vertices %.0f | fragments %.0f | blended %.0f",
+            "Renderer cost: %s | vertices %.0f | fragments %.0f / %.0f | blended %.0f / %.0f",
             invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileName(
                 session.adaptiveLodCache.rendererCostProfile),
             session.adaptiveLodCache.estimatedVertexCost,
             session.adaptiveLodCache.estimatedFragments,
-            session.adaptiveLodCache.estimatedBlendedFragments);
+            session.adaptiveLodCache.fragmentBudget,
+            session.adaptiveLodCache.estimatedBlendedFragments,
+            session.adaptiveLodCache.blendedFragmentBudget);
         ImGui::Text(
             "Compensation: radius %.2f-%.2fx | opacity %.2f-%.2fx | emission %.2f-%.2fx | clamps %s/%s/%s",
             session.adaptiveLodCache.minRadiusScale,
@@ -13822,10 +14038,13 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             FormatPointCount(session.adaptiveLodCache.culledRepresentedSourceCount).c_str());
         const char* budgetPressure =
             session.adaptiveLodCache.representativeBudgetReached && session.adaptiveLodCache.fragmentBudgetReached
-                ? "reps+fragments"
+                ? (session.adaptiveLodCache.blendedFragmentBudgetReached ? "reps+fragments+blended"
+                                                                          : "reps+fragments")
                 : session.adaptiveLodCache.representativeBudgetReached
                 ? "reps"
-                : session.adaptiveLodCache.fragmentBudgetReached ? "fragments" : "none";
+                : session.adaptiveLodCache.fragmentBudgetReached
+                ? (session.adaptiveLodCache.blendedFragmentBudgetReached ? "fragments+blended" : "fragments")
+                : session.adaptiveLodCache.blendedFragmentBudgetReached ? "blended" : "none";
         ImGui::Text(
             "Frontier: %s nodes | age %s frames | budget pressure: %s",
             FormatPointCount(session.adaptiveLodCache.visibleFrontierNodeCount).c_str(),
@@ -19321,6 +19540,19 @@ void DrawDiagnosticsWindow(
             ImGui::Text("UI render: %.3f ms", diagnostics.frameUiRenderMs);
             ImGui::Text("Fence wait: %.3f ms", diagnostics.frameFenceWaitMs);
             ImGui::Text("LOD traversal: %.3f ms", diagnostics.adaptiveLodTraversalMs);
+            ImGui::Text(
+                "GPU timestamps: %s (%s)",
+                diagnostics.gpuTimestampSupported ? "supported" : "unavailable",
+                diagnostics.gpuTimestampState.c_str());
+            ImGui::Text(
+                "GPU point passes: Fast Basic %.3f ms | Beauty depth %.3f ms | Beauty point %.3f ms",
+                diagnostics.gpuFastBasicPointPassMs,
+                diagnostics.gpuBeautyDepthPassMs,
+                diagnostics.gpuBeautyPointPassMs);
+            ImGui::Text(
+                "GPU composite/EDL: composite %.3f ms | post %.3f ms",
+                diagnostics.gpuCompositePassMs,
+                diagnostics.gpuPostProcessPassMs);
             ImGui::Text("Draw-item upload: %.3f ms", diagnostics.pointDrawItemUploadMs);
             ImGui::Text("Draw-item GPU idle/wait: %.3f ms", diagnostics.pointDrawItemWaitMs);
             ImGui::Text("Adaptive GPU idle waits: %u", diagnostics.adaptiveGpuIdleWaitCount);
@@ -19362,11 +19594,34 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveEstimatedFragments,
                     diagnostics.adaptiveFragmentBudget);
                 ImGui::Text(
-                    "Adaptive cost profile: %s | vertices %.0f | blended %.0f",
+                    "Adaptive cost profile: %s | vertices %.0f | blended %.0f / %.0f",
                     invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileName(
                         diagnostics.adaptiveRendererCostProfile),
                     diagnostics.adaptiveEstimatedVertexCost,
-                    diagnostics.adaptiveEstimatedBlendedFragments);
+                    diagnostics.adaptiveEstimatedBlendedFragments,
+                    diagnostics.adaptiveBlendedFragmentBudget);
+                ImGui::Text(
+                    "GPU governor: point %.3f ms / EWMA %.3f ms / target %.3f ms | scale %.2fx",
+                    diagnostics.adaptiveGovernorPointPassMs,
+                    diagnostics.adaptiveGovernorPointPassEwmaMs,
+                    diagnostics.adaptiveGovernorTargetPointPassMs,
+                    diagnostics.adaptiveGovernorBudgetScale);
+                ImGui::Text(
+                    "GPU composite/EDL: %.3f ms / EWMA %.3f ms | timestamps %s",
+                    diagnostics.adaptiveGovernorCompositeMs,
+                    diagnostics.adaptiveGovernorCompositeEwmaMs,
+                    diagnostics.adaptiveGovernorTimestampState.empty()
+                        ? diagnostics.gpuTimestampState.c_str()
+                        : diagnostics.adaptiveGovernorTimestampState.c_str());
+                ImGui::Text(
+                    "Governor limit: %s | upload %.2f MB | status %s",
+                    diagnostics.adaptiveGovernorActiveLimit.empty()
+                        ? "-"
+                        : diagnostics.adaptiveGovernorActiveLimit.c_str(),
+                    static_cast<double>(diagnostics.adaptiveGovernorUploadBudgetBytes) / (1024.0 * 1024.0),
+                    diagnostics.adaptiveGovernorStatus.empty()
+                        ? "-"
+                        : diagnostics.adaptiveGovernorStatus.c_str());
                 ImGui::Text(
                     "Adaptive compensation: radius %.2f-%.2fx | opacity %.2f-%.2fx | emission %.2f-%.2fx",
                     diagnostics.adaptiveMinRadiusScale,
@@ -19385,10 +19640,13 @@ void DrawDiagnosticsWindow(
                     FormatPointCount(diagnostics.adaptiveRepresentativeBudget).c_str());
                 const char* budgetPressure =
                     diagnostics.adaptiveRepresentativeBudgetReached && diagnostics.adaptiveFragmentBudgetReached
-                        ? "reps+fragments"
+                        ? (diagnostics.adaptiveBlendedFragmentBudgetReached ? "reps+fragments+blended"
+                                                                            : "reps+fragments")
                         : diagnostics.adaptiveRepresentativeBudgetReached
                         ? "reps"
-                        : diagnostics.adaptiveFragmentBudgetReached ? "fragments" : "none";
+                        : diagnostics.adaptiveFragmentBudgetReached
+                        ? (diagnostics.adaptiveBlendedFragmentBudgetReached ? "fragments+blended" : "fragments")
+                        : diagnostics.adaptiveBlendedFragmentBudgetReached ? "blended" : "none";
                 ImGui::Text(
                     "Adaptive frontier: %s nodes | cache age %s frames | budget pressure: %s",
                     FormatPointCount(diagnostics.adaptiveVisibleFrontierNodeCount).c_str(),
@@ -19849,6 +20107,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 const auto densityMode = SelectAdaptiveViewportDensityMode(
                     runtimeState,
                     viewport,
+                    effectiveStyle,
                     &session,
                     paintedAdaptivePointRenderer,
                     FastBasicPointRendererActive(runtimeState.projectSettings));
@@ -20092,6 +20351,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     double fastBasicMaxFrameMs = 0.0;
     double fastBasicMaxSceneUpdateMs = 0.0;
     double fastBasicMinFps = std::numeric_limits<double>::max();
+    bool fastBasicTimestampSupported = false;
+    bool fastBasicSawGpuTiming = false;
+    std::string fastBasicTimestampState;
+    double fastBasicMaxGpuPointPassMs = 0.0;
+    double fastBasicMaxGpuPointPassEwmaMs = 0.0;
+    double fastBasicMinGovernorBudgetScale = std::numeric_limits<double>::max();
+    double fastBasicMaxGovernorBudgetScale = 0.0;
+    std::uint32_t fastBasicPerformanceLimitedFrames = 0;
     std::uint64_t fastBasicStaleTraversals = 0;
     std::string fastBasicRuntimeStatus;
     std::string fastBasicFallbackState;
@@ -20144,6 +20411,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t transitions = 0;
         double transitionAgeMs = 0.0;
         bool idleRefinementPending = false;
+        double gpuPointPassMs = 0.0;
+        double gpuPointPassEwmaMs = 0.0;
+        double governorBudgetScale = 1.0;
         bool budgetExceeded = false;
         bool fullSourceFallback = false;
     };
@@ -20272,6 +20542,25 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         if (diagnostics.frameFps > 0.0) {
             fastBasicMinFps = std::min(fastBasicMinFps, diagnostics.frameFps);
         }
+        fastBasicTimestampSupported = fastBasicTimestampSupported || diagnostics.gpuTimestampSupported;
+        fastBasicSawGpuTiming = fastBasicSawGpuTiming || diagnostics.gpuFastBasicPointPassMs > 0.0;
+        if (!diagnostics.gpuTimestampState.empty()) {
+            fastBasicTimestampState = diagnostics.gpuTimestampState;
+        }
+        fastBasicMaxGpuPointPassMs = std::max(
+            fastBasicMaxGpuPointPassMs,
+            diagnostics.gpuFastBasicPointPassMs);
+        fastBasicMaxGpuPointPassEwmaMs = std::max(
+            fastBasicMaxGpuPointPassEwmaMs,
+            diagnostics.adaptiveGovernorPointPassEwmaMs);
+        fastBasicMinGovernorBudgetScale = std::min(
+            fastBasicMinGovernorBudgetScale,
+            diagnostics.adaptiveGovernorBudgetScale);
+        fastBasicMaxGovernorBudgetScale = std::max(
+            fastBasicMaxGovernorBudgetScale,
+            diagnostics.adaptiveGovernorBudgetScale);
+        fastBasicPerformanceLimitedFrames +=
+            diagnostics.adaptiveGovernorStatus == "performance-limited" ? 1U : 0U;
         fastBasicStaleTraversals = std::max(
             fastBasicStaleTraversals,
             diagnostics.adaptiveLodStaleTraversalDiscardedCount);
@@ -20339,6 +20628,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
              .transitions = diagnostics.adaptiveActiveTransitionCount,
              .transitionAgeMs = diagnostics.adaptiveMaxTransitionAgeMs,
              .idleRefinementPending = diagnostics.adaptiveIdleRefinementPending,
+             .gpuPointPassMs = diagnostics.gpuFastBasicPointPassMs,
+             .gpuPointPassEwmaMs = diagnostics.adaptiveGovernorPointPassEwmaMs,
+             .governorBudgetScale = diagnostics.adaptiveGovernorBudgetScale,
              .budgetExceeded =
                  (diagnostics.adaptiveRepresentativeBudget > 0 &&
                   diagnostics.adaptiveRepresentativeCount > diagnostics.adaptiveRepresentativeBudget) ||
@@ -20355,6 +20647,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     runtimeState.performanceInteraction.active = false;
     if (fastBasicMinFps == std::numeric_limits<double>::max()) {
         fastBasicMinFps = 0.0;
+    }
+    if (fastBasicMinGovernorBudgetScale == std::numeric_limits<double>::max()) {
+        fastBasicMinGovernorBudgetScale = 1.0;
     }
     runtimeState.sessions.front().adaptiveLodTransitionActive = false;
     runtimeState.sessions.front().adaptiveLodIdleRefinementPending = false;
@@ -20694,6 +20989,126 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         return 6;
     }
 
+    struct BeautyViewportStressMetrics {
+        bool timestampSupported = false;
+        bool sawGpuTiming = false;
+        bool exceededBudget = false;
+        bool submittedFullSource = false;
+        bool representativeBudgetReached = false;
+        bool fragmentBudgetReached = false;
+        bool blendedFragmentBudgetReached = false;
+        std::string timestampState;
+        std::string governorStatus;
+        double maxGpuPointPassMs = 0.0;
+        double maxGpuPointPassEwmaMs = 0.0;
+        double minGovernorBudgetScale = std::numeric_limits<double>::max();
+        double maxGovernorBudgetScale = 0.0;
+        double maxEstimatedFragments = 0.0;
+        double maxEstimatedBlendedFragments = 0.0;
+        double maxFragmentBudget = 0.0;
+        double maxBlendedFragmentBudget = 0.0;
+        std::uint64_t maxAdaptiveRepresentatives = 0;
+        std::uint32_t performanceLimitedFrames = 0;
+    };
+
+    auto runBeautyViewportStress = [&](PointCloudStyleState stressStyle, std::uint32_t frameCount) {
+        BeautyViewportStressMetrics stress;
+        auto& stressSession = runtimeState.sessions.front();
+        ClearAdaptiveLodRuntimeCache(&stressSession);
+        stressSession.pointStyle = std::move(stressStyle);
+        SanitizePointCloudStyle(&stressSession);
+        stressSession.adaptiveMovementDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality;
+        stressSession.adaptiveLodTransitionActive = false;
+        stressSession.adaptiveLodIdleRefinementPending = false;
+        stressSession.adaptiveLodTransitionDrawItems.reset();
+        runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
+        runtimeState.projectSettings.eyeDomeLightingEnabled = true;
+        runtimeState.performanceInteraction.active = true;
+        runtimeState.cameraInteraction.navigationActive = true;
+        viewport.SetSceneCachingEnabled(false);
+        viewport.SetLiveSceneRenderingEnabled(true);
+
+        for (std::uint32_t frame = 0; frame < frameCount; ++frame) {
+            window.PollEvents();
+            ++runtimeState.previewFrameCounter;
+            PollPointCloudLodWorkers(&runtimeState);
+            runtimeState.camera.Orbit(1.4F + static_cast<float>(frame % 3U), frame % 2U == 0U ? 0.6F : -0.4F);
+            if (frame % 24U == 0U) {
+                runtimeState.camera.Dolly(frame % 48U == 0U ? 0.35F : -0.35F);
+            }
+            viewport.BeginUiFrame();
+            const auto sceneUpdateStart = std::chrono::steady_clock::now();
+            const auto renderState = BuildRenderState(runtimeState, viewport, 0.0F);
+            const auto sceneUpdateEnd = std::chrono::steady_clock::now();
+            runtimeState.previewSceneUpdateMs = MillisecondsBetween(sceneUpdateStart, sceneUpdateEnd);
+            runtimeState.previewSceneUpdateFps =
+                runtimeState.previewSceneUpdateMs > 0.0 ? 1000.0 / runtimeState.previewSceneUpdateMs : 0.0;
+            viewport.UpdateRenderState(renderState);
+            viewport.DrawFrame();
+            PollPointCloudLodWorkers(&runtimeState);
+
+            const auto& diagnostics = viewport.Diagnostics();
+            stress.timestampSupported = stress.timestampSupported || diagnostics.gpuTimestampSupported;
+            stress.sawGpuTiming = stress.sawGpuTiming || diagnostics.gpuBeautyPointPassMs > 0.0;
+            if (!diagnostics.gpuTimestampState.empty()) {
+                stress.timestampState = diagnostics.gpuTimestampState;
+            }
+            if (!diagnostics.adaptiveGovernorStatus.empty()) {
+                stress.governorStatus = diagnostics.adaptiveGovernorStatus;
+            }
+            stress.maxGpuPointPassMs = std::max(stress.maxGpuPointPassMs, diagnostics.gpuBeautyPointPassMs);
+            stress.maxGpuPointPassEwmaMs =
+                std::max(stress.maxGpuPointPassEwmaMs, diagnostics.adaptiveGovernorPointPassEwmaMs);
+            stress.minGovernorBudgetScale =
+                std::min(stress.minGovernorBudgetScale, diagnostics.adaptiveGovernorBudgetScale);
+            stress.maxGovernorBudgetScale =
+                std::max(stress.maxGovernorBudgetScale, diagnostics.adaptiveGovernorBudgetScale);
+            stress.maxEstimatedFragments =
+                std::max(stress.maxEstimatedFragments, diagnostics.adaptiveEstimatedFragments);
+            stress.maxEstimatedBlendedFragments =
+                std::max(stress.maxEstimatedBlendedFragments, diagnostics.adaptiveEstimatedBlendedFragments);
+            stress.maxFragmentBudget = std::max(stress.maxFragmentBudget, diagnostics.adaptiveFragmentBudget);
+            stress.maxBlendedFragmentBudget =
+                std::max(stress.maxBlendedFragmentBudget, diagnostics.adaptiveBlendedFragmentBudget);
+            stress.maxAdaptiveRepresentatives =
+                std::max(stress.maxAdaptiveRepresentatives, diagnostics.adaptiveRepresentativeCount);
+            stress.representativeBudgetReached =
+                stress.representativeBudgetReached || diagnostics.adaptiveRepresentativeBudgetReached;
+            stress.fragmentBudgetReached =
+                stress.fragmentBudgetReached || diagnostics.adaptiveFragmentBudgetReached;
+            stress.blendedFragmentBudgetReached =
+                stress.blendedFragmentBudgetReached || diagnostics.adaptiveBlendedFragmentBudgetReached;
+            stress.performanceLimitedFrames +=
+                diagnostics.adaptiveGovernorStatus == "performance-limited" ? 1U : 0U;
+            stress.exceededBudget =
+                stress.exceededBudget ||
+                (diagnostics.adaptiveRepresentativeBudget > 0 &&
+                 diagnostics.adaptiveRepresentativeCount > diagnostics.adaptiveRepresentativeBudget) ||
+                (diagnostics.adaptiveFragmentBudget > 0.0 &&
+                 diagnostics.adaptiveEstimatedFragments > diagnostics.adaptiveFragmentBudget + 0.5) ||
+                (diagnostics.adaptiveBlendedFragmentBudget > 0.0 &&
+                 diagnostics.adaptiveEstimatedBlendedFragments > diagnostics.adaptiveBlendedFragmentBudget + 0.5);
+            stress.submittedFullSource =
+                stress.submittedFullSource ||
+                (diagnostics.pointSubmittedCount >= runtimeState.sessions.front().totalPrimitives &&
+                 runtimeState.sessions.front().totalPrimitives > 0);
+        }
+        runtimeState.performanceInteraction.active = false;
+        runtimeState.cameraInteraction.navigationActive = false;
+        if (stress.minGovernorBudgetScale == std::numeric_limits<double>::max()) {
+            stress.minGovernorBudgetScale = 1.0;
+        }
+        return stress;
+    };
+
+    auto beautyStressStyle = makeBaseBeautyStyle();
+    beautyStressStyle.falloffProfile = PointCloudFalloffProfile::Gaussian;
+    beautyStressStyle.solidCenters = false;
+    invisible_places::style::SetScalarConstant(&beautyStressStyle.pointSize, 15.0F);
+    invisible_places::style::SetScalarConstant(&beautyStressStyle.opacity, 0.42F);
+    const auto beautyStress = runBeautyViewportStress(beautyStressStyle, 120U);
+    runtimeState.sessions.front().pointStyle = originalBeautyStyle;
+
     const auto& primaryBeautyResult = beautyResults.front();
     const auto& fullPath = primaryBeautyResult.fullPath;
     const auto& adaptivePath = primaryBeautyResult.adaptivePath;
@@ -20714,6 +21129,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::ofstream trace{fastBasicTracePath, std::ios::trunc};
         trace << "frame,moving,representatives,represented_source,representative_delta,promoted_nodes,"
                  "demoted_nodes,hysteresis_kept_nodes,transitions,transition_age_ms,idle_refinement_pending,"
+                 "gpu_point_pass_ms,gpu_point_pass_ewma_ms,governor_budget_scale,"
                  "budget_exceeded,full_source_fallback,render_representatives,render_transitions,"
                  "session_transition_active,session_transition_apply_count,displayed_generation,cache_generation,"
                  "displayed_coarse_fallback,cache_coarse_fallback\n";
@@ -20729,6 +21145,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                   << row.transitions << ','
                   << row.transitionAgeMs << ','
                   << (row.idleRefinementPending ? "true" : "false") << ','
+                  << row.gpuPointPassMs << ','
+                  << row.gpuPointPassEwmaMs << ','
+                  << row.governorBudgetScale << ','
                   << (row.budgetExceeded ? "true" : "false") << ','
                   << (row.fullSourceFallback ? "true" : "false") << ','
                   << row.renderRepresentatives << ','
@@ -20835,6 +21254,39 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         metrics << "  ],\n"
                 << "  \"world_surfels_skipped_no_normals\": "
                 << (worldSurfelsSkippedNoNormals ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_timestamp_supported\": "
+                << (beautyStress.timestampSupported ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_timestamp_state\": \"" << beautyStress.timestampState << "\",\n"
+                << "  \"beauty_stress_saw_gpu_timing\": "
+                << (beautyStress.sawGpuTiming ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_max_gpu_point_pass_ms\": " << beautyStress.maxGpuPointPassMs << ",\n"
+                << "  \"beauty_stress_max_gpu_point_pass_ewma_ms\": " << beautyStress.maxGpuPointPassEwmaMs << ",\n"
+                << "  \"beauty_stress_min_governor_budget_scale\": "
+                << beautyStress.minGovernorBudgetScale << ",\n"
+                << "  \"beauty_stress_max_governor_budget_scale\": "
+                << beautyStress.maxGovernorBudgetScale << ",\n"
+                << "  \"beauty_stress_governor_status\": \"" << beautyStress.governorStatus << "\",\n"
+                << "  \"beauty_stress_performance_limited_frames\": "
+                << beautyStress.performanceLimitedFrames << ",\n"
+                << "  \"beauty_stress_representative_budget_reached\": "
+                << (beautyStress.representativeBudgetReached ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_fragment_budget_reached\": "
+                << (beautyStress.fragmentBudgetReached ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_blended_fragment_budget_reached\": "
+                << (beautyStress.blendedFragmentBudgetReached ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_max_adaptive_representatives\": "
+                << beautyStress.maxAdaptiveRepresentatives << ",\n"
+                << "  \"beauty_stress_max_estimated_fragments\": "
+                << beautyStress.maxEstimatedFragments << ",\n"
+                << "  \"beauty_stress_max_estimated_blended_fragments\": "
+                << beautyStress.maxEstimatedBlendedFragments << ",\n"
+                << "  \"beauty_stress_fragment_budget\": " << beautyStress.maxFragmentBudget << ",\n"
+                << "  \"beauty_stress_blended_fragment_budget\": "
+                << beautyStress.maxBlendedFragmentBudget << ",\n"
+                << "  \"beauty_stress_exceeded_budget\": "
+                << (beautyStress.exceededBudget ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_submitted_full_source\": "
+                << (beautyStress.submittedFullSource ? "true" : "false") << ",\n"
                 << "  \"fast_basic_viewport_frames\": " << kFastBasicDiagnosticFrames << ",\n"
                 << "  \"fast_basic_max_submitted_points\": " << fastBasicMaxSubmittedPoints << ",\n"
                 << "  \"fast_basic_max_pass_submitted_points\": " << fastBasicMaxPassSubmittedPoints << ",\n"
@@ -20876,6 +21328,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"fast_basic_max_frame_ms\": " << fastBasicMaxFrameMs << ",\n"
                 << "  \"fast_basic_min_fps\": " << fastBasicMinFps << ",\n"
                 << "  \"fast_basic_max_scene_update_ms\": " << fastBasicMaxSceneUpdateMs << ",\n"
+                << "  \"fast_basic_timestamp_supported\": "
+                << (fastBasicTimestampSupported ? "true" : "false") << ",\n"
+                << "  \"fast_basic_timestamp_state\": \"" << fastBasicTimestampState << "\",\n"
+                << "  \"fast_basic_saw_gpu_timing\": "
+                << (fastBasicSawGpuTiming ? "true" : "false") << ",\n"
+                << "  \"fast_basic_max_gpu_point_pass_ms\": " << fastBasicMaxGpuPointPassMs << ",\n"
+                << "  \"fast_basic_max_gpu_point_pass_ewma_ms\": " << fastBasicMaxGpuPointPassEwmaMs << ",\n"
+                << "  \"fast_basic_min_governor_budget_scale\": " << fastBasicMinGovernorBudgetScale << ",\n"
+                << "  \"fast_basic_max_governor_budget_scale\": " << fastBasicMaxGovernorBudgetScale << ",\n"
+                << "  \"fast_basic_performance_limited_frames\": " << fastBasicPerformanceLimitedFrames << ",\n"
                 << "  \"fast_basic_saw_adaptive_draw_items\": "
                 << (fastBasicSawAdaptiveDrawItems ? "true" : "false") << ",\n"
                 << "  \"fast_basic_saw_previous_set\": "
@@ -20924,6 +21386,20 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << (adaptiveClassCounts[3] + adaptiveClassCounts[4] + adaptiveClassCounts[5]) << "/"
               << adaptiveClassCounts[2] << "/"
               << adaptiveClassCounts[6] << "\n"
+              << "Beauty stress: timestamp "
+              << (beautyStress.timestampSupported ? "supported" : "unavailable")
+              << " (" << beautyStress.timestampState << ")"
+              << " | max GPU point pass " << beautyStress.maxGpuPointPassMs
+              << " ms | EWMA " << beautyStress.maxGpuPointPassEwmaMs
+              << " ms | budget scale " << beautyStress.minGovernorBudgetScale
+              << "-" << beautyStress.maxGovernorBudgetScale
+              << " | status " << beautyStress.governorStatus
+              << " | budget reached reps/fragments/blended: "
+              << (beautyStress.representativeBudgetReached ? "yes" : "no") << "/"
+              << (beautyStress.fragmentBudgetReached ? "yes" : "no") << "/"
+              << (beautyStress.blendedFragmentBudgetReached ? "yes" : "no")
+              << " | full-source fallback: " << (beautyStress.submittedFullSource ? "yes" : "no")
+              << " | budget exceeded: " << (beautyStress.exceededBudget ? "yes" : "no") << "\n"
               << "Fast Basic exact CPU feature reps colour/scalar/normal/accent: "
               << fastBasicExactClassCounts[1] << "/"
               << (fastBasicExactClassCounts[3] + fastBasicExactClassCounts[4] + fastBasicExactClassCounts[5]) << "/"

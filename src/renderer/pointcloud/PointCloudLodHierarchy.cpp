@@ -1872,9 +1872,12 @@ float DefaultFragmentBudget(const PointCloudLodTraversalParams& params) {
 struct TraversalBudgetState {
     std::uint32_t maxRepresentatives = 0;
     float maxEstimatedFragments = 0.0F;
+    float maxEstimatedBlendedFragments = 0.0F;
     float emittedEstimatedFragments = 0.0F;
+    float emittedEstimatedBlendedFragments = 0.0F;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
+    bool blendedFragmentBudgetReached = false;
 
     [[nodiscard]] bool CanEmitMore(const std::vector<PointCloudDrawItemGpu>& drawItems) const {
         return maxRepresentatives == 0 || drawItems.size() < maxRepresentatives;
@@ -1882,17 +1885,28 @@ struct TraversalBudgetState {
 
     bool CanEmitCost(
         const std::vector<PointCloudDrawItemGpu>& drawItems,
-        float estimatedFragmentCost,
+        const RepresentativeCostEstimate& cost,
         bool allowFragmentOverBudgetForCoverage) {
         if (!CanEmitMore(drawItems)) {
             representativeBudgetReached = true;
             return false;
         }
-        if (maxEstimatedFragments <= 0.0F || drawItems.empty()) {
+        if (drawItems.empty()) {
             return true;
         }
-        if (emittedEstimatedFragments + estimatedFragmentCost > maxEstimatedFragments) {
+        const bool overFragmentBudget =
+            maxEstimatedFragments > 0.0F &&
+            emittedEstimatedFragments + cost.fragmentCost > maxEstimatedFragments;
+        const bool overBlendedFragmentBudget =
+            maxEstimatedBlendedFragments > 0.0F &&
+            emittedEstimatedBlendedFragments + cost.blendedFragmentCost > maxEstimatedBlendedFragments;
+        if (overFragmentBudget) {
             fragmentBudgetReached = true;
+        }
+        if (overBlendedFragmentBudget) {
+            blendedFragmentBudgetReached = true;
+        }
+        if (overFragmentBudget || overBlendedFragmentBudget) {
             return allowFragmentOverBudgetForCoverage;
         }
         return true;
@@ -2545,7 +2559,7 @@ void EmitRepresentatives(
         const auto cost = EstimateRepresentativeCost(params, footprint);
         const bool preserveBeautyCoverage =
             IsBeautyCostProfile(params.rendererCostProfile) && emittedForNode == 0U;
-        if (!budget->CanEmitCost(*drawItems, cost.fragmentCost, preserveBeautyCoverage)) {
+        if (!budget->CanEmitCost(*drawItems, cost, preserveBeautyCoverage)) {
             return false;
         }
         const auto compensation = RepresentativeAreaCompensation(
@@ -2573,6 +2587,7 @@ void EmitRepresentatives(
         AccumulateRepresentativeClassCounts(diagnostics, representative.representativeClassFlags);
         AccumulateRepresentativeCostDiagnostics(diagnostics, footprint, compensation, cost);
         budget->emittedEstimatedFragments += cost.fragmentCost;
+        budget->emittedEstimatedBlendedFragments += cost.blendedFragmentCost;
         ++emittedForNode;
         return true;
     };
@@ -2949,6 +2964,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
         .maxEstimatedFragments = params.maxEstimatedFragments > 0.0F
                                      ? params.maxEstimatedFragments
                                      : DefaultFragmentBudget(params),
+        .maxEstimatedBlendedFragments = params.maxEstimatedBlendedFragments,
     };
 
     if (invisible_places::output::PointCloudExportDensityModeUsesFullSource(params.densityMode)) {
@@ -2974,6 +2990,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
                 budget.representativeBudgetReached ||
                 (budget.maxRepresentatives > 0U && drawItems.size() >= budget.maxRepresentatives);
             diagnostics->fragmentBudgetReached = budget.fragmentBudgetReached;
+            diagnostics->blendedFragmentBudgetReached = budget.blendedFragmentBudgetReached;
         }
         return drawItems;
     }
@@ -2998,6 +3015,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
     TraversalBudgetState emitBudget{
         .maxRepresentatives = budget.maxRepresentatives,
         .maxEstimatedFragments = budget.maxEstimatedFragments,
+        .maxEstimatedBlendedFragments = budget.maxEstimatedBlendedFragments,
     };
     std::vector<FrontierEmissionAllocation> allocations;
     AllocateAdaptiveFrontierRepresentatives(
@@ -3038,6 +3056,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
             emitBudget.representativeBudgetReached ||
             (emitBudget.maxRepresentatives > 0U && drawItems.size() >= emitBudget.maxRepresentatives);
         diagnostics->fragmentBudgetReached = emitBudget.fragmentBudgetReached;
+        diagnostics->blendedFragmentBudgetReached = emitBudget.blendedFragmentBudgetReached;
     }
     return drawItems;
 }
@@ -3108,6 +3127,7 @@ std::vector<PointCloudDrawItemGpu> BuildCoarsePointCloudLodFallbackDrawItems(
     TraversalBudgetState budget{
         .maxRepresentatives = 0,
         .maxEstimatedFragments = 0.0F,
+        .maxEstimatedBlendedFragments = 0.0F,
     };
     drawItems.reserve(estimatedRepresentatives);
     for (const auto nodeIndex : frontier) {

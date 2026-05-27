@@ -9,11 +9,12 @@ this audit.
 
 ## Current Build Status
 
-The current worktree builds with the Stage 05 Beauty adaptive LOD quality path:
+The current worktree builds with the Stage 06 measured GPU timing governor:
 hierarchy cache v4, visual node statistics, class-aware representatives,
 per-node scalar stats, CPU traversal feature triggers, Beauty optical-depth
-compensation, and renderer-aware cost profiles. GPU compute selection remains a
-later-stage item.
+compensation, renderer-aware cost profiles, Vulkan timestamp diagnostics, and
+EWMA-governed adaptive budgets. GPU compute selection remains a later-stage
+item.
 
 Fresh runtime/performance reports now include the HUD/diagnostics values
 described below so sparse, stale, or feature-erasing adaptive output can be
@@ -95,6 +96,18 @@ sample-count cap anymore.
   cost profile, radius/opacity/emission scale ranges, estimated
   vertices/fragments/blended fragments, and opacity/emission/performance clamp
   status.
+- The viewport checks Vulkan timestamp support from `timestampPeriod` and
+  graphics-queue `timestampValidBits`, creates per-frame query pools, writes
+  timestamp pairs around Fast Basic point, Beauty depth, Beauty accumulation,
+  composite, and postprocess/EDL passes, and reads previous-frame results
+  without `WAIT_BIT`.
+- Adaptive quality no longer uses scene/present FPS thresholds. A pure
+  `PointCloudPerformanceGovernor` holds separate EWMA and budget-scale state
+  for Fast Basic, Beauty screen sprites, Beauty world-mm sprites, and Beauty
+  world surfels. It scales representative, fragment, blended-fragment,
+  target-spacing, and draw-item upload-byte budgets gradually, holds cached
+  frames, and reports explicit `visually lossless`, `performance-limited`, or
+  conservative timestamp fallback status.
 - PLY load progress reports points read, payload bytes read, elapsed time, and
   ETA when enough samples exist.
 - LOD hierarchy/cache rebuild progress reports elapsed time, approximate ETA,
@@ -113,8 +126,9 @@ sample-count cap anymore.
   exact Fast Basic CPU representative class counts, viewport Fast Basic
   boundedness/smoothness metrics, Beauty matrix renderer profiles,
   radius/opacity/emission ranges, estimated vertex/fragment/blended-fragment
-  costs, clamp flags, and colour, scalar, normal, and emissive/accent
-  feature-triggered refinement counts.
+  costs, clamp flags, raw/EWMA GPU point-pass timings, governor budget scale,
+  timestamp support/fallback state, Beauty stress metrics, and colour, scalar,
+  normal, and emissive/accent feature-triggered refinement counts.
 - Stage 05 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports exact
   Adaptive HQ Beauty matrix output with no fallback. Matrix luminance ratios:
   small opaque 0.805370, large translucent Gaussian 0.831266,
@@ -137,6 +151,26 @@ sample-count cap anymore.
   representative delta 5,640, 22 transition-active frames, 0 large
   representative-jump frames, 0 budget-exceeded frames, 0 full-source fallback
   frames, and `fast_basic_zoom_out_updated=true`.
+- Stage 06 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports
+  Vulkan timestamps supported with `valid previous frame` state. Fast Basic
+  reached max GPU point pass 1.02421 ms, EWMA 0.0213727 ms, governor scale 1,
+  max submitted 262,115 under a 4,823,449 representative budget, max estimated
+  fragments 956,657 under a 915,702,000 fragment budget, 0 performance-limited
+  frames, 0 large representative-jump frames, no budget exceedance, and no
+  full-source fallback. The Beauty stress pass reached max GPU point pass
+  1.14775 ms, EWMA 0.482701 ms, governor scale 1, max estimated blended
+  fragments 46,212,000 under a 152,617,000 blended budget, no budget
+  reached/exceeded state, and no full-source fallback.
+- Stage 06 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` also reports
+  Vulkan timestamps supported with `valid previous frame` state. Fast Basic
+  reached max GPU point pass 0.16225 ms, EWMA 0.0172543 ms, governor scale 1,
+  max submitted 262,132 under a 4,823,449 representative budget, max estimated
+  fragments 1,108,920 under a 915,702,000 fragment budget, 0
+  performance-limited frames, 0 large representative-jump frames, no budget
+  exceedance, and no full-source fallback. Beauty stress reached max GPU point
+  pass 0.934542 ms, EWMA 0.13772 ms, governor scale 1, max estimated blended
+  fragments 46,213,100 under a 152,617,000 blended budget, no budget
+  reached/exceeded state, and no full-source fallback.
 
 ## Partially Implemented
 
@@ -154,9 +188,6 @@ These pieces exist, but they are not yet the ideal system described in
   returns.
 - Traversal is CPU-only. There is no GPU compute culling, compaction, indirect
   draw generation, or GPU-driven visible-chunk selection.
-- Quality demotion/promotion uses scene update FPS and frame/present FPS, not
-  measured GPU point-pass timings. It can react to UI/present behavior rather
-  than the actual expensive point/surfel passes.
 - Manual sampled point budgets still exist and are uploaded as sampled index
   buffers. The adaptive path treats them mostly as a debug/loading cap, but the
   UI still exposes a generic `Budget` control that can be confused with LOD.
@@ -165,12 +196,13 @@ These pieces exist, but they are not yet the ideal system described in
   `lodBlend`, parent/child crossfade, and feature-preserving palettes.
 - Pixel screen sprites, world-mm screen sprites, world surfels, and
   camera-facing world sprites now have separate CPU selection and cost tuning,
-  but they still do not have independent authorable policies or GPU timing
-  feedback.
+  plus measured GPU timing profiles, but they still do not have independent
+  authorable policies.
 - The LOD comparison metrics now report coverage, mean luminance, feature class
-  counts, feature-triggered refinement counts, and a Fast Basic transition
-  trace, but not image error maps, timing breakdowns, peak memory, upload
-  bandwidth, or per-render-pass GPU time.
+  counts, feature-triggered refinement counts, raw/EWMA GPU point-pass timing,
+  governor state, Beauty stress timing, and a Fast Basic transition trace, but
+  not image error maps, peak memory, upload bandwidth, upload timing, or tile
+  overdraw budgets.
 - The 100M `--lod-compare` path proves bounded replacement and deterministic
   trace metrics, but it does not automatically prove final exact idle
   refinement completion. The current 500-frame harness still ends with async
@@ -192,9 +224,9 @@ These are still target-system items from the ideal plan.
   large-cloud path.
 - Beauty-specific parent/child opacity crossfade transition policy.
 - Dedicated LOD style data block with explicit compensation/footprint policy.
-- Vulkan timestamp queries for point pass, depth prepass, accumulation,
-  EDL/composite, upload, and render-state submission.
-- EWMA performance governor driven by measured GPU point-pass time.
+- Upload and render-state submission timestamp diagnostics; point/depth/
+  accumulation/composite/postprocess GPU timing is implemented for viewport
+  diagnostics.
 - Tile overdraw estimates and per-tile fragment/blended-fragment budgets.
 - Conservative occlusion culling, depth proxy, or Hi-Z pyramid.
 - GPU compute traversal/culling/compaction and indirect draw submission.
@@ -213,11 +245,11 @@ Investigate these before adding more ideal-plan features.
   draw-item requirements.
 - Async traversal discards stale completions now, but new camera/style keys can
   still spend visible time in coarse fallback while replacement work finishes.
-- The quality controller reacts to scene/present FPS instead of GPU pass time,
-  so it may demote too late, promote too early, or miss point-pass bottlenecks
-  hidden by cached presentation.
+- The quality controller now reacts to measured GPU point-pass time, but upload
+  stalls and tile-local overdraw are still only inferred through draw-item byte
+  and global fragment/blended-fragment budgets.
 - Current projected spacing now uses stored node spacing and feature statistics,
-  but there is still no tile-pressure model or measured GPU point-pass feedback.
+  but there is still no tile-pressure model.
 - All source positions are still uploaded and retained in several forms:
   `LoadedPointCloud`, `cpuPositions`, vertex position buffer, storage position
   buffer, color buffer, normal buffer, scalar buffer, and hierarchy data. Large
@@ -327,16 +359,19 @@ Metrics to watch:
 - visible popping while moving slowly
 - scalar/water/normal/source-color correctness in adaptive mode
 
-### 4. Add Measured Governor
+### 4. Extend Measured Governor
 
-Replace FPS guessing with measured pass timing.
+Stage 06 replaced FPS guessing with measured pass timing for viewport point
+passes. Keep this section for the remaining timing and policy follow-up work.
 
-- Add Vulkan timestamp queries for point pass, depth prepass, accumulation,
-  EDL/composite, and upload/submission where practical.
-- Track EWMA timings per renderer mode and geometry mode.
-- Drive adaptive density and fragment budgets from point-pass GPU ms, not
-  present FPS alone.
-- Surface an explicit `performance-limited` status when interactive quality
+- Add direct upload/submission timing where practical; Stage 06 currently
+  governs draw-item upload bytes from point-pass timing rather than measured
+  upload stalls.
+- Add tile/overdraw budget diagnostics if Beauty styles need more local
+  pressure control than the current global fragment/blended-fragment budgets.
+- Keep exercising over-target hardware/views so the clamped budget-scale path
+  is validated by runtime stress as well as focused governor tests.
+- Preserve the explicit `performance-limited` status when interactive quality
   floors cannot be maintained.
 
 Metrics to watch:
