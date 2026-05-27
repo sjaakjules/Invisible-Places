@@ -9,12 +9,14 @@ this audit.
 
 ## Current Build Status
 
-The current worktree builds with the Stage 06 measured GPU timing governor:
+The current worktree builds with the Stage 07 progressive `.ipcloud` cache path:
 hierarchy cache v4, visual node statistics, class-aware representatives,
 per-node scalar stats, CPU traversal feature triggers, Beauty optical-depth
-compensation, renderer-aware cost profiles, Vulkan timestamp diagnostics, and
-EWMA-governed adaptive budgets. GPU compute selection remains a later-stage
-item.
+compensation, renderer-aware cost profiles, Vulkan timestamp diagnostics,
+EWMA-governed adaptive budgets, and a `.ipcloud` v1 representative-preview
+bundle that can render coarse point-cloud data before full source load/build
+work completes. GPU compute selection and full raw-chunk residency remain
+later-stage items.
 
 Fresh runtime/performance reports now include the HUD/diagnostics values
 described below so sparse, stale, or feature-erasing adaptive output can be
@@ -39,6 +41,24 @@ sample-count cap anymore.
   canonicalized before cache hashing, so relative and absolute references reuse
   the same v4 cache.
 - Hierarchy cache writes go through a temporary file and publish by rename.
+- A second additive `.ipcloud` v1 cache bundle exists under
+  `Saved/PointCloudCache/<stem>.<fingerprint>.ipcloud/` with `manifest.json`,
+  `attribute_schema.bin`, `hierarchy.bin`, `node_pages.bin`, `node_stats.bin`,
+  `lod_representatives.bin`, `scalar_stats.bin`, `raw_chunks/`,
+  `build_status.json`, and `build_log.txt`.
+- `.ipcloud` validation fingerprints canonical source path hash, source size,
+  nanosecond mtime, PLY header hash, sampled payload hash, point/scalar counts,
+  RGB/normals presence, LOD build settings version, and attribute schema
+  version. Inspections report explicit missing, hit, stale, partial, and corrupt
+  states with reason strings.
+- `.ipcloud` publish writes into `<bundle>.tmp`, records build phases in
+  `build_status.json`, validates all required files, then publishes by directory
+  rename. Temporary bundles are ignored as complete caches; partial bundles can
+  drive resume/restart decisions.
+- Legacy v4 single-file hierarchy caches remain non-destructive fallback assets
+  after full source load. They are not counted as `.ipcloud` warm caches because
+  they lack the representative attribute payload needed for pre-full-load
+  preview.
 - v4 hierarchy nodes store spacing, density, colour variance/contrast, normal
   variance, scalar range/variance hints, emissive/accent hints, and feature
   flags derived from the full `LoadedPointCloud`.
@@ -117,6 +137,18 @@ sample-count cap anymore.
   movement quality tier, cache filename/size, hierarchy source/node/rep counts,
   runtime cache hit/miss, async state, and whether the displayed adaptive buffer
   is exact or coarse fallback.
+- The status HUD, LOD debug panel, and `--lod-cache-check` expose `.ipcloud`
+  cache state/reason, load phase, build phase, publish/resume status,
+  preview/full mode, representative preview count, represented source count,
+  time to bounds/placeholder, time to first coarse frame, and time to first
+  refined frame.
+- Cold point-cloud loads can parse header/schema, upload a remapped
+  representative preview `LoadedPointCloud`, render that preview through the
+  existing viewport upload path, and then replace it with the full source cloud
+  and exact adaptive hierarchy when ready. Warm `.ipcloud` loads validate
+  `manifest.json`, load representative payload first, upload a dense preview,
+  and hand off to the existing adaptive renderer without changing the 32-byte
+  `PointCloudDrawItemGpu` ABI.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
   `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
   It now renders a repeatable Beauty matrix covering small opaque sprites,
@@ -171,18 +203,34 @@ sample-count cap anymore.
   pass 0.934542 ms, EWMA 0.13772 ms, governor scale 1, max estimated blended
   fragments 46,213,100 under a 152,617,000 blended budget, no budget
   reached/exceeded state, and no full-source fallback.
+- Stage 07 cache evidence on `Data/Site3-Sample-Terrestrial.ply` reports cold
+  cache `missing`, 65,536 source-sampled preview representatives covering
+  12,183,742 source points, time to bounds/coarse frame 2,663.56 ms, full source
+  load 6,078.93 ms, hierarchy build 82,512.1 ms, time to first refined frame
+  91,254.6 ms, `.ipcloud` publish 717.66 ms, warm cache `hit`, warm time to
+  first coarse frame 304.21 ms, and a synthetic interrupted `.tmp` bundle marked
+  resumable with `raw_chunks_completed=1/4`. The run wrote
+  `Saved/diagnostics/lod_cache/lod_cache_metrics.json`.
+- Stage 07 renderer evidence after the cache changes kept the existing adaptive
+  path intact on the sample: coverage ratio 1, luminance ratio 0.802810,
+  1,564,580 Adaptive HQ representatives covering 12,183,742 source points,
+  Fast Basic max submitted 2,880,233 under a 4,823,449 representative budget,
+  max estimated fragments 4,681,200 under a 915,702,000 fragment budget, no
+  budget exceedance, and no full-source fallback.
 
 ## Partially Implemented
 
 These pieces exist, but they are not yet the ideal system described in
 `point_cloud_adaptive_lod_fast_beauty.md`.
 
-- The persistent cache stores hierarchy nodes, representatives, and scalar
-  stats. It does not store a `.ipcloud` manifest, raw chunks, attribute schema,
-  node pages, resumable build status, or source-data chunks.
-- Loading still parses and uploads the full PLY source before adaptive rendering
-  can be useful. There is no progressive first-load path that displays coarse
-  representatives before full parse/upload completes.
+- Stage 07 `.ipcloud` `raw_chunks/` files are validated source-range metadata
+  rather than full independently streamable attribute chunks. Stage 08 must turn
+  those ranges into real raw chunk residency, memory mapping, upload scheduling,
+  and LRU behavior.
+- Warm `.ipcloud` loading currently accelerates representative preview display.
+  The exact full hierarchy handoff still relies on the existing full
+  `LoadedPointCloud` path and v4 hierarchy cache/build path once source load is
+  complete.
 - Hierarchy build is asynchronous and reports progress, but the build itself is
   still monolithic and not cancellable until `BuildPointCloudLodHierarchy(...)`
   returns.
@@ -213,12 +261,9 @@ These pieces exist, but they are not yet the ideal system described in
 
 These are still target-system items from the ideal plan.
 
-- `.ipcloud` cache bundle with manifest, source fingerprint, attribute schema,
-  hierarchy pages, raw chunks, LOD representatives, scalar stats, build status,
-  and build log.
-- Raw chunk streaming and visible-chunk residency.
-- Progressive cache build that renders coarse upper hierarchy data while lower
-  levels are still building.
+- Raw chunk streaming and visible-chunk residency from `.ipcloud` bundles.
+- Direct exact-hierarchy attach from `.ipcloud` without first assembling the
+  full source cloud.
 - Memory-mapped source chunks and CPU/GPU LRU caches.
 - Device-local static point/chunk buffers with staging uploads as the normal
   large-cloud path.
@@ -230,8 +275,7 @@ These are still target-system items from the ideal plan.
 - Tile overdraw estimates and per-tile fragment/blended-fragment budgets.
 - Conservative occlusion culling, depth proxy, or Hi-Z pyramid.
 - GPU compute traversal/culling/compaction and indirect draw submission.
-- Runtime metrics for cache hit load time, time to first coarse frame, peak
-  resident memory, and tile budget pressure.
+- Runtime metrics for peak resident memory and tile budget pressure.
 
 ## Likely Lag Sources
 
@@ -385,21 +429,24 @@ Metrics to watch:
 
 ### 5. Move Toward Ideal Cache And Streaming
 
-Only start the `.ipcloud` cache after the current hierarchy path is stable and
-measured.
+Stage 07 started the `.ipcloud` cache after the hierarchy path was stable and
+measured. Keep this section as the Stage 08 streaming checklist.
 
-- Add a manifest/chunk cache bundle beside or replacing the current single
-  hierarchy cache.
-- Store directly streamable raw chunks and upper LOD data.
-- Render upper hierarchy data first, then stream visible chunks and deeper LOD.
-- Track cache-hit load time, time to first coarse frame, upload bytes per frame,
-  and peak resident memory.
+- Preserve the additive `.ipcloud` bundle beside the v4 single-file hierarchy
+  cache until full streaming has its own validation evidence.
+- Replace Stage 07 raw range metadata with directly streamable raw attribute
+  chunks and visible-chunk residency.
+- Attach exact hierarchy/page data directly from `.ipcloud` when possible,
+  while keeping representative preview first.
+- Track upload bytes per frame, warm-cache exact handoff time, and peak resident
+  memory before and after chunking.
 
 Metrics to watch:
 
 - first launch build time
 - second launch time to first coarse frame
 - cache hit/miss/stale reason
+- publish/resume status
 - visible chunk hit rate
 - upload bytes per frame
 - peak memory before and after chunking
@@ -430,6 +477,7 @@ Use these commands and outputs when validating LOD work:
 cmake --build --preset build-macos-debug
 ./build/macos-debug/invisible_places_tests "[pointcloud][lod]"
 ctest --test-dir build/macos-debug --output-on-failure
+build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places --lod-cache-check <cloud>
 build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places --lod-compare <cloud>
 ```
 
@@ -437,6 +485,7 @@ Inspect:
 
 ```text
 Saved/diagnostics/lod_compare/lod_compare_metrics.json
+Saved/diagnostics/lod_cache/lod_cache_metrics.json
 ```
 
 Initial quality targets:
@@ -455,6 +504,10 @@ Initial quality targets:
   feature-triggered refinement counts.
 - Scalar, water-effect, normal, source-color, depth, and AOV lookups must remain
   source-correct through `drawItem.sourcePointIndex`.
+- `.ipcloud` checks should report explicit cold/warm cache state and reason,
+  representative preview count, time to first coarse frame, publish status, and
+  interrupted/resume decision. A legacy v4 hierarchy cache alone should not be
+  reported as a `.ipcloud` warm hit.
 - Stage 03 manual acceptance for the 100M Fast Basic path: slow orbit has no
   popping/flicker/stochastic crawl; slow dolly through thresholds shows gradual
   parent/child replacement; fast navigation then stop refines over multiple

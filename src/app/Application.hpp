@@ -10,6 +10,7 @@ class Application {
 
     int Run() const;
     int RunLodComparison(std::filesystem::path pointCloudPath = {}) const;
+    int RunLodCacheCheck(std::filesystem::path pointCloudPath = {}) const;
     static std::filesystem::path DefaultDataDirectory();
 
   private:

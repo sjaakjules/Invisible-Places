@@ -22,6 +22,7 @@
 #include "renderer/core/VulkanViewportShell.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
+#include "renderer/pointcloud/PointCloudIpcloudCache.hpp"
 #include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPerformanceGovernor.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
@@ -652,8 +653,20 @@ struct PreviewLayerSession {
     std::jthread pointLodBuildWorker;
     invisible_places::renderer::pointcloud::PointCloudLodCacheSource pointLodCacheSource{};
     std::filesystem::path pointLodCachePath;
+    std::filesystem::path pointIpcloudBundlePath;
     invisible_places::renderer::pointcloud::PointCloudLodBuildConfig pointLodBuildConfig{};
     std::string pointLodCacheStatus = "LOD cache unavailable";
+    std::string pointIpcloudLoadPhase = "not started";
+    std::string pointIpcloudBuildPhase = "not started";
+    std::string pointIpcloudPublishStatus = "not published";
+    bool pointCloudPreviewActive = false;
+    bool pointCloudPreviewFromPersistentCache = false;
+    std::uint64_t pointIpcloudPreviewPointCount = 0;
+    std::uint64_t pointIpcloudRepresentedSourceCount = 0;
+    double pointIpcloudTimeToBoundsMs = 0.0;
+    double pointIpcloudTimeToFirstCoarseFrameMs = 0.0;
+    double pointIpcloudTimeToFirstRefinedFrameMs = 0.0;
+    std::chrono::steady_clock::time_point pointIpcloudLoadStartedAt{};
     std::string adaptiveLodRuntimeStatus = "runtime cache empty";
     bool rebuildPointLodCacheOnLoad = false;
     PointCloudExportDensityMode adaptiveLodRequestedDensityMode =
@@ -757,6 +770,7 @@ struct PointCloudLodBuildProgressSnapshot {
 struct BackgroundLayerLoadState {
     std::mutex mutex;
     std::optional<LayerLoadResult> result;
+    std::optional<invisible_places::renderer::pointcloud::PointCloudIpcloudPreview> pointCloudPreview;
     std::optional<PointCloudLoadProgress> pointCloudProgress;
 };
 
@@ -767,6 +781,7 @@ struct PendingLayerLoad {
     std::jthread backgroundThread;
     std::optional<LayerLoadResult> completedResult;
     bool showUploadOverlayFrame = false;
+    bool previewActivated = false;
     std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
 };
 
@@ -1011,6 +1026,46 @@ std::string NormalizePathKey(const std::filesystem::path& path) {
     return path.lexically_normal().generic_string();
 }
 
+std::string JsonStringLiteral(std::string_view value) {
+    std::ostringstream output;
+    output << '"';
+    for (const unsigned char c : value) {
+        switch (c) {
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\b':
+                output << "\\b";
+                break;
+            case '\f':
+                output << "\\f";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
+            default:
+                if (c < 0x20U) {
+                    output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                           << static_cast<unsigned int>(c) << std::dec << std::setfill(' ');
+                } else {
+                    output << static_cast<char>(c);
+                }
+                break;
+        }
+    }
+    output << '"';
+    return output.str();
+}
+
 std::filesystem::path DefaultProjectFilePath(const std::filesystem::path& dataRoot) {
     return dataRoot.parent_path() / "Saved" / "invisible_places_project.json";
 }
@@ -1030,6 +1085,12 @@ std::filesystem::path DefaultAnimationDirectory(const std::filesystem::path& dat
 std::filesystem::path PointCloudLodCacheDirectory(const PreviewRuntimeState& runtimeState) {
     const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
     return projectPath.empty() ? std::filesystem::path{"Saved"} / "lod" : projectPath.parent_path() / "lod";
+}
+
+std::filesystem::path PointCloudIpcloudCacheDirectory(const PreviewRuntimeState& runtimeState) {
+    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
+    return projectPath.empty() ? std::filesystem::path{"Saved"} / "PointCloudCache"
+                               : projectPath.parent_path() / "PointCloudCache";
 }
 
 std::uint32_t RemovePointCloudLodCacheFiles(
@@ -1094,6 +1155,35 @@ std::uint32_t RemovePointCloudLodCacheFiles(
         }
         errorMessage->append(iterationError.message());
     }
+    return removedCount;
+}
+
+std::uint32_t RemovePointCloudIpcloudBundleFiles(
+    const std::filesystem::path& activeBundlePath,
+    std::string* errorMessage = nullptr) {
+    if (activeBundlePath.empty()) {
+        return 0U;
+    }
+
+    std::uint32_t removedCount = 0U;
+    auto removePath = [&](const std::filesystem::path& path) {
+        std::error_code removeError;
+        if (std::filesystem::exists(path, removeError)) {
+            std::filesystem::remove_all(path, removeError);
+            if (removeError && errorMessage != nullptr) {
+                if (!errorMessage->empty()) {
+                    errorMessage->append("; ");
+                }
+                errorMessage->append(removeError.message());
+            } else {
+                ++removedCount;
+            }
+        }
+    };
+    removePath(activeBundlePath);
+    auto temporaryPath = activeBundlePath;
+    temporaryPath += ".tmp";
+    removePath(temporaryPath);
     return removedCount;
 }
 
@@ -4996,11 +5086,13 @@ void StartPointCloudLodBuildWorker(
     }
     const auto cachePath = session->pointLodCachePath;
     const auto cacheSource = session->pointLodCacheSource;
+    const auto ipcloudBundlePath = session->pointIpcloudBundlePath;
     const auto buildConfig = session->pointLodBuildConfig;
     const bool writePersistentCache = !cachePath.empty() && cacheSource.sourceSizeBytes > 0ULL;
     session->pointLodCacheStatus = writePersistentCache ? "Building LOD cache" : "Building in-memory LOD";
+    session->pointIpcloudBuildPhase = writePersistentCache ? "Building .ipcloud bundle data" : "In-memory only";
     session->pointLodBuildWorker = std::jthread{
-        [buildState, cloud = std::move(cloud), cachePath, cacheSource, buildConfig, writePersistentCache](
+        [buildState, cloud = std::move(cloud), cachePath, cacheSource, ipcloudBundlePath, buildConfig, writePersistentCache](
             std::stop_token stopToken) {
             auto progressCallback = [buildState](const PointCloudLodBuildProgress& progress) {
                 std::scoped_lock lock(buildState->mutex);
@@ -5026,11 +5118,36 @@ void StartPointCloudLodBuildWorker(
                     hierarchy,
                     &saveError);
             }
+            bool ipcloudSaved = false;
+            if (writePersistentCache && !hierarchy.Empty() && !ipcloudBundlePath.empty()) {
+                std::string sourceError;
+                const auto ipcloudSourceInfo =
+                    invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(
+                        cacheSource.sourcePath,
+                        &sourceError);
+                if (ipcloudSourceInfo.has_value()) {
+                    const auto ipcloudSave = invisible_places::renderer::pointcloud::SavePointCloudIpcloudBundle(
+                        ipcloudBundlePath,
+                        ipcloudSourceInfo.value(),
+                        buildConfig,
+                        *cloud,
+                        hierarchy);
+                    ipcloudSaved = ipcloudSave.saved;
+                    if (!ipcloudSave.saved && saveError.empty()) {
+                        saveError = ipcloudSave.errorMessage.empty() ? "could not save .ipcloud bundle"
+                                                                     : ipcloudSave.errorMessage;
+                    }
+                } else if (saveError.empty()) {
+                    saveError = sourceError.empty() ? "could not inspect source for .ipcloud bundle" : sourceError;
+                }
+            }
             std::string status = "LOD cache ready";
             if (writePersistentCache && !cacheSaved) {
                 status = saveError.empty() ? "LOD cache ready, save failed" : "LOD cache ready, save failed: " + saveError;
             } else if (!writePersistentCache) {
                 status = "In-memory LOD ready";
+            } else if (ipcloudSaved) {
+                status = "LOD cache ready, .ipcloud bundle ready";
             }
 
             std::scoped_lock lock(buildState->mutex);
@@ -5068,6 +5185,7 @@ bool RebuildSelectedPointCloudLodCache(
 
     std::string removeError;
     const auto removedCount = RemovePointCloudLodCacheFiles(session->pointLodCachePath, &removeError);
+    const auto removedBundleCount = RemovePointCloudIpcloudBundleFiles(session->pointIpcloudBundlePath, &removeError);
     ClearAdaptiveLodRuntimeCache(session);
     session->pointLodHierarchy.reset();
     session->pointLodHierarchyGeneration =
@@ -5078,11 +5196,15 @@ bool RebuildSelectedPointCloudLodCache(
         session->pointLodHierarchyGeneration = 1ULL;
     }
     session->pointLodCacheStatus =
-        removedCount > 0U ? "Rebuilding LOD cache" : "Rebuilding LOD cache from source";
+        (removedCount + removedBundleCount) > 0U ? "Rebuilding LOD cache" : "Rebuilding LOD cache from source";
+    session->pointIpcloudBuildPhase = "Rebuilding .ipcloud bundle";
+    session->pointIpcloudPublishStatus = "rebuild requested";
     runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->statusMessage =
         session->displayName + ": rebuilding LOD cache" +
-        (removedCount > 0U ? " after removing " + FormatPointCount(removedCount) + " cache file(s)." : ".");
+        ((removedCount + removedBundleCount) > 0U
+             ? " after removing " + FormatPointCount(removedCount + removedBundleCount) + " cache item(s)."
+             : ".");
     runtimeState->errorMessage = std::move(removeError);
 
     StartPointCloudLodBuildWorker(session, session->offlinePointCloud);
@@ -5112,6 +5234,14 @@ void PollPointCloudLodWorkers(PreviewRuntimeState* runtimeState) {
                     &session,
                     std::move(completion->hierarchy),
                     completion->statusMessage);
+                session.pointIpcloudBuildPhase =
+                    completion->statusMessage.find(".ipcloud bundle ready") != std::string::npos
+                        ? "Complete"
+                        : "Complete; .ipcloud publish unavailable";
+                session.pointIpcloudPublishStatus =
+                    completion->statusMessage.find(".ipcloud bundle ready") != std::string::npos
+                        ? ".ipcloud bundle ready"
+                        : session.pointIpcloudPublishStatus;
                 runtimeState->statusMessage = session.displayName + ": " + completion->statusMessage;
             }
             if (!running && session.pointLodBuildWorker.joinable()) {
@@ -6145,6 +6275,22 @@ std::optional<LayerLoadResult> TakeCompletedBackgroundResult(
     return completed;
 }
 
+std::optional<invisible_places::renderer::pointcloud::PointCloudIpcloudPreview> TakeBackgroundPointCloudPreview(
+    const std::shared_ptr<BackgroundLayerLoadState>& backgroundState) {
+    if (backgroundState == nullptr) {
+        return std::nullopt;
+    }
+
+    std::scoped_lock lock(backgroundState->mutex);
+    if (!backgroundState->pointCloudPreview.has_value()) {
+        return std::nullopt;
+    }
+
+    auto preview = std::move(backgroundState->pointCloudPreview.value());
+    backgroundState->pointCloudPreview.reset();
+    return preview;
+}
+
 std::optional<PointCloudLoadProgress> CurrentPointCloudLoadProgress(
     const std::shared_ptr<BackgroundLayerLoadState>& backgroundState) {
     if (backgroundState == nullptr) {
@@ -6189,6 +6335,104 @@ void FocusSessionLayer(
     SyncPivotOverlayToCamera(runtimeState);
 }
 
+bool ActivatePointCloudPreview(
+    std::size_t sessionIndex,
+    invisible_places::renderer::pointcloud::PointCloudIpcloudPreview preview,
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::chrono::steady_clock::time_point loadStartedAt) {
+    if (runtimeState == nullptr || viewport == nullptr || sessionIndex >= runtimeState->sessions.size() ||
+        !preview.loaded || preview.cloud.positions.empty()) {
+        return false;
+    }
+
+    const bool hadVisibleLayersBefore = VisibleLayerCount(*runtimeState) > 0;
+    auto& session = runtimeState->sessions[sessionIndex];
+    StopPointCloudBackgroundLodWork(&session);
+
+    session.hasSourceRgb = preview.cloud.hasSourceRgb;
+    session.hasNormals = preview.cloud.hasNormals;
+    session.totalPrimitives = preview.representedSourceCount > 0ULL
+                                  ? preview.representedSourceCount
+                                  : static_cast<std::uint64_t>(preview.cloud.PointCount());
+    session.scalarFields = preview.cloud.scalarFields;
+    session.bounds = preview.cloud.bounds;
+    session.focusPoint = preview.cloud.focusPoint;
+    session.hasFocusPoint = preview.cloud.hasFocusPoint;
+    session.pivotSamples = BuildPivotSamples(preview.cloud.positions, preview.cloud.bounds);
+    session.loaded = true;
+    session.visible = true;
+    session.pointCloudPreviewActive = true;
+    session.pointCloudPreviewFromPersistentCache = preview.fromPersistentBundle;
+    session.pointIpcloudPreviewPointCount = preview.cloud.PointCount();
+    session.pointIpcloudRepresentedSourceCount = session.totalPrimitives;
+    session.pointIpcloudLoadStartedAt = loadStartedAt;
+    session.pointIpcloudTimeToBoundsMs =
+        loadStartedAt.time_since_epoch().count() == 0
+            ? preview.loadMilliseconds
+            : MillisecondsBetween(loadStartedAt, std::chrono::steady_clock::now());
+    session.pointIpcloudTimeToFirstCoarseFrameMs = session.pointIpcloudTimeToBoundsMs;
+    session.pointIpcloudTimeToFirstRefinedFrameMs = 0.0;
+    session.pointIpcloudLoadPhase = preview.fromPersistentBundle ? "warm-cache representative preview"
+                                                                 : "source-sampled representative preview";
+    session.pointIpcloudBuildPhase = preview.fromPersistentBundle ? "bundle complete" : "full parse/build pending";
+    session.pointIpcloudPublishStatus = preview.fromPersistentBundle ? "published bundle loaded" : "not published yet";
+    session.pointLodCacheStatus = preview.status.empty() ? "Rendering coarse preview" : preview.status;
+
+    session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
+        preview.cloud.PointCount(),
+        preview.cloud.PointCount());
+    ClearAdaptiveLodRuntimeCache(&session);
+    session.pointLodHierarchy =
+        std::make_shared<invisible_places::renderer::pointcloud::PointCloudLodHierarchy>(std::move(preview.hierarchy));
+    session.pointLodHierarchyGeneration =
+        session.pointLodHierarchyGeneration == std::numeric_limits<std::uint64_t>::max()
+            ? 1ULL
+            : session.pointLodHierarchyGeneration + 1ULL;
+    if (session.pointLodHierarchyGeneration == 0ULL) {
+        session.pointLodHierarchyGeneration = 1ULL;
+    }
+
+    SanitizePointCloudStyle(&session);
+    if (session.kind == LayerKind::PointCloud) {
+        EnsurePointVisuals(&session);
+        UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+    }
+
+    auto previewCloudPtr =
+        std::make_shared<invisible_places::io::LoadedPointCloud>(std::move(preview.cloud));
+    try {
+        viewport->UploadPointCloud(sessionIndex, *previewCloudPtr, session.pointBudget.sampledIndices);
+    } catch (const std::exception& error) {
+        session.loaded = false;
+        session.visible = false;
+        session.offlinePointCloud.reset();
+        session.pointLodHierarchy.reset();
+        ClearAdaptiveLodRuntimeCache(&session);
+        runtimeState->errorMessage = "GPU preview upload failed: " + std::string{error.what()};
+        std::cerr << runtimeState->errorMessage << std::endl;
+        return false;
+    }
+    session.offlinePointCloud = previewCloudPtr;
+    runtimeState->selectedSessionIndex = sessionIndex;
+    runtimeState->previewRenderStateSignatureValid = false;
+
+    if (!hadVisibleLayersBefore && runtimeState->preserveProjectCameraOnNextLayerActivation) {
+        runtimeState->preserveProjectCameraOnNextLayerActivation = false;
+        SyncPivotOverlayToCamera(runtimeState);
+    } else if (!hadVisibleLayersBefore) {
+        constexpr float kStartupFocusDistanceScale = 0.46F;
+        FocusSessionLayer(runtimeState, *viewport, sessionIndex, kStartupFocusDistanceScale);
+    }
+
+    runtimeState->statusMessage =
+        session.displayName + ": " + session.pointLodCacheStatus + " (" +
+        FormatPointCount(session.pointIpcloudPreviewPointCount) + " reps).";
+    runtimeState->errorMessage.clear();
+    std::cout << runtimeState->statusMessage << std::endl;
+    return true;
+}
+
 bool ActivateLoadedPointCloud(
     std::size_t sessionIndex,
     invisible_places::io::LoadedPointCloud cloud,
@@ -6200,6 +6444,8 @@ bool ActivateLoadedPointCloud(
 
     const bool hadVisibleLayersBefore = VisibleLayerCount(*runtimeState) > 0;
     auto& session = runtimeState->sessions[sessionIndex];
+    const bool replacingPreview = session.pointCloudPreviewActive;
+    const auto previewLoadStartedAt = session.pointIpcloudLoadStartedAt;
     StopPointCloudBackgroundLodWork(&session);
     session.hasSourceRgb = cloud.hasSourceRgb;
     session.hasNormals = cloud.hasNormals;
@@ -6224,18 +6470,43 @@ bool ActivateLoadedPointCloud(
     ClearAdaptiveLodRuntimeCache(&session);
     session.pointLodHierarchy.reset();
     session.pointLodHierarchyGeneration = 0;
+    session.pointCloudPreviewActive = false;
+    session.pointCloudPreviewFromPersistentCache = false;
+    session.pointIpcloudTimeToFirstRefinedFrameMs =
+        replacingPreview && previewLoadStartedAt.time_since_epoch().count() != 0
+            ? MillisecondsBetween(previewLoadStartedAt, std::chrono::steady_clock::now())
+            : session.pointIpcloudTimeToFirstRefinedFrameMs;
+    session.pointIpcloudLoadPhase = replacingPreview ? "full source uploaded after coarse preview"
+                                                     : "full source loaded";
     const auto effectiveSourcePath = !cloud.sourcePath.empty() ? cloud.sourcePath : session.sourcePath;
     session.pointLodCacheSource =
         invisible_places::renderer::pointcloud::MakePointCloudLodCacheSource(effectiveSourcePath, cloud);
     session.pointLodCachePath = invisible_places::renderer::pointcloud::BuildPointCloudLodCachePath(
         PointCloudLodCacheDirectory(*runtimeState),
         effectiveSourcePath);
+    if (auto ipcloudSourceInfo =
+            invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(effectiveSourcePath);
+        ipcloudSourceInfo.has_value()) {
+        session.pointIpcloudBundlePath = invisible_places::renderer::pointcloud::BuildPointCloudIpcloudBundlePath(
+            PointCloudIpcloudCacheDirectory(*runtimeState),
+            ipcloudSourceInfo.value());
+        const auto inspection = invisible_places::renderer::pointcloud::InspectPointCloudIpcloudBundle(
+            session.pointIpcloudBundlePath,
+            ipcloudSourceInfo.value(),
+            session.pointLodBuildConfig);
+        session.pointIpcloudPublishStatus = inspection.status + ": " + inspection.reason;
+    } else {
+        session.pointIpcloudBundlePath.clear();
+        session.pointIpcloudPublishStatus = ".ipcloud unavailable";
+    }
     session.pointLodCacheStatus = "Loading LOD cache";
     if (session.pointLodCacheSource.sourceSizeBytes > 0ULL && session.rebuildPointLodCacheOnLoad) {
         std::string removeError;
         const auto removedCount = RemovePointCloudLodCacheFiles(session.pointLodCachePath, &removeError);
+        const auto removedBundles = RemovePointCloudIpcloudBundleFiles(session.pointIpcloudBundlePath, &removeError);
         session.pointLodCacheStatus =
-            removedCount > 0U ? "LOD cache rebuild requested" : "LOD cache rebuild requested, no old cache found";
+            (removedCount + removedBundles) > 0U ? "LOD cache rebuild requested"
+                                                 : "LOD cache rebuild requested, no old cache found";
         if (!removeError.empty()) {
             runtimeState->errorMessage = "LOD cache cleanup warning: " + removeError;
         }
@@ -6371,27 +6642,85 @@ void BeginLayerLoad(std::size_t sessionIndex, PreviewRuntimeState* runtimeState)
     const auto layerKind = session.kind;
     const auto filePath = session.sourcePath;
     const auto transformPath = session.transformPath;
+    const auto ipcloudCacheDirectory = PointCloudIpcloudCacheDirectory(*runtimeState);
+    const auto pointLodBuildConfig = session.pointLodBuildConfig;
+    const bool rebuildPointLodCacheOnLoad = session.rebuildPointLodCacheOnLoad;
+    session.pointIpcloudLoadStartedAt = std::chrono::steady_clock::now();
+    session.pointIpcloudLoadPhase = layerKind == LayerKind::PointCloud ? "Inspecting .ipcloud cache" : "not applicable";
+    session.pointIpcloudBuildPhase = "not started";
+    session.pointIpcloudPublishStatus = "not published";
+    session.pointIpcloudTimeToBoundsMs = 0.0;
+    session.pointIpcloudTimeToFirstCoarseFrameMs = 0.0;
+    session.pointIpcloudTimeToFirstRefinedFrameMs = 0.0;
+    if (layerKind == LayerKind::PointCloud) {
+        if (auto sourceInfo = invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(filePath);
+            sourceInfo.has_value()) {
+            session.pointIpcloudBundlePath =
+                invisible_places::renderer::pointcloud::BuildPointCloudIpcloudBundlePath(
+                    ipcloudCacheDirectory,
+                    sourceInfo.value());
+            if (rebuildPointLodCacheOnLoad) {
+                std::string removeError;
+                static_cast<void>(RemovePointCloudIpcloudBundleFiles(session.pointIpcloudBundlePath, &removeError));
+                if (!removeError.empty()) {
+                    runtimeState->errorMessage = "LOD cache cleanup warning: " + removeError;
+                }
+            }
+        }
+    }
     runtimeState->statusMessage = "Loading " + session.displayName + " in the background...";
     runtimeState->errorMessage.clear();
     std::cout << "Loading " << LayerKindLabel(layerKind) << ": " << filePath.filename().string() << std::endl;
 
     auto backgroundState = std::make_shared<BackgroundLayerLoadState>();
     std::jthread backgroundThread{
-        [backgroundState, layerKind, filePath, transformPath](std::stop_token stopToken) {
+        [backgroundState,
+         layerKind,
+         filePath,
+         transformPath,
+         ipcloudCacheDirectory,
+         pointLodBuildConfig,
+         rebuildPointLodCacheOnLoad](std::stop_token stopToken) {
             if (stopToken.stop_requested()) {
                 return;
             }
 
-            LayerLoadResult result =
-                layerKind == LayerKind::PointCloud
-                    ? LayerLoadResult{invisible_places::io::LoadPointCloud(
-                          filePath,
-                          [backgroundState](const PointCloudLoadProgress& progress) {
-                              std::scoped_lock lock(backgroundState->mutex);
-                              backgroundState->pointCloudProgress = progress;
-                          })}
-                    : LayerLoadResult{
-                          invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
+            LayerLoadResult result;
+            if (layerKind == LayerKind::PointCloud) {
+                std::string sourceError;
+                const auto sourceInfo =
+                    invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(filePath, &sourceError);
+                if (sourceInfo.has_value() && !stopToken.stop_requested()) {
+                    const auto bundlePath =
+                        invisible_places::renderer::pointcloud::BuildPointCloudIpcloudBundlePath(
+                            ipcloudCacheDirectory,
+                            sourceInfo.value());
+                    invisible_places::renderer::pointcloud::PointCloudIpcloudPreview preview;
+                    if (!rebuildPointLodCacheOnLoad) {
+                        preview = invisible_places::renderer::pointcloud::LoadPointCloudIpcloudPreview(
+                            bundlePath,
+                            sourceInfo.value(),
+                            pointLodBuildConfig);
+                    }
+                    if (!preview.loaded && !stopToken.stop_requested()) {
+                        preview = invisible_places::renderer::pointcloud::LoadPointCloudIpcloudSourcePreview(
+                            filePath,
+                            invisible_places::renderer::pointcloud::kPointCloudIpcloudDefaultPreviewPointCount);
+                    }
+                    if (preview.loaded && !stopToken.stop_requested()) {
+                        std::scoped_lock lock(backgroundState->mutex);
+                        backgroundState->pointCloudPreview = std::move(preview);
+                    }
+                }
+                result = LayerLoadResult{invisible_places::io::LoadPointCloud(
+                    filePath,
+                    [backgroundState](const PointCloudLoadProgress& progress) {
+                        std::scoped_lock lock(backgroundState->mutex);
+                        backgroundState->pointCloudProgress = progress;
+                    })};
+            } else {
+                result = LayerLoadResult{invisible_places::io::LoadGaussianSplat(filePath, transformPath)};
+            }
             if (stopToken.stop_requested()) {
                 return;
             }
@@ -6407,6 +6736,7 @@ void BeginLayerLoad(std::size_t sessionIndex, PreviewRuntimeState* runtimeState)
         .backgroundThread = std::move(backgroundThread),
         .completedResult = std::nullopt,
         .showUploadOverlayFrame = false,
+        .previewActivated = false,
         .startedAt = std::chrono::steady_clock::now(),
     };
 }
@@ -6421,6 +6751,18 @@ void PollPendingLayerLoad(
     auto& pendingLoad = runtimeState->pendingLoad.value();
 
     if (pendingLoad.phase == PendingLoadPhase::CpuLoading) {
+        if (!pendingLoad.previewActivated &&
+            runtimeState->sessions[pendingLoad.sessionIndex].kind == LayerKind::PointCloud) {
+            auto preview = TakeBackgroundPointCloudPreview(pendingLoad.backgroundState);
+            if (preview.has_value() && preview->loaded) {
+                pendingLoad.previewActivated = ActivatePointCloudPreview(
+                    pendingLoad.sessionIndex,
+                    std::move(preview.value()),
+                    runtimeState,
+                    viewport,
+                    pendingLoad.startedAt);
+            }
+        }
         const auto completedResult = TakeCompletedBackgroundResult(pendingLoad.backgroundState);
         if (!completedResult.has_value()) {
             return;
@@ -6521,6 +6863,16 @@ void UnloadLayerByIndex(
     session.pointLodHierarchy.reset();
     session.pointLodHierarchyGeneration = 0;
     session.pointLodCacheStatus = "LOD cache unavailable";
+    session.pointIpcloudLoadPhase = "not started";
+    session.pointIpcloudBuildPhase = "not started";
+    session.pointIpcloudPublishStatus = "not published";
+    session.pointCloudPreviewActive = false;
+    session.pointCloudPreviewFromPersistentCache = false;
+    session.pointIpcloudPreviewPointCount = 0;
+    session.pointIpcloudRepresentedSourceCount = 0;
+    session.pointIpcloudTimeToBoundsMs = 0.0;
+    session.pointIpcloudTimeToFirstCoarseFrameMs = 0.0;
+    session.pointIpcloudTimeToFirstRefinedFrameMs = 0.0;
     ClearAdaptiveLodRuntimeCache(&session);
 }
 
@@ -13926,6 +14278,24 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             fileSizeError ? "" : " | ",
             fileSizeError ? "" : FormatByteCount(fileSize).c_str());
     }
+    if (!session.pointIpcloudBundlePath.empty()) {
+        ImGui::TextWrapped(
+            ".ipcloud: %s | load %s | build %s | publish %s",
+            session.pointIpcloudBundlePath.filename().string().c_str(),
+            session.pointIpcloudLoadPhase.c_str(),
+            session.pointIpcloudBuildPhase.c_str(),
+            session.pointIpcloudPublishStatus.c_str());
+        ImGui::Text(
+            ".ipcloud preview: %s | %s reps for %s source | bounds %.1f ms | first coarse %.1f ms | first refined %.1f ms",
+            session.pointCloudPreviewActive
+                ? (session.pointCloudPreviewFromPersistentCache ? "warm" : "cold")
+                : "inactive",
+            FormatPointCount(session.pointIpcloudPreviewPointCount).c_str(),
+            FormatPointCount(session.pointIpcloudRepresentedSourceCount).c_str(),
+            session.pointIpcloudTimeToBoundsMs,
+            session.pointIpcloudTimeToFirstCoarseFrameMs,
+            session.pointIpcloudTimeToFirstRefinedFrameMs);
+    }
 
     if (session.pointLodHierarchy != nullptr && !session.pointLodHierarchy->Empty()) {
         ImGui::Text(
@@ -14122,6 +14492,14 @@ void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
                 DrawLodBuildProgressLines(lodBuildProgress);
             } else {
                 ImGui::Text("LOD cache: %s", session->pointLodCacheStatus.c_str());
+            }
+            if (session->pointIpcloudTimeToFirstCoarseFrameMs > 0.0 ||
+                session->pointIpcloudTimeToFirstRefinedFrameMs > 0.0) {
+                ImGui::Text(
+                    ".ipcloud: %s | coarse %.1f ms | refined %.1f ms",
+                    session->pointCloudPreviewActive ? "preview" : session->pointIpcloudPublishStatus.c_str(),
+                    session->pointIpcloudTimeToFirstCoarseFrameMs,
+                    session->pointIpcloudTimeToFirstRefinedFrameMs);
             }
             ImGui::Text(
                 "LOD density: %s / %s",
@@ -21424,6 +21802,260 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     } catch (const std::exception& error) {
         std::cerr << "LOD comparison failed: " << error.what() << "\n";
         return 9;
+    }
+}
+
+int Application::RunLodCacheCheck(std::filesystem::path pointCloudPath) const {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    try {
+        if (pointCloudPath.empty()) {
+            pointCloudPath = dataRoot_ / "Site3-Sample-Terrestrial.ply";
+        } else if (pointCloudPath.is_relative() && !std::filesystem::exists(pointCloudPath)) {
+            pointCloudPath = dataRoot_ / pointCloudPath;
+        }
+
+        std::cout << "Invisible Places .ipcloud cache check" << std::endl;
+        std::cout << "Data root: " << dataRoot_.string() << std::endl;
+        std::cout << "Point cloud: " << pointCloudPath.string() << std::endl << std::endl;
+
+        pc::PointCloudLodBuildConfig buildConfig{};
+        std::string sourceError;
+        const auto sourceInfo = pc::MakePointCloudIpcloudSourceInfo(pointCloudPath, &sourceError);
+        if (!sourceInfo.has_value()) {
+            std::cerr << "Could not inspect point cloud source: " << sourceError << "\n";
+            return 2;
+        }
+
+        const auto cacheDirectory = dataRoot_.parent_path() / "Saved" / "PointCloudCache";
+        const auto bundlePath = pc::BuildPointCloudIpcloudBundlePath(cacheDirectory, sourceInfo.value());
+        std::error_code createCacheError;
+        std::filesystem::create_directories(cacheDirectory, createCacheError);
+        if (createCacheError) {
+            std::cerr << "Could not create .ipcloud cache directory: " << createCacheError.message() << "\n";
+            return 3;
+        }
+
+        std::string removeError;
+        const auto removedBundles = RemovePointCloudIpcloudBundleFiles(bundlePath, &removeError);
+        if (!removeError.empty()) {
+            std::cerr << "Warning: could not clear all .ipcloud bundle files: " << removeError << "\n";
+        }
+
+        const auto checkStart = std::chrono::steady_clock::now();
+        const auto coldInspection = pc::InspectPointCloudIpcloudBundle(
+            bundlePath,
+            sourceInfo.value(),
+            buildConfig);
+        std::cout << "Cold cache state: "
+                  << pc::PointCloudIpcloudCacheStateName(coldInspection.state)
+                  << " (" << coldInspection.reason << ")\n";
+
+        const auto coldPreviewStart = std::chrono::steady_clock::now();
+        auto coldPreview = pc::LoadPointCloudIpcloudSourcePreview(
+            pointCloudPath,
+            pc::kPointCloudIpcloudDefaultPreviewPointCount);
+        const auto coldPreviewEnd = std::chrono::steady_clock::now();
+        const double timeToBoundsMs = MillisecondsBetween(checkStart, coldPreviewEnd);
+        const double timeToFirstCoarseFrameMs = MillisecondsBetween(checkStart, coldPreviewEnd);
+        const double coldPreviewWallMs = MillisecondsBetween(coldPreviewStart, coldPreviewEnd);
+        if (!coldPreview.loaded) {
+            std::cerr << "Cold source preview failed: " << coldPreview.reason << "\n";
+            return 4;
+        }
+        std::cout << "Cold preview representatives: " << coldPreview.cloud.PointCount()
+                  << " for " << coldPreview.representedSourceCount
+                  << " source points in " << coldPreviewWallMs << " ms\n";
+
+        const auto fullLoadStart = std::chrono::steady_clock::now();
+        auto loadResult = invisible_places::io::LoadPointCloud(pointCloudPath);
+        const auto fullLoadEnd = std::chrono::steady_clock::now();
+        if (!loadResult.success) {
+            std::cerr << "Could not load full point cloud: " << loadResult.errorMessage << "\n";
+            return 5;
+        }
+        const double fullLoadMs = MillisecondsBetween(fullLoadStart, fullLoadEnd);
+        std::cout << "Full source loaded: " << loadResult.cloud.PointCount()
+                  << " points in " << fullLoadMs << " ms\n";
+
+        const auto hierarchyStart = std::chrono::steady_clock::now();
+        auto hierarchy = pc::BuildPointCloudLodHierarchy(loadResult.cloud, buildConfig);
+        const auto hierarchyEnd = std::chrono::steady_clock::now();
+        if (hierarchy.Empty()) {
+            std::cerr << "LOD hierarchy build produced no nodes.\n";
+            return 6;
+        }
+        const double hierarchyBuildMs = MillisecondsBetween(hierarchyStart, hierarchyEnd);
+        const double timeToFirstRefinedFrameMs = MillisecondsBetween(checkStart, hierarchyEnd);
+        std::cout << "LOD hierarchy built: " << hierarchy.nodes.size()
+                  << " nodes, " << hierarchy.representatives.size()
+                  << " representatives in " << hierarchyBuildMs << " ms\n";
+
+        const auto publishStart = std::chrono::steady_clock::now();
+        const auto saveResult = pc::SavePointCloudIpcloudBundle(
+            bundlePath,
+            sourceInfo.value(),
+            buildConfig,
+            loadResult.cloud,
+            hierarchy);
+        const auto publishEnd = std::chrono::steady_clock::now();
+        const double publishMs = MillisecondsBetween(publishStart, publishEnd);
+        if (!saveResult.saved) {
+            std::cerr << "Could not publish .ipcloud bundle: " << saveResult.errorMessage << "\n";
+            return 7;
+        }
+        const auto publishInspection = pc::InspectPointCloudIpcloudBundle(
+            bundlePath,
+            sourceInfo.value(),
+            buildConfig);
+        std::cout << "Published .ipcloud bundle: "
+                  << pc::PointCloudIpcloudCacheStateName(publishInspection.state)
+                  << " (" << publishInspection.reason << ") in " << publishMs << " ms\n";
+
+        const auto warmPreviewStart = std::chrono::steady_clock::now();
+        const auto warmPreview = pc::LoadPointCloudIpcloudPreview(
+            bundlePath,
+            sourceInfo.value(),
+            buildConfig);
+        const auto warmPreviewEnd = std::chrono::steady_clock::now();
+        const double warmPreviewWallMs = MillisecondsBetween(warmPreviewStart, warmPreviewEnd);
+        if (!warmPreview.loaded) {
+            std::cerr << "Warm .ipcloud preview failed: " << warmPreview.reason << "\n";
+            return 8;
+        }
+        std::cout << "Warm preview representatives: " << warmPreview.cloud.PointCount()
+                  << " for " << warmPreview.representedSourceCount
+                  << " source points in " << warmPreviewWallMs << " ms\n";
+
+        auto resumeProbeBundlePath = bundlePath;
+        resumeProbeBundlePath += ".resume_probe";
+        std::string resumeRemoveError;
+        static_cast<void>(RemovePointCloudIpcloudBundleFiles(resumeProbeBundlePath, &resumeRemoveError));
+        auto resumeProbeTemporaryPath = resumeProbeBundlePath;
+        resumeProbeTemporaryPath += ".tmp";
+        std::error_code resumeDirectoryError;
+        std::filesystem::create_directories(resumeProbeTemporaryPath, resumeDirectoryError);
+        if (resumeDirectoryError) {
+            std::cerr << "Could not create interrupted .ipcloud probe: "
+                      << resumeDirectoryError.message() << "\n";
+            return 9;
+        }
+        {
+            std::ofstream status{resumeProbeTemporaryPath / "build_status.json", std::ios::trunc};
+            status << "{\n"
+                   << "  \"parse_header_complete\": true,\n"
+                   << "  \"upper_hierarchy_complete\": true,\n"
+                   << "  \"node_pages_complete\": false,\n"
+                   << "  \"representative_ranges_complete\": true,\n"
+                   << "  \"raw_chunk_ranges_complete\": false,\n"
+                   << "  \"scalar_stats_complete\": false,\n"
+                   << "  \"complete\": false,\n"
+                   << "  \"failed\": false,\n"
+                   << "  \"interrupted\": true,\n"
+                   << "  \"raw_chunks_completed\": 1,\n"
+                   << "  \"raw_chunk_count\": 4,\n"
+                   << "  \"phase\": \"representatives\",\n"
+                   << "  \"message\": \"diagnostic interrupted build probe\"\n"
+                   << "}\n";
+        }
+        const auto resumeResult = pc::ResumePointCloudIpcloudBuild(
+            resumeProbeBundlePath,
+            sourceInfo.value(),
+            buildConfig);
+        std::string resumeCleanupError;
+        static_cast<void>(RemovePointCloudIpcloudBundleFiles(resumeProbeBundlePath, &resumeCleanupError));
+        std::cout << "Interrupted/resume probe: " << resumeResult.status
+                  << " (" << resumeResult.reason << ")\n";
+
+        const auto outputDirectory = dataRoot_.parent_path() / "Saved" / "diagnostics" / "lod_cache";
+        std::error_code createOutputError;
+        std::filesystem::create_directories(outputDirectory, createOutputError);
+        if (createOutputError) {
+            std::cerr << "Could not create cache diagnostic output directory: "
+                      << createOutputError.message() << "\n";
+            return 10;
+        }
+
+        const auto metricsPath = outputDirectory / "lod_cache_metrics.json";
+        {
+            const auto boolLiteral = [](bool value) -> const char* { return value ? "true" : "false"; };
+            std::ofstream metrics{metricsPath, std::ios::trunc};
+            metrics << "{\n"
+                    << "  \"point_cloud\": "
+                    << JsonStringLiteral(pointCloudPath.lexically_normal().generic_string()) << ",\n"
+                    << "  \"cache_bundle\": "
+                    << JsonStringLiteral(bundlePath.lexically_normal().generic_string()) << ",\n"
+                    << "  \"cache_format_version\": " << pc::kPointCloudIpcloudCacheFormatVersion << ",\n"
+                    << "  \"attribute_schema_version\": "
+                    << pc::kPointCloudIpcloudAttributeSchemaVersion << ",\n"
+                    << "  \"build_settings_version\": "
+                    << pc::kPointCloudIpcloudBuildSettingsVersion << ",\n"
+                    << "  \"legacy_v4_policy\": "
+                    << JsonStringLiteral("fallback-only after full source load") << ",\n"
+                    << "  \"clean_cache_removed_bundles\": " << removedBundles << ",\n"
+                    << "  \"cold_cache_state\": "
+                    << JsonStringLiteral(pc::PointCloudIpcloudCacheStateName(coldInspection.state)) << ",\n"
+                    << "  \"cold_cache_reason\": " << JsonStringLiteral(coldInspection.reason) << ",\n"
+                    << "  \"cold_load_phase\": " << JsonStringLiteral("source preview, full parse, hierarchy, publish") << ",\n"
+                    << "  \"cold_preview_loaded\": " << boolLiteral(coldPreview.loaded) << ",\n"
+                    << "  \"cold_preview_status\": " << JsonStringLiteral(coldPreview.status) << ",\n"
+                    << "  \"cold_preview_reason\": " << JsonStringLiteral(coldPreview.reason) << ",\n"
+                    << "  \"cold_preview_points\": " << coldPreview.cloud.PointCount() << ",\n"
+                    << "  \"cold_represented_source_count\": " << coldPreview.representedSourceCount << ",\n"
+                    << "  \"time_to_bounds_ms\": " << timeToBoundsMs << ",\n"
+                    << "  \"time_to_first_coarse_frame_ms\": " << timeToFirstCoarseFrameMs << ",\n"
+                    << "  \"time_to_first_refined_frame_ms\": " << timeToFirstRefinedFrameMs << ",\n"
+                    << "  \"cold_source_preview_ms\": " << coldPreviewWallMs << ",\n"
+                    << "  \"full_source_load_ms\": " << fullLoadMs << ",\n"
+                    << "  \"full_source_point_count\": " << loadResult.cloud.PointCount() << ",\n"
+                    << "  \"hierarchy_build_ms\": " << hierarchyBuildMs << ",\n"
+                    << "  \"hierarchy_nodes\": " << hierarchy.nodes.size() << ",\n"
+                    << "  \"hierarchy_representatives\": " << hierarchy.representatives.size() << ",\n"
+                    << "  \"publish_saved\": " << boolLiteral(saveResult.saved) << ",\n"
+                    << "  \"publish_status\": " << JsonStringLiteral(saveResult.status) << ",\n"
+                    << "  \"publish_ms\": " << publishMs << ",\n"
+                    << "  \"publish_inspection_state\": "
+                    << JsonStringLiteral(pc::PointCloudIpcloudCacheStateName(publishInspection.state)) << ",\n"
+                    << "  \"publish_inspection_reason\": "
+                    << JsonStringLiteral(publishInspection.reason) << ",\n"
+                    << "  \"warm_cache_state\": "
+                    << JsonStringLiteral(pc::PointCloudIpcloudCacheStateName(publishInspection.state)) << ",\n"
+                    << "  \"warm_cache_reason\": "
+                    << JsonStringLiteral(publishInspection.reason) << ",\n"
+                    << "  \"warm_preview_loaded\": " << boolLiteral(warmPreview.loaded) << ",\n"
+                    << "  \"warm_preview_from_persistent_cache\": "
+                    << boolLiteral(warmPreview.fromPersistentBundle) << ",\n"
+                    << "  \"warm_preview_points\": " << warmPreview.cloud.PointCount() << ",\n"
+                    << "  \"warm_represented_source_count\": " << warmPreview.representedSourceCount << ",\n"
+                    << "  \"warm_time_to_first_coarse_frame_ms\": " << warmPreviewWallMs << ",\n"
+                    << "  \"warm_preview_load_ms\": " << warmPreview.loadMilliseconds << ",\n"
+                    << "  \"resume_status\": " << JsonStringLiteral(resumeResult.status) << ",\n"
+                    << "  \"resume_reason\": " << JsonStringLiteral(resumeResult.reason) << ",\n"
+                    << "  \"resume_resumable\": " << boolLiteral(resumeResult.resumable) << ",\n"
+                    << "  \"resume_restart_required\": " << boolLiteral(resumeResult.restartRequired) << ",\n"
+                    << "  \"resume_phase\": " << JsonStringLiteral(resumeResult.buildStatus.phase) << ",\n"
+                    << "  \"resume_raw_chunks_completed\": "
+                    << resumeResult.buildStatus.rawChunksCompleted << ",\n"
+                    << "  \"resume_raw_chunk_count\": " << resumeResult.buildStatus.rawChunkCount << "\n"
+                    << "}\n";
+        }
+
+        const bool success =
+            coldInspection.state == pc::PointCloudIpcloudCacheState::Missing &&
+            coldPreview.loaded &&
+            saveResult.saved &&
+            publishInspection.state == pc::PointCloudIpcloudCacheState::Hit &&
+            warmPreview.loaded &&
+            warmPreview.fromPersistentBundle &&
+            resumeResult.resumable &&
+            !resumeResult.restartRequired;
+
+        std::cout << "Wrote cache diagnostics: " << metricsPath.string() << "\n"
+                  << "Cache check: " << (success ? "pass" : "fail") << std::endl;
+        return success ? 0 : 11;
+    } catch (const std::exception& error) {
+        std::cerr << ".ipcloud cache check failed: " << error.what() << "\n";
+        return 12;
     }
 }
 

@@ -21,6 +21,7 @@
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
+#include "renderer/pointcloud/PointCloudIpcloudCache.hpp"
 #include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPerformanceGovernor.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
@@ -1569,6 +1570,153 @@ TEST_CASE("Point-cloud LOD hierarchy cache round-trips and rejects stale metadat
     std::filesystem::remove_all(tempRoot);
 }
 
+TEST_CASE("Point-cloud .ipcloud bundle publishes atomically and validates manifest", "[pointcloud][lod][cache]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    const auto sourcePath = WriteTinyBinaryPointCloudFixture();
+    auto loadResult = invisible_places::io::LoadPointCloud(sourcePath);
+    REQUIRE(loadResult.success);
+    auto sourceInfo = pc::MakePointCloudIpcloudSourceInfo(sourcePath);
+    REQUIRE(sourceInfo.has_value());
+
+    const pc::PointCloudLodBuildConfig config{
+        .maxLeafSourcePoints = 2U,
+        .maxDepth = 4U,
+        .maxInternalRepresentatives = 8U};
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(loadResult.cloud, config);
+    REQUIRE(!hierarchy.Empty());
+
+    const auto tempRoot =
+        std::filesystem::temp_directory_path() /
+        ("InvisiblePlacesIpcloudTest-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto bundlePath = pc::BuildPointCloudIpcloudBundlePath(tempRoot / "PointCloudCache", sourceInfo.value());
+    const auto saveResult =
+        pc::SavePointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config, loadResult.cloud, hierarchy);
+    REQUIRE(saveResult.saved);
+    CHECK(std::filesystem::is_directory(bundlePath));
+    CHECK(!std::filesystem::exists(std::filesystem::path{bundlePath.string() + ".tmp"}));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "manifest.json"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "attribute_schema.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "hierarchy.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "node_pages.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "node_stats.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "lod_representatives.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "scalar_stats.bin"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "build_status.json"));
+    CHECK(std::filesystem::is_regular_file(bundlePath / "build_log.txt"));
+    CHECK(std::filesystem::is_directory(bundlePath / "raw_chunks"));
+
+    auto inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config);
+    CHECK(inspection.state == pc::PointCloudIpcloudCacheState::Hit);
+    CHECK(inspection.previewPointCount > 0U);
+    CHECK(inspection.representedSourceCount == sourceInfo->pointCount);
+
+    auto preview = pc::LoadPointCloudIpcloudPreview(bundlePath, sourceInfo.value(), config);
+    REQUIRE(preview.loaded);
+    CHECK(preview.fromPersistentBundle);
+    CHECK(preview.cloud.PointCount() == inspection.previewPointCount);
+    CHECK(preview.representedSourceCount == sourceInfo->pointCount);
+    REQUIRE(!preview.hierarchy.Empty());
+    for (const auto& drawItem : pc::TraversePointCloudLodHierarchy(preview.hierarchy, {})) {
+        CHECK(drawItem.sourcePointIndex < preview.cloud.PointCount());
+    }
+
+    const auto replaceResult =
+        pc::SavePointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config, loadResult.cloud, hierarchy);
+    REQUIRE(replaceResult.saved);
+    CHECK(!std::filesystem::exists(std::filesystem::path{bundlePath.string() + ".tmp"}));
+    CHECK(!std::filesystem::exists(std::filesystem::path{bundlePath.string() + ".old"}));
+
+    auto wrongConfig = config;
+    ++wrongConfig.maxDepth;
+    inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), wrongConfig);
+    CHECK(inspection.state == pc::PointCloudIpcloudCacheState::Stale);
+    CHECK(inspection.reason.find("build settings") != std::string::npos);
+
+    std::filesystem::remove(bundlePath / "lod_representatives.bin");
+    inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config);
+    CHECK(inspection.state == pc::PointCloudIpcloudCacheState::Corrupt);
+    CHECK(inspection.reason.find("lod_representatives.bin") != std::string::npos);
+
+    std::filesystem::remove_all(tempRoot);
+    std::filesystem::remove(sourcePath);
+}
+
+TEST_CASE("Point-cloud .ipcloud temporary bundle is partial and resumable", "[pointcloud][lod][cache]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    const auto sourcePath = WriteTinyBinaryPointCloudFixture();
+    auto sourceInfo = pc::MakePointCloudIpcloudSourceInfo(sourcePath);
+    REQUIRE(sourceInfo.has_value());
+    const auto tempRoot =
+        std::filesystem::temp_directory_path() /
+        ("InvisiblePlacesIpcloudPartialTest-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const pc::PointCloudLodBuildConfig config{
+        .maxLeafSourcePoints = 2U,
+        .maxDepth = 4U,
+        .maxInternalRepresentatives = 8U};
+    const auto bundlePath = pc::BuildPointCloudIpcloudBundlePath(tempRoot / "PointCloudCache", sourceInfo.value());
+    const auto temporaryPath = std::filesystem::path{bundlePath.string() + ".tmp"};
+    std::filesystem::create_directories(temporaryPath);
+    {
+        std::ofstream status{temporaryPath / "build_status.json"};
+        status << R"json({
+  "parse_header_complete": true,
+  "upper_hierarchy_complete": true,
+  "node_pages_complete": false,
+  "representative_ranges_complete": true,
+  "raw_chunk_ranges_complete": false,
+  "scalar_stats_complete": false,
+  "complete": false,
+  "failed": false,
+  "interrupted": true,
+  "raw_chunks_completed": 1,
+  "raw_chunk_count": 3,
+  "phase": "interrupted after representatives",
+  "message": "test interruption"
+})json";
+    }
+
+    const auto inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config);
+    CHECK(inspection.state == pc::PointCloudIpcloudCacheState::Partial);
+    CHECK(inspection.buildStatus.interrupted);
+    CHECK(inspection.buildStatus.representativeRangesComplete);
+
+    const auto resume = pc::ResumePointCloudIpcloudBuild(bundlePath, sourceInfo.value(), config);
+    CHECK(resume.resumable);
+    CHECK(!resume.restartRequired);
+
+    std::filesystem::remove_all(tempRoot);
+    std::filesystem::remove(sourcePath);
+}
+
+TEST_CASE("Point-cloud .ipcloud source preview remaps draw-item indices", "[pointcloud][lod][cache]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    const auto sourcePath = WriteTinyBinaryPointCloudFixture();
+    auto preview = pc::LoadPointCloudIpcloudSourcePreview(sourcePath, 2U);
+    REQUIRE(preview.loaded);
+    REQUIRE(preview.cloud.PointCount() == 2U);
+    REQUIRE(preview.sourcePointIndices.size() == preview.cloud.PointCount());
+    CHECK(preview.representedSourceCount == 3U);
+    REQUIRE(!preview.hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::FullSource;
+    params.viewportWidth = 128;
+    params.viewportHeight = 128;
+    params.maxRepresentatives = 16U;
+    const auto drawItems = pc::TraversePointCloudLodHierarchy(preview.hierarchy, params);
+    REQUIRE(!drawItems.empty());
+    for (const auto& drawItem : drawItems) {
+        CHECK(drawItem.sourcePointIndex < preview.cloud.PointCount());
+    }
+
+    std::filesystem::remove(sourcePath);
+}
+
 TEST_CASE("Point-cloud adaptive LOD traversal culls offscreen nodes and obeys budgets", "[pointcloud][lod]") {
     invisible_places::io::LoadedPointCloud cloud;
     for (int z = 0; z < 4; ++z) {
@@ -2599,6 +2747,21 @@ TEST_CASE("LiDAR loading and LOD cache builds expose progress and ETA", "[ui][po
     CHECK(appSource.find("CurrentPointCloudLodBuildProgress") != std::string::npos);
     CHECK(appSource.find("BuildPointCloudLodHierarchy(\n                *cloud,\n                buildConfig,\n                progressCallback)") !=
           std::string::npos);
+}
+
+TEST_CASE(".ipcloud cache check CLI reports cold, warm, and resume diagnostics", "[pointcloud][lod][cache]") {
+    const auto appSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto mainSource = ReadRepoTextFile("src/main.cpp");
+
+    CHECK(mainSource.find("--lod-cache-check") != std::string::npos);
+    CHECK(appSource.find("int Application::RunLodCacheCheck") != std::string::npos);
+    CHECK(appSource.find("lod_cache_metrics.json") != std::string::npos);
+    CHECK(appSource.find("cold_cache_state") != std::string::npos);
+    CHECK(appSource.find("warm_cache_state") != std::string::npos);
+    CHECK(appSource.find("resume_resumable") != std::string::npos);
+    CHECK(appSource.find("time_to_first_coarse_frame_ms") != std::string::npos);
+    CHECK(appSource.find("LoadPointCloudIpcloudSourcePreview") != std::string::npos);
+    CHECK(appSource.find("LoadPointCloudIpcloudPreview") != std::string::npos);
 }
 
 TEST_CASE("LOD HUD reports adaptive density fallback and hierarchy details", "[ui][pointcloud][lod]") {

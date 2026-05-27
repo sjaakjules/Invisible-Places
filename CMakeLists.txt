@@ -123,6 +123,7 @@ add_library(
     src/platform/WindowTitle.cpp
     src/renderer/core/VulkanViewportShell.cpp
     src/renderer/gsplat/HighQualityGaussianScene.cpp
+    src/renderer/pointcloud/PointCloudIpcloudCache.cpp
     src/renderer/pointcloud/Colormap.cpp
     src/renderer/pointcloud/PointCloudLodHierarchy.cpp
     src/renderer/pointcloud/PointCloudPerformanceGovernor.cpp
