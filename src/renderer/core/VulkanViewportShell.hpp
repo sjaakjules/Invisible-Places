@@ -163,6 +163,7 @@ struct ViewportDiagnostics {
     std::string adaptiveGpuCompactionSelectionFrustumFallbackReason;
     bool adaptiveGpuCompactionOutputWriteEnabled = false;
     std::string adaptiveGpuCompactionOutputWriteFallbackReason;
+    std::uint32_t adaptiveGpuCompactionOutputCapacity = 0;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
     std::string adaptiveGpuCompactionOutputProbeParityStatus = "not checked";
     std::uint32_t adaptiveGpuCompactionOutputProbeCpuCount = 0;

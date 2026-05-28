@@ -260,9 +260,8 @@ constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
 constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = true;
-constexpr std::uint32_t kGpuDiagnosticCompactionOutputProbeCapacity = 4096U;
 constexpr std::string_view kGpuDiagnosticCompactionOutputWriteFallbackReason =
-    "compacted draw-item output writes are capped to a 4096-item diagnostic probe because the compacted buffer is not submitted yet; "
+    "compacted draw-item output writes cover the bounded diagnostic prefix, but the compacted buffer is not submitted yet; "
     "CPU draw submission remains authoritative while the GPU pass compares count/source-fingerprint/checksum and generates a diagnostic indirect command";
 constexpr double kGpuDiagnosticCompactionTimingEpsilonMs = 0.02;
 constexpr std::uint32_t kGpuDiagnosticCompactionSlowFrameThreshold = 1U;
@@ -292,10 +291,7 @@ std::uint32_t GpuDiagnosticCompactionOutputCapacity(std::uint32_t drawPointCount
     if (!kGpuDiagnosticCompactionOutputWriteEnabled) {
         return 1U;
     }
-    return std::clamp<std::uint32_t>(
-        std::max<std::uint32_t>(1U, drawPointCount),
-        1U,
-        kGpuDiagnosticCompactionOutputProbeCapacity);
+    return std::max<std::uint32_t>(1U, GpuDiagnosticPrefixSelectionLimit(drawPointCount));
 }
 
 std::uint32_t DrawItemRepresentativeClassFlags(
@@ -1272,6 +1268,7 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason.clear();
         diagnostics_.adaptiveGpuCompactionOutputWriteEnabled = false;
         diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason.clear();
+        diagnostics_.adaptiveGpuCompactionOutputCapacity = 0;
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionOutputProbeParityStatus = "not checked";
         diagnostics_.adaptiveGpuCompactionOutputProbeCpuCount = 0;
@@ -1713,6 +1710,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason.clear();
     diagnostics_.adaptiveGpuCompactionOutputWriteEnabled = false;
     diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason.clear();
+    diagnostics_.adaptiveGpuCompactionOutputCapacity = 0;
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionOutputProbeParityStatus = "not checked";
     diagnostics_.adaptiveGpuCompactionOutputProbeCpuCount = 0;
@@ -7605,11 +7603,12 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         if (selectionWriteOutput) {
             diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason =
                 std::string(kGpuDiagnosticCompactionOutputWriteFallbackReason);
+            diagnostics_.adaptiveGpuCompactionOutputCapacity += selectionMaxOutputCount;
             diagnostics_.adaptiveGpuCompactionCopiedDrawItems +=
                 std::min(expectedStats.count, selectionMaxOutputCount);
             if (expectedStats.count > selectionMaxOutputCount) {
                 diagnostics_.adaptiveGpuCompactionOutputProbeParityStatus =
-                    "not checked: selected count exceeds capped output probe";
+                    "not checked: selected count exceeds diagnostic output capacity";
             }
         } else {
             diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason =

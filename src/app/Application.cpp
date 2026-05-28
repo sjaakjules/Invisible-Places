@@ -21371,10 +21371,11 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuCompactionPerformanceRetryFrames);
                     }
                     ImGui::Text(
-                        "GPU prefix output probe: %s | %u/%u items",
+                        "GPU prefix output probe: %s | %u/%u items | capacity %u",
                         diagnostics.adaptiveGpuCompactionOutputProbeParityStatus.c_str(),
                         diagnostics.adaptiveGpuCompactionOutputProbeGpuCount,
-                        diagnostics.adaptiveGpuCompactionOutputProbeCpuCount);
+                        diagnostics.adaptiveGpuCompactionOutputProbeCpuCount,
+                        diagnostics.adaptiveGpuCompactionOutputCapacity);
                     ImGui::Text(
                         "Adaptive GPU command generation: %.3f ms",
                         diagnostics.adaptiveGpuIndirectCommandMs);
@@ -22258,6 +22259,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::string fastBasicGpuCompactionSelectionFrustumFallbackReason;
     bool fastBasicGpuCompactionOutputWriteEnabled = false;
     std::string fastBasicGpuCompactionOutputWriteFallbackReason;
+    std::uint32_t fastBasicMaxGpuCompactionOutputCapacity = 0;
     std::uint32_t fastBasicMaxGpuCompactionCopiedDrawItems = 0;
     std::string fastBasicGpuCompactionOutputProbeParityStatus = "not checked";
     std::uint32_t fastBasicGpuCompactionOutputProbeCpuCount = 0;
@@ -22604,6 +22606,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             fastBasicGpuCompactionOutputWriteFallbackReason =
                 diagnostics.adaptiveGpuCompactionOutputWriteFallbackReason;
         }
+        fastBasicMaxGpuCompactionOutputCapacity = std::max(
+            fastBasicMaxGpuCompactionOutputCapacity,
+            diagnostics.adaptiveGpuCompactionOutputCapacity);
         fastBasicMaxGpuCompactionCopiedDrawItems = std::max(
             fastBasicMaxGpuCompactionCopiedDrawItems,
             diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23294,6 +23299,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::string gpuCompactionSelectionFrustumFallbackReason;
         bool gpuCompactionOutputWriteEnabled = false;
         std::string gpuCompactionOutputWriteFallbackReason;
+        std::uint32_t maxGpuCompactionOutputCapacity = 0;
         std::uint32_t maxGpuCompactionCopiedDrawItems = 0;
         std::string gpuCompactionOutputProbeParityStatus = "not checked";
         std::uint32_t gpuCompactionOutputProbeCpuCount = 0;
@@ -23543,6 +23549,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 stress.gpuCompactionOutputWriteFallbackReason =
                     diagnostics.adaptiveGpuCompactionOutputWriteFallbackReason;
             }
+            stress.maxGpuCompactionOutputCapacity = std::max(
+                stress.maxGpuCompactionOutputCapacity,
+                diagnostics.adaptiveGpuCompactionOutputCapacity);
             stress.maxGpuCompactionCopiedDrawItems = std::max(
                 stress.maxGpuCompactionCopiedDrawItems,
                 diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23889,6 +23898,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (fastBasicGpuCompactionOutputWriteEnabled ? "true" : "false") << ",\n"
                 << "  \"gpu_compaction_output_write_fallback_reason\": "
                 << JsonStringLiteral(fastBasicGpuCompactionOutputWriteFallbackReason) << ",\n"
+                << "  \"gpu_compaction_output_capacity\": "
+                << fastBasicMaxGpuCompactionOutputCapacity << ",\n"
                 << "  \"gpu_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"gpu_compaction_output_probe_parity_status\": "
@@ -24248,6 +24259,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (beautyStress.gpuCompactionOutputWriteEnabled ? "true" : "false") << ",\n"
                 << "  \"beauty_stress_compaction_output_write_fallback_reason\": "
                 << JsonStringLiteral(beautyStress.gpuCompactionOutputWriteFallbackReason) << ",\n"
+                << "  \"beauty_stress_compaction_output_capacity\": "
+                << beautyStress.maxGpuCompactionOutputCapacity << ",\n"
                 << "  \"beauty_stress_compaction_copied_draw_items\": "
                 << beautyStress.maxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"beauty_stress_compaction_output_probe_parity_status\": "
@@ -24528,6 +24541,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (fastBasicGpuCompactionOutputWriteEnabled ? "true" : "false") << ",\n"
                 << "  \"fast_basic_compaction_output_write_fallback_reason\": "
                 << JsonStringLiteral(fastBasicGpuCompactionOutputWriteFallbackReason) << ",\n"
+                << "  \"fast_basic_compaction_output_capacity\": "
+                << fastBasicMaxGpuCompactionOutputCapacity << ",\n"
                 << "  \"fast_basic_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"fast_basic_compaction_output_probe_parity_status\": "
@@ -24656,9 +24671,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " (" << fastBasicGpuCompactionParityStatus
               << ", " << fastBasicMaxGpuCompactionDispatches
               << " dispatches, " << fastBasicMaxGpuCompactionCopiedDrawItems
+              << "/" << fastBasicMaxGpuCompactionOutputCapacity
               << "/" << fastBasicMaxGpuCompactionDispatchedDrawItems
               << "/" << fastBasicMaxGpuCompactionInputDrawItems
-              << " items copied/dispatched/input, output "
+              << " items copied/capacity/dispatched/input, output "
               << (fastBasicGpuCompactionOutputWriteEnabled ? "write" : "count-only")
               << ", output probe " << fastBasicGpuCompactionOutputProbeParityStatus
               << " " << fastBasicGpuCompactionOutputProbeGpuCount
