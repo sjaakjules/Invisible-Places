@@ -427,8 +427,6 @@ class VulkanViewportShell {
         std::uint32_t representedCountXor = 0;
         std::uint32_t footprintXor = 0;
         std::uint32_t sourceIndexSum = 0;
-        std::uint32_t sourceFingerprintXor = 0;
-        std::uint32_t sourceFingerprintSum = 0;
         std::uint32_t representedCountSum = 0;
         std::uint32_t drawIndexXor = 0;
         std::uint32_t combinedChecksum = 0;

@@ -3020,8 +3020,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("clipPosition.w <= 0.0") != std::string::npos);
     CHECK(compactionShader.find("outputDrawItems.drawItems") != std::string::npos);
     CHECK(compactionShader.find("const uint outputIndex = atomicAdd(stats.count") != std::string::npos);
-    CHECK(compactionShader.find("sourceFingerprintXor") != std::string::npos);
-    CHECK(compactionShader.find("sourceFingerprintSum") != std::string::npos);
+    CHECK(compactionShader.find("atomicXor(stats.sourceIndexXor") != std::string::npos);
+    CHECK(compactionShader.find("atomicAdd(stats.sourceIndexSum") != std::string::npos);
+    CHECK(compactionShader.find("sourceFingerprintSum") == std::string::npos);
     CHECK(compactionShader.find("floatBitsToUint(item.params.x)") != std::string::npos);
     CHECK(compactionShader.find("combinedChecksum") != std::string::npos);
     CHECK(metadataCompactionShader.find("layout(local_size_x = 64") != std::string::npos);
@@ -3031,7 +3032,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(metadataCompactionShader.find("uniforms.viewProjection") == std::string::npos);
     CHECK(metadataCompactionShader.find("pointPositions.positions") == std::string::npos);
     CHECK(metadataCompactionShader.find("outputDrawItems.drawItems") != std::string::npos);
-    CHECK(metadataCompactionShader.find("sourceFingerprintXor") != std::string::npos);
+    CHECK(metadataCompactionShader.find("atomicXor(stats.sourceIndexXor") != std::string::npos);
+    CHECK(metadataCompactionShader.find("sourceFingerprintSum") == std::string::npos);
     CHECK(metadataCompactionShader.find("combinedChecksum") != std::string::npos);
     CHECK(computeShader.find("layout(local_size_x = 1") != std::string::npos);
     CHECK(computeShader.find("layout(push_constant)") != std::string::npos);
@@ -3097,7 +3099,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("DrawItemWithinRepresentedSourceWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinFrustumGuard") != std::string::npos);
     CHECK(rendererSource.find("cpuReferenceStart") != std::string::npos);
-    CHECK(rendererSource.find("sourceFingerprintXor") != std::string::npos);
+    CHECK(rendererSource.find("foldSourceFingerprint") != std::string::npos);
     CHECK(rendererSource.find("bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER") != std::string::npos);
     CHECK(rendererSource.find("FloatBits(selectionMinFootprintAreaPixels)") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativeClassFlags") != std::string::npos);
