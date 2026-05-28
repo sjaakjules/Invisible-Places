@@ -259,6 +259,10 @@ constexpr float kGpuDiagnosticMaxSelectionEmissionCompensation = 4.0F;
 constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
+constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = false;
+constexpr std::string_view kGpuDiagnosticCompactionOutputWriteFallbackReason =
+    "compacted draw-item output writes are disabled because the compacted buffer is not submitted yet; "
+    "the GPU pass compares count/source-fingerprint/checksum and generates a diagnostic indirect command";
 constexpr float kGpuDiagnosticSelectionFrustumGuardBand = 1.05F;
 constexpr bool kGpuDiagnosticSelectionFrustumGuardEnabled = false;
 constexpr std::string_view kGpuDiagnosticSelectionFrustumFallbackReason =
@@ -1248,6 +1252,8 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
         diagnostics_.adaptiveGpuCompactionSelectionFrustumEnabled = false;
         diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason.clear();
+        diagnostics_.adaptiveGpuCompactionOutputWriteEnabled = false;
+        diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason.clear();
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -1677,6 +1683,8 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
     diagnostics_.adaptiveGpuCompactionSelectionFrustumEnabled = false;
     diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason.clear();
+    diagnostics_.adaptiveGpuCompactionOutputWriteEnabled = false;
+    diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason.clear();
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -5125,11 +5133,14 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
 
     const auto drawItemCount = drawItems == nullptr ? 0U : static_cast<std::uint32_t>(
         std::min<std::size_t>(drawItems->size(), std::numeric_limits<std::uint32_t>::max()));
+    const auto requiredCapacity = std::max<std::uint32_t>(1U, drawItemCount);
+    const auto requiredGpuCompactedDrawItemCapacity =
+        kGpuDiagnosticCompactionOutputWriteEnabled ? requiredCapacity : 1U;
     if (resources->drawItemSignatures[frameIndex] == revision &&
         resources->drawItemCounts[frameIndex] == drawItemCount &&
         resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCompactedDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
-        resources->gpuCompactedDrawItemCapacities[frameIndex] >= std::max<std::uint32_t>(1U, drawItemCount) &&
+        resources->gpuCompactedDrawItemCapacities[frameIndex] >= requiredGpuCompactedDrawItemCapacity &&
         resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE) {
         resources->drawItemSignature = revision;
@@ -5138,7 +5149,6 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
     }
 
     bool reallocated = false;
-    const auto requiredCapacity = std::max<std::uint32_t>(1U, drawItemCount);
     if (resources->drawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
         resources->drawItemCapacities[frameIndex] < requiredCapacity) {
         DestroyBuffer(&resources->drawItemBuffers[frameIndex]);
@@ -5150,10 +5160,12 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
         reallocated = true;
     }
     if (resources->gpuCompactedDrawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
-        resources->gpuCompactedDrawItemCapacities[frameIndex] < requiredCapacity) {
+        resources->gpuCompactedDrawItemCapacities[frameIndex] < requiredGpuCompactedDrawItemCapacity) {
         DestroyBuffer(&resources->gpuCompactedDrawItemBuffers[frameIndex]);
         const auto newCapacity =
-            std::max(requiredCapacity, resources->gpuCompactedDrawItemCapacities[frameIndex] * 2U);
+            std::max(
+                requiredGpuCompactedDrawItemCapacity,
+                resources->gpuCompactedDrawItemCapacities[frameIndex] * 2U);
         resources->gpuCompactedDrawItemBuffers[frameIndex] = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(newCapacity * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -7016,9 +7028,11 @@ bool VulkanViewportShell::PointCloudPlanUsesGpuCompaction(
         return false;
     }
 
+    const auto requiredCompactedOutputCapacity =
+        kGpuDiagnosticCompactionOutputWriteEnabled ? plan.drawPointCount : 1U;
     return plan.resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactedDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
-           plan.resources->gpuCompactedDrawItemCapacities[frameIndex] >= plan.drawPointCount &&
+           plan.resources->gpuCompactedDrawItemCapacities[frameIndex] >= requiredCompactedOutputCapacity &&
            plan.resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->positionStorageBuffer.buffer != VK_NULL_HANDLE &&
@@ -7084,6 +7098,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             kGpuDiagnosticMinSelectionRepresentedSourceCount;
         constexpr std::uint32_t selectionMaxRepresentedSourceCount =
             kGpuDiagnosticMaxSelectionRepresentedSourceCount;
+        constexpr bool selectionWriteOutput = kGpuDiagnosticCompactionOutputWriteEnabled;
         constexpr bool selectionFrustumEnabled = kGpuDiagnosticSelectionFrustumGuardEnabled;
         const auto selectionPositionCount = selectionFrustumEnabled
                                                 ? static_cast<std::uint32_t>(
@@ -7141,7 +7156,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMaxRepresentedSourceCount,
                 selectionPositionCount,
                 FloatBits(selectionFrustumGuardBand)},
-            glm::uvec4{selectionProfileMask, 0U, 0U, 0U},
+            glm::uvec4{selectionProfileMask, selectionWriteOutput ? 1U : 0U, 0U, 0U},
             glm::uvec4{
                 FloatBits(selectionMinOpacityCompensation),
                 FloatBits(selectionMaxOpacityCompensation),
@@ -7310,7 +7325,15 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason =
                 std::string(kGpuDiagnosticSelectionFrustumFallbackReason);
         }
-        diagnostics_.adaptiveGpuCompactionCopiedDrawItems += expectedStats.count;
+        diagnostics_.adaptiveGpuCompactionOutputWriteEnabled =
+            diagnostics_.adaptiveGpuCompactionOutputWriteEnabled || selectionWriteOutput;
+        if (!selectionWriteOutput) {
+            diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason =
+                std::string(kGpuDiagnosticCompactionOutputWriteFallbackReason);
+        }
+        if (selectionWriteOutput) {
+            diagnostics_.adaptiveGpuCompactionCopiedDrawItems += expectedStats.count;
+        }
     }
 
     if (recordedAny) {
@@ -7322,7 +7345,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, workgroup-aggregated, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
+            "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, workgroup-aggregated, count-compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
             "the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
@@ -7450,7 +7473,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, workgroup-aggregated, compacted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
+                  "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, workgroup-aggregated, count-compacted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =

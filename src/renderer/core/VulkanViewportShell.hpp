@@ -161,6 +161,8 @@ struct ViewportDiagnostics {
     float adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
     bool adaptiveGpuCompactionSelectionFrustumEnabled = false;
     std::string adaptiveGpuCompactionSelectionFrustumFallbackReason;
+    bool adaptiveGpuCompactionOutputWriteEnabled = false;
+    std::string adaptiveGpuCompactionOutputWriteFallbackReason;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
