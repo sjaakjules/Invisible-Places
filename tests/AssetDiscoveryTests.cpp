@@ -3128,7 +3128,6 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("GpuDiagnosticCompactionOutputCapacity") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticSelectionLimit(drawPointCount)") != std::string::npos);
     CHECK(rendererSource.find("return drawPointCount;") != std::string::npos);
-    CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteFallbackReason") != std::string::npos);
     CHECK(rendererSource.find("GpuDrawItemOutputProbeStats") != std::string::npos);
     CHECK(rendererSource.find("orderChecksum") != std::string::npos);
     CHECK(rendererSource.find("AccumulateGpuCompactionOutputProbeStats") != std::string::npos);
@@ -3177,6 +3176,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-compacted-indirect-submit") != std::string::npos);
     CHECK(rendererSource.find("GPU-compacted draw-item output submitted after CPU/GPU parity") != std::string::npos);
+    CHECK(rendererSource.find("PointCloudPlanUsesGpuCompactionSubmission(plan, frameIndex, imageIndex, false)") != std::string::npos);
+    CHECK(rendererSource.find("CPU-count indirect command generation remains the fallback when compacted submission gates fail") != std::string::npos);
     CHECK(rendererSource.find("resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer") != std::string::npos);
     CHECK(rendererSource.find("resources->gpuCompactedDescriptorSets[frameIndex][imageIndex]") != std::string::npos);
     CHECK(rendererSource.find("workgroup-aggregated") != std::string::npos);

@@ -37,7 +37,7 @@ full-range semantic-equivalent selection/count-compaction/source-fingerprint/che
 diagnostic viewport draws, a compacted-output diagnostic buffer capped at 3,145,728
 draw items, ordered draw-index-preserving output writes when the fitted CPU-selected range is complete, order-sensitive output identity parity, compacted-output descriptor/barrier submission after parity and performance gates pass, diagnostic compacted-count indirect
 command output, full CPU-selected-range dispatch, and CPU-count compute-generated submitted indirect
-command output when compacted output is not eligible. It also tracks CPU/GPU full-range predicate
+command output only when compacted output is not eligible for the current image. It also tracks CPU/GPU full-range predicate
 timing per renderer profile and keeps explicit retry-window fallback reasons when the GPU path is slower or unsupported. The frustum-checked shader path remains available for comparison,
 but is disabled by default after slower MoltenVK timing. GPU compute selection
 remains guarded behind feature, parity, and timing proof; on the local MoltenVK
@@ -405,8 +405,9 @@ sample-count cap anymore.
 - Stage 11 sample evidence on `Data/Site3-Sample-Terrestrial.ply` completed
   build, focused GPU/LOD tests, full CTest 189/189, stream check, JSON metrics
   validation, and repeat `--lod-compare` runs after compacted draw-item graphics
-  submission was enabled. The local MoltenVK runtime reported GPU-selection
-  feature support plus indirect-count support; the runtime path now reports
+  submission was enabled and redundant CPU-count indirect command generation was
+  skipped once compacted submission became eligible for the current image. The
+  local MoltenVK runtime reported GPU-selection feature support plus indirect-count support; the runtime path now reports
   `cpu-selection+gpu-full-range-selection-compare+gpu-compacted-indirect-submit`
   for eligible viewport draws. The metadata compute shader decodes draw-item
   renderer profile/class/rank/depth/flags plus represented-count,
@@ -424,16 +425,19 @@ sample-count cap anymore.
   draw items, matched previous-frame CPU/GPU selected count 2,876,771 / 2,876,771,
   matched compacted indirect CPU/GPU vertices 2,876,771 / 2,876,771, copied all
   2,876,771 draw items into the compacted output buffer, and passed ordered
-  output identity 2,876,771 / 2,876,771. Fast Basic measured 226.521 ms for the
-  CPU reference predicate and 9.29846 ms for GPU full-range compaction, so the
+  output identity 2,876,771 / 2,876,771. Fast Basic measured 226.882 ms for the
+  CPU reference predicate and 9.66508 ms for GPU full-range compaction, so the
   GPU pass is measurably faster for the semantic-equivalent predicate. The
   compacted-submission gate now reports `gpu_compaction_submission_used=true`,
-  an empty submission fallback reason, candidate/reference vertices 2,876,771 /
+  empty output-write and submission fallback reasons, candidate/reference vertices 2,876,771 /
   2,876,771, and submitted 2,876,771 compacted indirect vertices under the
-  4,823,449 representative budget. Beauty stress also submitted compacted output
-  after parity, reported candidate/reference vertices 262,132 / 262,132,
-  measured 21.2543 ms CPU reference vs 6.79808 ms GPU compaction, and kept max
-  GPU point pass 0.089 ms with EWMA 0.0363169 ms. The frustum-checked shader path
+  4,823,449 representative budget. The older CPU-count indirect command remains
+  as a first-frame fallback only, with 1 dispatch at 0.011542 ms in the latest
+  sample run. Beauty stress also submitted compacted output after parity,
+  reported candidate/reference vertices 262,132 / 262,132, measured 20.8719 ms
+  CPU reference vs 7.64238 ms GPU compaction, kept max GPU point pass 0.096917 ms
+  with EWMA 0.0298263 ms, and skipped the CPU-count indirect command entirely
+  once compacted submission was eligible. The frustum-checked shader path
   still exists, but `*_compaction_selection_frustum_enabled=false`, guard band 0,
   and the fallback reason reports that the GPU geometry-frustum predicate is
   disabled because the previous MoltenVK/sample measurement was slower than
@@ -721,7 +725,8 @@ the next GPU candidate is profiled.
 - Keep the current indirect and compacted-output submission paths guarded by
   runtime diagnostics. Move culling, projected-error evaluation, authoritative
   compaction/selection, and indirect-count work to compute only where they beat
-  the CPU path.
+  the CPU path, and keep skipping redundant CPU-count command generation when a
+  compacted command is already eligible.
 - Keep a CPU fallback for portability and debugging.
 
 Metrics to watch:

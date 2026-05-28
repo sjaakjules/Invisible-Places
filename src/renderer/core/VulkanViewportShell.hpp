@@ -753,6 +753,7 @@ class VulkanViewportShell {
     [[nodiscard]] bool RecordGpuDrivenIndirectCommandsForScene(
         VkCommandBuffer commandBuffer,
         std::size_t frameIndex,
+        std::uint32_t imageIndex,
         bool forceFullSource);
     void CreateOrUpdateCompositeDescriptorSet();
     void CreateOrUpdateCompositeDescriptorSet(
