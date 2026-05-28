@@ -55,6 +55,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_surfel_exr_constant_simple_accumulation.frag
     shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
+    shaders/pointcloud_draw_item_compact.comp
     shaders/pointcloud_indirect_command.comp
     shaders/gsplat_accumulation.vert
     shaders/gsplat_accumulation.frag

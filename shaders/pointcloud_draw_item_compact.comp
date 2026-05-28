@@ -1,0 +1,69 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct PointDrawItemGpu {
+    uvec4 indices;
+    vec4 params;
+};
+
+layout(push_constant) uniform CompactionPushConstants {
+    uint itemCount;
+    uint flags;
+    uint reserved0;
+    uint reserved1;
+} pushConstants;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
+    PointDrawItemGpu drawItems[];
+} inputDrawItems;
+
+layout(set = 0, binding = 1, std430) buffer OutputDrawItems {
+    PointDrawItemGpu drawItems[];
+} outputDrawItems;
+
+layout(set = 0, binding = 2, std430) buffer CompactionStats {
+    uint count;
+    uint sourceIndexXor;
+    uint representedCountXor;
+    uint footprintXor;
+    uint sourceIndexSum;
+    uint representedCountSum;
+    uint drawIndexXor;
+    uint combinedChecksum;
+} stats;
+
+uint MixWord(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+void main() {
+    const uint drawIndex = gl_GlobalInvocationID.x;
+    if (drawIndex >= pushConstants.itemCount) {
+        return;
+    }
+
+    const PointDrawItemGpu item = inputDrawItems.drawItems[drawIndex];
+    outputDrawItems.drawItems[drawIndex] = item;
+
+    const uint sourceIndex = item.indices.x;
+    const uint representedCount = item.indices.y;
+    const uint footprintBits = floatBitsToUint(item.params.x);
+    const uint mixed = MixWord(sourceIndex ^ (drawIndex * 0x9e3779b9u)) ^
+                       MixWord(representedCount + 0x85ebca6bu) ^
+                       MixWord(footprintBits + 0xc2b2ae35u);
+
+    atomicAdd(stats.count, 1u);
+    atomicXor(stats.sourceIndexXor, sourceIndex);
+    atomicXor(stats.representedCountXor, representedCount);
+    atomicXor(stats.footprintXor, footprintBits);
+    atomicAdd(stats.sourceIndexSum, sourceIndex);
+    atomicAdd(stats.representedCountSum, representedCount);
+    atomicXor(stats.drawIndexXor, drawIndex);
+    atomicXor(stats.combinedChecksum, mixed);
+}

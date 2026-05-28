@@ -131,6 +131,15 @@ struct ViewportDiagnostics {
     std::string adaptiveSelectionParityStatus = "not checked";
     bool adaptiveGpuSelectionSupported = false;
     bool adaptiveGpuSelectionBeneficial = false;
+    bool adaptiveGpuCompactionSupported = false;
+    bool adaptiveGpuCompactionUsed = false;
+    std::string adaptiveGpuCompactionParityStatus = "not checked";
+    std::uint32_t adaptiveGpuCompactionDispatches = 0;
+    std::uint32_t adaptiveGpuCompactionCpuCount = 0;
+    std::uint32_t adaptiveGpuCompactionGpuCount = 0;
+    std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
+    std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
+    std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
     bool adaptiveIndirectDrawSupported = false;
     bool adaptiveIndirectCountSupported = false;
     bool adaptiveIndirectDrawRecommended = false;
@@ -144,6 +153,7 @@ struct ViewportDiagnostics {
     std::uint64_t adaptiveGpuSelectedRepresentativeCount = 0;
     double adaptiveGpuSelectionMs = 0.0;
     double adaptiveGpuCompactionMs = 0.0;
+    double adaptiveGpuIndirectCommandMs = 0.0;
     std::string adaptiveLodPersistentCacheStatus;
     std::string adaptiveLodRuntimeStatus;
     std::string adaptiveLodRequestedDensity;
@@ -378,6 +388,17 @@ class VulkanViewportShell {
         VkFormat format = VK_FORMAT_UNDEFINED;
     };
 
+    struct GpuDrawItemCompactionStats {
+        std::uint32_t count = 0;
+        std::uint32_t sourceIndexXor = 0;
+        std::uint32_t representedCountXor = 0;
+        std::uint32_t footprintXor = 0;
+        std::uint32_t sourceIndexSum = 0;
+        std::uint32_t representedCountSum = 0;
+        std::uint32_t drawIndexXor = 0;
+        std::uint32_t combinedChecksum = 0;
+    };
+
     struct ActivePointCloudResources {
         std::size_t layerId = 0;
         BufferAllocation positionBuffer{};
@@ -392,14 +413,20 @@ class VulkanViewportShell {
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
         std::array<BufferAllocation, kFramesInFlight> drawItemBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> gpuCompactedDrawItemBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> gpuCompactionStatsBuffers{};
         std::array<BufferAllocation, kFramesInFlight> indirectDrawCommandBuffers{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuIndirectDescriptorSets{};
+        std::array<VkDescriptorSet, kFramesInFlight> gpuCompactionDescriptorSets{};
         BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
         std::uint32_t activePointCount = 0;
         std::uint32_t drawItemCount = 0;
         std::array<std::uint32_t, kFramesInFlight> drawItemCounts{};
         std::array<std::uint32_t, kFramesInFlight> drawItemCapacities{};
+        std::array<std::uint32_t, kFramesInFlight> gpuCompactedDrawItemCapacities{};
+        std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuCompactionExpectedStats{};
+        std::array<bool, kFramesInFlight> gpuCompactionResultPending{};
         std::uint32_t exrDrawItemCount = 0;
         std::uint32_t exrDrawItemCapacity = 0;
         std::uint32_t scalarFieldCount = 0;
@@ -445,7 +472,7 @@ class VulkanViewportShell {
         VkFence fence = VK_NULL_HANDLE;
         VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
         bool timestampQueriesArmed = false;
-        std::array<bool, 6U> timestampPassWritten{};
+        std::array<bool, 7U> timestampPassWritten{};
     };
 
     struct HighQualityGaussianSceneResources {
@@ -515,6 +542,7 @@ class VulkanViewportShell {
     void CreateCompositeDescriptorSetLayout();
     void CreatePostProcessDescriptorSetLayout();
     void CreateGpuDrivenSelectionDescriptorSetLayout();
+    void CreateGpuCompactionDescriptorSetLayout();
     void CreateDescriptorPools();
     void CreatePostProcessSampler();
     void CreateUniformResources();
@@ -524,6 +552,7 @@ class VulkanViewportShell {
     void CreateCompositePipeline();
     void CreatePostProcessPipeline();
     void CreateGpuDrivenSelectionPipeline();
+    void CreateGpuCompactionPipeline();
     void CreateExrExportResources(std::uint32_t width, std::uint32_t height);
     void CreateExrExportRenderPass(ExrExportResources* resources);
     void CreateExrExportPipelines(ExrExportResources* resources);
@@ -537,6 +566,7 @@ class VulkanViewportShell {
     void CreateCommandBuffers();
     void CreateSyncObjects();
     void ReadPreviousGpuTimestampResults(FrameResources* frame);
+    void ReadPreviousGpuCompactionResults(std::size_t frameIndex);
     void ResetGpuTimestampQueries(VkCommandBuffer commandBuffer, FrameResources* frame);
     void WriteGpuTimestamp(
         VkCommandBuffer commandBuffer,
@@ -562,6 +592,18 @@ class VulkanViewportShell {
         VkImageView sceneDepthView);
     void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
     void UpdateGpuDrivenIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
+    void UpdateGpuCompactionDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
+    [[nodiscard]] GpuDrawItemCompactionStats ComputeGpuCompactionStats(
+        const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
+        std::uint32_t drawItemCount) const;
+    [[nodiscard]] bool PointCloudPlanUsesGpuCompaction(
+        const PointCloudDrawPlan& plan,
+        std::size_t frameIndex,
+        bool exrStyle) const;
+    [[nodiscard]] bool RecordGpuDrawItemCompactionForScene(
+        VkCommandBuffer commandBuffer,
+        std::size_t frameIndex,
+        bool forceFullSource);
     [[nodiscard]] bool PointCloudPlanUsesGpuIndirectCommand(
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
@@ -670,6 +712,7 @@ class VulkanViewportShell {
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout postProcessPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout gpuDrivenSelectionPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout gpuCompactionPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
@@ -684,12 +727,14 @@ class VulkanViewportShell {
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
     VkPipeline gpuDrivenIndirectCommandPipeline_ = VK_NULL_HANDLE;
+    VkPipeline gpuDrawItemCompactionPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout postProcessDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gpuDrivenSelectionDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gpuCompactionDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool gaussianSplatDescriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool imguiDescriptorPool_ = VK_NULL_HANDLE;
