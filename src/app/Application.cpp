@@ -21327,7 +21327,7 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveGpuIndirectCommandDispatches);
                 if (diagnostics.adaptiveGpuIndirectCommandUsed || diagnostics.adaptiveGpuCompactionMs > 0.0) {
                     ImGui::Text(
-                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u reps %u-%u frustum %s %.2fx/%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | %.3f ms",
+                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u reps %u-%u frustum %s %.2fx/%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | cpu %.3f ms gpu %.3f ms",
                         diagnostics.adaptiveGpuCompactionParityStatus.c_str(),
                         diagnostics.adaptiveGpuCompactionCopiedDrawItems,
                         diagnostics.adaptiveGpuCompactionInputDrawItems,
@@ -21346,6 +21346,7 @@ void DrawDiagnosticsWindow(
                         diagnostics.adaptiveGpuCompactionSelectionMaxRenderAreaPixels,
                         diagnostics.adaptiveGpuCompactionSelectionRequiredFlags,
                         diagnostics.adaptiveGpuCompactionSelectionRejectedFlags,
+                        diagnostics.adaptiveGpuCompactionCpuReferenceMs,
                         diagnostics.adaptiveGpuCompactionMs);
                     if (!diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason.empty()) {
                         ImGui::TextWrapped(
@@ -22236,6 +22237,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuCompactionIndirectCommandGpuVertices = 0;
     std::uint64_t fastBasicIndirectSubmittedVertices = 0;
     std::uint64_t fastBasicGpuSelectedRepresentativeCount = 0;
+    double fastBasicMaxGpuCompactionCpuReferenceMs = 0.0;
     double fastBasicMaxGpuCompactionMs = 0.0;
     double fastBasicMaxGpuIndirectCommandMs = 0.0;
     double fastBasicMaxGpuPointPassMs = 0.0;
@@ -22561,6 +22563,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             std::max(fastBasicIndirectSubmittedVertices, diagnostics.adaptiveIndirectSubmittedVertices);
         fastBasicGpuSelectedRepresentativeCount =
             std::max(fastBasicGpuSelectedRepresentativeCount, diagnostics.adaptiveGpuSelectedRepresentativeCount);
+        fastBasicMaxGpuCompactionCpuReferenceMs =
+            std::max(fastBasicMaxGpuCompactionCpuReferenceMs, diagnostics.adaptiveGpuCompactionCpuReferenceMs);
         fastBasicMaxGpuCompactionMs =
             std::max(fastBasicMaxGpuCompactionMs, diagnostics.adaptiveGpuCompactionMs);
         fastBasicMaxGpuIndirectCommandMs =
@@ -23190,6 +23194,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t gpuCompactionIndirectCommandGpuVertices = 0;
         std::uint64_t indirectSubmittedVertices = 0;
         std::uint64_t gpuSelectedRepresentativeCount = 0;
+        double maxGpuCompactionCpuReferenceMs = 0.0;
         double maxGpuCompactionMs = 0.0;
         double maxGpuIndirectCommandMs = 0.0;
         std::uint64_t maxAdaptiveRepresentatives = 0;
@@ -23418,6 +23423,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 std::max(stress.indirectSubmittedVertices, diagnostics.adaptiveIndirectSubmittedVertices);
             stress.gpuSelectedRepresentativeCount =
                 std::max(stress.gpuSelectedRepresentativeCount, diagnostics.adaptiveGpuSelectedRepresentativeCount);
+            stress.maxGpuCompactionCpuReferenceMs =
+                std::max(stress.maxGpuCompactionCpuReferenceMs, diagnostics.adaptiveGpuCompactionCpuReferenceMs);
             stress.maxGpuCompactionMs =
                 std::max(stress.maxGpuCompactionMs, diagnostics.adaptiveGpuCompactionMs);
             stress.maxGpuIndirectCommandMs =
@@ -23572,6 +23579,22 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         }
     }
 
+    const auto gpuCompactionPerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU prefix compaction faster than CPU reference"}
+                   : std::string{"CPU reference faster; GPU prefix compaction remains compare-only"};
+    };
+    const auto fastBasicGpuCompactionPerformanceStatus =
+        gpuCompactionPerformanceStatus(fastBasicMaxGpuCompactionCpuReferenceMs, fastBasicMaxGpuCompactionMs);
+    const auto beautyStressGpuCompactionPerformanceStatus =
+        gpuCompactionPerformanceStatus(beautyStress.maxGpuCompactionCpuReferenceMs, beautyStress.maxGpuCompactionMs);
+
     const auto metricsPath = outputDirectory / "lod_compare_metrics.json";
     {
         std::ofstream metrics{metricsPath, std::ios::trunc};
@@ -23676,6 +23699,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"gpu_compaction_gpu_count\": " << fastBasicGpuCompactionGpuCount << ",\n"
                 << "  \"gpu_compaction_cpu_checksum\": " << fastBasicGpuCompactionCpuChecksum << ",\n"
                 << "  \"gpu_compaction_gpu_checksum\": " << fastBasicGpuCompactionGpuChecksum << ",\n"
+                << "  \"gpu_compaction_cpu_reference_ms\": "
+                << fastBasicMaxGpuCompactionCpuReferenceMs << ",\n"
+                << "  \"gpu_compaction_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuCompactionPerformanceStatus) << ",\n"
                 << "  \"gpu_compaction_ms\": " << fastBasicMaxGpuCompactionMs << ",\n"
                 << "  \"gpu_compaction_indirect_command_supported\": "
                 << (fastBasicGpuCompactionIndirectCommandSupported ? "true" : "false") << ",\n"
@@ -23995,6 +24022,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << beautyStress.gpuCompactionCpuChecksum << ",\n"
                 << "  \"beauty_stress_compaction_gpu_checksum\": "
                 << beautyStress.gpuCompactionGpuChecksum << ",\n"
+                << "  \"beauty_stress_compaction_cpu_reference_ms\": "
+                << beautyStress.maxGpuCompactionCpuReferenceMs << ",\n"
+                << "  \"beauty_stress_compaction_performance_status\": "
+                << JsonStringLiteral(beautyStressGpuCompactionPerformanceStatus) << ",\n"
                 << "  \"beauty_stress_compaction_ms\": "
                 << beautyStress.maxGpuCompactionMs << ",\n"
                 << "  \"beauty_stress_compaction_indirect_command_supported\": "
@@ -24231,6 +24262,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicGpuCompactionCpuChecksum << ",\n"
                 << "  \"fast_basic_compaction_gpu_checksum\": "
                 << fastBasicGpuCompactionGpuChecksum << ",\n"
+                << "  \"fast_basic_compaction_cpu_reference_ms\": "
+                << fastBasicMaxGpuCompactionCpuReferenceMs << ",\n"
+                << "  \"fast_basic_compaction_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuCompactionPerformanceStatus) << ",\n"
                 << "  \"fast_basic_compaction_ms\": "
                 << fastBasicMaxGpuCompactionMs << ",\n"
                 << "  \"fast_basic_compaction_indirect_command_supported\": "
@@ -24341,7 +24376,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << "-" << fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels
               << ", flags +" << fastBasicGpuCompactionSelectionRequiredFlags
               << "/-" << fastBasicGpuCompactionSelectionRejectedFlags
-              << ", " << fastBasicMaxGpuCompactionMs << " ms)"
+              << ", cpu " << fastBasicMaxGpuCompactionCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuCompactionMs
+              << " ms, " << fastBasicGpuCompactionPerformanceStatus << ")"
               << " | gpu compacted indirect: "
               << (fastBasicGpuCompactionIndirectCommandUsed ? "yes" : "no")
               << " (" << fastBasicGpuCompactionIndirectCommandParityStatus

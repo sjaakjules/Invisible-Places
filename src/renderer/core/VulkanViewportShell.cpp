@@ -1232,6 +1232,7 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveIndirectSubmittedVertices = 0;
         diagnostics_.adaptiveGpuSelectedRepresentativeCount = 0;
         diagnostics_.adaptiveGpuSelectionMs = 0.0;
+        diagnostics_.adaptiveGpuCompactionCpuReferenceMs = 0.0;
         diagnostics_.adaptiveGpuCompactionMs = 0.0;
         diagnostics_.adaptiveGpuIndirectCommandMs = 0.0;
     }
@@ -1652,6 +1653,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveIndirectSubmittedVertices = 0;
     diagnostics_.adaptiveGpuSelectedRepresentativeCount = gpuSelectionDecision.gpuSelectedRepresentativeCount;
     diagnostics_.adaptiveGpuSelectionMs = gpuSelectionDecision.computeSelectionMs;
+    diagnostics_.adaptiveGpuCompactionCpuReferenceMs = 0.0;
     diagnostics_.adaptiveGpuCompactionMs = gpuSelectionDecision.compactionMs;
     diagnostics_.adaptiveGpuIndirectCommandMs = 0.0;
     diagnostics_.adaptiveLodPersistentCacheStatus = std::move(adaptivePersistentCacheStatus);
@@ -7001,6 +7003,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                                                 : 0U;
         constexpr float selectionFrustumGuardBand =
             selectionFrustumEnabled ? kGpuDiagnosticSelectionFrustumGuardBand : 0.0F;
+        const auto cpuReferenceStart = std::chrono::steady_clock::now();
         const auto expectedStats =
             ComputeGpuCompactionStats(
                 *layer.adaptiveDrawItems,
@@ -7020,6 +7023,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMaxRepresentedSourceCount,
                 renderState_.viewProjection,
                 selectionFrustumGuardBand);
+        diagnostics_.adaptiveGpuCompactionCpuReferenceMs +=
+            MillisecondsBetween(cpuReferenceStart, std::chrono::steady_clock::now());
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
             plan.resources->gpuCompactionStatsBuffers[frameIndex],

@@ -176,6 +176,7 @@ struct ViewportDiagnostics {
     std::uint64_t adaptiveIndirectSubmittedVertices = 0;
     std::uint64_t adaptiveGpuSelectedRepresentativeCount = 0;
     double adaptiveGpuSelectionMs = 0.0;
+    double adaptiveGpuCompactionCpuReferenceMs = 0.0;
     double adaptiveGpuCompactionMs = 0.0;
     double adaptiveGpuIndirectCommandMs = 0.0;
     std::string adaptiveLodPersistentCacheStatus;
