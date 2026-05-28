@@ -3108,6 +3108,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("gpuCompactionExpectedIndirectCommands") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteEnabled") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputCapacityLimit") != std::string::npos);
+    CHECK(rendererSource.find("1'310'720U") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticCompactionOutputCapacity") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticSelectionLimit(drawPointCount)") != std::string::npos);
     CHECK(rendererSource.find("return drawPointCount;") != std::string::npos);

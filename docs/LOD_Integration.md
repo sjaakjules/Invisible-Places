@@ -34,7 +34,7 @@ Stage 11 adds runtime GPU-driven selection feature checks, CPU/GPU parity policy
 helpers, indirect draw diagnostics, `vkCmdDrawIndirect` submission for large
 adaptive draw-item paths when supported, compare-only GPU draw-item
 full-range selection/performance-clamped represented-count-limited projected-footprint depth-windowed rank-and-representative-class filtering/count-compaction/source-fingerprint/checksum/class-count diagnostics for
-diagnostic viewport draws, a compacted-output diagnostic buffer capped at 262,144
+diagnostic viewport draws, a compacted-output diagnostic buffer capped at 1,310,720
 draw items with an explicit not-submitted fallback while CPU draw submission remains authoritative, diagnostic compacted-count indirect
 command output, full CPU-selected-range dispatch, and CPU-count compute-generated submitted indirect
 command output for eligible viewport draws. It also tracks CPU/GPU full-range predicate
@@ -414,7 +414,7 @@ sample-count cap anymore.
   selected items per workgroup before updating global compaction stats,
   accumulates CPU/GPU representative class counts, folds source-identity
   fingerprints from the existing source-index XOR/sum accumulators, checksums
-  CPU-selected draw items, writes a capped 262,144-item compacted-output
+  CPU-selected draw items, writes a capped 1,310,720-item compacted-output
   diagnostic buffer when possible, and converts the compacted GPU count to a
   diagnostic indirect command. The compacted output buffer still has an explicit
   fallback reason because it is not submitted yet; CPU draw submission remains
@@ -426,17 +426,16 @@ sample-count cap anymore.
   185,218,674, class counts spatial 1,135,280 / 1,135,280, colour 56/56, normal
   12/12, scalar min/max/threshold 229/229 / 246/246 / 58/58, emissive 67/67,
   blue-noise 0/0, and matched compacted indirect CPU/GPU vertices 1,135,802 /
-  1,135,802. Fast Basic copied 262,144 draw items into the capped diagnostic
-  output buffer, but the output probe is explicitly not checked because the full
-  selected count exceeds that capacity. Fast Basic measured 71.482 ms for the CPU
-  reference predicate and 4.28862 ms for GPU full-range compaction, so the GPU
-  pass is measurably faster for that diagnostic predicate.
-  Beauty stress recorded 1 full-range dispatch over 262,132 CPU-selected draw
-  items, matched previous-frame CPU/GPU count 4,957 / 4,957, matched class counts
-  and compacted indirect vertices 4,957 / 4,957, and verified compacted-output
-  probe identity, but measured 3.32017 ms CPU reference vs 5.13196 ms GPU
+  1,135,802. Fast Basic copied all 1,135,802 selected draw items into the
+  1,310,720-item diagnostic output buffer and the compacted-output probe passed
+  previous-frame identity 1,135,802 / 1,135,802. Fast Basic measured 102.967 ms
+  for the CPU reference predicate and 5.74038 ms for GPU full-range compaction,
+  so the GPU pass is measurably faster for that diagnostic predicate.
+  Beauty stress remained in the CPU-faster compare-only fallback: latest metrics
+  used 262,115 input draw items, copied 8,519 selected items, passed compacted-output
+  probe identity, and measured 3.16617 ms CPU reference vs 4.37279 ms GPU
   compaction. It therefore reports
-  `GPU full-range compaction was slower than the CPU reference after a slower Beauty screen sprite sample (last CPU 3.192750 ms, GPU 5.131958 ms); compare pass suspended until the retry window reopens`
+  `GPU full-range compaction was slower than the CPU reference after a slower Beauty screen sprite sample (last CPU 3.109375 ms, GPU 3.540792 ms); compare pass suspended until the retry window reopens`
   with 119 retry frames remaining. The frustum-checked shader path still exists,
   but `*_compaction_selection_frustum_enabled=false`, guard band 0, and the
   fallback reason reports that the GPU geometry-frustum predicate is disabled

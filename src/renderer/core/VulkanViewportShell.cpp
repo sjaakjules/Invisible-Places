@@ -260,7 +260,7 @@ constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
 constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = true;
-constexpr std::uint32_t kGpuDiagnosticCompactionOutputCapacityLimit = 262'144U;
+constexpr std::uint32_t kGpuDiagnosticCompactionOutputCapacityLimit = 1'310'720U;
 constexpr std::string_view kGpuDiagnosticCompactionOutputWriteFallbackReason =
     "compacted draw-item output writes cover a capped diagnostic slice of the full CPU-selected range, but the compacted buffer is not submitted yet; "
     "CPU draw submission remains authoritative while the GPU pass compares full-range count/source-fingerprint/checksum/class-counts and generates a diagnostic indirect command";
