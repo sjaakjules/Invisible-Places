@@ -155,6 +155,12 @@ struct ViewportDiagnostics {
     bool adaptiveGpuIndirectCommandSupported = false;
     bool adaptiveGpuIndirectCommandUsed = false;
     std::uint32_t adaptiveGpuIndirectCommandDispatches = 0;
+    bool adaptiveGpuCompactionIndirectCommandSupported = false;
+    bool adaptiveGpuCompactionIndirectCommandUsed = false;
+    std::string adaptiveGpuCompactionIndirectCommandParityStatus = "not checked";
+    std::uint32_t adaptiveGpuCompactionIndirectCommandDispatches = 0;
+    std::uint32_t adaptiveGpuCompactionIndirectCommandCpuVertices = 0;
+    std::uint32_t adaptiveGpuCompactionIndirectCommandGpuVertices = 0;
     std::uint32_t adaptiveIndirectDrawCalls = 0;
     std::uint32_t adaptiveIndirectDrawCount = 0;
     std::uint64_t adaptiveIndirectSubmittedVertices = 0;
@@ -424,7 +430,9 @@ class VulkanViewportShell {
         std::array<BufferAllocation, kFramesInFlight> gpuCompactedDrawItemBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuCompactionStatsBuffers{};
         std::array<BufferAllocation, kFramesInFlight> indirectDrawCommandBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> gpuCompactionIndirectCommandBuffers{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuIndirectDescriptorSets{};
+        std::array<VkDescriptorSet, kFramesInFlight> gpuCompactionIndirectDescriptorSets{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuCompactionDescriptorSets{};
         BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
@@ -435,6 +443,8 @@ class VulkanViewportShell {
         std::array<std::uint32_t, kFramesInFlight> gpuCompactedDrawItemCapacities{};
         std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuCompactionExpectedStats{};
         std::array<bool, kFramesInFlight> gpuCompactionResultPending{};
+        std::array<VkDrawIndirectCommand, kFramesInFlight> gpuCompactionExpectedIndirectCommands{};
+        std::array<bool, kFramesInFlight> gpuCompactionIndirectCommandResultPending{};
         std::uint32_t exrDrawItemCount = 0;
         std::uint32_t exrDrawItemCapacity = 0;
         std::uint32_t scalarFieldCount = 0;
@@ -600,6 +610,7 @@ class VulkanViewportShell {
         VkImageView sceneDepthView);
     void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
     void UpdateGpuDrivenIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
+    void UpdateGpuCompactionIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     void UpdateGpuCompactionDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     [[nodiscard]] GpuDrawItemCompactionStats ComputeGpuCompactionStats(
         const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,

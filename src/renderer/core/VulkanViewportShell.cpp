@@ -229,6 +229,8 @@ constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
 constexpr std::uint32_t kMinimumAdaptiveIndirectDrawPoints = 4096U;
+constexpr std::uint32_t kGpuIndirectCommandModeFromPushConstants = 0U;
+constexpr std::uint32_t kGpuIndirectCommandModeFromCompactionStats = 1U;
 constexpr std::uint32_t kDrawItemMetadataRankMask = 0x7ffU;
 constexpr std::uint32_t kGpuDiagnosticRankSelectionLimit = kDrawItemMetadataRankMask / 2U;
 constexpr std::uint32_t kDrawItemMetadataDepthShift = 24U;
@@ -275,6 +277,13 @@ std::uint32_t DrawItemRepresentativePackedDepth(
 std::uint32_t DrawItemRepresentativePackedFlags(
     const renderer::pointcloud::PointCloudDrawItemGpu& item) {
     return (item.reserved1 >> kDrawItemMetadataFlagsShift) & kDrawItemMetadataFlagsMask;
+}
+
+std::uint32_t IndirectVertexCountFromCompactedItems(
+    std::uint32_t compactedItemCount,
+    bool worldSurfels) {
+    const auto multiplier = worldSurfels ? kSurfelVerticesPerPoint : 1U;
+    return std::min(compactedItemCount, std::numeric_limits<std::uint32_t>::max() / multiplier) * multiplier;
 }
 
 bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, float epsilon = 1.0e-6F) {
@@ -1136,6 +1145,15 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
             gpuDrivenSelectionCapabilities_.computeQueueSupported &&
             gpuDrivenIndirectCommandPipeline_ != VK_NULL_HANDLE;
         diagnostics_.adaptiveGpuIndirectCommandUsed = false;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandSupported =
+            gpuDrivenSelectionCapabilities_.computeQueueSupported &&
+            gpuDrivenIndirectCommandPipeline_ != VK_NULL_HANDLE &&
+            gpuDrawItemCompactionPipeline_ != VK_NULL_HANDLE;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandUsed = false;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandParityStatus = "not checked";
+        diagnostics_.adaptiveGpuCompactionIndirectCommandDispatches = 0;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandCpuVertices = 0;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandGpuVertices = 0;
         diagnostics_.adaptiveGpuIndirectCommandDispatches = 0;
         diagnostics_.adaptiveIndirectDrawCalls = 0;
         diagnostics_.adaptiveIndirectDrawCount = 0;
@@ -1538,6 +1556,15 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         gpuDrivenIndirectCommandPipeline_ != VK_NULL_HANDLE;
     diagnostics_.adaptiveGpuIndirectCommandUsed = false;
     diagnostics_.adaptiveGpuIndirectCommandDispatches = 0;
+    diagnostics_.adaptiveGpuCompactionIndirectCommandSupported =
+        gpuDrivenSelectionCapabilities_.computeQueueSupported &&
+        gpuDrivenIndirectCommandPipeline_ != VK_NULL_HANDLE &&
+        gpuDrawItemCompactionPipeline_ != VK_NULL_HANDLE;
+    diagnostics_.adaptiveGpuCompactionIndirectCommandUsed = false;
+    diagnostics_.adaptiveGpuCompactionIndirectCommandParityStatus = "not checked";
+    diagnostics_.adaptiveGpuCompactionIndirectCommandDispatches = 0;
+    diagnostics_.adaptiveGpuCompactionIndirectCommandCpuVertices = 0;
+    diagnostics_.adaptiveGpuCompactionIndirectCommandGpuVertices = 0;
     diagnostics_.adaptiveIndirectDrawCalls = 0;
     diagnostics_.adaptiveIndirectDrawCount = gpuSelectionDecision.indirectDrawCount;
     diagnostics_.adaptiveIndirectSubmittedVertices = 0;
@@ -1714,7 +1741,15 @@ void VulkanViewportShell::UploadPointCloud(
             resources.indirectDrawCommandBuffers[frameIndex],
             &fallbackIndirectDraw,
             sizeof(fallbackIndirectDraw));
+        resources.gpuCompactionIndirectCommandBuffers[frameIndex] = CreateHostVisibleBuffer(
+            sizeof(fallbackIndirectDraw),
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources.gpuCompactionIndirectCommandBuffers[frameIndex],
+            &fallbackIndirectDraw,
+            sizeof(fallbackIndirectDraw));
         UpdateGpuDrivenIndirectDescriptorSet(&resources, frameIndex);
+        UpdateGpuCompactionIndirectDescriptorSet(&resources, frameIndex);
         UpdateGpuCompactionDescriptorSet(&resources, frameIndex);
         resources.drawItemCapacities[frameIndex] = 1U;
         resources.gpuCompactedDrawItemCapacities[frameIndex] = 1U;
@@ -2762,15 +2797,17 @@ void VulkanViewportShell::CreatePostProcessDescriptorSetLayout() {
 }
 
 void VulkanViewportShell::CreateGpuDrivenSelectionDescriptorSetLayout() {
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+    for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[bindingIndex].descriptorCount = 1;
+        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    layoutInfo.bindingCount = 1;
-    layoutInfo.pBindings = &binding;
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
 
     Check(
         vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &gpuDrivenSelectionDescriptorSetLayout_),
@@ -4745,47 +4782,83 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
     std::uint32_t gpuCount = 0;
     std::uint32_t cpuChecksum = 0;
     std::uint32_t gpuChecksum = 0;
+    bool indirectChecked = false;
+    bool indirectPassed = true;
+    std::uint32_t indirectCpuVertices = 0;
+    std::uint32_t indirectGpuVertices = 0;
     for (auto& resources : pointCloudResources_) {
         if (!resources.gpuCompactionResultPending[frameIndex] ||
             resources.gpuCompactionStatsBuffers[frameIndex].mapped == nullptr) {
-            continue;
+            if (!resources.gpuCompactionIndirectCommandResultPending[frameIndex] ||
+                resources.gpuCompactionIndirectCommandBuffers[frameIndex].mapped == nullptr) {
+                continue;
+            }
         }
 
-        GpuDrawItemCompactionStats actual{};
-        std::memcpy(
-            &actual,
-            resources.gpuCompactionStatsBuffers[frameIndex].mapped,
-            sizeof(actual));
-        const auto expected = resources.gpuCompactionExpectedStats[frameIndex];
-        const bool layerPassed =
-            actual.count == expected.count &&
-            actual.sourceIndexXor == expected.sourceIndexXor &&
-            actual.representedCountXor == expected.representedCountXor &&
-            actual.footprintXor == expected.footprintXor &&
-            actual.sourceIndexSum == expected.sourceIndexSum &&
-            actual.representedCountSum == expected.representedCountSum &&
-            actual.drawIndexXor == expected.drawIndexXor &&
-            actual.combinedChecksum == expected.combinedChecksum;
+        if (resources.gpuCompactionResultPending[frameIndex] &&
+            resources.gpuCompactionStatsBuffers[frameIndex].mapped != nullptr) {
+            GpuDrawItemCompactionStats actual{};
+            std::memcpy(
+                &actual,
+                resources.gpuCompactionStatsBuffers[frameIndex].mapped,
+                sizeof(actual));
+            const auto expected = resources.gpuCompactionExpectedStats[frameIndex];
+            const bool layerPassed =
+                actual.count == expected.count &&
+                actual.sourceIndexXor == expected.sourceIndexXor &&
+                actual.representedCountXor == expected.representedCountXor &&
+                actual.footprintXor == expected.footprintXor &&
+                actual.sourceIndexSum == expected.sourceIndexSum &&
+                actual.representedCountSum == expected.representedCountSum &&
+                actual.drawIndexXor == expected.drawIndexXor &&
+                actual.combinedChecksum == expected.combinedChecksum;
 
-        checked = true;
-        passed = passed && layerPassed;
-        cpuCount += expected.count;
-        gpuCount += actual.count;
-        cpuChecksum ^= expected.combinedChecksum;
-        gpuChecksum ^= actual.combinedChecksum;
-        resources.gpuCompactionResultPending[frameIndex] = false;
+            checked = true;
+            passed = passed && layerPassed;
+            cpuCount += expected.count;
+            gpuCount += actual.count;
+            cpuChecksum ^= expected.combinedChecksum;
+            gpuChecksum ^= actual.combinedChecksum;
+            resources.gpuCompactionResultPending[frameIndex] = false;
+        }
+
+        if (resources.gpuCompactionIndirectCommandResultPending[frameIndex] &&
+            resources.gpuCompactionIndirectCommandBuffers[frameIndex].mapped != nullptr) {
+            VkDrawIndirectCommand actualCommand{};
+            std::memcpy(
+                &actualCommand,
+                resources.gpuCompactionIndirectCommandBuffers[frameIndex].mapped,
+                sizeof(actualCommand));
+            const auto expectedCommand = resources.gpuCompactionExpectedIndirectCommands[frameIndex];
+            const bool commandPassed =
+                actualCommand.vertexCount == expectedCommand.vertexCount &&
+                actualCommand.instanceCount == expectedCommand.instanceCount &&
+                actualCommand.firstVertex == expectedCommand.firstVertex &&
+                actualCommand.firstInstance == expectedCommand.firstInstance;
+            indirectChecked = true;
+            indirectPassed = indirectPassed && commandPassed;
+            indirectCpuVertices += expectedCommand.vertexCount;
+            indirectGpuVertices += actualCommand.vertexCount;
+            resources.gpuCompactionIndirectCommandResultPending[frameIndex] = false;
+        }
     }
 
-    if (!checked) {
-        return;
+    if (checked) {
+        diagnostics_.adaptiveGpuCompactionCpuCount = cpuCount;
+        diagnostics_.adaptiveGpuCompactionGpuCount = gpuCount;
+        diagnostics_.adaptiveGpuCompactionCpuChecksum = cpuChecksum;
+        diagnostics_.adaptiveGpuCompactionGpuChecksum = gpuChecksum;
+        diagnostics_.adaptiveGpuCompactionParityStatus =
+            passed ? "passed previous-frame prefix count/checksum" : "mismatch in previous-frame prefix count/checksum";
     }
 
-    diagnostics_.adaptiveGpuCompactionCpuCount = cpuCount;
-    diagnostics_.adaptiveGpuCompactionGpuCount = gpuCount;
-    diagnostics_.adaptiveGpuCompactionCpuChecksum = cpuChecksum;
-    diagnostics_.adaptiveGpuCompactionGpuChecksum = gpuChecksum;
-    diagnostics_.adaptiveGpuCompactionParityStatus =
-        passed ? "passed previous-frame prefix count/checksum" : "mismatch in previous-frame prefix count/checksum";
+    if (indirectChecked) {
+        diagnostics_.adaptiveGpuCompactionIndirectCommandCpuVertices = indirectCpuVertices;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandGpuVertices = indirectGpuVertices;
+        diagnostics_.adaptiveGpuCompactionIndirectCommandParityStatus =
+            indirectPassed ? "passed previous-frame compacted indirect vertex count"
+                           : "mismatch in previous-frame compacted indirect vertex count";
+    }
 }
 
 void VulkanViewportShell::ResetGpuTimestampQueries(VkCommandBuffer commandBuffer, FrameResources* frame) {
@@ -4901,7 +4974,8 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
         resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCompactedDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCompactedDrawItemCapacities[frameIndex] >= std::max<std::uint32_t>(1U, drawItemCount) &&
-        resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE) {
+        resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+        resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE) {
         resources->drawItemSignature = revision;
         resources->drawItemCount = drawItemCount;
         return false;
@@ -4941,6 +5015,17 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
             sizeof(fallbackStats));
         reallocated = true;
     }
+    if (resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
+        const VkDrawIndirectCommand fallbackIndirectDraw{0U, 1U, 0U, 0U};
+        resources->gpuCompactionIndirectCommandBuffers[frameIndex] = CreateHostVisibleBuffer(
+            sizeof(fallbackIndirectDraw),
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->gpuCompactionIndirectCommandBuffers[frameIndex],
+            &fallbackIndirectDraw,
+            sizeof(fallbackIndirectDraw));
+        reallocated = true;
+    }
 
     if (drawItemCount == 0) {
         const renderer::pointcloud::PointCloudDrawItemGpu fallback{};
@@ -4964,6 +5049,8 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
                 imageIndex,
                 depthImages_[imageIndex].view);
         }
+        UpdateGpuDrivenIndirectDescriptorSet(resources, frameIndex);
+        UpdateGpuCompactionIndirectDescriptorSet(resources, frameIndex);
         UpdateGpuCompactionDescriptorSet(resources, frameIndex);
     }
     return reallocated;
@@ -5239,7 +5326,8 @@ void VulkanViewportShell::UpdateGpuDrivenIndirectDescriptorSet(
     if (resources == nullptr ||
         frameIndex >= kFramesInFlight ||
         gpuDrivenSelectionDescriptorSetLayout_ == VK_NULL_HANDLE ||
-        resources->indirectDrawCommandBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
+        resources->indirectDrawCommandBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+        resources->gpuCompactionStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
         return;
     }
 
@@ -5259,14 +5347,71 @@ void VulkanViewportShell::UpdateGpuDrivenIndirectDescriptorSet(
     commandInfo.offset = 0;
     commandInfo.range = sizeof(VkDrawIndirectCommand);
 
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = descriptorSet;
-    write.dstBinding = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo = &commandInfo;
+    VkDescriptorBufferInfo statsInfo{};
+    statsInfo.buffer = resources->gpuCompactionStatsBuffers[frameIndex].buffer;
+    statsInfo.offset = 0;
+    statsInfo.range = sizeof(GpuDrawItemCompactionStats);
 
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    for (auto& write : writes) {
+        write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = descriptorSet;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+    }
+    writes[0].dstBinding = 0;
+    writes[0].pBufferInfo = &commandInfo;
+    writes[1].dstBinding = 1;
+    writes[1].pBufferInfo = &statsInfo;
+
+    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void VulkanViewportShell::UpdateGpuCompactionIndirectDescriptorSet(
+    ActivePointCloudResources* resources,
+    std::size_t frameIndex) {
+    if (resources == nullptr ||
+        frameIndex >= kFramesInFlight ||
+        gpuDrivenSelectionDescriptorSetLayout_ == VK_NULL_HANDLE ||
+        resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+        resources->gpuCompactionStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto& descriptorSet = resources->gpuCompactionIndirectDescriptorSets[frameIndex];
+    if (descriptorSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = descriptorPool_;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &gpuDrivenSelectionDescriptorSetLayout_;
+        Check(
+            vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet),
+            "vkAllocateDescriptorSets(point gpu compaction indirect)");
+    }
+
+    VkDescriptorBufferInfo commandInfo{};
+    commandInfo.buffer = resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer;
+    commandInfo.offset = 0;
+    commandInfo.range = sizeof(VkDrawIndirectCommand);
+
+    VkDescriptorBufferInfo statsInfo{};
+    statsInfo.buffer = resources->gpuCompactionStatsBuffers[frameIndex].buffer;
+    statsInfo.offset = 0;
+    statsInfo.range = sizeof(GpuDrawItemCompactionStats);
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    for (auto& write : writes) {
+        write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = descriptorSet;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+    }
+    writes[0].dstBinding = 0;
+    writes[0].pBufferInfo = &commandInfo;
+    writes[1].dstBinding = 1;
+    writes[1].pBufferInfo = &statsInfo;
+
+    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void VulkanViewportShell::UpdateGpuCompactionDescriptorSet(
@@ -6106,6 +6251,9 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     for (auto& indirectDrawCommandBuffer : resources->indirectDrawCommandBuffers) {
         DestroyBuffer(&indirectDrawCommandBuffer);
     }
+    for (auto& indirectDrawCommandBuffer : resources->gpuCompactionIndirectCommandBuffers) {
+        DestroyBuffer(&indirectDrawCommandBuffer);
+    }
     DestroyBuffer(&resources->exrDrawItemBuffer);
     for (auto& descriptorSets : resources->descriptorSets) {
         for (auto& descriptorSet : descriptorSets) {
@@ -6118,6 +6266,14 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
         descriptorSets.clear();
     }
     for (auto& descriptorSet : resources->gpuIndirectDescriptorSets) {
+        if (descriptorSet != VK_NULL_HANDLE &&
+            descriptorPool_ != VK_NULL_HANDLE &&
+            device_ != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+            descriptorSet = VK_NULL_HANDLE;
+        }
+    }
+    for (auto& descriptorSet : resources->gpuCompactionIndirectDescriptorSets) {
         if (descriptorSet != VK_NULL_HANDLE &&
             descriptorPool_ != VK_NULL_HANDLE &&
             device_ != VK_NULL_HANDLE) {
@@ -6643,6 +6799,8 @@ bool VulkanViewportShell::PointCloudPlanUsesGpuCompaction(
            plan.resources->gpuCompactedDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactedDrawItemCapacities[frameIndex] >= plan.drawPointCount &&
            plan.resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+           plan.resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+           plan.resources->gpuCompactionIndirectDescriptorSets[frameIndex] != VK_NULL_HANDLE &&
            plan.resources->gpuCompactionDescriptorSets[frameIndex] != VK_NULL_HANDLE;
 }
 
@@ -6658,6 +6816,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
     }
 
     bool recordedAny = false;
+    bool compactionPipelineBound = false;
     for (const auto& layer : renderState_.pointCloudLayers) {
         PointCloudDrawPlan plan;
         if (!ResolvePointCloudDrawPlan(layer, forceFullSource, &plan) ||
@@ -6673,11 +6832,14 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 &frameResources_[frameIndex],
                 kGpuTimestampGpuDrawItemCompactionPass,
                 false);
+            recordedAny = true;
+        }
+        if (!compactionPipelineBound) {
             vkCmdBindPipeline(
                 commandBuffer,
                 VK_PIPELINE_BIND_POINT_COMPUTE,
                 gpuDrawItemCompactionPipeline_);
-            recordedAny = true;
+            compactionPipelineBound = true;
         }
 
         const auto selectionLimit = GpuDiagnosticPrefixSelectionLimit(plan.drawPointCount);
@@ -6727,6 +6889,89 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             &pushConstants);
         vkCmdDispatch(commandBuffer, (plan.drawPointCount + 63U) / 64U, 1, 1);
 
+        if (gpuDrivenIndirectCommandPipeline_ != VK_NULL_HANDLE &&
+            gpuDrivenSelectionPipelineLayout_ != VK_NULL_HANDLE &&
+            plan.resources->gpuCompactionIndirectDescriptorSets[frameIndex] != VK_NULL_HANDLE) {
+            VkBufferMemoryBarrier statsBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            statsBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            statsBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            statsBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            statsBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            statsBarrier.buffer = plan.resources->gpuCompactionStatsBuffers[frameIndex].buffer;
+            statsBarrier.offset = 0;
+            statsBarrier.size = sizeof(GpuDrawItemCompactionStats);
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                nullptr,
+                1,
+                &statsBarrier,
+                0,
+                nullptr);
+
+            vkCmdBindPipeline(
+                commandBuffer,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                gpuDrivenIndirectCommandPipeline_);
+            compactionPipelineBound = false;
+            const auto vertexMultiplier = plan.worldSurfels ? kSurfelVerticesPerPoint : 1U;
+            const GpuDrivenIndirectCommandPushConstants indirectPushConstants{
+                glm::uvec4{vertexMultiplier, 1U, 0U, kGpuIndirectCommandModeFromCompactionStats}};
+            VkDescriptorSet indirectDescriptorSet =
+                plan.resources->gpuCompactionIndirectDescriptorSets[frameIndex];
+            vkCmdBindDescriptorSets(
+                commandBuffer,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                gpuDrivenSelectionPipelineLayout_,
+                0,
+                1,
+                &indirectDescriptorSet,
+                0,
+                nullptr);
+            vkCmdPushConstants(
+                commandBuffer,
+                gpuDrivenSelectionPipelineLayout_,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                sizeof(GpuDrivenIndirectCommandPushConstants),
+                &indirectPushConstants);
+            vkCmdDispatch(commandBuffer, 1, 1, 1);
+
+            VkBufferMemoryBarrier commandBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            commandBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            commandBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            commandBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            commandBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            commandBarrier.buffer = plan.resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer;
+            commandBarrier.offset = 0;
+            commandBarrier.size = sizeof(VkDrawIndirectCommand);
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                0,
+                nullptr,
+                1,
+                &commandBarrier,
+                0,
+                nullptr);
+
+            const VkDrawIndirectCommand expectedIndirectCommand{
+                IndirectVertexCountFromCompactedItems(expectedStats.count, plan.worldSurfels),
+                1U,
+                0U,
+                0U,
+            };
+            plan.resources->gpuCompactionExpectedIndirectCommands[frameIndex] = expectedIndirectCommand;
+            plan.resources->gpuCompactionIndirectCommandResultPending[frameIndex] = true;
+            diagnostics_.adaptiveGpuCompactionIndirectCommandUsed = true;
+            diagnostics_.adaptiveGpuCompactionIndirectCommandDispatches += 1U;
+        }
+
         diagnostics_.adaptiveGpuCompactionUsed = true;
         diagnostics_.adaptiveGpuCompactionDispatches += 1U;
         diagnostics_.adaptiveGpuCompactionInputDrawItems += plan.drawPointCount;
@@ -6755,9 +7000,14 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected performance-clamped depth-windowed rank-limited feature draw items are prefix-filtered, compacted, and checksummed by compute for comparison";
+            "CPU-selected performance-clamped depth-windowed rank-limited feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
+        }
+        if (diagnostics_.adaptiveGpuCompactionIndirectCommandUsed &&
+            diagnostics_.adaptiveGpuCompactionIndirectCommandParityStatus == "not checked") {
+            diagnostics_.adaptiveGpuCompactionIndirectCommandParityStatus =
+                "waiting for previous-frame compacted indirect command";
         }
     }
 
@@ -6781,6 +7031,7 @@ bool VulkanViewportShell::PointCloudPlanUsesGpuIndirectCommand(
     }
 
     return plan.resources->indirectDrawCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+           plan.resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuIndirectDescriptorSets[frameIndex] != VK_NULL_HANDLE;
 }
 
@@ -6819,7 +7070,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         const std::uint32_t vertexCount =
             plan.worldSurfels ? plan.drawPointCount * kSurfelVerticesPerPoint : plan.drawPointCount;
         const GpuDrivenIndirectCommandPushConstants pushConstants{
-            glm::uvec4{vertexCount, 1U, 0U, 0U}};
+            glm::uvec4{vertexCount, 1U, 0U, kGpuIndirectCommandModeFromPushConstants}};
         VkDescriptorSet descriptorSet = plan.resources->gpuIndirectDescriptorSets[frameIndex];
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -6876,7 +7127,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected performance-clamped depth-windowed rank-limited feature draw items are prefix-filtered, compacted, and checksummed by compute, and indirect commands are generated by compute"
+                  "CPU-selected performance-clamped depth-windowed rank-limited feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =

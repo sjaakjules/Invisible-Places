@@ -13,13 +13,34 @@ layout(set = 0, binding = 0, std430) buffer IndirectCommandBuffer {
     uint firstInstance;
 } indirectCommand;
 
+layout(set = 0, binding = 1, std430) readonly buffer CompactionStats {
+    uint count;
+    uint sourceIndexXor;
+    uint representedCountXor;
+    uint footprintXor;
+    uint sourceIndexSum;
+    uint representedCountSum;
+    uint drawIndexXor;
+    uint combinedChecksum;
+} stats;
+
 void main() {
     if (gl_GlobalInvocationID.x != 0u) {
+        return;
+    }
+
+    if (pushConstants.command.w == 1u) {
+        const uint vertexMultiplier = max(pushConstants.command.x, 1u);
+        const uint compactedCount = min(stats.count, 0xffffffffu / vertexMultiplier);
+        indirectCommand.vertexCount = compactedCount * vertexMultiplier;
+        indirectCommand.instanceCount = pushConstants.command.y;
+        indirectCommand.firstVertex = pushConstants.command.z;
+        indirectCommand.firstInstance = 0u;
         return;
     }
 
     indirectCommand.vertexCount = pushConstants.command.x;
     indirectCommand.instanceCount = pushConstants.command.y;
     indirectCommand.firstVertex = pushConstants.command.z;
-    indirectCommand.firstInstance = pushConstants.command.w;
+    indirectCommand.firstInstance = 0u;
 }
