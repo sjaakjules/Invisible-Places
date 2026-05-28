@@ -14,8 +14,8 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionRankLimit;
     uint selectionMinDepth;
     uint selectionMaxDepth;
-    uint reserved0;
-    uint reserved1;
+    uint selectionRequiredFlags;
+    uint selectionRejectedFlags;
 } pushConstants;
 
 layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
@@ -68,6 +68,13 @@ void main() {
     const uint packedDepth = (item.indices.w >> 24u) & 0xffu;
     if (packedDepth < pushConstants.selectionMinDepth ||
         packedDepth > pushConstants.selectionMaxDepth) {
+        return;
+    }
+    const uint packedFlags = (item.indices.w >> 11u) & 0x7u;
+    if ((packedFlags & pushConstants.selectionRequiredFlags) != pushConstants.selectionRequiredFlags) {
+        return;
+    }
+    if ((packedFlags & pushConstants.selectionRejectedFlags) != 0u) {
         return;
     }
 
