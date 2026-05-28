@@ -294,6 +294,8 @@ constexpr std::uint32_t kGpuDiagnosticFeatureClassProbeMask =
     renderer::pointcloud::PointCloudLodRepresentativeClassScalarThreshold |
     renderer::pointcloud::PointCloudLodRepresentativeClassEmissiveAccent;
 constexpr std::uint32_t kGpuDiagnosticRankProbeLimit = 0xffU;
+constexpr bool kGpuDiagnosticRankProbeOutputWriteEnabled = true;
+constexpr std::uint32_t kGpuDiagnosticRankProbeOutputCapacityLimit = 1'310'720U;
 constexpr std::uint32_t kGpuDiagnosticDepthProbeMin = 7U;
 constexpr std::uint32_t kGpuDiagnosticDepthProbeMax = kDrawItemMetadataDepthMask;
 constexpr float kGpuDiagnosticProjectedAreaProbeMinFootprintAreaPixels = 4.0F;
@@ -335,6 +337,15 @@ std::uint32_t GpuDiagnosticCompactionOutputCapacity(std::uint32_t drawPointCount
     return std::max<std::uint32_t>(
         1U,
         std::min(GpuDiagnosticSelectionLimit(drawPointCount), kGpuDiagnosticCompactionOutputCapacityLimit));
+}
+
+std::uint32_t GpuDiagnosticRankProbeOutputCapacity(std::uint32_t drawPointCount) {
+    if (!kGpuDiagnosticRankProbeOutputWriteEnabled) {
+        return 1U;
+    }
+    return std::max<std::uint32_t>(
+        1U,
+        std::min(GpuDiagnosticSelectionLimit(drawPointCount), kGpuDiagnosticRankProbeOutputCapacityLimit));
 }
 
 std::uint32_t GpuDiagnosticRendererProfileSelectionMask(
@@ -1344,6 +1355,17 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuRankProbeGpuSourceFingerprint = 0;
         diagnostics_.adaptiveGpuRankProbeCpuReferenceMs = 0.0;
         diagnostics_.adaptiveGpuRankProbeMs = 0.0;
+        diagnostics_.adaptiveGpuRankProbeOutputWriteEnabled = false;
+        diagnostics_.adaptiveGpuRankProbeOutputFallbackReason.clear();
+        diagnostics_.adaptiveGpuRankProbeOutputCapacity = 0;
+        diagnostics_.adaptiveGpuRankProbeCopiedDrawItems = 0;
+        diagnostics_.adaptiveGpuRankProbeOutputParityStatus = "not checked";
+        diagnostics_.adaptiveGpuRankProbeOutputCpuCount = 0;
+        diagnostics_.adaptiveGpuRankProbeOutputGpuCount = 0;
+        diagnostics_.adaptiveGpuRankProbeOutputCpuChecksum = 0;
+        diagnostics_.adaptiveGpuRankProbeOutputGpuChecksum = 0;
+        diagnostics_.adaptiveGpuRankProbeOutputCpuSourceFingerprint = 0;
+        diagnostics_.adaptiveGpuRankProbeOutputGpuSourceFingerprint = 0;
         diagnostics_.adaptiveGpuDepthProbeUsed = false;
         diagnostics_.adaptiveGpuDepthProbeParityStatus = "not checked";
         diagnostics_.adaptiveGpuDepthProbeDispatches = 0;
@@ -1909,6 +1931,17 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuRankProbeGpuSourceFingerprint = 0;
     diagnostics_.adaptiveGpuRankProbeCpuReferenceMs = 0.0;
     diagnostics_.adaptiveGpuRankProbeMs = 0.0;
+    diagnostics_.adaptiveGpuRankProbeOutputWriteEnabled = false;
+    diagnostics_.adaptiveGpuRankProbeOutputFallbackReason.clear();
+    diagnostics_.adaptiveGpuRankProbeOutputCapacity = 0;
+    diagnostics_.adaptiveGpuRankProbeCopiedDrawItems = 0;
+    diagnostics_.adaptiveGpuRankProbeOutputParityStatus = "not checked";
+    diagnostics_.adaptiveGpuRankProbeOutputCpuCount = 0;
+    diagnostics_.adaptiveGpuRankProbeOutputGpuCount = 0;
+    diagnostics_.adaptiveGpuRankProbeOutputCpuChecksum = 0;
+    diagnostics_.adaptiveGpuRankProbeOutputGpuChecksum = 0;
+    diagnostics_.adaptiveGpuRankProbeOutputCpuSourceFingerprint = 0;
+    diagnostics_.adaptiveGpuRankProbeOutputGpuSourceFingerprint = 0;
     diagnostics_.adaptiveGpuDepthProbeUsed = false;
     diagnostics_.adaptiveGpuDepthProbeParityStatus = "not checked";
     diagnostics_.adaptiveGpuDepthProbeDispatches = 0;
@@ -2196,6 +2229,13 @@ void VulkanViewportShell::UploadPointCloud(
             resources.gpuCompactedDrawItemBuffers[frameIndex],
             &fallbackDrawItem,
             sizeof(fallbackDrawItem));
+        resources.gpuRankProbeOutputDrawItemBuffers[frameIndex] = CreateHostVisibleBuffer(
+            sizeof(fallbackDrawItem),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources.gpuRankProbeOutputDrawItemBuffers[frameIndex],
+            &fallbackDrawItem,
+            sizeof(fallbackDrawItem));
         resources.gpuCompactionStatsBuffers[frameIndex] = CreateHostVisibleBuffer(
             sizeof(fallbackCompactionStats),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -2286,6 +2326,7 @@ void VulkanViewportShell::UploadPointCloud(
         UpdateGpuClampFlagsProbeDescriptorSet(&resources, frameIndex);
         resources.drawItemCapacities[frameIndex] = 1U;
         resources.gpuCompactedDrawItemCapacities[frameIndex] = 1U;
+        resources.gpuRankProbeOutputDrawItemCapacities[frameIndex] = 1U;
     }
     resources.exrDrawItemBuffer = CreateHostVisibleBuffer(
         sizeof(fallbackDrawItem),
@@ -5432,6 +5473,14 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
     std::uint32_t rankProbeGpuChecksum = 0;
     std::uint32_t rankProbeCpuSourceFingerprint = 0;
     std::uint32_t rankProbeGpuSourceFingerprint = 0;
+    bool rankProbeOutputChecked = false;
+    bool rankProbeOutputPassed = true;
+    std::uint32_t rankProbeOutputCpuCount = 0;
+    std::uint32_t rankProbeOutputGpuCount = 0;
+    std::uint32_t rankProbeOutputCpuChecksum = 0;
+    std::uint32_t rankProbeOutputGpuChecksum = 0;
+    std::uint32_t rankProbeOutputCpuSourceFingerprint = 0;
+    std::uint32_t rankProbeOutputGpuSourceFingerprint = 0;
     bool depthProbeChecked = false;
     bool depthProbePassed = true;
     std::uint32_t depthProbeCpuCount = 0;
@@ -5506,6 +5555,15 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
         mixedSum ^= mixedSum >> 16U;
         return stats.sourceIndexXor ^ stats.metadataXor ^ stats.orderChecksum ^ mixedSum;
     };
+    const auto foldUnorderedOutputProbeFingerprint = [](const GpuDrawItemOutputProbeStats& stats) {
+        auto mixedSum = stats.sourceIndexSum;
+        mixedSum ^= mixedSum >> 16U;
+        mixedSum *= 0x7feb352dU;
+        mixedSum ^= mixedSum >> 15U;
+        mixedSum *= 0x846ca68bU;
+        mixedSum ^= mixedSum >> 16U;
+        return stats.sourceIndexXor ^ stats.metadataXor ^ mixedSum;
+    };
     bool indirectChecked = false;
     bool indirectPassed = true;
     std::uint32_t indirectCpuVertices = 0;
@@ -5525,6 +5583,9 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
             const bool rankProbePendingAndMapped =
                 resources.gpuRankProbeResultPending[frameIndex] &&
                 resources.gpuRankProbeStatsBuffers[frameIndex].mapped != nullptr;
+            const bool rankProbeOutputPendingAndMapped =
+                resources.gpuRankProbeOutputProbeResultPending[frameIndex] &&
+                resources.gpuRankProbeOutputDrawItemBuffers[frameIndex].mapped != nullptr;
             const bool depthProbePendingAndMapped =
                 resources.gpuDepthProbeResultPending[frameIndex] &&
                 resources.gpuDepthProbeStatsBuffers[frameIndex].mapped != nullptr;
@@ -5547,6 +5608,7 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
                 !indirectPendingAndMapped &&
                 !featureProbePendingAndMapped &&
                 !rankProbePendingAndMapped &&
+                !rankProbeOutputPendingAndMapped &&
                 !depthProbePendingAndMapped &&
                 !projectedAreaProbePendingAndMapped &&
                 !renderAreaProbePendingAndMapped &&
@@ -5649,6 +5711,34 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
             rankProbeCpuSourceFingerprint ^= foldSourceFingerprint(expected);
             rankProbeGpuSourceFingerprint ^= foldSourceFingerprint(actual);
             resources.gpuRankProbeResultPending[frameIndex] = false;
+        }
+
+        if (resources.gpuRankProbeOutputProbeResultPending[frameIndex] &&
+            resources.gpuRankProbeOutputDrawItemBuffers[frameIndex].mapped != nullptr) {
+            const auto expected = resources.gpuRankProbeExpectedOutputProbeStats[frameIndex];
+            const auto actual = ComputeGpuCompactionOutputProbeStatsFromBuffer(
+                static_cast<const renderer::pointcloud::PointCloudDrawItemGpu*>(
+                    resources.gpuRankProbeOutputDrawItemBuffers[frameIndex].mapped),
+                expected.count);
+            const bool layerPassed =
+                actual.count == expected.count &&
+                actual.sourceIndexXor == expected.sourceIndexXor &&
+                actual.representedCountXor == expected.representedCountXor &&
+                actual.footprintXor == expected.footprintXor &&
+                actual.metadataXor == expected.metadataXor &&
+                actual.sourceIndexSum == expected.sourceIndexSum &&
+                actual.representedCountSum == expected.representedCountSum &&
+                actual.identityChecksum == expected.identityChecksum;
+
+            rankProbeOutputChecked = true;
+            rankProbeOutputPassed = rankProbeOutputPassed && layerPassed;
+            rankProbeOutputCpuCount += expected.count;
+            rankProbeOutputGpuCount += actual.count;
+            rankProbeOutputCpuChecksum ^= expected.identityChecksum;
+            rankProbeOutputGpuChecksum ^= actual.identityChecksum;
+            rankProbeOutputCpuSourceFingerprint ^= foldUnorderedOutputProbeFingerprint(expected);
+            rankProbeOutputGpuSourceFingerprint ^= foldUnorderedOutputProbeFingerprint(actual);
+            resources.gpuRankProbeOutputProbeResultPending[frameIndex] = false;
         }
 
         if (resources.gpuDepthProbeResultPending[frameIndex] &&
@@ -5921,6 +6011,21 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
                 : "mismatch in previous-frame stable-rank prefix count/source-fingerprint/checksum/class-counts";
     }
 
+    if (rankProbeOutputChecked) {
+        diagnostics_.adaptiveGpuRankProbeOutputCpuCount = rankProbeOutputCpuCount;
+        diagnostics_.adaptiveGpuRankProbeOutputGpuCount = rankProbeOutputGpuCount;
+        diagnostics_.adaptiveGpuRankProbeOutputCpuChecksum = rankProbeOutputCpuChecksum;
+        diagnostics_.adaptiveGpuRankProbeOutputGpuChecksum = rankProbeOutputGpuChecksum;
+        diagnostics_.adaptiveGpuRankProbeOutputCpuSourceFingerprint =
+            rankProbeOutputCpuSourceFingerprint;
+        diagnostics_.adaptiveGpuRankProbeOutputGpuSourceFingerprint =
+            rankProbeOutputGpuSourceFingerprint;
+        diagnostics_.adaptiveGpuRankProbeOutputParityStatus =
+            rankProbeOutputPassed
+                ? "passed previous-frame stable-rank prefix unordered compacted output identity"
+                : "mismatch in previous-frame stable-rank prefix unordered compacted output identity";
+    }
+
     if (depthProbeChecked) {
         diagnostics_.adaptiveGpuDepthProbeCpuCount = depthProbeCpuCount;
         diagnostics_.adaptiveGpuDepthProbeGpuCount = depthProbeGpuCount;
@@ -6147,16 +6252,21 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
     const auto requiredCapacity = std::max<std::uint32_t>(1U, drawItemCount);
     const auto requiredGpuCompactedDrawItemCapacity =
         GpuDiagnosticCompactionOutputCapacity(drawItemCount);
+    const auto requiredGpuRankProbeOutputCapacity =
+        GpuDiagnosticRankProbeOutputCapacity(drawItemCount);
     if (resources->drawItemSignatures[frameIndex] == revision &&
         resources->drawItemCounts[frameIndex] == drawItemCount &&
         resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCompactedDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCompactedDrawItemCapacities[frameIndex] >= requiredGpuCompactedDrawItemCapacity &&
+        resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+        resources->gpuRankProbeOutputDrawItemCapacities[frameIndex] >= requiredGpuRankProbeOutputCapacity &&
         resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuFeatureClassProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuRankProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuDepthProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuProjectedAreaProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+        resources->gpuRenderAreaProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuRepresentedCountProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuCoverageCompensationProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
         resources->gpuClampFlagsProbeStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
@@ -6188,6 +6298,24 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
             static_cast<VkDeviceSize>(newCapacity * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         resources->gpuCompactedDrawItemCapacities[frameIndex] = newCapacity;
+        reallocated = true;
+    }
+    if (resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+        resources->gpuRankProbeOutputDrawItemCapacities[frameIndex] < requiredGpuRankProbeOutputCapacity) {
+        DestroyBuffer(&resources->gpuRankProbeOutputDrawItemBuffers[frameIndex]);
+        const auto newCapacity =
+            std::max(
+                requiredGpuRankProbeOutputCapacity,
+                resources->gpuRankProbeOutputDrawItemCapacities[frameIndex] * 2U);
+        resources->gpuRankProbeOutputDrawItemBuffers[frameIndex] = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(newCapacity * sizeof(renderer::pointcloud::PointCloudDrawItemGpu)),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->gpuRankProbeOutputDrawItemCapacities[frameIndex] = newCapacity;
+        const renderer::pointcloud::PointCloudDrawItemGpu fallback{};
+        UploadBufferData(
+            resources->gpuRankProbeOutputDrawItemBuffers[frameIndex],
+            &fallback,
+            sizeof(fallback));
         reallocated = true;
     }
     if (resources->gpuCompactionStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
@@ -6900,7 +7028,7 @@ void VulkanViewportShell::UpdateGpuRankProbeDescriptorSet(
         frameIndex >= kFramesInFlight ||
         gpuCompactionDescriptorSetLayout_ == VK_NULL_HANDLE ||
         resources->drawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
-        resources->gpuCompactedDrawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+        resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
         resources->gpuRankProbeStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
         frameResources_[frameIndex].uniformBuffer.buffer == VK_NULL_HANDLE ||
         resources->positionStorageBuffer.buffer == VK_NULL_HANDLE) {
@@ -6924,9 +7052,9 @@ void VulkanViewportShell::UpdateGpuRankProbeDescriptorSet(
     inputInfo.range = resources->drawItemBuffers[frameIndex].size;
 
     VkDescriptorBufferInfo outputInfo{};
-    outputInfo.buffer = resources->gpuCompactedDrawItemBuffers[frameIndex].buffer;
+    outputInfo.buffer = resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].buffer;
     outputInfo.offset = 0;
-    outputInfo.range = resources->gpuCompactedDrawItemBuffers[frameIndex].size;
+    outputInfo.range = resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].size;
 
     VkDescriptorBufferInfo statsInfo{};
     statsInfo.buffer = resources->gpuRankProbeStatsBuffers[frameIndex].buffer;
@@ -8293,6 +8421,9 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     for (auto& compactedDrawItemBuffer : resources->gpuCompactedDrawItemBuffers) {
         DestroyBuffer(&compactedDrawItemBuffer);
     }
+    for (auto& rankProbeOutputDrawItemBuffer : resources->gpuRankProbeOutputDrawItemBuffers) {
+        DestroyBuffer(&rankProbeOutputDrawItemBuffer);
+    }
     for (auto& statsBuffer : resources->gpuCompactionStatsBuffers) {
         DestroyBuffer(&statsBuffer);
     }
@@ -9646,6 +9777,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         const auto& performanceGate = gpuCompactionPerformanceGates_[performanceProfileIndex];
         if (performanceGate.retryCooldownFrames > 0U ||
             plan.resources->gpuRankProbeStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+            plan.resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
             plan.resources->gpuRankProbeDescriptorSets[frameIndex] == VK_NULL_HANDLE) {
             continue;
         }
@@ -9688,6 +9820,9 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         constexpr std::uint32_t selectionMaxRepresentedSourceCount =
             kGpuDiagnosticMaxSelectionRepresentedSourceCount;
         constexpr float selectionFrustumGuardBand = 0.0F;
+        const auto rankProbeOutputCapacity =
+            GpuDiagnosticRankProbeOutputCapacity(plan.drawPointCount);
+        GpuDrawItemOutputProbeStats expectedOutputProbeStats{};
 
         const auto cpuReferenceStart = std::chrono::steady_clock::now();
         const auto expectedStats =
@@ -9714,10 +9849,14 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMaxRepresentedSourceCount,
                 renderState_.viewProjection,
                 selectionFrustumGuardBand,
-                nullptr,
-                0U);
+                &expectedOutputProbeStats,
+                rankProbeOutputCapacity);
         diagnostics_.adaptiveGpuRankProbeCpuReferenceMs +=
             MillisecondsBetween(cpuReferenceStart, std::chrono::steady_clock::now());
+        const bool rankProbeOutputWriteActive =
+            kGpuDiagnosticRankProbeOutputWriteEnabled &&
+            expectedStats.count > 0U &&
+            expectedStats.count <= rankProbeOutputCapacity;
 
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
@@ -9726,6 +9865,9 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             sizeof(resetStats));
         plan.resources->gpuRankProbeExpectedStats[frameIndex] = expectedStats;
         plan.resources->gpuRankProbeResultPending[frameIndex] = true;
+        plan.resources->gpuRankProbeExpectedOutputProbeStats[frameIndex] = expectedOutputProbeStats;
+        plan.resources->gpuRankProbeOutputProbeResultPending[frameIndex] =
+            rankProbeOutputWriteActive;
 
         const GpuDrawItemCompactionPushConstants pushConstants{
             glm::uvec4{plan.drawPointCount, selectionLimit, selectionClassMask, selectionRankLimit},
@@ -9742,8 +9884,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 FloatBits(selectionFrustumGuardBand)},
             glm::uvec4{
                 selectionProfileMask,
-                0U,
-                1U,
+                rankProbeOutputWriteActive ? 1U : 0U,
+                rankProbeOutputCapacity,
                 0U},
             glm::uvec4{
                 FloatBits(selectionMinOpacityCompensation),
@@ -9770,6 +9912,29 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         const auto dispatchItemCount = std::min(plan.drawPointCount, selectionLimit);
         vkCmdDispatch(commandBuffer, (dispatchItemCount + 63U) / 64U, 1, 1);
 
+        if (rankProbeOutputWriteActive) {
+            VkBufferMemoryBarrier outputProbeBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            outputProbeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            outputProbeBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            outputProbeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outputProbeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outputProbeBarrier.buffer = plan.resources->gpuRankProbeOutputDrawItemBuffers[frameIndex].buffer;
+            outputProbeBarrier.offset = 0;
+            outputProbeBarrier.size = static_cast<VkDeviceSize>(
+                rankProbeOutputCapacity * sizeof(renderer::pointcloud::PointCloudDrawItemGpu));
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                0,
+                nullptr,
+                1,
+                &outputProbeBarrier,
+                0,
+                nullptr);
+        }
+
         VkBufferMemoryBarrier probeStatsBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         probeStatsBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         probeStatsBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -9795,6 +9960,30 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuRankProbeLimit = std::max(
             diagnostics_.adaptiveGpuRankProbeLimit,
             selectionRankLimit);
+        diagnostics_.adaptiveGpuRankProbeOutputWriteEnabled =
+            diagnostics_.adaptiveGpuRankProbeOutputWriteEnabled ||
+            kGpuDiagnosticRankProbeOutputWriteEnabled;
+        diagnostics_.adaptiveGpuRankProbeOutputCapacity += rankProbeOutputCapacity;
+        diagnostics_.adaptiveGpuRankProbeCopiedDrawItems +=
+            rankProbeOutputWriteActive ? expectedStats.count : 0U;
+        if (!kGpuDiagnosticRankProbeOutputWriteEnabled) {
+            diagnostics_.adaptiveGpuRankProbeOutputFallbackReason =
+                "stable-rank compacted output writes are disabled by policy";
+            diagnostics_.adaptiveGpuRankProbeOutputParityStatus =
+                "not checked: stable-rank compacted output writes disabled";
+        } else if (expectedStats.count == 0U) {
+            diagnostics_.adaptiveGpuRankProbeOutputFallbackReason =
+                "stable-rank compacted output not written: no rank-prefix candidates";
+            diagnostics_.adaptiveGpuRankProbeOutputParityStatus =
+                "not checked: stable-rank prefix selected zero candidates";
+        } else if (expectedStats.count > rankProbeOutputCapacity) {
+            diagnostics_.adaptiveGpuRankProbeOutputFallbackReason =
+                "stable-rank compacted output not written: selected count exceeds diagnostic rank output capacity";
+            diagnostics_.adaptiveGpuRankProbeOutputParityStatus =
+                "not checked: stable-rank prefix selected count exceeds diagnostic output capacity";
+        } else {
+            diagnostics_.adaptiveGpuRankProbeOutputFallbackReason.clear();
+        }
     }
 
     if (rankProbeRecordedAny) {
@@ -9806,6 +9995,11 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         if (diagnostics_.adaptiveGpuRankProbeParityStatus == "not checked") {
             diagnostics_.adaptiveGpuRankProbeParityStatus =
                 "waiting for previous-frame stable-rank prefix GPU checksum";
+        }
+        if (diagnostics_.adaptiveGpuRankProbeOutputWriteEnabled &&
+            diagnostics_.adaptiveGpuRankProbeOutputParityStatus == "not checked") {
+            diagnostics_.adaptiveGpuRankProbeOutputParityStatus =
+                "waiting for previous-frame stable-rank prefix unordered compacted output probe";
         }
     }
 

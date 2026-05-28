@@ -21399,6 +21399,18 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuRankProbeCpuCount,
                             diagnostics.adaptiveGpuRankProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuRankProbeMs);
+                        ImGui::Text(
+                            "GPU stable-rank output probe: %s | %u/%u items | copied %u capacity %u",
+                            diagnostics.adaptiveGpuRankProbeOutputParityStatus.c_str(),
+                            diagnostics.adaptiveGpuRankProbeOutputGpuCount,
+                            diagnostics.adaptiveGpuRankProbeOutputCpuCount,
+                            diagnostics.adaptiveGpuRankProbeCopiedDrawItems,
+                            diagnostics.adaptiveGpuRankProbeOutputCapacity);
+                        if (!diagnostics.adaptiveGpuRankProbeOutputFallbackReason.empty()) {
+                            ImGui::TextWrapped(
+                                "GPU stable-rank output fallback: %s",
+                                diagnostics.adaptiveGpuRankProbeOutputFallbackReason.c_str());
+                        }
                     }
                     if (diagnostics.adaptiveGpuDepthProbeUsed ||
                         diagnostics.adaptiveGpuDepthProbeParityStatus != "not checked" ||
@@ -22486,6 +22498,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuRankProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuRankProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuRankProbeMs = 0.0;
+    bool fastBasicGpuRankProbeOutputWriteEnabled = false;
+    std::string fastBasicGpuRankProbeOutputFallbackReason;
+    std::uint32_t fastBasicMaxGpuRankProbeOutputCapacity = 0;
+    std::uint32_t fastBasicMaxGpuRankProbeCopiedDrawItems = 0;
+    std::string fastBasicGpuRankProbeOutputParityStatus = "not checked";
+    std::uint32_t fastBasicGpuRankProbeOutputCpuCount = 0;
+    std::uint32_t fastBasicGpuRankProbeOutputGpuCount = 0;
+    std::uint32_t fastBasicGpuRankProbeOutputCpuChecksum = 0;
+    std::uint32_t fastBasicGpuRankProbeOutputGpuChecksum = 0;
+    std::uint32_t fastBasicGpuRankProbeOutputCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuRankProbeOutputGpuSourceFingerprint = 0;
     bool fastBasicGpuDepthProbeUsed = false;
     std::string fastBasicGpuDepthProbeParityStatus = "not checked";
     std::uint32_t fastBasicMaxGpuDepthProbeDispatches = 0;
@@ -23023,6 +23046,51 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuRankProbeMs = std::max(
             fastBasicMaxGpuRankProbeMs,
             diagnostics.adaptiveGpuRankProbeMs);
+        fastBasicGpuRankProbeOutputWriteEnabled =
+            fastBasicGpuRankProbeOutputWriteEnabled ||
+            diagnostics.adaptiveGpuRankProbeOutputWriteEnabled;
+        if (!diagnostics.adaptiveGpuRankProbeOutputFallbackReason.empty()) {
+            fastBasicGpuRankProbeOutputFallbackReason =
+                diagnostics.adaptiveGpuRankProbeOutputFallbackReason;
+        }
+        fastBasicMaxGpuRankProbeOutputCapacity = std::max(
+            fastBasicMaxGpuRankProbeOutputCapacity,
+            diagnostics.adaptiveGpuRankProbeOutputCapacity);
+        fastBasicMaxGpuRankProbeCopiedDrawItems = std::max(
+            fastBasicMaxGpuRankProbeCopiedDrawItems,
+            diagnostics.adaptiveGpuRankProbeCopiedDrawItems);
+        if (diagnostics.adaptiveGpuRankProbeOutputParityStatus != "not checked") {
+            fastBasicGpuRankProbeOutputParityStatus =
+                diagnostics.adaptiveGpuRankProbeOutputParityStatus;
+            if (fastBasicGpuRankProbeOutputParityStatus.rfind("not checked:", 0) == 0) {
+                fastBasicGpuRankProbeOutputCpuCount = 0;
+                fastBasicGpuRankProbeOutputGpuCount = 0;
+                fastBasicGpuRankProbeOutputCpuChecksum = 0;
+                fastBasicGpuRankProbeOutputGpuChecksum = 0;
+                fastBasicGpuRankProbeOutputCpuSourceFingerprint = 0;
+                fastBasicGpuRankProbeOutputGpuSourceFingerprint = 0;
+            }
+        }
+        const bool fastBasicRankOutputProbeSkipped =
+            fastBasicGpuRankProbeOutputParityStatus.rfind("not checked:", 0) == 0;
+        const bool hasFastBasicRankOutputProbeCounts =
+            !fastBasicRankOutputProbeSkipped &&
+            (diagnostics.adaptiveGpuRankProbeOutputCpuCount != 0U ||
+             diagnostics.adaptiveGpuRankProbeOutputGpuCount != 0U);
+        if (hasFastBasicRankOutputProbeCounts) {
+            fastBasicGpuRankProbeOutputCpuCount =
+                diagnostics.adaptiveGpuRankProbeOutputCpuCount;
+            fastBasicGpuRankProbeOutputGpuCount =
+                diagnostics.adaptiveGpuRankProbeOutputGpuCount;
+            fastBasicGpuRankProbeOutputCpuChecksum =
+                diagnostics.adaptiveGpuRankProbeOutputCpuChecksum;
+            fastBasicGpuRankProbeOutputGpuChecksum =
+                diagnostics.adaptiveGpuRankProbeOutputGpuChecksum;
+            fastBasicGpuRankProbeOutputCpuSourceFingerprint =
+                diagnostics.adaptiveGpuRankProbeOutputCpuSourceFingerprint;
+            fastBasicGpuRankProbeOutputGpuSourceFingerprint =
+                diagnostics.adaptiveGpuRankProbeOutputGpuSourceFingerprint;
+        }
         fastBasicGpuDepthProbeUsed =
             fastBasicGpuDepthProbeUsed || diagnostics.adaptiveGpuDepthProbeUsed;
         if (diagnostics.adaptiveGpuDepthProbeParityStatus != "not checked") {
@@ -24841,6 +24909,28 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuRankProbeMs << ",\n"
                 << "  \"gpu_rank_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuRankProbePerformanceStatus) << ",\n"
+                << "  \"gpu_rank_probe_output_write_enabled\": "
+                << (fastBasicGpuRankProbeOutputWriteEnabled ? "true" : "false") << ",\n"
+                << "  \"gpu_rank_probe_output_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuRankProbeOutputFallbackReason) << ",\n"
+                << "  \"gpu_rank_probe_output_capacity\": "
+                << fastBasicMaxGpuRankProbeOutputCapacity << ",\n"
+                << "  \"gpu_rank_probe_copied_draw_items\": "
+                << fastBasicMaxGpuRankProbeCopiedDrawItems << ",\n"
+                << "  \"gpu_rank_probe_output_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRankProbeOutputParityStatus) << ",\n"
+                << "  \"gpu_rank_probe_output_cpu_count\": "
+                << fastBasicGpuRankProbeOutputCpuCount << ",\n"
+                << "  \"gpu_rank_probe_output_gpu_count\": "
+                << fastBasicGpuRankProbeOutputGpuCount << ",\n"
+                << "  \"gpu_rank_probe_output_cpu_checksum\": "
+                << fastBasicGpuRankProbeOutputCpuChecksum << ",\n"
+                << "  \"gpu_rank_probe_output_gpu_checksum\": "
+                << fastBasicGpuRankProbeOutputGpuChecksum << ",\n"
+                << "  \"gpu_rank_probe_output_cpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeOutputCpuSourceFingerprint << ",\n"
+                << "  \"gpu_rank_probe_output_gpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeOutputGpuSourceFingerprint << ",\n"
                 << "  \"gpu_depth_probe_used\": "
                 << (fastBasicGpuDepthProbeUsed ? "true" : "false") << ",\n"
                 << "  \"gpu_depth_probe_parity_status\": "
@@ -25748,6 +25838,28 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuRankProbeMs << ",\n"
                 << "  \"fast_basic_rank_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuRankProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_rank_probe_output_write_enabled\": "
+                << (fastBasicGpuRankProbeOutputWriteEnabled ? "true" : "false") << ",\n"
+                << "  \"fast_basic_rank_probe_output_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuRankProbeOutputFallbackReason) << ",\n"
+                << "  \"fast_basic_rank_probe_output_capacity\": "
+                << fastBasicMaxGpuRankProbeOutputCapacity << ",\n"
+                << "  \"fast_basic_rank_probe_copied_draw_items\": "
+                << fastBasicMaxGpuRankProbeCopiedDrawItems << ",\n"
+                << "  \"fast_basic_rank_probe_output_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRankProbeOutputParityStatus) << ",\n"
+                << "  \"fast_basic_rank_probe_output_cpu_count\": "
+                << fastBasicGpuRankProbeOutputCpuCount << ",\n"
+                << "  \"fast_basic_rank_probe_output_gpu_count\": "
+                << fastBasicGpuRankProbeOutputGpuCount << ",\n"
+                << "  \"fast_basic_rank_probe_output_cpu_checksum\": "
+                << fastBasicGpuRankProbeOutputCpuChecksum << ",\n"
+                << "  \"fast_basic_rank_probe_output_gpu_checksum\": "
+                << fastBasicGpuRankProbeOutputGpuChecksum << ",\n"
+                << "  \"fast_basic_rank_probe_output_cpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeOutputCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_rank_probe_output_gpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeOutputGpuSourceFingerprint << ",\n"
                 << "  \"fast_basic_depth_probe_used\": "
                 << (fastBasicGpuDepthProbeUsed ? "true" : "false") << ",\n"
                 << "  \"fast_basic_depth_probe_parity_status\": "
