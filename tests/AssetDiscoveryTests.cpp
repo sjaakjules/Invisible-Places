@@ -3103,6 +3103,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionIndirectCommandUsed") != std::string::npos);
+    CHECK(rendererHeader.find("gpuCompactedDescriptorSets") != std::string::npos);
+    CHECK(rendererHeader.find("gpuCompactionSubmissionEligible") != std::string::npos);
+    CHECK(rendererHeader.find("gpuCompactionSubmissionVertexCounts") != std::string::npos);
     CHECK(rendererSource.find("vkCreateComputePipelines") != std::string::npos);
     CHECK(rendererSource.find("VK_PIPELINE_BIND_POINT_COMPUTE") != std::string::npos);
     CHECK(rendererSource.find("RecordGpuDrawItemCompactionForScene") != std::string::npos);
@@ -3114,6 +3117,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuIndirectCommandModeFromCompactionStats") != std::string::npos);
     CHECK(rendererSource.find("gpuCompactionIndirectCommandBuffers") != std::string::npos);
     CHECK(rendererSource.find("gpuCompactionExpectedIndirectCommands") != std::string::npos);
+    CHECK(rendererSource.find("UpdatePointCloudCompactedDescriptorSet") != std::string::npos);
+    CHECK(rendererSource.find("UpdatePointCloudDescriptorSetForDrawItems") != std::string::npos);
+    CHECK(rendererSource.find("PointCloudPlanUsesGpuCompactionSubmission") != std::string::npos);
+    CHECK(rendererSource.find("ResetGpuCompactionSubmissionFrame") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteEnabled") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputCapacityLimit") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOrderedOutputEnabled") != std::string::npos);
@@ -3128,6 +3135,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("ComputeGpuCompactionOutputProbeStatsFromBuffer") != std::string::npos);
     CHECK(rendererSource.find("submitted compacted draws require semantic-equivalent selection") != std::string::npos);
     CHECK(rendererSource.find("VK_ACCESS_HOST_READ_BIT") != std::string::npos);
+    CHECK(rendererSource.find("VK_PIPELINE_STAGE_VERTEX_SHADER_BIT") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame ordered compacted output identity") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionSlowFrameThreshold") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionRetryCooldownFrames") != std::string::npos);
@@ -3167,9 +3175,14 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("DrawItemRepresentativePackedDepth") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedFlags") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect") != std::string::npos);
+    CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-compacted-indirect-submit") != std::string::npos);
+    CHECK(rendererSource.find("GPU-compacted draw-item output submitted after CPU/GPU parity") != std::string::npos);
+    CHECK(rendererSource.find("resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer") != std::string::npos);
+    CHECK(rendererSource.find("resources->gpuCompactedDescriptorSets[frameIndex][imageIndex]") != std::string::npos);
     CHECK(rendererSource.find("workgroup-aggregated") != std::string::npos);
     CHECK(rendererSource.find("const bool useGpuGeneratedIndirectCommand") != std::string::npos);
-    CHECK(rendererSource.find("if (!useGpuGeneratedIndirectCommand)") != std::string::npos);
+    CHECK(rendererSource.find("const bool useGpuCompactedSubmission") != std::string::npos);
+    CHECK(rendererSource.find("if (!useGpuCompactedSubmission && !useGpuGeneratedIndirectCommand)") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_input_draw_items") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_dispatched_draw_items") != std::string::npos);

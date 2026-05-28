@@ -22671,7 +22671,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicGpuCompactionSubmissionUsed =
             fastBasicGpuCompactionSubmissionUsed ||
             diagnostics.adaptiveGpuCompactionSubmissionUsed;
-        if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
+        if (diagnostics.adaptiveGpuCompactionSubmissionUsed) {
+            fastBasicGpuCompactionSubmissionFallbackReason.clear();
+        } else if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
             fastBasicGpuCompactionSubmissionFallbackReason =
                 diagnostics.adaptiveGpuCompactionSubmissionFallbackReason;
         }
@@ -23665,7 +23667,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             stress.gpuCompactionSubmissionUsed =
                 stress.gpuCompactionSubmissionUsed ||
                 diagnostics.adaptiveGpuCompactionSubmissionUsed;
-            if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
+            if (diagnostics.adaptiveGpuCompactionSubmissionUsed) {
+                stress.gpuCompactionSubmissionFallbackReason.clear();
+            } else if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
                 stress.gpuCompactionSubmissionFallbackReason =
                     diagnostics.adaptiveGpuCompactionSubmissionFallbackReason;
             }

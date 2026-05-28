@@ -486,6 +486,7 @@ class VulkanViewportShell {
         std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
         BufferAllocation exrStyleBuffer{};
         std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+        std::array<std::vector<VkDescriptorSet>, kFramesInFlight> gpuCompactedDescriptorSets{};
         VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
@@ -510,6 +511,8 @@ class VulkanViewportShell {
         std::array<bool, kFramesInFlight> gpuCompactionOutputProbeResultPending{};
         std::array<VkDrawIndirectCommand, kFramesInFlight> gpuCompactionExpectedIndirectCommands{};
         std::array<bool, kFramesInFlight> gpuCompactionIndirectCommandResultPending{};
+        std::array<bool, kFramesInFlight> gpuCompactionSubmissionEligible{};
+        std::array<std::uint32_t, kFramesInFlight> gpuCompactionSubmissionVertexCounts{};
         std::uint32_t exrDrawItemCount = 0;
         std::uint32_t exrDrawItemCapacity = 0;
         std::uint32_t scalarFieldCount = 0;
@@ -680,6 +683,19 @@ class VulkanViewportShell {
         std::size_t frameIndex,
         std::uint32_t imageIndex,
         VkImageView sceneDepthView);
+    void UpdatePointCloudCompactedDescriptorSet(
+        ActivePointCloudResources* resources,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
+        VkImageView sceneDepthView);
+    void UpdatePointCloudDescriptorSetForDrawItems(
+        ActivePointCloudResources* resources,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
+        VkImageView sceneDepthView,
+        const BufferAllocation& drawItemBuffer,
+        VkDescriptorSet* descriptorSet,
+        std::string_view allocationContext);
     void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
     void UpdateGpuDrivenIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     void UpdateGpuCompactionIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
@@ -720,6 +736,12 @@ class VulkanViewportShell {
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
         bool exrStyle) const;
+    [[nodiscard]] bool PointCloudPlanUsesGpuCompactionSubmission(
+        const PointCloudDrawPlan& plan,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
+        bool exrStyle) const;
+    void ResetGpuCompactionSubmissionFrame(std::size_t frameIndex);
     [[nodiscard]] bool RecordGpuDrawItemCompactionForScene(
         VkCommandBuffer commandBuffer,
         std::size_t frameIndex,
