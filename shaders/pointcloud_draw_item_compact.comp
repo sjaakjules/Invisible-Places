@@ -10,7 +10,7 @@ struct PointDrawItemGpu {
 layout(push_constant) uniform CompactionPushConstants {
     uint itemCount;
     uint selectionLimit;
-    uint reserved0;
+    uint selectionClassMask;
     uint reserved1;
 } pushConstants;
 
@@ -52,6 +52,12 @@ void main() {
     }
 
     const PointDrawItemGpu item = inputDrawItems.drawItems[drawIndex];
+    const uint classFlags = (item.indices.w >> 14u) & 0xffu;
+    if (pushConstants.selectionClassMask != 0u &&
+        (classFlags & pushConstants.selectionClassMask) == 0u) {
+        return;
+    }
+
     const uint outputIndex = atomicAdd(stats.count, 1u);
     outputDrawItems.drawItems[outputIndex] = item;
 

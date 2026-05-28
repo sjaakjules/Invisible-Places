@@ -2977,7 +2977,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(cmakeSource.find("shaders/pointcloud_indirect_command.comp") != std::string::npos);
     CHECK(compactionShader.find("layout(local_size_x = 64") != std::string::npos);
     CHECK(compactionShader.find("selectionLimit") != std::string::npos);
+    CHECK(compactionShader.find("selectionClassMask") != std::string::npos);
     CHECK(compactionShader.find("drawIndex >= pushConstants.selectionLimit") != std::string::npos);
+    CHECK(compactionShader.find("item.indices.w >> 14u") != std::string::npos);
+    CHECK(compactionShader.find("classFlags & pushConstants.selectionClassMask") != std::string::npos);
     CHECK(compactionShader.find("outputDrawItems.drawItems") != std::string::npos);
     CHECK(compactionShader.find("const uint outputIndex = atomicAdd(stats.count") != std::string::npos);
     CHECK(compactionShader.find("floatBitsToUint(item.params.x)") != std::string::npos);
@@ -2988,6 +2991,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionInputDrawItems") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionLimit") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionClassMask") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
     CHECK(rendererSource.find("vkCreateComputePipelines") != std::string::npos);
@@ -3000,13 +3004,17 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticPrefixSelectionLimit") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticFeatureClassSelectionMask") != std::string::npos);
+    CHECK(rendererSource.find("DrawItemRepresentativeClassFlags") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("const bool useGpuGeneratedIndirectCommand") != std::string::npos);
     CHECK(rendererSource.find("if (!useGpuGeneratedIndirectCommand)") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_input_draw_items") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_class_mask") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_used") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_input_draw_items") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_class_mask") != std::string::npos);
     CHECK(appSource.find("fast_basic_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("beauty_stress_indirect_command_used") != std::string::npos);
 }

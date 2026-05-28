@@ -139,6 +139,7 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionGpuCount = 0;
     std::uint32_t adaptiveGpuCompactionInputDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionSelectionLimit = 0;
+    std::uint32_t adaptiveGpuCompactionSelectionClassMask = 0;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
@@ -597,7 +598,8 @@ class VulkanViewportShell {
     void UpdateGpuCompactionDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     [[nodiscard]] GpuDrawItemCompactionStats ComputeGpuCompactionStats(
         const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
-        std::uint32_t drawItemCount) const;
+        std::uint32_t drawItemCount,
+        std::uint32_t selectionClassMask) const;
     [[nodiscard]] bool PointCloudPlanUsesGpuCompaction(
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
