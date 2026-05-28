@@ -176,6 +176,10 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionCpuSourceFingerprint = 0;
     std::uint32_t adaptiveGpuCompactionGpuSourceFingerprint = 0;
+    std::array<std::uint32_t, renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        adaptiveGpuCompactionCpuClassCounts{};
+    std::array<std::uint32_t, renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        adaptiveGpuCompactionGpuClassCounts{};
     std::string adaptiveGpuCompactionPerformanceFallbackReason;
     std::uint32_t adaptiveGpuCompactionPerformanceSlowFrames = 0;
     std::uint32_t adaptiveGpuCompactionPerformanceRetryFrames = 0;
@@ -444,6 +448,8 @@ class VulkanViewportShell {
         std::uint32_t representedCountSum = 0;
         std::uint32_t drawIndexXor = 0;
         std::uint32_t combinedChecksum = 0;
+        std::array<std::uint32_t, renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+            classCounts{};
     };
 
     struct GpuDrawItemOutputProbeStats {

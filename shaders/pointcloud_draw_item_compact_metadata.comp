@@ -51,6 +51,7 @@ layout(set = 0, binding = 2, std430) buffer CompactionStats {
     uint representedCountSum;
     uint drawIndexXor;
     uint combinedChecksum;
+    uint classCounts[8];
 } stats;
 
 shared uint groupCount;
@@ -62,6 +63,7 @@ shared uint groupSourceIndexSum;
 shared uint groupRepresentedCountSum;
 shared uint groupDrawIndexXor;
 shared uint groupCombinedChecksum;
+shared uint groupClassCounts[8];
 
 uint MixWord(uint value) {
     value ^= value >> 16;
@@ -85,6 +87,9 @@ void main() {
         groupDrawIndexXor = 0u;
         groupCombinedChecksum = 0u;
     }
+    if (localIndex < 8u) {
+        groupClassCounts[localIndex] = 0u;
+    }
     barrier();
 
     const uint drawIndex = gl_GlobalInvocationID.x;
@@ -92,6 +97,7 @@ void main() {
     uint sourceIndex = 0u;
     uint representedCount = 0u;
     uint footprintBits = 0u;
+    uint classFlags = 0u;
     uint mixed = 0u;
     uint localOutputIndex = 0u;
     bool selected = drawIndex < pushConstants.itemCount &&
@@ -100,7 +106,7 @@ void main() {
     if (selected) {
         item = inputDrawItems.drawItems[drawIndex];
         sourceIndex = item.indices.x;
-        const uint classFlags = (item.indices.w >> 14u) & 0xffu;
+        classFlags = (item.indices.w >> 14u) & 0xffu;
         selected = pushConstants.selectionClassMask == 0u ||
                    (classFlags & pushConstants.selectionClassMask) != 0u;
     }
@@ -167,6 +173,11 @@ void main() {
         atomicAdd(groupRepresentedCountSum, representedCount);
         atomicXor(groupDrawIndexXor, drawIndex);
         atomicXor(groupCombinedChecksum, mixed);
+        for (uint classIndex = 0u; classIndex < 8u; ++classIndex) {
+            if ((classFlags & (1u << classIndex)) != 0u) {
+                atomicAdd(groupClassCounts[classIndex], 1u);
+            }
+        }
     }
 
     barrier();
@@ -179,6 +190,9 @@ void main() {
         atomicAdd(stats.representedCountSum, groupRepresentedCountSum);
         atomicXor(stats.drawIndexXor, groupDrawIndexXor);
         atomicXor(stats.combinedChecksum, groupCombinedChecksum);
+        for (uint classIndex = 0u; classIndex < 8u; ++classIndex) {
+            atomicAdd(stats.classCounts[classIndex], groupClassCounts[classIndex]);
+        }
     }
     barrier();
 

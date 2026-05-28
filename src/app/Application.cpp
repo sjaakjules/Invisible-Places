@@ -22274,6 +22274,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuCompactionGpuChecksum = 0;
     std::uint32_t fastBasicGpuCompactionCpuSourceFingerprint = 0;
     std::uint32_t fastBasicGpuCompactionGpuSourceFingerprint = 0;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        fastBasicGpuCompactionCpuClassCounts{};
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        fastBasicGpuCompactionGpuClassCounts{};
     std::uint32_t fastBasicGpuCompactionIndirectCommandCpuVertices = 0;
     std::uint32_t fastBasicGpuCompactionIndirectCommandGpuVertices = 0;
     std::string fastBasicGpuCompactionPerformanceFallbackReason;
@@ -22645,6 +22649,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 diagnostics.adaptiveGpuCompactionCpuSourceFingerprint;
             fastBasicGpuCompactionGpuSourceFingerprint =
                 diagnostics.adaptiveGpuCompactionGpuSourceFingerprint;
+            fastBasicGpuCompactionCpuClassCounts =
+                diagnostics.adaptiveGpuCompactionCpuClassCounts;
+            fastBasicGpuCompactionGpuClassCounts =
+                diagnostics.adaptiveGpuCompactionGpuClassCounts;
         }
         const bool hasFastBasicGpuCompactionIndirectVertices =
             diagnostics.adaptiveGpuCompactionIndirectCommandCpuVertices != 0U ||
@@ -23314,6 +23322,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t gpuCompactionGpuChecksum = 0;
         std::uint32_t gpuCompactionCpuSourceFingerprint = 0;
         std::uint32_t gpuCompactionGpuSourceFingerprint = 0;
+        std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+            gpuCompactionCpuClassCounts{};
+        std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+            gpuCompactionGpuClassCounts{};
         std::uint32_t gpuCompactionIndirectCommandCpuVertices = 0;
         std::uint32_t gpuCompactionIndirectCommandGpuVertices = 0;
         std::string gpuCompactionPerformanceFallbackReason;
@@ -23588,6 +23600,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                     diagnostics.adaptiveGpuCompactionCpuSourceFingerprint;
                 stress.gpuCompactionGpuSourceFingerprint =
                     diagnostics.adaptiveGpuCompactionGpuSourceFingerprint;
+                stress.gpuCompactionCpuClassCounts =
+                    diagnostics.adaptiveGpuCompactionCpuClassCounts;
+                stress.gpuCompactionGpuClassCounts =
+                    diagnostics.adaptiveGpuCompactionGpuClassCounts;
             }
             const bool hasStressGpuCompactionIndirectVertices =
                 diagnostics.adaptiveGpuCompactionIndirectCommandCpuVertices != 0U ||
@@ -23783,6 +23799,28 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         gpuCompactionPerformanceStatus(fastBasicMaxGpuCompactionCpuReferenceMs, fastBasicMaxGpuCompactionMs);
     const auto beautyStressGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(beautyStress.maxGpuCompactionCpuReferenceMs, beautyStress.maxGpuCompactionMs);
+    const auto writeGpuCompactionClassCountMetrics =
+        [](std::ostream& metrics,
+           std::string_view prefix,
+           const std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>& cpuCounts,
+           const std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>& gpuCounts) {
+            constexpr std::array<std::string_view, 8> kClassMetricNames{{
+                "spatial",
+                "colour_contrast",
+                "normal_edge",
+                "scalar_min",
+                "scalar_max",
+                "scalar_threshold",
+                "emissive_accent",
+                "blue_noise_fill",
+            }};
+            for (std::size_t classIndex = 0; classIndex < kClassMetricNames.size(); ++classIndex) {
+                metrics << "  \"" << prefix << "_cpu_class_" << kClassMetricNames[classIndex] << "\": "
+                        << cpuCounts[classIndex] << ",\n";
+                metrics << "  \"" << prefix << "_gpu_class_" << kClassMetricNames[classIndex] << "\": "
+                        << gpuCounts[classIndex] << ",\n";
+            }
+        };
 
     const auto metricsPath = outputDirectory / "lod_compare_metrics.json";
     {
@@ -23923,7 +23961,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"gpu_compaction_cpu_source_fingerprint\": "
                 << fastBasicGpuCompactionCpuSourceFingerprint << ",\n"
                 << "  \"gpu_compaction_gpu_source_fingerprint\": "
-                << fastBasicGpuCompactionGpuSourceFingerprint << ",\n"
+                << fastBasicGpuCompactionGpuSourceFingerprint << ",\n";
+            writeGpuCompactionClassCountMetrics(
+                metrics,
+                "gpu_compaction",
+                fastBasicGpuCompactionCpuClassCounts,
+                fastBasicGpuCompactionGpuClassCounts);
+            metrics
                 << "  \"gpu_compaction_cpu_reference_ms\": "
                 << fastBasicMaxGpuCompactionCpuReferenceMs << ",\n"
                 << "  \"gpu_compaction_performance_status\": "
@@ -24288,7 +24332,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"beauty_stress_compaction_cpu_source_fingerprint\": "
                 << beautyStress.gpuCompactionCpuSourceFingerprint << ",\n"
                 << "  \"beauty_stress_compaction_gpu_source_fingerprint\": "
-                << beautyStress.gpuCompactionGpuSourceFingerprint << ",\n"
+                << beautyStress.gpuCompactionGpuSourceFingerprint << ",\n";
+            writeGpuCompactionClassCountMetrics(
+                metrics,
+                "beauty_stress_compaction",
+                beautyStress.gpuCompactionCpuClassCounts,
+                beautyStress.gpuCompactionGpuClassCounts);
+            metrics
                 << "  \"beauty_stress_compaction_cpu_reference_ms\": "
                 << beautyStress.maxGpuCompactionCpuReferenceMs << ",\n"
                 << "  \"beauty_stress_compaction_performance_status\": "
@@ -24570,7 +24620,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"fast_basic_compaction_cpu_source_fingerprint\": "
                 << fastBasicGpuCompactionCpuSourceFingerprint << ",\n"
                 << "  \"fast_basic_compaction_gpu_source_fingerprint\": "
-                << fastBasicGpuCompactionGpuSourceFingerprint << ",\n"
+                << fastBasicGpuCompactionGpuSourceFingerprint << ",\n";
+            writeGpuCompactionClassCountMetrics(
+                metrics,
+                "fast_basic_compaction",
+                fastBasicGpuCompactionCpuClassCounts,
+                fastBasicGpuCompactionGpuClassCounts);
+            metrics
                 << "  \"fast_basic_compaction_cpu_reference_ms\": "
                 << fastBasicMaxGpuCompactionCpuReferenceMs << ",\n"
                 << "  \"fast_basic_compaction_performance_status\": "
