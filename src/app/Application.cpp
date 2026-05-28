@@ -21388,6 +21388,18 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuFeatureClassProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuFeatureClassProbeMs);
                     }
+                    if (diagnostics.adaptiveGpuRankProbeUsed ||
+                        diagnostics.adaptiveGpuRankProbeParityStatus != "not checked" ||
+                        diagnostics.adaptiveGpuRankProbeMs > 0.0) {
+                        ImGui::Text(
+                            "GPU stable-rank prefix probe: %s | rank <= %u | %u/%u items | cpu %.3f ms gpu %.3f ms",
+                            diagnostics.adaptiveGpuRankProbeParityStatus.c_str(),
+                            diagnostics.adaptiveGpuRankProbeLimit,
+                            diagnostics.adaptiveGpuRankProbeGpuCount,
+                            diagnostics.adaptiveGpuRankProbeCpuCount,
+                            diagnostics.adaptiveGpuRankProbeCpuReferenceMs,
+                            diagnostics.adaptiveGpuRankProbeMs);
+                    }
                     ImGui::Text(
                         "GPU compacted submission: %s | %u/%u vertices",
                         diagnostics.adaptiveGpuCompactionSubmissionUsed
@@ -22382,6 +22394,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuFeatureClassProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuFeatureClassProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuFeatureClassProbeMs = 0.0;
+    bool fastBasicGpuRankProbeUsed = false;
+    std::string fastBasicGpuRankProbeParityStatus = "not checked";
+    std::uint32_t fastBasicMaxGpuRankProbeDispatches = 0;
+    std::uint32_t fastBasicMaxGpuRankProbeLimit = 0;
+    std::uint32_t fastBasicGpuRankProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuRankProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuRankProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuRankProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuRankProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuRankProbeGpuSourceFingerprint = 0;
+    double fastBasicMaxGpuRankProbeCpuReferenceMs = 0.0;
+    double fastBasicMaxGpuRankProbeMs = 0.0;
     bool fastBasicGpuCompactionSubmissionEligible = false;
     bool fastBasicGpuCompactionSubmissionUsed = false;
     std::string fastBasicGpuCompactionSubmissionFallbackReason;
@@ -22800,6 +22824,41 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuFeatureClassProbeMs = std::max(
             fastBasicMaxGpuFeatureClassProbeMs,
             diagnostics.adaptiveGpuFeatureClassProbeMs);
+        fastBasicGpuRankProbeUsed =
+            fastBasicGpuRankProbeUsed || diagnostics.adaptiveGpuRankProbeUsed;
+        if (diagnostics.adaptiveGpuRankProbeParityStatus != "not checked") {
+            fastBasicGpuRankProbeParityStatus =
+                diagnostics.adaptiveGpuRankProbeParityStatus;
+        }
+        fastBasicMaxGpuRankProbeDispatches = std::max(
+            fastBasicMaxGpuRankProbeDispatches,
+            diagnostics.adaptiveGpuRankProbeDispatches);
+        fastBasicMaxGpuRankProbeLimit = std::max(
+            fastBasicMaxGpuRankProbeLimit,
+            diagnostics.adaptiveGpuRankProbeLimit);
+        const bool hasFastBasicRankProbeCounts =
+            diagnostics.adaptiveGpuRankProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuRankProbeGpuCount != 0U;
+        if (hasFastBasicRankProbeCounts) {
+            fastBasicGpuRankProbeCpuCount =
+                diagnostics.adaptiveGpuRankProbeCpuCount;
+            fastBasicGpuRankProbeGpuCount =
+                diagnostics.adaptiveGpuRankProbeGpuCount;
+            fastBasicGpuRankProbeCpuChecksum =
+                diagnostics.adaptiveGpuRankProbeCpuChecksum;
+            fastBasicGpuRankProbeGpuChecksum =
+                diagnostics.adaptiveGpuRankProbeGpuChecksum;
+            fastBasicGpuRankProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuRankProbeCpuSourceFingerprint;
+            fastBasicGpuRankProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuRankProbeGpuSourceFingerprint;
+        }
+        fastBasicMaxGpuRankProbeCpuReferenceMs = std::max(
+            fastBasicMaxGpuRankProbeCpuReferenceMs,
+            diagnostics.adaptiveGpuRankProbeCpuReferenceMs);
+        fastBasicMaxGpuRankProbeMs = std::max(
+            fastBasicMaxGpuRankProbeMs,
+            diagnostics.adaptiveGpuRankProbeMs);
         fastBasicGpuCompactionSubmissionEligible =
             fastBasicGpuCompactionSubmissionEligible ||
             diagnostics.adaptiveGpuCompactionSubmissionEligible;
@@ -24043,12 +24102,27 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                    ? std::string{"GPU protected feature-class probe faster than CPU reference"}
                    : std::string{"CPU reference faster; protected feature-class probe remains compare-only"};
     };
+    const auto gpuRankProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU stable-rank prefix probe faster than CPU reference"}
+                   : std::string{"CPU reference faster; stable-rank prefix probe remains compare-only"};
+    };
     const auto fastBasicGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(fastBasicMaxGpuCompactionCpuReferenceMs, fastBasicMaxGpuCompactionMs);
     const auto fastBasicGpuFeatureClassProbePerformanceStatus =
         gpuFeatureClassProbePerformanceStatus(
             fastBasicMaxGpuFeatureClassProbeCpuReferenceMs,
             fastBasicMaxGpuFeatureClassProbeMs);
+    const auto fastBasicGpuRankProbePerformanceStatus =
+        gpuRankProbePerformanceStatus(
+            fastBasicMaxGpuRankProbeCpuReferenceMs,
+            fastBasicMaxGpuRankProbeMs);
     const auto beautyStressGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(beautyStress.maxGpuCompactionCpuReferenceMs, beautyStress.maxGpuCompactionMs);
     const auto writeGpuCompactionClassCountMetrics =
@@ -24232,6 +24306,32 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuFeatureClassProbeMs << ",\n"
                 << "  \"gpu_feature_class_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuFeatureClassProbePerformanceStatus) << ",\n"
+                << "  \"gpu_rank_probe_used\": "
+                << (fastBasicGpuRankProbeUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_rank_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRankProbeParityStatus) << ",\n"
+                << "  \"gpu_rank_probe_dispatches\": "
+                << fastBasicMaxGpuRankProbeDispatches << ",\n"
+                << "  \"gpu_rank_probe_limit\": "
+                << fastBasicMaxGpuRankProbeLimit << ",\n"
+                << "  \"gpu_rank_probe_cpu_count\": "
+                << fastBasicGpuRankProbeCpuCount << ",\n"
+                << "  \"gpu_rank_probe_gpu_count\": "
+                << fastBasicGpuRankProbeGpuCount << ",\n"
+                << "  \"gpu_rank_probe_cpu_checksum\": "
+                << fastBasicGpuRankProbeCpuChecksum << ",\n"
+                << "  \"gpu_rank_probe_gpu_checksum\": "
+                << fastBasicGpuRankProbeGpuChecksum << ",\n"
+                << "  \"gpu_rank_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_rank_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_rank_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuRankProbeCpuReferenceMs << ",\n"
+                << "  \"gpu_rank_probe_ms\": "
+                << fastBasicMaxGpuRankProbeMs << ",\n"
+                << "  \"gpu_rank_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuRankProbePerformanceStatus) << ",\n"
                 << "  \"gpu_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"gpu_compaction_submission_used\": "
@@ -24933,6 +25033,32 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuFeatureClassProbeMs << ",\n"
                 << "  \"fast_basic_feature_class_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuFeatureClassProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_rank_probe_used\": "
+                << (fastBasicGpuRankProbeUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_rank_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRankProbeParityStatus) << ",\n"
+                << "  \"fast_basic_rank_probe_dispatches\": "
+                << fastBasicMaxGpuRankProbeDispatches << ",\n"
+                << "  \"fast_basic_rank_probe_limit\": "
+                << fastBasicMaxGpuRankProbeLimit << ",\n"
+                << "  \"fast_basic_rank_probe_cpu_count\": "
+                << fastBasicGpuRankProbeCpuCount << ",\n"
+                << "  \"fast_basic_rank_probe_gpu_count\": "
+                << fastBasicGpuRankProbeGpuCount << ",\n"
+                << "  \"fast_basic_rank_probe_cpu_checksum\": "
+                << fastBasicGpuRankProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_rank_probe_gpu_checksum\": "
+                << fastBasicGpuRankProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_rank_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_rank_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuRankProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_rank_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuRankProbeCpuReferenceMs << ",\n"
+                << "  \"fast_basic_rank_probe_ms\": "
+                << fastBasicMaxGpuRankProbeMs << ",\n"
+                << "  \"fast_basic_rank_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuRankProbePerformanceStatus) << ",\n"
                 << "  \"fast_basic_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"fast_basic_compaction_submission_used\": "
@@ -25109,6 +25235,15 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " gpu/cpu items, cpu " << fastBasicMaxGpuFeatureClassProbeCpuReferenceMs
               << " ms, gpu " << fastBasicMaxGpuFeatureClassProbeMs
               << " ms, " << fastBasicGpuFeatureClassProbePerformanceStatus
+              << ")"
+              << " | gpu rank probe: " << (fastBasicGpuRankProbeUsed ? "yes" : "no")
+              << " (" << fastBasicGpuRankProbeParityStatus
+              << ", rank <= " << fastBasicMaxGpuRankProbeLimit
+              << ", " << fastBasicGpuRankProbeGpuCount
+              << "/" << fastBasicGpuRankProbeCpuCount
+              << " gpu/cpu items, cpu " << fastBasicMaxGpuRankProbeCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuRankProbeMs
+              << " ms, " << fastBasicGpuRankProbePerformanceStatus
               << ")"
               << " | gpu compacted indirect: "
               << (fastBasicGpuCompactionIndirectCommandUsed ? "yes" : "no")
