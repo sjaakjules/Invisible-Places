@@ -466,6 +466,7 @@ class VulkanViewportShell {
         std::uint32_t sourceIndexSum = 0;
         std::uint32_t representedCountSum = 0;
         std::uint32_t identityChecksum = 0;
+        std::uint32_t orderChecksum = 0;
     };
 
     struct GpuCompactionPerformanceGateState {
@@ -710,6 +711,7 @@ class VulkanViewportShell {
         std::uint32_t outputProbeCapacity) const;
     static void AccumulateGpuCompactionOutputProbeStats(
         const renderer::pointcloud::PointCloudDrawItemGpu& item,
+        std::uint32_t outputIndex,
         GpuDrawItemOutputProbeStats* stats);
     [[nodiscard]] GpuDrawItemOutputProbeStats ComputeGpuCompactionOutputProbeStatsFromBuffer(
         const renderer::pointcloud::PointCloudDrawItemGpu* drawItems,

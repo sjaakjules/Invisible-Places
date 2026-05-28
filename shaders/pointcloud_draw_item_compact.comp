@@ -223,7 +223,8 @@ void main() {
     }
     barrier();
 
-    const uint outputIndex = groupBase + localOutputIndex;
+    const bool orderedOutput = pushConstants.reserved2 != 0u;
+    const uint outputIndex = orderedOutput ? drawIndex : groupBase + localOutputIndex;
     if (selected &&
         pushConstants.selectionWriteOutput != 0u &&
         outputIndex < pushConstants.selectionMaxOutputCount) {
