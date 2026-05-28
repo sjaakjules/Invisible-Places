@@ -1485,6 +1485,10 @@ bool BoundsIntersectsClipFrustum(
 
 struct ProjectedBoundsFootprint {
     bool visible = false;
+    float minX = 0.0F;
+    float minY = 0.0F;
+    float maxX = 0.0F;
+    float maxY = 0.0F;
     float widthPixels = 0.0F;
     float heightPixels = 0.0F;
     float areaPixels = 0.0F;
@@ -1513,6 +1517,190 @@ struct RepresentativeCostEstimate {
     float vertexCost = 1.0F;
     float fragmentCost = 1.0F;
     float blendedFragmentCost = 0.0F;
+};
+
+struct TileCoverage {
+    bool valid = false;
+    std::uint32_t minX = 0;
+    std::uint32_t minY = 0;
+    std::uint32_t maxX = 0;
+    std::uint32_t maxY = 0;
+
+    [[nodiscard]] std::uint32_t Count() const {
+        if (!valid || maxX < minX || maxY < minY) {
+            return 0U;
+        }
+        return (maxX - minX + 1U) * (maxY - minY + 1U);
+    }
+};
+
+struct TileBudgetPressure {
+    bool fragments = false;
+    bool blendedFragments = false;
+
+    [[nodiscard]] bool Any() const {
+        return fragments || blendedFragments;
+    }
+};
+
+bool RepresentativeClassIsTileProtected(std::uint32_t classFlags) {
+    constexpr std::uint32_t kProtectedFlags =
+        PointCloudLodRepresentativeClassColorContrast |
+        PointCloudLodRepresentativeClassNormalEdge |
+        PointCloudLodRepresentativeClassScalarMin |
+        PointCloudLodRepresentativeClassScalarMax |
+        PointCloudLodRepresentativeClassScalarThreshold |
+        PointCloudLodRepresentativeClassEmissiveAccent;
+    return (classFlags & kProtectedFlags) != 0U;
+}
+
+struct TileBudgetAccumulator {
+    bool diagnosticsEnabled = false;
+    bool limitingEnabled = false;
+    std::uint32_t tileSizePixels = 32;
+    std::uint32_t tileCountX = 0;
+    std::uint32_t tileCountY = 0;
+    float fragmentBudget = 0.0F;
+    float blendedFragmentBudget = 0.0F;
+    std::vector<float> fragments;
+    std::vector<float> blendedFragments;
+    std::uint32_t tileLimitedRepresentativeCount = 0;
+    std::uint32_t tileLimitedNodeCount = 0;
+    std::uint32_t tilePreservedRepresentativeCount = 0;
+
+    [[nodiscard]] std::size_t TileIndex(std::uint32_t x, std::uint32_t y) const {
+        return (static_cast<std::size_t>(y) * tileCountX) + x;
+    }
+
+    [[nodiscard]] bool HasTiles() const {
+        return diagnosticsEnabled && tileCountX > 0U && tileCountY > 0U && !fragments.empty();
+    }
+
+    [[nodiscard]] TileBudgetPressure ExceededPressure(
+        const TileCoverage& coverage,
+        const RepresentativeCostEstimate& cost) const {
+        if (!HasTiles() || !coverage.valid) {
+            return {};
+        }
+        const float tileShare = 1.0F / static_cast<float>(std::max<std::uint32_t>(1U, coverage.Count()));
+        const float fragmentShare = cost.fragmentCost * tileShare;
+        const float blendedShare = cost.blendedFragmentCost * tileShare;
+        TileBudgetPressure pressure;
+        for (std::uint32_t y = coverage.minY; y <= coverage.maxY && y < tileCountY; ++y) {
+            for (std::uint32_t x = coverage.minX; x <= coverage.maxX && x < tileCountX; ++x) {
+                const auto index = TileIndex(x, y);
+                const bool overFragments =
+                    fragmentBudget > 0.0F &&
+                    index < fragments.size() &&
+                    fragments[index] + fragmentShare > fragmentBudget;
+                const bool overBlended =
+                    blendedFragmentBudget > 0.0F &&
+                    index < blendedFragments.size() &&
+                    blendedFragments[index] + blendedShare > blendedFragmentBudget;
+                pressure.fragments = pressure.fragments || overFragments;
+                pressure.blendedFragments = pressure.blendedFragments || overBlended;
+            }
+        }
+        return pressure;
+    }
+
+    [[nodiscard]] bool WouldExceed(
+        const TileCoverage& coverage,
+        const RepresentativeCostEstimate& cost) const {
+        return ExceededPressure(coverage, cost).Any();
+    }
+
+    void Add(const TileCoverage& coverage, const RepresentativeCostEstimate& cost) {
+        if (!HasTiles() || !coverage.valid) {
+            return;
+        }
+        const float tileShare = 1.0F / static_cast<float>(std::max<std::uint32_t>(1U, coverage.Count()));
+        const float fragmentShare = cost.fragmentCost * tileShare;
+        const float blendedShare = cost.blendedFragmentCost * tileShare;
+        for (std::uint32_t y = coverage.minY; y <= coverage.maxY && y < tileCountY; ++y) {
+            for (std::uint32_t x = coverage.minX; x <= coverage.maxX && x < tileCountX; ++x) {
+                const auto index = TileIndex(x, y);
+                if (index < fragments.size()) {
+                    fragments[index] += fragmentShare;
+                }
+                if (index < blendedFragments.size()) {
+                    blendedFragments[index] += blendedShare;
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] bool AcceptOrPreserve(
+        const TileCoverage& coverage,
+        const RepresentativeCostEstimate& cost,
+        bool preserve,
+        bool* limited,
+        TileBudgetPressure* pressureOut = nullptr) {
+        if (limited != nullptr) {
+            *limited = false;
+        }
+        const auto pressure = ExceededPressure(coverage, cost);
+        if (pressureOut != nullptr) {
+            *pressureOut = pressure;
+        }
+        const bool overBudget = pressure.Any();
+        if (limitingEnabled && overBudget && !preserve) {
+            ++tileLimitedRepresentativeCount;
+            if (limited != nullptr) {
+                *limited = true;
+            }
+            return false;
+        }
+        if (limitingEnabled && overBudget && preserve) {
+            ++tilePreservedRepresentativeCount;
+        }
+        Add(coverage, cost);
+        return true;
+    }
+
+    void Finalize(
+        std::uint32_t viewportWidth,
+        std::uint32_t viewportHeight,
+        PointCloudLodTraversalDiagnostics* diagnostics) const {
+        if (diagnostics == nullptr) {
+            return;
+        }
+        diagnostics->tileBudgetEnabled = limitingEnabled;
+        diagnostics->tileSizePixels = diagnosticsEnabled ? tileSizePixels : 0U;
+        diagnostics->tileCount = tileCountX * tileCountY;
+        diagnostics->tileFragmentBudget = fragmentBudget;
+        diagnostics->tileBlendedFragmentBudget = blendedFragmentBudget;
+        diagnostics->tileLimitedRepresentativeCount = tileLimitedRepresentativeCount;
+        diagnostics->tileLimitedNodeCount = tileLimitedNodeCount;
+        diagnostics->tilePreservedRepresentativeCount = tilePreservedRepresentativeCount;
+        if (!HasTiles()) {
+            return;
+        }
+
+        std::uint32_t overBudgetTiles = 0;
+        for (std::size_t index = 0; index < fragments.size(); ++index) {
+            diagnostics->maxTileEstimatedFragments =
+                std::max(diagnostics->maxTileEstimatedFragments, fragments[index]);
+            if (index < blendedFragments.size()) {
+                diagnostics->maxTileEstimatedBlendedFragments =
+                    std::max(diagnostics->maxTileEstimatedBlendedFragments, blendedFragments[index]);
+            }
+            const bool overFragments = fragmentBudget > 0.0F && fragments[index] > fragmentBudget;
+            const bool overBlended =
+                blendedFragmentBudget > 0.0F &&
+                index < blendedFragments.size() &&
+                blendedFragments[index] > blendedFragmentBudget;
+            if (overFragments || overBlended) {
+                ++overBudgetTiles;
+            }
+        }
+        diagnostics->overBudgetTileCount = overBudgetTiles;
+        const float tilePixels = static_cast<float>(tileSizePixels) * static_cast<float>(tileSizePixels);
+        const float screenPixels = static_cast<float>(std::max<std::uint32_t>(1U, viewportWidth)) *
+                                   static_cast<float>(std::max<std::uint32_t>(1U, viewportHeight));
+        diagnostics->overBudgetTileScreenPercent =
+            std::min(100.0F, 100.0F * static_cast<float>(overBudgetTiles) * tilePixels / screenPixels);
+    }
 };
 
 ProjectedBoundsFootprint ProjectedBoundsFootprintPixels(
@@ -1551,10 +1739,99 @@ ProjectedBoundsFootprint ProjectedBoundsFootprintPixels(
     const float height = std::max(1.0F, maxY - minY);
     return {
         .visible = true,
+        .minX = minX,
+        .minY = minY,
+        .maxX = maxX,
+        .maxY = maxY,
         .widthPixels = width,
         .heightPixels = height,
         .areaPixels = width * height,
     };
+}
+
+TileCoverage TileCoverageFromPixelRect(
+    float minX,
+    float minY,
+    float maxX,
+    float maxY,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    std::uint32_t tileSizePixels) {
+    if (viewportWidth == 0U ||
+        viewportHeight == 0U ||
+        tileSizePixels == 0U ||
+        maxX < 0.0F ||
+        maxY < 0.0F ||
+        minX > static_cast<float>(viewportWidth) ||
+        minY > static_cast<float>(viewportHeight)) {
+        return {};
+    }
+
+    const float clampedMinX = std::clamp(minX, 0.0F, static_cast<float>(viewportWidth - 1U));
+    const float clampedMaxX = std::clamp(maxX, 0.0F, static_cast<float>(viewportWidth - 1U));
+    const float clampedMinY = std::clamp(minY, 0.0F, static_cast<float>(viewportHeight - 1U));
+    const float clampedMaxY = std::clamp(maxY, 0.0F, static_cast<float>(viewportHeight - 1U));
+    if (clampedMaxX < clampedMinX || clampedMaxY < clampedMinY) {
+        return {};
+    }
+
+    return {
+        .valid = true,
+        .minX = static_cast<std::uint32_t>(std::floor(clampedMinX / static_cast<float>(tileSizePixels))),
+        .minY = static_cast<std::uint32_t>(std::floor(clampedMinY / static_cast<float>(tileSizePixels))),
+        .maxX = static_cast<std::uint32_t>(std::floor(clampedMaxX / static_cast<float>(tileSizePixels))),
+        .maxY = static_cast<std::uint32_t>(std::floor(clampedMaxY / static_cast<float>(tileSizePixels))),
+    };
+}
+
+TileCoverage TileCoverageFromNodeFootprint(
+    const ProjectedBoundsFootprint& footprint,
+    const PointCloudLodTraversalParams& params) {
+    if (!footprint.visible) {
+        return {};
+    }
+    return TileCoverageFromPixelRect(
+        footprint.minX,
+        footprint.minY,
+        footprint.maxX,
+        footprint.maxY,
+        params.viewportWidth,
+        params.viewportHeight,
+        std::max<std::uint32_t>(1U, params.tileSizePixels));
+}
+
+TileCoverage TileCoverageFromRepresentative(
+    const PointCloudLodRepresentative& representative,
+    const PointCloudLodTraversalParams& params,
+    const ProjectedBoundsFootprint& nodeFootprint,
+    const EmittedRepresentativeFootprint& footprint) {
+    const glm::vec4 clip =
+        params.viewProjection *
+        glm::vec4{
+            representative.position.x,
+            representative.position.y,
+            representative.position.z,
+            1.0F};
+    if (std::abs(clip.w) <= std::numeric_limits<float>::epsilon()) {
+        return TileCoverageFromNodeFootprint(nodeFootprint, params);
+    }
+
+    const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+    const float centerX = (ndc.x * 0.5F + 0.5F) * static_cast<float>(params.viewportWidth);
+    const float centerY = (ndc.y * 0.5F + 0.5F) * static_cast<float>(params.viewportHeight);
+    const float radius = 0.5F * std::sqrt(std::max(1.0F, footprint.renderAreaPixels));
+    auto coverage = TileCoverageFromPixelRect(
+        centerX - radius,
+        centerY - radius,
+        centerX + radius,
+        centerY + radius,
+        params.viewportWidth,
+        params.viewportHeight,
+        std::max<std::uint32_t>(1U, params.tileSizePixels));
+    if (!coverage.valid) {
+        coverage = TileCoverageFromNodeFootprint(nodeFootprint, params);
+    }
+    return coverage;
 }
 
 float ProjectedWorldDiameterPixels(
@@ -1867,6 +2144,93 @@ float DefaultFragmentBudget(const PointCloudLodTraversalParams& params) {
             return 0.0F;
     }
     return pixelCount * 4.0F;
+}
+
+float DefaultTileFragmentBudget(const PointCloudLodTraversalParams& params) {
+    if (invisible_places::output::PointCloudExportDensityModeUsesFullSource(params.densityMode)) {
+        return 0.0F;
+    }
+
+    const float tileSize = static_cast<float>(std::max<std::uint32_t>(1U, params.tileSizePixels));
+    const float tilePixels = tileSize * tileSize;
+    switch (params.densityMode) {
+        case invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview:
+            return tilePixels * 16.0F;
+        case invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive:
+        case invisible_places::output::PointCloudExportDensityMode::ArtisticAsPreview:
+            return tilePixels * 32.0F;
+        case invisible_places::output::PointCloudExportDensityMode::AdaptiveHighQuality:
+        case invisible_places::output::PointCloudExportDensityMode::ArtisticHighQuality:
+            return tilePixels * 64.0F;
+        case invisible_places::output::PointCloudExportDensityMode::FullSource:
+            return 0.0F;
+    }
+    return tilePixels * 32.0F;
+}
+
+TileBudgetAccumulator MakeTileBudgetAccumulator(const PointCloudLodTraversalParams& params) {
+    TileBudgetAccumulator accumulator;
+    if (invisible_places::output::PointCloudExportDensityModeUsesFullSource(params.densityMode) ||
+        params.viewportWidth == 0U ||
+        params.viewportHeight == 0U) {
+        return accumulator;
+    }
+
+    accumulator.diagnosticsEnabled = true;
+    accumulator.tileSizePixels = std::max<std::uint32_t>(1U, params.tileSizePixels);
+    accumulator.tileCountX =
+        (std::max<std::uint32_t>(1U, params.viewportWidth) + accumulator.tileSizePixels - 1U) /
+        accumulator.tileSizePixels;
+    accumulator.tileCountY =
+        (std::max<std::uint32_t>(1U, params.viewportHeight) + accumulator.tileSizePixels - 1U) /
+        accumulator.tileSizePixels;
+    accumulator.fragmentBudget = params.maxTileEstimatedFragments > 0.0F
+                                     ? params.maxTileEstimatedFragments
+                                     : DefaultTileFragmentBudget(params);
+    accumulator.blendedFragmentBudget =
+        params.maxTileEstimatedBlendedFragments > 0.0F
+            ? params.maxTileEstimatedBlendedFragments
+            : (IsBeautyCostProfile(params.rendererCostProfile) ? DefaultTileFragmentBudget(params) : 0.0F);
+    const std::size_t tileCount =
+        static_cast<std::size_t>(accumulator.tileCountX) * static_cast<std::size_t>(accumulator.tileCountY);
+    accumulator.fragments.assign(tileCount, 0.0F);
+    accumulator.blendedFragments.assign(tileCount, 0.0F);
+    accumulator.limitingEnabled =
+        params.tileBudgetEnabled &&
+        IsBeautyCostProfile(params.rendererCostProfile) &&
+        (accumulator.fragmentBudget > 0.0F || accumulator.blendedFragmentBudget > 0.0F);
+    return accumulator;
+}
+
+void InitializeConservativeCullingDiagnostics(
+    const PointCloudLodTraversalParams& params,
+    PointCloudLodTraversalDiagnostics* diagnostics) {
+    if (diagnostics == nullptr) {
+        return;
+    }
+
+    diagnostics->occlusionCullingEnabled = false;
+    diagnostics->occlusionRejectedNodeCount = 0U;
+    diagnostics->occlusionRejectedRepresentedSourceCount = 0ULL;
+    if (!params.occlusionCullingEnabled) {
+        diagnostics->occlusionCullingState = "disabled";
+        diagnostics->occlusionCullingDisabledReason = "not requested";
+        return;
+    }
+    if (invisible_places::output::PointCloudExportDensityModeUsesFullSource(params.densityMode)) {
+        diagnostics->occlusionCullingState = "disabled";
+        diagnostics->occlusionCullingDisabledReason = "Full Source bypass";
+        return;
+    }
+    if (!PointCloudStyleUsesDepthPrepass(params.style)) {
+        diagnostics->occlusionCullingState = "disabled";
+        diagnostics->occlusionCullingDisabledReason = "no depth-contributing style";
+        return;
+    }
+
+    diagnostics->occlusionCullingState = "uncertain";
+    diagnostics->occlusionCullingDisabledReason =
+        "conservative depth proxy not built for this traversal";
 }
 
 struct TraversalBudgetState {
@@ -2505,6 +2869,7 @@ void EmitRepresentatives(
     float maxRepresentativeDiameterPixels,
     std::uint32_t nodeRepresentativeLimit,
     TraversalBudgetState* budget,
+    TileBudgetAccumulator* tileBudget,
     std::vector<PointCloudDrawItemGpu>* drawItems,
     const std::stop_token& stopToken = {},
     PointCloudLodTraversalDiagnostics* diagnostics = nullptr) {
@@ -2544,6 +2909,12 @@ void EmitRepresentatives(
     }
 
     std::uint32_t emittedForNode = 0;
+    bool tileLimitedForNode = false;
+    enum class EmitRepresentativeStatus {
+        Emitted,
+        Skipped,
+        Stop,
+    };
     const auto pushDrawItem = [&](const PointCloudLodRepresentative& representative,
                                   std::uint32_t representedSourceCount,
                                   std::uint64_t rankKey,
@@ -2560,7 +2931,30 @@ void EmitRepresentatives(
         const bool preserveBeautyCoverage =
             IsBeautyCostProfile(params.rendererCostProfile) && emittedForNode == 0U;
         if (!budget->CanEmitCost(*drawItems, cost, preserveBeautyCoverage)) {
-            return false;
+            return EmitRepresentativeStatus::Stop;
+        }
+        if (tileBudget != nullptr) {
+            const auto tileCoverage = TileCoverageFromRepresentative(
+                representative,
+                params,
+                nodeFootprint,
+                footprint);
+            const bool preserveTile =
+                preserveBeautyCoverage ||
+                RepresentativeClassIsTileProtected(representative.representativeClassFlags);
+            bool limitedByTile = false;
+            TileBudgetPressure tilePressure;
+            if (!tileBudget->AcceptOrPreserve(tileCoverage, cost, preserveTile, &limitedByTile, &tilePressure)) {
+                budget->fragmentBudgetReached =
+                    budget->fragmentBudgetReached || tilePressure.fragments;
+                budget->blendedFragmentBudgetReached =
+                    budget->blendedFragmentBudgetReached || tilePressure.blendedFragments;
+                if (limitedByTile && !tileLimitedForNode) {
+                    ++tileBudget->tileLimitedNodeCount;
+                    tileLimitedForNode = true;
+                }
+                return EmitRepresentativeStatus::Skipped;
+            }
         }
         const auto compensation = RepresentativeAreaCompensation(
             representative,
@@ -2589,7 +2983,7 @@ void EmitRepresentatives(
         budget->emittedEstimatedFragments += cost.fragmentCost;
         budget->emittedEstimatedBlendedFragments += cost.blendedFragmentCost;
         ++emittedForNode;
-        return true;
+        return EmitRepresentativeStatus::Emitted;
     };
 
     if (emitCount >= availableCount) {
@@ -2607,11 +3001,12 @@ void EmitRepresentatives(
                 return;
             }
             const auto& representative = hierarchy.representatives[representativeIndex];
-            if (!pushDrawItem(
-                    representative,
-                    representative.representedSourceCount,
-                    rankedOffsets[rankOrdinal].rankKey,
-                    rankOrdinal)) {
+            const auto emitStatus = pushDrawItem(
+                representative,
+                representative.representedSourceCount,
+                rankedOffsets[rankOrdinal].rankKey,
+                rankOrdinal);
+            if (emitStatus == EmitRepresentativeStatus::Stop) {
                 return;
             }
         }
@@ -2641,11 +3036,12 @@ void EmitRepresentatives(
         if (selectedRepresentativeIndex >= hierarchy.representatives.size()) {
             continue;
         }
-        if (!pushDrawItem(
-                hierarchy.representatives[selectedRepresentativeIndex],
-                std::max<std::uint32_t>(1U, representedCounts[emittedIndex]),
-                rankedOffsets[emittedIndex].rankKey,
-                emittedIndex)) {
+        const auto emitStatus = pushDrawItem(
+            hierarchy.representatives[selectedRepresentativeIndex],
+            std::max<std::uint32_t>(1U, representedCounts[emittedIndex]),
+            rankedOffsets[emittedIndex].rankKey,
+            emittedIndex);
+        if (emitStatus == EmitRepresentativeStatus::Stop) {
             return;
         }
     }
@@ -2666,7 +3062,7 @@ void TraverseFullSourceNode(
     }
     const auto& node = hierarchy.nodes[nodeIndex];
     if (node.IsLeaf()) {
-        EmitRepresentatives(hierarchy, nodeIndex, node, params, {}, 0.0F, 0U, budget, drawItems, stopToken);
+        EmitRepresentatives(hierarchy, nodeIndex, node, params, {}, 0.0F, 0U, budget, nullptr, drawItems, stopToken);
         return;
     }
 
@@ -2947,8 +3343,11 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
         *diagnostics = {};
         diagnostics->rendererCostProfile = params.rendererCostProfile;
     }
+    InitializeConservativeCullingDiagnostics(params, diagnostics);
+    auto tileBudget = MakeTileBudgetAccumulator(params);
     std::vector<PointCloudDrawItemGpu> drawItems;
     if (hierarchy.Empty() || TraversalCancelled(stopToken)) {
+        tileBudget.Finalize(params.viewportWidth, params.viewportHeight, diagnostics);
         return drawItems;
     }
 
@@ -2992,6 +3391,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
             diagnostics->fragmentBudgetReached = budget.fragmentBudgetReached;
             diagnostics->blendedFragmentBudgetReached = budget.blendedFragmentBudgetReached;
         }
+        tileBudget.Finalize(params.viewportWidth, params.viewportHeight, diagnostics);
         return drawItems;
     }
 
@@ -3004,6 +3404,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
         stopToken,
         diagnostics);
     if (TraversalCancelled(stopToken)) {
+        tileBudget.Finalize(params.viewportWidth, params.viewportHeight, diagnostics);
         return {};
     }
     if (diagnostics != nullptr) {
@@ -3029,6 +3430,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
             : std::min<std::size_t>(allocations.size(), budget.maxRepresentatives));
     for (const auto& allocation : allocations) {
         if (TraversalCancelled(stopToken)) {
+            tileBudget.Finalize(params.viewportWidth, params.viewportHeight, diagnostics);
             return {};
         }
         if (allocation.node.nodeIndex >= hierarchy.nodes.size() ||
@@ -3044,6 +3446,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
             maxRepresentativeDiameterPixels,
             allocation.allocatedRepresentatives,
             &emitBudget,
+            &tileBudget,
             &drawItems,
             stopToken,
             diagnostics);
@@ -3058,6 +3461,7 @@ std::vector<PointCloudDrawItemGpu> TraversePointCloudLodHierarchy(
         diagnostics->fragmentBudgetReached = emitBudget.fragmentBudgetReached;
         diagnostics->blendedFragmentBudgetReached = emitBudget.blendedFragmentBudgetReached;
     }
+    tileBudget.Finalize(params.viewportWidth, params.viewportHeight, diagnostics);
     return drawItems;
 }
 
@@ -3155,6 +3559,7 @@ std::vector<PointCloudDrawItemGpu> BuildCoarsePointCloudLodFallbackDrawItems(
             maxRepresentativeDiameterPixels,
             0U,
             &budget,
+            nullptr,
             &drawItems);
     }
 

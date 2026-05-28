@@ -1062,6 +1062,13 @@ std::uint64_t DecodedRawChunkBytes(
            (pointCount * static_cast<std::uint64_t>(scalarFieldCount) * sizeof(float));
 }
 
+std::uint64_t EstimatedRawChunkGpuBytes(const PointCloudIpcloudRawChunkInfo& info) {
+    return (static_cast<std::uint64_t>(info.pointCount) * sizeof(glm::vec4)) +
+           (static_cast<std::uint64_t>(info.pointCount) * sizeof(std::uint32_t)) +
+           (info.hasNormals ? static_cast<std::uint64_t>(info.pointCount) * sizeof(glm::vec4) : sizeof(glm::vec4)) +
+           (static_cast<std::uint64_t>(info.pointCount) * info.scalarFieldCount * sizeof(float));
+}
+
 bool WriteRawChunkPayload(
     const std::filesystem::path& path,
     std::uint32_t chunkIndex,
@@ -1816,6 +1823,53 @@ PointCloudIpcloudRawChunkCatalog LoadPointCloudIpcloudRawChunkCatalog(
     return catalog;
 }
 
+std::uint32_t CountPointCloudIpcloudRawChunkTargetHits(
+    const std::filesystem::path& bundlePath,
+    std::uint32_t chunkIndex,
+    const std::unordered_set<std::uint32_t>& targetSourceIndices) {
+    if (targetSourceIndices.empty()) {
+        return 0U;
+    }
+
+    const auto path = bundlePath / "raw_chunks" / RawChunkFileName(chunkIndex);
+    std::ifstream input{path, std::ios::binary};
+    if (!input) {
+        return 0U;
+    }
+
+    RawChunkRangeHeader header;
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!input ||
+        header.magic != kRawChunkMagic ||
+        header.version != kPointCloudIpcloudRawChunkFormatVersion ||
+        header.headerSize != sizeof(RawChunkRangeHeader) ||
+        header.chunkIndex != chunkIndex) {
+        return 0U;
+    }
+
+    std::uint32_t hits = 0U;
+    std::uint32_t remaining = header.pointCount;
+    std::array<std::uint32_t, 4096> sourceIds{};
+    while (remaining > 0U) {
+        const auto batch = std::min<std::uint32_t>(
+            remaining,
+            static_cast<std::uint32_t>(sourceIds.size()));
+        input.read(
+            reinterpret_cast<char*>(sourceIds.data()),
+            static_cast<std::streamsize>(batch * sizeof(sourceIds.front())));
+        if (!input) {
+            return hits;
+        }
+        for (std::uint32_t index = 0; index < batch; ++index) {
+            if (targetSourceIndices.find(sourceIds[index]) != targetSourceIndices.end()) {
+                ++hits;
+            }
+        }
+        remaining -= batch;
+    }
+    return hits;
+}
+
 PointCloudIpcloudRawChunk LoadPointCloudIpcloudRawChunk(
     const std::filesystem::path& bundlePath,
     std::uint32_t chunkIndex,
@@ -1956,6 +2010,46 @@ PointCloudIpcloudResidentSet BuildPointCloudIpcloudResidentSet(
         infoByIndex.emplace(info.chunkIndex, info);
     }
 
+    if (requestedChunks.size() > 1U) {
+        std::unordered_set<std::uint32_t> targetSourceIndices;
+        targetSourceIndices.reserve(drawItems.size() * 2U);
+        for (const auto& drawItem : drawItems) {
+            targetSourceIndices.insert(drawItem.sourcePointIndex);
+        }
+        std::unordered_map<std::uint32_t, std::uint32_t> targetHitCountByChunk;
+        targetHitCountByChunk.reserve(requestedChunks.size());
+        for (const auto chunkIndex : requestedChunks) {
+            targetHitCountByChunk.emplace(
+                chunkIndex,
+                CountPointCloudIpcloudRawChunkTargetHits(
+                    bundlePath,
+                    chunkIndex,
+                    targetSourceIndices));
+        }
+        std::stable_sort(
+            requestedChunks.begin(),
+            requestedChunks.end(),
+            [&](std::uint32_t left, std::uint32_t right) {
+                const auto leftHits = targetHitCountByChunk[left];
+                const auto rightHits = targetHitCountByChunk[right];
+                if (leftHits != rightHits) {
+                    return leftHits > rightHits;
+                }
+                const auto leftInfo = infoByIndex.find(left);
+                const auto rightInfo = infoByIndex.find(right);
+                const auto leftBytes = leftInfo == infoByIndex.end()
+                                           ? std::numeric_limits<std::uint64_t>::max()
+                                           : EstimatedRawChunkGpuBytes(leftInfo->second);
+                const auto rightBytes = rightInfo == infoByIndex.end()
+                                            ? std::numeric_limits<std::uint64_t>::max()
+                                            : EstimatedRawChunkGpuBytes(rightInfo->second);
+                if (leftBytes != rightBytes) {
+                    return leftBytes < rightBytes;
+                }
+                return left < right;
+            });
+    }
+
     std::vector<PointCloudIpcloudRawChunk> loadedChunks;
     loadedChunks.reserve(requestedChunks.size());
     std::uint64_t cpuBytes = 0;
@@ -1966,11 +2060,7 @@ PointCloudIpcloudResidentSet BuildPointCloudIpcloudResidentSet(
             ++resident.diagnostics.missingChunkCount;
             continue;
         }
-        const auto estimatedGpuBytes =
-            (static_cast<std::uint64_t>(infoIt->second.pointCount) * sizeof(glm::vec4)) +
-            (static_cast<std::uint64_t>(infoIt->second.pointCount) * sizeof(std::uint32_t)) +
-            (infoIt->second.hasNormals ? static_cast<std::uint64_t>(infoIt->second.pointCount) * sizeof(glm::vec4) : sizeof(glm::vec4)) +
-            (static_cast<std::uint64_t>(infoIt->second.pointCount) * infoIt->second.scalarFieldCount * sizeof(float));
+        const auto estimatedGpuBytes = EstimatedRawChunkGpuBytes(infoIt->second);
         if (resident.diagnostics.residentChunkCount > 0U &&
             (cpuBytes + infoIt->second.decodedCpuBytes > cpuResidencyBudgetBytes ||
              gpuBytes + estimatedGpuBytes > uploadBudgetBytes)) {

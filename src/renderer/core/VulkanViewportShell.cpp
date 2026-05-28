@@ -1074,6 +1074,23 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     double adaptiveEstimatedVertexCost = 0.0;
     double adaptiveEstimatedBlendedFragments = 0.0;
     double adaptiveBlendedFragmentBudget = 0.0;
+    bool adaptiveTileBudgetEnabled = false;
+    std::uint32_t adaptiveTileSizePixels = 0;
+    std::uint32_t adaptiveTileCount = 0;
+    double adaptiveTileFragmentBudget = 0.0;
+    double adaptiveTileBlendedFragmentBudget = 0.0;
+    double adaptiveMaxTileEstimatedFragments = 0.0;
+    double adaptiveMaxTileEstimatedBlendedFragments = 0.0;
+    std::uint32_t adaptiveOverBudgetTileCount = 0;
+    double adaptiveOverBudgetTileScreenPercent = 0.0;
+    std::uint32_t adaptiveTileLimitedRepresentativeCount = 0;
+    std::uint32_t adaptiveTileLimitedNodeCount = 0;
+    std::uint32_t adaptiveTilePreservedRepresentativeCount = 0;
+    bool adaptiveOcclusionCullingEnabled = false;
+    std::string adaptiveOcclusionCullingState = "disabled";
+    std::string adaptiveOcclusionCullingDisabledReason = "not requested";
+    std::uint32_t adaptiveOcclusionRejectedNodeCount = 0;
+    std::uint64_t adaptiveOcclusionRejectedRepresentedSourceCount = 0;
     bool adaptiveOpacityCompensationClamped = false;
     bool adaptiveEmissionCompensationClamped = false;
     bool adaptivePerformanceCompensationClamped = false;
@@ -1169,6 +1186,37 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
             }
             adaptiveEstimatedVertexCost += layer.adaptiveEstimatedVertexCost;
             adaptiveEstimatedBlendedFragments += layer.adaptiveEstimatedBlendedFragments;
+            adaptiveTileBudgetEnabled = adaptiveTileBudgetEnabled || layer.adaptiveTileBudgetEnabled;
+            adaptiveTileSizePixels = std::max(adaptiveTileSizePixels, layer.adaptiveTileSizePixels);
+            adaptiveTileCount = std::max(adaptiveTileCount, layer.adaptiveTileCount);
+            adaptiveTileFragmentBudget =
+                std::max(adaptiveTileFragmentBudget, static_cast<double>(layer.adaptiveTileFragmentBudget));
+            adaptiveTileBlendedFragmentBudget =
+                std::max(adaptiveTileBlendedFragmentBudget, static_cast<double>(layer.adaptiveTileBlendedFragmentBudget));
+            adaptiveMaxTileEstimatedFragments =
+                std::max(adaptiveMaxTileEstimatedFragments, static_cast<double>(layer.adaptiveMaxTileEstimatedFragments));
+            adaptiveMaxTileEstimatedBlendedFragments = std::max(
+                adaptiveMaxTileEstimatedBlendedFragments,
+                static_cast<double>(layer.adaptiveMaxTileEstimatedBlendedFragments));
+            adaptiveOverBudgetTileCount += layer.adaptiveOverBudgetTileCount;
+            adaptiveOverBudgetTileScreenPercent = std::max(
+                adaptiveOverBudgetTileScreenPercent,
+                static_cast<double>(layer.adaptiveOverBudgetTileScreenPercent));
+            adaptiveTileLimitedRepresentativeCount += layer.adaptiveTileLimitedRepresentativeCount;
+            adaptiveTileLimitedNodeCount += layer.adaptiveTileLimitedNodeCount;
+            adaptiveTilePreservedRepresentativeCount += layer.adaptiveTilePreservedRepresentativeCount;
+            adaptiveOcclusionCullingEnabled =
+                adaptiveOcclusionCullingEnabled || layer.adaptiveOcclusionCullingEnabled;
+            if (layer.adaptiveOcclusionCullingState == "active" ||
+                (layer.adaptiveOcclusionCullingState == "uncertain" &&
+                 adaptiveOcclusionCullingState != "active") ||
+                (adaptiveOcclusionCullingState == "disabled" &&
+                 !layer.adaptiveOcclusionCullingState.empty())) {
+                adaptiveOcclusionCullingState = layer.adaptiveOcclusionCullingState;
+                adaptiveOcclusionCullingDisabledReason = layer.adaptiveOcclusionCullingDisabledReason;
+            }
+            adaptiveOcclusionRejectedNodeCount += layer.adaptiveOcclusionRejectedNodeCount;
+            adaptiveOcclusionRejectedRepresentedSourceCount += layer.adaptiveOcclusionRejectedRepresentedSourceCount;
             adaptiveGovernorBudgetScale = std::min(
                 adaptiveGovernorBudgetScale,
                 static_cast<double>(layer.adaptiveGovernorBudgetScale));
@@ -1273,6 +1321,23 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveEstimatedVertexCost = adaptiveEstimatedVertexCost;
     diagnostics_.adaptiveEstimatedBlendedFragments = adaptiveEstimatedBlendedFragments;
     diagnostics_.adaptiveBlendedFragmentBudget = adaptiveBlendedFragmentBudget;
+    diagnostics_.adaptiveTileBudgetEnabled = adaptiveTileBudgetEnabled;
+    diagnostics_.adaptiveTileSizePixels = adaptiveTileSizePixels;
+    diagnostics_.adaptiveTileCount = adaptiveTileCount;
+    diagnostics_.adaptiveTileFragmentBudget = adaptiveTileFragmentBudget;
+    diagnostics_.adaptiveTileBlendedFragmentBudget = adaptiveTileBlendedFragmentBudget;
+    diagnostics_.adaptiveMaxTileEstimatedFragments = adaptiveMaxTileEstimatedFragments;
+    diagnostics_.adaptiveMaxTileEstimatedBlendedFragments = adaptiveMaxTileEstimatedBlendedFragments;
+    diagnostics_.adaptiveOverBudgetTileCount = adaptiveOverBudgetTileCount;
+    diagnostics_.adaptiveOverBudgetTileScreenPercent = adaptiveOverBudgetTileScreenPercent;
+    diagnostics_.adaptiveTileLimitedRepresentativeCount = adaptiveTileLimitedRepresentativeCount;
+    diagnostics_.adaptiveTileLimitedNodeCount = adaptiveTileLimitedNodeCount;
+    diagnostics_.adaptiveTilePreservedRepresentativeCount = adaptiveTilePreservedRepresentativeCount;
+    diagnostics_.adaptiveOcclusionCullingEnabled = adaptiveOcclusionCullingEnabled;
+    diagnostics_.adaptiveOcclusionCullingState = std::move(adaptiveOcclusionCullingState);
+    diagnostics_.adaptiveOcclusionCullingDisabledReason = std::move(adaptiveOcclusionCullingDisabledReason);
+    diagnostics_.adaptiveOcclusionRejectedNodeCount = adaptiveOcclusionRejectedNodeCount;
+    diagnostics_.adaptiveOcclusionRejectedRepresentedSourceCount = adaptiveOcclusionRejectedRepresentedSourceCount;
     diagnostics_.adaptiveOpacityCompensationClamped = adaptiveOpacityCompensationClamped;
     diagnostics_.adaptiveEmissionCompensationClamped = adaptiveEmissionCompensationClamped;
     diagnostics_.adaptivePerformanceCompensationClamped = adaptivePerformanceCompensationClamped;

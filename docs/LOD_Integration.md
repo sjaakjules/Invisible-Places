@@ -9,7 +9,7 @@ this audit.
 
 ## Current Build Status
 
-The current worktree builds with the Stage 08 progressive `.ipcloud` streaming path:
+The current worktree builds with the progressive `.ipcloud` streaming path:
 hierarchy cache v4, visual node statistics, class-aware representatives,
 per-node scalar stats, CPU traversal feature triggers, Beauty optical-depth
 compensation, renderer-aware cost profiles, Vulkan timestamp diagnostics,
@@ -24,7 +24,12 @@ are still queued.
 Stage 09 adds explicit export density policy semantics, deterministic adaptive
 export traversal, Full Source exact-source guards, Match Viewport still-export
 snapshotting, Fast Adaptive Preview Quick MP4 labeling, export logs, and
-`--lod-compare` schema v2 deterministic/error-map diagnostics.
+deterministic/error-map diagnostics.
+Stage 10 adds conservative 32 px tile-pressure diagnostics and Beauty
+tile-budget limiting for low-priority representatives, keeps Fast Basic
+diagnostic-only, keeps Full Source exact, and reports conservative culling as
+disabled or uncertain until a safe depth proxy or reliable normal metadata
+exists. `--lod-compare` now writes schema v3 tile/culling fields.
 GPU compute selection, memory-mapped chunks, and fully device-local chunk
 residency remain later-stage items.
 
@@ -107,6 +112,19 @@ sample-count cap anymore.
   Beauty traversal keeps one representative per visible frontier node under
   fragment pressure so expensive styles degrade by adapting representatives
   instead of dropping unvisited cloud regions.
+- Adaptive traversal includes a 32 px tile accumulator. Fast Basic records tile
+  pressure diagnostics without using tile pressure to reduce output. Beauty
+  Adaptive uses per-tile fragment/blended-fragment budgets only for extra
+  low-priority representatives, preserves the first representative per visible
+  frontier node, and protects scalar, emissive/accent, color-contrast, and
+  normal/edge representatives from tile-only rejection. Full Source bypasses
+  tile limiting.
+- Conservative occlusion/backface/depth-proxy culling diagnostics are wired
+  through traversal, cache state, viewport diagnostics, HUD/debug UI, and
+  compare metrics. Actual rejection remains disabled when metadata or depth
+  confidence is missing; translucent/no-depth Beauty styles report disabled
+  culling, and depth-capable styles without a safe proxy report uncertain
+  culling with zero rejected nodes/source points.
 - Traversal accepts the previously displayed frontier, applies separate
   promote/demote hysteresis bands, and reports promoted, demoted,
   hysteresis-kept, and representative-delta diagnostics.
@@ -203,16 +221,16 @@ sample-count cap anymore.
   transition trace CSV. It now renders a repeatable Beauty matrix covering small
   opaque sprites, large translucent Gaussian sprites, emissive/scalar sprites,
   world-sized sprites, and world surfels when normals are present.
-- `lod_compare_metrics.json` schema v2 reports source/cache fingerprints,
+- `lod_compare_metrics.json` schema v3 reports source/cache fingerprints,
   density policy fields, deterministic adaptive selection and image/error-map
   hashes, per-channel/RGB/luminance/alpha MAE/RMSE/max error, Adaptive HQ
   representative class counts, exact Fast Basic CPU representative class counts,
   viewport Fast Basic boundedness/smoothness metrics, Beauty matrix renderer
   profiles, radius/opacity/emission ranges, estimated vertex/fragment/
   blended-fragment costs, clamp flags, raw/EWMA GPU point-pass timings, governor
-  budget scale, timestamp support/fallback state, Beauty stress metrics, and
-  colour, scalar, normal, and emissive/accent feature-triggered refinement
-  counts.
+  budget scale, timestamp support/fallback state, tile pressure and conservative
+  culling fields, Beauty stress metrics, and colour, scalar, normal, and
+  emissive/accent feature-triggered refinement counts.
 - Stage 05 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports exact
   Adaptive HQ Beauty matrix output with no fallback. Matrix luminance ratios:
   small opaque 0.805370, large translucent Gaussian 0.831266,
@@ -326,6 +344,24 @@ sample-count cap anymore.
   of 100,743,210, coverage ratio 1, luminance ratio 0.666881, RGB MAE
   0.0280766, RGB RMSE 0.121346, and alpha RMSE 0. The run used a ready LOD cache
   and reported `.ipcloud` full source loaded.
+- Stage 10 sample evidence on `Data/Site3-Sample-Terrestrial.ply` completed
+  build, focused LOD tests, full CTest, stream check, and `--lod-compare` with
+  metrics schema v3. The stream check passed with center/repeat-center
+  563 / 2,292 requested chunks, 43,438 / 56,537 remapped draw items, 120.9 MiB
+  CPU residency, 128.0 MiB GPU residency/upload, and 76.8311% chunk hit rate.
+  The compare reported coverage ratio 1, luminance ratio 0.773804, RGB MAE
+  0.0193481, 397,898 Adaptive HQ representatives covering 12,156,322 source
+  points, Beauty stress max GPU point pass 0.157584 ms, tile-limited reps/nodes
+  297,011 / 5,473, max tile blended pressure 194,343 against the 65,536 tile
+  budget, culling disabled for the no-depth translucent stress style, no
+  adaptive/full-source fallback, and no budget exceedance.
+- Stage 10 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` completed
+  `--lod-compare` with coverage ratio 1, luminance ratio 0.658456, RGB MAE
+  0.0285489, 1,191,182 Adaptive HQ representatives covering 94,091,952 source
+  points, Beauty stress max GPU point pass 0.572459 ms, tile-limited reps/nodes
+  1,002,773 / 22,345, max tile blended pressure 364,341 against the 65,536 tile
+  budget, culling disabled, no adaptive/full-source fallback, and no budget
+  exceedance.
 
 ## Partially Implemented
 
@@ -370,8 +406,8 @@ These pieces exist, but they are not yet the ideal system described in
 - The LOD comparison metrics now report coverage, mean luminance, feature class
   counts, feature-triggered refinement counts, raw/EWMA GPU point-pass timing,
   governor state, Beauty stress timing, deterministic selection/image hashes,
-  image error-map metrics, and a Fast Basic transition trace, but not tile
-  overdraw budgets. Streaming memory/upload diagnostics are emitted by
+  image error-map metrics, tile pressure, conservative culling state, and a Fast
+  Basic transition trace. Streaming memory/upload diagnostics are emitted by
   `--lod-stream-check` and summarized in export logs where available.
 - The 100M `--lod-compare` path proves bounded replacement and deterministic
   trace metrics, but it does not automatically prove final exact idle
@@ -392,10 +428,10 @@ These are still target-system items from the ideal plan.
 - Upload and render-state submission timestamp diagnostics; point/depth/
   accumulation/composite/postprocess GPU timing is implemented for viewport
   diagnostics.
-- Tile overdraw estimates and per-tile fragment/blended-fragment budgets.
-- Conservative occlusion culling, depth proxy, or Hi-Z pyramid.
+- Active depth-proxy, backface, or Hi-Z occlusion rejection; Stage 10 only
+  reports disabled/uncertain conservative culling states until correctness is
+  provable.
 - GPU compute traversal/culling/compaction and indirect draw submission.
-- Runtime tile budget pressure metrics.
 
 ## Likely Lag Sources
 
@@ -410,11 +446,13 @@ Investigate these before adding more ideal-plan features.
   draw-item requirements.
 - Async traversal discards stale completions now, but new camera/style keys can
   still spend visible time in coarse fallback while replacement work finishes.
-- The quality controller now reacts to measured GPU point-pass time, but upload
-  stalls and tile-local overdraw are still only inferred through draw-item byte
-  and global fragment/blended-fragment budgets.
-- Current projected spacing now uses stored node spacing and feature statistics,
-  but there is still no tile-pressure model.
+- The quality controller now reacts to measured GPU point-pass time, and Stage
+  10 reports tile-local pressure. Upload stalls are still inferred through
+  draw-item byte budgets, and over-budget tiles can intentionally remain
+  over-budget when preserving visible frontier or protected feature reps.
+- Current projected spacing now uses stored node spacing and feature
+  statistics. The tile-pressure model is conservative and CPU-side; it is not a
+  substitute for a future depth proxy, Hi-Z pyramid, or GPU-driven compaction.
 - Dense exact/debug/export surfaces still upload and retain source data in
   several forms: `LoadedPointCloud`, `cpuPositions`, vertex position buffer,
   storage position buffer, color buffer, normal buffer, scalar buffer, and
@@ -426,9 +464,10 @@ Investigate these before adding more ideal-plan features.
 - The manual sampled budget path calls `WaitIdle()` during point-budget updates.
   That is acceptable for explicit debug/loading cap changes, but it must not be
   part of normal adaptive updates.
-- There is no tile overdraw budget yet. Close, grazing, long-site views with
-  large translucent marks can still produce the exact overdraw problem the ideal
-  plan is designed to avoid.
+- Tile budgets now reduce low-priority Beauty representatives, but close,
+  grazing, long-site views with large translucent marks can still exceed local
+  budgets when conservative correctness rules choose drawing too much over
+  culling visible data.
 
 ## Implementation Order
 
@@ -534,8 +573,8 @@ passes. Keep this section for the remaining timing and policy follow-up work.
 - Add direct upload/submission timing where practical; Stage 06 currently
   governs draw-item upload bytes from point-pass timing rather than measured
   upload stalls.
-- Add tile/overdraw budget diagnostics if Beauty styles need more local
-  pressure control than the current global fragment/blended-fragment budgets.
+- Keep Stage 10 tile-pressure diagnostics active as the local complement to the
+  global fragment/blended-fragment budgets.
 - Keep exercising over-target hardware/views so the clamped budget-scale path
   is validated by runtime stress as well as focused governor tests.
 - Preserve the explicit `performance-limited` status when interactive quality
@@ -581,8 +620,9 @@ Metrics to watch:
 
 Move to GPU-driven features after the CPU path is correct and profiled.
 
-- Add tile overdraw estimates and per-tile fragment budgets.
-- Add a conservative depth proxy or Hi-Z pyramid for occlusion culling.
+- Tile overdraw estimates and first CPU-side per-tile fragment budgets are
+  implemented for Beauty Adaptive. Next, add a conservative depth proxy or Hi-Z
+  pyramid before enabling actual hidden-node rejection.
 - Move culling, projected-error evaluation, compaction, and indirect draw command
   generation to compute where it beats the CPU path.
 - Keep a CPU fallback for portability and debugging.
@@ -626,15 +666,16 @@ Initial quality targets:
   and world-surfel cases when normals are available.
 - Adaptive renders should not be empty or stuck on coarse fallback.
 - Fast Basic should report no full-source fallback, no representative or
-  fragment budget exceedance, zero large representative-jump frames, and
-  `fast_basic_zoom_out_updated=true`.
+  fragment budget exceedance, no unexplained large representative-jump frames,
+  and `fast_basic_zoom_out_updated=true`.
 - Repeated `--lod-compare` runs should match on deterministic selection hashes,
   full/adaptive/error-map image hashes, representative counts, represented
   source counts, coverage/luminance ratios, and error metrics. Timing and
   viewport stress values may differ.
 - `lod_compare_metrics.json` should include `metrics_schema_version`,
   `density_policy`, `determinism`, source/cache fingerprints, and
-  `difference_exr`.
+  `difference_exr`; schema v3 should also include tile pressure and
+  conservative culling fields.
 - Applicable RGB/scalar/normal/emissive data should produce nonzero Adaptive HQ
   and exact Fast Basic CPU representative class counts plus nonzero
   feature-triggered refinement counts.

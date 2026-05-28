@@ -395,6 +395,23 @@ struct MatchViewportExportSnapshot {
     float maxEmissionCoverageScale = 1.0F;
     float estimatedVertexCost = 0.0F;
     float estimatedBlendedFragments = 0.0F;
+    bool tileBudgetEnabled = false;
+    std::uint32_t tileSizePixels = 0;
+    std::uint32_t tileCount = 0;
+    float tileFragmentBudget = 0.0F;
+    float tileBlendedFragmentBudget = 0.0F;
+    float maxTileEstimatedFragments = 0.0F;
+    float maxTileEstimatedBlendedFragments = 0.0F;
+    std::uint32_t overBudgetTileCount = 0;
+    float overBudgetTileScreenPercent = 0.0F;
+    std::uint32_t tileLimitedRepresentativeCount = 0;
+    std::uint32_t tileLimitedNodeCount = 0;
+    std::uint32_t tilePreservedRepresentativeCount = 0;
+    bool occlusionCullingEnabled = false;
+    std::string occlusionCullingState = "disabled";
+    std::string occlusionCullingDisabledReason = "not requested";
+    std::uint32_t occlusionRejectedNodeCount = 0;
+    std::uint64_t occlusionRejectedRepresentedSourceCount = 0;
     std::uint64_t drawItemBytes = 0;
     std::string persistentCacheStatus;
     std::string runtimeStatus;
@@ -548,6 +565,23 @@ struct AdaptiveLodCacheState {
     float estimatedFragments = 0.0F;
     float fragmentBudget = 0.0F;
     std::uint32_t representativeBudget = 0;
+    bool tileBudgetEnabled = false;
+    std::uint32_t tileSizePixels = 0;
+    std::uint32_t tileCount = 0;
+    float tileFragmentBudget = 0.0F;
+    float tileBlendedFragmentBudget = 0.0F;
+    float maxTileEstimatedFragments = 0.0F;
+    float maxTileEstimatedBlendedFragments = 0.0F;
+    std::uint32_t overBudgetTileCount = 0;
+    float overBudgetTileScreenPercent = 0.0F;
+    std::uint32_t tileLimitedRepresentativeCount = 0;
+    std::uint32_t tileLimitedNodeCount = 0;
+    std::uint32_t tilePreservedRepresentativeCount = 0;
+    bool occlusionCullingEnabled = false;
+    std::string occlusionCullingState = "disabled";
+    std::string occlusionCullingDisabledReason = "not requested";
+    std::uint32_t occlusionRejectedNodeCount = 0;
+    std::uint64_t occlusionRejectedRepresentedSourceCount = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
     bool blendedFragmentBudgetReached = false;
@@ -602,6 +636,23 @@ struct AdaptiveLodBuildResult {
     float fragmentBudget = 0.0F;
     float blendedFragmentBudget = 0.0F;
     std::uint32_t representativeBudget = 0;
+    bool tileBudgetEnabled = false;
+    std::uint32_t tileSizePixels = 0;
+    std::uint32_t tileCount = 0;
+    float tileFragmentBudget = 0.0F;
+    float tileBlendedFragmentBudget = 0.0F;
+    float maxTileEstimatedFragments = 0.0F;
+    float maxTileEstimatedBlendedFragments = 0.0F;
+    std::uint32_t overBudgetTileCount = 0;
+    float overBudgetTileScreenPercent = 0.0F;
+    std::uint32_t tileLimitedRepresentativeCount = 0;
+    std::uint32_t tileLimitedNodeCount = 0;
+    std::uint32_t tilePreservedRepresentativeCount = 0;
+    bool occlusionCullingEnabled = false;
+    std::string occlusionCullingState = "disabled";
+    std::string occlusionCullingDisabledReason = "not requested";
+    std::uint32_t occlusionRejectedNodeCount = 0;
+    std::uint64_t occlusionRejectedRepresentedSourceCount = 0;
     bool representativeBudgetReached = false;
     bool fragmentBudgetReached = false;
     bool blendedFragmentBudgetReached = false;
@@ -727,6 +778,12 @@ struct PreviewLayerSession {
     invisible_places::renderer::pointcloud::PointCloudIpcloudRawChunkCatalog pointIpcloudRawChunkCatalog;
     invisible_places::renderer::pointcloud::PointCloudIpcloudResidencyDiagnostics pointIpcloudResidencyDiagnostics{};
     std::uint64_t pointIpcloudStreamingRevision = 0;
+    std::uint64_t pointIpcloudResidentInputRevision = 0;
+    std::uint64_t pointIpcloudResidentUploadBudgetBytes = 0;
+    std::uint64_t pointIpcloudResidentAdaptiveRevision = 0;
+    std::size_t pointIpcloudResidentRepresentativeCount = 0;
+    std::uint64_t pointIpcloudResidentDrawItemBytes = 0;
+    std::shared_ptr<const std::vector<PointCloudDrawItemGpu>> pointIpcloudResidentDrawItems;
     std::uint64_t pointIpcloudPeakResidentMemoryBytes = 0;
     std::uint64_t pointIpcloudPreviewPointCount = 0;
     std::uint64_t pointIpcloudRepresentedSourceCount = 0;
@@ -769,6 +826,23 @@ struct PreviewLayerSession {
     float adaptiveLodEstimatedVertexCost = 0.0F;
     float adaptiveLodEstimatedBlendedFragments = 0.0F;
     float adaptiveLodBlendedFragmentBudget = 0.0F;
+    bool adaptiveLodTileBudgetEnabled = false;
+    std::uint32_t adaptiveLodTileSizePixels = 0;
+    std::uint32_t adaptiveLodTileCount = 0;
+    float adaptiveLodTileFragmentBudget = 0.0F;
+    float adaptiveLodTileBlendedFragmentBudget = 0.0F;
+    float adaptiveLodMaxTileEstimatedFragments = 0.0F;
+    float adaptiveLodMaxTileEstimatedBlendedFragments = 0.0F;
+    std::uint32_t adaptiveLodOverBudgetTileCount = 0;
+    float adaptiveLodOverBudgetTileScreenPercent = 0.0F;
+    std::uint32_t adaptiveLodTileLimitedRepresentativeCount = 0;
+    std::uint32_t adaptiveLodTileLimitedNodeCount = 0;
+    std::uint32_t adaptiveLodTilePreservedRepresentativeCount = 0;
+    bool adaptiveLodOcclusionCullingEnabled = false;
+    std::string adaptiveLodOcclusionCullingState = "disabled";
+    std::string adaptiveLodOcclusionCullingDisabledReason = "not requested";
+    std::uint32_t adaptiveLodOcclusionRejectedNodeCount = 0;
+    std::uint64_t adaptiveLodOcclusionRejectedRepresentedSourceCount = 0;
     bool adaptiveLodOpacityCompensationClamped = false;
     bool adaptiveLodEmissionCompensationClamped = false;
     bool adaptiveLodPerformanceCompensationClamped = false;
@@ -1019,6 +1093,7 @@ struct PreviewRuntimeState {
     bool previewSceneStateChanged = false;
     bool previewAdaptiveLodReusedPrevious = false;
     std::uint64_t previewFrameCounter = 0;
+    bool interactiveViewportRuntime = false;
     std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
     std::string statusMessage;
     std::string errorMessage;
@@ -1322,6 +1397,18 @@ bool PointCloudStreamingPreviewActive(const PreviewLayerSession& session) {
            session.pointCloudPreviewActive &&
            session.pointIpcloudStreamingActive &&
            !PointCloudExactSourceResident(session);
+}
+
+void ClearPointCloudStreamingResidentCache(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return;
+    }
+    session->pointIpcloudResidentInputRevision = 0;
+    session->pointIpcloudResidentUploadBudgetBytes = 0;
+    session->pointIpcloudResidentAdaptiveRevision = 0;
+    session->pointIpcloudResidentRepresentativeCount = 0;
+    session->pointIpcloudResidentDrawItemBytes = 0;
+    session->pointIpcloudResidentDrawItems.reset();
 }
 
 bool PointCloudNeedsExactSourceLoad(const PreviewLayerSession& session) {
@@ -3164,7 +3251,7 @@ std::uint64_t DrawItemByteCount(std::size_t drawItemCount) {
     return static_cast<std::uint64_t>(drawItemCount) * sizeof(PointCloudDrawItemGpu);
 }
 
-constexpr std::uint32_t kStreamingPreviewMaxAdaptiveDrawItems = 131'072U;
+constexpr std::uint32_t kStreamingPreviewMaxAdaptiveDrawItems = 524'288U;
 
 std::uint32_t AdaptiveViewportRepresentativeBudget(
     std::uint32_t viewportWidth,
@@ -3400,6 +3487,23 @@ float AdaptiveViewportBlendedFragmentBudget(
     return AdaptiveViewportFragmentBudget(viewportWidth, viewportHeight, densityMode, fastBasicProfile);
 }
 
+float AdaptiveViewportTileFragmentBudget(PointCloudExportDensityMode densityMode) {
+    constexpr float kTilePixels = 32.0F * 32.0F;
+    switch (densityMode) {
+        case PointCloudExportDensityMode::FastAdaptivePreview:
+            return kTilePixels * 16.0F;
+        case PointCloudExportDensityMode::MatchViewportAdaptive:
+        case PointCloudExportDensityMode::ArtisticAsPreview:
+            return kTilePixels * 32.0F;
+        case PointCloudExportDensityMode::AdaptiveHighQuality:
+        case PointCloudExportDensityMode::ArtisticHighQuality:
+            return kTilePixels * 64.0F;
+        case PointCloudExportDensityMode::FullSource:
+            return 0.0F;
+    }
+    return kTilePixels * 32.0F;
+}
+
 double GpuPointPassMillisecondsForProfile(
     const invisible_places::renderer::core::ViewportDiagnostics& diagnostics,
     PointCloudLodRendererCostProfile profile) {
@@ -3507,9 +3611,10 @@ PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
         adaptiveInteractionActive);
 
     if (PointCloudStreamingPreviewActive(*session)) {
-        setQuality(PointCloudExportDensityMode::FastAdaptivePreview);
-        session->adaptiveLodEmergencyDemotion = true;
-        return PointCloudExportDensityMode::FastAdaptivePreview;
+        const auto streamingQuality = AdaptiveViewportQualityMode(paintedAdaptive);
+        setQuality(streamingQuality);
+        session->adaptiveLodEmergencyDemotion = false;
+        return streamingQuality;
     }
 
     if (!adaptiveInteractionActive) {
@@ -3588,6 +3693,16 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
         params.viewportHeight,
         densityMode,
         fastBasicProfile) * governorBudgetScale;
+    params.tileSizePixels = 32U;
+    params.maxTileEstimatedFragments = AdaptiveViewportTileFragmentBudget(densityMode) * governorBudgetScale;
+    params.maxTileEstimatedBlendedFragments =
+        fastBasicProfile ? 0.0F : AdaptiveViewportTileFragmentBudget(densityMode) * governorBudgetScale;
+    params.tileBudgetEnabled =
+        !fastBasicProfile &&
+        !invisible_places::output::PointCloudExportDensityModeUsesFullSource(densityMode);
+    params.occlusionCullingEnabled =
+        !fastBasicProfile &&
+        !invisible_places::output::PointCloudExportDensityModeUsesFullSource(densityMode);
     params.targetProjectedSpacingPixels =
         BaseAdaptiveTargetSpacingPixels(densityMode) * governorOutput.targetSpacingScale;
     if (!deterministicExport) {
@@ -3652,7 +3767,9 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
             params.maxEstimatedFragments);
         params.targetProjectedSpacingPixels = std::max(
             params.targetProjectedSpacingPixels,
-            BaseAdaptiveTargetSpacingPixels(PointCloudExportDensityMode::FastAdaptivePreview));
+            BaseAdaptiveTargetSpacingPixels(AdaptiveViewportQualityMode(
+                densityMode == PointCloudExportDensityMode::ArtisticAsPreview ||
+                densityMode == PointCloudExportDensityMode::ArtisticHighQuality)));
     }
     return params;
 }
@@ -3793,6 +3910,106 @@ double CurrentAdaptiveLodPendingAgeMs(const PreviewLayerSession& session) {
         .count();
 }
 
+void CopyTileCullingDiagnosticsToEntry(
+    AdaptiveLodCacheState* entry,
+    const PointCloudLodTraversalDiagnostics& diagnostics) {
+    if (entry == nullptr) {
+        return;
+    }
+    entry->tileBudgetEnabled = diagnostics.tileBudgetEnabled;
+    entry->tileSizePixels = diagnostics.tileSizePixels;
+    entry->tileCount = diagnostics.tileCount;
+    entry->tileFragmentBudget = diagnostics.tileFragmentBudget;
+    entry->tileBlendedFragmentBudget = diagnostics.tileBlendedFragmentBudget;
+    entry->maxTileEstimatedFragments = diagnostics.maxTileEstimatedFragments;
+    entry->maxTileEstimatedBlendedFragments = diagnostics.maxTileEstimatedBlendedFragments;
+    entry->overBudgetTileCount = diagnostics.overBudgetTileCount;
+    entry->overBudgetTileScreenPercent = diagnostics.overBudgetTileScreenPercent;
+    entry->tileLimitedRepresentativeCount = diagnostics.tileLimitedRepresentativeCount;
+    entry->tileLimitedNodeCount = diagnostics.tileLimitedNodeCount;
+    entry->tilePreservedRepresentativeCount = diagnostics.tilePreservedRepresentativeCount;
+    entry->occlusionCullingEnabled = diagnostics.occlusionCullingEnabled;
+    entry->occlusionCullingState = diagnostics.occlusionCullingState;
+    entry->occlusionCullingDisabledReason = diagnostics.occlusionCullingDisabledReason;
+    entry->occlusionRejectedNodeCount = diagnostics.occlusionRejectedNodeCount;
+    entry->occlusionRejectedRepresentedSourceCount = diagnostics.occlusionRejectedRepresentedSourceCount;
+}
+
+void CopyTileCullingEntryToResult(
+    AdaptiveLodBuildResult* result,
+    const AdaptiveLodCacheState& entry) {
+    if (result == nullptr) {
+        return;
+    }
+    result->tileBudgetEnabled = entry.tileBudgetEnabled;
+    result->tileSizePixels = entry.tileSizePixels;
+    result->tileCount = entry.tileCount;
+    result->tileFragmentBudget = entry.tileFragmentBudget;
+    result->tileBlendedFragmentBudget = entry.tileBlendedFragmentBudget;
+    result->maxTileEstimatedFragments = entry.maxTileEstimatedFragments;
+    result->maxTileEstimatedBlendedFragments = entry.maxTileEstimatedBlendedFragments;
+    result->overBudgetTileCount = entry.overBudgetTileCount;
+    result->overBudgetTileScreenPercent = entry.overBudgetTileScreenPercent;
+    result->tileLimitedRepresentativeCount = entry.tileLimitedRepresentativeCount;
+    result->tileLimitedNodeCount = entry.tileLimitedNodeCount;
+    result->tilePreservedRepresentativeCount = entry.tilePreservedRepresentativeCount;
+    result->occlusionCullingEnabled = entry.occlusionCullingEnabled;
+    result->occlusionCullingState = entry.occlusionCullingState;
+    result->occlusionCullingDisabledReason = entry.occlusionCullingDisabledReason;
+    result->occlusionRejectedNodeCount = entry.occlusionRejectedNodeCount;
+    result->occlusionRejectedRepresentedSourceCount = entry.occlusionRejectedRepresentedSourceCount;
+}
+
+void CopyTileCullingResultToEntry(
+    AdaptiveLodCacheState* entry,
+    const AdaptiveLodBuildResult& result) {
+    if (entry == nullptr) {
+        return;
+    }
+    entry->tileBudgetEnabled = result.tileBudgetEnabled;
+    entry->tileSizePixels = result.tileSizePixels;
+    entry->tileCount = result.tileCount;
+    entry->tileFragmentBudget = result.tileFragmentBudget;
+    entry->tileBlendedFragmentBudget = result.tileBlendedFragmentBudget;
+    entry->maxTileEstimatedFragments = result.maxTileEstimatedFragments;
+    entry->maxTileEstimatedBlendedFragments = result.maxTileEstimatedBlendedFragments;
+    entry->overBudgetTileCount = result.overBudgetTileCount;
+    entry->overBudgetTileScreenPercent = result.overBudgetTileScreenPercent;
+    entry->tileLimitedRepresentativeCount = result.tileLimitedRepresentativeCount;
+    entry->tileLimitedNodeCount = result.tileLimitedNodeCount;
+    entry->tilePreservedRepresentativeCount = result.tilePreservedRepresentativeCount;
+    entry->occlusionCullingEnabled = result.occlusionCullingEnabled;
+    entry->occlusionCullingState = result.occlusionCullingState;
+    entry->occlusionCullingDisabledReason = result.occlusionCullingDisabledReason;
+    entry->occlusionRejectedNodeCount = result.occlusionRejectedNodeCount;
+    entry->occlusionRejectedRepresentedSourceCount = result.occlusionRejectedRepresentedSourceCount;
+}
+
+void CopyTileCullingResultToLayer(
+    invisible_places::renderer::core::SceneRenderState::PointCloudLayerState* layer,
+    const AdaptiveLodBuildResult& result) {
+    if (layer == nullptr) {
+        return;
+    }
+    layer->adaptiveTileBudgetEnabled = result.tileBudgetEnabled;
+    layer->adaptiveTileSizePixels = result.tileSizePixels;
+    layer->adaptiveTileCount = result.tileCount;
+    layer->adaptiveTileFragmentBudget = result.tileFragmentBudget;
+    layer->adaptiveTileBlendedFragmentBudget = result.tileBlendedFragmentBudget;
+    layer->adaptiveMaxTileEstimatedFragments = result.maxTileEstimatedFragments;
+    layer->adaptiveMaxTileEstimatedBlendedFragments = result.maxTileEstimatedBlendedFragments;
+    layer->adaptiveOverBudgetTileCount = result.overBudgetTileCount;
+    layer->adaptiveOverBudgetTileScreenPercent = result.overBudgetTileScreenPercent;
+    layer->adaptiveTileLimitedRepresentativeCount = result.tileLimitedRepresentativeCount;
+    layer->adaptiveTileLimitedNodeCount = result.tileLimitedNodeCount;
+    layer->adaptiveTilePreservedRepresentativeCount = result.tilePreservedRepresentativeCount;
+    layer->adaptiveOcclusionCullingEnabled = result.occlusionCullingEnabled;
+    layer->adaptiveOcclusionCullingState = result.occlusionCullingState;
+    layer->adaptiveOcclusionCullingDisabledReason = result.occlusionCullingDisabledReason;
+    layer->adaptiveOcclusionRejectedNodeCount = result.occlusionRejectedNodeCount;
+    layer->adaptiveOcclusionRejectedRepresentedSourceCount = result.occlusionRejectedRepresentedSourceCount;
+}
+
 constexpr auto kAdaptiveMotionApplyInterval = std::chrono::milliseconds{33};
 
 void ApplyAdaptiveLodCacheMetadata(
@@ -3816,6 +4033,23 @@ void ApplyAdaptiveLodCacheMetadata(
     session->adaptiveLodEstimatedVertexCost = entry.estimatedVertexCost;
     session->adaptiveLodEstimatedBlendedFragments = entry.estimatedBlendedFragments;
     session->adaptiveLodBlendedFragmentBudget = entry.blendedFragmentBudget;
+    session->adaptiveLodTileBudgetEnabled = entry.tileBudgetEnabled;
+    session->adaptiveLodTileSizePixels = entry.tileSizePixels;
+    session->adaptiveLodTileCount = entry.tileCount;
+    session->adaptiveLodTileFragmentBudget = entry.tileFragmentBudget;
+    session->adaptiveLodTileBlendedFragmentBudget = entry.tileBlendedFragmentBudget;
+    session->adaptiveLodMaxTileEstimatedFragments = entry.maxTileEstimatedFragments;
+    session->adaptiveLodMaxTileEstimatedBlendedFragments = entry.maxTileEstimatedBlendedFragments;
+    session->adaptiveLodOverBudgetTileCount = entry.overBudgetTileCount;
+    session->adaptiveLodOverBudgetTileScreenPercent = entry.overBudgetTileScreenPercent;
+    session->adaptiveLodTileLimitedRepresentativeCount = entry.tileLimitedRepresentativeCount;
+    session->adaptiveLodTileLimitedNodeCount = entry.tileLimitedNodeCount;
+    session->adaptiveLodTilePreservedRepresentativeCount = entry.tilePreservedRepresentativeCount;
+    session->adaptiveLodOcclusionCullingEnabled = entry.occlusionCullingEnabled;
+    session->adaptiveLodOcclusionCullingState = entry.occlusionCullingState;
+    session->adaptiveLodOcclusionCullingDisabledReason = entry.occlusionCullingDisabledReason;
+    session->adaptiveLodOcclusionRejectedNodeCount = entry.occlusionRejectedNodeCount;
+    session->adaptiveLodOcclusionRejectedRepresentedSourceCount = entry.occlusionRejectedRepresentedSourceCount;
     session->adaptiveLodOpacityCompensationClamped = entry.opacityCompensationClamped;
     session->adaptiveLodEmissionCompensationClamped = entry.emissionCompensationClamped;
     session->adaptiveLodPerformanceCompensationClamped = entry.performanceCompensationClamped;
@@ -3904,6 +4138,7 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     entry.representativeBudgetReached = diagnostics.representativeBudgetReached;
     entry.fragmentBudgetReached = diagnostics.fragmentBudgetReached;
     entry.blendedFragmentBudgetReached = diagnostics.blendedFragmentBudgetReached;
+    CopyTileCullingDiagnosticsToEntry(&entry, diagnostics);
     const auto fallbackStats = EstimateDrawItemCompensationStats(drawItems, diagnostics.rendererCostProfile);
     entry.estimatedFragments = diagnostics.estimatedFragmentCost > 0.0F
                                    ? diagnostics.estimatedFragmentCost
@@ -4190,7 +4425,7 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
     const auto transitionStats = EstimateDrawItemCompensationStats(
         *session->adaptiveLodTransitionDrawItems,
         target.rendererCostProfile);
-    return AdaptiveLodBuildResult{
+    auto result = AdaptiveLodBuildResult{
         .available = true,
         .drawItems = session->adaptiveLodTransitionDrawItems,
         .revision = session->adaptiveLodTransitionRevision,
@@ -4253,6 +4488,8 @@ std::optional<AdaptiveLodBuildResult> BuildActiveAdaptiveLodTransitionResult(
         .persistentCacheStatus = session->pointLodCacheStatus,
         .fallbackState = session->adaptiveLodFallbackState,
     };
+    CopyTileCullingEntryToResult(&result, target);
+    return result;
 }
 
 std::uint32_t CoarseAdaptiveFallbackRepresentativeTarget(
@@ -4533,7 +4770,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             bool reusedPrevious,
             bool runtimeCacheHit,
             bool asyncPending) -> AdaptiveLodBuildResult {
-        return {
+        auto result = AdaptiveLodBuildResult{
             .available = true,
             .drawItems = entry.drawItems,
             .revision = entry.generation,
@@ -4596,6 +4833,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             .persistentCacheStatus = session->pointLodCacheStatus,
             .fallbackState = session->adaptiveLodFallbackState,
         };
+        CopyTileCullingEntryToResult(&result, entry);
+        return result;
     };
 
     if (!deterministicExport) {
@@ -4914,6 +5153,7 @@ void RememberDisplayedAdaptiveLodEntry(
     displayed.opacityCompensationClamped = result.opacityCompensationClamped;
     displayed.emissionCompensationClamped = result.emissionCompensationClamped;
     displayed.performanceCompensationClamped = result.performanceCompensationClamped;
+    CopyTileCullingResultToEntry(&displayed, result);
     displayed.densityMode = result.displayedDensityMode;
     displayed.drawItems = result.drawItems;
     session->adaptiveLodDisplayedEntry = std::move(displayed);
@@ -4993,6 +5233,7 @@ bool PopulateAdaptivePointCloudLayer(
         layer->adaptiveMaxEmissionCoverageScale = result.maxEmissionCoverageScale;
         layer->adaptiveEstimatedVertexCost = result.estimatedVertexCost;
         layer->adaptiveEstimatedBlendedFragments = result.estimatedBlendedFragments;
+        CopyTileCullingResultToLayer(layer, result);
         layer->adaptiveGovernorBudgetScale = result.governorOutput.budgetScale;
         layer->adaptiveGovernorPointPassMs = result.governorOutput.gpuPointPassMs;
         layer->adaptiveGovernorPointPassEwmaMs = result.governorOutput.gpuPointPassEwmaMs;
@@ -5028,7 +5269,7 @@ bool PopulateAdaptivePointCloudLayer(
     auto representativeCount = result.representativeCount;
     auto drawItemBytes = result.drawItemBytes;
     auto adaptiveRevision = result.revision;
-    if (session->pointIpcloudStreamingActive) {
+    if (!deterministicExport && session->pointIpcloudStreamingActive) {
         if (viewport == nullptr) {
             session->pointIpcloudStreamingFallbackReason =
                 "streaming resident upload unavailable for this render surface";
@@ -5039,55 +5280,79 @@ bool PopulateAdaptivePointCloudLayer(
             layer->drawPointCount = 0;
             layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
             layer->adaptiveLodFallbackState = "streaming fallback unavailable";
+            CopyTileCullingResultToLayer(layer, result);
             return false;
         }
 
-        auto resident = invisible_places::renderer::pointcloud::BuildPointCloudIpcloudResidentSet(
-            session->pointIpcloudBundlePath,
-            session->pointIpcloudRawChunkCatalog,
-            result.frontierNodeIndices,
-            *result.drawItems,
-            session->scalarFields,
-            result.governorOutput.maxUploadBytesPerFrame);
-        session->pointIpcloudResidencyDiagnostics = resident.diagnostics;
-        session->pointIpcloudPeakResidentMemoryBytes =
-            std::max(session->pointIpcloudPeakResidentMemoryBytes, CurrentResidentMemoryBytes());
-        if (!resident.loaded || resident.remappedDrawItems.empty()) {
-            session->pointIpcloudStreamingFallbackReason =
-                resident.diagnostics.fallbackReason.empty() ? "visible chunks not resident"
-                                                           : resident.diagnostics.fallbackReason;
-            layer->adaptiveDrawItems.reset();
-            layer->useAdaptiveDrawItems = false;
-            layer->drawPointCount = 0;
-            layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
-            layer->adaptiveLodFallbackState = "waiting on streamed chunks";
-            return false;
-        }
-
-        try {
-            viewport->UploadPointCloudResidentSubset(layer->layerId, resident.cloud);
-            adaptiveDrawItems =
-                std::make_shared<const std::vector<PointCloudDrawItemGpu>>(std::move(resident.remappedDrawItems));
-            representativeCount = adaptiveDrawItems->size();
-            drawItemBytes = DrawItemByteCount(representativeCount);
+        const auto uploadBudgetBytes = result.governorOutput.maxUploadBytesPerFrame;
+        const bool residentCacheHit =
+            session->pointIpcloudResidentDrawItems != nullptr &&
+            session->pointIpcloudResidentInputRevision == result.revision &&
+            session->pointIpcloudResidentUploadBudgetBytes == uploadBudgetBytes;
+        if (residentCacheHit) {
+            adaptiveDrawItems = session->pointIpcloudResidentDrawItems;
+            representativeCount = session->pointIpcloudResidentRepresentativeCount;
+            drawItemBytes = session->pointIpcloudResidentDrawItemBytes;
+            adaptiveRevision = session->pointIpcloudResidentAdaptiveRevision;
             session->pointIpcloudStreamingFallbackReason.clear();
-            session->pointIpcloudStreamingRevision =
-                session->pointIpcloudStreamingRevision == std::numeric_limits<std::uint64_t>::max()
-                    ? 1ULL
-                    : session->pointIpcloudStreamingRevision + 1ULL;
-            adaptiveRevision = result.revision ^
-                               (session->pointIpcloudStreamingRevision * 0x9e3779b97f4a7c15ULL);
-        } catch (const std::exception& error) {
-            session->pointIpcloudStreamingFallbackReason =
-                "resident chunk upload failed: " + std::string{error.what()};
-            session->pointIpcloudResidencyDiagnostics.fallbackReason =
-                session->pointIpcloudStreamingFallbackReason;
-            layer->adaptiveDrawItems.reset();
-            layer->useAdaptiveDrawItems = false;
-            layer->drawPointCount = 0;
-            layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
-            layer->adaptiveLodFallbackState = "streaming upload failed";
-            return false;
+        } else {
+            auto resident = invisible_places::renderer::pointcloud::BuildPointCloudIpcloudResidentSet(
+                session->pointIpcloudBundlePath,
+                session->pointIpcloudRawChunkCatalog,
+                result.frontierNodeIndices,
+                *result.drawItems,
+                session->scalarFields,
+                uploadBudgetBytes);
+            session->pointIpcloudResidencyDiagnostics = resident.diagnostics;
+            session->pointIpcloudPeakResidentMemoryBytes =
+                std::max(session->pointIpcloudPeakResidentMemoryBytes, CurrentResidentMemoryBytes());
+            if (!resident.loaded || resident.remappedDrawItems.empty()) {
+                ClearPointCloudStreamingResidentCache(session);
+                session->pointIpcloudStreamingFallbackReason =
+                    resident.diagnostics.fallbackReason.empty() ? "visible chunks not resident"
+                                                               : resident.diagnostics.fallbackReason;
+                layer->adaptiveDrawItems.reset();
+                layer->useAdaptiveDrawItems = false;
+                layer->drawPointCount = 0;
+                layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
+                layer->adaptiveLodFallbackState = "waiting on streamed chunks";
+                CopyTileCullingResultToLayer(layer, result);
+                return false;
+            }
+
+            try {
+                viewport->UploadPointCloudResidentSubset(layer->layerId, resident.cloud);
+                adaptiveDrawItems =
+                    std::make_shared<const std::vector<PointCloudDrawItemGpu>>(std::move(resident.remappedDrawItems));
+                representativeCount = adaptiveDrawItems->size();
+                drawItemBytes = DrawItemByteCount(representativeCount);
+                session->pointIpcloudStreamingFallbackReason.clear();
+                session->pointIpcloudStreamingRevision =
+                    session->pointIpcloudStreamingRevision == std::numeric_limits<std::uint64_t>::max()
+                        ? 1ULL
+                        : session->pointIpcloudStreamingRevision + 1ULL;
+                adaptiveRevision = result.revision ^
+                                   (session->pointIpcloudStreamingRevision * 0x9e3779b97f4a7c15ULL);
+                session->pointIpcloudResidentInputRevision = result.revision;
+                session->pointIpcloudResidentUploadBudgetBytes = uploadBudgetBytes;
+                session->pointIpcloudResidentAdaptiveRevision = adaptiveRevision;
+                session->pointIpcloudResidentRepresentativeCount = representativeCount;
+                session->pointIpcloudResidentDrawItemBytes = drawItemBytes;
+                session->pointIpcloudResidentDrawItems = adaptiveDrawItems;
+            } catch (const std::exception& error) {
+                ClearPointCloudStreamingResidentCache(session);
+                session->pointIpcloudStreamingFallbackReason =
+                    "resident chunk upload failed: " + std::string{error.what()};
+                session->pointIpcloudResidencyDiagnostics.fallbackReason =
+                    session->pointIpcloudStreamingFallbackReason;
+                layer->adaptiveDrawItems.reset();
+                layer->useAdaptiveDrawItems = false;
+                layer->drawPointCount = 0;
+                layer->adaptiveLodRuntimeStatus = result.runtimeStatus + "; " + session->pointIpcloudStreamingFallbackReason;
+                layer->adaptiveLodFallbackState = "streaming upload failed";
+                CopyTileCullingResultToLayer(layer, result);
+                return false;
+            }
         }
     }
 
@@ -5132,6 +5397,7 @@ bool PopulateAdaptivePointCloudLayer(
     layer->adaptiveMaxEmissionCoverageScale = result.maxEmissionCoverageScale;
     layer->adaptiveEstimatedVertexCost = result.estimatedVertexCost;
     layer->adaptiveEstimatedBlendedFragments = result.estimatedBlendedFragments;
+    CopyTileCullingResultToLayer(layer, result);
     layer->adaptiveGovernorBudgetScale = result.governorOutput.budgetScale;
     layer->adaptiveGovernorPointPassMs = result.governorOutput.gpuPointPassMs;
     layer->adaptiveGovernorPointPassEwmaMs = result.governorOutput.gpuPointPassEwmaMs;
@@ -6743,6 +7009,7 @@ bool ActivatePointCloudPreview(
     session.pointIpcloudRawChunkCatalog = {};
     session.pointIpcloudResidencyDiagnostics = {};
     session.pointIpcloudStreamingRevision = 0;
+    ClearPointCloudStreamingResidentCache(&session);
     if (preview.fromPersistentBundle && !session.pointIpcloudBundlePath.empty()) {
         std::string sourceError;
         const auto sourceInfo =
@@ -6868,6 +7135,7 @@ bool ActivateLoadedPointCloud(
     session.pointIpcloudRawChunkCatalog = {};
     session.pointIpcloudResidencyDiagnostics = {};
     session.pointIpcloudStreamingRevision = 0;
+    ClearPointCloudStreamingResidentCache(&session);
     session.pointIpcloudTimeToFirstRefinedFrameMs =
         replacingPreview && previewLoadStartedAt.time_since_epoch().count() != 0
             ? MillisecondsBetween(previewLoadStartedAt, std::chrono::steady_clock::now())
@@ -6965,6 +7233,78 @@ bool ActivateLoadedPointCloud(
     runtimeState->errorMessage.clear();
     std::cout << runtimeState->statusMessage << std::endl;
     return true;
+}
+
+bool RestorePointCloudIpcloudAdaptivePreview(
+    std::size_t sessionIndex,
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr ||
+        viewport == nullptr ||
+        runtimeState->pendingLoad.has_value() ||
+        sessionIndex >= runtimeState->sessions.size()) {
+        return false;
+    }
+
+    auto& session = runtimeState->sessions[sessionIndex];
+    if (session.kind != LayerKind::PointCloud ||
+        !session.loaded ||
+        !session.visible ||
+        session.sourcePath.empty() ||
+        !PointCloudExactSourceResident(session)) {
+        return false;
+    }
+
+    std::string sourceError;
+    const auto sourceInfo =
+        invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(session.sourcePath, &sourceError);
+    if (!sourceInfo.has_value()) {
+        session.pointIpcloudStreamingFallbackReason =
+            sourceError.empty() ? "could not inspect source for .ipcloud restore" : sourceError;
+        return false;
+    }
+
+    if (session.pointIpcloudBundlePath.empty()) {
+        session.pointIpcloudBundlePath = invisible_places::renderer::pointcloud::BuildPointCloudIpcloudBundlePath(
+            PointCloudIpcloudCacheDirectory(*runtimeState),
+            sourceInfo.value());
+    }
+
+    const auto inspection = invisible_places::renderer::pointcloud::InspectPointCloudIpcloudBundle(
+        session.pointIpcloudBundlePath,
+        sourceInfo.value(),
+        session.pointLodBuildConfig);
+    if (inspection.state != invisible_places::renderer::pointcloud::PointCloudIpcloudCacheState::Hit) {
+        session.pointIpcloudStreamingFallbackReason =
+            "warm .ipcloud restore unavailable: " + inspection.reason;
+        return false;
+    }
+
+    auto preview = invisible_places::renderer::pointcloud::LoadPointCloudIpcloudPreview(
+        session.pointIpcloudBundlePath,
+        sourceInfo.value(),
+        session.pointLodBuildConfig);
+    if (!preview.loaded || !preview.fromPersistentBundle) {
+        session.pointIpcloudStreamingFallbackReason =
+            preview.reason.empty() ? "warm .ipcloud preview restore failed" : preview.reason;
+        return false;
+    }
+
+    const auto loadStartedAt = std::chrono::steady_clock::now();
+    const auto displayName = session.displayName;
+    const bool restored = ActivatePointCloudPreview(
+        sessionIndex,
+        std::move(preview),
+        runtimeState,
+        viewport,
+        loadStartedAt);
+    if (restored) {
+        runtimeState->statusMessage =
+            displayName + ": restored warm .ipcloud adaptive streaming after Source mode.";
+        runtimeState->errorMessage.clear();
+        std::cout << runtimeState->statusMessage << std::endl;
+    }
+    return restored;
 }
 
 bool ActivateLoadedGaussianSplats(
@@ -7308,6 +7648,7 @@ void UnloadLayerByIndex(
     session.pointIpcloudTimeToBoundsMs = 0.0;
     session.pointIpcloudTimeToFirstCoarseFrameMs = 0.0;
     session.pointIpcloudTimeToFirstRefinedFrameMs = 0.0;
+    ClearPointCloudStreamingResidentCache(&session);
     ClearAdaptiveLodRuntimeCache(&session);
 }
 
@@ -12714,6 +13055,23 @@ void ApplyMatchViewportExportSnapshot(
     layer->adaptiveMaxEmissionCoverageScale = snapshot.maxEmissionCoverageScale;
     layer->adaptiveEstimatedVertexCost = snapshot.estimatedVertexCost;
     layer->adaptiveEstimatedBlendedFragments = snapshot.estimatedBlendedFragments;
+    layer->adaptiveTileBudgetEnabled = snapshot.tileBudgetEnabled;
+    layer->adaptiveTileSizePixels = snapshot.tileSizePixels;
+    layer->adaptiveTileCount = snapshot.tileCount;
+    layer->adaptiveTileFragmentBudget = snapshot.tileFragmentBudget;
+    layer->adaptiveTileBlendedFragmentBudget = snapshot.tileBlendedFragmentBudget;
+    layer->adaptiveMaxTileEstimatedFragments = snapshot.maxTileEstimatedFragments;
+    layer->adaptiveMaxTileEstimatedBlendedFragments = snapshot.maxTileEstimatedBlendedFragments;
+    layer->adaptiveOverBudgetTileCount = snapshot.overBudgetTileCount;
+    layer->adaptiveOverBudgetTileScreenPercent = snapshot.overBudgetTileScreenPercent;
+    layer->adaptiveTileLimitedRepresentativeCount = snapshot.tileLimitedRepresentativeCount;
+    layer->adaptiveTileLimitedNodeCount = snapshot.tileLimitedNodeCount;
+    layer->adaptiveTilePreservedRepresentativeCount = snapshot.tilePreservedRepresentativeCount;
+    layer->adaptiveOcclusionCullingEnabled = snapshot.occlusionCullingEnabled;
+    layer->adaptiveOcclusionCullingState = snapshot.occlusionCullingState;
+    layer->adaptiveOcclusionCullingDisabledReason = snapshot.occlusionCullingDisabledReason;
+    layer->adaptiveOcclusionRejectedNodeCount = snapshot.occlusionRejectedNodeCount;
+    layer->adaptiveOcclusionRejectedRepresentedSourceCount = snapshot.occlusionRejectedRepresentedSourceCount;
     layer->adaptiveDrawItemBytes = snapshot.drawItemBytes;
     layer->adaptiveLodPersistentCacheStatus = snapshot.persistentCacheStatus;
     layer->adaptiveLodRuntimeStatus =
@@ -12785,6 +13143,23 @@ bool CaptureMatchViewportExportSnapshots(
              .maxEmissionCoverageScale = displayed.maxEmissionCoverageScale,
              .estimatedVertexCost = displayed.estimatedVertexCost,
              .estimatedBlendedFragments = displayed.estimatedBlendedFragments,
+             .tileBudgetEnabled = displayed.tileBudgetEnabled,
+             .tileSizePixels = displayed.tileSizePixels,
+             .tileCount = displayed.tileCount,
+             .tileFragmentBudget = displayed.tileFragmentBudget,
+             .tileBlendedFragmentBudget = displayed.tileBlendedFragmentBudget,
+             .maxTileEstimatedFragments = displayed.maxTileEstimatedFragments,
+             .maxTileEstimatedBlendedFragments = displayed.maxTileEstimatedBlendedFragments,
+             .overBudgetTileCount = displayed.overBudgetTileCount,
+             .overBudgetTileScreenPercent = displayed.overBudgetTileScreenPercent,
+             .tileLimitedRepresentativeCount = displayed.tileLimitedRepresentativeCount,
+             .tileLimitedNodeCount = displayed.tileLimitedNodeCount,
+             .tilePreservedRepresentativeCount = displayed.tilePreservedRepresentativeCount,
+             .occlusionCullingEnabled = displayed.occlusionCullingEnabled,
+             .occlusionCullingState = displayed.occlusionCullingState,
+             .occlusionCullingDisabledReason = displayed.occlusionCullingDisabledReason,
+             .occlusionRejectedNodeCount = displayed.occlusionRejectedNodeCount,
+             .occlusionRejectedRepresentedSourceCount = displayed.occlusionRejectedRepresentedSourceCount,
              .drawItemBytes = displayed.drawItemBytes,
              .persistentCacheStatus = session.pointLodCacheStatus,
              .runtimeStatus = displayed.coarseFallback ? "match viewport captured coarse fallback"
@@ -15213,6 +15588,32 @@ void DrawPointCloudLodDebugLines(const PreviewLayerSession& session) {
             session.adaptiveLodCache.fragmentBudget,
             session.adaptiveLodCache.estimatedBlendedFragments,
             session.adaptiveLodCache.blendedFragmentBudget);
+        ImGui::Text(
+            "Tile pressure: %s | %u px tiles %u | max %.0f / %.0f blended %.0f / %.0f",
+            session.adaptiveLodCache.tileBudgetEnabled ? "enabled" : "diagnostic",
+            session.adaptiveLodCache.tileSizePixels,
+            session.adaptiveLodCache.tileCount,
+            session.adaptiveLodCache.maxTileEstimatedFragments,
+            session.adaptiveLodCache.tileFragmentBudget,
+            session.adaptiveLodCache.maxTileEstimatedBlendedFragments,
+            session.adaptiveLodCache.tileBlendedFragmentBudget);
+        ImGui::Text(
+            "Tile over budget: %u tiles (%.2f%% screen) | limited reps/nodes %u/%u | preserved %u",
+            session.adaptiveLodCache.overBudgetTileCount,
+            session.adaptiveLodCache.overBudgetTileScreenPercent,
+            session.adaptiveLodCache.tileLimitedRepresentativeCount,
+            session.adaptiveLodCache.tileLimitedNodeCount,
+            session.adaptiveLodCache.tilePreservedRepresentativeCount);
+        const auto cullingState =
+            session.adaptiveLodCache.occlusionCullingDisabledReason.empty()
+                ? session.adaptiveLodCache.occlusionCullingState
+                : session.adaptiveLodCache.occlusionCullingState +
+                      " (" + session.adaptiveLodCache.occlusionCullingDisabledReason + ")";
+        ImGui::Text(
+            "Conservative culling: %s | rejected nodes/source %u/%s",
+            cullingState.c_str(),
+            session.adaptiveLodCache.occlusionRejectedNodeCount,
+            FormatPointCount(session.adaptiveLodCache.occlusionRejectedRepresentedSourceCount).c_str());
         ImGui::Text(
             "Compensation: radius %.2f-%.2fx | opacity %.2f-%.2fx | emission %.2f-%.2fx | clamps %s/%s/%s",
             session.adaptiveLodCache.minRadiusScale,
@@ -20818,6 +21219,32 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveEstimatedBlendedFragments,
                     diagnostics.adaptiveBlendedFragmentBudget);
                 ImGui::Text(
+                    "Adaptive tile pressure: %s | %u px tiles %u | max %.0f / %.0f blended %.0f / %.0f",
+                    diagnostics.adaptiveTileBudgetEnabled ? "enabled" : "diagnostic",
+                    diagnostics.adaptiveTileSizePixels,
+                    diagnostics.adaptiveTileCount,
+                    diagnostics.adaptiveMaxTileEstimatedFragments,
+                    diagnostics.adaptiveTileFragmentBudget,
+                    diagnostics.adaptiveMaxTileEstimatedBlendedFragments,
+                    diagnostics.adaptiveTileBlendedFragmentBudget);
+                ImGui::Text(
+                    "Adaptive tile over budget: %u tiles (%.2f%% screen) | limited reps/nodes %u/%u | preserved %u",
+                    diagnostics.adaptiveOverBudgetTileCount,
+                    diagnostics.adaptiveOverBudgetTileScreenPercent,
+                    diagnostics.adaptiveTileLimitedRepresentativeCount,
+                    diagnostics.adaptiveTileLimitedNodeCount,
+                    diagnostics.adaptiveTilePreservedRepresentativeCount);
+                const auto adaptiveCullingState =
+                    diagnostics.adaptiveOcclusionCullingDisabledReason.empty()
+                        ? diagnostics.adaptiveOcclusionCullingState
+                        : diagnostics.adaptiveOcclusionCullingState +
+                              " (" + diagnostics.adaptiveOcclusionCullingDisabledReason + ")";
+                ImGui::Text(
+                    "Adaptive culling: %s | rejected nodes/source %u/%s",
+                    adaptiveCullingState.c_str(),
+                    diagnostics.adaptiveOcclusionRejectedNodeCount,
+                    FormatPointCount(diagnostics.adaptiveOcclusionRejectedRepresentedSourceCount).c_str());
+                ImGui::Text(
                     "GPU governor: point %.3f ms / EWMA %.3f ms / target %.3f ms | scale %.2fx",
                     diagnostics.adaptiveGovernorPointPassMs,
                     diagnostics.adaptiveGovernorPointPassEwmaMs,
@@ -21306,6 +21733,14 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         }
 
         if (session.kind == LayerKind::PointCloud) {
+            if (runtimeState.interactiveViewportRuntime &&
+                !fullSourcePointRenderer &&
+                PointCloudExactSourceResident(session)) {
+                static_cast<void>(RestorePointCloudIpcloudAdaptivePreview(
+                    sessionIndex,
+                    &runtimeState,
+                    &viewport));
+            }
             const bool exactFullSourceReady =
                 !fullSourcePointRenderer || PointCloudExactSourceResident(session);
             auto drawPointCount = std::min<std::uint64_t>(
@@ -21583,6 +22018,8 @@ std::filesystem::path Application::DefaultDataDirectory() {
 }
 
 int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
+    namespace pc = invisible_places::renderer::pointcloud;
+
     try {
         if (pointCloudPath.empty()) {
             pointCloudPath = dataRoot_ / "Site3-Sample-Terrestrial.ply";
@@ -22078,6 +22515,23 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         double adaptiveEstimatedVertices = 0.0;
         double adaptiveEstimatedFragments = 0.0;
         double adaptiveEstimatedBlendedFragments = 0.0;
+        bool adaptiveTileBudgetEnabled = false;
+        std::uint32_t adaptiveTileSizePixels = 0;
+        std::uint32_t adaptiveTileCount = 0;
+        double adaptiveTileFragmentBudget = 0.0;
+        double adaptiveTileBlendedFragmentBudget = 0.0;
+        double adaptiveMaxTileEstimatedFragments = 0.0;
+        double adaptiveMaxTileEstimatedBlendedFragments = 0.0;
+        std::uint32_t adaptiveOverBudgetTileCount = 0;
+        double adaptiveOverBudgetTileScreenPercent = 0.0;
+        std::uint32_t adaptiveTileLimitedRepresentativeCount = 0;
+        std::uint32_t adaptiveTileLimitedNodeCount = 0;
+        std::uint32_t adaptiveTilePreservedRepresentativeCount = 0;
+        bool adaptiveOcclusionCullingEnabled = false;
+        std::string adaptiveOcclusionCullingState = "disabled";
+        std::string adaptiveOcclusionCullingDisabledReason = "not requested";
+        std::uint32_t adaptiveOcclusionRejectedNodeCount = 0;
+        std::uint64_t adaptiveOcclusionRejectedRepresentedSourceCount = 0;
         bool adaptiveOpacityClamped = false;
         bool adaptiveEmissionClamped = false;
         bool adaptivePerformanceClamped = false;
@@ -22275,6 +22729,43 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             result.adaptiveEstimatedVertices += layer.adaptiveEstimatedVertexCost;
             result.adaptiveEstimatedFragments += layer.adaptiveEstimatedFragments;
             result.adaptiveEstimatedBlendedFragments += layer.adaptiveEstimatedBlendedFragments;
+            result.adaptiveTileBudgetEnabled =
+                result.adaptiveTileBudgetEnabled || layer.adaptiveTileBudgetEnabled;
+            result.adaptiveTileSizePixels =
+                std::max(result.adaptiveTileSizePixels, layer.adaptiveTileSizePixels);
+            result.adaptiveTileCount = std::max(result.adaptiveTileCount, layer.adaptiveTileCount);
+            result.adaptiveTileFragmentBudget =
+                std::max(result.adaptiveTileFragmentBudget, static_cast<double>(layer.adaptiveTileFragmentBudget));
+            result.adaptiveTileBlendedFragmentBudget = std::max(
+                result.adaptiveTileBlendedFragmentBudget,
+                static_cast<double>(layer.adaptiveTileBlendedFragmentBudget));
+            result.adaptiveMaxTileEstimatedFragments = std::max(
+                result.adaptiveMaxTileEstimatedFragments,
+                static_cast<double>(layer.adaptiveMaxTileEstimatedFragments));
+            result.adaptiveMaxTileEstimatedBlendedFragments = std::max(
+                result.adaptiveMaxTileEstimatedBlendedFragments,
+                static_cast<double>(layer.adaptiveMaxTileEstimatedBlendedFragments));
+            result.adaptiveOverBudgetTileCount += layer.adaptiveOverBudgetTileCount;
+            result.adaptiveOverBudgetTileScreenPercent = std::max(
+                result.adaptiveOverBudgetTileScreenPercent,
+                static_cast<double>(layer.adaptiveOverBudgetTileScreenPercent));
+            result.adaptiveTileLimitedRepresentativeCount += layer.adaptiveTileLimitedRepresentativeCount;
+            result.adaptiveTileLimitedNodeCount += layer.adaptiveTileLimitedNodeCount;
+            result.adaptiveTilePreservedRepresentativeCount += layer.adaptiveTilePreservedRepresentativeCount;
+            result.adaptiveOcclusionCullingEnabled =
+                result.adaptiveOcclusionCullingEnabled || layer.adaptiveOcclusionCullingEnabled;
+            if (layer.adaptiveOcclusionCullingState == "active" ||
+                (layer.adaptiveOcclusionCullingState == "uncertain" &&
+                 result.adaptiveOcclusionCullingState != "active") ||
+                (result.adaptiveOcclusionCullingState == "disabled" &&
+                 !layer.adaptiveOcclusionCullingState.empty())) {
+                result.adaptiveOcclusionCullingState = layer.adaptiveOcclusionCullingState;
+                result.adaptiveOcclusionCullingDisabledReason =
+                    layer.adaptiveOcclusionCullingDisabledReason;
+            }
+            result.adaptiveOcclusionRejectedNodeCount += layer.adaptiveOcclusionRejectedNodeCount;
+            result.adaptiveOcclusionRejectedRepresentedSourceCount +=
+                layer.adaptiveOcclusionRejectedRepresentedSourceCount;
             result.adaptiveOpacityClamped =
                 result.adaptiveOpacityClamped || layer.adaptiveOpacityCompensationClamped;
             result.adaptiveEmissionClamped =
@@ -22398,6 +22889,22 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         double maxEstimatedBlendedFragments = 0.0;
         double maxFragmentBudget = 0.0;
         double maxBlendedFragmentBudget = 0.0;
+        bool tileBudgetEnabled = false;
+        std::uint32_t maxTileCount = 0;
+        double maxTileFragmentBudget = 0.0;
+        double maxTileBlendedFragmentBudget = 0.0;
+        double maxTileEstimatedFragments = 0.0;
+        double maxTileEstimatedBlendedFragments = 0.0;
+        std::uint32_t maxOverBudgetTileCount = 0;
+        double maxOverBudgetTileScreenPercent = 0.0;
+        std::uint32_t tileLimitedRepresentativeCount = 0;
+        std::uint32_t tileLimitedNodeCount = 0;
+        std::uint32_t tilePreservedRepresentativeCount = 0;
+        bool occlusionCullingEnabled = false;
+        std::string occlusionCullingState = "disabled";
+        std::string occlusionCullingDisabledReason = "not requested";
+        std::uint32_t occlusionRejectedNodeCount = 0;
+        std::uint64_t occlusionRejectedRepresentedSourceCount = 0;
         std::uint64_t maxAdaptiveRepresentatives = 0;
         std::uint32_t performanceLimitedFrames = 0;
     };
@@ -22418,6 +22925,57 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         runtimeState.cameraInteraction.navigationActive = true;
         viewport.SetSceneCachingEnabled(false);
         viewport.SetLiveSceneRenderingEnabled(true);
+
+        if (stressSession.pointLodHierarchy != nullptr && !stressSession.pointLodHierarchy->Empty()) {
+            const auto aspectRatio = CurrentAspectRatio(viewport);
+            const auto matrices = runtimeState.camera.Matrices(aspectRatio);
+            auto params = MakeAdaptiveLodTraversalParams(
+                stressSession,
+                stressSession.pointStyle,
+                matrices.viewProjection,
+                matrices.position,
+                std::max<std::uint32_t>(1U, viewport.Width()),
+                std::max<std::uint32_t>(1U, viewport.Height()),
+                PointCloudExportDensityMode::AdaptiveHighQuality,
+                false,
+                true);
+            params.previousFrontierNodeIndices.clear();
+            PointCloudLodTraversalDiagnostics traversalDiagnostics;
+            static_cast<void>(pc::TraversePointCloudLodHierarchy(
+                *stressSession.pointLodHierarchy,
+                params,
+                {},
+                &traversalDiagnostics));
+            stress.tileBudgetEnabled =
+                stress.tileBudgetEnabled || traversalDiagnostics.tileBudgetEnabled;
+            stress.maxTileCount = std::max(stress.maxTileCount, traversalDiagnostics.tileCount);
+            stress.maxTileFragmentBudget =
+                std::max(stress.maxTileFragmentBudget, static_cast<double>(traversalDiagnostics.tileFragmentBudget));
+            stress.maxTileBlendedFragmentBudget = std::max(
+                stress.maxTileBlendedFragmentBudget,
+                static_cast<double>(traversalDiagnostics.tileBlendedFragmentBudget));
+            stress.maxTileEstimatedFragments = std::max(
+                stress.maxTileEstimatedFragments,
+                static_cast<double>(traversalDiagnostics.maxTileEstimatedFragments));
+            stress.maxTileEstimatedBlendedFragments = std::max(
+                stress.maxTileEstimatedBlendedFragments,
+                static_cast<double>(traversalDiagnostics.maxTileEstimatedBlendedFragments));
+            stress.maxOverBudgetTileCount =
+                std::max(stress.maxOverBudgetTileCount, traversalDiagnostics.overBudgetTileCount);
+            stress.maxOverBudgetTileScreenPercent = std::max(
+                stress.maxOverBudgetTileScreenPercent,
+                static_cast<double>(traversalDiagnostics.overBudgetTileScreenPercent));
+            stress.tileLimitedRepresentativeCount += traversalDiagnostics.tileLimitedRepresentativeCount;
+            stress.tileLimitedNodeCount += traversalDiagnostics.tileLimitedNodeCount;
+            stress.tilePreservedRepresentativeCount += traversalDiagnostics.tilePreservedRepresentativeCount;
+            stress.occlusionCullingEnabled =
+                stress.occlusionCullingEnabled || traversalDiagnostics.occlusionCullingEnabled;
+            stress.occlusionCullingState = traversalDiagnostics.occlusionCullingState;
+            stress.occlusionCullingDisabledReason = traversalDiagnostics.occlusionCullingDisabledReason;
+            stress.occlusionRejectedNodeCount += traversalDiagnostics.occlusionRejectedNodeCount;
+            stress.occlusionRejectedRepresentedSourceCount +=
+                traversalDiagnostics.occlusionRejectedRepresentedSourceCount;
+        }
 
         for (std::uint32_t frame = 0; frame < frameCount; ++frame) {
             window.PollEvents();
@@ -22461,6 +23019,40 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             stress.maxFragmentBudget = std::max(stress.maxFragmentBudget, diagnostics.adaptiveFragmentBudget);
             stress.maxBlendedFragmentBudget =
                 std::max(stress.maxBlendedFragmentBudget, diagnostics.adaptiveBlendedFragmentBudget);
+            stress.tileBudgetEnabled = stress.tileBudgetEnabled || diagnostics.adaptiveTileBudgetEnabled;
+            stress.maxTileCount = std::max(stress.maxTileCount, diagnostics.adaptiveTileCount);
+            stress.maxTileFragmentBudget =
+                std::max(stress.maxTileFragmentBudget, diagnostics.adaptiveTileFragmentBudget);
+            stress.maxTileBlendedFragmentBudget =
+                std::max(stress.maxTileBlendedFragmentBudget, diagnostics.adaptiveTileBlendedFragmentBudget);
+            stress.maxTileEstimatedFragments =
+                std::max(stress.maxTileEstimatedFragments, diagnostics.adaptiveMaxTileEstimatedFragments);
+            stress.maxTileEstimatedBlendedFragments = std::max(
+                stress.maxTileEstimatedBlendedFragments,
+                diagnostics.adaptiveMaxTileEstimatedBlendedFragments);
+            stress.maxOverBudgetTileCount =
+                std::max(stress.maxOverBudgetTileCount, diagnostics.adaptiveOverBudgetTileCount);
+            stress.maxOverBudgetTileScreenPercent = std::max(
+                stress.maxOverBudgetTileScreenPercent,
+                diagnostics.adaptiveOverBudgetTileScreenPercent);
+            stress.tileLimitedRepresentativeCount += diagnostics.adaptiveTileLimitedRepresentativeCount;
+            stress.tileLimitedNodeCount += diagnostics.adaptiveTileLimitedNodeCount;
+            stress.tilePreservedRepresentativeCount += diagnostics.adaptiveTilePreservedRepresentativeCount;
+            stress.occlusionCullingEnabled =
+                stress.occlusionCullingEnabled || diagnostics.adaptiveOcclusionCullingEnabled;
+            if (diagnostics.adaptiveOcclusionCullingState == "active" ||
+                (diagnostics.adaptiveOcclusionCullingState == "uncertain" &&
+                 stress.occlusionCullingState != "active") ||
+                (stress.occlusionCullingState == "disabled" &&
+                 stress.occlusionCullingDisabledReason == "not requested" &&
+                 !diagnostics.adaptiveOcclusionCullingState.empty())) {
+                stress.occlusionCullingState = diagnostics.adaptiveOcclusionCullingState;
+                stress.occlusionCullingDisabledReason =
+                    diagnostics.adaptiveOcclusionCullingDisabledReason;
+            }
+            stress.occlusionRejectedNodeCount += diagnostics.adaptiveOcclusionRejectedNodeCount;
+            stress.occlusionRejectedRepresentedSourceCount +=
+                diagnostics.adaptiveOcclusionRejectedRepresentedSourceCount;
             stress.maxAdaptiveRepresentatives =
                 std::max(stress.maxAdaptiveRepresentatives, diagnostics.adaptiveRepresentativeCount);
             stress.representativeBudgetReached =
@@ -22564,7 +23156,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     {
         std::ofstream metrics{metricsPath, std::ios::trunc};
         metrics << "{\n"
-                << "  \"metrics_schema_version\": 2,\n"
+                << "  \"metrics_schema_version\": 3,\n"
                 << "  \"point_cloud\": \"" << pointCloudPath.lexically_normal().generic_string() << "\",\n"
                 << "  \"source_point_count\": "
                 << (sourceInfoForMetrics.has_value() ? sourceInfoForMetrics->pointCount : 0ULL) << ",\n"
@@ -22671,6 +23263,38 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"adaptive_scalar_feature_refinements\": " << adaptiveScalarFeatureRefinements << ",\n"
                 << "  \"adaptive_normal_feature_refinements\": " << adaptiveNormalFeatureRefinements << ",\n"
                 << "  \"adaptive_emissive_feature_refinements\": " << adaptiveEmissiveFeatureRefinements << ",\n"
+                << "  \"adaptive_tile_budget_enabled\": "
+                << (primaryBeautyResult.adaptiveTileBudgetEnabled ? "true" : "false") << ",\n"
+                << "  \"adaptive_tile_size_pixels\": " << primaryBeautyResult.adaptiveTileSizePixels << ",\n"
+                << "  \"adaptive_tile_count\": " << primaryBeautyResult.adaptiveTileCount << ",\n"
+                << "  \"adaptive_tile_fragment_budget\": "
+                << primaryBeautyResult.adaptiveTileFragmentBudget << ",\n"
+                << "  \"adaptive_tile_blended_fragment_budget\": "
+                << primaryBeautyResult.adaptiveTileBlendedFragmentBudget << ",\n"
+                << "  \"adaptive_max_tile_estimated_fragments\": "
+                << primaryBeautyResult.adaptiveMaxTileEstimatedFragments << ",\n"
+                << "  \"adaptive_max_tile_estimated_blended_fragments\": "
+                << primaryBeautyResult.adaptiveMaxTileEstimatedBlendedFragments << ",\n"
+                << "  \"adaptive_over_budget_tile_count\": "
+                << primaryBeautyResult.adaptiveOverBudgetTileCount << ",\n"
+                << "  \"adaptive_over_budget_tile_screen_percent\": "
+                << primaryBeautyResult.adaptiveOverBudgetTileScreenPercent << ",\n"
+                << "  \"adaptive_tile_limited_representatives\": "
+                << primaryBeautyResult.adaptiveTileLimitedRepresentativeCount << ",\n"
+                << "  \"adaptive_tile_limited_nodes\": "
+                << primaryBeautyResult.adaptiveTileLimitedNodeCount << ",\n"
+                << "  \"adaptive_tile_preserved_representatives\": "
+                << primaryBeautyResult.adaptiveTilePreservedRepresentativeCount << ",\n"
+                << "  \"adaptive_occlusion_culling_enabled\": "
+                << (primaryBeautyResult.adaptiveOcclusionCullingEnabled ? "true" : "false") << ",\n"
+                << "  \"adaptive_occlusion_culling_state\": "
+                << JsonStringLiteral(primaryBeautyResult.adaptiveOcclusionCullingState) << ",\n"
+                << "  \"adaptive_occlusion_culling_disabled_reason\": "
+                << JsonStringLiteral(primaryBeautyResult.adaptiveOcclusionCullingDisabledReason) << ",\n"
+                << "  \"adaptive_occlusion_rejected_nodes\": "
+                << primaryBeautyResult.adaptiveOcclusionRejectedNodeCount << ",\n"
+                << "  \"adaptive_occlusion_rejected_represented_source\": "
+                << primaryBeautyResult.adaptiveOcclusionRejectedRepresentedSourceCount << ",\n"
                 << "  \"adaptive_density\": \"Adaptive High Quality\",\n"
                 << "  \"adaptive_fallback\": false,\n"
                 << "  \"beauty_matrix\": [\n";
@@ -22717,6 +23341,37 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                     << "      \"adaptive_estimated_fragments\": " << result.adaptiveEstimatedFragments << ",\n"
                     << "      \"adaptive_estimated_blended_fragments\": "
                     << result.adaptiveEstimatedBlendedFragments << ",\n"
+                    << "      \"adaptive_tile_budget_enabled\": "
+                    << (result.adaptiveTileBudgetEnabled ? "true" : "false") << ",\n"
+                    << "      \"adaptive_tile_size_pixels\": " << result.adaptiveTileSizePixels << ",\n"
+                    << "      \"adaptive_tile_count\": " << result.adaptiveTileCount << ",\n"
+                    << "      \"adaptive_tile_fragment_budget\": " << result.adaptiveTileFragmentBudget << ",\n"
+                    << "      \"adaptive_tile_blended_fragment_budget\": "
+                    << result.adaptiveTileBlendedFragmentBudget << ",\n"
+                    << "      \"adaptive_max_tile_estimated_fragments\": "
+                    << result.adaptiveMaxTileEstimatedFragments << ",\n"
+                    << "      \"adaptive_max_tile_estimated_blended_fragments\": "
+                    << result.adaptiveMaxTileEstimatedBlendedFragments << ",\n"
+                    << "      \"adaptive_over_budget_tile_count\": "
+                    << result.adaptiveOverBudgetTileCount << ",\n"
+                    << "      \"adaptive_over_budget_tile_screen_percent\": "
+                    << result.adaptiveOverBudgetTileScreenPercent << ",\n"
+                    << "      \"adaptive_tile_limited_representatives\": "
+                    << result.adaptiveTileLimitedRepresentativeCount << ",\n"
+                    << "      \"adaptive_tile_limited_nodes\": "
+                    << result.adaptiveTileLimitedNodeCount << ",\n"
+                    << "      \"adaptive_tile_preserved_representatives\": "
+                    << result.adaptiveTilePreservedRepresentativeCount << ",\n"
+                    << "      \"adaptive_occlusion_culling_enabled\": "
+                    << (result.adaptiveOcclusionCullingEnabled ? "true" : "false") << ",\n"
+                    << "      \"adaptive_occlusion_culling_state\": "
+                    << JsonStringLiteral(result.adaptiveOcclusionCullingState) << ",\n"
+                    << "      \"adaptive_occlusion_culling_disabled_reason\": "
+                    << JsonStringLiteral(result.adaptiveOcclusionCullingDisabledReason) << ",\n"
+                    << "      \"adaptive_occlusion_rejected_nodes\": "
+                    << result.adaptiveOcclusionRejectedNodeCount << ",\n"
+                    << "      \"adaptive_occlusion_rejected_represented_source\": "
+                    << result.adaptiveOcclusionRejectedRepresentedSourceCount << ",\n"
                     << "      \"adaptive_radius_scale_min\": " << result.adaptiveRadiusScaleMin << ",\n"
                     << "      \"adaptive_radius_scale_max\": " << result.adaptiveRadiusScaleMax << ",\n"
                     << "      \"adaptive_opacity_scale_min\": " << result.adaptiveOpacityScaleMin << ",\n"
@@ -22781,6 +23436,37 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"beauty_stress_fragment_budget\": " << beautyStress.maxFragmentBudget << ",\n"
                 << "  \"beauty_stress_blended_fragment_budget\": "
                 << beautyStress.maxBlendedFragmentBudget << ",\n"
+                << "  \"beauty_stress_tile_budget_enabled\": "
+                << (beautyStress.tileBudgetEnabled ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_max_tile_count\": " << beautyStress.maxTileCount << ",\n"
+                << "  \"beauty_stress_tile_fragment_budget\": "
+                << beautyStress.maxTileFragmentBudget << ",\n"
+                << "  \"beauty_stress_tile_blended_fragment_budget\": "
+                << beautyStress.maxTileBlendedFragmentBudget << ",\n"
+                << "  \"beauty_stress_max_tile_estimated_fragments\": "
+                << beautyStress.maxTileEstimatedFragments << ",\n"
+                << "  \"beauty_stress_max_tile_estimated_blended_fragments\": "
+                << beautyStress.maxTileEstimatedBlendedFragments << ",\n"
+                << "  \"beauty_stress_over_budget_tile_count\": "
+                << beautyStress.maxOverBudgetTileCount << ",\n"
+                << "  \"beauty_stress_over_budget_tile_screen_percent\": "
+                << beautyStress.maxOverBudgetTileScreenPercent << ",\n"
+                << "  \"beauty_stress_tile_limited_representatives\": "
+                << beautyStress.tileLimitedRepresentativeCount << ",\n"
+                << "  \"beauty_stress_tile_limited_nodes\": "
+                << beautyStress.tileLimitedNodeCount << ",\n"
+                << "  \"beauty_stress_tile_preserved_representatives\": "
+                << beautyStress.tilePreservedRepresentativeCount << ",\n"
+                << "  \"beauty_stress_occlusion_culling_enabled\": "
+                << (beautyStress.occlusionCullingEnabled ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_occlusion_culling_state\": "
+                << JsonStringLiteral(beautyStress.occlusionCullingState) << ",\n"
+                << "  \"beauty_stress_occlusion_culling_disabled_reason\": "
+                << JsonStringLiteral(beautyStress.occlusionCullingDisabledReason) << ",\n"
+                << "  \"beauty_stress_occlusion_rejected_nodes\": "
+                << beautyStress.occlusionRejectedNodeCount << ",\n"
+                << "  \"beauty_stress_occlusion_rejected_represented_source\": "
+                << beautyStress.occlusionRejectedRepresentedSourceCount << ",\n"
                 << "  \"beauty_stress_exceeded_budget\": "
                 << (beautyStress.exceededBudget ? "true" : "false") << ",\n"
                 << "  \"beauty_stress_submitted_full_source\": "
@@ -22899,6 +23585,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << (beautyStress.representativeBudgetReached ? "yes" : "no") << "/"
               << (beautyStress.fragmentBudgetReached ? "yes" : "no") << "/"
               << (beautyStress.blendedFragmentBudgetReached ? "yes" : "no")
+              << " | tile limited reps/nodes: "
+              << beautyStress.tileLimitedRepresentativeCount << "/"
+              << beautyStress.tileLimitedNodeCount
+              << " | max tile blended "
+              << beautyStress.maxTileEstimatedBlendedFragments
+              << " / " << beautyStress.maxTileBlendedFragmentBudget
+              << " | culling " << beautyStress.occlusionCullingState
               << " | full-source fallback: " << (beautyStress.submittedFullSource ? "yes" : "no")
               << " | budget exceeded: " << (beautyStress.exceededBudget ? "yes" : "no") << "\n"
               << "Fast Basic exact CPU feature reps colour/scalar/normal/accent: "
@@ -23551,6 +24244,7 @@ int Application::Run() const {
     }
 
     PreviewRuntimeState runtimeState;
+    runtimeState.interactiveViewportRuntime = true;
     runtimeState.water.defaultPointVisualStyle = MakeDefaultWaterPointVisualStyle();
     runtimeState.sessions = BuildSessions(assetCatalog);
     runtimeState.sidePanel.pinned = false;
