@@ -260,16 +260,17 @@ constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
 constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = true;
+constexpr std::uint32_t kGpuDiagnosticCompactionOutputCapacityLimit = 262'144U;
 constexpr std::string_view kGpuDiagnosticCompactionOutputWriteFallbackReason =
-    "compacted draw-item output writes cover the bounded diagnostic prefix, but the compacted buffer is not submitted yet; "
-    "CPU draw submission remains authoritative while the GPU pass compares count/source-fingerprint/checksum/class-counts and generates a diagnostic indirect command";
+    "compacted draw-item output writes cover a capped diagnostic slice of the full CPU-selected range, but the compacted buffer is not submitted yet; "
+    "CPU draw submission remains authoritative while the GPU pass compares full-range count/source-fingerprint/checksum/class-counts and generates a diagnostic indirect command";
 constexpr double kGpuDiagnosticCompactionTimingEpsilonMs = 0.02;
 constexpr std::uint32_t kGpuDiagnosticCompactionSlowFrameThreshold = 1U;
 constexpr std::uint32_t kGpuDiagnosticCompactionRetryCooldownFrames = 120U;
 constexpr float kGpuDiagnosticSelectionFrustumGuardBand = 1.05F;
 constexpr bool kGpuDiagnosticSelectionFrustumGuardEnabled = false;
 constexpr std::string_view kGpuDiagnosticSelectionFrustumFallbackReason =
-    "GPU geometry-frustum prefix predicate is disabled because the previous MoltenVK/sample measurement was slower than metadata-only prefix compaction";
+    "GPU geometry-frustum predicate is disabled because the previous MoltenVK/sample measurement was slower than metadata-only full-range compaction";
 constexpr std::uint32_t kDrawItemMetadataClassShift = 14U;
 constexpr std::uint32_t kDrawItemMetadataClassMask = 0xffU;
 constexpr std::uint32_t kGpuDiagnosticRepresentativeClassSelectionMask =
@@ -282,18 +283,17 @@ constexpr std::uint32_t kGpuDiagnosticRepresentativeClassSelectionMask =
     renderer::pointcloud::PointCloudLodRepresentativeClassEmissiveAccent |
     renderer::pointcloud::PointCloudLodRepresentativeClassBlueNoiseFill;
 
-std::uint32_t GpuDiagnosticPrefixSelectionLimit(std::uint32_t drawPointCount) {
-    if (drawPointCount <= kMinimumAdaptiveIndirectDrawPoints) {
-        return drawPointCount;
-    }
-    return std::max(kMinimumAdaptiveIndirectDrawPoints, drawPointCount / 2U);
+std::uint32_t GpuDiagnosticSelectionLimit(std::uint32_t drawPointCount) {
+    return drawPointCount;
 }
 
 std::uint32_t GpuDiagnosticCompactionOutputCapacity(std::uint32_t drawPointCount) {
     if (!kGpuDiagnosticCompactionOutputWriteEnabled) {
         return 1U;
     }
-    return std::max<std::uint32_t>(1U, GpuDiagnosticPrefixSelectionLimit(drawPointCount));
+    return std::max<std::uint32_t>(
+        1U,
+        std::min(GpuDiagnosticSelectionLimit(drawPointCount), kGpuDiagnosticCompactionOutputCapacityLimit));
 }
 
 std::uint32_t DrawItemRepresentativeClassFlags(
@@ -4926,7 +4926,7 @@ std::string VulkanViewportShell::GpuCompactionPerformanceFallbackReason(
         kGpuDiagnosticCompactionSlowFrameThreshold == 1U
             ? std::string{"a slower "}
             : (std::to_string(kGpuDiagnosticCompactionSlowFrameThreshold) + " consecutive slower ");
-    return std::string{"GPU prefix compaction was slower than the CPU reference after "} +
+    return std::string{"GPU full-range compaction was slower than the CPU reference after "} +
            slowSamplePhrase + renderer::pointcloud::PointCloudLodRendererCostProfileName(profile) +
            " sample (last CPU " + std::to_string(gate.lastCpuReferenceMs) +
            " ms, GPU " + std::to_string(gate.lastGpuMs) +
@@ -5181,8 +5181,8 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
         diagnostics_.adaptiveGpuCompactionCpuClassCounts = cpuClassCounts;
         diagnostics_.adaptiveGpuCompactionGpuClassCounts = gpuClassCounts;
         diagnostics_.adaptiveGpuCompactionParityStatus =
-            passed ? "passed previous-frame prefix count/source-fingerprint/checksum/class-counts"
-                   : "mismatch in previous-frame prefix count/source-fingerprint/checksum/class-counts";
+            passed ? "passed previous-frame full-range count/source-fingerprint/checksum/class-counts"
+                   : "mismatch in previous-frame full-range count/source-fingerprint/checksum/class-counts";
     }
 
     if (outputProbeChecked) {
@@ -7339,7 +7339,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             compactionPipelineBound = true;
         }
 
-        const auto selectionLimit = GpuDiagnosticPrefixSelectionLimit(plan.drawPointCount);
+        const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticRepresentativeClassSelectionMask;
         const auto selectionProfileMask = RendererCostProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
@@ -7633,6 +7633,12 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             if (expectedStats.count > selectionMaxOutputCount) {
                 diagnostics_.adaptiveGpuCompactionOutputProbeParityStatus =
                     "not checked: selected count exceeds diagnostic output capacity";
+                diagnostics_.adaptiveGpuCompactionOutputProbeCpuCount = 0;
+                diagnostics_.adaptiveGpuCompactionOutputProbeGpuCount = 0;
+                diagnostics_.adaptiveGpuCompactionOutputProbeCpuChecksum = 0;
+                diagnostics_.adaptiveGpuCompactionOutputProbeGpuChecksum = 0;
+                diagnostics_.adaptiveGpuCompactionOutputProbeCpuSourceFingerprint = 0;
+                diagnostics_.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint = 0;
             }
         } else {
             diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason =
@@ -7648,18 +7654,19 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             &frameResources_[frameIndex],
             kGpuTimestampGpuDrawItemCompactionPass,
             true);
-        diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
+        diagnostics_.adaptiveSelectionExecutionPath =
+            "cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint representative draw items are prefix-filtered, workgroup-aggregated, count-compacted, class-counted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
-            "the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing";
+            "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint representative draw items are full-range filtered, workgroup-aggregated, count-compacted, class-counted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
+            "the geometry-frustum predicate remains disabled after slower MoltenVK timing";
         if (!diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.empty()) {
             diagnostics_.adaptiveSelectionFallbackReason +=
-                "; GPU prefix compaction performance fallback: " +
+                "; GPU full-range compaction performance fallback: " +
                 diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason;
         }
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
-            diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
+            diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame full-range GPU checksum";
         }
         if (diagnostics_.adaptiveGpuCompactionIndirectCommandUsed &&
             diagnostics_.adaptiveGpuCompactionIndirectCommandParityStatus == "not checked") {
@@ -7784,17 +7791,17 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
             true);
         diagnostics_.adaptiveSelectionExecutionPath =
             diagnostics_.adaptiveGpuCompactionUsed
-                ? "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect"
+                ? "cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect"
                 : "cpu-selection+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint representative draw items are prefix-filtered, workgroup-aggregated, count-compacted, class-counted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
+                  "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint representative draw items are full-range filtered, workgroup-aggregated, count-compacted, class-counted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         if (!diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.empty()) {
             diagnostics_.adaptiveSelectionFallbackReason +=
-                "; GPU prefix compaction performance fallback: " +
+                "; GPU full-range compaction performance fallback: " +
                 diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason;
         }
         diagnostics_.adaptiveSelectionParityStatus =

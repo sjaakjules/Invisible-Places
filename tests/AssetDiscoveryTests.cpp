@@ -3107,8 +3107,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("gpuCompactionIndirectCommandBuffers") != std::string::npos);
     CHECK(rendererSource.find("gpuCompactionExpectedIndirectCommands") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteEnabled") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputCapacityLimit") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticCompactionOutputCapacity") != std::string::npos);
-    CHECK(rendererSource.find("GpuDiagnosticPrefixSelectionLimit(drawPointCount)") != std::string::npos);
+    CHECK(rendererSource.find("GpuDiagnosticSelectionLimit(drawPointCount)") != std::string::npos);
+    CHECK(rendererSource.find("return drawPointCount;") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteFallbackReason") != std::string::npos);
     CHECK(rendererSource.find("GpuDrawItemOutputProbeStats") != std::string::npos);
     CHECK(rendererSource.find("AccumulateGpuCompactionOutputProbeStats") != std::string::npos);
@@ -3120,9 +3122,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("GpuCompactionPerformanceFallbackReason") != std::string::npos);
     CHECK(rendererSource.find("UpdateGpuCompactionPerformanceGate") != std::string::npos);
     CHECK(rendererSource.find("ResetGpuCompactionPerformanceFrame") != std::string::npos);
-    CHECK(rendererSource.find("GPU prefix compaction performance fallback") != std::string::npos);
+    CHECK(rendererSource.find("GPU full-range compaction performance fallback") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-generated-indirect") != std::string::npos);
-    CHECK(rendererSource.find("GpuDiagnosticPrefixSelectionLimit") != std::string::npos);
+    CHECK(rendererSource.find("GpuDiagnosticSelectionLimit") != std::string::npos);
     CHECK(rendererSource.find("dispatchItemCount") != std::string::npos);
     CHECK(rendererSource.find("RendererCostProfileSelectionMask") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRepresentativeClassSelectionMask") != std::string::npos);
@@ -3148,12 +3150,12 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("FloatBits(selectionMinFootprintAreaPixels)") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativeClassFlags") != std::string::npos);
     CHECK(rendererSource.find("classCounts == expected.classCounts") != std::string::npos);
-    CHECK(rendererSource.find("passed previous-frame prefix count/source-fingerprint/checksum/class-counts") != std::string::npos);
+    CHECK(rendererSource.find("passed previous-frame full-range count/source-fingerprint/checksum/class-counts") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRendererCostProfileBit") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedRank") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedDepth") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedFlags") != std::string::npos);
-    CHECK(rendererSource.find("cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect") != std::string::npos);
+    CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("workgroup-aggregated") != std::string::npos);
     CHECK(rendererSource.find("const bool useGpuGeneratedIndirectCommand") != std::string::npos);
     CHECK(rendererSource.find("if (!useGpuGeneratedIndirectCommand)") != std::string::npos);
