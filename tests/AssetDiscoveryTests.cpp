@@ -2542,6 +2542,38 @@ TEST_CASE("Fast Basic adaptive viewport targets high quality and reserves previe
     CHECK(buildRenderStateSection.find("FastBasicPointRendererActive(runtimeState.projectSettings)") != std::string::npos);
 }
 
+TEST_CASE("Streaming ipcloud previews stay in bounded fast adaptive mode", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto helperSection = SourceSection(
+        applicationSource,
+        "bool PointCloudStreamingPreviewActive",
+        "bool PointCloudNeedsExactSourceLoad");
+    const auto controllerSection = SourceSection(
+        applicationSource,
+        "PointCloudExportDensityMode SelectAdaptiveViewportDensityMode",
+        "invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams");
+    const auto traversalSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams",
+        "std::uint64_t AdaptiveLodTraversalKey");
+
+    CHECK(helperSection.find("pointCloudPreviewActive") != std::string::npos);
+    CHECK(helperSection.find("pointIpcloudStreamingActive") != std::string::npos);
+    CHECK(helperSection.find("!PointCloudExactSourceResident(session)") != std::string::npos);
+    CHECK(applicationSource.find("kStreamingPreviewMaxAdaptiveDrawItems = 131'072U") != std::string::npos);
+    CHECK(controllerSection.find("PointCloudStreamingPreviewActive(*session)") != std::string::npos);
+    CHECK(controllerSection.find("setQuality(PointCloudExportDensityMode::FastAdaptivePreview)") !=
+          std::string::npos);
+    CHECK(controllerSection.find("session->adaptiveLodEmergencyDemotion = true") != std::string::npos);
+    CHECK(traversalSection.find("PointCloudStreamingPreviewActive(session)") != std::string::npos);
+    CHECK(traversalSection.find("std::min(params.maxDrawItems, streamingCap)") != std::string::npos);
+    CHECK(traversalSection.find("std::min(params.maxRepresentatives, streamingCap)") != std::string::npos);
+    CHECK(traversalSection.find("BaseAdaptiveTargetSpacingPixels(PointCloudExportDensityMode::FastAdaptivePreview)") !=
+          std::string::npos);
+    CHECK(traversalSection.find("!deterministicExport && PointCloudStreamingPreviewActive(session)") !=
+          std::string::npos);
+}
+
 TEST_CASE("Fast Basic adaptive budgets use a dense renderer profile", "[pointcloud][lod][source]") {
     const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
     const auto budgetSection = SourceSection(

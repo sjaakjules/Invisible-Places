@@ -1317,6 +1317,13 @@ bool PointCloudExactSourceResident(const PreviewLayerSession& session) {
     return static_cast<std::uint64_t>(session.offlinePointCloud->PointCount()) >= session.totalPrimitives;
 }
 
+bool PointCloudStreamingPreviewActive(const PreviewLayerSession& session) {
+    return session.kind == LayerKind::PointCloud &&
+           session.pointCloudPreviewActive &&
+           session.pointIpcloudStreamingActive &&
+           !PointCloudExactSourceResident(session);
+}
+
 bool PointCloudNeedsExactSourceLoad(const PreviewLayerSession& session) {
     return session.kind == LayerKind::PointCloud &&
            session.loaded &&
@@ -3157,6 +3164,8 @@ std::uint64_t DrawItemByteCount(std::size_t drawItemCount) {
     return static_cast<std::uint64_t>(drawItemCount) * sizeof(PointCloudDrawItemGpu);
 }
 
+constexpr std::uint32_t kStreamingPreviewMaxAdaptiveDrawItems = 131'072U;
+
 std::uint32_t AdaptiveViewportRepresentativeBudget(
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
@@ -3497,6 +3506,12 @@ PointCloudExportDensityMode SelectAdaptiveViewportDensityMode(
         rendererCostProfile,
         adaptiveInteractionActive);
 
+    if (PointCloudStreamingPreviewActive(*session)) {
+        setQuality(PointCloudExportDensityMode::FastAdaptivePreview);
+        session->adaptiveLodEmergencyDemotion = true;
+        return PointCloudExportDensityMode::FastAdaptivePreview;
+    }
+
     if (!adaptiveInteractionActive) {
         if (session->adaptiveMovementDensityMode != highQuality &&
             sinceChange >= idleQualityStepDelay) {
@@ -3620,6 +3635,24 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
         params.maxRepresentatives = params.maxRepresentatives == 0U
                                         ? manualCap
                                         : std::min(params.maxRepresentatives, manualCap);
+    }
+    if (!deterministicExport && PointCloudStreamingPreviewActive(session)) {
+        const auto streamingCap = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(kStreamingPreviewMaxAdaptiveDrawItems, session.totalPrimitives));
+        params.maxDrawItems =
+            params.maxDrawItems == 0U ? streamingCap : std::min(params.maxDrawItems, streamingCap);
+        params.maxRepresentatives =
+            params.maxRepresentatives == 0U ? streamingCap : std::min(params.maxRepresentatives, streamingCap);
+        params.maxEstimatedFragments = std::min(
+            params.maxEstimatedFragments,
+            static_cast<float>(std::max<std::uint32_t>(1U, viewportWidth)) *
+                static_cast<float>(std::max<std::uint32_t>(1U, viewportHeight)) * 8.0F);
+        params.maxEstimatedBlendedFragments = std::min(
+            params.maxEstimatedBlendedFragments,
+            params.maxEstimatedFragments);
+        params.targetProjectedSpacingPixels = std::max(
+            params.targetProjectedSpacingPixels,
+            BaseAdaptiveTargetSpacingPixels(PointCloudExportDensityMode::FastAdaptivePreview));
     }
     return params;
 }

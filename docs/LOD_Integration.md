@@ -17,6 +17,10 @@ EWMA-governed adaptive budgets, and a `.ipcloud` v2 bundle that can render
 coarse representative data first, attach the cached exact hierarchy, and stream
 visible raw chunks into compact resident buffers without requiring a permanent
 full PLY parse/upload for normal Fast Basic or Beauty Adaptive viewport use.
+Warm streaming-preview viewports are held in bounded Fast Adaptive Preview until
+exact source data is resident, so startup cannot immediately promote a coarse
+preview into a multi-million-item Adaptive HQ resident rebuild while raw chunks
+are still queued.
 Stage 09 adds explicit export density policy semantics, deterministic adaptive
 export traversal, Full Source exact-source guards, Match Viewport still-export
 snapshotting, Fast Adaptive Preview Quick MP4 labeling, export logs, and
@@ -181,6 +185,11 @@ sample-count cap anymore.
   catalog, and render normal Fast Basic / Beauty Adaptive viewports by streaming
   compact resident chunks. The 32-byte `PointCloudDrawItemGpu` ABI is unchanged;
   draw-item `sourcePointIndex` values are remapped into resident dense indices.
+- While that warm preview is still chunk-streaming and exact source data is not
+  resident, viewport density selection stays at `Fast Adaptive Preview` and
+  traversal caps draw items/representatives at 131,072 with Fast Preview spacing
+  and fragment pressure. Exports remain governed by their explicit density
+  policies and do not use this interactive warm-preview throttle.
 - The viewport exposes `.ipcloud` residency diagnostics: visible chunks
   requested/resident/missing, CPU resident bytes, GPU resident bytes, peak RSS,
   upload bytes and upload budget, upload queue length, chunk hit rate, eviction
@@ -299,6 +308,15 @@ sample-count cap anymore.
   and repeat-center chunk residency matching at 599 / 2,292 requested chunks,
   16,233 / 56,537 remapped draw items, 120.9 MiB CPU residency, and 128.0 MiB /
   128.0 MiB compact GPU upload.
+- Stage 09 warm-preview responsiveness evidence on the same sample reran after
+  the viewport throttle and kept the stream check deterministic at 599 / 2,292
+  requested chunks, 16,233 / 56,537 remapped draw items, 120.9 MiB CPU
+  residency, 128.0 MiB GPU residency/upload, and 28.7122% chunk hit rate. A
+  repeat `--lod-compare` pair matched stable fields exactly: selection hash
+  `0xe135407d7f51ed5c`, full-source hash `0x3033fb94fdde875f`, adaptive hash
+  `0x6a742042412c541d`, error-map hash `0x1c76cf9d00a8ad1b`, 401,553
+  representatives, 12,183,742 represented source points, coverage ratio 1,
+  luminance ratio 0.773691, RGB MAE 0.0193535, and alpha MAE 0.
 - Stage 09 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` completed one
   warm-cache `--lod-compare` and wrote Full Source, Adaptive HQ, and error-map
   EXRs with metrics schema v2. The run reported selection hash
