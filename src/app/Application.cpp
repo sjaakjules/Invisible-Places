@@ -21318,12 +21318,18 @@ void DrawDiagnosticsWindow(
                         ? diagnostics.adaptiveLodFallbackState.c_str()
                         : (diagnostics.adaptiveLodReusedPrevious ? "using previous adaptive buffer" : "current"));
                 ImGui::Text(
-                    "Adaptive selection path: %s | indirect %s (%u draws)",
+                    "Adaptive selection path: %s | indirect %s (%u draws, %u gpu cmd)",
                     diagnostics.adaptiveSelectionExecutionPath.c_str(),
                     diagnostics.adaptiveIndirectDrawUsed
                         ? "used"
                         : (diagnostics.adaptiveIndirectDrawRecommended ? "ready" : "direct"),
-                    diagnostics.adaptiveIndirectDrawCalls);
+                    diagnostics.adaptiveIndirectDrawCalls,
+                    diagnostics.adaptiveGpuIndirectCommandDispatches);
+                if (diagnostics.adaptiveGpuIndirectCommandUsed || diagnostics.adaptiveGpuCompactionMs > 0.0) {
+                    ImGui::Text(
+                        "Adaptive GPU command generation: %.3f ms",
+                        diagnostics.adaptiveGpuCompactionMs);
+                }
                 if (!diagnostics.adaptiveSelectionFallbackReason.empty()) {
                     ImGui::TextWrapped(
                         "GPU selection fallback: %s",
@@ -22152,12 +22158,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     bool fastBasicIndirectCountSupported = false;
     bool fastBasicIndirectDrawRecommended = false;
     bool fastBasicIndirectDrawUsed = false;
+    bool fastBasicGpuIndirectCommandSupported = false;
+    bool fastBasicGpuIndirectCommandUsed = false;
     std::string fastBasicGpuSelectionPath = "cpu";
     std::string fastBasicGpuSelectionFallbackReason;
     std::string fastBasicGpuSelectionParityStatus = "not checked";
     std::uint32_t fastBasicMaxIndirectDrawCalls = 0;
+    std::uint32_t fastBasicMaxGpuIndirectCommandDispatches = 0;
     std::uint64_t fastBasicIndirectSubmittedVertices = 0;
     std::uint64_t fastBasicGpuSelectedRepresentativeCount = 0;
+    double fastBasicMaxGpuIndirectCommandMs = 0.0;
     double fastBasicMaxGpuPointPassMs = 0.0;
     double fastBasicMaxGpuPointPassEwmaMs = 0.0;
     double fastBasicMinGovernorBudgetScale = std::numeric_limits<double>::max();
@@ -22364,6 +22374,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             fastBasicIndirectDrawRecommended || diagnostics.adaptiveIndirectDrawRecommended;
         fastBasicIndirectDrawUsed =
             fastBasicIndirectDrawUsed || diagnostics.adaptiveIndirectDrawUsed;
+        fastBasicGpuIndirectCommandSupported =
+            fastBasicGpuIndirectCommandSupported || diagnostics.adaptiveGpuIndirectCommandSupported;
+        fastBasicGpuIndirectCommandUsed =
+            fastBasicGpuIndirectCommandUsed || diagnostics.adaptiveGpuIndirectCommandUsed;
         if (!diagnostics.adaptiveSelectionExecutionPath.empty()) {
             fastBasicGpuSelectionPath = diagnostics.adaptiveSelectionExecutionPath;
         }
@@ -22375,10 +22389,15 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         }
         fastBasicMaxIndirectDrawCalls =
             std::max(fastBasicMaxIndirectDrawCalls, diagnostics.adaptiveIndirectDrawCalls);
+        fastBasicMaxGpuIndirectCommandDispatches = std::max(
+            fastBasicMaxGpuIndirectCommandDispatches,
+            diagnostics.adaptiveGpuIndirectCommandDispatches);
         fastBasicIndirectSubmittedVertices =
             std::max(fastBasicIndirectSubmittedVertices, diagnostics.adaptiveIndirectSubmittedVertices);
         fastBasicGpuSelectedRepresentativeCount =
             std::max(fastBasicGpuSelectedRepresentativeCount, diagnostics.adaptiveGpuSelectedRepresentativeCount);
+        fastBasicMaxGpuIndirectCommandMs =
+            std::max(fastBasicMaxGpuIndirectCommandMs, diagnostics.adaptiveGpuCompactionMs);
         fastBasicMaxGpuPointPassMs = std::max(
             fastBasicMaxGpuPointPassMs,
             diagnostics.gpuFastBasicPointPassMs);
@@ -22962,12 +22981,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         bool indirectCountSupported = false;
         bool indirectDrawRecommended = false;
         bool indirectDrawUsed = false;
+        bool gpuIndirectCommandSupported = false;
+        bool gpuIndirectCommandUsed = false;
         std::string gpuSelectionPath = "cpu";
         std::string gpuSelectionFallbackReason;
         std::string gpuSelectionParityStatus = "not checked";
         std::uint32_t maxIndirectDrawCalls = 0;
+        std::uint32_t maxGpuIndirectCommandDispatches = 0;
         std::uint64_t indirectSubmittedVertices = 0;
         std::uint64_t gpuSelectedRepresentativeCount = 0;
+        double maxGpuIndirectCommandMs = 0.0;
         std::uint64_t maxAdaptiveRepresentatives = 0;
         std::uint32_t performanceLimitedFrames = 0;
     };
@@ -23077,6 +23100,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 stress.indirectDrawRecommended || diagnostics.adaptiveIndirectDrawRecommended;
             stress.indirectDrawUsed =
                 stress.indirectDrawUsed || diagnostics.adaptiveIndirectDrawUsed;
+            stress.gpuIndirectCommandSupported =
+                stress.gpuIndirectCommandSupported || diagnostics.adaptiveGpuIndirectCommandSupported;
+            stress.gpuIndirectCommandUsed =
+                stress.gpuIndirectCommandUsed || diagnostics.adaptiveGpuIndirectCommandUsed;
             if (!diagnostics.adaptiveSelectionExecutionPath.empty()) {
                 stress.gpuSelectionPath = diagnostics.adaptiveSelectionExecutionPath;
             }
@@ -23088,10 +23115,15 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             }
             stress.maxIndirectDrawCalls =
                 std::max(stress.maxIndirectDrawCalls, diagnostics.adaptiveIndirectDrawCalls);
+            stress.maxGpuIndirectCommandDispatches = std::max(
+                stress.maxGpuIndirectCommandDispatches,
+                diagnostics.adaptiveGpuIndirectCommandDispatches);
             stress.indirectSubmittedVertices =
                 std::max(stress.indirectSubmittedVertices, diagnostics.adaptiveIndirectSubmittedVertices);
             stress.gpuSelectedRepresentativeCount =
                 std::max(stress.gpuSelectedRepresentativeCount, diagnostics.adaptiveGpuSelectedRepresentativeCount);
+            stress.maxGpuIndirectCommandMs =
+                std::max(stress.maxGpuIndirectCommandMs, diagnostics.adaptiveGpuCompactionMs);
             if (!diagnostics.adaptiveGovernorStatus.empty()) {
                 stress.governorStatus = diagnostics.adaptiveGovernorStatus;
             }
@@ -23296,6 +23328,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (fastBasicIndirectDrawRecommended ? "true" : "false") << ",\n"
                 << "  \"gpu_indirect_draw_used\": "
                 << (fastBasicIndirectDrawUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_command_supported\": "
+                << (fastBasicGpuIndirectCommandSupported ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_command_used\": "
+                << (fastBasicGpuIndirectCommandUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_command_dispatches\": "
+                << fastBasicMaxGpuIndirectCommandDispatches << ",\n"
+                << "  \"gpu_indirect_command_ms\": " << fastBasicMaxGpuIndirectCommandMs << ",\n"
                 << "  \"gpu_indirect_draw_calls\": " << fastBasicMaxIndirectDrawCalls << ",\n"
                 << "  \"gpu_indirect_submitted_vertices\": " << fastBasicIndirectSubmittedVertices << ",\n"
                 << "  \"gpu_selected_representative_count\": "
@@ -23541,6 +23580,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (beautyStress.indirectDrawRecommended ? "true" : "false") << ",\n"
                 << "  \"beauty_stress_indirect_draw_used\": "
                 << (beautyStress.indirectDrawUsed ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_command_supported\": "
+                << (beautyStress.gpuIndirectCommandSupported ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_command_used\": "
+                << (beautyStress.gpuIndirectCommandUsed ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_command_dispatches\": "
+                << beautyStress.maxGpuIndirectCommandDispatches << ",\n"
+                << "  \"beauty_stress_indirect_command_ms\": "
+                << beautyStress.maxGpuIndirectCommandMs << ",\n"
                 << "  \"beauty_stress_indirect_draw_calls\": " << beautyStress.maxIndirectDrawCalls << ",\n"
                 << "  \"beauty_stress_indirect_submitted_vertices\": "
                 << beautyStress.indirectSubmittedVertices << ",\n"
@@ -23701,6 +23748,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (fastBasicIndirectDrawRecommended ? "true" : "false") << ",\n"
                 << "  \"fast_basic_indirect_draw_used\": "
                 << (fastBasicIndirectDrawUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_command_supported\": "
+                << (fastBasicGpuIndirectCommandSupported ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_command_used\": "
+                << (fastBasicGpuIndirectCommandUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_command_dispatches\": "
+                << fastBasicMaxGpuIndirectCommandDispatches << ",\n"
+                << "  \"fast_basic_indirect_command_ms\": "
+                << fastBasicMaxGpuIndirectCommandMs << ",\n"
                 << "  \"fast_basic_indirect_draw_calls\": " << fastBasicMaxIndirectDrawCalls << ",\n"
                 << "  \"fast_basic_indirect_submitted_vertices\": "
                 << fastBasicIndirectSubmittedVertices << ",\n"
@@ -23765,6 +23820,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " | min FPS " << fastBasicMinFps
               << " | max rep delta/frame " << fastBasicMaxRepresentativeDeltaPerFrame
               << " | large jump frames " << fastBasicLargeRepresentativeJumpFrames
+              << " | gpu indirect command: " << (fastBasicGpuIndirectCommandUsed ? "yes" : "no")
+              << " (" << fastBasicMaxGpuIndirectCommandDispatches
+              << " dispatches, " << fastBasicMaxGpuIndirectCommandMs << " ms)"
               << " | full-source fallback: " << (fastBasicSubmittedFullSource ? "yes" : "no")
               << " | budget exceeded: " << (fastBasicExceededBudget ? "yes" : "no")
               << std::endl;

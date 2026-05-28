@@ -2963,6 +2963,30 @@ TEST_CASE("Viewport diagnostics expose Vulkan timestamp governor surfaces", "[po
     CHECK(appSource.find("fast_basic_max_gpu_point_pass_ms") != std::string::npos);
 }
 
+TEST_CASE("GPU-driven indirect command generation is guarded and diagnosed", "[pointcloud][lod][gpu][source]") {
+    const auto cmakeSource = ReadRepoTextFile("CMakeLists.txt");
+    const auto computeShader = ReadRepoTextFile("shaders/pointcloud_indirect_command.comp");
+    const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
+    const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
+    const auto appSource = ReadRepoTextFile("src/app/Application.cpp");
+
+    CHECK(cmakeSource.find("shaders/pointcloud_indirect_command.comp") != std::string::npos);
+    CHECK(computeShader.find("layout(local_size_x = 1") != std::string::npos);
+    CHECK(computeShader.find("layout(push_constant)") != std::string::npos);
+    CHECK(computeShader.find("indirectCommand.vertexCount") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
+    CHECK(rendererSource.find("vkCreateComputePipelines") != std::string::npos);
+    CHECK(rendererSource.find("VK_PIPELINE_BIND_POINT_COMPUTE") != std::string::npos);
+    CHECK(rendererSource.find("vkCmdDispatch(commandBuffer, 1, 1, 1)") != std::string::npos);
+    CHECK(rendererSource.find("VK_ACCESS_INDIRECT_COMMAND_READ_BIT") != std::string::npos);
+    CHECK(rendererSource.find("VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT") != std::string::npos);
+    CHECK(rendererSource.find("cpu-selection+gpu-generated-indirect") != std::string::npos);
+    CHECK(rendererSource.find("const bool useGpuGeneratedIndirectCommand") != std::string::npos);
+    CHECK(rendererSource.find("if (!useGpuGeneratedIndirectCommand)") != std::string::npos);
+    CHECK(appSource.find("fast_basic_indirect_command_used") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_indirect_command_used") != std::string::npos);
+}
+
 TEST_CASE("Fast Basic adaptive viewport targets high quality and reserves preview for emergency demotion", "[pointcloud][lod][source]") {
     const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
     const auto controllerSection = SourceSection(

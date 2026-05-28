@@ -135,6 +135,9 @@ struct ViewportDiagnostics {
     bool adaptiveIndirectCountSupported = false;
     bool adaptiveIndirectDrawRecommended = false;
     bool adaptiveIndirectDrawUsed = false;
+    bool adaptiveGpuIndirectCommandSupported = false;
+    bool adaptiveGpuIndirectCommandUsed = false;
+    std::uint32_t adaptiveGpuIndirectCommandDispatches = 0;
     std::uint32_t adaptiveIndirectDrawCalls = 0;
     std::uint32_t adaptiveIndirectDrawCount = 0;
     std::uint64_t adaptiveIndirectSubmittedVertices = 0;
@@ -390,6 +393,7 @@ class VulkanViewportShell {
         BufferAllocation sampledSurfelIndexBuffer{};
         std::array<BufferAllocation, kFramesInFlight> drawItemBuffers{};
         std::array<BufferAllocation, kFramesInFlight> indirectDrawCommandBuffers{};
+        std::array<VkDescriptorSet, kFramesInFlight> gpuIndirectDescriptorSets{};
         BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
         std::uint32_t activePointCount = 0;
@@ -441,7 +445,7 @@ class VulkanViewportShell {
         VkFence fence = VK_NULL_HANDLE;
         VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
         bool timestampQueriesArmed = false;
-        std::array<bool, 5U> timestampPassWritten{};
+        std::array<bool, 6U> timestampPassWritten{};
     };
 
     struct HighQualityGaussianSceneResources {
@@ -510,6 +514,7 @@ class VulkanViewportShell {
     void CreateHighQualityGaussianSplatDescriptorSetLayout();
     void CreateCompositeDescriptorSetLayout();
     void CreatePostProcessDescriptorSetLayout();
+    void CreateGpuDrivenSelectionDescriptorSetLayout();
     void CreateDescriptorPools();
     void CreatePostProcessSampler();
     void CreateUniformResources();
@@ -518,6 +523,7 @@ class VulkanViewportShell {
     void CreateHighQualityGaussianSplatPipeline();
     void CreateCompositePipeline();
     void CreatePostProcessPipeline();
+    void CreateGpuDrivenSelectionPipeline();
     void CreateExrExportResources(std::uint32_t width, std::uint32_t height);
     void CreateExrExportRenderPass(ExrExportResources* resources);
     void CreateExrExportPipelines(ExrExportResources* resources);
@@ -555,6 +561,15 @@ class VulkanViewportShell {
         std::uint32_t imageIndex,
         VkImageView sceneDepthView);
     void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
+    void UpdateGpuDrivenIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
+    [[nodiscard]] bool PointCloudPlanUsesGpuIndirectCommand(
+        const PointCloudDrawPlan& plan,
+        std::size_t frameIndex,
+        bool exrStyle) const;
+    [[nodiscard]] bool RecordGpuDrivenIndirectCommandsForScene(
+        VkCommandBuffer commandBuffer,
+        std::size_t frameIndex,
+        bool forceFullSource);
     void CreateOrUpdateCompositeDescriptorSet();
     void CreateOrUpdateCompositeDescriptorSet(
         VkDescriptorSet* descriptorSet,
@@ -654,6 +669,7 @@ class VulkanViewportShell {
     VkPipelineLayout highQualityGaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout postProcessPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout gpuDrivenSelectionPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline pointDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
@@ -667,11 +683,13 @@ class VulkanViewportShell {
     VkPipeline highQualityGaussianSplatPipeline_ = VK_NULL_HANDLE;
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
+    VkPipeline gpuDrivenIndirectCommandPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout postProcessDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gpuDrivenSelectionDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool gaussianSplatDescriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool imguiDescriptorPool_ = VK_NULL_HANDLE;
