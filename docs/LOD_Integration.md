@@ -43,6 +43,9 @@ but is disabled by default after slower MoltenVK timing. GPU compute selection
 remains guarded behind feature, parity, and timing proof; on the local MoltenVK
 runtime the current reported path is
 `cpu-selection+gpu-full-range-selection-compare+gpu-compacted-indirect-submit`.
+Dense full-source comparison is now preflighted before allocation; target-cloud
+sources that exceed the local safety limit write a `skipped_dense_full_source_preflight`
+diagnostic instead of silently running out of memory.
 Memory-mapped chunks and fully device-local chunk residency remain later-stage
 items.
 
@@ -421,22 +424,22 @@ sample-count cap anymore.
   accumulators, checksums CPU-selected draw items, writes an ordered output copy
   when the full fitted range is selected, and converts the compacted GPU count
   into the submitted indirect command after the parity gates pass.
-  Fast Basic recorded 1 metadata full-range dispatch over 2,876,771 CPU-selected
+  The latest Fast Basic compare recorded 1 metadata full-range dispatch over 2,876,771 CPU-selected
   draw items, matched previous-frame CPU/GPU selected count 2,876,771 / 2,876,771,
   matched compacted indirect CPU/GPU vertices 2,876,771 / 2,876,771, copied all
   2,876,771 draw items into the compacted output buffer, and passed ordered
-  output identity 2,876,771 / 2,876,771. Fast Basic measured 226.882 ms for the
-  CPU reference predicate and 9.66508 ms for GPU full-range compaction, so the
+  output identity 2,876,771 / 2,876,771. Fast Basic measured 228.732 ms for the
+  CPU reference predicate and 9.74983 ms for GPU full-range compaction, so the
   GPU pass is measurably faster for the semantic-equivalent predicate. The
   compacted-submission gate now reports `gpu_compaction_submission_used=true`,
   empty output-write and submission fallback reasons, candidate/reference vertices 2,876,771 /
   2,876,771, and submitted 2,876,771 compacted indirect vertices under the
   4,823,449 representative budget. The older CPU-count indirect command remains
-  as a first-frame fallback only, with 1 dispatch at 0.011542 ms in the latest
+  as a first-frame fallback only, with 1 dispatch at 0.011417 ms in the latest
   sample run. Beauty stress also submitted compacted output after parity,
-  reported candidate/reference vertices 262,132 / 262,132, measured 20.8719 ms
-  CPU reference vs 7.64238 ms GPU compaction, kept max GPU point pass 0.096917 ms
-  with EWMA 0.0298263 ms, and skipped the CPU-count indirect command entirely
+  reported candidate/reference vertices 262,132 / 262,132, measured 21.5789 ms
+  CPU reference vs 5.90683 ms GPU compaction, kept max GPU point pass 0.0925 ms
+  with EWMA 0.0241042 ms, and skipped the CPU-count indirect command entirely
   once compacted submission was eligible. The frustum-checked shader path
   still exists, but `*_compaction_selection_frustum_enabled=false`, guard band 0,
   and the fallback reason reports that the GPU geometry-frustum predicate is
@@ -452,6 +455,26 @@ sample-count cap anymore.
   passed at center/repeat-center 563 / 2,292 chunks, 43,438 / 56,537 remapped
   draw items, 120.9 MiB CPU residency, 128.0 MiB GPU residency/upload, and
   76.8311% chunk hit rate.
+- Stage 11 target-cloud evidence on `Data/Site3-Mid-1mm100M.ply` passed
+  `--lod-stream-check` after rebuilding the stale v2 `.ipcloud` bundle for
+  100,743,210 source points and 1,903 raw chunks. The rebuild loaded full source
+  in 47,822 ms, built the hierarchy in 766,039 ms, published in 54,992.3 ms, and
+  then warm-loaded the 65,536-point preview in 301.479 ms. Center/pan/repeat
+  stream passes stayed bounded at 120.9 MiB CPU residency and 128.0 MiB GPU
+  residency/upload: center 101/1,903 chunks with 13,942/27,334 remapped draw
+  items, pan-left 132/1,903 chunks with 20,380/34,614 remapped draw items,
+  pan-right 121/1,903 chunks with 14,852/27,845 remapped draw items, and
+  repeat-center matching center. The rebuild run peaked at 11.1 GiB RSS because
+  dense exact-source compatibility is still used for bundle rebuild and exact
+  debug/export flows. A full `--lod-compare Data/Site3-Mid-1mm100M.ply` now
+  exits before dense allocation with code 13 and
+  `lod_compare_status=skipped_dense_full_source_preflight`: estimated dense
+  CPU+GPU resident bytes are 14,909,995,080 against the 6,442,450,944-byte
+  safety limit, and the valid bundle path is reported as
+  `Saved/PointCloudCache/Site3-Mid-1mm100M.1544b2b5635db91e.ipcloud`. This is an
+  intentional fallback diagnostic, not a GPU parity failure; full-source 100M
+  visual parity remains outstanding until compare/export can iterate exact source
+  data chunk-wise.
 
 ## Partially Implemented
 
@@ -782,7 +805,9 @@ Initial quality targets:
   `difference_exr`; schema v3 should also include tile pressure and
   conservative culling fields, plus GPU compaction submission use/fallback and
   performance fallback/retry fields when compare-only full-range compaction is
-  slower than the CPU reference.
+  slower than the CPU reference. If a target-cloud dense comparison is unsafe,
+  the same path should instead report `lod_compare_status=skipped_dense_full_source_preflight`
+  and `full_source_compare_skipped_reason`.
 - Applicable RGB/scalar/normal/emissive data should produce nonzero Adaptive HQ
   and exact Fast Basic CPU representative class counts plus nonzero
   feature-triggered refinement counts.

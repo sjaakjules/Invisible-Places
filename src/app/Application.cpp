@@ -22123,6 +22123,92 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::cout << "Point cloud: " << pointCloudPath.string() << std::endl << std::endl;
         std::cout << platform::DescribeVulkanRuntime(runtimeConfig) << std::endl << std::endl;
 
+        const auto outputDirectory = dataRoot_.parent_path() / "Saved" / "diagnostics" / "lod_compare";
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        if (createError) {
+            std::cerr << "Could not create comparison output directory: " << createError.message() << "\n";
+            return 5;
+        }
+
+        constexpr std::uint64_t kDenseLodComparePreflightLimitBytes =
+            6ULL * 1024ULL * 1024ULL * 1024ULL;
+        std::string preflightSourceError;
+        const auto preflightSourceInfo =
+            pc::MakePointCloudIpcloudSourceInfo(pointCloudPath, &preflightSourceError);
+        if (preflightSourceInfo.has_value()) {
+            const auto& sourceInfo = preflightSourceInfo.value();
+            const std::uint64_t cpuDenseBytes =
+                sourceInfo.pointCount * sizeof(invisible_places::io::Float3) +
+                (sourceInfo.hasRgb ? sourceInfo.pointCount * sizeof(std::uint32_t) : 0ULL) +
+                (sourceInfo.hasNormals ? sourceInfo.pointCount * sizeof(invisible_places::io::Float3) : 0ULL) +
+                sourceInfo.pointCount * sourceInfo.scalarFieldCount * sizeof(float);
+            const std::uint64_t gpuDenseBytes =
+                sourceInfo.pointCount * sizeof(invisible_places::io::Float3) +
+                sourceInfo.pointCount * sizeof(glm::vec4) +
+                sourceInfo.pointCount * sizeof(std::uint32_t) +
+                (sourceInfo.hasNormals ? sourceInfo.pointCount * sizeof(glm::vec4) : sizeof(glm::vec4)) +
+                sourceInfo.pointCount * sourceInfo.scalarFieldCount * sizeof(float);
+            const std::uint64_t estimatedDenseResidentBytes =
+                std::max(sourceInfo.sourceSizeBytes, cpuDenseBytes + gpuDenseBytes);
+            if (estimatedDenseResidentBytes > kDenseLodComparePreflightLimitBytes) {
+                const auto cacheDirectory = dataRoot_.parent_path() / "Saved" / "PointCloudCache";
+                const pc::PointCloudLodBuildConfig buildConfig{};
+                const auto bundlePath = pc::BuildPointCloudIpcloudBundlePath(cacheDirectory, sourceInfo);
+                const auto inspection = pc::InspectPointCloudIpcloudBundle(bundlePath, sourceInfo, buildConfig);
+                const std::string skipReason =
+                    "dense full-source comparison preflight skipped because estimated dense CPU+GPU resident bytes " +
+                    std::to_string(estimatedDenseResidentBytes) + " exceed the safety limit " +
+                    std::to_string(kDenseLodComparePreflightLimitBytes) +
+                    "; run --lod-stream-check for bounded streaming diagnostics or compare a smaller representative crop";
+
+                const auto metricsPath = outputDirectory / "lod_compare_metrics.json";
+                std::ofstream metrics(metricsPath, std::ios::trunc);
+                if (!metrics) {
+                    std::cerr << "Failed to write LOD comparison preflight metrics: "
+                              << metricsPath << std::endl;
+                    return 5;
+                }
+                metrics << "{\n";
+                metrics << "  \"metrics_schema_version\": 3,\n";
+                metrics << "  \"lod_compare_status\": \"skipped_dense_full_source_preflight\",\n";
+                metrics << "  \"point_cloud\": " << JsonStringLiteral(pointCloudPath.generic_string()) << ",\n";
+                metrics << "  \"source_point_count\": " << sourceInfo.pointCount << ",\n";
+                metrics << "  \"source_size_bytes\": " << sourceInfo.sourceSizeBytes << ",\n";
+                metrics << "  \"normalized_path_hash\": "
+                        << JsonStringLiteral(Hex64(sourceInfo.normalizedPathHash)) << ",\n";
+                metrics << "  \"header_hash\": " << JsonStringLiteral(Hex64(sourceInfo.headerHash)) << ",\n";
+                metrics << "  \"sampled_content_hash\": "
+                        << JsonStringLiteral(Hex64(sourceInfo.sampledContentHash)) << ",\n";
+                metrics << "  \"ipcloud_bundle_path\": " << JsonStringLiteral(bundlePath.generic_string()) << ",\n";
+                metrics << "  \"ipcloud_cache_status\": "
+                        << JsonStringLiteral(pc::PointCloudIpcloudCacheStateName(inspection.state)) << ",\n";
+                metrics << "  \"ipcloud_cache_reason\": " << JsonStringLiteral(inspection.reason) << ",\n";
+                metrics << "  \"dense_compare_estimated_cpu_bytes\": " << cpuDenseBytes << ",\n";
+                metrics << "  \"dense_compare_estimated_gpu_bytes\": " << gpuDenseBytes << ",\n";
+                metrics << "  \"dense_compare_estimated_resident_bytes\": " << estimatedDenseResidentBytes << ",\n";
+                metrics << "  \"dense_compare_preflight_limit_bytes\": "
+                        << kDenseLodComparePreflightLimitBytes << ",\n";
+                metrics << "  \"full_source_compare_skipped\": true,\n";
+                metrics << "  \"full_source_compare_skipped_reason\": " << JsonStringLiteral(skipReason) << ",\n";
+                metrics << "  \"adaptive_fallback_reason\": " << JsonStringLiteral(skipReason) << ",\n";
+                metrics << "  \"gpu_selection_path\": \"not run: dense full-source preflight skipped\",\n";
+                metrics << "  \"gpu_selection_fallback_reason\": " << JsonStringLiteral(skipReason) << ",\n";
+                metrics << "  \"gpu_selection_parity_status\": \"not checked\"\n";
+                metrics << "}\n";
+                metrics.close();
+
+                std::cout << "Wrote LOD comparison preflight diagnostics: "
+                          << metricsPath << std::endl;
+                std::cerr << "LOD comparison skipped: " << skipReason << std::endl;
+                return 13;
+            }
+        } else {
+            std::cerr << "LOD comparison preflight warning: "
+                      << (preflightSourceError.empty() ? "failed to inspect source metadata" : preflightSourceError)
+                      << std::endl;
+        }
+
         auto loadResult = invisible_places::io::LoadPointCloud(pointCloudPath);
         if (!loadResult.success) {
             std::cerr << "Could not load point cloud: " << loadResult.errorMessage << "\n";
@@ -22184,14 +22270,6 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
 
     constexpr std::uint32_t kComparisonWidth = 1600;
     constexpr std::uint32_t kComparisonHeight = 1000;
-    const auto outputDirectory = dataRoot_.parent_path() / "Saved" / "diagnostics" / "lod_compare";
-    std::error_code createError;
-    std::filesystem::create_directories(outputDirectory, createError);
-    if (createError) {
-        std::cerr << "Could not create comparison output directory: " << createError.message() << "\n";
-        StopBackgroundWorkForShutdown(&runtimeState);
-        return 5;
-    }
 
     runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::FastBasic;
     runtimeState.projectSettings.constantUpdateView = true;

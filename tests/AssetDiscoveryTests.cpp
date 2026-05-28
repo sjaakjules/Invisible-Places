@@ -3499,6 +3499,10 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("beauty_full_source.exr") != std::string::npos);
     CHECK(comparisonSection.find("beauty_adaptive_hq.exr") != std::string::npos);
     CHECK(comparisonSection.find("beauty_adaptive_hq_error.exr") != std::string::npos);
+    CHECK(comparisonSection.find("kDenseLodComparePreflightLimitBytes") != std::string::npos);
+    CHECK(comparisonSection.find("skipped_dense_full_source_preflight") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"full_source_compare_skipped_reason\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("dense full-source comparison preflight skipped") != std::string::npos);
     CHECK(comparisonSection.find("BeautyLodComparisonCase") != std::string::npos);
     CHECK(comparisonSection.find("small_opaque_sprites") != std::string::npos);
     CHECK(comparisonSection.find("large_translucent_gaussian_sprites") != std::string::npos);
