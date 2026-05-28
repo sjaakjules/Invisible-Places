@@ -196,6 +196,21 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuRankProbeGpuSourceFingerprint = 0;
     double adaptiveGpuRankProbeCpuReferenceMs = 0.0;
     double adaptiveGpuRankProbeMs = 0.0;
+    bool adaptiveGpuProjectedAreaProbeUsed = false;
+    std::string adaptiveGpuProjectedAreaProbeParityStatus = "not checked";
+    std::uint32_t adaptiveGpuProjectedAreaProbeDispatches = 0;
+    float adaptiveGpuProjectedAreaProbeMinFootprintAreaPixels = 0.0F;
+    float adaptiveGpuProjectedAreaProbeMaxFootprintAreaPixels = 0.0F;
+    float adaptiveGpuProjectedAreaProbeMinRenderAreaPixels = 0.0F;
+    float adaptiveGpuProjectedAreaProbeMaxRenderAreaPixels = 0.0F;
+    std::uint32_t adaptiveGpuProjectedAreaProbeCpuCount = 0;
+    std::uint32_t adaptiveGpuProjectedAreaProbeGpuCount = 0;
+    std::uint32_t adaptiveGpuProjectedAreaProbeCpuChecksum = 0;
+    std::uint32_t adaptiveGpuProjectedAreaProbeGpuChecksum = 0;
+    std::uint32_t adaptiveGpuProjectedAreaProbeCpuSourceFingerprint = 0;
+    std::uint32_t adaptiveGpuProjectedAreaProbeGpuSourceFingerprint = 0;
+    double adaptiveGpuProjectedAreaProbeCpuReferenceMs = 0.0;
+    double adaptiveGpuProjectedAreaProbeMs = 0.0;
     bool adaptiveGpuCompactionSubmissionEligible = false;
     bool adaptiveGpuCompactionSubmissionUsed = false;
     std::string adaptiveGpuCompactionSubmissionFallbackReason;
@@ -519,6 +534,7 @@ class VulkanViewportShell {
         std::array<BufferAllocation, kFramesInFlight> gpuCompactionStatsBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuFeatureClassProbeStatsBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuRankProbeStatsBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> gpuProjectedAreaProbeStatsBuffers{};
         std::array<BufferAllocation, kFramesInFlight> indirectDrawCommandBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuCompactionIndirectCommandBuffers{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuIndirectDescriptorSets{};
@@ -526,6 +542,7 @@ class VulkanViewportShell {
         std::array<VkDescriptorSet, kFramesInFlight> gpuCompactionDescriptorSets{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuFeatureClassProbeDescriptorSets{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuRankProbeDescriptorSets{};
+        std::array<VkDescriptorSet, kFramesInFlight> gpuProjectedAreaProbeDescriptorSets{};
         BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
         std::uint32_t activePointCount = 0;
@@ -539,6 +556,8 @@ class VulkanViewportShell {
         std::array<bool, kFramesInFlight> gpuFeatureClassProbeResultPending{};
         std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuRankProbeExpectedStats{};
         std::array<bool, kFramesInFlight> gpuRankProbeResultPending{};
+        std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuProjectedAreaProbeExpectedStats{};
+        std::array<bool, kFramesInFlight> gpuProjectedAreaProbeResultPending{};
         std::array<GpuDrawItemOutputProbeStats, kFramesInFlight> gpuCompactionExpectedOutputProbeStats{};
         std::array<bool, kFramesInFlight> gpuCompactionOutputProbeResultPending{};
         std::array<VkDrawIndirectCommand, kFramesInFlight> gpuCompactionExpectedIndirectCommands{};
@@ -590,7 +609,7 @@ class VulkanViewportShell {
         VkFence fence = VK_NULL_HANDLE;
         VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
         bool timestampQueriesArmed = false;
-        std::array<bool, 9U> timestampPassWritten{};
+        std::array<bool, 10U> timestampPassWritten{};
     };
 
     struct HighQualityGaussianSceneResources {
@@ -734,6 +753,7 @@ class VulkanViewportShell {
     void UpdateGpuCompactionDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     void UpdateGpuFeatureClassProbeDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     void UpdateGpuRankProbeDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
+    void UpdateGpuProjectedAreaProbeDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     [[nodiscard]] GpuDrawItemCompactionStats ComputeGpuCompactionStats(
         const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
         const std::vector<invisible_places::io::Float3>& positions,

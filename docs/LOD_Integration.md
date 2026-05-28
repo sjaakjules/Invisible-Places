@@ -35,9 +35,9 @@ helpers, indirect draw diagnostics, `vkCmdDrawIndirect` submission for large
 adaptive draw-item paths when supported, compare-only GPU draw-item
 full-range semantic-equivalent selection/count-compaction/source-fingerprint/checksum/class-count diagnostics for
 diagnostic viewport draws, a compacted-output diagnostic buffer capped at 3,145,728
-draw items, ordered draw-index-preserving output writes when the fitted CPU-selected range is complete, order-sensitive output identity parity, compare-only protected feature-class and stable-rank-prefix predicate probes, compacted-output descriptor/barrier submission after parity and performance gates pass, diagnostic compacted-count indirect
+draw items, ordered draw-index-preserving output writes when the fitted CPU-selected range is complete, order-sensitive output identity parity, compare-only protected feature-class, stable-rank-prefix, and projected-area predicate probes, compacted-output descriptor/barrier submission after parity and performance gates pass, diagnostic compacted-count indirect
 command output, full CPU-selected-range dispatch, and CPU-count compute-generated submitted indirect
-command output only when compacted output is not eligible for the current image. It also tracks CPU/GPU full-range, protected feature-class, and stable-rank-prefix predicate
+command output only when compacted output is not eligible for the current image. It also tracks CPU/GPU full-range, protected feature-class, stable-rank-prefix, and projected-area predicate
 timing per renderer profile and keeps explicit retry-window fallback reasons when the GPU path is slower or unsupported. The frustum-checked shader path remains available for comparison,
 but is disabled by default after slower MoltenVK timing. GPU compute selection
 remains guarded behind feature, parity, and timing proof; on the local MoltenVK
@@ -156,7 +156,10 @@ sample-count cap anymore.
   class-count, and timing parity without submitting the reduced output. A third
   compare-only pass filters a stable rank prefix on GPU with packed rank <= 255
   and reports the same count/fingerprint/checksum/class-count/timing parity
-  without submitting the reduced output. A
+  without submitting the reduced output. A fourth compare-only pass filters a
+  projected-footprint area window on GPU with `footprintAreaPixels >= 4` and
+  reports the same count/fingerprint/checksum/class-count/timing parity without
+  submitting the reduced output. A
   separate shader can project source positions through the frame
   `viewProjection` for frustum comparison, but that predicate is disabled on the
   default path after slower local measurements. Selection semantics remain
@@ -277,6 +280,7 @@ sample-count cap anymore.
   CPU-reference timing, GPU timing, performance status, protected feature-class
   GPU probe mask/count/checksum/source-fingerprint/timing/performance status,
   stable-rank prefix GPU probe limit/count/checksum/source-fingerprint/timing/performance status,
+  projected-area GPU probe footprint/render-area window/count/checksum/source-fingerprint/timing/performance status,
   Beauty stress metrics, and colour, scalar, normal, and
   emissive/accent feature-triggered refinement counts.
 - Stage 05 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports exact
@@ -436,24 +440,27 @@ sample-count cap anymore.
   draw items, matched previous-frame CPU/GPU selected count 2,876,771 / 2,876,771,
   matched compacted indirect CPU/GPU vertices 2,876,771 / 2,876,771, copied all
   2,876,771 draw items into the compacted output buffer, and passed ordered
-  output identity 2,876,771 / 2,876,771. Fast Basic measured 231.447 ms for the
-  CPU reference predicate and 10.0969 ms for GPU full-range compaction, so the
+  output identity 2,876,771 / 2,876,771. Fast Basic measured 226.263 ms for the
+  CPU reference predicate and 10.8164 ms for GPU full-range compaction, so the
   GPU pass is measurably faster for the semantic-equivalent predicate. A new
   protected feature-class GPU probe filtered colour contrast, normal edge,
   scalar min/max/threshold, and emissive accent representatives with mask 126;
   it matched CPU/GPU count 1,290 / 1,290, source fingerprint 1,646,296,788,
-  checksum 3,534,349,174, and measured 9.05796 ms CPU reference vs 0.122625 ms
+  checksum 3,534,349,174, and measured 8.71867 ms CPU reference vs 0.04675 ms
   GPU. A stable-rank prefix GPU probe filtered packed rank <= 255, matched
   CPU/GPU count 1,195,635 / 1,195,635, source fingerprint 362,019,890,
-  checksum 3,671,843,879, and measured 60.4236 ms CPU reference vs 0.029 ms
+  checksum 3,671,843,879, and measured 60.3382 ms CPU reference vs 0.108375 ms
+  GPU. A projected-area GPU probe filtered `footprintAreaPixels >= 4`, matched
+  CPU/GPU count 102,497 / 102,497, source fingerprint 263,410,465,
+  checksum 65,403,358, and measured 26.0211 ms CPU reference vs 0.151542 ms
   GPU. The
   compacted-submission gate now reports `gpu_compaction_submission_used=true`,
   empty output-write and submission fallback reasons, candidate/reference vertices 2,876,771 /
   2,876,771, and submitted 2,876,771 compacted indirect vertices under the
   4,823,449 representative budget. The older CPU-count indirect command remains
-  as a first-frame fallback only, with 1 dispatch at 0.011 ms in the latest
-  sample run. Beauty stress kept max GPU point pass 0.08875 ms with EWMA
-  0.0298472 ms and reported no adaptive/full-source fallback or budget
+  as a first-frame fallback only, with 1 dispatch at 0.010958 ms in the latest
+  sample run. Beauty stress kept max GPU point pass 0.158916 ms with EWMA
+  0.047266 ms and reported no adaptive/full-source fallback or budget
   exceedance. The frustum-checked shader path
   still exists, but `*_compaction_selection_frustum_enabled=false`, guard band 0,
   and the fallback reason reports that the GPU geometry-frustum predicate is
@@ -462,14 +469,17 @@ sample-count cap anymore.
   0.8166, RGB MAE 0.015853, selection hash `0xc56d6360df4e9d71`, Adaptive HQ
   used 1,508,358 representatives covering 11,983,509 source points, and the
   repeat compare reported no adaptive/full-source fallback or budget exceedance.
-  CPU traversal remains authoritative; protected feature-class and stable-rank
-  filtering stay compare-only, and CPU-selected direct or CPU-count indirect
+  CPU traversal remains authoritative; protected feature-class, stable-rank,
+  and projected-area filtering stay compare-only, and CPU-selected direct or CPU-count indirect
   draw submission remains active whenever compacted output is unsupported,
   slower, incomplete, or non-equivalent. The final hands-on
   Fast Basic/Beauty/export matrix remains outstanding. The stream check still
   passed at center/repeat-center 563 / 2,292 chunks, 43,438 / 56,537 remapped
   draw items, 120.9 MiB CPU residency, 128.0 MiB GPU residency/upload, and
-  76.8311% chunk hit rate.
+  76.8311% chunk hit rate. The 100M full-source compare preflight still exits
+  13 with `lod_compare_status=skipped_dense_full_source_preflight` because the
+  estimated dense resident footprint remains 14,909,995,080 bytes against the
+  6,442,450,944-byte safety limit.
 - Stage 11 target-cloud evidence on `Data/Site3-Mid-1mm100M.ply` passed
   `--lod-stream-check` after rebuilding the stale v2 `.ipcloud` bundle for
   100,743,210 source points and 1,903 raw chunks. The rebuild loaded full source
@@ -522,9 +532,10 @@ These pieces exist, but they are not yet the ideal system described in
 - Traversal selection is still CPU-authored by default. A compare-only GPU
   full-range selection/draw-item compaction/checksum pass is active for large
   eligible viewport paths and its ordered compacted output can be submitted
-  after parity/performance gates pass. A protected feature-class filtering probe
-  and stable-rank prefix filtering probe also run on GPU for comparison, but
-  they do not author or submit a reduced selection. GPU compute culling and
+  after parity/performance gates pass. A protected feature-class filtering probe,
+  stable-rank prefix filtering probe, and projected-area filtering probe also
+  run on GPU for comparison, but they do not author or submit a reduced
+  selection. GPU compute culling and
   authoritative traversal selection are not active. The slower geometry-frustum
   predicate is disabled with an explicit
   fallback reason. Indirect draw
@@ -764,8 +775,8 @@ the next GPU candidate is profiled.
   implemented for Beauty Adaptive. Next, add a conservative depth proxy or Hi-Z
   pyramid before enabling actual hidden-node rejection.
 - Keep the current indirect, compacted-output submission, protected
-  feature-class probe, and stable-rank prefix probe paths guarded by runtime
-  diagnostics. Move culling,
+  feature-class probe, stable-rank prefix probe, and projected-area probe paths
+  guarded by runtime diagnostics. Move culling,
   projected-error evaluation, authoritative compaction/selection, and
   indirect-count work to compute only where they beat the CPU path, and keep
   skipping redundant CPU-count command generation when a compacted command is
@@ -780,6 +791,7 @@ Metrics to watch:
 - GPU full-range selection/compaction parity/status/input/dispatched/selection/profile-mask/class-mask/rank-limit/depth-window/projected-footprint-window/opacity-window/emission-window/represented-source-count-window/frustum-enabled/frustum-guard/frustum-fallback-reason/output-write-enabled/output-write-fallback/output-capacity/copied-draw-items/output-probe-parity/submission-eligible/submission-used/submission-fallback/candidate-vs-reference vertices/CPU-vs-GPU class counts/position-count/required-flags/rejected-flags/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - protected feature-class GPU probe use/parity/mask/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - stable-rank prefix GPU probe use/parity/rank-limit/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
+- projected-area GPU probe use/parity/footprint-window/render-window/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - diagnostic compacted-indirect command parity/dispatch/CPU-vs-GPU vertices
 - indirect draw count
 - GPU-selection path/fallback/parity status
@@ -826,7 +838,8 @@ Initial quality targets:
   `density_policy`, `determinism`, source/cache fingerprints, and
   `difference_exr`; schema v3 should also include tile pressure and
   conservative culling fields, GPU compaction submission use/fallback, protected
-  feature-class and stable-rank prefix GPU probe parity/timing fields, and performance fallback/retry
+  feature-class, stable-rank prefix, and projected-area GPU probe parity/timing
+  fields, and performance fallback/retry
   fields when compare-only full-range compaction is slower than the CPU
   reference. If a target-cloud dense comparison is unsafe,
   the same path should instead report `lod_compare_status=skipped_dense_full_source_preflight`
