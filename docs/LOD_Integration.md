@@ -345,15 +345,18 @@ sample-count cap anymore.
   0.0280766, RGB RMSE 0.121346, and alpha RMSE 0. The run used a ready LOD cache
   and reported `.ipcloud` full source loaded.
 - Stage 10 sample evidence on `Data/Site3-Sample-Terrestrial.ply` completed
-  build, focused LOD tests, full CTest, stream check, and `--lod-compare` with
-  metrics schema v3. The stream check passed with center/repeat-center
+  build, focused LOD tests, full CTest, stream check, and repeat
+  `--lod-compare` runs with metrics schema v3. The stream check passed with center/repeat-center
   563 / 2,292 requested chunks, 43,438 / 56,537 remapped draw items, 120.9 MiB
   CPU residency, 128.0 MiB GPU residency/upload, and 76.8311% chunk hit rate.
-  The compare reported coverage ratio 1, luminance ratio 0.773804, RGB MAE
-  0.0193481, 397,898 Adaptive HQ representatives covering 12,156,322 source
-  points, Beauty stress max GPU point pass 0.157584 ms, tile-limited reps/nodes
-  297,011 / 5,473, max tile blended pressure 194,343 against the 65,536 tile
-  budget, culling disabled for the no-depth translucent stress style, no
+  The final repeatable compare pair matched stable fields exactly with
+  selection/full/adaptive/error-map hashes `0x64f020924ab61fdd` /
+  `0x46256cddd083a685` / `0x76a7253132d047ea` / `0x9ff3c47aff352c38`,
+  coverage ratio 1, luminance ratio 0.804235, RGB MAE 0.0152765,
+  1,824,536 Adaptive HQ representatives covering 11,848,474 source points,
+  Beauty stress max GPU point pass 0.267583 ms, tile-limited reps/nodes
+  1,457,653 / 15,783, max tile blended pressure 130,769 against the 65,536
+  tile budget, culling disabled for the no-depth translucent stress style, no
   adaptive/full-source fallback, and no budget exceedance.
 - Stage 10 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` completed
   `--lod-compare` with coverage ratio 1, luminance ratio 0.658456, RGB MAE
