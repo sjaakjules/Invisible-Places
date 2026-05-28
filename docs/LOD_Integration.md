@@ -35,7 +35,7 @@ helpers, indirect draw diagnostics, `vkCmdDrawIndirect` submission for large
 adaptive draw-item paths when supported, compare-only GPU draw-item
 full-range selection/performance-clamped represented-count-limited projected-footprint depth-windowed rank-and-representative-class filtering/count-compaction/source-fingerprint/checksum/class-count diagnostics for
 diagnostic viewport draws, a compacted-output diagnostic buffer capped at 1,310,720
-draw items with an explicit not-submitted fallback while CPU draw submission remains authoritative, diagnostic compacted-count indirect
+draw items with explicit submission eligibility/fallback diagnostics while CPU draw submission remains authoritative, diagnostic compacted-count indirect
 command output, full CPU-selected-range dispatch, and CPU-count compute-generated submitted indirect
 command output for eligible viewport draws. It also tracks CPU/GPU full-range predicate
 timing per renderer profile and temporarily suspends the compare-only full-range pass
@@ -416,10 +416,11 @@ sample-count cap anymore.
   fingerprints from the existing source-index XOR/sum accumulators, checksums
   CPU-selected draw items, writes a capped 1,310,720-item compacted-output
   diagnostic buffer when possible, and converts the compacted GPU count to a
-  diagnostic indirect command. The compacted output buffer still has an explicit
-  fallback reason because it is not submitted yet; CPU draw submission remains
-  authoritative while count/source-fingerprint/checksum/class-count and capped
-  output-probe identity parity are measured.
+  diagnostic indirect command. The compacted output buffer still has explicit
+  submission eligibility/fallback diagnostics; CPU draw submission remains
+  authoritative while count/source-fingerprint/checksum/class-count, capped
+  output-probe identity parity, and candidate-vs-reference vertex equivalence are
+  measured.
   Fast Basic recorded 1 metadata full-range dispatch over 2,876,771 CPU-selected
   draw items, matched previous-frame CPU/GPU selected count 1,135,802 / 1,135,802,
   source fingerprint 699,421,798 / 699,421,798, checksum 185,218,674 /
@@ -428,13 +429,19 @@ sample-count cap anymore.
   blue-noise 0/0, and matched compacted indirect CPU/GPU vertices 1,135,802 /
   1,135,802. Fast Basic copied all 1,135,802 selected draw items into the
   1,310,720-item diagnostic output buffer and the compacted-output probe passed
-  previous-frame identity 1,135,802 / 1,135,802. Fast Basic measured 102.967 ms
-  for the CPU reference predicate and 5.74038 ms for GPU full-range compaction,
-  so the GPU pass is measurably faster for that diagnostic predicate.
+  previous-frame identity 1,135,802 / 1,135,802. Fast Basic measured 90.3099 ms
+  for the CPU reference predicate and 8.11717 ms for GPU full-range compaction,
+  so the GPU pass is measurably faster for that diagnostic predicate. The
+  compacted-submission gate leaves the compacted output unsubmitted because the
+  GPU diagnostic predicate selected 1,135,802 vertices from 2,876,771
+  CPU-submitted vertices; submitted compacted draws require semantic-equivalent
+  selection or explicit visual acceptance.
   Beauty stress remained in the CPU-faster compare-only fallback: latest metrics
   used 262,115 input draw items, copied 8,519 selected items, passed compacted-output
   probe identity, and measured 3.16617 ms CPU reference vs 4.37279 ms GPU
-  compaction. It therefore reports
+  compaction. Beauty compacted submission is also in fallback because the GPU
+  diagnostic predicate selected 8,519 vertices from 262,115 CPU-submitted
+  vertices. It therefore reports
   `GPU full-range compaction was slower than the CPU reference after a slower Beauty screen sprite sample (last CPU 3.109375 ms, GPU 3.540792 ms); compare pass suspended until the retry window reopens`
   with 119 retry frames remaining. The frustum-checked shader path still exists,
   but `*_compaction_selection_frustum_enabled=false`, guard band 0, and the
@@ -446,8 +453,8 @@ sample-count cap anymore.
   2,876,771 points under the 4,823,449 representative budget, and the repeat
   compare reported no adaptive/full-source fallback or budget exceedance. CPU
   fallback plus CPU-count submitted indirect command remain active until complete
-  compacted-output submission and broader GPU selection timing are proven
-  beneficial. The stream check still passed at center/repeat-center 563 / 2,292
+  compacted-output submission equivalence and broader GPU selection timing are
+  proven beneficial. The stream check still passed at center/repeat-center 563 / 2,292
   chunks, 43,438 / 56,537 remapped draw items, 120.9 MiB CPU residency,
   128.0 MiB GPU residency/upload, and 76.8311% chunk hit rate.
 
@@ -730,7 +737,7 @@ Metrics to watch:
 - tiles over budget
 - culled hidden nodes
 - compute selection ms
-- GPU full-range selection/compaction parity/status/input/dispatched/selection/profile-mask/class-mask/rank-limit/depth-window/projected-footprint-window/opacity-window/emission-window/represented-source-count-window/frustum-enabled/frustum-guard/frustum-fallback-reason/output-write-enabled/output-write-fallback/output-capacity/copied-draw-items/output-probe-parity/CPU-vs-GPU class counts/position-count/required-flags/rejected-flags/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
+- GPU full-range selection/compaction parity/status/input/dispatched/selection/profile-mask/class-mask/rank-limit/depth-window/projected-footprint-window/opacity-window/emission-window/represented-source-count-window/frustum-enabled/frustum-guard/frustum-fallback-reason/output-write-enabled/output-write-fallback/output-capacity/copied-draw-items/output-probe-parity/submission-eligible/submission-used/submission-fallback/candidate-vs-reference vertices/CPU-vs-GPU class counts/position-count/required-flags/rejected-flags/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - diagnostic compacted-indirect command parity/dispatch/CPU-vs-GPU vertices
 - indirect draw count
 - GPU-selection path/fallback/parity status

@@ -172,6 +172,11 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionOutputProbeGpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionOutputProbeCpuSourceFingerprint = 0;
     std::uint32_t adaptiveGpuCompactionOutputProbeGpuSourceFingerprint = 0;
+    bool adaptiveGpuCompactionSubmissionEligible = false;
+    bool adaptiveGpuCompactionSubmissionUsed = false;
+    std::string adaptiveGpuCompactionSubmissionFallbackReason;
+    std::uint32_t adaptiveGpuCompactionSubmissionCandidateVertices = 0;
+    std::uint32_t adaptiveGpuCompactionSubmissionReferenceVertices = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionCpuSourceFingerprint = 0;

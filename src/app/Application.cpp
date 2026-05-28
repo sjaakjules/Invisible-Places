@@ -21377,6 +21377,18 @@ void DrawDiagnosticsWindow(
                         diagnostics.adaptiveGpuCompactionOutputProbeCpuCount,
                         diagnostics.adaptiveGpuCompactionOutputCapacity);
                     ImGui::Text(
+                        "GPU compacted submission: %s | %u/%u vertices",
+                        diagnostics.adaptiveGpuCompactionSubmissionUsed
+                            ? "used"
+                            : (diagnostics.adaptiveGpuCompactionSubmissionEligible ? "eligible" : "fallback"),
+                        diagnostics.adaptiveGpuCompactionSubmissionCandidateVertices,
+                        diagnostics.adaptiveGpuCompactionSubmissionReferenceVertices);
+                    if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
+                        ImGui::TextWrapped(
+                            "GPU compacted submission fallback: %s",
+                            diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.c_str());
+                    }
+                    ImGui::Text(
                         "Adaptive GPU command generation: %.3f ms",
                         diagnostics.adaptiveGpuIndirectCommandMs);
                     if (diagnostics.adaptiveGpuCompactionIndirectCommandUsed ||
@@ -22268,6 +22280,11 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuCompactionOutputProbeGpuChecksum = 0;
     std::uint32_t fastBasicGpuCompactionOutputProbeCpuSourceFingerprint = 0;
     std::uint32_t fastBasicGpuCompactionOutputProbeGpuSourceFingerprint = 0;
+    bool fastBasicGpuCompactionSubmissionEligible = false;
+    bool fastBasicGpuCompactionSubmissionUsed = false;
+    std::string fastBasicGpuCompactionSubmissionFallbackReason;
+    std::uint32_t fastBasicGpuCompactionSubmissionCandidateVertices = 0;
+    std::uint32_t fastBasicGpuCompactionSubmissionReferenceVertices = 0;
     std::uint32_t fastBasicGpuCompactionCpuCount = 0;
     std::uint32_t fastBasicGpuCompactionGpuCount = 0;
     std::uint32_t fastBasicGpuCompactionCpuChecksum = 0;
@@ -22648,6 +22665,22 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             fastBasicGpuCompactionOutputProbeGpuSourceFingerprint =
                 diagnostics.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint;
         }
+        fastBasicGpuCompactionSubmissionEligible =
+            fastBasicGpuCompactionSubmissionEligible ||
+            diagnostics.adaptiveGpuCompactionSubmissionEligible;
+        fastBasicGpuCompactionSubmissionUsed =
+            fastBasicGpuCompactionSubmissionUsed ||
+            diagnostics.adaptiveGpuCompactionSubmissionUsed;
+        if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
+            fastBasicGpuCompactionSubmissionFallbackReason =
+                diagnostics.adaptiveGpuCompactionSubmissionFallbackReason;
+        }
+        fastBasicGpuCompactionSubmissionCandidateVertices = std::max(
+            fastBasicGpuCompactionSubmissionCandidateVertices,
+            diagnostics.adaptiveGpuCompactionSubmissionCandidateVertices);
+        fastBasicGpuCompactionSubmissionReferenceVertices = std::max(
+            fastBasicGpuCompactionSubmissionReferenceVertices,
+            diagnostics.adaptiveGpuCompactionSubmissionReferenceVertices);
         const bool hasFastBasicGpuCompactionParityCounts =
             diagnostics.adaptiveGpuCompactionCpuCount != 0U ||
             diagnostics.adaptiveGpuCompactionGpuCount != 0U;
@@ -23338,6 +23371,11 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t gpuCompactionOutputProbeGpuChecksum = 0;
         std::uint32_t gpuCompactionOutputProbeCpuSourceFingerprint = 0;
         std::uint32_t gpuCompactionOutputProbeGpuSourceFingerprint = 0;
+        bool gpuCompactionSubmissionEligible = false;
+        bool gpuCompactionSubmissionUsed = false;
+        std::string gpuCompactionSubmissionFallbackReason;
+        std::uint32_t gpuCompactionSubmissionCandidateVertices = 0;
+        std::uint32_t gpuCompactionSubmissionReferenceVertices = 0;
         std::uint32_t gpuCompactionCpuCount = 0;
         std::uint32_t gpuCompactionGpuCount = 0;
         std::uint32_t gpuCompactionCpuChecksum = 0;
@@ -23621,6 +23659,22 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 stress.gpuCompactionOutputProbeGpuSourceFingerprint =
                     diagnostics.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint;
             }
+            stress.gpuCompactionSubmissionEligible =
+                stress.gpuCompactionSubmissionEligible ||
+                diagnostics.adaptiveGpuCompactionSubmissionEligible;
+            stress.gpuCompactionSubmissionUsed =
+                stress.gpuCompactionSubmissionUsed ||
+                diagnostics.adaptiveGpuCompactionSubmissionUsed;
+            if (!diagnostics.adaptiveGpuCompactionSubmissionFallbackReason.empty()) {
+                stress.gpuCompactionSubmissionFallbackReason =
+                    diagnostics.adaptiveGpuCompactionSubmissionFallbackReason;
+            }
+            stress.gpuCompactionSubmissionCandidateVertices = std::max(
+                stress.gpuCompactionSubmissionCandidateVertices,
+                diagnostics.adaptiveGpuCompactionSubmissionCandidateVertices);
+            stress.gpuCompactionSubmissionReferenceVertices = std::max(
+                stress.gpuCompactionSubmissionReferenceVertices,
+                diagnostics.adaptiveGpuCompactionSubmissionReferenceVertices);
             const bool hasStressGpuCompactionParityCounts =
                 diagnostics.adaptiveGpuCompactionCpuCount != 0U ||
                 diagnostics.adaptiveGpuCompactionGpuCount != 0U;
@@ -23998,6 +24052,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicGpuCompactionOutputProbeCpuSourceFingerprint << ",\n"
                 << "  \"gpu_compaction_output_probe_gpu_source_fingerprint\": "
                 << fastBasicGpuCompactionOutputProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_compaction_submission_eligible\": "
+                << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
+                << "  \"gpu_compaction_submission_used\": "
+                << (fastBasicGpuCompactionSubmissionUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_compaction_submission_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuCompactionSubmissionFallbackReason) << ",\n"
+                << "  \"gpu_compaction_submission_candidate_vertices\": "
+                << fastBasicGpuCompactionSubmissionCandidateVertices << ",\n"
+                << "  \"gpu_compaction_submission_reference_vertices\": "
+                << fastBasicGpuCompactionSubmissionReferenceVertices << ",\n"
                 << "  \"gpu_compaction_cpu_count\": " << fastBasicGpuCompactionCpuCount << ",\n"
                 << "  \"gpu_compaction_gpu_count\": " << fastBasicGpuCompactionGpuCount << ",\n"
                 << "  \"gpu_compaction_cpu_checksum\": " << fastBasicGpuCompactionCpuChecksum << ",\n"
@@ -24365,6 +24429,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << beautyStress.gpuCompactionOutputProbeCpuSourceFingerprint << ",\n"
                 << "  \"beauty_stress_compaction_output_probe_gpu_source_fingerprint\": "
                 << beautyStress.gpuCompactionOutputProbeGpuSourceFingerprint << ",\n"
+                << "  \"beauty_stress_compaction_submission_eligible\": "
+                << (beautyStress.gpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_compaction_submission_used\": "
+                << (beautyStress.gpuCompactionSubmissionUsed ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_compaction_submission_fallback_reason\": "
+                << JsonStringLiteral(beautyStress.gpuCompactionSubmissionFallbackReason) << ",\n"
+                << "  \"beauty_stress_compaction_submission_candidate_vertices\": "
+                << beautyStress.gpuCompactionSubmissionCandidateVertices << ",\n"
+                << "  \"beauty_stress_compaction_submission_reference_vertices\": "
+                << beautyStress.gpuCompactionSubmissionReferenceVertices << ",\n"
                 << "  \"beauty_stress_compaction_cpu_count\": "
                 << beautyStress.gpuCompactionCpuCount << ",\n"
                 << "  \"beauty_stress_compaction_gpu_count\": "
@@ -24653,6 +24727,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicGpuCompactionOutputProbeCpuSourceFingerprint << ",\n"
                 << "  \"fast_basic_compaction_output_probe_gpu_source_fingerprint\": "
                 << fastBasicGpuCompactionOutputProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_compaction_submission_eligible\": "
+                << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
+                << "  \"fast_basic_compaction_submission_used\": "
+                << (fastBasicGpuCompactionSubmissionUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_compaction_submission_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuCompactionSubmissionFallbackReason) << ",\n"
+                << "  \"fast_basic_compaction_submission_candidate_vertices\": "
+                << fastBasicGpuCompactionSubmissionCandidateVertices << ",\n"
+                << "  \"fast_basic_compaction_submission_reference_vertices\": "
+                << fastBasicGpuCompactionSubmissionReferenceVertices << ",\n"
                 << "  \"fast_basic_compaction_cpu_count\": "
                 << fastBasicGpuCompactionCpuCount << ",\n"
                 << "  \"fast_basic_compaction_gpu_count\": "
@@ -24818,6 +24902,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " dispatches, " << fastBasicGpuCompactionIndirectCommandGpuVertices
               << "/" << fastBasicGpuCompactionIndirectCommandCpuVertices
               << " vertices)"
+              << " | gpu compacted submission: "
+              << (fastBasicGpuCompactionSubmissionUsed
+                      ? "used"
+                      : (fastBasicGpuCompactionSubmissionEligible ? "eligible" : "fallback"))
+              << " (" << fastBasicGpuCompactionSubmissionCandidateVertices
+              << "/" << fastBasicGpuCompactionSubmissionReferenceVertices
+              << " vertices"
+              << (fastBasicGpuCompactionSubmissionFallbackReason.empty()
+                      ? std::string{}
+                      : (", " + fastBasicGpuCompactionSubmissionFallbackReason))
+              << ")"
               << " | gpu indirect command: " << (fastBasicGpuIndirectCommandUsed ? "yes" : "no")
               << " (" << fastBasicMaxGpuIndirectCommandDispatches
               << " dispatches, " << fastBasicMaxGpuIndirectCommandMs << " ms)"

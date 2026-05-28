@@ -1279,6 +1279,11 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionOutputProbeGpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionOutputProbeCpuSourceFingerprint = 0;
         diagnostics_.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint = 0;
+        diagnostics_.adaptiveGpuCompactionSubmissionEligible = false;
+        diagnostics_.adaptiveGpuCompactionSubmissionUsed = false;
+        diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason.clear();
+        diagnostics_.adaptiveGpuCompactionSubmissionCandidateVertices = 0;
+        diagnostics_.adaptiveGpuCompactionSubmissionReferenceVertices = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = 0;
@@ -1723,6 +1728,11 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionOutputProbeGpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionOutputProbeCpuSourceFingerprint = 0;
     diagnostics_.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint = 0;
+    diagnostics_.adaptiveGpuCompactionSubmissionEligible = false;
+    diagnostics_.adaptiveGpuCompactionSubmissionUsed = false;
+    diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason.clear();
+    diagnostics_.adaptiveGpuCompactionSubmissionCandidateVertices = 0;
+    diagnostics_.adaptiveGpuCompactionSubmissionReferenceVertices = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = 0;
@@ -7412,6 +7422,49 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         plan.resources->gpuCompactionExpectedOutputProbeStats[frameIndex] = expectedOutputProbeStats;
         plan.resources->gpuCompactionOutputProbeResultPending[frameIndex] =
             selectionWriteOutput && expectedStats.count <= selectionMaxOutputCount;
+        const auto compactedSubmissionCandidateVertices =
+            IndirectVertexCountFromCompactedItems(expectedStats.count, plan.worldSurfels);
+        const auto compactedSubmissionReferenceVertices =
+            IndirectVertexCountFromCompactedItems(plan.drawPointCount, plan.worldSurfels);
+        const bool compactedSubmissionOutputFits =
+            selectionWriteOutput && expectedStats.count <= selectionMaxOutputCount;
+        const bool compactedSubmissionSemanticEquivalent =
+            compactedSubmissionCandidateVertices == compactedSubmissionReferenceVertices;
+        const bool compactedSubmissionOutputProbePassed =
+            diagnostics_.adaptiveGpuCompactionOutputProbeParityStatus.rfind("passed", 0) == 0;
+        const bool compactedSubmissionEligible =
+            compactedSubmissionOutputFits &&
+            compactedSubmissionSemanticEquivalent &&
+            compactedSubmissionOutputProbePassed &&
+            diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.empty();
+        diagnostics_.adaptiveGpuCompactionSubmissionEligible =
+            diagnostics_.adaptiveGpuCompactionSubmissionEligible || compactedSubmissionEligible;
+        diagnostics_.adaptiveGpuCompactionSubmissionCandidateVertices += compactedSubmissionCandidateVertices;
+        diagnostics_.adaptiveGpuCompactionSubmissionReferenceVertices += compactedSubmissionReferenceVertices;
+        if (!selectionWriteOutput) {
+            diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason =
+                "compacted output not submitted: diagnostic output writes are disabled";
+        } else if (!compactedSubmissionOutputFits) {
+            diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason =
+                "compacted output not submitted: selected count exceeds diagnostic output capacity";
+        } else if (!compactedSubmissionSemanticEquivalent) {
+            diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason =
+                "compacted output not submitted: GPU diagnostic predicate selected " +
+                std::to_string(compactedSubmissionCandidateVertices) +
+                " vertices from " +
+                std::to_string(compactedSubmissionReferenceVertices) +
+                " CPU-submitted vertices; submitted compacted draws require semantic-equivalent selection or explicit visual acceptance";
+        } else if (!compactedSubmissionOutputProbePassed) {
+            diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason =
+                "compacted output not submitted: waiting for previous-frame compacted output identity parity";
+        } else if (!diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.empty()) {
+            diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason =
+                "compacted output not submitted: " +
+                diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason;
+        } else {
+            diagnostics_.adaptiveGpuCompactionSubmissionFallbackReason =
+                "compacted output not submitted: eligible diagnostic output still needs the graphics descriptor and barrier submission path enabled";
+        }
 
         const GpuDrawItemCompactionPushConstants pushConstants{
             glm::uvec4{plan.drawPointCount, selectionLimit, selectionClassMask, selectionRankLimit},
