@@ -406,7 +406,8 @@ sample-count cap anymore.
   projected-footprint/render-area metadata, and opacity/emission compensation,
   prefix-filters performance-clamped renderer-profile-matched compensation-windowed
   represented-count-limited projected-footprint depth-windowed rank-limited feature
-  representatives, dispatches only the bounded prefix range, compacts, folds
+  representatives, dispatches only the bounded prefix range, aggregates selected
+  items per workgroup before updating global compaction stats, compacts, folds
   source-identity fingerprints from the existing source-index XOR/sum accumulators,
   checksums CPU-selected draw items, and converts
   the compacted GPU count to a diagnostic indirect command. The submitted
@@ -415,7 +416,7 @@ sample-count cap anymore.
   but `*_compaction_selection_frustum_enabled=false`, guard band 0, and the
   fallback reason reports that the GPU geometry-frustum prefix predicate is
   disabled because the previous MoltenVK/sample measurement was slower than
-  metadata-only prefix compaction. The latest folded-source-fingerprint run records CPU reference timing
+  metadata-only prefix compaction. The latest workgroup-aggregated run records CPU reference timing
   and reports `CPU reference faster; GPU prefix compaction remains compare-only`.
   Fast Basic recorded 1 metadata prefix dispatch
   over 262,115 CPU-selected draw items but dispatched only 131,057 work items,
@@ -423,21 +424,23 @@ sample-count cap anymore.
   mask 1, class mask 126, rank limit 1023, depth window 2-255, required flags 4, and rejected
   flags 0, opacity window 0.05-8, emission window 1-4, represented-count window
   2-4,294,967,295 and projected footprint/render area window 1-1.04858e+06 px,
-  compacted up to 4,363 items, measured 0.613834 ms for the CPU reference
-  predicate and 1.79433 ms for GPU compaction, matched previous-frame CPU/GPU
+  compacted up to 4,363 items, measured 0.59125 ms for the CPU reference
+  predicate and 2.05854 ms for GPU compaction, matched previous-frame CPU/GPU
   count 3,139, source fingerprint 2,306,815,097 / 2,306,815,097, and checksum
   1,197,028,360 / 1,197,028,360, matched compacted indirect CPU/GPU
   vertices 3,139 / 3,139, plus 1 CPU-count GPU indirect-command dispatch at
-  0.659666 ms. Beauty stress recorded 1 matching
+  0.93225 ms. Beauty stress recorded 1 matching
   metadata prefix dispatch over 262,132 draw items but dispatched only 131,066 work items,
   checked a 131,066-item prefix
   with profile mask 2, class mask 126, rank limit 1023, depth window 2-255,
   required flags 4, and rejected flags 0, compacted up to 4,274 items, measured
-  0.529667 ms for the CPU reference predicate and 2.70458 ms for GPU compaction, matched
+  0.528958 ms for the CPU reference predicate and 1.59104 ms for GPU compaction, matched
   previous-frame CPU/GPU count 2,301, source fingerprint 3,348,557,094 / 3,348,557,094,
   and checksum 4,287,346,937 / 4,287,346,937, and matched
   compacted indirect CPU/GPU vertices 2,301 / 2,301; Beauty GPU indirect-command
-  timing was 0.128917 ms. The prior frustum shader measurement was
+  timing was 0.040417 ms. Beauty stress improved, but Fast Basic did not prove
+  a stable GPU win, so the CPU fallback and
+  compare-only status remain active. The prior frustum shader measurement was
   13.6525 ms in Fast Basic and 8.31621 ms in Beauty stress, so it remains
   disabled unless a future optimization makes it beneficial.
   Coverage ratio

@@ -53,6 +53,16 @@ layout(set = 0, binding = 2, std430) buffer CompactionStats {
     uint combinedChecksum;
 } stats;
 
+shared uint groupCount;
+shared uint groupBase;
+shared uint groupSourceIndexXor;
+shared uint groupRepresentedCountXor;
+shared uint groupFootprintXor;
+shared uint groupSourceIndexSum;
+shared uint groupRepresentedCountSum;
+shared uint groupDrawIndexXor;
+shared uint groupCombinedChecksum;
+
 uint MixWord(uint value) {
     value ^= value >> 16;
     value *= 0x7feb352du;
@@ -63,85 +73,116 @@ uint MixWord(uint value) {
 }
 
 void main() {
+    const uint localIndex = gl_LocalInvocationIndex;
+    if (localIndex == 0u) {
+        groupCount = 0u;
+        groupBase = 0u;
+        groupSourceIndexXor = 0u;
+        groupRepresentedCountXor = 0u;
+        groupFootprintXor = 0u;
+        groupSourceIndexSum = 0u;
+        groupRepresentedCountSum = 0u;
+        groupDrawIndexXor = 0u;
+        groupCombinedChecksum = 0u;
+    }
+    barrier();
+
     const uint drawIndex = gl_GlobalInvocationID.x;
-    if (drawIndex >= pushConstants.itemCount) {
-        return;
+    PointDrawItemGpu item;
+    uint sourceIndex = 0u;
+    uint representedCount = 0u;
+    uint footprintBits = 0u;
+    uint mixed = 0u;
+    uint localOutputIndex = 0u;
+    bool selected = drawIndex < pushConstants.itemCount &&
+                    drawIndex < pushConstants.selectionLimit;
+
+    if (selected) {
+        item = inputDrawItems.drawItems[drawIndex];
+        sourceIndex = item.indices.x;
+        const uint classFlags = (item.indices.w >> 14u) & 0xffu;
+        selected = pushConstants.selectionClassMask == 0u ||
+                   (classFlags & pushConstants.selectionClassMask) != 0u;
     }
-    if (drawIndex >= pushConstants.selectionLimit) {
-        return;
+    if (selected) {
+        const uint profileBits = (item.indices.w >> 22u) & 0x3u;
+        selected = pushConstants.selectionProfileMask == 0u ||
+                   ((1u << profileBits) & pushConstants.selectionProfileMask) != 0u;
+    }
+    if (selected) {
+        const uint packedRank = item.indices.w & 0x7ffu;
+        selected = packedRank <= pushConstants.selectionRankLimit;
+    }
+    if (selected) {
+        const uint packedDepth = (item.indices.w >> 24u) & 0xffu;
+        selected = packedDepth >= pushConstants.selectionMinDepth &&
+                   packedDepth <= pushConstants.selectionMaxDepth;
+    }
+    if (selected) {
+        const uint packedFlags = (item.indices.w >> 11u) & 0x7u;
+        selected = (packedFlags & pushConstants.selectionRequiredFlags) ==
+                       pushConstants.selectionRequiredFlags &&
+                   (packedFlags & pushConstants.selectionRejectedFlags) == 0u;
+    }
+    if (selected) {
+        const float footprintArea = item.params.x;
+        const float renderArea = item.params.w;
+        const float minFootprintArea = uintBitsToFloat(pushConstants.selectionMinFootprintAreaBits);
+        const float maxFootprintArea = uintBitsToFloat(pushConstants.selectionMaxFootprintAreaBits);
+        const float minRenderArea = uintBitsToFloat(pushConstants.selectionMinRenderAreaBits);
+        const float maxRenderArea = uintBitsToFloat(pushConstants.selectionMaxRenderAreaBits);
+        selected = footprintArea >= minFootprintArea &&
+                   footprintArea <= maxFootprintArea &&
+                   renderArea >= minRenderArea &&
+                   renderArea <= maxRenderArea;
+    }
+    if (selected) {
+        const float opacityCompensation = item.params.y;
+        const float emissionCompensation = item.params.z;
+        const float minOpacityCompensation = uintBitsToFloat(pushConstants.selectionMinOpacityCompensationBits);
+        const float maxOpacityCompensation = uintBitsToFloat(pushConstants.selectionMaxOpacityCompensationBits);
+        const float minEmissionCompensation = uintBitsToFloat(pushConstants.selectionMinEmissionCompensationBits);
+        const float maxEmissionCompensation = uintBitsToFloat(pushConstants.selectionMaxEmissionCompensationBits);
+        selected = opacityCompensation >= minOpacityCompensation &&
+                   opacityCompensation <= maxOpacityCompensation &&
+                   emissionCompensation >= minEmissionCompensation &&
+                   emissionCompensation <= maxEmissionCompensation;
+    }
+    if (selected) {
+        representedCount = item.indices.y;
+        selected = representedCount >= pushConstants.selectionMinRepresentedSourceCount &&
+                   representedCount <= pushConstants.selectionMaxRepresentedSourceCount;
+    }
+    if (selected) {
+        footprintBits = floatBitsToUint(item.params.x);
+        mixed = MixWord(sourceIndex ^ (drawIndex * 0x9e3779b9u)) ^
+                MixWord(representedCount + 0x85ebca6bu) ^
+                MixWord(footprintBits + 0xc2b2ae35u);
+
+        localOutputIndex = atomicAdd(groupCount, 1u);
+        atomicXor(groupSourceIndexXor, sourceIndex);
+        atomicXor(groupRepresentedCountXor, representedCount);
+        atomicXor(groupFootprintXor, footprintBits);
+        atomicAdd(groupSourceIndexSum, sourceIndex);
+        atomicAdd(groupRepresentedCountSum, representedCount);
+        atomicXor(groupDrawIndexXor, drawIndex);
+        atomicXor(groupCombinedChecksum, mixed);
     }
 
-    const PointDrawItemGpu item = inputDrawItems.drawItems[drawIndex];
-    const uint sourceIndex = item.indices.x;
-    const uint classFlags = (item.indices.w >> 14u) & 0xffu;
-    if (pushConstants.selectionClassMask != 0u &&
-        (classFlags & pushConstants.selectionClassMask) == 0u) {
-        return;
+    barrier();
+    if (localIndex == 0u && groupCount > 0u) {
+        groupBase = atomicAdd(stats.count, groupCount);
+        atomicXor(stats.sourceIndexXor, groupSourceIndexXor);
+        atomicXor(stats.representedCountXor, groupRepresentedCountXor);
+        atomicXor(stats.footprintXor, groupFootprintXor);
+        atomicAdd(stats.sourceIndexSum, groupSourceIndexSum);
+        atomicAdd(stats.representedCountSum, groupRepresentedCountSum);
+        atomicXor(stats.drawIndexXor, groupDrawIndexXor);
+        atomicXor(stats.combinedChecksum, groupCombinedChecksum);
     }
-    const uint profileBits = (item.indices.w >> 22u) & 0x3u;
-    if (pushConstants.selectionProfileMask != 0u &&
-        ((1u << profileBits) & pushConstants.selectionProfileMask) == 0u) {
-        return;
-    }
-    const uint packedRank = item.indices.w & 0x7ffu;
-    if (packedRank > pushConstants.selectionRankLimit) {
-        return;
-    }
-    const uint packedDepth = (item.indices.w >> 24u) & 0xffu;
-    if (packedDepth < pushConstants.selectionMinDepth ||
-        packedDepth > pushConstants.selectionMaxDepth) {
-        return;
-    }
-    const uint packedFlags = (item.indices.w >> 11u) & 0x7u;
-    if ((packedFlags & pushConstants.selectionRequiredFlags) != pushConstants.selectionRequiredFlags) {
-        return;
-    }
-    if ((packedFlags & pushConstants.selectionRejectedFlags) != 0u) {
-        return;
-    }
-    const float footprintArea = item.params.x;
-    const float renderArea = item.params.w;
-    const float minFootprintArea = uintBitsToFloat(pushConstants.selectionMinFootprintAreaBits);
-    const float maxFootprintArea = uintBitsToFloat(pushConstants.selectionMaxFootprintAreaBits);
-    const float minRenderArea = uintBitsToFloat(pushConstants.selectionMinRenderAreaBits);
-    const float maxRenderArea = uintBitsToFloat(pushConstants.selectionMaxRenderAreaBits);
-    if (footprintArea < minFootprintArea ||
-        footprintArea > maxFootprintArea ||
-        renderArea < minRenderArea ||
-        renderArea > maxRenderArea) {
-        return;
-    }
-    const float opacityCompensation = item.params.y;
-    const float emissionCompensation = item.params.z;
-    const float minOpacityCompensation = uintBitsToFloat(pushConstants.selectionMinOpacityCompensationBits);
-    const float maxOpacityCompensation = uintBitsToFloat(pushConstants.selectionMaxOpacityCompensationBits);
-    const float minEmissionCompensation = uintBitsToFloat(pushConstants.selectionMinEmissionCompensationBits);
-    const float maxEmissionCompensation = uintBitsToFloat(pushConstants.selectionMaxEmissionCompensationBits);
-    if (opacityCompensation < minOpacityCompensation ||
-        opacityCompensation > maxOpacityCompensation ||
-        emissionCompensation < minEmissionCompensation ||
-        emissionCompensation > maxEmissionCompensation) {
-        return;
-    }
-    const uint representedCount = item.indices.y;
-    if (representedCount < pushConstants.selectionMinRepresentedSourceCount ||
-        representedCount > pushConstants.selectionMaxRepresentedSourceCount) {
-        return;
-    }
+    barrier();
 
-    const uint outputIndex = atomicAdd(stats.count, 1u);
-    outputDrawItems.drawItems[outputIndex] = item;
-
-    const uint footprintBits = floatBitsToUint(item.params.x);
-    const uint mixed = MixWord(sourceIndex ^ (drawIndex * 0x9e3779b9u)) ^
-                       MixWord(representedCount + 0x85ebca6bu) ^
-                       MixWord(footprintBits + 0xc2b2ae35u);
-
-    atomicXor(stats.sourceIndexXor, sourceIndex);
-    atomicXor(stats.representedCountXor, representedCount);
-    atomicXor(stats.footprintXor, footprintBits);
-    atomicAdd(stats.sourceIndexSum, sourceIndex);
-    atomicAdd(stats.representedCountSum, representedCount);
-    atomicXor(stats.drawIndexXor, drawIndex);
-    atomicXor(stats.combinedChecksum, mixed);
+    if (selected) {
+        outputDrawItems.drawItems[groupBase + localOutputIndex] = item;
+    }
 }
