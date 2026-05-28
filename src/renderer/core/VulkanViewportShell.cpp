@@ -166,6 +166,7 @@ struct alignas(16) GpuDrawItemCompactionPushConstants {
     glm::uvec4 areaWindow{0U, 0U, 0U, 0U};
     glm::uvec4 representedSourceWindow{0U, 0U, 0U, 0U};
     glm::uvec4 profileWindow{0U, 0U, 0U, 0U};
+    glm::uvec4 compensationWindow{0U, 0U, 0U, 0U};
 };
 
 std::string NormalizeScalarFieldName(std::string_view name) {
@@ -251,6 +252,10 @@ constexpr float kGpuDiagnosticMinSelectionFootprintAreaPixels = 1.0F;
 constexpr float kGpuDiagnosticMaxSelectionFootprintAreaPixels = 1'048'576.0F;
 constexpr float kGpuDiagnosticMinSelectionRenderAreaPixels = 1.0F;
 constexpr float kGpuDiagnosticMaxSelectionRenderAreaPixels = 1'048'576.0F;
+constexpr float kGpuDiagnosticMinSelectionOpacityCompensation = 0.05F;
+constexpr float kGpuDiagnosticMaxSelectionOpacityCompensation = 8.0F;
+constexpr float kGpuDiagnosticMinSelectionEmissionCompensation = 1.0F;
+constexpr float kGpuDiagnosticMaxSelectionEmissionCompensation = 4.0F;
 constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
@@ -335,6 +340,18 @@ bool DrawItemWithinRepresentedSourceWindow(
     std::uint32_t selectionMaxRepresentedSourceCount) {
     return item.representedSourceCount >= selectionMinRepresentedSourceCount &&
            item.representedSourceCount <= selectionMaxRepresentedSourceCount;
+}
+
+bool DrawItemWithinCompensationWindow(
+    const renderer::pointcloud::PointCloudDrawItemGpu& item,
+    float selectionMinOpacityCompensation,
+    float selectionMaxOpacityCompensation,
+    float selectionMinEmissionCompensation,
+    float selectionMaxEmissionCompensation) {
+    return item.opacityCompensation >= selectionMinOpacityCompensation &&
+           item.opacityCompensation <= selectionMaxOpacityCompensation &&
+           item.emissionCompensation >= selectionMinEmissionCompensation &&
+           item.emissionCompensation <= selectionMaxEmissionCompensation;
 }
 
 bool DrawItemWithinFrustumGuard(
@@ -1220,6 +1237,10 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionSelectionMaxFootprintAreaPixels = 0.0F;
         diagnostics_.adaptiveGpuCompactionSelectionMinRenderAreaPixels = 0.0F;
         diagnostics_.adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
+        diagnostics_.adaptiveGpuCompactionSelectionMinOpacityCompensation = 0.0F;
+        diagnostics_.adaptiveGpuCompactionSelectionMaxOpacityCompensation = 0.0F;
+        diagnostics_.adaptiveGpuCompactionSelectionMinEmissionCompensation = 0.0F;
+        diagnostics_.adaptiveGpuCompactionSelectionMaxEmissionCompensation = 0.0F;
         diagnostics_.adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
         diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
         diagnostics_.adaptiveGpuCompactionSelectionPositionCount = 0;
@@ -1642,6 +1663,10 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionSelectionMaxFootprintAreaPixels = 0.0F;
     diagnostics_.adaptiveGpuCompactionSelectionMinRenderAreaPixels = 0.0F;
     diagnostics_.adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
+    diagnostics_.adaptiveGpuCompactionSelectionMinOpacityCompensation = 0.0F;
+    diagnostics_.adaptiveGpuCompactionSelectionMaxOpacityCompensation = 0.0F;
+    diagnostics_.adaptiveGpuCompactionSelectionMinEmissionCompensation = 0.0F;
+    diagnostics_.adaptiveGpuCompactionSelectionMaxEmissionCompensation = 0.0F;
     diagnostics_.adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
     diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
     diagnostics_.adaptiveGpuCompactionSelectionPositionCount = 0;
@@ -5610,6 +5635,10 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
     float selectionMaxFootprintAreaPixels,
     float selectionMinRenderAreaPixels,
     float selectionMaxRenderAreaPixels,
+    float selectionMinOpacityCompensation,
+    float selectionMaxOpacityCompensation,
+    float selectionMinEmissionCompensation,
+    float selectionMaxEmissionCompensation,
     std::uint32_t selectionMinRepresentedSourceCount,
     std::uint32_t selectionMaxRepresentedSourceCount,
     const glm::mat4& selectionViewProjection,
@@ -5658,6 +5687,14 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
                 selectionMaxFootprintAreaPixels,
                 selectionMinRenderAreaPixels,
                 selectionMaxRenderAreaPixels)) {
+            continue;
+        }
+        if (!DrawItemWithinCompensationWindow(
+                item,
+                selectionMinOpacityCompensation,
+                selectionMaxOpacityCompensation,
+                selectionMinEmissionCompensation,
+                selectionMaxEmissionCompensation)) {
             continue;
         }
         if (!DrawItemWithinRepresentedSourceWindow(
@@ -7017,6 +7054,10 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         constexpr float selectionMaxFootprintAreaPixels = kGpuDiagnosticMaxSelectionFootprintAreaPixels;
         constexpr float selectionMinRenderAreaPixels = kGpuDiagnosticMinSelectionRenderAreaPixels;
         constexpr float selectionMaxRenderAreaPixels = kGpuDiagnosticMaxSelectionRenderAreaPixels;
+        constexpr float selectionMinOpacityCompensation = kGpuDiagnosticMinSelectionOpacityCompensation;
+        constexpr float selectionMaxOpacityCompensation = kGpuDiagnosticMaxSelectionOpacityCompensation;
+        constexpr float selectionMinEmissionCompensation = kGpuDiagnosticMinSelectionEmissionCompensation;
+        constexpr float selectionMaxEmissionCompensation = kGpuDiagnosticMaxSelectionEmissionCompensation;
         constexpr std::uint32_t selectionMinRepresentedSourceCount =
             kGpuDiagnosticMinSelectionRepresentedSourceCount;
         constexpr std::uint32_t selectionMaxRepresentedSourceCount =
@@ -7047,6 +7088,10 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMaxFootprintAreaPixels,
                 selectionMinRenderAreaPixels,
                 selectionMaxRenderAreaPixels,
+                selectionMinOpacityCompensation,
+                selectionMaxOpacityCompensation,
+                selectionMinEmissionCompensation,
+                selectionMaxEmissionCompensation,
                 selectionMinRepresentedSourceCount,
                 selectionMaxRepresentedSourceCount,
                 renderState_.viewProjection,
@@ -7074,7 +7119,12 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMaxRepresentedSourceCount,
                 selectionPositionCount,
                 FloatBits(selectionFrustumGuardBand)},
-            glm::uvec4{selectionProfileMask, 0U, 0U, 0U}};
+            glm::uvec4{selectionProfileMask, 0U, 0U, 0U},
+            glm::uvec4{
+                FloatBits(selectionMinOpacityCompensation),
+                FloatBits(selectionMaxOpacityCompensation),
+                FloatBits(selectionMinEmissionCompensation),
+                FloatBits(selectionMaxEmissionCompensation)}};
         VkDescriptorSet descriptorSet = plan.resources->gpuCompactionDescriptorSets[frameIndex];
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -7206,6 +7256,18 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuCompactionSelectionMaxRenderAreaPixels = std::max(
             diagnostics_.adaptiveGpuCompactionSelectionMaxRenderAreaPixels,
             selectionMaxRenderAreaPixels);
+        diagnostics_.adaptiveGpuCompactionSelectionMinOpacityCompensation = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionMinOpacityCompensation,
+            selectionMinOpacityCompensation);
+        diagnostics_.adaptiveGpuCompactionSelectionMaxOpacityCompensation = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionMaxOpacityCompensation,
+            selectionMaxOpacityCompensation);
+        diagnostics_.adaptiveGpuCompactionSelectionMinEmissionCompensation = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionMinEmissionCompensation,
+            selectionMinEmissionCompensation);
+        diagnostics_.adaptiveGpuCompactionSelectionMaxEmissionCompensation = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionMaxEmissionCompensation,
+            selectionMaxEmissionCompensation);
         diagnostics_.adaptiveGpuCompactionSelectionMinRepresentedSourceCount = std::max(
             diagnostics_.adaptiveGpuCompactionSelectionMinRepresentedSourceCount,
             selectionMinRepresentedSourceCount);

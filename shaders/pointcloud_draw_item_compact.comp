@@ -28,6 +28,10 @@ layout(push_constant) uniform CompactionPushConstants {
     uint reserved0;
     uint reserved1;
     uint reserved2;
+    uint selectionMinOpacityCompensationBits;
+    uint selectionMaxOpacityCompensationBits;
+    uint selectionMinEmissionCompensationBits;
+    uint selectionMaxEmissionCompensationBits;
 } pushConstants;
 
 layout(set = 0, binding = 3) uniform FrameUniforms {
@@ -113,6 +117,18 @@ void main() {
         footprintArea > maxFootprintArea ||
         renderArea < minRenderArea ||
         renderArea > maxRenderArea) {
+        return;
+    }
+    const float opacityCompensation = item.params.y;
+    const float emissionCompensation = item.params.z;
+    const float minOpacityCompensation = uintBitsToFloat(pushConstants.selectionMinOpacityCompensationBits);
+    const float maxOpacityCompensation = uintBitsToFloat(pushConstants.selectionMaxOpacityCompensationBits);
+    const float minEmissionCompensation = uintBitsToFloat(pushConstants.selectionMinEmissionCompensationBits);
+    const float maxEmissionCompensation = uintBitsToFloat(pushConstants.selectionMaxEmissionCompensationBits);
+    if (opacityCompensation < minOpacityCompensation ||
+        opacityCompensation > maxOpacityCompensation ||
+        emissionCompensation < minEmissionCompensation ||
+        emissionCompensation > maxEmissionCompensation) {
         return;
     }
     const uint representedCount = item.indices.y;

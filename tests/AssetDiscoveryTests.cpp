@@ -2988,6 +2988,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("selectionRejectedFlags") != std::string::npos);
     CHECK(compactionShader.find("selectionMinFootprintAreaBits") != std::string::npos);
     CHECK(compactionShader.find("selectionMaxRenderAreaBits") != std::string::npos);
+    CHECK(compactionShader.find("selectionMinOpacityCompensationBits") != std::string::npos);
+    CHECK(compactionShader.find("selectionMaxEmissionCompensationBits") != std::string::npos);
     CHECK(compactionShader.find("selectionMinRepresentedSourceCount") != std::string::npos);
     CHECK(compactionShader.find("selectionMaxRepresentedSourceCount") != std::string::npos);
     CHECK(compactionShader.find("selectionPositionCount") != std::string::npos);
@@ -3009,6 +3011,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("const float footprintArea = item.params.x") != std::string::npos);
     CHECK(compactionShader.find("uintBitsToFloat(pushConstants.selectionMinFootprintAreaBits)") != std::string::npos);
     CHECK(compactionShader.find("renderArea > maxRenderArea") != std::string::npos);
+    CHECK(compactionShader.find("const float opacityCompensation = item.params.y") != std::string::npos);
+    CHECK(compactionShader.find("const float emissionCompensation = item.params.z") != std::string::npos);
     CHECK(compactionShader.find("representedCount < pushConstants.selectionMinRepresentedSourceCount") != std::string::npos);
     CHECK(compactionShader.find("if (frustumGuardBand > 0.0)") != std::string::npos);
     CHECK(compactionShader.find("sourceIndex >= pushConstants.selectionPositionCount") != std::string::npos);
@@ -3021,6 +3025,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(metadataCompactionShader.find("layout(local_size_x = 64") != std::string::npos);
     CHECK(metadataCompactionShader.find("selectionFrustumGuardBandBits") != std::string::npos);
     CHECK(metadataCompactionShader.find("selectionProfileMask") != std::string::npos);
+    CHECK(metadataCompactionShader.find("selectionMinOpacityCompensationBits") != std::string::npos);
     CHECK(metadataCompactionShader.find("uniforms.viewProjection") == std::string::npos);
     CHECK(metadataCompactionShader.find("pointPositions.positions") == std::string::npos);
     CHECK(metadataCompactionShader.find("outputDrawItems.drawItems") != std::string::npos);
@@ -3043,6 +3048,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionRejectedFlags") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMinFootprintAreaPixels") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMaxRenderAreaPixels") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMinOpacityCompensation") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMaxEmissionCompensation") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMinRepresentedSourceCount") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMaxRepresentedSourceCount") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionFrustumGuardBand") != std::string::npos);
@@ -3072,12 +3079,14 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionDepth") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRequiredSelectionFlags") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionFootprintAreaPixels") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticMinSelectionOpacityCompensation") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionRepresentedSourceCount") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumGuardBand") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumGuardEnabled") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumFallbackReason") != std::string::npos);
     CHECK(rendererSource.find("pointcloud_draw_item_compact_metadata.comp.spv") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinProjectedAreaWindow") != std::string::npos);
+    CHECK(rendererSource.find("DrawItemWithinCompensationWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinRepresentedSourceWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinFrustumGuard") != std::string::npos);
     CHECK(rendererSource.find("cpuReferenceStart") != std::string::npos);
@@ -3099,6 +3108,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_compaction_selection_min_depth") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_min_footprint_area_pixels") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_max_render_area_pixels") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_min_opacity_compensation") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_max_emission_compensation") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_min_represented_source_count") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_frustum_guard_band") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_frustum_enabled") != std::string::npos);
@@ -3115,6 +3126,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("beauty_stress_compaction_selection_min_depth") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_min_footprint_area_pixels") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_max_render_area_pixels") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_min_opacity_compensation") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_max_emission_compensation") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_min_represented_source_count") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_frustum_guard_band") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_frustum_enabled") != std::string::npos);

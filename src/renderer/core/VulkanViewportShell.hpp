@@ -150,6 +150,10 @@ struct ViewportDiagnostics {
     float adaptiveGpuCompactionSelectionMaxFootprintAreaPixels = 0.0F;
     float adaptiveGpuCompactionSelectionMinRenderAreaPixels = 0.0F;
     float adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
+    float adaptiveGpuCompactionSelectionMinOpacityCompensation = 0.0F;
+    float adaptiveGpuCompactionSelectionMaxOpacityCompensation = 0.0F;
+    float adaptiveGpuCompactionSelectionMinEmissionCompensation = 0.0F;
+    float adaptiveGpuCompactionSelectionMaxEmissionCompensation = 0.0F;
     std::uint32_t adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
     std::uint32_t adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
     std::uint32_t adaptiveGpuCompactionSelectionPositionCount = 0;
@@ -639,6 +643,10 @@ class VulkanViewportShell {
         float selectionMaxFootprintAreaPixels,
         float selectionMinRenderAreaPixels,
         float selectionMaxRenderAreaPixels,
+        float selectionMinOpacityCompensation,
+        float selectionMaxOpacityCompensation,
+        float selectionMinEmissionCompensation,
+        float selectionMaxEmissionCompensation,
         std::uint32_t selectionMinRepresentedSourceCount,
         std::uint32_t selectionMaxRepresentedSourceCount,
         const glm::mat4& selectionViewProjection,

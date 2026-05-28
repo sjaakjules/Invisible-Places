@@ -255,7 +255,7 @@ sample-count cap anymore.
   profiles, radius/opacity/emission ranges, estimated vertex/fragment/
   blended-fragment costs, clamp flags, raw/EWMA GPU point-pass timings, governor
   budget scale, timestamp support/fallback state, tile pressure and conservative
-  culling fields, GPU prefix-compaction profile-mask/frustum enabled/guard/fallback/position-count fields,
+  culling fields, GPU prefix-compaction profile-mask/opacity-window/emission-window/frustum enabled/guard/fallback/position-count fields,
   CPU-reference timing, GPU timing, performance status,
   Beauty stress metrics, and colour, scalar, normal, and
   emissive/accent feature-triggered refinement counts.
@@ -399,9 +399,10 @@ sample-count cap anymore.
   support plus indirect-count support; the runtime path now reports
   `cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect` for eligible
   viewport draws when diagnostics are enabled because a compute shader
-  decodes draw-item renderer profile/class/rank/depth/clamp-flag plus represented-count and
-  projected-footprint/render-area metadata, prefix-filters performance-clamped
-  renderer-profile-matched represented-count-limited projected-footprint depth-windowed rank-limited feature
+  decodes draw-item renderer profile/class/rank/depth/clamp-flag plus represented-count,
+  projected-footprint/render-area metadata, and opacity/emission compensation,
+  prefix-filters performance-clamped renderer-profile-matched compensation-windowed
+  represented-count-limited projected-footprint depth-windowed rank-limited feature
   representatives, compacts, checksums CPU-selected draw items, and converts
   the compacted GPU count to a diagnostic indirect command. The submitted
   indirect command remains CPU-count driven until full CPU/GPU compute-selection
@@ -414,16 +415,17 @@ sample-count cap anymore.
   Fast Basic recorded 1 metadata prefix dispatch
   over 262,115 CPU-selected draw items, checked a 131,057-item prefix with profile
   mask 1, class mask 126, rank limit 1023, depth window 2-255, required flags 4, and rejected
-  flags 0, represented-count window 2-4,294,967,295 and projected footprint/render
-  area window 1-1.04858e+06 px, compacted up to 5,515 items, measured
-  0.617625 ms for the CPU reference predicate and 1.9305 ms for GPU compaction,
-  matched previous-frame CPU/GPU count 3,837 with checksum 1,840,937,211,
-  matched compacted indirect CPU/GPU vertices 3,837 / 3,837, plus 1 CPU-count
-  GPU indirect-command dispatch at 3.29479 ms. Beauty stress recorded 1 matching
+  flags 0, opacity window 0.05-8, emission window 1-4, represented-count window
+  2-4,294,967,295 and projected footprint/render area window 1-1.04858e+06 px,
+  compacted up to 4,626 items, measured 0.572292 ms for the CPU reference
+  predicate and 1.94908 ms for GPU compaction, matched previous-frame CPU/GPU
+  count 3,139 with checksum 1,197,028,360, matched compacted indirect CPU/GPU
+  vertices 3,139 / 3,139, plus 1 CPU-count GPU indirect-command dispatch at
+  1.93562 ms. Beauty stress recorded 1 matching
   metadata prefix dispatch over 262,132 draw items, checked a 131,066-item prefix
   with profile mask 2, class mask 126, rank limit 1023, depth window 2-255,
   required flags 4, and rejected flags 0, compacted up to 4,318 items, measured
-  0.593167 ms for the CPU reference predicate and 1.80713 ms for GPU compaction, matched
+  0.529917 ms for the CPU reference predicate and 4.281 ms for GPU compaction, matched
   previous-frame CPU/GPU count 2,301 with checksum 933,328,382, and matched
   compacted indirect CPU/GPU vertices 2,301 / 2,301. The prior frustum shader measurement was
   13.6525 ms in Fast Basic and 8.31621 ms in Beauty stress, so it remains
@@ -717,7 +719,7 @@ Metrics to watch:
 - tiles over budget
 - culled hidden nodes
 - compute selection ms
-- GPU prefix-selection/compaction parity/status/input/selection/profile-mask/class-mask/rank-limit/depth-window/projected-footprint-window/represented-source-count-window/frustum-enabled/frustum-guard/frustum-fallback-reason/position-count/required-flags/rejected-flags/count/checksum/CPU-reference-ms/GPU-ms/performance-status
+- GPU prefix-selection/compaction parity/status/input/selection/profile-mask/class-mask/rank-limit/depth-window/projected-footprint-window/opacity-window/emission-window/represented-source-count-window/frustum-enabled/frustum-guard/frustum-fallback-reason/position-count/required-flags/rejected-flags/count/checksum/CPU-reference-ms/GPU-ms/performance-status
 - diagnostic compacted-indirect command parity/dispatch/CPU-vs-GPU vertices
 - indirect draw count
 - GPU-selection path/fallback/parity status
