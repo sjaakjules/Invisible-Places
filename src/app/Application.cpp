@@ -21426,6 +21426,21 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuRepresentedCountProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuRepresentedCountProbeMs);
                     }
+                    if (diagnostics.adaptiveGpuCoverageCompensationProbeUsed ||
+                        diagnostics.adaptiveGpuCoverageCompensationProbeParityStatus != "not checked" ||
+                        diagnostics.adaptiveGpuCoverageCompensationProbeMs > 0.0) {
+                        ImGui::Text(
+                            "GPU coverage-compensation probe: %s | opacity %.2f-%.2f emission %.2f-%.2f | %u/%u items | cpu %.3f ms gpu %.3f ms",
+                            diagnostics.adaptiveGpuCoverageCompensationProbeParityStatus.c_str(),
+                            diagnostics.adaptiveGpuCoverageCompensationProbeMinOpacityCompensation,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeMaxOpacityCompensation,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeMinEmissionCompensation,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeMaxEmissionCompensation,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeGpuCount,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeCpuCount,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeCpuReferenceMs,
+                            diagnostics.adaptiveGpuCoverageCompensationProbeMs);
+                    }
                     ImGui::Text(
                         "GPU compacted submission: %s | %u/%u vertices",
                         diagnostics.adaptiveGpuCompactionSubmissionUsed
@@ -22460,6 +22475,21 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuRepresentedCountProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuRepresentedCountProbeMs = 0.0;
+    bool fastBasicGpuCoverageCompensationProbeUsed = false;
+    std::string fastBasicGpuCoverageCompensationProbeParityStatus = "not checked";
+    std::uint32_t fastBasicMaxGpuCoverageCompensationProbeDispatches = 0;
+    float fastBasicMaxGpuCoverageCompensationProbeMinOpacityCompensation = 0.0F;
+    float fastBasicMaxGpuCoverageCompensationProbeMaxOpacityCompensation = 0.0F;
+    float fastBasicMaxGpuCoverageCompensationProbeMinEmissionCompensation = 0.0F;
+    float fastBasicMaxGpuCoverageCompensationProbeMaxEmissionCompensation = 0.0F;
+    std::uint32_t fastBasicGpuCoverageCompensationProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuCoverageCompensationProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuCoverageCompensationProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuCoverageCompensationProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuCoverageCompensationProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuCoverageCompensationProbeGpuSourceFingerprint = 0;
+    double fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs = 0.0;
+    double fastBasicMaxGpuCoverageCompensationProbeMs = 0.0;
     bool fastBasicGpuCompactionSubmissionEligible = false;
     bool fastBasicGpuCompactionSubmissionUsed = false;
     std::string fastBasicGpuCompactionSubmissionFallbackReason;
@@ -22997,6 +23027,51 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuRepresentedCountProbeMs = std::max(
             fastBasicMaxGpuRepresentedCountProbeMs,
             diagnostics.adaptiveGpuRepresentedCountProbeMs);
+        fastBasicGpuCoverageCompensationProbeUsed =
+            fastBasicGpuCoverageCompensationProbeUsed ||
+            diagnostics.adaptiveGpuCoverageCompensationProbeUsed;
+        if (diagnostics.adaptiveGpuCoverageCompensationProbeParityStatus != "not checked") {
+            fastBasicGpuCoverageCompensationProbeParityStatus =
+                diagnostics.adaptiveGpuCoverageCompensationProbeParityStatus;
+        }
+        fastBasicMaxGpuCoverageCompensationProbeDispatches = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeDispatches,
+            diagnostics.adaptiveGpuCoverageCompensationProbeDispatches);
+        fastBasicMaxGpuCoverageCompensationProbeMinOpacityCompensation = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeMinOpacityCompensation,
+            diagnostics.adaptiveGpuCoverageCompensationProbeMinOpacityCompensation);
+        fastBasicMaxGpuCoverageCompensationProbeMaxOpacityCompensation = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeMaxOpacityCompensation,
+            diagnostics.adaptiveGpuCoverageCompensationProbeMaxOpacityCompensation);
+        fastBasicMaxGpuCoverageCompensationProbeMinEmissionCompensation = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeMinEmissionCompensation,
+            diagnostics.adaptiveGpuCoverageCompensationProbeMinEmissionCompensation);
+        fastBasicMaxGpuCoverageCompensationProbeMaxEmissionCompensation = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeMaxEmissionCompensation,
+            diagnostics.adaptiveGpuCoverageCompensationProbeMaxEmissionCompensation);
+        const bool hasFastBasicCoverageCompensationProbeCounts =
+            diagnostics.adaptiveGpuCoverageCompensationProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuCoverageCompensationProbeGpuCount != 0U;
+        if (hasFastBasicCoverageCompensationProbeCounts) {
+            fastBasicGpuCoverageCompensationProbeCpuCount =
+                diagnostics.adaptiveGpuCoverageCompensationProbeCpuCount;
+            fastBasicGpuCoverageCompensationProbeGpuCount =
+                diagnostics.adaptiveGpuCoverageCompensationProbeGpuCount;
+            fastBasicGpuCoverageCompensationProbeCpuChecksum =
+                diagnostics.adaptiveGpuCoverageCompensationProbeCpuChecksum;
+            fastBasicGpuCoverageCompensationProbeGpuChecksum =
+                diagnostics.adaptiveGpuCoverageCompensationProbeGpuChecksum;
+            fastBasicGpuCoverageCompensationProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuCoverageCompensationProbeCpuSourceFingerprint;
+            fastBasicGpuCoverageCompensationProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuCoverageCompensationProbeGpuSourceFingerprint;
+        }
+        fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs,
+            diagnostics.adaptiveGpuCoverageCompensationProbeCpuReferenceMs);
+        fastBasicMaxGpuCoverageCompensationProbeMs = std::max(
+            fastBasicMaxGpuCoverageCompensationProbeMs,
+            diagnostics.adaptiveGpuCoverageCompensationProbeMs);
         fastBasicGpuCompactionSubmissionEligible =
             fastBasicGpuCompactionSubmissionEligible ||
             diagnostics.adaptiveGpuCompactionSubmissionEligible;
@@ -24273,6 +24348,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                    ? std::string{"GPU represented-count probe faster than CPU reference"}
                    : std::string{"CPU reference faster; represented-count probe remains compare-only"};
     };
+    const auto gpuCoverageCompensationProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU coverage-compensation probe faster than CPU reference"}
+                   : std::string{"CPU reference faster; coverage-compensation probe remains compare-only"};
+    };
     const auto fastBasicGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(fastBasicMaxGpuCompactionCpuReferenceMs, fastBasicMaxGpuCompactionMs);
     const auto fastBasicGpuFeatureClassProbePerformanceStatus =
@@ -24291,6 +24377,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         gpuRepresentedCountProbePerformanceStatus(
             fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs,
             fastBasicMaxGpuRepresentedCountProbeMs);
+    const auto fastBasicGpuCoverageCompensationProbePerformanceStatus =
+        gpuCoverageCompensationProbePerformanceStatus(
+            fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs,
+            fastBasicMaxGpuCoverageCompensationProbeMs);
     const auto beautyStressGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(beautyStress.maxGpuCompactionCpuReferenceMs, beautyStress.maxGpuCompactionMs);
     const auto writeGpuCompactionClassCountMetrics =
@@ -24560,6 +24650,38 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuRepresentedCountProbeMs << ",\n"
                 << "  \"gpu_represented_count_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuRepresentedCountProbePerformanceStatus) << ",\n"
+                << "  \"gpu_coverage_compensation_probe_used\": "
+                << (fastBasicGpuCoverageCompensationProbeUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_coverage_compensation_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuCoverageCompensationProbeParityStatus) << ",\n"
+                << "  \"gpu_coverage_compensation_probe_dispatches\": "
+                << fastBasicMaxGpuCoverageCompensationProbeDispatches << ",\n"
+                << "  \"gpu_coverage_compensation_probe_min_opacity_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMinOpacityCompensation << ",\n"
+                << "  \"gpu_coverage_compensation_probe_max_opacity_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMaxOpacityCompensation << ",\n"
+                << "  \"gpu_coverage_compensation_probe_min_emission_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMinEmissionCompensation << ",\n"
+                << "  \"gpu_coverage_compensation_probe_max_emission_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMaxEmissionCompensation << ",\n"
+                << "  \"gpu_coverage_compensation_probe_cpu_count\": "
+                << fastBasicGpuCoverageCompensationProbeCpuCount << ",\n"
+                << "  \"gpu_coverage_compensation_probe_gpu_count\": "
+                << fastBasicGpuCoverageCompensationProbeGpuCount << ",\n"
+                << "  \"gpu_coverage_compensation_probe_cpu_checksum\": "
+                << fastBasicGpuCoverageCompensationProbeCpuChecksum << ",\n"
+                << "  \"gpu_coverage_compensation_probe_gpu_checksum\": "
+                << fastBasicGpuCoverageCompensationProbeGpuChecksum << ",\n"
+                << "  \"gpu_coverage_compensation_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuCoverageCompensationProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_coverage_compensation_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuCoverageCompensationProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_coverage_compensation_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs << ",\n"
+                << "  \"gpu_coverage_compensation_probe_ms\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMs << ",\n"
+                << "  \"gpu_coverage_compensation_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuCoverageCompensationProbePerformanceStatus) << ",\n"
                 << "  \"gpu_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"gpu_compaction_submission_used\": "
@@ -25347,6 +25469,38 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuRepresentedCountProbeMs << ",\n"
                 << "  \"fast_basic_represented_count_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuRepresentedCountProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_used\": "
+                << (fastBasicGpuCoverageCompensationProbeUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuCoverageCompensationProbeParityStatus) << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_dispatches\": "
+                << fastBasicMaxGpuCoverageCompensationProbeDispatches << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_min_opacity_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMinOpacityCompensation << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_max_opacity_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMaxOpacityCompensation << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_min_emission_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMinEmissionCompensation << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_max_emission_compensation\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMaxEmissionCompensation << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_cpu_count\": "
+                << fastBasicGpuCoverageCompensationProbeCpuCount << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_gpu_count\": "
+                << fastBasicGpuCoverageCompensationProbeGpuCount << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_cpu_checksum\": "
+                << fastBasicGpuCoverageCompensationProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_gpu_checksum\": "
+                << fastBasicGpuCoverageCompensationProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuCoverageCompensationProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuCoverageCompensationProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_ms\": "
+                << fastBasicMaxGpuCoverageCompensationProbeMs << ",\n"
+                << "  \"fast_basic_coverage_compensation_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuCoverageCompensationProbePerformanceStatus) << ",\n"
                 << "  \"fast_basic_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"fast_basic_compaction_submission_used\": "
@@ -25552,6 +25706,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " gpu/cpu items, cpu " << fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs
               << " ms, gpu " << fastBasicMaxGpuRepresentedCountProbeMs
               << " ms, " << fastBasicGpuRepresentedCountProbePerformanceStatus
+              << ")"
+              << " | gpu coverage-compensation probe: "
+              << (fastBasicGpuCoverageCompensationProbeUsed ? "yes" : "no")
+              << " (" << fastBasicGpuCoverageCompensationProbeParityStatus
+              << ", opacity >= " << fastBasicMaxGpuCoverageCompensationProbeMinOpacityCompensation
+              << ", emission >= " << fastBasicMaxGpuCoverageCompensationProbeMinEmissionCompensation
+              << ", " << fastBasicGpuCoverageCompensationProbeGpuCount
+              << "/" << fastBasicGpuCoverageCompensationProbeCpuCount
+              << " gpu/cpu items, cpu " << fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuCoverageCompensationProbeMs
+              << " ms, " << fastBasicGpuCoverageCompensationProbePerformanceStatus
               << ")"
               << " | gpu compacted indirect: "
               << (fastBasicGpuCompactionIndirectCommandUsed ? "yes" : "no")
