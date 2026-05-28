@@ -3233,8 +3233,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticRepresentedCountProbeMin") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCoverageCompensationProbeMinOpacity") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticClampFlagsProbeRequiredFlags") != std::string::npos);
+    CHECK(rendererSource.find("PointCloudLodRepresentativeClassSpatialCoverage") != std::string::npos);
     CHECK(rendererSource.find("PointCloudLodRepresentativeClassColorContrast") != std::string::npos);
     CHECK(rendererSource.find("PointCloudLodRepresentativeClassEmissiveAccent") != std::string::npos);
+    CHECK(rendererSource.find("PointCloudLodRepresentativeClassBlueNoiseFill") != std::string::npos);
     CHECK(rendererSource.find("pointcloud_draw_item_compact_metadata.comp.spv") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinProjectedAreaWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinCompensationWindow") != std::string::npos);

@@ -244,7 +244,15 @@ constexpr std::uint32_t kMinimumAdaptiveIndirectDrawPoints = 4096U;
 constexpr std::uint32_t kGpuIndirectCommandModeFromPushConstants = 0U;
 constexpr std::uint32_t kGpuIndirectCommandModeFromCompactionStats = 1U;
 constexpr std::uint32_t kDrawItemMetadataRankMask = 0x7ffU;
-constexpr std::uint32_t kGpuDiagnosticSemanticSelectionClassMask = 0U;
+constexpr std::uint32_t kGpuDiagnosticSemanticSelectionClassMask =
+    renderer::pointcloud::PointCloudLodRepresentativeClassSpatialCoverage |
+    renderer::pointcloud::PointCloudLodRepresentativeClassColorContrast |
+    renderer::pointcloud::PointCloudLodRepresentativeClassNormalEdge |
+    renderer::pointcloud::PointCloudLodRepresentativeClassScalarMin |
+    renderer::pointcloud::PointCloudLodRepresentativeClassScalarMax |
+    renderer::pointcloud::PointCloudLodRepresentativeClassScalarThreshold |
+    renderer::pointcloud::PointCloudLodRepresentativeClassEmissiveAccent |
+    renderer::pointcloud::PointCloudLodRepresentativeClassBlueNoiseFill;
 constexpr std::uint32_t kGpuDiagnosticSemanticSelectionProfileMask = 0U;
 constexpr std::uint32_t kGpuDiagnosticRankSelectionLimit = kDrawItemMetadataRankMask;
 constexpr std::uint32_t kDrawItemMetadataDepthShift = 24U;
