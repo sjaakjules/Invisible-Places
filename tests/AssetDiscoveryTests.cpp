@@ -3099,6 +3099,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuRankProbeLimit") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuRankProbeCpuReferenceMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuRankProbeMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuDepthProbeUsed") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuDepthProbeParityStatus") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuDepthProbeMinDepth") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuDepthProbeCpuReferenceMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuDepthProbeMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuProjectedAreaProbeUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuProjectedAreaProbeParityStatus") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuProjectedAreaProbeMinFootprintAreaPixels") != std::string::npos);
@@ -3135,6 +3140,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("gpuRankProbeStatsBuffers") != std::string::npos);
     CHECK(rendererHeader.find("gpuRankProbeDescriptorSets") != std::string::npos);
     CHECK(rendererHeader.find("gpuRankProbeExpectedStats") != std::string::npos);
+    CHECK(rendererHeader.find("gpuDepthProbeStatsBuffers") != std::string::npos);
+    CHECK(rendererHeader.find("gpuDepthProbeDescriptorSets") != std::string::npos);
+    CHECK(rendererHeader.find("gpuDepthProbeExpectedStats") != std::string::npos);
     CHECK(rendererHeader.find("gpuProjectedAreaProbeStatsBuffers") != std::string::npos);
     CHECK(rendererHeader.find("gpuProjectedAreaProbeDescriptorSets") != std::string::npos);
     CHECK(rendererHeader.find("gpuProjectedAreaProbeExpectedStats") != std::string::npos);
@@ -3144,7 +3152,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("gpuCoverageCompensationProbeStatsBuffers") != std::string::npos);
     CHECK(rendererHeader.find("gpuCoverageCompensationProbeDescriptorSets") != std::string::npos);
     CHECK(rendererHeader.find("gpuCoverageCompensationProbeExpectedStats") != std::string::npos);
-    CHECK(rendererHeader.find("std::array<bool, 12U> timestampPassWritten") != std::string::npos);
+    CHECK(rendererHeader.find("std::array<bool, 13U> timestampPassWritten") != std::string::npos);
     CHECK(rendererHeader.find("gpuCompactionSubmissionEligible") != std::string::npos);
     CHECK(rendererHeader.find("gpuCompactionSubmissionVertexCounts") != std::string::npos);
     CHECK(rendererSource.find("vkCreateComputePipelines") != std::string::npos);
@@ -3154,6 +3162,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuTimestampGpuDrawItemCompactionPass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuFeatureClassProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuRankProbePass") != std::string::npos);
+    CHECK(rendererSource.find("kGpuTimestampGpuDepthProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuProjectedAreaProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuRepresentedCountProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuCoverageCompensationProbePass") != std::string::npos);
@@ -3204,6 +3213,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumFallbackReason") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticFeatureClassProbeMask") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRankProbeLimit") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticDepthProbeMin") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticProjectedAreaProbeMinFootprintAreaPixels") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRepresentedCountProbeMin") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCoverageCompensationProbeMinOpacity") != std::string::npos);
@@ -3234,6 +3244,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("gpuRankProbeResultPending") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame stable-rank prefix count/source-fingerprint/checksum/class-counts") != std::string::npos);
     CHECK(rendererSource.find("waiting for previous-frame stable-rank prefix GPU checksum") != std::string::npos);
+    CHECK(rendererSource.find("UpdateGpuDepthProbeDescriptorSet") != std::string::npos);
+    CHECK(rendererSource.find("gpuDepthProbeResultPending") != std::string::npos);
+    CHECK(rendererSource.find("passed previous-frame hierarchy-depth window count/source-fingerprint/checksum/class-counts") != std::string::npos);
+    CHECK(rendererSource.find("waiting for previous-frame hierarchy-depth GPU checksum") != std::string::npos);
     CHECK(rendererSource.find("UpdateGpuProjectedAreaProbeDescriptorSet") != std::string::npos);
     CHECK(rendererSource.find("gpuProjectedAreaProbeResultPending") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame projected-area window count/source-fingerprint/checksum/class-counts") != std::string::npos);
@@ -3281,6 +3295,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_rank_probe_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_rank_probe_performance_status") != std::string::npos);
     CHECK(appSource.find("GPU stable-rank prefix probe") != std::string::npos);
+    CHECK(appSource.find("gpu_depth_probe_used") != std::string::npos);
+    CHECK(appSource.find("gpu_depth_probe_performance_status") != std::string::npos);
+    CHECK(appSource.find("fast_basic_depth_probe_used") != std::string::npos);
+    CHECK(appSource.find("fast_basic_depth_probe_performance_status") != std::string::npos);
+    CHECK(appSource.find("GPU hierarchy-depth probe") != std::string::npos);
     CHECK(appSource.find("gpu_projected_area_probe_used") != std::string::npos);
     CHECK(appSource.find("gpu_projected_area_probe_performance_status") != std::string::npos);
     CHECK(appSource.find("fast_basic_projected_area_probe_used") != std::string::npos);

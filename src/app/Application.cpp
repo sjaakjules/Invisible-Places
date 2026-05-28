@@ -21400,6 +21400,19 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuRankProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuRankProbeMs);
                     }
+                    if (diagnostics.adaptiveGpuDepthProbeUsed ||
+                        diagnostics.adaptiveGpuDepthProbeParityStatus != "not checked" ||
+                        diagnostics.adaptiveGpuDepthProbeMs > 0.0) {
+                        ImGui::Text(
+                            "GPU hierarchy-depth probe: %s | depth %u-%u | %u/%u items | cpu %.3f ms gpu %.3f ms",
+                            diagnostics.adaptiveGpuDepthProbeParityStatus.c_str(),
+                            diagnostics.adaptiveGpuDepthProbeMinDepth,
+                            diagnostics.adaptiveGpuDepthProbeMaxDepth,
+                            diagnostics.adaptiveGpuDepthProbeGpuCount,
+                            diagnostics.adaptiveGpuDepthProbeCpuCount,
+                            diagnostics.adaptiveGpuDepthProbeCpuReferenceMs,
+                            diagnostics.adaptiveGpuDepthProbeMs);
+                    }
                     if (diagnostics.adaptiveGpuProjectedAreaProbeUsed ||
                         diagnostics.adaptiveGpuProjectedAreaProbeParityStatus != "not checked" ||
                         diagnostics.adaptiveGpuProjectedAreaProbeMs > 0.0) {
@@ -22447,6 +22460,19 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuRankProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuRankProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuRankProbeMs = 0.0;
+    bool fastBasicGpuDepthProbeUsed = false;
+    std::string fastBasicGpuDepthProbeParityStatus = "not checked";
+    std::uint32_t fastBasicMaxGpuDepthProbeDispatches = 0;
+    std::uint32_t fastBasicMaxGpuDepthProbeMinDepth = 0;
+    std::uint32_t fastBasicMaxGpuDepthProbeMaxDepth = 0;
+    std::uint32_t fastBasicGpuDepthProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuDepthProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuDepthProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuDepthProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuDepthProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuDepthProbeGpuSourceFingerprint = 0;
+    double fastBasicMaxGpuDepthProbeCpuReferenceMs = 0.0;
+    double fastBasicMaxGpuDepthProbeMs = 0.0;
     bool fastBasicGpuProjectedAreaProbeUsed = false;
     std::string fastBasicGpuProjectedAreaProbeParityStatus = "not checked";
     std::uint32_t fastBasicMaxGpuProjectedAreaProbeDispatches = 0;
@@ -22943,6 +22969,44 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuRankProbeMs = std::max(
             fastBasicMaxGpuRankProbeMs,
             diagnostics.adaptiveGpuRankProbeMs);
+        fastBasicGpuDepthProbeUsed =
+            fastBasicGpuDepthProbeUsed || diagnostics.adaptiveGpuDepthProbeUsed;
+        if (diagnostics.adaptiveGpuDepthProbeParityStatus != "not checked") {
+            fastBasicGpuDepthProbeParityStatus =
+                diagnostics.adaptiveGpuDepthProbeParityStatus;
+        }
+        fastBasicMaxGpuDepthProbeDispatches = std::max(
+            fastBasicMaxGpuDepthProbeDispatches,
+            diagnostics.adaptiveGpuDepthProbeDispatches);
+        fastBasicMaxGpuDepthProbeMinDepth = std::max(
+            fastBasicMaxGpuDepthProbeMinDepth,
+            diagnostics.adaptiveGpuDepthProbeMinDepth);
+        fastBasicMaxGpuDepthProbeMaxDepth = std::max(
+            fastBasicMaxGpuDepthProbeMaxDepth,
+            diagnostics.adaptiveGpuDepthProbeMaxDepth);
+        const bool hasFastBasicDepthProbeCounts =
+            diagnostics.adaptiveGpuDepthProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuDepthProbeGpuCount != 0U;
+        if (hasFastBasicDepthProbeCounts) {
+            fastBasicGpuDepthProbeCpuCount =
+                diagnostics.adaptiveGpuDepthProbeCpuCount;
+            fastBasicGpuDepthProbeGpuCount =
+                diagnostics.adaptiveGpuDepthProbeGpuCount;
+            fastBasicGpuDepthProbeCpuChecksum =
+                diagnostics.adaptiveGpuDepthProbeCpuChecksum;
+            fastBasicGpuDepthProbeGpuChecksum =
+                diagnostics.adaptiveGpuDepthProbeGpuChecksum;
+            fastBasicGpuDepthProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuDepthProbeCpuSourceFingerprint;
+            fastBasicGpuDepthProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuDepthProbeGpuSourceFingerprint;
+        }
+        fastBasicMaxGpuDepthProbeCpuReferenceMs = std::max(
+            fastBasicMaxGpuDepthProbeCpuReferenceMs,
+            diagnostics.adaptiveGpuDepthProbeCpuReferenceMs);
+        fastBasicMaxGpuDepthProbeMs = std::max(
+            fastBasicMaxGpuDepthProbeMs,
+            diagnostics.adaptiveGpuDepthProbeMs);
         fastBasicGpuProjectedAreaProbeUsed =
             fastBasicGpuProjectedAreaProbeUsed ||
             diagnostics.adaptiveGpuProjectedAreaProbeUsed;
@@ -24326,6 +24390,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                    ? std::string{"GPU stable-rank prefix probe faster than CPU reference"}
                    : std::string{"CPU reference faster; stable-rank prefix probe remains compare-only"};
     };
+    const auto gpuDepthProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU hierarchy-depth probe faster than CPU reference"}
+                   : std::string{"CPU reference faster; hierarchy-depth probe remains compare-only"};
+    };
     const auto gpuProjectedAreaProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
         if (gpuMs <= 0.0) {
             return std::string{"not measured"};
@@ -24369,6 +24444,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         gpuRankProbePerformanceStatus(
             fastBasicMaxGpuRankProbeCpuReferenceMs,
             fastBasicMaxGpuRankProbeMs);
+    const auto fastBasicGpuDepthProbePerformanceStatus =
+        gpuDepthProbePerformanceStatus(
+            fastBasicMaxGpuDepthProbeCpuReferenceMs,
+            fastBasicMaxGpuDepthProbeMs);
     const auto fastBasicGpuProjectedAreaProbePerformanceStatus =
         gpuProjectedAreaProbePerformanceStatus(
             fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs,
@@ -24590,6 +24669,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuRankProbeMs << ",\n"
                 << "  \"gpu_rank_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuRankProbePerformanceStatus) << ",\n"
+                << "  \"gpu_depth_probe_used\": "
+                << (fastBasicGpuDepthProbeUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_depth_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuDepthProbeParityStatus) << ",\n"
+                << "  \"gpu_depth_probe_dispatches\": "
+                << fastBasicMaxGpuDepthProbeDispatches << ",\n"
+                << "  \"gpu_depth_probe_min_depth\": "
+                << fastBasicMaxGpuDepthProbeMinDepth << ",\n"
+                << "  \"gpu_depth_probe_max_depth\": "
+                << fastBasicMaxGpuDepthProbeMaxDepth << ",\n"
+                << "  \"gpu_depth_probe_cpu_count\": "
+                << fastBasicGpuDepthProbeCpuCount << ",\n"
+                << "  \"gpu_depth_probe_gpu_count\": "
+                << fastBasicGpuDepthProbeGpuCount << ",\n"
+                << "  \"gpu_depth_probe_cpu_checksum\": "
+                << fastBasicGpuDepthProbeCpuChecksum << ",\n"
+                << "  \"gpu_depth_probe_gpu_checksum\": "
+                << fastBasicGpuDepthProbeGpuChecksum << ",\n"
+                << "  \"gpu_depth_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuDepthProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_depth_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuDepthProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_depth_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuDepthProbeCpuReferenceMs << ",\n"
+                << "  \"gpu_depth_probe_ms\": "
+                << fastBasicMaxGpuDepthProbeMs << ",\n"
+                << "  \"gpu_depth_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuDepthProbePerformanceStatus) << ",\n"
                 << "  \"gpu_projected_area_probe_used\": "
                 << (fastBasicGpuProjectedAreaProbeUsed ? "true" : "false") << ",\n"
                 << "  \"gpu_projected_area_probe_parity_status\": "
@@ -25409,6 +25516,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuRankProbeMs << ",\n"
                 << "  \"fast_basic_rank_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuRankProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_depth_probe_used\": "
+                << (fastBasicGpuDepthProbeUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_depth_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuDepthProbeParityStatus) << ",\n"
+                << "  \"fast_basic_depth_probe_dispatches\": "
+                << fastBasicMaxGpuDepthProbeDispatches << ",\n"
+                << "  \"fast_basic_depth_probe_min_depth\": "
+                << fastBasicMaxGpuDepthProbeMinDepth << ",\n"
+                << "  \"fast_basic_depth_probe_max_depth\": "
+                << fastBasicMaxGpuDepthProbeMaxDepth << ",\n"
+                << "  \"fast_basic_depth_probe_cpu_count\": "
+                << fastBasicGpuDepthProbeCpuCount << ",\n"
+                << "  \"fast_basic_depth_probe_gpu_count\": "
+                << fastBasicGpuDepthProbeGpuCount << ",\n"
+                << "  \"fast_basic_depth_probe_cpu_checksum\": "
+                << fastBasicGpuDepthProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_depth_probe_gpu_checksum\": "
+                << fastBasicGpuDepthProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_depth_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuDepthProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_depth_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuDepthProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_depth_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuDepthProbeCpuReferenceMs << ",\n"
+                << "  \"fast_basic_depth_probe_ms\": "
+                << fastBasicMaxGpuDepthProbeMs << ",\n"
+                << "  \"fast_basic_depth_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuDepthProbePerformanceStatus) << ",\n"
                 << "  \"fast_basic_projected_area_probe_used\": "
                 << (fastBasicGpuProjectedAreaProbeUsed ? "true" : "false") << ",\n"
                 << "  \"fast_basic_projected_area_probe_parity_status\": "
@@ -25686,6 +25821,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " gpu/cpu items, cpu " << fastBasicMaxGpuRankProbeCpuReferenceMs
               << " ms, gpu " << fastBasicMaxGpuRankProbeMs
               << " ms, " << fastBasicGpuRankProbePerformanceStatus
+              << ")"
+              << " | gpu depth probe: " << (fastBasicGpuDepthProbeUsed ? "yes" : "no")
+              << " (" << fastBasicGpuDepthProbeParityStatus
+              << ", depth " << fastBasicMaxGpuDepthProbeMinDepth
+              << "-" << fastBasicMaxGpuDepthProbeMaxDepth
+              << ", " << fastBasicGpuDepthProbeGpuCount
+              << "/" << fastBasicGpuDepthProbeCpuCount
+              << " gpu/cpu items, cpu " << fastBasicMaxGpuDepthProbeCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuDepthProbeMs
+              << " ms, " << fastBasicGpuDepthProbePerformanceStatus
               << ")"
               << " | gpu projected-area probe: "
               << (fastBasicGpuProjectedAreaProbeUsed ? "yes" : "no")
