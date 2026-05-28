@@ -165,6 +165,7 @@ struct alignas(16) GpuDrawItemCompactionPushConstants {
     glm::uvec4 metadataWindow{0U, 0xffU, 0U, 0U};
     glm::uvec4 areaWindow{0U, 0U, 0U, 0U};
     glm::uvec4 representedSourceWindow{0U, 0U, 0U, 0U};
+    glm::uvec4 profileWindow{0U, 0U, 0U, 0U};
 };
 
 std::string NormalizeScalarFieldName(std::string_view name) {
@@ -237,6 +238,8 @@ constexpr std::uint32_t kDrawItemMetadataRankMask = 0x7ffU;
 constexpr std::uint32_t kGpuDiagnosticRankSelectionLimit = kDrawItemMetadataRankMask / 2U;
 constexpr std::uint32_t kDrawItemMetadataDepthShift = 24U;
 constexpr std::uint32_t kDrawItemMetadataDepthMask = 0xffU;
+constexpr std::uint32_t kDrawItemMetadataProfileShift = 22U;
+constexpr std::uint32_t kDrawItemMetadataProfileMask = 0x3U;
 constexpr std::uint32_t kGpuDiagnosticMinSelectionDepth = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionDepth = kDrawItemMetadataDepthMask;
 constexpr std::uint32_t kDrawItemMetadataFlagsShift = 11U;
@@ -275,6 +278,22 @@ std::uint32_t GpuDiagnosticPrefixSelectionLimit(std::uint32_t drawPointCount) {
 std::uint32_t DrawItemRepresentativeClassFlags(
     const renderer::pointcloud::PointCloudDrawItemGpu& item) {
     return (item.reserved1 >> kDrawItemMetadataClassShift) & kDrawItemMetadataClassMask;
+}
+
+std::uint32_t DrawItemRendererCostProfileBit(
+    const renderer::pointcloud::PointCloudDrawItemGpu& item) {
+    const auto profileIndex =
+        (item.reserved1 >> kDrawItemMetadataProfileShift) & kDrawItemMetadataProfileMask;
+    return 1U << profileIndex;
+}
+
+std::uint32_t RendererCostProfileSelectionMask(
+    renderer::pointcloud::PointCloudLodRendererCostProfile profile) {
+    const auto profileIndex =
+        std::min<std::uint32_t>(
+            static_cast<std::uint32_t>(profile),
+            kDrawItemMetadataProfileMask);
+    return 1U << profileIndex;
 }
 
 std::uint32_t DrawItemRepresentativePackedRank(
@@ -1190,6 +1209,7 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionGpuCount = 0;
         diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
+        diagnostics_.adaptiveGpuCompactionSelectionProfileMask = 0;
         diagnostics_.adaptiveGpuCompactionSelectionClassMask = 0;
         diagnostics_.adaptiveGpuCompactionSelectionRankLimit = 0;
         diagnostics_.adaptiveGpuCompactionSelectionMinDepth = 0;
@@ -1611,6 +1631,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionGpuCount = 0;
     diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
+    diagnostics_.adaptiveGpuCompactionSelectionProfileMask = 0;
     diagnostics_.adaptiveGpuCompactionSelectionClassMask = 0;
     diagnostics_.adaptiveGpuCompactionSelectionRankLimit = 0;
     diagnostics_.adaptiveGpuCompactionSelectionMinDepth = 0;
@@ -5579,6 +5600,7 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
     const std::vector<invisible_places::io::Float3>& positions,
     std::uint32_t drawItemCount,
     std::uint32_t selectionClassMask,
+    std::uint32_t selectionProfileMask,
     std::uint32_t selectionRankLimit,
     std::uint32_t selectionMinDepth,
     std::uint32_t selectionMaxDepth,
@@ -5610,6 +5632,10 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
         const auto& item = drawItems[drawIndex];
         if (selectionClassMask != 0U &&
             (DrawItemRepresentativeClassFlags(item) & selectionClassMask) == 0U) {
+            continue;
+        }
+        if (selectionProfileMask != 0U &&
+            (DrawItemRendererCostProfileBit(item) & selectionProfileMask) == 0U) {
             continue;
         }
         if (DrawItemRepresentativePackedRank(item) > selectionRankLimit) {
@@ -6981,6 +7007,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticPrefixSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticFeatureClassSelectionMask;
+        const auto selectionProfileMask = RendererCostProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -7010,6 +7037,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 plan.resources->cpuPositions,
                 selectionLimit,
                 selectionClassMask,
+                selectionProfileMask,
                 selectionRankLimit,
                 selectionMinDepth,
                 selectionMaxDepth,
@@ -7045,7 +7073,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMinRepresentedSourceCount,
                 selectionMaxRepresentedSourceCount,
                 selectionPositionCount,
-                FloatBits(selectionFrustumGuardBand)}};
+                FloatBits(selectionFrustumGuardBand)},
+            glm::uvec4{selectionProfileMask, 0U, 0U, 0U}};
         VkDescriptorSet descriptorSet = plan.resources->gpuCompactionDescriptorSets[frameIndex];
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -7152,6 +7181,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuCompactionDispatches += 1U;
         diagnostics_.adaptiveGpuCompactionInputDrawItems += plan.drawPointCount;
         diagnostics_.adaptiveGpuCompactionSelectionLimit += selectionLimit;
+        diagnostics_.adaptiveGpuCompactionSelectionProfileMask |= selectionProfileMask;
         diagnostics_.adaptiveGpuCompactionSelectionClassMask |= selectionClassMask;
         diagnostics_.adaptiveGpuCompactionSelectionRankLimit = std::max(
             diagnostics_.adaptiveGpuCompactionSelectionRankLimit,
@@ -7206,7 +7236,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
+            "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
             "the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
@@ -7334,7 +7364,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
+                  "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =

@@ -139,6 +139,7 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionGpuCount = 0;
     std::uint32_t adaptiveGpuCompactionInputDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionSelectionLimit = 0;
+    std::uint32_t adaptiveGpuCompactionSelectionProfileMask = 0;
     std::uint32_t adaptiveGpuCompactionSelectionClassMask = 0;
     std::uint32_t adaptiveGpuCompactionSelectionRankLimit = 0;
     std::uint32_t adaptiveGpuCompactionSelectionMinDepth = 0;
@@ -628,6 +629,7 @@ class VulkanViewportShell {
         const std::vector<invisible_places::io::Float3>& positions,
         std::uint32_t drawItemCount,
         std::uint32_t selectionClassMask,
+        std::uint32_t selectionProfileMask,
         std::uint32_t selectionRankLimit,
         std::uint32_t selectionMinDepth,
         std::uint32_t selectionMaxDepth,

@@ -24,6 +24,10 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionMaxRepresentedSourceCount;
     uint selectionPositionCount;
     uint selectionFrustumGuardBandBits;
+    uint selectionProfileMask;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
 } pushConstants;
 
 layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
@@ -68,6 +72,11 @@ void main() {
     const uint classFlags = (item.indices.w >> 14u) & 0xffu;
     if (pushConstants.selectionClassMask != 0u &&
         (classFlags & pushConstants.selectionClassMask) == 0u) {
+        return;
+    }
+    const uint profileBits = (item.indices.w >> 22u) & 0x3u;
+    if (pushConstants.selectionProfileMask != 0u &&
+        ((1u << profileBits) & pushConstants.selectionProfileMask) == 0u) {
         return;
     }
     const uint packedRank = item.indices.w & 0x7ffu;

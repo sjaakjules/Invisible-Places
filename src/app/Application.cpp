@@ -21327,10 +21327,11 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveGpuIndirectCommandDispatches);
                 if (diagnostics.adaptiveGpuIndirectCommandUsed || diagnostics.adaptiveGpuCompactionMs > 0.0) {
                     ImGui::Text(
-                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u reps %u-%u frustum %s %.2fx/%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | cpu %.3f ms gpu %.3f ms",
+                        "Adaptive GPU prefix selection: %s | %u/%u items | profile 0x%x class 0x%02x rank <= %u depth %u-%u reps %u-%u frustum %s %.2fx/%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | cpu %.3f ms gpu %.3f ms",
                         diagnostics.adaptiveGpuCompactionParityStatus.c_str(),
                         diagnostics.adaptiveGpuCompactionCopiedDrawItems,
                         diagnostics.adaptiveGpuCompactionInputDrawItems,
+                        diagnostics.adaptiveGpuCompactionSelectionProfileMask,
                         diagnostics.adaptiveGpuCompactionSelectionClassMask,
                         diagnostics.adaptiveGpuCompactionSelectionRankLimit,
                         diagnostics.adaptiveGpuCompactionSelectionMinDepth,
@@ -22212,6 +22213,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicMaxGpuCompactionDispatches = 0;
     std::uint32_t fastBasicMaxGpuCompactionInputDrawItems = 0;
     std::uint32_t fastBasicMaxGpuCompactionSelectionLimit = 0;
+    std::uint32_t fastBasicGpuCompactionSelectionProfileMask = 0;
     std::uint32_t fastBasicGpuCompactionSelectionClassMask = 0;
     std::uint32_t fastBasicMaxGpuCompactionSelectionRankLimit = 0;
     std::uint32_t fastBasicMaxGpuCompactionSelectionMinDepth = 0;
@@ -22493,6 +22495,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuCompactionSelectionLimit = std::max(
             fastBasicMaxGpuCompactionSelectionLimit,
             diagnostics.adaptiveGpuCompactionSelectionLimit);
+        fastBasicGpuCompactionSelectionProfileMask |=
+            diagnostics.adaptiveGpuCompactionSelectionProfileMask;
         fastBasicGpuCompactionSelectionClassMask |= diagnostics.adaptiveGpuCompactionSelectionClassMask;
         fastBasicMaxGpuCompactionSelectionRankLimit = std::max(
             fastBasicMaxGpuCompactionSelectionRankLimit,
@@ -23169,6 +23173,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t maxGpuCompactionDispatches = 0;
         std::uint32_t maxGpuCompactionInputDrawItems = 0;
         std::uint32_t maxGpuCompactionSelectionLimit = 0;
+        std::uint32_t gpuCompactionSelectionProfileMask = 0;
         std::uint32_t gpuCompactionSelectionClassMask = 0;
         std::uint32_t maxGpuCompactionSelectionRankLimit = 0;
         std::uint32_t maxGpuCompactionSelectionMinDepth = 0;
@@ -23353,6 +23358,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             stress.maxGpuCompactionSelectionLimit = std::max(
                 stress.maxGpuCompactionSelectionLimit,
                 diagnostics.adaptiveGpuCompactionSelectionLimit);
+            stress.gpuCompactionSelectionProfileMask |=
+                diagnostics.adaptiveGpuCompactionSelectionProfileMask;
             stress.gpuCompactionSelectionClassMask |= diagnostics.adaptiveGpuCompactionSelectionClassMask;
             stress.maxGpuCompactionSelectionRankLimit = std::max(
                 stress.maxGpuCompactionSelectionRankLimit,
@@ -23661,6 +23668,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuCompactionInputDrawItems << ",\n"
                 << "  \"gpu_compaction_selection_limit\": "
                 << fastBasicMaxGpuCompactionSelectionLimit << ",\n"
+                << "  \"gpu_compaction_selection_profile_mask\": "
+                << fastBasicGpuCompactionSelectionProfileMask << ",\n"
                 << "  \"gpu_compaction_selection_class_mask\": "
                 << fastBasicGpuCompactionSelectionClassMask << ",\n"
                 << "  \"gpu_compaction_selection_rank_limit\": "
@@ -23980,6 +23989,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << beautyStress.maxGpuCompactionInputDrawItems << ",\n"
                 << "  \"beauty_stress_compaction_selection_limit\": "
                 << beautyStress.maxGpuCompactionSelectionLimit << ",\n"
+                << "  \"beauty_stress_compaction_selection_profile_mask\": "
+                << beautyStress.gpuCompactionSelectionProfileMask << ",\n"
                 << "  \"beauty_stress_compaction_selection_class_mask\": "
                 << beautyStress.gpuCompactionSelectionClassMask << ",\n"
                 << "  \"beauty_stress_compaction_selection_rank_limit\": "
@@ -24220,6 +24231,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuCompactionInputDrawItems << ",\n"
                 << "  \"fast_basic_compaction_selection_limit\": "
                 << fastBasicMaxGpuCompactionSelectionLimit << ",\n"
+                << "  \"fast_basic_compaction_selection_profile_mask\": "
+                << fastBasicGpuCompactionSelectionProfileMask << ",\n"
                 << "  \"fast_basic_compaction_selection_class_mask\": "
                 << fastBasicGpuCompactionSelectionClassMask << ",\n"
                 << "  \"fast_basic_compaction_selection_rank_limit\": "
@@ -24357,7 +24370,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << ", " << fastBasicMaxGpuCompactionDispatches
               << " dispatches, " << fastBasicMaxGpuCompactionCopiedDrawItems
               << "/" << fastBasicMaxGpuCompactionInputDrawItems
-              << " items, class mask " << fastBasicGpuCompactionSelectionClassMask
+              << " items, profile mask " << fastBasicGpuCompactionSelectionProfileMask
+              << ", class mask " << fastBasicGpuCompactionSelectionClassMask
               << ", rank <= " << fastBasicMaxGpuCompactionSelectionRankLimit
               << ", depth " << fastBasicMaxGpuCompactionSelectionMinDepth
               << "-" << fastBasicMaxGpuCompactionSelectionMaxDepth
