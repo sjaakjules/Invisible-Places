@@ -21327,9 +21327,10 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveGpuIndirectCommandDispatches);
                 if (diagnostics.adaptiveGpuIndirectCommandUsed || diagnostics.adaptiveGpuCompactionMs > 0.0) {
                     ImGui::Text(
-                        "Adaptive GPU compaction: %s | %u items | %.3f ms",
+                        "Adaptive GPU prefix selection: %s | %u/%u items | %.3f ms",
                         diagnostics.adaptiveGpuCompactionParityStatus.c_str(),
                         diagnostics.adaptiveGpuCompactionCopiedDrawItems,
+                        diagnostics.adaptiveGpuCompactionInputDrawItems,
                         diagnostics.adaptiveGpuCompactionMs);
                     ImGui::Text(
                         "Adaptive GPU command generation: %.3f ms",
@@ -22174,6 +22175,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicMaxIndirectDrawCalls = 0;
     std::uint32_t fastBasicMaxGpuIndirectCommandDispatches = 0;
     std::uint32_t fastBasicMaxGpuCompactionDispatches = 0;
+    std::uint32_t fastBasicMaxGpuCompactionInputDrawItems = 0;
+    std::uint32_t fastBasicMaxGpuCompactionSelectionLimit = 0;
     std::uint32_t fastBasicMaxGpuCompactionCopiedDrawItems = 0;
     std::uint32_t fastBasicGpuCompactionCpuCount = 0;
     std::uint32_t fastBasicGpuCompactionGpuCount = 0;
@@ -22417,6 +22420,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuCompactionDispatches = std::max(
             fastBasicMaxGpuCompactionDispatches,
             diagnostics.adaptiveGpuCompactionDispatches);
+        fastBasicMaxGpuCompactionInputDrawItems = std::max(
+            fastBasicMaxGpuCompactionInputDrawItems,
+            diagnostics.adaptiveGpuCompactionInputDrawItems);
+        fastBasicMaxGpuCompactionSelectionLimit = std::max(
+            fastBasicMaxGpuCompactionSelectionLimit,
+            diagnostics.adaptiveGpuCompactionSelectionLimit);
         fastBasicMaxGpuCompactionCopiedDrawItems = std::max(
             fastBasicMaxGpuCompactionCopiedDrawItems,
             diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23031,6 +23040,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t maxIndirectDrawCalls = 0;
         std::uint32_t maxGpuIndirectCommandDispatches = 0;
         std::uint32_t maxGpuCompactionDispatches = 0;
+        std::uint32_t maxGpuCompactionInputDrawItems = 0;
+        std::uint32_t maxGpuCompactionSelectionLimit = 0;
         std::uint32_t maxGpuCompactionCopiedDrawItems = 0;
         std::uint32_t gpuCompactionCpuCount = 0;
         std::uint32_t gpuCompactionGpuCount = 0;
@@ -23177,6 +23188,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             stress.maxGpuCompactionDispatches = std::max(
                 stress.maxGpuCompactionDispatches,
                 diagnostics.adaptiveGpuCompactionDispatches);
+            stress.maxGpuCompactionInputDrawItems = std::max(
+                stress.maxGpuCompactionInputDrawItems,
+                diagnostics.adaptiveGpuCompactionInputDrawItems);
+            stress.maxGpuCompactionSelectionLimit = std::max(
+                stress.maxGpuCompactionSelectionLimit,
+                diagnostics.adaptiveGpuCompactionSelectionLimit);
             stress.maxGpuCompactionCopiedDrawItems = std::max(
                 stress.maxGpuCompactionCopiedDrawItems,
                 diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23409,6 +23426,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << JsonStringLiteral(fastBasicGpuCompactionParityStatus) << ",\n"
                 << "  \"gpu_compaction_dispatches\": "
                 << fastBasicMaxGpuCompactionDispatches << ",\n"
+                << "  \"gpu_compaction_input_draw_items\": "
+                << fastBasicMaxGpuCompactionInputDrawItems << ",\n"
+                << "  \"gpu_compaction_selection_limit\": "
+                << fastBasicMaxGpuCompactionSelectionLimit << ",\n"
                 << "  \"gpu_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"gpu_compaction_cpu_count\": " << fastBasicGpuCompactionCpuCount << ",\n"
@@ -23676,6 +23697,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << JsonStringLiteral(beautyStress.gpuCompactionParityStatus) << ",\n"
                 << "  \"beauty_stress_compaction_dispatches\": "
                 << beautyStress.maxGpuCompactionDispatches << ",\n"
+                << "  \"beauty_stress_compaction_input_draw_items\": "
+                << beautyStress.maxGpuCompactionInputDrawItems << ",\n"
+                << "  \"beauty_stress_compaction_selection_limit\": "
+                << beautyStress.maxGpuCompactionSelectionLimit << ",\n"
                 << "  \"beauty_stress_compaction_copied_draw_items\": "
                 << beautyStress.maxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"beauty_stress_compaction_cpu_count\": "
@@ -23864,6 +23889,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << JsonStringLiteral(fastBasicGpuCompactionParityStatus) << ",\n"
                 << "  \"fast_basic_compaction_dispatches\": "
                 << fastBasicMaxGpuCompactionDispatches << ",\n"
+                << "  \"fast_basic_compaction_input_draw_items\": "
+                << fastBasicMaxGpuCompactionInputDrawItems << ",\n"
+                << "  \"fast_basic_compaction_selection_limit\": "
+                << fastBasicMaxGpuCompactionSelectionLimit << ",\n"
                 << "  \"fast_basic_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"fast_basic_compaction_cpu_count\": "
@@ -23948,10 +23977,11 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " | min FPS " << fastBasicMinFps
               << " | max rep delta/frame " << fastBasicMaxRepresentativeDeltaPerFrame
               << " | large jump frames " << fastBasicLargeRepresentativeJumpFrames
-              << " | gpu compaction: " << (fastBasicGpuCompactionUsed ? "yes" : "no")
+              << " | gpu prefix selection: " << (fastBasicGpuCompactionUsed ? "yes" : "no")
               << " (" << fastBasicGpuCompactionParityStatus
               << ", " << fastBasicMaxGpuCompactionDispatches
               << " dispatches, " << fastBasicMaxGpuCompactionCopiedDrawItems
+              << "/" << fastBasicMaxGpuCompactionInputDrawItems
               << " items, " << fastBasicMaxGpuCompactionMs << " ms)"
               << " | gpu indirect command: " << (fastBasicGpuIndirectCommandUsed ? "yes" : "no")
               << " (" << fastBasicMaxGpuIndirectCommandDispatches

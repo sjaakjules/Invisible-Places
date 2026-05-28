@@ -9,7 +9,7 @@ struct PointDrawItemGpu {
 
 layout(push_constant) uniform CompactionPushConstants {
     uint itemCount;
-    uint flags;
+    uint selectionLimit;
     uint reserved0;
     uint reserved1;
 } pushConstants;
@@ -47,9 +47,13 @@ void main() {
     if (drawIndex >= pushConstants.itemCount) {
         return;
     }
+    if (drawIndex >= pushConstants.selectionLimit) {
+        return;
+    }
 
     const PointDrawItemGpu item = inputDrawItems.drawItems[drawIndex];
-    outputDrawItems.drawItems[drawIndex] = item;
+    const uint outputIndex = atomicAdd(stats.count, 1u);
+    outputDrawItems.drawItems[outputIndex] = item;
 
     const uint sourceIndex = item.indices.x;
     const uint representedCount = item.indices.y;
@@ -58,7 +62,6 @@ void main() {
                        MixWord(representedCount + 0x85ebca6bu) ^
                        MixWord(footprintBits + 0xc2b2ae35u);
 
-    atomicAdd(stats.count, 1u);
     atomicXor(stats.sourceIndexXor, sourceIndex);
     atomicXor(stats.representedCountXor, representedCount);
     atomicXor(stats.footprintXor, footprintBits);

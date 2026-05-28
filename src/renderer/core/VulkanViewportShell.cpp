@@ -229,6 +229,13 @@ constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
 constexpr std::uint32_t kMinimumAdaptiveIndirectDrawPoints = 4096U;
 
+std::uint32_t GpuDiagnosticPrefixSelectionLimit(std::uint32_t drawPointCount) {
+    if (drawPointCount <= kMinimumAdaptiveIndirectDrawPoints) {
+        return drawPointCount;
+    }
+    return std::max(kMinimumAdaptiveIndirectDrawPoints, drawPointCount / 2U);
+}
+
 bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, float epsilon = 1.0e-6F) {
     for (int column = 0; column < 4; ++column) {
         for (int row = 0; row < 4; ++row) {
@@ -813,6 +820,11 @@ void VulkanViewportShell::BeginUiFrame() {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+    auto& io = ImGui::GetIO();
+    if ((io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0 &&
+        ImGui::GetPlatformIO().Monitors.Size == 0) {
+        io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+    }
     ImGui::NewFrame();
     uiFrameBegun_ = true;
 }
@@ -1064,6 +1076,8 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionDispatches = 0;
         diagnostics_.adaptiveGpuCompactionCpuCount = 0;
         diagnostics_.adaptiveGpuCompactionGpuCount = 0;
+        diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
+        diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -1457,6 +1471,8 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionDispatches = 0;
     diagnostics_.adaptiveGpuCompactionCpuCount = 0;
     diagnostics_.adaptiveGpuCompactionGpuCount = 0;
+    diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
+    diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -4716,7 +4732,7 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
     diagnostics_.adaptiveGpuCompactionCpuChecksum = cpuChecksum;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = gpuChecksum;
     diagnostics_.adaptiveGpuCompactionParityStatus =
-        passed ? "passed previous-frame count/checksum" : "mismatch in previous-frame count/checksum";
+        passed ? "passed previous-frame prefix count/checksum" : "mismatch in previous-frame prefix count/checksum";
 }
 
 void VulkanViewportShell::ResetGpuTimestampQueries(VkCommandBuffer commandBuffer, FrameResources* frame) {
@@ -6586,7 +6602,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             recordedAny = true;
         }
 
-        const auto expectedStats = ComputeGpuCompactionStats(*layer.adaptiveDrawItems, plan.drawPointCount);
+        const auto selectionLimit = GpuDiagnosticPrefixSelectionLimit(plan.drawPointCount);
+        const auto expectedStats = ComputeGpuCompactionStats(*layer.adaptiveDrawItems, selectionLimit);
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
             plan.resources->gpuCompactionStatsBuffers[frameIndex],
@@ -6596,7 +6613,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         plan.resources->gpuCompactionResultPending[frameIndex] = true;
 
         const GpuDrawItemCompactionPushConstants pushConstants{
-            glm::uvec4{plan.drawPointCount, 0U, 0U, 0U}};
+            glm::uvec4{plan.drawPointCount, selectionLimit, 0U, 0U}};
         VkDescriptorSet descriptorSet = plan.resources->gpuCompactionDescriptorSets[frameIndex];
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -6618,7 +6635,9 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         diagnostics_.adaptiveGpuCompactionUsed = true;
         diagnostics_.adaptiveGpuCompactionDispatches += 1U;
-        diagnostics_.adaptiveGpuCompactionCopiedDrawItems += plan.drawPointCount;
+        diagnostics_.adaptiveGpuCompactionInputDrawItems += plan.drawPointCount;
+        diagnostics_.adaptiveGpuCompactionSelectionLimit += selectionLimit;
+        diagnostics_.adaptiveGpuCompactionCopiedDrawItems += selectionLimit;
     }
 
     if (recordedAny) {
@@ -6627,12 +6646,12 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             &frameResources_[frameIndex],
             kGpuTimestampGpuDrawItemCompactionPass,
             true);
-        diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-compaction-compare+gpu-generated-indirect";
+        diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected draw items are compacted and checksummed by compute for comparison";
+            "CPU-selected draw items are prefix-filtered, compacted, and checksummed by compute for comparison";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
-            diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame GPU checksum";
+            diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
         }
     }
 
@@ -6746,12 +6765,12 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
             true);
         diagnostics_.adaptiveSelectionExecutionPath =
             diagnostics_.adaptiveGpuCompactionUsed
-                ? "cpu-selection+gpu-compaction-compare+gpu-generated-indirect"
+                ? "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect"
                 : "cpu-selection+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected draw items are compacted/checksummed by compute, and indirect commands are generated by compute"
+                  "CPU-selected draw items are prefix-filtered, compacted, and checksummed by compute, and indirect commands are generated by compute"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =
