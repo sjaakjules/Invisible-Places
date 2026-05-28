@@ -1251,6 +1251,8 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
+        diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = 0;
+        diagnostics_.adaptiveGpuCompactionGpuSourceFingerprint = 0;
         diagnostics_.adaptiveIndirectDrawSupported = gpuDrivenSelectionCapabilities_.indirectDrawSupported;
         diagnostics_.adaptiveIndirectCountSupported = gpuDrivenSelectionCapabilities_.indirectCountSupported;
         diagnostics_.adaptiveIndirectDrawRecommended = false;
@@ -1678,6 +1680,8 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
+    diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = 0;
+    diagnostics_.adaptiveGpuCompactionGpuSourceFingerprint = 0;
     diagnostics_.adaptiveIndirectDrawSupported = gpuSelectionDecision.indirectDrawSupported;
     diagnostics_.adaptiveIndirectCountSupported = gpuSelectionDecision.indirectCountSupported;
     diagnostics_.adaptiveIndirectDrawRecommended = gpuSelectionDecision.indirectDrawRecommended;
@@ -4918,6 +4922,8 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
     std::uint32_t gpuCount = 0;
     std::uint32_t cpuChecksum = 0;
     std::uint32_t gpuChecksum = 0;
+    std::uint32_t cpuSourceFingerprint = 0;
+    std::uint32_t gpuSourceFingerprint = 0;
     bool indirectChecked = false;
     bool indirectPassed = true;
     std::uint32_t indirectCpuVertices = 0;
@@ -4945,6 +4951,8 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
                 actual.representedCountXor == expected.representedCountXor &&
                 actual.footprintXor == expected.footprintXor &&
                 actual.sourceIndexSum == expected.sourceIndexSum &&
+                actual.sourceFingerprintXor == expected.sourceFingerprintXor &&
+                actual.sourceFingerprintSum == expected.sourceFingerprintSum &&
                 actual.representedCountSum == expected.representedCountSum &&
                 actual.drawIndexXor == expected.drawIndexXor &&
                 actual.combinedChecksum == expected.combinedChecksum;
@@ -4955,6 +4963,10 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
             gpuCount += actual.count;
             cpuChecksum ^= expected.combinedChecksum;
             gpuChecksum ^= actual.combinedChecksum;
+            cpuSourceFingerprint ^= expected.sourceFingerprintXor;
+            cpuSourceFingerprint += expected.sourceFingerprintSum;
+            gpuSourceFingerprint ^= actual.sourceFingerprintXor;
+            gpuSourceFingerprint += actual.sourceFingerprintSum;
             resources.gpuCompactionResultPending[frameIndex] = false;
         }
 
@@ -4984,8 +4996,11 @@ void VulkanViewportShell::ReadPreviousGpuCompactionResults(std::size_t frameInde
         diagnostics_.adaptiveGpuCompactionGpuCount = gpuCount;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = cpuChecksum;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = gpuChecksum;
+        diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = cpuSourceFingerprint;
+        diagnostics_.adaptiveGpuCompactionGpuSourceFingerprint = gpuSourceFingerprint;
         diagnostics_.adaptiveGpuCompactionParityStatus =
-            passed ? "passed previous-frame prefix count/checksum" : "mismatch in previous-frame prefix count/checksum";
+            passed ? "passed previous-frame prefix count/source-fingerprint/checksum"
+                   : "mismatch in previous-frame prefix count/source-fingerprint/checksum";
     }
 
     if (indirectChecked) {
@@ -5715,6 +5730,7 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
         }
         std::uint32_t footprintBits = 0;
         std::memcpy(&footprintBits, &item.footprintAreaPixels, sizeof(footprintBits));
+        const auto sourceFingerprint = mixWord(item.sourcePointIndex + 0x27d4eb2dU);
         const auto mixed =
             mixWord(item.sourcePointIndex ^ (drawIndex * 0x9e3779b9U)) ^
             mixWord(item.representedSourceCount + 0x85ebca6bU) ^
@@ -5724,6 +5740,8 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
         stats.representedCountXor ^= item.representedSourceCount;
         stats.footprintXor ^= footprintBits;
         stats.sourceIndexSum += item.sourcePointIndex;
+        stats.sourceFingerprintXor ^= sourceFingerprint;
+        stats.sourceFingerprintSum += sourceFingerprint;
         stats.representedCountSum += item.representedSourceCount;
         stats.drawIndexXor ^= drawIndex;
         stats.combinedChecksum ^= mixed;

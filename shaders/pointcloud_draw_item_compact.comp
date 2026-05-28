@@ -52,6 +52,8 @@ layout(set = 0, binding = 2, std430) buffer CompactionStats {
     uint representedCountXor;
     uint footprintXor;
     uint sourceIndexSum;
+    uint sourceFingerprintXor;
+    uint sourceFingerprintSum;
     uint representedCountSum;
     uint drawIndexXor;
     uint combinedChecksum;
@@ -160,6 +162,7 @@ void main() {
     outputDrawItems.drawItems[outputIndex] = item;
 
     const uint footprintBits = floatBitsToUint(item.params.x);
+    const uint sourceFingerprint = MixWord(sourceIndex + 0x27d4eb2du);
     const uint mixed = MixWord(sourceIndex ^ (drawIndex * 0x9e3779b9u)) ^
                        MixWord(representedCount + 0x85ebca6bu) ^
                        MixWord(footprintBits + 0xc2b2ae35u);
@@ -168,6 +171,8 @@ void main() {
     atomicXor(stats.representedCountXor, representedCount);
     atomicXor(stats.footprintXor, footprintBits);
     atomicAdd(stats.sourceIndexSum, sourceIndex);
+    atomicXor(stats.sourceFingerprintXor, sourceFingerprint);
+    atomicAdd(stats.sourceFingerprintSum, sourceFingerprint);
     atomicAdd(stats.representedCountSum, representedCount);
     atomicXor(stats.drawIndexXor, drawIndex);
     atomicXor(stats.combinedChecksum, mixed);

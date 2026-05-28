@@ -3020,6 +3020,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("clipPosition.w <= 0.0") != std::string::npos);
     CHECK(compactionShader.find("outputDrawItems.drawItems") != std::string::npos);
     CHECK(compactionShader.find("const uint outputIndex = atomicAdd(stats.count") != std::string::npos);
+    CHECK(compactionShader.find("sourceFingerprintXor") != std::string::npos);
+    CHECK(compactionShader.find("sourceFingerprintSum") != std::string::npos);
     CHECK(compactionShader.find("floatBitsToUint(item.params.x)") != std::string::npos);
     CHECK(compactionShader.find("combinedChecksum") != std::string::npos);
     CHECK(metadataCompactionShader.find("layout(local_size_x = 64") != std::string::npos);
@@ -3029,6 +3031,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(metadataCompactionShader.find("uniforms.viewProjection") == std::string::npos);
     CHECK(metadataCompactionShader.find("pointPositions.positions") == std::string::npos);
     CHECK(metadataCompactionShader.find("outputDrawItems.drawItems") != std::string::npos);
+    CHECK(metadataCompactionShader.find("sourceFingerprintXor") != std::string::npos);
     CHECK(metadataCompactionShader.find("combinedChecksum") != std::string::npos);
     CHECK(computeShader.find("layout(local_size_x = 1") != std::string::npos);
     CHECK(computeShader.find("layout(push_constant)") != std::string::npos);
@@ -3058,6 +3061,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionFrustumEnabled") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionFrustumFallbackReason") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionCpuReferenceMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionCpuSourceFingerprint") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionGpuSourceFingerprint") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionIndirectCommandUsed") != std::string::npos);
@@ -3092,6 +3097,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("DrawItemWithinRepresentedSourceWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinFrustumGuard") != std::string::npos);
     CHECK(rendererSource.find("cpuReferenceStart") != std::string::npos);
+    CHECK(rendererSource.find("sourceFingerprintXor") != std::string::npos);
     CHECK(rendererSource.find("bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER") != std::string::npos);
     CHECK(rendererSource.find("FloatBits(selectionMinFootprintAreaPixels)") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativeClassFlags") != std::string::npos);
@@ -3118,6 +3124,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_compaction_selection_frustum_enabled") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_frustum_fallback_reason") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_cpu_reference_ms") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_cpu_source_fingerprint") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_gpu_source_fingerprint") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_performance_status") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_indirect_command_used") != std::string::npos);
@@ -3137,6 +3145,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("beauty_stress_compaction_selection_frustum_enabled") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_frustum_fallback_reason") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_cpu_reference_ms") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_cpu_source_fingerprint") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_gpu_source_fingerprint") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_performance_status") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_indirect_command_used") != std::string::npos);
