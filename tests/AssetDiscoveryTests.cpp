@@ -3223,6 +3223,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionFootprintAreaPixels") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionOpacityCompensation") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionRepresentedSourceCount") != std::string::npos);
+    CHECK(rendererSource.find("constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 1U") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumGuardBand") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumGuardEnabled") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumFallbackReason") != std::string::npos);
@@ -3250,6 +3251,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("classCounts == expected.classCounts") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame full-range count/source-fingerprint/checksum/class-counts") != std::string::npos);
     CHECK(rendererSource.find("selectionOrderedOutput ? 1U : 0U") != std::string::npos);
+    CHECK(rendererSource.find("selectionOutputWriteActive ? 1U : 0U") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRendererCostProfileBit") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedRank") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedDepth") != std::string::npos);

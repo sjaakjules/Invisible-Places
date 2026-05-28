@@ -273,7 +273,7 @@ constexpr float kGpuDiagnosticMinSelectionOpacityCompensation = std::numeric_lim
 constexpr float kGpuDiagnosticMaxSelectionOpacityCompensation = std::numeric_limits<float>::max();
 constexpr float kGpuDiagnosticMinSelectionEmissionCompensation = std::numeric_limits<float>::lowest();
 constexpr float kGpuDiagnosticMaxSelectionEmissionCompensation = std::numeric_limits<float>::max();
-constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 0U;
+constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 1U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
 constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = true;
@@ -9115,6 +9115,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             kGpuDiagnosticCompactionOrderedOutputEnabled &&
             expectedStats.count == selectionLimit &&
             expectedStats.count <= selectionMaxOutputCount;
+        const bool selectionOutputWriteActive = selectionWriteOutput && selectionOrderedOutput;
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
             plan.resources->gpuCompactionStatsBuffers[frameIndex],
@@ -9124,7 +9125,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         plan.resources->gpuCompactionResultPending[frameIndex] = true;
         plan.resources->gpuCompactionExpectedOutputProbeStats[frameIndex] = expectedOutputProbeStats;
         plan.resources->gpuCompactionOutputProbeResultPending[frameIndex] =
-            selectionOrderedOutput;
+            selectionOutputWriteActive;
         const auto compactedSubmissionCandidateVertices =
             IndirectVertexCountFromCompactedItems(expectedStats.count, plan.worldSurfels);
         const auto compactedSubmissionReferenceVertices =
@@ -9192,7 +9193,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 FloatBits(selectionFrustumGuardBand)},
             glm::uvec4{
                 selectionProfileMask,
-                selectionWriteOutput ? 1U : 0U,
+                selectionOutputWriteActive ? 1U : 0U,
                 selectionMaxOutputCount,
                 selectionOrderedOutput ? 1U : 0U},
             glm::uvec4{
@@ -9220,7 +9221,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         const auto dispatchItemCount = std::min(plan.drawPointCount, selectionLimit);
         vkCmdDispatch(commandBuffer, (dispatchItemCount + 63U) / 64U, 1, 1);
 
-        if (selectionWriteOutput && selectionMaxOutputCount > 0U) {
+        if (selectionOutputWriteActive && selectionMaxOutputCount > 0U) {
             VkBufferMemoryBarrier outputProbeBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
             outputProbeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             outputProbeBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
@@ -9392,7 +9393,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason.clear();
             diagnostics_.adaptiveGpuCompactionOutputCapacity += selectionMaxOutputCount;
             diagnostics_.adaptiveGpuCompactionCopiedDrawItems +=
-                std::min(expectedStats.count, selectionMaxOutputCount);
+                selectionOutputWriteActive ? std::min(expectedStats.count, selectionMaxOutputCount) : 0U;
             if (expectedStats.count > selectionMaxOutputCount) {
                 diagnostics_.adaptiveGpuCompactionOutputProbeParityStatus =
                     "not checked: selected count exceeds diagnostic output capacity";
