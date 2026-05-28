@@ -20,6 +20,10 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionMaxFootprintAreaBits;
     uint selectionMinRenderAreaBits;
     uint selectionMaxRenderAreaBits;
+    uint selectionMinRepresentedSourceCount;
+    uint selectionMaxRepresentedSourceCount;
+    uint reserved0;
+    uint reserved1;
 } pushConstants;
 
 layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
@@ -93,12 +97,16 @@ void main() {
         renderArea > maxRenderArea) {
         return;
     }
+    const uint representedCount = item.indices.y;
+    if (representedCount < pushConstants.selectionMinRepresentedSourceCount ||
+        representedCount > pushConstants.selectionMaxRepresentedSourceCount) {
+        return;
+    }
 
     const uint outputIndex = atomicAdd(stats.count, 1u);
     outputDrawItems.drawItems[outputIndex] = item;
 
     const uint sourceIndex = item.indices.x;
-    const uint representedCount = item.indices.y;
     const uint footprintBits = floatBitsToUint(item.params.x);
     const uint mixed = MixWord(sourceIndex ^ (drawIndex * 0x9e3779b9u)) ^
                        MixWord(representedCount + 0x85ebca6bu) ^

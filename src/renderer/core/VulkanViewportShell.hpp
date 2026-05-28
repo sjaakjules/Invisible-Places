@@ -149,6 +149,8 @@ struct ViewportDiagnostics {
     float adaptiveGpuCompactionSelectionMaxFootprintAreaPixels = 0.0F;
     float adaptiveGpuCompactionSelectionMinRenderAreaPixels = 0.0F;
     float adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
+    std::uint32_t adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
+    std::uint32_t adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
@@ -628,7 +630,9 @@ class VulkanViewportShell {
         float selectionMinFootprintAreaPixels,
         float selectionMaxFootprintAreaPixels,
         float selectionMinRenderAreaPixels,
-        float selectionMaxRenderAreaPixels) const;
+        float selectionMaxRenderAreaPixels,
+        std::uint32_t selectionMinRepresentedSourceCount,
+        std::uint32_t selectionMaxRepresentedSourceCount) const;
     [[nodiscard]] bool PointCloudPlanUsesGpuCompaction(
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
