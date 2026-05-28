@@ -251,6 +251,7 @@ constexpr float kGpuDiagnosticMaxSelectionRenderAreaPixels = 1'048'576.0F;
 constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
+constexpr float kGpuDiagnosticSelectionFrustumGuardBand = 1.05F;
 constexpr std::uint32_t kDrawItemMetadataClassShift = 14U;
 constexpr std::uint32_t kDrawItemMetadataClassMask = 0xffU;
 constexpr std::uint32_t kGpuDiagnosticFeatureClassSelectionMask =
@@ -312,6 +313,29 @@ bool DrawItemWithinRepresentedSourceWindow(
     std::uint32_t selectionMaxRepresentedSourceCount) {
     return item.representedSourceCount >= selectionMinRepresentedSourceCount &&
            item.representedSourceCount <= selectionMaxRepresentedSourceCount;
+}
+
+bool DrawItemWithinFrustumGuard(
+    const renderer::pointcloud::PointCloudDrawItemGpu& item,
+    const std::vector<invisible_places::io::Float3>& positions,
+    const glm::mat4& viewProjection,
+    float frustumGuardBand) {
+    if (item.sourcePointIndex >= positions.size()) {
+        return false;
+    }
+    const auto& position = positions[item.sourcePointIndex];
+    const glm::vec4 clipPosition =
+        viewProjection * glm::vec4{position.x, position.y, position.z, 1.0F};
+    if (clipPosition.w <= 0.0F) {
+        return false;
+    }
+    const auto guardedW = clipPosition.w * std::max(1.0F, frustumGuardBand);
+    return clipPosition.x >= -guardedW &&
+           clipPosition.x <= guardedW &&
+           clipPosition.y >= -guardedW &&
+           clipPosition.y <= guardedW &&
+           clipPosition.z >= -guardedW &&
+           clipPosition.z <= guardedW;
 }
 
 std::uint32_t IndirectVertexCountFromCompactedItems(
@@ -1175,6 +1199,8 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
         diagnostics_.adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
         diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
+        diagnostics_.adaptiveGpuCompactionSelectionPositionCount = 0;
+        diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -1591,6 +1617,8 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
     diagnostics_.adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
     diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
+    diagnostics_.adaptiveGpuCompactionSelectionPositionCount = 0;
+    diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -2862,13 +2890,14 @@ void VulkanViewportShell::CreateGpuDrivenSelectionDescriptorSetLayout() {
 }
 
 void VulkanViewportShell::CreateGpuCompactionDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
     for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
         bindings[bindingIndex].binding = bindingIndex;
         bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[bindingIndex].descriptorCount = 1;
         bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
@@ -5469,7 +5498,9 @@ void VulkanViewportShell::UpdateGpuCompactionDescriptorSet(
         gpuCompactionDescriptorSetLayout_ == VK_NULL_HANDLE ||
         resources->drawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
         resources->gpuCompactedDrawItemBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
-        resources->gpuCompactionStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
+        resources->gpuCompactionStatsBuffers[frameIndex].buffer == VK_NULL_HANDLE ||
+        frameResources_[frameIndex].uniformBuffer.buffer == VK_NULL_HANDLE ||
+        resources->positionStorageBuffer.buffer == VK_NULL_HANDLE) {
         return;
     }
 
@@ -5499,7 +5530,17 @@ void VulkanViewportShell::UpdateGpuCompactionDescriptorSet(
     statsInfo.offset = 0;
     statsInfo.range = sizeof(GpuDrawItemCompactionStats);
 
-    std::array<VkWriteDescriptorSet, 3> writes{};
+    VkDescriptorBufferInfo uniformInfo{};
+    uniformInfo.buffer = frameResources_[frameIndex].uniformBuffer.buffer;
+    uniformInfo.offset = 0;
+    uniformInfo.range = sizeof(FrameUniforms);
+
+    VkDescriptorBufferInfo positionInfo{};
+    positionInfo.buffer = resources->positionStorageBuffer.buffer;
+    positionInfo.offset = 0;
+    positionInfo.range = resources->positionStorageBuffer.size;
+
+    std::array<VkWriteDescriptorSet, 5> writes{};
     for (auto& write : writes) {
         write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.dstSet = descriptorSet;
@@ -5512,12 +5553,18 @@ void VulkanViewportShell::UpdateGpuCompactionDescriptorSet(
     writes[1].pBufferInfo = &outputInfo;
     writes[2].dstBinding = 2;
     writes[2].pBufferInfo = &statsInfo;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[3].pBufferInfo = &uniformInfo;
+    writes[4].dstBinding = 4;
+    writes[4].pBufferInfo = &positionInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuCompactionStats(
     const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
+    const std::vector<invisible_places::io::Float3>& positions,
     std::uint32_t drawItemCount,
     std::uint32_t selectionClassMask,
     std::uint32_t selectionRankLimit,
@@ -5530,7 +5577,9 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
     float selectionMinRenderAreaPixels,
     float selectionMaxRenderAreaPixels,
     std::uint32_t selectionMinRepresentedSourceCount,
-    std::uint32_t selectionMaxRepresentedSourceCount) const {
+    std::uint32_t selectionMaxRepresentedSourceCount,
+    const glm::mat4& selectionViewProjection,
+    float selectionFrustumGuardBand) const {
     const auto mixWord = [](std::uint32_t value) {
         value ^= value >> 16U;
         value *= 0x7feb352dU;
@@ -5577,6 +5626,13 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
                 item,
                 selectionMinRepresentedSourceCount,
                 selectionMaxRepresentedSourceCount)) {
+            continue;
+        }
+        if (!DrawItemWithinFrustumGuard(
+                item,
+                positions,
+                selectionViewProjection,
+                selectionFrustumGuardBand)) {
             continue;
         }
         std::uint32_t footprintBits = 0;
@@ -6867,6 +6923,7 @@ bool VulkanViewportShell::PointCloudPlanUsesGpuCompaction(
            plan.resources->gpuCompactedDrawItemCapacities[frameIndex] >= plan.drawPointCount &&
            plan.resources->gpuCompactionStatsBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactionIndirectCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
+           plan.resources->positionStorageBuffer.buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactionIndirectDescriptorSets[frameIndex] != VK_NULL_HANDLE &&
            plan.resources->gpuCompactionDescriptorSets[frameIndex] != VK_NULL_HANDLE;
 }
@@ -6924,9 +6981,15 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             kGpuDiagnosticMinSelectionRepresentedSourceCount;
         constexpr std::uint32_t selectionMaxRepresentedSourceCount =
             kGpuDiagnosticMaxSelectionRepresentedSourceCount;
+        const auto selectionPositionCount = static_cast<std::uint32_t>(
+            std::min<std::size_t>(
+                plan.resources->cpuPositions.size(),
+                std::numeric_limits<std::uint32_t>::max()));
+        constexpr float selectionFrustumGuardBand = kGpuDiagnosticSelectionFrustumGuardBand;
         const auto expectedStats =
             ComputeGpuCompactionStats(
                 *layer.adaptiveDrawItems,
+                plan.resources->cpuPositions,
                 selectionLimit,
                 selectionClassMask,
                 selectionRankLimit,
@@ -6939,7 +7002,9 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMinRenderAreaPixels,
                 selectionMaxRenderAreaPixels,
                 selectionMinRepresentedSourceCount,
-                selectionMaxRepresentedSourceCount);
+                selectionMaxRepresentedSourceCount,
+                renderState_.viewProjection,
+                selectionFrustumGuardBand);
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
             plan.resources->gpuCompactionStatsBuffers[frameIndex],
@@ -6959,8 +7024,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             glm::uvec4{
                 selectionMinRepresentedSourceCount,
                 selectionMaxRepresentedSourceCount,
-                0U,
-                0U}};
+                selectionPositionCount,
+                FloatBits(selectionFrustumGuardBand)}};
         VkDescriptorSet descriptorSet = plan.resources->gpuCompactionDescriptorSets[frameIndex];
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -7097,6 +7162,12 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = std::max(
             diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount,
             selectionMaxRepresentedSourceCount);
+        diagnostics_.adaptiveGpuCompactionSelectionPositionCount = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionPositionCount,
+            selectionPositionCount);
+        diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand,
+            selectionFrustumGuardBand);
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems += expectedStats.count;
     }
 
@@ -7109,7 +7180,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison";
+            "CPU-selected frustum-checked performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
         }
@@ -7236,7 +7307,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; submitted indirect commands are still CPU-count driven"
+                  "CPU-selected frustum-checked performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =

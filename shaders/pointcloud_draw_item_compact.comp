@@ -22,9 +22,13 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionMaxRenderAreaBits;
     uint selectionMinRepresentedSourceCount;
     uint selectionMaxRepresentedSourceCount;
-    uint reserved0;
-    uint reserved1;
+    uint selectionPositionCount;
+    uint selectionFrustumGuardBandBits;
 } pushConstants;
+
+layout(set = 0, binding = 3) uniform FrameUniforms {
+    mat4 viewProjection;
+} uniforms;
 
 layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
     PointDrawItemGpu drawItems[];
@@ -45,6 +49,10 @@ layout(set = 0, binding = 2, std430) buffer CompactionStats {
     uint combinedChecksum;
 } stats;
 
+layout(set = 0, binding = 4, std430) readonly buffer PointPositions {
+    vec4 positions[];
+} pointPositions;
+
 uint MixWord(uint value) {
     value ^= value >> 16;
     value *= 0x7feb352du;
@@ -64,6 +72,7 @@ void main() {
     }
 
     const PointDrawItemGpu item = inputDrawItems.drawItems[drawIndex];
+    const uint sourceIndex = item.indices.x;
     const uint classFlags = (item.indices.w >> 14u) & 0xffu;
     if (pushConstants.selectionClassMask != 0u &&
         (classFlags & pushConstants.selectionClassMask) == 0u) {
@@ -102,11 +111,27 @@ void main() {
         representedCount > pushConstants.selectionMaxRepresentedSourceCount) {
         return;
     }
+    if (sourceIndex >= pushConstants.selectionPositionCount) {
+        return;
+    }
+    const vec4 clipPosition = uniforms.viewProjection * pointPositions.positions[sourceIndex];
+    const float frustumGuardBand = uintBitsToFloat(pushConstants.selectionFrustumGuardBandBits);
+    if (clipPosition.w <= 0.0) {
+        return;
+    }
+    const float guardedW = clipPosition.w * max(frustumGuardBand, 1.0);
+    if (clipPosition.x < -guardedW ||
+        clipPosition.x > guardedW ||
+        clipPosition.y < -guardedW ||
+        clipPosition.y > guardedW ||
+        clipPosition.z < -guardedW ||
+        clipPosition.z > guardedW) {
+        return;
+    }
 
     const uint outputIndex = atomicAdd(stats.count, 1u);
     outputDrawItems.drawItems[outputIndex] = item;
 
-    const uint sourceIndex = item.indices.x;
     const uint footprintBits = floatBitsToUint(item.params.x);
     const uint mixed = MixWord(sourceIndex ^ (drawIndex * 0x9e3779b9u)) ^
                        MixWord(representedCount + 0x85ebca6bu) ^

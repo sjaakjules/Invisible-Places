@@ -151,6 +151,8 @@ struct ViewportDiagnostics {
     float adaptiveGpuCompactionSelectionMaxRenderAreaPixels = 0.0F;
     std::uint32_t adaptiveGpuCompactionSelectionMinRepresentedSourceCount = 0;
     std::uint32_t adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
+    std::uint32_t adaptiveGpuCompactionSelectionPositionCount = 0;
+    float adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
@@ -620,6 +622,7 @@ class VulkanViewportShell {
     void UpdateGpuCompactionDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     [[nodiscard]] GpuDrawItemCompactionStats ComputeGpuCompactionStats(
         const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
+        const std::vector<invisible_places::io::Float3>& positions,
         std::uint32_t drawItemCount,
         std::uint32_t selectionClassMask,
         std::uint32_t selectionRankLimit,
@@ -632,7 +635,9 @@ class VulkanViewportShell {
         float selectionMinRenderAreaPixels,
         float selectionMaxRenderAreaPixels,
         std::uint32_t selectionMinRepresentedSourceCount,
-        std::uint32_t selectionMaxRepresentedSourceCount) const;
+        std::uint32_t selectionMaxRepresentedSourceCount,
+        const glm::mat4& selectionViewProjection,
+        float selectionFrustumGuardBand) const;
     [[nodiscard]] bool PointCloudPlanUsesGpuCompaction(
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
