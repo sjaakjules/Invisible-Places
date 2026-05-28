@@ -172,6 +172,18 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionOutputProbeGpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionOutputProbeCpuSourceFingerprint = 0;
     std::uint32_t adaptiveGpuCompactionOutputProbeGpuSourceFingerprint = 0;
+    bool adaptiveGpuFeatureClassProbeUsed = false;
+    std::string adaptiveGpuFeatureClassProbeParityStatus = "not checked";
+    std::uint32_t adaptiveGpuFeatureClassProbeDispatches = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeMask = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeCpuCount = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeGpuCount = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeCpuChecksum = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeGpuChecksum = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeCpuSourceFingerprint = 0;
+    std::uint32_t adaptiveGpuFeatureClassProbeGpuSourceFingerprint = 0;
+    double adaptiveGpuFeatureClassProbeCpuReferenceMs = 0.0;
+    double adaptiveGpuFeatureClassProbeMs = 0.0;
     bool adaptiveGpuCompactionSubmissionEligible = false;
     bool adaptiveGpuCompactionSubmissionUsed = false;
     std::string adaptiveGpuCompactionSubmissionFallbackReason;
@@ -493,11 +505,13 @@ class VulkanViewportShell {
         std::array<BufferAllocation, kFramesInFlight> drawItemBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuCompactedDrawItemBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuCompactionStatsBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> gpuFeatureClassProbeStatsBuffers{};
         std::array<BufferAllocation, kFramesInFlight> indirectDrawCommandBuffers{};
         std::array<BufferAllocation, kFramesInFlight> gpuCompactionIndirectCommandBuffers{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuIndirectDescriptorSets{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuCompactionIndirectDescriptorSets{};
         std::array<VkDescriptorSet, kFramesInFlight> gpuCompactionDescriptorSets{};
+        std::array<VkDescriptorSet, kFramesInFlight> gpuFeatureClassProbeDescriptorSets{};
         BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
         std::uint32_t activePointCount = 0;
@@ -507,6 +521,8 @@ class VulkanViewportShell {
         std::array<std::uint32_t, kFramesInFlight> gpuCompactedDrawItemCapacities{};
         std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuCompactionExpectedStats{};
         std::array<bool, kFramesInFlight> gpuCompactionResultPending{};
+        std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuFeatureClassProbeExpectedStats{};
+        std::array<bool, kFramesInFlight> gpuFeatureClassProbeResultPending{};
         std::array<GpuDrawItemOutputProbeStats, kFramesInFlight> gpuCompactionExpectedOutputProbeStats{};
         std::array<bool, kFramesInFlight> gpuCompactionOutputProbeResultPending{};
         std::array<VkDrawIndirectCommand, kFramesInFlight> gpuCompactionExpectedIndirectCommands{};
@@ -558,7 +574,7 @@ class VulkanViewportShell {
         VkFence fence = VK_NULL_HANDLE;
         VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
         bool timestampQueriesArmed = false;
-        std::array<bool, 7U> timestampPassWritten{};
+        std::array<bool, 8U> timestampPassWritten{};
     };
 
     struct HighQualityGaussianSceneResources {
@@ -700,6 +716,7 @@ class VulkanViewportShell {
     void UpdateGpuDrivenIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     void UpdateGpuCompactionIndirectDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     void UpdateGpuCompactionDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
+    void UpdateGpuFeatureClassProbeDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex);
     [[nodiscard]] GpuDrawItemCompactionStats ComputeGpuCompactionStats(
         const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
         const std::vector<invisible_places::io::Float3>& positions,
