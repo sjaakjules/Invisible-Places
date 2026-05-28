@@ -228,6 +228,8 @@ constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
 constexpr std::uint32_t kMinimumAdaptiveIndirectDrawPoints = 4096U;
+constexpr std::uint32_t kDrawItemMetadataRankMask = 0x7ffU;
+constexpr std::uint32_t kGpuDiagnosticRankSelectionLimit = kDrawItemMetadataRankMask / 2U;
 constexpr std::uint32_t kDrawItemMetadataClassShift = 14U;
 constexpr std::uint32_t kDrawItemMetadataClassMask = 0xffU;
 constexpr std::uint32_t kGpuDiagnosticFeatureClassSelectionMask =
@@ -248,6 +250,11 @@ std::uint32_t GpuDiagnosticPrefixSelectionLimit(std::uint32_t drawPointCount) {
 std::uint32_t DrawItemRepresentativeClassFlags(
     const renderer::pointcloud::PointCloudDrawItemGpu& item) {
     return (item.reserved1 >> kDrawItemMetadataClassShift) & kDrawItemMetadataClassMask;
+}
+
+std::uint32_t DrawItemRepresentativePackedRank(
+    const renderer::pointcloud::PointCloudDrawItemGpu& item) {
+    return item.reserved1 & kDrawItemMetadataRankMask;
 }
 
 bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, float epsilon = 1.0e-6F) {
@@ -1093,6 +1100,7 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
         diagnostics_.adaptiveGpuCompactionSelectionClassMask = 0;
+        diagnostics_.adaptiveGpuCompactionSelectionRankLimit = 0;
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -1489,6 +1497,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
     diagnostics_.adaptiveGpuCompactionSelectionClassMask = 0;
+    diagnostics_.adaptiveGpuCompactionSelectionRankLimit = 0;
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -5290,7 +5299,8 @@ void VulkanViewportShell::UpdateGpuCompactionDescriptorSet(
 VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuCompactionStats(
     const std::vector<renderer::pointcloud::PointCloudDrawItemGpu>& drawItems,
     std::uint32_t drawItemCount,
-    std::uint32_t selectionClassMask) const {
+    std::uint32_t selectionClassMask,
+    std::uint32_t selectionRankLimit) const {
     const auto mixWord = [](std::uint32_t value) {
         value ^= value >> 16U;
         value *= 0x7feb352dU;
@@ -5309,6 +5319,9 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
         const auto& item = drawItems[drawIndex];
         if (selectionClassMask != 0U &&
             (DrawItemRepresentativeClassFlags(item) & selectionClassMask) == 0U) {
+            continue;
+        }
+        if (DrawItemRepresentativePackedRank(item) > selectionRankLimit) {
             continue;
         }
         std::uint32_t footprintBits = 0;
@@ -6626,8 +6639,13 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticPrefixSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticFeatureClassSelectionMask;
+        constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         const auto expectedStats =
-            ComputeGpuCompactionStats(*layer.adaptiveDrawItems, selectionLimit, selectionClassMask);
+            ComputeGpuCompactionStats(
+                *layer.adaptiveDrawItems,
+                selectionLimit,
+                selectionClassMask,
+                selectionRankLimit);
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
             plan.resources->gpuCompactionStatsBuffers[frameIndex],
@@ -6637,7 +6655,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         plan.resources->gpuCompactionResultPending[frameIndex] = true;
 
         const GpuDrawItemCompactionPushConstants pushConstants{
-            glm::uvec4{plan.drawPointCount, selectionLimit, selectionClassMask, 0U}};
+            glm::uvec4{plan.drawPointCount, selectionLimit, selectionClassMask, selectionRankLimit}};
         VkDescriptorSet descriptorSet = plan.resources->gpuCompactionDescriptorSets[frameIndex];
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -6662,6 +6680,9 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuCompactionInputDrawItems += plan.drawPointCount;
         diagnostics_.adaptiveGpuCompactionSelectionLimit += selectionLimit;
         diagnostics_.adaptiveGpuCompactionSelectionClassMask |= selectionClassMask;
+        diagnostics_.adaptiveGpuCompactionSelectionRankLimit = std::max(
+            diagnostics_.adaptiveGpuCompactionSelectionRankLimit,
+            selectionRankLimit);
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems += expectedStats.count;
     }
 
@@ -6674,7 +6695,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected feature-class draw items are prefix-filtered, compacted, and checksummed by compute for comparison";
+            "CPU-selected rank-limited feature draw items are prefix-filtered, compacted, and checksummed by compute for comparison";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
         }
@@ -6795,7 +6816,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected feature-class draw items are prefix-filtered, compacted, and checksummed by compute, and indirect commands are generated by compute"
+                  "CPU-selected rank-limited feature draw items are prefix-filtered, compacted, and checksummed by compute, and indirect commands are generated by compute"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =
