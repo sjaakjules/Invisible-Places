@@ -3082,6 +3082,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionOutputProbeCpuChecksum") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionCpuSourceFingerprint") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionGpuSourceFingerprint") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionPerformanceFallbackReason") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionPerformanceSlowFrames") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionPerformanceRetryFrames") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionIndirectCommandUsed") != std::string::npos);
@@ -3105,6 +3108,12 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("ComputeGpuCompactionOutputProbeStatsFromBuffer") != std::string::npos);
     CHECK(rendererSource.find("VK_ACCESS_HOST_READ_BIT") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame compacted output probe identity") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticCompactionSlowFrameThreshold") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticCompactionRetryCooldownFrames") != std::string::npos);
+    CHECK(rendererSource.find("GpuCompactionPerformanceFallbackReason") != std::string::npos);
+    CHECK(rendererSource.find("UpdateGpuCompactionPerformanceGate") != std::string::npos);
+    CHECK(rendererSource.find("ResetGpuCompactionPerformanceFrame") != std::string::npos);
+    CHECK(rendererSource.find("GPU prefix compaction performance fallback") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticPrefixSelectionLimit") != std::string::npos);
     CHECK(rendererSource.find("dispatchItemCount") != std::string::npos);
@@ -3159,7 +3168,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_compaction_cpu_reference_ms") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_cpu_source_fingerprint") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_gpu_source_fingerprint") != std::string::npos);
+    CHECK(appSource.find("gpu_compaction_performance_fallback_reason") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_performance_status") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_performance_fallback_reason") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_performance_retry_frames") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_used") != std::string::npos);
@@ -3185,6 +3197,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("beauty_stress_compaction_cpu_source_fingerprint") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_gpu_source_fingerprint") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_performance_status") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_performance_fallback_reason") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_performance_retry_frames") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_indirect_command_used") != std::string::npos);

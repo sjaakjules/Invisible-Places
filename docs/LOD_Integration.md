@@ -37,7 +37,9 @@ prefix-selection/performance-clamped represented-count-limited projected-footpri
 diagnostic viewport draws, a capped 4,096-item compacted-output diagnostic probe
 with an explicit not-submitted fallback while CPU draw submission remains authoritative, diagnostic compacted-count indirect
 command output, bounded prefix-range dispatch, and CPU-count compute-generated submitted indirect
-command output for eligible viewport draws. The frustum-checked shader path remains available for comparison,
+command output for eligible viewport draws. It also tracks CPU/GPU prefix predicate
+timing per renderer profile and temporarily suspends the compare-only prefix pass
+with an explicit retry-window fallback when the GPU path is slower. The frustum-checked shader path remains available for comparison,
 but is disabled by default after slower MoltenVK timing. GPU compute selection
 remains guarded behind feature, parity, and timing proof; on the local MoltenVK
 runtime the current reported path is
@@ -421,8 +423,10 @@ sample-count cap anymore.
   but `*_compaction_selection_frustum_enabled=false`, guard band 0, and the
   fallback reason reports that the GPU geometry-frustum prefix predicate is
   disabled because the previous MoltenVK/sample measurement was slower than
-  metadata-only prefix compaction. The latest bounded-output-probe readback run records CPU reference timing
-  and reports `CPU reference faster; GPU prefix compaction remains compare-only`.
+  metadata-only prefix compaction. The latest performance-gated output-probe run records CPU reference timing,
+  reports `CPU reference faster; GPU prefix compaction remains compare-only`,
+  and suspends the compare-only prefix pass for a 120-frame retry window after
+  a slower per-profile sample.
   Fast Basic recorded 1 metadata prefix dispatch
   over 262,115 CPU-selected draw items but dispatched only 131,057 work items,
   checked a 131,057-item prefix with profile
@@ -430,27 +434,31 @@ sample-count cap anymore.
   flags 0, opacity window 0.05-8, emission window 1-4, represented-count window
   2-4,294,967,295 and projected footprint/render area window 1-1.04858e+06 px,
   wrote a max 4,096 draw items to the capped output probe,
-  measured 0.574375 ms for the CPU reference predicate and 1.238 ms for GPU
-  compaction, matched previous-frame CPU/GPU
+  measured 0.592042 ms for the CPU reference predicate and 1.26679 ms for GPU
+  compaction, reported performance fallback
+  `GPU prefix compaction was slower than the CPU reference after a slower Fast Basic square sample (last CPU 0.484667 ms, GPU 1.266792 ms); compare pass suspended until the retry window reopens`,
+  left 119 retry frames, and matched previous-frame CPU/GPU
   count 3,139, source fingerprint 2,306,815,097 / 2,306,815,097, checksum
   1,197,028,360 / 1,197,028,360, output-probe count 3,139 / 3,139,
   output-probe fingerprint 2,355,254,641 / 2,355,254,641, output-probe checksum
   3,556,994,294 / 3,556,994,294, matched compacted indirect CPU/GPU
   vertices 3,139 / 3,139, plus 1 CPU-count GPU indirect-command dispatch at
-  0.38825 ms. Beauty stress recorded 1 matching
+  0.954666 ms. Beauty stress recorded 1 matching
   metadata prefix dispatch over 262,132 draw items but dispatched only 131,066 work items,
   checked a 131,066-item prefix
   with profile mask 2, class mask 126, rank limit 1023, depth window 2-255,
   required flags 4, and rejected flags 0, wrote a max 4,096 draw items to the
-  capped output probe, measured 0.586084 ms for the CPU reference predicate and
-  1.92621 ms for GPU compaction, matched
+  capped output probe, measured 0.601583 ms for the CPU reference predicate and
+  3.20367 ms for GPU compaction, reported performance fallback
+  `GPU prefix compaction was slower than the CPU reference after a slower Beauty screen sprite sample (last CPU 0.569666 ms, GPU 3.203666 ms); compare pass suspended until the retry window reopens`,
+  left 119 retry frames, and matched
   previous-frame CPU/GPU count 2,301, source fingerprint 3,348,557,094 / 3,348,557,094,
   checksum 4,287,346,937 / 4,287,346,937, output-probe count 2,301 / 2,301,
   output-probe fingerprint 3,318,372,212 / 3,318,372,212, and output-probe checksum
   2,612,362,694 / 2,612,362,694, and matched
   compacted indirect CPU/GPU vertices 2,301 / 2,301. The bounded output probe keeps compacted-output writes
   safe and measured, but CPU reference predicates are still
-  faster, so the CPU fallback and
+  faster, so the CPU fallback, performance cooldown, and
   compare-only status remain active. The prior frustum shader measurement was
   13.6525 ms in Fast Basic and 8.31621 ms in Beauty stress, so it remains
   disabled unless a future optimization makes it beneficial.
@@ -789,7 +797,8 @@ Initial quality targets:
 - `lod_compare_metrics.json` should include `metrics_schema_version`,
   `density_policy`, `determinism`, source/cache fingerprints, and
   `difference_exr`; schema v3 should also include tile pressure and
-  conservative culling fields.
+  conservative culling fields, plus GPU compaction performance fallback/retry
+  fields when compare-only prefix compaction is slower than the CPU reference.
 - Applicable RGB/scalar/normal/emissive data should produce nonzero Adaptive HQ
   and exact Fast Basic CPU representative class counts plus nonzero
   feature-triggered refinement counts.

@@ -175,6 +175,9 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionCpuSourceFingerprint = 0;
     std::uint32_t adaptiveGpuCompactionGpuSourceFingerprint = 0;
+    std::string adaptiveGpuCompactionPerformanceFallbackReason;
+    std::uint32_t adaptiveGpuCompactionPerformanceSlowFrames = 0;
+    std::uint32_t adaptiveGpuCompactionPerformanceRetryFrames = 0;
     bool adaptiveIndirectDrawSupported = false;
     bool adaptiveIndirectCountSupported = false;
     bool adaptiveIndirectDrawRecommended = false;
@@ -415,6 +418,7 @@ class VulkanViewportShell {
 
   private:
     static constexpr std::size_t kFramesInFlight = 2U;
+    static constexpr std::size_t kGpuCompactionPerformanceProfileCount = 4U;
 
     struct BufferAllocation {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -450,6 +454,13 @@ class VulkanViewportShell {
         std::uint32_t sourceIndexSum = 0;
         std::uint32_t representedCountSum = 0;
         std::uint32_t identityChecksum = 0;
+    };
+
+    struct GpuCompactionPerformanceGateState {
+        double lastCpuReferenceMs = 0.0;
+        double lastGpuMs = 0.0;
+        std::uint32_t consecutiveSlowerFrames = 0;
+        std::uint32_t retryCooldownFrames = 0;
     };
 
     struct ActivePointCloudResources {
@@ -624,8 +635,15 @@ class VulkanViewportShell {
     void CreateCommandPool();
     void CreateCommandBuffers();
     void CreateSyncObjects();
-    void ReadPreviousGpuTimestampResults(FrameResources* frame);
+    void ReadPreviousGpuTimestampResults(FrameResources* frame, std::size_t frameIndex);
     void ReadPreviousGpuCompactionResults(std::size_t frameIndex);
+    void ResetGpuCompactionPerformanceFrame(std::size_t frameIndex);
+    void DecayGpuCompactionPerformanceCooldowns();
+    void UpdateGpuCompactionPerformanceGate(std::size_t frameIndex, double gpuMs);
+    [[nodiscard]] static std::size_t GpuCompactionPerformanceProfileIndex(
+        renderer::pointcloud::PointCloudLodRendererCostProfile profile);
+    [[nodiscard]] std::string GpuCompactionPerformanceFallbackReason(
+        renderer::pointcloud::PointCloudLodRendererCostProfile profile) const;
     void ResetGpuTimestampQueries(VkCommandBuffer commandBuffer, FrameResources* frame);
     void WriteGpuTimestamp(
         VkCommandBuffer commandBuffer,
@@ -863,6 +881,10 @@ class VulkanViewportShell {
     std::vector<ActiveGaussianSplatResources> gaussianSplatResources_;
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
     ExrExportResources exrExportResources_{};
+    std::array<std::array<double, kGpuCompactionPerformanceProfileCount>, kFramesInFlight>
+        gpuCompactionCpuReferenceMsByFrame_{};
+    std::array<GpuCompactionPerformanceGateState, kGpuCompactionPerformanceProfileCount>
+        gpuCompactionPerformanceGates_{};
     bool highQualityGaussianSceneDirty_ = true;
     SceneRenderState renderState_{};
     ViewportDiagnostics diagnostics_{};

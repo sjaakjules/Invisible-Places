@@ -264,6 +264,9 @@ constexpr std::uint32_t kGpuDiagnosticCompactionOutputProbeCapacity = 4096U;
 constexpr std::string_view kGpuDiagnosticCompactionOutputWriteFallbackReason =
     "compacted draw-item output writes are capped to a 4096-item diagnostic probe because the compacted buffer is not submitted yet; "
     "CPU draw submission remains authoritative while the GPU pass compares count/source-fingerprint/checksum and generates a diagnostic indirect command";
+constexpr double kGpuDiagnosticCompactionTimingEpsilonMs = 0.02;
+constexpr std::uint32_t kGpuDiagnosticCompactionSlowFrameThreshold = 1U;
+constexpr std::uint32_t kGpuDiagnosticCompactionRetryCooldownFrames = 120U;
 constexpr float kGpuDiagnosticSelectionFrustumGuardBand = 1.05F;
 constexpr bool kGpuDiagnosticSelectionFrustumGuardEnabled = false;
 constexpr std::string_view kGpuDiagnosticSelectionFrustumFallbackReason =
@@ -1034,7 +1037,7 @@ void VulkanViewportShell::DrawFrame() {
     auto& frame = frameResources_[currentFrameIndex_];
     vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
     if (collectDiagnostics) {
-        ReadPreviousGpuTimestampResults(&frame);
+        ReadPreviousGpuTimestampResults(&frame, currentFrameIndex_);
         ReadPreviousGpuCompactionResults(currentFrameIndex_);
     }
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
@@ -1198,6 +1201,10 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
     }
     diagnosticsEnabled_ = enabled;
     if (enabled) {
+        for (auto& cpuReferenceMsByProfile : gpuCompactionCpuReferenceMsByFrame_) {
+            cpuReferenceMsByProfile.fill(0.0);
+        }
+        gpuCompactionPerformanceGates_.fill({});
         diagnosticsTimingInitialized_ = false;
         diagnosticsFpsWindowMs_ = 0.0;
         diagnosticsFpsWindowFrames_ = 0;
@@ -1277,6 +1284,9 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = 0;
         diagnostics_.adaptiveGpuCompactionGpuSourceFingerprint = 0;
+        diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.clear();
+        diagnostics_.adaptiveGpuCompactionPerformanceSlowFrames = 0;
+        diagnostics_.adaptiveGpuCompactionPerformanceRetryFrames = 0;
         diagnostics_.adaptiveIndirectDrawSupported = gpuDrivenSelectionCapabilities_.indirectDrawSupported;
         diagnostics_.adaptiveIndirectCountSupported = gpuDrivenSelectionCapabilities_.indirectCountSupported;
         diagnostics_.adaptiveIndirectDrawRecommended = false;
@@ -1715,6 +1725,9 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionCpuSourceFingerprint = 0;
     diagnostics_.adaptiveGpuCompactionGpuSourceFingerprint = 0;
+    diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.clear();
+    diagnostics_.adaptiveGpuCompactionPerformanceSlowFrames = 0;
+    diagnostics_.adaptiveGpuCompactionPerformanceRetryFrames = 0;
     diagnostics_.adaptiveIndirectDrawSupported = gpuSelectionDecision.indirectDrawSupported;
     diagnostics_.adaptiveIndirectCountSupported = gpuSelectionDecision.indirectCountSupported;
     diagnostics_.adaptiveIndirectDrawRecommended = gpuSelectionDecision.indirectDrawRecommended;
@@ -4876,7 +4889,72 @@ void VulkanViewportShell::CreateSyncObjects() {
     }
 }
 
-void VulkanViewportShell::ReadPreviousGpuTimestampResults(FrameResources* frame) {
+void VulkanViewportShell::ResetGpuCompactionPerformanceFrame(std::size_t frameIndex) {
+    if (frameIndex >= gpuCompactionCpuReferenceMsByFrame_.size()) {
+        return;
+    }
+    gpuCompactionCpuReferenceMsByFrame_[frameIndex].fill(0.0);
+}
+
+void VulkanViewportShell::DecayGpuCompactionPerformanceCooldowns() {
+    for (auto& gate : gpuCompactionPerformanceGates_) {
+        if (gate.retryCooldownFrames > 0U) {
+            --gate.retryCooldownFrames;
+        }
+    }
+}
+
+std::size_t VulkanViewportShell::GpuCompactionPerformanceProfileIndex(
+    renderer::pointcloud::PointCloudLodRendererCostProfile profile) {
+    return std::min<std::size_t>(
+        static_cast<std::size_t>(profile),
+        kGpuCompactionPerformanceProfileCount - 1U);
+}
+
+std::string VulkanViewportShell::GpuCompactionPerformanceFallbackReason(
+    renderer::pointcloud::PointCloudLodRendererCostProfile profile) const {
+    const auto profileIndex = GpuCompactionPerformanceProfileIndex(profile);
+    const auto& gate = gpuCompactionPerformanceGates_[profileIndex];
+    if (gate.retryCooldownFrames == 0U) {
+        return {};
+    }
+    const auto slowSamplePhrase =
+        kGpuDiagnosticCompactionSlowFrameThreshold == 1U
+            ? std::string{"a slower "}
+            : (std::to_string(kGpuDiagnosticCompactionSlowFrameThreshold) + " consecutive slower ");
+    return std::string{"GPU prefix compaction was slower than the CPU reference after "} +
+           slowSamplePhrase + renderer::pointcloud::PointCloudLodRendererCostProfileName(profile) +
+           " sample (last CPU " + std::to_string(gate.lastCpuReferenceMs) +
+           " ms, GPU " + std::to_string(gate.lastGpuMs) +
+           " ms); compare pass suspended until the retry window reopens";
+}
+
+void VulkanViewportShell::UpdateGpuCompactionPerformanceGate(std::size_t frameIndex, double gpuMs) {
+    if (frameIndex >= gpuCompactionCpuReferenceMsByFrame_.size() || gpuMs <= 0.0) {
+        return;
+    }
+    for (std::size_t profileIndex = 0; profileIndex < kGpuCompactionPerformanceProfileCount; ++profileIndex) {
+        const double cpuReferenceMs = gpuCompactionCpuReferenceMsByFrame_[frameIndex][profileIndex];
+        if (cpuReferenceMs <= 0.0) {
+            continue;
+        }
+        auto& gate = gpuCompactionPerformanceGates_[profileIndex];
+        gate.lastCpuReferenceMs = cpuReferenceMs;
+        gate.lastGpuMs = gpuMs;
+        if (gpuMs > cpuReferenceMs + kGpuDiagnosticCompactionTimingEpsilonMs) {
+            ++gate.consecutiveSlowerFrames;
+            if (gate.consecutiveSlowerFrames >= kGpuDiagnosticCompactionSlowFrameThreshold) {
+                gate.retryCooldownFrames = kGpuDiagnosticCompactionRetryCooldownFrames;
+                gate.consecutiveSlowerFrames = 0U;
+            }
+        } else {
+            gate.consecutiveSlowerFrames = 0U;
+            gate.retryCooldownFrames = 0U;
+        }
+    }
+}
+
+void VulkanViewportShell::ReadPreviousGpuTimestampResults(FrameResources* frame, std::size_t frameIndex) {
     diagnostics_.gpuTimestampSupported = gpuTimestampsSupported_;
     diagnostics_.gpuTimestampTimingValid = false;
     diagnostics_.gpuFastBasicPointPassMs = 0.0;
@@ -4932,6 +5010,7 @@ void VulkanViewportShell::ReadPreviousGpuTimestampResults(FrameResources* frame)
     diagnostics_.gpuPostProcessPassMs = passMilliseconds(kGpuTimestampPostProcessPass);
     diagnostics_.adaptiveGpuCompactionMs = passMilliseconds(kGpuTimestampGpuDrawItemCompactionPass);
     diagnostics_.adaptiveGpuIndirectCommandMs = passMilliseconds(kGpuTimestampGpuDrivenIndirectCommandPass);
+    UpdateGpuCompactionPerformanceGate(frameIndex, diagnostics_.adaptiveGpuCompactionMs);
     diagnostics_.gpuTimestampTimingValid =
         diagnostics_.gpuFastBasicPointPassMs > 0.0 ||
         diagnostics_.gpuBeautyDepthPassMs > 0.0 ||
@@ -7181,6 +7260,10 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
     VkCommandBuffer commandBuffer,
     std::size_t frameIndex,
     bool forceFullSource) {
+    if (frameIndex < kFramesInFlight) {
+        ResetGpuCompactionPerformanceFrame(frameIndex);
+        DecayGpuCompactionPerformanceCooldowns();
+    }
     if (commandBuffer == VK_NULL_HANDLE ||
         frameIndex >= kFramesInFlight ||
         gpuDrawItemCompactionPipeline_ == VK_NULL_HANDLE ||
@@ -7196,6 +7279,25 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             !PointCloudPlanUsesGpuCompaction(plan, frameIndex, false) ||
             layer.adaptiveDrawItems == nullptr ||
             layer.adaptiveDrawItems->empty()) {
+            continue;
+        }
+
+        const auto performanceProfileIndex =
+            GpuCompactionPerformanceProfileIndex(layer.adaptiveRendererCostProfile);
+        const auto& performanceGate = gpuCompactionPerformanceGates_[performanceProfileIndex];
+        const auto performanceSlowFrames =
+            performanceGate.retryCooldownFrames > 0U
+                ? kGpuDiagnosticCompactionSlowFrameThreshold
+                : performanceGate.consecutiveSlowerFrames;
+        diagnostics_.adaptiveGpuCompactionPerformanceSlowFrames = std::max(
+            diagnostics_.adaptiveGpuCompactionPerformanceSlowFrames,
+            performanceSlowFrames);
+        diagnostics_.adaptiveGpuCompactionPerformanceRetryFrames = std::max(
+            diagnostics_.adaptiveGpuCompactionPerformanceRetryFrames,
+            performanceGate.retryCooldownFrames);
+        if (performanceGate.retryCooldownFrames > 0U) {
+            diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason =
+                GpuCompactionPerformanceFallbackReason(layer.adaptiveRendererCostProfile);
             continue;
         }
 
@@ -7275,8 +7377,9 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionFrustumGuardBand,
                 &expectedOutputProbeStats,
                 selectionMaxOutputCount);
-        diagnostics_.adaptiveGpuCompactionCpuReferenceMs +=
-            MillisecondsBetween(cpuReferenceStart, std::chrono::steady_clock::now());
+        const double cpuReferenceMs = MillisecondsBetween(cpuReferenceStart, std::chrono::steady_clock::now());
+        diagnostics_.adaptiveGpuCompactionCpuReferenceMs += cpuReferenceMs;
+        gpuCompactionCpuReferenceMsByFrame_[frameIndex][performanceProfileIndex] += cpuReferenceMs;
         const GpuDrawItemCompactionStats resetStats{};
         UploadBufferData(
             plan.resources->gpuCompactionStatsBuffers[frameIndex],
@@ -7527,6 +7630,11 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
             "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, workgroup-aggregated, count-compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
             "the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing";
+        if (!diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.empty()) {
+            diagnostics_.adaptiveSelectionFallbackReason +=
+                "; GPU prefix compaction performance fallback: " +
+                diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason;
+        }
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
         }
@@ -7661,6 +7769,11 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
                   "CPU-selected renderer-profile-filtered performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, workgroup-aggregated, count-compacted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
+        if (!diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason.empty()) {
+            diagnostics_.adaptiveSelectionFallbackReason +=
+                "; GPU prefix compaction performance fallback: " +
+                diagnostics_.adaptiveGpuCompactionPerformanceFallbackReason;
+        }
         diagnostics_.adaptiveSelectionParityStatus =
             "CPU-selected draw count drives GPU-generated indirect command";
     }
