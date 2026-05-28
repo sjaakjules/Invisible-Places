@@ -259,10 +259,11 @@ constexpr float kGpuDiagnosticMaxSelectionEmissionCompensation = 4.0F;
 constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
-constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = false;
+constexpr bool kGpuDiagnosticCompactionOutputWriteEnabled = true;
+constexpr std::uint32_t kGpuDiagnosticCompactionOutputProbeCapacity = 4096U;
 constexpr std::string_view kGpuDiagnosticCompactionOutputWriteFallbackReason =
-    "compacted draw-item output writes are disabled because the compacted buffer is not submitted yet; "
-    "the GPU pass compares count/source-fingerprint/checksum and generates a diagnostic indirect command";
+    "compacted draw-item output writes are capped to a 4096-item diagnostic probe because the compacted buffer is not submitted yet; "
+    "CPU draw submission remains authoritative while the GPU pass compares count/source-fingerprint/checksum and generates a diagnostic indirect command";
 constexpr float kGpuDiagnosticSelectionFrustumGuardBand = 1.05F;
 constexpr bool kGpuDiagnosticSelectionFrustumGuardEnabled = false;
 constexpr std::string_view kGpuDiagnosticSelectionFrustumFallbackReason =
@@ -282,6 +283,16 @@ std::uint32_t GpuDiagnosticPrefixSelectionLimit(std::uint32_t drawPointCount) {
         return drawPointCount;
     }
     return std::max(kMinimumAdaptiveIndirectDrawPoints, drawPointCount / 2U);
+}
+
+std::uint32_t GpuDiagnosticCompactionOutputCapacity(std::uint32_t drawPointCount) {
+    if (!kGpuDiagnosticCompactionOutputWriteEnabled) {
+        return 1U;
+    }
+    return std::clamp<std::uint32_t>(
+        std::max<std::uint32_t>(1U, drawPointCount),
+        1U,
+        kGpuDiagnosticCompactionOutputProbeCapacity);
 }
 
 std::uint32_t DrawItemRepresentativeClassFlags(
@@ -5135,7 +5146,7 @@ bool VulkanViewportShell::UpdatePointCloudDrawItemBuffer(
         std::min<std::size_t>(drawItems->size(), std::numeric_limits<std::uint32_t>::max()));
     const auto requiredCapacity = std::max<std::uint32_t>(1U, drawItemCount);
     const auto requiredGpuCompactedDrawItemCapacity =
-        kGpuDiagnosticCompactionOutputWriteEnabled ? requiredCapacity : 1U;
+        GpuDiagnosticCompactionOutputCapacity(drawItemCount);
     if (resources->drawItemSignatures[frameIndex] == revision &&
         resources->drawItemCounts[frameIndex] == drawItemCount &&
         resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
@@ -7029,7 +7040,7 @@ bool VulkanViewportShell::PointCloudPlanUsesGpuCompaction(
     }
 
     const auto requiredCompactedOutputCapacity =
-        kGpuDiagnosticCompactionOutputWriteEnabled ? plan.drawPointCount : 1U;
+        GpuDiagnosticCompactionOutputCapacity(plan.drawPointCount);
     return plan.resources->drawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactedDrawItemBuffers[frameIndex].buffer != VK_NULL_HANDLE &&
            plan.resources->gpuCompactedDrawItemCapacities[frameIndex] >= requiredCompactedOutputCapacity &&
@@ -7099,6 +7110,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         constexpr std::uint32_t selectionMaxRepresentedSourceCount =
             kGpuDiagnosticMaxSelectionRepresentedSourceCount;
         constexpr bool selectionWriteOutput = kGpuDiagnosticCompactionOutputWriteEnabled;
+        const auto selectionMaxOutputCount =
+            GpuDiagnosticCompactionOutputCapacity(plan.drawPointCount);
         constexpr bool selectionFrustumEnabled = kGpuDiagnosticSelectionFrustumGuardEnabled;
         const auto selectionPositionCount = selectionFrustumEnabled
                                                 ? static_cast<std::uint32_t>(
@@ -7156,7 +7169,11 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
                 selectionMaxRepresentedSourceCount,
                 selectionPositionCount,
                 FloatBits(selectionFrustumGuardBand)},
-            glm::uvec4{selectionProfileMask, selectionWriteOutput ? 1U : 0U, 0U, 0U},
+            glm::uvec4{
+                selectionProfileMask,
+                selectionWriteOutput ? 1U : 0U,
+                selectionMaxOutputCount,
+                0U},
             glm::uvec4{
                 FloatBits(selectionMinOpacityCompensation),
                 FloatBits(selectionMaxOpacityCompensation),
@@ -7327,12 +7344,14 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         }
         diagnostics_.adaptiveGpuCompactionOutputWriteEnabled =
             diagnostics_.adaptiveGpuCompactionOutputWriteEnabled || selectionWriteOutput;
-        if (!selectionWriteOutput) {
+        if (selectionWriteOutput) {
             diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason =
                 std::string(kGpuDiagnosticCompactionOutputWriteFallbackReason);
-        }
-        if (selectionWriteOutput) {
-            diagnostics_.adaptiveGpuCompactionCopiedDrawItems += expectedStats.count;
+            diagnostics_.adaptiveGpuCompactionCopiedDrawItems +=
+                std::min(expectedStats.count, selectionMaxOutputCount);
+        } else {
+            diagnostics_.adaptiveGpuCompactionOutputWriteFallbackReason =
+                "compacted draw-item output writes are disabled by policy";
         }
     }
 

@@ -34,8 +34,8 @@ Stage 11 adds runtime GPU-driven selection feature checks, CPU/GPU parity policy
 helpers, indirect draw diagnostics, `vkCmdDrawIndirect` submission for large
 adaptive draw-item paths when supported, compare-only GPU draw-item
 prefix-selection/performance-clamped represented-count-limited projected-footprint depth-windowed rank-and-feature-class filtering/count-compaction/source-fingerprint/checksum diagnostics for
-diagnostic viewport draws, explicit count-only output-write fallback while the
-compacted draw-item buffer is not submitted, diagnostic compacted-count indirect
+diagnostic viewport draws, a capped 4,096-item compacted-output diagnostic probe
+with an explicit not-submitted fallback while CPU draw submission remains authoritative, diagnostic compacted-count indirect
 command output, bounded prefix-range dispatch, and CPU-count compute-generated submitted indirect
 command output for eligible viewport draws. The frustum-checked shader path remains available for comparison,
 but is disabled by default after slower MoltenVK timing. GPU compute selection
@@ -410,18 +410,17 @@ sample-count cap anymore.
   representatives, dispatches only the bounded prefix range, aggregates selected
   items per workgroup before updating global compaction stats, folds
   source-identity fingerprints from the existing source-index XOR/sum accumulators,
-  checksums CPU-selected draw items, and converts
-  the compacted GPU count to a diagnostic indirect command. Compacted draw-item
-  output writes are disabled with an explicit fallback reason because the
-  compacted buffer is not submitted yet; the pass is count-only for now and
-  reports 0 copied draw items while preserving count/source-fingerprint/checksum
-  parity. The submitted
+  checksums CPU-selected draw items, writes a capped 4,096-item compacted-output
+  diagnostic probe, and converts the compacted GPU count to a diagnostic indirect
+  command. The output probe has an explicit fallback reason because the compacted
+  buffer is not submitted yet; CPU draw submission remains authoritative while
+  count/source-fingerprint/checksum parity is measured. The submitted
   indirect command remains CPU-count driven until full CPU/GPU compute-selection
   parity and timing are available. The frustum-checked shader path still exists,
   but `*_compaction_selection_frustum_enabled=false`, guard band 0, and the
   fallback reason reports that the GPU geometry-frustum prefix predicate is
   disabled because the previous MoltenVK/sample measurement was slower than
-  metadata-only prefix compaction. The latest count-only workgroup-aggregated run records CPU reference timing
+  metadata-only prefix compaction. The latest bounded-output-probe run records CPU reference timing
   and reports `CPU reference faster; GPU prefix compaction remains compare-only`.
   Fast Basic recorded 1 metadata prefix dispatch
   over 262,115 CPU-selected draw items but dispatched only 131,057 work items,
@@ -429,24 +428,24 @@ sample-count cap anymore.
   mask 1, class mask 126, rank limit 1023, depth window 2-255, required flags 4, and rejected
   flags 0, opacity window 0.05-8, emission window 1-4, represented-count window
   2-4,294,967,295 and projected footprint/render area window 1-1.04858e+06 px,
-  count-compacted 3,139 items without writing compacted draw-item output,
-  measured 0.530833 ms for the CPU reference predicate and 1.51617 ms for GPU
+  wrote a max 4,096 draw items to the capped output probe,
+  measured 0.620667 ms for the CPU reference predicate and 1.33662 ms for GPU
   compaction, matched previous-frame CPU/GPU
   count 3,139, source fingerprint 2,306,815,097 / 2,306,815,097, and checksum
   1,197,028,360 / 1,197,028,360, matched compacted indirect CPU/GPU
   vertices 3,139 / 3,139, plus 1 CPU-count GPU indirect-command dispatch at
-  0.647291 ms. Beauty stress recorded 1 matching
+  0.941208 ms. Beauty stress recorded 1 matching
   metadata prefix dispatch over 262,132 draw items but dispatched only 131,066 work items,
   checked a 131,066-item prefix
   with profile mask 2, class mask 126, rank limit 1023, depth window 2-255,
-  required flags 4, and rejected flags 0, count-compacted 2,301 items without
-  writing compacted draw-item output, measured 0.531708 ms for the CPU reference
-  predicate and 1.41175 ms for GPU compaction, matched
+  required flags 4, and rejected flags 0, wrote a max 4,096 draw items to the
+  capped output probe, measured 0.504 ms for the CPU reference predicate and
+  2.03842 ms for GPU compaction, matched
   previous-frame CPU/GPU count 2,301, source fingerprint 3,348,557,094 / 3,348,557,094,
   and checksum 4,287,346,937 / 4,287,346,937, and matched
   compacted indirect CPU/GPU vertices 2,301 / 2,301; Beauty GPU indirect-command
-  timing was 0.043292 ms. Count-only output reduced GPU work relative to the
-  previous compacted-output timing, but CPU reference predicates are still
+  timing was 0.04075 ms. The bounded output probe keeps compacted-output writes
+  safe and measured, but CPU reference predicates are still
   faster, so the CPU fallback and
   compare-only status remain active. The prior frustum shader measurement was
   13.6525 ms in Fast Basic and 8.31621 ms in Beauty stress, so it remains

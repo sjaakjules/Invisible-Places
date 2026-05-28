@@ -26,7 +26,7 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionFrustumGuardBandBits;
     uint selectionProfileMask;
     uint selectionWriteOutput;
-    uint reserved1;
+    uint selectionMaxOutputCount;
     uint reserved2;
     uint selectionMinOpacityCompensationBits;
     uint selectionMaxOpacityCompensationBits;
@@ -182,7 +182,10 @@ void main() {
     }
     barrier();
 
-    if (selected && pushConstants.selectionWriteOutput != 0u) {
-        outputDrawItems.drawItems[groupBase + localOutputIndex] = item;
+    const uint outputIndex = groupBase + localOutputIndex;
+    if (selected &&
+        pushConstants.selectionWriteOutput != 0u &&
+        outputIndex < pushConstants.selectionMaxOutputCount) {
+        outputDrawItems.drawItems[outputIndex] = item;
     }
 }

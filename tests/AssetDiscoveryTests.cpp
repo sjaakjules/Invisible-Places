@@ -2991,6 +2991,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("selectionMinOpacityCompensationBits") != std::string::npos);
     CHECK(compactionShader.find("selectionMaxEmissionCompensationBits") != std::string::npos);
     CHECK(compactionShader.find("selectionWriteOutput") != std::string::npos);
+    CHECK(compactionShader.find("selectionMaxOutputCount") != std::string::npos);
     CHECK(compactionShader.find("selectionMinRepresentedSourceCount") != std::string::npos);
     CHECK(compactionShader.find("selectionMaxRepresentedSourceCount") != std::string::npos);
     CHECK(compactionShader.find("selectionPositionCount") != std::string::npos);
@@ -3023,6 +3024,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("clipPosition.w > 0.0") != std::string::npos);
     CHECK(compactionShader.find("outputDrawItems.drawItems") != std::string::npos);
     CHECK(compactionShader.find("pushConstants.selectionWriteOutput != 0u") != std::string::npos);
+    CHECK(compactionShader.find("outputIndex < pushConstants.selectionMaxOutputCount") != std::string::npos);
     CHECK(compactionShader.find("localOutputIndex = atomicAdd(groupCount") != std::string::npos);
     CHECK(compactionShader.find("groupBase = atomicAdd(stats.count, groupCount)") != std::string::npos);
     CHECK(compactionShader.find("atomicXor(stats.sourceIndexXor") != std::string::npos);
@@ -3035,9 +3037,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(metadataCompactionShader.find("selectionProfileMask") != std::string::npos);
     CHECK(metadataCompactionShader.find("selectionMinOpacityCompensationBits") != std::string::npos);
     CHECK(metadataCompactionShader.find("selectionWriteOutput") != std::string::npos);
+    CHECK(metadataCompactionShader.find("selectionMaxOutputCount") != std::string::npos);
     CHECK(metadataCompactionShader.find("shared uint groupCount") != std::string::npos);
     CHECK(metadataCompactionShader.find("localOutputIndex = atomicAdd(groupCount") != std::string::npos);
     CHECK(metadataCompactionShader.find("groupBase = atomicAdd(stats.count, groupCount)") != std::string::npos);
+    CHECK(metadataCompactionShader.find("outputIndex < pushConstants.selectionMaxOutputCount") != std::string::npos);
     CHECK(metadataCompactionShader.find("uniforms.viewProjection") == std::string::npos);
     CHECK(metadataCompactionShader.find("pointPositions.positions") == std::string::npos);
     CHECK(metadataCompactionShader.find("outputDrawItems.drawItems") != std::string::npos);
@@ -3091,6 +3095,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("gpuCompactionIndirectCommandBuffers") != std::string::npos);
     CHECK(rendererSource.find("gpuCompactionExpectedIndirectCommands") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteEnabled") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputProbeCapacity") != std::string::npos);
+    CHECK(rendererSource.find("GpuDiagnosticCompactionOutputCapacity") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteFallbackReason") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticPrefixSelectionLimit") != std::string::npos);
