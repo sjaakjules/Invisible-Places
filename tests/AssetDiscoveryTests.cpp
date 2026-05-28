@@ -3119,6 +3119,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCoverageCompensationProbeMinOpacityCompensation") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCoverageCompensationProbeCpuReferenceMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCoverageCompensationProbeMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuClampFlagsProbeUsed") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuClampFlagsProbeParityStatus") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuClampFlagsProbeRequiredFlags") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuClampFlagsProbeCpuReferenceMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuClampFlagsProbeMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSubmissionEligible") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSubmissionFallbackReason") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSubmissionCandidateVertices") != std::string::npos);
@@ -3152,7 +3157,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("gpuCoverageCompensationProbeStatsBuffers") != std::string::npos);
     CHECK(rendererHeader.find("gpuCoverageCompensationProbeDescriptorSets") != std::string::npos);
     CHECK(rendererHeader.find("gpuCoverageCompensationProbeExpectedStats") != std::string::npos);
-    CHECK(rendererHeader.find("std::array<bool, 13U> timestampPassWritten") != std::string::npos);
+    CHECK(rendererHeader.find("gpuClampFlagsProbeStatsBuffers") != std::string::npos);
+    CHECK(rendererHeader.find("gpuClampFlagsProbeDescriptorSets") != std::string::npos);
+    CHECK(rendererHeader.find("gpuClampFlagsProbeExpectedStats") != std::string::npos);
+    CHECK(rendererHeader.find("std::array<bool, 14U> timestampPassWritten") != std::string::npos);
     CHECK(rendererHeader.find("gpuCompactionSubmissionEligible") != std::string::npos);
     CHECK(rendererHeader.find("gpuCompactionSubmissionVertexCounts") != std::string::npos);
     CHECK(rendererSource.find("vkCreateComputePipelines") != std::string::npos);
@@ -3166,6 +3174,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuTimestampGpuProjectedAreaProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuRepresentedCountProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuCoverageCompensationProbePass") != std::string::npos);
+    CHECK(rendererSource.find("kGpuTimestampGpuClampFlagsProbePass") != std::string::npos);
     CHECK(rendererSource.find("vkCmdDispatch(commandBuffer, 1, 1, 1)") != std::string::npos);
     CHECK(rendererSource.find("VK_ACCESS_INDIRECT_COMMAND_READ_BIT") != std::string::npos);
     CHECK(rendererSource.find("VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT") != std::string::npos);
@@ -3217,6 +3226,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticProjectedAreaProbeMinFootprintAreaPixels") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRepresentedCountProbeMin") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCoverageCompensationProbeMinOpacity") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticClampFlagsProbeRequiredFlags") != std::string::npos);
     CHECK(rendererSource.find("PointCloudLodRepresentativeClassColorContrast") != std::string::npos);
     CHECK(rendererSource.find("PointCloudLodRepresentativeClassEmissiveAccent") != std::string::npos);
     CHECK(rendererSource.find("pointcloud_draw_item_compact_metadata.comp.spv") != std::string::npos);
@@ -3260,6 +3270,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("gpuCoverageCompensationProbeResultPending") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame coverage-compensation window count/source-fingerprint/checksum/class-counts") != std::string::npos);
     CHECK(rendererSource.find("waiting for previous-frame coverage-compensation GPU checksum") != std::string::npos);
+    CHECK(rendererSource.find("UpdateGpuClampFlagsProbeDescriptorSet") != std::string::npos);
+    CHECK(rendererSource.find("gpuClampFlagsProbeResultPending") != std::string::npos);
+    CHECK(rendererSource.find("passed previous-frame clamp-flags count/source-fingerprint/checksum/class-counts") != std::string::npos);
+    CHECK(rendererSource.find("waiting for previous-frame clamp-flags GPU checksum") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-compacted-indirect-submit") != std::string::npos);
     CHECK(rendererSource.find("GPU-compacted draw-item output submitted after CPU/GPU parity") != std::string::npos);
@@ -3314,6 +3328,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("gpu_coverage_compensation_probe_performance_status") != std::string::npos);
     CHECK(appSource.find("fast_basic_coverage_compensation_probe_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_coverage_compensation_probe_performance_status") != std::string::npos);
+    CHECK(appSource.find("gpu_clamp_flags_probe_used") != std::string::npos);
+    CHECK(appSource.find("gpu_clamp_flags_probe_performance_status") != std::string::npos);
+    CHECK(appSource.find("fast_basic_clamp_flags_probe_used") != std::string::npos);
+    CHECK(appSource.find("fast_basic_clamp_flags_probe_performance_status") != std::string::npos);
     CHECK(appSource.find("GPU coverage-compensation probe") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_submission_eligible") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_submission_fallback_reason") != std::string::npos);

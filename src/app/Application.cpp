@@ -21454,6 +21454,19 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuCoverageCompensationProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuCoverageCompensationProbeMs);
                     }
+                    if (diagnostics.adaptiveGpuClampFlagsProbeUsed ||
+                        diagnostics.adaptiveGpuClampFlagsProbeParityStatus != "not checked" ||
+                        diagnostics.adaptiveGpuClampFlagsProbeMs > 0.0) {
+                        ImGui::Text(
+                            "GPU clamp-flags probe: %s | flags +0x%02x/-0x%02x | %u/%u items | cpu %.3f ms gpu %.3f ms",
+                            diagnostics.adaptiveGpuClampFlagsProbeParityStatus.c_str(),
+                            diagnostics.adaptiveGpuClampFlagsProbeRequiredFlags,
+                            diagnostics.adaptiveGpuClampFlagsProbeRejectedFlags,
+                            diagnostics.adaptiveGpuClampFlagsProbeGpuCount,
+                            diagnostics.adaptiveGpuClampFlagsProbeCpuCount,
+                            diagnostics.adaptiveGpuClampFlagsProbeCpuReferenceMs,
+                            diagnostics.adaptiveGpuClampFlagsProbeMs);
+                    }
                     ImGui::Text(
                         "GPU compacted submission: %s | %u/%u vertices",
                         diagnostics.adaptiveGpuCompactionSubmissionUsed
@@ -22516,6 +22529,19 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuCoverageCompensationProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuCoverageCompensationProbeMs = 0.0;
+    bool fastBasicGpuClampFlagsProbeUsed = false;
+    std::string fastBasicGpuClampFlagsProbeParityStatus = "not checked";
+    std::uint32_t fastBasicMaxGpuClampFlagsProbeDispatches = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeRequiredFlags = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeRejectedFlags = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuClampFlagsProbeGpuSourceFingerprint = 0;
+    double fastBasicMaxGpuClampFlagsProbeCpuReferenceMs = 0.0;
+    double fastBasicMaxGpuClampFlagsProbeMs = 0.0;
     bool fastBasicGpuCompactionSubmissionEligible = false;
     bool fastBasicGpuCompactionSubmissionUsed = false;
     std::string fastBasicGpuCompactionSubmissionFallbackReason;
@@ -23136,6 +23162,42 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuCoverageCompensationProbeMs = std::max(
             fastBasicMaxGpuCoverageCompensationProbeMs,
             diagnostics.adaptiveGpuCoverageCompensationProbeMs);
+        fastBasicGpuClampFlagsProbeUsed =
+            fastBasicGpuClampFlagsProbeUsed || diagnostics.adaptiveGpuClampFlagsProbeUsed;
+        if (diagnostics.adaptiveGpuClampFlagsProbeParityStatus != "not checked") {
+            fastBasicGpuClampFlagsProbeParityStatus =
+                diagnostics.adaptiveGpuClampFlagsProbeParityStatus;
+        }
+        fastBasicMaxGpuClampFlagsProbeDispatches = std::max(
+            fastBasicMaxGpuClampFlagsProbeDispatches,
+            diagnostics.adaptiveGpuClampFlagsProbeDispatches);
+        fastBasicGpuClampFlagsProbeRequiredFlags |=
+            diagnostics.adaptiveGpuClampFlagsProbeRequiredFlags;
+        fastBasicGpuClampFlagsProbeRejectedFlags |=
+            diagnostics.adaptiveGpuClampFlagsProbeRejectedFlags;
+        const bool hasFastBasicClampFlagsProbeCounts =
+            diagnostics.adaptiveGpuClampFlagsProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuClampFlagsProbeGpuCount != 0U;
+        if (hasFastBasicClampFlagsProbeCounts) {
+            fastBasicGpuClampFlagsProbeCpuCount =
+                diagnostics.adaptiveGpuClampFlagsProbeCpuCount;
+            fastBasicGpuClampFlagsProbeGpuCount =
+                diagnostics.adaptiveGpuClampFlagsProbeGpuCount;
+            fastBasicGpuClampFlagsProbeCpuChecksum =
+                diagnostics.adaptiveGpuClampFlagsProbeCpuChecksum;
+            fastBasicGpuClampFlagsProbeGpuChecksum =
+                diagnostics.adaptiveGpuClampFlagsProbeGpuChecksum;
+            fastBasicGpuClampFlagsProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuClampFlagsProbeCpuSourceFingerprint;
+            fastBasicGpuClampFlagsProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuClampFlagsProbeGpuSourceFingerprint;
+        }
+        fastBasicMaxGpuClampFlagsProbeCpuReferenceMs = std::max(
+            fastBasicMaxGpuClampFlagsProbeCpuReferenceMs,
+            diagnostics.adaptiveGpuClampFlagsProbeCpuReferenceMs);
+        fastBasicMaxGpuClampFlagsProbeMs = std::max(
+            fastBasicMaxGpuClampFlagsProbeMs,
+            diagnostics.adaptiveGpuClampFlagsProbeMs);
         fastBasicGpuCompactionSubmissionEligible =
             fastBasicGpuCompactionSubmissionEligible ||
             diagnostics.adaptiveGpuCompactionSubmissionEligible;
@@ -24434,6 +24496,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                    ? std::string{"GPU coverage-compensation probe faster than CPU reference"}
                    : std::string{"CPU reference faster; coverage-compensation probe remains compare-only"};
     };
+    const auto gpuClampFlagsProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU clamp-flags probe faster than CPU reference"}
+                   : std::string{"CPU reference faster; clamp-flags probe remains compare-only"};
+    };
     const auto fastBasicGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(fastBasicMaxGpuCompactionCpuReferenceMs, fastBasicMaxGpuCompactionMs);
     const auto fastBasicGpuFeatureClassProbePerformanceStatus =
@@ -24460,6 +24533,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         gpuCoverageCompensationProbePerformanceStatus(
             fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs,
             fastBasicMaxGpuCoverageCompensationProbeMs);
+    const auto fastBasicGpuClampFlagsProbePerformanceStatus =
+        gpuClampFlagsProbePerformanceStatus(
+            fastBasicMaxGpuClampFlagsProbeCpuReferenceMs,
+            fastBasicMaxGpuClampFlagsProbeMs);
     const auto beautyStressGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(beautyStress.maxGpuCompactionCpuReferenceMs, beautyStress.maxGpuCompactionMs);
     const auto writeGpuCompactionClassCountMetrics =
@@ -24789,6 +24866,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuCoverageCompensationProbeMs << ",\n"
                 << "  \"gpu_coverage_compensation_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuCoverageCompensationProbePerformanceStatus) << ",\n"
+                << "  \"gpu_clamp_flags_probe_used\": "
+                << (fastBasicGpuClampFlagsProbeUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_clamp_flags_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuClampFlagsProbeParityStatus) << ",\n"
+                << "  \"gpu_clamp_flags_probe_dispatches\": "
+                << fastBasicMaxGpuClampFlagsProbeDispatches << ",\n"
+                << "  \"gpu_clamp_flags_probe_required_flags\": "
+                << fastBasicGpuClampFlagsProbeRequiredFlags << ",\n"
+                << "  \"gpu_clamp_flags_probe_rejected_flags\": "
+                << fastBasicGpuClampFlagsProbeRejectedFlags << ",\n"
+                << "  \"gpu_clamp_flags_probe_cpu_count\": "
+                << fastBasicGpuClampFlagsProbeCpuCount << ",\n"
+                << "  \"gpu_clamp_flags_probe_gpu_count\": "
+                << fastBasicGpuClampFlagsProbeGpuCount << ",\n"
+                << "  \"gpu_clamp_flags_probe_cpu_checksum\": "
+                << fastBasicGpuClampFlagsProbeCpuChecksum << ",\n"
+                << "  \"gpu_clamp_flags_probe_gpu_checksum\": "
+                << fastBasicGpuClampFlagsProbeGpuChecksum << ",\n"
+                << "  \"gpu_clamp_flags_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuClampFlagsProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_clamp_flags_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuClampFlagsProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_clamp_flags_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuClampFlagsProbeCpuReferenceMs << ",\n"
+                << "  \"gpu_clamp_flags_probe_ms\": "
+                << fastBasicMaxGpuClampFlagsProbeMs << ",\n"
+                << "  \"gpu_clamp_flags_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuClampFlagsProbePerformanceStatus) << ",\n"
                 << "  \"gpu_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"gpu_compaction_submission_used\": "
@@ -25636,6 +25741,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuCoverageCompensationProbeMs << ",\n"
                 << "  \"fast_basic_coverage_compensation_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuCoverageCompensationProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_used\": "
+                << (fastBasicGpuClampFlagsProbeUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuClampFlagsProbeParityStatus) << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_dispatches\": "
+                << fastBasicMaxGpuClampFlagsProbeDispatches << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_required_flags\": "
+                << fastBasicGpuClampFlagsProbeRequiredFlags << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_rejected_flags\": "
+                << fastBasicGpuClampFlagsProbeRejectedFlags << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_cpu_count\": "
+                << fastBasicGpuClampFlagsProbeCpuCount << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_gpu_count\": "
+                << fastBasicGpuClampFlagsProbeGpuCount << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_cpu_checksum\": "
+                << fastBasicGpuClampFlagsProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_gpu_checksum\": "
+                << fastBasicGpuClampFlagsProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuClampFlagsProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuClampFlagsProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuClampFlagsProbeCpuReferenceMs << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_ms\": "
+                << fastBasicMaxGpuClampFlagsProbeMs << ",\n"
+                << "  \"fast_basic_clamp_flags_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuClampFlagsProbePerformanceStatus) << ",\n"
                 << "  \"fast_basic_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"fast_basic_compaction_submission_used\": "
@@ -25862,6 +25995,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " gpu/cpu items, cpu " << fastBasicMaxGpuCoverageCompensationProbeCpuReferenceMs
               << " ms, gpu " << fastBasicMaxGpuCoverageCompensationProbeMs
               << " ms, " << fastBasicGpuCoverageCompensationProbePerformanceStatus
+              << ")"
+              << " | gpu clamp-flags probe: "
+              << (fastBasicGpuClampFlagsProbeUsed ? "yes" : "no")
+              << " (" << fastBasicGpuClampFlagsProbeParityStatus
+              << ", flags +" << fastBasicGpuClampFlagsProbeRequiredFlags
+              << "/-" << fastBasicGpuClampFlagsProbeRejectedFlags
+              << ", " << fastBasicGpuClampFlagsProbeGpuCount
+              << "/" << fastBasicGpuClampFlagsProbeCpuCount
+              << " gpu/cpu items, cpu " << fastBasicMaxGpuClampFlagsProbeCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuClampFlagsProbeMs
+              << " ms, " << fastBasicGpuClampFlagsProbePerformanceStatus
               << ")"
               << " | gpu compacted indirect: "
               << (fastBasicGpuCompactionIndirectCommandUsed ? "yes" : "no")
