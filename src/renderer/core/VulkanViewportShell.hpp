@@ -164,6 +164,13 @@ struct ViewportDiagnostics {
     bool adaptiveGpuCompactionOutputWriteEnabled = false;
     std::string adaptiveGpuCompactionOutputWriteFallbackReason;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
+    std::string adaptiveGpuCompactionOutputProbeParityStatus = "not checked";
+    std::uint32_t adaptiveGpuCompactionOutputProbeCpuCount = 0;
+    std::uint32_t adaptiveGpuCompactionOutputProbeGpuCount = 0;
+    std::uint32_t adaptiveGpuCompactionOutputProbeCpuChecksum = 0;
+    std::uint32_t adaptiveGpuCompactionOutputProbeGpuChecksum = 0;
+    std::uint32_t adaptiveGpuCompactionOutputProbeCpuSourceFingerprint = 0;
+    std::uint32_t adaptiveGpuCompactionOutputProbeGpuSourceFingerprint = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionCpuSourceFingerprint = 0;
@@ -434,6 +441,17 @@ class VulkanViewportShell {
         std::uint32_t combinedChecksum = 0;
     };
 
+    struct GpuDrawItemOutputProbeStats {
+        std::uint32_t count = 0;
+        std::uint32_t sourceIndexXor = 0;
+        std::uint32_t representedCountXor = 0;
+        std::uint32_t footprintXor = 0;
+        std::uint32_t metadataXor = 0;
+        std::uint32_t sourceIndexSum = 0;
+        std::uint32_t representedCountSum = 0;
+        std::uint32_t identityChecksum = 0;
+    };
+
     struct ActivePointCloudResources {
         std::size_t layerId = 0;
         BufferAllocation positionBuffer{};
@@ -464,6 +482,8 @@ class VulkanViewportShell {
         std::array<std::uint32_t, kFramesInFlight> gpuCompactedDrawItemCapacities{};
         std::array<GpuDrawItemCompactionStats, kFramesInFlight> gpuCompactionExpectedStats{};
         std::array<bool, kFramesInFlight> gpuCompactionResultPending{};
+        std::array<GpuDrawItemOutputProbeStats, kFramesInFlight> gpuCompactionExpectedOutputProbeStats{};
+        std::array<bool, kFramesInFlight> gpuCompactionOutputProbeResultPending{};
         std::array<VkDrawIndirectCommand, kFramesInFlight> gpuCompactionExpectedIndirectCommands{};
         std::array<bool, kFramesInFlight> gpuCompactionIndirectCommandResultPending{};
         std::uint32_t exrDrawItemCount = 0;
@@ -655,7 +675,15 @@ class VulkanViewportShell {
         std::uint32_t selectionMinRepresentedSourceCount,
         std::uint32_t selectionMaxRepresentedSourceCount,
         const glm::mat4& selectionViewProjection,
-        float selectionFrustumGuardBand) const;
+        float selectionFrustumGuardBand,
+        GpuDrawItemOutputProbeStats* outputProbeStats,
+        std::uint32_t outputProbeCapacity) const;
+    static void AccumulateGpuCompactionOutputProbeStats(
+        const renderer::pointcloud::PointCloudDrawItemGpu& item,
+        GpuDrawItemOutputProbeStats* stats);
+    [[nodiscard]] GpuDrawItemOutputProbeStats ComputeGpuCompactionOutputProbeStatsFromBuffer(
+        const renderer::pointcloud::PointCloudDrawItemGpu* drawItems,
+        std::uint32_t drawItemCount) const;
     [[nodiscard]] bool PointCloudPlanUsesGpuCompaction(
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,

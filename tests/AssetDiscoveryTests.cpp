@@ -3078,6 +3078,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionCpuReferenceMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionOutputWriteEnabled") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionOutputWriteFallbackReason") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionOutputProbeParityStatus") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionOutputProbeCpuChecksum") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionCpuSourceFingerprint") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionGpuSourceFingerprint") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
@@ -3098,6 +3100,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputProbeCapacity") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticCompactionOutputCapacity") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticCompactionOutputWriteFallbackReason") != std::string::npos);
+    CHECK(rendererSource.find("GpuDrawItemOutputProbeStats") != std::string::npos);
+    CHECK(rendererSource.find("AccumulateGpuCompactionOutputProbeStats") != std::string::npos);
+    CHECK(rendererSource.find("ComputeGpuCompactionOutputProbeStatsFromBuffer") != std::string::npos);
+    CHECK(rendererSource.find("VK_ACCESS_HOST_READ_BIT") != std::string::npos);
+    CHECK(rendererSource.find("passed previous-frame compacted output probe identity") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("GpuDiagnosticPrefixSelectionLimit") != std::string::npos);
     CHECK(rendererSource.find("dispatchItemCount") != std::string::npos);
@@ -3140,6 +3147,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_compaction_selection_min_footprint_area_pixels") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_output_write_enabled") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_output_write_fallback_reason") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_output_probe_parity_status") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_output_probe_cpu_checksum") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_max_render_area_pixels") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_min_opacity_compensation") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_max_emission_compensation") != std::string::npos);
@@ -3170,6 +3179,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("beauty_stress_compaction_selection_frustum_fallback_reason") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_output_write_enabled") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_output_write_fallback_reason") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_output_probe_parity_status") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_output_probe_cpu_checksum") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_cpu_reference_ms") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_cpu_source_fingerprint") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_gpu_source_fingerprint") != std::string::npos);

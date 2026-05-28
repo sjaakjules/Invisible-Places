@@ -21365,6 +21365,11 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuCompactionOutputWriteFallbackReason.c_str());
                     }
                     ImGui::Text(
+                        "GPU prefix output probe: %s | %u/%u items",
+                        diagnostics.adaptiveGpuCompactionOutputProbeParityStatus.c_str(),
+                        diagnostics.adaptiveGpuCompactionOutputProbeGpuCount,
+                        diagnostics.adaptiveGpuCompactionOutputProbeCpuCount);
+                    ImGui::Text(
                         "Adaptive GPU command generation: %.3f ms",
                         diagnostics.adaptiveGpuIndirectCommandMs);
                     if (diagnostics.adaptiveGpuCompactionIndirectCommandUsed ||
@@ -22248,6 +22253,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     bool fastBasicGpuCompactionOutputWriteEnabled = false;
     std::string fastBasicGpuCompactionOutputWriteFallbackReason;
     std::uint32_t fastBasicMaxGpuCompactionCopiedDrawItems = 0;
+    std::string fastBasicGpuCompactionOutputProbeParityStatus = "not checked";
+    std::uint32_t fastBasicGpuCompactionOutputProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuCompactionOutputProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuCompactionOutputProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuCompactionOutputProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuCompactionOutputProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuCompactionOutputProbeGpuSourceFingerprint = 0;
     std::uint32_t fastBasicGpuCompactionCpuCount = 0;
     std::uint32_t fastBasicGpuCompactionGpuCount = 0;
     std::uint32_t fastBasicGpuCompactionCpuChecksum = 0;
@@ -22586,6 +22598,27 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuCompactionCopiedDrawItems = std::max(
             fastBasicMaxGpuCompactionCopiedDrawItems,
             diagnostics.adaptiveGpuCompactionCopiedDrawItems);
+        if (diagnostics.adaptiveGpuCompactionOutputProbeParityStatus != "not checked") {
+            fastBasicGpuCompactionOutputProbeParityStatus =
+                diagnostics.adaptiveGpuCompactionOutputProbeParityStatus;
+        }
+        const bool hasFastBasicGpuCompactionOutputProbeCounts =
+            diagnostics.adaptiveGpuCompactionOutputProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuCompactionOutputProbeGpuCount != 0U;
+        if (hasFastBasicGpuCompactionOutputProbeCounts) {
+            fastBasicGpuCompactionOutputProbeCpuCount =
+                diagnostics.adaptiveGpuCompactionOutputProbeCpuCount;
+            fastBasicGpuCompactionOutputProbeGpuCount =
+                diagnostics.adaptiveGpuCompactionOutputProbeGpuCount;
+            fastBasicGpuCompactionOutputProbeCpuChecksum =
+                diagnostics.adaptiveGpuCompactionOutputProbeCpuChecksum;
+            fastBasicGpuCompactionOutputProbeGpuChecksum =
+                diagnostics.adaptiveGpuCompactionOutputProbeGpuChecksum;
+            fastBasicGpuCompactionOutputProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuCompactionOutputProbeCpuSourceFingerprint;
+            fastBasicGpuCompactionOutputProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint;
+        }
         const bool hasFastBasicGpuCompactionParityCounts =
             diagnostics.adaptiveGpuCompactionCpuCount != 0U ||
             diagnostics.adaptiveGpuCompactionGpuCount != 0U;
@@ -23243,6 +23276,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         bool gpuCompactionOutputWriteEnabled = false;
         std::string gpuCompactionOutputWriteFallbackReason;
         std::uint32_t maxGpuCompactionCopiedDrawItems = 0;
+        std::string gpuCompactionOutputProbeParityStatus = "not checked";
+        std::uint32_t gpuCompactionOutputProbeCpuCount = 0;
+        std::uint32_t gpuCompactionOutputProbeGpuCount = 0;
+        std::uint32_t gpuCompactionOutputProbeCpuChecksum = 0;
+        std::uint32_t gpuCompactionOutputProbeGpuChecksum = 0;
+        std::uint32_t gpuCompactionOutputProbeCpuSourceFingerprint = 0;
+        std::uint32_t gpuCompactionOutputProbeGpuSourceFingerprint = 0;
         std::uint32_t gpuCompactionCpuCount = 0;
         std::uint32_t gpuCompactionGpuCount = 0;
         std::uint32_t gpuCompactionCpuChecksum = 0;
@@ -23484,6 +23524,27 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             stress.maxGpuCompactionCopiedDrawItems = std::max(
                 stress.maxGpuCompactionCopiedDrawItems,
                 diagnostics.adaptiveGpuCompactionCopiedDrawItems);
+            if (diagnostics.adaptiveGpuCompactionOutputProbeParityStatus != "not checked") {
+                stress.gpuCompactionOutputProbeParityStatus =
+                    diagnostics.adaptiveGpuCompactionOutputProbeParityStatus;
+            }
+            const bool hasStressGpuCompactionOutputProbeCounts =
+                diagnostics.adaptiveGpuCompactionOutputProbeCpuCount != 0U ||
+                diagnostics.adaptiveGpuCompactionOutputProbeGpuCount != 0U;
+            if (hasStressGpuCompactionOutputProbeCounts) {
+                stress.gpuCompactionOutputProbeCpuCount =
+                    diagnostics.adaptiveGpuCompactionOutputProbeCpuCount;
+                stress.gpuCompactionOutputProbeGpuCount =
+                    diagnostics.adaptiveGpuCompactionOutputProbeGpuCount;
+                stress.gpuCompactionOutputProbeCpuChecksum =
+                    diagnostics.adaptiveGpuCompactionOutputProbeCpuChecksum;
+                stress.gpuCompactionOutputProbeGpuChecksum =
+                    diagnostics.adaptiveGpuCompactionOutputProbeGpuChecksum;
+                stress.gpuCompactionOutputProbeCpuSourceFingerprint =
+                    diagnostics.adaptiveGpuCompactionOutputProbeCpuSourceFingerprint;
+                stress.gpuCompactionOutputProbeGpuSourceFingerprint =
+                    diagnostics.adaptiveGpuCompactionOutputProbeGpuSourceFingerprint;
+            }
             const bool hasStressGpuCompactionParityCounts =
                 diagnostics.adaptiveGpuCompactionCpuCount != 0U ||
                 diagnostics.adaptiveGpuCompactionGpuCount != 0U;
@@ -23798,6 +23859,20 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << JsonStringLiteral(fastBasicGpuCompactionOutputWriteFallbackReason) << ",\n"
                 << "  \"gpu_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
+                << "  \"gpu_compaction_output_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuCompactionOutputProbeParityStatus) << ",\n"
+                << "  \"gpu_compaction_output_probe_cpu_count\": "
+                << fastBasicGpuCompactionOutputProbeCpuCount << ",\n"
+                << "  \"gpu_compaction_output_probe_gpu_count\": "
+                << fastBasicGpuCompactionOutputProbeGpuCount << ",\n"
+                << "  \"gpu_compaction_output_probe_cpu_checksum\": "
+                << fastBasicGpuCompactionOutputProbeCpuChecksum << ",\n"
+                << "  \"gpu_compaction_output_probe_gpu_checksum\": "
+                << fastBasicGpuCompactionOutputProbeGpuChecksum << ",\n"
+                << "  \"gpu_compaction_output_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuCompactionOutputProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_compaction_output_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuCompactionOutputProbeGpuSourceFingerprint << ",\n"
                 << "  \"gpu_compaction_cpu_count\": " << fastBasicGpuCompactionCpuCount << ",\n"
                 << "  \"gpu_compaction_gpu_count\": " << fastBasicGpuCompactionGpuCount << ",\n"
                 << "  \"gpu_compaction_cpu_checksum\": " << fastBasicGpuCompactionCpuChecksum << ",\n"
@@ -24137,6 +24212,20 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << JsonStringLiteral(beautyStress.gpuCompactionOutputWriteFallbackReason) << ",\n"
                 << "  \"beauty_stress_compaction_copied_draw_items\": "
                 << beautyStress.maxGpuCompactionCopiedDrawItems << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_parity_status\": "
+                << JsonStringLiteral(beautyStress.gpuCompactionOutputProbeParityStatus) << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_cpu_count\": "
+                << beautyStress.gpuCompactionOutputProbeCpuCount << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_gpu_count\": "
+                << beautyStress.gpuCompactionOutputProbeGpuCount << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_cpu_checksum\": "
+                << beautyStress.gpuCompactionOutputProbeCpuChecksum << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_gpu_checksum\": "
+                << beautyStress.gpuCompactionOutputProbeGpuChecksum << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_cpu_source_fingerprint\": "
+                << beautyStress.gpuCompactionOutputProbeCpuSourceFingerprint << ",\n"
+                << "  \"beauty_stress_compaction_output_probe_gpu_source_fingerprint\": "
+                << beautyStress.gpuCompactionOutputProbeGpuSourceFingerprint << ",\n"
                 << "  \"beauty_stress_compaction_cpu_count\": "
                 << beautyStress.gpuCompactionCpuCount << ",\n"
                 << "  \"beauty_stress_compaction_gpu_count\": "
@@ -24397,6 +24486,20 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << JsonStringLiteral(fastBasicGpuCompactionOutputWriteFallbackReason) << ",\n"
                 << "  \"fast_basic_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
+                << "  \"fast_basic_compaction_output_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuCompactionOutputProbeParityStatus) << ",\n"
+                << "  \"fast_basic_compaction_output_probe_cpu_count\": "
+                << fastBasicGpuCompactionOutputProbeCpuCount << ",\n"
+                << "  \"fast_basic_compaction_output_probe_gpu_count\": "
+                << fastBasicGpuCompactionOutputProbeGpuCount << ",\n"
+                << "  \"fast_basic_compaction_output_probe_cpu_checksum\": "
+                << fastBasicGpuCompactionOutputProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_compaction_output_probe_gpu_checksum\": "
+                << fastBasicGpuCompactionOutputProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_compaction_output_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuCompactionOutputProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_compaction_output_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuCompactionOutputProbeGpuSourceFingerprint << ",\n"
                 << "  \"fast_basic_compaction_cpu_count\": "
                 << fastBasicGpuCompactionCpuCount << ",\n"
                 << "  \"fast_basic_compaction_gpu_count\": "
@@ -24507,6 +24610,9 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << "/" << fastBasicMaxGpuCompactionInputDrawItems
               << " items copied/dispatched/input, output "
               << (fastBasicGpuCompactionOutputWriteEnabled ? "write" : "count-only")
+              << ", output probe " << fastBasicGpuCompactionOutputProbeParityStatus
+              << " " << fastBasicGpuCompactionOutputProbeGpuCount
+              << "/" << fastBasicGpuCompactionOutputProbeCpuCount
               << ", profile mask " << fastBasicGpuCompactionSelectionProfileMask
               << ", class mask " << fastBasicGpuCompactionSelectionClassMask
               << ", rank <= " << fastBasicMaxGpuCompactionSelectionRankLimit
