@@ -4009,6 +4009,20 @@ std::vector<PointCloudDrawItemGpu> BuildAdaptiveTransitionDrawItems(
     return mixed;
 }
 
+bool AdaptiveLodTransitionTooLargeForSmoothBlend(
+    const AdaptiveLodCacheState& source,
+    const AdaptiveLodCacheState& target) {
+    const auto sourceCount =
+        source.drawItems == nullptr ? std::size_t{0} : source.drawItems->size();
+    const auto targetCount =
+        target.drawItems == nullptr ? std::size_t{0} : target.drawItems->size();
+    const auto largestCount = std::max(sourceCount, targetCount);
+    constexpr std::size_t kMaxSmoothAdaptiveTransitionItems = 512'000U;
+    constexpr std::uint64_t kMaxSmoothAdaptiveTransitionBytes = 16ULL * 1024ULL * 1024ULL;
+    return largestCount > kMaxSmoothAdaptiveTransitionItems ||
+           DrawItemByteCount(largestCount) > kMaxSmoothAdaptiveTransitionBytes;
+}
+
 std::string RuntimeStatusWithGovernor(
     std::string status,
     const PointCloudPerformanceGovernorOutput& governorOutput) {
@@ -4044,6 +4058,15 @@ void BeginAdaptiveLodTransition(
         session->adaptiveLodTransitionActive = false;
         session->adaptiveLodIdleRefinementPending = false;
         session->adaptiveLodTransitionDrawItems.reset();
+        return;
+    }
+    if (AdaptiveLodTransitionTooLargeForSmoothBlend(source, target)) {
+        session->adaptiveLodTransitionActive = false;
+        session->adaptiveLodIdleRefinementPending = false;
+        session->adaptiveLodTransitionDrawItems.reset();
+        session->adaptiveLodTransitionAgeMs = 0.0;
+        session->adaptiveLodRuntimeStatus = "large adaptive transition skipped";
+        session->adaptiveLodFallbackState = "direct large adaptive update";
         return;
     }
 

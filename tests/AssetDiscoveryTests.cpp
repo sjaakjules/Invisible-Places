@@ -2369,6 +2369,9 @@ TEST_CASE("Adaptive viewport path does not fall back to source draw count", "[po
     CHECK(populateSection.find("layer->drawPointCount = 0") != std::string::npos);
     CHECK(populateSection.find("layer->useAdaptiveDrawItems = false") != std::string::npos);
     CHECK(populateSection.find("adaptiveLodRuntimeStatus") != std::string::npos);
+    CHECK(applicationSource.find("AdaptiveLodTransitionTooLargeForSmoothBlend") != std::string::npos);
+    CHECK(applicationSource.find("large adaptive transition skipped") != std::string::npos);
+    CHECK(applicationSource.find("512'000U") != std::string::npos);
     CHECK(resolveSection.find("layer.requiresAdaptiveDrawItems") != std::string::npos);
     CHECK(resolveSection.find("return false;") < resolveSection.find("resources->activePointCount"));
     CHECK(buildRenderStateSection.find("exactFullSourceReady") != std::string::npos);
