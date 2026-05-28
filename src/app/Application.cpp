@@ -21413,6 +21413,19 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuProjectedAreaProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuProjectedAreaProbeMs);
                     }
+                    if (diagnostics.adaptiveGpuRepresentedCountProbeUsed ||
+                        diagnostics.adaptiveGpuRepresentedCountProbeParityStatus != "not checked" ||
+                        diagnostics.adaptiveGpuRepresentedCountProbeMs > 0.0) {
+                        ImGui::Text(
+                            "GPU represented-count probe: %s | represented %u-%u | %u/%u items | cpu %.3f ms gpu %.3f ms",
+                            diagnostics.adaptiveGpuRepresentedCountProbeParityStatus.c_str(),
+                            diagnostics.adaptiveGpuRepresentedCountProbeMinRepresentedSourceCount,
+                            diagnostics.adaptiveGpuRepresentedCountProbeMaxRepresentedSourceCount,
+                            diagnostics.adaptiveGpuRepresentedCountProbeGpuCount,
+                            diagnostics.adaptiveGpuRepresentedCountProbeCpuCount,
+                            diagnostics.adaptiveGpuRepresentedCountProbeCpuReferenceMs,
+                            diagnostics.adaptiveGpuRepresentedCountProbeMs);
+                    }
                     ImGui::Text(
                         "GPU compacted submission: %s | %u/%u vertices",
                         diagnostics.adaptiveGpuCompactionSubmissionUsed
@@ -22434,6 +22447,19 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuProjectedAreaProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuProjectedAreaProbeMs = 0.0;
+    bool fastBasicGpuRepresentedCountProbeUsed = false;
+    std::string fastBasicGpuRepresentedCountProbeParityStatus = "not checked";
+    std::uint32_t fastBasicMaxGpuRepresentedCountProbeDispatches = 0;
+    std::uint32_t fastBasicMaxGpuRepresentedCountProbeMinRepresentedSourceCount = 0;
+    std::uint32_t fastBasicMaxGpuRepresentedCountProbeMaxRepresentedSourceCount = 0;
+    std::uint32_t fastBasicGpuRepresentedCountProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuRepresentedCountProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuRepresentedCountProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuRepresentedCountProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuRepresentedCountProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuRepresentedCountProbeGpuSourceFingerprint = 0;
+    double fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs = 0.0;
+    double fastBasicMaxGpuRepresentedCountProbeMs = 0.0;
     bool fastBasicGpuCompactionSubmissionEligible = false;
     bool fastBasicGpuCompactionSubmissionUsed = false;
     std::string fastBasicGpuCompactionSubmissionFallbackReason;
@@ -22932,6 +22958,45 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuProjectedAreaProbeMs = std::max(
             fastBasicMaxGpuProjectedAreaProbeMs,
             diagnostics.adaptiveGpuProjectedAreaProbeMs);
+        fastBasicGpuRepresentedCountProbeUsed =
+            fastBasicGpuRepresentedCountProbeUsed ||
+            diagnostics.adaptiveGpuRepresentedCountProbeUsed;
+        if (diagnostics.adaptiveGpuRepresentedCountProbeParityStatus != "not checked") {
+            fastBasicGpuRepresentedCountProbeParityStatus =
+                diagnostics.adaptiveGpuRepresentedCountProbeParityStatus;
+        }
+        fastBasicMaxGpuRepresentedCountProbeDispatches = std::max(
+            fastBasicMaxGpuRepresentedCountProbeDispatches,
+            diagnostics.adaptiveGpuRepresentedCountProbeDispatches);
+        fastBasicMaxGpuRepresentedCountProbeMinRepresentedSourceCount = std::max(
+            fastBasicMaxGpuRepresentedCountProbeMinRepresentedSourceCount,
+            diagnostics.adaptiveGpuRepresentedCountProbeMinRepresentedSourceCount);
+        fastBasicMaxGpuRepresentedCountProbeMaxRepresentedSourceCount = std::max(
+            fastBasicMaxGpuRepresentedCountProbeMaxRepresentedSourceCount,
+            diagnostics.adaptiveGpuRepresentedCountProbeMaxRepresentedSourceCount);
+        const bool hasFastBasicRepresentedCountProbeCounts =
+            diagnostics.adaptiveGpuRepresentedCountProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuRepresentedCountProbeGpuCount != 0U;
+        if (hasFastBasicRepresentedCountProbeCounts) {
+            fastBasicGpuRepresentedCountProbeCpuCount =
+                diagnostics.adaptiveGpuRepresentedCountProbeCpuCount;
+            fastBasicGpuRepresentedCountProbeGpuCount =
+                diagnostics.adaptiveGpuRepresentedCountProbeGpuCount;
+            fastBasicGpuRepresentedCountProbeCpuChecksum =
+                diagnostics.adaptiveGpuRepresentedCountProbeCpuChecksum;
+            fastBasicGpuRepresentedCountProbeGpuChecksum =
+                diagnostics.adaptiveGpuRepresentedCountProbeGpuChecksum;
+            fastBasicGpuRepresentedCountProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuRepresentedCountProbeCpuSourceFingerprint;
+            fastBasicGpuRepresentedCountProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuRepresentedCountProbeGpuSourceFingerprint;
+        }
+        fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs = std::max(
+            fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs,
+            diagnostics.adaptiveGpuRepresentedCountProbeCpuReferenceMs);
+        fastBasicMaxGpuRepresentedCountProbeMs = std::max(
+            fastBasicMaxGpuRepresentedCountProbeMs,
+            diagnostics.adaptiveGpuRepresentedCountProbeMs);
         fastBasicGpuCompactionSubmissionEligible =
             fastBasicGpuCompactionSubmissionEligible ||
             diagnostics.adaptiveGpuCompactionSubmissionEligible;
@@ -24197,6 +24262,17 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                    ? std::string{"GPU projected-area probe faster than CPU reference"}
                    : std::string{"CPU reference faster; projected-area probe remains compare-only"};
     };
+    const auto gpuRepresentedCountProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU represented-count probe faster than CPU reference"}
+                   : std::string{"CPU reference faster; represented-count probe remains compare-only"};
+    };
     const auto fastBasicGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(fastBasicMaxGpuCompactionCpuReferenceMs, fastBasicMaxGpuCompactionMs);
     const auto fastBasicGpuFeatureClassProbePerformanceStatus =
@@ -24211,6 +24287,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         gpuProjectedAreaProbePerformanceStatus(
             fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs,
             fastBasicMaxGpuProjectedAreaProbeMs);
+    const auto fastBasicGpuRepresentedCountProbePerformanceStatus =
+        gpuRepresentedCountProbePerformanceStatus(
+            fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs,
+            fastBasicMaxGpuRepresentedCountProbeMs);
     const auto beautyStressGpuCompactionPerformanceStatus =
         gpuCompactionPerformanceStatus(beautyStress.maxGpuCompactionCpuReferenceMs, beautyStress.maxGpuCompactionMs);
     const auto writeGpuCompactionClassCountMetrics =
@@ -24452,6 +24532,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuProjectedAreaProbeMs << ",\n"
                 << "  \"gpu_projected_area_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuProjectedAreaProbePerformanceStatus) << ",\n"
+                << "  \"gpu_represented_count_probe_used\": "
+                << (fastBasicGpuRepresentedCountProbeUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_represented_count_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRepresentedCountProbeParityStatus) << ",\n"
+                << "  \"gpu_represented_count_probe_dispatches\": "
+                << fastBasicMaxGpuRepresentedCountProbeDispatches << ",\n"
+                << "  \"gpu_represented_count_probe_min_represented_source_count\": "
+                << fastBasicMaxGpuRepresentedCountProbeMinRepresentedSourceCount << ",\n"
+                << "  \"gpu_represented_count_probe_max_represented_source_count\": "
+                << fastBasicMaxGpuRepresentedCountProbeMaxRepresentedSourceCount << ",\n"
+                << "  \"gpu_represented_count_probe_cpu_count\": "
+                << fastBasicGpuRepresentedCountProbeCpuCount << ",\n"
+                << "  \"gpu_represented_count_probe_gpu_count\": "
+                << fastBasicGpuRepresentedCountProbeGpuCount << ",\n"
+                << "  \"gpu_represented_count_probe_cpu_checksum\": "
+                << fastBasicGpuRepresentedCountProbeCpuChecksum << ",\n"
+                << "  \"gpu_represented_count_probe_gpu_checksum\": "
+                << fastBasicGpuRepresentedCountProbeGpuChecksum << ",\n"
+                << "  \"gpu_represented_count_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuRepresentedCountProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_represented_count_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuRepresentedCountProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_represented_count_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs << ",\n"
+                << "  \"gpu_represented_count_probe_ms\": "
+                << fastBasicMaxGpuRepresentedCountProbeMs << ",\n"
+                << "  \"gpu_represented_count_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuRepresentedCountProbePerformanceStatus) << ",\n"
                 << "  \"gpu_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"gpu_compaction_submission_used\": "
@@ -25211,6 +25319,34 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuProjectedAreaProbeMs << ",\n"
                 << "  \"fast_basic_projected_area_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuProjectedAreaProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_represented_count_probe_used\": "
+                << (fastBasicGpuRepresentedCountProbeUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_represented_count_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRepresentedCountProbeParityStatus) << ",\n"
+                << "  \"fast_basic_represented_count_probe_dispatches\": "
+                << fastBasicMaxGpuRepresentedCountProbeDispatches << ",\n"
+                << "  \"fast_basic_represented_count_probe_min_represented_source_count\": "
+                << fastBasicMaxGpuRepresentedCountProbeMinRepresentedSourceCount << ",\n"
+                << "  \"fast_basic_represented_count_probe_max_represented_source_count\": "
+                << fastBasicMaxGpuRepresentedCountProbeMaxRepresentedSourceCount << ",\n"
+                << "  \"fast_basic_represented_count_probe_cpu_count\": "
+                << fastBasicGpuRepresentedCountProbeCpuCount << ",\n"
+                << "  \"fast_basic_represented_count_probe_gpu_count\": "
+                << fastBasicGpuRepresentedCountProbeGpuCount << ",\n"
+                << "  \"fast_basic_represented_count_probe_cpu_checksum\": "
+                << fastBasicGpuRepresentedCountProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_represented_count_probe_gpu_checksum\": "
+                << fastBasicGpuRepresentedCountProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_represented_count_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuRepresentedCountProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_represented_count_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuRepresentedCountProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_represented_count_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs << ",\n"
+                << "  \"fast_basic_represented_count_probe_ms\": "
+                << fastBasicMaxGpuRepresentedCountProbeMs << ",\n"
+                << "  \"fast_basic_represented_count_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuRepresentedCountProbePerformanceStatus) << ",\n"
                 << "  \"fast_basic_compaction_submission_eligible\": "
                 << (fastBasicGpuCompactionSubmissionEligible ? "true" : "false") << ",\n"
                 << "  \"fast_basic_compaction_submission_used\": "
@@ -25406,6 +25542,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " gpu/cpu items, cpu " << fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs
               << " ms, gpu " << fastBasicMaxGpuProjectedAreaProbeMs
               << " ms, " << fastBasicGpuProjectedAreaProbePerformanceStatus
+              << ")"
+              << " | gpu represented-count probe: "
+              << (fastBasicGpuRepresentedCountProbeUsed ? "yes" : "no")
+              << " (" << fastBasicGpuRepresentedCountProbeParityStatus
+              << ", represented >= " << fastBasicMaxGpuRepresentedCountProbeMinRepresentedSourceCount
+              << ", " << fastBasicGpuRepresentedCountProbeGpuCount
+              << "/" << fastBasicGpuRepresentedCountProbeCpuCount
+              << " gpu/cpu items, cpu " << fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuRepresentedCountProbeMs
+              << " ms, " << fastBasicGpuRepresentedCountProbePerformanceStatus
               << ")"
               << " | gpu compacted indirect: "
               << (fastBasicGpuCompactionIndirectCommandUsed ? "yes" : "no")

@@ -3104,6 +3104,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuProjectedAreaProbeMinFootprintAreaPixels") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuProjectedAreaProbeCpuReferenceMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuProjectedAreaProbeMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuRepresentedCountProbeUsed") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuRepresentedCountProbeParityStatus") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuRepresentedCountProbeMinRepresentedSourceCount") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuRepresentedCountProbeCpuReferenceMs") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuRepresentedCountProbeMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSubmissionEligible") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSubmissionFallbackReason") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSubmissionCandidateVertices") != std::string::npos);
@@ -3128,7 +3133,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("gpuProjectedAreaProbeStatsBuffers") != std::string::npos);
     CHECK(rendererHeader.find("gpuProjectedAreaProbeDescriptorSets") != std::string::npos);
     CHECK(rendererHeader.find("gpuProjectedAreaProbeExpectedStats") != std::string::npos);
-    CHECK(rendererHeader.find("std::array<bool, 10U> timestampPassWritten") != std::string::npos);
+    CHECK(rendererHeader.find("gpuRepresentedCountProbeStatsBuffers") != std::string::npos);
+    CHECK(rendererHeader.find("gpuRepresentedCountProbeDescriptorSets") != std::string::npos);
+    CHECK(rendererHeader.find("gpuRepresentedCountProbeExpectedStats") != std::string::npos);
+    CHECK(rendererHeader.find("std::array<bool, 11U> timestampPassWritten") != std::string::npos);
     CHECK(rendererHeader.find("gpuCompactionSubmissionEligible") != std::string::npos);
     CHECK(rendererHeader.find("gpuCompactionSubmissionVertexCounts") != std::string::npos);
     CHECK(rendererSource.find("vkCreateComputePipelines") != std::string::npos);
@@ -3139,6 +3147,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuTimestampGpuFeatureClassProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuRankProbePass") != std::string::npos);
     CHECK(rendererSource.find("kGpuTimestampGpuProjectedAreaProbePass") != std::string::npos);
+    CHECK(rendererSource.find("kGpuTimestampGpuRepresentedCountProbePass") != std::string::npos);
     CHECK(rendererSource.find("vkCmdDispatch(commandBuffer, 1, 1, 1)") != std::string::npos);
     CHECK(rendererSource.find("VK_ACCESS_INDIRECT_COMMAND_READ_BIT") != std::string::npos);
     CHECK(rendererSource.find("VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT") != std::string::npos);
@@ -3187,6 +3196,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticFeatureClassProbeMask") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRankProbeLimit") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticProjectedAreaProbeMinFootprintAreaPixels") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticRepresentedCountProbeMin") != std::string::npos);
     CHECK(rendererSource.find("PointCloudLodRepresentativeClassColorContrast") != std::string::npos);
     CHECK(rendererSource.find("PointCloudLodRepresentativeClassEmissiveAccent") != std::string::npos);
     CHECK(rendererSource.find("pointcloud_draw_item_compact_metadata.comp.spv") != std::string::npos);
@@ -3218,6 +3228,10 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("gpuProjectedAreaProbeResultPending") != std::string::npos);
     CHECK(rendererSource.find("passed previous-frame projected-area window count/source-fingerprint/checksum/class-counts") != std::string::npos);
     CHECK(rendererSource.find("waiting for previous-frame projected-area GPU checksum") != std::string::npos);
+    CHECK(rendererSource.find("UpdateGpuRepresentedCountProbeDescriptorSet") != std::string::npos);
+    CHECK(rendererSource.find("gpuRepresentedCountProbeResultPending") != std::string::npos);
+    CHECK(rendererSource.find("passed previous-frame represented-count window count/source-fingerprint/checksum/class-counts") != std::string::npos);
+    CHECK(rendererSource.find("waiting for previous-frame represented-count GPU checksum") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-generated-indirect") != std::string::npos);
     CHECK(rendererSource.find("cpu-selection+gpu-full-range-selection-compare+gpu-compacted-indirect-submit") != std::string::npos);
     CHECK(rendererSource.find("GPU-compacted draw-item output submitted after CPU/GPU parity") != std::string::npos);
@@ -3258,6 +3272,11 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_projected_area_probe_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_projected_area_probe_performance_status") != std::string::npos);
     CHECK(appSource.find("GPU projected-area probe") != std::string::npos);
+    CHECK(appSource.find("gpu_represented_count_probe_used") != std::string::npos);
+    CHECK(appSource.find("gpu_represented_count_probe_performance_status") != std::string::npos);
+    CHECK(appSource.find("fast_basic_represented_count_probe_used") != std::string::npos);
+    CHECK(appSource.find("fast_basic_represented_count_probe_performance_status") != std::string::npos);
+    CHECK(appSource.find("GPU represented-count probe") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_submission_eligible") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_submission_fallback_reason") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_submission_candidate_vertices") != std::string::npos);

@@ -281,6 +281,7 @@ sample-count cap anymore.
   GPU probe mask/count/checksum/source-fingerprint/timing/performance status,
   stable-rank prefix GPU probe limit/count/checksum/source-fingerprint/timing/performance status,
   projected-area GPU probe footprint/render-area window/count/checksum/source-fingerprint/timing/performance status,
+  represented-count GPU probe window/count/checksum/source-fingerprint/timing/performance status,
   Beauty stress metrics, and colour, scalar, normal, and
   emissive/accent feature-triggered refinement counts.
 - Stage 05 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports exact
@@ -440,27 +441,30 @@ sample-count cap anymore.
   draw items, matched previous-frame CPU/GPU selected count 2,876,771 / 2,876,771,
   matched compacted indirect CPU/GPU vertices 2,876,771 / 2,876,771, copied all
   2,876,771 draw items into the compacted output buffer, and passed ordered
-  output identity 2,876,771 / 2,876,771. Fast Basic measured 226.263 ms for the
-  CPU reference predicate and 10.8164 ms for GPU full-range compaction, so the
+  output identity 2,876,771 / 2,876,771. Fast Basic measured 223.659 ms for the
+  CPU reference predicate and 10.5479 ms for GPU full-range compaction, so the
   GPU pass is measurably faster for the semantic-equivalent predicate. A new
   protected feature-class GPU probe filtered colour contrast, normal edge,
   scalar min/max/threshold, and emissive accent representatives with mask 126;
   it matched CPU/GPU count 1,290 / 1,290, source fingerprint 1,646,296,788,
-  checksum 3,534,349,174, and measured 8.71867 ms CPU reference vs 0.04675 ms
+  checksum 3,534,349,174, and measured 8.70629 ms CPU reference vs 0.167167 ms
   GPU. A stable-rank prefix GPU probe filtered packed rank <= 255, matched
   CPU/GPU count 1,195,635 / 1,195,635, source fingerprint 362,019,890,
-  checksum 3,671,843,879, and measured 60.3382 ms CPU reference vs 0.108375 ms
+  checksum 3,671,843,879, and measured 59.9873 ms CPU reference vs 0.231125 ms
   GPU. A projected-area GPU probe filtered `footprintAreaPixels >= 4`, matched
   CPU/GPU count 102,497 / 102,497, source fingerprint 263,410,465,
-  checksum 65,403,358, and measured 26.0211 ms CPU reference vs 0.151542 ms
+  checksum 65,403,358, and measured 27.7657 ms CPU reference vs 0.025917 ms
+  GPU. A represented-count GPU probe filtered `representedSourceCount >= 2`,
+  matched CPU/GPU count 1,652,511 / 1,652,511, source fingerprint 1,058,297,337,
+  checksum 1,624,835,333, and measured 86.8678 ms CPU reference vs 0.42975 ms
   GPU. The
   compacted-submission gate now reports `gpu_compaction_submission_used=true`,
   empty output-write and submission fallback reasons, candidate/reference vertices 2,876,771 /
   2,876,771, and submitted 2,876,771 compacted indirect vertices under the
   4,823,449 representative budget. The older CPU-count indirect command remains
-  as a first-frame fallback only, with 1 dispatch at 0.010958 ms in the latest
-  sample run. Beauty stress kept max GPU point pass 0.158916 ms with EWMA
-  0.047266 ms and reported no adaptive/full-source fallback or budget
+  as a first-frame fallback only, with 1 dispatch at 0.010917 ms in the latest
+  sample run. Beauty stress kept max GPU point pass 0.083166 ms with EWMA
+  0.0307785 ms and reported no adaptive/full-source fallback or budget
   exceedance. The frustum-checked shader path
   still exists, but `*_compaction_selection_frustum_enabled=false`, guard band 0,
   and the fallback reason reports that the GPU geometry-frustum predicate is
@@ -470,7 +474,7 @@ sample-count cap anymore.
   used 1,508,358 representatives covering 11,983,509 source points, and the
   repeat compare reported no adaptive/full-source fallback or budget exceedance.
   CPU traversal remains authoritative; protected feature-class, stable-rank,
-  and projected-area filtering stay compare-only, and CPU-selected direct or CPU-count indirect
+  projected-area, and represented-count filtering stay compare-only, and CPU-selected direct or CPU-count indirect
   draw submission remains active whenever compacted output is unsupported,
   slower, incomplete, or non-equivalent. The final hands-on
   Fast Basic/Beauty/export matrix remains outstanding. The stream check still
@@ -775,7 +779,8 @@ the next GPU candidate is profiled.
   implemented for Beauty Adaptive. Next, add a conservative depth proxy or Hi-Z
   pyramid before enabling actual hidden-node rejection.
 - Keep the current indirect, compacted-output submission, protected
-  feature-class probe, stable-rank prefix probe, and projected-area probe paths
+  feature-class probe, stable-rank prefix probe, projected-area probe, and
+  represented-count probe paths
   guarded by runtime diagnostics. Move culling,
   projected-error evaluation, authoritative compaction/selection, and
   indirect-count work to compute only where they beat the CPU path, and keep
@@ -792,6 +797,7 @@ Metrics to watch:
 - protected feature-class GPU probe use/parity/mask/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - stable-rank prefix GPU probe use/parity/rank-limit/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - projected-area GPU probe use/parity/footprint-window/render-window/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
+- represented-count GPU probe use/parity/represented-source-window/count/source-fingerprint/checksum/CPU-reference-ms/GPU-ms/performance-status
 - diagnostic compacted-indirect command parity/dispatch/CPU-vs-GPU vertices
 - indirect draw count
 - GPU-selection path/fallback/parity status
@@ -838,7 +844,7 @@ Initial quality targets:
   `density_policy`, `determinism`, source/cache fingerprints, and
   `difference_exr`; schema v3 should also include tile pressure and
   conservative culling fields, GPU compaction submission use/fallback, protected
-  feature-class, stable-rank prefix, and projected-area GPU probe parity/timing
+  feature-class, stable-rank prefix, projected-area, and represented-count GPU probe parity/timing
   fields, and performance fallback/retry
   fields when compare-only full-range compaction is slower than the CPU
   reference. If a target-cloud dense comparison is unsafe,
