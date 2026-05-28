@@ -1591,12 +1591,34 @@ TEST_CASE("Point-cloud .ipcloud bundle publishes atomically and validates manife
         ("InvisiblePlacesIpcloudTest-" +
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const auto bundlePath = pc::BuildPointCloudIpcloudBundlePath(tempRoot / "PointCloudCache", sourceInfo.value());
+    auto partialPreview = pc::LoadPointCloudIpcloudSourcePreview(sourcePath, 2U);
+    REQUIRE(partialPreview.loaded);
+    auto partialHierarchy = pc::BuildPointCloudLodHierarchy(partialPreview.cloud, config);
+    REQUIRE(!partialHierarchy.Empty());
+    const auto partialBundlePath = bundlePath.parent_path() / "partial-preview-bundle";
+    const auto partialSaveResult =
+        pc::SavePointCloudIpcloudBundle(
+            partialBundlePath,
+            sourceInfo.value(),
+            config,
+            partialPreview.cloud,
+            partialHierarchy);
+    CHECK(!partialSaveResult.saved);
+    CHECK(partialSaveResult.errorMessage.find("source point count mismatch") != std::string::npos);
+    CHECK(!std::filesystem::exists(partialBundlePath));
+
     const auto saveResult =
         pc::SavePointCloudIpcloudBundle(bundlePath, sourceInfo.value(), config, loadResult.cloud, hierarchy);
     REQUIRE(saveResult.saved);
     CHECK(std::filesystem::is_directory(bundlePath));
     CHECK(!std::filesystem::exists(std::filesystem::path{bundlePath.string() + ".tmp"}));
     CHECK(std::filesystem::is_regular_file(bundlePath / "manifest.json"));
+    std::ifstream manifestInput{bundlePath / "manifest.json"};
+    const std::string manifestText{
+        std::istreambuf_iterator<char>{manifestInput},
+        std::istreambuf_iterator<char>{}};
+    CHECK(manifestText.find("\"source_point_count\"") != std::string::npos);
+    CHECK(manifestText.find(std::to_string(sourceInfo->pointCount)) != std::string::npos);
     CHECK(std::filesystem::is_regular_file(bundlePath / "attribute_schema.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "hierarchy.bin"));
     CHECK(std::filesystem::is_regular_file(bundlePath / "node_pages.bin"));
@@ -2349,7 +2371,8 @@ TEST_CASE("Adaptive viewport path does not fall back to source draw count", "[po
     CHECK(populateSection.find("adaptiveLodRuntimeStatus") != std::string::npos);
     CHECK(resolveSection.find("layer.requiresAdaptiveDrawItems") != std::string::npos);
     CHECK(resolveSection.find("return false;") < resolveSection.find("resources->activePointCount"));
-    CHECK(buildRenderStateSection.find("fullSourcePointRenderer ? session.totalPrimitives") != std::string::npos);
+    CHECK(buildRenderStateSection.find("exactFullSourceReady") != std::string::npos);
+    CHECK(buildRenderStateSection.find("PointCloudExactSourceResident(session)") != std::string::npos);
     CHECK(buildRenderStateSection.find("PopulateAdaptivePointCloudLayer") != std::string::npos);
 }
 
@@ -2553,7 +2576,8 @@ TEST_CASE("Fast Basic Source mode serializes and uses full source through Fast B
     const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
     CHECK(appSource.find("Fast Basic Source") != std::string::npos);
     CHECK(projectSource.find("\"fast_basic_source\"") != std::string::npos);
-    CHECK(appSource.find("fullSourcePointRenderer ? session.totalPrimitives") != std::string::npos);
+    CHECK(appSource.find("exactFullSourceReady ? session.totalPrimitives : 0ULL") != std::string::npos);
+    CHECK(appSource.find("PointCloudExactSourceResident") != std::string::npos);
     CHECK(appSource.find("PointCloudRendererModeUsesFullSource(rendererMode)") != std::string::npos);
     CHECK(rendererSource.find("\"fast-basic-source\"") != std::string::npos);
 }
@@ -2859,10 +2883,14 @@ TEST_CASE("LiDAR panel exposes manual adaptive LOD cache rebuild controls", "[ui
     const auto source = ReadRepoTextFile("src/app/Application.cpp");
     CHECK(source.find("bool rebuildPointLodCacheOnLoad") != std::string::npos);
     CHECK(source.find("RemovePointCloudLodCacheFiles") != std::string::npos);
+    CHECK(source.find("PointCloudExactSourceResident") != std::string::npos);
+    CHECK(source.find("BeginPointCloudExactSourceLoad") != std::string::npos);
     CHECK(source.find("RebuildSelectedPointCloudLodCache") != std::string::npos);
     CHECK(source.find("session.rebuildPointLodCacheOnLoad") != std::string::npos);
     CHECK(source.find("\"Rebuild LOD Cache On Load\"") != std::string::npos);
     CHECK(source.find("\"Rebuild LOD Cache Now\"") != std::string::npos);
+    CHECK(source.find("Waiting for exact source before LOD rebuild") != std::string::npos);
+    CHECK(source.find("Source modes wait for exact source data") != std::string::npos);
     CHECK(source.find("session.pointLodCacheSource.sourceSizeBytes > 0ULL && session.rebuildPointLodCacheOnLoad") !=
           std::string::npos);
 }

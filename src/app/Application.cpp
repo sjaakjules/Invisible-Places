@@ -849,6 +849,7 @@ struct PendingLayerLoad {
     std::optional<LayerLoadResult> completedResult;
     bool showUploadOverlayFrame = false;
     bool previewActivated = false;
+    bool exactPointCloudSourceOnly = false;
     std::chrono::steady_clock::time_point startedAt = std::chrono::steady_clock::now();
 };
 
@@ -1305,6 +1306,23 @@ PointBudgetState MakePreviewPointBudgetState(
     return invisible_places::renderer::pointcloud::MakePointBudgetState(
         session.totalPrimitives,
         requestedPoints);
+}
+
+bool PointCloudExactSourceResident(const PreviewLayerSession& session) {
+    if (session.kind != LayerKind::PointCloud ||
+        session.pointCloudPreviewActive ||
+        session.offlinePointCloud == nullptr) {
+        return false;
+    }
+    return static_cast<std::uint64_t>(session.offlinePointCloud->PointCount()) >= session.totalPrimitives;
+}
+
+bool PointCloudNeedsExactSourceLoad(const PreviewLayerSession& session) {
+    return session.kind == LayerKind::PointCloud &&
+           session.loaded &&
+           session.pointCloudPreviewActive &&
+           session.offlinePointCloud != nullptr &&
+           !session.sourcePath.empty();
 }
 
 const char* LayerKindLabel(LayerKind kind) {
@@ -5234,6 +5252,75 @@ void AttachPointCloudLodHierarchy(
     }
 }
 
+bool BeginPointCloudExactSourceLoad(
+    std::size_t sessionIndex,
+    PreviewRuntimeState* runtimeState,
+    std::string_view reason) {
+    if (runtimeState == nullptr || sessionIndex >= runtimeState->sessions.size()) {
+        return false;
+    }
+    auto& session = runtimeState->sessions[sessionIndex];
+    if (PointCloudExactSourceResident(session)) {
+        return true;
+    }
+    if (!PointCloudNeedsExactSourceLoad(session)) {
+        runtimeState->errorMessage =
+            session.displayName + ": exact source data is not available for loading.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (runtimeState->pendingLoad.has_value()) {
+        runtimeState->statusMessage =
+            session.displayName + ": exact source load will wait for the current layer load.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
+
+    const auto filePath = session.sourcePath;
+    session.pointIpcloudLoadStartedAt = std::chrono::steady_clock::now();
+    session.pointIpcloudLoadPhase = "loading exact source";
+    if (!reason.empty()) {
+        session.pointIpcloudBuildPhase = std::string{reason};
+    }
+    runtimeState->statusMessage =
+        session.displayName + ": loading exact source data for " +
+        (reason.empty() ? std::string{"Full Source mode"} : std::string{reason}) + "...";
+    runtimeState->errorMessage.clear();
+
+    auto backgroundState = std::make_shared<BackgroundLayerLoadState>();
+    std::jthread backgroundThread{
+        [backgroundState, filePath](std::stop_token stopToken) {
+            if (stopToken.stop_requested()) {
+                return;
+            }
+            auto result = invisible_places::io::LoadPointCloud(
+                filePath,
+                [backgroundState](const PointCloudLoadProgress& progress) {
+                    std::scoped_lock lock(backgroundState->mutex);
+                    backgroundState->pointCloudProgress = progress;
+                });
+            if (stopToken.stop_requested()) {
+                return;
+            }
+
+            std::scoped_lock lock(backgroundState->mutex);
+            backgroundState->result = LayerLoadResult{std::move(result)};
+        }};
+
+    runtimeState->pendingLoad = PendingLayerLoad{
+        .sessionIndex = sessionIndex,
+        .phase = PendingLoadPhase::CpuLoading,
+        .backgroundState = std::move(backgroundState),
+        .backgroundThread = std::move(backgroundThread),
+        .completedResult = std::nullopt,
+        .showUploadOverlayFrame = false,
+        .previewActivated = true,
+        .exactPointCloudSourceOnly = true,
+        .startedAt = session.pointIpcloudLoadStartedAt,
+    };
+    return true;
+}
+
 void StartPointCloudLodBuildWorker(
     PreviewLayerSession* session,
     std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud) {
@@ -5343,6 +5430,40 @@ bool RebuildSelectedPointCloudLodCache(
         runtimeState->statusMessage = session->displayName + ": LOD cache rebuild already running.";
         runtimeState->errorMessage.clear();
         return false;
+    }
+    if (!PointCloudExactSourceResident(*session)) {
+        std::string removeError;
+        const auto activeLodCachePath =
+            !session->pointLodCachePath.empty()
+                ? session->pointLodCachePath
+                : invisible_places::renderer::pointcloud::BuildPointCloudLodCachePath(
+                      PointCloudLodCacheDirectory(*runtimeState),
+                      session->sourcePath);
+        const auto removedCount = RemovePointCloudLodCacheFiles(activeLodCachePath, &removeError);
+        const auto removedBundleCount =
+            RemovePointCloudIpcloudBundleFiles(session->pointIpcloudBundlePath, &removeError);
+        ClearAdaptiveLodRuntimeCache(session);
+        session->pointLodHierarchy.reset();
+        session->pointLodHierarchyGeneration =
+            session->pointLodHierarchyGeneration == std::numeric_limits<std::uint64_t>::max()
+                ? 1ULL
+                : session->pointLodHierarchyGeneration + 1ULL;
+        if (session->pointLodHierarchyGeneration == 0ULL) {
+            session->pointLodHierarchyGeneration = 1ULL;
+        }
+        session->pointLodCacheStatus = "Waiting for exact source before LOD rebuild";
+        session->pointIpcloudBuildPhase = "Waiting for exact source before rebuild";
+        session->pointIpcloudPublishStatus =
+            (removedCount + removedBundleCount) > 0U ? "old cache removed; rebuild pending"
+                                                     : "rebuild pending exact source";
+        runtimeState->previewRenderStateSignatureValid = false;
+        if (!removeError.empty()) {
+            runtimeState->errorMessage = "LOD cache cleanup warning: " + removeError;
+        }
+        return BeginPointCloudExactSourceLoad(
+            static_cast<std::size_t>(session - runtimeState->sessions.data()),
+            runtimeState,
+            "LOD rebuild");
     }
 
     if (session->adaptiveLodWorker.joinable()) {
@@ -6975,7 +7096,8 @@ void PollPendingLayerLoad(
     auto& pendingLoad = runtimeState->pendingLoad.value();
 
     if (pendingLoad.phase == PendingLoadPhase::CpuLoading) {
-        if (!pendingLoad.previewActivated &&
+        if (!pendingLoad.exactPointCloudSourceOnly &&
+            !pendingLoad.previewActivated &&
             runtimeState->sessions[pendingLoad.sessionIndex].kind == LayerKind::PointCloud) {
             auto preview = TakeBackgroundPointCloudPreview(pendingLoad.backgroundState);
             if (preview.has_value() && preview->loaded) {
@@ -7013,7 +7135,9 @@ void PollPendingLayerLoad(
         pendingLoad.phase = PendingLoadPhase::UploadPending;
         pendingLoad.showUploadOverlayFrame = true;
         runtimeState->statusMessage =
-            "Uploading " + runtimeState->sessions[pendingLoad.sessionIndex].displayName + " to the GPU...";
+            "Uploading " +
+            std::string{pendingLoad.exactPointCloudSourceOnly ? "exact source " : ""} +
+            runtimeState->sessions[pendingLoad.sessionIndex].displayName + " to the GPU...";
         return;
     }
 
@@ -7069,6 +7193,26 @@ void PollPendingLayerLoad(
             WaterOverlayRefreshPersistence::InMemoryOnly);
     }
     RefreshLoadedWaterEffectOutputs(runtimeState, viewport, true);
+}
+
+bool EnsureExactPointCloudSourceForFullSourceRenderer(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !FullSourcePointRendererActive(runtimeState->projectSettings) ||
+        runtimeState->pendingLoad.has_value()) {
+        return false;
+    }
+
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState->sessions[sessionIndex];
+        if (!session.visible || !PointCloudNeedsExactSourceLoad(session)) {
+            continue;
+        }
+        return BeginPointCloudExactSourceLoad(
+            sessionIndex,
+            runtimeState,
+            "Full Source mode");
+    }
+    return false;
 }
 
 void UnloadLayerByIndex(
@@ -12388,16 +12532,13 @@ bool ValidateExactFullSourceExportReady(
             session.totalPrimitives == 0) {
             continue;
         }
-        const std::uint64_t residentSourcePoints =
-            session.offlinePointCloud == nullptr ? 0ULL : session.offlinePointCloud->PointCount();
-        if (session.pointCloudPreviewActive ||
-            session.offlinePointCloud == nullptr ||
-            residentSourcePoints < session.totalPrimitives) {
+        if (!PointCloudExactSourceResident(session)) {
             if (errorMessage != nullptr) {
                 *errorMessage =
                     "Full Source export needs exact source data for " +
                     (session.displayName.empty() ? std::string{"the selected LiDAR layer"} : session.displayName) +
-                    ". The layer is still using representative preview/chunk data; wait for full source load "
+                    ". The layer is still using representative preview/chunk data; switch to a Source renderer "
+                    "to load exact source data, wait for it to finish, "
                     "or choose Adaptive High Quality / Fast Adaptive Preview.";
             }
             return false;
@@ -18946,6 +19087,7 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
         "Beauty Adaptive",
         "Beauty Full Source",
         "Painted Adaptive"};
+    bool rendererModeChanged = false;
     if (ImGui::Combo(
             "Mode",
             &pointRendererModeIndex,
@@ -18971,10 +19113,25 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
                 settings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
                 break;
         }
+        rendererModeChanged = true;
+    }
+    if (rendererModeChanged) {
+        static_cast<void>(EnsureExactPointCloudSourceForFullSourceRenderer(runtimeState));
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
             "Fast Basic uses dense adaptive draw-item LOD. Fast Basic Source draws every raw source point through the square-point path. Beauty Adaptive uses draw-item LOD. Beauty Full Source draws raw source points through the beauty path. Painted Adaptive uses the adaptive hierarchy with brush styling.");
+    }
+    if (FullSourcePointRendererActive(settings)) {
+        const bool waitingForExactSource = std::any_of(
+            runtimeState->sessions.begin(),
+            runtimeState->sessions.end(),
+            [](const PreviewLayerSession& session) {
+                return session.visible && PointCloudNeedsExactSourceLoad(session);
+            });
+        if (waitingForExactSource) {
+            ImGui::TextDisabled("Source modes wait for exact source data; preview representatives are not drawn as source.");
+        }
     }
 
     const bool fastBasicRenderer = FastBasicPointRendererActive(settings);
@@ -21093,8 +21250,12 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         }
 
         if (session.kind == LayerKind::PointCloud) {
+            const bool exactFullSourceReady =
+                !fullSourcePointRenderer || PointCloudExactSourceResident(session);
             auto drawPointCount = std::min<std::uint64_t>(
-                fullSourcePointRenderer ? session.totalPrimitives : EffectivePointDrawCount(runtimeState, session),
+                fullSourcePointRenderer
+                    ? (exactFullSourceReady ? session.totalPrimitives : 0ULL)
+                    : EffectivePointDrawCount(runtimeState, session),
                 std::numeric_limits<std::uint32_t>::max());
             const auto effectiveStyle = MakeEffectivePointRendererStyle(
                 runtimeState.projectSettings.pointCloudRendererMode,
@@ -23418,6 +23579,7 @@ int Application::Run() const {
             viewport->SetSceneCachingEnabled(!runtimeState.projectSettings.constantUpdateView);
             viewport->SetLiveSceneRenderingEnabled(!pauseLiveViewport);
             if (!pauseLiveViewport) {
+                static_cast<void>(EnsureExactPointCloudSourceForFullSourceRenderer(&runtimeState));
                 const float previewFlowTimeSeconds =
                     runtimeState.projectSettings.liveVisualEffects
                         ? std::chrono::duration<float>(

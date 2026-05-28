@@ -565,6 +565,10 @@ bool ManifestMatchesSourceAndBuild(
         build.value("max_internal_representatives", 0U) != buildConfig.maxInternalRepresentatives) {
         return reject("build settings mismatch");
     }
+    const auto cloud = manifest.value("cloud", json::object());
+    if (cloud.value("source_point_count", 0ULL) != sourceInfo.pointCount) {
+        return reject("cloud source point count mismatch");
+    }
     return true;
 }
 
@@ -1305,6 +1309,7 @@ json MakeManifest(
         {"cloud",
          {
              {"bounds", BoundsJson(cloud.bounds)},
+             {"source_point_count", cloud.PointCount()},
              {"estimated_raw_spacing_meters", estimatedSpacing},
              {"hierarchy_node_count", hierarchy.nodes.size()},
              {"leaf_chunk_count", LeafNodeCount(hierarchy)},
@@ -2103,6 +2108,12 @@ PointCloudIpcloudSaveResult SavePointCloudIpcloudBundle(
     result.bundlePath = bundlePath;
     if (bundlePath.empty() || cloud.positions.empty() || hierarchy.Empty()) {
         result.errorMessage = "empty cloud or hierarchy";
+        return result;
+    }
+    if (cloud.PointCount() != sourceInfo.pointCount ||
+        hierarchy.sourcePointCount != sourceInfo.pointCount) {
+        result.errorMessage =
+            "source point count mismatch; refusing to publish partial preview .ipcloud bundle";
         return result;
     }
 
