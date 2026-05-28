@@ -22,6 +22,7 @@
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
 #include "renderer/pointcloud/PointCloudIpcloudCache.hpp"
+#include "renderer/pointcloud/PointCloudGpuDrivenSelection.hpp"
 #include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPerformanceGovernor.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
@@ -1845,6 +1846,125 @@ TEST_CASE("Point-cloud adaptive LOD traversal culls offscreen nodes and obeys bu
         hierarchy,
         params);
     CHECK(offscreen.empty());
+}
+
+TEST_CASE("Point-cloud GPU selection parity compares compacted draw-item identity", "[pointcloud][lod][gpu]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud cloud;
+    constexpr int gridSize = 4;
+    for (int z = 0; z < gridSize; ++z) {
+        for (int y = 0; y < gridSize; ++y) {
+            for (int x = 0; x < gridSize; ++x) {
+                invisible_places::io::Float3 point{
+                    (static_cast<float>(x) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(y) / static_cast<float>(gridSize - 1)) - 0.5F,
+                    (static_cast<float>(z) / static_cast<float>(gridSize - 1)) - 0.5F};
+                cloud.positions.push_back(point);
+                cloud.bounds.Expand(point);
+            }
+        }
+    }
+
+    const auto hierarchy = pc::BuildPointCloudLodHierarchy(
+        cloud,
+        {.maxLeafSourcePoints = 1U, .maxDepth = 6U, .maxInternalRepresentatives = 16U});
+    REQUIRE(!hierarchy.Empty());
+
+    pc::PointCloudLodTraversalParams params;
+    params.densityMode = invisible_places::output::PointCloudExportDensityMode::MatchViewportAdaptive;
+    params.viewportWidth = 512;
+    params.viewportHeight = 512;
+    params.maxRepresentatives = 16U;
+    params.maxEstimatedFragments = 1.0e9F;
+    params.targetProjectedSpacingPixels = 10000.0F;
+    params.maxRepresentativeDiameterPixels = 10000.0F;
+    const auto cpuSelection = pc::TraversePointCloudLodHierarchy(hierarchy, params);
+    REQUIRE(!cpuSelection.empty());
+
+    const auto exactParity = pc::ComparePointCloudGpuSelectionParity(cpuSelection, cpuSelection);
+    CHECK(exactParity.passed);
+    CHECK(exactParity.selectedCountDelta == 0);
+    CHECK(exactParity.sourceOverlapRatio == Catch::Approx(1.0));
+    CHECK(exactParity.cpuSelectionHash == exactParity.gpuSelectionHash);
+
+    auto mismatchedGpuSelection = cpuSelection;
+    mismatchedGpuSelection.pop_back();
+    const auto mismatch = pc::ComparePointCloudGpuSelectionParity(cpuSelection, mismatchedGpuSelection);
+    CHECK_FALSE(mismatch.passed);
+    CHECK(mismatch.selectedCountDelta == -1);
+}
+
+TEST_CASE("GPU-driven selection policy keeps CPU fallback until parity and speed are proven", "[pointcloud][lod][gpu]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    pc::PointCloudGpuDrivenSelectionCapabilities capabilities;
+    capabilities.computeQueueSupported = true;
+    capabilities.storageBuffersSupported = true;
+    capabilities.indirectDrawSupported = true;
+    capabilities.indirectCountSupported = false;
+    capabilities.maxStorageBuffersPerShaderStage = 8U;
+    capabilities.maxStorageBufferRange = 1ULL << 30U;
+    capabilities.maxDrawIndirectCount = 1U;
+
+    pc::PointCloudGpuDrivenSelectionInputs inputs;
+    inputs.hierarchyNodeCount = 4096U;
+    inputs.representativeCount = 131072U;
+    inputs.selectedDrawItemCount = 131072U;
+    inputs.cpuSelectionMs = 4.0;
+
+    const auto unproven = pc::EvaluatePointCloudGpuDrivenSelection(capabilities, inputs);
+    CHECK(unproven.selectionPath == "cpu-selection+indirect");
+    CHECK(unproven.indirectDrawRecommended);
+    CHECK_FALSE(unproven.indirectCountSupported);
+    CHECK(unproven.fallbackReason.find("parity") != std::string::npos);
+    CHECK(unproven.fallbackReason.find("timing") != std::string::npos);
+
+    inputs.parityChecked = true;
+    inputs.parityPassed = true;
+    inputs.gpuSelectionMs = 2.5;
+    inputs.gpuCompactionMs = 0.2;
+    const auto proven = pc::EvaluatePointCloudGpuDrivenSelection(capabilities, inputs);
+    CHECK(proven.selectionPath == "gpu-driven+indirect");
+    CHECK(proven.fallbackReason.empty());
+    CHECK(proven.computeSelectionBeneficial);
+
+    inputs.gpuSelectionMs = 4.2;
+    const auto slower = pc::EvaluatePointCloudGpuDrivenSelection(capabilities, inputs);
+    CHECK(slower.selectionPath == "cpu-selection+indirect");
+    CHECK(slower.fallbackReason.find("not measurably faster") != std::string::npos);
+}
+
+TEST_CASE("GPU-driven selection policy reports feature fallback reasons", "[pointcloud][lod][gpu]") {
+    namespace pc = invisible_places::renderer::pointcloud;
+
+    pc::PointCloudGpuDrivenSelectionCapabilities capabilities;
+    capabilities.computeQueueSupported = false;
+    capabilities.storageBuffersSupported = false;
+    capabilities.indirectDrawSupported = false;
+    capabilities.maxStorageBuffersPerShaderStage = 1U;
+    capabilities.maxStorageBufferRange = 16U;
+    capabilities.maxDrawIndirectCount = 0U;
+
+    const auto decision = pc::EvaluatePointCloudGpuDrivenSelection(
+        capabilities,
+        {.hierarchyNodeCount = 1024U,
+         .representativeCount = 131072U,
+         .selectedDrawItemCount = 131072U,
+         .cpuSelectionMs = 6.0,
+         .gpuSelectionMs = 2.0,
+         .gpuCompactionMs = 0.4,
+         .parityChecked = true,
+         .parityPassed = true,
+         .allowGpuDrivenSelection = true,
+         .allowIndirectDraw = true});
+
+    CHECK(decision.selectionPath == "cpu");
+    CHECK_FALSE(decision.computeSelectionSupported);
+    CHECK_FALSE(decision.indirectDrawRecommended);
+    CHECK(decision.fallbackReason.find("compute") != std::string::npos);
+    CHECK(decision.fallbackReason.find("storage-buffer") != std::string::npos);
+    CHECK(decision.fallbackReason.find("indirect draw unsupported") != std::string::npos);
 }
 
 TEST_CASE("Point-cloud adaptive LOD traversal enforces estimated fragment budget", "[pointcloud][lod]") {

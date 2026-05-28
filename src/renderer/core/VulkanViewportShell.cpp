@@ -217,6 +217,7 @@ std::optional<std::uint32_t> FindExactScalarFieldSlot(
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
+constexpr std::uint32_t kMinimumAdaptiveIndirectDrawPoints = 4096U;
 
 bool MatricesApproximatelyEqual(const glm::mat4& left, const glm::mat4& right, float epsilon = 1.0e-6F) {
     for (int column = 0; column < 4; ++column) {
@@ -1017,6 +1018,21 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.gpuBeautyPointPassMs = 0.0;
         diagnostics_.gpuCompositePassMs = 0.0;
         diagnostics_.gpuPostProcessPassMs = 0.0;
+        diagnostics_.adaptiveSelectionExecutionPath = "cpu";
+        diagnostics_.adaptiveSelectionFallbackReason = "GPU-driven selection has not been evaluated";
+        diagnostics_.adaptiveSelectionParityStatus = "not checked";
+        diagnostics_.adaptiveGpuSelectionSupported = false;
+        diagnostics_.adaptiveGpuSelectionBeneficial = false;
+        diagnostics_.adaptiveIndirectDrawSupported = gpuDrivenSelectionCapabilities_.indirectDrawSupported;
+        diagnostics_.adaptiveIndirectCountSupported = gpuDrivenSelectionCapabilities_.indirectCountSupported;
+        diagnostics_.adaptiveIndirectDrawRecommended = false;
+        diagnostics_.adaptiveIndirectDrawUsed = false;
+        diagnostics_.adaptiveIndirectDrawCalls = 0;
+        diagnostics_.adaptiveIndirectDrawCount = 0;
+        diagnostics_.adaptiveIndirectSubmittedVertices = 0;
+        diagnostics_.adaptiveGpuSelectedRepresentativeCount = 0;
+        diagnostics_.adaptiveGpuSelectionMs = 0.0;
+        diagnostics_.adaptiveGpuCompactionMs = 0.0;
     }
 }
 
@@ -1360,6 +1376,39 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveLodStaleTraversalDiscardedCount = adaptiveStaleTraversalDiscardedCount;
     diagnostics_.adaptiveGpuIdleWaitCount = 0;
     diagnostics_.adaptiveDrawItemBytes = adaptiveDrawItemBytes;
+    const auto gpuSelectionDecision = renderer::pointcloud::EvaluatePointCloudGpuDrivenSelection(
+        gpuDrivenSelectionCapabilities_,
+        {.hierarchyNodeCount = adaptiveVisibleFrontierNodeCount,
+         .representativeCount = static_cast<std::uint32_t>(
+             std::min<std::uint64_t>(
+                 adaptiveRepresentativeCount,
+                 std::numeric_limits<std::uint32_t>::max())),
+         .selectedDrawItemCount = static_cast<std::uint32_t>(
+             std::min<std::uint64_t>(
+                 adaptiveRepresentativeCount,
+                 std::numeric_limits<std::uint32_t>::max())),
+         .cpuSelectionMs = adaptiveTraversalMs,
+         .gpuSelectionMs = 0.0,
+         .gpuCompactionMs = 0.0,
+         .parityChecked = false,
+         .parityPassed = false,
+         .allowGpuDrivenSelection = true,
+         .allowIndirectDraw = true});
+    diagnostics_.adaptiveSelectionExecutionPath = gpuSelectionDecision.selectionPath;
+    diagnostics_.adaptiveSelectionFallbackReason = gpuSelectionDecision.fallbackReason;
+    diagnostics_.adaptiveSelectionParityStatus = gpuSelectionDecision.parityStatus;
+    diagnostics_.adaptiveGpuSelectionSupported = gpuSelectionDecision.computeSelectionSupported;
+    diagnostics_.adaptiveGpuSelectionBeneficial = gpuSelectionDecision.computeSelectionBeneficial;
+    diagnostics_.adaptiveIndirectDrawSupported = gpuSelectionDecision.indirectDrawSupported;
+    diagnostics_.adaptiveIndirectCountSupported = gpuSelectionDecision.indirectCountSupported;
+    diagnostics_.adaptiveIndirectDrawRecommended = gpuSelectionDecision.indirectDrawRecommended;
+    diagnostics_.adaptiveIndirectDrawUsed = false;
+    diagnostics_.adaptiveIndirectDrawCalls = 0;
+    diagnostics_.adaptiveIndirectDrawCount = gpuSelectionDecision.indirectDrawCount;
+    diagnostics_.adaptiveIndirectSubmittedVertices = 0;
+    diagnostics_.adaptiveGpuSelectedRepresentativeCount = gpuSelectionDecision.gpuSelectedRepresentativeCount;
+    diagnostics_.adaptiveGpuSelectionMs = gpuSelectionDecision.computeSelectionMs;
+    diagnostics_.adaptiveGpuCompactionMs = gpuSelectionDecision.compactionMs;
     diagnostics_.adaptiveLodPersistentCacheStatus = std::move(adaptivePersistentCacheStatus);
     diagnostics_.adaptiveLodRuntimeStatus = std::move(adaptiveRuntimeStatus);
     diagnostics_.adaptiveLodRequestedDensity = std::move(adaptiveRequestedDensity);
@@ -1501,11 +1550,19 @@ void VulkanViewportShell::UploadPointCloud(
         sizeof(PointCloudStyleGpu),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     const renderer::pointcloud::PointCloudDrawItemGpu fallbackDrawItem{};
+    const VkDrawIndirectCommand fallbackIndirectDraw{0U, 1U, 0U, 0U};
     for (std::size_t frameIndex = 0; frameIndex < resources.drawItemBuffers.size(); ++frameIndex) {
         resources.drawItemBuffers[frameIndex] = CreateHostVisibleBuffer(
             sizeof(fallbackDrawItem),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources.drawItemBuffers[frameIndex], &fallbackDrawItem, sizeof(fallbackDrawItem));
+        resources.indirectDrawCommandBuffers[frameIndex] = CreateHostVisibleBuffer(
+            sizeof(fallbackIndirectDraw),
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+        UploadBufferData(
+            resources.indirectDrawCommandBuffers[frameIndex],
+            &fallbackIndirectDraw,
+            sizeof(fallbackIndirectDraw));
         resources.drawItemCapacities[frameIndex] = 1U;
     }
     resources.exrDrawItemBuffer = CreateHostVisibleBuffer(
@@ -2019,11 +2076,35 @@ void VulkanViewportShell::PickPhysicalDevice() {
 
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(device, &properties);
+        VkPhysicalDeviceFeatures features{};
+        vkGetPhysicalDeviceFeatures(device, &features);
+        const auto extensions = EnumerateDeviceExtensions(device);
         diagnostics_.rendererName = properties.deviceName;
         diagnostics_.driverName = "Vulkan";
         gpuTimestampPeriodNs_ = properties.limits.timestampPeriod;
         pointSizeRangeMin_ = std::max(1.0F, properties.limits.pointSizeRange[0]);
         pointSizeRangeMax_ = std::max(pointSizeRangeMin_, properties.limits.pointSizeRange[1]);
+        gpuDrivenSelectionCapabilities_.deviceName = properties.deviceName;
+        gpuDrivenSelectionCapabilities_.portabilitySubsetActive = portabilitySubsetEnabled;
+        gpuDrivenSelectionCapabilities_.storageBuffersSupported =
+            properties.limits.maxPerStageDescriptorStorageBuffers >= 4U &&
+            properties.limits.maxStorageBufferRange >= sizeof(renderer::pointcloud::PointCloudDrawItemGpu);
+        gpuDrivenSelectionCapabilities_.maxStorageBuffersPerShaderStage =
+            properties.limits.maxPerStageDescriptorStorageBuffers;
+        gpuDrivenSelectionCapabilities_.maxStorageBufferRange = properties.limits.maxStorageBufferRange;
+        gpuDrivenSelectionCapabilities_.indirectDrawSupported = properties.limits.maxDrawIndirectCount > 0U;
+        gpuDrivenSelectionCapabilities_.maxDrawIndirectCount = properties.limits.maxDrawIndirectCount;
+        gpuDrivenSelectionCapabilities_.drawIndirectFirstInstance =
+            features.drawIndirectFirstInstance == VK_TRUE;
+        gpuDrivenSelectionCapabilities_.multiDrawIndirect = features.multiDrawIndirect == VK_TRUE;
+#ifdef VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME
+        gpuDrivenSelectionCapabilities_.indirectCountSupported =
+            properties.apiVersion >= VK_API_VERSION_1_2 ||
+            HasExtension(extensions, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+#else
+        gpuDrivenSelectionCapabilities_.indirectCountSupported =
+            properties.apiVersion >= VK_API_VERSION_1_2;
+#endif
         break;
     }
 
@@ -2042,6 +2123,12 @@ void VulkanViewportShell::PickPhysicalDevice() {
     }
     graphicsQueueTimestampValidBits_ =
         graphicsQueueFamily_ < queueFamilies.size() ? queueFamilies[graphicsQueueFamily_].timestampValidBits : 0U;
+    gpuDrivenSelectionCapabilities_.computeQueueSupported =
+        graphicsQueueFamily_ < queueFamilies.size() &&
+        (queueFamilies[graphicsQueueFamily_].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+    if (enablePortabilitySubset_ && gpuDrivenSelectionCapabilities_.limitations.empty()) {
+        gpuDrivenSelectionCapabilities_.limitations = "MoltenVK portability subset active; GPU selection remains guarded";
+    }
     gpuTimestampsSupported_ = gpuTimestampPeriodNs_ > 0.0F && graphicsQueueTimestampValidBits_ > 0U;
     diagnostics_.gpuTimestampSupported = gpuTimestampsSupported_;
     diagnostics_.gpuTimestampState =
@@ -5488,6 +5575,9 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     for (auto& drawItemBuffer : resources->drawItemBuffers) {
         DestroyBuffer(&drawItemBuffer);
     }
+    for (auto& indirectDrawCommandBuffer : resources->indirectDrawCommandBuffers) {
+        DestroyBuffer(&indirectDrawCommandBuffer);
+    }
     DestroyBuffer(&resources->exrDrawItemBuffer);
     for (auto& descriptorSets : resources->descriptorSets) {
         for (auto& descriptorSet : descriptorSets) {
@@ -6053,8 +6143,37 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         *recordedDrawPointCount = plan.drawPointCount;
     }
 
+    const bool useIndirectDraw =
+        gpuDrivenSelectionCapabilities_.indirectDrawSupported &&
+        plan.drawItemReady &&
+        plan.drawPointCount >= kMinimumAdaptiveIndirectDrawPoints &&
+        frameIndex < kFramesInFlight &&
+        resources->indirectDrawCommandBuffers[frameIndex].buffer != VK_NULL_HANDLE;
+
     if (plan.worldSurfels) {
         const std::uint32_t surfelVertexCount = plan.drawPointCount * kSurfelVerticesPerPoint;
+        if (useIndirectDraw) {
+            const VkDrawIndirectCommand command{
+                surfelVertexCount,
+                1U,
+                0U,
+                0U,
+            };
+            UploadBufferData(
+                resources->indirectDrawCommandBuffers[frameIndex],
+                &command,
+                sizeof(command));
+            vkCmdDrawIndirect(
+                commandBuffer,
+                resources->indirectDrawCommandBuffers[frameIndex].buffer,
+                0,
+                1,
+                sizeof(VkDrawIndirectCommand));
+            diagnostics_.adaptiveIndirectDrawUsed = true;
+            diagnostics_.adaptiveIndirectDrawCalls += 1U;
+            diagnostics_.adaptiveIndirectSubmittedVertices += surfelVertexCount;
+            return true;
+        }
         if (plan.sampledBudgetReady && !plan.drawItemReady) {
             vkCmdBindIndexBuffer(
                 commandBuffer,
@@ -6087,6 +6206,26 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
             0,
             VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(commandBuffer, plan.drawPointCount, 1, 0, 0, 0);
+    } else if (useIndirectDraw) {
+        const VkDrawIndirectCommand command{
+            plan.drawPointCount,
+            1U,
+            0U,
+            0U,
+        };
+        UploadBufferData(
+            resources->indirectDrawCommandBuffers[frameIndex],
+            &command,
+            sizeof(command));
+        vkCmdDrawIndirect(
+            commandBuffer,
+            resources->indirectDrawCommandBuffers[frameIndex].buffer,
+            0,
+            1,
+            sizeof(VkDrawIndirectCommand));
+        diagnostics_.adaptiveIndirectDrawUsed = true;
+        diagnostics_.adaptiveIndirectDrawCalls += 1U;
+        diagnostics_.adaptiveIndirectSubmittedVertices += plan.drawPointCount;
     } else {
         vkCmdDraw(commandBuffer, plan.drawPointCount, 1, 0, 0);
     }

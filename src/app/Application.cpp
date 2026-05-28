@@ -21318,6 +21318,18 @@ void DrawDiagnosticsWindow(
                         ? diagnostics.adaptiveLodFallbackState.c_str()
                         : (diagnostics.adaptiveLodReusedPrevious ? "using previous adaptive buffer" : "current"));
                 ImGui::Text(
+                    "Adaptive selection path: %s | indirect %s (%u draws)",
+                    diagnostics.adaptiveSelectionExecutionPath.c_str(),
+                    diagnostics.adaptiveIndirectDrawUsed
+                        ? "used"
+                        : (diagnostics.adaptiveIndirectDrawRecommended ? "ready" : "direct"),
+                    diagnostics.adaptiveIndirectDrawCalls);
+                if (!diagnostics.adaptiveSelectionFallbackReason.empty()) {
+                    ImGui::TextWrapped(
+                        "GPU selection fallback: %s",
+                        diagnostics.adaptiveSelectionFallbackReason.c_str());
+                }
+                ImGui::Text(
                     "Adaptive bytes: %.2f MB",
                     static_cast<double>(diagnostics.adaptiveDrawItemBytes) / (1024.0 * 1024.0));
                 if (!diagnostics.adaptiveLodPersistentCacheStatus.empty()) {
@@ -22134,6 +22146,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     bool fastBasicTimestampSupported = false;
     bool fastBasicSawGpuTiming = false;
     std::string fastBasicTimestampState;
+    bool fastBasicGpuSelectionSupported = false;
+    bool fastBasicGpuSelectionBeneficial = false;
+    bool fastBasicIndirectDrawSupported = false;
+    bool fastBasicIndirectCountSupported = false;
+    bool fastBasicIndirectDrawRecommended = false;
+    bool fastBasicIndirectDrawUsed = false;
+    std::string fastBasicGpuSelectionPath = "cpu";
+    std::string fastBasicGpuSelectionFallbackReason;
+    std::string fastBasicGpuSelectionParityStatus = "not checked";
+    std::uint32_t fastBasicMaxIndirectDrawCalls = 0;
+    std::uint64_t fastBasicIndirectSubmittedVertices = 0;
+    std::uint64_t fastBasicGpuSelectedRepresentativeCount = 0;
     double fastBasicMaxGpuPointPassMs = 0.0;
     double fastBasicMaxGpuPointPassEwmaMs = 0.0;
     double fastBasicMinGovernorBudgetScale = std::numeric_limits<double>::max();
@@ -22328,6 +22352,33 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         if (!diagnostics.gpuTimestampState.empty()) {
             fastBasicTimestampState = diagnostics.gpuTimestampState;
         }
+        fastBasicGpuSelectionSupported =
+            fastBasicGpuSelectionSupported || diagnostics.adaptiveGpuSelectionSupported;
+        fastBasicGpuSelectionBeneficial =
+            fastBasicGpuSelectionBeneficial || diagnostics.adaptiveGpuSelectionBeneficial;
+        fastBasicIndirectDrawSupported =
+            fastBasicIndirectDrawSupported || diagnostics.adaptiveIndirectDrawSupported;
+        fastBasicIndirectCountSupported =
+            fastBasicIndirectCountSupported || diagnostics.adaptiveIndirectCountSupported;
+        fastBasicIndirectDrawRecommended =
+            fastBasicIndirectDrawRecommended || diagnostics.adaptiveIndirectDrawRecommended;
+        fastBasicIndirectDrawUsed =
+            fastBasicIndirectDrawUsed || diagnostics.adaptiveIndirectDrawUsed;
+        if (!diagnostics.adaptiveSelectionExecutionPath.empty()) {
+            fastBasicGpuSelectionPath = diagnostics.adaptiveSelectionExecutionPath;
+        }
+        if (!diagnostics.adaptiveSelectionFallbackReason.empty()) {
+            fastBasicGpuSelectionFallbackReason = diagnostics.adaptiveSelectionFallbackReason;
+        }
+        if (!diagnostics.adaptiveSelectionParityStatus.empty()) {
+            fastBasicGpuSelectionParityStatus = diagnostics.adaptiveSelectionParityStatus;
+        }
+        fastBasicMaxIndirectDrawCalls =
+            std::max(fastBasicMaxIndirectDrawCalls, diagnostics.adaptiveIndirectDrawCalls);
+        fastBasicIndirectSubmittedVertices =
+            std::max(fastBasicIndirectSubmittedVertices, diagnostics.adaptiveIndirectSubmittedVertices);
+        fastBasicGpuSelectedRepresentativeCount =
+            std::max(fastBasicGpuSelectedRepresentativeCount, diagnostics.adaptiveGpuSelectedRepresentativeCount);
         fastBasicMaxGpuPointPassMs = std::max(
             fastBasicMaxGpuPointPassMs,
             diagnostics.gpuFastBasicPointPassMs);
@@ -22905,6 +22956,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::string occlusionCullingDisabledReason = "not requested";
         std::uint32_t occlusionRejectedNodeCount = 0;
         std::uint64_t occlusionRejectedRepresentedSourceCount = 0;
+        bool gpuSelectionSupported = false;
+        bool gpuSelectionBeneficial = false;
+        bool indirectDrawSupported = false;
+        bool indirectCountSupported = false;
+        bool indirectDrawRecommended = false;
+        bool indirectDrawUsed = false;
+        std::string gpuSelectionPath = "cpu";
+        std::string gpuSelectionFallbackReason;
+        std::string gpuSelectionParityStatus = "not checked";
+        std::uint32_t maxIndirectDrawCalls = 0;
+        std::uint64_t indirectSubmittedVertices = 0;
+        std::uint64_t gpuSelectedRepresentativeCount = 0;
         std::uint64_t maxAdaptiveRepresentatives = 0;
         std::uint32_t performanceLimitedFrames = 0;
     };
@@ -23002,6 +23065,33 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             if (!diagnostics.gpuTimestampState.empty()) {
                 stress.timestampState = diagnostics.gpuTimestampState;
             }
+            stress.gpuSelectionSupported =
+                stress.gpuSelectionSupported || diagnostics.adaptiveGpuSelectionSupported;
+            stress.gpuSelectionBeneficial =
+                stress.gpuSelectionBeneficial || diagnostics.adaptiveGpuSelectionBeneficial;
+            stress.indirectDrawSupported =
+                stress.indirectDrawSupported || diagnostics.adaptiveIndirectDrawSupported;
+            stress.indirectCountSupported =
+                stress.indirectCountSupported || diagnostics.adaptiveIndirectCountSupported;
+            stress.indirectDrawRecommended =
+                stress.indirectDrawRecommended || diagnostics.adaptiveIndirectDrawRecommended;
+            stress.indirectDrawUsed =
+                stress.indirectDrawUsed || diagnostics.adaptiveIndirectDrawUsed;
+            if (!diagnostics.adaptiveSelectionExecutionPath.empty()) {
+                stress.gpuSelectionPath = diagnostics.adaptiveSelectionExecutionPath;
+            }
+            if (!diagnostics.adaptiveSelectionFallbackReason.empty()) {
+                stress.gpuSelectionFallbackReason = diagnostics.adaptiveSelectionFallbackReason;
+            }
+            if (!diagnostics.adaptiveSelectionParityStatus.empty()) {
+                stress.gpuSelectionParityStatus = diagnostics.adaptiveSelectionParityStatus;
+            }
+            stress.maxIndirectDrawCalls =
+                std::max(stress.maxIndirectDrawCalls, diagnostics.adaptiveIndirectDrawCalls);
+            stress.indirectSubmittedVertices =
+                std::max(stress.indirectSubmittedVertices, diagnostics.adaptiveIndirectSubmittedVertices);
+            stress.gpuSelectedRepresentativeCount =
+                std::max(stress.gpuSelectedRepresentativeCount, diagnostics.adaptiveGpuSelectedRepresentativeCount);
             if (!diagnostics.adaptiveGovernorStatus.empty()) {
                 stress.governorStatus = diagnostics.adaptiveGovernorStatus;
             }
@@ -23189,6 +23279,27 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"adaptive_missing_chunks\": " << lodCompareResidency.missingChunkCount << ",\n"
                 << "  \"adaptive_chunk_hit_rate\": " << lodCompareResidency.chunkHitRate << ",\n"
                 << "  \"adaptive_fallback_reason\": " << JsonStringLiteral(lodCompareFallbackReason) << ",\n"
+                << "  \"gpu_selection_path\": " << JsonStringLiteral(fastBasicGpuSelectionPath) << ",\n"
+                << "  \"gpu_selection_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuSelectionFallbackReason) << ",\n"
+                << "  \"gpu_selection_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuSelectionParityStatus) << ",\n"
+                << "  \"gpu_selection_supported\": "
+                << (fastBasicGpuSelectionSupported ? "true" : "false") << ",\n"
+                << "  \"gpu_selection_beneficial\": "
+                << (fastBasicGpuSelectionBeneficial ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_draw_supported\": "
+                << (fastBasicIndirectDrawSupported ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_count_supported\": "
+                << (fastBasicIndirectCountSupported ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_draw_recommended\": "
+                << (fastBasicIndirectDrawRecommended ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_draw_used\": "
+                << (fastBasicIndirectDrawUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_indirect_draw_calls\": " << fastBasicMaxIndirectDrawCalls << ",\n"
+                << "  \"gpu_indirect_submitted_vertices\": " << fastBasicIndirectSubmittedVertices << ",\n"
+                << "  \"gpu_selected_representative_count\": "
+                << fastBasicGpuSelectedRepresentativeCount << ",\n"
                 << "  \"full_source_exr\": \"" << fullPath.lexically_normal().generic_string() << "\",\n"
                 << "  \"adaptive_exr\": \"" << adaptivePath.lexically_normal().generic_string() << "\",\n"
                 << "  \"difference_exr\": \"" << primaryDifferencePath.lexically_normal().generic_string() << "\",\n"
@@ -23412,6 +23523,29 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"beauty_stress_timestamp_state\": \"" << beautyStress.timestampState << "\",\n"
                 << "  \"beauty_stress_saw_gpu_timing\": "
                 << (beautyStress.sawGpuTiming ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_gpu_selection_path\": "
+                << JsonStringLiteral(beautyStress.gpuSelectionPath) << ",\n"
+                << "  \"beauty_stress_gpu_selection_fallback_reason\": "
+                << JsonStringLiteral(beautyStress.gpuSelectionFallbackReason) << ",\n"
+                << "  \"beauty_stress_gpu_selection_parity_status\": "
+                << JsonStringLiteral(beautyStress.gpuSelectionParityStatus) << ",\n"
+                << "  \"beauty_stress_gpu_selection_supported\": "
+                << (beautyStress.gpuSelectionSupported ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_gpu_selection_beneficial\": "
+                << (beautyStress.gpuSelectionBeneficial ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_draw_supported\": "
+                << (beautyStress.indirectDrawSupported ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_count_supported\": "
+                << (beautyStress.indirectCountSupported ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_draw_recommended\": "
+                << (beautyStress.indirectDrawRecommended ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_draw_used\": "
+                << (beautyStress.indirectDrawUsed ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_indirect_draw_calls\": " << beautyStress.maxIndirectDrawCalls << ",\n"
+                << "  \"beauty_stress_indirect_submitted_vertices\": "
+                << beautyStress.indirectSubmittedVertices << ",\n"
+                << "  \"beauty_stress_gpu_selected_representative_count\": "
+                << beautyStress.gpuSelectedRepresentativeCount << ",\n"
                 << "  \"beauty_stress_max_gpu_point_pass_ms\": " << beautyStress.maxGpuPointPassMs << ",\n"
                 << "  \"beauty_stress_max_gpu_point_pass_ewma_ms\": " << beautyStress.maxGpuPointPassEwmaMs << ",\n"
                 << "  \"beauty_stress_min_governor_budget_scale\": "
@@ -23549,6 +23683,29 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << (fastBasicSubmittedFullSource ? "true" : "false") << ",\n"
                 << "  \"fast_basic_stale_traversals_discarded\": " << fastBasicStaleTraversals << ",\n"
                 << "  \"fast_basic_runtime_status\": \"" << fastBasicRuntimeStatus << "\",\n"
+                << "  \"fast_basic_gpu_selection_path\": "
+                << JsonStringLiteral(fastBasicGpuSelectionPath) << ",\n"
+                << "  \"fast_basic_gpu_selection_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuSelectionFallbackReason) << ",\n"
+                << "  \"fast_basic_gpu_selection_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuSelectionParityStatus) << ",\n"
+                << "  \"fast_basic_gpu_selection_supported\": "
+                << (fastBasicGpuSelectionSupported ? "true" : "false") << ",\n"
+                << "  \"fast_basic_gpu_selection_beneficial\": "
+                << (fastBasicGpuSelectionBeneficial ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_draw_supported\": "
+                << (fastBasicIndirectDrawSupported ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_count_supported\": "
+                << (fastBasicIndirectCountSupported ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_draw_recommended\": "
+                << (fastBasicIndirectDrawRecommended ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_draw_used\": "
+                << (fastBasicIndirectDrawUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_indirect_draw_calls\": " << fastBasicMaxIndirectDrawCalls << ",\n"
+                << "  \"fast_basic_indirect_submitted_vertices\": "
+                << fastBasicIndirectSubmittedVertices << ",\n"
+                << "  \"fast_basic_gpu_selected_representative_count\": "
+                << fastBasicGpuSelectedRepresentativeCount << ",\n"
                 << "  \"fast_basic_fallback_state\": \"" << fastBasicFallbackState << "\"\n"
                 << "}\n";
     }

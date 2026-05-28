@@ -30,8 +30,12 @@ tile-budget limiting for low-priority representatives, keeps Fast Basic
 diagnostic-only, keeps Full Source exact, and reports conservative culling as
 disabled or uncertain until a safe depth proxy or reliable normal metadata
 exists. `--lod-compare` now writes schema v3 tile/culling fields.
-GPU compute selection, memory-mapped chunks, and fully device-local chunk
-residency remain later-stage items.
+Stage 11 adds runtime GPU-driven selection feature checks, CPU/GPU parity policy
+helpers, indirect draw diagnostics, and `vkCmdDrawIndirect` submission for large
+adaptive draw-item paths when supported. GPU compute selection remains guarded
+behind feature, parity, and timing proof; on the local MoltenVK runtime the
+default reported path is `cpu-selection+indirect`. Memory-mapped chunks and
+fully device-local chunk residency remain later-stage items.
 
 Fresh runtime/performance reports now include the HUD/diagnostics values
 described below so sparse, stale, or feature-erasing adaptive output can be
@@ -119,6 +123,13 @@ sample-count cap anymore.
   frontier node, and protects scalar, emissive/accent, color-contrast, and
   normal/edge representatives from tile-only rejection. Full Source bypasses
   tile limiting.
+- GPU-driven selection policy support exists. The renderer checks compute-queue
+  availability, storage-buffer limits, indirect draw, indirect count, MoltenVK
+  portability subset state, parity status, and CPU/GPU timing before allowing a
+  compute selector to replace the CPU selector. Large adaptive draw-item paths
+  submit through `vkCmdDrawIndirect` when supported; current indirect commands
+  use the CPU-selected compact draw-item count, so selection semantics remain
+  unchanged.
 - Conservative occlusion/backface/depth-proxy culling diagnostics are wired
   through traversal, cache state, viewport diagnostics, HUD/debug UI, and
   compare metrics. Actual rejection remains disabled when metadata or depth
@@ -365,6 +376,21 @@ sample-count cap anymore.
   1,002,773 / 22,345, max tile blended pressure 364,341 against the 65,536 tile
   budget, culling disabled, no adaptive/full-source fallback, and no budget
   exceedance.
+- Stage 11 sample evidence on `Data/Site3-Sample-Terrestrial.ply` completed
+  build, focused GPU/LOD tests, full CTest, stream check, and `--lod-compare`.
+  The local MoltenVK runtime reported GPU-selection feature support plus
+  indirect-count support, but the runtime path stayed `cpu-selection+indirect`
+  because CPU/GPU compute-selection parity and timing are not yet available.
+  Indirect draw submission was used for adaptive draw items: Fast Basic recorded
+  1 indirect draw / 262,115 submitted vertices and Beauty stress recorded 2
+  indirect draws / 524,264 submitted vertices. The fallback reason was explicit:
+  `CPU/GPU selection parity has not been checked; GPU selection timing is not
+  available`. Coverage ratio stayed 1, luminance ratio 0.804235, RGB MAE
+  0.0152765, Adaptive HQ used 1,824,536 representatives covering 11,848,474
+  source points, and the run reported no adaptive/full-source fallback or budget
+  exceedance. The stream check still passed at center/repeat-center 563 / 2,292
+  chunks, 43,438 / 56,537 remapped draw items, 120.9 MiB CPU residency,
+  128.0 MiB GPU residency/upload, and 76.8311% chunk hit rate.
 
 ## Partially Implemented
 
@@ -394,8 +420,10 @@ These pieces exist, but they are not yet the ideal system described in
 - Hierarchy build is asynchronous and reports progress, but the build itself is
   still monolithic and not cancellable until `BuildPointCloudLodHierarchy(...)`
   returns.
-- Traversal is CPU-only. There is no GPU compute culling, compaction, indirect
-  draw generation, or GPU-driven visible-chunk selection.
+- Traversal selection is still CPU-authored by default. GPU compute culling and
+  compaction are not active until parity and timing pass, while indirect draw
+  submission is active for large adaptive draw-item paths where Vulkan supports
+  it.
 - Manual sampled point budgets still exist and are uploaded as sampled index
   buffers. The adaptive path treats them mostly as a debug/loading cap, but the
   UI still exposes a generic `Budget` control that can be confused with LOD.
@@ -434,7 +462,8 @@ These are still target-system items from the ideal plan.
 - Active depth-proxy, backface, or Hi-Z occlusion rejection; Stage 10 only
   reports disabled/uncertain conservative culling states until correctness is
   provable.
-- GPU compute traversal/culling/compaction and indirect draw submission.
+- GPU compute traversal/culling/compaction, GPU-generated indirect commands, and
+  indirect-count submission.
 
 ## Likely Lag Sources
 
@@ -621,13 +650,15 @@ Metrics to watch:
 
 ### 6. Advanced Performance Work
 
-Move to GPU-driven features after the CPU path is correct and profiled.
+Move further GPU-driven features only after the CPU path remains correct and
+the next GPU candidate is profiled.
 
 - Tile overdraw estimates and first CPU-side per-tile fragment budgets are
   implemented for Beauty Adaptive. Next, add a conservative depth proxy or Hi-Z
   pyramid before enabling actual hidden-node rejection.
-- Move culling, projected-error evaluation, compaction, and indirect draw command
-  generation to compute where it beats the CPU path.
+- Keep the current indirect draw submission path guarded by runtime diagnostics.
+  Move culling, projected-error evaluation, compaction, and GPU-generated
+  indirect commands to compute only where they beat the CPU path.
 - Keep a CPU fallback for portability and debugging.
 
 Metrics to watch:
@@ -636,6 +667,7 @@ Metrics to watch:
 - culled hidden nodes
 - compute selection ms
 - indirect draw count
+- GPU-selection path/fallback/parity status
 - point-pass ms before/after tile and occlusion work
 
 ## Checks And Metrics

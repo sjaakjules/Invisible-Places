@@ -6,6 +6,7 @@
 #include "output/RenderPreset.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
+#include "renderer/pointcloud/PointCloudGpuDrivenSelection.hpp"
 #include "renderer/pointcloud/PointCloudLodHierarchy.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 
@@ -125,6 +126,21 @@ struct ViewportDiagnostics {
     std::uint64_t adaptiveLodStaleTraversalDiscardedCount = 0;
     std::uint32_t adaptiveGpuIdleWaitCount = 0;
     std::uint64_t adaptiveDrawItemBytes = 0;
+    std::string adaptiveSelectionExecutionPath = "cpu";
+    std::string adaptiveSelectionFallbackReason = "GPU-driven selection has not been evaluated";
+    std::string adaptiveSelectionParityStatus = "not checked";
+    bool adaptiveGpuSelectionSupported = false;
+    bool adaptiveGpuSelectionBeneficial = false;
+    bool adaptiveIndirectDrawSupported = false;
+    bool adaptiveIndirectCountSupported = false;
+    bool adaptiveIndirectDrawRecommended = false;
+    bool adaptiveIndirectDrawUsed = false;
+    std::uint32_t adaptiveIndirectDrawCalls = 0;
+    std::uint32_t adaptiveIndirectDrawCount = 0;
+    std::uint64_t adaptiveIndirectSubmittedVertices = 0;
+    std::uint64_t adaptiveGpuSelectedRepresentativeCount = 0;
+    double adaptiveGpuSelectionMs = 0.0;
+    double adaptiveGpuCompactionMs = 0.0;
     std::string adaptiveLodPersistentCacheStatus;
     std::string adaptiveLodRuntimeStatus;
     std::string adaptiveLodRequestedDensity;
@@ -373,6 +389,7 @@ class VulkanViewportShell {
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
         std::array<BufferAllocation, kFramesInFlight> drawItemBuffers{};
+        std::array<BufferAllocation, kFramesInFlight> indirectDrawCommandBuffers{};
         BufferAllocation exrDrawItemBuffer{};
         std::uint32_t pointCount = 0;
         std::uint32_t activePointCount = 0;
@@ -707,6 +724,7 @@ class VulkanViewportShell {
     double diagnosticsFpsWindowMs_ = 0.0;
     std::uint32_t diagnosticsFpsWindowFrames_ = 0;
     bool gpuTimestampsSupported_ = false;
+    renderer::pointcloud::PointCloudGpuDrivenSelectionCapabilities gpuDrivenSelectionCapabilities_{};
     float gpuTimestampPeriodNs_ = 0.0F;
     float pointSizeRangeMin_ = 1.0F;
     float pointSizeRangeMax_ = 64.0F;
