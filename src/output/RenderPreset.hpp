@@ -46,8 +46,24 @@ enum class PointCloudExportDensityMode {
     ArtisticHighQuality,
 };
 
+struct PointCloudExportDensityModePolicy {
+    PointCloudExportDensityMode mode = PointCloudExportDensityMode::AdaptiveHighQuality;
+    const char* label = "Adaptive High Quality";
+    const char* logDescription = "";
+    bool usesFullSource = false;
+    bool previewQuality = false;
+    bool requiresViewportSnapshot = false;
+    bool deterministicSelection = true;
+    bool artistic = false;
+};
+
 const char* PointCloudExportDensityModeName(PointCloudExportDensityMode mode);
 bool PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode mode);
+const PointCloudExportDensityModePolicy& PointCloudExportDensityModePolicyFor(PointCloudExportDensityMode mode);
+const char* PointCloudExportDensityModeDescription(PointCloudExportDensityMode mode);
+bool PointCloudExportDensityModeIsPreview(PointCloudExportDensityMode mode);
+bool PointCloudExportDensityModeRequiresViewportSnapshot(PointCloudExportDensityMode mode);
+bool PointCloudExportDensityModeUsesDeterministicSelection(PointCloudExportDensityMode mode);
 
 std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(
     const std::vector<invisible_places::camera::CameraShot>& shots,

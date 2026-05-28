@@ -17,6 +17,10 @@ EWMA-governed adaptive budgets, and a `.ipcloud` v2 bundle that can render
 coarse representative data first, attach the cached exact hierarchy, and stream
 visible raw chunks into compact resident buffers without requiring a permanent
 full PLY parse/upload for normal Fast Basic or Beauty Adaptive viewport use.
+Stage 09 adds explicit export density policy semantics, deterministic adaptive
+export traversal, Full Source exact-source guards, Match Viewport still-export
+snapshotting, Fast Adaptive Preview Quick MP4 labeling, export logs, and
+`--lod-compare` schema v2 deterministic/error-map diagnostics.
 GPU compute selection, memory-mapped chunks, and fully device-local chunk
 residency remain later-stage items.
 
@@ -114,6 +118,23 @@ sample-count cap anymore.
 - Export density modes are explicit: `Full Source`, `Adaptive High Quality`,
   `Match Viewport Adaptive`, `Fast Adaptive Preview`, `Artistic As Preview`, and
   `Artistic High Quality`.
+- Export density modes share a policy helper with label, log description,
+  full-source flag, preview-quality flag, viewport-snapshot requirement,
+  deterministic-selection flag, and artistic flag. Adaptive HQ, Artistic HQ, and
+  Fast Preview exports use deterministic fixed traversal parameters; Full Source
+  is exact/debug only; Match Viewport modes require a captured displayed
+  adaptive selection.
+- Adaptive EXR/MP4 export traversal is synchronous and deterministic. It skips
+  async viewport reuse, previous-frontier hysteresis, manual point-budget caps,
+  and interactive governor scaling. Source/debug renderer modes are normalized
+  back to adaptive renderers unless the density mode is explicitly Full Source.
+- Full Source export refuses representative-preview/chunk-only state with a
+  clear error instead of substituting representatives. Quick MP4 remains
+  explicitly `Fast Adaptive Preview`.
+- Match Viewport still-camera export captures displayed adaptive draw items,
+  frontier/style diagnostics, and camera state at export start. Animation EXR
+  export rejects Match Viewport modes until approved per-frame viewport states
+  exist.
 - The diagnostics overlay reports scene update time/FPS, frame time/FPS,
   adaptive representative count, represented source count, traversal time,
   draw-item upload time, draw-item reallocations, cache status, runtime status,
@@ -169,17 +190,20 @@ sample-count cap anymore.
   use, queue/eviction state, and writes
   `Saved/diagnostics/lod_stream/lod_stream_metrics.json`.
 - `--lod-compare` exists and writes full-source/adaptive EXRs plus
-  `lod_compare_metrics.json` and a Fast Basic per-frame transition trace CSV.
-  It now renders a repeatable Beauty matrix covering small opaque sprites,
-  large translucent Gaussian sprites, emissive/scalar sprites, world-sized
-  sprites, and world surfels when normals are present.
-- `lod_compare_metrics.json` reports Adaptive HQ representative class counts,
-  exact Fast Basic CPU representative class counts, viewport Fast Basic
-  boundedness/smoothness metrics, Beauty matrix renderer profiles,
-  radius/opacity/emission ranges, estimated vertex/fragment/blended-fragment
-  costs, clamp flags, raw/EWMA GPU point-pass timings, governor budget scale,
-  timestamp support/fallback state, Beauty stress metrics, and colour, scalar,
-  normal, and emissive/accent feature-triggered refinement counts.
+  error-map EXRs, `lod_compare_metrics.json`, and a Fast Basic per-frame
+  transition trace CSV. It now renders a repeatable Beauty matrix covering small
+  opaque sprites, large translucent Gaussian sprites, emissive/scalar sprites,
+  world-sized sprites, and world surfels when normals are present.
+- `lod_compare_metrics.json` schema v2 reports source/cache fingerprints,
+  density policy fields, deterministic adaptive selection and image/error-map
+  hashes, per-channel/RGB/luminance/alpha MAE/RMSE/max error, Adaptive HQ
+  representative class counts, exact Fast Basic CPU representative class counts,
+  viewport Fast Basic boundedness/smoothness metrics, Beauty matrix renderer
+  profiles, radius/opacity/emission ranges, estimated vertex/fragment/
+  blended-fragment costs, clamp flags, raw/EWMA GPU point-pass timings, governor
+  budget scale, timestamp support/fallback state, Beauty stress metrics, and
+  colour, scalar, normal, and emissive/accent feature-triggered refinement
+  counts.
 - Stage 05 sample evidence on `Data/Site3-Sample-Terrestrial.ply` reports exact
   Adaptive HQ Beauty matrix output with no fallback. Matrix luminance ratios:
   small opaque 0.805370, large translucent Gaussian 0.831266,
@@ -262,6 +286,28 @@ sample-count cap anymore.
   frames; coverage ratio 1, luminance ratio 0.649889, Beauty stress max GPU
   point pass 0.202458 ms, and Fast Basic viewport max submitted 1,084,047 under
   a 1,810,284 representative budget.
+- Stage 09 sample export-determinism evidence on
+  `Data/Site3-Sample-Terrestrial.ply` ran `--lod-compare` twice with identical
+  inputs, then reran once after the final Full Source/Quick MP4 guard. The
+  deterministic fields matched exactly: adaptive selection hash
+  `0x282219d27c49476c`, full-source image hash `0x46256cddd083a685`, adaptive
+  image hash `0xfb7a0106ae18cdcb`, error-map hash `0x1f382b69f57ce81c`,
+  1,874,048 representatives, 12,183,742 represented source points, coverage
+  ratio 1, luminance ratio 0.804748, RGB MAE 0.0152239, RGB RMSE 0.0789348, and
+  alpha RMSE 0. All five Beauty matrix cases matched on selection/image/error
+  hashes and representative counts. The final stream check passed with center
+  and repeat-center chunk residency matching at 599 / 2,292 requested chunks,
+  16,233 / 56,537 remapped draw items, 120.9 MiB CPU residency, and 128.0 MiB /
+  128.0 MiB compact GPU upload.
+- Stage 09 full-cloud evidence on `Data/Site3-Mid-1mm100M.ply` completed one
+  warm-cache `--lod-compare` and wrote Full Source, Adaptive HQ, and error-map
+  EXRs with metrics schema v2. The run reported selection hash
+  `0xc2334f1749bab8d1`, full-source image hash `0xd66034c701054d00`, adaptive
+  image hash `0xb4ec01582968a865`, error-map hash `0x482eee74d3c3d993`,
+  1,729,641 Adaptive HQ representatives covering 99,504,849 source points out
+  of 100,743,210, coverage ratio 1, luminance ratio 0.666881, RGB MAE
+  0.0280766, RGB RMSE 0.121346, and alpha RMSE 0. The run used a ready LOD cache
+  and reported `.ipcloud` full source loaded.
 
 ## Partially Implemented
 
@@ -277,11 +323,13 @@ These pieces exist, but they are not yet the ideal system described in
   mappings. It preserves progressive coarse rendering and bounded upload, but it
   does not yet include async prefetch, memory mapping, or fine-grained persistent
   GPU LRU reuse across every viewport pass.
-- Beauty Full Source, Fast Basic Source, export, picking, and editing keep the
-  dense compatibility path when exact/debug semantics require it. The smallest
-  safe migration is to route these surfaces through a chunk iteration/query API
-  backed by the v2 decoder and source-ID tables before deleting the dense
-  `LoadedPointCloud` requirement.
+- Beauty Full Source, Fast Basic Source, explicit Full Source export, picking,
+  and editing keep the dense compatibility path when exact/debug semantics
+  require it. Adaptive HQ/Fast Preview export uses deterministic adaptive draw
+  items and chunk-streamed resident uploads where available. The smallest safe
+  remaining migration is to route exact/debug picking/editing and future Full
+  Source chunk iteration through a chunk query API backed by the v2 decoder and
+  source-ID tables before deleting the dense `LoadedPointCloud` requirement.
 - First-time `.ipcloud` v2 construction still performs a full source parse and
   monolithic hierarchy build. Warm-cache adaptive rendering avoids permanent
   full parse/upload duplication, but cache creation progress/cancel points
@@ -303,9 +351,10 @@ These pieces exist, but they are not yet the ideal system described in
   authorable policies.
 - The LOD comparison metrics now report coverage, mean luminance, feature class
   counts, feature-triggered refinement counts, raw/EWMA GPU point-pass timing,
-  governor state, Beauty stress timing, and a Fast Basic transition trace, but
-  not image error maps or tile overdraw budgets. Streaming memory/upload
-  diagnostics are emitted by `--lod-stream-check` rather than `--lod-compare`.
+  governor state, Beauty stress timing, deterministic selection/image hashes,
+  image error-map metrics, and a Fast Basic transition trace, but not tile
+  overdraw budgets. Streaming memory/upload diagnostics are emitted by
+  `--lod-stream-check` and summarized in export logs where available.
 - The 100M `--lod-compare` path proves bounded replacement and deterministic
   trace metrics, but it does not automatically prove final exact idle
   refinement completion. The current 500-frame harness still ends with async
@@ -537,6 +586,7 @@ cmake --build --preset build-macos-debug
 ./build/macos-debug/invisible_places_tests "[pointcloud][lod]"
 ctest --test-dir build/macos-debug --output-on-failure
 build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places --lod-cache-check <cloud>
+build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places --lod-stream-check <cloud>
 build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places --lod-compare <cloud>
 ```
 
@@ -544,7 +594,9 @@ Inspect:
 
 ```text
 Saved/diagnostics/lod_compare/lod_compare_metrics.json
+Saved/diagnostics/lod_compare/*_error.exr
 Saved/diagnostics/lod_cache/lod_cache_metrics.json
+Saved/diagnostics/lod_stream/lod_stream_metrics.json
 ```
 
 Initial quality targets:
@@ -558,6 +610,13 @@ Initial quality targets:
 - Fast Basic should report no full-source fallback, no representative or
   fragment budget exceedance, zero large representative-jump frames, and
   `fast_basic_zoom_out_updated=true`.
+- Repeated `--lod-compare` runs should match on deterministic selection hashes,
+  full/adaptive/error-map image hashes, representative counts, represented
+  source counts, coverage/luminance ratios, and error metrics. Timing and
+  viewport stress values may differ.
+- `lod_compare_metrics.json` should include `metrics_schema_version`,
+  `density_policy`, `determinism`, source/cache fingerprints, and
+  `difference_exr`.
 - Applicable RGB/scalar/normal/emissive data should produce nonzero Adaptive HQ
   and exact Fast Basic CPU representative class counts plus nonzero
   feature-triggered refinement counts.
@@ -567,6 +626,13 @@ Initial quality targets:
   representative preview count, time to first coarse frame, publish status, and
   interrupted/resume decision. A legacy v4 hierarchy cache alone should not be
   reported as a `.ipcloud` warm hit.
+- Export logs should state the density policy, Full Source/preview/viewport
+  snapshot/deterministic-selection semantics, selection signature,
+  fallback/error frame counts, representative min/max/mean, and streamed
+  upload/chunk summaries.
+- Full Source export should fail if exact source data is not resident; Match
+  Viewport animation should fail until approved per-frame viewport states exist;
+  Quick MP4 should stay `Fast Adaptive Preview`.
 - Stage 03 manual acceptance for the 100M Fast Basic path: slow orbit has no
   popping/flicker/stochastic crawl; slow dolly through thresholds shows gradual
   parent/child replacement; fast navigation then stop refines over multiple
@@ -591,5 +657,8 @@ Initial performance targets:
 - Keep manual point budgets only as explicit debug/loading caps.
 - Keep `Beauty Full Source` / `Full Source` as exact/debug modes, not adaptive
   fallbacks.
+- Treat Match Viewport export as an explicit approval workflow: the user must
+  approve the current viewport look before still export, and animation exports
+  must use Adaptive HQ or Fast Preview until per-frame viewport approvals exist.
 - Prioritize measured lag sources before ideal architecture polish.
 - Do not present sampled-index controls as adaptive LOD.

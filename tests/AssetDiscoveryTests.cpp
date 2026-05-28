@@ -2652,6 +2652,7 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("Site3-Sample-Terrestrial.ply") != std::string::npos);
     CHECK(comparisonSection.find("beauty_full_source.exr") != std::string::npos);
     CHECK(comparisonSection.find("beauty_adaptive_hq.exr") != std::string::npos);
+    CHECK(comparisonSection.find("beauty_adaptive_hq_error.exr") != std::string::npos);
     CHECK(comparisonSection.find("BeautyLodComparisonCase") != std::string::npos);
     CHECK(comparisonSection.find("small_opaque_sprites") != std::string::npos);
     CHECK(comparisonSection.find("large_translucent_gaussian_sprites") != std::string::npos);
@@ -2659,6 +2660,20 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("world_sized_sprites") != std::string::npos);
     CHECK(comparisonSection.find("world_surfels") != std::string::npos);
     CHECK(comparisonSection.find("lod_compare_metrics.json") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"metrics_schema_version\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"difference_exr\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"density_policy\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"determinism\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_selection_hash\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"full_source_image_hash\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_image_hash\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"difference_image_hash\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"rgb_mae\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"alpha_rmse\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"process_peak_resident_memory_bytes\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_upload_budget_bytes\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_visible_chunks\\\"") != std::string::npos);
+    CHECK(comparisonSection.find("\\\"adaptive_fallback_reason\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"beauty_matrix\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"renderer_cost_profile\\\"") != std::string::npos);
     CHECK(comparisonSection.find("\\\"adaptive_estimated_vertices\\\"") != std::string::npos);
@@ -2686,6 +2701,61 @@ TEST_CASE("LOD comparison command writes full-source and adaptive image metrics"
     CHECK(comparisonSection.find("\\\"fast_basic_zoom_out_updated\\\"") != std::string::npos);
     CHECK(comparisonSection.find("kFastBasicZoomOutStartFrame") != std::string::npos);
     CHECK(comparisonSection.find("\\\"fast_basic_submitted_full_source\\\"") != std::string::npos);
+}
+
+TEST_CASE("Adaptive export density modes use deterministic explicit policies", "[pointcloud][lod][source]") {
+    const auto applicationSource = ReadRepoTextFile("src/app/Application.cpp");
+    const auto renderPresetHeader = ReadRepoTextFile("src/output/RenderPreset.hpp");
+    const auto renderPresetSource = ReadRepoTextFile("src/output/RenderPreset.cpp");
+    const auto traversalParamsSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiveLodTraversalParams",
+        "std::uint64_t AdaptiveLodTraversalKey");
+    const auto traversalKeySection = SourceSection(
+        applicationSource,
+        "std::uint64_t AdaptiveLodTraversalKey",
+        "AdaptiveLodCacheState* FindAdaptiveLodCacheEntry");
+    const auto adaptiveBuildSection = SourceSection(
+        applicationSource,
+        "AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems",
+        "void RememberDisplayedAdaptiveLodEntry");
+    const auto exrRenderStateSection = SourceSection(
+        applicationSource,
+        "invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState",
+        "std::uint64_t CurrentResidentMemoryBytes");
+    const auto stillExportSection = SourceSection(
+        applicationSource,
+        "void StartStillCameraExportJob",
+        "void StartAnimationExportJob");
+    const auto animationExportSection = SourceSection(
+        applicationSource,
+        "void StartAnimationExportJob",
+        "void FinishOfflineRenderJob");
+    const auto exportLogSection = SourceSection(
+        applicationSource,
+        "std::string WriteExportLog",
+        "void UpdateOfflineRenderProgress");
+
+    CHECK(renderPresetHeader.find("PointCloudExportDensityModePolicy") != std::string::npos);
+    CHECK(renderPresetSource.find("requiresViewportSnapshot = true") != std::string::npos);
+    CHECK(renderPresetSource.find("deterministicSelection = true") != std::string::npos);
+    CHECK(traversalParamsSection.find("deterministicExport") != std::string::npos);
+    CHECK(traversalParamsSection.find("deterministic export fixed budget") != std::string::npos);
+    CHECK(traversalParamsSection.find("!deterministicExport && manualCap") != std::string::npos);
+    CHECK(traversalKeySection.find("HashBool(&seed, deterministicExport)") != std::string::npos);
+    CHECK(adaptiveBuildSection.find("if (!deterministicExport)") != std::string::npos);
+    CHECK(applicationSource.find("EffectiveExportPointCloudRendererMode") != std::string::npos);
+    CHECK(applicationSource.find("Full Source export needs exact source data") != std::string::npos);
+    CHECK(exrRenderStateSection.find("PointCloudExportDensityModeRequiresViewportSnapshot") != std::string::npos);
+    CHECK(exrRenderStateSection.find("ApplyMatchViewportExportSnapshot") != std::string::npos);
+    CHECK(exrRenderStateSection.find("true,\n                static_cast<std::uint64_t>(job.currentFrame)") !=
+          std::string::npos);
+    CHECK(stillExportSection.find("CaptureMatchViewportExportSnapshots") != std::string::npos);
+    CHECK(animationExportSection.find("Animation EXR paths need Adaptive High Quality or Fast Adaptive Preview") !=
+          std::string::npos);
+    CHECK(exportLogSection.find("Point density policy") != std::string::npos);
+    CHECK(exportLogSection.find("Selection signature") != std::string::npos);
+    CHECK(exportLogSection.find("Adaptive streamed chunks visible/resident/missing max") != std::string::npos);
 }
 
 TEST_CASE("Adaptive LOD summary reads cached metadata without retraversal", "[pointcloud][lod][source]") {
@@ -7753,7 +7823,12 @@ TEST_CASE("Adaptive export point-size scale follows output viewport ratio", "[ou
 
 TEST_CASE("Point-cloud export density modes are explicit", "[output][animation][lod]") {
     using invisible_places::output::PointCloudExportDensityMode;
+    using invisible_places::output::PointCloudExportDensityModeDescription;
+    using invisible_places::output::PointCloudExportDensityModeIsPreview;
     using invisible_places::output::PointCloudExportDensityModeName;
+    using invisible_places::output::PointCloudExportDensityModePolicyFor;
+    using invisible_places::output::PointCloudExportDensityModeRequiresViewportSnapshot;
+    using invisible_places::output::PointCloudExportDensityModeUsesDeterministicSelection;
     using invisible_places::output::PointCloudExportDensityModeUsesFullSource;
 
     CHECK(PointCloudExportDensityModeName(PointCloudExportDensityMode::FullSource) == std::string{"Full Source"});
@@ -7763,9 +7838,21 @@ TEST_CASE("Point-cloud export density modes are explicit", "[output][animation][
     CHECK(
         PointCloudExportDensityModeName(PointCloudExportDensityMode::FastAdaptivePreview) ==
         std::string{"Fast Adaptive Preview"});
+    CHECK(
+        PointCloudExportDensityModeName(PointCloudExportDensityMode::MatchViewportAdaptive) ==
+        std::string{"Match Viewport Adaptive"});
     CHECK(PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode::FullSource));
     CHECK_FALSE(PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode::AdaptiveHighQuality));
     CHECK_FALSE(PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode::MatchViewportAdaptive));
+    CHECK(PointCloudExportDensityModeIsPreview(PointCloudExportDensityMode::FastAdaptivePreview));
+    CHECK_FALSE(PointCloudExportDensityModeIsPreview(PointCloudExportDensityMode::AdaptiveHighQuality));
+    CHECK(PointCloudExportDensityModeRequiresViewportSnapshot(PointCloudExportDensityMode::MatchViewportAdaptive));
+    CHECK(PointCloudExportDensityModeRequiresViewportSnapshot(PointCloudExportDensityMode::ArtisticAsPreview));
+    CHECK_FALSE(PointCloudExportDensityModeRequiresViewportSnapshot(PointCloudExportDensityMode::AdaptiveHighQuality));
+    CHECK(PointCloudExportDensityModeUsesDeterministicSelection(PointCloudExportDensityMode::AdaptiveHighQuality));
+    CHECK(PointCloudExportDensityModeUsesDeterministicSelection(PointCloudExportDensityMode::FastAdaptivePreview));
+    CHECK(PointCloudExportDensityModeDescription(PointCloudExportDensityMode::FullSource) == std::string{
+        PointCloudExportDensityModePolicyFor(PointCloudExportDensityMode::FullSource).logDescription});
 }
 
 TEST_CASE("Quick MP4 output paths append visual names and collision suffixes", "[output][video]") {

@@ -363,6 +363,44 @@ struct ExportLogState {
     std::size_t peakQueuedFrames = 0;
 };
 
+struct MatchViewportExportSnapshot {
+    bool valid = false;
+    std::size_t layerId = 0;
+    PointCloudExportDensityMode densityMode = PointCloudExportDensityMode::MatchViewportAdaptive;
+    std::shared_ptr<const std::vector<PointCloudDrawItemGpu>> drawItems;
+    std::uint64_t revision = 0;
+    std::size_t representativeCount = 0;
+    std::uint64_t representedSourceCount = 0;
+    std::uint64_t visibleRepresentedSourceCount = 0;
+    std::uint64_t emittedRepresentedSourceCount = 0;
+    std::uint64_t culledRepresentedSourceCount = 0;
+    std::uint32_t visibleFrontierNodeCount = 0;
+    std::vector<std::uint32_t> frontierNodeIndices;
+    std::array<std::uint32_t, invisible_places::renderer::pointcloud::kPointCloudLodRepresentativeClassCount>
+        emittedClassCounts{};
+    std::uint32_t colorFeatureRefinedNodeCount = 0;
+    std::uint32_t scalarFeatureRefinedNodeCount = 0;
+    std::uint32_t normalFeatureRefinedNodeCount = 0;
+    std::uint32_t emissiveFeatureRefinedNodeCount = 0;
+    float estimatedFragments = 0.0F;
+    float fragmentBudget = 0.0F;
+    float blendedFragmentBudget = 0.0F;
+    std::uint32_t representativeBudget = 0;
+    PointCloudLodRendererCostProfile rendererCostProfile = PointCloudLodRendererCostProfile::FastBasicSquare;
+    float minRadiusScale = 1.0F;
+    float maxRadiusScale = 1.0F;
+    float minOpacityCoverageScale = 1.0F;
+    float maxOpacityCoverageScale = 1.0F;
+    float minEmissionCoverageScale = 1.0F;
+    float maxEmissionCoverageScale = 1.0F;
+    float estimatedVertexCost = 0.0F;
+    float estimatedBlendedFragments = 0.0F;
+    std::uint64_t drawItemBytes = 0;
+    std::string persistentCacheStatus;
+    std::string runtimeStatus;
+    std::string fallbackState;
+};
+
 struct OfflineRenderJobState {
     bool active = false;
     bool cancelRequested = false;
@@ -399,6 +437,22 @@ struct OfflineRenderJobState {
     std::filesystem::path animationFilePath;
     std::string exportVisualName;
     ExportLogState exportLog{};
+    std::vector<MatchViewportExportSnapshot> matchViewportSnapshots;
+    std::uint64_t adaptiveSelectionHash = 1469598103934665603ULL;
+    std::uint64_t adaptiveFrameSamples = 0;
+    std::uint64_t adaptiveFallbackFrames = 0;
+    std::uint64_t adaptiveErrorFrames = 0;
+    std::uint64_t adaptiveRepresentativeMin = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t adaptiveRepresentativeMax = 0;
+    std::uint64_t adaptiveRepresentativeTotal = 0;
+    std::uint64_t adaptiveRepresentedSourceMax = 0;
+    std::uint64_t adaptiveUploadBytesTotal = 0;
+    std::uint64_t adaptiveUploadBudgetMax = 0;
+    std::uint64_t adaptiveVisibleChunksMax = 0;
+    std::uint64_t adaptiveResidentChunksMax = 0;
+    std::uint64_t adaptiveMissingChunksMax = 0;
+    std::string adaptiveLastRuntimeStatus;
+    std::string adaptiveLastFallbackState;
     glm::vec4 exportBackgroundColor{0.0F, 0.0F, 0.0F, 0.0F};
     bool exportEyeDomeLightingEnabled = false;
     float exportEyeDomeLightingThickness = 1.0F;
@@ -3455,7 +3509,8 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
     PointCloudExportDensityMode densityMode,
-    bool fastBasicProfile) {
+    bool fastBasicProfile,
+    bool deterministicExport = false) {
     invisible_places::renderer::pointcloud::PointCloudLodTraversalParams params;
     params.viewProjection = viewProjection;
     params.cameraPosition = cameraPosition;
@@ -3464,7 +3519,15 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
     params.style = style;
     params.densityMode = densityMode;
     params.rendererCostProfile = ResolveAdaptiveLodRendererCostProfile(style, fastBasicProfile);
-    const auto governorOutput = CurrentAdaptivePerformanceGovernorOutput(session, params.rendererCostProfile);
+    auto governorOutput = CurrentAdaptivePerformanceGovernorOutput(session, params.rendererCostProfile);
+    if (deterministicExport) {
+        governorOutput = {};
+        governorOutput.maxUploadBytesPerFrame =
+            invisible_places::renderer::pointcloud::DefaultPointCloudGovernorUploadBudgetBytes(
+                params.rendererCostProfile);
+        governorOutput.status = "deterministic export fixed budget";
+        governorOutput.timestampState = "export deterministic fixed budget";
+    }
     const float governorBudgetScale = std::clamp(governorOutput.budgetScale, 0.05F, 4.0F);
     const auto scaleRepresentativeBudget = [](std::uint32_t budget, float scale) {
         if (budget == 0U) {
@@ -3494,12 +3557,14 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
         fastBasicProfile) * governorBudgetScale;
     params.targetProjectedSpacingPixels =
         BaseAdaptiveTargetSpacingPixels(densityMode) * governorOutput.targetSpacingScale;
-    const auto& previousFrontierSource =
-        session.adaptiveLodTransitionActive && session.adaptiveLodTransitionTarget.valid
-            ? session.adaptiveLodTransitionTarget
-            : AdaptiveLodDisplayedTransitionSource(session);
-    if (!previousFrontierSource.frontierNodeIndices.empty()) {
-        params.previousFrontierNodeIndices = previousFrontierSource.frontierNodeIndices;
+    if (!deterministicExport) {
+        const auto& previousFrontierSource =
+            session.adaptiveLodTransitionActive && session.adaptiveLodTransitionTarget.valid
+                ? session.adaptiveLodTransitionTarget
+                : AdaptiveLodDisplayedTransitionSource(session);
+        if (!previousFrontierSource.frontierNodeIndices.empty()) {
+            params.previousFrontierNodeIndices = previousFrontierSource.frontierNodeIndices;
+        }
     }
     params.hysteresisPromoteScale = fastBasicProfile ? 1.10F : 1.12F;
     params.hysteresisDemoteScale = fastBasicProfile ? 0.76F : 0.78F;
@@ -3532,7 +3597,7 @@ invisible_places::renderer::pointcloud::PointCloudLodTraversalParams MakeAdaptiv
         params.maxRepresentatives =
             params.maxRepresentatives == 0U ? uploadDrawItemCap : std::min(params.maxRepresentatives, uploadDrawItemCap);
     }
-    if (manualCap > 0U) {
+    if (!deterministicExport && manualCap > 0U) {
         params.maxDrawItems = manualCap;
         params.maxRepresentatives = params.maxRepresentatives == 0U
                                         ? manualCap
@@ -3549,7 +3614,8 @@ std::uint64_t AdaptiveLodTraversalKey(
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
     PointCloudExportDensityMode densityMode,
-    PointCloudLodRendererCostProfile rendererCostProfile) {
+    PointCloudLodRendererCostProfile rendererCostProfile,
+    bool deterministicExport = false) {
     std::uint64_t seed = 1469598103934665603ULL;
     HashQuantizedMat4(&seed, viewProjection, 4096.0F);
     HashQuantizedVec3(&seed, cameraPosition, 1024.0F);
@@ -3557,10 +3623,13 @@ std::uint64_t AdaptiveLodTraversalKey(
     HashCombine(&seed, std::max<std::uint32_t>(1U, viewportHeight));
     HashCombine(&seed, static_cast<std::uint64_t>(densityMode));
     HashCombine(&seed, static_cast<std::uint64_t>(rendererCostProfile));
-    HashCombine(&seed, ManualAdaptiveDrawItemCap(session));
-    const auto governorOutput = CurrentAdaptivePerformanceGovernorOutput(session, rendererCostProfile);
-    HashQuantizedFloat(&seed, governorOutput.budgetScale, 100.0F);
-    HashCombine(&seed, governorOutput.maxUploadBytesPerFrame / 1024ULL);
+    HashBool(&seed, deterministicExport);
+    if (!deterministicExport) {
+        HashCombine(&seed, ManualAdaptiveDrawItemCap(session));
+        const auto governorOutput = CurrentAdaptivePerformanceGovernorOutput(session, rendererCostProfile);
+        HashQuantizedFloat(&seed, governorOutput.budgetScale, 100.0F);
+        HashCombine(&seed, governorOutput.maxUploadBytesPerFrame / 1024ULL);
+    }
     HashCombine(
         &seed,
         session.pointLodHierarchy == nullptr ? 0ULL : session.pointLodHierarchy->sourcePointCount);
@@ -3736,7 +3805,8 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     double traversalMs,
     std::uint64_t frameCounter,
     bool coarseFallback,
-    const PointCloudLodTraversalDiagnostics& diagnostics = {}) {
+    const PointCloudLodTraversalDiagnostics& diagnostics = {},
+    bool deterministicExport = false) {
     AdaptiveLodCacheState entry;
     if (session == nullptr || drawItems.empty()) {
         return entry;
@@ -3811,6 +3881,14 @@ AdaptiveLodCacheState StoreAdaptiveLodCacheEntry(
     entry.blendedFragmentBudget = blendedFragmentBudget;
     entry.representativeBudget = representativeBudget;
     entry.governorOutput = CurrentAdaptivePerformanceGovernorOutput(*session, entry.rendererCostProfile);
+    if (deterministicExport) {
+        entry.governorOutput = {};
+        entry.governorOutput.maxUploadBytesPerFrame =
+            invisible_places::renderer::pointcloud::DefaultPointCloudGovernorUploadBudgetBytes(
+                entry.rendererCostProfile);
+        entry.governorOutput.status = "deterministic export fixed budget";
+        entry.governorOutput.timestampState = "export deterministic fixed budget";
+    }
     entry.traversalMs = traversalMs;
     entry.drawItemBytes = DrawItemByteCount(drawItems.size());
     entry.densityMode = densityMode;
@@ -4310,6 +4388,7 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
     bool fastBasicNavigationActive,
     bool allowReusePrevious,
     bool allowSynchronousTraversal,
+    bool deterministicExport,
     std::uint64_t frameCounter) {
     if (session == nullptr ||
         invisible_places::output::PointCloudExportDensityModeUsesFullSource(densityMode)) {
@@ -4323,7 +4402,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         viewportWidth,
         viewportHeight,
         densityMode,
-        fastBasicProfile);
+        fastBasicProfile,
+        deterministicExport);
     if (session->pointLodHierarchy == nullptr || session->pointLodHierarchy->Empty()) {
         session->adaptiveLodRequestedDensityMode = densityMode;
         session->adaptiveLodDisplayedDensityMode = densityMode;
@@ -4371,7 +4451,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         viewportWidth,
         viewportHeight,
         densityMode,
-        requestedParams.rendererCostProfile);
+        requestedParams.rendererCostProfile,
+        deterministicExport);
     session->adaptiveLodRequestedDensityMode = densityMode;
     auto makeResultFromEntry =
         [&](const AdaptiveLodCacheState& entry,
@@ -4443,13 +4524,14 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         };
     };
 
-    if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
-        transition.has_value()) {
-        return transition.value();
+    if (!deterministicExport) {
+        if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
+            transition.has_value()) {
+            return transition.value();
+        }
     }
 
     if (auto* cache = FindAdaptiveLodCacheEntry(session, traversalKey); cache != nullptr) {
-        const auto transitionSource = AdaptiveLodDisplayedTransitionSource(*session);
         cache->lastUsedFrame = frameCounter;
         ApplyAdaptiveLodCacheMetadata(session, *cache, frameCounter);
         session->adaptiveLodRuntimeCacheHit = true;
@@ -4457,16 +4539,19 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
         session->adaptiveLodAsyncPendingAgeMs = 0.0;
         session->adaptiveLodRuntimeStatus = "runtime cache hit";
         session->adaptiveLodDisplayedDensityMode = cache->densityMode;
-        BeginAdaptiveLodTransition(
-            session,
-            transitionSource,
-            *cache,
-            frameCounter,
-            fastBasicNavigationActive,
-            session->adaptiveLodEmergencyDemotion);
-        if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
-            transition.has_value()) {
-            return transition.value();
+        if (!deterministicExport) {
+            const auto transitionSource = AdaptiveLodDisplayedTransitionSource(*session);
+            BeginAdaptiveLodTransition(
+                session,
+                transitionSource,
+                *cache,
+                frameCounter,
+                fastBasicNavigationActive,
+                session->adaptiveLodEmergencyDemotion);
+            if (auto transition = BuildActiveAdaptiveLodTransitionResult(session, densityMode, frameCounter);
+                transition.has_value()) {
+                return transition.value();
+            }
         }
         return makeResultFromEntry(*cache, false, true, false);
     }
@@ -4495,7 +4580,8 @@ AdaptiveLodBuildResult BuildAdaptivePointCloudDrawItems(
             MillisecondsBetween(traversalStart, traversalEnd),
             frameCounter,
             false,
-            traversalDiagnostics);
+            traversalDiagnostics,
+            deterministicExport);
         session->adaptiveLodRuntimeCacheHit = false;
         session->adaptiveLodAsyncPending = false;
         session->adaptiveLodAsyncPendingAgeMs = 0.0;
@@ -4770,6 +4856,7 @@ bool PopulateAdaptivePointCloudLayer(
     bool fastBasicNavigationActive,
     bool allowReusePrevious,
     bool allowSynchronousTraversal,
+    bool deterministicExport,
     std::uint64_t frameCounter,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     invisible_places::renderer::core::SceneRenderState::PointCloudLayerState* layer) {
@@ -4790,6 +4877,7 @@ bool PopulateAdaptivePointCloudLayer(
         fastBasicNavigationActive,
         allowReusePrevious,
         allowSynchronousTraversal,
+        deterministicExport,
         frameCounter);
     if (!result.available || result.drawItems == nullptr || result.drawItems->empty()) {
         layer->adaptiveDrawItems.reset();
@@ -12265,6 +12353,59 @@ bool HasOfflinePointLayers(const PreviewRuntimeState& runtimeState) {
         });
 }
 
+PointCloudRendererMode EffectiveExportPointCloudRendererMode(
+    PointCloudRendererMode rendererMode,
+    invisible_places::output::PointCloudExportDensityMode densityMode) {
+    if (invisible_places::output::PointCloudExportDensityModeUsesFullSource(densityMode) ||
+        !invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFullSource(rendererMode)) {
+        return rendererMode;
+    }
+    return rendererMode == PointCloudRendererMode::FastBasicSource
+               ? PointCloudRendererMode::FastBasic
+               : PointCloudRendererMode::BeautyAdaptive;
+}
+
+bool ExportRequiresExactFullSource(
+    invisible_places::output::PointCloudExportDensityMode densityMode,
+    PointCloudRendererMode rendererMode) {
+    return invisible_places::output::PointCloudExportDensityModeUsesFullSource(densityMode) ||
+           invisible_places::renderer::pointcloud::PointCloudRendererModeUsesFullSource(rendererMode);
+}
+
+bool ValidateExactFullSourceExportReady(
+    const PreviewRuntimeState& runtimeState,
+    invisible_places::output::PointCloudExportDensityMode densityMode,
+    PointCloudRendererMode rendererMode,
+    std::string* errorMessage) {
+    if (!ExportRequiresExactFullSource(densityMode, rendererMode)) {
+        return true;
+    }
+
+    for (const auto& session : runtimeState.sessions) {
+        if (!session.loaded ||
+            !session.visible ||
+            session.kind != LayerKind::PointCloud ||
+            session.totalPrimitives == 0) {
+            continue;
+        }
+        const std::uint64_t residentSourcePoints =
+            session.offlinePointCloud == nullptr ? 0ULL : session.offlinePointCloud->PointCount();
+        if (session.pointCloudPreviewActive ||
+            session.offlinePointCloud == nullptr ||
+            residentSourcePoints < session.totalPrimitives) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Full Source export needs exact source data for " +
+                    (session.displayName.empty() ? std::string{"the selected LiDAR layer"} : session.displayName) +
+                    ". The layer is still using representative preview/chunk data; wait for full source load "
+                    "or choose Adaptive High Quality / Fast Adaptive Preview.";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 std::uint64_t EffectiveAnimationExportPointDrawCount(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session,
@@ -12328,6 +12469,157 @@ BuildAnimationExportPointCloudLayerSnapshot(
     return layers;
 }
 
+const MatchViewportExportSnapshot* FindMatchViewportExportSnapshot(
+    const OfflineRenderJobState& job,
+    std::size_t layerId) {
+    const auto found = std::find_if(
+        job.matchViewportSnapshots.begin(),
+        job.matchViewportSnapshots.end(),
+        [layerId](const MatchViewportExportSnapshot& snapshot) {
+            return snapshot.valid && snapshot.layerId == layerId;
+        });
+    return found == job.matchViewportSnapshots.end() ? nullptr : &*found;
+}
+
+void ApplyMatchViewportExportSnapshot(
+    const MatchViewportExportSnapshot& snapshot,
+    PointCloudExportDensityMode requestedDensityMode,
+    invisible_places::renderer::core::SceneRenderState::PointCloudLayerState* layer) {
+    if (layer == nullptr || snapshot.drawItems == nullptr || snapshot.drawItems->empty()) {
+        return;
+    }
+    layer->requiresAdaptiveDrawItems = true;
+    layer->useAdaptiveDrawItems = true;
+    layer->adaptiveDrawItems = snapshot.drawItems;
+    layer->drawPointCount = static_cast<std::uint32_t>(
+        std::min<std::size_t>(snapshot.drawItems->size(), std::numeric_limits<std::uint32_t>::max()));
+    layer->adaptiveLodRevision = snapshot.revision;
+    layer->adaptiveRepresentedSourceCount = snapshot.representedSourceCount;
+    layer->adaptiveVisibleRepresentedSourceCount = snapshot.visibleRepresentedSourceCount;
+    layer->adaptiveEmittedRepresentedSourceCount = snapshot.emittedRepresentedSourceCount;
+    layer->adaptiveCulledRepresentedSourceCount = snapshot.culledRepresentedSourceCount;
+    layer->adaptiveVisibleFrontierNodeCount = snapshot.visibleFrontierNodeCount;
+    layer->adaptiveEmittedClassCounts = snapshot.emittedClassCounts;
+    layer->adaptiveColorFeatureRefinedNodeCount = snapshot.colorFeatureRefinedNodeCount;
+    layer->adaptiveScalarFeatureRefinedNodeCount = snapshot.scalarFeatureRefinedNodeCount;
+    layer->adaptiveNormalFeatureRefinedNodeCount = snapshot.normalFeatureRefinedNodeCount;
+    layer->adaptiveEmissiveFeatureRefinedNodeCount = snapshot.emissiveFeatureRefinedNodeCount;
+    layer->adaptiveEstimatedFragments = snapshot.estimatedFragments;
+    layer->adaptiveFragmentBudget = snapshot.fragmentBudget;
+    layer->adaptiveBlendedFragmentBudget = snapshot.blendedFragmentBudget;
+    layer->adaptiveRepresentativeBudget = snapshot.representativeBudget;
+    layer->adaptiveRendererCostProfile = snapshot.rendererCostProfile;
+    layer->adaptiveMinRadiusScale = snapshot.minRadiusScale;
+    layer->adaptiveMaxRadiusScale = snapshot.maxRadiusScale;
+    layer->adaptiveMinOpacityCoverageScale = snapshot.minOpacityCoverageScale;
+    layer->adaptiveMaxOpacityCoverageScale = snapshot.maxOpacityCoverageScale;
+    layer->adaptiveMinEmissionCoverageScale = snapshot.minEmissionCoverageScale;
+    layer->adaptiveMaxEmissionCoverageScale = snapshot.maxEmissionCoverageScale;
+    layer->adaptiveEstimatedVertexCost = snapshot.estimatedVertexCost;
+    layer->adaptiveEstimatedBlendedFragments = snapshot.estimatedBlendedFragments;
+    layer->adaptiveDrawItemBytes = snapshot.drawItemBytes;
+    layer->adaptiveLodPersistentCacheStatus = snapshot.persistentCacheStatus;
+    layer->adaptiveLodRuntimeStatus =
+        snapshot.runtimeStatus.empty() ? "match viewport snapshot" : snapshot.runtimeStatus;
+    layer->adaptiveLodRequestedDensity =
+        invisible_places::output::PointCloudExportDensityModeName(requestedDensityMode);
+    layer->adaptiveLodDisplayedDensity =
+        invisible_places::output::PointCloudExportDensityModeName(snapshot.densityMode);
+    layer->adaptiveLodFallbackState =
+        snapshot.fallbackState.empty() ? "match viewport snapshot" : snapshot.fallbackState;
+}
+
+bool CaptureMatchViewportExportSnapshots(
+    const PreviewRuntimeState& runtimeState,
+    std::vector<MatchViewportExportSnapshot>* snapshots,
+    std::string* errorMessage) {
+    if (snapshots == nullptr) {
+        return false;
+    }
+    snapshots->clear();
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!session.loaded ||
+            !session.visible ||
+            session.kind != LayerKind::PointCloud ||
+            session.totalPrimitives == 0) {
+            continue;
+        }
+
+        const auto& displayed = AdaptiveLodDisplayedTransitionSource(session);
+        if (!displayed.valid || displayed.drawItems == nullptr || displayed.drawItems->empty()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Match Viewport export needs an approved adaptive viewport selection. "
+                    "Switch to Beauty/Fast Adaptive, let the viewport draw the desired look, then export again.";
+            }
+            snapshots->clear();
+            return false;
+        }
+
+        snapshots->push_back(
+            {.valid = true,
+             .layerId = sessionIndex,
+             .densityMode = displayed.densityMode,
+             .drawItems = displayed.drawItems,
+             .revision = displayed.generation,
+             .representativeCount = displayed.representativeCount,
+             .representedSourceCount = displayed.representedSourceCount,
+             .visibleRepresentedSourceCount = displayed.visibleRepresentedSourceCount,
+             .emittedRepresentedSourceCount = displayed.emittedRepresentedSourceCount,
+             .culledRepresentedSourceCount = displayed.culledRepresentedSourceCount,
+             .visibleFrontierNodeCount = displayed.visibleFrontierNodeCount,
+             .frontierNodeIndices = displayed.frontierNodeIndices,
+             .emittedClassCounts = displayed.emittedClassCounts,
+             .colorFeatureRefinedNodeCount = displayed.colorFeatureRefinedNodeCount,
+             .scalarFeatureRefinedNodeCount = displayed.scalarFeatureRefinedNodeCount,
+             .normalFeatureRefinedNodeCount = displayed.normalFeatureRefinedNodeCount,
+             .emissiveFeatureRefinedNodeCount = displayed.emissiveFeatureRefinedNodeCount,
+             .estimatedFragments = displayed.estimatedFragments,
+             .fragmentBudget = displayed.fragmentBudget,
+             .blendedFragmentBudget = displayed.blendedFragmentBudget,
+             .representativeBudget = displayed.representativeBudget,
+             .rendererCostProfile = displayed.rendererCostProfile,
+             .minRadiusScale = displayed.minRadiusScale,
+             .maxRadiusScale = displayed.maxRadiusScale,
+             .minOpacityCoverageScale = displayed.minOpacityCoverageScale,
+             .maxOpacityCoverageScale = displayed.maxOpacityCoverageScale,
+             .minEmissionCoverageScale = displayed.minEmissionCoverageScale,
+             .maxEmissionCoverageScale = displayed.maxEmissionCoverageScale,
+             .estimatedVertexCost = displayed.estimatedVertexCost,
+             .estimatedBlendedFragments = displayed.estimatedBlendedFragments,
+             .drawItemBytes = displayed.drawItemBytes,
+             .persistentCacheStatus = session.pointLodCacheStatus,
+             .runtimeStatus = displayed.coarseFallback ? "match viewport captured coarse fallback"
+                                                       : "match viewport captured exact traversal",
+             .fallbackState = displayed.coarseFallback ? "captured coarse fallback"
+                                                       : "captured viewport adaptive selection"});
+    }
+    return !snapshots->empty();
+}
+
+std::string Hex64(std::uint64_t value) {
+    std::ostringstream output;
+    output << "0x" << std::hex << std::setw(16) << std::setfill('0') << value;
+    return output.str();
+}
+
+std::uint64_t HashDrawItemsForDiagnostics(const std::vector<PointCloudDrawItemGpu>& drawItems) {
+    std::uint64_t seed = 1469598103934665603ULL;
+    HashCombine(&seed, drawItems.size());
+    for (const auto& item : drawItems) {
+        HashCombine(&seed, item.sourcePointIndex);
+        HashCombine(&seed, item.representedSourceCount);
+        HashCombine(&seed, item.reserved0);
+        HashCombine(&seed, item.reserved1);
+        HashFloat(&seed, item.footprintAreaPixels);
+        HashFloat(&seed, item.opacityCompensation);
+        HashFloat(&seed, item.emissionCompensation);
+        HashFloat(&seed, item.renderAreaPixels);
+    }
+    return seed;
+}
+
 invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState(
     PreviewRuntimeState& runtimeState,
     const OfflineRenderJobState& job,
@@ -12381,6 +12673,14 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
             if (layer.layerId >= runtimeState.sessions.size()) {
                 continue;
             }
+            if (invisible_places::output::PointCloudExportDensityModeRequiresViewportSnapshot(
+                    job.pointCloudDensityMode)) {
+                if (const auto* snapshot = FindMatchViewportExportSnapshot(job, layer.layerId);
+                    snapshot != nullptr) {
+                    ApplyMatchViewportExportSnapshot(*snapshot, job.pointCloudDensityMode, &layer);
+                }
+                continue;
+            }
             static_cast<void>(PopulateAdaptivePointCloudLayer(
                 &runtimeState.sessions[layer.layerId],
                 renderState.viewProjection,
@@ -12392,6 +12692,7 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                 false,
                 false,
                 true,
+                true,
                 static_cast<std::uint64_t>(job.currentFrame) + 1ULL,
                 nullptr,
                 &layer));
@@ -12399,6 +12700,68 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     }
 
     return renderState;
+}
+
+void AccumulateExportAdaptiveDiagnostics(
+    OfflineRenderJobState* job,
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::SceneRenderState& renderState) {
+    if (job == nullptr ||
+        invisible_places::output::PointCloudExportDensityModeUsesFullSource(job->pointCloudDensityMode)) {
+        return;
+    }
+
+    bool sawAdaptiveLayer = false;
+    std::uint64_t frameHash = 1469598103934665603ULL;
+    HashCombine(&frameHash, job->currentFrame);
+    HashCombine(&frameHash, renderState.pointCloudLayers.size());
+    for (const auto& layer : renderState.pointCloudLayers) {
+        if (!layer.requiresAdaptiveDrawItems) {
+            continue;
+        }
+        if (!layer.useAdaptiveDrawItems || layer.adaptiveDrawItems == nullptr || layer.adaptiveDrawItems->empty()) {
+            ++job->adaptiveErrorFrames;
+            job->adaptiveLastRuntimeStatus = layer.adaptiveLodRuntimeStatus;
+            job->adaptiveLastFallbackState = layer.adaptiveLodFallbackState;
+            continue;
+        }
+
+        sawAdaptiveLayer = true;
+        const auto representatives = static_cast<std::uint64_t>(layer.adaptiveDrawItems->size());
+        job->adaptiveRepresentativeMin = std::min(job->adaptiveRepresentativeMin, representatives);
+        job->adaptiveRepresentativeMax = std::max(job->adaptiveRepresentativeMax, representatives);
+        job->adaptiveRepresentativeTotal += representatives;
+        job->adaptiveRepresentedSourceMax =
+            std::max(job->adaptiveRepresentedSourceMax, layer.adaptiveRepresentedSourceCount);
+        HashCombine(&frameHash, layer.layerId);
+        HashCombine(&frameHash, HashDrawItemsForDiagnostics(*layer.adaptiveDrawItems));
+        HashCombine(&frameHash, layer.adaptiveRepresentedSourceCount);
+        HashString(&frameHash, layer.adaptiveLodRequestedDensity);
+        HashString(&frameHash, layer.adaptiveLodDisplayedDensity);
+        if (layer.adaptiveLodFallbackState.find("fallback") != std::string::npos ||
+            layer.adaptiveLodRuntimeStatus.find("fallback") != std::string::npos) {
+            ++job->adaptiveFallbackFrames;
+        }
+        job->adaptiveLastRuntimeStatus = layer.adaptiveLodRuntimeStatus;
+        job->adaptiveLastFallbackState = layer.adaptiveLodFallbackState;
+
+        if (layer.layerId < runtimeState.sessions.size()) {
+            const auto& residency = runtimeState.sessions[layer.layerId].pointIpcloudResidencyDiagnostics;
+            job->adaptiveUploadBytesTotal += residency.uploadBytesThisFrame;
+            job->adaptiveUploadBudgetMax = std::max(job->adaptiveUploadBudgetMax, residency.uploadBudgetBytes);
+            job->adaptiveVisibleChunksMax =
+                std::max<std::uint64_t>(job->adaptiveVisibleChunksMax, residency.visibleChunkRequestCount);
+            job->adaptiveResidentChunksMax =
+                std::max<std::uint64_t>(job->adaptiveResidentChunksMax, residency.residentChunkCount);
+            job->adaptiveMissingChunksMax =
+                std::max<std::uint64_t>(job->adaptiveMissingChunksMax, residency.missingChunkCount);
+        }
+    }
+
+    if (sawAdaptiveLayer) {
+        ++job->adaptiveFrameSamples;
+        HashCombine(&job->adaptiveSelectionHash, frameHash);
+    }
 }
 
 std::uint64_t CurrentResidentMemoryBytes() {
@@ -12808,6 +13171,21 @@ std::string WriteExportLog(
     log << "Point density mode: "
         << invisible_places::output::PointCloudExportDensityModeName(job.pointCloudDensityMode)
         << '\n';
+    log << "Point density policy: "
+        << invisible_places::output::PointCloudExportDensityModeDescription(job.pointCloudDensityMode)
+        << '\n';
+    log << "Point density full source: "
+        << (invisible_places::output::PointCloudExportDensityModeUsesFullSource(job.pointCloudDensityMode) ? "yes" : "no")
+        << '\n';
+    log << "Point density preview quality: "
+        << (invisible_places::output::PointCloudExportDensityModeIsPreview(job.pointCloudDensityMode) ? "yes" : "no")
+        << '\n';
+    log << "Point density requires viewport snapshot: "
+        << (invisible_places::output::PointCloudExportDensityModeRequiresViewportSnapshot(job.pointCloudDensityMode) ? "yes" : "no")
+        << '\n';
+    log << "Point density deterministic selection: "
+        << (invisible_places::output::PointCloudExportDensityModeUsesDeterministicSelection(job.pointCloudDensityMode) ? "yes" : "no")
+        << '\n';
     log << "Point renderer: " << PointCloudRendererModeLabel(job.pointCloudRendererMode) << '\n';
     log << "Export renderer: Beauty Raster\n";
     if (job.exportEyeDomeLightingEnabled) {
@@ -12821,6 +13199,35 @@ std::string WriteExportLog(
     log << "Visible LiDAR export layers: " << job.exportPointCloudLayers.size() << '\n';
     log << "Total export draw points: " << totalDrawPoints << '\n';
     log << "Setup viewport: " << job.setupViewportWidth << " x " << job.setupViewportHeight << '\n';
+    log << "Match Viewport captured layers: " << job.matchViewportSnapshots.size() << '\n';
+    log << '\n';
+
+    const auto representativeAverage =
+        job.adaptiveFrameSamples > 0U
+            ? static_cast<double>(job.adaptiveRepresentativeTotal) /
+                  static_cast<double>(job.adaptiveFrameSamples)
+            : 0.0;
+    log << "Adaptive Selection\n";
+    log << "Selection signature: " << Hex64(job.adaptiveSelectionHash) << '\n';
+    log << "Adaptive samples: " << job.adaptiveFrameSamples << '\n';
+    log << "Adaptive representative min: "
+        << (job.adaptiveRepresentativeMin == std::numeric_limits<std::uint64_t>::max()
+                ? 0
+                : job.adaptiveRepresentativeMin)
+        << '\n';
+    log << "Adaptive representative max: " << job.adaptiveRepresentativeMax << '\n';
+    log << "Adaptive representative average: " << representativeAverage << '\n';
+    log << "Adaptive represented source max: " << job.adaptiveRepresentedSourceMax << '\n';
+    log << "Adaptive fallback frames: " << job.adaptiveFallbackFrames << '\n';
+    log << "Adaptive error frames: " << job.adaptiveErrorFrames << '\n';
+    log << "Adaptive last runtime status: " << job.adaptiveLastRuntimeStatus << '\n';
+    log << "Adaptive last fallback state: " << job.adaptiveLastFallbackState << '\n';
+    log << "Adaptive streamed upload total: " << FormatByteCount(job.adaptiveUploadBytesTotal) << '\n';
+    log << "Adaptive streamed upload budget max: " << FormatByteCount(job.adaptiveUploadBudgetMax) << '\n';
+    log << "Adaptive streamed chunks visible/resident/missing max: "
+        << job.adaptiveVisibleChunksMax << " / "
+        << job.adaptiveResidentChunksMax << " / "
+        << job.adaptiveMissingChunksMax << '\n';
     log << '\n';
 
     log << "Timing\n";
@@ -13370,11 +13777,16 @@ bool StartQuickMp4ExportJob(
         .sessionIndex = request.visualSessionIndex,
         .style = visualStyle,
     };
+    constexpr auto quickMp4DensityMode =
+        invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview;
+    const auto quickMp4RendererMode = EffectiveExportPointCloudRendererMode(
+        runtimeState->projectSettings.pointCloudRendererMode,
+        quickMp4DensityMode);
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
-        invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview,
+        quickMp4DensityMode,
         visualOverride,
-        runtimeState->projectSettings.pointCloudRendererMode);
+        quickMp4RendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
         runtimeState->statusMessage.clear();
@@ -13405,8 +13817,8 @@ bool StartQuickMp4ExportJob(
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
-        .pointCloudDensityMode = invisible_places::output::PointCloudExportDensityMode::FastAdaptivePreview,
-        .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
+        .pointCloudDensityMode = quickMp4DensityMode,
+        .pointCloudRendererMode = quickMp4RendererMode,
         .quickMp4BatchJob = true,
         .quickMp4BatchIndex = runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
         .quickMp4BatchTotal = runtimeState->animationPanel.quickMp4QueueTotal,
@@ -13696,6 +14108,31 @@ void StartStillCameraExportJob(
     }
 
     const auto exportDensityMode = runtimeState->cameraPanel.stillDensityMode;
+    const auto exportRendererMode = EffectiveExportPointCloudRendererMode(
+        runtimeState->projectSettings.pointCloudRendererMode,
+        exportDensityMode);
+    std::string fullSourceError;
+    if (!ValidateExactFullSourceExportReady(
+            *runtimeState,
+            exportDensityMode,
+            exportRendererMode,
+            &fullSourceError)) {
+        runtimeState->errorMessage = fullSourceError;
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    std::vector<MatchViewportExportSnapshot> matchViewportSnapshots;
+    if (invisible_places::output::PointCloudExportDensityModeRequiresViewportSnapshot(exportDensityMode)) {
+        std::string snapshotError;
+        if (!CaptureMatchViewportExportSnapshots(*runtimeState, &matchViewportSnapshots, &snapshotError)) {
+            runtimeState->errorMessage =
+                snapshotError.empty()
+                    ? "Match Viewport export needs an approved adaptive viewport selection."
+                    : snapshotError;
+            runtimeState->statusMessage.clear();
+            return;
+        }
+    }
 
     auto frames = BuildStillCameraRenderSequence(*runtimeState, settings);
     if (frames.empty()) {
@@ -13724,11 +14161,12 @@ void StartStillCameraExportJob(
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .pointCloudDensityMode = exportDensityMode,
-        .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
+        .pointCloudRendererMode = exportRendererMode,
         .stillCameraJob = true,
         .animationName = "Still Camera",
         .exportVisualName = "Current View",
         .exportLog = MakeExportLogState(settings.outputDirectory, mode),
+        .matchViewportSnapshots = std::move(matchViewportSnapshots),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
             runtimeState->projectSettings.backgroundColor[1],
@@ -13777,6 +14215,26 @@ void StartAnimationExportJob(
 
     std::filesystem::path videoOutputPath;
     const auto exportDensityMode = runtimeState->animationPanel.exportDensityMode;
+    const auto exportRendererMode = EffectiveExportPointCloudRendererMode(
+        runtimeState->projectSettings.pointCloudRendererMode,
+        exportDensityMode);
+    std::string fullSourceError;
+    if (!ValidateExactFullSourceExportReady(
+            *runtimeState,
+            exportDensityMode,
+            exportRendererMode,
+            &fullSourceError)) {
+        runtimeState->errorMessage = fullSourceError;
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    if (invisible_places::output::PointCloudExportDensityModeRequiresViewportSnapshot(exportDensityMode)) {
+        runtimeState->errorMessage =
+            "Match Viewport Adaptive exports use the approved current viewport selection. "
+            "Animation EXR paths need Adaptive High Quality or Fast Adaptive Preview instead.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
 
     auto frames = invisible_places::output::BuildAnimationRenderSequence(
         runtimeState->animationPanel.currentPath.value(),
@@ -13791,7 +14249,7 @@ void StartAnimationExportJob(
         *runtimeState,
         exportDensityMode,
         std::nullopt,
-        runtimeState->projectSettings.pointCloudRendererMode);
+        exportRendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
         runtimeState->statusMessage.clear();
@@ -13821,7 +14279,7 @@ void StartAnimationExportJob(
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .pointCloudDensityMode = exportDensityMode,
-        .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
+        .pointCloudRendererMode = exportRendererMode,
         .animationName = runtimeState->animationPanel.currentPath->name,
         .animationFilePath = runtimeState->animationPanel.currentFilePath.empty()
                                   ? std::filesystem::path{}
@@ -13999,6 +14457,7 @@ void ProcessOfflineRenderJobStep(
             if (renderState.pointCloudLayers.empty()) {
                 throw std::runtime_error{"No visible loaded LiDAR layers are available for rendering."};
             }
+            AccumulateExportAdaptiveDiagnostics(&job, *runtimeState, renderState);
 
             const invisible_places::renderer::core::PointCloudExrFrameRequest request{
                 .renderState = renderState,
@@ -20667,6 +21126,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                     runtimeState.cameraInteraction.navigationActive,
                     true,
                     false,
+                    false,
                     runtimeState.previewFrameCounter,
                     &viewport,
                     &layer));
@@ -20697,6 +21157,22 @@ struct LodComparisonImageMetrics {
     double luminanceSum = 0.0;
 };
 
+struct LodComparisonErrorMetrics {
+    std::uint64_t comparedPixels = 0;
+    double redMae = 0.0;
+    double greenMae = 0.0;
+    double blueMae = 0.0;
+    double alphaMae = 0.0;
+    double rgbMae = 0.0;
+    double rgbRmse = 0.0;
+    double rgbMaxError = 0.0;
+    double alphaRmse = 0.0;
+    double alphaMaxError = 0.0;
+    double luminanceMae = 0.0;
+    double luminanceRmse = 0.0;
+    double luminanceMaxError = 0.0;
+};
+
 float HalfBitsToFloat(std::uint16_t bits) {
     Imath::half value;
     value.setBits(bits);
@@ -20719,6 +21195,103 @@ LodComparisonImageMetrics ComputeLodComparisonMetrics(
             ++metrics.coveredPixels;
         }
     }
+    return metrics;
+}
+
+std::uint64_t HashHalfRgbaImageForDiagnostics(
+    const invisible_places::output::HalfRgbaExrImage& image) {
+    std::uint64_t seed = 1469598103934665603ULL;
+    HashCombine(&seed, image.width);
+    HashCombine(&seed, image.height);
+    HashCombine(&seed, image.rgbaHalf.size());
+    for (const auto value : image.rgbaHalf) {
+        HashCombine(&seed, value);
+    }
+    HashCombine(&seed, image.depth.size());
+    for (const auto value : image.depth) {
+        HashFloat(&seed, value);
+    }
+    return seed;
+}
+
+LodComparisonErrorMetrics ComputeLodComparisonErrorMetrics(
+    const invisible_places::output::HalfRgbaExrImage& full,
+    const invisible_places::output::HalfRgbaExrImage& adaptive,
+    invisible_places::output::ExrImage* differenceImage = nullptr) {
+    LodComparisonErrorMetrics metrics;
+    if (full.width != adaptive.width || full.height != adaptive.height) {
+        return metrics;
+    }
+
+    const auto comparedPixels = std::min(full.rgbaHalf.size(), adaptive.rgbaHalf.size()) / 4U;
+    metrics.comparedPixels = static_cast<std::uint64_t>(comparedPixels);
+    if (differenceImage != nullptr) {
+        differenceImage->width = full.width;
+        differenceImage->height = full.height;
+        differenceImage->beautyR.assign(comparedPixels, 0.0F);
+        differenceImage->beautyG.assign(comparedPixels, 0.0F);
+        differenceImage->beautyB.assign(comparedPixels, 0.0F);
+        differenceImage->alpha.assign(comparedPixels, 0.0F);
+        differenceImage->depth.assign(comparedPixels, 0.0F);
+    }
+    if (comparedPixels == 0U) {
+        return metrics;
+    }
+
+    double redSquared = 0.0;
+    double greenSquared = 0.0;
+    double blueSquared = 0.0;
+    double alphaSquared = 0.0;
+    double luminanceSquared = 0.0;
+    for (std::size_t index = 0; index < comparedPixels; ++index) {
+        const float fullR = HalfBitsToFloat(full.rgbaHalf[index * 4U + 0U]);
+        const float fullG = HalfBitsToFloat(full.rgbaHalf[index * 4U + 1U]);
+        const float fullB = HalfBitsToFloat(full.rgbaHalf[index * 4U + 2U]);
+        const float fullA = HalfBitsToFloat(full.rgbaHalf[index * 4U + 3U]);
+        const float adaptiveR = HalfBitsToFloat(adaptive.rgbaHalf[index * 4U + 0U]);
+        const float adaptiveG = HalfBitsToFloat(adaptive.rgbaHalf[index * 4U + 1U]);
+        const float adaptiveB = HalfBitsToFloat(adaptive.rgbaHalf[index * 4U + 2U]);
+        const float adaptiveA = HalfBitsToFloat(adaptive.rgbaHalf[index * 4U + 3U]);
+        const float redError = std::abs(fullR - adaptiveR);
+        const float greenError = std::abs(fullG - adaptiveG);
+        const float blueError = std::abs(fullB - adaptiveB);
+        const float alphaError = std::abs(fullA - adaptiveA);
+        const float luminanceError = std::abs(
+            ((0.2126F * fullR) + (0.7152F * fullG) + (0.0722F * fullB)) -
+            ((0.2126F * adaptiveR) + (0.7152F * adaptiveG) + (0.0722F * adaptiveB)));
+        metrics.redMae += redError;
+        metrics.greenMae += greenError;
+        metrics.blueMae += blueError;
+        metrics.alphaMae += alphaError;
+        metrics.luminanceMae += luminanceError;
+        redSquared += static_cast<double>(redError) * redError;
+        greenSquared += static_cast<double>(greenError) * greenError;
+        blueSquared += static_cast<double>(blueError) * blueError;
+        alphaSquared += static_cast<double>(alphaError) * alphaError;
+        luminanceSquared += static_cast<double>(luminanceError) * luminanceError;
+        metrics.rgbMaxError = std::max<double>(
+            metrics.rgbMaxError,
+            std::max({redError, greenError, blueError}));
+        metrics.alphaMaxError = std::max<double>(metrics.alphaMaxError, alphaError);
+        metrics.luminanceMaxError = std::max<double>(metrics.luminanceMaxError, luminanceError);
+        if (differenceImage != nullptr) {
+            differenceImage->beautyR[index] = redError;
+            differenceImage->beautyG[index] = greenError;
+            differenceImage->beautyB[index] = blueError;
+            differenceImage->alpha[index] = alphaError;
+        }
+    }
+
+    const double denominator = static_cast<double>(comparedPixels);
+    metrics.redMae /= denominator;
+    metrics.greenMae /= denominator;
+    metrics.blueMae /= denominator;
+    metrics.alphaMae /= denominator;
+    metrics.luminanceMae /= denominator;
+    metrics.rgbMae = (metrics.redMae + metrics.greenMae + metrics.blueMae) / 3.0;
+    metrics.rgbRmse = std::sqrt((redSquared + greenSquared + blueSquared) / (denominator * 3.0));
+    metrics.alphaRmse = std::sqrt(alphaSquared / denominator);
+    metrics.luminanceRmse = std::sqrt(luminanceSquared / denominator);
     return metrics;
 }
 
@@ -20773,6 +21346,7 @@ invisible_places::renderer::core::SceneRenderState BuildExactAdaptiveComparisonR
             false,
             false,
             false,
+            true,
             true,
             runtimeState.previewFrameCounter,
             nullptr,
@@ -20843,6 +21417,11 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         StopBackgroundWorkForShutdown(&runtimeState);
         return 3;
     }
+    std::uint64_t lodComparePeakResidentMemoryBytes = CurrentResidentMemoryBytes();
+    const auto sampleLodComparePeakResidentMemory = [&lodComparePeakResidentMemoryBytes]() {
+        lodComparePeakResidentMemoryBytes =
+            std::max(lodComparePeakResidentMemoryBytes, CurrentResidentMemoryBytes());
+    };
 
     const auto lodWaitStart = std::chrono::steady_clock::now();
     while ((runtimeState.sessions.front().pointLodHierarchy == nullptr ||
@@ -21034,6 +21613,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         runtimeState.previewSceneUpdateFps =
             runtimeState.previewSceneUpdateMs > 0.0 ? 1000.0 / runtimeState.previewSceneUpdateMs : 0.0;
         viewport.DrawFrame();
+        sampleLodComparePeakResidentMemory();
         PollPointCloudLodWorkers(&runtimeState);
 
         const auto& diagnostics = viewport.Diagnostics();
@@ -21248,8 +21828,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::string label;
         std::filesystem::path fullPath;
         std::filesystem::path adaptivePath;
+        std::filesystem::path differencePath;
         LodComparisonImageMetrics fullMetrics{};
         LodComparisonImageMetrics adaptiveMetrics{};
+        LodComparisonErrorMetrics errorMetrics{};
+        std::uint64_t fullImageHash = 0;
+        std::uint64_t adaptiveImageHash = 0;
+        std::uint64_t differenceImageHash = 0;
+        std::uint64_t selectionHash = 1469598103934665603ULL;
         double fullCoverage = 0.0;
         double adaptiveCoverage = 0.0;
         double coverageRatio = 0.0;
@@ -21421,10 +22007,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
              .width = kComparisonWidth,
              .height = kComparisonHeight,
              .pointCloudDensityMode = PointCloudExportDensityMode::FullSource});
+        sampleLodComparePeakResidentMemory();
 
         ++runtimeState.previewFrameCounter;
         runtimeState.projectSettings.pointCloudRendererMode = PointCloudRendererMode::BeautyAdaptive;
         const auto adaptiveState = BuildExactAdaptiveComparisonRenderState(runtimeState, viewport);
+        sampleLodComparePeakResidentMemory();
 
         BeautyLodComparisonResult result;
         result.slug = beautyCases[caseIndex].slug;
@@ -21437,6 +22025,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             caseIndex == 0U
                 ? outputDirectory / "beauty_adaptive_hq.exr"
                 : outputDirectory / ("beauty_" + result.slug + "_adaptive_hq.exr");
+        result.differencePath =
+            caseIndex == 0U
+                ? outputDirectory / "beauty_adaptive_hq_error.exr"
+                : outputDirectory / ("beauty_" + result.slug + "_adaptive_hq_error.exr");
 
         bool firstAdaptiveLayer = true;
         for (const auto& layer : adaptiveState.pointCloudLayers) {
@@ -21450,6 +22042,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             result.adaptiveFallback =
                 result.adaptiveFallback ||
                 layer.adaptiveLodFallbackState.find("fallback") != std::string::npos;
+            if (layer.adaptiveDrawItems != nullptr) {
+                HashCombine(&result.selectionHash, layer.layerId);
+                HashCombine(&result.selectionHash, HashDrawItemsForDiagnostics(*layer.adaptiveDrawItems));
+            }
             result.representatives += layer.drawPointCount;
             result.representedSource += layer.adaptiveRepresentedSourceCount;
             for (std::size_t classIndex = 0; classIndex < result.adaptiveClassCounts.size(); ++classIndex) {
@@ -21505,6 +22101,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
              .width = kComparisonWidth,
              .height = kComparisonHeight,
              .pointCloudDensityMode = PointCloudExportDensityMode::AdaptiveHighQuality});
+        sampleLodComparePeakResidentMemory();
 
         if (!invisible_places::output::WriteExrImage(fullSourceImage, result.fullPath, &errorMessage)) {
             std::cerr << errorMessage << "\n";
@@ -21515,6 +22112,36 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             std::cerr << errorMessage << "\n";
             StopBackgroundWorkForShutdown(&runtimeState);
             return 8;
+        }
+        invisible_places::output::ExrImage differenceImage;
+        result.errorMetrics = ComputeLodComparisonErrorMetrics(
+            fullSourceImage,
+            adaptiveImage,
+            &differenceImage);
+        if (!invisible_places::output::WriteExrImage(differenceImage, result.differencePath, &errorMessage)) {
+            std::cerr << errorMessage << "\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 8;
+        }
+        result.fullImageHash = HashHalfRgbaImageForDiagnostics(fullSourceImage);
+        result.adaptiveImageHash = HashHalfRgbaImageForDiagnostics(adaptiveImage);
+        result.differenceImageHash = HashHalfRgbaImageForDiagnostics(
+            invisible_places::output::HalfRgbaExrImage{
+                .width = differenceImage.width,
+                .height = differenceImage.height,
+            });
+        HashCombine(&result.differenceImageHash, differenceImage.beautyR.size());
+        for (const auto value : differenceImage.beautyR) {
+            HashFloat(&result.differenceImageHash, value);
+        }
+        for (const auto value : differenceImage.beautyG) {
+            HashFloat(&result.differenceImageHash, value);
+        }
+        for (const auto value : differenceImage.beautyB) {
+            HashFloat(&result.differenceImageHash, value);
+        }
+        for (const auto value : differenceImage.alpha) {
+            HashFloat(&result.differenceImageHash, value);
         }
 
         result.fullMetrics = ComputeLodComparisonMetrics(fullSourceImage);
@@ -21670,6 +22297,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     const auto adaptiveScalarFeatureRefinements = primaryBeautyResult.adaptiveScalarFeatureRefinements;
     const auto adaptiveNormalFeatureRefinements = primaryBeautyResult.adaptiveNormalFeatureRefinements;
     const auto adaptiveEmissiveFeatureRefinements = primaryBeautyResult.adaptiveEmissiveFeatureRefinements;
+    const auto primaryDifferencePath = primaryBeautyResult.differencePath;
+    const auto sourceInfoForMetrics =
+        invisible_places::renderer::pointcloud::MakePointCloudIpcloudSourceInfo(pointCloudPath);
+    const auto& lodCompareResidency = runtimeState.sessions.front().pointIpcloudResidencyDiagnostics;
+    const auto lodCompareFallbackReason =
+        !runtimeState.sessions.front().pointIpcloudStreamingFallbackReason.empty()
+            ? runtimeState.sessions.front().pointIpcloudStreamingFallbackReason
+            : runtimeState.sessions.front().adaptiveLodFallbackState;
 
     const auto fastBasicTracePath = outputDirectory / "fast_basic_transition_trace.csv";
     {
@@ -21712,10 +22347,82 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     {
         std::ofstream metrics{metricsPath, std::ios::trunc};
         metrics << "{\n"
+                << "  \"metrics_schema_version\": 2,\n"
                 << "  \"point_cloud\": \"" << pointCloudPath.lexically_normal().generic_string() << "\",\n"
+                << "  \"source_point_count\": "
+                << (sourceInfoForMetrics.has_value() ? sourceInfoForMetrics->pointCount : 0ULL) << ",\n"
+                << "  \"source_size_bytes\": "
+                << (sourceInfoForMetrics.has_value() ? sourceInfoForMetrics->sourceSizeBytes : 0ULL) << ",\n"
+                << "  \"source_normalized_path_hash\": \""
+                << (sourceInfoForMetrics.has_value() ? Hex64(sourceInfoForMetrics->normalizedPathHash) : "0x0000000000000000")
+                << "\",\n"
+                << "  \"source_header_hash\": \""
+                << (sourceInfoForMetrics.has_value() ? Hex64(sourceInfoForMetrics->headerHash) : "0x0000000000000000")
+                << "\",\n"
+                << "  \"source_sampled_content_hash\": \""
+                << (sourceInfoForMetrics.has_value() ? Hex64(sourceInfoForMetrics->sampledContentHash) : "0x0000000000000000")
+                << "\",\n"
+                << "  \"lod_cache_status\": \"" << runtimeState.sessions.front().pointLodCacheStatus << "\",\n"
+                << "  \"lod_cache_path\": \""
+                << runtimeState.sessions.front().pointLodCachePath.lexically_normal().generic_string() << "\",\n"
+                << "  \"ipcloud_bundle_path\": \""
+                << runtimeState.sessions.front().pointIpcloudBundlePath.lexically_normal().generic_string() << "\",\n"
+                << "  \"ipcloud_cache_status\": \"" << runtimeState.sessions.front().pointIpcloudLoadPhase << "\",\n"
+                << "  \"ipcloud_cache_format_version\": "
+                << invisible_places::renderer::pointcloud::kPointCloudIpcloudCacheFormatVersion << ",\n"
+                << "  \"ipcloud_build_settings_version\": "
+                << invisible_places::renderer::pointcloud::kPointCloudIpcloudBuildSettingsVersion << ",\n"
+                << "  \"process_peak_resident_memory_bytes\": " << lodComparePeakResidentMemoryBytes << ",\n"
+                << "  \"adaptive_upload_bytes\": " << lodCompareResidency.uploadBytesThisFrame << ",\n"
+                << "  \"adaptive_upload_budget_bytes\": " << lodCompareResidency.uploadBudgetBytes << ",\n"
+                << "  \"adaptive_visible_chunks\": " << lodCompareResidency.visibleChunkRequestCount << ",\n"
+                << "  \"adaptive_resident_chunks\": " << lodCompareResidency.residentChunkCount << ",\n"
+                << "  \"adaptive_missing_chunks\": " << lodCompareResidency.missingChunkCount << ",\n"
+                << "  \"adaptive_chunk_hit_rate\": " << lodCompareResidency.chunkHitRate << ",\n"
+                << "  \"adaptive_fallback_reason\": " << JsonStringLiteral(lodCompareFallbackReason) << ",\n"
                 << "  \"full_source_exr\": \"" << fullPath.lexically_normal().generic_string() << "\",\n"
                 << "  \"adaptive_exr\": \"" << adaptivePath.lexically_normal().generic_string() << "\",\n"
+                << "  \"difference_exr\": \"" << primaryDifferencePath.lexically_normal().generic_string() << "\",\n"
                 << "  \"fast_basic_trace_csv\": \"" << fastBasicTracePath.lexically_normal().generic_string() << "\",\n"
+                << "  \"density_policy\": {\n"
+                << "    \"mode\": \"Adaptive High Quality\",\n"
+                << "    \"description\": \""
+                << invisible_places::output::PointCloudExportDensityModeDescription(
+                       PointCloudExportDensityMode::AdaptiveHighQuality)
+                << "\",\n"
+                << "    \"full_source\": "
+                << (invisible_places::output::PointCloudExportDensityModeUsesFullSource(
+                        PointCloudExportDensityMode::AdaptiveHighQuality)
+                        ? "true"
+                        : "false")
+                << ",\n"
+                << "    \"preview_quality\": "
+                << (invisible_places::output::PointCloudExportDensityModeIsPreview(
+                        PointCloudExportDensityMode::AdaptiveHighQuality)
+                        ? "true"
+                        : "false")
+                << ",\n"
+                << "    \"requires_viewport_snapshot\": "
+                << (invisible_places::output::PointCloudExportDensityModeRequiresViewportSnapshot(
+                        PointCloudExportDensityMode::AdaptiveHighQuality)
+                        ? "true"
+                        : "false")
+                << ",\n"
+                << "    \"deterministic_selection\": "
+                << (invisible_places::output::PointCloudExportDensityModeUsesDeterministicSelection(
+                        PointCloudExportDensityMode::AdaptiveHighQuality)
+                        ? "true"
+                        : "false")
+                << "\n"
+                << "  },\n"
+                << "  \"determinism\": {\n"
+                << "    \"adaptive_selection_hash\": \"" << Hex64(primaryBeautyResult.selectionHash) << "\",\n"
+                << "    \"full_source_image_hash\": \"" << Hex64(primaryBeautyResult.fullImageHash) << "\",\n"
+                << "    \"adaptive_image_hash\": \"" << Hex64(primaryBeautyResult.adaptiveImageHash) << "\",\n"
+                << "    \"difference_image_hash\": \"" << Hex64(primaryBeautyResult.differenceImageHash) << "\",\n"
+                << "    \"adaptive_representatives\": " << representatives << ",\n"
+                << "    \"adaptive_represented_source\": " << representedSource << "\n"
+                << "  },\n"
                 << "  \"full_source_coverage\": " << fullCoverage << ",\n"
                 << "  \"adaptive_coverage\": " << adaptiveCoverage << ",\n"
                 << "  \"coverage_ratio\": "
@@ -21724,6 +22431,15 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << "  \"adaptive_mean_luminance\": " << adaptiveMeanLuminance << ",\n"
                 << "  \"luminance_ratio\": "
                 << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0) << ",\n"
+                << "  \"rgb_mae\": " << primaryBeautyResult.errorMetrics.rgbMae << ",\n"
+                << "  \"rgb_rmse\": " << primaryBeautyResult.errorMetrics.rgbRmse << ",\n"
+                << "  \"rgb_max_error\": " << primaryBeautyResult.errorMetrics.rgbMaxError << ",\n"
+                << "  \"alpha_mae\": " << primaryBeautyResult.errorMetrics.alphaMae << ",\n"
+                << "  \"alpha_rmse\": " << primaryBeautyResult.errorMetrics.alphaRmse << ",\n"
+                << "  \"alpha_max_error\": " << primaryBeautyResult.errorMetrics.alphaMaxError << ",\n"
+                << "  \"luminance_mae\": " << primaryBeautyResult.errorMetrics.luminanceMae << ",\n"
+                << "  \"luminance_rmse\": " << primaryBeautyResult.errorMetrics.luminanceRmse << ",\n"
+                << "  \"luminance_max_error\": " << primaryBeautyResult.errorMetrics.luminanceMaxError << ",\n"
                 << "  \"adaptive_representatives\": " << representatives << ",\n"
                 << "  \"adaptive_represented_source\": " << representedSource << ",\n"
                 << "  \"adaptive_class_spatial\": " << adaptiveClassCounts[0] << ",\n"
@@ -21750,6 +22466,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                     << result.fullPath.lexically_normal().generic_string() << "\",\n"
                     << "      \"adaptive_exr\": \""
                     << result.adaptivePath.lexically_normal().generic_string() << "\",\n"
+                    << "      \"difference_exr\": \""
+                    << result.differencePath.lexically_normal().generic_string() << "\",\n"
+                    << "      \"adaptive_selection_hash\": \"" << Hex64(result.selectionHash) << "\",\n"
+                    << "      \"full_source_image_hash\": \"" << Hex64(result.fullImageHash) << "\",\n"
+                    << "      \"adaptive_image_hash\": \"" << Hex64(result.adaptiveImageHash) << "\",\n"
+                    << "      \"difference_image_hash\": \"" << Hex64(result.differenceImageHash) << "\",\n"
                     << "      \"renderer_cost_profile\": \""
                     << invisible_places::renderer::pointcloud::PointCloudLodRendererCostProfileName(
                            result.rendererCostProfile)
@@ -21760,6 +22482,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                     << "      \"full_source_mean_luminance\": " << result.fullMeanLuminance << ",\n"
                     << "      \"adaptive_mean_luminance\": " << result.adaptiveMeanLuminance << ",\n"
                     << "      \"luminance_ratio\": " << result.luminanceRatio << ",\n"
+                    << "      \"red_mae\": " << result.errorMetrics.redMae << ",\n"
+                    << "      \"green_mae\": " << result.errorMetrics.greenMae << ",\n"
+                    << "      \"blue_mae\": " << result.errorMetrics.blueMae << ",\n"
+                    << "      \"alpha_mae\": " << result.errorMetrics.alphaMae << ",\n"
+                    << "      \"rgb_mae\": " << result.errorMetrics.rgbMae << ",\n"
+                    << "      \"rgb_rmse\": " << result.errorMetrics.rgbRmse << ",\n"
+                    << "      \"rgb_max_error\": " << result.errorMetrics.rgbMaxError << ",\n"
+                    << "      \"alpha_rmse\": " << result.errorMetrics.alphaRmse << ",\n"
+                    << "      \"alpha_max_error\": " << result.errorMetrics.alphaMaxError << ",\n"
+                    << "      \"luminance_mae\": " << result.errorMetrics.luminanceMae << ",\n"
+                    << "      \"luminance_rmse\": " << result.errorMetrics.luminanceRmse << ",\n"
+                    << "      \"luminance_max_error\": " << result.errorMetrics.luminanceMaxError << ",\n"
                     << "      \"adaptive_representatives\": " << result.representatives << ",\n"
                     << "      \"adaptive_represented_source\": " << result.representedSource << ",\n"
                     << "      \"adaptive_estimated_vertices\": " << result.adaptiveEstimatedVertices << ",\n"
@@ -21919,6 +22653,7 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::cout << "Wrote LOD comparison outputs:\n"
               << "- " << fullPath.string() << "\n"
               << "- " << adaptivePath.string() << "\n"
+              << "- " << primaryDifferencePath.string() << "\n"
               << "- " << fastBasicTracePath.string() << "\n"
               << "- " << metricsPath.string() << "\n"
               << "Beauty matrix cases: " << beautyResults.size()
@@ -21926,8 +22661,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << "Coverage ratio: " << (fullCoverage > 0.0 ? adaptiveCoverage / fullCoverage : 0.0)
               << " | luminance ratio: "
               << (fullMeanLuminance > 0.0 ? adaptiveMeanLuminance / fullMeanLuminance : 0.0)
+              << " | RGB MAE: " << primaryBeautyResult.errorMetrics.rgbMae
               << " | representatives: " << representatives
               << " | represented source: " << representedSource
+              << " | selection hash: " << Hex64(primaryBeautyResult.selectionHash)
               << " | feature reps colour/scalar/normal/accent: "
               << adaptiveClassCounts[1] << "/"
               << (adaptiveClassCounts[3] + adaptiveClassCounts[4] + adaptiveClassCounts[5]) << "/"

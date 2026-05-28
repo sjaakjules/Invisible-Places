@@ -11,6 +11,75 @@ namespace invisible_places::output {
 
 namespace {
 
+constexpr PointCloudExportDensityModePolicy kDensityPolicies[] = {
+    {
+        .mode = PointCloudExportDensityMode::FullSource,
+        .label = "Full Source",
+        .logDescription =
+            "Draws literal source points/chunks with user-authored size, opacity, and emission; exact/debug quality.",
+        .usesFullSource = true,
+        .previewQuality = false,
+        .requiresViewportSnapshot = false,
+        .deterministicSelection = true,
+        .artistic = false,
+    },
+    {
+        .mode = PointCloudExportDensityMode::AdaptiveHighQuality,
+        .label = "Adaptive High Quality",
+        .logDescription =
+            "Uses strict adaptive LOD thresholds with deterministic representatives and fixed export budgets.",
+        .usesFullSource = false,
+        .previewQuality = false,
+        .requiresViewportSnapshot = false,
+        .deterministicSelection = true,
+        .artistic = false,
+    },
+    {
+        .mode = PointCloudExportDensityMode::MatchViewportAdaptive,
+        .label = "Match Viewport Adaptive",
+        .logDescription =
+            "Uses the captured approved viewport adaptive selection without silently refining beyond it.",
+        .usesFullSource = false,
+        .previewQuality = false,
+        .requiresViewportSnapshot = true,
+        .deterministicSelection = true,
+        .artistic = false,
+    },
+    {
+        .mode = PointCloudExportDensityMode::FastAdaptivePreview,
+        .label = "Fast Adaptive Preview",
+        .logDescription =
+            "Uses deterministic adaptive preview budgets intended for fast MP4/iteration output.",
+        .usesFullSource = false,
+        .previewQuality = true,
+        .requiresViewportSnapshot = false,
+        .deterministicSelection = true,
+        .artistic = false,
+    },
+    {
+        .mode = PointCloudExportDensityMode::ArtisticAsPreview,
+        .label = "Artistic As Preview",
+        .logDescription =
+            "Uses the captured artistic viewport adaptive selection without silent refinement.",
+        .usesFullSource = false,
+        .previewQuality = false,
+        .requiresViewportSnapshot = true,
+        .deterministicSelection = true,
+        .artistic = true,
+    },
+    {
+        .mode = PointCloudExportDensityMode::ArtisticHighQuality,
+        .label = "Artistic High Quality",
+        .logDescription =
+            "Uses strict deterministic adaptive LOD thresholds for high-quality artistic exports.",
+        .usesFullSource = false,
+        .previewQuality = false,
+        .requiresViewportSnapshot = false,
+        .deterministicSelection = true,
+        .artistic = true,
+    },
+};
+
 std::uint32_t ScaleThirtyFpsFramesToOutputFps(
     std::uint32_t sourceDurationFrames,
     std::uint32_t framesPerSecond) {
@@ -50,37 +119,36 @@ std::vector<invisible_places::camera::CameraState> SliceFrameRange(
 }  // namespace
 
 const char* PointCloudExportDensityModeName(PointCloudExportDensityMode mode) {
-    switch (mode) {
-        case PointCloudExportDensityMode::FullSource:
-            return "Full Source";
-        case PointCloudExportDensityMode::AdaptiveHighQuality:
-            return "Adaptive High Quality";
-        case PointCloudExportDensityMode::MatchViewportAdaptive:
-            return "Match Viewport Adaptive";
-        case PointCloudExportDensityMode::FastAdaptivePreview:
-            return "Fast Adaptive Preview";
-        case PointCloudExportDensityMode::ArtisticAsPreview:
-            return "Artistic As Preview";
-        case PointCloudExportDensityMode::ArtisticHighQuality:
-            return "Artistic High Quality";
-    }
-
-    return "Adaptive High Quality";
+    return PointCloudExportDensityModePolicyFor(mode).label;
 }
 
 bool PointCloudExportDensityModeUsesFullSource(PointCloudExportDensityMode mode) {
-    switch (mode) {
-        case PointCloudExportDensityMode::FullSource:
-            return true;
-        case PointCloudExportDensityMode::AdaptiveHighQuality:
-        case PointCloudExportDensityMode::MatchViewportAdaptive:
-        case PointCloudExportDensityMode::FastAdaptivePreview:
-        case PointCloudExportDensityMode::ArtisticAsPreview:
-        case PointCloudExportDensityMode::ArtisticHighQuality:
-            return false;
-    }
+    return PointCloudExportDensityModePolicyFor(mode).usesFullSource;
+}
 
-    return false;
+const PointCloudExportDensityModePolicy& PointCloudExportDensityModePolicyFor(PointCloudExportDensityMode mode) {
+    for (const auto& policy : kDensityPolicies) {
+        if (policy.mode == mode) {
+            return policy;
+        }
+    }
+    return kDensityPolicies[1];
+}
+
+const char* PointCloudExportDensityModeDescription(PointCloudExportDensityMode mode) {
+    return PointCloudExportDensityModePolicyFor(mode).logDescription;
+}
+
+bool PointCloudExportDensityModeIsPreview(PointCloudExportDensityMode mode) {
+    return PointCloudExportDensityModePolicyFor(mode).previewQuality;
+}
+
+bool PointCloudExportDensityModeRequiresViewportSnapshot(PointCloudExportDensityMode mode) {
+    return PointCloudExportDensityModePolicyFor(mode).requiresViewportSnapshot;
+}
+
+bool PointCloudExportDensityModeUsesDeterministicSelection(PointCloudExportDensityMode mode) {
+    return PointCloudExportDensityModePolicyFor(mode).deterministicSelection;
 }
 
 std::vector<invisible_places::camera::CameraState> BuildCameraRenderSequence(
