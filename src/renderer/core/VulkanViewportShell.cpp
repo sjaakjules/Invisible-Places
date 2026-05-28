@@ -1225,6 +1225,7 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionCpuCount = 0;
         diagnostics_.adaptiveGpuCompactionGpuCount = 0;
         diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
+        diagnostics_.adaptiveGpuCompactionDispatchedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
         diagnostics_.adaptiveGpuCompactionSelectionProfileMask = 0;
         diagnostics_.adaptiveGpuCompactionSelectionClassMask = 0;
@@ -1651,6 +1652,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionCpuCount = 0;
     diagnostics_.adaptiveGpuCompactionGpuCount = 0;
     diagnostics_.adaptiveGpuCompactionInputDrawItems = 0;
+    diagnostics_.adaptiveGpuCompactionDispatchedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionSelectionLimit = 0;
     diagnostics_.adaptiveGpuCompactionSelectionProfileMask = 0;
     diagnostics_.adaptiveGpuCompactionSelectionClassMask = 0;
@@ -7142,7 +7144,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             0,
             sizeof(GpuDrawItemCompactionPushConstants),
             &pushConstants);
-        vkCmdDispatch(commandBuffer, (plan.drawPointCount + 63U) / 64U, 1, 1);
+        const auto dispatchItemCount = std::min(plan.drawPointCount, selectionLimit);
+        vkCmdDispatch(commandBuffer, (dispatchItemCount + 63U) / 64U, 1, 1);
 
         if (gpuDrivenIndirectCommandPipeline_ != VK_NULL_HANDLE &&
             gpuDrivenSelectionPipelineLayout_ != VK_NULL_HANDLE &&
@@ -7230,6 +7233,7 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuCompactionUsed = true;
         diagnostics_.adaptiveGpuCompactionDispatches += 1U;
         diagnostics_.adaptiveGpuCompactionInputDrawItems += plan.drawPointCount;
+        diagnostics_.adaptiveGpuCompactionDispatchedDrawItems += dispatchItemCount;
         diagnostics_.adaptiveGpuCompactionSelectionLimit += selectionLimit;
         diagnostics_.adaptiveGpuCompactionSelectionProfileMask |= selectionProfileMask;
         diagnostics_.adaptiveGpuCompactionSelectionClassMask |= selectionClassMask;

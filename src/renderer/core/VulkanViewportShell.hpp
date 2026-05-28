@@ -138,6 +138,7 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionCpuCount = 0;
     std::uint32_t adaptiveGpuCompactionGpuCount = 0;
     std::uint32_t adaptiveGpuCompactionInputDrawItems = 0;
+    std::uint32_t adaptiveGpuCompactionDispatchedDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionSelectionLimit = 0;
     std::uint32_t adaptiveGpuCompactionSelectionProfileMask = 0;
     std::uint32_t adaptiveGpuCompactionSelectionClassMask = 0;
