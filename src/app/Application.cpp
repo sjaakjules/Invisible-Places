@@ -21327,7 +21327,7 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveGpuIndirectCommandDispatches);
                 if (diagnostics.adaptiveGpuIndirectCommandUsed || diagnostics.adaptiveGpuCompactionMs > 0.0) {
                     ImGui::Text(
-                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u reps %u-%u frustum %.2fx/%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | %.3f ms",
+                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u reps %u-%u frustum %s %.2fx/%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | %.3f ms",
                         diagnostics.adaptiveGpuCompactionParityStatus.c_str(),
                         diagnostics.adaptiveGpuCompactionCopiedDrawItems,
                         diagnostics.adaptiveGpuCompactionInputDrawItems,
@@ -21337,6 +21337,7 @@ void DrawDiagnosticsWindow(
                         diagnostics.adaptiveGpuCompactionSelectionMaxDepth,
                         diagnostics.adaptiveGpuCompactionSelectionMinRepresentedSourceCount,
                         diagnostics.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount,
+                        diagnostics.adaptiveGpuCompactionSelectionFrustumEnabled ? "on" : "off",
                         diagnostics.adaptiveGpuCompactionSelectionFrustumGuardBand,
                         diagnostics.adaptiveGpuCompactionSelectionPositionCount,
                         diagnostics.adaptiveGpuCompactionSelectionMinFootprintAreaPixels,
@@ -21346,6 +21347,11 @@ void DrawDiagnosticsWindow(
                         diagnostics.adaptiveGpuCompactionSelectionRequiredFlags,
                         diagnostics.adaptiveGpuCompactionSelectionRejectedFlags,
                         diagnostics.adaptiveGpuCompactionMs);
+                    if (!diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason.empty()) {
+                        ImGui::TextWrapped(
+                            "GPU prefix frustum fallback: %s",
+                            diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason.c_str());
+                    }
                     ImGui::Text(
                         "Adaptive GPU command generation: %.3f ms",
                         diagnostics.adaptiveGpuIndirectCommandMs);
@@ -22219,6 +22225,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicMaxGpuCompactionSelectionMaxRepresentedSourceCount = 0;
     std::uint32_t fastBasicMaxGpuCompactionSelectionPositionCount = 0;
     double fastBasicMaxGpuCompactionSelectionFrustumGuardBand = 0.0;
+    bool fastBasicGpuCompactionSelectionFrustumEnabled = false;
+    std::string fastBasicGpuCompactionSelectionFrustumFallbackReason;
     std::uint32_t fastBasicMaxGpuCompactionCopiedDrawItems = 0;
     std::uint32_t fastBasicGpuCompactionCpuCount = 0;
     std::uint32_t fastBasicGpuCompactionGpuCount = 0;
@@ -22521,6 +22529,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuCompactionSelectionFrustumGuardBand = std::max(
             fastBasicMaxGpuCompactionSelectionFrustumGuardBand,
             static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionFrustumGuardBand));
+        fastBasicGpuCompactionSelectionFrustumEnabled =
+            fastBasicGpuCompactionSelectionFrustumEnabled ||
+            diagnostics.adaptiveGpuCompactionSelectionFrustumEnabled;
+        if (!diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason.empty()) {
+            fastBasicGpuCompactionSelectionFrustumFallbackReason =
+                diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason;
+        }
         fastBasicMaxGpuCompactionCopiedDrawItems = std::max(
             fastBasicMaxGpuCompactionCopiedDrawItems,
             diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23164,6 +23179,8 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t maxGpuCompactionSelectionMaxRepresentedSourceCount = 0;
         std::uint32_t maxGpuCompactionSelectionPositionCount = 0;
         double maxGpuCompactionSelectionFrustumGuardBand = 0.0;
+        bool gpuCompactionSelectionFrustumEnabled = false;
+        std::string gpuCompactionSelectionFrustumFallbackReason;
         std::uint32_t maxGpuCompactionCopiedDrawItems = 0;
         std::uint32_t gpuCompactionCpuCount = 0;
         std::uint32_t gpuCompactionGpuCount = 0;
@@ -23369,6 +23386,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             stress.maxGpuCompactionSelectionFrustumGuardBand = std::max(
                 stress.maxGpuCompactionSelectionFrustumGuardBand,
                 static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionFrustumGuardBand));
+            stress.gpuCompactionSelectionFrustumEnabled =
+                stress.gpuCompactionSelectionFrustumEnabled ||
+                diagnostics.adaptiveGpuCompactionSelectionFrustumEnabled;
+            if (!diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason.empty()) {
+                stress.gpuCompactionSelectionFrustumFallbackReason =
+                    diagnostics.adaptiveGpuCompactionSelectionFrustumFallbackReason;
+            }
             stress.maxGpuCompactionCopiedDrawItems = std::max(
                 stress.maxGpuCompactionCopiedDrawItems,
                 diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23642,6 +23666,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuCompactionSelectionPositionCount << ",\n"
                 << "  \"gpu_compaction_selection_frustum_guard_band\": "
                 << fastBasicMaxGpuCompactionSelectionFrustumGuardBand << ",\n"
+                << "  \"gpu_compaction_selection_frustum_enabled\": "
+                << (fastBasicGpuCompactionSelectionFrustumEnabled ? "true" : "false") << ",\n"
+                << "  \"gpu_compaction_selection_frustum_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuCompactionSelectionFrustumFallbackReason) << ",\n"
                 << "  \"gpu_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"gpu_compaction_cpu_count\": " << fastBasicGpuCompactionCpuCount << ",\n"
@@ -23953,6 +23981,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << beautyStress.maxGpuCompactionSelectionPositionCount << ",\n"
                 << "  \"beauty_stress_compaction_selection_frustum_guard_band\": "
                 << beautyStress.maxGpuCompactionSelectionFrustumGuardBand << ",\n"
+                << "  \"beauty_stress_compaction_selection_frustum_enabled\": "
+                << (beautyStress.gpuCompactionSelectionFrustumEnabled ? "true" : "false") << ",\n"
+                << "  \"beauty_stress_compaction_selection_frustum_fallback_reason\": "
+                << JsonStringLiteral(beautyStress.gpuCompactionSelectionFrustumFallbackReason) << ",\n"
                 << "  \"beauty_stress_compaction_copied_draw_items\": "
                 << beautyStress.maxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"beauty_stress_compaction_cpu_count\": "
@@ -24185,6 +24217,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuCompactionSelectionPositionCount << ",\n"
                 << "  \"fast_basic_compaction_selection_frustum_guard_band\": "
                 << fastBasicMaxGpuCompactionSelectionFrustumGuardBand << ",\n"
+                << "  \"fast_basic_compaction_selection_frustum_enabled\": "
+                << (fastBasicGpuCompactionSelectionFrustumEnabled ? "true" : "false") << ",\n"
+                << "  \"fast_basic_compaction_selection_frustum_fallback_reason\": "
+                << JsonStringLiteral(fastBasicGpuCompactionSelectionFrustumFallbackReason) << ",\n"
                 << "  \"fast_basic_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"fast_basic_compaction_cpu_count\": "
@@ -24292,8 +24328,13 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << "-" << fastBasicMaxGpuCompactionSelectionMaxDepth
               << ", reps " << fastBasicMaxGpuCompactionSelectionMinRepresentedSourceCount
               << "-" << fastBasicMaxGpuCompactionSelectionMaxRepresentedSourceCount
-              << ", frustum " << fastBasicMaxGpuCompactionSelectionFrustumGuardBand
+              << ", frustum "
+              << (fastBasicGpuCompactionSelectionFrustumEnabled ? "on " : "off ")
+              << fastBasicMaxGpuCompactionSelectionFrustumGuardBand
               << "x/" << fastBasicMaxGpuCompactionSelectionPositionCount
+              << (fastBasicGpuCompactionSelectionFrustumFallbackReason.empty()
+                      ? ""
+                      : (", " + fastBasicGpuCompactionSelectionFrustumFallbackReason))
               << ", area " << fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels
               << "-" << fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels
               << ", render " << fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels

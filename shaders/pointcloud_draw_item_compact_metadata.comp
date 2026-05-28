@@ -26,10 +26,6 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionFrustumGuardBandBits;
 } pushConstants;
 
-layout(set = 0, binding = 3) uniform FrameUniforms {
-    mat4 viewProjection;
-} uniforms;
-
 layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
     PointDrawItemGpu drawItems[];
 } inputDrawItems;
@@ -48,10 +44,6 @@ layout(set = 0, binding = 2, std430) buffer CompactionStats {
     uint drawIndexXor;
     uint combinedChecksum;
 } stats;
-
-layout(set = 0, binding = 4, std430) readonly buffer PointPositions {
-    vec4 positions[];
-} pointPositions;
 
 uint MixWord(uint value) {
     value ^= value >> 16;
@@ -110,25 +102,6 @@ void main() {
     if (representedCount < pushConstants.selectionMinRepresentedSourceCount ||
         representedCount > pushConstants.selectionMaxRepresentedSourceCount) {
         return;
-    }
-    const float frustumGuardBand = uintBitsToFloat(pushConstants.selectionFrustumGuardBandBits);
-    if (frustumGuardBand > 0.0) {
-        if (sourceIndex >= pushConstants.selectionPositionCount) {
-            return;
-        }
-        const vec4 clipPosition = uniforms.viewProjection * pointPositions.positions[sourceIndex];
-        if (clipPosition.w <= 0.0) {
-            return;
-        }
-        const float guardedW = clipPosition.w * max(frustumGuardBand, 1.0);
-        if (clipPosition.x < -guardedW ||
-            clipPosition.x > guardedW ||
-            clipPosition.y < -guardedW ||
-            clipPosition.y > guardedW ||
-            clipPosition.z < -guardedW ||
-            clipPosition.z > guardedW) {
-            return;
-        }
     }
 
     const uint outputIndex = atomicAdd(stats.count, 1u);

@@ -252,6 +252,9 @@ constexpr std::uint32_t kGpuDiagnosticMinSelectionRepresentedSourceCount = 2U;
 constexpr std::uint32_t kGpuDiagnosticMaxSelectionRepresentedSourceCount =
     std::numeric_limits<std::uint32_t>::max();
 constexpr float kGpuDiagnosticSelectionFrustumGuardBand = 1.05F;
+constexpr bool kGpuDiagnosticSelectionFrustumGuardEnabled = false;
+constexpr std::string_view kGpuDiagnosticSelectionFrustumFallbackReason =
+    "GPU geometry-frustum prefix predicate is disabled because the previous MoltenVK/sample measurement was slower than metadata-only prefix compaction";
 constexpr std::uint32_t kDrawItemMetadataClassShift = 14U;
 constexpr std::uint32_t kDrawItemMetadataClassMask = 0xffU;
 constexpr std::uint32_t kGpuDiagnosticFeatureClassSelectionMask =
@@ -1201,6 +1204,8 @@ void VulkanViewportShell::SetDiagnosticsEnabled(bool enabled) {
         diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
         diagnostics_.adaptiveGpuCompactionSelectionPositionCount = 0;
         diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
+        diagnostics_.adaptiveGpuCompactionSelectionFrustumEnabled = false;
+        diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason.clear();
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
         diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
         diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -1619,6 +1624,8 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
     diagnostics_.adaptiveGpuCompactionSelectionPositionCount = 0;
     diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
+    diagnostics_.adaptiveGpuCompactionSelectionFrustumEnabled = false;
+    diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason.clear();
     diagnostics_.adaptiveGpuCompactionCopiedDrawItems = 0;
     diagnostics_.adaptiveGpuCompactionCpuChecksum = 0;
     diagnostics_.adaptiveGpuCompactionGpuChecksum = 0;
@@ -4553,8 +4560,11 @@ void VulkanViewportShell::CreateGpuCompactionPipeline() {
         return;
     }
 
+    const auto compactionShaderName = kGpuDiagnosticSelectionFrustumGuardEnabled
+                                          ? "pointcloud_draw_item_compact.comp.spv"
+                                          : "pointcloud_draw_item_compact_metadata.comp.spv";
     const auto computeShaderCode =
-        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_draw_item_compact.comp.spv").string());
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / compactionShaderName).string());
     const auto computeModule =
         CreateShaderModule(device_, computeShaderCode, "vkCreateShaderModule(pointcloud draw item compaction compute)");
 
@@ -5628,7 +5638,8 @@ VulkanViewportShell::GpuDrawItemCompactionStats VulkanViewportShell::ComputeGpuC
                 selectionMaxRepresentedSourceCount)) {
             continue;
         }
-        if (!DrawItemWithinFrustumGuard(
+        if (selectionFrustumGuardBand > 0.0F &&
+            !DrawItemWithinFrustumGuard(
                 item,
                 positions,
                 selectionViewProjection,
@@ -6981,11 +6992,15 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
             kGpuDiagnosticMinSelectionRepresentedSourceCount;
         constexpr std::uint32_t selectionMaxRepresentedSourceCount =
             kGpuDiagnosticMaxSelectionRepresentedSourceCount;
-        const auto selectionPositionCount = static_cast<std::uint32_t>(
-            std::min<std::size_t>(
-                plan.resources->cpuPositions.size(),
-                std::numeric_limits<std::uint32_t>::max()));
-        constexpr float selectionFrustumGuardBand = kGpuDiagnosticSelectionFrustumGuardBand;
+        constexpr bool selectionFrustumEnabled = kGpuDiagnosticSelectionFrustumGuardEnabled;
+        const auto selectionPositionCount = selectionFrustumEnabled
+                                                ? static_cast<std::uint32_t>(
+                                                      std::min<std::size_t>(
+                                                          plan.resources->cpuPositions.size(),
+                                                          std::numeric_limits<std::uint32_t>::max()))
+                                                : 0U;
+        constexpr float selectionFrustumGuardBand =
+            selectionFrustumEnabled ? kGpuDiagnosticSelectionFrustumGuardBand : 0.0F;
         const auto expectedStats =
             ComputeGpuCompactionStats(
                 *layer.adaptiveDrawItems,
@@ -7168,6 +7183,12 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand = std::max(
             diagnostics_.adaptiveGpuCompactionSelectionFrustumGuardBand,
             selectionFrustumGuardBand);
+        diagnostics_.adaptiveGpuCompactionSelectionFrustumEnabled =
+            diagnostics_.adaptiveGpuCompactionSelectionFrustumEnabled || selectionFrustumEnabled;
+        if (!selectionFrustumEnabled) {
+            diagnostics_.adaptiveGpuCompactionSelectionFrustumFallbackReason =
+                std::string(kGpuDiagnosticSelectionFrustumFallbackReason);
+        }
         diagnostics_.adaptiveGpuCompactionCopiedDrawItems += expectedStats.count;
     }
 
@@ -7180,7 +7201,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
         diagnostics_.adaptiveSelectionExecutionPath = "cpu-selection+gpu-prefix-selection-compare+gpu-generated-indirect";
         diagnostics_.adaptiveSelectionFallbackReason =
             "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-            "CPU-selected frustum-checked performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison";
+            "CPU-selected performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute for comparison; "
+            "the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing";
         if (diagnostics_.adaptiveGpuCompactionParityStatus == "not checked") {
             diagnostics_.adaptiveGpuCompactionParityStatus = "waiting for previous-frame prefix GPU checksum";
         }
@@ -7307,7 +7329,7 @@ bool VulkanViewportShell::RecordGpuDrivenIndirectCommandsForScene(
         diagnostics_.adaptiveSelectionFallbackReason =
             diagnostics_.adaptiveGpuCompactionUsed
                 ? "GPU compute selection remains on CPU fallback until full selection parity/timing are proven; "
-                  "CPU-selected frustum-checked performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; submitted indirect commands are still CPU-count driven"
+                  "CPU-selected performance-clamped represented-count-limited depth-windowed rank-limited projected-footprint feature draw items are prefix-filtered, compacted, checksummed, and converted to a diagnostic indirect command by compute; the geometry-frustum prefix predicate remains disabled after slower MoltenVK timing; submitted indirect commands are still CPU-count driven"
                 : "GPU compute selection remains on CPU fallback until parity/timing are proven; "
                   "indirect draw commands are generated by a compute dispatch";
         diagnostics_.adaptiveSelectionParityStatus =

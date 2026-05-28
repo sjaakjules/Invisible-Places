@@ -2968,12 +2968,14 @@ TEST_CASE("Viewport diagnostics expose Vulkan timestamp governor surfaces", "[po
 TEST_CASE("GPU-driven draw item compaction and indirect command generation are guarded and diagnosed", "[pointcloud][lod][gpu][source]") {
     const auto cmakeSource = ReadRepoTextFile("CMakeLists.txt");
     const auto compactionShader = ReadRepoTextFile("shaders/pointcloud_draw_item_compact.comp");
+    const auto metadataCompactionShader = ReadRepoTextFile("shaders/pointcloud_draw_item_compact_metadata.comp");
     const auto computeShader = ReadRepoTextFile("shaders/pointcloud_indirect_command.comp");
     const auto rendererHeader = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.hpp");
     const auto rendererSource = ReadRepoTextFile("src/renderer/core/VulkanViewportShell.cpp");
     const auto appSource = ReadRepoTextFile("src/app/Application.cpp");
 
     CHECK(cmakeSource.find("shaders/pointcloud_draw_item_compact.comp") != std::string::npos);
+    CHECK(cmakeSource.find("shaders/pointcloud_draw_item_compact_metadata.comp") != std::string::npos);
     CHECK(cmakeSource.find("shaders/pointcloud_indirect_command.comp") != std::string::npos);
     CHECK(compactionShader.find("layout(local_size_x = 64") != std::string::npos);
     CHECK(compactionShader.find("selectionLimit") != std::string::npos);
@@ -3005,6 +3007,7 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("uintBitsToFloat(pushConstants.selectionMinFootprintAreaBits)") != std::string::npos);
     CHECK(compactionShader.find("renderArea > maxRenderArea") != std::string::npos);
     CHECK(compactionShader.find("representedCount < pushConstants.selectionMinRepresentedSourceCount") != std::string::npos);
+    CHECK(compactionShader.find("if (frustumGuardBand > 0.0)") != std::string::npos);
     CHECK(compactionShader.find("sourceIndex >= pushConstants.selectionPositionCount") != std::string::npos);
     CHECK(compactionShader.find("uniforms.viewProjection * pointPositions.positions[sourceIndex]") != std::string::npos);
     CHECK(compactionShader.find("clipPosition.w <= 0.0") != std::string::npos);
@@ -3012,6 +3015,12 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("const uint outputIndex = atomicAdd(stats.count") != std::string::npos);
     CHECK(compactionShader.find("floatBitsToUint(item.params.x)") != std::string::npos);
     CHECK(compactionShader.find("combinedChecksum") != std::string::npos);
+    CHECK(metadataCompactionShader.find("layout(local_size_x = 64") != std::string::npos);
+    CHECK(metadataCompactionShader.find("selectionFrustumGuardBandBits") != std::string::npos);
+    CHECK(metadataCompactionShader.find("uniforms.viewProjection") == std::string::npos);
+    CHECK(metadataCompactionShader.find("pointPositions.positions") == std::string::npos);
+    CHECK(metadataCompactionShader.find("outputDrawItems.drawItems") != std::string::npos);
+    CHECK(metadataCompactionShader.find("combinedChecksum") != std::string::npos);
     CHECK(computeShader.find("layout(local_size_x = 1") != std::string::npos);
     CHECK(computeShader.find("layout(push_constant)") != std::string::npos);
     CHECK(computeShader.find("layout(set = 0, binding = 1") != std::string::npos);
@@ -3033,6 +3042,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMaxRepresentedSourceCount") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionFrustumGuardBand") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionPositionCount") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionFrustumEnabled") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionFrustumFallbackReason") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionIndirectCommandUsed") != std::string::npos);
@@ -3056,6 +3067,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionFootprintAreaPixels") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionRepresentedSourceCount") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumGuardBand") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumGuardEnabled") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticSelectionFrustumFallbackReason") != std::string::npos);
+    CHECK(rendererSource.find("pointcloud_draw_item_compact_metadata.comp.spv") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinProjectedAreaWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinRepresentedSourceWindow") != std::string::npos);
     CHECK(rendererSource.find("DrawItemWithinFrustumGuard") != std::string::npos);
@@ -3077,6 +3091,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_compaction_selection_max_render_area_pixels") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_min_represented_source_count") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_frustum_guard_band") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_frustum_enabled") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_frustum_fallback_reason") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_used") != std::string::npos);
@@ -3088,6 +3104,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("beauty_stress_compaction_selection_max_render_area_pixels") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_min_represented_source_count") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_frustum_guard_band") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_frustum_enabled") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_frustum_fallback_reason") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_indirect_command_used") != std::string::npos);

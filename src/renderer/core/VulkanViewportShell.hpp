@@ -153,6 +153,8 @@ struct ViewportDiagnostics {
     std::uint32_t adaptiveGpuCompactionSelectionMaxRepresentedSourceCount = 0;
     std::uint32_t adaptiveGpuCompactionSelectionPositionCount = 0;
     float adaptiveGpuCompactionSelectionFrustumGuardBand = 0.0F;
+    bool adaptiveGpuCompactionSelectionFrustumEnabled = false;
+    std::string adaptiveGpuCompactionSelectionFrustumFallbackReason;
     std::uint32_t adaptiveGpuCompactionCopiedDrawItems = 0;
     std::uint32_t adaptiveGpuCompactionCpuChecksum = 0;
     std::uint32_t adaptiveGpuCompactionGpuChecksum = 0;
