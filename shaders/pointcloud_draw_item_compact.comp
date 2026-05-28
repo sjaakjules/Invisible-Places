@@ -16,6 +16,10 @@ layout(push_constant) uniform CompactionPushConstants {
     uint selectionMaxDepth;
     uint selectionRequiredFlags;
     uint selectionRejectedFlags;
+    uint selectionMinFootprintAreaBits;
+    uint selectionMaxFootprintAreaBits;
+    uint selectionMinRenderAreaBits;
+    uint selectionMaxRenderAreaBits;
 } pushConstants;
 
 layout(set = 0, binding = 0, std430) readonly buffer InputDrawItems {
@@ -75,6 +79,18 @@ void main() {
         return;
     }
     if ((packedFlags & pushConstants.selectionRejectedFlags) != 0u) {
+        return;
+    }
+    const float footprintArea = item.params.x;
+    const float renderArea = item.params.w;
+    const float minFootprintArea = uintBitsToFloat(pushConstants.selectionMinFootprintAreaBits);
+    const float maxFootprintArea = uintBitsToFloat(pushConstants.selectionMaxFootprintAreaBits);
+    const float minRenderArea = uintBitsToFloat(pushConstants.selectionMinRenderAreaBits);
+    const float maxRenderArea = uintBitsToFloat(pushConstants.selectionMaxRenderAreaBits);
+    if (footprintArea < minFootprintArea ||
+        footprintArea > maxFootprintArea ||
+        renderArea < minRenderArea ||
+        renderArea > maxRenderArea) {
         return;
     }
 

@@ -2983,6 +2983,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("selectionMaxDepth") != std::string::npos);
     CHECK(compactionShader.find("selectionRequiredFlags") != std::string::npos);
     CHECK(compactionShader.find("selectionRejectedFlags") != std::string::npos);
+    CHECK(compactionShader.find("selectionMinFootprintAreaBits") != std::string::npos);
+    CHECK(compactionShader.find("selectionMaxRenderAreaBits") != std::string::npos);
     CHECK(compactionShader.find("drawIndex >= pushConstants.selectionLimit") != std::string::npos);
     CHECK(compactionShader.find("item.indices.w >> 14u") != std::string::npos);
     CHECK(compactionShader.find("classFlags & pushConstants.selectionClassMask") != std::string::npos);
@@ -2993,6 +2995,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(compactionShader.find("const uint packedFlags = (item.indices.w >> 11u) & 0x7u") != std::string::npos);
     CHECK(compactionShader.find("packedFlags & pushConstants.selectionRequiredFlags") != std::string::npos);
     CHECK(compactionShader.find("packedFlags & pushConstants.selectionRejectedFlags") != std::string::npos);
+    CHECK(compactionShader.find("const float footprintArea = item.params.x") != std::string::npos);
+    CHECK(compactionShader.find("uintBitsToFloat(pushConstants.selectionMinFootprintAreaBits)") != std::string::npos);
+    CHECK(compactionShader.find("renderArea > maxRenderArea") != std::string::npos);
     CHECK(compactionShader.find("outputDrawItems.drawItems") != std::string::npos);
     CHECK(compactionShader.find("const uint outputIndex = atomicAdd(stats.count") != std::string::npos);
     CHECK(compactionShader.find("floatBitsToUint(item.params.x)") != std::string::npos);
@@ -3012,6 +3017,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMaxDepth") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionRequiredFlags") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionRejectedFlags") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMinFootprintAreaPixels") != std::string::npos);
+    CHECK(rendererHeader.find("adaptiveGpuCompactionSelectionMaxRenderAreaPixels") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandMs") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuIndirectCommandUsed") != std::string::npos);
     CHECK(rendererHeader.find("adaptiveGpuCompactionIndirectCommandUsed") != std::string::npos);
@@ -3032,6 +3039,9 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("kGpuDiagnosticRankSelectionLimit") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionDepth") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRequiredSelectionFlags") != std::string::npos);
+    CHECK(rendererSource.find("kGpuDiagnosticMinSelectionFootprintAreaPixels") != std::string::npos);
+    CHECK(rendererSource.find("DrawItemWithinProjectedAreaWindow") != std::string::npos);
+    CHECK(rendererSource.find("FloatBits(selectionMinFootprintAreaPixels)") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativeClassFlags") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedRank") != std::string::npos);
     CHECK(rendererSource.find("DrawItemRepresentativePackedDepth") != std::string::npos);
@@ -3044,6 +3054,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("fast_basic_compaction_selection_class_mask") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_rank_limit") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_min_depth") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_min_footprint_area_pixels") != std::string::npos);
+    CHECK(appSource.find("fast_basic_compaction_selection_max_render_area_pixels") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("fast_basic_compaction_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_used") != std::string::npos);
@@ -3051,6 +3063,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(appSource.find("beauty_stress_compaction_selection_class_mask") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_rank_limit") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_min_depth") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_min_footprint_area_pixels") != std::string::npos);
+    CHECK(appSource.find("beauty_stress_compaction_selection_max_render_area_pixels") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_selection_required_flags") != std::string::npos);
     CHECK(appSource.find("beauty_stress_compaction_indirect_command_used") != std::string::npos);
     CHECK(appSource.find("fast_basic_indirect_command_used") != std::string::npos);

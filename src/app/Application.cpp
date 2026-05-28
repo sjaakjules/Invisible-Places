@@ -21327,7 +21327,7 @@ void DrawDiagnosticsWindow(
                     diagnostics.adaptiveGpuIndirectCommandDispatches);
                 if (diagnostics.adaptiveGpuIndirectCommandUsed || diagnostics.adaptiveGpuCompactionMs > 0.0) {
                     ImGui::Text(
-                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u flags +0x%x -0x%x | %.3f ms",
+                        "Adaptive GPU prefix selection: %s | %u/%u items | class 0x%02x rank <= %u depth %u-%u area %.1f-%.0f render %.1f-%.0f flags +0x%x -0x%x | %.3f ms",
                         diagnostics.adaptiveGpuCompactionParityStatus.c_str(),
                         diagnostics.adaptiveGpuCompactionCopiedDrawItems,
                         diagnostics.adaptiveGpuCompactionInputDrawItems,
@@ -21335,6 +21335,10 @@ void DrawDiagnosticsWindow(
                         diagnostics.adaptiveGpuCompactionSelectionRankLimit,
                         diagnostics.adaptiveGpuCompactionSelectionMinDepth,
                         diagnostics.adaptiveGpuCompactionSelectionMaxDepth,
+                        diagnostics.adaptiveGpuCompactionSelectionMinFootprintAreaPixels,
+                        diagnostics.adaptiveGpuCompactionSelectionMaxFootprintAreaPixels,
+                        diagnostics.adaptiveGpuCompactionSelectionMinRenderAreaPixels,
+                        diagnostics.adaptiveGpuCompactionSelectionMaxRenderAreaPixels,
                         diagnostics.adaptiveGpuCompactionSelectionRequiredFlags,
                         diagnostics.adaptiveGpuCompactionSelectionRejectedFlags,
                         diagnostics.adaptiveGpuCompactionMs);
@@ -22203,6 +22207,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicMaxGpuCompactionSelectionMaxDepth = 0;
     std::uint32_t fastBasicGpuCompactionSelectionRequiredFlags = 0;
     std::uint32_t fastBasicGpuCompactionSelectionRejectedFlags = 0;
+    double fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels = 0.0;
+    double fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels = 0.0;
+    double fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels = 0.0;
+    double fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels = 0.0;
     std::uint32_t fastBasicMaxGpuCompactionCopiedDrawItems = 0;
     std::uint32_t fastBasicGpuCompactionCpuCount = 0;
     std::uint32_t fastBasicGpuCompactionGpuCount = 0;
@@ -22481,6 +22489,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
             diagnostics.adaptiveGpuCompactionSelectionRequiredFlags;
         fastBasicGpuCompactionSelectionRejectedFlags |=
             diagnostics.adaptiveGpuCompactionSelectionRejectedFlags;
+        fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels = std::max(
+            fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels,
+            static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMinFootprintAreaPixels));
+        fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels = std::max(
+            fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels,
+            static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMaxFootprintAreaPixels));
+        fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels = std::max(
+            fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels,
+            static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMinRenderAreaPixels));
+        fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels = std::max(
+            fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels,
+            static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMaxRenderAreaPixels));
         fastBasicMaxGpuCompactionCopiedDrawItems = std::max(
             fastBasicMaxGpuCompactionCopiedDrawItems,
             diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23116,6 +23136,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         std::uint32_t maxGpuCompactionSelectionMaxDepth = 0;
         std::uint32_t gpuCompactionSelectionRequiredFlags = 0;
         std::uint32_t gpuCompactionSelectionRejectedFlags = 0;
+        double maxGpuCompactionSelectionMinFootprintAreaPixels = 0.0;
+        double maxGpuCompactionSelectionMaxFootprintAreaPixels = 0.0;
+        double maxGpuCompactionSelectionMinRenderAreaPixels = 0.0;
+        double maxGpuCompactionSelectionMaxRenderAreaPixels = 0.0;
         std::uint32_t maxGpuCompactionCopiedDrawItems = 0;
         std::uint32_t gpuCompactionCpuCount = 0;
         std::uint32_t gpuCompactionGpuCount = 0;
@@ -23297,6 +23321,18 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 diagnostics.adaptiveGpuCompactionSelectionRequiredFlags;
             stress.gpuCompactionSelectionRejectedFlags |=
                 diagnostics.adaptiveGpuCompactionSelectionRejectedFlags;
+            stress.maxGpuCompactionSelectionMinFootprintAreaPixels = std::max(
+                stress.maxGpuCompactionSelectionMinFootprintAreaPixels,
+                static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMinFootprintAreaPixels));
+            stress.maxGpuCompactionSelectionMaxFootprintAreaPixels = std::max(
+                stress.maxGpuCompactionSelectionMaxFootprintAreaPixels,
+                static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMaxFootprintAreaPixels));
+            stress.maxGpuCompactionSelectionMinRenderAreaPixels = std::max(
+                stress.maxGpuCompactionSelectionMinRenderAreaPixels,
+                static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMinRenderAreaPixels));
+            stress.maxGpuCompactionSelectionMaxRenderAreaPixels = std::max(
+                stress.maxGpuCompactionSelectionMaxRenderAreaPixels,
+                static_cast<double>(diagnostics.adaptiveGpuCompactionSelectionMaxRenderAreaPixels));
             stress.maxGpuCompactionCopiedDrawItems = std::max(
                 stress.maxGpuCompactionCopiedDrawItems,
                 diagnostics.adaptiveGpuCompactionCopiedDrawItems);
@@ -23554,6 +23590,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicGpuCompactionSelectionRequiredFlags << ",\n"
                 << "  \"gpu_compaction_selection_rejected_flags\": "
                 << fastBasicGpuCompactionSelectionRejectedFlags << ",\n"
+                << "  \"gpu_compaction_selection_min_footprint_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels << ",\n"
+                << "  \"gpu_compaction_selection_max_footprint_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels << ",\n"
+                << "  \"gpu_compaction_selection_min_render_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels << ",\n"
+                << "  \"gpu_compaction_selection_max_render_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels << ",\n"
                 << "  \"gpu_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"gpu_compaction_cpu_count\": " << fastBasicGpuCompactionCpuCount << ",\n"
@@ -23849,6 +23893,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << beautyStress.gpuCompactionSelectionRequiredFlags << ",\n"
                 << "  \"beauty_stress_compaction_selection_rejected_flags\": "
                 << beautyStress.gpuCompactionSelectionRejectedFlags << ",\n"
+                << "  \"beauty_stress_compaction_selection_min_footprint_area_pixels\": "
+                << beautyStress.maxGpuCompactionSelectionMinFootprintAreaPixels << ",\n"
+                << "  \"beauty_stress_compaction_selection_max_footprint_area_pixels\": "
+                << beautyStress.maxGpuCompactionSelectionMaxFootprintAreaPixels << ",\n"
+                << "  \"beauty_stress_compaction_selection_min_render_area_pixels\": "
+                << beautyStress.maxGpuCompactionSelectionMinRenderAreaPixels << ",\n"
+                << "  \"beauty_stress_compaction_selection_max_render_area_pixels\": "
+                << beautyStress.maxGpuCompactionSelectionMaxRenderAreaPixels << ",\n"
                 << "  \"beauty_stress_compaction_copied_draw_items\": "
                 << beautyStress.maxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"beauty_stress_compaction_cpu_count\": "
@@ -24065,6 +24117,14 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicGpuCompactionSelectionRequiredFlags << ",\n"
                 << "  \"fast_basic_compaction_selection_rejected_flags\": "
                 << fastBasicGpuCompactionSelectionRejectedFlags << ",\n"
+                << "  \"fast_basic_compaction_selection_min_footprint_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels << ",\n"
+                << "  \"fast_basic_compaction_selection_max_footprint_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels << ",\n"
+                << "  \"fast_basic_compaction_selection_min_render_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels << ",\n"
+                << "  \"fast_basic_compaction_selection_max_render_area_pixels\": "
+                << fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels << ",\n"
                 << "  \"fast_basic_compaction_copied_draw_items\": "
                 << fastBasicMaxGpuCompactionCopiedDrawItems << ",\n"
                 << "  \"fast_basic_compaction_cpu_count\": "
@@ -24170,6 +24230,10 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << ", rank <= " << fastBasicMaxGpuCompactionSelectionRankLimit
               << ", depth " << fastBasicMaxGpuCompactionSelectionMinDepth
               << "-" << fastBasicMaxGpuCompactionSelectionMaxDepth
+              << ", area " << fastBasicMaxGpuCompactionSelectionMinFootprintAreaPixels
+              << "-" << fastBasicMaxGpuCompactionSelectionMaxFootprintAreaPixels
+              << ", render " << fastBasicMaxGpuCompactionSelectionMinRenderAreaPixels
+              << "-" << fastBasicMaxGpuCompactionSelectionMaxRenderAreaPixels
               << ", flags +" << fastBasicGpuCompactionSelectionRequiredFlags
               << "/-" << fastBasicGpuCompactionSelectionRejectedFlags
               << ", " << fastBasicMaxGpuCompactionMs << " ms)"
