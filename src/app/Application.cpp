@@ -21426,6 +21426,19 @@ void DrawDiagnosticsWindow(
                             diagnostics.adaptiveGpuProjectedAreaProbeCpuReferenceMs,
                             diagnostics.adaptiveGpuProjectedAreaProbeMs);
                     }
+                    if (diagnostics.adaptiveGpuRenderAreaProbeUsed ||
+                        diagnostics.adaptiveGpuRenderAreaProbeParityStatus != "not checked" ||
+                        diagnostics.adaptiveGpuRenderAreaProbeMs > 0.0) {
+                        ImGui::Text(
+                            "GPU render-area probe: %s | render %.1f-%.1f px^2 | %u/%u items | cpu %.3f ms gpu %.3f ms",
+                            diagnostics.adaptiveGpuRenderAreaProbeParityStatus.c_str(),
+                            diagnostics.adaptiveGpuRenderAreaProbeMinRenderAreaPixels,
+                            diagnostics.adaptiveGpuRenderAreaProbeMaxRenderAreaPixels,
+                            diagnostics.adaptiveGpuRenderAreaProbeGpuCount,
+                            diagnostics.adaptiveGpuRenderAreaProbeCpuCount,
+                            diagnostics.adaptiveGpuRenderAreaProbeCpuReferenceMs,
+                            diagnostics.adaptiveGpuRenderAreaProbeMs);
+                    }
                     if (diagnostics.adaptiveGpuRepresentedCountProbeUsed ||
                         diagnostics.adaptiveGpuRepresentedCountProbeParityStatus != "not checked" ||
                         diagnostics.adaptiveGpuRepresentedCountProbeMs > 0.0) {
@@ -22501,6 +22514,21 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
     std::uint32_t fastBasicGpuProjectedAreaProbeGpuSourceFingerprint = 0;
     double fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs = 0.0;
     double fastBasicMaxGpuProjectedAreaProbeMs = 0.0;
+    bool fastBasicGpuRenderAreaProbeUsed = false;
+    std::string fastBasicGpuRenderAreaProbeParityStatus = "not checked";
+    std::uint32_t fastBasicMaxGpuRenderAreaProbeDispatches = 0;
+    float fastBasicMaxGpuRenderAreaProbeMinFootprintAreaPixels = 0.0F;
+    float fastBasicMaxGpuRenderAreaProbeMaxFootprintAreaPixels = 0.0F;
+    float fastBasicMaxGpuRenderAreaProbeMinRenderAreaPixels = 0.0F;
+    float fastBasicMaxGpuRenderAreaProbeMaxRenderAreaPixels = 0.0F;
+    std::uint32_t fastBasicGpuRenderAreaProbeCpuCount = 0;
+    std::uint32_t fastBasicGpuRenderAreaProbeGpuCount = 0;
+    std::uint32_t fastBasicGpuRenderAreaProbeCpuChecksum = 0;
+    std::uint32_t fastBasicGpuRenderAreaProbeGpuChecksum = 0;
+    std::uint32_t fastBasicGpuRenderAreaProbeCpuSourceFingerprint = 0;
+    std::uint32_t fastBasicGpuRenderAreaProbeGpuSourceFingerprint = 0;
+    double fastBasicMaxGpuRenderAreaProbeCpuReferenceMs = 0.0;
+    double fastBasicMaxGpuRenderAreaProbeMs = 0.0;
     bool fastBasicGpuRepresentedCountProbeUsed = false;
     std::string fastBasicGpuRepresentedCountProbeParityStatus = "not checked";
     std::uint32_t fastBasicMaxGpuRepresentedCountProbeDispatches = 0;
@@ -23078,6 +23106,51 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         fastBasicMaxGpuProjectedAreaProbeMs = std::max(
             fastBasicMaxGpuProjectedAreaProbeMs,
             diagnostics.adaptiveGpuProjectedAreaProbeMs);
+        fastBasicGpuRenderAreaProbeUsed =
+            fastBasicGpuRenderAreaProbeUsed ||
+            diagnostics.adaptiveGpuRenderAreaProbeUsed;
+        if (diagnostics.adaptiveGpuRenderAreaProbeParityStatus != "not checked") {
+            fastBasicGpuRenderAreaProbeParityStatus =
+                diagnostics.adaptiveGpuRenderAreaProbeParityStatus;
+        }
+        fastBasicMaxGpuRenderAreaProbeDispatches = std::max(
+            fastBasicMaxGpuRenderAreaProbeDispatches,
+            diagnostics.adaptiveGpuRenderAreaProbeDispatches);
+        fastBasicMaxGpuRenderAreaProbeMinFootprintAreaPixels = std::max(
+            fastBasicMaxGpuRenderAreaProbeMinFootprintAreaPixels,
+            diagnostics.adaptiveGpuRenderAreaProbeMinFootprintAreaPixels);
+        fastBasicMaxGpuRenderAreaProbeMaxFootprintAreaPixels = std::max(
+            fastBasicMaxGpuRenderAreaProbeMaxFootprintAreaPixels,
+            diagnostics.adaptiveGpuRenderAreaProbeMaxFootprintAreaPixels);
+        fastBasicMaxGpuRenderAreaProbeMinRenderAreaPixels = std::max(
+            fastBasicMaxGpuRenderAreaProbeMinRenderAreaPixels,
+            diagnostics.adaptiveGpuRenderAreaProbeMinRenderAreaPixels);
+        fastBasicMaxGpuRenderAreaProbeMaxRenderAreaPixels = std::max(
+            fastBasicMaxGpuRenderAreaProbeMaxRenderAreaPixels,
+            diagnostics.adaptiveGpuRenderAreaProbeMaxRenderAreaPixels);
+        const bool hasFastBasicRenderAreaProbeCounts =
+            diagnostics.adaptiveGpuRenderAreaProbeCpuCount != 0U ||
+            diagnostics.adaptiveGpuRenderAreaProbeGpuCount != 0U;
+        if (hasFastBasicRenderAreaProbeCounts) {
+            fastBasicGpuRenderAreaProbeCpuCount =
+                diagnostics.adaptiveGpuRenderAreaProbeCpuCount;
+            fastBasicGpuRenderAreaProbeGpuCount =
+                diagnostics.adaptiveGpuRenderAreaProbeGpuCount;
+            fastBasicGpuRenderAreaProbeCpuChecksum =
+                diagnostics.adaptiveGpuRenderAreaProbeCpuChecksum;
+            fastBasicGpuRenderAreaProbeGpuChecksum =
+                diagnostics.adaptiveGpuRenderAreaProbeGpuChecksum;
+            fastBasicGpuRenderAreaProbeCpuSourceFingerprint =
+                diagnostics.adaptiveGpuRenderAreaProbeCpuSourceFingerprint;
+            fastBasicGpuRenderAreaProbeGpuSourceFingerprint =
+                diagnostics.adaptiveGpuRenderAreaProbeGpuSourceFingerprint;
+        }
+        fastBasicMaxGpuRenderAreaProbeCpuReferenceMs = std::max(
+            fastBasicMaxGpuRenderAreaProbeCpuReferenceMs,
+            diagnostics.adaptiveGpuRenderAreaProbeCpuReferenceMs);
+        fastBasicMaxGpuRenderAreaProbeMs = std::max(
+            fastBasicMaxGpuRenderAreaProbeMs,
+            diagnostics.adaptiveGpuRenderAreaProbeMs);
         fastBasicGpuRepresentedCountProbeUsed =
             fastBasicGpuRepresentedCountProbeUsed ||
             diagnostics.adaptiveGpuRepresentedCountProbeUsed;
@@ -24474,6 +24547,22 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                    ? std::string{"GPU projected-area probe faster than CPU reference"}
                    : std::string{"CPU reference faster; projected-area probe remains compare-only"};
     };
+    const auto gpuRenderAreaProbePerformanceStatus =
+        [](double cpuReferenceMs, double gpuMs, std::uint32_t cpuCount, std::uint32_t gpuCount) {
+        if (cpuCount == 0U && gpuCount == 0U) {
+            return std::string{
+                "matched zero render-area candidates; render-area probe remains diagnostic-only"};
+        }
+        if (gpuMs <= 0.0) {
+            return std::string{"not measured"};
+        }
+        if (cpuReferenceMs <= 0.0) {
+            return std::string{"CPU reference not measured"};
+        }
+        return gpuMs < cpuReferenceMs
+                   ? std::string{"GPU render-area probe faster than CPU reference"}
+                   : std::string{"CPU reference faster; render-area probe remains compare-only"};
+    };
     const auto gpuRepresentedCountProbePerformanceStatus = [](double cpuReferenceMs, double gpuMs) {
         if (gpuMs <= 0.0) {
             return std::string{"not measured"};
@@ -24525,6 +24614,12 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
         gpuProjectedAreaProbePerformanceStatus(
             fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs,
             fastBasicMaxGpuProjectedAreaProbeMs);
+    const auto fastBasicGpuRenderAreaProbePerformanceStatus =
+        gpuRenderAreaProbePerformanceStatus(
+            fastBasicMaxGpuRenderAreaProbeCpuReferenceMs,
+            fastBasicMaxGpuRenderAreaProbeMs,
+            fastBasicGpuRenderAreaProbeCpuCount,
+            fastBasicGpuRenderAreaProbeGpuCount);
     const auto fastBasicGpuRepresentedCountProbePerformanceStatus =
         gpuRepresentedCountProbePerformanceStatus(
             fastBasicMaxGpuRepresentedCountProbeCpuReferenceMs,
@@ -24806,6 +24901,38 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuProjectedAreaProbeMs << ",\n"
                 << "  \"gpu_projected_area_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuProjectedAreaProbePerformanceStatus) << ",\n"
+                << "  \"gpu_render_area_probe_used\": "
+                << (fastBasicGpuRenderAreaProbeUsed ? "true" : "false") << ",\n"
+                << "  \"gpu_render_area_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRenderAreaProbeParityStatus) << ",\n"
+                << "  \"gpu_render_area_probe_dispatches\": "
+                << fastBasicMaxGpuRenderAreaProbeDispatches << ",\n"
+                << "  \"gpu_render_area_probe_min_footprint_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMinFootprintAreaPixels << ",\n"
+                << "  \"gpu_render_area_probe_max_footprint_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMaxFootprintAreaPixels << ",\n"
+                << "  \"gpu_render_area_probe_min_render_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMinRenderAreaPixels << ",\n"
+                << "  \"gpu_render_area_probe_max_render_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMaxRenderAreaPixels << ",\n"
+                << "  \"gpu_render_area_probe_cpu_count\": "
+                << fastBasicGpuRenderAreaProbeCpuCount << ",\n"
+                << "  \"gpu_render_area_probe_gpu_count\": "
+                << fastBasicGpuRenderAreaProbeGpuCount << ",\n"
+                << "  \"gpu_render_area_probe_cpu_checksum\": "
+                << fastBasicGpuRenderAreaProbeCpuChecksum << ",\n"
+                << "  \"gpu_render_area_probe_gpu_checksum\": "
+                << fastBasicGpuRenderAreaProbeGpuChecksum << ",\n"
+                << "  \"gpu_render_area_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuRenderAreaProbeCpuSourceFingerprint << ",\n"
+                << "  \"gpu_render_area_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuRenderAreaProbeGpuSourceFingerprint << ",\n"
+                << "  \"gpu_render_area_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuRenderAreaProbeCpuReferenceMs << ",\n"
+                << "  \"gpu_render_area_probe_ms\": "
+                << fastBasicMaxGpuRenderAreaProbeMs << ",\n"
+                << "  \"gpu_render_area_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuRenderAreaProbePerformanceStatus) << ",\n"
                 << "  \"gpu_represented_count_probe_used\": "
                 << (fastBasicGpuRepresentedCountProbeUsed ? "true" : "false") << ",\n"
                 << "  \"gpu_represented_count_probe_parity_status\": "
@@ -25681,6 +25808,38 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
                 << fastBasicMaxGpuProjectedAreaProbeMs << ",\n"
                 << "  \"fast_basic_projected_area_probe_performance_status\": "
                 << JsonStringLiteral(fastBasicGpuProjectedAreaProbePerformanceStatus) << ",\n"
+                << "  \"fast_basic_render_area_probe_used\": "
+                << (fastBasicGpuRenderAreaProbeUsed ? "true" : "false") << ",\n"
+                << "  \"fast_basic_render_area_probe_parity_status\": "
+                << JsonStringLiteral(fastBasicGpuRenderAreaProbeParityStatus) << ",\n"
+                << "  \"fast_basic_render_area_probe_dispatches\": "
+                << fastBasicMaxGpuRenderAreaProbeDispatches << ",\n"
+                << "  \"fast_basic_render_area_probe_min_footprint_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMinFootprintAreaPixels << ",\n"
+                << "  \"fast_basic_render_area_probe_max_footprint_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMaxFootprintAreaPixels << ",\n"
+                << "  \"fast_basic_render_area_probe_min_render_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMinRenderAreaPixels << ",\n"
+                << "  \"fast_basic_render_area_probe_max_render_area_pixels\": "
+                << fastBasicMaxGpuRenderAreaProbeMaxRenderAreaPixels << ",\n"
+                << "  \"fast_basic_render_area_probe_cpu_count\": "
+                << fastBasicGpuRenderAreaProbeCpuCount << ",\n"
+                << "  \"fast_basic_render_area_probe_gpu_count\": "
+                << fastBasicGpuRenderAreaProbeGpuCount << ",\n"
+                << "  \"fast_basic_render_area_probe_cpu_checksum\": "
+                << fastBasicGpuRenderAreaProbeCpuChecksum << ",\n"
+                << "  \"fast_basic_render_area_probe_gpu_checksum\": "
+                << fastBasicGpuRenderAreaProbeGpuChecksum << ",\n"
+                << "  \"fast_basic_render_area_probe_cpu_source_fingerprint\": "
+                << fastBasicGpuRenderAreaProbeCpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_render_area_probe_gpu_source_fingerprint\": "
+                << fastBasicGpuRenderAreaProbeGpuSourceFingerprint << ",\n"
+                << "  \"fast_basic_render_area_probe_cpu_reference_ms\": "
+                << fastBasicMaxGpuRenderAreaProbeCpuReferenceMs << ",\n"
+                << "  \"fast_basic_render_area_probe_ms\": "
+                << fastBasicMaxGpuRenderAreaProbeMs << ",\n"
+                << "  \"fast_basic_render_area_probe_performance_status\": "
+                << JsonStringLiteral(fastBasicGpuRenderAreaProbePerformanceStatus) << ",\n"
                 << "  \"fast_basic_represented_count_probe_used\": "
                 << (fastBasicGpuRepresentedCountProbeUsed ? "true" : "false") << ",\n"
                 << "  \"fast_basic_represented_count_probe_parity_status\": "
@@ -25974,6 +26133,16 @@ int Application::RunLodComparison(std::filesystem::path pointCloudPath) const {
               << " gpu/cpu items, cpu " << fastBasicMaxGpuProjectedAreaProbeCpuReferenceMs
               << " ms, gpu " << fastBasicMaxGpuProjectedAreaProbeMs
               << " ms, " << fastBasicGpuProjectedAreaProbePerformanceStatus
+              << ")"
+              << " | gpu render-area probe: "
+              << (fastBasicGpuRenderAreaProbeUsed ? "yes" : "no")
+              << " (" << fastBasicGpuRenderAreaProbeParityStatus
+              << ", render >= " << fastBasicMaxGpuRenderAreaProbeMinRenderAreaPixels
+              << " px^2, " << fastBasicGpuRenderAreaProbeGpuCount
+              << "/" << fastBasicGpuRenderAreaProbeCpuCount
+              << " gpu/cpu items, cpu " << fastBasicMaxGpuRenderAreaProbeCpuReferenceMs
+              << " ms, gpu " << fastBasicMaxGpuRenderAreaProbeMs
+              << " ms, " << fastBasicGpuRenderAreaProbePerformanceStatus
               << ")"
               << " | gpu represented-count probe: "
               << (fastBasicGpuRepresentedCountProbeUsed ? "yes" : "no")
