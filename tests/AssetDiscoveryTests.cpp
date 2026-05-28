@@ -3215,6 +3215,8 @@ TEST_CASE("GPU-driven draw item compaction and indirect command generation are g
     CHECK(rendererSource.find("dispatchItemCount") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSemanticSelectionClassMask") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticSemanticSelectionProfileMask") != std::string::npos);
+    CHECK(rendererSource.find("GpuDiagnosticRendererProfileSelectionMask") != std::string::npos);
+    CHECK(rendererSource.find("layer.adaptiveRendererCostProfile") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRankSelectionLimit") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticMinSelectionDepth") != std::string::npos);
     CHECK(rendererSource.find("kGpuDiagnosticRequiredSelectionFlags") != std::string::npos);

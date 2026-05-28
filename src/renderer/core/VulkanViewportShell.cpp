@@ -329,6 +329,15 @@ std::uint32_t GpuDiagnosticCompactionOutputCapacity(std::uint32_t drawPointCount
         std::min(GpuDiagnosticSelectionLimit(drawPointCount), kGpuDiagnosticCompactionOutputCapacityLimit));
 }
 
+std::uint32_t GpuDiagnosticRendererProfileSelectionMask(
+    renderer::pointcloud::PointCloudLodRendererCostProfile profile) {
+    const auto profileIndex = static_cast<std::uint32_t>(profile);
+    if (profileIndex > kDrawItemMetadataProfileMask) {
+        return kGpuDiagnosticSemanticSelectionProfileMask;
+    }
+    return 1U << profileIndex;
+}
+
 std::uint32_t DrawItemRepresentativeClassFlags(
     const renderer::pointcloud::PointCloudDrawItemGpu& item) {
     return (item.reserved1 >> kDrawItemMetadataClassShift) & kDrawItemMetadataClassMask;
@@ -9031,7 +9040,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -9472,7 +9482,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticFeatureClassProbeMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -9648,7 +9659,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankProbeLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -9826,7 +9838,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticDepthProbeMin;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticDepthProbeMax;
@@ -10007,7 +10020,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -10198,7 +10212,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -10389,7 +10404,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -10570,7 +10586,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
@@ -10761,7 +10778,8 @@ bool VulkanViewportShell::RecordGpuDrawItemCompactionForScene(
 
         const auto selectionLimit = GpuDiagnosticSelectionLimit(plan.drawPointCount);
         constexpr std::uint32_t selectionClassMask = kGpuDiagnosticSemanticSelectionClassMask;
-        constexpr std::uint32_t selectionProfileMask = kGpuDiagnosticSemanticSelectionProfileMask;
+        const std::uint32_t selectionProfileMask =
+            GpuDiagnosticRendererProfileSelectionMask(layer.adaptiveRendererCostProfile);
         constexpr std::uint32_t selectionRankLimit = kGpuDiagnosticRankSelectionLimit;
         constexpr std::uint32_t selectionMinDepth = kGpuDiagnosticMinSelectionDepth;
         constexpr std::uint32_t selectionMaxDepth = kGpuDiagnosticMaxSelectionDepth;
