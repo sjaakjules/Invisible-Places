@@ -4,6 +4,10 @@
 
 ```text
 /goal Finish adaptive LOD integration for EXR/MP4/export workflows with explicit density modes, deterministic selection, and expanded quality/performance diagnostics, verified by repeatable exports, lod-compare metrics, and manual viewport-match checks. Preserve viewport responsiveness, Full Source exactness, and chunk-streamed adaptive rendering. Between iterations, make one export mode or metric deterministic and test it twice with the same inputs. If export expectations are ambiguous, keep modes explicit and report what the user must choose.
+See docs/lod_goal_plans/lod_goal_stage09.md for details of implementation and completion verification.
+docs/point_cloud_adaptive_lod_fast_beauty.md describes the full adaptive LOD system with docs/lod_goal_plans/lod_goal_index.md describing the stages of development.
+Please update docs/CURRENT_STATE.md, docs/LOD_Integration.md, and push a git update on completion of edits.
+You can use Data/Site3-Sample-Terrestrial.ply to do tests initially as it is a section of the main cloud (Data/Site3-Mid-1mm100M.ply) with same density, only 12M as it covers an area 5m x 5m not 10m x 30m
 ```
 
 ## Required prior stage

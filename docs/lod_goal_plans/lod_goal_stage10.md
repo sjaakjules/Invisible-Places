@@ -4,6 +4,10 @@
 
 ```text
 /goal Reduce worst-case Beauty overdraw and hidden-point work by adding tile-level fragment/blended-fragment budgets and conservative occlusion/depth-proxy culling, verified by diagnostics and stress views showing lower point-pass/accumulation cost without holes, missing visible features, or regressions in Fast Basic, Beauty, streaming, or exports. Between iterations, enable one conservative budget/culling layer, compare before/after metrics on the same camera path, and keep any risky rejection disabled until proven safe. If correctness is uncertain, prefer drawing too much over culling visible data.
+See docs/lod_goal_plans/lod_goal_stage10.md for details of implementation and completion verification.
+docs/point_cloud_adaptive_lod_fast_beauty.md describes the full adaptive LOD system with docs/lod_goal_plans/lod_goal_index.md describing the stages of development.
+Please update docs/CURRENT_STATE.md, docs/LOD_Integration.md, and push a git update on completion of edits.
+You can use Data/Site3-Sample-Terrestrial.ply to do tests initially as it is a section of the main cloud (Data/Site3-Mid-1mm100M.ply) with same density, only 12M as it covers an area 5m x 5m not 10m x 30m
 ```
 
 ## Required prior stage

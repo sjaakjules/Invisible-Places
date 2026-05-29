@@ -4,6 +4,10 @@
 
 ```text
 /goal Move adaptive point-cloud culling/selection/compaction toward GPU-driven execution where it is measurably better, with indirect draw submission when supported and a correct CPU fallback, verified by CPU/GPU selection parity tests, MoltenVK feature checks, performance diagnostics, full tests, and final Fast Basic/Beauty/export manual runs. Preserve all prior quality, streaming, cache, and export semantics. Between iterations, port one bounded part of selection to GPU, compare output/performance against CPU fallback, and keep the CPU path active until parity is proven. If GPU-driven work is slower or unsupported, leave a clear fallback and diagnostic reason.
+See docs/lod_goal_plans/lod_goal_stage11.md for details of implementation and completion verification.
+docs/point_cloud_adaptive_lod_fast_beauty.md describes the full adaptive LOD system with docs/lod_goal_plans/lod_goal_index.md describing the stages of development.
+Please update docs/CURRENT_STATE.md, docs/LOD_Integration.md, and push a git update on completion of edits.
+You can use Data/Site3-Sample-Terrestrial.ply to do tests initially as it is a section of the main cloud (Data/Site3-Mid-1mm100M.ply) with same density, only 12M as it covers an area 5m x 5m not 10m x 30m
 ```
 
 ## Required prior stage
