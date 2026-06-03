@@ -109,6 +109,7 @@ add_library(
     invisible_places_core
     src/app/Application.cpp
     src/app/PointVisualSelection.cpp
+    src/app/WaterPathDiagnostics.cpp
     src/camera/AnimationPath.cpp
     src/camera/CameraPath.cpp
     src/camera/OrbitCamera.cpp

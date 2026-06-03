@@ -1777,6 +1777,10 @@ float CrossXy(
            ((left.y - origin.y) * (right.x - origin.x));
 }
 
+float Cross2d(const glm::vec2& left, const glm::vec2& right) {
+    return left.x * right.y - left.y * right.x;
+}
+
 float DistanceToSegmentXy(
     const glm::vec3& point,
     const invisible_places::io::Float3& start,
@@ -2045,6 +2049,193 @@ void IncludeWaterPathAnchorsOnly(
     }
 }
 
+float FiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+float ClampFinite01(float value) {
+    return Clamp01(FiniteOr(value, 0.0F));
+}
+
+float SafeAcos(float value) {
+    return std::acos(std::clamp(value, -1.0F, 1.0F));
+}
+
+std::vector<WaterOverlayPoint> OrderedAnalysisAnchors(const WaterPathBranch& branch) {
+    auto anchors = branch.rawAnchors;
+    if (anchors.empty()) {
+        return anchors;
+    }
+    std::stable_sort(
+        anchors.begin(),
+        anchors.end(),
+        [](const WaterOverlayPoint& left, const WaterOverlayPoint& right) {
+            return left.pathDistance < right.pathDistance;
+        });
+
+    bool monotonic = true;
+    for (std::size_t index = 1U; index < anchors.size(); ++index) {
+        if (anchors[index].pathDistance <= anchors[index - 1U].pathDistance) {
+            monotonic = false;
+            break;
+        }
+    }
+    if (!monotonic) {
+        RecomputePathDistances(&anchors, std::max(0.001F, branch.length));
+    }
+    return anchors;
+}
+
+float AnalysisRadiusForCache(const WaterPathCache& cache) {
+    const float spacing = PositiveOr(
+        cache.tunedSettings.pathSampleSpacing,
+        PositiveOr(cache.diagnostics.pathSampleSpacing, cache.requestedSettings.pathSampleSpacing));
+    const float voxel = PositiveOr(
+        cache.tunedSettings.supportVoxelSize,
+        PositiveOr(cache.diagnostics.supportVoxelSize, cache.requestedSettings.supportVoxelSize));
+    const float bridge = PositiveOr(
+        cache.tunedSettings.maxBridgeDistance,
+        PositiveOr(cache.diagnostics.maxBridgeDistance, cache.requestedSettings.maxBridgeDistance));
+    return std::clamp(
+        std::max({spacing * 8.0F, voxel * 8.0F, bridge * 0.75F, 0.025F}),
+        0.025F,
+        2.5F);
+}
+
+std::size_t FindAnalysisWindowIndex(
+    const std::vector<WaterOverlayPoint>& anchors,
+    std::size_t index,
+    float targetDistance,
+    bool searchLeft) {
+    if (anchors.empty()) {
+        return 0U;
+    }
+    if (searchLeft) {
+        std::size_t best = index;
+        while (best > 0U && anchors[best].pathDistance > targetDistance) {
+            --best;
+        }
+        return best == index && index > 0U ? index - 1U : best;
+    }
+
+    std::size_t best = index;
+    while (best + 1U < anchors.size() && anchors[best].pathDistance < targetDistance) {
+        ++best;
+    }
+    return best == index && index + 1U < anchors.size() ? index + 1U : best;
+}
+
+float AnalysisSlopeAt(
+    const std::vector<WaterOverlayPoint>& anchors,
+    std::size_t index,
+    float windowDistance) {
+    if (anchors.size() < 2U || index >= anchors.size()) {
+        return 0.0F;
+    }
+    const float pathDistance = anchors[index].pathDistance;
+    const std::size_t left = FindAnalysisWindowIndex(anchors, index, pathDistance - windowDistance, true);
+    const std::size_t right = FindAnalysisWindowIndex(anchors, index, pathDistance + windowDistance, false);
+    if (left == right || right >= anchors.size()) {
+        return 0.0F;
+    }
+    const float distance = std::max(1.0e-4F, std::abs(anchors[right].pathDistance - anchors[left].pathDistance));
+    const float dz = std::abs(anchors[right].position.z - anchors[left].position.z);
+    constexpr float slopeHigh = 0.70F;
+    return Clamp01((dz / distance) / slopeHigh);
+}
+
+float AnalysisCurvatureAt(
+    const std::vector<WaterOverlayPoint>& anchors,
+    std::size_t index,
+    float* signedCurvature) {
+    if (signedCurvature != nullptr) {
+        *signedCurvature = 0.0F;
+    }
+    if (anchors.size() < 3U || index == 0U || index + 1U >= anchors.size()) {
+        return 0.0F;
+    }
+    const glm::vec3 previous = ToGlm(anchors[index - 1U].position);
+    const glm::vec3 current = ToGlm(anchors[index].position);
+    const glm::vec3 next = ToGlm(anchors[index + 1U].position);
+    glm::vec3 incoming = current - previous;
+    glm::vec3 outgoing = next - current;
+    if (glm::dot(incoming, incoming) <= 1.0e-8F || glm::dot(outgoing, outgoing) <= 1.0e-8F) {
+        return 0.0F;
+    }
+    incoming = glm::normalize(incoming);
+    outgoing = glm::normalize(outgoing);
+    const float angle = SafeAcos(glm::dot(incoming, outgoing));
+    constexpr float curvatureHighRadians = 1.57079637F;
+    const float curvature = Clamp01(angle / curvatureHighRadians);
+    if (signedCurvature != nullptr) {
+        const float turnSign = glm::cross(incoming, outgoing).z < 0.0F ? -1.0F : 1.0F;
+        *signedCurvature = curvature * turnSign;
+    }
+    return curvature;
+}
+
+void SmoothAnalysisField(
+    std::vector<WaterPathAnalysisSample>* samples,
+    float WaterPathAnalysisSample::*field,
+    bool normalized) {
+    if (samples == nullptr || samples->size() < 3U) {
+        return;
+    }
+    std::vector<float> values;
+    values.reserve(samples->size());
+    for (const auto& sample : *samples) {
+        values.push_back(sample.*field);
+    }
+    for (std::size_t index = 1U; index + 1U < samples->size(); ++index) {
+        float value = (values[index - 1U] * 0.25F) + (values[index] * 0.50F) + (values[index + 1U] * 0.25F);
+        if (normalized) {
+            value = Clamp01(value);
+        }
+        (*samples)[index].*field = value;
+    }
+}
+
+void SanitizeAnalysisSample(WaterPathAnalysisSample* sample) {
+    if (sample == nullptr) {
+        return;
+    }
+    sample->pathDistance = std::max(0.0F, FiniteOr(sample->pathDistance, 0.0F));
+    sample->slope = ClampFinite01(sample->slope);
+    sample->flatness = ClampFinite01(sample->flatness);
+    sample->curvature = ClampFinite01(sample->curvature);
+    sample->neighborDensity = ClampFinite01(sample->neighborDensity);
+    sample->nearestPathDistance = std::max(0.0F, FiniteOr(sample->nearestPathDistance, 0.0F));
+    sample->confluence = ClampFinite01(sample->confluence);
+    sample->channelWidth = std::max(0.001F, FiniteOr(sample->channelWidth, 0.001F));
+    sample->speed = std::max(0.0F, FiniteOr(sample->speed, 0.0F));
+    sample->turbulence = ClampFinite01(sample->turbulence);
+    sample->eddyPotential = ClampFinite01(sample->eddyPotential);
+    sample->ripplePotential = ClampFinite01(sample->ripplePotential);
+}
+
+struct AnalysisFlatSample {
+    std::size_t branchIndex = 0;
+    std::size_t sampleIndex = 0;
+    std::uint32_t branchId = 0;
+    std::optional<std::uint32_t> parentId;
+    std::uint32_t emitterId = 0;
+    WaterPathBranchRole role = WaterPathBranchRole::Main;
+    glm::vec3 position{0.0F};
+    glm::vec3 tangent{0.0F, 0.0F, -1.0F};
+    float pathDistance = 0.0F;
+    float baseWidth = 0.01F;
+    float baseSpeed = 0.45F;
+    float confidence = 1.0F;
+    float roughness = 0.0F;
+};
+
+bool BranchesRelatedForConfluence(const AnalysisFlatSample& left, const AnalysisFlatSample& right) {
+    return left.emitterId == right.emitterId ||
+           (left.parentId.has_value() && left.parentId.value() == right.branchId) ||
+           (right.parentId.has_value() && right.parentId.value() == left.branchId) ||
+           (left.parentId.has_value() && right.parentId.has_value() && left.parentId.value() == right.parentId.value());
+}
+
 void WriteFloat(std::ofstream& output, float value) {
     output.write(reinterpret_cast<const char*>(&value), sizeof(float));
 }
@@ -2054,6 +2245,275 @@ void WriteUchar(std::ofstream& output, std::uint8_t value) {
 }
 
 }  // namespace
+
+WaterPathAnalysisCache BuildWaterPathAnalysis(const WaterPathCache& cache) {
+    WaterPathAnalysisCache analysis;
+    analysis.analysisRadiusMeters = AnalysisRadiusForCache(cache);
+    if (cache.branches.empty()) {
+        return analysis;
+    }
+
+    std::vector<std::vector<WaterOverlayPoint>> orderedBranches;
+    orderedBranches.reserve(cache.branches.size());
+    analysis.branches.reserve(cache.branches.size());
+
+    for (const auto& branch : cache.branches) {
+        auto anchors = OrderedAnalysisAnchors(branch);
+        WaterPathBranchAnalysis branchAnalysis;
+        branchAnalysis.branchId = branch.id;
+        branchAnalysis.samples.reserve(anchors.size());
+
+        const float branchLength =
+            anchors.size() < 2U
+                ? 0.0F
+                : std::max(0.0F, anchors.back().pathDistance - anchors.front().pathDistance);
+        const float spacing = PositiveOr(
+            cache.tunedSettings.pathSampleSpacing,
+            PositiveOr(cache.diagnostics.pathSampleSpacing, cache.requestedSettings.pathSampleSpacing));
+        const float windowDistance = std::clamp(
+            std::max({spacing * 4.0F, analysis.analysisRadiusMeters * 0.35F, branchLength * 0.08F}),
+            0.01F,
+            std::max(0.01F, branchLength * 0.40F));
+
+        for (std::size_t index = 0U; index < anchors.size(); ++index) {
+            const auto& anchor = anchors[index];
+            WaterPathAnalysisSample sample;
+            sample.branchId = branch.id;
+            sample.sampleIndex = static_cast<std::uint32_t>(
+                std::min<std::size_t>(index, std::numeric_limits<std::uint32_t>::max()));
+            sample.pathDistance = std::max(0.0F, anchor.pathDistance);
+            sample.slope = AnalysisSlopeAt(anchors, index, windowDistance);
+            sample.flatness = Clamp01(
+                (1.0F - sample.slope) * 0.82F +
+                Clamp01(anchor.pooling) * 0.10F +
+                Clamp01(branch.flatness) * 0.08F);
+            sample.curvature = AnalysisCurvatureAt(anchors, index, nullptr);
+            sample.nearestPathDistance = analysis.analysisRadiusMeters * 1.5F;
+            sample.channelWidth = std::max(0.001F, anchor.width);
+            sample.speed = std::max(0.0F, anchor.speed);
+            SanitizeAnalysisSample(&sample);
+            branchAnalysis.samples.push_back(sample);
+        }
+
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::slope, true);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::flatness, true);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::curvature, true);
+        orderedBranches.push_back(std::move(anchors));
+        analysis.branches.push_back(std::move(branchAnalysis));
+    }
+
+    std::vector<AnalysisFlatSample> flatSamples;
+    flatSamples.reserve([&]() {
+        std::size_t total = 0U;
+        for (const auto& branch : analysis.branches) {
+            total += branch.samples.size();
+        }
+        return total;
+    }());
+
+    std::unordered_map<GridKey, std::vector<std::size_t>, GridKeyHash> sampleGrid;
+    const float radius = std::max(0.001F, analysis.analysisRadiusMeters);
+    for (std::size_t branchIndex = 0U; branchIndex < analysis.branches.size(); ++branchIndex) {
+        const auto& branch = cache.branches[branchIndex];
+        const auto& anchors = orderedBranches[branchIndex];
+        const auto& branchAnalysis = analysis.branches[branchIndex];
+        for (std::size_t sampleIndex = 0U;
+             sampleIndex < branchAnalysis.samples.size() && sampleIndex < anchors.size();
+             ++sampleIndex) {
+            const auto& anchor = anchors[sampleIndex];
+            AnalysisFlatSample flat;
+            flat.branchIndex = branchIndex;
+            flat.sampleIndex = sampleIndex;
+            flat.branchId = branch.id;
+            flat.parentId = branch.parentId;
+            flat.emitterId = branch.emitterId;
+            flat.role = branch.role;
+            flat.position = ToGlm(anchor.position);
+            flat.tangent = WaterPathTangent(anchors, sampleIndex);
+            flat.pathDistance = anchor.pathDistance;
+            flat.baseWidth = std::clamp(PositiveOr(anchor.width, radius * 0.08F), 0.001F, radius);
+            flat.baseSpeed = std::clamp(PositiveOr(anchor.speed, 0.45F), 0.02F, 8.0F);
+            flat.confidence = Clamp01(anchor.confidence * branch.confidence);
+            flat.roughness = std::max(
+                Clamp01(1.0F - flat.confidence),
+                std::max(Clamp01(anchor.surfaceSteepness * 0.35F), Clamp01(static_cast<float>(branch.gapCount) / 3.0F)));
+            const std::size_t flatIndex = flatSamples.size();
+            flatSamples.push_back(flat);
+            sampleGrid[MakeGridKey(flat.position, radius)].push_back(flatIndex);
+        }
+    }
+
+    const int searchRadiusCells = 1;
+    for (std::size_t flatIndex = 0U; flatIndex < flatSamples.size(); ++flatIndex) {
+        const auto& sampleInfo = flatSamples[flatIndex];
+        auto& sample = analysis.branches[sampleInfo.branchIndex].samples[sampleInfo.sampleIndex];
+        const GridKey key = MakeGridKey(sampleInfo.position, radius);
+        float neighborWeightSum = 0.0F;
+        float confluenceWeightSum = 0.0F;
+        float nearestDistance = std::numeric_limits<float>::max();
+
+        for (int dz = -searchRadiusCells; dz <= searchRadiusCells; ++dz) {
+            for (int dy = -searchRadiusCells; dy <= searchRadiusCells; ++dy) {
+                for (int dx = -searchRadiusCells; dx <= searchRadiusCells; ++dx) {
+                    const GridKey neighborKey{key.x + dx, key.y + dy, key.z + dz};
+                    const auto cellIt = sampleGrid.find(neighborKey);
+                    if (cellIt == sampleGrid.end()) {
+                        continue;
+                    }
+                    for (const std::size_t otherFlatIndex : cellIt->second) {
+                        if (otherFlatIndex == flatIndex || otherFlatIndex >= flatSamples.size()) {
+                            continue;
+                        }
+                        const auto& other = flatSamples[otherFlatIndex];
+                        const float sameBranchDistance = std::abs(other.pathDistance - sampleInfo.pathDistance);
+                        if (other.branchId == sampleInfo.branchId && sameBranchDistance <= radius * 1.25F) {
+                            continue;
+                        }
+                        const glm::vec3 delta = other.position - sampleInfo.position;
+                        const float distance = glm::length(delta);
+                        if (!std::isfinite(distance) || distance <= 1.0e-5F || distance > radius) {
+                            continue;
+                        }
+                        nearestDistance = std::min(nearestDistance, distance);
+
+                        const float distanceWeight = 1.0F - (distance / radius);
+                        const float progressDelta = std::abs(other.pathDistance - sampleInfo.pathDistance);
+                        const float progressWeight = 1.0F - Clamp01(progressDelta / std::max(radius * 2.0F, 1.0e-4F));
+                        const float roleWeight =
+                            other.role == WaterPathBranchRole::Spread || sampleInfo.role == WaterPathBranchRole::Spread
+                                ? 1.15F
+                                : 1.0F;
+                        const float neighborWeight = distanceWeight * (0.65F + progressWeight * 0.35F) * roleWeight;
+                        neighborWeightSum += neighborWeight;
+
+                        const float directionAlignment =
+                            Clamp01((glm::dot(sampleInfo.tangent, other.tangent) + 1.0F) * 0.5F);
+                        const float relatedWeight = BranchesRelatedForConfluence(sampleInfo, other) ? 1.0F : 0.68F;
+                        confluenceWeightSum += neighborWeight * directionAlignment * relatedWeight;
+                    }
+                }
+            }
+        }
+
+        const bool hasNeighbor = nearestDistance < std::numeric_limits<float>::max();
+        sample.nearestPathDistance = hasNeighbor ? nearestDistance : radius * 1.5F;
+        sample.neighborDensity = Clamp01(neighborWeightSum / 2.75F);
+        sample.confluence = Clamp01(confluenceWeightSum / 2.25F);
+    }
+
+    for (auto& branchAnalysis : analysis.branches) {
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::neighborDensity, true);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::confluence, true);
+    }
+
+    const float minimumWidth = std::max(
+        0.002F,
+        PositiveOr(cache.tunedSettings.pathSampleSpacing, cache.requestedSettings.pathSampleSpacing) * 0.35F);
+    const float maximumWidth = std::max(minimumWidth * 4.0F, radius * 2.50F);
+    for (const auto& sampleInfo : flatSamples) {
+        auto& sample = analysis.branches[sampleInfo.branchIndex].samples[sampleInfo.sampleIndex];
+        const float nearest = std::max(0.0F, sample.nearestPathDistance);
+        const bool hasNeighbor = nearest <= radius;
+        const float neighborWidth =
+            hasNeighbor ? std::clamp(nearest * (0.55F + sample.confluence * 0.35F), minimumWidth, maximumWidth)
+                        : sampleInfo.baseWidth;
+        const float widthSeed =
+            std::max(sampleInfo.baseWidth, sampleInfo.baseWidth + (neighborWidth - sampleInfo.baseWidth) * sample.neighborDensity);
+        const float flatSpread = 1.0F + sample.flatness * 0.75F;
+        const float confluenceSpread = 1.0F + sample.confluence * 0.90F;
+        const float isolationNarrow = 0.72F + sample.neighborDensity * 0.28F;
+        const float steepNarrow = 1.0F - sample.slope * 0.36F;
+        sample.channelWidth = std::clamp(
+            widthSeed * flatSpread * confluenceSpread * isolationNarrow * steepNarrow,
+            minimumWidth,
+            maximumWidth);
+
+        const float slopeSpeed = 0.35F + sample.slope * 1.65F;
+        const float flatDamping = 1.0F - sample.flatness * 0.48F;
+        const float confluenceDamping = 1.0F - sample.confluence * 0.16F;
+        sample.speed = std::clamp(sampleInfo.baseSpeed * slopeSpeed * flatDamping * confluenceDamping, 0.02F, 8.0F);
+    }
+
+    for (const auto& sampleInfo : flatSamples) {
+        auto& branchSamples = analysis.branches[sampleInfo.branchIndex].samples;
+        auto& sample = branchSamples[sampleInfo.sampleIndex];
+        const std::size_t previous = sampleInfo.sampleIndex > 0U ? sampleInfo.sampleIndex - 1U : sampleInfo.sampleIndex;
+        const std::size_t next = std::min<std::size_t>(sampleInfo.sampleIndex + 1U, branchSamples.size() - 1U);
+        const float slopeTransition =
+            branchSamples.empty()
+                ? 0.0F
+                : std::abs(branchSamples[next].slope - branchSamples[previous].slope);
+        const float widthTransition =
+            branchSamples.empty()
+                ? 0.0F
+                : Clamp01(std::abs(branchSamples[next].channelWidth - branchSamples[previous].channelWidth) /
+                          std::max(0.001F, sample.channelWidth));
+        const float normalizedSpeed = Clamp01(sample.speed / 2.0F);
+        const float fastNonFlat = normalizedSpeed * (1.0F - sample.flatness * 0.55F);
+        sample.turbulence = Clamp01(
+            normalizedSpeed * 0.32F +
+            sample.curvature * 0.26F +
+            sampleInfo.roughness * 0.22F +
+            sample.confluence * 0.20F);
+        sample.eddyPotential = Clamp01(
+            sample.curvature * 0.42F +
+            slopeTransition * 0.24F +
+            widthTransition * 0.16F +
+            sampleInfo.roughness * 0.12F +
+            fastNonFlat * 0.18F);
+        sample.ripplePotential = Clamp01(
+            sample.curvature * 0.38F +
+            sample.eddyPotential * 0.24F +
+            sample.turbulence * 0.18F +
+            sample.flatness * normalizedSpeed * 0.12F +
+            sample.confluence * 0.08F);
+    }
+
+    for (auto& branchAnalysis : analysis.branches) {
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::channelWidth, false);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::speed, false);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::turbulence, true);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::eddyPotential, true);
+        SmoothAnalysisField(&branchAnalysis.samples, &WaterPathAnalysisSample::ripplePotential, true);
+        for (auto& sample : branchAnalysis.samples) {
+            SanitizeAnalysisSample(&sample);
+        }
+    }
+
+    return analysis;
+}
+
+bool WaterPathAnalysisCacheCompatible(const WaterPathCache& cache) {
+    if (!cache.analysis.has_value() ||
+        cache.analysis->schemaVersion != 1U ||
+        !std::isfinite(cache.analysis->analysisRadiusMeters) ||
+        cache.analysis->branches.size() != cache.branches.size()) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < cache.branches.size(); ++index) {
+        const auto& branch = cache.branches[index];
+        const auto& analysisBranch = cache.analysis->branches[index];
+        if (analysisBranch.branchId != branch.id ||
+            analysisBranch.samples.size() != branch.rawAnchors.size()) {
+            return false;
+        }
+        for (const auto& sample : analysisBranch.samples) {
+            if (sample.branchId != branch.id) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void EnsureWaterPathAnalysis(WaterPathCache* cache) {
+    if (cache == nullptr) {
+        return;
+    }
+    if (!WaterPathAnalysisCacheCompatible(*cache)) {
+        cache->analysis = BuildWaterPathAnalysis(*cache);
+    }
+}
 
 const char* WaterScaleModeName(WaterScaleMode mode) {
     switch (mode) {
@@ -2200,6 +2660,33 @@ WaterFlowStreamSettings ApplyWaterTrailGeometryToFlowStreamSettings(
     settings.streamWidthMeters = geometry.widthMeters;
     settings.streamWorldLengthMeters = geometry.worldLengthMeters;
     return settings;
+}
+
+bool WaterFlowLaneRouteInputsEqual(
+    const WaterFlowStreamSettings& left,
+    const WaterFlowStreamSettings& right) {
+    return left.enabled == right.enabled &&
+           left.streamCountTotal == right.streamCountTotal &&
+           left.laneCount == right.laneCount &&
+           left.streamLengthMeters == right.streamLengthMeters &&
+           left.streamPointSpacingMeters == right.streamPointSpacingMeters &&
+           left.streamWidthMeters == right.streamWidthMeters &&
+           left.streamWorldLengthMeters == right.streamWorldLengthMeters &&
+           left.surfaceOffsetMeters == right.surfaceOffsetMeters &&
+           left.pathAttraction == right.pathAttraction &&
+           left.laneSpreadMeters == right.laneSpreadMeters &&
+           left.laneCrossing == right.laneCrossing &&
+           left.streamSmoothness == right.streamSmoothness &&
+           left.streamLooseness == right.streamLooseness &&
+           left.turbulence == right.turbulence &&
+           left.seed == right.seed;
+}
+
+bool WaterFlowLaneSpeedOnlyEdit(
+    const WaterFlowStreamSettings& before,
+    const WaterFlowStreamSettings& after) {
+    return WaterFlowLaneRouteInputsEqual(before, after) &&
+           before.speedMetersPerSecond != after.speedMetersPerSecond;
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
@@ -2563,6 +3050,7 @@ WaterPathCache GenerateWaterPathCache(
                 ? "No supported water branches reached from the selected emitters."
                 : "Generated water branch cache.";
     }
+    cache.analysis = BuildWaterPathAnalysis(cache);
     return cache;
 }
 
@@ -2634,6 +3122,7 @@ WaterPathCache GenerateWaterPathCache(
         combined.branches.empty()
             ? "No supported water branches reached from the selected emitters."
             : "Generated per-source water branch cache.";
+    combined.analysis = BuildWaterPathAnalysis(combined);
     return combined;
 }
 
@@ -3129,6 +3618,54 @@ float EffectPolygonEdgeDistance3d(
     return distance == std::numeric_limits<float>::max() ? 0.0F : distance;
 }
 
+float DirectionalDistanceToRegionEdge(
+    const glm::vec3& point,
+    const glm::vec3& direction,
+    const std::vector<invisible_places::io::Float3>& polygon) {
+    if (polygon.size() < 2U) {
+        return 0.0F;
+    }
+
+    glm::vec2 rayDirection{direction.x, direction.y};
+    if (glm::dot(rayDirection, rayDirection) <= 1.0e-8F) {
+        return EffectPolygonEdgeDistanceXy(point, polygon);
+    }
+    rayDirection = glm::normalize(rayDirection);
+
+    const glm::vec2 origin{point.x, point.y};
+    float nearestHit = std::numeric_limits<float>::max();
+    for (std::size_t index = 0; index < polygon.size(); ++index) {
+        const auto next = (index + 1U) % polygon.size();
+        const glm::vec2 start{polygon[index].x, polygon[index].y};
+        const glm::vec2 end{polygon[next].x, polygon[next].y};
+        const glm::vec2 segment = end - start;
+        const float denominator = Cross2d(rayDirection, segment);
+        if (std::abs(denominator) <= 1.0e-8F) {
+            continue;
+        }
+
+        const glm::vec2 delta = start - origin;
+        const float rayDistance = Cross2d(delta, segment) / denominator;
+        const float segmentPosition = Cross2d(delta, rayDirection) / denominator;
+        if (rayDistance >= -1.0e-5F &&
+            segmentPosition >= -1.0e-5F &&
+            segmentPosition <= 1.0F + 1.0e-5F) {
+            nearestHit = std::min(nearestHit, std::max(0.0F, rayDistance));
+        }
+    }
+
+    if (nearestHit != std::numeric_limits<float>::max() && std::isfinite(nearestHit)) {
+        return nearestHit;
+    }
+
+    float furthestProjection = -std::numeric_limits<float>::max();
+    for (const auto& vertex : polygon) {
+        furthestProjection = std::max(furthestProjection, glm::dot(glm::vec2{vertex.x, vertex.y}, rayDirection));
+    }
+    const float supportDistance = furthestProjection - glm::dot(origin, rayDirection);
+    return std::isfinite(supportDistance) ? std::max(0.0F, supportDistance) : 0.0F;
+}
+
 constexpr float kRippleTwoPi = 6.28318530718F;
 
 float Fract01(float value) {
@@ -3539,41 +4076,115 @@ float RuntimeRippleRainRingValue(
 
 float RuntimeRippleTideBandsValue(
     const glm::vec2& uv,
+    float shoreDistance,
+    float edgeBlendWidth,
     float wavelength,
     float warp,
     float turbulence,
+    float density,
     float seed,
     float phase) {
     const float travelDistance = std::max(wavelength, 0.015F);
     const float t = -phase;
-    const float tidePhase = t * 0.082F * kRippleTwoPi;
-    const float cycle = 0.5F - 0.5F * std::cos(tidePhase);
-    const float motion = std::sin(tidePhase);
-    const float motionDirection = motion >= 0.0F ? 1.0F : -1.0F;
-    const float travel = (cycle * 2.0F - 1.0F) * travelDistance;
+    const float density01 = std::clamp(density, 0.0F, 1.0F);
+    const float turbulence01 = std::clamp(turbulence, 0.0F, 1.0F);
+    const float clampedWarp = std::clamp(warp, 0.0F, 2.0F);
     const float lateralScale = std::max(wavelength * 1.35F, 0.012F);
-    const float scallopNoise = RuntimeRippleSmoothBlockNoise(
-        glm::vec2{uv.y, t * 0.035F + seed * 0.13F},
-        std::max(wavelength * 0.48F, 0.008F),
-        seed,
-        151.0F);
-    const float frontWarp =
-        (std::sin((uv.y / lateralScale) + seed * 1.17F + t * 0.028F) * 0.62F +
-         std::sin((uv.y / std::max(wavelength * 0.58F, 0.006F)) - seed * 0.73F + t * 0.019F) * 0.28F +
-         (scallopNoise - 0.5F) * 1.15F) *
-        wavelength * (0.08F + std::clamp(warp, 0.0F, 8.0F) * 0.10F + turbulence * 0.06F);
-    const float front = uv.x - travel - frontWarp;
-    const float frontWidth = std::max(wavelength * (0.050F + turbulence * 0.028F), 0.003F);
-    const float crest = RippleLine(front, frontWidth);
-    const float trailDistance = std::max(0.0F, -front * motionDirection);
-    const float trailLength = std::max(wavelength * (0.42F + turbulence * 0.34F), frontWidth * 5.0F);
-    const float trailingFoam =
-        std::exp(-trailDistance / std::max(trailLength, 1.0e-4F)) *
-        SmoothStep(frontWidth * 0.40F, frontWidth * 1.80F, trailDistance) *
-        (1.0F - SmoothStep(trailLength, trailLength * 1.65F, trailDistance));
-    const float shoreBreakup = SmoothStep(0.24F, 0.92F, scallopNoise + turbulence * 0.22F);
-    const float calmMotion = 0.62F + 0.28F * std::abs(motion);
-    return Clamp01((crest * (0.72F + shoreBreakup * 0.28F) + trailingFoam * shoreBreakup * 0.32F) * calmMotion);
+    const float frontWidth = std::max(wavelength * (0.046F + turbulence01 * 0.026F), 0.003F);
+    const float trailLength = std::max(wavelength * (1.05F + turbulence01 * 0.68F), frontWidth * 7.0F);
+    constexpr float incomingShare = 0.58F;
+    constexpr float returnShare = 0.30F;
+    const float waveRate = 0.070F + density01 * 0.045F;
+    const float warpGuard = wavelength * (0.18F + clampedWarp * 0.16F + turbulence01 * 0.08F);
+    const float finishOffset = std::max(edgeBlendWidth, edgeBlendWidth + warpGuard);
+    float combined = 0.0F;
+
+    for (int waveIndex = 0; waveIndex < 4; ++waveIndex) {
+        const float slot = static_cast<float>(waveIndex);
+        const float slotSeed = seed + slot * 53.17F;
+        const float timingNoise = RuntimeRippleHash(slotSeed * 0.071F + 11.0F);
+        const float speedNoise = std::lerp(0.76F, 1.26F, RuntimeRippleHash(slotSeed * 0.097F + 23.0F));
+        const float waveGate = RuntimeRippleHash(slotSeed * 0.113F + 31.0F);
+        if (waveGate > std::lerp(0.62F, 1.0F, density01)) {
+            continue;
+        }
+
+        const float offset =
+            slot * 0.235F +
+            (timingNoise - 0.5F) * (0.12F + turbulence01 * 0.10F) +
+            RuntimeRippleSmoothBlockNoise(glm::vec2{t * 0.018F, slotSeed}, 0.23F, seed, 181.0F) * 0.10F;
+        const float cycle = Fract01(t * waveRate * speedNoise + offset);
+        constexpr float activeEnd = incomingShare + returnShare;
+        if (cycle >= activeEnd) {
+            continue;
+        }
+
+        const float scallopNoise = RuntimeRippleSmoothBlockNoise(
+            glm::vec2{uv.y + slot * wavelength * 0.37F, seed * 0.13F + slot * 0.41F},
+            std::max(wavelength * 0.48F, 0.008F),
+            seed,
+            151.0F + slot * 19.0F);
+        const float frontWarp =
+            (std::sin((uv.y / lateralScale) + seed * 1.17F + slot * 1.91F) * 0.62F +
+             std::sin((uv.y / std::max(wavelength * 0.58F, 0.006F)) - seed * 0.73F + slot * 2.37F) * 0.28F +
+             (scallopNoise - 0.5F) * 1.15F) *
+            wavelength * (0.08F + clampedWarp * 0.10F + turbulence01 * 0.06F);
+        const float x = finishOffset - std::max(0.0F, shoreDistance) - frontWarp;
+        const float waveTravel =
+            travelDistance * std::lerp(1.38F, 1.82F, RuntimeRippleHash(slotSeed * 0.061F + 47.0F));
+        const float offshoreStart = -waveTravel * (0.72F + timingNoise * 0.18F);
+        constexpr float shoreEnd = 0.0F;
+        const float shoreBreakup = SmoothStep(0.24F, 0.92F, scallopNoise + turbulence01 * 0.22F);
+        const float foamNoise = RuntimeRippleSmoothBlockNoise(
+            glm::vec2{x * 0.37F + slot * 0.19F, uv.y + slot * 0.31F},
+            std::max(wavelength * 0.35F, 0.006F),
+            seed,
+            203.0F + slot * 23.0F);
+        const float breakup = SmoothStep(
+            0.18F,
+            0.96F,
+            foamNoise + shoreBreakup * 0.45F + turbulence01 * 0.18F);
+        const float shorewardMask =
+            1.0F - SmoothStep(frontWidth * 0.45F, frontWidth * 2.20F, x - shoreEnd);
+
+        if (cycle < incomingShare) {
+            const float incomingProgress = SmoothStep(0.0F, 1.0F, cycle / incomingShare);
+            const float frontPosition = std::lerp(offshoreStart, shoreEnd, incomingProgress);
+            const float front = x - frontPosition;
+            const float crest = RippleLine(front, frontWidth);
+            const float trailDistance = std::max(0.0F, -front);
+            const float trailingFoam =
+                std::exp(-trailDistance / std::max(trailLength, 1.0e-4F)) *
+                SmoothStep(frontWidth * 0.35F, frontWidth * 1.70F, trailDistance) *
+                (1.0F - SmoothStep(trailLength * 1.08F, trailLength * 2.15F, trailDistance));
+            const float crestFade =
+                SmoothStep(0.02F, 0.18F, cycle) *
+                (1.0F - SmoothStep(0.91F, 1.0F, incomingProgress));
+            const float value =
+                crest * (0.78F + shoreBreakup * 0.24F) * crestFade +
+                trailingFoam * (0.30F + density01 * 0.18F) * breakup;
+            combined = std::max(combined, value * shorewardMask);
+        } else {
+            const float returnProgress = SmoothStep(0.0F, 1.0F, (cycle - incomingShare) / returnShare);
+            const float returnDistance = waveTravel * 0.50F;
+            const float clearFront = shoreEnd - returnDistance * returnProgress;
+            const float front = x - clearFront;
+            const float remainingMask = 1.0F - SmoothStep(-frontWidth * 1.25F, frontWidth * 1.55F, front);
+            const float trailDistance = std::max(0.0F, shoreEnd - x);
+            const float heldFoam =
+                std::exp(-trailDistance / std::max(trailLength, 1.0e-4F)) *
+                SmoothStep(frontWidth * 0.35F, frontWidth * 1.70F, trailDistance) *
+                (1.0F - SmoothStep(trailLength * 1.08F, trailLength * 2.15F, trailDistance));
+            const float clearCrest = RippleLine(front, frontWidth * 1.15F);
+            const float returnFade = 1.0F - SmoothStep(0.45F, 1.0F, returnProgress);
+            const float value =
+                heldFoam * remainingMask * (0.32F + density01 * 0.18F) * breakup * returnFade +
+                clearCrest * (0.34F + shoreBreakup * 0.16F) * returnFade;
+            combined = std::max(combined, value * shorewardMask);
+        }
+    }
+
+    return Clamp01(combined);
 }
 
 float RuntimeRippleWetSheenValue(
@@ -4245,6 +4856,8 @@ float RuntimeRipplePatternValue(
     const glm::vec2& regionUv,
     const glm::vec3& normal,
     float edge,
+    float shoreDistance,
+    float edgeBlendWidth,
     float wavelength,
     float warp,
     float turbulence,
@@ -4262,7 +4875,7 @@ float RuntimeRipplePatternValue(
         case WaterRippleOverlayType::RainRings:
             return RuntimeRippleRainRingValue(regionUv, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::TideBands:
-            return RuntimeRippleTideBandsValue(uv, wavelength, warp, turbulence, seed, phase);
+            return RuntimeRippleTideBandsValue(uv, shoreDistance, edgeBlendWidth, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::WetSheen:
             return RuntimeRippleWetSheenValue(uv, normal, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::CurrentThreads:
@@ -4296,6 +4909,7 @@ RipplePatternResult EvaluateRipplePattern(
     const glm::vec3& regionCenter,
     float edge,
     float edgeDistance,
+    float shoreDistance,
     std::uint32_t pointIndex) {
     RipplePatternResult result;
     result.tangent = baseTangent;
@@ -4325,6 +4939,8 @@ RipplePatternResult EvaluateRipplePattern(
         relative.x * scale,
         relative.y * scale,
     };
+    const float scaledShoreDistance = std::max(0.0F, shoreDistance) * scale;
+    const float scaledEdgeBlendWidth = layer.edgeBlendWidth * scale;
     const float wavelength = std::max(0.005F, pattern.wavelengthMeters);
     const float layerPhase = pattern.phase + RegionHash01(layer.id + layer.seed, 0U, RippleOverlayTypeSalt(layer.rippleOverlayType));
     const float radialDistance = glm::length(uv);
@@ -4377,9 +4993,12 @@ RipplePatternResult EvaluateRipplePattern(
         case WaterRippleOverlayType::TideBands: {
             result.value = RuntimeRippleTideBandsValue(
                 uv,
+                scaledShoreDistance,
+                scaledEdgeBlendWidth,
                 wavelength,
                 std::max(0.0F, pattern.warp),
                 std::max(0.0F, pattern.turbulence),
+                std::clamp(pattern.density, 0.0F, 1.0F),
                 static_cast<float>(seed),
                 layerPhase);
             result.confidence = 0.70F + result.value * 0.30F;
@@ -4477,6 +5096,169 @@ RipplePatternResult EvaluateRipplePattern(
     return result;
 }
 
+struct LaneAnalysisSample {
+    bool available = false;
+    float channelWidth = 0.0F;
+    float speed = 1.0F;
+    float turbulence = 0.0F;
+    float eddyPotential = 0.0F;
+    float ripplePotential = 0.0F;
+    float curvature = 0.0F;
+    float flatness = 0.0F;
+    float confluence = 0.0F;
+    float neighborDensity = 0.0F;
+};
+
+const WaterPathBranchAnalysis* FindPathAnalysisBranch(
+    const WaterPathAnalysisCache* analysis,
+    std::uint32_t branchId) {
+    if (analysis == nullptr || analysis->branches.empty()) {
+        return nullptr;
+    }
+    const auto branchIt = std::find_if(
+        analysis->branches.begin(),
+        analysis->branches.end(),
+        [branchId](const WaterPathBranchAnalysis& branch) {
+            return branch.branchId == branchId && !branch.samples.empty();
+        });
+    return branchIt == analysis->branches.end() ? nullptr : &*branchIt;
+}
+
+LaneAnalysisSample SampleLaneAnalysis(
+    const WaterPathBranchAnalysis* branch,
+    float pathDistance) {
+    LaneAnalysisSample result;
+    if (branch == nullptr || branch->samples.empty()) {
+        return result;
+    }
+
+    const auto& samples = branch->samples;
+    auto sampleAt = [](const WaterPathAnalysisSample& sample) {
+        LaneAnalysisSample value;
+        value.available = true;
+        value.channelWidth = std::max(0.001F, FiniteOr(sample.channelWidth, 0.001F));
+        value.speed = std::max(0.01F, FiniteOr(sample.speed, 1.0F));
+        value.turbulence = ClampFinite01(sample.turbulence);
+        value.eddyPotential = ClampFinite01(sample.eddyPotential);
+        value.ripplePotential = ClampFinite01(sample.ripplePotential);
+        value.curvature = ClampFinite01(sample.curvature);
+        value.flatness = ClampFinite01(sample.flatness);
+        value.confluence = ClampFinite01(sample.confluence);
+        value.neighborDensity = ClampFinite01(sample.neighborDensity);
+        return value;
+    };
+
+    if (samples.size() == 1U || pathDistance <= samples.front().pathDistance) {
+        return sampleAt(samples.front());
+    }
+    if (pathDistance >= samples.back().pathDistance) {
+        return sampleAt(samples.back());
+    }
+
+    const auto rightIt = std::lower_bound(
+        samples.begin(),
+        samples.end(),
+        pathDistance,
+        [](const WaterPathAnalysisSample& sample, float distance) {
+            return sample.pathDistance < distance;
+        });
+    if (rightIt == samples.begin()) {
+        return sampleAt(samples.front());
+    }
+    if (rightIt == samples.end()) {
+        return sampleAt(samples.back());
+    }
+    const auto leftIt = rightIt - 1;
+    const float span = std::max(1.0e-5F, rightIt->pathDistance - leftIt->pathDistance);
+    const float t = Clamp01((pathDistance - leftIt->pathDistance) / span);
+    const auto left = sampleAt(*leftIt);
+    const auto right = sampleAt(*rightIt);
+    result.available = true;
+    result.channelWidth = left.channelWidth + (right.channelWidth - left.channelWidth) * t;
+    result.speed = left.speed + (right.speed - left.speed) * t;
+    result.turbulence = left.turbulence + (right.turbulence - left.turbulence) * t;
+    result.eddyPotential = left.eddyPotential + (right.eddyPotential - left.eddyPotential) * t;
+    result.ripplePotential = left.ripplePotential + (right.ripplePotential - left.ripplePotential) * t;
+    result.curvature = left.curvature + (right.curvature - left.curvature) * t;
+    result.flatness = left.flatness + (right.flatness - left.flatness) * t;
+    result.confluence = left.confluence + (right.confluence - left.confluence) * t;
+    result.neighborDensity = left.neighborDensity + (right.neighborDensity - left.neighborDensity) * t;
+    return result;
+}
+
+float LaneAnalysisGuideInfluence(
+    float turbulence,
+    float laneCrossing,
+    float pathAttraction,
+    float streamLooseness) {
+    const float attractionRelief = 1.0F - std::clamp(pathAttraction, 0.0F, 1.0F);
+    return std::clamp(
+        std::clamp(laneCrossing, 0.0F, 1.0F) * 0.38F +
+            std::clamp(streamLooseness, 0.0F, 1.0F) * 0.30F +
+            attractionRelief * 0.24F +
+            std::clamp(turbulence, 0.0F, 1.0F) * 0.18F,
+        0.0F,
+        1.0F);
+}
+
+float LaneAnalysisSpan(
+    const LaneAnalysisSample& analysis,
+    float fallbackSpan,
+    float streamWidthMeters,
+    float analysisInfluence) {
+    if (!analysis.available) {
+        return fallbackSpan;
+    }
+    const float minimumSpan = std::max(streamWidthMeters * 2.0F, 0.001F);
+    const float channelWidth = std::max(minimumSpan, analysis.channelWidth);
+    if (fallbackSpan <= 1.0e-6F) {
+        return channelWidth;
+    }
+    const float authoredSpan = std::max(minimumSpan, fallbackSpan);
+    const float guideInfluence = std::clamp(analysisInfluence, 0.0F, 1.0F);
+    const float cappedChannelWidth =
+        std::min(channelWidth, authoredSpan * (1.0F + guideInfluence * 12.0F));
+    return std::max(
+        minimumSpan,
+        authoredSpan + (cappedChannelWidth - authoredSpan) * guideInfluence);
+}
+
+float LaneAnalysisPitch(
+    const LaneAnalysisSample& analysis,
+    float lanePitch,
+    float localSpan,
+    std::uint32_t laneCount) {
+    if (!analysis.available || laneCount <= 1U || localSpan <= 1.0e-6F) {
+        return lanePitch;
+    }
+    return std::max(lanePitch, localSpan / static_cast<float>(laneCount));
+}
+
+float LaneAnalysisWeight(
+    const WaterPathBranchAnalysis* branch,
+    float fallbackSpan,
+    float analysisInfluence) {
+    if (branch == nullptr || branch->samples.empty()) {
+        return 1.0F;
+    }
+    float width = 0.0F;
+    float confluence = 0.0F;
+    for (const auto& sample : branch->samples) {
+        width += std::max(0.001F, FiniteOr(sample.channelWidth, 0.001F));
+        confluence += ClampFinite01(sample.confluence);
+    }
+    const float count = static_cast<float>(branch->samples.size());
+    const float averageWidth = width / count;
+    const float averageConfluence = confluence / count;
+    const float spanReference = std::max(0.001F, fallbackSpan);
+    const float analysisWeight =
+        std::clamp(
+            0.72F + Clamp01(averageWidth / spanReference) * 0.36F + averageConfluence * 0.32F,
+            0.55F,
+            1.65F);
+    return 1.0F + (analysisWeight - 1.0F) * std::clamp(analysisInfluence, 0.0F, 1.0F);
+}
+
 WaterStreamOverlay BuildStreamOverlayFromPaths(
     const std::vector<std::vector<WaterOverlayPoint>>& paths,
     std::uint32_t requestedStreamCount,
@@ -4489,24 +5271,54 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
     std::uint32_t requestedLaneCount,
     float turbulence,
     float laneCrossing,
+    float pathAttraction,
+    float streamSmoothness,
+    float streamLooseness,
     float speedMetersPerSecond,
     std::uint32_t seed,
-    float featureType) {
+    float featureType,
+    const WaterPathAnalysisCache* analysisCache) {
     WaterStreamOverlay overlay;
     if (paths.empty() || requestedStreamCount == 0U) {
         return overlay;
     }
 
+    const float safeStreamWidth = std::max(0.0005F, streamWidthMeters);
+    const float laneSpan = std::max(0.0F, laneSpreadMeters);
+    const float lanePitch = std::max(safeStreamWidth * 0.5F, 0.00025F);
+    const float analysisGuideInfluence =
+        LaneAnalysisGuideInfluence(turbulence, laneCrossing, pathAttraction, streamLooseness);
+
     std::vector<float> pathLengths;
     pathLengths.reserve(paths.size());
+    std::vector<const WaterPathBranchAnalysis*> pathAnalyses;
+    pathAnalyses.reserve(paths.size());
+    std::vector<float> pathWeights;
+    pathWeights.reserve(paths.size());
     float totalLength = 0.0F;
+    float totalWeight = 0.0F;
     for (const auto& path : paths) {
         const float length = PathLengthMeters(path);
         pathLengths.push_back(length);
+        const auto branchId =
+            path.empty()
+                ? 0U
+                : static_cast<std::uint32_t>(std::max(0.0F, std::floor(path.front().flowId + 0.5F)));
+        const auto* analysisBranch = FindPathAnalysisBranch(analysisCache, branchId);
+        pathAnalyses.push_back(analysisBranch);
+        const float pathWeight =
+            std::max(0.0F, length) *
+            LaneAnalysisWeight(analysisBranch, laneSpan, analysisGuideInfluence);
+        pathWeights.push_back(pathWeight);
         totalLength += std::max(0.0F, length);
+        totalWeight += pathWeight;
     }
     if (totalLength <= 1.0e-5F) {
         return overlay;
+    }
+    if (totalWeight <= 1.0e-5F) {
+        totalWeight = totalLength;
+        pathWeights = pathLengths;
     }
 
     const float safeLength = std::clamp(streamLengthMeters, 0.02F, 100.0F);
@@ -4514,9 +5326,6 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
     const std::uint32_t samplesPerStream = std::max<std::uint32_t>(
         2U,
         static_cast<std::uint32_t>(std::ceil(safeLength / safeSpacing)) + 1U);
-    const float safeStreamWidth = std::max(0.0005F, streamWidthMeters);
-    const float laneSpan = std::max(0.0F, laneSpreadMeters);
-    const float lanePitch = std::max(safeStreamWidth * 0.5F, 0.00025F);
     const auto potentialLaneCount =
         requestedLaneCount > 0U
             ? std::max<std::uint32_t>(1U, requestedLaneCount)
@@ -4545,10 +5354,11 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
         const auto routePointCount = std::max<std::uint32_t>(
             2U,
             static_cast<std::uint32_t>(std::ceil(pathLength / safeSpacing)) + 1U);
+        const auto* analysisBranch = pathIndex < pathAnalyses.size() ? pathAnalyses[pathIndex] : nullptr;
         const std::uint32_t streamsForPath = std::max<std::uint32_t>(
             1U,
             static_cast<std::uint32_t>(
-                std::round(static_cast<float>(requestedStreamCount) * (pathLength / totalLength))));
+                std::round(static_cast<float>(requestedStreamCount) * (pathWeights[pathIndex] / totalWeight))));
         const auto branchId = static_cast<std::uint32_t>(
             std::max(0.0F, std::floor(path.front().flowId + 0.5F)));
         const auto sourceId = static_cast<std::uint32_t>(
@@ -4564,6 +5374,15 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 tangent = TangentAtPathDistance(path, routeDistance, safeSpacing * 2.0F);
             }
             tangent = glm::normalize(tangent);
+            const auto localAnalysis = SampleLaneAnalysis(analysisBranch, routeDistance);
+            const float localSpan =
+                LaneAnalysisSpan(localAnalysis, laneSpan, safeStreamWidth, analysisGuideInfluence);
+            const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
+            const float localSpeed = std::max(
+                0.01F,
+                localAnalysis.available
+                    ? speedMetersPerSecond * std::clamp(localAnalysis.speed, 0.10F, 8.0F)
+                    : speedMetersPerSecond);
 
             WaterStreamSample routeSample;
             routeSample.position = FromGlm(ToGlm(anchor.position) + normal * std::max(0.0F, surfaceOffsetMeters));
@@ -4578,7 +5397,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
             routeSample.branchId = static_cast<float>(branchId);
             routeSample.streamDistance = routeDistance;
             routeSample.streamLength = safeLength;
-            routeSample.streamSpeed = std::max(0.01F, speedMetersPerSecond);
+            routeSample.streamSpeed = localSpeed;
             routeSample.streamWidth = std::max(0.0005F, streamWidthMeters);
             routeSample.streamWorldLength = std::max(
                 routeSample.streamWidth * 2.0F,
@@ -4594,8 +5413,8 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 pathLength > 1.0e-5F ? std::clamp(routeDistance / pathLength, 0.0F, 1.0F) : 0.0F;
             routeSample.streamLaneIndex = 0.0F;
             routeSample.streamLaneCount = static_cast<float>(potentialLaneCount);
-            routeSample.streamLanePitch = lanePitch;
-            routeSample.streamLaneSpan = laneSpan;
+            routeSample.streamLanePitch = localPitch;
+            routeSample.streamLaneSpan = localSpan;
             routeSample.streamLaneCrossing = laneCrossingAmount;
             routeSample.streamCrossSeed = RegionHash01(seed + branchId, routeIndex, 7029U);
             IncludeStreamSample(&overlay, routeSample);
@@ -4606,14 +5425,24 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
             const float laneSeed = RegionHash01(seed + branchId, streamId, 7003U);
             const std::uint32_t centerLaneLow = (potentialLaneCount - 1U) / 2U;
             const std::uint32_t centerLaneHigh = potentialLaneCount / 2U;
-            const std::uint32_t baseLaneIndex = laneSeed < 0.5F ? centerLaneLow : centerLaneHigh;
+            const bool analysedRoute = analysisBranch != nullptr;
+            const std::uint32_t baseLaneIndex =
+                analysedRoute
+                    ? std::min<std::uint32_t>(
+                          potentialLaneCount - 1U,
+                          static_cast<std::uint32_t>(std::floor(laneSeed * static_cast<float>(potentialLaneCount))))
+                    : (laneSeed < 0.5F ? centerLaneLow : centerLaneHigh);
             const float baseLaneCenter = laneCenter(baseLaneIndex, potentialLaneCount, laneSpan);
+            const float baseLaneUnit = laneCenter(baseLaneIndex, potentialLaneCount, 1.0F);
             const float laneCellWidth =
                 potentialLaneCount > 0U ? laneSpan / static_cast<float>(potentialLaneCount) : 0.0F;
             const float laneJitterAmplitude =
                 laneSpan <= 1.0e-6F ? 0.0F : std::min(lanePitch, laneCellWidth) * 0.18F;
             const float laneJitter =
                 (RegionHash01(seed + branchId, streamId, 7011U) - 0.5F) * 2.0F * laneJitterAmplitude;
+            const float laneJitterUnit =
+                (RegionHash01(seed + branchId, streamId, 7011U) - 0.5F) *
+                (potentialLaneCount > 1U ? 0.36F / static_cast<float>(potentialLaneCount) : 0.0F);
             const float laneOffset = baseLaneCenter + laneJitter;
             const float streamCrossSeed = RegionHash01(seed + branchId, streamId, 7027U);
             const float maxStart = std::max(0.0F, pathLength - safeLength);
@@ -4639,16 +5468,77 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 } else {
                     lateral = glm::normalize(lateral);
                 }
+                const float pointAge = safeLength > 1.0e-5F ? localDistance / safeLength : 0.0F;
+                const auto localAnalysis = SampleLaneAnalysis(analysisBranch, pathDistance);
+                const float localSpan =
+                    LaneAnalysisSpan(localAnalysis, laneSpan, safeStreamWidth, analysisGuideInfluence);
+                const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
+                const float localTurbulence =
+                    localAnalysis.available
+                        ? std::clamp(
+                              turbulence + localAnalysis.turbulence * 0.70F * analysisGuideInfluence,
+                              0.0F,
+                              5.0F)
+                        : std::max(0.0F, turbulence);
+                const float motionLooseness =
+                    std::clamp(streamLooseness +
+                                   (localAnalysis.ripplePotential * 0.28F +
+                                    localAnalysis.eddyPotential * 0.20F) *
+                                       analysisGuideInfluence,
+                               0.0F,
+                               1.5F);
+                const float attraction = std::clamp(
+                    pathAttraction -
+                        (localAnalysis.flatness * 0.34F + localAnalysis.confluence * 0.20F) *
+                            analysisGuideInfluence,
+                    0.12F,
+                    1.0F);
+                const float smoothness = std::clamp(streamSmoothness, 0.0F, 1.0F);
+                const float dynamicBaseOffset =
+                    localAnalysis.available
+                        ? (baseLaneUnit + laneJitterUnit) * localSpan * (1.0F - attraction * 0.18F)
+                        : laneOffset;
+                const float wavePhase =
+                    static_cast<float>(sampleIndex) *
+                        (0.43F + localAnalysis.ripplePotential * 0.32F * analysisGuideInfluence) +
+                    streamSeed * 6.28318530718F +
+                    pathDistance * (1.7F + localAnalysis.curvature * 2.2F * analysisGuideInfluence);
                 const float wobbleAmplitude =
-                    std::min(lanePitch * 0.35F, safeStreamWidth * 0.20F) * std::max(0.0F, turbulence);
-                const float wobble =
-                    std::sin((static_cast<float>(sampleIndex) * 0.43F + streamSeed * 6.28318530718F)) *
-                    wobbleAmplitude;
-                const float lateralOffset = laneOffset + wobble;
+                    localAnalysis.available
+                        ? localSpan * (0.015F + motionLooseness * 0.035F) *
+                              (0.25F + localTurbulence +
+                               localAnalysis.ripplePotential * 0.85F * analysisGuideInfluence)
+                        : std::min(lanePitch * 0.35F, safeStreamWidth * 0.20F) * localTurbulence;
+                const float wobble = std::sin(wavePhase) * wobbleAmplitude * (1.0F - smoothness * 0.45F);
+                const float curl =
+                    localAnalysis.available
+                        ? std::cos(
+                              pathDistance * (2.1F + localAnalysis.eddyPotential * 4.0F) +
+                              streamCrossSeed * 6.28318530718F) *
+                              localSpan * 0.12F * localAnalysis.eddyPotential *
+                              (0.35F + localTurbulence) * analysisGuideInfluence
+                        : 0.0F;
+                const float crossing =
+                    localAnalysis.available
+                        ? std::sin(
+                              pointAge * 6.28318530718F +
+                              streamCrossSeed * 6.28318530718F) *
+                              localSpan * 0.10F * laneCrossingAmount *
+                              std::max({localAnalysis.confluence, localAnalysis.ripplePotential, localTurbulence}) *
+                              analysisGuideInfluence
+                        : 0.0F;
+                const float lateralLimit =
+                    localAnalysis.available
+                        ? localSpan * 0.5F *
+                              (1.0F + laneCrossingAmount * 0.18F *
+                                           std::max({localAnalysis.confluence, localAnalysis.ripplePotential, localTurbulence}) *
+                                           analysisGuideInfluence)
+                        : std::numeric_limits<float>::max();
+                const float lateralOffset =
+                    std::clamp(dynamicBaseOffset + wobble + curl + crossing, -lateralLimit, lateralLimit);
                 position += lateral * lateralOffset;
                 position += normal * std::max(0.0F, surfaceOffsetMeters);
 
-                const float pointAge = safeLength > 1.0e-5F ? localDistance / safeLength : 0.0F;
                 WaterStreamSample sample;
                 sample.position = FromGlm(position);
                 sample.normal = FromGlm(normal);
@@ -4668,8 +5558,22 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 sample.streamLength = safeLength;
                 sample.pointAge = pointAge;
                 sample.streamAge = RegionHash01(seed + branchId, streamId, 7019U);
-                sample.streamSpeed = speed;
-                sample.streamWidth = std::max(0.0005F, streamWidthMeters * (0.80F + streamSeed * 0.42F));
+                const float localSpeed =
+                    localAnalysis.available
+                        ? std::max(0.01F, speed * std::clamp(localAnalysis.speed, 0.10F, 8.0F))
+                        : speed;
+                const float localWidthFactor =
+                    localAnalysis.available
+                        ? std::clamp(
+                              0.78F +
+                                  Clamp01(localSpan / std::max(0.001F, laneSpan + safeStreamWidth)) * 0.28F +
+                                  localTurbulence * 0.16F,
+                              0.55F,
+                              1.85F)
+                        : 1.0F;
+                sample.streamSpeed = localSpeed;
+                sample.streamWidth =
+                    std::max(0.0005F, streamWidthMeters * (0.80F + streamSeed * 0.42F) * localWidthFactor);
                 sample.streamWorldLength = std::max(
                     sample.streamWidth * 2.0F,
                     std::max(streamWorldLengthMeters, safeSpacing * 2.5F));
@@ -4685,8 +5589,8 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 sample.streamLateralOffset = lateralOffset;
                 sample.streamLaneIndex = static_cast<float>(baseLaneIndex);
                 sample.streamLaneCount = static_cast<float>(potentialLaneCount);
-                sample.streamLanePitch = lanePitch;
-                sample.streamLaneSpan = laneSpan;
+                sample.streamLanePitch = localPitch;
+                sample.streamLaneSpan = localSpan;
                 sample.streamLaneCrossing = laneCrossingAmount;
                 sample.streamCrossSeed = streamCrossSeed;
                 IncludeStreamSample(&overlay, sample);
@@ -4931,9 +5835,10 @@ constexpr std::array<WaterRipplePatternControlSpec, 6> kRainSpecs{{
     kScaleSpec,
 }};
 
-constexpr std::array<WaterRipplePatternControlSpec, 6> kTideSpecs{{
+constexpr std::array<WaterRipplePatternControlSpec, 7> kTideSpecs{{
     {WaterRipplePatternControl::WavelengthMeters, "Travel Distance", "How far the shoreline wash travels before receding.", 0.03F, 5.0F, true},
     {WaterRipplePatternControl::Speed, "Tide Speed", "Slow in/out tide speed.", 0.0F, 2.0F, false},
+    {WaterRipplePatternControl::Density, "Wave Crowd", "Controls how many staggered shoreline waves arrive before a break.", 0.0F, 1.0F, false},
     {WaterRipplePatternControl::Warp, "Shoreline Warp", "Bends the moving front like an uneven shore.", 0.0F, 2.0F, false},
     {WaterRipplePatternControl::Turbulence, "Foam Breakup", "Adds irregular breakup along the front.", 0.0F, 1.0F, false},
     kDirectionSpec,
@@ -5374,14 +6279,25 @@ WaterStreamOverlay BuildAnimatedWaterTrailOverlay(
         settings.laneCount,
         settings.turbulence,
         settings.laneCrossing,
+        settings.pathAttraction,
+        settings.streamSmoothness,
+        settings.streamLooseness,
         settings.speedMetersPerSecond,
         settings.seed,
-        settings.featureType);
+        settings.featureType,
+        nullptr);
 }
 
 WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFlowStreamSettings& settings) {
+    return BuildFlowStreamOverlayFromPathAnchors(pathAnchors, settings, nullptr);
+}
+
+WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+    const WaterOverlay& pathAnchors,
+    const WaterFlowStreamSettings& settings,
+    const WaterPathAnalysisCache* analysis) {
     if (!settings.enabled) {
         return {};
     }
@@ -5398,23 +6314,32 @@ WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
         path.anchors = anchors;
         paths.push_back(std::move(path));
     }
-    return BuildAnimatedWaterTrailOverlay(
-        paths,
-        {
-            .trailCountTotal = settings.streamCountTotal,
-            .laneCount = settings.laneCount,
-            .trailLengthMeters = settings.streamLengthMeters,
-            .trailPointSpacingMeters = settings.streamPointSpacingMeters,
-            .trailWidthMeters = settings.streamWidthMeters,
-            .trailWorldLengthMeters = settings.streamWorldLengthMeters,
-            .surfaceOffsetMeters = settings.surfaceOffsetMeters,
-            .laneSpreadMeters = settings.laneSpreadMeters,
-            .turbulence = settings.turbulence,
-            .laneCrossing = settings.laneCrossing,
-            .speedMetersPerSecond = settings.speedMetersPerSecond,
-            .seed = settings.seed,
-            .featureType = 0.0F,
-        });
+    std::vector<std::vector<WaterOverlayPoint>> flowPaths;
+    flowPaths.reserve(paths.size());
+    for (const auto& path : paths) {
+        if (path.anchors.size() >= 2U) {
+            flowPaths.push_back(path.anchors);
+        }
+    }
+    return BuildStreamOverlayFromPaths(
+        flowPaths,
+        settings.streamCountTotal,
+        settings.streamLengthMeters,
+        settings.streamPointSpacingMeters,
+        settings.streamWidthMeters,
+        settings.streamWorldLengthMeters,
+        settings.surfaceOffsetMeters,
+        settings.laneSpreadMeters,
+        settings.laneCount,
+        settings.turbulence,
+        settings.laneCrossing,
+        settings.pathAttraction,
+        settings.streamSmoothness,
+        settings.streamLooseness,
+        settings.speedMetersPerSecond,
+        settings.seed,
+        0.0F,
+        analysis);
 }
 
 WaterFieldCache BuildFieldCacheFromPathAnchors(
@@ -6097,6 +7022,7 @@ void IncludeRippleEffectPoint(
     const invisible_places::io::Float3& fieldVector,
     float edgeWeight,
     float edgeDistance,
+    float shoreDistance,
     const glm::vec3& regionCenter) {
     if (overlay == nullptr) {
         return;
@@ -6120,6 +7046,7 @@ void IncludeRippleEffectPoint(
         regionCenter,
         clampedEdgeWeight,
         edgeDistance,
+        shoreDistance,
         pointIndex);
     WaterEffectPoint effect;
     effect.position = sourcePosition;
@@ -6206,6 +7133,10 @@ WaterEffectOverlay GenerateRippleEffectOverlay(
                 selected.fieldVector,
                 selected.edgeWeight,
                 selected.edgeDistance,
+                DirectionalDistanceToRegionEdge(
+                    ToGlm(selected.position),
+                    ToGlm(selected.fieldVector),
+                    selection.boundary),
                 regionCenter);
         }
     }
@@ -6277,6 +7208,7 @@ WaterEffectOverlay GenerateRippleEffectOverlayFromPointIndices(
             FromGlm(fieldVector),
             edgeWeight,
             edgeDistance,
+            DirectionalDistanceToRegionEdge(position, fieldVector, boundary),
             regionCenter);
     }
     return overlay;
@@ -6309,6 +7241,10 @@ WaterEffectOverlay GenerateRippleEffectOverlayFromSelection(
             selected.fieldVector,
             selected.edgeWeight,
             selected.edgeDistance,
+            DirectionalDistanceToRegionEdge(
+                ToGlm(selected.position),
+                ToGlm(selected.fieldVector),
+                selection.boundary),
             regionCenter);
     }
     return overlay;
@@ -6355,6 +7291,10 @@ std::vector<WaterRippleRuntimeMembership> BuildWaterRippleRuntimeMemberships(
         membership.paramIndex = paramIndex;
         membership.edgeDistance = point.edgeDistance;
         membership.seed = RegionHash01(selection.layerId + paramIndex + 1U, point.pointIndex, 901U);
+        membership.shoreDistance = DirectionalDistanceToRegionEdge(
+            ToGlm(point.position),
+            ToGlm(point.fieldVector),
+            selection.boundary);
         memberships.push_back(membership);
     }
     return memberships;
@@ -6386,6 +7326,8 @@ WaterRippleRuntimeContribution EvaluateWaterRippleRuntimeContribution(
         std::max(0.0F, membership.edgeDistance));
     const glm::vec3 relative = position - params.regionCenter;
     const float patternScale = std::clamp(params.patternScale, 0.05F, 100.0F);
+    const float scaledShoreDistance = std::max(0.0F, membership.shoreDistance) * patternScale;
+    const float scaledEdgeBlendWidth = params.edgeBlendWidth * patternScale;
     const glm::vec2 uv{
         glm::dot(relative, tangent) * patternScale,
         glm::dot(relative, lateral) * patternScale,
@@ -6406,6 +7348,8 @@ WaterRippleRuntimeContribution EvaluateWaterRippleRuntimeContribution(
         regionUv,
         normal,
         edgeWeight,
+        scaledShoreDistance,
+        scaledEdgeBlendWidth,
         wavelength,
         std::max(0.0F, params.warp),
         std::max(0.0F, params.turbulence),

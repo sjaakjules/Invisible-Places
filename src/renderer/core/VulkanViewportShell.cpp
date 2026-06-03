@@ -1356,7 +1356,7 @@ void VulkanViewportShell::UploadSparseWaterRippleMembership(
         gpuMembership.data = glm::vec4{
             std::max(0.0F, membership.edgeDistance),
             std::isfinite(membership.seed) ? membership.seed : 0.0F,
-            0.0F,
+            std::isfinite(membership.shoreDistance) ? std::max(0.0F, membership.shoreDistance) : 0.0F,
             0.0F,
         };
         gpuMemberships.push_back(gpuMembership);

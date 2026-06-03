@@ -53,6 +53,9 @@ using invisible_places::water::WaterParticleTrailShapeSettings;
 using invisible_places::water::WaterParticleVisualSettings;
 using invisible_places::water::WaterPathAutoTuneDiagnostics;
 using invisible_places::water::WaterPathBranch;
+using invisible_places::water::WaterPathAnalysisCache;
+using invisible_places::water::WaterPathAnalysisSample;
+using invisible_places::water::WaterPathBranchAnalysis;
 using invisible_places::water::WaterPathBranchRole;
 using invisible_places::water::WaterPathCache;
 using invisible_places::water::WaterPathGenerationSettings;
@@ -2534,6 +2537,94 @@ WaterPathBranch ParseWaterPathBranch(const json& branchJson) {
     return branch;
 }
 
+json SerializeWaterPathAnalysisSample(const WaterPathAnalysisSample& sample) {
+    return json{
+        {"branch_id", sample.branchId},
+        {"sample_index", sample.sampleIndex},
+        {"path_distance", sample.pathDistance},
+        {"slope", sample.slope},
+        {"flatness", sample.flatness},
+        {"curvature", sample.curvature},
+        {"neighbor_density", sample.neighborDensity},
+        {"nearest_path_distance", sample.nearestPathDistance},
+        {"confluence", sample.confluence},
+        {"channel_width", sample.channelWidth},
+        {"speed", sample.speed},
+        {"turbulence", sample.turbulence},
+        {"eddy_potential", sample.eddyPotential},
+        {"ripple_potential", sample.ripplePotential},
+    };
+}
+
+WaterPathAnalysisSample ParseWaterPathAnalysisSample(const json& sampleJson) {
+    WaterPathAnalysisSample sample;
+    sample.branchId = sampleJson.value("branch_id", sample.branchId);
+    sample.sampleIndex = sampleJson.value("sample_index", sample.sampleIndex);
+    sample.pathDistance = sampleJson.value("path_distance", sample.pathDistance);
+    sample.slope = std::clamp(sampleJson.value("slope", sample.slope), 0.0F, 1.0F);
+    sample.flatness = std::clamp(sampleJson.value("flatness", sample.flatness), 0.0F, 1.0F);
+    sample.curvature = std::clamp(sampleJson.value("curvature", sample.curvature), 0.0F, 1.0F);
+    sample.neighborDensity =
+        std::clamp(sampleJson.value("neighbor_density", sample.neighborDensity), 0.0F, 1.0F);
+    sample.nearestPathDistance =
+        std::max(0.0F, sampleJson.value("nearest_path_distance", sample.nearestPathDistance));
+    sample.confluence = std::clamp(sampleJson.value("confluence", sample.confluence), 0.0F, 1.0F);
+    sample.channelWidth = std::max(0.0F, sampleJson.value("channel_width", sample.channelWidth));
+    sample.speed = std::max(0.0F, sampleJson.value("speed", sample.speed));
+    sample.turbulence = std::clamp(sampleJson.value("turbulence", sample.turbulence), 0.0F, 1.0F);
+    sample.eddyPotential = std::clamp(sampleJson.value("eddy_potential", sample.eddyPotential), 0.0F, 1.0F);
+    sample.ripplePotential =
+        std::clamp(sampleJson.value("ripple_potential", sample.ripplePotential), 0.0F, 1.0F);
+    return sample;
+}
+
+json SerializeWaterPathBranchAnalysis(const WaterPathBranchAnalysis& branchAnalysis) {
+    json branchJson{
+        {"branch_id", branchAnalysis.branchId},
+        {"samples", json::array()},
+    };
+    for (const auto& sample : branchAnalysis.samples) {
+        branchJson["samples"].push_back(SerializeWaterPathAnalysisSample(sample));
+    }
+    return branchJson;
+}
+
+WaterPathBranchAnalysis ParseWaterPathBranchAnalysis(const json& branchJson) {
+    WaterPathBranchAnalysis branchAnalysis;
+    branchAnalysis.branchId = branchJson.value("branch_id", branchAnalysis.branchId);
+    if (branchJson.contains("samples") && branchJson.at("samples").is_array()) {
+        for (const auto& sampleJson : branchJson.at("samples")) {
+            branchAnalysis.samples.push_back(ParseWaterPathAnalysisSample(sampleJson));
+        }
+    }
+    return branchAnalysis;
+}
+
+json SerializeWaterPathAnalysisCache(const WaterPathAnalysisCache& analysis) {
+    json analysisJson{
+        {"schema_version", analysis.schemaVersion},
+        {"analysis_radius_meters", analysis.analysisRadiusMeters},
+        {"branches", json::array()},
+    };
+    for (const auto& branchAnalysis : analysis.branches) {
+        analysisJson["branches"].push_back(SerializeWaterPathBranchAnalysis(branchAnalysis));
+    }
+    return analysisJson;
+}
+
+WaterPathAnalysisCache ParseWaterPathAnalysisCache(const json& analysisJson) {
+    WaterPathAnalysisCache analysis;
+    analysis.schemaVersion = analysisJson.value("schema_version", analysis.schemaVersion);
+    analysis.analysisRadiusMeters =
+        std::max(0.0F, analysisJson.value("analysis_radius_meters", analysis.analysisRadiusMeters));
+    if (analysisJson.contains("branches") && analysisJson.at("branches").is_array()) {
+        for (const auto& branchJson : analysisJson.at("branches")) {
+            analysis.branches.push_back(ParseWaterPathBranchAnalysis(branchJson));
+        }
+    }
+    return analysis;
+}
+
 json SerializeWaterPathCache(const WaterPathCache& cache) {
     json cacheJson{
         {"schema_version", cache.schemaVersion},
@@ -2549,6 +2640,9 @@ json SerializeWaterPathCache(const WaterPathCache& cache) {
     };
     for (const auto& branch : cache.branches) {
         cacheJson["branches"].push_back(SerializeWaterPathBranch(branch));
+    }
+    if (cache.analysis.has_value()) {
+        cacheJson["analysis"] = SerializeWaterPathAnalysisCache(cache.analysis.value());
     }
     return cacheJson;
 }
@@ -2577,6 +2671,9 @@ WaterPathCache ParseWaterPathCache(const json& cacheJson) {
         for (const auto& branchJson : cacheJson.at("branches")) {
             cache.branches.push_back(ParseWaterPathBranch(branchJson));
         }
+    }
+    if (cacheJson.contains("analysis")) {
+        cache.analysis = ParseWaterPathAnalysisCache(cacheJson.at("analysis"));
     }
     return cache;
 }

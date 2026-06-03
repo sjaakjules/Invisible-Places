@@ -238,6 +238,7 @@ struct WaterRippleRuntimeMembership {
     std::uint32_t paramIndex = 0;
     float edgeDistance = 0.0F;
     float seed = 0.0F;
+    float shoreDistance = 0.0F;
 };
 
 struct WaterRippleRuntimeParams {
@@ -303,6 +304,13 @@ struct WaterFlowStreamSettings {
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
 };
+
+[[nodiscard]] bool WaterFlowLaneRouteInputsEqual(
+    const WaterFlowStreamSettings& left,
+    const WaterFlowStreamSettings& right);
+[[nodiscard]] bool WaterFlowLaneSpeedOnlyEdit(
+    const WaterFlowStreamSettings& before,
+    const WaterFlowStreamSettings& after);
 
 struct WaterTrailGeometrySettings {
     float trailLengthMeters = 0.75F;
@@ -665,9 +673,12 @@ struct WaterAnimatedTrailBuildSettings {
     float trailWidthMeters = 0.006F;
     float trailWorldLengthMeters = 0.045F;
     float surfaceOffsetMeters = 0.004F;
+    float pathAttraction = 0.85F;
     float laneSpreadMeters = 0.12F;
     float turbulence = 0.06F;
     float laneCrossing = 0.22F;
+    float streamSmoothness = 0.85F;
+    float streamLooseness = 0.08F;
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
     float featureType = 0.0F;
@@ -751,6 +762,34 @@ struct WaterPathBranch {
     std::vector<WaterOverlayPoint> rawAnchors;
 };
 
+struct WaterPathAnalysisSample {
+    std::uint32_t branchId = 0;
+    std::uint32_t sampleIndex = 0;
+    float pathDistance = 0.0F;
+    float slope = 0.0F;
+    float flatness = 0.0F;
+    float curvature = 0.0F;
+    float neighborDensity = 0.0F;
+    float nearestPathDistance = 0.0F;
+    float confluence = 0.0F;
+    float channelWidth = 0.0F;
+    float speed = 0.0F;
+    float turbulence = 0.0F;
+    float eddyPotential = 0.0F;
+    float ripplePotential = 0.0F;
+};
+
+struct WaterPathBranchAnalysis {
+    std::uint32_t branchId = 0;
+    std::vector<WaterPathAnalysisSample> samples;
+};
+
+struct WaterPathAnalysisCache {
+    std::uint32_t schemaVersion = 1;
+    float analysisRadiusMeters = 0.0F;
+    std::vector<WaterPathBranchAnalysis> branches;
+};
+
 struct WaterPathCache {
     std::uint32_t schemaVersion = 2;
     std::filesystem::path supportLayerPath;
@@ -761,6 +800,7 @@ struct WaterPathCache {
     WaterPathAutoTuneDiagnostics diagnostics{};
     std::vector<WaterPathBranch> branches;
     std::vector<std::uint32_t> hiddenBranchIds;
+    std::optional<WaterPathAnalysisCache> analysis;
     bool stale = false;
 };
 
@@ -819,6 +859,10 @@ struct WaterPathCache {
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEmitter>& emitters,
     const WaterSourceSettings& defaultSettings);
+
+[[nodiscard]] WaterPathAnalysisCache BuildWaterPathAnalysis(const WaterPathCache& cache);
+[[nodiscard]] bool WaterPathAnalysisCacheCompatible(const WaterPathCache& cache);
+void EnsureWaterPathAnalysis(WaterPathCache* cache);
 
 [[nodiscard]] std::shared_ptr<const TrailSurfaceIndex> BuildTrailSurfaceIndex(
     const invisible_places::io::LoadedPointCloud& cloud);
@@ -909,6 +953,10 @@ struct WaterPathCache {
 [[nodiscard]] WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFlowStreamSettings& settings);
+[[nodiscard]] WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+    const WaterOverlay& pathAnchors,
+    const WaterFlowStreamSettings& settings,
+    const WaterPathAnalysisCache* analysis);
 [[nodiscard]] WaterFieldCache BuildFieldCacheFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFieldSettings& settings);

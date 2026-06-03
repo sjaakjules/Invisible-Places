@@ -1,6 +1,7 @@
 #include "app/Application.hpp"
 
 #include "app/PointVisualSelection.hpp"
+#include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
 #include "camera/CameraPath.hpp"
 #include "camera/CameraShot.hpp"
@@ -146,6 +147,7 @@ using WaterScaleMode = invisible_places::water::WaterScaleMode;
 using WaterSettingsBundle = invisible_places::water::WaterSettingsBundle;
 using WaterSourceSettingsAssignment = invisible_places::water::WaterSourceSettingsAssignment;
 using WaterSourceSettings = invisible_places::water::WaterSourceSettings;
+using WaterStreamSample = invisible_places::water::WaterStreamSample;
 using WaterStreamOverlay = invisible_places::water::WaterStreamOverlay;
 using WaterTrailBuildDiagnostics = invisible_places::water::WaterTrailBuildDiagnostics;
 using WaterTrailBuildQuality = invisible_places::water::WaterTrailBuildQuality;
@@ -585,6 +587,12 @@ enum class WaterOverlayViewMode {
     Path
 };
 
+enum class WaterPathDebugOverlayMode {
+    PathsAndLaneRoutes,
+    PathsOnly,
+    LaneRoutesOnly
+};
+
 enum class WaterRegionFeature {
     None,
     Ripple,
@@ -617,10 +625,40 @@ struct WaterRegionEditorState {
     bool consumedViewportInputThisFrame = false;
 };
 
+enum WaterPathDebugDiagnosticMask : std::uint32_t {
+    WaterPathDebugDiagnosticSlope = 1U << 0U,
+    WaterPathDebugDiagnosticFlatness = 1U << 1U,
+    WaterPathDebugDiagnosticCurvature = 1U << 2U,
+    WaterPathDebugDiagnosticNeighborDensity = 1U << 3U,
+    WaterPathDebugDiagnosticConfluence = 1U << 4U,
+    WaterPathDebugDiagnosticChannelWidth = 1U << 5U,
+    WaterPathDebugDiagnosticSpeed = 1U << 6U,
+    WaterPathDebugDiagnosticTurbulence = 1U << 7U,
+    WaterPathDebugDiagnosticEddies = 1U << 8U,
+    WaterPathDebugDiagnosticRipples = 1U << 9U,
+};
+
+struct WaterPathDebugSample {
+    invisible_places::io::Float3 position{};
+    float pathDistance = 0.0F;
+    float slope = 0.0F;
+    float flatness = 0.0F;
+    float curvature = 0.0F;
+    float neighborDensity = 0.0F;
+    float confluence = 0.0F;
+    float channelWidth = 0.0F;
+    float speed = 0.0F;
+    float turbulence = 0.0F;
+    float eddies = 0.0F;
+    float ripples = 0.0F;
+    bool hasPathDistance = false;
+    std::uint32_t diagnosticMask = 0U;
+};
+
 struct WaterPathDebugPolyline {
     std::uint32_t branchId = 0;
     bool trailLane = false;
-    std::vector<invisible_places::io::Float3> points;
+    std::vector<WaterPathDebugSample> samples;
 };
 
 struct WaterRegionPointPreview {
@@ -714,6 +752,7 @@ struct WaterWorkflowState {
     WaterAnimationTrailProfileSource activeAnimationTrailProfileSource =
         WaterAnimationTrailProfileSource::Auto;
     WaterFlowStreamSettings flowStreamSettings{};
+    std::optional<WaterFlowStreamSettings> lastInstalledLaneSettings;
     WaterFieldSettings fieldSettings{};
     WaterFieldStreamSettings fieldStreamSettings{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
@@ -728,6 +767,10 @@ struct WaterWorkflowState {
     std::uint64_t fieldCacheRevision = 0;
     std::uint64_t pathDebugCacheRevision = 0;
     std::vector<WaterPathDebugPolyline> pathDebugPolylines;
+    WaterPathDiagnosticColorMode pathDiagnosticColorMode = WaterPathDiagnosticColorMode::Branch;
+    WaterPathDebugOverlayMode pathDebugOverlayMode = WaterPathDebugOverlayMode::PathsAndLaneRoutes;
+    WaterPathDiagnosticRebuildCounters pathDiagnosticRebuildCounters{};
+    WaterPathDiagnosticModeChangeStats pathDiagnosticModeChangeStats{};
     WaterPathCache pathCache{};
     std::shared_ptr<const TrailSurfaceIndex> trailSurfaceIndex;
     std::string trailSurfaceIndexSupportSignature;
@@ -5350,6 +5393,18 @@ const char* WaterOverlayViewModeName(WaterOverlayViewMode mode) {
     return "Trail View";
 }
 
+const char* WaterPathDebugOverlayModeName(WaterPathDebugOverlayMode mode) {
+    switch (mode) {
+        case WaterPathDebugOverlayMode::PathsAndLaneRoutes:
+            return "Paths + Lane Routes";
+        case WaterPathDebugOverlayMode::PathsOnly:
+            return "Paths Only";
+        case WaterPathDebugOverlayMode::LaneRoutesOnly:
+            return "Lane Routes Only";
+    }
+    return "Paths + Lane Routes";
+}
+
 PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
     PointCloudStyleState style;
     style.geometryMode = PointCloudGeometryMode::ScreenSprites;
@@ -5718,6 +5773,28 @@ void ApplyWaterOverlayDisplayStyle(PreviewRuntimeState* runtimeState) {
             session.pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
         }
     }
+}
+
+void SetWaterPathDiagnosticColorMode(
+    PreviewRuntimeState* runtimeState,
+    WaterPathDiagnosticColorMode mode) {
+    if (runtimeState == nullptr || runtimeState->water.pathDiagnosticColorMode == mode) {
+        return;
+    }
+
+    auto& water = runtimeState->water;
+    const auto before = water.pathDiagnosticRebuildCounters;
+    const auto start = std::chrono::steady_clock::now();
+    water.pathDiagnosticColorMode = mode;
+    const auto after = water.pathDiagnosticRebuildCounters;
+    water.pathDiagnosticModeChangeStats = RecordWaterPathDiagnosticModeChange(
+        water.pathDiagnosticModeChangeStats,
+        before,
+        after,
+        std::chrono::steady_clock::now() - start);
+    runtimeState->statusMessage =
+        std::string{"Path View colours set to "} + WaterPathDiagnosticColorModeLabel(mode) + ".";
+    runtimeState->errorMessage.clear();
 }
 
 void ApplyWaterPointVisualStyleToGeneratedSessions(PreviewRuntimeState* runtimeState) {
@@ -6239,9 +6316,20 @@ struct WaterTrailOverlayGroup {
     WaterStreamOverlay overlay;
 };
 
+const invisible_places::water::WaterPathAnalysisCache* FlowPathAnalysisForLanes(
+    const WaterWorkflowState& water) {
+    if (!water.pathCacheLoaded ||
+        !invisible_places::water::WaterPathAnalysisCacheCompatible(water.pathCache) ||
+        !water.pathCache.analysis.has_value()) {
+        return nullptr;
+    }
+    return &water.pathCache.analysis.value();
+}
+
 std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
     const PreviewRuntimeState& runtimeState) {
     std::vector<WaterTrailOverlayGroup> groups;
+    const auto* pathAnalysis = FlowPathAnalysisForLanes(runtimeState.water);
     const auto addOverlay = [&](const SavedWaterTrailProfileState& profile, WaterStreamOverlay overlay) {
         if (overlay.samples.empty()) {
             return;
@@ -6283,7 +6371,7 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
         const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile);
         addOverlay(
             trailProfile,
-            invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, flowSettings));
+            invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, flowSettings, pathAnalysis));
     }
 
     if (!usedEmitterAnchors) {
@@ -6296,7 +6384,8 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
             trailProfile,
             invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
                 runtimeState.water.pathAnchors,
-                flowSettings));
+                flowSettings,
+                pathAnalysis));
     }
     return groups;
 }
@@ -6548,6 +6637,8 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
         sampleCount += group.overlay.samples.size();
         AppendWaterStreamOverlay(&combined, group.overlay);
     }
+    ++runtimeState->water.pathDiagnosticRebuildCounters.laneBuilds;
+    ++runtimeState->water.pathDiagnosticRebuildCounters.trailBuilds;
     StoreLiveWaterFlowStreamOverlay(runtimeState, combined);
     UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
 
@@ -6569,6 +6660,90 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
             group.trailProfile.style);
     }
     return sampleCount;
+}
+
+std::optional<std::size_t> ScalarFieldIndexByName(
+    const std::vector<invisible_places::io::ScalarFieldStats>& fields,
+    std::string_view name) {
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+        if (fields[index].name == name) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+bool ScaleWaterFlowStreamSpeedScalars(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFlowStreamSettings& previousSettings,
+    const WaterFlowStreamSettings& nextSettings) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        previousSettings.speedMetersPerSecond <= 1.0e-6F ||
+        nextSettings.speedMetersPerSecond <= 1.0e-6F ||
+        !invisible_places::water::WaterFlowLaneSpeedOnlyEdit(previousSettings, nextSettings)) {
+        return false;
+    }
+
+    const float speedScale = nextSettings.speedMetersPerSecond / previousSettings.speedMetersPerSecond;
+    if (!std::isfinite(speedScale) || speedScale <= 1.0e-6F) {
+        return false;
+    }
+
+    for (auto& sample : runtimeState->water.flowStreamOverlay.samples) {
+        sample.streamSpeed = std::max(0.01F, sample.streamSpeed * speedScale);
+    }
+
+    bool updatedAny = false;
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+        auto& session = runtimeState->sessions[sessionIndex];
+        const auto stem = session.sourcePath.stem().string();
+        if (!session.loaded ||
+            !IsGeneratedWaterFlowOverlaySession(session) ||
+            (stem.find("-WaterFlowTrails-") == std::string::npos &&
+             !stem.ends_with("-WaterFlowStreams")) ||
+            session.offlinePointCloud == nullptr) {
+            continue;
+        }
+        auto& cloud = *session.offlinePointCloud;
+        const auto speedSlot = ScalarFieldIndexByName(cloud.scalarFields, "stream_speed");
+        if (!speedSlot.has_value() || cloud.PointCount() == 0U) {
+            continue;
+        }
+        const std::size_t expectedValueCount = cloud.scalarFields.size() * cloud.PointCount();
+        if (cloud.scalarFieldValues.size() != expectedValueCount) {
+            continue;
+        }
+        invisible_places::io::ScalarFieldStats speedStats;
+        speedStats.name = "stream_speed";
+        for (std::size_t pointIndex = 0; pointIndex < cloud.PointCount(); ++pointIndex) {
+            const auto valueIndex = cloud.ScalarFieldValueIndex(speedSlot.value(), pointIndex);
+            cloud.scalarFieldValues[valueIndex] = std::max(0.01F, cloud.scalarFieldValues[valueIndex] * speedScale);
+            speedStats.Include(cloud.scalarFieldValues[valueIndex]);
+        }
+        cloud.scalarFields[speedSlot.value()] = speedStats;
+        session.scalarFields = cloud.scalarFields;
+        try {
+            viewport->UploadPointCloudScalarFields(
+                sessionIndex,
+                cloud.scalarFields,
+                cloud.scalarFieldValues);
+        } catch (const std::exception& error) {
+            runtimeState->errorMessage = "Water flow speed scalar update failed: " + std::string{error.what()};
+            return false;
+        }
+        updatedAny = true;
+    }
+
+    if (!updatedAny) {
+        return false;
+    }
+
+    runtimeState->water.lastInstalledLaneSettings = nextSettings;
+    runtimeState->statusMessage =
+        "Water flow speed updated without rebuilding lane routes.";
+    runtimeState->errorMessage.clear();
+    return true;
 }
 
 std::size_t AddOrRefreshWaterEffectOverlaySession(
@@ -7187,6 +7362,7 @@ bool BakeWaterOverlayForActiveLayer(
 
     runtimeState->statusMessage = "Baking water main paths...";
     const auto pathEmitters = WaterEmittersWithResolvedPathProfiles(runtimeState->water);
+    ++runtimeState->water.pathDiagnosticRebuildCounters.pathBakes;
     runtimeState->water.pathCache = invisible_places::water::GenerateWaterPathCache(
         *sourceSession.offlinePointCloud,
         pathEmitters,
@@ -7197,6 +7373,7 @@ bool BakeWaterOverlayForActiveLayer(
     runtimeState->water.pathCache.stale = false;
     runtimeState->water.pathCacheLoaded = true;
     runtimeState->water.pathCacheStale = false;
+    invisible_places::water::EnsureWaterPathAnalysis(&runtimeState->water.pathCache);
     runtimeState->water.pathEditUndoHiddenBranchIds.clear();
     runtimeState->water.selectedPathBranchId.reset();
     runtimeState->water.hoveredPathBranchId.reset();
@@ -7220,6 +7397,7 @@ bool BakeWaterOverlayForActiveLayer(
         viewport,
         sourceSession,
         groups);
+    runtimeState->water.lastInstalledLaneSettings = ViewedGlobalWaterLaneSettings(runtimeState->water);
     runtimeState->water.pathDirty = false;
     runtimeState->water.dirtyEmitterIds.clear();
     runtimeState->statusMessage =
@@ -7252,6 +7430,7 @@ bool RefreshWaterOverlayFromAnchors(
         return false;
     }
     if (runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCache.branches.empty()) {
+        invisible_places::water::EnsureWaterPathAnalysis(&runtimeState->water.pathCache);
         runtimeState->water.pathAnchors = WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
     }
     if (runtimeState->water.pathAnchors.points.empty()) {
@@ -7282,6 +7461,7 @@ bool RefreshWaterOverlayFromAnchors(
         viewport,
         runtimeState->sessions[supportIndex.value()],
         groups);
+    runtimeState->water.lastInstalledLaneSettings = ViewedGlobalWaterLaneSettings(runtimeState->water);
     runtimeState->statusMessage =
         "Water flow trails refreshed with " + FormatPointCount(sampleCount) + " surfels.";
     runtimeState->errorMessage.clear();
@@ -14667,32 +14847,445 @@ std::vector<WaterOverlayPoint> WaterPathDisplayAnchorsForBranch(
     return branch.rawAnchors;
 }
 
-std::vector<invisible_places::io::Float3> DecimateWaterPathPolyline(
-    const std::vector<invisible_places::io::Float3>& points,
+WaterPathDebugSample MakeWaterPathDebugSample(const WaterOverlayPoint& point) {
+    WaterPathDebugSample sample;
+    sample.position = point.position;
+    if (std::isfinite(point.pathDistance)) {
+        sample.pathDistance = std::max(0.0F, point.pathDistance);
+        sample.hasPathDistance = true;
+    }
+    if (std::isfinite(point.surfaceSteepness)) {
+        sample.slope = std::clamp(point.surfaceSteepness, 0.0F, 1.0F);
+        sample.flatness = 1.0F - sample.slope;
+        sample.diagnosticMask |= WaterPathDebugDiagnosticSlope | WaterPathDebugDiagnosticFlatness;
+    }
+    if (std::isfinite(point.pooling) && point.pooling > 0.0F) {
+        sample.flatness = std::max(sample.flatness, std::clamp(point.pooling, 0.0F, 1.0F));
+        sample.diagnosticMask |= WaterPathDebugDiagnosticFlatness;
+    }
+    if (std::isfinite(point.width) && point.width > 0.0F) {
+        sample.channelWidth = point.width;
+        sample.diagnosticMask |= WaterPathDebugDiagnosticChannelWidth;
+    }
+    if (std::isfinite(point.speed) && point.speed > 0.0F) {
+        sample.speed = point.speed;
+        sample.diagnosticMask |= WaterPathDebugDiagnosticSpeed;
+    }
+    return sample;
+}
+
+float WaterPathLaneRouteCenter(std::uint32_t laneIndex, std::uint32_t laneCount, float span) {
+    if (laneCount <= 1U || span <= 1.0e-6F) {
+        return 0.0F;
+    }
+    const auto clampedIndex = std::min(laneIndex, laneCount - 1U);
+    return (((static_cast<float>(clampedIndex) + 0.5F) / static_cast<float>(laneCount)) - 0.5F) * span;
+}
+
+WaterPathDebugSample MakeWaterPathDebugSample(
+    const WaterStreamSample& streamSample,
+    const glm::vec3& position) {
+    WaterPathDebugSample sample;
+    sample.position = FromGlm(position);
+    if (std::isfinite(streamSample.streamDistance)) {
+        sample.pathDistance = std::max(0.0F, streamSample.streamDistance);
+        sample.hasPathDistance = true;
+    }
+    if (std::isfinite(streamSample.streamLaneSpan) && streamSample.streamLaneSpan > 0.0F) {
+        sample.channelWidth = streamSample.streamLaneSpan;
+        sample.diagnosticMask |= WaterPathDebugDiagnosticChannelWidth;
+    }
+    if (std::isfinite(streamSample.streamSpeed) && streamSample.streamSpeed > 0.0F) {
+        sample.speed = streamSample.streamSpeed;
+        sample.diagnosticMask |= WaterPathDebugDiagnosticSpeed;
+    }
+    return sample;
+}
+
+std::vector<WaterPathDebugSample> DecimateWaterPathSamples(
+    const std::vector<WaterPathDebugSample>& samples,
     std::size_t maxPointCount) {
-    if (points.size() <= maxPointCount || maxPointCount < 2U) {
-        return points;
+    if (samples.size() <= maxPointCount || maxPointCount < 2U) {
+        return samples;
     }
 
-    std::vector<invisible_places::io::Float3> decimated;
+    std::vector<WaterPathDebugSample> decimated;
     decimated.reserve(maxPointCount);
-    const double scale = static_cast<double>(points.size() - 1U) / static_cast<double>(maxPointCount - 1U);
+    const double scale = static_cast<double>(samples.size() - 1U) / static_cast<double>(maxPointCount - 1U);
     std::size_t previousIndex = std::numeric_limits<std::size_t>::max();
     for (std::size_t index = 0; index < maxPointCount; ++index) {
         const auto sourceIndex = std::min<std::size_t>(
-            points.size() - 1U,
+            samples.size() - 1U,
             static_cast<std::size_t>(std::round(static_cast<double>(index) * scale)));
         if (sourceIndex != previousIndex) {
-            decimated.push_back(points[sourceIndex]);
+            decimated.push_back(samples[sourceIndex]);
             previousIndex = sourceIndex;
         }
     }
-    if (decimated.back().x != points.back().x ||
-        decimated.back().y != points.back().y ||
-        decimated.back().z != points.back().z) {
-        decimated.back() = points.back();
+    if (decimated.back().position.x != samples.back().position.x ||
+        decimated.back().position.y != samples.back().position.y ||
+        decimated.back().position.z != samples.back().position.z) {
+        decimated.back() = samples.back();
     }
     return decimated;
+}
+
+float DistanceMeters(const invisible_places::io::Float3& left, const invisible_places::io::Float3& right) {
+    const glm::vec3 delta = ToGlm(right) - ToGlm(left);
+    return glm::length(delta);
+}
+
+void SetWaterPathDebugDiagnostic(
+    WaterPathDebugSample* sample,
+    WaterPathDebugDiagnosticMask mask,
+    float value) {
+    if (sample == nullptr || !std::isfinite(value)) {
+        return;
+    }
+    switch (mask) {
+        case WaterPathDebugDiagnosticSlope:
+            sample->slope = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticFlatness:
+            sample->flatness = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticCurvature:
+            sample->curvature = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticNeighborDensity:
+            sample->neighborDensity = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticConfluence:
+            sample->confluence = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticChannelWidth:
+            sample->channelWidth = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticSpeed:
+            sample->speed = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticTurbulence:
+            sample->turbulence = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticEddies:
+            sample->eddies = std::clamp(value, 0.0F, 1.0F);
+            break;
+        case WaterPathDebugDiagnosticRipples:
+            sample->ripples = std::clamp(value, 0.0F, 1.0F);
+            break;
+        default:
+            return;
+    }
+    sample->diagnosticMask |= mask;
+}
+
+float WaterPathDebugCurvatureAt(const std::vector<WaterPathDebugSample>& samples, std::size_t index) {
+    if (index == 0U || index + 1U >= samples.size()) {
+        return 0.0F;
+    }
+    const glm::vec3 previous = ToGlm(samples[index - 1U].position);
+    const glm::vec3 current = ToGlm(samples[index].position);
+    const glm::vec3 next = ToGlm(samples[index + 1U].position);
+    const glm::vec3 incoming = current - previous;
+    const glm::vec3 outgoing = next - current;
+    if (glm::length(incoming) <= 1.0e-5F || glm::length(outgoing) <= 1.0e-5F) {
+        return 0.0F;
+    }
+    const float dotValue = std::clamp(glm::dot(glm::normalize(incoming), glm::normalize(outgoing)), -1.0F, 1.0F);
+    return std::clamp(std::acos(dotValue) / kPi, 0.0F, 1.0F);
+}
+
+float WaterPathDebugSlopeAt(const std::vector<WaterPathDebugSample>& samples, std::size_t index) {
+    if (samples.size() < 2U) {
+        return 0.0F;
+    }
+    const auto previousIndex = index == 0U ? 0U : index - 1U;
+    const auto nextIndex = std::min(samples.size() - 1U, index + 1U);
+    if (previousIndex == nextIndex) {
+        return 0.0F;
+    }
+    const float distance = DistanceMeters(samples[previousIndex].position, samples[nextIndex].position);
+    if (distance <= 1.0e-5F) {
+        return 0.0F;
+    }
+    const float dz = std::abs(samples[nextIndex].position.z - samples[previousIndex].position.z);
+    return std::clamp(dz / std::max(distance, 1.0e-5F), 0.0F, 1.0F);
+}
+
+struct WaterPathDebugCellKey {
+    int x = 0;
+    int y = 0;
+    int z = 0;
+
+    bool operator==(const WaterPathDebugCellKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct WaterPathDebugCellKeyHash {
+    std::size_t operator()(const WaterPathDebugCellKey& key) const {
+        std::uint64_t seed = 1469598103934665603ULL;
+        auto mix = [&seed](int value) {
+            seed ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(value));
+            seed *= 1099511628211ULL;
+        };
+        mix(key.x);
+        mix(key.y);
+        mix(key.z);
+        return static_cast<std::size_t>(seed);
+    }
+};
+
+const invisible_places::water::WaterPathAnalysisSample* WaterPathAnalysisSampleForDebugSample(
+    const WaterPathCache& cache,
+    std::uint32_t branchId,
+    const WaterPathDebugSample& sample) {
+    if (!sample.hasPathDistance ||
+        !invisible_places::water::WaterPathAnalysisCacheCompatible(cache) ||
+        !cache.analysis.has_value()) {
+        return nullptr;
+    }
+    const auto& analysis = cache.analysis.value();
+    const auto branchIt = std::find_if(
+        analysis.branches.begin(),
+        analysis.branches.end(),
+        [branchId](const invisible_places::water::WaterPathBranchAnalysis& branchAnalysis) {
+            return branchAnalysis.branchId == branchId;
+        });
+    if (branchIt == analysis.branches.end() || branchIt->samples.empty()) {
+        return nullptr;
+    }
+
+    const auto sampleIt = std::lower_bound(
+        branchIt->samples.begin(),
+        branchIt->samples.end(),
+        sample.pathDistance,
+        [](const invisible_places::water::WaterPathAnalysisSample& analysisSample, float pathDistance) {
+            return analysisSample.pathDistance < pathDistance;
+        });
+    if (sampleIt == branchIt->samples.begin()) {
+        return &*sampleIt;
+    }
+    if (sampleIt == branchIt->samples.end()) {
+        return &branchIt->samples.back();
+    }
+    const auto previousIt = std::prev(sampleIt);
+    return std::abs(previousIt->pathDistance - sample.pathDistance) <=
+                   std::abs(sampleIt->pathDistance - sample.pathDistance)
+               ? &*previousIt
+               : &*sampleIt;
+}
+
+void ApplyWaterPathAnalysisDiagnosticValues(
+    WaterPathDebugSample* sample,
+    const invisible_places::water::WaterPathAnalysisSample& analysisSample) {
+    if (sample == nullptr) {
+        return;
+    }
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticSlope, analysisSample.slope);
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticFlatness, analysisSample.flatness);
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticCurvature, analysisSample.curvature);
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticNeighborDensity, analysisSample.neighborDensity);
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticConfluence, analysisSample.confluence);
+    if (std::isfinite(analysisSample.channelWidth) && analysisSample.channelWidth > 0.0F) {
+        sample->channelWidth = analysisSample.channelWidth;
+        sample->diagnosticMask |= WaterPathDebugDiagnosticChannelWidth;
+    }
+    if (std::isfinite(analysisSample.speed) && analysisSample.speed >= 0.0F) {
+        sample->speed = analysisSample.speed;
+        sample->diagnosticMask |= WaterPathDebugDiagnosticSpeed;
+    }
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticTurbulence, analysisSample.turbulence);
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticEddies, analysisSample.eddyPotential);
+    SetWaterPathDebugDiagnostic(sample, WaterPathDebugDiagnosticRipples, analysisSample.ripplePotential);
+}
+
+void FinalizeWaterPathDebugDiagnostics(
+    std::vector<WaterPathDebugPolyline>* polylines,
+    const WaterPathCache& cache) {
+    if (polylines == nullptr || polylines->empty()) {
+        return;
+    }
+
+    std::unordered_map<std::uint32_t, const WaterPathBranch*> branchById;
+    branchById.reserve(cache.branches.size());
+    for (const auto& branch : cache.branches) {
+        branchById[branch.id] = &branch;
+    }
+
+    float minWidth = std::numeric_limits<float>::max();
+    float maxWidth = 0.0F;
+    float minSpeed = std::numeric_limits<float>::max();
+    float maxSpeed = 0.0F;
+
+    for (auto& polyline : *polylines) {
+        const auto branchIt = branchById.find(polyline.branchId);
+        const float branchFlatness =
+            branchIt != branchById.end() ? std::clamp(branchIt->second->flatness, 0.0F, 1.0F) : 0.0F;
+        for (std::size_t index = 0; index < polyline.samples.size(); ++index) {
+            auto& sample = polyline.samples[index];
+            if (const auto* analysisSample = WaterPathAnalysisSampleForDebugSample(cache, polyline.branchId, sample);
+                analysisSample != nullptr) {
+                ApplyWaterPathAnalysisDiagnosticValues(&sample, *analysisSample);
+            }
+            const float geometricSlope = WaterPathDebugSlopeAt(polyline.samples, index);
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticSlope) == 0U || sample.slope <= 1.0e-5F) {
+                SetWaterPathDebugDiagnostic(&sample, WaterPathDebugDiagnosticSlope, geometricSlope);
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticFlatness) == 0U) {
+                const float flatness = branchFlatness > 1.0e-5F ? branchFlatness : 1.0F - sample.slope;
+                SetWaterPathDebugDiagnostic(&sample, WaterPathDebugDiagnosticFlatness, flatness);
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticCurvature) == 0U) {
+                SetWaterPathDebugDiagnostic(
+                    &sample,
+                    WaterPathDebugDiagnosticCurvature,
+                    WaterPathDebugCurvatureAt(polyline.samples, index));
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticChannelWidth) != 0U) {
+                minWidth = std::min(minWidth, sample.channelWidth);
+                maxWidth = std::max(maxWidth, sample.channelWidth);
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticSpeed) != 0U) {
+                minSpeed = std::min(minSpeed, sample.speed);
+                maxSpeed = std::max(maxSpeed, sample.speed);
+            }
+        }
+    }
+
+    struct SampleRef {
+        std::size_t polylineIndex = 0;
+        std::size_t sampleIndex = 0;
+        std::uint32_t branchId = 0;
+        glm::vec3 position{};
+    };
+
+    const float radius =
+        std::max(0.02F, cache.diagnostics.branchSearchRadius > 0.0F
+                            ? cache.diagnostics.branchSearchRadius
+                            : std::max(cache.tunedSettings.pathSampleSpacing * 8.0F, 0.12F));
+    const float invCell = 1.0F / radius;
+    auto cellForPosition = [invCell](const glm::vec3& position) {
+        return WaterPathDebugCellKey{
+            .x = static_cast<int>(std::floor(position.x * invCell)),
+            .y = static_cast<int>(std::floor(position.y * invCell)),
+            .z = static_cast<int>(std::floor(position.z * invCell)),
+        };
+    };
+
+    std::vector<SampleRef> refs;
+    std::unordered_map<WaterPathDebugCellKey, std::vector<std::size_t>, WaterPathDebugCellKeyHash> grid;
+    for (std::size_t polylineIndex = 0; polylineIndex < polylines->size(); ++polylineIndex) {
+        const auto& polyline = (*polylines)[polylineIndex];
+        if (polyline.trailLane) {
+            continue;
+        }
+        for (std::size_t sampleIndex = 0; sampleIndex < polyline.samples.size(); ++sampleIndex) {
+            const auto refIndex = refs.size();
+            refs.push_back({
+                .polylineIndex = polylineIndex,
+                .sampleIndex = sampleIndex,
+                .branchId = polyline.branchId,
+                .position = ToGlm(polyline.samples[sampleIndex].position),
+            });
+            grid[cellForPosition(refs.back().position)].push_back(refIndex);
+        }
+    }
+
+    const float radiusSquared = radius * radius;
+    for (const auto& ref : refs) {
+        auto& sample = (*polylines)[ref.polylineIndex].samples[ref.sampleIndex];
+        if ((sample.diagnosticMask & WaterPathDebugDiagnosticNeighborDensity) != 0U) {
+            continue;
+        }
+        float density = 0.0F;
+        const auto cell = cellForPosition(ref.position);
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const auto bucketIt = grid.find({.x = cell.x + dx, .y = cell.y + dy, .z = cell.z + dz});
+                    if (bucketIt == grid.end()) {
+                        continue;
+                    }
+                    for (const auto otherRefIndex : bucketIt->second) {
+                        const auto& other = refs[otherRefIndex];
+                        if (other.branchId == ref.branchId) {
+                            continue;
+                        }
+                        const glm::vec3 delta = other.position - ref.position;
+                        const float distanceSquared = glm::dot(delta, delta);
+                        if (distanceSquared > radiusSquared) {
+                            continue;
+                        }
+                        const float distance = std::sqrt(std::max(0.0F, distanceSquared));
+                        density += 1.0F - std::clamp(distance / radius, 0.0F, 1.0F);
+                    }
+                }
+            }
+        }
+        SetWaterPathDebugDiagnostic(
+            &sample,
+            WaterPathDebugDiagnosticNeighborDensity,
+            std::clamp(density / 3.0F, 0.0F, 1.0F));
+    }
+
+    const float widthRange = maxWidth - minWidth;
+    const float speedRange = maxSpeed - minSpeed;
+    for (auto& polyline : *polylines) {
+        for (std::size_t index = 0; index < polyline.samples.size(); ++index) {
+            auto& sample = polyline.samples[index];
+            float confluence = sample.neighborDensity;
+            std::uint32_t confluenceCount = 1U;
+            if (!polyline.trailLane) {
+                const std::size_t begin = index > 2U ? index - 2U : 0U;
+                const std::size_t end = std::min(polyline.samples.size(), index + 3U);
+                confluence = 0.0F;
+                confluenceCount = 0U;
+                for (std::size_t smoothIndex = begin; smoothIndex < end; ++smoothIndex) {
+                    confluence += polyline.samples[smoothIndex].neighborDensity;
+                    ++confluenceCount;
+                }
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticConfluence) == 0U) {
+                SetWaterPathDebugDiagnostic(
+                    &sample,
+                    WaterPathDebugDiagnosticConfluence,
+                    confluence / static_cast<float>(std::max(1U, confluenceCount)));
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticChannelWidth) != 0U) {
+                const float normalizedWidth =
+                    widthRange > 1.0e-5F
+                        ? (sample.channelWidth - minWidth) / widthRange
+                        : sample.channelWidth / std::max(0.001F, cache.tunedSettings.maxBridgeDistance);
+                SetWaterPathDebugDiagnostic(&sample, WaterPathDebugDiagnosticChannelWidth, normalizedWidth);
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticSpeed) != 0U) {
+                const float normalizedSpeed =
+                    speedRange > 1.0e-5F ? (sample.speed - minSpeed) / speedRange : sample.speed / 3.0F;
+                SetWaterPathDebugDiagnostic(&sample, WaterPathDebugDiagnosticSpeed, normalizedSpeed);
+            }
+            const float turbulence =
+                sample.speed * 0.34F +
+                sample.curvature * 0.28F +
+                sample.confluence * 0.24F +
+                sample.slope * 0.14F;
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticTurbulence) == 0U) {
+                SetWaterPathDebugDiagnostic(&sample, WaterPathDebugDiagnosticTurbulence, turbulence);
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticEddies) == 0U) {
+                SetWaterPathDebugDiagnostic(
+                    &sample,
+                    WaterPathDebugDiagnosticEddies,
+                    sample.curvature * 0.52F + sample.turbulence * 0.30F + sample.confluence * 0.18F);
+            }
+            if ((sample.diagnosticMask & WaterPathDebugDiagnosticRipples) == 0U) {
+                SetWaterPathDebugDiagnostic(
+                    &sample,
+                    WaterPathDebugDiagnosticRipples,
+                    sample.curvature * 0.44F + sample.flatness * 0.22F + sample.turbulence * 0.34F);
+            }
+        }
+    }
 }
 
 void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
@@ -14711,15 +15304,15 @@ void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
     constexpr std::size_t kMaxTotalSamples = 50000U;
 
     auto addPolyline =
-        [&](std::uint32_t branchId, bool trailLane, const std::vector<invisible_places::io::Float3>& points) {
-            if (points.size() < 2U || WaterPathBranchIsHidden(water.pathCache, branchId)) {
+        [&](std::uint32_t branchId, bool trailLane, const std::vector<WaterPathDebugSample>& samples) {
+            if (samples.size() < 2U || WaterPathBranchIsHidden(water.pathCache, branchId)) {
                 return;
             }
             water.pathDebugPolylines.push_back({
                 .branchId = branchId,
                 .trailLane = trailLane,
-                .points = DecimateWaterPathPolyline(
-                    points,
+                .samples = DecimateWaterPathSamples(
+                    samples,
                     trailLane ? kMaxLaneSamples : kMaxMainSamplesPerBranch),
             });
         };
@@ -14735,13 +15328,13 @@ void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
     };
 
     std::optional<PolylineKey> currentKey;
-    std::vector<invisible_places::io::Float3> currentPoints;
+    std::vector<WaterPathDebugSample> currentSamples;
     const auto flushCurrent = [&]() {
         if (currentKey.has_value()) {
-            addPolyline(currentKey->branchId, currentKey->trailLane, currentPoints);
+            addPolyline(currentKey->branchId, currentKey->trailLane, currentSamples);
         }
         currentKey.reset();
-        currentPoints.clear();
+        currentSamples.clear();
     };
 
     for (const auto& point : water.flowOverlay.points) {
@@ -14762,37 +15355,123 @@ void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
             flushCurrent();
         }
         currentKey = key;
-        currentPoints.push_back(point.position);
+        currentSamples.push_back(MakeWaterPathDebugSample(point));
     }
     flushCurrent();
 
-    if (water.pathDebugPolylines.empty() && water.pathCacheLoaded) {
+    std::vector<WaterStreamSample> currentRouteSamples;
+    std::optional<std::uint32_t> currentRouteBranchId;
+    const auto flushRouteLaneGuides = [&]() {
+        if (!currentRouteBranchId.has_value() || currentRouteSamples.size() < 2U) {
+            currentRouteSamples.clear();
+            currentRouteBranchId.reset();
+            return;
+        }
+        std::uint32_t laneCount = 1U;
+        for (const auto& sample : currentRouteSamples) {
+            if (std::isfinite(sample.streamLaneCount)) {
+                laneCount = std::max<std::uint32_t>(
+                    laneCount,
+                    static_cast<std::uint32_t>(std::clamp(
+                        std::lround(sample.streamLaneCount),
+                        1L,
+                        32L)));
+            }
+        }
+        for (std::uint32_t laneIndex = 0; laneIndex < laneCount; ++laneIndex) {
+            std::vector<WaterPathDebugSample> laneSamples;
+            laneSamples.reserve(currentRouteSamples.size());
+            for (const auto& sample : currentRouteSamples) {
+                const auto sampleLaneCount = static_cast<std::uint32_t>(std::clamp(
+                    std::lround(std::isfinite(sample.streamLaneCount) ? sample.streamLaneCount : 1.0F),
+                    1L,
+                    32L));
+                if (laneIndex >= sampleLaneCount) {
+                    continue;
+                }
+                glm::vec3 normal = ToGlm(sample.normal);
+                if (glm::dot(normal, normal) <= 1.0e-8F) {
+                    normal = {0.0F, 0.0F, 1.0F};
+                } else {
+                    normal = glm::normalize(normal);
+                }
+                glm::vec3 tangent = ToGlm(sample.tangent);
+                tangent -= normal * glm::dot(tangent, normal);
+                if (glm::dot(tangent, tangent) <= 1.0e-8F) {
+                    tangent = {1.0F, 0.0F, 0.0F};
+                } else {
+                    tangent = glm::normalize(tangent);
+                }
+                glm::vec3 lateral = glm::cross(normal, tangent);
+                if (glm::dot(lateral, lateral) <= 1.0e-8F) {
+                    lateral = {0.0F, 1.0F, 0.0F};
+                } else {
+                    lateral = glm::normalize(lateral);
+                }
+                const float laneCenter = WaterPathLaneRouteCenter(
+                    laneIndex,
+                    sampleLaneCount,
+                    std::max(0.0F, sample.streamLaneSpan));
+                laneSamples.push_back(MakeWaterPathDebugSample(
+                    sample,
+                    ToGlm(sample.position) + lateral * laneCenter));
+            }
+            addPolyline(currentRouteBranchId.value(), true, laneSamples);
+        }
+        currentRouteSamples.clear();
+        currentRouteBranchId.reset();
+    };
+
+    for (const auto& sample : water.flowStreamOverlay.samples) {
+        if (sample.streamRole >= 0.5F) {
+            continue;
+        }
+        const auto branchId =
+            static_cast<std::uint32_t>(std::max(0.0F, std::floor(sample.branchId + 0.5F)));
+        if (currentRouteBranchId.has_value() && currentRouteBranchId.value() != branchId) {
+            flushRouteLaneGuides();
+        }
+        currentRouteBranchId = branchId;
+        currentRouteSamples.push_back(sample);
+    }
+    flushRouteLaneGuides();
+
+    const bool hasMainPathPolyline = std::any_of(
+        water.pathDebugPolylines.begin(),
+        water.pathDebugPolylines.end(),
+        [](const WaterPathDebugPolyline& polyline) {
+            return !polyline.trailLane;
+        });
+    if (!hasMainPathPolyline && water.pathCacheLoaded) {
         for (const auto& branch : water.pathCache.branches) {
             if (WaterPathBranchIsHidden(water.pathCache, branch.id)) {
                 continue;
             }
             const auto anchors = WaterPathDisplayAnchorsForBranch(*runtimeState, branch);
-            std::vector<invisible_places::io::Float3> points;
-            points.reserve(anchors.size());
+            std::vector<WaterPathDebugSample> samples;
+            samples.reserve(anchors.size());
             for (const auto& anchor : anchors) {
-                points.push_back(anchor.position);
+                samples.push_back(MakeWaterPathDebugSample(anchor));
             }
-            addPolyline(branch.id, false, points);
+            addPolyline(branch.id, false, samples);
         }
     }
 
+    FinalizeWaterPathDebugDiagnostics(&water.pathDebugPolylines, water.pathCache);
+
     std::size_t totalPointCount = 0;
     for (const auto& polyline : water.pathDebugPolylines) {
-        totalPointCount += polyline.points.size();
+        totalPointCount += polyline.samples.size();
     }
     if (totalPointCount > kMaxTotalSamples) {
         const double scale = static_cast<double>(kMaxTotalSamples) / static_cast<double>(totalPointCount);
         for (auto& polyline : water.pathDebugPolylines) {
             const auto scaledLimit = std::max<std::size_t>(
                 2U,
-                static_cast<std::size_t>(std::floor(static_cast<double>(polyline.points.size()) * scale)));
-            polyline.points = DecimateWaterPathPolyline(polyline.points, scaledLimit);
+                static_cast<std::size_t>(std::floor(static_cast<double>(polyline.samples.size()) * scale)));
+            polyline.samples = DecimateWaterPathSamples(polyline.samples, scaledLimit);
         }
+        FinalizeWaterPathDebugDiagnostics(&water.pathDebugPolylines, water.pathCache);
     }
 
     water.pathDebugCacheRevision = water.flowOverlayRevision;
@@ -14813,12 +15492,12 @@ std::optional<std::uint32_t> PickWaterPathBranchAtScreenPoint(
     std::optional<std::uint32_t> bestBranchId;
     float bestDistance = 13.5F;
     for (const auto& polyline : runtimeState->water.pathDebugPolylines) {
-        if (polyline.trailLane || polyline.points.size() < 2U) {
+        if (polyline.trailLane || polyline.samples.size() < 2U) {
             continue;
         }
         std::optional<ImVec2> previous;
-        for (const auto& point : polyline.points) {
-            const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
+        for (const auto& sample : polyline.samples) {
+            const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(sample.position));
             if (!projected.has_value()) {
                 previous.reset();
                 continue;
@@ -14933,6 +15612,117 @@ bool HandleWaterPathViewInput(
     return false;
 }
 
+std::uint32_t WaterPathDiagnosticMaskForMode(WaterPathDiagnosticColorMode mode) {
+    switch (mode) {
+        case WaterPathDiagnosticColorMode::Slope:
+            return WaterPathDebugDiagnosticSlope;
+        case WaterPathDiagnosticColorMode::Flatness:
+            return WaterPathDebugDiagnosticFlatness;
+        case WaterPathDiagnosticColorMode::Curvature:
+            return WaterPathDebugDiagnosticCurvature;
+        case WaterPathDiagnosticColorMode::NeighborDensity:
+            return WaterPathDebugDiagnosticNeighborDensity;
+        case WaterPathDiagnosticColorMode::Confluence:
+            return WaterPathDebugDiagnosticConfluence;
+        case WaterPathDiagnosticColorMode::ChannelWidth:
+            return WaterPathDebugDiagnosticChannelWidth;
+        case WaterPathDiagnosticColorMode::Speed:
+            return WaterPathDebugDiagnosticSpeed;
+        case WaterPathDiagnosticColorMode::Turbulence:
+            return WaterPathDebugDiagnosticTurbulence;
+        case WaterPathDiagnosticColorMode::Eddies:
+            return WaterPathDebugDiagnosticEddies;
+        case WaterPathDiagnosticColorMode::Ripples:
+            return WaterPathDebugDiagnosticRipples;
+        case WaterPathDiagnosticColorMode::Branch:
+            break;
+    }
+    return 0U;
+}
+
+std::optional<float> WaterPathDiagnosticValueForSample(
+    const WaterPathDebugSample& sample,
+    WaterPathDiagnosticColorMode mode) {
+    const auto mask = WaterPathDiagnosticMaskForMode(mode);
+    if (mask == 0U || (sample.diagnosticMask & mask) == 0U) {
+        return std::nullopt;
+    }
+    switch (mode) {
+        case WaterPathDiagnosticColorMode::Slope:
+            return sample.slope;
+        case WaterPathDiagnosticColorMode::Flatness:
+            return sample.flatness;
+        case WaterPathDiagnosticColorMode::Curvature:
+            return sample.curvature;
+        case WaterPathDiagnosticColorMode::NeighborDensity:
+            return sample.neighborDensity;
+        case WaterPathDiagnosticColorMode::Confluence:
+            return sample.confluence;
+        case WaterPathDiagnosticColorMode::ChannelWidth:
+            return sample.channelWidth;
+        case WaterPathDiagnosticColorMode::Speed:
+            return sample.speed;
+        case WaterPathDiagnosticColorMode::Turbulence:
+            return sample.turbulence;
+        case WaterPathDiagnosticColorMode::Eddies:
+            return sample.eddies;
+        case WaterPathDiagnosticColorMode::Ripples:
+            return sample.ripples;
+        case WaterPathDiagnosticColorMode::Branch:
+            break;
+    }
+    return std::nullopt;
+}
+
+struct WaterPathDiagnosticRgb {
+    float red = 0.0F;
+    float green = 0.0F;
+    float blue = 0.0F;
+};
+
+WaterPathDiagnosticRgb MixWaterPathDiagnosticRgb(
+    WaterPathDiagnosticRgb left,
+    WaterPathDiagnosticRgb right,
+    float t) {
+    t = std::clamp(t, 0.0F, 1.0F);
+    return {
+        .red = left.red + ((right.red - left.red) * t),
+        .green = left.green + ((right.green - left.green) * t),
+        .blue = left.blue + ((right.blue - left.blue) * t),
+    };
+}
+
+ImU32 WaterPathDiagnosticColor(
+    WaterPathDiagnosticColorMode mode,
+    const WaterPathDebugSample& sample,
+    ImU32 fallbackColor) {
+    if (mode == WaterPathDiagnosticColorMode::Branch) {
+        return fallbackColor;
+    }
+    const auto value = WaterPathDiagnosticValueForSample(sample, mode);
+    if (!value.has_value()) {
+        return fallbackColor;
+    }
+
+    const float t = std::clamp(value.value(), 0.0F, 1.0F);
+    const WaterPathDiagnosticRgb low{0.12F, 0.28F, 0.92F};
+    const WaterPathDiagnosticRgb mid{0.05F, 0.84F, 0.68F};
+    const WaterPathDiagnosticRgb high{1.0F, 0.56F, 0.10F};
+    const WaterPathDiagnosticRgb peak{1.0F, 0.12F, 0.18F};
+    const auto rgb =
+        t < 0.45F
+            ? MixWaterPathDiagnosticRgb(low, mid, t / 0.45F)
+            : (t < 0.82F
+                   ? MixWaterPathDiagnosticRgb(mid, high, (t - 0.45F) / 0.37F)
+                   : MixWaterPathDiagnosticRgb(high, peak, (t - 0.82F) / 0.18F));
+    const auto alpha = static_cast<int>((fallbackColor >> IM_COL32_A_SHIFT) & 0xFFU);
+    return IM_COL32(
+        static_cast<int>(std::clamp(rgb.red, 0.0F, 1.0F) * 255.0F),
+        static_cast<int>(std::clamp(rgb.green, 0.0F, 1.0F) * 255.0F),
+        static_cast<int>(std::clamp(rgb.blue, 0.0F, 1.0F) * 255.0F),
+        alpha);
+}
+
 void DrawWaterPathDebugOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -14954,7 +15744,14 @@ void DrawWaterPathDebugOverlay(
     }
 
     for (const auto& polyline : runtimeState->water.pathDebugPolylines) {
-        if (polyline.points.size() < 2U) {
+        if (polyline.samples.size() < 2U) {
+            continue;
+        }
+        const bool showPolyline =
+            polyline.trailLane
+                ? runtimeState->water.pathDebugOverlayMode != WaterPathDebugOverlayMode::PathsOnly
+                : runtimeState->water.pathDebugOverlayMode != WaterPathDebugOverlayMode::LaneRoutesOnly;
+        if (!showPolyline) {
             continue;
         }
         const auto branchIt = branchById.find(polyline.branchId);
@@ -14986,6 +15783,10 @@ void DrawWaterPathDebugOverlay(
             color = IM_COL32(255, 255, 255, 255);
             width += 2.2F;
         }
+        const auto colorMode =
+            (!polyline.trailLane && (hovered || selected))
+                ? WaterPathDiagnosticColorMode::Branch
+                : runtimeState->water.pathDiagnosticColorMode;
 
         std::optional<ImVec2> firstPoint;
         const auto strokeCurrentPath = [&](ImU32 strokeColor, float strokeWidth) {
@@ -14996,8 +15797,8 @@ void DrawWaterPathDebugOverlay(
             }
         };
         drawList->PathClear();
-        for (const auto& point : polyline.points) {
-            const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
+        for (const auto& sample : polyline.samples) {
+            const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(sample.position));
             if (!projected.has_value()) {
                 strokeCurrentPath(
                     IM_COL32(0, 0, 0, polyline.trailLane ? 70 : (selected ? 230 : 180)),
@@ -15013,20 +15814,40 @@ void DrawWaterPathDebugOverlay(
         strokeCurrentPath(
             IM_COL32(0, 0, 0, polyline.trailLane ? 70 : (selected ? 230 : 180)),
             width + (polyline.trailLane ? 1.3F : (selected ? 5.0F : 3.2F)));
-        drawList->PathClear();
-        for (const auto& point : polyline.points) {
-            const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
-            if (!projected.has_value()) {
-                strokeCurrentPath(color, width);
-                drawList->PathClear();
-                continue;
+        if (colorMode == WaterPathDiagnosticColorMode::Branch) {
+            drawList->PathClear();
+            for (const auto& sample : polyline.samples) {
+                const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(sample.position));
+                if (!projected.has_value()) {
+                    strokeCurrentPath(color, width);
+                    drawList->PathClear();
+                    continue;
+                }
+                drawList->PathLineTo(projected->screen);
             }
-            drawList->PathLineTo(projected->screen);
+            strokeCurrentPath(color, width);
+        } else {
+            std::optional<ImVec2> previousPoint;
+            for (const auto& sample : polyline.samples) {
+                const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(sample.position));
+                if (!projected.has_value()) {
+                    previousPoint.reset();
+                    continue;
+                }
+                if (previousPoint.has_value()) {
+                    drawList->AddLine(
+                        previousPoint.value(),
+                        projected->screen,
+                        WaterPathDiagnosticColor(colorMode, sample, color),
+                        width);
+                }
+                previousPoint = projected->screen;
+            }
         }
-        strokeCurrentPath(color, width);
         if (!polyline.trailLane && firstPoint.has_value()) {
+            const auto headColor = WaterPathDiagnosticColor(colorMode, polyline.samples.front(), color);
             drawList->AddCircleFilled(firstPoint.value(), selected ? 5.4F : 3.8F, IM_COL32(0, 0, 0, 210), 20);
-            drawList->AddCircleFilled(firstPoint.value(), selected ? 3.6F : 2.5F, color, 20);
+            drawList->AddCircleFilled(firstPoint.value(), selected ? 3.6F : 2.5F, headColor, 20);
         }
     }
 }
@@ -19221,6 +20042,53 @@ void DrawWaterPanel(
                 std::string{"Water viewport set to "} + WaterOverlayViewModeName(water.overlayViewMode) + ".";
             runtimeState->errorMessage.clear();
         }
+        if (water.overlayViewMode == WaterOverlayViewMode::Path) {
+            const auto* selectedOverlayLabel =
+                WaterPathDebugOverlayModeName(water.pathDebugOverlayMode);
+            if (ImGui::BeginCombo("Path Overlay", selectedOverlayLabel)) {
+                constexpr WaterPathDebugOverlayMode overlayModes[] = {
+                    WaterPathDebugOverlayMode::PathsAndLaneRoutes,
+                    WaterPathDebugOverlayMode::PathsOnly,
+                    WaterPathDebugOverlayMode::LaneRoutesOnly,
+                };
+                for (const auto mode : overlayModes) {
+                    const bool selected = water.pathDebugOverlayMode == mode;
+                    if (ImGui::Selectable(WaterPathDebugOverlayModeName(mode), selected)) {
+                        water.pathDebugOverlayMode = mode;
+                        runtimeState->statusMessage =
+                            std::string{"Path overlay set to "} +
+                            WaterPathDebugOverlayModeName(mode) + ".";
+                        runtimeState->errorMessage.clear();
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            const auto* selectedDiagnosticLabel =
+                WaterPathDiagnosticColorModeLabel(water.pathDiagnosticColorMode);
+            if (ImGui::BeginCombo("Path Colour", selectedDiagnosticLabel)) {
+                for (const auto mode : AllWaterPathDiagnosticColorModes()) {
+                    const bool selected = water.pathDiagnosticColorMode == mode;
+                    if (ImGui::Selectable(WaterPathDiagnosticColorModeLabel(mode), selected)) {
+                        SetWaterPathDiagnosticColorMode(runtimeState, mode);
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (water.pathDiagnosticModeChangeStats.changeCount > 0U) {
+                ImGui::TextDisabled(
+                    "Diagnostic switch: %.3f ms, %s",
+                    water.pathDiagnosticModeChangeStats.lastLatencyMs,
+                    water.pathDiagnosticModeChangeStats.lastChangeTouchedRebuildCounters
+                        ? "rebuild counter changed"
+                        : "no path/lane/trail rebuild");
+            }
+        }
 
         if (BeginPanelSection("Source Settings")) {
             auto* selectedEmitter = SelectedWaterEmitter(runtimeState);
@@ -19425,82 +20293,114 @@ void DrawWaterPanel(
         if (BeginPanelSection("Lanes")) {
             DrawWaterLaneProfileSelector(runtimeState);
             auto laneSettings = ViewedGlobalWaterLaneSettings(water);
+            const auto previousLaneSettings = laneSettings;
             bool lanesChanged = false;
+            bool refreshLanes = false;
             const auto laneTooltip = [](const char* text) {
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("%s", text);
                 }
             };
-            lanesChanged |= ImGui::Checkbox("Enabled", &laneSettings.enabled);
+            if (ImGui::Checkbox("Enabled", &laneSettings.enabled)) {
+                lanesChanged = true;
+                refreshLanes = true;
+            }
             laneTooltip("Shows or hides the generated moving flow trails.");
             int trailCount = static_cast<int>(laneSettings.streamCountTotal);
             if (ImGui::SliderInt("Trail Count", &trailCount, 1, 8000)) {
                 laneSettings.streamCountTotal = static_cast<std::uint32_t>(std::max(1, trailCount));
                 lanesChanged = true;
             }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Total number of flow trails to distribute across the baked paths.");
             int laneCount = static_cast<int>(laneSettings.laneCount);
             if (ImGui::SliderInt("Lane Count", &laneCount, 0, 64)) {
                 laneSettings.laneCount = static_cast<std::uint32_t>(std::max(0, laneCount));
                 lanesChanged = true;
             }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Set to 0 to derive lane count from coverage width and Trail width.");
-            lanesChanged |= ImGui::SliderFloat(
+            if (ImGui::SliderFloat(
                 "Lane Cover Width",
                 &laneSettings.laneSpreadMeters,
                 0.0F,
                 1.0F,
-                "%.2f m");
+                "%.2f m")) {
+                lanesChanged = true;
+            }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Total cross-path width covered by the lanes.");
-            lanesChanged |= ImGui::SliderFloat(
+            if (ImGui::SliderFloat(
                 "Lane Crossing",
                 &laneSettings.laneCrossing,
                 0.0F,
                 1.0F,
-                "%.2f");
+                "%.2f")) {
+                lanesChanged = true;
+            }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Chance and strength for trails to ease into neighboring lanes while moving.");
-            lanesChanged |= ImGui::SliderFloat("Turbulence", &laneSettings.turbulence, 0.0F, 1.0F, "%.2f");
+            if (ImGui::SliderFloat("Turbulence", &laneSettings.turbulence, 0.0F, 1.0F, "%.2f")) {
+                lanesChanged = true;
+            }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Small local wobble around each lane.");
-            lanesChanged |= ImGui::SliderFloat(
+            if (ImGui::SliderFloat(
                 "Speed",
                 &laneSettings.speedMetersPerSecond,
                 0.01F,
                 3.0F,
                 "%.2f m/s",
-                ImGuiSliderFlags_Logarithmic);
+                ImGuiSliderFlags_Logarithmic)) {
+                lanesChanged = true;
+            }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("How fast trail points travel along their route.");
-            lanesChanged |= ImGui::SliderFloat(
+            if (ImGui::SliderFloat(
                 "Surface Offset",
                 &laneSettings.surfaceOffsetMeters,
                 -0.20F,
                 0.20F,
-                "%.3f m");
+                "%.3f m")) {
+                lanesChanged = true;
+            }
+            refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
             laneTooltip("Moves lane trails above or below the supporting surface.");
             if (ImGui::TreeNode("Advanced Lane Controls")) {
-                lanesChanged |= ImGui::SliderFloat(
+                if (ImGui::SliderFloat(
                     "Path Attraction",
                     &laneSettings.pathAttraction,
                     0.0F,
                     1.0F,
-                    "%.2f");
-                lanesChanged |= ImGui::SliderFloat(
+                    "%.2f")) {
+                    lanesChanged = true;
+                }
+                refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
+                if (ImGui::SliderFloat(
                     "Lane Smoothness",
                     &laneSettings.streamSmoothness,
                     0.0F,
                     1.0F,
-                    "%.2f");
-                lanesChanged |= ImGui::SliderFloat(
+                    "%.2f")) {
+                    lanesChanged = true;
+                }
+                refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
+                if (ImGui::SliderFloat(
                     "Lane Looseness",
                     &laneSettings.streamLooseness,
                     0.0F,
                     1.0F,
-                    "%.2f");
+                    "%.2f")) {
+                    lanesChanged = true;
+                }
+                refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
                 ImGui::TreePop();
             }
             int seed = static_cast<int>(laneSettings.seed);
             if (ImGui::InputInt("Seed", &seed)) {
                 laneSettings.seed = static_cast<std::uint32_t>(std::max(0, seed));
                 lanesChanged = true;
+                refreshLanes = true;
             }
             laneTooltip("Deterministic random seed for lane placement and crossing.");
             laneSettings.laneSpreadMeters = std::clamp(laneSettings.laneSpreadMeters, 0.0F, 10.0F);
@@ -19514,7 +20414,17 @@ void DrawWaterPanel(
                 water.editedLaneProfileSettings = laneSettings;
                 water.selectedLaneProfileName = EditedWaterProfileName(water.selectedLaneProfileName);
                 water.laneProfileNameBuffer = BaseWaterProfileName(water.selectedLaneProfileName);
-                RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+            }
+            if (refreshLanes) {
+                const auto installedLaneSettings =
+                    water.lastInstalledLaneSettings.value_or(previousLaneSettings);
+                if (!ScaleWaterFlowStreamSpeedScalars(
+                        runtimeState,
+                        viewport,
+                        installedLaneSettings,
+                        laneSettings)) {
+                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+                }
             }
             if (ImGui::Button("Regenerate Lanes")) {
                 RefreshWaterOverlayFromAnchors(runtimeState, viewport);

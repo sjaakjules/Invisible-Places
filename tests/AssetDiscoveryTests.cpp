@@ -1,5 +1,6 @@
 #include "InvisiblePlacesBuildConfig.hpp"
 #include "app/PointVisualSelection.hpp"
+#include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
 #include "camera/CameraPath.hpp"
 #include "camera/CameraShot.hpp"
@@ -36,6 +37,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/geometric.hpp>
 #include <glm/matrix.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1769,6 +1772,10 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     REQUIRE(loadedDocument->waterPathCache->branches[0].rawAnchors.size() == 2U);
     CHECK(loadedDocument->waterPathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(2.5F));
     CHECK(loadedDocument->waterPathCache->hiddenBranchIds == std::vector<std::uint32_t>{99U});
+    auto recomputedProjectCache = loadedDocument->waterPathCache.value();
+    CHECK_FALSE(invisible_places::water::WaterPathAnalysisCacheCompatible(recomputedProjectCache));
+    invisible_places::water::EnsureWaterPathAnalysis(&recomputedProjectCache);
+    CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(recomputedProjectCache));
     REQUIRE(loadedDocument->waterRippleLayers.size() == 1U);
     CHECK(loadedDocument->waterRippleLayers[0].name == "Rock pool caustic lace");
     CHECK(
@@ -3070,6 +3077,200 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
     CHECK(surfaceMotion.points.front().featureType == Catch::Approx(2.0F));
 }
 
+TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][lanes]") {
+    const auto source = invisible_places::water::DefaultWaterSourceSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    auto refreshOnlySource = source;
+    refreshOnlySource.path.smoothing = std::clamp(source.path.smoothing + 0.20F, 0.0F, 1.0F);
+    CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, refreshOnlySource));
+
+    invisible_places::water::WaterFlowStreamSettings lanes;
+    auto speedOnly = lanes;
+    speedOnly.speedMetersPerSecond *= 1.75F;
+    CHECK(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, speedOnly));
+    CHECK(invisible_places::water::WaterFlowLaneSpeedOnlyEdit(lanes, speedOnly));
+
+    auto routeChanging = lanes;
+    routeChanging.laneSpreadMeters *= 2.0F;
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneSpeedOnlyEdit(lanes, routeChanging));
+    CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, source));
+}
+
+TEST_CASE("Calm Water Flow lanes keep path analysis as a bounded guide", "[water][flow][lanes]") {
+    invisible_places::water::WaterOverlay anchors;
+    constexpr std::uint32_t branchId = 77U;
+    for (std::uint32_t index = 0; index < 8U; ++index) {
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = {static_cast<float>(index) * 0.08F, 0.0F, 0.0F};
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = static_cast<float>(branchId);
+        point.emitterId = 11.0F;
+        point.pathDistance = static_cast<float>(index) * 0.08F;
+        point.speed = 1.0F;
+        point.width = 0.060F;
+        point.confidence = 0.95F;
+        point.accumulation = 0.70F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::water::WaterPathAnalysisCache analysis;
+    invisible_places::water::WaterPathBranchAnalysis branchAnalysis;
+    branchAnalysis.branchId = branchId;
+    for (std::uint32_t index = 0; index < 8U; ++index) {
+        invisible_places::water::WaterPathAnalysisSample sample;
+        sample.branchId = branchId;
+        sample.sampleIndex = index;
+        sample.pathDistance = static_cast<float>(index) * 0.08F;
+        sample.slope = 0.18F;
+        sample.flatness = 0.82F;
+        sample.curvature = 0.68F;
+        sample.neighborDensity = 0.95F;
+        sample.nearestPathDistance = 0.020F;
+        sample.confluence = 0.92F;
+        sample.channelWidth = 1.20F;
+        sample.speed = 0.55F;
+        sample.turbulence = 0.88F;
+        sample.eddyPotential = 0.72F;
+        sample.ripplePotential = 0.76F;
+        branchAnalysis.samples.push_back(sample);
+    }
+    analysis.branches.push_back(branchAnalysis);
+
+    invisible_places::water::WaterFlowStreamSettings settings;
+    settings.streamCountTotal = 24U;
+    settings.laneCount = 5U;
+    settings.streamLengthMeters = 0.30F;
+    settings.streamPointSpacingMeters = 0.05F;
+    settings.streamWidthMeters = 0.004F;
+    settings.streamWorldLengthMeters = 0.011F;
+    settings.laneSpreadMeters = 0.080F;
+    settings.laneCrossing = 0.06F;
+    settings.turbulence = 0.015F;
+    settings.pathAttraction = 0.85F;
+    settings.streamLooseness = 0.08F;
+    settings.speedMetersPerSecond = 0.24F;
+    settings.seed = 11U;
+
+    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
+        anchors,
+        settings,
+        &analysis);
+    REQUIRE_FALSE(overlay.samples.empty());
+
+    float maxSpan = 0.0F;
+    float maxAbsOffset = 0.0F;
+    std::size_t visibleCount = 0U;
+    for (const auto& sample : overlay.samples) {
+        if (sample.streamRole < 0.5F) {
+            continue;
+        }
+        maxSpan = std::max(maxSpan, sample.streamLaneSpan);
+        maxAbsOffset = std::max(maxAbsOffset, std::abs(sample.streamLateralOffset));
+        ++visibleCount;
+    }
+    REQUIRE(visibleCount > 0U);
+    CHECK(maxSpan <= settings.laneSpreadMeters * 1.15F);
+    CHECK(maxAbsOffset <= settings.laneSpreadMeters * 0.58F);
+}
+
+TEST_CASE("Water Flow lanes consume path analysis width and speed variation", "[water][flow][lanes]") {
+    invisible_places::water::WaterOverlay anchors;
+    constexpr std::uint32_t branchId = 42U;
+    for (std::uint32_t index = 0; index < 9U; ++index) {
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = {static_cast<float>(index) * 0.10F, 0.0F, 0.0F};
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = static_cast<float>(branchId);
+        point.emitterId = 3.0F;
+        point.pathDistance = static_cast<float>(index) * 0.10F;
+        point.speed = 1.0F;
+        point.width = 0.030F;
+        point.confidence = 0.95F;
+        point.accumulation = 0.65F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::water::WaterPathAnalysisCache analysis;
+    analysis.analysisRadiusMeters = 0.20F;
+    invisible_places::water::WaterPathBranchAnalysis branchAnalysis;
+    branchAnalysis.branchId = branchId;
+    for (std::uint32_t index = 0; index < 9U; ++index) {
+        invisible_places::water::WaterPathAnalysisSample sample;
+        sample.branchId = branchId;
+        sample.sampleIndex = index;
+        sample.pathDistance = static_cast<float>(index) * 0.10F;
+        const bool broadFast = index >= 5U;
+        sample.slope = broadFast ? 0.80F : 0.12F;
+        sample.flatness = broadFast ? 0.20F : 0.82F;
+        sample.curvature = broadFast ? 0.72F : 0.05F;
+        sample.neighborDensity = broadFast ? 0.88F : 0.10F;
+        sample.nearestPathDistance = broadFast ? 0.035F : 0.25F;
+        sample.confluence = broadFast ? 0.82F : 0.04F;
+        sample.channelWidth = broadFast ? 0.260F : 0.026F;
+        sample.speed = broadFast ? 1.85F : 0.42F;
+        sample.turbulence = broadFast ? 0.86F : 0.04F;
+        sample.eddyPotential = broadFast ? 0.72F : 0.02F;
+        sample.ripplePotential = broadFast ? 0.78F : 0.03F;
+        branchAnalysis.samples.push_back(sample);
+    }
+    analysis.branches.push_back(branchAnalysis);
+
+    invisible_places::water::WaterFlowStreamSettings settings;
+    settings.streamCountTotal = 36U;
+    settings.laneCount = 9U;
+    settings.streamLengthMeters = 0.42F;
+    settings.streamPointSpacingMeters = 0.07F;
+    settings.streamWidthMeters = 0.010F;
+    settings.laneSpreadMeters = 0.050F;
+    settings.turbulence = 0.02F;
+    settings.laneCrossing = 0.45F;
+    settings.pathAttraction = 0.72F;
+    settings.streamLooseness = 0.20F;
+    settings.speedMetersPerSecond = 0.55F;
+    settings.seed = 501U;
+
+    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
+        anchors,
+        settings,
+        &analysis);
+    REQUIRE_FALSE(overlay.samples.empty());
+
+    struct LaneStats {
+        float spanSum = 0.0F;
+        float speedSum = 0.0F;
+        float maxAbsOffset = 0.0F;
+        std::size_t count = 0U;
+    };
+    LaneStats upstream;
+    LaneStats downstream;
+    for (const auto& sample : overlay.samples) {
+        if (sample.streamRole < 0.5F) {
+            continue;
+        }
+        const float station = sample.streamStartPhase * sample.routeLength + sample.streamDistance;
+        auto* stats = station < 0.30F ? &upstream : (station > 0.56F ? &downstream : nullptr);
+        if (stats == nullptr) {
+            continue;
+        }
+        stats->spanSum += sample.streamLaneSpan;
+        stats->speedSum += sample.streamSpeed;
+        stats->maxAbsOffset = std::max(stats->maxAbsOffset, std::abs(sample.streamLateralOffset));
+        ++stats->count;
+    }
+    REQUIRE(upstream.count > 0U);
+    REQUIRE(downstream.count > 0U);
+    const float upstreamSpan = upstream.spanSum / static_cast<float>(upstream.count);
+    const float downstreamSpan = downstream.spanSum / static_cast<float>(downstream.count);
+    const float upstreamSpeed = upstream.speedSum / static_cast<float>(upstream.count);
+    const float downstreamSpeed = downstream.speedSum / static_cast<float>(downstream.count);
+    CHECK(downstreamSpan > upstreamSpan * 2.0F);
+    CHECK(downstreamSpeed > upstreamSpeed * 2.0F);
+    CHECK(downstream.maxAbsOffset > upstream.maxAbsOffset * 1.4F);
+}
+
 TEST_CASE("Water ripple overlay types generate distinct procedural effect fields", "[water][v2][ripples]") {
     const auto cloud = MakeRippleFixtureCloud();
     const auto overlayTypes = invisible_places::water::AllWaterRippleOverlayTypes();
@@ -3393,7 +3594,7 @@ TEST_CASE("Runtime ripple Rain Rings produce sparse expanding circular peaks", "
     CHECK(RuntimeSampleMaxDelta(first, later) > 0.20F);
 }
 
-TEST_CASE("Runtime ripple Shoreline is a narrow warped foam front slower than linear ripples", "[water][v2][ripples][runtime]") {
+TEST_CASE("Runtime ripple Shoreline uses warped staggered foam fronts slower than linear ripples", "[water][v2][ripples][runtime]") {
     const auto cloud = MakeRippleRuntimeFixtureCloud();
     auto tideLayer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::TideBands, 103U);
     tideLayer.wavelengthMeters = 0.20F;
@@ -3428,8 +3629,110 @@ TEST_CASE("Runtime ripple Shoreline is a narrow warped foam front slower than li
     }
     REQUIRE(sampledColumns > 10U);
     CHECK(strongestColumnRange > 0.035F);
-    CHECK(RuntimeSampleCountAbove(tideFirst, 0.16F) < tideFirst.size() / 5U);
+    CHECK(RuntimeSampleCountAbove(tideFirst, 0.16F) < (tideFirst.size() * 2U) / 5U);
     CHECK(RuntimeSampleMeanDelta(tideFirst, tideSoon) < RuntimeSampleMeanDelta(linearFirst, linearSoon) * 0.75F);
+}
+
+TEST_CASE("Runtime ripple Shoreline anchors to the local directional jagged edge", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::TideBands, 112U);
+    layer.vertices = {
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        {1.0F, 1.0F, 0.0F},
+        {0.75F, 1.0F, 0.0F},
+        {0.75F, 0.70F, 0.0F},
+        {0.25F, 0.70F, 0.0F},
+        {0.25F, 1.0F, 0.0F},
+        {0.0F, 1.0F, 0.0F},
+    };
+    layer.hull = invisible_places::water::BuildWaterRegionHull(layer.vertices);
+    layer.directionX = 0.0F;
+    layer.directionY = 1.0F;
+    layer.directionZ = 0.0F;
+
+    const auto selection = invisible_places::water::BuildWaterRegionSelection(
+        cloud,
+        layer,
+        invisible_places::water::WaterRegionSelectionOptions{.previewOnly = true});
+    REQUIRE(selection.Valid());
+    const auto memberships = invisible_places::water::BuildWaterRippleRuntimeMemberships(selection, 0U);
+    REQUIRE_FALSE(memberships.empty());
+
+    const auto membershipAt = [&](float x, float y) {
+        return std::find_if(
+            memberships.begin(),
+            memberships.end(),
+            [&](const invisible_places::water::WaterRippleRuntimeMembership& membership) {
+                const auto& position = cloud.positions[membership.pointIndex];
+                return std::abs(position.x - x) <= 1.0e-5F &&
+                       std::abs(position.y - y) <= 1.0e-5F;
+            });
+    };
+
+    const auto notchMembership = membershipAt(0.50F, 0.50F);
+    const auto fullEdgeMembership = membershipAt(0.90F, 0.50F);
+    REQUIRE(notchMembership != memberships.end());
+    REQUIRE(fullEdgeMembership != memberships.end());
+    CHECK(notchMembership->shoreDistance == Catch::Approx(0.20F).margin(0.02F));
+    CHECK(fullEdgeMembership->shoreDistance == Catch::Approx(0.50F).margin(0.02F));
+    CHECK(fullEdgeMembership->shoreDistance > notchMembership->shoreDistance + 0.25F);
+}
+
+TEST_CASE("Runtime ripple Shoreline return consumes the incoming foam tail", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::TideBands, 103U);
+    layer.wavelengthMeters = 0.20F;
+    layer.speed = 1.0F;
+    layer.warp = 0.90F;
+    layer.turbulence = 0.45F;
+    layer.density = 1.0F;
+
+    struct TailBalance {
+        float left = 0.0F;
+        float right = 0.0F;
+        float peak = 0.0F;
+        float peakX = 0.0F;
+    };
+    const auto centralRowTailBalance = [](const std::vector<RuntimeRippleSample>& samples) {
+        TailBalance balance;
+        for (const auto& sample : samples) {
+            if (std::abs(sample.y - 0.50F) > 1.0e-5F) {
+                continue;
+            }
+            if (sample.value > balance.peak) {
+                balance.peak = sample.value;
+                balance.peakX = sample.x;
+            }
+        }
+        for (const auto& sample : samples) {
+            if (std::abs(sample.y - 0.50F) > 1.0e-5F) {
+                continue;
+            }
+            const float distanceFromPeak = std::abs(sample.x - balance.peakX);
+            if (distanceFromPeak <= 0.025F || distanceFromPeak > 0.14F) {
+                continue;
+            }
+            if (sample.x < balance.peakX) {
+                balance.left += sample.value;
+            } else {
+                balance.right += sample.value;
+            }
+        }
+        return balance;
+    };
+
+    std::size_t checkedFrames = 0U;
+    for (const float timeSeconds : {2.0F, 3.7F, 6.5F}) {
+        INFO("timeSeconds=" << timeSeconds);
+        const auto samples = RuntimeRippleSamples(cloud, layer, timeSeconds);
+        const auto balance = centralRowTailBalance(samples);
+        INFO("peakX=" << balance.peakX << " peak=" << balance.peak << " left=" << balance.left << " right=" << balance.right);
+        REQUIRE(balance.peak > 0.16F);
+        CHECK(balance.left > balance.right * 1.08F);
+        ++checkedFrames;
+    }
+    CHECK(checkedFrames == 3U);
 }
 
 TEST_CASE("Runtime ripple Foam Sparkle fades inward from the region edge", "[water][v2][ripples][runtime]") {
@@ -4908,7 +5211,7 @@ TEST_CASE("Offline ripple effect overlays render from virtual effect fields", "[
     const auto sourceCloud = MakeRippleFixtureCloud();
     const auto overlay = invisible_places::water::GenerateRippleEffectOverlay(
         sourceCloud,
-        {MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CausticLace, 31U)});
+        {MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CausticLace, 1U)});
     REQUIRE_FALSE(overlay.points.empty());
 
     const auto cloud = invisible_places::water::BuildWaterEffectOverlayPointCloud(
@@ -4927,6 +5230,15 @@ TEST_CASE("Offline ripple effect overlays render from virtual effect fields", "[
     REQUIRE(emissionFieldIt != cloud.scalarFields.end());
     const auto emissionFieldSlot = static_cast<std::uint32_t>(
         std::distance(cloud.scalarFields.begin(), emissionFieldIt));
+    INFO(
+        "cloud bounds min: " << cloud.bounds.minimum.x << ", " << cloud.bounds.minimum.y << ", " <<
+        cloud.bounds.minimum.z << " max: " << cloud.bounds.maximum.x << ", " << cloud.bounds.maximum.y << ", " <<
+        cloud.bounds.maximum.z);
+    INFO(
+        "ripple_value range: " << cloud.scalarFields[2].minimum << " .. " << cloud.scalarFields[2].maximum);
+    INFO(
+        "ripple_emission_hint range: " << cloud.scalarFields[emissionFieldSlot].minimum << " .. " <<
+        cloud.scalarFields[emissionFieldSlot].maximum);
 
     invisible_places::renderer::pointcloud::PointCloudStyleState style;
     style.geometryMode =
@@ -4977,11 +5289,15 @@ TEST_CASE("Offline ripple effect overlays render from virtual effect fields", "[
 
     invisible_places::output::ExrImage image;
     invisible_places::output::InitializeExrImage(&image, 128, 128);
+    invisible_places::output::OfflinePointRenderDiagnostics diagnostics;
     invisible_places::output::RenderPointCloudTile(
         {layer},
         cameraState,
         invisible_places::output::OfflineRenderTile{0, 0, 128, 128},
-        &image);
+        &image,
+        &diagnostics);
+    INFO("accumulation visited points: " << diagnostics.accumulationVisitedPoints);
+    INFO("accumulation covered pixels: " << diagnostics.accumulationCoveredPixels);
 
     float alphaSum = 0.0F;
     float beautySum = 0.0F;
@@ -5368,6 +5684,269 @@ TEST_CASE("Water trail surface index is reusable for preview and final builds", 
     CHECK(secondPreviewDiagnostics.routedPathCount == previewDiagnostics.routedPathCount);
 }
 
+invisible_places::water::WaterPathBranch MakeSyntheticAnalysisBranch(
+    std::uint32_t branchId,
+    std::uint32_t emitterId,
+    std::vector<invisible_places::io::Float3> positions,
+    invisible_places::water::WaterPathBranchRole role = invisible_places::water::WaterPathBranchRole::Main,
+    std::optional<std::uint32_t> parentId = std::nullopt) {
+    invisible_places::water::WaterPathBranch branch;
+    branch.id = branchId;
+    branch.emitterId = emitterId;
+    branch.role = role;
+    branch.parentId = parentId;
+    branch.confidence = 1.0F;
+    branch.rawAnchors.reserve(positions.size());
+    float distance = 0.0F;
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        if (index > 0U) {
+            const glm::vec3 previous{
+                positions[index - 1U].x,
+                positions[index - 1U].y,
+                positions[index - 1U].z};
+            const glm::vec3 current{positions[index].x, positions[index].y, positions[index].z};
+            distance += glm::length(current - previous);
+        }
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = positions[index];
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = static_cast<float>(branchId);
+        point.emitterId = static_cast<float>(emitterId);
+        point.pathDistance = distance;
+        point.width = 0.035F;
+        point.speed = 1.0F;
+        point.confidence = 1.0F;
+        point.pooling = 0.5F;
+        branch.rawAnchors.push_back(point);
+    }
+    branch.length = distance;
+    return branch;
+}
+
+invisible_places::water::WaterPathCache MakeSyntheticAnalysisCache(
+    std::vector<invisible_places::water::WaterPathBranch> branches) {
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.autoTune = false;
+    settings.supportVoxelSize = 0.02F;
+    settings.maxBridgeDistance = 0.12F;
+    settings.pathSampleSpacing = 0.04F;
+    settings.pathLength = 1.0F;
+    settings.maxSteps = 64U;
+    invisible_places::water::WaterPathCache cache;
+    cache.supportLayerPath = "synthetic-path-analysis.ply";
+    cache.requestedSettings = settings;
+    cache.tunedSettings = settings;
+    cache.diagnostics.pathSampleSpacing = settings.pathSampleSpacing;
+    cache.diagnostics.supportVoxelSize = settings.supportVoxelSize;
+    cache.diagnostics.maxBridgeDistance = settings.maxBridgeDistance;
+    cache.branches = std::move(branches);
+    return cache;
+}
+
+float MeanAnalysisValue(
+    const invisible_places::water::WaterPathAnalysisCache& analysis,
+    float invisible_places::water::WaterPathAnalysisSample::*field) {
+    float sum = 0.0F;
+    std::size_t count = 0U;
+    for (const auto& branch : analysis.branches) {
+        for (const auto& sample : branch.samples) {
+            sum += sample.*field;
+            ++count;
+        }
+    }
+    return count == 0U ? 0.0F : sum / static_cast<float>(count);
+}
+
+float MaxAnalysisValue(
+    const invisible_places::water::WaterPathAnalysisCache& analysis,
+    float invisible_places::water::WaterPathAnalysisSample::*field) {
+    float maximum = 0.0F;
+    for (const auto& branch : analysis.branches) {
+        for (const auto& sample : branch.samples) {
+            maximum = std::max(maximum, sample.*field);
+        }
+    }
+    return maximum;
+}
+
+bool WaterPathAnalysisSamplesFinite(const invisible_places::water::WaterPathAnalysisCache& analysis) {
+    for (const auto& branch : analysis.branches) {
+        for (const auto& sample : branch.samples) {
+            const std::array<float, 11> values{
+                sample.slope,
+                sample.flatness,
+                sample.curvature,
+                sample.neighborDensity,
+                sample.nearestPathDistance,
+                sample.confluence,
+                sample.channelWidth,
+                sample.speed,
+                sample.turbulence,
+                sample.eddyPotential,
+                sample.ripplePotential,
+            };
+            if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); })) {
+                return false;
+            }
+            if (sample.slope < 0.0F || sample.slope > 1.0F ||
+                sample.flatness < 0.0F || sample.flatness > 1.0F ||
+                sample.curvature < 0.0F || sample.curvature > 1.0F ||
+                sample.neighborDensity < 0.0F || sample.neighborDensity > 1.0F ||
+                sample.confluence < 0.0F || sample.confluence > 1.0F ||
+                sample.turbulence < 0.0F || sample.turbulence > 1.0F ||
+                sample.eddyPotential < 0.0F || sample.eddyPotential > 1.0F ||
+                sample.ripplePotential < 0.0F || sample.ripplePotential > 1.0F) {
+                return false;
+            }
+            if (sample.nearestPathDistance < 0.0F || sample.channelWidth <= 0.0F || sample.speed < 0.0F) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+TEST_CASE("Water path analysis separates steep and flat flow values", "[water][path-analysis]") {
+    const auto steepCache = MakeSyntheticAnalysisCache({
+        MakeSyntheticAnalysisBranch(
+            1U,
+            7U,
+            {{0.0F, 0.0F, 1.0F}, {0.0F, 0.18F, 0.78F}, {0.0F, 0.36F, 0.56F}, {0.0F, 0.54F, 0.34F}}),
+    });
+    const auto flatCache = MakeSyntheticAnalysisCache({
+        MakeSyntheticAnalysisBranch(
+            1U,
+            7U,
+            {{0.0F, 0.0F, 1.0F}, {0.0F, 0.18F, 0.99F}, {0.0F, 0.36F, 0.98F}, {0.0F, 0.54F, 0.97F}}),
+    });
+
+    const auto steepAnalysis = invisible_places::water::BuildWaterPathAnalysis(steepCache);
+    const auto flatAnalysis = invisible_places::water::BuildWaterPathAnalysis(flatCache);
+
+    CHECK(WaterPathAnalysisSamplesFinite(steepAnalysis));
+    CHECK(WaterPathAnalysisSamplesFinite(flatAnalysis));
+    CHECK(MeanAnalysisValue(steepAnalysis, &invisible_places::water::WaterPathAnalysisSample::slope) >
+          MeanAnalysisValue(flatAnalysis, &invisible_places::water::WaterPathAnalysisSample::slope) + 0.40F);
+    CHECK(MeanAnalysisValue(flatAnalysis, &invisible_places::water::WaterPathAnalysisSample::flatness) >
+          MeanAnalysisValue(steepAnalysis, &invisible_places::water::WaterPathAnalysisSample::flatness) + 0.35F);
+    CHECK(MeanAnalysisValue(steepAnalysis, &invisible_places::water::WaterPathAnalysisSample::speed) >
+          MeanAnalysisValue(flatAnalysis, &invisible_places::water::WaterPathAnalysisSample::speed) * 1.25F);
+    CHECK(MeanAnalysisValue(flatAnalysis, &invisible_places::water::WaterPathAnalysisSample::channelWidth) >
+          MeanAnalysisValue(steepAnalysis, &invisible_places::water::WaterPathAnalysisSample::channelWidth) * 1.15F);
+}
+
+TEST_CASE("Water path analysis widens nearby confluence branches", "[water][path-analysis]") {
+    const auto closeCache = MakeSyntheticAnalysisCache({
+        MakeSyntheticAnalysisBranch(
+            1U,
+            9U,
+            {{0.0F, 0.0F, 1.0F}, {0.0F, 0.16F, 0.94F}, {0.0F, 0.32F, 0.88F}, {0.0F, 0.48F, 0.82F}}),
+        MakeSyntheticAnalysisBranch(
+            2U,
+            9U,
+            {{0.04F, 0.0F, 1.0F}, {0.04F, 0.16F, 0.94F}, {0.04F, 0.32F, 0.88F}, {0.04F, 0.48F, 0.82F}},
+            invisible_places::water::WaterPathBranchRole::Secondary,
+            1U),
+    });
+    const auto isolatedCache = MakeSyntheticAnalysisCache({
+        MakeSyntheticAnalysisBranch(
+            1U,
+            9U,
+            {{0.0F, 0.0F, 1.0F}, {0.0F, 0.16F, 0.94F}, {0.0F, 0.32F, 0.88F}, {0.0F, 0.48F, 0.82F}}),
+    });
+
+    const auto closeAnalysis = invisible_places::water::BuildWaterPathAnalysis(closeCache);
+    const auto isolatedAnalysis = invisible_places::water::BuildWaterPathAnalysis(isolatedCache);
+
+    CHECK(WaterPathAnalysisSamplesFinite(closeAnalysis));
+    CHECK(MeanAnalysisValue(closeAnalysis, &invisible_places::water::WaterPathAnalysisSample::neighborDensity) > 0.15F);
+    CHECK(MeanAnalysisValue(closeAnalysis, &invisible_places::water::WaterPathAnalysisSample::confluence) > 0.15F);
+    CHECK(MeanAnalysisValue(closeAnalysis, &invisible_places::water::WaterPathAnalysisSample::channelWidth) >
+          MeanAnalysisValue(isolatedAnalysis, &invisible_places::water::WaterPathAnalysisSample::channelWidth) * 1.25F);
+    CHECK(MeanAnalysisValue(closeAnalysis, &invisible_places::water::WaterPathAnalysisSample::nearestPathDistance) <
+          MeanAnalysisValue(isolatedAnalysis, &invisible_places::water::WaterPathAnalysisSample::nearestPathDistance));
+}
+
+TEST_CASE("Water path analysis raises eddies and ripples on curved paths", "[water][path-analysis]") {
+    const auto straightCache = MakeSyntheticAnalysisCache({
+        MakeSyntheticAnalysisBranch(
+            1U,
+            5U,
+            {{0.0F, 0.0F, 1.0F}, {0.12F, 0.0F, 0.95F}, {0.24F, 0.0F, 0.90F}, {0.36F, 0.0F, 0.85F}}),
+    });
+    const auto curvedCache = MakeSyntheticAnalysisCache({
+        MakeSyntheticAnalysisBranch(
+            1U,
+            5U,
+            {{0.0F, 0.0F, 1.0F}, {0.12F, 0.0F, 0.95F}, {0.16F, 0.10F, 0.90F}, {0.08F, 0.18F, 0.85F}, {0.0F, 0.20F, 0.80F}}),
+    });
+
+    const auto straightAnalysis = invisible_places::water::BuildWaterPathAnalysis(straightCache);
+    const auto curvedAnalysis = invisible_places::water::BuildWaterPathAnalysis(curvedCache);
+
+    CHECK(WaterPathAnalysisSamplesFinite(curvedAnalysis));
+    CHECK(MaxAnalysisValue(curvedAnalysis, &invisible_places::water::WaterPathAnalysisSample::curvature) >
+          MaxAnalysisValue(straightAnalysis, &invisible_places::water::WaterPathAnalysisSample::curvature) + 0.20F);
+    CHECK(MaxAnalysisValue(curvedAnalysis, &invisible_places::water::WaterPathAnalysisSample::eddyPotential) >
+          MaxAnalysisValue(straightAnalysis, &invisible_places::water::WaterPathAnalysisSample::eddyPotential) + 0.08F);
+    CHECK(MaxAnalysisValue(curvedAnalysis, &invisible_places::water::WaterPathAnalysisSample::ripplePotential) >
+          MaxAnalysisValue(straightAnalysis, &invisible_places::water::WaterPathAnalysisSample::ripplePotential) + 0.08F);
+}
+
+TEST_CASE("Site3 path analysis fixture parses and bakes when sample data exists", "[water][path-analysis][sample][.]") {
+    const auto fixturePath = DataRoot().parent_path() / "tests" / "water_flow_path_analysis_site3_fixture.json";
+    std::ifstream input{fixturePath};
+    REQUIRE(input.good());
+    const auto fixture = nlohmann::json::parse(input);
+    CHECK(fixture.value("name", std::string{}) == "site3_flow_path_analysis_reference");
+    REQUIRE(fixture.contains("emitter"));
+    REQUIRE(fixture.contains("path_settings"));
+
+    const auto sourcePath = DataRoot().parent_path() / fixture.at("source_path").get<std::string>();
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    const auto& pathSettings = fixture.at("path_settings");
+    settings.autoTune = pathSettings.value("autoTune", settings.autoTune);
+    settings.branching = pathSettings.value("branching", settings.branching);
+    settings.coverage = pathSettings.value("coverage", settings.coverage);
+    settings.gapTolerance = pathSettings.value("gapTolerance", settings.gapTolerance);
+    settings.pathLength = pathSettings.value("pathLength", settings.pathLength);
+    settings.smoothing = pathSettings.value("smoothing", settings.smoothing);
+    settings.supportVoxelSize = pathSettings.value("supportVoxelSize", settings.supportVoxelSize);
+    settings.maxBridgeDistance = pathSettings.value("maxBridgeDistance", settings.maxBridgeDistance);
+    settings.pathSampleSpacing = pathSettings.value("pathSampleSpacing", settings.pathSampleSpacing);
+    settings.maxSteps = pathSettings.value("maxSteps", settings.maxSteps);
+    settings.supportSampleLimit = pathSettings.value("supportSampleLimit", settings.supportSampleLimit);
+
+    const auto& emitterJson = fixture.at("emitter");
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = emitterJson.value("id", 0U);
+    emitter.name = emitterJson.value("name", std::string{"Site3 path analysis source"});
+    const auto position = emitterJson.at("position").get<std::array<float, 3>>();
+    emitter.position = {position[0], position[1], position[2]};
+    emitter.radius = emitterJson.value("radius", emitter.radius);
+    emitter.confidence = emitterJson.value("confidence", emitter.confidence);
+
+    if (!std::filesystem::exists(sourcePath)) {
+        return;
+    }
+
+    const auto loadResult = invisible_places::io::LoadPointCloud(sourcePath);
+    REQUIRE(loadResult.success);
+    auto cache = invisible_places::water::GenerateWaterPathCache(
+        loadResult.cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        settings);
+    REQUIRE_FALSE(cache.branches.empty());
+    invisible_places::water::EnsureWaterPathAnalysis(&cache);
+    REQUIRE(invisible_places::water::WaterPathAnalysisCacheCompatible(cache));
+    REQUIRE(cache.analysis.has_value());
+    CHECK(WaterPathAnalysisSamplesFinite(cache.analysis.value()));
+    CHECK(MeanAnalysisValue(cache.analysis.value(), &invisible_places::water::WaterPathAnalysisSample::channelWidth) > 0.0F);
+    CHECK(MeanAnalysisValue(cache.analysis.value(), &invisible_places::water::WaterPathAnalysisSample::speed) > 0.0F);
+}
+
 TEST_CASE("Water path smoothing changes baked anchor geometry", "[water]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.sourcePath = "synthetic-water-zigzag.ply";
@@ -5585,6 +6164,57 @@ TEST_CASE("Water path bake inputs ignore refresh-only trail and smoothing settin
     bakeChanging = source;
     bakeChanging.path.branching = std::clamp(source.path.branching + 0.2F, 0.0F, 1.0F);
     CHECK_FALSE(invisible_places::water::WaterSourceBakeInputsEqual(source, bakeChanging));
+}
+
+TEST_CASE("Path View diagnostic colour mode changes do not rebuild water paths lanes or trails", "[water][path-view][ui]") {
+    const auto modes = invisible_places::app::AllWaterPathDiagnosticColorModes();
+    REQUIRE(modes.size() == 11U);
+
+    std::vector<std::string> labels;
+    labels.reserve(modes.size());
+    for (const auto mode : modes) {
+        labels.emplace_back(invisible_places::app::WaterPathDiagnosticColorModeLabel(mode));
+    }
+    CHECK(labels == std::vector<std::string>{
+                        "Branch",
+                        "Slope",
+                        "Flatness",
+                        "Curvature",
+                        "Neighbor Density",
+                        "Confluence",
+                        "Channel Width",
+                        "Speed",
+                        "Turbulence",
+                        "Eddies",
+                        "Ripples",
+                    });
+
+    invisible_places::app::WaterPathDiagnosticModeChangeStats stats;
+    const invisible_places::app::WaterPathDiagnosticRebuildCounters before{
+        .pathBakes = 4U,
+        .laneBuilds = 8U,
+        .trailBuilds = 12U,
+    };
+    const auto after = before;
+    stats = invisible_places::app::RecordWaterPathDiagnosticModeChange(
+        stats,
+        before,
+        after,
+        std::chrono::microseconds{275});
+    CHECK(stats.changeCount == 1U);
+    CHECK(stats.lastLatencyMs == Catch::Approx(0.275));
+    CHECK_FALSE(stats.lastChangeTouchedRebuildCounters);
+    CHECK(invisible_places::app::WaterPathDiagnosticRebuildCountersEqual(stats.before, stats.after));
+
+    auto rebuilt = after;
+    ++rebuilt.trailBuilds;
+    stats = invisible_places::app::RecordWaterPathDiagnosticModeChange(
+        stats,
+        after,
+        rebuilt,
+        std::chrono::microseconds{100});
+    CHECK(stats.changeCount == 2U);
+    CHECK(stats.lastChangeTouchedRebuildCounters);
 }
 
 TEST_CASE("Water gap tolerance controls how much bridge upper limit is used", "[water]") {
@@ -5812,6 +6442,9 @@ TEST_CASE("Water path cache tags bridge gaps and round-trips hidden branches", "
         settings);
     CHECK(cache.schemaVersion == 2U);
     REQUIRE_FALSE(cache.branches.empty());
+    REQUIRE(cache.analysis.has_value());
+    CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(cache));
+    CHECK(WaterPathAnalysisSamplesFinite(cache.analysis.value()));
     CHECK(std::any_of(cache.branches.begin(), cache.branches.end(), [](const auto& branch) {
         return branch.gapCount > 0U || branch.confidence < 0.95F;
     }));
@@ -5832,6 +6465,14 @@ TEST_CASE("Water path cache tags bridge gaps and round-trips hidden branches", "
     REQUIRE(loaded->branches.size() == cache.branches.size());
     CHECK(loaded->hiddenBranchIds == cache.hiddenBranchIds);
     CHECK(loaded->branches.front().rawAnchors.size() == cache.branches.front().rawAnchors.size());
+    REQUIRE(loaded->analysis.has_value());
+    CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(loaded.value()));
+    auto legacyCache = loaded.value();
+    legacyCache.analysis.reset();
+    CHECK_FALSE(invisible_places::water::WaterPathAnalysisCacheCompatible(legacyCache));
+    invisible_places::water::EnsureWaterPathAnalysis(&legacyCache);
+    REQUIRE(legacyCache.analysis.has_value());
+    CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(legacyCache));
     std::filesystem::remove(outputPath);
 }
 
@@ -6183,6 +6824,10 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->pathCache->branches[0].id == 77U);
     REQUIRE(loaded->pathCache->branches[0].rawAnchors.size() == 2U);
     CHECK(loaded->pathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(1.75F));
+    auto recomputedSourceCache = loaded->pathCache.value();
+    CHECK_FALSE(invisible_places::water::WaterPathAnalysisCacheCompatible(recomputedSourceCache));
+    invisible_places::water::EnsureWaterPathAnalysis(&recomputedSourceCache);
+    CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(recomputedSourceCache));
     const auto& linkedSettings = invisible_places::water::ResolveWaterSourceSettings(
         loaded->emitters[1],
         loaded->emitters,

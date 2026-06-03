@@ -250,37 +250,104 @@ float RippleRainRingValue(vec2 uv, float wavelength, float warp, float turbulenc
     return clamp(max(best, blend * (0.26 + density01 * 0.18)), 0.0, 1.0);
 }
 
-float RippleTideBandsValue(vec2 uv, float wavelength, float warp, float turbulence, float seed, float phase) {
+float RippleTideBandsValue(vec2 uv, float shoreDistance, float edgeBlendWidth, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
     const float travelDistance = max(wavelength, 0.015);
     const float t = -phase;
-    const float tidePhase = t * 0.082 * kRippleTwoPi;
-    const float cycle = 0.5 - 0.5 * cos(tidePhase);
-    const float motion = sin(tidePhase);
-    const float motionDirection = motion >= 0.0 ? 1.0 : -1.0;
-    const float travel = (cycle * 2.0 - 1.0) * travelDistance;
+    const float density01 = clamp(density, 0.0, 1.0);
+    const float turbulence01 = clamp(turbulence, 0.0, 1.0);
+    const float clampedWarp = clamp(warp, 0.0, 2.0);
     const float lateralScale = max(wavelength * 1.35, 0.012);
-    const float scallopNoise = RippleSmoothBlockNoise(
-        vec2(uv.y, t * 0.035 + seed * 0.13),
-        max(wavelength * 0.48, 0.008),
-        seed,
-        151.0);
-    const float frontWarp =
-        (sin((uv.y / lateralScale) + seed * 1.17 + t * 0.028) * 0.62 +
-         sin((uv.y / max(wavelength * 0.58, 0.006)) - seed * 0.73 + t * 0.019) * 0.28 +
-         (scallopNoise - 0.5) * 1.15) *
-        wavelength * (0.08 + clamp(warp, 0.0, 8.0) * 0.10 + turbulence * 0.06);
-    const float front = uv.x - travel - frontWarp;
-    const float frontWidth = max(wavelength * (0.050 + turbulence * 0.028), 0.003);
-    const float crest = RippleLine(front, frontWidth);
-    const float trailDistance = max(0.0, -front * motionDirection);
-    const float trailLength = max(wavelength * (0.42 + turbulence * 0.34), frontWidth * 5.0);
-    const float trailingFoam =
-        exp(-trailDistance / max(trailLength, 1.0e-4)) *
-        smoothstep(frontWidth * 0.40, frontWidth * 1.80, trailDistance) *
-        (1.0 - smoothstep(trailLength, trailLength * 1.65, trailDistance));
-    const float shoreBreakup = smoothstep(0.24, 0.92, scallopNoise + turbulence * 0.22);
-    const float calmMotion = 0.62 + 0.28 * abs(motion);
-    return clamp((crest * (0.72 + shoreBreakup * 0.28) + trailingFoam * shoreBreakup * 0.32) * calmMotion, 0.0, 1.0);
+    const float frontWidth = max(wavelength * (0.046 + turbulence01 * 0.026), 0.003);
+    const float trailLength = max(wavelength * (1.05 + turbulence01 * 0.68), frontWidth * 7.0);
+    const float incomingShare = 0.58;
+    const float returnShare = 0.30;
+    const float waveRate = 0.070 + density01 * 0.045;
+    const float warpGuard = wavelength * (0.18 + clampedWarp * 0.16 + turbulence01 * 0.08);
+    const float finishOffset = max(edgeBlendWidth, edgeBlendWidth + warpGuard);
+    float combined = 0.0;
+
+    for (int waveIndex = 0; waveIndex < 4; ++waveIndex) {
+        const float slot = float(waveIndex);
+        const float slotSeed = seed + slot * 53.17;
+        const float timingNoise = RippleHash(slotSeed * 0.071 + 11.0);
+        const float speedNoise = mix(0.76, 1.26, RippleHash(slotSeed * 0.097 + 23.0));
+        const float waveGate = RippleHash(slotSeed * 0.113 + 31.0);
+        if (waveGate > mix(0.62, 1.0, density01)) {
+            continue;
+        }
+
+        const float offset =
+            slot * 0.235 +
+            (timingNoise - 0.5) * (0.12 + turbulence01 * 0.10) +
+            RippleSmoothBlockNoise(vec2(t * 0.018, slotSeed), 0.23, seed, 181.0) * 0.10;
+        const float cycle = fract(t * waveRate * speedNoise + offset);
+        const float activeEnd = incomingShare + returnShare;
+        if (cycle >= activeEnd) {
+            continue;
+        }
+
+        const float scallopNoise = RippleSmoothBlockNoise(
+            vec2(uv.y + slot * wavelength * 0.37, seed * 0.13 + slot * 0.41),
+            max(wavelength * 0.48, 0.008),
+            seed,
+            151.0 + slot * 19.0);
+        const float frontWarp =
+            (sin((uv.y / lateralScale) + seed * 1.17 + slot * 1.91) * 0.62 +
+             sin((uv.y / max(wavelength * 0.58, 0.006)) - seed * 0.73 + slot * 2.37) * 0.28 +
+             (scallopNoise - 0.5) * 1.15) *
+            wavelength * (0.08 + clampedWarp * 0.10 + turbulence01 * 0.06);
+        const float x = finishOffset - max(0.0, shoreDistance) - frontWarp;
+        const float waveTravel = travelDistance * mix(1.38, 1.82, RippleHash(slotSeed * 0.061 + 47.0));
+        const float offshoreStart = -waveTravel * (0.72 + timingNoise * 0.18);
+        const float shoreEnd = 0.0;
+        const float shoreBreakup = smoothstep(0.24, 0.92, scallopNoise + turbulence01 * 0.22);
+        const float foamNoise = RippleSmoothBlockNoise(
+            vec2(x * 0.37 + slot * 0.19, uv.y + slot * 0.31),
+            max(wavelength * 0.35, 0.006),
+            seed,
+            203.0 + slot * 23.0);
+        const float breakup = smoothstep(
+            0.18,
+            0.96,
+            foamNoise + shoreBreakup * 0.45 + turbulence01 * 0.18);
+        const float shorewardMask = 1.0 - smoothstep(frontWidth * 0.45, frontWidth * 2.20, x - shoreEnd);
+
+        if (cycle < incomingShare) {
+            const float incomingProgress = smoothstep(0.0, 1.0, cycle / incomingShare);
+            const float frontPosition = mix(offshoreStart, shoreEnd, incomingProgress);
+            const float front = x - frontPosition;
+            const float crest = RippleLine(front, frontWidth);
+            const float trailDistance = max(0.0, -front);
+            const float trailingFoam =
+                exp(-trailDistance / max(trailLength, 1.0e-4)) *
+                smoothstep(frontWidth * 0.35, frontWidth * 1.70, trailDistance) *
+                (1.0 - smoothstep(trailLength * 1.08, trailLength * 2.15, trailDistance));
+            const float crestFade = smoothstep(0.02, 0.18, cycle) * (1.0 - smoothstep(0.91, 1.0, incomingProgress));
+            const float value =
+                crest * (0.78 + shoreBreakup * 0.24) * crestFade +
+                trailingFoam * (0.30 + density01 * 0.18) * breakup;
+            combined = max(combined, value * shorewardMask);
+        } else {
+            const float returnProgress = smoothstep(0.0, 1.0, (cycle - incomingShare) / returnShare);
+            const float returnDistance = waveTravel * 0.50;
+            const float clearFront = shoreEnd - returnDistance * returnProgress;
+            const float front = x - clearFront;
+            const float remainingMask = 1.0 - smoothstep(-frontWidth * 1.25, frontWidth * 1.55, front);
+            const float trailDistance = max(0.0, shoreEnd - x);
+            const float heldFoam =
+                exp(-trailDistance / max(trailLength, 1.0e-4)) *
+                smoothstep(frontWidth * 0.35, frontWidth * 1.70, trailDistance) *
+                (1.0 - smoothstep(trailLength * 1.08, trailLength * 2.15, trailDistance));
+            const float clearCrest = RippleLine(front, frontWidth * 1.15);
+            const float returnFade = 1.0 - smoothstep(0.45, 1.0, returnProgress);
+            const float value =
+                heldFoam * remainingMask * (0.32 + density01 * 0.18) * breakup * returnFade +
+                clearCrest * (0.34 + shoreBreakup * 0.16) * returnFade;
+            combined = max(combined, value * shorewardMask);
+        }
+    }
+
+    return clamp(combined, 0.0, 1.0);
 }
 
 float RippleWetSheenValue(vec2 uv, vec3 normal, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
@@ -830,7 +897,7 @@ float RippleFoamSparkleValue(vec2 regionUv, float edge, float wavelength, float 
     return clamp(edgeFade * foam * pulse, 0.0, 1.0);
 }
 
-float RipplePatternValue(uint overlayType, vec2 uv, vec2 regionUv, vec3 normal, float edge, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
+float RipplePatternValue(uint overlayType, vec2 uv, vec2 regionUv, vec3 normal, float edge, float shoreDistance, float edgeBlendWidth, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
     const float radialDistance = length(uv);
     const float regionRadialDistance = length(regionUv);
     if (overlayType == 0u) {
@@ -846,7 +913,7 @@ float RipplePatternValue(uint overlayType, vec2 uv, vec2 regionUv, vec3 normal, 
         return RippleRainRingValue(regionUv, wavelength, warp, turbulence, density, seed, phase);
     }
     if (overlayType == 4u) {
-        return RippleTideBandsValue(uv, wavelength, warp, turbulence, seed, phase);
+        return RippleTideBandsValue(uv, shoreDistance, edgeBlendWidth, wavelength, warp, turbulence, density, seed, phase);
     }
     if (overlayType == 5u) {
         return RippleWetSheenValue(uv, normal, wavelength, warp, turbulence, density, seed, phase);
@@ -890,6 +957,7 @@ SparseRippleComposite EvaluateSparseRippleContribution(SparseRippleMembership me
     lateral = dot(lateral, lateral) > 1e-8 ? normalize(lateral) : RippleSafeLateral(tangent);
 
     const float edgeDistance = max(0.0, membership.data.x);
+    const float shoreDistance = max(0.0, membership.data.z);
     const float edge = smoothstep(0.0, max(1e-5, params.region1.w), edgeDistance);
     const float strength = clamp(params.region0.w, 0.0, 1.0);
     const bool causticLace = params.control.x == 0u;
@@ -898,6 +966,8 @@ SparseRippleComposite EvaluateSparseRippleContribution(SparseRippleMembership me
     }
 
     const float patternScale = clamp(params.pattern0.x, 0.05, 100.0);
+    const float scaledShoreDistance = shoreDistance * patternScale;
+    const float scaledEdgeBlendWidth = params.region1.w * patternScale;
     const float wavelength = max(0.005, params.pattern0.y);
     const float speed = max(0.0, params.pattern0.z);
     const float warp = max(0.0, params.pattern0.w);
@@ -918,6 +988,8 @@ SparseRippleComposite EvaluateSparseRippleContribution(SparseRippleMembership me
         regionUv,
         normal,
         edge,
+        scaledShoreDistance,
+        scaledEdgeBlendWidth,
         wavelength,
         warp,
         turbulence,

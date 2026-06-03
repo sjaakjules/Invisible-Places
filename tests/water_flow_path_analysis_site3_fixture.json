@@ -1,0 +1,28 @@
+{
+  "name": "site3_flow_path_analysis_reference",
+  "source_path": "Data/Site3-Sample-Terrestrial.ply",
+  "emitter": {
+    "id": 301,
+    "name": "Site3 path analysis source",
+    "position": [307.709, 102.395, 2.007],
+    "radius": 0.035,
+    "confidence": 1.0,
+    "scope": "Detail",
+    "origin": "Manual",
+    "status": "Accepted"
+  },
+  "path_settings": {
+    "legacyScaleMode": "Detail",
+    "autoTune": true,
+    "branching": 1.0,
+    "coverage": 0.91,
+    "gapTolerance": 0.94,
+    "pathLength": 17.3,
+    "smoothing": 0.9,
+    "supportVoxelSize": 0.01,
+    "maxBridgeDistance": 0.567,
+    "pathSampleSpacing": 0.012,
+    "maxSteps": 20000,
+    "supportSampleLimit": 261946
+  }
+}
