@@ -59,6 +59,7 @@ using invisible_places::water::WaterPathGenerationSettings;
 using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
 using invisible_places::water::WaterRippleOverlayType;
+using invisible_places::water::WaterRipplePatternSettings;
 using invisible_places::water::WaterScaleMode;
 using invisible_places::water::WaterSettingsBundle;
 using invisible_places::water::WaterSourceSettingsAssignment;
@@ -496,6 +497,7 @@ void MigrateLegacyPointCloudRenderMode(
             break;
         case LegacyPointCloudRenderMode::DepthXray:
             style->depthContribution = PointCloudDepthContribution::Always;
+            style->xrayStrength.active = true;
             if (invisible_places::style::ScalarConstant(style->xrayStrength) <= 0.0F) {
                 invisible_places::style::SetScalarConstant(&style->xrayStrength, 1.0F);
             }
@@ -1478,66 +1480,13 @@ WaterEffectFeatureType ParseWaterEffectFeatureType(const json& typeJson) {
 }
 
 const char* WaterRippleOverlayTypeName(WaterRippleOverlayType type) {
-    switch (type) {
-        case WaterRippleOverlayType::LinearRipples:
-            return "linear_ripples";
-        case WaterRippleOverlayType::RadialRipples:
-            return "radial_ripples";
-        case WaterRippleOverlayType::RainRings:
-            return "rain_rings";
-        case WaterRippleOverlayType::TideBands:
-            return "tide_bands";
-        case WaterRippleOverlayType::WetSheen:
-            return "wet_sheen";
-        case WaterRippleOverlayType::CurrentThreads:
-            return "current_threads";
-        case WaterRippleOverlayType::DropletGlints:
-            return "droplet_glints";
-        case WaterRippleOverlayType::DripTrails:
-            return "drip_trails";
-        case WaterRippleOverlayType::FoamSparkle:
-            return "foam_sparkle";
-        case WaterRippleOverlayType::SaltMineralShimmer:
-            return "salt_mineral_shimmer";
-        case WaterRippleOverlayType::CausticLace:
-            return "caustic_lace";
-    }
-    return "caustic_lace";
+    return invisible_places::water::WaterRippleOverlayTypeNameForStorage(type).data();
 }
 
 WaterRippleOverlayType ParseWaterRippleOverlayType(const json& typeJson) {
     const auto name = typeJson.get<std::string>();
-    if (name == "linear_ripples") {
-        return WaterRippleOverlayType::LinearRipples;
-    }
-    if (name == "radial_ripples") {
-        return WaterRippleOverlayType::RadialRipples;
-    }
-    if (name == "rain_rings") {
-        return WaterRippleOverlayType::RainRings;
-    }
-    if (name == "tide_bands") {
-        return WaterRippleOverlayType::TideBands;
-    }
-    if (name == "wet_sheen") {
-        return WaterRippleOverlayType::WetSheen;
-    }
-    if (name == "current_threads") {
-        return WaterRippleOverlayType::CurrentThreads;
-    }
-    if (name == "droplet_glints") {
-        return WaterRippleOverlayType::DropletGlints;
-    }
-    if (name == "drip_trails") {
-        return WaterRippleOverlayType::DripTrails;
-    }
-    if (name == "foam_sparkle") {
-        return WaterRippleOverlayType::FoamSparkle;
-    }
-    if (name == "salt_mineral_shimmer") {
-        return WaterRippleOverlayType::SaltMineralShimmer;
-    }
-    return WaterRippleOverlayType::CausticLace;
+    return invisible_places::water::ParseWaterRippleOverlayTypeName(name)
+        .value_or(WaterRippleOverlayType::CausticLace);
 }
 
 const char* WaterEffectBlendModeName(WaterEffectBlendMode mode) {
@@ -1633,6 +1582,61 @@ WaterEffectResponseSettings ParseWaterEffectResponseSettings(const json& setting
     return settings;
 }
 
+json SerializeWaterRipplePatternSettings(const WaterRipplePatternSettings& settings) {
+    return json{
+        {"pattern_scale", settings.patternScale},
+        {"wavelength_meters", settings.wavelengthMeters},
+        {"speed", settings.speed},
+        {"warp", settings.warp},
+        {"turbulence", settings.turbulence},
+        {"density", settings.density},
+        {"phase", settings.phase},
+        {"direction", {settings.directionX, settings.directionY, settings.directionZ}},
+    };
+}
+
+WaterRipplePatternSettings ParseWaterRipplePatternSettings(
+    const json& settingsJson,
+    WaterRippleOverlayType type) {
+    auto settings = invisible_places::water::DefaultWaterRipplePatternSettings(type);
+    settings.patternScale = std::clamp(settingsJson.value("pattern_scale", settings.patternScale), 0.001F, 100.0F);
+    settings.wavelengthMeters = std::clamp(
+        settingsJson.value("wavelength_meters", settings.wavelengthMeters),
+        0.001F,
+        50.0F);
+    settings.speed = std::clamp(settingsJson.value("speed", settings.speed), 0.0F, 20.0F);
+    settings.warp = std::clamp(settingsJson.value("warp", settings.warp), 0.0F, 20.0F);
+    settings.turbulence = std::clamp(settingsJson.value("turbulence", settings.turbulence), 0.0F, 20.0F);
+    settings.density = std::clamp(settingsJson.value("density", settings.density), 0.0F, 1.0F);
+    settings.phase = settingsJson.value("phase", settings.phase);
+    if (settingsJson.contains("direction")) {
+        const auto direction = settingsJson.at("direction").get<std::array<float, 3>>();
+        settings.directionX = direction[0];
+        settings.directionY = direction[1];
+        settings.directionZ = direction[2];
+    }
+    return settings;
+}
+
+json SerializeWaterRipplePatternSettingsByOverlay(const WaterEffectLayer& layer) {
+    json settingsJson = json::object();
+    auto settings = layer.overlayPatternSettings;
+    for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
+        const auto index = invisible_places::water::WaterRippleOverlayTypeIndex(type);
+        if (settings[index].patternScale <= 0.0F || settings[index].wavelengthMeters <= 0.0F) {
+            settings[index] = invisible_places::water::DefaultWaterRipplePatternSettings(type);
+        }
+    }
+    settings[invisible_places::water::WaterRippleOverlayTypeIndex(layer.rippleOverlayType)] =
+        invisible_places::water::ActiveWaterRipplePatternSettings(layer);
+    for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
+        settingsJson[std::string{invisible_places::water::WaterRippleOverlayTypeNameForStorage(type)}] =
+            SerializeWaterRipplePatternSettings(
+                settings[invisible_places::water::WaterRippleOverlayTypeIndex(type)]);
+    }
+    return settingsJson;
+}
+
 json SerializeWaterEffectLayer(const WaterEffectLayer& layer) {
     return json{
         {"id", layer.id},
@@ -1653,8 +1657,10 @@ json SerializeWaterEffectLayer(const WaterEffectLayer& layer) {
         {"wavelength_meters", layer.wavelengthMeters},
         {"warp", layer.warp},
         {"turbulence", layer.turbulence},
+        {"density", layer.density},
         {"phase", layer.phase},
         {"direction", {layer.directionX, layer.directionY, layer.directionZ}},
+        {"overlay_pattern_settings", SerializeWaterRipplePatternSettingsByOverlay(layer)},
         {"seed", layer.seed},
         {"max_affected_points", layer.maxAffectedPoints},
         {"response", SerializeWaterEffectResponseSettings(layer.response)},
@@ -1691,6 +1697,7 @@ WaterEffectLayer ParseWaterEffectLayer(const json& layerJson) {
     layer.wavelengthMeters = std::clamp(layerJson.value("wavelength_meters", layer.wavelengthMeters), 0.001F, 50.0F);
     layer.warp = std::clamp(layerJson.value("warp", layer.warp), 0.0F, 20.0F);
     layer.turbulence = std::clamp(layerJson.value("turbulence", layer.turbulence), 0.0F, 20.0F);
+    layer.density = std::clamp(layerJson.value("density", layer.density), 0.0F, 1.0F);
     layer.phase = layerJson.value("phase", layer.phase);
     if (layerJson.contains("direction")) {
         const auto direction = layerJson.at("direction").get<std::array<float, 3>>();
@@ -1698,6 +1705,25 @@ WaterEffectLayer ParseWaterEffectLayer(const json& layerJson) {
         layer.directionY = direction[1];
         layer.directionZ = direction[2];
     }
+    const auto legacyActiveSettings = invisible_places::water::ActiveWaterRipplePatternSettings(layer);
+    for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
+        layer.overlayPatternSettings[invisible_places::water::WaterRippleOverlayTypeIndex(type)] =
+            invisible_places::water::DefaultWaterRipplePatternSettings(type);
+    }
+    layer.overlayPatternSettings[invisible_places::water::WaterRippleOverlayTypeIndex(layer.rippleOverlayType)] =
+        legacyActiveSettings;
+    if (layerJson.contains("overlay_pattern_settings") &&
+        layerJson.at("overlay_pattern_settings").is_object()) {
+        const auto& byOverlay = layerJson.at("overlay_pattern_settings");
+        for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
+            const auto key = std::string{invisible_places::water::WaterRippleOverlayTypeNameForStorage(type)};
+            if (byOverlay.contains(key)) {
+                layer.overlayPatternSettings[invisible_places::water::WaterRippleOverlayTypeIndex(type)] =
+                    ParseWaterRipplePatternSettings(byOverlay.at(key), type);
+            }
+        }
+    }
+    invisible_places::water::ApplyActiveWaterRipplePatternSettings(&layer);
     layer.seed = layerJson.value("seed", layer.seed);
     layer.maxAffectedPoints = layerJson.value("max_affected_points", layer.maxAffectedPoints);
     if (layerJson.contains("response")) {
@@ -1720,6 +1746,7 @@ json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings) {
         {"surface_offset_meters", settings.surfaceOffsetMeters},
         {"path_attraction", settings.pathAttraction},
         {"lane_spread_meters", settings.laneSpreadMeters},
+        {"lane_crossing", settings.laneCrossing},
         {"stream_smoothness", settings.streamSmoothness},
         {"stream_looseness", settings.streamLooseness},
         {"turbulence", settings.turbulence},
@@ -1739,6 +1766,7 @@ WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson) {
     settings.surfaceOffsetMeters = settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters);
     settings.pathAttraction = settingsJson.value("path_attraction", settings.pathAttraction);
     settings.laneSpreadMeters = settingsJson.value("lane_spread_meters", settings.laneSpreadMeters);
+    settings.laneCrossing = settingsJson.value("lane_crossing", settings.laneCrossing);
     settings.streamSmoothness = settingsJson.value("stream_smoothness", settings.streamSmoothness);
     settings.streamLooseness = settingsJson.value("stream_looseness", settings.streamLooseness);
     settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
@@ -2740,6 +2768,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
                 layer.speed = document.waterCausticLookSettings.speed;
                 layer.wavelengthMeters = document.waterCausticLookSettings.cellSizeMeters;
                 layer.warp = document.waterCausticLookSettings.warp;
+                for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
+                    layer.overlayPatternSettings[invisible_places::water::WaterRippleOverlayTypeIndex(type)] =
+                        invisible_places::water::DefaultWaterRipplePatternSettings(type);
+                }
+                invisible_places::water::StoreActiveWaterRipplePatternSettings(&layer);
                 document.waterRippleLayers.push_back(std::move(layer));
             }
         }
@@ -3056,6 +3089,11 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
                 layer.speed = document.causticLookSettings.speed;
                 layer.wavelengthMeters = document.causticLookSettings.cellSizeMeters;
                 layer.warp = document.causticLookSettings.warp;
+                for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
+                    layer.overlayPatternSettings[invisible_places::water::WaterRippleOverlayTypeIndex(type)] =
+                        invisible_places::water::DefaultWaterRipplePatternSettings(type);
+                }
+                invisible_places::water::StoreActiveWaterRipplePatternSettings(&layer);
                 document.rippleLayers.push_back(std::move(layer));
             }
         }

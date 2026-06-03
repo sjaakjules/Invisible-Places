@@ -4,12 +4,14 @@
 #include "io/PointCloudData.hpp"
 #include "output/ExrWriter.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "water/WaterFlow.hpp"
 
 #include <cstdint>
 #include <limits>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
+#include <glm/vec2.hpp>
 
 namespace invisible_places::output {
 
@@ -31,6 +33,9 @@ struct OfflinePointLayer {
     std::size_t waterEffectColourGreenFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t waterEffectColourBlueFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t waterEffectColourMixFieldSlot = std::numeric_limits<std::size_t>::max();
+    std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
+    std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
+    std::vector<glm::uvec2> rippleMembershipRanges;
     float roughnessMotionMinimum = 0.0F;
     float roughnessMotionInvRange = 1.0F;
 };

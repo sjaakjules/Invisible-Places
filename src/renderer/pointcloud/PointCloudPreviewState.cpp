@@ -321,6 +321,8 @@ PointCloudStyleState::PointCloudStyleState() {
     invisible_places::style::SetScalarConstant(&xrayStrength, kInactiveXrayDefault);
     invisible_places::style::SetScalarConstant(&depthFade, kInactiveDepthFadeDefault);
     invisible_places::style::SetScalarConstant(&colormapPosition, kInactiveColormapPositionDefault);
+    xrayStrength.active = false;
+    depthFade.active = false;
 }
 
 bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style) {

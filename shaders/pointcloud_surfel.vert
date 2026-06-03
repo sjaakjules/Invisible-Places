@@ -66,7 +66,13 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     uvec4 waterEffectControl;
     uvec4 waterEffectSlots0;
     uvec4 waterEffectSlots1;
+    uvec4 rippleEffectSlots0;
+    uvec4 rippleEffectSlots1;
+    uvec4 rippleEffectSlots2;
+    uvec4 rippleEffectSlots3;
 } styleData;
+
+#include "pointcloud_sparse_ripple.glsl"
 
 layout(set = 0, binding = 4, std430) readonly buffer SurfelPositions {
     vec4 positions[];
@@ -95,17 +101,28 @@ const uint kWaterPathCountFieldSlot = 11u;
 const uint kWaterJitterSeedFieldSlot = 12u;
 const uint kWaterTrailAgeFieldSlot = 13u;
 const uint kWaterFeatureTypeFieldSlot = 15u;
-const uint kWaterStreamPointSeedFieldSlot = 5u;
-const uint kWaterStreamPointAgeFieldSlot = 8u;
-const uint kWaterStreamSpeedFieldSlot = 10u;
-const uint kWaterStreamWidthFieldSlot = 11u;
-const uint kWaterStreamWorldLengthFieldSlot = 12u;
-const uint kWaterStreamConfidenceFieldSlot = 13u;
-const uint kWaterStreamWetnessFieldSlot = 14u;
-const uint kWaterStreamFeatureTypeFieldSlot = 15u;
-const uint kWaterStreamTangentXFieldSlot = 16u;
-const uint kWaterStreamTangentYFieldSlot = 17u;
-const uint kWaterStreamTangentZFieldSlot = 18u;
+const uint kWaterStreamRoleFieldSlot = 0u;
+const uint kWaterStreamLengthFieldSlot = 8u;
+const uint kWaterStreamRouteStartFieldSlot = 9u;
+const uint kWaterStreamRouteCountFieldSlot = 10u;
+const uint kWaterStreamRouteLengthFieldSlot = 11u;
+const uint kWaterStreamStartPhaseFieldSlot = 12u;
+const uint kWaterStreamLateralOffsetFieldSlot = 13u;
+const uint kWaterStreamPointAgeFieldSlot = 14u;
+const uint kWaterStreamAgeFieldSlot = 15u;
+const uint kWaterStreamSpeedFieldSlot = 16u;
+const uint kWaterStreamWidthFieldSlot = 17u;
+const uint kWaterStreamWorldLengthFieldSlot = 18u;
+const uint kWaterStreamFeatureTypeFieldSlot = 21u;
+const uint kWaterStreamTangentXFieldSlot = 22u;
+const uint kWaterStreamTangentYFieldSlot = 23u;
+const uint kWaterStreamTangentZFieldSlot = 24u;
+const uint kWaterStreamLaneIndexFieldSlot = 25u;
+const uint kWaterStreamLaneCountFieldSlot = 26u;
+const uint kWaterStreamLanePitchFieldSlot = 27u;
+const uint kWaterStreamLaneSpanFieldSlot = 28u;
+const uint kWaterStreamLaneCrossingFieldSlot = 29u;
+const uint kWaterStreamCrossSeedFieldSlot = 30u;
 const float kWaterParticleSpeedScale = 0.12;
 
 const vec2 kSurfelCorners[6] = vec2[](
@@ -179,8 +196,61 @@ float WaterEffectField(uint slotPlusOne, uint pointIndex, float fallback) {
     return LoadScalarFieldValue(slotPlusOne - 1u, pointIndex);
 }
 
-vec3 ApplyWaterEffectColor(vec3 baseColor, uint pointIndex) {
-    const float mixAmount = clamp(WaterEffectField(styleData.waterEffectSlots0.z, pointIndex, 0.0), 0.0, 1.0);
+bool HasRippleEffectFields() {
+    return styleData.rippleEffectSlots0.x != 0u &&
+           styleData.rippleEffectSlots0.y != 0u &&
+           styleData.rippleEffectSlots0.z != 0u &&
+           styleData.rippleEffectSlots0.w != 0u &&
+           styleData.rippleEffectSlots1.x != 0u &&
+           styleData.rippleEffectSlots1.y != 0u &&
+           styleData.rippleEffectSlots1.w != 0u &&
+           styleData.rippleEffectSlots2.x != 0u &&
+           styleData.rippleEffectSlots2.y != 0u &&
+           styleData.rippleEffectSlots2.z != 0u &&
+           styleData.rippleEffectSlots2.w != 0u;
+}
+
+float RippleEffectField(uint slotPlusOne, uint pointIndex, float fallback) {
+    if (!HasRippleEffectFields() || slotPlusOne == 0u) {
+        return fallback;
+    }
+    return LoadScalarFieldValue(slotPlusOne - 1u, pointIndex);
+}
+
+float ResolveRippleEffectScale(uint pointIndex) {
+    if (!HasRippleEffectFields()) {
+        return 1.0;
+    }
+    const float mask = clamp(RippleEffectField(styleData.rippleEffectSlots0.x, pointIndex, 0.0), 0.0, 1.0);
+    if (mask <= 1e-5) {
+        return 1.0;
+    }
+    const float edge = clamp(RippleEffectField(styleData.rippleEffectSlots0.y, pointIndex, 0.0), 0.0, 1.0);
+    const float value = clamp(RippleEffectField(styleData.rippleEffectSlots0.z, pointIndex, 0.0), 0.0, 1.0);
+    const float seed = RippleEffectField(styleData.rippleEffectSlots0.w, pointIndex, 0.0);
+    const float distance = RippleEffectField(styleData.rippleEffectSlots1.x, pointIndex, 0.0);
+    const float linearCoord = RippleEffectField(styleData.rippleEffectSlots1.y, pointIndex, 0.0);
+    const float speed = max(0.0, RippleEffectField(styleData.rippleEffectSlots1.w, pointIndex, 0.0));
+    const float confidence = clamp(RippleEffectField(styleData.rippleEffectSlots2.x, pointIndex, 0.0), 0.0, 1.0);
+    const float wavelength = max(0.005, RippleEffectField(styleData.rippleEffectSlots2.y, pointIndex, 0.25));
+    const float warp = max(0.0, RippleEffectField(styleData.rippleEffectSlots2.z, pointIndex, 0.0));
+    const float phaseOffset = RippleEffectField(styleData.rippleEffectSlots2.w, pointIndex, 0.0);
+    const float time = max(0.0, uniforms.depthParameters.x);
+    const float ripplePhase =
+        (linearCoord / wavelength) -
+        (time * speed) +
+        phaseOffset +
+        (seed * 0.173);
+    const float warpPhase =
+        sin(((distance / wavelength) + time * 0.37 + seed) * 6.28318530718) * warp;
+    const float wave = 0.5 + 0.5 * cos((ripplePhase + warpPhase) * 6.28318530718);
+    const float crest = smoothstep(0.42, 1.0, wave);
+    return clamp(value * mask * edge * confidence * (0.18 + 0.82 * crest), 0.0, 1.0);
+}
+
+vec3 ApplyWaterEffectColor(vec3 baseColor, uint pointIndex, float waterEffectScale) {
+    const float mixAmount =
+        clamp(WaterEffectField(styleData.waterEffectSlots0.z, pointIndex, 0.0) * waterEffectScale, 0.0, 1.0);
     if (mixAmount <= 1e-5) {
         return baseColor;
     }
@@ -213,8 +283,7 @@ float WaterFeatureType(uint pointIndex) {
 
 float WaterTrailFade(uint pointIndex) {
     if (WaterStreamOverlayEnabled()) {
-        const float age = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot, pointIndex), 0.0, 1.0);
-        return 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, age), 1.35);
+        return 1.0;
     }
     if (styleData.globalControl.z <= kWaterTrailAgeFieldSlot) {
         return 1.0;
@@ -424,12 +493,240 @@ vec3 JitteredWaterAnchorPosition(
     return basePosition + (lateral * lateralNoise + secondary * secondaryNoise * 0.22) * amplitude;
 }
 
+uint WaterStreamRouteStart(uint pointIndex) {
+    return uint(max(0.0, floor(LoadScalarFieldValue(kWaterStreamRouteStartFieldSlot, pointIndex) + 0.5)));
+}
+
+uint WaterStreamRouteCount(uint pointIndex) {
+    return uint(max(0.0, floor(LoadScalarFieldValue(kWaterStreamRouteCountFieldSlot, pointIndex) + 0.5)));
+}
+
+float WaterStreamTravelPhase(uint pointIndex) {
+    const float routeLength = max(0.001, LoadScalarFieldValue(kWaterStreamRouteLengthFieldSlot, pointIndex));
+    const float streamLength = max(0.0, LoadScalarFieldValue(kWaterStreamLengthFieldSlot, pointIndex));
+    const float pointAge = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot, pointIndex), 0.0, 1.0);
+    const float streamAge = LoadScalarFieldValue(kWaterStreamAgeFieldSlot, pointIndex);
+    const float streamStartPhase = LoadScalarFieldValue(kWaterStreamStartPhaseFieldSlot, pointIndex);
+    const float speed = max(0.0, LoadScalarFieldValue(kWaterStreamSpeedFieldSlot, pointIndex));
+    return fract(
+        streamStartPhase +
+        streamAge +
+        max(0.0, uniforms.depthParameters.x) * speed / routeLength -
+        pointAge * streamLength / routeLength);
+}
+
+float WaterStreamHash(float a, float b, float c) {
+    return fract(sin(dot(vec3(a, b, c), vec3(12.9898, 78.233, 37.719))) * 43758.5453123);
+}
+
+float WaterStreamLaneCenter(float laneIndex, float laneCount, float laneSpan) {
+    const float count = max(1.0, floor(laneCount + 0.5));
+    if (count <= 1.0 || laneSpan <= 0.00001) {
+        return 0.0;
+    }
+    const float clampedIndex = clamp(laneIndex, 0.0, count - 1.0);
+    return (((clampedIndex + 0.5) / count) - 0.5) * laneSpan;
+}
+
+float WaterStreamRouteTurnBias(uint pointIndex, float travelPhase, vec3 routeNormal) {
+    const uint routeStart = WaterStreamRouteStart(pointIndex);
+    const uint routeCount = WaterStreamRouteCount(pointIndex);
+    if (routeCount < 3u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
+        return 0.0;
+    }
+
+    const float routePosition = fract(travelPhase) * float(routeCount - 1u);
+    const uint centerOffset = min(max(uint(floor(routePosition)), 1u), routeCount - 2u);
+    const vec3 previous = surfelPositions.positions[routeStart + centerOffset - 1u].xyz;
+    const vec3 center = surfelPositions.positions[routeStart + centerOffset].xyz;
+    const vec3 next = surfelPositions.positions[routeStart + centerOffset + 1u].xyz;
+    vec3 previousTangent = center - previous;
+    vec3 nextTangent = next - center;
+    if (dot(previousTangent, previousTangent) <= 1e-8 || dot(nextTangent, nextTangent) <= 1e-8) {
+        return 0.0;
+    }
+
+    previousTangent = normalize(previousTangent);
+    nextTangent = normalize(nextTangent);
+    const float signedTurn = dot(cross(previousTangent, nextTangent), routeNormal);
+    return clamp(-signedTurn * 8.0, -1.0, 1.0);
+}
+
+float WaterStreamApplyLaneJump(
+    float currentLane,
+    float laneCount,
+    float jumpChance,
+    float turnBias,
+    float crossSeed,
+    float segmentIndex) {
+    if (WaterStreamHash(crossSeed, segmentIndex, 17.0) >= jumpChance) {
+        return currentLane;
+    }
+
+    const float outerLaneProbability = clamp(0.5 + turnBias * 0.42, 0.08, 0.92);
+    const float direction =
+        WaterStreamHash(crossSeed, segmentIndex, 29.0) < outerLaneProbability ? 1.0 : -1.0;
+    return clamp(currentLane + direction, 0.0, laneCount - 1.0);
+}
+
+float ResolveWaterStreamLateralOffset(
+    uint pointIndex,
+    float travelPhase,
+    vec3 routeTangent,
+    float turnBias) {
+    const float baseOffset = LoadScalarFieldValue(kWaterStreamLateralOffsetFieldSlot, pointIndex);
+    if (styleData.globalControl.z <= kWaterStreamCrossSeedFieldSlot) {
+        return baseOffset;
+    }
+
+    const float crossing = clamp(LoadScalarFieldValue(kWaterStreamLaneCrossingFieldSlot, pointIndex), 0.0, 1.0);
+    const float laneCount = max(1.0, floor(LoadScalarFieldValue(kWaterStreamLaneCountFieldSlot, pointIndex) + 0.5));
+    const float lanePitch = max(0.0, LoadScalarFieldValue(kWaterStreamLanePitchFieldSlot, pointIndex));
+    const float laneSpan = max(0.0, LoadScalarFieldValue(kWaterStreamLaneSpanFieldSlot, pointIndex));
+    if (crossing <= 0.0001 || laneCount <= 1.0 || lanePitch <= 0.0 || laneSpan <= 0.00001) {
+        return baseOffset;
+    }
+
+    const float baseLane = clamp(
+        floor(LoadScalarFieldValue(kWaterStreamLaneIndexFieldSlot, pointIndex) + 0.5),
+        0.0,
+        laneCount - 1.0);
+    const float baseCenter = WaterStreamLaneCenter(baseLane, laneCount, laneSpan);
+    const float offsetJitter = baseOffset - baseCenter;
+    const float crossSeed = LoadScalarFieldValue(kWaterStreamCrossSeedFieldSlot, pointIndex);
+    const float routeProgress = fract(travelPhase);
+    const float sourceProgress = smoothstep(0.03, 0.55, routeProgress);
+    const float flatness = 1.0 - smoothstep(0.05, 0.45, abs(routeTangent.z));
+    const float jumpChance = clamp(
+        crossing *
+            sourceProgress *
+            mix(0.30, 1.45, flatness) *
+            (1.0 + abs(turnBias) * 0.75),
+        0.0,
+        1.0);
+    const float segmentCount = mix(2.0, 12.0, crossing);
+    const float segmentCoord = routeProgress * segmentCount;
+    const float segmentIndex = floor(segmentCoord);
+    const float localPhase = fract(segmentCoord);
+    float currentLane = baseLane;
+    for (int segment = 0; segment < 12; ++segment) {
+        const float segmentValue = float(segment);
+        if (segmentValue >= segmentIndex || segmentValue >= segmentCount) {
+            break;
+        }
+        currentLane = WaterStreamApplyLaneJump(
+            currentLane,
+            laneCount,
+            jumpChance,
+            turnBias,
+            crossSeed,
+            segmentValue);
+    }
+
+    const float targetLane = WaterStreamApplyLaneJump(
+        currentLane,
+        laneCount,
+        jumpChance,
+        turnBias,
+        crossSeed,
+        segmentIndex);
+    const float envelope = smoothstep(0.18, 0.92, localPhase);
+    const float resolvedLane = mix(currentLane, targetLane, envelope);
+    return WaterStreamLaneCenter(resolvedLane, laneCount, laneSpan) + offsetJitter;
+}
+
+vec3 WaterStreamRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
+    const uint routeStart = WaterStreamRouteStart(pointIndex);
+    const uint routeCount = WaterStreamRouteCount(pointIndex);
+    if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
+        return fallbackPosition;
+    }
+
+    const float routePosition = fract(phase) * float(routeCount - 1u);
+    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 1u);
+    const float t = fract(routePosition);
+    const uint p0Offset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
+    const uint p1Offset = anchorOffset;
+    const uint p2Offset = min(anchorOffset + 1u, routeCount - 1u);
+    const uint p3Offset = min(anchorOffset + 2u, routeCount - 1u);
+    const vec3 p0 = surfelPositions.positions[routeStart + p0Offset].xyz;
+    const vec3 p1 = surfelPositions.positions[routeStart + p1Offset].xyz;
+    const vec3 p2 = surfelPositions.positions[routeStart + p2Offset].xyz;
+    const vec3 p3 = surfelPositions.positions[routeStart + p3Offset].xyz;
+    return CatmullRomWater(p0, p1, p2, p3, t);
+}
+
+vec3 WaterStreamRouteTangent(uint pointIndex, float phase) {
+    const uint routeStart = WaterStreamRouteStart(pointIndex);
+    const uint routeCount = WaterStreamRouteCount(pointIndex);
+    if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
+        const vec3 tangent = vec3(
+            LoadScalarFieldValue(kWaterStreamTangentXFieldSlot, pointIndex),
+            LoadScalarFieldValue(kWaterStreamTangentYFieldSlot, pointIndex),
+            LoadScalarFieldValue(kWaterStreamTangentZFieldSlot, pointIndex));
+        return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(1.0, 0.0, 0.0);
+    }
+
+    const float routePosition = fract(phase) * float(routeCount - 1u);
+    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 1u);
+    const uint prevOffset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
+    const uint nextOffset = min(anchorOffset + 1u, routeCount - 1u);
+    const vec3 previous = surfelPositions.positions[routeStart + prevOffset].xyz;
+    const vec3 next = surfelPositions.positions[routeStart + nextOffset].xyz;
+    const vec3 tangent = next - previous;
+    return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(1.0, 0.0, 0.0);
+}
+
+vec3 WaterStreamRouteNormal(uint pointIndex, float phase) {
+    if (styleData.pointMeta.z == 0u) {
+        return vec3(0.0, 0.0, 1.0);
+    }
+
+    const uint routeStart = WaterStreamRouteStart(pointIndex);
+    const uint routeCount = WaterStreamRouteCount(pointIndex);
+    if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
+        const vec3 normal = surfelNormals.normals[pointIndex].xyz;
+        return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+    }
+
+    const float routePosition = fract(phase) * float(routeCount - 1u);
+    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 1u);
+    const float t = fract(routePosition);
+    const uint p1Offset = anchorOffset;
+    const uint p2Offset = min(anchorOffset + 1u, routeCount - 1u);
+    const vec3 normal = mix(
+        surfelNormals.normals[routeStart + p1Offset].xyz,
+        surfelNormals.normals[routeStart + p2Offset].xyz,
+        t);
+    return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+}
+
+vec3 ResolveWaterStreamPosition(vec3 basePosition, uint pointIndex) {
+    const float streamRole = LoadScalarFieldValue(kWaterStreamRoleFieldSlot, pointIndex);
+    if (streamRole < 0.5) {
+        return basePosition;
+    }
+
+    const float phase = WaterStreamTravelPhase(pointIndex);
+    const vec3 routePosition = WaterStreamRoutePosition(pointIndex, phase, basePosition);
+    const vec3 routeTangent = WaterStreamRouteTangent(pointIndex, phase);
+    const vec3 routeNormal = WaterStreamRouteNormal(pointIndex, phase);
+    vec3 lateral = cross(routeNormal, routeTangent);
+    if (dot(lateral, lateral) <= 1e-8) {
+        lateral = SafeWaterLateral(routeTangent, vec3(1.0, 0.0, 0.0));
+    } else {
+        lateral = normalize(lateral);
+    }
+    const float turnBias = WaterStreamRouteTurnBias(pointIndex, phase, routeNormal);
+    return routePosition + lateral * ResolveWaterStreamLateralOffset(pointIndex, phase, routeTangent, turnBias);
+}
+
 vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
     if (!HasWaterParticleFields()) {
         return basePosition;
     }
     if (WaterStreamOverlayEnabled()) {
-        return basePosition;
+        return ResolveWaterStreamPosition(basePosition, pointIndex);
     }
     if (WaterPathViewEnabled()) {
         return basePosition;
@@ -467,11 +764,7 @@ vec3 ResolveWaterFlowTangent(uint pointIndex) {
         return vec3(0.0);
     }
     if (WaterStreamOverlayEnabled()) {
-        const vec3 tangent = vec3(
-            LoadScalarFieldValue(kWaterStreamTangentXFieldSlot, pointIndex),
-            LoadScalarFieldValue(kWaterStreamTangentYFieldSlot, pointIndex),
-            LoadScalarFieldValue(kWaterStreamTangentZFieldSlot, pointIndex));
-        return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(0.0);
+        return WaterStreamRouteTangent(pointIndex, WaterStreamTravelPhase(pointIndex));
     }
 
     const uint pathStart = uint(max(0.0, floor(LoadScalarFieldValue(kWaterPathStartFieldSlot, pointIndex) + 0.5)));
@@ -525,17 +818,12 @@ vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
     }
 
     if (WaterStreamOverlayEnabled()) {
-        const float age = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot, pointIndex), 0.0, 1.0);
-        const float speed = max(0.001, LoadScalarFieldValue(kWaterStreamSpeedFieldSlot, pointIndex));
-        const float confidence = clamp(LoadScalarFieldValue(kWaterStreamConfidenceFieldSlot, pointIndex), 0.0, 1.0);
-        const float wetness = clamp(LoadScalarFieldValue(kWaterStreamWetnessFieldSlot, pointIndex), 0.0, 1.0);
-        const float seed = LoadScalarFieldValue(kWaterStreamPointSeedFieldSlot, pointIndex);
-        const float animatedAge = fract(age - max(0.0, uniforms.depthParameters.x) * speed * 0.18 + seed);
-        const float fade = 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, animatedAge), 1.35);
-        const float pulse =
-            0.78 + 0.22 * sin((seed + animatedAge + max(0.0, uniforms.depthParameters.x) * speed * 0.07) * 6.28318530718);
-        const float energy = confidence * wetness * fade * pulse;
-        return vec2(opacity * energy, emissive * (0.35 + energy * 1.65));
+        const float streamRole = LoadScalarFieldValue(kWaterStreamRoleFieldSlot, pointIndex);
+        return streamRole < 0.5 ? vec2(0.0) : vec2(opacity, emissive);
+    }
+
+    if (styleData.pointMeta.w == 3u) {
+        return vec2(opacity, emissive);
     }
 
     if (HasWaterParticleFields()) {
@@ -745,10 +1033,22 @@ void main() {
     const float centerDepth = -centerViewPosition.z;
     float centerPreviewTint = 0.0;
     const float centerCaustic = ResolveCausticStrength(center, pointIndex, centerPreviewTint);
+    const float waterEffectScale = ResolveRippleEffectScale(pointIndex);
+    vec3 rippleNormal =
+        styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
+            ? surfelNormals.normals[pointIndex].xyz
+            : vec3(0.0, 0.0, 1.0);
+    rippleNormal = dot(rippleNormal, rippleNormal) > 1e-8 ? normalize(rippleNormal) : vec3(0.0, 0.0, 1.0);
+    const SparseRippleComposite sparseRipple =
+        ResolveSparseRippleComposite(center, rippleNormal, pointIndex, uniforms.depthParameters.x);
     const float waterEffectPointSizeAdd =
-        HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectSlots0.x, pointIndex, 0.0) : 0.0;
+        HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectSlots0.x, pointIndex, 0.0) * waterEffectScale : 0.0;
+    const float sparseRipplePointSizeAdd = sparseRipple.pointSizeAdd;
     const float waterEffectPointSizeMultiply =
-        HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectSlots0.y, pointIndex, 1.0)) : 1.0;
+        HasWaterEffectComposition()
+            ? mix(1.0, max(0.0, WaterEffectField(styleData.waterEffectSlots0.y, pointIndex, 1.0)), waterEffectScale)
+            : 1.0;
+    const float sparseRipplePointSizeMultiply = sparseRipple.pointSizeMultiply;
     const float diameter =
         ((WaterStreamOverlayEnabled()
               ? max(0.0001, LoadScalarFieldValue(kWaterStreamWidthFieldSlot, pointIndex))
@@ -756,8 +1056,10 @@ void main() {
              WaterPathPointSizeScale(pointIndex) *
              WaterSteamSizeScale(pointIndex) *
              (1.0 + centerCaustic * max(0.0, styleData.causticParams1.w)) *
-             waterEffectPointSizeMultiply) +
+             waterEffectPointSizeMultiply *
+             sparseRipplePointSizeMultiply) +
         waterEffectPointSizeAdd +
+        sparseRipplePointSizeAdd +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
     const float waterStreakAspect =
         WaterStreamOverlayEnabled()
@@ -773,16 +1075,26 @@ void main() {
 
     const vec4 sourceColor = UnpackRgba8(surfelColors.colors[pointIndex]);
     const float waterEffectOpacityAdd =
-        HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectControl.z, pointIndex, 0.0) : 0.0;
+        HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectControl.z, pointIndex, 0.0) * waterEffectScale : 0.0;
+    const float sparseRippleOpacityAdd = sparseRipple.opacityAdd;
     const float waterEffectOpacityMultiply =
-        HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectControl.w, pointIndex, 1.0)) : 1.0;
+        HasWaterEffectComposition()
+            ? mix(1.0, max(0.0, WaterEffectField(styleData.waterEffectControl.w, pointIndex, 1.0)), waterEffectScale)
+            : 1.0;
+    const float sparseRippleOpacityMultiply = sparseRipple.opacityMultiply;
     const float waterEffectEmissionAdd =
-        HasWaterEffectComposition() ? max(0.0, WaterEffectField(styleData.waterEffectControl.y, pointIndex, 0.0)) : 0.0;
+        HasWaterEffectComposition()
+            ? max(0.0, WaterEffectField(styleData.waterEffectControl.y, pointIndex, 0.0)) * waterEffectScale
+            : 0.0;
+    const float sparseRippleEmissionAdd = sparseRipple.emissionAdd;
     outSourceColor =
         vec4(
-            ApplyWaterEffectColor(
-                mix(sourceColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
-                pointIndex),
+            ApplySparseRippleColor(
+                ApplyWaterEffectColor(
+                    mix(sourceColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+                    pointIndex,
+                    waterEffectScale),
+                sparseRipple),
             sourceColor.a);
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding, pointIndex);
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
@@ -791,11 +1103,17 @@ void main() {
         pointIndex);
     outOpacity = clamp(
         (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
-             waterEffectOpacityMultiply) +
-            waterEffectOpacityAdd,
+             waterEffectOpacityMultiply *
+             sparseRippleOpacityMultiply) +
+            waterEffectOpacityAdd +
+            sparseRippleOpacityAdd,
         0.0,
         4.0);
-    outEmissive = animatedFlow.y + caustic * max(0.0, styleData.causticParams1.y) + waterEffectEmissionAdd;
+    outEmissive =
+        animatedFlow.y +
+        caustic * max(0.0, styleData.causticParams1.y) +
+        waterEffectEmissionAdd +
+        sparseRippleEmissionAdd;
     outXray = EvaluateBinding(styleData.xrayBinding, pointIndex);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding, pointIndex);
     outViewDepth = -viewPosition.z;

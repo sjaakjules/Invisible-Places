@@ -16,6 +16,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(INVISIBLE_PLACES_ENABLE_VULKAN "Enable Vulkan toolchain checks during configure." ON)
 option(INVISIBLE_PLACES_ENABLE_TESTS "Enable unit tests when Catch2 is available." ON)
 option(
+    INVISIBLE_PLACES_ENABLE_GUI_SMOKE_TESTS
+    "Enable opt-in native GUI smoke tests that require a visible Vulkan-capable window."
+    OFF
+)
+option(
     INVISIBLE_PLACES_ENABLE_FETCHCONTENT_GS
     "Allow FetchContent as an exception path for Gaussian splat integration."
     OFF
@@ -67,6 +72,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_caustics.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
 )
 
@@ -205,5 +211,44 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         catch_discover_tests(invisible_places_tests)
     else()
         message(STATUS "Catch2 not found yet. Tests will activate automatically once dependencies are installed.")
+    endif()
+
+    if(INVISIBLE_PLACES_ENABLE_GUI_SMOKE_TESTS)
+        add_test(
+            NAME water-region-sample-terrestrial-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke water-region-sample-terrestrial
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
+        )
+        set_tests_properties(
+            water-region-sample-terrestrial-gui-smoke
+            PROPERTIES LABELS gui_smoke
+        )
+        add_test(
+            NAME water-region-test-points-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke water-region-test-points
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
+        )
+        set_tests_properties(
+            water-region-test-points-gui-smoke
+            PROPERTIES LABELS gui_smoke
+        )
+        add_test(
+            NAME water-ripple-patterns-test-points-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke water-ripple-patterns-test-points
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
+        )
+        set_tests_properties(
+            water-ripple-patterns-test-points-gui-smoke
+            PROPERTIES LABELS gui_smoke
+        )
     endif()
 endif()

@@ -2,15 +2,23 @@
 
 #include "io/PointCloudData.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
 
 namespace invisible_places::water {
 
@@ -59,6 +67,56 @@ enum class WaterRippleOverlayType {
     FoamSparkle,
     SaltMineralShimmer
 };
+
+constexpr std::size_t kWaterRippleOverlayTypeCount = 11U;
+
+enum class WaterRipplePatternControl {
+    PatternScale,
+    WavelengthMeters,
+    Speed,
+    Warp,
+    Turbulence,
+    Density,
+    Direction
+};
+
+struct WaterRipplePatternControlSpec {
+    WaterRipplePatternControl control = WaterRipplePatternControl::PatternScale;
+    std::string_view label;
+    std::string_view tooltip;
+    float minimum = 0.0F;
+    float maximum = 1.0F;
+    bool logarithmic = false;
+};
+
+struct WaterRipplePatternSettings {
+    float patternScale = 0.0F;
+    float wavelengthMeters = 0.0F;
+    float speed = 0.0F;
+    float warp = 0.0F;
+    float turbulence = 0.0F;
+    float density = 0.0F;
+    float phase = 0.0F;
+    float directionX = 0.0F;
+    float directionY = 0.0F;
+    float directionZ = 0.0F;
+};
+
+struct WaterEffectLayer;
+
+[[nodiscard]] std::array<WaterRippleOverlayType, 11> AllWaterRippleOverlayTypes();
+[[nodiscard]] std::string_view WaterRippleOverlayTypeDescription(WaterRippleOverlayType type);
+[[nodiscard]] std::string_view WaterRippleOverlayTypeNameForStorage(WaterRippleOverlayType type);
+[[nodiscard]] std::optional<WaterRippleOverlayType> ParseWaterRippleOverlayTypeName(std::string_view value);
+[[nodiscard]] std::size_t WaterRippleOverlayTypeIndex(WaterRippleOverlayType type);
+[[nodiscard]] WaterRipplePatternSettings DefaultWaterRipplePatternSettings(WaterRippleOverlayType type);
+[[nodiscard]] std::span<const WaterRipplePatternControlSpec> WaterRipplePatternControlSpecs(
+    WaterRippleOverlayType type);
+[[nodiscard]] WaterRipplePatternSettings ActiveWaterRipplePatternSettings(const WaterEffectLayer& layer);
+void StoreActiveWaterRipplePatternSettings(WaterEffectLayer* layer);
+void ApplyWaterRipplePatternSettings(WaterEffectLayer* layer, const WaterRipplePatternSettings& settings);
+void ApplyActiveWaterRipplePatternSettings(WaterEffectLayer* layer);
+void InitializeWaterRipplePatternSettings(WaterEffectLayer* layer);
 
 enum class WaterEffectBlendMode {
     Add,
@@ -166,10 +224,66 @@ struct WaterEffectLayer {
     float directionX = 1.0F;
     float directionY = 0.0F;
     float directionZ = 0.0F;
+    float density = 0.55F;
+    std::array<WaterRipplePatternSettings, kWaterRippleOverlayTypeCount> overlayPatternSettings{};
     std::uint32_t seed = 1;
     std::uint32_t maxAffectedPoints = 250000;
     WaterEffectResponseSettings response{};
 };
+
+struct WaterRegionSelection;
+
+struct WaterRippleRuntimeMembership {
+    std::uint32_t pointIndex = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t paramIndex = 0;
+    float edgeDistance = 0.0F;
+    float seed = 0.0F;
+};
+
+struct WaterRippleRuntimeParams {
+    WaterRippleOverlayType overlayType = WaterRippleOverlayType::CausticLace;
+    WaterEffectBlendMode blendMode = WaterEffectBlendMode::Add;
+    std::uint32_t layerId = 0;
+    std::uint32_t seed = 1;
+    glm::vec3 regionCenter{0.0F, 0.0F, 0.0F};
+    glm::vec3 direction{1.0F, 0.0F, 0.0F};
+    float regionStrength = 1.0F;
+    float edgeBlendWidth = 0.60F;
+    float patternScale = 1.0F;
+    float wavelengthMeters = 0.25F;
+    float speed = 0.55F;
+    float warp = 0.35F;
+    float turbulence = 0.06F;
+    float density = 0.55F;
+    float phase = 0.0F;
+    WaterEffectResponseSettings response{};
+};
+
+struct WaterRippleRuntimeContribution {
+    float scale = 0.0F;
+    float colourMix = 0.0F;
+    float emissionAdd = 0.0F;
+    float opacityAdd = 0.0F;
+    float opacityMultiply = 1.0F;
+    float pointSizeAdd = 0.0F;
+    float pointSizeMultiply = 1.0F;
+    glm::vec3 colour{0.62F, 0.88F, 1.0F};
+};
+
+[[nodiscard]] WaterRippleRuntimeParams BuildWaterRippleRuntimeParams(
+    const WaterEffectLayer& layer,
+    const WaterRegionSelection& selection);
+
+[[nodiscard]] std::vector<WaterRippleRuntimeMembership> BuildWaterRippleRuntimeMemberships(
+    const WaterRegionSelection& selection,
+    std::uint32_t paramIndex);
+
+[[nodiscard]] WaterRippleRuntimeContribution EvaluateWaterRippleRuntimeContribution(
+    const WaterRippleRuntimeParams& params,
+    const WaterRippleRuntimeMembership& membership,
+    const invisible_places::io::Float3& position,
+    const invisible_places::io::Float3& normal,
+    float timeSeconds);
 
 struct WaterFlowStreamSettings {
     bool enabled = true;
@@ -181,6 +295,7 @@ struct WaterFlowStreamSettings {
     float surfaceOffsetMeters = 0.004F;
     float pathAttraction = 0.85F;
     float laneSpreadMeters = 0.12F;
+    float laneCrossing = 0.22F;
     float streamSmoothness = 0.85F;
     float streamLooseness = 0.08F;
     float turbulence = 0.06F;
@@ -243,11 +358,62 @@ struct WaterFieldNode {
 
 struct WaterFieldCache {
     std::uint32_t schemaVersion = 1;
+    std::filesystem::path supportLayerPath;
     std::string supportSignature;
+    std::string settingsFingerprint;
+    std::string regionFingerprint;
     WaterFieldSettings settings{};
     std::vector<invisible_places::io::Float3> regionBoundary;
     std::vector<WaterFieldNode> nodes;
     bool stale = false;
+};
+
+struct WaterRegionSelectedPoint {
+    std::uint32_t pointIndex = std::numeric_limits<std::uint32_t>::max();
+    invisible_places::io::Float3 position{};
+    invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
+    float edgeDistance = 0.0F;
+    float edgeWeight = 1.0F;
+    std::vector<float> scalarValues;
+    invisible_places::io::Float3 fieldVector{1.0F, 0.0F, 0.0F};
+    float fieldWetness = 1.0F;
+    float fieldConfidence = 1.0F;
+    bool flowBlocked = false;
+    bool bridgeAllowed = false;
+    bool bridgeBlocked = false;
+    WaterEffectBlendMode blendMode = WaterEffectBlendMode::Add;
+    WaterEffectResponseSettings response{};
+    std::uint32_t sourceLayerId = 0;
+    float effectSpeed = 0.55F;
+};
+
+struct WaterRegionSelection {
+    std::uint32_t layerId = 0;
+    WaterEffectFeatureType featureType = WaterEffectFeatureType::Ripple;
+    std::filesystem::path targetLayerSourcePath;
+    std::string targetLayerKey;
+    std::vector<invisible_places::io::Float3> boundary;
+    std::vector<invisible_places::io::Float3> hull;
+    invisible_places::io::Bounds3f bounds{};
+    std::vector<WaterRegionSelectedPoint> points;
+
+    [[nodiscard]] bool Valid() const { return boundary.size() >= 3U; }
+};
+
+struct WaterRegionSelectionOptions {
+    bool previewOnly = false;
+    std::span<const std::uint32_t> candidatePointIndices{};
+    const glm::mat4* visibleViewProjection = nullptr;
+    const std::stop_token* stopToken = nullptr;
+    std::function<void(std::size_t, std::size_t)> progress;
+};
+
+struct WaterFieldSourcePoint {
+    invisible_places::io::Float3 position{};
+    std::uint32_t sourceId = 0;
+    float radiusMeters = 0.10F;
+    float strength = 1.0F;
+    std::uint32_t seed = 1;
 };
 
 struct WaterStreamSample {
@@ -273,6 +439,18 @@ struct WaterStreamSample {
     float streamConfidence = 1.0F;
     float wetness = 1.0F;
     float featureType = 0.0F;
+    float streamRole = 1.0F;
+    float routeStartIndex = 0.0F;
+    float routePointCount = 0.0F;
+    float routeLength = 1.0F;
+    float streamStartPhase = 0.0F;
+    float streamLateralOffset = 0.0F;
+    float streamLaneIndex = 0.0F;
+    float streamLaneCount = 1.0F;
+    float streamLanePitch = 0.00025F;
+    float streamLaneSpan = 0.0F;
+    float streamLaneCrossing = 0.22F;
+    float streamCrossSeed = 0.0F;
 };
 
 struct WaterFieldStreamDiagnostics {
@@ -321,6 +499,16 @@ struct WaterEffectPoint {
     float sizeHint = 0.0F;
     float sizeMultiplyHint = 1.0F;
     float colourMixHint = 0.0F;
+    float ripplePotential = 0.0F;
+    float rippleEmissionHint = 0.0F;
+    float rippleOpacityHint = 0.0F;
+    float rippleOpacityMultiplyHint = 1.0F;
+    float rippleSizeHint = 0.0F;
+    float rippleSizeMultiplyHint = 1.0F;
+    float rippleColourMixHint = 0.0F;
+    float wavelength = 0.25F;
+    float warp = 0.0F;
+    float phase = 0.0F;
     float fieldFlowU = 0.0F;
     float fieldWetness = 1.0F;
     float fieldSurfaceConfidence = 1.0F;
@@ -343,6 +531,19 @@ struct WaterEffectCompositionFields {
     std::vector<float> colourGreen;
     std::vector<float> colourBlue;
     std::vector<float> colourMix;
+    std::vector<float> rippleMask;
+    std::vector<float> rippleEdge;
+    std::vector<float> rippleValue;
+    std::vector<float> rippleSeed;
+    std::vector<float> rippleRegionId;
+    std::vector<float> rippleDistance;
+    std::vector<float> rippleLinearCoord;
+    std::vector<float> rippleAngle;
+    std::vector<float> rippleSpeed;
+    std::vector<float> rippleConfidence;
+    std::vector<float> rippleWavelength;
+    std::vector<float> rippleWarp;
+    std::vector<float> ripplePhase;
     std::size_t affectedPointCount = 0;
 };
 
@@ -425,6 +626,32 @@ struct WaterOverlayPoint {
 struct WaterOverlay {
     std::vector<WaterOverlayPoint> points;
     invisible_places::io::Bounds3f bounds{};
+};
+
+enum class WaterAnimatedTrailMotionMode {
+    Path,
+    VectorField
+};
+
+struct WaterAnimatedTrailPath {
+    WaterAnimatedTrailMotionMode motionMode = WaterAnimatedTrailMotionMode::Path;
+    std::uint32_t sourceId = 0;
+    std::vector<WaterOverlayPoint> anchors;
+};
+
+struct WaterAnimatedTrailBuildSettings {
+    std::uint32_t trailCountTotal = 700;
+    float trailLengthMeters = 0.75F;
+    float trailPointSpacingMeters = 0.010F;
+    float trailWidthMeters = 0.006F;
+    float trailWorldLengthMeters = 0.045F;
+    float surfaceOffsetMeters = 0.004F;
+    float laneSpreadMeters = 0.12F;
+    float turbulence = 0.06F;
+    float laneCrossing = 0.22F;
+    float speedMetersPerSecond = 0.45F;
+    std::uint32_t seed = 1;
+    float featureType = 0.0F;
 };
 
 enum class WaterTrailBuildQuality {
@@ -646,6 +873,20 @@ struct WaterPathCache {
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEmitter>& emitters,
     const WaterSettingsBundle& settings);
+[[nodiscard]] WaterRegionSelection BuildWaterRegionSelection(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const WaterEffectLayer& layer,
+    const WaterRegionSelectionOptions& options = {});
+[[nodiscard]] std::vector<WaterRegionSelection> BuildWaterRegionSelections(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<WaterEffectLayer>& layers,
+    WaterEffectFeatureType featureType,
+    const WaterRegionSelectionOptions& options = {});
+[[nodiscard]] std::string WaterEffectLayersFingerprint(const std::vector<WaterEffectLayer>& layers);
+[[nodiscard]] std::string WaterFieldSettingsFingerprint(const WaterFieldSettings& settings);
+[[nodiscard]] WaterStreamOverlay BuildAnimatedWaterTrailOverlay(
+    const std::vector<WaterAnimatedTrailPath>& paths,
+    const WaterAnimatedTrailBuildSettings& settings);
 [[nodiscard]] WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFlowStreamSettings& settings);
@@ -659,9 +900,21 @@ struct WaterPathCache {
 [[nodiscard]] WaterStreamOverlay BuildFieldStreamOverlay(
     const WaterFieldCache& fieldCache,
     const WaterFieldStreamSettings& settings);
+[[nodiscard]] WaterStreamOverlay BuildFieldStreamOverlay(
+    const WaterFieldCache& fieldCache,
+    const WaterFieldStreamSettings& settings,
+    const std::vector<WaterEmitter>& emitters);
 [[nodiscard]] WaterEffectOverlay GenerateRippleEffectOverlay(
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEffectLayer>& layers);
+[[nodiscard]] WaterEffectOverlay GenerateRippleEffectOverlayFromPointIndices(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const WaterEffectLayer& layer,
+    const std::vector<std::uint32_t>& pointIndices);
+[[nodiscard]] WaterEffectOverlay GenerateRippleEffectOverlayFromSelection(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const WaterEffectLayer& layer,
+    const WaterRegionSelection& selection);
 [[nodiscard]] WaterEffectOverlay GenerateFieldSurfaceEffectOverlay(
     const WaterFieldCache& fieldCache,
     const WaterEffectLayer& layer);
@@ -683,6 +936,13 @@ struct WaterPathCache {
 [[nodiscard]] std::vector<invisible_places::io::Float3> BuildWaterRegionHull(
     const std::vector<invisible_places::io::Float3>& vertices);
 
+bool SaveWaterFieldCacheBinary(
+    const WaterFieldCache& cache,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage);
+[[nodiscard]] std::optional<WaterFieldCache> LoadWaterFieldCacheBinary(
+    const std::filesystem::path& inputPath,
+    std::string* errorMessage);
 bool WriteWaterOverlayPly(
     const WaterOverlay& overlay,
     const std::filesystem::path& outputPath,

@@ -66,6 +66,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     uvec4 waterEffectControl;
     uvec4 waterEffectSlots0;
     uvec4 waterEffectSlots1;
+    uvec4 rippleEffectSlots0;
+    uvec4 rippleEffectSlots1;
+    uvec4 rippleEffectSlots2;
+    uvec4 rippleEffectSlots3;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
 } styleData;

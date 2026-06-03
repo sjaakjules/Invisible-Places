@@ -6,9 +6,11 @@
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "water/WaterFlow.hpp"
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -113,6 +115,11 @@ struct PointCloudExrFrameRequest {
     bool previewDensity = true;
 };
 
+struct PointHighlightStyle {
+    std::array<float, 4> color{0.45F, 0.88F, 1.0F, 0.86F};
+    bool pulseAlpha = true;
+};
+
 class VulkanViewportShell {
   public:
     explicit VulkanViewportShell(GLFWwindow* window);
@@ -132,10 +139,32 @@ class VulkanViewportShell {
         std::size_t layerId,
         const invisible_places::io::LoadedPointCloud& cloud,
         const std::vector<std::uint32_t>& sampledIndices);
+    void UploadPointCloudScalarFields(
+        std::size_t layerId,
+        const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+        const std::vector<float>& scalarFieldValues);
+    void UploadSparseWaterRippleMembership(
+        std::size_t layerId,
+        const std::vector<invisible_places::water::WaterRippleRuntimeMembership>& memberships,
+        const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
+    void UpdateSparseWaterRippleParams(
+        std::size_t layerId,
+        const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
+    [[nodiscard]] std::size_t SparseWaterRippleEffectCount(std::size_t layerId) const;
+    [[nodiscard]] std::size_t SparseWaterRippleRegionCount(std::size_t layerId) const;
+    [[nodiscard]] std::uint64_t SparseWaterRippleMembershipUploadRevision(std::size_t layerId) const;
+    [[nodiscard]] std::uint64_t SparseWaterRippleParamsUploadRevision(std::size_t layerId) const;
     void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
     void UpdateInteractivePointSampleBuffer(
         std::size_t layerId,
         const std::vector<std::uint32_t>& sampledIndices);
+    void UploadPointHighlightIndices(
+        std::size_t layerId,
+        std::uint64_t key,
+        const std::vector<std::uint32_t>& indices,
+        const PointHighlightStyle& style = {});
+    void ClearPointHighlightIndices(std::size_t layerId, std::uint64_t key);
+    void ClearPointHighlights(std::size_t layerId);
     void RemovePointCloud(std::size_t layerId);
     void ClearPointClouds();
     void UploadGaussianSplats(std::size_t layerId, const invisible_places::io::LoadedGaussianSplat& splats);
@@ -177,12 +206,25 @@ class VulkanViewportShell {
     };
 
     struct ActivePointCloudResources {
+        struct PointHighlightResources {
+            std::uint64_t key = 0;
+            BufferAllocation indexBuffer{};
+            BufferAllocation surfelIndexBuffer{};
+            std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
+            std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+            std::uint32_t indexCount = 0;
+            PointHighlightStyle style{};
+        };
+
         std::size_t layerId = 0;
         BufferAllocation positionBuffer{};
         BufferAllocation positionStorageBuffer{};
         BufferAllocation colorBuffer{};
         BufferAllocation normalBuffer{};
         BufferAllocation scalarFieldBuffer{};
+        BufferAllocation sparseRippleRangeBuffer{};
+        BufferAllocation sparseRippleMembershipBuffer{};
+        BufferAllocation sparseRippleParamsBuffer{};
         std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
         BufferAllocation exrStyleBuffer{};
         std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
@@ -195,10 +237,16 @@ class VulkanViewportShell {
         std::uint32_t activePointCount = 0;
         std::uint32_t interactiveSampledIndexCount = 0;
         std::uint32_t scalarFieldCount = 0;
+        std::uint32_t sparseRippleMembershipCount = 0;
+        std::uint32_t sparseRippleParamCount = 0;
+        std::uint64_t sparseRippleMembershipUploadRevision = 0;
+        std::uint64_t sparseRippleParamsUploadRevision = 0;
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
         std::vector<invisible_places::io::Float3> cpuPositions;
+        std::vector<std::uint32_t> activeSparseRipplePointIndices;
+        std::vector<PointHighlightResources> highlights;
     };
 
     struct PointCloudDrawPlan {
@@ -328,6 +376,15 @@ class VulkanViewportShell {
         std::size_t frameIndex,
         std::uint32_t imageIndex,
         VkImageView sceneDepthView);
+    void UpdatePointHighlightDescriptorSets(
+        ActivePointCloudResources* resources,
+        ActivePointCloudResources::PointHighlightResources* highlight);
+    void UpdatePointHighlightDescriptorSet(
+        ActivePointCloudResources* resources,
+        ActivePointCloudResources::PointHighlightResources* highlight,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
+        VkImageView sceneDepthView);
     void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
     void CreateOrUpdateCompositeDescriptorSet();
     void CreateOrUpdateCompositeDescriptorSet(
@@ -352,6 +409,7 @@ class VulkanViewportShell {
     void RefreshHighQualityGaussianScene(std::size_t frameIndex);
     void CleanupSwapchain();
     void CleanupPointCloudResources(ActivePointCloudResources* resources);
+    void CleanupPointHighlightResources(ActivePointCloudResources::PointHighlightResources* highlight);
     void CleanupGaussianSplatResources(ActiveGaussianSplatResources* resources);
     void CleanupHighQualityGaussianScene();
     void CleanupExrExportResources();
@@ -368,7 +426,8 @@ class VulkanViewportShell {
         const SceneRenderState::PointCloudLayerState& layer,
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
-        bool exrStyle);
+        bool exrStyle,
+        const BufferAllocation* styleBufferOverride = nullptr);
     [[nodiscard]] bool RecordPointCloudLayerDraw(
         VkCommandBuffer commandBuffer,
         const SceneRenderState::PointCloudLayerState& layer,
@@ -379,6 +438,15 @@ class VulkanViewportShell {
         std::size_t frameIndex,
         std::uint32_t imageIndex,
         bool exrStyle,
+        std::uint32_t* recordedDrawPointCount = nullptr);
+    [[nodiscard]] bool RecordPointCloudHighlightDraw(
+        VkCommandBuffer commandBuffer,
+        const SceneRenderState::PointCloudLayerState& layer,
+        const ActivePointCloudResources::PointHighlightResources& highlight,
+        VkPipeline spritePipeline,
+        VkPipeline surfelPipeline,
+        std::size_t frameIndex,
+        std::uint32_t imageIndex,
         std::uint32_t* recordedDrawPointCount = nullptr);
     void UpdateUniformBuffer(std::size_t frameIndex);
     void UploadFrameUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);

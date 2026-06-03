@@ -51,21 +51,23 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     uvec4 waterEffectControl;
     uvec4 waterEffectSlots0;
     uvec4 waterEffectSlots1;
+    uvec4 rippleEffectSlots0;
+    uvec4 rippleEffectSlots1;
+    uvec4 rippleEffectSlots2;
+    uvec4 rippleEffectSlots3;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
 } styleData;
+
+#include "pointcloud_sparse_ripple.glsl"
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
 const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterJitterSeedFieldSlot = 12u;
 const uint kWaterTrailAgeFieldSlot = 13u;
-const uint kWaterStreamPointSeedFieldSlot = 5u;
-const uint kWaterStreamPointAgeFieldSlot = 8u;
-const uint kWaterStreamSpeedFieldSlot = 10u;
-const uint kWaterStreamConfidenceFieldSlot = 13u;
-const uint kWaterStreamWetnessFieldSlot = 14u;
-const uint kWaterStreamTangentZFieldSlot = 18u;
+const uint kWaterStreamRoleFieldSlot = 0u;
+const uint kWaterStreamTangentZFieldSlot = 24u;
 
 float LoadScalarFieldValue(uint fieldSlot) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -116,8 +118,60 @@ float WaterEffectField(uint slotPlusOne, float fallback) {
     return LoadScalarFieldValue(slotPlusOne - 1u);
 }
 
-vec3 ApplyWaterEffectColor(vec3 baseColor) {
-    const float mixAmount = clamp(WaterEffectField(styleData.waterEffectSlots0.z, 0.0), 0.0, 1.0);
+bool HasRippleEffectFields() {
+    return styleData.rippleEffectSlots0.x != 0u &&
+           styleData.rippleEffectSlots0.y != 0u &&
+           styleData.rippleEffectSlots0.z != 0u &&
+           styleData.rippleEffectSlots0.w != 0u &&
+           styleData.rippleEffectSlots1.x != 0u &&
+           styleData.rippleEffectSlots1.y != 0u &&
+           styleData.rippleEffectSlots1.w != 0u &&
+           styleData.rippleEffectSlots2.x != 0u &&
+           styleData.rippleEffectSlots2.y != 0u &&
+           styleData.rippleEffectSlots2.z != 0u &&
+           styleData.rippleEffectSlots2.w != 0u;
+}
+
+float RippleEffectField(uint slotPlusOne, float fallback) {
+    if (!HasRippleEffectFields() || slotPlusOne == 0u) {
+        return fallback;
+    }
+    return LoadScalarFieldValue(slotPlusOne - 1u);
+}
+
+float ResolveRippleEffectScale() {
+    if (!HasRippleEffectFields()) {
+        return 1.0;
+    }
+    const float mask = clamp(RippleEffectField(styleData.rippleEffectSlots0.x, 0.0), 0.0, 1.0);
+    if (mask <= 1e-5) {
+        return 1.0;
+    }
+    const float edge = clamp(RippleEffectField(styleData.rippleEffectSlots0.y, 0.0), 0.0, 1.0);
+    const float value = clamp(RippleEffectField(styleData.rippleEffectSlots0.z, 0.0), 0.0, 1.0);
+    const float seed = RippleEffectField(styleData.rippleEffectSlots0.w, 0.0);
+    const float distance = RippleEffectField(styleData.rippleEffectSlots1.x, 0.0);
+    const float linearCoord = RippleEffectField(styleData.rippleEffectSlots1.y, 0.0);
+    const float speed = max(0.0, RippleEffectField(styleData.rippleEffectSlots1.w, 0.0));
+    const float confidence = clamp(RippleEffectField(styleData.rippleEffectSlots2.x, 0.0), 0.0, 1.0);
+    const float wavelength = max(0.005, RippleEffectField(styleData.rippleEffectSlots2.y, 0.25));
+    const float warp = max(0.0, RippleEffectField(styleData.rippleEffectSlots2.z, 0.0));
+    const float phaseOffset = RippleEffectField(styleData.rippleEffectSlots2.w, 0.0);
+    const float time = max(0.0, styleData.renderParams3.w);
+    const float ripplePhase =
+        (linearCoord / wavelength) -
+        (time * speed) +
+        phaseOffset +
+        (seed * 0.173);
+    const float warpPhase =
+        sin(((distance / wavelength) + time * 0.37 + seed) * 6.28318530718) * warp;
+    const float wave = 0.5 + 0.5 * cos((ripplePhase + warpPhase) * 6.28318530718);
+    const float crest = smoothstep(0.42, 1.0, wave);
+    return clamp(value * mask * edge * confidence * (0.18 + 0.82 * crest), 0.0, 1.0);
+}
+
+vec3 ApplyWaterEffectColor(vec3 baseColor, float waterEffectScale) {
+    const float mixAmount = clamp(WaterEffectField(styleData.waterEffectSlots0.z, 0.0) * waterEffectScale, 0.0, 1.0);
     if (mixAmount <= 1e-5) {
         return baseColor;
     }
@@ -211,19 +265,6 @@ vec3 ApplyColorize(vec3 baseColor) {
     return mix(baseColor, HslToRgb(vec3(tintHsl.x, tintHsl.y, sourceHsl.z)), amount);
 }
 
-float WaterStreamEnergy() {
-    const float age = clamp(LoadScalarFieldValue(kWaterStreamPointAgeFieldSlot), 0.0, 1.0);
-    const float speed = max(0.001, LoadScalarFieldValue(kWaterStreamSpeedFieldSlot));
-    const float confidence = clamp(LoadScalarFieldValue(kWaterStreamConfidenceFieldSlot), 0.0, 1.0);
-    const float wetness = clamp(LoadScalarFieldValue(kWaterStreamWetnessFieldSlot), 0.0, 1.0);
-    const float seed = LoadScalarFieldValue(kWaterStreamPointSeedFieldSlot);
-    const float time = max(0.0, styleData.renderParams3.w);
-    const float animatedAge = fract(age - time * speed * 0.18 + seed);
-    const float fade = 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, animatedAge), 1.35);
-    const float pulse = 0.78 + 0.22 * sin((seed + animatedAge + time * speed * 0.07) * 6.28318530718);
-    return clamp(confidence * wetness * fade * pulse, 0.0, 1.0);
-}
-
 vec3 ResolveBaseColor() {
     vec3 baseColor = styleData.solidColor.rgb;
     if (styleData.globalControl.x == 0u && styleData.globalControl.w != 0u) {
@@ -238,15 +279,27 @@ vec3 ResolveBaseColor() {
     baseColor = ApplyColorize(baseColor);
     float previewTint = 0.0;
     const float caustic = ResolveCausticStrength(previewTint);
-    return ApplyWaterEffectColor(
-        mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)));
+    const float waterEffectScale = ResolveRippleEffectScale();
+    const SparseRippleComposite sparseRipple =
+        ResolveSparseRippleComposite(inWorldPosition, inPointNormal, inPointIndex, styleData.renderParams3.w);
+    return ApplySparseRippleColor(
+        ApplyWaterEffectColor(
+            mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+            waterEffectScale),
+        sparseRipple);
 }
 
 void main() {
     float waterTrailFade = 1.0;
     if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot) {
-        waterTrailFade = WaterStreamEnergy();
-        outColor = vec4(ResolveBaseColor() * waterTrailFade, 1.0);
+        if (LoadScalarFieldValue(kWaterStreamRoleFieldSlot) < 0.5) {
+            discard;
+        }
+        outColor = vec4(ResolveBaseColor(), 1.0);
+        return;
+    }
+    if (styleData.pointMeta.w == 3u) {
+        outColor = vec4(ResolveBaseColor(), 1.0);
         return;
     }
     if (styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot) {
