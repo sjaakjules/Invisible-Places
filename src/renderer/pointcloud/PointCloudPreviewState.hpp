@@ -3,9 +3,12 @@
 #include "io/PointCloudData.hpp"
 #include "style/RenderParameterBinding.hpp"
 
+#include <glm/mat4x4.hpp>
+
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -238,6 +241,11 @@ std::vector<std::uint32_t> GenerateSpatialSampleIndices(
     const std::vector<invisible_places::io::Float3>& positions,
     const invisible_places::io::Bounds3f& bounds,
     std::uint64_t requestedPoints);
+std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
+    const std::vector<invisible_places::io::Float3>& positions,
+    const invisible_places::io::Bounds3f& bounds,
+    std::span<const glm::mat4> viewProjections,
+    std::uint32_t gridDimension = 64U);
 std::vector<std::uint32_t> GenerateSurfelEncodedSampleIndices(
     const std::vector<std::uint32_t>& sampledPointIndices);
 

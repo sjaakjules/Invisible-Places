@@ -48,6 +48,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -937,6 +938,52 @@ TEST_CASE("Spatial point budget keeps full-resolution draws unsampled", "[budget
         3);
     REQUIRE(capped.size() == 3);
     CHECK(fullBudget.activePoints == cloud.PointCount());
+}
+
+TEST_CASE("Frustum union point mask keeps full-density visible points", "[budget][frustum][export]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    const std::array<invisible_places::io::Float3, 5> points = {
+        invisible_places::io::Float3{-4.0F, 0.0F, 0.0F},
+        invisible_places::io::Float3{-0.25F, 0.0F, 0.0F},
+        invisible_places::io::Float3{0.25F, 0.0F, 0.0F},
+        invisible_places::io::Float3{4.0F, 0.0F, 0.0F},
+        invisible_places::io::Float3{0.0F, 2.5F, 0.0F},
+    };
+    for (const auto& point : points) {
+        cloud.positions.push_back(point);
+        cloud.bounds.Expand(point);
+    }
+
+    const std::vector<glm::mat4> centerView{
+        glm::ortho(-0.5F, 0.5F, -0.5F, 0.5F, -1.0F, 1.0F),
+    };
+    const auto centerMask = invisible_places::renderer::pointcloud::GenerateFrustumUnionPointIndices(
+        cloud.positions,
+        cloud.bounds,
+        std::span<const glm::mat4>{centerView.data(), centerView.size()},
+        32U);
+
+    CHECK(std::is_sorted(centerMask.begin(), centerMask.end()));
+    CHECK(std::find(centerMask.begin(), centerMask.end(), 1U) != centerMask.end());
+    CHECK(std::find(centerMask.begin(), centerMask.end(), 2U) != centerMask.end());
+    CHECK(std::find(centerMask.begin(), centerMask.end(), 0U) == centerMask.end());
+    CHECK(std::find(centerMask.begin(), centerMask.end(), 3U) == centerMask.end());
+    CHECK(std::find(centerMask.begin(), centerMask.end(), 4U) == centerMask.end());
+
+    const std::vector<glm::mat4> pathViews{
+        glm::ortho(-4.25F, -3.75F, -0.5F, 0.5F, -1.0F, 1.0F),
+        glm::ortho(3.75F, 4.25F, -0.5F, 0.5F, -1.0F, 1.0F),
+    };
+    const auto pathMask = invisible_places::renderer::pointcloud::GenerateFrustumUnionPointIndices(
+        cloud.positions,
+        cloud.bounds,
+        std::span<const glm::mat4>{pathViews.data(), pathViews.size()},
+        32U);
+
+    CHECK(std::find(pathMask.begin(), pathMask.end(), 0U) != pathMask.end());
+    CHECK(std::find(pathMask.begin(), pathMask.end(), 3U) != pathMask.end());
+    CHECK(std::find(pathMask.begin(), pathMask.end(), 1U) == pathMask.end());
+    CHECK(std::find(pathMask.begin(), pathMask.end(), 2U) == pathMask.end());
 }
 
 TEST_CASE("Orbit camera can move its pivot without changing the current view", "[camera][pivot]") {

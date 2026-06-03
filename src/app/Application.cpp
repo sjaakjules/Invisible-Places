@@ -154,6 +154,8 @@ constexpr float kPi = 3.14159265358979323846F;
 constexpr std::size_t kMaxPivotSamples = 65536;
 constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
 constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
+constexpr std::uint32_t kAnimationExportFrustumMaskGridDimension = 48U;
+constexpr double kAnimationExportFrustumMaskUsefulFraction = 0.85;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
 constexpr std::string_view kDefaultPointVisualName = invisible_places::app::point_visual::kDefaultName;
 constexpr std::string_view kPresetPointVisualSuffix = invisible_places::app::point_visual::kPresetSuffix;
@@ -369,6 +371,9 @@ struct OfflineRenderJobState {
     std::uint32_t writtenFrameCount = 0;
     std::size_t pendingFrameCount = 0;
     bool previewDensity = true;
+    bool exportFrustumMask = false;
+    std::uint64_t exportFrustumMaskDrawPoints = 0;
+    std::uint64_t exportFrustumMaskFullSourcePoints = 0;
     PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::Beauty;
     bool writerFinishRequested = false;
     bool quickMp4BatchJob = false;
@@ -10643,21 +10648,121 @@ bool HasOfflinePointLayers(const PreviewRuntimeState& runtimeState) {
         });
 }
 
+struct PointVisualExportOverride {
+    std::size_t sessionIndex = 0;
+    PointCloudStyleState style{};
+};
+
+struct AnimationExportFrustumMaskSummary {
+    bool enabled = false;
+    std::uint64_t effectiveDrawPoints = 0;
+    std::uint64_t fullSourcePoints = 0;
+};
+
+std::vector<glm::mat4> BuildAnimationExportViewProjections(
+    std::span<const invisible_places::camera::CameraState> frames,
+    const RenderJobSettings& settings) {
+    std::vector<glm::mat4> viewProjections;
+    viewProjections.reserve(frames.size());
+
+    invisible_places::camera::OrbitCamera camera;
+    const float aspectRatio =
+        static_cast<float>(std::max<std::uint32_t>(1U, settings.width)) /
+        static_cast<float>(std::max<std::uint32_t>(1U, settings.height));
+    for (const auto& frame : frames) {
+        camera.ApplyState(frame);
+        viewProjections.push_back(camera.Matrices(aspectRatio).viewProjection);
+    }
+    return viewProjections;
+}
+
+AnimationExportFrustumMaskSummary PrepareAnimationExportFrustumMasks(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::span<const invisible_places::camera::CameraState> frames,
+    const RenderJobSettings& settings,
+    const std::optional<PointVisualExportOverride>& visualOverride,
+    PointCloudRendererMode rendererMode) {
+    AnimationExportFrustumMaskSummary summary;
+    if (runtimeState == nullptr || viewport == nullptr || frames.empty()) {
+        return summary;
+    }
+
+    const auto viewProjections = BuildAnimationExportViewProjections(frames, settings);
+    if (viewProjections.empty()) {
+        return summary;
+    }
+
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+        auto& session = runtimeState->sessions[sessionIndex];
+        if (!session.loaded ||
+            !session.visible ||
+            session.kind != LayerKind::PointCloud ||
+            session.offlinePointCloud == nullptr ||
+            session.totalPrimitives == 0) {
+            continue;
+        }
+
+        summary.fullSourcePoints += session.totalPrimitives;
+        auto maskIndices = invisible_places::renderer::pointcloud::GenerateFrustumUnionPointIndices(
+            session.offlinePointCloud->positions,
+            session.offlinePointCloud->bounds,
+            std::span<const glm::mat4>{viewProjections.data(), viewProjections.size()},
+            kAnimationExportFrustumMaskGridDimension);
+        const double maskFraction =
+            session.totalPrimitives == 0
+                ? 1.0
+                : static_cast<double>(maskIndices.size()) / static_cast<double>(session.totalPrimitives);
+        const bool usefulMask =
+            !maskIndices.empty() &&
+            maskFraction < kAnimationExportFrustumMaskUsefulFraction;
+        if (!usefulMask) {
+            ClearPreviewLodSampleCache(&session);
+            viewport->UpdateInteractivePointSampleBuffer(sessionIndex, session.previewLodSampledIndices, false);
+            summary.effectiveDrawPoints += session.totalPrimitives;
+            continue;
+        }
+
+        auto exportStyle =
+            visualOverride.has_value() && visualOverride->sessionIndex == sessionIndex
+                ? visualOverride->style
+                : session.pointStyle;
+        if (IsGeneratedWaterOverlaySession(session) && !exportStyle.flowAnimation) {
+            exportStyle = MakeWaterTrailExportStyle(exportStyle);
+        }
+        const bool includeSurfelIndices =
+            rendererMode != PointCloudRendererMode::FastBasic &&
+            exportStyle.geometryMode != PointCloudGeometryMode::ScreenSprites;
+
+        session.previewLodSampledIndices = std::move(maskIndices);
+        session.previewLodRequestedDrawCount = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            session.totalPrimitives,
+            std::numeric_limits<std::uint32_t>::max()));
+        session.previewLodSampledDrawCount =
+            static_cast<std::uint32_t>(session.previewLodSampledIndices.size());
+        viewport->UpdateInteractivePointSampleBuffer(
+            sessionIndex,
+            session.previewLodSampledIndices,
+            includeSurfelIndices);
+        summary.enabled = true;
+        summary.effectiveDrawPoints += session.previewLodSampledDrawCount;
+    }
+
+    return summary;
+}
+
 std::uint64_t EffectiveAnimationExportPointDrawCount(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session,
     bool previewDensity,
     PointCloudRendererMode rendererMode) {
     (void)runtimeState;
-    (void)previewDensity;
+    if (previewDensity && session.previewLodSampledDrawCount > 0) {
+        return session.previewLodSampledDrawCount;
+    }
     (void)rendererMode;
     return session.totalPrimitives;
 }
-
-struct PointVisualExportOverride {
-    std::size_t sessionIndex = 0;
-    PointCloudStyleState style{};
-};
 
 std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState>
 BuildAnimationExportPointCloudLayerSnapshot(
@@ -11127,7 +11232,12 @@ std::string WriteExportLog(
     log << "Total frames planned: " << job.frames.size() << '\n';
     log << "Frames captured: " << job.currentFrame << '\n';
     log << "Frames written: " << job.writtenFrameCount << '\n';
-    log << "Preview density: " << (job.previewDensity ? "yes" : "no") << '\n';
+    log << "Preview density: " << (job.previewDensity && !job.exportFrustumMask ? "yes" : "no") << '\n';
+    log << "Camera-path frustum mask: " << (job.exportFrustumMask ? "yes" : "no") << '\n';
+    if (job.exportFrustumMask) {
+        log << "Frustum-mask draw points: " << job.exportFrustumMaskDrawPoints << '\n';
+        log << "Full-source visible-layer points: " << job.exportFrustumMaskFullSourcePoints << '\n';
+    }
     log << "Point renderer: " << PointCloudRendererModeLabel(job.pointCloudRendererMode) << '\n';
     log << "Export renderer: Beauty Raster\n";
     if (job.exportEyeDomeLightingEnabled) {
@@ -11686,13 +11796,20 @@ bool StartQuickMp4ExportJob(
         visualStyle = MakeWaterTrailExportStyle(visualStyle);
     }
 
-    const PointVisualExportOverride visualOverride{
+    const std::optional<PointVisualExportOverride> visualOverride{PointVisualExportOverride{
         .sessionIndex = request.visualSessionIndex,
         .style = visualStyle,
-    };
+    }};
+    const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
+        runtimeState,
+        viewport,
+        std::span<const invisible_places::camera::CameraState>{frames.data(), frames.size()},
+        settings,
+        visualOverride,
+        runtimeState->projectSettings.pointCloudRendererMode);
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
-        false,
+        frustumMaskSummary.enabled,
         visualOverride,
         runtimeState->projectSettings.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
@@ -11725,7 +11842,10 @@ bool StartQuickMp4ExportJob(
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
-        .previewDensity = false,
+        .previewDensity = frustumMaskSummary.enabled,
+        .exportFrustumMask = frustumMaskSummary.enabled,
+        .exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints,
+        .exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints,
         .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .quickMp4BatchJob = true,
         .quickMp4BatchIndex = runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
@@ -12101,8 +12221,6 @@ void StartStillCameraExportJob(
         }
     }
 
-    const bool exportUsesPreviewDensity = false;
-
     auto frames = BuildStillCameraRenderSequence(*runtimeState, settings);
     if (frames.empty()) {
         runtimeState->errorMessage = "Still-camera export did not produce any output frames.";
@@ -12110,10 +12228,16 @@ void StartStillCameraExportJob(
         return;
     }
 
+    const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
+        runtimeState,
+        viewport,
+        std::span<const invisible_places::camera::CameraState>{frames.data(), frames.size()},
+        settings,
+        std::nullopt,
+        runtimeState->projectSettings.pointCloudRendererMode);
+    const bool exportUsesPreviewDensity = frustumMaskSummary.enabled;
+
     std::vector<StillCameraPreviewLodPreparationRequest> preparationRequests;
-    if (viewport != nullptr && exportUsesPreviewDensity) {
-        preparationRequests = BuildStillCameraPreviewLodPreparationRequests(*runtimeState);
-    }
 
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
     auto preparationState = !preparationRequests.empty()
@@ -12138,6 +12262,9 @@ void StartStillCameraExportJob(
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
+        .exportFrustumMask = frustumMaskSummary.enabled,
+        .exportFrustumMaskDrawPoints = frustumMaskSummary.effectiveDrawPoints,
+        .exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints,
         .pointCloudRendererMode = runtimeState->projectSettings.pointCloudRendererMode,
         .stillCameraJob = true,
         .animationName = "Still Camera",
@@ -12541,7 +12668,7 @@ void DrawAnimationExportSection(
         panel.exportMode = exportModes[std::clamp(exportModeIndex, 0, 1)];
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        ImGui::TextDisabled("Fast MP4: full-cloud beauty export, sparse-point smoothing, no AOVs.");
+        ImGui::TextDisabled("Fast MP4: full-density camera-path frustum export, sparse-point smoothing, no AOVs.");
     } else {
         ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
     }
@@ -12594,7 +12721,7 @@ void DrawAnimationExportSection(
         MarkCurrentAnimationExportSettingsDirty(runtimeState);
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        ImGui::TextDisabled("Point density: full source clouds; MP4 smoothing fills tiny gaps during encode.");
+        ImGui::TextDisabled("Point density: full source inside the export frustum; off-camera points are skipped when useful.");
     } else {
         ImGui::SameLine();
         ImGui::Checkbox("Preview Density", &panel.exportPreviewDensity);
@@ -12784,7 +12911,11 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             job.frames.size());
         ImGui::Text("Queued: %zu", job.pendingFrameCount);
     }
-        ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
+        if (job.exportFrustumMask) {
+            ImGui::TextUnformatted("Renderer: GPU frustum mask, full visible density");
+        } else {
+            ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
+        }
     if (job.writePreviewMp4 && job.mp4SupersampleScale > 1U) {
         ImGui::Text(
             "MP4 supersample: %ux -> %u x %u",

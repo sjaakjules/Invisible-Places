@@ -1534,7 +1534,8 @@ void VulkanViewportShell::UpdatePointBudget(
 
 void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
     std::size_t layerId,
-    const std::vector<std::uint32_t>& sampledIndices) {
+    const std::vector<std::uint32_t>& sampledIndices,
+    bool includeSurfelIndices) {
     WaitIdle();
 
     auto* resources = FindPointCloudResources(layerId);
@@ -1559,16 +1560,18 @@ void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
         resources->interactiveSampledIndexBuffer.size);
     resources->interactiveSampledIndexCount = static_cast<std::uint32_t>(sampledIndices.size());
 
-    const auto surfelIndices =
-        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledIndices);
-    if (!surfelIndices.empty()) {
-        resources->interactiveSurfelIndexBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        UploadBufferData(
-            resources->interactiveSurfelIndexBuffer,
-            surfelIndices.data(),
-            resources->interactiveSurfelIndexBuffer.size);
+    if (includeSurfelIndices) {
+        const auto surfelIndices =
+            invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledIndices);
+        if (!surfelIndices.empty()) {
+            resources->interactiveSurfelIndexBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            UploadBufferData(
+                resources->interactiveSurfelIndexBuffer,
+                surfelIndices.data(),
+                resources->interactiveSurfelIndexBuffer.size);
+        }
     }
 }
 

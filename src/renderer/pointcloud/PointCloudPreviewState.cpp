@@ -6,6 +6,10 @@
 #include <numeric>
 #include <unordered_map>
 
+#include <glm/geometric.hpp>
+#include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
+
 namespace invisible_places::renderer::pointcloud {
 
 namespace {
@@ -131,6 +135,77 @@ float SquaredDistance(
     return (dx * dx) + (dy * dy) + (dz * dz);
 }
 
+struct FrustumPlane {
+    glm::vec3 normal{0.0F, 0.0F, 1.0F};
+    float distance = 0.0F;
+};
+
+std::array<FrustumPlane, 6> FrustumPlanes(const glm::mat4& viewProjection) {
+    const glm::vec4 row0{
+        viewProjection[0][0],
+        viewProjection[1][0],
+        viewProjection[2][0],
+        viewProjection[3][0]};
+    const glm::vec4 row1{
+        viewProjection[0][1],
+        viewProjection[1][1],
+        viewProjection[2][1],
+        viewProjection[3][1]};
+    const glm::vec4 row2{
+        viewProjection[0][2],
+        viewProjection[1][2],
+        viewProjection[2][2],
+        viewProjection[3][2]};
+    const glm::vec4 row3{
+        viewProjection[0][3],
+        viewProjection[1][3],
+        viewProjection[2][3],
+        viewProjection[3][3]};
+    const std::array<glm::vec4, 6> rawPlanes{
+        row3 + row0,
+        row3 - row0,
+        row3 + row1,
+        row3 - row1,
+        row3 + row2,
+        row3 - row2,
+    };
+
+    std::array<FrustumPlane, 6> planes{};
+    for (std::size_t index = 0; index < rawPlanes.size(); ++index) {
+        const glm::vec3 normal{rawPlanes[index].x, rawPlanes[index].y, rawPlanes[index].z};
+        const float length = glm::length(normal);
+        if (length <= 1.0e-7F || !std::isfinite(length)) {
+            continue;
+        }
+        planes[index].normal = normal / length;
+        planes[index].distance = rawPlanes[index].w / length;
+    }
+    return planes;
+}
+
+bool BoundsIntersectsFrustumPlanes(
+    const invisible_places::io::Float3& minimum,
+    const invisible_places::io::Float3& maximum,
+    const std::array<FrustumPlane, 6>& planes) {
+    for (const auto& plane : planes) {
+        const glm::vec3 positive{
+            plane.normal.x >= 0.0F ? maximum.x : minimum.x,
+            plane.normal.y >= 0.0F ? maximum.y : minimum.y,
+            plane.normal.z >= 0.0F ? maximum.z : minimum.z,
+        };
+        if (glm::dot(plane.normal, positive) + plane.distance < 0.0F) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::size_t FrustumCellIndex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint32_t dimension) {
+    return static_cast<std::size_t>(x) +
+           (static_cast<std::size_t>(y) * static_cast<std::size_t>(dimension)) +
+           (static_cast<std::size_t>(z) * static_cast<std::size_t>(dimension) * static_cast<std::size_t>(dimension));
+}
+
 invisible_places::io::Float3 VoxelCenter(
     const invisible_places::io::Bounds3f& bounds,
     const VoxelKey& key,
@@ -227,7 +302,8 @@ std::vector<VoxelCandidate> BuildOctreeCandidates(
         std::max<std::uint64_t>(reserveTarget, 1024ULL),
         static_cast<std::uint64_t>(positions.size()))));
 
-    for (std::uint32_t pointIndex = 0; pointIndex < positions.size(); ++pointIndex) {
+    const auto pointCount = static_cast<std::uint32_t>(positions.size());
+    for (std::uint32_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
         const auto& point = positions[pointIndex];
         const VoxelKey key{
             .x = VoxelCoordinate(point.x, bounds.minimum.x, config.xExtent, xDimension),
@@ -640,6 +716,102 @@ std::vector<std::uint32_t> GenerateSpatialSampleIndices(
     }
 
     return SelectStratifiedCandidateIndices(bestCandidates, clampedRequested);
+}
+
+std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
+    const std::vector<invisible_places::io::Float3>& positions,
+    const invisible_places::io::Bounds3f& bounds,
+    std::span<const glm::mat4> viewProjections,
+    std::uint32_t gridDimension) {
+    if (positions.empty() ||
+        !bounds.valid ||
+        viewProjections.empty() ||
+        positions.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return {};
+    }
+
+    const std::uint32_t dimension = std::clamp(gridDimension, 1U, 128U);
+    const auto cellCount =
+        static_cast<std::size_t>(dimension) *
+        static_cast<std::size_t>(dimension) *
+        static_cast<std::size_t>(dimension);
+    if (cellCount == 0) {
+        return {};
+    }
+
+    const float xExtent = bounds.maximum.x - bounds.minimum.x;
+    const float yExtent = bounds.maximum.y - bounds.minimum.y;
+    const float zExtent = bounds.maximum.z - bounds.minimum.z;
+    const float safeXExtent = std::max(xExtent, 1.0e-6F);
+    const float safeYExtent = std::max(yExtent, 1.0e-6F);
+    const float safeZExtent = std::max(zExtent, 1.0e-6F);
+    const float xCellExtent = safeXExtent / static_cast<float>(dimension);
+    const float yCellExtent = safeYExtent / static_cast<float>(dimension);
+    const float zCellExtent = safeZExtent / static_cast<float>(dimension);
+
+    std::vector<std::array<FrustumPlane, 6>> frustums;
+    frustums.reserve(viewProjections.size());
+    for (const auto& viewProjection : viewProjections) {
+        frustums.push_back(FrustumPlanes(viewProjection));
+    }
+
+    std::vector<std::uint8_t> visibleCells(cellCount, 0U);
+    std::size_t visibleCellCount = 0;
+    for (std::uint32_t z = 0; z < dimension; ++z) {
+        for (std::uint32_t y = 0; y < dimension; ++y) {
+            for (std::uint32_t x = 0; x < dimension; ++x) {
+                const invisible_places::io::Float3 cellMinimum{
+                    bounds.minimum.x + (static_cast<float>(x) * xCellExtent) - xCellExtent,
+                    bounds.minimum.y + (static_cast<float>(y) * yCellExtent) - yCellExtent,
+                    bounds.minimum.z + (static_cast<float>(z) * zCellExtent) - zCellExtent,
+                };
+                const invisible_places::io::Float3 cellMaximum{
+                    bounds.minimum.x + (static_cast<float>(x + 1U) * xCellExtent) + xCellExtent,
+                    bounds.minimum.y + (static_cast<float>(y + 1U) * yCellExtent) + yCellExtent,
+                    bounds.minimum.z + (static_cast<float>(z + 1U) * zCellExtent) + zCellExtent,
+                };
+                bool visible = false;
+                for (const auto& frustum : frustums) {
+                    if (BoundsIntersectsFrustumPlanes(cellMinimum, cellMaximum, frustum)) {
+                        visible = true;
+                        break;
+                    }
+                }
+                if (visible) {
+                    visibleCells[FrustumCellIndex(x, y, z, dimension)] = 1U;
+                    ++visibleCellCount;
+                }
+            }
+        }
+    }
+
+    if (visibleCellCount == 0) {
+        return {};
+    }
+
+    std::vector<std::uint32_t> indices;
+    const double visibleFraction =
+        static_cast<double>(visibleCellCount) / static_cast<double>(visibleCells.size());
+    const auto reserveCount = static_cast<std::size_t>(std::min<double>(
+        static_cast<double>(positions.size()),
+        std::max(1024.0, static_cast<double>(positions.size()) * visibleFraction * 1.5)));
+    indices.reserve(reserveCount);
+
+    const auto pointCount = static_cast<std::uint32_t>(positions.size());
+    for (std::uint32_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        const auto& point = positions[pointIndex];
+        const std::uint32_t x = VoxelCoordinate(point.x, bounds.minimum.x, safeXExtent, dimension);
+        const std::uint32_t y = VoxelCoordinate(point.y, bounds.minimum.y, safeYExtent, dimension);
+        const std::uint32_t z = VoxelCoordinate(point.z, bounds.minimum.z, safeZExtent, dimension);
+        if (visibleCells[FrustumCellIndex(x, y, z, dimension)] != 0U) {
+            indices.push_back(pointIndex);
+        }
+    }
+
+    if (indices.size() >= positions.size()) {
+        return {};
+    }
+    return indices;
 }
 
 std::vector<std::uint32_t> GenerateSurfelEncodedSampleIndices(

@@ -157,7 +157,8 @@ class VulkanViewportShell {
     void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
     void UpdateInteractivePointSampleBuffer(
         std::size_t layerId,
-        const std::vector<std::uint32_t>& sampledIndices);
+        const std::vector<std::uint32_t>& sampledIndices,
+        bool includeSurfelIndices = true);
     void UploadPointHighlightIndices(
         std::size_t layerId,
         std::uint64_t key,
