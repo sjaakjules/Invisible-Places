@@ -680,13 +680,13 @@ float RippleCurrentThreadsValue(vec2 uv, vec3 normal, float wavelength, float wa
     const float normalBias = clamp(length(normal.xy), 0.0, 1.0);
     const float cellXSize = max(wavelength * (2.10 + warp * 0.35), 0.036);
     const float cellYSize = max(wavelength * (1.05 + turbulence * 0.35), 0.024);
-    vec2 streamUv = uv;
-    streamUv.x += normalBias * wavelength * (0.10 + warp * 0.06);
-    streamUv.y += sin(uv.x / max(wavelength * 1.25, 0.010) + seed * 1.17 + t * 0.13) *
+    vec2 currentUv = uv;
+    currentUv.x += normalBias * wavelength * (0.10 + warp * 0.06);
+    currentUv.y += sin(uv.x / max(wavelength * 1.25, 0.010) + seed * 1.17 + t * 0.13) *
                   wavelength * (0.055 + warp * 0.060 + normalBias * 0.035);
-    streamUv.y += sin(uv.x / max(wavelength * 0.47, 0.006) - seed * 0.73 - t * 0.19) *
+    currentUv.y += sin(uv.x / max(wavelength * 0.47, 0.006) - seed * 0.73 - t * 0.19) *
                   wavelength * turbulence * 0.055;
-    const vec2 p = vec2(streamUv.x / cellXSize, streamUv.y / cellYSize);
+    const vec2 p = vec2(currentUv.x / cellXSize, currentUv.y / cellYSize);
     const int baseX = int(floor(p.x));
     const int baseY = int(floor(p.y));
     const float originDensity = clamp(0.16 + density * 0.66 + normalBias * 0.16, 0.10, 0.92);
@@ -708,7 +708,7 @@ float RippleCurrentThreadsValue(vec2 uv, vec3 normal, float wavelength, float wa
             const float travelRange = cellXSize * (0.82 + warp * 0.10 + normalBias * 0.34);
             const float head = life * travelRange;
             const float trailLength = max(wavelength * (1.15 + warp * 0.34 + normalBias * 0.44), 0.035);
-            const vec2 local = streamUv - origin;
+            const vec2 local = currentUv - origin;
             const float forward = local.x;
             const float tail = head - forward;
             const float inPulse =
@@ -738,7 +738,7 @@ float RippleCurrentThreadsValue(vec2 uv, vec3 normal, float wavelength, float wa
                 branchGate *
                 inPulse;
             const float breakupNoise = RippleSmoothBlockNoise(
-                streamUv + vec2(t * 0.018 + pulseSeed, -t * 0.011),
+                currentUv + vec2(t * 0.018 + pulseSeed, -t * 0.011),
                 max(wavelength * (0.24 + turbulence * 0.16), 0.006),
                 seed,
                 233.0);
@@ -760,13 +760,13 @@ float RippleCurrentThreadsValue(vec2 uv, vec3 normal, float wavelength, float wa
         }
     }
     const float fallbackNoise = RippleSmoothBlockNoise(
-        streamUv + vec2(t * 0.014, -t * 0.009),
+        currentUv + vec2(t * 0.014, -t * 0.009),
         max(wavelength * 0.42, 0.006),
         seed,
         239.0);
     const float fallbackPulse =
         RippleWavePeak(
-            streamUv.x / max(wavelength * 1.9, 0.012) - t * 0.22 + fallbackNoise,
+            currentUv.x / max(wavelength * 1.9, 0.012) - t * 0.22 + fallbackNoise,
             2.1) *
         smoothstep(0.42 - density * 0.16, 0.96, fallbackNoise);
     const float softFallback =

@@ -143,7 +143,7 @@ struct PointCloudStyleState {
     bool solidCenters = true;
     bool flowAnimation = false;
     bool waterPathView = false;
-    bool waterStreamOverlay = false;
+    bool waterTrailOverlay = false;
     bool causticAnimation = false;
     float causticIntensity = 0.0F;
     float causticScale = 4.0F;

@@ -1281,7 +1281,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.waterTrailGeometry.trailLengthMeters = 1.65F;
     document.waterTrailGeometry.pointSpacingMeters = 0.033F;
     document.waterTrailGeometry.widthMeters = 0.014F;
-    document.waterTrailGeometry.worldLengthMeters = 0.095F;
+    document.waterTrailGeometry.streakLengthMeters = 0.095F;
     invisible_places::serialization::WaterPathProfileDocument pathProfile;
     pathProfile.name = "Shelf Path";
     pathProfile.settings = document.waterSourceSettings.path;
@@ -1290,8 +1290,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.waterPathProfiles.push_back(pathProfile);
     invisible_places::serialization::WaterLaneProfileDocument laneProfile;
     laneProfile.name = "Braided Custom";
-    laneProfile.settings = document.waterFlowStreamSettings;
-    laneProfile.settings.streamCountTotal = 1234U;
+    laneProfile.settings = document.waterFlowTrailSettings;
+    laneProfile.settings.trailCountTotal = 1234U;
     laneProfile.settings.laneCount = 9U;
     laneProfile.settings.laneSpreadMeters = 0.42F;
     laneProfile.settings.laneCrossing = 0.57F;
@@ -1300,7 +1300,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     flowTrailProfile.name = "Silver Trail";
     flowTrailProfile.geometry = document.waterTrailGeometry;
     flowTrailProfile.geometry.widthMeters = 0.021F;
-    flowTrailProfile.geometry.worldLengthMeters = 0.13F;
+    flowTrailProfile.geometry.streakLengthMeters = 0.13F;
     invisible_places::style::SetScalarConstant(&flowTrailProfile.style.opacity, 0.39F);
     invisible_places::style::SetScalarConstant(&flowTrailProfile.style.emissiveStrength, 1.7F);
     document.waterTrailProfiles.push_back(flowTrailProfile);
@@ -1432,13 +1432,13 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     noFlowLayer.vertices = causticLaceVertices;
     noFlowLayer.hull = invisible_places::water::BuildWaterRegionHull(noFlowLayer.vertices);
     document.waterFieldLayers.push_back(noFlowLayer);
-    document.waterFlowStreamSettings.streamCountTotal = 321U;
-    document.waterFlowStreamSettings.streamWidthMeters = 0.014F;
-    document.waterFlowStreamSettings.laneCrossing = 0.44F;
+    document.waterFlowTrailSettings.trailCountTotal = 321U;
+    document.waterFlowTrailSettings.trailWidthMeters = 0.014F;
+    document.waterFlowTrailSettings.laneCrossing = 0.44F;
     document.waterFieldSettings.corridorRadiusMeters = 0.42F;
     document.waterFieldSettings.outputMode = invisible_places::water::WaterFieldOutputMode::Both;
-    document.waterFieldStreamSettings.streamlineCount = 654U;
-    document.waterFieldStreamSettings.streamlineWidthMeters = 0.009F;
+    document.waterFieldTrailSettings.trailCount = 654U;
+    document.waterFieldTrailSettings.trailWidthMeters = 0.009F;
     document.cameraPathShotIndices = {0, 0};
     document.cameraPathDurationFrames = 144;
     document.hasSavedAnimationRegistry = true;
@@ -1518,7 +1518,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.depthAlphaThreshold = 0.42F;
     pointStyle.solidCenters = false;
     pointStyle.flowAnimation = true;
-    pointStyle.waterStreamOverlay = true;
+    pointStyle.waterTrailOverlay = true;
     invisible_places::style::ConfigureFieldMapFromStats(
         &pointStyle.pointSize,
         2,
@@ -1606,15 +1606,15 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"water_field_layers\"") != std::string::npos);
         CHECK(savedJson.find("\"field_surface_motion\"") != std::string::npos);
         CHECK(savedJson.find("\"caustic_lace\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_flow_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_flow_trail_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"lane_count\"") != std::string::npos);
         CHECK(savedJson.find("\"water_field_settings\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_field_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_trail_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"preview_tint_mode\"") == std::string::npos);
         CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_stream_overlay\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_trail_overlay\"") != std::string::npos);
         CHECK(savedJson.find("\"water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"temp_water_visual_settings\"") == std::string::npos);
         CHECK(savedJson.find("\"settings_assignment\"") != std::string::npos);
@@ -1695,20 +1695,20 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterTrailGeometry.trailLengthMeters == Catch::Approx(1.65F));
     CHECK(loadedDocument->waterTrailGeometry.pointSpacingMeters == Catch::Approx(0.033F));
     CHECK(loadedDocument->waterTrailGeometry.widthMeters == Catch::Approx(0.014F));
-    CHECK(loadedDocument->waterTrailGeometry.worldLengthMeters == Catch::Approx(0.095F));
+    CHECK(loadedDocument->waterTrailGeometry.streakLengthMeters == Catch::Approx(0.095F));
     REQUIRE(loadedDocument->waterPathProfiles.size() == 1U);
     CHECK(loadedDocument->waterPathProfiles[0].name == "Shelf Path");
     CHECK(loadedDocument->waterPathProfiles[0].settings.pathLength == Catch::Approx(7.5F));
     CHECK(loadedDocument->waterPathProfiles[0].settings.smoothing == Catch::Approx(0.41F));
     REQUIRE(loadedDocument->waterLaneProfiles.size() == 1U);
     CHECK(loadedDocument->waterLaneProfiles[0].name == "Braided Custom");
-    CHECK(loadedDocument->waterLaneProfiles[0].settings.streamCountTotal == 1234U);
+    CHECK(loadedDocument->waterLaneProfiles[0].settings.trailCountTotal == 1234U);
     CHECK(loadedDocument->waterLaneProfiles[0].settings.laneCount == 9U);
     CHECK(loadedDocument->waterLaneProfiles[0].settings.laneSpreadMeters == Catch::Approx(0.42F));
     REQUIRE(loadedDocument->waterTrailProfiles.size() == 1U);
     CHECK(loadedDocument->waterTrailProfiles[0].name == "Silver Trail");
     CHECK(loadedDocument->waterTrailProfiles[0].geometry.widthMeters == Catch::Approx(0.021F));
-    CHECK(loadedDocument->waterTrailProfiles[0].geometry.worldLengthMeters == Catch::Approx(0.13F));
+    CHECK(loadedDocument->waterTrailProfiles[0].geometry.streakLengthMeters == Catch::Approx(0.13F));
     CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterTrailProfiles[0].style.opacity) ==
           Catch::Approx(0.39F));
     CHECK(loadedDocument->selectedWaterPathProfileName == "Shelf Path_edited");
@@ -1795,12 +1795,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(
         loadedDocument->waterFieldLayers[1].featureType ==
         invisible_places::water::WaterEffectFeatureType::FieldNoFlowRegion);
-    CHECK(loadedDocument->waterFlowStreamSettings.streamCountTotal == 321U);
-    CHECK(loadedDocument->waterFlowStreamSettings.streamWidthMeters == Catch::Approx(0.014F));
-    CHECK(loadedDocument->waterFlowStreamSettings.laneCrossing == Catch::Approx(0.44F));
+    CHECK(loadedDocument->waterFlowTrailSettings.trailCountTotal == 321U);
+    CHECK(loadedDocument->waterFlowTrailSettings.trailWidthMeters == Catch::Approx(0.014F));
+    CHECK(loadedDocument->waterFlowTrailSettings.laneCrossing == Catch::Approx(0.44F));
     CHECK(loadedDocument->waterFieldSettings.corridorRadiusMeters == Catch::Approx(0.42F));
-    CHECK(loadedDocument->waterFieldStreamSettings.streamlineCount == 654U);
-    CHECK(loadedDocument->waterFieldStreamSettings.streamlineWidthMeters == Catch::Approx(0.009F));
+    CHECK(loadedDocument->waterFieldTrailSettings.trailCount == 654U);
+    CHECK(loadedDocument->waterFieldTrailSettings.trailWidthMeters == Catch::Approx(0.009F));
     CHECK(loadedDocument->waterCausticLookSettings.enabled);
     CHECK(loadedDocument->waterCausticLookSettings.intensity == Catch::Approx(1.25F));
     CHECK(loadedDocument->waterCausticLookSettings.scale == Catch::Approx(5.5F));
@@ -1906,7 +1906,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedLayer.pointStyle->depthAlphaThreshold == Catch::Approx(0.42F));
     CHECK(!loadedLayer.pointStyle->solidCenters);
     CHECK(loadedLayer.pointStyle->flowAnimation);
-    CHECK(loadedLayer.pointStyle->waterStreamOverlay);
+    CHECK(loadedLayer.pointStyle->waterTrailOverlay);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldSlot == 2);
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.fieldName == "Height");
     CHECK(loadedLayer.pointStyle->pointSize.fieldMap.inputMin == Catch::Approx(-2.0F));
@@ -2242,6 +2242,42 @@ TEST_CASE("Point cloud style parses and round-trips world-sized screen sprites",
         roundTrip->style.screenSpriteSizeMode ==
         invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode::WorldMillimeters);
     CHECK(invisible_places::style::ScalarConstant(roundTrip->style.surfelDiameter) == Catch::Approx(0.012F));
+
+    std::filesystem::remove(presetPath);
+    std::filesystem::remove(roundTripPath);
+}
+
+TEST_CASE("Legacy water stream style keys load as trail overlays", "[serialization][point-style][water]") {
+    const auto presetPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_water_stream_style.json";
+    std::ofstream output{presetPath, std::ios::trunc};
+    output << R"({
+  "schema_version": 2,
+  "preset_name": "Legacy Water Stream Style",
+  "point_style": {
+    "water_stream_overlay": true,
+    "water_overlay_render_mode": "stream"
+  }
+})";
+    output.close();
+
+    std::string errorMessage;
+    const auto preset = invisible_places::serialization::LoadPointCloudStylePreset(presetPath, &errorMessage);
+    REQUIRE(preset.has_value());
+    CHECK(preset->style.waterTrailOverlay);
+
+    const auto roundTripPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_water_stream_style_roundtrip.json";
+    REQUIRE(invisible_places::serialization::SavePointCloudStylePreset(*preset, roundTripPath, &errorMessage));
+    {
+        std::ifstream savedPreset{roundTripPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{savedPreset},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"water_trail_overlay\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_stream_overlay\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_overlay_render_mode\"") == std::string::npos);
+    }
 
     std::filesystem::remove(presetPath);
     std::filesystem::remove(roundTripPath);
@@ -2869,7 +2905,7 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     std::filesystem::remove(outputPath);
 }
 
-TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]") {
+TEST_CASE("Water v2 trails expose deterministic scalar contracts", "[water][v2]") {
     invisible_places::water::WaterOverlay anchors;
     for (std::uint32_t index = 0; index < 6U; ++index) {
         invisible_places::water::WaterOverlayPoint point;
@@ -2885,78 +2921,79 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
         anchors.points.push_back(point);
     }
 
-    invisible_places::water::WaterFlowStreamSettings streamSettings;
-    streamSettings.streamCountTotal = 8U;
-    streamSettings.streamLengthMeters = 0.36F;
-    streamSettings.streamPointSpacingMeters = 0.09F;
-    streamSettings.streamWidthMeters = 0.012F;
-    streamSettings.streamWorldLengthMeters = 0.050F;
-    streamSettings.laneSpreadMeters = 0.04F;
-    streamSettings.laneCount = 4U;
-    streamSettings.laneCrossing = 0.37F;
-    streamSettings.turbulence = 0.03F;
-    streamSettings.seed = 123U;
-    const auto flowA = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, streamSettings);
-    const auto flowB = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, streamSettings);
+    invisible_places::water::WaterFlowTrailSettings trailSettings;
+    trailSettings.trailCountTotal = 8U;
+    trailSettings.trailLengthMeters = 0.36F;
+    trailSettings.trailPointSpacingMeters = 0.09F;
+    trailSettings.trailWidthMeters = 0.012F;
+    trailSettings.trailStreakLengthMeters = 0.050F;
+    trailSettings.laneSpreadMeters = 0.04F;
+    trailSettings.laneCount = 4U;
+    trailSettings.laneCrossing = 0.37F;
+    trailSettings.turbulence = 0.03F;
+    trailSettings.seed = 123U;
+    const auto flowA = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, trailSettings);
+    const auto flowB = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, trailSettings);
     REQUIRE_FALSE(flowA.samples.empty());
     REQUIRE(flowA.samples.size() == flowB.samples.size());
     CHECK(flowA.samples.front().position.x == Catch::Approx(flowB.samples.front().position.x));
     CHECK(flowA.samples.front().tangent.x == Catch::Approx(flowB.samples.front().tangent.x));
     CHECK(flowA.samples.back().pointSeed == Catch::Approx(flowB.samples.back().pointSeed));
 
-    const auto cloud = invisible_places::water::BuildWaterStreamOverlayPointCloud(
+    const auto cloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
         flowA,
-        "Saved/water/test-WaterFlowStreams.generated",
+        "Saved/water/test-WaterFlowTrails.generated",
         "flow trails");
     const std::vector<std::string> expectedFields{
-        "stream_role",
-        "stream_id",
+        "trail_role",
+        "trail_id",
         "source_id",
         "path_id",
         "branch_id",
-        "stream_seed",
+        "trail_seed",
         "point_seed",
-        "stream_distance",
-        "stream_length",
+        "trail_distance",
+        "trail_length",
         "route_start_index",
         "route_point_count",
         "route_length",
-        "stream_start_phase",
-        "stream_lateral_offset",
+        "trail_start_phase",
+        "trail_lateral_offset",
         "point_age",
-        "stream_age",
-        "stream_speed",
-        "stream_width",
-        "stream_world_length",
-        "stream_confidence",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
         "wetness",
         "feature_type",
         "tangent_x",
         "tangent_y",
         "tangent_z",
-        "stream_lane_index",
-        "stream_lane_count",
-        "stream_lane_pitch",
-        "stream_lane_span",
-        "stream_lane_crossing",
-        "stream_cross_seed"};
+        "trail_lane_index",
+        "trail_lane_count",
+        "trail_lane_pitch",
+        "trail_lane_span",
+        "trail_lane_crossing",
+        "trail_cross_seed"};
     REQUIRE(cloud.ScalarFieldCount() == expectedFields.size());
     for (std::size_t index = 0; index < expectedFields.size(); ++index) {
         CHECK(cloud.scalarFields[index].name == expectedFields[index]);
+        CHECK(cloud.scalarFields[index].name.find("stream") == std::string::npos);
     }
     REQUIRE(cloud.PointCount() == flowA.samples.size());
 
     const auto firstRouteSample = std::find_if(
         flowA.samples.begin(),
         flowA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole < 0.5F;
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole < 0.5F;
         });
     const auto firstVisibleSample = std::find_if(
         flowA.samples.begin(),
         flowA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole >= 0.5F;
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole >= 0.5F;
         });
     REQUIRE(firstRouteSample != flowA.samples.end());
     REQUIRE(firstVisibleSample != flowA.samples.end());
@@ -2964,66 +3001,66 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
         std::distance(flowA.samples.begin(), firstVisibleSample));
     CHECK(firstRouteSample->routeStartIndex == Catch::Approx(0.0F));
     CHECK(firstRouteSample->routePointCount >= 2.0F);
-    CHECK(firstRouteSample->streamConfidence >= 0.0F);
+    CHECK(firstRouteSample->trailConfidence >= 0.0F);
     CHECK(firstVisibleSample->routeStartIndex >= 0.0F);
     CHECK(firstVisibleSample->routePointCount >= 2.0F);
     CHECK(firstVisibleSample->routeStartIndex + firstVisibleSample->routePointCount <=
           static_cast<float>(flowA.samples.size()));
     CHECK(firstVisibleSample->pointAge >= 0.0F);
     CHECK(firstVisibleSample->pointAge <= 1.0F);
-    CHECK(firstVisibleSample->streamAge >= 0.0F);
-    CHECK(firstVisibleSample->streamAge <= 1.0F);
+    CHECK(firstVisibleSample->trailAge >= 0.0F);
+    CHECK(firstVisibleSample->trailAge <= 1.0F);
     CHECK(firstVisibleSample->wetness >= 0.0F);
     CHECK(firstVisibleSample->wetness <= 1.0F);
-    CHECK(firstVisibleSample->streamConfidence >= 0.0F);
-    CHECK(firstVisibleSample->streamConfidence <= 1.0F);
-    const float expectedLanePitch = std::max(streamSettings.streamWidthMeters * 0.5F, 0.00025F);
-    const auto expectedLaneCount = streamSettings.laneCount;
+    CHECK(firstVisibleSample->trailConfidence >= 0.0F);
+    CHECK(firstVisibleSample->trailConfidence <= 1.0F);
+    const float expectedLanePitch = std::max(trailSettings.trailWidthMeters * 0.5F, 0.00025F);
+    const auto expectedLaneCount = trailSettings.laneCount;
     const auto expectedCenterLaneLow = (expectedLaneCount - 1U) / 2U;
     const auto expectedCenterLaneHigh = expectedLaneCount / 2U;
-    CHECK(firstVisibleSample->streamLaneIndex >= 0.0F);
-    CHECK(firstVisibleSample->streamLaneIndex < static_cast<float>(expectedLaneCount));
-    CHECK((firstVisibleSample->streamLaneIndex == Catch::Approx(static_cast<float>(expectedCenterLaneLow)) ||
-           firstVisibleSample->streamLaneIndex == Catch::Approx(static_cast<float>(expectedCenterLaneHigh))));
-    CHECK(firstVisibleSample->streamLaneCount == Catch::Approx(static_cast<float>(expectedLaneCount)));
-    CHECK(firstVisibleSample->streamLanePitch == Catch::Approx(expectedLanePitch));
-    CHECK(firstVisibleSample->streamLaneSpan == Catch::Approx(streamSettings.laneSpreadMeters));
-    CHECK(firstVisibleSample->streamLaneCrossing == Catch::Approx(streamSettings.laneCrossing));
-    CHECK(firstVisibleSample->streamCrossSeed >= 0.0F);
-    CHECK(firstVisibleSample->streamCrossSeed <= 1.0F);
-    CHECK(std::abs(firstVisibleSample->streamLateralOffset) <= (streamSettings.laneSpreadMeters * 0.5F) + 0.002F);
+    CHECK(firstVisibleSample->trailLaneIndex >= 0.0F);
+    CHECK(firstVisibleSample->trailLaneIndex < static_cast<float>(expectedLaneCount));
+    CHECK((firstVisibleSample->trailLaneIndex == Catch::Approx(static_cast<float>(expectedCenterLaneLow)) ||
+           firstVisibleSample->trailLaneIndex == Catch::Approx(static_cast<float>(expectedCenterLaneHigh))));
+    CHECK(firstVisibleSample->trailLaneCount == Catch::Approx(static_cast<float>(expectedLaneCount)));
+    CHECK(firstVisibleSample->trailLanePitch == Catch::Approx(expectedLanePitch));
+    CHECK(firstVisibleSample->trailLaneSpan == Catch::Approx(trailSettings.laneSpreadMeters));
+    CHECK(firstVisibleSample->trailLaneCrossing == Catch::Approx(trailSettings.laneCrossing));
+    CHECK(firstVisibleSample->trailCrossSeed >= 0.0F);
+    CHECK(firstVisibleSample->trailCrossSeed <= 1.0F);
+    CHECK(std::abs(firstVisibleSample->trailLateralOffset) <= (trailSettings.laneSpreadMeters * 0.5F) + 0.002F);
     CHECK(expectedLaneCount < static_cast<std::uint32_t>(
-        std::ceil(streamSettings.laneSpreadMeters / expectedLanePitch)));
+        std::ceil(trailSettings.laneSpreadMeters / expectedLanePitch)));
 
-    const float firstStreamWidth = cloud.scalarFieldValues[
+    const float firstTrailWidth = cloud.scalarFieldValues[
         cloud.ScalarFieldValueIndex(17, firstVisibleIndex)];
-    const float firstStreamWorldLength = cloud.scalarFieldValues[
+    const float firstTrailStreakLength = cloud.scalarFieldValues[
         cloud.ScalarFieldValueIndex(18, firstVisibleIndex)];
-    CHECK(firstStreamWidth >= streamSettings.streamWidthMeters * 0.80F);
-    CHECK(firstStreamWidth <= streamSettings.streamWidthMeters * 1.22F);
-    CHECK(firstStreamWorldLength >= std::max(streamSettings.streamWorldLengthMeters, streamSettings.streamPointSpacingMeters * 2.5F));
-    CHECK(firstStreamWorldLength >= firstStreamWidth * 2.0F);
+    CHECK(firstTrailWidth >= trailSettings.trailWidthMeters * 0.80F);
+    CHECK(firstTrailWidth <= trailSettings.trailWidthMeters * 1.22F);
+    CHECK(firstTrailStreakLength >= std::max(trailSettings.trailStreakLengthMeters, trailSettings.trailPointSpacingMeters * 2.5F));
+    CHECK(firstTrailStreakLength >= firstTrailWidth * 2.0F);
 
-    auto noCrossSettings = streamSettings;
+    auto noCrossSettings = trailSettings;
     noCrossSettings.laneCrossing = 0.0F;
-    const auto noCrossA = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, noCrossSettings);
-    const auto noCrossB = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, noCrossSettings);
+    const auto noCrossA = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, noCrossSettings);
+    const auto noCrossB = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, noCrossSettings);
     const auto noCrossVisibleA = std::find_if(
         noCrossA.samples.begin(),
         noCrossA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole >= 0.5F;
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole >= 0.5F;
         });
     const auto noCrossVisibleB = std::find_if(
         noCrossB.samples.begin(),
         noCrossB.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole >= 0.5F;
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole >= 0.5F;
         });
     REQUIRE(noCrossVisibleA != noCrossA.samples.end());
     REQUIRE(noCrossVisibleB != noCrossB.samples.end());
-    CHECK(noCrossVisibleA->streamLaneCrossing == Catch::Approx(0.0F));
-    CHECK(noCrossVisibleA->streamLateralOffset == Catch::Approx(noCrossVisibleB->streamLateralOffset));
+    CHECK(noCrossVisibleA->trailLaneCrossing == Catch::Approx(0.0F));
+    CHECK(noCrossVisibleA->trailLateralOffset == Catch::Approx(noCrossVisibleB->trailLateralOffset));
 
     invisible_places::water::WaterFieldSettings fieldSettings;
     fieldSettings.corridorRadiusMeters = 0.18F;
@@ -3036,38 +3073,38 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
     CHECK(fieldCacheA.nodes.front().position.x == Catch::Approx(fieldCacheB.nodes.front().position.x));
     CHECK(fieldCacheA.nodes.front().confidence == Catch::Approx(fieldCacheB.nodes.front().confidence));
 
-    invisible_places::water::WaterFieldStreamSettings fieldStreamSettings;
-    fieldStreamSettings.streamlineCount = 7U;
-    fieldStreamSettings.streamlineLengthMeters = 0.30F;
-    fieldStreamSettings.stepLengthMeters = 0.06F;
-    fieldStreamSettings.streamlineWidthMeters = 0.008F;
-    fieldStreamSettings.streamWorldLengthMeters = 0.042F;
-    const auto fieldStreamA = invisible_places::water::BuildFieldStreamOverlay(fieldCacheA, fieldStreamSettings);
-    const auto fieldStreamB = invisible_places::water::BuildFieldStreamOverlay(fieldCacheA, fieldStreamSettings);
-    REQUIRE_FALSE(fieldStreamA.samples.empty());
-    REQUIRE(fieldStreamA.samples.size() == fieldStreamB.samples.size());
-    CHECK(fieldStreamA.samples.front().position.x == Catch::Approx(fieldStreamB.samples.front().position.x));
+    invisible_places::water::WaterFieldTrailSettings fieldTrailSettings;
+    fieldTrailSettings.trailCount = 7U;
+    fieldTrailSettings.trailLengthMeters = 0.30F;
+    fieldTrailSettings.trailPointSpacingMeters = 0.06F;
+    fieldTrailSettings.trailWidthMeters = 0.008F;
+    fieldTrailSettings.trailStreakLengthMeters = 0.042F;
+    const auto fieldTrailA = invisible_places::water::BuildFieldTrailOverlay(fieldCacheA, fieldTrailSettings);
+    const auto fieldTrailB = invisible_places::water::BuildFieldTrailOverlay(fieldCacheA, fieldTrailSettings);
+    REQUIRE_FALSE(fieldTrailA.samples.empty());
+    REQUIRE(fieldTrailA.samples.size() == fieldTrailB.samples.size());
+    CHECK(fieldTrailA.samples.front().position.x == Catch::Approx(fieldTrailB.samples.front().position.x));
     CHECK(std::any_of(
-        fieldStreamA.samples.begin(),
-        fieldStreamA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole < 0.5F;
+        fieldTrailA.samples.begin(),
+        fieldTrailA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole < 0.5F;
         }));
     CHECK(std::any_of(
-        fieldStreamA.samples.begin(),
-        fieldStreamA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole >= 0.5F && sample.featureType == Catch::Approx(3.0F);
+        fieldTrailA.samples.begin(),
+        fieldTrailA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole >= 0.5F && sample.featureType == Catch::Approx(3.0F);
         }));
-    const auto firstFieldStream = std::find_if(
-        fieldStreamA.samples.begin(),
-        fieldStreamA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
-            return sample.streamRole >= 0.5F;
+    const auto firstFieldTrail = std::find_if(
+        fieldTrailA.samples.begin(),
+        fieldTrailA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole >= 0.5F;
         });
-    REQUIRE(firstFieldStream != fieldStreamA.samples.end());
-    CHECK(firstFieldStream->streamLaneCount >= 1.0F);
-    CHECK(firstFieldStream->streamLaneCrossing == Catch::Approx(0.22F));
+    REQUIRE(firstFieldTrail != fieldTrailA.samples.end());
+    CHECK(firstFieldTrail->trailLaneCount >= 1.0F);
+    CHECK(firstFieldTrail->trailLaneCrossing == Catch::Approx(0.22F));
 
     invisible_places::water::WaterEffectLayer fieldLayer;
     fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
@@ -3084,7 +3121,7 @@ TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][
     refreshOnlySource.path.smoothing = std::clamp(source.path.smoothing + 0.20F, 0.0F, 1.0F);
     CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, refreshOnlySource));
 
-    invisible_places::water::WaterFlowStreamSettings lanes;
+    invisible_places::water::WaterFlowTrailSettings lanes;
     auto speedOnly = lanes;
     speedOnly.speedMetersPerSecond *= 1.75F;
     CHECK(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, speedOnly));
@@ -3115,8 +3152,8 @@ TEST_CASE("Water Flow trail point spacing creates dense moving trail samples", "
         anchors.points.push_back(point);
     }
 
-    invisible_places::water::WaterFlowStreamSettings settings;
-    settings.streamCountTotal = 97U;
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 97U;
     settings.laneCount = 39U;
     settings.laneSpreadMeters = 0.030F;
     settings.laneCrossing = 1.0F;
@@ -3124,49 +3161,197 @@ TEST_CASE("Water Flow trail point spacing creates dense moving trail samples", "
     settings.speedMetersPerSecond = 0.17F;
     settings.surfaceOffsetMeters = 0.004F;
     settings.seed = 37U;
-    settings.streamLengthMeters = 0.24F;
-    settings.streamPointSpacingMeters = 0.004F;
-    settings.streamWidthMeters = 0.011F;
-    settings.streamWorldLengthMeters = 0.022F;
+    settings.trailLengthMeters = 0.24F;
+    settings.trailPointSpacingMeters = 0.004F;
+    settings.trailWidthMeters = 0.011F;
+    settings.trailStreakLengthMeters = 0.022F;
 
-    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, settings);
+    const auto overlay = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
     REQUIRE_FALSE(overlay.samples.empty());
 
     const auto expectedSamplesPerTrail = std::max<std::uint32_t>(
         2U,
         static_cast<std::uint32_t>(
-            std::ceil(settings.streamLengthMeters / settings.streamPointSpacingMeters)) +
+            std::ceil(settings.trailLengthMeters / settings.trailPointSpacingMeters)) +
             1U);
     std::unordered_map<std::uint32_t, std::vector<float>> distancesByTrail;
+    std::unordered_map<std::uint32_t, std::vector<float>> visibleStationsByTrail;
     std::size_t visibleSampleCount = 0U;
     for (const auto& sample : overlay.samples) {
-        if (sample.streamRole < 0.5F) {
+        if (sample.trailRole < 0.5F) {
             continue;
         }
-        const auto streamId = static_cast<std::uint32_t>(
-            std::max(0.0F, std::floor(sample.streamId + 0.5F)));
-        distancesByTrail[streamId].push_back(sample.streamDistance);
+        const auto trailId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(sample.trailId + 0.5F)));
+        distancesByTrail[trailId].push_back(sample.trailDistance);
         ++visibleSampleCount;
-        CHECK(sample.streamLaneCount == Catch::Approx(static_cast<float>(settings.laneCount)));
-        CHECK(sample.streamWidth >= settings.streamWidthMeters * 0.80F);
-        CHECK(sample.streamWorldLength >= settings.streamWorldLengthMeters);
-        CHECK(sample.streamWorldLength >= settings.streamPointSpacingMeters * 2.5F);
+        CHECK(sample.trailLaneCount == Catch::Approx(static_cast<float>(settings.laneCount)));
+        CHECK(sample.trailWidth >= settings.trailWidthMeters * 0.80F);
+        CHECK(sample.trailStreakLength >= settings.trailStreakLengthMeters);
+        CHECK(sample.trailStreakLength >= settings.trailPointSpacingMeters * 2.5F);
+        const float trailStartPhase =
+            sample.trailStartPhase + sample.trailAge -
+            std::floor(sample.trailStartPhase + sample.trailAge);
+        const float openRoutePhase =
+            trailStartPhase + sample.trailDistance / std::max(sample.routeLength, 0.001F);
+        if (openRoutePhase <= 1.0F) {
+            visibleStationsByTrail[trailId].push_back(openRoutePhase * sample.routeLength);
+        }
     }
 
-    CHECK(distancesByTrail.size() == settings.streamCountTotal);
+    CHECK(distancesByTrail.size() == settings.trailCountTotal);
     CHECK(visibleSampleCount == distancesByTrail.size() * expectedSamplesPerTrail);
-    for (auto& [streamId, distances] : distancesByTrail) {
-        CAPTURE(streamId);
+    for (auto& [trailId, distances] : distancesByTrail) {
+        CAPTURE(trailId);
         REQUIRE(distances.size() == expectedSamplesPerTrail);
         std::sort(distances.begin(), distances.end());
         CHECK(distances.front() == Catch::Approx(0.0F));
-        CHECK(distances.back() >= settings.streamLengthMeters - settings.streamPointSpacingMeters);
+        CHECK(distances.back() >= settings.trailLengthMeters - settings.trailPointSpacingMeters);
         float largestGap = 0.0F;
         for (std::size_t index = 1U; index < distances.size(); ++index) {
             largestGap = std::max(largestGap, distances[index] - distances[index - 1U]);
         }
-        CHECK(largestGap <= settings.streamPointSpacingMeters * 1.01F);
+        CHECK(largestGap <= settings.trailPointSpacingMeters * 1.01F);
     }
+    std::size_t checkedVisibleTrails = 0U;
+    for (auto& [trailId, stations] : visibleStationsByTrail) {
+        if (stations.size() < 2U) {
+            continue;
+        }
+        CAPTURE(trailId);
+        std::sort(stations.begin(), stations.end());
+        float largestVisibleGap = 0.0F;
+        for (std::size_t index = 1U; index < stations.size(); ++index) {
+            largestVisibleGap = std::max(largestVisibleGap, stations[index] - stations[index - 1U]);
+        }
+        CHECK(largestVisibleGap <= settings.trailPointSpacingMeters * 1.01F);
+        ++checkedVisibleTrails;
+    }
+    CHECK(checkedVisibleTrails > 0U);
+}
+
+TEST_CASE("Water Flow trail count is exact per source across branches", "[water][flow][trail]") {
+    invisible_places::water::WaterOverlay anchors;
+    const auto addBranch = [&](std::uint32_t branchId, float y, std::uint32_t pointCount) {
+        for (std::uint32_t index = 0; index < pointCount; ++index) {
+            invisible_places::water::WaterOverlayPoint point;
+            point.position = {static_cast<float>(index) * 0.050F, y, 0.0F};
+            point.normal = {0.0F, 0.0F, 1.0F};
+            point.flowId = static_cast<float>(branchId);
+            point.emitterId = 12.0F;
+            point.pathDistance = static_cast<float>(index) * 0.050F;
+            point.speed = 1.0F;
+            point.width = 0.030F;
+            point.confidence = 1.0F;
+            point.accumulation = 0.75F;
+            anchors.bounds.Expand(point.position);
+            anchors.points.push_back(point);
+        }
+    };
+    addBranch(301U, 0.0F, 28U);
+    addBranch(302U, 0.25F, 9U);
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 1U;
+    settings.laneCount = 4U;
+    settings.laneSpreadMeters = 0.030F;
+    settings.laneCrossing = 0.45F;
+    settings.turbulence = 0.0F;
+    settings.speedMetersPerSecond = 0.22F;
+    settings.surfaceOffsetMeters = 0.004F;
+    settings.seed = 71U;
+    settings.trailLengthMeters = 0.18F;
+    settings.trailPointSpacingMeters = 0.006F;
+    settings.trailWidthMeters = 0.006F;
+    settings.trailStreakLengthMeters = 0.030F;
+
+    const auto oneTrailOverlay =
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
+    std::set<std::uint32_t> oneTrailIds;
+    std::set<std::uint32_t> oneTrailBranches;
+    for (const auto& sample : oneTrailOverlay.samples) {
+        if (sample.trailRole < 0.5F) {
+            continue;
+        }
+        oneTrailIds.insert(static_cast<std::uint32_t>(std::floor(sample.trailId + 0.5F)));
+        oneTrailBranches.insert(static_cast<std::uint32_t>(std::floor(sample.branchId + 0.5F)));
+    }
+    CHECK(oneTrailIds.size() == 1U);
+    CHECK(oneTrailBranches == std::set<std::uint32_t>{301U});
+
+    settings.trailCountTotal = 5U;
+    const auto multiTrailOverlay =
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
+    const auto repeatOverlay =
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
+    REQUIRE(multiTrailOverlay.samples.size() == repeatOverlay.samples.size());
+
+    std::unordered_map<std::uint32_t, std::set<std::uint32_t>> trailsByBranch;
+    std::unordered_map<std::uint32_t, float> startPhaseByTrail;
+    for (std::size_t index = 0; index < multiTrailOverlay.samples.size(); ++index) {
+        const auto& sample = multiTrailOverlay.samples[index];
+        const auto& repeat = repeatOverlay.samples[index];
+        CHECK(sample.trailId == Catch::Approx(repeat.trailId));
+        CHECK(sample.branchId == Catch::Approx(repeat.branchId));
+        CHECK(sample.trailStartPhase == Catch::Approx(repeat.trailStartPhase));
+        if (sample.trailRole < 0.5F) {
+            continue;
+        }
+        const auto trailId = static_cast<std::uint32_t>(std::floor(sample.trailId + 0.5F));
+        const auto branchId = static_cast<std::uint32_t>(std::floor(sample.branchId + 0.5F));
+        trailsByBranch[branchId].insert(trailId);
+        startPhaseByTrail.try_emplace(trailId, sample.trailStartPhase);
+    }
+
+    std::set<std::uint32_t> allTrailIds;
+    for (const auto& [branchId, trailIds] : trailsByBranch) {
+        allTrailIds.insert(trailIds.begin(), trailIds.end());
+    }
+    CHECK(allTrailIds.size() == settings.trailCountTotal);
+    REQUIRE(trailsByBranch.contains(301U));
+    REQUIRE(trailsByBranch.contains(302U));
+    CHECK(trailsByBranch.at(301U).size() > trailsByBranch.at(302U).size());
+
+    std::vector<float> longBranchStartPhases;
+    for (const auto trailId : trailsByBranch.at(301U)) {
+        longBranchStartPhases.push_back(startPhaseByTrail.at(trailId));
+    }
+    REQUIRE(longBranchStartPhases.size() >= 2U);
+    std::sort(longBranchStartPhases.begin(), longBranchStartPhases.end());
+    CHECK(longBranchStartPhases.back() - longBranchStartPhases.front() > 0.20F);
+}
+
+TEST_CASE("Water Flow trail auto fit keeps moving trails continuous", "[water][flow][trail]") {
+    invisible_places::water::WaterTrailGeometrySettings defaultGeometry;
+    defaultGeometry.trailLengthMeters = 0.75F;
+    defaultGeometry.widthMeters = 0.006F;
+    defaultGeometry.pointSpacingMeters = 0.20F;
+    defaultGeometry.streakLengthMeters = 0.002F;
+
+    const auto fittedDefault =
+        invisible_places::water::FitWaterTrailGeometryForContinuousLines(defaultGeometry);
+    CHECK(fittedDefault.pointSpacingMeters == Catch::Approx(0.0099F));
+    CHECK(fittedDefault.streakLengthMeters == Catch::Approx(0.045F));
+    CHECK(fittedDefault.streakLengthMeters >= fittedDefault.pointSpacingMeters * 3.0F);
+
+    auto longGeometry = defaultGeometry;
+    longGeometry.trailLengthMeters = 5.0F;
+    const auto fittedLong =
+        invisible_places::water::FitWaterTrailGeometryForContinuousLines(longGeometry);
+    const auto longSampleCount =
+        static_cast<std::uint32_t>(
+            std::ceil(fittedLong.trailLengthMeters / fittedLong.pointSpacingMeters)) +
+        1U;
+    CHECK(longSampleCount <= 130U);
+    CHECK(fittedLong.streakLengthMeters >= fittedLong.pointSpacingMeters * 3.0F);
+
+    auto wideGeometry = defaultGeometry;
+    wideGeometry.widthMeters = 0.040F;
+    const auto fittedWide =
+        invisible_places::water::FitWaterTrailGeometryForContinuousLines(wideGeometry);
+    CHECK(fittedWide.pointSpacingMeters >= fittedWide.widthMeters * 1.60F);
+    CHECK(fittedWide.streakLengthMeters >= fittedWide.widthMeters * 7.0F);
+    CHECK(fittedWide.streakLengthMeters >= fittedWide.pointSpacingMeters * 3.0F);
 }
 
 TEST_CASE("Calm Water Flow lanes keep path analysis as a bounded guide", "[water][flow][lanes]") {
@@ -3210,22 +3395,22 @@ TEST_CASE("Calm Water Flow lanes keep path analysis as a bounded guide", "[water
     }
     analysis.branches.push_back(branchAnalysis);
 
-    invisible_places::water::WaterFlowStreamSettings settings;
-    settings.streamCountTotal = 24U;
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 24U;
     settings.laneCount = 5U;
-    settings.streamLengthMeters = 0.30F;
-    settings.streamPointSpacingMeters = 0.05F;
-    settings.streamWidthMeters = 0.004F;
-    settings.streamWorldLengthMeters = 0.011F;
+    settings.trailLengthMeters = 0.30F;
+    settings.trailPointSpacingMeters = 0.05F;
+    settings.trailWidthMeters = 0.004F;
+    settings.trailStreakLengthMeters = 0.011F;
     settings.laneSpreadMeters = 0.080F;
     settings.laneCrossing = 0.06F;
     settings.turbulence = 0.015F;
     settings.pathAttraction = 0.85F;
-    settings.streamLooseness = 0.08F;
+    settings.trailLooseness = 0.08F;
     settings.speedMetersPerSecond = 0.24F;
     settings.seed = 11U;
 
-    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
+    const auto overlay = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
         anchors,
         settings,
         &analysis);
@@ -3235,11 +3420,11 @@ TEST_CASE("Calm Water Flow lanes keep path analysis as a bounded guide", "[water
     float maxAbsOffset = 0.0F;
     std::size_t visibleCount = 0U;
     for (const auto& sample : overlay.samples) {
-        if (sample.streamRole < 0.5F) {
+        if (sample.trailRole < 0.5F) {
             continue;
         }
-        maxSpan = std::max(maxSpan, sample.streamLaneSpan);
-        maxAbsOffset = std::max(maxAbsOffset, std::abs(sample.streamLateralOffset));
+        maxSpan = std::max(maxSpan, sample.trailLaneSpan);
+        maxAbsOffset = std::max(maxAbsOffset, std::abs(sample.trailLateralOffset));
         ++visibleCount;
     }
     REQUIRE(visibleCount > 0U);
@@ -3290,21 +3475,21 @@ TEST_CASE("Water Flow lanes consume path analysis width and speed variation", "[
     }
     analysis.branches.push_back(branchAnalysis);
 
-    invisible_places::water::WaterFlowStreamSettings settings;
-    settings.streamCountTotal = 36U;
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 36U;
     settings.laneCount = 9U;
-    settings.streamLengthMeters = 0.42F;
-    settings.streamPointSpacingMeters = 0.07F;
-    settings.streamWidthMeters = 0.010F;
+    settings.trailLengthMeters = 0.42F;
+    settings.trailPointSpacingMeters = 0.07F;
+    settings.trailWidthMeters = 0.010F;
     settings.laneSpreadMeters = 0.050F;
     settings.turbulence = 0.02F;
     settings.laneCrossing = 0.45F;
     settings.pathAttraction = 0.72F;
-    settings.streamLooseness = 0.20F;
+    settings.trailLooseness = 0.20F;
     settings.speedMetersPerSecond = 0.55F;
     settings.seed = 501U;
 
-    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
+    const auto overlay = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
         anchors,
         settings,
         &analysis);
@@ -3319,17 +3504,17 @@ TEST_CASE("Water Flow lanes consume path analysis width and speed variation", "[
     LaneStats upstream;
     LaneStats downstream;
     for (const auto& sample : overlay.samples) {
-        if (sample.streamRole < 0.5F) {
+        if (sample.trailRole < 0.5F) {
             continue;
         }
-        const float station = sample.streamStartPhase * sample.routeLength + sample.streamDistance;
+        const float station = sample.trailStartPhase * sample.routeLength + sample.trailDistance;
         auto* stats = station < 0.30F ? &upstream : (station > 0.56F ? &downstream : nullptr);
         if (stats == nullptr) {
             continue;
         }
-        stats->spanSum += sample.streamLaneSpan;
-        stats->speedSum += sample.streamSpeed;
-        stats->maxAbsOffset = std::max(stats->maxAbsOffset, std::abs(sample.streamLateralOffset));
+        stats->spanSum += sample.trailLaneSpan;
+        stats->speedSum += sample.trailSpeed;
+        stats->maxAbsOffset = std::max(stats->maxAbsOffset, std::abs(sample.trailLateralOffset));
         ++stats->count;
     }
     REQUIRE(upstream.count > 0U);
@@ -5140,16 +5325,16 @@ TEST_CASE("Field cache builds from concave selected regions", "[water][v2][field
     REQUIRE(noFlowNode != cache.nodes.end());
     CHECK(noFlowNode->flowBlocked);
 
-    invisible_places::water::WaterFieldStreamSettings streamSettings;
-    streamSettings.streamlineCount = 24U;
-    streamSettings.streamlineLengthMeters = 0.20F;
-    streamSettings.stepLengthMeters = 0.04F;
-    streamSettings.streamlineWidthMeters = 0.008F;
-    streamSettings.streamWorldLengthMeters = 0.040F;
-    const auto streamOverlay = invisible_places::water::BuildFieldStreamOverlay(cache, streamSettings);
-    REQUIRE_FALSE(streamOverlay.samples.empty());
-    for (const auto& sample : streamOverlay.samples) {
-        if (sample.streamRole < 0.5F) {
+    invisible_places::water::WaterFieldTrailSettings trailSettings;
+    trailSettings.trailCount = 24U;
+    trailSettings.trailLengthMeters = 0.20F;
+    trailSettings.trailPointSpacingMeters = 0.04F;
+    trailSettings.trailWidthMeters = 0.008F;
+    trailSettings.trailStreakLengthMeters = 0.040F;
+    const auto trailOverlay = invisible_places::water::BuildFieldTrailOverlay(cache, trailSettings);
+    REQUIRE_FALSE(trailOverlay.samples.empty());
+    for (const auto& sample : trailOverlay.samples) {
+        if (sample.trailRole < 0.5F) {
             continue;
         }
         const bool inCutOut = sample.position.x > 0.25F &&
@@ -5188,7 +5373,7 @@ TEST_CASE("Field cache builds from concave selected regions", "[water][v2][field
     }
 }
 
-TEST_CASE("Field streamlines split rejected gaps and fade low-confidence support", "[water][v2][field]") {
+TEST_CASE("Field trails split rejected gaps and fade low-confidence support", "[water][v2][field]") {
     invisible_places::water::WaterFieldCache cache;
     cache.settings.enabled = true;
     cache.settings.fieldResolutionMeters = 0.05F;
@@ -5214,40 +5399,40 @@ TEST_CASE("Field streamlines split rejected gaps and fade low-confidence support
         makeNode(1.05F, 0.25F),
     };
 
-    invisible_places::water::WaterFieldStreamSettings streamSettings;
-    streamSettings.streamlineCount = 8U;
-    streamSettings.streamlineLengthMeters = 0.05F;
-    streamSettings.stepLengthMeters = 0.025F;
-    streamSettings.streamlineWidthMeters = 0.006F;
-    streamSettings.streamWorldLengthMeters = 0.030F;
-    streamSettings.fadeOnLowConfidence = true;
+    invisible_places::water::WaterFieldTrailSettings trailSettings;
+    trailSettings.trailCount = 8U;
+    trailSettings.trailLengthMeters = 0.05F;
+    trailSettings.trailPointSpacingMeters = 0.025F;
+    trailSettings.trailWidthMeters = 0.006F;
+    trailSettings.trailStreakLengthMeters = 0.030F;
+    trailSettings.fadeOnLowConfidence = true;
 
-    const auto streamOverlay = invisible_places::water::BuildFieldStreamOverlay(cache, streamSettings);
-    REQUIRE_FALSE(streamOverlay.samples.empty());
+    const auto trailOverlay = invisible_places::water::BuildFieldTrailOverlay(cache, trailSettings);
+    REQUIRE_FALSE(trailOverlay.samples.empty());
 
     bool highConfidenceSeen = false;
     bool fadedConfidenceSeen = false;
-    for (const auto& sample : streamOverlay.samples) {
+    for (const auto& sample : trailOverlay.samples) {
         const bool inRejectedGap = sample.position.x > 0.20F && sample.position.x < 0.80F;
         CHECK_FALSE(inRejectedGap);
         if (sample.position.x < 0.20F) {
-            highConfidenceSeen = highConfidenceSeen || sample.streamConfidence > 0.70F;
+            highConfidenceSeen = highConfidenceSeen || sample.trailConfidence > 0.70F;
         }
         if (sample.position.x > 0.80F) {
-            fadedConfidenceSeen = fadedConfidenceSeen || sample.streamConfidence < 0.35F;
+            fadedConfidenceSeen = fadedConfidenceSeen || sample.trailConfidence < 0.35F;
         }
     }
     CHECK(highConfidenceSeen);
     CHECK(fadedConfidenceSeen);
-    CHECK(streamOverlay.fieldDiagnostics.inputNodeCount == 4U);
-    CHECK(streamOverlay.fieldDiagnostics.emittedPathCount == 2U);
-    CHECK(streamOverlay.fieldDiagnostics.emittedSampleCount == streamOverlay.samples.size());
-    CHECK(streamOverlay.fieldDiagnostics.acceptedBridgeCount >= 1U);
-    CHECK(streamOverlay.fieldDiagnostics.rejectedGapCount == 1U);
-    CHECK(streamOverlay.fieldDiagnostics.lowConfidenceFadeCount >= 2U);
-    CHECK(streamOverlay.fieldDiagnostics.lowConfidenceTerminationCount == 0U);
-    CHECK(streamOverlay.fieldDiagnostics.maxAcceptedBridgeMeters >= 0.09F);
-    CHECK(streamOverlay.fieldDiagnostics.minRejectedGapMeters >= 0.80F);
+    CHECK(trailOverlay.fieldDiagnostics.inputNodeCount == 4U);
+    CHECK(trailOverlay.fieldDiagnostics.emittedPathCount == 2U);
+    CHECK(trailOverlay.fieldDiagnostics.emittedSampleCount == trailOverlay.samples.size());
+    CHECK(trailOverlay.fieldDiagnostics.acceptedBridgeCount >= 1U);
+    CHECK(trailOverlay.fieldDiagnostics.rejectedGapCount == 1U);
+    CHECK(trailOverlay.fieldDiagnostics.lowConfidenceFadeCount >= 2U);
+    CHECK(trailOverlay.fieldDiagnostics.lowConfidenceTerminationCount == 0U);
+    CHECK(trailOverlay.fieldDiagnostics.maxAcceptedBridgeMeters >= 0.09F);
+    CHECK(trailOverlay.fieldDiagnostics.minRejectedGapMeters >= 0.80F);
 
     auto allowedBridgeCache = cache;
     allowedBridgeCache.nodes = {
@@ -5258,7 +5443,7 @@ TEST_CASE("Field streamlines split rejected gaps and fade low-confidence support
     };
     allowedBridgeCache.nodes[1].bridgeAllowed = true;
     allowedBridgeCache.nodes[2].bridgeAllowed = true;
-    const auto allowedOverlay = invisible_places::water::BuildFieldStreamOverlay(allowedBridgeCache, streamSettings);
+    const auto allowedOverlay = invisible_places::water::BuildFieldTrailOverlay(allowedBridgeCache, trailSettings);
     CHECK(allowedOverlay.fieldDiagnostics.rejectedGapCount == 0U);
     CHECK(allowedOverlay.fieldDiagnostics.manualBridgeAllowedCount == 1U);
     CHECK(allowedOverlay.fieldDiagnostics.acceptedBridgeCount >= 1U);
@@ -5270,7 +5455,7 @@ TEST_CASE("Field streamlines split rejected gaps and fade low-confidence support
         makeNode(0.10F, 1.0F),
     };
     blockedBridgeCache.nodes[1].bridgeBlocked = true;
-    const auto blockedOverlay = invisible_places::water::BuildFieldStreamOverlay(blockedBridgeCache, streamSettings);
+    const auto blockedOverlay = invisible_places::water::BuildFieldTrailOverlay(blockedBridgeCache, trailSettings);
     CHECK(blockedOverlay.fieldDiagnostics.manualBridgeBlockedCount >= 1U);
     CHECK(blockedOverlay.fieldDiagnostics.rejectedGapCount >= 1U);
 
@@ -5281,7 +5466,7 @@ TEST_CASE("Field streamlines split rejected gaps and fade low-confidence support
         makeNode(0.10F, 1.0F),
     };
     noFlowCache.nodes[0].flowBlocked = true;
-    const auto noFlowOverlay = invisible_places::water::BuildFieldStreamOverlay(noFlowCache, streamSettings);
+    const auto noFlowOverlay = invisible_places::water::BuildFieldTrailOverlay(noFlowCache, trailSettings);
     CHECK(noFlowOverlay.fieldDiagnostics.manualNoFlowBlockCount == 1U);
     REQUIRE_FALSE(noFlowOverlay.samples.empty());
     for (const auto& sample : noFlowOverlay.samples) {
@@ -5333,7 +5518,7 @@ TEST_CASE("Water field vector caches save reload and expose invalidation fingerp
     CHECK(invisible_places::water::WaterEffectLayersFingerprint({changedLayer}) != loaded->regionFingerprint);
 }
 
-TEST_CASE("Field stream trails use emitter perturbation and follow vector fields", "[water][v2][field][trails]") {
+TEST_CASE("Field trails use emitter perturbation and follow vector fields", "[water][v2][field][trails]") {
     invisible_places::water::WaterFieldCache cache;
     cache.settings.enabled = true;
     cache.settings.fieldResolutionMeters = 0.05F;
@@ -5354,14 +5539,14 @@ TEST_CASE("Field stream trails use emitter perturbation and follow vector fields
         cache.nodes.push_back(node);
     }
 
-    invisible_places::water::WaterFieldStreamSettings streamSettings;
-    streamSettings.streamlineCount = 4U;
-    streamSettings.seedSpacingMeters = 0.04F;
-    streamSettings.streamlineLengthMeters = 0.20F;
-    streamSettings.stepLengthMeters = 0.05F;
-    streamSettings.streamlineWidthMeters = 0.006F;
-    streamSettings.streamWorldLengthMeters = 0.030F;
-    streamSettings.fadeOnLowConfidence = true;
+    invisible_places::water::WaterFieldTrailSettings trailSettings;
+    trailSettings.trailCount = 4U;
+    trailSettings.seedSpacingMeters = 0.04F;
+    trailSettings.trailLengthMeters = 0.20F;
+    trailSettings.trailPointSpacingMeters = 0.05F;
+    trailSettings.trailWidthMeters = 0.006F;
+    trailSettings.trailStreakLengthMeters = 0.030F;
+    trailSettings.fadeOnLowConfidence = true;
 
     invisible_places::water::WaterEmitter emitter;
     emitter.id = 88U;
@@ -5371,8 +5556,8 @@ TEST_CASE("Field stream trails use emitter perturbation and follow vector fields
     emitter.status = invisible_places::water::WaterEmitterStatus::Accepted;
     const std::vector<invisible_places::water::WaterEmitter> emitters{emitter};
 
-    const auto overlayA = invisible_places::water::BuildFieldStreamOverlay(cache, streamSettings, emitters);
-    const auto overlayB = invisible_places::water::BuildFieldStreamOverlay(cache, streamSettings, emitters);
+    const auto overlayA = invisible_places::water::BuildFieldTrailOverlay(cache, trailSettings, emitters);
+    const auto overlayB = invisible_places::water::BuildFieldTrailOverlay(cache, trailSettings, emitters);
     REQUIRE_FALSE(overlayA.samples.empty());
     REQUIRE(overlayA.samples.size() == overlayB.samples.size());
     CHECK(overlayA.samples.front().position.x == Catch::Approx(overlayB.samples.front().position.x));
@@ -5380,19 +5565,19 @@ TEST_CASE("Field stream trails use emitter perturbation and follow vector fields
     CHECK(std::all_of(
         overlayA.samples.begin(),
         overlayA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
+        [](const invisible_places::water::WaterTrailSample& sample) {
             return sample.tangent.x > 0.75F;
         }));
     CHECK(std::any_of(
         overlayA.samples.begin(),
         overlayA.samples.end(),
-        [](const invisible_places::water::WaterStreamSample& sample) {
+        [](const invisible_places::water::WaterTrailSample& sample) {
             return sample.sourceId == Catch::Approx(88.0F);
         }));
 
     auto changedSeedCache = cache;
     changedSeedCache.settings.seed = 701U;
-    const auto overlayC = invisible_places::water::BuildFieldStreamOverlay(changedSeedCache, streamSettings, emitters);
+    const auto overlayC = invisible_places::water::BuildFieldTrailOverlay(changedSeedCache, trailSettings, emitters);
     REQUIRE_FALSE(overlayC.samples.empty());
     const bool seedChangedOutput =
         std::abs(overlayA.samples.front().position.x - overlayC.samples.front().position.x) > 1.0e-5F ||
@@ -5402,7 +5587,7 @@ TEST_CASE("Field stream trails use emitter perturbation and follow vector fields
 
     auto blockedCache = cache;
     blockedCache.nodes[1].flowBlocked = true;
-    const auto blockedOverlay = invisible_places::water::BuildFieldStreamOverlay(blockedCache, streamSettings, emitters);
+    const auto blockedOverlay = invisible_places::water::BuildFieldTrailOverlay(blockedCache, trailSettings, emitters);
     CHECK(blockedOverlay.fieldDiagnostics.manualNoFlowBlockCount >= 1U);
 }
 
@@ -6733,7 +6918,7 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.trailGeometry.trailLengthMeters = 1.25F;
     document.trailGeometry.pointSpacingMeters = 0.044F;
     document.trailGeometry.widthMeters = 0.018F;
-    document.trailGeometry.worldLengthMeters = 0.12F;
+    document.trailGeometry.streakLengthMeters = 0.12F;
     invisible_places::serialization::WaterPathProfileDocument sourcePathProfile;
     sourcePathProfile.name = "Source Path";
     sourcePathProfile.settings = document.sourceSettings.path;
@@ -6741,8 +6926,8 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.pathProfiles.push_back(sourcePathProfile);
     invisible_places::serialization::WaterLaneProfileDocument sourceLaneProfile;
     sourceLaneProfile.name = "Sheet Lanes";
-    sourceLaneProfile.settings = document.flowStreamSettings;
-    sourceLaneProfile.settings.streamCountTotal = 777U;
+    sourceLaneProfile.settings = document.flowTrailSettings;
+    sourceLaneProfile.settings.trailCountTotal = 777U;
     sourceLaneProfile.settings.laneCount = 13U;
     sourceLaneProfile.settings.turbulence = 0.42F;
     document.laneProfiles.push_back(sourceLaneProfile);
@@ -6857,12 +7042,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     fieldLayer.edgeBlendWidth = 0.33F;
     fieldLayer.regionStrength = 0.77F;
     document.fieldLayers.push_back(fieldLayer);
-    document.flowStreamSettings.streamCountTotal = 222U;
-    document.flowStreamSettings.streamWorldLengthMeters = 0.052F;
-    document.flowStreamSettings.laneCrossing = 0.31F;
+    document.flowTrailSettings.trailCountTotal = 222U;
+    document.flowTrailSettings.trailStreakLengthMeters = 0.052F;
+    document.flowTrailSettings.laneCrossing = 0.31F;
     document.fieldSettings.corridorRadiusMeters = 0.38F;
-    document.fieldStreamSettings.streamlineCount = 333U;
-    document.fieldStreamSettings.streamlineLengthMeters = 0.94F;
+    document.fieldTrailSettings.trailCount = 333U;
+    document.fieldTrailSettings.trailLengthMeters = 0.94F;
 
     const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_water_sources.json";
     std::string errorMessage;
@@ -6903,9 +7088,9 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         CHECK(savedJson.find("\"water_ripple_layers\"") != std::string::npos);
         CHECK(savedJson.find("\"water_field_layers\"") != std::string::npos);
         CHECK(savedJson.find("\"field_surface_motion\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_flow_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_flow_trail_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_field_settings\"") != std::string::npos);
-        CHECK(savedJson.find("\"water_field_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_trail_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
@@ -6933,13 +7118,13 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->trailGeometry.trailLengthMeters == Catch::Approx(1.25F));
     CHECK(loaded->trailGeometry.pointSpacingMeters == Catch::Approx(0.044F));
     CHECK(loaded->trailGeometry.widthMeters == Catch::Approx(0.018F));
-    CHECK(loaded->trailGeometry.worldLengthMeters == Catch::Approx(0.12F));
+    CHECK(loaded->trailGeometry.streakLengthMeters == Catch::Approx(0.12F));
     REQUIRE(loaded->pathProfiles.size() == 1U);
     CHECK(loaded->pathProfiles[0].name == "Source Path");
     CHECK(loaded->pathProfiles[0].settings.pathLength == Catch::Approx(12.5F));
     REQUIRE(loaded->laneProfiles.size() == 1U);
     CHECK(loaded->laneProfiles[0].name == "Sheet Lanes");
-    CHECK(loaded->laneProfiles[0].settings.streamCountTotal == 777U);
+    CHECK(loaded->laneProfiles[0].settings.trailCountTotal == 777U);
     CHECK(loaded->laneProfiles[0].settings.laneCount == 13U);
     CHECK(loaded->laneProfiles[0].settings.turbulence == Catch::Approx(0.42F));
     REQUIRE(loaded->trailProfiles.size() == 1U);
@@ -6998,12 +7183,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion);
     CHECK(loaded->fieldLayers[0].edgeBlendWidth == Catch::Approx(0.33F));
     CHECK(loaded->fieldLayers[0].regionStrength == Catch::Approx(0.77F));
-    CHECK(loaded->flowStreamSettings.streamCountTotal == 222U);
-    CHECK(loaded->flowStreamSettings.streamWorldLengthMeters == Catch::Approx(0.052F));
-    CHECK(loaded->flowStreamSettings.laneCrossing == Catch::Approx(0.31F));
+    CHECK(loaded->flowTrailSettings.trailCountTotal == 222U);
+    CHECK(loaded->flowTrailSettings.trailStreakLengthMeters == Catch::Approx(0.052F));
+    CHECK(loaded->flowTrailSettings.laneCrossing == Catch::Approx(0.31F));
     CHECK(loaded->fieldSettings.corridorRadiusMeters == Catch::Approx(0.38F));
-    CHECK(loaded->fieldStreamSettings.streamlineCount == 333U);
-    CHECK(loaded->fieldStreamSettings.streamlineLengthMeters == Catch::Approx(0.94F));
+    CHECK(loaded->fieldTrailSettings.trailCount == 333U);
+    CHECK(loaded->fieldTrailSettings.trailLengthMeters == Catch::Approx(0.94F));
     CHECK(loaded->causticLookSettings.enabled);
     CHECK(loaded->causticLookSettings.intensity == Catch::Approx(1.4F));
     CHECK(loaded->causticLookSettings.opacityBoost == Catch::Approx(0.22F));
@@ -7040,6 +7225,106 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         loaded->sourceSettings);
     CHECK(fallbackSettings.trailShape.splineAnchorSpacing == Catch::Approx(1.25F));
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Legacy water stream settings load and save as trail settings", "[water][serialization]") {
+    const auto projectPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_water_stream_settings_project.json";
+    {
+        std::ofstream output{projectPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 7,
+  "project_name": "Legacy Stream Settings",
+  "water_flow_stream_settings": {
+    "enabled": true,
+    "stream_count_total": 17,
+    "lane_count": 5,
+    "stream_length_meters": 0.44,
+    "stream_point_spacing_meters": 0.012,
+    "stream_width_meters": 0.006,
+    "stream_world_length_meters": 0.052,
+    "stream_smoothness": 0.71,
+    "stream_looseness": 0.14,
+    "lane_crossing": 0.33,
+    "speed_meters_per_second": 0.27
+  },
+  "water_field_stream_settings": {
+    "enabled": true,
+    "streamline_count": 23,
+    "streamline_length_meters": 0.88,
+    "step_length_meters": 0.019,
+    "streamline_width_meters": 0.007,
+    "stream_world_length_meters": 0.061
+  }
+})";
+    }
+
+    std::string errorMessage;
+    const auto loadedProject = invisible_places::serialization::LoadProjectDocument(projectPath, &errorMessage);
+    REQUIRE(loadedProject.has_value());
+    CHECK(loadedProject->waterFlowTrailSettings.trailCountTotal == 17U);
+    CHECK(loadedProject->waterFlowTrailSettings.laneCount == 5U);
+    CHECK(loadedProject->waterFlowTrailSettings.trailLengthMeters == Catch::Approx(0.44F));
+    CHECK(loadedProject->waterFlowTrailSettings.trailPointSpacingMeters == Catch::Approx(0.012F));
+    CHECK(loadedProject->waterFlowTrailSettings.trailWidthMeters == Catch::Approx(0.006F));
+    CHECK(loadedProject->waterFlowTrailSettings.trailStreakLengthMeters == Catch::Approx(0.052F));
+    CHECK(loadedProject->waterFlowTrailSettings.trailSmoothness == Catch::Approx(0.71F));
+    CHECK(loadedProject->waterFlowTrailSettings.trailLooseness == Catch::Approx(0.14F));
+    CHECK(loadedProject->waterFieldTrailSettings.trailCount == 23U);
+    CHECK(loadedProject->waterFieldTrailSettings.trailLengthMeters == Catch::Approx(0.88F));
+    CHECK(loadedProject->waterFieldTrailSettings.trailPointSpacingMeters == Catch::Approx(0.019F));
+    CHECK(loadedProject->waterFieldTrailSettings.trailWidthMeters == Catch::Approx(0.007F));
+    CHECK(loadedProject->waterFieldTrailSettings.trailStreakLengthMeters == Catch::Approx(0.061F));
+
+    const auto projectRoundTripPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_water_stream_settings_project_roundtrip.json";
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(*loadedProject, projectRoundTripPath, &errorMessage));
+    {
+        std::ifstream savedProject{projectRoundTripPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{savedProject},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"water_flow_trail_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_field_trail_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_count_total\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_streak_length_meters\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_flow_stream_settings\"") == std::string::npos);
+        CHECK(savedJson.find("\"water_field_stream_settings\"") == std::string::npos);
+        CHECK(savedJson.find("\"stream_count_total\"") == std::string::npos);
+        CHECK(savedJson.find("\"streamline_count\"") == std::string::npos);
+        CHECK(savedJson.find("\"stream_world_length_meters\"") == std::string::npos);
+    }
+
+    const auto sourcesPath =
+        std::filesystem::temp_directory_path() / "invisible_places_legacy_water_stream_settings_sources.json";
+    {
+        std::ofstream output{sourcesPath, std::ios::trunc};
+        output << R"({
+  "schema_version": 7,
+  "water_flow_stream_settings": {
+    "stream_count_total": 11,
+    "stream_point_spacing_meters": 0.021,
+    "stream_world_length_meters": 0.073
+  },
+  "water_field_stream_settings": {
+    "streamline_count": 13,
+    "step_length_meters": 0.024,
+    "stream_world_length_meters": 0.082
+  }
+})";
+    }
+    const auto loadedSources = invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
+    REQUIRE(loadedSources.has_value());
+    CHECK(loadedSources->flowTrailSettings.trailCountTotal == 11U);
+    CHECK(loadedSources->flowTrailSettings.trailPointSpacingMeters == Catch::Approx(0.021F));
+    CHECK(loadedSources->flowTrailSettings.trailStreakLengthMeters == Catch::Approx(0.073F));
+    CHECK(loadedSources->fieldTrailSettings.trailCount == 13U);
+    CHECK(loadedSources->fieldTrailSettings.trailPointSpacingMeters == Catch::Approx(0.024F));
+    CHECK(loadedSources->fieldTrailSettings.trailStreakLengthMeters == Catch::Approx(0.082F));
+
+    std::filesystem::remove(projectPath);
+    std::filesystem::remove(projectRoundTripPath);
+    std::filesystem::remove(sourcesPath);
 }
 
 TEST_CASE("Legacy water caustic look settings derive meter controls", "[water][serialization]") {
@@ -9596,46 +9881,46 @@ TEST_CASE("Offline water streaks follow projected flow tangent", "[output][offli
     CHECK(height > width * 3U);
 }
 
-TEST_CASE("Offline water stream overlays use stream tangent and world length", "[output][offline][water][v2]") {
+TEST_CASE("Offline water trail overlays use trail tangent and streak length", "[output][offline][water][v2]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {{0.0F, 0.0F, 0.0F}};
     cloud.hasSourceRgb = false;
     cloud.bounds.Expand(cloud.positions.front());
 
-    const std::vector<std::string> streamFields{
-        "stream_role",
-        "stream_id",
+    const std::vector<std::string> trailFields{
+        "trail_role",
+        "trail_id",
         "source_id",
         "path_id",
         "branch_id",
-        "stream_seed",
+        "trail_seed",
         "point_seed",
-        "stream_distance",
-        "stream_length",
+        "trail_distance",
+        "trail_length",
         "route_start_index",
         "route_point_count",
         "route_length",
-        "stream_start_phase",
-        "stream_lateral_offset",
+        "trail_start_phase",
+        "trail_lateral_offset",
         "point_age",
-        "stream_age",
-        "stream_speed",
-        "stream_width",
-        "stream_world_length",
-        "stream_confidence",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
         "wetness",
         "feature_type",
         "tangent_x",
         "tangent_y",
         "tangent_z",
-        "stream_lane_index",
-        "stream_lane_count",
-        "stream_lane_pitch",
-        "stream_lane_span",
-        "stream_lane_crossing",
-        "stream_cross_seed"};
-    cloud.scalarFields.reserve(streamFields.size());
-    for (const auto& name : streamFields) {
+        "trail_lane_index",
+        "trail_lane_count",
+        "trail_lane_pitch",
+        "trail_lane_span",
+        "trail_lane_crossing",
+        "trail_cross_seed"};
+    cloud.scalarFields.reserve(trailFields.size());
+    for (const auto& name : trailFields) {
         cloud.scalarFields.push_back({
             .name = name,
             .minimum = 0.0F,
@@ -9644,7 +9929,7 @@ TEST_CASE("Offline water stream overlays use stream tangent and world length", "
             .valid = true,
         });
     }
-    cloud.scalarFieldValues.assign(streamFields.size() * cloud.positions.size(), 0.0F);
+    cloud.scalarFieldValues.assign(trailFields.size() * cloud.positions.size(), 0.0F);
     auto setField = [&cloud](std::size_t fieldSlot, float value) {
         cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, 0)] = value;
     };
@@ -9668,7 +9953,7 @@ TEST_CASE("Offline water stream overlays use stream tangent and world length", "
     style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
     style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
     style.flowAnimation = true;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.01F);
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
@@ -9722,7 +10007,7 @@ TEST_CASE("Offline water stream overlays use stream tangent and world length", "
     CHECK(width > height * 3U);
 }
 
-TEST_CASE("Offline water stream overlays animate through time playback", "[output][offline][water][v2]") {
+TEST_CASE("Offline water trail overlays animate through time playback", "[output][offline][water][v2]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {
         {-0.40F, 0.0F, 0.0F},
@@ -9734,40 +10019,40 @@ TEST_CASE("Offline water stream overlays animate through time playback", "[outpu
         cloud.bounds.Expand(position);
     }
 
-    const std::vector<std::string> streamFields{
-        "stream_role",
-        "stream_id",
+    const std::vector<std::string> trailFields{
+        "trail_role",
+        "trail_id",
         "source_id",
         "path_id",
         "branch_id",
-        "stream_seed",
+        "trail_seed",
         "point_seed",
-        "stream_distance",
-        "stream_length",
+        "trail_distance",
+        "trail_length",
         "route_start_index",
         "route_point_count",
         "route_length",
-        "stream_start_phase",
-        "stream_lateral_offset",
+        "trail_start_phase",
+        "trail_lateral_offset",
         "point_age",
-        "stream_age",
-        "stream_speed",
-        "stream_width",
-        "stream_world_length",
-        "stream_confidence",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
         "wetness",
         "feature_type",
         "tangent_x",
         "tangent_y",
         "tangent_z",
-        "stream_lane_index",
-        "stream_lane_count",
-        "stream_lane_pitch",
-        "stream_lane_span",
-        "stream_lane_crossing",
-        "stream_cross_seed"};
-    cloud.scalarFields.reserve(streamFields.size());
-    for (const auto& name : streamFields) {
+        "trail_lane_index",
+        "trail_lane_count",
+        "trail_lane_pitch",
+        "trail_lane_span",
+        "trail_lane_crossing",
+        "trail_cross_seed"};
+    cloud.scalarFields.reserve(trailFields.size());
+    for (const auto& name : trailFields) {
         cloud.scalarFields.push_back({
             .name = name,
             .minimum = 0.0F,
@@ -9776,7 +10061,7 @@ TEST_CASE("Offline water stream overlays animate through time playback", "[outpu
             .valid = true,
         });
     }
-    cloud.scalarFieldValues.assign(streamFields.size() * cloud.positions.size(), 0.0F);
+    cloud.scalarFieldValues.assign(trailFields.size() * cloud.positions.size(), 0.0F);
     auto setField = [&cloud](std::size_t fieldSlot, std::size_t pointIndex, float value) {
         cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, pointIndex)] = value;
     };
@@ -9808,7 +10093,7 @@ TEST_CASE("Offline water stream overlays animate through time playback", "[outpu
     style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
     style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
     style.flowAnimation = true;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.01F);
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
@@ -9860,7 +10145,7 @@ TEST_CASE("Offline water stream overlays animate through time playback", "[outpu
     CHECK(frameBCentroidX > frameACentroidX + 4.0F);
 }
 
-TEST_CASE("Offline water stream lane crossing changes lateral travel only when enabled", "[output][offline][water][v2]") {
+TEST_CASE("Offline water trail placement uses baked lateral offsets", "[output][offline][water][v2]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {
         {0.0F, -0.40F, 0.0F},
@@ -9872,40 +10157,40 @@ TEST_CASE("Offline water stream lane crossing changes lateral travel only when e
         cloud.bounds.Expand(position);
     }
 
-    const std::vector<std::string> streamFields{
-        "stream_role",
-        "stream_id",
+    const std::vector<std::string> trailFields{
+        "trail_role",
+        "trail_id",
         "source_id",
         "path_id",
         "branch_id",
-        "stream_seed",
+        "trail_seed",
         "point_seed",
-        "stream_distance",
-        "stream_length",
+        "trail_distance",
+        "trail_length",
         "route_start_index",
         "route_point_count",
         "route_length",
-        "stream_start_phase",
-        "stream_lateral_offset",
+        "trail_start_phase",
+        "trail_lateral_offset",
         "point_age",
-        "stream_age",
-        "stream_speed",
-        "stream_width",
-        "stream_world_length",
-        "stream_confidence",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
         "wetness",
         "feature_type",
         "tangent_x",
         "tangent_y",
         "tangent_z",
-        "stream_lane_index",
-        "stream_lane_count",
-        "stream_lane_pitch",
-        "stream_lane_span",
-        "stream_lane_crossing",
-        "stream_cross_seed"};
-    cloud.scalarFields.reserve(streamFields.size());
-    for (const auto& name : streamFields) {
+        "trail_lane_index",
+        "trail_lane_count",
+        "trail_lane_pitch",
+        "trail_lane_span",
+        "trail_lane_crossing",
+        "trail_cross_seed"};
+    cloud.scalarFields.reserve(trailFields.size());
+    for (const auto& name : trailFields) {
         cloud.scalarFields.push_back({
             .name = name,
             .minimum = 0.0F,
@@ -9914,7 +10199,7 @@ TEST_CASE("Offline water stream lane crossing changes lateral travel only when e
             .valid = true,
         });
     }
-    cloud.scalarFieldValues.assign(streamFields.size() * cloud.positions.size(), 0.0F);
+    cloud.scalarFieldValues.assign(trailFields.size() * cloud.positions.size(), 0.0F);
     auto setField = [&cloud](std::size_t fieldSlot, std::size_t pointIndex, float value) {
         cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, pointIndex)] = value;
     };
@@ -9945,7 +10230,7 @@ TEST_CASE("Offline water stream lane crossing changes lateral travel only when e
     style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
     style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
     style.flowAnimation = true;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.01F);
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
@@ -9991,6 +10276,7 @@ TEST_CASE("Offline water stream lane crossing changes lateral travel only when e
     };
 
     for (std::size_t pointIndex = 0; pointIndex < cloud.PointCount(); ++pointIndex) {
+        setField(13U, pointIndex, 0.0F);
         setField(29U, pointIndex, 0.0F);
     }
     const auto [stableAlphaA, stableCentroidA] = renderAlphaCentroidX(0.0F);
@@ -10002,15 +10288,22 @@ TEST_CASE("Offline water stream lane crossing changes lateral travel only when e
     for (std::size_t pointIndex = 0; pointIndex < cloud.PointCount(); ++pointIndex) {
         setField(29U, pointIndex, 1.0F);
     }
-    const auto [movingAlphaA, movingCentroidA] = renderAlphaCentroidX(0.0F);
-    CHECK(movingAlphaA > 0.0F);
-    bool crossedLane = false;
+    const auto [crossingOnlyAlpha, crossingOnlyCentroid] = renderAlphaCentroidX(0.0F);
+    CHECK(crossingOnlyAlpha > 0.0F);
+    CHECK(std::abs(crossingOnlyCentroid - stableCentroidA) < 0.5F);
     for (float timeSeconds : {0.08F, 0.14F, 0.21F, 0.33F, 0.47F, 0.62F}) {
-        const auto [movingAlphaB, movingCentroidB] = renderAlphaCentroidX(timeSeconds);
-        CHECK(movingAlphaB > 0.0F);
-        crossedLane = crossedLane || std::abs(movingCentroidB - movingCentroidA) > 1.0F;
+        const auto [crossingAlpha, crossingCentroid] = renderAlphaCentroidX(timeSeconds);
+        CHECK(crossingAlpha > 0.0F);
+        CHECK(std::abs(crossingCentroid - stableCentroidA) < 0.5F);
     }
-    CHECK(crossedLane);
+
+    setField(13U, 2U, 0.18F);
+    const auto [bakedOffsetAlphaA, bakedOffsetCentroidA] = renderAlphaCentroidX(0.0F);
+    const auto [bakedOffsetAlphaB, bakedOffsetCentroidB] = renderAlphaCentroidX(0.5F);
+    CHECK(bakedOffsetAlphaA > 0.0F);
+    CHECK(bakedOffsetAlphaB > 0.0F);
+    CHECK(std::abs(bakedOffsetCentroidA - stableCentroidA) > 1.0F);
+    CHECK(std::abs(bakedOffsetCentroidB - bakedOffsetCentroidA) < 0.75F);
 }
 
 TEST_CASE("Offline point diagnostics skip depth pass for non-depth layers", "[output][offline][point-style]") {

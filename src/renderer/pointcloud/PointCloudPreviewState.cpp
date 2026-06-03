@@ -493,7 +493,7 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.waterStreakAspect = sourceStyle.waterStreakAspect;
     style.flowAnimation = false;
     style.waterPathView = false;
-    style.waterStreamOverlay = false;
+    style.waterTrailOverlay = false;
     style.causticAnimation = sourceStyle.causticAnimation;
     style.causticIntensity = sourceStyle.causticIntensity;
     style.causticScale = sourceStyle.causticScale;
@@ -566,7 +566,7 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
          style.emissiveStrength.constantValue[0] <= kMaterialEpsilon);
     const bool noColorize = style.colorizeAmount <= kMaterialEpsilon;
 
-    if (style.flowAnimation || style.waterStreamOverlay) {
+    if (style.flowAnimation || style.waterTrailOverlay) {
         return PointCloudMaterialVariant::Unified;
     }
 

@@ -131,8 +131,8 @@ using WaterEmitterStatus = invisible_places::water::WaterEmitterStatus;
 using WaterFieldCache = invisible_places::water::WaterFieldCache;
 using WaterFieldOutputMode = invisible_places::water::WaterFieldOutputMode;
 using WaterFieldSettings = invisible_places::water::WaterFieldSettings;
-using WaterFieldStreamSettings = invisible_places::water::WaterFieldStreamSettings;
-using WaterFlowStreamSettings = invisible_places::water::WaterFlowStreamSettings;
+using WaterFieldTrailSettings = invisible_places::water::WaterFieldTrailSettings;
+using WaterFlowTrailSettings = invisible_places::water::WaterFlowTrailSettings;
 using WaterOverlay = invisible_places::water::WaterOverlay;
 using WaterOverlayPoint = invisible_places::water::WaterOverlayPoint;
 using WaterParticleTrailSettings = invisible_places::water::WaterParticleTrailSettings;
@@ -150,8 +150,8 @@ using WaterScaleMode = invisible_places::water::WaterScaleMode;
 using WaterSettingsBundle = invisible_places::water::WaterSettingsBundle;
 using WaterSourceSettingsAssignment = invisible_places::water::WaterSourceSettingsAssignment;
 using WaterSourceSettings = invisible_places::water::WaterSourceSettings;
-using WaterStreamSample = invisible_places::water::WaterStreamSample;
-using WaterStreamOverlay = invisible_places::water::WaterStreamOverlay;
+using WaterTrailSample = invisible_places::water::WaterTrailSample;
+using WaterTrailOverlay = invisible_places::water::WaterTrailOverlay;
 using WaterTrailBuildDiagnostics = invisible_places::water::WaterTrailBuildDiagnostics;
 using WaterTrailBuildQuality = invisible_places::water::WaterTrailBuildQuality;
 using WaterTrailGeometrySettings = invisible_places::water::WaterTrailGeometrySettings;
@@ -511,7 +511,7 @@ struct SavedWaterPathProfileState {
 
 struct SavedWaterLaneProfileState {
     std::string name = "Default";
-    WaterFlowStreamSettings settings{};
+    WaterFlowTrailSettings settings{};
 };
 
 struct SavedWaterTrailProfileState {
@@ -750,7 +750,7 @@ struct WaterWorkflowState {
     std::vector<SavedWaterLaneProfileState> laneProfiles;
     std::string selectedLaneProfileName = "Default";
     std::string laneProfileNameBuffer = "Default";
-    std::optional<WaterFlowStreamSettings> editedLaneProfileSettings;
+    std::optional<WaterFlowTrailSettings> editedLaneProfileSettings;
     WaterTrailGeometrySettings defaultTrailGeometry =
         invisible_places::water::DefaultWaterTrailGeometrySettings();
     std::optional<WaterTrailGeometrySettings> tempDefaultTrailGeometry;
@@ -760,15 +760,15 @@ struct WaterWorkflowState {
     std::optional<SavedWaterTrailProfileState> editedTrailProfile;
     WaterAnimationTrailProfileSource activeAnimationTrailProfileSource =
         WaterAnimationTrailProfileSource::Auto;
-    WaterFlowStreamSettings flowStreamSettings{};
-    std::optional<WaterFlowStreamSettings> lastInstalledLaneSettings;
+    WaterFlowTrailSettings flowTrailSettings{};
+    std::optional<WaterFlowTrailSettings> lastInstalledLaneSettings;
     WaterFieldSettings fieldSettings{};
-    WaterFieldStreamSettings fieldStreamSettings{};
+    WaterFieldTrailSettings fieldTrailSettings{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
     WaterOverlay pathAnchors{};
     WaterOverlay flowOverlay{};
-    WaterStreamOverlay flowStreamOverlay{};
-    WaterStreamOverlay fieldStreamOverlay{};
+    WaterTrailOverlay flowTrailOverlay{};
+    WaterTrailOverlay fieldTrailOverlay{};
     WaterEffectOverlay rippleEffectOverlay{};
     WaterEffectOverlay fieldSurfaceEffectOverlay{};
     WaterFieldCache fieldCache{};
@@ -803,7 +803,7 @@ struct WaterWorkflowState {
     std::optional<std::size_t> activeSupportSessionIndex;
     std::filesystem::path lastOverlayPath;
     std::filesystem::path lastRippleOverlayPath;
-    std::filesystem::path lastFieldStreamOverlayPath;
+    std::filesystem::path lastFieldTrailOverlayPath;
     std::filesystem::path lastFieldSurfaceOverlayPath;
     std::uint32_t nextEmitterId = 1;
     std::uint32_t nextRippleLayerId = 1;
@@ -1720,7 +1720,7 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashBool(seed, style.solidCenters);
     HashBool(seed, style.flowAnimation);
     HashBool(seed, style.waterPathView);
-    HashBool(seed, style.waterStreamOverlay);
+    HashBool(seed, style.waterTrailOverlay);
     HashBinding(seed, style.pointSize);
     HashBinding(seed, style.surfelDiameter);
     HashBinding(seed, style.opacity);
@@ -2008,27 +2008,85 @@ void EnsureFieldMappedBindingDefaults(
         &scalarFields[0]);
 }
 
-std::optional<std::int32_t> FindWaterStreamScalarFieldSlotByName(
+std::optional<std::int32_t> FindWaterTrailScalarFieldSlotByName(
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
     std::string_view name) {
     const auto target = NormalizeMotionScalarFieldName(name);
+    const auto legacyTarget = [&target]() -> std::string_view {
+        if (target == "trailrole") {
+            return "streamrole";
+        }
+        if (target == "trailid") {
+            return "streamid";
+        }
+        if (target == "trailseed") {
+            return "streamseed";
+        }
+        if (target == "traildistance") {
+            return "streamdistance";
+        }
+        if (target == "traillength") {
+            return "streamlength";
+        }
+        if (target == "trailstartphase") {
+            return "streamstartphase";
+        }
+        if (target == "traillateraloffset") {
+            return "streamlateraloffset";
+        }
+        if (target == "trailage") {
+            return "streamage";
+        }
+        if (target == "trailspeed") {
+            return "streamspeed";
+        }
+        if (target == "trailwidth") {
+            return "streamwidth";
+        }
+        if (target == "trailstreaklength") {
+            return "streamworldlength";
+        }
+        if (target == "trailconfidence") {
+            return "streamconfidence";
+        }
+        if (target == "traillaneindex") {
+            return "streamlaneindex";
+        }
+        if (target == "traillanecount") {
+            return "streamlanecount";
+        }
+        if (target == "traillanepitch") {
+            return "streamlanepitch";
+        }
+        if (target == "traillanespan") {
+            return "streamlanespan";
+        }
+        if (target == "traillanecrossing") {
+            return "streamlanecrossing";
+        }
+        if (target == "trailcrossseed") {
+            return "streamcrossseed";
+        }
+        return {};
+    }();
     for (std::size_t index = 0; index < scalarFields.size(); ++index) {
-        if (NormalizeMotionScalarFieldName(scalarFields[index].name) == target) {
+        const auto fieldName = NormalizeMotionScalarFieldName(scalarFields[index].name);
+        if (fieldName == target || (!legacyTarget.empty() && fieldName == legacyTarget)) {
             return static_cast<std::int32_t>(index);
         }
     }
     return std::nullopt;
 }
 
-bool HasWaterStreamV2ScalarFields(const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
-    return FindWaterStreamScalarFieldSlotByName(scalarFields, "stream_role").has_value() &&
-           FindWaterStreamScalarFieldSlotByName(scalarFields, "route_start_index").has_value() &&
-           FindWaterStreamScalarFieldSlotByName(scalarFields, "point_age").has_value() &&
-           FindWaterStreamScalarFieldSlotByName(scalarFields, "stream_confidence").has_value() &&
-           FindWaterStreamScalarFieldSlotByName(scalarFields, "wetness").has_value();
+bool HasWaterTrailV2ScalarFields(const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    return FindWaterTrailScalarFieldSlotByName(scalarFields, "trail_role").has_value() &&
+           FindWaterTrailScalarFieldSlotByName(scalarFields, "route_start_index").has_value() &&
+           FindWaterTrailScalarFieldSlotByName(scalarFields, "point_age").has_value() &&
+           FindWaterTrailScalarFieldSlotByName(scalarFields, "trail_confidence").has_value() &&
+           FindWaterTrailScalarFieldSlotByName(scalarFields, "wetness").has_value();
 }
 
-void RemapLegacyWaterStreamBinding(
+void RemapLegacyWaterTrailBinding(
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
     if (binding == nullptr || binding->mode != ParameterSourceMode::FieldMapped) {
@@ -2038,7 +2096,7 @@ void RemapLegacyWaterStreamBinding(
     const auto normalizedName = NormalizeMotionScalarFieldName(binding->fieldMap.fieldName);
     std::string_view targetName;
     if (normalizedName == "confidence") {
-        targetName = "stream_confidence";
+        targetName = "trail_confidence";
     } else if (normalizedName == "accumulation") {
         targetName = "wetness";
     } else if (normalizedName == "trailage") {
@@ -2047,7 +2105,7 @@ void RemapLegacyWaterStreamBinding(
         return;
     }
 
-    const auto targetSlot = FindWaterStreamScalarFieldSlotByName(scalarFields, targetName);
+    const auto targetSlot = FindWaterTrailScalarFieldSlotByName(scalarFields, targetName);
     if (!targetSlot.has_value()) {
         return;
     }
@@ -2062,20 +2120,20 @@ void RemapLegacyWaterStreamBinding(
         false);
 }
 
-void RemapLegacyWaterStreamBindings(PreviewLayerSession* session) {
+void RemapLegacyWaterTrailBindings(PreviewLayerSession* session) {
     if (session == nullptr ||
-        !session->pointStyle.waterStreamOverlay ||
-        !HasWaterStreamV2ScalarFields(session->scalarFields)) {
+        !session->pointStyle.waterTrailOverlay ||
+        !HasWaterTrailV2ScalarFields(session->scalarFields)) {
         return;
     }
 
-    RemapLegacyWaterStreamBinding(&session->pointStyle.pointSize, session->scalarFields);
-    RemapLegacyWaterStreamBinding(&session->pointStyle.surfelDiameter, session->scalarFields);
-    RemapLegacyWaterStreamBinding(&session->pointStyle.opacity, session->scalarFields);
-    RemapLegacyWaterStreamBinding(&session->pointStyle.emissiveStrength, session->scalarFields);
-    RemapLegacyWaterStreamBinding(&session->pointStyle.xrayStrength, session->scalarFields);
-    RemapLegacyWaterStreamBinding(&session->pointStyle.depthFade, session->scalarFields);
-    RemapLegacyWaterStreamBinding(&session->pointStyle.colormapPosition, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.pointSize, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.surfelDiameter, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.opacity, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.emissiveStrength, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.xrayStrength, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.depthFade, session->scalarFields);
+    RemapLegacyWaterTrailBinding(&session->pointStyle.colormapPosition, session->scalarFields);
 }
 
 void SanitizePointCloudStyle(PreviewLayerSession* session) {
@@ -2095,7 +2153,7 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
             session->hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
     }
 
-    RemapLegacyWaterStreamBindings(session);
+    RemapLegacyWaterTrailBindings(session);
 
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.pointSize, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.surfelDiameter, session->scalarFields);
@@ -2303,7 +2361,7 @@ bool PointStylesEqualForSelection(
 
 bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session);
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session);
-bool VisibleGeneratedWaterStreamOverlayPresent(const PreviewRuntimeState& runtimeState);
+bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState);
 bool IsProtectedWaterPointVisualName(std::string_view name);
 std::optional<PointCloudStyleState> MakeProtectedWaterPointVisualStyle(
     const PreviewRuntimeState& runtimeState,
@@ -3307,6 +3365,13 @@ invisible_places::io::Float3 FromGlm(const glm::vec3& value) {
     return {value.x, value.y, value.z};
 }
 
+bool IsGeneratedWaterFlowTrailOverlayStem(const std::string& stem) {
+    return stem.ends_with("-WaterFlowTrails") ||
+           stem.find("-WaterFlowTrails-") != std::string::npos ||
+           stem.ends_with("-WaterFlowStreams") ||
+           stem.find("-WaterFlowStreams-") != std::string::npos;
+}
+
 bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
     if (session.kind != LayerKind::PointCloud) {
         return false;
@@ -3315,16 +3380,15 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
     const auto stem = session.sourcePath.stem().string();
     const auto waterVisualName = NormalizeWaterPointVisualName(session.selectedPointVisualName);
     return session.pointStyle.flowAnimation ||
-           session.pointStyle.waterStreamOverlay ||
+           session.pointStyle.waterTrailOverlay ||
            waterVisualName == "Water Flow_preset" ||
            waterVisualName == "Ripples" ||
            waterVisualName == "Field Surface" ||
            stem.ends_with("-WaterPreview") ||
            stem.ends_with("-WaterFlow") ||
-           stem.ends_with("-WaterFlowStreams") ||
-           stem.find("-WaterFlowTrails-") != std::string::npos ||
+           IsGeneratedWaterFlowTrailOverlayStem(stem) ||
            stem.ends_with("-Ripples") ||
-           stem.ends_with("-FieldStreamlines") ||
+           stem.ends_with("-FieldTrails") ||
            stem.ends_with("-FieldSurface");
 }
 
@@ -3336,12 +3400,11 @@ bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session) {
     return NormalizeWaterPointVisualName(session.selectedPointVisualName) == "Water Flow_preset" ||
            stem.ends_with("-WaterPreview") ||
            stem.ends_with("-WaterFlow") ||
-           stem.ends_with("-WaterFlowStreams") ||
-           stem.find("-WaterFlowTrails-") != std::string::npos ||
-           stem.ends_with("-FieldStreamlines");
+           IsGeneratedWaterFlowTrailOverlayStem(stem) ||
+           stem.ends_with("-FieldTrails");
 }
 
-bool VisibleGeneratedWaterStreamOverlayPresent(const PreviewRuntimeState& runtimeState) {
+bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState) {
     return std::any_of(
         runtimeState.sessions.begin(),
         runtimeState.sessions.end(),
@@ -3349,7 +3412,7 @@ bool VisibleGeneratedWaterStreamOverlayPresent(const PreviewRuntimeState& runtim
             return session.loaded &&
                    session.visible &&
                    session.kind == LayerKind::PointCloud &&
-                   session.pointStyle.waterStreamOverlay &&
+                   session.pointStyle.waterTrailOverlay &&
                    IsGeneratedWaterFlowOverlaySession(session);
         });
 }
@@ -3370,10 +3433,9 @@ bool IsAssociableLidarSession(const PreviewLayerSession& session) {
            waterVisualName != "Field Surface" &&
            !stem.ends_with("-WaterPreview") &&
            !stem.ends_with("-WaterFlow") &&
-           !stem.ends_with("-WaterFlowStreams") &&
-           stem.find("-WaterFlowTrails-") == std::string::npos &&
+           !IsGeneratedWaterFlowTrailOverlayStem(stem) &&
            !stem.ends_with("-Ripples") &&
-           !stem.ends_with("-FieldStreamlines") &&
+           !stem.ends_with("-FieldTrails") &&
            !stem.ends_with("-FieldSurface");
 }
 
@@ -5291,7 +5353,7 @@ PointCloudStyleState ViewedWaterPointVisualStyle(const PreviewRuntimeState& runt
 PointCloudStyleState MakeWaterTrailExportStyle(PointCloudStyleState style) {
     style.flowAnimation = true;
     style.waterPathView = false;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     style.geometryMode = PointCloudGeometryMode::CameraFacingWorldSprites;
     style.depthContribution = PointCloudDepthContribution::None;
     style.stylisationMode = PointCloudStylisationMode::Off;
@@ -5306,10 +5368,10 @@ PointCloudStyleState MakeWaterTrailSessionStyle(
     const WaterTrailGeometrySettings& geometry) {
     style = MakeWaterTrailExportStyle(style);
     const float width = std::max(0.0005F, geometry.widthMeters);
-    const float worldLength = std::max(width, geometry.worldLengthMeters);
+    const float streakLength = std::max(width, geometry.streakLengthMeters);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, width);
     invisible_places::style::SetScalarConstant(&style.pointSize, width * 1000.0F);
-    style.waterStreakAspect = std::clamp(worldLength / width, 1.0F, 32.0F);
+    style.waterStreakAspect = std::clamp(streakLength / width, 1.0F, 32.0F);
     return style;
 }
 
@@ -5375,14 +5437,14 @@ std::optional<std::size_t> ResolveWaterSupportSessionIndex(const PreviewRuntimeS
     return std::nullopt;
 }
 
-constexpr std::int32_t kWaterStreamFieldStreamRole = 0;
-constexpr std::int32_t kWaterStreamFieldPointAge = 14;
-constexpr std::int32_t kWaterStreamFieldStreamAge = 15;
-constexpr std::int32_t kWaterStreamFieldStreamSpeed = 16;
-constexpr std::int32_t kWaterStreamFieldStreamWidth = 17;
-constexpr std::int32_t kWaterStreamFieldStreamWorldLength = 18;
-constexpr std::int32_t kWaterStreamFieldStreamConfidence = 19;
-constexpr std::int32_t kWaterStreamFieldWetness = 20;
+constexpr std::int32_t kWaterTrailFieldTrailRole = 0;
+constexpr std::int32_t kWaterTrailFieldPointAge = 14;
+constexpr std::int32_t kWaterTrailFieldTrailAge = 15;
+constexpr std::int32_t kWaterTrailFieldTrailSpeed = 16;
+constexpr std::int32_t kWaterTrailFieldTrailWidth = 17;
+constexpr std::int32_t kWaterTrailFieldTrailStreakLength = 18;
+constexpr std::int32_t kWaterTrailFieldTrailConfidence = 19;
+constexpr std::int32_t kWaterTrailFieldWetness = 20;
 
 void ConfigureWaterFieldBinding(
     RenderParameterBinding* binding,
@@ -5445,7 +5507,7 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
     style.densityClamp = 8.0F;
     style.solidCenters = true;
     style.flowAnimation = true;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     style.waterPathView = viewMode == WaterOverlayViewMode::Path;
     style.geometryMode = PointCloudGeometryMode::WorldSurfels;
     style.waterStreakAspect = 7.5F;
@@ -5454,8 +5516,8 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
         style.waterPathView ? 12.0F : 14.0F);
     ConfigureWaterFieldBinding(
         &style.opacity,
-        kWaterStreamFieldStreamConfidence,
-        "stream_confidence",
+        kWaterTrailFieldTrailConfidence,
+        "trail_confidence",
         0.0F,
         style.waterPathView ? 1.0F : 0.24F);
     invisible_places::style::SetFieldMapFlag(
@@ -5464,7 +5526,7 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
         false);
     ConfigureWaterFieldBinding(
         &style.emissiveStrength,
-        kWaterStreamFieldWetness,
+        kWaterTrailFieldWetness,
         "wetness",
         style.waterPathView ? 0.65F : 0.0F,
         style.waterPathView ? 1.40F : 0.35F);
@@ -5563,7 +5625,7 @@ const char* WaterOverlayVisualPresetName(WaterOverlayVisualPreset preset) {
 PointCloudStyleState MakeWaterOverlayVisualPreset(WaterOverlayVisualPreset preset) {
     auto style = MakeWaterOverlayStyle(WaterOverlayViewMode::Trail);
     style.flowAnimation = true;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     style.waterPathView = false;
     style.colorMode = PointCloudColorMode::SolidColor;
     style.falloffProfile = PointCloudFalloffProfile::Gaussian;
@@ -5572,12 +5634,12 @@ PointCloudStyleState MakeWaterOverlayVisualPreset(WaterOverlayVisualPreset prese
     style.densityScale = 1.0F;
     style.densityClamp = 10.0F;
     style.waterStreakAspect = 1.0F;
-    ConfigureWaterFieldBinding(&style.opacity, kWaterStreamFieldPointAge, "point_age", 0.28F, 0.035F);
+    ConfigureWaterFieldBinding(&style.opacity, kWaterTrailFieldPointAge, "point_age", 0.28F, 0.035F);
     invisible_places::style::SetFieldMapFlag(
         &style.opacity.fieldMap,
         invisible_places::style::FieldMapFlagUseLayerStats,
         false);
-    ConfigureWaterFieldBinding(&style.emissiveStrength, kWaterStreamFieldWetness, "wetness", 0.55F, 1.65F);
+    ConfigureWaterFieldBinding(&style.emissiveStrength, kWaterTrailFieldWetness, "wetness", 0.55F, 1.65F);
     invisible_places::style::SetFieldMapFlag(
         &style.emissiveStrength.fieldMap,
         invisible_places::style::FieldMapFlagUseLayerStats,
@@ -5755,7 +5817,7 @@ void SeedWaterFlowBuiltInVisuals(PreviewRuntimeState* runtimeState, PreviewLayer
     runtimeState->water.selectedPointVisualName = session->selectedPointVisualName;
     runtimeState->water.pointVisualNameBuffer = BasePointVisualName(session->selectedPointVisualName);
     session->pointStyle.flowAnimation = true;
-    session->pointStyle.waterStreamOverlay = true;
+    session->pointStyle.waterTrailOverlay = true;
     session->pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
 }
 
@@ -5780,7 +5842,7 @@ void ApplyWaterOverlayVisualPreset(PreviewRuntimeState* runtimeState, PreviewLay
 PointCloudStyleState MakeWaterOverlayDisplayStyle(const PreviewRuntimeState& runtimeState) {
     auto style = ViewedWaterPointVisualStyle(runtimeState);
     style.flowAnimation = true;
-    style.waterStreamOverlay = true;
+    style.waterTrailOverlay = true;
     style.waterPathView = runtimeState.water.overlayViewMode == WaterOverlayViewMode::Path;
     return style;
 }
@@ -5794,7 +5856,7 @@ void ApplyWaterOverlayDisplayStyle(PreviewRuntimeState* runtimeState) {
             continue;
         }
         session.pointStyle = MakeWaterTrailExportStyle(session.pointStyle);
-        if (session.sourcePath.stem().string().find("-WaterFlowTrails-") == std::string::npos) {
+        if (!IsGeneratedWaterFlowTrailOverlayStem(session.sourcePath.stem().string())) {
             session.pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
         }
     }
@@ -5830,7 +5892,7 @@ void ApplyWaterPointVisualStyleToGeneratedSessions(PreviewRuntimeState* runtimeS
         if (!IsGeneratedWaterFlowOverlaySession(session)) {
             continue;
         }
-        if (session.sourcePath.stem().string().find("-WaterFlowTrails-") != std::string::npos) {
+        if (IsGeneratedWaterFlowTrailOverlayStem(session.sourcePath.stem().string())) {
             continue;
         }
         SeedWaterFlowBuiltInVisuals(runtimeState, &session);
@@ -5923,11 +5985,11 @@ std::optional<WaterPathGenerationSettings> BuiltInWaterPathProfileSettings(std::
     return std::nullopt;
 }
 
-std::optional<WaterFlowStreamSettings> BuiltInWaterLaneProfileSettings(std::string_view name) {
+std::optional<WaterFlowTrailSettings> BuiltInWaterLaneProfileSettings(std::string_view name) {
     const auto normalized = NormalizeWaterProfileName(name);
-    WaterFlowStreamSettings settings;
+    WaterFlowTrailSettings settings;
     if (normalized == "Calm Lanes_preset") {
-        settings.streamCountTotal = 420U;
+        settings.trailCountTotal = 420U;
         settings.laneCount = 5U;
         settings.laneSpreadMeters = 0.08F;
         settings.laneCrossing = 0.06F;
@@ -5937,7 +5999,7 @@ std::optional<WaterFlowStreamSettings> BuiltInWaterLaneProfileSettings(std::stri
         return settings;
     }
     if (normalized == "Braided Lanes_preset") {
-        settings.streamCountTotal = 1100U;
+        settings.trailCountTotal = 1100U;
         settings.laneCount = 11U;
         settings.laneSpreadMeters = 0.28F;
         settings.laneCrossing = 0.62F;
@@ -5947,7 +6009,7 @@ std::optional<WaterFlowStreamSettings> BuiltInWaterLaneProfileSettings(std::stri
         return settings;
     }
     if (normalized == "Wide Sheet_preset") {
-        settings.streamCountTotal = 1800U;
+        settings.trailCountTotal = 1800U;
         settings.laneCount = 17U;
         settings.laneSpreadMeters = 0.55F;
         settings.laneCrossing = 0.18F;
@@ -5983,7 +6045,7 @@ std::optional<SavedWaterTrailProfileState> BuiltInWaterTrailProfile(
         geometry.trailLengthMeters = 0.95F;
         geometry.pointSpacingMeters = 0.018F;
         geometry.widthMeters = 0.0055F;
-        geometry.worldLengthMeters = 0.045F;
+        geometry.streakLengthMeters = 0.045F;
         return MakeWaterTrailProfile(
             normalized,
             geometry,
@@ -5993,7 +6055,7 @@ std::optional<SavedWaterTrailProfileState> BuiltInWaterTrailProfile(
         geometry.trailLengthMeters = 1.35F;
         geometry.pointSpacingMeters = 0.026F;
         geometry.widthMeters = 0.012F;
-        geometry.worldLengthMeters = 0.108F;
+        geometry.streakLengthMeters = 0.108F;
         return MakeWaterTrailProfile(
             normalized,
             geometry,
@@ -6003,7 +6065,7 @@ std::optional<SavedWaterTrailProfileState> BuiltInWaterTrailProfile(
         geometry.trailLengthMeters = 2.2F;
         geometry.pointSpacingMeters = 0.045F;
         geometry.widthMeters = 0.040F;
-        geometry.worldLengthMeters = 0.160F;
+        geometry.streakLengthMeters = 0.160F;
         return MakeWaterTrailProfile(
             normalized,
             geometry,
@@ -6013,7 +6075,7 @@ std::optional<SavedWaterTrailProfileState> BuiltInWaterTrailProfile(
         geometry.trailLengthMeters = 1.1F;
         geometry.pointSpacingMeters = 0.022F;
         geometry.widthMeters = 0.008F;
-        geometry.worldLengthMeters = 0.055F;
+        geometry.streakLengthMeters = 0.055F;
         return MakeWaterTrailProfile(
             normalized,
             geometry,
@@ -6179,7 +6241,7 @@ WaterPathGenerationSettings WaterPathProfileSettingsByName(
     return water.defaultSourceSettings.path;
 }
 
-WaterFlowStreamSettings WaterLaneProfileSettingsByName(
+WaterFlowTrailSettings WaterLaneProfileSettingsByName(
     const WaterWorkflowState& water,
     std::string_view name) {
     const auto normalized = NormalizeWaterProfileName(name);
@@ -6189,7 +6251,7 @@ WaterFlowStreamSettings WaterLaneProfileSettingsByName(
     if (const auto index = FindWaterLaneProfileIndex(water, normalized); index.has_value()) {
         return water.laneProfiles[index.value()].settings;
     }
-    return water.flowStreamSettings;
+    return water.flowTrailSettings;
 }
 
 SavedWaterTrailProfileState WaterTrailProfileByName(
@@ -6216,7 +6278,7 @@ WaterPathGenerationSettings ViewedGlobalWaterPathSettings(const WaterWorkflowSta
     return WaterPathProfileSettingsByName(water, water.selectedPathProfileName);
 }
 
-WaterFlowStreamSettings ViewedGlobalWaterLaneSettings(const WaterWorkflowState& water) {
+WaterFlowTrailSettings ViewedGlobalWaterLaneSettings(const WaterWorkflowState& water) {
     if (water.editedLaneProfileSettings.has_value()) {
         return water.editedLaneProfileSettings.value();
     }
@@ -6242,7 +6304,7 @@ WaterPathGenerationSettings ResolveEmitterWaterPathSettings(
     return WaterPathProfileSettingsByName(water, emitter.pathProfileName);
 }
 
-WaterFlowStreamSettings ResolveEmitterWaterLaneSettings(
+WaterFlowTrailSettings ResolveEmitterWaterLaneSettings(
     const WaterWorkflowState& water,
     const WaterEmitter& emitter) {
     if (IsGlobalWaterProfileName(emitter.laneProfileName)) {
@@ -6260,11 +6322,11 @@ SavedWaterTrailProfileState ResolveEmitterWaterTrailProfile(
     return WaterTrailProfileByName(runtimeState, emitter.trailProfileName);
 }
 
-WaterFlowStreamSettings MakeEmitterFlowSettings(
+WaterFlowTrailSettings MakeEmitterFlowSettings(
     const WaterWorkflowState& water,
     const WaterEmitter& emitter,
     const SavedWaterTrailProfileState& trailProfile) {
-    return invisible_places::water::ApplyWaterTrailGeometryToFlowStreamSettings(
+    return invisible_places::water::ApplyWaterTrailGeometryToFlowTrailSettings(
         ResolveEmitterWaterLaneSettings(water, emitter),
         trailProfile.geometry);
 }
@@ -6321,9 +6383,9 @@ std::filesystem::path BuildWaterTrailOverlayPath(
             WaterProfileFileToken(trailProfileName) + ".generated");
 }
 
-void AppendWaterStreamOverlay(
-    WaterStreamOverlay* target,
-    WaterStreamOverlay source) {
+void AppendWaterTrailOverlay(
+    WaterTrailOverlay* target,
+    WaterTrailOverlay source) {
     if (target == nullptr || source.samples.empty()) {
         return;
     }
@@ -6338,7 +6400,7 @@ void AppendWaterStreamOverlay(
 
 struct WaterTrailOverlayGroup {
     SavedWaterTrailProfileState trailProfile;
-    WaterStreamOverlay overlay;
+    WaterTrailOverlay overlay;
 };
 
 const invisible_places::water::WaterPathAnalysisCache* FlowPathAnalysisForLanes(
@@ -6355,7 +6417,7 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
     const PreviewRuntimeState& runtimeState) {
     std::vector<WaterTrailOverlayGroup> groups;
     const auto* pathAnalysis = FlowPathAnalysisForLanes(runtimeState.water);
-    const auto addOverlay = [&](const SavedWaterTrailProfileState& profile, WaterStreamOverlay overlay) {
+    const auto addOverlay = [&](const SavedWaterTrailProfileState& profile, WaterTrailOverlay overlay) {
         if (overlay.samples.empty()) {
             return;
         }
@@ -6369,10 +6431,10 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
         if (groupIt == groups.end()) {
             WaterTrailOverlayGroup group;
             group.trailProfile = profile;
-            AppendWaterStreamOverlay(&group.overlay, std::move(overlay));
+            AppendWaterTrailOverlay(&group.overlay, std::move(overlay));
             groups.push_back(std::move(group));
         } else {
-            AppendWaterStreamOverlay(&groupIt->overlay, std::move(overlay));
+            AppendWaterTrailOverlay(&groupIt->overlay, std::move(overlay));
         }
     };
 
@@ -6396,7 +6458,7 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
         const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile);
         addOverlay(
             trailProfile,
-            invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, flowSettings, pathAnalysis));
+            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, flowSettings, pathAnalysis));
     }
 
     if (!usedEmitterAnchors) {
@@ -6407,7 +6469,7 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
         const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, fallbackEmitter, trailProfile);
         addOverlay(
             trailProfile,
-            invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(
+            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
                 runtimeState.water.pathAnchors,
                 flowSettings,
                 pathAnalysis));
@@ -6420,10 +6482,10 @@ PointCloudStyleState MakeEffectiveFastBasicStyle(
     bool hasSourceRgb,
     bool waterOverlay) {
     auto style = invisible_places::renderer::pointcloud::MakeFastBasicPointCloudStyle(sourceStyle, hasSourceRgb);
-    if (waterOverlay && (sourceStyle.flowAnimation || sourceStyle.waterStreamOverlay)) {
+    if (waterOverlay && (sourceStyle.flowAnimation || sourceStyle.waterTrailOverlay)) {
         style.flowAnimation = true;
         style.waterPathView = sourceStyle.waterPathView;
-        style.waterStreamOverlay = sourceStyle.waterStreamOverlay;
+        style.waterTrailOverlay = sourceStyle.waterTrailOverlay;
         if (style.waterPathView) {
             style.pointSize = sourceStyle.pointSize;
         }
@@ -6476,7 +6538,7 @@ std::size_t AddOrRefreshWaterOverlaySession(
         session.pointVisuals.push_back({.name = session.selectedPointVisualName, .style = session.pointStyle});
     } else {
         session.pointStyle.flowAnimation = true;
-        session.pointStyle.waterStreamOverlay = NormalizeWaterPointVisualName(visualName) == "Water Flow_preset";
+        session.pointStyle.waterTrailOverlay = NormalizeWaterPointVisualName(visualName) == "Water Flow_preset";
         session.pointStyle.waterPathView =
             NormalizeWaterPointVisualName(visualName) == "Water Flow_preset" &&
             runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
@@ -6533,7 +6595,7 @@ std::size_t AddOrRefreshWaterFlowOverlaySession(
         session.pointVisuals.push_back({.name = "Water Flow_preset", .style = session.pointStyle});
     } else {
         session.pointStyle.flowAnimation = true;
-        session.pointStyle.waterStreamOverlay = true;
+        session.pointStyle.waterTrailOverlay = true;
         session.pointStyle.waterPathView = runtimeState->water.overlayViewMode == WaterOverlayViewMode::Path;
         EnsurePointVisuals(&session);
     }
@@ -6549,23 +6611,23 @@ std::size_t AddOrRefreshWaterFlowOverlaySession(
     return sessionIndex;
 }
 
-void StoreLiveWaterFlowStreamOverlay(
+void StoreLiveWaterFlowTrailOverlay(
     PreviewRuntimeState* runtimeState,
-    WaterStreamOverlay overlay) {
+    WaterTrailOverlay overlay) {
     if (runtimeState == nullptr) {
         return;
     }
-    runtimeState->water.flowStreamOverlay = std::move(overlay);
+    runtimeState->water.flowTrailOverlay = std::move(overlay);
     ++runtimeState->water.flowOverlayRevision;
     runtimeState->water.pathDebugCacheRevision = 0;
     runtimeState->water.pathDebugPolylines.clear();
 }
 
-std::size_t AddOrRefreshWaterStreamOverlaySession(
+std::size_t AddOrRefreshWaterTrailOverlaySession(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     const std::filesystem::path& overlayPath,
-    WaterStreamOverlay overlay,
+    WaterTrailOverlay overlay,
     std::string_view visualName,
     bool storeAsFlowOverlay,
     std::optional<PointCloudStyleState> defaultStyle = std::nullopt) {
@@ -6574,8 +6636,8 @@ std::size_t AddOrRefreshWaterStreamOverlaySession(
     }
 
     if (storeAsFlowOverlay) {
-        StoreLiveWaterFlowStreamOverlay(runtimeState, overlay);
-        overlay = runtimeState->water.flowStreamOverlay;
+        StoreLiveWaterFlowTrailOverlay(runtimeState, overlay);
+        overlay = runtimeState->water.flowTrailOverlay;
     }
     const auto existingIndex = FindSessionIndexBySourcePath(*runtimeState, overlayPath);
     const auto sessionIndex = existingIndex.value_or(runtimeState->sessions.size());
@@ -6606,7 +6668,7 @@ std::size_t AddOrRefreshWaterStreamOverlaySession(
         session.pointVisuals.push_back({.name = session.selectedPointVisualName, .style = session.pointStyle});
     } else {
         session.pointStyle.flowAnimation = true;
-        session.pointStyle.waterStreamOverlay = true;
+        session.pointStyle.waterTrailOverlay = true;
         session.pointStyle.waterPathView = false;
         EnsurePointVisuals(&session);
     }
@@ -6614,8 +6676,8 @@ std::size_t AddOrRefreshWaterStreamOverlaySession(
         SeedWaterFlowBuiltInVisuals(runtimeState, &session);
     }
 
-    auto cloud = invisible_places::water::BuildWaterStreamOverlayPointCloud(
-        storeAsFlowOverlay ? runtimeState->water.flowStreamOverlay : overlay,
+    auto cloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
+        storeAsFlowOverlay ? runtimeState->water.flowTrailOverlay : overlay,
         overlayPath,
         session.displayName);
     if (!ActivateLoadedPointCloud(sessionIndex, std::move(cloud), runtimeState, viewport)) {
@@ -6638,8 +6700,7 @@ bool UnloadGeneratedWaterFlowOverlaySessions(
             continue;
         }
         const auto stem = session.sourcePath.stem().string();
-        if (stem.ends_with("-WaterFlowStreams") ||
-            stem.find("-WaterFlowTrails-") != std::string::npos) {
+        if (IsGeneratedWaterFlowTrailOverlayStem(stem)) {
             UnloadLayerByIndex(runtimeState, viewport, index);
             unloadedAny = true;
         }
@@ -6656,15 +6717,15 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
         return 0U;
     }
 
-    WaterStreamOverlay combined;
+    WaterTrailOverlay combined;
     std::size_t sampleCount = 0U;
     for (const auto& group : groups) {
         sampleCount += group.overlay.samples.size();
-        AppendWaterStreamOverlay(&combined, group.overlay);
+        AppendWaterTrailOverlay(&combined, group.overlay);
     }
     ++runtimeState->water.pathDiagnosticRebuildCounters.laneBuilds;
     ++runtimeState->water.pathDiagnosticRebuildCounters.trailBuilds;
-    StoreLiveWaterFlowStreamOverlay(runtimeState, combined);
+    StoreLiveWaterFlowTrailOverlay(runtimeState, combined);
     UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
 
     bool setLastOverlayPath = false;
@@ -6675,7 +6736,7 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
             runtimeState->water.lastOverlayPath = outputPath;
             setLastOverlayPath = true;
         }
-        AddOrRefreshWaterStreamOverlaySession(
+        AddOrRefreshWaterTrailOverlaySession(
             runtimeState,
             viewport,
             outputPath,
@@ -6687,22 +6748,11 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
     return sampleCount;
 }
 
-std::optional<std::size_t> ScalarFieldIndexByName(
-    const std::vector<invisible_places::io::ScalarFieldStats>& fields,
-    std::string_view name) {
-    for (std::size_t index = 0; index < fields.size(); ++index) {
-        if (fields[index].name == name) {
-            return index;
-        }
-    }
-    return std::nullopt;
-}
-
-bool ScaleWaterFlowStreamSpeedScalars(
+bool ScaleWaterFlowTrailSpeedScalars(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
-    const WaterFlowStreamSettings& previousSettings,
-    const WaterFlowStreamSettings& nextSettings) {
+    const WaterFlowTrailSettings& previousSettings,
+    const WaterFlowTrailSettings& nextSettings) {
     if (runtimeState == nullptr || viewport == nullptr ||
         previousSettings.speedMetersPerSecond <= 1.0e-6F ||
         nextSettings.speedMetersPerSecond <= 1.0e-6F ||
@@ -6715,8 +6765,8 @@ bool ScaleWaterFlowStreamSpeedScalars(
         return false;
     }
 
-    for (auto& sample : runtimeState->water.flowStreamOverlay.samples) {
-        sample.streamSpeed = std::max(0.01F, sample.streamSpeed * speedScale);
+    for (auto& sample : runtimeState->water.flowTrailOverlay.samples) {
+        sample.trailSpeed = std::max(0.01F, sample.trailSpeed * speedScale);
     }
 
     bool updatedAny = false;
@@ -6725,13 +6775,12 @@ bool ScaleWaterFlowStreamSpeedScalars(
         const auto stem = session.sourcePath.stem().string();
         if (!session.loaded ||
             !IsGeneratedWaterFlowOverlaySession(session) ||
-            (stem.find("-WaterFlowTrails-") == std::string::npos &&
-             !stem.ends_with("-WaterFlowStreams")) ||
+            !IsGeneratedWaterFlowTrailOverlayStem(stem) ||
             session.offlinePointCloud == nullptr) {
             continue;
         }
         auto& cloud = *session.offlinePointCloud;
-        const auto speedSlot = ScalarFieldIndexByName(cloud.scalarFields, "stream_speed");
+        const auto speedSlot = FindWaterTrailScalarFieldSlotByName(cloud.scalarFields, "trail_speed");
         if (!speedSlot.has_value() || cloud.PointCount() == 0U) {
             continue;
         }
@@ -6740,13 +6789,15 @@ bool ScaleWaterFlowStreamSpeedScalars(
             continue;
         }
         invisible_places::io::ScalarFieldStats speedStats;
-        speedStats.name = "stream_speed";
+        speedStats.name = "trail_speed";
         for (std::size_t pointIndex = 0; pointIndex < cloud.PointCount(); ++pointIndex) {
-            const auto valueIndex = cloud.ScalarFieldValueIndex(speedSlot.value(), pointIndex);
+            const auto valueIndex = cloud.ScalarFieldValueIndex(
+                static_cast<std::size_t>(speedSlot.value()),
+                pointIndex);
             cloud.scalarFieldValues[valueIndex] = std::max(0.01F, cloud.scalarFieldValues[valueIndex] * speedScale);
             speedStats.Include(cloud.scalarFieldValues[valueIndex]);
         }
-        cloud.scalarFields[speedSlot.value()] = speedStats;
+        cloud.scalarFields[static_cast<std::size_t>(speedSlot.value())] = speedStats;
         session.scalarFields = cloud.scalarFields;
         try {
             viewport->UploadPointCloudScalarFields(
@@ -6822,7 +6873,7 @@ std::filesystem::path BuildWaterOverlayPath(
     const auto waterDirectory = projectPath.empty()
                                     ? std::filesystem::path{"Saved"} / "water"
                                     : projectPath.parent_path() / "water";
-    const auto suffix = "-WaterFlowStreams.generated";
+    const auto suffix = "-WaterFlowTrails.generated";
     return waterDirectory / (sourceSession.sourcePath.stem().string() + suffix);
 }
 
@@ -7553,10 +7604,10 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     document.emitters = runtimeState->water.emitters;
     document.rippleLayers = runtimeState->water.rippleLayers;
     document.fieldLayers = runtimeState->water.fieldLayers;
-    document.flowStreamSettings = runtimeState->water.flowStreamSettings;
+    document.flowTrailSettings = runtimeState->water.flowTrailSettings;
     document.trailGeometry = runtimeState->water.defaultTrailGeometry;
     document.fieldSettings = runtimeState->water.fieldSettings;
-    document.fieldStreamSettings = runtimeState->water.fieldStreamSettings;
+    document.fieldTrailSettings = runtimeState->water.fieldTrailSettings;
     document.sourceSettings = runtimeState->water.defaultSourceSettings;
     document.tempSourceSettings = runtimeState->water.tempDefaultSourceSettings;
     document.causticLookSettings = runtimeState->water.defaultCausticLookSettings;
@@ -7613,10 +7664,10 @@ void LoadWaterSources(
     runtimeState->water.rippleLayers = document->rippleLayers;
     runtimeState->water.fieldLayers = document->fieldLayers;
     runtimeState->water.rippleRuntimeCaches = document->rippleRuntimeCaches;
-    runtimeState->water.flowStreamSettings = document->flowStreamSettings;
+    runtimeState->water.flowTrailSettings = document->flowTrailSettings;
     runtimeState->water.defaultTrailGeometry = document->trailGeometry;
     runtimeState->water.fieldSettings = document->fieldSettings;
-    runtimeState->water.fieldStreamSettings = document->fieldStreamSettings;
+    runtimeState->water.fieldTrailSettings = document->fieldTrailSettings;
     runtimeState->water.defaultSourceSettings = document->sourceSettings;
     runtimeState->water.tempDefaultSourceSettings = document->tempSourceSettings;
     runtimeState->water.defaultCausticLookSettings = document->causticLookSettings;
@@ -8433,11 +8484,11 @@ bool RefreshWaterFieldOverlays(
     }
     if (!candidateFieldLayers.empty() && targetFieldLayers.empty()) {
         runtimeState->water.fieldCache = {};
-        runtimeState->water.fieldStreamOverlay = {};
+        runtimeState->water.fieldTrailOverlay = {};
         runtimeState->water.fieldSurfaceEffectOverlay = {};
-        runtimeState->water.lastFieldStreamOverlayPath.clear();
+        runtimeState->water.lastFieldTrailOverlayPath.clear();
         runtimeState->water.lastFieldSurfaceOverlayPath.clear();
-        UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-FieldStreamlines");
+        UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-FieldTrails");
         UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-FieldSurface");
         std::vector<WaterEffectOverlay> compositionOverlays;
         if (!ApplyWaterEffectCompositionFieldsToSession(
@@ -8490,13 +8541,13 @@ bool RefreshWaterFieldOverlays(
         }
         if (runtimeState->water.pathAnchors.points.empty()) {
             if (!runtimeState->water.fieldSurfaceEffectOverlay.points.empty() ||
-                !runtimeState->water.fieldStreamOverlay.samples.empty()) {
+                !runtimeState->water.fieldTrailOverlay.samples.empty()) {
                 runtimeState->water.fieldCache = {};
-                runtimeState->water.fieldStreamOverlay = {};
+                runtimeState->water.fieldTrailOverlay = {};
                 runtimeState->water.fieldSurfaceEffectOverlay = {};
-                runtimeState->water.lastFieldStreamOverlayPath.clear();
+                runtimeState->water.lastFieldTrailOverlayPath.clear();
                 runtimeState->water.lastFieldSurfaceOverlayPath.clear();
-                UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-FieldStreamlines");
+                UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-FieldTrails");
                 UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-FieldSurface");
                 std::vector<WaterEffectOverlay> compositionOverlays;
                 if (!ApplyWaterEffectCompositionFieldsToSession(
@@ -8515,7 +8566,7 @@ bool RefreshWaterFieldOverlays(
                 runtimeState->errorMessage.clear();
                 return true;
             }
-            runtimeState->errorMessage = "Bake Flow paths or draw a Field region before building Field streamlines.";
+            runtimeState->errorMessage = "Bake Flow paths or draw a Field region before building Field trails.";
             runtimeState->statusMessage.clear();
             return false;
         }
@@ -8536,24 +8587,24 @@ bool RefreshWaterFieldOverlays(
     }
 
     std::size_t outputPoints = 0;
-    if (runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::Streamlines ||
+    if (runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::Trails ||
         runtimeState->water.fieldSettings.outputMode == WaterFieldOutputMode::Both) {
-        auto streamOverlay = invisible_places::water::BuildFieldStreamOverlay(
+        auto trailOverlay = invisible_places::water::BuildFieldTrailOverlay(
             runtimeState->water.fieldCache,
-            runtimeState->water.fieldStreamSettings,
+            runtimeState->water.fieldTrailSettings,
             runtimeState->water.emitters);
-        outputPoints += streamOverlay.samples.size();
-        runtimeState->water.fieldStreamOverlay = streamOverlay;
+        outputPoints += trailOverlay.samples.size();
+        runtimeState->water.fieldTrailOverlay = trailOverlay;
         const auto outputPath = BuildWaterFeatureOverlayPath(
             *runtimeState,
             sourceSession,
-            "-FieldStreamlines.generated");
-        runtimeState->water.lastFieldStreamOverlayPath = outputPath;
-        AddOrRefreshWaterStreamOverlaySession(
+            "-FieldTrails.generated");
+        runtimeState->water.lastFieldTrailOverlayPath = outputPath;
+        AddOrRefreshWaterTrailOverlaySession(
             runtimeState,
             viewport,
             outputPath,
-            streamOverlay,
+            trailOverlay,
             "Water Flow_preset",
             false);
     }
@@ -8568,7 +8619,7 @@ bool RefreshWaterFieldOverlays(
         layer.response.colouriseGreen = 0.95F;
         layer.response.colouriseBlue = 0.78F;
         layer.regionStrength = 1.0F;
-        layer.speed = runtimeState->water.fieldStreamSettings.speedMetersPerSecond;
+        layer.speed = runtimeState->water.fieldTrailSettings.speedMetersPerSecond;
         layer.maxAffectedPoints = 300000U;
         auto effectOverlay = invisible_places::water::GenerateFieldSurfaceEffectOverlay(
             runtimeState->water.fieldCache,
@@ -9499,9 +9550,9 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.waterEmitters = runtimeState.water.emitters;
     document.waterRippleLayers = runtimeState.water.rippleLayers;
     document.waterFieldLayers = runtimeState.water.fieldLayers;
-    document.waterFlowStreamSettings = runtimeState.water.flowStreamSettings;
+    document.waterFlowTrailSettings = runtimeState.water.flowTrailSettings;
     document.waterFieldSettings = runtimeState.water.fieldSettings;
-    document.waterFieldStreamSettings = runtimeState.water.fieldStreamSettings;
+    document.waterFieldTrailSettings = runtimeState.water.fieldTrailSettings;
     document.waterSourceSettings = runtimeState.water.defaultSourceSettings;
     document.tempWaterSourceSettings = runtimeState.water.tempDefaultSourceSettings;
     document.waterTrailGeometry = runtimeState.water.defaultTrailGeometry;
@@ -9745,13 +9796,13 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.emitters = document.waterEmitters;
     runtimeState->water.rippleLayers = document.waterRippleLayers;
     runtimeState->water.fieldLayers = document.waterFieldLayers;
-    runtimeState->water.flowStreamSettings = document.waterFlowStreamSettings;
+    runtimeState->water.flowTrailSettings = document.waterFlowTrailSettings;
     runtimeState->water.defaultTrailGeometry = document.waterTrailGeometry;
     runtimeState->water.fieldSettings = document.waterFieldSettings;
-    runtimeState->water.fieldStreamSettings = document.waterFieldStreamSettings;
+    runtimeState->water.fieldTrailSettings = document.waterFieldTrailSettings;
     runtimeState->water.flowOverlay = {};
-    runtimeState->water.flowStreamOverlay = {};
-    runtimeState->water.fieldStreamOverlay = {};
+    runtimeState->water.flowTrailOverlay = {};
+    runtimeState->water.fieldTrailOverlay = {};
     runtimeState->water.rippleEffectOverlay = {};
     runtimeState->water.fieldSurfaceEffectOverlay = {};
     runtimeState->water.fieldCache = {};
@@ -11882,7 +11933,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     std::vector<OfflinePointLayerSnapshot> layers;
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
-        !VisibleGeneratedWaterStreamOverlayPresent(runtimeState);
+        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     for (const auto& session : runtimeState.sessions) {
         if (!session.loaded ||
             !session.visible ||
@@ -12212,7 +12263,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> layers;
     const bool fastBasicRenderer =
         rendererMode == PointCloudRendererMode::FastBasic &&
-        !VisibleGeneratedWaterStreamOverlayPresent(runtimeState);
+        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
         if (!session.loaded ||
@@ -13243,7 +13294,7 @@ bool StartQuickMp4ExportJob(
         .style = visualStyle,
     }};
     const auto exportRendererMode =
-        VisibleGeneratedWaterStreamOverlayPresent(*runtimeState)
+        VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
     const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
@@ -13675,7 +13726,7 @@ void StartStillCameraExportJob(
     }
 
     const auto exportRendererMode =
-        VisibleGeneratedWaterStreamOverlayPresent(*runtimeState)
+        VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
     const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
@@ -13792,7 +13843,7 @@ void StartAnimationExportJob(
     }
 
     const auto exportRendererMode =
-        VisibleGeneratedWaterStreamOverlayPresent(*runtimeState)
+        VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
@@ -15367,20 +15418,20 @@ float WaterPathLaneRouteCenter(std::uint32_t laneIndex, std::uint32_t laneCount,
 }
 
 WaterPathDebugSample MakeWaterPathDebugSample(
-    const WaterStreamSample& streamSample,
+    const WaterTrailSample& trailSample,
     const glm::vec3& position) {
     WaterPathDebugSample sample;
     sample.position = FromGlm(position);
-    if (std::isfinite(streamSample.streamDistance)) {
-        sample.pathDistance = std::max(0.0F, streamSample.streamDistance);
+    if (std::isfinite(trailSample.trailDistance)) {
+        sample.pathDistance = std::max(0.0F, trailSample.trailDistance);
         sample.hasPathDistance = true;
     }
-    if (std::isfinite(streamSample.streamLaneSpan) && streamSample.streamLaneSpan > 0.0F) {
-        sample.channelWidth = streamSample.streamLaneSpan;
+    if (std::isfinite(trailSample.trailLaneSpan) && trailSample.trailLaneSpan > 0.0F) {
+        sample.channelWidth = trailSample.trailLaneSpan;
         sample.diagnosticMask |= WaterPathDebugDiagnosticChannelWidth;
     }
-    if (std::isfinite(streamSample.streamSpeed) && streamSample.streamSpeed > 0.0F) {
-        sample.speed = streamSample.streamSpeed;
+    if (std::isfinite(trailSample.trailSpeed) && trailSample.trailSpeed > 0.0F) {
+        sample.speed = trailSample.trailSpeed;
         sample.diagnosticMask |= WaterPathDebugDiagnosticSpeed;
     }
     return sample;
@@ -15843,31 +15894,31 @@ void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
     }
     flushCurrent();
 
-    std::vector<WaterStreamSample> currentRouteSamples;
+    std::vector<WaterTrailSample> currentRouteTrailSamples;
     std::optional<std::uint32_t> currentRouteBranchId;
     const auto flushRouteLaneGuides = [&]() {
-        if (!currentRouteBranchId.has_value() || currentRouteSamples.size() < 2U) {
-            currentRouteSamples.clear();
+        if (!currentRouteBranchId.has_value() || currentRouteTrailSamples.size() < 2U) {
+            currentRouteTrailSamples.clear();
             currentRouteBranchId.reset();
             return;
         }
         std::uint32_t laneCount = 1U;
-        for (const auto& sample : currentRouteSamples) {
-            if (std::isfinite(sample.streamLaneCount)) {
+        for (const auto& sample : currentRouteTrailSamples) {
+            if (std::isfinite(sample.trailLaneCount)) {
                 laneCount = std::max<std::uint32_t>(
                     laneCount,
                     static_cast<std::uint32_t>(std::clamp(
-                        std::lround(sample.streamLaneCount),
+                        std::lround(sample.trailLaneCount),
                         1L,
                         32L)));
             }
         }
         for (std::uint32_t laneIndex = 0; laneIndex < laneCount; ++laneIndex) {
             std::vector<WaterPathDebugSample> laneSamples;
-            laneSamples.reserve(currentRouteSamples.size());
-            for (const auto& sample : currentRouteSamples) {
+            laneSamples.reserve(currentRouteTrailSamples.size());
+            for (const auto& sample : currentRouteTrailSamples) {
                 const auto sampleLaneCount = static_cast<std::uint32_t>(std::clamp(
-                    std::lround(std::isfinite(sample.streamLaneCount) ? sample.streamLaneCount : 1.0F),
+                    std::lround(std::isfinite(sample.trailLaneCount) ? sample.trailLaneCount : 1.0F),
                     1L,
                     32L));
                 if (laneIndex >= sampleLaneCount) {
@@ -15895,19 +15946,19 @@ void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
                 const float laneCenter = WaterPathLaneRouteCenter(
                     laneIndex,
                     sampleLaneCount,
-                    std::max(0.0F, sample.streamLaneSpan));
+                    std::max(0.0F, sample.trailLaneSpan));
                 laneSamples.push_back(MakeWaterPathDebugSample(
                     sample,
                     ToGlm(sample.position) + lateral * laneCenter));
             }
             addPolyline(currentRouteBranchId.value(), true, laneSamples);
         }
-        currentRouteSamples.clear();
+        currentRouteTrailSamples.clear();
         currentRouteBranchId.reset();
     };
 
-    for (const auto& sample : water.flowStreamOverlay.samples) {
-        if (sample.streamRole >= 0.5F) {
+    for (const auto& sample : water.flowTrailOverlay.samples) {
+        if (sample.trailRole >= 0.5F) {
             continue;
         }
         const auto branchId =
@@ -15916,7 +15967,7 @@ void EnsureWaterPathDebugCache(PreviewRuntimeState* runtimeState) {
             flushRouteLaneGuides();
         }
         currentRouteBranchId = branchId;
-        currentRouteSamples.push_back(sample);
+        currentRouteTrailSamples.push_back(sample);
     }
     flushRouteLaneGuides();
 
@@ -19535,8 +19586,8 @@ void DrawWaterRipplesPanel(
 
 const char* WaterFieldOutputModeLabel(WaterFieldOutputMode mode) {
     switch (mode) {
-        case WaterFieldOutputMode::Streamlines:
-            return "Streamlines";
+        case WaterFieldOutputMode::Trails:
+            return "Trails";
         case WaterFieldOutputMode::SurfaceMotion:
             return "Surface Motion";
         case WaterFieldOutputMode::Both:
@@ -19592,7 +19643,7 @@ void DrawWaterFieldPanel(
         changed |= ImGui::Checkbox("Enabled", &water.fieldSettings.enabled);
         const std::array<WaterFieldOutputMode, 3> outputModes{
             WaterFieldOutputMode::Both,
-            WaterFieldOutputMode::Streamlines,
+            WaterFieldOutputMode::Trails,
             WaterFieldOutputMode::SurfaceMotion};
         if (ImGui::BeginCombo("Output", WaterFieldOutputModeLabel(water.fieldSettings.outputMode))) {
             for (const auto mode : outputModes) {
@@ -19831,42 +19882,42 @@ void DrawWaterFieldPanel(
             "%.2f");
         changed |= ImGui::SliderFloat("Field Turbulence", &water.fieldSettings.turbulence, 0.0F, 1.0F, "%.2f");
 
-        int streamlineCount = static_cast<int>(water.fieldStreamSettings.streamlineCount);
-        if (ImGui::SliderInt("Streamlines", &streamlineCount, 1, 10000)) {
-            water.fieldStreamSettings.streamlineCount =
-                static_cast<std::uint32_t>(std::max(1, streamlineCount));
+        int trailCount = static_cast<int>(water.fieldTrailSettings.trailCount);
+        if (ImGui::SliderInt("Trails", &trailCount, 1, 10000)) {
+            water.fieldTrailSettings.trailCount =
+                static_cast<std::uint32_t>(std::max(1, trailCount));
             changed = true;
         }
         changed |= ImGui::SliderFloat(
-            "Streamline Length",
-            &water.fieldStreamSettings.streamlineLengthMeters,
+            "Trail Length",
+            &water.fieldTrailSettings.trailLengthMeters,
             0.03F,
             5.0F,
             "%.2f m",
             ImGuiSliderFlags_Logarithmic);
         changed |= ImGui::SliderFloat(
-            "Step Length",
-            &water.fieldStreamSettings.stepLengthMeters,
+            "Point Spacing",
+            &water.fieldTrailSettings.trailPointSpacingMeters,
             0.002F,
             0.20F,
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
         changed |= ImGui::SliderFloat(
-            "Streamline Width",
-            &water.fieldStreamSettings.streamlineWidthMeters,
+            "Trail Width",
+            &water.fieldTrailSettings.trailWidthMeters,
             0.001F,
             0.08F,
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
         changed |= ImGui::SliderFloat(
-            "World Length",
-            &water.fieldStreamSettings.streamWorldLengthMeters,
+            "Streak Length",
+            &water.fieldTrailSettings.trailStreakLengthMeters,
             0.002F,
             0.30F,
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
-        changed |= ImGui::SliderFloat("Momentum", &water.fieldStreamSettings.momentum, 0.0F, 1.0F, "%.2f");
-        changed |= ImGui::Checkbox("Fade Low Confidence", &water.fieldStreamSettings.fadeOnLowConfidence);
+        changed |= ImGui::SliderFloat("Momentum", &water.fieldTrailSettings.momentum, 0.0F, 1.0F, "%.2f");
+        changed |= ImGui::Checkbox("Fade Low Confidence", &water.fieldTrailSettings.fadeOnLowConfidence);
         if (changed) {
             MarkWaterFieldEffectsDirty(runtimeState, false);
         }
@@ -19882,11 +19933,11 @@ void DrawWaterFieldPanel(
                 FormatPointCount(water.fieldCache.nodes.size()).c_str(),
                 water.fieldCache.stale ? "  | stale" : "");
         }
-        if (!water.lastFieldStreamOverlayPath.empty()) {
-            ImGui::TextDisabled("Streamlines: %s", water.lastFieldStreamOverlayPath.filename().string().c_str());
+        if (!water.lastFieldTrailOverlayPath.empty()) {
+            ImGui::TextDisabled("Trails: %s", water.lastFieldTrailOverlayPath.filename().string().c_str());
         }
-        if (water.fieldStreamOverlay.fieldDiagnostics.inputNodeCount > 0U) {
-            const auto& diagnostics = water.fieldStreamOverlay.fieldDiagnostics;
+        if (water.fieldTrailOverlay.fieldDiagnostics.inputNodeCount > 0U) {
+            const auto& diagnostics = water.fieldTrailOverlay.fieldDiagnostics;
             ImGui::TextDisabled(
                 "Field gaps: accepted %u  rejected %u  faded %u  stopped %u",
                 diagnostics.acceptedBridgeCount,
@@ -20104,7 +20155,7 @@ void DrawWaterProfileSelectionOption(
     std::string* selectedName,
     std::string* nameBuffer,
     std::optional<WaterPathGenerationSettings>* editedPath,
-    std::optional<WaterFlowStreamSettings>* editedLane,
+    std::optional<WaterFlowTrailSettings>* editedLane,
     std::optional<SavedWaterTrailProfileState>* editedTrail) {
     const auto normalized = NormalizeWaterProfileName(name);
     const bool selected = NormalizeWaterProfileName(*selectedName) == normalized;
@@ -20255,7 +20306,7 @@ void DrawWaterLaneProfileSelector(PreviewRuntimeState* runtimeState) {
             runtimeState->errorMessage = "Protected Lane presets must be saved with a new custom name.";
             runtimeState->statusMessage.clear();
         } else if (targetName == kWaterProfileDefaultName) {
-            water.flowStreamSettings = currentSettings;
+            water.flowTrailSettings = currentSettings;
             water.selectedLaneProfileName = std::string{kWaterProfileDefaultName};
             water.editedLaneProfileSettings.reset();
             runtimeState->statusMessage = "Saved Default Lane profile.";
@@ -20376,33 +20427,33 @@ std::vector<invisible_places::io::ScalarFieldStats> WaterTrailScalarFieldsForUi(
     const PreviewRuntimeState& runtimeState) {
     for (const auto& session : runtimeState.sessions) {
         if (IsGeneratedWaterFlowOverlaySession(session) &&
-            HasWaterStreamV2ScalarFields(session.scalarFields)) {
+            HasWaterTrailV2ScalarFields(session.scalarFields)) {
             return session.scalarFields;
         }
     }
 
     std::vector<invisible_places::io::ScalarFieldStats> fields;
     constexpr std::string_view names[] = {
-        "stream_role",
-        "stream_id",
+        "trail_role",
+        "trail_id",
         "source_id",
         "path_id",
         "branch_id",
-        "stream_seed",
+        "trail_seed",
         "point_seed",
-        "stream_distance",
-        "stream_length",
+        "trail_distance",
+        "trail_length",
         "route_start_index",
         "route_point_count",
         "route_length",
-        "stream_start_phase",
-        "stream_lateral_offset",
+        "trail_start_phase",
+        "trail_lateral_offset",
         "point_age",
-        "stream_age",
-        "stream_speed",
-        "stream_width",
-        "stream_world_length",
-        "stream_confidence",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
         "wetness",
     };
     fields.reserve(std::size(names));
@@ -20418,39 +20469,63 @@ void DrawWaterTrailStyleEditor(
     SavedWaterTrailProfileState profile) {
     auto& water = runtimeState->water;
     bool geometryChanged = false;
-    geometryChanged |= ImGui::SliderFloat(
+    bool simpleGeometryChanged = false;
+    const auto trailTooltip = [](const char* text) {
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", text);
+        }
+    };
+    simpleGeometryChanged |= ImGui::SliderFloat(
         "Trail Length",
         &profile.geometry.trailLengthMeters,
         0.03F,
         5.0F,
         "%.2f m",
         ImGuiSliderFlags_Logarithmic);
-    geometryChanged |= ImGui::SliderFloat(
-        "Point Spacing",
-        &profile.geometry.pointSpacingMeters,
-        0.002F,
-        0.20F,
-        "%.3f m",
-        ImGuiSliderFlags_Logarithmic);
-    geometryChanged |= ImGui::SliderFloat(
-        "Width",
+    trailTooltip("Total length of each generated flow trail along the water path.");
+    simpleGeometryChanged |= ImGui::SliderFloat(
+        "Trail Width",
         &profile.geometry.widthMeters,
         0.001F,
         0.08F,
         "%.3f m",
         ImGuiSliderFlags_Logarithmic);
-    geometryChanged |= ImGui::SliderFloat(
-        "Streak Length",
-        &profile.geometry.worldLengthMeters,
-        0.002F,
-        0.30F,
-        "%.3f m",
-        ImGuiSliderFlags_Logarithmic);
+    trailTooltip("Rendered width of the moving flow trail.");
+    if (simpleGeometryChanged) {
+        profile.geometry =
+            invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
+        geometryChanged = true;
+    }
+    if (ImGui::TreeNode("Advanced Trail Controls")) {
+        if (ImGui::Button("Auto Fit")) {
+            profile.geometry =
+                invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
+            geometryChanged = true;
+        }
+        trailTooltip("Derive dense spacing and overlapping streaks from Trail Length and Trail Width.");
+        geometryChanged |= ImGui::SliderFloat(
+            "Point Spacing",
+            &profile.geometry.pointSpacingMeters,
+            0.002F,
+            0.20F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        trailTooltip("Distance between generated trail samples.");
+        geometryChanged |= ImGui::SliderFloat(
+            "Streak Length",
+            &profile.geometry.streakLengthMeters,
+            0.002F,
+            1.0F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        trailTooltip("Rendered dash length for each trail sample.");
+        ImGui::TreePop();
+    }
     profile.geometry.trailLengthMeters = std::clamp(profile.geometry.trailLengthMeters, 0.001F, 50.0F);
     profile.geometry.pointSpacingMeters = std::clamp(profile.geometry.pointSpacingMeters, 0.001F, 10.0F);
     profile.geometry.widthMeters = std::clamp(profile.geometry.widthMeters, 0.0005F, 1.0F);
-    profile.geometry.worldLengthMeters =
-        std::max(profile.geometry.widthMeters, std::clamp(profile.geometry.worldLengthMeters, 0.001F, 5.0F));
+    profile.geometry.streakLengthMeters =
+        std::max(profile.geometry.widthMeters, std::clamp(profile.geometry.streakLengthMeters, 0.001F, 5.0F));
 
     PreviewLayerSession editSession;
     editSession.kind = LayerKind::PointCloud;
@@ -20800,13 +20875,13 @@ void DrawWaterPanel(
                 refreshLanes = true;
             }
             laneTooltip("Shows or hides the generated moving flow trails.");
-            int trailCount = static_cast<int>(laneSettings.streamCountTotal);
+            int trailCount = static_cast<int>(laneSettings.trailCountTotal);
             if (ImGui::SliderInt("Trail Count", &trailCount, 1, 8000)) {
-                laneSettings.streamCountTotal = static_cast<std::uint32_t>(std::max(1, trailCount));
+                laneSettings.trailCountTotal = static_cast<std::uint32_t>(std::max(1, trailCount));
                 lanesChanged = true;
             }
             refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
-            laneTooltip("Total number of flow trails to distribute across the baked paths.");
+            laneTooltip("Number of active moving trail segments per source.");
             int laneCount = static_cast<int>(laneSettings.laneCount);
             if (ImGui::SliderInt("Lane Count", &laneCount, 0, 64)) {
                 laneSettings.laneCount = static_cast<std::uint32_t>(std::max(0, laneCount));
@@ -20872,7 +20947,7 @@ void DrawWaterPanel(
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
                 if (ImGui::SliderFloat(
                     "Lane Smoothness",
-                    &laneSettings.streamSmoothness,
+                    &laneSettings.trailSmoothness,
                     0.0F,
                     1.0F,
                     "%.2f")) {
@@ -20881,7 +20956,7 @@ void DrawWaterPanel(
                 refreshLanes |= ImGui::IsItemDeactivatedAfterEdit();
                 if (ImGui::SliderFloat(
                     "Lane Looseness",
-                    &laneSettings.streamLooseness,
+                    &laneSettings.trailLooseness,
                     0.0F,
                     1.0F,
                     "%.2f")) {
@@ -20902,8 +20977,8 @@ void DrawWaterPanel(
             laneSettings.turbulence = std::clamp(laneSettings.turbulence, 0.0F, 5.0F);
             laneSettings.speedMetersPerSecond = std::clamp(laneSettings.speedMetersPerSecond, 0.001F, 10.0F);
             laneSettings.pathAttraction = std::clamp(laneSettings.pathAttraction, 0.0F, 1.0F);
-            laneSettings.streamSmoothness = std::clamp(laneSettings.streamSmoothness, 0.0F, 1.0F);
-            laneSettings.streamLooseness = std::clamp(laneSettings.streamLooseness, 0.0F, 1.0F);
+            laneSettings.trailSmoothness = std::clamp(laneSettings.trailSmoothness, 0.0F, 1.0F);
+            laneSettings.trailLooseness = std::clamp(laneSettings.trailLooseness, 0.0F, 1.0F);
             if (lanesChanged) {
                 water.editedLaneProfileSettings = laneSettings;
                 water.selectedLaneProfileName = EditedWaterProfileName(water.selectedLaneProfileName);
@@ -20912,7 +20987,7 @@ void DrawWaterPanel(
             if (refreshLanes) {
                 const auto installedLaneSettings =
                     water.lastInstalledLaneSettings.value_or(previousLaneSettings);
-                if (!ScaleWaterFlowStreamSpeedScalars(
+                if (!ScaleWaterFlowTrailSpeedScalars(
                         runtimeState,
                         viewport,
                         installedLaneSettings,
@@ -21573,7 +21648,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
-        !VisibleGeneratedWaterStreamOverlayPresent(runtimeState);
+        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     if (!runtimeState.projectSettings.liveVisualEffects ||
         fastBasicRenderer) {
         return false;
@@ -21585,7 +21660,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
             continue;
         }
         if (session.pointStyle.flowAnimation ||
-            session.pointStyle.waterStreamOverlay ||
+            session.pointStyle.waterTrailOverlay ||
             invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(session.pointStyle) ||
             invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(session.pointStyle) ||
             viewport.SparseWaterRippleEffectCount(sessionIndex) > 0U) {
@@ -21604,7 +21679,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     const auto matrices = runtimeState.camera.Matrices(aspectRatio);
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
-        !VisibleGeneratedWaterStreamOverlayPresent(runtimeState);
+        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
 
     renderState.view = matrices.view;
     renderState.projection = matrices.projection;

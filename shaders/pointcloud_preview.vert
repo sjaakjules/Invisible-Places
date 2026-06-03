@@ -96,31 +96,31 @@ const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterPathStartFieldSlot = 10u;
 const uint kWaterPathCountFieldSlot = 11u;
 const uint kWaterJitterSeedFieldSlot = 12u;
-const uint kWaterTrailAgeFieldSlot = 13u;
+const uint kWaterAgeFieldSlot = 13u;
 const uint kWaterFeatureTypeFieldSlot = 15u;
-const uint kWaterStreamRoleFieldSlot = 0u;
-const uint kWaterStreamDistanceFieldSlot = 7u;
-const uint kWaterStreamLengthFieldSlot = 8u;
-const uint kWaterStreamRouteStartFieldSlot = 9u;
-const uint kWaterStreamRouteCountFieldSlot = 10u;
-const uint kWaterStreamRouteLengthFieldSlot = 11u;
-const uint kWaterStreamStartPhaseFieldSlot = 12u;
-const uint kWaterStreamLateralOffsetFieldSlot = 13u;
-const uint kWaterStreamPointAgeFieldSlot = 14u;
-const uint kWaterStreamAgeFieldSlot = 15u;
-const uint kWaterStreamSpeedFieldSlot = 16u;
-const uint kWaterStreamWidthFieldSlot = 17u;
-const uint kWaterStreamWorldLengthFieldSlot = 18u;
-const uint kWaterStreamFeatureTypeFieldSlot = 21u;
-const uint kWaterStreamTangentXFieldSlot = 22u;
-const uint kWaterStreamTangentYFieldSlot = 23u;
-const uint kWaterStreamTangentZFieldSlot = 24u;
-const uint kWaterStreamLaneIndexFieldSlot = 25u;
-const uint kWaterStreamLaneCountFieldSlot = 26u;
-const uint kWaterStreamLanePitchFieldSlot = 27u;
-const uint kWaterStreamLaneSpanFieldSlot = 28u;
-const uint kWaterStreamLaneCrossingFieldSlot = 29u;
-const uint kWaterStreamCrossSeedFieldSlot = 30u;
+const uint kWaterTrailRoleFieldSlot = 0u;
+const uint kWaterTrailDistanceFieldSlot = 7u;
+const uint kWaterTrailLengthFieldSlot = 8u;
+const uint kWaterTrailRouteStartFieldSlot = 9u;
+const uint kWaterTrailRouteCountFieldSlot = 10u;
+const uint kWaterTrailRouteLengthFieldSlot = 11u;
+const uint kWaterTrailStartPhaseFieldSlot = 12u;
+const uint kWaterTrailLateralOffsetFieldSlot = 13u;
+const uint kWaterTrailPointAgeFieldSlot = 14u;
+const uint kWaterTrailAgeFieldSlot = 15u;
+const uint kWaterTrailSpeedFieldSlot = 16u;
+const uint kWaterTrailWidthFieldSlot = 17u;
+const uint kWaterTrailStreakLengthFieldSlot = 18u;
+const uint kWaterTrailFeatureTypeFieldSlot = 21u;
+const uint kWaterTrailTangentXFieldSlot = 22u;
+const uint kWaterTrailTangentYFieldSlot = 23u;
+const uint kWaterTrailTangentZFieldSlot = 24u;
+const uint kWaterTrailLaneIndexFieldSlot = 25u;
+const uint kWaterTrailLaneCountFieldSlot = 26u;
+const uint kWaterTrailLanePitchFieldSlot = 27u;
+const uint kWaterTrailLaneSpanFieldSlot = 28u;
+const uint kWaterTrailLaneCrossingFieldSlot = 29u;
+const uint kWaterTrailCrossSeedFieldSlot = 30u;
 const float kWaterParticleSpeedScale = 0.12;
 
 float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
@@ -257,18 +257,18 @@ vec3 ApplyWaterEffectColor(vec3 baseColor, uint pointIndex, float waterEffectSca
 
 bool HasWaterParticleFields() {
     if (styleData.pointMeta.w == 3u) {
-        return styleData.globalControl.z > kWaterStreamTangentZFieldSlot;
+        return styleData.globalControl.z > kWaterTrailTangentZFieldSlot;
     }
     return styleData.pointMeta.w != 0u && styleData.globalControl.z > kWaterJitterSeedFieldSlot;
 }
 
-bool WaterStreamOverlayEnabled() {
-    return styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot;
+bool WaterTrailOverlayEnabled() {
+    return styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterTrailTangentZFieldSlot;
 }
 
 float WaterFeatureType(uint pointIndex) {
-    if (WaterStreamOverlayEnabled()) {
-        return LoadScalarFieldValueForPoint(kWaterStreamFeatureTypeFieldSlot, pointIndex);
+    if (WaterTrailOverlayEnabled()) {
+        return LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex);
     }
     return styleData.globalControl.z > kWaterFeatureTypeFieldSlot
         ? LoadScalarFieldValueForPoint(kWaterFeatureTypeFieldSlot, pointIndex)
@@ -276,13 +276,13 @@ float WaterFeatureType(uint pointIndex) {
 }
 
 float WaterTrailFade(uint pointIndex) {
-    if (WaterStreamOverlayEnabled()) {
+    if (WaterTrailOverlayEnabled()) {
         return 1.0;
     }
-    if (styleData.globalControl.z <= kWaterTrailAgeFieldSlot) {
+    if (styleData.globalControl.z <= kWaterAgeFieldSlot) {
         return 1.0;
     }
-    const float age = clamp(LoadScalarFieldValueForPoint(kWaterTrailAgeFieldSlot, pointIndex), 0.0, 1.0);
+    const float age = clamp(LoadScalarFieldValueForPoint(kWaterAgeFieldSlot, pointIndex), 0.0, 1.0);
     return pow(1.0 - smoothstep(0.0, 1.0, age), 1.35);
 }
 
@@ -487,150 +487,38 @@ vec3 JitteredWaterAnchorPosition(
     return basePosition + (lateral * lateralNoise + secondary * secondaryNoise * 0.22) * amplitude;
 }
 
-uint WaterStreamRouteStart(uint pointIndex) {
-    return uint(max(0.0, floor(LoadScalarFieldValueForPoint(kWaterStreamRouteStartFieldSlot, pointIndex) + 0.5)));
+uint WaterTrailRouteStart(uint pointIndex) {
+    return uint(max(0.0, floor(LoadScalarFieldValueForPoint(kWaterTrailRouteStartFieldSlot, pointIndex) + 0.5)));
 }
 
-uint WaterStreamRouteCount(uint pointIndex) {
-    return uint(max(0.0, floor(LoadScalarFieldValueForPoint(kWaterStreamRouteCountFieldSlot, pointIndex) + 0.5)));
+uint WaterTrailRouteCount(uint pointIndex) {
+    return uint(max(0.0, floor(LoadScalarFieldValueForPoint(kWaterTrailRouteCountFieldSlot, pointIndex) + 0.5)));
 }
 
-float WaterStreamTravelPhase(uint pointIndex) {
-    const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterStreamRouteLengthFieldSlot, pointIndex));
-    const float streamDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamDistanceFieldSlot, pointIndex));
-    const float streamAge = LoadScalarFieldValueForPoint(kWaterStreamAgeFieldSlot, pointIndex);
-    const float streamStartPhase = LoadScalarFieldValueForPoint(kWaterStreamStartPhaseFieldSlot, pointIndex);
-    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamSpeedFieldSlot, pointIndex));
-    return fract(
-        streamStartPhase +
-        streamAge +
-        max(0.0, uniforms.depthParameters.x) * speed / routeLength -
-        streamDistance / routeLength);
+float WaterTrailTravelPhase(uint pointIndex) {
+    const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
+    const float trailDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailDistanceFieldSlot, pointIndex));
+    const float trailAge = LoadScalarFieldValueForPoint(kWaterTrailAgeFieldSlot, pointIndex);
+    const float baseStartPhase = LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, pointIndex);
+    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex));
+    const float trailStartPhase = fract(
+        baseStartPhase +
+        trailAge +
+        max(0.0, uniforms.depthParameters.x) * speed / routeLength);
+    return trailStartPhase + trailDistance / routeLength;
 }
 
-float WaterStreamHash(float a, float b, float c) {
-    return fract(sin(dot(vec3(a, b, c), vec3(12.9898, 78.233, 37.719))) * 43758.5453123);
+float WaterTrailVisibility(uint pointIndex) {
+    const float phase = WaterTrailTravelPhase(pointIndex);
+    const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
+    const float trailStreakLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+    const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.08);
+    return 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
 }
 
-float WaterStreamLaneCenter(float laneIndex, float laneCount, float laneSpan) {
-    const float count = max(1.0, floor(laneCount + 0.5));
-    if (count <= 1.0 || laneSpan <= 0.00001) {
-        return 0.0;
-    }
-    const float clampedIndex = clamp(laneIndex, 0.0, count - 1.0);
-    return (((clampedIndex + 0.5) / count) - 0.5) * laneSpan;
-}
-
-float WaterStreamRouteTurnBias(uint pointIndex, float travelPhase, vec3 routeNormal) {
-    const uint routeStart = WaterStreamRouteStart(pointIndex);
-    const uint routeCount = WaterStreamRouteCount(pointIndex);
-    if (routeCount < 3u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
-        return 0.0;
-    }
-
-    const float routePosition = fract(travelPhase) * float(routeCount - 1u);
-    const uint centerOffset = min(max(uint(floor(routePosition)), 1u), routeCount - 2u);
-    const vec3 previous = pointPositions.positions[routeStart + centerOffset - 1u].xyz;
-    const vec3 center = pointPositions.positions[routeStart + centerOffset].xyz;
-    const vec3 next = pointPositions.positions[routeStart + centerOffset + 1u].xyz;
-    vec3 previousTangent = center - previous;
-    vec3 nextTangent = next - center;
-    if (dot(previousTangent, previousTangent) <= 1e-8 || dot(nextTangent, nextTangent) <= 1e-8) {
-        return 0.0;
-    }
-
-    previousTangent = normalize(previousTangent);
-    nextTangent = normalize(nextTangent);
-    const float signedTurn = dot(cross(previousTangent, nextTangent), routeNormal);
-    return clamp(-signedTurn * 8.0, -1.0, 1.0);
-}
-
-float WaterStreamApplyLaneJump(
-    float currentLane,
-    float laneCount,
-    float jumpChance,
-    float turnBias,
-    float crossSeed,
-    float segmentIndex) {
-    if (WaterStreamHash(crossSeed, segmentIndex, 17.0) >= jumpChance) {
-        return currentLane;
-    }
-
-    const float outerLaneProbability = clamp(0.5 + turnBias * 0.42, 0.08, 0.92);
-    const float direction =
-        WaterStreamHash(crossSeed, segmentIndex, 29.0) < outerLaneProbability ? 1.0 : -1.0;
-    return clamp(currentLane + direction, 0.0, laneCount - 1.0);
-}
-
-float ResolveWaterStreamLateralOffset(
-    uint pointIndex,
-    float travelPhase,
-    vec3 routeTangent,
-    float turnBias) {
-    const float baseOffset = LoadScalarFieldValueForPoint(kWaterStreamLateralOffsetFieldSlot, pointIndex);
-    if (styleData.globalControl.z <= kWaterStreamCrossSeedFieldSlot) {
-        return baseOffset;
-    }
-
-    const float crossing = clamp(LoadScalarFieldValueForPoint(kWaterStreamLaneCrossingFieldSlot, pointIndex), 0.0, 1.0);
-    const float laneCount = max(1.0, floor(LoadScalarFieldValueForPoint(kWaterStreamLaneCountFieldSlot, pointIndex) + 0.5));
-    const float lanePitch = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamLanePitchFieldSlot, pointIndex));
-    const float laneSpan = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamLaneSpanFieldSlot, pointIndex));
-    if (crossing <= 0.0001 || laneCount <= 1.0 || lanePitch <= 0.0 || laneSpan <= 0.00001) {
-        return baseOffset;
-    }
-
-    const float baseLane = clamp(
-        floor(LoadScalarFieldValueForPoint(kWaterStreamLaneIndexFieldSlot, pointIndex) + 0.5),
-        0.0,
-        laneCount - 1.0);
-    const float baseCenter = WaterStreamLaneCenter(baseLane, laneCount, laneSpan);
-    const float offsetJitter = baseOffset - baseCenter;
-    const float crossSeed = LoadScalarFieldValueForPoint(kWaterStreamCrossSeedFieldSlot, pointIndex);
-    const float routeProgress = fract(travelPhase);
-    const float sourceProgress = smoothstep(0.03, 0.55, routeProgress);
-    const float flatness = 1.0 - smoothstep(0.05, 0.45, abs(routeTangent.z));
-    const float jumpChance = clamp(
-        crossing *
-            sourceProgress *
-            mix(0.30, 1.45, flatness) *
-            (1.0 + abs(turnBias) * 0.75),
-        0.0,
-        1.0);
-    const float segmentCount = mix(2.0, 12.0, crossing);
-    const float segmentCoord = routeProgress * segmentCount;
-    const float segmentIndex = floor(segmentCoord);
-    const float localPhase = fract(segmentCoord);
-    float currentLane = baseLane;
-    for (int segment = 0; segment < 12; ++segment) {
-        const float segmentValue = float(segment);
-        if (segmentValue >= segmentIndex || segmentValue >= segmentCount) {
-            break;
-        }
-        currentLane = WaterStreamApplyLaneJump(
-            currentLane,
-            laneCount,
-            jumpChance,
-            turnBias,
-            crossSeed,
-            segmentValue);
-    }
-
-    const float targetLane = WaterStreamApplyLaneJump(
-        currentLane,
-        laneCount,
-        jumpChance,
-        turnBias,
-        crossSeed,
-        segmentIndex);
-    const float envelope = smoothstep(0.18, 0.92, localPhase);
-    const float resolvedLane = mix(currentLane, targetLane, envelope);
-    return WaterStreamLaneCenter(resolvedLane, laneCount, laneSpan) + offsetJitter;
-}
-
-vec3 WaterStreamRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
-    const uint routeStart = WaterStreamRouteStart(pointIndex);
-    const uint routeCount = WaterStreamRouteCount(pointIndex);
+vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
+    const uint routeStart = WaterTrailRouteStart(pointIndex);
+    const uint routeCount = WaterTrailRouteCount(pointIndex);
     if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
         return fallbackPosition;
     }
@@ -649,14 +537,14 @@ vec3 WaterStreamRoutePosition(uint pointIndex, float phase, vec3 fallbackPositio
     return CatmullRomWater(p0, p1, p2, p3, t);
 }
 
-vec3 WaterStreamRouteTangent(uint pointIndex, float phase) {
-    const uint routeStart = WaterStreamRouteStart(pointIndex);
-    const uint routeCount = WaterStreamRouteCount(pointIndex);
+vec3 WaterTrailRouteTangent(uint pointIndex, float phase) {
+    const uint routeStart = WaterTrailRouteStart(pointIndex);
+    const uint routeCount = WaterTrailRouteCount(pointIndex);
     if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
         const vec3 tangent = vec3(
-            LoadScalarFieldValueForPoint(kWaterStreamTangentXFieldSlot, pointIndex),
-            LoadScalarFieldValueForPoint(kWaterStreamTangentYFieldSlot, pointIndex),
-            LoadScalarFieldValueForPoint(kWaterStreamTangentZFieldSlot, pointIndex));
+            LoadScalarFieldValueForPoint(kWaterTrailTangentXFieldSlot, pointIndex),
+            LoadScalarFieldValueForPoint(kWaterTrailTangentYFieldSlot, pointIndex),
+            LoadScalarFieldValueForPoint(kWaterTrailTangentZFieldSlot, pointIndex));
         return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(1.0, 0.0, 0.0);
     }
 
@@ -670,13 +558,13 @@ vec3 WaterStreamRouteTangent(uint pointIndex, float phase) {
     return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(1.0, 0.0, 0.0);
 }
 
-vec3 WaterStreamRouteNormal(uint pointIndex, float phase) {
+vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {
     if (styleData.pointMeta.z == 0u) {
         return vec3(0.0, 0.0, 1.0);
     }
 
-    const uint routeStart = WaterStreamRouteStart(pointIndex);
-    const uint routeCount = WaterStreamRouteCount(pointIndex);
+    const uint routeStart = WaterTrailRouteStart(pointIndex);
+    const uint routeCount = WaterTrailRouteCount(pointIndex);
     if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
         const vec3 normal = pointNormals.normals[pointIndex].xyz;
         return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
@@ -694,32 +582,32 @@ vec3 WaterStreamRouteNormal(uint pointIndex, float phase) {
     return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
 }
 
-vec3 ResolveWaterStreamPosition(vec3 basePosition, uint pointIndex) {
-    const float streamRole = LoadScalarFieldValueForPoint(kWaterStreamRoleFieldSlot, pointIndex);
-    if (streamRole < 0.5) {
+vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
+    const float trailRole = LoadScalarFieldValueForPoint(kWaterTrailRoleFieldSlot, pointIndex);
+    if (trailRole < 0.5) {
         return basePosition;
     }
 
-    const float phase = WaterStreamTravelPhase(pointIndex);
-    const vec3 routePosition = WaterStreamRoutePosition(pointIndex, phase, basePosition);
-    const vec3 routeTangent = WaterStreamRouteTangent(pointIndex, phase);
-    const vec3 routeNormal = WaterStreamRouteNormal(pointIndex, phase);
+    const float phase = WaterTrailTravelPhase(pointIndex);
+    const vec3 routePosition = WaterTrailRoutePosition(pointIndex, phase, basePosition);
+    const vec3 routeTangent = WaterTrailRouteTangent(pointIndex, phase);
+    const vec3 routeNormal = WaterTrailRouteNormal(pointIndex, phase);
     vec3 lateral = cross(routeNormal, routeTangent);
     if (dot(lateral, lateral) <= 1e-8) {
         lateral = SafeWaterLateral(routeTangent, vec3(1.0, 0.0, 0.0));
     } else {
         lateral = normalize(lateral);
     }
-    const float turnBias = WaterStreamRouteTurnBias(pointIndex, phase, routeNormal);
-    return routePosition + lateral * ResolveWaterStreamLateralOffset(pointIndex, phase, routeTangent, turnBias);
+    const float lateralOffset = LoadScalarFieldValueForPoint(kWaterTrailLateralOffsetFieldSlot, pointIndex);
+    return routePosition + lateral * lateralOffset;
 }
 
 vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
     if (!HasWaterParticleFields()) {
         return basePosition;
     }
-    if (WaterStreamOverlayEnabled()) {
-        return ResolveWaterStreamPosition(basePosition, pointIndex);
+    if (WaterTrailOverlayEnabled()) {
+        return ResolveWaterTrailPosition(basePosition, pointIndex);
     }
     if (WaterPathViewEnabled()) {
         return basePosition;
@@ -779,9 +667,13 @@ vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
         return vec2(opacity, emissive);
     }
 
-    if (WaterStreamOverlayEnabled()) {
-        const float streamRole = LoadScalarFieldValueForPoint(kWaterStreamRoleFieldSlot, pointIndex);
-        return streamRole < 0.5 ? vec2(0.0) : vec2(opacity, emissive);
+    if (WaterTrailOverlayEnabled()) {
+        const float trailRole = LoadScalarFieldValueForPoint(kWaterTrailRoleFieldSlot, pointIndex);
+        if (trailRole < 0.5) {
+            return vec2(0.0);
+        }
+        const float trailVisibility = WaterTrailVisibility(pointIndex);
+        return vec2(opacity * trailVisibility, emissive * trailVisibility);
     }
 
     if (styleData.pointMeta.w == 3u) {
@@ -900,7 +792,7 @@ vec3 ResolveAovNormal(uint pointIndex) {
     if (styleData.pointMeta.z == 0u || pointIndex >= styleData.pointMeta.x) {
         return vec3(0.0);
     }
-    if (WaterStreamOverlayEnabled()) {
+    if (WaterTrailOverlayEnabled()) {
         return vec3(0.0);
     }
     if (HasWaterParticleFields()) {

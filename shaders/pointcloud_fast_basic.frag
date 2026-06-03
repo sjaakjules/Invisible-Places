@@ -65,9 +65,9 @@ const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
 const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterJitterSeedFieldSlot = 12u;
-const uint kWaterTrailAgeFieldSlot = 13u;
-const uint kWaterStreamRoleFieldSlot = 0u;
-const uint kWaterStreamTangentZFieldSlot = 24u;
+const uint kWaterAgeFieldSlot = 13u;
+const uint kWaterTrailRoleFieldSlot = 0u;
+const uint kWaterTrailTangentZFieldSlot = 24u;
 
 float LoadScalarFieldValue(uint fieldSlot) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -291,8 +291,8 @@ vec3 ResolveBaseColor() {
 
 void main() {
     float waterTrailFade = 1.0;
-    if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot) {
-        if (LoadScalarFieldValue(kWaterStreamRoleFieldSlot) < 0.5) {
+    if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterTrailTangentZFieldSlot) {
+        if (LoadScalarFieldValue(kWaterTrailRoleFieldSlot) < 0.5) {
             discard;
         }
         outColor = vec4(ResolveBaseColor(), 1.0);
@@ -316,8 +316,8 @@ void main() {
         } else if (role < 0.5 || role >= 1.5) {
             discard;
         }
-        if (styleData.pointMeta.w != 2u && styleData.globalControl.z > kWaterTrailAgeFieldSlot) {
-            const float age = clamp(LoadScalarFieldValue(kWaterTrailAgeFieldSlot), 0.0, 1.0);
+        if (styleData.pointMeta.w != 2u && styleData.globalControl.z > kWaterAgeFieldSlot) {
+            const float age = clamp(LoadScalarFieldValue(kWaterAgeFieldSlot), 0.0, 1.0);
             waterTrailFade = 0.35 + 0.65 * pow(1.0 - smoothstep(0.0, 1.0, age), 1.35);
         }
     }

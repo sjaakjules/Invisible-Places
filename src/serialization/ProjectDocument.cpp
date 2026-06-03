@@ -51,8 +51,8 @@ using invisible_places::water::WaterEmitterStatus;
 using invisible_places::water::WaterAnimationTrailSettings;
 using invisible_places::water::WaterFieldOutputMode;
 using invisible_places::water::WaterFieldSettings;
-using invisible_places::water::WaterFieldStreamSettings;
-using invisible_places::water::WaterFlowStreamSettings;
+using invisible_places::water::WaterFieldTrailSettings;
+using invisible_places::water::WaterFlowTrailSettings;
 using invisible_places::water::WaterParticleTrailSettings;
 using invisible_places::water::WaterParticleTrailShapeSettings;
 using invisible_places::water::WaterParticleVisualSettings;
@@ -93,12 +93,12 @@ json SerializeWaterEffectLayer(const WaterEffectLayer& layer);
 WaterEffectLayer ParseWaterEffectLayer(const json& layerJson);
 json SerializeWaterRippleRuntimeCache(const WaterRippleRuntimeCacheDocument& cache);
 WaterRippleRuntimeCacheDocument ParseWaterRippleRuntimeCache(const json& cacheJson);
-json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings);
-WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson);
+json SerializeWaterFlowTrailSettings(const WaterFlowTrailSettings& settings);
+WaterFlowTrailSettings ParseWaterFlowTrailSettings(const json& settingsJson);
 json SerializeWaterFieldSettings(const WaterFieldSettings& settings);
 WaterFieldSettings ParseWaterFieldSettings(const json& settingsJson);
-json SerializeWaterFieldStreamSettings(const WaterFieldStreamSettings& settings);
-WaterFieldStreamSettings ParseWaterFieldStreamSettings(const json& settingsJson);
+json SerializeWaterFieldTrailSettings(const WaterFieldTrailSettings& settings);
+WaterFieldTrailSettings ParseWaterFieldTrailSettings(const json& settingsJson);
 json SerializeWaterVisualSettings(const WaterVisualSettings& settings);
 WaterVisualSettings ParseWaterVisualSettings(const json& settingsJson);
 PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& visualSettings);
@@ -688,7 +688,7 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"solid_centers", style.solidCenters},
         {"flow_animation", style.flowAnimation},
         {"water_path_view", style.waterPathView},
-        {"water_stream_overlay", style.waterStreamOverlay},
+        {"water_trail_overlay", style.waterTrailOverlay},
         {"point_size", SerializeBinding(style.pointSize)},
         {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
@@ -880,9 +880,11 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
     style.flowAnimation = styleJson.value("flow_animation", style.flowAnimation);
     style.waterPathView = styleJson.value("water_path_view", style.waterPathView);
-    style.waterStreamOverlay = styleJson.value(
-        "water_stream_overlay",
-        styleJson.value("water_overlay_render_mode", std::string{}) == "stream");
+    style.waterTrailOverlay = styleJson.value(
+        "water_trail_overlay",
+        styleJson.value(
+            "water_stream_overlay",
+            styleJson.value("water_overlay_render_mode", std::string{}) == "stream"));
     if (styleJson.contains("point_size")) {
         style.pointSize = ParseBinding(styleJson.at("point_size"));
     }
@@ -1640,8 +1642,8 @@ WaterEffectBlendMode ParseWaterEffectBlendMode(const json& modeJson) {
 
 const char* WaterFieldOutputModeName(WaterFieldOutputMode mode) {
     switch (mode) {
-        case WaterFieldOutputMode::Streamlines:
-            return "streamlines";
+        case WaterFieldOutputMode::Trails:
+            return "trails";
         case WaterFieldOutputMode::SurfaceMotion:
             return "surface_motion";
         case WaterFieldOutputMode::Both:
@@ -1652,8 +1654,8 @@ const char* WaterFieldOutputModeName(WaterFieldOutputMode mode) {
 
 WaterFieldOutputMode ParseWaterFieldOutputMode(const json& modeJson) {
     const auto name = modeJson.get<std::string>();
-    if (name == "streamlines") {
-        return WaterFieldOutputMode::Streamlines;
+    if (name == "trails" || name == "streamlines") {
+        return WaterFieldOutputMode::Trails;
     }
     if (name == "surface_motion") {
         return WaterFieldOutputMode::SurfaceMotion;
@@ -1995,42 +1997,56 @@ WaterRippleRuntimeCacheDocument ParseWaterRippleRuntimeCache(const json& cacheJs
     return cache;
 }
 
-json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings) {
+json SerializeWaterFlowTrailSettings(const WaterFlowTrailSettings& settings) {
     return json{
         {"enabled", settings.enabled},
-        {"stream_count_total", settings.streamCountTotal},
+        {"trail_count_total", settings.trailCountTotal},
         {"lane_count", settings.laneCount},
-        {"stream_length_meters", settings.streamLengthMeters},
-        {"stream_point_spacing_meters", settings.streamPointSpacingMeters},
-        {"stream_width_meters", settings.streamWidthMeters},
-        {"stream_world_length_meters", settings.streamWorldLengthMeters},
+        {"trail_length_meters", settings.trailLengthMeters},
+        {"trail_point_spacing_meters", settings.trailPointSpacingMeters},
+        {"trail_width_meters", settings.trailWidthMeters},
+        {"trail_streak_length_meters", settings.trailStreakLengthMeters},
         {"surface_offset_meters", settings.surfaceOffsetMeters},
         {"path_attraction", settings.pathAttraction},
         {"lane_spread_meters", settings.laneSpreadMeters},
         {"lane_crossing", settings.laneCrossing},
-        {"stream_smoothness", settings.streamSmoothness},
-        {"stream_looseness", settings.streamLooseness},
+        {"trail_smoothness", settings.trailSmoothness},
+        {"trail_looseness", settings.trailLooseness},
         {"turbulence", settings.turbulence},
         {"speed_meters_per_second", settings.speedMetersPerSecond},
         {"seed", settings.seed},
     };
 }
 
-WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson) {
-    WaterFlowStreamSettings settings;
+WaterFlowTrailSettings ParseWaterFlowTrailSettings(const json& settingsJson) {
+    WaterFlowTrailSettings settings;
     settings.enabled = settingsJson.value("enabled", settings.enabled);
-    settings.streamCountTotal = settingsJson.value("stream_count_total", settings.streamCountTotal);
+    settings.trailCountTotal = settingsJson.value(
+        "trail_count_total",
+        settingsJson.value("stream_count_total", settings.trailCountTotal));
     settings.laneCount = settingsJson.value("lane_count", settings.laneCount);
-    settings.streamLengthMeters = settingsJson.value("stream_length_meters", settings.streamLengthMeters);
-    settings.streamPointSpacingMeters = settingsJson.value("stream_point_spacing_meters", settings.streamPointSpacingMeters);
-    settings.streamWidthMeters = settingsJson.value("stream_width_meters", settings.streamWidthMeters);
-    settings.streamWorldLengthMeters = settingsJson.value("stream_world_length_meters", settings.streamWorldLengthMeters);
+    settings.trailLengthMeters = settingsJson.value(
+        "trail_length_meters",
+        settingsJson.value("stream_length_meters", settings.trailLengthMeters));
+    settings.trailPointSpacingMeters = settingsJson.value(
+        "trail_point_spacing_meters",
+        settingsJson.value("stream_point_spacing_meters", settings.trailPointSpacingMeters));
+    settings.trailWidthMeters = settingsJson.value(
+        "trail_width_meters",
+        settingsJson.value("stream_width_meters", settings.trailWidthMeters));
+    settings.trailStreakLengthMeters = settingsJson.value(
+        "trail_streak_length_meters",
+        settingsJson.value("stream_world_length_meters", settings.trailStreakLengthMeters));
     settings.surfaceOffsetMeters = settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters);
     settings.pathAttraction = settingsJson.value("path_attraction", settings.pathAttraction);
     settings.laneSpreadMeters = settingsJson.value("lane_spread_meters", settings.laneSpreadMeters);
     settings.laneCrossing = settingsJson.value("lane_crossing", settings.laneCrossing);
-    settings.streamSmoothness = settingsJson.value("stream_smoothness", settings.streamSmoothness);
-    settings.streamLooseness = settingsJson.value("stream_looseness", settings.streamLooseness);
+    settings.trailSmoothness = settingsJson.value(
+        "trail_smoothness",
+        settingsJson.value("stream_smoothness", settings.trailSmoothness));
+    settings.trailLooseness = settingsJson.value(
+        "trail_looseness",
+        settingsJson.value("stream_looseness", settings.trailLooseness));
     settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
     settings.speedMetersPerSecond = settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond);
     settings.seed = settingsJson.value("seed", settings.seed);
@@ -2083,15 +2099,15 @@ WaterFieldSettings ParseWaterFieldSettings(const json& settingsJson) {
     return settings;
 }
 
-json SerializeWaterFieldStreamSettings(const WaterFieldStreamSettings& settings) {
+json SerializeWaterFieldTrailSettings(const WaterFieldTrailSettings& settings) {
     return json{
         {"enabled", settings.enabled},
-        {"streamline_count", settings.streamlineCount},
+        {"trail_count", settings.trailCount},
         {"seed_spacing_meters", settings.seedSpacingMeters},
-        {"streamline_length_meters", settings.streamlineLengthMeters},
-        {"step_length_meters", settings.stepLengthMeters},
-        {"streamline_width_meters", settings.streamlineWidthMeters},
-        {"stream_world_length_meters", settings.streamWorldLengthMeters},
+        {"trail_length_meters", settings.trailLengthMeters},
+        {"trail_point_spacing_meters", settings.trailPointSpacingMeters},
+        {"trail_width_meters", settings.trailWidthMeters},
+        {"trail_streak_length_meters", settings.trailStreakLengthMeters},
         {"momentum", settings.momentum},
         {"max_turn_angle_degrees", settings.maxTurnAngleDegrees},
         {"speed_meters_per_second", settings.speedMetersPerSecond},
@@ -2099,15 +2115,25 @@ json SerializeWaterFieldStreamSettings(const WaterFieldStreamSettings& settings)
     };
 }
 
-WaterFieldStreamSettings ParseWaterFieldStreamSettings(const json& settingsJson) {
-    WaterFieldStreamSettings settings;
+WaterFieldTrailSettings ParseWaterFieldTrailSettings(const json& settingsJson) {
+    WaterFieldTrailSettings settings;
     settings.enabled = settingsJson.value("enabled", settings.enabled);
-    settings.streamlineCount = settingsJson.value("streamline_count", settings.streamlineCount);
+    settings.trailCount = settingsJson.value(
+        "trail_count",
+        settingsJson.value("streamline_count", settings.trailCount));
     settings.seedSpacingMeters = settingsJson.value("seed_spacing_meters", settings.seedSpacingMeters);
-    settings.streamlineLengthMeters = settingsJson.value("streamline_length_meters", settings.streamlineLengthMeters);
-    settings.stepLengthMeters = settingsJson.value("step_length_meters", settings.stepLengthMeters);
-    settings.streamlineWidthMeters = settingsJson.value("streamline_width_meters", settings.streamlineWidthMeters);
-    settings.streamWorldLengthMeters = settingsJson.value("stream_world_length_meters", settings.streamWorldLengthMeters);
+    settings.trailLengthMeters = settingsJson.value(
+        "trail_length_meters",
+        settingsJson.value("streamline_length_meters", settings.trailLengthMeters));
+    settings.trailPointSpacingMeters = settingsJson.value(
+        "trail_point_spacing_meters",
+        settingsJson.value("step_length_meters", settings.trailPointSpacingMeters));
+    settings.trailWidthMeters = settingsJson.value(
+        "trail_width_meters",
+        settingsJson.value("streamline_width_meters", settings.trailWidthMeters));
+    settings.trailStreakLengthMeters = settingsJson.value(
+        "trail_streak_length_meters",
+        settingsJson.value("stream_world_length_meters", settings.trailStreakLengthMeters));
     settings.momentum = settingsJson.value("momentum", settings.momentum);
     settings.maxTurnAngleDegrees = settingsJson.value("max_turn_angle_degrees", settings.maxTurnAngleDegrees);
     settings.speedMetersPerSecond = settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond);
@@ -2251,7 +2277,7 @@ json SerializeWaterTrailGeometrySettings(const WaterTrailGeometrySettings& setti
         {"trail_length_meters", settings.trailLengthMeters},
         {"point_spacing_meters", settings.pointSpacingMeters},
         {"width_meters", settings.widthMeters},
-        {"world_length_meters", settings.worldLengthMeters},
+        {"streak_length_meters", settings.streakLengthMeters},
     };
 }
 
@@ -2263,8 +2289,12 @@ WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJ
         std::clamp(settingsJson.value("point_spacing_meters", settings.pointSpacingMeters), 0.001F, 10.0F);
     settings.widthMeters =
         std::clamp(settingsJson.value("width_meters", settings.widthMeters), 0.0005F, 1.0F);
-    settings.worldLengthMeters =
-        std::clamp(settingsJson.value("world_length_meters", settings.worldLengthMeters), 0.001F, 5.0F);
+    settings.streakLengthMeters = std::clamp(
+        settingsJson.value(
+            "streak_length_meters",
+            settingsJson.value("world_length_meters", settings.streakLengthMeters)),
+        0.001F,
+        5.0F);
     return settings;
 }
 
@@ -2287,7 +2317,7 @@ WaterPathProfileDocument ParseWaterPathProfile(const json& profileJson) {
 json SerializeWaterLaneProfile(const WaterLaneProfileDocument& profile) {
     return json{
         {"name", profile.name},
-        {"settings", SerializeWaterFlowStreamSettings(profile.settings)},
+        {"settings", SerializeWaterFlowTrailSettings(profile.settings)},
     };
 }
 
@@ -2295,7 +2325,7 @@ WaterLaneProfileDocument ParseWaterLaneProfile(const json& profileJson) {
     WaterLaneProfileDocument profile;
     profile.name = profileJson.value("name", profile.name);
     if (profileJson.contains("settings")) {
-        profile.settings = ParseWaterFlowStreamSettings(profileJson.at("settings"));
+        profile.settings = ParseWaterFlowTrailSettings(profileJson.at("settings"));
     }
     return profile;
 }
@@ -3017,9 +3047,9 @@ bool SaveProjectDocument(
         {"selected_water_lane_profile", document.selectedWaterLaneProfileName},
         {"selected_water_trail_profile", document.selectedWaterTrailProfileName},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
-        {"water_flow_stream_settings", SerializeWaterFlowStreamSettings(document.waterFlowStreamSettings)},
+        {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
-        {"water_field_stream_settings", SerializeWaterFieldStreamSettings(document.waterFieldStreamSettings)},
+        {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.waterFieldTrailSettings)},
         {"water_point_visuals", json::array()},
         {"selected_water_point_visual", document.selectedWaterPointVisualName},
         {"water_ripple_layers", json::array()},
@@ -3066,7 +3096,7 @@ bool SaveProjectDocument(
     }
     if (document.tempWaterLaneProfileSettings.has_value()) {
         projectJson["temp_water_lane_profile_settings"] =
-            SerializeWaterFlowStreamSettings(document.tempWaterLaneProfileSettings.value());
+            SerializeWaterFlowTrailSettings(document.tempWaterLaneProfileSettings.value());
     }
     if (document.tempWaterTrailProfile.has_value()) {
         projectJson["temp_water_trail_profile"] =
@@ -3161,20 +3191,26 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterCausticLookSettings =
             ParseWaterCausticLookSettings(projectJson->at("water_caustic_look_settings"));
     }
-    if (projectJson->contains("water_flow_stream_settings")) {
-        document.waterFlowStreamSettings =
-            ParseWaterFlowStreamSettings(projectJson->at("water_flow_stream_settings"));
+    if (projectJson->contains("water_flow_trail_settings")) {
+        document.waterFlowTrailSettings =
+            ParseWaterFlowTrailSettings(projectJson->at("water_flow_trail_settings"));
+    } else if (projectJson->contains("water_flow_stream_settings")) {
+        document.waterFlowTrailSettings =
+            ParseWaterFlowTrailSettings(projectJson->at("water_flow_stream_settings"));
     }
     if (!hasWaterTrailGeometry) {
         document.waterTrailGeometry =
-            invisible_places::water::WaterTrailGeometryFromFlowStreamSettings(document.waterFlowStreamSettings);
+            invisible_places::water::WaterTrailGeometryFromFlowTrailSettings(document.waterFlowTrailSettings);
     }
     if (projectJson->contains("water_field_settings")) {
         document.waterFieldSettings = ParseWaterFieldSettings(projectJson->at("water_field_settings"));
     }
-    if (projectJson->contains("water_field_stream_settings")) {
-        document.waterFieldStreamSettings =
-            ParseWaterFieldStreamSettings(projectJson->at("water_field_stream_settings"));
+    if (projectJson->contains("water_field_trail_settings")) {
+        document.waterFieldTrailSettings =
+            ParseWaterFieldTrailSettings(projectJson->at("water_field_trail_settings"));
+    } else if (projectJson->contains("water_field_stream_settings")) {
+        document.waterFieldTrailSettings =
+            ParseWaterFieldTrailSettings(projectJson->at("water_field_stream_settings"));
     }
     if (projectJson->contains("temp_water_animation_trail_settings")) {
         document.tempWaterAnimationTrailSettings =
@@ -3216,7 +3252,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     if (projectJson->contains("temp_water_lane_profile_settings")) {
         document.tempWaterLaneProfileSettings =
-            ParseWaterFlowStreamSettings(projectJson->at("temp_water_lane_profile_settings"));
+            ParseWaterFlowTrailSettings(projectJson->at("temp_water_lane_profile_settings"));
     }
     if (projectJson->contains("temp_water_trail_profile")) {
         document.tempWaterTrailProfile = ParseWaterTrailProfile(projectJson->at("temp_water_trail_profile"));
@@ -3462,7 +3498,7 @@ bool SaveWaterSourcesDocument(
         {"schema_version", document.schemaVersion},
         {"water_source_settings", SerializeWaterSourceSettings(document.sourceSettings)},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.causticLookSettings)},
-        {"water_flow_stream_settings", SerializeWaterFlowStreamSettings(document.flowStreamSettings)},
+        {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.flowTrailSettings)},
         {"water_trail_geometry", SerializeWaterTrailGeometrySettings(document.trailGeometry)},
         {"water_path_profiles", json::array()},
         {"water_lane_profiles", json::array()},
@@ -3471,7 +3507,7 @@ bool SaveWaterSourcesDocument(
         {"selected_water_lane_profile", document.selectedLaneProfileName},
         {"selected_water_trail_profile", document.selectedTrailProfileName},
         {"water_field_settings", SerializeWaterFieldSettings(document.fieldSettings)},
-        {"water_field_stream_settings", SerializeWaterFieldStreamSettings(document.fieldStreamSettings)},
+        {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.fieldTrailSettings)},
         {"water_emitters", json::array()},
         {"water_ripple_layers", json::array()},
         {"water_field_layers", json::array()},
@@ -3491,7 +3527,7 @@ bool SaveWaterSourcesDocument(
     }
     if (document.tempLaneProfileSettings.has_value()) {
         sourcesJson["temp_water_lane_profile_settings"] =
-            SerializeWaterFlowStreamSettings(document.tempLaneProfileSettings.value());
+            SerializeWaterFlowTrailSettings(document.tempLaneProfileSettings.value());
     }
     if (document.tempTrailProfile.has_value()) {
         sourcesJson["temp_water_trail_profile"] =
@@ -3546,16 +3582,19 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
         document.causticLookSettings =
             ParseWaterCausticLookSettings(sourcesJson->at("water_caustic_look_settings"));
     }
-    if (sourcesJson->contains("water_flow_stream_settings")) {
-        document.flowStreamSettings =
-            ParseWaterFlowStreamSettings(sourcesJson->at("water_flow_stream_settings"));
+    if (sourcesJson->contains("water_flow_trail_settings")) {
+        document.flowTrailSettings =
+            ParseWaterFlowTrailSettings(sourcesJson->at("water_flow_trail_settings"));
+    } else if (sourcesJson->contains("water_flow_stream_settings")) {
+        document.flowTrailSettings =
+            ParseWaterFlowTrailSettings(sourcesJson->at("water_flow_stream_settings"));
     }
     if (sourcesJson->contains("water_trail_geometry")) {
         document.trailGeometry =
             ParseWaterTrailGeometrySettings(sourcesJson->at("water_trail_geometry"));
     } else {
         document.trailGeometry =
-            invisible_places::water::WaterTrailGeometryFromFlowStreamSettings(document.flowStreamSettings);
+            invisible_places::water::WaterTrailGeometryFromFlowTrailSettings(document.flowTrailSettings);
     }
     if (sourcesJson->contains("water_path_profiles") &&
         sourcesJson->at("water_path_profiles").is_array()) {
@@ -3587,7 +3626,7 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     }
     if (sourcesJson->contains("temp_water_lane_profile_settings")) {
         document.tempLaneProfileSettings =
-            ParseWaterFlowStreamSettings(sourcesJson->at("temp_water_lane_profile_settings"));
+            ParseWaterFlowTrailSettings(sourcesJson->at("temp_water_lane_profile_settings"));
     }
     if (sourcesJson->contains("temp_water_trail_profile")) {
         document.tempTrailProfile = ParseWaterTrailProfile(sourcesJson->at("temp_water_trail_profile"));
@@ -3595,9 +3634,12 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_field_settings")) {
         document.fieldSettings = ParseWaterFieldSettings(sourcesJson->at("water_field_settings"));
     }
-    if (sourcesJson->contains("water_field_stream_settings")) {
-        document.fieldStreamSettings =
-            ParseWaterFieldStreamSettings(sourcesJson->at("water_field_stream_settings"));
+    if (sourcesJson->contains("water_field_trail_settings")) {
+        document.fieldTrailSettings =
+            ParseWaterFieldTrailSettings(sourcesJson->at("water_field_trail_settings"));
+    } else if (sourcesJson->contains("water_field_stream_settings")) {
+        document.fieldTrailSettings =
+            ParseWaterFieldTrailSettings(sourcesJson->at("water_field_stream_settings"));
     }
     if (sourcesJson->contains("temp_water_caustic_look_settings")) {
         document.tempCausticLookSettings =

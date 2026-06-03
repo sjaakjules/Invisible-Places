@@ -41,8 +41,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 
 const uint kWaterParticleRoleFieldSlot = 9u;
 const uint kWaterJitterSeedFieldSlot = 12u;
-const uint kWaterStreamRoleFieldSlot = 0u;
-const uint kWaterStreamTangentZFieldSlot = 24u;
+const uint kWaterTrailRoleFieldSlot = 0u;
+const uint kWaterTrailTangentZFieldSlot = 24u;
 
 float LoadScalarFieldValue(uint fieldSlot) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -55,8 +55,8 @@ float LoadScalarFieldValue(uint fieldSlot) {
 }
 
 void main() {
-    if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterStreamTangentZFieldSlot) {
-        if (LoadScalarFieldValue(kWaterStreamRoleFieldSlot) < 0.5) {
+    if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterTrailTangentZFieldSlot) {
+        if (LoadScalarFieldValue(kWaterTrailRoleFieldSlot) < 0.5) {
             discard;
         }
         outLinearDepth = inViewDepth;

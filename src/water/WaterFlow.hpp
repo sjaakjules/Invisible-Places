@@ -127,7 +127,7 @@ enum class WaterEffectBlendMode {
 };
 
 enum class WaterFieldOutputMode {
-    Streamlines,
+    Trails,
     SurfaceMotion,
     Both
 };
@@ -287,44 +287,48 @@ struct WaterRippleRuntimeContribution {
     const invisible_places::io::Float3& normal,
     float timeSeconds);
 
-struct WaterFlowStreamSettings {
+struct WaterFlowTrailSettings {
     bool enabled = true;
-    std::uint32_t streamCountTotal = 700;
+    std::uint32_t trailCountTotal = 700;
     std::uint32_t laneCount = 0;
-    float streamLengthMeters = 0.75F;
-    float streamPointSpacingMeters = 0.010F;
-    float streamWidthMeters = 0.006F;
-    float streamWorldLengthMeters = 0.045F;
+    float trailLengthMeters = 0.75F;
+    float trailPointSpacingMeters = 0.010F;
+    float trailWidthMeters = 0.006F;
+    float trailStreakLengthMeters = 0.045F;
     float surfaceOffsetMeters = 0.004F;
     float pathAttraction = 0.85F;
     float laneSpreadMeters = 0.12F;
     float laneCrossing = 0.22F;
-    float streamSmoothness = 0.85F;
-    float streamLooseness = 0.08F;
+    float trailSmoothness = 0.85F;
+    float trailLooseness = 0.08F;
     float turbulence = 0.06F;
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
 };
 
 [[nodiscard]] bool WaterFlowLaneRouteInputsEqual(
-    const WaterFlowStreamSettings& left,
-    const WaterFlowStreamSettings& right);
+    const WaterFlowTrailSettings& left,
+    const WaterFlowTrailSettings& right);
 [[nodiscard]] bool WaterFlowLaneSpeedOnlyEdit(
-    const WaterFlowStreamSettings& before,
-    const WaterFlowStreamSettings& after);
+    const WaterFlowTrailSettings& before,
+    const WaterFlowTrailSettings& after);
 
 struct WaterTrailGeometrySettings {
     float trailLengthMeters = 0.75F;
     float pointSpacingMeters = 0.010F;
     float widthMeters = 0.006F;
-    float worldLengthMeters = 0.045F;
+    float streakLengthMeters = 0.045F;
 };
 
 [[nodiscard]] WaterTrailGeometrySettings DefaultWaterTrailGeometrySettings();
-[[nodiscard]] WaterTrailGeometrySettings WaterTrailGeometryFromFlowStreamSettings(
-    const WaterFlowStreamSettings& settings);
-[[nodiscard]] WaterFlowStreamSettings ApplyWaterTrailGeometryToFlowStreamSettings(
-    WaterFlowStreamSettings settings,
+[[nodiscard]] float AutoWaterTrailPointSpacingMeters(float trailLengthMeters, float widthMeters);
+[[nodiscard]] float AutoWaterTrailStreakLengthMeters(float pointSpacingMeters, float widthMeters);
+[[nodiscard]] WaterTrailGeometrySettings FitWaterTrailGeometryForContinuousLines(
+    WaterTrailGeometrySettings geometry);
+[[nodiscard]] WaterTrailGeometrySettings WaterTrailGeometryFromFlowTrailSettings(
+    const WaterFlowTrailSettings& settings);
+[[nodiscard]] WaterFlowTrailSettings ApplyWaterTrailGeometryToFlowTrailSettings(
+    WaterFlowTrailSettings settings,
     const WaterTrailGeometrySettings& geometry);
 
 struct WaterFieldSettings {
@@ -347,14 +351,14 @@ struct WaterFieldSettings {
     std::uint32_t seed = 7;
 };
 
-struct WaterFieldStreamSettings {
+struct WaterFieldTrailSettings {
     bool enabled = true;
-    std::uint32_t streamlineCount = 850;
+    std::uint32_t trailCount = 850;
     float seedSpacingMeters = 0.025F;
-    float streamlineLengthMeters = 0.85F;
-    float stepLengthMeters = 0.012F;
-    float streamlineWidthMeters = 0.005F;
-    float streamWorldLengthMeters = 0.045F;
+    float trailLengthMeters = 0.85F;
+    float trailPointSpacingMeters = 0.012F;
+    float trailWidthMeters = 0.005F;
+    float trailStreakLengthMeters = 0.045F;
     float momentum = 0.84F;
     float maxTurnAngleDegrees = 12.0F;
     float speedMetersPerSecond = 0.38F;
@@ -440,44 +444,44 @@ struct WaterFieldSourcePoint {
     std::uint32_t seed = 1;
 };
 
-struct WaterStreamSample {
+struct WaterTrailSample {
     invisible_places::io::Float3 position{};
     invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
     invisible_places::io::Float3 tangent{1.0F, 0.0F, 0.0F};
     std::uint8_t red = 40;
     std::uint8_t green = 210;
     std::uint8_t blue = 255;
-    float streamId = 0.0F;
+    float trailId = 0.0F;
     float sourceId = 0.0F;
     float pathId = 0.0F;
     float branchId = 0.0F;
-    float streamSeed = 0.0F;
+    float trailSeed = 0.0F;
     float pointSeed = 0.0F;
-    float streamDistance = 0.0F;
-    float streamLength = 1.0F;
+    float trailDistance = 0.0F;
+    float trailLength = 1.0F;
     float pointAge = 0.0F;
-    float streamAge = 0.0F;
-    float streamSpeed = 1.0F;
-    float streamWidth = 0.006F;
-    float streamWorldLength = 0.045F;
-    float streamConfidence = 1.0F;
+    float trailAge = 0.0F;
+    float trailSpeed = 1.0F;
+    float trailWidth = 0.006F;
+    float trailStreakLength = 0.045F;
+    float trailConfidence = 1.0F;
     float wetness = 1.0F;
     float featureType = 0.0F;
-    float streamRole = 1.0F;
+    float trailRole = 1.0F;
     float routeStartIndex = 0.0F;
     float routePointCount = 0.0F;
     float routeLength = 1.0F;
-    float streamStartPhase = 0.0F;
-    float streamLateralOffset = 0.0F;
-    float streamLaneIndex = 0.0F;
-    float streamLaneCount = 1.0F;
-    float streamLanePitch = 0.00025F;
-    float streamLaneSpan = 0.0F;
-    float streamLaneCrossing = 0.22F;
-    float streamCrossSeed = 0.0F;
+    float trailStartPhase = 0.0F;
+    float trailLateralOffset = 0.0F;
+    float trailLaneIndex = 0.0F;
+    float trailLaneCount = 1.0F;
+    float trailLanePitch = 0.00025F;
+    float trailLaneSpan = 0.0F;
+    float trailLaneCrossing = 0.22F;
+    float trailCrossSeed = 0.0F;
 };
 
-struct WaterFieldStreamDiagnostics {
+struct WaterFieldTrailDiagnostics {
     std::uint32_t inputNodeCount = 0;
     std::uint32_t emittedPathCount = 0;
     std::uint32_t emittedSampleCount = 0;
@@ -492,10 +496,10 @@ struct WaterFieldStreamDiagnostics {
     float minRejectedGapMeters = 0.0F;
 };
 
-struct WaterStreamOverlay {
-    std::vector<WaterStreamSample> samples;
+struct WaterTrailOverlay {
+    std::vector<WaterTrailSample> samples;
     invisible_places::io::Bounds3f bounds{};
-    WaterFieldStreamDiagnostics fieldDiagnostics{};
+    WaterFieldTrailDiagnostics fieldDiagnostics{};
 };
 
 struct WaterEffectPoint {
@@ -672,14 +676,14 @@ struct WaterAnimatedTrailBuildSettings {
     float trailLengthMeters = 0.75F;
     float trailPointSpacingMeters = 0.010F;
     float trailWidthMeters = 0.006F;
-    float trailWorldLengthMeters = 0.045F;
+    float trailStreakLengthMeters = 0.045F;
     float surfaceOffsetMeters = 0.004F;
     float pathAttraction = 0.85F;
     float laneSpreadMeters = 0.12F;
     float turbulence = 0.06F;
     float laneCrossing = 0.22F;
-    float streamSmoothness = 0.85F;
-    float streamLooseness = 0.08F;
+    float trailSmoothness = 0.85F;
+    float trailLooseness = 0.08F;
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
     float featureType = 0.0F;
@@ -948,15 +952,15 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterRegionSelectionOptions& options = {});
 [[nodiscard]] std::string WaterEffectLayersFingerprint(const std::vector<WaterEffectLayer>& layers);
 [[nodiscard]] std::string WaterFieldSettingsFingerprint(const WaterFieldSettings& settings);
-[[nodiscard]] WaterStreamOverlay BuildAnimatedWaterTrailOverlay(
+[[nodiscard]] WaterTrailOverlay BuildAnimatedWaterTrailOverlay(
     const std::vector<WaterAnimatedTrailPath>& paths,
     const WaterAnimatedTrailBuildSettings& settings);
-[[nodiscard]] WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+[[nodiscard]] WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
-    const WaterFlowStreamSettings& settings);
-[[nodiscard]] WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+    const WaterFlowTrailSettings& settings);
+[[nodiscard]] WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
-    const WaterFlowStreamSettings& settings,
+    const WaterFlowTrailSettings& settings,
     const WaterPathAnalysisCache* analysis);
 [[nodiscard]] WaterFieldCache BuildFieldCacheFromPathAnchors(
     const WaterOverlay& pathAnchors,
@@ -965,12 +969,12 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEffectLayer>& layers,
     const WaterFieldSettings& settings);
-[[nodiscard]] WaterStreamOverlay BuildFieldStreamOverlay(
+[[nodiscard]] WaterTrailOverlay BuildFieldTrailOverlay(
     const WaterFieldCache& fieldCache,
-    const WaterFieldStreamSettings& settings);
-[[nodiscard]] WaterStreamOverlay BuildFieldStreamOverlay(
+    const WaterFieldTrailSettings& settings);
+[[nodiscard]] WaterTrailOverlay BuildFieldTrailOverlay(
     const WaterFieldCache& fieldCache,
-    const WaterFieldStreamSettings& settings,
+    const WaterFieldTrailSettings& settings,
     const std::vector<WaterEmitter>& emitters);
 [[nodiscard]] WaterEffectOverlay GenerateRippleEffectOverlay(
     const invisible_places::io::LoadedPointCloud& cloud,
@@ -989,8 +993,8 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
 [[nodiscard]] WaterEffectCompositionFields ComposeWaterEffectFields(
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEffectOverlay>& overlays);
-[[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterStreamOverlayPointCloud(
-    const WaterStreamOverlay& overlay,
+[[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
+    const WaterTrailOverlay& overlay,
     const std::filesystem::path& sourcePath,
     std::string_view layerName);
 [[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterEffectOverlayPointCloud(

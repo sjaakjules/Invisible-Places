@@ -50,7 +50,7 @@ struct WaterPathProfileDocument {
 
 struct WaterLaneProfileDocument {
     std::string name = "Default";
-    invisible_places::water::WaterFlowStreamSettings settings{};
+    invisible_places::water::WaterFlowTrailSettings settings{};
 };
 
 struct WaterTrailProfileDocument {
@@ -114,7 +114,7 @@ struct ProjectDocument {
     std::string selectedWaterLaneProfileName = "Default";
     std::string selectedWaterTrailProfileName = "Default";
     std::optional<invisible_places::water::WaterPathGenerationSettings> tempWaterPathProfileSettings;
-    std::optional<invisible_places::water::WaterFlowStreamSettings> tempWaterLaneProfileSettings;
+    std::optional<invisible_places::water::WaterFlowTrailSettings> tempWaterLaneProfileSettings;
     std::optional<WaterTrailProfileDocument> tempWaterTrailProfile;
     invisible_places::water::WaterCausticLookSettings waterCausticLookSettings{};
     std::optional<invisible_places::water::WaterCausticLookSettings> tempWaterCausticLookSettings;
@@ -128,9 +128,9 @@ struct ProjectDocument {
     std::optional<invisible_places::water::WaterSettingsBundle> tempWaterSettings;
     invisible_places::water::WaterBakeSettings waterBakeSettings{};
     invisible_places::water::WaterRenderSettings waterRenderSettings{};
-    invisible_places::water::WaterFlowStreamSettings waterFlowStreamSettings{};
+    invisible_places::water::WaterFlowTrailSettings waterFlowTrailSettings{};
     invisible_places::water::WaterFieldSettings waterFieldSettings{};
-    invisible_places::water::WaterFieldStreamSettings waterFieldStreamSettings{};
+    invisible_places::water::WaterFieldTrailSettings waterFieldTrailSettings{};
     std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
     std::vector<WaterRippleRuntimeCacheDocument> waterRippleRuntimeCaches;
@@ -160,14 +160,14 @@ struct WaterSourcesDocument {
     std::string selectedLaneProfileName = "Default";
     std::string selectedTrailProfileName = "Default";
     std::optional<invisible_places::water::WaterPathGenerationSettings> tempPathProfileSettings;
-    std::optional<invisible_places::water::WaterFlowStreamSettings> tempLaneProfileSettings;
+    std::optional<invisible_places::water::WaterFlowTrailSettings> tempLaneProfileSettings;
     std::optional<WaterTrailProfileDocument> tempTrailProfile;
     invisible_places::water::WaterBakeSettings bakeSettings{};
     invisible_places::water::WaterRenderSettings renderSettings{};
-    invisible_places::water::WaterFlowStreamSettings flowStreamSettings{};
+    invisible_places::water::WaterFlowTrailSettings flowTrailSettings{};
     invisible_places::water::WaterTrailGeometrySettings trailGeometry{};
     invisible_places::water::WaterFieldSettings fieldSettings{};
-    invisible_places::water::WaterFieldStreamSettings fieldStreamSettings{};
+    invisible_places::water::WaterFieldTrailSettings fieldTrailSettings{};
     std::optional<invisible_places::water::WaterPathCache> pathCache;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
 };

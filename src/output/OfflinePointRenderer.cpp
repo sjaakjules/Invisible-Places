@@ -31,30 +31,30 @@ constexpr std::size_t kWaterParticleRoleFieldSlot = 9U;
 constexpr std::size_t kWaterPathStartFieldSlot = 10U;
 constexpr std::size_t kWaterPathCountFieldSlot = 11U;
 constexpr std::size_t kWaterJitterSeedFieldSlot = 12U;
-constexpr std::size_t kWaterTrailAgeFieldSlot = 13U;
+constexpr std::size_t kWaterAgeFieldSlot = 13U;
 constexpr std::size_t kWaterFeatureTypeFieldSlot = 15U;
-constexpr std::size_t kWaterStreamRoleFieldSlot = 0U;
-constexpr std::size_t kWaterStreamDistanceFieldSlot = 7U;
-constexpr std::size_t kWaterStreamLengthFieldSlot = 8U;
-constexpr std::size_t kWaterStreamRouteStartFieldSlot = 9U;
-constexpr std::size_t kWaterStreamRouteCountFieldSlot = 10U;
-constexpr std::size_t kWaterStreamRouteLengthFieldSlot = 11U;
-constexpr std::size_t kWaterStreamStartPhaseFieldSlot = 12U;
-constexpr std::size_t kWaterStreamLateralOffsetFieldSlot = 13U;
-constexpr std::size_t kWaterStreamPointAgeFieldSlot = 14U;
-constexpr std::size_t kWaterStreamAgeFieldSlot = 15U;
-constexpr std::size_t kWaterStreamSpeedFieldSlot = 16U;
-constexpr std::size_t kWaterStreamWidthFieldSlot = 17U;
-constexpr std::size_t kWaterStreamWorldLengthFieldSlot = 18U;
-constexpr std::size_t kWaterStreamTangentXFieldSlot = 22U;
-constexpr std::size_t kWaterStreamTangentYFieldSlot = 23U;
-constexpr std::size_t kWaterStreamTangentZFieldSlot = 24U;
-constexpr std::size_t kWaterStreamLaneIndexFieldSlot = 25U;
-constexpr std::size_t kWaterStreamLaneCountFieldSlot = 26U;
-constexpr std::size_t kWaterStreamLanePitchFieldSlot = 27U;
-constexpr std::size_t kWaterStreamLaneSpanFieldSlot = 28U;
-constexpr std::size_t kWaterStreamLaneCrossingFieldSlot = 29U;
-constexpr std::size_t kWaterStreamCrossSeedFieldSlot = 30U;
+constexpr std::size_t kWaterTrailRoleFieldSlot = 0U;
+constexpr std::size_t kWaterTrailDistanceFieldSlot = 7U;
+constexpr std::size_t kWaterTrailLengthFieldSlot = 8U;
+constexpr std::size_t kWaterTrailRouteStartFieldSlot = 9U;
+constexpr std::size_t kWaterTrailRouteCountFieldSlot = 10U;
+constexpr std::size_t kWaterTrailRouteLengthFieldSlot = 11U;
+constexpr std::size_t kWaterTrailStartPhaseFieldSlot = 12U;
+constexpr std::size_t kWaterTrailLateralOffsetFieldSlot = 13U;
+constexpr std::size_t kWaterTrailPointAgeFieldSlot = 14U;
+constexpr std::size_t kWaterTrailAgeFieldSlot = 15U;
+constexpr std::size_t kWaterTrailSpeedFieldSlot = 16U;
+constexpr std::size_t kWaterTrailWidthFieldSlot = 17U;
+constexpr std::size_t kWaterTrailStreakLengthFieldSlot = 18U;
+constexpr std::size_t kWaterTrailTangentXFieldSlot = 22U;
+constexpr std::size_t kWaterTrailTangentYFieldSlot = 23U;
+constexpr std::size_t kWaterTrailTangentZFieldSlot = 24U;
+constexpr std::size_t kWaterTrailLaneIndexFieldSlot = 25U;
+constexpr std::size_t kWaterTrailLaneCountFieldSlot = 26U;
+constexpr std::size_t kWaterTrailLanePitchFieldSlot = 27U;
+constexpr std::size_t kWaterTrailLaneSpanFieldSlot = 28U;
+constexpr std::size_t kWaterTrailLaneCrossingFieldSlot = 29U;
+constexpr std::size_t kWaterTrailCrossSeedFieldSlot = 30U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
 
 float Clamp01(float value) {
@@ -150,15 +150,15 @@ bool HasWaterParticleFields(
     const invisible_places::io::LoadedPointCloud& cloud,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     return style.flowAnimation &&
-           !style.waterStreamOverlay &&
+           !style.waterTrailOverlay &&
            cloud.scalarFields.size() > kWaterJitterSeedFieldSlot;
 }
 
-bool HasWaterStreamFields(
+bool HasWaterTrailFields(
     const invisible_places::io::LoadedPointCloud& cloud,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
-    return style.waterStreamOverlay &&
-           cloud.scalarFields.size() > kWaterStreamTangentZFieldSlot;
+    return style.waterTrailOverlay &&
+           cloud.scalarFields.size() > kWaterTrailTangentZFieldSlot;
 }
 
 float WaterParticleTravel(
@@ -185,10 +185,10 @@ bool IsWaterSteam(
 float WaterTrailFade(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex) {
-    if (cloud.scalarFields.size() <= kWaterTrailAgeFieldSlot) {
+    if (cloud.scalarFields.size() <= kWaterAgeFieldSlot) {
         return 1.0F;
     }
-    const float age = Clamp01(ScalarFieldValueBySlot(cloud, kWaterTrailAgeFieldSlot, pointIndex));
+    const float age = Clamp01(ScalarFieldValueBySlot(cloud, kWaterAgeFieldSlot, pointIndex));
     return std::pow(1.0F - SmoothStep(0.0F, 1.0F, age), 1.35F);
 }
 
@@ -434,171 +434,52 @@ glm::vec3 CatmullRomWater(
         (-p0 + (3.0F * p1) - (3.0F * p2) + p3) * t3);
 }
 
-std::size_t WaterStreamRouteStart(
+std::size_t WaterTrailRouteStart(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex) {
     return static_cast<std::size_t>(
-        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterStreamRouteStartFieldSlot, pointIndex) + 0.5F)));
+        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterTrailRouteStartFieldSlot, pointIndex) + 0.5F)));
 }
 
-std::size_t WaterStreamRouteCount(
+std::size_t WaterTrailRouteCount(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex) {
     return static_cast<std::size_t>(
-        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterStreamRouteCountFieldSlot, pointIndex) + 0.5F)));
+        std::max(0.0F, std::floor(ScalarFieldValueBySlot(cloud, kWaterTrailRouteCountFieldSlot, pointIndex) + 0.5F)));
 }
 
-float WaterStreamTravelPhase(
+float WaterTrailTravelPhase(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     float timeSeconds) {
-    const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterStreamRouteLengthFieldSlot, pointIndex));
-    const float streamDistance = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamDistanceFieldSlot, pointIndex));
-    const float streamAge = ScalarFieldValueBySlot(cloud, kWaterStreamAgeFieldSlot, pointIndex);
-    const float streamStartPhase = ScalarFieldValueBySlot(cloud, kWaterStreamStartPhaseFieldSlot, pointIndex);
-    const float speed = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamSpeedFieldSlot, pointIndex));
-    return PositiveFract(
-        streamStartPhase +
-        streamAge +
-        std::max(0.0F, timeSeconds) * speed / routeLength -
-        streamDistance / routeLength);
+    const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailRouteLengthFieldSlot, pointIndex));
+    const float trailDistance = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailDistanceFieldSlot, pointIndex));
+    const float trailAge = ScalarFieldValueBySlot(cloud, kWaterTrailAgeFieldSlot, pointIndex);
+    const float baseStartPhase = ScalarFieldValueBySlot(cloud, kWaterTrailStartPhaseFieldSlot, pointIndex);
+    const float speed = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailSpeedFieldSlot, pointIndex));
+    const float trailStartPhase = PositiveFract(
+        baseStartPhase +
+        trailAge +
+        std::max(0.0F, timeSeconds) * speed / routeLength);
+    return trailStartPhase + trailDistance / routeLength;
 }
 
-float WaterStreamHash(float a, float b, float c) {
-    return PositiveFract(
-        std::sin(glm::dot(glm::vec3{a, b, c}, glm::vec3{12.9898F, 78.233F, 37.719F})) *
-        43758.5453123F);
-}
-
-float WaterStreamLaneCenter(float laneIndex, float laneCount, float laneSpan) {
-    const float count = std::max(1.0F, std::floor(laneCount + 0.5F));
-    if (count <= 1.0F || laneSpan <= 0.00001F) {
-        return 0.0F;
-    }
-    const float clampedIndex = std::clamp(laneIndex, 0.0F, count - 1.0F);
-    return (((clampedIndex + 0.5F) / count) - 0.5F) * laneSpan;
-}
-
-float WaterStreamRouteTurnBias(
+float WaterTrailVisibility(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
-    float travelPhase,
-    glm::vec3 routeNormal) {
-    const auto routeStart = WaterStreamRouteStart(cloud, pointIndex);
-    const auto routeCount = WaterStreamRouteCount(cloud, pointIndex);
-    if (routeCount < 3U ||
-        routeStart >= cloud.positions.size() ||
-        routeStart + routeCount > cloud.positions.size()) {
+    float timeSeconds) {
+    if (ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F) {
         return 0.0F;
     }
-
-    const float routePosition = PositiveFract(travelPhase) * static_cast<float>(routeCount - 1U);
-    const auto centerOffset = std::min<std::size_t>(
-        std::max<std::size_t>(static_cast<std::size_t>(std::floor(routePosition)), 1U),
-        routeCount - 2U);
-    const glm::vec3 previous = ToGlm(cloud.positions[routeStart + centerOffset - 1U]);
-    const glm::vec3 center = ToGlm(cloud.positions[routeStart + centerOffset]);
-    const glm::vec3 next = ToGlm(cloud.positions[routeStart + centerOffset + 1U]);
-    glm::vec3 previousTangent = center - previous;
-    glm::vec3 nextTangent = next - center;
-    if (glm::dot(previousTangent, previousTangent) <= 1.0e-8F ||
-        glm::dot(nextTangent, nextTangent) <= 1.0e-8F) {
-        return 0.0F;
-    }
-
-    previousTangent = glm::normalize(previousTangent);
-    nextTangent = glm::normalize(nextTangent);
-    const float signedTurn = glm::dot(glm::cross(previousTangent, nextTangent), routeNormal);
-    return std::clamp(-signedTurn * 8.0F, -1.0F, 1.0F);
+    const float phase = WaterTrailTravelPhase(cloud, pointIndex, timeSeconds);
+    const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailRouteLengthFieldSlot, pointIndex));
+    const float trailStreakLength =
+        std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailStreakLengthFieldSlot, pointIndex));
+    const float endFeather = std::clamp(trailStreakLength / routeLength, 0.001F, 0.08F);
+    return 1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase);
 }
 
-float WaterStreamApplyLaneJump(
-    float currentLane,
-    float laneCount,
-    float jumpChance,
-    float turnBias,
-    float crossSeed,
-    float segmentIndex) {
-    if (WaterStreamHash(crossSeed, segmentIndex, 17.0F) >= jumpChance) {
-        return currentLane;
-    }
-
-    const float outerLaneProbability = std::clamp(0.5F + turnBias * 0.42F, 0.08F, 0.92F);
-    const float direction =
-        WaterStreamHash(crossSeed, segmentIndex, 29.0F) < outerLaneProbability ? 1.0F : -1.0F;
-    return std::clamp(currentLane + direction, 0.0F, laneCount - 1.0F);
-}
-
-float ResolveWaterStreamLateralOffset(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    std::size_t pointIndex,
-    float travelPhase,
-    glm::vec3 routeTangent,
-    float turnBias) {
-    const float baseOffset = ScalarFieldValueBySlot(cloud, kWaterStreamLateralOffsetFieldSlot, pointIndex);
-    if (cloud.scalarFields.size() <= kWaterStreamCrossSeedFieldSlot) {
-        return baseOffset;
-    }
-
-    const float crossing = Clamp01(ScalarFieldValueBySlot(cloud, kWaterStreamLaneCrossingFieldSlot, pointIndex));
-    const float laneCount = std::max(
-        1.0F,
-        std::floor(ScalarFieldValueBySlot(cloud, kWaterStreamLaneCountFieldSlot, pointIndex) + 0.5F));
-    const float lanePitch = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamLanePitchFieldSlot, pointIndex));
-    const float laneSpan = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamLaneSpanFieldSlot, pointIndex));
-    if (crossing <= 0.0001F || laneCount <= 1.0F || lanePitch <= 0.0F || laneSpan <= 0.00001F) {
-        return baseOffset;
-    }
-
-    const float baseLane = std::clamp(
-        std::floor(ScalarFieldValueBySlot(cloud, kWaterStreamLaneIndexFieldSlot, pointIndex) + 0.5F),
-        0.0F,
-        laneCount - 1.0F);
-    const float baseCenter = WaterStreamLaneCenter(baseLane, laneCount, laneSpan);
-    const float offsetJitter = baseOffset - baseCenter;
-    const float crossSeed = ScalarFieldValueBySlot(cloud, kWaterStreamCrossSeedFieldSlot, pointIndex);
-    const float routeProgress = PositiveFract(travelPhase);
-    const float sourceProgress = SmoothStep(0.03F, 0.55F, routeProgress);
-    const float flatness = 1.0F - SmoothStep(0.05F, 0.45F, std::abs(routeTangent.z));
-    const float jumpChance = std::clamp(
-        crossing *
-            sourceProgress *
-            glm::mix(0.30F, 1.45F, flatness) *
-            (1.0F + std::abs(turnBias) * 0.75F),
-        0.0F,
-        1.0F);
-    const float segmentCount = glm::mix(2.0F, 12.0F, crossing);
-    const float segmentCoord = routeProgress * segmentCount;
-    const float segmentIndex = std::floor(segmentCoord);
-    const float localPhase = PositiveFract(segmentCoord);
-    float currentLane = baseLane;
-    for (int segment = 0; segment < 12; ++segment) {
-        const float segmentValue = static_cast<float>(segment);
-        if (segmentValue >= segmentIndex || segmentValue >= segmentCount) {
-            break;
-        }
-        currentLane = WaterStreamApplyLaneJump(
-            currentLane,
-            laneCount,
-            jumpChance,
-            turnBias,
-            crossSeed,
-            segmentValue);
-    }
-
-    const float targetLane = WaterStreamApplyLaneJump(
-        currentLane,
-        laneCount,
-        jumpChance,
-        turnBias,
-        crossSeed,
-        segmentIndex);
-    const float envelope = SmoothStep(0.18F, 0.92F, localPhase);
-    const float resolvedLane = glm::mix(currentLane, targetLane, envelope);
-    return WaterStreamLaneCenter(resolvedLane, laneCount, laneSpan) + offsetJitter;
-}
-
-bool WaterStreamRouteValid(
+bool WaterTrailRouteValid(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t routeStart,
     std::size_t routeCount) {
@@ -607,14 +488,14 @@ bool WaterStreamRouteValid(
            routeStart + routeCount <= cloud.positions.size();
 }
 
-glm::vec3 WaterStreamRoutePosition(
+glm::vec3 WaterTrailRoutePosition(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     float phase,
     glm::vec3 fallbackPosition) {
-    const auto routeStart = WaterStreamRouteStart(cloud, pointIndex);
-    const auto routeCount = WaterStreamRouteCount(cloud, pointIndex);
-    if (!WaterStreamRouteValid(cloud, routeStart, routeCount)) {
+    const auto routeStart = WaterTrailRouteStart(cloud, pointIndex);
+    const auto routeCount = WaterTrailRouteCount(cloud, pointIndex);
+    if (!WaterTrailRouteValid(cloud, routeStart, routeCount)) {
         return fallbackPosition;
     }
 
@@ -635,17 +516,17 @@ glm::vec3 WaterStreamRoutePosition(
         t);
 }
 
-glm::vec3 WaterStreamRouteTangent(
+glm::vec3 WaterTrailRouteTangent(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     float phase) {
-    const auto routeStart = WaterStreamRouteStart(cloud, pointIndex);
-    const auto routeCount = WaterStreamRouteCount(cloud, pointIndex);
-    if (!WaterStreamRouteValid(cloud, routeStart, routeCount)) {
+    const auto routeStart = WaterTrailRouteStart(cloud, pointIndex);
+    const auto routeCount = WaterTrailRouteCount(cloud, pointIndex);
+    if (!WaterTrailRouteValid(cloud, routeStart, routeCount)) {
         const glm::vec3 tangent{
-            ScalarFieldValueBySlot(cloud, kWaterStreamTangentXFieldSlot, pointIndex),
-            ScalarFieldValueBySlot(cloud, kWaterStreamTangentYFieldSlot, pointIndex),
-            ScalarFieldValueBySlot(cloud, kWaterStreamTangentZFieldSlot, pointIndex)};
+            ScalarFieldValueBySlot(cloud, kWaterTrailTangentXFieldSlot, pointIndex),
+            ScalarFieldValueBySlot(cloud, kWaterTrailTangentYFieldSlot, pointIndex),
+            ScalarFieldValueBySlot(cloud, kWaterTrailTangentZFieldSlot, pointIndex)};
         return glm::dot(tangent, tangent) > 1.0e-8F ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
     }
 
@@ -661,7 +542,7 @@ glm::vec3 WaterStreamRouteTangent(
     return glm::dot(tangent, tangent) > 1.0e-8F ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
 }
 
-glm::vec3 WaterStreamRouteNormal(
+glm::vec3 WaterTrailRouteNormal(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     float phase) {
@@ -669,9 +550,9 @@ glm::vec3 WaterStreamRouteNormal(
         return {0.0F, 0.0F, 1.0F};
     }
 
-    const auto routeStart = WaterStreamRouteStart(cloud, pointIndex);
-    const auto routeCount = WaterStreamRouteCount(cloud, pointIndex);
-    if (!WaterStreamRouteValid(cloud, routeStart, routeCount)) {
+    const auto routeStart = WaterTrailRouteStart(cloud, pointIndex);
+    const auto routeCount = WaterTrailRouteCount(cloud, pointIndex);
+    if (!WaterTrailRouteValid(cloud, routeStart, routeCount)) {
         const glm::vec3 normal = pointIndex < cloud.normals.size() ? ToGlm(cloud.normals[pointIndex]) : glm::vec3{0.0F, 0.0F, 1.0F};
         return glm::dot(normal, normal) > 1.0e-8F ? glm::normalize(normal) : glm::vec3{0.0F, 0.0F, 1.0F};
     }
@@ -693,23 +574,23 @@ glm::vec3 WaterStreamRouteNormal(
     return glm::dot(normal, normal) > 1.0e-8F ? glm::normalize(normal) : glm::vec3{0.0F, 0.0F, 1.0F};
 }
 
-glm::vec3 ResolveWaterStreamPosition(
+glm::vec3 ResolveWaterTrailPosition(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
     float timeSeconds,
     glm::vec3 basePosition) {
-    const float phase = WaterStreamTravelPhase(cloud, pointIndex, timeSeconds);
-    const glm::vec3 routePosition = WaterStreamRoutePosition(cloud, pointIndex, phase, basePosition);
-    const glm::vec3 routeTangent = WaterStreamRouteTangent(cloud, pointIndex, phase);
-    const glm::vec3 routeNormal = WaterStreamRouteNormal(cloud, pointIndex, phase);
+    const float phase = WaterTrailTravelPhase(cloud, pointIndex, timeSeconds);
+    const glm::vec3 routePosition = WaterTrailRoutePosition(cloud, pointIndex, phase, basePosition);
+    const glm::vec3 routeTangent = WaterTrailRouteTangent(cloud, pointIndex, phase);
+    const glm::vec3 routeNormal = WaterTrailRouteNormal(cloud, pointIndex, phase);
     glm::vec3 lateral = glm::cross(routeNormal, routeTangent);
     if (glm::dot(lateral, lateral) <= 1.0e-8F) {
         lateral = SafeWaterLateral(routeTangent, glm::vec3{1.0F, 0.0F, 0.0F});
     } else {
         lateral = glm::normalize(lateral);
     }
-    const float turnBias = WaterStreamRouteTurnBias(cloud, pointIndex, phase, routeNormal);
-    return routePosition + lateral * ResolveWaterStreamLateralOffset(cloud, pointIndex, phase, routeTangent, turnBias);
+    const float lateralOffset = ScalarFieldValueBySlot(cloud, kWaterTrailLateralOffsetFieldSlot, pointIndex);
+    return routePosition + lateral * lateralOffset;
 }
 
 glm::vec3 JitteredWaterAnchorPosition(
@@ -1652,7 +1533,7 @@ bool BuildOfflinePointSample(
     }
 
     const auto& cloud = *layer.cloud;
-    const bool waterStreams = HasWaterStreamFields(cloud, layer.style);
+    const bool waterTrails = HasWaterTrailFields(cloud, layer.style);
     const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
     float waterParticleRole = 0.0F;
     if (waterParticles) {
@@ -1670,11 +1551,11 @@ bool BuildOfflinePointSample(
 
     const auto& point = cloud.positions[pointIndex];
     glm::vec3 localPoint{point.x, point.y, point.z};
-    if (waterStreams) {
-        if (ScalarFieldValueBySlot(cloud, kWaterStreamRoleFieldSlot, pointIndex) < 0.5F) {
+    if (waterTrails) {
+        if (WaterTrailVisibility(cloud, pointIndex, stylisationTimeSeconds) <= 0.0F) {
             return false;
         }
-        localPoint = ResolveWaterStreamPosition(cloud, pointIndex, stylisationTimeSeconds, localPoint);
+        localPoint = ResolveWaterTrailPosition(cloud, pointIndex, stylisationTimeSeconds, localPoint);
     }
     if (waterParticles && !layer.style.waterPathView && waterParticleRole >= 0.5F && waterParticleRole < 1.5F) {
         localPoint = ResolveWaterParticlePosition(cloud, pointIndex, stylisationTimeSeconds, localPoint);
@@ -1829,15 +1710,15 @@ bool BuildOfflinePointSample(
     sample->surfelAspect = layer.style.flowAnimation
                                 ? std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F)
                                 : 1.0F;
-    if (waterStreams) {
+    if (waterTrails) {
         sample->surfelDiameter = std::max(
             0.0001F,
-            ScalarFieldValueBySlot(cloud, kWaterStreamWidthFieldSlot, pointIndex));
-        const float streamWorldLength = std::max(
+            ScalarFieldValueBySlot(cloud, kWaterTrailWidthFieldSlot, pointIndex));
+        const float trailStreakLength = std::max(
             sample->surfelDiameter,
-            ScalarFieldValueBySlot(cloud, kWaterStreamWorldLengthFieldSlot, pointIndex));
+            ScalarFieldValueBySlot(cloud, kWaterTrailStreakLengthFieldSlot, pointIndex));
         sample->surfelAspect = std::clamp(
-            streamWorldLength / std::max(sample->surfelDiameter, 0.0001F),
+            trailStreakLength / std::max(sample->surfelDiameter, 0.0001F),
             1.0F,
             64.0F);
     }
@@ -1905,11 +1786,11 @@ bool BuildOfflinePointSample(
         }
     }
     sample->hasPreferredTangent = false;
-    if (waterStreams) {
-        const glm::vec3 localTangent = WaterStreamRouteTangent(
+    if (waterTrails) {
+        const glm::vec3 localTangent = WaterTrailRouteTangent(
             cloud,
             pointIndex,
-            WaterStreamTravelPhase(cloud, pointIndex, stylisationTimeSeconds));
+            WaterTrailTravelPhase(cloud, pointIndex, stylisationTimeSeconds));
         if (glm::dot(localTangent, localTangent) > 1.0e-8F) {
             const glm::vec3 worldTangent = glm::mat3{layer.localToWorld} * localTangent;
             if (IsFinite(worldTangent) && glm::dot(worldTangent, worldTangent) > 1.0e-8F) {
@@ -2163,7 +2044,7 @@ void RenderFastBasicPointCloudTile(
         }
 
         const auto& cloud = *layer.cloud;
-        const bool waterStreams = HasWaterStreamFields(cloud, layer.style);
+        const bool waterTrails = HasWaterTrailFields(cloud, layer.style);
         const auto sourcePointCount = cloud.positions.size();
         const auto drawPointCount =
             static_cast<std::size_t>(std::min<std::uint64_t>(
@@ -2183,12 +2064,12 @@ void RenderFastBasicPointCloudTile(
                            static_cast<std::uint64_t>(sourcePointCount)) /
                           static_cast<std::uint64_t>(drawPointCount))
                     : sampleIndex;
-            if (waterStreams && ScalarFieldValueBySlot(cloud, kWaterStreamRoleFieldSlot, pointIndex) < 0.5F) {
+            if (waterTrails && ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F) {
                 continue;
             }
             glm::vec3 localPosition = ToGlm(cloud.positions[pointIndex]);
-            if (waterStreams) {
-                localPosition = ResolveWaterStreamPosition(cloud, pointIndex, stylisationTimeSeconds, localPosition);
+            if (waterTrails) {
+                localPosition = ResolveWaterTrailPosition(cloud, pointIndex, stylisationTimeSeconds, localPosition);
             }
             const glm::vec4 worldPosition4 = layer.localToWorld * glm::vec4{localPosition, 1.0F};
             const glm::vec3 worldPosition{worldPosition4};

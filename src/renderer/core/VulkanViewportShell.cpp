@@ -5789,7 +5789,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         resources->pointCount,
         plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
-        layer.style.waterStreamOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
+        layer.style.waterTrailOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
     };
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled ||
@@ -6197,7 +6197,7 @@ bool VulkanViewportShell::RecordPointCloudHighlightDraw(
     highlightLayer.style.colorizeAmount = 0.0F;
     highlightLayer.style.flowAnimation = false;
     highlightLayer.style.waterPathView = false;
-    highlightLayer.style.waterStreamOverlay = false;
+    highlightLayer.style.waterTrailOverlay = false;
     highlightLayer.style.causticAnimation = false;
     highlightLayer.style.causticIntensity = 0.0F;
     highlightLayer.style.roughnessMotionStrength = 0.0F;

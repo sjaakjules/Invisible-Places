@@ -2642,49 +2642,74 @@ WaterTrailGeometrySettings DefaultWaterTrailGeometrySettings() {
     return {};
 }
 
-WaterTrailGeometrySettings WaterTrailGeometryFromFlowStreamSettings(
-    const WaterFlowStreamSettings& settings) {
-    WaterTrailGeometrySettings geometry;
-    geometry.trailLengthMeters = settings.streamLengthMeters;
-    geometry.pointSpacingMeters = settings.streamPointSpacingMeters;
-    geometry.widthMeters = settings.streamWidthMeters;
-    geometry.worldLengthMeters = settings.streamWorldLengthMeters;
+float AutoWaterTrailPointSpacingMeters(float trailLengthMeters, float widthMeters) {
+    const float safeLength = std::clamp(trailLengthMeters, 0.001F, 50.0F);
+    const float safeWidth = std::clamp(widthMeters, 0.0005F, 1.0F);
+    const float widthDrivenSpacing = safeWidth * 1.65F;
+    const float lengthDrivenSpacing = safeLength / 128.0F;
+    return std::clamp(std::max(widthDrivenSpacing, lengthDrivenSpacing), 0.002F, 0.20F);
+}
+
+float AutoWaterTrailStreakLengthMeters(float pointSpacingMeters, float widthMeters) {
+    const float safeSpacing = std::clamp(pointSpacingMeters, 0.001F, 10.0F);
+    const float safeWidth = std::clamp(widthMeters, 0.0005F, 1.0F);
+    return std::clamp(std::max({safeWidth * 7.5F, safeSpacing * 3.25F, safeWidth}), 0.002F, 5.0F);
+}
+
+WaterTrailGeometrySettings FitWaterTrailGeometryForContinuousLines(
+    WaterTrailGeometrySettings geometry) {
+    geometry.trailLengthMeters = std::clamp(geometry.trailLengthMeters, 0.001F, 50.0F);
+    geometry.widthMeters = std::clamp(geometry.widthMeters, 0.0005F, 1.0F);
+    geometry.pointSpacingMeters =
+        AutoWaterTrailPointSpacingMeters(geometry.trailLengthMeters, geometry.widthMeters);
+    geometry.streakLengthMeters =
+        AutoWaterTrailStreakLengthMeters(geometry.pointSpacingMeters, geometry.widthMeters);
     return geometry;
 }
 
-WaterFlowStreamSettings ApplyWaterTrailGeometryToFlowStreamSettings(
-    WaterFlowStreamSettings settings,
+WaterTrailGeometrySettings WaterTrailGeometryFromFlowTrailSettings(
+    const WaterFlowTrailSettings& settings) {
+    WaterTrailGeometrySettings geometry;
+    geometry.trailLengthMeters = settings.trailLengthMeters;
+    geometry.pointSpacingMeters = settings.trailPointSpacingMeters;
+    geometry.widthMeters = settings.trailWidthMeters;
+    geometry.streakLengthMeters = settings.trailStreakLengthMeters;
+    return geometry;
+}
+
+WaterFlowTrailSettings ApplyWaterTrailGeometryToFlowTrailSettings(
+    WaterFlowTrailSettings settings,
     const WaterTrailGeometrySettings& geometry) {
-    settings.streamLengthMeters = geometry.trailLengthMeters;
-    settings.streamPointSpacingMeters = geometry.pointSpacingMeters;
-    settings.streamWidthMeters = geometry.widthMeters;
-    settings.streamWorldLengthMeters = geometry.worldLengthMeters;
+    settings.trailLengthMeters = geometry.trailLengthMeters;
+    settings.trailPointSpacingMeters = geometry.pointSpacingMeters;
+    settings.trailWidthMeters = geometry.widthMeters;
+    settings.trailStreakLengthMeters = geometry.streakLengthMeters;
     return settings;
 }
 
 bool WaterFlowLaneRouteInputsEqual(
-    const WaterFlowStreamSettings& left,
-    const WaterFlowStreamSettings& right) {
+    const WaterFlowTrailSettings& left,
+    const WaterFlowTrailSettings& right) {
     return left.enabled == right.enabled &&
-           left.streamCountTotal == right.streamCountTotal &&
+           left.trailCountTotal == right.trailCountTotal &&
            left.laneCount == right.laneCount &&
-           left.streamLengthMeters == right.streamLengthMeters &&
-           left.streamPointSpacingMeters == right.streamPointSpacingMeters &&
-           left.streamWidthMeters == right.streamWidthMeters &&
-           left.streamWorldLengthMeters == right.streamWorldLengthMeters &&
+           left.trailLengthMeters == right.trailLengthMeters &&
+           left.trailPointSpacingMeters == right.trailPointSpacingMeters &&
+           left.trailWidthMeters == right.trailWidthMeters &&
+           left.trailStreakLengthMeters == right.trailStreakLengthMeters &&
            left.surfaceOffsetMeters == right.surfaceOffsetMeters &&
            left.pathAttraction == right.pathAttraction &&
            left.laneSpreadMeters == right.laneSpreadMeters &&
            left.laneCrossing == right.laneCrossing &&
-           left.streamSmoothness == right.streamSmoothness &&
-           left.streamLooseness == right.streamLooseness &&
+           left.trailSmoothness == right.trailSmoothness &&
+           left.trailLooseness == right.trailLooseness &&
            left.turbulence == right.turbulence &&
            left.seed == right.seed;
 }
 
 bool WaterFlowLaneSpeedOnlyEdit(
-    const WaterFlowStreamSettings& before,
-    const WaterFlowStreamSettings& after) {
+    const WaterFlowTrailSettings& before,
+    const WaterFlowTrailSettings& after) {
     return WaterFlowLaneRouteInputsEqual(before, after) &&
            before.speedMetersPerSecond != after.speedMetersPerSecond;
 }
@@ -3490,7 +3515,7 @@ std::vector<invisible_places::io::Float3> BuildWaterRegionBoundary(
 
 namespace {
 
-void IncludeStreamSample(WaterStreamOverlay* overlay, WaterStreamSample sample) {
+void IncludeTrailSample(WaterTrailOverlay* overlay, WaterTrailSample sample) {
     if (overlay == nullptr) {
         return;
     }
@@ -3586,7 +3611,7 @@ glm::vec3 TangentAtPathDistance(const std::vector<WaterOverlayPoint>& path, floa
     return glm::dot(tangent, tangent) > kNormalEpsilon ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
 }
 
-std::uint8_t StreamColorByte(float value) {
+std::uint8_t TrailColorByte(float value) {
     return FloatToByte(std::clamp(value, 0.0F, 1.0F));
 }
 
@@ -4603,13 +4628,13 @@ float RuntimeRippleCurrentThreadsValue(
     const float normalBias = Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
     const float cellXSize = std::max(wavelength * (2.10F + warp * 0.35F), 0.036F);
     const float cellYSize = std::max(wavelength * (1.05F + turbulence * 0.35F), 0.024F);
-    glm::vec2 streamUv = uv;
-    streamUv.x += normalBias * wavelength * (0.10F + warp * 0.06F);
-    streamUv.y += std::sin(uv.x / std::max(wavelength * 1.25F, 0.010F) + seed * 1.17F + t * 0.13F) *
+    glm::vec2 currentUv = uv;
+    currentUv.x += normalBias * wavelength * (0.10F + warp * 0.06F);
+    currentUv.y += std::sin(uv.x / std::max(wavelength * 1.25F, 0.010F) + seed * 1.17F + t * 0.13F) *
                   wavelength * (0.055F + warp * 0.060F + normalBias * 0.035F);
-    streamUv.y += std::sin(uv.x / std::max(wavelength * 0.47F, 0.006F) - seed * 0.73F - t * 0.19F) *
+    currentUv.y += std::sin(uv.x / std::max(wavelength * 0.47F, 0.006F) - seed * 0.73F - t * 0.19F) *
                   wavelength * turbulence * 0.055F;
-    const glm::vec2 p{streamUv.x / cellXSize, streamUv.y / cellYSize};
+    const glm::vec2 p{currentUv.x / cellXSize, currentUv.y / cellYSize};
     const auto baseX = static_cast<int>(std::floor(p.x));
     const auto baseY = static_cast<int>(std::floor(p.y));
     const float originDensity = std::clamp(0.16F + density * 0.66F + normalBias * 0.16F, 0.10F, 0.92F);
@@ -4632,7 +4657,7 @@ float RuntimeRippleCurrentThreadsValue(
             const float travelRange = cellXSize * (0.82F + warp * 0.10F + normalBias * 0.34F);
             const float head = life * travelRange;
             const float trailLength = std::max(wavelength * (1.15F + warp * 0.34F + normalBias * 0.44F), 0.035F);
-            const glm::vec2 local = streamUv - origin;
+            const glm::vec2 local = currentUv - origin;
             const float forward = local.x;
             const float tail = head - forward;
             const float inPulse =
@@ -4663,7 +4688,7 @@ float RuntimeRippleCurrentThreadsValue(
                 branchGate *
                 inPulse;
             const float breakupNoise = RuntimeRippleSmoothBlockNoise(
-                streamUv + glm::vec2{t * 0.018F + pulseSeed, -t * 0.011F},
+                currentUv + glm::vec2{t * 0.018F + pulseSeed, -t * 0.011F},
                 std::max(wavelength * (0.24F + turbulence * 0.16F), 0.006F),
                 seed,
                 233.0F);
@@ -4685,13 +4710,13 @@ float RuntimeRippleCurrentThreadsValue(
         }
     }
     const float fallbackNoise = RuntimeRippleSmoothBlockNoise(
-        streamUv + glm::vec2{t * 0.014F, -t * 0.009F},
+        currentUv + glm::vec2{t * 0.014F, -t * 0.009F},
         std::max(wavelength * 0.42F, 0.006F),
         seed,
         239.0F);
     const float fallbackPulse =
         RippleWavePeak(
-            streamUv.x / std::max(wavelength * 1.9F, 0.012F) - t * 0.22F + fallbackNoise,
+            currentUv.x / std::max(wavelength * 1.9F, 0.012F) - t * 0.22F + fallbackNoise,
             2.1F) *
         SmoothStep(0.42F - density * 0.16F, 0.96F, fallbackNoise);
     const float softFallback =
@@ -5188,11 +5213,11 @@ float LaneAnalysisGuideInfluence(
     float turbulence,
     float laneCrossing,
     float pathAttraction,
-    float streamLooseness) {
+    float trailLooseness) {
     const float attractionRelief = 1.0F - std::clamp(pathAttraction, 0.0F, 1.0F);
     return std::clamp(
         std::clamp(laneCrossing, 0.0F, 1.0F) * 0.38F +
-            std::clamp(streamLooseness, 0.0F, 1.0F) * 0.30F +
+            std::clamp(trailLooseness, 0.0F, 1.0F) * 0.30F +
             attractionRelief * 0.24F +
             std::clamp(turbulence, 0.0F, 1.0F) * 0.18F,
         0.0F,
@@ -5202,12 +5227,12 @@ float LaneAnalysisGuideInfluence(
 float LaneAnalysisSpan(
     const LaneAnalysisSample& analysis,
     float fallbackSpan,
-    float streamWidthMeters,
+    float trailWidthMeters,
     float analysisInfluence) {
     if (!analysis.available) {
         return fallbackSpan;
     }
-    const float minimumSpan = std::max(streamWidthMeters * 2.0F, 0.001F);
+    const float minimumSpan = std::max(trailWidthMeters * 2.0F, 0.001F);
     const float channelWidth = std::max(minimumSpan, analysis.channelWidth);
     if (fallbackSpan <= 1.0e-6F) {
         return channelWidth;
@@ -5257,35 +5282,121 @@ float LaneAnalysisWeight(
     return 1.0F + (analysisWeight - 1.0F) * std::clamp(analysisInfluence, 0.0F, 1.0F);
 }
 
-WaterStreamOverlay BuildStreamOverlayFromPaths(
+std::vector<std::uint32_t> AllocateExactTrailCountsForPaths(
+    const std::vector<float>& pathLengths,
+    const std::vector<float>& pathWeights,
+    std::uint32_t requestedTrailCount) {
+    std::vector<std::uint32_t> allocations(pathLengths.size(), 0U);
+    if (requestedTrailCount == 0U || pathLengths.empty()) {
+        return allocations;
+    }
+
+    struct Candidate {
+        std::size_t index = 0U;
+        float weight = 0.0F;
+        double remainder = 0.0;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(pathLengths.size());
+    for (std::size_t index = 0U; index < pathLengths.size(); ++index) {
+        const float length = pathLengths[index];
+        if (length <= 1.0e-5F) {
+            continue;
+        }
+        const float weight = index < pathWeights.size() ? std::max(0.0F, pathWeights[index]) : length;
+        candidates.push_back({.index = index, .weight = weight > 1.0e-5F ? weight : length});
+    }
+    if (candidates.empty()) {
+        return allocations;
+    }
+
+    auto byWeight = [](const Candidate& left, const Candidate& right) {
+        if (left.weight != right.weight) {
+            return left.weight > right.weight;
+        }
+        return left.index < right.index;
+    };
+    std::sort(candidates.begin(), candidates.end(), byWeight);
+
+    const std::uint32_t initiallyAssigned =
+        std::min<std::uint32_t>(requestedTrailCount, static_cast<std::uint32_t>(candidates.size()));
+    for (std::uint32_t index = 0U; index < initiallyAssigned; ++index) {
+        allocations[candidates[index].index] = 1U;
+    }
+    if (initiallyAssigned == requestedTrailCount) {
+        return allocations;
+    }
+
+    const std::uint32_t remaining = requestedTrailCount - initiallyAssigned;
+    double totalWeight = 0.0;
+    for (const auto& candidate : candidates) {
+        totalWeight += static_cast<double>(std::max(candidate.weight, 0.0F));
+    }
+    if (totalWeight <= 1.0e-9) {
+        totalWeight = static_cast<double>(candidates.size());
+        for (auto& candidate : candidates) {
+            candidate.weight = 1.0F;
+        }
+    }
+
+    std::uint32_t assignedExtra = 0U;
+    for (auto& candidate : candidates) {
+        const double exactShare =
+            (static_cast<double>(remaining) * static_cast<double>(candidate.weight)) / totalWeight;
+        const auto extra = static_cast<std::uint32_t>(std::floor(exactShare));
+        allocations[candidate.index] += extra;
+        assignedExtra += extra;
+        candidate.remainder = exactShare - static_cast<double>(extra);
+    }
+
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const Candidate& left, const Candidate& right) {
+            if (left.remainder != right.remainder) {
+                return left.remainder > right.remainder;
+            }
+            if (left.weight != right.weight) {
+                return left.weight > right.weight;
+            }
+            return left.index < right.index;
+        });
+    for (std::uint32_t index = 0U; assignedExtra < remaining; ++index, ++assignedExtra) {
+        allocations[candidates[index % candidates.size()].index] += 1U;
+    }
+    return allocations;
+}
+
+WaterTrailOverlay BuildTrailOverlayFromPaths(
     const std::vector<std::vector<WaterOverlayPoint>>& paths,
-    std::uint32_t requestedStreamCount,
-    float streamLengthMeters,
+    std::uint32_t requestedTrailCount,
+    float trailLengthMeters,
     float pointSpacingMeters,
-    float streamWidthMeters,
-    float streamWorldLengthMeters,
+    float trailWidthMeters,
+    float trailStreakLengthMeters,
     float surfaceOffsetMeters,
     float laneSpreadMeters,
     std::uint32_t requestedLaneCount,
     float turbulence,
     float laneCrossing,
     float pathAttraction,
-    float streamSmoothness,
-    float streamLooseness,
+    float trailSmoothness,
+    float trailLooseness,
     float speedMetersPerSecond,
     std::uint32_t seed,
     float featureType,
     const WaterPathAnalysisCache* analysisCache) {
-    WaterStreamOverlay overlay;
-    if (paths.empty() || requestedStreamCount == 0U) {
+    WaterTrailOverlay overlay;
+    if (paths.empty() || requestedTrailCount == 0U) {
         return overlay;
     }
 
-    const float safeStreamWidth = std::max(0.0005F, streamWidthMeters);
+    const float safeTrailWidth = std::max(0.0005F, trailWidthMeters);
     const float laneSpan = std::max(0.0F, laneSpreadMeters);
-    const float lanePitch = std::max(safeStreamWidth * 0.5F, 0.00025F);
+    const float lanePitch = std::max(safeTrailWidth * 0.5F, 0.00025F);
     const float analysisGuideInfluence =
-        LaneAnalysisGuideInfluence(turbulence, laneCrossing, pathAttraction, streamLooseness);
+        LaneAnalysisGuideInfluence(turbulence, laneCrossing, pathAttraction, trailLooseness);
 
     std::vector<float> pathLengths;
     pathLengths.reserve(paths.size());
@@ -5319,9 +5430,9 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
         pathWeights = pathLengths;
     }
 
-    const float safeLength = std::clamp(streamLengthMeters, 0.02F, 100.0F);
+    const float safeLength = std::clamp(trailLengthMeters, 0.02F, 100.0F);
     const float safeSpacing = std::clamp(pointSpacingMeters, 0.001F, 5.0F);
-    const std::uint32_t samplesPerStream = std::max<std::uint32_t>(
+    const std::uint32_t samplesPerTrail = std::max<std::uint32_t>(
         2U,
         static_cast<std::uint32_t>(std::ceil(safeLength / safeSpacing)) + 1U);
     const auto potentialLaneCount =
@@ -5330,6 +5441,8 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
             : static_cast<std::uint32_t>(std::max<float>(
                   1.0F,
                   std::ceil(laneSpan / lanePitch)));
+    const auto trailAllocations =
+        AllocateExactTrailCountsForPaths(pathLengths, pathWeights, requestedTrailCount);
     const float laneCrossingAmount = std::clamp(laneCrossing, 0.0F, 1.0F);
     const auto laneCenter = [](std::uint32_t laneIndex, std::uint32_t laneCount, float span) {
         if (laneCount <= 1U || span <= 1.0e-6F) {
@@ -5338,12 +5451,17 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
         const auto clampedIndex = std::min(laneIndex, laneCount - 1U);
         return (((static_cast<float>(clampedIndex) + 0.5F) / static_cast<float>(laneCount)) - 0.5F) * span;
     };
-    std::uint32_t streamId = 1U;
+    std::uint32_t trailId = 1U;
 
     for (std::size_t pathIndex = 0; pathIndex < paths.size(); ++pathIndex) {
         const auto& path = paths[pathIndex];
         const float pathLength = pathLengths[pathIndex];
         if (path.size() < 2U || pathLength <= 1.0e-5F) {
+            continue;
+        }
+        const std::uint32_t trailsForPath =
+            pathIndex < trailAllocations.size() ? trailAllocations[pathIndex] : 0U;
+        if (trailsForPath == 0U) {
             continue;
         }
         const auto routeStartIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
@@ -5353,10 +5471,6 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
             2U,
             static_cast<std::uint32_t>(std::ceil(pathLength / safeSpacing)) + 1U);
         const auto* analysisBranch = pathIndex < pathAnalyses.size() ? pathAnalyses[pathIndex] : nullptr;
-        const std::uint32_t streamsForPath = std::max<std::uint32_t>(
-            1U,
-            static_cast<std::uint32_t>(
-                std::round(static_cast<float>(requestedStreamCount) * (pathWeights[pathIndex] / totalWeight))));
         const auto branchId = static_cast<std::uint32_t>(
             std::max(0.0F, std::floor(path.front().flowId + 0.5F)));
         const auto sourceId = static_cast<std::uint32_t>(
@@ -5374,7 +5488,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
             tangent = glm::normalize(tangent);
             const auto localAnalysis = SampleLaneAnalysis(analysisBranch, routeDistance);
             const float localSpan =
-                LaneAnalysisSpan(localAnalysis, laneSpan, safeStreamWidth, analysisGuideInfluence);
+                LaneAnalysisSpan(localAnalysis, laneSpan, safeTrailWidth, analysisGuideInfluence);
             const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
             const float localSpeed = std::max(
                 0.01F,
@@ -5382,45 +5496,45 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                     ? speedMetersPerSecond * std::clamp(localAnalysis.speed, 0.10F, 8.0F)
                     : speedMetersPerSecond);
 
-            WaterStreamSample routeSample;
+            WaterTrailSample routeSample;
             routeSample.position = FromGlm(ToGlm(anchor.position) + normal * std::max(0.0F, surfaceOffsetMeters));
             routeSample.normal = FromGlm(normal);
             routeSample.tangent = FromGlm(tangent);
             routeSample.red = 0U;
             routeSample.green = 0U;
             routeSample.blue = 0U;
-            routeSample.streamId = 0.0F;
+            routeSample.trailId = 0.0F;
             routeSample.sourceId = static_cast<float>(sourceId);
             routeSample.pathId = static_cast<float>(pathIndex + 1U);
             routeSample.branchId = static_cast<float>(branchId);
-            routeSample.streamDistance = routeDistance;
-            routeSample.streamLength = safeLength;
-            routeSample.streamSpeed = localSpeed;
-            routeSample.streamWidth = std::max(0.0005F, streamWidthMeters);
-            routeSample.streamWorldLength = std::max(
-                routeSample.streamWidth * 2.0F,
-                std::max(streamWorldLengthMeters, safeSpacing * 2.5F));
-            routeSample.streamConfidence = std::clamp(anchor.confidence, 0.0F, 1.0F);
+            routeSample.trailDistance = routeDistance;
+            routeSample.trailLength = safeLength;
+            routeSample.trailSpeed = localSpeed;
+            routeSample.trailWidth = std::max(0.0005F, trailWidthMeters);
+            routeSample.trailStreakLength = std::max(
+                routeSample.trailWidth * 2.0F,
+                std::max(trailStreakLengthMeters, safeSpacing * 2.5F));
+            routeSample.trailConfidence = std::clamp(anchor.confidence, 0.0F, 1.0F);
             routeSample.wetness = std::clamp(0.35F + anchor.accumulation * 0.65F, 0.0F, 1.0F);
             routeSample.featureType = featureType;
-            routeSample.streamRole = 0.0F;
+            routeSample.trailRole = 0.0F;
             routeSample.routeStartIndex = static_cast<float>(routeStartIndex);
             routeSample.routePointCount = static_cast<float>(routePointCount);
             routeSample.routeLength = pathLength;
-            routeSample.streamStartPhase =
+            routeSample.trailStartPhase =
                 pathLength > 1.0e-5F ? std::clamp(routeDistance / pathLength, 0.0F, 1.0F) : 0.0F;
-            routeSample.streamLaneIndex = 0.0F;
-            routeSample.streamLaneCount = static_cast<float>(potentialLaneCount);
-            routeSample.streamLanePitch = localPitch;
-            routeSample.streamLaneSpan = localSpan;
-            routeSample.streamLaneCrossing = laneCrossingAmount;
-            routeSample.streamCrossSeed = RegionHash01(seed + branchId, routeIndex, 7029U);
-            IncludeStreamSample(&overlay, routeSample);
+            routeSample.trailLaneIndex = 0.0F;
+            routeSample.trailLaneCount = static_cast<float>(potentialLaneCount);
+            routeSample.trailLanePitch = localPitch;
+            routeSample.trailLaneSpan = localSpan;
+            routeSample.trailLaneCrossing = laneCrossingAmount;
+            routeSample.trailCrossSeed = RegionHash01(seed + branchId, routeIndex, 7029U);
+            IncludeTrailSample(&overlay, routeSample);
         }
 
-        for (std::uint32_t laneIndex = 0; laneIndex < streamsForPath && streamId <= requestedStreamCount; ++laneIndex, ++streamId) {
-            const float streamSeed = RegionHash01(seed + branchId, streamId, 7001U);
-            const float laneSeed = RegionHash01(seed + branchId, streamId, 7003U);
+        for (std::uint32_t laneIndex = 0; laneIndex < trailsForPath && trailId <= requestedTrailCount; ++laneIndex, ++trailId) {
+            const float trailSeed = RegionHash01(seed + branchId, trailId, 7001U);
+            const float laneSeed = RegionHash01(seed + branchId, trailId, 7003U);
             const std::uint32_t centerLaneLow = (potentialLaneCount - 1U) / 2U;
             const std::uint32_t centerLaneHigh = potentialLaneCount / 2U;
             const bool analysedRoute = analysisBranch != nullptr;
@@ -5437,16 +5551,20 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
             const float laneJitterAmplitude =
                 laneSpan <= 1.0e-6F ? 0.0F : std::min(lanePitch, laneCellWidth) * 0.18F;
             const float laneJitter =
-                (RegionHash01(seed + branchId, streamId, 7011U) - 0.5F) * 2.0F * laneJitterAmplitude;
+                (RegionHash01(seed + branchId, trailId, 7011U) - 0.5F) * 2.0F * laneJitterAmplitude;
             const float laneJitterUnit =
-                (RegionHash01(seed + branchId, streamId, 7011U) - 0.5F) *
+                (RegionHash01(seed + branchId, trailId, 7011U) - 0.5F) *
                 (potentialLaneCount > 1U ? 0.36F / static_cast<float>(potentialLaneCount) : 0.0F);
             const float laneOffset = baseLaneCenter + laneJitter;
-            const float streamCrossSeed = RegionHash01(seed + branchId, streamId, 7027U);
+            const float trailCrossSeed = RegionHash01(seed + branchId, trailId, 7027U);
             const float maxStart = std::max(0.0F, pathLength - safeLength);
-            const float startDistance = maxStart * RegionHash01(seed + branchId, streamId, 7009U);
-            const float speed = std::max(0.01F, speedMetersPerSecond * (0.72F + streamSeed * 0.58F));
-            for (std::uint32_t sampleIndex = 0; sampleIndex < samplesPerStream; ++sampleIndex) {
+            const float startJitter = RegionHash01(seed + branchId, trailId, 7009U);
+            const float startSlot =
+                (static_cast<float>(laneIndex) + startJitter) /
+                static_cast<float>(std::max<std::uint32_t>(1U, trailsForPath));
+            const float startDistance = maxStart * std::clamp(startSlot, 0.0F, 1.0F);
+            const float speed = std::max(0.01F, speedMetersPerSecond * (0.72F + trailSeed * 0.58F));
+            for (std::uint32_t sampleIndex = 0; sampleIndex < samplesPerTrail; ++sampleIndex) {
                 const float localDistance = std::min(
                     safeLength,
                     static_cast<float>(sampleIndex) * safeSpacing);
@@ -5469,7 +5587,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 const float pointAge = safeLength > 1.0e-5F ? localDistance / safeLength : 0.0F;
                 const auto localAnalysis = SampleLaneAnalysis(analysisBranch, pathDistance);
                 const float localSpan =
-                    LaneAnalysisSpan(localAnalysis, laneSpan, safeStreamWidth, analysisGuideInfluence);
+                    LaneAnalysisSpan(localAnalysis, laneSpan, safeTrailWidth, analysisGuideInfluence);
                 const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
                 const float localTurbulence =
                     localAnalysis.available
@@ -5479,7 +5597,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                               5.0F)
                         : std::max(0.0F, turbulence);
                 const float motionLooseness =
-                    std::clamp(streamLooseness +
+                    std::clamp(trailLooseness +
                                    (localAnalysis.ripplePotential * 0.28F +
                                     localAnalysis.eddyPotential * 0.20F) *
                                        analysisGuideInfluence,
@@ -5491,7 +5609,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                             analysisGuideInfluence,
                     0.12F,
                     1.0F);
-                const float smoothness = std::clamp(streamSmoothness, 0.0F, 1.0F);
+                const float smoothness = std::clamp(trailSmoothness, 0.0F, 1.0F);
                 const float dynamicBaseOffset =
                     localAnalysis.available
                         ? (baseLaneUnit + laneJitterUnit) * localSpan * (1.0F - attraction * 0.18F)
@@ -5499,20 +5617,20 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 const float wavePhase =
                     static_cast<float>(sampleIndex) *
                         (0.43F + localAnalysis.ripplePotential * 0.32F * analysisGuideInfluence) +
-                    streamSeed * 6.28318530718F +
+                    trailSeed * 6.28318530718F +
                     pathDistance * (1.7F + localAnalysis.curvature * 2.2F * analysisGuideInfluence);
                 const float wobbleAmplitude =
                     localAnalysis.available
                         ? localSpan * (0.015F + motionLooseness * 0.035F) *
                               (0.25F + localTurbulence +
                                localAnalysis.ripplePotential * 0.85F * analysisGuideInfluence)
-                        : std::min(lanePitch * 0.35F, safeStreamWidth * 0.20F) * localTurbulence;
+                        : std::min(lanePitch * 0.35F, safeTrailWidth * 0.20F) * localTurbulence;
                 const float wobble = std::sin(wavePhase) * wobbleAmplitude * (1.0F - smoothness * 0.45F);
                 const float curl =
                     localAnalysis.available
                         ? std::cos(
                               pathDistance * (2.1F + localAnalysis.eddyPotential * 4.0F) +
-                              streamCrossSeed * 6.28318530718F) *
+                              trailCrossSeed * 6.28318530718F) *
                               localSpan * 0.12F * localAnalysis.eddyPotential *
                               (0.35F + localTurbulence) * analysisGuideInfluence
                         : 0.0F;
@@ -5520,7 +5638,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                     localAnalysis.available
                         ? std::sin(
                               pointAge * 6.28318530718F +
-                              streamCrossSeed * 6.28318530718F) *
+                              trailCrossSeed * 6.28318530718F) *
                               localSpan * 0.10F * laneCrossingAmount *
                               std::max({localAnalysis.confluence, localAnalysis.ripplePotential, localTurbulence}) *
                               analysisGuideInfluence
@@ -5537,25 +5655,25 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                 position += lateral * lateralOffset;
                 position += normal * std::max(0.0F, surfaceOffsetMeters);
 
-                WaterStreamSample sample;
+                WaterTrailSample sample;
                 sample.position = FromGlm(position);
                 sample.normal = FromGlm(normal);
                 sample.tangent = FromGlm(tangent);
-                sample.red = featureType >= 3.0F ? StreamColorByte(0.06F + streamSeed * 0.10F)
-                                                  : StreamColorByte(0.04F + streamSeed * 0.12F);
-                sample.green = featureType >= 3.0F ? StreamColorByte(0.52F + pointAge * 0.26F)
-                                                    : StreamColorByte(0.68F + pointAge * 0.20F);
-                sample.blue = StreamColorByte(0.95F + streamSeed * 0.05F);
-                sample.streamId = static_cast<float>(streamId);
+                sample.red = featureType >= 3.0F ? TrailColorByte(0.06F + trailSeed * 0.10F)
+                                                  : TrailColorByte(0.04F + trailSeed * 0.12F);
+                sample.green = featureType >= 3.0F ? TrailColorByte(0.52F + pointAge * 0.26F)
+                                                    : TrailColorByte(0.68F + pointAge * 0.20F);
+                sample.blue = TrailColorByte(0.95F + trailSeed * 0.05F);
+                sample.trailId = static_cast<float>(trailId);
                 sample.sourceId = static_cast<float>(sourceId);
                 sample.pathId = static_cast<float>(pathIndex + 1U);
                 sample.branchId = static_cast<float>(branchId);
-                sample.streamSeed = streamSeed;
-                sample.pointSeed = RegionHash01(seed + branchId, streamId + sampleIndex, 7013U);
-                sample.streamDistance = localDistance;
-                sample.streamLength = safeLength;
+                sample.trailSeed = trailSeed;
+                sample.pointSeed = RegionHash01(seed + branchId, trailId + sampleIndex, 7013U);
+                sample.trailDistance = localDistance;
+                sample.trailLength = safeLength;
                 sample.pointAge = pointAge;
-                sample.streamAge = RegionHash01(seed + branchId, streamId, 7019U);
+                sample.trailAge = RegionHash01(seed + branchId, trailId, 7019U);
                 const float localSpeed =
                     localAnalysis.available
                         ? std::max(0.01F, speed * std::clamp(localAnalysis.speed, 0.10F, 8.0F))
@@ -5564,34 +5682,34 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
                     localAnalysis.available
                         ? std::clamp(
                               0.78F +
-                                  Clamp01(localSpan / std::max(0.001F, laneSpan + safeStreamWidth)) * 0.28F +
+                                  Clamp01(localSpan / std::max(0.001F, laneSpan + safeTrailWidth)) * 0.28F +
                                   localTurbulence * 0.16F,
                               0.55F,
                               1.85F)
                         : 1.0F;
-                sample.streamSpeed = localSpeed;
-                sample.streamWidth =
-                    std::max(0.0005F, streamWidthMeters * (0.80F + streamSeed * 0.42F) * localWidthFactor);
-                sample.streamWorldLength = std::max(
-                    sample.streamWidth * 2.0F,
-                    std::max(streamWorldLengthMeters, safeSpacing * 2.5F));
-                sample.streamConfidence = std::clamp(anchor.confidence * (0.72F + 0.28F * streamSeed), 0.0F, 1.0F);
+                sample.trailSpeed = localSpeed;
+                sample.trailWidth =
+                    std::max(0.0005F, trailWidthMeters * (0.80F + trailSeed * 0.42F) * localWidthFactor);
+                sample.trailStreakLength = std::max(
+                    sample.trailWidth * 2.0F,
+                    std::max(trailStreakLengthMeters, safeSpacing * 2.5F));
+                sample.trailConfidence = std::clamp(anchor.confidence * (0.72F + 0.28F * trailSeed), 0.0F, 1.0F);
                 sample.wetness = std::clamp(0.35F + anchor.accumulation * 0.65F, 0.0F, 1.0F);
                 sample.featureType = featureType;
-                sample.streamRole = 1.0F;
+                sample.trailRole = 1.0F;
                 sample.routeStartIndex = static_cast<float>(routeStartIndex);
                 sample.routePointCount = static_cast<float>(routePointCount);
                 sample.routeLength = pathLength;
-                sample.streamStartPhase =
+                sample.trailStartPhase =
                     pathLength > 1.0e-5F ? Fract01(startDistance / pathLength) : 0.0F;
-                sample.streamLateralOffset = lateralOffset;
-                sample.streamLaneIndex = static_cast<float>(baseLaneIndex);
-                sample.streamLaneCount = static_cast<float>(potentialLaneCount);
-                sample.streamLanePitch = localPitch;
-                sample.streamLaneSpan = localSpan;
-                sample.streamLaneCrossing = laneCrossingAmount;
-                sample.streamCrossSeed = streamCrossSeed;
-                IncludeStreamSample(&overlay, sample);
+                sample.trailLateralOffset = lateralOffset;
+                sample.trailLaneIndex = static_cast<float>(baseLaneIndex);
+                sample.trailLaneCount = static_cast<float>(potentialLaneCount);
+                sample.trailLanePitch = localPitch;
+                sample.trailLaneSpan = localSpan;
+                sample.trailLaneCrossing = laneCrossingAmount;
+                sample.trailCrossSeed = trailCrossSeed;
+                IncludeTrailSample(&overlay, sample);
             }
         }
     }
@@ -6255,7 +6373,7 @@ std::string WaterFieldSettingsFingerprint(const WaterFieldSettings& settings) {
     return stream.str();
 }
 
-WaterStreamOverlay BuildAnimatedWaterTrailOverlay(
+WaterTrailOverlay BuildAnimatedWaterTrailOverlay(
     const std::vector<WaterAnimatedTrailPath>& paths,
     const WaterAnimatedTrailBuildSettings& settings) {
     std::vector<std::vector<WaterOverlayPoint>> groupedPaths;
@@ -6265,36 +6383,36 @@ WaterStreamOverlay BuildAnimatedWaterTrailOverlay(
             groupedPaths.push_back(path.anchors);
         }
     }
-    return BuildStreamOverlayFromPaths(
+    return BuildTrailOverlayFromPaths(
         groupedPaths,
         settings.trailCountTotal,
         settings.trailLengthMeters,
         settings.trailPointSpacingMeters,
         settings.trailWidthMeters,
-        settings.trailWorldLengthMeters,
+        settings.trailStreakLengthMeters,
         settings.surfaceOffsetMeters,
         settings.laneSpreadMeters,
         settings.laneCount,
         settings.turbulence,
         settings.laneCrossing,
         settings.pathAttraction,
-        settings.streamSmoothness,
-        settings.streamLooseness,
+        settings.trailSmoothness,
+        settings.trailLooseness,
         settings.speedMetersPerSecond,
         settings.seed,
         settings.featureType,
         nullptr);
 }
 
-WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
-    const WaterFlowStreamSettings& settings) {
-    return BuildFlowStreamOverlayFromPathAnchors(pathAnchors, settings, nullptr);
+    const WaterFlowTrailSettings& settings) {
+    return BuildFlowTrailOverlayFromPathAnchors(pathAnchors, settings, nullptr);
 }
 
-WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
+WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
-    const WaterFlowStreamSettings& settings,
+    const WaterFlowTrailSettings& settings,
     const WaterPathAnalysisCache* analysis) {
     if (!settings.enabled) {
         return {};
@@ -6319,21 +6437,21 @@ WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
             flowPaths.push_back(path.anchors);
         }
     }
-    return BuildStreamOverlayFromPaths(
+    return BuildTrailOverlayFromPaths(
         flowPaths,
-        settings.streamCountTotal,
-        settings.streamLengthMeters,
-        settings.streamPointSpacingMeters,
-        settings.streamWidthMeters,
-        settings.streamWorldLengthMeters,
+        settings.trailCountTotal,
+        settings.trailLengthMeters,
+        settings.trailPointSpacingMeters,
+        settings.trailWidthMeters,
+        settings.trailStreakLengthMeters,
         settings.surfaceOffsetMeters,
         settings.laneSpreadMeters,
         settings.laneCount,
         settings.turbulence,
         settings.laneCrossing,
         settings.pathAttraction,
-        settings.streamSmoothness,
-        settings.streamLooseness,
+        settings.trailSmoothness,
+        settings.trailLooseness,
         settings.speedMetersPerSecond,
         settings.seed,
         0.0F,
@@ -6541,18 +6659,18 @@ WaterFieldCache BuildFieldCacheFromRegions(
     return cache;
 }
 
-void FilterVisibleStreamSamplesToRegionBoundary(
-    WaterStreamOverlay* overlay,
+void FilterVisibleTrailSamplesToRegionBoundary(
+    WaterTrailOverlay* overlay,
     const std::vector<invisible_places::io::Float3>& boundary) {
     if (overlay == nullptr || overlay->samples.empty() || boundary.size() < 3U) {
         return;
     }
 
-    WaterStreamOverlay filtered;
+    WaterTrailOverlay filtered;
     filtered.fieldDiagnostics = overlay->fieldDiagnostics;
     filtered.samples.reserve(overlay->samples.size());
     for (const auto& sample : overlay->samples) {
-        if (sample.streamRole >= 0.5F && !PointInPolygonXy(ToGlm(sample.position), boundary)) {
+        if (sample.trailRole >= 0.5F && !PointInPolygonXy(ToGlm(sample.position), boundary)) {
             continue;
         }
         filtered.bounds.Expand(sample.position);
@@ -6564,9 +6682,9 @@ void FilterVisibleStreamSamplesToRegionBoundary(
     *overlay = std::move(filtered);
 }
 
-WaterStreamOverlay BuildFieldStreamOverlay(
+WaterTrailOverlay BuildFieldTrailOverlay(
     const WaterFieldCache& fieldCache,
-    const WaterFieldStreamSettings& settings) {
+    const WaterFieldTrailSettings& settings) {
     if (!settings.enabled || fieldCache.nodes.size() < 2U) {
         return {};
     }
@@ -6574,7 +6692,7 @@ WaterStreamOverlay BuildFieldStreamOverlay(
     std::vector<WaterOverlayPoint> path;
     path.reserve(fieldCache.nodes.size());
     float distance = 0.0F;
-    WaterFieldStreamDiagnostics diagnostics;
+    WaterFieldTrailDiagnostics diagnostics;
     diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
         fieldCache.nodes.size(),
         static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
@@ -6679,11 +6797,11 @@ WaterStreamOverlay BuildFieldStreamOverlay(
     auto overlay = BuildAnimatedWaterTrailOverlay(
         animatedPaths,
         {
-            .trailCountTotal = settings.streamlineCount,
-            .trailLengthMeters = settings.streamlineLengthMeters,
-            .trailPointSpacingMeters = settings.stepLengthMeters,
-            .trailWidthMeters = settings.streamlineWidthMeters,
-            .trailWorldLengthMeters = settings.streamWorldLengthMeters,
+            .trailCountTotal = settings.trailCount,
+            .trailLengthMeters = settings.trailLengthMeters,
+            .trailPointSpacingMeters = settings.trailPointSpacingMeters,
+            .trailWidthMeters = settings.trailWidthMeters,
+            .trailStreakLengthMeters = settings.trailStreakLengthMeters,
             .surfaceOffsetMeters = fieldCache.settings.surfaceOffsetMeters,
             .laneSpreadMeters = std::max(settings.seedSpacingMeters, fieldCache.settings.corridorRadiusMeters * 0.30F),
             .turbulence = fieldCache.settings.turbulence,
@@ -6696,13 +6814,13 @@ WaterStreamOverlay BuildFieldStreamOverlay(
         overlay.samples.size(),
         static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
     overlay.fieldDiagnostics = diagnostics;
-    FilterVisibleStreamSamplesToRegionBoundary(&overlay, fieldCache.regionBoundary);
+    FilterVisibleTrailSamplesToRegionBoundary(&overlay, fieldCache.regionBoundary);
     return overlay;
 }
 
-WaterStreamOverlay BuildFieldStreamOverlay(
+WaterTrailOverlay BuildFieldTrailOverlay(
     const WaterFieldCache& fieldCache,
-    const WaterFieldStreamSettings& settings,
+    const WaterFieldTrailSettings& settings,
     const std::vector<WaterEmitter>& emitters) {
     if (!settings.enabled || fieldCache.nodes.size() < 2U) {
         return {};
@@ -6714,7 +6832,7 @@ WaterStreamOverlay BuildFieldStreamOverlay(
     };
     const float cellSize = std::max(
         std::max(0.003F, fieldCache.settings.fieldResolutionMeters),
-        std::max(0.003F, settings.stepLengthMeters) * 2.0F);
+        std::max(0.003F, settings.trailPointSpacingMeters) * 2.0F);
     std::unordered_map<GridKey, std::vector<std::uint32_t>, GridKeyHash> grid;
     grid.reserve(fieldCache.nodes.size());
     std::vector<IndexedNode> indexedNodes;
@@ -6732,7 +6850,7 @@ WaterStreamOverlay BuildFieldStreamOverlay(
         indexedNodes.push_back({.index = nodeIndex, .key = key});
     }
     if (indexedNodes.size() < 2U) {
-        return BuildFieldStreamOverlay(fieldCache, settings);
+        return BuildFieldTrailOverlay(fieldCache, settings);
     }
 
     auto nearestNode = [&](const glm::vec3& position, float radiusMeters) -> std::optional<std::uint32_t> {
@@ -6785,7 +6903,7 @@ WaterStreamOverlay BuildFieldStreamOverlay(
 
         const float searchRadius = std::max(
             fieldCache.settings.maxBridgeDistanceMeters,
-            std::max(settings.stepLengthMeters * 4.0F, fieldCache.settings.fieldResolutionMeters * 4.0F));
+            std::max(settings.trailPointSpacingMeters * 4.0F, fieldCache.settings.fieldResolutionMeters * 4.0F));
         const int cellRadius = std::clamp(
             static_cast<int>(std::ceil(searchRadius / cellSize)),
             1,
@@ -6851,10 +6969,10 @@ WaterStreamOverlay BuildFieldStreamOverlay(
         });
     }
     if (sources.empty()) {
-        return BuildFieldStreamOverlay(fieldCache, settings);
+        return BuildFieldTrailOverlay(fieldCache, settings);
     }
 
-    WaterFieldStreamDiagnostics diagnostics;
+    WaterFieldTrailDiagnostics diagnostics;
     diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
         fieldCache.nodes.size(),
         static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
@@ -6864,14 +6982,14 @@ WaterStreamOverlay BuildFieldStreamOverlay(
         fieldCache.settings.fieldResolutionMeters * (1.25F + fieldCache.settings.bridgeAggression * 4.0F));
     const float confidenceThreshold = std::clamp(fieldCache.settings.surfaceConfidenceThreshold, 0.0F, 1.0F);
     const std::uint32_t requestedPathCount = std::clamp<std::uint32_t>(
-        std::max<std::uint32_t>(1U, settings.streamlineCount / 4U),
+        std::max<std::uint32_t>(1U, settings.trailCount / 4U),
         1U,
         96U);
     const std::uint32_t maxSteps = std::max<std::uint32_t>(
         2U,
         static_cast<std::uint32_t>(
-            std::ceil(std::max(0.02F, settings.streamlineLengthMeters) /
-                      std::max(0.001F, settings.stepLengthMeters))) +
+            std::ceil(std::max(0.02F, settings.trailLengthMeters) /
+                      std::max(0.001F, settings.trailPointSpacingMeters))) +
             1U);
 
     std::vector<WaterAnimatedTrailPath> animatedPaths;
@@ -6990,11 +7108,11 @@ WaterStreamOverlay BuildFieldStreamOverlay(
     auto overlay = BuildAnimatedWaterTrailOverlay(
         animatedPaths,
         {
-            .trailCountTotal = settings.streamlineCount,
-            .trailLengthMeters = settings.streamlineLengthMeters,
-            .trailPointSpacingMeters = settings.stepLengthMeters,
-            .trailWidthMeters = settings.streamlineWidthMeters,
-            .trailWorldLengthMeters = settings.streamWorldLengthMeters,
+            .trailCountTotal = settings.trailCount,
+            .trailLengthMeters = settings.trailLengthMeters,
+            .trailPointSpacingMeters = settings.trailPointSpacingMeters,
+            .trailWidthMeters = settings.trailWidthMeters,
+            .trailStreakLengthMeters = settings.trailStreakLengthMeters,
             .surfaceOffsetMeters = fieldCache.settings.surfaceOffsetMeters,
             .laneSpreadMeters = std::max(settings.seedSpacingMeters, fieldCache.settings.corridorRadiusMeters * 0.30F),
             .turbulence = fieldCache.settings.turbulence,
@@ -7007,7 +7125,7 @@ WaterStreamOverlay BuildFieldStreamOverlay(
         overlay.samples.size(),
         static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
     overlay.fieldDiagnostics = diagnostics;
-    FilterVisibleStreamSamplesToRegionBoundary(&overlay, fieldCache.regionBoundary);
+    FilterVisibleTrailSamplesToRegionBoundary(&overlay, fieldCache.regionBoundary);
     return overlay;
 }
 
@@ -7723,8 +7841,8 @@ WaterEffectCompositionFields ComposeWaterEffectFields(
     return fields;
 }
 
-invisible_places::io::LoadedPointCloud BuildWaterStreamOverlayPointCloud(
-    const WaterStreamOverlay& overlay,
+invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
+    const WaterTrailOverlay& overlay,
     const std::filesystem::path& sourcePath,
     std::string_view layerName) {
     invisible_places::io::LoadedPointCloud cloud;
@@ -7754,42 +7872,42 @@ invisible_places::io::LoadedPointCloud BuildWaterStreamOverlayPointCloud(
         cloud.hasFocusPoint = true;
     }
 
-    struct StreamScalarField {
+    struct TrailScalarField {
         std::string_view name;
-        float (*value)(const WaterStreamSample&);
+        float (*value)(const WaterTrailSample&);
     };
-    const StreamScalarField fields[] = {
-        {"stream_role", [](const WaterStreamSample& sample) { return sample.streamRole; }},
-        {"stream_id", [](const WaterStreamSample& sample) { return sample.streamId; }},
-        {"source_id", [](const WaterStreamSample& sample) { return sample.sourceId; }},
-        {"path_id", [](const WaterStreamSample& sample) { return sample.pathId; }},
-        {"branch_id", [](const WaterStreamSample& sample) { return sample.branchId; }},
-        {"stream_seed", [](const WaterStreamSample& sample) { return sample.streamSeed; }},
-        {"point_seed", [](const WaterStreamSample& sample) { return sample.pointSeed; }},
-        {"stream_distance", [](const WaterStreamSample& sample) { return sample.streamDistance; }},
-        {"stream_length", [](const WaterStreamSample& sample) { return sample.streamLength; }},
-        {"route_start_index", [](const WaterStreamSample& sample) { return sample.routeStartIndex; }},
-        {"route_point_count", [](const WaterStreamSample& sample) { return sample.routePointCount; }},
-        {"route_length", [](const WaterStreamSample& sample) { return sample.routeLength; }},
-        {"stream_start_phase", [](const WaterStreamSample& sample) { return sample.streamStartPhase; }},
-        {"stream_lateral_offset", [](const WaterStreamSample& sample) { return sample.streamLateralOffset; }},
-        {"point_age", [](const WaterStreamSample& sample) { return sample.pointAge; }},
-        {"stream_age", [](const WaterStreamSample& sample) { return sample.streamAge; }},
-        {"stream_speed", [](const WaterStreamSample& sample) { return sample.streamSpeed; }},
-        {"stream_width", [](const WaterStreamSample& sample) { return sample.streamWidth; }},
-        {"stream_world_length", [](const WaterStreamSample& sample) { return sample.streamWorldLength; }},
-        {"stream_confidence", [](const WaterStreamSample& sample) { return sample.streamConfidence; }},
-        {"wetness", [](const WaterStreamSample& sample) { return sample.wetness; }},
-        {"feature_type", [](const WaterStreamSample& sample) { return sample.featureType; }},
-        {"tangent_x", [](const WaterStreamSample& sample) { return sample.tangent.x; }},
-        {"tangent_y", [](const WaterStreamSample& sample) { return sample.tangent.y; }},
-        {"tangent_z", [](const WaterStreamSample& sample) { return sample.tangent.z; }},
-        {"stream_lane_index", [](const WaterStreamSample& sample) { return sample.streamLaneIndex; }},
-        {"stream_lane_count", [](const WaterStreamSample& sample) { return sample.streamLaneCount; }},
-        {"stream_lane_pitch", [](const WaterStreamSample& sample) { return sample.streamLanePitch; }},
-        {"stream_lane_span", [](const WaterStreamSample& sample) { return sample.streamLaneSpan; }},
-        {"stream_lane_crossing", [](const WaterStreamSample& sample) { return sample.streamLaneCrossing; }},
-        {"stream_cross_seed", [](const WaterStreamSample& sample) { return sample.streamCrossSeed; }},
+    const TrailScalarField fields[] = {
+        {"trail_role", [](const WaterTrailSample& sample) { return sample.trailRole; }},
+        {"trail_id", [](const WaterTrailSample& sample) { return sample.trailId; }},
+        {"source_id", [](const WaterTrailSample& sample) { return sample.sourceId; }},
+        {"path_id", [](const WaterTrailSample& sample) { return sample.pathId; }},
+        {"branch_id", [](const WaterTrailSample& sample) { return sample.branchId; }},
+        {"trail_seed", [](const WaterTrailSample& sample) { return sample.trailSeed; }},
+        {"point_seed", [](const WaterTrailSample& sample) { return sample.pointSeed; }},
+        {"trail_distance", [](const WaterTrailSample& sample) { return sample.trailDistance; }},
+        {"trail_length", [](const WaterTrailSample& sample) { return sample.trailLength; }},
+        {"route_start_index", [](const WaterTrailSample& sample) { return sample.routeStartIndex; }},
+        {"route_point_count", [](const WaterTrailSample& sample) { return sample.routePointCount; }},
+        {"route_length", [](const WaterTrailSample& sample) { return sample.routeLength; }},
+        {"trail_start_phase", [](const WaterTrailSample& sample) { return sample.trailStartPhase; }},
+        {"trail_lateral_offset", [](const WaterTrailSample& sample) { return sample.trailLateralOffset; }},
+        {"point_age", [](const WaterTrailSample& sample) { return sample.pointAge; }},
+        {"trail_age", [](const WaterTrailSample& sample) { return sample.trailAge; }},
+        {"trail_speed", [](const WaterTrailSample& sample) { return sample.trailSpeed; }},
+        {"trail_width", [](const WaterTrailSample& sample) { return sample.trailWidth; }},
+        {"trail_streak_length", [](const WaterTrailSample& sample) { return sample.trailStreakLength; }},
+        {"trail_confidence", [](const WaterTrailSample& sample) { return sample.trailConfidence; }},
+        {"wetness", [](const WaterTrailSample& sample) { return sample.wetness; }},
+        {"feature_type", [](const WaterTrailSample& sample) { return sample.featureType; }},
+        {"tangent_x", [](const WaterTrailSample& sample) { return sample.tangent.x; }},
+        {"tangent_y", [](const WaterTrailSample& sample) { return sample.tangent.y; }},
+        {"tangent_z", [](const WaterTrailSample& sample) { return sample.tangent.z; }},
+        {"trail_lane_index", [](const WaterTrailSample& sample) { return sample.trailLaneIndex; }},
+        {"trail_lane_count", [](const WaterTrailSample& sample) { return sample.trailLaneCount; }},
+        {"trail_lane_pitch", [](const WaterTrailSample& sample) { return sample.trailLanePitch; }},
+        {"trail_lane_span", [](const WaterTrailSample& sample) { return sample.trailLaneSpan; }},
+        {"trail_lane_crossing", [](const WaterTrailSample& sample) { return sample.trailLaneCrossing; }},
+        {"trail_cross_seed", [](const WaterTrailSample& sample) { return sample.trailCrossSeed; }},
     };
 
     cloud.scalarFields.reserve(std::size(fields));
