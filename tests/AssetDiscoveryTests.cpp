@@ -1275,6 +1275,41 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     trailProfile.settings.trailLengthMeters = 2.4F;
     trailProfile.settings.trailSampleSpacingMeters = 0.022F;
     document.waterAnimationTrailProfiles.push_back(trailProfile);
+    document.waterTrailGeometry.trailLengthMeters = 1.65F;
+    document.waterTrailGeometry.pointSpacingMeters = 0.033F;
+    document.waterTrailGeometry.widthMeters = 0.014F;
+    document.waterTrailGeometry.worldLengthMeters = 0.095F;
+    invisible_places::serialization::WaterPathProfileDocument pathProfile;
+    pathProfile.name = "Shelf Path";
+    pathProfile.settings = document.waterSourceSettings.path;
+    pathProfile.settings.pathLength = 7.5F;
+    pathProfile.settings.smoothing = 0.41F;
+    document.waterPathProfiles.push_back(pathProfile);
+    invisible_places::serialization::WaterLaneProfileDocument laneProfile;
+    laneProfile.name = "Braided Custom";
+    laneProfile.settings = document.waterFlowStreamSettings;
+    laneProfile.settings.streamCountTotal = 1234U;
+    laneProfile.settings.laneCount = 9U;
+    laneProfile.settings.laneSpreadMeters = 0.42F;
+    laneProfile.settings.laneCrossing = 0.57F;
+    document.waterLaneProfiles.push_back(laneProfile);
+    invisible_places::serialization::WaterTrailProfileDocument flowTrailProfile;
+    flowTrailProfile.name = "Silver Trail";
+    flowTrailProfile.geometry = document.waterTrailGeometry;
+    flowTrailProfile.geometry.widthMeters = 0.021F;
+    flowTrailProfile.geometry.worldLengthMeters = 0.13F;
+    invisible_places::style::SetScalarConstant(&flowTrailProfile.style.opacity, 0.39F);
+    invisible_places::style::SetScalarConstant(&flowTrailProfile.style.emissiveStrength, 1.7F);
+    document.waterTrailProfiles.push_back(flowTrailProfile);
+    document.selectedWaterPathProfileName = "Shelf Path_edited";
+    document.tempWaterPathProfileSettings = pathProfile.settings;
+    document.tempWaterPathProfileSettings->pathLength = 8.25F;
+    document.selectedWaterLaneProfileName = "Braided Custom_edited";
+    document.tempWaterLaneProfileSettings = laneProfile.settings;
+    document.tempWaterLaneProfileSettings->speedMetersPerSecond = 0.91F;
+    document.selectedWaterTrailProfileName = "Silver Trail_edited";
+    document.tempWaterTrailProfile = flowTrailProfile;
+    document.tempWaterTrailProfile->geometry.trailLengthMeters = 2.05F;
     invisible_places::renderer::pointcloud::PointCloudStyleState waterVisualStyle;
     invisible_places::style::SetScalarConstant(&waterVisualStyle.pointSize, 22.0F);
     invisible_places::style::SetScalarConstant(&waterVisualStyle.opacity, 0.42F);
@@ -1312,6 +1347,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     waterEmitter.origin = invisible_places::water::WaterEmitterOrigin::Manual;
     waterEmitter.status = invisible_places::water::WaterEmitterStatus::Accepted;
     waterEmitter.confidence = 0.92F;
+    waterEmitter.pathProfileName = "Shelf Path";
+    waterEmitter.laneProfileName = "Braided Custom";
+    waterEmitter.trailProfileName = "Silver Trail";
     document.waterEmitters.push_back(waterEmitter);
     invisible_places::water::WaterPathCache projectPathCache;
     projectPathCache.supportLayerPath = "Data/Site2 -5mm.ply";
@@ -1537,6 +1575,19 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"water_animation_trail_profiles\"") != std::string::npos);
         CHECK(savedJson.find("\"Custom Bright Ribbons\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_animation_trail_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_trail_geometry\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_path_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_lane_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_trail_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_path_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_lane_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_trail_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_path_profile_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_lane_profile_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_trail_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"path_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"lane_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_profile\"") != std::string::npos);
         CHECK(savedJson.find("\"water_streak_aspect\"") != std::string::npos);
         CHECK(savedJson.find("\"water_point_visuals\"") != std::string::npos);
         CHECK(savedJson.find("\"selected_water_point_visual\"") != std::string::npos);
@@ -1553,6 +1604,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"field_surface_motion\"") != std::string::npos);
         CHECK(savedJson.find("\"caustic_lace\"") != std::string::npos);
         CHECK(savedJson.find("\"water_flow_stream_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"lane_count\"") != std::string::npos);
         CHECK(savedJson.find("\"water_field_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_field_stream_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
@@ -1590,7 +1642,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"selected_point_visual\"") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"saved_animations\"") != std::string::npos);
-        CHECK(savedJson.find("\"schema_version\": 24") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 25") != std::string::npos);
         CHECK(savedJson.find("\"id\": \"camera_entry\"") != std::string::npos);
         CHECK(savedJson.find("\"duration_frames\": 120") == std::string::npos);
     }
@@ -1637,6 +1689,34 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterAnimationTrailProfiles[0].settings.particleDensity == Catch::Approx(2.6F));
     CHECK(loadedDocument->waterAnimationTrailProfiles[0].settings.trailLengthMeters == Catch::Approx(2.4F));
     CHECK(loadedDocument->waterAnimationTrailProfiles[0].settings.trailSampleSpacingMeters == Catch::Approx(0.022F));
+    CHECK(loadedDocument->waterTrailGeometry.trailLengthMeters == Catch::Approx(1.65F));
+    CHECK(loadedDocument->waterTrailGeometry.pointSpacingMeters == Catch::Approx(0.033F));
+    CHECK(loadedDocument->waterTrailGeometry.widthMeters == Catch::Approx(0.014F));
+    CHECK(loadedDocument->waterTrailGeometry.worldLengthMeters == Catch::Approx(0.095F));
+    REQUIRE(loadedDocument->waterPathProfiles.size() == 1U);
+    CHECK(loadedDocument->waterPathProfiles[0].name == "Shelf Path");
+    CHECK(loadedDocument->waterPathProfiles[0].settings.pathLength == Catch::Approx(7.5F));
+    CHECK(loadedDocument->waterPathProfiles[0].settings.smoothing == Catch::Approx(0.41F));
+    REQUIRE(loadedDocument->waterLaneProfiles.size() == 1U);
+    CHECK(loadedDocument->waterLaneProfiles[0].name == "Braided Custom");
+    CHECK(loadedDocument->waterLaneProfiles[0].settings.streamCountTotal == 1234U);
+    CHECK(loadedDocument->waterLaneProfiles[0].settings.laneCount == 9U);
+    CHECK(loadedDocument->waterLaneProfiles[0].settings.laneSpreadMeters == Catch::Approx(0.42F));
+    REQUIRE(loadedDocument->waterTrailProfiles.size() == 1U);
+    CHECK(loadedDocument->waterTrailProfiles[0].name == "Silver Trail");
+    CHECK(loadedDocument->waterTrailProfiles[0].geometry.widthMeters == Catch::Approx(0.021F));
+    CHECK(loadedDocument->waterTrailProfiles[0].geometry.worldLengthMeters == Catch::Approx(0.13F));
+    CHECK(invisible_places::style::ScalarConstant(loadedDocument->waterTrailProfiles[0].style.opacity) ==
+          Catch::Approx(0.39F));
+    CHECK(loadedDocument->selectedWaterPathProfileName == "Shelf Path_edited");
+    CHECK(loadedDocument->selectedWaterLaneProfileName == "Braided Custom_edited");
+    CHECK(loadedDocument->selectedWaterTrailProfileName == "Silver Trail_edited");
+    REQUIRE(loadedDocument->tempWaterPathProfileSettings.has_value());
+    CHECK(loadedDocument->tempWaterPathProfileSettings->pathLength == Catch::Approx(8.25F));
+    REQUIRE(loadedDocument->tempWaterLaneProfileSettings.has_value());
+    CHECK(loadedDocument->tempWaterLaneProfileSettings->speedMetersPerSecond == Catch::Approx(0.91F));
+    REQUIRE(loadedDocument->tempWaterTrailProfile.has_value());
+    CHECK(loadedDocument->tempWaterTrailProfile->geometry.trailLengthMeters == Catch::Approx(2.05F));
     CHECK(loadedDocument->selectedWaterPointVisualName == "River Threads");
     REQUIRE(loadedDocument->waterPointVisuals.size() == 1U);
     CHECK(loadedDocument->waterPointVisuals[0].name == "River Threads");
@@ -1677,6 +1757,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(
         loadedDocument->waterEmitters[0].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::Default);
+    CHECK(loadedDocument->waterEmitters[0].pathProfileName == "Shelf Path");
+    CHECK(loadedDocument->waterEmitters[0].laneProfileName == "Braided Custom");
+    CHECK(loadedDocument->waterEmitters[0].trailProfileName == "Silver Trail");
     REQUIRE(loadedDocument->waterPathCache.has_value());
     CHECK(loadedDocument->waterPathCache->supportLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
     CHECK(loadedDocument->waterPathCache->supportSignature == "Data/Site2 -5mm.ply|points=2048");
@@ -2802,6 +2885,7 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
     streamSettings.streamWidthMeters = 0.012F;
     streamSettings.streamWorldLengthMeters = 0.050F;
     streamSettings.laneSpreadMeters = 0.04F;
+    streamSettings.laneCount = 4U;
     streamSettings.laneCrossing = 0.37F;
     streamSettings.turbulence = 0.03F;
     streamSettings.seed = 123U;
@@ -2816,7 +2900,7 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
     const auto cloud = invisible_places::water::BuildWaterStreamOverlayPointCloud(
         flowA,
         "Saved/water/test-WaterFlowStreams.generated",
-        "flow streams");
+        "flow trails");
     const std::vector<std::string> expectedFields{
         "stream_role",
         "stream_id",
@@ -2887,9 +2971,7 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
     CHECK(firstVisibleSample->streamConfidence >= 0.0F);
     CHECK(firstVisibleSample->streamConfidence <= 1.0F);
     const float expectedLanePitch = std::max(streamSettings.streamWidthMeters * 0.5F, 0.00025F);
-    const auto expectedLaneCount = static_cast<std::uint32_t>(std::max<float>(
-        1.0F,
-        std::ceil(streamSettings.laneSpreadMeters / expectedLanePitch)));
+    const auto expectedLaneCount = streamSettings.laneCount;
     const auto expectedCenterLaneLow = (expectedLaneCount - 1U) / 2U;
     const auto expectedCenterLaneHigh = expectedLaneCount / 2U;
     CHECK(firstVisibleSample->streamLaneIndex >= 0.0F);
@@ -2903,7 +2985,8 @@ TEST_CASE("Water v2 streams expose deterministic scalar contracts", "[water][v2]
     CHECK(firstVisibleSample->streamCrossSeed >= 0.0F);
     CHECK(firstVisibleSample->streamCrossSeed <= 1.0F);
     CHECK(std::abs(firstVisibleSample->streamLateralOffset) <= (streamSettings.laneSpreadMeters * 0.5F) + 0.002F);
-    CHECK(streamSettings.laneSpreadMeters / static_cast<float>(expectedLaneCount) <= expectedLanePitch + 1.0e-5F);
+    CHECK(expectedLaneCount < static_cast<std::uint32_t>(
+        std::ceil(streamSettings.laneSpreadMeters / expectedLanePitch)));
 
     const float firstStreamWidth = cloud.scalarFieldValues[
         cloud.ScalarFieldValueIndex(17, firstVisibleIndex)];
@@ -5807,6 +5890,37 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.settings.trail.splineAnchorSpacing = document.sourceSettings.trailShape.splineAnchorSpacing;
     document.bakeSettings = document.sourceSettings.path;
     document.renderSettings = document.settings;
+    document.trailGeometry.trailLengthMeters = 1.25F;
+    document.trailGeometry.pointSpacingMeters = 0.044F;
+    document.trailGeometry.widthMeters = 0.018F;
+    document.trailGeometry.worldLengthMeters = 0.12F;
+    invisible_places::serialization::WaterPathProfileDocument sourcePathProfile;
+    sourcePathProfile.name = "Source Path";
+    sourcePathProfile.settings = document.sourceSettings.path;
+    sourcePathProfile.settings.pathLength = 12.5F;
+    document.pathProfiles.push_back(sourcePathProfile);
+    invisible_places::serialization::WaterLaneProfileDocument sourceLaneProfile;
+    sourceLaneProfile.name = "Sheet Lanes";
+    sourceLaneProfile.settings = document.flowStreamSettings;
+    sourceLaneProfile.settings.streamCountTotal = 777U;
+    sourceLaneProfile.settings.laneCount = 13U;
+    sourceLaneProfile.settings.turbulence = 0.42F;
+    document.laneProfiles.push_back(sourceLaneProfile);
+    invisible_places::serialization::WaterTrailProfileDocument sourceTrailProfile;
+    sourceTrailProfile.name = "Mist Trail";
+    sourceTrailProfile.geometry = document.trailGeometry;
+    sourceTrailProfile.geometry.trailLengthMeters = 2.2F;
+    invisible_places::style::SetScalarConstant(&sourceTrailProfile.style.opacity, 0.27F);
+    document.trailProfiles.push_back(sourceTrailProfile);
+    document.selectedPathProfileName = "Source Path_edited";
+    document.tempPathProfileSettings = sourcePathProfile.settings;
+    document.tempPathProfileSettings->coverage = 0.88F;
+    document.selectedLaneProfileName = "Sheet Lanes_edited";
+    document.tempLaneProfileSettings = sourceLaneProfile.settings;
+    document.tempLaneProfileSettings->laneCrossing = 0.63F;
+    document.selectedTrailProfileName = "Mist Trail_edited";
+    document.tempTrailProfile = sourceTrailProfile;
+    document.tempTrailProfile->geometry.widthMeters = 0.033F;
 
     invisible_places::water::WaterEmitter emitter;
     emitter.id = 42;
@@ -5823,6 +5937,9 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     emitter.tempSourceSettings = emitter.sourceSettings;
     emitter.tempSourceSettings->trailShape.particleJitter = 1.2F;
     emitter.tempSourceSettings->trailShape.trailMomentum = 0.31F;
+    emitter.pathProfileName = "Source Path";
+    emitter.laneProfileName = "Sheet Lanes";
+    emitter.trailProfileName = "Mist Trail";
     document.emitters.push_back(emitter);
 
     invisible_places::water::WaterEmitter linkedEmitter;
@@ -5915,11 +6032,24 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedSources},
             std::istreambuf_iterator<char>{}};
-        CHECK(savedJson.find("\"schema_version\": 6") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 7") != std::string::npos);
         CHECK(savedJson.find("\"water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_source_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_trail_geometry\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_path_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_lane_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_trail_profiles\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_path_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_lane_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"selected_water_trail_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_path_profile_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_lane_profile_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"temp_water_trail_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"path_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"lane_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_profile\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_lane_count\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_smoothness\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_turbulence\"") != std::string::npos);
@@ -5960,6 +6090,32 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->sourceSettings.trailShape.trailSmoothness == Catch::Approx(0.82F));
     CHECK(loaded->settings.path.maxBridgeDistance == Catch::Approx(6.5F));
     CHECK(loaded->settings.trail.particleJitter == Catch::Approx(0.72F));
+    CHECK(loaded->trailGeometry.trailLengthMeters == Catch::Approx(1.25F));
+    CHECK(loaded->trailGeometry.pointSpacingMeters == Catch::Approx(0.044F));
+    CHECK(loaded->trailGeometry.widthMeters == Catch::Approx(0.018F));
+    CHECK(loaded->trailGeometry.worldLengthMeters == Catch::Approx(0.12F));
+    REQUIRE(loaded->pathProfiles.size() == 1U);
+    CHECK(loaded->pathProfiles[0].name == "Source Path");
+    CHECK(loaded->pathProfiles[0].settings.pathLength == Catch::Approx(12.5F));
+    REQUIRE(loaded->laneProfiles.size() == 1U);
+    CHECK(loaded->laneProfiles[0].name == "Sheet Lanes");
+    CHECK(loaded->laneProfiles[0].settings.streamCountTotal == 777U);
+    CHECK(loaded->laneProfiles[0].settings.laneCount == 13U);
+    CHECK(loaded->laneProfiles[0].settings.turbulence == Catch::Approx(0.42F));
+    REQUIRE(loaded->trailProfiles.size() == 1U);
+    CHECK(loaded->trailProfiles[0].name == "Mist Trail");
+    CHECK(loaded->trailProfiles[0].geometry.trailLengthMeters == Catch::Approx(2.2F));
+    CHECK(invisible_places::style::ScalarConstant(loaded->trailProfiles[0].style.opacity) ==
+          Catch::Approx(0.27F));
+    CHECK(loaded->selectedPathProfileName == "Source Path_edited");
+    CHECK(loaded->selectedLaneProfileName == "Sheet Lanes_edited");
+    CHECK(loaded->selectedTrailProfileName == "Mist Trail_edited");
+    REQUIRE(loaded->tempPathProfileSettings.has_value());
+    CHECK(loaded->tempPathProfileSettings->coverage == Catch::Approx(0.88F));
+    REQUIRE(loaded->tempLaneProfileSettings.has_value());
+    CHECK(loaded->tempLaneProfileSettings->laneCrossing == Catch::Approx(0.63F));
+    REQUIRE(loaded->tempTrailProfile.has_value());
+    CHECK(loaded->tempTrailProfile->geometry.widthMeters == Catch::Approx(0.033F));
     REQUIRE(loaded->tempSourceSettings.has_value());
     CHECK(loaded->tempSourceSettings->trailShape.particleJitter == Catch::Approx(1.05F));
     CHECK(loaded->tempSourceSettings->trailShape.trailLaneCount == 8U);
@@ -5971,6 +6127,9 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(
         loaded->emitters[0].sourceSettingsAssignment ==
         invisible_places::water::WaterSourceSettingsAssignment::Custom);
+    CHECK(loaded->emitters[0].pathProfileName == "Source Path");
+    CHECK(loaded->emitters[0].laneProfileName == "Sheet Lanes");
+    CHECK(loaded->emitters[0].trailProfileName == "Mist Trail");
     REQUIRE(loaded->emitters[0].parentId.has_value());
     CHECK(loaded->emitters[0].parentId.value() == 7U);
     REQUIRE(loaded->emitters[0].sourceSettings.has_value());

@@ -26,19 +26,19 @@ This document describes the implemented project surface for future edits. Eviden
 - Ripple and Field regions use the authored clicked polygon boundary for containment, so concave regions preserve their cut-out areas.
 - Ripple and Field share one region-selection path that exposes selected base point indices, edge weights, normals, scalar values, field vectors, and manual control flags.
 - Flow path cache reuse, hidden branch IDs, smoothing refresh, and support-layer signatures are part of the saved/reloaded water workflow.
-- Flow Streams animate from stream age, seed, speed, wetness, confidence, width, and render time. Playback changes do not require topology regeneration.
+- Flow Lanes animate Trail points from stream age, seed, speed, wetness, confidence, width, and render time. Playback changes do not require topology regeneration; internal `stream_*` scalar names remain the renderer contract.
 - Field supports user-defined Surface Motion, No Flow, Bridge Allowed, and Bridge Blocked regions.
 - Region-built Field vector caches are saved under `Saved/water/<source-stem>-WaterFieldCache.bin` and reused when support, settings, and region fingerprints match. Path-anchor Field caches are currently rebuilt from Flow path anchors and kept in memory.
-- Flow and Field Streamlines share the animated stream trail visualization schema; Flow follows path anchors while Field follows cached vector-field integration from perturbed source points.
+- Flow trails and Field Streamlines share the animated `stream_*` scalar schema; Flow follows path anchors through Lane profiles while Field follows cached vector-field integration from perturbed source points.
 - Field streamlines stay surface-bound, split rejected gaps, fade low-confidence support when configured, and report accepted bridge, rejected gap, fade, termination, and manual control diagnostics.
-- Viewport rendering, EXR export, and MP4 preview conversion include sparse Ripple runtime effects, water streams, and active-cloud Field Surface Motion output without requiring water PLY export.
+- Viewport rendering, EXR export, and MP4 preview conversion include sparse Ripple runtime effects, Flow Trails, and active-cloud Field Surface Motion output without requiring water PLY export.
 - Field Surface Motion is a candidate for the same optimization pattern as Ripples: region-bounded support, shader/offline procedural evaluation, and parameter-only updates instead of dense base-cloud field uploads when only visual settings change.
 
 ## Serialization
 
-- Project serialization uses schema version 24 for the current project shape.
-- Project documents persist Water v2 emitters, Ripple layers, Field layers, Flow stream settings, Field settings, Field stream settings, water visuals, and water path cache data.
-- Project documents also preserve water animation trail settings/profiles and caustic look settings for animation and legacy visual compatibility.
+- Project serialization uses schema version 25 for the current project shape.
+- Project documents persist Water v2 emitters, Ripple layers, Field layers, Flow Path/Lanes/Trail profiles, Field settings, Field stream settings, base-cloud water visuals, and water path cache data.
+- Project documents also preserve water animation trail settings/profiles and caustic look settings for legacy animation and visual compatibility.
 - Standalone water-source documents persist the same active Water v2 surface needed to reload sources independently from projects.
 - Animation paths preserve water caustic look settings for current visual style compatibility.
 - Generated/effect water output is treated as derived data and is not stored as normal project source layers.

@@ -43,12 +43,12 @@ Implemented in the current repository:
 
 - `emitters`, `defaultSourceSettings`, `tempDefaultSourceSettings`, and per-emitter settings for Flow path generation.
 - `pathCache`, `pathAnchors`, path revisions, dirty flags, and hidden branch IDs for reusable Flow paths.
-- `flowStreamSettings` and `flowStreamOverlay` for generated Flow Streams.
+- Path/Lanes/Trail profiles plus `flowStreamOverlay` for generated Flow trails. Internal `stream_*` names are retained for renderer/offline compatibility.
 - `rippleLayers` plus sparse runtime memberships/params for current Ripple evaluation. `rippleEffectOverlay` is kept as selected-region debug/evidence data, not as a generated visible Ripple layer.
 - `fieldSettings`, `fieldStreamSettings`, `fieldCache`, `fieldStreamOverlay`, and `fieldSurfaceEffectOverlay` for Field.
 - `activeRegionFeature`, `regionEditor`, and placement flags for editable Ripple regions and legacy-safe region editing.
 
-Generated water overlay sessions are excluded from support-layer discovery. They are renderable water output, not source LiDAR layers for future water bakes. Ripples no longer create active visible `-Ripples.generated` sessions; their region membership and procedural params are uploaded to the base-cloud renderer instead. Field Surface Motion contributes to active/base cloud composition through `water_effect_*` fields, while Flow and Field Streamlines remain generated stream overlay sessions.
+Generated water overlay sessions are excluded from support-layer discovery and from base-cloud look-dev/export visual selection. They are renderable water output, not source LiDAR layers for future water bakes. Ripples no longer create active visible `-Ripples.generated` sessions; their region membership and procedural params are uploaded to the base-cloud renderer instead. Field Surface Motion contributes to active/base cloud composition through `water_effect_*` fields, while Flow trails and Field Streamlines remain generated overlay sessions.
 
 ## Active UI Contract
 
@@ -70,16 +70,19 @@ Animation Trail Playback
 legacy trail particle controls
 ```
 
-Flow still exposes path baking, branch hiding, source/path settings, and stream controls. Ripples exposes region/layer controls and procedural overlay settings. Field exposes field build settings, stream settings, surface-motion output controls, and user-authored Field regions.
+Flow exposes path baking, branch hiding, source profile assignments, Lanes controls, and Trail styling. Ripples exposes region/layer controls and procedural overlay settings. Field exposes field build settings, stream settings, surface-motion output controls, and user-authored Field regions.
 
 ## Serialization Contract
 
-Project documents now use schema `24`. New saves write the v2 water keys:
+Project documents now use schema `25`. New saves write the v2 water keys:
 
 ```text
 water_emitters
 water_source_settings
 water_path_cache
+water_path_profiles
+water_lane_profiles
+water_trail_profiles
 water_ripple_layers
 water_field_layers
 water_flow_stream_settings
@@ -87,7 +90,7 @@ water_field_settings
 water_field_stream_settings
 ```
 
-Project saves also preserve `water_animation_trail_settings`, `water_animation_trail_profiles`, and caustic look settings for animation/legacy visual compatibility, even though those are no longer standalone Water tabs.
+Project saves also preserve `water_animation_trail_settings`, `water_animation_trail_profiles`, and caustic look settings for legacy animation/visual compatibility, even though those are no longer standalone Water tabs.
 
 `water_sources.json` mirrors the active source/layer/settings subset for reusable water setup, including the same Ripple/Flow/Field settings and the current Flow path cache when available.
 
@@ -142,19 +145,19 @@ Changing a complete Ripple layer region refreshes sparse base-cloud membership. 
 
 ## Flow
 
-Flow keeps the existing path bake model:
+Flow now exposes three profile-backed setting areas: Path, Lanes, and Trail. Flow keeps the existing path bake model:
 
 1. Emitters and source/path settings define bake inputs.
 2. `GenerateWaterPathCache` creates or refreshes `WaterPathCache`.
 3. `BuildWaterPathAnchorsFromCache` rebuilds visible anchors and applies hidden branch IDs.
-4. `BuildFlowStreamOverlayFromPathAnchors` converts path anchors into shared animated trail paths and generates deterministic stream surfels.
-5. `BuildWaterStreamOverlayPointCloud` exposes the generated stream as an in-memory point-cloud session.
+4. `BuildFlowStreamOverlayFromPathAnchors` converts path anchors into shared animated trail paths and generates deterministic trail surfels with legacy `stream_*` scalar names.
+5. `BuildWaterStreamOverlayPointCloud` exposes generated trails as in-memory point-cloud sessions grouped by resolved Trail profile.
 
-Path-affecting changes dirty the path cache. Stream visual/settings changes, such as stream count, width, length, spacing, turbulence, and speed, refresh the stream overlay without dirtying the path cache.
+Path-affecting changes dirty the path cache. Lane changes such as trail count, lane count, coverage width, crossing, turbulence, and speed refresh from existing anchors without dirtying the path cache. Trail geometry changes regenerate generated trail samples when needed; Trail colour, opacity, and emission are owned by Water > Flow, not the Visuals tab.
 
-Flow Streams replace legacy trail particles as the primary visible water output. The old generated water PLY workflow is no longer required for viewport, EXR, or MP4 water visuals.
+Flow trails replace legacy trail particles as the primary visible water output. The old generated water PLY workflow is no longer required for viewport, EXR, or MP4 water visuals.
 
-Flow stream geometry stays static while shader/offline playback derives animated age from `point_age`, `point_seed`, `stream_speed`, and render time. Opacity, emission, and colour energy can change over time without rebaking paths or regenerating topology.
+Flow Trail geometry stays static while shader/offline playback derives animated age from `point_age`, `point_seed`, `stream_speed`, and render time. Opacity, emission, and colour energy can change over time without rebaking paths or regenerating topology.
 
 ## Field
 
@@ -176,7 +179,7 @@ Field should continue moving toward the Ripple performance pattern where practic
 
 ## Stream Surfel Scalar Contract
 
-Generated Flow Streams and Field Streamlines must expose these scalar fields in this order:
+Generated Flow trails and Field Streamlines must expose these scalar fields in this order:
 
 ```text
 stream_role
@@ -277,10 +280,10 @@ Use these checks after water feature changes:
 
 - Serialization: new saves include Ripple/Flow/Field keys and omit Basin/Runoff/Caustic region keys.
 - Legacy load: old Caustic regions become Ripple `Caustic Lace`; old Basin/Runoff records are ignored.
-- Flow: path-affecting settings dirty `WaterPathCache`; stream settings only refresh stream overlays.
+- Flow: path-affecting settings dirty `WaterPathCache`; Lane and Trail refreshes preserve Trail profile/style state.
 - Stream schema: generated stream scalar fields match the exact order above.
 - Rendering: `waterStreamOverlay` styles compile and render tangent-aligned surfels.
-- Visuals: base-cloud scalar mappings remain intact after creating Ripples, Flow Streams, Field Streamlines, and Field Surface Motion; Ripples update sparse runtime params when possible, and Field Surface Motion composes through Visuals-compatible `water_effect_*` fields instead of replacing base visuals.
+- Visuals: base-cloud scalar mappings remain intact after creating Ripples, Flow trails, Field Streamlines, and Field Surface Motion; generated Flow trail sessions are hidden from base-cloud look-dev/export visual selection.
 - Regions: Ripple and Field regions preserve concave clicked boundaries.
 - Motion: Flow and Field Streams visibly animate through shader/Visuals playback, not only static generated positions.
 - Field cache: region Field caches save, reload, and invalidate on support, region, or settings changes; path-derived Field caches rebuild from Flow path anchors.

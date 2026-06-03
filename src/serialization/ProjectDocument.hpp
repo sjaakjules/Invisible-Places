@@ -41,13 +41,29 @@ struct WaterAnimationTrailProfileDocument {
     invisible_places::water::WaterAnimationTrailSettings settings{};
 };
 
+struct WaterPathProfileDocument {
+    std::string name = "Default";
+    invisible_places::water::WaterPathGenerationSettings settings{};
+};
+
+struct WaterLaneProfileDocument {
+    std::string name = "Default";
+    invisible_places::water::WaterFlowStreamSettings settings{};
+};
+
+struct WaterTrailProfileDocument {
+    std::string name = "Default";
+    invisible_places::water::WaterTrailGeometrySettings geometry{};
+    invisible_places::renderer::pointcloud::PointCloudStyleState style{};
+};
+
 struct ProjectDocument {
     struct SavedAnimation {
         std::filesystem::path filePath;
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 24;
+    std::uint32_t schemaVersion = 25;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
@@ -78,6 +94,16 @@ struct ProjectDocument {
     invisible_places::water::WaterAnimationTrailSettings waterAnimationTrailSettings{};
     std::optional<invisible_places::water::WaterAnimationTrailSettings> tempWaterAnimationTrailSettings;
     std::vector<WaterAnimationTrailProfileDocument> waterAnimationTrailProfiles;
+    invisible_places::water::WaterTrailGeometrySettings waterTrailGeometry{};
+    std::vector<WaterPathProfileDocument> waterPathProfiles;
+    std::vector<WaterLaneProfileDocument> waterLaneProfiles;
+    std::vector<WaterTrailProfileDocument> waterTrailProfiles;
+    std::string selectedWaterPathProfileName = "Default";
+    std::string selectedWaterLaneProfileName = "Default";
+    std::string selectedWaterTrailProfileName = "Default";
+    std::optional<invisible_places::water::WaterPathGenerationSettings> tempWaterPathProfileSettings;
+    std::optional<invisible_places::water::WaterFlowStreamSettings> tempWaterLaneProfileSettings;
+    std::optional<WaterTrailProfileDocument> tempWaterTrailProfile;
     invisible_places::water::WaterCausticLookSettings waterCausticLookSettings{};
     std::optional<invisible_places::water::WaterCausticLookSettings> tempWaterCausticLookSettings;
     std::vector<ProjectLayerDocument::PointVisual> waterPointVisuals;
@@ -104,7 +130,7 @@ struct PointCloudStylePresetDocument {
 };
 
 struct WaterSourcesDocument {
-    std::uint32_t schemaVersion = 6;
+    std::uint32_t schemaVersion = 7;
     std::vector<invisible_places::water::WaterEmitter> emitters;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
@@ -114,9 +140,19 @@ struct WaterSourcesDocument {
     std::optional<invisible_places::water::WaterCausticLookSettings> tempCausticLookSettings;
     invisible_places::water::WaterSettingsBundle settings{};
     std::optional<invisible_places::water::WaterSettingsBundle> tempSettings;
+    std::vector<WaterPathProfileDocument> pathProfiles;
+    std::vector<WaterLaneProfileDocument> laneProfiles;
+    std::vector<WaterTrailProfileDocument> trailProfiles;
+    std::string selectedPathProfileName = "Default";
+    std::string selectedLaneProfileName = "Default";
+    std::string selectedTrailProfileName = "Default";
+    std::optional<invisible_places::water::WaterPathGenerationSettings> tempPathProfileSettings;
+    std::optional<invisible_places::water::WaterFlowStreamSettings> tempLaneProfileSettings;
+    std::optional<WaterTrailProfileDocument> tempTrailProfile;
     invisible_places::water::WaterBakeSettings bakeSettings{};
     invisible_places::water::WaterRenderSettings renderSettings{};
     invisible_places::water::WaterFlowStreamSettings flowStreamSettings{};
+    invisible_places::water::WaterTrailGeometrySettings trailGeometry{};
     invisible_places::water::WaterFieldSettings fieldSettings{};
     invisible_places::water::WaterFieldStreamSettings fieldStreamSettings{};
     std::optional<invisible_places::water::WaterPathCache> pathCache;

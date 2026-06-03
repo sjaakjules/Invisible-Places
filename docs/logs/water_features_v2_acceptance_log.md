@@ -34,7 +34,7 @@ Scope: local repository verification for the Water Features v2 migration describ
 - Shader/style handling covers world-aligned stream surfels.
   Evidence: `waterStreamOverlay` style state is serialized, forces the unified shader path, and feeds stream width, world length, tangent, confidence, and wetness fields to viewport/offline rendering. Test `Offline water stream overlays use stream tangent and world length` verifies tangent-oriented world-length rendering.
 
-- Flow Stream motion is time-driven without topology regeneration.
+- Flow Trail motion is time-driven without topology regeneration.
   Evidence: viewport/raycast/surfel shaders and offline rendering derive animated stream age from `point_age`, `point_seed`, `stream_speed`, and render time, then modulate opacity/emission/colour energy. Test `Offline water stream overlays animate through time playback` renders the same stream topology at two times and verifies the alpha changes.
 
 - Field can build from user-defined regions with concave containment.

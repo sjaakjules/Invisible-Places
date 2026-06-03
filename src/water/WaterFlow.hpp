@@ -288,6 +288,7 @@ struct WaterRippleRuntimeContribution {
 struct WaterFlowStreamSettings {
     bool enabled = true;
     std::uint32_t streamCountTotal = 700;
+    std::uint32_t laneCount = 0;
     float streamLengthMeters = 0.75F;
     float streamPointSpacingMeters = 0.010F;
     float streamWidthMeters = 0.006F;
@@ -302,6 +303,20 @@ struct WaterFlowStreamSettings {
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
 };
+
+struct WaterTrailGeometrySettings {
+    float trailLengthMeters = 0.75F;
+    float pointSpacingMeters = 0.010F;
+    float widthMeters = 0.006F;
+    float worldLengthMeters = 0.045F;
+};
+
+[[nodiscard]] WaterTrailGeometrySettings DefaultWaterTrailGeometrySettings();
+[[nodiscard]] WaterTrailGeometrySettings WaterTrailGeometryFromFlowStreamSettings(
+    const WaterFlowStreamSettings& settings);
+[[nodiscard]] WaterFlowStreamSettings ApplyWaterTrailGeometryToFlowStreamSettings(
+    WaterFlowStreamSettings settings,
+    const WaterTrailGeometrySettings& geometry);
 
 struct WaterFieldSettings {
     bool enabled = true;
@@ -593,6 +608,9 @@ struct WaterEmitter {
     std::optional<std::uint32_t> linkedSourceSettingsEmitterId;
     std::optional<WaterSourceSettings> sourceSettings;
     std::optional<WaterSourceSettings> tempSourceSettings;
+    std::string pathProfileName = "Global";
+    std::string laneProfileName = "Global";
+    std::string trailProfileName = "Global";
 };
 
 struct WaterOverlayPoint {
@@ -641,6 +659,7 @@ struct WaterAnimatedTrailPath {
 
 struct WaterAnimatedTrailBuildSettings {
     std::uint32_t trailCountTotal = 700;
+    std::uint32_t laneCount = 0;
     float trailLengthMeters = 0.75F;
     float trailPointSpacingMeters = 0.010F;
     float trailWidthMeters = 0.006F;

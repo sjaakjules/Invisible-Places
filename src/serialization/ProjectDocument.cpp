@@ -64,6 +64,7 @@ using invisible_places::water::WaterScaleMode;
 using invisible_places::water::WaterSettingsBundle;
 using invisible_places::water::WaterSourceSettingsAssignment;
 using invisible_places::water::WaterSourceSettings;
+using invisible_places::water::WaterTrailGeometrySettings;
 using invisible_places::water::WaterVisualSettings;
 
 json SerializeWaterSettingsBundle(const WaterSettingsBundle& settings);
@@ -72,6 +73,8 @@ json SerializeWaterSourceSettings(const WaterSourceSettings& settings);
 WaterSourceSettings ParseWaterSourceSettings(const json& settingsJson);
 json SerializeWaterAnimationTrailSettings(const WaterAnimationTrailSettings& settings);
 WaterAnimationTrailSettings ParseWaterAnimationTrailSettings(const json& settingsJson);
+json SerializeWaterTrailGeometrySettings(const WaterTrailGeometrySettings& settings);
+WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJson);
 json SerializeWaterCausticLookSettings(const WaterCausticLookSettings& settings);
 WaterCausticLookSettings ParseWaterCausticLookSettings(const json& settingsJson);
 json SerializeWaterEffectLayer(const WaterEffectLayer& layer);
@@ -1329,6 +1332,9 @@ json SerializeWaterEmitter(const WaterEmitter& emitter) {
         {"status", SerializedWaterEmitterStatusName(emitter.status)},
         {"confidence", emitter.confidence},
         {"settings_assignment", SerializedWaterSourceSettingsAssignmentName(emitter.sourceSettingsAssignment)},
+        {"path_profile", emitter.pathProfileName},
+        {"lane_profile", emitter.laneProfileName},
+        {"trail_profile", emitter.trailProfileName},
     };
     if (emitter.parentId.has_value()) {
         emitterJson["parent_id"] = emitter.parentId.value();
@@ -1367,6 +1373,9 @@ WaterEmitter ParseWaterEmitter(const json& emitterJson) {
         emitter.status = ParseWaterEmitterStatus(emitterJson.at("status"));
     }
     emitter.confidence = emitterJson.value("confidence", emitter.confidence);
+    emitter.pathProfileName = emitterJson.value("path_profile", emitter.pathProfileName);
+    emitter.laneProfileName = emitterJson.value("lane_profile", emitter.laneProfileName);
+    emitter.trailProfileName = emitterJson.value("trail_profile", emitter.trailProfileName);
     if (emitterJson.contains("parent_id")) {
         emitter.parentId = emitterJson.at("parent_id").get<std::uint32_t>();
     }
@@ -1739,6 +1748,7 @@ json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings) {
     return json{
         {"enabled", settings.enabled},
         {"stream_count_total", settings.streamCountTotal},
+        {"lane_count", settings.laneCount},
         {"stream_length_meters", settings.streamLengthMeters},
         {"stream_point_spacing_meters", settings.streamPointSpacingMeters},
         {"stream_width_meters", settings.streamWidthMeters},
@@ -1759,6 +1769,7 @@ WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson) {
     WaterFlowStreamSettings settings;
     settings.enabled = settingsJson.value("enabled", settings.enabled);
     settings.streamCountTotal = settingsJson.value("stream_count_total", settings.streamCountTotal);
+    settings.laneCount = settingsJson.value("lane_count", settings.laneCount);
     settings.streamLengthMeters = settingsJson.value("stream_length_meters", settings.streamLengthMeters);
     settings.streamPointSpacingMeters = settingsJson.value("stream_point_spacing_meters", settings.streamPointSpacingMeters);
     settings.streamWidthMeters = settingsJson.value("stream_width_meters", settings.streamWidthMeters);
@@ -1982,6 +1993,80 @@ WaterAnimationTrailSettings ParseWaterAnimationTrailSettings(const json& setting
     settings.trailSampleSpacingMeters =
         std::clamp(settingsJson.value("trail_sample_spacing_meters", settings.trailSampleSpacingMeters), 0.0F, 25.0F);
     return settings;
+}
+
+json SerializeWaterTrailGeometrySettings(const WaterTrailGeometrySettings& settings) {
+    return json{
+        {"trail_length_meters", settings.trailLengthMeters},
+        {"point_spacing_meters", settings.pointSpacingMeters},
+        {"width_meters", settings.widthMeters},
+        {"world_length_meters", settings.worldLengthMeters},
+    };
+}
+
+WaterTrailGeometrySettings ParseWaterTrailGeometrySettings(const json& settingsJson) {
+    WaterTrailGeometrySettings settings;
+    settings.trailLengthMeters =
+        std::clamp(settingsJson.value("trail_length_meters", settings.trailLengthMeters), 0.001F, 50.0F);
+    settings.pointSpacingMeters =
+        std::clamp(settingsJson.value("point_spacing_meters", settings.pointSpacingMeters), 0.001F, 10.0F);
+    settings.widthMeters =
+        std::clamp(settingsJson.value("width_meters", settings.widthMeters), 0.0005F, 1.0F);
+    settings.worldLengthMeters =
+        std::clamp(settingsJson.value("world_length_meters", settings.worldLengthMeters), 0.001F, 5.0F);
+    return settings;
+}
+
+json SerializeWaterPathProfile(const WaterPathProfileDocument& profile) {
+    return json{
+        {"name", profile.name},
+        {"settings", SerializeWaterPathGenerationSettings(profile.settings)},
+    };
+}
+
+WaterPathProfileDocument ParseWaterPathProfile(const json& profileJson) {
+    WaterPathProfileDocument profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("settings")) {
+        profile.settings = ParseWaterPathGenerationSettings(profileJson.at("settings"));
+    }
+    return profile;
+}
+
+json SerializeWaterLaneProfile(const WaterLaneProfileDocument& profile) {
+    return json{
+        {"name", profile.name},
+        {"settings", SerializeWaterFlowStreamSettings(profile.settings)},
+    };
+}
+
+WaterLaneProfileDocument ParseWaterLaneProfile(const json& profileJson) {
+    WaterLaneProfileDocument profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("settings")) {
+        profile.settings = ParseWaterFlowStreamSettings(profileJson.at("settings"));
+    }
+    return profile;
+}
+
+json SerializeWaterTrailProfile(const WaterTrailProfileDocument& profile) {
+    return json{
+        {"name", profile.name},
+        {"geometry", SerializeWaterTrailGeometrySettings(profile.geometry)},
+        {"style", SerializePointCloudStyle(profile.style)},
+    };
+}
+
+WaterTrailProfileDocument ParseWaterTrailProfile(const json& profileJson) {
+    WaterTrailProfileDocument profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("geometry")) {
+        profile.geometry = ParseWaterTrailGeometrySettings(profileJson.at("geometry"));
+    }
+    if (profileJson.contains("style")) {
+        profile.style = ParsePointCloudStyle(profileJson.at("style"));
+    }
+    return profile;
 }
 
 json SerializeWaterAnimationTrailProfile(const WaterAnimationTrailProfileDocument& profile) {
@@ -2570,6 +2655,13 @@ bool SaveProjectDocument(
         {"water_source_settings", SerializeWaterSourceSettings(document.waterSourceSettings)},
         {"water_animation_trail_settings", SerializeWaterAnimationTrailSettings(document.waterAnimationTrailSettings)},
         {"water_animation_trail_profiles", json::array()},
+        {"water_trail_geometry", SerializeWaterTrailGeometrySettings(document.waterTrailGeometry)},
+        {"water_path_profiles", json::array()},
+        {"water_lane_profiles", json::array()},
+        {"water_trail_profiles", json::array()},
+        {"selected_water_path_profile", document.selectedWaterPathProfileName},
+        {"selected_water_lane_profile", document.selectedWaterLaneProfileName},
+        {"selected_water_trail_profile", document.selectedWaterTrailProfileName},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
         {"water_flow_stream_settings", SerializeWaterFlowStreamSettings(document.waterFlowStreamSettings)},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
@@ -2588,6 +2680,15 @@ bool SaveProjectDocument(
     for (const auto& profile : document.waterAnimationTrailProfiles) {
         projectJson["water_animation_trail_profiles"].push_back(SerializeWaterAnimationTrailProfile(profile));
     }
+    for (const auto& profile : document.waterPathProfiles) {
+        projectJson["water_path_profiles"].push_back(SerializeWaterPathProfile(profile));
+    }
+    for (const auto& profile : document.waterLaneProfiles) {
+        projectJson["water_lane_profiles"].push_back(SerializeWaterLaneProfile(profile));
+    }
+    for (const auto& profile : document.waterTrailProfiles) {
+        projectJson["water_trail_profiles"].push_back(SerializeWaterTrailProfile(profile));
+    }
     for (const auto& visual : document.waterPointVisuals) {
         projectJson["water_point_visuals"].push_back(SerializePointCloudVisual(visual));
     }
@@ -2598,6 +2699,18 @@ bool SaveProjectDocument(
     if (document.tempWaterAnimationTrailSettings.has_value()) {
         projectJson["temp_water_animation_trail_settings"] =
             SerializeWaterAnimationTrailSettings(document.tempWaterAnimationTrailSettings.value());
+    }
+    if (document.tempWaterPathProfileSettings.has_value()) {
+        projectJson["temp_water_path_profile_settings"] =
+            SerializeWaterPathGenerationSettings(document.tempWaterPathProfileSettings.value());
+    }
+    if (document.tempWaterLaneProfileSettings.has_value()) {
+        projectJson["temp_water_lane_profile_settings"] =
+            SerializeWaterFlowStreamSettings(document.tempWaterLaneProfileSettings.value());
+    }
+    if (document.tempWaterTrailProfile.has_value()) {
+        projectJson["temp_water_trail_profile"] =
+            SerializeWaterTrailProfile(document.tempWaterTrailProfile.value());
     }
     if (document.tempWaterCausticLookSettings.has_value()) {
         projectJson["temp_water_caustic_look_settings"] =
@@ -2679,6 +2792,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterAnimationTrailSettings =
             ParseWaterAnimationTrailSettings(projectJson->at("water_animation_trail_settings"));
     }
+    const bool hasWaterTrailGeometry = projectJson->contains("water_trail_geometry");
+    if (hasWaterTrailGeometry) {
+        document.waterTrailGeometry =
+            ParseWaterTrailGeometrySettings(projectJson->at("water_trail_geometry"));
+    }
     if (projectJson->contains("water_caustic_look_settings")) {
         document.waterCausticLookSettings =
             ParseWaterCausticLookSettings(projectJson->at("water_caustic_look_settings"));
@@ -2686,6 +2804,10 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (projectJson->contains("water_flow_stream_settings")) {
         document.waterFlowStreamSettings =
             ParseWaterFlowStreamSettings(projectJson->at("water_flow_stream_settings"));
+    }
+    if (!hasWaterTrailGeometry) {
+        document.waterTrailGeometry =
+            invisible_places::water::WaterTrailGeometryFromFlowStreamSettings(document.waterFlowStreamSettings);
     }
     if (projectJson->contains("water_field_settings")) {
         document.waterFieldSettings = ParseWaterFieldSettings(projectJson->at("water_field_settings"));
@@ -2703,6 +2825,41 @@ std::optional<ProjectDocument> LoadProjectDocument(
         for (const auto& profileJson : projectJson->at("water_animation_trail_profiles")) {
             document.waterAnimationTrailProfiles.push_back(ParseWaterAnimationTrailProfile(profileJson));
         }
+    }
+    if (projectJson->contains("water_path_profiles") &&
+        projectJson->at("water_path_profiles").is_array()) {
+        for (const auto& profileJson : projectJson->at("water_path_profiles")) {
+            document.waterPathProfiles.push_back(ParseWaterPathProfile(profileJson));
+        }
+    }
+    if (projectJson->contains("water_lane_profiles") &&
+        projectJson->at("water_lane_profiles").is_array()) {
+        for (const auto& profileJson : projectJson->at("water_lane_profiles")) {
+            document.waterLaneProfiles.push_back(ParseWaterLaneProfile(profileJson));
+        }
+    }
+    if (projectJson->contains("water_trail_profiles") &&
+        projectJson->at("water_trail_profiles").is_array()) {
+        for (const auto& profileJson : projectJson->at("water_trail_profiles")) {
+            document.waterTrailProfiles.push_back(ParseWaterTrailProfile(profileJson));
+        }
+    }
+    document.selectedWaterPathProfileName =
+        projectJson->value("selected_water_path_profile", document.selectedWaterPathProfileName);
+    document.selectedWaterLaneProfileName =
+        projectJson->value("selected_water_lane_profile", document.selectedWaterLaneProfileName);
+    document.selectedWaterTrailProfileName =
+        projectJson->value("selected_water_trail_profile", document.selectedWaterTrailProfileName);
+    if (projectJson->contains("temp_water_path_profile_settings")) {
+        document.tempWaterPathProfileSettings =
+            ParseWaterPathGenerationSettings(projectJson->at("temp_water_path_profile_settings"));
+    }
+    if (projectJson->contains("temp_water_lane_profile_settings")) {
+        document.tempWaterLaneProfileSettings =
+            ParseWaterFlowStreamSettings(projectJson->at("temp_water_lane_profile_settings"));
+    }
+    if (projectJson->contains("temp_water_trail_profile")) {
+        document.tempWaterTrailProfile = ParseWaterTrailProfile(projectJson->at("temp_water_trail_profile"));
     }
     if (projectJson->contains("temp_water_caustic_look_settings")) {
         document.tempWaterCausticLookSettings =
@@ -2937,6 +3094,13 @@ bool SaveWaterSourcesDocument(
         {"water_source_settings", SerializeWaterSourceSettings(document.sourceSettings)},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.causticLookSettings)},
         {"water_flow_stream_settings", SerializeWaterFlowStreamSettings(document.flowStreamSettings)},
+        {"water_trail_geometry", SerializeWaterTrailGeometrySettings(document.trailGeometry)},
+        {"water_path_profiles", json::array()},
+        {"water_lane_profiles", json::array()},
+        {"water_trail_profiles", json::array()},
+        {"selected_water_path_profile", document.selectedPathProfileName},
+        {"selected_water_lane_profile", document.selectedLaneProfileName},
+        {"selected_water_trail_profile", document.selectedTrailProfileName},
         {"water_field_settings", SerializeWaterFieldSettings(document.fieldSettings)},
         {"water_field_stream_settings", SerializeWaterFieldStreamSettings(document.fieldStreamSettings)},
         {"water_emitters", json::array()},
@@ -2950,6 +3114,27 @@ bool SaveWaterSourcesDocument(
     if (document.tempCausticLookSettings.has_value()) {
         sourcesJson["temp_water_caustic_look_settings"] =
             SerializeWaterCausticLookSettings(document.tempCausticLookSettings.value());
+    }
+    if (document.tempPathProfileSettings.has_value()) {
+        sourcesJson["temp_water_path_profile_settings"] =
+            SerializeWaterPathGenerationSettings(document.tempPathProfileSettings.value());
+    }
+    if (document.tempLaneProfileSettings.has_value()) {
+        sourcesJson["temp_water_lane_profile_settings"] =
+            SerializeWaterFlowStreamSettings(document.tempLaneProfileSettings.value());
+    }
+    if (document.tempTrailProfile.has_value()) {
+        sourcesJson["temp_water_trail_profile"] =
+            SerializeWaterTrailProfile(document.tempTrailProfile.value());
+    }
+    for (const auto& profile : document.pathProfiles) {
+        sourcesJson["water_path_profiles"].push_back(SerializeWaterPathProfile(profile));
+    }
+    for (const auto& profile : document.laneProfiles) {
+        sourcesJson["water_lane_profiles"].push_back(SerializeWaterLaneProfile(profile));
+    }
+    for (const auto& profile : document.trailProfiles) {
+        sourcesJson["water_trail_profiles"].push_back(SerializeWaterTrailProfile(profile));
     }
     for (const auto& emitter : document.emitters) {
         sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
@@ -2989,6 +3174,48 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_flow_stream_settings")) {
         document.flowStreamSettings =
             ParseWaterFlowStreamSettings(sourcesJson->at("water_flow_stream_settings"));
+    }
+    if (sourcesJson->contains("water_trail_geometry")) {
+        document.trailGeometry =
+            ParseWaterTrailGeometrySettings(sourcesJson->at("water_trail_geometry"));
+    } else {
+        document.trailGeometry =
+            invisible_places::water::WaterTrailGeometryFromFlowStreamSettings(document.flowStreamSettings);
+    }
+    if (sourcesJson->contains("water_path_profiles") &&
+        sourcesJson->at("water_path_profiles").is_array()) {
+        for (const auto& profileJson : sourcesJson->at("water_path_profiles")) {
+            document.pathProfiles.push_back(ParseWaterPathProfile(profileJson));
+        }
+    }
+    if (sourcesJson->contains("water_lane_profiles") &&
+        sourcesJson->at("water_lane_profiles").is_array()) {
+        for (const auto& profileJson : sourcesJson->at("water_lane_profiles")) {
+            document.laneProfiles.push_back(ParseWaterLaneProfile(profileJson));
+        }
+    }
+    if (sourcesJson->contains("water_trail_profiles") &&
+        sourcesJson->at("water_trail_profiles").is_array()) {
+        for (const auto& profileJson : sourcesJson->at("water_trail_profiles")) {
+            document.trailProfiles.push_back(ParseWaterTrailProfile(profileJson));
+        }
+    }
+    document.selectedPathProfileName =
+        sourcesJson->value("selected_water_path_profile", document.selectedPathProfileName);
+    document.selectedLaneProfileName =
+        sourcesJson->value("selected_water_lane_profile", document.selectedLaneProfileName);
+    document.selectedTrailProfileName =
+        sourcesJson->value("selected_water_trail_profile", document.selectedTrailProfileName);
+    if (sourcesJson->contains("temp_water_path_profile_settings")) {
+        document.tempPathProfileSettings =
+            ParseWaterPathGenerationSettings(sourcesJson->at("temp_water_path_profile_settings"));
+    }
+    if (sourcesJson->contains("temp_water_lane_profile_settings")) {
+        document.tempLaneProfileSettings =
+            ParseWaterFlowStreamSettings(sourcesJson->at("temp_water_lane_profile_settings"));
+    }
+    if (sourcesJson->contains("temp_water_trail_profile")) {
+        document.tempTrailProfile = ParseWaterTrailProfile(sourcesJson->at("temp_water_trail_profile"));
     }
     if (sourcesJson->contains("water_field_settings")) {
         document.fieldSettings = ParseWaterFieldSettings(sourcesJson->at("water_field_settings"));

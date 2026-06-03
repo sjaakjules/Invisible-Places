@@ -2178,6 +2178,30 @@ WaterVisualSettings DefaultWaterVisualSettings() {
     return {};
 }
 
+WaterTrailGeometrySettings DefaultWaterTrailGeometrySettings() {
+    return {};
+}
+
+WaterTrailGeometrySettings WaterTrailGeometryFromFlowStreamSettings(
+    const WaterFlowStreamSettings& settings) {
+    WaterTrailGeometrySettings geometry;
+    geometry.trailLengthMeters = settings.streamLengthMeters;
+    geometry.pointSpacingMeters = settings.streamPointSpacingMeters;
+    geometry.widthMeters = settings.streamWidthMeters;
+    geometry.worldLengthMeters = settings.streamWorldLengthMeters;
+    return geometry;
+}
+
+WaterFlowStreamSettings ApplyWaterTrailGeometryToFlowStreamSettings(
+    WaterFlowStreamSettings settings,
+    const WaterTrailGeometrySettings& geometry) {
+    settings.streamLengthMeters = geometry.trailLengthMeters;
+    settings.streamPointSpacingMeters = geometry.pointSpacingMeters;
+    settings.streamWidthMeters = geometry.widthMeters;
+    settings.streamWorldLengthMeters = geometry.worldLengthMeters;
+    return settings;
+}
+
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
     WaterSettingsBundle settings;
     settings.path = DefaultWaterPathGenerationSettings(mode);
@@ -4462,6 +4486,7 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
     float streamWorldLengthMeters,
     float surfaceOffsetMeters,
     float laneSpreadMeters,
+    std::uint32_t requestedLaneCount,
     float turbulence,
     float laneCrossing,
     float speedMetersPerSecond,
@@ -4492,9 +4517,12 @@ WaterStreamOverlay BuildStreamOverlayFromPaths(
     const float safeStreamWidth = std::max(0.0005F, streamWidthMeters);
     const float laneSpan = std::max(0.0F, laneSpreadMeters);
     const float lanePitch = std::max(safeStreamWidth * 0.5F, 0.00025F);
-    const auto potentialLaneCount = static_cast<std::uint32_t>(std::max<float>(
-        1.0F,
-        std::ceil(laneSpan / lanePitch)));
+    const auto potentialLaneCount =
+        requestedLaneCount > 0U
+            ? std::max<std::uint32_t>(1U, requestedLaneCount)
+            : static_cast<std::uint32_t>(std::max<float>(
+                  1.0F,
+                  std::ceil(laneSpan / lanePitch)));
     const float laneCrossingAmount = std::clamp(laneCrossing, 0.0F, 1.0F);
     const auto laneCenter = [](std::uint32_t laneIndex, std::uint32_t laneCount, float span) {
         if (laneCount <= 1U || span <= 1.0e-6F) {
@@ -5343,6 +5371,7 @@ WaterStreamOverlay BuildAnimatedWaterTrailOverlay(
         settings.trailWorldLengthMeters,
         settings.surfaceOffsetMeters,
         settings.laneSpreadMeters,
+        settings.laneCount,
         settings.turbulence,
         settings.laneCrossing,
         settings.speedMetersPerSecond,
@@ -5373,6 +5402,7 @@ WaterStreamOverlay BuildFlowStreamOverlayFromPathAnchors(
         paths,
         {
             .trailCountTotal = settings.streamCountTotal,
+            .laneCount = settings.laneCount,
             .trailLengthMeters = settings.streamLengthMeters,
             .trailPointSpacingMeters = settings.streamPointSpacingMeters,
             .trailWidthMeters = settings.streamWidthMeters,
