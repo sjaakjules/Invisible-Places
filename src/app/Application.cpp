@@ -7405,7 +7405,10 @@ std::vector<WaterRippleRuntimeCacheDocument> CurrentWaterRippleRuntimeCachesForD
     const PreviewRuntimeState& runtimeState) {
     std::vector<WaterRippleRuntimeCacheDocument> caches;
     for (const auto& cache : runtimeState.water.rippleRuntimeCaches) {
-        if (cache.stale || cache.memberships.empty()) {
+        if (cache.stale ||
+            cache.memberships.empty() ||
+            cache.memberships.size() >
+                invisible_places::serialization::kMaxSerializedWaterRippleRuntimeCacheMemberships) {
             continue;
         }
         const auto supportKey = NormalizePathKey(cache.supportLayerPath);

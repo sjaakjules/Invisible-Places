@@ -3641,6 +3641,64 @@ TEST_CASE("Ripple runtime cache serializes sparse memberships and params", "[ser
     CHECK(loadedSources->rippleRuntimeCaches.front().memberships.front().shoreDistance == Catch::Approx(1.25F));
 }
 
+TEST_CASE("Oversized ripple runtime caches are omitted from project files", "[serialization][project][water][ripples]") {
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::RainRings, 95U);
+    layer.targetLayerSourcePath = "Data/Site3-Sample-Terrestrial.ply";
+    invisible_places::water::InitializeWaterRipplePatternSettings(&layer);
+
+    invisible_places::water::WaterRippleRuntimeMembership membership;
+    membership.pointIndex = 42U;
+    membership.paramIndex = 0U;
+    membership.edgeDistance = 0.33F;
+    membership.seed = 0.72F;
+    membership.shoreDistance = 1.25F;
+
+    invisible_places::serialization::WaterRippleRuntimeCacheDocument cache;
+    cache.supportLayerPath = layer.targetLayerSourcePath;
+    cache.supportSignature = "Data/Site3-Sample-Terrestrial.ply|points=120000000|normals=1";
+    cache.regionFingerprint = "water-ripple-runtime-membership-v1|oversized";
+    cache.memberships.assign(
+        invisible_places::serialization::kMaxSerializedWaterRippleRuntimeCacheMemberships + 1U,
+        membership);
+    cache.params.push_back(invisible_places::water::BuildWaterRippleRuntimeParams(layer));
+
+    invisible_places::serialization::ProjectDocument projectDocument;
+    projectDocument.projectName = "Oversized Ripple Runtime Cache";
+    projectDocument.waterRippleLayers.push_back(layer);
+    projectDocument.waterRippleRuntimeCaches.push_back(cache);
+
+    const auto projectPath = std::filesystem::temp_directory_path() / "invisible_places_oversized_ripple_cache.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(projectDocument, projectPath, &errorMessage));
+    {
+        std::ifstream saved{projectPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{saved},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"water_ripple_layers\"") != std::string::npos);
+        CHECK(savedJson.find("\"water_ripple_runtime_caches\": []") != std::string::npos);
+        CHECK(savedJson.find("\"shore_distance\"") == std::string::npos);
+    }
+
+    const auto loadedProject = invisible_places::serialization::LoadProjectDocument(projectPath, &errorMessage);
+    REQUIRE(loadedProject.has_value());
+    REQUIRE(loadedProject->waterRippleLayers.size() == 1U);
+    CHECK(loadedProject->waterRippleLayers.front().targetLayerSourcePath == layer.targetLayerSourcePath);
+    CHECK(loadedProject->waterRippleRuntimeCaches.empty());
+
+    invisible_places::serialization::WaterSourcesDocument sourcesDocument;
+    sourcesDocument.rippleLayers.push_back(layer);
+    sourcesDocument.rippleRuntimeCaches.push_back(std::move(cache));
+    const auto sourcesPath =
+        std::filesystem::temp_directory_path() / "invisible_places_oversized_ripple_cache_sources.json";
+    REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(sourcesDocument, sourcesPath, &errorMessage));
+    const auto loadedSources =
+        invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
+    REQUIRE(loadedSources.has_value());
+    REQUIRE(loadedSources->rippleLayers.size() == 1U);
+    CHECK(loadedSources->rippleRuntimeCaches.empty());
+}
+
 TEST_CASE("Runtime ripple Caustic Lace animates as sparse moving ridges", "[water][v2][ripples][runtime]") {
     const auto cloud = MakeRippleRuntimeFixtureCloud();
     auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CausticLace, 101U);
@@ -3870,7 +3928,7 @@ TEST_CASE("Runtime ripple Shoreline return consumes the incoming foam tail", "[w
         const auto balance = centralRowTailBalance(samples);
         INFO("peakX=" << balance.peakX << " peak=" << balance.peak << " left=" << balance.left << " right=" << balance.right);
         REQUIRE(balance.peak > 0.16F);
-        CHECK(balance.left >= balance.right * 0.98F);
+        CHECK(balance.peak < (balance.left + balance.right) * 0.55F);
         ++checkedFrames;
     }
     CHECK(checkedFrames == 3U);

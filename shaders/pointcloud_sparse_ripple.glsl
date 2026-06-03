@@ -270,7 +270,7 @@ float RippleTideBandsValue(vec2 uv, float shoreDistance, float edgeBlendWidth, f
         const float slot = float(waveIndex);
         const float slotSeed = seed + slot * 53.17;
         const float timingNoise = RippleHash(slotSeed * 0.071 + 11.0);
-        const float speedNoise = mix(0.76, 1.26, RippleHash(slotSeed * 0.097 + 23.0));
+        const float speedNoise = mix(0.91, 1.09, RippleHash(slotSeed * 0.097 + 23.0));
         const float waveGate = RippleHash(slotSeed * 0.113 + 31.0);
         if (waveGate > mix(0.62, 1.0, density01)) {
             continue;
@@ -338,11 +338,9 @@ float RippleTideBandsValue(vec2 uv, float shoreDistance, float edgeBlendWidth, f
                 exp(-trailDistance / max(trailLength, 1.0e-4)) *
                 smoothstep(frontWidth * 0.35, frontWidth * 1.70, trailDistance) *
                 (1.0 - smoothstep(trailLength * 1.08, trailLength * 2.15, trailDistance));
-            const float clearCrest = RippleLine(front, frontWidth * 1.15);
             const float returnFade = 1.0 - smoothstep(0.45, 1.0, returnProgress);
             const float value =
-                heldFoam * remainingMask * (0.50 + density01 * 0.30) * breakup * returnFade +
-                clearCrest * (0.34 + shoreBreakup * 0.16) * returnFade;
+                heldFoam * remainingMask * (0.50 + density01 * 0.30) * breakup * returnFade;
             combined = max(combined, value * shorewardMask);
         }
     }

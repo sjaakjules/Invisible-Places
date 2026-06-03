@@ -3,10 +3,13 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <sstream>
+#include <string_view>
 #include <unordered_set>
 
 #include <nlohmann/json.hpp>
@@ -74,6 +77,8 @@ using invisible_places::water::WaterSourceSettings;
 using invisible_places::water::WaterTrailGeometrySettings;
 using invisible_places::water::WaterVisualSettings;
 
+constexpr std::uintmax_t kLargeJsonRippleCacheStripBytes = 32ULL * 1024ULL * 1024ULL;
+
 json SerializeWaterSettingsBundle(const WaterSettingsBundle& settings);
 WaterSettingsBundle ParseWaterSettingsBundle(const json& settingsJson);
 json SerializeWaterSourceSettings(const WaterSourceSettings& settings);
@@ -117,6 +122,99 @@ const char* ParameterSourceModeName(ParameterSourceMode mode) {
     }
 
     return "constant";
+}
+
+bool IsJsonWhitespace(char character) {
+    return std::isspace(static_cast<unsigned char>(character)) != 0;
+}
+
+std::size_t SkipJsonWhitespace(const std::string& text, std::size_t offset) {
+    while (offset < text.size() && IsJsonWhitespace(text[offset])) {
+        ++offset;
+    }
+    return offset;
+}
+
+std::optional<std::size_t> FindJsonArrayEnd(const std::string& text, std::size_t arrayStart) {
+    if (arrayStart >= text.size() || text[arrayStart] != '[') {
+        return std::nullopt;
+    }
+
+    std::size_t depth = 0U;
+    bool inString = false;
+    bool escaped = false;
+    for (std::size_t offset = arrayStart; offset < text.size(); ++offset) {
+        const char character = text[offset];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (character == '\\') {
+                escaped = true;
+            } else if (character == '"') {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (character == '"') {
+            inString = true;
+        } else if (character == '[') {
+            ++depth;
+        } else if (character == ']') {
+            if (depth == 0U) {
+                return std::nullopt;
+            }
+            --depth;
+            if (depth == 0U) {
+                return offset;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool StripJsonArrayPropertyValue(std::string* text, std::string_view propertyName) {
+    if (text == nullptr || text->empty()) {
+        return false;
+    }
+
+    const std::string keyToken = "\"" + std::string{propertyName} + "\"";
+    bool stripped = false;
+    std::size_t searchOffset = 0U;
+    while (searchOffset < text->size()) {
+        const auto keyOffset = text->find(keyToken, searchOffset);
+        if (keyOffset == std::string::npos) {
+            break;
+        }
+
+        const auto colonOffset = SkipJsonWhitespace(*text, keyOffset + keyToken.size());
+        if (colonOffset >= text->size() || (*text)[colonOffset] != ':') {
+            searchOffset = keyOffset + keyToken.size();
+            continue;
+        }
+        const auto arrayStart = SkipJsonWhitespace(*text, colonOffset + 1U);
+        if (arrayStart >= text->size() || (*text)[arrayStart] != '[') {
+            searchOffset = keyOffset + keyToken.size();
+            continue;
+        }
+        const auto arrayEnd = FindJsonArrayEnd(*text, arrayStart);
+        if (!arrayEnd.has_value()) {
+            searchOffset = keyOffset + keyToken.size();
+            continue;
+        }
+
+        text->replace(arrayStart, arrayEnd.value() - arrayStart + 1U, "[]");
+        searchOffset = arrayStart + 2U;
+        stripped = true;
+    }
+    return stripped;
+}
+
+bool ShouldSerializeWaterRippleRuntimeCache(const WaterRippleRuntimeCacheDocument& cache) {
+    return !cache.stale &&
+           !cache.memberships.empty() &&
+           !cache.params.empty() &&
+           cache.memberships.size() <= kMaxSerializedWaterRippleRuntimeCacheMemberships;
 }
 
 ParameterSourceMode ParseParameterSourceMode(const json& value) {
@@ -1877,11 +1975,16 @@ WaterRippleRuntimeCacheDocument ParseWaterRippleRuntimeCache(const json& cacheJs
     cache.regionFingerprint = cacheJson.value("region_fingerprint", cache.regionFingerprint);
     cache.stale = cacheJson.value("stale", cache.stale);
     if (cacheJson.contains("memberships") && cacheJson.at("memberships").is_array()) {
-        for (const auto& membershipJson : cacheJson.at("memberships")) {
-            auto membership = ParseWaterRippleRuntimeMembership(membershipJson);
-            if (membership.pointIndex != std::numeric_limits<std::uint32_t>::max()) {
-                cache.memberships.push_back(membership);
+        const auto& membershipsJson = cacheJson.at("memberships");
+        if (membershipsJson.size() <= kMaxSerializedWaterRippleRuntimeCacheMemberships) {
+            for (const auto& membershipJson : membershipsJson) {
+                auto membership = ParseWaterRippleRuntimeMembership(membershipJson);
+                if (membership.pointIndex != std::numeric_limits<std::uint32_t>::max()) {
+                    cache.memberships.push_back(membership);
+                }
             }
+        } else {
+            cache.stale = true;
         }
     }
     if (cacheJson.contains("params") && cacheJson.at("params").is_array()) {
@@ -2854,7 +2957,7 @@ bool WriteJsonDocument(
 }
 
 std::optional<json> ReadJsonDocument(const std::filesystem::path& inputPath, std::string* errorMessage) {
-    std::ifstream input{inputPath};
+    std::ifstream input{inputPath, std::ios::binary};
     if (!input.is_open()) {
         if (errorMessage != nullptr) {
             *errorMessage = "Failed to open input file.";
@@ -2863,6 +2966,15 @@ std::optional<json> ReadJsonDocument(const std::filesystem::path& inputPath, std
     }
 
     try {
+        std::error_code sizeError;
+        const auto fileSize = std::filesystem::file_size(inputPath, sizeError);
+        if (!sizeError && fileSize >= kLargeJsonRippleCacheStripBytes) {
+            std::ostringstream buffer;
+            buffer << input.rdbuf();
+            auto text = buffer.str();
+            StripJsonArrayPropertyValue(&text, "water_ripple_runtime_caches");
+            return json::parse(text);
+        }
         return json::parse(input);
     } catch (const std::exception& error) {
         if (errorMessage != nullptr) {
@@ -2921,7 +3033,7 @@ bool SaveProjectDocument(
         projectJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
     for (const auto& cache : document.waterRippleRuntimeCaches) {
-        if (!cache.memberships.empty() && !cache.params.empty()) {
+        if (ShouldSerializeWaterRippleRuntimeCache(cache)) {
             projectJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
         }
     }
@@ -3404,7 +3516,7 @@ bool SaveWaterSourcesDocument(
         sourcesJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
     for (const auto& cache : document.rippleRuntimeCaches) {
-        if (!cache.memberships.empty() && !cache.params.empty()) {
+        if (ShouldSerializeWaterRippleRuntimeCache(cache)) {
             sourcesJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
         }
     }

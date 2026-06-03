@@ -4103,7 +4103,7 @@ float RuntimeRippleTideBandsValue(
         const float slot = static_cast<float>(waveIndex);
         const float slotSeed = seed + slot * 53.17F;
         const float timingNoise = RuntimeRippleHash(slotSeed * 0.071F + 11.0F);
-        const float speedNoise = std::lerp(0.76F, 1.26F, RuntimeRippleHash(slotSeed * 0.097F + 23.0F));
+        const float speedNoise = std::lerp(0.91F, 1.09F, RuntimeRippleHash(slotSeed * 0.097F + 23.0F));
         const float waveGate = RuntimeRippleHash(slotSeed * 0.113F + 31.0F);
         if (waveGate > std::lerp(0.62F, 1.0F, density01)) {
             continue;
@@ -4175,11 +4175,9 @@ float RuntimeRippleTideBandsValue(
                 std::exp(-trailDistance / std::max(trailLength, 1.0e-4F)) *
                 SmoothStep(frontWidth * 0.35F, frontWidth * 1.70F, trailDistance) *
                 (1.0F - SmoothStep(trailLength * 1.08F, trailLength * 2.15F, trailDistance));
-            const float clearCrest = RippleLine(front, frontWidth * 1.15F);
             const float returnFade = 1.0F - SmoothStep(0.45F, 1.0F, returnProgress);
             const float value =
-                heldFoam * remainingMask * (0.50F + density01 * 0.30F) * breakup * returnFade +
-                clearCrest * (0.34F + shoreBreakup * 0.16F) * returnFade;
+                heldFoam * remainingMask * (0.50F + density01 * 0.30F) * breakup * returnFade;
             combined = std::max(combined, value * shorewardMask);
         }
     }

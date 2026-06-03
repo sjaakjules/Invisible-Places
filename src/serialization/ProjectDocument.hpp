@@ -16,6 +16,8 @@
 
 namespace invisible_places::serialization {
 
+inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
+
 enum class SerializedLayerKind {
     PointCloud,
     GaussianSplat
