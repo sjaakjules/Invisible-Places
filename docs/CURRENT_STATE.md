@@ -15,11 +15,12 @@ This document describes the implemented project surface for future edits. Eviden
 - Basin and Runoff records in older project or water-source JSON load harmlessly and do not participate in active UI, runtime editing, or new saves.
 - Older Caustics region records load into Ripple layers using the Caustic Lace overlay type.
 - New project and water-source saves use v2 water keys and omit `water_basin_regions`, `water_runoff_regions`, and `water_caustic_regions`.
-- Flow and Field stream sessions are derived render output. Ripple effect data is composed onto the active/base cloud only; stale legacy `-Ripples.generated` sessions are cleared rather than refreshed. Normal project layer persistence skips generated water output, and v2 settings plus cache data regenerate the needed in-memory output.
+- Flow and Field stream sessions are derived render output. Ripple effect data is evaluated on the active/base cloud through sparse runtime memberships and compact procedural params; stale legacy `-Ripples.generated` sessions are cleared rather than refreshed. Normal project layer persistence skips generated water output, and v2 settings plus cache data regenerate the needed in-memory output.
 
 ## Water v2 Behavior
 
-- Ripple and Field Surface Motion contribute to active/base point-cloud visual evaluation through composable `water_effect_*` scalar fields.
+- Ripple contributes to active/base point-cloud visual evaluation through sparse GPU/offline runtime memberships and params. Field Surface Motion currently contributes through composable `water_effect_*` scalar fields.
+- Ripple pattern and contribution edits can live-update compact runtime params when region membership is current, giving millisecond-scale feedback and avoiding dense full-cloud scalar uploads.
 - Water effect composition supports intensity, emission, opacity add/multiply, point-size add/multiply, and colourise contributions with add, max, multiply, screen, and override blend modes.
 - Existing base-cloud scalar mappings, including Height and Intensity driven mappings, remain active while water effects compose on top.
 - Ripple and Field regions use the authored clicked polygon boundary for containment, so concave regions preserve their cut-out areas.
@@ -27,15 +28,17 @@ This document describes the implemented project surface for future edits. Eviden
 - Flow path cache reuse, hidden branch IDs, smoothing refresh, and support-layer signatures are part of the saved/reloaded water workflow.
 - Flow Streams animate from stream age, seed, speed, wetness, confidence, width, and render time. Playback changes do not require topology regeneration.
 - Field supports user-defined Surface Motion, No Flow, Bridge Allowed, and Bridge Blocked regions.
-- Field region vector caches are saved under `Saved/water/<source-stem>-WaterFieldCache.bin` and reused when support, settings, and region fingerprints match.
+- Region-built Field vector caches are saved under `Saved/water/<source-stem>-WaterFieldCache.bin` and reused when support, settings, and region fingerprints match. Path-anchor Field caches are currently rebuilt from Flow path anchors and kept in memory.
 - Flow and Field Streamlines share the animated stream trail visualization schema; Flow follows path anchors while Field follows cached vector-field integration from perturbed source points.
 - Field streamlines stay surface-bound, split rejected gaps, fade low-confidence support when configured, and report accepted bridge, rejected gap, fade, termination, and manual control diagnostics.
-- Viewport rendering, EXR export, and MP4 preview conversion include water stream and active-cloud water-effect output without requiring water PLY export.
+- Viewport rendering, EXR export, and MP4 preview conversion include sparse Ripple runtime effects, water streams, and active-cloud Field Surface Motion output without requiring water PLY export.
+- Field Surface Motion is a candidate for the same optimization pattern as Ripples: region-bounded support, shader/offline procedural evaluation, and parameter-only updates instead of dense base-cloud field uploads when only visual settings change.
 
 ## Serialization
 
 - Project serialization uses schema version 24 for the current project shape.
 - Project documents persist Water v2 emitters, Ripple layers, Field layers, Flow stream settings, Field settings, Field stream settings, water visuals, and water path cache data.
+- Project documents also preserve water animation trail settings/profiles and caustic look settings for animation and legacy visual compatibility.
 - Standalone water-source documents persist the same active Water v2 surface needed to reload sources independently from projects.
 - Animation paths preserve water caustic look settings for current visual style compatibility.
 - Generated/effect water output is treated as derived data and is not stored as normal project source layers.
