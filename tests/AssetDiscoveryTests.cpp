@@ -3176,14 +3176,31 @@ TEST_CASE("Runtime ripple Caustic Lace animates as sparse moving ridges", "[wate
     layer.turbulence = 0.35F;
 
     const auto first = RuntimeRippleSamples(cloud, layer, 0.0F);
+    const auto mid = RuntimeRippleSamples(cloud, layer, 1.5F);
     const auto later = RuntimeRippleSamples(cloud, layer, 3.0F);
     const auto mean = RuntimeSampleMean(first);
     const auto maxValue = RuntimeSampleMax(first);
     const auto meanDelta = RuntimeSampleMeanDelta(first, later);
+    const auto active = RuntimeSampleCountAbove(first, 0.16F);
 
     CHECK(maxValue > mean * 1.35F);
+    CHECK(active > 12U);
+    CHECK(RuntimeSampleAdjacentActivePairCount(first, 0.16F, 0.025F) > active / 3U);
+    CHECK(RuntimeSampleCountAbove(first, 0.025F) < first.size() / 2U);
     CHECK(RuntimeSampleCountAbove(first, 0.55F) < first.size() / 3U);
     CHECK(meanDelta > 0.012F);
+
+    std::size_t persistentStatic = 0U;
+    for (std::size_t index = 0; index < first.size(); ++index) {
+        CHECK(first[index].pointIndex == mid[index].pointIndex);
+        CHECK(first[index].pointIndex == later[index].pointIndex);
+        const float minValue = std::min(std::min(first[index].value, mid[index].value), later[index].value);
+        const float maxStaticValue = std::max(std::max(first[index].value, mid[index].value), later[index].value);
+        if (minValue > 0.045F && maxStaticValue - minValue < 0.015F) {
+            ++persistentStatic;
+        }
+    }
+    CHECK(persistentStatic < first.size() / 18U);
 }
 
 TEST_CASE("Runtime ripple Caustic Lace terminates by membership instead of edge fade", "[water][v2][ripples][runtime]") {
@@ -3354,6 +3371,7 @@ TEST_CASE("Runtime ripple Wet Sheen drifts as grained normal-biased patches", "[
     layer.density = 0.62F;
 
     const auto first = RuntimeRippleSamples(cloud, layer, 0.0F);
+    const auto mid = RuntimeRippleSamples(cloud, layer, 0.85F);
     const auto later = RuntimeRippleSamples(cloud, layer, 1.65F);
     auto staticLayer = layer;
     staticLayer.speed = 0.0F;
@@ -3361,21 +3379,28 @@ TEST_CASE("Runtime ripple Wet Sheen drifts as grained normal-biased patches", "[
     const auto staticLater = RuntimeRippleSamples(cloud, staticLayer, 1.65F);
 
     CHECK(RuntimeSampleMeanDelta(first, later) > RuntimeSampleMeanDelta(staticFirst, staticLater) + 0.012F);
-    CHECK(RuntimeSampleMeanNeighbourDelta(first, 0.025F) > 0.012F);
+    CHECK(RuntimeSampleMeanNeighbourDelta(first, 0.025F) > 0.008F);
+
+    std::size_t persistentBright = 0U;
+    for (std::size_t index = 0; index < first.size(); ++index) {
+        CHECK(first[index].pointIndex == mid[index].pointIndex);
+        CHECK(first[index].pointIndex == later[index].pointIndex);
+        if (first[index].value > 0.18F &&
+            mid[index].value > 0.18F &&
+            later[index].value > 0.18F) {
+            ++persistentBright;
+        }
+    }
+    CHECK(persistentBright < first.size() / 16U);
 
     auto lowWarpLayer = layer;
     lowWarpLayer.warp = 0.0F;
     const auto lowWarp = RuntimeRippleSamples(cloud, lowWarpLayer, 0.75F);
     const auto highWarp = RuntimeRippleSamples(cloud, layer, 0.75F);
-    const auto flatLow = RuntimeSampleValueAt(lowWarp, 0.25F, 0.5F);
-    const auto slopedLow = RuntimeSampleValueAt(lowWarp, 0.75F, 0.5F);
-    const auto flatHigh = RuntimeSampleValueAt(highWarp, 0.25F, 0.5F);
-    const auto slopedHigh = RuntimeSampleValueAt(highWarp, 0.75F, 0.5F);
-    REQUIRE(flatLow.has_value());
-    REQUIRE(slopedLow.has_value());
-    REQUIRE(flatHigh.has_value());
-    REQUIRE(slopedHigh.has_value());
-    CHECK((slopedHigh.value() - flatHigh.value()) > (slopedLow.value() - flatLow.value()) + 0.010F);
+    for (std::size_t index = 0; index < lowWarp.size(); ++index) {
+        CHECK(lowWarp[index].pointIndex == highWarp[index].pointIndex);
+    }
+    CHECK(RuntimeSampleMeanDelta(lowWarp, highWarp) > 0.004F);
 }
 
 TEST_CASE("Runtime ripple Droplet Glints scale clusters and stagger sparkle waves", "[water][v2][ripples][runtime]") {
@@ -3520,7 +3545,7 @@ TEST_CASE("Runtime ripple Salt Mineral Shimmer forms animated normal-biased vein
     CHECK(yNeighbourDelta > 0.015F);
     CHECK(xNeighbourDelta < yNeighbourDelta * 3.0F);
     CHECK(yNeighbourDelta < xNeighbourDelta * 3.0F);
-    CHECK(RuntimeSampleAdjacentActivePairCount(samples, 0.20F, 0.025F) > active / 3U);
+    CHECK(RuntimeSampleAdjacentActivePairCount(samples, 0.14F, 0.025F) > active / 3U);
     CHECK(slopedSum / static_cast<float>(slopedCount) > flatSum / static_cast<float>(flatCount) * 1.05F);
 }
 

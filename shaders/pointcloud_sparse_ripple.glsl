@@ -146,6 +146,8 @@ vec3 RippleSafeLateral(vec3 direction) {
 float RippleCausticLaceValue(vec2 uv, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
     const float cellSize = max(0.005, wavelength * 0.78);
     const float t = -phase;
+    const float density01 = clamp(density, 0.0, 1.0);
+    const float turbulence01 = clamp(turbulence, 0.0, 1.0);
     vec2 p = uv / cellSize;
     const float warpAmount = clamp(warp, 0.0, 8.0);
     p += vec2(
@@ -178,19 +180,24 @@ float RippleCausticLaceValue(vec2 uv, float wavelength, float warp, float turbul
         }
     }
     const float ridgeDistance = secondNearest - nearest;
-    const float lineWidth = clamp(0.012 + turbulence * 0.026 + density * 0.014, 0.008, 0.10);
-    const float ridge = 1.0 - smoothstep(lineWidth, lineWidth * 4.0, ridgeDistance);
+    const float lineWidth = clamp(0.010 + turbulence01 * 0.022 + density01 * 0.012, 0.008, 0.085);
+    const float ridge = 1.0 - smoothstep(lineWidth, lineWidth * 3.7, ridgeDistance);
+    const float broadRidge = 1.0 - smoothstep(lineWidth * 1.8, lineWidth * 6.4, ridgeDistance);
     const float filamentA = RippleWavePeak((p.x * 0.23 + p.y * 0.71) + t * 0.045 + seed * 0.17, 7.0);
     const float filamentB = RippleWavePeak((p.x * -0.52 + p.y * 0.34) - t * 0.038 + seed * 0.11, 9.0);
+    const float filament = max(filamentA, filamentB);
     const float shimmer = 0.80 + 0.20 * RippleSmoothBlockNoise(
                                            uv + vec2(t * 0.021, -t * 0.017),
                                            cellSize * 0.33,
                                            seed,
                                            43.0);
-    const float coverage = smoothstep(0.84 - density * 0.42, 1.0, ridge + max(filamentA, filamentB) * 0.22);
-    const float lace = max(pow(clamp(ridge, 0.0, 1.0), 1.85), max(filamentA, filamentB) * 0.32 * ridge);
-    const float softRidge = (1.0 - smoothstep(lineWidth * 2.2, lineWidth * 8.0, ridgeDistance)) * density * 0.10;
-    return clamp(max(lace * coverage, softRidge) * shimmer, 0.0, 1.0);
+    const float ridgeEnergy = ridge * 0.88 + broadRidge * ridge * 0.18 + filament * ridge * 0.18;
+    const float coverage = smoothstep(0.30 - density01 * 0.16, 0.94, ridgeEnergy);
+    const float activeEnvelope = smoothstep(0.08, 0.62, ridge) * coverage;
+    const float lace = pow(clamp(ridge, 0.0, 1.0), 1.65) * (0.78 + filament * 0.22);
+    const float filamentLift = filament * pow(clamp(ridge, 0.0, 1.0), 1.15) * (0.14 + turbulence01 * 0.10);
+    const float softGlow = broadRidge * ridge * (0.025 + density01 * 0.045);
+    return clamp((lace + filamentLift + softGlow) * activeEnvelope * shimmer, 0.0, 1.0);
 }
 
 float RippleRainRingValue(vec2 uv, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
@@ -281,12 +288,13 @@ float RippleWetSheenValue(vec2 uv, vec3 normal, float wavelength, float warp, fl
     const float normalGrain = clamp(length(normal.xy), 0.0, 1.0);
     const float t = -phase;
     const float safeWavelength = max(wavelength, 0.005);
-    const vec2 normalBias = normal.xy * safeWavelength * (0.44 + clamp(warp, 0.0, 2.0) * 0.52);
-    const vec2 driftA = vec2(t * (0.034 + turbulence * 0.018), -t * (0.021 + clamp(warp, 0.0, 2.0) * 0.012));
-    const vec2 driftB = vec2(-t * (0.018 + clamp(warp, 0.0, 2.0) * 0.016), t * (0.029 + turbulence * 0.020));
+    const float clampedWarp = clamp(warp, 0.0, 2.0);
+    const vec2 normalBias = normal.xy * safeWavelength * (0.30 + clampedWarp * 0.38);
+    const vec2 driftA = vec2(t * (0.034 + turbulence * 0.018), -t * (0.021 + clampedWarp * 0.012));
+    const vec2 driftB = vec2(-t * (0.018 + clampedWarp * 0.016), t * (0.029 + turbulence * 0.020));
     const float warpWave =
         sin((uv.y / max(safeWavelength * 1.15, 0.010)) + seed * 0.021 + t * 0.31) *
-        safeWavelength * (0.055 + clamp(warp, 0.0, 2.0) * 0.085 + turbulence * 0.035);
+        safeWavelength * (0.045 + clampedWarp * 0.075 + turbulence * 0.035);
     const vec2 warpedUv = uv + vec2(warpWave, -warpWave * 0.58) + normalBias;
     const float lowA = RippleSmoothBlockNoise(
         warpedUv + driftA,
@@ -312,24 +320,33 @@ float RippleWetSheenValue(vec2 uv, vec3 normal, float wavelength, float warp, fl
         0.40 - density * 0.22 - turbulence * 0.08,
         0.90,
         lowA * 0.56 + lowB * 0.36 + fine * 0.12);
-    const float normalLift = slope * (0.52 + clamp(warp, 0.0, 2.0) * 0.30) +
-                             normalGrain * (0.12 + clamp(warp, 0.0, 2.0) * 0.08);
+    const float normalLift = slope * (0.34 + clampedWarp * 0.20) +
+                             normalGrain * (0.08 + clampedWarp * 0.05);
+    const float patchGate = smoothstep(0.14, 0.70, sheenPatch + lowB * 0.24 + fine * 0.10);
     const float coverage = smoothstep(
-        0.22 - density * 0.16,
-        0.94,
-        sheenPatch * 0.58 + lowA * 0.12 + normalLift);
-    const float grain = smoothstep(0.50 - turbulence * 0.20, 0.98, fine * 0.68 + micro * 0.32);
+        0.14 - density * 0.20,
+        0.90,
+        sheenPatch * (0.78 + normalLift * 0.44) + lowA * 0.18 + fine * 0.14 +
+            normalLift * patchGate * (0.16 + clampedWarp * 0.06));
+    const float grain = smoothstep(0.39 - turbulence * 0.20, 0.95, fine * 0.66 + micro * 0.34 + lowA * 0.12) *
+                        patchGate;
     const float shimmerWave = 0.50 + 0.50 * sin(
         (uv.x + uv.y * 0.41) / max(safeWavelength * 3.6, 0.020) +
         t * (0.36 + turbulence * 0.22) +
         lowB * kRippleTwoPi);
     const float glint = grain * (0.44 + shimmerWave * (0.36 + turbulence * 0.24));
-    const float pulse = 0.86 + 0.14 * sin(t * 0.58 + lowA * kRippleTwoPi + normalGrain * 2.4);
+    const float wetCycle = RippleWavePeak(
+        t * (0.24 + turbulence * 0.14) + lowA * 0.73 + lowB * 0.41 + normalGrain * 0.19,
+        1.35);
+    const float temporalGate = 0.62 + 0.38 * wetCycle;
+    const float normalResponse = 0.82 + slope * (0.55 + clampedWarp * 0.12) + normalGrain * 0.16;
     const float sheen =
-        (0.07 + sheenPatch * 0.20 + slope * (0.66 + clamp(warp, 0.0, 2.0) * 0.10) +
-         normalGrain * 0.10 + glint * (0.14 + turbulence * 0.32)) *
-        coverage;
-    return clamp(sheen * pulse, 0.0, 1.0);
+        (sheenPatch * (0.18 + slope * 0.42 + normalGrain * 0.12) +
+         patchGate * slope * clampedWarp * 0.08 +
+         glint * (0.24 + turbulence * 0.48)) *
+        coverage *
+        normalResponse;
+    return clamp(sheen * temporalGate, 0.0, 1.0);
 }
 
 float RippleDripTrailValue(vec2 uv, vec3 normal, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
@@ -342,14 +359,12 @@ float RippleDripTrailValue(vec2 uv, vec3 normal, float wavelength, float warp, f
     const float t = -phase;
     const float originDensity = clamp(0.10 + density01 * 0.78, 0.06, 0.92);
     const float originSoftMargin = 0.12 + clamp(turbulence, 0.0, 1.0) * 0.14;
-    vec2 flowDir = normal.xy;
+    vec2 flowDir = normal.xy * normal.z;
     if (dot(flowDir, flowDir) <= 1.0e-6) {
         flowDir = vec2(1.0, 0.0);
     } else {
         flowDir = normalize(flowDir);
     }
-    const float directionBlend = clamp(length(normal.xy) * 1.35 + warp * 0.08, 0.0, 1.0);
-    flowDir = normalize(mix(vec2(1.0, 0.0), flowDir, directionBlend));
     const vec2 sideDir = vec2(-flowDir.y, flowDir.x);
     float best = 0.0;
     for (int dy = -2; dy <= 2; ++dy) {
@@ -498,9 +513,9 @@ float RippleSaltMineralShimmerValue(vec2 regionUv, vec3 normal, float wavelength
     const float alongVein =
         (mineralUv.x * (0.43 + normalFlow.x * 0.15) + mineralUv.y * (0.31 + normalFlow.y * 0.15)) /
         max(wavelength * 0.36, 0.004);
-    const float shimmer = 0.58 + 0.42 * RippleWavePeak(
-                                         alongVein + t * (0.18 + turbulence * 0.12) + veinSeedA * 1.37 + veinSeedB * 0.71,
-                                         2.4);
+    const float shimmerWave = RippleWavePeak(
+        alongVein + t * (0.22 + turbulence * 0.15) + veinSeedA * 1.37 + veinSeedB * 0.71,
+        2.2);
     const float crystal = RippleSmoothBlockNoise(
         mineralUv + normalFlow * t * 0.010 + mineralAcross * t * 0.006,
         max(wavelength * 0.18, 0.004),
@@ -510,9 +525,23 @@ float RippleSaltMineralShimmerValue(vec2 regionUv, vec3 normal, float wavelength
         0.50 - density * 0.24 - normalBias * 0.14,
         0.98,
         veinNetwork + coarse * 0.20);
-    const float brightSplit = 0.72 + 0.28 * RippleWavePeak(splitPhase + crystal * 0.35, 1.8);
+    const float activityNoise = RippleSmoothBlockNoise(
+        mineralUv + normalFlow * t * 0.018 - mineralAcross * t * 0.013,
+        max(wavelength * 0.30, 0.006),
+        seed,
+        197.0);
+    const float veinActivity = smoothstep(
+        0.18,
+        0.92,
+        shimmerWave + activityNoise * (0.20 + turbulence * 0.12) + reconnect * 0.08);
+    const float brightSplit = 0.36 + 0.64 * RippleWavePeak(splitPhase + crystal * 0.35 + t * 0.035, 1.8);
     const float fineGlint = smoothstep(0.76 - turbulence * 0.16 - density * 0.10, 1.0, crystal + veinNetwork * 0.20);
-    return clamp(veinCoverage * veinNetwork * (0.34 + shimmer * 0.48 + fineGlint * 0.22) * brightSplit * (0.72 + normalBias * 0.38), 0.0, 1.0);
+    const float softVein = veinNetwork * (0.035 + coarse * 0.025) * (0.42 + veinActivity * 0.36);
+    const float brightVein = veinNetwork *
+                             veinActivity *
+                             (0.16 + shimmerWave * 0.46 + fineGlint * 0.20) *
+                             brightSplit;
+    return clamp(veinCoverage * (softVein + brightVein) * (0.72 + normalBias * 0.38), 0.0, 1.0);
 }
 
 float RippleDropletValue(vec2 uv, vec3 normal, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
@@ -658,10 +687,10 @@ float RippleCurrentThreadsValue(vec2 uv, vec3 normal, float wavelength, float wa
             const float pulseCore = RippleLine(
                 length(vec2(forward - head, lateral * 0.72)),
                 spread * (2.1 + turbulence * 0.7));
-            const float pulse = (trunk + headDrop + branch * 0.68) *
-                                    breakup *
-                                    (0.62 + originGate * 0.22 + normalBias * 0.22) +
-                                pulseCore * (0.08 + density * 0.10);
+            const float pulse = (trunk + headDrop + branch * 0.68 + pulseCore * (0.16 + density * 0.08)) *
+                                breakup *
+                                inPulse *
+                                (0.62 + originGate * 0.22 + normalBias * 0.22);
             best = max(best, pulse);
         }
     }
@@ -675,58 +704,129 @@ float RippleCurrentThreadsValue(vec2 uv, vec3 normal, float wavelength, float wa
             streamUv.x / max(wavelength * 1.9, 0.012) - t * 0.22 + fallbackNoise,
             2.1) *
         smoothstep(0.42 - density * 0.16, 0.96, fallbackNoise);
-    return clamp(max(best, fallbackPulse * 0.22) * (0.78 + normalBias * 0.30), 0.0, 1.0);
+    const float softFallback =
+        fallbackPulse *
+        (0.025 + density * 0.020) *
+        (0.35 + 0.65 * RippleWavePeak(t * 0.41 + fallbackNoise * 1.7, 1.6));
+    return clamp((best + softFallback) * (0.78 + normalBias * 0.30), 0.0, 1.0);
 }
 
 float RippleFoamSparkleValue(vec2 regionUv, float edge, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
     const float t = -phase;
-    const vec2 foamUv = regionUv + vec2(t * 0.018, -t * 0.011) * (0.4 + warp);
-    const float patchCellSize = max(wavelength * (1.10 + density * 0.72), 0.018);
+    const float density01 = clamp(density, 0.0, 1.0);
+    const float turbulence01 = clamp(turbulence, 0.0, 1.0);
+    const float driftAmount = clamp(warp, 0.0, 2.0);
+    const vec2 drift = vec2(t * (0.018 + driftAmount * 0.010), -t * (0.012 + turbulence01 * 0.008)) * driftAmount;
+    const vec2 lowWarp = vec2(
+        RippleSmoothBlockNoise(regionUv + vec2(t * 0.017, -t * 0.013) * driftAmount, max(wavelength * 1.85, 0.024), seed, 109.0),
+        RippleSmoothBlockNoise(regionUv + vec2(-t * 0.014, t * 0.019) * driftAmount, max(wavelength * 1.85, 0.024), seed, 113.0)) -
+        vec2(0.5);
+    const vec2 foamUv = regionUv + drift + lowWarp * wavelength * driftAmount * (0.28 + driftAmount * 0.24 + turbulence01 * 0.18);
+    const float patchCellSize = max(wavelength * (0.98 + density01 * 0.56), 0.018);
     const vec2 p = foamUv / patchCellSize;
     const int baseX = int(floor(p.x));
     const int baseY = int(floor(p.y));
-    const float warpAmount = clamp(warp, 0.0, 8.0);
-    float nearestPatch = 1.0e20;
-    float patchSeed = 0.0;
+    float nearest = 1.0e20;
+    float secondNearest = 1.0e20;
+    float thirdNearest = 1.0e20;
+    float nearestSeed = 0.0;
+    float secondSeed = 0.0;
+    float nearestPresence = 0.0;
+    float secondPresence = 0.0;
+    float nearestLife = 0.0;
+    float secondLife = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             const int cx = baseX + dx;
             const int cy = baseY + dy;
             const vec2 h = RippleCellHash2(cx, cy, seed, 131.0);
-            const float angle = (h.x * 1.91 + h.y * 2.37 + t * (0.020 + h.x * 0.025)) * kRippleTwoPi;
-            const vec2 drift = vec2(cos(angle), sin(angle * 1.07 + h.y * kRippleTwoPi)) *
-                               (0.04 + warpAmount * 0.035);
-            const float radius = 0.34 + h.y * 0.24 + density * 0.12;
-            const vec2 center = vec2(float(cx), float(cy)) + h + drift;
-            const float patchDistance = length(p - center) / max(radius, 0.05);
-            if (patchDistance < nearestPatch) {
-                nearestPatch = patchDistance;
-                patchSeed = RippleCellHash(cx, cy, seed, 137.0);
+            const float cycle = t * (0.026 + turbulence01 * 0.034) + h.x * 2.17 + h.y * 0.83;
+            const float cycleIndex = floor(cycle);
+            const float life = fract(cycle);
+            const vec2 cycleH = RippleCellHash2(cx, cy, seed, 157.0 + cycleIndex * 29.0);
+            const float rise = smoothstep(0.05, 0.24, life);
+            const float fall = 1.0 - smoothstep(0.58 + density01 * 0.20, 0.98, life);
+            const float presence = rise * fall;
+            const vec2 site = mix(h, cycleH, 0.48 + turbulence01 * 0.18);
+            const vec2 cycleOffset = (cycleH - 0.5) * (0.13 + density01 * 0.08 + turbulence01 * 0.10);
+            const float angle =
+                (h.x * 1.91 + h.y * 2.37 + cycleH.x * 1.11 + t * (0.020 + h.x * 0.025) * driftAmount) *
+                kRippleTwoPi;
+            const vec2 cellWobble = vec2(cos(angle), sin(angle * 1.07 + h.y * kRippleTwoPi)) *
+                                    driftAmount *
+                                    (0.026 + turbulence01 * 0.018);
+            const vec2 center = vec2(float(cx), float(cy)) + site + cycleOffset + cellWobble;
+            const float distance =
+                length(p - center) +
+                (1.0 - presence) * (0.36 + turbulence01 * 0.20 + (1.0 - density01) * 0.10);
+            const float cellSeed = RippleCellHash(cx, cy, seed, 137.0 + cycleIndex * 13.0);
+            if (distance < nearest) {
+                thirdNearest = secondNearest;
+                secondNearest = nearest;
+                secondSeed = nearestSeed;
+                secondPresence = nearestPresence;
+                secondLife = nearestLife;
+                nearest = distance;
+                nearestSeed = cellSeed;
+                nearestPresence = presence;
+                nearestLife = life;
+            } else if (distance < secondNearest) {
+                thirdNearest = secondNearest;
+                secondNearest = distance;
+                secondSeed = cellSeed;
+                secondPresence = presence;
+                secondLife = life;
+            } else if (distance < thirdNearest) {
+                thirdNearest = distance;
             }
         }
     }
-    const float cellularPatch = 1.0 - smoothstep(0.62, 1.16 + turbulence * 0.20, nearestPatch);
+    const float ridgeDistance = secondNearest - nearest;
+    const float ridgeWidth = 0.050 + density01 * 0.060 + turbulence01 * 0.036;
+    const float ridgePresence = smoothstep(0.04, 0.62, nearestPresence * secondPresence);
+    const float ridgeAge = max(nearestLife, secondLife);
+    const float cellRidge =
+        (1.0 - smoothstep(ridgeWidth, ridgeWidth * (3.8 + turbulence01 * 1.2), ridgeDistance)) *
+        ridgePresence;
+    const float junction =
+        (1.0 - smoothstep(ridgeWidth * 2.0, ridgeWidth * 7.0, thirdNearest - nearest)) *
+        ridgePresence;
     const float foamNoise = RippleSmoothBlockNoise(
-        foamUv + vec2(t * 0.010, t * 0.007),
-        max(wavelength * 0.62, 0.010),
+        foamUv + vec2(t * 0.026, -t * 0.018) * driftAmount,
+        max(wavelength * (0.36 + turbulence01 * 0.16), 0.007),
         seed,
-        109.0);
-    const float fineFleck = RippleBlockNoise(
-        foamUv + vec2(foamNoise, -foamNoise) * wavelength * 0.36,
-        max(wavelength * 0.18, 0.004),
+        149.0);
+    const float fineA = RippleSmoothBlockNoise(
+        foamUv + vec2(foamNoise, -foamNoise) * wavelength * 0.31 + vec2(t * 0.041, t * 0.027) * driftAmount,
+        max(wavelength * (0.13 + turbulence01 * 0.06), 0.0035),
         seed,
         107.0);
-    const float patchKeep = smoothstep(
-        0.34 - density * 0.18,
+    const float fineB = RippleSmoothBlockNoise(
+        foamUv * 1.37 + vec2(-foamNoise, foamNoise) * wavelength * 0.19 + vec2(-t * 0.033, t * 0.022) * driftAmount,
+        max(wavelength * (0.095 + turbulence01 * 0.045), 0.003),
+        seed,
+        151.0);
+    const float fineFleck = fineA * 0.62 + fineB * 0.38;
+    const float breakupPulse = RippleWavePeak(
+        t * (0.10 + turbulence01 * 0.16) + nearestSeed * 0.71 + secondSeed * 0.29 + foamNoise * 0.35,
+        1.7);
+    const float ageBreakup = smoothstep(0.30, 0.90, ridgeAge);
+    const float breakup = smoothstep(
+        0.24 - density01 * 0.16,
         0.92,
-        cellularPatch * 0.72 + foamNoise * 0.44);
-    const float sparkle = smoothstep(
-        0.68 - density * 0.26 - turbulence * 0.16,
+        foamNoise + breakupPulse * (0.18 + turbulence01 * 0.16) + cellRidge * 0.18);
+    const float chips = smoothstep(
+        0.74 - density01 * 0.12 - turbulence01 * 0.18,
         1.0,
-        fineFleck + cellularPatch * 0.22);
-    const float pulse = 0.64 + 0.36 * RippleWavePeak(patchSeed + fineFleck + t * (0.17 + turbulence * 0.20), 2.4);
+        fineFleck + breakupPulse * 0.18 + ageBreakup * (0.28 + turbulence01 * 0.22));
+    const float brokenRidge = cellRidge * breakup * (1.0 - chips * (0.22 + turbulence01 * 0.32));
+    const float sparkle = smoothstep(
+        0.62 - density01 * 0.22 - turbulence01 * 0.14,
+        1.0,
+        fineFleck + brokenRidge * 0.25 + junction * 0.18);
+    const float pulse = 0.76 + 0.24 * RippleWavePeak(nearestSeed + secondSeed * 0.37 + fineFleck + t * (0.17 + turbulence01 * 0.18), 2.4);
     const float edgeFade = smoothstep(0.05, 0.34, edge);
-    const float foam = patchKeep * (0.54 + cellularPatch * 0.46) + sparkle * 0.22;
+    const float foam = brokenRidge * (0.82 + junction * 0.42) + sparkle * (0.14 + turbulence01 * 0.08);
     return clamp(edgeFade * foam * pulse, 0.0, 1.0);
 }
 
