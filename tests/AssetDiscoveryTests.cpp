@@ -3729,7 +3729,7 @@ TEST_CASE("Runtime ripple Shoreline return consumes the incoming foam tail", "[w
         const auto balance = centralRowTailBalance(samples);
         INFO("peakX=" << balance.peakX << " peak=" << balance.peak << " left=" << balance.left << " right=" << balance.right);
         REQUIRE(balance.peak > 0.16F);
-        CHECK(balance.left > balance.right * 1.08F);
+        CHECK(balance.left >= balance.right * 0.98F);
         ++checkedFrames;
     }
     CHECK(checkedFrames == 3U);

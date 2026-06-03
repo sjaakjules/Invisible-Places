@@ -4162,7 +4162,7 @@ float RuntimeRippleTideBandsValue(
                 (1.0F - SmoothStep(0.91F, 1.0F, incomingProgress));
             const float value =
                 crest * (0.78F + shoreBreakup * 0.24F) * crestFade +
-                trailingFoam * (0.30F + density01 * 0.18F) * breakup;
+                trailingFoam * (0.46F + density01 * 0.34F) * breakup;
             combined = std::max(combined, value * shorewardMask);
         } else {
             const float returnProgress = SmoothStep(0.0F, 1.0F, (cycle - incomingShare) / returnShare);
@@ -4178,7 +4178,7 @@ float RuntimeRippleTideBandsValue(
             const float clearCrest = RippleLine(front, frontWidth * 1.15F);
             const float returnFade = 1.0F - SmoothStep(0.45F, 1.0F, returnProgress);
             const float value =
-                heldFoam * remainingMask * (0.32F + density01 * 0.18F) * breakup * returnFade +
+                heldFoam * remainingMask * (0.50F + density01 * 0.30F) * breakup * returnFade +
                 clearCrest * (0.34F + shoreBreakup * 0.16F) * returnFade;
             combined = std::max(combined, value * shorewardMask);
         }

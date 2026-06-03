@@ -325,7 +325,7 @@ float RippleTideBandsValue(vec2 uv, float shoreDistance, float edgeBlendWidth, f
             const float crestFade = smoothstep(0.02, 0.18, cycle) * (1.0 - smoothstep(0.91, 1.0, incomingProgress));
             const float value =
                 crest * (0.78 + shoreBreakup * 0.24) * crestFade +
-                trailingFoam * (0.30 + density01 * 0.18) * breakup;
+                trailingFoam * (0.46 + density01 * 0.34) * breakup;
             combined = max(combined, value * shorewardMask);
         } else {
             const float returnProgress = smoothstep(0.0, 1.0, (cycle - incomingShare) / returnShare);
@@ -341,7 +341,7 @@ float RippleTideBandsValue(vec2 uv, float shoreDistance, float edgeBlendWidth, f
             const float clearCrest = RippleLine(front, frontWidth * 1.15);
             const float returnFade = 1.0 - smoothstep(0.45, 1.0, returnProgress);
             const float value =
-                heldFoam * remainingMask * (0.32 + density01 * 0.18) * breakup * returnFade +
+                heldFoam * remainingMask * (0.50 + density01 * 0.30) * breakup * returnFade +
                 clearCrest * (0.34 + shoreBreakup * 0.16) * returnFade;
             combined = max(combined, value * shorewardMask);
         }
