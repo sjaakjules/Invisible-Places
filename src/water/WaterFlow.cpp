@@ -3217,26 +3217,70 @@ float RippleCausticLaceValue(const glm::vec2& uv, const WaterEffectLayer& layer,
 
 float RippleRainRingValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
     const float wavelength = std::max(0.005F, layer.wavelengthMeters);
-    const float cellSize = std::max(wavelength * 2.8F, 0.025F);
+    const float warp = std::max(0.0F, layer.warp);
+    const float turbulence = std::max(0.0F, layer.turbulence);
+    const float density01 = std::clamp(layer.density, 0.0F, 1.0F);
+    const float densityCurve = std::sqrt(density01);
+    const float cellSize = std::max(wavelength * 1.45F, std::lerp(0.34F, 0.115F, densityCurve));
     const glm::vec2 p = uv / cellSize;
-    const int baseX = static_cast<int>(std::floor(p.x));
-    const int baseY = static_cast<int>(std::floor(p.y));
+    const auto baseX = static_cast<int>(std::floor(p.x));
+    const auto baseY = static_cast<int>(std::floor(p.y));
+    const float t = -layer.phase;
+    const float rainDensity = std::clamp(0.10F + density01 * 0.78F, 0.06F, 0.92F);
+    const float width = std::max(wavelength * (0.026F + turbulence * 0.024F), 0.0022F);
+    const float closeSpacing = std::max(wavelength * (0.15F + turbulence * 0.055F), width * 3.0F);
+    const float maxRadius = std::max(
+        wavelength * (1.72F + turbulence * 0.38F + std::clamp(warp, 0.0F, 2.0F) * 0.13F),
+        cellSize * 0.46F);
     float best = 0.0F;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
+    float blend = 0.0F;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
             const int cx = baseX + dx;
             const int cy = baseY + dy;
-            const glm::vec2 center = (glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
-                                      RippleCellHash2(cx, cy, seed, 59U)) *
-                                     cellSize;
+            const float dropGate = RippleCellHash(cx, cy, seed, 71U);
+            if (dropGate > rainDensity) {
+                continue;
+            }
+            glm::vec2 center =
+                (glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
+                 RippleCellHash2(cx, cy, seed, 59U)) *
+                cellSize;
+            center += (RippleCellHash2(cx, cy, seed, 67U) - glm::vec2{0.5F}) *
+                      cellSize *
+                      std::clamp(warp, 0.0F, 2.0F) *
+                      0.13F;
             const float distance = glm::length(uv - center);
-            const float ring = RippleWavePeak((distance / wavelength) - layer.phase, 8.0F);
-            const float envelope = 1.0F - SmoothStep(wavelength * 0.25F, cellSize * 0.82F, distance);
-            const float dropSeed = 0.55F + 0.45F * RippleCellHash(cx, cy, seed, 71U);
-            best = std::max(best, ring * envelope * dropSeed);
+            const float dropSeed = RippleCellHash(cx, cy, seed, 79U);
+            const float life = Fract01(t * (0.16F + dropSeed * 0.07F + density01 * 0.025F) + dropSeed);
+            const float radius = maxRadius * SmoothStep(0.0F, 1.0F, life);
+            const float fade = std::pow(1.0F - life, 1.22F) * SmoothStep(0.025F, 0.13F, life);
+            const float reachEnvelope = 1.0F - SmoothStep(maxRadius * 0.86F, maxRadius * 1.10F, distance);
+            const float innerVisible = SmoothStep(closeSpacing * 1.1F, maxRadius * 0.82F, radius);
+            const float outerVisible = SmoothStep(closeSpacing * 0.6F, maxRadius * 0.92F, radius);
+            const float primary = RippleLine(distance - radius, width);
+            const float inner =
+                RippleLine(distance - std::max(0.0F, radius - closeSpacing * 0.92F), width * 0.72F) *
+                innerVisible *
+                0.54F;
+            const float outer =
+                RippleLine(distance - (radius + closeSpacing * 0.78F), width * 0.82F) *
+                outerVisible *
+                0.34F;
+            const float wave = RippleWavePeak(
+                (distance - radius) / std::max(closeSpacing, 0.002F) + dropSeed * 0.37F,
+                2.4F);
+            const float interference =
+                wave *
+                (1.0F - SmoothStep(width * 2.0F, closeSpacing * 3.2F, std::abs(distance - radius))) *
+                0.22F;
+            const float amplitude = (0.66F + dropSeed * 0.24F + (rainDensity - dropGate) * 0.10F) * fade * reachEnvelope;
+            const float drop = (primary + inner + outer + interference) * amplitude;
+            best = std::max(best, drop);
+            blend += drop;
         }
     }
-    return Clamp01(best);
+    return Clamp01(std::max(best, blend * (0.26F + density01 * 0.18F)));
 }
 
 float RippleDropletValue(const glm::vec2& uv, const WaterEffectLayer& layer, std::uint32_t seed) {
@@ -3401,17 +3445,23 @@ float RuntimeRippleRainRingValue(
     float density,
     float seed,
     float phase) {
-    const float cellSize = std::max(wavelength * 2.8F, 0.025F);
+    const float density01 = std::clamp(density, 0.0F, 1.0F);
+    const float densityCurve = std::sqrt(density01);
+    const float cellSize = std::max(wavelength * 1.45F, std::lerp(0.34F, 0.115F, densityCurve));
     const glm::vec2 p = uv / cellSize;
     const auto baseX = static_cast<int>(std::floor(p.x));
     const auto baseY = static_cast<int>(std::floor(p.y));
     const float t = -phase;
-    const float rainDensity = std::clamp(0.05F + density * 0.75F, 0.02F, 0.88F);
-    const float width = std::max(wavelength * (0.030F + turbulence * 0.018F), 0.0025F);
-    const float maxRadius = cellSize * 0.86F;
+    const float rainDensity = std::clamp(0.10F + density01 * 0.78F, 0.06F, 0.92F);
+    const float width = std::max(wavelength * (0.026F + turbulence * 0.024F), 0.0022F);
+    const float closeSpacing = std::max(wavelength * (0.15F + turbulence * 0.055F), width * 3.0F);
+    const float maxRadius = std::max(
+        wavelength * (1.72F + turbulence * 0.38F + std::clamp(warp, 0.0F, 2.0F) * 0.13F),
+        cellSize * 0.46F);
     float best = 0.0F;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
+    float blend = 0.0F;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
             const int cx = baseX + dx;
             const int cy = baseY + dy;
             const float dropGate = RuntimeRippleCellHash(cx, cy, seed, 71.0F);
@@ -3420,23 +3470,43 @@ float RuntimeRippleRainRingValue(
             }
             glm::vec2 center =
                 (glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
-                 RuntimeRippleCellHash2(cx, cy, seed, 59.0F)) *
+                RuntimeRippleCellHash2(cx, cy, seed, 59.0F)) *
                 cellSize;
             center += (RuntimeRippleCellHash2(cx, cy, seed, 67.0F) - glm::vec2{0.5F}) *
                       cellSize *
                       std::clamp(warp, 0.0F, 2.0F) *
-                      0.18F;
+                      0.13F;
             const float distance = glm::length(uv - center);
             const float dropSeed = RuntimeRippleCellHash(cx, cy, seed, 79.0F);
-            const float life = Fract01(t * (0.18F + dropSeed * 0.08F) + dropSeed);
+            const float life = Fract01(t * (0.16F + dropSeed * 0.07F + density01 * 0.025F) + dropSeed);
             const float radius = maxRadius * SmoothStep(0.0F, 1.0F, life);
-            const float fade = std::pow(1.0F - life, 1.35F) * SmoothStep(0.025F, 0.14F, life);
-            const float ring = RippleLine(distance - radius, width);
-            const float outer = RippleLine(distance - radius * 0.68F, width * 0.72F) * 0.24F;
-            best = std::max(best, (ring + outer) * fade * (0.72F + dropGate * 0.28F));
+            const float fade = std::pow(1.0F - life, 1.22F) * SmoothStep(0.025F, 0.13F, life);
+            const float reachEnvelope = 1.0F - SmoothStep(maxRadius * 0.86F, maxRadius * 1.10F, distance);
+            const float innerVisible = SmoothStep(closeSpacing * 1.1F, maxRadius * 0.82F, radius);
+            const float outerVisible = SmoothStep(closeSpacing * 0.6F, maxRadius * 0.92F, radius);
+            const float primary = RippleLine(distance - radius, width);
+            const float inner =
+                RippleLine(distance - std::max(0.0F, radius - closeSpacing * 0.92F), width * 0.72F) *
+                innerVisible *
+                0.54F;
+            const float outer =
+                RippleLine(distance - (radius + closeSpacing * 0.78F), width * 0.82F) *
+                outerVisible *
+                0.34F;
+            const float wave = RippleWavePeak(
+                (distance - radius) / std::max(closeSpacing, 0.002F) + dropSeed * 0.37F,
+                2.4F);
+            const float interference =
+                wave *
+                (1.0F - SmoothStep(width * 2.0F, closeSpacing * 3.2F, std::abs(distance - radius))) *
+                0.22F;
+            const float amplitude = (0.66F + dropSeed * 0.24F + (rainDensity - dropGate) * 0.10F) * fade * reachEnvelope;
+            const float drop = (primary + inner + outer + interference) * amplitude;
+            best = std::max(best, drop);
+            blend += drop;
         }
     }
-    return Clamp01(best);
+    return Clamp01(std::max(best, blend * (0.26F + density01 * 0.18F)));
 }
 
 float RuntimeRippleTideBandsValue(
@@ -3448,23 +3518,34 @@ float RuntimeRippleTideBandsValue(
     float phase) {
     const float travelDistance = std::max(wavelength, 0.015F);
     const float t = -phase;
-    const float cycle = 0.5F - 0.5F * std::cos(t * 0.095F * kRippleTwoPi);
+    const float tidePhase = t * 0.082F * kRippleTwoPi;
+    const float cycle = 0.5F - 0.5F * std::cos(tidePhase);
+    const float motion = std::sin(tidePhase);
+    const float motionDirection = motion >= 0.0F ? 1.0F : -1.0F;
     const float travel = (cycle * 2.0F - 1.0F) * travelDistance;
     const float lateralScale = std::max(wavelength * 1.35F, 0.012F);
+    const float scallopNoise = RuntimeRippleSmoothBlockNoise(
+        glm::vec2{uv.y, t * 0.035F + seed * 0.13F},
+        std::max(wavelength * 0.48F, 0.008F),
+        seed,
+        151.0F);
     const float frontWarp =
-        (std::sin((uv.y / lateralScale) + seed * 1.17F + t * 0.040F) +
-         0.52F * std::sin((uv.y / std::max(wavelength * 0.43F, 0.006F)) - seed * 0.73F + t * 0.027F)) *
-        wavelength * (0.14F + std::clamp(warp, 0.0F, 8.0F) * 0.12F + turbulence * 0.08F);
+        (std::sin((uv.y / lateralScale) + seed * 1.17F + t * 0.028F) * 0.62F +
+         std::sin((uv.y / std::max(wavelength * 0.58F, 0.006F)) - seed * 0.73F + t * 0.019F) * 0.28F +
+         (scallopNoise - 0.5F) * 1.15F) *
+        wavelength * (0.08F + std::clamp(warp, 0.0F, 8.0F) * 0.10F + turbulence * 0.06F);
     const float front = uv.x - travel - frontWarp;
-    const float wash = 1.0F - SmoothStep(wavelength * 0.06F, wavelength * 1.08F, std::abs(front));
-    const float crest = RippleLine(front, wavelength * (0.16F + turbulence * 0.06F));
-    const float scallop = 0.65F + 0.35F * RuntimeRippleSmoothBlockNoise(
-                                           glm::vec2{uv.y, travel + frontWarp},
-                                           std::max(wavelength * 0.52F, 0.008F),
-                                           seed,
-                                           151.0F);
-    const float shoreFoam = SmoothStep(0.18F, 1.0F, scallop + turbulence * 0.22F);
-    return Clamp01((wash * 0.22F + crest * 0.78F) * shoreFoam);
+    const float frontWidth = std::max(wavelength * (0.050F + turbulence * 0.028F), 0.003F);
+    const float crest = RippleLine(front, frontWidth);
+    const float trailDistance = std::max(0.0F, -front * motionDirection);
+    const float trailLength = std::max(wavelength * (0.42F + turbulence * 0.34F), frontWidth * 5.0F);
+    const float trailingFoam =
+        std::exp(-trailDistance / std::max(trailLength, 1.0e-4F)) *
+        SmoothStep(frontWidth * 0.40F, frontWidth * 1.80F, trailDistance) *
+        (1.0F - SmoothStep(trailLength, trailLength * 1.65F, trailDistance));
+    const float shoreBreakup = SmoothStep(0.24F, 0.92F, scallopNoise + turbulence * 0.22F);
+    const float calmMotion = 0.62F + 0.28F * std::abs(motion);
+    return Clamp01((crest * (0.72F + shoreBreakup * 0.28F) + trailingFoam * shoreBreakup * 0.32F) * calmMotion);
 }
 
 float RuntimeRippleWetSheenValue(
@@ -3479,73 +3560,158 @@ float RuntimeRippleWetSheenValue(
     const float slope = Clamp01(1.0F - std::abs(normal.z));
     const float normalGrain = Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
     const float t = -phase;
-    const float low = RuntimeRippleSmoothBlockNoise(
-        uv + glm::vec2{normal.x, normal.y} * wavelength * 0.65F + glm::vec2{t * 0.012F, -t * 0.009F},
-        std::max(wavelength * 1.80F, 0.018F),
+    const float safeWavelength = std::max(wavelength, 0.005F);
+    const float clampedWarp = std::clamp(warp, 0.0F, 2.0F);
+    const glm::vec2 normalBias =
+        glm::vec2{normal.x, normal.y} * safeWavelength * (0.44F + clampedWarp * 0.52F);
+    const glm::vec2 driftA{
+        t * (0.034F + turbulence * 0.018F),
+        -t * (0.021F + clampedWarp * 0.012F)};
+    const glm::vec2 driftB{
+        -t * (0.018F + clampedWarp * 0.016F),
+        t * (0.029F + turbulence * 0.020F)};
+    const float warpWave =
+        std::sin((uv.y / std::max(safeWavelength * 1.15F, 0.010F)) + seed * 0.021F + t * 0.31F) *
+        safeWavelength *
+        (0.055F + clampedWarp * 0.085F + turbulence * 0.035F);
+    const glm::vec2 warpedUv = uv + glm::vec2{warpWave, -warpWave * 0.58F} + normalBias;
+    const float lowA = RuntimeRippleSmoothBlockNoise(
+        warpedUv + driftA,
+        std::max(safeWavelength * 1.70F, 0.018F),
         seed,
         163.0F);
+    const float lowB = RuntimeRippleSmoothBlockNoise(
+        uv * 0.73F + glm::vec2{normal.y, normal.x} * safeWavelength * (0.50F + clampedWarp * 0.35F) + driftB,
+        std::max(safeWavelength * 2.45F, 0.024F),
+        seed,
+        173.0F);
     const float fine = RuntimeRippleSmoothBlockNoise(
-        uv + glm::vec2{normal.y, normal.x} * wavelength * 0.35F + glm::vec2{-t * 0.019F, t * 0.015F},
-        std::max(wavelength * 0.34F, 0.006F),
+        warpedUv + glm::vec2{-t * 0.046F, t * 0.039F},
+        std::max(safeWavelength * (0.30F - turbulence * 0.10F), 0.005F),
         seed,
         167.0F);
+    const float micro = RuntimeRippleBlockNoise(
+        warpedUv + glm::vec2{normal.y, normal.x} * safeWavelength * 0.22F + glm::vec2{t * 0.062F, -t * 0.047F},
+        std::max(safeWavelength * (0.105F - turbulence * 0.030F), 0.0025F),
+        seed,
+        181.0F);
+    const float patch = SmoothStep(
+        0.40F - density * 0.22F - turbulence * 0.08F,
+        0.90F,
+        lowA * 0.56F + lowB * 0.36F + fine * 0.12F);
+    const float normalLift = slope * (0.52F + clampedWarp * 0.30F) +
+                             normalGrain * (0.12F + clampedWarp * 0.08F);
     const float coverage = SmoothStep(
-        0.50F - density * 0.26F,
-        0.99F,
-        low * 0.36F + slope * (0.78F + warp * 0.16F) + normalGrain * 0.24F + fine * 0.16F);
-    const float glint = SmoothStep(0.76F - turbulence * 0.10F, 0.98F, fine) *
-                        (0.72F + 0.28F * RippleWavePeak(t * 0.18F + low, 2.0F));
-    const float pulse = 0.84F + 0.16F * std::sin(t * 0.42F + low * kRippleTwoPi + normalGrain * 2.0F);
-    const float sheen = (0.12F + slope * 0.78F + glint * (0.18F + turbulence * 0.16F)) * coverage;
+        0.22F - density * 0.16F,
+        0.94F,
+        patch * 0.58F + lowA * 0.12F + normalLift);
+    const float grain = SmoothStep(0.50F - turbulence * 0.20F, 0.98F, fine * 0.68F + micro * 0.32F);
+    const float shimmerWave =
+        0.50F +
+        0.50F * std::sin(
+                     (uv.x + uv.y * 0.41F) / std::max(safeWavelength * 3.6F, 0.020F) +
+                     t * (0.36F + turbulence * 0.22F) +
+                     lowB * kRippleTwoPi);
+    const float glint = grain * (0.44F + shimmerWave * (0.36F + turbulence * 0.24F));
+    const float pulse = 0.86F + 0.14F * std::sin(t * 0.58F + lowA * kRippleTwoPi + normalGrain * 2.4F);
+    const float sheen =
+        (0.07F + patch * 0.20F + slope * (0.66F + clampedWarp * 0.10F) +
+         normalGrain * 0.10F + glint * (0.14F + turbulence * 0.32F)) *
+        coverage;
     return Clamp01(sheen * pulse);
 }
 
 float RuntimeRippleDripTrailValue(
     const glm::vec2& uv,
+    const glm::vec3& normal,
     float wavelength,
     float warp,
     float turbulence,
     float density,
     float seed,
     float phase) {
-    const float cellXSize = std::max(wavelength * 2.35F, 0.040F);
-    const float cellYSize = std::max(wavelength * 1.25F, 0.024F);
-    const glm::vec2 p{uv.x / cellXSize, uv.y / cellYSize};
+    const float density01 = std::clamp(density, 0.0F, 1.0F);
+    const float densityCurve = std::sqrt(density01);
+    const float cellSize = std::max(wavelength * 1.45F, std::lerp(0.34F, 0.115F, densityCurve));
+    const glm::vec2 p = uv / cellSize;
     const auto baseX = static_cast<int>(std::floor(p.x));
     const auto baseY = static_cast<int>(std::floor(p.y));
     const float t = -phase;
-    const float originDensity = std::clamp(0.04F + density * 0.74F, 0.02F, 0.86F);
+    const float originDensity = std::clamp(0.10F + density01 * 0.78F, 0.06F, 0.92F);
+    const float originSoftMargin = 0.12F + std::clamp(turbulence, 0.0F, 1.0F) * 0.14F;
+    glm::vec2 flowDir{normal.x, normal.y};
+    if (glm::dot(flowDir, flowDir) <= 1.0e-6F) {
+        flowDir = {1.0F, 0.0F};
+    } else {
+        flowDir = glm::normalize(flowDir);
+    }
+    const float directionBlend = std::clamp(glm::length(glm::vec2{normal.x, normal.y}) * 1.35F + warp * 0.08F, 0.0F, 1.0F);
+    flowDir = glm::normalize(glm::vec2{1.0F, 0.0F} * (1.0F - directionBlend) + flowDir * directionBlend);
+    const glm::vec2 sideDir{-flowDir.y, flowDir.x};
     float best = 0.0F;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
             const int cx = baseX + dx;
             const int cy = baseY + dy;
-            const float originGate = RuntimeRippleCellHash(cx, cy, seed, 137.0F);
-            if (originGate > originDensity) {
+            const float originGate = RuntimeRippleCellHash(cx, cy, seed, 71.0F);
+            if (originGate > originDensity + originSoftMargin) {
                 continue;
             }
-            const glm::vec2 origin =
+            const float originWeight = 1.0F - SmoothStep(originDensity, originDensity + originSoftMargin, originGate);
+            glm::vec2 origin =
                 (glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
-                 RuntimeRippleCellHash2(cx, cy, seed, 139.0F)) *
-                glm::vec2{cellXSize, cellYSize};
-            const float trailSeed = RuntimeRippleCellHash(cx, cy, seed, 149.0F);
-            const float life = Fract01(t * (0.11F + trailSeed * 0.07F) + trailSeed);
-            const float trailLength = std::max(wavelength * (1.55F + std::clamp(warp, 0.0F, 8.0F) * 0.35F), 0.035F);
-            const float head = life * trailLength;
+                 RuntimeRippleCellHash2(cx, cy, seed, 59.0F)) *
+                cellSize;
+            origin += (RuntimeRippleCellHash2(cx, cy, seed, 67.0F) - glm::vec2{0.5F}) *
+                      cellSize *
+                      std::clamp(warp, 0.0F, 2.0F) *
+                      0.13F;
+            const float trailSeed = RuntimeRippleCellHash(cx, cy, seed, 79.0F);
+            const float life = Fract01(t * (0.12F + trailSeed * 0.055F + density01 * 0.018F) + trailSeed);
+            const float travel = std::max(wavelength * (1.35F + std::clamp(warp, 0.0F, 8.0F) * 0.32F + turbulence * 0.22F), 0.040F);
+            const float head = travel * SmoothStep(0.0F, 1.0F, life);
+            const float ageFade = std::pow(1.0F - life, 0.74F) * SmoothStep(0.015F, 0.12F, life);
             const glm::vec2 local = uv - origin;
-            const float behindHead = head - local.x;
-            const float tail = Clamp01(behindHead / trailLength);
+            const float along = glm::dot(local, flowDir);
+            const float cross = glm::dot(local, sideDir);
+            const float tailLength = travel * (0.28F + 0.72F * SmoothStep(0.05F, 0.80F, life));
+            const float behindHead = head - along;
+            const float tail = Clamp01(behindHead / std::max(tailLength, 1.0e-5F));
             const float inLength =
-                SmoothStep(0.0F, 0.08F, behindHead) *
-                (1.0F - SmoothStep(trailLength * 0.78F, trailLength, behindHead));
+                SmoothStep(0.0F, wavelength * 0.08F, along) *
+                SmoothStep(0.0F, wavelength * 0.10F, behindHead) *
+                (1.0F - SmoothStep(tailLength * 0.72F, tailLength, behindHead));
             const float wiggle =
-                std::sin((local.x / std::max(wavelength * 0.42F, 0.006F)) + trailSeed * kRippleTwoPi + t * 0.58F) *
-                wavelength * (0.08F + std::clamp(warp, 0.0F, 8.0F) * 0.035F + turbulence * 0.04F);
-            const float width = std::max(wavelength * (0.030F + turbulence * 0.030F), 0.0025F);
-            const float lateral = RippleLine(local.y - wiggle, width);
-            const float taper = 1.0F - tail * 0.72F;
-            const float headDrop = RippleLine(glm::length(glm::vec2{local.x - head, local.y - wiggle}), width * 2.6F);
-            best = std::max(best, lateral * inLength * taper + headDrop * 0.30F);
+                std::sin((along / std::max(wavelength * 0.40F, 0.006F)) + trailSeed * kRippleTwoPi + t * (0.42F + turbulence * 0.22F)) *
+                wavelength *
+                (0.050F + std::clamp(warp, 0.0F, 8.0F) * 0.030F + turbulence * 0.050F) *
+                SmoothStep(0.0F, travel * 0.52F, along);
+            const float width = std::max(wavelength * (0.038F + turbulence * 0.052F), 0.0038F);
+            const float activeWidth = width * (1.0F + tail * (0.65F + turbulence * 0.35F));
+            const float lateral = RippleLine(cross - wiggle, activeWidth);
+            const float wetWidth = activeWidth * (2.0F + turbulence * 1.1F) + wavelength * 0.010F;
+            const float wetTrail = RippleLine(cross - wiggle * 0.55F, wetWidth) *
+                                   inLength *
+                                   (0.18F + tail * (0.28F + turbulence * 0.16F));
+            const float wakeLength = travel * (0.16F + 0.74F * SmoothStep(0.03F, 0.92F, life));
+            const float inWake = SmoothStep(-wavelength * 0.035F, wavelength * 0.055F, along) *
+                                 (1.0F - SmoothStep(wakeLength * 0.82F, wakeLength, along));
+            const float wakeWidth = std::max(wavelength * (0.052F + turbulence * 0.050F), 0.0075F) *
+                                    (1.0F + tail * 0.70F);
+            const float wake = RippleLine(cross - wiggle * 0.35F, wakeWidth) *
+                               inWake *
+                               (0.14F + turbulence * 0.16F) *
+                               (0.35F + originWeight * 0.65F);
+            const float taper = 1.0F - tail * 0.78F;
+            const float headDrop = RippleLine(
+                glm::length(glm::vec2{along - head, cross - wiggle}),
+                width * (3.1F + turbulence * 1.4F));
+            const float bead = RippleLine(glm::length(local), width * 2.7F) * (1.0F - SmoothStep(0.18F, 0.42F, life));
+            const float trail =
+                (lateral * inLength * taper + wetTrail + wake + headDrop * 0.42F + bead * 0.20F) *
+                ageFade *
+                (0.50F + originWeight * 0.36F + trailSeed * 0.18F);
+            best = std::max(best, trail);
         }
     }
     return Clamp01(best);
@@ -3561,28 +3727,136 @@ float RuntimeRippleSaltMineralShimmerValue(
     float seed,
     float phase) {
     const float t = -phase;
-    const float normalBias = Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
+    const glm::vec2 normalXy{normal.x, normal.y};
+    const float normalBias = Clamp01(glm::length(normalXy));
+    const glm::vec2 normalFlow = normalBias > 1.0e-4F ? normalXy / normalBias : glm::vec2{0.37F, -0.21F};
+    const glm::vec2 mineralAcross{-normalFlow.y, normalFlow.x};
+    const float veinCell = std::max(wavelength * (1.05F + warp * 0.20F - density * 0.18F), 0.018F);
+    const glm::vec2 lowWarp =
+        glm::vec2{
+            RuntimeRippleSmoothBlockNoise(
+                regionUv + glm::vec2{t * 0.012F, -t * 0.009F},
+                std::max(wavelength * 1.35F, 0.018F),
+                seed,
+                113.0F),
+            RuntimeRippleSmoothBlockNoise(
+                regionUv + glm::vec2{-t * 0.010F, t * 0.014F},
+                std::max(wavelength * 1.35F, 0.018F),
+                seed,
+                127.0F)} -
+        glm::vec2{0.5F};
+    const glm::vec2 mineralUv =
+        regionUv +
+        normalFlow * wavelength * (0.50F + normalBias * 0.36F + warp * 0.20F) +
+        mineralAcross * wavelength * normalBias * 0.22F +
+        lowWarp * wavelength * (0.32F + warp * 0.30F + turbulence * 0.18F);
+
     const float coarse = RuntimeRippleSmoothBlockNoise(
-        regionUv + glm::vec2{normal.x, normal.y} * wavelength * (0.45F + warp * 0.15F) + glm::vec2{t * 0.010F, -t * 0.007F},
-        std::max(wavelength * 1.65F, 0.020F),
-        seed,
-        113.0F);
-    const float patch =
-        0.12F + 0.88F * SmoothStep(0.66F - density * 0.44F, 0.98F, coarse + normalBias * (0.16F + warp * 0.05F));
-    const float grain = RuntimeRippleBlockNoise(
-        regionUv + glm::vec2{t * 0.009F, -t * 0.006F},
-        std::max(wavelength * 0.18F, 0.004F),
-        seed,
-        127.0F);
-    const float micro = RuntimeRippleBlockNoise(
-        regionUv + glm::vec2{-t * 0.014F, t * 0.011F},
-        std::max(wavelength * 0.060F, 0.0025F),
+        mineralUv + normalFlow * wavelength * 0.35F,
+        std::max(wavelength * 1.80F, 0.020F),
         seed,
         131.0F);
-    const float crystal = SmoothStep(0.58F, 0.96F, grain);
-    const float fleck = SmoothStep(0.80F - turbulence * 0.12F - density * 0.10F, 1.0F, micro) *
-                        (0.70F + 0.30F * RippleWavePeak(t * 0.21F + grain, 2.0F));
-    return Clamp01(patch * (0.06F + crystal * 0.52F + fleck * 0.68F));
+    const float splitPhase =
+        0.5F +
+        0.5F * std::sin((t * (0.075F + turbulence * 0.045F) + coarse * 0.62F + seed * 0.013F) * kRippleTwoPi);
+    const float splitBlend = SmoothStep(0.18F, 0.82F, splitPhase);
+    const float reconnect = 1.0F - std::abs(splitBlend * 2.0F - 1.0F);
+
+    const glm::vec2 pA = mineralUv / veinCell;
+    const glm::vec2 pB =
+        (mineralUv +
+         mineralAcross * wavelength * (0.42F + normalBias * 0.26F) * (splitBlend * 2.0F - 1.0F) +
+         normalFlow * wavelength * 0.16F * reconnect) /
+        veinCell;
+    const auto baseAX = static_cast<int>(std::floor(pA.x));
+    const auto baseAY = static_cast<int>(std::floor(pA.y));
+    const auto baseBX = static_cast<int>(std::floor(pB.x));
+    const auto baseBY = static_cast<int>(std::floor(pB.y));
+    float nearestA = std::numeric_limits<float>::max();
+    float secondA = std::numeric_limits<float>::max();
+    float nearestB = std::numeric_limits<float>::max();
+    float secondB = std::numeric_limits<float>::max();
+    float veinSeedA = 0.0F;
+    float veinSeedB = 0.0F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int ax = baseAX + dx;
+            const int ay = baseAY + dy;
+            const glm::vec2 hA = RuntimeRippleCellHash2(ax, ay, seed, 149.0F);
+            const float angleA = (hA.x * 1.51F + hA.y * 2.07F + t * (0.025F + hA.y * 0.035F)) * kRippleTwoPi;
+            const glm::vec2 featureA =
+                glm::vec2{static_cast<float>(ax), static_cast<float>(ay)} +
+                hA +
+                glm::vec2{
+                    std::cos(angleA),
+                    std::sin(angleA * 1.17F + hA.x * kRippleTwoPi)} *
+                    (0.07F + turbulence * 0.045F) +
+                normalFlow * normalBias * (hA.x - 0.5F) * 0.22F;
+            const float distanceA = glm::length(pA - featureA);
+            if (distanceA < nearestA) {
+                secondA = nearestA;
+                nearestA = distanceA;
+                veinSeedA = hA.x;
+            } else if (distanceA < secondA) {
+                secondA = distanceA;
+            }
+
+            const int bx = baseBX + dx;
+            const int by = baseBY + dy;
+            const glm::vec2 hB = RuntimeRippleCellHash2(bx, by, seed, 181.0F);
+            const float angleB = (hB.x * 1.73F + hB.y * 1.39F - t * (0.030F + hB.x * 0.030F)) * kRippleTwoPi;
+            const glm::vec2 featureB =
+                glm::vec2{static_cast<float>(bx), static_cast<float>(by)} +
+                hB +
+                glm::vec2{
+                    std::sin(angleB * 1.11F + hB.y * kRippleTwoPi),
+                    std::cos(angleB)} *
+                    (0.08F + turbulence * 0.050F) -
+                mineralAcross * normalBias * (hB.y - 0.5F) * 0.20F;
+            const float distanceB = glm::length(pB - featureB);
+            if (distanceB < nearestB) {
+                secondB = nearestB;
+                nearestB = distanceB;
+                veinSeedB = hB.y;
+            } else if (distanceB < secondB) {
+                secondB = distanceB;
+            }
+        }
+    }
+
+    const float veinWidth =
+        std::clamp(0.024F + turbulence * 0.018F + density * 0.014F + normalBias * 0.010F, 0.014F, 0.085F);
+    const float veinA = 1.0F - SmoothStep(veinWidth, veinWidth * 4.0F, secondA - nearestA);
+    const float veinB = 1.0F - SmoothStep(veinWidth * 0.82F, veinWidth * 3.8F, secondB - nearestB);
+    const float bridge = std::sqrt(std::max(0.0F, veinA * veinB)) * (0.20F + reconnect * 0.48F);
+    const float veinNetwork = Clamp01(std::max(
+        std::max(veinA * (0.90F - splitBlend * 0.18F), veinB * (0.54F + splitBlend * 0.46F)),
+        bridge));
+    const float alongVein =
+        (mineralUv.x * (0.43F + normalFlow.x * 0.15F) + mineralUv.y * (0.31F + normalFlow.y * 0.15F)) /
+        std::max(wavelength * 0.36F, 0.004F);
+    const float shimmer =
+        0.58F +
+        0.42F * RippleWavePeak(
+                    alongVein + t * (0.18F + turbulence * 0.12F) + veinSeedA * 1.37F + veinSeedB * 0.71F,
+                    2.4F);
+    const float crystal = RuntimeRippleSmoothBlockNoise(
+        mineralUv + normalFlow * t * 0.010F + mineralAcross * t * 0.006F,
+        std::max(wavelength * 0.18F, 0.004F),
+        seed,
+        193.0F);
+    const float veinCoverage = SmoothStep(
+        0.50F - density * 0.24F - normalBias * 0.14F,
+        0.98F,
+        veinNetwork + coarse * 0.20F);
+    const float brightSplit = 0.72F + 0.28F * RippleWavePeak(splitPhase + crystal * 0.35F, 1.8F);
+    const float fineGlint = SmoothStep(0.76F - turbulence * 0.16F - density * 0.10F, 1.0F, crystal + veinNetwork * 0.20F);
+    return Clamp01(
+        veinCoverage *
+        veinNetwork *
+        (0.34F + shimmer * 0.48F + fineGlint * 0.22F) *
+        brightSplit *
+        (0.72F + normalBias * 0.38F));
 }
 
 float RuntimeRippleDropletValue(
@@ -3594,77 +3868,178 @@ float RuntimeRippleDropletValue(
     float density,
     float seed,
     float phase) {
-    const float cellSize = std::max(wavelength * 1.65F, 0.025F);
+    const float safeWavelength = std::max(wavelength, 0.005F);
+    const float cellSize = std::max(safeWavelength * 1.45F, 0.018F);
     const glm::vec2 p = uv / cellSize;
-    const auto cellX = static_cast<int>(std::floor(p.x));
-    const auto cellY = static_cast<int>(std::floor(p.y));
-    const glm::vec2 center =
-        (glm::vec2{static_cast<float>(cellX), static_cast<float>(cellY)} +
-         RuntimeRippleCellHash2(cellX, cellY, seed, 83.0F)) *
-        cellSize;
-    const float sparseGate = RuntimeRippleCellHash(cellX, cellY, seed, 89.0F);
-    const float keep = SmoothStep(0.96F - density * 0.72F - std::clamp(turbulence, 0.0F, 1.0F) * 0.14F, 1.0F, sparseGate);
-    const glm::vec2 clusterOffset =
-        (RuntimeRippleCellHash2(cellX, cellY, seed, 91.0F) - glm::vec2{0.5F}) *
-        cellSize *
-        std::clamp(warp, 0.0F, 2.0F) *
-        0.18F;
-    const float distance = glm::length(uv - center - clusterOffset);
-    const float geometryBias = 0.72F + 0.28F * Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
-    const float glint = 1.0F - SmoothStep(0.0F, cellSize * (0.18F + turbulence * 0.05F), distance);
-    const float satellite = 1.0F - SmoothStep(
-        0.0F,
-        cellSize * 0.11F,
-        glm::length(
-            uv -
-            center -
-            (RuntimeRippleCellHash2(cellX, cellY, seed, 93.0F) - glm::vec2{0.5F}) * cellSize * 0.55F));
-    const float pulse = 0.55F + 0.45F * RippleWavePeak(phase + sparseGate * 1.73F, 2.0F);
-    return Clamp01((std::pow(Clamp01(glint), 2.2F) + satellite * 0.42F) * keep * pulse * geometryBias);
+    const auto baseX = static_cast<int>(std::floor(p.x));
+    const auto baseY = static_cast<int>(std::floor(p.y));
+    const float t = -phase;
+    const float normalBias = Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
+    const float geometryBias = 0.64F + normalBias * (0.24F + std::clamp(warp, 0.0F, 2.0F) * 0.06F);
+    float best = 0.0F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int cellX = baseX + dx;
+            const int cellY = baseY + dy;
+            const float sparseGate = RuntimeRippleCellHash(cellX, cellY, seed, 89.0F);
+            const float keep = SmoothStep(
+                0.94F - density * 0.70F - std::clamp(turbulence, 0.0F, 1.0F) * 0.16F,
+                1.0F,
+                sparseGate);
+            const float clusterSeed = RuntimeRippleCellHash(cellX, cellY, seed, 91.0F);
+            const glm::vec2 center =
+                (glm::vec2{static_cast<float>(cellX), static_cast<float>(cellY)} +
+                 RuntimeRippleCellHash2(cellX, cellY, seed, 83.0F)) *
+                cellSize;
+            const glm::vec2 clusterOffset =
+                (RuntimeRippleCellHash2(cellX, cellY, seed, 97.0F) - glm::vec2{0.5F}) *
+                cellSize *
+                std::clamp(warp, 0.0F, 2.0F) *
+                0.24F;
+            const glm::vec2 anchor = center + clusterOffset;
+            const float clusterRadius =
+                std::max(safeWavelength * (0.17F + clusterSeed * 0.16F + turbulence * 0.08F), 0.0035F);
+            const float distance = glm::length(uv - anchor);
+            const float core = 1.0F - SmoothStep(0.0F, clusterRadius, distance);
+            const glm::vec2 satelliteA =
+                anchor + (RuntimeRippleCellHash2(cellX, cellY, seed, 101.0F) - glm::vec2{0.5F}) * clusterRadius * 2.45F;
+            const glm::vec2 satelliteB =
+                anchor + (RuntimeRippleCellHash2(cellX, cellY, seed, 103.0F) - glm::vec2{0.5F}) * clusterRadius * 3.10F;
+            const float satellite =
+                (1.0F - SmoothStep(
+                            0.0F,
+                            clusterRadius * (0.42F + turbulence * 0.12F),
+                            glm::length(uv - satelliteA))) *
+                    0.55F +
+                (1.0F - SmoothStep(
+                            0.0F,
+                            clusterRadius * (0.30F + clusterSeed * 0.18F),
+                            glm::length(uv - satelliteB))) *
+                    0.34F;
+            const float waveA = RippleWavePeak(
+                t * (0.82F + clusterSeed * 0.52F) +
+                    (anchor.x * 0.67F + anchor.y * 0.31F) / std::max(safeWavelength * 1.85F, 0.012F) +
+                    sparseGate * 2.1F,
+                2.4F);
+            const float waveB = RippleWavePeak(
+                t * (1.22F - clusterSeed * 0.32F) +
+                    (anchor.x * -0.28F + anchor.y * 0.81F) / std::max(safeWavelength * 2.60F, 0.018F) +
+                    clusterSeed * 2.7F,
+                3.4F);
+            const float twinkle = RippleWavePeak(t * (1.75F + clusterSeed * 0.65F) + sparseGate * 3.6F, 5.0F);
+            const float pulse = 0.18F + 0.58F * (waveA * 0.62F + waveB * 0.38F) + 0.24F * twinkle;
+            const float cluster = std::pow(Clamp01(core), 2.0F) + satellite;
+            best = std::max(best, cluster * keep * pulse * geometryBias);
+        }
+    }
+    return Clamp01(best);
 }
 
 float RuntimeRippleCurrentThreadsValue(
     const glm::vec2& uv,
+    const glm::vec3& normal,
     float wavelength,
     float warp,
     float turbulence,
     float density,
     float seed,
     float phase) {
-    const float spacing = std::max(wavelength * 0.90F, 0.010F);
-    const float t = -phase * 0.45F;
-    glm::vec2 warped = uv;
-    warped.y += std::sin(uv.x / std::max(wavelength * 1.8F, 0.012F) + seed * 1.2F + t * 0.18F) *
-                wavelength * (0.10F + warp * 0.18F);
-    warped.y += std::sin(uv.x / std::max(wavelength * 0.62F, 0.006F) - seed * 0.7F - t * 0.11F) *
-                wavelength * turbulence * 0.13F;
-    const float lane = std::floor(warped.y / spacing);
-    const auto branchColumn = static_cast<int>(std::floor(warped.x / std::max(spacing * 6.0F, 0.02F)));
-    const float laneSeed = RuntimeRippleCellHash(static_cast<int>(lane), branchColumn, seed, 97.0F);
-    const float laneCenter = (lane + 0.18F + laneSeed * 0.64F) * spacing;
-    const float keep = 0.55F + 0.45F * SmoothStep(0.78F - density * 0.55F, 1.0F, laneSeed);
-    const float width = spacing * (0.080F + turbulence * 0.045F);
-    const float mainLine = RippleLine(warped.y - laneCenter, width);
-    const float branchPhase = std::floor(warped.x / std::max(wavelength * 1.55F, 0.012F));
-    const auto branchIndex = static_cast<int>(branchPhase);
-    const float branchSeed = RuntimeRippleCellHash(static_cast<int>(lane), branchIndex, seed, 101.0F);
-    const float branchGate = SmoothStep(0.70F - density * 0.42F, 1.0F, branchSeed);
-    const float branchSlope = std::lerp(
-        -0.42F,
-        0.42F,
-        RuntimeRippleCellHash(static_cast<int>(lane), branchIndex, seed, 103.0F));
-    const float branchX = Fract01(warped.x / std::max(wavelength * 1.55F, 0.012F));
-    const float branchEnvelope = SmoothStep(0.05F, 0.28F, branchX) * (1.0F - SmoothStep(0.58F, 0.98F, branchX));
-    const float branch = RippleLine(
-                             warped.y - laneCenter - (branchX - 0.18F) * branchSlope * wavelength,
-                             width * 0.72F) *
-                         branchEnvelope *
-                         branchGate;
-    const float broken = SmoothStep(
-        0.22F,
-        0.94F,
-        0.5F + 0.5F * std::sin((warped.x / std::max(wavelength * 2.4F, 0.012F)) + laneSeed * kRippleTwoPi - phase * 0.55F));
-    return Clamp01((mainLine * broken + branch * 0.85F) * keep);
+    const float t = -phase;
+    const float normalBias = Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
+    const float cellXSize = std::max(wavelength * (2.10F + warp * 0.35F), 0.036F);
+    const float cellYSize = std::max(wavelength * (1.05F + turbulence * 0.35F), 0.024F);
+    glm::vec2 streamUv = uv;
+    streamUv.x += normalBias * wavelength * (0.10F + warp * 0.06F);
+    streamUv.y += std::sin(uv.x / std::max(wavelength * 1.25F, 0.010F) + seed * 1.17F + t * 0.13F) *
+                  wavelength * (0.055F + warp * 0.060F + normalBias * 0.035F);
+    streamUv.y += std::sin(uv.x / std::max(wavelength * 0.47F, 0.006F) - seed * 0.73F - t * 0.19F) *
+                  wavelength * turbulence * 0.055F;
+    const glm::vec2 p{streamUv.x / cellXSize, streamUv.y / cellYSize};
+    const auto baseX = static_cast<int>(std::floor(p.x));
+    const auto baseY = static_cast<int>(std::floor(p.y));
+    const float originDensity = std::clamp(0.16F + density * 0.66F + normalBias * 0.16F, 0.10F, 0.92F);
+    float best = 0.0F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -2; dx <= 1; ++dx) {
+            const int cx = baseX + dx;
+            const int cy = baseY + dy;
+            const float originGate = RuntimeRippleCellHash(cx, cy, seed, 199.0F);
+            if (originGate > originDensity) {
+                continue;
+            }
+            glm::vec2 origin =
+                (glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} +
+                 RuntimeRippleCellHash2(cx, cy, seed, 211.0F)) *
+                glm::vec2{cellXSize, cellYSize};
+            const float pulseSeed = RuntimeRippleCellHash(cx, cy, seed, 223.0F);
+            origin.y += (pulseSeed - 0.5F) * cellYSize * (0.22F + turbulence * 0.18F);
+            const float life = Fract01(t * (0.095F + pulseSeed * 0.075F + normalBias * 0.030F) + pulseSeed);
+            const float travelRange = cellXSize * (0.82F + warp * 0.10F + normalBias * 0.34F);
+            const float head = life * travelRange;
+            const float trailLength = std::max(wavelength * (1.15F + warp * 0.34F + normalBias * 0.44F), 0.035F);
+            const glm::vec2 local = streamUv - origin;
+            const float forward = local.x;
+            const float tail = head - forward;
+            const float inPulse =
+                SmoothStep(0.0F, wavelength * 0.11F, forward) *
+                SmoothStep(0.0F, wavelength * 0.08F, tail) *
+                (1.0F - SmoothStep(trailLength * 0.78F, trailLength, tail));
+            const float fan = Clamp01(forward / std::max(trailLength, 1.0e-4F));
+            const float wiggle =
+                std::sin(forward / std::max(wavelength * 0.42F, 0.006F) + pulseSeed * kRippleTwoPi + t * 0.37F) *
+                wavelength * (0.045F + turbulence * 0.055F + warp * 0.022F);
+            const float spread =
+                wavelength * (0.026F + turbulence * 0.026F + normalBias * 0.020F) +
+                fan * wavelength * (0.072F + warp * 0.048F + normalBias * 0.064F);
+            const float lateral = local.y - wiggle;
+            const float trunk = RippleLine(lateral, spread) * inPulse * (1.0F - fan * 0.42F);
+            const float headDrop =
+                RippleLine(glm::length(glm::vec2{(forward - head) * 0.72F, lateral}), spread * 2.75F) * 0.36F;
+            const float branchSeed = RuntimeRippleCellHash(cx, cy, seed, 227.0F);
+            const float branchGate = SmoothStep(0.54F - density * 0.30F, 1.0F, branchSeed + normalBias * 0.12F);
+            const float splitWindow = SmoothStep(0.18F, 0.48F, fan) * (1.0F - SmoothStep(0.70F, 1.0F, fan));
+            const float branchSlope = std::lerp(-0.72F, 0.72F, RuntimeRippleCellHash(cx, cy, seed, 229.0F));
+            const float branchOffset = (fan - 0.20F) * branchSlope * wavelength * (0.72F + warp * 0.38F);
+            const float branch =
+                std::max(
+                    RippleLine(lateral - branchOffset, spread * 0.58F),
+                    RippleLine(lateral + branchOffset * 0.68F, spread * 0.48F)) *
+                splitWindow *
+                branchGate *
+                inPulse;
+            const float breakupNoise = RuntimeRippleSmoothBlockNoise(
+                streamUv + glm::vec2{t * 0.018F + pulseSeed, -t * 0.011F},
+                std::max(wavelength * (0.24F + turbulence * 0.16F), 0.006F),
+                seed,
+                233.0F);
+            const float breakupPulse = RippleWavePeak(
+                forward / std::max(wavelength * 0.76F, 0.008F) - t * (0.12F + pulseSeed * 0.05F),
+                1.8F);
+            const float breakup = SmoothStep(
+                0.18F - turbulence * 0.10F,
+                0.88F,
+                breakupNoise + breakupPulse * (0.20F + turbulence * 0.16F));
+            const float pulseCore = RippleLine(
+                glm::length(glm::vec2{forward - head, lateral * 0.72F}),
+                spread * (2.1F + turbulence * 0.7F));
+            const float pulse = (trunk + headDrop + branch * 0.68F) *
+                                breakup *
+                                (0.62F + originGate * 0.22F + normalBias * 0.22F) +
+                                pulseCore * (0.08F + density * 0.10F);
+            best = std::max(best, pulse);
+        }
+    }
+    const float fallbackNoise = RuntimeRippleSmoothBlockNoise(
+        streamUv + glm::vec2{t * 0.014F, -t * 0.009F},
+        std::max(wavelength * 0.42F, 0.006F),
+        seed,
+        239.0F);
+    const float fallbackPulse =
+        RippleWavePeak(
+            streamUv.x / std::max(wavelength * 1.9F, 0.012F) - t * 0.22F + fallbackNoise,
+            2.1F) *
+        SmoothStep(0.42F - density * 0.16F, 0.96F, fallbackNoise);
+    return Clamp01(std::max(best, fallbackPulse * 0.22F) * (0.78F + normalBias * 0.30F));
 }
 
 float RuntimeRippleFoamSparkleValue(
@@ -3677,15 +4052,58 @@ float RuntimeRippleFoamSparkleValue(
     float seed,
     float phase) {
     const float t = -phase;
-    const float edgeBand = 0.12F + SmoothStep(0.01F, 0.10F, edge) * (1.0F - SmoothStep(0.78F, 1.0F, edge));
     const glm::vec2 foamUv =
         regionUv +
         glm::vec2{t * 0.018F, -t * 0.011F} * (0.4F + warp);
-    const float patch = RuntimeRippleSmoothBlockNoise(foamUv, std::max(wavelength * 2.2F, 0.018F), seed, 109.0F);
-    const float fleck = RuntimeRippleBlockNoise(foamUv, std::max(wavelength * 0.26F, 0.004F), seed, 107.0F);
-    const float keep = 0.20F + 0.80F * SmoothStep(0.74F - density * 0.54F - turbulence * 0.12F, 1.0F, fleck + patch * 0.18F);
-    const float pulse = 0.45F + 0.55F * SmoothStep(0.20F, 1.0F, Fract01(fleck + t * (0.23F + turbulence * 0.19F)));
-    return Clamp01(edgeBand * keep * pulse * (0.62F + patch * 0.38F));
+    const float patchCellSize = std::max(wavelength * (1.10F + density * 0.72F), 0.018F);
+    const glm::vec2 p = foamUv / patchCellSize;
+    const auto baseX = static_cast<int>(std::floor(p.x));
+    const auto baseY = static_cast<int>(std::floor(p.y));
+    const float warpAmount = std::clamp(warp, 0.0F, 8.0F);
+    float nearestPatch = std::numeric_limits<float>::max();
+    float patchSeed = 0.0F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int cx = baseX + dx;
+            const int cy = baseY + dy;
+            const glm::vec2 h = RuntimeRippleCellHash2(cx, cy, seed, 131.0F);
+            const float angle = (h.x * 1.91F + h.y * 2.37F + t * (0.020F + h.x * 0.025F)) * kRippleTwoPi;
+            const glm::vec2 drift{
+                std::cos(angle) * (0.04F + warpAmount * 0.035F),
+                std::sin(angle * 1.07F + h.y * kRippleTwoPi) * (0.04F + warpAmount * 0.035F),
+            };
+            const float radius = 0.34F + h.y * 0.24F + density * 0.12F;
+            const glm::vec2 center = glm::vec2{static_cast<float>(cx), static_cast<float>(cy)} + h + drift;
+            const float patchDistance = glm::length(p - center) / std::max(radius, 0.05F);
+            if (patchDistance < nearestPatch) {
+                nearestPatch = patchDistance;
+                patchSeed = RuntimeRippleCellHash(cx, cy, seed, 137.0F);
+            }
+        }
+    }
+    const float cellularPatch = 1.0F - SmoothStep(0.62F, 1.16F + turbulence * 0.20F, nearestPatch);
+    const float foamNoise = RuntimeRippleSmoothBlockNoise(
+        foamUv + glm::vec2{t * 0.010F, t * 0.007F},
+        std::max(wavelength * 0.62F, 0.010F),
+        seed,
+        109.0F);
+    const float fineFleck = RuntimeRippleBlockNoise(
+        foamUv + glm::vec2{foamNoise, -foamNoise} * wavelength * 0.36F,
+        std::max(wavelength * 0.18F, 0.004F),
+        seed,
+        107.0F);
+    const float patchKeep = SmoothStep(
+        0.34F - density * 0.18F,
+        0.92F,
+        cellularPatch * 0.72F + foamNoise * 0.44F);
+    const float sparkle = SmoothStep(
+        0.68F - density * 0.26F - turbulence * 0.16F,
+        1.0F,
+        fineFleck + cellularPatch * 0.22F);
+    const float pulse = 0.64F + 0.36F * RippleWavePeak(patchSeed + fineFleck + t * (0.17F + turbulence * 0.20F), 2.4F);
+    const float edgeFade = SmoothStep(0.05F, 0.34F, edge);
+    const float foam = patchKeep * (0.54F + cellularPatch * 0.46F) + sparkle * 0.22F;
+    return Clamp01(edgeFade * foam * pulse);
 }
 
 float RuntimeRipplePatternValue(
@@ -3715,11 +4133,11 @@ float RuntimeRipplePatternValue(
         case WaterRippleOverlayType::WetSheen:
             return RuntimeRippleWetSheenValue(uv, normal, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::CurrentThreads:
-            return RuntimeRippleCurrentThreadsValue(uv, wavelength, warp, turbulence, density, seed, phase);
+            return RuntimeRippleCurrentThreadsValue(uv, normal, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::DropletGlints:
             return RuntimeRippleDropletValue(regionUv, normal, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::DripTrails:
-            return RuntimeRippleDripTrailValue(uv, wavelength, warp, turbulence, density, seed, phase);
+            return RuntimeRippleDripTrailValue(regionUv, normal, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::FoamSparkle:
             return RuntimeRippleFoamSparkleValue(regionUv, edge, wavelength, warp, turbulence, density, seed, phase);
         case WaterRippleOverlayType::SaltMineralShimmer:
@@ -3850,6 +4268,7 @@ RipplePatternResult EvaluateRipplePattern(
         case WaterRippleOverlayType::CurrentThreads:
             result.value = RuntimeRippleCurrentThreadsValue(
                 uv,
+                normal,
                 wavelength,
                 std::max(0.0F, pattern.warp),
                 std::max(0.0F, pattern.turbulence),
@@ -3872,7 +4291,8 @@ RipplePatternResult EvaluateRipplePattern(
             break;
         case WaterRippleOverlayType::DripTrails: {
             result.value = RuntimeRippleDripTrailValue(
-                uv,
+                regionUv,
+                normal,
                 wavelength,
                 std::max(0.0F, pattern.warp),
                 std::max(0.0F, pattern.turbulence),
@@ -4167,7 +4587,7 @@ std::string_view WaterRippleOverlayTypeNameForStorage(WaterRippleOverlayType typ
         case WaterRippleOverlayType::RainRings:
             return "rain_rings";
         case WaterRippleOverlayType::TideBands:
-            return "tide_bands";
+            return "shoreline";
         case WaterRippleOverlayType::WetSheen:
             return "wet_sheen";
         case WaterRippleOverlayType::CurrentThreads:
@@ -4187,6 +4607,9 @@ std::string_view WaterRippleOverlayTypeNameForStorage(WaterRippleOverlayType typ
 }
 
 std::optional<WaterRippleOverlayType> ParseWaterRippleOverlayTypeName(std::string_view value) {
+    if (value == "tide_bands") {
+        return WaterRippleOverlayType::TideBands;
+    }
     for (const auto type : AllWaterRippleOverlayTypes()) {
         if (value == WaterRippleOverlayTypeNameForStorage(type)) {
             return type;
@@ -4299,7 +4722,7 @@ WaterRipplePatternSettings DefaultWaterRipplePatternSettings(WaterRippleOverlayT
             settings.speed = 0.45F;
             settings.warp = 0.85F;
             settings.turbulence = 0.45F;
-            settings.density = 0.28F;
+            settings.density = 0.42F;
             break;
         case WaterRippleOverlayType::FoamSparkle:
             settings.patternScale = 1.0F;
@@ -4556,7 +4979,7 @@ std::string_view WaterRippleOverlayTypeDescription(WaterRippleOverlayType type) 
         case WaterRippleOverlayType::RainRings:
             return "Sparse raindrop impacts that expand into fading circular rings.";
         case WaterRippleOverlayType::TideBands:
-            return "Slow organic shoreward wash that moves in and out along the region direction.";
+            return "Calm shoreline foam wash that moves in and out along the region direction.";
         case WaterRippleOverlayType::WetSheen:
             return "Normal-driven glossy shimmer with soft surface grain instead of wave bands.";
         case WaterRippleOverlayType::CurrentThreads:
@@ -5570,19 +5993,21 @@ void IncludeRippleEffectPoint(
     effect.blue = FloatToByte(layer.response.colouriseBlue);
     effect.mask = std::clamp(layer.regionStrength, 0.0F, 1.0F);
     effect.edge = clampedEdgeWeight;
+    const float patternEdgeWeight =
+        layer.rippleOverlayType == WaterRippleOverlayType::CausticLace ? 1.0F : clampedEdgeWeight;
     effect.value =
         Clamp01(pattern.value * std::max(0.0F, layer.response.intensity)) *
         effect.mask *
-        clampedEdgeWeight;
+        patternEdgeWeight;
     effect.ripplePotential =
-        Clamp01(std::max(0.0F, layer.response.intensity) * effect.mask * clampedEdgeWeight);
+        Clamp01(std::max(0.0F, layer.response.intensity) * effect.mask * patternEdgeWeight);
     effect.seed = seedValue;
     effect.regionId = static_cast<float>(layer.id);
     effect.distance = pattern.distance;
     effect.linearCoord = pattern.linearCoord;
     effect.angle = pattern.angle;
     effect.speed = std::max(0.0F, layer.speed);
-    effect.confidence = Clamp01(pattern.confidence * clampedEdgeWeight);
+    effect.confidence = Clamp01(pattern.confidence * patternEdgeWeight);
     effect.emissionHint = effect.value * layer.response.emissionAdd;
     effect.opacityHint = effect.value * layer.response.opacityAdd;
     effect.opacityMultiplyHint = std::lerp(
@@ -5833,9 +6258,9 @@ WaterRippleRuntimeContribution EvaluateWaterRippleRuntimeContribution(
     const float wavelength = std::max(0.005F, params.wavelengthMeters);
     const float phase = params.phase - (std::max(0.0F, timeSeconds) * std::max(0.0F, params.speed));
     const float seed =
-        membership.seed +
         static_cast<float>(params.seed) * 0.013F +
-        static_cast<float>(params.layerId) * 0.017F;
+        static_cast<float>(params.layerId) * 0.017F +
+        static_cast<float>(RippleOverlayTypeSalt(params.overlayType)) * 0.011F;
     const float value = RuntimeRipplePatternValue(
         params.overlayType,
         uv,
@@ -5850,11 +6275,13 @@ WaterRippleRuntimeContribution EvaluateWaterRippleRuntimeContribution(
         phase);
 
     const float mask = std::clamp(params.regionStrength, 0.0F, 1.0F);
+    const float edgeFactor =
+        params.overlayType == WaterRippleOverlayType::CausticLace ? 1.0F : edgeWeight;
     const float scale = Clamp01(
         value *
         std::max(0.0F, params.response.intensity) *
         mask *
-        edgeWeight);
+        edgeFactor);
 
     WaterRippleRuntimeContribution contribution;
     contribution.scale = scale;

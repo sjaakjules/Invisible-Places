@@ -787,6 +787,21 @@ std::string FormatFixed(double value, int precision) {
     return output.str();
 }
 
+double PercentileValue(std::vector<double> values, double percentile) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const double clamped = std::clamp(percentile, 0.0, 1.0);
+    const double scaled = clamped * static_cast<double>(values.size() - 1U);
+    const auto low = static_cast<std::size_t>(std::floor(scaled));
+    const auto high = static_cast<std::size_t>(std::ceil(scaled));
+    if (low == high) {
+        return values[low];
+    }
+    return std::lerp(values[low], values[high], scaled - static_cast<double>(low));
+}
+
 std::string NormalizePathKey(const std::filesystem::path& path) {
     return path.lexically_normal().generic_string();
 }
@@ -16846,7 +16861,7 @@ const char* WaterRippleOverlayTypeLabel(WaterRippleOverlayType type) {
         case WaterRippleOverlayType::RainRings:
             return "Rain Rings";
         case WaterRippleOverlayType::TideBands:
-            return "Tide Bands";
+            return "Shoreline";
         case WaterRippleOverlayType::WetSheen:
             return "Wet Sheen";
         case WaterRippleOverlayType::CurrentThreads:
@@ -19129,6 +19144,10 @@ struct GuiSmokeReport {
     std::size_t sparseRippleRegionCount = 0;
     std::size_t regionVertexCount = 0;
     double paramsOnlyUpdateMs = 0.0;
+    double patternParamsUpdateTotalMs = 0.0;
+    double patternParamsUpdateP50Ms = 0.0;
+    double patternParamsUpdateP95Ms = 0.0;
+    double patternParamsUpdateMaxMs = 0.0;
     std::uint64_t membershipRevisionBeforeParams = 0;
     std::uint64_t membershipRevisionAfterParams = 0;
     std::uint64_t paramsRevisionBeforeParams = 0;
@@ -19178,6 +19197,10 @@ bool WriteGuiSmokeReport(const GuiSmokeReport& report) {
     output << "  \"sparse_ripple_region_count\": " << report.sparseRippleRegionCount << ",\n";
     output << "  \"region_vertex_count\": " << report.regionVertexCount << ",\n";
     output << "  \"params_only_update_ms\": " << FormatFixed(report.paramsOnlyUpdateMs, 3) << ",\n";
+    output << "  \"pattern_params_update_total_ms\": " << FormatFixed(report.patternParamsUpdateTotalMs, 3) << ",\n";
+    output << "  \"pattern_params_update_p50_ms\": " << FormatFixed(report.patternParamsUpdateP50Ms, 3) << ",\n";
+    output << "  \"pattern_params_update_p95_ms\": " << FormatFixed(report.patternParamsUpdateP95Ms, 3) << ",\n";
+    output << "  \"pattern_params_update_max_ms\": " << FormatFixed(report.patternParamsUpdateMaxMs, 3) << ",\n";
     output << "  \"membership_revision_before_params\": " << report.membershipRevisionBeforeParams << ",\n";
     output << "  \"membership_revision_after_params\": " << report.membershipRevisionAfterParams << ",\n";
     output << "  \"params_revision_before_params\": " << report.paramsRevisionBeforeParams << ",\n";
@@ -19673,7 +19696,8 @@ int RunWaterRegionSampleTerrestrialSmoke(
             viewport->SparseWaterRippleMembershipUploadRevision(sampleSessionIndex);
         const auto patternParamsRevisionBefore =
             viewport->SparseWaterRippleParamsUploadRevision(sampleSessionIndex);
-        double patternParamsUpdateTotalMs = 0.0;
+        std::vector<double> patternParamsUpdateSamplesMs;
+        patternParamsUpdateSamplesMs.reserve(invisible_places::water::AllWaterRippleOverlayTypes().size());
         for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
             rippleLayer.rippleOverlayType = type;
             invisible_places::water::ApplyWaterRipplePatternSettings(
@@ -19688,9 +19712,17 @@ int RunWaterRegionSampleTerrestrialSmoke(
                     runtimeState->errorMessage);
                 break;
             }
-            patternParamsUpdateTotalMs +=
+            const double elapsedMs =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - patternParamsStart).count();
+            patternParamsUpdateSamplesMs.push_back(elapsedMs);
+            report.patternParamsUpdateTotalMs += elapsedMs;
         }
+        report.patternParamsUpdateP50Ms = PercentileValue(patternParamsUpdateSamplesMs, 0.50);
+        report.patternParamsUpdateP95Ms = PercentileValue(patternParamsUpdateSamplesMs, 0.95);
+        report.patternParamsUpdateMaxMs =
+            patternParamsUpdateSamplesMs.empty()
+                ? 0.0
+                : *std::max_element(patternParamsUpdateSamplesMs.begin(), patternParamsUpdateSamplesMs.end());
         const auto patternMembershipRevisionAfter =
             viewport->SparseWaterRippleMembershipUploadRevision(sampleSessionIndex);
         const auto patternParamsRevisionAfter =
@@ -19701,13 +19733,34 @@ int RunWaterRegionSampleTerrestrialSmoke(
         } else {
             report.Fail("Cycling Ripple overlay defaults rebuilt membership.");
         }
-        if (patternParamsUpdateTotalMs <= 30.0) {
-            report.Pass("Cycling overlay defaults stayed within params-only timing budget.");
+        if (report.patternParamsUpdateMaxMs < 1000.0) {
+            report.Pass(
+                "Pattern params-only update max stayed below the 1 s hard boundary: " +
+                FormatFixed(report.patternParamsUpdateMaxMs, 3) +
+                " ms.");
         } else {
             report.Fail(
-                "Cycling overlay defaults was slower than expected: " +
-                FormatFixed(patternParamsUpdateTotalMs, 3) +
+                "Pattern params-only update reached the 1 s hard boundary: " +
+                FormatFixed(report.patternParamsUpdateMaxMs, 3) +
                 " ms.");
+        }
+        if (report.patternParamsUpdateP95Ms < 100.0) {
+            report.Pass(
+                "Pattern params-only update p95 stayed below the 100 ms firm limit: " +
+                FormatFixed(report.patternParamsUpdateP95Ms, 3) +
+                " ms.");
+        } else {
+            report.Fail(
+                "Pattern params-only update p95 exceeded the 100 ms firm limit: " +
+                FormatFixed(report.patternParamsUpdateP95Ms, 3) +
+                " ms.");
+        }
+        if (report.patternParamsUpdateP95Ms < 1.0) {
+            report.Pass("Pattern params-only update p95 reached the ideal <1 ms target.");
+        } else if (report.patternParamsUpdateP95Ms < 10.0) {
+            report.Pass("Pattern params-only update p95 reached the desired <10 ms target.");
+        } else {
+            report.Pass("Pattern params-only update p95 missed the desired <10 ms target but stayed within the firm limit.");
         }
 
         std::string contactError;

@@ -328,6 +328,44 @@ std::optional<float> RuntimeSampleValueAt(
     return std::nullopt;
 }
 
+float RuntimeSampleMeanNeighbourDelta(const std::vector<RuntimeRippleSample>& samples, float step) {
+    float delta = 0.0F;
+    std::size_t pairs = 0U;
+    for (const auto& sample : samples) {
+        if (const auto neighbour = RuntimeSampleValueAt(samples, sample.x + step, sample.y)) {
+            delta += std::abs(sample.value - neighbour.value());
+            ++pairs;
+        }
+        if (const auto neighbour = RuntimeSampleValueAt(samples, sample.x, sample.y + step)) {
+            delta += std::abs(sample.value - neighbour.value());
+            ++pairs;
+        }
+    }
+    REQUIRE(pairs > 0U);
+    return delta / static_cast<float>(pairs);
+}
+
+std::size_t RuntimeSampleAdjacentActivePairCount(
+    const std::vector<RuntimeRippleSample>& samples,
+    float threshold,
+    float step) {
+    std::size_t pairs = 0U;
+    for (const auto& sample : samples) {
+        if (sample.value <= threshold) {
+            continue;
+        }
+        if (const auto neighbour = RuntimeSampleValueAt(samples, sample.x + step, sample.y);
+            neighbour.has_value() && neighbour.value() > threshold) {
+            ++pairs;
+        }
+        if (const auto neighbour = RuntimeSampleValueAt(samples, sample.x, sample.y + step);
+            neighbour.has_value() && neighbour.value() > threshold) {
+            ++pairs;
+        }
+    }
+    return pairs;
+}
+
 template <typename T>
 void AppendBinary(std::vector<std::byte>* bytes, const T& value) {
     const auto* begin = reinterpret_cast<const std::byte*>(&value);
@@ -3090,6 +3128,47 @@ TEST_CASE("Ripple pattern settings serialize by overlay and migrate legacy activ
     CHECK(migratedLayer.density == Catch::Approx(0.55F));
 }
 
+TEST_CASE("Ripple Shoreline storage keeps legacy tide bands compatible", "[serialization][project][water][ripples]") {
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::TideBands, 93U);
+    invisible_places::water::InitializeWaterRipplePatternSettings(&layer);
+
+    invisible_places::serialization::ProjectDocument document;
+    document.projectName = "Shoreline Ripple";
+    document.waterRippleLayers.push_back(layer);
+    const auto outputPath = std::filesystem::temp_directory_path() / "invisible_places_shoreline_ripple.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(document, outputPath, &errorMessage));
+    {
+        std::ifstream saved{outputPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{saved},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"shoreline\"") != std::string::npos);
+        CHECK(savedJson.find("\"tide_bands\"") == std::string::npos);
+    }
+
+    const auto legacyPath = std::filesystem::temp_directory_path() / "invisible_places_legacy_tide_bands_ripple.json";
+    {
+        std::ofstream legacy{legacyPath, std::ios::trunc};
+        legacy << R"({
+  "schema_version": 7,
+  "project_name": "Legacy Tide Bands",
+  "water_ripple_layers": [{
+    "id": 4,
+    "name": "legacy tide",
+    "feature_type": "ripple",
+    "overlay_type": "tide_bands",
+    "vertices": [[0,0,0],[1,0,0],[0,1,0]]
+  }]
+})";
+    }
+    const auto legacyLoaded = invisible_places::serialization::LoadProjectDocument(legacyPath, &errorMessage);
+    REQUIRE(legacyLoaded.has_value());
+    REQUIRE(legacyLoaded->waterRippleLayers.size() == 1U);
+    CHECK(legacyLoaded->waterRippleLayers.front().rippleOverlayType ==
+          invisible_places::water::WaterRippleOverlayType::TideBands);
+}
+
 TEST_CASE("Runtime ripple Caustic Lace animates as sparse moving ridges", "[water][v2][ripples][runtime]") {
     const auto cloud = MakeRippleRuntimeFixtureCloud();
     auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CausticLace, 101U);
@@ -3105,6 +3184,48 @@ TEST_CASE("Runtime ripple Caustic Lace animates as sparse moving ridges", "[wate
     CHECK(maxValue > mean * 1.35F);
     CHECK(RuntimeSampleCountAbove(first, 0.55F) < first.size() / 3U);
     CHECK(meanDelta > 0.012F);
+}
+
+TEST_CASE("Runtime ripple Caustic Lace terminates by membership instead of edge fade", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CausticLace, 107U);
+    layer.edgeBlendWidth = 0.25F;
+    layer.warp = 0.85F;
+    layer.turbulence = 0.35F;
+    const auto selection = invisible_places::water::BuildWaterRegionSelection(
+        cloud,
+        layer,
+        invisible_places::water::WaterRegionSelectionOptions{.previewOnly = true});
+    REQUIRE(selection.Valid());
+    const auto params = invisible_places::water::BuildWaterRippleRuntimeParams(layer, selection);
+
+    bool foundActiveSample = false;
+    for (std::size_t index = 0; index < cloud.positions.size(); ++index) {
+        invisible_places::water::WaterRippleRuntimeMembership edgeMembership;
+        edgeMembership.pointIndex = static_cast<std::uint32_t>(index);
+        edgeMembership.edgeDistance = 0.0F;
+        invisible_places::water::WaterRippleRuntimeMembership interiorMembership = edgeMembership;
+        interiorMembership.edgeDistance = layer.edgeBlendWidth * 2.0F;
+
+        const auto edgeContribution = invisible_places::water::EvaluateWaterRippleRuntimeContribution(
+            params,
+            edgeMembership,
+            cloud.positions[index],
+            cloud.normals[index],
+            1.0F);
+        const auto interiorContribution = invisible_places::water::EvaluateWaterRippleRuntimeContribution(
+            params,
+            interiorMembership,
+            cloud.positions[index],
+            cloud.normals[index],
+            1.0F);
+        if (interiorContribution.scale > 0.04F) {
+            foundActiveSample = true;
+            CHECK(edgeContribution.scale == Catch::Approx(interiorContribution.scale).margin(1.0e-5F));
+            break;
+        }
+    }
+    CHECK(foundActiveSample);
 }
 
 TEST_CASE("Runtime ripple Rain Rings produce sparse expanding circular peaks", "[water][v2][ripples][runtime]") {
@@ -3125,7 +3246,7 @@ TEST_CASE("Runtime ripple Rain Rings produce sparse expanding circular peaks", "
     CHECK(RuntimeSampleMaxDelta(first, later) > 0.20F);
 }
 
-TEST_CASE("Runtime ripple Tide Bands are laterally warped and slower than linear ripples", "[water][v2][ripples][runtime]") {
+TEST_CASE("Runtime ripple Shoreline is a narrow warped foam front slower than linear ripples", "[water][v2][ripples][runtime]") {
     const auto cloud = MakeRippleRuntimeFixtureCloud();
     auto tideLayer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::TideBands, 103U);
     tideLayer.wavelengthMeters = 0.20F;
@@ -3141,16 +3262,72 @@ TEST_CASE("Runtime ripple Tide Bands are laterally warped and slower than linear
     const auto linearFirst = RuntimeRippleSamples(cloud, linearLayer, 0.0F);
     const auto linearSoon = RuntimeRippleSamples(cloud, linearLayer, 0.50F);
 
-    std::vector<float> tideColumn;
-    for (const auto& sample : tideFirst) {
-        if (std::abs(sample.x - 0.5F) <= 1.0e-5F) {
-            tideColumn.push_back(sample.value);
+    float strongestColumnRange = 0.0F;
+    std::size_t sampledColumns = 0U;
+    for (std::uint32_t column = 0; column <= 40U; ++column) {
+        const float x = static_cast<float>(column) / 40.0F;
+        std::vector<float> tideColumn;
+        for (const auto& sample : tideFirst) {
+            if (std::abs(sample.x - x) <= 1.0e-5F) {
+                tideColumn.push_back(sample.value);
+            }
+        }
+        if (tideColumn.size() <= 10U) {
+            continue;
+        }
+        ++sampledColumns;
+        const auto [minColumn, maxColumn] = std::minmax_element(tideColumn.begin(), tideColumn.end());
+        strongestColumnRange = std::max(strongestColumnRange, *maxColumn - *minColumn);
+    }
+    REQUIRE(sampledColumns > 10U);
+    CHECK(strongestColumnRange > 0.035F);
+    CHECK(RuntimeSampleCountAbove(tideFirst, 0.16F) < tideFirst.size() / 5U);
+    CHECK(RuntimeSampleMeanDelta(tideFirst, tideSoon) < RuntimeSampleMeanDelta(linearFirst, linearSoon) * 0.75F);
+}
+
+TEST_CASE("Runtime ripple Foam Sparkle fades inward from the region edge", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::FoamSparkle, 109U);
+    layer.edgeBlendWidth = 0.25F;
+    layer.wavelengthMeters = 0.10F;
+    layer.warp = 0.45F;
+    layer.turbulence = 0.62F;
+    layer.density = 0.70F;
+    const auto selection = invisible_places::water::BuildWaterRegionSelection(
+        cloud,
+        layer,
+        invisible_places::water::WaterRegionSelectionOptions{.previewOnly = true});
+    REQUIRE(selection.Valid());
+    const auto params = invisible_places::water::BuildWaterRippleRuntimeParams(layer, selection);
+
+    float strongestInterior = 0.0F;
+    float nearEdgeAtStrongest = 0.0F;
+    for (std::size_t index = 0; index < cloud.positions.size(); ++index) {
+        invisible_places::water::WaterRippleRuntimeMembership nearEdgeMembership;
+        nearEdgeMembership.pointIndex = static_cast<std::uint32_t>(index);
+        nearEdgeMembership.edgeDistance = layer.edgeBlendWidth * 0.20F;
+        invisible_places::water::WaterRippleRuntimeMembership interiorMembership = nearEdgeMembership;
+        interiorMembership.edgeDistance = layer.edgeBlendWidth * 2.0F;
+
+        const auto nearEdgeContribution = invisible_places::water::EvaluateWaterRippleRuntimeContribution(
+            params,
+            nearEdgeMembership,
+            cloud.positions[index],
+            cloud.normals[index],
+            1.35F);
+        const auto interiorContribution = invisible_places::water::EvaluateWaterRippleRuntimeContribution(
+            params,
+            interiorMembership,
+            cloud.positions[index],
+            cloud.normals[index],
+            1.35F);
+        if (interiorContribution.scale > strongestInterior) {
+            strongestInterior = interiorContribution.scale;
+            nearEdgeAtStrongest = nearEdgeContribution.scale;
         }
     }
-    REQUIRE(tideColumn.size() > 10U);
-    const auto [minColumn, maxColumn] = std::minmax_element(tideColumn.begin(), tideColumn.end());
-    CHECK((*maxColumn - *minColumn) > 0.035F);
-    CHECK(RuntimeSampleMeanDelta(tideFirst, tideSoon) < RuntimeSampleMeanDelta(linearFirst, linearSoon) * 0.75F);
+    REQUIRE(strongestInterior > 0.04F);
+    CHECK(nearEdgeAtStrongest < strongestInterior * 0.50F);
 }
 
 TEST_CASE("Runtime ripple Wet Sheen responds to normals instead of linear bands", "[water][v2][ripples][runtime]") {
@@ -3167,22 +3344,155 @@ TEST_CASE("Runtime ripple Wet Sheen responds to normals instead of linear bands"
     CHECK(slopedValue.value() > flatValue.value() + 0.08F);
 }
 
-TEST_CASE("Runtime ripple Salt Mineral Shimmer is granular without directional bands", "[water][v2][ripples][runtime]") {
+TEST_CASE("Runtime ripple Wet Sheen drifts as grained normal-biased patches", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::WetSheen, 108U);
+    layer.wavelengthMeters = 0.24F;
+    layer.speed = 0.95F;
+    layer.warp = 1.15F;
+    layer.turbulence = 0.66F;
+    layer.density = 0.62F;
+
+    const auto first = RuntimeRippleSamples(cloud, layer, 0.0F);
+    const auto later = RuntimeRippleSamples(cloud, layer, 1.65F);
+    auto staticLayer = layer;
+    staticLayer.speed = 0.0F;
+    const auto staticFirst = RuntimeRippleSamples(cloud, staticLayer, 0.0F);
+    const auto staticLater = RuntimeRippleSamples(cloud, staticLayer, 1.65F);
+
+    CHECK(RuntimeSampleMeanDelta(first, later) > RuntimeSampleMeanDelta(staticFirst, staticLater) + 0.012F);
+    CHECK(RuntimeSampleMeanNeighbourDelta(first, 0.025F) > 0.012F);
+
+    auto lowWarpLayer = layer;
+    lowWarpLayer.warp = 0.0F;
+    const auto lowWarp = RuntimeRippleSamples(cloud, lowWarpLayer, 0.75F);
+    const auto highWarp = RuntimeRippleSamples(cloud, layer, 0.75F);
+    const auto flatLow = RuntimeSampleValueAt(lowWarp, 0.25F, 0.5F);
+    const auto slopedLow = RuntimeSampleValueAt(lowWarp, 0.75F, 0.5F);
+    const auto flatHigh = RuntimeSampleValueAt(highWarp, 0.25F, 0.5F);
+    const auto slopedHigh = RuntimeSampleValueAt(highWarp, 0.75F, 0.5F);
+    REQUIRE(flatLow.has_value());
+    REQUIRE(slopedLow.has_value());
+    REQUIRE(flatHigh.has_value());
+    REQUIRE(slopedHigh.has_value());
+    CHECK((slopedHigh.value() - flatHigh.value()) > (slopedLow.value() - flatLow.value()) + 0.010F);
+}
+
+TEST_CASE("Runtime ripple Droplet Glints scale clusters and stagger sparkle waves", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::DropletGlints, 109U);
+    layer.speed = 1.20F;
+    layer.warp = 0.70F;
+    layer.turbulence = 0.58F;
+    layer.density = 0.78F;
+
+    auto smallCluster = layer;
+    smallCluster.wavelengthMeters = 0.055F;
+    auto largeCluster = layer;
+    largeCluster.wavelengthMeters = 0.18F;
+    const auto small = RuntimeRippleSamples(cloud, smallCluster, 0.35F);
+    const auto large = RuntimeRippleSamples(cloud, largeCluster, 0.35F);
+    CHECK(RuntimeSampleAdjacentActivePairCount(large, 0.035F, 0.025F) >
+          RuntimeSampleAdjacentActivePairCount(small, 0.035F, 0.025F) + 2U);
+
+    layer.wavelengthMeters = 0.11F;
+    const auto first = RuntimeRippleSamples(cloud, layer, 0.0F);
+    const auto later = RuntimeRippleSamples(cloud, layer, 0.85F);
+    std::size_t brightened = 0U;
+    std::size_t dimmed = 0U;
+    for (std::size_t index = 0; index < first.size(); ++index) {
+        CHECK(first[index].pointIndex == later[index].pointIndex);
+        if (later[index].value > first[index].value + 0.015F) {
+            ++brightened;
+        }
+        if (first[index].value > later[index].value + 0.015F) {
+            ++dimmed;
+        }
+    }
+    CHECK(brightened > 2U);
+    CHECK(dimmed > 2U);
+    CHECK(RuntimeSampleMaxDelta(first, later) > 0.04F);
+}
+
+TEST_CASE("Runtime ripple Current Threads spread as sparse downhill pulses", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::CurrentThreads, 110U);
+    layer.wavelengthMeters = 0.14F;
+    layer.speed = 0.72F;
+    layer.warp = 0.82F;
+    layer.turbulence = 0.58F;
+    layer.density = 0.58F;
+
+    const auto first = RuntimeRippleSamples(cloud, layer, 0.0F);
+    const auto later = RuntimeRippleSamples(cloud, layer, 2.4F);
+    const auto mean = RuntimeSampleMean(first);
+    const auto maxValue = RuntimeSampleMax(first);
+    const auto active = RuntimeSampleCountAbove(first, 0.16F);
+
+    CHECK(maxValue > mean * 1.55F);
+    CHECK(active > 6U);
+    CHECK(active < first.size() / 4U);
+    CHECK(RuntimeSampleMaxDelta(first, later) > 0.14F);
+
+    float flatSum = 0.0F;
+    float slopedSum = 0.0F;
+    std::size_t flatCount = 0U;
+    std::size_t slopedCount = 0U;
+    std::unordered_map<int, std::size_t> activeRows;
+    std::unordered_map<int, std::size_t> activeColumns;
+    std::unordered_map<int, std::size_t> spreadRows;
+    for (const auto& sample : first) {
+        if (sample.x <= 0.50F) {
+            flatSum += sample.value;
+            ++flatCount;
+        } else {
+            slopedSum += sample.value;
+            ++slopedCount;
+        }
+        if (sample.value > 0.16F) {
+            ++activeRows[static_cast<int>(std::lround(sample.y * 1000.0F))];
+            ++activeColumns[static_cast<int>(std::lround(sample.x * 1000.0F))];
+        }
+        if (sample.value > 0.08F) {
+            ++spreadRows[static_cast<int>(std::lround(sample.y * 1000.0F))];
+        }
+    }
+    REQUIRE(flatCount > 0U);
+    REQUIRE(slopedCount > 0U);
+    CHECK(slopedSum / static_cast<float>(slopedCount) > flatSum / static_cast<float>(flatCount) * 1.08F);
+    CHECK(spreadRows.size() > 3U);
+    CHECK(activeColumns.size() > 3U);
+    CHECK(std::all_of(activeRows.begin(), activeRows.end(), [](const auto& row) { return row.second < 18U; }));
+}
+
+TEST_CASE("Runtime ripple Salt Mineral Shimmer forms animated normal-biased vein networks", "[water][v2][ripples][runtime]") {
     const auto cloud = MakeRippleRuntimeFixtureCloud();
     auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::SaltMineralShimmer, 105U);
     layer.wavelengthMeters = 0.14F;
+    layer.warp = 0.46F;
     layer.turbulence = 0.46F;
+    layer.density = 0.42F;
+    layer.speed = 0.55F;
 
     const auto samples = RuntimeRippleSamples(cloud, layer, 1.0F);
+    const auto later = RuntimeRippleSamples(cloud, layer, 3.6F);
     const auto mean = RuntimeSampleMean(samples);
     const auto maxValue = RuntimeSampleMax(samples);
-    CHECK(maxValue > mean * 1.45F);
-    CHECK(RuntimeSampleCountAbove(samples, 0.45F) > 4U);
+    const auto active = RuntimeSampleCountAbove(samples, 0.20F);
+    CHECK(maxValue > mean * 1.50F);
+    CHECK(active > 8U);
+    CHECK(active < samples.size() / 3U);
+    CHECK(RuntimeSampleMeanDelta(samples, later) > 0.018F);
+    CHECK(RuntimeSampleMaxDelta(samples, later) > 0.12F);
 
     float xNeighbourDelta = 0.0F;
     float yNeighbourDelta = 0.0F;
     std::size_t xPairs = 0U;
     std::size_t yPairs = 0U;
+    float flatSum = 0.0F;
+    float slopedSum = 0.0F;
+    std::size_t flatCount = 0U;
+    std::size_t slopedCount = 0U;
     for (const auto& sample : samples) {
         if (const auto neighbour = RuntimeSampleValueAt(samples, sample.x + 0.025F, sample.y)) {
             xNeighbourDelta += std::abs(sample.value - neighbour.value());
@@ -3192,15 +3502,26 @@ TEST_CASE("Runtime ripple Salt Mineral Shimmer is granular without directional b
             yNeighbourDelta += std::abs(sample.value - neighbour.value());
             ++yPairs;
         }
+        if (sample.x <= 0.50F) {
+            flatSum += sample.value;
+            ++flatCount;
+        } else {
+            slopedSum += sample.value;
+            ++slopedCount;
+        }
     }
     REQUIRE(xPairs > 0U);
     REQUIRE(yPairs > 0U);
+    REQUIRE(flatCount > 0U);
+    REQUIRE(slopedCount > 0U);
     xNeighbourDelta /= static_cast<float>(xPairs);
     yNeighbourDelta /= static_cast<float>(yPairs);
     CHECK(xNeighbourDelta > 0.015F);
     CHECK(yNeighbourDelta > 0.015F);
     CHECK(xNeighbourDelta < yNeighbourDelta * 3.0F);
     CHECK(yNeighbourDelta < xNeighbourDelta * 3.0F);
+    CHECK(RuntimeSampleAdjacentActivePairCount(samples, 0.20F, 0.025F) > active / 3U);
+    CHECK(slopedSum / static_cast<float>(slopedCount) > flatSum / static_cast<float>(flatCount) * 1.05F);
 }
 
 TEST_CASE("Runtime ripple Drip Trails are sparse tapered origins instead of continuous lanes", "[water][v2][ripples][runtime]") {
@@ -3230,6 +3551,26 @@ TEST_CASE("Runtime ripple Drip Trails are sparse tapered origins instead of cont
         widestRow = std::max(widestRow, count);
     }
     CHECK(widestRow < 18U);
+}
+
+TEST_CASE("Runtime ripple Drip Trails default settings produce visible sparse contact samples", "[water][v2][ripples][runtime]") {
+    const auto cloud = MakeRippleRuntimeFixtureCloud();
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::DripTrails, 111U);
+    invisible_places::water::ApplyWaterRipplePatternSettings(
+        &layer,
+        invisible_places::water::DefaultWaterRipplePatternSettings(layer.rippleOverlayType));
+
+    const auto first = RuntimeRippleSamples(cloud, layer, 0.0F);
+    const auto mid = RuntimeRippleSamples(cloud, layer, 1.35F);
+    const auto later = RuntimeRippleSamples(cloud, layer, 2.70F);
+    const auto active =
+        RuntimeSampleCountAbove(first, 0.02F) +
+        RuntimeSampleCountAbove(mid, 0.02F) +
+        RuntimeSampleCountAbove(later, 0.02F);
+    CHECK(active > 0U);
+    CHECK(active < (first.size() + mid.size() + later.size()) / 3U);
+    CHECK(std::max({RuntimeSampleMax(first), RuntimeSampleMax(mid), RuntimeSampleMax(later)}) > 0.04F);
+    CHECK(RuntimeSampleMaxDelta(first, later) > 0.03F);
 }
 
 TEST_CASE("Ripple and Field effects compose onto base cloud visual evaluation", "[water][v2][effects][output]") {

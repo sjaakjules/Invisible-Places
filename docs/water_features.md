@@ -130,7 +130,7 @@ Each Ripple overlay type now produces a distinct sparse runtime contribution:
 - `Linear Ripples`: parallel phase bands along the layer direction.
 - `Radial Ripples`: symmetric expanding rings around the region centre.
 - `Rain Rings`: seeded local ring impacts across the region.
-- `Tide Bands`: broad slow bands for large sand or sheet-water regions.
+- `Shoreline`: calm advancing and receding foam wash for shore-like regions.
 - `Wet Sheen`: slope-sensitive wet highlights with low-frequency variation.
 - `Current Threads`: thin stretched directional streaks.
 - `Droplet Glints`: sparse seeded point glints and pulses.

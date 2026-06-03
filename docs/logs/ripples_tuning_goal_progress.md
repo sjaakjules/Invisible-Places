@@ -1,0 +1,6 @@
+# Ripples Tuning Goal Progress
+
+2026-06-03 | Documentation | `docs/ripples_tuning.md`, `docs/RipplesTuning_GOAL.md` | Started | GPU-first Ripple tuning contract and goal checkpoints created.
+2026-06-03 | Pattern implementation | `shaders/pointcloud_sparse_ripple.glsl`, `src/water/WaterFlow.cpp`, `src/app/Application.cpp`, `tests/AssetDiscoveryTests.cpp` | Completed | GPU-first runtime params retained; GLSL and C++ mirror paths tuned for Caustic Lace, Rain Rings, Shoreline, Wet Sheen, Current Threads, Droplet Glints, Drip Trails, Foam Sparkle, and Mineral Shimmer.
+2026-06-03 | Visual smoke evidence | `build/macos-debug/water-region-smoke/water-ripple-patterns-test-points.json`, `ripple-pattern-contact-sheet.ppm`, `ripple-pattern-contact-sheet.exr`, `ripple-pattern-contact-sheet.png` | Passed | Contact sheet produced active visual samples for every Ripple overlay; params-only update p50 0.009 ms, p95 0.022 ms, max 0.034 ms; membership revision stayed unchanged at 1 while params revision advanced.
+2026-06-03 | Required validation | `cmake --build build/macos-debug --target invisible_places_tests`; `cmake --build build/macos-debug --target invisible_places`; focused and full `ctest`; `git diff --check` | Passed | Focused Water/Ripple CTest passed 33/33; full CTest passed 154/154; diff check clean.
