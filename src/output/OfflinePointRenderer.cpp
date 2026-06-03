@@ -34,6 +34,7 @@ constexpr std::size_t kWaterJitterSeedFieldSlot = 12U;
 constexpr std::size_t kWaterTrailAgeFieldSlot = 13U;
 constexpr std::size_t kWaterFeatureTypeFieldSlot = 15U;
 constexpr std::size_t kWaterStreamRoleFieldSlot = 0U;
+constexpr std::size_t kWaterStreamDistanceFieldSlot = 7U;
 constexpr std::size_t kWaterStreamLengthFieldSlot = 8U;
 constexpr std::size_t kWaterStreamRouteStartFieldSlot = 9U;
 constexpr std::size_t kWaterStreamRouteCountFieldSlot = 10U;
@@ -452,8 +453,7 @@ float WaterStreamTravelPhase(
     std::size_t pointIndex,
     float timeSeconds) {
     const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterStreamRouteLengthFieldSlot, pointIndex));
-    const float streamLength = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamLengthFieldSlot, pointIndex));
-    const float pointAge = Clamp01(ScalarFieldValueBySlot(cloud, kWaterStreamPointAgeFieldSlot, pointIndex));
+    const float streamDistance = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamDistanceFieldSlot, pointIndex));
     const float streamAge = ScalarFieldValueBySlot(cloud, kWaterStreamAgeFieldSlot, pointIndex);
     const float streamStartPhase = ScalarFieldValueBySlot(cloud, kWaterStreamStartPhaseFieldSlot, pointIndex);
     const float speed = std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterStreamSpeedFieldSlot, pointIndex));
@@ -461,7 +461,7 @@ float WaterStreamTravelPhase(
         streamStartPhase +
         streamAge +
         std::max(0.0F, timeSeconds) * speed / routeLength -
-        pointAge * streamLength / routeLength);
+        streamDistance / routeLength);
 }
 
 float WaterStreamHash(float a, float b, float c) {

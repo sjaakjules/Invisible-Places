@@ -7277,6 +7277,20 @@ WaterRippleRuntimeParams BuildWaterRippleRuntimeParams(
     return params;
 }
 
+WaterRippleRuntimeParams BuildWaterRippleRuntimeParams(const WaterEffectLayer& layer) {
+    WaterRegionSelection selection;
+    selection.layerId = layer.id;
+    selection.featureType = layer.featureType;
+    selection.targetLayerSourcePath = layer.targetLayerSourcePath;
+    selection.targetLayerKey = layer.targetLayerSourcePath.generic_string();
+    selection.boundary = BuildWaterRegionBoundary(layer.vertices);
+    selection.hull = layer.hull.empty() ? BuildWaterRegionHull(layer.vertices) : layer.hull;
+    for (const auto& vertex : selection.boundary) {
+        selection.bounds.Expand(vertex);
+    }
+    return BuildWaterRippleRuntimeParams(layer, selection);
+}
+
 std::vector<WaterRippleRuntimeMembership> BuildWaterRippleRuntimeMemberships(
     const WaterRegionSelection& selection,
     std::uint32_t paramIndex) {

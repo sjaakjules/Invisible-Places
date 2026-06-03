@@ -3097,6 +3097,78 @@ TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][
     CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, source));
 }
 
+TEST_CASE("Water Flow trail point spacing creates dense moving trail samples", "[water][flow][trail]") {
+    invisible_places::water::WaterOverlay anchors;
+    constexpr std::uint32_t branchId = 101U;
+    for (std::uint32_t index = 0; index <= 80U; ++index) {
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = {static_cast<float>(index) * 0.020F, 0.0F, 0.0F};
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = static_cast<float>(branchId);
+        point.emitterId = 1.0F;
+        point.pathDistance = static_cast<float>(index) * 0.020F;
+        point.speed = 1.0F;
+        point.width = 0.030F;
+        point.confidence = 1.0F;
+        point.accumulation = 0.75F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::water::WaterFlowStreamSettings settings;
+    settings.streamCountTotal = 97U;
+    settings.laneCount = 39U;
+    settings.laneSpreadMeters = 0.030F;
+    settings.laneCrossing = 1.0F;
+    settings.turbulence = 0.0F;
+    settings.speedMetersPerSecond = 0.17F;
+    settings.surfaceOffsetMeters = 0.004F;
+    settings.seed = 37U;
+    settings.streamLengthMeters = 0.24F;
+    settings.streamPointSpacingMeters = 0.004F;
+    settings.streamWidthMeters = 0.011F;
+    settings.streamWorldLengthMeters = 0.022F;
+
+    const auto overlay = invisible_places::water::BuildFlowStreamOverlayFromPathAnchors(anchors, settings);
+    REQUIRE_FALSE(overlay.samples.empty());
+
+    const auto expectedSamplesPerTrail = std::max<std::uint32_t>(
+        2U,
+        static_cast<std::uint32_t>(
+            std::ceil(settings.streamLengthMeters / settings.streamPointSpacingMeters)) +
+            1U);
+    std::unordered_map<std::uint32_t, std::vector<float>> distancesByTrail;
+    std::size_t visibleSampleCount = 0U;
+    for (const auto& sample : overlay.samples) {
+        if (sample.streamRole < 0.5F) {
+            continue;
+        }
+        const auto streamId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(sample.streamId + 0.5F)));
+        distancesByTrail[streamId].push_back(sample.streamDistance);
+        ++visibleSampleCount;
+        CHECK(sample.streamLaneCount == Catch::Approx(static_cast<float>(settings.laneCount)));
+        CHECK(sample.streamWidth >= settings.streamWidthMeters * 0.80F);
+        CHECK(sample.streamWorldLength >= settings.streamWorldLengthMeters);
+        CHECK(sample.streamWorldLength >= settings.streamPointSpacingMeters * 2.5F);
+    }
+
+    CHECK(distancesByTrail.size() == settings.streamCountTotal);
+    CHECK(visibleSampleCount == distancesByTrail.size() * expectedSamplesPerTrail);
+    for (auto& [streamId, distances] : distancesByTrail) {
+        CAPTURE(streamId);
+        REQUIRE(distances.size() == expectedSamplesPerTrail);
+        std::sort(distances.begin(), distances.end());
+        CHECK(distances.front() == Catch::Approx(0.0F));
+        CHECK(distances.back() >= settings.streamLengthMeters - settings.streamPointSpacingMeters);
+        float largestGap = 0.0F;
+        for (std::size_t index = 1U; index < distances.size(); ++index) {
+            largestGap = std::max(largestGap, distances[index] - distances[index - 1U]);
+        }
+        CHECK(largestGap <= settings.streamPointSpacingMeters * 1.01F);
+    }
+}
+
 TEST_CASE("Calm Water Flow lanes keep path analysis as a bounded guide", "[water][flow][lanes]") {
     invisible_places::water::WaterOverlay anchors;
     constexpr std::uint32_t branchId = 77U;
@@ -3498,6 +3570,75 @@ TEST_CASE("Ripple Shoreline storage keeps legacy tide bands compatible", "[seria
     REQUIRE(legacyLoaded->waterRippleLayers.size() == 1U);
     CHECK(legacyLoaded->waterRippleLayers.front().rippleOverlayType ==
           invisible_places::water::WaterRippleOverlayType::TideBands);
+}
+
+TEST_CASE("Ripple runtime cache serializes sparse memberships and params", "[serialization][project][water][ripples]") {
+    auto layer = MakeRippleTestLayer(invisible_places::water::WaterRippleOverlayType::RainRings, 94U);
+    layer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    invisible_places::water::InitializeWaterRipplePatternSettings(&layer);
+    layer.response.emissionAdd = 1.35F;
+    auto params = invisible_places::water::BuildWaterRippleRuntimeParams(layer);
+    params.regionStrength = 1.45F;
+
+    invisible_places::water::WaterRippleRuntimeMembership membership;
+    membership.pointIndex = 42U;
+    membership.paramIndex = 0U;
+    membership.edgeDistance = 0.33F;
+    membership.seed = 0.72F;
+    membership.shoreDistance = 1.25F;
+
+    invisible_places::serialization::WaterRippleRuntimeCacheDocument cache;
+    cache.supportLayerPath = layer.targetLayerSourcePath;
+    cache.supportSignature = "Data/Site2 -5mm.ply|points=2048|normals=1";
+    cache.regionFingerprint = "water-ripple-runtime-membership-v1|roundtrip";
+    cache.memberships.push_back(membership);
+    cache.params.push_back(params);
+
+    invisible_places::serialization::ProjectDocument projectDocument;
+    projectDocument.projectName = "Ripple Runtime Cache";
+    projectDocument.waterRippleLayers.push_back(layer);
+    projectDocument.waterRippleRuntimeCaches.push_back(cache);
+
+    const auto projectPath = std::filesystem::temp_directory_path() / "invisible_places_ripple_runtime_cache.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(projectDocument, projectPath, &errorMessage));
+    {
+        std::ifstream saved{projectPath};
+        const std::string savedJson{
+            std::istreambuf_iterator<char>{saved},
+            std::istreambuf_iterator<char>{}};
+        CHECK(savedJson.find("\"water_ripple_runtime_caches\"") != std::string::npos);
+        CHECK(savedJson.find("\"shore_distance\"") != std::string::npos);
+        CHECK(savedJson.find("\"region_fingerprint\"") != std::string::npos);
+    }
+
+    const auto loadedProject = invisible_places::serialization::LoadProjectDocument(projectPath, &errorMessage);
+    REQUIRE(loadedProject.has_value());
+    REQUIRE(loadedProject->waterRippleRuntimeCaches.size() == 1U);
+    const auto& loadedCache = loadedProject->waterRippleRuntimeCaches.front();
+    CHECK(loadedCache.supportLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
+    CHECK(loadedCache.supportSignature == "Data/Site2 -5mm.ply|points=2048|normals=1");
+    CHECK(loadedCache.regionFingerprint == "water-ripple-runtime-membership-v1|roundtrip");
+    REQUIRE(loadedCache.memberships.size() == 1U);
+    CHECK(loadedCache.memberships.front().pointIndex == 42U);
+    CHECK(loadedCache.memberships.front().shoreDistance == Catch::Approx(1.25F));
+    REQUIRE(loadedCache.params.size() == 1U);
+    CHECK(loadedCache.params.front().overlayType == invisible_places::water::WaterRippleOverlayType::RainRings);
+    CHECK(loadedCache.params.front().regionStrength == Catch::Approx(1.45F));
+    CHECK(loadedCache.params.front().response.emissionAdd == Catch::Approx(1.35F));
+
+    invisible_places::serialization::WaterSourcesDocument sourcesDocument;
+    sourcesDocument.rippleLayers.push_back(layer);
+    sourcesDocument.rippleRuntimeCaches.push_back(cache);
+    const auto sourcesPath =
+        std::filesystem::temp_directory_path() / "invisible_places_ripple_runtime_cache_sources.json";
+    REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(sourcesDocument, sourcesPath, &errorMessage));
+    const auto loadedSources =
+        invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
+    REQUIRE(loadedSources.has_value());
+    REQUIRE(loadedSources->rippleRuntimeCaches.size() == 1U);
+    REQUIRE(loadedSources->rippleRuntimeCaches.front().memberships.size() == 1U);
+    CHECK(loadedSources->rippleRuntimeCaches.front().memberships.front().shoreDistance == Catch::Approx(1.25F));
 }
 
 TEST_CASE("Runtime ripple Caustic Lace animates as sparse moving ridges", "[water][v2][ripples][runtime]") {

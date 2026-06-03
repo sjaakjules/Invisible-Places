@@ -3,7 +3,9 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <unordered_set>
 
@@ -63,6 +65,8 @@ using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
 using invisible_places::water::WaterRippleOverlayType;
 using invisible_places::water::WaterRipplePatternSettings;
+using invisible_places::water::WaterRippleRuntimeMembership;
+using invisible_places::water::WaterRippleRuntimeParams;
 using invisible_places::water::WaterScaleMode;
 using invisible_places::water::WaterSettingsBundle;
 using invisible_places::water::WaterSourceSettingsAssignment;
@@ -82,6 +86,8 @@ json SerializeWaterCausticLookSettings(const WaterCausticLookSettings& settings)
 WaterCausticLookSettings ParseWaterCausticLookSettings(const json& settingsJson);
 json SerializeWaterEffectLayer(const WaterEffectLayer& layer);
 WaterEffectLayer ParseWaterEffectLayer(const json& layerJson);
+json SerializeWaterRippleRuntimeCache(const WaterRippleRuntimeCacheDocument& cache);
+WaterRippleRuntimeCacheDocument ParseWaterRippleRuntimeCache(const json& cacheJson);
 json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings);
 WaterFlowStreamSettings ParseWaterFlowStreamSettings(const json& settingsJson);
 json SerializeWaterFieldSettings(const WaterFieldSettings& settings);
@@ -1747,6 +1753,145 @@ WaterEffectLayer ParseWaterEffectLayer(const json& layerJson) {
     return layer;
 }
 
+json SerializeVec3(const glm::vec3& value) {
+    return json::array({value.x, value.y, value.z});
+}
+
+float ParseFiniteFloat(const json& valueJson, float fallback) {
+    if (!valueJson.is_number()) {
+        return fallback;
+    }
+    const float value = valueJson.get<float>();
+    return std::isfinite(value) ? value : fallback;
+}
+
+glm::vec3 ParseVec3(const json& valueJson, const glm::vec3& fallback) {
+    if (!valueJson.is_array() || valueJson.size() < 3U) {
+        return fallback;
+    }
+    return glm::vec3{
+        ParseFiniteFloat(valueJson.at(0), fallback.x),
+        ParseFiniteFloat(valueJson.at(1), fallback.y),
+        ParseFiniteFloat(valueJson.at(2), fallback.z),
+    };
+}
+
+json SerializeWaterRippleRuntimeMembership(const WaterRippleRuntimeMembership& membership) {
+    return json{
+        {"point_index", membership.pointIndex},
+        {"param_index", membership.paramIndex},
+        {"edge_distance", membership.edgeDistance},
+        {"seed", membership.seed},
+        {"shore_distance", membership.shoreDistance},
+    };
+}
+
+WaterRippleRuntimeMembership ParseWaterRippleRuntimeMembership(const json& membershipJson) {
+    WaterRippleRuntimeMembership membership;
+    membership.pointIndex =
+        membershipJson.value("point_index", std::numeric_limits<std::uint32_t>::max());
+    membership.paramIndex = membershipJson.value("param_index", membership.paramIndex);
+    membership.edgeDistance = std::max(0.0F, membershipJson.value("edge_distance", membership.edgeDistance));
+    membership.seed = membershipJson.value("seed", membership.seed);
+    membership.shoreDistance = std::max(0.0F, membershipJson.value("shore_distance", membership.shoreDistance));
+    return membership;
+}
+
+json SerializeWaterRippleRuntimeParams(const WaterRippleRuntimeParams& params) {
+    return json{
+        {"overlay_type", WaterRippleOverlayTypeName(params.overlayType)},
+        {"blend_mode", WaterEffectBlendModeName(params.blendMode)},
+        {"layer_id", params.layerId},
+        {"seed", params.seed},
+        {"region_center", SerializeVec3(params.regionCenter)},
+        {"direction", SerializeVec3(params.direction)},
+        {"region_strength", params.regionStrength},
+        {"edge_blend_width", params.edgeBlendWidth},
+        {"pattern_scale", params.patternScale},
+        {"wavelength_meters", params.wavelengthMeters},
+        {"speed", params.speed},
+        {"warp", params.warp},
+        {"turbulence", params.turbulence},
+        {"density", params.density},
+        {"phase", params.phase},
+        {"response", SerializeWaterEffectResponseSettings(params.response)},
+    };
+}
+
+WaterRippleRuntimeParams ParseWaterRippleRuntimeParams(const json& paramsJson) {
+    WaterRippleRuntimeParams params;
+    if (paramsJson.contains("overlay_type")) {
+        params.overlayType = ParseWaterRippleOverlayType(paramsJson.at("overlay_type"));
+    }
+    if (paramsJson.contains("blend_mode")) {
+        params.blendMode = ParseWaterEffectBlendMode(paramsJson.at("blend_mode"));
+    }
+    params.layerId = paramsJson.value("layer_id", params.layerId);
+    params.seed = paramsJson.value("seed", params.seed);
+    if (paramsJson.contains("region_center")) {
+        params.regionCenter = ParseVec3(paramsJson.at("region_center"), params.regionCenter);
+    }
+    if (paramsJson.contains("direction")) {
+        params.direction = ParseVec3(paramsJson.at("direction"), params.direction);
+    }
+    params.regionStrength = std::clamp(paramsJson.value("region_strength", params.regionStrength), 0.0F, 8.0F);
+    params.edgeBlendWidth = std::clamp(paramsJson.value("edge_blend_width", params.edgeBlendWidth), 0.001F, 50.0F);
+    params.patternScale = std::clamp(paramsJson.value("pattern_scale", params.patternScale), 0.001F, 100.0F);
+    params.wavelengthMeters =
+        std::clamp(paramsJson.value("wavelength_meters", params.wavelengthMeters), 0.001F, 50.0F);
+    params.speed = std::clamp(paramsJson.value("speed", params.speed), 0.0F, 20.0F);
+    params.warp = std::clamp(paramsJson.value("warp", params.warp), 0.0F, 20.0F);
+    params.turbulence = std::clamp(paramsJson.value("turbulence", params.turbulence), 0.0F, 20.0F);
+    params.density = std::clamp(paramsJson.value("density", params.density), 0.0F, 1.0F);
+    params.phase = paramsJson.value("phase", params.phase);
+    if (paramsJson.contains("response")) {
+        params.response = ParseWaterEffectResponseSettings(paramsJson.at("response"));
+    }
+    return params;
+}
+
+json SerializeWaterRippleRuntimeCache(const WaterRippleRuntimeCacheDocument& cache) {
+    json cacheJson{
+        {"schema_version", cache.schemaVersion},
+        {"support_layer_path", cache.supportLayerPath.generic_string()},
+        {"support_signature", cache.supportSignature},
+        {"region_fingerprint", cache.regionFingerprint},
+        {"stale", cache.stale},
+        {"memberships", json::array()},
+        {"params", json::array()},
+    };
+    for (const auto& membership : cache.memberships) {
+        cacheJson["memberships"].push_back(SerializeWaterRippleRuntimeMembership(membership));
+    }
+    for (const auto& params : cache.params) {
+        cacheJson["params"].push_back(SerializeWaterRippleRuntimeParams(params));
+    }
+    return cacheJson;
+}
+
+WaterRippleRuntimeCacheDocument ParseWaterRippleRuntimeCache(const json& cacheJson) {
+    WaterRippleRuntimeCacheDocument cache;
+    cache.schemaVersion = cacheJson.value("schema_version", cache.schemaVersion);
+    cache.supportLayerPath = cacheJson.value("support_layer_path", std::string{});
+    cache.supportSignature = cacheJson.value("support_signature", cache.supportSignature);
+    cache.regionFingerprint = cacheJson.value("region_fingerprint", cache.regionFingerprint);
+    cache.stale = cacheJson.value("stale", cache.stale);
+    if (cacheJson.contains("memberships") && cacheJson.at("memberships").is_array()) {
+        for (const auto& membershipJson : cacheJson.at("memberships")) {
+            auto membership = ParseWaterRippleRuntimeMembership(membershipJson);
+            if (membership.pointIndex != std::numeric_limits<std::uint32_t>::max()) {
+                cache.memberships.push_back(membership);
+            }
+        }
+    }
+    if (cacheJson.contains("params") && cacheJson.at("params").is_array()) {
+        for (const auto& paramsJson : cacheJson.at("params")) {
+            cache.params.push_back(ParseWaterRippleRuntimeParams(paramsJson));
+        }
+    }
+    return cache;
+}
+
 json SerializeWaterFlowStreamSettings(const WaterFlowStreamSettings& settings) {
     return json{
         {"enabled", settings.enabled},
@@ -2767,12 +2912,18 @@ bool SaveProjectDocument(
         {"selected_water_point_visual", document.selectedWaterPointVisualName},
         {"water_ripple_layers", json::array()},
         {"water_field_layers", json::array()},
+        {"water_ripple_runtime_caches", json::array()},
     };
     for (const auto& layer : document.waterRippleLayers) {
         projectJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
     for (const auto& layer : document.waterFieldLayers) {
         projectJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
+    }
+    for (const auto& cache : document.waterRippleRuntimeCaches) {
+        if (!cache.memberships.empty() && !cache.params.empty()) {
+            projectJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
+        }
     }
     for (const auto& profile : document.waterAnimationTrailProfiles) {
         projectJson["water_animation_trail_profiles"].push_back(SerializeWaterAnimationTrailProfile(profile));
@@ -3034,6 +3185,15 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (projectJson->contains("water_path_cache")) {
         document.waterPathCache = ParseWaterPathCache(projectJson->at("water_path_cache"));
     }
+    if (projectJson->contains("water_ripple_runtime_caches") &&
+        projectJson->at("water_ripple_runtime_caches").is_array()) {
+        for (const auto& cacheJson : projectJson->at("water_ripple_runtime_caches")) {
+            auto cache = ParseWaterRippleRuntimeCache(cacheJson);
+            if (!cache.memberships.empty() && !cache.params.empty()) {
+                document.waterRippleRuntimeCaches.push_back(std::move(cache));
+            }
+        }
+    }
     if (projectJson->contains("water_visual_settings")) {
         document.waterVisualSettings = ParseWaterVisualSettings(projectJson->at("water_visual_settings"));
         if (!projectJson->contains("water_animation_trail_settings")) {
@@ -3203,6 +3363,7 @@ bool SaveWaterSourcesDocument(
         {"water_emitters", json::array()},
         {"water_ripple_layers", json::array()},
         {"water_field_layers", json::array()},
+        {"water_ripple_runtime_caches", json::array()},
     };
     if (document.tempSourceSettings.has_value()) {
         sourcesJson["temp_water_source_settings"] =
@@ -3241,6 +3402,11 @@ bool SaveWaterSourcesDocument(
     }
     for (const auto& layer : document.fieldLayers) {
         sourcesJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
+    }
+    for (const auto& cache : document.rippleRuntimeCaches) {
+        if (!cache.memberships.empty() && !cache.params.empty()) {
+            sourcesJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
+        }
     }
     if (document.pathCache.has_value() && !document.pathCache->branches.empty()) {
         sourcesJson["water_path_cache"] = SerializeWaterPathCache(document.pathCache.value());
@@ -3424,6 +3590,15 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     }
     if (sourcesJson->contains("water_path_cache")) {
         document.pathCache = ParseWaterPathCache(sourcesJson->at("water_path_cache"));
+    }
+    if (sourcesJson->contains("water_ripple_runtime_caches") &&
+        sourcesJson->at("water_ripple_runtime_caches").is_array()) {
+        for (const auto& cacheJson : sourcesJson->at("water_ripple_runtime_caches")) {
+            auto cache = ParseWaterRippleRuntimeCache(cacheJson);
+            if (!cache.memberships.empty() && !cache.params.empty()) {
+                document.rippleRuntimeCaches.push_back(std::move(cache));
+            }
+        }
     }
     return document;
 }

@@ -274,6 +274,7 @@ struct WaterRippleRuntimeContribution {
 [[nodiscard]] WaterRippleRuntimeParams BuildWaterRippleRuntimeParams(
     const WaterEffectLayer& layer,
     const WaterRegionSelection& selection);
+[[nodiscard]] WaterRippleRuntimeParams BuildWaterRippleRuntimeParams(const WaterEffectLayer& layer);
 
 [[nodiscard]] std::vector<WaterRippleRuntimeMembership> BuildWaterRippleRuntimeMemberships(
     const WaterRegionSelection& selection,

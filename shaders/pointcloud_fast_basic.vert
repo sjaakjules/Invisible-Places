@@ -79,6 +79,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 #include "pointcloud_sparse_ripple.glsl"
 
 const uint kWaterStreamRoleFieldSlot = 0u;
+const uint kWaterStreamDistanceFieldSlot = 7u;
 const uint kWaterStreamLengthFieldSlot = 8u;
 const uint kWaterStreamRouteStartFieldSlot = 9u;
 const uint kWaterStreamRouteCountFieldSlot = 10u;
@@ -141,8 +142,7 @@ uint WaterStreamRouteCount(uint pointIndex) {
 
 float WaterStreamTravelPhase(uint pointIndex) {
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterStreamRouteLengthFieldSlot, pointIndex));
-    const float streamLength = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamLengthFieldSlot, pointIndex));
-    const float pointAge = clamp(LoadScalarFieldValueForPoint(kWaterStreamPointAgeFieldSlot, pointIndex), 0.0, 1.0);
+    const float streamDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamDistanceFieldSlot, pointIndex));
     const float streamAge = LoadScalarFieldValueForPoint(kWaterStreamAgeFieldSlot, pointIndex);
     const float streamStartPhase = LoadScalarFieldValueForPoint(kWaterStreamStartPhaseFieldSlot, pointIndex);
     const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterStreamSpeedFieldSlot, pointIndex));
@@ -150,7 +150,7 @@ float WaterStreamTravelPhase(uint pointIndex) {
         streamStartPhase +
         streamAge +
         max(0.0, uniforms.depthParameters.x) * speed / routeLength -
-        pointAge * streamLength / routeLength);
+        streamDistance / routeLength);
 }
 
 float WaterStreamHash(float a, float b, float c) {

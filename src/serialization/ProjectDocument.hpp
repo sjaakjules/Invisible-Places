@@ -57,6 +57,16 @@ struct WaterTrailProfileDocument {
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
 };
 
+struct WaterRippleRuntimeCacheDocument {
+    std::uint32_t schemaVersion = 1;
+    std::filesystem::path supportLayerPath;
+    std::string supportSignature;
+    std::string regionFingerprint;
+    std::vector<invisible_places::water::WaterRippleRuntimeMembership> memberships;
+    std::vector<invisible_places::water::WaterRippleRuntimeParams> params;
+    bool stale = false;
+};
+
 struct ProjectDocument {
     struct SavedAnimation {
         std::filesystem::path filePath;
@@ -121,6 +131,7 @@ struct ProjectDocument {
     invisible_places::water::WaterFieldStreamSettings waterFieldStreamSettings{};
     std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
+    std::vector<WaterRippleRuntimeCacheDocument> waterRippleRuntimeCaches;
 };
 
 struct PointCloudStylePresetDocument {
@@ -156,6 +167,7 @@ struct WaterSourcesDocument {
     invisible_places::water::WaterFieldSettings fieldSettings{};
     invisible_places::water::WaterFieldStreamSettings fieldStreamSettings{};
     std::optional<invisible_places::water::WaterPathCache> pathCache;
+    std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
 };
 
 bool SaveProjectDocument(
