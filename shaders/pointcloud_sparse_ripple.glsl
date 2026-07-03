@@ -984,12 +984,14 @@ SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3
     const float normalCoordinate = shoreDistance + dot(worldPosition.xy, shoreNormal) * 0.015;
     const float patternScale = max(0.01, styleData.shorelineWaveParams1.z);
     const float wavelength = max(0.002, styleData.shorelineWaveParams1.w);
+    const float shorelineEdgeBlendWidth =
+        max(0.001, min(max(edgeFadeMeters, wavelength * 0.20), reachMeters * 0.45));
     const float timePhase =
         styleData.shorelineWaveParams3.x + (timeSeconds * max(0.0, styleData.shorelineWaveParams2.x));
     const float pattern = RippleTideBandsValue(
         vec2(tangentCoordinate, normalCoordinate) * patternScale,
         shoreDistance,
-        reachMeters,
+        shorelineEdgeBlendWidth,
         wavelength,
         styleData.shorelineWaveParams2.y,
         styleData.shorelineWaveParams2.z,

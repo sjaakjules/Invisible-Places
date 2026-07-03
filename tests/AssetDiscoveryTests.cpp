@@ -813,6 +813,11 @@ TEST_CASE("ExhibitionScene project template contains only selected multi-cloud s
     REQUIRE(sandIt->pointStyle.has_value());
     CHECK(sandIt->pointStyle->shorelineWaveEnabled);
     CHECK(sandIt->pointStyle->shorelineBoundaryZ == Catch::Approx(1.55F));
+    CHECK(sandIt->pointStyle->shorelineIntensity >= 1.0F);
+    CHECK(sandIt->pointStyle->shorelineEmissionAdd >= 0.5F);
+    CHECK(sandIt->pointStyle->shorelineOpacityAdd > 0.0F);
+    CHECK(sandIt->pointStyle->shorelinePointSizeMultiply > 1.0F);
+    CHECK(sandIt->pointStyle->shorelineColourMix >= 0.70F);
 }
 
 TEST_CASE("Combined water support samples all scene roles with role multipliers", "[water][scene]") {
@@ -883,6 +888,18 @@ TEST_CASE("Shoreline wave height mask fades around the sand-rock boundary", "[wa
     CHECK(ShorelineWaveHeightMask(boundaryZ, reach, fade, 1.40F) > 0.95F);
     CHECK(ShorelineWaveHeightMask(boundaryZ, reach, fade, 1.08F) > 0.0F);
     CHECK(ShorelineWaveHeightMask(boundaryZ, reach, fade, 0.99F) == Catch::Approx(0.0F));
+}
+
+TEST_CASE("Shoreline wave defaults are visible when enabled", "[water][shoreline][pointcloud]") {
+    invisible_places::renderer::pointcloud::PointCloudStyleState style;
+    style.shorelineWaveEnabled = true;
+
+    CHECK(style.shorelineIntensity >= 1.0F);
+    CHECK(style.shorelineEmissionAdd >= 0.5F);
+    CHECK(style.shorelineOpacityAdd > 0.0F);
+    CHECK(style.shorelineOpacityMultiply > 1.0F);
+    CHECK(style.shorelinePointSizeMultiply > 1.0F);
+    CHECK(style.shorelineColourMix >= 0.70F);
 }
 
 TEST_CASE("Bootstrap window title summarizes discovered layer counts", "[window][discovery]") {

@@ -114,11 +114,11 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 rippleEffectSlots2{0U, 0U, 0U, 0U};
     glm::uvec4 rippleEffectSlots3{0U, 0U, 0U, 0U};
     glm::uvec4 shorelineWaveControl{0U, 1U, 0U, 0U};
-    glm::vec4 shorelineWaveParams0{1.55F, 0.45F, 0.05F, 0.75F};
+    glm::vec4 shorelineWaveParams0{1.55F, 0.45F, 0.05F, 1.15F};
     glm::vec4 shorelineWaveParams1{1.0F, 0.0F, 1.0F, 0.25F};
     glm::vec4 shorelineWaveParams2{0.55F, 0.35F, 0.06F, 0.55F};
-    glm::vec4 shorelineWaveParams3{0.0F, 0.15F, 0.0F, 1.0F};
-    glm::vec4 shorelineWaveParams4{0.0F, 1.0F, 0.45F, 0.0F};
+    glm::vec4 shorelineWaveParams3{0.0F, 0.65F, 0.08F, 1.25F};
+    glm::vec4 shorelineWaveParams4{0.0F, 1.35F, 0.75F, 0.0F};
     glm::vec4 shorelineWaveTint{0.62F, 0.88F, 1.0F, 1.0F};
     glm::vec4 gradientStartColor{0.05F, 0.28F, 0.95F, 1.0F};
     glm::vec4 gradientEndColor{0.96F, 0.94F, 0.58F, 1.0F};
