@@ -34,7 +34,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;
-    RenderParameterBindingGpu xrayBinding;
     RenderParameterBindingGpu depthFadeBinding;
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;

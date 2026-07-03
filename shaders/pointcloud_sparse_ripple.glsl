@@ -50,6 +50,13 @@ bool HasSparseRippleEffects() {
            styleData.rippleEffectSlots3.z != 0u;
 }
 
+bool HasShorelineWaveEffect() {
+    return styleData.shorelineWaveControl.x != 0u &&
+           styleData.shorelineWaveParams0.y > 1e-5 &&
+           styleData.shorelineWaveParams1.w > 1e-5 &&
+           styleData.shorelineWaveParams0.w > 1e-5;
+}
+
 float RippleHash(float value) {
     return fract(sin(value) * 43758.5453123);
 }
@@ -944,6 +951,70 @@ SparseRippleComposite EmptySparseRippleComposite() {
     return result;
 }
 
+float ShorelineHeightMask(float boundaryZ, float reachMeters, float edgeFadeMeters, float worldZ) {
+    const float shoreDistance = boundaryZ - worldZ;
+    if (shoreDistance < -edgeFadeMeters || shoreDistance > reachMeters + edgeFadeMeters) {
+        return 0.0;
+    }
+    const float waterSide = smoothstep(-edgeFadeMeters, max(edgeFadeMeters, 1e-5), shoreDistance);
+    const float reachFade =
+        1.0 - smoothstep(max(0.0, reachMeters), reachMeters + max(edgeFadeMeters, 1e-5), shoreDistance);
+    return clamp(waterSide * reachFade, 0.0, 1.0);
+}
+
+SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3 pointNormal, float timeSeconds) {
+    SparseRippleComposite contribution = EmptySparseRippleComposite();
+    if (!HasShorelineWaveEffect()) {
+        return contribution;
+    }
+
+    const float boundaryZ = styleData.shorelineWaveParams0.x;
+    const float reachMeters = max(0.001, styleData.shorelineWaveParams0.y);
+    const float edgeFadeMeters = max(0.0, styleData.shorelineWaveParams0.z);
+    const float heightMask = ShorelineHeightMask(boundaryZ, reachMeters, edgeFadeMeters, worldPosition.z);
+    if (heightMask <= 1e-5) {
+        return contribution;
+    }
+
+    vec2 tangent = vec2(styleData.shorelineWaveParams1.x, styleData.shorelineWaveParams1.y);
+    tangent = dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec2(1.0, 0.0);
+    const vec2 shoreNormal = vec2(-tangent.y, tangent.x);
+    const float tangentCoordinate = dot(worldPosition.xy, tangent);
+    const float shoreDistance = max(0.0, boundaryZ - worldPosition.z);
+    const float normalCoordinate = shoreDistance + dot(worldPosition.xy, shoreNormal) * 0.015;
+    const float patternScale = max(0.01, styleData.shorelineWaveParams1.z);
+    const float wavelength = max(0.002, styleData.shorelineWaveParams1.w);
+    const float timePhase =
+        styleData.shorelineWaveParams3.x + (timeSeconds * max(0.0, styleData.shorelineWaveParams2.x));
+    const float pattern = RippleTideBandsValue(
+        vec2(tangentCoordinate, normalCoordinate) * patternScale,
+        shoreDistance,
+        reachMeters,
+        wavelength,
+        styleData.shorelineWaveParams2.y,
+        styleData.shorelineWaveParams2.z,
+        styleData.shorelineWaveParams2.w,
+        float(styleData.shorelineWaveControl.y),
+        timePhase);
+
+    const float normalMask =
+        clamp(0.62 + 0.38 * abs(dot(RippleSafeNormal(pointNormal), vec3(0.0, 0.0, 1.0))), 0.0, 1.0);
+    const float scale = clamp(pattern * heightMask * normalMask * styleData.shorelineWaveParams0.w, 0.0, 1.0);
+    if (scale <= 1e-5) {
+        return contribution;
+    }
+
+    contribution.scale = scale;
+    contribution.colourMix = clamp(styleData.shorelineWaveParams4.z * scale, 0.0, 1.0);
+    contribution.emissionAdd = max(0.0, styleData.shorelineWaveParams3.y) * scale;
+    contribution.opacityAdd = styleData.shorelineWaveParams3.z * scale;
+    contribution.opacityMultiply = mix(1.0, max(0.0, styleData.shorelineWaveParams3.w), scale);
+    contribution.pointSizeAdd = styleData.shorelineWaveParams4.x * scale;
+    contribution.pointSizeMultiply = mix(1.0, max(0.0, styleData.shorelineWaveParams4.y), scale);
+    contribution.colour = clamp(styleData.shorelineWaveTint.rgb, vec3(0.0), vec3(1.0));
+    return contribution;
+}
+
 SparseRippleComposite EvaluateSparseRippleContribution(SparseRippleMembership membership, SparseRippleParams params, vec3 worldPosition, vec3 pointNormal, float timeSeconds) {
     SparseRippleComposite contribution = EmptySparseRippleComposite();
     const vec3 normal = RippleSafeNormal(pointNormal);
@@ -1063,10 +1134,14 @@ void BlendSparseRippleContribution(inout SparseRippleComposite target, SparseRip
 }
 
 SparseRippleComposite ResolveSparseRippleComposite(vec3 worldPosition, vec3 pointNormal, uint pointIndex, float timeSeconds) {
-    SparseRippleComposite result = EmptySparseRippleComposite();
-    if (!HasSparseRippleEffects() ||
-        styleData.pointMeta.x == 0u ||
-        pointIndex >= styleData.pointMeta.x) {
+    SparseRippleComposite result = EvaluateShorelineWaveContribution(worldPosition, pointNormal, timeSeconds);
+    if (!HasSparseRippleEffects()) {
+        result.opacityMultiply = max(0.0, result.opacityMultiply);
+        result.pointSizeMultiply = max(0.0, result.pointSizeMultiply);
+        result.colourMix = clamp(result.colourMix, 0.0, 1.0);
+        return result;
+    }
+    if (styleData.pointMeta.x == 0u || pointIndex >= styleData.pointMeta.x) {
         return result;
     }
     const SparseRippleRange pointRange = sparseRippleRangeData.sparseRippleRanges[pointIndex];

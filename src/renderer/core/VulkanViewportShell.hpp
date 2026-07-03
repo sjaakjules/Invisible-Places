@@ -45,7 +45,6 @@ struct ViewportDiagnostics {
     std::uint32_t pointUnifiedDrawCalls = 0;
     std::uint32_t pointFastBasicDrawCalls = 0;
     std::uint64_t pointFastBasicDrawnPoints = 0;
-    std::uint32_t pointDepthPrepassSkippedNoXray = 0;
     bool sceneRenderedThisFrame = false;
     bool sceneCacheActive = false;
     double pointCommandRecordMs = 0.0;

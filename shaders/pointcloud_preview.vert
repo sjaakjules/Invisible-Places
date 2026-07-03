@@ -8,7 +8,6 @@ layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outColormapValue;
 layout(location = 2) out float outOpacity;
 layout(location = 3) out float outEmissive;
-layout(location = 4) out float outXray;
 layout(location = 5) out float outDepthFade;
 layout(location = 6) out float outViewDepth;
 layout(location = 7) flat out uint outPointIndex;
@@ -57,7 +56,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;
-    RenderParameterBindingGpu xrayBinding;
     RenderParameterBindingGpu depthFadeBinding;
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
@@ -80,6 +78,13 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     uvec4 rippleEffectSlots1;
     uvec4 rippleEffectSlots2;
     uvec4 rippleEffectSlots3;
+    uvec4 shorelineWaveControl;
+    vec4 shorelineWaveParams0;
+    vec4 shorelineWaveParams1;
+    vec4 shorelineWaveParams2;
+    vec4 shorelineWaveParams3;
+    vec4 shorelineWaveParams4;
+    vec4 shorelineWaveTint;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
@@ -899,7 +904,6 @@ void main() {
         caustic * max(0.0, styleData.causticParams1.y) +
         waterEffectEmissionAdd +
         sparseRippleEmissionAdd;
-    outXray = EvaluateBinding(styleData.xrayBinding);
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;
     outPointIndex = pointIndex;

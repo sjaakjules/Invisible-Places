@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace invisible_places::renderer::pointcloud {
@@ -18,7 +19,6 @@ inline constexpr float kInactivePointSizeDefault = 1.0F;
 inline constexpr float kInactiveSurfelDiameterDefault = 0.005F;
 inline constexpr float kInactiveOpacityDefault = 1.0F;
 inline constexpr float kInactiveEmissionDefault = 0.0F;
-inline constexpr float kInactiveXrayDefault = 0.0F;
 inline constexpr float kInactiveDepthFadeDefault = 0.0F;
 inline constexpr float kInactiveColormapPositionDefault = 0.5F;
 
@@ -52,12 +52,6 @@ enum class PointCloudGeometryMode {
 enum class PointCloudScreenSpriteSizeMode {
     Pixels,
     WorldMillimeters
-};
-
-enum class PointCloudDepthContribution {
-    None,
-    AlphaThreshold,
-    Always
 };
 
 enum class PointCloudFalloffProfile {
@@ -100,7 +94,6 @@ struct PointCloudStyleState {
 
     PointCloudGeometryMode geometryMode = PointCloudGeometryMode::ScreenSprites;
     PointCloudScreenSpriteSizeMode screenSpriteSizeMode = PointCloudScreenSpriteSizeMode::Pixels;
-    PointCloudDepthContribution depthContribution = PointCloudDepthContribution::None;
     PointCloudFalloffProfile falloffProfile = PointCloudFalloffProfile::HardDisc;
     PointCloudStylisationMode stylisationMode = PointCloudStylisationMode::Off;
     PointCloudNprPreset nprPreset = PointCloudNprPreset::Watercolor;
@@ -132,14 +125,7 @@ struct PointCloudStyleState {
     float innerRadius = 0.55F;
     float gaussianSharpness = 4.0F;
     float featherPower = 1.6F;
-    float depthFalloff = 80.0F;
-    float depthBias = 0.0005F;
-    float frontAlpha = 0.16F;
-    float hiddenAlpha = 0.08F;
-    float densityScale = 1.0F;
-    float densityClamp = 64.0F;
     float waterStreakAspect = 1.0F;
-    float depthAlphaThreshold = 0.5F;
     bool solidCenters = true;
     bool flowAnimation = false;
     bool waterPathView = false;
@@ -164,11 +150,32 @@ struct PointCloudStyleState {
     std::int32_t causticMaskFieldSlot = -1;
     std::int32_t causticEdgeFieldSlot = -1;
     std::int32_t causticSeedFieldSlot = -1;
+    bool shorelineWaveEnabled = false;
+    float shorelineBoundaryZ = 1.55F;
+    float shorelineHeightReachMeters = 0.45F;
+    float shorelineEdgeFadeMeters = 0.05F;
+    float shorelineDirectionX = 1.0F;
+    float shorelineDirectionY = 0.0F;
+    float shorelinePatternScale = 1.0F;
+    float shorelineWavelengthMeters = 0.25F;
+    float shorelineSpeed = 0.55F;
+    float shorelineWarp = 0.35F;
+    float shorelineTurbulence = 0.06F;
+    float shorelineDensity = 0.55F;
+    float shorelinePhase = 0.0F;
+    float shorelineIntensity = 0.75F;
+    float shorelineEmissionAdd = 0.15F;
+    float shorelineOpacityAdd = 0.0F;
+    float shorelineOpacityMultiply = 1.0F;
+    float shorelinePointSizeAdd = 0.0F;
+    float shorelinePointSizeMultiply = 1.0F;
+    float shorelineColourMix = 0.45F;
+    std::array<float, 3> shorelineColour{0.62F, 0.88F, 1.0F};
+    std::uint32_t shorelineSeed = 1U;
     invisible_places::style::RenderParameterBinding pointSize;
     invisible_places::style::RenderParameterBinding surfelDiameter;
     invisible_places::style::RenderParameterBinding opacity;
     invisible_places::style::RenderParameterBinding emissiveStrength;
-    invisible_places::style::RenderParameterBinding xrayStrength;
     invisible_places::style::RenderParameterBinding depthFade;
     invisible_places::style::RenderParameterBinding colormapPosition;
 };
@@ -203,13 +210,19 @@ struct PointCloudSessionState {
 };
 
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints);
-[[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style);
-[[nodiscard]] bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style, bool sceneHasActiveXray);
-[[nodiscard]] bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha);
-[[nodiscard]] bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudAlphaContributesDepth(float alpha);
 [[nodiscard]] bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudSceneRoleAllowsRoughnessMotion(std::string_view sceneRole);
+[[nodiscard]] PointCloudStyleState MakePointCloudStyleForSceneRole(
+    PointCloudStyleState style,
+    std::string_view sceneRole);
 [[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style);
+[[nodiscard]] float ShorelineWaveHeightMask(
+    float boundaryZ,
+    float reachMeters,
+    float edgeFadeMeters,
+    float worldZ);
 [[nodiscard]] float WorldDiameterToScreenPointSizePixels(
     float diameterMeters,
     float viewDepth,

@@ -736,7 +736,6 @@ std::uint32_t InactivePointBindingCount(
     count += style.surfelDiameter.active ? 0U : 1U;
     count += style.opacity.active ? 0U : 1U;
     count += style.emissiveStrength.active ? 0U : 1U;
-    count += style.xrayStrength.active ? 0U : 1U;
     count += style.depthFade.active ? 0U : 1U;
     count += style.colormapPosition.active ? 0U : 1U;
     return count;
@@ -882,7 +881,6 @@ struct OfflinePointSample {
     float surfelAspect = 1.0F;
     float opacity = 1.0F;
     float emissive = 0.0F;
-    float xray = 0.0F;
     float depthFade = 0.0F;
     glm::vec3 color{1.0F, 1.0F, 1.0F};
     bool worldSurfels = false;
@@ -1756,12 +1754,6 @@ bool BuildOfflinePointSample(
         sample->emissive += caustic * std::max(0.0F, layer.style.causticEmissionBoost);
         sample->emissive += waterEffectEmissionAdd;
         sample->emissive += sparseRipple.emissionAdd;
-        sample->xray = Clamp01(
-            EvaluateBindingOrDefault(
-                cloud,
-                layer.style.xrayStrength,
-                pointIndex,
-                invisible_places::renderer::pointcloud::kInactiveXrayDefault));
         sample->color = ResolvePointColor(layer, pointIndex);
         sample->color = glm::mix(
             sample->color,
@@ -2218,22 +2210,10 @@ void RenderPointCloudTile(
     auto& emissionB = activeScratch.emissionB;
     auto& emissionA = activeScratch.emissionA;
 
-    const bool sceneHasActiveXray = std::any_of(
-        layers.begin(),
-        layers.end(),
-        [](const OfflinePointLayer& layer) {
-            return layer.cloud != nullptr &&
-                   !layer.cloud->positions.empty() &&
-                   invisible_places::renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
-        });
-
     const auto depthStart = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
         if (layer.cloud == nullptr ||
-            layer.cloud->positions.empty() ||
-            !invisible_places::renderer::pointcloud::PointCloudStyleUsesDepthPrepass(
-                layer.style,
-                sceneHasActiveXray)) {
+            layer.cloud->positions.empty()) {
             continue;
         }
         if (diagnostics != nullptr) {
@@ -2286,7 +2266,6 @@ void RenderPointCloudTile(
                         if (pixelIndex < image->depth.size() &&
                             coveredViewDepth < image->depth[pixelIndex] &&
                             invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(
-                                layer.style,
                                 alpha)) {
                             image->depth[pixelIndex] = coveredViewDepth;
                         }
@@ -2374,10 +2353,8 @@ void RenderPointCloudTile(
                             sample.pointIndex,
                             surfaceAngleMask,
                             stylisationTimeSeconds);
-                        const float densityScale = std::max(1.0F, layer.style.densityScale);
-                        const float densityClamp = std::max(0.0F, layer.style.densityClamp);
                         const float weightedAlpha = std::clamp(
-                            densityClamp > 0.0F ? std::min(alpha * densityScale, densityClamp) : alpha,
+                            alpha,
                             0.0F,
                             AlphaClampMax(layer.style));
                         const float weight = WeightedAlphaWeight(weightedAlpha, coveredViewDepth, cameraState);
@@ -2395,35 +2372,6 @@ void RenderPointCloudTile(
                             emissionA[localIndex] += alpha * emissionGain;
                         }
 
-                        if (sample.xray > 1.0e-5F) {
-                            const float sceneDepth = image->depth[pixelIndex];
-                            if (!std::isfinite(sceneDepth) || sample.xray <= 1.0e-5F) {
-                                return;
-                            }
-
-                            const float behind = std::max(
-                                coveredViewDepth - sceneDepth - std::max(0.0F, layer.style.depthBias),
-                                0.0F);
-                            const float hiddenFade =
-                                std::exp(-behind * std::max(0.0F, layer.style.depthFalloff));
-                            const float frontMask =
-                                coveredViewDepth <= sceneDepth + std::max(0.0F, layer.style.depthBias) ? 1.0F : 0.0F;
-                            const float xrayAlpha =
-                                alpha * sample.xray *
-                                std::lerp(
-                                    layer.style.hiddenAlpha * hiddenFade,
-                                    layer.style.frontAlpha,
-                                    frontMask);
-                            if (xrayAlpha <= 1.0e-5F) {
-                                return;
-                            }
-
-                            const float gain = std::max(0.0F, layer.style.exposure);
-                            emissionR[localIndex] += stylisedColor.r * xrayAlpha * gain;
-                            emissionG[localIndex] += stylisedColor.g * xrayAlpha * gain;
-                            emissionB[localIndex] += stylisedColor.b * xrayAlpha * gain;
-                            emissionA[localIndex] += xrayAlpha * gain;
-                        }
                     });
             }
         }

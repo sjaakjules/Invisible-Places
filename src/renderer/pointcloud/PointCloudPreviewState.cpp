@@ -1,6 +1,7 @@
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -394,40 +395,13 @@ PointCloudStyleState::PointCloudStyleState() {
     invisible_places::style::SetScalarConstant(&surfelDiameter, kInactiveSurfelDiameterDefault);
     invisible_places::style::SetScalarConstant(&opacity, kInactiveOpacityDefault);
     invisible_places::style::SetScalarConstant(&emissiveStrength, kInactiveEmissionDefault);
-    invisible_places::style::SetScalarConstant(&xrayStrength, kInactiveXrayDefault);
     invisible_places::style::SetScalarConstant(&depthFade, kInactiveDepthFadeDefault);
     invisible_places::style::SetScalarConstant(&colormapPosition, kInactiveColormapPositionDefault);
-    xrayStrength.active = false;
     depthFade.active = false;
 }
 
-bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style) {
-    return style.depthContribution != PointCloudDepthContribution::None;
-}
-
-bool PointCloudStyleUsesDepthPrepass(const PointCloudStyleState& style, bool sceneHasActiveXray) {
-    return sceneHasActiveXray && PointCloudStyleUsesDepthPrepass(style);
-}
-
-bool PointCloudAlphaContributesDepth(const PointCloudStyleState& style, float alpha) {
-    if (alpha <= 1.0e-5F || !PointCloudStyleUsesDepthPrepass(style)) {
-        return false;
-    }
-    if (style.depthContribution == PointCloudDepthContribution::AlphaThreshold) {
-        return alpha >= std::clamp(style.depthAlphaThreshold, 0.0F, 1.0F);
-    }
-    return true;
-}
-
-bool PointCloudStyleHasActiveXray(const PointCloudStyleState& style) {
-    if (!style.xrayStrength.active) {
-        return false;
-    }
-    if (style.xrayStrength.mode == invisible_places::style::ParameterSourceMode::Constant) {
-        return style.xrayStrength.constantValue[0] > kMaterialEpsilon;
-    }
-    return std::max(style.xrayStrength.fieldMap.outputMin, style.xrayStrength.fieldMap.outputMax) >
-           kMaterialEpsilon;
+bool PointCloudAlphaContributesDepth(float alpha) {
+    return alpha > kMaterialEpsilon;
 }
 
 bool PointCloudStyleHasActiveStylisation(const PointCloudStyleState& style) {
@@ -438,6 +412,47 @@ bool PointCloudStyleHasActiveStylisation(const PointCloudStyleState& style) {
 bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) {
     return style.roughnessMotionStrength > kMaterialEpsilon &&
            style.roughnessMotionSpeed > kMaterialEpsilon;
+}
+
+bool PointCloudSceneRoleAllowsRoughnessMotion(std::string_view sceneRole) {
+    if (sceneRole.empty()) {
+        return true;
+    }
+
+    std::string normalized;
+    normalized.reserve(sceneRole.size());
+    for (const char character : sceneRole) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(byte)));
+    }
+    return normalized == "veg" || normalized == "vegetation";
+}
+
+PointCloudStyleState MakePointCloudStyleForSceneRole(
+    PointCloudStyleState style,
+    std::string_view sceneRole) {
+    const bool groupedSceneRole = !sceneRole.empty();
+    if (!PointCloudSceneRoleAllowsRoughnessMotion(sceneRole)) {
+        style.roughnessMotionStrength = 0.0F;
+    }
+    if (groupedSceneRole) {
+        std::string normalized;
+        normalized.reserve(sceneRole.size());
+        for (const char character : sceneRole) {
+            const auto byte = static_cast<unsigned char>(character);
+            if (std::isalnum(byte) == 0) {
+                continue;
+            }
+            normalized.push_back(static_cast<char>(std::tolower(byte)));
+        }
+        if (normalized != "sand") {
+            style.shorelineWaveEnabled = false;
+        }
+    }
+    return style;
 }
 
 bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style) {
@@ -452,6 +467,28 @@ bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style) {
 bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style) {
     return style.geometryMode == PointCloudGeometryMode::ScreenSprites &&
            style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters;
+}
+
+float ShorelineWaveHeightMask(
+    float boundaryZ,
+    float reachMeters,
+    float edgeFadeMeters,
+    float worldZ) {
+    const float safeReach = std::max(0.001F, reachMeters);
+    const float safeFade = std::max(0.0F, edgeFadeMeters);
+    const float shoreDistance = boundaryZ - worldZ;
+    if (shoreDistance < -safeFade || shoreDistance > safeReach + safeFade) {
+        return 0.0F;
+    }
+    const auto smoothstep = [](float edge0, float edge1, float value) {
+        const float width = std::max(edge1 - edge0, 1.0e-5F);
+        const float t = std::clamp((value - edge0) / width, 0.0F, 1.0F);
+        return t * t * (3.0F - 2.0F * t);
+    };
+    const float waterSide = smoothstep(-safeFade, std::max(safeFade, 1.0e-5F), shoreDistance);
+    const float reachFade =
+        1.0F - smoothstep(safeReach, safeReach + std::max(safeFade, 1.0e-5F), shoreDistance);
+    return std::clamp(waterSide * reachFade, 0.0F, 1.0F);
 }
 
 float WorldDiameterToScreenPointSizePixels(
@@ -475,7 +512,6 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.screenSpriteSizeMode = sourceStyle.geometryMode == PointCloudGeometryMode::ScreenSprites
                                      ? sourceStyle.screenSpriteSizeMode
                                      : PointCloudScreenSpriteSizeMode::Pixels;
-    style.depthContribution = PointCloudDepthContribution::None;
     style.falloffProfile = PointCloudFalloffProfile::HardDisc;
     style.stylisationMode = PointCloudStylisationMode::Off;
     style.nprPreset = sourceStyle.nprPreset;
@@ -523,7 +559,6 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     }
     invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
     invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
-    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
     style.colormapPosition = sourceStyle.colorMode == PointCloudColorMode::ScalarColormap
                                  ? sourceStyle.colormapPosition
@@ -589,8 +624,7 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
         noEmission &&
         noColormapField &&
         noDepthFade &&
-        noColorize &&
-        !PointCloudStyleHasActiveXray(style)) {
+        noColorize) {
         return PointCloudMaterialVariant::OpaqueHardDisc;
     }
 
@@ -599,8 +633,7 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyle
         constantOpacity &&
         constantEmission &&
         noColormapField &&
-        noDepthFade &&
-        !PointCloudStyleHasActiveXray(style)) {
+        noDepthFade) {
         return PointCloudMaterialVariant::ConstantSimple;
     }
     return PointCloudMaterialVariant::Unified;

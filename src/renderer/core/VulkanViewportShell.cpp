@@ -85,13 +85,12 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 pointMeta{0U, 0U, 0U, 0U};
     glm::uvec4 renderControl{0U, 1U, 0U, 0U};
     glm::vec4 renderParams0{1.0F, 0.55F, 4.0F, 1.6F};
-    glm::vec4 renderParams1{80.0F, 0.0005F, 0.16F, 0.08F};
-    glm::vec4 renderParams2{1.0F, 64.0F, 1.0F, 64.0F};
-    glm::vec4 renderParams3{0.5F, 1.0F, 64.0F, 0.0F};
+    glm::vec4 renderParams1{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 renderParams2{1.0F, 0.0F, 1.0F, 0.0F};
+    glm::vec4 renderParams3{0.0F, 1.0F, 64.0F, 0.0F};
     PointCloudBindingGpu pointSize{};
     PointCloudBindingGpu opacity{};
     PointCloudBindingGpu emissive{};
-    PointCloudBindingGpu xray{};
     PointCloudBindingGpu depthFade{};
     PointCloudBindingGpu colormapPosition{};
     PointCloudBindingGpu surfelDiameter{};
@@ -114,6 +113,13 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 rippleEffectSlots1{0U, 0U, 0U, 0U};
     glm::uvec4 rippleEffectSlots2{0U, 0U, 0U, 0U};
     glm::uvec4 rippleEffectSlots3{0U, 0U, 0U, 0U};
+    glm::uvec4 shorelineWaveControl{0U, 1U, 0U, 0U};
+    glm::vec4 shorelineWaveParams0{1.55F, 0.45F, 0.05F, 0.75F};
+    glm::vec4 shorelineWaveParams1{1.0F, 0.0F, 1.0F, 0.25F};
+    glm::vec4 shorelineWaveParams2{0.55F, 0.35F, 0.06F, 0.55F};
+    glm::vec4 shorelineWaveParams3{0.0F, 0.15F, 0.0F, 1.0F};
+    glm::vec4 shorelineWaveParams4{0.0F, 1.0F, 0.45F, 0.0F};
+    glm::vec4 shorelineWaveTint{0.62F, 0.88F, 1.0F, 1.0F};
     glm::vec4 gradientStartColor{0.05F, 0.28F, 0.95F, 1.0F};
     glm::vec4 gradientEndColor{0.96F, 0.94F, 0.58F, 1.0F};
 };
@@ -544,7 +550,6 @@ std::uint32_t InactivePointBindingCount(const renderer::pointcloud::PointCloudSt
     count += style.surfelDiameter.active ? 0U : 1U;
     count += style.opacity.active ? 0U : 1U;
     count += style.emissiveStrength.active ? 0U : 1U;
-    count += style.xrayStrength.active ? 0U : 1U;
     count += style.depthFade.active ? 0U : 1U;
     count += style.colormapPosition.active ? 0U : 1U;
     return count;
@@ -5795,13 +5800,8 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         renderState_.eyeDomeLightingEnabled ||
         renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style) ==
             renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
-    const auto effectiveDepthContribution =
-        forceDepthContribution &&
-                layer.style.depthContribution == renderer::pointcloud::PointCloudDepthContribution::None
-            ? renderer::pointcloud::PointCloudDepthContribution::Always
-            : layer.style.depthContribution;
     styleGpu.renderControl = glm::uvec4{
-        static_cast<std::uint32_t>(effectiveDepthContribution),
+        forceDepthContribution ? 2U : 0U,
         static_cast<std::uint32_t>(layer.style.falloffProfile),
         static_cast<std::uint32_t>(layer.style.geometryMode),
         layer.style.solidCenters ? 1U : 0U,
@@ -5813,19 +5813,19 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.featherPower,
     };
     styleGpu.renderParams1 = glm::vec4{
-        layer.style.depthFalloff,
-        layer.style.depthBias,
-        layer.style.frontAlpha,
-        layer.style.hiddenAlpha,
+        0.0F,
+        0.0F,
+        0.0F,
+        0.0F,
     };
     styleGpu.renderParams2 = glm::vec4{
-        layer.style.densityScale,
-        layer.style.densityClamp,
+        1.0F,
+        0.0F,
         std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
         renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
     };
     styleGpu.renderParams3 = glm::vec4{
-        layer.style.depthAlphaThreshold,
+        0.0F,
         pointSizeRangeMin_,
         pointSizeRangeMax_,
         std::max(0.0F, renderState_.flowTimeSeconds),
@@ -5908,6 +5908,58 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             std::clamp(layer.style.causticTint[0], 0.0F, 4.0F),
             std::clamp(layer.style.causticTint[1], 0.0F, 4.0F),
             std::clamp(layer.style.causticTint[2], 0.0F, 4.0F),
+            1.0F,
+        };
+    }
+    if (layer.style.shorelineWaveEnabled) {
+        const glm::vec2 directionInput{
+            layer.style.shorelineDirectionX,
+            layer.style.shorelineDirectionY,
+        };
+        const glm::vec2 shorelineDirection =
+            glm::dot(directionInput, directionInput) > 1.0e-8F
+                ? glm::normalize(directionInput)
+                : glm::vec2{1.0F, 0.0F};
+        styleGpu.shorelineWaveControl = glm::uvec4{
+            1U,
+            layer.style.shorelineSeed,
+            0U,
+            0U,
+        };
+        styleGpu.shorelineWaveParams0 = glm::vec4{
+            layer.style.shorelineBoundaryZ,
+            std::clamp(layer.style.shorelineHeightReachMeters, 0.001F, 50.0F),
+            std::clamp(layer.style.shorelineEdgeFadeMeters, 0.0F, 10.0F),
+            std::clamp(layer.style.shorelineIntensity, 0.0F, 5.0F),
+        };
+        styleGpu.shorelineWaveParams1 = glm::vec4{
+            shorelineDirection.x,
+            shorelineDirection.y,
+            std::clamp(layer.style.shorelinePatternScale, 0.01F, 50.0F),
+            std::clamp(layer.style.shorelineWavelengthMeters, 0.002F, 10.0F),
+        };
+        styleGpu.shorelineWaveParams2 = glm::vec4{
+            std::clamp(layer.style.shorelineSpeed, 0.0F, 10.0F),
+            std::clamp(layer.style.shorelineWarp, 0.0F, 3.0F),
+            std::clamp(layer.style.shorelineTurbulence, 0.0F, 1.0F),
+            std::clamp(layer.style.shorelineDensity, 0.0F, 1.0F),
+        };
+        styleGpu.shorelineWaveParams3 = glm::vec4{
+            layer.style.shorelinePhase,
+            std::clamp(layer.style.shorelineEmissionAdd, 0.0F, 8.0F),
+            std::clamp(layer.style.shorelineOpacityAdd, -1.0F, 2.0F),
+            std::clamp(layer.style.shorelineOpacityMultiply, 0.0F, 8.0F),
+        };
+        styleGpu.shorelineWaveParams4 = glm::vec4{
+            std::clamp(layer.style.shorelinePointSizeAdd, -256.0F, 512.0F),
+            std::clamp(layer.style.shorelinePointSizeMultiply, 0.0F, 8.0F),
+            std::clamp(layer.style.shorelineColourMix, 0.0F, 1.0F),
+            0.0F,
+        };
+        styleGpu.shorelineWaveTint = glm::vec4{
+            std::clamp(layer.style.shorelineColour[0], 0.0F, 4.0F),
+            std::clamp(layer.style.shorelineColour[1], 0.0F, 4.0F),
+            std::clamp(layer.style.shorelineColour[2], 0.0F, 4.0F),
             1.0F,
         };
     }
@@ -6015,10 +6067,6 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.emissiveStrength,
         layer.scalarFields,
         renderer::pointcloud::kInactiveEmissionDefault);
-    styleGpu.xray = MakePointCloudBindingGpu(
-        layer.style.xrayStrength,
-        layer.scalarFields,
-        renderer::pointcloud::kInactiveXrayDefault);
     styleGpu.depthFade = MakePointCloudBindingGpu(
         layer.style.depthFade,
         layer.scalarFields,
@@ -6210,7 +6258,6 @@ bool VulkanViewportShell::RecordPointCloudHighlightDraw(
         std::max(0.0001F, layer.style.surfelDiameter.constantValue[0]));
     invisible_places::style::SetScalarConstant(&highlightLayer.style.opacity, alpha);
     invisible_places::style::SetScalarConstant(&highlightLayer.style.emissiveStrength, 0.12F);
-    invisible_places::style::SetScalarConstant(&highlightLayer.style.xrayStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&highlightLayer.style.depthFade, 0.0F);
     invisible_places::style::SetScalarConstant(&highlightLayer.style.colormapPosition, 0.5F);
 
@@ -6349,12 +6396,6 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
-    const bool sceneHasActiveXray = !fastBasicPointRenderer && std::any_of(
-        request.renderState.pointCloudLayers.begin(),
-        request.renderState.pointCloudLayers.end(),
-        [](const SceneRenderState::PointCloudLayerState& layer) {
-            return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
-        });
     for (const auto& layer : request.renderState.pointCloudLayers) {
         if (fastBasicPointRenderer) {
             static_cast<void>(RecordPointCloudLayerDraw(
@@ -6369,8 +6410,10 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                 true));
             continue;
         }
-        if (renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray) ||
-            request.renderState.eyeDomeLightingEnabled) {
+        const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+        const bool opaqueHardDisc =
+            materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
+        if (opaqueHardDisc || request.renderState.eyeDomeLightingEnabled) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
@@ -6526,7 +6569,6 @@ void VulkanViewportShell::RecordCommandBuffer(
     std::uint64_t pointFastBasicDrawnPoints = 0;
     std::uint64_t pointSubmittedCount = diagnostics_.pointSubmittedCount;
     std::uint64_t pointPassSubmittedCount = diagnostics_.pointPassSubmittedCount;
-    std::uint32_t pointDepthPrepassSkippedNoXray = 0;
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
@@ -6589,28 +6631,12 @@ void VulkanViewportShell::RecordCommandBuffer(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    const bool sceneHasActiveXray =
-        drawLiveScene &&
-        std::any_of(
-            renderState_.pointCloudLayers.begin(),
-            renderState_.pointCloudLayers.end(),
-            [](const SceneRenderState::PointCloudLayerState& layer) {
-                return renderer::pointcloud::PointCloudStyleHasActiveXray(layer.style);
-            });
     if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
             const bool opaqueHardDisc =
                 materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
-            if (collectDiagnostics &&
-                !sceneHasActiveXray &&
-                renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style) &&
-                !opaqueHardDisc) {
-                ++pointDepthPrepassSkippedNoXray;
-            }
-            if (opaqueHardDisc ||
-                renderer::pointcloud::PointCloudStyleUsesDepthPrepass(layer.style, sceneHasActiveXray) ||
-                renderState_.eyeDomeLightingEnabled) {
+            if (opaqueHardDisc || renderState_.eyeDomeLightingEnabled) {
                 if (collectDiagnostics) {
                     ++pointDepthLayerCount;
                 }
@@ -7001,7 +7027,6 @@ void VulkanViewportShell::RecordCommandBuffer(
     diagnostics_.pointFastBasicDrawnPoints = pointFastBasicDrawnPoints;
     diagnostics_.pointSubmittedCount = pointSubmittedCount;
     diagnostics_.pointPassSubmittedCount = pointPassSubmittedCount;
-    diagnostics_.pointDepthPrepassSkippedNoXray = pointDepthPrepassSkippedNoXray;
     diagnostics_.sceneRenderedThisFrame = drawLiveScene;
     diagnostics_.sceneCacheActive = sceneCachingEnabled_;
     diagnostics_.pointCommandRecordMs =

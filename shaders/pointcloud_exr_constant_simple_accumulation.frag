@@ -39,7 +39,6 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     RenderParameterBindingGpu pointSizeBinding;
     RenderParameterBindingGpu opacityBinding;
     RenderParameterBindingGpu emissiveBinding;
-    RenderParameterBindingGpu xrayBinding;
     RenderParameterBindingGpu depthFadeBinding;
     RenderParameterBindingGpu colormapPositionBinding;
     RenderParameterBindingGpu surfelDiameterBinding;
@@ -183,10 +182,7 @@ void main() {
     }
 
     const vec3 baseColor = ApplyColorize(ResolveBaseColor());
-    const float densityScale = max(0.0, styleData.renderParams2.x);
-    const float densityClamp = max(0.0, styleData.renderParams2.y);
-    const float densityAlpha = densityClamp > 0.0 ? min(alpha * max(1.0, densityScale), densityClamp) : alpha;
-    const float weightedAlpha = clamp(densityAlpha, 0.0, AlphaClampMax());
+    const float weightedAlpha = clamp(alpha, 0.0, AlphaClampMax());
     const float weight = WeightedAlphaWeight(weightedAlpha);
     const float aovWeight = weightedAlpha * weight;
 
