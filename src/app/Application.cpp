@@ -22403,20 +22403,24 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
-    if (!runtimeState.projectSettings.liveVisualEffects ||
-        fastBasicRenderer) {
-        return false;
-    }
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
         if (!session.loaded || !session.visible || session.kind != LayerKind::PointCloud) {
             continue;
         }
-        if (session.pointStyle.flowAnimation ||
-            session.pointStyle.waterTrailOverlay ||
-            invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(session.pointStyle) ||
-            invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(session.pointStyle) ||
+        const auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
+        if (invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves(renderStyle)) {
+            return true;
+        }
+        if (!runtimeState.projectSettings.liveVisualEffects ||
+            fastBasicRenderer) {
+            continue;
+        }
+        if (renderStyle.flowAnimation ||
+            renderStyle.waterTrailOverlay ||
+            invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(renderStyle) ||
+            invisible_places::renderer::pointcloud::PointCloudStyleHasActiveCaustics(renderStyle) ||
             viewport.SparseWaterRippleEffectCount(sessionIndex) > 0U) {
             return true;
         }

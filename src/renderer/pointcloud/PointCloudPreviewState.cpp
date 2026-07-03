@@ -414,6 +414,14 @@ bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) 
            style.roughnessMotionSpeed > kMaterialEpsilon;
 }
 
+bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style) {
+    return style.shorelineWaveEnabled &&
+           style.shorelineHeightReachMeters > kMaterialEpsilon &&
+           style.shorelineWavelengthMeters > kMaterialEpsilon &&
+           style.shorelineIntensity > kMaterialEpsilon &&
+           style.shorelineSpeed > kMaterialEpsilon;
+}
+
 bool PointCloudSceneRoleAllowsRoughnessMotion(std::string_view sceneRole) {
     if (sceneRole.empty()) {
         return true;

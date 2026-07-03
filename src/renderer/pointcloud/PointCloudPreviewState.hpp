@@ -216,6 +216,7 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] PointCloudStyleState MakePointCloudStyleForSceneRole(
     PointCloudStyleState style,
     std::string_view sceneRole);
+[[nodiscard]] bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style);
 [[nodiscard]] float ShorelineWaveHeightMask(

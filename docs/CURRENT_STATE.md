@@ -68,6 +68,7 @@ ctest --test-dir build/macos-debug --output-on-failure
 Focused tests for this state include:
 
 - `SampleScene validates local multi-cloud shoreline fixture`
+- `SampleScene shoreline waves animate over time`
 - `Discovery groups role-named sibling PLY files by folder`
 - `ExhibitionScene project template contains only selected multi-cloud scene layers`
 - `Scene role roughness motion only animates vegetation`

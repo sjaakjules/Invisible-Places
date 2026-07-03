@@ -737,6 +737,106 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
                            "Site3-VEG-1mm.Sample.ply"});
 }
 
+TEST_CASE("SampleScene shoreline waves animate over time", "[discovery][scene][sample][shoreline]") {
+    using invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ShorelineWaveHeightMask;
+
+    const auto sampleRoot = DataRoot() / "SampleScene";
+    if (!std::filesystem::exists(sampleRoot)) {
+        SKIP("SampleScene fixture is not present in the local Data directory.");
+    }
+
+    const auto catalog = invisible_places::io::DiscoverAssets(DataRoot());
+    const auto sandIt = std::find_if(
+        catalog.pointClouds.begin(),
+        catalog.pointClouds.end(),
+        [](const auto& asset) {
+            return asset.sceneGroupName == "SampleScene" &&
+                   asset.sceneRole == "SAND";
+        });
+    REQUIRE(sandIt != catalog.pointClouds.end());
+    CHECK(sandIt->filePath.filename() == "Site3-SAND-2mm.Sample.ply");
+    CHECK(sandIt->inferredPointSpacingMeters == Catch::Approx(0.002F));
+
+    PointCloudStyleState style;
+    style.shorelineWaveEnabled = true;
+    REQUIRE(PointCloudStyleHasActiveShorelineWaves(style));
+
+    invisible_places::water::WaterRippleRuntimeParams params;
+    params.overlayType = invisible_places::water::WaterRippleOverlayType::TideBands;
+    params.seed = style.shorelineSeed;
+    params.direction = glm::vec3{style.shorelineDirectionX, style.shorelineDirectionY, 0.0F};
+    params.regionStrength = 1.0F;
+    params.edgeBlendWidth = std::max(
+        0.001F,
+        std::min(
+            std::max(style.shorelineEdgeFadeMeters, style.shorelineWavelengthMeters * 0.20F),
+            style.shorelineHeightReachMeters * 0.45F));
+    params.patternScale = style.shorelinePatternScale;
+    params.wavelengthMeters = style.shorelineWavelengthMeters;
+    params.speed = style.shorelineSpeed;
+    params.warp = style.shorelineWarp;
+    params.turbulence = style.shorelineTurbulence;
+    params.density = style.shorelineDensity;
+    params.phase = style.shorelinePhase;
+    params.response.intensity = style.shorelineIntensity;
+    params.response.emissionAdd = style.shorelineEmissionAdd;
+    params.response.opacityAdd = style.shorelineOpacityAdd;
+    params.response.opacityMultiply = style.shorelineOpacityMultiply;
+    params.response.pointSizeAdd = style.shorelinePointSizeAdd;
+    params.response.pointSizeMultiply = style.shorelinePointSizeMultiply;
+    params.response.colouriseAmount = style.shorelineColourMix;
+    params.response.colouriseRed = style.shorelineColour[0];
+    params.response.colouriseGreen = style.shorelineColour[1];
+    params.response.colouriseBlue = style.shorelineColour[2];
+
+    const invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
+    const std::array<float, 10> shoreDistances{0.025F, 0.05F, 0.08F, 0.12F, 0.16F, 0.21F, 0.27F, 0.33F, 0.39F, 0.44F};
+    const std::array<float, 9> tangentOffsets{0.0F, 0.04F, 0.09F, 0.16F, 0.25F, 0.38F, 0.53F, 0.71F, 0.92F};
+    const auto evaluateAt = [&](float timeSeconds) {
+        std::vector<float> scales;
+        scales.reserve(shoreDistances.size() * tangentOffsets.size());
+        for (const float shoreDistance : shoreDistances) {
+            invisible_places::water::WaterRippleRuntimeMembership membership;
+            membership.edgeDistance = params.edgeBlendWidth;
+            membership.shoreDistance = shoreDistance;
+            const float worldZ = style.shorelineBoundaryZ - shoreDistance;
+            const float heightMask = ShorelineWaveHeightMask(
+                style.shorelineBoundaryZ,
+                style.shorelineHeightReachMeters,
+                style.shorelineEdgeFadeMeters,
+                worldZ);
+            for (const float tangentOffset : tangentOffsets) {
+                const invisible_places::io::Float3 position{tangentOffset, shoreDistance, worldZ};
+                const auto contribution = invisible_places::water::EvaluateWaterRippleRuntimeContribution(
+                    params,
+                    membership,
+                    position,
+                    normal,
+                    timeSeconds);
+                scales.push_back(contribution.scale * heightMask);
+            }
+        }
+        return scales;
+    };
+
+    const auto baseline = evaluateAt(0.0F);
+    float maxAnimatedDelta = 0.0F;
+    float maxScale = 0.0F;
+    for (const float timeSeconds : {0.75F, 1.5F, 3.0F, 6.0F, 9.0F, 12.0F}) {
+        const auto animated = evaluateAt(timeSeconds);
+        REQUIRE(animated.size() == baseline.size());
+        for (std::size_t index = 0; index < animated.size(); ++index) {
+            maxAnimatedDelta = std::max(maxAnimatedDelta, std::abs(animated[index] - baseline[index]));
+            maxScale = std::max(maxScale, animated[index]);
+        }
+    }
+
+    CHECK(maxScale > 0.02F);
+    CHECK(maxAnimatedDelta > 0.01F);
+}
+
 TEST_CASE("Point-cloud scene roles and millimetre spacing are inferred from filenames", "[discovery][scene]") {
     CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-ROCK-1mm.ply") == "ROCK");
     CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-SAND-2mm.ply") == "SAND");
@@ -10687,6 +10787,7 @@ TEST_CASE("Scene role roughness motion only animates vegetation", "[pointcloud][
     using invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole;
     using invisible_places::renderer::pointcloud::PointCloudSceneRoleAllowsRoughnessMotion;
     using invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion;
+    using invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves;
     using invisible_places::renderer::pointcloud::PointCloudStyleState;
 
     PointCloudStyleState style;
@@ -10708,6 +10809,12 @@ TEST_CASE("Scene role roughness motion only animates vegetation", "[pointcloud][
     CHECK(MakePointCloudStyleForSceneRole(style, "SAND").shorelineWaveEnabled);
     CHECK_FALSE(MakePointCloudStyleForSceneRole(style, "ROCK").shorelineWaveEnabled);
     CHECK_FALSE(MakePointCloudStyleForSceneRole(style, "VEG").shorelineWaveEnabled);
+    CHECK(PointCloudStyleHasActiveShorelineWaves(MakePointCloudStyleForSceneRole(style, "SAND")));
+    CHECK_FALSE(PointCloudStyleHasActiveShorelineWaves(MakePointCloudStyleForSceneRole(style, "ROCK")));
+
+    auto staticShoreline = MakePointCloudStyleForSceneRole(style, "SAND");
+    staticShoreline.shorelineSpeed = 0.0F;
+    CHECK_FALSE(PointCloudStyleHasActiveShorelineWaves(staticShoreline));
 }
 
 TEST_CASE("World sprite diameter projects to depth-adaptive point pixels", "[pointcloud][style]") {
