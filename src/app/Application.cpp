@@ -91,7 +91,6 @@ using PointBudgetState = invisible_places::renderer::pointcloud::PointBudgetStat
 using PointCloudStyleState = invisible_places::renderer::pointcloud::PointCloudStyleState;
 using PointCloudColorMode = invisible_places::renderer::pointcloud::PointCloudColorMode;
 using PointCloudColormapId = invisible_places::renderer::pointcloud::PointCloudColormapId;
-using PointCloudDepthContribution = invisible_places::renderer::pointcloud::PointCloudDepthContribution;
 using PointCloudFalloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset;
@@ -524,6 +523,13 @@ struct PreviewLayerSession {
     LayerKind kind = LayerKind::PointCloud;
     std::filesystem::path sourcePath;
     std::filesystem::path transformPath;
+    std::string sceneGroupName;
+    std::string sceneRole;
+    float inferredPointSpacingMeters = 0.0F;
+    float pointSpacingMeters = 0.0F;
+    bool pointSpacingManualOverride = false;
+    bool scenePrimaryRole = false;
+    std::filesystem::path selectedSceneVariantPath;
     std::string displayName;
     bool loaded = false;
     bool visible = false;
@@ -785,6 +791,8 @@ struct WaterWorkflowState {
     std::shared_ptr<const TrailSurfaceIndex> trailSurfaceIndex;
     std::string trailSurfaceIndexSupportSignature;
     std::filesystem::path trailSurfaceIndexSupportPath;
+    std::shared_ptr<invisible_places::io::LoadedPointCloud> combinedSupportCloud;
+    std::string combinedSupportSignature;
     WaterTrailBuildDiagnostics lastTrailBuildDiagnostics{};
     bool pathCacheLoaded = false;
     bool pathCacheStale = false;
@@ -1206,7 +1214,15 @@ std::size_t RefreshWaterRegionPointPreviews(
 }
 
 std::filesystem::path DefaultProjectFilePath(const std::filesystem::path& dataRoot) {
-    return dataRoot.parent_path() / "Saved" / "invisible_places_project.json";
+    const auto savedDirectory = dataRoot.filename() == "ExhibitionScene"
+                                    ? dataRoot.parent_path().parent_path() / "Saved"
+                                    : dataRoot.parent_path() / "Saved";
+    const auto exhibitionProjectPath = savedDirectory / "exhibitionScene_project.json";
+    std::error_code error;
+    if (std::filesystem::is_regular_file(exhibitionProjectPath, error)) {
+        return exhibitionProjectPath;
+    }
+    return savedDirectory / "invisible_places_project.json";
 }
 
 std::filesystem::path DefaultPointStylePresetPath(const std::filesystem::path& dataRoot) {
@@ -1647,7 +1663,6 @@ void HashBinding(std::uint64_t* seed, const RenderParameterBinding& binding) {
 void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashCombine(seed, static_cast<std::uint64_t>(style.geometryMode));
     HashCombine(seed, static_cast<std::uint64_t>(style.screenSpriteSizeMode));
-    HashCombine(seed, static_cast<std::uint64_t>(style.depthContribution));
     HashCombine(seed, static_cast<std::uint64_t>(style.falloffProfile));
     HashCombine(seed, static_cast<std::uint64_t>(style.stylisationMode));
     HashCombine(seed, static_cast<std::uint64_t>(style.nprPreset));
@@ -1709,14 +1724,7 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashFloat(seed, style.innerRadius);
     HashFloat(seed, style.gaussianSharpness);
     HashFloat(seed, style.featherPower);
-    HashFloat(seed, style.depthFalloff);
-    HashFloat(seed, style.depthBias);
-    HashFloat(seed, style.frontAlpha);
-    HashFloat(seed, style.hiddenAlpha);
-    HashFloat(seed, style.densityScale);
-    HashFloat(seed, style.densityClamp);
     HashFloat(seed, style.waterStreakAspect);
-    HashFloat(seed, style.depthAlphaThreshold);
     HashBool(seed, style.solidCenters);
     HashBool(seed, style.flowAnimation);
     HashBool(seed, style.waterPathView);
@@ -1725,7 +1733,6 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashBinding(seed, style.surfelDiameter);
     HashBinding(seed, style.opacity);
     HashBinding(seed, style.emissiveStrength);
-    HashBinding(seed, style.xrayStrength);
     HashBinding(seed, style.depthFade);
     HashBinding(seed, style.colormapPosition);
 }
@@ -2131,7 +2138,6 @@ void RemapLegacyWaterTrailBindings(PreviewLayerSession* session) {
     RemapLegacyWaterTrailBinding(&session->pointStyle.surfelDiameter, session->scalarFields);
     RemapLegacyWaterTrailBinding(&session->pointStyle.opacity, session->scalarFields);
     RemapLegacyWaterTrailBinding(&session->pointStyle.emissiveStrength, session->scalarFields);
-    RemapLegacyWaterTrailBinding(&session->pointStyle.xrayStrength, session->scalarFields);
     RemapLegacyWaterTrailBinding(&session->pointStyle.depthFade, session->scalarFields);
     RemapLegacyWaterTrailBinding(&session->pointStyle.colormapPosition, session->scalarFields);
 }
@@ -2159,7 +2165,6 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.surfelDiameter, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.opacity, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.emissiveStrength, session->scalarFields);
-    invisible_places::style::SyncBindingFieldReference(&session->pointStyle.xrayStrength, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.depthFade, session->scalarFields);
     invisible_places::style::SyncBindingFieldReference(&session->pointStyle.colormapPosition, session->scalarFields);
 
@@ -2167,14 +2172,7 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     session->pointStyle.innerRadius = std::clamp(session->pointStyle.innerRadius, 0.0F, 0.99F);
     session->pointStyle.gaussianSharpness = std::max(0.001F, session->pointStyle.gaussianSharpness);
     session->pointStyle.featherPower = std::max(0.001F, session->pointStyle.featherPower);
-    session->pointStyle.depthFalloff = std::max(0.0F, session->pointStyle.depthFalloff);
-    session->pointStyle.depthBias = std::max(0.0F, session->pointStyle.depthBias);
-    session->pointStyle.frontAlpha = std::clamp(session->pointStyle.frontAlpha, 0.0F, 1.0F);
-    session->pointStyle.hiddenAlpha = std::clamp(session->pointStyle.hiddenAlpha, 0.0F, 1.0F);
-    session->pointStyle.densityScale = std::max(0.0F, session->pointStyle.densityScale);
-    session->pointStyle.densityClamp = std::max(0.0F, session->pointStyle.densityClamp);
     session->pointStyle.waterStreakAspect = std::clamp(session->pointStyle.waterStreakAspect, 1.0F, 32.0F);
-    session->pointStyle.depthAlphaThreshold = std::clamp(session->pointStyle.depthAlphaThreshold, 0.0F, 1.0F);
     session->pointStyle.colorizeAmount = std::clamp(session->pointStyle.colorizeAmount, 0.0F, 1.0F);
     session->pointStyle.stylisationStrength =
         std::clamp(session->pointStyle.stylisationStrength, 0.0F, 1.0F);
@@ -2394,6 +2392,11 @@ void PollWaterRippleLiveEffectRefresh(
     invisible_places::renderer::core::VulkanViewportShell* viewport);
 void ClearWaterRegionEffectsDirtyForFeature(WaterWorkflowState* water, WaterEffectFeatureType featureType);
 void ClearWaterFieldRegionEffectsDirty(WaterWorkflowState* water);
+std::optional<std::size_t> FindSessionIndexBySourcePath(
+    const PreviewRuntimeState& runtimeState,
+    const std::filesystem::path& sourcePath);
+void SyncScenePointVisualsFromOwner(PreviewRuntimeState* runtimeState, PreviewLayerSession* editedSession);
+void ConsolidateScenePointVisuals(PreviewRuntimeState* runtimeState);
 
 std::optional<std::size_t> FindPointVisualIndex(
     const PreviewLayerSession& session,
@@ -3190,6 +3193,436 @@ bool DrawScalarBindingWidget(
     return changed;
 }
 
+float EffectivePointSpacingMeters(const PreviewLayerSession& session) {
+    if (session.pointSpacingManualOverride && session.pointSpacingMeters > 0.0F) {
+        return session.pointSpacingMeters;
+    }
+    if (session.pointSpacingMeters > 0.0F) {
+        return session.pointSpacingMeters;
+    }
+    return session.inferredPointSpacingMeters;
+}
+
+float DefaultSceneVariantSpacingMeters(std::string_view role) {
+    if (role == "SAND") {
+        return 0.002F;
+    }
+    if (role == "ROCK" || role == "VEG") {
+        return 0.001F;
+    }
+    return 0.0F;
+}
+
+bool IsSceneGroupedPointCloud(const PreviewLayerSession& session) {
+    return session.kind == LayerKind::PointCloud &&
+           !session.sceneGroupName.empty() &&
+           !session.sceneRole.empty();
+}
+
+bool IsSelectedSceneVariant(const PreviewLayerSession& session) {
+    if (!IsSceneGroupedPointCloud(session)) {
+        return true;
+    }
+    if (session.selectedSceneVariantPath.empty()) {
+        return true;
+    }
+    return session.selectedSceneVariantPath == session.sourcePath;
+}
+
+void AssignDefaultSceneVariantSelections(std::vector<PreviewLayerSession>* sessions) {
+    if (sessions == nullptr) {
+        return;
+    }
+
+    for (auto& session : *sessions) {
+        if (!IsSceneGroupedPointCloud(session)) {
+            continue;
+        }
+
+        const float targetSpacing = DefaultSceneVariantSpacingMeters(session.sceneRole);
+        std::size_t bestIndex = std::numeric_limits<std::size_t>::max();
+        float bestDistance = std::numeric_limits<float>::max();
+        for (std::size_t candidateIndex = 0; candidateIndex < sessions->size(); ++candidateIndex) {
+            const auto& candidate = sessions->at(candidateIndex);
+            if (candidate.kind != LayerKind::PointCloud ||
+                candidate.sceneGroupName != session.sceneGroupName ||
+                candidate.sceneRole != session.sceneRole) {
+                continue;
+            }
+            const float candidateSpacing = EffectivePointSpacingMeters(candidate);
+            const float distance = targetSpacing > 0.0F && candidateSpacing > 0.0F
+                                       ? std::fabs(candidateSpacing - targetSpacing)
+                                       : 0.0F;
+            const bool preferCandidate =
+                bestIndex == std::numeric_limits<std::size_t>::max() ||
+                distance < bestDistance ||
+                (distance == bestDistance &&
+                 candidate.totalPrimitives < sessions->at(bestIndex).totalPrimitives);
+            if (preferCandidate) {
+                bestIndex = candidateIndex;
+                bestDistance = distance;
+            }
+        }
+
+        if (bestIndex != std::numeric_limits<std::size_t>::max()) {
+            session.selectedSceneVariantPath = sessions->at(bestIndex).sourcePath;
+        }
+    }
+}
+
+void ScaleRenderBindingOutputs(RenderParameterBinding* binding, float scale) {
+    if (binding == nullptr || scale <= 0.0F) {
+        return;
+    }
+    binding->constantValue[0] *= scale;
+    binding->fieldMap.outputMin *= scale;
+    binding->fieldMap.outputMax *= scale;
+}
+
+float PrimarySceneSpacingMeters(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    if (!IsSceneGroupedPointCloud(session)) {
+        return 0.0F;
+    }
+    for (const auto& candidate : runtimeState.sessions) {
+        if (candidate.sceneGroupName == session.sceneGroupName &&
+            candidate.scenePrimaryRole &&
+            IsSelectedSceneVariant(candidate)) {
+            const float spacing = EffectivePointSpacingMeters(candidate);
+            if (spacing > 0.0F) {
+                return spacing;
+            }
+        }
+    }
+    return EffectivePointSpacingMeters(session);
+}
+
+PointCloudStyleState MakeSceneDensityCompensatedStyle(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    PointCloudStyleState style) {
+    if (!IsSceneGroupedPointCloud(session) || session.scenePrimaryRole) {
+        return style;
+    }
+    const float primarySpacing = PrimarySceneSpacingMeters(runtimeState, session);
+    const float roleSpacing = EffectivePointSpacingMeters(session);
+    if (primarySpacing <= 0.0F || roleSpacing <= 0.0F) {
+        return style;
+    }
+
+    const float spacingRatio = std::clamp(roleSpacing / primarySpacing, 0.05F, 50.0F);
+    const bool worldSized =
+        style.geometryMode != PointCloudGeometryMode::ScreenSprites ||
+        invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(style);
+    if (worldSized) {
+        ScaleRenderBindingOutputs(&style.surfelDiameter, spacingRatio);
+        if (style.geometryMode == PointCloudGeometryMode::ScreenSprites) {
+            ScaleRenderBindingOutputs(&style.pointSize, spacingRatio);
+        }
+    } else {
+        const float areaRatio = spacingRatio * spacingRatio;
+        ScaleRenderBindingOutputs(&style.opacity, std::clamp(areaRatio, 0.05F, 8.0F));
+    }
+    return style;
+}
+
+PointCloudStyleState MakeSceneRenderStyle(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    PointCloudStyleState style) {
+    style = MakeSceneDensityCompensatedStyle(runtimeState, session, style);
+    return invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole(
+        style,
+        session.sceneRole);
+}
+
+std::string NormalizeSceneRoleName(std::string_view role) {
+    std::string normalized;
+    normalized.reserve(role.size());
+    for (const char character : role) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::toupper(byte)));
+    }
+    return normalized;
+}
+
+bool SceneRoleIs(std::string_view role, std::string_view target) {
+    return NormalizeSceneRoleName(role) == NormalizeSceneRoleName(target);
+}
+
+void CopyShorelineWaveSettings(PointCloudStyleState* target, const PointCloudStyleState& source) {
+    if (target == nullptr) {
+        return;
+    }
+    target->shorelineWaveEnabled = source.shorelineWaveEnabled;
+    target->shorelineBoundaryZ = source.shorelineBoundaryZ;
+    target->shorelineHeightReachMeters = source.shorelineHeightReachMeters;
+    target->shorelineEdgeFadeMeters = source.shorelineEdgeFadeMeters;
+    target->shorelineDirectionX = source.shorelineDirectionX;
+    target->shorelineDirectionY = source.shorelineDirectionY;
+    target->shorelinePatternScale = source.shorelinePatternScale;
+    target->shorelineWavelengthMeters = source.shorelineWavelengthMeters;
+    target->shorelineSpeed = source.shorelineSpeed;
+    target->shorelineWarp = source.shorelineWarp;
+    target->shorelineTurbulence = source.shorelineTurbulence;
+    target->shorelineDensity = source.shorelineDensity;
+    target->shorelinePhase = source.shorelinePhase;
+    target->shorelineIntensity = source.shorelineIntensity;
+    target->shorelineEmissionAdd = source.shorelineEmissionAdd;
+    target->shorelineOpacityAdd = source.shorelineOpacityAdd;
+    target->shorelineOpacityMultiply = source.shorelineOpacityMultiply;
+    target->shorelinePointSizeAdd = source.shorelinePointSizeAdd;
+    target->shorelinePointSizeMultiply = source.shorelinePointSizeMultiply;
+    target->shorelineColourMix = source.shorelineColourMix;
+    target->shorelineColour = source.shorelineColour;
+    target->shorelineSeed = source.shorelineSeed;
+}
+
+void CopyRoughnessMotionSettings(PointCloudStyleState* target, const PointCloudStyleState& source) {
+    if (target == nullptr) {
+        return;
+    }
+    target->roughnessMotionStrength = source.roughnessMotionStrength;
+    target->roughnessMotionScale = source.roughnessMotionScale;
+    target->roughnessMotionSpeed = source.roughnessMotionSpeed;
+    target->roughnessMotionThreshold = source.roughnessMotionThreshold;
+    target->roughnessMotionGroundId = source.roughnessMotionGroundId;
+}
+
+void MergeSceneRoleSpecificVisualSettings(
+    PointCloudStyleState* target,
+    const PointCloudStyleState& source,
+    std::string_view role) {
+    if (target == nullptr) {
+        return;
+    }
+    if (SceneRoleIs(role, "SAND") && source.shorelineWaveEnabled) {
+        CopyShorelineWaveSettings(target, source);
+    }
+    if (SceneRoleIs(role, "VEG") &&
+        invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(source)) {
+        CopyRoughnessMotionSettings(target, source);
+    }
+}
+
+std::optional<std::size_t> FindSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& targetSession) {
+    for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
+        if (&runtimeState.sessions[index] == &targetSession) {
+            return index;
+        }
+    }
+    return FindSessionIndexBySourcePath(runtimeState, targetSession.sourcePath);
+}
+
+std::optional<std::size_t> FindSceneVisualOwnerIndex(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    bool requireLoaded) {
+    if (!IsSceneGroupedPointCloud(session)) {
+        return FindSessionIndex(runtimeState, session);
+    }
+
+    std::optional<std::size_t> fallbackIndex;
+    for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
+        const auto& candidate = runtimeState.sessions[index];
+        if (!IsSceneGroupedPointCloud(candidate) ||
+            candidate.sceneGroupName != session.sceneGroupName ||
+            !IsSelectedSceneVariant(candidate) ||
+            (requireLoaded && !candidate.loaded) ||
+            IsGeneratedWaterOverlaySession(candidate)) {
+            continue;
+        }
+        if (!fallbackIndex.has_value()) {
+            fallbackIndex = index;
+        }
+        if (candidate.scenePrimaryRole || SceneRoleIs(candidate.sceneRole, "ROCK")) {
+            return index;
+        }
+    }
+    return fallbackIndex;
+}
+
+std::optional<std::size_t> FindSceneVisualOwnerIndexForGroup(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view sceneGroupName,
+    bool requireLoaded) {
+    std::optional<std::size_t> fallbackIndex;
+    for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
+        const auto& candidate = runtimeState.sessions[index];
+        if (!IsSceneGroupedPointCloud(candidate) ||
+            candidate.sceneGroupName != sceneGroupName ||
+            !IsSelectedSceneVariant(candidate) ||
+            (requireLoaded && !candidate.loaded) ||
+            IsGeneratedWaterOverlaySession(candidate)) {
+            continue;
+        }
+        if (!fallbackIndex.has_value()) {
+            fallbackIndex = index;
+        }
+        if (candidate.scenePrimaryRole || SceneRoleIs(candidate.sceneRole, "ROCK")) {
+            return index;
+        }
+    }
+    return fallbackIndex;
+}
+
+std::string SceneVisualDisplayName(const PreviewLayerSession& session) {
+    if (IsSceneGroupedPointCloud(session)) {
+        return session.sceneGroupName.empty() ? session.displayName : session.sceneGroupName;
+    }
+    return session.displayName;
+}
+
+bool SceneVisualGroupVisible(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    if (!IsSceneGroupedPointCloud(session)) {
+        return session.visible;
+    }
+    return std::any_of(
+        runtimeState.sessions.begin(),
+        runtimeState.sessions.end(),
+        [&](const PreviewLayerSession& candidate) {
+            return IsSceneGroupedPointCloud(candidate) &&
+                   candidate.sceneGroupName == session.sceneGroupName &&
+                   IsSelectedSceneVariant(candidate) &&
+                   candidate.loaded &&
+                   candidate.visible;
+        });
+}
+
+void MergeSceneRoleVisualsIntoOwner(
+    PreviewLayerSession* owner,
+    PreviewLayerSession* roleSession) {
+    if (owner == nullptr ||
+        roleSession == nullptr ||
+        owner == roleSession ||
+        !IsSceneGroupedPointCloud(*owner) ||
+        !IsSceneGroupedPointCloud(*roleSession) ||
+        owner->sceneGroupName != roleSession->sceneGroupName) {
+        return;
+    }
+
+    EnsurePointVisuals(owner);
+    EnsurePointVisuals(roleSession);
+    MergeSceneRoleSpecificVisualSettings(&owner->pointStyle, roleSession->pointStyle, roleSession->sceneRole);
+    for (const auto& roleVisual : roleSession->pointVisuals) {
+        const auto roleVisualName = NormalizePointVisualName(roleVisual.name);
+        auto ownerVisualIndex = FindPointVisualIndex(*owner, roleVisualName);
+        if (!ownerVisualIndex.has_value()) {
+            owner->pointVisuals.push_back({.name = roleVisualName, .style = roleVisual.style});
+            ownerVisualIndex = owner->pointVisuals.size() - 1U;
+        }
+        MergeSceneRoleSpecificVisualSettings(
+            &owner->pointVisuals[ownerVisualIndex.value()].style,
+            roleVisual.style,
+            roleSession->sceneRole);
+    }
+}
+
+void MirrorSceneOwnerVisualsToSelectedRoles(
+    PreviewRuntimeState* runtimeState,
+    std::size_t ownerIndex) {
+    if (runtimeState == nullptr || ownerIndex >= runtimeState->sessions.size()) {
+        return;
+    }
+
+    auto& owner = runtimeState->sessions[ownerIndex];
+    if (!IsSceneGroupedPointCloud(owner)) {
+        return;
+    }
+
+    EnsurePointVisuals(&owner);
+    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+        if (index == ownerIndex) {
+            continue;
+        }
+        auto& candidate = runtimeState->sessions[index];
+        if (!IsSceneGroupedPointCloud(candidate) ||
+            candidate.sceneGroupName != owner.sceneGroupName ||
+            !IsSelectedSceneVariant(candidate)) {
+            continue;
+        }
+
+        candidate.pointVisuals = owner.pointVisuals;
+        candidate.selectedPointVisualName = owner.selectedPointVisualName;
+        candidate.pointVisualNameBuffer = owner.pointVisualNameBuffer;
+        candidate.pointStyle = owner.pointStyle;
+        EnsurePointVisuals(&candidate);
+        if (const auto visualIndex = FindPointVisualIndex(candidate, candidate.selectedPointVisualName);
+            visualIndex.has_value()) {
+            candidate.pointStyle = candidate.pointVisuals[visualIndex.value()].style;
+        }
+        SanitizePointCloudStyle(&candidate);
+    }
+}
+
+void SyncScenePointVisualsFromOwner(PreviewRuntimeState* runtimeState, PreviewLayerSession* editedSession) {
+    if (runtimeState == nullptr || editedSession == nullptr || !IsSceneGroupedPointCloud(*editedSession)) {
+        return;
+    }
+
+    const auto editedIndex = FindSessionIndex(*runtimeState, *editedSession);
+    if (!editedIndex.has_value()) {
+        return;
+    }
+    const auto ownerIndex =
+        FindSceneVisualOwnerIndex(*runtimeState, *editedSession, false).value_or(editedIndex.value());
+    auto& owner = runtimeState->sessions[ownerIndex];
+    if (ownerIndex != editedIndex.value()) {
+        owner.pointVisuals = editedSession->pointVisuals;
+        owner.selectedPointVisualName = editedSession->selectedPointVisualName;
+        owner.pointVisualNameBuffer = editedSession->pointVisualNameBuffer;
+        owner.pointStyle = editedSession->pointStyle;
+    }
+    EnsurePointVisuals(&owner);
+    UpsertPointVisual(&owner, owner.selectedPointVisualName, owner.pointStyle);
+    MirrorSceneOwnerVisualsToSelectedRoles(runtimeState, ownerIndex);
+}
+
+void ConsolidateScenePointVisuals(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    std::vector<std::string> processedGroups;
+    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+        const auto& session = runtimeState->sessions[index];
+        if (!IsSceneGroupedPointCloud(session) ||
+            std::find(processedGroups.begin(), processedGroups.end(), session.sceneGroupName) !=
+                processedGroups.end()) {
+            continue;
+        }
+
+        const auto ownerIndex = FindSceneVisualOwnerIndexForGroup(
+            *runtimeState,
+            session.sceneGroupName,
+            false);
+        if (!ownerIndex.has_value()) {
+            continue;
+        }
+        for (std::size_t roleIndex = 0; roleIndex < runtimeState->sessions.size(); ++roleIndex) {
+            auto& roleSession = runtimeState->sessions[roleIndex];
+            if (!IsSceneGroupedPointCloud(roleSession) ||
+                roleSession.sceneGroupName != session.sceneGroupName ||
+                !IsSelectedSceneVariant(roleSession)) {
+                continue;
+            }
+            MergeSceneRoleVisualsIntoOwner(
+                &runtimeState->sessions[ownerIndex.value()],
+                &roleSession);
+        }
+        MirrorSceneOwnerVisualsToSelectedRoles(runtimeState, ownerIndex.value());
+        processedGroups.push_back(session.sceneGroupName);
+    }
+}
+
 std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::AssetCatalog& assetCatalog) {
     std::vector<PreviewLayerSession> sessions;
     sessions.reserve(assetCatalog.pointClouds.size() + assetCatalog.gaussianSplats.size());
@@ -3198,6 +3631,12 @@ std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::Asset
         PreviewLayerSession session;
         session.kind = LayerKind::PointCloud;
         session.sourcePath = asset.filePath;
+        session.sceneGroupName = asset.sceneGroupName;
+        session.sceneRole = asset.sceneRole;
+        session.inferredPointSpacingMeters = asset.inferredPointSpacingMeters;
+        session.pointSpacingMeters = asset.inferredPointSpacingMeters;
+        session.scenePrimaryRole = asset.scenePrimaryRole;
+        session.selectedSceneVariantPath = asset.filePath;
         session.displayName = asset.filePath.stem().string();
         session.hasSourceRgb = asset.header.HasColorRgb();
         session.totalPrimitives = asset.header.vertexCount;
@@ -3221,6 +3660,7 @@ std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::Asset
         sessions.push_back(std::move(session));
     }
 
+    AssignDefaultSceneVariantSelections(&sessions);
     return sessions;
 }
 
@@ -4151,6 +4591,7 @@ bool IsLoadedPointCloudSession(const PreviewLayerSession& session) {
 bool IsVisibleLoadedWaterSupportSession(const PreviewLayerSession& session) {
     return IsVisibleLoadedPointCloudSession(session) &&
            session.offlinePointCloud != nullptr &&
+           IsSelectedSceneVariant(session) &&
            !IsGeneratedWaterOverlaySession(session);
 }
 
@@ -4160,14 +4601,16 @@ std::optional<std::size_t> ResolveLoadedPointCloudLookdevIndex(const PreviewRunt
         const auto selectedIndex = runtimeState.selectedSessionIndex.value();
         if (IsLoadedPointCloudSession(runtimeState.sessions[selectedIndex]) &&
             !IsGeneratedWaterOverlaySession(runtimeState.sessions[selectedIndex])) {
-            return selectedIndex;
+            return FindSceneVisualOwnerIndex(runtimeState, runtimeState.sessions[selectedIndex], true)
+                .value_or(selectedIndex);
         }
     }
 
     for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
         if (IsLoadedPointCloudSession(runtimeState.sessions[index]) &&
             !IsGeneratedWaterOverlaySession(runtimeState.sessions[index])) {
-            return index;
+            return FindSceneVisualOwnerIndex(runtimeState, runtimeState.sessions[index], true)
+                .value_or(index);
         }
     }
 
@@ -4180,14 +4623,16 @@ std::optional<std::size_t> ResolveVisiblePointCloudLookdevIndex(const PreviewRun
         const auto selectedIndex = runtimeState.selectedSessionIndex.value();
         if (IsVisibleLoadedPointCloudSession(runtimeState.sessions[selectedIndex]) &&
             !IsGeneratedWaterOverlaySession(runtimeState.sessions[selectedIndex])) {
-            return selectedIndex;
+            return FindSceneVisualOwnerIndex(runtimeState, runtimeState.sessions[selectedIndex], true)
+                .value_or(selectedIndex);
         }
     }
 
     for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
         if (IsVisibleLoadedPointCloudSession(runtimeState.sessions[index]) &&
             !IsGeneratedWaterOverlaySession(runtimeState.sessions[index])) {
-            return index;
+            return FindSceneVisualOwnerIndex(runtimeState, runtimeState.sessions[index], true)
+                .value_or(index);
         }
     }
 
@@ -4274,6 +4719,26 @@ bool ActivateLoadedPointCloud(
 
     SanitizePointCloudStyle(&session);
     if (session.kind == LayerKind::PointCloud) {
+        if (session.sceneRole == "SAND" && session.bounds.valid) {
+            const float widthX = session.bounds.maximum.x - session.bounds.minimum.x;
+            const float widthY = session.bounds.maximum.y - session.bounds.minimum.y;
+            const float tangentX = widthX >= widthY ? 1.0F : 0.0F;
+            const float tangentY = widthX >= widthY ? 0.0F : 1.0F;
+            auto applyDefaultShorelineDirection = [&](PointCloudStyleState* style) {
+                if (style == nullptr ||
+                    !style->shorelineWaveEnabled ||
+                    std::abs(style->shorelineDirectionX - 1.0F) > 1.0e-5F ||
+                    std::abs(style->shorelineDirectionY) > 1.0e-5F) {
+                    return;
+                }
+                style->shorelineDirectionX = tangentX;
+                style->shorelineDirectionY = tangentY;
+            };
+            applyDefaultShorelineDirection(&session.pointStyle);
+            for (auto& visual : session.pointVisuals) {
+                applyDefaultShorelineDirection(&visual.style);
+            }
+        }
         EnsurePointVisuals(&session);
         UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
     }
@@ -5355,10 +5820,8 @@ PointCloudStyleState MakeWaterTrailExportStyle(PointCloudStyleState style) {
     style.waterPathView = false;
     style.waterTrailOverlay = true;
     style.geometryMode = PointCloudGeometryMode::CameraFacingWorldSprites;
-    style.depthContribution = PointCloudDepthContribution::None;
     style.stylisationMode = PointCloudStylisationMode::Off;
     style.roughnessMotionStrength = 0.0F;
-    style.xrayStrength.active = false;
     style.depthFade.active = false;
     return style;
 }
@@ -5495,7 +5958,6 @@ const char* WaterPathDebugOverlayModeName(WaterPathDebugOverlayMode mode) {
 PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
     PointCloudStyleState style;
     style.geometryMode = PointCloudGeometryMode::ScreenSprites;
-    style.depthContribution = PointCloudDepthContribution::None;
     style.falloffProfile = PointCloudFalloffProfile::Gaussian;
     style.colorMode = PointCloudColorMode::SourceRgb;
     style.solidColor = {0.04F, 0.74F, 1.0F, 1.0F};
@@ -5503,8 +5965,6 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
     style.colorizeAmount = 0.0F;
     style.exposure = 1.8F;
     style.gaussianSharpness = 1.65F;
-    style.densityScale = 1.0F;
-    style.densityClamp = 8.0F;
     style.solidCenters = true;
     style.flowAnimation = true;
     style.waterTrailOverlay = true;
@@ -5534,7 +5994,6 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
         &style.emissiveStrength.fieldMap,
         invisible_places::style::FieldMapFlagUseLayerStats,
         false);
-    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
     invisible_places::style::SetScalarConstant(&style.colormapPosition, 0.5F);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.012F);
@@ -5544,7 +6003,6 @@ PointCloudStyleState MakeWaterOverlayStyle(WaterOverlayViewMode viewMode) {
 PointCloudStyleState MakeWaterEffectOverlayStyle(std::string_view visualName) {
     PointCloudStyleState style;
     style.geometryMode = PointCloudGeometryMode::WorldSurfels;
-    style.depthContribution = PointCloudDepthContribution::None;
     style.falloffProfile = PointCloudFalloffProfile::Gaussian;
     style.colorMode = PointCloudColorMode::SourceRgb;
     style.solidColor = {0.50F, 0.86F, 1.0F, 1.0F};
@@ -5552,8 +6010,6 @@ PointCloudStyleState MakeWaterEffectOverlayStyle(std::string_view visualName) {
     style.colorizeAmount = 0.16F;
     style.exposure = 1.55F;
     style.gaussianSharpness = 1.45F;
-    style.densityScale = 0.88F;
-    style.densityClamp = 8.0F;
     style.solidCenters = false;
     invisible_places::style::SetScalarConstant(&style.pointSize, 3.0F);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.018F);
@@ -5629,10 +6085,7 @@ PointCloudStyleState MakeWaterOverlayVisualPreset(WaterOverlayVisualPreset prese
     style.waterPathView = false;
     style.colorMode = PointCloudColorMode::SolidColor;
     style.falloffProfile = PointCloudFalloffProfile::Gaussian;
-    style.depthContribution = PointCloudDepthContribution::None;
     style.solidCenters = false;
-    style.densityScale = 1.0F;
-    style.densityClamp = 10.0F;
     style.waterStreakAspect = 1.0F;
     ConfigureWaterFieldBinding(&style.opacity, kWaterTrailFieldPointAge, "point_age", 0.28F, 0.035F);
     invisible_places::style::SetFieldMapFlag(
@@ -5677,7 +6130,6 @@ PointCloudStyleState MakeWaterOverlayVisualPreset(WaterOverlayVisualPreset prese
             style.colorizeColor = {0.74F, 0.88F, 1.0F};
             style.exposure = 1.45F;
             style.gaussianSharpness = 0.72F;
-            style.densityScale = 0.72F;
             style.waterStreakAspect = 4.0F;
             invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.040F);
             style.opacity.fieldMap.outputMin = 0.11F;
@@ -6915,6 +7367,106 @@ std::string WaterSupportSignature(const PreviewLayerSession& sourceSession) {
     return signature.str();
 }
 
+float WaterSupportSamplingMultiplierForRole(std::string_view role) {
+    if (role == "SAND" || role == "VEG") {
+        return 2.0F;
+    }
+    return 1.0F;
+}
+
+std::vector<invisible_places::water::WaterSceneSupportLayer> BuildWaterSceneSupportLayers(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& sourceSession) {
+    std::vector<invisible_places::water::WaterSceneSupportLayer> layers;
+    if (!IsSceneGroupedPointCloud(sourceSession)) {
+        return layers;
+    }
+    for (const auto& session : runtimeState.sessions) {
+        if (!IsVisibleLoadedWaterSupportSession(session) ||
+            session.offlinePointCloud == nullptr ||
+            session.sceneGroupName != sourceSession.sceneGroupName ||
+            !IsSelectedSceneVariant(session)) {
+            continue;
+        }
+        layers.push_back({
+            .cloud = session.offlinePointCloud.get(),
+            .role = session.sceneRole,
+            .pointSpacingMeters = EffectivePointSpacingMeters(session),
+            .samplingMultiplier = WaterSupportSamplingMultiplierForRole(session.sceneRole),
+        });
+    }
+    return layers;
+}
+
+std::string CombinedWaterSupportSignature(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& sourceSession,
+    const WaterPathGenerationSettings& settings) {
+    if (!IsSceneGroupedPointCloud(sourceSession)) {
+        return WaterSupportSignature(sourceSession);
+    }
+
+    std::ostringstream signature;
+    signature << "scene=" << sourceSession.sceneGroupName
+              << "|voxel=" << settings.supportVoxelSize
+              << "|samples=" << settings.supportSampleLimit;
+    for (const auto& session : runtimeState.sessions) {
+        if (!IsVisibleLoadedWaterSupportSession(session) ||
+            session.offlinePointCloud == nullptr ||
+            session.sceneGroupName != sourceSession.sceneGroupName ||
+            !IsSelectedSceneVariant(session)) {
+            continue;
+        }
+        signature << "|layer=" << session.sceneRole
+                  << "," << session.sourcePath.generic_string()
+                  << ",spacing=" << EffectivePointSpacingMeters(session)
+                  << ",multiplier=" << WaterSupportSamplingMultiplierForRole(session.sceneRole)
+                  << ",points=" << session.offlinePointCloud->positions.size();
+        if (session.bounds.valid) {
+            signature << ",min="
+                      << session.bounds.minimum.x << ","
+                      << session.bounds.minimum.y << ","
+                      << session.bounds.minimum.z
+                      << ",max="
+                      << session.bounds.maximum.x << ","
+                      << session.bounds.maximum.y << ","
+                      << session.bounds.maximum.z;
+        }
+    }
+    return signature.str();
+}
+
+const invisible_places::io::LoadedPointCloud* EnsureWaterSupportCloud(
+    PreviewRuntimeState* runtimeState,
+    const PreviewLayerSession& sourceSession,
+    const WaterPathGenerationSettings& settings) {
+    if (runtimeState == nullptr || sourceSession.offlinePointCloud == nullptr) {
+        return nullptr;
+    }
+    if (!IsSceneGroupedPointCloud(sourceSession)) {
+        return sourceSession.offlinePointCloud.get();
+    }
+
+    const auto layers = BuildWaterSceneSupportLayers(*runtimeState, sourceSession);
+    if (layers.empty()) {
+        return sourceSession.offlinePointCloud.get();
+    }
+    const auto signature = CombinedWaterSupportSignature(*runtimeState, sourceSession, settings);
+    if (runtimeState->water.combinedSupportCloud != nullptr &&
+        runtimeState->water.combinedSupportSignature == signature) {
+        return runtimeState->water.combinedSupportCloud.get();
+    }
+
+    auto combined = std::make_shared<invisible_places::io::LoadedPointCloud>(
+        invisible_places::water::BuildCombinedWaterSupportCloud(layers, settings));
+    if (combined->positions.empty()) {
+        return sourceSession.offlinePointCloud.get();
+    }
+    runtimeState->water.combinedSupportCloud = std::move(combined);
+    runtimeState->water.combinedSupportSignature = signature;
+    return runtimeState->water.combinedSupportCloud.get();
+}
+
 const TrailSurfaceIndex* EnsureTrailSurfaceIndexForSupport(
     PreviewRuntimeState* runtimeState,
     const PreviewLayerSession& sourceSession,
@@ -6923,7 +7475,12 @@ const TrailSurfaceIndex* EnsureTrailSurfaceIndexForSupport(
         return nullptr;
     }
 
-    const auto signature = WaterSupportSignature(sourceSession);
+    const auto supportSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path;
+    const auto* supportCloud = EnsureWaterSupportCloud(runtimeState, sourceSession, supportSettings);
+    if (supportCloud == nullptr) {
+        return nullptr;
+    }
+    const auto signature = CombinedWaterSupportSignature(*runtimeState, sourceSession, supportSettings);
     if (runtimeState->water.trailSurfaceIndex != nullptr &&
         runtimeState->water.trailSurfaceIndexSupportSignature == signature &&
         NormalizePathKey(runtimeState->water.trailSurfaceIndexSupportPath) ==
@@ -6936,7 +7493,7 @@ const TrailSurfaceIndex* EnsureTrailSurfaceIndexForSupport(
     }
 
     runtimeState->water.trailSurfaceIndex =
-        invisible_places::water::BuildTrailSurfaceIndex(sourceSession.offlinePointCloud.get());
+        invisible_places::water::BuildTrailSurfaceIndex(supportCloud);
     runtimeState->water.trailSurfaceIndexSupportSignature = signature;
     runtimeState->water.trailSurfaceIndexSupportPath = sourceSession.sourcePath;
     if (diagnostics != nullptr && runtimeState->water.trailSurfaceIndex != nullptr) {
@@ -6994,8 +7551,9 @@ bool WaterPathCacheMatchesSupportAndSettings(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& sourceSession,
     const WaterPathCache& cache) {
+    const auto defaultSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState.water);
     return NormalizePathKey(cache.supportLayerPath) == NormalizePathKey(sourceSession.sourcePath) &&
-           cache.supportSignature == WaterSupportSignature(sourceSession) &&
+           cache.supportSignature == CombinedWaterSupportSignature(runtimeState, sourceSession, defaultSettings.path) &&
            cache.emitterSettingsFingerprint == WaterEmitterSettingsFingerprint(runtimeState);
 }
 
@@ -7007,15 +7565,13 @@ bool SaveWaterPathCacheForSupport(
     }
     auto cache = runtimeState->water.pathCache;
     cache.supportLayerPath = sourceSession.sourcePath;
-    cache.supportSignature = WaterSupportSignature(sourceSession);
+    cache.supportSignature =
+        CombinedWaterSupportSignature(
+            *runtimeState,
+            sourceSession,
+            ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path);
     cache.emitterSettingsFingerprint = WaterEmitterSettingsFingerprint(*runtimeState);
     cache.stale = runtimeState->water.pathCacheStale;
-    const auto outputPath = BuildWaterPathCachePath(*runtimeState, sourceSession);
-    std::string errorMessage;
-    if (!invisible_places::serialization::SaveWaterPathCacheDocument(cache, outputPath, &errorMessage)) {
-        runtimeState->errorMessage = errorMessage;
-        return false;
-    }
     runtimeState->water.pathCache = std::move(cache);
     runtimeState->water.pathCacheLoaded = true;
     return true;
@@ -7065,14 +7621,7 @@ bool TryLoadWaterPathCacheForSupport(
         cache.stale = false;
         return ApplyWaterPathCacheForSupport(runtimeState, sourceSession, std::move(cache));
     }
-
-    const auto inputPath = BuildWaterPathCachePath(*runtimeState, sourceSession);
-    std::string errorMessage;
-    auto cache = invisible_places::serialization::LoadWaterPathCacheDocument(inputPath, &errorMessage);
-    if (!cache.has_value()) {
-        return false;
-    }
-    return ApplyWaterPathCacheForSupport(runtimeState, sourceSession, std::move(cache.value()));
+    return false;
 }
 
 std::optional<WaterPathCache> CurrentWaterPathCacheForDocument(const PreviewRuntimeState& runtimeState) {
@@ -7087,7 +7636,11 @@ std::optional<WaterPathCache> CurrentWaterPathCacheForDocument(const PreviewRunt
         const auto& sourceSession = runtimeState.sessions[supportIndex.value()];
         cache.supportLayerPath = sourceSession.sourcePath;
         if (!cache.stale) {
-            cache.supportSignature = WaterSupportSignature(sourceSession);
+            cache.supportSignature =
+                CombinedWaterSupportSignature(
+                    runtimeState,
+                    sourceSession,
+                    ActiveProfileDefaultWaterSourceSettings(runtimeState.water).path);
             cache.emitterSettingsFingerprint = WaterEmitterSettingsFingerprint(runtimeState);
         }
     }
@@ -7829,9 +8382,15 @@ bool BakeWaterOverlayForActiveLayer(
         runtimeState->statusMessage.clear();
         return false;
     }
+    const auto defaultSourceSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water);
+    const auto* supportCloud = EnsureWaterSupportCloud(runtimeState, sourceSession, defaultSourceSettings.path);
+    if (supportCloud == nullptr || supportCloud->positions.empty()) {
+        runtimeState->errorMessage = "No usable point-cloud support was available for water flow.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
 
     runtimeState->errorMessage.clear();
-    const auto defaultSourceSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water);
     if (TryLoadWaterPathCacheForSupport(runtimeState, sourceSession) &&
         !runtimeState->water.pathCacheStale) {
         runtimeState->water.pathEditUndoHiddenBranchIds.clear();
@@ -7858,11 +8417,12 @@ bool BakeWaterOverlayForActiveLayer(
     const auto pathEmitters = WaterEmittersWithResolvedPathProfiles(runtimeState->water);
     ++runtimeState->water.pathDiagnosticRebuildCounters.pathBakes;
     runtimeState->water.pathCache = invisible_places::water::GenerateWaterPathCache(
-        *sourceSession.offlinePointCloud,
+        *supportCloud,
         pathEmitters,
         defaultSourceSettings);
     runtimeState->water.pathCache.supportLayerPath = sourceSession.sourcePath;
-    runtimeState->water.pathCache.supportSignature = WaterSupportSignature(sourceSession);
+    runtimeState->water.pathCache.supportSignature =
+        CombinedWaterSupportSignature(*runtimeState, sourceSession, defaultSourceSettings.path);
     runtimeState->water.pathCache.emitterSettingsFingerprint = WaterEmitterSettingsFingerprint(*runtimeState);
     runtimeState->water.pathCache.stale = false;
     runtimeState->water.pathCacheLoaded = true;
@@ -9679,6 +10239,13 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
                                  ? invisible_places::serialization::SerializedLayerKind::GaussianSplat
                                  : invisible_places::serialization::SerializedLayerKind::PointCloud;
         layerDocument.sourcePath = session.sourcePath;
+        layerDocument.sceneGroupName = session.sceneGroupName;
+        layerDocument.sceneRole = session.sceneRole;
+        layerDocument.inferredPointSpacingMeters = session.inferredPointSpacingMeters;
+        layerDocument.pointSpacingMeters = EffectivePointSpacingMeters(session);
+        layerDocument.pointSpacingManualOverride = session.pointSpacingManualOverride;
+        layerDocument.scenePrimaryRole = session.scenePrimaryRole;
+        layerDocument.selectedSceneVariantPath = session.selectedSceneVariantPath;
         layerDocument.loaded = session.loaded;
         layerDocument.visible = session.visible;
         if (session.kind == LayerKind::PointCloud) {
@@ -10035,6 +10602,26 @@ bool ApplyProjectDocumentToRuntime(
         }
 
         if (session.kind == LayerKind::PointCloud) {
+            if (!layerIt->sceneGroupName.empty()) {
+                session.sceneGroupName = layerIt->sceneGroupName;
+            }
+            if (!layerIt->sceneRole.empty()) {
+                session.sceneRole = layerIt->sceneRole;
+            }
+            if (layerIt->inferredPointSpacingMeters > 0.0F) {
+                session.inferredPointSpacingMeters = layerIt->inferredPointSpacingMeters;
+            }
+            if (layerIt->pointSpacingMeters > 0.0F) {
+                session.pointSpacingMeters = layerIt->pointSpacingMeters;
+            }
+            session.pointSpacingManualOverride = layerIt->pointSpacingManualOverride;
+            session.scenePrimaryRole = layerIt->scenePrimaryRole;
+            if (!layerIt->selectedSceneVariantPath.empty()) {
+                session.selectedSceneVariantPath = layerIt->selectedSceneVariantPath;
+            }
+        }
+
+        if (session.kind == LayerKind::PointCloud) {
             session.pointVisuals.clear();
             for (const auto& visualDocument : layerIt->pointVisuals) {
                 session.pointVisuals.push_back({
@@ -10090,6 +10677,8 @@ bool ApplyProjectDocumentToRuntime(
             runtimeState->persistence.queuedLoadIndices.push_back(sessionIndex);
         }
     }
+
+    ConsolidateScenePointVisuals(runtimeState);
 
     runtimeState->selectedSessionIndex.reset();
     if (!document.selectedLayerPath.empty()) {
@@ -11945,6 +12534,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         auto style = IsGeneratedWaterOverlaySession(session)
                          ? MakeWaterTrailExportStyle(session.pointStyle)
                          : session.pointStyle;
+        style = MakeSceneRenderStyle(runtimeState, session, style);
         std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
         std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
         BuildOfflineRippleRuntimeForSession(
@@ -12285,6 +12875,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
         if (IsGeneratedWaterOverlaySession(session)) {
             exportStyle = MakeWaterTrailExportStyle(exportStyle);
         }
+        exportStyle = MakeSceneRenderStyle(runtimeState, session, exportStyle);
         const auto effectiveStyle =
             fastBasicRenderer
                 ? MakeEffectiveFastBasicStyle(
@@ -14245,7 +14836,7 @@ void DrawAnimationExportSection(
         } else {
             auto& session = runtimeState->sessions[visualIndex.value()];
             EnsurePointVisuals(&session);
-            ImGui::TextDisabled("Source: %s", session.displayName.c_str());
+            ImGui::TextDisabled("Source: %s", SceneVisualDisplayName(session).c_str());
             std::size_t exportableVisualCount = 0;
             for (const auto& visual : session.pointVisuals) {
                 if (!IsExportablePointVisualName(visual.name)) {
@@ -17389,6 +17980,103 @@ bool DrawPointCloudSurfaceMotionSection(PreviewLayerSession* session) {
     return changed;
 }
 
+bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Shoreline Waves")) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    changed |= ImGui::Checkbox("Enable Shoreline Waves", &style.shorelineWaveEnabled);
+
+    if (style.shorelineWaveEnabled) {
+        changed |= DrawRangedFloatControl(
+            "Boundary Height",
+            &style.shorelineBoundaryZ,
+            {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+        changed |= DrawRangedFloatControl(
+            "Height Reach",
+            &style.shorelineHeightReachMeters,
+            {.visualMin = 0.001F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.001F, .hardMax = 50.0F});
+        changed |= DrawRangedFloatControl(
+            "Edge Fade",
+            &style.shorelineEdgeFadeMeters,
+            {.visualMin = 0.0F, .visualMax = 0.50F, .format = "%.3f m", .hardMin = 0.0F, .hardMax = 10.0F});
+
+        constexpr float kPi = 3.14159265358979323846F;
+        float directionDegrees =
+            std::atan2(style.shorelineDirectionY, style.shorelineDirectionX) * 180.0F / kPi;
+        if (DrawRangedFloatControl(
+                "Wave Direction",
+                &directionDegrees,
+                {.visualMin = -180.0F, .visualMax = 180.0F, .format = "%.1f deg"})) {
+            const float radians = directionDegrees * kPi / 180.0F;
+            style.shorelineDirectionX = std::cos(radians);
+            style.shorelineDirectionY = std::sin(radians);
+            changed = true;
+        }
+
+        changed |= DrawRangedFloatControl(
+            "Wavelength",
+            &style.shorelineWavelengthMeters,
+            {.visualMin = 0.002F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.002F, .hardMax = 10.0F});
+        changed |= DrawRangedFloatControl(
+            "Pattern Scale",
+            &style.shorelinePatternScale,
+            {.visualMin = 0.01F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.01F, .hardMax = 50.0F});
+        changed |= DrawRangedFloatControl(
+            "Speed",
+            &style.shorelineSpeed,
+            {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 10.0F});
+        changed |= DrawRangedFloatControl(
+            "Warp",
+            &style.shorelineWarp,
+            {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+        changed |= DrawRangedFloatControl(
+            "Turbulence",
+            &style.shorelineTurbulence,
+            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+        changed |= DrawRangedFloatControl(
+            "Band Density",
+            &style.shorelineDensity,
+            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+
+        ImGui::Spacing();
+        changed |= DrawRangedFloatControl(
+            "Intensity",
+            &style.shorelineIntensity,
+            {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+        changed |= DrawRangedFloatControl(
+            "Emission Add",
+            &style.shorelineEmissionAdd,
+            {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+        changed |= DrawRangedFloatControl(
+            "Opacity Add",
+            &style.shorelineOpacityAdd,
+            {.visualMin = -1.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = -1.0F, .hardMax = 2.0F});
+        changed |= DrawRangedFloatControl(
+            "Opacity Multiply",
+            &style.shorelineOpacityMultiply,
+            {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+        changed |= DrawRangedFloatControl(
+            "Point Size Add",
+            &style.shorelinePointSizeAdd,
+            {.visualMin = -32.0F, .visualMax = 64.0F, .format = "%.1f", .hardMin = -256.0F, .hardMax = 512.0F});
+        changed |= DrawRangedFloatControl(
+            "Point Size Multiply",
+            &style.shorelinePointSizeMultiply,
+            {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+        changed |= DrawRangedFloatControl(
+            "Colour Mix",
+            &style.shorelineColourMix,
+            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+        changed |= ImGui::ColorEdit3("Wave Colour", style.shorelineColour.data());
+    }
+
+    EndPanelSection();
+    return changed;
+}
+
 bool DrawPointCloudFalloffSection(PreviewLayerSession* session) {
     if (session == nullptr || !BeginPanelSection("Point Falloff")) {
         return false;
@@ -17474,51 +18162,6 @@ bool DrawPointCloudEmissionSection(PreviewLayerSession* session) {
     return changed;
 }
 
-bool DrawPointCloudXraySection(PreviewLayerSession* session) {
-    if (session == nullptr) {
-        return false;
-    }
-
-    auto& style = session->pointStyle;
-    bool activeChanged = false;
-    if (!BeginPanelSection("X-Ray", true, &style.xrayStrength.active, &activeChanged)) {
-        return activeChanged;
-    }
-    bool changed = activeChanged;
-    changed |= DrawScalarBindingBody(
-        "X-Ray",
-        &style.xrayStrength,
-        session->scalarFields,
-        {.constantMin = 0.0F,
-         .constantMax = 1.0F,
-         .defaultOutputMin = 0.0F,
-         .defaultOutputMax = 1.0F,
-         .defaultConstant = 0.0F,
-         .format = "%.2f",
-         .hardMin = 0.0F,
-         .hardMax = 1.0F},
-        false);
-    changed |= DrawRangedFloatControl(
-        "Depth Falloff",
-        &style.depthFalloff,
-        {.visualMin = 0.0F, .visualMax = 400.0F, .format = "%.1f", .hardMin = 0.0F});
-    changed |= DrawRangedFloatControl(
-        "Depth Bias",
-        &style.depthBias,
-        {.visualMin = 0.0F, .visualMax = 0.01F, .format = "%.5f", .hardMin = 0.0F});
-    changed |= DrawRangedFloatControl(
-        "Front Alpha",
-        &style.frontAlpha,
-        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-    changed |= DrawRangedFloatControl(
-        "Hidden Alpha",
-        &style.hiddenAlpha,
-        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-
-    EndPanelSection();
-    return changed;
-}
-
 bool DrawPointCloudDepthFadeSection(PreviewLayerSession* session) {
     if (session == nullptr) {
         return false;
@@ -17539,60 +18182,6 @@ bool DrawPointCloudDepthFadeSection(PreviewLayerSession* session) {
          .hardMax = 1.0F});
 }
 
-const char* PointCloudDepthContributionLabel(PointCloudDepthContribution contribution) {
-    switch (contribution) {
-        case PointCloudDepthContribution::None:
-            return "None";
-        case PointCloudDepthContribution::AlphaThreshold:
-            return "Alpha Threshold";
-        case PointCloudDepthContribution::Always:
-            return "Always";
-    }
-
-    return "Alpha Threshold";
-}
-
-bool DrawPointCloudCompositingSection(PreviewLayerSession* session) {
-    if (session == nullptr || !BeginPanelSection("Compositing")) {
-        return false;
-    }
-
-    auto& style = session->pointStyle;
-    bool changed = false;
-    changed |= DrawRangedFloatControl(
-        "Density Scale",
-        &style.densityScale,
-        {.visualMin = 0.0F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.0F});
-    changed |= DrawRangedFloatControl(
-        "Density Clamp",
-        &style.densityClamp,
-        {.visualMin = 0.0F, .visualMax = 512.0F, .format = "%.1f", .hardMin = 0.0F});
-
-    int depthContributionIndex = static_cast<int>(style.depthContribution);
-    const char* depthContributionModes[] = {
-        PointCloudDepthContributionLabel(PointCloudDepthContribution::None),
-        PointCloudDepthContributionLabel(PointCloudDepthContribution::AlphaThreshold),
-        PointCloudDepthContributionLabel(PointCloudDepthContribution::Always),
-    };
-    if (DrawRightAlignedCombo(
-            "Depth Contribution",
-            &depthContributionIndex,
-            depthContributionModes,
-            IM_ARRAYSIZE(depthContributionModes))) {
-        style.depthContribution = static_cast<PointCloudDepthContribution>(depthContributionIndex);
-        changed = true;
-    }
-    if (style.depthContribution == PointCloudDepthContribution::AlphaThreshold) {
-        changed |= DrawRangedFloatControl(
-            "Depth Alpha Threshold",
-            &style.depthAlphaThreshold,
-            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-    }
-
-    EndPanelSection();
-    return changed;
-}
-
 bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
     if (session == nullptr) {
         return false;
@@ -17604,6 +18193,7 @@ bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
     changed |= DrawPointCloudPointSettingsSection(session);
     changed |= DrawPointCloudStylisationSection(session);
     changed |= DrawPointCloudSurfaceMotionSection(session);
+    changed |= DrawPointCloudShorelineWavesSection(session);
     changed |= DrawPointCloudFalloffSection(session);
     changed |= DrawPointCloudColourSection(session);
     changed |= DrawVisualBindingSection(
@@ -17620,9 +18210,7 @@ bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
          .hardMin = 0.0F,
          .hardMax = 1.0F});
     changed |= DrawPointCloudEmissionSection(session);
-    changed |= DrawPointCloudXraySection(session);
     changed |= DrawPointCloudDepthFadeSection(session);
-    changed |= DrawPointCloudCompositingSection(session);
 
     if (changed) {
         SanitizePointCloudStyle(session);
@@ -17686,10 +18274,17 @@ void DrawStyleSection(PreviewRuntimeState* runtimeState) {
         EndPanelSection();
         return;
     }
+    if (session->kind == LayerKind::PointCloud) {
+        if (const auto visualIndex = ResolveLoadedPointCloudLookdevIndex(*runtimeState);
+            visualIndex.has_value()) {
+            session = &runtimeState->sessions[visualIndex.value()];
+        }
+    }
 
     if (session->kind == LayerKind::PointCloud) {
         if (DrawPointCloudStyleSection(session)) {
             MarkPointVisualEdited(session);
+            SyncScenePointVisualsFromOwner(runtimeState, session);
             SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
         }
     } else {
@@ -18775,6 +19370,7 @@ void DrawProjectSection(
 
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
     if (ImGui::Button("Save Project")) {
+        ConsolidateScenePointVisuals(runtimeState);
         const auto document = BuildProjectDocument(*runtimeState);
         std::string errorMessage;
         if (invisible_places::serialization::SaveProjectDocument(
@@ -18856,6 +19452,7 @@ void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* s
             session->pointStyle = presetDocument->style;
             SanitizePointCloudStyle(session);
             MarkPointVisualEdited(session);
+            SyncScenePointVisualsFromOwner(runtimeState, session);
             SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
             runtimeState->statusMessage =
                 "Loaded point style preset from " + runtimeState->persistence.pointStylePresetPath + ".";
@@ -18877,20 +19474,36 @@ PreviewLayerSession* DrawLoadedPointCloudLookdevSelector(PreviewRuntimeState* ru
 
     const auto currentIndex = visualIndex.value();
     const std::string currentLabel =
-        runtimeState->sessions[currentIndex].displayName +
-        (runtimeState->sessions[currentIndex].visible ? "" : " [hidden]");
-    if (ImGui::BeginCombo("Lidar Cloud", currentLabel.c_str())) {
+        SceneVisualDisplayName(runtimeState->sessions[currentIndex]) +
+        (SceneVisualGroupVisible(*runtimeState, runtimeState->sessions[currentIndex]) ? "" : " [hidden]");
+    if (ImGui::BeginCombo("Cloud", currentLabel.c_str())) {
+        std::vector<std::string> listedSceneGroups;
         for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
             auto& session = runtimeState->sessions[index];
             if (!IsLoadedPointCloudSession(session) || IsGeneratedWaterOverlaySession(session)) {
                 continue;
             }
 
-            const bool selected = visualIndex.has_value() && visualIndex.value() == index;
-            const std::string label = session.displayName + (session.visible ? "" : " [hidden]");
+            std::size_t itemIndex = index;
+            if (IsSceneGroupedPointCloud(session)) {
+                if (std::find(
+                        listedSceneGroups.begin(),
+                        listedSceneGroups.end(),
+                        session.sceneGroupName) != listedSceneGroups.end()) {
+                    continue;
+                }
+                listedSceneGroups.push_back(session.sceneGroupName);
+                itemIndex = FindSceneVisualOwnerIndex(*runtimeState, session, true).value_or(index);
+            }
+
+            const auto& itemSession = runtimeState->sessions[itemIndex];
+            const bool selected = visualIndex.has_value() && visualIndex.value() == itemIndex;
+            const std::string label =
+                SceneVisualDisplayName(itemSession) +
+                (SceneVisualGroupVisible(*runtimeState, itemSession) ? "" : " [hidden]");
             if (ImGui::Selectable(label.c_str(), selected)) {
-                runtimeState->selectedSessionIndex = index;
-                visualIndex = index;
+                runtimeState->selectedSessionIndex = itemIndex;
+                visualIndex = itemIndex;
             }
             if (selected) {
                 ImGui::SetItemDefaultFocus();
@@ -18915,6 +19528,7 @@ void DrawSavedPointVisualSelector(PreviewRuntimeState* runtimeState, PreviewLaye
             const bool selected = visualName == selectedName;
             if (ImGui::Selectable(visualName.c_str(), selected)) {
                 SelectPointVisual(session, visualName);
+                SyncScenePointVisualsFromOwner(runtimeState, session);
                 SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
                 runtimeState->statusMessage = "Loaded visual " + visualName + ".";
                 runtimeState->errorMessage.clear();
@@ -18929,6 +19543,7 @@ void DrawSavedPointVisualSelector(PreviewRuntimeState* runtimeState, PreviewLaye
     InputTextString("Visual Name", &session->pointVisualNameBuffer);
     if (ImGui::Button("Save Visual")) {
         SaveCurrentPointVisual(runtimeState, session);
+        SyncScenePointVisualsFromOwner(runtimeState, session);
     }
     if (IsEditedPointVisualName(session->selectedPointVisualName)) {
         ImGui::SameLine();
@@ -18944,6 +19559,155 @@ void DrawSavedPointVisualSelector(PreviewRuntimeState* runtimeState, PreviewLaye
 void DrawLidarPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState != nullptr && BeginPanelSection("Lidar Scenes")) {
+        std::vector<std::string> groupNames;
+        for (const auto& session : runtimeState->sessions) {
+            if (!IsSceneGroupedPointCloud(session)) {
+                continue;
+            }
+            if (std::find(groupNames.begin(), groupNames.end(), session.sceneGroupName) == groupNames.end()) {
+                groupNames.push_back(session.sceneGroupName);
+            }
+        }
+
+        if (groupNames.empty()) {
+            ImGui::TextDisabled("No grouped LiDAR scenes were discovered.");
+        }
+
+        const std::array<std::string_view, 3> roleOrder{"ROCK", "SAND", "VEG"};
+        for (const auto& groupName : groupNames) {
+            ImGui::PushID(groupName.c_str());
+            if (ImGui::CollapsingHeader(groupName.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+                std::vector<std::size_t> selectedVariantIndices;
+                for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+                    const auto& session = runtimeState->sessions[index];
+                    if (IsSceneGroupedPointCloud(session) &&
+                        session.sceneGroupName == groupName &&
+                        IsSelectedSceneVariant(session)) {
+                        selectedVariantIndices.push_back(index);
+                    }
+                }
+                bool anyLoaded = std::any_of(
+                    selectedVariantIndices.begin(),
+                    selectedVariantIndices.end(),
+                    [&](std::size_t index) { return runtimeState->sessions[index].loaded; });
+                bool allVisible = !selectedVariantIndices.empty() &&
+                                  std::all_of(
+                                      selectedVariantIndices.begin(),
+                                      selectedVariantIndices.end(),
+                                      [&](std::size_t index) {
+                                          const auto& session = runtimeState->sessions[index];
+                                          return !session.loaded || session.visible;
+                                      });
+                if (ImGui::Checkbox("Visible", &allVisible)) {
+                    for (const auto index : selectedVariantIndices) {
+                        auto& session = runtimeState->sessions[index];
+                        if (session.loaded) {
+                            session.visible = allVisible;
+                        }
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(anyLoaded ? "Load Missing Roles" : "Load Scene")) {
+                    for (const auto index : selectedVariantIndices) {
+                        if (!runtimeState->sessions[index].loaded) {
+                            if (!runtimeState->pendingLoad.has_value()) {
+                                BeginLayerLoad(index, runtimeState);
+                            } else if (
+                                std::find(
+                                    runtimeState->persistence.queuedLoadIndices.begin(),
+                                    runtimeState->persistence.queuedLoadIndices.end(),
+                                    index) == runtimeState->persistence.queuedLoadIndices.end()) {
+                                runtimeState->persistence.queuedLoadIndices.push_back(index);
+                            }
+                        }
+                    }
+                }
+
+                for (const auto role : roleOrder) {
+                    std::vector<std::size_t> variants;
+                    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+                        const auto& session = runtimeState->sessions[index];
+                        if (IsSceneGroupedPointCloud(session) &&
+                            session.sceneGroupName == groupName &&
+                            session.sceneRole == role) {
+                            variants.push_back(index);
+                        }
+                    }
+                    if (variants.empty()) {
+                        continue;
+                    }
+
+                    std::size_t selectedVariant = variants.front();
+                    for (const auto index : variants) {
+                        if (IsSelectedSceneVariant(runtimeState->sessions[index])) {
+                            selectedVariant = index;
+                            break;
+                        }
+                    }
+                    ImGui::PushID(role.data());
+                    const auto roleLabel = std::string{role};
+                    if (ImGui::Selectable(
+                            roleLabel.c_str(),
+                            runtimeState->selectedSessionIndex.has_value() &&
+                                runtimeState->selectedSessionIndex.value() == selectedVariant)) {
+                        runtimeState->selectedSessionIndex = selectedVariant;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(
+                        "%s",
+                        runtimeState->sessions[selectedVariant].loaded
+                            ? (runtimeState->sessions[selectedVariant].visible ? "loaded" : "hidden")
+                            : FormatPointCount(runtimeState->sessions[selectedVariant].totalPrimitives).c_str());
+                    auto variantLabel = [&](std::size_t index) {
+                        const auto& session = runtimeState->sessions[index];
+                        std::string label = session.sourcePath.filename().string();
+                        const float spacing = EffectivePointSpacingMeters(session);
+                        if (spacing > 0.0F) {
+                            label += " (" + FormatFixed(spacing * 1000.0, 3) + " mm)";
+                        }
+                        return label;
+                    };
+                    ImGui::SetNextItemWidth(std::max(180.0F, ImGui::GetContentRegionAvail().x * 0.42F));
+                    const auto currentVariantLabel = variantLabel(selectedVariant);
+                    if (ImGui::BeginCombo("Variant", currentVariantLabel.c_str())) {
+                        for (const auto nextIndex : variants) {
+                            const bool selected = nextIndex == selectedVariant;
+                            const auto label = variantLabel(nextIndex);
+                            if (ImGui::Selectable(label.c_str(), selected)) {
+                                const auto nextPath = runtimeState->sessions[nextIndex].sourcePath;
+                                for (const auto index : variants) {
+                                    runtimeState->sessions[index].selectedSceneVariantPath = nextPath;
+                                    if (index != nextIndex && runtimeState->sessions[index].loaded) {
+                                        UnloadLayerByIndex(runtimeState, viewport, index);
+                                    }
+                                }
+                                runtimeState->selectedSessionIndex = nextIndex;
+                                selectedVariant = nextIndex;
+                            }
+                            if (selected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+
+                    auto& selectedSession = runtimeState->sessions[selectedVariant];
+                    float spacingMm = EffectivePointSpacingMeters(selectedSession) * 1000.0F;
+                    ImGui::SetNextItemWidth(120.0F);
+                    if (ImGui::DragFloat("Spacing mm", &spacingMm, 0.01F, 0.001F, 100.0F, "%.3f")) {
+                        selectedSession.pointSpacingMeters = std::max(0.000001F, spacingMm * 0.001F);
+                        selectedSession.pointSpacingManualOverride = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(selectedSession.scenePrimaryRole ? "primary" : "density-comp");
+                    ImGui::PopID();
+                }
+            }
+            ImGui::PopID();
+        }
+        EndPanelSection();
+    }
     DrawLayerSection(runtimeState, viewport, LayerKind::PointCloud, "Lidar Layers");
 }
 
@@ -19099,6 +19863,7 @@ void DrawVisualsPanel(
     DrawWaterEffectStackVisualsSection(runtimeState, viewport, session);
     if (DrawPointCloudStyleSection(session)) {
         MarkPointVisualEdited(session);
+        SyncScenePointVisualsFromOwner(runtimeState, session);
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
     }
     DrawPresetSection(runtimeState, session);
@@ -20676,17 +21441,9 @@ void DrawWaterPanel(
                 SuggestWaterEmittersForActiveLayer(runtimeState);
             }
 
-            if (ImGui::Button("Save Sources")) {
-                SaveWaterSources(runtimeState);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Load Sources")) {
-                LoadWaterSources(runtimeState, viewport);
-            }
             if (!water.lastOverlayPath.empty()) {
                 ImGui::TextDisabled("Last overlay: %s", water.lastOverlayPath.filename().string().c_str());
             }
-            ImGui::TextDisabled("Sources file: %s", WaterSourcesPath(*runtimeState).filename().string().c_str());
             ImGui::Separator();
 
             if (selectedEmitter != nullptr) {
@@ -21338,9 +22095,6 @@ void DrawDiagnosticsWindow(
                     diagnostics.pointFastBasicDrawCalls,
                     FormatPointCount(diagnostics.pointFastBasicDrawnPoints).c_str());
             }
-            ImGui::Text(
-                "Depth prepass skipped (no X-Ray): %u",
-                diagnostics.pointDepthPrepassSkippedNoXray);
             ImGui::Text("Style uploads: %u", diagnostics.pointStyleUploadCount);
             ImGui::Text("Inactive bindings skipped: %u", diagnostics.pointSkippedInactiveBindings);
             ImGui::Text("Command record: %.3f ms", diagnostics.pointCommandRecordMs);
@@ -21718,14 +22472,18 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             auto drawPointCount = std::min<std::uint64_t>(
                 EffectivePointDrawCount(runtimeState, session),
                 std::numeric_limits<std::uint32_t>::max());
+            auto renderStyle = MakeSceneRenderStyle(
+                runtimeState,
+                session,
+                session.pointStyle);
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,
                  .style = fastBasicRenderer
                               ? MakeEffectiveFastBasicStyle(
-                                    session.pointStyle,
+                                    renderStyle,
                                     session.hasSourceRgb,
                                     IsGeneratedWaterOverlaySession(session))
-                              : session.pointStyle,
+                              : renderStyle,
                  .scalarFields = session.scalarFields,
                  .hasSourceRgb = session.hasSourceRgb,
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount)});
@@ -22703,10 +23461,10 @@ int Application::Run(ApplicationRunOptions options) const {
                 ApplyProjectDocumentToRuntime(startupProject.value(), &runtimeState, &viewport.value())) {
                 loadedStartupProject = true;
                 runtimeState.statusMessage =
-                    "Loaded last project from " + startupProjectPath.string() + ".";
+                    "Loaded default project from " + startupProjectPath.string() + ".";
             } else {
                 runtimeState.errorMessage =
-                    "Could not load last project: " + projectErrorMessage + ". Loading the startup cloud instead.";
+                    "Could not load default project: " + projectErrorMessage + ". Loading the startup cloud instead.";
                 std::cerr << runtimeState.errorMessage << std::endl;
             }
         }
