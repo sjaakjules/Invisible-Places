@@ -18,6 +18,10 @@ struct DiscoveryIssue {
 struct PointCloudAsset {
     std::filesystem::path filePath;
     PlyHeader header;
+    std::string sceneGroupName;
+    std::string sceneRole;
+    float inferredPointSpacingMeters = 0.0F;
+    bool scenePrimaryRole = false;
 };
 
 struct GaussianSplatAsset {
@@ -38,5 +42,8 @@ struct AssetCatalog {
 
 AssetCatalog DiscoverAssets(const std::filesystem::path& dataRoot);
 
-}  // namespace invisible_places::io
+[[nodiscard]] std::string InferPointCloudSceneRoleFromName(std::string_view name);
+[[nodiscard]] float InferPointSpacingMetersFromName(std::string_view name);
+[[nodiscard]] bool IsPrimaryPointCloudSceneRole(std::string_view role);
 
+}  // namespace invisible_places::io

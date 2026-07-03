@@ -26,6 +26,13 @@ enum class SerializedLayerKind {
 struct ProjectLayerDocument {
     SerializedLayerKind kind = SerializedLayerKind::PointCloud;
     std::filesystem::path sourcePath;
+    std::string sceneGroupName;
+    std::string sceneRole;
+    float inferredPointSpacingMeters = 0.0F;
+    float pointSpacingMeters = 0.0F;
+    bool pointSpacingManualOverride = false;
+    bool scenePrimaryRole = false;
+    std::filesystem::path selectedSceneVariantPath;
     bool loaded = false;
     bool visible = false;
     std::uint64_t pointBudgetActivePoints = 0;
@@ -75,7 +82,7 @@ struct ProjectDocument {
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 25;
+    std::uint32_t schemaVersion = 26;
     std::string projectName;
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;

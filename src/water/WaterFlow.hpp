@@ -626,6 +626,13 @@ struct WaterEmitter {
     std::string trailProfileName = "Global";
 };
 
+struct WaterSceneSupportLayer {
+    const invisible_places::io::LoadedPointCloud* cloud = nullptr;
+    std::string role;
+    float pointSpacingMeters = 0.0F;
+    float samplingMultiplier = 1.0F;
+};
+
 struct WaterOverlayPoint {
     invisible_places::io::Float3 position{};
     invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
@@ -864,6 +871,10 @@ struct WaterPathCache {
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEmitter>& emitters,
     const WaterSourceSettings& defaultSettings);
+
+[[nodiscard]] invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
+    std::span<const WaterSceneSupportLayer> layers,
+    const WaterPathGenerationSettings& settings);
 
 [[nodiscard]] WaterPathAnalysisCache BuildWaterPathAnalysis(const WaterPathCache& cache);
 [[nodiscard]] bool WaterPathAnalysisCacheCompatible(const WaterPathCache& cache);

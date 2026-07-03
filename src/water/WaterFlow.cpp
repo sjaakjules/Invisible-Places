@@ -3079,6 +3079,102 @@ WaterPathCache GenerateWaterPathCache(
     return cache;
 }
 
+invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
+    std::span<const WaterSceneSupportLayer> layers,
+    const WaterPathGenerationSettings& settings) {
+    invisible_places::io::LoadedPointCloud combined;
+    combined.sourcePath = "combined-water-support";
+    combined.layerName = "Combined Water Support";
+
+    std::vector<const WaterSceneSupportLayer*> validLayers;
+    validLayers.reserve(layers.size());
+    double totalWeight = 0.0;
+    for (const auto& layer : layers) {
+        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+            continue;
+        }
+        const double multiplier = std::max(1.0, static_cast<double>(layer.samplingMultiplier));
+        const double weight = static_cast<double>(layer.cloud->positions.size()) / multiplier;
+        if (weight <= 0.0) {
+            continue;
+        }
+        validLayers.push_back(&layer);
+        totalWeight += weight;
+    }
+    if (validLayers.empty() || totalWeight <= 0.0) {
+        return combined;
+    }
+
+    const std::size_t sampleLimit = static_cast<std::size_t>(
+        std::max<std::uint32_t>(1U, settings.supportSampleLimit));
+    combined.positions.reserve(sampleLimit);
+    combined.normals.reserve(sampleLimit);
+    combined.packedColors.reserve(sampleLimit);
+
+    std::unordered_set<GridKey, GridKeyHash> occupiedVoxels;
+    occupiedVoxels.reserve(sampleLimit * 2U);
+    const float baseVoxelSize = std::max(0.001F, settings.supportVoxelSize);
+
+    for (const auto* layer : validLayers) {
+        const auto& cloud = *layer->cloud;
+        const double multiplier = std::max(1.0, static_cast<double>(layer->samplingMultiplier));
+        const double layerWeight = static_cast<double>(cloud.positions.size()) / multiplier;
+        const std::size_t layerTarget = std::max<std::size_t>(
+            1U,
+            static_cast<std::size_t>(
+                std::ceil((layerWeight / totalWeight) * static_cast<double>(sampleLimit))));
+        const std::size_t stride = std::max<std::size_t>(
+            1U,
+            cloud.positions.size() / std::max<std::size_t>(1U, layerTarget * 4U));
+        const float roleVoxelSize = std::max(
+            baseVoxelSize * static_cast<float>(multiplier),
+            std::max(0.0F, layer->pointSpacingMeters));
+        const float invVoxel = 1.0F / std::max(0.001F, roleVoxelSize);
+
+        std::size_t layerSamples = 0U;
+        for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); pointIndex += stride) {
+            if (combined.positions.size() >= sampleLimit || layerSamples >= layerTarget) {
+                break;
+            }
+            const auto& position = cloud.positions[pointIndex];
+            const GridKey key{
+                static_cast<int>(std::floor(position.x * invVoxel)),
+                static_cast<int>(std::floor(position.y * invVoxel)),
+                static_cast<int>(std::floor(position.z * invVoxel)),
+            };
+            if (!occupiedVoxels.insert(key).second) {
+                continue;
+            }
+
+            combined.positions.push_back(position);
+            combined.bounds.Expand(position);
+            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+                combined.normals.push_back(cloud.normals[pointIndex]);
+            } else {
+                combined.normals.push_back({0.0F, 0.0F, 1.0F});
+            }
+            if (cloud.hasSourceRgb && pointIndex < cloud.packedColors.size()) {
+                combined.packedColors.push_back(cloud.packedColors[pointIndex]);
+            } else {
+                combined.packedColors.push_back(0xFFFFFFFFU);
+            }
+            ++layerSamples;
+        }
+    }
+
+    combined.hasNormals = combined.normals.size() == combined.positions.size();
+    combined.hasSourceRgb = combined.packedColors.size() == combined.positions.size();
+    if (combined.bounds.valid) {
+        combined.focusPoint = {
+            0.5F * (combined.bounds.minimum.x + combined.bounds.maximum.x),
+            0.5F * (combined.bounds.minimum.y + combined.bounds.maximum.y),
+            0.5F * (combined.bounds.minimum.z + combined.bounds.maximum.z),
+        };
+        combined.hasFocusPoint = true;
+    }
+    return combined;
+}
+
 WaterPathCache GenerateWaterPathCache(
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEmitter>& emitters,

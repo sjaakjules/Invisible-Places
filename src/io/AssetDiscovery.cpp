@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <map>
 #include <sstream>
 #include <string_view>
@@ -19,6 +20,46 @@ std::string LowercaseCopy(std::string value) {
         return static_cast<char>(std::tolower(character));
     });
     return value;
+}
+
+bool TokenBoundary(char character) {
+    return character == '\0' ||
+           character == '-' ||
+           character == '_' ||
+           character == ' ' ||
+           character == '.';
+}
+
+bool ContainsRoleToken(std::string_view lowerName, std::string_view token) {
+    std::size_t cursor = 0;
+    while (cursor < lowerName.size()) {
+        const auto position = lowerName.find(token, cursor);
+        if (position == std::string_view::npos) {
+            return false;
+        }
+        const char before = position == 0U ? '\0' : lowerName[position - 1U];
+        const char after = position + token.size() >= lowerName.size()
+                               ? '\0'
+                               : lowerName[position + token.size()];
+        if (TokenBoundary(before) && TokenBoundary(after)) {
+            return true;
+        }
+        cursor = position + 1U;
+    }
+    return false;
+}
+
+std::string SceneRoleFromStem(const std::filesystem::path& filePath) {
+    return InferPointCloudSceneRoleFromName(filePath.stem().string());
+}
+
+float SceneSpacingFromStem(const std::filesystem::path& filePath) {
+    return InferPointSpacingMetersFromName(filePath.stem().string());
+}
+
+bool ParentIsDiscoveryRoot(const std::filesystem::path& dataRoot, const std::filesystem::path& filePath) {
+    std::error_code error;
+    return std::filesystem::equivalent(filePath.parent_path(), dataRoot, error) && !error;
 }
 
 std::vector<std::filesystem::path> SortedDataFiles(const std::filesystem::path& root) {
@@ -43,6 +84,57 @@ std::vector<std::filesystem::path> SortedDataFiles(const std::filesystem::path& 
 
 }  // namespace
 
+std::string InferPointCloudSceneRoleFromName(std::string_view name) {
+    std::string lowerName{name};
+    lowerName = LowercaseCopy(std::move(lowerName));
+    const std::string_view lowerView{lowerName};
+    if (ContainsRoleToken(lowerView, "rock")) {
+        return "ROCK";
+    }
+    if (ContainsRoleToken(lowerView, "sand")) {
+        return "SAND";
+    }
+    if (ContainsRoleToken(lowerView, "veg") || ContainsRoleToken(lowerView, "vegetation")) {
+        return "VEG";
+    }
+    return {};
+}
+
+float InferPointSpacingMetersFromName(std::string_view name) {
+    std::string lowerName{name};
+    lowerName = LowercaseCopy(std::move(lowerName));
+    const char* data = lowerName.data();
+    const char* const end = data + lowerName.size();
+    for (const char* cursor = data; cursor < end; ++cursor) {
+        if (!std::isdigit(static_cast<unsigned char>(*cursor)) && *cursor != '.') {
+            continue;
+        }
+        const char* numberStart = cursor;
+        bool seenDecimal = false;
+        while (cursor < end &&
+               (std::isdigit(static_cast<unsigned char>(*cursor)) ||
+                (!seenDecimal && *cursor == '.'))) {
+            seenDecimal = seenDecimal || *cursor == '.';
+            ++cursor;
+        }
+        if (cursor + 1 < end && cursor[0] == 'm' && cursor[1] == 'm') {
+            float millimetres = 0.0F;
+            const auto result = std::from_chars(numberStart, cursor, millimetres);
+            if (result.ec == std::errc{} && millimetres > 0.0F) {
+                return millimetres * 0.001F;
+            }
+        }
+        if (cursor == numberStart) {
+            ++cursor;
+        }
+    }
+    return 0.0F;
+}
+
+bool IsPrimaryPointCloudSceneRole(std::string_view role) {
+    return role == "ROCK" || role == "rock" || role == "Rock";
+}
+
 std::string AssetCatalog::Summary() const {
     std::ostringstream output;
     output << "Asset discovery summary\n";
@@ -55,6 +147,15 @@ std::string AssetCatalog::Summary() const {
         for (const auto& asset : pointClouds) {
             output << "  * " << asset.filePath.filename().string() << " (" << asset.header.vertexCount
                    << " vertices";
+            if (!asset.sceneGroupName.empty()) {
+                output << ", scene: " << asset.sceneGroupName;
+                if (!asset.sceneRole.empty()) {
+                    output << "/" << asset.sceneRole;
+                }
+                if (asset.inferredPointSpacingMeters > 0.0F) {
+                    output << ", spacing: " << (asset.inferredPointSpacingMeters * 1000.0F) << " mm";
+                }
+            }
 
             const auto scalarFields = asset.header.ScalarFieldNames();
             if (!scalarFields.empty()) {
@@ -148,7 +249,14 @@ AssetCatalog DiscoverAssets(const std::filesystem::path& dataRoot) {
         }
 
         if (headerResult.header.LooksLikePointCloud()) {
-            catalog.pointClouds.push_back({.filePath = filePath, .header = headerResult.header});
+            PointCloudAsset asset{.filePath = filePath, .header = headerResult.header};
+            asset.sceneRole = SceneRoleFromStem(filePath);
+            asset.inferredPointSpacingMeters = SceneSpacingFromStem(filePath);
+            asset.scenePrimaryRole = IsPrimaryPointCloudSceneRole(asset.sceneRole);
+            if (!asset.sceneRole.empty() && !ParentIsDiscoveryRoot(dataRoot, filePath)) {
+                asset.sceneGroupName = filePath.parent_path().filename().string();
+            }
+            catalog.pointClouds.push_back(std::move(asset));
             continue;
         }
 

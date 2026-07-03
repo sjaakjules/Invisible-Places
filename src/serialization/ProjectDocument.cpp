@@ -27,7 +27,6 @@ using invisible_places::camera::CameraState;
 using invisible_places::output::RenderJobSettings;
 using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
-using invisible_places::renderer::pointcloud::PointCloudDepthContribution;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using invisible_places::renderer::pointcloud::PointCloudNprPreset;
@@ -107,9 +106,6 @@ enum class LegacyPointCloudRenderMode {
     Solid,
     EmissiveHard,
     EmissiveFeathered,
-    DepthXray,
-    WeightedTransparent,
-    ComputeDensity,
     GaussianPointSprite
 };
 
@@ -412,43 +408,10 @@ LegacyPointCloudRenderMode ParseLegacyPointCloudRenderMode(const json& value) {
     if (modeName == "emissive_feathered") {
         return LegacyPointCloudRenderMode::EmissiveFeathered;
     }
-    if (modeName == "depth_xray") {
-        return LegacyPointCloudRenderMode::DepthXray;
-    }
-    if (modeName == "weighted_transparent") {
-        return LegacyPointCloudRenderMode::WeightedTransparent;
-    }
-    if (modeName == "compute_density") {
-        return LegacyPointCloudRenderMode::ComputeDensity;
-    }
     if (modeName == "gaussian_point_sprite") {
         return LegacyPointCloudRenderMode::GaussianPointSprite;
     }
     return LegacyPointCloudRenderMode::Solid;
-}
-
-const char* PointCloudDepthContributionName(PointCloudDepthContribution contribution) {
-    switch (contribution) {
-        case PointCloudDepthContribution::None:
-            return "none";
-        case PointCloudDepthContribution::AlphaThreshold:
-            return "alpha_threshold";
-        case PointCloudDepthContribution::Always:
-            return "always";
-    }
-
-    return "alpha_threshold";
-}
-
-PointCloudDepthContribution ParsePointCloudDepthContribution(const json& value) {
-    const auto contributionName = value.get<std::string>();
-    if (contributionName == "none") {
-        return PointCloudDepthContribution::None;
-    }
-    if (contributionName == "always") {
-        return PointCloudDepthContribution::Always;
-    }
-    return PointCloudDepthContribution::AlphaThreshold;
 }
 
 const char* PointCloudFalloffProfileName(PointCloudFalloffProfile profile) {
@@ -591,7 +554,6 @@ void MigrateLegacyPointCloudRenderMode(
 
     switch (mode) {
         case LegacyPointCloudRenderMode::Solid:
-            style->depthContribution = PointCloudDepthContribution::AlphaThreshold;
             break;
         case LegacyPointCloudRenderMode::EmissiveHard:
             style->falloffProfile = PointCloudFalloffProfile::HardDisc;
@@ -605,16 +567,6 @@ void MigrateLegacyPointCloudRenderMode(
                 invisible_places::style::SetScalarConstant(&style->emissiveStrength, 1.0F);
             }
             break;
-        case LegacyPointCloudRenderMode::DepthXray:
-            style->depthContribution = PointCloudDepthContribution::Always;
-            style->xrayStrength.active = true;
-            if (invisible_places::style::ScalarConstant(style->xrayStrength) <= 0.0F) {
-                invisible_places::style::SetScalarConstant(&style->xrayStrength, 1.0F);
-            }
-            break;
-        case LegacyPointCloudRenderMode::WeightedTransparent:
-        case LegacyPointCloudRenderMode::ComputeDensity:
-            break;
         case LegacyPointCloudRenderMode::GaussianPointSprite:
             style->falloffProfile = PointCloudFalloffProfile::Gaussian;
             break;
@@ -627,7 +579,6 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
     return json{
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
         {"screen_sprite_size_mode", PointCloudScreenSpriteSizeModeName(style.screenSpriteSizeMode)},
-        {"depth_contribution", PointCloudDepthContributionName(style.depthContribution)},
         {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
         {"stylisation_mode", PointCloudStylisationModeName(style.stylisationMode)},
         {"npr_preset", PointCloudNprPresetName(style.nprPreset)},
@@ -673,18 +624,32 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"caustic_mask_field_slot", style.causticMaskFieldSlot},
         {"caustic_edge_field_slot", style.causticEdgeFieldSlot},
         {"caustic_seed_field_slot", style.causticSeedFieldSlot},
+        {"shoreline_wave_enabled", style.shorelineWaveEnabled},
+        {"shoreline_boundary_z", style.shorelineBoundaryZ},
+        {"shoreline_height_reach_meters", style.shorelineHeightReachMeters},
+        {"shoreline_edge_fade_meters", style.shorelineEdgeFadeMeters},
+        {"shoreline_direction", std::array<float, 2>{style.shorelineDirectionX, style.shorelineDirectionY}},
+        {"shoreline_pattern_scale", style.shorelinePatternScale},
+        {"shoreline_wavelength_meters", style.shorelineWavelengthMeters},
+        {"shoreline_speed", style.shorelineSpeed},
+        {"shoreline_warp", style.shorelineWarp},
+        {"shoreline_turbulence", style.shorelineTurbulence},
+        {"shoreline_density", style.shorelineDensity},
+        {"shoreline_phase", style.shorelinePhase},
+        {"shoreline_intensity", style.shorelineIntensity},
+        {"shoreline_emission_add", style.shorelineEmissionAdd},
+        {"shoreline_opacity_add", style.shorelineOpacityAdd},
+        {"shoreline_opacity_multiply", style.shorelineOpacityMultiply},
+        {"shoreline_point_size_add", style.shorelinePointSizeAdd},
+        {"shoreline_point_size_multiply", style.shorelinePointSizeMultiply},
+        {"shoreline_colour_mix", style.shorelineColourMix},
+        {"shoreline_colour", style.shorelineColour},
+        {"shoreline_seed", style.shorelineSeed},
         {"exposure", style.exposure},
         {"inner_radius", style.innerRadius},
         {"gaussian_sharpness", style.gaussianSharpness},
         {"feather_power", style.featherPower},
-        {"depth_falloff", style.depthFalloff},
-        {"depth_bias", style.depthBias},
-        {"front_alpha", style.frontAlpha},
-        {"hidden_alpha", style.hiddenAlpha},
-        {"density_scale", style.densityScale},
-        {"density_clamp", style.densityClamp},
         {"water_streak_aspect", style.waterStreakAspect},
-        {"depth_alpha_threshold", style.depthAlphaThreshold},
         {"solid_centers", style.solidCenters},
         {"flow_animation", style.flowAnimation},
         {"water_path_view", style.waterPathView},
@@ -693,7 +658,6 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"surfel_diameter", SerializeBinding(style.surfelDiameter)},
         {"opacity", SerializeBinding(style.opacity)},
         {"emissive_strength", SerializeBinding(style.emissiveStrength)},
-        {"xray_strength", SerializeBinding(style.xrayStrength)},
         {"depth_fade", SerializeBinding(style.depthFade)},
         {"colormap_position", SerializeBinding(style.colormapPosition)},
     };
@@ -729,9 +693,6 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     }
     if (styleJson.contains("render_mode")) {
         legacyRenderMode = ParseLegacyPointCloudRenderMode(styleJson.at("render_mode"));
-    }
-    if (styleJson.contains("depth_contribution")) {
-        style.depthContribution = ParsePointCloudDepthContribution(styleJson.at("depth_contribution"));
     }
     if (styleJson.contains("falloff_profile")) {
         style.falloffProfile = ParsePointCloudFalloffProfile(styleJson.at("falloff_profile"));
@@ -865,18 +826,57 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.causticMaskFieldSlot = styleJson.value("caustic_mask_field_slot", style.causticMaskFieldSlot);
     style.causticEdgeFieldSlot = styleJson.value("caustic_edge_field_slot", style.causticEdgeFieldSlot);
     style.causticSeedFieldSlot = styleJson.value("caustic_seed_field_slot", style.causticSeedFieldSlot);
+    style.shorelineWaveEnabled = styleJson.value("shoreline_wave_enabled", style.shorelineWaveEnabled);
+    style.shorelineBoundaryZ =
+        std::clamp(styleJson.value("shoreline_boundary_z", style.shorelineBoundaryZ), -1000.0F, 1000.0F);
+    style.shorelineHeightReachMeters = std::clamp(
+        styleJson.value("shoreline_height_reach_meters", style.shorelineHeightReachMeters),
+        0.001F,
+        50.0F);
+    style.shorelineEdgeFadeMeters = std::clamp(
+        styleJson.value("shoreline_edge_fade_meters", style.shorelineEdgeFadeMeters),
+        0.0F,
+        10.0F);
+    if (styleJson.contains("shoreline_direction")) {
+        const auto direction = styleJson.at("shoreline_direction").get<std::array<float, 2>>();
+        style.shorelineDirectionX = direction[0];
+        style.shorelineDirectionY = direction[1];
+    }
+    style.shorelinePatternScale =
+        std::clamp(styleJson.value("shoreline_pattern_scale", style.shorelinePatternScale), 0.01F, 50.0F);
+    style.shorelineWavelengthMeters =
+        std::clamp(styleJson.value("shoreline_wavelength_meters", style.shorelineWavelengthMeters), 0.002F, 10.0F);
+    style.shorelineSpeed = std::clamp(styleJson.value("shoreline_speed", style.shorelineSpeed), 0.0F, 10.0F);
+    style.shorelineWarp = std::clamp(styleJson.value("shoreline_warp", style.shorelineWarp), 0.0F, 3.0F);
+    style.shorelineTurbulence =
+        std::clamp(styleJson.value("shoreline_turbulence", style.shorelineTurbulence), 0.0F, 1.0F);
+    style.shorelineDensity = std::clamp(styleJson.value("shoreline_density", style.shorelineDensity), 0.0F, 1.0F);
+    style.shorelinePhase = styleJson.value("shoreline_phase", style.shorelinePhase);
+    style.shorelineIntensity =
+        std::clamp(styleJson.value("shoreline_intensity", style.shorelineIntensity), 0.0F, 5.0F);
+    style.shorelineEmissionAdd =
+        std::clamp(styleJson.value("shoreline_emission_add", style.shorelineEmissionAdd), 0.0F, 8.0F);
+    style.shorelineOpacityAdd =
+        std::clamp(styleJson.value("shoreline_opacity_add", style.shorelineOpacityAdd), -1.0F, 2.0F);
+    style.shorelineOpacityMultiply =
+        std::clamp(styleJson.value("shoreline_opacity_multiply", style.shorelineOpacityMultiply), 0.0F, 8.0F);
+    style.shorelinePointSizeAdd =
+        std::clamp(styleJson.value("shoreline_point_size_add", style.shorelinePointSizeAdd), -256.0F, 512.0F);
+    style.shorelinePointSizeMultiply = std::clamp(
+        styleJson.value("shoreline_point_size_multiply", style.shorelinePointSizeMultiply),
+        0.0F,
+        8.0F);
+    style.shorelineColourMix =
+        std::clamp(styleJson.value("shoreline_colour_mix", style.shorelineColourMix), 0.0F, 1.0F);
+    if (styleJson.contains("shoreline_colour")) {
+        style.shorelineColour = styleJson.at("shoreline_colour").get<std::array<float, 3>>();
+    }
+    style.shorelineSeed = styleJson.value("shoreline_seed", style.shorelineSeed);
     style.exposure = styleJson.value("exposure", style.exposure);
     style.innerRadius = styleJson.value("inner_radius", style.innerRadius);
     style.gaussianSharpness = styleJson.value("gaussian_sharpness", style.gaussianSharpness);
     style.featherPower = styleJson.value("feather_power", style.featherPower);
-    style.depthFalloff = styleJson.value("depth_falloff", style.depthFalloff);
-    style.depthBias = styleJson.value("depth_bias", style.depthBias);
-    style.frontAlpha = styleJson.value("front_alpha", style.frontAlpha);
-    style.hiddenAlpha = styleJson.value("hidden_alpha", style.hiddenAlpha);
-    style.densityScale = styleJson.value("density_scale", style.densityScale);
-    style.densityClamp = styleJson.value("density_clamp", style.densityClamp);
     style.waterStreakAspect = std::clamp(styleJson.value("water_streak_aspect", style.waterStreakAspect), 1.0F, 32.0F);
-    style.depthAlphaThreshold = styleJson.value("depth_alpha_threshold", style.depthAlphaThreshold);
     style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
     style.flowAnimation = styleJson.value("flow_animation", style.flowAnimation);
     style.waterPathView = styleJson.value("water_path_view", style.waterPathView);
@@ -896,9 +896,6 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     }
     if (styleJson.contains("emissive_strength")) {
         style.emissiveStrength = ParseBinding(styleJson.at("emissive_strength"));
-    }
-    if (styleJson.contains("xray_strength")) {
-        style.xrayStrength = ParseBinding(styleJson.at("xray_strength"));
     }
     if (styleJson.contains("depth_fade")) {
         style.depthFade = ParseBinding(styleJson.at("depth_fade"));
@@ -923,6 +920,27 @@ json SerializeProjectLayer(const ProjectLayerDocument& layer) {
         {"visible", layer.visible},
         {"point_budget_active_points", layer.pointBudgetActivePoints},
     };
+    if (!layer.sceneGroupName.empty()) {
+        layerJson["scene_group"] = layer.sceneGroupName;
+    }
+    if (!layer.sceneRole.empty()) {
+        layerJson["scene_role"] = layer.sceneRole;
+    }
+    if (layer.inferredPointSpacingMeters > 0.0F) {
+        layerJson["inferred_point_spacing_meters"] = layer.inferredPointSpacingMeters;
+    }
+    if (layer.pointSpacingMeters > 0.0F) {
+        layerJson["point_spacing_meters"] = layer.pointSpacingMeters;
+    }
+    if (layer.pointSpacingManualOverride) {
+        layerJson["point_spacing_manual_override"] = layer.pointSpacingManualOverride;
+    }
+    if (layer.scenePrimaryRole) {
+        layerJson["scene_primary_role"] = layer.scenePrimaryRole;
+    }
+    if (!layer.selectedSceneVariantPath.empty()) {
+        layerJson["selected_scene_variant_path"] = layer.selectedSceneVariantPath.generic_string();
+    }
     if (layer.pointStyle.has_value()) {
         layerJson["point_style"] = SerializePointCloudStyle(layer.pointStyle.value());
     }
@@ -942,6 +960,13 @@ ProjectLayerDocument ParseProjectLayer(const json& layerJson) {
     ProjectLayerDocument layer;
     layer.kind = ParseSerializedLayerKind(layerJson.at("kind"));
     layer.sourcePath = layerJson.value("source_path", std::string{});
+    layer.sceneGroupName = layerJson.value("scene_group", std::string{});
+    layer.sceneRole = layerJson.value("scene_role", std::string{});
+    layer.inferredPointSpacingMeters = layerJson.value("inferred_point_spacing_meters", 0.0F);
+    layer.pointSpacingMeters = layerJson.value("point_spacing_meters", 0.0F);
+    layer.pointSpacingManualOverride = layerJson.value("point_spacing_manual_override", false);
+    layer.scenePrimaryRole = layerJson.value("scene_primary_role", false);
+    layer.selectedSceneVariantPath = layerJson.value("selected_scene_variant_path", std::string{});
     layer.loaded = layerJson.value("loaded", false);
     layer.visible = layerJson.value("visible", false);
     layer.pointBudgetActivePoints = layerJson.value("point_budget_active_points", 0ULL);
@@ -2533,7 +2558,6 @@ void ConfigureLegacyWaterFieldBinding(
 PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& visualSettings) {
     PointCloudStyleState style;
     style.geometryMode = PointCloudGeometryMode::ScreenSprites;
-    style.depthContribution = PointCloudDepthContribution::None;
     style.falloffProfile = PointCloudFalloffProfile::Gaussian;
     style.colorMode = PointCloudColorMode::SourceRgb;
     style.solidColor = {0.04F, 0.74F, 1.0F, 1.0F};
@@ -2541,8 +2565,6 @@ PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& 
     style.colorizeAmount = 0.0F;
     style.exposure = 1.8F;
     style.gaussianSharpness = 1.65F;
-    style.densityScale = 1.0F;
-    style.densityClamp = 8.0F;
     style.solidCenters = true;
     style.flowAnimation = true;
     style.waterPathView = false;
@@ -2561,7 +2583,6 @@ PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& 
         "accumulation",
         0.0F,
         std::clamp(visualSettings.glow, 0.0F, 4.0F));
-    invisible_places::style::SetScalarConstant(&style.xrayStrength, 0.0F);
     invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
     invisible_places::style::SetScalarConstant(&style.colormapPosition, 0.5F);
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.012F);
