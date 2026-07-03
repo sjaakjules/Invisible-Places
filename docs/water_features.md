@@ -17,11 +17,14 @@ Basin and Runoff are removed from the public v2 workflow. Legacy code and tests 
 Implemented in the current repository:
 
 - Active Water tabs for Ripples, Flow, and Field.
-- Project schema `24` with v2 Ripple/Flow/Field settings and legacy Caustics-to-Ripples migration.
+- Project schema `26` with grouped scene metadata, v2 Ripple/Flow/Field settings, saved Flow caches, and legacy Caustics-to-Ripples migration.
 - Ripple `WaterEffectLayer` records and distinct shader/offline procedural patterns for all `WaterRippleOverlayType` values.
 - Sparse Ripple membership uploads for selected region points, with pattern/response edits updating compact GPU params when region membership has not changed. This supports millisecond-scale live modifications instead of CPU-regenerating dense fields.
 - Shared region selection for Ripple and Field support, including selected base point indices, edge weights, normals, source scalar values, field vectors, and manual Field control flags.
 - Flow path cache reuse, branch hiding, and generated stream surfels with the v2 stream scalar contract.
+- Project-owned Flow emitters and point sources. Sources are no longer loaded from a separate global save into every project.
+- Saved Flow path cache data can reload baked paths and anchors when support/settings signatures still match.
+- Combined ROCK/SAND/VEG support sampling for grouped scenes. ROCK is the high-detail support reference; SAND and VEG use lighter role multipliers and no full merged GPU point buffer is created.
 - Field cache, Field Streamlines, and Field Surface Motion built from Flow path anchors or user-authored Field regions, with region Field caches saved and reused offline.
 - Field no-flow, bridge-allowed, and bridge-blocked control regions with visible diagnostics.
 - Shared animated trail visualization for Flow and Field streams; Flow moves along baked path anchors, while Field moves along cached vector-field paths seeded from perturbed source points.
@@ -50,6 +53,8 @@ Implemented in the current repository:
 
 Generated water overlay sessions are excluded from support-layer discovery and from base-cloud look-dev/export visual selection. They are renderable water output, not source LiDAR layers for future water bakes. Ripples no longer create active visible `-Ripples.generated` sessions; their region membership and procedural params are uploaded to the base-cloud renderer instead. Field Surface Motion contributes to active/base cloud composition through `water_effect_*` fields, while Flow trails and Field Streamlines remain generated overlay sessions.
 
+For grouped LiDAR scenes, support discovery can use all selected roles under one folder-level scene. The renderer still uploads and draws each role as its own point-cloud layer; water support builders sample those roles into CPU-side support views only when path, trail, or snapping workflows need them.
+
 ## Active UI Contract
 
 The active Water panel tabs are:
@@ -74,9 +79,15 @@ Flow exposes path baking, branch hiding, source profile assignments, Lanes contr
 
 ## Serialization Contract
 
-Project documents now use schema `25`. New saves write the v2 water keys:
+Project documents now use schema `26`. New saves write the grouped scene and v2 water keys:
 
 ```text
+scene_group
+scene_role
+inferred_point_spacing_meters
+point_spacing_meters
+point_spacing_manual_override
+selected_scene_variant_path
 water_emitters
 water_source_settings
 water_path_cache
@@ -108,10 +119,13 @@ Legacy loading rules:
 - `water_basin_regions` and `water_runoff_regions` are ignored.
 - Compatibility caustic look settings may still be parsed/written for old visual data, but caustic region geometry is no longer the active public save contract.
 - Existing `water_path_cache` records are preserved when their support/settings fingerprint matches.
+- Water emitters and point sources are stored inside the project document. Loading another project should not import sources from a previous project unless that project explicitly contains them.
 
 ## Ripples
 
 Ripples use `WaterEffectLayer` records plus sparse region memberships to evaluate procedural effects directly on the active/base cloud. The active workflow does not create visible `-Ripples.generated` point-cloud sessions and does not upload dense `water_effect_*` or `ripple_*` scalar fields for ordinary Ripple recalculation.
+
+Grouped-scene shoreline waves are a separate point-cloud style path, not a Ripple region. They are evaluated in the point-cloud shader for the SAND role from `boundaryZ - worldPosition.z`, default to `z = 1.55 m`, and can be toggled in Cloud Visuals > Shoreline Waves without recalculating region membership.
 
 The first region recalculation selects base-cloud points and uploads compact membership and parameter buffers. When only procedural settings or contribution controls change, the viewport can update the parameter buffer without rebuilding membership. This keeps editing responsive at millisecond-scale latency: pattern, colour, opacity, size, emission, speed, phase, and blend changes can be previewed live because the expensive region scan and most CPU-side upload work are skipped when the region has not changed. Offline rendering reconstructs the same sparse memberships/params for export.
 
@@ -235,6 +249,8 @@ Generated Flow and Field stream layers participate in viewport rendering and the
 
 Base cloud visuals are evaluated first. Ripple contributions then combine through sparse runtime evaluation, while Field Surface Motion contributions combine through Visuals-compatible `water_effect_*` fields. Generated Flow and Field Streamline overlays keep their own stream scalar fields.
 
+Grouped scene visuals are folder-level. ROCK is the primary visual owner by default, with SAND and VEG receiving mirrored settings adjusted by point-spacing density compensation. Role-specific gates still apply after mirroring: SAND can show shader shoreline waves, VEG can show roughness surface motion, and ROCK remains the primary stationary reference.
+
 Layer-linked saved visuals should keep field availability honest:
 
 - Base-cloud visuals can use base scalar fields.
@@ -278,7 +294,10 @@ Cache metadata should include source layer signature, point count, bounds, norma
 
 Use these checks after water feature changes:
 
+- Sample scene: when `Data/SampleScene` exists, discovery validates the local ROCK/SAND/VEG sample files, inferred spacing, scalar fields, and grouping.
 - Serialization: new saves include Ripple/Flow/Field keys and omit Basin/Runoff/Caustic region keys.
+- Project ownership: water emitters/sources load from the active project only; new projects are allowed to have none.
+- Cache reload: saved Flow path caches and baked anchors reload only when support/settings signatures match.
 - Legacy load: old Caustic regions become Ripple `Caustic Lace`; old Basin/Runoff records are ignored.
 - Flow: path-affecting settings dirty `WaterPathCache`; Lane and Trail refreshes preserve Trail profile/style state.
 - Stream schema: generated stream scalar fields match the exact order above.

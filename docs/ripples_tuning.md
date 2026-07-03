@@ -6,6 +6,8 @@ This document defines the required end states for the Ripple overlay patterns th
 
 CPU-side pattern code exists to mirror shader behavior for offline renders, tests, and contact-sheet generation. The live visual source of truth is `shaders/pointcloud_sparse_ripple.glsl`; matching logic in `src/water/WaterFlow.cpp` is a parity path, not the interactive path.
 
+There is also a separate grouped-scene shoreline wave mode for ExhibitionScene-style LiDAR folders. That mode is a point-cloud visual setting, not a Ripple region: it applies only to the SAND role, derives its mask from `boundaryZ - worldPosition.z`, and does not build per-point CPU membership. Keep the region-based `Shoreline` Ripple pattern available for local polygon effects.
+
 ## Performance Contract
 
 The latency thresholds below apply to editing pattern, response, blend, colour, opacity, size, emission, speed, phase, density, direction, warp, and turbulence after region membership already exists.
@@ -217,4 +219,3 @@ Expected artifacts:
 - `build/macos-debug/water-region-smoke/water-ripple-patterns-test-points.json`
 - `build/macos-debug/water-region-smoke/ripple-pattern-contact-sheet.ppm`
 - `build/macos-debug/water-region-smoke/ripple-pattern-contact-sheet.exr`
-

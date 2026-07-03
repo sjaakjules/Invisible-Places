@@ -680,12 +680,71 @@ TEST_CASE("Data discovery finds both point clouds and gaussian splats", "[discov
     CHECK(catalog.issues.empty());
 }
 
+TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discovery][scene][sample]") {
+    const auto sampleRoot = DataRoot() / "SampleScene";
+    if (!std::filesystem::exists(sampleRoot)) {
+        SKIP("SampleScene fixture is not present in the local Data directory.");
+    }
+
+    const auto catalog = invisible_places::io::DiscoverAssets(DataRoot());
+    std::vector<invisible_places::io::PointCloudAsset> sampleAssets;
+    std::copy_if(
+        catalog.pointClouds.begin(),
+        catalog.pointClouds.end(),
+        std::back_inserter(sampleAssets),
+        [](const auto& asset) {
+            return asset.filePath.parent_path().filename() == "SampleScene";
+        });
+
+    REQUIRE(sampleAssets.size() == 3U);
+    std::set<std::string> roles;
+    std::set<std::string> filenames;
+    for (const auto& asset : sampleAssets) {
+        roles.insert(asset.sceneRole);
+        filenames.insert(asset.filePath.filename().string());
+        CHECK(asset.sceneGroupName == "SampleScene");
+        CHECK(asset.header.LooksLikePointCloud());
+        CHECK(asset.header.HasColorRgb());
+        CHECK(asset.header.HasProperty("nx"));
+        CHECK(asset.header.HasProperty("ny"));
+        CHECK(asset.header.HasProperty("nz"));
+        CHECK(asset.header.vertexCount > 1'000'000ULL);
+
+        const auto scalarFields = asset.header.ScalarFieldNames();
+        CHECK(std::find(scalarFields.begin(), scalarFields.end(), "Intensity") != scalarFields.end());
+        CHECK(std::find(scalarFields.begin(), scalarFields.end(), "Ranges") != scalarFields.end());
+        CHECK(std::find(scalarFields.begin(), scalarFields.end(), "Composite") != scalarFields.end());
+        CHECK(std::find(scalarFields.begin(), scalarFields.end(), "ScanID") != scalarFields.end());
+        if (asset.sceneRole == "ROCK") {
+            CHECK(asset.scenePrimaryRole);
+            CHECK(asset.inferredPointSpacingMeters == Catch::Approx(0.001F));
+            CHECK(std::find(scalarFields.begin(), scalarFields.end(), "Interest") != scalarFields.end());
+        } else if (asset.sceneRole == "SAND") {
+            CHECK_FALSE(asset.scenePrimaryRole);
+            CHECK(asset.inferredPointSpacingMeters == Catch::Approx(0.002F));
+            CHECK(std::find(scalarFields.begin(), scalarFields.end(), "Roughness") != scalarFields.end());
+        } else if (asset.sceneRole == "VEG") {
+            CHECK_FALSE(asset.scenePrimaryRole);
+            CHECK(asset.inferredPointSpacingMeters == Catch::Approx(0.001F));
+            CHECK(std::find(scalarFields.begin(), scalarFields.end(), "Roughness") != scalarFields.end());
+        }
+    }
+
+    CHECK(roles == std::set<std::string>{"ROCK", "SAND", "VEG"});
+    CHECK(filenames == std::set<std::string>{
+                           "Site3-ROCK-1mm.Sample.ply",
+                           "Site3-SAND-2mm.Sample.ply",
+                           "Site3-VEG-1mm.Sample.ply"});
+}
+
 TEST_CASE("Point-cloud scene roles and millimetre spacing are inferred from filenames", "[discovery][scene]") {
     CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-ROCK-1mm.ply") == "ROCK");
     CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-SAND-2mm.ply") == "SAND");
     CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-VEG-1mm.ply") == "VEG");
+    CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-ROCK-1mm.Sample.ply") == "ROCK");
     CHECK(invisible_places::io::InferPointCloudSceneRoleFromName("Site3-Mid-1mm100M.ply").empty());
     CHECK(invisible_places::io::InferPointSpacingMetersFromName("Site3-ROCK-1mm.ply") == Catch::Approx(0.001F));
+    CHECK(invisible_places::io::InferPointSpacingMetersFromName("Site3-ROCK-1mm.Sample.ply") == Catch::Approx(0.001F));
     CHECK(invisible_places::io::InferPointSpacingMetersFromName("Site3-SAND-2.5mm.ply") == Catch::Approx(0.0025F));
 }
 

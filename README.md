@@ -10,17 +10,17 @@ Invisible Places is not just a point-cloud viewer. It is an authoring environmen
 
 It lets a user load LiDAR-style point clouds, preserve their scalar fields, mix in aligned Gaussian splat captures, design visual treatments, save camera shots, turn those shots into animation paths, and export preview movies or EXR image stacks for postproduction.
 
-The central idea is that data already present in the point cloud can become visual direction. Height, roughness, classification, curvature, density proxies, or any CloudCompare-authored scalar field can drive colour, point size, opacity, emission, X-ray strength, depth fade, and related style parameters.
+The central idea is that data already present in the point cloud can become visual direction. Height, roughness, classification, curvature, density proxies, or any CloudCompare-authored scalar field can drive colour, point size, opacity, emission, depth fade, and related style parameters.
 
 ## Why it is useful
 
 - **Fast render iteration:** the app has deterministic point budgets, automatic camera-motion preview LOD, and a Fast Basic point-render path for keeping navigation, playback, and look-development responsive.
-- **Beauty render control:** the Beauty path supports richer point-cloud styling, screen sprites, world surfels, falloff profiles, depth-aware rendering, X-ray looks, emissive accents, eye-dome lighting, stylisation, and Gaussian splat preview.
+- **Beauty render control:** the Beauty path supports richer point-cloud styling, screen sprites, world surfels, falloff profiles, depth-aware rendering, emissive accents, eye-dome lighting, stylisation, and Gaussian splat preview.
 - **Smooth camera paths:** camera shots store orientation as quaternions, use shortest-path quaternion interpolation for rotations, and evaluate saved shot paths on a 30 fps timebase. Editable animation paths spline camera and focus positions for controlled fly-throughs.
 - **Data-driven art direction:** render parameters can be constant values or field-mapped controls with input/output ranges, layer statistics, clamp, invert, and gamma shaping.
 - **Hybrid capture scenes:** point-cloud layers and Gaussian splat layers share the same camera, scene, and project workflow, so survey geometry and photogrammetric/3DGS material can be composed together.
 - **Postproduction-friendly output:** preview-density EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
-- **Portable project state:** scenes, camera shots, animation paths, style presets, render settings, and panel state are serialized to JSON so a session can be reopened and rendered consistently.
+- **Portable project state:** scenes, camera shots, animation paths, style presets, render settings, water emitters, water path caches, and panel state are serialized to JSON so a session can be reopened and rendered consistently.
 
 ## Current capabilities
 
@@ -29,6 +29,9 @@ The central idea is that data already present in the point cloud can become visu
 - Discovers point-cloud and Gaussian splat assets from `Data/`.
 - Loads CloudCompare-style binary PLY point clouds with RGB and optional `scalar_*` fields.
 - Reads scalar-field statistics for field-driven styling.
+- Groups sibling role-named PLY files into one folder-level scene, such as ROCK/SAND/VEG layers under `Data/ExhibitionScene`.
+- Infers point spacing from filenames such as `1mm` and `2mm`, keeps manual spacing overrides in projects, and compensates folder-level visuals across different cloud densities.
+- Treats the ROCK role as the primary visual/style reference in grouped scenes while keeping role-specific backend behavior available.
 - Loads Gaussian splat PLY files named with the `gSplat-` prefix.
 - Applies same-stem `.txt` 4x4 transform matrices for Gaussian splat alignment.
 - Supports multiple LiDAR and gSplat layers in the same scene.
@@ -44,6 +47,8 @@ The central idea is that data already present in the point cloud can become visu
 - Supports source RGB, solid colour, and scalar colormap modes.
 - Includes colormaps such as Viridis, Plasma, Inferno, Magma, Cividis, Turbo, topographic, land-surface, fire, ice, and high-contrast ramps.
 - Includes point-cloud stylisation controls for watercolor, living wash, cartoon ink, brush dabs, pencil hatch, grainy pigment, and related painterly looks.
+- Includes folder-level multi-cloud visuals so grouped ROCK/SAND/VEG scenes are edited as one cloud while per-role spacing/density compensation is applied at render time.
+- Includes SAND-only shader shoreline waves for grouped coastal scenes. These use the editable boundary height, defaulting to `z = 1.55 m`, and do not require region polygons or CPU point membership.
 - Supports eye-dome lighting for depth readability outside the Fast Basic path.
 - Uses deterministic point sampling and spatial sampling so large clouds can be reduced predictably.
 - Has automatic preview LOD during camera navigation or animation playback.
@@ -70,7 +75,7 @@ The central idea is that data already present in the point cloud can become visu
   - clamp,
   - invert,
   - gamma shaping.
-- Field-driven controls currently cover point size, surfel diameter, opacity, emissive strength, X-ray strength, depth fade, and colormap position.
+- Field-driven controls currently cover point size, surfel diameter, opacity, emissive strength, depth fade, and colormap position.
 - Saves and reloads point-cloud style presets.
 
 ### Export and persistence
@@ -162,6 +167,9 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 ## Data assumptions
 
 - Point-cloud PLY files are standard CloudCompare exports with RGB and optional `scalar_*` properties.
+- Multi-cloud scene folders may contain sibling role-named point clouds. `ROCK`, `SAND`, and `VEG` tokens define the role; `1mm`, `2mm`, and similar tokens define inferred point spacing in meters.
+- `Data/ExhibitionScene` is the default full scene when `Saved/exhibitionScene_project.json` exists. It is expected to contain selected variants such as `Site3-ROCK-1mm.ply`, `Site3-SAND-2mm.ply`, and `Site3-VEG-1mm.ply`.
+- `Data/SampleScene` is the local validation fixture for the same multi-cloud contract. The expected sample files are `Site3-ROCK-1mm.Sample.ply`, `Site3-SAND-2mm.Sample.ply`, and `Site3-VEG-1mm.Sample.ply`.
 - Gaussian splat files are PLY files whose filename starts with `gSplat-` and whose header exposes Gaussian attributes such as `f_dc_0`, `opacity`, `scale_0`, and `rot_0`.
 - Each gSplat file is paired with a same-stem `.txt` file containing a 4x4 transform matrix.
 - `ffmpeg` is expected at `/opt/homebrew/bin/ffmpeg` for Fast Preview / Quick MP4 export.
@@ -190,3 +198,10 @@ The following setup path was validated in this workspace on April 30, 2026:
 - `cmake --preset macos-debug-vcpkg` configured successfully when `VCPKG_ROOT="$HOME/vcpkg"` was set
 - the preview executable built and discovered 8 point-cloud layers plus 10 gSplat layers from `Data/`
 - `ctest --test-dir build/macos-debug --output-on-failure` passed
+
+The ExhibitionScene multi-cloud workflow was additionally validated locally on July 4, 2026:
+
+- `Data/SampleScene` discovered as one grouped ROCK/SAND/VEG scene with inferred `1mm`, `2mm`, and `1mm` spacing.
+- `Saved/exhibitionScene_project.json` loads the ExhibitionScene project by default when present.
+- `RGB-Ghost`, `Roughness`, and `ghosted` are folder-level point visuals with density-compensated role rendering.
+- SAND shoreline waves compile through the point-cloud shader path and are covered by focused shoreline tests.
