@@ -938,6 +938,10 @@ struct WaterPathCache {
 [[nodiscard]] invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
     std::span<const WaterSceneSupportLayer> layers,
     const WaterPathGenerationSettings& settings);
+[[nodiscard]] invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
+    std::span<const WaterSceneSupportLayer> layers,
+    const WaterPathGenerationSettings& settings,
+    std::span<const invisible_places::io::Float3> priorityPoints);
 
 [[nodiscard]] WaterPathAnalysisCache BuildWaterPathAnalysis(const WaterPathCache& cache);
 [[nodiscard]] bool WaterPathAnalysisCacheCompatible(const WaterPathCache& cache);

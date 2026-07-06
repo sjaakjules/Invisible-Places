@@ -3179,9 +3179,42 @@ WaterPathCache GenerateWaterPathCache(
     return cache;
 }
 
+void AppendCombinedSupportPoint(
+    invisible_places::io::LoadedPointCloud* combined,
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex) {
+    if (combined == nullptr || pointIndex >= cloud.positions.size()) {
+        return;
+    }
+
+    const auto& position = cloud.positions[pointIndex];
+    combined->positions.push_back(position);
+    combined->bounds.Expand(position);
+    if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+        combined->normals.push_back(cloud.normals[pointIndex]);
+    } else {
+        combined->normals.push_back({0.0F, 0.0F, 1.0F});
+    }
+    if (cloud.hasSourceRgb && pointIndex < cloud.packedColors.size()) {
+        combined->packedColors.push_back(cloud.packedColors[pointIndex]);
+    } else {
+        combined->packedColors.push_back(0xFFFFFFFFU);
+    }
+}
+
 invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
     std::span<const WaterSceneSupportLayer> layers,
     const WaterPathGenerationSettings& settings) {
+    return BuildCombinedWaterSupportCloud(
+        layers,
+        settings,
+        std::span<const invisible_places::io::Float3>{});
+}
+
+invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
+    std::span<const WaterSceneSupportLayer> layers,
+    const WaterPathGenerationSettings& settings,
+    std::span<const invisible_places::io::Float3> priorityPoints) {
     invisible_places::io::LoadedPointCloud combined;
     combined.sourcePath = "combined-water-support";
     combined.layerName = "Combined Water Support";
@@ -3215,6 +3248,93 @@ invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
     occupiedVoxels.reserve(sampleLimit * 2U);
     const float baseVoxelSize = std::max(0.001F, settings.supportVoxelSize);
 
+    auto appendIfVoxelFree =
+        [&](std::unordered_set<GridKey, GridKeyHash>* occupied,
+            const invisible_places::io::LoadedPointCloud& cloud,
+            std::size_t pointIndex,
+            float voxelSize) {
+            if (occupied == nullptr || pointIndex >= cloud.positions.size() || combined.positions.size() >= sampleLimit) {
+                return false;
+            }
+            const auto& position = cloud.positions[pointIndex];
+            const float invVoxel = 1.0F / std::max(0.001F, voxelSize);
+            const GridKey key{
+                static_cast<int>(std::floor(position.x * invVoxel)),
+                static_cast<int>(std::floor(position.y * invVoxel)),
+                static_cast<int>(std::floor(position.z * invVoxel)),
+            };
+            if (!occupied->insert(key).second) {
+                return false;
+            }
+            AppendCombinedSupportPoint(&combined, cloud, pointIndex);
+            return true;
+        };
+
+    if (!priorityPoints.empty()) {
+        std::unordered_set<GridKey, GridKeyHash> occupiedPriorityVoxels;
+        occupiedPriorityVoxels.reserve(std::min<std::size_t>(sampleLimit, 262144U));
+        const float priorityVoxelSize = std::max(
+            0.001F,
+            std::min({
+                baseVoxelSize,
+                std::max(0.001F, settings.pathSampleSpacing),
+                0.010F,
+            }));
+        const bool aerialScale = settings.legacyScaleMode == WaterScaleMode::Aerial;
+        const float priorityRadius = aerialScale
+                                         ? std::clamp(settings.maxBridgeDistance * 2.5F, 0.25F, 30.0F)
+                                         : std::clamp(
+                                               std::max({
+                                                   settings.maxBridgeDistance * 6.0F,
+                                                   baseVoxelSize * 32.0F,
+                                                   std::max(0.001F, settings.pathSampleSpacing) * 32.0F,
+                                                   0.06F,
+                                               }),
+                                               0.06F,
+                                               1.25F);
+        const float priorityRadiusSquared = priorityRadius * priorityRadius;
+        const std::size_t prioritySampleLimit = std::min<std::size_t>(
+            sampleLimit,
+            std::max<std::size_t>(1U, (sampleLimit * 3U) / 5U));
+        const std::size_t priorityLayerTarget = std::max<std::size_t>(
+            1U,
+            prioritySampleLimit / std::max<std::size_t>(1U, priorityPoints.size() * validLayers.size()));
+        std::size_t prioritySamples = 0U;
+
+        for (const auto& priorityPoint : priorityPoints) {
+            if (prioritySamples >= prioritySampleLimit || combined.positions.size() >= sampleLimit) {
+                break;
+            }
+            const glm::vec3 priority = ToGlm(priorityPoint);
+            for (const auto* layer : validLayers) {
+                if (prioritySamples >= prioritySampleLimit || combined.positions.size() >= sampleLimit) {
+                    break;
+                }
+                const auto& cloud = *layer->cloud;
+                std::size_t layerPrioritySamples = 0U;
+                for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); ++pointIndex) {
+                    if (prioritySamples >= prioritySampleLimit ||
+                        layerPrioritySamples >= priorityLayerTarget ||
+                        combined.positions.size() >= sampleLimit) {
+                        break;
+                    }
+                    const glm::vec3 position = ToGlm(cloud.positions[pointIndex]);
+                    const glm::vec3 delta = position - priority;
+                    if (std::abs(delta.x) > priorityRadius ||
+                        std::abs(delta.y) > priorityRadius ||
+                        std::abs(delta.z) > priorityRadius ||
+                        glm::dot(delta, delta) > priorityRadiusSquared) {
+                        continue;
+                    }
+                    if (appendIfVoxelFree(&occupiedPriorityVoxels, cloud, pointIndex, priorityVoxelSize)) {
+                        ++prioritySamples;
+                        ++layerPrioritySamples;
+                    }
+                }
+            }
+        }
+    }
+
     for (const auto* layer : validLayers) {
         const auto& cloud = *layer->cloud;
         const double multiplier = std::max(1.0, static_cast<double>(layer->samplingMultiplier));
@@ -3229,34 +3349,14 @@ invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
         const float roleVoxelSize = std::max(
             baseVoxelSize * static_cast<float>(multiplier),
             std::max(0.0F, layer->pointSpacingMeters));
-        const float invVoxel = 1.0F / std::max(0.001F, roleVoxelSize);
 
         std::size_t layerSamples = 0U;
         for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); pointIndex += stride) {
             if (combined.positions.size() >= sampleLimit || layerSamples >= layerTarget) {
                 break;
             }
-            const auto& position = cloud.positions[pointIndex];
-            const GridKey key{
-                static_cast<int>(std::floor(position.x * invVoxel)),
-                static_cast<int>(std::floor(position.y * invVoxel)),
-                static_cast<int>(std::floor(position.z * invVoxel)),
-            };
-            if (!occupiedVoxels.insert(key).second) {
+            if (!appendIfVoxelFree(&occupiedVoxels, cloud, pointIndex, roleVoxelSize)) {
                 continue;
-            }
-
-            combined.positions.push_back(position);
-            combined.bounds.Expand(position);
-            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
-                combined.normals.push_back(cloud.normals[pointIndex]);
-            } else {
-                combined.normals.push_back({0.0F, 0.0F, 1.0F});
-            }
-            if (cloud.hasSourceRgb && pointIndex < cloud.packedColors.size()) {
-                combined.packedColors.push_back(cloud.packedColors[pointIndex]);
-            } else {
-                combined.packedColors.push_back(0xFFFFFFFFU);
             }
             ++layerSamples;
         }

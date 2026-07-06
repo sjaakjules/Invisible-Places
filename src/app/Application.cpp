@@ -165,6 +165,9 @@ using LayerLoadResult = std::variant<
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr std::size_t kMaxPivotSamples = 65536;
+constexpr std::uint64_t kWaterSourcePickSampleLimit = 3'000'000ULL;
+constexpr float kWaterSourcePickRadiusPixels = 22.0F;
+constexpr float kWaterSourceFallbackPickRadiusPixels = 42.0F;
 constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
 constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
 constexpr std::uint32_t kAnimationExportFrustumMaskGridDimension = 48U;
@@ -4609,6 +4612,26 @@ glm::vec3 BulkCenter(const std::vector<PivotCandidate>& candidates) {
     return nearest != candidates.end() ? nearest->point : center;
 }
 
+glm::vec3 BestPrecisePivotPoint(const std::vector<PivotCandidate>& candidates) {
+    if (candidates.empty()) {
+        return {0.0F, 0.0F, 0.0F};
+    }
+
+    const auto best = std::min_element(
+        candidates.begin(),
+        candidates.end(),
+        [](const PivotCandidate& left, const PivotCandidate& right) {
+            if (std::abs(left.screenDistance - right.screenDistance) > 0.35F) {
+                return left.screenDistance < right.screenDistance;
+            }
+            if (std::abs(left.rayDistance - right.rayDistance) > 1.0e-5F) {
+                return left.rayDistance < right.rayDistance;
+            }
+            return left.alongRay < right.alongRay;
+        });
+    return best != candidates.end() ? best->point : candidates.front().point;
+}
+
 std::optional<ResolvedPivot> ResolveSurfacePivot(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -7832,6 +7855,7 @@ std::string CombinedWaterSupportSignature(
 
     std::ostringstream signature;
     signature << "scene=" << sourceSession.sceneGroupName
+              << "|builder=combined-v2"
               << "|voxel=" << settings.supportVoxelSize
               << "|samples=" << settings.supportSampleLimit;
     for (const auto& session : runtimeState.sessions) {
@@ -7889,6 +7913,213 @@ const invisible_places::io::LoadedPointCloud* EnsureWaterSupportCloud(
     runtimeState->water.combinedSupportCloud = std::move(combined);
     runtimeState->water.combinedSupportSignature = signature;
     return runtimeState->water.combinedSupportCloud.get();
+}
+
+std::vector<invisible_places::water::WaterSceneSupportLayer> BuildWaterSourcePickSupportLayers(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& sourceSession) {
+    auto layers = BuildWaterSceneSupportLayers(runtimeState, sourceSession);
+    if (!layers.empty()) {
+        return layers;
+    }
+    if (sourceSession.offlinePointCloud != nullptr) {
+        layers.push_back({
+            .cloud = sourceSession.offlinePointCloud.get(),
+            .role = sourceSession.sceneRole,
+            .pointSpacingMeters = EffectivePointSpacingMeters(sourceSession),
+            .samplingMultiplier = 1.0F,
+        });
+    }
+    return layers;
+}
+
+std::uint64_t WaterSupportLayerPointCount(
+    std::span<const invisible_places::water::WaterSceneSupportLayer> layers) {
+    std::uint64_t count = 0;
+    for (const auto& layer : layers) {
+        if (layer.cloud != nullptr) {
+            count += static_cast<std::uint64_t>(layer.cloud->positions.size());
+        }
+    }
+    return count;
+}
+
+std::string WaterSupportLayerSummary(
+    std::span<const invisible_places::water::WaterSceneSupportLayer> layers) {
+    if (layers.empty()) {
+        return "no role layers";
+    }
+
+    std::ostringstream summary;
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        if (index > 0U) {
+            summary << ", ";
+        }
+        const auto& layer = layers[index];
+        const auto pointCount = layer.cloud == nullptr ? 0ULL : static_cast<std::uint64_t>(layer.cloud->positions.size());
+        summary << (layer.role.empty() ? "POINTS" : layer.role)
+                << "=" << FormatPointCount(pointCount);
+    }
+    return summary.str();
+}
+
+std::shared_ptr<invisible_places::io::LoadedPointCloud> BuildFocusedWaterPathSupportCloud(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& sourceSession,
+    const WaterPathGenerationSettings& settings,
+    std::span<const WaterEmitter> emitters) {
+    const auto layers = BuildWaterSceneSupportLayers(runtimeState, sourceSession);
+    if (layers.empty()) {
+        return nullptr;
+    }
+
+    std::vector<invisible_places::io::Float3> priorityPoints;
+    priorityPoints.reserve(emitters.size());
+    for (const auto& emitter : emitters) {
+        if (emitter.status != WaterEmitterStatus::Disabled) {
+            priorityPoints.push_back(emitter.position);
+        }
+    }
+    if (priorityPoints.empty()) {
+        return nullptr;
+    }
+
+    auto focused = std::make_shared<invisible_places::io::LoadedPointCloud>(
+        invisible_places::water::BuildCombinedWaterSupportCloud(
+            layers,
+            settings,
+            priorityPoints));
+    return focused->positions.empty() ? nullptr : focused;
+}
+
+std::optional<ResolvedPivot> ResolveWaterSourceSupportPivot(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    const auto supportIndex = ResolveWaterSupportSessionIndex(runtimeState);
+    if (!supportIndex.has_value() || supportIndex.value() >= runtimeState.sessions.size()) {
+        return std::nullopt;
+    }
+    const auto& sourceSession = runtimeState.sessions[supportIndex.value()];
+    const auto layers = BuildWaterSourcePickSupportLayers(runtimeState, sourceSession);
+    if (layers.empty()) {
+        return std::nullopt;
+    }
+
+    std::uint64_t rawPointCount = 0;
+    for (const auto& layer : layers) {
+        if (layer.cloud != nullptr) {
+            rawPointCount += static_cast<std::uint64_t>(layer.cloud->positions.size());
+        }
+    }
+    if (rawPointCount == 0U) {
+        return std::nullopt;
+    }
+
+    if (!IsInsideRenderViewport(viewport, screenPoint)) {
+        screenPoint = CurrentUiViewportCenter(viewport);
+    }
+    const auto viewportSize = CurrentUiViewportSize(viewport);
+    const float viewportHeight = std::max(1.0F, viewportSize.y);
+    const auto matrices = runtimeState.camera.Matrices(CurrentAspectRatio(viewport));
+    const auto screenRay = MakeScreenRay(matrices, viewport, screenPoint);
+    if (!screenRay.has_value()) {
+        return std::nullopt;
+    }
+
+    auto collectCandidates = [&](float pickRadiusPixels) {
+        std::vector<PivotCandidate> candidates;
+        candidates.reserve(1024);
+        const float tanHalfFov = std::tan(runtimeState.camera.FovDegrees() * kPi / 360.0F);
+        const std::uint64_t pickBudget = std::min(rawPointCount, kWaterSourcePickSampleLimit);
+        const std::uint64_t layerCount = std::max<std::uint64_t>(1U, layers.size());
+        const std::uint64_t layerFloor = std::min<std::uint64_t>(
+            128000ULL,
+            std::max<std::uint64_t>(1ULL, pickBudget / std::max<std::uint64_t>(1ULL, layerCount * 4ULL)));
+
+        for (const auto& layer : layers) {
+            if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+                continue;
+            }
+            const auto& cloud = *layer.cloud;
+            const auto cloudPointCount = static_cast<std::uint64_t>(cloud.positions.size());
+            std::uint64_t layerTarget = static_cast<std::uint64_t>(
+                std::ceil(
+                    (static_cast<double>(cloudPointCount) / static_cast<double>(rawPointCount)) *
+                    static_cast<double>(pickBudget)));
+            layerTarget = std::max<std::uint64_t>(
+                layerTarget,
+                std::min<std::uint64_t>(cloudPointCount, layerFloor));
+            layerTarget = std::clamp<std::uint64_t>(layerTarget, 1ULL, cloudPointCount);
+            const auto stride = static_cast<std::size_t>(
+                std::max<std::uint64_t>(1ULL, (cloudPointCount + layerTarget - 1ULL) / layerTarget));
+
+            for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); pointIndex += stride) {
+                const auto& sample = cloud.positions[pointIndex];
+                const glm::vec3 worldPoint{sample.x, sample.y, sample.z};
+                const auto projected = ProjectWorldPoint(matrices, viewport, worldPoint);
+                if (!projected.has_value()) {
+                    continue;
+                }
+
+                const glm::vec3 pointFromRayOrigin = worldPoint - screenRay->origin;
+                const float alongRay = glm::dot(pointFromRayOrigin, screenRay->direction);
+                if (alongRay <= runtimeState.camera.NearPlane()) {
+                    continue;
+                }
+
+                const float dx = projected->screen.x - screenPoint.x;
+                const float dy = projected->screen.y - screenPoint.y;
+                const float screenDistance = std::sqrt((dx * dx) + (dy * dy));
+                if (screenDistance > pickRadiusPixels) {
+                    continue;
+                }
+
+                const glm::vec3 closestPointOnRay = screenRay->origin + (screenRay->direction * alongRay);
+                const float rayDistance = glm::length(worldPoint - closestPointOnRay);
+                const float worldUnitsPerPixel =
+                    (2.0F * std::max(0.001F, alongRay) * tanHalfFov) / viewportHeight;
+                const float pickRadiusWorld = std::max(0.0001F, worldUnitsPerPixel * pickRadiusPixels);
+                if (rayDistance > pickRadiusWorld) {
+                    continue;
+                }
+
+                candidates.push_back(
+                    {.point = worldPoint,
+                     .rayDistance = rayDistance,
+                     .alongRay = alongRay,
+                     .depth = projected->depth,
+                     .screenDistance = screenDistance,
+                     .pickRadiusWorld = pickRadiusWorld});
+            }
+        }
+        return candidates;
+    };
+
+    auto candidates = collectCandidates(kWaterSourcePickRadiusPixels);
+    if (candidates.empty()) {
+        candidates = collectCandidates(kWaterSourceFallbackPickRadiusPixels);
+    }
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+
+    auto cluster = SelectPivotDepthCluster(std::move(candidates));
+    return ResolvedPivot{
+        .point = FromGlm(BestPrecisePivotPoint(cluster)),
+        .matchedSurface = true,
+        .sampleCount = cluster.size()};
+}
+
+std::optional<ResolvedPivot> ResolveWaterSourcePlacementPivot(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (const auto supportPivot = ResolveWaterSourceSupportPivot(runtimeState, viewport, screenPoint);
+        supportPivot.has_value()) {
+        return supportPivot;
+    }
+    return ResolveSurfacePivot(runtimeState, viewport, screenPoint);
 }
 
 const TrailSurfaceIndex* EnsureTrailSurfaceIndexForSupport(
@@ -8876,11 +9107,27 @@ bool BakeWaterOverlayForActiveLayer(
         return true;
     }
 
-    runtimeState->statusMessage = "Baking water main paths...";
     const auto pathEmitters = WaterEmittersWithResolvedPathProfiles(runtimeState->water);
+    if (std::none_of(
+            pathEmitters.begin(),
+            pathEmitters.end(),
+            [](const WaterEmitter& emitter) { return emitter.status != WaterEmitterStatus::Disabled; })) {
+        runtimeState->errorMessage = "No enabled water sources were available for path baking.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    runtimeState->statusMessage = "Baking water main paths...";
+    const auto supportLayers = BuildWaterSourcePickSupportLayers(*runtimeState, sourceSession);
+    const auto focusedSupportCloud = BuildFocusedWaterPathSupportCloud(
+        *runtimeState,
+        sourceSession,
+        defaultSourceSettings.path,
+        pathEmitters);
+    const auto* bakeSupportCloud = focusedSupportCloud != nullptr ? focusedSupportCloud.get() : supportCloud;
     ++runtimeState->water.pathDiagnosticRebuildCounters.pathBakes;
     runtimeState->water.pathCache = invisible_places::water::GenerateWaterPathCache(
-        *supportCloud,
+        *bakeSupportCloud,
         pathEmitters,
         defaultSourceSettings);
     runtimeState->water.pathCache.supportLayerPath = sourceSession.sourcePath;
@@ -8895,6 +9142,17 @@ bool BakeWaterOverlayForActiveLayer(
     runtimeState->water.selectedPathBranchId.reset();
     runtimeState->water.hoveredPathBranchId.reset();
     runtimeState->water.pathAnchors = WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
+    if (runtimeState->water.pathCache.branches.empty() || runtimeState->water.pathAnchors.points.empty()) {
+        runtimeState->water.pathDirty = true;
+        runtimeState->errorMessage =
+            "Water path bake found no supported downhill paths from " +
+            FormatPointCount(pathEmitters.size()) + " sources using " +
+            FormatPointCount(bakeSupportCloud->positions.size()) + " support samples over " +
+            FormatPointCount(WaterSupportLayerPointCount(supportLayers)) + " raw role points from " +
+            WaterSupportLayerSummary(supportLayers) + ".";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
     const auto groups = BuildFlowTrailOverlayGroups(*runtimeState);
     const auto sampleCount = std::accumulate(
         groups.begin(),
@@ -10361,7 +10619,7 @@ bool PlaceWaterEmitterAtScreenPoint(
         return false;
     }
 
-    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
+    const auto pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
     if (!pivot.has_value()) {
         runtimeState->errorMessage = "No visible point-cloud surface was available for water source placement.";
         runtimeState->statusMessage.clear();
@@ -10371,14 +10629,15 @@ bool PlaceWaterEmitterAtScreenPoint(
     WaterEmitter emitter;
     emitter.id = NextWaterEmitterId(*runtimeState);
     emitter.name = "Source " + std::to_string(emitter.id);
+    const auto pathSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path;
     emitter.position = pivot->point;
-    const auto& pathSettings = ActiveDefaultWaterSourceSettings(*runtimeState).path;
     emitter.radius = std::max(0.05F, pathSettings.maxBridgeDistance * 0.75F);
     emitter.strength = 1.0F;
     emitter.speed = 1.0F;
     emitter.origin = WaterEmitterOrigin::Manual;
     emitter.status = WaterEmitterStatus::Accepted;
     emitter.confidence = pivot->matchedSurface ? 1.0F : 0.55F;
+    const auto placedPosition = emitter.position;
     runtimeState->water.nextEmitterId = emitter.id + 1U;
     runtimeState->water.emitters.push_back(std::move(emitter));
     runtimeState->water.selectedEmitterIndex = runtimeState->water.emitters.size() - 1U;
@@ -10386,7 +10645,7 @@ bool PlaceWaterEmitterAtScreenPoint(
     runtimeState->water.movingEmitterIndex.reset();
     QueueWaterPreview(runtimeState);
     runtimeState->pivotOverlay.visible = true;
-    runtimeState->pivotOverlay.pivot = pivot->point;
+    runtimeState->pivotOverlay.pivot = placedPosition;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
     runtimeState->statusMessage = "Placed water source from viewport; path bake required.";
     runtimeState->errorMessage.clear();
@@ -10521,7 +10780,7 @@ bool MoveWaterEmitterAtScreenPoint(
         return false;
     }
 
-    const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
+    const auto pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
     if (!pivot.has_value()) {
         runtimeState->errorMessage = "No visible point-cloud surface was available for moving the water source.";
         runtimeState->statusMessage.clear();
@@ -10530,13 +10789,15 @@ bool MoveWaterEmitterAtScreenPoint(
 
     auto& emitter = runtimeState->water.emitters[emitterIndex];
     emitter.position = pivot->point;
-    emitter.confidence = std::max(emitter.confidence, pivot->matchedSurface ? 0.85F : 0.55F);
+    emitter.confidence = std::max(
+        emitter.confidence,
+        pivot->matchedSurface ? 0.85F : 0.55F);
     runtimeState->water.selectedEmitterIndex = emitterIndex;
     runtimeState->water.movingEmitterIndex.reset();
     runtimeState->water.placementArmed = false;
     MarkWaterPathDirty(runtimeState, emitter.id);
     runtimeState->pivotOverlay.visible = true;
-    runtimeState->pivotOverlay.pivot = pivot->point;
+    runtimeState->pivotOverlay.pivot = emitter.position;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
     runtimeState->statusMessage = "Moved water source " + emitter.name + "; path bake required.";
     runtimeState->errorMessage.clear();
@@ -10559,10 +10820,11 @@ void SuggestWaterEmittersForActiveLayer(PreviewRuntimeState* runtimeState) {
         runtimeState->statusMessage.clear();
         return;
     }
+    const auto defaultSourceSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water);
     const auto* supportCloud = EnsureWaterSupportCloud(
         runtimeState,
         session,
-        ActiveDefaultWaterSourceSettings(*runtimeState).path);
+        defaultSourceSettings.path);
     if (supportCloud == nullptr || supportCloud->positions.empty()) {
         runtimeState->errorMessage = "No usable point-cloud support was available for water source suggestions.";
         runtimeState->statusMessage.clear();
@@ -10573,7 +10835,7 @@ void SuggestWaterEmittersForActiveLayer(PreviewRuntimeState* runtimeState) {
     auto suggestions = invisible_places::water::SuggestWaterEmitters(
         *supportCloud,
         runtimeState->water.emitters,
-        ActiveDefaultWaterSourceSettings(*runtimeState).path,
+        defaultSourceSettings.path,
         firstId,
         runtimeState->water.maxAutoSuggestions);
     if (suggestions.empty()) {
@@ -10610,10 +10872,11 @@ void PropagateWaterEmittersToActiveLayer(PreviewRuntimeState* runtimeState) {
         runtimeState->statusMessage.clear();
         return;
     }
+    const auto defaultSourceSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water);
     const auto* supportCloud = EnsureWaterSupportCloud(
         runtimeState,
         targetSession,
-        ActiveDefaultWaterSourceSettings(*runtimeState).path);
+        defaultSourceSettings.path);
     if (supportCloud == nullptr || supportCloud->positions.empty()) {
         runtimeState->errorMessage = "No usable point-cloud support was available for water source snapping.";
         runtimeState->statusMessage.clear();
@@ -10630,7 +10893,7 @@ void PropagateWaterEmittersToActiveLayer(PreviewRuntimeState* runtimeState) {
             invisible_places::water::ResolveWaterSourceSettings(
                 emitter,
                 runtimeState->water.emitters,
-                ActiveDefaultWaterSourceSettings(*runtimeState)).path;
+                defaultSourceSettings).path;
         const auto snapped = invisible_places::water::SnapEmitterToCloud(
             *supportCloud,
             emitter.position,
@@ -22465,7 +22728,7 @@ void DrawWaterPanel(
                     pathChanged = true;
                 }
                 int sampleLimit = static_cast<int>(pathSettings.supportSampleLimit);
-                if (ImGui::SliderInt("Support Samples", &sampleLimit, 512, 500000)) {
+                if (ImGui::SliderInt("Support Samples", &sampleLimit, 512, 5000000)) {
                     pathSettings.supportSampleLimit = static_cast<std::uint32_t>(std::max(512, sampleLimit));
                     pathChanged = true;
                 }

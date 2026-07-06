@@ -1135,6 +1135,66 @@ TEST_CASE("Combined water support samples all scene roles with role multipliers"
     CHECK(rockSamples >= vegSamples);
 }
 
+TEST_CASE("Combined water support reserves source-neighbour samples across scene roles", "[water][scene]") {
+    auto makeCloud = [](float xOffset) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.sourcePath = "role-cloud.ply";
+        cloud.layerName = "role-cloud";
+        cloud.hasNormals = true;
+        cloud.hasSourceRgb = true;
+        for (std::size_t index = 0; index < 80U; ++index) {
+            const invisible_places::io::Float3 point{
+                xOffset + static_cast<float>(index % 20U) * 0.001F,
+                static_cast<float>(index / 20U) * 0.001F,
+                1.0F - static_cast<float>(index % 7U) * 0.001F,
+            };
+            cloud.positions.push_back(point);
+            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(point);
+        }
+        cloud.hasFocusPoint = true;
+        cloud.focusPoint = {xOffset, 0.0F, 1.0F};
+        return cloud;
+    };
+
+    const auto rock = makeCloud(0.00F);
+    const auto sand = makeCloud(0.20F);
+    const auto veg = makeCloud(0.40F);
+    invisible_places::water::WaterPathGenerationSettings settings;
+    settings.supportVoxelSize = 0.002F;
+    settings.maxBridgeDistance = 0.050F;
+    settings.pathSampleSpacing = 0.002F;
+    settings.supportSampleLimit = 30U;
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 3> layers{
+        invisible_places::water::WaterSceneSupportLayer{.cloud = &rock, .role = "ROCK", .pointSpacingMeters = 0.001F, .samplingMultiplier = 1.0F},
+        invisible_places::water::WaterSceneSupportLayer{.cloud = &sand, .role = "SAND", .pointSpacingMeters = 0.001F, .samplingMultiplier = 2.0F},
+        invisible_places::water::WaterSceneSupportLayer{.cloud = &veg, .role = "VEG", .pointSpacingMeters = 0.001F, .samplingMultiplier = 2.0F},
+    };
+    const std::array<invisible_places::io::Float3, 1> sources{{{0.20F, 0.0F, 1.0F}}};
+
+    const auto combined = invisible_places::water::BuildCombinedWaterSupportCloud(layers, settings, sources);
+
+    REQUIRE(combined.positions.size() <= settings.supportSampleLimit);
+    REQUIRE(combined.positions.size() >= 18U);
+    const auto priorityEnd = combined.positions.begin() + 18;
+    const auto rockPrioritySamples = static_cast<std::size_t>(std::count_if(
+        combined.positions.begin(),
+        priorityEnd,
+        [](const auto& point) { return point.x < 0.10F; }));
+    const auto sandPrioritySamples = static_cast<std::size_t>(std::count_if(
+        combined.positions.begin(),
+        priorityEnd,
+        [](const auto& point) { return point.x > 0.10F && point.x < 0.30F; }));
+    const auto vegPrioritySamples = static_cast<std::size_t>(std::count_if(
+        combined.positions.begin(),
+        priorityEnd,
+        [](const auto& point) { return point.x > 0.30F; }));
+    CHECK(rockPrioritySamples > 0U);
+    CHECK(sandPrioritySamples > 0U);
+    CHECK(vegPrioritySamples > 0U);
+}
+
 TEST_CASE("Shoreline wave height mask fades around the sand-rock boundary", "[water][shoreline]") {
     using invisible_places::renderer::pointcloud::ShorelineWaveHeightMask;
     constexpr float boundaryZ = 1.55F;
