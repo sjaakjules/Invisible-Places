@@ -3473,6 +3473,64 @@ TEST_CASE("Water flow overlay bakes loadable scalar-field PLY traces", "[water][
     std::filesystem::remove(outputPath);
 }
 
+TEST_CASE("Water trail lanes tighten on Z-vertical guide drops", "[water][trail]") {
+    const auto makeAnchors = [](bool vertical) {
+        invisible_places::water::WaterOverlay anchors;
+        for (std::uint32_t index = 0; index < 7U; ++index) {
+            invisible_places::water::WaterOverlayPoint point;
+            point.position = vertical
+                                 ? invisible_places::io::Float3{0.0F, 0.0F, 1.0F - static_cast<float>(index) * 0.045F}
+                                 : invisible_places::io::Float3{static_cast<float>(index) * 0.045F, 0.0F, 1.0F};
+            point.normal = vertical ? invisible_places::io::Float3{1.0F, 0.0F, 0.0F}
+                                    : invisible_places::io::Float3{0.0F, 0.0F, 1.0F};
+            point.flowId = 42.0F;
+            point.emitterId = 3.0F;
+            point.pathDistance = static_cast<float>(index) * 0.045F;
+            point.speed = 1.0F;
+            point.width = 0.080F;
+            point.confidence = 1.0F;
+            point.accumulation = static_cast<float>(index) / 6.0F;
+            anchors.bounds.Expand(point.position);
+            anchors.points.push_back(point);
+        }
+        return anchors;
+    };
+    const auto maxLaneOffset = [](const invisible_places::water::WaterOverlay& overlay) {
+        float maximum = 0.0F;
+        for (const auto& point : overlay.points) {
+            if (point.particleRole >= 2.5F && point.particleRole < 3.5F) {
+                maximum = std::max(maximum, std::abs(point.trailLateralOffset));
+            }
+        }
+        return maximum;
+    };
+
+    auto sourceSettings = invisible_places::water::DefaultWaterSourceSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    sourceSettings.trailShape.particleJitter = 1.0F;
+    sourceSettings.trailShape.trailLooseness = 1.0F;
+    sourceSettings.trailShape.trailSmoothness = 0.0F;
+    sourceSettings.trailShape.trailLaneCount = 7U;
+    sourceSettings.trailShape.splineAnchorSpacing = 0.020F;
+    invisible_places::water::WaterAnimationTrailSettings animationSettings;
+    animationSettings.particleDensity = 0.0F;
+
+    const auto verticalOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        makeAnchors(true),
+        sourceSettings.trailShape,
+        animationSettings);
+    const auto horizontalOverlay = invisible_places::water::BuildWaterOverlayFromPathAnchors(
+        makeAnchors(false),
+        sourceSettings.trailShape,
+        animationSettings);
+    const float verticalMaxOffset = maxLaneOffset(verticalOverlay);
+    const float horizontalMaxOffset = maxLaneOffset(horizontalOverlay);
+
+    REQUIRE(verticalMaxOffset > 0.0F);
+    REQUIRE(horizontalMaxOffset > 0.0F);
+    CHECK(verticalMaxOffset < horizontalMaxOffset * 0.35F);
+}
+
 TEST_CASE("Water v2 trails expose deterministic scalar contracts", "[water][v2]") {
     invisible_places::water::WaterOverlay anchors;
     for (std::uint32_t index = 0; index < 6U; ++index) {
@@ -7015,6 +7073,56 @@ invisible_places::water::WaterPathCache MakeSyntheticAnalysisCache(
     return cache;
 }
 
+struct WaterPathDropStats {
+    float totalLength = 0.0F;
+    float totalDrop = 0.0F;
+    float uphillAmount = 0.0F;
+    float lateralDistance = 0.0F;
+    float largestUphillStep = 0.0F;
+    float largestSidewaysWithoutDrop = 0.0F;
+    std::size_t segmentCount = 0U;
+    std::size_t downhillSegmentCount = 0U;
+};
+
+WaterPathDropStats ComputeWaterPathDropStats(
+    const std::vector<invisible_places::water::WaterOverlayPoint>& anchors) {
+    WaterPathDropStats stats;
+    if (anchors.size() < 2U) {
+        return stats;
+    }
+
+    for (std::size_t index = 1U; index < anchors.size(); ++index) {
+        const glm::vec3 previous{
+            anchors[index - 1U].position.x,
+            anchors[index - 1U].position.y,
+            anchors[index - 1U].position.z};
+        const glm::vec3 current{anchors[index].position.x, anchors[index].position.y, anchors[index].position.z};
+        const glm::vec3 delta = current - previous;
+        const float length = glm::length(delta);
+        if (length <= 1.0e-6F) {
+            continue;
+        }
+
+        const float zDrop = previous.z - current.z;
+        const float horizontal = glm::length(glm::vec2{delta.x, delta.y});
+        stats.totalLength += length;
+        stats.totalDrop += zDrop;
+        stats.lateralDistance += horizontal;
+        ++stats.segmentCount;
+        if (zDrop >= -1.0e-5F) {
+            ++stats.downhillSegmentCount;
+        } else {
+            const float uphill = -zDrop;
+            stats.uphillAmount += uphill;
+            stats.largestUphillStep = std::max(stats.largestUphillStep, uphill);
+        }
+        if (zDrop < 0.0015F) {
+            stats.largestSidewaysWithoutDrop = std::max(stats.largestSidewaysWithoutDrop, horizontal);
+        }
+    }
+    return stats;
+}
+
 float MeanAnalysisValue(
     const invisible_places::water::WaterPathAnalysisCache& analysis,
     float invisible_places::water::WaterPathAnalysisSample::*field) {
@@ -7488,6 +7596,78 @@ TEST_CASE("Path View diagnostic colour mode changes do not rebuild water paths l
     CHECK(stats.lastChangeTouchedRebuildCounters);
 }
 
+TEST_CASE("Water path ranking prefers Z-down support over sideways shelves", "[water]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-sideways-shelf.ply";
+    cloud.layerName = "synthetic-water-sideways-shelf";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+
+    const auto appendPoint = [&](invisible_places::io::Float3 position, invisible_places::io::Float3 normal) {
+        cloud.positions.push_back(position);
+        cloud.normals.push_back(normal);
+        cloud.packedColors.push_back(0xFFFFFFFFU);
+        cloud.bounds.Expand(position);
+    };
+
+    appendPoint({0.0F, 0.0F, 1.0F}, {0.65F, 0.0F, 0.76F});
+    for (int index = 1; index <= 14; ++index) {
+        appendPoint(
+            {0.017F * static_cast<float>(index), 0.0F, 1.0F - 0.0012F * static_cast<float>(index)},
+            {0.65F, 0.0F, 0.76F});
+    }
+    for (int index = 1; index <= 14; ++index) {
+        appendPoint(
+            {0.004F * static_cast<float>(index % 2),
+             -0.024F * static_cast<float>(index),
+             1.0F - 0.022F * static_cast<float>(index)},
+            {0.0F, -0.62F, 0.78F});
+    }
+
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.autoTune = false;
+    settings.supportVoxelSize = 0.006F;
+    settings.maxBridgeDistance = 0.052F;
+    settings.pathLength = 0.42F;
+    settings.pathSampleSpacing = 0.006F;
+    settings.branching = 0.20F;
+    settings.coverage = 0.70F;
+    settings.gapTolerance = 0.50F;
+    settings.maxSteps = 96U;
+    settings.supportSampleLimit = 256U;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 71U;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.024F;
+    emitter.confidence = 1.0F;
+
+    const auto cache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        settings);
+    const auto mainBranch = std::find_if(
+        cache.branches.begin(),
+        cache.branches.end(),
+        [](const invisible_places::water::WaterPathBranch& branch) {
+            return branch.role == invisible_places::water::WaterPathBranchRole::Main;
+        });
+    REQUIRE(mainBranch != cache.branches.end());
+    REQUIRE(mainBranch->rawAnchors.size() > 8U);
+
+    const auto stats = ComputeWaterPathDropStats(mainBranch->rawAnchors);
+    const auto& start = mainBranch->rawAnchors.front().position;
+    const auto& end = mainBranch->rawAnchors.back().position;
+    CAPTURE(stats.totalDrop, stats.uphillAmount, stats.lateralDistance, start.x, start.y, start.z, end.x, end.y, end.z);
+    CHECK(stats.totalDrop > 0.18F);
+    CHECK(stats.downhillSegmentCount >= stats.segmentCount * 8U / 10U);
+    CHECK(stats.largestUphillStep < 0.010F);
+    CHECK(end.z < start.z - 0.18F);
+    CHECK(end.y < start.y - 0.16F);
+    CHECK(std::abs(end.x - start.x) < 0.070F);
+}
+
 TEST_CASE("Water gap tolerance controls how much bridge upper limit is used", "[water]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.sourcePath = "synthetic-water-gap-tolerance.ply";
@@ -7594,6 +7774,118 @@ TEST_CASE("Site3 terrestrial sample water sources produce cached paths", "[water
         emitters,
         sourceSettings);
     CHECK_FALSE(anchors.points.empty());
+}
+
+TEST_CASE("SampleScene combined water support source descends in Z", "[water][sample][.]") {
+    const auto sampleRoot = DataRoot() / "SampleScene";
+    const auto rockPath = sampleRoot / "Site3-ROCK-1mm.Sample.ply";
+    const auto sandPath = sampleRoot / "Site3-SAND-2mm.Sample.ply";
+    const auto vegPath = sampleRoot / "Site3-VEG-1mm.Sample.ply";
+    if (!std::filesystem::exists(rockPath) ||
+        !std::filesystem::exists(sandPath) ||
+        !std::filesystem::exists(vegPath)) {
+        SKIP("SampleScene multi-cloud fixture is not present in the local Data directory.");
+    }
+
+    const auto rockResult = invisible_places::io::LoadPointCloud(rockPath);
+    const auto sandResult = invisible_places::io::LoadPointCloud(sandPath);
+    const auto vegResult = invisible_places::io::LoadPointCloud(vegPath);
+    REQUIRE(rockResult.success);
+    REQUIRE(sandResult.success);
+    REQUIRE(vegResult.success);
+
+    auto sourceSettings = invisible_places::water::DefaultWaterSourceSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    sourceSettings.path.autoTune = true;
+    sourceSettings.path.supportVoxelSize = 0.006F;
+    sourceSettings.path.maxBridgeDistance = 0.065F;
+    sourceSettings.path.pathSampleSpacing = 0.006F;
+    sourceSettings.path.pathLength = 2.20F;
+    sourceSettings.path.branching = 0.55F;
+    sourceSettings.path.coverage = 0.85F;
+    sourceSettings.path.gapTolerance = 0.70F;
+    sourceSettings.path.maxSteps = 1000U;
+    sourceSettings.path.supportSampleLimit = 650000U;
+
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 3> layers{
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &rockResult.cloud,
+            .role = "ROCK",
+            .pointSpacingMeters = 0.001F,
+            .samplingMultiplier = 1.0F},
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &sandResult.cloud,
+            .role = "SAND",
+            .pointSpacingMeters = 0.002F,
+            .samplingMultiplier = 2.0F},
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &vegResult.cloud,
+            .role = "VEG",
+            .pointSpacingMeters = 0.001F,
+            .samplingMultiplier = 2.0F},
+    };
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 207U;
+    emitter.name = "SampleScene source";
+    emitter.position = {307.658F, 102.342F, 2.219F};
+    emitter.radius = 0.030F;
+    emitter.confidence = 1.0F;
+    const std::array<invisible_places::io::Float3, 1> sourcePoints{{emitter.position}};
+
+    const auto combined = invisible_places::water::BuildCombinedWaterSupportCloud(
+        layers,
+        sourceSettings.path,
+        sourcePoints);
+    REQUIRE(combined.PointCount() > 1000U);
+    CHECK(combined.hasNormals);
+    const glm::vec3 source{emitter.position.x, emitter.position.y, emitter.position.z};
+    const auto sourceNeighbourCount = static_cast<std::size_t>(std::count_if(
+        combined.positions.begin(),
+        combined.positions.end(),
+        [&](const invisible_places::io::Float3& point) {
+            const glm::vec3 delta{point.x - source.x, point.y - source.y, point.z - source.z};
+            return glm::dot(delta, delta) <= 0.35F * 0.35F;
+        }));
+    CHECK(sourceNeighbourCount > 96U);
+
+    const auto cache = invisible_places::water::GenerateWaterPathCache(
+        combined,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        sourceSettings);
+    const auto mainBranch = std::find_if(
+        cache.branches.begin(),
+        cache.branches.end(),
+        [](const invisible_places::water::WaterPathBranch& branch) {
+            return branch.role == invisible_places::water::WaterPathBranchRole::Main;
+        });
+    REQUIRE(mainBranch != cache.branches.end());
+    REQUIRE(mainBranch->rawAnchors.size() > 8U);
+
+    const auto stats = ComputeWaterPathDropStats(mainBranch->rawAnchors);
+    const auto& start = mainBranch->rawAnchors.front().position;
+    const auto& end = mainBranch->rawAnchors.back().position;
+    CAPTURE(
+        combined.PointCount(),
+        sourceNeighbourCount,
+        cache.diagnostics.summary,
+        stats.totalLength,
+        stats.totalDrop,
+        stats.uphillAmount,
+        stats.lateralDistance,
+        start.x,
+        start.y,
+        start.z,
+        end.x,
+        end.y,
+        end.z);
+    CHECK(cache.diagnostics.estimatedPointSpacing > 0.0F);
+    CHECK(cache.tunedSettings.pathSampleSpacing <= 0.008F);
+    CHECK(stats.totalDrop > 0.045F);
+    CHECK(stats.downhillSegmentCount >= stats.segmentCount * 55U / 100U);
+    CHECK(stats.uphillAmount < stats.totalDrop * 0.65F + 0.035F);
+    CHECK(stats.largestUphillStep < 0.035F);
+    CHECK(end.z < start.z - 0.040F);
 }
 
 TEST_CASE("Water path cache branches across flat fan support", "[water]") {

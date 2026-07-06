@@ -505,15 +505,31 @@ std::vector<RankedNeighbour> RankDownhillNeighbours(
         }
 
         const float zDrop = current.position.z - candidate.position.z;
+        const float inverseDistance = 1.0F / std::max(1.0e-5F, distance);
+        const float horizontalDistance = glm::length(glm::vec2{delta.x, delta.y});
+        const float horizontalRatio = horizontalDistance * inverseDistance;
+        const float dropRatio = zDrop * inverseDistance;
+        const float usefulDrop = std::max(preferredStep * 0.10F, searchRadius * 0.012F);
+        const float strongDrop = std::max(preferredStep * 0.32F, searchRadius * 0.045F);
         const float alignment = glm::dot(glm::normalize(delta), direction);
-        const float downhillScore = zDrop / std::max(0.02F, distance);
-        const float uphillPenalty = zDrop < -settings.maxBridgeDistance * 0.12F ? std::abs(zDrop) * 8.0F : 0.0F;
+        const float downhillScore = zDrop / std::max(0.012F, distance);
+        const float uphillPenalty = zDrop < -settings.maxBridgeDistance * 0.08F ? std::abs(zDrop) * 12.0F : 0.0F;
         const float bridgeAmount = SmoothStep(bridgeStart, searchRadius, distance);
         const float beyondSoftBridge = SmoothStep(softBridgeLimit, searchRadius, distance);
         const float bridgePenalty =
             (distance / std::max(0.01F, searchRadius)) * 0.55F +
             bridgeAmount * (0.30F + (1.0F - gapTolerance) * 1.05F) +
             beyondSoftBridge * (2.35F - gapTolerance * 1.45F);
+        const float downhillProgress = Clamp01(zDrop / std::max(1.0e-5F, strongDrop));
+        const float lateralWithoutDrop = zDrop < usefulDrop ? Clamp01(horizontalRatio) : 0.0F;
+        const float lateralBridgePenalty =
+            lateralWithoutDrop *
+            (0.62F + bridgeAmount * (0.55F + (1.0F - gapTolerance) * 0.65F) + beyondSoftBridge * 1.80F);
+        const float contourBridgePenalty =
+            (zDrop < usefulDrop)
+                ? SmoothStep(preferredStep * 1.35F, searchRadius, horizontalDistance) *
+                      (0.42F + beyondSoftBridge * 1.65F)
+                : 0.0F;
         const float normalCoherence = current.hasNormal && candidate.hasNormal
                                           ? Clamp01((glm::dot(current.normal, candidate.normal) + 1.0F) * 0.5F)
                                           : 0.55F;
@@ -527,16 +543,30 @@ std::vector<RankedNeighbour> RankDownhillNeighbours(
             bridgeJump
                 ? std::clamp(0.52F + gapTolerance * 0.34F - beyondSoftBridge * 0.18F, 0.28F, 0.92F)
                 : 1.0F;
+        const float zProgressBias =
+            std::clamp(dropRatio, -1.0F, 1.0F) * 1.65F +
+            downhillProgress * 1.10F;
         const float score =
-            (downhillScore * 3.2F) +
-            (alignment * 1.9F) +
-            (candidate.confidence * 1.6F) +
-            (normalCoherence * 0.55F) -
+            (downhillScore * 4.15F) +
+            (alignment * 1.35F) +
+            (candidate.confidence * 1.25F) +
+            (normalCoherence * 0.45F) +
+            zProgressBias -
             bridgePenalty -
-            uphillPenalty +
+            uphillPenalty -
+            lateralBridgePenalty -
+            contourBridgePenalty +
             (flatness * std::clamp(settings.branching, 0.0F, 1.0F) * 0.22F);
         const float acceptanceThreshold = 1.45F + beyondSoftBridge * (1.35F - gapTolerance * 0.85F);
-        if (zDrop > -settings.maxBridgeDistance * 0.08F || score > acceptanceThreshold) {
+        const float uphillAllowance = settings.maxBridgeDistance * (0.012F + gapTolerance * 0.030F);
+        const bool acceptedDownhill = zDrop >= usefulDrop;
+        const bool acceptedFlatLocal =
+            zDrop >= -uphillAllowance &&
+            distance <= bridgeStart * (1.15F + gapTolerance * 0.55F);
+        const bool acceptedByScore =
+            score > acceptanceThreshold &&
+            zDrop >= -uphillAllowance * (1.50F + gapTolerance);
+        if (acceptedDownhill || acceptedFlatLocal || acceptedByScore) {
             ranked.push_back({
                 .supportIndex = candidateIndex,
                 .score = score,
@@ -1240,12 +1270,16 @@ std::vector<WaterOverlayPoint> BuildOffsetTrailLanePath(
         auto lanePoint = guidePath[index];
         const glm::vec3 tangent = WaterPathTangent(guidePath, index);
         const glm::vec3 lateral = WaterPathLateral(tangent);
+        const float horizontalTangent = glm::length(glm::vec2{tangent.x, tangent.y});
+        const float verticalLaneTightening = 0.22F + SmoothStep(0.18F, 0.70F, horizontalTangent) * 0.78F;
         const float guideSteepness = std::max(lanePoint.surfaceSteepness, FallbackPathTurbulence(guidePath, index));
         const float endpointFade =
             std::min(
                 SmoothStep(0.0F, 2.0F, static_cast<float>(index)),
                 SmoothStep(0.0F, 2.0F, static_cast<float>((guidePath.size() - 1U) - index)));
-        const float maxOffset = std::max(0.0F, lanePoint.width * jitter * (0.28F + looseness * 0.34F) * endpointFade);
+        const float maxOffset = std::max(
+            0.0F,
+            lanePoint.width * jitter * (0.28F + looseness * 0.34F) * endpointFade * verticalLaneTightening);
         const float lowFrequencyWander =
             std::sin(
                 lanePoint.pathDistance * (0.72F + laneSeed * 1.45F) +
