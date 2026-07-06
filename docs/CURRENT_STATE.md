@@ -31,7 +31,7 @@ This document describes the implemented project surface for future edits. Eviden
 - Ripple and Field regions use the authored clicked polygon boundary for containment, so concave regions preserve their cut-out areas.
 - Ripple and Field share one region-selection path that exposes selected base point indices, edge weights, normals, scalar values, field vectors, and manual control flags.
 - Flow path cache reuse, hidden branch IDs, smoothing refresh, support-layer signatures, and baked path anchors are part of the saved/reloaded water workflow.
-- Grouped ROCK/SAND/VEG scenes build combined water support without creating a full merged GPU point buffer. ROCK is sampled at the reference detail, while SAND and VEG use lighter role multipliers by default.
+- Grouped ROCK/SAND/VEG scenes build combined water support from the active scene, not from an individually selected child layer. ROCK is the canonical high-detail support owner, while SAND and VEG use lighter role multipliers by default without creating a full merged GPU point buffer.
 - Flow Lanes animate Trail points from stream age, seed, speed, wetness, confidence, width, and render time. Playback changes do not require topology regeneration; internal `stream_*` scalar names remain the renderer contract.
 - Field supports user-defined Surface Motion, No Flow, Bridge Allowed, and Bridge Blocked regions.
 - Region-built Field vector caches are saved under `Saved/water/<source-stem>-WaterFieldCache.bin` and reused when support, settings, and region fingerprints match. Path-anchor Field caches are currently rebuilt from Flow path anchors and kept in memory.
@@ -44,6 +44,7 @@ This document describes the implemented project surface for future edits. Eviden
 
 - Project serialization uses schema version 26 for the current project shape.
 - Project documents persist scene grouping metadata, role names, inferred/manual point spacing, selected scene variants, Water v2 emitters, Ripple layers, Field layers, Flow Path/Lanes/Trail profiles, Field settings, Field stream settings, base-cloud water visuals, and water path cache data.
+- Camera shots and animation paths associate grouped point-cloud work with the scene folder, not the individual ROCK/SAND/VEG child PLY paths. Older child-path associations are canonicalized to the scene when loaded.
 - Project documents also preserve water animation trail settings/profiles and caustic look settings for legacy animation and visual compatibility.
 - Standalone water-source documents persist the same active Water v2 surface needed to reload sources independently from projects.
 - Animation paths preserve water caustic look settings for current visual style compatibility.

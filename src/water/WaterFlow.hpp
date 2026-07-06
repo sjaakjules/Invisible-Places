@@ -365,6 +365,69 @@ struct WaterFieldTrailSettings {
     bool fadeOnLowConfidence = true;
 };
 
+enum class WaterRainIntensityPreset {
+    LightMist,
+    Rain,
+    HeavyDownpour
+};
+
+struct WaterRainSettings {
+    bool enabled = false;
+    WaterRainIntensityPreset intensityPreset = WaterRainIntensityPreset::Rain;
+    std::uint32_t dropCount = 900;
+    float fallSpeedMetersPerSecond = 8.0F;
+    float spawnHeightMeters = 4.0F;
+    float spawnRadiusMeters = 6.0F;
+    float spawnOutOfFrameMargin = 0.18F;
+    float surfaceSearchRadiusMeters = 0.20F;
+    float downhillSearchRadiusMeters = 1.20F;
+    float killBelowSceneMeters = 3.0F;
+    float cameraDeathDistanceMeters = 28.0F;
+    float surfaceRunSpeedMetersPerSecond = 1.05F;
+    float sandRunDistanceMeters = 0.65F;
+    float windDirectionX = 1.0F;
+    float windDirectionY = 0.0F;
+    float windStrengthMeters = 0.30F;
+    float windNoise = 0.45F;
+    float windResponse = 0.50F;
+    float trailLengthMeters = 0.75F;
+    float trailPointSpacingMeters = 0.18F;
+    float trailWidthMeters = 0.004F;
+    float trailStreakLengthMeters = 0.12F;
+    std::uint32_t routeAnchorCount = 10;
+    std::uint32_t supportSampleLimit = 250000;
+    std::uint32_t seed = 101U;
+};
+
+struct WaterRainCameraFrame {
+    invisible_places::io::Float3 position{};
+    invisible_places::io::Float3 target{};
+    float fovDegrees = 55.0F;
+    float aspectRatio = 1.0F;
+};
+
+struct WaterRainDiagnostics {
+    std::uint32_t requestedDropCount = 0;
+    std::uint32_t emittedDropCount = 0;
+    std::uint32_t emittedSampleCount = 0;
+    std::uint32_t routeAnchorCount = 0;
+    std::uint32_t firstSupportHitCount = 0;
+    std::uint32_t sandTerminationCount = 0;
+    std::uint32_t fallbackTerminationCount = 0;
+    std::uint32_t noSupportKillCount = 0;
+};
+
+inline constexpr float kWaterTrailFeatureTypeRain = 4.0F;
+
+[[nodiscard]] std::array<WaterRainIntensityPreset, 3> AllWaterRainIntensityPresets();
+[[nodiscard]] std::string_view WaterRainIntensityPresetLabel(WaterRainIntensityPreset preset);
+[[nodiscard]] std::string_view WaterRainIntensityPresetNameForStorage(WaterRainIntensityPreset preset);
+[[nodiscard]] std::optional<WaterRainIntensityPreset> ParseWaterRainIntensityPresetName(std::string_view value);
+[[nodiscard]] WaterRainSettings DefaultWaterRainSettings();
+[[nodiscard]] WaterRainSettings ApplyWaterRainIntensityPreset(
+    WaterRainSettings settings,
+    WaterRainIntensityPreset preset);
+
 struct WaterFieldNode {
     invisible_places::io::Float3 position{};
     invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
@@ -987,6 +1050,11 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterFieldCache& fieldCache,
     const WaterFieldTrailSettings& settings,
     const std::vector<WaterEmitter>& emitters);
+[[nodiscard]] WaterTrailOverlay BuildRainTrailOverlay(
+    std::span<const WaterSceneSupportLayer> supportLayers,
+    const WaterRainCameraFrame& cameraFrame,
+    const WaterRainSettings& settings,
+    WaterRainDiagnostics* diagnostics = nullptr);
 [[nodiscard]] WaterEffectOverlay GenerateRippleEffectOverlay(
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEffectLayer>& layers);

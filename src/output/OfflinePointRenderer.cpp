@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
@@ -46,6 +47,7 @@ constexpr std::size_t kWaterTrailAgeFieldSlot = 15U;
 constexpr std::size_t kWaterTrailSpeedFieldSlot = 16U;
 constexpr std::size_t kWaterTrailWidthFieldSlot = 17U;
 constexpr std::size_t kWaterTrailStreakLengthFieldSlot = 18U;
+constexpr std::size_t kWaterTrailFeatureTypeFieldSlot = 21U;
 constexpr std::size_t kWaterTrailTangentXFieldSlot = 22U;
 constexpr std::size_t kWaterTrailTangentYFieldSlot = 23U;
 constexpr std::size_t kWaterTrailTangentZFieldSlot = 24U;
@@ -56,6 +58,7 @@ constexpr std::size_t kWaterTrailLaneSpanFieldSlot = 28U;
 constexpr std::size_t kWaterTrailLaneCrossingFieldSlot = 29U;
 constexpr std::size_t kWaterTrailCrossSeedFieldSlot = 30U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
+constexpr float kWaterTrailFeatureTypeRain = 4.0F;
 
 float Clamp01(float value) {
     return std::clamp(value, 0.0F, 1.0F);
@@ -464,10 +467,23 @@ float WaterTrailTravelPhase(
     return trailStartPhase + trailDistance / routeLength;
 }
 
+bool WaterTrailIsRain(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex) {
+    if (cloud.scalarFields.size() <= kWaterTrailFeatureTypeFieldSlot) {
+        return false;
+    }
+    const float featureType = ScalarFieldValueBySlot(cloud, kWaterTrailFeatureTypeFieldSlot, pointIndex);
+    return featureType > kWaterTrailFeatureTypeRain - 0.5F &&
+           featureType < kWaterTrailFeatureTypeRain + 0.5F;
+}
+
 float WaterTrailVisibility(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
-    float timeSeconds) {
+    float timeSeconds,
+    const glm::vec3& worldCenter,
+    const glm::vec3& cameraPosition) {
     if (ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F) {
         return 0.0F;
     }
@@ -475,8 +491,21 @@ float WaterTrailVisibility(
     const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength =
         std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailStreakLengthFieldSlot, pointIndex));
-    const float endFeather = std::clamp(trailStreakLength / routeLength, 0.001F, 0.08F);
-    return 1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase);
+    const float endFeather = std::clamp(trailStreakLength / routeLength, 0.001F, 0.10F);
+    const float endFade = 1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase);
+    if (!WaterTrailIsRain(cloud, pointIndex)) {
+        return endFade;
+    }
+    const float birthFeather = std::clamp(trailStreakLength / routeLength, 0.003F, 0.12F);
+    const float birthFade = SmoothStep(0.0F, birthFeather, phase);
+    const float cameraDeathDistance =
+        std::max(0.1F, ScalarFieldValueBySlot(cloud, kWaterTrailLaneSpanFieldSlot, pointIndex));
+    const float cameraDistance = glm::length(worldCenter - cameraPosition);
+    const float cameraFade =
+        1.0F - SmoothStep(cameraDeathDistance * 0.82F, cameraDeathDistance, cameraDistance);
+    const float pointAge = Clamp01(ScalarFieldValueBySlot(cloud, kWaterTrailPointAgeFieldSlot, pointIndex));
+    const float tailFade = 1.0F - SmoothStep(0.86F, 1.0F, pointAge);
+    return birthFade * endFade * cameraFade * tailFade;
 }
 
 bool WaterTrailRouteValid(
@@ -486,6 +515,47 @@ bool WaterTrailRouteValid(
     return routeCount >= 2U &&
            routeStart < cloud.positions.size() &&
            routeStart + routeCount <= cloud.positions.size();
+}
+
+std::pair<std::size_t, float> WaterTrailRouteSegment(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    float phase,
+    bool timedAnchors) {
+    const auto routeStart = WaterTrailRouteStart(cloud, pointIndex);
+    const auto routeCount = WaterTrailRouteCount(cloud, pointIndex);
+    if (!WaterTrailRouteValid(cloud, routeStart, routeCount)) {
+        return {0U, 0.0F};
+    }
+
+    const float routePhase = PositiveFract(phase);
+    if (timedAnchors) {
+        for (std::size_t offset = 0; offset + 1U < routeCount; ++offset) {
+            const float startPhase = std::clamp(
+                ScalarFieldValueBySlot(cloud, kWaterTrailStartPhaseFieldSlot, routeStart + offset),
+                0.0F,
+                1.0F);
+            const float rawEndPhase = std::clamp(
+                ScalarFieldValueBySlot(cloud, kWaterTrailStartPhaseFieldSlot, routeStart + offset + 1U),
+                0.0F,
+                1.0F);
+            const float endPhase = std::max(startPhase + 0.0001F, rawEndPhase);
+            if (routePhase <= endPhase || offset + 2U >= routeCount) {
+                const float t = std::clamp(
+                    (routePhase - startPhase) / std::max(0.0001F, endPhase - startPhase),
+                    0.0F,
+                    1.0F);
+                return {std::min<std::size_t>(offset, routeCount - 2U), t};
+            }
+        }
+        return {routeCount - 2U, 1.0F};
+    }
+
+    const float routePosition = routePhase * static_cast<float>(routeCount - 1U);
+    const auto anchorOffset = std::min<std::size_t>(
+        static_cast<std::size_t>(std::floor(routePosition)),
+        routeCount - 2U);
+    return {anchorOffset, PositiveFract(routePosition)};
 }
 
 glm::vec3 WaterTrailRoutePosition(
@@ -499,11 +569,7 @@ glm::vec3 WaterTrailRoutePosition(
         return fallbackPosition;
     }
 
-    const float routePosition = PositiveFract(phase) * static_cast<float>(routeCount - 1U);
-    const auto anchorOffset = std::min<std::size_t>(
-        static_cast<std::size_t>(std::floor(routePosition)),
-        routeCount - 1U);
-    const float t = PositiveFract(routePosition);
+    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase, WaterTrailIsRain(cloud, pointIndex));
     const auto p0Offset = anchorOffset > 0U ? anchorOffset - 1U : anchorOffset;
     const auto p1Offset = anchorOffset;
     const auto p2Offset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
@@ -530,11 +596,9 @@ glm::vec3 WaterTrailRouteTangent(
         return glm::dot(tangent, tangent) > 1.0e-8F ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
     }
 
-    const float routePosition = PositiveFract(phase) * static_cast<float>(routeCount - 1U);
-    const auto anchorOffset = std::min<std::size_t>(
-        static_cast<std::size_t>(std::floor(routePosition)),
-        routeCount - 1U);
-    const auto previousOffset = anchorOffset > 0U ? anchorOffset - 1U : anchorOffset;
+    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase, WaterTrailIsRain(cloud, pointIndex));
+    (void)t;
+    const auto previousOffset = anchorOffset;
     const auto nextOffset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
     const glm::vec3 tangent =
         ToGlm(cloud.positions[routeStart + nextOffset]) -
@@ -557,11 +621,7 @@ glm::vec3 WaterTrailRouteNormal(
         return glm::dot(normal, normal) > 1.0e-8F ? glm::normalize(normal) : glm::vec3{0.0F, 0.0F, 1.0F};
     }
 
-    const float routePosition = PositiveFract(phase) * static_cast<float>(routeCount - 1U);
-    const auto anchorOffset = std::min<std::size_t>(
-        static_cast<std::size_t>(std::floor(routePosition)),
-        routeCount - 1U);
-    const float t = PositiveFract(routePosition);
+    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase, WaterTrailIsRain(cloud, pointIndex));
     const auto p1Offset = anchorOffset;
     const auto p2Offset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
     const glm::vec3 p1 = routeStart + p1Offset < cloud.normals.size()
@@ -590,7 +650,22 @@ glm::vec3 ResolveWaterTrailPosition(
         lateral = glm::normalize(lateral);
     }
     const float lateralOffset = ScalarFieldValueBySlot(cloud, kWaterTrailLateralOffsetFieldSlot, pointIndex);
-    return routePosition + lateral * lateralOffset;
+    glm::vec3 position = routePosition + lateral * lateralOffset;
+    if (WaterTrailIsRain(cloud, pointIndex)) {
+        const float windStrength =
+            std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailLanePitchFieldSlot, pointIndex));
+        const float windResponse =
+            std::clamp(ScalarFieldValueBySlot(cloud, kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0F, 2.0F);
+        const float seed = ScalarFieldValueBySlot(cloud, kWaterTrailCrossSeedFieldSlot, pointIndex);
+        const float pointSeed =
+            ScalarFieldValueBySlot(cloud, kWaterTrailPointAgeFieldSlot, pointIndex) +
+            ScalarFieldValueBySlot(cloud, kWaterTrailDistanceFieldSlot, pointIndex) * 0.013F;
+        const float sway =
+            std::sin((timeSeconds * (1.7F + seed) + seed * 17.31F + pointSeed * 5.13F) * 6.28318530718F) *
+            windStrength * windResponse * 0.055F;
+        position += lateral * sway;
+    }
+    return position;
 }
 
 glm::vec3 JitteredWaterAnchorPosition(
@@ -1550,9 +1625,6 @@ bool BuildOfflinePointSample(
     const auto& point = cloud.positions[pointIndex];
     glm::vec3 localPoint{point.x, point.y, point.z};
     if (waterTrails) {
-        if (WaterTrailVisibility(cloud, pointIndex, stylisationTimeSeconds) <= 0.0F) {
-            return false;
-        }
         localPoint = ResolveWaterTrailPosition(cloud, pointIndex, stylisationTimeSeconds, localPoint);
     }
     if (waterParticles && !layer.style.waterPathView && waterParticleRole >= 0.5F && waterParticleRole < 1.5F) {
@@ -1566,6 +1638,15 @@ bool BuildOfflinePointSample(
     }
 
     const glm::vec4 normalizedWorld = worldPosition / worldPosition.w;
+    if (waterTrails &&
+        WaterTrailVisibility(
+            cloud,
+            pointIndex,
+            stylisationTimeSeconds,
+            glm::vec3{normalizedWorld},
+            matrices.position) <= 0.0F) {
+        return false;
+    }
     const glm::vec4 viewPosition = matrices.view * normalizedWorld;
     const float viewDepth = -viewPosition.z;
     if (viewDepth <= cameraState.nearPlane || viewDepth >= cameraState.farPlane) {
@@ -2065,6 +2146,15 @@ void RenderFastBasicPointCloudTile(
             }
             const glm::vec4 worldPosition4 = layer.localToWorld * glm::vec4{localPosition, 1.0F};
             const glm::vec3 worldPosition{worldPosition4};
+            if (waterTrails &&
+                WaterTrailVisibility(
+                    cloud,
+                    pointIndex,
+                    stylisationTimeSeconds,
+                    worldPosition,
+                    matrices.position) <= 0.0F) {
+                continue;
+            }
             const glm::vec4 viewPosition = matrices.view * glm::vec4{worldPosition, 1.0F};
             const float viewDepth = -viewPosition.z;
             if (viewDepth <= 0.0F) {

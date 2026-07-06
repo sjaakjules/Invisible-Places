@@ -244,6 +244,105 @@ invisible_places::io::LoadedPointCloud MakeRippleRuntimeFixtureCloud() {
     return cloud;
 }
 
+invisible_places::io::LoadedPointCloud MakeRainSupportFixtureCloud(
+    std::string_view layerName,
+    float z,
+    float xOffset = 0.0F,
+    float yOffset = 0.0F,
+    std::uint32_t gridSize = 11U,
+    float halfExtent = 1.25F) {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = std::string{layerName} + ".ply";
+    cloud.layerName = std::string{layerName};
+    cloud.hasNormals = true;
+    cloud.hasSourceRgb = true;
+    const auto safeGridSize = std::max<std::uint32_t>(2U, gridSize);
+    cloud.positions.reserve(safeGridSize * safeGridSize);
+    cloud.normals.reserve(safeGridSize * safeGridSize);
+    cloud.packedColors.reserve(safeGridSize * safeGridSize);
+    for (std::uint32_t y = 0; y < safeGridSize; ++y) {
+        for (std::uint32_t x = 0; x < safeGridSize; ++x) {
+            const float tx = static_cast<float>(x) / static_cast<float>(safeGridSize - 1U);
+            const float ty = static_cast<float>(y) / static_cast<float>(safeGridSize - 1U);
+            const invisible_places::io::Float3 point{
+                xOffset + (tx - 0.5F) * halfExtent * 2.0F,
+                yOffset + (ty - 0.5F) * halfExtent * 2.0F,
+                z};
+            cloud.positions.push_back(point);
+            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xffffffffU);
+            cloud.bounds.Expand(point);
+        }
+    }
+    cloud.hasFocusPoint = true;
+    cloud.focusPoint = {xOffset, yOffset, z};
+    return cloud;
+}
+
+invisible_places::io::LoadedPointCloud MakeRainSupportLineCloud(
+    std::string_view layerName,
+    std::span<const invisible_places::io::Float3> points) {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = std::string{layerName} + ".ply";
+    cloud.layerName = std::string{layerName};
+    cloud.hasNormals = true;
+    cloud.hasSourceRgb = true;
+    cloud.positions.reserve(points.size());
+    cloud.normals.reserve(points.size());
+    cloud.packedColors.reserve(points.size());
+    for (const auto& point : points) {
+        cloud.positions.push_back(point);
+        cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+        cloud.packedColors.push_back(0xffffffffU);
+        cloud.bounds.Expand(point);
+    }
+    if (!points.empty()) {
+        cloud.hasFocusPoint = true;
+        cloud.focusPoint = points.front();
+    }
+    return cloud;
+}
+
+invisible_places::water::WaterRainCameraFrame MakeRainFixtureCameraFrame() {
+    invisible_places::water::WaterRainCameraFrame frame;
+    frame.position = {0.0F, -2.25F, 1.35F};
+    frame.target = {0.0F, 0.0F, 0.0F};
+    frame.fovDegrees = 24.0F;
+    frame.aspectRatio = 1.0F;
+    return frame;
+}
+
+invisible_places::water::WaterRainSettings MakeRainFixtureSettings(std::uint32_t dropCount = 16U) {
+    auto settings = invisible_places::water::ApplyWaterRainIntensityPreset(
+        invisible_places::water::DefaultWaterRainSettings(),
+        invisible_places::water::WaterRainIntensityPreset::Rain);
+    settings.enabled = true;
+    settings.dropCount = dropCount;
+    settings.fallSpeedMetersPerSecond = 6.0F;
+    settings.spawnHeightMeters = 1.25F;
+    settings.spawnRadiusMeters = 0.20F;
+    settings.spawnOutOfFrameMargin = 0.10F;
+    settings.surfaceSearchRadiusMeters = 0.35F;
+    settings.downhillSearchRadiusMeters = 2.0F;
+    settings.killBelowSceneMeters = 0.75F;
+    settings.cameraDeathDistanceMeters = 7.25F;
+    settings.surfaceRunSpeedMetersPerSecond = 0.75F;
+    settings.sandRunDistanceMeters = 0.35F;
+    settings.windDirectionX = 1.0F;
+    settings.windDirectionY = 0.25F;
+    settings.windStrengthMeters = 0.24F;
+    settings.windNoise = 0.35F;
+    settings.windResponse = 0.50F;
+    settings.trailLengthMeters = 0.36F;
+    settings.trailPointSpacingMeters = 0.18F;
+    settings.trailWidthMeters = 0.004F;
+    settings.trailStreakLengthMeters = 0.11F;
+    settings.routeAnchorCount = 10U;
+    settings.supportSampleLimit = 4096U;
+    settings.seed = 411U;
+    return settings;
+}
+
 struct RuntimeRippleSample {
     std::uint32_t pointIndex = 0U;
     float x = 0.0F;
@@ -1047,6 +1146,39 @@ TEST_CASE("Shoreline wave height mask fades around the sand-rock boundary", "[wa
     CHECK(ShorelineWaveHeightMask(boundaryZ, reach, fade, 1.40F) > 0.95F);
     CHECK(ShorelineWaveHeightMask(boundaryZ, reach, fade, 1.08F) > 0.0F);
     CHECK(ShorelineWaveHeightMask(boundaryZ, reach, fade, 0.99F) == Catch::Approx(0.0F));
+}
+
+TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shoreline][shader]") {
+    const auto shaderPath = DataRoot().parent_path() / "shaders" / "pointcloud_sparse_ripple.glsl";
+    std::ifstream input{shaderPath};
+    REQUIRE(input.good());
+    const std::string shader{
+        std::istreambuf_iterator<char>{input},
+        std::istreambuf_iterator<char>{}};
+
+    const auto helperPos = shader.find("float SandCloudShorelineWaveValue(");
+    REQUIRE(helperPos != std::string::npos);
+    const auto helperEnd = shader.find("\n}\n\nfloat RippleWetSheenValue", helperPos);
+    REQUIRE(helperEnd != std::string::npos);
+    const auto helperBody = shader.substr(helperPos, helperEnd - helperPos);
+    CHECK(helperBody.find("const float alongShore = uv.y;") != std::string::npos);
+    CHECK(helperBody.find("finishOffset - max(0.0, shoreDistance)") != std::string::npos);
+    CHECK(helperBody.find("const float incomingMask") != std::string::npos);
+    CHECK(helperBody.find("const float arrivingFoam") != std::string::npos);
+    CHECK(helperBody.find("const vec2 waveFrontStreakUv") != std::string::npos);
+    CHECK(helperBody.find("const float waveFrontStreakNoise") != std::string::npos);
+    CHECK(helperBody.find("const float incomingFollowMask") != std::string::npos);
+    CHECK(helperBody.find("const float trailDistance = max(0.0, front);") != std::string::npos);
+    CHECK(helperBody.find("const float returnFollowMask") != std::string::npos);
+    CHECK(helperBody.find("const float edgeIntroduce = smoothstep(0.0, 0.18, returnProgress);") != std::string::npos);
+
+    const auto evaluatePos = shader.find("SparseRippleComposite EvaluateShorelineWaveContribution(");
+    REQUIRE(evaluatePos != std::string::npos);
+    const auto evaluateEnd = shader.find("SparseRippleComposite EvaluateSparseRippleContribution", evaluatePos);
+    REQUIRE(evaluateEnd != std::string::npos);
+    const auto evaluateBody = shader.substr(evaluatePos, evaluateEnd - evaluatePos);
+    CHECK(evaluateBody.find("SandCloudShorelineWaveValue(") != std::string::npos);
+    CHECK(evaluateBody.find("RippleTideBandsValue(") == std::string::npos);
 }
 
 TEST_CASE("Shoreline wave defaults are visible when enabled", "[water][shoreline][pointcloud]") {
@@ -3488,6 +3620,327 @@ TEST_CASE("Water v2 trails expose deterministic scalar contracts", "[water][v2]"
     const auto surfaceMotion = invisible_places::water::GenerateFieldSurfaceEffectOverlay(fieldCacheA, fieldLayer);
     REQUIRE_FALSE(surfaceMotion.points.empty());
     CHECK(surfaceMotion.points.front().featureType == Catch::Approx(2.0F));
+}
+
+TEST_CASE("Water Rain intensity presets scale density speed wind and visual strength", "[water][rain]") {
+    using invisible_places::water::ApplyWaterRainIntensityPreset;
+    using invisible_places::water::DefaultWaterRainSettings;
+    using invisible_places::water::WaterRainIntensityPreset;
+
+    const auto light = ApplyWaterRainIntensityPreset(
+        DefaultWaterRainSettings(),
+        WaterRainIntensityPreset::LightMist);
+    const auto rain = ApplyWaterRainIntensityPreset(
+        DefaultWaterRainSettings(),
+        WaterRainIntensityPreset::Rain);
+    const auto downpour = ApplyWaterRainIntensityPreset(
+        DefaultWaterRainSettings(),
+        WaterRainIntensityPreset::HeavyDownpour);
+
+    CHECK(light.dropCount < rain.dropCount);
+    CHECK(rain.dropCount < downpour.dropCount);
+    CHECK(light.fallSpeedMetersPerSecond < rain.fallSpeedMetersPerSecond);
+    CHECK(rain.fallSpeedMetersPerSecond < downpour.fallSpeedMetersPerSecond);
+    CHECK(light.surfaceRunSpeedMetersPerSecond < rain.surfaceRunSpeedMetersPerSecond);
+    CHECK(rain.surfaceRunSpeedMetersPerSecond < downpour.surfaceRunSpeedMetersPerSecond);
+    CHECK(light.surfaceRunSpeedMetersPerSecond < light.fallSpeedMetersPerSecond);
+    CHECK(rain.surfaceRunSpeedMetersPerSecond < rain.fallSpeedMetersPerSecond);
+    CHECK(downpour.surfaceRunSpeedMetersPerSecond < downpour.fallSpeedMetersPerSecond);
+    CHECK(light.sandRunDistanceMeters < rain.sandRunDistanceMeters);
+    CHECK(rain.sandRunDistanceMeters < downpour.sandRunDistanceMeters);
+    CHECK(light.trailWidthMeters < rain.trailWidthMeters);
+    CHECK(rain.trailWidthMeters < downpour.trailWidthMeters);
+    CHECK(light.trailStreakLengthMeters < rain.trailStreakLengthMeters);
+    CHECK(rain.trailStreakLengthMeters < downpour.trailStreakLengthMeters);
+    CHECK(light.windResponse > rain.windResponse);
+    CHECK(rain.windResponse > downpour.windResponse);
+    CHECK(light.windNoise > rain.windNoise);
+    CHECK(rain.windNoise > downpour.windNoise);
+
+    const auto rock = MakeRainSupportFixtureCloud("rain-preset-rock", 0.20F);
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 1> layers{
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &rock,
+            .role = "ROCK",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+    };
+    const auto frame = MakeRainFixtureCameraFrame();
+    auto lightSettings = MakeRainFixtureSettings(4U);
+    auto rainSettings = lightSettings;
+    auto downpourSettings = lightSettings;
+    lightSettings = ApplyWaterRainIntensityPreset(lightSettings, WaterRainIntensityPreset::LightMist);
+    rainSettings = ApplyWaterRainIntensityPreset(rainSettings, WaterRainIntensityPreset::Rain);
+    downpourSettings = ApplyWaterRainIntensityPreset(downpourSettings, WaterRainIntensityPreset::HeavyDownpour);
+    lightSettings.enabled = rainSettings.enabled = downpourSettings.enabled = true;
+    lightSettings.dropCount = rainSettings.dropCount = downpourSettings.dropCount = 4U;
+    lightSettings.surfaceSearchRadiusMeters =
+        rainSettings.surfaceSearchRadiusMeters =
+            downpourSettings.surfaceSearchRadiusMeters = 0.35F;
+    lightSettings.downhillSearchRadiusMeters =
+        rainSettings.downhillSearchRadiusMeters =
+            downpourSettings.downhillSearchRadiusMeters = 2.0F;
+    lightSettings.supportSampleLimit =
+        rainSettings.supportSampleLimit =
+            downpourSettings.supportSampleLimit = 4096U;
+
+    const auto lightOverlay = invisible_places::water::BuildRainTrailOverlay(layers, frame, lightSettings);
+    const auto rainOverlay = invisible_places::water::BuildRainTrailOverlay(layers, frame, rainSettings);
+    const auto downpourOverlay = invisible_places::water::BuildRainTrailOverlay(layers, frame, downpourSettings);
+    REQUIRE_FALSE(lightOverlay.samples.empty());
+    REQUIRE_FALSE(rainOverlay.samples.empty());
+    REQUIRE_FALSE(downpourOverlay.samples.empty());
+    const auto firstLightVisible = std::find_if(
+        lightOverlay.samples.begin(),
+        lightOverlay.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole >= 0.5F; });
+    const auto firstRainVisible = std::find_if(
+        rainOverlay.samples.begin(),
+        rainOverlay.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole >= 0.5F; });
+    const auto firstDownpourVisible = std::find_if(
+        downpourOverlay.samples.begin(),
+        downpourOverlay.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole >= 0.5F; });
+    REQUIRE(firstLightVisible != lightOverlay.samples.end());
+    REQUIRE(firstRainVisible != rainOverlay.samples.end());
+    REQUIRE(firstDownpourVisible != downpourOverlay.samples.end());
+    CHECK(firstLightVisible->wetness < firstRainVisible->wetness);
+    CHECK(firstRainVisible->wetness < firstDownpourVisible->wetness);
+    CHECK(firstLightVisible->trailLaneCrossing > firstRainVisible->trailLaneCrossing);
+    CHECK(firstRainVisible->trailLaneCrossing > firstDownpourVisible->trailLaneCrossing);
+}
+
+TEST_CASE("Water Rain routes deterministic falling drops to sand support", "[water][rain]") {
+    const auto rock = MakeRainSupportFixtureCloud("rain-rock", 0.24F);
+    const auto sand = MakeRainSupportFixtureCloud("rain-sand", -0.42F);
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 2> layers{
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &rock,
+            .role = "ROCK",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &sand,
+            .role = "SAND",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+    };
+    const auto frame = MakeRainFixtureCameraFrame();
+    const auto settings = MakeRainFixtureSettings(18U);
+
+    invisible_places::water::WaterRainDiagnostics diagnosticsA;
+    const auto overlayA = invisible_places::water::BuildRainTrailOverlay(
+        layers,
+        frame,
+        settings,
+        &diagnosticsA);
+    invisible_places::water::WaterRainDiagnostics diagnosticsB;
+    const auto overlayB = invisible_places::water::BuildRainTrailOverlay(
+        layers,
+        frame,
+        settings,
+        &diagnosticsB);
+
+    REQUIRE_FALSE(overlayA.samples.empty());
+    REQUIRE(overlayA.samples.size() == overlayB.samples.size());
+    CHECK(diagnosticsA.requestedDropCount == settings.dropCount);
+    CHECK(diagnosticsA.emittedDropCount == settings.dropCount);
+    CHECK(diagnosticsA.emittedSampleCount > 0U);
+    CHECK(diagnosticsA.routeAnchorCount >= settings.dropCount * 5U);
+    CHECK(diagnosticsA.firstSupportHitCount == settings.dropCount);
+    CHECK(diagnosticsA.sandTerminationCount == settings.dropCount);
+    CHECK(diagnosticsA.fallbackTerminationCount == 0U);
+    CHECK(diagnosticsA.noSupportKillCount == 0U);
+    CHECK(diagnosticsA.emittedDropCount == diagnosticsB.emittedDropCount);
+    CHECK(diagnosticsA.emittedSampleCount == diagnosticsB.emittedSampleCount);
+    CHECK(diagnosticsA.routeAnchorCount == diagnosticsB.routeAnchorCount);
+    for (std::size_t index = 0; index < std::min<std::size_t>(overlayA.samples.size(), 12U); ++index) {
+        CHECK(overlayA.samples[index].position.x == Catch::Approx(overlayB.samples[index].position.x));
+        CHECK(overlayA.samples[index].position.y == Catch::Approx(overlayB.samples[index].position.y));
+        CHECK(overlayA.samples[index].position.z == Catch::Approx(overlayB.samples[index].position.z));
+        CHECK(overlayA.samples[index].trailStartPhase == Catch::Approx(overlayB.samples[index].trailStartPhase));
+    }
+
+    const auto hiddenRouteCount = static_cast<std::uint32_t>(std::count_if(
+        overlayA.samples.begin(),
+        overlayA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole < 0.5F; }));
+    const auto visibleRainCount = static_cast<std::uint32_t>(std::count_if(
+        overlayA.samples.begin(),
+        overlayA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole >= 0.5F; }));
+    CHECK(hiddenRouteCount == diagnosticsA.routeAnchorCount);
+    CHECK(visibleRainCount == diagnosticsA.emittedSampleCount);
+
+    const auto firstRouteSample = std::find_if(
+        overlayA.samples.begin(),
+        overlayA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole < 0.5F; });
+    const auto firstVisibleSample = std::find_if(
+        overlayA.samples.begin(),
+        overlayA.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole >= 0.5F; });
+    REQUIRE(firstRouteSample != overlayA.samples.end());
+    REQUIRE(firstVisibleSample != overlayA.samples.end());
+    const auto firstVisibleIndex = static_cast<std::size_t>(
+        std::distance(overlayA.samples.begin(), firstVisibleSample));
+    CHECK(firstRouteSample->featureType == Catch::Approx(invisible_places::water::kWaterTrailFeatureTypeRain));
+    CHECK(firstVisibleSample->featureType == Catch::Approx(invisible_places::water::kWaterTrailFeatureTypeRain));
+    CHECK(firstVisibleSample->routeStartIndex + firstVisibleSample->routePointCount <=
+          static_cast<float>(overlayA.samples.size()));
+    CHECK(firstVisibleSample->routePointCount >= 5.0F);
+    CHECK(firstVisibleSample->routePointCount <= static_cast<float>(settings.routeAnchorCount));
+    CHECK(firstVisibleSample->trailLanePitch == Catch::Approx(settings.windStrengthMeters));
+    CHECK(firstVisibleSample->trailLaneSpan == Catch::Approx(settings.cameraDeathDistanceMeters));
+    CHECK(firstVisibleSample->trailLaneCrossing == Catch::Approx(settings.windResponse));
+    CHECK(firstVisibleSample->trailStreakLength >= firstVisibleSample->trailWidth * 2.0F);
+
+    const auto cloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
+        overlayA,
+        "Saved/water/rain-RainTrails.generated",
+        "rain trails");
+    REQUIRE(cloud.PointCount() == overlayA.samples.size());
+    REQUIRE(cloud.ScalarFieldCount() == 31U);
+    CHECK(cloud.scalarFields[0].name == "trail_role");
+    CHECK(cloud.scalarFields[21].name == "feature_type");
+    CHECK(cloud.scalarFields[27].name == "trail_lane_pitch");
+    CHECK(cloud.scalarFields[28].name == "trail_lane_span");
+    CHECK(cloud.scalarFields[29].name == "trail_lane_crossing");
+    CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(21, firstVisibleIndex)] ==
+          Catch::Approx(invisible_places::water::kWaterTrailFeatureTypeRain));
+    CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(27, firstVisibleIndex)] ==
+          Catch::Approx(settings.windStrengthMeters));
+    CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(28, firstVisibleIndex)] ==
+          Catch::Approx(settings.cameraDeathDistanceMeters));
+    CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(29, firstVisibleIndex)] ==
+          Catch::Approx(settings.windResponse));
+}
+
+TEST_CASE("Water Rain follows lower support points slowly after impact", "[water][rain]") {
+    const std::array<invisible_places::io::Float3, 4> rockPoints{
+        invisible_places::io::Float3{0.00F, 0.0F, 0.55F},
+        invisible_places::io::Float3{0.12F, 0.0F, 0.48F},
+        invisible_places::io::Float3{0.24F, 0.0F, 0.40F},
+        invisible_places::io::Float3{0.34F, 0.0F, 0.35F},
+    };
+    const std::array<invisible_places::io::Float3, 3> sandPoints{
+        invisible_places::io::Float3{0.46F, 0.0F, 0.30F},
+        invisible_places::io::Float3{0.60F, 0.0F, 0.29F},
+        invisible_places::io::Float3{0.76F, 0.0F, 0.28F},
+    };
+    const auto rock = MakeRainSupportLineCloud("rain-runoff-rock", rockPoints);
+    const auto sand = MakeRainSupportLineCloud("rain-runoff-sand", sandPoints);
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 2> layers{
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &rock,
+            .role = "ROCK",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &sand,
+            .role = "SAND",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+    };
+    auto frame = MakeRainFixtureCameraFrame();
+    frame.target = {0.0F, 0.0F, 0.55F};
+    auto settings = MakeRainFixtureSettings(1U);
+    settings.spawnHeightMeters = 1.35F;
+    settings.surfaceSearchRadiusMeters = 0.50F;
+    settings.downhillSearchRadiusMeters = 0.20F;
+    settings.fallSpeedMetersPerSecond = 6.0F;
+    settings.surfaceRunSpeedMetersPerSecond = 0.45F;
+    settings.sandRunDistanceMeters = 0.24F;
+    settings.routeAnchorCount = 9U;
+    settings.seed = 712U;
+
+    invisible_places::water::WaterRainDiagnostics diagnostics;
+    const auto overlay = invisible_places::water::BuildRainTrailOverlay(
+        layers,
+        frame,
+        settings,
+        &diagnostics);
+    REQUIRE_FALSE(overlay.samples.empty());
+    CHECK(diagnostics.emittedDropCount == 1U);
+    CHECK(diagnostics.firstSupportHitCount == 1U);
+    CHECK(diagnostics.sandTerminationCount == 1U);
+    CHECK(diagnostics.fallbackTerminationCount == 0U);
+
+    std::vector<invisible_places::water::WaterTrailSample> anchors;
+    for (const auto& sample : overlay.samples) {
+        if (sample.trailRole < 0.5F && sample.pathId == Catch::Approx(1.0F)) {
+            anchors.push_back(sample);
+        }
+    }
+    REQUIRE(anchors.size() >= 6U);
+    CHECK(anchors.front().position.z > anchors[2].position.z);
+    CHECK(anchors[3].position.z < anchors[2].position.z);
+    CHECK(anchors[4].position.z < anchors[3].position.z);
+    CHECK(anchors.back().position.z <= 0.32F);
+    CHECK(anchors[2].trailStartPhase < 0.35F);
+    CHECK(1.0F - anchors[2].trailStartPhase > anchors[2].trailStartPhase);
+    CHECK(anchors.back().trailStartPhase == Catch::Approx(1.0F));
+    for (std::size_t index = 1; index < anchors.size(); ++index) {
+        CHECK(anchors[index].trailStartPhase >= anchors[index - 1U].trailStartPhase);
+    }
+}
+
+TEST_CASE("Water Rain terminates on fallback support or no-hit kill plane", "[water][rain]") {
+    const auto frame = MakeRainFixtureCameraFrame();
+    const auto settings = MakeRainFixtureSettings(10U);
+
+    SECTION("fallback support without sand") {
+        const auto rock = MakeRainSupportFixtureCloud("rain-fallback-rock", 0.12F);
+        const std::array<invisible_places::water::WaterSceneSupportLayer, 1> layers{
+            invisible_places::water::WaterSceneSupportLayer{
+                .cloud = &rock,
+                .role = "ROCK",
+                .pointSpacingMeters = 0.02F,
+                .samplingMultiplier = 1.0F},
+        };
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto overlay = invisible_places::water::BuildRainTrailOverlay(
+            layers,
+            frame,
+            settings,
+            &diagnostics);
+        REQUIRE_FALSE(overlay.samples.empty());
+        CHECK(diagnostics.emittedDropCount == settings.dropCount);
+        CHECK(diagnostics.firstSupportHitCount == settings.dropCount);
+        CHECK(diagnostics.sandTerminationCount == 0U);
+        CHECK(diagnostics.fallbackTerminationCount == settings.dropCount);
+        CHECK(diagnostics.noSupportKillCount == 0U);
+    }
+
+    SECTION("no support in camera footprint") {
+        const auto distantRock = MakeRainSupportFixtureCloud("rain-distant-rock", 0.12F, 25.0F, 25.0F);
+        const std::array<invisible_places::water::WaterSceneSupportLayer, 1> layers{
+            invisible_places::water::WaterSceneSupportLayer{
+                .cloud = &distantRock,
+                .role = "ROCK",
+                .pointSpacingMeters = 0.02F,
+                .samplingMultiplier = 1.0F},
+        };
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto overlay = invisible_places::water::BuildRainTrailOverlay(
+            layers,
+            frame,
+            settings,
+            &diagnostics);
+        REQUIRE_FALSE(overlay.samples.empty());
+        CHECK(diagnostics.emittedDropCount == settings.dropCount);
+        CHECK(diagnostics.firstSupportHitCount == 0U);
+        CHECK(diagnostics.sandTerminationCount == 0U);
+        CHECK(diagnostics.fallbackTerminationCount == 0U);
+        CHECK(diagnostics.noSupportKillCount == settings.dropCount);
+        const auto firstVisibleSample = std::find_if(
+            overlay.samples.begin(),
+            overlay.samples.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) { return sample.trailRole >= 0.5F; });
+        REQUIRE(firstVisibleSample != overlay.samples.end());
+        CHECK(firstVisibleSample->trailLaneSpan == Catch::Approx(settings.cameraDeathDistanceMeters));
+    }
 }
 
 TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][lanes]") {
@@ -7599,6 +8052,131 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         loaded->sourceSettings);
     CHECK(fallbackSettings.trailShape.splineAnchorSpacing == Catch::Approx(1.25F));
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE("Water Rain settings and trail profile selection round-trip in saved documents", "[water][rain][serialization]") {
+    auto rainSettings = invisible_places::water::ApplyWaterRainIntensityPreset(
+        invisible_places::water::DefaultWaterRainSettings(),
+        invisible_places::water::WaterRainIntensityPreset::HeavyDownpour);
+    rainSettings.enabled = true;
+    rainSettings.dropCount = 321U;
+    rainSettings.fallSpeedMetersPerSecond = 12.25F;
+    rainSettings.spawnHeightMeters = 6.5F;
+    rainSettings.spawnRadiusMeters = 8.25F;
+    rainSettings.spawnOutOfFrameMargin = 0.33F;
+    rainSettings.surfaceSearchRadiusMeters = 0.44F;
+    rainSettings.downhillSearchRadiusMeters = 2.75F;
+    rainSettings.killBelowSceneMeters = 4.5F;
+    rainSettings.cameraDeathDistanceMeters = 41.0F;
+    rainSettings.surfaceRunSpeedMetersPerSecond = 1.33F;
+    rainSettings.sandRunDistanceMeters = 0.88F;
+    rainSettings.windDirectionX = -0.5F;
+    rainSettings.windDirectionY = 0.85F;
+    rainSettings.windStrengthMeters = 0.18F;
+    rainSettings.windNoise = 0.27F;
+    rainSettings.windResponse = 0.14F;
+    rainSettings.trailLengthMeters = 1.15F;
+    rainSettings.trailPointSpacingMeters = 0.19F;
+    rainSettings.trailWidthMeters = 0.007F;
+    rainSettings.trailStreakLengthMeters = 0.26F;
+    rainSettings.routeAnchorCount = 7U;
+    rainSettings.supportSampleLimit = 12345U;
+    rainSettings.seed = 9876U;
+
+    invisible_places::serialization::WaterTrailProfileDocument customProfile;
+    customProfile.name = "Rain Custom";
+    customProfile.geometry.trailLengthMeters = 1.4F;
+    customProfile.geometry.pointSpacingMeters = 0.21F;
+    customProfile.geometry.widthMeters = 0.008F;
+    customProfile.geometry.streakLengthMeters = 0.31F;
+
+    invisible_places::serialization::ProjectDocument projectDocument;
+    projectDocument.projectName = "Rain Roundtrip";
+    projectDocument.waterRainSettings = rainSettings;
+    projectDocument.selectedWaterRainTrailProfileName = "Rain Downpour_preset";
+    projectDocument.tempWaterRainTrailProfile = customProfile;
+
+    const auto projectPath =
+        std::filesystem::temp_directory_path() / "invisible_places_rain_project_roundtrip.json";
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(projectDocument, projectPath, &errorMessage));
+    {
+        std::ifstream savedProject{projectPath};
+        nlohmann::json savedJson;
+        savedProject >> savedJson;
+        CHECK(savedJson.contains("water_rain_settings"));
+        CHECK(savedJson.contains("selected_water_rain_trail_profile"));
+        CHECK(savedJson.contains("temp_water_rain_trail_profile"));
+    }
+    const auto loadedProject = invisible_places::serialization::LoadProjectDocument(projectPath, &errorMessage);
+    REQUIRE(loadedProject.has_value());
+    CHECK(loadedProject->waterRainSettings.enabled);
+    CHECK(
+        loadedProject->waterRainSettings.intensityPreset ==
+        invisible_places::water::WaterRainIntensityPreset::HeavyDownpour);
+    CHECK(loadedProject->waterRainSettings.dropCount == 321U);
+    CHECK(loadedProject->waterRainSettings.fallSpeedMetersPerSecond == Catch::Approx(12.25F));
+    CHECK(loadedProject->waterRainSettings.spawnHeightMeters == Catch::Approx(6.5F));
+    CHECK(loadedProject->waterRainSettings.cameraDeathDistanceMeters == Catch::Approx(41.0F));
+    CHECK(loadedProject->waterRainSettings.surfaceRunSpeedMetersPerSecond == Catch::Approx(1.33F));
+    CHECK(loadedProject->waterRainSettings.sandRunDistanceMeters == Catch::Approx(0.88F));
+    CHECK(loadedProject->waterRainSettings.windStrengthMeters == Catch::Approx(0.18F));
+    CHECK(loadedProject->waterRainSettings.windResponse == Catch::Approx(0.14F));
+    CHECK(loadedProject->waterRainSettings.trailWidthMeters == Catch::Approx(0.007F));
+    CHECK(loadedProject->waterRainSettings.seed == 9876U);
+    CHECK(loadedProject->selectedWaterRainTrailProfileName == "Rain Downpour_preset");
+    REQUIRE(loadedProject->tempWaterRainTrailProfile.has_value());
+    CHECK(loadedProject->tempWaterRainTrailProfile->name == "Rain Custom");
+    CHECK(loadedProject->tempWaterRainTrailProfile->geometry.streakLengthMeters == Catch::Approx(0.31F));
+
+    const auto legacyProjectPath =
+        std::filesystem::temp_directory_path() / "invisible_places_rain_project_legacy.json";
+    {
+        std::ifstream savedProject{projectPath};
+        nlohmann::json legacyJson;
+        savedProject >> legacyJson;
+        legacyJson.erase("water_rain_settings");
+        legacyJson.erase("selected_water_rain_trail_profile");
+        legacyJson.erase("temp_water_rain_trail_profile");
+        std::ofstream legacyOutput{legacyProjectPath, std::ios::trunc};
+        legacyOutput << legacyJson.dump(2);
+    }
+    const auto legacyProject = invisible_places::serialization::LoadProjectDocument(legacyProjectPath, &errorMessage);
+    REQUIRE(legacyProject.has_value());
+    CHECK_FALSE(legacyProject->waterRainSettings.enabled);
+    CHECK(
+        legacyProject->waterRainSettings.intensityPreset ==
+        invisible_places::water::WaterRainIntensityPreset::Rain);
+    CHECK(legacyProject->selectedWaterRainTrailProfileName == "Rain Fine Lines_preset");
+    CHECK_FALSE(legacyProject->tempWaterRainTrailProfile.has_value());
+
+    invisible_places::serialization::WaterSourcesDocument sourcesDocument;
+    sourcesDocument.rainSettings = rainSettings;
+    sourcesDocument.selectedRainTrailProfileName = "Rain Mist_preset";
+    sourcesDocument.tempRainTrailProfile = customProfile;
+    sourcesDocument.tempRainTrailProfile->name = "Sources Rain Custom";
+    sourcesDocument.tempRainTrailProfile->geometry.widthMeters = 0.009F;
+    const auto sourcesPath =
+        std::filesystem::temp_directory_path() / "invisible_places_rain_sources_roundtrip.json";
+    REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(sourcesDocument, sourcesPath, &errorMessage));
+    const auto loadedSources = invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
+    REQUIRE(loadedSources.has_value());
+    CHECK(loadedSources->rainSettings.enabled);
+    CHECK(
+        loadedSources->rainSettings.intensityPreset ==
+        invisible_places::water::WaterRainIntensityPreset::HeavyDownpour);
+    CHECK(loadedSources->rainSettings.dropCount == 321U);
+    CHECK(loadedSources->rainSettings.cameraDeathDistanceMeters == Catch::Approx(41.0F));
+    CHECK(loadedSources->rainSettings.surfaceRunSpeedMetersPerSecond == Catch::Approx(1.33F));
+    CHECK(loadedSources->rainSettings.sandRunDistanceMeters == Catch::Approx(0.88F));
+    CHECK(loadedSources->selectedRainTrailProfileName == "Rain Mist_preset");
+    REQUIRE(loadedSources->tempRainTrailProfile.has_value());
+    CHECK(loadedSources->tempRainTrailProfile->name == "Sources Rain Custom");
+    CHECK(loadedSources->tempRainTrailProfile->geometry.widthMeters == Catch::Approx(0.009F));
+
+    std::filesystem::remove(projectPath);
+    std::filesystem::remove(legacyProjectPath);
+    std::filesystem::remove(sourcesPath);
 }
 
 TEST_CASE("Legacy water stream settings load and save as trail settings", "[water][serialization]") {

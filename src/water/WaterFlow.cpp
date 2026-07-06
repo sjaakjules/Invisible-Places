@@ -2714,6 +2714,106 @@ bool WaterFlowLaneSpeedOnlyEdit(
            before.speedMetersPerSecond != after.speedMetersPerSecond;
 }
 
+std::array<WaterRainIntensityPreset, 3> AllWaterRainIntensityPresets() {
+    return {
+        WaterRainIntensityPreset::LightMist,
+        WaterRainIntensityPreset::Rain,
+        WaterRainIntensityPreset::HeavyDownpour,
+    };
+}
+
+std::string_view WaterRainIntensityPresetLabel(WaterRainIntensityPreset preset) {
+    switch (preset) {
+        case WaterRainIntensityPreset::LightMist:
+            return "Light Mist";
+        case WaterRainIntensityPreset::Rain:
+            return "Rain";
+        case WaterRainIntensityPreset::HeavyDownpour:
+            return "Heavy Downpour";
+    }
+    return "Rain";
+}
+
+std::string_view WaterRainIntensityPresetNameForStorage(WaterRainIntensityPreset preset) {
+    switch (preset) {
+        case WaterRainIntensityPreset::LightMist:
+            return "light_mist";
+        case WaterRainIntensityPreset::Rain:
+            return "rain";
+        case WaterRainIntensityPreset::HeavyDownpour:
+            return "heavy_downpour";
+    }
+    return "rain";
+}
+
+std::optional<WaterRainIntensityPreset> ParseWaterRainIntensityPresetName(std::string_view value) {
+    if (value == "light_mist" || value == "Light Mist") {
+        return WaterRainIntensityPreset::LightMist;
+    }
+    if (value == "rain" || value == "Rain") {
+        return WaterRainIntensityPreset::Rain;
+    }
+    if (value == "heavy_downpour" || value == "Heavy Downpour") {
+        return WaterRainIntensityPreset::HeavyDownpour;
+    }
+    return std::nullopt;
+}
+
+WaterRainSettings DefaultWaterRainSettings() {
+    return ApplyWaterRainIntensityPreset({}, WaterRainIntensityPreset::Rain);
+}
+
+WaterRainSettings ApplyWaterRainIntensityPreset(
+    WaterRainSettings settings,
+    WaterRainIntensityPreset preset) {
+    settings.intensityPreset = preset;
+    switch (preset) {
+        case WaterRainIntensityPreset::LightMist:
+            settings.dropCount = 420U;
+            settings.fallSpeedMetersPerSecond = 2.8F;
+            settings.surfaceRunSpeedMetersPerSecond = 0.38F;
+            settings.sandRunDistanceMeters = 0.35F;
+            settings.windStrengthMeters = 0.62F;
+            settings.windNoise = 0.82F;
+            settings.windResponse = 1.0F;
+            settings.trailLengthMeters = 0.42F;
+            settings.trailPointSpacingMeters = 0.16F;
+            settings.trailWidthMeters = 0.0022F;
+            settings.trailStreakLengthMeters = 0.055F;
+            settings.routeAnchorCount = 8U;
+            break;
+        case WaterRainIntensityPreset::Rain:
+            settings.dropCount = 900U;
+            settings.fallSpeedMetersPerSecond = 8.0F;
+            settings.surfaceRunSpeedMetersPerSecond = 1.05F;
+            settings.sandRunDistanceMeters = 0.65F;
+            settings.windStrengthMeters = 0.30F;
+            settings.windNoise = 0.45F;
+            settings.windResponse = 0.50F;
+            settings.trailLengthMeters = 0.75F;
+            settings.trailPointSpacingMeters = 0.18F;
+            settings.trailWidthMeters = 0.004F;
+            settings.trailStreakLengthMeters = 0.12F;
+            settings.routeAnchorCount = 10U;
+            break;
+        case WaterRainIntensityPreset::HeavyDownpour:
+            settings.dropCount = 2200U;
+            settings.fallSpeedMetersPerSecond = 13.5F;
+            settings.surfaceRunSpeedMetersPerSecond = 1.85F;
+            settings.sandRunDistanceMeters = 0.95F;
+            settings.windStrengthMeters = 0.12F;
+            settings.windNoise = 0.18F;
+            settings.windResponse = 0.16F;
+            settings.trailLengthMeters = 1.20F;
+            settings.trailPointSpacingMeters = 0.22F;
+            settings.trailWidthMeters = 0.0065F;
+            settings.trailStreakLengthMeters = 0.24F;
+            settings.routeAnchorCount = 12U;
+            break;
+    }
+    return settings;
+}
+
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
     WaterSettingsBundle settings;
     settings.path = DefaultWaterPathGenerationSettings(mode);
@@ -6552,6 +6652,716 @@ WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
         settings.seed,
         0.0F,
         analysis);
+}
+
+namespace {
+
+struct RainSupportSample {
+    glm::vec3 position{0.0F, 0.0F, 0.0F};
+    glm::vec3 normal{0.0F, 0.0F, 1.0F};
+    std::string_view role;
+};
+
+struct RainSupportIndex {
+    std::vector<RainSupportSample> samples;
+    std::unordered_map<GridKey, std::vector<std::uint32_t>, GridKeyHash> grid;
+    invisible_places::io::Bounds3f bounds{};
+    float cellSize = 0.20F;
+};
+
+struct RainRouteAnchor {
+    glm::vec3 position{0.0F, 0.0F, 0.0F};
+    glm::vec3 normal{0.0F, 0.0F, 1.0F};
+    float timeFraction = 0.0F;
+    bool surface = false;
+    bool sand = false;
+};
+
+bool RainRoleIsSand(std::string_view role) {
+    return role == "SAND" || role == "sand" || role == "Sand";
+}
+
+float RainPresetVisualStrength(WaterRainIntensityPreset preset) {
+    switch (preset) {
+        case WaterRainIntensityPreset::LightMist:
+            return 0.30F;
+        case WaterRainIntensityPreset::Rain:
+            return 0.68F;
+        case WaterRainIntensityPreset::HeavyDownpour:
+            return 1.0F;
+    }
+    return 0.68F;
+}
+
+RainSupportIndex BuildRainSupportIndex(
+    std::span<const WaterSceneSupportLayer> supportLayers,
+    const WaterRainSettings& settings) {
+    RainSupportIndex index;
+    index.cellSize = std::max(0.01F, settings.surfaceSearchRadiusMeters);
+    const auto layerCount = std::max<std::size_t>(1U, supportLayers.size());
+    const auto perLayerLimit = static_cast<std::uint32_t>(
+        std::max<std::size_t>(512U, std::max<std::uint32_t>(512U, settings.supportSampleLimit) / layerCount));
+    for (const auto& layer : supportLayers) {
+        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+            continue;
+        }
+        const auto& cloud = *layer.cloud;
+        const std::size_t stride = SampleStride(cloud.positions.size(), perLayerLimit);
+        for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); pointIndex += stride) {
+            const glm::vec3 position = ToGlm(cloud.positions[pointIndex]);
+            if (!IsValidPoint(position)) {
+                continue;
+            }
+            glm::vec3 normal{0.0F, 0.0F, 1.0F};
+            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+                normal = SafeOverlayNormal(ToGlm(cloud.normals[pointIndex]));
+            }
+            const auto sampleIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+                index.samples.size(),
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+            index.samples.push_back({.position = position, .normal = normal, .role = layer.role});
+            index.grid[MakeGridKey({position.x, position.y, 0.0F}, index.cellSize)].push_back(sampleIndex);
+            index.bounds.Expand(cloud.positions[pointIndex]);
+        }
+    }
+    return index;
+}
+
+std::optional<std::uint32_t> FindRainSupportSample(
+    const RainSupportIndex& index,
+    const glm::vec2& xy,
+    float radiusMeters,
+    bool requireSand,
+    bool chooseLowest,
+    std::optional<float> maxZ = std::nullopt) {
+    if (index.samples.empty()) {
+        return std::nullopt;
+    }
+    const float safeRadius = std::max(radiusMeters, index.cellSize);
+    const float safeRadiusSquared = safeRadius * safeRadius;
+    const int cellRadius = std::clamp(static_cast<int>(std::ceil(safeRadius / index.cellSize)), 1, 12);
+    const auto baseKey = MakeGridKey({xy.x, xy.y, 0.0F}, index.cellSize);
+    std::optional<std::uint32_t> bestIndex;
+    float bestZ = chooseLowest ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+    float bestDistanceSquared = std::numeric_limits<float>::max();
+    for (int dy = -cellRadius; dy <= cellRadius; ++dy) {
+        for (int dx = -cellRadius; dx <= cellRadius; ++dx) {
+            const GridKey key{baseKey.x + dx, baseKey.y + dy, 0};
+            const auto bucketIt = index.grid.find(key);
+            if (bucketIt == index.grid.end()) {
+                continue;
+            }
+            for (const auto candidateIndex : bucketIt->second) {
+                if (candidateIndex >= index.samples.size()) {
+                    continue;
+                }
+                const auto& sample = index.samples[candidateIndex];
+                if (requireSand && !RainRoleIsSand(sample.role)) {
+                    continue;
+                }
+                if (maxZ.has_value() && sample.position.z > maxZ.value()) {
+                    continue;
+                }
+                const glm::vec2 delta{sample.position.x - xy.x, sample.position.y - xy.y};
+                const float distanceSquared = glm::dot(delta, delta);
+                if (distanceSquared > safeRadiusSquared) {
+                    continue;
+                }
+                const bool betterZ = chooseLowest ? sample.position.z < bestZ : sample.position.z > bestZ;
+                const bool equalZNearer =
+                    std::abs(sample.position.z - bestZ) <= 1.0e-5F && distanceSquared < bestDistanceSquared;
+                if (!bestIndex.has_value() || betterZ || equalZNearer) {
+                    bestIndex = candidateIndex;
+                    bestZ = sample.position.z;
+                    bestDistanceSquared = distanceSquared;
+                }
+            }
+        }
+    }
+    return bestIndex;
+}
+
+bool RainVisitedSample(const std::vector<std::uint32_t>& visited, std::uint32_t sampleIndex) {
+    return std::find(visited.begin(), visited.end(), sampleIndex) != visited.end();
+}
+
+std::optional<std::uint32_t> FindRainSurfaceCandidate(
+    const RainSupportIndex& index,
+    std::uint32_t currentIndex,
+    float radiusMeters,
+    const std::vector<std::uint32_t>& visited,
+    bool requireSand,
+    bool allowSand,
+    bool chooseLowest) {
+    if (currentIndex >= index.samples.size()) {
+        return std::nullopt;
+    }
+    const auto& current = index.samples[currentIndex];
+    const float safeRadius = std::max(radiusMeters, index.cellSize);
+    const float safeRadiusSquared = safeRadius * safeRadius;
+    const float minStepSquared = std::max(1.0e-5F, index.cellSize * index.cellSize * 0.08F);
+    const float allowedRise = std::max(0.015F, safeRadius * 0.08F);
+    const int cellRadius = std::clamp(static_cast<int>(std::ceil(safeRadius / index.cellSize)), 1, 18);
+    const auto baseKey = MakeGridKey({current.position.x, current.position.y, 0.0F}, index.cellSize);
+    std::optional<std::uint32_t> bestIndex;
+    float bestScore = std::numeric_limits<float>::max();
+    for (int dy = -cellRadius; dy <= cellRadius; ++dy) {
+        for (int dx = -cellRadius; dx <= cellRadius; ++dx) {
+            const GridKey key{baseKey.x + dx, baseKey.y + dy, 0};
+            const auto bucketIt = index.grid.find(key);
+            if (bucketIt == index.grid.end()) {
+                continue;
+            }
+            for (const auto candidateIndex : bucketIt->second) {
+                if (candidateIndex >= index.samples.size() ||
+                    candidateIndex == currentIndex ||
+                    RainVisitedSample(visited, candidateIndex)) {
+                    continue;
+                }
+                const auto& candidate = index.samples[candidateIndex];
+                const bool candidateSand = RainRoleIsSand(candidate.role);
+                if (requireSand && !candidateSand) {
+                    continue;
+                }
+                if (!allowSand && candidateSand) {
+                    continue;
+                }
+                const glm::vec2 delta{
+                    candidate.position.x - current.position.x,
+                    candidate.position.y - current.position.y};
+                const float distanceSquared = glm::dot(delta, delta);
+                if (distanceSquared > safeRadiusSquared || distanceSquared < minStepSquared) {
+                    continue;
+                }
+                const float rise = candidate.position.z - current.position.z;
+                if (rise > allowedRise) {
+                    continue;
+                }
+                const float distance = std::sqrt(distanceSquared);
+                const float descent = std::max(0.0F, current.position.z - candidate.position.z);
+                if (chooseLowest && !candidateSand && descent <= std::max(0.002F, safeRadius * 0.01F)) {
+                    continue;
+                }
+                float score = distance - descent * (chooseLowest ? 4.0F : 1.2F);
+                if (candidateSand) {
+                    score -= safeRadius * 0.18F;
+                }
+                if (rise > 0.0F) {
+                    score += rise * 8.0F;
+                }
+                if (!bestIndex.has_value() || score < bestScore) {
+                    bestIndex = candidateIndex;
+                    bestScore = score;
+                }
+            }
+        }
+    }
+    return bestIndex;
+}
+
+glm::vec3 SafeRainWindDirection(const WaterRainSettings& settings) {
+    glm::vec3 wind{settings.windDirectionX, settings.windDirectionY, 0.0F};
+    if (glm::dot(wind, wind) <= kNormalEpsilon) {
+        wind = {1.0F, 0.0F, 0.0F};
+    }
+    return glm::normalize(wind);
+}
+
+glm::vec3 SafeRainCameraForward(const WaterRainCameraFrame& cameraFrame) {
+    glm::vec3 forward = ToGlm(cameraFrame.target) - ToGlm(cameraFrame.position);
+    if (glm::dot(forward, forward) <= kNormalEpsilon) {
+        forward = {0.0F, 1.0F, -0.25F};
+    }
+    return glm::normalize(forward);
+}
+
+void AppendRainRouteAnchor(
+    std::vector<RainRouteAnchor>* route,
+    const glm::vec3& position,
+    const glm::vec3& normal,
+    bool surface,
+    bool sand) {
+    if (route == nullptr) {
+        return;
+    }
+    glm::vec3 safeNormal = normal;
+    if (glm::dot(safeNormal, safeNormal) <= kNormalEpsilon) {
+        safeNormal = {0.0F, 0.0F, 1.0F};
+    } else {
+        safeNormal = glm::normalize(safeNormal);
+    }
+    route->push_back({
+        .position = position,
+        .normal = safeNormal,
+        .surface = surface,
+        .sand = sand,
+    });
+}
+
+void AppendRainSupportAnchor(
+    std::vector<RainRouteAnchor>* route,
+    const RainSupportSample& sample,
+    float supportOffset) {
+    AppendRainRouteAnchor(
+        route,
+        sample.position + sample.normal * supportOffset,
+        sample.normal,
+        true,
+        RainRoleIsSand(sample.role));
+}
+
+void AppendRainSyntheticSandRunAnchor(
+    std::vector<RainRouteAnchor>* route,
+    const glm::vec3& windDirection,
+    float distanceMeters) {
+    if (route == nullptr || route->empty() || distanceMeters <= 1.0e-4F) {
+        return;
+    }
+    const auto& last = route->back();
+    glm::vec3 direction{windDirection.x, windDirection.y, 0.0F};
+    if (route->size() >= 2U) {
+        direction = last.position - route->at(route->size() - 2U).position;
+    }
+    direction -= last.normal * glm::dot(direction, last.normal);
+    if (glm::dot(direction, direction) <= kNormalEpsilon) {
+        direction = glm::cross(last.normal, glm::vec3{0.0F, 0.0F, 1.0F});
+        if (glm::dot(direction, direction) <= kNormalEpsilon) {
+            direction = {1.0F, 0.0F, 0.0F};
+        }
+    } else {
+        direction = glm::normalize(direction);
+    }
+    AppendRainRouteAnchor(
+        route,
+        last.position + direction * distanceMeters,
+        last.normal,
+        true,
+        true);
+}
+
+void ComputeRainRouteTiming(
+    std::vector<RainRouteAnchor>* route,
+    float fallSpeedMetersPerSecond,
+    float surfaceRunSpeedMetersPerSecond,
+    float* effectiveRouteLength) {
+    if (effectiveRouteLength != nullptr) {
+        *effectiveRouteLength = 0.0F;
+    }
+    if (route == nullptr || route->size() < 2U) {
+        return;
+    }
+    const float fallSpeed = std::max(0.01F, fallSpeedMetersPerSecond);
+    const float surfaceSpeed = std::clamp(surfaceRunSpeedMetersPerSecond, 0.01F, fallSpeed * 0.92F);
+    float totalTime = 0.0F;
+    std::vector<float> cumulativeTimes(route->size(), 0.0F);
+    for (std::size_t index = 1; index < route->size(); ++index) {
+        const float segmentLength = glm::length(route->at(index).position - route->at(index - 1U).position);
+        const float segmentSpeed = route->at(index - 1U).surface ? surfaceSpeed : fallSpeed;
+        totalTime += segmentLength / std::max(0.01F, segmentSpeed);
+        cumulativeTimes[index] = totalTime;
+    }
+    if (totalTime <= 1.0e-5F) {
+        for (std::size_t index = 0; index < route->size(); ++index) {
+            route->at(index).timeFraction =
+                route->size() <= 1U ? 0.0F : static_cast<float>(index) / static_cast<float>(route->size() - 1U);
+        }
+        return;
+    }
+    for (std::size_t index = 0; index < route->size(); ++index) {
+        route->at(index).timeFraction = std::clamp(cumulativeTimes[index] / totalTime, 0.0F, 1.0F);
+    }
+    route->front().timeFraction = 0.0F;
+    route->back().timeFraction = 1.0F;
+    if (effectiveRouteLength != nullptr) {
+        *effectiveRouteLength = fallSpeed * totalTime;
+    }
+}
+
+std::vector<RainRouteAnchor> BuildRainRouteAnchors(
+    const glm::vec3& spawn,
+    const RainSupportIndex& support,
+    std::optional<std::uint32_t> firstHitIndex,
+    const glm::vec3& noHitEnd,
+    const glm::vec3& windDirection,
+    float windNoiseMeters,
+    float supportOffset,
+    std::uint32_t seed,
+    std::uint32_t dropIndex,
+    const WaterRainSettings& settings,
+    bool* sandTermination,
+    bool* fallbackTermination) {
+    if (sandTermination != nullptr) {
+        *sandTermination = false;
+    }
+    if (fallbackTermination != nullptr) {
+        *fallbackTermination = false;
+    }
+    const std::uint32_t routeCount = std::clamp<std::uint32_t>(settings.routeAnchorCount, 3U, 32U);
+    std::vector<RainRouteAnchor> route;
+    route.reserve(routeCount);
+    glm::vec3 lateral = glm::cross(windDirection + glm::vec3{0.0F, 0.0F, -1.0F}, glm::vec3{0.0F, 0.0F, 1.0F});
+    if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
+        lateral = {1.0F, 0.0F, 0.0F};
+    } else {
+        lateral = glm::normalize(lateral);
+    }
+
+    AppendRainRouteAnchor(&route, spawn, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+    if (!firstHitIndex.has_value() || firstHitIndex.value() >= support.samples.size()) {
+        const float noise = (RegionHash01(seed + dropIndex, 0U, 9311U) - 0.5F) * 2.0F;
+        const float curl = std::sin(RegionHash01(seed, dropIndex, 9323U) * 6.28318530718F);
+        const glm::vec3 midpoint =
+            glm::mix(spawn, noHitEnd, 0.54F) + lateral * (noise * 0.55F + curl * 0.45F) * windNoiseMeters;
+        AppendRainRouteAnchor(&route, midpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+        AppendRainRouteAnchor(&route, noHitEnd, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+        return route;
+    }
+
+    const auto& first = support.samples[firstHitIndex.value()];
+    const float midNoise = (RegionHash01(seed + dropIndex, 1U, 9311U) - 0.5F) * 2.0F;
+    const float midCurl = std::sin(RegionHash01(seed, dropIndex, 9323U) * 6.28318530718F);
+    const glm::vec3 firstHit = first.position + first.normal * supportOffset;
+    const glm::vec3 airMidpoint =
+        glm::mix(spawn, firstHit, 0.58F) + lateral * (midNoise * 0.55F + midCurl * 0.45F) * windNoiseMeters;
+    AppendRainRouteAnchor(&route, airMidpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+    AppendRainSupportAnchor(&route, first, supportOffset);
+
+    std::vector<std::uint32_t> visited;
+    visited.reserve(routeCount);
+    visited.push_back(firstHitIndex.value());
+    std::uint32_t currentIndex = firstHitIndex.value();
+    float sandTravelDistance = 0.0F;
+    const float radius = std::max(settings.downhillSearchRadiusMeters, settings.surfaceSearchRadiusMeters);
+    while (route.size() < routeCount) {
+        if (currentIndex >= support.samples.size()) {
+            break;
+        }
+        const auto& current = support.samples[currentIndex];
+        const bool currentSand = RainRoleIsSand(current.role);
+        if (currentSand) {
+            if (sandTermination != nullptr) {
+                *sandTermination = true;
+            }
+            if (sandTravelDistance >= std::max(0.0F, settings.sandRunDistanceMeters)) {
+                break;
+            }
+            const auto nextSand = FindRainSurfaceCandidate(
+                support,
+                currentIndex,
+                radius,
+                visited,
+                true,
+                true,
+                false);
+            if (!nextSand.has_value()) {
+                const float remaining = std::max(0.0F, settings.sandRunDistanceMeters - sandTravelDistance);
+                AppendRainSyntheticSandRunAnchor(&route, windDirection, remaining);
+                break;
+            }
+            const auto previousPosition = route.back().position;
+            currentIndex = nextSand.value();
+            visited.push_back(currentIndex);
+            AppendRainSupportAnchor(&route, support.samples[currentIndex], supportOffset);
+            sandTravelDistance += glm::length(route.back().position - previousPosition);
+            continue;
+        }
+
+        auto nextIndex = FindRainSurfaceCandidate(
+            support,
+            currentIndex,
+            radius,
+            visited,
+            false,
+            false,
+            true);
+        if (!nextIndex.has_value()) {
+            nextIndex = FindRainSurfaceCandidate(
+                support,
+                currentIndex,
+                radius,
+                visited,
+                true,
+                true,
+                false);
+        }
+        if (!nextIndex.has_value()) {
+            if (fallbackTermination != nullptr) {
+                *fallbackTermination = true;
+            }
+            break;
+        }
+        currentIndex = nextIndex.value();
+        visited.push_back(currentIndex);
+        AppendRainSupportAnchor(&route, support.samples[currentIndex], supportOffset);
+    }
+
+    if (sandTermination != nullptr && !*sandTermination) {
+        const auto& last = support.samples[currentIndex];
+        if (RainRoleIsSand(last.role)) {
+            *sandTermination = true;
+        }
+    }
+    if (fallbackTermination != nullptr && sandTermination != nullptr && !*sandTermination) {
+        *fallbackTermination = true;
+    }
+    return route;
+}
+
+}  // namespace
+
+WaterTrailOverlay BuildRainTrailOverlay(
+    std::span<const WaterSceneSupportLayer> supportLayers,
+    const WaterRainCameraFrame& cameraFrame,
+    const WaterRainSettings& settings,
+    WaterRainDiagnostics* diagnostics) {
+    WaterRainDiagnostics localDiagnostics;
+    localDiagnostics.requestedDropCount = settings.enabled ? settings.dropCount : 0U;
+    if (diagnostics != nullptr) {
+        *diagnostics = localDiagnostics;
+    }
+    if (!settings.enabled || settings.dropCount == 0U || supportLayers.empty()) {
+        return {};
+    }
+
+    const auto support = BuildRainSupportIndex(supportLayers, settings);
+    if (support.samples.empty() || !support.bounds.valid) {
+        localDiagnostics.noSupportKillCount = settings.dropCount;
+        if (diagnostics != nullptr) {
+            *diagnostics = localDiagnostics;
+        }
+        return {};
+    }
+
+    WaterTrailOverlay overlay;
+    const glm::vec3 cameraPosition = ToGlm(cameraFrame.position);
+    const glm::vec3 cameraTarget = ToGlm(cameraFrame.target);
+    const glm::vec3 cameraForward = SafeRainCameraForward(cameraFrame);
+    glm::vec3 cameraRight = glm::cross(cameraForward, glm::vec3{0.0F, 0.0F, 1.0F});
+    if (glm::dot(cameraRight, cameraRight) <= kNormalEpsilon) {
+        cameraRight = {1.0F, 0.0F, 0.0F};
+    } else {
+        cameraRight = glm::normalize(cameraRight);
+    }
+    glm::vec3 forwardXy{cameraForward.x, cameraForward.y, 0.0F};
+    if (glm::dot(forwardXy, forwardXy) <= kNormalEpsilon) {
+        forwardXy = glm::cross(glm::vec3{0.0F, 0.0F, 1.0F}, cameraRight);
+    }
+    forwardXy = glm::normalize(forwardXy);
+
+    const glm::vec3 windDirection = SafeRainWindDirection(settings);
+    const float sceneHeight = std::max(0.1F, support.bounds.maximum.z - support.bounds.minimum.z);
+    const float spawnHeight = std::clamp(settings.spawnHeightMeters, 0.05F, sceneHeight + 200.0F);
+    const float targetDistance = std::max(1.0F, glm::length(cameraTarget - cameraPosition));
+    const float tanHalfFov =
+        std::tan(std::clamp(cameraFrame.fovDegrees, 5.0F, 140.0F) * 0.00872664625997F);
+    const float halfHeight = std::max(settings.spawnRadiusMeters, targetDistance * tanHalfFov);
+    const float halfWidth = halfHeight * std::clamp(cameraFrame.aspectRatio, 0.25F, 4.0F);
+    const float spawnMargin = 1.0F + std::clamp(settings.spawnOutOfFrameMargin, 0.0F, 2.0F);
+    const float visualStrength = RainPresetVisualStrength(settings.intensityPreset);
+    const float windNoiseMeters =
+        std::max(0.0F, settings.windStrengthMeters * settings.windNoise * settings.windResponse);
+    const float supportOffset = std::max(0.006F, settings.trailWidthMeters * 2.5F);
+    const float visibleSpacing = std::clamp(settings.trailPointSpacingMeters, 0.01F, 5.0F);
+    const std::uint32_t visibleSamplesPerDrop = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(std::ceil(std::max(0.001F, settings.trailLengthMeters) / visibleSpacing)),
+        1U,
+        10U);
+
+    for (std::uint32_t dropIndex = 0; dropIndex < settings.dropCount; ++dropIndex) {
+        const float u = (RegionHash01(settings.seed, dropIndex, 9101U) - 0.5F) * 2.0F;
+        const float v = (RegionHash01(settings.seed, dropIndex, 9109U) - 0.5F) * 2.0F;
+        const float edgeChoice = RegionHash01(settings.seed, dropIndex, 9113U);
+        float spawnU = u;
+        float spawnV = v;
+        if (edgeChoice < 0.25F) {
+            spawnU = -spawnMargin;
+        } else if (edgeChoice < 0.50F) {
+            spawnU = spawnMargin;
+        } else if (edgeChoice < 0.75F) {
+            spawnV = -spawnMargin;
+        } else {
+            spawnV = spawnMargin;
+        }
+        const glm::vec3 footprintCenter = cameraTarget;
+        const glm::vec3 targetPoint =
+            footprintCenter +
+            cameraRight * (u * halfWidth) +
+            forwardXy * (v * halfHeight);
+        const glm::vec3 spawnBase =
+            footprintCenter +
+            cameraRight * (spawnU * halfWidth) +
+            forwardXy * (spawnV * halfHeight);
+        glm::vec3 spawn{
+            spawnBase.x,
+            spawnBase.y,
+            support.bounds.maximum.z + spawnHeight +
+                RegionHash01(settings.seed, dropIndex, 9119U) * spawnHeight * 0.35F};
+        spawn -= windDirection * settings.windStrengthMeters * settings.windResponse * spawnHeight;
+
+        const glm::vec2 targetXy{targetPoint.x, targetPoint.y};
+        const auto firstHitIndex = FindRainSupportSample(
+            support,
+            targetXy,
+            std::max(0.005F, settings.surfaceSearchRadiusMeters),
+            false,
+            false);
+
+        const bool hasSupportHit = firstHitIndex.has_value();
+        const glm::vec3 noHitEnd{
+            targetPoint.x,
+            targetPoint.y,
+            support.bounds.minimum.z - settings.killBelowSceneMeters};
+        if (hasSupportHit) {
+            ++localDiagnostics.firstSupportHitCount;
+        } else {
+            ++localDiagnostics.noSupportKillCount;
+        }
+
+        bool sandTermination = false;
+        bool fallbackTermination = false;
+        auto routeAnchors = BuildRainRouteAnchors(
+            spawn,
+            support,
+            firstHitIndex,
+            noHitEnd,
+            windDirection,
+            windNoiseMeters,
+            supportOffset,
+            settings.seed,
+            dropIndex,
+            settings,
+            &sandTermination,
+            &fallbackTermination);
+        if (sandTermination) {
+            ++localDiagnostics.sandTerminationCount;
+        } else if (fallbackTermination) {
+            ++localDiagnostics.fallbackTerminationCount;
+        }
+        if (routeAnchors.size() < 2U) {
+            continue;
+        }
+
+        float routeLength = 0.0F;
+        ComputeRainRouteTiming(
+            &routeAnchors,
+            settings.fallSpeedMetersPerSecond,
+            settings.surfaceRunSpeedMetersPerSecond,
+            &routeLength);
+        if (routeLength <= 1.0e-5F) {
+            for (std::size_t routeIndex = 1; routeIndex < routeAnchors.size(); ++routeIndex) {
+                routeLength += glm::length(routeAnchors[routeIndex].position - routeAnchors[routeIndex - 1U].position);
+            }
+        }
+        if (routeLength <= 1.0e-5F) {
+            continue;
+        }
+        const float supportConfidence = hasSupportHit ? 1.0F : 0.55F;
+        const glm::vec3 endPoint = routeAnchors.back().position;
+
+        const auto routeStartIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+            overlay.samples.size(),
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+        float routeDistance = 0.0F;
+        for (std::size_t routeIndex = 0; routeIndex < routeAnchors.size(); ++routeIndex) {
+            if (routeIndex > 0U) {
+                routeDistance += glm::length(routeAnchors[routeIndex].position - routeAnchors[routeIndex - 1U].position);
+            }
+            const auto previousIndex = routeIndex > 0U ? routeIndex - 1U : routeIndex;
+            const auto nextIndex = std::min(routeIndex + 1U, routeAnchors.size() - 1U);
+            glm::vec3 tangent = routeAnchors[nextIndex].position - routeAnchors[previousIndex].position;
+            if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
+                tangent = {0.0F, 0.0F, -1.0F};
+            }
+            tangent = glm::normalize(tangent);
+
+            WaterTrailSample routeSample;
+            routeSample.position = FromGlm(routeAnchors[routeIndex].position);
+            routeSample.normal = FromGlm(routeAnchors[routeIndex].normal);
+            routeSample.tangent = FromGlm(tangent);
+            routeSample.red = 0U;
+            routeSample.green = 0U;
+            routeSample.blue = 0U;
+            routeSample.sourceId = 0.0F;
+            routeSample.pathId = static_cast<float>(dropIndex + 1U);
+            routeSample.branchId = 0.0F;
+            routeSample.trailDistance = routeDistance;
+            routeSample.trailLength = std::max(0.001F, settings.trailLengthMeters);
+            routeSample.trailSpeed = std::max(0.01F, settings.fallSpeedMetersPerSecond);
+            routeSample.trailWidth = std::max(0.0005F, settings.trailWidthMeters);
+            routeSample.trailStreakLength = std::max(routeSample.trailWidth * 2.0F, settings.trailStreakLengthMeters);
+            routeSample.trailConfidence = supportConfidence * visualStrength;
+            routeSample.wetness = visualStrength;
+            routeSample.featureType = kWaterTrailFeatureTypeRain;
+            routeSample.trailRole = 0.0F;
+            routeSample.routeStartIndex = static_cast<float>(routeStartIndex);
+            routeSample.routePointCount = static_cast<float>(routeAnchors.size());
+            routeSample.routeLength = routeLength;
+            routeSample.trailStartPhase = routeAnchors[routeIndex].timeFraction;
+            routeSample.trailLaneSpan = std::max(0.1F, settings.cameraDeathDistanceMeters);
+            routeSample.trailLaneCrossing = std::clamp(settings.windResponse, 0.0F, 2.0F);
+            routeSample.trailCrossSeed = RegionHash01(settings.seed, dropIndex, 9133U);
+            IncludeTrailSample(&overlay, routeSample);
+        }
+
+        const float startPhase = RegionHash01(settings.seed, dropIndex, 9143U);
+        const float speedJitter = 0.82F + RegionHash01(settings.seed, dropIndex, 9151U) * 0.36F;
+        for (std::uint32_t sampleIndex = 0; sampleIndex < visibleSamplesPerDrop; ++sampleIndex) {
+            const float pointAge = visibleSamplesPerDrop <= 1U
+                                       ? 0.0F
+                                       : static_cast<float>(sampleIndex) /
+                                             static_cast<float>(visibleSamplesPerDrop - 1U);
+            const float localDistance = std::min(
+                routeLength * 0.35F,
+                static_cast<float>(sampleIndex) * visibleSpacing);
+            WaterTrailSample sample;
+            sample.position = FromGlm(spawn);
+            sample.normal = FromGlm(glm::vec3{0.0F, 0.0F, 1.0F});
+            sample.tangent = FromGlm(glm::normalize(endPoint - spawn));
+            sample.red = TrailColorByte(0.72F + visualStrength * 0.16F);
+            sample.green = TrailColorByte(0.86F + visualStrength * 0.10F);
+            sample.blue = TrailColorByte(1.0F);
+            sample.trailId = static_cast<float>(dropIndex + 1U);
+            sample.sourceId = 0.0F;
+            sample.pathId = static_cast<float>(dropIndex + 1U);
+            sample.branchId = 0.0F;
+            sample.trailSeed = RegionHash01(settings.seed, dropIndex, 9161U);
+            sample.pointSeed = RegionHash01(settings.seed, dropIndex + sampleIndex, 9169U);
+            sample.trailDistance = localDistance;
+            sample.trailLength = std::max(0.001F, settings.trailLengthMeters);
+            sample.pointAge = pointAge;
+            sample.trailAge = RegionHash01(settings.seed, dropIndex, 9173U);
+            sample.trailSpeed = std::max(0.01F, settings.fallSpeedMetersPerSecond * speedJitter);
+            sample.trailWidth =
+                std::max(0.0005F, settings.trailWidthMeters * (0.72F + sample.trailSeed * 0.48F));
+            sample.trailStreakLength = std::max(sample.trailWidth * 2.0F, settings.trailStreakLengthMeters);
+            sample.trailConfidence = supportConfidence * visualStrength * (0.70F + sample.pointSeed * 0.30F);
+            sample.wetness = visualStrength;
+            sample.featureType = kWaterTrailFeatureTypeRain;
+            sample.trailRole = 1.0F;
+            sample.routeStartIndex = static_cast<float>(routeStartIndex);
+            sample.routePointCount = static_cast<float>(routeAnchors.size());
+            sample.routeLength = routeLength;
+            sample.trailStartPhase = startPhase;
+            sample.trailLaneIndex = 0.0F;
+            sample.trailLaneCount = 1.0F;
+            sample.trailLanePitch = std::max(0.0F, settings.windStrengthMeters);
+            sample.trailLaneSpan = std::max(0.1F, settings.cameraDeathDistanceMeters);
+            sample.trailLaneCrossing = std::clamp(settings.windResponse, 0.0F, 2.0F);
+            sample.trailCrossSeed = RegionHash01(settings.seed, dropIndex, 9181U);
+            IncludeTrailSample(&overlay, sample);
+            ++localDiagnostics.emittedSampleCount;
+        }
+        ++localDiagnostics.emittedDropCount;
+        localDiagnostics.routeAnchorCount += static_cast<std::uint32_t>(routeAnchors.size());
+    }
+
+    if (diagnostics != nullptr) {
+        *diagnostics = localDiagnostics;
+    }
+    overlay.fieldDiagnostics.emittedPathCount = localDiagnostics.emittedDropCount;
+    overlay.fieldDiagnostics.emittedSampleCount = localDiagnostics.emittedSampleCount;
+    overlay.fieldDiagnostics.inputNodeCount = localDiagnostics.routeAnchorCount;
+    return overlay;
 }
 
 WaterFieldCache BuildFieldCacheFromPathAnchors(

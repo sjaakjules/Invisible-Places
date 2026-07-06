@@ -138,6 +138,9 @@ struct ProjectDocument {
     invisible_places::water::WaterFlowTrailSettings waterFlowTrailSettings{};
     invisible_places::water::WaterFieldSettings waterFieldSettings{};
     invisible_places::water::WaterFieldTrailSettings waterFieldTrailSettings{};
+    invisible_places::water::WaterRainSettings waterRainSettings{};
+    std::string selectedWaterRainTrailProfileName = "Rain Fine Lines_preset";
+    std::optional<WaterTrailProfileDocument> tempWaterRainTrailProfile;
     std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
     std::vector<WaterRippleRuntimeCacheDocument> waterRippleRuntimeCaches;
@@ -175,6 +178,9 @@ struct WaterSourcesDocument {
     invisible_places::water::WaterTrailGeometrySettings trailGeometry{};
     invisible_places::water::WaterFieldSettings fieldSettings{};
     invisible_places::water::WaterFieldTrailSettings fieldTrailSettings{};
+    invisible_places::water::WaterRainSettings rainSettings{};
+    std::string selectedRainTrailProfileName = "Rain Fine Lines_preset";
+    std::optional<WaterTrailProfileDocument> tempRainTrailProfile;
     std::optional<invisible_places::water::WaterPathCache> pathCache;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
 };
