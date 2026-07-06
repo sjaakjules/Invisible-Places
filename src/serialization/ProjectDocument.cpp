@@ -1791,6 +1791,7 @@ json SerializeWaterEffectLayer(const WaterEffectLayer& layer) {
         {"overlay_type", WaterRippleOverlayTypeName(layer.rippleOverlayType)},
         {"blend_mode", WaterEffectBlendModeName(layer.blendMode)},
         {"target_layer_source_path", layer.targetLayerSourcePath.generic_string()},
+        {"target_scene_roles", layer.targetSceneRoles},
         {"vertices", SerializeWaterRegionVertices(layer.vertices)},
         {"hull", SerializeWaterRegionVertices(layer.hull)},
         {"enabled_in_viewport", layer.enabledInViewport},
@@ -1827,6 +1828,9 @@ WaterEffectLayer ParseWaterEffectLayer(const json& layerJson) {
         layer.blendMode = ParseWaterEffectBlendMode(layerJson.at("blend_mode"));
     }
     layer.targetLayerSourcePath = layerJson.value("target_layer_source_path", std::string{});
+    if (layerJson.contains("target_scene_roles") && layerJson.at("target_scene_roles").is_array()) {
+        layer.targetSceneRoles = layerJson.at("target_scene_roles").get<std::vector<std::string>>();
+    }
     if (layerJson.contains("vertices")) {
         layer.vertices = ParseWaterRegionVertices(layerJson.at("vertices"));
     }
@@ -2254,6 +2258,9 @@ json SerializeWaterPathGenerationSettings(const WaterPathGenerationSettings& set
         {"branching", settings.branching},
         {"coverage", settings.coverage},
         {"gap_tolerance", settings.gapTolerance},
+        {"attractor_enabled", settings.attractorEnabled},
+        {"attractor_position", {settings.attractorPosition.x, settings.attractorPosition.y, settings.attractorPosition.z}},
+        {"attractor_strength", settings.attractorStrength},
         {"max_steps", settings.maxSteps},
         {"support_sample_limit", settings.supportSampleLimit},
     };
@@ -2276,6 +2283,15 @@ WaterPathGenerationSettings ParseWaterPathGenerationSettings(const json& setting
     settings.branching = std::clamp(settingsJson.value("branching", settings.branching), 0.0F, 1.0F);
     settings.coverage = std::clamp(settingsJson.value("coverage", settings.coverage), 0.0F, 1.0F);
     settings.gapTolerance = std::clamp(settingsJson.value("gap_tolerance", settings.gapTolerance), 0.0F, 1.0F);
+    settings.attractorEnabled = settingsJson.value("attractor_enabled", settings.attractorEnabled);
+    if (settingsJson.contains("attractor_position")) {
+        const auto position = settingsJson.at("attractor_position").get<std::array<float, 3>>();
+        settings.attractorPosition = {position[0], position[1], position[2]};
+    }
+    settings.attractorStrength = std::clamp(
+        settingsJson.value("attractor_strength", settings.attractorStrength),
+        0.0F,
+        1.0F);
     settings.maxSteps = settingsJson.value("max_steps", settings.maxSteps);
     settings.supportSampleLimit = settingsJson.value("support_sample_limit", settings.supportSampleLimit);
     return settings;
@@ -2877,6 +2893,7 @@ json SerializeWaterPathBranch(const WaterPathBranch& branch) {
         {"length", branch.length},
         {"flatness", branch.flatness},
         {"gap_count", branch.gapCount},
+        {"bake_fingerprint", branch.bakeFingerprint},
         {"raw_anchors", json::array()},
     };
     if (branch.parentId.has_value()) {
@@ -2905,6 +2922,7 @@ WaterPathBranch ParseWaterPathBranch(const json& branchJson) {
     branch.length = branchJson.value("length", branch.length);
     branch.flatness = branchJson.value("flatness", branch.flatness);
     branch.gapCount = branchJson.value("gap_count", branch.gapCount);
+    branch.bakeFingerprint = branchJson.value("bake_fingerprint", branch.bakeFingerprint);
     if (branchJson.contains("raw_anchors") && branchJson.at("raw_anchors").is_array()) {
         for (const auto& pointJson : branchJson.at("raw_anchors")) {
             branch.rawAnchors.push_back(ParseWaterOverlayPoint(pointJson));

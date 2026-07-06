@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pointcloud_coverage.glsl"
 
 layout(location = 0) in vec4 inSourceColor;
 layout(location = 1) in float inViewDepth;
@@ -168,15 +170,16 @@ void WriteAovs(vec3 albedo, vec3 normal, float aovWeight) {
 
 void main() {
     vec2 centered = (gl_PointCoord * 2.0) - 1.0;
-    float radiusSquared = dot(centered, centered);
-    if (radiusSquared > 1.0) {
+    const float coverage = PointCloudDiscCoverage(centered, styleData.renderParams2.x);
+    if (coverage <= 1.0e-5) {
         discard;
     }
 
+    float radiusSquared = dot(centered, centered);
     const float radius = sqrt(radiusSquared);
     const float falloff = ResolveFalloff(radius, radiusSquared);
     const float opacity = clamp(styleData.opacityBinding.constantValue.x, 0.0, 1.0);
-    const float alpha = clamp(opacity * falloff, 0.0, AlphaClampMax());
+    const float alpha = clamp(opacity * falloff * coverage, 0.0, AlphaClampMax());
     if (alpha <= 1e-5) {
         discard;
     }

@@ -459,6 +459,9 @@ PointCloudStyleState MakePointCloudStyleForSceneRole(
         if (normalized != "sand") {
             style.shorelineWaveEnabled = false;
         }
+        style.roughnessMotionFullLayer = normalized == "veg" || normalized == "vegetation";
+    } else {
+        style.roughnessMotionFullLayer = false;
     }
     return style;
 }

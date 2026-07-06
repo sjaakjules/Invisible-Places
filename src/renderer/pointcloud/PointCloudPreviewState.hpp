@@ -121,6 +121,7 @@ struct PointCloudStyleState {
     float roughnessMotionSpeed = 0.35F;
     float roughnessMotionThreshold = 0.58F;
     float roughnessMotionGroundId = 1.0F;
+    bool roughnessMotionFullLayer = false;
     float exposure = 1.0F;
     float innerRadius = 0.55F;
     float gaussianSharpness = 4.0F;

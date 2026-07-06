@@ -276,10 +276,10 @@ Owns coordinated water slices across:
 - `docs/water_features.md` and `docs/water_features_redesign_v2.md`
 
 Must preserve:
-- Active tabs are Ripples, Flow, and Field.
+- Active tabs are Ripples, Shoreline, Rain, Flow, and Field.
 - Base point-cloud scalar mappings remain source of truth.
-- Ripples and Field Surface Motion use virtual/effect overlays, not dense base-cloud scalar injection.
-- Flow Streams and Field Streamlines use generated stream surfels with the documented scalar-field contract.
+- Ripples use sparse runtime memberships, Shoreline uses the SAND point-cloud shader path, and Field Surface Motion uses virtual/effect overlays rather than dense permanent base-cloud scalar injection.
+- Flow Streams, Field Streamlines, and Rain Trails use generated stream surfels with the documented scalar-field contract.
 - New saves omit Basin/Runoff/Caustic region keys; old Basin/Runoff records are ignored and old Caustics migrate to Ripple Caustic Lace.
 
 ---

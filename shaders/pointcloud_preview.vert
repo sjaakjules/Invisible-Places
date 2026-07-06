@@ -126,6 +126,7 @@ const uint kWaterTrailLanePitchFieldSlot = 27u;
 const uint kWaterTrailLaneSpanFieldSlot = 28u;
 const uint kWaterTrailLaneCrossingFieldSlot = 29u;
 const uint kWaterTrailCrossSeedFieldSlot = 30u;
+const float kWaterTrailFeatureTypeRain = 4.0;
 const float kWaterParticleSpeedScale = 0.12;
 
 float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
@@ -393,7 +394,13 @@ vec3 SurfaceMotionNoiseVector(vec3 position, float time) {
 }
 
 float SurfaceMotionMask(uint pointIndex) {
-    if (styleData.stylisationControl.z == 0u || styleData.surfaceMotionParams.x <= 1e-5) {
+    if (styleData.surfaceMotionParams.x <= 1e-5) {
+        return 0.0;
+    }
+    if (styleData.stylisationControl.z == 0xffffffffu) {
+        return 1.0;
+    }
+    if (styleData.stylisationControl.z == 0u) {
         return 0.0;
     }
 
@@ -513,6 +520,46 @@ float WaterTrailTravelPhase(uint pointIndex) {
     return trailStartPhase + trailDistance / routeLength;
 }
 
+bool WaterTrailIsRain(uint pointIndex) {
+    if (styleData.globalControl.z <= kWaterTrailFeatureTypeFieldSlot) {
+        return false;
+    }
+    const float featureType = LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex);
+    return featureType > kWaterTrailFeatureTypeRain - 0.5 && featureType < kWaterTrailFeatureTypeRain + 0.5;
+}
+
+vec2 WaterTrailRouteSegment(uint pointIndex, float phase, bool timedAnchors) {
+    const uint routeStart = WaterTrailRouteStart(pointIndex);
+    const uint routeCount = WaterTrailRouteCount(pointIndex);
+    if (routeCount < 2u || routeStart >= styleData.pointMeta.x || routeStart + routeCount > styleData.pointMeta.x) {
+        return vec2(0.0);
+    }
+
+    const float routePhase = fract(phase);
+    if (timedAnchors) {
+        for (uint offset = 0u; offset + 1u < routeCount; ++offset) {
+            const float startPhase = clamp(
+                LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, routeStart + offset),
+                0.0,
+                1.0);
+            const float rawEndPhase = clamp(
+                LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, routeStart + offset + 1u),
+                0.0,
+                1.0);
+            const float endPhase = max(startPhase + 0.0001, rawEndPhase);
+            if (routePhase <= endPhase || offset + 2u >= routeCount) {
+                const float t = clamp((routePhase - startPhase) / max(0.0001, endPhase - startPhase), 0.0, 1.0);
+                return vec2(float(offset), t);
+            }
+        }
+        return vec2(float(routeCount - 2u), 1.0);
+    }
+
+    const float routePosition = routePhase * float(routeCount - 1u);
+    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 2u);
+    return vec2(float(anchorOffset), fract(routePosition));
+}
+
 float WaterTrailVisibility(uint pointIndex) {
     const float phase = WaterTrailTravelPhase(pointIndex);
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
@@ -528,9 +575,9 @@ vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition
         return fallbackPosition;
     }
 
-    const float routePosition = fract(phase) * float(routeCount - 1u);
-    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 1u);
-    const float t = fract(routePosition);
+    const vec2 segment = WaterTrailRouteSegment(pointIndex, phase, WaterTrailIsRain(pointIndex));
+    const uint anchorOffset = min(uint(segment.x), routeCount - 2u);
+    const float t = segment.y;
     const uint p0Offset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
     const uint p1Offset = anchorOffset;
     const uint p2Offset = min(anchorOffset + 1u, routeCount - 1u);
@@ -553,9 +600,9 @@ vec3 WaterTrailRouteTangent(uint pointIndex, float phase) {
         return dot(tangent, tangent) > 1e-8 ? normalize(tangent) : vec3(1.0, 0.0, 0.0);
     }
 
-    const float routePosition = fract(phase) * float(routeCount - 1u);
-    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 1u);
-    const uint prevOffset = anchorOffset > 0u ? anchorOffset - 1u : anchorOffset;
+    const vec2 segment = WaterTrailRouteSegment(pointIndex, phase, WaterTrailIsRain(pointIndex));
+    const uint anchorOffset = min(uint(segment.x), routeCount - 2u);
+    const uint prevOffset = anchorOffset;
     const uint nextOffset = min(anchorOffset + 1u, routeCount - 1u);
     const vec3 previous = pointPositions.positions[routeStart + prevOffset].xyz;
     const vec3 next = pointPositions.positions[routeStart + nextOffset].xyz;
@@ -575,9 +622,9 @@ vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {
         return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
     }
 
-    const float routePosition = fract(phase) * float(routeCount - 1u);
-    const uint anchorOffset = min(uint(floor(routePosition)), routeCount - 1u);
-    const float t = fract(routePosition);
+    const vec2 segment = WaterTrailRouteSegment(pointIndex, phase, WaterTrailIsRain(pointIndex));
+    const uint anchorOffset = min(uint(segment.x), routeCount - 2u);
+    const float t = segment.y;
     const uint p1Offset = anchorOffset;
     const uint p2Offset = min(anchorOffset + 1u, routeCount - 1u);
     const vec3 normal = mix(
@@ -585,6 +632,35 @@ vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {
         pointNormals.normals[routeStart + p2Offset].xyz,
         t);
     return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+}
+
+vec3 RainPseudoWindOffset(uint pointIndex, vec3 routePosition, vec3 routeTangent) {
+    const float windStrength = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailLanePitchFieldSlot, pointIndex));
+    const float windResponse = clamp(LoadScalarFieldValueForPoint(kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0, 2.0);
+    const float maxOffset = clamp(windStrength * windResponse * 0.10, 0.0, 0.11);
+    if (maxOffset <= 1e-5) {
+        return vec3(0.0);
+    }
+    const float seed = LoadScalarFieldValueForPoint(kWaterTrailCrossSeedFieldSlot, pointIndex);
+    const float pointSeed =
+        LoadScalarFieldValueForPoint(kWaterTrailPointAgeFieldSlot, pointIndex) +
+        LoadScalarFieldValueForPoint(kWaterTrailDistanceFieldSlot, pointIndex) * 0.013;
+    const float scale = 1.10 + windResponse * 0.45;
+    const float speed = 0.35 + windResponse * 0.55 + seed * 0.15;
+    const vec3 noisePosition =
+        (routePosition + vec3(seed * 19.7, pointSeed * 7.1, seed * 3.3)) * scale;
+    vec3 gust =
+        SurfaceMotionNoiseVector(noisePosition, max(0.0, uniforms.depthParameters.x) * speed) -
+        SurfaceMotionNoiseVector(noisePosition, 0.0);
+    const vec3 tangent = dot(routeTangent, routeTangent) > 1e-8 ? normalize(routeTangent) : vec3(0.0, 0.0, -1.0);
+    gust -= tangent * dot(gust, tangent);
+    gust.z *= 0.25;
+    vec3 offset = gust * maxOffset * 0.65;
+    const float offsetLength = length(offset);
+    if (offsetLength > maxOffset) {
+        offset *= maxOffset / offsetLength;
+    }
+    return offset;
 }
 
 vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
@@ -604,7 +680,11 @@ vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
         lateral = normalize(lateral);
     }
     const float lateralOffset = LoadScalarFieldValueForPoint(kWaterTrailLateralOffsetFieldSlot, pointIndex);
-    return routePosition + lateral * lateralOffset;
+    vec3 position = routePosition + lateral * lateralOffset;
+    if (WaterTrailIsRain(pointIndex)) {
+        position += RainPseudoWindOffset(pointIndex, routePosition, routeTangent);
+    }
+    return position;
 }
 
 vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
@@ -871,10 +951,12 @@ void main() {
                     sparseRipplePointSizeMultiply) +
                    waterEffectPointSizeAdd +
                    sparseRipplePointSizeAdd);
+    const float minPointSize = max(1.0, styleData.renderParams3.y);
+    const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
     gl_PointSize = clamp(
-        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth),
-        max(1.0, styleData.renderParams3.y),
-        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth) + max(0.0, styleData.renderParams2.x),
+        minPointSize,
+        maxPointSize);
 
     const float causticColorSignal = CausticColorSignal(caustic, previewTint);
     outSourceColor =

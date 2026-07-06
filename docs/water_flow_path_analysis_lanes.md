@@ -36,6 +36,10 @@ Outputs:
 - hidden branch state,
 - diagnostics about support spacing, bridge distance, branches, confidence, and gaps.
 
+Bake Path is now incremental at source granularity when the support signature is unchanged. Each branch stores a bake fingerprint derived from the emitter and resolved Path profile. Moving, adding, or deleting a source marks only that emitter ID dirty; global Path profile changes, support setting changes, and attractor edits still dirty all relevant source paths because they can affect every route.
+
+The optional Path attractor belongs to the Path bake stage. It is picked from the same grouped-scene support as sources and biases candidate ranking in XY only; Z remains the vertical descent axis through the downhill score and acceptance thresholds. Lane and Trail stages should treat the attractor as already baked into the anchors rather than as a playback force.
+
 Path bake must not know about Trail colour, Trail opacity, Trail emission, or display-only Lane parameters. Path setting/source changes dirty path bake and invalidate downstream Path Analysis, Lanes, and Trail samples.
 
 ### Path Analysis

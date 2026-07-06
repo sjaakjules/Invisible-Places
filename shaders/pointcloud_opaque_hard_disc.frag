@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pointcloud_coverage.glsl"
 
 layout(location = 0) in vec4 inSourceColor;
 
@@ -42,9 +44,10 @@ vec3 ResolveBaseColor() {
 
 void main() {
     vec2 centered = (gl_PointCoord * 2.0) - 1.0;
-    if (dot(centered, centered) > 1.0) {
+    const float coverage = PointCloudDiscCoverage(centered, styleData.renderParams2.x);
+    if (coverage <= 1.0e-5) {
         discard;
     }
 
-    outColor = vec4(ResolveBaseColor(), 1.0);
+    outColor = vec4(ResolveBaseColor(), coverage);
 }

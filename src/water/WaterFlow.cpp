@@ -287,6 +287,11 @@ WaterPathGenerationSettings TuneWaterPathSettings(
     tuned.branching = std::clamp(tuned.branching, 0.0F, 1.0F);
     tuned.coverage = std::clamp(tuned.coverage, 0.0F, 1.0F);
     tuned.gapTolerance = std::clamp(tuned.gapTolerance, 0.0F, 1.0F);
+    tuned.attractorStrength = std::clamp(tuned.attractorStrength, 0.0F, 1.0F);
+    if (!tuned.attractorEnabled || tuned.attractorStrength <= 1.0e-4F || !IsValidPoint(ToGlm(tuned.attractorPosition))) {
+        tuned.attractorEnabled = false;
+        tuned.attractorStrength = 0.0F;
+    }
     tuned.maxSteps = std::clamp<std::uint32_t>(std::max<std::uint32_t>(8U, tuned.maxSteps), 8U, 20000U);
     tuned.supportSampleLimit = std::max<std::uint32_t>(512U, tuned.supportSampleLimit);
 
@@ -546,12 +551,50 @@ std::vector<RankedNeighbour> RankDownhillNeighbours(
         const float zProgressBias =
             std::clamp(dropRatio, -1.0F, 1.0F) * 1.65F +
             downhillProgress * 1.10F;
+        // The attractor is horizontal guidance only; Z descent stays governed by the
+        // downhill score and acceptance thresholds so routes do not climb toward it.
+        float attractorBias = 0.0F;
+        if (settings.attractorEnabled && settings.attractorStrength > 1.0e-4F) {
+            const glm::vec3 attractor = ToGlm(settings.attractorPosition);
+            const glm::vec2 currentToAttractor{
+                attractor.x - current.position.x,
+                attractor.y - current.position.y};
+            const glm::vec2 candidateToAttractor{
+                attractor.x - candidate.position.x,
+                attractor.y - candidate.position.y};
+            const float currentAttractorDistance = glm::length(currentToAttractor);
+            const float candidateAttractorDistance = glm::length(candidateToAttractor);
+            if (currentAttractorDistance > 1.0e-4F) {
+                const float progressTowardAttractor =
+                    (currentAttractorDistance - candidateAttractorDistance) * inverseDistance;
+                const float proximityFade = 1.0F - SmoothStep(
+                    std::max(searchRadius * 0.50F, preferredStep),
+                    std::max(searchRadius * 18.0F, settings.pathLength * 0.85F),
+                    currentAttractorDistance);
+                attractorBias =
+                    std::clamp(progressTowardAttractor, -1.0F, 1.0F) *
+                    settings.attractorStrength *
+                    (0.55F + proximityFade * 0.70F);
+                if (horizontalDistance > 1.0e-5F) {
+                    const float axisProgress =
+                        ((std::abs(currentToAttractor.x) - std::abs(candidateToAttractor.x)) +
+                         (std::abs(currentToAttractor.y) - std::abs(candidateToAttractor.y))) /
+                        horizontalDistance;
+                    attractorBias +=
+                        std::clamp(axisProgress, -1.0F, 1.0F) *
+                        settings.attractorStrength *
+                        0.85F;
+                }
+            }
+        }
         const float score =
             (downhillScore * 4.15F) +
             (alignment * 1.35F) +
             (candidate.confidence * 1.25F) +
             (normalCoherence * 0.45F) +
             zProgressBias -
+            (attractorBias < 0.0F ? -attractorBias * 0.90F : 0.0F) +
+            std::max(0.0F, attractorBias) * 2.45F -
             bridgePenalty -
             uphillPenalty -
             lateralBridgePenalty -
@@ -2848,6 +2891,26 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
     return settings;
 }
 
+float WaterRainEffectiveWindResponse(const WaterRainSettings& settings) {
+    const float noiseMix = std::clamp(settings.windNoise, 0.0F, 2.0F);
+    return std::clamp(settings.windResponse * (0.55F + noiseMix * 0.45F), 0.0F, 2.0F);
+}
+
+float WaterRainPseudoWindDisplacementMeters(const WaterRainSettings& settings) {
+    return std::clamp(
+        std::max(0.0F, settings.windStrengthMeters) * WaterRainEffectiveWindResponse(settings) * 0.10F,
+        0.0F,
+        0.11F);
+}
+
+float WaterRainFallAngleDegrees(const WaterRainSettings& settings) {
+    const float slope = std::clamp(
+        std::max(0.0F, settings.windStrengthMeters) * WaterRainEffectiveWindResponse(settings) * 0.20F,
+        0.0F,
+        0.22F);
+    return std::atan(slope) * 57.2957795131F;
+}
+
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
     WaterSettingsBundle settings;
     settings.path = DefaultWaterPathGenerationSettings(mode);
@@ -2873,6 +2936,11 @@ bool WaterPathBakeInputsEqual(
            left.branching == right.branching &&
            left.coverage == right.coverage &&
            left.gapTolerance == right.gapTolerance &&
+           left.attractorEnabled == right.attractorEnabled &&
+           left.attractorPosition.x == right.attractorPosition.x &&
+           left.attractorPosition.y == right.attractorPosition.y &&
+           left.attractorPosition.z == right.attractorPosition.z &&
+           left.attractorStrength == right.attractorStrength &&
            left.maxSteps == right.maxSteps &&
            left.supportSampleLimit == right.supportSampleLimit;
 }
@@ -7001,6 +7069,11 @@ glm::vec3 SafeRainWindDirection(const WaterRainSettings& settings) {
     return glm::normalize(wind);
 }
 
+glm::vec3 RainFallDirection(const WaterRainSettings& settings) {
+    const float slope = std::tan(WaterRainFallAngleDegrees(settings) * 0.01745329251994F);
+    return glm::normalize((SafeRainWindDirection(settings) * slope) + glm::vec3{0.0F, 0.0F, -1.0F});
+}
+
 glm::vec3 SafeRainCameraForward(const WaterRainCameraFrame& cameraFrame) {
     glm::vec3 forward = ToGlm(cameraFrame.target) - ToGlm(cameraFrame.position);
     if (glm::dot(forward, forward) <= kNormalEpsilon) {
@@ -7117,10 +7190,7 @@ std::vector<RainRouteAnchor> BuildRainRouteAnchors(
     std::optional<std::uint32_t> firstHitIndex,
     const glm::vec3& noHitEnd,
     const glm::vec3& windDirection,
-    float windNoiseMeters,
     float supportOffset,
-    std::uint32_t seed,
-    std::uint32_t dropIndex,
     const WaterRainSettings& settings,
     bool* sandTermination,
     bool* fallbackTermination) {
@@ -7133,30 +7203,18 @@ std::vector<RainRouteAnchor> BuildRainRouteAnchors(
     const std::uint32_t routeCount = std::clamp<std::uint32_t>(settings.routeAnchorCount, 3U, 32U);
     std::vector<RainRouteAnchor> route;
     route.reserve(routeCount);
-    glm::vec3 lateral = glm::cross(windDirection + glm::vec3{0.0F, 0.0F, -1.0F}, glm::vec3{0.0F, 0.0F, 1.0F});
-    if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
-        lateral = {1.0F, 0.0F, 0.0F};
-    } else {
-        lateral = glm::normalize(lateral);
-    }
 
     AppendRainRouteAnchor(&route, spawn, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
     if (!firstHitIndex.has_value() || firstHitIndex.value() >= support.samples.size()) {
-        const float noise = (RegionHash01(seed + dropIndex, 0U, 9311U) - 0.5F) * 2.0F;
-        const float curl = std::sin(RegionHash01(seed, dropIndex, 9323U) * 6.28318530718F);
-        const glm::vec3 midpoint =
-            glm::mix(spawn, noHitEnd, 0.54F) + lateral * (noise * 0.55F + curl * 0.45F) * windNoiseMeters;
+        const glm::vec3 midpoint = glm::mix(spawn, noHitEnd, 0.54F);
         AppendRainRouteAnchor(&route, midpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
         AppendRainRouteAnchor(&route, noHitEnd, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
         return route;
     }
 
     const auto& first = support.samples[firstHitIndex.value()];
-    const float midNoise = (RegionHash01(seed + dropIndex, 1U, 9311U) - 0.5F) * 2.0F;
-    const float midCurl = std::sin(RegionHash01(seed, dropIndex, 9323U) * 6.28318530718F);
     const glm::vec3 firstHit = first.position + first.normal * supportOffset;
-    const glm::vec3 airMidpoint =
-        glm::mix(spawn, firstHit, 0.58F) + lateral * (midNoise * 0.55F + midCurl * 0.45F) * windNoiseMeters;
+    const glm::vec3 airMidpoint = glm::mix(spawn, firstHit, 0.58F);
     AppendRainRouteAnchor(&route, airMidpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
     AppendRainSupportAnchor(&route, first, supportOffset);
 
@@ -7283,6 +7341,7 @@ WaterTrailOverlay BuildRainTrailOverlay(
     forwardXy = glm::normalize(forwardXy);
 
     const glm::vec3 windDirection = SafeRainWindDirection(settings);
+    const glm::vec3 fallDirection = RainFallDirection(settings);
     const float sceneHeight = std::max(0.1F, support.bounds.maximum.z - support.bounds.minimum.z);
     const float spawnHeight = std::clamp(settings.spawnHeightMeters, 0.05F, sceneHeight + 200.0F);
     const float targetDistance = std::max(1.0F, glm::length(cameraTarget - cameraPosition));
@@ -7290,10 +7349,9 @@ WaterTrailOverlay BuildRainTrailOverlay(
         std::tan(std::clamp(cameraFrame.fovDegrees, 5.0F, 140.0F) * 0.00872664625997F);
     const float halfHeight = std::max(settings.spawnRadiusMeters, targetDistance * tanHalfFov);
     const float halfWidth = halfHeight * std::clamp(cameraFrame.aspectRatio, 0.25F, 4.0F);
-    const float spawnMargin = 1.0F + std::clamp(settings.spawnOutOfFrameMargin, 0.0F, 2.0F);
+    const float targetSpread = 1.0F + std::clamp(settings.spawnOutOfFrameMargin, 0.0F, 2.0F) * 0.35F;
     const float visualStrength = RainPresetVisualStrength(settings.intensityPreset);
-    const float windNoiseMeters =
-        std::max(0.0F, settings.windStrengthMeters * settings.windNoise * settings.windResponse);
+    const float effectiveWindResponse = WaterRainEffectiveWindResponse(settings);
     const float supportOffset = std::max(0.006F, settings.trailWidthMeters * 2.5F);
     const float visibleSpacing = std::clamp(settings.trailPointSpacingMeters, 0.01F, 5.0F);
     const std::uint32_t visibleSamplesPerDrop = std::clamp<std::uint32_t>(
@@ -7304,33 +7362,11 @@ WaterTrailOverlay BuildRainTrailOverlay(
     for (std::uint32_t dropIndex = 0; dropIndex < settings.dropCount; ++dropIndex) {
         const float u = (RegionHash01(settings.seed, dropIndex, 9101U) - 0.5F) * 2.0F;
         const float v = (RegionHash01(settings.seed, dropIndex, 9109U) - 0.5F) * 2.0F;
-        const float edgeChoice = RegionHash01(settings.seed, dropIndex, 9113U);
-        float spawnU = u;
-        float spawnV = v;
-        if (edgeChoice < 0.25F) {
-            spawnU = -spawnMargin;
-        } else if (edgeChoice < 0.50F) {
-            spawnU = spawnMargin;
-        } else if (edgeChoice < 0.75F) {
-            spawnV = -spawnMargin;
-        } else {
-            spawnV = spawnMargin;
-        }
         const glm::vec3 footprintCenter = cameraTarget;
         const glm::vec3 targetPoint =
             footprintCenter +
-            cameraRight * (u * halfWidth) +
-            forwardXy * (v * halfHeight);
-        const glm::vec3 spawnBase =
-            footprintCenter +
-            cameraRight * (spawnU * halfWidth) +
-            forwardXy * (spawnV * halfHeight);
-        glm::vec3 spawn{
-            spawnBase.x,
-            spawnBase.y,
-            support.bounds.maximum.z + spawnHeight +
-                RegionHash01(settings.seed, dropIndex, 9119U) * spawnHeight * 0.35F};
-        spawn -= windDirection * settings.windStrengthMeters * settings.windResponse * spawnHeight;
+            cameraRight * (u * halfWidth * targetSpread) +
+            forwardXy * (v * halfHeight * targetSpread);
 
         const glm::vec2 targetXy{targetPoint.x, targetPoint.y};
         const auto firstHitIndex = FindRainSupportSample(
@@ -7341,6 +7377,17 @@ WaterTrailOverlay BuildRainTrailOverlay(
             false);
 
         const bool hasSupportHit = firstHitIndex.has_value();
+        const glm::vec3 fallTarget =
+            hasSupportHit && firstHitIndex.value() < support.samples.size()
+                ? support.samples[firstHitIndex.value()].position +
+                      support.samples[firstHitIndex.value()].normal * supportOffset
+                : glm::vec3{targetPoint.x, targetPoint.y, support.bounds.minimum.z};
+        const float spawnZ =
+            support.bounds.maximum.z + spawnHeight +
+            RegionHash01(settings.seed, dropIndex, 9119U) * spawnHeight * 0.35F;
+        const float verticalDrop = std::max(0.10F, spawnZ - fallTarget.z);
+        const float windTravel = verticalDrop / std::max(0.05F, -fallDirection.z);
+        const glm::vec3 spawn = glm::vec3{fallTarget.x, fallTarget.y, spawnZ} - fallDirection * windTravel;
         const glm::vec3 noHitEnd{
             targetPoint.x,
             targetPoint.y,
@@ -7359,10 +7406,7 @@ WaterTrailOverlay BuildRainTrailOverlay(
             firstHitIndex,
             noHitEnd,
             windDirection,
-            windNoiseMeters,
             supportOffset,
-            settings.seed,
-            dropIndex,
             settings,
             &sandTermination,
             &fallbackTermination);
@@ -7432,7 +7476,7 @@ WaterTrailOverlay BuildRainTrailOverlay(
             routeSample.routeLength = routeLength;
             routeSample.trailStartPhase = routeAnchors[routeIndex].timeFraction;
             routeSample.trailLaneSpan = std::max(0.1F, settings.cameraDeathDistanceMeters);
-            routeSample.trailLaneCrossing = std::clamp(settings.windResponse, 0.0F, 2.0F);
+            routeSample.trailLaneCrossing = effectiveWindResponse;
             routeSample.trailCrossSeed = RegionHash01(settings.seed, dropIndex, 9133U);
             IncludeTrailSample(&overlay, routeSample);
         }
@@ -7480,7 +7524,7 @@ WaterTrailOverlay BuildRainTrailOverlay(
             sample.trailLaneCount = 1.0F;
             sample.trailLanePitch = std::max(0.0F, settings.windStrengthMeters);
             sample.trailLaneSpan = std::max(0.1F, settings.cameraDeathDistanceMeters);
-            sample.trailLaneCrossing = std::clamp(settings.windResponse, 0.0F, 2.0F);
+            sample.trailLaneCrossing = effectiveWindResponse;
             sample.trailCrossSeed = RegionHash01(settings.seed, dropIndex, 9181U);
             IncludeTrailSample(&overlay, sample);
             ++localDiagnostics.emittedSampleCount;

@@ -401,7 +401,13 @@ vec3 SurfaceMotionNoiseVector(vec3 position, float time) {
 }
 
 float SurfaceMotionMask(uint pointIndex) {
-    if (styleData.stylisationControl.z == 0u || styleData.surfaceMotionParams.x <= 1e-5) {
+    if (styleData.surfaceMotionParams.x <= 1e-5) {
+        return 0.0;
+    }
+    if (styleData.stylisationControl.z == 0xffffffffu) {
+        return 1.0;
+    }
+    if (styleData.stylisationControl.z == 0u) {
         return 0.0;
     }
 
@@ -646,6 +652,34 @@ vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {
     return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
 }
 
+vec3 RainPseudoWindOffset(uint pointIndex, vec3 routePosition, vec3 routeTangent) {
+    const float windStrength = max(0.0, LoadScalarFieldValue(kWaterTrailLanePitchFieldSlot, pointIndex));
+    const float windResponse = clamp(LoadScalarFieldValue(kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0, 2.0);
+    const float maxOffset = clamp(windStrength * windResponse * 0.10, 0.0, 0.11);
+    if (maxOffset <= 1e-5) {
+        return vec3(0.0);
+    }
+    const float seed = LoadScalarFieldValue(kWaterTrailCrossSeedFieldSlot, pointIndex);
+    const float pointSeed = LoadScalarFieldValue(kWaterTrailPointAgeFieldSlot, pointIndex) +
+        LoadScalarFieldValue(kWaterTrailDistanceFieldSlot, pointIndex) * 0.013;
+    const float scale = 1.10 + windResponse * 0.45;
+    const float speed = 0.35 + windResponse * 0.55 + seed * 0.15;
+    const vec3 noisePosition =
+        (routePosition + vec3(seed * 19.7, pointSeed * 7.1, seed * 3.3)) * scale;
+    vec3 gust =
+        SurfaceMotionNoiseVector(noisePosition, max(0.0, uniforms.depthParameters.x) * speed) -
+        SurfaceMotionNoiseVector(noisePosition, 0.0);
+    const vec3 tangent = dot(routeTangent, routeTangent) > 1e-8 ? normalize(routeTangent) : vec3(0.0, 0.0, -1.0);
+    gust -= tangent * dot(gust, tangent);
+    gust.z *= 0.25;
+    vec3 offset = gust * maxOffset * 0.65;
+    const float offsetLength = length(offset);
+    if (offsetLength > maxOffset) {
+        offset *= maxOffset / offsetLength;
+    }
+    return offset;
+}
+
 vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
     const float trailRole = LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex);
     if (trailRole < 0.5) {
@@ -665,15 +699,7 @@ vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
     const float lateralOffset = LoadScalarFieldValue(kWaterTrailLateralOffsetFieldSlot, pointIndex);
     vec3 position = routePosition + lateral * lateralOffset;
     if (WaterTrailIsRain(pointIndex)) {
-        const float windStrength = max(0.0, LoadScalarFieldValue(kWaterTrailLanePitchFieldSlot, pointIndex));
-        const float windResponse = clamp(LoadScalarFieldValue(kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0, 2.0);
-        const float seed = LoadScalarFieldValue(kWaterTrailCrossSeedFieldSlot, pointIndex);
-        const float pointSeed = LoadScalarFieldValue(kWaterTrailPointAgeFieldSlot, pointIndex) +
-            LoadScalarFieldValue(kWaterTrailDistanceFieldSlot, pointIndex) * 0.013;
-        const float sway =
-            sin((uniforms.depthParameters.x * (1.7 + seed) + seed * 17.31 + pointSeed * 5.13) * 6.28318530718) *
-            windStrength * windResponse * 0.055;
-        position += lateral * sway;
+        position += RainPseudoWindOffset(pointIndex, routePosition, routeTangent);
     }
     return position;
 }
@@ -977,6 +1003,11 @@ float ResolveDepthOfFieldWorldRadius(float viewDepth) {
     return max(0.0, blurNdcY * max(0.001, viewDepth) / max(abs(uniforms.projection[1][1]), 1e-5));
 }
 
+float ScreenPixelWorldSpan(float viewDepth, float pixels) {
+    const float spanNdcY = max(0.0, pixels) * uniforms.viewportParameters.w;
+    return max(0.0, spanNdcY * max(0.001, viewDepth) / max(abs(uniforms.projection[1][1]), 1e-5));
+}
+
 void main() {
     const uint encodedVertexIndex = uint(gl_VertexIndex);
     const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
@@ -1021,7 +1052,8 @@ void main() {
              sparseRipplePointSizeMultiply) +
         waterEffectPointSizeAdd +
         sparseRipplePointSizeAdd +
-        (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
+        (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
+        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
     const float waterStreakAspect =
         WaterTrailOverlayEnabled()
             ? max(1.0, LoadScalarFieldValue(kWaterTrailStreakLengthFieldSlot, pointIndex) / max(diameter, 0.0001))

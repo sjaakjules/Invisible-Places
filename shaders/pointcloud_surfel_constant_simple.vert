@@ -139,6 +139,11 @@ float ResolveDepthOfFieldWorldRadius(float viewDepth) {
     return max(0.0, blurNdcY * max(0.001, viewDepth) / max(abs(uniforms.projection[1][1]), 1e-5));
 }
 
+float ScreenPixelWorldSpan(float viewDepth, float pixels) {
+    const float spanNdcY = max(0.0, pixels) * uniforms.viewportParameters.w;
+    return max(0.0, spanNdcY * max(0.001, viewDepth) / max(abs(uniforms.projection[1][1]), 1e-5));
+}
+
 void main() {
     const uint encodedVertexIndex = uint(gl_VertexIndex);
     const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
@@ -154,7 +159,8 @@ void main() {
     const float centerDepth = -centerViewPosition.z;
     const float diameter =
         max(0.0, styleData.surfelDiameterBinding.constantValue.x) +
-        (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0);
+        (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
+        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
     const vec3 offset = (tangent * corner.x + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
     const vec4 viewPosition = uniforms.view * worldPosition;

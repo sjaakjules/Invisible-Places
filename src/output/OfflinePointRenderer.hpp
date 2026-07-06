@@ -22,6 +22,7 @@ struct OfflinePointLayer {
     bool fastBasic = false;
     std::uint64_t drawPointCount = 0;
     glm::mat4 localToWorld{1.0F};
+    bool roughnessMotionFullLayer = false;
     std::size_t roughnessMotionFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t groundIdMotionFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t waterEffectEmissionAddFieldSlot = std::numeric_limits<std::size_t>::max();

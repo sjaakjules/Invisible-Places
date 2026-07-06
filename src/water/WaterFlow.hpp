@@ -143,6 +143,9 @@ struct WaterPathGenerationSettings {
     float branching = 0.70F;
     float coverage = 0.65F;
     float gapTolerance = 0.60F;
+    bool attractorEnabled = false;
+    invisible_places::io::Float3 attractorPosition{};
+    float attractorStrength = 0.0F;
     std::uint32_t maxSteps = 2200;
     std::uint32_t supportSampleLimit = 450000;
 };
@@ -208,6 +211,7 @@ struct WaterEffectLayer {
     WaterRippleOverlayType rippleOverlayType = WaterRippleOverlayType::CausticLace;
     WaterEffectBlendMode blendMode = WaterEffectBlendMode::Add;
     std::filesystem::path targetLayerSourcePath;
+    std::vector<std::string> targetSceneRoles;
     std::vector<invisible_places::io::Float3> vertices;
     std::vector<invisible_places::io::Float3> hull;
     bool enabledInViewport = true;
@@ -427,6 +431,9 @@ inline constexpr float kWaterTrailFeatureTypeRain = 4.0F;
 [[nodiscard]] WaterRainSettings ApplyWaterRainIntensityPreset(
     WaterRainSettings settings,
     WaterRainIntensityPreset preset);
+[[nodiscard]] float WaterRainEffectiveWindResponse(const WaterRainSettings& settings);
+[[nodiscard]] float WaterRainPseudoWindDisplacementMeters(const WaterRainSettings& settings);
+[[nodiscard]] float WaterRainFallAngleDegrees(const WaterRainSettings& settings);
 
 struct WaterFieldNode {
     invisible_places::io::Float3 position{};
@@ -834,6 +841,7 @@ struct WaterPathBranch {
     float length = 0.0F;
     float flatness = 0.0F;
     std::uint32_t gapCount = 0;
+    std::string bakeFingerprint;
     std::vector<WaterOverlayPoint> rawAnchors;
 };
 

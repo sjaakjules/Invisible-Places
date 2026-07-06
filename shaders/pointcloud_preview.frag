@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#include "pointcloud_coverage.glsl"
 
 layout(location = 2) in float inOpacity;
 layout(location = 5) in float inDepthFade;
@@ -79,10 +80,12 @@ float ResolveDepthFadeAlpha(float depthFade) {
 
 void main() {
     vec2 centered = (gl_PointCoord * 2.0) - 1.0;
-    float radiusSquared = dot(centered, centered);
-    if (radiusSquared > 1.0) {
+    const float coverage = PointCloudDiscCoverage(centered, styleData.renderParams2.x);
+    if (coverage <= 1.0e-5) {
         discard;
     }
+
+    float radiusSquared = dot(centered, centered);
     float radius = sqrt(radiusSquared);
 
     float opacity = clamp(inOpacity, 0.0, 1.0);
@@ -90,7 +93,7 @@ void main() {
     float alpha =
         clamp(
             opacity * edge * PointStylisationCoverage(centered, radius, radiusSquared, inPointIndex) *
-                ResolveDepthFadeAlpha(inDepthFade),
+                ResolveDepthFadeAlpha(inDepthFade) * coverage,
             0.0,
             AlphaClampMax());
     if (alpha <= 1e-5 ||

@@ -40,6 +40,8 @@ namespace {
 #define VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
 #endif
 
+constexpr float kPointCloudAntialiasFeatherPixels = 1.0F;
+
 struct QueueFamilySelection {
     std::optional<std::uint32_t> graphicsFamily;
     std::optional<std::uint32_t> presentFamily;
@@ -2818,7 +2820,7 @@ void VulkanViewportShell::CreatePointPipelines() {
         inputAssembly,
         opaqueHardDiscFragmentModule,
         3,
-        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        std::vector<VkPipelineColorBlendAttachmentState>{MakeAlphaBlendAttachment()},
         true,
         false,
         VK_COMPARE_OP_LESS_OR_EQUAL,
@@ -2889,7 +2891,7 @@ void VulkanViewportShell::CreatePointPipelines() {
         surfelInputAssembly,
         surfelOpaqueHardDiscFragmentModule,
         3,
-        std::vector<VkPipelineColorBlendAttachmentState>{opaqueColorBlend},
+        std::vector<VkPipelineColorBlendAttachmentState>{MakeAlphaBlendAttachment()},
         true,
         false,
         VK_COMPARE_OP_LESS_OR_EQUAL,
@@ -5819,7 +5821,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         0.0F,
     };
     styleGpu.renderParams2 = glm::vec4{
-        1.0F,
+        kPointCloudAntialiasFeatherPixels,
         0.0F,
         std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
         renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
@@ -5855,28 +5857,42 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         std::clamp(layer.style.granulationAngleStrength, 0.0F, 1.0F),
     };
     if (layer.style.roughnessMotionStrength > 1.0e-5F) {
-        const auto roughnessSlot = FindRoughnessScalarFieldSlot(layer.scalarFields);
-        if (roughnessSlot.has_value() && roughnessSlot.value() < layer.scalarFields.size()) {
-            const auto& roughnessStats = layer.scalarFields[roughnessSlot.value()];
-            const float roughnessRange =
-                std::max(1.0e-6F, roughnessStats.maximum - roughnessStats.minimum);
-            styleGpu.stylisationControl.z = roughnessSlot.value() + 1U;
-            if (const auto groundSlot = FindGroundIdScalarFieldSlot(layer.scalarFields);
-                groundSlot.has_value() && groundSlot.value() < layer.scalarFields.size()) {
-                styleGpu.stylisationControl.w = groundSlot.value() + 1U;
-            }
+        auto setSurfaceMotionParams = [&]() {
             styleGpu.surfaceMotionParams = glm::vec4{
                 std::clamp(layer.style.roughnessMotionStrength, 0.0F, 1.0F),
                 std::clamp(layer.style.roughnessMotionScale, 0.01F, 50.0F),
                 std::clamp(layer.style.roughnessMotionSpeed, 0.0F, 8.0F),
                 std::clamp(layer.style.roughnessMotionThreshold, 0.0F, 1.0F),
             };
+        };
+        if (layer.style.roughnessMotionFullLayer) {
+            styleGpu.stylisationControl.z = std::numeric_limits<std::uint32_t>::max();
+            setSurfaceMotionParams();
             styleGpu.surfaceMotionStats = glm::vec4{
-                roughnessStats.minimum,
-                1.0F / roughnessRange,
+                0.0F,
+                1.0F,
                 std::clamp(layer.style.roughnessMotionGroundId, 0.0F, 1.0F),
                 0.25F,
             };
+        } else {
+            const auto roughnessSlot = FindRoughnessScalarFieldSlot(layer.scalarFields);
+            if (roughnessSlot.has_value() && roughnessSlot.value() < layer.scalarFields.size()) {
+                const auto& roughnessStats = layer.scalarFields[roughnessSlot.value()];
+                const float roughnessRange =
+                    std::max(1.0e-6F, roughnessStats.maximum - roughnessStats.minimum);
+                styleGpu.stylisationControl.z = roughnessSlot.value() + 1U;
+                if (const auto groundSlot = FindGroundIdScalarFieldSlot(layer.scalarFields);
+                    groundSlot.has_value() && groundSlot.value() < layer.scalarFields.size()) {
+                    styleGpu.stylisationControl.w = groundSlot.value() + 1U;
+                }
+                setSurfaceMotionParams();
+                styleGpu.surfaceMotionStats = glm::vec4{
+                    roughnessStats.minimum,
+                    1.0F / roughnessRange,
+                    std::clamp(layer.style.roughnessMotionGroundId, 0.0F, 1.0F),
+                    0.25F,
+                };
+            }
         }
     }
     if (renderer::pointcloud::PointCloudStyleHasActiveCaustics(layer.style)) {

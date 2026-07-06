@@ -95,10 +95,12 @@ void main() {
                   styleData.pointSizeBinding.constantValue.x,
                   max(1.0, styleData.renderParams3.y),
                   max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+    const float minPointSize = max(1.0, styleData.renderParams3.y);
+    const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
     gl_PointSize = clamp(
-        basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth),
-        max(1.0, styleData.renderParams3.y),
-        max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+        basePointSize + ResolveDepthOfFieldBlurPixels(viewDepth) + max(0.0, styleData.renderParams2.x),
+        minPointSize,
+        maxPointSize);
 
     outSourceColor = inColor;
     outViewDepth = viewDepth;

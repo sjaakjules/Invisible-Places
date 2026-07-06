@@ -1221,16 +1221,26 @@ TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shore
     const auto helperEnd = shader.find("\n}\n\nfloat RippleWetSheenValue", helperPos);
     REQUIRE(helperEnd != std::string::npos);
     const auto helperBody = shader.substr(helperPos, helperEnd - helperPos);
+    CHECK(helperBody.find("const float t = phase;") != std::string::npos);
+    CHECK(helperBody.find("const float t = -phase;") == std::string::npos);
     CHECK(helperBody.find("const float alongShore = uv.y;") != std::string::npos);
     CHECK(helperBody.find("finishOffset - max(0.0, shoreDistance)") != std::string::npos);
     CHECK(helperBody.find("const float incomingMask") != std::string::npos);
+    CHECK(helperBody.find("const float incomingDeepSideMask") != std::string::npos);
+    CHECK(helperBody.find("const float incomingStartMask") != std::string::npos);
+    CHECK(helperBody.find("const float incomingBodyFoam") != std::string::npos);
     CHECK(helperBody.find("const float arrivingFoam") != std::string::npos);
+    CHECK(helperBody.find("const float frontLocalCoordinate = front;") != std::string::npos);
     CHECK(helperBody.find("const vec2 waveFrontStreakUv") != std::string::npos);
     CHECK(helperBody.find("const float waveFrontStreakNoise") != std::string::npos);
+    CHECK(helperBody.find("frontLocalCoordinate * (2.05 + turbulence01 * 0.45)") != std::string::npos);
+    CHECK(helperBody.find("x * (2.05 + turbulence01 * 0.45)") == std::string::npos);
     CHECK(helperBody.find("const float incomingFollowMask") != std::string::npos);
     CHECK(helperBody.find("const float trailDistance = max(0.0, front);") != std::string::npos);
     CHECK(helperBody.find("const float returnFollowMask") != std::string::npos);
     CHECK(helperBody.find("const float edgeIntroduce = smoothstep(0.0, 0.18, returnProgress);") != std::string::npos);
+    CHECK(helperBody.find("const float peakCarryFade") != std::string::npos);
+    CHECK(helperBody.find("edgeValue * edgeIntroduce") != std::string::npos);
 
     const auto evaluatePos = shader.find("SparseRippleComposite EvaluateShorelineWaveContribution(");
     REQUIRE(evaluatePos != std::string::npos);
@@ -1848,6 +1858,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     document.waterSourceSettings = invisible_places::water::DefaultWaterSourceSettings(
         invisible_places::water::WaterScaleMode::Detail);
     document.waterSourceSettings.path.pathLength = 4.25F;
+    document.waterSourceSettings.path.attractorEnabled = true;
+    document.waterSourceSettings.path.attractorPosition = {1.25F, 2.50F, 3.75F};
+    document.waterSourceSettings.path.attractorStrength = 0.42F;
     document.waterSourceSettings.trailShape.particleJitter = 0.64F;
     document.waterSourceSettings.trailShape.splineAnchorSpacing = 0.37F;
     document.waterSourceSettings.trailShape.trailLaneCount = 11U;
@@ -1956,6 +1969,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     projectBranch.emitterId = waterEmitter.id;
     projectBranch.role = invisible_places::water::WaterPathBranchRole::Main;
     projectBranch.length = 2.5F;
+    projectBranch.bakeFingerprint = "emitter=17|roundtrip";
     projectBranch.rawAnchors.push_back({
         .position = {1.0F, 2.0F, 3.0F},
         .normal = {0.0F, 0.0F, 1.0F},
@@ -1996,6 +2010,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     rippleLayer.featureType = invisible_places::water::WaterEffectFeatureType::Ripple;
     rippleLayer.rippleOverlayType = invisible_places::water::WaterRippleOverlayType::CausticLace;
     rippleLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    rippleLayer.targetSceneRoles = {"ROCK", "VEG"};
     rippleLayer.vertices = causticLaceVertices;
     rippleLayer.hull = invisible_places::water::BuildWaterRegionHull(rippleLayer.vertices);
     rippleLayer.edgeBlendWidth = causticLaceEdgeBlend;
@@ -2007,6 +2022,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     fieldLayer.name = "Rock edge field";
     fieldLayer.featureType = invisible_places::water::WaterEffectFeatureType::FieldSurfaceMotion;
     fieldLayer.targetLayerSourcePath = "Data/Site2 -5mm.ply";
+    fieldLayer.targetSceneRoles = {"VEG"};
     fieldLayer.vertices = causticLaceVertices;
     fieldLayer.hull = invisible_places::water::BuildWaterRegionHull(fieldLayer.vertices);
     fieldLayer.edgeBlendWidth = 0.24F;
@@ -2152,6 +2168,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"npr_preset\"") != std::string::npos);
         CHECK(savedJson.find("\"water_emitters\"") != std::string::npos);
         CHECK(savedJson.find("\"water_source_settings\"") != std::string::npos);
+        CHECK(savedJson.find("\"attractor_enabled\"") != std::string::npos);
+        CHECK(savedJson.find("\"bake_fingerprint\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_animation_trail_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_length_meters\"") != std::string::npos);
@@ -2185,6 +2203,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"water_caustic_regions\"") == std::string::npos);
         CHECK(savedJson.find("\"water_ripple_layers\"") != std::string::npos);
         CHECK(savedJson.find("\"water_field_layers\"") != std::string::npos);
+        CHECK(savedJson.find("\"target_scene_roles\"") != std::string::npos);
         CHECK(savedJson.find("\"field_surface_motion\"") != std::string::npos);
         CHECK(savedJson.find("\"caustic_lace\"") != std::string::npos);
         CHECK(savedJson.find("\"water_flow_trail_settings\"") != std::string::npos);
@@ -2255,6 +2274,11 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->renderJobSettings.endFrame == 42);
     CHECK(loadedDocument->renderJobSettings.toShotIndex == 1);
     CHECK(loadedDocument->waterSourceSettings.path.pathLength == Catch::Approx(4.25F));
+    CHECK(loadedDocument->waterSourceSettings.path.attractorEnabled);
+    CHECK(loadedDocument->waterSourceSettings.path.attractorPosition.x == Catch::Approx(1.25F));
+    CHECK(loadedDocument->waterSourceSettings.path.attractorPosition.y == Catch::Approx(2.50F));
+    CHECK(loadedDocument->waterSourceSettings.path.attractorPosition.z == Catch::Approx(3.75F));
+    CHECK(loadedDocument->waterSourceSettings.path.attractorStrength == Catch::Approx(0.42F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.particleJitter == Catch::Approx(0.64F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.splineAnchorSpacing == Catch::Approx(0.37F));
     CHECK(loadedDocument->waterSourceSettings.trailShape.trailLaneCount == 11U);
@@ -2350,6 +2374,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterPathCache->emitterSettingsFingerprint == "roundtrip-fingerprint");
     REQUIRE(loadedDocument->waterPathCache->branches.size() == 1U);
     CHECK(loadedDocument->waterPathCache->branches[0].id == 31U);
+    CHECK(loadedDocument->waterPathCache->branches[0].bakeFingerprint == "emitter=17|roundtrip");
     REQUIRE(loadedDocument->waterPathCache->branches[0].rawAnchors.size() == 2U);
     CHECK(loadedDocument->waterPathCache->branches[0].rawAnchors[1].pathDistance == Catch::Approx(2.5F));
     CHECK(loadedDocument->waterPathCache->hiddenBranchIds == std::vector<std::uint32_t>{99U});
@@ -2364,6 +2389,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         invisible_places::water::WaterRippleOverlayType::CausticLace);
     CHECK(loadedDocument->waterRippleLayers[0].edgeBlendWidth == Catch::Approx(0.70F));
     CHECK(loadedDocument->waterRippleLayers[0].wavelengthMeters == Catch::Approx(0.18F));
+    REQUIRE(loadedDocument->waterRippleLayers[0].targetSceneRoles.size() == 2U);
+    CHECK(loadedDocument->waterRippleLayers[0].targetSceneRoles[0] == "ROCK");
+    CHECK(loadedDocument->waterRippleLayers[0].targetSceneRoles[1] == "VEG");
     REQUIRE(loadedDocument->waterFieldLayers.size() == 2U);
     CHECK(loadedDocument->waterFieldLayers[0].name == "Rock edge field");
     CHECK(
@@ -2372,6 +2400,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterFieldLayers[0].edgeBlendWidth == Catch::Approx(0.24F));
     CHECK(loadedDocument->waterFieldLayers[0].regionStrength == Catch::Approx(0.82F));
     CHECK(loadedDocument->waterFieldLayers[0].directionY == Catch::Approx(1.0F));
+    REQUIRE(loadedDocument->waterFieldLayers[0].targetSceneRoles.size() == 1U);
+    CHECK(loadedDocument->waterFieldLayers[0].targetSceneRoles[0] == "VEG");
     CHECK(loadedDocument->waterFieldLayers[1].name == "No flow backside");
     CHECK(
         loadedDocument->waterFieldLayers[1].featureType ==
@@ -3774,6 +3804,28 @@ TEST_CASE("Water Rain intensity presets scale density speed wind and visual stre
     CHECK(rain.windResponse > downpour.windResponse);
     CHECK(light.windNoise > rain.windNoise);
     CHECK(rain.windNoise > downpour.windNoise);
+    CHECK(
+        invisible_places::water::WaterRainEffectiveWindResponse(light) >
+        invisible_places::water::WaterRainEffectiveWindResponse(rain));
+    CHECK(
+        invisible_places::water::WaterRainEffectiveWindResponse(rain) >
+        invisible_places::water::WaterRainEffectiveWindResponse(downpour));
+    CHECK(
+        invisible_places::water::WaterRainPseudoWindDisplacementMeters(light) >
+        invisible_places::water::WaterRainPseudoWindDisplacementMeters(rain));
+    CHECK(
+        invisible_places::water::WaterRainPseudoWindDisplacementMeters(rain) >
+        invisible_places::water::WaterRainPseudoWindDisplacementMeters(downpour));
+    CHECK(invisible_places::water::WaterRainPseudoWindDisplacementMeters(light) > 0.040F);
+    CHECK(invisible_places::water::WaterRainPseudoWindDisplacementMeters(light) < 0.080F);
+    CHECK(invisible_places::water::WaterRainPseudoWindDisplacementMeters(rain) > 0.008F);
+    CHECK(invisible_places::water::WaterRainPseudoWindDisplacementMeters(rain) < 0.020F);
+    CHECK(invisible_places::water::WaterRainPseudoWindDisplacementMeters(downpour) < 0.004F);
+    CHECK(invisible_places::water::WaterRainFallAngleDegrees(light) > 4.0F);
+    CHECK(invisible_places::water::WaterRainFallAngleDegrees(light) < 8.0F);
+    CHECK(invisible_places::water::WaterRainFallAngleDegrees(rain) > 0.8F);
+    CHECK(invisible_places::water::WaterRainFallAngleDegrees(rain) < 2.0F);
+    CHECK(invisible_places::water::WaterRainFallAngleDegrees(downpour) < 0.4F);
 
     const auto rock = MakeRainSupportFixtureCloud("rain-preset-rock", 0.20F);
     const std::array<invisible_places::water::WaterSceneSupportLayer, 1> layers{
@@ -3827,6 +3879,31 @@ TEST_CASE("Water Rain intensity presets scale density speed wind and visual stre
     CHECK(firstRainVisible->wetness < firstDownpourVisible->wetness);
     CHECK(firstLightVisible->trailLaneCrossing > firstRainVisible->trailLaneCrossing);
     CHECK(firstRainVisible->trailLaneCrossing > firstDownpourVisible->trailLaneCrossing);
+}
+
+TEST_CASE("Water Rain pseudo wind reuses surface motion noise", "[water][rain][shader][offline]") {
+    const auto shaderRoot = DataRoot().parent_path() / "shaders";
+    const auto readText = [](const std::filesystem::path& path) {
+        std::ifstream input{path};
+        REQUIRE(input.good());
+        return std::string{
+            std::istreambuf_iterator<char>{input},
+            std::istreambuf_iterator<char>{}};
+    };
+
+    const auto previewShader = readText(shaderRoot / "pointcloud_preview.vert");
+    const auto surfelShader = readText(shaderRoot / "pointcloud_surfel.vert");
+    const auto offlinePath = DataRoot().parent_path() / "src" / "output" / "OfflinePointRenderer.cpp";
+    const auto offlineRenderer = readText(offlinePath);
+
+    CHECK(previewShader.find("vec3 RainPseudoWindOffset") != std::string::npos);
+    CHECK(surfelShader.find("vec3 RainPseudoWindOffset") != std::string::npos);
+    CHECK(offlineRenderer.find("glm::vec3 RainPseudoWindOffset") != std::string::npos);
+    CHECK(previewShader.find("SurfaceMotionNoiseVector(noisePosition") != std::string::npos);
+    CHECK(surfelShader.find("SurfaceMotionNoiseVector(noisePosition") != std::string::npos);
+    CHECK(offlineRenderer.find("SurfaceMotionNoiseVector(noisePosition") != std::string::npos);
+    CHECK(surfelShader.find("sin((uniforms.depthParameters.x * (1.7 + seed)") == std::string::npos);
+    CHECK(offlineRenderer.find("std::sin((timeSeconds * (1.7F + seed)") == std::string::npos);
 }
 
 TEST_CASE("Water Rain routes deterministic falling drops to sand support", "[water][rain]") {
@@ -3911,8 +3988,32 @@ TEST_CASE("Water Rain routes deterministic falling drops to sand support", "[wat
     CHECK(firstVisibleSample->routePointCount <= static_cast<float>(settings.routeAnchorCount));
     CHECK(firstVisibleSample->trailLanePitch == Catch::Approx(settings.windStrengthMeters));
     CHECK(firstVisibleSample->trailLaneSpan == Catch::Approx(settings.cameraDeathDistanceMeters));
-    CHECK(firstVisibleSample->trailLaneCrossing == Catch::Approx(settings.windResponse));
+    CHECK(
+        firstVisibleSample->trailLaneCrossing ==
+        Catch::Approx(invisible_places::water::WaterRainEffectiveWindResponse(settings)));
     CHECK(firstVisibleSample->trailStreakLength >= firstVisibleSample->trailWidth * 2.0F);
+
+    std::vector<glm::vec3> airborneDirections;
+    auto toVec3 = [](const invisible_places::io::Float3& point) {
+        return glm::vec3{point.x, point.y, point.z};
+    };
+    for (std::uint32_t dropIndex = 0; dropIndex < settings.dropCount; ++dropIndex) {
+        std::vector<glm::vec3> anchors;
+        const float pathId = static_cast<float>(dropIndex + 1U);
+        for (const auto& sample : overlayA.samples) {
+            if (sample.trailRole < 0.5F &&
+                std::abs(sample.pathId - pathId) <= 0.5F) {
+                anchors.push_back(toVec3(sample.position));
+            }
+        }
+        REQUIRE(anchors.size() >= 2U);
+        const auto direction = glm::normalize(anchors[1] - anchors[0]);
+        airborneDirections.push_back(direction);
+    }
+    REQUIRE_FALSE(airborneDirections.empty());
+    for (const auto& direction : airborneDirections) {
+        CHECK(glm::dot(direction, airborneDirections.front()) > 0.999F);
+    }
 
     const auto cloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
         overlayA,
@@ -3932,7 +4033,7 @@ TEST_CASE("Water Rain routes deterministic falling drops to sand support", "[wat
     CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(28, firstVisibleIndex)] ==
           Catch::Approx(settings.cameraDeathDistanceMeters));
     CHECK(cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(29, firstVisibleIndex)] ==
-          Catch::Approx(settings.windResponse));
+          Catch::Approx(invisible_places::water::WaterRainEffectiveWindResponse(settings)));
 }
 
 TEST_CASE("Water Rain follows lower support points slowly after impact", "[water][rain]") {
@@ -7326,6 +7427,107 @@ TEST_CASE("Site3 path analysis fixture parses and bakes when sample data exists"
     CHECK(MeanAnalysisValue(cache.analysis.value(), &invisible_places::water::WaterPathAnalysisSample::speed) > 0.0F);
 }
 
+TEST_CASE("Water path attractor biases a downhill fork without climbing Z", "[water][path]") {
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.sourcePath = "synthetic-water-attractor-fork.ply";
+    cloud.layerName = "synthetic-water-attractor-fork";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    cloud.positions.push_back({0.0F, 0.0F, 1.0F});
+    cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+    cloud.packedColors.push_back(0xFFFFFFFFU);
+    cloud.bounds.Expand(cloud.positions.back());
+    for (int step = 1; step <= 9; ++step) {
+        const float y = static_cast<float>(step) * 0.020F;
+        const float z = 1.0F - static_cast<float>(step) * 0.055F;
+        for (const auto position : std::array<invisible_places::io::Float3, 2>{
+                 invisible_places::io::Float3{-0.040F, y, z},
+                 invisible_places::io::Float3{0.040F, y, z}}) {
+            cloud.positions.push_back(position);
+            cloud.normals.push_back({0.0F, 0.0F, 1.0F});
+            cloud.packedColors.push_back(0xFFFFFFFFU);
+            cloud.bounds.Expand(position);
+        }
+    }
+    cloud.focusPoint = cloud.positions.front();
+    cloud.hasFocusPoint = true;
+
+    auto settings = invisible_places::water::DefaultWaterPathGenerationSettings(
+        invisible_places::water::WaterScaleMode::Detail);
+    settings.autoTune = false;
+    settings.supportVoxelSize = 0.010F;
+    settings.maxBridgeDistance = 0.105F;
+    settings.pathLength = 0.65F;
+    settings.pathSampleSpacing = 0.012F;
+    settings.branching = 0.0F;
+    settings.coverage = 0.0F;
+    settings.gapTolerance = 0.35F;
+    settings.attractorEnabled = true;
+    settings.attractorPosition = {0.040F, 0.18F, 0.505F};
+    settings.attractorStrength = 1.0F;
+    settings.maxSteps = 80;
+    settings.supportSampleLimit = 128;
+
+    invisible_places::water::WaterEmitter emitter;
+    emitter.id = 51;
+    emitter.position = cloud.positions.front();
+    emitter.radius = 0.05F;
+    emitter.confidence = 1.0F;
+
+    auto leftAttractorSettings = settings;
+    leftAttractorSettings.attractorPosition = {-0.040F, 0.18F, 0.505F};
+    const auto leftAttractorCache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        leftAttractorSettings);
+    const auto leftMainBranch = std::find_if(
+        leftAttractorCache.branches.begin(),
+        leftAttractorCache.branches.end(),
+        [](const invisible_places::water::WaterPathBranch& branch) {
+            return branch.role == invisible_places::water::WaterPathBranchRole::Main;
+        });
+    REQUIRE(leftMainBranch != leftAttractorCache.branches.end());
+
+    const auto cache = invisible_places::water::GenerateWaterPathCache(
+        cloud,
+        std::vector<invisible_places::water::WaterEmitter>{emitter},
+        settings);
+    CHECK(cache.tunedSettings.attractorEnabled);
+    CHECK(cache.tunedSettings.attractorStrength == Catch::Approx(1.0F));
+    const auto mainBranch = std::find_if(
+        cache.branches.begin(),
+        cache.branches.end(),
+        [](const invisible_places::water::WaterPathBranch& branch) {
+            return branch.role == invisible_places::water::WaterPathBranchRole::Main;
+    });
+    REQUIRE(mainBranch != cache.branches.end());
+    REQUIRE(mainBranch->rawAnchors.size() >= 4U);
+    const auto averagePathX = [](const invisible_places::water::WaterPathBranch& branch) {
+        float sum = 0.0F;
+        for (const auto& anchor : branch.rawAnchors) {
+            sum += anchor.position.x;
+        }
+        return branch.rawAnchors.empty() ? 0.0F : sum / static_cast<float>(branch.rawAnchors.size());
+    };
+    const auto maxPathX = [](const invisible_places::water::WaterPathBranch& branch) {
+        float maxX = -std::numeric_limits<float>::max();
+        for (const auto& anchor : branch.rawAnchors) {
+            maxX = std::max(maxX, anchor.position.x);
+        }
+        return maxX;
+    };
+    CHECK(averagePathX(*mainBranch) > averagePathX(*leftMainBranch) + 0.040F);
+    CHECK(maxPathX(*mainBranch) > 0.015F);
+    CHECK(
+        mainBranch->rawAnchors.front().position.z -
+        mainBranch->rawAnchors.back().position.z > 0.30F);
+    for (std::size_t index = 1; index < mainBranch->rawAnchors.size(); ++index) {
+        CHECK(
+            mainBranch->rawAnchors[index].position.z <=
+            mainBranch->rawAnchors[index - 1U].position.z + 1.0e-4F);
+    }
+}
+
 TEST_CASE("Water path smoothing changes baked anchor geometry", "[water]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.sourcePath = "synthetic-water-zigzag.ply";
@@ -7542,6 +7744,12 @@ TEST_CASE("Water path bake inputs ignore refresh-only trail and smoothing settin
 
     bakeChanging = source;
     bakeChanging.path.branching = std::clamp(source.path.branching + 0.2F, 0.0F, 1.0F);
+    CHECK_FALSE(invisible_places::water::WaterSourceBakeInputsEqual(source, bakeChanging));
+
+    bakeChanging = source;
+    bakeChanging.path.attractorEnabled = true;
+    bakeChanging.path.attractorPosition = {0.05F, 0.02F, 0.40F};
+    bakeChanging.path.attractorStrength = 0.55F;
     CHECK_FALSE(invisible_places::water::WaterSourceBakeInputsEqual(source, bakeChanging));
 }
 
@@ -11369,6 +11577,187 @@ TEST_CASE("Offline water trail overlays animate through time playback", "[output
     CHECK(frameBCentroidX > frameACentroidX + 4.0F);
 }
 
+TEST_CASE("Offline rain pseudo wind render damps from mist to downpour", "[output][offline][water][rain]") {
+    using invisible_places::water::ApplyWaterRainIntensityPreset;
+    using invisible_places::water::DefaultWaterRainSettings;
+    using invisible_places::water::WaterRainEffectiveWindResponse;
+    using invisible_places::water::WaterRainIntensityPreset;
+
+    const std::vector<std::string> trailFields{
+        "trail_role",
+        "trail_id",
+        "source_id",
+        "path_id",
+        "branch_id",
+        "trail_seed",
+        "point_seed",
+        "trail_distance",
+        "trail_length",
+        "route_start_index",
+        "route_point_count",
+        "route_length",
+        "trail_start_phase",
+        "trail_lateral_offset",
+        "point_age",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
+        "wetness",
+        "feature_type",
+        "tangent_x",
+        "tangent_y",
+        "tangent_z",
+        "trail_lane_index",
+        "trail_lane_count",
+        "trail_lane_pitch",
+        "trail_lane_span",
+        "trail_lane_crossing",
+        "trail_cross_seed"};
+
+    constexpr std::size_t kAnchorCount = 3U;
+    constexpr std::size_t kVisibleCount = 9U;
+    constexpr std::uint32_t kImageSize = 512U;
+
+    auto makeCloud = [&](const invisible_places::water::WaterRainSettings& settings) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.positions = {
+            {0.0F, 0.0F, 0.55F},
+            {0.0F, 0.0F, 0.0F},
+            {0.0F, 0.0F, -0.55F},
+        };
+        for (std::size_t index = 0; index < kVisibleCount; ++index) {
+            cloud.positions.push_back({0.0F, 0.0F, 0.0F});
+        }
+        cloud.hasSourceRgb = false;
+        cloud.hasNormals = true;
+        cloud.normals.assign(cloud.positions.size(), {0.0F, 1.0F, 0.0F});
+        for (const auto& position : cloud.positions) {
+            cloud.bounds.Expand(position);
+        }
+        cloud.scalarFields.reserve(trailFields.size());
+        for (const auto& name : trailFields) {
+            cloud.scalarFields.push_back({
+                .name = name,
+                .minimum = 0.0F,
+                .maximum = 1.0F,
+                .count = cloud.positions.size(),
+                .valid = true,
+            });
+        }
+        cloud.scalarFieldValues.assign(trailFields.size() * cloud.positions.size(), 0.0F);
+
+        auto setField = [&cloud](std::size_t fieldSlot, std::size_t pointIndex, float value) {
+            cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(fieldSlot, pointIndex)] = value;
+        };
+        setField(12U, 0U, 0.0F);
+        setField(12U, 1U, 0.5F);
+        setField(12U, 2U, 1.0F);
+        for (std::size_t pointIndex = kAnchorCount; pointIndex < cloud.PointCount(); ++pointIndex) {
+            const float seed = 0.071F * static_cast<float>(pointIndex - kAnchorCount + 1U);
+            setField(0U, pointIndex, 1.0F);
+            setField(8U, pointIndex, 0.16F);
+            setField(9U, pointIndex, 0.0F);
+            setField(10U, pointIndex, static_cast<float>(kAnchorCount));
+            setField(11U, pointIndex, 1.10F);
+            setField(12U, pointIndex, 0.45F);
+            setField(14U, pointIndex, 0.10F + seed * 0.45F);
+            setField(16U, pointIndex, 0.0F);
+            setField(17U, pointIndex, 0.024F);
+            setField(18U, pointIndex, 0.10F);
+            setField(19U, pointIndex, 1.0F);
+            setField(20U, pointIndex, 1.0F);
+            setField(21U, pointIndex, 4.0F);
+            setField(22U, pointIndex, 0.0F);
+            setField(23U, pointIndex, 0.0F);
+            setField(24U, pointIndex, -1.0F);
+            setField(25U, pointIndex, static_cast<float>(pointIndex - kAnchorCount));
+            setField(26U, pointIndex, static_cast<float>(kVisibleCount));
+            setField(27U, pointIndex, settings.windStrengthMeters);
+            setField(28U, pointIndex, 50.0F);
+            setField(29U, pointIndex, WaterRainEffectiveWindResponse(settings));
+            setField(30U, pointIndex, seed);
+        }
+        return cloud;
+    };
+
+    auto renderAlphaFootprint = [](const invisible_places::io::LoadedPointCloud& cloud) {
+        invisible_places::renderer::pointcloud::PointCloudStyleState style;
+        style.geometryMode =
+            invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites;
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+        style.solidColor = {1.0F, 1.0F, 1.0F, 1.0F};
+        style.falloffProfile = invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
+        style.flowAnimation = true;
+        style.waterTrailOverlay = true;
+        invisible_places::style::SetScalarConstant(&style.surfelDiameter, 0.01F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+        invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.0F);
+        invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = false,
+            .localToWorld = glm::mat4{1.0F},
+        };
+
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, -1.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.fovDegrees = 45.0F;
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 20.0F;
+        WriteLookAtOrientation(&cameraState);
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, kImageSize, kImageSize);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0, 0, kImageSize, kImageSize},
+            &image,
+            nullptr,
+            nullptr,
+            4.0F);
+
+        std::uint32_t minX = image.width;
+        std::uint32_t maxX = 0U;
+        std::uint32_t minY = image.height;
+        std::uint32_t maxY = 0U;
+        for (std::uint32_t y = 0; y < image.height; ++y) {
+            for (std::uint32_t x = 0; x < image.width; ++x) {
+                const auto index = static_cast<std::size_t>(y) * image.width + x;
+                if (image.alpha[index] <= 0.012F) {
+                    continue;
+                }
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+        }
+        REQUIRE(minX <= maxX);
+        REQUIRE(minY <= maxY);
+        const float width = static_cast<float>(maxX - minX + 1U);
+        const float height = static_cast<float>(maxY - minY + 1U);
+        return std::max(width, height);
+    };
+
+    const auto mist = ApplyWaterRainIntensityPreset(
+        DefaultWaterRainSettings(),
+        WaterRainIntensityPreset::LightMist);
+    const auto downpour = ApplyWaterRainIntensityPreset(
+        DefaultWaterRainSettings(),
+        WaterRainIntensityPreset::HeavyDownpour);
+
+    const float mistFootprint = renderAlphaFootprint(makeCloud(mist));
+    const float downpourFootprint = renderAlphaFootprint(makeCloud(downpour));
+    CAPTURE(mistFootprint, downpourFootprint);
+    CHECK(mistFootprint > downpourFootprint + 2.0F);
+}
+
 TEST_CASE("Offline water trail placement uses baked lateral offsets", "[output][offline][water][v2]") {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.positions = {
@@ -11735,6 +12124,11 @@ TEST_CASE("Scene role roughness motion only animates vegetation", "[pointcloud][
     CHECK(PointCloudStyleHasActiveRoughnessMotion(MakePointCloudStyleForSceneRole(style, "VEG")));
     CHECK_FALSE(PointCloudStyleHasActiveRoughnessMotion(MakePointCloudStyleForSceneRole(style, "ROCK")));
     CHECK_FALSE(PointCloudStyleHasActiveRoughnessMotion(MakePointCloudStyleForSceneRole(style, "SAND")));
+    CHECK_FALSE(MakePointCloudStyleForSceneRole(style, "").roughnessMotionFullLayer);
+    CHECK(MakePointCloudStyleForSceneRole(style, "VEG").roughnessMotionFullLayer);
+    CHECK(MakePointCloudStyleForSceneRole(style, "Vegetation").roughnessMotionFullLayer);
+    CHECK_FALSE(MakePointCloudStyleForSceneRole(style, "ROCK").roughnessMotionFullLayer);
+    CHECK_FALSE(MakePointCloudStyleForSceneRole(style, "SAND").roughnessMotionFullLayer);
     CHECK(MakePointCloudStyleForSceneRole(style, "").shorelineWaveEnabled);
     CHECK(MakePointCloudStyleForSceneRole(style, "SAND").shorelineWaveEnabled);
     CHECK_FALSE(MakePointCloudStyleForSceneRole(style, "ROCK").shorelineWaveEnabled);

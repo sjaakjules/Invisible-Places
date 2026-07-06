@@ -65,6 +65,7 @@ float Clamp01(float value) {
 }
 
 float SmoothStep(float edge0, float edge1, float value);
+glm::vec3 SurfaceMotionNoiseVector(const glm::vec3& position, float time);
 
 glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
     return {value.x, value.y, value.z};
@@ -634,6 +635,46 @@ glm::vec3 WaterTrailRouteNormal(
     return glm::dot(normal, normal) > 1.0e-8F ? glm::normalize(normal) : glm::vec3{0.0F, 0.0F, 1.0F};
 }
 
+glm::vec3 RainPseudoWindOffset(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    const glm::vec3& routePosition,
+    const glm::vec3& routeTangent,
+    float timeSeconds) {
+    const float windStrength =
+        std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailLanePitchFieldSlot, pointIndex));
+    const float windResponse =
+        std::clamp(ScalarFieldValueBySlot(cloud, kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0F, 2.0F);
+    const float maxOffset = std::clamp(windStrength * windResponse * 0.10F, 0.0F, 0.11F);
+    if (maxOffset <= 1.0e-5F) {
+        return {0.0F, 0.0F, 0.0F};
+    }
+
+    const float seed = ScalarFieldValueBySlot(cloud, kWaterTrailCrossSeedFieldSlot, pointIndex);
+    const float pointSeed =
+        ScalarFieldValueBySlot(cloud, kWaterTrailPointAgeFieldSlot, pointIndex) +
+        ScalarFieldValueBySlot(cloud, kWaterTrailDistanceFieldSlot, pointIndex) * 0.013F;
+    const float scale = 1.10F + windResponse * 0.45F;
+    const float speed = 0.35F + windResponse * 0.55F + seed * 0.15F;
+    const glm::vec3 noisePosition =
+        (routePosition + glm::vec3{seed * 19.7F, pointSeed * 7.1F, seed * 3.3F}) * scale;
+    glm::vec3 gust =
+        SurfaceMotionNoiseVector(noisePosition, std::max(0.0F, timeSeconds) * speed) -
+        SurfaceMotionNoiseVector(noisePosition, 0.0F);
+    const glm::vec3 tangent =
+        glm::dot(routeTangent, routeTangent) > 1.0e-8F ? glm::normalize(routeTangent)
+                                                       : glm::vec3{0.0F, 0.0F, -1.0F};
+    gust -= tangent * glm::dot(gust, tangent);
+    gust.z *= 0.25F;
+
+    glm::vec3 offset = gust * maxOffset * 0.65F;
+    const float offsetLength = glm::length(offset);
+    if (offsetLength > maxOffset) {
+        offset *= maxOffset / offsetLength;
+    }
+    return offset;
+}
+
 glm::vec3 ResolveWaterTrailPosition(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
@@ -652,18 +693,7 @@ glm::vec3 ResolveWaterTrailPosition(
     const float lateralOffset = ScalarFieldValueBySlot(cloud, kWaterTrailLateralOffsetFieldSlot, pointIndex);
     glm::vec3 position = routePosition + lateral * lateralOffset;
     if (WaterTrailIsRain(cloud, pointIndex)) {
-        const float windStrength =
-            std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailLanePitchFieldSlot, pointIndex));
-        const float windResponse =
-            std::clamp(ScalarFieldValueBySlot(cloud, kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0F, 2.0F);
-        const float seed = ScalarFieldValueBySlot(cloud, kWaterTrailCrossSeedFieldSlot, pointIndex);
-        const float pointSeed =
-            ScalarFieldValueBySlot(cloud, kWaterTrailPointAgeFieldSlot, pointIndex) +
-            ScalarFieldValueBySlot(cloud, kWaterTrailDistanceFieldSlot, pointIndex) * 0.013F;
-        const float sway =
-            std::sin((timeSeconds * (1.7F + seed) + seed * 17.31F + pointSeed * 5.13F) * 6.28318530718F) *
-            windStrength * windResponse * 0.055F;
-        position += lateral * sway;
+        position += RainPseudoWindOffset(cloud, pointIndex, routePosition, routeTangent, timeSeconds);
     }
     return position;
 }
@@ -1101,8 +1131,13 @@ float SurfaceMotionMask(
     const OfflinePointLayer& layer,
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex) {
-    if (layer.roughnessMotionFieldSlot >= cloud.scalarFields.size() ||
-        layer.style.roughnessMotionStrength <= 1.0e-5F) {
+    if (layer.style.roughnessMotionStrength <= 1.0e-5F) {
+        return 0.0F;
+    }
+    if (layer.roughnessMotionFullLayer) {
+        return 1.0F;
+    }
+    if (layer.roughnessMotionFieldSlot >= cloud.scalarFields.size()) {
         return 0.0F;
     }
 

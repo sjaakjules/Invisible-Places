@@ -357,7 +357,7 @@ float RippleTideBandsValue(vec2 uv, float shoreDistance, float edgeBlendWidth, f
 
 float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendWidth, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
     const float travelDistance = max(wavelength, 0.015);
-    const float t = -phase;
+    const float t = phase;
     const float density01 = clamp(density, 0.0, 1.0);
     const float turbulence01 = clamp(turbulence, 0.0, 1.0);
     const float clampedWarp = clamp(warp, 0.0, 2.0);
@@ -407,43 +407,47 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
         const float offshoreStart = -waveTravel * (0.72 + timingNoise * 0.18);
         const float shoreEnd = 0.0;
         const float shoreBreakup = smoothstep(0.24, 0.92, scallopNoise + turbulence01 * 0.22);
-        // Stretch breakup along the moving wave front so foam grain avoids shore-normal streaks.
-        const vec2 waveFrontStreakUv = vec2(
-            x * (2.05 + turbulence01 * 0.45) + slot * 0.19,
-            alongShore * (0.11 + turbulence01 * 0.05) +
-                sin(x / max(wavelength * 0.55, 0.006) + slotSeed * 0.17) * wavelength * 0.045 +
-                slot * 0.31);
-        const float waveFrontStreakNoise = RippleSmoothBlockNoise(
-            waveFrontStreakUv,
-            max(wavelength * 0.20, 0.006),
-            seed,
-            203.0 + slot * 23.0);
-        const float foamMottleNoise = RippleSmoothBlockNoise(
-            vec2(x * 0.54 + slot * 0.19, alongShore * 0.62 + slot * 0.31),
-            max(wavelength * 0.42, 0.007),
-            seed,
-            227.0 + slot * 29.0);
-        const float foamNoise = RippleSmoothBlockNoise(
-            mix(vec2(x * 0.54 + slot * 0.19, alongShore * 0.62 + slot * 0.31), waveFrontStreakUv, 0.78),
-            max(wavelength * 0.24, 0.006),
-            seed,
-            251.0 + slot * 31.0);
-        const float breakup = smoothstep(
-            0.18,
-            0.96,
-            waveFrontStreakNoise * 0.52 +
-                foamNoise * 0.28 +
-                foamMottleNoise * 0.18 +
-                shoreBreakup * 0.24 +
-                turbulence01 * 0.18);
-        const float foamContinuity = mix(0.72, 1.0, breakup);
         const float shorewardMask = 1.0 - smoothstep(frontWidth * 0.45, frontWidth * 2.20, x - shoreEnd);
 
         if (cycle < incomingShare) {
             const float incomingProgress = smoothstep(0.0, 1.0, cycle / incomingShare);
             const float frontPosition = mix(offshoreStart, shoreEnd, incomingProgress);
             const float front = x - frontPosition;
-            const float incomingMask = 1.0 - smoothstep(-frontWidth * 1.25, frontWidth * 1.55, front);
+            const float frontLocalCoordinate = front;
+            // Stretch breakup along the moving wave front so foam grain travels with the crest.
+            const vec2 waveFrontStreakUv = vec2(
+                frontLocalCoordinate * (2.05 + turbulence01 * 0.45) + slot * 0.19,
+                alongShore * (0.11 + turbulence01 * 0.05) +
+                    sin(frontLocalCoordinate / max(wavelength * 0.55, 0.006) + slotSeed * 0.17) * wavelength * 0.045 +
+                    slot * 0.31);
+            const float waveFrontStreakNoise = RippleSmoothBlockNoise(
+                waveFrontStreakUv,
+                max(wavelength * 0.20, 0.006),
+                seed,
+                203.0 + slot * 23.0);
+            const float foamMottleNoise = RippleSmoothBlockNoise(
+                vec2(frontLocalCoordinate * 0.54 + slot * 0.19, alongShore * 0.62 + slot * 0.31),
+                max(wavelength * 0.42, 0.007),
+                seed,
+                227.0 + slot * 29.0);
+            const float foamNoise = RippleSmoothBlockNoise(
+                mix(vec2(frontLocalCoordinate * 0.54 + slot * 0.19, alongShore * 0.62 + slot * 0.31), waveFrontStreakUv, 0.78),
+                max(wavelength * 0.24, 0.006),
+                seed,
+                251.0 + slot * 31.0);
+            const float breakup = smoothstep(
+                0.18,
+                0.96,
+                waveFrontStreakNoise * 0.52 +
+                    foamNoise * 0.28 +
+                    foamMottleNoise * 0.18 +
+                    shoreBreakup * 0.24 +
+                    turbulence01 * 0.18);
+            const float foamContinuity = mix(0.72, 1.0, breakup);
+            const float incomingDeepSideMask = 1.0 - smoothstep(-frontWidth * 0.35, frontWidth * 0.15, front);
+            const float incomingStartMask =
+                smoothstep(offshoreStart - frontWidth * 1.25, offshoreStart + frontWidth * 1.25, x);
+            const float incomingMask = incomingStartMask * incomingDeepSideMask;
             const float crest = RippleLine(front, frontWidth);
             const float crestHalo = RippleLine(front, frontWidth * 1.70);
             const float frontTrailDistance = max(0.0, -front);
@@ -453,19 +457,56 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                 exp(-frontTrailDistance / max(trailLength * 0.42, 1.0e-4)) *
                 smoothstep(frontWidth * 0.35, frontWidth * 1.70, frontTrailDistance) *
                 incomingFollowMask;
+            const float incomingBodyDistance = max(0.0, frontPosition - x);
+            const float incomingBodyFade =
+                1.0 - smoothstep(waveTravel * 0.72, waveTravel * 1.02, incomingBodyDistance);
+            const float incomingBodyFoam =
+                incomingMask * incomingBodyFade * (0.10 + density01 * 0.12) * foamContinuity;
             const float arrivalFade = smoothstep(0.01, 0.12, cycle);
             const float peakSoftening = 1.0 - smoothstep(0.84, 1.0, incomingProgress) * 0.28;
-            const float value =
+            const float incomingEdgeFoam =
                 (crest * (0.62 + shoreBreakup * 0.20) * foamContinuity +
                  crestHalo * (0.10 + density01 * 0.06) * foamContinuity +
                  arrivingFoam * (0.38 + density01 * 0.24) * breakup) *
-                incomingMask * arrivalFade * peakSoftening;
+                incomingMask;
+            const float value = max(incomingBodyFoam, incomingEdgeFoam) * arrivalFade * peakSoftening;
             combined = max(combined, value * shorewardMask);
         } else {
             const float returnProgress = smoothstep(0.0, 1.0, (cycle - incomingShare) / returnShare);
             const float returnDistance = waveTravel * 0.50;
             const float clearFront = shoreEnd - returnDistance * returnProgress;
             const float front = x - clearFront;
+            const float frontLocalCoordinate = front;
+            // Reuse the same front-local grain as the incoming phase so the crest does not resample at peak.
+            const vec2 waveFrontStreakUv = vec2(
+                frontLocalCoordinate * (2.05 + turbulence01 * 0.45) + slot * 0.19,
+                alongShore * (0.11 + turbulence01 * 0.05) +
+                    sin(frontLocalCoordinate / max(wavelength * 0.55, 0.006) + slotSeed * 0.17) * wavelength * 0.045 +
+                    slot * 0.31);
+            const float waveFrontStreakNoise = RippleSmoothBlockNoise(
+                waveFrontStreakUv,
+                max(wavelength * 0.20, 0.006),
+                seed,
+                203.0 + slot * 23.0);
+            const float foamMottleNoise = RippleSmoothBlockNoise(
+                vec2(frontLocalCoordinate * 0.54 + slot * 0.19, alongShore * 0.62 + slot * 0.31),
+                max(wavelength * 0.42, 0.007),
+                seed,
+                227.0 + slot * 29.0);
+            const float foamNoise = RippleSmoothBlockNoise(
+                mix(vec2(frontLocalCoordinate * 0.54 + slot * 0.19, alongShore * 0.62 + slot * 0.31), waveFrontStreakUv, 0.78),
+                max(wavelength * 0.24, 0.006),
+                seed,
+                251.0 + slot * 31.0);
+            const float breakup = smoothstep(
+                0.18,
+                0.96,
+                waveFrontStreakNoise * 0.52 +
+                    foamNoise * 0.28 +
+                    foamMottleNoise * 0.18 +
+                    shoreBreakup * 0.24 +
+                    turbulence01 * 0.18);
+            const float foamContinuity = mix(0.72, 1.0, breakup);
             const float remainingMask = 1.0 - smoothstep(-frontWidth * 1.25, frontWidth * 1.55, front);
             const float foamDistance = max(0.0, shoreEnd - x);
             const float heldFoam =
@@ -491,7 +532,20 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                  trailingFoam * (0.42 + density01 * 0.28) * breakup) *
                 edgeFade;
             const float edgeIntroduce = smoothstep(0.0, 0.18, returnProgress);
-            const float value = max(heldValue, edgeValue * mix(0.72, 1.0, edgeIntroduce));
+            const float peakFront = x - shoreEnd;
+            const float peakTrailDistance = max(0.0, -peakFront);
+            const float peakCarryMask = 1.0 - smoothstep(-frontWidth * 0.35, frontWidth * 0.15, peakFront);
+            const float peakCarryFoam =
+                exp(-peakTrailDistance / max(trailLength * 0.42, 1.0e-4)) *
+                smoothstep(frontWidth * 0.35, frontWidth * 1.70, peakTrailDistance) *
+                (1.0 - smoothstep(trailLength * 0.18, trailLength * 0.50, peakTrailDistance));
+            const float peakCarryFade = 1.0 - smoothstep(0.0, 0.20, returnProgress);
+            const float peakCarryValue =
+                (RippleLine(peakFront, frontWidth) * (0.62 + shoreBreakup * 0.20) * foamContinuity +
+                 RippleLine(peakFront, frontWidth * 1.70) * (0.10 + density01 * 0.06) * foamContinuity +
+                 peakCarryFoam * (0.38 + density01 * 0.24) * breakup) *
+                peakCarryMask * peakCarryFade * 0.72;
+            const float value = max(max(heldValue, peakCarryValue), edgeValue * edgeIntroduce);
             combined = max(combined, value * shorewardMask);
         }
     }

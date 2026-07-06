@@ -25,6 +25,7 @@ Reference guidance:
 - Lanes generate dynamic routes through the analysed corridor instead of fixed global path offsets.
 - Close top paths merge into wider regions, isolated paths stay thinner, flat areas spread and slow down, steep areas narrow and speed up, bends/roughness create eddies, wavy regions get lateral curl/noise, and ripple-prone regions are exposed.
 - Trail style edits do not recalculate lanes or paths. Trail geometry edits may resample surfels from cached lane routes only.
+- Source-only Path edits should preserve source-level incremental baking where unchanged emitters keep reusable path-cache branches.
 - Path View can colour paths by the cached analysis values so the user can see why Flow behaves differently in different terrain regions.
 - The Site3 fixture in `tests/water_flow_path_analysis_site3_fixture.json` validates the reference source and screenshot path settings.
 
@@ -58,7 +59,8 @@ Reference guidance:
    - Keep generated output compatible with current Trail rendering and `stream_*` scalar consumers.
 
 4. Fast Edit Invalidation
-   - Path edits invalidate paths, analysis, lanes, and trails.
+- Path edits invalidate paths, analysis, lanes, and trails.
+- Source movement, insertion, or deletion should invalidate only the affected source branch set when the support signature still matches.
    - Path-analysis edits invalidate analysis, lanes, and trails only.
    - Lane topology edits invalidate lane routes and trail samples only.
    - Lane param-only edits update scalar/style data where possible.
