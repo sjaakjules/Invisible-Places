@@ -60,6 +60,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_surfel_exr_constant_simple_accumulation.frag
     shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
+    shaders/dynamic_mesh_flow.comp
     shaders/gsplat_accumulation.vert
     shaders/gsplat_accumulation.frag
     shaders/gsplat_high_quality.vert
@@ -116,6 +117,7 @@ add_library(
     src/camera/OrbitCamera.cpp
     src/io/AssetDiscovery.cpp
     src/io/GaussianSplatData.cpp
+    src/io/MeshData.cpp
     src/io/PointCloudData.cpp
     src/io/PlyHeader.cpp
     src/io/TransformMatrix.cpp
@@ -123,9 +125,9 @@ add_library(
     src/output/EyeDomeLighting.cpp
     src/output/HoudiniCameraExport.cpp
     src/output/OfflinePointRenderer.cpp
+    src/output/PngWriter.cpp
     src/output/RenderPreset.cpp
     src/output/VideoWriter.cpp
-    src/platform/MacWindowingRuntime.cpp
     src/platform/VulkanRuntimeConfig.cpp
     src/platform/Window.cpp
     src/platform/WindowTitle.cpp
@@ -201,7 +203,14 @@ if(INVISIBLE_PLACES_ENABLE_VULKAN)
 endif()
 
 if(APPLE)
-    target_link_libraries(invisible_places_core PRIVATE "-framework AppKit" "-framework QuartzCore")
+    target_link_libraries(
+        invisible_places_core
+        PRIVATE
+            "-framework AppKit"
+            "-framework CoreFoundation"
+            "-framework IOKit"
+            "-framework QuartzCore"
+    )
 endif()
 
 if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
@@ -250,6 +259,18 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             water-ripple-patterns-test-points-gui-smoke
+            PROPERTIES LABELS gui_smoke
+        )
+        add_test(
+            NAME dynamic-mesh-flow-site3-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke dynamic-mesh-flow-site3
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
+        )
+        set_tests_properties(
+            dynamic-mesh-flow-site3-gui-smoke
             PROPERTIES LABELS gui_smoke
         )
     endif()

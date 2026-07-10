@@ -20,51 +20,47 @@ namespace {
 
 constexpr float kAnimationFramesPerSecond = 30.0F;
 
-struct NaturalCubicSpline {
-    std::vector<float> knots;
-    std::vector<float> values;
-    std::vector<float> secondDerivatives;
-
-    [[nodiscard]] float Evaluate(float x) const {
-        if (knots.empty() || values.empty()) {
-            return 0.0F;
-        }
-        if (knots.size() == 1U || values.size() == 1U) {
-            return values.front();
-        }
-
-        const float clampedX = std::clamp(x, knots.front(), knots.back());
-        if (clampedX <= knots.front()) {
-            return values.front();
-        }
-        if (clampedX >= knots.back()) {
-            return values.back();
-        }
-
-        const auto upper = std::upper_bound(knots.begin(), knots.end(), clampedX);
-        const std::size_t rightIndex =
-            std::clamp<std::size_t>(static_cast<std::size_t>(upper - knots.begin()), 1U, knots.size() - 1U);
-        const std::size_t leftIndex = rightIndex - 1U;
-        const float interval = knots[rightIndex] - knots[leftIndex];
-        if (interval <= 1.0e-6F) {
-            return values[leftIndex];
-        }
-
-        const float a = (knots[rightIndex] - clampedX) / interval;
-        const float b = (clampedX - knots[leftIndex]) / interval;
-        const float leftCurve = ((a * a * a) - a) * secondDerivatives[leftIndex];
-        const float rightCurve = ((b * b * b) - b) * secondDerivatives[rightIndex];
-        return (a * values[leftIndex]) +
-               (b * values[rightIndex]) +
-               ((leftCurve + rightCurve) * interval * interval / 6.0F);
+float EvaluatePreparedScalarSpline(
+    const std::vector<float>& knots,
+    const AnimationPreparedScalarSpline& spline,
+    float x) {
+    if (knots.empty() || spline.values.empty()) {
+        return 0.0F;
     }
-};
+    if (knots.size() == 1U || spline.values.size() == 1U) {
+        return spline.values.front();
+    }
 
-NaturalCubicSpline BuildNaturalCubicSpline(
+    const float clampedX = std::clamp(x, knots.front(), knots.back());
+    if (clampedX <= knots.front()) {
+        return spline.values.front();
+    }
+    if (clampedX >= knots.back()) {
+        return spline.values.back();
+    }
+
+    const auto upper = std::upper_bound(knots.begin(), knots.end(), clampedX);
+    const std::size_t rightIndex =
+        std::clamp<std::size_t>(static_cast<std::size_t>(upper - knots.begin()), 1U, knots.size() - 1U);
+    const std::size_t leftIndex = rightIndex - 1U;
+    const float interval = knots[rightIndex] - knots[leftIndex];
+    if (interval <= 1.0e-6F) {
+        return spline.values[leftIndex];
+    }
+
+    const float a = (knots[rightIndex] - clampedX) / interval;
+    const float b = (clampedX - knots[leftIndex]) / interval;
+    const float leftCurve = ((a * a * a) - a) * spline.secondDerivatives[leftIndex];
+    const float rightCurve = ((b * b * b) - b) * spline.secondDerivatives[rightIndex];
+    return (a * spline.values[leftIndex]) +
+           (b * spline.values[rightIndex]) +
+           ((leftCurve + rightCurve) * interval * interval / 6.0F);
+}
+
+AnimationPreparedScalarSpline BuildNaturalCubicSpline(
     const std::vector<float>& knots,
     const std::vector<float>& values) {
-    NaturalCubicSpline spline{
-        .knots = knots,
+    AnimationPreparedScalarSpline spline{
         .values = values,
         .secondDerivatives = std::vector<float>(values.size(), 0.0F),
     };
@@ -124,10 +120,6 @@ NaturalCubicSpline BuildNaturalCubicSpline(
 
 glm::vec3 ToGlm(const std::array<float, 3>& value) {
     return {value[0], value[1], value[2]};
-}
-
-std::array<float, 3> FromGlm(const glm::vec3& value) {
-    return {value.x, value.y, value.z};
 }
 
 std::uint32_t MinimumAnimationDurationFrames(const AnimationPath& path) {
@@ -230,26 +222,6 @@ std::vector<float> BuildKeySamples(
     return samples;
 }
 
-float EvaluateScalar(
-    const AnimationPath& path,
-    const std::vector<float>& knots,
-    float timeSeconds,
-    float (*readValue)(const AnimationPathKey& key)) {
-    return BuildNaturalCubicSpline(knots, BuildKeySamples(path, readValue)).Evaluate(timeSeconds);
-}
-
-std::array<float, 3> EvaluateVector3(
-    const AnimationPath& path,
-    const std::vector<float>& knots,
-    float timeSeconds,
-    const std::array<float (*)(const AnimationPathKey& key), 3>& readers) {
-    return {
-        EvaluateScalar(path, knots, timeSeconds, readers[0]),
-        EvaluateScalar(path, knots, timeSeconds, readers[1]),
-        EvaluateScalar(path, knots, timeSeconds, readers[2]),
-    };
-}
-
 float ReadCameraX(const AnimationPathKey& key) {
     return key.cameraPosition[0];
 }
@@ -336,40 +308,6 @@ glm::quat OrientationFromKey(const AnimationPathKey& key) {
     return LookAtOrientation(ToGlm(key.cameraPosition), ToGlm(key.focusPoint));
 }
 
-glm::quat EvaluateOrientation(
-    const AnimationPath& path,
-    const std::vector<float>& knots,
-    float timeSeconds) {
-    if (path.keys.empty()) {
-        return glm::quat{1.0F, 0.0F, 0.0F, 0.0F};
-    }
-    if (path.keys.size() == 1U || knots.size() != path.keys.size()) {
-        return OrientationFromKey(path.keys.front());
-    }
-
-    const float clampedTime = std::clamp(timeSeconds, knots.front(), knots.back());
-    if (clampedTime <= knots.front()) {
-        return OrientationFromKey(path.keys.front());
-    }
-    if (clampedTime >= knots.back()) {
-        return OrientationFromKey(path.keys.back());
-    }
-
-    const auto upper = std::upper_bound(knots.begin(), knots.end(), clampedTime);
-    const std::size_t rightIndex =
-        std::clamp<std::size_t>(static_cast<std::size_t>(upper - knots.begin()), 1U, knots.size() - 1U);
-    const std::size_t leftIndex = rightIndex - 1U;
-    const float interval = knots[rightIndex] - knots[leftIndex];
-    const float amount = interval <= 1.0e-6F ? 0.0F : (clampedTime - knots[leftIndex]) / interval;
-
-    auto left = OrientationFromKey(path.keys[leftIndex]);
-    auto right = OrientationFromKey(path.keys[rightIndex]);
-    if (glm::dot(left, right) < 0.0F) {
-        right = -right;
-    }
-    return glm::normalize(glm::slerp(left, right, std::clamp(amount, 0.0F, 1.0F)));
-}
-
 glm::quat LookAtOrientation(glm::vec3 cameraPosition, glm::vec3 focusPoint) {
     glm::vec3 forward = focusPoint - cameraPosition;
     if (glm::length(forward) <= 1.0e-5F) {
@@ -385,6 +323,51 @@ glm::quat LookAtOrientation(glm::vec3 cameraPosition, glm::vec3 focusPoint) {
     const auto view = glm::lookAtRH(cameraPosition, focusPoint, up);
     const auto cameraToWorld = glm::inverse(glm::mat3{view});
     return glm::normalize(glm::quat_cast(cameraToWorld));
+}
+
+std::array<float, 4> QuaternionToArray(const glm::quat& orientation) {
+    return {orientation.x, orientation.y, orientation.z, orientation.w};
+}
+
+glm::quat QuaternionFromArray(const std::array<float, 4>& orientation) {
+    return glm::quat{orientation[3], orientation[0], orientation[1], orientation[2]};
+}
+
+glm::quat EvaluatePreparedOrientation(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds) {
+    if (context.orientationQuaternions.empty()) {
+        return glm::quat{1.0F, 0.0F, 0.0F, 0.0F};
+    }
+    if (context.orientationQuaternions.size() == 1U ||
+        context.knots.size() != context.orientationQuaternions.size()) {
+        return QuaternionFromArray(context.orientationQuaternions.front());
+    }
+
+    const float clampedTime = std::clamp(timeSeconds, context.knots.front(), context.knots.back());
+    if (clampedTime <= context.knots.front()) {
+        return QuaternionFromArray(context.orientationQuaternions.front());
+    }
+    if (clampedTime >= context.knots.back()) {
+        return QuaternionFromArray(context.orientationQuaternions.back());
+    }
+
+    const auto upper = std::upper_bound(context.knots.begin(), context.knots.end(), clampedTime);
+    const std::size_t rightIndex =
+        std::clamp<std::size_t>(
+            static_cast<std::size_t>(upper - context.knots.begin()),
+            1U,
+            context.knots.size() - 1U);
+    const std::size_t leftIndex = rightIndex - 1U;
+    const float interval = context.knots[rightIndex] - context.knots[leftIndex];
+    const float amount = interval <= 1.0e-6F ? 0.0F : (clampedTime - context.knots[leftIndex]) / interval;
+
+    auto left = QuaternionFromArray(context.orientationQuaternions[leftIndex]);
+    auto right = QuaternionFromArray(context.orientationQuaternions[rightIndex]);
+    if (glm::dot(left, right) < 0.0F) {
+        right = -right;
+    }
+    return glm::normalize(glm::slerp(left, right, std::clamp(amount, 0.0F, 1.0F)));
 }
 
 }  // namespace
@@ -427,26 +410,155 @@ float AnimationPathDurationSeconds(const AnimationPath& path) {
            kAnimationFramesPerSecond;
 }
 
-AnimationPathMotionStats MeasureAnimationPathMotion(
-    const AnimationPath& path,
+PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const AnimationPath& path) {
+    PreparedAnimationPathEvaluationContext context;
+    if (path.keys.empty()) {
+        return context;
+    }
+
+    context.valid = true;
+    context.singleKey = path.keys.size() == 1U;
+    context.durationSeconds = AnimationPathDurationSeconds(path);
+    context.depthOfFieldEnabled = path.depthOfFieldEnabled;
+    context.apertureFStops = std::max(0.1F, path.apertureFStops);
+    context.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
+    context.hasOrientation = AnyKeyHasOrientation(path);
+    context.hasFocusDistance = AnyKeyHasFocusDistance(path);
+    context.hasApertureFStops = AnyKeyHasApertureFStops(path);
+
+    if (context.singleKey) {
+        context.singleKeySnapshot = path.keys.front();
+        return context;
+    }
+
+    context.knots = BuildAnimationKnots(path);
+    if (context.knots.size() != path.keys.size() || context.knots.empty()) {
+        context.valid = false;
+        return context;
+    }
+
+    context.cameraX = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadCameraX));
+    context.cameraY = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadCameraY));
+    context.cameraZ = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadCameraZ));
+    context.focusX = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFocusX));
+    context.focusY = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFocusY));
+    context.focusZ = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFocusZ));
+    context.fovDegrees = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFovDegrees));
+    context.nearPlane = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadNearPlane));
+    context.farPlane = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFarPlane));
+    context.focusDistance = BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadFocusDistance));
+    context.apertureFStopsSpline =
+        BuildNaturalCubicSpline(context.knots, BuildKeySamples(path, ReadApertureFStops));
+    context.orientationQuaternions.reserve(path.keys.size());
+    for (const auto& key : path.keys) {
+        context.orientationQuaternions.push_back(QuaternionToArray(OrientationFromKey(key)));
+    }
+
+    return context;
+}
+
+AnimationPathEvaluation EvaluatePreparedAnimationPath(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds) {
+    AnimationPathEvaluation evaluation;
+    if (!context.valid) {
+        return evaluation;
+    }
+
+    if (context.singleKey) {
+        const auto& key = context.singleKeySnapshot;
+        evaluation.focusPoint = key.focusPoint;
+        evaluation.focusDistance = glm::length(ToGlm(key.focusPoint) - ToGlm(key.cameraPosition));
+        if (key.hasFocusDistance) {
+            evaluation.focusDistance = std::max(0.001F, key.focusDistance);
+        }
+        evaluation.camera.position = key.cameraPosition;
+        evaluation.camera.target = key.focusPoint;
+        evaluation.camera.orbitCenter = key.focusPoint;
+        evaluation.camera.hasOrbitCenter = true;
+        WriteQuaternionToCameraState(OrientationFromKey(key), &evaluation.camera);
+        evaluation.camera.fovDegrees = key.fovDegrees;
+        evaluation.camera.nearPlane = key.nearPlane;
+        evaluation.camera.farPlane = key.farPlane;
+        evaluation.camera.hasDepthOfField = context.depthOfFieldEnabled;
+        evaluation.camera.focusDistance = evaluation.focusDistance;
+        evaluation.camera.apertureFStops = key.hasApertureFStops
+                                               ? std::max(0.1F, key.apertureFStops)
+                                               : context.apertureFStops;
+        evaluation.camera.depthOfFieldMaxBlurPixels = context.depthOfFieldMaxBlurPixels;
+        return evaluation;
+    }
+
+    if (context.knots.empty()) {
+        return evaluation;
+    }
+
+    const float clampedTimeSeconds = std::clamp(timeSeconds, 0.0F, context.knots.back());
+    evaluation.camera.position = {
+        EvaluatePreparedScalarSpline(context.knots, context.cameraX, clampedTimeSeconds),
+        EvaluatePreparedScalarSpline(context.knots, context.cameraY, clampedTimeSeconds),
+        EvaluatePreparedScalarSpline(context.knots, context.cameraZ, clampedTimeSeconds),
+    };
+    evaluation.focusPoint = {
+        EvaluatePreparedScalarSpline(context.knots, context.focusX, clampedTimeSeconds),
+        EvaluatePreparedScalarSpline(context.knots, context.focusY, clampedTimeSeconds),
+        EvaluatePreparedScalarSpline(context.knots, context.focusZ, clampedTimeSeconds),
+    };
+    evaluation.camera.target = evaluation.focusPoint;
+    evaluation.camera.orbitCenter = evaluation.focusPoint;
+    evaluation.camera.hasOrbitCenter = true;
+
+    const auto cameraPosition = ToGlm(evaluation.camera.position);
+    const auto focusPoint = ToGlm(evaluation.focusPoint);
+    evaluation.focusDistance = glm::length(focusPoint - cameraPosition);
+    if (context.hasFocusDistance) {
+        evaluation.focusDistance =
+            EvaluatePreparedScalarSpline(context.knots, context.focusDistance, clampedTimeSeconds);
+    }
+    if (context.hasOrientation) {
+        WriteQuaternionToCameraState(
+            EvaluatePreparedOrientation(context, clampedTimeSeconds),
+            &evaluation.camera);
+    } else {
+        WriteQuaternionToCameraState(LookAtOrientation(cameraPosition, focusPoint), &evaluation.camera);
+    }
+
+    evaluation.camera.fovDegrees =
+        EvaluatePreparedScalarSpline(context.knots, context.fovDegrees, clampedTimeSeconds);
+    evaluation.camera.nearPlane =
+        EvaluatePreparedScalarSpline(context.knots, context.nearPlane, clampedTimeSeconds);
+    evaluation.camera.farPlane =
+        EvaluatePreparedScalarSpline(context.knots, context.farPlane, clampedTimeSeconds);
+    evaluation.camera.hasDepthOfField = context.depthOfFieldEnabled;
+    evaluation.camera.focusDistance = evaluation.focusDistance;
+    evaluation.camera.apertureFStops =
+        context.hasApertureFStops
+            ? EvaluatePreparedScalarSpline(context.knots, context.apertureFStopsSpline, clampedTimeSeconds)
+            : context.apertureFStops;
+    evaluation.camera.depthOfFieldMaxBlurPixels = context.depthOfFieldMaxBlurPixels;
+    return evaluation;
+}
+
+AnimationPathMotionStats MeasurePreparedAnimationPathMotion(
+    const PreparedAnimationPathEvaluationContext& context,
     float normalizedTime,
     std::uint32_t sampleCount) {
     AnimationPathMotionStats stats;
-    if (path.keys.empty()) {
+    if (!context.valid) {
         return stats;
     }
 
-    stats.durationSeconds = AnimationPathDurationSeconds(path);
+    stats.durationSeconds = context.durationSeconds;
     if (stats.durationSeconds <= 1.0e-6F) {
         return stats;
     }
 
     const std::uint32_t steps = std::max<std::uint32_t>(1U, sampleCount);
-    auto previous = EvaluateAnimationPath(path, 0.0F);
+    auto previous = EvaluatePreparedAnimationPath(context, 0.0F);
     for (std::uint32_t step = 1U; step <= steps; ++step) {
         const float timeSeconds =
             stats.durationSeconds * (static_cast<float>(step) / static_cast<float>(steps));
-        const auto current = EvaluateAnimationPath(path, timeSeconds);
+        const auto current = EvaluatePreparedAnimationPath(context, timeSeconds);
         stats.cameraDistance += Distance(previous.camera.position, current.camera.position);
         stats.targetDistance += Distance(previous.focusPoint, current.focusPoint);
         previous = current;
@@ -463,13 +575,23 @@ AnimationPathMotionStats MeasureAnimationPathMotion(
     const float rightTime = std::min(stats.durationSeconds, timeSeconds + deltaSeconds);
     const float spanSeconds = rightTime - leftTime;
     if (spanSeconds > 1.0e-6F) {
-        const auto left = EvaluateAnimationPath(path, leftTime);
-        const auto right = EvaluateAnimationPath(path, rightTime);
+        const auto left = EvaluatePreparedAnimationPath(context, leftTime);
+        const auto right = EvaluatePreparedAnimationPath(context, rightTime);
         stats.currentCameraSpeed = Distance(left.camera.position, right.camera.position) / spanSeconds;
         stats.currentTargetSpeed = Distance(left.focusPoint, right.focusPoint) / spanSeconds;
     }
 
     return stats;
+}
+
+AnimationPathMotionStats MeasureAnimationPathMotion(
+    const AnimationPath& path,
+    float normalizedTime,
+    std::uint32_t sampleCount) {
+    return MeasurePreparedAnimationPathMotion(
+        PrepareAnimationPathEvaluation(path),
+        normalizedTime,
+        sampleCount);
 }
 
 std::uint32_t AnimationDurationFramesForAverageSpeed(
@@ -482,7 +604,10 @@ std::uint32_t AnimationDurationFramesForAverageSpeed(
         return minimumFrames;
     }
 
-    const auto stats = MeasureAnimationPathMotion(path, 0.0F, sampleCount);
+    const auto stats = MeasurePreparedAnimationPathMotion(
+        PrepareAnimationPathEvaluation(path),
+        0.0F,
+        sampleCount);
     const float distance =
         target == AnimationPathMotionTarget::Camera ? stats.cameraDistance : stats.targetDistance;
     if (distance <= 1.0e-5F) {
@@ -501,77 +626,9 @@ std::uint32_t AnimationDurationFramesForAverageSpeed(
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,
     float timeSeconds) {
-    AnimationPathEvaluation evaluation;
-    if (path.keys.empty()) {
-        return evaluation;
-    }
-
-    if (path.keys.size() == 1U) {
-        const auto& key = path.keys.front();
-        evaluation.focusPoint = key.focusPoint;
-        evaluation.focusDistance = glm::length(ToGlm(key.focusPoint) - ToGlm(key.cameraPosition));
-        if (key.hasFocusDistance) {
-            evaluation.focusDistance = std::max(0.001F, key.focusDistance);
-        }
-        evaluation.camera.position = key.cameraPosition;
-        evaluation.camera.target = key.focusPoint;
-        evaluation.camera.orbitCenter = key.focusPoint;
-        evaluation.camera.hasOrbitCenter = true;
-        WriteQuaternionToCameraState(OrientationFromKey(key), &evaluation.camera);
-        evaluation.camera.fovDegrees = key.fovDegrees;
-        evaluation.camera.nearPlane = key.nearPlane;
-        evaluation.camera.farPlane = key.farPlane;
-        evaluation.camera.hasDepthOfField = path.depthOfFieldEnabled;
-        evaluation.camera.focusDistance = evaluation.focusDistance;
-        evaluation.camera.apertureFStops = key.hasApertureFStops
-                                               ? std::max(0.1F, key.apertureFStops)
-                                               : std::max(0.1F, path.apertureFStops);
-        evaluation.camera.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
-        return evaluation;
-    }
-
-    const auto knots = BuildAnimationKnots(path);
-    if (knots.size() != path.keys.size() || knots.empty()) {
-        return evaluation;
-    }
-
-    const float clampedTimeSeconds = std::clamp(timeSeconds, 0.0F, knots.back());
-    evaluation.camera.position = EvaluateVector3(
-        path,
-        knots,
-        clampedTimeSeconds,
-        {ReadCameraX, ReadCameraY, ReadCameraZ});
-    evaluation.focusPoint = EvaluateVector3(
-        path,
-        knots,
-        clampedTimeSeconds,
-        {ReadFocusX, ReadFocusY, ReadFocusZ});
-    evaluation.camera.target = evaluation.focusPoint;
-    evaluation.camera.orbitCenter = evaluation.focusPoint;
-    evaluation.camera.hasOrbitCenter = true;
-
-    const auto cameraPosition = ToGlm(evaluation.camera.position);
-    const auto focusPoint = ToGlm(evaluation.focusPoint);
-    evaluation.focusDistance = glm::length(focusPoint - cameraPosition);
-    if (AnyKeyHasFocusDistance(path)) {
-        evaluation.focusDistance = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFocusDistance);
-    }
-    if (AnyKeyHasOrientation(path)) {
-        WriteQuaternionToCameraState(EvaluateOrientation(path, knots, clampedTimeSeconds), &evaluation.camera);
-    } else {
-        WriteQuaternionToCameraState(LookAtOrientation(cameraPosition, focusPoint), &evaluation.camera);
-    }
-
-    evaluation.camera.fovDegrees = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFovDegrees);
-    evaluation.camera.nearPlane = EvaluateScalar(path, knots, clampedTimeSeconds, ReadNearPlane);
-    evaluation.camera.farPlane = EvaluateScalar(path, knots, clampedTimeSeconds, ReadFarPlane);
-    evaluation.camera.hasDepthOfField = path.depthOfFieldEnabled;
-    evaluation.camera.focusDistance = evaluation.focusDistance;
-    evaluation.camera.apertureFStops = AnyKeyHasApertureFStops(path)
-                                           ? EvaluateScalar(path, knots, clampedTimeSeconds, ReadApertureFStops)
-                                           : std::max(0.1F, path.apertureFStops);
-    evaluation.camera.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
-    return evaluation;
+    return EvaluatePreparedAnimationPath(
+        PrepareAnimationPathEvaluation(path),
+        timeSeconds);
 }
 
 void MoveAnimationCameraKey(

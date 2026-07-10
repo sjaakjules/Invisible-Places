@@ -71,6 +71,37 @@ struct AnimationPathEvaluation {
     float focusDistance = 1.0F;
 };
 
+struct AnimationPreparedScalarSpline {
+    std::vector<float> values;
+    std::vector<float> secondDerivatives;
+};
+
+struct PreparedAnimationPathEvaluationContext {
+    bool valid = false;
+    bool singleKey = false;
+    float durationSeconds = 0.0F;
+    bool depthOfFieldEnabled = false;
+    float apertureFStops = 8.0F;
+    float depthOfFieldMaxBlurPixels = 24.0F;
+    bool hasOrientation = false;
+    bool hasFocusDistance = false;
+    bool hasApertureFStops = false;
+    AnimationPathKey singleKeySnapshot{};
+    std::vector<float> knots;
+    AnimationPreparedScalarSpline cameraX;
+    AnimationPreparedScalarSpline cameraY;
+    AnimationPreparedScalarSpline cameraZ;
+    AnimationPreparedScalarSpline focusX;
+    AnimationPreparedScalarSpline focusY;
+    AnimationPreparedScalarSpline focusZ;
+    AnimationPreparedScalarSpline fovDegrees;
+    AnimationPreparedScalarSpline nearPlane;
+    AnimationPreparedScalarSpline farPlane;
+    AnimationPreparedScalarSpline focusDistance;
+    AnimationPreparedScalarSpline apertureFStopsSpline;
+    std::vector<std::array<float, 4>> orientationQuaternions;
+};
+
 enum class AnimationPathMotionTarget {
     Camera,
     Target
@@ -93,8 +124,17 @@ AnimationPath BuildAnimationPathFromCameraShots(
     float apertureFStops = 8.0F);
 
 [[nodiscard]] float AnimationPathDurationSeconds(const AnimationPath& path);
+[[nodiscard]] PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(
+    const AnimationPath& path);
+[[nodiscard]] AnimationPathEvaluation EvaluatePreparedAnimationPath(
+    const PreparedAnimationPathEvaluationContext& context,
+    float timeSeconds);
 [[nodiscard]] AnimationPathMotionStats MeasureAnimationPathMotion(
     const AnimationPath& path,
+    float normalizedTime,
+    std::uint32_t sampleCount = 240U);
+[[nodiscard]] AnimationPathMotionStats MeasurePreparedAnimationPathMotion(
+    const PreparedAnimationPathEvaluationContext& context,
     float normalizedTime,
     std::uint32_t sampleCount = 240U);
 [[nodiscard]] std::uint32_t AnimationDurationFramesForAverageSpeed(
