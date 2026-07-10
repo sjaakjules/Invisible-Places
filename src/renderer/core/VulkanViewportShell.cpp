@@ -25,6 +25,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -146,6 +147,34 @@ struct alignas(16) SparseWaterRippleParamsGpu {
     glm::vec4 response2{0.35F, 0.0F, 0.0F, 0.0F};
 };
 
+struct alignas(16) DynamicMeshFlowUniformsGpu {
+    glm::uvec4 counts0{0U, 0U, 0U, 0U};
+    glm::uvec4 counts1{0U, 0U, 0U, 0U};
+    glm::vec4 surface0{0.08F, 0.24F, 0.020F, invisible_places::water::kWaterTrailFeatureTypeDynamicMesh};
+    glm::ivec4 grid0{0, 0, 1, 0};
+    glm::uvec4 grid1{1U, 1U, 0U, 0U};
+    glm::vec4 flow0{18.0F, 0.12F, 0.62F, 4.0F};
+    glm::vec4 flow1{1.35F, 1.0F, 0.35F, 0.18F};
+    glm::vec4 flow2{0.64F, 0.36F, 0.08F, 0.65F};
+    glm::vec4 visual0{0.005F, 0.18F, 0.25F, 0.12F};
+};
+
+struct alignas(16) DynamicMeshSurfaceCellGpu {
+    glm::vec4 positionConfidence{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 normalAmbiguous{0.0F, 0.0F, 1.0F, 0.0F};
+    glm::vec4 downhillSampleCount{1.0F, 0.0F, 0.0F, 0.0F};
+};
+
+struct alignas(16) DynamicMeshFlowEmitterGpu {
+    glm::vec4 positionRadius{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 strengthSpeedIdSeed{1.0F, 1.0F, 0.0F, 0.0F};
+};
+
+struct alignas(16) DynamicMeshFlowAttractorGpu {
+    glm::vec4 positionRadius{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 strengthEnabled{0.0F, 0.0F, 0.0F, 0.0F};
+};
+
 SparseWaterRippleParamsGpu MakeSparseWaterRippleParamsGpu(
     const invisible_places::water::WaterRippleRuntimeParams& params) {
     SparseWaterRippleParamsGpu gpu;
@@ -227,6 +256,7 @@ struct alignas(16) HighQualityGaussianPushConstants {
 
 struct alignas(16) PostProcessPushConstants {
     glm::vec4 edl{0.0F, 24.0F, 0.35F, 1.0F};
+    glm::vec4 preview{0.0F, 0.0F, 0.0F, 0.0F};
 };
 
 std::string NormalizeScalarFieldName(std::string_view name) {
@@ -662,6 +692,10 @@ bool FormatSupportsOptimalFeatures(
     return (properties.optimalTilingFeatures & requiredFeatures) == requiredFeatures;
 }
 
+ImTextureID TextureIdFromDescriptorSet(VkDescriptorSet descriptorSet) {
+    return static_cast<ImTextureID>(reinterpret_cast<std::uintptr_t>(descriptorSet));
+}
+
 }  // namespace
 
 VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
@@ -681,6 +715,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateRenderPass();
     CreatePresentRenderPass();
     CreatePointDescriptorSetLayout();
+    CreateDynamicMeshFlowDescriptorSetLayout();
     CreateGaussianSplatDescriptorSetLayout();
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
@@ -693,6 +728,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateAccumulationResources();
     CreateLinearDepthResources();
     CreatePointPipelines();
+    CreateDynamicMeshFlowComputePipeline();
     CreateGaussianSplatPipeline();
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
@@ -712,6 +748,8 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
     }
+
+    ClearImGuiPreviewImageTexture();
 
     if (ImGui::GetCurrentContext() != nullptr) {
         ImGui_ImplVulkan_Shutdown();
@@ -769,6 +807,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (pointFastBasicPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, pointFastBasicPipeline_, nullptr);
     }
+    if (dynamicMeshFlowComputePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, dynamicMeshFlowComputePipeline_, nullptr);
+    }
     if (surfelDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelDepthPrepassPipeline_, nullptr);
     }
@@ -796,6 +837,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (pointPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, pointPipelineLayout_, nullptr);
     }
+    if (dynamicMeshFlowPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, dynamicMeshFlowPipelineLayout_, nullptr);
+    }
     if (gaussianSplatPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, gaussianSplatPipelineLayout_, nullptr);
     }
@@ -822,6 +866,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (pointDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, pointDescriptorSetLayout_, nullptr);
+    }
+    if (dynamicMeshFlowDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, dynamicMeshFlowDescriptorSetLayout_, nullptr);
     }
     if (gaussianSplatDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, gaussianSplatDescriptorSetLayout_, nullptr);
@@ -1292,6 +1339,441 @@ void VulkanViewportShell::UploadPointCloudScalarFields(
         UpdatePointHighlightDescriptorSets(resources, &highlight);
     }
     ++sceneRevision_;
+}
+
+DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreviewPointCloud(
+    std::size_t layerId,
+    const invisible_places::water::MeshSurfaceCache& cache,
+    const std::vector<invisible_places::water::WaterEmitter>& emitters,
+    const invisible_places::water::WaterDynamicMeshFlowSettings& settings,
+    invisible_places::water::WaterTrailBuildQuality quality) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    if (!settings.enabled || cache.cells.empty()) {
+        throw std::runtime_error{"Dynamic mesh flow GPU upload requires an enabled settings object and a warm cache."};
+    }
+    if (dynamicMeshFlowComputePipeline_ == VK_NULL_HANDLE ||
+        dynamicMeshFlowPipelineLayout_ == VK_NULL_HANDLE ||
+        dynamicMeshFlowDescriptorSetLayout_ == VK_NULL_HANDLE) {
+        throw std::runtime_error{"Dynamic mesh flow compute pipeline is not available."};
+    }
+
+    std::vector<DynamicMeshFlowEmitterGpu> activeEmitters;
+    activeEmitters.reserve(emitters.size());
+    for (const auto& emitter : emitters) {
+        if (emitter.status == invisible_places::water::WaterEmitterStatus::Disabled ||
+            emitter.strength <= 0.0F) {
+            continue;
+        }
+        DynamicMeshFlowEmitterGpu gpuEmitter;
+        gpuEmitter.positionRadius = glm::vec4{
+            emitter.position.x,
+            emitter.position.y,
+            emitter.position.z,
+            std::max(0.0F, emitter.radius),
+        };
+        gpuEmitter.strengthSpeedIdSeed = glm::vec4{
+            std::max(0.0F, emitter.strength),
+            std::max(0.01F, emitter.speed),
+            static_cast<float>(emitter.id),
+            static_cast<float>(settings.seed ^ (emitter.id * 2654435761U)),
+        };
+        activeEmitters.push_back(gpuEmitter);
+    }
+    if (activeEmitters.empty()) {
+        throw std::runtime_error{"Dynamic mesh flow GPU upload needs at least one active emitter."};
+    }
+
+    std::vector<DynamicMeshFlowAttractorGpu> gpuAttractors;
+    gpuAttractors.reserve(std::max<std::size_t>(1U, settings.attractors.size()));
+    for (const auto& attractor : settings.attractors) {
+        DynamicMeshFlowAttractorGpu gpuAttractor;
+        gpuAttractor.positionRadius = glm::vec4{
+            attractor.position.x,
+            attractor.position.y,
+            attractor.position.z,
+            std::max(0.0F, attractor.radiusMeters),
+        };
+        gpuAttractor.strengthEnabled = glm::vec4{
+            std::max(0.0F, attractor.strength),
+            attractor.enabled ? 1.0F : 0.0F,
+            static_cast<float>(attractor.id),
+            0.0F,
+        };
+        gpuAttractors.push_back(gpuAttractor);
+    }
+    if (gpuAttractors.empty()) {
+        gpuAttractors.push_back({});
+    }
+
+    const std::uint32_t requestedParticleCount = std::max<std::uint32_t>(
+        1U,
+        quality == invisible_places::water::WaterTrailBuildQuality::Preview
+            ? settings.previewParticleLimit
+            : settings.finalParticleLimit);
+    const std::uint32_t routeAnchorLimit =
+        quality == invisible_places::water::WaterTrailBuildQuality::Preview ? 192U : 384U;
+    const std::uint32_t routeAnchorCount = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(
+            std::ceil(std::max(0.02F, settings.trailLengthMeters) /
+                      std::max(0.002F, settings.stepMeters))) + 1U,
+        2U,
+        routeAnchorLimit);
+    const std::uint32_t visibleSampleCount = routeAnchorCount;
+    const std::uint32_t routeStride = routeAnchorCount + visibleSampleCount;
+    constexpr std::uint32_t kMaxGpuMeshFlowPreviewPoints = 1'200'000U;
+    const std::uint32_t particleCount = std::max<std::uint32_t>(
+        1U,
+        std::min(requestedParticleCount, kMaxGpuMeshFlowPreviewPoints / std::max(1U, routeStride)));
+    const std::uint64_t pointCount64 =
+        static_cast<std::uint64_t>(particleCount) * static_cast<std::uint64_t>(routeStride);
+    if (pointCount64 == 0U || pointCount64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Dynamic mesh flow GPU output exceeds the current 32-bit draw-count limit."};
+    }
+    const auto pointCount = static_cast<std::uint32_t>(pointCount64);
+
+    auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr) {
+        pointCloudResources_.push_back(ActivePointCloudResources{});
+        resources = &pointCloudResources_.back();
+    }
+    const auto emitterCapacityNeeded = static_cast<std::uint32_t>(activeEmitters.size());
+    const auto attractorCapacityNeeded = static_cast<std::uint32_t>(gpuAttractors.size());
+    const bool hasStaticDynamicMeshBuffers =
+        resources->dynamicMeshFlowCellBuffer.buffer != VK_NULL_HANDLE &&
+        resources->dynamicMeshFlowGridBuffer.buffer != VK_NULL_HANDLE &&
+        resources->positionStorageBuffer.buffer != VK_NULL_HANDLE &&
+        resources->normalBuffer.buffer != VK_NULL_HANDLE &&
+        resources->scalarFieldBuffer.buffer != VK_NULL_HANDLE;
+    const bool hasLiveDynamicMeshBuffers =
+        resources->dynamicMeshFlowUniformBuffers.front().buffer != VK_NULL_HANDLE &&
+        resources->dynamicMeshFlowEmitterBuffers.front().buffer != VK_NULL_HANDLE &&
+        resources->dynamicMeshFlowAttractorBuffers.front().buffer != VK_NULL_HANDLE;
+    const bool rebuildStaticBuffers =
+        !hasStaticDynamicMeshBuffers ||
+        resources->layerId != layerId ||
+        resources->dynamicMeshFlowCacheIdentity != &cache ||
+        resources->pointCount != pointCount ||
+        resources->dynamicMeshFlowParticleCount != particleCount ||
+        resources->dynamicMeshFlowRouteAnchorCount != routeAnchorCount ||
+        resources->dynamicMeshFlowVisibleSampleCount != visibleSampleCount ||
+        resources->scalarFieldCount != 31U;
+    const bool rebuildLiveBuffers =
+        rebuildStaticBuffers ||
+        !hasLiveDynamicMeshBuffers ||
+        resources->dynamicMeshFlowEmitterCapacity < emitterCapacityNeeded ||
+        resources->dynamicMeshFlowAttractorCapacity < attractorCapacityNeeded;
+
+    double staticUploadMilliseconds = 0.0;
+    if (rebuildStaticBuffers) {
+        const auto staticStartedAt = std::chrono::steady_clock::now();
+        WaitIdle();
+        CleanupPointCloudResources(resources);
+
+        const float cellSize = std::clamp(cache.settings.cacheCellSizeMeters, 0.005F, 5.0F);
+        int minCellX = std::numeric_limits<int>::max();
+        int minCellY = std::numeric_limits<int>::max();
+        int maxCellX = std::numeric_limits<int>::min();
+        int maxCellY = std::numeric_limits<int>::min();
+        std::vector<DynamicMeshSurfaceCellGpu> gpuCells;
+        gpuCells.reserve(cache.cells.size());
+        for (const auto& cell : cache.cells) {
+            const int cellX = cell.cellX;
+            const int cellY = cell.cellY;
+            minCellX = std::min(minCellX, cellX);
+            minCellY = std::min(minCellY, cellY);
+            maxCellX = std::max(maxCellX, cellX);
+            maxCellY = std::max(maxCellY, cellY);
+
+            DynamicMeshSurfaceCellGpu gpuCell;
+            gpuCell.positionConfidence = glm::vec4{
+                cell.position.x,
+                cell.position.y,
+                cell.position.z,
+                std::clamp(cell.confidence, 0.0F, 1.0F),
+            };
+            gpuCell.normalAmbiguous = glm::vec4{
+                cell.normal.x,
+                cell.normal.y,
+                cell.normal.z,
+                cell.ambiguous ? 1.0F : 0.0F,
+            };
+            gpuCell.downhillSampleCount = glm::vec4{
+                cell.downhill.x,
+                cell.downhill.y,
+                cell.downhill.z,
+                static_cast<float>(cell.sampleCount),
+            };
+            gpuCells.push_back(gpuCell);
+        }
+        if (gpuCells.empty() || minCellX > maxCellX || minCellY > maxCellY) {
+            throw std::runtime_error{"Dynamic mesh flow GPU cache has no uploadable cells."};
+        }
+        const std::uint64_t gridWidth64 = static_cast<std::uint64_t>(
+            static_cast<long long>(maxCellX) - static_cast<long long>(minCellX) + 1LL);
+        const std::uint64_t gridHeight64 = static_cast<std::uint64_t>(
+            static_cast<long long>(maxCellY) - static_cast<long long>(minCellY) + 1LL);
+        constexpr std::uint64_t kMaxDynamicMeshFlowGridEntries = 32'000'000ULL;
+        if (gridWidth64 == 0U ||
+            gridHeight64 == 0U ||
+            gridWidth64 > std::numeric_limits<std::uint32_t>::max() ||
+            gridHeight64 > std::numeric_limits<std::uint32_t>::max() ||
+            gridWidth64 * gridHeight64 > kMaxDynamicMeshFlowGridEntries) {
+            throw std::runtime_error{
+                "Dynamic mesh flow GPU cache grid is too large; increase the mesh cache cell size."};
+        }
+        const auto gridWidth = static_cast<std::uint32_t>(gridWidth64);
+        const auto gridHeight = static_cast<std::uint32_t>(gridHeight64);
+        std::vector<std::uint32_t> denseGrid(static_cast<std::size_t>(gridWidth64 * gridHeight64), 0U);
+        for (std::size_t cellIndex = 0; cellIndex < cache.cells.size(); ++cellIndex) {
+            const auto& cell = cache.cells[cellIndex];
+            const int cellX = cell.cellX;
+            const int cellY = cell.cellY;
+            const auto localX = static_cast<std::uint32_t>(cellX - minCellX);
+            const auto localY = static_cast<std::uint32_t>(cellY - minCellY);
+            denseGrid[static_cast<std::size_t>(localY) * gridWidth + localX] =
+                static_cast<std::uint32_t>(std::min<std::size_t>(
+                    cellIndex + 1U,
+                    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+        }
+
+        resources->layerId = layerId;
+        resources->pointCount = pointCount;
+        resources->activePointCount = pointCount;
+        resources->scalarFieldCount = 31U;
+        resources->hasSourceRgb = true;
+        resources->hasNormals = true;
+        resources->cpuPositions.clear();
+        resources->dynamicMeshFlowCacheIdentity = &cache;
+        resources->dynamicMeshFlowParticleCount = particleCount;
+        resources->dynamicMeshFlowRouteAnchorCount = routeAnchorCount;
+        resources->dynamicMeshFlowVisibleSampleCount = visibleSampleCount;
+        resources->dynamicMeshFlowGridWidth = gridWidth;
+        resources->dynamicMeshFlowGridHeight = gridHeight;
+        resources->dynamicMeshFlowEmitterCapacity = emitterCapacityNeeded;
+        resources->dynamicMeshFlowAttractorCapacity = attractorCapacityNeeded;
+        resources->dynamicMeshFlowCellCount = cache.cells.size();
+        resources->dynamicMeshFlowMinCellX = minCellX;
+        resources->dynamicMeshFlowMinCellY = minCellY;
+        resources->dynamicMeshFlowCellSize = cellSize;
+        resources->dynamicMeshFlowNextLiveSlot = 0;
+
+        resources->positionBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(pointCount) * sizeof(invisible_places::io::Float3),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        if (resources->positionBuffer.mapped != nullptr) {
+            std::memset(resources->positionBuffer.mapped, 0, static_cast<std::size_t>(resources->positionBuffer.size));
+        }
+        resources->positionStorageBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(pointCount) * sizeof(glm::vec4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->normalBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(pointCount) * sizeof(glm::vec4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->scalarFieldBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(pointCount) * 31U * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (resources->positionStorageBuffer.mapped != nullptr) {
+            std::memset(resources->positionStorageBuffer.mapped, 0, static_cast<std::size_t>(resources->positionStorageBuffer.size));
+        }
+        if (resources->normalBuffer.mapped != nullptr) {
+            std::memset(resources->normalBuffer.mapped, 0, static_cast<std::size_t>(resources->normalBuffer.size));
+        }
+        if (resources->scalarFieldBuffer.mapped != nullptr) {
+            std::memset(resources->scalarFieldBuffer.mapped, 0, static_cast<std::size_t>(resources->scalarFieldBuffer.size));
+        }
+
+        const std::uint32_t waterColor =
+            static_cast<std::uint32_t>(190U) |
+            (static_cast<std::uint32_t>(230U) << 8U) |
+            (static_cast<std::uint32_t>(255U) << 16U) |
+            (0xFFU << 24U);
+        std::vector<std::uint32_t> packedColors(pointCount, waterColor);
+        resources->colorBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(packedColors.size() * sizeof(std::uint32_t)),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->colorBuffer, packedColors.data(), resources->colorBuffer.size);
+
+        const SparseWaterRippleRangeGpu emptySparseRippleRange{};
+        resources->sparseRippleRangeBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleRange),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->sparseRippleRangeBuffer, &emptySparseRippleRange, sizeof(emptySparseRippleRange));
+        const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
+        resources->sparseRippleMembershipBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleMembership),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->sparseRippleMembershipBuffer,
+            &emptySparseRippleMembership,
+            sizeof(emptySparseRippleMembership));
+        const SparseWaterRippleParamsGpu emptySparseRippleParams{};
+        resources->sparseRippleParamsBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleParams),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->sparseRippleParamsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
+
+        resources->dynamicMeshFlowCellBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(gpuCells.size() * sizeof(DynamicMeshSurfaceCellGpu)),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->dynamicMeshFlowCellBuffer, gpuCells.data(), resources->dynamicMeshFlowCellBuffer.size);
+        resources->dynamicMeshFlowGridBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(denseGrid.size() * sizeof(std::uint32_t)),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->dynamicMeshFlowGridBuffer, denseGrid.data(), resources->dynamicMeshFlowGridBuffer.size);
+
+        for (std::size_t liveSlot = 0; liveSlot < kDynamicMeshFlowLiveSlots; ++liveSlot) {
+            resources->dynamicMeshFlowUniformBuffers[liveSlot] = CreateHostVisibleBuffer(
+                sizeof(DynamicMeshFlowUniformsGpu),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            resources->dynamicMeshFlowEmitterBuffers[liveSlot] = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(emitterCapacityNeeded * sizeof(DynamicMeshFlowEmitterGpu)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            resources->dynamicMeshFlowAttractorBuffers[liveSlot] = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(attractorCapacityNeeded * sizeof(DynamicMeshFlowAttractorGpu)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
+
+        for (auto& styleBuffer : resources->styleBuffers) {
+            styleBuffer = CreateHostVisibleBuffer(sizeof(PointCloudStyleGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        }
+        resources->exrStyleBuffer = CreateHostVisibleBuffer(sizeof(PointCloudStyleGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+        UpdatePointCloudDescriptorSets(resources);
+        for (std::size_t liveSlot = 0; liveSlot < kDynamicMeshFlowLiveSlots; ++liveSlot) {
+            UpdateDynamicMeshFlowDescriptorSet(resources, liveSlot);
+        }
+        staticUploadMilliseconds = MillisecondsBetween(staticStartedAt, std::chrono::steady_clock::now());
+    }
+    if (!rebuildStaticBuffers && rebuildLiveBuffers) {
+        WaitIdle();
+        for (std::size_t liveSlot = 0; liveSlot < kDynamicMeshFlowLiveSlots; ++liveSlot) {
+            auto& commandBuffer = resources->dynamicMeshFlowCommandBuffers[liveSlot];
+            if (commandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(device_, commandPool_, 1, &commandBuffer);
+                commandBuffer = VK_NULL_HANDLE;
+            }
+            auto& fence = resources->dynamicMeshFlowDispatchFences[liveSlot];
+            if (fence != VK_NULL_HANDLE) {
+                vkDestroyFence(device_, fence, nullptr);
+                fence = VK_NULL_HANDLE;
+            }
+            auto& descriptorSet = resources->dynamicMeshFlowDescriptorSets[liveSlot];
+            if (descriptorSet != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+                descriptorSet = VK_NULL_HANDLE;
+            }
+            DestroyBuffer(&resources->dynamicMeshFlowUniformBuffers[liveSlot]);
+            DestroyBuffer(&resources->dynamicMeshFlowEmitterBuffers[liveSlot]);
+            DestroyBuffer(&resources->dynamicMeshFlowAttractorBuffers[liveSlot]);
+        }
+        resources->dynamicMeshFlowEmitterCapacity = emitterCapacityNeeded;
+        resources->dynamicMeshFlowAttractorCapacity = attractorCapacityNeeded;
+        resources->dynamicMeshFlowNextLiveSlot = 0;
+        for (std::size_t liveSlot = 0; liveSlot < kDynamicMeshFlowLiveSlots; ++liveSlot) {
+            resources->dynamicMeshFlowUniformBuffers[liveSlot] = CreateHostVisibleBuffer(
+                sizeof(DynamicMeshFlowUniformsGpu),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            resources->dynamicMeshFlowEmitterBuffers[liveSlot] = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(emitterCapacityNeeded * sizeof(DynamicMeshFlowEmitterGpu)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            resources->dynamicMeshFlowAttractorBuffers[liveSlot] = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(attractorCapacityNeeded * sizeof(DynamicMeshFlowAttractorGpu)),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UpdateDynamicMeshFlowDescriptorSet(resources, liveSlot);
+        }
+    }
+
+    DynamicMeshFlowUniformsGpu uniforms;
+    uniforms.counts0 = glm::uvec4{particleCount, routeAnchorCount, visibleSampleCount, pointCount};
+    uniforms.counts1 = glm::uvec4{
+        31U,
+        static_cast<std::uint32_t>(activeEmitters.size()),
+        static_cast<std::uint32_t>(settings.attractors.size()),
+        settings.seed,
+    };
+    uniforms.surface0 = glm::vec4{
+        resources->dynamicMeshFlowCellSize,
+        std::max(settings.projectionSearchRadiusMeters, resources->dynamicMeshFlowCellSize),
+        settings.surfaceOffsetMeters,
+        invisible_places::water::kWaterTrailFeatureTypeDynamicMesh,
+    };
+    uniforms.grid0 = glm::ivec4{
+        resources->dynamicMeshFlowMinCellX,
+        resources->dynamicMeshFlowMinCellY,
+        std::clamp(
+            static_cast<int>(
+                std::ceil(
+                    std::max(settings.projectionSearchRadiusMeters, resources->dynamicMeshFlowCellSize) /
+                    resources->dynamicMeshFlowCellSize)),
+            1,
+            24),
+        0,
+    };
+    uniforms.grid1 = glm::uvec4{
+        resources->dynamicMeshFlowGridWidth,
+        resources->dynamicMeshFlowGridHeight,
+        0U,
+        0U,
+    };
+    uniforms.flow0 = glm::vec4{
+        std::max(0.02F, settings.trailLengthMeters),
+        std::clamp(settings.stepMeters, 0.002F, 5.0F),
+        std::max(0.01F, settings.speedMetersPerSecond),
+        std::max(0.0F, settings.animationDurationSeconds),
+    };
+    uniforms.flow1 = glm::vec4{
+        std::max(0.0F, settings.downhillWeight),
+        std::max(0.0F, settings.attractorWeight),
+        std::max(0.0F, settings.sourceVelocityWeight),
+        std::max(0.0F, settings.curlStrength),
+    };
+    uniforms.flow2 = glm::vec4{
+        std::clamp(settings.inertia, 0.0F, 0.98F),
+        std::max(0.0F, settings.branchingStrength),
+        std::max(0.0F, settings.eddyStrength),
+        std::max(0.0F, settings.topologyResponse),
+    };
+    uniforms.visual0 = glm::vec4{
+        std::max(0.0005F, settings.trailWidthMeters),
+        std::max(0.001F, settings.trailStreakLengthMeters),
+        std::max(settings.trailWidthMeters * 8.0F, settings.stepMeters * 0.75F),
+        std::clamp(settings.attractorWeight * 0.22F, 0.0F, 2.0F),
+    };
+
+    const auto liveUploadStartedAt = std::chrono::steady_clock::now();
+    const auto liveSlot = resources->dynamicMeshFlowNextLiveSlot % kDynamicMeshFlowLiveSlots;
+    resources->dynamicMeshFlowNextLiveSlot = (resources->dynamicMeshFlowNextLiveSlot + 1U) % kDynamicMeshFlowLiveSlots;
+    PrepareDynamicMeshFlowDispatchSlot(resources, liveSlot);
+    UploadBufferData(resources->dynamicMeshFlowUniformBuffers[liveSlot], &uniforms, sizeof(uniforms));
+    UploadBufferData(
+        resources->dynamicMeshFlowEmitterBuffers[liveSlot],
+        activeEmitters.data(),
+        static_cast<VkDeviceSize>(activeEmitters.size() * sizeof(DynamicMeshFlowEmitterGpu)));
+    UploadBufferData(
+        resources->dynamicMeshFlowAttractorBuffers[liveSlot],
+        gpuAttractors.data(),
+        static_cast<VkDeviceSize>(gpuAttractors.size() * sizeof(DynamicMeshFlowAttractorGpu)));
+    if (resources->dynamicMeshFlowDescriptorSets[liveSlot] == VK_NULL_HANDLE) {
+        UpdateDynamicMeshFlowDescriptorSet(resources, liveSlot);
+    }
+    const double liveUploadMilliseconds = MillisecondsBetween(liveUploadStartedAt, std::chrono::steady_clock::now());
+    const auto dispatchStartedAt = std::chrono::steady_clock::now();
+    DispatchDynamicMeshFlowCompute(resources, particleCount, liveSlot);
+    const double dispatchMilliseconds = MillisecondsBetween(dispatchStartedAt, std::chrono::steady_clock::now());
+
+    ++sceneRevision_;
+    return {
+        .pointCount = pointCount,
+        .particleCount = particleCount,
+        .routeAnchorCount = routeAnchorCount,
+        .visibleSampleCount = visibleSampleCount,
+        .solveMilliseconds = MillisecondsBetween(startedAt, std::chrono::steady_clock::now()),
+        .staticUploadMilliseconds = staticUploadMilliseconds,
+        .liveUploadMilliseconds = liveUploadMilliseconds,
+        .dispatchMilliseconds = dispatchMilliseconds,
+        .reusedStaticBuffers = !rebuildStaticBuffers,
+        .asynchronousDispatch = true,
+    };
 }
 
 void VulkanViewportShell::UploadSparseWaterRippleMembership(
@@ -1822,6 +2304,17 @@ bool VulkanViewportShell::HasGaussianSplats() const {
 
 invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloudExrFrame(
     const PointCloudExrFrameRequest& request) {
+    if (!BeginPointCloudExrFrame(request)) {
+        throw std::runtime_error{"GPU EXR export already has a frame in flight."};
+    }
+    Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr complete)");
+    return CompletePointCloudExrFrame();
+}
+
+bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameRequest& request) {
+    if (exrExportFrameInFlight_) {
+        return false;
+    }
     if (request.width == 0 || request.height == 0) {
         throw std::runtime_error{"GPU EXR export requires a non-zero frame size."};
     }
@@ -1835,21 +2328,15 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         CreateExrExportResources(request.width, request.height);
     }
 
-    std::array<VkFence, kFramesInFlight> frameFences{};
-    std::size_t frameFenceCount = 0;
-    for (const auto& frame : frameResources_) {
-        if (frame.fence != VK_NULL_HANDLE) {
-            frameFences[frameFenceCount++] = frame.fence;
-        }
+    if (exrExportResources_.fence == VK_NULL_HANDLE ||
+        exrExportResources_.commandBuffer == VK_NULL_HANDLE) {
+        throw std::runtime_error{"GPU EXR export resources are not initialized."};
     }
-    if (frameFenceCount > 0) {
-        vkWaitForFences(
-            device_,
-            static_cast<std::uint32_t>(frameFenceCount),
-            frameFences.data(),
-            VK_TRUE,
-            UINT64_MAX);
+    const VkResult existingFenceStatus = vkGetFenceStatus(device_, exrExportResources_.fence);
+    if (existingFenceStatus == VK_NOT_READY) {
+        return false;
     }
+    Check(existingFenceStatus, "vkGetFenceStatus(exr idle)");
 
     const auto previousRenderState = renderState_;
     auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
@@ -1865,25 +2352,84 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         Check(
             vkResetCommandBuffer(exrExportResources_.commandBuffer, 0),
             "vkResetCommandBuffer(exr)");
-        UploadFrameUniforms(0U, request.width, request.height);
+        UploadFrameUniformsToBuffer(exrExportResources_.uniformBuffer, request.width, request.height);
         RecordExrExportCommandBuffer(request);
 
         VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &exrExportResources_.commandBuffer;
         Check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, exrExportResources_.fence), "vkQueueSubmit(exr)");
-        Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr complete)");
+        exrExportFrameInFlight_ = true;
+        exrExportInFlightWidth_ = request.width;
+        exrExportInFlightHeight_ = request.height;
+        exrExportInFlightReadbackMask_ = request.readbackMask;
+        restoreRenderState();
+        return true;
+    } catch (...) {
+        restoreRenderState();
+        throw;
+    }
+}
 
-        invisible_places::output::HalfRgbaExrImage image;
-        image.width = request.width;
-        image.height = request.height;
-        const auto pixelCount =
-            static_cast<std::size_t>(request.width) * static_cast<std::size_t>(request.height);
+PointCloudExrFrameStatus VulkanViewportShell::PollPointCloudExrFrame() {
+    if (!exrExportFrameInFlight_) {
+        return PointCloudExrFrameStatus::Idle;
+    }
+    const VkResult status = vkGetFenceStatus(device_, exrExportResources_.fence);
+    if (status == VK_SUCCESS) {
+        return PointCloudExrFrameStatus::Ready;
+    }
+    if (status == VK_NOT_READY) {
+        return PointCloudExrFrameStatus::Running;
+    }
+    Check(status, "vkGetFenceStatus(exr)");
+    return PointCloudExrFrameStatus::Running;
+}
+
+invisible_places::output::HalfRgbaExrImage VulkanViewportShell::CompletePointCloudExrFrame() {
+    if (!exrExportFrameInFlight_) {
+        return {};
+    }
+    const VkResult status = vkGetFenceStatus(device_, exrExportResources_.fence);
+    if (status == VK_NOT_READY) {
+        throw std::runtime_error{"GPU EXR export frame is still running."};
+    }
+    Check(status, "vkGetFenceStatus(exr complete)");
+
+    const auto width = exrExportInFlightWidth_;
+    const auto height = exrExportInFlightHeight_;
+    const auto mask = exrExportInFlightReadbackMask_;
+    exrExportFrameInFlight_ = false;
+    exrExportInFlightWidth_ = 0;
+    exrExportInFlightHeight_ = 0;
+    exrExportInFlightReadbackMask_ = PointCloudExrReadbackMask::All;
+    return ReadCompletedExrExportFrame(mask, width, height);
+}
+
+void VulkanViewportShell::CancelPointCloudExrFrame() {
+    if (!exrExportFrameInFlight_) {
+        return;
+    }
+    if (exrExportResources_.fence != VK_NULL_HANDLE) {
+        Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr cancel)");
+    }
+    exrExportFrameInFlight_ = false;
+    exrExportInFlightWidth_ = 0;
+    exrExportInFlightHeight_ = 0;
+    exrExportInFlightReadbackMask_ = PointCloudExrReadbackMask::All;
+}
+
+invisible_places::output::HalfRgbaExrImage VulkanViewportShell::ReadCompletedExrExportFrame(
+    PointCloudExrReadbackMask readbackMask,
+    std::uint32_t width,
+    std::uint32_t height) {
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = width;
+    image.height = height;
+    const auto pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+
+    if (HasPointCloudExrReadback(readbackMask, PointCloudExrReadbackMask::Color)) {
         image.rgbaHalf.resize(pixelCount * 4U);
-        image.normalHalf.resize(pixelCount * 3U);
-        image.albedoHalf.resize(pixelCount * 3U);
-        image.depth.resize(pixelCount);
-
         void* mappedColor = exrExportResources_.colorReadbackBuffer.mapped;
         bool unmapColor = false;
         if (mappedColor == nullptr) {
@@ -1905,7 +2451,10 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         if (unmapColor) {
             vkUnmapMemory(device_, exrExportResources_.colorReadbackBuffer.memory);
         }
+    }
 
+    if (HasPointCloudExrReadback(readbackMask, PointCloudExrReadbackMask::Depth)) {
+        image.depth.resize(pixelCount);
         void* mappedDepth = exrExportResources_.depthReadbackBuffer.mapped;
         bool unmapDepth = false;
         if (mappedDepth == nullptr) {
@@ -1927,44 +2476,241 @@ invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloud
         if (unmapDepth) {
             vkUnmapMemory(device_, exrExportResources_.depthReadbackBuffer.memory);
         }
+    }
 
-        auto copyRgbHalfReadback = [&](const BufferAllocation& buffer,
-                                       std::vector<std::uint16_t>* destination,
-                                       const char* mapLabel) {
-            if (destination == nullptr || destination->size() != pixelCount * 3U) {
-                return;
-            }
+    auto copyRgbHalfReadback = [&](const BufferAllocation& buffer,
+                                   std::vector<std::uint16_t>* destination,
+                                   const char* mapLabel) {
+        if (destination == nullptr || destination->size() != pixelCount * 3U) {
+            return;
+        }
 
-            void* mapped = buffer.mapped;
-            bool unmap = false;
-            if (mapped == nullptr) {
-                Check(
-                    vkMapMemory(device_, buffer.memory, 0, buffer.size, 0, &mapped),
-                    mapLabel);
-                unmap = true;
-            }
+        void* mapped = buffer.mapped;
+        bool unmap = false;
+        if (mapped == nullptr) {
+            Check(
+                vkMapMemory(device_, buffer.memory, 0, buffer.size, 0, &mapped),
+                mapLabel);
+            unmap = true;
+        }
 
-            const auto* source = static_cast<const std::uint16_t*>(mapped);
-            for (std::size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex) {
-                const std::size_t sourceOffset = pixelIndex * 4U;
-                const std::size_t destinationOffset = pixelIndex * 3U;
-                (*destination)[destinationOffset + 0U] = source[sourceOffset + 0U];
-                (*destination)[destinationOffset + 1U] = source[sourceOffset + 1U];
-                (*destination)[destinationOffset + 2U] = source[sourceOffset + 2U];
-            }
-            if (unmap) {
-                vkUnmapMemory(device_, buffer.memory);
-            }
-        };
+        const auto* source = static_cast<const std::uint16_t*>(mapped);
+        for (std::size_t pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex) {
+            const std::size_t sourceOffset = pixelIndex * 4U;
+            const std::size_t destinationOffset = pixelIndex * 3U;
+            (*destination)[destinationOffset + 0U] = source[sourceOffset + 0U];
+            (*destination)[destinationOffset + 1U] = source[sourceOffset + 1U];
+            (*destination)[destinationOffset + 2U] = source[sourceOffset + 2U];
+        }
+        if (unmap) {
+            vkUnmapMemory(device_, buffer.memory);
+        }
+    };
+    if (HasPointCloudExrReadback(readbackMask, PointCloudExrReadbackMask::Normal)) {
+        image.normalHalf.resize(pixelCount * 3U);
         copyRgbHalfReadback(exrExportResources_.normalReadbackBuffer, &image.normalHalf, "vkMapMemory(exr normal)");
+    }
+    if (HasPointCloudExrReadback(readbackMask, PointCloudExrReadbackMask::Albedo)) {
+        image.albedoHalf.resize(pixelCount * 3U);
         copyRgbHalfReadback(exrExportResources_.albedoReadbackBuffer, &image.albedoHalf, "vkMapMemory(exr albedo)");
+    }
+    return image;
+}
 
-        restoreRenderState();
-        return image;
+VulkanViewportShell::ImGuiPreviewImageTexture VulkanViewportShell::UploadImGuiPreviewImageTexture(
+    std::uint32_t width,
+    std::uint32_t height,
+    const std::vector<std::uint8_t>& rgba) {
+    if (width == 0 || height == 0) {
+        throw std::runtime_error{"Preview image upload requires a non-zero image size."};
+    }
+    const auto byteCount =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4U;
+    if (rgba.size() != byteCount) {
+        throw std::runtime_error{"Preview image upload received an invalid RGBA buffer size."};
+    }
+    if (device_ == VK_NULL_HANDLE || commandPool_ == VK_NULL_HANDLE) {
+        throw std::runtime_error{"Preview image upload requires an active Vulkan viewport."};
+    }
+
+    BufferAllocation stagingBuffer{};
+    ImageAllocation image{};
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+
+    try {
+        stagingBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(byteCount),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        UploadBufferData(stagingBuffer, rgba.data(), static_cast<VkDeviceSize>(byteCount));
+
+        image = CreateAttachmentImage(
+            width,
+            height,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT);
+
+        VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocInfo.commandPool = commandPool_;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        Check(vkAllocateCommandBuffers(device_, &allocInfo, &commandBuffer), "vkAllocateCommandBuffers(preview texture)");
+
+        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(preview texture)");
+
+        VkImageMemoryBarrier transferBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        transferBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        transferBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        transferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        transferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        transferBarrier.image = image.image;
+        transferBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        transferBarrier.subresourceRange.baseMipLevel = 0;
+        transferBarrier.subresourceRange.levelCount = 1;
+        transferBarrier.subresourceRange.baseArrayLayer = 0;
+        transferBarrier.subresourceRange.layerCount = 1;
+        transferBarrier.srcAccessMask = 0;
+        transferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &transferBarrier);
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.bufferRowLength = 0;
+        copyRegion.bufferImageHeight = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.mipLevel = 0;
+        copyRegion.imageSubresource.baseArrayLayer = 0;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageOffset = {0, 0, 0};
+        copyRegion.imageExtent = {width, height, 1};
+        vkCmdCopyBufferToImage(
+            commandBuffer,
+            stagingBuffer.buffer,
+            image.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &copyRegion);
+
+        VkImageMemoryBarrier shaderReadBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        shaderReadBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        shaderReadBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        shaderReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        shaderReadBarrier.image = image.image;
+        shaderReadBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        shaderReadBarrier.subresourceRange.baseMipLevel = 0;
+        shaderReadBarrier.subresourceRange.levelCount = 1;
+        shaderReadBarrier.subresourceRange.baseArrayLayer = 0;
+        shaderReadBarrier.subresourceRange.layerCount = 1;
+        shaderReadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        shaderReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &shaderReadBarrier);
+
+        Check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(preview texture)");
+
+        VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+        Check(vkQueueSubmit(graphicsQueue_, 1, &submitInfo, VK_NULL_HANDLE), "vkQueueSubmit(preview texture)");
+        Check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(preview texture)");
+        vkFreeCommandBuffers(device_, commandPool_, 1, &commandBuffer);
+        commandBuffer = VK_NULL_HANDLE;
+
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.mipLodBias = 0.0F;
+        samplerInfo.anisotropyEnable = VK_FALSE;
+        samplerInfo.maxAnisotropy = 1.0F;
+        samplerInfo.compareEnable = VK_FALSE;
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+        samplerInfo.minLod = 0.0F;
+        samplerInfo.maxLod = 0.0F;
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+        Check(vkCreateSampler(device_, &samplerInfo, nullptr, &sampler), "vkCreateSampler(preview texture)");
+
+        descriptorSet =
+            ImGui_ImplVulkan_AddTexture(sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        ClearImGuiPreviewImageTexture();
+        imguiPreviewImageTexture_ = {
+            .width = width,
+            .height = height,
+            .image = image,
+            .sampler = sampler,
+            .descriptorSet = descriptorSet,
+        };
+        image = {};
+        sampler = VK_NULL_HANDLE;
+        descriptorSet = VK_NULL_HANDLE;
+        DestroyBuffer(&stagingBuffer);
+
+        return {
+            .textureId = TextureIdFromDescriptorSet(imguiPreviewImageTexture_.descriptorSet),
+            .width = width,
+            .height = height,
+        };
     } catch (...) {
-        restoreRenderState();
+        if (commandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_, commandPool_, 1, &commandBuffer);
+        }
+        if (descriptorSet != VK_NULL_HANDLE && ImGui::GetCurrentContext() != nullptr) {
+            ImGui_ImplVulkan_RemoveTexture(descriptorSet);
+        }
+        if (sampler != VK_NULL_HANDLE) {
+            vkDestroySampler(device_, sampler, nullptr);
+        }
+        DestroyImage(&image);
+        DestroyBuffer(&stagingBuffer);
         throw;
     }
+}
+
+void VulkanViewportShell::ClearImGuiPreviewImageTexture() {
+    if (device_ == VK_NULL_HANDLE) {
+        imguiPreviewImageTexture_ = {};
+        return;
+    }
+
+    if (imguiPreviewImageTexture_.descriptorSet != VK_NULL_HANDLE &&
+        ImGui::GetCurrentContext() != nullptr) {
+        vkDeviceWaitIdle(device_);
+        ImGui_ImplVulkan_RemoveTexture(imguiPreviewImageTexture_.descriptorSet);
+    }
+    if (imguiPreviewImageTexture_.sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, imguiPreviewImageTexture_.sampler, nullptr);
+    }
+    DestroyImage(&imguiPreviewImageTexture_.image);
+    imguiPreviewImageTexture_ = {};
 }
 
 void VulkanViewportShell::CreateInstance() {
@@ -2434,6 +3180,24 @@ void VulkanViewportShell::CreatePointDescriptorSetLayout() {
     Check(
         vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &pointDescriptorSetLayout_),
         "vkCreateDescriptorSetLayout(point)");
+}
+
+void VulkanViewportShell::CreateDynamicMeshFlowDescriptorSetLayout() {
+    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
+    for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorCount = 1;
+        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[bindingIndex].descriptorType =
+            bindingIndex == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    Check(
+        vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &dynamicMeshFlowDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(dynamic mesh flow)");
 }
 
 void VulkanViewportShell::CreateGaussianSplatDescriptorSetLayout() {
@@ -2914,6 +3678,40 @@ void VulkanViewportShell::CreatePointPipelines() {
     vkDestroyShaderModule(device_, vertexModule, nullptr);
 }
 
+void VulkanViewportShell::CreateDynamicMeshFlowComputePipeline() {
+    const auto shaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "dynamic_mesh_flow.comp.spv").string());
+    const auto shaderModule =
+        CreateShaderModule(device_, shaderCode, "vkCreateShaderModule(dynamic mesh flow compute)");
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stageInfo.module = shaderModule;
+    stageInfo.pName = "main";
+
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &dynamicMeshFlowDescriptorSetLayout_;
+    Check(
+        vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &dynamicMeshFlowPipelineLayout_),
+        "vkCreatePipelineLayout(dynamic mesh flow)");
+
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = stageInfo;
+    pipelineInfo.layout = dynamicMeshFlowPipelineLayout_;
+    Check(
+        vkCreateComputePipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1,
+            &pipelineInfo,
+            nullptr,
+            &dynamicMeshFlowComputePipeline_),
+        "vkCreateComputePipelines(dynamic mesh flow)");
+
+    vkDestroyShaderModule(device_, shaderModule, nullptr);
+}
+
 void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uint32_t height) {
     if (width == 0 || height == 0) {
         throw std::runtime_error{"GPU EXR export requires a non-zero frame size."};
@@ -3039,6 +3837,7 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
     resources.albedoReadbackBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4U * sizeof(std::uint16_t),
         VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    resources.uniformBuffer = CreateHostVisibleBuffer(sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
     VkCommandBufferAllocateInfo commandBufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     commandBufferInfo.commandPool = commandPool_;
@@ -4484,6 +5283,185 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
+void VulkanViewportShell::UpdateDynamicMeshFlowDescriptorSet(
+    ActivePointCloudResources* resources,
+    std::size_t liveSlot) {
+    if (resources == nullptr || liveSlot >= kDynamicMeshFlowLiveSlots) {
+        return;
+    }
+    auto& descriptorSet = resources->dynamicMeshFlowDescriptorSets[liveSlot];
+    if (descriptorSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = descriptorPool_;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &dynamicMeshFlowDescriptorSetLayout_;
+        Check(
+            vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet),
+            "vkAllocateDescriptorSets(dynamic mesh flow)");
+    }
+
+    VkDescriptorBufferInfo uniformInfo{
+        resources->dynamicMeshFlowUniformBuffers[liveSlot].buffer,
+        0,
+        resources->dynamicMeshFlowUniformBuffers[liveSlot].size};
+    VkDescriptorBufferInfo cellInfo{
+        resources->dynamicMeshFlowCellBuffer.buffer,
+        0,
+        resources->dynamicMeshFlowCellBuffer.size};
+    VkDescriptorBufferInfo gridInfo{
+        resources->dynamicMeshFlowGridBuffer.buffer,
+        0,
+        resources->dynamicMeshFlowGridBuffer.size};
+    VkDescriptorBufferInfo emitterInfo{
+        resources->dynamicMeshFlowEmitterBuffers[liveSlot].buffer,
+        0,
+        resources->dynamicMeshFlowEmitterBuffers[liveSlot].size};
+    VkDescriptorBufferInfo attractorInfo{
+        resources->dynamicMeshFlowAttractorBuffers[liveSlot].buffer,
+        0,
+        resources->dynamicMeshFlowAttractorBuffers[liveSlot].size};
+    VkDescriptorBufferInfo positionInfo{
+        resources->positionStorageBuffer.buffer,
+        0,
+        resources->positionStorageBuffer.size};
+    VkDescriptorBufferInfo normalInfo{
+        resources->normalBuffer.buffer,
+        0,
+        resources->normalBuffer.size};
+    VkDescriptorBufferInfo scalarInfo{
+        resources->scalarFieldBuffer.buffer,
+        0,
+        resources->scalarFieldBuffer.size};
+
+    std::array<VkWriteDescriptorSet, 8> writes{};
+    VkDescriptorBufferInfo* infos[] = {
+        &uniformInfo,
+        &cellInfo,
+        &gridInfo,
+        &emitterInfo,
+        &attractorInfo,
+        &positionInfo,
+        &normalInfo,
+        &scalarInfo,
+    };
+    for (std::uint32_t bindingIndex = 0; bindingIndex < writes.size(); ++bindingIndex) {
+        writes[bindingIndex] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[bindingIndex].dstSet = descriptorSet;
+        writes[bindingIndex].dstBinding = bindingIndex;
+        writes[bindingIndex].descriptorType =
+            bindingIndex == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[bindingIndex].descriptorCount = 1;
+        writes[bindingIndex].pBufferInfo = infos[bindingIndex];
+    }
+    vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void VulkanViewportShell::PrepareDynamicMeshFlowDispatchSlot(
+    ActivePointCloudResources* resources,
+    std::size_t liveSlot) {
+    if (resources == nullptr || liveSlot >= kDynamicMeshFlowLiveSlots || commandPool_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto& fence = resources->dynamicMeshFlowDispatchFences[liveSlot];
+    if (fence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        Check(vkCreateFence(device_, &fenceInfo, nullptr, &fence), "vkCreateFence(dynamic mesh flow)");
+    } else {
+        const VkResult status = vkGetFenceStatus(device_, fence);
+        if (status == VK_NOT_READY) {
+            Check(vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(dynamic mesh flow)");
+        } else if (status != VK_SUCCESS) {
+            Check(status, "vkGetFenceStatus(dynamic mesh flow)");
+        }
+    }
+
+    auto& commandBuffer = resources->dynamicMeshFlowCommandBuffers[liveSlot];
+    if (commandBuffer != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device_, commandPool_, 1, &commandBuffer);
+        commandBuffer = VK_NULL_HANDLE;
+    }
+}
+
+void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
+    ActivePointCloudResources* resources,
+    std::uint32_t particleCount,
+    std::size_t liveSlot) {
+    if (resources == nullptr ||
+        particleCount == 0U ||
+        liveSlot >= kDynamicMeshFlowLiveSlots ||
+        resources->dynamicMeshFlowDescriptorSets[liveSlot] == VK_NULL_HANDLE ||
+        resources->dynamicMeshFlowDispatchFences[liveSlot] == VK_NULL_HANDLE ||
+        commandPool_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = commandPool_;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    Check(vkAllocateCommandBuffers(device_, &allocInfo, &commandBuffer), "vkAllocateCommandBuffers(dynamic mesh flow)");
+    resources->dynamicMeshFlowCommandBuffers[liveSlot] = commandBuffer;
+
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(dynamic mesh flow)");
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, dynamicMeshFlowComputePipeline_);
+    vkCmdBindDescriptorSets(
+        commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        dynamicMeshFlowPipelineLayout_,
+        0,
+        1,
+        &resources->dynamicMeshFlowDescriptorSets[liveSlot],
+        0,
+        nullptr);
+    vkCmdDispatch(commandBuffer, (particleCount + 63U) / 64U, 1U, 1U);
+
+    std::array<VkBufferMemoryBarrier, 3> barriers{};
+    VkBuffer outputBuffers[] = {
+        resources->positionStorageBuffer.buffer,
+        resources->normalBuffer.buffer,
+        resources->scalarFieldBuffer.buffer,
+    };
+    for (std::size_t index = 0; index < barriers.size(); ++index) {
+        barriers[index] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barriers[index].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[index].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+        barriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[index].buffer = outputBuffers[index];
+        barriers[index].offset = 0;
+        barriers[index].size = VK_WHOLE_SIZE;
+    }
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        0,
+        0,
+        nullptr,
+        static_cast<std::uint32_t>(barriers.size()),
+        barriers.data(),
+        0,
+        nullptr);
+
+    Check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(dynamic mesh flow)");
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    Check(
+        vkResetFences(device_, 1, &resources->dynamicMeshFlowDispatchFences[liveSlot]),
+        "vkResetFences(dynamic mesh flow)");
+    Check(
+        vkQueueSubmit(graphicsQueue_, 1, &submitInfo, resources->dynamicMeshFlowDispatchFences[liveSlot]),
+        "vkQueueSubmit(dynamic mesh flow)");
+}
+
 void VulkanViewportShell::UpdatePointHighlightDescriptorSets(
     ActivePointCloudResources* resources,
     ActivePointCloudResources::PointHighlightResources* highlight) {
@@ -4667,7 +5645,7 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
             "vkAllocateDescriptorSets(point exr)");
     }
 
-    VkDescriptorBufferInfo uniformInfo{frameResources_[0].uniformBuffer.buffer, 0, sizeof(FrameUniforms)};
+    VkDescriptorBufferInfo uniformInfo{exrExportResources_.uniformBuffer.buffer, 0, sizeof(FrameUniforms)};
     VkDescriptorBufferInfo scalarInfo{resources->scalarFieldBuffer.buffer, 0, resources->scalarFieldBuffer.size};
     VkDescriptorBufferInfo styleInfo{resources->exrStyleBuffer.buffer, 0, sizeof(PointCloudStyleGpu)};
     VkDescriptorBufferInfo positionStorageInfo{
@@ -5469,6 +6447,26 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     }
     resources->highlights.clear();
 
+    for (std::size_t liveSlot = 0; liveSlot < kDynamicMeshFlowLiveSlots; ++liveSlot) {
+        auto& fence = resources->dynamicMeshFlowDispatchFences[liveSlot];
+        if (fence != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+            const VkResult status = vkGetFenceStatus(device_, fence);
+            if (status == VK_NOT_READY) {
+                vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+            }
+        }
+        auto& commandBuffer = resources->dynamicMeshFlowCommandBuffers[liveSlot];
+        if (commandBuffer != VK_NULL_HANDLE &&
+            commandPool_ != VK_NULL_HANDLE &&
+            device_ != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_, commandPool_, 1, &commandBuffer);
+            commandBuffer = VK_NULL_HANDLE;
+        }
+        if (fence != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, fence, nullptr);
+            fence = VK_NULL_HANDLE;
+        }
+    }
     DestroyBuffer(&resources->positionBuffer);
     DestroyBuffer(&resources->positionStorageBuffer);
     DestroyBuffer(&resources->colorBuffer);
@@ -5477,6 +6475,17 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->sparseRippleRangeBuffer);
     DestroyBuffer(&resources->sparseRippleMembershipBuffer);
     DestroyBuffer(&resources->sparseRippleParamsBuffer);
+    for (auto& uniformBuffer : resources->dynamicMeshFlowUniformBuffers) {
+        DestroyBuffer(&uniformBuffer);
+    }
+    DestroyBuffer(&resources->dynamicMeshFlowCellBuffer);
+    DestroyBuffer(&resources->dynamicMeshFlowGridBuffer);
+    for (auto& emitterBuffer : resources->dynamicMeshFlowEmitterBuffers) {
+        DestroyBuffer(&emitterBuffer);
+    }
+    for (auto& attractorBuffer : resources->dynamicMeshFlowAttractorBuffers) {
+        DestroyBuffer(&attractorBuffer);
+    }
     for (auto& styleBuffer : resources->styleBuffers) {
         DestroyBuffer(&styleBuffer);
     }
@@ -5499,6 +6508,14 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
         descriptorPool_ != VK_NULL_HANDLE &&
         device_ != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(device_, descriptorPool_, 1, &resources->exrDescriptorSet);
+    }
+    for (auto& descriptorSet : resources->dynamicMeshFlowDescriptorSets) {
+        if (descriptorSet != VK_NULL_HANDLE &&
+            descriptorPool_ != VK_NULL_HANDLE &&
+            device_ != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
+            descriptorSet = VK_NULL_HANDLE;
+        }
     }
     *resources = ActivePointCloudResources{};
 }
@@ -5580,6 +6597,8 @@ void VulkanViewportShell::CleanupHighQualityGaussianScene() {
 void VulkanViewportShell::CleanupExrExportResources() {
     auto& resources = exrExportResources_;
 
+    CancelPointCloudExrFrame();
+
     if (resources.commandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(device_, commandPool_, 1, &resources.commandBuffer);
     }
@@ -5639,6 +6658,7 @@ void VulkanViewportShell::CleanupExrExportResources() {
     DestroyBuffer(&resources.depthReadbackBuffer);
     DestroyBuffer(&resources.normalReadbackBuffer);
     DestroyBuffer(&resources.albedoReadbackBuffer);
+    DestroyBuffer(&resources.uniformBuffer);
 
     resources = ExrExportResources{};
 }
@@ -5815,7 +6835,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.featherPower,
     };
     styleGpu.renderParams1 = glm::vec4{
-        0.0F,
+        layer.style.waterTrailStyleGeometry ? 1.0F : 0.0F,
         0.0F,
         0.0F,
         0.0F,
@@ -6514,13 +7534,15 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     colorCopyRegion.imageSubresource.baseArrayLayer = 0;
     colorCopyRegion.imageSubresource.layerCount = 1;
     colorCopyRegion.imageExtent = {request.width, request.height, 1};
-    vkCmdCopyImageToBuffer(
-        resources.commandBuffer,
-        resources.colorImage.image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        resources.colorReadbackBuffer.buffer,
-        1,
-        &colorCopyRegion);
+    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Color)) {
+        vkCmdCopyImageToBuffer(
+            resources.commandBuffer,
+            resources.colorImage.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            resources.colorReadbackBuffer.buffer,
+            1,
+            &colorCopyRegion);
+    }
 
     VkBufferImageCopy depthCopyRegion{};
     depthCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -6528,13 +7550,15 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     depthCopyRegion.imageSubresource.baseArrayLayer = 0;
     depthCopyRegion.imageSubresource.layerCount = 1;
     depthCopyRegion.imageExtent = {request.width, request.height, 1};
-    vkCmdCopyImageToBuffer(
-        resources.commandBuffer,
-        resources.linearDepthImage.image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        resources.depthReadbackBuffer.buffer,
-        1,
-        &depthCopyRegion);
+    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Depth)) {
+        vkCmdCopyImageToBuffer(
+            resources.commandBuffer,
+            resources.linearDepthImage.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            resources.depthReadbackBuffer.buffer,
+            1,
+            &depthCopyRegion);
+    }
 
     VkBufferImageCopy normalCopyRegion{};
     normalCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -6542,13 +7566,15 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     normalCopyRegion.imageSubresource.baseArrayLayer = 0;
     normalCopyRegion.imageSubresource.layerCount = 1;
     normalCopyRegion.imageExtent = {request.width, request.height, 1};
-    vkCmdCopyImageToBuffer(
-        resources.commandBuffer,
-        resources.normalImage.image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        resources.normalReadbackBuffer.buffer,
-        1,
-        &normalCopyRegion);
+    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Normal)) {
+        vkCmdCopyImageToBuffer(
+            resources.commandBuffer,
+            resources.normalImage.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            resources.normalReadbackBuffer.buffer,
+            1,
+            &normalCopyRegion);
+    }
 
     VkBufferImageCopy albedoCopyRegion{};
     albedoCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -6556,13 +7582,15 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     albedoCopyRegion.imageSubresource.baseArrayLayer = 0;
     albedoCopyRegion.imageSubresource.layerCount = 1;
     albedoCopyRegion.imageExtent = {request.width, request.height, 1};
-    vkCmdCopyImageToBuffer(
-        resources.commandBuffer,
-        resources.albedoImage.image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        resources.albedoReadbackBuffer.buffer,
-        1,
-        &albedoCopyRegion);
+    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Albedo)) {
+        vkCmdCopyImageToBuffer(
+            resources.commandBuffer,
+            resources.albedoImage.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            resources.albedoReadbackBuffer.buffer,
+            1,
+            &albedoCopyRegion);
+    }
 
     Check(vkEndCommandBuffer(resources.commandBuffer), "vkEndCommandBuffer(exr)");
 }
@@ -6621,13 +7649,14 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     if (drawLiveScene) {
     std::array<VkClearValue, 6> clearValues{};
-    clearValues[0].color = {
-        {
-            renderState_.backgroundColor.r,
-            renderState_.backgroundColor.g,
-            renderState_.backgroundColor.b,
-            renderState_.backgroundColor.a,
-        }};
+    clearValues[0].color = renderState_.proResAlphaPreviewEnabled
+                                ? VkClearColorValue{{0.0F, 0.0F, 0.0F, 0.0F}}
+                                : VkClearColorValue{{
+                                      renderState_.backgroundColor.r,
+                                      renderState_.backgroundColor.g,
+                                      renderState_.backgroundColor.b,
+                                      renderState_.backgroundColor.a,
+                                  }};
     clearValues[1].depthStencil = {1.0F, 0};
     clearValues[2].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
     clearValues[3].color = {{1.0F, 0.0F, 0.0F, 0.0F}};
@@ -7003,6 +8032,12 @@ void VulkanViewportShell::RecordCommandBuffer(
             0.35F,
             std::clamp(renderState_.eyeDomeLightingThickness, 1.0F, 24.0F),
         };
+        pushConstants.preview = glm::vec4{
+            renderState_.proResAlphaPreviewEnabled ? 1.0F : 0.0F,
+            0.0F,
+            0.0F,
+            0.0F,
+        };
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, postProcessPipeline_);
         vkCmdBindDescriptorSets(
             commandBuffer,
@@ -7062,6 +8097,17 @@ void VulkanViewportShell::UploadFrameUniforms(
         return;
     }
 
+    UploadFrameUniformsToBuffer(frameResources_[frameIndex].uniformBuffer, width, height);
+}
+
+void VulkanViewportShell::UploadFrameUniformsToBuffer(
+    const BufferAllocation& buffer,
+    std::uint32_t width,
+    std::uint32_t height) {
+    if (buffer.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
     FrameUniforms uniforms;
     uniforms.viewProjection = renderState_.viewProjection;
     uniforms.view = renderState_.view;
@@ -7089,7 +8135,7 @@ void VulkanViewportShell::UploadFrameUniforms(
     };
     uniforms.inverseViewProjection = glm::inverse(renderState_.viewProjection);
 
-    UploadBufferData(frameResources_[frameIndex].uniformBuffer, &uniforms, sizeof(uniforms));
+    UploadBufferData(buffer, &uniforms, sizeof(uniforms));
 }
 
 VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuffer(

@@ -8,6 +8,7 @@ layout(set = 0, binding = 1) uniform sampler2D linearDepthInput;
 
 layout(push_constant) uniform PostProcessData {
     vec4 edl;
+    vec4 preview;
 } postProcess;
 
 bool ValidDepth(float depth) {
@@ -73,5 +74,9 @@ void main() {
     const ivec2 coord = clamp(ivec2(gl_FragCoord.xy), ivec2(0), size - ivec2(1));
     const vec4 sceneColor = texelFetch(sceneColorInput, coord, 0);
     const float shade = EyeDomeLightingShade(coord, size);
-    outColor = vec4(sceneColor.rgb * shade, sceneColor.a);
+    vec3 color = sceneColor.rgb;
+    if (postProcess.preview.x > 0.5) {
+        color *= clamp(sceneColor.a, 0.0, 1.0);
+    }
+    outColor = vec4(color * shade, sceneColor.a);
 }

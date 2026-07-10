@@ -3,6 +3,7 @@
 #include "camera/AnimationPath.hpp"
 #include "camera/CameraShot.hpp"
 #include "output/RenderPreset.hpp"
+#include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "water/WaterFlow.hpp"
 
@@ -76,14 +77,35 @@ struct WaterRippleRuntimeCacheDocument {
     bool stale = false;
 };
 
+struct WaterSceneStateDocument {
+    std::string sceneGroupName = "Default";
+    std::vector<invisible_places::water::WaterEmitter> emitters;
+    std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
+    std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
+    std::optional<invisible_places::water::WaterPathCache> pathCache;
+    std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
+    std::filesystem::path dynamicMeshPath;
+    std::vector<invisible_places::water::WaterDynamicMeshAttractor> dynamicMeshAttractors;
+    std::vector<invisible_places::water::WaterDynamicMeshEmitterMotion> dynamicMeshEmitterMotions;
+};
+
+struct ScenePointVisualStateDocument {
+    std::string sceneGroupName;
+    ProjectLayerDocument::PointVisual visual;
+};
+
 struct ProjectDocument {
     struct SavedAnimation {
         std::filesystem::path filePath;
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 26;
+    std::uint32_t schemaVersion = 32;
     std::string projectName;
+    std::vector<ProjectLayerDocument::PointVisual> pointVisuals;
+    std::string selectedPointVisualName = "Unnamed";
+    std::vector<ScenePointVisualStateDocument> sceneVisualStates;
+    invisible_places::renderer::gsplat::GaussianSplatStyleState gsplatVisualStyle{};
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
     std::vector<invisible_places::camera::CameraShot> cameraShots;
@@ -95,6 +117,7 @@ struct ProjectDocument {
     std::filesystem::path lastAnimationPath;
     std::array<float, 4> backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
     bool eyeDomeLightingEnabled = false;
+    bool proResAlphaPreviewEnabled = false;
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
     bool sidePanelPinned = false;
@@ -106,6 +129,9 @@ struct ProjectDocument {
     invisible_places::renderer::pointcloud::PointCloudRendererMode pointCloudRendererMode =
         invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
     invisible_places::output::RenderJobSettings renderJobSettings{};
+    std::vector<invisible_places::output::ExportPreset> exportPresets;
+    std::string selectedExportPresetName = std::string{invisible_places::output::kFastPreviewMp4PresetName};
+    std::optional<invisible_places::output::ExportPreset> tempExportPreset;
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
@@ -138,9 +164,11 @@ struct ProjectDocument {
     invisible_places::water::WaterFlowTrailSettings waterFlowTrailSettings{};
     invisible_places::water::WaterFieldSettings waterFieldSettings{};
     invisible_places::water::WaterFieldTrailSettings waterFieldTrailSettings{};
+    invisible_places::water::WaterDynamicMeshFlowSettings waterDynamicMeshFlowSettings{};
     invisible_places::water::WaterRainSettings waterRainSettings{};
     std::string selectedWaterRainTrailProfileName = "Rain Fine Lines_preset";
     std::optional<WaterTrailProfileDocument> tempWaterRainTrailProfile;
+    std::vector<WaterSceneStateDocument> waterSceneStates;
     std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
     std::vector<WaterRippleRuntimeCacheDocument> waterRippleRuntimeCaches;
@@ -153,7 +181,7 @@ struct PointCloudStylePresetDocument {
 };
 
 struct WaterSourcesDocument {
-    std::uint32_t schemaVersion = 7;
+    std::uint32_t schemaVersion = 10;
     std::vector<invisible_places::water::WaterEmitter> emitters;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
@@ -178,6 +206,7 @@ struct WaterSourcesDocument {
     invisible_places::water::WaterTrailGeometrySettings trailGeometry{};
     invisible_places::water::WaterFieldSettings fieldSettings{};
     invisible_places::water::WaterFieldTrailSettings fieldTrailSettings{};
+    invisible_places::water::WaterDynamicMeshFlowSettings dynamicMeshFlowSettings{};
     invisible_places::water::WaterRainSettings rainSettings{};
     std::string selectedRainTrailProfileName = "Rain Fine Lines_preset";
     std::optional<WaterTrailProfileDocument> tempRainTrailProfile;

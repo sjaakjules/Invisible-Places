@@ -15,8 +15,10 @@
 #include "output/EyeDomeLighting.hpp"
 #include "output/HoudiniCameraExport.hpp"
 #include "output/OfflinePointRenderer.hpp"
+#include "output/PngWriter.hpp"
 #include "output/RenderPreset.hpp"
 #include "output/VideoWriter.hpp"
+#include "platform/MacWindowingRuntime.hpp"
 #include "platform/VulkanRuntimeConfig.hpp"
 #include "platform/Window.hpp"
 #include "platform/WindowTitle.hpp"
@@ -71,6 +73,7 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <unistd.h>
 #endif
@@ -115,6 +118,7 @@ using WaterRippleRuntimeCacheDocument = invisible_places::serialization::WaterRi
 using WaterLaneProfileDocument = invisible_places::serialization::WaterLaneProfileDocument;
 using WaterPathProfileDocument = invisible_places::serialization::WaterPathProfileDocument;
 using WaterTrailProfileDocument = invisible_places::serialization::WaterTrailProfileDocument;
+using ExportPreset = invisible_places::output::ExportPreset;
 using RenderJobSettings = invisible_places::output::RenderJobSettings;
 using WaterBakeSettings = invisible_places::water::WaterBakeSettings;
 using WaterAnimationTrailSettings = invisible_places::water::WaterAnimationTrailSettings;
@@ -131,7 +135,13 @@ using WaterFieldCache = invisible_places::water::WaterFieldCache;
 using WaterFieldOutputMode = invisible_places::water::WaterFieldOutputMode;
 using WaterFieldSettings = invisible_places::water::WaterFieldSettings;
 using WaterFieldTrailSettings = invisible_places::water::WaterFieldTrailSettings;
+using WaterDynamicMeshAttractor = invisible_places::water::WaterDynamicMeshAttractor;
+using WaterDynamicMeshEmitterMotion = invisible_places::water::WaterDynamicMeshEmitterMotion;
+using WaterDynamicMeshFlowDiagnostics = invisible_places::water::WaterDynamicMeshFlowDiagnostics;
+using WaterDynamicMeshFlowSettings = invisible_places::water::WaterDynamicMeshFlowSettings;
+using WaterDynamicMeshMotionKeyframe = invisible_places::water::WaterDynamicMeshMotionKeyframe;
 using WaterFlowTrailSettings = invisible_places::water::WaterFlowTrailSettings;
+using MeshSurfaceCache = invisible_places::water::MeshSurfaceCache;
 using WaterOverlay = invisible_places::water::WaterOverlay;
 using WaterOverlayPoint = invisible_places::water::WaterOverlayPoint;
 using WaterParticleTrailSettings = invisible_places::water::WaterParticleTrailSettings;
@@ -172,6 +182,7 @@ constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
 constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
 constexpr std::uint32_t kAnimationExportFrustumMaskGridDimension = 48U;
 constexpr double kAnimationExportFrustumMaskUsefulFraction = 0.85;
+constexpr std::size_t kMaxQueuedExportFrames = 2U;
 constexpr auto kPerformanceInteractionHold = std::chrono::milliseconds{300};
 constexpr std::string_view kDefaultPointVisualName = invisible_places::app::point_visual::kDefaultName;
 constexpr std::string_view kPresetPointVisualSuffix = invisible_places::app::point_visual::kPresetSuffix;
@@ -191,6 +202,7 @@ enum class GsplatTransformConvention {
 struct ProjectSettings {
     std::array<float, 4> backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
     bool eyeDomeLightingEnabled = false;
+    bool proResAlphaPreviewEnabled = false;
     float eyeDomeLightingThickness = 1.0F;
     bool showStatusOverlay = true;
     bool constantUpdateView = false;
@@ -201,6 +213,7 @@ struct ProjectSettings {
     PointCloudRendererMode pointCloudRendererMode = PointCloudRendererMode::Beauty;
     float gaussianSplatFootprintBoost = 1.5F;
     GsplatTransformConvention gsplatTransformConvention = GsplatTransformConvention::AsEncoded;
+    GaussianSplatStyleState gsplatVisualStyle{};
 };
 
 struct PersistenceState {
@@ -265,12 +278,43 @@ struct AnimationViewportDragState {
 
 struct QueuedQuickMp4Export {
     AnimationPath animationPath{};
+    invisible_places::output::AnimationExportMode mode =
+        invisible_places::output::AnimationExportMode::FastPreviewMp4;
     RenderJobSettings settings{};
     std::filesystem::path animationFilePath;
     std::string visualName;
     std::size_t visualSessionIndex = 0;
     PointCloudStyleState visualStyle{};
     std::filesystem::path videoOutputPath;
+};
+
+struct AnimationFramePreviewState {
+    bool open = false;
+    bool closePending = false;
+    invisible_places::output::AnimationExportMode exportMode =
+        invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    RenderJobSettings renderSettings{};
+    std::string animationName;
+    invisible_places::renderer::core::VulkanViewportShell::ImGuiPreviewImageTexture texture{};
+    invisible_places::output::HalfRgbaExrImage image{};
+    std::vector<std::uint8_t> displayRgba8;
+    std::string title;
+    std::string summary;
+    std::string saveStatus;
+    std::filesystem::path savedPath;
+};
+
+struct AnimationMotionStatsCacheState {
+    bool valid = false;
+    std::uint64_t pathFingerprint = 0;
+    float scrubAmount = -1.0F;
+    invisible_places::camera::AnimationPathMotionStats stats{};
+};
+
+struct AnimationPreparedPathCacheState {
+    bool valid = false;
+    std::uint64_t pathFingerprint = 0;
+    invisible_places::camera::PreparedAnimationPathEvaluationContext context{};
 };
 
 struct AnimationPanelState {
@@ -295,6 +339,10 @@ struct AnimationPanelState {
     AnimationEditTarget editTarget = AnimationEditTarget::Camera;
     invisible_places::output::AnimationExportMode exportMode =
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    std::vector<ExportPreset> exportPresets;
+    std::string selectedExportPresetName = std::string{invisible_places::output::kFastPreviewMp4PresetName};
+    std::string exportPresetNameBuffer = "Fast Preview MP4";
+    std::optional<ExportPreset> editedExportPreset;
     float scrubAmount = 0.0F;
     bool liveApply = true;
     bool previewDepthOfField = false;
@@ -307,7 +355,10 @@ struct AnimationPanelState {
     std::filesystem::path lastHoudiniCameraScriptPath;
     std::filesystem::path lastHoudiniCameraExportDirectory;
     bool showHoudiniCameraExportNotice = false;
+    AnimationPreparedPathCacheState preparedPathCache{};
+    AnimationMotionStatsCacheState motionStatsCache{};
     AnimationViewportDragState drag{};
+    AnimationFramePreviewState framePreview{};
 };
 
 struct AnimationPlaybackState {
@@ -326,8 +377,10 @@ struct AnimationExportFramePayload {
 struct AnimationExportOutputOptions {
     bool writeExrStack = false;
     bool writePreviewMp4 = false;
+    bool writeProResMov = false;
     bool previewMp4Optional = false;
     std::uint32_t mp4SupersampleScale = 1;
+    bool spatialAntialiasing = true;
     std::filesystem::path previewVideoPath;
     std::string previewVideoWarning;
 };
@@ -358,8 +411,40 @@ struct ExportLogState {
     std::chrono::steady_clock::duration gpuCaptureTotal{};
     std::chrono::steady_clock::duration gpuCaptureMin{};
     std::chrono::steady_clock::duration gpuCaptureMax{};
+    std::chrono::steady_clock::duration gpuSampleTotal{};
+    std::chrono::steady_clock::duration gpuSampleMax{};
+    std::chrono::steady_clock::duration readbackTotal{};
+    std::chrono::steady_clock::duration readbackMax{};
+    std::chrono::steady_clock::duration postProcessTotal{};
+    std::chrono::steady_clock::duration postProcessMax{};
+    std::chrono::steady_clock::duration writerWaitTotal{};
+    std::chrono::steady_clock::duration writerWaitMax{};
     std::uint32_t capturedFrames = 0;
+    std::uint32_t gpuSampleCount = 0;
+    std::uint32_t readbackCount = 0;
+    std::uint32_t postProcessCount = 0;
+    std::uint32_t writerWaitCount = 0;
     std::size_t peakQueuedFrames = 0;
+};
+
+struct OfflineRenderFrameSampleState {
+    bool active = false;
+    std::uint32_t frameIndex = 0;
+    std::uint32_t outputFrameIndex = 0;
+    std::vector<float> sampleOffsetsFrames;
+    std::size_t nextSampleIndex = 0;
+    bool previewPassPending = false;
+    bool gpuSampleInFlight = false;
+    bool gpuSamplePreviewPass = false;
+    bool gpuSampleEyeDomeLighting = false;
+    float gpuSampleEyeDomeLightingThickness = 1.0F;
+    std::chrono::steady_clock::time_point gpuSampleSubmittedAt{};
+    std::chrono::steady_clock::duration lastGpuSampleDuration{};
+    std::chrono::steady_clock::duration lastReadbackDuration{};
+    std::chrono::steady_clock::duration lastPostProcessDuration{};
+    std::vector<invisible_places::output::HalfRgbaExrImage> imageSamples;
+    std::vector<invisible_places::output::HalfRgbaExrImage> previewSamples;
+    std::chrono::steady_clock::time_point startedAt{};
 };
 
 struct OfflineRenderJobState {
@@ -371,6 +456,7 @@ struct OfflineRenderJobState {
     std::vector<invisible_places::camera::CameraState> frames;
     std::vector<invisible_places::output::OfflineRenderTile> tiles;
     std::uint32_t currentFrame = 0;
+    OfflineRenderFrameSampleState frameSampleState{};
     std::uint32_t currentTile = 0;
     invisible_places::output::ExrImage image{};
     std::chrono::steady_clock::time_point startedAt{};
@@ -378,8 +464,10 @@ struct OfflineRenderJobState {
     std::filesystem::path videoOutputPath;
     bool writeExrStack = false;
     bool writePreviewMp4 = false;
+    bool writeProResMov = false;
     bool optionalPreviewMp4 = false;
     std::uint32_t mp4SupersampleScale = 1;
+    bool spatialAntialiasing = true;
     std::string previewVideoWarning;
     std::string errorMessage;
     std::uint32_t setupViewportWidth = 1;
@@ -397,6 +485,8 @@ struct OfflineRenderJobState {
     std::size_t quickMp4BatchIndex = 0;
     std::size_t quickMp4BatchTotal = 0;
     std::string animationName;
+    std::optional<AnimationPath> animationPath;
+    std::optional<invisible_places::camera::PreparedAnimationPathEvaluationContext> preparedAnimationPath;
     std::filesystem::path animationFilePath;
     std::string exportVisualName;
     ExportLogState exportLog{};
@@ -410,6 +500,8 @@ struct OfflineRenderJobState {
     std::shared_ptr<AnimationExportWriterState> writerState;
     std::shared_ptr<struct OfflineRenderProgressState> progressState;
     std::jthread worker;
+    bool writerWaitActive = false;
+    std::chrono::steady_clock::time_point writerWaitStartedAt{};
 };
 
 struct StillCameraPreviewLodPreparationRequest {
@@ -462,6 +554,13 @@ void FinishOfflineRenderJob(
     PreviewRuntimeState* runtimeState,
     const std::string& statusMessage,
     const std::string& errorMessage = {});
+void NormalizeAnimationRenderSettings(RenderJobSettings* settings);
+bool AnimationExportWritesMp4(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportWritesVideo(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportWritesExr(invisible_places::output::AnimationExportMode mode);
+const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode);
+std::uint32_t ScaledRenderDimension(std::uint32_t dimension, std::uint32_t scale);
 std::filesystem::path AnimationDirectory(const PreviewRuntimeState& runtimeState);
 std::filesystem::path HoudiniCameraExportDirectory(const PreviewRuntimeState& runtimeState);
 const std::vector<std::filesystem::path>& AnimationRegistryAssociationPaths(
@@ -513,6 +612,18 @@ struct OfflinePointLayerSnapshot {
 };
 
 using SavedPointVisualState = invisible_places::app::point_visual::VisualState;
+
+struct ScenePointVisualState {
+    std::string sceneGroupName;
+    SavedPointVisualState visual;
+};
+
+struct ProjectPointVisualLibraryState {
+    std::vector<SavedPointVisualState> pointVisuals;
+    std::string selectedPointVisualName = std::string{kDefaultPointVisualName};
+    std::string pointVisualNameBuffer = std::string{kDefaultPointVisualName};
+    std::vector<ScenePointVisualState> sceneVisualStates;
+};
 
 struct SavedWaterAnimationTrailProfileState {
     std::string name = "Unnamed";
@@ -576,6 +687,29 @@ struct PreviewLayerSession {
 struct BackgroundLayerLoadState {
     std::mutex mutex;
     std::optional<LayerLoadResult> result;
+};
+
+struct DynamicMeshSurfaceCacheWarmupResult {
+    bool success = false;
+    std::filesystem::path meshPath;
+    std::string signature;
+    std::shared_ptr<MeshSurfaceCache> cache;
+    WaterDynamicMeshFlowDiagnostics diagnostics{};
+    std::string errorMessage;
+};
+
+struct DynamicMeshSurfaceCacheWarmupShared {
+    std::mutex mutex;
+    std::optional<DynamicMeshSurfaceCacheWarmupResult> result;
+    std::string stage;
+};
+
+struct DynamicMeshSurfaceCacheWarmupJob {
+    std::shared_ptr<DynamicMeshSurfaceCacheWarmupShared> shared;
+    std::jthread worker;
+    std::filesystem::path meshPath;
+    std::string signature;
+    std::chrono::steady_clock::time_point startedAt{};
 };
 
 struct PendingLayerLoad {
@@ -780,23 +914,33 @@ struct WaterWorkflowState {
     std::string selectedTrailProfileName = "Default";
     std::string trailProfileNameBuffer = "Default";
     std::optional<SavedWaterTrailProfileState> editedTrailProfile;
+    std::string dynamicMeshTrailProfileNameBuffer = "Default";
+    std::optional<SavedWaterTrailProfileState> editedDynamicMeshTrailProfile;
     WaterAnimationTrailProfileSource activeAnimationTrailProfileSource =
         WaterAnimationTrailProfileSource::Auto;
     WaterFlowTrailSettings flowTrailSettings{};
     std::optional<WaterFlowTrailSettings> lastInstalledLaneSettings;
     WaterFieldSettings fieldSettings{};
     WaterFieldTrailSettings fieldTrailSettings{};
+    WaterDynamicMeshFlowSettings dynamicMeshFlowSettings =
+        invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
     WaterRainSettings rainSettings = invisible_places::water::DefaultWaterRainSettings();
     WaterRainDiagnostics rainDiagnostics{};
+    WaterDynamicMeshFlowDiagnostics dynamicMeshFlowDiagnostics{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
     WaterOverlay pathAnchors{};
     WaterOverlay flowOverlay{};
     WaterTrailOverlay flowTrailOverlay{};
     WaterTrailOverlay fieldTrailOverlay{};
+    WaterTrailOverlay dynamicMeshTrailOverlay{};
     WaterTrailOverlay rainTrailOverlay{};
     WaterEffectOverlay rippleEffectOverlay{};
     WaterEffectOverlay fieldSurfaceEffectOverlay{};
     WaterFieldCache fieldCache{};
+    std::shared_ptr<MeshSurfaceCache> dynamicMeshSurfaceCache;
+    std::filesystem::path dynamicMeshSurfaceCachePath;
+    std::string dynamicMeshSurfaceCacheSignature;
+    DynamicMeshSurfaceCacheWarmupJob dynamicMeshSurfaceCacheWarmup;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
     std::uint64_t flowOverlayRevision = 0;
     std::uint64_t fieldCacheRevision = 0;
@@ -817,6 +961,7 @@ struct WaterWorkflowState {
     bool pathCacheStale = false;
     bool placementArmed = false;
     bool pathAttractorPlacementArmed = false;
+    bool dynamicMeshAttractorPlacementArmed = false;
     bool pathDirty = false;
     std::unordered_set<std::uint32_t> dirtyEmitterIds;
     std::optional<std::uint32_t> hoveredPathBranchId;
@@ -826,6 +971,8 @@ struct WaterWorkflowState {
     WaterRegionEditorState regionEditor{};
     std::optional<std::size_t> selectedEmitterIndex;
     std::optional<std::size_t> movingEmitterIndex;
+    std::optional<std::size_t> selectedDynamicMeshAttractorIndex;
+    std::optional<std::size_t> movingDynamicMeshAttractorIndex;
     std::optional<std::size_t> selectedRippleLayerIndex;
     std::optional<std::size_t> selectedFieldLayerIndex;
     std::optional<std::size_t> activeSupportSessionIndex;
@@ -833,6 +980,7 @@ struct WaterWorkflowState {
     std::filesystem::path lastRippleOverlayPath;
     std::filesystem::path lastFieldTrailOverlayPath;
     std::filesystem::path lastFieldSurfaceOverlayPath;
+    std::filesystem::path lastDynamicMeshTrailOverlayPath;
     std::filesystem::path lastRainOverlayPath;
     std::uint32_t nextEmitterId = 1;
     std::uint32_t nextRippleLayerId = 1;
@@ -877,7 +1025,9 @@ struct PreviewRuntimeState {
     OfflineRenderJobState offlineRenderJob{};
     invisible_places::ui::SidePanelState sidePanel{};
     ProjectSettings projectSettings{};
+    ProjectPointVisualLibraryState pointVisualLibrary{};
     PersistenceState persistence{};
+    invisible_places::platform::ScopedPowerAssertion exportPowerAssertion{};
     bool showDiagnosticsPanel = false;
     bool pauseLiveViewportDuringExport = true;
     bool previewRenderStateSignatureValid = false;
@@ -897,6 +1047,14 @@ std::filesystem::path ResolveDataDirectory(const std::filesystem::path& requeste
     }
 
     return Application::DefaultDataDirectory();
+}
+
+void AcquireExportPowerAssertion(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || runtimeState->exportPowerAssertion.Active()) {
+        return;
+    }
+    runtimeState->exportPowerAssertion =
+        invisible_places::platform::PreventUserIdleSystemSleep("Invisible Places export");
 }
 
 std::string FormatPointCount(std::uint64_t value) {
@@ -930,6 +1088,13 @@ double PercentileValue(std::vector<double> values, double percentile) {
 
 std::string NormalizePathKey(const std::filesystem::path& path) {
     return path.lexically_normal().generic_string();
+}
+
+std::string LowercaseAsciiCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
 }
 
 std::uint64_t WaterRegionPreviewKey(WaterEffectFeatureType featureType, std::uint32_t layerId) {
@@ -1720,6 +1885,91 @@ void HashMat4(std::uint64_t* seed, const glm::mat4& value) {
     }
 }
 
+void HashArray3(std::uint64_t* seed, const std::array<float, 3>& value) {
+    HashFloat(seed, value[0]);
+    HashFloat(seed, value[1]);
+    HashFloat(seed, value[2]);
+}
+
+void HashArray4(std::uint64_t* seed, const std::array<float, 4>& value) {
+    HashFloat(seed, value[0]);
+    HashFloat(seed, value[1]);
+    HashFloat(seed, value[2]);
+    HashFloat(seed, value[3]);
+}
+
+std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
+    std::uint64_t seed = 1469598103934665603ULL;
+    HashCombine(&seed, path.durationFrames);
+    HashBool(&seed, path.depthOfFieldEnabled);
+    HashFloat(&seed, path.apertureFStops);
+    HashFloat(&seed, path.depthOfFieldMaxBlurPixels);
+    HashCombine(&seed, path.keys.size());
+    for (const auto& key : path.keys) {
+        HashArray3(&seed, key.cameraPosition);
+        HashArray3(&seed, key.focusPoint);
+        HashBool(&seed, key.hasOrientation);
+        HashArray4(&seed, key.orientation);
+        HashBool(&seed, key.hasFocusDistance);
+        HashFloat(&seed, key.focusDistance);
+        HashBool(&seed, key.hasApertureFStops);
+        HashFloat(&seed, key.apertureFStops);
+        HashFloat(&seed, key.fovDegrees);
+        HashFloat(&seed, key.nearPlane);
+        HashFloat(&seed, key.farPlane);
+        HashCombine(&seed, key.durationFrames);
+    }
+    return seed;
+}
+
+const invisible_places::camera::PreparedAnimationPathEvaluationContext& CachedPreparedAnimationPath(
+    AnimationPanelState* panel,
+    const AnimationPath& path) {
+    static thread_local invisible_places::camera::PreparedAnimationPathEvaluationContext fallbackContext;
+    const auto fingerprint = AnimationPathMotionFingerprint(path);
+    if (panel == nullptr) {
+        fallbackContext = invisible_places::camera::PrepareAnimationPathEvaluation(path);
+        return fallbackContext;
+    }
+
+    if (!panel->preparedPathCache.valid ||
+        panel->preparedPathCache.pathFingerprint != fingerprint) {
+        panel->preparedPathCache.context =
+            invisible_places::camera::PrepareAnimationPathEvaluation(path);
+        panel->preparedPathCache.pathFingerprint = fingerprint;
+        panel->preparedPathCache.valid = true;
+    }
+    return panel->preparedPathCache.context;
+}
+
+invisible_places::camera::AnimationPathMotionStats CachedAnimationPathMotionStats(
+    AnimationPanelState* panel,
+    const AnimationPath& path,
+    float scrubAmount) {
+    const float normalizedScrubAmount = std::clamp(scrubAmount, 0.0F, 1.0F);
+    const auto fingerprint = AnimationPathMotionFingerprint(path);
+    if (panel != nullptr &&
+        panel->motionStatsCache.valid &&
+        panel->motionStatsCache.pathFingerprint == fingerprint &&
+        std::abs(panel->motionStatsCache.scrubAmount - normalizedScrubAmount) <= 1.0e-6F) {
+        return panel->motionStatsCache.stats;
+    }
+
+    const auto& preparedPath = CachedPreparedAnimationPath(panel, path);
+    auto stats = invisible_places::camera::MeasurePreparedAnimationPathMotion(
+        preparedPath,
+        normalizedScrubAmount);
+    if (panel != nullptr) {
+        panel->motionStatsCache = {
+            .valid = true,
+            .pathFingerprint = fingerprint,
+            .scrubAmount = normalizedScrubAmount,
+            .stats = stats,
+        };
+    }
+    return stats;
+}
+
 void HashBinding(std::uint64_t* seed, const RenderParameterBinding& binding) {
     HashBool(seed, binding.active);
     HashCombine(seed, static_cast<std::uint64_t>(binding.mode));
@@ -1802,6 +2052,7 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashFloat(seed, style.gaussianSharpness);
     HashFloat(seed, style.featherPower);
     HashFloat(seed, style.waterStreakAspect);
+    HashBool(seed, style.waterTrailStyleGeometry);
     HashBool(seed, style.solidCenters);
     HashBool(seed, style.flowAnimation);
     HashBool(seed, style.waterPathView);
@@ -1849,6 +2100,7 @@ std::uint64_t RenderStateSignature(
     HashMat4(&seed, renderState.viewProjection);
     HashVec3(&seed, renderState.cameraPosition);
     HashVec4(&seed, renderState.backgroundColor);
+    HashBool(&seed, renderState.proResAlphaPreviewEnabled);
     HashBool(&seed, renderState.eyeDomeLightingEnabled);
     HashFloat(&seed, renderState.eyeDomeLightingThickness);
     HashFloat(&seed, renderState.nearPlane);
@@ -2002,6 +2254,47 @@ GaussianSplatQualityMode EffectiveGaussianSplatQualityMode(
         session.gsplatStyle.qualityMode,
         runtimeState.projectSettings.autoLowerGsplatQualityWhileNavigating,
         runtimeState.performanceInteraction.active);
+}
+
+void CopyGsplatVisualFields(
+    GaussianSplatStyleState* target,
+    const GaussianSplatStyleState& source) {
+    if (target == nullptr) {
+        return;
+    }
+    target->colorMode = source.colorMode;
+    target->debugMode = source.debugMode;
+    target->qualityMode = source.qualityMode;
+    target->opacityMultiplier = source.opacityMultiplier;
+    target->scaleMultiplier = source.scaleMultiplier;
+    target->exposure = source.exposure;
+    target->saturation = source.saturation;
+    target->layerTint = source.layerTint;
+}
+
+void ApplyProjectGsplatVisualStyleToSession(
+    const PreviewRuntimeState& runtimeState,
+    PreviewLayerSession* session) {
+    if (session == nullptr || session->kind != LayerKind::GaussianSplat) {
+        return;
+    }
+    CopyGsplatVisualFields(&session->gsplatStyle, runtimeState.projectSettings.gsplatVisualStyle);
+}
+
+void SyncProjectGsplatVisualStyleFromSession(
+    PreviewRuntimeState* runtimeState,
+    const PreviewLayerSession& sourceSession) {
+    if (runtimeState == nullptr || sourceSession.kind != LayerKind::GaussianSplat) {
+        return;
+    }
+
+    CopyGsplatVisualFields(&runtimeState->projectSettings.gsplatVisualStyle, sourceSession.gsplatStyle);
+    for (auto& session : runtimeState->sessions) {
+        if (session.kind != LayerKind::GaussianSplat) {
+            continue;
+        }
+        ApplyProjectGsplatVisualStyleToSession(*runtimeState, &session);
+    }
 }
 
 bool BoundsIntersectsViewFrustum(
@@ -2441,6 +2734,9 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session);
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session);
 bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState);
 bool IsProtectedWaterPointVisualName(std::string_view name);
+std::optional<std::size_t> FindScalarFieldByName(
+    const std::vector<invisible_places::io::ScalarFieldStats>& fields,
+    std::string_view name);
 std::optional<PointCloudStyleState> MakeProtectedWaterPointVisualStyle(
     const PreviewRuntimeState& runtimeState,
     std::string_view name);
@@ -2459,6 +2755,7 @@ bool RefreshWaterOverlayFromAnchors(
 bool RefreshWaterRainOverlay(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport);
+void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
 std::optional<std::size_t> ResolveWaterSupportSessionIndex(const PreviewRuntimeState& runtimeState);
 WaterSourceSettings ActiveProfileDefaultWaterSourceSettings(const WaterWorkflowState& water);
 bool TryLoadWaterPathCacheForSupport(
@@ -2487,6 +2784,165 @@ std::optional<std::size_t> FindSessionIndexBySourcePath(
 void SyncScenePointVisualsFromOwner(PreviewRuntimeState* runtimeState, PreviewLayerSession* editedSession);
 void ConsolidateScenePointVisuals(PreviewRuntimeState* runtimeState);
 
+std::string NormalizeExportPresetName(std::string_view name) {
+    auto normalized = TrimText(name);
+    return normalized.empty()
+               ? std::string{invisible_places::output::kFastPreviewMp4PresetName}
+               : normalized;
+}
+
+std::optional<ExportPreset> BuiltInExportPresetByName(std::string_view name) {
+    const auto normalized = NormalizeExportPresetName(name);
+    for (const auto& preset : invisible_places::output::BuiltInExportPresets()) {
+        if (NormalizeExportPresetName(preset.name) == normalized) {
+            return preset;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> FindExportPresetIndex(
+    const std::vector<ExportPreset>& presets,
+    std::string_view name) {
+    const auto normalized = NormalizeExportPresetName(name);
+    for (std::size_t index = 0; index < presets.size(); ++index) {
+        if (NormalizeExportPresetName(presets[index].name) == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+bool IsProtectedExportPresetName(std::string_view name) {
+    return invisible_places::output::IsBuiltInExportPresetName(NormalizeExportPresetName(name));
+}
+
+void SanitizeExportPreset(ExportPreset* preset) {
+    if (preset == nullptr) {
+        return;
+    }
+    preset->name = NormalizeExportPresetName(preset->name);
+    preset->settings.width = std::max<std::uint32_t>(1U, preset->settings.width);
+    preset->settings.height = std::max<std::uint32_t>(1U, preset->settings.height);
+    preset->settings.framesPerSecond = std::max<std::uint32_t>(1U, preset->settings.framesPerSecond);
+    preset->settings.stillCameraDurationSeconds =
+        std::clamp(preset->settings.stillCameraDurationSeconds, 0.001F, 3600.0F);
+    preset->settings.tileSize = std::max<std::uint32_t>(1U, preset->settings.tileSize);
+    preset->settings.supersampleScale = std::clamp(preset->settings.supersampleScale, 1U, 8U);
+    preset->settings.temporalSampleCount = std::clamp(preset->settings.temporalSampleCount, 1U, 64U);
+    preset->settings.motionBlurSampleCount = std::clamp(preset->settings.motionBlurSampleCount, 1U, 64U);
+    preset->settings.motionBlurShutterAngleDegrees =
+        std::clamp(preset->settings.motionBlurShutterAngleDegrees, 0.0F, 360.0F);
+}
+
+RenderJobSettings RenderSettingsFromExportPreset(
+    const ExportPreset& preset,
+    const std::string& fallbackOutputDirectory) {
+    auto settings = preset.settings;
+    if (settings.outputDirectory.empty()) {
+        settings.outputDirectory = fallbackOutputDirectory;
+    }
+    settings.width = std::max<std::uint32_t>(1U, settings.width);
+    settings.height = std::max<std::uint32_t>(1U, settings.height);
+    settings.framesPerSecond = std::max<std::uint32_t>(1U, settings.framesPerSecond);
+    settings.stillCameraDurationSeconds = std::clamp(settings.stillCameraDurationSeconds, 0.001F, 3600.0F);
+    settings.tileSize = std::max<std::uint32_t>(1U, settings.tileSize);
+    settings.supersampleScale = std::clamp(settings.supersampleScale, 1U, 8U);
+    settings.temporalSampleCount = std::clamp(settings.temporalSampleCount, 1U, 64U);
+    settings.motionBlurSampleCount = std::clamp(settings.motionBlurSampleCount, 1U, 64U);
+    settings.motionBlurShutterAngleDegrees =
+        std::clamp(settings.motionBlurShutterAngleDegrees, 0.0F, 360.0F);
+    return settings;
+}
+
+void EnsureExportPresets(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    for (auto& preset : panel.exportPresets) {
+        SanitizeExportPreset(&preset);
+    }
+    panel.exportPresets.erase(
+        std::remove_if(
+            panel.exportPresets.begin(),
+            panel.exportPresets.end(),
+            [](const ExportPreset& preset) {
+                return IsProtectedExportPresetName(preset.name) ||
+                       invisible_places::output::IsEditedExportPresetName(preset.name);
+            }),
+        panel.exportPresets.end());
+    if (panel.editedExportPreset.has_value()) {
+        SanitizeExportPreset(&panel.editedExportPreset.value());
+    }
+
+    panel.selectedExportPresetName = NormalizeExportPresetName(panel.selectedExportPresetName);
+    const bool hasEditedSelection =
+        panel.editedExportPreset.has_value() &&
+        NormalizeExportPresetName(panel.editedExportPreset->name) == panel.selectedExportPresetName;
+    const bool hasCustomSelection =
+        FindExportPresetIndex(panel.exportPresets, panel.selectedExportPresetName).has_value();
+    const bool hasBuiltInSelection = BuiltInExportPresetByName(panel.selectedExportPresetName).has_value();
+    if (!hasEditedSelection && !hasCustomSelection && !hasBuiltInSelection) {
+        panel.selectedExportPresetName = std::string{invisible_places::output::kFastPreviewMp4PresetName};
+        panel.editedExportPreset.reset();
+    }
+    if (panel.exportPresetNameBuffer.empty()) {
+        panel.exportPresetNameBuffer =
+            invisible_places::output::BaseExportPresetName(panel.selectedExportPresetName);
+    }
+}
+
+ExportPreset ViewedExportPreset(const PreviewRuntimeState& runtimeState) {
+    const auto& panel = runtimeState.animationPanel;
+    const auto selected = NormalizeExportPresetName(panel.selectedExportPresetName);
+    if (panel.editedExportPreset.has_value() &&
+        NormalizeExportPresetName(panel.editedExportPreset->name) == selected) {
+        return panel.editedExportPreset.value();
+    }
+    if (const auto index = FindExportPresetIndex(panel.exportPresets, selected); index.has_value()) {
+        return panel.exportPresets[index.value()];
+    }
+    if (const auto builtIn = BuiltInExportPresetByName(selected); builtIn.has_value()) {
+        return builtIn.value();
+    }
+    return invisible_places::output::MakeFastPreviewMp4ExportPreset();
+}
+
+ExportPreset& EditActiveExportPreset(PreviewRuntimeState* runtimeState) {
+    auto& panel = runtimeState->animationPanel;
+    EnsureExportPresets(runtimeState);
+    const auto selected = NormalizeExportPresetName(panel.selectedExportPresetName);
+    if (!invisible_places::output::IsEditedExportPresetName(selected) &&
+        !IsProtectedExportPresetName(selected)) {
+        if (const auto index = FindExportPresetIndex(panel.exportPresets, selected); index.has_value()) {
+            return panel.exportPresets[index.value()];
+        }
+    }
+
+    auto editable = ViewedExportPreset(*runtimeState);
+    editable.name = invisible_places::output::EditedExportPresetName(selected);
+    panel.selectedExportPresetName = editable.name;
+    panel.exportPresetNameBuffer = invisible_places::output::BaseExportPresetName(editable.name);
+    panel.editedExportPreset = editable;
+    return panel.editedExportPreset.value();
+}
+
+void ApplyActiveExportPresetToRenderSettings(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    EnsureExportPresets(runtimeState);
+    runtimeState->renderSettings = RenderSettingsFromExportPreset(
+        ViewedExportPreset(*runtimeState),
+        runtimeState->renderSettings.outputDirectory);
+}
+
+invisible_places::output::AnimationExportMode ActiveExportMode(PreviewRuntimeState* runtimeState) {
+    EnsureExportPresets(runtimeState);
+    return ViewedExportPreset(*runtimeState).mode;
+}
+
 std::optional<std::size_t> FindPointVisualIndex(
     const PreviewLayerSession& session,
     std::string_view name) {
@@ -2502,6 +2958,588 @@ void UpsertPointVisual(
     }
 
     invisible_places::app::point_visual::Upsert(&session->pointVisuals, name, style);
+}
+
+bool IsProjectPointVisualSession(const PreviewLayerSession& session) {
+    return session.kind == LayerKind::PointCloud && !IsGeneratedWaterOverlaySession(session);
+}
+
+std::string ProjectVisualSceneKey(const PreviewLayerSession& session) {
+    if (!session.sceneGroupName.empty()) {
+        return session.sceneGroupName;
+    }
+    if (!session.sourcePath.empty()) {
+        return session.sourcePath.stem().string();
+    }
+    return session.displayName;
+}
+
+std::string SceneTemporaryPointVisualName(std::string_view baseName, const PreviewLayerSession& session) {
+    const auto sceneKey = ProjectVisualSceneKey(session);
+    const auto base = BasePointVisualName(baseName);
+    if (sceneKey.empty()) {
+        return base;
+    }
+    return base + "_" + sceneKey;
+}
+
+std::string BaseNameFromSceneTemporaryPointVisual(
+    std::string_view visualName,
+    const PreviewLayerSession& session) {
+    auto normalized = NormalizePointVisualName(visualName);
+    const auto sceneKey = ProjectVisualSceneKey(session);
+    const std::string suffix = sceneKey.empty() ? std::string{} : "_" + sceneKey;
+    if (!suffix.empty() &&
+        normalized.size() > suffix.size() &&
+        normalized.substr(normalized.size() - suffix.size()) == suffix) {
+        normalized.resize(normalized.size() - suffix.size());
+    }
+    return BasePointVisualName(normalized);
+}
+
+std::string BaseNameFromProjectPointVisualName(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view visualName) {
+    auto normalized = NormalizePointVisualName(visualName);
+    for (const auto& state : library.sceneVisualStates) {
+        if (state.sceneGroupName.empty()) {
+            continue;
+        }
+        const std::string suffix = "_" + state.sceneGroupName;
+        if (normalized.size() > suffix.size() && EndsWith(normalized, suffix)) {
+            normalized.resize(normalized.size() - suffix.size());
+            break;
+        }
+    }
+    return BasePointVisualName(normalized);
+}
+
+std::optional<std::size_t> FindProjectPointVisualIndex(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view name) {
+    return invisible_places::app::point_visual::FindIndex(library.pointVisuals, name);
+}
+
+std::optional<std::size_t> FindScenePointVisualStateIndex(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view sceneGroupName) {
+    const std::string sceneKey{sceneGroupName};
+    for (std::size_t index = 0; index < library.sceneVisualStates.size(); ++index) {
+        if (library.sceneVisualStates[index].sceneGroupName == sceneKey) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> FindScenePointVisualStateIndex(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view sceneGroupName,
+    std::string_view visualName) {
+    const std::string sceneKey{sceneGroupName};
+    const auto normalized = NormalizePointVisualName(visualName);
+    for (std::size_t index = 0; index < library.sceneVisualStates.size(); ++index) {
+        const auto& state = library.sceneVisualStates[index];
+        if (state.sceneGroupName == sceneKey &&
+            NormalizePointVisualName(state.visual.name) == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> FindScenePointVisualStateByNameIndex(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view visualName) {
+    const auto normalized = NormalizePointVisualName(visualName);
+    for (std::size_t index = 0; index < library.sceneVisualStates.size(); ++index) {
+        if (NormalizePointVisualName(library.sceneVisualStates[index].visual.name) == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> FindScenePointVisualStateForBaseIndex(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view sceneGroupName,
+    std::string_view baseName) {
+    const std::string sceneKey{sceneGroupName};
+    const auto normalizedBase = BasePointVisualName(baseName);
+    for (std::size_t index = 0; index < library.sceneVisualStates.size(); ++index) {
+        const auto& state = library.sceneVisualStates[index];
+        if (state.sceneGroupName != sceneKey) {
+            continue;
+        }
+        if (BaseNameFromProjectPointVisualName(library, state.visual.name) == normalizedBase) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+void EnsureProjectPointVisuals(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    auto& library = runtimeState->pointVisualLibrary;
+    if (library.pointVisuals.empty()) {
+        PointCloudStyleState fallbackStyle{};
+        if (const auto sessionIt = std::find_if(
+                runtimeState->sessions.begin(),
+                runtimeState->sessions.end(),
+                [](const PreviewLayerSession& session) {
+                    return IsProjectPointVisualSession(session);
+                });
+            sessionIt != runtimeState->sessions.end()) {
+            fallbackStyle = sessionIt->pointStyle;
+        }
+        library.pointVisuals.push_back({.name = std::string{kDefaultPointVisualName}, .style = fallbackStyle});
+    }
+
+    for (auto& visual : library.pointVisuals) {
+        visual.name = NormalizePointVisualName(visual.name);
+    }
+    for (auto& state : library.sceneVisualStates) {
+        state.sceneGroupName = TrimText(state.sceneGroupName);
+        state.visual.name = NormalizePointVisualName(state.visual.name);
+    }
+    library.selectedPointVisualName = NormalizePointVisualName(library.selectedPointVisualName);
+    if (!FindProjectPointVisualIndex(library, library.selectedPointVisualName).has_value()) {
+        library.selectedPointVisualName = library.pointVisuals.front().name;
+    }
+    if (library.pointVisualNameBuffer.empty()) {
+        library.pointVisualNameBuffer = BasePointVisualName(library.selectedPointVisualName);
+    }
+}
+
+void UpsertProjectPointVisual(
+    PreviewRuntimeState* runtimeState,
+    std::string_view name,
+    const PointCloudStyleState& style) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    invisible_places::app::point_visual::Upsert(
+        &runtimeState->pointVisualLibrary.pointVisuals,
+        BasePointVisualName(name),
+        style);
+}
+
+void RemoveScenePointVisualStateForBase(
+    PreviewRuntimeState* runtimeState,
+    std::string_view sceneGroupName,
+    std::string_view baseName) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const std::string sceneKey{sceneGroupName};
+    const auto normalizedBase = BasePointVisualName(baseName);
+    auto& states = runtimeState->pointVisualLibrary.sceneVisualStates;
+    states.erase(
+        std::remove_if(
+            states.begin(),
+            states.end(),
+            [&sceneKey, &normalizedBase](const ScenePointVisualState& state) {
+                if (state.sceneGroupName != sceneKey) {
+                    return false;
+                }
+                auto stateBase = NormalizePointVisualName(state.visual.name);
+                const std::string suffix = "_" + state.sceneGroupName;
+                if (stateBase.size() > suffix.size() && EndsWith(stateBase, suffix)) {
+                    stateBase.resize(stateBase.size() - suffix.size());
+                }
+                return BasePointVisualName(stateBase) == normalizedBase;
+            }),
+        states.end());
+}
+
+void UpsertScenePointVisualState(
+    PreviewRuntimeState* runtimeState,
+    const PreviewLayerSession& session,
+    std::string_view visualName,
+    const PointCloudStyleState& style) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    const auto sceneKey = ProjectVisualSceneKey(session);
+    if (sceneKey.empty()) {
+        return;
+    }
+
+    ScenePointVisualState state;
+    state.sceneGroupName = sceneKey;
+    state.visual.name = NormalizePointVisualName(visualName);
+    state.visual.style = style;
+    if (const auto index = FindScenePointVisualStateIndex(runtimeState->pointVisualLibrary, sceneKey, state.visual.name);
+        index.has_value()) {
+        runtimeState->pointVisualLibrary.sceneVisualStates[index.value()] = std::move(state);
+    } else {
+        runtimeState->pointVisualLibrary.sceneVisualStates.push_back(std::move(state));
+    }
+}
+
+std::optional<PointCloudStyleState> ProjectPointVisualStyleByName(
+    const ProjectPointVisualLibraryState& library,
+    std::string_view visualName) {
+    const auto normalized = NormalizePointVisualName(visualName);
+    if (const auto visualIndex = FindProjectPointVisualIndex(library, normalized); visualIndex.has_value()) {
+        return library.pointVisuals[visualIndex.value()].style;
+    }
+    if (const auto stateIndex = FindScenePointVisualStateByNameIndex(library, normalized); stateIndex.has_value()) {
+        return library.sceneVisualStates[stateIndex.value()].visual.style;
+    }
+    return std::nullopt;
+}
+
+std::string JoinShortList(const std::vector<std::string>& values) {
+    std::ostringstream output;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) {
+            output << ", ";
+        }
+        output << values[index];
+    }
+    return output.str();
+}
+
+void AppendUniqueText(std::vector<std::string>* values, std::string value) {
+    if (values == nullptr || value.empty()) {
+        return;
+    }
+    if (std::find(values->begin(), values->end(), value) == values->end()) {
+        values->push_back(std::move(value));
+    }
+}
+
+void CollectMissingProjectVisualBindingFields(
+    const RenderParameterBinding& binding,
+    std::string_view label,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    std::vector<std::string>* missingFields) {
+    if (!binding.active || binding.mode != ParameterSourceMode::FieldMapped || missingFields == nullptr) {
+        return;
+    }
+
+    if (!binding.fieldMap.fieldName.empty()) {
+        if (!FindScalarFieldByName(scalarFields, binding.fieldMap.fieldName).has_value()) {
+            AppendUniqueText(
+                missingFields,
+                std::string{label} + " -> " + binding.fieldMap.fieldName);
+        }
+        return;
+    }
+
+    if (binding.fieldMap.fieldSlot < 0 ||
+        static_cast<std::size_t>(binding.fieldMap.fieldSlot) >= scalarFields.size()) {
+        AppendUniqueText(
+            missingFields,
+            std::string{label} + " -> scalar field slot " + std::to_string(binding.fieldMap.fieldSlot));
+    }
+}
+
+std::vector<std::string> MissingProjectVisualBindingFields(
+    const PointCloudStyleState& style,
+    const PreviewLayerSession& session) {
+    std::vector<std::string> missingFields;
+    CollectMissingProjectVisualBindingFields(style.pointSize, "Point Size", session.scalarFields, &missingFields);
+    CollectMissingProjectVisualBindingFields(
+        style.surfelDiameter,
+        "Surfel Diameter",
+        session.scalarFields,
+        &missingFields);
+    CollectMissingProjectVisualBindingFields(style.opacity, "Opacity", session.scalarFields, &missingFields);
+    CollectMissingProjectVisualBindingFields(
+        style.emissiveStrength,
+        "Emission",
+        session.scalarFields,
+        &missingFields);
+    CollectMissingProjectVisualBindingFields(style.depthFade, "Depth Fade", session.scalarFields, &missingFields);
+    CollectMissingProjectVisualBindingFields(
+        style.colormapPosition,
+        "Colormap",
+        session.scalarFields,
+        &missingFields);
+    return missingFields;
+}
+
+std::string ProjectVisualWarningLayerLabel(const PreviewLayerSession& session) {
+    if (!session.sceneRole.empty()) {
+        return session.sceneRole;
+    }
+    if (!session.displayName.empty()) {
+        return session.displayName;
+    }
+    if (!session.sourcePath.empty()) {
+        return session.sourcePath.filename().string();
+    }
+    return "layer";
+}
+
+std::string BuildProjectVisualFieldBindingWarning(
+    const PreviewRuntimeState& runtimeState,
+    std::string_view sceneKey,
+    std::string_view visualName,
+    const std::optional<PointCloudStyleState>& style) {
+    if (!style.has_value()) {
+        return {};
+    }
+
+    std::vector<std::string> layerWarnings;
+    for (const auto& session : runtimeState.sessions) {
+        if (!IsProjectPointVisualSession(session) ||
+            ProjectVisualSceneKey(session) != sceneKey ||
+            !session.loaded) {
+            continue;
+        }
+
+        const auto missingFields = MissingProjectVisualBindingFields(style.value(), session);
+        if (missingFields.empty()) {
+            continue;
+        }
+        layerWarnings.push_back(
+            ProjectVisualWarningLayerLabel(session) + " missing " + JoinShortList(missingFields));
+    }
+
+    if (layerWarnings.empty()) {
+        return {};
+    }
+
+    return "Visual '" + NormalizePointVisualName(visualName) +
+           "' has field-mapped controls that are unavailable on " +
+           JoinShortList(layerWarnings) + ".";
+}
+
+bool IsProjectVisualFieldBindingWarning(std::string_view message) {
+    return message.find("field-mapped controls") != std::string_view::npos &&
+           message.find("unavailable") != std::string_view::npos;
+}
+
+void UpdateProjectVisualFieldBindingWarning(
+    PreviewRuntimeState* runtimeState,
+    const std::string& warning) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    if (!warning.empty()) {
+        runtimeState->errorMessage = warning;
+        runtimeState->statusMessage.clear();
+    } else if (IsProjectVisualFieldBindingWarning(runtimeState->errorMessage)) {
+        runtimeState->errorMessage.clear();
+    }
+}
+
+bool ResolveProjectVisualBindingByFieldName(
+    RenderParameterBinding* binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
+    if (binding == nullptr || binding->mode != ParameterSourceMode::FieldMapped) {
+        return false;
+    }
+
+    if (!binding->fieldMap.fieldName.empty()) {
+        if (const auto slot = FindScalarFieldByName(scalarFields, binding->fieldMap.fieldName);
+            slot.has_value()) {
+            binding->fieldMap.fieldSlot = static_cast<std::int32_t>(slot.value());
+            binding->fieldMap.fieldName = scalarFields[slot.value()].name;
+            return false;
+        }
+        binding->mode = ParameterSourceMode::Constant;
+        binding->fieldMap.fieldSlot = -1;
+        return true;
+    }
+
+    if (binding->fieldMap.fieldSlot >= 0 &&
+        static_cast<std::size_t>(binding->fieldMap.fieldSlot) < scalarFields.size()) {
+        binding->fieldMap.fieldName = scalarFields[static_cast<std::size_t>(binding->fieldMap.fieldSlot)].name;
+        return false;
+    }
+
+    binding->mode = ParameterSourceMode::Constant;
+    binding->fieldMap.fieldSlot = -1;
+    return true;
+}
+
+bool ResolveProjectVisualStyleBindingsByFieldName(
+    PointCloudStyleState* style,
+    const PreviewLayerSession& session) {
+    if (style == nullptr) {
+        return false;
+    }
+
+    bool convertedMissingField = false;
+    convertedMissingField |= ResolveProjectVisualBindingByFieldName(&style->pointSize, session.scalarFields);
+    convertedMissingField |= ResolveProjectVisualBindingByFieldName(&style->surfelDiameter, session.scalarFields);
+    convertedMissingField |= ResolveProjectVisualBindingByFieldName(&style->opacity, session.scalarFields);
+    convertedMissingField |= ResolveProjectVisualBindingByFieldName(&style->emissiveStrength, session.scalarFields);
+    convertedMissingField |= ResolveProjectVisualBindingByFieldName(&style->depthFade, session.scalarFields);
+    convertedMissingField |= ResolveProjectVisualBindingByFieldName(&style->colormapPosition, session.scalarFields);
+    return convertedMissingField;
+}
+
+void CopyProjectVisualsToSessionList(
+    PreviewRuntimeState* runtimeState,
+    PreviewLayerSession* session,
+    std::string_view selectedName,
+    const PointCloudStyleState& selectedStyle) {
+    if (runtimeState == nullptr || session == nullptr) {
+        return;
+    }
+
+    session->pointVisuals = runtimeState->pointVisualLibrary.pointVisuals;
+    for (const auto& state : runtimeState->pointVisualLibrary.sceneVisualStates) {
+        invisible_places::app::point_visual::Upsert(
+            &session->pointVisuals,
+            state.visual.name,
+            state.visual.style);
+    }
+    invisible_places::app::point_visual::Upsert(&session->pointVisuals, selectedName, selectedStyle);
+}
+
+void ApplyProjectPointVisualToSession(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr || !IsProjectPointVisualSession(*session)) {
+        return;
+    }
+
+    EnsureProjectPointVisuals(runtimeState);
+    auto& library = runtimeState->pointVisualLibrary;
+    const auto sceneKey = ProjectVisualSceneKey(*session);
+    std::string selectedName = NormalizePointVisualName(session->selectedPointVisualName);
+    PointCloudStyleState style = library.pointVisuals.front().style;
+    bool hasResolvedStyle = false;
+
+    const bool useSessionSelection =
+        !selectedName.empty() &&
+        (selectedName != std::string{kDefaultPointVisualName} ||
+         library.selectedPointVisualName == std::string{kDefaultPointVisualName} ||
+         FindScenePointVisualStateByNameIndex(library, selectedName).has_value());
+    if (useSessionSelection) {
+        if (const auto visualIndex = FindProjectPointVisualIndex(library, selectedName); visualIndex.has_value()) {
+            style = library.pointVisuals[visualIndex.value()].style;
+            hasResolvedStyle = true;
+        } else if (const auto stateIndex = FindScenePointVisualStateByNameIndex(library, selectedName);
+                   stateIndex.has_value()) {
+            style = library.sceneVisualStates[stateIndex.value()].visual.style;
+            selectedName = library.sceneVisualStates[stateIndex.value()].visual.name;
+            hasResolvedStyle = true;
+        }
+    }
+
+    if (!hasResolvedStyle) {
+        selectedName = library.selectedPointVisualName;
+    }
+    if (!hasResolvedStyle &&
+        (FindProjectPointVisualIndex(library, selectedName).has_value() ||
+         FindScenePointVisualStateByNameIndex(library, selectedName).has_value())) {
+        if (const auto visualIndex = FindProjectPointVisualIndex(library, selectedName); visualIndex.has_value()) {
+            style = library.pointVisuals[visualIndex.value()].style;
+            hasResolvedStyle = true;
+        } else if (const auto stateIndex = FindScenePointVisualStateByNameIndex(library, selectedName);
+                   stateIndex.has_value()) {
+            style = library.sceneVisualStates[stateIndex.value()].visual.style;
+            selectedName = library.sceneVisualStates[stateIndex.value()].visual.name;
+            hasResolvedStyle = true;
+        }
+    }
+
+    if (!hasResolvedStyle) {
+        if (const auto visualIndex = FindProjectPointVisualIndex(library, selectedName);
+            visualIndex.has_value()) {
+            style = library.pointVisuals[visualIndex.value()].style;
+            hasResolvedStyle = true;
+        }
+    }
+
+    const auto selectedBaseName = BaseNameFromProjectPointVisualName(library, selectedName);
+    const auto stateIndex = FindScenePointVisualStateForBaseIndex(library, sceneKey, selectedBaseName);
+    const bool useSceneOverride = !useSessionSelection && stateIndex.has_value();
+    if (useSceneOverride) {
+        selectedName = library.sceneVisualStates[stateIndex.value()].visual.name;
+        style = library.sceneVisualStates[stateIndex.value()].visual.style;
+        hasResolvedStyle = true;
+    }
+
+    const bool resolvedFromSceneVisual =
+        FindScenePointVisualStateByNameIndex(library, selectedName).has_value();
+    const bool missingFieldConverted =
+        session->loaded && ResolveProjectVisualStyleBindingsByFieldName(&style, *session);
+    if (missingFieldConverted && !resolvedFromSceneVisual) {
+        const auto tempBaseName = BaseNameFromProjectPointVisualName(library, selectedName);
+        selectedName = SceneTemporaryPointVisualName(tempBaseName, *session);
+        UpsertScenePointVisualState(runtimeState, *session, selectedName, style);
+    }
+
+    session->selectedPointVisualName = NormalizePointVisualName(selectedName);
+    session->pointVisualNameBuffer =
+        BaseNameFromProjectPointVisualName(library, session->selectedPointVisualName);
+    session->pointStyle = style;
+    CopyProjectVisualsToSessionList(runtimeState, session, session->selectedPointVisualName, session->pointStyle);
+    SanitizePointCloudStyle(session);
+}
+
+void ApplyProjectPointVisualsToScene(
+    PreviewRuntimeState* runtimeState,
+    const PreviewLayerSession& sceneSession) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    const auto sceneKey = ProjectVisualSceneKey(sceneSession);
+    for (auto& candidate : runtimeState->sessions) {
+        if (!IsProjectPointVisualSession(candidate) ||
+            ProjectVisualSceneKey(candidate) != sceneKey) {
+            continue;
+        }
+        ApplyProjectPointVisualToSession(runtimeState, &candidate);
+    }
+}
+
+void ApplyProjectPointVisualsToAllSessions(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    EnsureProjectPointVisuals(runtimeState);
+    for (auto& session : runtimeState->sessions) {
+        ApplyProjectPointVisualToSession(runtimeState, &session);
+    }
+}
+
+std::string SelectProjectPointVisualForScene(
+    PreviewRuntimeState* runtimeState,
+    const PreviewLayerSession& sceneSession,
+    std::string_view name) {
+    if (runtimeState == nullptr) {
+        return {};
+    }
+
+    EnsureProjectPointVisuals(runtimeState);
+    const auto normalized = NormalizePointVisualName(name);
+    const bool isProjectVisual =
+        FindProjectPointVisualIndex(runtimeState->pointVisualLibrary, normalized).has_value();
+    const bool isSceneVisual =
+        FindScenePointVisualStateByNameIndex(runtimeState->pointVisualLibrary, normalized).has_value();
+    if (!isProjectVisual && !isSceneVisual) {
+        return {};
+    }
+
+    if (isProjectVisual) {
+        runtimeState->pointVisualLibrary.selectedPointVisualName = normalized;
+    }
+    runtimeState->pointVisualLibrary.pointVisualNameBuffer =
+        BaseNameFromProjectPointVisualName(runtimeState->pointVisualLibrary, normalized);
+
+    const auto sceneKey = ProjectVisualSceneKey(sceneSession);
+    const auto selectedStyle = ProjectPointVisualStyleByName(runtimeState->pointVisualLibrary, normalized);
+    for (auto& candidate : runtimeState->sessions) {
+        if (!IsProjectPointVisualSession(candidate) ||
+            ProjectVisualSceneKey(candidate) != sceneKey) {
+            continue;
+        }
+        candidate.selectedPointVisualName = normalized;
+        candidate.pointVisualNameBuffer = runtimeState->pointVisualLibrary.pointVisualNameBuffer;
+        ApplyProjectPointVisualToSession(runtimeState, &candidate);
+    }
+    return BuildProjectVisualFieldBindingWarning(*runtimeState, sceneKey, normalized, selectedStyle);
 }
 
 bool IsWaterProjectCustomVisualName(std::string_view name) {
@@ -2646,8 +3684,51 @@ void MarkPointVisualEdited(PreviewLayerSession* session) {
     SyncPointVisualNameBuffer(session);
 }
 
+void MarkPointVisualEdited(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    if (!IsProjectPointVisualSession(*session)) {
+        MarkPointVisualEdited(session);
+        return;
+    }
+
+    EnsureProjectPointVisuals(runtimeState);
+    auto baseName =
+        BaseNameFromProjectPointVisualName(runtimeState->pointVisualLibrary, session->selectedPointVisualName);
+    if (!FindProjectPointVisualIndex(runtimeState->pointVisualLibrary, baseName).has_value()) {
+        baseName = runtimeState->pointVisualLibrary.selectedPointVisualName;
+    }
+    const auto tempName = SceneTemporaryPointVisualName(baseName, *session);
+    UpsertScenePointVisualState(runtimeState, *session, tempName, session->pointStyle);
+    const auto warning = SelectProjectPointVisualForScene(runtimeState, *session, tempName);
+    UpdateProjectVisualFieldBindingWarning(runtimeState, warning);
+}
+
 void SaveCurrentPointVisual(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
     if (runtimeState == nullptr || session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    if (IsProjectPointVisualSession(*session)) {
+        EnsureProjectPointVisuals(runtimeState);
+        const auto selectedName = NormalizePointVisualName(session->selectedPointVisualName);
+        const auto fallbackName =
+            BaseNameFromProjectPointVisualName(runtimeState->pointVisualLibrary, selectedName);
+        const auto targetName = BasePointVisualName(
+            session->pointVisualNameBuffer.empty()
+                ? fallbackName
+                : session->pointVisualNameBuffer);
+        UpsertProjectPointVisual(runtimeState, targetName, session->pointStyle);
+        runtimeState->pointVisualLibrary.selectedPointVisualName = targetName;
+        runtimeState->pointVisualLibrary.pointVisualNameBuffer = BasePointVisualName(targetName);
+        RemoveScenePointVisualStateForBase(runtimeState, ProjectVisualSceneKey(*session), targetName);
+        session->selectedPointVisualName = targetName;
+        session->pointVisualNameBuffer = BasePointVisualName(targetName);
+        ApplyProjectPointVisualsToAllSessions(runtimeState);
+        runtimeState->statusMessage = "Saved project visual " + targetName + ".";
+        runtimeState->errorMessage.clear();
         return;
     }
 
@@ -2691,6 +3772,39 @@ void SaveCurrentPointVisual(PreviewRuntimeState* runtimeState, PreviewLayerSessi
         ApplyWaterPointVisualStyleToGeneratedSessions(runtimeState);
     }
     runtimeState->statusMessage = "Saved visual " + targetName + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void DeleteCurrentScenePointVisual(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
+    if (runtimeState == nullptr || session == nullptr || !IsProjectPointVisualSession(*session)) {
+        return;
+    }
+
+    EnsureProjectPointVisuals(runtimeState);
+    const auto selectedStateIndex = FindScenePointVisualStateByNameIndex(
+        runtimeState->pointVisualLibrary,
+        session->selectedPointVisualName);
+    const auto sceneKey = ProjectVisualSceneKey(*session);
+    if (!selectedStateIndex.has_value() ||
+        runtimeState->pointVisualLibrary.sceneVisualStates[selectedStateIndex.value()].sceneGroupName != sceneKey) {
+        runtimeState->errorMessage = "Only the active scene visual can be deleted here.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+
+    const auto baseName =
+        BaseNameFromProjectPointVisualName(runtimeState->pointVisualLibrary, session->selectedPointVisualName);
+    const auto deletedName = SceneTemporaryPointVisualName(baseName, *session);
+    RemoveScenePointVisualStateForBase(runtimeState, sceneKey, baseName);
+    const auto fallbackName = FindProjectPointVisualIndex(runtimeState->pointVisualLibrary, baseName).has_value()
+                                  ? baseName
+                                  : runtimeState->pointVisualLibrary.selectedPointVisualName;
+    const auto warning = SelectProjectPointVisualForScene(runtimeState, *session, fallbackName);
+    if (!warning.empty()) {
+        UpdateProjectVisualFieldBindingWarning(runtimeState, warning);
+        return;
+    }
+    runtimeState->statusMessage = "Deleted scene visual " + deletedName + ".";
     runtimeState->errorMessage.clear();
 }
 
@@ -3985,6 +5099,11 @@ bool IsGeneratedWaterRainTrailOverlayStem(const std::string& stem) {
            stem.find("-RainTrails-") != std::string::npos;
 }
 
+bool IsGeneratedWaterDynamicMeshTrailOverlayStem(const std::string& stem) {
+    return stem.ends_with("-DynamicMeshTrails") ||
+           stem.find("-DynamicMeshTrails-") != std::string::npos;
+}
+
 bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
     if (session.kind != LayerKind::PointCloud) {
         return false;
@@ -4004,6 +5123,7 @@ bool IsGeneratedWaterOverlaySession(const PreviewLayerSession& session) {
            stem.ends_with("-WaterFlow") ||
            IsGeneratedWaterFlowTrailOverlayStem(stem) ||
            IsGeneratedWaterRainTrailOverlayStem(stem) ||
+           IsGeneratedWaterDynamicMeshTrailOverlayStem(stem) ||
            stem.ends_with("-Ripples") ||
            stem.ends_with("-FieldTrails") ||
            stem.ends_with("-FieldSurface");
@@ -4055,6 +5175,7 @@ bool IsAssociableLidarSession(const PreviewLayerSession& session) {
            !stem.ends_with("-WaterFlow") &&
            !IsGeneratedWaterFlowTrailOverlayStem(stem) &&
            !IsGeneratedWaterRainTrailOverlayStem(stem) &&
+           !IsGeneratedWaterDynamicMeshTrailOverlayStem(stem) &&
            !stem.ends_with("-Ripples") &&
            !stem.ends_with("-FieldTrails") &&
            !stem.ends_with("-FieldSurface");
@@ -5135,7 +6256,11 @@ bool ActivateLoadedPointCloud(
         session.totalPrimitives);
     ClearPreviewLodSampleCache(&session);
 
-    SanitizePointCloudStyle(&session);
+    if (IsProjectPointVisualSession(session)) {
+        ApplyProjectPointVisualToSession(runtimeState, &session);
+    } else {
+        SanitizePointCloudStyle(&session);
+    }
     if (session.kind == LayerKind::PointCloud) {
         if (session.sceneRole == "SAND" && session.bounds.valid) {
             const float widthX = session.bounds.maximum.x - session.bounds.minimum.x;
@@ -5157,8 +6282,10 @@ bool ActivateLoadedPointCloud(
                 applyDefaultShorelineDirection(&visual.style);
             }
         }
-        EnsurePointVisuals(&session);
-        UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+        if (!IsProjectPointVisualSession(session)) {
+            EnsurePointVisuals(&session);
+            UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+        }
     }
 
     try {
@@ -5216,6 +6343,7 @@ bool ActivateLoadedGaussianSplats(
     session.pivotSamples = BuildPivotSamples(splats.centers, splats.localBounds);
     session.loaded = true;
     session.visible = true;
+    ApplyProjectGsplatVisualStyleToSession(*runtimeState, &session);
 
     try {
         viewport->UploadGaussianSplats(sessionIndex, splats);
@@ -5297,6 +6425,7 @@ void BeginLayerLoad(std::size_t sessionIndex, PreviewRuntimeState* runtimeState)
         .showUploadOverlayFrame = false,
         .startedAt = std::chrono::steady_clock::now(),
     };
+    StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
 }
 
 void PollPendingLayerLoad(
@@ -6273,6 +7402,7 @@ PointCloudStyleState MakeWaterTrailSessionStyle(
     invisible_places::style::SetScalarConstant(&style.surfelDiameter, width);
     invisible_places::style::SetScalarConstant(&style.pointSize, width * 1000.0F);
     style.waterStreakAspect = std::clamp(streakLength / width, 1.0F, 32.0F);
+    style.waterTrailStyleGeometry = true;
     return style;
 }
 
@@ -6362,6 +7492,124 @@ std::optional<std::size_t> ResolveWaterSupportSessionIndex(const PreviewRuntimeS
         }
     }
 
+    return std::nullopt;
+}
+
+bool IsDynamicMeshSurfacePathCandidate(const std::filesystem::path& path) {
+    if (LowercaseAsciiCopy(path.extension().string()) != ".ply") {
+        return false;
+    }
+    return LowercaseAsciiCopy(path.stem().string()).find("mesh") != std::string::npos;
+}
+
+std::optional<std::filesystem::path> FindDynamicMeshSurfaceInDirectory(const std::filesystem::path& directory) {
+    if (directory.empty() || !std::filesystem::exists(directory) || !std::filesystem::is_directory(directory)) {
+        return std::nullopt;
+    }
+
+    struct Candidate {
+        std::filesystem::path path;
+        int score = 0;
+    };
+    std::vector<Candidate> candidates;
+    for (const auto& entry : std::filesystem::directory_iterator{
+             directory,
+             std::filesystem::directory_options::skip_permission_denied}) {
+        if (!entry.is_regular_file() || !IsDynamicMeshSurfacePathCandidate(entry.path())) {
+            continue;
+        }
+        const auto header = invisible_places::io::ParsePlyHeader(entry.path());
+        if (!header.success || header.header.faceCount == 0U) {
+            continue;
+        }
+
+        const auto stem = LowercaseAsciiCopy(entry.path().stem().string());
+        int score = 1000;
+        if (stem == "mesh" || stem.ends_with("-mesh") || stem.ends_with("_mesh")) {
+            score += 120;
+        }
+        if (stem.find("-mesh") != std::string::npos || stem.find("_mesh") != std::string::npos) {
+            score += 60;
+        }
+        if (stem.find("sample") == std::string::npos) {
+            score += 10;
+        }
+        candidates.push_back({.path = entry.path(), .score = score});
+    }
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
+        if (left.score != right.score) {
+            return left.score > right.score;
+        }
+        return NormalizePathKey(left.path) < NormalizePathKey(right.path);
+    });
+    return candidates.front().path;
+}
+
+std::optional<std::size_t> ResolveDynamicMeshSceneAnchorSessionIndex(const PreviewRuntimeState& runtimeState) {
+    auto usableSession = [&](std::size_t index) -> std::optional<std::size_t> {
+        if (index >= runtimeState.sessions.size()) {
+            return std::nullopt;
+        }
+        const auto& session = runtimeState.sessions[index];
+        if (session.kind != LayerKind::PointCloud || IsGeneratedWaterOverlaySession(session)) {
+            return std::nullopt;
+        }
+        return index;
+    };
+
+    if (runtimeState.selectedSessionIndex.has_value()) {
+        if (const auto selected = usableSession(runtimeState.selectedSessionIndex.value()); selected.has_value()) {
+            return selected;
+        }
+    }
+    if (runtimeState.water.activeSupportSessionIndex.has_value()) {
+        if (const auto active = usableSession(runtimeState.water.activeSupportSessionIndex.value()); active.has_value()) {
+            return active;
+        }
+    }
+    if (const auto support = ResolveWaterSupportSessionIndex(runtimeState); support.has_value()) {
+        if (const auto resolved = usableSession(support.value()); resolved.has_value()) {
+            return resolved;
+        }
+    }
+    for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
+        if (const auto resolved = usableSession(index); resolved.has_value()) {
+            return resolved;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::filesystem::path> ResolveDynamicMeshSceneSurfacePath(const PreviewRuntimeState& runtimeState) {
+    if (const auto anchorIndex = ResolveDynamicMeshSceneAnchorSessionIndex(runtimeState);
+        anchorIndex.has_value() && anchorIndex.value() < runtimeState.sessions.size()) {
+        const auto& anchor = runtimeState.sessions[anchorIndex.value()];
+        if (IsDynamicMeshSurfacePathCandidate(anchor.sourcePath) && std::filesystem::exists(anchor.sourcePath)) {
+            const auto header = invisible_places::io::ParsePlyHeader(anchor.sourcePath);
+            if (header.success && header.header.faceCount > 0U) {
+                return anchor.sourcePath;
+            }
+        }
+        if (auto mesh = FindDynamicMeshSurfaceInDirectory(anchor.sourcePath.parent_path()); mesh.has_value()) {
+            return mesh;
+        }
+    }
+
+    for (const auto& session : runtimeState.sessions) {
+        if (session.kind != LayerKind::PointCloud ||
+            IsGeneratedWaterOverlaySession(session) ||
+            !IsDynamicMeshSurfacePathCandidate(session.sourcePath) ||
+            !std::filesystem::exists(session.sourcePath)) {
+            continue;
+        }
+        const auto header = invisible_places::io::ParsePlyHeader(session.sourcePath);
+        if (header.success && header.header.faceCount > 0U) {
+            return session.sourcePath;
+        }
+    }
     return std::nullopt;
 }
 
@@ -7366,6 +8614,16 @@ SavedWaterTrailProfileState ViewedRainWaterTrailProfile(const PreviewRuntimeStat
     return RainWaterTrailProfileByName(runtimeState, runtimeState.water.selectedRainTrailProfileName);
 }
 
+SavedWaterTrailProfileState ViewedDynamicMeshWaterTrailProfile(const PreviewRuntimeState& runtimeState) {
+    if (runtimeState.water.editedDynamicMeshTrailProfile.has_value()) {
+        return MakeWaterTrailProfile(
+            runtimeState.water.editedDynamicMeshTrailProfile->name,
+            runtimeState.water.editedDynamicMeshTrailProfile->geometry,
+            runtimeState.water.editedDynamicMeshTrailProfile->style);
+    }
+    return WaterTrailProfileByName(runtimeState, runtimeState.water.dynamicMeshFlowSettings.trailProfileName);
+}
+
 PointCloudStyleState ApplyRainIntensityToTrailStyle(
     PointCloudStyleState style,
     WaterRainIntensityPreset preset) {
@@ -7581,6 +8839,7 @@ PointCloudStyleState MakeEffectiveFastBasicStyle(
         style.flowAnimation = true;
         style.waterPathView = sourceStyle.waterPathView;
         style.waterTrailOverlay = sourceStyle.waterTrailOverlay;
+        style.waterTrailStyleGeometry = sourceStyle.waterTrailStyleGeometry;
         if (style.waterPathView) {
             style.pointSize = sourceStyle.pointSize;
         }
@@ -7778,6 +9037,90 @@ std::size_t AddOrRefreshWaterTrailOverlaySession(
     if (!ActivateLoadedPointCloud(sessionIndex, std::move(cloud), runtimeState, viewport)) {
         return std::numeric_limits<std::size_t>::max();
     }
+    return sessionIndex;
+}
+
+std::size_t AddOrRefreshDynamicMeshGpuTrailOverlaySession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const std::filesystem::path& overlayPath,
+    const MeshSurfaceCache& cache,
+    const WaterDynamicMeshFlowSettings& settings,
+    const std::vector<WaterEmitter>& emitters,
+    const SavedWaterTrailProfileState& profile,
+    WaterTrailBuildQuality quality,
+    invisible_places::renderer::core::DynamicMeshFlowGpuUploadResult* uploadResult) {
+    if (runtimeState == nullptr || viewport == nullptr || uploadResult == nullptr) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+
+    const auto existingIndex = FindSessionIndexBySourcePath(*runtimeState, overlayPath);
+    const auto sessionIndex = existingIndex.value_or(runtimeState->sessions.size());
+    if (!existingIndex.has_value()) {
+        PreviewLayerSession session;
+        session.kind = LayerKind::PointCloud;
+        session.sourcePath = overlayPath;
+        session.displayName = overlayPath.stem().string();
+        runtimeState->sessions.push_back(std::move(session));
+    }
+
+    auto solveSettings = settings;
+    solveSettings.trailWidthMeters = profile.geometry.widthMeters;
+    solveSettings.trailStreakLengthMeters = profile.geometry.streakLengthMeters;
+
+    auto result = viewport->UploadDynamicMeshFlowPreviewPointCloud(
+        sessionIndex,
+        cache,
+        emitters,
+        solveSettings,
+        quality);
+    if (result.pointCount == 0U) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+
+    auto& session = runtimeState->sessions[sessionIndex];
+    session.kind = LayerKind::PointCloud;
+    session.sourcePath = overlayPath;
+    session.displayName = overlayPath.stem().string();
+    session.hasSourceRgb = true;
+    session.hasNormals = true;
+    session.totalPrimitives = result.pointCount;
+    session.scalarFields = invisible_places::water::WaterTrailOverlayScalarFieldsForPointCount(result.pointCount);
+    session.bounds = cache.bounds;
+    if (session.bounds.valid) {
+        session.bounds.minimum.z += settings.surfaceOffsetMeters;
+        session.bounds.maximum.z += settings.surfaceOffsetMeters;
+        session.focusPoint = {
+            (session.bounds.minimum.x + session.bounds.maximum.x) * 0.5F,
+            (session.bounds.minimum.y + session.bounds.maximum.y) * 0.5F,
+            (session.bounds.minimum.z + session.bounds.maximum.z) * 0.5F,
+        };
+        session.hasFocusPoint = true;
+    } else {
+        session.focusPoint = {};
+        session.hasFocusPoint = false;
+    }
+    session.localBounds = session.bounds;
+    session.localFocusPoint = session.focusPoint;
+    session.hasLocalFocusPoint = session.hasFocusPoint;
+    session.pivotSamples.clear();
+    session.loaded = true;
+    session.visible = true;
+    session.offlinePointCloud.reset();
+    session.previewLodSampledIndices.clear();
+    session.previewLodRequestedDrawCount = 0;
+    session.previewLodSampledDrawCount = 0;
+    session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
+        result.pointCount,
+        result.pointCount);
+    session.pointStyle = MakeWaterTrailExportStyle(profile.style);
+    session.selectedPointVisualName = NormalizeWaterProfileName(profile.name);
+    session.pointVisualNameBuffer = BaseWaterProfileName(session.selectedPointVisualName);
+    session.pointVisuals.clear();
+    session.pointVisuals.push_back({.name = session.selectedPointVisualName, .style = session.pointStyle});
+    EnsurePointVisuals(&session);
+    *uploadResult = result;
+    runtimeState->selectedSessionIndex = sessionIndex;
     return sessionIndex;
 }
 
@@ -9174,6 +10517,7 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     document.trailGeometry = runtimeState->water.defaultTrailGeometry;
     document.fieldSettings = runtimeState->water.fieldSettings;
     document.fieldTrailSettings = runtimeState->water.fieldTrailSettings;
+    document.dynamicMeshFlowSettings = runtimeState->water.dynamicMeshFlowSettings;
     document.rainSettings = runtimeState->water.rainSettings;
     document.selectedRainTrailProfileName = NormalizeWaterProfileName(runtimeState->water.selectedRainTrailProfileName);
     document.sourceSettings = runtimeState->water.defaultSourceSettings;
@@ -9240,6 +10584,17 @@ void LoadWaterSources(
     runtimeState->water.defaultTrailGeometry = document->trailGeometry;
     runtimeState->water.fieldSettings = document->fieldSettings;
     runtimeState->water.fieldTrailSettings = document->fieldTrailSettings;
+    runtimeState->water.dynamicMeshFlowSettings = document->dynamicMeshFlowSettings;
+    runtimeState->water.dynamicMeshFlowSettings.trailProfileName =
+        NormalizeWaterProfileName(runtimeState->water.dynamicMeshFlowSettings.trailProfileName);
+    runtimeState->water.dynamicMeshFlowSettings.particlePresetName = std::string{
+        invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(
+            runtimeState->water.dynamicMeshFlowSettings.particlePresetName)};
+    runtimeState->water.dynamicMeshTrailProfileNameBuffer =
+        BaseWaterProfileName(runtimeState->water.dynamicMeshFlowSettings.trailProfileName);
+    runtimeState->water.dynamicMeshSurfaceCache.reset();
+    runtimeState->water.dynamicMeshSurfaceCachePath.clear();
+    runtimeState->water.dynamicMeshSurfaceCacheSignature.clear();
     runtimeState->water.rainSettings = document->rainSettings;
     runtimeState->water.selectedRainTrailProfileName = document->selectedRainTrailProfileName;
     runtimeState->water.rainTrailProfileNameBuffer =
@@ -9306,13 +10661,16 @@ void LoadWaterSources(
     runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
     runtimeState->water.nextFieldLayerId = NextWaterFieldLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
     runtimeState->water.selectedRippleLayerIndex.reset();
     runtimeState->water.selectedFieldLayerIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
     runtimeState->water.rippleRegionPlacementArmed = false;
     runtimeState->water.fieldRegionPlacementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     if (document->pathCache.has_value() && !document->pathCache->branches.empty()) {
         runtimeState->water.pathCache = document->pathCache.value();
         runtimeState->water.pathCacheLoaded = true;
@@ -9342,6 +10700,7 @@ void LoadWaterSources(
         viewport,
         &restoredRippleMemberships,
         &restoredRippleRegions);
+    StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
     runtimeState->statusMessage = "Loaded water sources from " + inputPath.string() + ".";
     if (restoredRippleSessions > 0U) {
         runtimeState->statusMessage +=
@@ -9363,6 +10722,7 @@ void SelectWaterEmitterInViewport(
 
     const auto& emitter = runtimeState->water.emitters[emitterIndex];
     runtimeState->water.selectedEmitterIndex = emitterIndex;
+    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
     runtimeState->pivotOverlay.visible = true;
     runtimeState->pivotOverlay.pivot = emitter.position;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
@@ -9379,11 +10739,38 @@ void DeselectWaterEmitter(PreviewRuntimeState* runtimeState) {
     runtimeState->water.movingEmitterIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     runtimeState->pivotOverlay.visible = false;
     runtimeState->cameraPlayback.active = false;
     runtimeState->statusMessage = runtimeState->water.tempDefaultSourceSettings.has_value()
                                       ? "Editing Default_edited water source settings."
                                       : "Editing Default water source settings.";
+    runtimeState->errorMessage.clear();
+}
+
+void SelectDynamicMeshAttractorInViewport(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell&,
+    std::size_t attractorIndex) {
+    if (runtimeState == nullptr ||
+        attractorIndex >= runtimeState->water.dynamicMeshFlowSettings.attractors.size()) {
+        return;
+    }
+
+    const auto& attractor = runtimeState->water.dynamicMeshFlowSettings.attractors[attractorIndex];
+    runtimeState->water.selectedDynamicMeshAttractorIndex = attractorIndex;
+    runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->water.placementArmed = false;
+    runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
+    runtimeState->pivotOverlay.visible = true;
+    runtimeState->pivotOverlay.pivot = attractor.position;
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->statusMessage = "Selected dynamic mesh attractor " + attractor.name + " in the viewport.";
     runtimeState->errorMessage.clear();
 }
 
@@ -10283,6 +11670,515 @@ bool RefreshWaterRainOverlay(
     return true;
 }
 
+std::string DynamicMeshSurfaceCacheSignature(
+    const WaterDynamicMeshFlowSettings& settings,
+    const std::filesystem::path& meshPath) {
+    std::ostringstream signature;
+    signature << meshPath.generic_string()
+              << "|algo=height-plane-grid-v2"
+              << "|cell=" << settings.cacheCellSizeMeters
+              << "|search=" << settings.projectionSearchRadiusMeters
+              << "|amb=" << settings.ambiguityHeightMeters;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(meshPath, error);
+    if (!error) {
+        signature << "|bytes=" << size;
+    }
+    const auto writeTime = std::filesystem::last_write_time(meshPath, error);
+    if (!error) {
+        const auto writeTimeSeconds =
+            std::chrono::duration_cast<std::chrono::seconds>(writeTime.time_since_epoch()).count();
+        signature << "|mtime=" << static_cast<long long>(writeTimeSeconds);
+    }
+    return signature.str();
+}
+
+std::filesystem::path DynamicMeshSurfaceCachePathForSettings(
+    const PreviewRuntimeState& runtimeState,
+    const WaterDynamicMeshFlowSettings& settings) {
+    if (const auto sceneMeshPath = ResolveDynamicMeshSceneSurfacePath(runtimeState); sceneMeshPath.has_value()) {
+        return sceneMeshPath.value();
+    }
+    if (!settings.meshPath.empty() && std::filesystem::exists(settings.meshPath)) {
+        return settings.meshPath;
+    }
+    return {};
+}
+
+bool DynamicMeshSurfaceWarmupActive(const WaterWorkflowState& water) {
+    return water.dynamicMeshSurfaceCacheWarmup.worker.joinable();
+}
+
+std::optional<DynamicMeshSurfaceCacheWarmupResult> TakeDynamicMeshSurfaceWarmupResult(
+    const std::shared_ptr<DynamicMeshSurfaceCacheWarmupShared>& shared) {
+    if (shared == nullptr) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock(shared->mutex);
+    if (!shared->result.has_value()) {
+        return std::nullopt;
+    }
+    auto result = std::move(shared->result.value());
+    shared->result.reset();
+    return result;
+}
+
+bool InstallDynamicMeshSurfaceWarmupResult(
+    PreviewRuntimeState* runtimeState,
+    DynamicMeshSurfaceCacheWarmupResult result,
+    bool publishStatus) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& water = runtimeState->water;
+    if (!result.success || result.cache == nullptr) {
+        if (publishStatus && !result.errorMessage.empty()) {
+            runtimeState->errorMessage = "Dynamic mesh cache prewarm failed: " + result.errorMessage;
+            runtimeState->statusMessage.clear();
+        }
+        return false;
+    }
+
+    const auto requestedMeshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, water.dynamicMeshFlowSettings);
+    const auto requestedSignature =
+        DynamicMeshSurfaceCacheSignature(water.dynamicMeshFlowSettings, requestedMeshPath);
+    if (NormalizePathKey(result.meshPath) != NormalizePathKey(requestedMeshPath) ||
+        result.signature != requestedSignature) {
+        if (publishStatus) {
+            runtimeState->statusMessage = "Ignored stale dynamic mesh cache prewarm result.";
+            runtimeState->errorMessage.clear();
+        }
+        return false;
+    }
+
+    water.dynamicMeshSurfaceCache = std::move(result.cache);
+    water.dynamicMeshSurfaceCachePath = result.meshPath;
+    water.dynamicMeshSurfaceCacheSignature = result.signature;
+    water.dynamicMeshFlowDiagnostics = result.diagnostics;
+    if (publishStatus) {
+        runtimeState->statusMessage =
+            "Prewarmed dynamic mesh cache with " +
+            FormatPointCount(water.dynamicMeshSurfaceCache->cells.size()) +
+            " surface cells.";
+        runtimeState->errorMessage.clear();
+    }
+    return true;
+}
+
+void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const auto meshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, water.dynamicMeshFlowSettings);
+    if (meshPath.empty()) {
+        return;
+    }
+    if (!std::filesystem::exists(meshPath)) {
+        if (publishStatus) {
+            runtimeState->errorMessage = "Dynamic mesh flow surface was not found: " + meshPath.string();
+            runtimeState->statusMessage.clear();
+        }
+        return;
+    }
+    const auto signature = DynamicMeshSurfaceCacheSignature(water.dynamicMeshFlowSettings, meshPath);
+    if (water.dynamicMeshSurfaceCache != nullptr &&
+        NormalizePathKey(water.dynamicMeshSurfaceCachePath) == NormalizePathKey(meshPath) &&
+        water.dynamicMeshSurfaceCacheSignature == signature) {
+        return;
+    }
+    if (DynamicMeshSurfaceWarmupActive(water)) {
+        return;
+    }
+
+    auto settings = water.dynamicMeshFlowSettings;
+    settings.meshPath = meshPath;
+    auto shared = std::make_shared<DynamicMeshSurfaceCacheWarmupShared>();
+    {
+        std::scoped_lock lock(shared->mutex);
+        shared->stage = "Reading mesh";
+    }
+    std::jthread worker{
+        [shared, settings, meshPath, signature](std::stop_token stopToken) {
+            DynamicMeshSurfaceCacheWarmupResult result;
+            result.meshPath = meshPath;
+            result.signature = signature;
+
+            const auto loadStartedAt = std::chrono::steady_clock::now();
+            auto loadResult = invisible_places::io::LoadTriangleMesh(meshPath);
+            result.diagnostics.meshLoadMilliseconds = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - loadStartedAt).count();
+            if (stopToken.stop_requested()) {
+                return;
+            }
+            if (!loadResult.success) {
+                result.errorMessage = loadResult.errorMessage;
+                std::scoped_lock lock(shared->mutex);
+                shared->stage = "Failed";
+                shared->result = std::move(result);
+                return;
+            }
+
+            {
+                std::scoped_lock lock(shared->mutex);
+                shared->stage = "Building surface cache";
+            }
+            auto cache = std::make_shared<MeshSurfaceCache>(
+                invisible_places::water::BuildMeshSurfaceCache(loadResult.mesh, settings));
+            if (stopToken.stop_requested()) {
+                return;
+            }
+            if (cache->cells.empty()) {
+                result.errorMessage = "Dynamic mesh flow cache did not produce surface cells.";
+                std::scoped_lock lock(shared->mutex);
+                shared->stage = "Failed";
+                shared->result = std::move(result);
+                return;
+            }
+
+            result.success = true;
+            result.diagnostics.cacheBuildMilliseconds = cache->buildMilliseconds;
+            result.diagnostics.sourceVertexCount = cache->sourceVertexCount;
+            result.diagnostics.sourceTriangleCount = cache->sourceTriangleCount;
+            result.diagnostics.cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+                cache->cells.size(),
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+            result.cache = std::move(cache);
+
+            std::scoped_lock lock(shared->mutex);
+            shared->stage = "Ready";
+            shared->result = std::move(result);
+        }};
+
+    water.dynamicMeshSurfaceCacheWarmup = DynamicMeshSurfaceCacheWarmupJob{
+        .shared = std::move(shared),
+        .worker = std::move(worker),
+        .meshPath = meshPath,
+        .signature = signature,
+        .startedAt = std::chrono::steady_clock::now(),
+    };
+    if (publishStatus) {
+        runtimeState->statusMessage =
+            "Prewarming dynamic mesh cache from " + meshPath.filename().string() + " in the background.";
+        runtimeState->errorMessage.clear();
+    }
+}
+
+void PollDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->water.dynamicMeshSurfaceCacheWarmup;
+    if (job.shared == nullptr) {
+        return;
+    }
+    auto result = TakeDynamicMeshSurfaceWarmupResult(job.shared);
+    if (!result.has_value()) {
+        return;
+    }
+    if (job.worker.joinable()) {
+        job.worker.join();
+    }
+    InstallDynamicMeshSurfaceWarmupResult(runtimeState, std::move(result.value()), publishStatus);
+    job = {};
+}
+
+bool FinishMatchingDynamicMeshSurfaceCacheWarmup(
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& meshPath,
+    std::string_view signature) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& job = runtimeState->water.dynamicMeshSurfaceCacheWarmup;
+    if (!job.worker.joinable() ||
+        NormalizePathKey(job.meshPath) != NormalizePathKey(meshPath) ||
+        job.signature != signature) {
+        return false;
+    }
+
+    runtimeState->statusMessage = "Waiting for dynamic mesh cache prewarm to finish...";
+    runtimeState->errorMessage.clear();
+    job.worker.join();
+    auto result = TakeDynamicMeshSurfaceWarmupResult(job.shared);
+    job = {};
+    if (!result.has_value()) {
+        return false;
+    }
+    return InstallDynamicMeshSurfaceWarmupResult(runtimeState, std::move(result.value()), true);
+}
+
+std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
+    PreviewRuntimeState* runtimeState,
+    WaterDynamicMeshFlowDiagnostics* diagnostics) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+    auto& water = runtimeState->water;
+    auto meshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, water.dynamicMeshFlowSettings);
+    if (meshPath.empty()) {
+        runtimeState->errorMessage = "Dynamic mesh flow could not find a mesh PLY in the active scene folder.";
+        runtimeState->statusMessage.clear();
+        return nullptr;
+    }
+    if (!std::filesystem::exists(meshPath)) {
+        runtimeState->errorMessage = "Dynamic mesh flow surface was not found: " + meshPath.string();
+        runtimeState->statusMessage.clear();
+        return nullptr;
+    }
+    const auto signature = DynamicMeshSurfaceCacheSignature(water.dynamicMeshFlowSettings, meshPath);
+    if (water.dynamicMeshSurfaceCache != nullptr &&
+        NormalizePathKey(water.dynamicMeshSurfaceCachePath) == NormalizePathKey(meshPath) &&
+        water.dynamicMeshSurfaceCacheSignature == signature) {
+        if (diagnostics != nullptr) {
+            diagnostics->cacheBuildMilliseconds = water.dynamicMeshSurfaceCache->buildMilliseconds;
+            diagnostics->sourceVertexCount = water.dynamicMeshSurfaceCache->sourceVertexCount;
+            diagnostics->sourceTriangleCount = water.dynamicMeshSurfaceCache->sourceTriangleCount;
+            diagnostics->cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+                water.dynamicMeshSurfaceCache->cells.size(),
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+        }
+        return water.dynamicMeshSurfaceCache;
+    }
+    if (FinishMatchingDynamicMeshSurfaceCacheWarmup(runtimeState, meshPath, signature)) {
+        if (diagnostics != nullptr && water.dynamicMeshSurfaceCache != nullptr) {
+            diagnostics->cacheBuildMilliseconds = water.dynamicMeshSurfaceCache->buildMilliseconds;
+            diagnostics->sourceVertexCount = water.dynamicMeshSurfaceCache->sourceVertexCount;
+            diagnostics->sourceTriangleCount = water.dynamicMeshSurfaceCache->sourceTriangleCount;
+            diagnostics->cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+                water.dynamicMeshSurfaceCache->cells.size(),
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+        }
+        return water.dynamicMeshSurfaceCache;
+    }
+
+    const auto loadStartedAt = std::chrono::steady_clock::now();
+    auto loadResult = invisible_places::io::LoadTriangleMesh(meshPath);
+    const double loadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - loadStartedAt).count();
+    if (!loadResult.success) {
+        runtimeState->errorMessage = "Dynamic mesh flow load failed: " + loadResult.errorMessage;
+        runtimeState->statusMessage.clear();
+        return nullptr;
+    }
+    auto cacheSettings = water.dynamicMeshFlowSettings;
+    cacheSettings.meshPath = meshPath;
+    auto cache = std::make_shared<MeshSurfaceCache>(
+        invisible_places::water::BuildMeshSurfaceCache(loadResult.mesh, cacheSettings));
+    if (cache->cells.empty()) {
+        runtimeState->errorMessage = "Dynamic mesh flow cache did not produce surface cells.";
+        runtimeState->statusMessage.clear();
+        return nullptr;
+    }
+    water.dynamicMeshSurfaceCache = cache;
+    water.dynamicMeshSurfaceCachePath = meshPath;
+    water.dynamicMeshSurfaceCacheSignature = signature;
+    if (diagnostics != nullptr) {
+        diagnostics->meshLoadMilliseconds = loadMs;
+        diagnostics->cacheBuildMilliseconds = cache->buildMilliseconds;
+        diagnostics->sourceVertexCount = cache->sourceVertexCount;
+        diagnostics->sourceTriangleCount = cache->sourceTriangleCount;
+        diagnostics->cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+            cache->cells.size(),
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    }
+    return cache;
+}
+
+bool RefreshWaterDynamicMeshFlowOverlay(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    WaterTrailBuildQuality quality = WaterTrailBuildQuality::Preview) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    auto& water = runtimeState->water;
+    if (!water.dynamicMeshFlowSettings.enabled) {
+        water.dynamicMeshTrailOverlay = {};
+        water.dynamicMeshFlowDiagnostics = {};
+        water.lastDynamicMeshTrailOverlayPath.clear();
+        UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-DynamicMeshTrails");
+        runtimeState->statusMessage = "Dynamic mesh flow disabled.";
+        runtimeState->errorMessage.clear();
+        return true;
+    }
+    if (water.emitters.empty()) {
+        water.dynamicMeshTrailOverlay = {};
+        water.dynamicMeshFlowDiagnostics = {};
+        water.lastDynamicMeshTrailOverlayPath.clear();
+        UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-DynamicMeshTrails");
+        runtimeState->errorMessage = "Add at least one water source before generating dynamic mesh flow.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    WaterDynamicMeshFlowDiagnostics diagnostics;
+    auto cache = EnsureDynamicMeshSurfaceCache(runtimeState, &diagnostics);
+    if (cache == nullptr) {
+        return false;
+    }
+    const auto profile = ViewedDynamicMeshWaterTrailProfile(*runtimeState);
+    auto solveSettings = water.dynamicMeshFlowSettings;
+    solveSettings.trailWidthMeters = profile.geometry.widthMeters;
+    solveSettings.trailStreakLengthMeters = profile.geometry.streakLengthMeters;
+    PreviewLayerSession meshSession;
+    meshSession.sourcePath = water.dynamicMeshSurfaceCachePath.empty()
+                                 ? water.dynamicMeshFlowSettings.meshPath
+                                 : water.dynamicMeshSurfaceCachePath;
+    const auto outputPath = BuildWaterFeatureOverlayPath(*runtimeState, meshSession, "-DynamicMeshTrails.generated");
+    if (quality == WaterTrailBuildQuality::Preview && solveSettings.gpuPreviewEnabled) {
+        try {
+            invisible_places::renderer::core::DynamicMeshFlowGpuUploadResult gpuResult;
+            const auto sessionIndex = AddOrRefreshDynamicMeshGpuTrailOverlaySession(
+                runtimeState,
+                viewport,
+                outputPath,
+                *cache,
+                solveSettings,
+                water.emitters,
+                profile,
+                quality,
+                &gpuResult);
+            if (sessionIndex != std::numeric_limits<std::size_t>::max()) {
+                diagnostics.emittedPathCount = gpuResult.particleCount;
+                diagnostics.emittedSampleCount = gpuResult.pointCount;
+                diagnostics.solveMilliseconds = gpuResult.solveMilliseconds;
+                diagnostics.gpuStaticUploadMilliseconds = gpuResult.staticUploadMilliseconds;
+                diagnostics.gpuLiveUploadMilliseconds = gpuResult.liveUploadMilliseconds;
+                diagnostics.gpuDispatchMilliseconds = gpuResult.dispatchMilliseconds;
+                diagnostics.gpuStaticBuffersReused = gpuResult.reusedStaticBuffers;
+                diagnostics.gpuAsynchronousDispatch = gpuResult.asynchronousDispatch;
+                water.dynamicMeshFlowDiagnostics = diagnostics;
+                water.dynamicMeshTrailOverlay = {};
+                water.lastDynamicMeshTrailOverlayPath = outputPath;
+                runtimeState->statusMessage =
+                    "GPU previewed dynamic mesh flow with " +
+                    FormatPointCount(gpuResult.particleCount) + " paths and " +
+                    FormatPointCount(gpuResult.pointCount) + " trail points.";
+                runtimeState->errorMessage.clear();
+                return true;
+            }
+        } catch (const std::exception& error) {
+            runtimeState->errorMessage =
+                "Dynamic mesh flow GPU preview failed; falling back to CPU preview: " +
+                std::string{error.what()};
+        }
+    }
+
+    auto overlay = invisible_places::water::BuildDynamicMeshWaterTrailOverlay(
+        *cache,
+        water.emitters,
+        solveSettings,
+        quality,
+        &diagnostics);
+    water.dynamicMeshFlowDiagnostics = diagnostics;
+    if (overlay.samples.empty()) {
+        water.dynamicMeshTrailOverlay = {};
+        water.lastDynamicMeshTrailOverlayPath.clear();
+        UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-DynamicMeshTrails");
+        runtimeState->errorMessage = "Dynamic mesh flow generated no visible trail samples.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    water.lastDynamicMeshTrailOverlayPath = outputPath;
+    water.dynamicMeshTrailOverlay = overlay;
+    AddOrRefreshWaterTrailOverlaySession(
+        runtimeState,
+        viewport,
+        outputPath,
+        std::move(overlay),
+        profile.name,
+        false,
+        profile.style);
+    runtimeState->statusMessage =
+        std::string{quality == WaterTrailBuildQuality::Preview ? "Previewed" : "Generated"} +
+        " dynamic mesh flow with " + FormatPointCount(diagnostics.emittedPathCount) +
+        " paths and " + FormatPointCount(diagnostics.emittedSampleCount) + " samples.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool RefreshWaterDynamicMeshFlowOverlayIfWarm(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (!runtimeState->water.dynamicMeshFlowSettings.enabled ||
+        runtimeState->water.dynamicMeshSurfaceCache == nullptr) {
+        return false;
+    }
+    return RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Preview);
+}
+
+bool RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (!runtimeState->water.dynamicMeshFlowSettings.enabled) {
+        return false;
+    }
+    if (runtimeState->water.emitters.empty()) {
+        runtimeState->water.dynamicMeshTrailOverlay = {};
+        runtimeState->water.dynamicMeshFlowDiagnostics = {};
+        runtimeState->water.lastDynamicMeshTrailOverlayPath.clear();
+        UnloadGeneratedWaterOverlaySessionsWithStemSuffix(runtimeState, viewport, "-DynamicMeshTrails");
+        runtimeState->statusMessage = "Dynamic mesh flow is ready; place a water source to build trails.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
+    return RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Preview);
+}
+
+std::optional<invisible_places::io::Float3> ProjectScreenRayToDynamicMeshSurface(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const MeshSurfaceCache& cache,
+    ImVec2 screenPoint) {
+    const auto matrices = runtimeState.camera.Matrices(CurrentAspectRatio(viewport));
+    const auto ray = MakeScreenRay(matrices, viewport, screenPoint);
+    if (!ray.has_value()) {
+        return std::nullopt;
+    }
+    const auto projection = invisible_places::water::ProjectRayToMeshSurface(
+        cache,
+        FromGlm(ray->origin),
+        FromGlm(ray->direction));
+    if (!projection.hit) {
+        return std::nullopt;
+    }
+    return projection.position;
+}
+
+std::optional<invisible_places::io::Float3> ProjectScreenPointToDynamicMeshSurfaceForPlacement(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint,
+    std::string_view label) {
+    if (runtimeState == nullptr || !runtimeState->water.dynamicMeshFlowSettings.enabled) {
+        return std::nullopt;
+    }
+
+    WaterDynamicMeshFlowDiagnostics diagnostics;
+    auto cache = EnsureDynamicMeshSurfaceCache(runtimeState, &diagnostics);
+    if (cache == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto projection = ProjectScreenRayToDynamicMeshSurface(*runtimeState, viewport, *cache, screenPoint);
+    if (projection.has_value()) {
+        return projection.value();
+    }
+
+    runtimeState->errorMessage =
+        "Could not place " + std::string{label} + " on the dynamic mesh surface under the cursor.";
+    runtimeState->statusMessage.clear();
+    return std::nullopt;
+}
+
 bool RefreshWaterFieldOverlays(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -11151,6 +13047,8 @@ void DisarmWaterRegionPlacementForModeSwitch(
     runtimeState->water.rippleRegionPlacementArmed = false;
     runtimeState->water.fieldRegionPlacementArmed = false;
     runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     if (wasRipplePlacementArmed) {
         runtimeState->statusMessage = "Ripple vertex placement stopped; selecting region points.";
         runtimeState->errorMessage.clear();
@@ -11185,37 +13083,60 @@ bool PlaceWaterEmitterAtScreenPoint(
         return false;
     }
 
-    const auto pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
-    if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No visible point-cloud surface was available for water source placement.";
-        runtimeState->statusMessage.clear();
-        return false;
+    std::optional<ResolvedPivot> pivot;
+    std::optional<invisible_places::io::Float3> placedPoint;
+    if (runtimeState->water.dynamicMeshFlowSettings.enabled) {
+        placedPoint = ProjectScreenPointToDynamicMeshSurfaceForPlacement(
+            runtimeState,
+            viewport,
+            screenPoint,
+            "water source");
+        if (!placedPoint.has_value()) {
+            return false;
+        }
+    } else {
+        pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
+        if (!pivot.has_value()) {
+            runtimeState->errorMessage = "No visible point-cloud surface was available for water source placement.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        placedPoint = pivot->point;
     }
 
     WaterEmitter emitter;
     emitter.id = NextWaterEmitterId(*runtimeState);
     emitter.name = "Source " + std::to_string(emitter.id);
     const auto pathSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path;
-    emitter.position = pivot->point;
+    emitter.position = placedPoint.value();
     emitter.radius = std::max(0.05F, pathSettings.maxBridgeDistance * 0.75F);
     emitter.strength = 1.0F;
     emitter.speed = 1.0F;
     emitter.origin = WaterEmitterOrigin::Manual;
     emitter.status = WaterEmitterStatus::Accepted;
-    emitter.confidence = pivot->matchedSurface ? 1.0F : 0.55F;
+    const bool placedOnSurface =
+        runtimeState->water.dynamicMeshFlowSettings.enabled ||
+        (pivot.has_value() && pivot->matchedSurface);
+    emitter.confidence = placedOnSurface ? 1.0F : 0.55F;
     const auto placedEmitterId = emitter.id;
     const auto placedPosition = emitter.position;
     runtimeState->water.nextEmitterId = emitter.id + 1U;
     runtimeState->water.emitters.push_back(std::move(emitter));
     runtimeState->water.selectedEmitterIndex = runtimeState->water.emitters.size() - 1U;
+    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     MarkWaterPathDirty(runtimeState, placedEmitterId);
     runtimeState->pivotOverlay.visible = true;
     runtimeState->pivotOverlay.pivot = placedPosition;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
-    runtimeState->statusMessage = "Placed water source from viewport; path bake required.";
+    runtimeState->statusMessage =
+        runtimeState->water.dynamicMeshFlowSettings.enabled
+            ? "Placed water source on the dynamic mesh surface."
+            : "Placed water source from viewport; path bake required.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -11245,8 +13166,10 @@ bool PlaceWaterPathAttractorAtScreenPoint(
     runtimeState->water.selectedPathProfileName = EditedWaterProfileName(runtimeState->water.selectedPathProfileName);
     runtimeState->water.pathProfileNameBuffer = BaseWaterProfileName(runtimeState->water.selectedPathProfileName);
     runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
     runtimeState->water.placementArmed = false;
     runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     runtimeState->water.rippleRegionPlacementArmed = false;
     runtimeState->water.fieldRegionPlacementArmed = false;
     MarkWaterPathDirty(runtimeState);
@@ -11386,27 +13309,132 @@ bool MoveWaterEmitterAtScreenPoint(
         return false;
     }
 
-    const auto pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
-    if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No visible point-cloud surface was available for moving the water source.";
-        runtimeState->statusMessage.clear();
-        return false;
+    std::optional<ResolvedPivot> pivot;
+    std::optional<invisible_places::io::Float3> movedPoint;
+    if (runtimeState->water.dynamicMeshFlowSettings.enabled) {
+        movedPoint = ProjectScreenPointToDynamicMeshSurfaceForPlacement(
+            runtimeState,
+            viewport,
+            screenPoint,
+            "water source");
+        if (!movedPoint.has_value()) {
+            return false;
+        }
+    } else {
+        pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
+        if (!pivot.has_value()) {
+            runtimeState->errorMessage = "No visible point-cloud surface was available for moving the water source.";
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+        movedPoint = pivot->point;
     }
 
     auto& emitter = runtimeState->water.emitters[emitterIndex];
-    emitter.position = pivot->point;
-    emitter.confidence = std::max(
-        emitter.confidence,
-        pivot->matchedSurface ? 0.85F : 0.55F);
+    emitter.position = movedPoint.value();
+    const bool movedOnSurface =
+        runtimeState->water.dynamicMeshFlowSettings.enabled ||
+        (pivot.has_value() && pivot->matchedSurface);
+    emitter.confidence = std::max(emitter.confidence, movedOnSurface ? 0.85F : 0.55F);
     runtimeState->water.selectedEmitterIndex = emitterIndex;
+    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
     runtimeState->water.movingEmitterIndex.reset();
     runtimeState->water.placementArmed = false;
     runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     MarkWaterPathDirty(runtimeState, emitter.id);
     runtimeState->pivotOverlay.visible = true;
     runtimeState->pivotOverlay.pivot = emitter.position;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
-    runtimeState->statusMessage = "Moved water source " + emitter.name + "; path bake required.";
+    runtimeState->statusMessage =
+        runtimeState->water.dynamicMeshFlowSettings.enabled
+            ? "Moved water source " + emitter.name + " on the dynamic mesh surface."
+            : "Moved water source " + emitter.name + "; path bake required.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+std::uint32_t NextDynamicMeshAttractorId(const WaterDynamicMeshFlowSettings& settings) {
+    std::uint32_t nextId = 1U;
+    for (const auto& attractor : settings.attractors) {
+        nextId = std::max(nextId, attractor.id + 1U);
+    }
+    return nextId;
+}
+
+bool PlaceDynamicMeshAttractorAtScreenPoint(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+
+    const auto meshPoint =
+        ProjectScreenPointToDynamicMeshSurfaceForPlacement(runtimeState, viewport, screenPoint, "mesh attractor");
+    if (!meshPoint.has_value()) {
+        return false;
+    }
+
+    auto& settings = runtimeState->water.dynamicMeshFlowSettings;
+    WaterDynamicMeshAttractor attractor;
+    attractor.id = NextDynamicMeshAttractorId(settings);
+    attractor.name = "Attractor " + std::to_string(attractor.id);
+    attractor.position = meshPoint.value();
+    attractor.enabled = true;
+    settings.attractors.push_back(std::move(attractor));
+    runtimeState->water.selectedDynamicMeshAttractorIndex = settings.attractors.size() - 1U;
+    runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
+    runtimeState->water.placementArmed = false;
+    runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->pivotOverlay.visible = true;
+    runtimeState->pivotOverlay.pivot = meshPoint.value();
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+    runtimeState->statusMessage = "Placed dynamic mesh attractor on the mesh surface.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool MoveDynamicMeshAttractorAtScreenPoint(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr || !runtimeState->water.movingDynamicMeshAttractorIndex.has_value()) {
+        return false;
+    }
+    auto& settings = runtimeState->water.dynamicMeshFlowSettings;
+    const auto attractorIndex = runtimeState->water.movingDynamicMeshAttractorIndex.value();
+    if (attractorIndex >= settings.attractors.size()) {
+        runtimeState->water.movingDynamicMeshAttractorIndex.reset();
+        runtimeState->errorMessage = "The selected dynamic mesh attractor is no longer available to move.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto meshPoint =
+        ProjectScreenPointToDynamicMeshSurfaceForPlacement(runtimeState, viewport, screenPoint, "mesh attractor");
+    if (!meshPoint.has_value()) {
+        return false;
+    }
+
+    auto& attractor = settings.attractors[attractorIndex];
+    attractor.position = meshPoint.value();
+    attractor.enabled = true;
+    runtimeState->water.selectedDynamicMeshAttractorIndex = attractorIndex;
+    runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.placementArmed = false;
+    runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->pivotOverlay.visible = true;
+    runtimeState->pivotOverlay.pivot = meshPoint.value();
+    runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+    runtimeState->statusMessage = "Moved dynamic mesh attractor " + attractor.name + ".";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -11549,6 +13577,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.projectName = "Invisible Places";
     document.backgroundColor = runtimeState.projectSettings.backgroundColor;
     document.eyeDomeLightingEnabled = runtimeState.projectSettings.eyeDomeLightingEnabled;
+    document.proResAlphaPreviewEnabled = runtimeState.projectSettings.proResAlphaPreviewEnabled;
     document.eyeDomeLightingThickness = runtimeState.projectSettings.eyeDomeLightingThickness;
     document.constantUpdateView = runtimeState.projectSettings.constantUpdateView;
     document.liveVisualEffects = runtimeState.projectSettings.liveVisualEffects;
@@ -11575,14 +13604,79 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
             {.filePath = runtimeState.animationPanel.availableFiles[index],
              .associatedLayerPaths = std::move(associatedLayerPaths)});
     }
-    document.renderJobSettings = runtimeState.renderSettings;
+    document.renderJobSettings = RenderSettingsFromExportPreset(
+        ViewedExportPreset(runtimeState),
+        runtimeState.renderSettings.outputDirectory);
+    document.exportPresets = runtimeState.animationPanel.exportPresets;
+    document.selectedExportPresetName = runtimeState.animationPanel.selectedExportPresetName;
+    document.tempExportPreset = runtimeState.animationPanel.editedExportPreset;
+    document.pointVisuals.reserve(runtimeState.pointVisualLibrary.pointVisuals.size());
+    for (const auto& visual : runtimeState.pointVisualLibrary.pointVisuals) {
+        ProjectLayerDocument::PointVisual visualDocument;
+        visualDocument.name = NormalizePointVisualName(visual.name);
+        visualDocument.style = visual.style;
+        document.pointVisuals.push_back(std::move(visualDocument));
+    }
+    if (document.pointVisuals.empty()) {
+        if (const auto sessionIt = std::find_if(
+                runtimeState.sessions.begin(),
+                runtimeState.sessions.end(),
+                [](const PreviewLayerSession& session) {
+                    return IsProjectPointVisualSession(session);
+                });
+            sessionIt != runtimeState.sessions.end()) {
+            document.pointVisuals.push_back(
+                {.name = std::string{kDefaultPointVisualName}, .style = sessionIt->pointStyle});
+        }
+    }
+    document.selectedPointVisualName =
+        runtimeState.pointVisualLibrary.selectedPointVisualName.empty()
+            ? std::string{kDefaultPointVisualName}
+            : NormalizePointVisualName(runtimeState.pointVisualLibrary.selectedPointVisualName);
+    if (document.pointVisuals.empty()) {
+        document.pointVisuals.push_back({.name = std::string{kDefaultPointVisualName}, .style = PointCloudStyleState{}});
+        document.selectedPointVisualName = std::string{kDefaultPointVisualName};
+    }
+    document.sceneVisualStates.reserve(runtimeState.pointVisualLibrary.sceneVisualStates.size());
+    for (const auto& state : runtimeState.pointVisualLibrary.sceneVisualStates) {
+        if (state.sceneGroupName.empty()) {
+            continue;
+        }
+        invisible_places::serialization::ScenePointVisualStateDocument stateDocument;
+        stateDocument.sceneGroupName = state.sceneGroupName;
+        stateDocument.visual.name = NormalizePointVisualName(state.visual.name);
+        stateDocument.visual.style = state.visual.style;
+        document.sceneVisualStates.push_back(std::move(stateDocument));
+    }
+    document.gsplatVisualStyle = runtimeState.projectSettings.gsplatVisualStyle;
     document.waterEmitters = runtimeState.water.emitters;
     document.waterRippleLayers = runtimeState.water.rippleLayers;
     document.waterFieldLayers = runtimeState.water.fieldLayers;
     document.waterFlowTrailSettings = runtimeState.water.flowTrailSettings;
     document.waterFieldSettings = runtimeState.water.fieldSettings;
     document.waterFieldTrailSettings = runtimeState.water.fieldTrailSettings;
+    document.waterDynamicMeshFlowSettings = runtimeState.water.dynamicMeshFlowSettings;
     document.waterRainSettings = runtimeState.water.rainSettings;
+    {
+        invisible_places::serialization::WaterSceneStateDocument waterSceneState;
+        waterSceneState.sceneGroupName = "Default";
+        if (const auto supportIndex = ResolveWaterSupportSessionIndex(runtimeState);
+            supportIndex.has_value() && supportIndex.value() < runtimeState.sessions.size()) {
+            const auto sceneKey = ProjectVisualSceneKey(runtimeState.sessions[supportIndex.value()]);
+            if (!sceneKey.empty()) {
+                waterSceneState.sceneGroupName = sceneKey;
+            }
+        }
+        waterSceneState.emitters = runtimeState.water.emitters;
+        waterSceneState.rippleLayers = runtimeState.water.rippleLayers;
+        waterSceneState.fieldLayers = runtimeState.water.fieldLayers;
+        waterSceneState.pathCache = CurrentWaterPathCacheForDocument(runtimeState);
+        waterSceneState.rippleRuntimeCaches = CurrentWaterRippleRuntimeCachesForDocument(runtimeState);
+        waterSceneState.dynamicMeshPath = runtimeState.water.dynamicMeshFlowSettings.meshPath;
+        waterSceneState.dynamicMeshAttractors = runtimeState.water.dynamicMeshFlowSettings.attractors;
+        waterSceneState.dynamicMeshEmitterMotions = runtimeState.water.dynamicMeshFlowSettings.emitterMotions;
+        document.waterSceneStates.push_back(std::move(waterSceneState));
+    }
     document.selectedWaterRainTrailProfileName =
         NormalizeWaterProfileName(runtimeState.water.selectedRainTrailProfileName);
     document.waterSourceSettings = runtimeState.water.defaultSourceSettings;
@@ -11727,25 +13821,6 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         if (session.kind == LayerKind::PointCloud) {
             layerDocument.pointBudgetActivePoints =
                 session.kind == LayerKind::PointCloud ? session.totalPrimitives : session.pointBudget.activePoints;
-            layerDocument.pointStyle = session.pointStyle;
-            layerDocument.selectedPointVisualName =
-                session.selectedPointVisualName.empty()
-                    ? std::string{kDefaultPointVisualName}
-                    : session.selectedPointVisualName;
-            if (session.pointVisuals.empty()) {
-                ProjectLayerDocument::PointVisual visual;
-                visual.name = std::string{kDefaultPointVisualName};
-                visual.style = session.pointStyle;
-                layerDocument.pointVisuals.push_back(std::move(visual));
-            } else {
-                layerDocument.pointVisuals.reserve(session.pointVisuals.size());
-                for (const auto& visual : session.pointVisuals) {
-                    ProjectLayerDocument::PointVisual visualDocument;
-                    visualDocument.name = NormalizePointVisualName(visual.name);
-                    visualDocument.style = visual.style;
-                    layerDocument.pointVisuals.push_back(std::move(visualDocument));
-                }
-            }
         }
         document.layers.push_back(std::move(layerDocument));
     }
@@ -11792,9 +13867,15 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
             runtimeState->offlineRenderJob.worker = std::jthread{};
         }
     }
+    runtimeState->exportPowerAssertion.Reset();
     if (runtimeState->water.regionPointPreviewJob.worker.joinable()) {
         runtimeState->water.regionPointPreviewJob.worker.request_stop();
         runtimeState->water.regionPointPreviewJob.worker = std::jthread{};
+    }
+    if (runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.joinable()) {
+        std::cout << "Waiting for dynamic mesh cache prewarm to finish before shutdown..." << std::endl;
+        runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.request_stop();
+        runtimeState->water.dynamicMeshSurfaceCacheWarmup = {};
     }
 
     if (!runtimeState->pendingLoad.has_value()) {
@@ -11821,6 +13902,7 @@ bool ApplyProjectDocumentToRuntime(
 
     runtimeState->projectSettings.backgroundColor = document.backgroundColor;
     runtimeState->projectSettings.eyeDomeLightingEnabled = document.eyeDomeLightingEnabled;
+    runtimeState->projectSettings.proResAlphaPreviewEnabled = document.proResAlphaPreviewEnabled;
     runtimeState->projectSettings.eyeDomeLightingThickness =
         std::clamp(document.eyeDomeLightingThickness, 1.0F, 24.0F);
     runtimeState->projectSettings.constantUpdateView = document.constantUpdateView;
@@ -11828,6 +13910,34 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
     runtimeState->projectSettings.autoLowerGsplatQualityWhileNavigating =
         document.autoLowerGsplatQualityWhileNavigating;
+    runtimeState->projectSettings.gsplatVisualStyle = document.gsplatVisualStyle;
+    runtimeState->pointVisualLibrary.pointVisuals.clear();
+    runtimeState->pointVisualLibrary.pointVisuals.reserve(document.pointVisuals.size());
+    for (const auto& visualDocument : document.pointVisuals) {
+        runtimeState->pointVisualLibrary.pointVisuals.push_back({
+            .name = NormalizePointVisualName(visualDocument.name),
+            .style = visualDocument.style,
+        });
+    }
+    runtimeState->pointVisualLibrary.selectedPointVisualName =
+        NormalizePointVisualName(document.selectedPointVisualName);
+    runtimeState->pointVisualLibrary.pointVisualNameBuffer =
+        BasePointVisualName(runtimeState->pointVisualLibrary.selectedPointVisualName);
+    runtimeState->pointVisualLibrary.sceneVisualStates.clear();
+    runtimeState->pointVisualLibrary.sceneVisualStates.reserve(document.sceneVisualStates.size());
+    for (const auto& stateDocument : document.sceneVisualStates) {
+        if (stateDocument.sceneGroupName.empty()) {
+            continue;
+        }
+        runtimeState->pointVisualLibrary.sceneVisualStates.push_back({
+            .sceneGroupName = stateDocument.sceneGroupName,
+            .visual = {
+                .name = NormalizePointVisualName(stateDocument.visual.name),
+                .style = stateDocument.visual.style,
+            },
+        });
+    }
+    EnsureProjectPointVisuals(runtimeState);
     runtimeState->projectSettings.pointCloudPreviewLodMode = PointCloudPreviewLodMode::FullResolution;
     runtimeState->projectSettings.interactivePointCap = document.interactivePointCap;
     runtimeState->projectSettings.pointCloudRendererMode = document.pointCloudRendererMode;
@@ -11836,6 +13946,17 @@ bool ApplyProjectDocumentToRuntime(
         renderSettings.outputDirectory = runtimeState->renderSettings.outputDirectory;
     }
     runtimeState->renderSettings = renderSettings;
+    runtimeState->animationPanel.exportPresets = document.exportPresets;
+    runtimeState->animationPanel.selectedExportPresetName =
+        document.selectedExportPresetName.empty()
+            ? std::string{invisible_places::output::kFastPreviewMp4PresetName}
+            : document.selectedExportPresetName;
+    runtimeState->animationPanel.editedExportPreset = document.tempExportPreset;
+    runtimeState->animationPanel.exportPresetNameBuffer =
+        invisible_places::output::BaseExportPresetName(
+            runtimeState->animationPanel.selectedExportPresetName);
+    EnsureExportPresets(runtimeState);
+    ApplyActiveExportPresetToRenderSettings(runtimeState);
     runtimeState->water.emitters = document.waterEmitters;
     runtimeState->water.rippleLayers = document.waterRippleLayers;
     runtimeState->water.fieldLayers = document.waterFieldLayers;
@@ -11843,6 +13964,17 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.defaultTrailGeometry = document.waterTrailGeometry;
     runtimeState->water.fieldSettings = document.waterFieldSettings;
     runtimeState->water.fieldTrailSettings = document.waterFieldTrailSettings;
+    runtimeState->water.dynamicMeshFlowSettings = document.waterDynamicMeshFlowSettings;
+    runtimeState->water.dynamicMeshFlowSettings.trailProfileName =
+        NormalizeWaterProfileName(runtimeState->water.dynamicMeshFlowSettings.trailProfileName);
+    runtimeState->water.dynamicMeshFlowSettings.particlePresetName = std::string{
+        invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(
+            runtimeState->water.dynamicMeshFlowSettings.particlePresetName)};
+    runtimeState->water.dynamicMeshTrailProfileNameBuffer =
+        BaseWaterProfileName(runtimeState->water.dynamicMeshFlowSettings.trailProfileName);
+    runtimeState->water.dynamicMeshSurfaceCache.reset();
+    runtimeState->water.dynamicMeshSurfaceCachePath.clear();
+    runtimeState->water.dynamicMeshSurfaceCacheSignature.clear();
     runtimeState->water.rainSettings = document.waterRainSettings;
     runtimeState->water.selectedRainTrailProfileName = document.selectedWaterRainTrailProfileName;
     runtimeState->water.rainTrailProfileNameBuffer =
@@ -12111,34 +14243,31 @@ bool ApplyProjectDocumentToRuntime(
         }
 
         if (session.kind == LayerKind::PointCloud) {
-            session.pointVisuals.clear();
-            for (const auto& visualDocument : layerIt->pointVisuals) {
-                session.pointVisuals.push_back({
-                    .name = NormalizePointVisualName(visualDocument.name),
-                    .style = visualDocument.style,
-                });
-            }
-            session.selectedPointVisualName = NormalizePointVisualName(layerIt->selectedPointVisualName);
-
-            if (!session.pointVisuals.empty()) {
-                EnsurePointVisuals(&session);
-                if (const auto visualIndex = FindPointVisualIndex(session, session.selectedPointVisualName);
-                    visualIndex.has_value()) {
-                    session.pointStyle = session.pointVisuals[visualIndex.value()].style;
-                }
-                SyncPointVisualNameBuffer(&session);
-            } else if (layerIt->pointStyle.has_value()) {
-                session.pointStyle = layerIt->pointStyle.value();
-                session.pointVisuals.push_back(
-                    {.name = std::string{kDefaultPointVisualName}, .style = session.pointStyle});
-                session.selectedPointVisualName = std::string{kDefaultPointVisualName};
-                SyncPointVisualNameBuffer(&session);
-            } else {
-                EnsurePointVisuals(&session);
-            }
             if (IsGeneratedWaterFlowOverlaySession(session)) {
+                session.pointVisuals.clear();
+                for (const auto& visualDocument : layerIt->pointVisuals) {
+                    session.pointVisuals.push_back({
+                        .name = NormalizePointVisualName(visualDocument.name),
+                        .style = visualDocument.style,
+                    });
+                }
+                session.selectedPointVisualName = NormalizePointVisualName(layerIt->selectedPointVisualName);
+                if (layerIt->pointStyle.has_value()) {
+                    session.pointStyle = layerIt->pointStyle.value();
+                }
+                EnsurePointVisuals(&session);
                 SeedWaterFlowBuiltInVisuals(runtimeState, &session);
+            } else {
+                session.selectedPointVisualName =
+                    runtimeState->pointVisualLibrary.selectedPointVisualName;
+                session.pointVisualNameBuffer =
+                    BaseNameFromProjectPointVisualName(
+                        runtimeState->pointVisualLibrary,
+                        session.selectedPointVisualName);
+                ApplyProjectPointVisualToSession(runtimeState, &session);
             }
+        } else if (session.kind == LayerKind::GaussianSplat) {
+            ApplyProjectGsplatVisualStyleToSession(*runtimeState, &session);
         }
 
         if (session.kind == LayerKind::PointCloud) {
@@ -12150,7 +14279,7 @@ bool ApplyProjectDocumentToRuntime(
         }
 
         SanitizePointCloudStyle(&session);
-        if (session.kind == LayerKind::PointCloud) {
+        if (session.kind == LayerKind::PointCloud && !IsProjectPointVisualSession(session)) {
             EnsurePointVisuals(&session);
             UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
         }
@@ -12167,7 +14296,6 @@ bool ApplyProjectDocumentToRuntime(
         }
     }
 
-    ConsolidateScenePointVisuals(runtimeState);
     CanonicalizeRuntimeSceneAssociations(runtimeState);
 
     runtimeState->selectedSessionIndex.reset();
@@ -12204,6 +14332,7 @@ bool ApplyProjectDocumentToRuntime(
         &restoredRippleMemberships,
         &restoredRippleRegions);
     QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
+    StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
 
     runtimeState->statusMessage =
         "Loaded project with " + FormatPointCount(document.layers.size()) + " layer settings.";
@@ -12462,13 +14591,13 @@ AnimationExportSettings AnimationExportSettingsFromRenderSettings(const RenderJo
 }
 
 void MarkCurrentAnimationExportSettingsDirty(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+    if (runtimeState == nullptr) {
         return;
     }
 
-    runtimeState->animationPanel.currentPath->exportSettings =
-        AnimationExportSettingsFromRenderSettings(runtimeState->renderSettings);
-    runtimeState->animationPanel.dirty = true;
+    auto& preset = EditActiveExportPreset(runtimeState);
+    preset.settings = runtimeState->renderSettings;
+    SanitizeExportPreset(&preset);
 }
 
 bool PathsLexicallyEqual(const std::filesystem::path& left, const std::filesystem::path& right) {
@@ -13412,7 +15541,7 @@ bool ImportLatestHoudiniCameraAnimation(PreviewRuntimeState* runtimeState) {
     if (!SaveAnimationPathToFile(runtimeState, importedPath.value(), outputPath)) {
         return false;
     }
-    runtimeState->renderSettings = RenderSettingsFromAnimationExportSettings(importedPath->exportSettings);
+    ApplyActiveExportPresetToRenderSettings(runtimeState);
     ApplyAnimationEvaluation(runtimeState, runtimeState->animationPanel.currentPath.value(), 0.0F, false);
     runtimeState->statusMessage =
         "Imported Houdini camera from " + inputPath->filename().string() +
@@ -13457,8 +15586,7 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     }
     runtimeState->animationPanel.currentFilePath = inputPath.string();
     runtimeState->animationPanel.draftAnimationName = runtimeState->animationPanel.currentPath->name;
-    runtimeState->renderSettings =
-        RenderSettingsFromAnimationExportSettings(runtimeState->animationPanel.currentPath->exportSettings);
+    ApplyActiveExportPresetToRenderSettings(runtimeState);
     runtimeState->animationPanel.selectedKeyIndex =
         runtimeState->animationPanel.currentPath->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
     runtimeState->animationPanel.scrubAmount = 0.0F;
@@ -14391,7 +16519,8 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     const OfflineRenderJobState& job,
     const invisible_places::camera::CameraState& cameraState,
     std::uint32_t width,
-    std::uint32_t height) {
+    std::uint32_t height,
+    float flowTimeSeconds) {
     invisible_places::renderer::core::SceneRenderState renderState;
     invisible_places::camera::OrbitCamera camera;
     camera.ApplyState(cameraState);
@@ -14424,13 +16553,302 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     renderState.depthOfFieldMaxBlurPixels =
         std::max(0.0F, cameraState.depthOfFieldMaxBlurPixels) * screenPixelScale;
     renderState.gaussianSplatFootprintBoost = job.exportGaussianSplatFootprintBoost;
-    renderState.flowTimeSeconds =
-        static_cast<float>(job.currentFrame) /
-        static_cast<float>(std::max<std::uint32_t>(1U, job.settings.framesPerSecond));
+    renderState.flowTimeSeconds = std::max(0.0F, flowTimeSeconds);
     renderState.pointSizeScale = screenPixelScale;
     renderState.pointCloudLayers = job.exportPointCloudLayers;
 
     return renderState;
+}
+
+std::filesystem::path UniqueAnimationFramePreviewPngPath(
+    const RenderJobSettings& settings,
+    invisible_places::output::AnimationExportMode mode,
+    std::string_view animationName) {
+    const auto directory = settings.outputDirectory.empty()
+                               ? DefaultRenderOutputDirectory(std::filesystem::path{})
+                               : std::filesystem::path{settings.outputDirectory};
+    const auto stem = invisible_places::output::BuildAnimationExportFilenameStem(
+        animationName,
+        mode,
+        settings);
+    auto candidate = directory / (stem + ".png");
+    std::error_code existsError;
+    if (!std::filesystem::exists(candidate, existsError)) {
+        return candidate;
+    }
+
+    for (std::uint32_t suffix = 2U; suffix < 10000U; ++suffix) {
+        candidate = directory / (stem + "_" + std::to_string(suffix) + ".png");
+        existsError.clear();
+        if (!std::filesystem::exists(candidate, existsError)) {
+            return candidate;
+        }
+    }
+    return candidate;
+}
+
+bool SaveAnimationFramePreviewPng(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.framePreview.texture.Valid() ||
+        runtimeState->animationPanel.framePreview.displayRgba8.empty()) {
+        return false;
+    }
+
+    const auto& panel = runtimeState->animationPanel;
+    const auto& preview = panel.framePreview;
+    const auto animationName =
+        !preview.animationName.empty()
+            ? preview.animationName
+            : panel.currentPath.has_value() ? panel.currentPath->name : std::string{"Animation"};
+    const auto outputPath =
+        UniqueAnimationFramePreviewPngPath(preview.renderSettings, preview.exportMode, animationName);
+    std::error_code createError;
+    const auto parentDirectory = outputPath.parent_path();
+    if (!parentDirectory.empty()) {
+        std::filesystem::create_directories(parentDirectory, createError);
+        if (createError) {
+            runtimeState->animationPanel.framePreview.saveStatus =
+                "Save failed: " + createError.message();
+            return false;
+        }
+    }
+
+    std::string errorMessage;
+    if (!invisible_places::output::WritePngRgba8(
+            outputPath,
+            runtimeState->animationPanel.framePreview.texture.width,
+            runtimeState->animationPanel.framePreview.texture.height,
+            runtimeState->animationPanel.framePreview.displayRgba8,
+            &errorMessage)) {
+        runtimeState->animationPanel.framePreview.saveStatus =
+            errorMessage.empty() ? std::string{"Save failed."} : "Save failed: " + errorMessage;
+        return false;
+    }
+
+    runtimeState->animationPanel.framePreview.savedPath = outputPath;
+    runtimeState->animationPanel.framePreview.saveStatus = "Saved: " + outputPath.string();
+    runtimeState->statusMessage = "Saved frame preview PNG: " + outputPath.filename().string() + ".";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool RenderCurrentAnimationFramePreview(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (runtimeState->offlineRenderJob.active) {
+        runtimeState->errorMessage = "Wait for the active export to finish before rendering a frame preview.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    if (!panel.currentPath.has_value() || panel.currentPath->keys.size() < 2U) {
+        runtimeState->errorMessage = "Load an animation path with at least two keys before rendering a frame preview.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (!HasOfflinePointLayers(*runtimeState)) {
+        runtimeState->errorMessage = "Load and show at least one LiDAR layer before rendering a frame preview.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    EnsureExportPresets(runtimeState);
+    const auto activePreset = ViewedExportPreset(*runtimeState);
+    const auto activeMode = activePreset.mode;
+    auto settings = RenderSettingsFromExportPreset(activePreset, runtimeState->renderSettings.outputDirectory);
+    NormalizeAnimationRenderSettings(&settings);
+    runtimeState->renderSettings = settings;
+
+    auto& animationPath = panel.currentPath.value();
+    const auto preparedAnimationPath = invisible_places::camera::PrepareAnimationPathEvaluation(animationPath);
+    if (!preparedAnimationPath.valid) {
+        runtimeState->errorMessage = "Frame preview failed: animation path could not be prepared.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const float durationSeconds = preparedAnimationPath.durationSeconds;
+    const float baseTimeSeconds = durationSeconds * std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+    const float framesPerSecond =
+        static_cast<float>(std::max<std::uint32_t>(1U, settings.framesPerSecond));
+    auto sampleOffsets = invisible_places::output::BuildExportFrameSampleOffsetsFrames(settings);
+    if (sampleOffsets.empty()) {
+        sampleOffsets.push_back(0.0F);
+    }
+    std::vector<float> sampleTimesSeconds;
+    std::vector<invisible_places::camera::CameraState> sampleCameras;
+    sampleTimesSeconds.reserve(sampleOffsets.size());
+    sampleCameras.reserve(sampleOffsets.size());
+    for (const auto offsetFrames : sampleOffsets) {
+        const float sampleTimeSeconds = std::clamp(
+            baseTimeSeconds + (offsetFrames / framesPerSecond),
+            0.0F,
+            std::max(0.0F, durationSeconds));
+        sampleTimesSeconds.push_back(sampleTimeSeconds);
+        sampleCameras.push_back(invisible_places::camera::EvaluatePreparedAnimationPath(
+            preparedAnimationPath,
+            sampleTimeSeconds).camera);
+    }
+
+    const auto exportRendererMode =
+        VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
+            ? PointCloudRendererMode::Beauty
+            : runtimeState->projectSettings.pointCloudRendererMode;
+
+    bool exportUsesPreviewDensity = false;
+    if (AnimationExportWritesMp4(activeMode)) {
+        const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
+            runtimeState,
+            viewport,
+            std::span<const invisible_places::camera::CameraState>{
+                sampleCameras.data(),
+                sampleCameras.size()},
+            settings,
+            std::nullopt,
+            exportRendererMode);
+        exportUsesPreviewDensity = frustumMaskSummary.enabled;
+    } else if (AnimationExportWritesExr(activeMode) && panel.exportPreviewDensity) {
+        PreparePreviewLodSampleCaches(runtimeState, viewport);
+        exportUsesPreviewDensity = true;
+    }
+
+    const auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
+        *runtimeState,
+        exportUsesPreviewDensity,
+        std::nullopt,
+        exportRendererMode);
+    if (exportPointCloudLayers.empty()) {
+        runtimeState->errorMessage = "No visible loaded LiDAR layers are available for frame preview.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto setupSize = CurrentFramebufferViewportSize(*viewport);
+    OfflineRenderJobState job;
+    job.mode = activeMode;
+    job.settings = settings;
+    job.setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x));
+    job.setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y));
+    job.previewDensity = exportUsesPreviewDensity;
+    job.pointCloudRendererMode = exportRendererMode;
+    job.animationName = animationPath.name;
+    job.animationPath = animationPath;
+    job.exportBackgroundColor = glm::vec4{
+        runtimeState->projectSettings.backgroundColor[0],
+        runtimeState->projectSettings.backgroundColor[1],
+        runtimeState->projectSettings.backgroundColor[2],
+        0.0F,
+    };
+    job.exportEyeDomeLightingEnabled = runtimeState->projectSettings.eyeDomeLightingEnabled;
+    job.exportEyeDomeLightingThickness = runtimeState->projectSettings.eyeDomeLightingThickness;
+    job.exportGaussianSplatFootprintBoost = runtimeState->projectSettings.gaussianSplatFootprintBoost;
+    job.exportPointCloudLayers = exportPointCloudLayers;
+
+    const auto renderScale =
+        AnimationExportWritesVideo(activeMode)
+            ? std::max<std::uint32_t>(1U, settings.supersampleScale)
+            : 1U;
+    const auto renderWidth = ScaledRenderDimension(settings.width, renderScale);
+    const auto renderHeight = ScaledRenderDimension(settings.height, renderScale);
+
+    std::vector<invisible_places::output::HalfRgbaExrImage> samples;
+    samples.reserve(sampleOffsets.size());
+    runtimeState->statusMessage =
+        "Rendering one-frame preview (" + std::to_string(sampleOffsets.size()) + " sample" +
+        (sampleOffsets.size() == 1U ? "" : "s") + ")...";
+    runtimeState->errorMessage.clear();
+
+    try {
+        for (std::size_t sampleIndex = 0; sampleIndex < sampleCameras.size(); ++sampleIndex) {
+            const auto& cameraState = sampleCameras[sampleIndex];
+            const float sampleTimeSeconds = sampleTimesSeconds[sampleIndex];
+            const auto renderState = BuildPointCloudExrRenderState(
+                job,
+                cameraState,
+                renderWidth,
+                renderHeight,
+                sampleTimeSeconds);
+            const invisible_places::renderer::core::PointCloudExrFrameRequest request{
+                .renderState = renderState,
+                .width = renderWidth,
+                .height = renderHeight,
+                .previewDensity = exportUsesPreviewDensity,
+            };
+            auto renderedImage = viewport->RenderPointCloudExrFrame(request);
+            if (job.exportEyeDomeLightingEnabled &&
+                job.pointCloudRendererMode != PointCloudRendererMode::FastBasic) {
+                invisible_places::output::ApplyEyeDomeLighting(
+                    &renderedImage,
+                    invisible_places::output::EyeDomeLightingSettings{
+                        .enabled = true,
+                        .outlineThicknessPixels = renderState.eyeDomeLightingThickness});
+            }
+            samples.push_back(std::move(renderedImage));
+        }
+    } catch (const std::exception& error) {
+        runtimeState->errorMessage = "Frame preview failed: " + std::string{error.what()};
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    auto previewImage = samples.size() == 1U
+                            ? std::move(samples.front())
+                            : invisible_places::output::AverageHalfRgbaFrames(samples);
+    if (previewImage.rgbaHalf.empty()) {
+        runtimeState->errorMessage = "Frame preview failed: sample accumulation did not produce a valid image.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    invisible_places::output::Mp4SparsePointSmoothingSettings smoothing;
+    smoothing.enabled = AnimationExportWritesMp4(activeMode);
+    auto displayBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
+        previewImage,
+        settings.width,
+        settings.height,
+        smoothing,
+        settings.spatialAntialiasing);
+    if (displayBytes.empty()) {
+        runtimeState->errorMessage = "Frame preview failed: could not create display pixels.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    try {
+        const auto texture = viewport->UploadImGuiPreviewImageTexture(
+            settings.width,
+            settings.height,
+            displayBytes);
+        panel.framePreview.texture = texture;
+        panel.framePreview.image = std::move(previewImage);
+        panel.framePreview.displayRgba8 = std::move(displayBytes);
+        panel.framePreview.exportMode = activeMode;
+        panel.framePreview.renderSettings = settings;
+        panel.framePreview.animationName = animationPath.name;
+        panel.framePreview.open = true;
+        panel.framePreview.closePending = false;
+        panel.framePreview.savedPath.clear();
+        panel.framePreview.saveStatus.clear();
+        panel.framePreview.title = "Frame Preview - " + animationPath.name;
+        panel.framePreview.summary =
+            std::string{AnimationExportModeLabel(activeMode)} + " | " +
+            std::to_string(settings.width) + " x " + std::to_string(settings.height) +
+            " | internal " + std::to_string(renderWidth) + " x " + std::to_string(renderHeight) +
+            " | " + std::to_string(sampleOffsets.size()) + " sample" +
+            (sampleOffsets.size() == 1U ? "" : "s") +
+            " | t=" + FormatFixed(baseTimeSeconds, 3) + "s";
+    } catch (const std::exception& error) {
+        runtimeState->errorMessage = "Frame preview display failed: " + std::string{error.what()};
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    runtimeState->statusMessage = "Rendered one-frame preview.";
+    runtimeState->errorMessage.clear();
+    return true;
 }
 
 std::string FormatElapsedTime(std::chrono::steady_clock::duration elapsed) {
@@ -14440,6 +16858,145 @@ std::string FormatElapsedTime(std::chrono::steady_clock::duration elapsed) {
     std::ostringstream output;
     output << minutes << "m " << seconds << "s";
     return output.str();
+}
+
+std::string FormatAdaptiveDuration(std::chrono::steady_clock::duration elapsed) {
+    auto totalSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    if (totalSeconds < 0) {
+        totalSeconds = 0;
+    }
+
+    std::ostringstream output;
+    if (totalSeconds < 60) {
+        output << totalSeconds << " sec";
+    } else if (totalSeconds < 3600) {
+        output << (totalSeconds / 60) << " min";
+        const auto seconds = totalSeconds % 60;
+        if (seconds > 0) {
+            output << ' ' << seconds << " sec";
+        }
+    } else {
+        output << (totalSeconds / 3600) << " hr";
+        const auto minutes = (totalSeconds % 3600) / 60;
+        if (minutes > 0) {
+            output << ' ' << minutes << " min";
+        }
+    }
+    return output.str();
+}
+
+std::string FormatLocalTime(std::chrono::system_clock::time_point timePoint, const char* format);
+
+std::string FormatEtaClock(std::chrono::steady_clock::duration remaining) {
+    const auto remainingSeconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+    const auto eta = std::chrono::system_clock::now() + remainingSeconds;
+    return FormatLocalTime(eta, remainingSeconds >= std::chrono::hours{24} ? "%a %H:%M" : "%H:%M");
+}
+
+std::size_t ExportSamplePassesPerOffset(const OfflineRenderJobState& job) {
+    const bool needsPreviewPass =
+        job.writeExrStack &&
+        (job.writePreviewMp4 || job.writeProResMov) &&
+        std::max<std::uint32_t>(1U, job.mp4SupersampleScale) > 1U;
+    return needsPreviewPass ? 2U : 1U;
+}
+
+std::size_t ExportTotalSamplePassCount(const OfflineRenderJobState& job) {
+    const auto sampleCount = job.frameSampleState.sampleOffsetsFrames.empty()
+                                 ? 1U
+                                 : job.frameSampleState.sampleOffsetsFrames.size();
+    return sampleCount * ExportSamplePassesPerOffset(job);
+}
+
+std::size_t ExportCompletedSamplePassCount(const OfflineRenderJobState& job) {
+    if (!job.frameSampleState.active) {
+        return 0U;
+    }
+    const auto passesPerSample = ExportSamplePassesPerOffset(job);
+    auto completed = job.frameSampleState.nextSampleIndex * passesPerSample;
+    if (job.frameSampleState.previewPassPending) {
+        completed += 1U;
+    }
+    return completed;
+}
+
+double ExportCurrentFrameSampleFraction(const OfflineRenderJobState& job) {
+    if (!job.frameSampleState.active) {
+        return 0.0;
+    }
+    const auto totalPasses = ExportTotalSamplePassCount(job);
+    if (totalPasses == 0U) {
+        return 0.0;
+    }
+    return std::clamp(
+        static_cast<double>(ExportCompletedSamplePassCount(job)) / static_cast<double>(totalPasses),
+        0.0,
+        1.0);
+}
+
+float ExportRenderProgressFraction(const OfflineRenderJobState& job) {
+    if (job.frames.empty()) {
+        return 0.0F;
+    }
+    const double completedFrames =
+        static_cast<double>(std::min<std::uint32_t>(
+            job.currentFrame,
+            static_cast<std::uint32_t>(job.frames.size()))) +
+        ExportCurrentFrameSampleFraction(job);
+    return static_cast<float>(
+        std::clamp(completedFrames / static_cast<double>(job.frames.size()), 0.0, 1.0));
+}
+
+std::optional<std::chrono::steady_clock::duration> AverageExportFrameRenderDuration(
+    const OfflineRenderJobState& job) {
+    if (job.exportLog.capturedFrames > 0U) {
+        return job.exportLog.gpuCaptureTotal / job.exportLog.capturedFrames;
+    }
+    if (job.frameSampleState.active) {
+        const double fraction = ExportCurrentFrameSampleFraction(job);
+        if (fraction > 0.01) {
+            const double elapsedSeconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - job.frameSampleState.startedAt).count();
+            return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>{elapsedSeconds / fraction});
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::chrono::steady_clock::duration> RemainingExportRenderDuration(
+    const OfflineRenderJobState& job) {
+    const auto average = AverageExportFrameRenderDuration(job);
+    if (!average.has_value() || job.frames.empty()) {
+        return std::nullopt;
+    }
+    const double completedFrames =
+        static_cast<double>(std::min<std::uint32_t>(
+            job.currentFrame,
+            static_cast<std::uint32_t>(job.frames.size()))) +
+        ExportCurrentFrameSampleFraction(job);
+    const double remainingFrames =
+        std::max(0.0, static_cast<double>(job.frames.size()) - completedFrames);
+    const double remainingSeconds =
+        std::chrono::duration<double>(average.value()).count() * remainingFrames;
+    return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>{remainingSeconds});
+}
+
+std::string ExportTimingStatusSuffix(const OfflineRenderJobState& job) {
+    const auto average = AverageExportFrameRenderDuration(job);
+    if (!average.has_value()) {
+        return {};
+    }
+    std::string suffix = " Avg " + FormatAdaptiveDuration(average.value()) + "/frame";
+    const auto remaining = RemainingExportRenderDuration(job);
+    if (remaining.has_value()) {
+        suffix += ", ETA " + FormatAdaptiveDuration(remaining.value()) +
+                  " (~" + FormatEtaClock(remaining.value()) + ")";
+    }
+    suffix += ".";
+    return suffix;
 }
 
 std::uint64_t CurrentResidentMemoryBytes() {
@@ -14467,6 +17024,26 @@ std::uint64_t CurrentResidentMemoryBytes() {
 #endif
 }
 
+std::uint64_t SystemPhysicalMemoryBytes() {
+#if defined(__APPLE__)
+    std::uint64_t memoryBytes = 0;
+    std::size_t size = sizeof(memoryBytes);
+    if (sysctlbyname("hw.memsize", &memoryBytes, &size, nullptr, 0) == 0) {
+        return memoryBytes;
+    }
+    return 0U;
+#elif defined(__linux__)
+    const long pageCount = sysconf(_SC_PHYS_PAGES);
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageCount <= 0 || pageSize <= 0) {
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(pageCount) * static_cast<std::uint64_t>(pageSize);
+#else
+    return 0U;
+#endif
+}
+
 std::string FormatByteCount(std::uint64_t bytes) {
     if (bytes == 0U) {
         return "Unavailable";
@@ -14483,6 +17060,84 @@ std::string FormatByteCount(std::uint64_t bytes) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(unitIndex == 0U ? 0 : 1) << value << ' ' << kUnits[unitIndex];
     return output.str();
+}
+
+bool AnimationExportWritesVideo(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode);
+const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMode mode);
+std::uint32_t ScaledRenderDimension(std::uint32_t dimension, std::uint32_t scale);
+
+std::uint64_t EstimateVideoExportWorkingSetBytes(
+    invisible_places::output::AnimationExportMode mode,
+    const RenderJobSettings& settings) {
+    if (!AnimationExportWritesVideo(mode)) {
+        return 0U;
+    }
+    const auto scale = std::max<std::uint32_t>(1U, settings.supersampleScale);
+    const auto width = ScaledRenderDimension(settings.width, scale);
+    const auto height = ScaledRenderDimension(settings.height, scale);
+    const auto pixelCount = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    constexpr std::uint64_t kHalfRgbaDepthBytesPerPixel = (4ULL * sizeof(std::uint16_t)) + sizeof(float);
+    const auto sampleCount = static_cast<std::uint64_t>(
+        std::max<std::size_t>(
+            1U,
+            invisible_places::output::BuildExportFrameSampleOffsetsFrames(settings).size()));
+    const auto sampleBytes = pixelCount * kHalfRgbaDepthBytesPerPixel * sampleCount;
+    const auto averagedFrameBytes = pixelCount * kHalfRgbaDepthBytesPerPixel;
+    const auto queuedFrameBytes =
+        pixelCount * kHalfRgbaDepthBytesPerPixel * static_cast<std::uint64_t>(kMaxQueuedExportFrames);
+    const auto deliveryPixelCount =
+        static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, settings.width)) *
+        static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, settings.height));
+    const auto rawEncoderFrameBytes =
+        deliveryPixelCount *
+        (AnimationExportPreservesAlpha(mode)
+             ? 4ULL * sizeof(std::uint16_t)
+             : AnimationExportWritesProRes(mode) ? 3ULL * sizeof(std::uint16_t) : 4ULL);
+    constexpr std::uint64_t kExportOverheadBytes = 512ULL * 1024ULL * 1024ULL;
+    return sampleBytes + averagedFrameBytes + queuedFrameBytes + rawEncoderFrameBytes + kExportOverheadBytes;
+}
+
+bool CheckVideoExportMemoryBudget(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::output::AnimationExportMode mode,
+    const RenderJobSettings& settings) {
+    if (runtimeState == nullptr || !AnimationExportWritesVideo(mode)) {
+        return true;
+    }
+    const auto estimateBytes = EstimateVideoExportWorkingSetBytes(mode, settings);
+    const auto physicalBytes = SystemPhysicalMemoryBytes();
+    if (physicalBytes == 0U || estimateBytes == 0U) {
+        return true;
+    }
+    const auto residentBytes = CurrentResidentMemoryBytes();
+    if (residentBytes > 0U && residentBytes + estimateBytes > (physicalBytes * 9ULL) / 10ULL) {
+        runtimeState->errorMessage =
+            std::string{AnimationExportModeLabel(mode)} +
+            " export would need about " + FormatByteCount(estimateBytes) +
+            " of additional render memory, which is too close to system memory " +
+            FormatByteCount(physicalBytes) + ". Reduce superscale, samples, or resolution.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (estimateBytes > (physicalBytes * 7ULL) / 10ULL) {
+        runtimeState->errorMessage =
+            std::string{AnimationExportModeLabel(mode)} +
+            " export is estimated to need " + FormatByteCount(estimateBytes) +
+            " of render memory on a " + FormatByteCount(physicalBytes) +
+            " machine. Reduce superscale, samples, or resolution before starting.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (estimateBytes > physicalBytes / 2ULL) {
+        runtimeState->statusMessage =
+            std::string{AnimationExportModeLabel(mode)} +
+            " memory preflight: estimated " + FormatByteCount(estimateBytes) +
+            " render working set.";
+        runtimeState->errorMessage.clear();
+    }
+    return true;
 }
 
 std::string FormatDurationForLog(std::chrono::steady_clock::duration duration) {
@@ -14512,8 +17167,60 @@ bool AnimationExportWritesMp4(invisible_places::output::AnimationExportMode mode
     return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4;
 }
 
+bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode mode) {
+    switch (mode) {
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return true;
+        case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+            return false;
+    }
+    return false;
+}
+
+bool AnimationExportUsesVideoToolbox(invisible_places::output::AnimationExportMode mode) {
+    return mode == invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov ||
+           mode == invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov ||
+           mode == invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov ||
+           mode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov;
+}
+
+bool AnimationExportUsesProResXq(invisible_places::output::AnimationExportMode mode) {
+    return mode == invisible_places::output::AnimationExportMode::ProRes4444XqMov ||
+           mode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov;
+}
+
+bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode) {
+    switch (mode) {
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return true;
+        case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return false;
+    }
+    return false;
+}
+
+bool AnimationExportWritesVideo(invisible_places::output::AnimationExportMode mode) {
+    return AnimationExportWritesMp4(mode) || AnimationExportWritesProRes(mode);
+}
+
 bool AnimationExportWritesExr(invisible_places::output::AnimationExportMode mode) {
-    return mode != invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    return mode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
 }
 
 std::uint32_t Mp4SupersampleScaleForSettings(const RenderJobSettings& settings) {
@@ -14542,8 +17249,12 @@ AnimationExportOutputOptions MakeAnimationExportOutputOptions(
     AnimationExportOutputOptions options;
     options.writeExrStack = AnimationExportWritesExr(mode);
     options.writePreviewMp4 = AnimationExportWritesMp4(mode);
+    options.writeProResMov = AnimationExportWritesProRes(mode);
     options.previewMp4Optional = previewMp4Optional;
-    options.mp4SupersampleScale = options.writePreviewMp4 ? Mp4SupersampleScaleForSettings(settings) : 1U;
+    options.mp4SupersampleScale = AnimationExportWritesVideo(mode)
+                                      ? std::max<std::uint32_t>(1U, settings.supersampleScale)
+                                      : 1U;
+    options.spatialAntialiasing = settings.spatialAntialiasing;
     options.previewVideoPath = std::move(videoOutputPath);
     options.previewVideoWarning = std::move(previewVideoWarning);
     return options;
@@ -14555,6 +17266,22 @@ const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMo
             return "Quick MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "HQ Preview-Density EXR";
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+            return "ProRes 422";
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+            return "ProRes 422 HQ";
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+            return "ProRes 422 VideoToolbox";
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return "ProRes 422 HQ VideoToolbox";
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+            return "ProRes 4444";
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+            return "ProRes 4444 XQ";
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            return "ProRes 4444 VideoToolbox";
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return "ProRes 4444 XQ VideoToolbox";
     }
 
     return "Animation Export";
@@ -14566,6 +17293,15 @@ const char* AnimationExportCaptureLabel(invisible_places::output::AnimationExpor
             return "MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "HQ EXR";
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return "ProRes";
     }
 
     return "Animation";
@@ -14577,6 +17313,22 @@ const char* AnimationExportOverlayLabel(invisible_places::output::AnimationExpor
             return "Encoding Fast Preview MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "Rendering HQ Preview-Density EXR";
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+            return "Encoding ProRes 422";
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+            return "Encoding ProRes 422 HQ";
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+            return "Encoding ProRes 422 VideoToolbox";
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return "Encoding ProRes 422 HQ VideoToolbox";
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+            return "Encoding ProRes 4444";
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+            return "Encoding ProRes 4444 XQ";
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            return "Encoding ProRes 4444 VideoToolbox";
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return "Encoding ProRes 4444 XQ VideoToolbox";
     }
 
     return "Animation Export";
@@ -14588,6 +17340,15 @@ const char* StillCameraExportOverlayLabel(invisible_places::output::AnimationExp
             return "Exporting Still Camera MP4";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "Exporting Still Camera EXR Stack";
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return "Exporting Still Camera ProRes";
     }
 
     return "Still Camera Export";
@@ -14603,6 +17364,22 @@ const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) 
             return "ExportLog_MP4_";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "ExportLog_EXR_";
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+            return "ExportLog_ProRes422_";
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+            return "ExportLog_ProRes422HQ_";
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+            return "ExportLog_ProRes422VT_";
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return "ExportLog_ProRes422HQVT_";
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+            return "ExportLog_ProRes4444_";
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+            return "ExportLog_ProRes4444XQ_";
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            return "ExportLog_ProRes4444VT_";
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return "ExportLog_ProRes4444XQVT_";
     }
 
     return "ExportLog_";
@@ -14610,6 +17387,217 @@ const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) 
 
 const char* ExportLogTypeLabel(invisible_places::output::AnimationExportMode mode) {
     return AnimationExportModeLabel(mode);
+}
+
+std::filesystem::path BuildUniqueProResOutputPathForMode(
+    invisible_places::output::AnimationExportMode mode,
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    const RenderJobSettings& settings,
+    std::string_view visualName,
+    const std::vector<std::filesystem::path>& reservedOutputPaths = {}) {
+    switch (mode) {
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+            return invisible_places::output::BuildUniqueProRes422OutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+            return invisible_places::output::BuildUniqueProRes422HqOutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+            return invisible_places::output::BuildUniqueProRes422VideoToolboxOutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return invisible_places::output::BuildUniqueProRes422HqVideoToolboxOutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+            return invisible_places::output::BuildUniqueProRes4444XqOutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            return invisible_places::output::BuildUniqueProRes4444VideoToolboxOutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return invisible_places::output::BuildUniqueProRes4444XqVideoToolboxOutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+            return invisible_places::output::BuildUniqueProRes4444OutputPath(
+                outputDirectory,
+                animationName,
+                settings,
+                visualName,
+                reservedOutputPaths);
+    }
+    return invisible_places::output::BuildUniqueProRes4444OutputPath(
+        outputDirectory,
+        animationName,
+        settings,
+        visualName,
+        reservedOutputPaths);
+}
+
+std::filesystem::path BuildUniqueAnimationVideoOutputPathForMode(
+    invisible_places::output::AnimationExportMode mode,
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    const RenderJobSettings& settings,
+    std::string_view visualName = {},
+    const std::vector<std::filesystem::path>& reservedOutputPaths = {}) {
+    if (AnimationExportWritesProRes(mode)) {
+        return BuildUniqueProResOutputPathForMode(
+            mode,
+            outputDirectory,
+            animationName,
+            settings,
+            visualName,
+            reservedOutputPaths);
+    }
+    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        return invisible_places::output::BuildUniqueQuickMp4OutputPath(
+            outputDirectory,
+            animationName,
+            settings,
+            visualName,
+            reservedOutputPaths);
+    }
+    return invisible_places::output::BuildUniqueAnimationExportMediaOutputPath(
+        outputDirectory,
+        animationName,
+        mode,
+        settings,
+        ".mp4",
+        visualName,
+        reservedOutputPaths);
+}
+
+std::filesystem::path BuildUniqueAnimationExportDirectory(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    invisible_places::output::AnimationExportMode mode,
+    const RenderJobSettings& settings,
+    const std::vector<std::filesystem::path>& reservedDirectories = {}) {
+    const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
+    const auto stem = invisible_places::output::BuildAnimationExportFilenameStem(
+        animationName,
+        mode,
+        settings);
+    auto candidate = directory / stem;
+    const auto reserved = [&reservedDirectories](const std::filesystem::path& path) {
+        const auto normalized = path.lexically_normal();
+        return std::any_of(
+            reservedDirectories.begin(),
+            reservedDirectories.end(),
+            [&normalized](const std::filesystem::path& reservedPath) {
+                return reservedPath.lexically_normal() == normalized;
+            });
+    };
+    for (std::uint32_t suffix = 1U; std::filesystem::exists(candidate) || reserved(candidate); ++suffix) {
+        candidate = directory / (stem + "_" + std::to_string(suffix));
+    }
+    return candidate;
+}
+
+std::string BuildFfmpegProResCommandForMode(
+    invisible_places::output::AnimationExportMode mode,
+    const std::filesystem::path& executablePath,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t framesPerSecond,
+    const std::filesystem::path& outputPath) {
+    switch (mode) {
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+            return invisible_places::output::BuildFfmpegProRes422Command(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+            return invisible_places::output::BuildFfmpegProRes422HqCommand(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+            return invisible_places::output::BuildFfmpegProRes422VideoToolboxCommand(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return invisible_places::output::BuildFfmpegProRes422HqVideoToolboxCommand(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+            return invisible_places::output::BuildFfmpegProRes4444XqCommand(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            return invisible_places::output::BuildFfmpegProRes4444VideoToolboxCommand(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return invisible_places::output::BuildFfmpegProRes4444XqVideoToolboxCommand(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+            return invisible_places::output::BuildFfmpegProRes4444Command(
+                executablePath,
+                width,
+                height,
+                framesPerSecond,
+                outputPath);
+    }
+    return invisible_places::output::BuildFfmpegProRes4444Command(
+        executablePath,
+        width,
+        height,
+        framesPerSecond,
+        outputPath);
 }
 
 std::filesystem::path BuildUniqueExportLogPath(
@@ -14675,10 +17663,113 @@ void RecordExportGpuCaptureDuration(
     ++log.capturedFrames;
 }
 
+void RecordExportDurationBucket(
+    std::chrono::steady_clock::duration duration,
+    std::chrono::steady_clock::duration* total,
+    std::chrono::steady_clock::duration* maxDuration,
+    std::uint32_t* count) {
+    if (total == nullptr || maxDuration == nullptr || count == nullptr) {
+        return;
+    }
+    *total += duration;
+    if (*count == 0U || duration > *maxDuration) {
+        *maxDuration = duration;
+    }
+    ++(*count);
+}
+
+void RecordExportGpuSampleDuration(
+    OfflineRenderJobState* job,
+    std::chrono::steady_clock::duration duration) {
+    if (job == nullptr || job->exportLog.path.empty()) {
+        return;
+    }
+    RecordExportDurationBucket(
+        duration,
+        &job->exportLog.gpuSampleTotal,
+        &job->exportLog.gpuSampleMax,
+        &job->exportLog.gpuSampleCount);
+}
+
+void RecordExportReadbackDuration(
+    OfflineRenderJobState* job,
+    std::chrono::steady_clock::duration duration) {
+    if (job == nullptr || job->exportLog.path.empty()) {
+        return;
+    }
+    RecordExportDurationBucket(
+        duration,
+        &job->exportLog.readbackTotal,
+        &job->exportLog.readbackMax,
+        &job->exportLog.readbackCount);
+}
+
+void RecordExportPostProcessDuration(
+    OfflineRenderJobState* job,
+    std::chrono::steady_clock::duration duration) {
+    if (job == nullptr || job->exportLog.path.empty()) {
+        return;
+    }
+    RecordExportDurationBucket(
+        duration,
+        &job->exportLog.postProcessTotal,
+        &job->exportLog.postProcessMax,
+        &job->exportLog.postProcessCount);
+}
+
+void BeginExportWriterWait(OfflineRenderJobState* job) {
+    if (job == nullptr || job->writerWaitActive) {
+        return;
+    }
+    job->writerWaitActive = true;
+    job->writerWaitStartedAt = std::chrono::steady_clock::now();
+}
+
+void EndExportWriterWait(OfflineRenderJobState* job) {
+    if (job == nullptr || !job->writerWaitActive) {
+        return;
+    }
+    const auto duration = std::chrono::steady_clock::now() - job->writerWaitStartedAt;
+    job->writerWaitActive = false;
+    RecordExportDurationBucket(
+        duration,
+        &job->exportLog.writerWaitTotal,
+        &job->exportLog.writerWaitMax,
+        &job->exportLog.writerWaitCount);
+}
+
+bool ExportEyeDomeLightingActive(const OfflineRenderJobState& job) {
+    return job.exportEyeDomeLightingEnabled &&
+           job.pointCloudRendererMode != PointCloudRendererMode::FastBasic;
+}
+
+invisible_places::renderer::core::PointCloudExrReadbackMask ExportReadbackMaskForPass(
+    const OfflineRenderJobState& job,
+    bool previewPass) {
+    using invisible_places::renderer::core::PointCloudExrReadbackMask;
+    if (previewPass) {
+        return PointCloudExrReadbackMask::Color | PointCloudExrReadbackMask::Depth;
+    }
+    if (job.writeExrStack) {
+        return PointCloudExrReadbackMask::All;
+    }
+    if (job.writePreviewMp4) {
+        return PointCloudExrReadbackMask::Color | PointCloudExrReadbackMask::Depth;
+    }
+    if (job.writeProResMov) {
+        auto mask = PointCloudExrReadbackMask::Color;
+        if (ExportEyeDomeLightingActive(job)) {
+            mask = mask | PointCloudExrReadbackMask::Depth;
+        }
+        return mask;
+    }
+    return PointCloudExrReadbackMask::Color | PointCloudExrReadbackMask::Depth;
+}
+
 std::uint64_t WrittenOutputByteCount(const OfflineRenderJobState& job) {
     std::uint64_t bytes = 0;
     std::error_code error;
-    if (job.writePreviewMp4) {
+    if (job.writePreviewMp4 || job.writeProResMov) {
         if (!job.videoOutputPath.empty() && std::filesystem::exists(job.videoOutputPath, error)) {
             error.clear();
             const auto fileBytes = std::filesystem::file_size(job.videoOutputPath, error);
@@ -14740,17 +17831,32 @@ std::string WriteExportLog(
     const auto readbackBytes =
         static_cast<std::uint64_t>(job.settings.width) *
         static_cast<std::uint64_t>(job.settings.height) * 4U * sizeof(std::uint16_t);
-    const auto mp4ReadbackBytes =
+    const auto videoReadbackBytes =
         static_cast<std::uint64_t>(ScaledRenderDimension(job.settings.width, job.mp4SupersampleScale)) *
         static_cast<std::uint64_t>(ScaledRenderDimension(job.settings.height, job.mp4SupersampleScale)) *
         4U * sizeof(std::uint16_t);
-    const auto mp4RawFrameBytes =
+    const auto videoRawFrameBytes =
         static_cast<std::uint64_t>(job.settings.width) *
-        static_cast<std::uint64_t>(job.settings.height) * 4U;
+        static_cast<std::uint64_t>(job.settings.height) *
+        (AnimationExportPreservesAlpha(job.mode)
+             ? 4U * sizeof(std::uint16_t)
+             : job.writeProResMov ? 3U * sizeof(std::uint16_t) : 4U);
     const auto outputBytes = WrittenOutputByteCount(job);
     const auto averageCaptureDuration =
         job.exportLog.capturedFrames > 0U
             ? job.exportLog.gpuCaptureTotal / job.exportLog.capturedFrames
+            : std::chrono::steady_clock::duration{};
+    const auto averageGpuSampleDuration =
+        job.exportLog.gpuSampleCount > 0U
+            ? job.exportLog.gpuSampleTotal / job.exportLog.gpuSampleCount
+            : std::chrono::steady_clock::duration{};
+    const auto averageReadbackDuration =
+        job.exportLog.readbackCount > 0U
+            ? job.exportLog.readbackTotal / job.exportLog.readbackCount
+            : std::chrono::steady_clock::duration{};
+    const auto averagePostProcessDuration =
+        job.exportLog.postProcessCount > 0U
+            ? job.exportLog.postProcessTotal / job.exportLog.postProcessCount
             : std::chrono::steady_clock::duration{};
 
     log << "Invisible Places Export Log\n";
@@ -14787,8 +17893,10 @@ std::string WriteExportLog(
     log << "Output\n";
     if (job.writePreviewMp4) {
         log << "MP4: " << job.videoOutputPath.string() << '\n';
+    } else if (job.writeProResMov) {
+        log << AnimationExportModeLabel(job.mode) << " MOV: " << job.videoOutputPath.string() << '\n';
     } else if (!job.previewVideoWarning.empty()) {
-        log << "MP4: " << job.previewVideoWarning << '\n';
+        log << "Video: " << job.previewVideoWarning << '\n';
     }
     if (job.writeExrStack) {
         log << "EXR folder: " << job.settings.outputDirectory << '\n';
@@ -14819,9 +17927,17 @@ std::string WriteExportLog(
     if (job.exportEyeDomeLightingEnabled) {
         log << "Eye-Dome Lighting thickness: " << job.exportEyeDomeLightingThickness << " px\n";
     }
-    if (job.writePreviewMp4) {
-        log << "MP4 sparse point smoothing: yes\n";
-        log << "MP4 supersample scale: " << std::max<std::uint32_t>(1U, job.mp4SupersampleScale) << "x\n";
+    if (job.writePreviewMp4 || job.writeProResMov) {
+        if (job.writePreviewMp4) {
+            log << "MP4 sparse point smoothing: yes\n";
+        }
+        log << "Video supersample scale: " << std::max<std::uint32_t>(1U, job.mp4SupersampleScale) << "x\n";
+        log << "Spatial AA/downscale: " << (job.spatialAntialiasing ? "yes" : "no") << '\n';
+        log << "Temporal supersampling: " << (job.settings.temporalSupersampling ? "yes" : "no") << '\n';
+        log << "Temporal samples: " << job.settings.temporalSampleCount << '\n';
+        log << "Motion blur: " << (job.settings.motionBlur ? "yes" : "no") << '\n';
+        log << "Motion samples: " << job.settings.motionBlurSampleCount << '\n';
+        log << "Motion shutter angle: " << job.settings.motionBlurShutterAngleDegrees << '\n';
     }
     log << "Eye-Dome Lighting: " << (job.exportEyeDomeLightingEnabled ? "yes" : "no") << '\n';
     log << "Visible LiDAR export layers: " << job.exportPointCloudLayers.size() << '\n';
@@ -14834,6 +17950,21 @@ std::string WriteExportLog(
     log << "GPU capture average: " << FormatDurationForLog(averageCaptureDuration) << '\n';
     log << "GPU capture min: " << FormatDurationForLog(job.exportLog.gpuCaptureMin) << '\n';
     log << "GPU capture max: " << FormatDurationForLog(job.exportLog.gpuCaptureMax) << '\n';
+    log << "GPU sample count: " << job.exportLog.gpuSampleCount << '\n';
+    log << "GPU sample total: " << FormatDurationForLog(job.exportLog.gpuSampleTotal) << '\n';
+    log << "GPU sample average: " << FormatDurationForLog(averageGpuSampleDuration) << '\n';
+    log << "GPU sample max: " << FormatDurationForLog(job.exportLog.gpuSampleMax) << '\n';
+    log << "Readback count: " << job.exportLog.readbackCount << '\n';
+    log << "Readback total: " << FormatDurationForLog(job.exportLog.readbackTotal) << '\n';
+    log << "Readback average: " << FormatDurationForLog(averageReadbackDuration) << '\n';
+    log << "Readback max: " << FormatDurationForLog(job.exportLog.readbackMax) << '\n';
+    log << "Post-process count: " << job.exportLog.postProcessCount << '\n';
+    log << "Post-process total: " << FormatDurationForLog(job.exportLog.postProcessTotal) << '\n';
+    log << "Post-process average: " << FormatDurationForLog(averagePostProcessDuration) << '\n';
+    log << "Post-process max: " << FormatDurationForLog(job.exportLog.postProcessMax) << '\n';
+    log << "Writer wait total: " << FormatDurationForLog(job.exportLog.writerWaitTotal) << '\n';
+    log << "Writer wait max: " << FormatDurationForLog(job.exportLog.writerWaitMax) << '\n';
+    log << "Writer wait events: " << job.exportLog.writerWaitCount << '\n';
     log << "Peak writer queue frames: " << job.exportLog.peakQueuedFrames << '\n';
     log << '\n';
 
@@ -14842,9 +17973,9 @@ std::string WriteExportLog(
     log << "Process resident at finish: " << FormatByteCount(job.exportLog.endResidentMemoryBytes) << '\n';
     log << "Peak sampled process resident: " << FormatByteCount(job.exportLog.peakResidentMemoryBytes) << '\n';
     log << "GPU readback frame buffer: " << FormatByteCount(readbackBytes) << '\n';
-    if (job.writePreviewMp4) {
-        log << "MP4 supersampled GPU readback frame buffer: " << FormatByteCount(mp4ReadbackBytes) << '\n';
-        log << "MP4 raw RGBA frame bytes: " << FormatByteCount(mp4RawFrameBytes) << '\n';
+    if (job.writePreviewMp4 || job.writeProResMov) {
+        log << "Video supersampled GPU readback frame buffer: " << FormatByteCount(videoReadbackBytes) << '\n';
+        log << "Video raw encoder frame bytes: " << FormatByteCount(videoRawFrameBytes) << '\n';
     }
 
     return {};
@@ -15014,7 +18145,6 @@ void SignalAnimationExportWriterFinish(OfflineRenderJobState* job) {
 }
 
 bool AnimationExportWriterCanAcceptFrame(const OfflineRenderJobState& job) {
-    constexpr std::size_t kMaxQueuedExportFrames = 2U;
     if (job.writerState == nullptr) {
         return false;
     }
@@ -15091,6 +18221,7 @@ void RunAnimationExportWriter(
     std::uint32_t totalFrames,
     std::shared_ptr<AnimationExportWriterState> writerState) {
     FILE* videoPipe = nullptr;
+    const std::string videoLabel{AnimationExportModeLabel(mode)};
     std::string previewVideoWarning = std::move(outputOptions.previewVideoWarning);
     auto appendPreviewVideoWarning = [&](const std::string& warning) {
         if (warning.empty()) {
@@ -15108,30 +18239,41 @@ void RunAnimationExportWriter(
     };
     try {
         bool writesMp4 = outputOptions.writePreviewMp4 && !outputOptions.previewVideoPath.empty();
+        bool writesProRes = outputOptions.writeProResMov && !outputOptions.previewVideoPath.empty();
         const bool writesExr = outputOptions.writeExrStack;
-        if (writesMp4) {
-            const auto command = invisible_places::output::BuildFfmpegRawRgbaCommand(
-                invisible_places::output::DefaultFfmpegExecutablePath(),
-                settings.width,
-                settings.height,
-                settings.framesPerSecond,
-                outputOptions.previewVideoPath);
+        if (writesMp4 || writesProRes) {
+            const auto command =
+                writesProRes
+                    ? BuildFfmpegProResCommandForMode(
+                          mode,
+                          invisible_places::output::DefaultFfmpegExecutablePath(),
+                          settings.width,
+                          settings.height,
+                          settings.framesPerSecond,
+                          outputOptions.previewVideoPath)
+                    : invisible_places::output::BuildFfmpegRawRgbaCommand(
+                          invisible_places::output::DefaultFfmpegExecutablePath(),
+                          settings.width,
+                          settings.height,
+                          settings.framesPerSecond,
+                          outputOptions.previewVideoPath);
             videoPipe = ::popen(command.c_str(), "w");
             if (videoPipe == nullptr) {
                 if (outputOptions.previewMp4Optional) {
                     writesMp4 = false;
-                    appendPreviewVideoWarning("Preview MP4 skipped: failed to start ffmpeg.");
+                    writesProRes = false;
+                    appendPreviewVideoWarning("Preview video skipped: failed to start ffmpeg.");
                 } else {
                     CompleteAnimationExportWriter(
                         writerState,
                         {},
-                        "Failed to start ffmpeg for " + std::string{AnimationExportModeLabel(mode)} + " export.");
+                        "Failed to start ffmpeg for " + videoLabel + " export.");
                     return;
                 }
             }
         }
 
-        if (!writesExr && !writesMp4) {
+        if (!writesExr && !writesMp4 && !writesProRes) {
             if (outputOptions.previewMp4Optional && !previewVideoWarning.empty()) {
                 CompleteAnimationExportWriter(
                     writerState,
@@ -15144,7 +18286,7 @@ void RunAnimationExportWriter(
         }
 
         auto disableOptionalPreviewVideo = [&](const std::string& warning) {
-            if (!writesMp4) {
+            if (!writesMp4 && !writesProRes) {
                 return true;
             }
             if (!outputOptions.previewMp4Optional) {
@@ -15156,16 +18298,19 @@ void RunAnimationExportWriter(
                 appendPreviewVideoWarning(closeError);
             }
             writesMp4 = false;
+            writesProRes = false;
             return true;
         };
 
         auto makeCompletionStatus = [&]() {
             std::string status;
-            if (writesExr && writesMp4) {
-                status = "EXR stack + preview MP4 complete: " + settings.outputDirectory +
+            if (writesExr && (writesMp4 || writesProRes)) {
+                status = "EXR stack + preview video complete: " + settings.outputDirectory +
                          " and " + outputOptions.previewVideoPath.string() + ".";
             } else if (writesExr) {
                 status = "EXR stack complete: " + settings.outputDirectory + ".";
+            } else if (writesProRes) {
+                status = videoLabel + " complete: " + outputOptions.previewVideoPath.string() + ".";
             } else {
                 status = "Fast Preview MP4 complete: " + outputOptions.previewVideoPath.string() + ".";
             }
@@ -15221,15 +18366,30 @@ void RunAnimationExportWriter(
                 }
             }
 
-            if (writesMp4) {
+            if (writesMp4 || writesProRes) {
                 const auto& mp4Image =
                     payload.previewImage.rgbaHalf.empty() ? payload.image : payload.previewImage;
-                const auto frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
-                    mp4Image,
-                    settings.width,
-                    settings.height);
+                const auto frameBytes =
+                    writesProRes
+                        ? AnimationExportPreservesAlpha(mode)
+                              ? invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
+                                    mp4Image,
+                                    settings.width,
+                                    settings.height,
+                                    outputOptions.spatialAntialiasing)
+                              : invisible_places::output::ConvertHalfRgbaToSrgbRgb16OpaqueBlack(
+                                    mp4Image,
+                                    settings.width,
+                                    settings.height,
+                                    outputOptions.spatialAntialiasing)
+                        : invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
+                              mp4Image,
+                              settings.width,
+                              settings.height,
+                              {},
+                              outputOptions.spatialAntialiasing);
                 if (frameBytes.empty()) {
-                    if (disableOptionalPreviewVideo("Preview MP4 skipped: GPU readback did not produce a valid frame.")) {
+                    if (disableOptionalPreviewVideo("Preview video skipped: GPU readback did not produce a valid frame.")) {
                         if (outputPath.empty()) {
                             outputPath = outputOptions.previewVideoPath;
                         }
@@ -15237,14 +18397,14 @@ void RunAnimationExportWriter(
                         CompleteAnimationExportWriter(
                             writerState,
                             {},
-                            "GPU readback did not produce a valid MP4 frame.");
+                            "GPU readback did not produce a valid " + videoLabel + " frame.");
                         return;
                     }
                 }
-                if (writesMp4) {
+                if (writesMp4 || writesProRes) {
                     const auto written = std::fwrite(frameBytes.data(), 1U, frameBytes.size(), videoPipe);
                     if (written != frameBytes.size()) {
-                        if (disableOptionalPreviewVideo("Preview MP4 skipped: failed to write raw frame data to ffmpeg.")) {
+                        if (disableOptionalPreviewVideo("Preview video skipped: failed to write raw frame data to ffmpeg.")) {
                             if (outputPath.empty()) {
                                 outputPath = outputOptions.previewVideoPath;
                             }
@@ -15304,6 +18464,11 @@ void NormalizeAnimationRenderSettings(RenderJobSettings* settings) {
     settings->framesPerSecond = std::max<std::uint32_t>(1U, settings->framesPerSecond);
     settings->stillCameraDurationSeconds = std::clamp(settings->stillCameraDurationSeconds, 0.001F, 3600.0F);
     settings->tileSize = std::max<std::uint32_t>(1U, settings->tileSize);
+    settings->supersampleScale = std::clamp(settings->supersampleScale, 1U, 8U);
+    settings->temporalSampleCount = std::clamp(settings->temporalSampleCount, 1U, 64U);
+    settings->motionBlurSampleCount = std::clamp(settings->motionBlurSampleCount, 1U, 64U);
+    settings->motionBlurShutterAngleDegrees =
+        std::clamp(settings->motionBlurShutterAngleDegrees, 0.0F, 360.0F);
     if (settings->outputDirectory.empty()) {
         settings->outputDirectory = DefaultRenderOutputDirectory(std::filesystem::path{}).string();
     }
@@ -15319,6 +18484,9 @@ bool StartQuickMp4ExportJob(
 
     auto settings = request.settings;
     NormalizeAnimationRenderSettings(&settings);
+    if (!CheckVideoExportMemoryBudget(runtimeState, request.mode, settings)) {
+        return false;
+    }
 
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
@@ -15343,7 +18511,8 @@ bool StartQuickMp4ExportJob(
     const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
     if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
         runtimeState->errorMessage =
-            "Fast MP4 export requires ffmpeg at " + ffmpegPath.string() + ".";
+            std::string{AnimationExportModeLabel(request.mode)} +
+            " export requires ffmpeg at " + ffmpegPath.string() + ".";
         runtimeState->statusMessage.clear();
         return false;
     }
@@ -15352,7 +18521,9 @@ bool StartQuickMp4ExportJob(
     if (!request.videoOutputPath.parent_path().empty()) {
         std::filesystem::create_directories(request.videoOutputPath.parent_path(), createError);
         if (createError) {
-            runtimeState->errorMessage = "Failed to create MP4 output directory: " + createError.message();
+            runtimeState->errorMessage =
+                "Failed to create " + std::string{AnimationExportModeLabel(request.mode)} +
+                " output directory: " + createError.message();
             runtimeState->statusMessage.clear();
             return false;
         }
@@ -15401,13 +18572,13 @@ bool StartQuickMp4ExportJob(
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
     auto writerState = std::make_shared<AnimationExportWriterState>();
     const auto outputOptions = MakeAnimationExportOutputOptions(
-        invisible_places::output::AnimationExportMode::FastPreviewMp4,
+        request.mode,
         settings,
         request.videoOutputPath);
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
-        .mode = invisible_places::output::AnimationExportMode::FastPreviewMp4,
+        .mode = request.mode,
         .settings = settings,
         .frames = std::move(frames),
         .tiles = {},
@@ -15417,8 +18588,10 @@ bool StartQuickMp4ExportJob(
         .videoOutputPath = request.videoOutputPath,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
+        .writeProResMov = outputOptions.writeProResMov,
         .optionalPreviewMp4 = outputOptions.previewMp4Optional,
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
+        .spatialAntialiasing = outputOptions.spatialAntialiasing,
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
@@ -15431,11 +18604,12 @@ bool StartQuickMp4ExportJob(
         .quickMp4BatchIndex = runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
         .quickMp4BatchTotal = runtimeState->animationPanel.quickMp4QueueTotal,
         .animationName = request.animationPath.name,
+        .animationPath = request.animationPath,
         .animationFilePath = request.animationFilePath,
         .exportVisualName = request.visualName,
         .exportLog = MakeExportLogState(
             request.videoOutputPath.parent_path(),
-            invisible_places::output::AnimationExportMode::FastPreviewMp4),
+            request.mode),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
             runtimeState->projectSettings.backgroundColor[1],
@@ -15448,6 +18622,7 @@ bool StartQuickMp4ExportJob(
         .exportPointCloudLayers = std::move(exportPointCloudLayers),
         .writerState = writerState,
     };
+    AcquireExportPowerAssertion(runtimeState);
     runtimeState->offlineRenderJob.worker = std::jthread{
         RunAnimationExportWriter,
         runtimeState->offlineRenderJob.mode,
@@ -15458,7 +18633,7 @@ bool StartQuickMp4ExportJob(
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
     runtimeState->statusMessage =
-        "Encoding Quick MP4 " +
+        "Encoding " + std::string{AnimationExportModeLabel(request.mode)} + " " +
         std::to_string(runtimeState->animationPanel.quickMp4QueueCompleted + 1U) +
         " / " + std::to_string(runtimeState->animationPanel.quickMp4QueueTotal) +
         ": " + request.animationPath.name + " / " + request.visualName + ".";
@@ -15477,7 +18652,7 @@ bool StartNextQueuedQuickMp4Export(
     if (panel.quickMp4Queue.empty()) {
         if (panel.quickMp4QueueTotal > 0) {
             runtimeState->statusMessage =
-                "Quick MP4 batch complete: " +
+                "Video export batch complete: " +
                 std::to_string(panel.quickMp4QueueCompleted) + " exported";
             if (panel.quickMp4QueueSkipped > 0) {
                 runtimeState->statusMessage +=
@@ -15513,6 +18688,21 @@ void StartSelectedQuickMp4Batch(
     panel.quickMp4QueueTotal = 0;
     panel.quickMp4QueueCompleted = 0;
     panel.quickMp4QueueSkipped = 0;
+    EnsureExportPresets(runtimeState);
+    const auto activePreset = ViewedExportPreset(*runtimeState);
+    const auto activeMode = activePreset.mode;
+    panel.exportMode = activeMode;
+    if (!AnimationExportWritesVideo(activeMode)) {
+        runtimeState->errorMessage =
+            std::string{AnimationExportModeLabel(activeMode)} +
+            " is not a saved-animation video preset.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    auto settings = RenderSettingsFromExportPreset(activePreset, runtimeState->renderSettings.outputDirectory);
+    NormalizeAnimationRenderSettings(&settings);
+    runtimeState->renderSettings = settings;
+    const std::string modeLabel{AnimationExportModeLabel(activeMode)};
 
     std::vector<std::filesystem::path> selectedFiles;
     selectedFiles.reserve(panel.availableFiles.size());
@@ -15523,14 +18713,14 @@ void StartSelectedQuickMp4Batch(
     }
 
     if (selectedFiles.empty()) {
-        runtimeState->errorMessage = "Select at least one saved animation for Quick MP4 export.";
+        runtimeState->errorMessage = "Select at least one saved animation for " + modeLabel + " export.";
         runtimeState->statusMessage.clear();
         return;
     }
 
     const auto visualSessionIndex = ResolveVisiblePointCloudLookdevIndex(*runtimeState);
     if (!visualSessionIndex.has_value()) {
-        runtimeState->errorMessage = "Load and show a LiDAR layer with saved visuals before exporting Quick MP4.";
+        runtimeState->errorMessage = "Load and show a LiDAR layer with saved visuals before exporting " + modeLabel + ".";
         runtimeState->statusMessage.clear();
         return;
     }
@@ -15546,7 +18736,7 @@ void StartSelectedQuickMp4Batch(
     const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
     if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
         runtimeState->errorMessage =
-            "Fast MP4 export requires ffmpeg at " + ffmpegPath.string() + ".";
+            modeLabel + " export requires ffmpeg at " + ffmpegPath.string() + ".";
         runtimeState->statusMessage.clear();
         return;
     }
@@ -15576,8 +18766,6 @@ void StartSelectedQuickMp4Batch(
             continue;
         }
 
-        auto settings = RenderSettingsFromAnimationExportSettings(animationPath.exportSettings);
-        NormalizeAnimationRenderSettings(&settings);
         for (const auto& visualName : animationPath.exportVisualNames) {
             const auto* visual = FindExportablePointVisual(visualSession, visualName);
             if (visual == nullptr) {
@@ -15585,14 +18773,17 @@ void StartSelectedQuickMp4Batch(
                 continue;
             }
 
-            const auto outputPath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
+            const auto outputPath = BuildUniqueAnimationVideoOutputPathForMode(
+                activeMode,
                 settings.outputDirectory,
                 animationPath.name,
+                settings,
                 visual->name,
                 reservedOutputPaths);
             reservedOutputPaths.push_back(outputPath);
             panel.quickMp4Queue.push_back(
                 {.animationPath = animationPath,
+                 .mode = activeMode,
                  .settings = settings,
                  .animationFilePath = animationFilePath,
                  .visualName = visual->name,
@@ -15605,7 +18796,7 @@ void StartSelectedQuickMp4Batch(
     panel.quickMp4QueueTotal = panel.quickMp4Queue.size();
     if (panel.quickMp4Queue.empty()) {
         runtimeState->statusMessage =
-            "No Quick MP4 exports were queued. Select at least one saved visual on each animation.";
+            "No " + modeLabel + " exports were queued. Select at least one saved visual on each animation.";
         if (panel.quickMp4QueueSkipped > 0) {
             runtimeState->statusMessage +=
                 " Skipped " + std::to_string(panel.quickMp4QueueSkipped) + " animation/visual entries.";
@@ -15650,8 +18841,10 @@ void StartStillCameraExportCapture(
     const AnimationExportOutputOptions outputOptions{
         .writeExrStack = job.writeExrStack,
         .writePreviewMp4 = job.writePreviewMp4,
+        .writeProResMov = job.writeProResMov,
         .previewMp4Optional = job.optionalPreviewMp4,
         .mp4SupersampleScale = job.mp4SupersampleScale,
+        .spatialAntialiasing = job.spatialAntialiasing,
         .previewVideoPath = job.videoOutputPath,
         .previewVideoWarning = job.previewVideoWarning,
     };
@@ -15756,8 +18949,9 @@ void StartStillCameraExportJob(
         return;
     }
 
-    auto& settings = runtimeState->renderSettings;
+    auto settings = runtimeState->renderSettings;
     NormalizeAnimationRenderSettings(&settings);
+    runtimeState->renderSettings = settings;
 
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting a still-camera render.";
@@ -15766,11 +18960,19 @@ void StartStillCameraExportJob(
     }
 
     const auto mode = runtimeState->cameraPanel.stillExportMode;
+    if (!CheckVideoExportMemoryBudget(runtimeState, mode, settings)) {
+        return;
+    }
+    const auto outputRoot = std::filesystem::path{settings.outputDirectory};
+    if (AnimationExportWritesExr(mode)) {
+        settings.outputDirectory =
+            BuildUniqueAnimationExportDirectory(outputRoot, "StillCamera", mode, settings).string();
+    }
     std::filesystem::path videoOutputPath;
     AnimationExportOutputOptions outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath);
     const bool exrStackPreviewMp4 =
         mode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
-    if (AnimationExportWritesMp4(mode) || exrStackPreviewMp4) {
+    if (AnimationExportWritesVideo(mode) || exrStackPreviewMp4) {
         const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
         const bool ffmpegAvailable = invisible_places::output::FfmpegExecutableAvailable(ffmpegPath);
         if (!ffmpegAvailable && !exrStackPreviewMp4) {
@@ -15782,10 +18984,11 @@ void StartStillCameraExportJob(
             return;
         }
         if (ffmpegAvailable) {
-            videoOutputPath = invisible_places::output::BuildUniqueQuickMp4OutputPath(
-                settings.outputDirectory,
+            videoOutputPath = BuildUniqueAnimationVideoOutputPathForMode(
+                mode,
+                outputRoot,
                 "StillCamera",
-                exrStackPreviewMp4 ? "EXRStackPreview" : "CurrentView");
+                settings);
         }
         outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath, exrStackPreviewMp4);
         if (exrStackPreviewMp4) {
@@ -15840,8 +19043,10 @@ void StartStillCameraExportJob(
         .videoOutputPath = videoOutputPath,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
+        .writeProResMov = outputOptions.writeProResMov,
         .optionalPreviewMp4 = outputOptions.previewMp4Optional,
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
+        .spatialAntialiasing = outputOptions.spatialAntialiasing,
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
@@ -15867,6 +19072,7 @@ void StartStillCameraExportJob(
         .preparingExport = !preparationRequests.empty(),
         .preparationState = preparationState,
     };
+    AcquireExportPowerAssertion(runtimeState);
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
     runtimeState->errorMessage.clear();
@@ -15888,14 +19094,22 @@ void StartAnimationExportJob(
         return;
     }
 
-    if (runtimeState->animationPanel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+    EnsureExportPresets(runtimeState);
+    const auto activePreset = ViewedExportPreset(*runtimeState);
+    const auto activeMode = activePreset.mode;
+    runtimeState->animationPanel.exportMode = activeMode;
+    if (activeMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         runtimeState->errorMessage = "Use Export Selected Quick MP4 for MP4 animation exports.";
         runtimeState->statusMessage.clear();
         return;
     }
 
-    auto& settings = runtimeState->renderSettings;
+    auto settings = RenderSettingsFromExportPreset(activePreset, runtimeState->renderSettings.outputDirectory);
     NormalizeAnimationRenderSettings(&settings);
+    runtimeState->renderSettings = settings;
+    if (!CheckVideoExportMemoryBudget(runtimeState, activeMode, settings)) {
+        return;
+    }
 
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
@@ -15910,8 +19124,31 @@ void StartAnimationExportJob(
         return;
     }
 
+    const auto outputRoot = std::filesystem::path{settings.outputDirectory};
+    const auto animationName = runtimeState->animationPanel.currentPath->name;
+    if (AnimationExportWritesExr(activeMode)) {
+        settings.outputDirectory =
+            BuildUniqueAnimationExportDirectory(outputRoot, animationName, activeMode, settings).string();
+    }
+
     std::filesystem::path videoOutputPath;
-    const bool exportUsesPreviewDensity = runtimeState->animationPanel.exportPreviewDensity;
+    if (AnimationExportWritesProRes(activeMode)) {
+        const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
+        if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
+            runtimeState->errorMessage =
+                std::string{AnimationExportModeLabel(activeMode)} +
+                " export requires ffmpeg at " + ffmpegPath.string() + ".";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        videoOutputPath = BuildUniqueAnimationVideoOutputPathForMode(
+            activeMode,
+            outputRoot,
+            animationName,
+            settings);
+    }
+    const bool exportUsesPreviewDensity =
+        AnimationExportWritesExr(activeMode) && runtimeState->animationPanel.exportPreviewDensity;
     if (viewport != nullptr && exportUsesPreviewDensity) {
         PreparePreviewLodSampleCaches(runtimeState, viewport);
     }
@@ -15943,11 +19180,14 @@ void StartAnimationExportJob(
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
     auto writerState = std::make_shared<AnimationExportWriterState>();
     const auto outputOptions =
-        MakeAnimationExportOutputOptions(runtimeState->animationPanel.exportMode, settings, videoOutputPath);
+        MakeAnimationExportOutputOptions(activeMode, settings, videoOutputPath);
+    const auto logDirectory = videoOutputPath.empty()
+                                  ? std::filesystem::path{settings.outputDirectory}
+                                  : videoOutputPath.parent_path();
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
-        .mode = runtimeState->animationPanel.exportMode,
+        .mode = activeMode,
         .settings = settings,
         .frames = std::move(frames),
         .tiles = {},
@@ -15957,20 +19197,23 @@ void StartAnimationExportJob(
         .videoOutputPath = videoOutputPath,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
+        .writeProResMov = outputOptions.writeProResMov,
         .optionalPreviewMp4 = outputOptions.previewMp4Optional,
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
+        .spatialAntialiasing = outputOptions.spatialAntialiasing,
         .previewVideoWarning = outputOptions.previewVideoWarning,
         .setupViewportWidth = static_cast<std::uint32_t>(std::max(1.0F, setupSize.x)),
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
         .pointCloudRendererMode = exportRendererMode,
         .animationName = runtimeState->animationPanel.currentPath->name,
+        .animationPath = runtimeState->animationPanel.currentPath.value(),
         .animationFilePath = runtimeState->animationPanel.currentFilePath.empty()
                                   ? std::filesystem::path{}
                                   : std::filesystem::path{runtimeState->animationPanel.currentFilePath},
         .exportLog = MakeExportLogState(
-            settings.outputDirectory,
-            runtimeState->animationPanel.exportMode),
+            logDirectory,
+            activeMode),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
             runtimeState->projectSettings.backgroundColor[1],
@@ -15983,6 +19226,7 @@ void StartAnimationExportJob(
         .exportPointCloudLayers = std::move(exportPointCloudLayers),
         .writerState = writerState,
     };
+    AcquireExportPowerAssertion(runtimeState);
     runtimeState->offlineRenderJob.worker = std::jthread{
         RunAnimationExportWriter,
         runtimeState->offlineRenderJob.mode,
@@ -15992,7 +19236,8 @@ void StartAnimationExportJob(
         writerState};
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
-    runtimeState->statusMessage = "Rendering HQ EXR stack on GPU...";
+    runtimeState->statusMessage =
+        "Rendering " + std::string{AnimationExportModeLabel(activeMode)} + " on GPU...";
     runtimeState->errorMessage.clear();
 }
 
@@ -16040,9 +19285,11 @@ void FinishOfflineRenderJob(
         }
     }
 
+    runtimeState->exportPowerAssertion.Reset();
     job.active = false;
     job.cancelRequested = false;
     job.writerFinishRequested = false;
+    job.frameSampleState = {};
     job.preparingExport = false;
     job.preparationState.reset();
     job.writerState.reset();
@@ -16062,6 +19309,7 @@ void RequestOfflineRenderCancellation(OfflineRenderJobState* job) {
     }
 
     job->cancelRequested = true;
+    job->frameSampleState = {};
     if (job->preparationState != nullptr) {
         std::scoped_lock lock(job->preparationState->mutex);
         job->preparationState->cancelRequested = true;
@@ -16119,6 +19367,10 @@ void ProcessOfflineRenderJobStep(
     }
 
     if (job.cancelRequested) {
+        if (job.frameSampleState.gpuSampleInFlight) {
+            viewport->CancelPointCloudExrFrame();
+            job.frameSampleState.gpuSampleInFlight = false;
+        }
         RequestAnimationExportWriterCancellation(&job);
         runtimeState->statusMessage = "Cancelling animation export...";
         return;
@@ -16130,75 +19382,232 @@ void ProcessOfflineRenderJobStep(
         return;
     }
 
-    if (!AnimationExportWriterCanAcceptFrame(job)) {
-        runtimeState->statusMessage =
-            "Animation export writer is saving queued frames (" +
-            std::to_string(job.writtenFrameCount) + " / " +
-            std::to_string(job.frames.size()) + " written).";
-        return;
+    if (!job.frameSampleState.active) {
+        if (!AnimationExportWriterCanAcceptFrame(job)) {
+            BeginExportWriterWait(&job);
+            runtimeState->statusMessage =
+                "Animation export writer is saving queued frames (" +
+                std::to_string(job.writtenFrameCount) + " / " +
+                std::to_string(job.frames.size()) + " written).";
+            return;
+        }
+        EndExportWriterWait(&job);
     }
 
-    const auto elapsed = FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt);
-    runtimeState->statusMessage =
-        ("Capturing " + std::string{AnimationExportCaptureLabel(job.mode)} + " frame ") +
-        std::to_string(job.currentFrame + 1U) +
-        " / " + std::to_string(job.frames.size()) + " on GPU (" + elapsed + ").";
-
     try {
-        const auto renderFrame = [&](std::uint32_t width, std::uint32_t height) {
+        const auto outputFrameIndex = job.settings.startFrame + job.currentFrame;
+        const float framesPerSecond =
+            static_cast<float>(std::max<std::uint32_t>(1U, job.settings.framesPerSecond));
+        const float baseTimeSeconds = static_cast<float>(outputFrameIndex) / framesPerSecond;
+        const float maxSampleTimeSeconds =
+            job.animationPath.has_value()
+                ? invisible_places::camera::AnimationPathDurationSeconds(job.animationPath.value())
+                : static_cast<float>(
+                      job.settings.startFrame +
+                      static_cast<std::uint32_t>(std::max<std::size_t>(1U, job.frames.size()) - 1U)) /
+                      framesPerSecond;
+        auto sampleOffsets = invisible_places::output::BuildExportFrameSampleOffsetsFrames(job.settings);
+        if (sampleOffsets.empty()) {
+            sampleOffsets.push_back(0.0F);
+        }
+        const auto videoScale =
+            (job.writePreviewMp4 || job.writeProResMov)
+                ? std::max<std::uint32_t>(1U, job.mp4SupersampleScale)
+                : 1U;
+        const auto videoWidth = ScaledRenderDimension(job.settings.width, videoScale);
+        const auto videoHeight = ScaledRenderDimension(job.settings.height, videoScale);
+        const bool needsPreviewPass =
+            job.writeExrStack &&
+            (job.writePreviewMp4 || job.writeProResMov) &&
+            videoScale > 1U;
+
+        if (!job.frameSampleState.active ||
+            job.frameSampleState.frameIndex != job.currentFrame ||
+            job.frameSampleState.outputFrameIndex != outputFrameIndex) {
+            job.frameSampleState = {};
+            job.frameSampleState.active = true;
+            job.frameSampleState.frameIndex = job.currentFrame;
+            job.frameSampleState.outputFrameIndex = outputFrameIndex;
+            job.frameSampleState.sampleOffsetsFrames = sampleOffsets;
+            job.frameSampleState.imageSamples.reserve(sampleOffsets.size());
+            if (needsPreviewPass) {
+                job.frameSampleState.previewSamples.reserve(sampleOffsets.size());
+            }
+            job.frameSampleState.startedAt = std::chrono::steady_clock::now();
+        }
+
+        const auto cameraForSampleTime = [&](float sampleTimeSeconds) {
+            if (job.animationPath.has_value() && job.animationPath->keys.size() >= 2U) {
+                if (!job.preparedAnimationPath.has_value()) {
+                    job.preparedAnimationPath =
+                        invisible_places::camera::PrepareAnimationPathEvaluation(job.animationPath.value());
+                }
+                if (job.preparedAnimationPath->valid) {
+                    return invisible_places::camera::EvaluatePreparedAnimationPath(
+                        job.preparedAnimationPath.value(),
+                        sampleTimeSeconds).camera;
+                }
+            }
+            return job.frames[job.currentFrame];
+        };
+        const auto buildFrameRequestAtTime = [&](
+            std::uint32_t width,
+            std::uint32_t height,
+            float sampleTimeSeconds,
+            invisible_places::renderer::core::PointCloudExrReadbackMask readbackMask) {
+            const auto cameraState = cameraForSampleTime(sampleTimeSeconds);
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
-                job.frames[job.currentFrame],
+                cameraState,
                 width,
-                height);
+                height,
+                sampleTimeSeconds);
             if (renderState.pointCloudLayers.empty()) {
                 throw std::runtime_error{"No visible loaded LiDAR layers are available for rendering."};
             }
 
-            const invisible_places::renderer::core::PointCloudExrFrameRequest request{
+            return invisible_places::renderer::core::PointCloudExrFrameRequest{
                 .renderState = renderState,
                 .width = width,
                 .height = height,
                 .previewDensity = job.previewDensity,
+                .readbackMask = readbackMask,
             };
-            invisible_places::output::HalfRgbaExrImage renderedImage =
-                viewport->RenderPointCloudExrFrame(request);
-
-            if (job.exportEyeDomeLightingEnabled &&
-                job.pointCloudRendererMode != PointCloudRendererMode::FastBasic) {
-                invisible_places::output::ApplyEyeDomeLighting(
-                    &renderedImage,
-                    invisible_places::output::EyeDomeLightingSettings{
-                        .enabled = true,
-                        .outlineThicknessPixels = renderState.eyeDomeLightingThickness});
-            }
-            return renderedImage;
         };
 
-        const auto captureStart = std::chrono::steady_clock::now();
-        const auto mp4Scale = job.writePreviewMp4 ? std::max<std::uint32_t>(1U, job.mp4SupersampleScale) : 1U;
-        const auto mp4Width = ScaledRenderDimension(job.settings.width, mp4Scale);
-        const auto mp4Height = ScaledRenderDimension(job.settings.height, mp4Scale);
-        invisible_places::output::HalfRgbaExrImage image;
-        invisible_places::output::HalfRgbaExrImage previewImage;
-        if (job.writeExrStack) {
-            image = renderFrame(job.settings.width, job.settings.height);
-            if (job.writePreviewMp4 && mp4Scale > 1U) {
-                previewImage = renderFrame(mp4Width, mp4Height);
+        auto& sampleState = job.frameSampleState;
+        const auto sampleCount = std::max<std::size_t>(1U, sampleState.sampleOffsetsFrames.size());
+        if (sampleState.nextSampleIndex < sampleCount) {
+            const auto elapsed = FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt);
+            const auto displaySampleIndex = sampleState.nextSampleIndex + 1U;
+            runtimeState->statusMessage =
+                ("Capturing " + std::string{AnimationExportCaptureLabel(job.mode)} + " frame ") +
+                std::to_string(job.currentFrame + 1U) +
+                " / " + std::to_string(job.frames.size()) +
+                ", sample " + std::to_string(displaySampleIndex) +
+                " / " + std::to_string(sampleCount) +
+                (sampleState.previewPassPending ? " preview pass" : "") +
+                " on GPU (" + elapsed + ")." + ExportTimingStatusSuffix(job);
+
+            if (sampleState.gpuSampleInFlight) {
+                const auto status = viewport->PollPointCloudExrFrame();
+                if (status == invisible_places::renderer::core::PointCloudExrFrameStatus::Running) {
+                    return;
+                }
+                if (status != invisible_places::renderer::core::PointCloudExrFrameStatus::Ready) {
+                    throw std::runtime_error{"GPU export sample was not available for completion."};
+                }
+
+                const auto readyAt = std::chrono::steady_clock::now();
+                auto renderedImage = viewport->CompletePointCloudExrFrame();
+                const auto readbackEnd = std::chrono::steady_clock::now();
+                sampleState.lastGpuSampleDuration = readyAt - sampleState.gpuSampleSubmittedAt;
+                sampleState.lastReadbackDuration = readbackEnd - readyAt;
+                RecordExportGpuSampleDuration(&job, sampleState.lastGpuSampleDuration);
+                RecordExportReadbackDuration(&job, sampleState.lastReadbackDuration);
+
+                const auto postStart = std::chrono::steady_clock::now();
+                if (sampleState.gpuSampleEyeDomeLighting) {
+                    invisible_places::output::ApplyEyeDomeLighting(
+                        &renderedImage,
+                        invisible_places::output::EyeDomeLightingSettings{
+                            .enabled = true,
+                            .outlineThicknessPixels = sampleState.gpuSampleEyeDomeLightingThickness});
+                }
+                const auto postEnd = std::chrono::steady_clock::now();
+                sampleState.lastPostProcessDuration = postEnd - postStart;
+                RecordExportPostProcessDuration(&job, sampleState.lastPostProcessDuration);
+
+                if (sampleState.gpuSamplePreviewPass) {
+                    sampleState.previewSamples.push_back(std::move(renderedImage));
+                    sampleState.previewPassPending = false;
+                    ++sampleState.nextSampleIndex;
+                } else {
+                    sampleState.imageSamples.push_back(std::move(renderedImage));
+                    if (needsPreviewPass) {
+                        sampleState.previewPassPending = true;
+                    } else {
+                        ++sampleState.nextSampleIndex;
+                    }
+                }
+                sampleState.gpuSampleInFlight = false;
+                sampleState.gpuSamplePreviewPass = false;
+                sampleState.gpuSampleEyeDomeLighting = false;
+                SampleExportLogMemory(&job);
             }
-        } else {
-            image = renderFrame(mp4Width, mp4Height);
+
+            if (sampleState.nextSampleIndex >= sampleCount && !sampleState.previewPassPending) {
+                // All samples for this frame are ready; fall through to accumulation and writer queueing.
+            } else {
+                const bool previewPass = sampleState.previewPassPending;
+                const auto targetWidth =
+                    previewPass ? videoWidth : (job.writeExrStack ? job.settings.width : videoWidth);
+                const auto targetHeight =
+                    previewPass ? videoHeight : (job.writeExrStack ? job.settings.height : videoHeight);
+                const float offsetFrames = sampleState.sampleOffsetsFrames[sampleState.nextSampleIndex];
+                const float sampleTimeSeconds = std::clamp(
+                    baseTimeSeconds + (offsetFrames / framesPerSecond),
+                    0.0F,
+                    std::max(0.0F, maxSampleTimeSeconds));
+                auto request = buildFrameRequestAtTime(
+                    targetWidth,
+                    targetHeight,
+                    sampleTimeSeconds,
+                    ExportReadbackMaskForPass(job, previewPass));
+                sampleState.gpuSampleEyeDomeLighting = ExportEyeDomeLightingActive(job);
+                sampleState.gpuSampleEyeDomeLightingThickness = request.renderState.eyeDomeLightingThickness;
+                if (!viewport->BeginPointCloudExrFrame(request)) {
+                    runtimeState->statusMessage = "Waiting for GPU export resources...";
+                    return;
+                }
+                sampleState.gpuSampleInFlight = true;
+                sampleState.gpuSamplePreviewPass = previewPass;
+                sampleState.gpuSampleSubmittedAt = std::chrono::steady_clock::now();
+                return;
+            }
         }
 
-        RecordExportGpuCaptureDuration(&job, std::chrono::steady_clock::now() - captureStart);
+        if (!AnimationExportWriterCanAcceptFrame(job)) {
+            BeginExportWriterWait(&job);
+            runtimeState->statusMessage =
+                "Animation export writer is saving queued frames (" +
+                std::to_string(job.writtenFrameCount) + " / " +
+                std::to_string(job.frames.size()) + " written).";
+            return;
+        }
+        EndExportWriterWait(&job);
+
+        auto finalizeSamples = [](std::vector<invisible_places::output::HalfRgbaExrImage>* samples) {
+            if (samples == nullptr || samples->empty()) {
+                return invisible_places::output::HalfRgbaExrImage{};
+            }
+            if (samples->size() == 1U) {
+                return std::move(samples->front());
+            }
+            return invisible_places::output::AverageHalfRgbaFrames(*samples);
+        };
+        auto image = finalizeSamples(&sampleState.imageSamples);
+        if (image.rgbaHalf.empty()) {
+            throw std::runtime_error{"Temporal sample accumulation did not produce a valid frame."};
+        }
+        auto previewImage = finalizeSamples(&sampleState.previewSamples);
+        if (needsPreviewPass && previewImage.rgbaHalf.empty()) {
+            throw std::runtime_error{"Temporal preview sample accumulation did not produce a valid frame."};
+        }
+
+        RecordExportGpuCaptureDuration(&job, std::chrono::steady_clock::now() - sampleState.startedAt);
         SampleExportLogMemory(&job);
-        const auto outputFrameIndex = job.settings.startFrame + job.currentFrame;
         if (!QueueAnimationExportFrame(&job, outputFrameIndex, std::move(image), std::move(previewImage))) {
             FinishOfflineRenderJob(runtimeState, {}, "Animation export writer stopped accepting frames.");
             return;
         }
         ++job.currentFrame;
+        job.frameSampleState = {};
     } catch (const std::exception& error) {
+        if (job.frameSampleState.gpuSampleInFlight) {
+            viewport->CancelPointCloudExrFrame();
+        }
+        job.frameSampleState = {};
         FinishOfflineRenderJob(runtimeState, {}, "GPU animation export failed: " + std::string{error.what()});
         return;
     }
@@ -16215,6 +19624,91 @@ void ProcessOfflineRenderJobStep(
     }
 }
 
+void DrawExportTimingSummary(const OfflineRenderJobState& job) {
+    if (job.frameSampleState.active) {
+        ImGui::Text(
+            "Current frame samples: %zu / %zu",
+            std::min(ExportCompletedSamplePassCount(job), ExportTotalSamplePassCount(job)),
+            ExportTotalSamplePassCount(job));
+        if (job.frameSampleState.gpuSampleInFlight) {
+            const auto inFlightDuration =
+                std::chrono::steady_clock::now() - job.frameSampleState.gpuSampleSubmittedAt;
+            ImGui::TextDisabled(
+                "GPU sample in flight: %s",
+                FormatAdaptiveDuration(inFlightDuration).c_str());
+        }
+        if (job.frameSampleState.lastGpuSampleDuration > std::chrono::steady_clock::duration{}) {
+            ImGui::Text(
+                "Last sample: GPU %s, readback %s, post %s",
+                FormatAdaptiveDuration(job.frameSampleState.lastGpuSampleDuration).c_str(),
+                FormatAdaptiveDuration(job.frameSampleState.lastReadbackDuration).c_str(),
+                FormatAdaptiveDuration(job.frameSampleState.lastPostProcessDuration).c_str());
+        }
+    }
+    const auto average = AverageExportFrameRenderDuration(job);
+    if (average.has_value()) {
+        ImGui::Text("Average render: %s / frame", FormatAdaptiveDuration(average.value()).c_str());
+    } else {
+        ImGui::TextDisabled("Average render: calculating...");
+    }
+    auto drawTimingBucket = [](
+        const char* label,
+        std::chrono::steady_clock::duration total,
+        std::chrono::steady_clock::duration maxDuration,
+        std::uint32_t count) {
+        if (count == 0U) {
+            return;
+        }
+        const auto averageDuration = total / count;
+        ImGui::Text(
+            "%s avg/max: %s / %s",
+            label,
+            FormatAdaptiveDuration(averageDuration).c_str(),
+            FormatAdaptiveDuration(maxDuration).c_str());
+    };
+    drawTimingBucket(
+        "GPU sample",
+        job.exportLog.gpuSampleTotal,
+        job.exportLog.gpuSampleMax,
+        job.exportLog.gpuSampleCount);
+    drawTimingBucket(
+        "Readback",
+        job.exportLog.readbackTotal,
+        job.exportLog.readbackMax,
+        job.exportLog.readbackCount);
+    drawTimingBucket(
+        "Post-process",
+        job.exportLog.postProcessTotal,
+        job.exportLog.postProcessMax,
+        job.exportLog.postProcessCount);
+    if (job.writerState != nullptr) {
+        std::size_t queueDepth = 0;
+        {
+            std::lock_guard<std::mutex> lock{job.writerState->mutex};
+            queueDepth = job.writerState->pendingFrames.size();
+        }
+        ImGui::Text("Writer queue: %zu frame%s", queueDepth, queueDepth == 1U ? "" : "s");
+    }
+    if (job.writerWaitActive) {
+        ImGui::TextDisabled(
+            "Writer wait active: %s",
+            FormatAdaptiveDuration(std::chrono::steady_clock::now() - job.writerWaitStartedAt).c_str());
+    } else if (job.exportLog.writerWaitCount > 0U) {
+        ImGui::Text(
+            "Writer wait total/max: %s / %s (%u events)",
+            FormatAdaptiveDuration(job.exportLog.writerWaitTotal).c_str(),
+            FormatAdaptiveDuration(job.exportLog.writerWaitMax).c_str(),
+            job.exportLog.writerWaitCount);
+    }
+    const auto remaining = RemainingExportRenderDuration(job);
+    if (remaining.has_value()) {
+        ImGui::Text(
+            "ETA: %s remaining (~%s)",
+            FormatAdaptiveDuration(remaining.value()).c_str(),
+            FormatEtaClock(remaining.value()).c_str());
+    }
+}
+
 void DrawAnimationExportSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -16226,18 +19720,139 @@ void DrawAnimationExportSection(
         return;
     }
     auto& panel = runtimeState->animationPanel;
+    EnsureExportPresets(runtimeState);
+    ApplyActiveExportPresetToRenderSettings(runtimeState);
     auto& settings = runtimeState->renderSettings;
-    if (!panel.exportSizeInitialized && viewport != nullptr) {
-        const auto viewportSize = CurrentUiViewportSize(*viewport);
-        settings.width = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.x));
-        settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
-        settings.framesPerSecond = 30U;
+    if (!panel.exportSizeInitialized) {
         panel.exportSizeInitialized = true;
+    }
+    panel.exportMode = ViewedExportPreset(*runtimeState).mode;
+
+    const auto selectExportPreset = [&](std::string_view name, bool keepEdited) {
+        panel.selectedExportPresetName = NormalizeExportPresetName(name);
+        panel.exportPresetNameBuffer =
+            invisible_places::output::BaseExportPresetName(panel.selectedExportPresetName);
+        if (!keepEdited) {
+            panel.editedExportPreset.reset();
+        }
+        ApplyActiveExportPresetToRenderSettings(runtimeState);
+        panel.exportMode = ViewedExportPreset(*runtimeState).mode;
+    };
+
+    const auto selectedPresetName = NormalizeExportPresetName(panel.selectedExportPresetName);
+    if (ImGui::BeginCombo("Export Preset", selectedPresetName.c_str())) {
+        if (panel.editedExportPreset.has_value()) {
+            const auto editedName = NormalizeExportPresetName(panel.editedExportPreset->name);
+            const bool selected = selectedPresetName == editedName;
+            if (ImGui::Selectable(editedName.c_str(), selected)) {
+                selectExportPreset(editedName, true);
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+            ImGui::Separator();
+        }
+        for (const auto& preset : invisible_places::output::BuiltInExportPresets()) {
+            const bool selected = selectedPresetName == NormalizeExportPresetName(preset.name);
+            if (ImGui::Selectable(preset.name.c_str(), selected)) {
+                selectExportPreset(preset.name, false);
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        if (!panel.exportPresets.empty()) {
+            ImGui::Separator();
+        }
+        for (const auto& preset : panel.exportPresets) {
+            const bool selected = selectedPresetName == NormalizeExportPresetName(preset.name);
+            if (ImGui::Selectable(preset.name.c_str(), selected)) {
+                selectExportPreset(preset.name, false);
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    InputTextString("Preset Name", &panel.exportPresetNameBuffer);
+    const auto savePresetAs = [&](std::string_view requestedName) {
+        const auto targetName = NormalizeExportPresetName(requestedName);
+        if (IsProtectedExportPresetName(targetName) ||
+            invisible_places::output::IsEditedExportPresetName(targetName)) {
+            runtimeState->errorMessage =
+                "Protected or temporary export presets must be saved with a new custom name.";
+            runtimeState->statusMessage.clear();
+            return;
+        }
+        auto savedPreset = ViewedExportPreset(*runtimeState);
+        savedPreset.name = targetName;
+        savedPreset.settings = settings;
+        savedPreset.mode = panel.exportMode;
+        SanitizeExportPreset(&savedPreset);
+        if (const auto index = FindExportPresetIndex(panel.exportPresets, targetName); index.has_value()) {
+            panel.exportPresets[index.value()] = savedPreset;
+        } else {
+            panel.exportPresets.push_back(savedPreset);
+        }
+        panel.selectedExportPresetName = targetName;
+        panel.exportPresetNameBuffer = invisible_places::output::BaseExportPresetName(targetName);
+        panel.editedExportPreset.reset();
+        ApplyActiveExportPresetToRenderSettings(runtimeState);
+        runtimeState->statusMessage = "Saved export preset " + targetName + ".";
+        runtimeState->errorMessage.clear();
+    };
+    if (ImGui::Button("Save Export Preset")) {
+        if (panel.editedExportPreset.has_value() &&
+            NormalizeExportPresetName(panel.selectedExportPresetName) ==
+                NormalizeExportPresetName(panel.editedExportPreset->name)) {
+            panel.editedExportPreset->settings = settings;
+            panel.editedExportPreset->mode = panel.exportMode;
+            SanitizeExportPreset(&panel.editedExportPreset.value());
+            runtimeState->statusMessage =
+                "Saved temporary export preset " + panel.editedExportPreset->name + " with the project.";
+            runtimeState->errorMessage.clear();
+        } else if (IsProtectedExportPresetName(panel.selectedExportPresetName)) {
+            runtimeState->errorMessage = "Built-in export presets are protected. Use Rename / Save As.";
+            runtimeState->statusMessage.clear();
+        } else {
+            savePresetAs(panel.selectedExportPresetName);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Rename / Save As")) {
+        savePresetAs(
+            panel.exportPresetNameBuffer.empty()
+                ? invisible_places::output::BaseExportPresetName(panel.selectedExportPresetName)
+                : panel.exportPresetNameBuffer);
+    }
+    if (panel.editedExportPreset.has_value()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Discard Edits")) {
+            panel.selectedExportPresetName =
+                invisible_places::output::BaseExportPresetName(panel.selectedExportPresetName);
+            panel.exportPresetNameBuffer =
+                invisible_places::output::BaseExportPresetName(panel.selectedExportPresetName);
+            panel.editedExportPreset.reset();
+            ApplyActiveExportPresetToRenderSettings(runtimeState);
+            panel.exportMode = ViewedExportPreset(*runtimeState).mode;
+            runtimeState->statusMessage = "Discarded export preset edits.";
+            runtimeState->errorMessage.clear();
+        }
     }
 
     const char* exportModeLabels[] = {
         "Fast Preview MP4",
         "HQ Preview-Density EXR",
+        "ProRes 422 MOV",
+        "ProRes 422 HQ MOV",
+        "ProRes 422 VideoToolbox MOV",
+        "ProRes 422 HQ VideoToolbox MOV",
+        "ProRes 4444 MOV",
+        "ProRes 4444 XQ MOV",
+        "ProRes 4444 VideoToolbox MOV",
+        "ProRes 4444 XQ VideoToolbox MOV",
     };
     int exportModeIndex = 0;
     switch (panel.exportMode) {
@@ -16247,24 +19862,71 @@ void DrawAnimationExportSection(
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             exportModeIndex = 1;
             break;
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+            exportModeIndex = 2;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+            exportModeIndex = 3;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+            exportModeIndex = 4;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+            exportModeIndex = 5;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+            exportModeIndex = 6;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+            exportModeIndex = 7;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            exportModeIndex = 8;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            exportModeIndex = 9;
+            break;
     }
-    if (ImGui::Combo("Export Mode", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
+    if (ImGui::Combo("Preset Mode", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
         const invisible_places::output::AnimationExportMode exportModes[] = {
             invisible_places::output::AnimationExportMode::FastPreviewMp4,
             invisible_places::output::AnimationExportMode::HqPreviewDensityExr,
+            invisible_places::output::AnimationExportMode::ProRes422Mov,
+            invisible_places::output::AnimationExportMode::ProRes422HqMov,
+            invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov,
+            invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov,
+            invisible_places::output::AnimationExportMode::ProRes4444Mov,
+            invisible_places::output::AnimationExportMode::ProRes4444XqMov,
+            invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov,
+            invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov,
         };
-        panel.exportMode = exportModes[std::clamp(exportModeIndex, 0, 1)];
+        auto& preset = EditActiveExportPreset(runtimeState);
+        const auto maxModeIndex = static_cast<int>(IM_ARRAYSIZE(exportModes) - 1);
+        panel.exportMode = exportModes[std::clamp(exportModeIndex, 0, maxModeIndex)];
+        preset.mode = panel.exportMode;
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Fast MP4: full-density camera-path frustum export, sparse-point smoothing, no AOVs.");
+    } else if (AnimationExportWritesProRes(panel.exportMode)) {
+        ImGui::TextDisabled(
+            AnimationExportPreservesAlpha(panel.exportMode)
+                ? "%s: display-referred straight-alpha MOV; filters run before 4K downscale."
+                : "%s: opaque MOV; transparent pixels are composited over black before encoding.",
+            AnimationExportModeLabel(panel.exportMode));
+        if (AnimationExportUsesVideoToolbox(panel.exportMode)) {
+            ImGui::TextDisabled("VideoToolbox uses Apple's encoder and may differ slightly from prores_ks.");
+        }
     } else {
         ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
     }
 
     bool settingsChanged = false;
     settingsChanged |= InputTextString("Output Folder", &settings.outputDirectory);
-    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
-        ImGui::TextDisabled("Quick MP4 names are generated as Animation_Visual.mp4.");
+    if (AnimationExportWritesVideo(panel.exportMode)) {
+        ImGui::TextDisabled(
+            AnimationExportWritesProRes(panel.exportMode)
+                ? "MOV names are generated as Animation_Visual_Format.mov."
+                : "MP4 names are generated as Animation_Visual.mp4.");
     }
 
     int width = static_cast<int>(settings.width);
@@ -16305,10 +19967,68 @@ void DrawAnimationExportSection(
         settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
         settingsChanged = true;
     }
-    if (settingsChanged) {
-        MarkCurrentAnimationExportSettingsDirty(runtimeState);
+
+    int superscale = static_cast<int>(settings.supersampleScale);
+    if (ImGui::InputInt("Superscale", &superscale)) {
+        settings.supersampleScale = static_cast<std::uint32_t>(std::clamp(superscale, 1, 8));
+        settingsChanged = true;
     }
-    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+    settingsChanged |= ImGui::Checkbox("Spatial AA", &settings.spatialAntialiasing);
+    settingsChanged |= ImGui::Checkbox("Temporal Supersampling", &settings.temporalSupersampling);
+    if (settings.temporalSupersampling) {
+        int temporalSamples = static_cast<int>(settings.temporalSampleCount);
+        if (ImGui::InputInt("Temporal Samples", &temporalSamples)) {
+            settings.temporalSampleCount = static_cast<std::uint32_t>(std::clamp(temporalSamples, 1, 64));
+            settingsChanged = true;
+        }
+    }
+    settingsChanged |= ImGui::Checkbox("Motion Blur", &settings.motionBlur);
+    if (settings.motionBlur) {
+        int motionSamples = static_cast<int>(settings.motionBlurSampleCount);
+        if (ImGui::InputInt("Motion Samples", &motionSamples)) {
+            settings.motionBlurSampleCount = static_cast<std::uint32_t>(std::clamp(motionSamples, 1, 64));
+            settingsChanged = true;
+        }
+        if (ImGui::InputFloat("Shutter Angle", &settings.motionBlurShutterAngleDegrees, 1.0F, 15.0F, "%.1f")) {
+            settings.motionBlurShutterAngleDegrees =
+                std::clamp(settings.motionBlurShutterAngleDegrees, 0.0F, 360.0F);
+            settingsChanged = true;
+        }
+    }
+    if (AnimationExportWritesVideo(panel.exportMode)) {
+        ImGui::TextDisabled(
+            "Internal render: %u x %u -> %u x %u.",
+            ScaledRenderDimension(settings.width, settings.supersampleScale),
+            ScaledRenderDimension(settings.height, settings.supersampleScale),
+            settings.width,
+            settings.height);
+    }
+
+    if (panel.currentPath.has_value()) {
+        auto fullRangeSettings = settings;
+        fullRangeSettings.startFrame = 0;
+        fullRangeSettings.endFrame = 0;
+        const auto fullFrameCount = invisible_places::output::AnimationRenderSequenceFrameCount(
+            panel.currentPath.value(),
+            fullRangeSettings);
+        if (fullFrameCount > 0U) {
+            const auto maxFrame = static_cast<std::uint32_t>(fullFrameCount - 1U);
+            if (settings.startFrame > maxFrame) {
+                settings.startFrame = maxFrame;
+                settingsChanged = true;
+            }
+            if (settings.endFrame != 0U && settings.endFrame > maxFrame) {
+                settings.endFrame = maxFrame;
+                settingsChanged = true;
+            }
+        }
+    }
+    if (settingsChanged) {
+        NormalizeAnimationRenderSettings(&settings);
+        MarkCurrentAnimationExportSettingsDirty(runtimeState);
+        panel.exportMode = ViewedExportPreset(*runtimeState).mode;
+    }
+    if (AnimationExportWritesVideo(panel.exportMode)) {
         ImGui::TextDisabled("Point density: full source inside the export frustum; off-camera points are skipped when useful.");
     } else {
         ImGui::SameLine();
@@ -16317,8 +20037,24 @@ void DrawAnimationExportSection(
             ImGui::SetTooltip("Uses the same draw counts and interactive sample buffers as animation playback.");
         }
     }
+    const bool framePreviewDisabled =
+        runtimeState->offlineRenderJob.active ||
+        viewport == nullptr ||
+        !panel.currentPath.has_value();
+    if (framePreviewDisabled) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Render Frame Preview")) {
+        RenderCurrentAnimationFramePreview(runtimeState, viewport);
+    }
+    if (framePreviewDisabled) {
+        ImGui::EndDisabled();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Renders one frame at the current animation position using the active export preset.");
+    }
 
-    if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 &&
+    if (AnimationExportWritesVideo(panel.exportMode) &&
         panel.currentPath.has_value()) {
         ImGui::Spacing();
         ImGui::TextUnformatted("Export Visuals");
@@ -16342,7 +20078,7 @@ void DrawAnimationExportSection(
                 }
             }
             if (exportableVisualCount == 0) {
-                ImGui::TextDisabled("No saved visuals are available for Quick MP4 export.");
+                ImGui::TextDisabled("No saved visuals are available for video export.");
             }
         }
     }
@@ -16355,14 +20091,20 @@ void DrawAnimationExportSection(
         ImGui::TextDisabled("Load or save an animation path to export.");
     }
 
-    const auto previewFrames = BuildCurrentAnimationRenderSequence(*runtimeState, settings);
+    const auto previewFrameCount = panel.currentPath.has_value()
+                                       ? invisible_places::output::AnimationRenderSequenceFrameCount(
+                                             panel.currentPath.value(),
+                                             settings)
+                                       : 0U;
     ImGui::TextDisabled(
         "%s: %zu frames.",
         panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
             ? "MP4"
-            : "EXR stack",
-        previewFrames.size());
-    if (AnimationExportWritesMp4(panel.exportMode) &&
+            : AnimationExportWritesProRes(panel.exportMode)
+                  ? "MOV"
+                  : "EXR stack",
+        previewFrameCount);
+    if (AnimationExportWritesVideo(panel.exportMode) &&
         !invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath())) {
         ImGui::TextDisabled("ffmpeg not found at %s.", invisible_places::output::DefaultFfmpegExecutablePath().string().c_str());
     }
@@ -16370,10 +20112,7 @@ void DrawAnimationExportSection(
     auto& job = runtimeState->offlineRenderJob;
     if (job.active) {
         RefreshAnimationExportWriterProgress(&job);
-        const float frameProgress = job.frames.empty()
-                                        ? 0.0F
-                                        : static_cast<float>(job.writtenFrameCount) /
-                                              static_cast<float>(job.frames.size());
+        const float frameProgress = ExportRenderProgressFraction(job);
         ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
         ImGui::Text(
             "Saved %u / %zu, captured %u, queued %zu",
@@ -16381,13 +20120,15 @@ void DrawAnimationExportSection(
             job.frames.size(),
             std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
             job.pendingFrameCount);
+        DrawExportTimingSummary(job);
         ImGui::TextDisabled(
             runtimeState->pauseLiveViewportDuringExport
                 ? "Live 3D view is paused; export rendering continues."
                 : "Export runs in its own window; the viewport remains editable.");
         if (job.quickMp4BatchJob) {
             ImGui::TextDisabled(
-                "Quick MP4 %zu / %zu: %s",
+                "%s %zu / %zu: %s",
+                AnimationExportModeLabel(job.mode),
                 panel.quickMp4QueueCompleted + 1U,
                 panel.quickMp4QueueTotal,
                 job.exportVisualName.c_str());
@@ -16398,9 +20139,10 @@ void DrawAnimationExportSection(
         if (!job.exportLog.path.empty()) {
             ImGui::TextWrapped("Log: %s", job.exportLog.path.string().c_str());
         }
-        if (job.writePreviewMp4 && job.mp4SupersampleScale > 1U) {
+        if ((job.writePreviewMp4 || job.writeProResMov) && job.mp4SupersampleScale > 1U) {
             ImGui::Text(
-                "MP4 supersample: %ux -> %u x %u",
+                "%s supersample: %ux -> %u x %u",
+                AnimationExportModeLabel(job.mode),
                 job.mp4SupersampleScale,
                 job.settings.width,
                 job.settings.height);
@@ -16416,8 +20158,6 @@ void DrawAnimationExportSection(
         return;
     }
 
-    const bool ffmpegAvailable =
-        invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath());
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Use Export Selected Quick MP4 above for saved animations. Current-view still export is in Camera.");
         EndPanelSection();
@@ -16428,16 +20168,107 @@ void DrawAnimationExportSection(
     if (!exportAvailable) {
         ImGui::BeginDisabled();
     }
-    if (ImGui::Button("Export HQ EXR Stack")) {
+    const char* exportButtonLabel =
+        AnimationExportWritesProRes(panel.exportMode)
+            ? "Export Current ProRes MOV"
+            : "Export HQ EXR Stack";
+    if (ImGui::Button(exportButtonLabel)) {
         StartAnimationExportJob(runtimeState, viewport);
     }
     if (!exportAvailable) {
         ImGui::EndDisabled();
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Writes beauty.RGB, alpha.A, and depth.Z EXRs using the selected point-density mode.");
+        ImGui::SetTooltip(
+            AnimationExportWritesProRes(panel.exportMode)
+                ? AnimationExportPreservesAlpha(panel.exportMode)
+                      ? "Writes a straight-alpha ProRes MOV from the current animation."
+                      : "Writes an opaque ProRes MOV flattened over black from the current animation."
+                : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using the selected point-density mode.");
     }
     EndPanelSection();
+}
+
+void DrawAnimationFramePreviewWindow(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+
+    auto& preview = runtimeState->animationPanel.framePreview;
+    if (preview.closePending) {
+        if (viewport == nullptr) {
+            return;
+        }
+        viewport->ClearImGuiPreviewImageTexture();
+        preview = AnimationFramePreviewState{};
+        return;
+    }
+    if (!preview.open || !preview.texture.Valid()) {
+        return;
+    }
+
+    const auto initialWidth =
+        std::min(1180.0F, static_cast<float>(preview.texture.width) + 32.0F);
+    const auto initialHeight =
+        std::min(820.0F, static_cast<float>(preview.texture.height) + 104.0F);
+    ImGui::SetNextWindowSize(ImVec2{initialWidth, initialHeight}, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2{360.0F, 260.0F}, ImVec2{FLT_MAX, FLT_MAX});
+
+    bool open = preview.open;
+    const std::string title = preview.title.empty() ? std::string{"Frame Preview"} : preview.title;
+    if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
+        if (!preview.summary.empty()) {
+            ImGui::TextWrapped("%s", preview.summary.c_str());
+        }
+
+        const ImVec2 available = ImGui::GetContentRegionAvail();
+        const float controlsHeight = ImGui::GetFrameHeightWithSpacing() * 2.0F + 12.0F;
+        const float maxImageWidth = std::max(120.0F, available.x);
+        const float maxImageHeight = std::max(120.0F, available.y - controlsHeight);
+        const float imageWidth = static_cast<float>(preview.texture.width);
+        const float imageHeight = static_cast<float>(preview.texture.height);
+        const float scale = std::min(
+            1.0F,
+            std::min(maxImageWidth / std::max(1.0F, imageWidth),
+                     maxImageHeight / std::max(1.0F, imageHeight)));
+        const ImVec2 imageSize{
+            std::max(1.0F, imageWidth * scale),
+            std::max(1.0F, imageHeight * scale)};
+
+        const ImVec2 imageTopLeft = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            imageTopLeft,
+            ImVec2{imageTopLeft.x + imageSize.x, imageTopLeft.y + imageSize.y},
+            IM_COL32(0, 0, 0, 255));
+        ImGui::Image(ImTextureRef(preview.texture.textureId), imageSize);
+
+        if (ImGui::Button("Save PNG")) {
+            SaveAnimationFramePreviewPng(runtimeState);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save PNG & Close")) {
+            if (SaveAnimationFramePreviewPng(runtimeState)) {
+                open = false;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close")) {
+            open = false;
+        }
+        if (!preview.saveStatus.empty()) {
+            ImGui::TextWrapped("%s", preview.saveStatus.c_str());
+        }
+    }
+    ImGui::End();
+
+    if (!open) {
+        preview.open = false;
+        preview.closePending = true;
+    } else {
+        preview.open = true;
+    }
 }
 
 void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
@@ -16448,7 +20279,7 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     auto& job = runtimeState->offlineRenderJob;
     RefreshAnimationExportWriterProgress(&job);
     const auto& io = ImGui::GetIO();
-    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize;
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse;
     ImGui::SetNextWindowPos(
         ImVec2{std::max(20.0F, io.DisplaySize.x - 420.0F), 24.0F},
         ImGuiCond_FirstUseEver);
@@ -16458,7 +20289,8 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     ImGui::TextUnformatted(OfflineRenderJobOverlayLabel(job));
     if (job.quickMp4BatchJob) {
         ImGui::Text(
-            "Quick MP4: %zu / %zu",
+            "%s: %zu / %zu",
+            AnimationExportModeLabel(job.mode),
             runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
             runtimeState->animationPanel.quickMp4QueueTotal);
         ImGui::Text("Visual: %s", job.exportVisualName.c_str());
@@ -16483,11 +20315,7 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
         }
     } else {
-        const float frameProgress =
-            job.frames.empty()
-                ? 0.0F
-                : static_cast<float>(job.writtenFrameCount) /
-                      static_cast<float>(job.frames.size());
+        const float frameProgress = ExportRenderProgressFraction(job);
         ImGui::ProgressBar(frameProgress, ImVec2{360.0F, 0.0F});
         ImGui::Text(
             "Captured: %u / %zu",
@@ -16498,15 +20326,17 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
             job.frames.size());
         ImGui::Text("Queued: %zu", job.pendingFrameCount);
+        DrawExportTimingSummary(job);
     }
-        if (job.exportFrustumMask) {
-            ImGui::TextUnformatted("Renderer: GPU frustum mask, full visible density");
-        } else {
-            ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
-        }
-    if (job.writePreviewMp4 && job.mp4SupersampleScale > 1U) {
+    if (job.exportFrustumMask) {
+        ImGui::TextUnformatted("Renderer: GPU frustum mask, full visible density");
+    } else {
+        ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
+    }
+    if ((job.writePreviewMp4 || job.writeProResMov) && job.mp4SupersampleScale > 1U) {
         ImGui::Text(
-            "MP4 supersample: %ux -> %u x %u",
+            "%s supersample: %ux -> %u x %u",
+            AnimationExportModeLabel(job.mode),
             job.mp4SupersampleScale,
             job.settings.width,
             job.settings.height);
@@ -16516,11 +20346,11 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
         FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
     ImGui::TextWrapped(
         "Output: %s",
-        job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4
+        AnimationExportWritesVideo(job.mode)
             ? job.videoOutputPath.string().c_str()
             : job.settings.outputDirectory.c_str());
-    if (job.writePreviewMp4 && !job.videoOutputPath.empty()) {
-        ImGui::TextWrapped("MP4: %s", job.videoOutputPath.string().c_str());
+    if ((job.writePreviewMp4 || job.writeProResMov) && !job.videoOutputPath.empty()) {
+        ImGui::TextWrapped("%s: %s", AnimationExportModeLabel(job.mode), job.videoOutputPath.string().c_str());
     } else if (!job.previewVideoWarning.empty()) {
         ImGui::TextWrapped("%s", job.previewVideoWarning.c_str());
     }
@@ -17357,9 +21187,23 @@ void DrawWaterEmitterOverlay(
         std::isfinite(pathSettings.attractorPosition.x) &&
         std::isfinite(pathSettings.attractorPosition.y) &&
         std::isfinite(pathSettings.attractorPosition.z);
+    const bool dynamicAttractorVisible =
+        runtimeState->water.dynamicMeshFlowSettings.enabled &&
+        std::any_of(
+            runtimeState->water.dynamicMeshFlowSettings.attractors.begin(),
+            runtimeState->water.dynamicMeshFlowSettings.attractors.end(),
+            [](const WaterDynamicMeshAttractor& attractor) {
+                return attractor.enabled &&
+                       std::isfinite(attractor.position.x) &&
+                       std::isfinite(attractor.position.y) &&
+                       std::isfinite(attractor.position.z);
+            });
     if (runtimeState->water.emitters.empty() &&
         !attractorVisible &&
-        !runtimeState->water.pathAttractorPlacementArmed) {
+        !runtimeState->water.pathAttractorPlacementArmed &&
+        !dynamicAttractorVisible &&
+        !runtimeState->water.dynamicMeshAttractorPlacementArmed &&
+        !runtimeState->water.movingDynamicMeshAttractorIndex.has_value()) {
         return;
     }
 
@@ -17373,9 +21217,11 @@ void DrawWaterEmitterOverlay(
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path &&
         !runtimeState->water.placementArmed &&
         !runtimeState->water.pathAttractorPlacementArmed &&
+        !runtimeState->water.dynamicMeshAttractorPlacementArmed &&
         !runtimeState->water.rippleRegionPlacementArmed &&
         !runtimeState->water.fieldRegionPlacementArmed &&
-        !runtimeState->water.movingEmitterIndex.has_value();
+        !runtimeState->water.movingEmitterIndex.has_value() &&
+        !runtimeState->water.movingDynamicMeshAttractorIndex.has_value();
 
     const auto drawAttractorMarker = [&](const invisible_places::io::Float3& point, bool preview) {
         const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
@@ -17405,6 +21251,49 @@ void DrawWaterEmitterOverlay(
         drawList->AddText(labelPosition, line, label.c_str());
     };
 
+    const auto drawMeshAttractorMarker = [&](
+        const invisible_places::io::Float3& point,
+        std::string_view label,
+        bool selected,
+        bool moving,
+        bool preview) {
+        const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
+        if (!projected.has_value()) {
+            return std::optional<ImVec2>{};
+        }
+        const ImVec2 center = projected->screen;
+        const float pulse = moving ? static_cast<float>(0.74 + (0.26 * std::sin(ImGui::GetTime() * 8.0))) : 1.0F;
+        const float radius = preview ? 7.5F : (selected ? 8.5F : 6.2F);
+        const ImU32 fill = preview
+                               ? IM_COL32(255, 210, 78, 190)
+                               : (selected ? IM_COL32(255, 255, 255, 250) : IM_COL32(255, 118, 222, 238));
+        const ImU32 ring = preview ? IM_COL32(255, 255, 214, 245) : IM_COL32(45, 255, 220, 235);
+        drawList->AddCircleFilled(center, (radius + 4.0F) * pulse, IM_COL32(0, 0, 0, preview ? 105 : 145), 30);
+        drawList->AddCircle(center, (radius + 3.0F) * pulse, ring, 30, selected || moving ? 2.5F : 1.8F);
+        drawList->AddCircleFilled(center, radius * 0.48F * pulse, fill, 24);
+        drawList->AddLine(
+            ImVec2{center.x - radius - 5.0F, center.y},
+            ImVec2{center.x + radius + 5.0F, center.y},
+            ring,
+            1.3F);
+        drawList->AddLine(
+            ImVec2{center.x, center.y - radius - 5.0F},
+            ImVec2{center.x, center.y + radius + 5.0F},
+            ring,
+            1.3F);
+        if (selected || moving || preview) {
+            const std::string displayLabel =
+                preview ? "Mesh attractor preview" : (moving ? std::string{label} + "  click new mesh point" : std::string{label});
+            const ImVec2 labelPosition{center.x + 13.0F, center.y - 14.0F};
+            drawList->AddText(
+                ImVec2{labelPosition.x + 1.0F, labelPosition.y + 1.0F},
+                IM_COL32(0, 0, 0, 220),
+                displayLabel.c_str());
+            drawList->AddText(labelPosition, ring, displayLabel.c_str());
+        }
+        return std::optional<ImVec2>{center};
+    };
+
     if (attractorVisible) {
         drawAttractorMarker(pathSettings.attractorPosition, false);
     }
@@ -17416,9 +21305,60 @@ void DrawWaterEmitterOverlay(
             drawAttractorMarker(pivot->point, true);
         }
     }
+	    if ((runtimeState->water.dynamicMeshAttractorPlacementArmed ||
+	         runtimeState->water.movingDynamicMeshAttractorIndex.has_value()) &&
+	        renderViewportHovered &&
+	        !viewport.UiWantsMouseCapture()) {
+	        if (runtimeState->water.dynamicMeshSurfaceCache != nullptr &&
+	            runtimeState->water.dynamicMeshFlowSettings.enabled) {
+	            const auto previewPoint = ProjectScreenRayToDynamicMeshSurface(
+	                *runtimeState,
+	                viewport,
+	                *runtimeState->water.dynamicMeshSurfaceCache,
+	                io.MousePos);
+	            if (previewPoint.has_value()) {
+	                drawMeshAttractorMarker(previewPoint.value(), "Mesh attractor", true, true, true);
+	            }
+	        }
+	    }
 
     std::optional<std::size_t> nearestEmitterIndex;
     float nearestEmitterDistance = 13.0F;
+    std::optional<std::size_t> nearestDynamicMeshAttractorIndex;
+    float nearestDynamicMeshAttractorDistance = 13.0F;
+
+    if (runtimeState->water.dynamicMeshFlowSettings.enabled) {
+        const auto& attractors = runtimeState->water.dynamicMeshFlowSettings.attractors;
+        for (std::size_t index = 0; index < attractors.size(); ++index) {
+            const auto& attractor = attractors[index];
+            const bool selected =
+                runtimeState->water.selectedDynamicMeshAttractorIndex.has_value() &&
+                runtimeState->water.selectedDynamicMeshAttractorIndex.value() == index;
+            if ((!attractor.enabled && !selected) ||
+                !std::isfinite(attractor.position.x) ||
+                !std::isfinite(attractor.position.y) ||
+                !std::isfinite(attractor.position.z)) {
+                continue;
+            }
+            const bool moving =
+                runtimeState->water.movingDynamicMeshAttractorIndex.has_value() &&
+                runtimeState->water.movingDynamicMeshAttractorIndex.value() == index;
+            const std::string markerLabel = attractor.name.empty() ? "Mesh attractor" : attractor.name;
+            const auto markerCenter = drawMeshAttractorMarker(
+                attractor.position,
+                markerLabel,
+                selected,
+                moving,
+                false);
+            if (canPick && markerCenter.has_value()) {
+                const float distance = ScreenDistance(io.MousePos, markerCenter.value());
+                if (distance < nearestDynamicMeshAttractorDistance) {
+                    nearestDynamicMeshAttractorDistance = distance;
+                    nearestDynamicMeshAttractorIndex = index;
+                }
+            }
+        }
+    }
 
     for (std::size_t index = 0; index < runtimeState->water.emitters.size(); ++index) {
         const auto& emitter = runtimeState->water.emitters[index];
@@ -17478,8 +21418,14 @@ void DrawWaterEmitterOverlay(
         }
     }
 
-    if (canPick && nearestEmitterIndex.has_value() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        SelectWaterEmitterInViewport(runtimeState, viewport, nearestEmitterIndex.value());
+    if (canPick && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (nearestEmitterIndex.has_value()) {
+            SelectWaterEmitterInViewport(runtimeState, viewport, nearestEmitterIndex.value());
+        } else if (nearestDynamicMeshAttractorIndex.has_value()) {
+            SelectDynamicMeshAttractorInViewport(runtimeState, viewport, nearestDynamicMeshAttractorIndex.value());
+        } else {
+            return;
+        }
         runtimeState->cameraInteraction.navigationActive = false;
     }
 }
@@ -18550,12 +22496,12 @@ void MoveAnimationKeyPoint(
 }
 
 void DrawAnimationCurveOverlay(
-    const AnimationPath& path,
+    const invisible_places::camera::PreparedAnimationPathEvaluationContext& preparedPath,
     const invisible_places::camera::OrbitCameraMatrices& matrices,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     ImU32 color,
     bool drawCameraCurve) {
-    if (path.keys.size() < 2U) {
+    if (!preparedPath.valid || preparedPath.singleKey) {
         return;
     }
 
@@ -18563,9 +22509,9 @@ void DrawAnimationCurveOverlay(
     constexpr std::uint32_t kSampleCount = 80;
     for (std::uint32_t sampleIndex = 0; sampleIndex <= kSampleCount; ++sampleIndex) {
         const float amount = static_cast<float>(sampleIndex) / static_cast<float>(kSampleCount);
-        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-            path,
-            AnimationDurationSeconds(path) * amount);
+        const auto evaluation = invisible_places::camera::EvaluatePreparedAnimationPath(
+            preparedPath,
+            preparedPath.durationSeconds * amount);
         const auto point = drawCameraCurve
                                ? glm::vec3{
                                      evaluation.camera.position[0],
@@ -18607,8 +22553,9 @@ void DrawAnimationViewportOverlay(
     const ImU32 cameraColor = IM_COL32(80, 160, 255, 230);
     const ImU32 focusColor = IM_COL32(88, 220, 150, 230);
     const ImU32 selectedColor = IM_COL32(255, 232, 128, 255);
-    DrawAnimationCurveOverlay(path, matrices, viewport, cameraColor, true);
-    DrawAnimationCurveOverlay(path, matrices, viewport, focusColor, false);
+    const auto& preparedPath = CachedPreparedAnimationPath(&panel, path);
+    DrawAnimationCurveOverlay(preparedPath, matrices, viewport, cameraColor, true);
+    DrawAnimationCurveOverlay(preparedPath, matrices, viewport, focusColor, false);
 
     const auto& io = ImGui::GetIO();
     if (panel.drag.active) {
@@ -19764,8 +23711,12 @@ bool DrawPointCloudStyleSection(PreviewLayerSession* session) {
     return changed;
 }
 
-void DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
+bool DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
+    if (session == nullptr) {
+        return false;
+    }
     auto& style = session->gsplatStyle;
+    bool changed = false;
 
     ImGui::TextDisabled(
         "Layer controls multiply the per-splat scale and opacity stored in the PLY. "
@@ -19775,38 +23726,42 @@ void DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
     const char* qualityModes[] = {"Fast", "Medium", "Surface Guided", "High"};
     if (ImGui::Combo("Quality", &qualityModeIndex, qualityModes, IM_ARRAYSIZE(qualityModes))) {
         style.qualityMode = static_cast<GaussianSplatQualityMode>(qualityModeIndex);
+        changed = true;
     }
 
     int colorModeIndex = static_cast<int>(style.colorMode);
     const char* colorModes[] = {"Full SH", "DC Only"};
     if (ImGui::Combo("Color Mode", &colorModeIndex, colorModes, IM_ARRAYSIZE(colorModes))) {
         style.colorMode = static_cast<GaussianSplatColorMode>(colorModeIndex);
+        changed = true;
     }
 
     int debugModeIndex = static_cast<int>(style.debugMode);
     const char* debugModes[] = {"Final", "Opacity", "Scale", "Depth", "Layer Tint"};
     if (ImGui::Combo("Debug View", &debugModeIndex, debugModes, IM_ARRAYSIZE(debugModes))) {
         style.debugMode = static_cast<GaussianSplatDebugMode>(debugModeIndex);
+        changed = true;
     }
 
     ImGui::Checkbox("Apply Transform", &style.transformEnabled);
-    ImGui::ColorEdit4("Layer Tint", style.layerTint.data());
-    DrawRangedFloatControl(
+    changed |= ImGui::ColorEdit4("Layer Tint", style.layerTint.data());
+    changed |= DrawRangedFloatControl(
         "Opacity Multiplier",
         &style.opacityMultiplier,
         {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F});
-    DrawRangedFloatControl(
+    changed |= DrawRangedFloatControl(
         "Scale Multiplier",
         &style.scaleMultiplier,
         {.visualMin = 0.1F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.001F});
-    DrawRangedFloatControl(
+    changed |= DrawRangedFloatControl(
         "Exposure",
         &style.exposure,
         {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F});
-    DrawRangedFloatControl(
+    changed |= DrawRangedFloatControl(
         "Saturation",
         &style.saturation,
         {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F});
+    return changed;
 }
 
 void DrawStyleSection(PreviewRuntimeState* runtimeState) {
@@ -19829,8 +23784,10 @@ void DrawStyleSection(PreviewRuntimeState* runtimeState) {
 
     if (session->kind == LayerKind::PointCloud) {
         if (DrawPointCloudStyleSection(session)) {
-            MarkPointVisualEdited(session);
-            SyncScenePointVisualsFromOwner(runtimeState, session);
+            MarkPointVisualEdited(runtimeState, session);
+            if (!IsProjectPointVisualSession(*session)) {
+                SyncScenePointVisualsFromOwner(runtimeState, session);
+            }
             SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
         }
     } else {
@@ -19840,7 +23797,9 @@ void DrawStyleSection(PreviewRuntimeState* runtimeState) {
                 "Rendering as %s while interacting.",
                 GaussianSplatQualityModeLabel(effectiveQuality));
         }
-        DrawGaussianSplatStyleSection(session);
+        if (DrawGaussianSplatStyleSection(session)) {
+            SyncProjectGsplatVisualStyleFromSession(runtimeState, *session);
+        }
     }
     EndPanelSection();
 }
@@ -20472,11 +24431,17 @@ void DrawAnimationSection(
     }
 
     const auto selectedQuickMp4Count = panel.selectedExportFiles.size();
-    const bool exportButtonDisabled = runtimeState->offlineRenderJob.active;
+    const auto selectedBatchMode = ActiveExportMode(runtimeState);
+    const bool selectedBatchModeIsVideo = AnimationExportWritesVideo(selectedBatchMode);
+    const std::string batchButtonLabel =
+        AnimationExportWritesProRes(selectedBatchMode)
+            ? "Export Selected " + std::string{AnimationExportModeLabel(selectedBatchMode)}
+            : "Export Selected Quick MP4";
+    const bool exportButtonDisabled = runtimeState->offlineRenderJob.active || !selectedBatchModeIsVideo;
     if (exportButtonDisabled) {
         ImGui::BeginDisabled();
     }
-    if (ImGui::Button("Export Selected Quick MP4")) {
+    if (ImGui::Button(batchButtonLabel.c_str())) {
         StartSelectedQuickMp4Batch(runtimeState, &viewport);
     }
     if (exportButtonDisabled) {
@@ -20554,9 +24519,7 @@ void DrawAnimationSection(
         setDurationFrames(requestedFrames);
     }
 
-    auto motionStats = invisible_places::camera::MeasureAnimationPathMotion(
-        animationPath,
-        panel.scrubAmount);
+    auto motionStats = CachedAnimationPathMotionStats(&panel, animationPath, panel.scrubAmount);
     ImGui::TextDisabled(
         "World distance: camera %.3f | target %.3f",
         motionStats.cameraDistance,
@@ -20573,9 +24536,7 @@ void DrawAnimationSection(
                 animationPath,
                 invisible_places::camera::AnimationPathMotionTarget::Camera,
                 cameraAverageSpeed));
-            motionStats = invisible_places::camera::MeasureAnimationPathMotion(
-                animationPath,
-                panel.scrubAmount);
+            motionStats = CachedAnimationPathMotionStats(&panel, animationPath, panel.scrubAmount);
         }
     }
     if (!cameraSpeedAvailable) {
@@ -20593,9 +24554,7 @@ void DrawAnimationSection(
                 animationPath,
                 invisible_places::camera::AnimationPathMotionTarget::Target,
                 targetAverageSpeed));
-            motionStats = invisible_places::camera::MeasureAnimationPathMotion(
-                animationPath,
-                panel.scrubAmount);
+            motionStats = CachedAnimationPathMotionStats(&panel, animationPath, panel.scrubAmount);
         }
     }
     if (!targetSpeedAvailable) {
@@ -20645,9 +24604,10 @@ void DrawAnimationSection(
         depthOfFieldChanged = true;
     }
 
-    const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-        animationPath,
-        AnimationDurationSeconds(animationPath) * std::clamp(panel.scrubAmount, 0.0F, 1.0F));
+    const auto& preparedAnimationPath = CachedPreparedAnimationPath(&panel, animationPath);
+    const auto evaluation = invisible_places::camera::EvaluatePreparedAnimationPath(
+        preparedAnimationPath,
+        preparedAnimationPath.durationSeconds * std::clamp(panel.scrubAmount, 0.0F, 1.0F));
     ImGui::TextDisabled("Focus distance: %.3f", evaluation.focusDistance);
     if (depthOfFieldPreviewChanged || (depthOfFieldChanged && panel.liveApply)) {
         ApplyAnimationScrub(runtimeState);
@@ -20658,9 +24618,7 @@ void DrawAnimationSection(
         &panel.scrubAmount,
         {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
     if (scrubChanged) {
-        motionStats = invisible_places::camera::MeasureAnimationPathMotion(
-            animationPath,
-            panel.scrubAmount);
+        motionStats = CachedAnimationPathMotionStats(&panel, animationPath, panel.scrubAmount);
     }
     ImGui::TextDisabled(
         "At position: camera %.3f/s | target %.3f/s",
@@ -20916,7 +24874,6 @@ void DrawProjectSection(
 
     InputTextString("Project File", &runtimeState->persistence.projectFilePath);
     if (ImGui::Button("Save Project")) {
-        ConsolidateScenePointVisuals(runtimeState);
         const auto document = BuildProjectDocument(*runtimeState);
         std::string errorMessage;
         if (invisible_places::serialization::SaveProjectDocument(
@@ -20997,8 +24954,10 @@ void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* s
         } else {
             session->pointStyle = presetDocument->style;
             SanitizePointCloudStyle(session);
-            MarkPointVisualEdited(session);
-            SyncScenePointVisualsFromOwner(runtimeState, session);
+            MarkPointVisualEdited(runtimeState, session);
+            if (!IsProjectPointVisualSession(*session)) {
+                SyncScenePointVisualsFromOwner(runtimeState, session);
+            }
             SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
             runtimeState->statusMessage =
                 "Loaded point style preset from " + runtimeState->persistence.pointStylePresetPath + ".";
@@ -21063,6 +25022,70 @@ PreviewLayerSession* DrawLoadedPointCloudLookdevSelector(PreviewRuntimeState* ru
 
 void DrawSavedPointVisualSelector(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
     if (runtimeState == nullptr || session == nullptr || session->kind != LayerKind::PointCloud) {
+        return;
+    }
+
+    if (IsProjectPointVisualSession(*session)) {
+        EnsureProjectPointVisuals(runtimeState);
+        ApplyProjectPointVisualToSession(runtimeState, session);
+        const auto selectedName = NormalizePointVisualName(session->selectedPointVisualName);
+        if (ImGui::BeginCombo("Saved Visuals", selectedName.c_str())) {
+            for (const auto& visual : runtimeState->pointVisualLibrary.pointVisuals) {
+                const std::string visualName = visual.name;
+                const bool selected = NormalizePointVisualName(visualName) == selectedName;
+                if (ImGui::Selectable(visualName.c_str(), selected)) {
+                    const auto warning = SelectProjectPointVisualForScene(runtimeState, *session, visualName);
+                    runtimeState->statusMessage = "Loaded project visual " + visualName + ".";
+                    UpdateProjectVisualFieldBindingWarning(runtimeState, warning);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            if (!runtimeState->pointVisualLibrary.sceneVisualStates.empty()) {
+                ImGui::Separator();
+                for (const auto& state : runtimeState->pointVisualLibrary.sceneVisualStates) {
+                    const auto& visual = state.visual;
+                    const bool selected = NormalizePointVisualName(visual.name) == selectedName;
+                    if (ImGui::Selectable(visual.name.c_str(), selected)) {
+                        const auto warning = SelectProjectPointVisualForScene(runtimeState, *session, visual.name);
+                        runtimeState->statusMessage = "Loaded scene visual " + visual.name + ".";
+                        UpdateProjectVisualFieldBindingWarning(runtimeState, warning);
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        InputTextString("Visual Name", &runtimeState->pointVisualLibrary.pointVisualNameBuffer);
+        session->pointVisualNameBuffer = runtimeState->pointVisualLibrary.pointVisualNameBuffer;
+        if (ImGui::Button("Save Visual")) {
+            SaveCurrentPointVisual(runtimeState, session);
+        }
+        if (const auto stateIndex = FindScenePointVisualStateByNameIndex(
+                runtimeState->pointVisualLibrary,
+                session->selectedPointVisualName);
+            stateIndex.has_value()) {
+            ImGui::SameLine();
+            const auto& state = runtimeState->pointVisualLibrary.sceneVisualStates[stateIndex.value()];
+            const bool activeSceneVisual = ProjectVisualSceneKey(*session) == state.sceneGroupName;
+            if (activeSceneVisual) {
+                if (ImGui::Button("Delete Scene Visual")) {
+                    DeleteCurrentScenePointVisual(runtimeState, session);
+                    return;
+                }
+                ImGui::SameLine();
+            }
+            ImGui::TextDisabled(
+                activeSceneVisual ? "Editing %s" : "Viewing %s",
+                BaseNameFromProjectPointVisualName(
+                    runtimeState->pointVisualLibrary,
+                    session->selectedPointVisualName)
+                    .c_str());
+        }
         return;
     }
 
@@ -21416,8 +25439,10 @@ void DrawVisualsPanel(
 
     DrawWaterEffectStackVisualsSection(runtimeState, viewport, session);
     if (DrawPointCloudStyleSection(session)) {
-        MarkPointVisualEdited(session);
-        SyncScenePointVisualsFromOwner(runtimeState, session);
+        MarkPointVisualEdited(runtimeState, session);
+        if (!IsProjectPointVisualSession(*session)) {
+            SyncScenePointVisualsFromOwner(runtimeState, session);
+        }
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
     }
     DrawPresetSection(runtimeState, session);
@@ -21436,7 +25461,9 @@ void DrawGsplatPanel(
                 "Rendering as %s while navigating.",
                 GaussianSplatQualityModeLabel(effectiveQuality));
         }
-        DrawGaussianSplatStyleSection(session);
+        if (DrawGaussianSplatStyleSection(session)) {
+            SyncProjectGsplatVisualStyleFromSession(runtimeState, *session);
+        }
         } else {
         ImGui::TextUnformatted("Select and load a gSplat layer to edit its visual settings.");
         }
@@ -21712,7 +25739,11 @@ void DrawWaterRipplesPanel(
         ImGui::SameLine();
         if (ImGui::Button(water.rippleRegionPlacementArmed ? "Stop Adding Vertices" : "Add Vertices")) {
             const bool wasPlacementArmed = water.rippleRegionPlacementArmed;
-            if (!wasPlacementArmed && (water.fieldRegionPlacementArmed || water.pathAttractorPlacementArmed)) {
+            if (!wasPlacementArmed &&
+                (water.fieldRegionPlacementArmed ||
+                 water.pathAttractorPlacementArmed ||
+                 water.dynamicMeshAttractorPlacementArmed ||
+                 water.movingDynamicMeshAttractorIndex.has_value())) {
                 DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
             }
             water.rippleRegionPlacementArmed = !water.rippleRegionPlacementArmed;
@@ -21720,6 +25751,8 @@ void DrawWaterRipplesPanel(
             water.movingEmitterIndex.reset();
             water.fieldRegionPlacementArmed = false;
             water.pathAttractorPlacementArmed = false;
+            water.dynamicMeshAttractorPlacementArmed = false;
+            water.movingDynamicMeshAttractorIndex.reset();
             runtimeState->statusMessage = water.rippleRegionPlacementArmed
                                               ? "Click LiDAR points to add ripple boundary vertices."
                                               : "Ripple vertex placement stopped; selecting region points.";
@@ -22065,7 +26098,11 @@ void DrawWaterFieldPanel(
         }
         if (ImGui::Button(water.fieldRegionPlacementArmed ? "Stop Field Vertices" : "Add Field Vertices")) {
             const bool wasPlacementArmed = water.fieldRegionPlacementArmed;
-            if (!wasPlacementArmed && (water.rippleRegionPlacementArmed || water.pathAttractorPlacementArmed)) {
+            if (!wasPlacementArmed &&
+                (water.rippleRegionPlacementArmed ||
+                 water.pathAttractorPlacementArmed ||
+                 water.dynamicMeshAttractorPlacementArmed ||
+                 water.movingDynamicMeshAttractorIndex.has_value())) {
                 DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
             }
             water.fieldRegionPlacementArmed = !water.fieldRegionPlacementArmed;
@@ -22073,6 +26110,8 @@ void DrawWaterFieldPanel(
             water.movingEmitterIndex.reset();
             water.rippleRegionPlacementArmed = false;
             water.pathAttractorPlacementArmed = false;
+            water.dynamicMeshAttractorPlacementArmed = false;
+            water.movingDynamicMeshAttractorIndex.reset();
             runtimeState->statusMessage = water.fieldRegionPlacementArmed
                                               ? "Click LiDAR points to add Field region boundary vertices."
                                               : "Field region vertex placement stopped; selecting region points.";
@@ -22376,6 +26415,8 @@ void DrawWaterSourceList(
                     DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
                     water.movingEmitterIndex = index;
                     water.placementArmed = false;
+                    water.dynamicMeshAttractorPlacementArmed = false;
+                    water.movingDynamicMeshAttractorIndex.reset();
                     water.rippleRegionPlacementArmed = false;
                     SelectWaterEmitterInViewport(runtimeState, *viewport, index);
                     runtimeState->statusMessage = "Click the point-cloud viewport to move " + emitter.name + ".";
@@ -22388,6 +26429,7 @@ void DrawWaterSourceList(
             }
             if (emitterChanged) {
                 MarkWaterPathDirty(runtimeState, emitter.id);
+                RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
             }
         }
         ImGui::Separator();
@@ -22422,6 +26464,7 @@ void DrawWaterSourceList(
         }
         MarkWaterPathDirty(runtimeState, deletedEmitterId);
         ValidateWaterSourceSettingLinks(runtimeState);
+        RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
     }
 
     EndPanelSection();
@@ -22834,61 +26877,129 @@ std::vector<invisible_places::io::ScalarFieldStats> WaterTrailScalarFieldsForUi(
     return fields;
 }
 
+bool WaterTrailProfileNamesMatchForLiveVisuals(
+    std::string_view sessionProfileName,
+    std::string_view editedProfileName) {
+    const auto sessionName = NormalizeWaterProfileName(sessionProfileName);
+    const auto editedName = NormalizeWaterProfileName(editedProfileName);
+    return sessionName == editedName ||
+           BaseWaterProfileName(sessionName) == BaseWaterProfileName(editedName);
+}
+
+bool WaterGeneratedTrailSessionMatchesLiveVisualTarget(
+    const PreviewLayerSession& session,
+    const SavedWaterTrailProfileState& profile,
+    bool dynamicMesh) {
+    if (session.kind != LayerKind::PointCloud) {
+        return false;
+    }
+    const auto stem = session.sourcePath.stem().string();
+    const bool matchingLayerType = dynamicMesh
+                                       ? IsGeneratedWaterDynamicMeshTrailOverlayStem(stem)
+                                       : IsGeneratedWaterFlowTrailOverlayStem(stem);
+    return matchingLayerType &&
+           WaterTrailProfileNamesMatchForLiveVisuals(session.selectedPointVisualName, profile.name);
+}
+
+std::size_t ApplyWaterTrailLiveVisualProfile(
+    PreviewRuntimeState* runtimeState,
+    const SavedWaterTrailProfileState& profile,
+    bool dynamicMesh) {
+    if (runtimeState == nullptr) {
+        return 0U;
+    }
+
+    std::size_t updatedCount = 0U;
+    const auto profileName = NormalizeWaterProfileName(profile.name);
+    const auto liveStyle = MakeWaterTrailSessionStyle(profile.style, profile.geometry);
+    for (auto& session : runtimeState->sessions) {
+        if (!WaterGeneratedTrailSessionMatchesLiveVisualTarget(session, profile, dynamicMesh)) {
+            continue;
+        }
+
+        session.pointStyle = liveStyle;
+        session.selectedPointVisualName = profileName;
+        session.pointVisualNameBuffer = BaseWaterProfileName(profileName);
+        EnsurePointVisuals(&session);
+        UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+        ++updatedCount;
+    }
+    return updatedCount;
+}
+
 void DrawWaterTrailStyleEditor(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     SavedWaterTrailProfileState profile) {
     auto& water = runtimeState->water;
-    bool geometryChanged = false;
-    bool simpleGeometryChanged = false;
+    const auto previousGeometry = profile.geometry;
+    bool generationChanged = false;
+    bool generationRefreshRequested = false;
+    bool visualChanged = false;
     const auto trailTooltip = [](const char* text) {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("%s", text);
         }
     };
-    simpleGeometryChanged |= ImGui::SliderFloat(
+    if (ImGui::SliderFloat(
         "Trail Length",
         &profile.geometry.trailLengthMeters,
         0.03F,
         5.0F,
         "%.2f m",
-        ImGuiSliderFlags_Logarithmic);
+        ImGuiSliderFlags_Logarithmic)) {
+        profile.geometry =
+            invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
+        generationChanged = true;
+        visualChanged = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        generationChanged = true;
+        generationRefreshRequested = true;
+    }
     trailTooltip("Total length of each generated flow trail along the water path.");
-    simpleGeometryChanged |= ImGui::SliderFloat(
+    if (ImGui::SliderFloat(
         "Trail Width",
         &profile.geometry.widthMeters,
         0.001F,
         0.08F,
         "%.3f m",
-        ImGuiSliderFlags_Logarithmic);
-    trailTooltip("Rendered width of the moving flow trail.");
-    if (simpleGeometryChanged) {
-        profile.geometry =
-            invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
-        geometryChanged = true;
+        ImGuiSliderFlags_Logarithmic)) {
+        visualChanged = true;
     }
+    trailTooltip("Rendered width of the moving flow trail.");
     if (ImGui::TreeNode("Advanced Trail Controls")) {
         if (ImGui::Button("Auto Fit")) {
             profile.geometry =
                 invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
-            geometryChanged = true;
+            generationChanged = true;
+            generationRefreshRequested = true;
+            visualChanged = true;
         }
         trailTooltip("Derive dense spacing and overlapping streaks from Trail Length and Trail Width.");
-        geometryChanged |= ImGui::SliderFloat(
+        if (ImGui::SliderFloat(
             "Point Spacing",
             &profile.geometry.pointSpacingMeters,
             0.002F,
             0.20F,
             "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
+            ImGuiSliderFlags_Logarithmic)) {
+            generationChanged = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            generationChanged = true;
+            generationRefreshRequested = true;
+        }
         trailTooltip("Distance between generated trail samples.");
-        geometryChanged |= ImGui::SliderFloat(
+        if (ImGui::SliderFloat(
             "Streak Length",
             &profile.geometry.streakLengthMeters,
             0.002F,
             1.0F,
             "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
+            ImGuiSliderFlags_Logarithmic)) {
+            visualChanged = true;
+        }
         trailTooltip("Rendered dash length for each trail sample.");
         ImGui::TreePop();
     }
@@ -22897,6 +27008,9 @@ void DrawWaterTrailStyleEditor(
     profile.geometry.widthMeters = std::clamp(profile.geometry.widthMeters, 0.0005F, 1.0F);
     profile.geometry.streakLengthMeters =
         std::max(profile.geometry.widthMeters, std::clamp(profile.geometry.streakLengthMeters, 0.001F, 5.0F));
+    visualChanged |= invisible_places::water::WaterTrailGeometryLiveVisualOnlyEdit(previousGeometry, profile.geometry);
+    generationChanged |=
+        !invisible_places::water::WaterTrailGeometryGenerationInputsEqual(previousGeometry, profile.geometry);
 
     PreviewLayerSession editSession;
     editSession.kind = LayerKind::PointCloud;
@@ -22920,13 +27034,222 @@ void DrawWaterTrailStyleEditor(
          .hardMax = 1.0F});
     styleChanged |= DrawPointCloudEmissionSection(&editSession);
 
-    if (geometryChanged || styleChanged) {
+    if (generationChanged || visualChanged || styleChanged) {
         const auto editedName = EditedWaterProfileName(water.selectedTrailProfileName);
         water.selectedTrailProfileName = editedName;
         water.trailProfileNameBuffer = BaseWaterProfileName(editedName);
-        water.editedTrailProfile =
-            MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
-        RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+        auto editedProfile = MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
+        water.editedTrailProfile = editedProfile;
+        if (generationRefreshRequested) {
+            RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+        } else if (visualChanged || styleChanged) {
+            const auto updatedCount = ApplyWaterTrailLiveVisualProfile(runtimeState, editedProfile, false);
+            if (updatedCount > 0U) {
+                runtimeState->statusMessage = "Water trail visuals updated without rebuilding trails.";
+                runtimeState->errorMessage.clear();
+            }
+        }
+    }
+}
+
+void DrawWaterDynamicMeshTrailProfileSelector(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    auto& water = runtimeState->water;
+    auto& settings = water.dynamicMeshFlowSettings;
+    const auto selectedName = NormalizeWaterProfileName(settings.trailProfileName);
+    const bool hadEditedProfile = water.editedDynamicMeshTrailProfile.has_value();
+    if (ImGui::BeginCombo("Mesh Trail Profile", selectedName.c_str())) {
+        if (water.editedDynamicMeshTrailProfile.has_value()) {
+            ImGui::Selectable(selectedName.c_str(), true);
+            ImGui::Separator();
+        }
+        auto option = [&](std::string_view name) {
+            const auto normalized = NormalizeWaterProfileName(name);
+            const bool selected = NormalizeWaterProfileName(settings.trailProfileName) == normalized;
+            if (ImGui::Selectable(normalized.c_str(), selected)) {
+                settings.trailProfileName = normalized;
+                water.dynamicMeshTrailProfileNameBuffer = BaseWaterProfileName(normalized);
+                water.editedDynamicMeshTrailProfile.reset();
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        };
+        option(kWaterProfileDefaultName);
+        for (const auto name : kBuiltInWaterTrailProfileNames) {
+            option(name);
+        }
+        if (!water.trailProfiles.empty()) {
+            ImGui::Separator();
+        }
+        for (const auto& profileState : water.trailProfiles) {
+            option(profileState.name);
+        }
+        ImGui::EndCombo();
+    }
+    if (selectedName != NormalizeWaterProfileName(settings.trailProfileName) ||
+        hadEditedProfile != water.editedDynamicMeshTrailProfile.has_value()) {
+        RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+    }
+
+    InputTextString("Mesh Trail Name", &water.dynamicMeshTrailProfileNameBuffer);
+    const auto currentProfile = ViewedDynamicMeshWaterTrailProfile(*runtimeState);
+    if (ImGui::Button("Save Mesh Trail Profile")) {
+        const auto targetName = NormalizeWaterProfileName(
+            water.dynamicMeshTrailProfileNameBuffer.empty()
+                ? BaseWaterProfileName(settings.trailProfileName)
+                : water.dynamicMeshTrailProfileNameBuffer);
+        if (IsProtectedWaterTrailProfileName(*runtimeState, targetName)) {
+            runtimeState->errorMessage = "Protected Trail presets must be saved with a new custom name.";
+            runtimeState->statusMessage.clear();
+        } else if (targetName == kWaterProfileDefaultName) {
+            water.defaultTrailGeometry = currentProfile.geometry;
+            water.defaultPointVisualStyle = currentProfile.style;
+            settings.trailProfileName = std::string{kWaterProfileDefaultName};
+            water.editedDynamicMeshTrailProfile.reset();
+            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+            runtimeState->statusMessage = "Saved Default mesh trail profile.";
+            runtimeState->errorMessage.clear();
+        } else {
+            const auto savedProfile = MakeWaterTrailProfile(targetName, currentProfile.geometry, currentProfile.style);
+            if (const auto index = FindWaterTrailProfileIndex(water, targetName); index.has_value()) {
+                water.trailProfiles[index.value()] = savedProfile;
+            } else {
+                water.trailProfiles.push_back(savedProfile);
+            }
+            settings.trailProfileName = targetName;
+            water.dynamicMeshTrailProfileNameBuffer = BaseWaterProfileName(targetName);
+            water.editedDynamicMeshTrailProfile.reset();
+            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+            runtimeState->statusMessage = "Saved mesh trail profile " + targetName + ".";
+            runtimeState->errorMessage.clear();
+        }
+    }
+    if (water.editedDynamicMeshTrailProfile.has_value()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Discard Mesh Trail Edits")) {
+            settings.trailProfileName = UneditedWaterProfileName(settings.trailProfileName);
+            water.dynamicMeshTrailProfileNameBuffer = BaseWaterProfileName(settings.trailProfileName);
+            water.editedDynamicMeshTrailProfile.reset();
+            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+        }
+    }
+}
+
+void DrawWaterDynamicMeshTrailStyleEditor(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    SavedWaterTrailProfileState profile) {
+    auto& water = runtimeState->water;
+    auto& settings = water.dynamicMeshFlowSettings;
+    const auto previousGeometry = profile.geometry;
+    bool generationChanged = false;
+    bool generationRefreshRequested = false;
+    bool visualChanged = false;
+    if (ImGui::SliderFloat(
+        "Mesh Trail Length",
+        &profile.geometry.trailLengthMeters,
+        0.03F,
+        5.0F,
+        "%.2f m",
+        ImGuiSliderFlags_Logarithmic)) {
+        profile.geometry =
+            invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
+        generationChanged = true;
+        visualChanged = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        generationChanged = true;
+        generationRefreshRequested = true;
+    }
+    if (ImGui::SliderFloat(
+        "Mesh Trail Width",
+        &profile.geometry.widthMeters,
+        0.001F,
+        0.08F,
+        "%.3f m",
+        ImGuiSliderFlags_Logarithmic)) {
+        visualChanged = true;
+    }
+    if (ImGui::TreeNode("Advanced Mesh Trail Controls")) {
+        if (ImGui::Button("Auto Fit Mesh Trail")) {
+            profile.geometry =
+                invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
+            generationChanged = true;
+            generationRefreshRequested = true;
+            visualChanged = true;
+        }
+        if (ImGui::SliderFloat(
+            "Mesh Point Spacing",
+            &profile.geometry.pointSpacingMeters,
+            0.002F,
+            0.20F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic)) {
+            generationChanged = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            generationChanged = true;
+            generationRefreshRequested = true;
+        }
+        if (ImGui::SliderFloat(
+            "Mesh Streak Length",
+            &profile.geometry.streakLengthMeters,
+            0.002F,
+            1.0F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic)) {
+            visualChanged = true;
+        }
+        ImGui::TreePop();
+    }
+    profile.geometry.trailLengthMeters = std::clamp(profile.geometry.trailLengthMeters, 0.001F, 50.0F);
+    profile.geometry.pointSpacingMeters = std::clamp(profile.geometry.pointSpacingMeters, 0.001F, 10.0F);
+    profile.geometry.widthMeters = std::clamp(profile.geometry.widthMeters, 0.0005F, 1.0F);
+    profile.geometry.streakLengthMeters =
+        std::max(profile.geometry.widthMeters, std::clamp(profile.geometry.streakLengthMeters, 0.001F, 5.0F));
+    visualChanged |= invisible_places::water::WaterTrailGeometryLiveVisualOnlyEdit(previousGeometry, profile.geometry);
+    generationChanged |=
+        !invisible_places::water::WaterTrailGeometryGenerationInputsEqual(previousGeometry, profile.geometry);
+
+    PreviewLayerSession editSession;
+    editSession.kind = LayerKind::PointCloud;
+    editSession.hasSourceRgb = true;
+    editSession.scalarFields = WaterTrailScalarFieldsForUi(*runtimeState);
+    editSession.pointStyle = MakeWaterTrailSessionStyle(profile.style, profile.geometry);
+    bool styleChanged = false;
+    styleChanged |= DrawPointCloudColourSection(&editSession);
+    styleChanged |= DrawVisualBindingSection(
+        "MeshTrailOpacity",
+        "Opacity",
+        &editSession.pointStyle.opacity,
+        editSession.scalarFields,
+        {.constantMin = 0.0F,
+         .constantMax = 1.0F,
+         .defaultOutputMin = 0.0F,
+         .defaultOutputMax = 1.0F,
+         .defaultConstant = 1.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+    styleChanged |= DrawPointCloudEmissionSection(&editSession);
+
+    if (generationChanged || visualChanged || styleChanged) {
+        const auto editedName = EditedWaterProfileName(settings.trailProfileName);
+        settings.trailProfileName = editedName;
+        water.dynamicMeshTrailProfileNameBuffer = BaseWaterProfileName(editedName);
+        auto editedProfile = MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
+        water.editedDynamicMeshTrailProfile = editedProfile;
+        if (generationRefreshRequested) {
+            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+        } else if (visualChanged || styleChanged) {
+            const auto updatedCount = ApplyWaterTrailLiveVisualProfile(runtimeState, editedProfile, true);
+            if (updatedCount > 0U) {
+                runtimeState->statusMessage = "Dynamic mesh trail visuals updated without rebuilding trails.";
+                runtimeState->errorMessage.clear();
+            }
+        }
     }
 }
 
@@ -23101,9 +27424,484 @@ void DrawWaterShorelineWavesPanel(PreviewRuntimeState* runtimeState) {
 
     if (DrawPointCloudShorelineWavesSection(session)) {
         SanitizePointCloudStyle(session);
-        MarkPointVisualEdited(session);
-        SyncScenePointVisualsFromOwner(runtimeState, session);
+        MarkPointVisualEdited(runtimeState, session);
+        if (!IsProjectPointVisualSession(*session)) {
+            SyncScenePointVisualsFromOwner(runtimeState, session);
+        }
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
+    }
+}
+
+void DrawWaterDynamicMeshFlowPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    auto& settings = water.dynamicMeshFlowSettings;
+    settings.trailProfileName = NormalizeWaterProfileName(settings.trailProfileName);
+    settings.particlePresetName = std::string{
+        invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(settings.particlePresetName)};
+    bool dynamicPreviewDirty = false;
+
+    if (BeginPanelSection("Mesh Surface")) {
+        if (ImGui::Checkbox("Enabled##DynamicMeshFlow", &settings.enabled)) {
+            if (!settings.enabled) {
+                RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport);
+            } else {
+                RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+            }
+        }
+        if (ImGui::Checkbox("GPU Preview", &settings.gpuPreviewEnabled)) {
+            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+        }
+
+        bool cacheChanged = false;
+        const auto sceneMeshPath = ResolveDynamicMeshSceneSurfacePath(*runtimeState);
+        const auto resolvedMeshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, settings);
+        if (!resolvedMeshPath.empty()) {
+            ImGui::TextDisabled(
+                "%s: %s",
+                sceneMeshPath.has_value() ? "Auto Scene Mesh" : "Legacy Mesh Fallback",
+                resolvedMeshPath.generic_string().c_str());
+        } else {
+            ImGui::TextDisabled("Auto Scene Mesh: no mesh PLY found in the active scene folder");
+        }
+        if (!settings.meshPath.empty() && sceneMeshPath.has_value()) {
+            ImGui::TextDisabled("Legacy saved mesh path ignored: %s", settings.meshPath.generic_string().c_str());
+            if (ImGui::Button("Clear Legacy Mesh Path")) {
+                settings.meshPath.clear();
+                cacheChanged = true;
+            }
+        }
+        cacheChanged |= ImGui::SliderFloat(
+            "Cache Cell",
+            &settings.cacheCellSizeMeters,
+            0.01F,
+            0.50F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        cacheChanged |= ImGui::SliderFloat(
+            "Projection Radius",
+            &settings.projectionSearchRadiusMeters,
+            0.02F,
+            1.50F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        cacheChanged |= ImGui::SliderFloat(
+            "Ambiguity Height",
+            &settings.ambiguityHeightMeters,
+            0.0F,
+            1.0F,
+            "%.2f m");
+        if (cacheChanged) {
+            water.dynamicMeshSurfaceCache.reset();
+            water.dynamicMeshSurfaceCachePath.clear();
+            water.dynamicMeshSurfaceCacheSignature.clear();
+            StartDynamicMeshSurfaceCacheWarmup(runtimeState, true);
+            dynamicPreviewDirty = true;
+        }
+        if (water.dynamicMeshSurfaceCache != nullptr) {
+            ImGui::TextDisabled(
+                "Mesh cache: %s cells  %.1f ms",
+                FormatPointCount(water.dynamicMeshSurfaceCache->cells.size()).c_str(),
+                water.dynamicMeshSurfaceCache->buildMilliseconds);
+        } else if (DynamicMeshSurfaceWarmupActive(water)) {
+            std::string warmupStage = "Working";
+            if (water.dynamicMeshSurfaceCacheWarmup.shared != nullptr) {
+                std::scoped_lock lock(water.dynamicMeshSurfaceCacheWarmup.shared->mutex);
+                if (!water.dynamicMeshSurfaceCacheWarmup.shared->stage.empty()) {
+                    warmupStage = water.dynamicMeshSurfaceCacheWarmup.shared->stage;
+                }
+            }
+            ImGui::TextDisabled(
+                "Mesh cache: %s for %s",
+                warmupStage.c_str(),
+                FormatElapsedTime(std::chrono::steady_clock::now() - water.dynamicMeshSurfaceCacheWarmup.startedAt).c_str());
+        }
+        if (DynamicMeshSurfaceWarmupActive(water)) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Clear Mesh Cache")) {
+            water.dynamicMeshSurfaceCache.reset();
+            water.dynamicMeshSurfaceCachePath.clear();
+            water.dynamicMeshSurfaceCacheSignature.clear();
+            runtimeState->statusMessage = "Dynamic mesh flow cache cleared.";
+            runtimeState->errorMessage.clear();
+        }
+        if (DynamicMeshSurfaceWarmupActive(water)) {
+            ImGui::EndDisabled();
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Mesh Sources")) {
+        if (ImGui::Button(water.placementArmed ? "Click Viewport..." : "Place Source")) {
+            const bool armPlacement = !water.placementArmed;
+            if (armPlacement) {
+                DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
+                water.placementArmed = true;
+                water.movingEmitterIndex.reset();
+                water.pathAttractorPlacementArmed = false;
+                water.dynamicMeshAttractorPlacementArmed = false;
+                water.movingDynamicMeshAttractorIndex.reset();
+            } else {
+                water.placementArmed = false;
+            }
+            runtimeState->statusMessage =
+                water.placementArmed
+                    ? "Click the viewport to place a water source on the dynamic mesh surface."
+                    : "Water source placement cancelled.";
+            runtimeState->errorMessage.clear();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Suggest Sources")) {
+            SuggestWaterEmittersForActiveLayer(runtimeState);
+            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+        }
+        ImGui::TextDisabled("Sources: %s", FormatPointCount(water.emitters.size()).c_str());
+        EndPanelSection();
+    }
+    DrawWaterSourceList(runtimeState, viewport);
+
+    if (BeginPanelSection("Mesh Source Motion")) {
+        if (const auto* selectedEmitter = SelectedWaterEmitter(runtimeState); selectedEmitter != nullptr) {
+            ImGui::TextDisabled("Selected emitter motion: %s", selectedEmitter->name.c_str());
+            auto motionIt = std::find_if(
+                settings.emitterMotions.begin(),
+                settings.emitterMotions.end(),
+                [selectedEmitter](const WaterDynamicMeshEmitterMotion& motion) {
+                    return motion.emitterId == selectedEmitter->id;
+                });
+            if (motionIt == settings.emitterMotions.end()) {
+                if (ImGui::Button("Add Emitter Motion")) {
+                    WaterDynamicMeshEmitterMotion motion;
+                    motion.emitterId = selectedEmitter->id;
+                    motion.name = selectedEmitter->name;
+                    motion.keyframes.push_back({0.0F, selectedEmitter->position});
+                    motion.keyframes.push_back(
+                        {std::max(1.0F, settings.animationDurationSeconds), selectedEmitter->position});
+                    settings.emitterMotions.push_back(std::move(motion));
+                    dynamicPreviewDirty = true;
+                }
+            } else {
+                auto& motion = *motionIt;
+                dynamicPreviewDirty |= ImGui::Checkbox("Emitter Motion Enabled", &motion.enabled);
+                InputTextString("Emitter Motion Name", &motion.name);
+                if (ImGui::Button("Add Emitter Key")) {
+                    WaterDynamicMeshMotionKeyframe keyframe;
+                    keyframe.timeSeconds = motion.keyframes.empty()
+                                               ? 0.0F
+                                               : std::min(
+                                                     settings.animationDurationSeconds,
+                                                     motion.keyframes.back().timeSeconds + 1.0F);
+                    keyframe.position = selectedEmitter->position;
+                    motion.keyframes.push_back(keyframe);
+                    dynamicPreviewDirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove Emitter Motion")) {
+                    settings.emitterMotions.erase(motionIt);
+                    dynamicPreviewDirty = true;
+                } else {
+                    for (std::size_t keyIndex = 0; keyIndex < motion.keyframes.size(); ++keyIndex) {
+                        auto& keyframe = motion.keyframes[keyIndex];
+                        ImGui::PushID(static_cast<int>(1000 + keyIndex));
+                        dynamicPreviewDirty |=
+                            ImGui::InputFloat("Motion Time", &keyframe.timeSeconds, 0.0F, 0.0F, "%.2f");
+                        float keyPosition[3] = {keyframe.position.x, keyframe.position.y, keyframe.position.z};
+                        if (ImGui::InputFloat3("Motion Position", keyPosition, "%.3f")) {
+                            keyframe.position = {keyPosition[0], keyPosition[1], keyPosition[2]};
+                            dynamicPreviewDirty = true;
+                        }
+                        if (ImGui::Button("Remove Motion Key")) {
+                            motion.keyframes.erase(motion.keyframes.begin() + static_cast<std::ptrdiff_t>(keyIndex));
+                            dynamicPreviewDirty = true;
+                            ImGui::PopID();
+                            break;
+                        }
+                        ImGui::Separator();
+                        ImGui::PopID();
+                    }
+                }
+            }
+        } else {
+            ImGui::TextDisabled("Select a source to edit emitter motion.");
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Mesh Nodes")) {
+        if (ImGui::Button(water.dynamicMeshAttractorPlacementArmed ? "Click Attractor..." : "Place Attractor")) {
+            const bool armPlacement = !water.dynamicMeshAttractorPlacementArmed;
+            if (armPlacement) {
+                DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
+                water.placementArmed = false;
+                water.movingEmitterIndex.reset();
+                water.pathAttractorPlacementArmed = false;
+                water.dynamicMeshAttractorPlacementArmed = true;
+                water.movingDynamicMeshAttractorIndex.reset();
+                runtimeState->statusMessage = "Click the viewport to place a dynamic mesh attractor.";
+            } else {
+                water.dynamicMeshAttractorPlacementArmed = false;
+                runtimeState->statusMessage = "Dynamic mesh attractor placement cancelled.";
+            }
+            runtimeState->errorMessage.clear();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New Attractor")) {
+            WaterDynamicMeshAttractor attractor;
+            attractor.id = NextDynamicMeshAttractorId(settings);
+            attractor.name = "Attractor " + std::to_string(attractor.id);
+            if (const auto* selectedEmitter = SelectedWaterEmitter(runtimeState); selectedEmitter != nullptr) {
+                attractor.position = selectedEmitter->position;
+            }
+            settings.attractors.push_back(std::move(attractor));
+            water.selectedDynamicMeshAttractorIndex = settings.attractors.size() - 1U;
+            water.selectedEmitterIndex.reset();
+            dynamicPreviewDirty = true;
+        }
+        for (std::size_t index = 0; index < settings.attractors.size(); ++index) {
+            auto& attractor = settings.attractors[index];
+            const bool selected =
+                water.selectedDynamicMeshAttractorIndex.has_value() &&
+                water.selectedDynamicMeshAttractorIndex.value() == index;
+            const std::string label =
+                attractor.name.empty() ? "Attractor " + std::to_string(index + 1U) : attractor.name;
+            ImGuiTreeNodeFlags nodeFlags = selected ? ImGuiTreeNodeFlags_Selected : ImGuiTreeNodeFlags_None;
+            const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), nodeFlags);
+            if (ImGui::IsItemClicked()) {
+                water.selectedDynamicMeshAttractorIndex = index;
+                water.selectedEmitterIndex.reset();
+            }
+            if (nodeOpen) {
+                InputTextString("Attractor Name", &attractor.name);
+                dynamicPreviewDirty |= ImGui::Checkbox("Attractor Enabled", &attractor.enabled);
+                float position[3] = {attractor.position.x, attractor.position.y, attractor.position.z};
+                if (ImGui::InputFloat3("Attractor Position", position, "%.3f")) {
+                    attractor.position = {position[0], position[1], position[2]};
+                    dynamicPreviewDirty = true;
+                }
+                const bool movingSelected =
+                    water.movingDynamicMeshAttractorIndex.has_value() &&
+                    water.movingDynamicMeshAttractorIndex.value() == index;
+                if (ImGui::Button(movingSelected ? "Cancel Move" : "Move In View")) {
+                    if (movingSelected) {
+                        water.movingDynamicMeshAttractorIndex.reset();
+                        runtimeState->statusMessage = "Dynamic mesh attractor move cancelled.";
+                    } else {
+                        DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
+                        water.placementArmed = false;
+                        water.movingEmitterIndex.reset();
+                        water.pathAttractorPlacementArmed = false;
+                        water.dynamicMeshAttractorPlacementArmed = false;
+                        water.movingDynamicMeshAttractorIndex = index;
+                        water.selectedDynamicMeshAttractorIndex = index;
+                        water.selectedEmitterIndex.reset();
+                        runtimeState->statusMessage = "Click the viewport to move " + label + ".";
+                    }
+                    runtimeState->errorMessage.clear();
+                }
+                dynamicPreviewDirty |=
+                    ImGui::SliderFloat("Attractor Radius", &attractor.radiusMeters, 0.01F, 8.0F, "%.2f m");
+                dynamicPreviewDirty |=
+                    ImGui::SliderFloat("Attractor Strength", &attractor.strength, 0.0F, 5.0F, "%.2f");
+                if (ImGui::TreeNode("Attractor Keyframes")) {
+                    if (ImGui::Button("Add Attractor Key")) {
+                        WaterDynamicMeshMotionKeyframe keyframe;
+                        keyframe.timeSeconds = attractor.keyframes.empty()
+                                                   ? 0.0F
+                                                   : std::min(
+                                                         settings.animationDurationSeconds,
+                                                         attractor.keyframes.back().timeSeconds + 1.0F);
+                        keyframe.position = attractor.position;
+                        attractor.keyframes.push_back(keyframe);
+                        dynamicPreviewDirty = true;
+                    }
+                    for (std::size_t keyIndex = 0; keyIndex < attractor.keyframes.size(); ++keyIndex) {
+                        auto& keyframe = attractor.keyframes[keyIndex];
+                        ImGui::PushID(static_cast<int>(keyIndex));
+                        dynamicPreviewDirty |= ImGui::InputFloat("Time", &keyframe.timeSeconds, 0.0F, 0.0F, "%.2f");
+                        float keyPosition[3] = {keyframe.position.x, keyframe.position.y, keyframe.position.z};
+                        if (ImGui::InputFloat3("Position", keyPosition, "%.3f")) {
+                            keyframe.position = {keyPosition[0], keyPosition[1], keyPosition[2]};
+                            dynamicPreviewDirty = true;
+                        }
+                        if (ImGui::Button("Remove Key")) {
+                            attractor.keyframes.erase(
+                                attractor.keyframes.begin() + static_cast<std::ptrdiff_t>(keyIndex));
+                            dynamicPreviewDirty = true;
+                            ImGui::PopID();
+                            break;
+                        }
+                        ImGui::Separator();
+                        ImGui::PopID();
+                    }
+                    ImGui::TreePop();
+                }
+                if (ImGui::Button("Remove Attractor")) {
+                    settings.attractors.erase(settings.attractors.begin() + static_cast<std::ptrdiff_t>(index));
+                    if (water.selectedDynamicMeshAttractorIndex.has_value()) {
+                        if (settings.attractors.empty() ||
+                            water.selectedDynamicMeshAttractorIndex.value() == index) {
+                            water.selectedDynamicMeshAttractorIndex.reset();
+                        } else if (water.selectedDynamicMeshAttractorIndex.value() > index) {
+                            water.selectedDynamicMeshAttractorIndex =
+                                water.selectedDynamicMeshAttractorIndex.value() - 1U;
+                        }
+                    }
+                    if (water.movingDynamicMeshAttractorIndex.has_value()) {
+                        if (settings.attractors.empty() ||
+                            water.movingDynamicMeshAttractorIndex.value() == index) {
+                            water.movingDynamicMeshAttractorIndex.reset();
+                        } else if (water.movingDynamicMeshAttractorIndex.value() > index) {
+                            water.movingDynamicMeshAttractorIndex =
+                                water.movingDynamicMeshAttractorIndex.value() - 1U;
+                        }
+                    }
+                    dynamicPreviewDirty = true;
+                    ImGui::TreePop();
+                    break;
+                }
+                ImGui::TreePop();
+            }
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Mesh Particle Controls")) {
+        if (ImGui::BeginCombo("Particle State", settings.particlePresetName.c_str())) {
+            for (const auto& preset : invisible_places::water::AllWaterDynamicMeshParticlePresets()) {
+                const bool selected = settings.particlePresetName == preset.name;
+                if (ImGui::Selectable(preset.label.data(), selected)) {
+                    settings = invisible_places::water::ApplyWaterDynamicMeshParticlePreset(settings, preset.name);
+                    dynamicPreviewDirty = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        int previewParticles = static_cast<int>(settings.previewParticleLimit);
+        if (ImGui::SliderInt("Preview Particles", &previewParticles, 1, 8000)) {
+            settings.previewParticleLimit = static_cast<std::uint32_t>(std::max(1, previewParticles));
+            dynamicPreviewDirty = true;
+        }
+        int finalParticles = static_cast<int>(settings.finalParticleLimit);
+        if (ImGui::SliderInt("Final Particles", &finalParticles, 1, 30000)) {
+            settings.finalParticleLimit = static_cast<std::uint32_t>(std::max(1, finalParticles));
+            dynamicPreviewDirty = true;
+        }
+        dynamicPreviewDirty |=
+            ImGui::SliderFloat("Mesh Surface Offset", &settings.surfaceOffsetMeters, -0.05F, 0.10F, "%.3f m");
+        dynamicPreviewDirty |= ImGui::SliderFloat(
+            "Route Length",
+            &settings.trailLengthMeters,
+            0.5F,
+            60.0F,
+            "%.1f m",
+            ImGuiSliderFlags_Logarithmic);
+        dynamicPreviewDirty |= ImGui::SliderFloat(
+            "Route Step",
+            &settings.stepMeters,
+            0.02F,
+            0.75F,
+            "%.3f m",
+            ImGuiSliderFlags_Logarithmic);
+        dynamicPreviewDirty |= ImGui::SliderFloat(
+            "Mesh Speed",
+            &settings.speedMetersPerSecond,
+            0.01F,
+            4.0F,
+            "%.2f m/s",
+            ImGuiSliderFlags_Logarithmic);
+        dynamicPreviewDirty |= ImGui::SliderFloat("Downhill", &settings.downhillWeight, 0.0F, 3.0F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat("Attraction", &settings.attractorWeight, 0.0F, 3.0F, "%.2f");
+        dynamicPreviewDirty |=
+            ImGui::SliderFloat("Source Velocity", &settings.sourceVelocityWeight, 0.0F, 3.0F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat("Curl", &settings.curlStrength, 0.0F, 1.5F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat("Branching", &settings.branchingStrength, 0.0F, 2.0F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat("Eddy Backflow", &settings.eddyStrength, 0.0F, 2.0F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat("Topology Response", &settings.topologyResponse, 0.0F, 2.0F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat("Inertia", &settings.inertia, 0.0F, 0.98F, "%.2f");
+        dynamicPreviewDirty |= ImGui::SliderFloat(
+            "Mesh Duration",
+            &settings.animationDurationSeconds,
+            0.0F,
+            30.0F,
+            "%.2f s");
+        int seed = static_cast<int>(settings.seed);
+        if (ImGui::InputInt("Mesh Seed", &seed)) {
+            settings.seed = static_cast<std::uint32_t>(std::max(0, seed));
+            dynamicPreviewDirty = true;
+        }
+        EndPanelSection();
+    }
+
+    settings.cacheCellSizeMeters = std::clamp(settings.cacheCellSizeMeters, 0.005F, 5.0F);
+    settings.projectionSearchRadiusMeters = std::clamp(settings.projectionSearchRadiusMeters, 0.005F, 25.0F);
+    settings.ambiguityHeightMeters = std::clamp(settings.ambiguityHeightMeters, 0.0F, 25.0F);
+    settings.trailLengthMeters = std::clamp(settings.trailLengthMeters, 0.02F, 100.0F);
+    settings.stepMeters = std::clamp(settings.stepMeters, 0.002F, 5.0F);
+    settings.sourceVelocityWeight = std::clamp(settings.sourceVelocityWeight, 0.0F, 10.0F);
+    settings.branchingStrength = std::clamp(settings.branchingStrength, 0.0F, 10.0F);
+    settings.eddyStrength = std::clamp(settings.eddyStrength, 0.0F, 10.0F);
+    settings.topologyResponse = std::clamp(settings.topologyResponse, 0.0F, 10.0F);
+    settings.animationDurationSeconds = std::clamp(settings.animationDurationSeconds, 0.0F, 86400.0F);
+    settings.inertia = std::clamp(settings.inertia, 0.0F, 0.98F);
+
+    if (dynamicPreviewDirty) {
+        RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
+    }
+
+    if (BeginPanelSection("Mesh Visual")) {
+        DrawWaterDynamicMeshTrailProfileSelector(runtimeState, viewport);
+        DrawWaterDynamicMeshTrailStyleEditor(runtimeState, viewport, ViewedDynamicMeshWaterTrailProfile(*runtimeState));
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Mesh Output")) {
+        if (ImGui::Button("Preview Mesh Flow")) {
+            RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Preview);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Final Mesh Flow")) {
+            RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Final);
+        }
+        if (!water.lastDynamicMeshTrailOverlayPath.empty()) {
+            ImGui::TextDisabled(
+                "Mesh trails: %s",
+                water.lastDynamicMeshTrailOverlayPath.filename().string().c_str());
+        }
+        if (water.dynamicMeshFlowDiagnostics.cacheCellCount > 0U ||
+            water.dynamicMeshFlowDiagnostics.emittedSampleCount > 0U) {
+            const auto& diagnostics = water.dynamicMeshFlowDiagnostics;
+            ImGui::TextDisabled(
+                "Mesh source: %s vertices  %s triangles",
+                FormatPointCount(diagnostics.sourceVertexCount).c_str(),
+                FormatPointCount(diagnostics.sourceTriangleCount).c_str());
+            ImGui::TextDisabled(
+                "Mesh output: paths %u  samples %u  misses %u  ambiguous %u",
+                diagnostics.emittedPathCount,
+                diagnostics.emittedSampleCount,
+                diagnostics.projectionMissCount,
+                diagnostics.ambiguousHitCount);
+            ImGui::TextDisabled(
+                "Mesh timing: load %.1f ms  cache %.1f ms  solve %.1f ms",
+                diagnostics.meshLoadMilliseconds,
+                diagnostics.cacheBuildMilliseconds,
+                diagnostics.solveMilliseconds);
+            ImGui::TextDisabled(
+                "GPU update: static %.2f ms  live %.2f ms  dispatch %.2f ms  %s %s",
+                diagnostics.gpuStaticUploadMilliseconds,
+                diagnostics.gpuLiveUploadMilliseconds,
+                diagnostics.gpuDispatchMilliseconds,
+                diagnostics.gpuStaticBuffersReused ? "warm" : "rebuilt",
+                diagnostics.gpuAsynchronousDispatch ? "async" : "sync");
+        }
+        EndPanelSection();
     }
 }
 
@@ -23342,12 +28140,15 @@ void DrawWaterPanel(
                     water.placementArmed = true;
                     water.movingEmitterIndex.reset();
                     water.pathAttractorPlacementArmed = false;
+                    water.dynamicMeshAttractorPlacementArmed = false;
+                    water.movingDynamicMeshAttractorIndex.reset();
                 } else {
                     water.placementArmed = false;
                 }
-                runtimeState->statusMessage = water.placementArmed
-                                                  ? "Click the point-cloud viewport to place a water source."
-                                                  : "Water source placement cancelled.";
+                runtimeState->statusMessage =
+                    water.placementArmed
+                        ? "Click the viewport to place a water source on the active surface."
+                        : "Water source placement cancelled.";
                 runtimeState->errorMessage.clear();
             }
             ImGui::SameLine();
@@ -23739,6 +28540,12 @@ void DrawWaterPanel(
     ImGui::EndTabItem();
     }
 
+    if (ImGui::BeginTabItem("Mesh Flow")) {
+        water.activeRegionFeature = WaterRegionFeature::None;
+        DrawWaterDynamicMeshFlowPanel(runtimeState, viewport);
+        ImGui::EndTabItem();
+    }
+
     if (ImGui::BeginTabItem("Field")) {
         water.activeRegionFeature = WaterRegionFeature::Field;
         DrawWaterFieldPanel(runtimeState, viewport);
@@ -23753,6 +28560,10 @@ void DrawProjectPanel(
     if (BeginPanelSection("Project Settings")) {
     auto& settings = runtimeState->projectSettings;
     ImGui::ColorEdit3("Background Color", settings.backgroundColor.data());
+    ImGui::Checkbox("ProRes Alpha Preview", &settings.proResAlphaPreviewEnabled);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Shows the live viewport with ProRes-style alpha composited over black.");
+    }
     ImGui::Checkbox("Eye-Dome Lighting", &settings.eyeDomeLightingEnabled);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Darkens point-cloud depth discontinuities in the viewport and animation exports.");
@@ -23940,10 +28751,7 @@ void DrawRenderInfoSection(
                 ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
             }
         } else {
-            const float frameProgress =
-                job.frames.empty()
-                    ? 0.0F
-                    : static_cast<float>(job.writtenFrameCount) / static_cast<float>(job.frames.size());
+            const float frameProgress = ExportRenderProgressFraction(job);
             ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
             ImGui::Text(
                 "Captured %u / %zu, saved %u, queued %zu",
@@ -23951,6 +28759,7 @@ void DrawRenderInfoSection(
                 job.frames.size(),
                 std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
                 job.pendingFrameCount);
+            DrawExportTimingSummary(job);
         }
         ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
         if (!job.lastOutputPath.empty()) {
@@ -24223,11 +29032,36 @@ void UpdateCameraFromInput(
     const bool mouseCanNavigate =
         !viewport.UiWantsMouseCapture() &&
         (renderViewportHovered || runtimeState->cameraInteraction.renderViewportMouseActive);
+    if (runtimeState->water.movingDynamicMeshAttractorIndex.has_value() &&
+        renderViewportHovered &&
+        !viewport.UiWantsMouseCapture() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (MoveDynamicMeshAttractorAtScreenPoint(runtimeState, viewport, io.MousePos) &&
+            runtimeState->water.dynamicMeshFlowSettings.enabled) {
+            RefreshWaterDynamicMeshFlowOverlay(runtimeState, &viewport, WaterTrailBuildQuality::Preview);
+        }
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
+    if (runtimeState->water.dynamicMeshAttractorPlacementArmed &&
+        renderViewportHovered &&
+        !viewport.UiWantsMouseCapture() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (PlaceDynamicMeshAttractorAtScreenPoint(runtimeState, viewport, io.MousePos) &&
+            runtimeState->water.dynamicMeshFlowSettings.enabled) {
+            RefreshWaterDynamicMeshFlowOverlay(runtimeState, &viewport, WaterTrailBuildQuality::Preview);
+        }
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
     if (runtimeState->water.movingEmitterIndex.has_value() &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        MoveWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos);
+        if (MoveWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos) &&
+            runtimeState->water.dynamicMeshFlowSettings.enabled) {
+            RefreshWaterDynamicMeshFlowOverlay(runtimeState, &viewport, WaterTrailBuildQuality::Preview);
+        }
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
@@ -24235,7 +29069,10 @@ void UpdateCameraFromInput(
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        PlaceWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos);
+        if (PlaceWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos) &&
+            runtimeState->water.dynamicMeshFlowSettings.enabled) {
+            RefreshWaterDynamicMeshFlowOverlay(runtimeState, &viewport, WaterTrailBuildQuality::Preview);
+        }
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
@@ -24424,6 +29261,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         runtimeState.projectSettings.backgroundColor[2],
         runtimeState.projectSettings.backgroundColor[3],
     };
+    renderState.proResAlphaPreviewEnabled = runtimeState.projectSettings.proResAlphaPreviewEnabled;
     renderState.pointCloudRendererMode =
         fastBasicRenderer ? PointCloudRendererMode::FastBasic : PointCloudRendererMode::Beauty;
     renderState.eyeDomeLightingEnabled =
@@ -24440,6 +29278,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     renderState.depthOfFieldMaxBlurPixels = cameraState.depthOfFieldMaxBlurPixels;
     renderState.gaussianSplatFootprintBoost = runtimeState.projectSettings.gaussianSplatFootprintBoost;
     renderState.flowTimeSeconds = flowTimeSeconds;
+    renderState.pointSizeScale = 1.0F;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -24643,6 +29482,14 @@ struct GuiSmokeReport {
     std::size_t sparseRippleRegionCount = 0;
     std::size_t regionVertexCount = 0;
     double paramsOnlyUpdateMs = 0.0;
+    double dynamicMeshWarmMoveTotalMs = 0.0;
+    double dynamicMeshWarmMoveAverageMs = 0.0;
+    double dynamicMeshWarmMoveP50Ms = 0.0;
+    double dynamicMeshWarmMoveP95Ms = 0.0;
+    double dynamicMeshWarmMoveMaxMs = 0.0;
+    std::size_t dynamicMeshWarmMoveCount = 0;
+    std::size_t dynamicMeshWarmMoveStaticReuseCount = 0;
+    std::size_t dynamicMeshWarmMoveAsyncDispatchCount = 0;
     double patternParamsUpdateTotalMs = 0.0;
     double patternParamsUpdateP50Ms = 0.0;
     double patternParamsUpdateP95Ms = 0.0;
@@ -24696,6 +29543,16 @@ bool WriteGuiSmokeReport(const GuiSmokeReport& report) {
     output << "  \"sparse_ripple_region_count\": " << report.sparseRippleRegionCount << ",\n";
     output << "  \"region_vertex_count\": " << report.regionVertexCount << ",\n";
     output << "  \"params_only_update_ms\": " << FormatFixed(report.paramsOnlyUpdateMs, 3) << ",\n";
+    output << "  \"dynamic_mesh_warm_move_total_ms\": " << FormatFixed(report.dynamicMeshWarmMoveTotalMs, 3) << ",\n";
+    output << "  \"dynamic_mesh_warm_move_average_ms\": " << FormatFixed(report.dynamicMeshWarmMoveAverageMs, 3) << ",\n";
+    output << "  \"dynamic_mesh_warm_move_p50_ms\": " << FormatFixed(report.dynamicMeshWarmMoveP50Ms, 3) << ",\n";
+    output << "  \"dynamic_mesh_warm_move_p95_ms\": " << FormatFixed(report.dynamicMeshWarmMoveP95Ms, 3) << ",\n";
+    output << "  \"dynamic_mesh_warm_move_max_ms\": " << FormatFixed(report.dynamicMeshWarmMoveMaxMs, 3) << ",\n";
+    output << "  \"dynamic_mesh_warm_move_count\": " << report.dynamicMeshWarmMoveCount << ",\n";
+    output << "  \"dynamic_mesh_warm_move_static_reuse_count\": "
+           << report.dynamicMeshWarmMoveStaticReuseCount << ",\n";
+    output << "  \"dynamic_mesh_warm_move_async_dispatch_count\": "
+           << report.dynamicMeshWarmMoveAsyncDispatchCount << ",\n";
     output << "  \"pattern_params_update_total_ms\": " << FormatFixed(report.patternParamsUpdateTotalMs, 3) << ",\n";
     output << "  \"pattern_params_update_p50_ms\": " << FormatFixed(report.patternParamsUpdateP50Ms, 3) << ",\n";
     output << "  \"pattern_params_update_p95_ms\": " << FormatFixed(report.patternParamsUpdateP95Ms, 3) << ",\n";
@@ -25338,6 +30195,199 @@ int RunWaterRegionSampleTerrestrialSmoke(
     return finish();
 }
 
+int RunDynamicMeshFlowSite3Smoke(
+    const GuiSmokeOptions& options,
+    const invisible_places::io::AssetCatalog& assetCatalog,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    GuiSmokeReport report;
+    report.scenario = options.scenario;
+    const auto outputDirectory = options.outputDirectory.empty()
+                                     ? std::filesystem::path{"build/macos-debug/water-region-smoke"}
+                                     : options.outputDirectory;
+    report.outputPath = outputDirectory / "dynamic-mesh-flow-site3.json";
+
+    auto finish = [&]() {
+        if (!WriteGuiSmokeReport(report)) {
+            std::cerr << "Failed to write GUI smoke report: " << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "GUI smoke report: " << report.outputPath.string() << std::endl;
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        report.Fail("Smoke runner did not receive a live window, viewport, and runtime state.");
+        return finish();
+    }
+
+    const auto meshPath = assetCatalog.dataRoot / "ExhibitionScene" / "Site3-MESH.ply";
+    if (!std::filesystem::exists(meshPath)) {
+        report.Fail("Data/ExhibitionScene/Site3-MESH.ply was not found.");
+        return finish();
+    }
+
+    runtimeState->water.dynamicMeshFlowSettings =
+        invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
+    runtimeState->water.dynamicMeshFlowSettings.enabled = true;
+    runtimeState->water.dynamicMeshFlowSettings.gpuPreviewEnabled = true;
+    runtimeState->water.dynamicMeshFlowSettings.meshPath.clear();
+    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+        const auto& session = runtimeState->sessions[index];
+        if (session.kind == LayerKind::PointCloud &&
+            NormalizePathKey(session.sourcePath.parent_path()) == NormalizePathKey(meshPath.parent_path())) {
+            runtimeState->selectedSessionIndex = index;
+            break;
+        }
+    }
+    const auto resolvedMeshPath =
+        DynamicMeshSurfaceCachePathForSettings(*runtimeState, runtimeState->water.dynamicMeshFlowSettings);
+    if (NormalizePathKey(resolvedMeshPath) == NormalizePathKey(meshPath)) {
+        report.Pass("GPU Mesh Flow smoke resolved the mesh from the selected scene folder.");
+    } else {
+        report.Fail(
+            "GPU Mesh Flow smoke resolved the wrong scene mesh: " +
+            (resolvedMeshPath.empty() ? std::string{"<none>"} : resolvedMeshPath.generic_string()));
+        return finish();
+    }
+    runtimeState->water.emitters.clear();
+    WaterEmitter emitter;
+    emitter.id = 17U;
+    emitter.name = "Source 17";
+    emitter.position = {307.622F, 102.514F, 2.066F};
+    emitter.radius = 0.035F;
+    emitter.strength = 1.0F;
+    emitter.speed = 1.0F;
+    emitter.status = WaterEmitterStatus::Accepted;
+    runtimeState->water.emitters.push_back(emitter);
+    runtimeState->water.nextEmitterId = 18U;
+
+    const auto generateStart = std::chrono::steady_clock::now();
+    if (!RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Preview)) {
+        report.Fail("GPU Mesh Flow preview failed: " + runtimeState->errorMessage);
+        return finish();
+    }
+    report.recalculateEffectsMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - generateStart).count();
+    const auto& diagnostics = runtimeState->water.dynamicMeshFlowDiagnostics;
+    if (diagnostics.emittedPathCount > 0U && diagnostics.emittedSampleCount > diagnostics.emittedPathCount) {
+        report.Pass("GPU Mesh Flow preview emitted paths and trail points.");
+    } else {
+        report.Fail("GPU Mesh Flow preview did not report emitted paths and trail points.");
+    }
+
+    const auto sessionIt = std::find_if(
+        runtimeState->sessions.begin(),
+        runtimeState->sessions.end(),
+        [](const PreviewLayerSession& session) {
+            return session.loaded &&
+                   session.visible &&
+                   session.kind == LayerKind::PointCloud &&
+                   session.pointStyle.waterTrailOverlay &&
+                   session.sourcePath.stem().string().ends_with("-DynamicMeshTrails");
+        });
+    if (sessionIt == runtimeState->sessions.end()) {
+        report.Fail("GPU Mesh Flow preview did not create a visible DynamicMeshTrails layer.");
+        return finish();
+    }
+    const auto sessionIndex = static_cast<std::size_t>(std::distance(runtimeState->sessions.begin(), sessionIt));
+    report.selectedPointCount = sessionIt->totalPrimitives;
+    if (sessionIt->totalPrimitives == diagnostics.emittedSampleCount &&
+        sessionIt->offlinePointCloud == nullptr) {
+        report.Pass("DynamicMeshTrails layer is GPU generated without a CPU point-cloud overlay.");
+    } else {
+        report.Fail("DynamicMeshTrails layer did not look like a GPU-generated preview layer.");
+    }
+
+    FocusSessionLayer(runtimeState, *viewport, sessionIndex, 0.65F);
+    std::vector<double> frameTimesMs;
+    for (int frame = 0; frame < 8; ++frame) {
+        PumpGuiSmokeFrame(window, runtimeState, viewport, &frameTimesMs);
+    }
+    if (!frameTimesMs.empty()) {
+        report.averageFrameMs =
+            std::accumulate(frameTimesMs.begin(), frameTimesMs.end(), 0.0) /
+            static_cast<double>(frameTimesMs.size());
+        report.maxFrameMs = *std::max_element(frameTimesMs.begin(), frameTimesMs.end());
+    }
+    const auto& viewportDiagnostics = viewport->Diagnostics();
+    if (viewportDiagnostics.pointSubmittedCount > 0U || viewportDiagnostics.pointCount > 0U) {
+        report.Pass("GPU Mesh Flow layer submitted point draws in the Vulkan viewport.");
+    } else {
+        report.Fail("GPU Mesh Flow layer did not submit points to the Vulkan viewport.");
+    }
+
+    viewport->WaitIdle();
+    std::vector<double> warmMoveSamplesMs;
+    const auto originalSourcePosition = runtimeState->water.emitters.front().position;
+    for (int moveIndex = 0; moveIndex < 12; ++moveIndex) {
+        const float phase = static_cast<float>(moveIndex) / 11.0F;
+        auto& movingEmitter = runtimeState->water.emitters.front();
+        movingEmitter.position = {
+            originalSourcePosition.x + std::sin(phase * 6.28318530718F) * 0.075F,
+            originalSourcePosition.y + std::cos(phase * 6.28318530718F) * 0.055F,
+            originalSourcePosition.z,
+        };
+        const auto moveStart = std::chrono::steady_clock::now();
+        if (!RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Preview)) {
+            report.Fail("Warm GPU Mesh Flow source move failed: " + runtimeState->errorMessage);
+            break;
+        }
+        const double elapsedMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - moveStart).count();
+        warmMoveSamplesMs.push_back(elapsedMs);
+        report.dynamicMeshWarmMoveTotalMs += elapsedMs;
+        const auto& warmDiagnostics = runtimeState->water.dynamicMeshFlowDiagnostics;
+        if (warmDiagnostics.gpuStaticBuffersReused) {
+            ++report.dynamicMeshWarmMoveStaticReuseCount;
+        }
+        if (warmDiagnostics.gpuAsynchronousDispatch) {
+            ++report.dynamicMeshWarmMoveAsyncDispatchCount;
+        }
+        PumpGuiSmokeFrame(window, runtimeState, viewport, &frameTimesMs);
+    }
+    runtimeState->water.emitters.front().position = originalSourcePosition;
+    report.dynamicMeshWarmMoveCount = warmMoveSamplesMs.size();
+    if (!warmMoveSamplesMs.empty()) {
+        report.dynamicMeshWarmMoveAverageMs =
+            report.dynamicMeshWarmMoveTotalMs / static_cast<double>(warmMoveSamplesMs.size());
+        report.dynamicMeshWarmMoveP50Ms = PercentileValue(warmMoveSamplesMs, 0.50);
+        report.dynamicMeshWarmMoveP95Ms = PercentileValue(warmMoveSamplesMs, 0.95);
+        report.dynamicMeshWarmMoveMaxMs =
+            *std::max_element(warmMoveSamplesMs.begin(), warmMoveSamplesMs.end());
+    }
+    if (report.dynamicMeshWarmMoveCount == 12U) {
+        report.Pass("GPU Mesh Flow source node moved repeatedly and refreshed trails.");
+    } else {
+        report.Fail("GPU Mesh Flow source node move validation did not complete every warm refresh.");
+    }
+    if (report.dynamicMeshWarmMoveStaticReuseCount == report.dynamicMeshWarmMoveCount &&
+        report.dynamicMeshWarmMoveCount > 0U) {
+        report.Pass("Warm source moves reused resident dynamic mesh GPU buffers.");
+    } else {
+        report.Fail("At least one warm source move rebuilt dynamic mesh GPU buffers.");
+    }
+    if (report.dynamicMeshWarmMoveAsyncDispatchCount == report.dynamicMeshWarmMoveCount &&
+        report.dynamicMeshWarmMoveCount > 0U) {
+        report.Pass("Warm source moves used asynchronous dynamic mesh GPU dispatch.");
+    } else {
+        report.Fail("At least one warm source move did not report asynchronous GPU dispatch.");
+    }
+    if (report.dynamicMeshWarmMoveMaxMs > 0.0 && report.dynamicMeshWarmMoveMaxMs < 1000.0) {
+        report.Pass(
+            "Warm source move processing stayed under one second; max " +
+            FormatFixed(report.dynamicMeshWarmMoveMaxMs, 3) +
+            " ms.");
+    } else {
+        report.Fail(
+            "Warm source move processing was not under one second; max " +
+            FormatFixed(report.dynamicMeshWarmMoveMaxMs, 3) +
+            " ms.");
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
 }  // namespace
 
 Application::Application(std::filesystem::path dataRoot)
@@ -25424,6 +30474,17 @@ int Application::Run(ApplicationRunOptions options) const {
             viewport->WaitIdle();
             return smokeExitCode;
         }
+        if (options.guiSmoke->scenario == "dynamic-mesh-flow-site3") {
+            const auto smokeExitCode = RunDynamicMeshFlowSite3Smoke(
+                options.guiSmoke.value(),
+                assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
         std::cerr << "Unknown GUI smoke scenario: " << options.guiSmoke->scenario << "\n";
         return 2;
     }
@@ -25457,6 +30518,7 @@ int Application::Run(ApplicationRunOptions options) const {
         } else {
             runtimeState.errorMessage = "No point clouds or gSplats were discovered in the Data directory.";
         }
+        StartDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
     } else if (runtimeState.sessions.empty()) {
         runtimeState.errorMessage = "No point clouds or gSplats were discovered in the Data directory.";
     }
@@ -25469,6 +30531,7 @@ int Application::Run(ApplicationRunOptions options) const {
 
         if (viewport.has_value()) {
             PollPendingLayerLoad(&runtimeState, &viewport.value());
+            PollDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
             PollWaterRegionPointPreviewJob(&runtimeState);
             PollWaterRippleLiveEffectRefresh(&runtimeState, &viewport.value());
             SyncWaterRegionPointPreviewHighlights(&runtimeState, &viewport.value());
@@ -25476,13 +30539,11 @@ int Application::Run(ApplicationRunOptions options) const {
                 StartQueuedLayerLoadIfIdle(&runtimeState);
             }
             viewport->BeginUiFrame();
-            if (runtimeState.offlineRenderJob.active) {
-                ProcessOfflineRenderJobStep(&runtimeState, &viewport.value());
-            }
             const bool pauseLiveViewport =
                 runtimeState.offlineRenderJob.active && runtimeState.pauseLiveViewportDuringExport;
 
             DrawControlsWindow(&runtimeState, &viewport.value());
+            DrawAnimationFramePreviewWindow(&runtimeState, &viewport.value());
             DrawDiagnosticsWindow(&runtimeState, viewport.value());
             DrawLoadingOverlay(runtimeState);
             DrawOfflineRenderOverlay(&runtimeState);
@@ -25532,6 +30593,9 @@ int Application::Run(ApplicationRunOptions options) const {
                 runtimeState.previewRenderStateSignatureValid = false;
             }
             viewport->DrawFrame();
+            if (runtimeState.offlineRenderJob.active) {
+                ProcessOfflineRenderJobStep(&runtimeState, &viewport.value());
+            }
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds{16});
         }

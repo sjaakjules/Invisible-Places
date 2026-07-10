@@ -3,6 +3,7 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <fstream>
@@ -24,7 +25,13 @@ using invisible_places::camera::AnimationPath;
 using invisible_places::camera::AnimationPathKey;
 using invisible_places::camera::CameraShot;
 using invisible_places::camera::CameraState;
+using invisible_places::output::AnimationExportMode;
+using invisible_places::output::ExportPreset;
 using invisible_places::output::RenderJobSettings;
+using invisible_places::renderer::gsplat::GaussianSplatColorMode;
+using invisible_places::renderer::gsplat::GaussianSplatDebugMode;
+using invisible_places::renderer::gsplat::GaussianSplatQualityMode;
+using invisible_places::renderer::gsplat::GaussianSplatStyleState;
 using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
@@ -52,6 +59,8 @@ using invisible_places::water::WaterFieldOutputMode;
 using invisible_places::water::WaterFieldSettings;
 using invisible_places::water::WaterFieldTrailSettings;
 using invisible_places::water::WaterFlowTrailSettings;
+using invisible_places::water::WaterDynamicMeshAttractor;
+using invisible_places::water::WaterDynamicMeshFlowSettings;
 using invisible_places::water::WaterParticleTrailSettings;
 using invisible_places::water::WaterParticleTrailShapeSettings;
 using invisible_places::water::WaterParticleVisualSettings;
@@ -79,6 +88,9 @@ using invisible_places::water::WaterVisualSettings;
 
 constexpr std::uintmax_t kLargeJsonRippleCacheStripBytes = 32ULL * 1024ULL * 1024ULL;
 
+constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
+constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
+
 json SerializeWaterSettingsBundle(const WaterSettingsBundle& settings);
 WaterSettingsBundle ParseWaterSettingsBundle(const json& settingsJson);
 json SerializeWaterSourceSettings(const WaterSourceSettings& settings);
@@ -99,8 +111,12 @@ json SerializeWaterFieldSettings(const WaterFieldSettings& settings);
 WaterFieldSettings ParseWaterFieldSettings(const json& settingsJson);
 json SerializeWaterFieldTrailSettings(const WaterFieldTrailSettings& settings);
 WaterFieldTrailSettings ParseWaterFieldTrailSettings(const json& settingsJson);
+json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& settings);
+WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& settingsJson);
 json SerializeWaterRainSettings(const WaterRainSettings& settings);
 WaterRainSettings ParseWaterRainSettings(const json& settingsJson);
+json SerializeWaterPathCache(const WaterPathCache& cache);
+WaterPathCache ParseWaterPathCache(const json& cacheJson);
 json SerializeWaterVisualSettings(const WaterVisualSettings& settings);
 WaterVisualSettings ParseWaterVisualSettings(const json& settingsJson);
 PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& visualSettings);
@@ -498,6 +514,88 @@ SerializedLayerKind ParseSerializedLayerKind(const json& value) {
                                                  : SerializedLayerKind::PointCloud;
 }
 
+const char* GaussianSplatColorModeName(GaussianSplatColorMode mode) {
+    switch (mode) {
+        case GaussianSplatColorMode::FullSh:
+            return "full_sh";
+        case GaussianSplatColorMode::DcOnly:
+            return "dc_only";
+    }
+
+    return "full_sh";
+}
+
+GaussianSplatColorMode ParseGaussianSplatColorMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "dc_only" || modeName == "dc") {
+        return GaussianSplatColorMode::DcOnly;
+    }
+    return GaussianSplatColorMode::FullSh;
+}
+
+const char* GaussianSplatDebugModeName(GaussianSplatDebugMode mode) {
+    switch (mode) {
+        case GaussianSplatDebugMode::Final:
+            return "final";
+        case GaussianSplatDebugMode::Opacity:
+            return "opacity";
+        case GaussianSplatDebugMode::Scale:
+            return "scale";
+        case GaussianSplatDebugMode::Depth:
+            return "depth";
+        case GaussianSplatDebugMode::LayerTint:
+            return "layer_tint";
+    }
+
+    return "final";
+}
+
+GaussianSplatDebugMode ParseGaussianSplatDebugMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "opacity") {
+        return GaussianSplatDebugMode::Opacity;
+    }
+    if (modeName == "scale") {
+        return GaussianSplatDebugMode::Scale;
+    }
+    if (modeName == "depth") {
+        return GaussianSplatDebugMode::Depth;
+    }
+    if (modeName == "layer_tint") {
+        return GaussianSplatDebugMode::LayerTint;
+    }
+    return GaussianSplatDebugMode::Final;
+}
+
+const char* GaussianSplatQualityModeName(GaussianSplatQualityMode mode) {
+    switch (mode) {
+        case GaussianSplatQualityMode::Fast:
+            return "fast";
+        case GaussianSplatQualityMode::Medium:
+            return "medium";
+        case GaussianSplatQualityMode::SurfaceGuided:
+            return "surface_guided";
+        case GaussianSplatQualityMode::High:
+            return "high";
+    }
+
+    return "fast";
+}
+
+GaussianSplatQualityMode ParseGaussianSplatQualityMode(const json& value) {
+    const auto modeName = value.get<std::string>();
+    if (modeName == "medium") {
+        return GaussianSplatQualityMode::Medium;
+    }
+    if (modeName == "surface_guided" || modeName == "surface") {
+        return GaussianSplatQualityMode::SurfaceGuided;
+    }
+    if (modeName == "high") {
+        return GaussianSplatQualityMode::High;
+    }
+    return GaussianSplatQualityMode::Fast;
+}
+
 json SerializeBinding(const RenderParameterBinding& binding) {
     return json{
         {"active", binding.active},
@@ -683,6 +781,407 @@ ProjectLayerDocument::PointVisual ParsePointCloudVisual(const json& visualJson) 
         visual.style = ParsePointCloudStyle(visualJson.at("point_style"));
     }
     return visual;
+}
+
+std::string TrimAsciiWhitespace(std::string value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), IsJsonWhitespace);
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), IsJsonWhitespace).base();
+    if (first >= last) {
+        return {};
+    }
+    return std::string{first, last};
+}
+
+std::string NormalizeProjectPointVisualName(std::string_view name) {
+    auto normalized = TrimAsciiWhitespace(std::string{name});
+    if (normalized.empty()) {
+        normalized = "Unnamed";
+    }
+    if (normalized.size() > kProjectVisualLegacyEditedSuffix.size() &&
+        normalized.ends_with(kProjectVisualLegacyEditedSuffix)) {
+        normalized.replace(
+            normalized.size() - kProjectVisualLegacyEditedSuffix.size(),
+            kProjectVisualLegacyEditedSuffix.size(),
+            kProjectVisualEditedSuffix);
+    }
+    return normalized;
+}
+
+bool IsProjectEditedPointVisualName(std::string_view name) {
+    const auto normalized = NormalizeProjectPointVisualName(name);
+    return normalized.size() > kProjectVisualEditedSuffix.size() &&
+           normalized.ends_with(kProjectVisualEditedSuffix);
+}
+
+std::string ProjectPointVisualBaseName(std::string_view name) {
+    auto normalized = NormalizeProjectPointVisualName(name);
+    if (IsProjectEditedPointVisualName(normalized)) {
+        normalized.resize(normalized.size() - kProjectVisualEditedSuffix.size());
+    }
+    return normalized.empty() ? std::string{"Unnamed"} : normalized;
+}
+
+std::string ProjectSceneVisualName(std::string_view baseName, std::string_view sceneGroupName) {
+    auto base = ProjectPointVisualBaseName(baseName);
+    auto scene = TrimAsciiWhitespace(std::string{sceneGroupName});
+    if (scene.empty()) {
+        return base;
+    }
+    return base + "_" + scene;
+}
+
+std::string LayerSceneVisualKey(const ProjectLayerDocument& layer) {
+    if (!layer.sceneGroupName.empty()) {
+        return layer.sceneGroupName;
+    }
+    if (!layer.sourcePath.empty()) {
+        return layer.sourcePath.stem().string();
+    }
+    return {};
+}
+
+std::optional<std::size_t> FindPointVisualDocumentIndex(
+    const std::vector<ProjectLayerDocument::PointVisual>& visuals,
+    std::string_view name) {
+    const auto normalized = NormalizeProjectPointVisualName(name);
+    for (std::size_t index = 0; index < visuals.size(); ++index) {
+        if (NormalizeProjectPointVisualName(visuals[index].name) == normalized) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+void UpsertPointVisualDocument(
+    std::vector<ProjectLayerDocument::PointVisual>* visuals,
+    std::string_view name,
+    const PointCloudStyleState& style,
+    bool replaceExisting) {
+    if (visuals == nullptr) {
+        return;
+    }
+
+    const auto normalized = NormalizeProjectPointVisualName(name);
+    if (const auto existing = FindPointVisualDocumentIndex(*visuals, normalized); existing.has_value()) {
+        if (replaceExisting) {
+            (*visuals)[existing.value()].name = normalized;
+            (*visuals)[existing.value()].style = style;
+        }
+        return;
+    }
+
+    visuals->push_back({.name = normalized, .style = style});
+}
+
+std::string NormalizeLegacySceneRole(std::string_view role) {
+    std::string normalized;
+    normalized.reserve(role.size());
+    for (const char character : role) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::toupper(byte)));
+    }
+    return normalized;
+}
+
+void CopyLegacyShorelineSettings(PointCloudStyleState* target, const PointCloudStyleState& source) {
+    if (target == nullptr) {
+        return;
+    }
+    target->shorelineWaveEnabled = source.shorelineWaveEnabled;
+    target->shorelineBoundaryZ = source.shorelineBoundaryZ;
+    target->shorelineHeightReachMeters = source.shorelineHeightReachMeters;
+    target->shorelineEdgeFadeMeters = source.shorelineEdgeFadeMeters;
+    target->shorelineDirectionX = source.shorelineDirectionX;
+    target->shorelineDirectionY = source.shorelineDirectionY;
+    target->shorelinePatternScale = source.shorelinePatternScale;
+    target->shorelineWavelengthMeters = source.shorelineWavelengthMeters;
+    target->shorelineSpeed = source.shorelineSpeed;
+    target->shorelineWarp = source.shorelineWarp;
+    target->shorelineTurbulence = source.shorelineTurbulence;
+    target->shorelineDensity = source.shorelineDensity;
+    target->shorelinePhase = source.shorelinePhase;
+    target->shorelineIntensity = source.shorelineIntensity;
+    target->shorelineEmissionAdd = source.shorelineEmissionAdd;
+    target->shorelineOpacityAdd = source.shorelineOpacityAdd;
+    target->shorelineOpacityMultiply = source.shorelineOpacityMultiply;
+    target->shorelinePointSizeAdd = source.shorelinePointSizeAdd;
+    target->shorelinePointSizeMultiply = source.shorelinePointSizeMultiply;
+    target->shorelineColourMix = source.shorelineColourMix;
+    target->shorelineColour = source.shorelineColour;
+    target->shorelineSeed = source.shorelineSeed;
+}
+
+void CopyLegacyRoughnessMotionSettings(PointCloudStyleState* target, const PointCloudStyleState& source) {
+    if (target == nullptr) {
+        return;
+    }
+    target->roughnessMotionStrength = source.roughnessMotionStrength;
+    target->roughnessMotionScale = source.roughnessMotionScale;
+    target->roughnessMotionSpeed = source.roughnessMotionSpeed;
+    target->roughnessMotionThreshold = source.roughnessMotionThreshold;
+    target->roughnessMotionGroundId = source.roughnessMotionGroundId;
+    target->roughnessMotionFullLayer = source.roughnessMotionFullLayer;
+}
+
+void MergeLegacySceneRoleSpecificVisualSettings(
+    PointCloudStyleState* target,
+    const PointCloudStyleState& source,
+    std::string_view role) {
+    if (target == nullptr) {
+        return;
+    }
+    const auto normalizedRole = NormalizeLegacySceneRole(role);
+    if (normalizedRole == "SAND" && source.shorelineWaveEnabled) {
+        CopyLegacyShorelineSettings(target, source);
+    }
+    if (normalizedRole == "VEG" &&
+        invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(source)) {
+        CopyLegacyRoughnessMotionSettings(target, source);
+    }
+}
+
+std::optional<std::size_t> FindSceneVisualStateIndex(
+    const std::vector<ScenePointVisualStateDocument>& states,
+    std::string_view sceneGroupName,
+    std::string_view visualName) {
+    const auto scene = TrimAsciiWhitespace(std::string{sceneGroupName});
+    const auto visual = NormalizeProjectPointVisualName(visualName);
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        if (states[index].sceneGroupName == scene &&
+            NormalizeProjectPointVisualName(states[index].visual.name) == visual) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+void UpsertSceneVisualStateDocument(
+    std::vector<ScenePointVisualStateDocument>* states,
+    std::string_view sceneGroupName,
+    std::string_view visualName,
+    const PointCloudStyleState& style) {
+    if (states == nullptr) {
+        return;
+    }
+
+    const auto scene = TrimAsciiWhitespace(std::string{sceneGroupName});
+    if (scene.empty()) {
+        return;
+    }
+
+    ScenePointVisualStateDocument state;
+    state.sceneGroupName = scene;
+    state.visual.name = NormalizeProjectPointVisualName(visualName);
+    state.visual.style = style;
+    if (const auto existing = FindSceneVisualStateIndex(*states, scene, state.visual.name);
+        existing.has_value()) {
+        (*states)[existing.value()] = std::move(state);
+    } else {
+        states->push_back(std::move(state));
+    }
+}
+
+void PruneSceneVisualStatesToKnownSceneGroups(ProjectDocument* document) {
+    if (document == nullptr || document->sceneVisualStates.empty()) {
+        return;
+    }
+
+    std::unordered_set<std::string> knownSceneGroups;
+    for (const auto& layer : document->layers) {
+        auto sceneGroup = TrimAsciiWhitespace(layer.sceneGroupName);
+        if (!sceneGroup.empty()) {
+            knownSceneGroups.insert(std::move(sceneGroup));
+        }
+    }
+    if (knownSceneGroups.empty()) {
+        return;
+    }
+
+    document->sceneVisualStates.erase(
+        std::remove_if(
+            document->sceneVisualStates.begin(),
+            document->sceneVisualStates.end(),
+            [&knownSceneGroups](const ScenePointVisualStateDocument& state) {
+                return knownSceneGroups.find(TrimAsciiWhitespace(state.sceneGroupName)) ==
+                       knownSceneGroups.end();
+            }),
+        document->sceneVisualStates.end());
+}
+
+bool SceneGroupHasName(std::string_view sceneGroupName, std::string_view expected) {
+    return TrimAsciiWhitespace(std::string{sceneGroupName}) == expected;
+}
+
+void MigrateLegacyLayerPointVisuals(ProjectDocument* document) {
+    if (document == nullptr) {
+        return;
+    }
+
+    const bool alreadyHasProjectVisuals = !document->pointVisuals.empty();
+    bool selectedFromExhibitionScene = false;
+    std::optional<std::string> firstLegacySelectedBase;
+
+    for (const auto& layer : document->layers) {
+        if (layer.kind != SerializedLayerKind::PointCloud) {
+            continue;
+        }
+
+        const bool exhibitionSceneLayer = SceneGroupHasName(layer.sceneGroupName, "ExhibitionScene");
+        const auto sceneKey = LayerSceneVisualKey(layer);
+        const auto selectedName = NormalizeProjectPointVisualName(layer.selectedPointVisualName);
+        if (!selectedName.empty() && !firstLegacySelectedBase.has_value()) {
+            firstLegacySelectedBase = ProjectPointVisualBaseName(selectedName);
+        }
+
+        if (layer.pointStyle.has_value() && layer.pointVisuals.empty() && !alreadyHasProjectVisuals) {
+            const auto fallbackName = ProjectPointVisualBaseName(selectedName);
+            UpsertPointVisualDocument(
+                &document->pointVisuals,
+                fallbackName,
+                layer.pointStyle.value(),
+                exhibitionSceneLayer);
+        }
+
+        for (const auto& legacyVisual : layer.pointVisuals) {
+            const auto visualName = NormalizeProjectPointVisualName(legacyVisual.name);
+            const auto baseName = ProjectPointVisualBaseName(visualName);
+            const bool selectedLegacyVisual = visualName == selectedName;
+            const bool editedLegacyVisual = IsProjectEditedPointVisualName(visualName);
+
+            if (exhibitionSceneLayer) {
+                if (editedLegacyVisual && selectedLegacyVisual) {
+                    if (const auto existing = FindPointVisualDocumentIndex(document->pointVisuals, baseName);
+                        existing.has_value()) {
+                        if (!selectedFromExhibitionScene) {
+                            document->pointVisuals[existing.value()].style = legacyVisual.style;
+                        }
+                        MergeLegacySceneRoleSpecificVisualSettings(
+                            &document->pointVisuals[existing.value()].style,
+                            legacyVisual.style,
+                            layer.sceneRole);
+                    } else {
+                        UpsertPointVisualDocument(
+                            &document->pointVisuals,
+                            baseName,
+                            legacyVisual.style,
+                            true);
+                    }
+                    document->selectedPointVisualName = baseName;
+                    selectedFromExhibitionScene = true;
+                } else if (!editedLegacyVisual) {
+                    if (const auto existing = FindPointVisualDocumentIndex(document->pointVisuals, visualName);
+                        existing.has_value()) {
+                        MergeLegacySceneRoleSpecificVisualSettings(
+                            &document->pointVisuals[existing.value()].style,
+                            legacyVisual.style,
+                            layer.sceneRole);
+                    } else {
+                        UpsertPointVisualDocument(
+                            &document->pointVisuals,
+                            visualName,
+                            legacyVisual.style,
+                            !alreadyHasProjectVisuals);
+                    }
+                    if (selectedLegacyVisual && !selectedFromExhibitionScene) {
+                        document->selectedPointVisualName = visualName;
+                        selectedFromExhibitionScene = true;
+                    }
+                }
+                continue;
+            }
+
+            if (editedLegacyVisual) {
+                if (!sceneKey.empty()) {
+                    UpsertSceneVisualStateDocument(
+                        &document->sceneVisualStates,
+                        sceneKey,
+                        ProjectSceneVisualName(baseName, sceneKey),
+                        legacyVisual.style);
+                } else if (!alreadyHasProjectVisuals) {
+                    UpsertPointVisualDocument(&document->pointVisuals, baseName, legacyVisual.style, false);
+                }
+                continue;
+            }
+
+            UpsertPointVisualDocument(
+                &document->pointVisuals,
+                visualName,
+                legacyVisual.style,
+                false);
+        }
+    }
+
+    if (document->pointVisuals.empty()) {
+        document->pointVisuals.push_back(
+            {.name = std::string{"Unnamed"}, .style = PointCloudStyleState{}});
+    }
+
+    document->selectedPointVisualName = ProjectPointVisualBaseName(
+        selectedFromExhibitionScene
+            ? document->selectedPointVisualName
+            : firstLegacySelectedBase.value_or(document->selectedPointVisualName));
+
+    if (!FindPointVisualDocumentIndex(document->pointVisuals, document->selectedPointVisualName).has_value()) {
+        document->selectedPointVisualName = NormalizeProjectPointVisualName(document->pointVisuals.front().name);
+    }
+}
+
+json SerializeScenePointVisualState(const ScenePointVisualStateDocument& state) {
+    return json{
+        {"scene_group", state.sceneGroupName},
+        {"visual", SerializePointCloudVisual(state.visual)},
+    };
+}
+
+ScenePointVisualStateDocument ParseScenePointVisualState(const json& stateJson) {
+    ScenePointVisualStateDocument state;
+    state.sceneGroupName = stateJson.value("scene_group", std::string{});
+    if (stateJson.contains("visual")) {
+        state.visual = ParsePointCloudVisual(stateJson.at("visual"));
+    }
+    if (state.visual.name.empty()) {
+        state.visual.name = ProjectSceneVisualName("Unnamed", state.sceneGroupName);
+    }
+    return state;
+}
+
+json SerializeGaussianSplatStyle(const GaussianSplatStyleState& style) {
+    return json{
+        {"color_mode", GaussianSplatColorModeName(style.colorMode)},
+        {"debug_mode", GaussianSplatDebugModeName(style.debugMode)},
+        {"quality_mode", GaussianSplatQualityModeName(style.qualityMode)},
+        {"opacity_multiplier", style.opacityMultiplier},
+        {"scale_multiplier", style.scaleMultiplier},
+        {"exposure", style.exposure},
+        {"saturation", style.saturation},
+        {"layer_tint", style.layerTint},
+    };
+}
+
+GaussianSplatStyleState ParseGaussianSplatStyle(const json& styleJson) {
+    GaussianSplatStyleState style;
+    if (styleJson.contains("color_mode")) {
+        style.colorMode = ParseGaussianSplatColorMode(styleJson.at("color_mode"));
+    }
+    if (styleJson.contains("debug_mode")) {
+        style.debugMode = ParseGaussianSplatDebugMode(styleJson.at("debug_mode"));
+    }
+    if (styleJson.contains("quality_mode")) {
+        style.qualityMode = ParseGaussianSplatQualityMode(styleJson.at("quality_mode"));
+    }
+    style.opacityMultiplier =
+        std::clamp(styleJson.value("opacity_multiplier", style.opacityMultiplier), 0.0F, 64.0F);
+    style.scaleMultiplier =
+        std::clamp(styleJson.value("scale_multiplier", style.scaleMultiplier), 0.001F, 64.0F);
+    style.exposure = std::clamp(styleJson.value("exposure", style.exposure), 0.0F, 64.0F);
+    style.saturation = std::clamp(styleJson.value("saturation", style.saturation), 0.0F, 64.0F);
+    if (styleJson.contains("layer_tint")) {
+        style.layerTint = styleJson.at("layer_tint").get<std::array<float, 4>>();
+    }
+    return style;
 }
 
 PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
@@ -943,18 +1442,6 @@ json SerializeProjectLayer(const ProjectLayerDocument& layer) {
     }
     if (!layer.selectedSceneVariantPath.empty()) {
         layerJson["selected_scene_variant_path"] = layer.selectedSceneVariantPath.generic_string();
-    }
-    if (layer.pointStyle.has_value()) {
-        layerJson["point_style"] = SerializePointCloudStyle(layer.pointStyle.value());
-    }
-    if (!layer.pointVisuals.empty()) {
-        json visualsJson = json::array();
-        for (const auto& visual : layer.pointVisuals) {
-            visualsJson.push_back(SerializePointCloudVisual(visual));
-        }
-        layerJson["point_visuals"] = std::move(visualsJson);
-        layerJson["selected_point_visual"] =
-            layer.selectedPointVisualName.empty() ? std::string{"Unnamed"} : layer.selectedPointVisualName;
     }
     return layerJson;
 }
@@ -1354,6 +1841,13 @@ json SerializeRenderJobSettings(const RenderJobSettings& settings) {
         {"end_frame", settings.endFrame},
         {"from_shot_index", settings.fromShotIndex},
         {"to_shot_index", settings.toShotIndex},
+        {"supersample_scale", settings.supersampleScale},
+        {"spatial_antialiasing", settings.spatialAntialiasing},
+        {"temporal_supersampling", settings.temporalSupersampling},
+        {"temporal_sample_count", settings.temporalSampleCount},
+        {"motion_blur", settings.motionBlur},
+        {"motion_blur_sample_count", settings.motionBlurSampleCount},
+        {"motion_blur_shutter_angle_degrees", settings.motionBlurShutterAngleDegrees},
     };
 }
 
@@ -1370,7 +1864,106 @@ RenderJobSettings ParseRenderJobSettings(const json& settingsJson) {
     settings.endFrame = settingsJson.value("end_frame", 0U);
     settings.fromShotIndex = settingsJson.value("from_shot_index", static_cast<std::size_t>(0U));
     settings.toShotIndex = settingsJson.value("to_shot_index", static_cast<std::size_t>(1U));
+    settings.supersampleScale =
+        std::clamp(settingsJson.value("supersample_scale", settings.supersampleScale), 1U, 8U);
+    settings.spatialAntialiasing =
+        settingsJson.value("spatial_antialiasing", settings.spatialAntialiasing);
+    settings.temporalSupersampling =
+        settingsJson.value("temporal_supersampling", settings.temporalSupersampling);
+    settings.temporalSampleCount =
+        std::clamp(settingsJson.value("temporal_sample_count", settings.temporalSampleCount), 1U, 64U);
+    settings.motionBlur = settingsJson.value("motion_blur", settings.motionBlur);
+    settings.motionBlurSampleCount =
+        std::clamp(settingsJson.value("motion_blur_sample_count", settings.motionBlurSampleCount), 1U, 64U);
+    settings.motionBlurShutterAngleDegrees =
+        std::clamp(
+            settingsJson.value(
+                "motion_blur_shutter_angle_degrees",
+                settings.motionBlurShutterAngleDegrees),
+            0.0F,
+            360.0F);
     return settings;
+}
+
+const char* AnimationExportModeName(AnimationExportMode mode) {
+    switch (mode) {
+        case AnimationExportMode::FastPreviewMp4:
+            return "fast_preview_mp4";
+        case AnimationExportMode::HqPreviewDensityExr:
+            return "hq_preview_density_exr";
+        case AnimationExportMode::ProRes422Mov:
+            return "prores_422_mov";
+        case AnimationExportMode::ProRes422HqMov:
+            return "prores_422_hq_mov";
+        case AnimationExportMode::ProRes422VideoToolboxMov:
+            return "prores_422_videotoolbox_mov";
+        case AnimationExportMode::ProRes422HqVideoToolboxMov:
+            return "prores_422_hq_videotoolbox_mov";
+        case AnimationExportMode::ProRes4444Mov:
+            return "prores_4444_mov";
+        case AnimationExportMode::ProRes4444XqMov:
+            return "prores_4444_xq_mov";
+        case AnimationExportMode::ProRes4444VideoToolboxMov:
+            return "prores_4444_videotoolbox_mov";
+        case AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            return "prores_4444_xq_videotoolbox_mov";
+    }
+
+    return "fast_preview_mp4";
+}
+
+AnimationExportMode ParseAnimationExportMode(const json& modeJson) {
+    const auto mode = modeJson.is_string()
+                          ? modeJson.get<std::string>()
+                          : std::string{AnimationExportModeName(AnimationExportMode::FastPreviewMp4)};
+    if (mode == "hq_preview_density_exr" || mode == "hq_exr") {
+        return AnimationExportMode::HqPreviewDensityExr;
+    }
+    if (mode == "prores_422_mov" || mode == "prores_422") {
+        return AnimationExportMode::ProRes422Mov;
+    }
+    if (mode == "prores_422_hq_mov" || mode == "prores_422_hq") {
+        return AnimationExportMode::ProRes422HqMov;
+    }
+    if (mode == "prores_422_videotoolbox_mov" || mode == "prores_422_videotoolbox") {
+        return AnimationExportMode::ProRes422VideoToolboxMov;
+    }
+    if (mode == "prores_422_hq_videotoolbox_mov" || mode == "prores_422_hq_videotoolbox") {
+        return AnimationExportMode::ProRes422HqVideoToolboxMov;
+    }
+    if (mode == "prores_4444_mov" || mode == "prores_4444") {
+        return AnimationExportMode::ProRes4444Mov;
+    }
+    if (mode == "prores_4444_xq_mov" || mode == "prores_4444_xq") {
+        return AnimationExportMode::ProRes4444XqMov;
+    }
+    if (mode == "prores_4444_videotoolbox_mov" || mode == "prores_4444_videotoolbox") {
+        return AnimationExportMode::ProRes4444VideoToolboxMov;
+    }
+    if (mode == "prores_4444_xq_videotoolbox_mov" || mode == "prores_4444_xq_videotoolbox") {
+        return AnimationExportMode::ProRes4444XqVideoToolboxMov;
+    }
+    return AnimationExportMode::FastPreviewMp4;
+}
+
+json SerializeExportPreset(const ExportPreset& preset) {
+    return json{
+        {"name", preset.name},
+        {"mode", AnimationExportModeName(preset.mode)},
+        {"settings", SerializeRenderJobSettings(preset.settings)},
+    };
+}
+
+ExportPreset ParseExportPreset(const json& presetJson) {
+    ExportPreset preset = invisible_places::output::MakeFastPreviewMp4ExportPreset();
+    preset.name = presetJson.value("name", preset.name);
+    if (presetJson.contains("mode")) {
+        preset.mode = ParseAnimationExportMode(presetJson.at("mode"));
+    }
+    if (presetJson.contains("settings")) {
+        preset.settings = ParseRenderJobSettings(presetJson.at("settings"));
+    }
+    return preset;
 }
 
 json SerializeSavedAnimation(const ProjectDocument::SavedAnimation& animation) {
@@ -2171,6 +2764,349 @@ WaterFieldTrailSettings ParseWaterFieldTrailSettings(const json& settingsJson) {
     settings.speedMetersPerSecond = settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond);
     settings.fadeOnLowConfidence = settingsJson.value("fade_on_low_confidence", settings.fadeOnLowConfidence);
     return settings;
+}
+
+json SerializeWaterDynamicMeshMotionKeyframe(const invisible_places::water::WaterDynamicMeshMotionKeyframe& keyframe) {
+    return json{
+        {"time_seconds", keyframe.timeSeconds},
+        {"position", {keyframe.position.x, keyframe.position.y, keyframe.position.z}},
+    };
+}
+
+invisible_places::water::WaterDynamicMeshMotionKeyframe ParseWaterDynamicMeshMotionKeyframe(
+    const json& keyframeJson) {
+    invisible_places::water::WaterDynamicMeshMotionKeyframe keyframe;
+    keyframe.timeSeconds = std::clamp(keyframeJson.value("time_seconds", keyframe.timeSeconds), 0.0F, 86400.0F);
+    if (keyframeJson.contains("position")) {
+        const auto position = keyframeJson.at("position").get<std::array<float, 3>>();
+        keyframe.position = {position[0], position[1], position[2]};
+    }
+    return keyframe;
+}
+
+json SerializeWaterDynamicMeshAttractor(const WaterDynamicMeshAttractor& attractor) {
+    json attractorJson{
+        {"id", attractor.id},
+        {"name", attractor.name},
+        {"position", {attractor.position.x, attractor.position.y, attractor.position.z}},
+        {"radius_meters", attractor.radiusMeters},
+        {"strength", attractor.strength},
+        {"enabled", attractor.enabled},
+    };
+    if (!attractor.keyframes.empty()) {
+        attractorJson["keyframes"] = json::array();
+        for (const auto& keyframe : attractor.keyframes) {
+            attractorJson["keyframes"].push_back(SerializeWaterDynamicMeshMotionKeyframe(keyframe));
+        }
+    }
+    return attractorJson;
+}
+
+WaterDynamicMeshAttractor ParseWaterDynamicMeshAttractor(const json& attractorJson) {
+    WaterDynamicMeshAttractor attractor;
+    attractor.id = attractorJson.value("id", attractor.id);
+    attractor.name = attractorJson.value("name", attractor.name);
+    if (attractorJson.contains("position")) {
+        const auto position = attractorJson.at("position").get<std::array<float, 3>>();
+        attractor.position = {position[0], position[1], position[2]};
+    }
+    attractor.radiusMeters = std::clamp(
+        attractorJson.value("radius_meters", attractor.radiusMeters),
+        0.001F,
+        100.0F);
+    attractor.strength = std::clamp(attractorJson.value("strength", attractor.strength), 0.0F, 10.0F);
+    attractor.enabled = attractorJson.value("enabled", attractor.enabled);
+    if (attractorJson.contains("keyframes") && attractorJson.at("keyframes").is_array()) {
+        attractor.keyframes.clear();
+        for (const auto& keyframeJson : attractorJson.at("keyframes")) {
+            attractor.keyframes.push_back(ParseWaterDynamicMeshMotionKeyframe(keyframeJson));
+        }
+    }
+    return attractor;
+}
+
+json SerializeWaterDynamicMeshEmitterMotion(
+    const invisible_places::water::WaterDynamicMeshEmitterMotion& motion) {
+    json motionJson{
+        {"emitter_id", motion.emitterId},
+        {"name", motion.name},
+        {"enabled", motion.enabled},
+        {"keyframes", json::array()},
+    };
+    for (const auto& keyframe : motion.keyframes) {
+        motionJson["keyframes"].push_back(SerializeWaterDynamicMeshMotionKeyframe(keyframe));
+    }
+    return motionJson;
+}
+
+invisible_places::water::WaterDynamicMeshEmitterMotion ParseWaterDynamicMeshEmitterMotion(
+    const json& motionJson) {
+    invisible_places::water::WaterDynamicMeshEmitterMotion motion;
+    motion.emitterId = motionJson.value("emitter_id", motion.emitterId);
+    motion.name = motionJson.value("name", motion.name);
+    motion.enabled = motionJson.value("enabled", motion.enabled);
+    if (motionJson.contains("keyframes") && motionJson.at("keyframes").is_array()) {
+        motion.keyframes.clear();
+        for (const auto& keyframeJson : motionJson.at("keyframes")) {
+            motion.keyframes.push_back(ParseWaterDynamicMeshMotionKeyframe(keyframeJson));
+        }
+    }
+    return motion;
+}
+
+json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& settings) {
+    json settingsJson{
+        {"enabled", settings.enabled},
+        {"gpu_preview_enabled", settings.gpuPreviewEnabled},
+        {"cache_cell_size_meters", settings.cacheCellSizeMeters},
+        {"projection_search_radius_meters", settings.projectionSearchRadiusMeters},
+        {"ambiguity_height_meters", settings.ambiguityHeightMeters},
+        {"preview_particle_limit", settings.previewParticleLimit},
+        {"final_particle_limit", settings.finalParticleLimit},
+        {"trail_length_meters", settings.trailLengthMeters},
+        {"step_meters", settings.stepMeters},
+        {"trail_width_meters", settings.trailWidthMeters},
+        {"trail_streak_length_meters", settings.trailStreakLengthMeters},
+        {"surface_offset_meters", settings.surfaceOffsetMeters},
+        {"speed_meters_per_second", settings.speedMetersPerSecond},
+        {"downhill_weight", settings.downhillWeight},
+        {"attractor_weight", settings.attractorWeight},
+        {"source_velocity_weight", settings.sourceVelocityWeight},
+        {"curl_strength", settings.curlStrength},
+        {"branching_strength", settings.branchingStrength},
+        {"eddy_strength", settings.eddyStrength},
+        {"topology_response", settings.topologyResponse},
+        {"inertia", settings.inertia},
+        {"animation_duration_seconds", settings.animationDurationSeconds},
+        {"seed", settings.seed},
+        {"particle_preset_name", settings.particlePresetName},
+        {"trail_profile_name", settings.trailProfileName},
+    };
+    if (!settings.attractors.empty()) {
+        settingsJson["attractors"] = json::array();
+        for (const auto& attractor : settings.attractors) {
+            settingsJson["attractors"].push_back(SerializeWaterDynamicMeshAttractor(attractor));
+        }
+    }
+    if (!settings.emitterMotions.empty()) {
+        settingsJson["emitter_motions"] = json::array();
+        for (const auto& motion : settings.emitterMotions) {
+            settingsJson["emitter_motions"].push_back(SerializeWaterDynamicMeshEmitterMotion(motion));
+        }
+    }
+    return settingsJson;
+}
+
+WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& settingsJson) {
+    auto settings = invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
+    settings.enabled = settingsJson.value("enabled", settings.enabled);
+    settings.gpuPreviewEnabled = settingsJson.value("gpu_preview_enabled", settings.gpuPreviewEnabled);
+    settings.meshPath = settingsJson.value("mesh_path", settings.meshPath.generic_string());
+    settings.cacheCellSizeMeters = std::clamp(
+        settingsJson.value("cache_cell_size_meters", settings.cacheCellSizeMeters),
+        0.005F,
+        5.0F);
+    settings.projectionSearchRadiusMeters = std::clamp(
+        settingsJson.value("projection_search_radius_meters", settings.projectionSearchRadiusMeters),
+        0.005F,
+        25.0F);
+    settings.ambiguityHeightMeters = std::clamp(
+        settingsJson.value("ambiguity_height_meters", settings.ambiguityHeightMeters),
+        0.0F,
+        25.0F);
+    settings.previewParticleLimit = std::clamp<std::uint32_t>(
+        settingsJson.value("preview_particle_limit", settings.previewParticleLimit),
+        1U,
+        100000U);
+    settings.finalParticleLimit = std::clamp<std::uint32_t>(
+        settingsJson.value("final_particle_limit", settings.finalParticleLimit),
+        1U,
+        250000U);
+    settings.trailLengthMeters = std::clamp(
+        settingsJson.value("trail_length_meters", settings.trailLengthMeters),
+        0.02F,
+        100.0F);
+    settings.stepMeters = std::clamp(settingsJson.value("step_meters", settings.stepMeters), 0.002F, 5.0F);
+    settings.trailWidthMeters = std::clamp(
+        settingsJson.value("trail_width_meters", settings.trailWidthMeters),
+        0.0005F,
+        1.0F);
+    settings.trailStreakLengthMeters = std::clamp(
+        settingsJson.value("trail_streak_length_meters", settings.trailStreakLengthMeters),
+        0.001F,
+        5.0F);
+    settings.surfaceOffsetMeters = std::clamp(
+        settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters),
+        -1.0F,
+        1.0F);
+    settings.speedMetersPerSecond = std::clamp(
+        settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond),
+        0.001F,
+        100.0F);
+    settings.downhillWeight = std::clamp(settingsJson.value("downhill_weight", settings.downhillWeight), 0.0F, 10.0F);
+    settings.attractorWeight = std::clamp(
+        settingsJson.value("attractor_weight", settings.attractorWeight),
+        0.0F,
+        10.0F);
+    settings.sourceVelocityWeight = std::clamp(
+        settingsJson.value("source_velocity_weight", settings.sourceVelocityWeight),
+        0.0F,
+        10.0F);
+    settings.curlStrength = std::clamp(settingsJson.value("curl_strength", settings.curlStrength), 0.0F, 10.0F);
+    settings.branchingStrength = std::clamp(
+        settingsJson.value("branching_strength", settings.branchingStrength),
+        0.0F,
+        10.0F);
+    settings.eddyStrength = std::clamp(settingsJson.value("eddy_strength", settings.eddyStrength), 0.0F, 10.0F);
+    settings.topologyResponse = std::clamp(
+        settingsJson.value("topology_response", settings.topologyResponse),
+        0.0F,
+        10.0F);
+    settings.inertia = std::clamp(settingsJson.value("inertia", settings.inertia), 0.0F, 0.98F);
+    settings.animationDurationSeconds = std::clamp(
+        settingsJson.value("animation_duration_seconds", settings.animationDurationSeconds),
+        0.0F,
+        86400.0F);
+    settings.seed = settingsJson.value("seed", settings.seed);
+    settings.particlePresetName = std::string{
+        invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(
+            settingsJson.value("particle_preset_name", settings.particlePresetName))};
+    settings.trailProfileName = settingsJson.value("trail_profile_name", settings.trailProfileName);
+    if (settingsJson.contains("attractors") && settingsJson.at("attractors").is_array()) {
+        settings.attractors.clear();
+        for (const auto& attractorJson : settingsJson.at("attractors")) {
+            settings.attractors.push_back(ParseWaterDynamicMeshAttractor(attractorJson));
+        }
+    }
+    if (settingsJson.contains("emitter_motions") && settingsJson.at("emitter_motions").is_array()) {
+        settings.emitterMotions.clear();
+        for (const auto& motionJson : settingsJson.at("emitter_motions")) {
+            settings.emitterMotions.push_back(ParseWaterDynamicMeshEmitterMotion(motionJson));
+        }
+    }
+    return settings;
+}
+
+WaterDynamicMeshFlowSettings ProjectLevelWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings) {
+    settings.meshPath.clear();
+    settings.attractors.clear();
+    settings.emitterMotions.clear();
+    return settings;
+}
+
+json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
+    json stateJson{
+        {"scene_group", state.sceneGroupName.empty() ? std::string{"Default"} : state.sceneGroupName},
+        {"water_emitters", json::array()},
+        {"water_ripple_layers", json::array()},
+        {"water_field_layers", json::array()},
+        {"water_ripple_runtime_caches", json::array()},
+        {"dynamic_mesh_path", state.dynamicMeshPath.generic_string()},
+        {"dynamic_mesh_attractors", json::array()},
+        {"dynamic_mesh_emitter_motions", json::array()},
+    };
+    for (const auto& emitter : state.emitters) {
+        stateJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
+    }
+    for (const auto& layer : state.rippleLayers) {
+        stateJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
+    }
+    for (const auto& layer : state.fieldLayers) {
+        stateJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
+    }
+    if (state.pathCache.has_value() && !state.pathCache->branches.empty()) {
+        stateJson["water_path_cache"] = SerializeWaterPathCache(state.pathCache.value());
+    }
+    for (const auto& cache : state.rippleRuntimeCaches) {
+        if (ShouldSerializeWaterRippleRuntimeCache(cache)) {
+            stateJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
+        }
+    }
+    for (const auto& attractor : state.dynamicMeshAttractors) {
+        stateJson["dynamic_mesh_attractors"].push_back(SerializeWaterDynamicMeshAttractor(attractor));
+    }
+    for (const auto& motion : state.dynamicMeshEmitterMotions) {
+        stateJson["dynamic_mesh_emitter_motions"].push_back(SerializeWaterDynamicMeshEmitterMotion(motion));
+    }
+    return stateJson;
+}
+
+WaterSceneStateDocument ParseWaterSceneState(const json& stateJson) {
+    WaterSceneStateDocument state;
+    state.sceneGroupName = stateJson.value("scene_group", state.sceneGroupName);
+    if (state.sceneGroupName.empty()) {
+        state.sceneGroupName = "Default";
+    }
+    state.dynamicMeshPath = stateJson.value("dynamic_mesh_path", std::string{});
+    if (stateJson.contains("water_emitters") && stateJson.at("water_emitters").is_array()) {
+        for (const auto& emitterJson : stateJson.at("water_emitters")) {
+            state.emitters.push_back(ParseWaterEmitter(emitterJson));
+        }
+    }
+    if (stateJson.contains("water_ripple_layers") && stateJson.at("water_ripple_layers").is_array()) {
+        for (const auto& layerJson : stateJson.at("water_ripple_layers")) {
+            state.rippleLayers.push_back(ParseWaterEffectLayer(layerJson));
+        }
+    }
+    if (stateJson.contains("water_field_layers") && stateJson.at("water_field_layers").is_array()) {
+        for (const auto& layerJson : stateJson.at("water_field_layers")) {
+            auto layer = ParseWaterEffectLayer(layerJson);
+            if (!layerJson.contains("feature_type")) {
+                layer.featureType = WaterEffectFeatureType::FieldSurfaceMotion;
+            }
+            state.fieldLayers.push_back(std::move(layer));
+        }
+    }
+    if (stateJson.contains("water_path_cache")) {
+        state.pathCache = ParseWaterPathCache(stateJson.at("water_path_cache"));
+    }
+    if (stateJson.contains("water_ripple_runtime_caches") &&
+        stateJson.at("water_ripple_runtime_caches").is_array()) {
+        for (const auto& cacheJson : stateJson.at("water_ripple_runtime_caches")) {
+            auto cache = ParseWaterRippleRuntimeCache(cacheJson);
+            if (!cache.memberships.empty() && !cache.params.empty()) {
+                state.rippleRuntimeCaches.push_back(std::move(cache));
+            }
+        }
+    }
+    if (stateJson.contains("dynamic_mesh_attractors") &&
+        stateJson.at("dynamic_mesh_attractors").is_array()) {
+        for (const auto& attractorJson : stateJson.at("dynamic_mesh_attractors")) {
+            state.dynamicMeshAttractors.push_back(ParseWaterDynamicMeshAttractor(attractorJson));
+        }
+    }
+    if (stateJson.contains("dynamic_mesh_emitter_motions") &&
+        stateJson.at("dynamic_mesh_emitter_motions").is_array()) {
+        for (const auto& motionJson : stateJson.at("dynamic_mesh_emitter_motions")) {
+            state.dynamicMeshEmitterMotions.push_back(ParseWaterDynamicMeshEmitterMotion(motionJson));
+        }
+    }
+    return state;
+}
+
+bool WaterSceneStateHasPayload(const WaterSceneStateDocument& state) {
+    return !state.emitters.empty() ||
+           !state.rippleLayers.empty() ||
+           !state.fieldLayers.empty() ||
+           (state.pathCache.has_value() && !state.pathCache->branches.empty()) ||
+           !state.rippleRuntimeCaches.empty() ||
+           !state.dynamicMeshPath.empty() ||
+           !state.dynamicMeshAttractors.empty() ||
+           !state.dynamicMeshEmitterMotions.empty();
+}
+
+WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocument& document) {
+    WaterSceneStateDocument state;
+    state.sceneGroupName = "Default";
+    state.emitters = document.waterEmitters;
+    state.rippleLayers = document.waterRippleLayers;
+    state.fieldLayers = document.waterFieldLayers;
+    state.pathCache = document.waterPathCache;
+    state.rippleRuntimeCaches = document.waterRippleRuntimeCaches;
+    state.dynamicMeshPath = document.waterDynamicMeshFlowSettings.meshPath;
+    state.dynamicMeshAttractors = document.waterDynamicMeshFlowSettings.attractors;
+    state.dynamicMeshEmitterMotions = document.waterDynamicMeshFlowSettings.emitterMotions;
+    return state;
 }
 
 json SerializeWaterRainSettings(const WaterRainSettings& settings) {
@@ -3143,15 +4079,23 @@ bool SaveProjectDocument(
         {"last_animation_path", document.lastAnimationPath.generic_string()},
         {"background_color", document.backgroundColor},
         {"eye_dome_lighting_enabled", document.eyeDomeLightingEnabled},
+        {"pro_res_alpha_preview_enabled", document.proResAlphaPreviewEnabled},
         {"eye_dome_lighting_thickness", document.eyeDomeLightingThickness},
         {"constant_update_view", document.constantUpdateView},
         {"live_visual_effects", document.liveVisualEffects},
         {"side_panel_pinned", document.sidePanelPinned},
         {"auto_lower_gsplat_quality_while_navigating", document.autoLowerGsplatQualityWhileNavigating},
+        {"point_visuals", json::array()},
+        {"selected_point_visual", document.selectedPointVisualName.empty() ? std::string{"Unnamed"}
+                                                                           : document.selectedPointVisualName},
+        {"scene_visual_states", json::array()},
+        {"gsplat_visual_style", SerializeGaussianSplatStyle(document.gsplatVisualStyle)},
         {"point_cloud_preview_lod_mode", PointCloudPreviewLodModeName(document.pointCloudPreviewLodMode)},
         {"interactive_point_cap", document.interactivePointCap},
         {"point_cloud_renderer_mode", PointCloudRendererModeName(document.pointCloudRendererMode)},
         {"render_job", SerializeRenderJobSettings(document.renderJobSettings)},
+        {"export_presets", json::array()},
+        {"selected_export_preset", document.selectedExportPresetName},
         {"water_source_settings", SerializeWaterSourceSettings(document.waterSourceSettings)},
         {"water_animation_trail_settings", SerializeWaterAnimationTrailSettings(document.waterAnimationTrailSettings)},
         {"water_animation_trail_profiles", json::array()},
@@ -3166,23 +4110,37 @@ bool SaveProjectDocument(
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
         {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.waterFieldTrailSettings)},
+        {"water_dynamic_mesh_flow_settings",
+         SerializeWaterDynamicMeshFlowSettings(
+             ProjectLevelWaterDynamicMeshFlowSettings(document.waterDynamicMeshFlowSettings))},
         {"water_rain_settings", SerializeWaterRainSettings(document.waterRainSettings)},
         {"selected_water_rain_trail_profile", document.selectedWaterRainTrailProfileName},
         {"water_point_visuals", json::array()},
         {"selected_water_point_visual", document.selectedWaterPointVisualName},
-        {"water_ripple_layers", json::array()},
-        {"water_field_layers", json::array()},
-        {"water_ripple_runtime_caches", json::array()},
+        {"water_scene_states", json::array()},
     };
-    for (const auto& layer : document.waterRippleLayers) {
-        projectJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
+    for (const auto& visual : document.pointVisuals) {
+        projectJson["point_visuals"].push_back(SerializePointCloudVisual(visual));
     }
-    for (const auto& layer : document.waterFieldLayers) {
-        projectJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
+    for (const auto& state : document.sceneVisualStates) {
+        projectJson["scene_visual_states"].push_back(SerializeScenePointVisualState(state));
     }
-    for (const auto& cache : document.waterRippleRuntimeCaches) {
-        if (ShouldSerializeWaterRippleRuntimeCache(cache)) {
-            projectJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
+    for (const auto& preset : document.exportPresets) {
+        projectJson["export_presets"].push_back(SerializeExportPreset(preset));
+    }
+    if (document.tempExportPreset.has_value()) {
+        projectJson["temp_export_preset"] = SerializeExportPreset(document.tempExportPreset.value());
+    }
+    if (!document.waterSceneStates.empty()) {
+        for (const auto& state : document.waterSceneStates) {
+            if (WaterSceneStateHasPayload(state)) {
+                projectJson["water_scene_states"].push_back(SerializeWaterSceneState(state));
+            }
+        }
+    } else {
+        const auto fallbackSceneState = MakeDefaultWaterSceneStateFromProject(document);
+        if (WaterSceneStateHasPayload(fallbackSceneState)) {
+            projectJson["water_scene_states"].push_back(SerializeWaterSceneState(fallbackSceneState));
         }
     }
     for (const auto& profile : document.waterAnimationTrailProfiles) {
@@ -3228,9 +4186,6 @@ bool SaveProjectDocument(
         projectJson["temp_water_caustic_look_settings"] =
             SerializeWaterCausticLookSettings(document.tempWaterCausticLookSettings.value());
     }
-    if (document.waterPathCache.has_value() && !document.waterPathCache->branches.empty()) {
-        projectJson["water_path_cache"] = SerializeWaterPathCache(document.waterPathCache.value());
-    }
     if (document.cameraState.has_value()) {
         projectJson["camera"] = SerializeCameraState(document.cameraState.value());
     }
@@ -3252,11 +4207,6 @@ bool SaveProjectDocument(
     for (const auto& animation : document.savedAnimations) {
         projectJson["saved_animations"].push_back(SerializeSavedAnimation(animation));
     }
-    projectJson["water_emitters"] = json::array();
-    for (const auto& emitter : document.waterEmitters) {
-        projectJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
-    }
-
     return WriteJsonDocument(document, projectJson, outputPath, errorMessage);
 }
 
@@ -3276,12 +4226,39 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.backgroundColor =
         projectJson->value("background_color", std::array<float, 4>{0.0F, 0.0F, 0.0F, 1.0F});
     document.eyeDomeLightingEnabled = projectJson->value("eye_dome_lighting_enabled", false);
+    document.proResAlphaPreviewEnabled = projectJson->value("pro_res_alpha_preview_enabled", false);
     document.eyeDomeLightingThickness = projectJson->value("eye_dome_lighting_thickness", 1.0F);
     document.constantUpdateView = projectJson->value("constant_update_view", false);
     document.liveVisualEffects = projectJson->value("live_visual_effects", false);
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
     document.autoLowerGsplatQualityWhileNavigating =
         projectJson->value("auto_lower_gsplat_quality_while_navigating", true);
+    if (projectJson->contains("point_visuals") && projectJson->at("point_visuals").is_array()) {
+        for (const auto& visualJson : projectJson->at("point_visuals")) {
+            auto visual = ParsePointCloudVisual(visualJson);
+            visual.name = NormalizeProjectPointVisualName(visual.name);
+            UpsertPointVisualDocument(&document.pointVisuals, visual.name, visual.style, true);
+        }
+    }
+    document.selectedPointVisualName =
+        NormalizeProjectPointVisualName(projectJson->value("selected_point_visual", document.selectedPointVisualName));
+    if (projectJson->contains("scene_visual_states") && projectJson->at("scene_visual_states").is_array()) {
+        for (const auto& stateJson : projectJson->at("scene_visual_states")) {
+            auto state = ParseScenePointVisualState(stateJson);
+            state.sceneGroupName = TrimAsciiWhitespace(state.sceneGroupName);
+            state.visual.name = NormalizeProjectPointVisualName(state.visual.name);
+            if (!state.sceneGroupName.empty()) {
+                UpsertSceneVisualStateDocument(
+                    &document.sceneVisualStates,
+                    state.sceneGroupName,
+                    state.visual.name,
+                    state.visual.style);
+            }
+        }
+    }
+    if (projectJson->contains("gsplat_visual_style")) {
+        document.gsplatVisualStyle = ParseGaussianSplatStyle(projectJson->at("gsplat_visual_style"));
+    }
     if (projectJson->contains("point_cloud_preview_lod_mode")) {
         document.pointCloudPreviewLodMode =
             ParsePointCloudPreviewLodMode(projectJson->at("point_cloud_preview_lod_mode"));
@@ -3293,6 +4270,16 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     if (projectJson->contains("render_job")) {
         document.renderJobSettings = ParseRenderJobSettings(projectJson->at("render_job"));
+    }
+    if (projectJson->contains("export_presets") && projectJson->at("export_presets").is_array()) {
+        for (const auto& presetJson : projectJson->at("export_presets")) {
+            document.exportPresets.push_back(ParseExportPreset(presetJson));
+        }
+    }
+    document.selectedExportPresetName =
+        projectJson->value("selected_export_preset", document.selectedExportPresetName);
+    if (projectJson->contains("temp_export_preset")) {
+        document.tempExportPreset = ParseExportPreset(projectJson->at("temp_export_preset"));
     }
     if (projectJson->contains("water_source_settings")) {
         document.waterSourceSettings = ParseWaterSourceSettings(projectJson->at("water_source_settings"));
@@ -3333,6 +4320,10 @@ std::optional<ProjectDocument> LoadProjectDocument(
     } else if (projectJson->contains("water_field_stream_settings")) {
         document.waterFieldTrailSettings =
             ParseWaterFieldTrailSettings(projectJson->at("water_field_stream_settings"));
+    }
+    if (projectJson->contains("water_dynamic_mesh_flow_settings")) {
+        document.waterDynamicMeshFlowSettings =
+            ParseWaterDynamicMeshFlowSettings(projectJson->at("water_dynamic_mesh_flow_settings"));
     }
     if (projectJson->contains("water_rain_settings")) {
         document.waterRainSettings = ParseWaterRainSettings(projectJson->at("water_rain_settings"));
@@ -3473,6 +4464,25 @@ std::optional<ProjectDocument> LoadProjectDocument(
             }
         }
     }
+    if (projectJson->contains("water_scene_states") && projectJson->at("water_scene_states").is_array()) {
+        for (const auto& stateJson : projectJson->at("water_scene_states")) {
+            auto state = ParseWaterSceneState(stateJson);
+            if (WaterSceneStateHasPayload(state)) {
+                document.waterSceneStates.push_back(std::move(state));
+            }
+        }
+    }
+    if (!document.waterSceneStates.empty()) {
+        const auto& activeSceneState = document.waterSceneStates.front();
+        document.waterEmitters = activeSceneState.emitters;
+        document.waterRippleLayers = activeSceneState.rippleLayers;
+        document.waterFieldLayers = activeSceneState.fieldLayers;
+        document.waterPathCache = activeSceneState.pathCache;
+        document.waterRippleRuntimeCaches = activeSceneState.rippleRuntimeCaches;
+        document.waterDynamicMeshFlowSettings.meshPath = activeSceneState.dynamicMeshPath;
+        document.waterDynamicMeshFlowSettings.attractors = activeSceneState.dynamicMeshAttractors;
+        document.waterDynamicMeshFlowSettings.emitterMotions = activeSceneState.dynamicMeshEmitterMotions;
+    }
     if (projectJson->contains("water_visual_settings")) {
         document.waterVisualSettings = ParseWaterVisualSettings(projectJson->at("water_visual_settings"));
         if (!projectJson->contains("water_animation_trail_settings")) {
@@ -3590,6 +4600,14 @@ std::optional<ProjectDocument> LoadProjectDocument(
             document.layers.push_back(ParseProjectLayer(layerJson));
         }
     }
+    if (document.schemaVersion < 30U || document.pointVisuals.empty()) {
+        MigrateLegacyLayerPointVisuals(&document);
+    } else if (
+        !document.selectedPointVisualName.empty() &&
+        !FindPointVisualDocumentIndex(document.pointVisuals, document.selectedPointVisualName).has_value()) {
+        document.selectedPointVisualName = NormalizeProjectPointVisualName(document.pointVisuals.front().name);
+    }
+    PruneSceneVisualStatesToKnownSceneGroups(&document);
 
     if (projectJson->contains("camera_shots")) {
         for (const auto& shotJson : projectJson->at("camera_shots")) {
@@ -3617,6 +4635,9 @@ std::optional<ProjectDocument> LoadProjectDocument(
             document.waterEmitters.push_back(ParseWaterEmitter(emitterJson));
         }
     }
+    if (document.schemaVersion < 32U) {
+        document.schemaVersion = 32U;
+    }
 
     return document;
 }
@@ -3639,6 +4660,7 @@ bool SaveWaterSourcesDocument(
         {"selected_water_trail_profile", document.selectedTrailProfileName},
         {"water_field_settings", SerializeWaterFieldSettings(document.fieldSettings)},
         {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.fieldTrailSettings)},
+        {"water_dynamic_mesh_flow_settings", SerializeWaterDynamicMeshFlowSettings(document.dynamicMeshFlowSettings)},
         {"water_rain_settings", SerializeWaterRainSettings(document.rainSettings)},
         {"selected_water_rain_trail_profile", document.selectedRainTrailProfileName},
         {"water_emitters", json::array()},
@@ -3785,6 +4807,10 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     }
     if (sourcesJson->contains("water_rain_settings")) {
         document.rainSettings = ParseWaterRainSettings(sourcesJson->at("water_rain_settings"));
+    }
+    if (sourcesJson->contains("water_dynamic_mesh_flow_settings")) {
+        document.dynamicMeshFlowSettings =
+            ParseWaterDynamicMeshFlowSettings(sourcesJson->at("water_dynamic_mesh_flow_settings"));
     }
     if (sourcesJson->contains("temp_water_caustic_look_settings")) {
         document.tempCausticLookSettings =

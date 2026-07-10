@@ -12,10 +12,12 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
+#include <imgui.h>
 #include <vulkan/vulkan.h>
 
 struct GLFWwindow;
@@ -75,6 +77,7 @@ struct SceneRenderState {
     glm::mat4 viewProjection{1.0F};
     glm::vec3 cameraPosition{0.0F, 0.0F, 1.0F};
     glm::vec4 backgroundColor{0.0F, 0.0F, 0.0F, 1.0F};
+    bool proResAlphaPreviewEnabled = false;
     bool eyeDomeLightingEnabled = false;
     float eyeDomeLightingThickness = 1.0F;
     float nearPlane = 0.05F;
@@ -107,11 +110,49 @@ struct SceneRenderState {
     std::vector<GaussianSplatLayerState> gaussianSplatLayers;
 };
 
+enum class PointCloudExrReadbackMask : std::uint32_t {
+    None = 0U,
+    Color = 1U << 0U,
+    Depth = 1U << 1U,
+    Normal = 1U << 2U,
+    Albedo = 1U << 3U,
+    All = (1U << 0U) | (1U << 1U) | (1U << 2U) | (1U << 3U),
+};
+
+inline PointCloudExrReadbackMask operator|(
+    PointCloudExrReadbackMask lhs,
+    PointCloudExrReadbackMask rhs) {
+    using Underlying = std::underlying_type_t<PointCloudExrReadbackMask>;
+    return static_cast<PointCloudExrReadbackMask>(
+        static_cast<Underlying>(lhs) | static_cast<Underlying>(rhs));
+}
+
+inline PointCloudExrReadbackMask operator&(
+    PointCloudExrReadbackMask lhs,
+    PointCloudExrReadbackMask rhs) {
+    using Underlying = std::underlying_type_t<PointCloudExrReadbackMask>;
+    return static_cast<PointCloudExrReadbackMask>(
+        static_cast<Underlying>(lhs) & static_cast<Underlying>(rhs));
+}
+
+inline bool HasPointCloudExrReadback(
+    PointCloudExrReadbackMask mask,
+    PointCloudExrReadbackMask flag) {
+    return (mask & flag) != PointCloudExrReadbackMask::None;
+}
+
+enum class PointCloudExrFrameStatus {
+    Idle,
+    Running,
+    Ready,
+};
+
 struct PointCloudExrFrameRequest {
     SceneRenderState renderState{};
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     bool previewDensity = true;
+    PointCloudExrReadbackMask readbackMask = PointCloudExrReadbackMask::All;
 };
 
 struct PointHighlightStyle {
@@ -119,8 +160,31 @@ struct PointHighlightStyle {
     bool pulseAlpha = true;
 };
 
+struct DynamicMeshFlowGpuUploadResult {
+    std::uint32_t pointCount = 0;
+    std::uint32_t particleCount = 0;
+    std::uint32_t routeAnchorCount = 0;
+    std::uint32_t visibleSampleCount = 0;
+    double solveMilliseconds = 0.0;
+    double staticUploadMilliseconds = 0.0;
+    double liveUploadMilliseconds = 0.0;
+    double dispatchMilliseconds = 0.0;
+    bool reusedStaticBuffers = false;
+    bool asynchronousDispatch = false;
+};
+
 class VulkanViewportShell {
   public:
+    struct ImGuiPreviewImageTexture {
+        ImTextureID textureId = ImTextureID_Invalid;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+
+        [[nodiscard]] bool Valid() const {
+            return textureId != ImTextureID_Invalid && width > 0 && height > 0;
+        }
+    };
+
     explicit VulkanViewportShell(GLFWwindow* window);
     ~VulkanViewportShell();
 
@@ -146,6 +210,12 @@ class VulkanViewportShell {
         std::size_t layerId,
         const std::vector<invisible_places::water::WaterRippleRuntimeMembership>& memberships,
         const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
+    [[nodiscard]] DynamicMeshFlowGpuUploadResult UploadDynamicMeshFlowPreviewPointCloud(
+        std::size_t layerId,
+        const invisible_places::water::MeshSurfaceCache& cache,
+        const std::vector<invisible_places::water::WaterEmitter>& emitters,
+        const invisible_places::water::WaterDynamicMeshFlowSettings& settings,
+        invisible_places::water::WaterTrailBuildQuality quality);
     void UpdateSparseWaterRippleParams(
         std::size_t layerId,
         const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
@@ -172,6 +242,15 @@ class VulkanViewportShell {
     void ClearGaussianSplats();
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage RenderPointCloudExrFrame(
         const PointCloudExrFrameRequest& request);
+    [[nodiscard]] bool BeginPointCloudExrFrame(const PointCloudExrFrameRequest& request);
+    [[nodiscard]] PointCloudExrFrameStatus PollPointCloudExrFrame();
+    [[nodiscard]] invisible_places::output::HalfRgbaExrImage CompletePointCloudExrFrame();
+    void CancelPointCloudExrFrame();
+    [[nodiscard]] ImGuiPreviewImageTexture UploadImGuiPreviewImageTexture(
+        std::uint32_t width,
+        std::uint32_t height,
+        const std::vector<std::uint8_t>& rgba);
+    void ClearImGuiPreviewImageTexture();
 
     [[nodiscard]] bool UiWantsMouseCapture() const;
     [[nodiscard]] bool UiWantsKeyboardCapture() const;
@@ -190,6 +269,7 @@ class VulkanViewportShell {
 
   private:
     static constexpr std::size_t kFramesInFlight = 2U;
+    static constexpr std::size_t kDynamicMeshFlowLiveSlots = 4U;
 
     struct BufferAllocation {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -225,9 +305,17 @@ class VulkanViewportShell {
         BufferAllocation sparseRippleRangeBuffer{};
         BufferAllocation sparseRippleMembershipBuffer{};
         BufferAllocation sparseRippleParamsBuffer{};
+        BufferAllocation dynamicMeshFlowCellBuffer{};
+        BufferAllocation dynamicMeshFlowGridBuffer{};
+        std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowUniformBuffers{};
+        std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowEmitterBuffers{};
+        std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowAttractorBuffers{};
         std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
         BufferAllocation exrStyleBuffer{};
         std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+        std::array<VkDescriptorSet, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDescriptorSets{};
+        std::array<VkFence, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDispatchFences{};
+        std::array<VkCommandBuffer, kDynamicMeshFlowLiveSlots> dynamicMeshFlowCommandBuffers{};
         VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
@@ -241,6 +329,19 @@ class VulkanViewportShell {
         std::uint32_t sparseRippleParamCount = 0;
         std::uint64_t sparseRippleMembershipUploadRevision = 0;
         std::uint64_t sparseRippleParamsUploadRevision = 0;
+        const invisible_places::water::MeshSurfaceCache* dynamicMeshFlowCacheIdentity = nullptr;
+        std::uint32_t dynamicMeshFlowParticleCount = 0;
+        std::uint32_t dynamicMeshFlowRouteAnchorCount = 0;
+        std::uint32_t dynamicMeshFlowVisibleSampleCount = 0;
+        std::uint32_t dynamicMeshFlowGridWidth = 0;
+        std::uint32_t dynamicMeshFlowGridHeight = 0;
+        std::uint32_t dynamicMeshFlowEmitterCapacity = 0;
+        std::uint32_t dynamicMeshFlowAttractorCapacity = 0;
+        std::size_t dynamicMeshFlowCellCount = 0;
+        int dynamicMeshFlowMinCellX = 0;
+        int dynamicMeshFlowMinCellY = 0;
+        float dynamicMeshFlowCellSize = 0.0F;
+        std::size_t dynamicMeshFlowNextLiveSlot = 0;
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
@@ -333,6 +434,15 @@ class VulkanViewportShell {
         BufferAllocation depthReadbackBuffer{};
         BufferAllocation normalReadbackBuffer{};
         BufferAllocation albedoReadbackBuffer{};
+        BufferAllocation uniformBuffer{};
+    };
+
+    struct ImGuiPreviewImageTextureResources {
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        ImageAllocation image{};
+        VkSampler sampler = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     };
 
     void CreateInstance();
@@ -344,6 +454,7 @@ class VulkanViewportShell {
     void CreateRenderPass();
     void CreatePresentRenderPass();
     void CreatePointDescriptorSetLayout();
+    void CreateDynamicMeshFlowDescriptorSetLayout();
     void CreateGaussianSplatDescriptorSetLayout();
     void CreateHighQualityGaussianSplatDescriptorSetLayout();
     void CreateCompositeDescriptorSetLayout();
@@ -352,6 +463,7 @@ class VulkanViewportShell {
     void CreatePostProcessSampler();
     void CreateUniformResources();
     void CreatePointPipelines();
+    void CreateDynamicMeshFlowComputePipeline();
     void CreateGaussianSplatPipeline();
     void CreateHighQualityGaussianSplatPipeline();
     void CreateCompositePipeline();
@@ -371,6 +483,12 @@ class VulkanViewportShell {
     void CreateImGuiResources();
     void UploadImGuiFonts();
     void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);
+    void UpdateDynamicMeshFlowDescriptorSet(ActivePointCloudResources* resources, std::size_t liveSlot);
+    void PrepareDynamicMeshFlowDispatchSlot(ActivePointCloudResources* resources, std::size_t liveSlot);
+    void DispatchDynamicMeshFlowCompute(
+        ActivePointCloudResources* resources,
+        std::uint32_t particleCount,
+        std::size_t liveSlot);
     void UpdatePointCloudDescriptorSet(
         ActivePointCloudResources* resources,
         std::size_t frameIndex,
@@ -416,6 +534,10 @@ class VulkanViewportShell {
     void RecreateSwapchain();
     void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, std::size_t frameIndex);
     void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
+    [[nodiscard]] invisible_places::output::HalfRgbaExrImage ReadCompletedExrExportFrame(
+        PointCloudExrReadbackMask readbackMask,
+        std::uint32_t width,
+        std::uint32_t height);
     [[nodiscard]] bool SceneImageNeedsRender(std::uint32_t imageIndex) const;
     [[nodiscard]] bool AnySceneImageNeedsRender() const;
     [[nodiscard]] bool ResolvePointCloudDrawPlan(
@@ -450,6 +572,10 @@ class VulkanViewportShell {
         std::uint32_t* recordedDrawPointCount = nullptr);
     void UpdateUniformBuffer(std::size_t frameIndex);
     void UploadFrameUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);
+    void UploadFrameUniformsToBuffer(
+        const BufferAllocation& buffer,
+        std::uint32_t width,
+        std::uint32_t height);
 
     [[nodiscard]] BufferAllocation CreateHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
     void UploadBufferData(const BufferAllocation& buffer, const void* data, VkDeviceSize size) const;
@@ -492,6 +618,7 @@ class VulkanViewportShell {
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkRenderPass presentRenderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pointPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout dynamicMeshFlowPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout gaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout highQualityGaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
@@ -501,6 +628,7 @@ class VulkanViewportShell {
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointOpaqueHardDiscPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointFastBasicPipeline_ = VK_NULL_HANDLE;
+    VkPipeline dynamicMeshFlowComputePipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
@@ -510,6 +638,7 @@ class VulkanViewportShell {
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dynamicMeshFlowDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
@@ -553,6 +682,11 @@ class VulkanViewportShell {
     std::vector<ActiveGaussianSplatResources> gaussianSplatResources_;
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
     ExrExportResources exrExportResources_{};
+    bool exrExportFrameInFlight_ = false;
+    std::uint32_t exrExportInFlightWidth_ = 0;
+    std::uint32_t exrExportInFlightHeight_ = 0;
+    PointCloudExrReadbackMask exrExportInFlightReadbackMask_ = PointCloudExrReadbackMask::All;
+    ImGuiPreviewImageTextureResources imguiPreviewImageTexture_{};
     bool highQualityGaussianSceneDirty_ = true;
     SceneRenderState renderState_{};
     ViewportDiagnostics diagnostics_{};
