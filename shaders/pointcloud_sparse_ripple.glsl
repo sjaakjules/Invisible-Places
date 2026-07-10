@@ -465,9 +465,9 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
             const float arrivalFade = smoothstep(0.01, 0.12, cycle);
             const float peakSoftening = 1.0 - smoothstep(0.84, 1.0, incomingProgress) * 0.28;
             const float incomingEdgeFoam =
-                (crest * (0.62 + shoreBreakup * 0.20) * foamContinuity +
-                 crestHalo * (0.10 + density01 * 0.06) * foamContinuity +
-                 arrivingFoam * (0.38 + density01 * 0.24) * breakup) *
+                (crest * (0.70 + shoreBreakup * 0.22) * foamContinuity +
+                 crestHalo * (0.08 + density01 * 0.06) * foamContinuity +
+                 arrivingFoam * (0.42 + density01 * 0.28) * breakup) *
                 incomingMask;
             const float value = max(incomingBodyFoam, incomingEdgeFoam) * arrivalFade * peakSoftening;
             combined = max(combined, value * shorewardMask);
@@ -527,9 +527,9 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
                 returnFollowMask;
             const float edgeFade = 1.0 - smoothstep(0.78, 1.0, returnProgress);
             const float edgeValue =
-                (crest * (0.70 + shoreBreakup * 0.22) * foamContinuity +
-                 crestHalo * (0.08 + density01 * 0.06) * foamContinuity +
-                 trailingFoam * (0.42 + density01 * 0.28) * breakup) *
+                (crest * (0.62 + shoreBreakup * 0.20) * foamContinuity +
+                 crestHalo * (0.10 + density01 * 0.06) * foamContinuity +
+                 trailingFoam * (0.38 + density01 * 0.24) * breakup) *
                 edgeFade;
             const float edgeIntroduce = smoothstep(0.0, 0.18, returnProgress);
             const float peakFront = x - shoreEnd;
