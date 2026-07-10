@@ -1,0 +1,466 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint kTrailRoleFieldSlot = 0u;
+const uint kTrailIdFieldSlot = 1u;
+const uint kSourceIdFieldSlot = 2u;
+const uint kPathIdFieldSlot = 3u;
+const uint kBranchIdFieldSlot = 4u;
+const uint kTrailSeedFieldSlot = 5u;
+const uint kPointSeedFieldSlot = 6u;
+const uint kTrailDistanceFieldSlot = 7u;
+const uint kTrailLengthFieldSlot = 8u;
+const uint kRouteStartFieldSlot = 9u;
+const uint kRouteCountFieldSlot = 10u;
+const uint kRouteLengthFieldSlot = 11u;
+const uint kTrailStartPhaseFieldSlot = 12u;
+const uint kTrailLateralOffsetFieldSlot = 13u;
+const uint kPointAgeFieldSlot = 14u;
+const uint kTrailAgeFieldSlot = 15u;
+const uint kTrailSpeedFieldSlot = 16u;
+const uint kTrailWidthFieldSlot = 17u;
+const uint kTrailStreakLengthFieldSlot = 18u;
+const uint kTrailConfidenceFieldSlot = 19u;
+const uint kWetnessFieldSlot = 20u;
+const uint kFeatureTypeFieldSlot = 21u;
+const uint kTangentXFieldSlot = 22u;
+const uint kTangentYFieldSlot = 23u;
+const uint kTangentZFieldSlot = 24u;
+const uint kLaneIndexFieldSlot = 25u;
+const uint kLaneCountFieldSlot = 26u;
+const uint kLanePitchFieldSlot = 27u;
+const uint kLaneSpanFieldSlot = 28u;
+const uint kLaneCrossingFieldSlot = 29u;
+const uint kCrossSeedFieldSlot = 30u;
+
+struct MeshSurfaceCellGpu {
+    vec4 positionConfidence;
+    vec4 normalAmbiguous;
+    vec4 downhillSampleCount;
+};
+
+struct MeshFlowEmitterGpu {
+    vec4 positionRadius;
+    vec4 strengthSpeedIdSeed;
+};
+
+struct MeshFlowAttractorGpu {
+    vec4 positionRadius;
+    vec4 strengthEnabled;
+};
+
+layout(set = 0, binding = 0, std140) uniform DynamicMeshFlowUniforms {
+    uvec4 counts0;      // particles, route anchors, visible samples, output points
+    uvec4 counts1;      // scalar fields, emitters, attractors, seed
+    vec4 surface0;      // cell size, search radius, surface offset, feature type
+    ivec4 grid0;        // min cell x, min cell y, search cell radius, unused
+    uvec4 grid1;        // width, height, unused, unused
+    vec4 flow0;         // trail length, step meters, speed, animation duration
+    vec4 flow1;         // downhill, attractor, source velocity, curl
+    vec4 flow2;         // inertia, branching, eddy, topology response
+    vec4 visual0;       // trail width, streak length, lane span, lane crossing
+} uniforms;
+
+layout(set = 0, binding = 1, std430) readonly buffer MeshSurfaceCells {
+    MeshSurfaceCellGpu cells[];
+} meshSurface;
+
+layout(set = 0, binding = 2, std430) readonly buffer MeshSurfaceGrid {
+    uint cellIndicesPlusOne[];
+} meshGrid;
+
+layout(set = 0, binding = 3, std430) readonly buffer MeshFlowEmitters {
+    MeshFlowEmitterGpu emitters[];
+} meshEmitters;
+
+layout(set = 0, binding = 4, std430) readonly buffer MeshFlowAttractors {
+    MeshFlowAttractorGpu attractors[];
+} meshAttractors;
+
+layout(set = 0, binding = 5, std430) buffer OutputPositions {
+    vec4 positions[];
+} outputPositions;
+
+layout(set = 0, binding = 6, std430) buffer OutputNormals {
+    vec4 normals[];
+} outputNormals;
+
+layout(set = 0, binding = 7, std430) buffer OutputScalarFields {
+    float values[];
+} outputScalars;
+
+uint HashUint(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+float Hash01(uint a, uint b, uint c) {
+    return float(HashUint(a ^ (b * 0x9e3779b9u) ^ (c * 0x85ebca6bu))) / 4294967295.0;
+}
+
+vec3 SafeNormalize(vec3 value, vec3 fallback) {
+    const float lengthSquared = dot(value, value);
+    if (lengthSquared <= 1.0e-10) {
+        return fallback;
+    }
+    return value * inversesqrt(lengthSquared);
+}
+
+void StoreField(uint slot, uint pointIndex, float value) {
+    if (slot >= uniforms.counts1.x || pointIndex >= uniforms.counts0.w) {
+        return;
+    }
+    outputScalars.values[(slot * uniforms.counts0.w) + pointIndex] = value;
+}
+
+void StoreTrailPoint(
+    uint pointIndex,
+    vec3 position,
+    vec3 normal,
+    float role,
+    float trailId,
+    float sourceId,
+    float routeStart,
+    float routeCount,
+    float routeLength,
+    float trailDistance,
+    float startPhase,
+    float lateralOffset,
+    float pointAge,
+    float speed,
+    float confidence,
+    vec3 tangent,
+    float seed) {
+    if (pointIndex >= uniforms.counts0.w) {
+        return;
+    }
+
+    outputPositions.positions[pointIndex] = vec4(position, 1.0);
+    outputNormals.normals[pointIndex] = vec4(SafeNormalize(normal, vec3(0.0, 0.0, 1.0)), 0.0);
+    StoreField(kTrailRoleFieldSlot, pointIndex, role);
+    StoreField(kTrailIdFieldSlot, pointIndex, trailId);
+    StoreField(kSourceIdFieldSlot, pointIndex, sourceId);
+    StoreField(kPathIdFieldSlot, pointIndex, trailId);
+    StoreField(kBranchIdFieldSlot, pointIndex, 0.0);
+    StoreField(kTrailSeedFieldSlot, pointIndex, seed);
+    StoreField(kPointSeedFieldSlot, pointIndex, fract(seed + pointAge * 1.61803398875));
+    StoreField(kTrailDistanceFieldSlot, pointIndex, trailDistance);
+    StoreField(kTrailLengthFieldSlot, pointIndex, max(0.001, uniforms.flow0.x));
+    StoreField(kRouteStartFieldSlot, pointIndex, routeStart);
+    StoreField(kRouteCountFieldSlot, pointIndex, routeCount);
+    StoreField(kRouteLengthFieldSlot, pointIndex, max(0.001, routeLength));
+    StoreField(kTrailStartPhaseFieldSlot, pointIndex, startPhase);
+    StoreField(kTrailLateralOffsetFieldSlot, pointIndex, lateralOffset);
+    StoreField(kPointAgeFieldSlot, pointIndex, pointAge);
+    StoreField(kTrailAgeFieldSlot, pointIndex, 0.0);
+    StoreField(kTrailSpeedFieldSlot, pointIndex, max(0.01, speed));
+    StoreField(kTrailWidthFieldSlot, pointIndex, max(0.0005, uniforms.visual0.x));
+    StoreField(kTrailStreakLengthFieldSlot, pointIndex, max(0.001, uniforms.visual0.y));
+    StoreField(kTrailConfidenceFieldSlot, pointIndex, clamp(confidence, 0.0, 1.0));
+    StoreField(kWetnessFieldSlot, pointIndex, 1.0);
+    StoreField(kFeatureTypeFieldSlot, pointIndex, uniforms.surface0.w);
+    StoreField(kTangentXFieldSlot, pointIndex, tangent.x);
+    StoreField(kTangentYFieldSlot, pointIndex, tangent.y);
+    StoreField(kTangentZFieldSlot, pointIndex, tangent.z);
+    StoreField(kLaneIndexFieldSlot, pointIndex, 0.0);
+    StoreField(kLaneCountFieldSlot, pointIndex, 1.0);
+    StoreField(kLanePitchFieldSlot, pointIndex, max(0.0001, uniforms.visual0.x * 2.0));
+    StoreField(kLaneSpanFieldSlot, pointIndex, max(0.0, uniforms.visual0.z));
+    StoreField(kLaneCrossingFieldSlot, pointIndex, clamp(uniforms.visual0.w, 0.0, 2.0));
+    StoreField(kCrossSeedFieldSlot, pointIndex, seed);
+}
+
+float ProjectedSurfaceZ(MeshSurfaceCellGpu cell, vec3 normal, vec3 query, float cellSize, float searchRadius) {
+    float projectedZ = cell.positionConfidence.z;
+    if (abs(normal.z) > 0.05) {
+        const vec2 offset = query.xy - cell.positionConfidence.xy;
+        const float planeZ = cell.positionConfidence.z - dot(normal.xy, offset) / normal.z;
+        const float maxPlaneDelta = max(max(cellSize * 8.0, searchRadius), 0.02);
+        if (abs(planeZ - cell.positionConfidence.z) <= maxPlaneDelta) {
+            projectedZ = planeZ;
+        }
+    }
+    return projectedZ;
+}
+
+bool ProjectToSurface(vec3 query, out vec3 projectedPosition, out vec3 normal, out vec3 downhill, out float confidence, out float ambiguous) {
+    const float cellSize = max(0.001, uniforms.surface0.x);
+    const ivec2 baseCell = ivec2(floor(query.xy / cellSize));
+    const int searchRadius = max(1, uniforms.grid0.z);
+    const float maxSearchDistance = max(cellSize, uniforms.surface0.y) + cellSize * 0.75;
+    const float maxSearchDistanceSquared = maxSearchDistance * maxSearchDistance;
+    float bestScore = 3.402823466e38;
+    uint bestCellIndex = 0xffffffffu;
+    float bestProjectedZ = query.z;
+
+    for (int dy = -searchRadius; dy <= searchRadius; ++dy) {
+        for (int dx = -searchRadius; dx <= searchRadius; ++dx) {
+            const ivec2 cell = baseCell + ivec2(dx, dy);
+            const ivec2 local = cell - uniforms.grid0.xy;
+            if (local.x < 0 || local.y < 0 ||
+                uint(local.x) >= uniforms.grid1.x ||
+                uint(local.y) >= uniforms.grid1.y) {
+                continue;
+            }
+            const uint gridIndex = uint(local.y) * uniforms.grid1.x + uint(local.x);
+            const uint cellIndexPlusOne = meshGrid.cellIndicesPlusOne[gridIndex];
+            if (cellIndexPlusOne == 0u) {
+                continue;
+            }
+            const uint cellIndex = cellIndexPlusOne - 1u;
+            const vec2 cellCenter = (vec2(cell) + vec2(0.5)) * cellSize;
+            const vec2 centerDelta = cellCenter - query.xy;
+            const float centerDistanceSquared = dot(centerDelta, centerDelta);
+            if (centerDistanceSquared > maxSearchDistanceSquared) {
+                continue;
+            }
+            const MeshSurfaceCellGpu candidate = meshSurface.cells[cellIndex];
+            const vec3 candidateNormal = SafeNormalize(candidate.normalAmbiguous.xyz, vec3(0.0, 0.0, 1.0));
+            const float candidateProjectedZ =
+                ProjectedSurfaceZ(candidate, candidateNormal, query, cellSize, uniforms.surface0.y);
+            const float verticalDelta = candidateProjectedZ - query.z;
+            const float verticalPenalty =
+                min(verticalDelta * verticalDelta, maxSearchDistanceSquared) * 0.35;
+            const float ringPenalty = float(abs(dx) + abs(dy)) * cellSize * cellSize * 0.08;
+            const float score = centerDistanceSquared + verticalPenalty + ringPenalty;
+            if (score < bestScore) {
+                bestScore = score;
+                bestCellIndex = cellIndex;
+                bestProjectedZ = candidateProjectedZ;
+            }
+        }
+    }
+
+    if (bestCellIndex == 0xffffffffu) {
+        projectedPosition = query;
+        normal = vec3(0.0, 0.0, 1.0);
+        downhill = vec3(1.0, 0.0, 0.0);
+        confidence = 0.0;
+        ambiguous = 0.0;
+        return false;
+    }
+
+    const MeshSurfaceCellGpu cell = meshSurface.cells[bestCellIndex];
+    normal = SafeNormalize(cell.normalAmbiguous.xyz, vec3(0.0, 0.0, 1.0));
+    projectedPosition = vec3(query.xy, bestProjectedZ + uniforms.surface0.z);
+    downhill = SafeNormalize(vec3(cell.downhillSampleCount.xy, 0.0), vec3(1.0, 0.0, 0.0));
+    confidence = clamp(cell.positionConfidence.w, 0.0, 1.0);
+    ambiguous = cell.normalAmbiguous.w;
+    return true;
+}
+
+void WriteDeadParticleRange(uint routeStart, uint routeAnchors, uint visibleSamples, vec3 position, float seed) {
+    const uint total = routeAnchors + visibleSamples;
+    for (uint offset = 0u; offset < total; ++offset) {
+        StoreTrailPoint(
+            routeStart + offset,
+            position,
+            vec3(0.0, 0.0, 1.0),
+            0.0,
+            0.0,
+            0.0,
+            float(routeStart),
+            0.0,
+            0.001,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.01,
+            0.0,
+            vec3(1.0, 0.0, 0.0),
+            seed);
+    }
+}
+
+void main() {
+    const uint particleIndex = gl_GlobalInvocationID.x;
+    const uint particleCount = uniforms.counts0.x;
+    const uint routeAnchors = max(2u, uniforms.counts0.y);
+    const uint visibleSamples = max(1u, uniforms.counts0.z);
+    const uint routeStride = routeAnchors + visibleSamples;
+    if (particleIndex >= particleCount ||
+        uniforms.counts1.y == 0u ||
+        routeStride == 0u) {
+        return;
+    }
+
+    const uint routeStart = particleIndex * routeStride;
+    const uint visibleStart = routeStart + routeAnchors;
+    const uint emitterIndex = particleIndex % uniforms.counts1.y;
+    const MeshFlowEmitterGpu emitter = meshEmitters.emitters[emitterIndex];
+    const uint seed = uniforms.counts1.w ^ uint(emitter.strengthSpeedIdSeed.w) ^ (particleIndex * 747796405u);
+    const float angle = Hash01(seed, particleIndex, 17u) * 6.28318530718;
+    const float radius = sqrt(Hash01(seed, particleIndex, 23u)) * max(0.0, emitter.positionRadius.w);
+    vec3 query = emitter.positionRadius.xyz + vec3(cos(angle) * radius, sin(angle) * radius, 0.0);
+
+    vec3 position;
+    vec3 normal;
+    vec3 downhill;
+    float confidence;
+    float ambiguous;
+    if (!ProjectToSurface(query, position, normal, downhill, confidence, ambiguous)) {
+        WriteDeadParticleRange(routeStart, routeAnchors, visibleSamples, emitter.positionRadius.xyz, Hash01(seed, particleIndex, 31u));
+        return;
+    }
+
+    vec3 velocity = SafeNormalize(downhill, vec3(1.0, 0.0, 0.0));
+    const float sourceId = emitter.strengthSpeedIdSeed.z;
+    const float trailId = float(particleIndex + 1u);
+    const float trailSeed = Hash01(seed, particleIndex, 37u);
+    const float speed = max(0.01, uniforms.flow0.z * max(0.05, emitter.strengthSpeedIdSeed.y));
+    const float sourceStrength = clamp(emitter.strengthSpeedIdSeed.x, 0.0, 1.0);
+    const float stepMeters = clamp(uniforms.flow0.y, 0.002, 5.0);
+    const float safeInertia = clamp(uniforms.flow2.x, 0.0, 0.98);
+    float travelled = 0.0;
+    uint actualAnchors = 1u;
+
+    StoreTrailPoint(
+        routeStart,
+        position,
+        normal,
+        0.0,
+        trailId,
+        sourceId,
+        float(routeStart),
+        float(routeAnchors),
+        max(0.001, uniforms.flow0.x),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        speed,
+        confidence * sourceStrength,
+        velocity,
+        trailSeed);
+
+    for (uint anchorIndex = 1u; anchorIndex < routeAnchors; ++anchorIndex) {
+        const float topologyGate =
+            clamp((ambiguous > 0.5 ? 1.0 : (0.25 + (1.0 - confidence) * uniforms.flow2.w)), 0.0, 1.0);
+        vec3 force = downhill * max(0.0, uniforms.flow1.x);
+        for (uint attractorIndex = 0u; attractorIndex < uniforms.counts1.z; ++attractorIndex) {
+            const MeshFlowAttractorGpu attractor = meshAttractors.attractors[attractorIndex];
+            if (attractor.strengthEnabled.y < 0.5 || attractor.strengthEnabled.x <= 0.0 || attractor.positionRadius.w <= 0.00001) {
+                continue;
+            }
+            vec3 toAttractor = attractor.positionRadius.xyz - position;
+            toAttractor.z = 0.0;
+            const float distanceToAttractor = length(toAttractor);
+            if (distanceToAttractor <= 0.00001 || distanceToAttractor > attractor.positionRadius.w) {
+                continue;
+            }
+            const float x = clamp(distanceToAttractor / attractor.positionRadius.w, 0.0, 1.0);
+            const float falloff = 1.0 - (x * x * (3.0 - 2.0 * x));
+            force += normalize(toAttractor) * uniforms.flow1.y * attractor.strengthEnabled.x * falloff;
+        }
+
+        vec3 lateral = cross(normal, velocity);
+        if (dot(lateral, lateral) > 1.0e-10) {
+            lateral = normalize(lateral);
+            const float curlPhase = travelled * 2.7 + trailSeed * 6.28318530718;
+            const float branchSign = Hash01(seed, particleIndex, anchorIndex + 43u) < 0.5 ? -1.0 : 1.0;
+            force += lateral *
+                (sin(curlPhase) * max(0.0, uniforms.flow1.w) +
+                 branchSign * max(0.0, uniforms.flow2.y) * topologyGate * 0.55);
+            const float eddyPhase = travelled * 5.1 + Hash01(seed, particleIndex, 47u) * 6.28318530718;
+            force -= velocity * (max(0.0, sin(eddyPhase)) * max(0.0, uniforms.flow2.z) * topologyGate);
+        }
+        force.z = 0.0;
+        force = SafeNormalize(force, velocity);
+        vec3 nextVelocity = velocity * safeInertia + force * (1.0 - safeInertia);
+        nextVelocity.z = 0.0;
+        nextVelocity = SafeNormalize(nextVelocity, velocity);
+
+        vec3 nextPosition;
+        vec3 nextNormal;
+        vec3 nextDownhill;
+        float nextConfidence;
+        float nextAmbiguous;
+        if (!ProjectToSurface(position + nextVelocity * stepMeters, nextPosition, nextNormal, nextDownhill, nextConfidence, nextAmbiguous)) {
+            break;
+        }
+        travelled += length(nextPosition - position);
+        position = nextPosition;
+        normal = nextNormal;
+        downhill = nextDownhill;
+        confidence = nextConfidence;
+        ambiguous = nextAmbiguous;
+        velocity = nextVelocity;
+        actualAnchors = anchorIndex + 1u;
+        StoreTrailPoint(
+            routeStart + anchorIndex,
+            position,
+            normal,
+            0.0,
+            trailId,
+            sourceId,
+            float(routeStart),
+            float(routeAnchors),
+            max(0.001, uniforms.flow0.x),
+            travelled,
+            float(anchorIndex) / float(max(1u, routeAnchors - 1u)),
+            0.0,
+            float(anchorIndex) / float(max(1u, routeAnchors - 1u)),
+            speed,
+            confidence * sourceStrength,
+            velocity,
+            trailSeed);
+    }
+
+    for (uint anchorIndex = actualAnchors; anchorIndex < routeAnchors; ++anchorIndex) {
+        StoreTrailPoint(
+            routeStart + anchorIndex,
+            position,
+            normal,
+            0.0,
+            trailId,
+            sourceId,
+            float(routeStart),
+            float(actualAnchors),
+            max(0.001, travelled),
+            travelled,
+            float(anchorIndex) / float(max(1u, routeAnchors - 1u)),
+            0.0,
+            1.0,
+            speed,
+            confidence * sourceStrength,
+            velocity,
+            trailSeed);
+    }
+
+    const float routeLength = max(0.001, travelled);
+    for (uint sampleIndex = 0u; sampleIndex < visibleSamples; ++sampleIndex) {
+        const float sampleT = visibleSamples > 1u ? float(sampleIndex) / float(visibleSamples - 1u) : 0.0;
+        const float phase = fract(trailSeed + Hash01(seed, sampleIndex, 59u) * 0.33);
+        const float lateralOffset =
+            (Hash01(seed, sampleIndex, 61u) - 0.5) *
+            max(uniforms.visual0.x * 2.5, stepMeters * 0.18) *
+            (0.35 + max(0.0, uniforms.flow2.y));
+        const uint anchorLookup = min(uint(floor(sampleT * float(max(1u, actualAnchors - 1u)))), routeAnchors - 1u);
+        const vec3 samplePosition = outputPositions.positions[routeStart + anchorLookup].xyz;
+        const vec3 sampleNormal = outputNormals.normals[routeStart + anchorLookup].xyz;
+        StoreTrailPoint(
+            visibleStart + sampleIndex,
+            samplePosition,
+            sampleNormal,
+            1.0,
+            trailId,
+            sourceId,
+            float(routeStart),
+            float(actualAnchors),
+            routeLength,
+            routeLength * sampleT,
+            phase,
+            lateralOffset,
+            sampleT,
+            speed,
+            confidence * sourceStrength,
+            velocity,
+            trailSeed);
+    }
+}

@@ -538,6 +538,7 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.stylisationStrength = 0.0F;
     style.roughnessMotionStrength = 0.0F;
     style.waterStreakAspect = sourceStyle.waterStreakAspect;
+    style.waterTrailStyleGeometry = sourceStyle.waterTrailStyleGeometry;
     style.flowAnimation = false;
     style.waterPathView = false;
     style.waterTrailOverlay = false;

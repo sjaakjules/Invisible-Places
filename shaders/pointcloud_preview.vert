@@ -528,6 +528,25 @@ bool WaterTrailIsRain(uint pointIndex) {
     return featureType > kWaterTrailFeatureTypeRain - 0.5 && featureType < kWaterTrailFeatureTypeRain + 0.5;
 }
 
+bool WaterTrailStyleGeometryAvailable() {
+    return styleData.renderParams1.x > 0.5 &&
+           styleData.surfelDiameterBinding.control.w != 0u &&
+           styleData.surfelDiameterBinding.control.x == 0u &&
+           styleData.surfelDiameterBinding.constantValue.x > 0.0 &&
+           styleData.renderParams2.z > 0.0;
+}
+
+float WaterTrailStyleWidth() {
+    return max(0.0001, styleData.surfelDiameterBinding.constantValue.x);
+}
+
+float WaterTrailStreakLength(uint pointIndex) {
+    if (WaterTrailStyleGeometryAvailable()) {
+        return WaterTrailStyleWidth() * max(1.0, styleData.renderParams2.z);
+    }
+    return max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+}
+
 vec2 WaterTrailRouteSegment(uint pointIndex, float phase, bool timedAnchors) {
     const uint routeStart = WaterTrailRouteStart(pointIndex);
     const uint routeCount = WaterTrailRouteCount(pointIndex);
@@ -563,7 +582,7 @@ vec2 WaterTrailRouteSegment(uint pointIndex, float phase, bool timedAnchors) {
 float WaterTrailVisibility(uint pointIndex) {
     const float phase = WaterTrailTravelPhase(pointIndex);
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
-    const float trailStreakLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+    const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.08);
     return 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
 }

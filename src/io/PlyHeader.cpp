@@ -69,6 +69,7 @@ PlyHeaderParseResult ParsePlyHeader(const std::filesystem::path& filePath) {
     PlyHeader header;
     std::string line;
     bool sawPlyMagic = false;
+    PlyElement* currentElement = nullptr;
 
     while (std::getline(input, line)) {
         const auto trimmed = TrimRight(line);
@@ -105,18 +106,36 @@ PlyHeaderParseResult ParsePlyHeader(const std::filesystem::path& filePath) {
 
         if (head == "element") {
             std::string elementName;
-            tokens >> elementName;
+            std::uint64_t elementCount = 0;
+            tokens >> elementName >> elementCount;
+            header.elements.push_back({.name = elementName, .count = elementCount});
+            currentElement = &header.elements.back();
             if (elementName == "vertex") {
-                tokens >> header.vertexCount;
+                header.vertexCount = elementCount;
+            } else if (elementName == "face") {
+                header.faceCount = elementCount;
             }
             continue;
         }
 
         if (head == "property") {
             PlyProperty property;
-            tokens >> property.type >> property.name;
+            tokens >> property.type;
+            if (property.type == "list") {
+                property.isList = true;
+                tokens >> property.listCountType >> property.listValueType >> property.name;
+            } else {
+                tokens >> property.name;
+            }
             if (!property.type.empty() && !property.name.empty()) {
-                header.properties.push_back(std::move(property));
+                if (currentElement != nullptr) {
+                    currentElement->properties.push_back(property);
+                }
+                if (currentElement == nullptr || currentElement->name == "vertex") {
+                    header.properties.push_back(std::move(property));
+                } else if (currentElement->name == "face") {
+                    header.faceProperties.push_back(std::move(property));
+                }
             }
         }
     }

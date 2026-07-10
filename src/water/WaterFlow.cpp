@@ -30,6 +30,7 @@ namespace {
 
 constexpr glm::vec3 kGravity{0.0F, 0.0F, -1.0F};
 constexpr float kNormalEpsilon = 1.0e-6F;
+constexpr float kMeshTriangleNormalEpsilon = 1.0e-20F;
 
 struct SupportPoint {
     std::uint32_t sourceIndex = 0;
@@ -2764,6 +2765,21 @@ WaterFlowTrailSettings ApplyWaterTrailGeometryToFlowTrailSettings(
     return settings;
 }
 
+bool WaterTrailGeometryGenerationInputsEqual(
+    const WaterTrailGeometrySettings& left,
+    const WaterTrailGeometrySettings& right) {
+    return left.trailLengthMeters == right.trailLengthMeters &&
+           left.pointSpacingMeters == right.pointSpacingMeters;
+}
+
+bool WaterTrailGeometryLiveVisualOnlyEdit(
+    const WaterTrailGeometrySettings& before,
+    const WaterTrailGeometrySettings& after) {
+    return WaterTrailGeometryGenerationInputsEqual(before, after) &&
+           (before.widthMeters != after.widthMeters ||
+            before.streakLengthMeters != after.streakLengthMeters);
+}
+
 bool WaterFlowLaneRouteInputsEqual(
     const WaterFlowTrailSettings& left,
     const WaterFlowTrailSettings& right) {
@@ -2772,8 +2788,6 @@ bool WaterFlowLaneRouteInputsEqual(
            left.laneCount == right.laneCount &&
            left.trailLengthMeters == right.trailLengthMeters &&
            left.trailPointSpacingMeters == right.trailPointSpacingMeters &&
-           left.trailWidthMeters == right.trailWidthMeters &&
-           left.trailStreakLengthMeters == right.trailStreakLengthMeters &&
            left.surfaceOffsetMeters == right.surfaceOffsetMeters &&
            left.pathAttraction == right.pathAttraction &&
            left.laneSpreadMeters == right.laneSpreadMeters &&
@@ -2788,6 +2802,8 @@ bool WaterFlowLaneSpeedOnlyEdit(
     const WaterFlowTrailSettings& before,
     const WaterFlowTrailSettings& after) {
     return WaterFlowLaneRouteInputsEqual(before, after) &&
+           before.trailWidthMeters == after.trailWidthMeters &&
+           before.trailStreakLengthMeters == after.trailStreakLengthMeters &&
            before.speedMetersPerSecond != after.speedMetersPerSecond;
 }
 
@@ -2838,6 +2854,106 @@ std::optional<WaterRainIntensityPreset> ParseWaterRainIntensityPresetName(std::s
 
 WaterRainSettings DefaultWaterRainSettings() {
     return ApplyWaterRainIntensityPreset({}, WaterRainIntensityPreset::Rain);
+}
+
+WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings() {
+    return {};
+}
+
+std::array<WaterDynamicMeshParticlePreset, 4> AllWaterDynamicMeshParticlePresets() {
+    return {{
+        {.name = "Default", .label = "Default"},
+        {.name = "Laminar", .label = "Laminar"},
+        {.name = "Branching", .label = "Branching"},
+        {.name = "Turbulent", .label = "Turbulent"},
+    }};
+}
+
+std::string_view NormalizeWaterDynamicMeshParticlePresetName(std::string_view presetName) {
+    for (const auto& preset : AllWaterDynamicMeshParticlePresets()) {
+        if (presetName == preset.name || presetName == preset.label) {
+            return preset.name;
+        }
+    }
+    if (presetName == "laminar") {
+        return "Laminar";
+    }
+    if (presetName == "branching") {
+        return "Branching";
+    }
+    if (presetName == "turbulent") {
+        return "Turbulent";
+    }
+    return "Default";
+}
+
+WaterDynamicMeshFlowSettings ApplyWaterDynamicMeshParticlePreset(
+    WaterDynamicMeshFlowSettings settings,
+    std::string_view presetName) {
+    const auto normalized = NormalizeWaterDynamicMeshParticlePresetName(presetName);
+    settings.particlePresetName = std::string{normalized};
+    if (normalized == "Laminar") {
+        settings.previewParticleLimit = 360U;
+        settings.finalParticleLimit = 1600U;
+        settings.trailLengthMeters = 20.0F;
+        settings.stepMeters = 0.13F;
+        settings.speedMetersPerSecond = 0.55F;
+        settings.downhillWeight = 1.70F;
+        settings.attractorWeight = 0.65F;
+        settings.sourceVelocityWeight = 0.18F;
+        settings.curlStrength = 0.035F;
+        settings.branchingStrength = 0.08F;
+        settings.eddyStrength = 0.015F;
+        settings.topologyResponse = 0.45F;
+        settings.inertia = 0.86F;
+        return settings;
+    }
+    if (normalized == "Branching") {
+        settings.previewParticleLimit = 760U;
+        settings.finalParticleLimit = 3200U;
+        settings.trailLengthMeters = 20.0F;
+        settings.stepMeters = 0.11F;
+        settings.speedMetersPerSecond = 0.66F;
+        settings.downhillWeight = 1.18F;
+        settings.attractorWeight = 1.05F;
+        settings.sourceVelocityWeight = 0.42F;
+        settings.curlStrength = 0.28F;
+        settings.branchingStrength = 1.05F;
+        settings.eddyStrength = 0.10F;
+        settings.topologyResponse = 0.95F;
+        settings.inertia = 0.48F;
+        return settings;
+    }
+    if (normalized == "Turbulent") {
+        settings.previewParticleLimit = 900U;
+        settings.finalParticleLimit = 3800U;
+        settings.trailLengthMeters = 18.0F;
+        settings.stepMeters = 0.10F;
+        settings.speedMetersPerSecond = 0.72F;
+        settings.downhillWeight = 0.96F;
+        settings.attractorWeight = 1.15F;
+        settings.sourceVelocityWeight = 0.50F;
+        settings.curlStrength = 0.82F;
+        settings.branchingStrength = 0.78F;
+        settings.eddyStrength = 0.56F;
+        settings.topologyResponse = 1.15F;
+        settings.inertia = 0.24F;
+        return settings;
+    }
+    settings.previewParticleLimit = 560U;
+    settings.finalParticleLimit = 2400U;
+    settings.trailLengthMeters = 18.0F;
+    settings.stepMeters = 0.12F;
+    settings.speedMetersPerSecond = 0.62F;
+    settings.downhillWeight = 1.35F;
+    settings.attractorWeight = 1.0F;
+    settings.sourceVelocityWeight = 0.35F;
+    settings.curlStrength = 0.18F;
+    settings.branchingStrength = 0.36F;
+    settings.eddyStrength = 0.08F;
+    settings.topologyResponse = 0.65F;
+    settings.inertia = 0.64F;
+    return settings;
 }
 
 WaterRainSettings ApplyWaterRainIntensityPreset(
@@ -7542,6 +7658,861 @@ WaterTrailOverlay BuildRainTrailOverlay(
     return overlay;
 }
 
+MeshSurfaceCache BuildMeshSurfaceCache(
+    const invisible_places::io::LoadedTriangleMesh& mesh,
+    const WaterDynamicMeshFlowSettings& settings) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    MeshSurfaceCache cache;
+    cache.meshPath = mesh.sourcePath;
+    cache.settings = settings;
+    cache.settings.attractors.clear();
+    cache.bounds = mesh.bounds;
+    cache.sourceVertexCount = static_cast<std::uint64_t>(mesh.vertices.size());
+    cache.sourceTriangleCount = static_cast<std::uint64_t>(mesh.triangles.size());
+    cache.meshSignature = mesh.sourcePath.generic_string() +
+                          "|v=" + std::to_string(cache.sourceVertexCount) +
+                          "|t=" + std::to_string(cache.sourceTriangleCount);
+    if (mesh.vertices.empty() || mesh.triangles.empty()) {
+        return cache;
+    }
+
+    struct Accumulator {
+        glm::vec3 positionSum{0.0F, 0.0F, 0.0F};
+        glm::vec3 normalSum{0.0F, 0.0F, 0.0F};
+        double localXSum = 0.0;
+        double localYSum = 0.0;
+        double zSum = 0.0;
+        double localXXSum = 0.0;
+        double localXYSum = 0.0;
+        double localYYSum = 0.0;
+        double localXZSum = 0.0;
+        double localYZSum = 0.0;
+        float minZ = std::numeric_limits<float>::max();
+        float maxZ = -std::numeric_limits<float>::max();
+        int cellX = 0;
+        int cellY = 0;
+        std::uint32_t count = 0;
+    };
+
+    const float cellSize = std::clamp(settings.cacheCellSizeMeters, 0.005F, 5.0F);
+    const float ambiguityHeight = std::max(0.0F, settings.ambiguityHeightMeters);
+    std::unordered_map<std::uint64_t, Accumulator> accumulators;
+    accumulators.reserve(std::min<std::size_t>(mesh.triangles.size(), 1'000'000U));
+    const bool sparseLargeMeshMode = mesh.triangles.size() > 2'000'000U;
+
+    auto addSample = [&](const glm::vec3& position, const glm::vec3& normal) {
+        if (!IsValidPoint(position)) {
+            return;
+        }
+        const auto key = MakeXyGridKey(position, cellSize);
+        auto& accumulator = accumulators[EncodeTrailSurfaceGridKey(key.x, key.y)];
+        if (accumulator.count == 0U) {
+            accumulator.cellX = key.x;
+            accumulator.cellY = key.y;
+        }
+        const double cellCenterX = (static_cast<double>(key.x) + 0.5) * static_cast<double>(cellSize);
+        const double cellCenterY = (static_cast<double>(key.y) + 0.5) * static_cast<double>(cellSize);
+        const double localX = static_cast<double>(position.x) - cellCenterX;
+        const double localY = static_cast<double>(position.y) - cellCenterY;
+        const double z = static_cast<double>(position.z);
+        accumulator.positionSum += position;
+        accumulator.normalSum += SafeOverlayNormal(normal);
+        accumulator.localXSum += localX;
+        accumulator.localYSum += localY;
+        accumulator.zSum += z;
+        accumulator.localXXSum += localX * localX;
+        accumulator.localXYSum += localX * localY;
+        accumulator.localYYSum += localY * localY;
+        accumulator.localXZSum += localX * z;
+        accumulator.localYZSum += localY * z;
+        accumulator.minZ = std::min(accumulator.minZ, position.z);
+        accumulator.maxZ = std::max(accumulator.maxZ, position.z);
+        ++accumulator.count;
+    };
+
+    auto barycentric2 = [](const glm::vec2& p, const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
+        const glm::vec2 v0 = b - a;
+        const glm::vec2 v1 = c - a;
+        const glm::vec2 v2 = p - a;
+        const float d00 = glm::dot(v0, v0);
+        const float d01 = glm::dot(v0, v1);
+        const float d11 = glm::dot(v1, v1);
+        const float d20 = glm::dot(v2, v0);
+        const float d21 = glm::dot(v2, v1);
+        const float denom = d00 * d11 - d01 * d01;
+        if (std::abs(denom) <= 1.0e-12F) {
+            return glm::vec3{-1.0F, -1.0F, -1.0F};
+        }
+        const float v = (d11 * d20 - d01 * d21) / denom;
+        const float w = (d00 * d21 - d01 * d20) / denom;
+        const float u = 1.0F - v - w;
+        return glm::vec3{u, v, w};
+    };
+
+    auto addSparseTriangleSamples = [&](
+                                        const glm::vec3& a,
+                                        const glm::vec3& b,
+                                        const glm::vec3& c,
+                                        const glm::vec3& normal,
+                                        const glm::vec2& minXy,
+                                        const glm::vec2& maxXy,
+                                        std::uint32_t sampleBudget) {
+        const glm::vec3 centroid = (a + b + c) / 3.0F;
+        sampleBudget = std::max<std::uint32_t>(1U, sampleBudget);
+        const float boundsArea = std::max(
+            (maxXy.x - minXy.x) * (maxXy.y - minXy.y),
+            cellSize * cellSize);
+        const float budgetSpacing = std::sqrt(boundsArea / static_cast<float>(sampleBudget));
+        const float sparseSpacing = std::clamp(
+            std::max(cellSize, budgetSpacing),
+            cellSize,
+            std::max(cellSize * 16.0F, settings.projectionSearchRadiusMeters * 0.50F));
+        const int minSampleX = static_cast<int>(std::floor(minXy.x / sparseSpacing));
+        const int maxSampleX = static_cast<int>(std::floor(maxXy.x / sparseSpacing));
+        const int minSampleY = static_cast<int>(std::floor(minXy.y / sparseSpacing));
+        const int maxSampleY = static_cast<int>(std::floor(maxXy.y / sparseSpacing));
+        const int sampleSpanX = std::max(0, maxSampleX - minSampleX + 1);
+        const int sampleSpanY = std::max(0, maxSampleY - minSampleY + 1);
+        const auto sampleSpan = static_cast<std::uint64_t>(sampleSpanX) * static_cast<std::uint64_t>(sampleSpanY);
+        if (sampleSpan == 0U) {
+            addSample(centroid, normal);
+            return;
+        }
+
+        bool sampledInterior = false;
+        if (sampleSpan <= static_cast<std::uint64_t>(sampleBudget)) {
+            for (int sampleY = minSampleY; sampleY <= maxSampleY; ++sampleY) {
+                for (int sampleX = minSampleX; sampleX <= maxSampleX; ++sampleX) {
+                    const glm::vec2 p{
+                        (static_cast<float>(sampleX) + 0.5F) * sparseSpacing,
+                        (static_cast<float>(sampleY) + 0.5F) * sparseSpacing,
+                    };
+                    const glm::vec3 weights = barycentric2(p, {a.x, a.y}, {b.x, b.y}, {c.x, c.y});
+                    if (weights.x < -1.0e-4F || weights.y < -1.0e-4F || weights.z < -1.0e-4F) {
+                        continue;
+                    }
+                    addSample(a * weights.x + b * weights.y + c * weights.z, normal);
+                    sampledInterior = true;
+                }
+            }
+        } else {
+            const auto latticeSide = static_cast<int>(std::clamp<std::uint32_t>(
+                static_cast<std::uint32_t>(std::ceil(std::sqrt(static_cast<float>(sampleBudget) * 2.0F))),
+                2U,
+                24U));
+            std::uint32_t emitted = 0U;
+            for (int y = 0; y < latticeSide && emitted < sampleBudget; ++y) {
+                for (int x = 0; x < latticeSide - y && emitted < sampleBudget; ++x) {
+                    const float u = (static_cast<float>(x) + 0.5F) / static_cast<float>(latticeSide + 1);
+                    const float v = (static_cast<float>(y) + 0.5F) / static_cast<float>(latticeSide + 1);
+                    if (u + v >= 1.0F) {
+                        continue;
+                    }
+                    addSample(a * (1.0F - u - v) + b * u + c * v, normal);
+                    sampledInterior = true;
+                    ++emitted;
+                }
+            }
+        }
+
+        if (!sampledInterior) {
+            addSample(centroid, normal);
+        }
+    };
+
+    for (const auto& triangle : mesh.triangles) {
+        if (triangle.indices[0] >= mesh.vertices.size() ||
+            triangle.indices[1] >= mesh.vertices.size() ||
+            triangle.indices[2] >= mesh.vertices.size()) {
+            continue;
+        }
+        const glm::vec3 a = ToGlm(mesh.vertices[triangle.indices[0]]);
+        const glm::vec3 b = ToGlm(mesh.vertices[triangle.indices[1]]);
+        const glm::vec3 c = ToGlm(mesh.vertices[triangle.indices[2]]);
+        glm::vec3 normal = glm::cross(b - a, c - a);
+        const float normalLengthSquared = glm::dot(normal, normal);
+        if (!std::isfinite(normalLengthSquared) ||
+            normalLengthSquared <= kMeshTriangleNormalEpsilon) {
+            continue;
+        }
+        normal = glm::normalize(normal);
+        if (normal.z < 0.0F) {
+            normal = -normal;
+        }
+
+        const glm::vec3 centroid = (a + b + c) / 3.0F;
+        const glm::vec2 minXy{
+            std::min({a.x, b.x, c.x}),
+            std::min({a.y, b.y, c.y}),
+        };
+        const glm::vec2 maxXy{
+            std::max({a.x, b.x, c.x}),
+            std::max({a.y, b.y, c.y}),
+        };
+        const int minCellX = static_cast<int>(std::floor(minXy.x / cellSize));
+        const int maxCellX = static_cast<int>(std::floor(maxXy.x / cellSize));
+        const int minCellY = static_cast<int>(std::floor(minXy.y / cellSize));
+        const int maxCellY = static_cast<int>(std::floor(maxXy.y / cellSize));
+        const int cellSpan = std::max(0, maxCellX - minCellX + 1) *
+                             std::max(0, maxCellY - minCellY + 1);
+        if (sparseLargeMeshMode) {
+            const float edgeXy =
+                std::max({glm::length(glm::vec2{b.x - a.x, b.y - a.y}),
+                          glm::length(glm::vec2{c.x - b.x, c.y - b.y}),
+                          glm::length(glm::vec2{a.x - c.x, a.y - c.y})});
+            if (cellSpan <= 0 ||
+                edgeXy <= std::max(cellSize * 3.0F, settings.projectionSearchRadiusMeters * 0.18F)) {
+                addSample(centroid, normal);
+            } else {
+                const auto sampleBudget = static_cast<std::uint32_t>(std::clamp(
+                    static_cast<int>(std::ceil(static_cast<float>(cellSpan) * 0.35F)),
+                    48,
+                    192));
+                addSparseTriangleSamples(a, b, c, normal, minXy, maxXy, sampleBudget);
+            }
+            continue;
+        }
+        if (cellSpan <= 0) {
+            addSample(centroid, normal);
+            continue;
+        }
+        if (cellSpan > 256) {
+            addSparseTriangleSamples(a, b, c, normal, minXy, maxXy, 512U);
+            continue;
+        }
+        bool sampledInterior = false;
+        for (int cellY = minCellY; cellY <= maxCellY; ++cellY) {
+            for (int cellX = minCellX; cellX <= maxCellX; ++cellX) {
+                const glm::vec2 p{
+                    (static_cast<float>(cellX) + 0.5F) * cellSize,
+                    (static_cast<float>(cellY) + 0.5F) * cellSize,
+                };
+                const glm::vec3 weights = barycentric2(p, {a.x, a.y}, {b.x, b.y}, {c.x, c.y});
+                if (weights.x < -1.0e-4F || weights.y < -1.0e-4F || weights.z < -1.0e-4F) {
+                    continue;
+                }
+                const glm::vec3 position = a * weights.x + b * weights.y + c * weights.z;
+                addSample(position, normal);
+                sampledInterior = true;
+            }
+        }
+        if (!sampledInterior) {
+            addSample(centroid, normal);
+        }
+    }
+
+    cache.cells.reserve(accumulators.size());
+    cache.cellLookup.reserve(accumulators.size());
+    for (const auto& [key, accumulator] : accumulators) {
+        if (accumulator.count == 0U) {
+            continue;
+        }
+        MeshSurfaceCacheCell cell;
+        const float count = static_cast<float>(accumulator.count);
+        cell.cellX = accumulator.cellX;
+        cell.cellY = accumulator.cellY;
+        cell.position = FromGlm(accumulator.positionSum / count);
+        glm::vec3 cellNormal = SafeOverlayNormal(accumulator.normalSum);
+        if (accumulator.count >= 3U) {
+            const double sampleCount = static_cast<double>(accumulator.count);
+            const double centeredXX =
+                accumulator.localXXSum - (accumulator.localXSum * accumulator.localXSum) / sampleCount;
+            const double centeredXY =
+                accumulator.localXYSum - (accumulator.localXSum * accumulator.localYSum) / sampleCount;
+            const double centeredYY =
+                accumulator.localYYSum - (accumulator.localYSum * accumulator.localYSum) / sampleCount;
+            const double centeredXZ =
+                accumulator.localXZSum - (accumulator.localXSum * accumulator.zSum) / sampleCount;
+            const double centeredYZ =
+                accumulator.localYZSum - (accumulator.localYSum * accumulator.zSum) / sampleCount;
+            const double determinant = centeredXX * centeredYY - centeredXY * centeredXY;
+            const double determinantEpsilon =
+                std::max(1.0e-14, std::pow(static_cast<double>(cellSize), 4.0) * 1.0e-6);
+            if (determinant > determinantEpsilon) {
+                const double slopeX = (centeredXZ * centeredYY - centeredYZ * centeredXY) / determinant;
+                const double slopeY = (centeredYZ * centeredXX - centeredXZ * centeredXY) / determinant;
+                if (std::isfinite(slopeX) && std::isfinite(slopeY)) {
+                    glm::vec3 fittedNormal{
+                        static_cast<float>(-slopeX),
+                        static_cast<float>(-slopeY),
+                        1.0F,
+                    };
+                    if (glm::dot(fittedNormal, fittedNormal) > kNormalEpsilon) {
+                        fittedNormal = glm::normalize(fittedNormal);
+                        if (fittedNormal.z < 0.0F) {
+                            fittedNormal = -fittedNormal;
+                        }
+                        if (fittedNormal.z > 0.05F) {
+                            cellNormal = fittedNormal;
+                        }
+                    }
+                }
+            }
+        }
+        cell.normal = FromGlm(SafeOverlayNormal(cellNormal));
+        const glm::vec3 normal = SafeOverlayNormal(ToGlm(cell.normal));
+        glm::vec3 downhill{normal.x * std::max(0.0F, normal.z), normal.y * std::max(0.0F, normal.z), 0.0F};
+        if (glm::dot(downhill, downhill) <= kNormalEpsilon) {
+            downhill = {1.0F, 0.0F, 0.0F};
+        } else {
+            downhill = glm::normalize(downhill);
+        }
+        cell.downhill = FromGlm(downhill);
+        cell.minZ = accumulator.minZ;
+        cell.maxZ = accumulator.maxZ;
+        cell.sampleCount = accumulator.count;
+        cell.confidence = Clamp01(std::sqrt(count) * 0.25F);
+        cell.ambiguous = (cell.maxZ - cell.minZ) > ambiguityHeight;
+        const auto cellIndex = static_cast<std::uint32_t>(
+            std::min<std::size_t>(cache.cells.size(), std::numeric_limits<std::uint32_t>::max()));
+        cache.cellLookup[key] = cellIndex;
+        cache.cells.push_back(cell);
+    }
+    const int downhillNeighbourRadius = std::clamp(
+        static_cast<int>(std::ceil(std::max(settings.projectionSearchRadiusMeters, cellSize) / cellSize)) * 4,
+        3,
+        16);
+    for (auto& cell : cache.cells) {
+        const glm::vec3 cellPosition = ToGlm(cell.position);
+        glm::vec3 bestLowerDirection{0.0F, 0.0F, 0.0F};
+        float bestLowerScore = 0.0F;
+        for (int dy = -downhillNeighbourRadius; dy <= downhillNeighbourRadius; ++dy) {
+            for (int dx = -downhillNeighbourRadius; dx <= downhillNeighbourRadius; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                const auto neighbourIt =
+                    cache.cellLookup.find(EncodeTrailSurfaceGridKey(cell.cellX + dx, cell.cellY + dy));
+                if (neighbourIt == cache.cellLookup.end() || neighbourIt->second >= cache.cells.size()) {
+                    continue;
+                }
+                const auto& neighbour = cache.cells[neighbourIt->second];
+                const glm::vec3 neighbourPosition = ToGlm(neighbour.position);
+                glm::vec3 delta = neighbourPosition - cellPosition;
+                delta.z = 0.0F;
+                const float distance = glm::length(delta);
+                if (distance <= 1.0e-5F) {
+                    continue;
+                }
+                const float drop = cellPosition.z - neighbourPosition.z;
+                if (drop <= std::max(0.001F, cellSize * 0.015F)) {
+                    continue;
+                }
+                const float score = drop / distance;
+                if (score > bestLowerScore) {
+                    bestLowerScore = score;
+                    bestLowerDirection = delta / distance;
+                }
+            }
+        }
+        if (bestLowerScore > 0.0F) {
+            const glm::vec3 normalDownhill = ToGlm(cell.downhill);
+            glm::vec3 blended = bestLowerDirection * 0.78F + normalDownhill * 0.22F;
+            if (glm::dot(blended, blended) > kNormalEpsilon) {
+                cell.downhill = FromGlm(glm::normalize(blended));
+            } else {
+                cell.downhill = FromGlm(bestLowerDirection);
+            }
+        }
+    }
+    cache.buildMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    return cache;
+}
+
+glm::vec3 MeshSurfaceCellProjectedPosition(
+    const MeshSurfaceCacheCell& cell,
+    const glm::vec3& query,
+    float cellSize,
+    float searchRadius) {
+    const glm::vec3 anchor = ToGlm(cell.position);
+    const glm::vec3 normal = SafeOverlayNormal(ToGlm(cell.normal));
+    float projectedZ = anchor.z;
+    if (std::abs(normal.z) > 0.05F) {
+        const glm::vec2 offset{query.x - anchor.x, query.y - anchor.y};
+        const float planeZ = anchor.z - ((normal.x * offset.x) + (normal.y * offset.y)) / normal.z;
+        const float maxPlaneDelta = std::max({cellSize * 8.0F, searchRadius, 0.02F});
+        if (std::isfinite(planeZ) && std::abs(planeZ - anchor.z) <= maxPlaneDelta) {
+            projectedZ = planeZ;
+        }
+    }
+    return {query.x, query.y, projectedZ};
+}
+
+MeshSurfaceProjection ProjectToMeshSurface(
+    const MeshSurfaceCache& cache,
+    const invisible_places::io::Float3& position) {
+    MeshSurfaceProjection projection;
+    if (cache.cells.empty()) {
+        return projection;
+    }
+    const float cellSize = std::clamp(cache.settings.cacheCellSizeMeters, 0.005F, 5.0F);
+    const float searchRadius = std::max(cache.settings.projectionSearchRadiusMeters, cellSize);
+    const int cellRadius = std::clamp(
+        static_cast<int>(std::ceil(searchRadius / cellSize)),
+        1,
+        24);
+    const glm::vec3 query = ToGlm(position);
+    const auto baseKey = MakeXyGridKey(query, cellSize);
+    const MeshSurfaceCacheCell* bestCell = nullptr;
+    glm::vec3 bestProjectedPosition{0.0F, 0.0F, 0.0F};
+    const float maxSearchDistance = searchRadius + cellSize * 0.75F;
+    const float maxSearchDistanceSquared = maxSearchDistance * maxSearchDistance;
+    float bestScore = std::numeric_limits<float>::max();
+    for (int dy = -cellRadius; dy <= cellRadius; ++dy) {
+        for (int dx = -cellRadius; dx <= cellRadius; ++dx) {
+            const int cellX = baseKey.x + dx;
+            const int cellY = baseKey.y + dy;
+            const auto key = EncodeTrailSurfaceGridKey(cellX, cellY);
+            const auto cellIt = cache.cellLookup.find(key);
+            if (cellIt == cache.cellLookup.end() || cellIt->second >= cache.cells.size()) {
+                continue;
+            }
+            const auto& cell = cache.cells[cellIt->second];
+            const glm::vec2 cellCenter{
+                (static_cast<float>(cellX) + 0.5F) * cellSize,
+                (static_cast<float>(cellY) + 0.5F) * cellSize,
+            };
+            const glm::vec2 centerDelta = cellCenter - glm::vec2{query.x, query.y};
+            const float centerDistanceSquared = glm::dot(centerDelta, centerDelta);
+            if (centerDistanceSquared > maxSearchDistanceSquared) {
+                continue;
+            }
+            const glm::vec3 projectedPosition =
+                MeshSurfaceCellProjectedPosition(cell, query, cellSize, searchRadius);
+            const float verticalDelta = projectedPosition.z - query.z;
+            const float verticalPenalty = std::min(
+                verticalDelta * verticalDelta,
+                maxSearchDistanceSquared) * 0.35F;
+            const float ringPenalty =
+                static_cast<float>(std::abs(dx) + std::abs(dy)) * cellSize * cellSize * 0.08F;
+            const float score = centerDistanceSquared + verticalPenalty + ringPenalty;
+            if (score < bestScore) {
+                bestScore = score;
+                bestCell = &cell;
+                bestProjectedPosition = projectedPosition;
+            }
+        }
+    }
+    if (bestCell == nullptr) {
+        return projection;
+    }
+    projection.position = FromGlm(bestProjectedPosition);
+    projection.normal = bestCell->normal;
+    projection.downhill = bestCell->downhill;
+    projection.confidence = bestCell->confidence;
+    projection.ambiguous = bestCell->ambiguous;
+    projection.hit = true;
+    return projection;
+}
+
+MeshSurfaceProjection ProjectRayToMeshSurface(
+    const MeshSurfaceCache& cache,
+    const invisible_places::io::Float3& rayOrigin,
+    const invisible_places::io::Float3& rayDirection) {
+    MeshSurfaceProjection projection;
+    if (cache.cells.empty()) {
+        return projection;
+    }
+
+    const glm::vec3 origin = ToGlm(rayOrigin);
+    glm::vec3 direction = ToGlm(rayDirection);
+    if (!IsValidPoint(origin) ||
+        !std::isfinite(direction.x) ||
+        !std::isfinite(direction.y) ||
+        !std::isfinite(direction.z) ||
+        glm::dot(direction, direction) <= kNormalEpsilon ||
+        std::abs(direction.z) <= 1.0e-5F) {
+        return projection;
+    }
+    direction = glm::normalize(direction);
+
+    const float cellSize = std::clamp(cache.settings.cacheCellSizeMeters, 0.005F, 5.0F);
+    const float searchRadius = std::max(cache.settings.projectionSearchRadiusMeters, cellSize);
+    glm::vec3 minimum{
+        cache.bounds.minimum.x,
+        cache.bounds.minimum.y,
+        cache.bounds.minimum.z,
+    };
+    glm::vec3 maximum{
+        cache.bounds.maximum.x,
+        cache.bounds.maximum.y,
+        cache.bounds.maximum.z,
+    };
+    if (!cache.bounds.valid) {
+        minimum = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+        maximum = {-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
+        for (const auto& cell : cache.cells) {
+            const glm::vec3 position = ToGlm(cell.position);
+            minimum = glm::min(minimum, position);
+            maximum = glm::max(maximum, position);
+        }
+    }
+    minimum -= glm::vec3{searchRadius, searchRadius, searchRadius};
+    maximum += glm::vec3{searchRadius, searchRadius, searchRadius};
+
+    float tMin = 0.0F;
+    float tMax = std::numeric_limits<float>::max();
+    auto includeSlab = [&](float slabMinimum, float slabMaximum, float rayValue, float rayDelta) {
+        if (std::abs(rayDelta) <= 1.0e-6F) {
+            return rayValue >= slabMinimum && rayValue <= slabMaximum;
+        }
+        float nearT = (slabMinimum - rayValue) / rayDelta;
+        float farT = (slabMaximum - rayValue) / rayDelta;
+        if (nearT > farT) {
+            std::swap(nearT, farT);
+        }
+        tMin = std::max(tMin, nearT);
+        tMax = std::min(tMax, farT);
+        return tMin <= tMax;
+    };
+    if (!includeSlab(minimum.x, maximum.x, origin.x, direction.x) ||
+        !includeSlab(minimum.y, maximum.y, origin.y, direction.y) ||
+        !includeSlab(minimum.z, maximum.z, origin.z, direction.z) ||
+        !std::isfinite(tMin) ||
+        !std::isfinite(tMax) ||
+        tMax <= 0.0F) {
+        return projection;
+    }
+    tMin = std::max(0.0F, tMin);
+
+    float bestT = tMin;
+    float bestResidual = std::numeric_limits<float>::max();
+    MeshSurfaceProjection bestProjection;
+    constexpr int kRaySampleCount = 32;
+    for (int sampleIndex = 0; sampleIndex < kRaySampleCount; ++sampleIndex) {
+        const float alpha = kRaySampleCount > 1
+                                ? static_cast<float>(sampleIndex) / static_cast<float>(kRaySampleCount - 1)
+                                : 0.0F;
+        const float t = tMin + (tMax - tMin) * alpha;
+        const glm::vec3 query = origin + direction * t;
+        auto candidate = ProjectToMeshSurface(cache, FromGlm(query));
+        if (!candidate.hit) {
+            continue;
+        }
+        const float residual = std::abs(query.z - candidate.position.z);
+        if (residual < bestResidual) {
+            bestResidual = residual;
+            bestT = t;
+            bestProjection = candidate;
+        }
+    }
+    if (!bestProjection.hit) {
+        return projection;
+    }
+
+    const float residualLimit = std::max({searchRadius * 2.0F, cellSize * 8.0F, 0.05F});
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        const glm::vec3 query = origin + direction * bestT;
+        auto candidate = ProjectToMeshSurface(cache, FromGlm(query));
+        if (!candidate.hit) {
+            break;
+        }
+        bestProjection = candidate;
+        bestResidual = std::abs(query.z - candidate.position.z);
+        const float nextT = (candidate.position.z - origin.z) / direction.z;
+        if (!std::isfinite(nextT) || nextT < 0.0F) {
+            break;
+        }
+        const float clampedNextT = std::clamp(nextT, tMin, tMax);
+        if (std::abs(clampedNextT - bestT) <= 1.0e-4F) {
+            bestT = clampedNextT;
+            break;
+        }
+        bestT = clampedNextT;
+    }
+
+    const glm::vec3 finalQuery = origin + direction * bestT;
+    auto finalProjection = ProjectToMeshSurface(cache, FromGlm(finalQuery));
+    if (!finalProjection.hit) {
+        finalProjection = bestProjection;
+    } else {
+        bestResidual = std::abs(finalQuery.z - finalProjection.position.z);
+    }
+    if (bestResidual > residualLimit) {
+        return projection;
+    }
+    return finalProjection;
+}
+
+glm::vec3 EvaluateDynamicMeshMotionPosition(
+    const std::vector<WaterDynamicMeshMotionKeyframe>& keyframes,
+    const invisible_places::io::Float3& fallbackPosition,
+    float timeSeconds) {
+    if (keyframes.empty()) {
+        return ToGlm(fallbackPosition);
+    }
+    const WaterDynamicMeshMotionKeyframe* previous = nullptr;
+    const WaterDynamicMeshMotionKeyframe* next = nullptr;
+    for (const auto& keyframe : keyframes) {
+        if (keyframe.timeSeconds <= timeSeconds &&
+            (previous == nullptr || keyframe.timeSeconds >= previous->timeSeconds)) {
+            previous = &keyframe;
+        }
+        if (keyframe.timeSeconds >= timeSeconds &&
+            (next == nullptr || keyframe.timeSeconds <= next->timeSeconds)) {
+            next = &keyframe;
+        }
+    }
+    if (previous == nullptr) {
+        return ToGlm(next != nullptr ? next->position : keyframes.front().position);
+    }
+    if (next == nullptr) {
+        return ToGlm(previous->position);
+    }
+    const float duration = next->timeSeconds - previous->timeSeconds;
+    if (std::abs(duration) <= 1.0e-5F) {
+        return ToGlm(next->position);
+    }
+    const float alpha = std::clamp((timeSeconds - previous->timeSeconds) / duration, 0.0F, 1.0F);
+    return glm::mix(ToGlm(previous->position), ToGlm(next->position), alpha);
+}
+
+const WaterDynamicMeshEmitterMotion* DynamicMeshEmitterMotionForId(
+    const WaterDynamicMeshFlowSettings& settings,
+    std::uint32_t emitterId) {
+    const auto motionIt = std::find_if(
+        settings.emitterMotions.begin(),
+        settings.emitterMotions.end(),
+        [emitterId](const WaterDynamicMeshEmitterMotion& motion) {
+            return motion.enabled && motion.emitterId == emitterId && !motion.keyframes.empty();
+        });
+    return motionIt == settings.emitterMotions.end() ? nullptr : &*motionIt;
+}
+
+WaterTrailOverlay BuildDynamicMeshWaterTrailOverlay(
+    const MeshSurfaceCache& cache,
+    const std::vector<WaterEmitter>& emitters,
+    const WaterDynamicMeshFlowSettings& settings,
+    WaterTrailBuildQuality quality,
+    WaterDynamicMeshFlowDiagnostics* diagnostics) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    WaterDynamicMeshFlowDiagnostics localDiagnostics;
+    localDiagnostics.cacheBuildMilliseconds = cache.buildMilliseconds;
+    localDiagnostics.sourceVertexCount = cache.sourceVertexCount;
+    localDiagnostics.sourceTriangleCount = cache.sourceTriangleCount;
+    localDiagnostics.cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        cache.cells.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    if (diagnostics != nullptr) {
+        *diagnostics = localDiagnostics;
+    }
+    if (!settings.enabled || cache.cells.empty()) {
+        return {};
+    }
+
+    std::vector<const WaterEmitter*> activeEmitters;
+    activeEmitters.reserve(emitters.size());
+    for (const auto& emitter : emitters) {
+        if (emitter.status != WaterEmitterStatus::Disabled && emitter.strength > 0.0F) {
+            activeEmitters.push_back(&emitter);
+        }
+    }
+    if (activeEmitters.empty()) {
+        if (diagnostics != nullptr) {
+            *diagnostics = localDiagnostics;
+        }
+        return {};
+    }
+
+    const std::uint32_t particleLimit = std::max<std::uint32_t>(
+        1U,
+        quality == WaterTrailBuildQuality::Preview
+            ? settings.previewParticleLimit
+            : settings.finalParticleLimit);
+    const std::uint32_t maxSteps = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(
+            std::ceil(std::max(0.02F, settings.trailLengthMeters) /
+                      std::max(0.002F, settings.stepMeters))) +
+            1U,
+        2U,
+        quality == WaterTrailBuildQuality::Preview ? 80U : 220U);
+    const float stepMeters = std::clamp(settings.stepMeters, 0.002F, 2.0F);
+    const float safeInertia = std::clamp(settings.inertia, 0.0F, 0.98F);
+    const float animationDurationSeconds = std::max(0.0F, settings.animationDurationSeconds);
+    const float sourceVelocityWeight = std::max(0.0F, settings.sourceVelocityWeight);
+    const float branchingStrength = std::max(0.0F, settings.branchingStrength);
+    const float eddyStrength = std::max(0.0F, settings.eddyStrength);
+    const float topologyResponse = std::max(0.0F, settings.topologyResponse);
+
+    std::vector<WaterAnimatedTrailPath> paths;
+    paths.reserve(particleLimit);
+    const std::vector<WaterDynamicMeshMotionKeyframe> emptyKeyframes;
+    for (std::uint32_t particleIndex = 0; particleIndex < particleLimit; ++particleIndex) {
+        const auto* emitter = activeEmitters[particleIndex % activeEmitters.size()];
+        const auto* emitterMotion = DynamicMeshEmitterMotionForId(settings, emitter->id);
+        const float angle = RegionHash01(settings.seed + emitter->id, particleIndex, 12011U) * 6.28318530718F;
+        const float radius01 = std::sqrt(RegionHash01(settings.seed + emitter->id, particleIndex, 12017U));
+        const float radius = radius01 * std::max(0.001F, emitter->radius);
+        glm::vec3 start = EvaluateDynamicMeshMotionPosition(
+            emitterMotion != nullptr ? emitterMotion->keyframes : emptyKeyframes,
+            emitter->position,
+            0.0F) + glm::vec3{
+            std::cos(angle) * radius,
+            std::sin(angle) * radius,
+            0.0F,
+        };
+        auto projected = ProjectToMeshSurface(cache, FromGlm(start));
+        if (!projected.hit) {
+            ++localDiagnostics.projectionMissCount;
+            continue;
+        }
+        if (projected.ambiguous) {
+            ++localDiagnostics.ambiguousHitCount;
+        }
+
+        WaterAnimatedTrailPath path;
+        path.motionMode = WaterAnimatedTrailMotionMode::VectorField;
+        path.sourceId = emitter->id;
+        path.anchors.reserve(maxSteps);
+        glm::vec3 position = ToGlm(projected.position);
+        glm::vec3 normal = SafeOverlayNormal(ToGlm(projected.normal));
+        glm::vec3 velocity = ToGlm(projected.downhill);
+        if (glm::dot(velocity, velocity) <= kNormalEpsilon) {
+            velocity = {1.0F, 0.0F, 0.0F};
+        }
+        velocity = glm::normalize(velocity);
+        float travelled = 0.0F;
+
+        for (std::uint32_t stepIndex = 0; stepIndex < maxSteps; ++stepIndex) {
+            WaterOverlayPoint point;
+            point.position = FromGlm(position);
+            point.normal = FromGlm(normal);
+            point.flowId = static_cast<float>(particleIndex + 1U);
+            point.emitterId = static_cast<float>(emitter->id);
+            point.pathDistance = travelled;
+            point.speed = std::max(0.01F, settings.speedMetersPerSecond * std::max(0.05F, emitter->speed));
+            point.width = std::max(0.0005F, settings.trailWidthMeters);
+            point.confidence = std::clamp(projected.confidence * emitter->confidence, 0.0F, 1.0F);
+            point.accumulation = std::clamp(emitter->strength, 0.0F, 1.0F);
+            path.anchors.push_back(point);
+            if (stepIndex + 1U >= maxSteps) {
+                break;
+            }
+
+            const float normalizedStep = maxSteps > 1U
+                                             ? static_cast<float>(stepIndex) / static_cast<float>(maxSteps - 1U)
+                                             : 0.0F;
+            const float normalizedNextStep = maxSteps > 1U
+                                                 ? static_cast<float>(stepIndex + 1U) /
+                                                       static_cast<float>(maxSteps - 1U)
+                                                 : normalizedStep;
+            const float motionTime = normalizedStep * animationDurationSeconds;
+            const float nextMotionTime = normalizedNextStep * animationDurationSeconds;
+            glm::vec3 force = ToGlm(projected.downhill) * std::max(0.0F, settings.downhillWeight);
+            if (emitterMotion != nullptr && sourceVelocityWeight > 0.0F) {
+                glm::vec3 sourceVelocity =
+                    EvaluateDynamicMeshMotionPosition(emitterMotion->keyframes, emitter->position, nextMotionTime) -
+                    EvaluateDynamicMeshMotionPosition(emitterMotion->keyframes, emitter->position, motionTime);
+                sourceVelocity.z = 0.0F;
+                if (glm::dot(sourceVelocity, sourceVelocity) > kNormalEpsilon) {
+                    force += glm::normalize(sourceVelocity) * sourceVelocityWeight;
+                }
+            }
+            for (const auto& attractor : settings.attractors) {
+                if (!attractor.enabled || attractor.strength <= 0.0F || attractor.radiusMeters <= 1.0e-5F) {
+                    continue;
+                }
+                glm::vec3 toAttractor =
+                    EvaluateDynamicMeshMotionPosition(attractor.keyframes, attractor.position, motionTime) -
+                    position;
+                toAttractor.z = 0.0F;
+                const float distance = glm::length(toAttractor);
+                if (distance <= 1.0e-5F || distance > attractor.radiusMeters) {
+                    continue;
+                }
+                const float falloff = 1.0F - SmoothStep(0.0F, attractor.radiusMeters, distance);
+                force += glm::normalize(toAttractor) *
+                         (settings.attractorWeight * attractor.strength * falloff);
+            }
+            const float curlPhase =
+                travelled * 2.7F +
+                RegionHash01(settings.seed + emitter->id, particleIndex, 12031U) * 6.28318530718F;
+            glm::vec3 lateral = glm::cross(normal, velocity);
+            if (glm::dot(lateral, lateral) > kNormalEpsilon) {
+                lateral = glm::normalize(lateral);
+                const float topologyBranchGate =
+                    projected.ambiguous
+                        ? 1.0F
+                        : std::clamp(0.25F + (1.0F - projected.confidence) * topologyResponse, 0.0F, 1.0F);
+                const float branchSign =
+                    RegionHash01(settings.seed + emitter->id, particleIndex, stepIndex + 12043U) < 0.5F
+                        ? -1.0F
+                        : 1.0F;
+                force += lateral *
+                         (std::sin(curlPhase) * std::max(0.0F, settings.curlStrength) +
+                          branchSign * branchingStrength * topologyBranchGate * 0.55F);
+                const float eddyPhase =
+                    travelled * 5.1F +
+                    RegionHash01(settings.seed + emitter->id, particleIndex, 12047U) * 6.28318530718F;
+                force -= velocity * (std::max(0.0F, std::sin(eddyPhase)) * eddyStrength * topologyBranchGate);
+            }
+            force.z = 0.0F;
+            if (glm::dot(force, force) <= kNormalEpsilon) {
+                force = velocity;
+            }
+            glm::vec3 nextVelocity = velocity * safeInertia + glm::normalize(force) * (1.0F - safeInertia);
+            nextVelocity.z = 0.0F;
+            if (glm::dot(nextVelocity, nextVelocity) <= kNormalEpsilon) {
+                nextVelocity = velocity;
+            }
+            nextVelocity = glm::normalize(nextVelocity);
+            const glm::vec3 candidate = position + nextVelocity * stepMeters;
+            auto nextProjection = ProjectToMeshSurface(cache, FromGlm(candidate));
+            if (!nextProjection.hit) {
+                ++localDiagnostics.projectionMissCount;
+                break;
+            }
+            if (nextProjection.ambiguous) {
+                ++localDiagnostics.ambiguousHitCount;
+            }
+            const glm::vec3 nextPosition = ToGlm(nextProjection.position);
+            travelled += glm::length(nextPosition - position);
+            position = nextPosition;
+            normal = SafeOverlayNormal(ToGlm(nextProjection.normal));
+            velocity = nextVelocity;
+            projected = nextProjection;
+        }
+        if (path.anchors.size() >= 2U) {
+            paths.push_back(std::move(path));
+        }
+    }
+
+    localDiagnostics.emittedPathCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        paths.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    auto overlay = BuildAnimatedWaterTrailOverlay(
+        paths,
+        {
+            .trailCountTotal = static_cast<std::uint32_t>(std::max<std::size_t>(1U, paths.size())),
+            .trailLengthMeters = settings.trailLengthMeters,
+            .trailPointSpacingMeters = settings.stepMeters,
+            .trailWidthMeters = settings.trailWidthMeters,
+            .trailStreakLengthMeters = settings.trailStreakLengthMeters,
+            .surfaceOffsetMeters = settings.surfaceOffsetMeters,
+            .laneSpreadMeters = std::max(settings.trailWidthMeters * 8.0F, settings.stepMeters * 0.75F),
+            .turbulence = settings.curlStrength,
+            .laneCrossing = std::clamp(settings.attractorWeight * 0.22F, 0.0F, 1.0F),
+            .speedMetersPerSecond = settings.speedMetersPerSecond,
+            .seed = settings.seed,
+            .featureType = kWaterTrailFeatureTypeDynamicMesh,
+        });
+    localDiagnostics.emittedSampleCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        overlay.samples.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    localDiagnostics.solveMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    overlay.fieldDiagnostics.inputNodeCount = localDiagnostics.cacheCellCount;
+    overlay.fieldDiagnostics.emittedPathCount = localDiagnostics.emittedPathCount;
+    overlay.fieldDiagnostics.emittedSampleCount = localDiagnostics.emittedSampleCount;
+    overlay.fieldDiagnostics.lowConfidenceTerminationCount = localDiagnostics.projectionMissCount;
+    overlay.fieldDiagnostics.lowConfidenceFadeCount = localDiagnostics.ambiguousHitCount;
+    if (diagnostics != nullptr) {
+        *diagnostics = localDiagnostics;
+    }
+    return overlay;
+}
+
 WaterFieldCache BuildFieldCacheFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFieldSettings& settings) {
@@ -9007,6 +9978,71 @@ invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
         cloud.scalarFields.push_back(stats);
     }
     return cloud;
+}
+
+std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarFieldsForPointCount(
+    std::uint64_t pointCount) {
+    constexpr std::string_view names[] = {
+        "trail_role",
+        "trail_id",
+        "source_id",
+        "path_id",
+        "branch_id",
+        "trail_seed",
+        "point_seed",
+        "trail_distance",
+        "trail_length",
+        "route_start_index",
+        "route_point_count",
+        "route_length",
+        "trail_start_phase",
+        "trail_lateral_offset",
+        "point_age",
+        "trail_age",
+        "trail_speed",
+        "trail_width",
+        "trail_streak_length",
+        "trail_confidence",
+        "wetness",
+        "feature_type",
+        "tangent_x",
+        "tangent_y",
+        "tangent_z",
+        "trail_lane_index",
+        "trail_lane_count",
+        "trail_lane_pitch",
+        "trail_lane_span",
+        "trail_lane_crossing",
+        "trail_cross_seed",
+    };
+
+    std::vector<invisible_places::io::ScalarFieldStats> fields;
+    fields.reserve(std::size(names));
+    for (const auto name : names) {
+        invisible_places::io::ScalarFieldStats stats;
+        stats.name = std::string{name};
+        stats.minimum = 0.0F;
+        stats.maximum = 1.0F;
+        stats.count = static_cast<std::uint64_t>(std::max<std::uint64_t>(1U, pointCount));
+        stats.valid = true;
+        if (name == "route_start_index" ||
+            name == "trail_id" ||
+            name == "source_id" ||
+            name == "path_id" ||
+            name == "branch_id") {
+            stats.maximum = static_cast<float>(std::max<std::uint64_t>(1U, pointCount));
+        } else if (name == "trail_distance" || name == "trail_length" || name == "route_length") {
+            stats.maximum = 100.0F;
+        } else if (name == "tangent_x" || name == "tangent_y" || name == "tangent_z" ||
+                   name == "trail_lateral_offset") {
+            stats.minimum = -1.0F;
+            stats.maximum = 1.0F;
+        } else if (name == "feature_type") {
+            stats.maximum = kWaterTrailFeatureTypeDynamicMesh;
+        }
+        fields.push_back(stats);
+    }
+    return fields;
 }
 
 invisible_places::io::LoadedPointCloud BuildWaterEffectOverlayPointCloud(

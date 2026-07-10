@@ -1,5 +1,6 @@
 #pragma once
 
+#include "io/MeshData.hpp"
 #include "io/PointCloudData.hpp"
 
 #include <array>
@@ -334,6 +335,12 @@ struct WaterTrailGeometrySettings {
 [[nodiscard]] WaterFlowTrailSettings ApplyWaterTrailGeometryToFlowTrailSettings(
     WaterFlowTrailSettings settings,
     const WaterTrailGeometrySettings& geometry);
+[[nodiscard]] bool WaterTrailGeometryGenerationInputsEqual(
+    const WaterTrailGeometrySettings& left,
+    const WaterTrailGeometrySettings& right);
+[[nodiscard]] bool WaterTrailGeometryLiveVisualOnlyEdit(
+    const WaterTrailGeometrySettings& before,
+    const WaterTrailGeometrySettings& after);
 
 struct WaterFieldSettings {
     bool enabled = true;
@@ -422,12 +429,131 @@ struct WaterRainDiagnostics {
 };
 
 inline constexpr float kWaterTrailFeatureTypeRain = 4.0F;
+inline constexpr float kWaterTrailFeatureTypeDynamicMesh = 5.0F;
+
+struct WaterDynamicMeshMotionKeyframe {
+    float timeSeconds = 0.0F;
+    invisible_places::io::Float3 position{};
+};
+
+struct WaterDynamicMeshAttractor {
+    std::uint32_t id = 1;
+    std::string name = "Attractor";
+    invisible_places::io::Float3 position{};
+    float radiusMeters = 0.65F;
+    float strength = 0.75F;
+    bool enabled = true;
+    std::vector<WaterDynamicMeshMotionKeyframe> keyframes;
+};
+
+struct WaterDynamicMeshEmitterMotion {
+    std::uint32_t emitterId = 0;
+    std::string name = "Emitter Motion";
+    bool enabled = true;
+    std::vector<WaterDynamicMeshMotionKeyframe> keyframes;
+};
+
+struct WaterDynamicMeshParticlePreset {
+    std::string_view name;
+    std::string_view label;
+};
+
+struct WaterDynamicMeshFlowSettings {
+    bool enabled = false;
+    bool gpuPreviewEnabled = true;
+    std::filesystem::path meshPath{};
+    float cacheCellSizeMeters = 0.08F;
+    float projectionSearchRadiusMeters = 1.25F;
+    float ambiguityHeightMeters = 0.18F;
+    std::uint32_t previewParticleLimit = 560;
+    std::uint32_t finalParticleLimit = 2400;
+    float trailLengthMeters = 18.0F;
+    float stepMeters = 0.12F;
+    float trailWidthMeters = 0.005F;
+    float trailStreakLengthMeters = 0.18F;
+    float surfaceOffsetMeters = 0.020F;
+    float speedMetersPerSecond = 0.62F;
+    float downhillWeight = 1.35F;
+    float attractorWeight = 1.0F;
+    float sourceVelocityWeight = 0.35F;
+    float curlStrength = 0.18F;
+    float branchingStrength = 0.36F;
+    float eddyStrength = 0.08F;
+    float topologyResponse = 0.65F;
+    float inertia = 0.64F;
+    float animationDurationSeconds = 4.0F;
+    std::uint32_t seed = 29U;
+    std::string particlePresetName = "Default";
+    std::string trailProfileName = "Default";
+    std::vector<WaterDynamicMeshAttractor> attractors;
+    std::vector<WaterDynamicMeshEmitterMotion> emitterMotions;
+};
+
+struct MeshSurfaceCacheCell {
+    invisible_places::io::Float3 position{};
+    invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
+    invisible_places::io::Float3 downhill{1.0F, 0.0F, 0.0F};
+    int cellX = 0;
+    int cellY = 0;
+    float minZ = 0.0F;
+    float maxZ = 0.0F;
+    float confidence = 1.0F;
+    std::uint32_t sampleCount = 0;
+    bool ambiguous = false;
+};
+
+struct MeshSurfaceCache {
+    std::uint32_t schemaVersion = 1;
+    std::filesystem::path meshPath;
+    std::string meshSignature;
+    WaterDynamicMeshFlowSettings settings{};
+    std::vector<MeshSurfaceCacheCell> cells;
+    std::unordered_map<std::uint64_t, std::uint32_t> cellLookup;
+    invisible_places::io::Bounds3f bounds{};
+    std::uint64_t sourceVertexCount = 0;
+    std::uint64_t sourceTriangleCount = 0;
+    double buildMilliseconds = 0.0;
+    bool stale = false;
+};
+
+struct MeshSurfaceProjection {
+    invisible_places::io::Float3 position{};
+    invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
+    invisible_places::io::Float3 downhill{1.0F, 0.0F, 0.0F};
+    float confidence = 0.0F;
+    bool ambiguous = false;
+    bool hit = false;
+};
+
+struct WaterDynamicMeshFlowDiagnostics {
+    double meshLoadMilliseconds = 0.0;
+    double cacheBuildMilliseconds = 0.0;
+    double solveMilliseconds = 0.0;
+    double gpuStaticUploadMilliseconds = 0.0;
+    double gpuLiveUploadMilliseconds = 0.0;
+    double gpuDispatchMilliseconds = 0.0;
+    std::uint64_t sourceVertexCount = 0;
+    std::uint64_t sourceTriangleCount = 0;
+    std::uint32_t cacheCellCount = 0;
+    std::uint32_t emittedPathCount = 0;
+    std::uint32_t emittedSampleCount = 0;
+    std::uint32_t projectionMissCount = 0;
+    std::uint32_t ambiguousHitCount = 0;
+    bool gpuStaticBuffersReused = false;
+    bool gpuAsynchronousDispatch = false;
+};
 
 [[nodiscard]] std::array<WaterRainIntensityPreset, 3> AllWaterRainIntensityPresets();
 [[nodiscard]] std::string_view WaterRainIntensityPresetLabel(WaterRainIntensityPreset preset);
 [[nodiscard]] std::string_view WaterRainIntensityPresetNameForStorage(WaterRainIntensityPreset preset);
 [[nodiscard]] std::optional<WaterRainIntensityPreset> ParseWaterRainIntensityPresetName(std::string_view value);
 [[nodiscard]] WaterRainSettings DefaultWaterRainSettings();
+[[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
+[[nodiscard]] std::array<WaterDynamicMeshParticlePreset, 4> AllWaterDynamicMeshParticlePresets();
+[[nodiscard]] WaterDynamicMeshFlowSettings ApplyWaterDynamicMeshParticlePreset(
+    WaterDynamicMeshFlowSettings settings,
+    std::string_view presetName);
+[[nodiscard]] std::string_view NormalizeWaterDynamicMeshParticlePresetName(std::string_view presetName);
 [[nodiscard]] WaterRainSettings ApplyWaterRainIntensityPreset(
     WaterRainSettings settings,
     WaterRainIntensityPreset preset);
@@ -1067,6 +1193,22 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterRainCameraFrame& cameraFrame,
     const WaterRainSettings& settings,
     WaterRainDiagnostics* diagnostics = nullptr);
+[[nodiscard]] MeshSurfaceCache BuildMeshSurfaceCache(
+    const invisible_places::io::LoadedTriangleMesh& mesh,
+    const WaterDynamicMeshFlowSettings& settings);
+[[nodiscard]] MeshSurfaceProjection ProjectToMeshSurface(
+    const MeshSurfaceCache& cache,
+    const invisible_places::io::Float3& position);
+[[nodiscard]] MeshSurfaceProjection ProjectRayToMeshSurface(
+    const MeshSurfaceCache& cache,
+    const invisible_places::io::Float3& rayOrigin,
+    const invisible_places::io::Float3& rayDirection);
+[[nodiscard]] WaterTrailOverlay BuildDynamicMeshWaterTrailOverlay(
+    const MeshSurfaceCache& cache,
+    const std::vector<WaterEmitter>& emitters,
+    const WaterDynamicMeshFlowSettings& settings,
+    WaterTrailBuildQuality quality = WaterTrailBuildQuality::Final,
+    WaterDynamicMeshFlowDiagnostics* diagnostics = nullptr);
 [[nodiscard]] WaterEffectOverlay GenerateRippleEffectOverlay(
     const invisible_places::io::LoadedPointCloud& cloud,
     const std::vector<WaterEffectLayer>& layers);
@@ -1088,6 +1230,8 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterTrailOverlay& overlay,
     const std::filesystem::path& sourcePath,
     std::string_view layerName);
+[[nodiscard]] std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarFieldsForPointCount(
+    std::uint64_t pointCount);
 [[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterEffectOverlayPointCloud(
     const WaterEffectOverlay& overlay,
     const std::filesystem::path& sourcePath,

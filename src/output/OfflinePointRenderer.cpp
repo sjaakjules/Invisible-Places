@@ -479,8 +479,40 @@ bool WaterTrailIsRain(
            featureType < kWaterTrailFeatureTypeRain + 0.5F;
 }
 
+bool WaterTrailStyleGeometryAvailable(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    return style.waterTrailStyleGeometry &&
+           style.surfelDiameter.active &&
+           style.surfelDiameter.mode == invisible_places::style::ParameterSourceMode::Constant &&
+           style.surfelDiameter.constantValue[0] > 0.0F &&
+           style.waterStreakAspect > 0.0F;
+}
+
+float WaterTrailWidth(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    if (WaterTrailStyleGeometryAvailable(style)) {
+        return std::max(0.0001F, style.surfelDiameter.constantValue[0]);
+    }
+    return std::max(0.0001F, ScalarFieldValueBySlot(cloud, kWaterTrailWidthFieldSlot, pointIndex));
+}
+
+float WaterTrailStreakLength(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
+    if (WaterTrailStyleGeometryAvailable(style)) {
+        return WaterTrailWidth(cloud, pointIndex, style) * std::max(1.0F, style.waterStreakAspect);
+    }
+    return std::max(
+        0.001F,
+        ScalarFieldValueBySlot(cloud, kWaterTrailStreakLengthFieldSlot, pointIndex));
+}
+
 float WaterTrailVisibility(
     const invisible_places::io::LoadedPointCloud& cloud,
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
     std::size_t pointIndex,
     float timeSeconds,
     const glm::vec3& worldCenter,
@@ -490,8 +522,7 @@ float WaterTrailVisibility(
     }
     const float phase = WaterTrailTravelPhase(cloud, pointIndex, timeSeconds);
     const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailRouteLengthFieldSlot, pointIndex));
-    const float trailStreakLength =
-        std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailStreakLengthFieldSlot, pointIndex));
+    const float trailStreakLength = WaterTrailStreakLength(cloud, pointIndex, style);
     const float endFeather = std::clamp(trailStreakLength / routeLength, 0.001F, 0.10F);
     const float endFade = 1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase);
     if (!WaterTrailIsRain(cloud, pointIndex)) {
@@ -1676,6 +1707,7 @@ bool BuildOfflinePointSample(
     if (waterTrails &&
         WaterTrailVisibility(
             cloud,
+            layer.style,
             pointIndex,
             stylisationTimeSeconds,
             glm::vec3{normalizedWorld},
@@ -1825,12 +1857,10 @@ bool BuildOfflinePointSample(
                                 ? std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F)
                                 : 1.0F;
     if (waterTrails) {
-        sample->surfelDiameter = std::max(
-            0.0001F,
-            ScalarFieldValueBySlot(cloud, kWaterTrailWidthFieldSlot, pointIndex));
+        sample->surfelDiameter = WaterTrailWidth(cloud, pointIndex, layer.style);
         const float trailStreakLength = std::max(
             sample->surfelDiameter,
-            ScalarFieldValueBySlot(cloud, kWaterTrailStreakLengthFieldSlot, pointIndex));
+            WaterTrailStreakLength(cloud, pointIndex, layer.style));
         sample->surfelAspect = std::clamp(
             trailStreakLength / std::max(sample->surfelDiameter, 0.0001F),
             1.0F,
@@ -2184,6 +2214,7 @@ void RenderFastBasicPointCloudTile(
             if (waterTrails &&
                 WaterTrailVisibility(
                     cloud,
+                    layer.style,
                     pointIndex,
                     stylisationTimeSeconds,
                     worldPosition,

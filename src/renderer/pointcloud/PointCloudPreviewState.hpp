@@ -127,6 +127,7 @@ struct PointCloudStyleState {
     float gaussianSharpness = 4.0F;
     float featherPower = 1.6F;
     float waterStreakAspect = 1.0F;
+    bool waterTrailStyleGeometry = false;
     bool solidCenters = true;
     bool flowAnimation = false;
     bool waterPathView = false;

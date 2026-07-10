@@ -11,14 +11,26 @@ namespace invisible_places::io {
 struct PlyProperty {
     std::string type;
     std::string name;
+    bool isList = false;
+    std::string listCountType;
+    std::string listValueType;
+};
+
+struct PlyElement {
+    std::string name;
+    std::uint64_t count = 0;
+    std::vector<PlyProperty> properties;
 };
 
 struct PlyHeader {
     std::string format;
     std::uint64_t vertexCount = 0;
+    std::uint64_t faceCount = 0;
     std::uint64_t dataOffsetBytes = 0;
     std::vector<std::string> comments;
     std::vector<PlyProperty> properties;
+    std::vector<PlyProperty> faceProperties;
+    std::vector<PlyElement> elements;
 
     bool HasProperty(std::string_view propertyName) const;
     bool HasColorRgb() const;
