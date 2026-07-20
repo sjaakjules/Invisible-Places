@@ -85,6 +85,12 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
     vec4 shorelineWaveTint;
+    vec4 gradientStartColor;
+    vec4 gradientEndColor;
+    uvec4 seepageControl;
+    vec4 seepageGridParams;
+    vec4 seepageBoundsMin;
+    vec4 seepageBoundsMax;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
@@ -947,29 +953,29 @@ void main() {
             : 0.0;
     const float sparseRippleEmissionAdd = sparseRipple.emissionAdd;
     const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
+    const float footprintScale = max(1.0e-6, styleData.renderParams1.y);
     const float pointSizeBeforeDepthOfField =
         worldSizedScreenSprites
             ? WorldDiameterToScreenPointSizePixels(
-                  (max(0.0, EvaluateBinding(styleData.surfelDiameterBinding)) *
-                       WaterPathPointSizeScale(pointIndex) *
-                       WaterSteamSizeScale(pointIndex) *
-                       (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
-                       waterEffectPointSizeMultiply *
-                       sparseRipplePointSizeMultiply) +
-                      waterEffectPointSizeAdd +
-                      sparseRipplePointSizeAdd,
+                  ((max(0.0, EvaluateBinding(styleData.surfelDiameterBinding)) *
+                        WaterPathPointSizeScale(pointIndex) *
+                        WaterSteamSizeScale(pointIndex) *
+                        (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
+                        waterEffectPointSizeMultiply *
+                        sparseRipplePointSizeMultiply) +
+                       waterEffectPointSizeAdd +
+                       sparseRipplePointSizeAdd) *
+                      footprintScale,
                   viewDepth)
-            : ((clamp(
-                    EvaluateBinding(styleData.pointSizeBinding),
-                    max(1.0, styleData.renderParams3.y),
-                    max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z)) *
+            : (((max(0.0, EvaluateBinding(styleData.pointSizeBinding)) *
                     WaterPathPointSizeScale(pointIndex) *
                     WaterSteamSizeScale(pointIndex) *
                     (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
                     waterEffectPointSizeMultiply *
                     sparseRipplePointSizeMultiply) +
                    waterEffectPointSizeAdd +
-                   sparseRipplePointSizeAdd);
+                   sparseRipplePointSizeAdd) *
+                  footprintScale);
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
     gl_PointSize = clamp(

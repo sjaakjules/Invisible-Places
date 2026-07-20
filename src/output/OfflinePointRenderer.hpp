@@ -22,6 +22,7 @@ struct OfflinePointLayer {
     bool fastBasic = false;
     std::uint64_t drawPointCount = 0;
     glm::mat4 localToWorld{1.0F};
+    invisible_places::renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
     bool roughnessMotionFullLayer = false;
     std::size_t roughnessMotionFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t groundIdMotionFieldSlot = std::numeric_limits<std::size_t>::max();
@@ -37,6 +38,7 @@ struct OfflinePointLayer {
     std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
     std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
     std::vector<glm::uvec2> rippleMembershipRanges;
+    invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
     float roughnessMotionMinimum = 0.0F;
     float roughnessMotionInvRange = 1.0F;
 };

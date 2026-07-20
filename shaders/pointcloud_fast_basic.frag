@@ -63,6 +63,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
+    uvec4 seepageControl;
+    vec4 seepageGridParams;
+    vec4 seepageBoundsMin;
+    vec4 seepageBoundsMax;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"

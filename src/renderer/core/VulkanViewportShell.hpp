@@ -98,6 +98,7 @@ struct SceneRenderState {
         std::vector<invisible_places::io::ScalarFieldStats> scalarFields;
         bool hasSourceRgb = true;
         std::uint32_t drawPointCount = 0;
+        renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
     };
 
     struct GaussianSplatLayerState {
@@ -219,10 +220,21 @@ class VulkanViewportShell {
     void UpdateSparseWaterRippleParams(
         std::size_t layerId,
         const std::vector<invisible_places::water::WaterRippleRuntimeParams>& params);
+    void UploadWaterSeepageTopology(
+        std::size_t layerId,
+        const invisible_places::water::WaterSeepageSpatialGrid& grid);
+    void UpdateWaterSeepageParams(
+        std::size_t layerId,
+        const invisible_places::water::WaterSeepageSpatialGrid& grid);
     [[nodiscard]] std::size_t SparseWaterRippleEffectCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t SparseWaterRippleRegionCount(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t SparseWaterRippleMembershipUploadRevision(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t SparseWaterRippleParamsUploadRevision(std::size_t layerId) const;
+    [[nodiscard]] std::size_t WaterSeepageNodeCount(std::size_t layerId) const;
+    [[nodiscard]] std::size_t WaterSeepageOccupiedCellCount(std::size_t layerId) const;
+    [[nodiscard]] std::size_t WaterSeepageNodeReferenceCount(std::size_t layerId) const;
+    [[nodiscard]] std::uint64_t WaterSeepageTopologyUploadRevision(std::size_t layerId) const;
+    [[nodiscard]] std::uint64_t WaterSeepageParamsUploadRevision(std::size_t layerId) const;
     void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
     void UpdateInteractivePointSampleBuffer(
         std::size_t layerId,
@@ -305,6 +317,9 @@ class VulkanViewportShell {
         BufferAllocation sparseRippleRangeBuffer{};
         BufferAllocation sparseRippleMembershipBuffer{};
         BufferAllocation sparseRippleParamsBuffer{};
+        BufferAllocation seepageNodeBuffer{};
+        BufferAllocation seepageHashCellBuffer{};
+        BufferAllocation seepageNodeReferenceBuffer{};
         BufferAllocation dynamicMeshFlowCellBuffer{};
         BufferAllocation dynamicMeshFlowGridBuffer{};
         std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowUniformBuffers{};
@@ -329,6 +344,15 @@ class VulkanViewportShell {
         std::uint32_t sparseRippleParamCount = 0;
         std::uint64_t sparseRippleMembershipUploadRevision = 0;
         std::uint64_t sparseRippleParamsUploadRevision = 0;
+        std::uint32_t seepageNodeCount = 0;
+        std::uint32_t seepageHashCellCapacity = 0;
+        std::uint32_t seepageOccupiedCellCount = 0;
+        std::uint32_t seepageNodeReferenceCount = 0;
+        std::uint32_t seepageHashProbeLimit = 1;
+        float seepageCellSizeMeters = 0.50F;
+        invisible_places::io::Bounds3f seepageUnionBounds{};
+        std::uint64_t seepageTopologyUploadRevision = 0;
+        std::uint64_t seepageParamsUploadRevision = 0;
         const invisible_places::water::MeshSurfaceCache* dynamicMeshFlowCacheIdentity = nullptr;
         std::uint32_t dynamicMeshFlowParticleCount = 0;
         std::uint32_t dynamicMeshFlowRouteAnchorCount = 0;

@@ -18,6 +18,7 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 34U;
 
 enum class SerializedLayerKind {
     PointCloud,
@@ -80,6 +81,7 @@ struct WaterRippleRuntimeCacheDocument {
 struct WaterSceneStateDocument {
     std::string sceneGroupName = "Default";
     std::vector<invisible_places::water::WaterEmitter> emitters;
+    std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     std::optional<invisible_places::water::WaterPathCache> pathCache;
@@ -94,17 +96,32 @@ struct ScenePointVisualStateDocument {
     ProjectLayerDocument::PointVisual visual;
 };
 
+struct ScenePointCloudRoleSourceDocument {
+    std::string sceneRole;
+    std::filesystem::path analysisSourcePath;
+    std::filesystem::path displaySourcePath;
+};
+
+struct ScenePointCloudGroupDocument {
+    std::string sceneGroupName;
+    float displaySpacingMeters = 0.0F;
+    bool displayLoaded = false;
+    bool displayVisible = false;
+    std::vector<ScenePointCloudRoleSourceDocument> roleSources;
+};
+
 struct ProjectDocument {
     struct SavedAnimation {
         std::filesystem::path filePath;
         std::vector<std::filesystem::path> associatedLayerPaths;
     };
 
-    std::uint32_t schemaVersion = 32;
+    std::uint32_t schemaVersion = kProjectDocumentSchemaVersion;
     std::string projectName;
     std::vector<ProjectLayerDocument::PointVisual> pointVisuals;
     std::string selectedPointVisualName = "Unnamed";
     std::vector<ScenePointVisualStateDocument> sceneVisualStates;
+    std::vector<ScenePointCloudGroupDocument> scenePointCloudGroups;
     invisible_places::renderer::gsplat::GaussianSplatStyleState gsplatVisualStyle{};
     std::vector<ProjectLayerDocument> layers;
     std::optional<invisible_places::camera::CameraState> cameraState;
@@ -133,6 +150,9 @@ struct ProjectDocument {
     std::string selectedExportPresetName = std::string{invisible_places::output::kFastPreviewMp4PresetName};
     std::optional<invisible_places::output::ExportPreset> tempExportPreset;
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
+    std::vector<invisible_places::water::WaterSeepageNode> waterSeepageNodes;
+    invisible_places::water::WaterSeepageLookSettings waterSeepageDefaultLook{};
+    std::vector<invisible_places::water::WaterSeepageLookProfile> waterSeepageLookProfiles;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
@@ -181,8 +201,11 @@ struct PointCloudStylePresetDocument {
 };
 
 struct WaterSourcesDocument {
-    std::uint32_t schemaVersion = 10;
+    std::uint32_t schemaVersion = 11;
     std::vector<invisible_places::water::WaterEmitter> emitters;
+    std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
+    invisible_places::water::WaterSeepageLookSettings seepageDefaultLook{};
+    std::vector<invisible_places::water::WaterSeepageLookProfile> seepageLookProfiles;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     invisible_places::water::WaterSourceSettings sourceSettings{};

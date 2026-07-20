@@ -81,6 +81,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
+    uvec4 seepageControl;
+    vec4 seepageGridParams;
+    vec4 seepageBoundsMin;
+    vec4 seepageBoundsMax;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"
@@ -233,8 +237,10 @@ void main() {
     const float falloff = ResolveFalloff(radius, radiusSquared);
     const float opacity = clamp(inOpacity, 0.0, 1.0);
     const float stylisedCoverage = PointStylisationCoverage(inDiscCoord, radius, radiusSquared, inPointIndex);
-    const float alpha =
-        clamp(opacity * falloff * stylisedCoverage * ResolveDepthFadeAlpha(inDepthFade) * coverage, 0.0, AlphaClampMax());
+    const float rawAlpha =
+        opacity * falloff * stylisedCoverage * ResolveDepthFadeAlpha(inDepthFade) * coverage;
+    const float compensatedRawAlpha = rawAlpha * max(0.0, styleData.renderParams1.z);
+    const float alpha = clamp(compensatedRawAlpha, 0.0, AlphaClampMax());
     if (alpha <= 1e-5) {
         discard;
     }
@@ -256,6 +262,8 @@ void main() {
 
     const float emissionGain = max(0.0, inEmissive) * max(0.0, styleData.renderParams0.x);
     if (emissionGain > 1e-5) {
-        outEmission += vec4(baseColor * alpha * emissionGain, alpha * emissionGain);
+        outEmission += vec4(
+            baseColor * compensatedRawAlpha * emissionGain,
+            compensatedRawAlpha * emissionGain);
     }
 }

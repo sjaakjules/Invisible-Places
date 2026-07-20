@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -88,7 +89,8 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 pointMeta{0U, 0U, 0U, 0U};
     glm::uvec4 renderControl{0U, 1U, 0U, 0U};
     glm::vec4 renderParams0{1.0F, 0.55F, 4.0F, 1.6F};
-    glm::vec4 renderParams1{0.0F, 0.0F, 0.0F, 0.0F};
+    // x: trail-style geometry, y: density footprint scale, z: density coverage correction.
+    glm::vec4 renderParams1{0.0F, 1.0F, 1.0F, 0.0F};
     glm::vec4 renderParams2{1.0F, 0.0F, 1.0F, 0.0F};
     glm::vec4 renderParams3{0.0F, 1.0F, 64.0F, 0.0F};
     PointCloudBindingGpu pointSize{};
@@ -125,6 +127,12 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 shorelineWaveTint{0.62F, 0.88F, 1.0F, 1.0F};
     glm::vec4 gradientStartColor{0.05F, 0.28F, 0.95F, 1.0F};
     glm::vec4 gradientEndColor{0.96F, 0.94F, 0.58F, 1.0F};
+    // x: enabled, y: node count, z: hash-cell capacity, w: node-reference count.
+    glm::uvec4 seepageControl{0U, 0U, 0U, 0U};
+    // x: cell size, y: inverse cell size, z: maximum linear probes.
+    glm::vec4 seepageGridParams{0.50F, 2.0F, 1.0F, 0.0F};
+    glm::vec4 seepageBoundsMin{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 seepageBoundsMax{0.0F, 0.0F, 0.0F, 0.0F};
 };
 
 struct alignas(8) SparseWaterRippleRangeGpu {
@@ -145,6 +153,30 @@ struct alignas(16) SparseWaterRippleParamsGpu {
     glm::vec4 response0{0.85F, 0.0F, 1.0F, 0.0F};
     glm::vec4 response1{1.0F, 0.62F, 0.88F, 1.0F};
     glm::vec4 response2{0.35F, 0.0F, 0.0F, 0.0F};
+};
+
+struct alignas(16) WaterSeepageNodeGpu {
+    static constexpr std::size_t kGuideSampleCapacity = 8U;
+
+    glm::uvec4 control{0U, 1U, 1U, 1U};
+    glm::vec4 positionReach{0.0F, 0.0F, 0.0F, 1.25F};
+    glm::vec4 normalSurface{0.0F, 1.0F, 0.0F, 0.15F};
+    glm::vec4 downEdge{0.0F, 0.0F, -1.0F, 0.10F};
+    glm::vec4 lateralStart{1.0F, 0.0F, 0.0F, 0.06F};
+    glm::vec4 geometry{0.375F, 0.20F, 1.0F, 0.0F};
+    glm::vec4 pattern0{1.0F, 0.16F, 0.18F, 0.40F};
+    glm::vec4 pattern1{0.22F, 0.0F, 0.45F, 0.85F};
+    glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
+    glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
+    glm::vec4 response2{0.22F, 0.35F, 0.55F, 0.50F};
+    glm::uvec4 guideControl{0U, 0U, 0U, 0U};
+    std::array<glm::vec4, kGuideSampleCapacity> guidePositionStation{};
+    std::array<glm::vec4, kGuideSampleCapacity> guideNormalConfidence{};
+};
+
+struct alignas(16) WaterSeepageHashCellGpu {
+    glm::ivec4 coordinate{0, 0, 0, 0};
+    glm::uvec4 range{0U, 0U, 0U, 0U};
 };
 
 struct alignas(16) DynamicMeshFlowUniformsGpu {
@@ -233,6 +265,252 @@ SparseWaterRippleParamsGpu MakeSparseWaterRippleParamsGpu(
         0.0F,
     };
     return gpu;
+}
+
+std::uint32_t WaterSeepageQualityGpu(invisible_places::water::WaterSeepageQuality quality) {
+    using Quality = invisible_places::water::WaterSeepageQuality;
+    switch (quality) {
+        case Quality::Low:
+            return 0U;
+        case Quality::High:
+            return 2U;
+        case Quality::Auto:
+        case Quality::Balanced:
+            return 1U;
+    }
+    return 1U;
+}
+
+glm::vec3 SafeSeepageDirection(glm::vec3 value, glm::vec3 fallback) {
+    if (glm::dot(value, value) <= 1.0e-8F) {
+        value = fallback;
+    }
+    return glm::dot(value, value) > 1.0e-8F ? glm::normalize(value) : glm::vec3{0.0F, 0.0F, 1.0F};
+}
+
+WaterSeepageNodeGpu MakeWaterSeepageNodeGpu(
+    const invisible_places::water::WaterSeepageRuntimeNode& node) {
+    WaterSeepageNodeGpu gpu;
+    const glm::vec3 normal = SafeSeepageDirection(node.surfaceNormal, {0.0F, 1.0F, 0.0F});
+    glm::vec3 down = node.downAxis - normal * glm::dot(node.downAxis, normal);
+    down = SafeSeepageDirection(down, {0.0F, 0.0F, -1.0F});
+    glm::vec3 lateral = node.lateralAxis;
+    lateral -= normal * glm::dot(lateral, normal);
+    lateral -= down * glm::dot(lateral, down);
+    lateral = SafeSeepageDirection(lateral, glm::cross(normal, down));
+
+    gpu.control = glm::uvec4{
+        node.id,
+        WaterSeepageQualityGpu(node.resolvedQuality),
+        static_cast<std::uint32_t>(node.look.blendMode),
+        node.seed,
+    };
+    gpu.positionReach = glm::vec4{node.position, std::max(0.001F, node.reachMeters)};
+    gpu.normalSurface = glm::vec4{normal, std::max(0.001F, node.depthToleranceMeters)};
+    gpu.downEdge = glm::vec4{down, std::max(0.001F, node.edgeFeatherMeters)};
+    gpu.lateralStart = glm::vec4{lateral, std::max(0.001F, node.startHalfWidthMeters)};
+    gpu.geometry = glm::vec4{
+        std::max(0.001F, node.endHalfWidthMeters),
+        std::clamp(node.normalAlignment, 0.0F, 1.0F),
+        std::max(0.0F, node.strength),
+        std::clamp(node.rainVisualStrength, 0.0F, 1.0F),
+    };
+    gpu.pattern0 = glm::vec4{
+        std::clamp(node.look.patternScale, 0.05F, 100.0F),
+        std::max(0.002F, node.look.wavelengthMeters),
+        std::max(0.0F, node.look.speed),
+        std::max(0.0F, node.look.warp),
+    };
+    gpu.pattern1 = glm::vec4{
+        std::clamp(node.look.turbulence, 0.0F, 1.0F),
+        node.look.phase,
+        std::clamp(node.look.density, 0.0F, 1.0F),
+        std::max(0.0F, node.look.response.intensity),
+    };
+    gpu.response0 = glm::vec4{
+        std::max(0.0F, node.look.response.emissionAdd),
+        std::isfinite(node.look.response.opacityAdd) ? node.look.response.opacityAdd : 0.0F,
+        std::max(0.0F, node.look.response.opacityMultiply),
+        std::isfinite(node.look.response.pointSizeAdd) ? node.look.response.pointSizeAdd : 0.0F,
+    };
+    gpu.response1 = glm::vec4{
+        std::max(0.0F, node.look.response.pointSizeMultiply),
+        std::clamp(node.look.response.colouriseRed, 0.0F, 1.0F),
+        std::clamp(node.look.response.colouriseGreen, 0.0F, 1.0F),
+        std::clamp(node.look.response.colouriseBlue, 0.0F, 1.0F),
+    };
+    gpu.response2 = glm::vec4{
+        std::clamp(node.look.response.colouriseAmount, 0.0F, 1.0F),
+        std::clamp(node.look.baseWetness, 0.0F, 1.0F),
+        std::max(0.0F, node.look.glisten),
+        std::clamp(node.look.rainResponse, 0.0F, 1.0F),
+    };
+    const auto guideSampleCount = node.guideValid
+                                      ? std::min<std::size_t>(
+                                            static_cast<std::size_t>(node.guideSampleCount),
+                                            std::min(
+                                                node.guideSamples.size(),
+                                                WaterSeepageNodeGpu::kGuideSampleCapacity))
+                                      : 0U;
+    const float guideAchievedReach = std::max(
+        0.0F,
+        std::isfinite(node.guideAchievedReachMeters)
+            ? node.guideAchievedReachMeters
+            : 0.0F);
+    gpu.guideControl = glm::uvec4{
+        static_cast<std::uint32_t>(guideSampleCount),
+        std::bit_cast<std::uint32_t>(guideAchievedReach),
+        node.guideValid ? 1U : 0U,
+        node.guideComplete ? 1U : 0U,
+    };
+    glm::vec3 previousGuideNormal = normal;
+    float previousStation = 0.0F;
+    for (std::size_t sampleIndex = 0U; sampleIndex < guideSampleCount; ++sampleIndex) {
+        const auto& sample = node.guideSamples[sampleIndex];
+        const glm::vec3 position{
+            sample.position.x,
+            sample.position.y,
+            sample.position.z,
+        };
+        glm::vec3 sampleNormal{
+            sample.normal.x,
+            sample.normal.y,
+            sample.normal.z,
+        };
+        sampleNormal = SafeSeepageDirection(sampleNormal, previousGuideNormal);
+        if (glm::dot(sampleNormal, previousGuideNormal) < 0.0F) {
+            sampleNormal = -sampleNormal;
+        }
+        const float station = std::max(
+            previousStation,
+            std::isfinite(sample.station) ? sample.station : previousStation);
+        const float confidence = std::clamp(
+            std::isfinite(sample.confidence) ? sample.confidence : 0.0F,
+            0.0F,
+            1.0F);
+        gpu.guidePositionStation[sampleIndex] = glm::vec4{position, station};
+        gpu.guideNormalConfidence[sampleIndex] = glm::vec4{sampleNormal, confidence};
+        previousGuideNormal = sampleNormal;
+        previousStation = station;
+    }
+    return gpu;
+}
+
+std::uint32_t SeepageHashUint(std::uint32_t value) {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return value;
+}
+
+std::uint32_t SeepageCellHash(std::int32_t x, std::int32_t y, std::int32_t z) {
+    std::uint32_t value = static_cast<std::uint32_t>(x) * 0x8da6b343U;
+    value ^= static_cast<std::uint32_t>(y) * 0xd8163841U;
+    value ^= static_cast<std::uint32_t>(z) * 0xcb1ab31fU;
+    return SeepageHashUint(value);
+}
+
+std::uint32_t NextSeepageHashCapacity(std::size_t occupiedCellCount) {
+    const std::size_t requested = std::max<std::size_t>(2U, occupiedCellCount * 2U);
+    std::size_t capacity = 1U;
+    while (capacity < requested && capacity <= (std::numeric_limits<std::uint32_t>::max() / 2U)) {
+        capacity *= 2U;
+    }
+    if (capacity < requested || capacity > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Seepage spatial hash exceeds the current 32-bit capacity."};
+    }
+    return static_cast<std::uint32_t>(capacity);
+}
+
+struct WaterSeepageGpuTopology {
+    std::vector<WaterSeepageNodeGpu> nodes;
+    std::vector<WaterSeepageHashCellGpu> hashCells;
+    std::vector<std::uint32_t> nodeReferences;
+    std::uint32_t occupiedCellCount = 0U;
+    std::uint32_t probeLimit = 1U;
+};
+
+WaterSeepageGpuTopology MakeWaterSeepageGpuTopology(
+    const invisible_places::water::WaterSeepageSpatialGrid& grid) {
+    WaterSeepageGpuTopology result;
+    if (grid.nodes.size() > std::numeric_limits<std::uint32_t>::max() ||
+        grid.nodeReferences.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Seepage GPU payload exceeds the current 32-bit limit."};
+    }
+    result.nodes.reserve(grid.nodes.size());
+    for (const auto& node : grid.nodes) {
+        result.nodes.push_back(MakeWaterSeepageNodeGpu(node));
+    }
+
+    struct OccupiedCell {
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::int32_t z = 0;
+        std::uint32_t referenceOffset = 0U;
+        std::uint32_t referenceCount = 0U;
+    };
+    std::vector<OccupiedCell> occupiedCells;
+    occupiedCells.reserve(grid.hashCells.size());
+    result.nodeReferences.reserve(grid.nodeReferences.size());
+    for (const auto& cell : grid.hashCells) {
+        if (!cell.occupied || cell.referenceCount == 0U ||
+            cell.referenceOffset >= grid.nodeReferences.size()) {
+            continue;
+        }
+        const std::size_t sourceEnd = std::min<std::size_t>(
+            grid.nodeReferences.size(),
+            static_cast<std::size_t>(cell.referenceOffset) + static_cast<std::size_t>(cell.referenceCount));
+        const auto targetOffset = static_cast<std::uint32_t>(result.nodeReferences.size());
+        for (std::size_t referenceIndex = cell.referenceOffset; referenceIndex < sourceEnd; ++referenceIndex) {
+            const auto nodeIndex = grid.nodeReferences[referenceIndex];
+            if (nodeIndex < result.nodes.size()) {
+                result.nodeReferences.push_back(nodeIndex);
+            }
+        }
+        const auto targetCount = static_cast<std::uint32_t>(result.nodeReferences.size()) - targetOffset;
+        if (targetCount > 0U) {
+            occupiedCells.push_back({
+                .x = cell.x,
+                .y = cell.y,
+                .z = cell.z,
+                .referenceOffset = targetOffset,
+                .referenceCount = targetCount,
+            });
+        }
+    }
+
+    const auto capacity = NextSeepageHashCapacity(occupiedCells.size());
+    result.hashCells.assign(capacity, WaterSeepageHashCellGpu{});
+    for (const auto& cell : occupiedCells) {
+        const std::uint32_t initialSlot = SeepageCellHash(cell.x, cell.y, cell.z) & (capacity - 1U);
+        bool inserted = false;
+        for (std::uint32_t probe = 0U; probe < capacity; ++probe) {
+            const std::uint32_t slot = (initialSlot + probe) & (capacity - 1U);
+            auto& target = result.hashCells[slot];
+            if (target.coordinate.w != 0) {
+                continue;
+            }
+            target.coordinate = glm::ivec4{cell.x, cell.y, cell.z, 1};
+            target.range = glm::uvec4{cell.referenceOffset, cell.referenceCount, 0U, 0U};
+            result.probeLimit = std::max(result.probeLimit, probe + 1U);
+            inserted = true;
+            break;
+        }
+        if (!inserted) {
+            throw std::runtime_error{"Seepage spatial hash insertion failed."};
+        }
+    }
+    result.occupiedCellCount = static_cast<std::uint32_t>(occupiedCells.size());
+
+    if (result.nodes.empty()) {
+        result.nodes.push_back(WaterSeepageNodeGpu{});
+    }
+    if (result.nodeReferences.empty()) {
+        result.nodeReferences.push_back(0U);
+    }
+    return result;
 }
 
 struct alignas(16) GaussianSplatPushConstants {
@@ -551,6 +829,10 @@ PointCloudBindingGpu MakePointCloudBindingGpu(
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
     float inactiveDefault) {
     const auto* fieldStats = ResolveBindingScalarFieldStats(binding, scalarFields);
+    const bool useFieldMapping =
+        binding.active &&
+        binding.mode == invisible_places::style::ParameterSourceMode::FieldMapped &&
+        fieldStats != nullptr;
     PointCloudBindingGpu gpuBinding;
     gpuBinding.constantValue = glm::vec4{
         binding.active ? binding.constantValue[0] : inactiveDefault,
@@ -566,11 +848,13 @@ PointCloudBindingGpu MakePointCloudBindingGpu(
     };
     gpuBinding.extra = glm::vec4{binding.fieldMap.gamma, 0.0F, 0.0F, 0.0F};
     gpuBinding.control = glm::uvec4{
-        binding.active ? static_cast<std::uint32_t>(binding.mode) : 0U,
-        binding.active && binding.fieldMap.fieldSlot >= 0
+        useFieldMapping
+            ? static_cast<std::uint32_t>(invisible_places::style::ParameterSourceMode::FieldMapped)
+            : static_cast<std::uint32_t>(invisible_places::style::ParameterSourceMode::Constant),
+        useFieldMapping
             ? static_cast<std::uint32_t>(binding.fieldMap.fieldSlot)
             : 0xFFFFFFFFU,
-        binding.active ? binding.fieldMap.flags : 0U,
+        useFieldMapping ? binding.fieldMap.flags : 0U,
         binding.active ? 1U : 0U,
     };
     return gpuBinding;
@@ -1135,9 +1419,14 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     double pointSizeSum = 0.0;
     std::uint64_t pointSizeWeight = 0;
     for (const auto& layer : renderState_.pointCloudLayers) {
+        const auto densityCompensation =
+            renderer::pointcloud::SanitizePointCloudDensityCompensation(layer.densityCompensation);
         pointCount += layer.drawPointCount;
         pointSizeSum +=
-            static_cast<double>(layer.style.pointSize.constantValue[0] * renderState_.pointSizeScale) *
+            static_cast<double>(
+                layer.style.pointSize.constantValue[0] *
+                renderState_.pointSizeScale *
+                densityCompensation.footprintScale) *
             static_cast<double>(std::max<std::uint32_t>(1U, layer.drawPointCount));
         pointSizeWeight += std::max<std::uint32_t>(1U, layer.drawPointCount);
     }
@@ -1284,6 +1573,27 @@ void VulkanViewportShell::UploadPointCloud(
         resources.sparseRippleParamsBuffer,
         &emptySparseRippleParams,
         sizeof(emptySparseRippleParams));
+    const WaterSeepageNodeGpu emptySeepageNode{};
+    resources.seepageNodeBuffer = CreateHostVisibleBuffer(
+        sizeof(emptySeepageNode),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(resources.seepageNodeBuffer, &emptySeepageNode, sizeof(emptySeepageNode));
+    const WaterSeepageHashCellGpu emptySeepageHashCell{};
+    resources.seepageHashCellBuffer = CreateHostVisibleBuffer(
+        sizeof(emptySeepageHashCell),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources.seepageHashCellBuffer,
+        &emptySeepageHashCell,
+        sizeof(emptySeepageHashCell));
+    const std::uint32_t emptySeepageNodeReference = 0U;
+    resources.seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
+        sizeof(emptySeepageNodeReference),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources.seepageNodeReferenceBuffer,
+        &emptySeepageNodeReference,
+        sizeof(emptySeepageNodeReference));
 
     for (auto& styleBuffer : resources.styleBuffers) {
         styleBuffer = CreateHostVisibleBuffer(
@@ -1611,6 +1921,27 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
             sizeof(emptySparseRippleParams),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources->sparseRippleParamsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
+        const WaterSeepageNodeGpu emptySeepageNode{};
+        resources->seepageNodeBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageNode),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->seepageNodeBuffer, &emptySeepageNode, sizeof(emptySeepageNode));
+        const WaterSeepageHashCellGpu emptySeepageHashCell{};
+        resources->seepageHashCellBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageHashCell),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->seepageHashCellBuffer,
+            &emptySeepageHashCell,
+            sizeof(emptySeepageHashCell));
+        const std::uint32_t emptySeepageNodeReference = 0U;
+        resources->seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageNodeReference),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->seepageNodeReferenceBuffer,
+            &emptySeepageNodeReference,
+            sizeof(emptySeepageNodeReference));
 
         resources->dynamicMeshFlowCellBuffer = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(gpuCells.size() * sizeof(DynamicMeshSurfaceCellGpu)),
@@ -1954,6 +2285,102 @@ void VulkanViewportShell::UpdateSparseWaterRippleParams(
     ++sceneRevision_;
 }
 
+void VulkanViewportShell::UploadWaterSeepageTopology(
+    std::size_t layerId,
+    const invisible_places::water::WaterSeepageSpatialGrid& grid) {
+    auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr || resources->pointCount == 0U) {
+        throw std::runtime_error{"Cannot upload Seepage topology for an unloaded point cloud."};
+    }
+    if (grid.nodes.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Seepage node count exceeds the current 32-bit limit."};
+    }
+
+    WaitIdle();
+    const auto payload = MakeWaterSeepageGpuTopology(grid);
+
+    DestroyBuffer(&resources->seepageNodeBuffer);
+    resources->seepageNodeBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(payload.nodes.size() * sizeof(WaterSeepageNodeGpu)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources->seepageNodeBuffer,
+        payload.nodes.data(),
+        resources->seepageNodeBuffer.size);
+
+    DestroyBuffer(&resources->seepageHashCellBuffer);
+    resources->seepageHashCellBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(payload.hashCells.size() * sizeof(WaterSeepageHashCellGpu)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources->seepageHashCellBuffer,
+        payload.hashCells.data(),
+        resources->seepageHashCellBuffer.size);
+
+    DestroyBuffer(&resources->seepageNodeReferenceBuffer);
+    resources->seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(payload.nodeReferences.size() * sizeof(std::uint32_t)),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources->seepageNodeReferenceBuffer,
+        payload.nodeReferences.data(),
+        resources->seepageNodeReferenceBuffer.size);
+
+    resources->seepageNodeCount = static_cast<std::uint32_t>(grid.nodes.size());
+    resources->seepageHashCellCapacity =
+        resources->seepageNodeCount > 0U && payload.occupiedCellCount > 0U
+            ? static_cast<std::uint32_t>(payload.hashCells.size())
+            : 0U;
+    resources->seepageOccupiedCellCount = payload.occupiedCellCount;
+    resources->seepageNodeReferenceCount =
+        payload.occupiedCellCount > 0U
+            ? static_cast<std::uint32_t>(payload.nodeReferences.size())
+            : 0U;
+    resources->seepageHashProbeLimit = payload.probeLimit;
+    resources->seepageCellSizeMeters = std::max(0.001F, grid.cellSizeMeters);
+    resources->seepageUnionBounds = grid.unionBounds;
+    ++resources->seepageTopologyUploadRevision;
+    ++resources->seepageParamsUploadRevision;
+
+    UpdatePointCloudDescriptorSets(resources);
+    for (auto& highlight : resources->highlights) {
+        UpdatePointHighlightDescriptorSets(resources, &highlight);
+    }
+    if (resources->exrDescriptorSet != VK_NULL_HANDLE &&
+        exrExportResources_.depthImage.view != VK_NULL_HANDLE) {
+        UpdatePointCloudExrDescriptorSet(resources, exrExportResources_.depthImage.view);
+    }
+    ++sceneRevision_;
+}
+
+void VulkanViewportShell::UpdateWaterSeepageParams(
+    std::size_t layerId,
+    const invisible_places::water::WaterSeepageSpatialGrid& grid) {
+    auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr || resources->pointCount == 0U) {
+        throw std::runtime_error{"Cannot update Seepage params for an unloaded point cloud."};
+    }
+    if (grid.nodes.size() != resources->seepageNodeCount) {
+        throw std::runtime_error{"Seepage node count changed without rebuilding topology."};
+    }
+
+    std::vector<WaterSeepageNodeGpu> nodes;
+    nodes.reserve(std::max<std::size_t>(grid.nodes.size(), 1U));
+    for (const auto& node : grid.nodes) {
+        nodes.push_back(MakeWaterSeepageNodeGpu(node));
+    }
+    if (nodes.empty()) {
+        nodes.push_back(WaterSeepageNodeGpu{});
+    }
+    const auto expectedSize = static_cast<VkDeviceSize>(nodes.size() * sizeof(WaterSeepageNodeGpu));
+    if (resources->seepageNodeBuffer.size != expectedSize) {
+        throw std::runtime_error{"Seepage params buffer has an unexpected size."};
+    }
+    UploadBufferData(resources->seepageNodeBuffer, nodes.data(), expectedSize);
+    ++resources->seepageParamsUploadRevision;
+    ++sceneRevision_;
+}
+
 std::size_t VulkanViewportShell::SparseWaterRippleEffectCount(std::size_t layerId) const {
     const auto* resources = FindPointCloudResources(layerId);
     return resources != nullptr ? static_cast<std::size_t>(resources->sparseRippleMembershipCount) : 0U;
@@ -1972,6 +2399,31 @@ std::uint64_t VulkanViewportShell::SparseWaterRippleMembershipUploadRevision(std
 std::uint64_t VulkanViewportShell::SparseWaterRippleParamsUploadRevision(std::size_t layerId) const {
     const auto* resources = FindPointCloudResources(layerId);
     return resources != nullptr ? resources->sparseRippleParamsUploadRevision : 0U;
+}
+
+std::size_t VulkanViewportShell::WaterSeepageNodeCount(std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    return resources != nullptr ? static_cast<std::size_t>(resources->seepageNodeCount) : 0U;
+}
+
+std::size_t VulkanViewportShell::WaterSeepageOccupiedCellCount(std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    return resources != nullptr ? static_cast<std::size_t>(resources->seepageOccupiedCellCount) : 0U;
+}
+
+std::size_t VulkanViewportShell::WaterSeepageNodeReferenceCount(std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    return resources != nullptr ? static_cast<std::size_t>(resources->seepageNodeReferenceCount) : 0U;
+}
+
+std::uint64_t VulkanViewportShell::WaterSeepageTopologyUploadRevision(std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    return resources != nullptr ? resources->seepageTopologyUploadRevision : 0U;
+}
+
+std::uint64_t VulkanViewportShell::WaterSeepageParamsUploadRevision(std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    return resources != nullptr ? resources->seepageParamsUploadRevision : 0U;
 }
 
 void VulkanViewportShell::UpdatePointBudget(
@@ -3149,7 +3601,7 @@ void VulkanViewportShell::CreatePresentRenderPass() {
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -5205,11 +5657,24 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     sparseRippleParamsInfo.offset = 0;
     sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffer.size;
 
+    VkDescriptorBufferInfo seepageNodeInfo{
+        resources->seepageNodeBuffer.buffer,
+        0,
+        resources->seepageNodeBuffer.size};
+    VkDescriptorBufferInfo seepageHashCellInfo{
+        resources->seepageHashCellBuffer.buffer,
+        0,
+        resources->seepageHashCellBuffer.size};
+    VkDescriptorBufferInfo seepageNodeReferenceInfo{
+        resources->seepageNodeReferenceBuffer.buffer,
+        0,
+        resources->seepageNodeReferenceBuffer.size};
+
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 10> writes{};
+    std::array<VkWriteDescriptorSet, 13> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -5279,6 +5744,27 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[9].descriptorCount = 1;
     writes[9].pBufferInfo = &sparseRippleParamsInfo;
+
+    writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[10].dstSet = descriptorSet;
+    writes[10].dstBinding = 10;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[10].descriptorCount = 1;
+    writes[10].pBufferInfo = &seepageNodeInfo;
+
+    writes[11] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[11].dstSet = descriptorSet;
+    writes[11].dstBinding = 11;
+    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[11].descriptorCount = 1;
+    writes[11].pBufferInfo = &seepageHashCellInfo;
+
+    writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[12].dstSet = descriptorSet;
+    writes[12].dstBinding = 12;
+    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[12].descriptorCount = 1;
+    writes[12].pBufferInfo = &seepageNodeReferenceInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -5550,11 +6036,24 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     sparseRippleParamsInfo.offset = 0;
     sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffer.size;
 
+    VkDescriptorBufferInfo seepageNodeInfo{
+        resources->seepageNodeBuffer.buffer,
+        0,
+        resources->seepageNodeBuffer.size};
+    VkDescriptorBufferInfo seepageHashCellInfo{
+        resources->seepageHashCellBuffer.buffer,
+        0,
+        resources->seepageHashCellBuffer.size};
+    VkDescriptorBufferInfo seepageNodeReferenceInfo{
+        resources->seepageNodeReferenceBuffer.buffer,
+        0,
+        resources->seepageNodeReferenceBuffer.size};
+
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 10> writes{};
+    std::array<VkWriteDescriptorSet, 13> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -5625,6 +6124,27 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     writes[9].descriptorCount = 1;
     writes[9].pBufferInfo = &sparseRippleParamsInfo;
 
+    writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[10].dstSet = descriptorSet;
+    writes[10].dstBinding = 10;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[10].descriptorCount = 1;
+    writes[10].pBufferInfo = &seepageNodeInfo;
+
+    writes[11] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[11].dstSet = descriptorSet;
+    writes[11].dstBinding = 11;
+    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[11].descriptorCount = 1;
+    writes[11].pBufferInfo = &seepageHashCellInfo;
+
+    writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[12].dstSet = descriptorSet;
+    writes[12].dstBinding = 12;
+    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[12].descriptorCount = 1;
+    writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -5666,11 +6186,23 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         resources->sparseRippleParamsBuffer.buffer,
         0,
         resources->sparseRippleParamsBuffer.size};
+    VkDescriptorBufferInfo seepageNodeInfo{
+        resources->seepageNodeBuffer.buffer,
+        0,
+        resources->seepageNodeBuffer.size};
+    VkDescriptorBufferInfo seepageHashCellInfo{
+        resources->seepageHashCellBuffer.buffer,
+        0,
+        resources->seepageHashCellBuffer.size};
+    VkDescriptorBufferInfo seepageNodeReferenceInfo{
+        resources->seepageNodeReferenceBuffer.buffer,
+        0,
+        resources->seepageNodeReferenceBuffer.size};
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 10> writes{};
+    std::array<VkWriteDescriptorSet, 13> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = resources->exrDescriptorSet;
     writes[0].dstBinding = 0;
@@ -5740,6 +6272,27 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[9].descriptorCount = 1;
     writes[9].pBufferInfo = &sparseRippleParamsInfo;
+
+    writes[10] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[10].dstSet = resources->exrDescriptorSet;
+    writes[10].dstBinding = 10;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[10].descriptorCount = 1;
+    writes[10].pBufferInfo = &seepageNodeInfo;
+
+    writes[11] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[11].dstSet = resources->exrDescriptorSet;
+    writes[11].dstBinding = 11;
+    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[11].descriptorCount = 1;
+    writes[11].pBufferInfo = &seepageHashCellInfo;
+
+    writes[12] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[12].dstSet = resources->exrDescriptorSet;
+    writes[12].dstBinding = 12;
+    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[12].descriptorCount = 1;
+    writes[12].pBufferInfo = &seepageNodeReferenceInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -6475,6 +7028,9 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->sparseRippleRangeBuffer);
     DestroyBuffer(&resources->sparseRippleMembershipBuffer);
     DestroyBuffer(&resources->sparseRippleParamsBuffer);
+    DestroyBuffer(&resources->seepageNodeBuffer);
+    DestroyBuffer(&resources->seepageHashCellBuffer);
+    DestroyBuffer(&resources->seepageNodeReferenceBuffer);
     for (auto& uniformBuffer : resources->dynamicMeshFlowUniformBuffers) {
         DestroyBuffer(&uniformBuffer);
     }
@@ -6818,9 +7374,11 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         resources->hasNormals ? 1U : 0U,
         layer.style.waterTrailOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
     };
+    const auto densityCompensation =
+        renderer::pointcloud::SanitizePointCloudDensityCompensation(layer.densityCompensation);
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled ||
-        renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style) ==
+        renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style, densityCompensation) ==
             renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
     styleGpu.renderControl = glm::uvec4{
         forceDepthContribution ? 2U : 0U,
@@ -6836,8 +7394,8 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     };
     styleGpu.renderParams1 = glm::vec4{
         layer.style.waterTrailStyleGeometry ? 1.0F : 0.0F,
-        0.0F,
-        0.0F,
+        densityCompensation.footprintScale,
+        densityCompensation.coverageCorrection,
         0.0F,
     };
     styleGpu.renderParams2 = glm::vec4{
@@ -7088,6 +7646,36 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             resources->sparseRippleMembershipCount,
             resources->sparseRippleParamCount,
             0U,
+        };
+    }
+    if (resources->seepageNodeCount > 0U &&
+        resources->seepageHashCellCapacity > 0U &&
+        resources->seepageNodeReferenceCount > 0U &&
+        resources->seepageUnionBounds.valid) {
+        const float cellSize = std::max(0.001F, resources->seepageCellSizeMeters);
+        styleGpu.seepageControl = glm::uvec4{
+            1U,
+            resources->seepageNodeCount,
+            resources->seepageHashCellCapacity,
+            resources->seepageNodeReferenceCount,
+        };
+        styleGpu.seepageGridParams = glm::vec4{
+            cellSize,
+            1.0F / cellSize,
+            static_cast<float>(std::max(1U, resources->seepageHashProbeLimit)),
+            0.0F,
+        };
+        styleGpu.seepageBoundsMin = glm::vec4{
+            resources->seepageUnionBounds.minimum.x,
+            resources->seepageUnionBounds.minimum.y,
+            resources->seepageUnionBounds.minimum.z,
+            0.0F,
+        };
+        styleGpu.seepageBoundsMax = glm::vec4{
+            resources->seepageUnionBounds.maximum.x,
+            resources->seepageUnionBounds.maximum.y,
+            resources->seepageUnionBounds.maximum.z,
+            0.0F,
         };
     }
     styleGpu.pointSize = MakePointCloudBindingGpu(
@@ -7446,7 +8034,9 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                 true));
             continue;
         }
-        const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+        const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
+            layer.style,
+            layer.densityCompensation);
         const bool opaqueHardDisc =
             materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
         if (opaqueHardDisc || request.renderState.eyeDomeLightingEnabled) {
@@ -7471,7 +8061,9 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     for (const auto& layer : request.renderState.pointCloudLayers) {
         VkPipeline spritePipeline = resources.pointAccumulationPipeline;
         VkPipeline surfelPipeline = resources.surfelAccumulationPipeline;
-        if (renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style) ==
+        if (renderer::pointcloud::ResolvePointCloudMaterialVariant(
+                layer.style,
+                layer.densityCompensation) ==
             renderer::pointcloud::PointCloudMaterialVariant::ConstantSimple) {
             spritePipeline = resources.pointConstantSimpleAccumulationPipeline;
             surfelPipeline = resources.surfelConstantSimpleAccumulationPipeline;
@@ -7678,7 +8270,9 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
+                layer.style,
+                layer.densityCompensation);
             const bool opaqueHardDisc =
                 materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
             if (opaqueHardDisc || renderState_.eyeDomeLightingEnabled) {
@@ -7712,7 +8306,9 @@ void VulkanViewportShell::RecordCommandBuffer(
 
     if (drawLiveScene && !fastBasicPointRenderer && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
+                layer.style,
+                layer.densityCompensation);
             if (materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
                 continue;
             }
@@ -7927,7 +8523,9 @@ void VulkanViewportShell::RecordCommandBuffer(
         }
     } else if (drawLiveScene && !renderState_.pointCloudLayers.empty()) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(layer.style);
+            const auto materialVariant = renderer::pointcloud::ResolvePointCloudMaterialVariant(
+                layer.style,
+                layer.densityCompensation);
             if (materialVariant != renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc) {
                 continue;
             }

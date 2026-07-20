@@ -80,6 +80,12 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
     vec4 shorelineWaveTint;
+    vec4 gradientStartColor;
+    vec4 gradientEndColor;
+    uvec4 seepageControl;
+    vec4 seepageGridParams;
+    vec4 seepageBoundsMin;
+    vec4 seepageBoundsMax;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
@@ -295,10 +301,11 @@ void main() {
         worldSizedScreenSprites
             ? WorldDiameterToScreenPointSizePixels(styleData.surfelDiameterBinding.constantValue.x, -viewPosition.z)
             : styleData.pointSizeBinding.constantValue.x;
+    const float footprintScale = max(1.0e-6, styleData.renderParams1.y);
     gl_PointSize = waterTrailVisibility <= 0.0
         ? 0.0
         : clamp(
-              (basePointSize * sparseRipple.pointSizeMultiply) + sparseRipple.pointSizeAdd,
+              ((basePointSize * sparseRipple.pointSizeMultiply) + sparseRipple.pointSizeAdd) * footprintScale,
               max(1.0, styleData.renderParams3.y),
               max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
     outSourceColor = inColor;

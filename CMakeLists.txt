@@ -135,6 +135,7 @@ add_library(
     src/renderer/gsplat/HighQualityGaussianScene.cpp
     src/renderer/pointcloud/Colormap.cpp
     src/renderer/pointcloud/PointCloudPreviewState.cpp
+    src/scene/PointCloudVariants.cpp
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
     src/style/RenderParameterBinding.cpp
@@ -216,7 +217,17 @@ endif()
 if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
     find_package(Catch2 3 CONFIG QUIET)
     if(Catch2_FOUND)
-        add_executable(invisible_places_tests tests/AssetDiscoveryTests.cpp)
+        add_executable(
+            invisible_places_tests
+            tests/AssetDiscoveryTests.cpp
+            tests/PointCloudDensityCompensationTests.cpp
+            tests/PointCloudVariantsTests.cpp
+            tests/ProjectDocumentSerializationTests.cpp
+            tests/RenderParameterBindingTests.cpp
+            tests/SeepageOfflineRendererTests.cpp
+            tests/SeepageSerializationTests.cpp
+            tests/SeepageWaterTests.cpp
+        )
         target_link_libraries(invisible_places_tests PRIVATE invisible_places_core Catch2::Catch2WithMain)
         include(Catch)
         catch_discover_tests(invisible_places_tests)
@@ -259,6 +270,18 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         )
         set_tests_properties(
             water-ripple-patterns-test-points-gui-smoke
+            PROPERTIES LABELS gui_smoke
+        )
+        add_test(
+            NAME seepage-sample-terrestrial-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke seepage-sample-terrestrial
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
+        )
+        set_tests_properties(
+            seepage-sample-terrestrial-gui-smoke
             PROPERTIES LABELS gui_smoke
         )
         add_test(

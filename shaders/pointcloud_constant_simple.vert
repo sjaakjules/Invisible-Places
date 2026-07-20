@@ -88,13 +88,13 @@ void main() {
     gl_Position = uniforms.viewProjection * worldPosition;
 
     const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
+    const float footprintScale = max(1.0e-6, styleData.renderParams1.y);
     const float basePointSize =
         worldSizedScreenSprites
-            ? WorldDiameterToScreenPointSizePixels(styleData.surfelDiameterBinding.constantValue.x, viewDepth)
-            : clamp(
-                  styleData.pointSizeBinding.constantValue.x,
-                  max(1.0, styleData.renderParams3.y),
-                  max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+            ? WorldDiameterToScreenPointSizePixels(
+                  max(0.0, styleData.surfelDiameterBinding.constantValue.x) * footprintScale,
+                  viewDepth)
+            : max(0.0, styleData.pointSizeBinding.constantValue.x) * footprintScale;
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
     gl_PointSize = clamp(

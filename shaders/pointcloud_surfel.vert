@@ -75,6 +75,12 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
     vec4 shorelineWaveTint;
+    vec4 gradientStartColor;
+    vec4 gradientEndColor;
+    uvec4 seepageControl;
+    vec4 seepageGridParams;
+    vec4 seepageBoundsMin;
+    vec4 seepageBoundsMax;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
@@ -1067,7 +1073,7 @@ void main() {
             ? mix(1.0, max(0.0, WaterEffectField(styleData.waterEffectSlots0.y, pointIndex, 1.0)), waterEffectScale)
             : 1.0;
     const float sparseRipplePointSizeMultiply = sparseRipple.pointSizeMultiply;
-    const float diameter =
+    const float authoredDiameter =
         ((WaterTrailOverlayEnabled()
               ? WaterTrailWidth(pointIndex)
               : max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex))) *
@@ -1077,7 +1083,9 @@ void main() {
              waterEffectPointSizeMultiply *
              sparseRipplePointSizeMultiply) +
         waterEffectPointSizeAdd +
-        sparseRipplePointSizeAdd +
+        sparseRipplePointSizeAdd;
+    const float diameter =
+        authoredDiameter * max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
         ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
     const float waterStreakAspect =

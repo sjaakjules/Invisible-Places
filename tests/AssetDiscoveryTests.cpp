@@ -9523,7 +9523,7 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedSources},
             std::istreambuf_iterator<char>{}};
-        CHECK(savedJson.find("\"schema_version\": 10") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 11") != std::string::npos);
         CHECK(savedJson.find("\"water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_source_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"source_settings\"") != std::string::npos);

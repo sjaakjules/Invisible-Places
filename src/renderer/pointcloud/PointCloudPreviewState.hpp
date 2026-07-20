@@ -89,6 +89,11 @@ enum class PointCloudMaterialVariant {
     Unified
 };
 
+struct PointCloudDensityCompensation {
+    float footprintScale = 1.0F;
+    float coverageCorrection = 1.0F;
+};
+
 struct PointCloudStyleState {
     PointCloudStyleState();
 
@@ -234,7 +239,17 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb);
+[[nodiscard]] PointCloudDensityCompensation ResolvePointCloudDensityCompensation(
+    float displaySpacingMeters,
+    std::uint64_t displayPointCount,
+    float referenceSpacingMeters,
+    std::uint64_t referencePointCount);
+[[nodiscard]] PointCloudDensityCompensation SanitizePointCloudDensityCompensation(
+    PointCloudDensityCompensation compensation);
 [[nodiscard]] PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style);
+[[nodiscard]] PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
+    const PointCloudStyleState& style,
+    PointCloudDensityCompensation densityCompensation);
 [[nodiscard]] const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant);
 PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 PointBudgetState MakePointBudgetState(

@@ -90,12 +90,13 @@ void main() {
 
     float opacity = clamp(inOpacity, 0.0, 1.0);
     float edge = ResolveFalloff(radius, radiusSquared);
-    float alpha =
-        clamp(
-            opacity * edge * PointStylisationCoverage(inDiscCoord, radius, radiusSquared, inPointIndex) *
-                ResolveDepthFadeAlpha(inDepthFade) * coverage,
-            0.0,
-            AlphaClampMax());
+    const float rawAlpha =
+        opacity * edge * PointStylisationCoverage(inDiscCoord, radius, radiusSquared, inPointIndex) *
+        ResolveDepthFadeAlpha(inDepthFade) * coverage;
+    const float alpha = clamp(
+        rawAlpha * max(0.0, styleData.renderParams1.z),
+        0.0,
+        AlphaClampMax());
     if (alpha <= 1e-5 ||
         styleData.renderControl.x == 0u ||
         (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0))) {

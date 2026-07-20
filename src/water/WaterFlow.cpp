@@ -1,11 +1,15 @@
 #include "water/WaterFlow.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -3027,6 +3031,1395 @@ float WaterRainFallAngleDegrees(const WaterRainSettings& settings) {
     return std::atan(slope) * 57.2957795131F;
 }
 
+float WaterRainPresetVisualStrength(WaterRainIntensityPreset preset) {
+    switch (preset) {
+        case WaterRainIntensityPreset::LightMist:
+            return 0.30F;
+        case WaterRainIntensityPreset::Rain:
+            return 0.68F;
+        case WaterRainIntensityPreset::HeavyDownpour:
+            return 1.0F;
+    }
+    return 0.68F;
+}
+
+namespace {
+
+constexpr float kSeepagePi = 3.14159265358979323846F;
+constexpr float kSeepageTwoPi = 2.0F * kSeepagePi;
+constexpr float kSeepageMaximumRainReachScale = 1.25F;
+constexpr float kSeepageMaximumRainWidthScale = 1.20F;
+
+struct MutableSeepageHashCell {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
+    std::array<std::uint32_t, WaterSeepageSpatialGrid::kMaxReferencesPerCell> references{};
+    std::uint32_t referenceCount = 0U;
+    bool occupied = false;
+    bool overflowed = false;
+};
+
+float SeepageFiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+WaterEffectResponseSettings SanitizeSeepageResponse(
+    WaterEffectResponseSettings response,
+    const WaterEffectResponseSettings& fallback) {
+    response.intensity = std::clamp(SeepageFiniteOr(response.intensity, fallback.intensity), 0.0F, 8.0F);
+    response.emissionAdd = std::clamp(SeepageFiniteOr(response.emissionAdd, fallback.emissionAdd), 0.0F, 16.0F);
+    response.opacityAdd = std::clamp(SeepageFiniteOr(response.opacityAdd, fallback.opacityAdd), -1.0F, 4.0F);
+    response.opacityMultiply = std::clamp(
+        SeepageFiniteOr(response.opacityMultiply, fallback.opacityMultiply),
+        0.0F,
+        16.0F);
+    response.pointSizeAdd = std::clamp(
+        SeepageFiniteOr(response.pointSizeAdd, fallback.pointSizeAdd),
+        -256.0F,
+        512.0F);
+    response.pointSizeMultiply = std::clamp(
+        SeepageFiniteOr(response.pointSizeMultiply, fallback.pointSizeMultiply),
+        0.0F,
+        16.0F);
+    response.hueShift = SeepageFiniteOr(response.hueShift, fallback.hueShift);
+    response.colouriseRed = std::clamp(
+        SeepageFiniteOr(response.colouriseRed, fallback.colouriseRed),
+        0.0F,
+        1.0F);
+    response.colouriseGreen = std::clamp(
+        SeepageFiniteOr(response.colouriseGreen, fallback.colouriseGreen),
+        0.0F,
+        1.0F);
+    response.colouriseBlue = std::clamp(
+        SeepageFiniteOr(response.colouriseBlue, fallback.colouriseBlue),
+        0.0F,
+        1.0F);
+    response.colouriseAmount = std::clamp(
+        SeepageFiniteOr(response.colouriseAmount, fallback.colouriseAmount),
+        0.0F,
+        1.0F);
+    response.gaussianSharpnessBias = std::clamp(
+        SeepageFiniteOr(response.gaussianSharpnessBias, fallback.gaussianSharpnessBias),
+        -8.0F,
+        8.0F);
+    return response;
+}
+
+WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
+    const WaterSeepageLookSettings fallback{};
+    look.baseWetness = std::clamp(SeepageFiniteOr(look.baseWetness, fallback.baseWetness), 0.0F, 1.0F);
+    look.density = std::clamp(SeepageFiniteOr(look.density, fallback.density), 0.0F, 1.0F);
+    look.glisten = std::clamp(SeepageFiniteOr(look.glisten, fallback.glisten), 0.0F, 1.0F);
+    look.wavelengthMeters = std::clamp(
+        SeepageFiniteOr(look.wavelengthMeters, fallback.wavelengthMeters),
+        0.002F,
+        50.0F);
+    look.patternScale = std::clamp(
+        SeepageFiniteOr(look.patternScale, fallback.patternScale),
+        0.05F,
+        100.0F);
+    look.speed = std::clamp(SeepageFiniteOr(look.speed, fallback.speed), 0.0F, 20.0F);
+    look.warp = std::clamp(SeepageFiniteOr(look.warp, fallback.warp), 0.0F, 8.0F);
+    look.turbulence = std::clamp(SeepageFiniteOr(look.turbulence, fallback.turbulence), 0.0F, 1.0F);
+    look.phase = SeepageFiniteOr(look.phase, fallback.phase);
+    look.rainResponse = std::clamp(SeepageFiniteOr(look.rainResponse, fallback.rainResponse), 0.0F, 1.0F);
+    look.response = SanitizeSeepageResponse(look.response, fallback.response);
+    return look;
+}
+
+std::string_view TrimSeepageName(std::string_view value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())) != 0) {
+        value.remove_prefix(1U);
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())) != 0) {
+        value.remove_suffix(1U);
+    }
+    return value;
+}
+
+std::string NormalizeSeepageRole(std::string_view role) {
+    std::string normalized;
+    normalized.reserve(role.size());
+    for (const char character : role) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) != 0) {
+            normalized.push_back(static_cast<char>(std::tolower(byte)));
+        }
+    }
+    if (normalized == "vegetation") {
+        return "veg";
+    }
+    return normalized;
+}
+
+bool SeepageNodeTargetsRole(const WaterSeepageNode& node, std::string_view targetRole) {
+    if (node.targetSceneRoles.empty()) {
+        return false;
+    }
+    if (targetRole.empty()) {
+        return true;
+    }
+    const auto normalizedTarget = NormalizeSeepageRole(targetRole);
+    return std::any_of(
+        node.targetSceneRoles.begin(),
+        node.targetSceneRoles.end(),
+        [&](const std::string& role) {
+            return NormalizeSeepageRole(role) == normalizedTarget;
+        });
+}
+
+glm::vec3 SafeSeepageNormal(const invisible_places::io::Float3& value) {
+    const glm::vec3 normal = ToGlm(value);
+    if (!IsValidPoint(normal) || glm::dot(normal, normal) <= kNormalEpsilon) {
+        return {0.0F, 1.0F, 0.0F};
+    }
+    return glm::normalize(normal);
+}
+
+std::uint32_t SeepageSpatialHash(std::int32_t x, std::int32_t y, std::int32_t z) {
+    std::uint32_t hash =
+        (static_cast<std::uint32_t>(x) * 0x8da6b343U) ^
+        (static_cast<std::uint32_t>(y) * 0xd8163841U) ^
+        (static_cast<std::uint32_t>(z) * 0xcb1ab31fU);
+    hash ^= hash >> 16U;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15U;
+    hash *= 0x846ca68bU;
+    hash ^= hash >> 16U;
+    return hash;
+}
+
+bool SeepageCellMatches(
+    const MutableSeepageHashCell& cell,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z) {
+    return cell.occupied && cell.x == x && cell.y == y && cell.z == z;
+}
+
+std::size_t SeepageHashSlot(
+    std::span<const MutableSeepageHashCell> cells,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z) {
+    if (cells.empty()) {
+        return 0U;
+    }
+    const auto mask = cells.size() - 1U;
+    std::size_t slot = static_cast<std::size_t>(SeepageSpatialHash(x, y, z)) & mask;
+    for (std::size_t probe = 0; probe < cells.size(); ++probe) {
+        if (!cells[slot].occupied || SeepageCellMatches(cells[slot], x, y, z)) {
+            return slot;
+        }
+        slot = (slot + 1U) & mask;
+    }
+    return cells.size();
+}
+
+void RehashSeepageCells(std::vector<MutableSeepageHashCell>* cells, std::size_t newCapacity) {
+    if (cells == nullptr) {
+        return;
+    }
+    newCapacity = std::max<std::size_t>(16U, newCapacity);
+    std::size_t powerOfTwo = 1U;
+    while (powerOfTwo < newCapacity) {
+        powerOfTwo *= 2U;
+    }
+    std::vector<MutableSeepageHashCell> replacement(powerOfTwo);
+    for (const auto& cell : *cells) {
+        if (!cell.occupied) {
+            continue;
+        }
+        const auto slot = SeepageHashSlot(replacement, cell.x, cell.y, cell.z);
+        replacement[slot] = cell;
+    }
+    *cells = std::move(replacement);
+}
+
+bool SeepageNodeReferencePreferred(
+    std::uint32_t leftIndex,
+    std::uint32_t rightIndex,
+    std::span<const WaterSeepageRuntimeNode> nodes,
+    std::int32_t cellX,
+    std::int32_t cellY,
+    std::int32_t cellZ,
+    float cellSizeMeters) {
+    if (leftIndex >= nodes.size()) {
+        return false;
+    }
+    if (rightIndex >= nodes.size()) {
+        return true;
+    }
+    const auto& left = nodes[leftIndex];
+    const auto& right = nodes[rightIndex];
+    if (std::abs(left.strength - right.strength) > 1.0e-6F) {
+        return left.strength > right.strength;
+    }
+    const glm::vec3 cellCenter{
+        (static_cast<float>(cellX) + 0.5F) * cellSizeMeters,
+        (static_cast<float>(cellY) + 0.5F) * cellSizeMeters,
+        (static_cast<float>(cellZ) + 0.5F) * cellSizeMeters,
+    };
+    const float leftDistanceSquared = glm::dot(left.position - cellCenter, left.position - cellCenter);
+    const float rightDistanceSquared = glm::dot(right.position - cellCenter, right.position - cellCenter);
+    if (std::abs(leftDistanceSquared - rightDistanceSquared) > 1.0e-8F) {
+        return leftDistanceSquared < rightDistanceSquared;
+    }
+    if (left.id != right.id) {
+        return left.id < right.id;
+    }
+    if (left.seed != right.seed) {
+        return left.seed < right.seed;
+    }
+    return leftIndex < rightIndex;
+}
+
+void InsertSeepageCellReference(
+    std::vector<MutableSeepageHashCell>* cells,
+    std::size_t* occupiedCount,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z,
+    std::uint32_t nodeIndex,
+    std::span<const WaterSeepageRuntimeNode> nodes,
+    float cellSizeMeters,
+    WaterSeepageSpatialGridDiagnostics* diagnostics) {
+    if (cells == nullptr || occupiedCount == nullptr || diagnostics == nullptr) {
+        return;
+    }
+    if (cells->empty()) {
+        cells->resize(16U);
+    }
+    auto slot = SeepageHashSlot(*cells, x, y, z);
+    const bool insertingCell = slot >= cells->size() || !cells->at(slot).occupied;
+    if (insertingCell && ((*occupiedCount + 1U) * 10U >= cells->size() * 7U)) {
+        RehashSeepageCells(cells, cells->size() * 2U);
+        slot = SeepageHashSlot(*cells, x, y, z);
+    }
+    if (slot >= cells->size()) {
+        return;
+    }
+    auto& cell = cells->at(slot);
+    if (!cell.occupied) {
+        cell.x = x;
+        cell.y = y;
+        cell.z = z;
+        cell.occupied = true;
+        ++*occupiedCount;
+    }
+    for (std::uint32_t index = 0U; index < cell.referenceCount; ++index) {
+        if (cell.references[index] == nodeIndex) {
+            return;
+        }
+    }
+    if (cell.referenceCount < WaterSeepageSpatialGrid::kMaxReferencesPerCell) {
+        cell.references[cell.referenceCount++] = nodeIndex;
+        return;
+    }
+    if (!cell.overflowed) {
+        cell.overflowed = true;
+        ++diagnostics->overflowCellCount;
+    }
+    ++diagnostics->droppedNodeReferenceCount;
+    std::uint32_t leastPreferredSlot = 0U;
+    for (std::uint32_t index = 1U; index < cell.referenceCount; ++index) {
+        if (SeepageNodeReferencePreferred(
+                cell.references[leastPreferredSlot],
+                cell.references[index],
+                nodes,
+                x,
+                y,
+                z,
+                cellSizeMeters)) {
+            leastPreferredSlot = index;
+        }
+    }
+    if (SeepageNodeReferencePreferred(
+            nodeIndex,
+            cell.references[leastPreferredSlot],
+            nodes,
+            x,
+            y,
+            z,
+            cellSizeMeters)) {
+        cell.references[leastPreferredSlot] = nodeIndex;
+    }
+}
+
+float SeepageRainGain(const WaterSeepageRuntimeNode& node) {
+    return Clamp01(node.rainVisualStrength * node.look.rainResponse);
+}
+
+const WaterSeepageSurfaceGuide* FindWaterSeepageSurfaceGuide(
+    std::span<const WaterSeepageSurfaceGuide> guides,
+    std::uint32_t nodeId) {
+    const auto guide = std::find_if(
+        guides.begin(),
+        guides.end(),
+        [nodeId](const WaterSeepageSurfaceGuide& candidate) {
+            return candidate.nodeId == nodeId;
+        });
+    return guide == guides.end() ? nullptr : &*guide;
+}
+
+void CopyWaterSeepageSurfaceGuide(
+    const WaterSeepageSurfaceGuide* guide,
+    WaterSeepageRuntimeNode* runtime) {
+    if (guide == nullptr || runtime == nullptr || !guide->valid || guide->sampleCount < 2U) {
+        return;
+    }
+
+    const auto sourceCount = std::min<std::size_t>(
+        guide->sampleCount,
+        kWaterSeepageMaximumGuideSamples);
+    float firstStation = 0.0F;
+    float previousStation = -1.0F;
+    glm::vec3 previousNormal = runtime->surfaceNormal;
+    for (std::size_t sourceIndex = 0U; sourceIndex < sourceCount; ++sourceIndex) {
+        const auto& source = guide->samples[sourceIndex];
+        const glm::vec3 position = ToGlm(source.position);
+        if (!IsValidPoint(position)) {
+            break;
+        }
+        if (sourceIndex == 0U) {
+            firstStation = std::isfinite(source.station) ? source.station : 0.0F;
+        }
+        float station = std::isfinite(source.station)
+                            ? std::max(0.0F, source.station - firstStation)
+                            : 0.0F;
+        if (runtime->guideSampleCount > 0U && station <= previousStation + 1.0e-5F) {
+            const glm::vec3 previousPosition = ToGlm(
+                runtime->guideSamples[runtime->guideSampleCount - 1U].position);
+            const float segmentLength = glm::length(position - previousPosition);
+            if (segmentLength <= 1.0e-5F) {
+                continue;
+            }
+            station = previousStation + segmentLength;
+        }
+
+        glm::vec3 normal = SafeSeepageNormal(source.normal);
+        if (glm::dot(normal, previousNormal) < 0.0F) {
+            normal = -normal;
+        }
+        auto& target = runtime->guideSamples[runtime->guideSampleCount++];
+        target.position = source.position;
+        target.normal = FromGlm(normal);
+        target.station = station;
+        target.confidence = std::clamp(
+            SeepageFiniteOr(source.confidence, 1.0F),
+            0.0F,
+            1.0F);
+        previousStation = station;
+        previousNormal = normal;
+    }
+
+    if (runtime->guideSampleCount < 2U) {
+        runtime->guideSampleCount = 0U;
+        return;
+    }
+    const float lastStation =
+        runtime->guideSamples[runtime->guideSampleCount - 1U].station;
+    const float declaredAchieved = std::max(
+        0.0F,
+        SeepageFiniteOr(guide->achievedReachMeters, lastStation));
+    runtime->guideRequestedReachMeters = std::max(
+        lastStation,
+        SeepageFiniteOr(guide->requestedReachMeters, lastStation));
+    runtime->guideAchievedReachMeters = std::min(lastStation, declaredAchieved);
+    if (runtime->guideAchievedReachMeters <= 1.0e-5F) {
+        runtime->guideSampleCount = 0U;
+        runtime->guideRequestedReachMeters = 0.0F;
+        runtime->guideAchievedReachMeters = 0.0F;
+        return;
+    }
+    runtime->guideValid = true;
+    runtime->guideComplete = guide->complete &&
+                             runtime->guideAchievedReachMeters + 1.0e-4F >=
+                                 runtime->guideRequestedReachMeters;
+}
+
+glm::vec3 WaterSeepageGuideTangent(
+    const WaterSeepageRuntimeNode& node,
+    std::size_t sampleIndex) {
+    if (!node.guideValid || node.guideSampleCount < 2U || sampleIndex >= node.guideSampleCount) {
+        return node.downAxis;
+    }
+    const auto previousIndex = sampleIndex > 0U ? sampleIndex - 1U : sampleIndex;
+    const auto nextIndex = std::min<std::size_t>(sampleIndex + 1U, node.guideSampleCount - 1U);
+    glm::vec3 tangent = ToGlm(node.guideSamples[nextIndex].position) -
+                        ToGlm(node.guideSamples[previousIndex].position);
+    if (!IsValidPoint(tangent) || glm::dot(tangent, tangent) <= kNormalEpsilon) {
+        tangent = node.downAxis;
+    }
+    return glm::normalize(tangent);
+}
+
+invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntimeNode& node) {
+    invisible_places::io::Bounds3f bounds;
+    const float feather = std::max(0.0F, node.edgeFeatherMeters);
+    const float lateralExtent =
+        std::max(
+            node.startHalfWidthMeters,
+            node.endHalfWidthMeters * kSeepageMaximumRainWidthScale) + feather;
+    const float depthExtent = node.depthToleranceMeters + feather;
+    if (node.guideValid && node.guideSampleCount >= 2U) {
+        const float maximumReach = std::max(
+            1.0e-5F,
+            node.reachMeters * kSeepageMaximumRainReachScale);
+        for (std::size_t sampleIndex = 0U;
+             sampleIndex < node.guideSampleCount;
+             ++sampleIndex) {
+            const auto& sample = node.guideSamples[sampleIndex];
+            const glm::vec3 position = ToGlm(sample.position);
+            const glm::vec3 normal = SafeSeepageNormal(sample.normal);
+            const glm::vec3 tangent = WaterSeepageGuideTangent(node, sampleIndex);
+            glm::vec3 lateral = glm::cross(normal, tangent);
+            if (!IsValidPoint(lateral) || glm::dot(lateral, lateral) <= kNormalEpsilon) {
+                lateral = node.lateralAxis;
+            } else {
+                lateral = glm::normalize(lateral);
+            }
+            if (glm::dot(lateral, node.lateralAxis) < 0.0F) {
+                lateral = -lateral;
+            }
+            const float progress = Clamp01(sample.station / maximumReach);
+            const float halfWidth = std::lerp(
+                node.startHalfWidthMeters,
+                node.endHalfWidthMeters * kSeepageMaximumRainWidthScale,
+                progress);
+            const glm::vec3 extent =
+                glm::abs(lateral) * (halfWidth + feather) +
+                glm::abs(normal) * depthExtent +
+                glm::abs(tangent) * feather;
+            bounds.Expand(FromGlm(position - extent));
+            bounds.Expand(FromGlm(position + extent));
+        }
+        return bounds;
+    }
+    const std::array<float, 2> longitudinal{
+        -feather,
+        node.reachMeters * kSeepageMaximumRainReachScale + feather};
+    const std::array<float, 2> lateral{-lateralExtent, lateralExtent};
+    const std::array<float, 2> depth{-depthExtent, depthExtent};
+    for (const float along : longitudinal) {
+        for (const float across : lateral) {
+            for (const float offset : depth) {
+                bounds.Expand(FromGlm(
+                    node.position +
+                    node.downAxis * along +
+                    node.lateralAxis * across +
+                    node.surfaceNormal * offset));
+            }
+        }
+    }
+    return bounds;
+}
+
+std::int32_t SeepageCellCoordinate(float value, float cellSize) {
+    const double scaled = std::floor(
+        static_cast<double>(value) / static_cast<double>(std::max(1.0e-4F, cellSize)));
+    return static_cast<std::int32_t>(std::clamp(
+        scaled,
+        static_cast<double>(std::numeric_limits<std::int32_t>::min()),
+        static_cast<double>(std::numeric_limits<std::int32_t>::max())));
+}
+
+float SeepageHash01(std::int32_t x, std::int32_t y, std::uint32_t seed) {
+    std::uint32_t hash = SeepageSpatialHash(x, y, static_cast<std::int32_t>(seed));
+    hash ^= seed * 0x9e3779b9U;
+    hash ^= hash >> 16U;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15U;
+    return static_cast<float>(hash & 0x00ffffffU) / static_cast<float>(0x01000000U);
+}
+
+float SeepageValueNoise(const glm::vec2& coordinate, std::uint32_t seed) {
+    const auto x0 = static_cast<std::int32_t>(std::floor(coordinate.x));
+    const auto y0 = static_cast<std::int32_t>(std::floor(coordinate.y));
+    const float tx = coordinate.x - static_cast<float>(x0);
+    const float ty = coordinate.y - static_cast<float>(y0);
+    const float sx = tx * tx * (3.0F - 2.0F * tx);
+    const float sy = ty * ty * (3.0F - 2.0F * ty);
+    const float a = SeepageHash01(x0, y0, seed);
+    const float b = SeepageHash01(x0 + 1, y0, seed);
+    const float c = SeepageHash01(x0, y0 + 1, seed);
+    const float d = SeepageHash01(x0 + 1, y0 + 1, seed);
+    return std::lerp(std::lerp(a, b, sx), std::lerp(c, d, sx), sy);
+}
+
+float SeepageFractalNoise(
+    glm::vec2 coordinate,
+    std::uint32_t seed,
+    WaterSeepageQuality quality) {
+    std::uint32_t octaveCount = 2U;
+    if (quality == WaterSeepageQuality::Low) {
+        octaveCount = 1U;
+    } else if (quality == WaterSeepageQuality::High) {
+        octaveCount = 3U;
+    }
+    float value = 0.0F;
+    float weight = 0.0F;
+    float amplitude = 1.0F;
+    for (std::uint32_t octave = 0U; octave < octaveCount; ++octave) {
+        value += SeepageValueNoise(coordinate, seed + octave * 1013U) * amplitude;
+        weight += amplitude;
+        coordinate = coordinate * 2.03F + glm::vec2{17.0F, 31.0F};
+        amplitude *= 0.5F;
+    }
+    return weight > 0.0F ? value / weight : 0.0F;
+}
+
+struct SeepageFanSample {
+    float mask = 0.0F;
+    float downDistance = 0.0F;
+    float lateralDistance = 0.0F;
+    float signedLateralDistance = 0.0F;
+};
+
+SeepageFanSample EvaluatePlanarSeepageFanMask(
+    const WaterSeepageRuntimeNode& node,
+    const glm::vec3& position,
+    const glm::vec3& pointNormal) {
+    SeepageFanSample sample;
+    const glm::vec3 relative = position - node.position;
+    sample.downDistance = glm::dot(relative, node.downAxis);
+    sample.signedLateralDistance = glm::dot(relative, node.lateralAxis);
+    sample.lateralDistance = std::abs(sample.signedLateralDistance);
+    const float depthDistance = std::abs(glm::dot(relative, node.surfaceNormal));
+    const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
+    const float rainGain = SeepageRainGain(node);
+    const float effectiveReach = node.reachMeters * (1.0F + 0.25F * rainGain);
+    const float effectiveEndHalfWidth = node.endHalfWidthMeters * (1.0F + 0.20F * rainGain);
+    if (sample.downDistance < -feather ||
+        sample.downDistance > effectiveReach + feather ||
+        depthDistance > node.depthToleranceMeters + feather) {
+        return sample;
+    }
+
+    const float along01 = Clamp01(sample.downDistance / std::max(1.0e-5F, effectiveReach));
+    const float halfWidth = std::lerp(node.startHalfWidthMeters, effectiveEndHalfWidth, along01);
+    if (sample.lateralDistance > halfWidth + feather) {
+        return sample;
+    }
+
+    const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
+    const float endMask = 1.0F - SmoothStep(
+        effectiveReach - feather,
+        effectiveReach + feather,
+        sample.downDistance);
+    const float lateralMask = 1.0F - SmoothStep(halfWidth, halfWidth + feather, sample.lateralDistance);
+    const float depthMask = 1.0F - SmoothStep(
+        node.depthToleranceMeters,
+        node.depthToleranceMeters + feather,
+        depthDistance);
+    const float normalAgreement = std::abs(glm::dot(pointNormal, node.surfaceNormal));
+    const float aligned = SmoothStep(0.15F, 0.85F, normalAgreement);
+    const float normalMask = std::lerp(1.0F, aligned, Clamp01(node.normalAlignment));
+    sample.mask = Clamp01(startMask * endMask * lateralMask * depthMask * normalMask);
+    return sample;
+}
+
+SeepageFanSample EvaluateGuidedSeepageFanMask(
+    const WaterSeepageRuntimeNode& node,
+    const glm::vec3& position,
+    const glm::vec3& pointNormal) {
+    SeepageFanSample sample;
+    if (!node.guideValid || node.guideSampleCount < 2U) {
+        return sample;
+    }
+
+    const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
+    if (position.z > node.position.z + feather) {
+        return sample;
+    }
+
+    std::size_t closestSegment = 0U;
+    float closestRawAmount = 0.0F;
+    float closestAmount = 0.0F;
+    float closestDistanceSquared = std::numeric_limits<float>::max();
+    for (std::size_t segmentIndex = 0U;
+         segmentIndex + 1U < node.guideSampleCount;
+         ++segmentIndex) {
+        const glm::vec3 start = ToGlm(node.guideSamples[segmentIndex].position);
+        const glm::vec3 end = ToGlm(node.guideSamples[segmentIndex + 1U].position);
+        const glm::vec3 segment = end - start;
+        const float lengthSquared = glm::dot(segment, segment);
+        if (!IsValidPoint(start) || !IsValidPoint(end) || lengthSquared <= 1.0e-10F) {
+            continue;
+        }
+        const float rawAmount = glm::dot(position - start, segment) / lengthSquared;
+        const float amount = Clamp01(rawAmount);
+        const glm::vec3 center = start + segment * amount;
+        const float distanceSquared = glm::dot(position - center, position - center);
+        if (distanceSquared + 1.0e-8F < closestDistanceSquared) {
+            closestSegment = segmentIndex;
+            closestRawAmount = rawAmount;
+            closestAmount = amount;
+            closestDistanceSquared = distanceSquared;
+        }
+    }
+    if (closestDistanceSquared == std::numeric_limits<float>::max()) {
+        glm::vec3 resolvedNormal = pointNormal;
+        if (!IsValidPoint(resolvedNormal) || glm::dot(resolvedNormal, resolvedNormal) <= kNormalEpsilon) {
+            resolvedNormal = node.surfaceNormal;
+        } else {
+            resolvedNormal = glm::normalize(resolvedNormal);
+        }
+        return EvaluatePlanarSeepageFanMask(node, position, resolvedNormal);
+    }
+
+    const auto& startSample = node.guideSamples[closestSegment];
+    const auto& endSample = node.guideSamples[closestSegment + 1U];
+    const glm::vec3 start = ToGlm(startSample.position);
+    const glm::vec3 end = ToGlm(endSample.position);
+    const glm::vec3 segment = end - start;
+    const float segmentLength = glm::length(segment);
+    if (segmentLength <= 1.0e-5F) {
+        return sample;
+    }
+    const glm::vec3 tangent = segment / segmentLength;
+    const glm::vec3 center = start + segment * closestAmount;
+    float stationAmount = closestAmount;
+    if ((closestSegment == 0U && closestRawAmount < 0.0F) ||
+        (closestSegment + 2U == node.guideSampleCount && closestRawAmount > 1.0F)) {
+        stationAmount = closestRawAmount;
+    }
+    sample.downDistance = std::lerp(
+        startSample.station,
+        endSample.station,
+        stationAmount);
+
+    glm::vec3 startNormal = SafeSeepageNormal(startSample.normal);
+    glm::vec3 endNormal = SafeSeepageNormal(endSample.normal);
+    if (glm::dot(startNormal, endNormal) < 0.0F) {
+        endNormal = -endNormal;
+    }
+    glm::vec3 surfaceNormal = glm::mix(startNormal, endNormal, closestAmount);
+    if (!IsValidPoint(surfaceNormal) || glm::dot(surfaceNormal, surfaceNormal) <= kNormalEpsilon) {
+        surfaceNormal = startNormal;
+    } else {
+        surfaceNormal = glm::normalize(surfaceNormal);
+    }
+    glm::vec3 lateral = glm::cross(surfaceNormal, tangent);
+    if (!IsValidPoint(lateral) || glm::dot(lateral, lateral) <= kNormalEpsilon) {
+        lateral = node.lateralAxis;
+    } else {
+        lateral = glm::normalize(lateral);
+    }
+    if (glm::dot(lateral, node.lateralAxis) < 0.0F) {
+        lateral = -lateral;
+    }
+
+    const glm::vec3 relative = position - center;
+    sample.signedLateralDistance = glm::dot(relative, lateral);
+    sample.lateralDistance = std::abs(sample.signedLateralDistance);
+    const float depthDistance = std::abs(glm::dot(relative, surfaceNormal));
+    const float rainGain = SeepageRainGain(node);
+    const float authoredReach = std::max(
+        1.0e-5F,
+        node.reachMeters * (1.0F + 0.25F * rainGain));
+    const float lastStation = node.guideSamples[node.guideSampleCount - 1U].station;
+    const float supportedReach = std::min({
+        authoredReach,
+        std::max(0.0F, node.guideAchievedReachMeters),
+        std::max(0.0F, lastStation),
+    });
+    if (supportedReach <= 1.0e-5F ||
+        sample.downDistance < -feather ||
+        sample.downDistance > supportedReach + feather ||
+        depthDistance > node.depthToleranceMeters + feather) {
+        return sample;
+    }
+
+    const float progress = Clamp01(sample.downDistance / authoredReach);
+    const float effectiveEndHalfWidth =
+        node.endHalfWidthMeters * (1.0F + 0.20F * rainGain);
+    const float halfWidth = std::lerp(
+        node.startHalfWidthMeters,
+        effectiveEndHalfWidth,
+        progress);
+    if (sample.lateralDistance > halfWidth + feather) {
+        return sample;
+    }
+
+    const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
+    const float endMask = 1.0F - SmoothStep(
+        supportedReach - feather,
+        supportedReach + feather,
+        sample.downDistance);
+    const float lateralMask = 1.0F - SmoothStep(
+        halfWidth,
+        halfWidth + feather,
+        sample.lateralDistance);
+    const float depthMask = 1.0F - SmoothStep(
+        node.depthToleranceMeters,
+        node.depthToleranceMeters + feather,
+        depthDistance);
+    const bool pointNormalValid = IsValidPoint(pointNormal) &&
+                                  glm::dot(pointNormal, pointNormal) > kNormalEpsilon;
+    const glm::vec3 resolvedPointNormal = pointNormalValid
+                                              ? glm::normalize(pointNormal)
+                                              : surfaceNormal;
+    const float normalAgreement = std::abs(glm::dot(resolvedPointNormal, surfaceNormal));
+    const float aligned = SmoothStep(0.15F, 0.85F, normalAgreement);
+    const float normalMask = std::lerp(1.0F, aligned, Clamp01(node.normalAlignment));
+    sample.mask = Clamp01(startMask * endMask * lateralMask * depthMask * normalMask);
+    return sample;
+}
+
+SeepageFanSample EvaluateSeepageFanMask(
+    const WaterSeepageRuntimeNode& node,
+    const glm::vec3& position,
+    const glm::vec3& pointNormal) {
+    const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
+    if (position.z > node.position.z + feather) {
+        return {};
+    }
+    if (node.guideValid && node.guideSampleCount >= 2U) {
+        return EvaluateGuidedSeepageFanMask(node, position, pointNormal);
+    }
+    glm::vec3 resolvedNormal = pointNormal;
+    if (!IsValidPoint(resolvedNormal) || glm::dot(resolvedNormal, resolvedNormal) <= kNormalEpsilon) {
+        resolvedNormal = node.surfaceNormal;
+    } else {
+        resolvedNormal = glm::normalize(resolvedNormal);
+    }
+    return EvaluatePlanarSeepageFanMask(node, position, resolvedNormal);
+}
+
+void BlendSeepageContribution(
+    WaterSeepageRuntimeContribution* target,
+    const WaterSeepageRuntimeContribution& contribution,
+    WaterEffectBlendMode blendMode) {
+    if (target == nullptr || contribution.scale <= 1.0e-6F) {
+        return;
+    }
+    if (target->scale <= 1.0e-6F || blendMode == WaterEffectBlendMode::Override) {
+        *target = contribution;
+        return;
+    }
+    if (blendMode == WaterEffectBlendMode::Max) {
+        target->mask = std::max(target->mask, contribution.mask);
+        target->damp = std::max(target->damp, contribution.damp);
+        target->ripple = std::max(target->ripple, contribution.ripple);
+        target->glint = std::max(target->glint, contribution.glint);
+        target->scale = std::max(target->scale, contribution.scale);
+        target->emissionAdd = std::max(target->emissionAdd, contribution.emissionAdd);
+        target->opacityAdd = std::max(target->opacityAdd, contribution.opacityAdd);
+        target->opacityMultiply = std::max(target->opacityMultiply, contribution.opacityMultiply);
+        target->pointSizeAdd = std::max(target->pointSizeAdd, contribution.pointSizeAdd);
+        target->pointSizeMultiply = std::max(target->pointSizeMultiply, contribution.pointSizeMultiply);
+        if (contribution.colourMix >= target->colourMix) {
+            target->colourMix = contribution.colourMix;
+            target->colour = contribution.colour;
+        }
+        return;
+    }
+
+    target->mask = std::max(target->mask, contribution.mask);
+    target->damp = std::max(target->damp, contribution.damp);
+    target->ripple = std::max(target->ripple, contribution.ripple);
+    target->glint = std::max(target->glint, contribution.glint);
+    if (blendMode == WaterEffectBlendMode::Multiply) {
+        target->scale = std::max(target->scale, contribution.scale);
+    } else if (blendMode == WaterEffectBlendMode::Screen) {
+        target->scale = 1.0F - ((1.0F - Clamp01(target->scale)) * (1.0F - Clamp01(contribution.scale)));
+    } else {
+        target->scale = Clamp01(target->scale + contribution.scale);
+    }
+    target->emissionAdd += contribution.emissionAdd;
+    target->opacityAdd += contribution.opacityAdd;
+    target->opacityMultiply *= contribution.opacityMultiply;
+    target->pointSizeAdd += contribution.pointSizeAdd;
+    target->pointSizeMultiply *= contribution.pointSizeMultiply;
+    const float combinedMix = Clamp01(target->colourMix + contribution.colourMix);
+    if (combinedMix > 1.0e-6F) {
+        target->colour = glm::mix(
+            target->colour,
+            contribution.colour,
+            contribution.colourMix / combinedMix);
+    }
+    target->colourMix = combinedMix;
+}
+
+bool SeepageBoundsContain(
+    const invisible_places::io::Bounds3f& bounds,
+    const invisible_places::io::Float3& point) {
+    return bounds.valid &&
+           point.x >= bounds.minimum.x && point.x <= bounds.maximum.x &&
+           point.y >= bounds.minimum.y && point.y <= bounds.maximum.y &&
+           point.z >= bounds.minimum.z && point.z <= bounds.maximum.z;
+}
+
+const WaterSeepageSpatialHashCell* FindSeepageHashCell(
+    const WaterSeepageSpatialGrid& grid,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z) {
+    if (grid.hashCells.empty() || (grid.hashCells.size() & (grid.hashCells.size() - 1U)) != 0U) {
+        return nullptr;
+    }
+    const auto mask = grid.hashCells.size() - 1U;
+    std::size_t slot = static_cast<std::size_t>(SeepageSpatialHash(x, y, z)) & mask;
+    for (std::size_t probe = 0U; probe < grid.hashCells.size(); ++probe) {
+        const auto& cell = grid.hashCells[slot];
+        if (!cell.occupied) {
+            return nullptr;
+        }
+        if (cell.x == x && cell.y == y && cell.z == z) {
+            return &cell;
+        }
+        slot = (slot + 1U) & mask;
+    }
+    return nullptr;
+}
+
+void SeepageFingerprintByte(std::uint64_t* hash, std::uint8_t value) {
+    *hash ^= value;
+    *hash *= 1099511628211ULL;
+}
+
+void SeepageFingerprintU32(std::uint64_t* hash, std::uint32_t value) {
+    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
+        SeepageFingerprintByte(hash, static_cast<std::uint8_t>((value >> shift) & 0xffU));
+    }
+}
+
+void SeepageFingerprintFloat(std::uint64_t* hash, float value) {
+    SeepageFingerprintU32(hash, std::bit_cast<std::uint32_t>(value));
+}
+
+std::string SeepageFingerprintString(std::uint64_t hash) {
+    std::ostringstream stream;
+    stream << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return stream.str();
+}
+
+}  // namespace
+
+WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
+    return {};
+}
+
+WaterSeepageQuality ResolveWaterSeepageQuality(
+    WaterSeepageQuality quality,
+    std::uint64_t effectivePointInvocations) {
+    if (quality != WaterSeepageQuality::Auto) {
+        return quality;
+    }
+    if (effectivePointInvocations <= 10'000'000ULL) {
+        return WaterSeepageQuality::High;
+    }
+    if (effectivePointInvocations <= 50'000'000ULL) {
+        return WaterSeepageQuality::Balanced;
+    }
+    return WaterSeepageQuality::Low;
+}
+
+WaterSeepageLookSettings ResolveWaterSeepageLook(
+    std::span<const WaterSeepageLookProfile> profiles,
+    const WaterSeepageLookSettings& defaultLook,
+    std::string_view profileName,
+    const std::optional<WaterSeepageLookSettings>& lookOverride,
+    const std::optional<WaterSeepageLookSettings>& tempLookOverride) {
+    WaterSeepageLookSettings resolved = defaultLook;
+    if (!profileName.empty()) {
+        const auto profile = std::find_if(
+            profiles.begin(),
+            profiles.end(),
+            [&](const WaterSeepageLookProfile& candidate) {
+                return candidate.name == profileName;
+            });
+        if (profile != profiles.end()) {
+            resolved = profile->settings;
+        }
+    }
+    if (lookOverride.has_value()) {
+        resolved = lookOverride.value();
+    }
+    if (tempLookOverride.has_value()) {
+        resolved = tempLookOverride.value();
+    }
+    return SanitizeSeepageLook(resolved);
+}
+
+WaterSeepageLookSettings ResolveWaterSeepageLook(
+    const WaterSeepageNode& node,
+    std::span<const WaterSeepageLookProfile> profiles,
+    const WaterSeepageLookSettings& defaultLook) {
+    return ResolveWaterSeepageLook(
+        profiles,
+        defaultLook,
+        node.lookProfileName,
+        node.lookOverride,
+        node.tempLookOverride);
+}
+
+std::string WaterSeepageLocalLookName(std::string_view baseName, std::uint32_t nodeId) {
+    baseName = TrimSeepageName(baseName);
+    if (baseName.empty()) {
+        baseName = "Default";
+    }
+    std::ostringstream stream;
+    stream << baseName << '_' << std::setw(2) << std::setfill('0') << nodeId;
+    return stream.str();
+}
+
+invisible_places::io::Float3 DeriveWaterSeepageDownAxis(
+    const invisible_places::io::Float3& surfaceNormal,
+    const invisible_places::io::Float3& fallbackAxis) {
+    const glm::vec3 normal = SafeSeepageNormal(surfaceNormal);
+    const auto projectToSurface = [&](glm::vec3 axis) {
+        if (!IsValidPoint(axis) || glm::dot(axis, axis) <= kNormalEpsilon) {
+            return glm::vec3{0.0F};
+        }
+        axis -= normal * glm::dot(axis, normal);
+        return glm::dot(axis, axis) > kNormalEpsilon ? glm::normalize(axis) : glm::vec3{0.0F};
+    };
+    glm::vec3 down = projectToSurface(kGravity);
+    if (glm::dot(down, down) <= kNormalEpsilon) {
+        down = projectToSurface(ToGlm(fallbackAxis));
+    }
+    if (glm::dot(down, down) <= kNormalEpsilon) {
+        const glm::vec3 rawFallback = ToGlm(fallbackAxis);
+        down = IsValidPoint(rawFallback) && glm::dot(rawFallback, rawFallback) > kNormalEpsilon
+                   ? glm::normalize(rawFallback)
+                   : kGravity;
+    }
+    if (glm::dot(down, kGravity) < 0.0F) {
+        down = -down;
+    }
+    return FromGlm(down);
+}
+
+WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
+    std::span<const WaterSeepageNode> nodes,
+    std::span<const WaterSeepageLookProfile> profiles,
+    const WaterSeepageLookSettings& defaultLook,
+    std::string_view targetSceneRole,
+    bool forExport,
+    const WaterRainSettings& rainSettings,
+    std::uint64_t effectivePointInvocations,
+    std::span<const WaterSeepageSurfaceGuide> guides) {
+    WaterSeepageSpatialGrid grid;
+    grid.diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        nodes.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    constexpr float preferredCellSize = 0.50F;
+    float largestSpan = 0.0F;
+    for (const auto& node : nodes) {
+        const bool enabled = forExport ? node.enabledInExport : node.enabledInViewport;
+        if (!enabled || !SeepageNodeTargetsRole(node, targetSceneRole) || !IsValidPoint(ToGlm(node.position))) {
+            continue;
+        }
+        auto look = ResolveWaterSeepageLook(node, profiles, defaultLook);
+        const auto resolvedQuality = ResolveWaterSeepageQuality(look.quality, effectivePointInvocations);
+        look.quality = resolvedQuality;
+        WaterSeepageRuntimeNode runtime;
+        runtime.id = node.id;
+        runtime.seed = node.seed;
+        runtime.position = ToGlm(node.position);
+        runtime.surfaceNormal = SafeSeepageNormal(node.surfaceNormal);
+        const auto derivedDown = DeriveWaterSeepageDownAxis(node.surfaceNormal, node.downAxis);
+        glm::vec3 requestedDown = ToGlm(node.downAxis);
+        requestedDown -= runtime.surfaceNormal * glm::dot(requestedDown, runtime.surfaceNormal);
+        runtime.downAxis =
+            IsValidPoint(requestedDown) && glm::dot(requestedDown, requestedDown) > kNormalEpsilon
+                ? glm::normalize(requestedDown)
+                : ToGlm(derivedDown);
+        if (glm::dot(runtime.downAxis, kGravity) < 0.0F) {
+            runtime.downAxis = -runtime.downAxis;
+        }
+        runtime.lateralAxis = glm::cross(runtime.surfaceNormal, runtime.downAxis);
+        if (glm::dot(runtime.lateralAxis, runtime.lateralAxis) <= kNormalEpsilon) {
+            const glm::vec3 helper = std::abs(runtime.surfaceNormal.x) < 0.8F
+                                         ? glm::vec3{1.0F, 0.0F, 0.0F}
+                                         : glm::vec3{0.0F, 1.0F, 0.0F};
+            runtime.lateralAxis = glm::cross(runtime.surfaceNormal, helper);
+        }
+        runtime.lateralAxis = glm::normalize(runtime.lateralAxis);
+        runtime.reachMeters = std::clamp(
+            SeepageFiniteOr(node.reachMeters, 1.25F),
+            0.001F,
+            1000.0F);
+        runtime.startHalfWidthMeters = 0.5F * std::clamp(
+            SeepageFiniteOr(node.startWidthMeters, 0.12F),
+            0.002F,
+            1000.0F);
+        runtime.endHalfWidthMeters = 0.5F * std::clamp(
+            SeepageFiniteOr(node.endWidthMeters, 0.75F),
+            0.002F,
+            1000.0F);
+        runtime.edgeFeatherMeters = std::clamp(
+            SeepageFiniteOr(node.edgeFeatherMeters, 0.10F),
+            0.001F,
+            100.0F);
+        runtime.depthToleranceMeters = std::clamp(
+            SeepageFiniteOr(node.depthToleranceMeters, 0.15F),
+            0.001F,
+            100.0F);
+        runtime.normalAlignment = std::clamp(
+            SeepageFiniteOr(node.normalAlignment, 0.20F),
+            0.0F,
+            1.0F);
+        runtime.strength = std::clamp(SeepageFiniteOr(node.strength, 1.0F), 0.0F, 8.0F);
+        runtime.rainVisualStrength = rainSettings.enabled
+                                         ? WaterRainPresetVisualStrength(rainSettings.intensityPreset)
+                                         : 0.0F;
+        runtime.resolvedQuality = resolvedQuality;
+        runtime.look = look;
+        CopyWaterSeepageSurfaceGuide(
+            FindWaterSeepageSurfaceGuide(guides, node.id),
+            &runtime);
+        largestSpan = std::max(
+            largestSpan,
+            std::max(
+                runtime.reachMeters * kSeepageMaximumRainReachScale +
+                    runtime.edgeFeatherMeters * 2.0F,
+                std::max(
+                    runtime.startHalfWidthMeters,
+                    runtime.endHalfWidthMeters * kSeepageMaximumRainWidthScale) * 2.0F +
+                    runtime.edgeFeatherMeters * 2.0F));
+        const auto nodeBounds = SeepageRuntimeNodeBounds(runtime);
+        if (nodeBounds.valid) {
+            grid.unionBounds.Expand(nodeBounds.minimum);
+            grid.unionBounds.Expand(nodeBounds.maximum);
+        }
+        grid.nodes.push_back(std::move(runtime));
+    }
+
+    std::sort(
+        grid.nodes.begin(),
+        grid.nodes.end(),
+        [](const WaterSeepageRuntimeNode& left, const WaterSeepageRuntimeNode& right) {
+            if (left.id != right.id) {
+                return left.id < right.id;
+            }
+            if (left.position.x != right.position.x) {
+                return left.position.x < right.position.x;
+            }
+            if (left.position.y != right.position.y) {
+                return left.position.y < right.position.y;
+            }
+            if (left.position.z != right.position.z) {
+                return left.position.z < right.position.z;
+            }
+            return left.seed < right.seed;
+        });
+
+    grid.cellSizeMeters = std::max(
+        preferredCellSize,
+        largestSpan > 0.0F ? largestSpan / 64.0F : preferredCellSize);
+    grid.cellSizeMeters = std::clamp(grid.cellSizeMeters, 0.05F, 50.0F);
+    grid.diagnostics.activeNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        grid.nodes.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    if (grid.nodes.empty()) {
+        return grid;
+    }
+
+    std::vector<MutableSeepageHashCell> mutableCells(16U);
+    std::size_t occupiedCellCount = 0U;
+    for (std::size_t nodeIndex = 0U; nodeIndex < grid.nodes.size(); ++nodeIndex) {
+        const auto bounds = SeepageRuntimeNodeBounds(grid.nodes[nodeIndex]);
+        if (!bounds.valid) {
+            continue;
+        }
+        const auto minX = SeepageCellCoordinate(bounds.minimum.x, grid.cellSizeMeters);
+        const auto minY = SeepageCellCoordinate(bounds.minimum.y, grid.cellSizeMeters);
+        const auto minZ = SeepageCellCoordinate(bounds.minimum.z, grid.cellSizeMeters);
+        const auto maxX = SeepageCellCoordinate(bounds.maximum.x, grid.cellSizeMeters);
+        const auto maxY = SeepageCellCoordinate(bounds.maximum.y, grid.cellSizeMeters);
+        const auto maxZ = SeepageCellCoordinate(bounds.maximum.z, grid.cellSizeMeters);
+        for (std::int64_t x = minX; x <= static_cast<std::int64_t>(maxX); ++x) {
+            for (std::int64_t y = minY; y <= static_cast<std::int64_t>(maxY); ++y) {
+                for (std::int64_t z = minZ; z <= static_cast<std::int64_t>(maxZ); ++z) {
+                    InsertSeepageCellReference(
+                        &mutableCells,
+                        &occupiedCellCount,
+                        static_cast<std::int32_t>(x),
+                        static_cast<std::int32_t>(y),
+                        static_cast<std::int32_t>(z),
+                        static_cast<std::uint32_t>(nodeIndex),
+                        grid.nodes,
+                        grid.cellSizeMeters,
+                        &grid.diagnostics);
+                }
+            }
+        }
+    }
+
+    for (auto& cell : mutableCells) {
+        if (!cell.occupied || cell.referenceCount < 2U) {
+            continue;
+        }
+        std::sort(
+            cell.references.begin(),
+            cell.references.begin() + static_cast<std::ptrdiff_t>(cell.referenceCount),
+            [&](std::uint32_t left, std::uint32_t right) {
+                return SeepageNodeReferencePreferred(
+                    left,
+                    right,
+                    grid.nodes,
+                    cell.x,
+                    cell.y,
+                    cell.z,
+                    grid.cellSizeMeters);
+            });
+    }
+
+    grid.hashCells.resize(mutableCells.size());
+    for (std::size_t slot = 0U; slot < mutableCells.size(); ++slot) {
+        const auto& source = mutableCells[slot];
+        if (!source.occupied) {
+            continue;
+        }
+        auto& target = grid.hashCells[slot];
+        target.x = source.x;
+        target.y = source.y;
+        target.z = source.z;
+        target.referenceOffset = static_cast<std::uint32_t>(grid.nodeReferences.size());
+        target.referenceCount = source.referenceCount;
+        target.occupied = true;
+        for (std::uint32_t index = 0U; index < source.referenceCount; ++index) {
+            grid.nodeReferences.push_back(source.references[index]);
+        }
+    }
+    grid.diagnostics.occupiedCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        occupiedCellCount,
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    grid.diagnostics.hashCellCapacity = static_cast<std::uint32_t>(std::min<std::size_t>(
+        grid.hashCells.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    grid.diagnostics.nodeReferenceCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        grid.nodeReferences.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    return grid;
+}
+
+WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
+    const WaterSeepageRuntimeNode& node,
+    const invisible_places::io::Float3& position,
+    const invisible_places::io::Float3& normal,
+    float timeSeconds) {
+    WaterSeepageRuntimeContribution contribution;
+    if (!IsValidPoint(ToGlm(position)) || node.reachMeters <= 0.0F || node.strength <= 0.0F) {
+        return contribution;
+    }
+    glm::vec3 pointNormal = ToGlm(normal);
+    if (!IsValidPoint(pointNormal) || glm::dot(pointNormal, pointNormal) <= kNormalEpsilon) {
+        pointNormal = glm::vec3{0.0F};
+    } else {
+        pointNormal = glm::normalize(pointNormal);
+    }
+    const auto fan = EvaluateSeepageFanMask(node, ToGlm(position), pointNormal);
+    if (fan.mask <= 1.0e-6F) {
+        return contribution;
+    }
+
+    const auto look = SanitizeSeepageLook(node.look);
+    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
+    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
+    const float density = Clamp01(look.density + 0.25F * rainGain);
+    const float glisten = look.glisten;
+    const float wavelength = std::max(0.002F, look.wavelengthMeters);
+    const float spatialScale = std::clamp(look.patternScale, 0.05F, 100.0F) / wavelength;
+    const float signedLateral = fan.signedLateralDistance;
+    const glm::vec2 noiseCoordinate{
+        signedLateral * spatialScale + look.warp * fan.downDistance,
+        fan.downDistance * spatialScale,
+    };
+    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
+    const float noise = SeepageFractalNoise(
+        noiseCoordinate * (0.42F + look.turbulence * 0.38F),
+        proceduralSeed,
+        node.resolvedQuality);
+    const float coverage = SmoothStep(1.0F - density - 0.12F, 1.0F - density + 0.12F, noise);
+    const float time = std::max(0.0F, timeSeconds);
+    const float phase =
+        (fan.downDistance * spatialScale) +
+        look.phase -
+        time * look.speed +
+        (noise - 0.5F) * look.warp;
+    const float rippleWave = 0.5F + 0.5F * std::sin(kSeepageTwoPi * phase);
+    const float ripplePeak = std::pow(
+        Clamp01(rippleWave),
+        node.resolvedQuality == WaterSeepageQuality::Low ? 2.0F : 3.5F);
+    const float glintWave = 0.5F + 0.5F * std::sin(
+        kSeepageTwoPi *
+        (phase * 1.73F + signedLateral * spatialScale * 0.37F + noise * 0.61F));
+    const float glintPeak = std::pow(
+        Clamp01(glintWave),
+        node.resolvedQuality == WaterSeepageQuality::High ? 7.0F : 5.0F);
+    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    contribution.mask = fan.mask;
+    contribution.damp = Clamp01(
+        strengthMask *
+        (wetness * (0.72F + noise * 0.28F) + coverage * (0.10F + rainGain * 0.12F)));
+    contribution.ripple = Clamp01(
+        strengthMask * coverage * ripplePeak * (0.30F + Clamp01(look.turbulence) * 0.70F));
+    contribution.glint = Clamp01(strengthMask * coverage * glisten * glintPeak);
+    const float rainProminence = 1.0F + 0.65F * rainGain;
+    contribution.scale = Clamp01(
+        (contribution.damp * 0.58F + contribution.ripple * 0.34F + contribution.glint * 0.46F) *
+        look.response.intensity * rainProminence);
+    contribution.colourMix = Clamp01(look.response.colouriseAmount * contribution.scale);
+    contribution.emissionAdd = std::max(0.0F, look.response.emissionAdd) * contribution.scale;
+    contribution.opacityAdd = look.response.opacityAdd * contribution.scale;
+    contribution.opacityMultiply = std::lerp(
+        1.0F,
+        std::max(0.0F, look.response.opacityMultiply),
+        contribution.scale);
+    contribution.pointSizeAdd = look.response.pointSizeAdd * contribution.scale;
+    contribution.pointSizeMultiply = std::lerp(
+        1.0F,
+        std::max(0.0F, look.response.pointSizeMultiply),
+        contribution.scale);
+    contribution.colour = {
+        look.response.colouriseRed,
+        look.response.colouriseGreen,
+        look.response.colouriseBlue,
+    };
+    return contribution;
+}
+
+WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
+    const WaterSeepageSpatialGrid& grid,
+    const invisible_places::io::Float3& position,
+    const invisible_places::io::Float3& normal,
+    float timeSeconds) {
+    WaterSeepageRuntimeContribution result;
+    if (grid.nodes.empty() ||
+        grid.hashCells.empty() ||
+        !SeepageBoundsContain(grid.unionBounds, position)) {
+        return result;
+    }
+    const auto x = SeepageCellCoordinate(position.x, grid.cellSizeMeters);
+    const auto y = SeepageCellCoordinate(position.y, grid.cellSizeMeters);
+    const auto z = SeepageCellCoordinate(position.z, grid.cellSizeMeters);
+    const auto* cell = FindSeepageHashCell(grid, x, y, z);
+    if (cell == nullptr || cell->referenceOffset >= grid.nodeReferences.size()) {
+        return result;
+    }
+    const std::size_t end = std::min<std::size_t>(
+        grid.nodeReferences.size(),
+        static_cast<std::size_t>(cell->referenceOffset) + cell->referenceCount);
+    for (std::size_t referenceIndex = cell->referenceOffset; referenceIndex < end; ++referenceIndex) {
+        const auto nodeIndex = grid.nodeReferences[referenceIndex];
+        if (nodeIndex >= grid.nodes.size()) {
+            continue;
+        }
+        const auto contribution = EvaluateWaterSeepageRuntimeContribution(
+            grid.nodes[nodeIndex],
+            position,
+            normal,
+            timeSeconds);
+        BlendSeepageContribution(&result, contribution, grid.nodes[nodeIndex].look.blendMode);
+    }
+    return result;
+}
+
+std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 2U);
+    SeepageFingerprintFloat(&hash, grid.cellSizeMeters);
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.nodes.size()));
+    for (const auto& node : grid.nodes) {
+        SeepageFingerprintU32(&hash, node.id);
+        SeepageFingerprintFloat(&hash, node.position.x);
+        SeepageFingerprintFloat(&hash, node.position.y);
+        SeepageFingerprintFloat(&hash, node.position.z);
+        SeepageFingerprintFloat(&hash, node.surfaceNormal.x);
+        SeepageFingerprintFloat(&hash, node.surfaceNormal.y);
+        SeepageFingerprintFloat(&hash, node.surfaceNormal.z);
+        SeepageFingerprintFloat(&hash, node.downAxis.x);
+        SeepageFingerprintFloat(&hash, node.downAxis.y);
+        SeepageFingerprintFloat(&hash, node.downAxis.z);
+        SeepageFingerprintFloat(&hash, node.lateralAxis.x);
+        SeepageFingerprintFloat(&hash, node.lateralAxis.y);
+        SeepageFingerprintFloat(&hash, node.lateralAxis.z);
+        SeepageFingerprintFloat(&hash, node.reachMeters);
+        SeepageFingerprintFloat(&hash, node.startHalfWidthMeters);
+        SeepageFingerprintFloat(&hash, node.endHalfWidthMeters);
+        SeepageFingerprintFloat(&hash, node.edgeFeatherMeters);
+        SeepageFingerprintFloat(&hash, node.depthToleranceMeters);
+        SeepageFingerprintU32(&hash, node.guideSampleCount);
+        SeepageFingerprintU32(&hash, node.guideValid ? 1U : 0U);
+        SeepageFingerprintU32(&hash, node.guideComplete ? 1U : 0U);
+        SeepageFingerprintFloat(&hash, node.guideRequestedReachMeters);
+        SeepageFingerprintFloat(&hash, node.guideAchievedReachMeters);
+        for (std::size_t sampleIndex = 0U;
+             sampleIndex < std::min<std::size_t>(
+                 node.guideSampleCount,
+                 kWaterSeepageMaximumGuideSamples);
+             ++sampleIndex) {
+            const auto& sample = node.guideSamples[sampleIndex];
+            SeepageFingerprintFloat(&hash, sample.position.x);
+            SeepageFingerprintFloat(&hash, sample.position.y);
+            SeepageFingerprintFloat(&hash, sample.position.z);
+            SeepageFingerprintFloat(&hash, sample.normal.x);
+            SeepageFingerprintFloat(&hash, sample.normal.y);
+            SeepageFingerprintFloat(&hash, sample.normal.z);
+            SeepageFingerprintFloat(&hash, sample.station);
+            SeepageFingerprintFloat(&hash, sample.confidence);
+        }
+    }
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.hashCells.size()));
+    for (const auto& cell : grid.hashCells) {
+        SeepageFingerprintU32(&hash, cell.occupied ? 1U : 0U);
+        if (!cell.occupied) {
+            continue;
+        }
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.x));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.y));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.z));
+        SeepageFingerprintU32(&hash, cell.referenceOffset);
+        SeepageFingerprintU32(&hash, cell.referenceCount);
+    }
+    for (const auto reference : grid.nodeReferences) {
+        SeepageFingerprintU32(&hash, reference);
+    }
+    return "water-seepage-topology-v2-" + SeepageFingerprintString(hash);
+}
+
+std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.nodes.size()));
+    for (const auto& node : grid.nodes) {
+        SeepageFingerprintU32(&hash, node.id);
+        SeepageFingerprintU32(&hash, node.seed);
+        SeepageFingerprintFloat(&hash, node.normalAlignment);
+        SeepageFingerprintFloat(&hash, node.strength);
+        SeepageFingerprintFloat(&hash, node.rainVisualStrength);
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(node.resolvedQuality));
+        const auto& look = node.look;
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
+        SeepageFingerprintFloat(&hash, look.baseWetness);
+        SeepageFingerprintFloat(&hash, look.density);
+        SeepageFingerprintFloat(&hash, look.glisten);
+        SeepageFingerprintFloat(&hash, look.wavelengthMeters);
+        SeepageFingerprintFloat(&hash, look.patternScale);
+        SeepageFingerprintFloat(&hash, look.speed);
+        SeepageFingerprintFloat(&hash, look.warp);
+        SeepageFingerprintFloat(&hash, look.turbulence);
+        SeepageFingerprintFloat(&hash, look.phase);
+        SeepageFingerprintFloat(&hash, look.rainResponse);
+        SeepageFingerprintFloat(&hash, look.response.intensity);
+        SeepageFingerprintFloat(&hash, look.response.emissionAdd);
+        SeepageFingerprintFloat(&hash, look.response.opacityAdd);
+        SeepageFingerprintFloat(&hash, look.response.opacityMultiply);
+        SeepageFingerprintFloat(&hash, look.response.pointSizeAdd);
+        SeepageFingerprintFloat(&hash, look.response.pointSizeMultiply);
+        SeepageFingerprintFloat(&hash, look.response.colouriseRed);
+        SeepageFingerprintFloat(&hash, look.response.colouriseGreen);
+        SeepageFingerprintFloat(&hash, look.response.colouriseBlue);
+        SeepageFingerprintFloat(&hash, look.response.colouriseAmount);
+    }
+    return "water-seepage-params-v1-" + SeepageFingerprintString(hash);
+}
+
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
     WaterSettingsBundle settings;
     settings.path = DefaultWaterPathGenerationSettings(mode);
@@ -3591,6 +4984,521 @@ invisible_places::io::LoadedPointCloud BuildCombinedWaterSupportCloud(
         combined.hasFocusPoint = true;
     }
     return combined;
+}
+
+namespace {
+
+struct SeepageGuideSupportGraph {
+    SupportGraph graph;
+    float pointSpacingMeters = 0.02F;
+};
+
+SeepageGuideSupportGraph BuildSeepageGuideSupportGraph(
+    std::span<const WaterSceneSupportLayer> layers,
+    std::string_view requestedRole,
+    std::size_t sampleLimit,
+    bool includeAllRoles = false) {
+    SeepageGuideSupportGraph result;
+    const auto normalizedRole = NormalizeSeepageRole(requestedRole);
+    std::vector<const WaterSceneSupportLayer*> selectedLayers;
+    selectedLayers.reserve(layers.size());
+    std::uint64_t totalPointCount = 0U;
+    float minimumSpacing = std::numeric_limits<float>::max();
+    for (const auto& layer : layers) {
+        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+            continue;
+        }
+        const auto layerRole = NormalizeSeepageRole(layer.role);
+        if (includeAllRoles) {
+            const bool unnamedOrGeneric =
+                layerRole.empty() ||
+                layerRole == "point" ||
+                layerRole == "points" ||
+                layerRole == "pointcloud" ||
+                layerRole == "unknown";
+            if (!unnamedOrGeneric) {
+                continue;
+            }
+        } else if (layerRole != normalizedRole) {
+            continue;
+        }
+        selectedLayers.push_back(&layer);
+        totalPointCount += static_cast<std::uint64_t>(layer.cloud->positions.size());
+        if (std::isfinite(layer.pointSpacingMeters) && layer.pointSpacingMeters > 0.0F) {
+            minimumSpacing = std::min(minimumSpacing, layer.pointSpacingMeters);
+        }
+    }
+    if (selectedLayers.empty() || totalPointCount == 0U) {
+        return result;
+    }
+
+    const std::size_t safeSampleLimit = std::clamp<std::size_t>(sampleLimit, 64U, 450'000U);
+    result.pointSpacingMeters =
+        minimumSpacing < std::numeric_limits<float>::max()
+            ? std::clamp(minimumSpacing, 0.001F, 0.25F)
+            : 0.02F;
+    result.graph.cellSize = std::clamp(
+        std::max(0.01F, result.pointSpacingMeters * 8.0F),
+        0.01F,
+        0.25F);
+    result.graph.points.reserve(std::min<std::size_t>(
+        safeSampleLimit,
+        static_cast<std::size_t>(std::min<std::uint64_t>(
+            totalPointCount,
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())))));
+
+    for (const auto* layer : selectedLayers) {
+        if (result.graph.points.size() >= safeSampleLimit) {
+            break;
+        }
+        const auto& cloud = *layer->cloud;
+        const std::size_t remainingBudget = safeSampleLimit - result.graph.points.size();
+        const auto proportionalTarget = static_cast<std::size_t>(std::max<double>(
+            1.0,
+            std::floor(
+                static_cast<double>(safeSampleLimit) *
+                (static_cast<double>(cloud.positions.size()) /
+                 static_cast<double>(totalPointCount)))));
+        const std::size_t layerTarget = std::min({
+            remainingBudget,
+            cloud.positions.size(),
+            proportionalTarget,
+        });
+        if (layerTarget == 0U) {
+            continue;
+        }
+        const std::size_t stride = std::max<std::size_t>(
+            1U,
+            (cloud.positions.size() + layerTarget - 1U) / layerTarget);
+        const auto neighbourSlot = FindScalarFieldSlot(cloud, "Number_of_neighbors");
+        std::size_t sampledFromLayer = 0U;
+        for (std::size_t pointIndex = 0U;
+             pointIndex < cloud.positions.size() &&
+             sampledFromLayer < layerTarget &&
+             result.graph.points.size() < safeSampleLimit;
+             pointIndex += stride) {
+            const glm::vec3 position = ToGlm(cloud.positions[pointIndex]);
+            if (!IsValidPoint(position)) {
+                continue;
+            }
+            SupportPoint support;
+            support.sourceIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+                pointIndex,
+                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+            support.position = position;
+            support.confidence = SupportConfidence(cloud, pointIndex, neighbourSlot);
+            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+                const glm::vec3 normal = ToGlm(cloud.normals[pointIndex]);
+                if (IsValidPoint(normal) && glm::dot(normal, normal) > kNormalEpsilon) {
+                    support.normal = glm::normalize(normal);
+                    support.hasNormal = true;
+                }
+            }
+            const auto supportIndex = static_cast<std::uint32_t>(result.graph.points.size());
+            result.graph.points.push_back(support);
+            result.graph.grid[MakeGridKey(position, result.graph.cellSize)].push_back(supportIndex);
+            ++sampledFromLayer;
+        }
+    }
+    return result;
+}
+
+float SeepageGuideStartSearchRadius(
+    const WaterSeepageNode& node,
+    const SeepageGuideSupportGraph& support) {
+    return std::clamp(
+        std::max({
+            support.pointSpacingMeters * 14.0F,
+            std::max(0.0F, node.depthToleranceMeters) + std::max(0.0F, node.edgeFeatherMeters),
+            0.06F,
+        }),
+        0.03F,
+        0.50F);
+}
+
+std::optional<std::uint32_t> FindSeepageGuideStartIndex(
+    const SeepageGuideSupportGraph& support,
+    const WaterSeepageNode& node) {
+    if (support.graph.points.empty() || !IsValidPoint(ToGlm(node.position))) {
+        return std::nullopt;
+    }
+    const glm::vec3 nodePosition = ToGlm(node.position);
+    const glm::vec3 nodeNormal = SafeSeepageNormal(node.surfaceNormal);
+    const float searchRadius = SeepageGuideStartSearchRadius(node, support);
+    const float searchRadiusSquared = searchRadius * searchRadius;
+    const auto candidates = NearbySupportIndices(
+        support.graph,
+        nodePosition,
+        searchRadius);
+    std::optional<std::uint32_t> bestIndex;
+    float bestScore = std::numeric_limits<float>::max();
+    for (const auto candidateIndex : candidates) {
+        if (candidateIndex >= support.graph.points.size()) {
+            continue;
+        }
+        const auto& candidate = support.graph.points[candidateIndex];
+        const glm::vec3 delta = candidate.position - nodePosition;
+        const float distanceSquared = glm::dot(delta, delta);
+        if (distanceSquared > searchRadiusSquared ||
+            candidate.position.z > nodePosition.z + std::max(0.004F, node.edgeFeatherMeters)) {
+            continue;
+        }
+        const float normalAgreement = candidate.hasNormal
+                                          ? std::abs(glm::dot(candidate.normal, nodeNormal))
+                                          : 0.55F;
+        if (candidate.hasNormal && normalAgreement < 0.20F) {
+            continue;
+        }
+        const float score = distanceSquared +
+                            (1.0F - Clamp01(normalAgreement)) *
+                                searchRadiusSquared * 0.35F;
+        if (!bestIndex.has_value() || score < bestScore) {
+            bestIndex = candidateIndex;
+            bestScore = score;
+        }
+    }
+    return bestIndex;
+}
+
+bool SeepageGuideGraphSupportsNode(
+    const SeepageGuideSupportGraph& support,
+    const WaterSeepageNode& node) {
+    if (support.graph.points.empty() || !IsValidPoint(ToGlm(node.position))) {
+        return false;
+    }
+    return FindSeepageGuideStartIndex(support, node).has_value();
+}
+
+WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceGuide(
+    const WaterSeepageNode& node,
+    const SeepageGuideSupportGraph& support) {
+    WaterSeepageSurfaceGuide guide;
+    guide.nodeId = node.id;
+    guide.requestedReachMeters = std::clamp(
+        SeepageFiniteOr(node.reachMeters, 1.25F),
+        0.001F,
+        1000.0F) * kSeepageMaximumRainReachScale;
+    if (!SeepageGuideGraphSupportsNode(support, node)) {
+        return guide;
+    }
+
+    const glm::vec3 nodePosition = ToGlm(node.position);
+    const auto startIndex = FindSeepageGuideStartIndex(support, node);
+    if (!startIndex.has_value() || startIndex.value() >= support.graph.points.size()) {
+        return guide;
+    }
+
+    WaterPathGenerationSettings routeSettings;
+    routeSettings.autoTune = false;
+    routeSettings.supportVoxelSize = std::clamp(
+        support.pointSpacingMeters * 1.5F,
+        0.003F,
+        0.08F);
+    routeSettings.maxBridgeDistance = std::clamp(
+        std::max({
+            support.pointSpacingMeters * 5.0F,
+            std::min(std::max(0.0F, node.depthToleranceMeters) * 0.35F, 0.08F),
+            guide.requestedReachMeters / 48.0F,
+            0.020F,
+        }),
+        0.020F,
+        0.12F);
+    routeSettings.pathLength = guide.requestedReachMeters;
+    routeSettings.pathSampleSpacing = std::clamp(
+        std::max(support.pointSpacingMeters * 3.0F, routeSettings.maxBridgeDistance * 0.22F),
+        0.005F,
+        0.10F);
+    routeSettings.branching = 0.0F;
+    routeSettings.coverage = 0.0F;
+    routeSettings.gapTolerance = 0.40F;
+    routeSettings.maxSteps = 256U;
+    routeSettings.supportSampleLimit = static_cast<std::uint32_t>(std::min<std::size_t>(
+        support.graph.points.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+
+    std::vector<WaterSeepageGuideSample> rawSamples;
+    rawSamples.reserve(64U);
+    glm::vec3 previousNormal = SafeSeepageNormal(node.surfaceNormal);
+    rawSamples.push_back({
+        .position = node.position,
+        .normal = FromGlm(previousNormal),
+        .station = 0.0F,
+        .confidence = 1.0F,
+    });
+    std::vector<std::uint32_t> visited;
+    visited.reserve(routeSettings.maxSteps);
+    std::uint32_t currentIndex = startIndex.value();
+    visited.push_back(currentIndex);
+    glm::vec3 previousCenter = nodePosition;
+    float previousZ = nodePosition.z;
+    float station = 0.0F;
+    glm::vec3 previousDirection = ToGlm(node.downAxis);
+    if (!IsValidPoint(previousDirection) || glm::dot(previousDirection, previousDirection) <= kNormalEpsilon) {
+        previousDirection = kGravity;
+    } else {
+        previousDirection = glm::normalize(previousDirection);
+    }
+    const float riseEpsilon = std::clamp(
+        support.pointSpacingMeters * 0.35F,
+        0.0005F,
+        0.004F);
+
+    for (std::uint32_t step = 0U;
+         step < routeSettings.maxSteps && station < guide.requestedReachMeters;
+         ++step) {
+        const auto ranked = RankDownhillNeighbours(
+            support.graph,
+            currentIndex,
+            routeSettings,
+            visited);
+        if (ranked.empty()) {
+            break;
+        }
+
+        std::optional<RankedNeighbour> selected;
+        float selectedScore = -std::numeric_limits<float>::max();
+        const auto& current = support.graph.points[currentIndex];
+        glm::vec3 currentNormal = current.hasNormal
+                                      ? current.normal
+                                      : previousNormal;
+        if (glm::dot(currentNormal, previousNormal) < 0.0F) {
+            currentNormal = -currentNormal;
+        }
+        glm::vec3 desiredDirection = kGravity - currentNormal * glm::dot(kGravity, currentNormal);
+        if (glm::dot(desiredDirection, desiredDirection) <= kNormalEpsilon) {
+            desiredDirection = previousDirection -
+                               currentNormal * glm::dot(previousDirection, currentNormal);
+        }
+        if (glm::dot(desiredDirection, desiredDirection) <= kNormalEpsilon) {
+            desiredDirection = previousDirection;
+        } else {
+            desiredDirection = glm::normalize(desiredDirection);
+        }
+        for (const auto& candidate : ranked) {
+            if (candidate.supportIndex >= support.graph.points.size()) {
+                continue;
+            }
+            const auto& next = support.graph.points[candidate.supportIndex];
+            if (next.position.z > previousZ + riseEpsilon ||
+                next.position.z > nodePosition.z + riseEpsilon) {
+                continue;
+            }
+            const glm::vec3 fromCurrent = next.position - current.position;
+            const float distance = glm::length(fromCurrent);
+            if (distance <= 1.0e-5F) {
+                continue;
+            }
+            const float planeDistance = std::abs(glm::dot(fromCurrent, currentNormal));
+            const float planeTolerance = std::max(
+                support.pointSpacingMeters * 5.0F,
+                distance * 0.55F);
+            if (planeDistance > planeTolerance) {
+                continue;
+            }
+            const float directionalAlignment = glm::dot(
+                fromCurrent / distance,
+                desiredDirection);
+            const float routeScore = candidate.score + directionalAlignment * 1.75F;
+            if (!selected.has_value() || routeScore > selectedScore) {
+                selected = candidate;
+                selectedScore = routeScore;
+            }
+        }
+        if (!selected.has_value()) {
+            break;
+        }
+
+        currentIndex = selected->supportIndex;
+        visited.push_back(currentIndex);
+        const auto& next = support.graph.points[currentIndex];
+        glm::vec3 nextNormal = next.hasNormal ? next.normal : previousNormal;
+        if (glm::dot(nextNormal, previousNormal) < 0.0F) {
+            nextNormal = -nextNormal;
+        }
+        if (glm::dot(nextNormal, nextNormal) <= kNormalEpsilon) {
+            nextNormal = previousNormal;
+        } else {
+            nextNormal = glm::normalize(nextNormal);
+        }
+
+        const glm::vec3 segment = next.position - previousCenter;
+        const float segmentLength = glm::length(segment);
+        if (segmentLength <= 1.0e-5F) {
+            continue;
+        }
+        const float remaining = guide.requestedReachMeters - station;
+        if (segmentLength >= remaining) {
+            const float amount = remaining / segmentLength;
+            glm::vec3 endNormal = glm::mix(previousNormal, nextNormal, amount);
+            endNormal = glm::dot(endNormal, endNormal) > kNormalEpsilon
+                            ? glm::normalize(endNormal)
+                            : previousNormal;
+            rawSamples.push_back({
+                .position = FromGlm(previousCenter + segment * amount),
+                .normal = FromGlm(endNormal),
+                .station = guide.requestedReachMeters,
+                .confidence = std::clamp(next.confidence, 0.0F, 1.0F),
+            });
+            station = guide.requestedReachMeters;
+            previousCenter = ToGlm(rawSamples.back().position);
+            previousNormal = endNormal;
+            previousZ = previousCenter.z;
+            break;
+        }
+
+        station += segmentLength;
+        rawSamples.push_back({
+            .position = FromGlm(next.position),
+            .normal = FromGlm(nextNormal),
+            .station = station,
+            .confidence = std::clamp(next.confidence, 0.0F, 1.0F),
+        });
+        previousCenter = next.position;
+        previousDirection = segment / segmentLength;
+        previousNormal = nextNormal;
+        previousZ = next.position.z;
+    }
+
+    guide.achievedReachMeters = station;
+    guide.complete = station + std::max(0.001F, support.pointSpacingMeters) >=
+                     guide.requestedReachMeters;
+    if (rawSamples.size() < 2U ||
+        guide.achievedReachMeters <= std::max(0.005F, support.pointSpacingMeters * 0.25F)) {
+        return guide;
+    }
+
+    const std::size_t outputCount = std::min<std::size_t>(
+        kWaterSeepageMaximumGuideSamples,
+        std::max<std::size_t>(2U, rawSamples.size()));
+    std::size_t rawSegment = 0U;
+    glm::vec3 outputPreviousNormal = SafeSeepageNormal(rawSamples.front().normal);
+    for (std::size_t outputIndex = 0U; outputIndex < outputCount; ++outputIndex) {
+        const float targetStation =
+            outputIndex + 1U == outputCount
+                ? guide.achievedReachMeters
+                : guide.achievedReachMeters *
+                      (static_cast<float>(outputIndex) /
+                       static_cast<float>(outputCount - 1U));
+        while (rawSegment + 1U < rawSamples.size() &&
+               rawSamples[rawSegment + 1U].station < targetStation) {
+            ++rawSegment;
+        }
+        const auto& left = rawSamples[rawSegment];
+        const auto& right = rawSamples[std::min<std::size_t>(rawSegment + 1U, rawSamples.size() - 1U)];
+        const float stationSpan = std::max(1.0e-5F, right.station - left.station);
+        const float amount = Clamp01((targetStation - left.station) / stationSpan);
+        glm::vec3 leftNormal = SafeSeepageNormal(left.normal);
+        glm::vec3 rightNormal = SafeSeepageNormal(right.normal);
+        if (glm::dot(leftNormal, rightNormal) < 0.0F) {
+            rightNormal = -rightNormal;
+        }
+        glm::vec3 normal = glm::mix(leftNormal, rightNormal, amount);
+        normal = glm::dot(normal, normal) > kNormalEpsilon
+                     ? glm::normalize(normal)
+                     : outputPreviousNormal;
+        if (glm::dot(normal, outputPreviousNormal) < 0.0F) {
+            normal = -normal;
+        }
+        const glm::vec3 position = glm::mix(
+            ToGlm(left.position),
+            ToGlm(right.position),
+            amount);
+        guide.samples[outputIndex] = {
+            .position = FromGlm(position),
+            .normal = FromGlm(normal),
+            .station = targetStation,
+            .confidence = std::lerp(left.confidence, right.confidence, amount),
+        };
+        outputPreviousNormal = normal;
+    }
+    guide.sampleCount = static_cast<std::uint32_t>(outputCount);
+    guide.valid = true;
+    return guide;
+}
+
+}  // namespace
+
+std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
+    std::span<const WaterSeepageNode> nodes,
+    std::span<const WaterSceneSupportLayer> supportLayers,
+    std::size_t sampleLimit) {
+    std::vector<WaterSeepageSurfaceGuide> guides;
+    guides.reserve(nodes.size());
+    if (nodes.empty()) {
+        return guides;
+    }
+
+    const std::size_t safeSampleLimit = std::clamp<std::size_t>(sampleLimit, 64U, 450'000U);
+    auto rockSupport = BuildSeepageGuideSupportGraph(
+        supportLayers,
+        "ROCK",
+        safeSampleLimit);
+    std::unordered_map<std::string, SeepageGuideSupportGraph> roleSupport;
+    std::optional<SeepageGuideSupportGraph> allRoleSupport;
+
+    auto supportForRole = [&](std::string_view role) -> const SeepageGuideSupportGraph* {
+        const auto normalized = NormalizeSeepageRole(role);
+        if (normalized == "rock" && !rockSupport.graph.points.empty()) {
+            return &rockSupport;
+        }
+        const auto existing = roleSupport.find(normalized);
+        if (existing != roleSupport.end()) {
+            return &existing->second;
+        }
+        auto [inserted, _] = roleSupport.emplace(
+            normalized,
+            BuildSeepageGuideSupportGraph(
+                supportLayers,
+                normalized,
+                safeSampleLimit));
+        return &inserted->second;
+    };
+
+    for (const auto& node : nodes) {
+        const SeepageGuideSupportGraph* selectedSupport = nullptr;
+        const bool rockPreferred = std::any_of(
+            node.targetSceneRoles.begin(),
+            node.targetSceneRoles.end(),
+            [](const std::string& role) {
+                const auto normalized = NormalizeSeepageRole(role);
+                return normalized == "rock" || normalized == "veg";
+            });
+        if (rockPreferred && SeepageGuideGraphSupportsNode(rockSupport, node)) {
+            selectedSupport = &rockSupport;
+        }
+        if (selectedSupport == nullptr) {
+            for (const auto& role : node.targetSceneRoles) {
+                const auto* candidate = supportForRole(role);
+                if (candidate != nullptr && SeepageGuideGraphSupportsNode(*candidate, node)) {
+                    selectedSupport = candidate;
+                    break;
+                }
+            }
+        }
+        if (selectedSupport == nullptr) {
+            if (!allRoleSupport.has_value()) {
+                allRoleSupport = BuildSeepageGuideSupportGraph(
+                    supportLayers,
+                    {},
+                    safeSampleLimit,
+                    true);
+            }
+            if (SeepageGuideGraphSupportsNode(*allRoleSupport, node)) {
+                selectedSupport = &*allRoleSupport;
+            }
+        }
+        guides.push_back(
+            selectedSupport == nullptr
+                ? WaterSeepageSurfaceGuide{
+                      .nodeId = node.id,
+                      .requestedReachMeters = std::clamp(
+                          SeepageFiniteOr(node.reachMeters, 1.25F),
+                          0.001F,
+                          1000.0F) * kSeepageMaximumRainReachScale,
+                  }
+                : TraceWaterSeepageSurfaceGuide(node, *selectedSupport));
+    }
+    return guides;
 }
 
 WaterPathCache GenerateWaterPathCache(
@@ -6999,18 +8907,6 @@ bool RainRoleIsSand(std::string_view role) {
     return role == "SAND" || role == "sand" || role == "Sand";
 }
 
-float RainPresetVisualStrength(WaterRainIntensityPreset preset) {
-    switch (preset) {
-        case WaterRainIntensityPreset::LightMist:
-            return 0.30F;
-        case WaterRainIntensityPreset::Rain:
-            return 0.68F;
-        case WaterRainIntensityPreset::HeavyDownpour:
-            return 1.0F;
-    }
-    return 0.68F;
-}
-
 RainSupportIndex BuildRainSupportIndex(
     std::span<const WaterSceneSupportLayer> supportLayers,
     const WaterRainSettings& settings) {
@@ -7466,7 +9362,7 @@ WaterTrailOverlay BuildRainTrailOverlay(
     const float halfHeight = std::max(settings.spawnRadiusMeters, targetDistance * tanHalfFov);
     const float halfWidth = halfHeight * std::clamp(cameraFrame.aspectRatio, 0.25F, 4.0F);
     const float targetSpread = 1.0F + std::clamp(settings.spawnOutOfFrameMargin, 0.0F, 2.0F) * 0.35F;
-    const float visualStrength = RainPresetVisualStrength(settings.intensityPreset);
+    const float visualStrength = WaterRainPresetVisualStrength(settings.intensityPreset);
     const float effectiveWindResponse = WaterRainEffectiveWindResponse(settings);
     const float supportOffset = std::max(0.006F, settings.trailWidthMeters * 2.5F);
     const float visibleSpacing = std::clamp(settings.trailPointSpacingMeters, 0.01F, 5.0F);

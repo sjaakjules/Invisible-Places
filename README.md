@@ -30,7 +30,8 @@ The central idea is that data already present in the point cloud can become visu
 - Loads CloudCompare-style binary PLY point clouds with RGB and optional `scalar_*` fields.
 - Reads scalar-field statistics for field-driven styling.
 - Groups sibling role-named PLY files into one folder-level scene, such as ROCK/SAND/VEG layers under `Data/ExhibitionScene`.
-- Infers point spacing from filenames such as `1mm` and `2mm`, keeps manual spacing overrides in projects, and compensates folder-level visuals across different cloud densities.
+- Infers point spacing from filenames such as `1mm` and `2mm`, builds complete scene-wide density bundles, and exposes one **Visible Point Cloud** selector in the Visuals tab.
+- Keeps canonical ROCK/VEG 1 mm and SAND 2 mm sources CPU-resident for picking, water, flow, rain, and field analysis while uploading only the committed display bundle.
 - Treats the ROCK role as the primary visual/style reference in grouped scenes while keeping role-specific backend behavior available.
 - Loads Gaussian splat PLY files named with the `gSplat-` prefix.
 - Applies same-stem `.txt` 4x4 transform matrices for Gaussian splat alignment.
@@ -47,7 +48,7 @@ The central idea is that data already present in the point cloud can become visu
 - Supports source RGB, solid colour, and scalar colormap modes.
 - Includes colormaps such as Viridis, Plasma, Inferno, Magma, Cividis, Turbo, topographic, land-surface, fire, ice, and high-contrast ramps.
 - Includes point-cloud stylisation controls for watercolor, living wash, cartoon ink, brush dabs, pencil hatch, grainy pigment, and related painterly looks.
-- Includes folder-level multi-cloud visuals so grouped ROCK/SAND/VEG scenes are edited as one cloud while per-role spacing/density compensation is applied at render time.
+- Includes folder-level multi-cloud visuals so grouped ROCK/SAND/VEG scenes are edited as one cloud. Authored values stay on a 1 mm baseline while per-role footprint and measured-count coverage compensation makes 2/3/5 mm display bundles retain a similar appearance.
 - Includes SAND-only shader shoreline waves for grouped coastal scenes. These use the editable boundary height, defaulting to `z = 1.55 m`, and do not require region polygons or CPU point membership.
 - Supports eye-dome lighting for depth readability outside the Fast Basic path.
 - Uses deterministic point sampling and spatial sampling so large clouds can be reduced predictably.
@@ -80,7 +81,7 @@ The central idea is that data already present in the point cloud can become visu
 
 ### Export and persistence
 
-- Saves and reloads project JSON containing scene state, point-cloud styles, camera shots, animation paths, saved visuals, and export selections.
+- Saves and reloads schema-33 project JSON containing scene density-group state, point-cloud styles, camera shots, animation paths, saved visuals, and export selections.
 - Exports selected saved animations and saved visuals as batched Quick MP4 files.
 - Exports preview-density EXR animation stacks.
 - Writes EXR `beauty.RGB`, `alpha.A`, and `depth.Z` channels.
@@ -168,11 +169,14 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 
 - Point-cloud PLY files are standard CloudCompare exports with RGB and optional `scalar_*` properties.
 - Multi-cloud scene folders may contain sibling role-named point clouds. `ROCK`, `SAND`, and `VEG` tokens define the role; `1mm`, `2mm`, and similar tokens define inferred point spacing in meters.
-- `Data/ExhibitionScene` is the default full scene when `Saved/exhibitionScene_project.json` exists. It is expected to contain selected variants such as `Site3-ROCK-1mm.ply`, `Site3-SAND-2mm.ply`, and `Site3-VEG-1mm.ply`.
+- A display spacing is selectable only when exactly one ROCK, SAND, and VEG file exists at that spacing. Incomplete or duplicate density sets are rejected rather than mixed during switching.
+- `Data/ExhibitionScene` is the default full scene when `Saved/exhibitionScene_project.json` exists. Canonical analysis uses variants such as `Site3-ROCK-1mm.ply`, `Site3-SAND-2mm.ply`, and `Site3-VEG-1mm.ply`; complete same-spacing sets provide the selectable display densities.
 - `Data/SampleScene` is the local validation fixture for the same multi-cloud contract. The expected sample files are `Site3-ROCK-1mm.Sample.ply`, `Site3-SAND-2mm.Sample.ply`, and `Site3-VEG-1mm.Sample.ply`.
 - Gaussian splat files are PLY files whose filename starts with `gSplat-` and whose header exposes Gaussian attributes such as `f_dc_0`, `opacity`, `scale_0`, and `rot_0`.
 - Each gSplat file is paired with a same-stem `.txt` file containing a 4x4 transform matrix.
 - `ffmpeg` is expected at `/opt/homebrew/bin/ffmpeg` for Fast Preview / Quick MP4 export.
+
+See [Scene-Wide Point-Cloud Density Switching](docs/scene_point_cloud_density_switching.md) for the scene catalog, transactional loading, rendering compensation, water-routing, and schema-33 contracts.
 
 ## Current status
 

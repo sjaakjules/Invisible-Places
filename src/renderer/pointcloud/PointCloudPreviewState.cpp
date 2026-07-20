@@ -581,7 +581,61 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     return style;
 }
 
+PointCloudDensityCompensation ResolvePointCloudDensityCompensation(
+    float displaySpacingMeters,
+    std::uint64_t displayPointCount,
+    float referenceSpacingMeters,
+    std::uint64_t referencePointCount) {
+    PointCloudDensityCompensation compensation;
+    if (std::isfinite(displaySpacingMeters) && displaySpacingMeters > 0.0F) {
+        compensation.footprintScale = displaySpacingMeters / 0.001F;
+    }
+
+    if (!std::isfinite(displaySpacingMeters) || displaySpacingMeters <= 0.0F ||
+        !std::isfinite(referenceSpacingMeters) || referenceSpacingMeters <= 0.0F ||
+        displayPointCount == 0U || referencePointCount == 0U) {
+        return SanitizePointCloudDensityCompensation(compensation);
+    }
+
+    const double spacingRatio =
+        static_cast<double>(displaySpacingMeters) / static_cast<double>(referenceSpacingMeters);
+    const double relativeCoverage =
+        (static_cast<double>(displayPointCount) / static_cast<double>(referencePointCount)) *
+        spacingRatio * spacingRatio;
+    if (std::isfinite(relativeCoverage) && relativeCoverage > 0.0) {
+        compensation.coverageCorrection = static_cast<float>(std::clamp(
+            1.0 / relativeCoverage,
+            1.0 / 16.0,
+            16.0));
+    }
+    return SanitizePointCloudDensityCompensation(compensation);
+}
+
+PointCloudDensityCompensation SanitizePointCloudDensityCompensation(
+    PointCloudDensityCompensation compensation) {
+    if (!std::isfinite(compensation.footprintScale) || compensation.footprintScale <= 0.0F) {
+        compensation.footprintScale = 1.0F;
+    }
+    if (!std::isfinite(compensation.coverageCorrection) || compensation.coverageCorrection <= 0.0F) {
+        compensation.coverageCorrection = 1.0F;
+    } else {
+        compensation.coverageCorrection = std::clamp(compensation.coverageCorrection, 1.0F / 16.0F, 16.0F);
+    }
+    return compensation;
+}
+
 PointCloudMaterialVariant ResolvePointCloudMaterialVariant(const PointCloudStyleState& style) {
+    return ResolvePointCloudMaterialVariant(style, {});
+}
+
+PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
+    const PointCloudStyleState& style,
+    PointCloudDensityCompensation densityCompensation) {
+    densityCompensation = SanitizePointCloudDensityCompensation(densityCompensation);
+    if (densityCompensation.coverageCorrection != 1.0F) {
+        return PointCloudMaterialVariant::Unified;
+    }
+
     const bool simpleColor =
         style.colorMode == PointCloudColorMode::SourceRgb ||
         style.colorMode == PointCloudColorMode::SolidColor;

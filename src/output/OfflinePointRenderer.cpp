@@ -59,6 +59,7 @@ constexpr std::size_t kWaterTrailLaneCrossingFieldSlot = 29U;
 constexpr std::size_t kWaterTrailCrossSeedFieldSlot = 30U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
 constexpr float kWaterTrailFeatureTypeRain = 4.0F;
+constexpr float kPointCloudAntialiasFeatherPixels = 1.0F;
 
 float Clamp01(float value) {
     return std::clamp(value, 0.0F, 1.0F);
@@ -843,9 +844,19 @@ float EvaluateBinding(
     const invisible_places::style::RenderParameterBinding& binding,
     std::size_t pointIndex) {
     const invisible_places::io::ScalarFieldStats* fieldStats = nullptr;
-    if (binding.fieldMap.fieldSlot >= 0 &&
-        static_cast<std::size_t>(binding.fieldMap.fieldSlot) < cloud.scalarFields.size()) {
-        fieldStats = &cloud.scalarFields[static_cast<std::size_t>(binding.fieldMap.fieldSlot)];
+    if (binding.mode == invisible_places::style::ParameterSourceMode::FieldMapped) {
+        if (binding.fieldMap.fieldSlot < 0 ||
+            static_cast<std::size_t>(binding.fieldMap.fieldSlot) >= cloud.scalarFields.size() ||
+            pointIndex >= cloud.PointCount()) {
+            return binding.constantValue[0];
+        }
+
+        const auto fieldSlot = static_cast<std::size_t>(binding.fieldMap.fieldSlot);
+        const auto valueIndex = cloud.ScalarFieldValueIndex(fieldSlot, pointIndex);
+        if (valueIndex >= cloud.scalarFieldValues.size()) {
+            return binding.constantValue[0];
+        }
+        fieldStats = &cloud.scalarFields[fieldSlot];
     }
 
     return invisible_places::style::EvaluateScalarBinding(
@@ -980,8 +991,8 @@ glm::vec3 ResolvePointColor(
         layer.hasSourceRgb &&
         pointIndex < cloud.packedColors.size()) {
         baseColor = SourceRgb(cloud.packedColors[pointIndex]);
-    } else if (layer.style.colorMode == invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap &&
-               !cloud.scalarFields.empty()) {
+    } else if (layer.style.colorMode ==
+               invisible_places::renderer::pointcloud::PointCloudColorMode::ScalarColormap) {
         const auto color = invisible_places::renderer::pointcloud::SampleColormap(
             layer.style.colormap,
             EvaluateBindingOrDefault(
@@ -1065,6 +1076,19 @@ float PointFalloff(
     return 1.0F;
 }
 
+float PointCloudDiscCoverage(float normalizedRadius, float footprintDiameterPixels) {
+    if (normalizedRadius >= 1.0F) {
+        return 0.0F;
+    }
+
+    const float safeDiameter = std::max(1.0F, footprintDiameterPixels);
+    const float coreRadius = std::clamp(
+        (safeDiameter - kPointCloudAntialiasFeatherPixels) / safeDiameter,
+        0.0F,
+        1.0F);
+    return 1.0F - SmoothStep(coreRadius, 1.0F, normalizedRadius);
+}
+
 float ResolveDepthFadeAlpha(
     const OfflinePointSample& sample,
     const invisible_places::camera::CameraState& cameraState,
@@ -1078,6 +1102,36 @@ float ResolveDepthFadeAlpha(
         1.0F,
         1.0F - depthNorm,
         std::clamp(sample.depthFade, 0.0F, 1.0F));
+}
+
+float ResolveDepthOfFieldBlurPixels(
+    const invisible_places::camera::CameraState& cameraState,
+    float viewDepth) {
+    if (!cameraState.hasDepthOfField) {
+        return 0.0F;
+    }
+
+    const float focusDistance = std::max(0.001F, cameraState.focusDistance);
+    const float apertureFStops = std::max(0.1F, cameraState.apertureFStops);
+    const float maxBlurPixels = std::max(0.0F, cameraState.depthOfFieldMaxBlurPixels);
+    const float distanceFromFocus =
+        std::abs(viewDepth - focusDistance) /
+        std::max(std::max(viewDepth, focusDistance), 0.001F);
+    return std::clamp(
+        distanceFromFocus * (8.0F / apertureFStops) * maxBlurPixels,
+        0.0F,
+        maxBlurPixels);
+}
+
+float ScreenPixelWorldSpan(
+    float viewDepth,
+    float pixels,
+    float projectionScaleY,
+    float viewportHeight) {
+    return std::max(0.0F, pixels) *
+           2.0F *
+           std::max(0.001F, viewDepth) /
+           (std::max(std::abs(projectionScaleY), 1.0e-5F) * std::max(1.0F, viewportHeight));
 }
 
 float AlphaClampMax(const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
@@ -1603,31 +1657,18 @@ invisible_places::water::WaterRippleRuntimeContribution ResolveOfflineRippleCont
     const glm::vec3& worldPosition,
     float timeSeconds) {
     invisible_places::water::WaterRippleRuntimeContribution result;
-    if (pointIndex >= layer.rippleMembershipRanges.size() ||
-        layer.rippleMemberships.empty() ||
-        layer.rippleParams.empty()) {
-        return result;
-    }
-
     glm::vec3 worldNormal{0.0F, 0.0F, 1.0F};
+    bool hasWorldNormal = false;
     if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
         const glm::vec3 localNormal = ToGlm(cloud.normals[pointIndex]);
         if (glm::dot(localNormal, localNormal) > 1.0e-8F) {
             worldNormal = glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
+            hasWorldNormal = IsFinite(worldNormal) && glm::dot(worldNormal, worldNormal) > 1.0e-8F;
         }
     }
-    if (!IsFinite(worldNormal) || glm::dot(worldNormal, worldNormal) <= 1.0e-8F) {
+    if (!hasWorldNormal) {
         worldNormal = {0.0F, 0.0F, 1.0F};
     }
-
-    const glm::uvec2 range = layer.rippleMembershipRanges[pointIndex];
-    const std::size_t start = range.x;
-    const std::size_t count = range.y;
-    if (count == 0U || start >= layer.rippleMemberships.size()) {
-        return result;
-    }
-
-    const std::size_t end = std::min(start + count, layer.rippleMemberships.size());
     const invisible_places::io::Float3 position{
         worldPosition.x,
         worldPosition.y,
@@ -1638,6 +1679,37 @@ invisible_places::water::WaterRippleRuntimeContribution ResolveOfflineRippleCont
         worldNormal.y,
         worldNormal.z,
     };
+    const invisible_places::io::Float3 seepageNormal =
+        hasWorldNormal ? normal : invisible_places::io::Float3{};
+
+    const auto seepage = invisible_places::water::EvaluateWaterSeepageGridContribution(
+        layer.seepageGrid,
+        position,
+        seepageNormal,
+        timeSeconds);
+    result.scale = seepage.scale;
+    result.colourMix = seepage.colourMix;
+    result.emissionAdd = seepage.emissionAdd;
+    result.opacityAdd = seepage.opacityAdd;
+    result.opacityMultiply = seepage.opacityMultiply;
+    result.pointSizeAdd = seepage.pointSizeAdd;
+    result.pointSizeMultiply = seepage.pointSizeMultiply;
+    result.colour = seepage.colour;
+
+    if (pointIndex >= layer.rippleMembershipRanges.size() ||
+        layer.rippleMemberships.empty() ||
+        layer.rippleParams.empty()) {
+        return result;
+    }
+
+    const glm::uvec2 range = layer.rippleMembershipRanges[pointIndex];
+    const std::size_t start = range.x;
+    const std::size_t count = range.y;
+    if (count == 0U || start >= layer.rippleMemberships.size()) {
+        return result;
+    }
+
+    const std::size_t end = std::min(start + count, layer.rippleMemberships.size());
     for (std::size_t entryIndex = start; entryIndex < end; ++entryIndex) {
         const auto& membership = layer.rippleMemberships[entryIndex];
         if (membership.paramIndex >= layer.rippleParams.size()) {
@@ -1672,6 +1744,9 @@ bool BuildOfflinePointSample(
     }
 
     const auto& cloud = *layer.cloud;
+    const auto densityCompensation =
+        invisible_places::renderer::pointcloud::SanitizePointCloudDensityCompensation(
+            layer.densityCompensation);
     const bool waterTrails = HasWaterTrailFields(cloud, layer.style);
     const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
     float waterParticleRole = 0.0F;
@@ -1800,48 +1875,7 @@ bool BuildOfflinePointSample(
         stylisationTimeSeconds);
     const float waterParticleSizeScale =
         waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
-    const bool worldSizedScreenSprites =
-        invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
-    if (worldSizedScreenSprites) {
-        const float diameterMeters =
-            (EvaluateBindingOrDefault(
-                 cloud,
-                 layer.style.surfelDiameter,
-                 pointIndex,
-                 invisible_places::renderer::pointcloud::kInactiveSurfelDiameterDefault) *
-                 waterParticleSizeScale *
-                 (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
-                 waterEffectPointSizeMultiply *
-                 sparseRipple.pointSizeMultiply) +
-            waterEffectPointSizeAdd +
-            sparseRipple.pointSizeAdd;
-        sample->pointSize = std::clamp(
-            invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
-                diameterMeters,
-                viewDepth,
-                matrices.projection[1][1],
-                static_cast<float>(image.height)),
-            1.0F,
-            64.0F);
-    } else {
-        sample->pointSize = std::clamp(
-            (EvaluateBindingOrDefault(
-                 cloud,
-                 layer.style.pointSize,
-                 pointIndex,
-                 invisible_places::renderer::pointcloud::kInactivePointSizeDefault) *
-                 waterParticleSizeScale *
-                 (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
-                 waterEffectPointSizeMultiply *
-                 sparseRipple.pointSizeMultiply) +
-                waterEffectPointSizeAdd +
-                sparseRipple.pointSizeAdd,
-            1.0F,
-            64.0F);
-    }
-    sample->worldSurfels = worldSurfels;
-    sample->surfelDiameter = std::max(
-        0.0F,
+    const float authoredSurfelDiameter =
         (EvaluateBindingOrDefault(
              cloud,
              layer.style.surfelDiameter,
@@ -1851,13 +1885,73 @@ bool BuildOfflinePointSample(
              (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
              waterEffectPointSizeMultiply *
              sparseRipple.pointSizeMultiply) +
-            waterEffectPointSizeAdd +
-            sparseRipple.pointSizeAdd);
+        waterEffectPointSizeAdd +
+        sparseRipple.pointSizeAdd;
+    const float authoredPointSize =
+        (EvaluateBindingOrDefault(
+             cloud,
+             layer.style.pointSize,
+             pointIndex,
+             invisible_places::renderer::pointcloud::kInactivePointSizeDefault) *
+             waterParticleSizeScale *
+             (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
+             waterEffectPointSizeMultiply *
+             sparseRipple.pointSizeMultiply) +
+        waterEffectPointSizeAdd +
+        sparseRipple.pointSizeAdd;
+    const float depthOfFieldBlurPixels = ResolveDepthOfFieldBlurPixels(cameraState, viewDepth);
+    const bool worldSizedScreenSprites =
+        invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
+    if (worldSizedScreenSprites) {
+        sample->pointSize = std::clamp(
+            invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                authoredSurfelDiameter * densityCompensation.footprintScale,
+                viewDepth,
+                matrices.projection[1][1],
+                static_cast<float>(image.height)) +
+                depthOfFieldBlurPixels +
+                kPointCloudAntialiasFeatherPixels,
+            1.0F,
+            64.0F);
+    } else {
+        sample->pointSize = std::clamp(
+            authoredPointSize * densityCompensation.footprintScale +
+                depthOfFieldBlurPixels +
+                kPointCloudAntialiasFeatherPixels,
+            1.0F,
+            64.0F);
+    }
+    sample->worldSurfels = worldSurfels;
+    sample->surfelDiameter = std::max(
+        0.0F,
+        authoredSurfelDiameter * densityCompensation.footprintScale +
+            2.0F * ScreenPixelWorldSpan(
+                       viewDepth,
+                       depthOfFieldBlurPixels,
+                       matrices.projection[1][1],
+                       static_cast<float>(image.height)) +
+            ScreenPixelWorldSpan(
+                viewDepth,
+                kPointCloudAntialiasFeatherPixels,
+                matrices.projection[1][1],
+                static_cast<float>(image.height)));
     sample->surfelAspect = layer.style.flowAnimation
                                 ? std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F)
                                 : 1.0F;
     if (waterTrails) {
-        sample->surfelDiameter = WaterTrailWidth(cloud, pointIndex, layer.style);
+        const float trailWidth = WaterTrailWidth(cloud, pointIndex, layer.style);
+        sample->surfelDiameter =
+            trailWidth * densityCompensation.footprintScale +
+            2.0F * ScreenPixelWorldSpan(
+                       viewDepth,
+                       depthOfFieldBlurPixels,
+                       matrices.projection[1][1],
+                       static_cast<float>(image.height)) +
+            ScreenPixelWorldSpan(
+                viewDepth,
+                kPointCloudAntialiasFeatherPixels,
+                matrices.projection[1][1],
+                static_cast<float>(image.height));
         const float trailStreakLength = std::max(
             sample->surfelDiameter,
             WaterTrailStreakLength(cloud, pointIndex, layer.style));
@@ -2001,6 +2095,22 @@ void VisitCoveredPixels(
             return;
         }
 
+        float bitangentPixelX = sample.pixelCenterX;
+        float bitangentPixelY = sample.pixelCenterY;
+        const bool projectedBitangent = ProjectWorldToPixel(
+            sample.worldCenter + sample.bitangent * bitangentRadiusWorld,
+            matrices,
+            image,
+            &bitangentPixelX,
+            &bitangentPixelY);
+        const float footprintDiameterPixels = projectedBitangent
+                                                  ? 2.0F * glm::length(glm::vec2{
+                                                        bitangentPixelX - sample.pixelCenterX,
+                                                        bitangentPixelY - sample.pixelCenterY})
+                                                  : std::max(1.0F, std::min(
+                                                        maxPixelX - minPixelX,
+                                                        maxPixelY - minPixelY));
+
         const int minX = std::max<int>(static_cast<int>(tile.x0), static_cast<int>(std::floor(minPixelX)) - 1);
         const int maxX = std::min<int>(static_cast<int>(tile.x1) - 1, static_cast<int>(std::ceil(maxPixelX)) + 1);
         const int minY = std::max<int>(static_cast<int>(tile.y0), static_cast<int>(std::floor(minPixelY)) - 1);
@@ -2052,7 +2162,11 @@ void VisitCoveredPixels(
                         normalizedRadius,
                         sample.pointIndex,
                         stylisationTimeSeconds);
-                if (falloff <= 1.0e-5F || stylisationCoverage <= 1.0e-5F) {
+                const float antialiasCoverage =
+                    PointCloudDiscCoverage(normalizedRadius, footprintDiameterPixels);
+                if (falloff <= 1.0e-5F ||
+                    stylisationCoverage <= 1.0e-5F ||
+                    antialiasCoverage <= 1.0e-5F) {
                     continue;
                 }
 
@@ -2069,7 +2183,7 @@ void VisitCoveredPixels(
                     static_cast<std::uint32_t>(x),
                     static_cast<std::uint32_t>(y),
                     localIndex,
-                    falloff * stylisationCoverage,
+                    falloff * stylisationCoverage * antialiasCoverage,
                     normalizedCoord,
                     coveredViewDepth);
             }
@@ -2108,7 +2222,11 @@ void VisitCoveredPixels(
                     normalizedRadius,
                     sample.pointIndex,
                     stylisationTimeSeconds);
-            if (falloff <= 1.0e-5F || stylisationCoverage <= 1.0e-5F) {
+            const float antialiasCoverage =
+                PointCloudDiscCoverage(normalizedRadius, sample.pointSize);
+            if (falloff <= 1.0e-5F ||
+                stylisationCoverage <= 1.0e-5F ||
+                antialiasCoverage <= 1.0e-5F) {
                 continue;
             }
 
@@ -2119,7 +2237,7 @@ void VisitCoveredPixels(
                 static_cast<std::uint32_t>(x),
                 static_cast<std::uint32_t>(y),
                 localIndex,
-                falloff * stylisationCoverage,
+                falloff * stylisationCoverage * antialiasCoverage,
                 normalizedCoord,
                 sample.viewDepth);
         }
@@ -2194,6 +2312,10 @@ void RenderFastBasicPointCloudTile(
 
         const bool worldSizedScreenSprites =
             invisible_places::renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style);
+        const float footprintScale =
+            invisible_places::renderer::pointcloud::SanitizePointCloudDensityCompensation(
+                layer.densityCompensation)
+                .footprintScale;
         for (std::size_t sampleIndex = 0; sampleIndex < drawPointCount; ++sampleIndex) {
             const auto pointIndex =
                 drawPointCount < sourcePointCount
@@ -2233,16 +2355,40 @@ void RenderFastBasicPointCloudTile(
                 continue;
             }
 
-            const glm::vec3 color = ResolvePointColor(layer, pointIndex);
-            if (worldSizedScreenSprites) {
-                const float pointSize = std::clamp(
-                    invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
-                        invisible_places::style::ScalarConstant(layer.style.surfelDiameter),
-                        viewDepth,
-                        matrices.projection[1][1],
-                        static_cast<float>(image->height)),
+            const auto sparseRipple = ResolveOfflineRippleContribution(
+                layer,
+                cloud,
+                pointIndex,
+                worldPosition,
+                stylisationTimeSeconds);
+            const glm::vec3 color =
+                glm::mix(
+                    ResolvePointColor(layer, pointIndex),
+                    sparseRipple.colour,
+                    Clamp01(sparseRipple.colourMix)) *
+                (1.0F + std::max(0.0F, sparseRipple.emissionAdd));
+            // Fast Basic intentionally ignores the authored material opacity,
+            // while procedural water effects can still attenuate its opaque base.
+            const float opacity = Clamp01(
+                sparseRipple.opacityMultiply + sparseRipple.opacityAdd);
+            if (opacity <= 1.0e-5F) {
+                continue;
+            }
+            const float basePointSize =
+                worldSizedScreenSprites
+                    ? invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                          invisible_places::style::ScalarConstant(layer.style.surfelDiameter),
+                          viewDepth,
+                          matrices.projection[1][1],
+                          static_cast<float>(image->height))
+                    : invisible_places::style::ScalarConstant(layer.style.pointSize);
+            const float pointSize =
+                std::clamp(
+                    ((basePointSize * sparseRipple.pointSizeMultiply) + sparseRipple.pointSizeAdd) *
+                        footprintScale,
                     1.0F,
                     64.0F);
+            if (worldSizedScreenSprites || pointSize > 1.0F) {
                 const float safeRadius = std::max(0.5F, pointSize * 0.5F);
                 const auto radiusPixels = static_cast<int>(std::ceil(safeRadius));
                 const int centerX = static_cast<int>(std::floor(pixelX));
@@ -2267,7 +2413,7 @@ void RenderFastBasicPointCloudTile(
                         image->beautyR[pixelIndex] = color.r;
                         image->beautyG[pixelIndex] = color.g;
                         image->beautyB[pixelIndex] = color.b;
-                        image->alpha[pixelIndex] = 1.0F;
+                        image->alpha[pixelIndex] = opacity;
                         image->depth[pixelIndex] = viewDepth;
                         if (diagnostics != nullptr) {
                             ++diagnostics->accumulationCoveredPixels;
@@ -2294,7 +2440,7 @@ void RenderFastBasicPointCloudTile(
                 image->beautyR[pixelIndex] = color.r;
                 image->beautyG[pixelIndex] = color.g;
                 image->beautyB[pixelIndex] = color.b;
-                image->alpha[pixelIndex] = 1.0F;
+                image->alpha[pixelIndex] = opacity;
                 image->depth[pixelIndex] = viewDepth;
                 if (diagnostics != nullptr) {
                     ++diagnostics->accumulationCoveredPixels;
@@ -2378,6 +2524,10 @@ void RenderPointCloudTile(
         }
 
         const auto& cloud = *layer.cloud;
+        const float coverageCorrection =
+            invisible_places::renderer::pointcloud::SanitizePointCloudDensityCompensation(
+                layer.densityCompensation)
+                .coverageCorrection;
         for (std::size_t chunkStart = 0; chunkStart < cloud.positions.size(); chunkStart += kOfflinePointChunkSize) {
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
@@ -2414,11 +2564,14 @@ void RenderPointCloudTile(
                         const auto pixelIndex =
                             static_cast<std::size_t>(y) * static_cast<std::size_t>(image->width) +
                             static_cast<std::size_t>(x);
-                        const float alpha =
-                            std::clamp(
-                                sample.opacity * falloff * ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth),
-                                0.0F,
-                                AlphaClampMax(layer.style));
+                        const float rawAlpha =
+                            sample.opacity *
+                            falloff *
+                            ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth);
+                        const float alpha = std::clamp(
+                            rawAlpha * coverageCorrection,
+                            0.0F,
+                            AlphaClampMax(layer.style));
                         if (pixelIndex < image->depth.size() &&
                             coveredViewDepth < image->depth[pixelIndex] &&
                             invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(
@@ -2449,6 +2602,10 @@ void RenderPointCloudTile(
         }
 
         const auto& cloud = *layer.cloud;
+        const float coverageCorrection =
+            invisible_places::renderer::pointcloud::SanitizePointCloudDensityCompensation(
+                layer.densityCompensation)
+                .coverageCorrection;
         for (std::size_t chunkStart = 0; chunkStart < cloud.positions.size(); chunkStart += kOfflinePointChunkSize) {
             const auto chunkEnd = std::min(cloud.positions.size(), chunkStart + kOfflinePointChunkSize);
             for (std::size_t pointIndex = chunkStart; pointIndex < chunkEnd; ++pointIndex) {
@@ -2490,11 +2647,15 @@ void RenderPointCloudTile(
                             return;
                         }
 
-                        const float alpha =
-                            std::clamp(
-                                sample.opacity * falloff * ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth),
-                                0.0F,
-                                AlphaClampMax(layer.style));
+                        const float rawAlpha =
+                            sample.opacity *
+                            falloff *
+                            ResolveDepthFadeAlpha(sample, cameraState, coveredViewDepth);
+                        const float compensatedRawAlpha = rawAlpha * coverageCorrection;
+                        const float alpha = std::clamp(
+                            compensatedRawAlpha,
+                            0.0F,
+                            AlphaClampMax(layer.style));
                         if (alpha <= 1.0e-5F) {
                             return;
                         }
@@ -2522,10 +2683,10 @@ void RenderPointCloudTile(
 
                         const float emissionGain = sample.emissive * std::max(0.0F, layer.style.exposure);
                         if (emissionGain > 1.0e-5F) {
-                            emissionR[localIndex] += stylisedColor.r * alpha * emissionGain;
-                            emissionG[localIndex] += stylisedColor.g * alpha * emissionGain;
-                            emissionB[localIndex] += stylisedColor.b * alpha * emissionGain;
-                            emissionA[localIndex] += alpha * emissionGain;
+                            emissionR[localIndex] += stylisedColor.r * compensatedRawAlpha * emissionGain;
+                            emissionG[localIndex] += stylisedColor.g * compensatedRawAlpha * emissionGain;
+                            emissionB[localIndex] += stylisedColor.b * compensatedRawAlpha * emissionGain;
+                            emissionA[localIndex] += compensatedRawAlpha * emissionGain;
                         }
 
                     });

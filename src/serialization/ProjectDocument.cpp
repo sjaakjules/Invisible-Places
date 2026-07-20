@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -80,6 +81,10 @@ using invisible_places::water::WaterRipplePatternSettings;
 using invisible_places::water::WaterRippleRuntimeMembership;
 using invisible_places::water::WaterRippleRuntimeParams;
 using invisible_places::water::WaterScaleMode;
+using invisible_places::water::WaterSeepageLookProfile;
+using invisible_places::water::WaterSeepageLookSettings;
+using invisible_places::water::WaterSeepageNode;
+using invisible_places::water::WaterSeepageQuality;
 using invisible_places::water::WaterSettingsBundle;
 using invisible_places::water::WaterSourceSettingsAssignment;
 using invisible_places::water::WaterSourceSettings;
@@ -1148,6 +1153,54 @@ ScenePointVisualStateDocument ParseScenePointVisualState(const json& stateJson) 
     return state;
 }
 
+json SerializeScenePointCloudRoleSource(
+    const ScenePointCloudRoleSourceDocument &source) {
+  return json{
+      {"scene_role", source.sceneRole},
+      {"analysis_source_path", source.analysisSourcePath.generic_string()},
+      {"display_source_path", source.displaySourcePath.generic_string()},
+  };
+}
+
+ScenePointCloudRoleSourceDocument
+ParseScenePointCloudRoleSource(const json &sourceJson) {
+  ScenePointCloudRoleSourceDocument source;
+  source.sceneRole = sourceJson.value("scene_role", std::string{});
+  source.analysisSourcePath =
+      sourceJson.value("analysis_source_path", std::string{});
+  source.displaySourcePath =
+      sourceJson.value("display_source_path", std::string{});
+  return source;
+}
+
+json SerializeScenePointCloudGroup(const ScenePointCloudGroupDocument &group) {
+  json groupJson{
+      {"scene_group", group.sceneGroupName},
+      {"display_spacing_meters", group.displaySpacingMeters},
+      {"display_loaded", group.displayLoaded},
+      {"display_visible", group.displayVisible},
+      {"roles", json::array()},
+  };
+  for (const auto &source : group.roleSources) {
+    groupJson["roles"].push_back(SerializeScenePointCloudRoleSource(source));
+  }
+  return groupJson;
+}
+
+ScenePointCloudGroupDocument ParseScenePointCloudGroup(const json &groupJson) {
+  ScenePointCloudGroupDocument group;
+  group.sceneGroupName = groupJson.value("scene_group", std::string{});
+  group.displaySpacingMeters = groupJson.value("display_spacing_meters", 0.0F);
+  group.displayLoaded = groupJson.value("display_loaded", false);
+  group.displayVisible = groupJson.value("display_visible", false);
+  if (groupJson.contains("roles") && groupJson.at("roles").is_array()) {
+    for (const auto &sourceJson : groupJson.at("roles")) {
+      group.roleSources.push_back(ParseScenePointCloudRoleSource(sourceJson));
+    }
+  }
+  return group;
+}
+
 json SerializeGaussianSplatStyle(const GaussianSplatStyleState& style) {
     return json{
         {"color_mode", GaussianSplatColorModeName(style.colorMode)},
@@ -1474,6 +1527,154 @@ ProjectLayerDocument ParseProjectLayer(const json& layerJson) {
         }
     }
     return layer;
+}
+
+bool SerializedPathsMatch(const std::filesystem::path &left,
+                          const std::filesystem::path &right) {
+  if (left.empty() || right.empty()) {
+    return left.empty() && right.empty();
+  }
+  return left.lexically_normal().generic_string() ==
+         right.lexically_normal().generic_string();
+}
+
+float LegacySceneLayerSpacingMeters(const ProjectLayerDocument &layer) {
+  if (std::isfinite(layer.inferredPointSpacingMeters) &&
+      layer.inferredPointSpacingMeters > 0.0F) {
+    return layer.inferredPointSpacingMeters;
+  }
+  if (std::isfinite(layer.pointSpacingMeters) &&
+      layer.pointSpacingMeters > 0.0F) {
+    return layer.pointSpacingMeters;
+  }
+  return 0.0F;
+}
+
+int LegacySceneSpacingPreference(const ProjectLayerDocument &layer) {
+  if (layer.scenePrimaryRole) {
+    return 3;
+  }
+  if (TrimAsciiWhitespace(layer.sceneRole) == "ROCK") {
+    return 2;
+  }
+  return 1;
+}
+
+bool IsLegacyScenePointCloudLayer(const ProjectLayerDocument &layer) {
+  return layer.kind == SerializedLayerKind::PointCloud &&
+         !TrimAsciiWhitespace(layer.sceneGroupName).empty() &&
+         !TrimAsciiWhitespace(layer.sceneRole).empty();
+}
+
+void MigrateLegacyScenePointCloudGroups(ProjectDocument *document) {
+  if (document == nullptr) {
+    return;
+  }
+
+  document->scenePointCloudGroups.clear();
+  for (const auto &layer : document->layers) {
+    if (!IsLegacyScenePointCloudLayer(layer)) {
+      continue;
+    }
+    const auto sceneGroupName = TrimAsciiWhitespace(layer.sceneGroupName);
+    const auto sceneRole = TrimAsciiWhitespace(layer.sceneRole);
+    auto groupIt = std::find_if(
+        document->scenePointCloudGroups.begin(),
+        document->scenePointCloudGroups.end(),
+        [&sceneGroupName](const ScenePointCloudGroupDocument &group) {
+          return group.sceneGroupName == sceneGroupName;
+        });
+    if (groupIt == document->scenePointCloudGroups.end()) {
+      document->scenePointCloudGroups.push_back(
+          {.sceneGroupName = sceneGroupName});
+      groupIt = std::prev(document->scenePointCloudGroups.end());
+    }
+    if (std::none_of(
+            groupIt->roleSources.begin(), groupIt->roleSources.end(),
+            [&sceneRole](const ScenePointCloudRoleSourceDocument &source) {
+              return source.sceneRole == sceneRole;
+            })) {
+      groupIt->roleSources.push_back({.sceneRole = sceneRole});
+    }
+  }
+
+  for (auto &group : document->scenePointCloudGroups) {
+    for (auto &source : group.roleSources) {
+      std::filesystem::path selectedCandidate;
+      std::filesystem::path fallbackCandidate;
+      for (const auto &layer : document->layers) {
+        if (!IsLegacyScenePointCloudLayer(layer) ||
+            TrimAsciiWhitespace(layer.sceneGroupName) != group.sceneGroupName ||
+            TrimAsciiWhitespace(layer.sceneRole) != source.sceneRole) {
+          continue;
+        }
+        if (fallbackCandidate.empty() && !layer.sourcePath.empty()) {
+          fallbackCandidate = layer.sourcePath;
+        }
+        if (layer.selectedSceneVariantPath.empty()) {
+          continue;
+        }
+        if (selectedCandidate.empty()) {
+          selectedCandidate = layer.selectedSceneVariantPath;
+        }
+        if (SerializedPathsMatch(layer.sourcePath,
+                                 layer.selectedSceneVariantPath)) {
+          selectedCandidate = layer.selectedSceneVariantPath;
+          break;
+        }
+      }
+      const auto &candidate =
+          selectedCandidate.empty() ? fallbackCandidate : selectedCandidate;
+      source.analysisSourcePath = candidate;
+      source.displaySourcePath = candidate;
+    }
+
+    const ProjectLayerDocument *bestSpacingLayer = nullptr;
+    int bestSpacingPreference = 0;
+    bool matchedSelectedLayer = false;
+    for (const auto &source : group.roleSources) {
+      for (const auto &layer : document->layers) {
+        if (!IsLegacyScenePointCloudLayer(layer) ||
+            TrimAsciiWhitespace(layer.sceneGroupName) != group.sceneGroupName ||
+            TrimAsciiWhitespace(layer.sceneRole) != source.sceneRole ||
+            !SerializedPathsMatch(layer.sourcePath, source.displaySourcePath)) {
+          continue;
+        }
+        matchedSelectedLayer = true;
+        group.displayLoaded |= layer.loaded;
+        group.displayVisible |= layer.visible;
+        const int spacingPreference = LegacySceneSpacingPreference(layer);
+        if (LegacySceneLayerSpacingMeters(layer) > 0.0F &&
+            (bestSpacingLayer == nullptr ||
+             spacingPreference > bestSpacingPreference)) {
+          bestSpacingLayer = &layer;
+          bestSpacingPreference = spacingPreference;
+        }
+      }
+    }
+
+    if (!matchedSelectedLayer) {
+      for (const auto &layer : document->layers) {
+        if (!IsLegacyScenePointCloudLayer(layer) ||
+            TrimAsciiWhitespace(layer.sceneGroupName) != group.sceneGroupName) {
+          continue;
+        }
+        group.displayLoaded |= layer.loaded;
+        group.displayVisible |= layer.visible;
+        const int spacingPreference = LegacySceneSpacingPreference(layer);
+        if (LegacySceneLayerSpacingMeters(layer) > 0.0F &&
+            (bestSpacingLayer == nullptr ||
+             spacingPreference > bestSpacingPreference)) {
+          bestSpacingLayer = &layer;
+          bestSpacingPreference = spacingPreference;
+        }
+      }
+    }
+    if (bestSpacingLayer != nullptr) {
+      group.displaySpacingMeters =
+          LegacySceneLayerSpacingMeters(*bestSpacingLayer);
+    }
+  }
 }
 
 json SerializeCameraState(const CameraState& state) {
@@ -2321,6 +2522,162 @@ WaterEffectResponseSettings ParseWaterEffectResponseSettings(const json& setting
     return settings;
 }
 
+const char* WaterSeepageQualityName(WaterSeepageQuality quality) {
+    switch (quality) {
+        case WaterSeepageQuality::Low:
+            return "low";
+        case WaterSeepageQuality::Balanced:
+            return "balanced";
+        case WaterSeepageQuality::High:
+            return "high";
+        case WaterSeepageQuality::Auto:
+            return "auto";
+    }
+    return "auto";
+}
+
+WaterSeepageQuality ParseWaterSeepageQuality(const json& qualityJson) {
+    const auto name = qualityJson.get<std::string>();
+    if (name == "low") {
+        return WaterSeepageQuality::Low;
+    }
+    if (name == "balanced") {
+        return WaterSeepageQuality::Balanced;
+    }
+    if (name == "high") {
+        return WaterSeepageQuality::High;
+    }
+    return WaterSeepageQuality::Auto;
+}
+
+json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings) {
+    return json{
+        {"quality", WaterSeepageQualityName(settings.quality)},
+        {"base_wetness", settings.baseWetness},
+        {"density", settings.density},
+        {"glisten", settings.glisten},
+        {"pattern_scale", settings.patternScale},
+        {"wavelength_meters", settings.wavelengthMeters},
+        {"speed", settings.speed},
+        {"warp", settings.warp},
+        {"turbulence", settings.turbulence},
+        {"phase", settings.phase},
+        {"rain_response", settings.rainResponse},
+        {"blend_mode", WaterEffectBlendModeName(settings.blendMode)},
+        {"response", SerializeWaterEffectResponseSettings(settings.response)},
+    };
+}
+
+WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson) {
+    WaterSeepageLookSettings settings;
+    if (settingsJson.contains("quality")) {
+        settings.quality = ParseWaterSeepageQuality(settingsJson.at("quality"));
+    }
+    settings.baseWetness = settingsJson.value("base_wetness", settings.baseWetness);
+    settings.density = settingsJson.value("density", settings.density);
+    settings.glisten = settingsJson.value("glisten", settings.glisten);
+    settings.patternScale = settingsJson.value("pattern_scale", settings.patternScale);
+    settings.wavelengthMeters = settingsJson.value("wavelength_meters", settings.wavelengthMeters);
+    settings.speed = settingsJson.value("speed", settings.speed);
+    settings.warp = settingsJson.value("warp", settings.warp);
+    settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
+    settings.phase = settingsJson.value("phase", settings.phase);
+    settings.rainResponse = settingsJson.value("rain_response", settings.rainResponse);
+    if (settingsJson.contains("blend_mode")) {
+        settings.blendMode = ParseWaterEffectBlendMode(settingsJson.at("blend_mode"));
+    }
+    if (settingsJson.contains("response")) {
+        settings.response = ParseWaterEffectResponseSettings(settingsJson.at("response"));
+    }
+    return settings;
+}
+
+json SerializeWaterSeepageLookProfile(const WaterSeepageLookProfile& profile) {
+    return json{
+        {"name", profile.name},
+        {"settings", SerializeWaterSeepageLookSettings(profile.settings)},
+    };
+}
+
+WaterSeepageLookProfile ParseWaterSeepageLookProfile(const json& profileJson) {
+    WaterSeepageLookProfile profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("settings")) {
+        profile.settings = ParseWaterSeepageLookSettings(profileJson.at("settings"));
+    }
+    return profile;
+}
+
+json SerializeWaterSeepageNode(const WaterSeepageNode& node) {
+    json nodeJson{
+        {"id", node.id},
+        {"name", node.name},
+        {"position", {node.position.x, node.position.y, node.position.z}},
+        {"surface_normal", {node.surfaceNormal.x, node.surfaceNormal.y, node.surfaceNormal.z}},
+        {"down_axis", {node.downAxis.x, node.downAxis.y, node.downAxis.z}},
+        {"reach_meters", node.reachMeters},
+        {"start_width_meters", node.startWidthMeters},
+        {"end_width_meters", node.endWidthMeters},
+        {"edge_feather_meters", node.edgeFeatherMeters},
+        {"depth_tolerance_meters", node.depthToleranceMeters},
+        {"normal_alignment", node.normalAlignment},
+        {"strength", node.strength},
+        {"seed", node.seed},
+        {"enabled_in_viewport", node.enabledInViewport},
+        {"enabled_in_export", node.enabledInExport},
+        {"target_scene_roles", node.targetSceneRoles},
+        {"look_profile_name", node.lookProfileName},
+    };
+    if (node.lookOverride.has_value()) {
+        nodeJson["look_override"] = SerializeWaterSeepageLookSettings(node.lookOverride.value());
+    }
+    if (node.tempLookOverride.has_value()) {
+        nodeJson["temp_look_override"] =
+            SerializeWaterSeepageLookSettings(node.tempLookOverride.value());
+    }
+    return nodeJson;
+}
+
+WaterSeepageNode ParseWaterSeepageNode(const json& nodeJson) {
+    WaterSeepageNode node;
+    node.id = nodeJson.value("id", node.id);
+    node.name = nodeJson.value("name", node.name);
+    if (nodeJson.contains("position")) {
+        const auto position = nodeJson.at("position").get<std::array<float, 3>>();
+        node.position = {position[0], position[1], position[2]};
+    }
+    if (nodeJson.contains("surface_normal")) {
+        const auto normal = nodeJson.at("surface_normal").get<std::array<float, 3>>();
+        node.surfaceNormal = {normal[0], normal[1], normal[2]};
+    }
+    if (nodeJson.contains("down_axis")) {
+        const auto downAxis = nodeJson.at("down_axis").get<std::array<float, 3>>();
+        node.downAxis = {downAxis[0], downAxis[1], downAxis[2]};
+    }
+    node.reachMeters = nodeJson.value("reach_meters", node.reachMeters);
+    node.startWidthMeters = nodeJson.value("start_width_meters", node.startWidthMeters);
+    node.endWidthMeters = nodeJson.value("end_width_meters", node.endWidthMeters);
+    node.edgeFeatherMeters = nodeJson.value("edge_feather_meters", node.edgeFeatherMeters);
+    node.depthToleranceMeters =
+        nodeJson.value("depth_tolerance_meters", node.depthToleranceMeters);
+    node.normalAlignment = nodeJson.value("normal_alignment", node.normalAlignment);
+    node.strength = nodeJson.value("strength", node.strength);
+    node.seed = nodeJson.value("seed", node.seed);
+    node.enabledInViewport = nodeJson.value("enabled_in_viewport", node.enabledInViewport);
+    node.enabledInExport = nodeJson.value("enabled_in_export", node.enabledInExport);
+    if (nodeJson.contains("target_scene_roles") && nodeJson.at("target_scene_roles").is_array()) {
+        node.targetSceneRoles = nodeJson.at("target_scene_roles").get<std::vector<std::string>>();
+    }
+    node.lookProfileName = nodeJson.value("look_profile_name", node.lookProfileName);
+    if (nodeJson.contains("look_override")) {
+        node.lookOverride = ParseWaterSeepageLookSettings(nodeJson.at("look_override"));
+    }
+    if (nodeJson.contains("temp_look_override")) {
+        node.tempLookOverride = ParseWaterSeepageLookSettings(nodeJson.at("temp_look_override"));
+    }
+    return node;
+}
+
 json SerializeWaterRipplePatternSettings(const WaterRipplePatternSettings& settings) {
     return json{
         {"pattern_scale", settings.patternScale},
@@ -2998,6 +3355,7 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
     json stateJson{
         {"scene_group", state.sceneGroupName.empty() ? std::string{"Default"} : state.sceneGroupName},
         {"water_emitters", json::array()},
+        {"water_seepage_nodes", json::array()},
         {"water_ripple_layers", json::array()},
         {"water_field_layers", json::array()},
         {"water_ripple_runtime_caches", json::array()},
@@ -3007,6 +3365,9 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
     };
     for (const auto& emitter : state.emitters) {
         stateJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
+    }
+    for (const auto& node : state.seepageNodes) {
+        stateJson["water_seepage_nodes"].push_back(SerializeWaterSeepageNode(node));
     }
     for (const auto& layer : state.rippleLayers) {
         stateJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
@@ -3041,6 +3402,12 @@ WaterSceneStateDocument ParseWaterSceneState(const json& stateJson) {
     if (stateJson.contains("water_emitters") && stateJson.at("water_emitters").is_array()) {
         for (const auto& emitterJson : stateJson.at("water_emitters")) {
             state.emitters.push_back(ParseWaterEmitter(emitterJson));
+        }
+    }
+    if (stateJson.contains("water_seepage_nodes") &&
+        stateJson.at("water_seepage_nodes").is_array()) {
+        for (const auto& nodeJson : stateJson.at("water_seepage_nodes")) {
+            state.seepageNodes.push_back(ParseWaterSeepageNode(nodeJson));
         }
     }
     if (stateJson.contains("water_ripple_layers") && stateJson.at("water_ripple_layers").is_array()) {
@@ -3086,6 +3453,7 @@ WaterSceneStateDocument ParseWaterSceneState(const json& stateJson) {
 
 bool WaterSceneStateHasPayload(const WaterSceneStateDocument& state) {
     return !state.emitters.empty() ||
+           !state.seepageNodes.empty() ||
            !state.rippleLayers.empty() ||
            !state.fieldLayers.empty() ||
            (state.pathCache.has_value() && !state.pathCache->branches.empty()) ||
@@ -3099,6 +3467,7 @@ WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocum
     WaterSceneStateDocument state;
     state.sceneGroupName = "Default";
     state.emitters = document.waterEmitters;
+    state.seepageNodes = document.waterSeepageNodes;
     state.rippleLayers = document.waterRippleLayers;
     state.fieldLayers = document.waterFieldLayers;
     state.pathCache = document.waterPathCache;
@@ -4089,6 +4458,7 @@ bool SaveProjectDocument(
         {"selected_point_visual", document.selectedPointVisualName.empty() ? std::string{"Unnamed"}
                                                                            : document.selectedPointVisualName},
         {"scene_visual_states", json::array()},
+        {"scene_point_cloud_groups", json::array()},
         {"gsplat_visual_style", SerializeGaussianSplatStyle(document.gsplatVisualStyle)},
         {"point_cloud_preview_lod_mode", PointCloudPreviewLodModeName(document.pointCloudPreviewLodMode)},
         {"interactive_point_cap", document.interactivePointCap},
@@ -4107,6 +4477,9 @@ bool SaveProjectDocument(
         {"selected_water_lane_profile", document.selectedWaterLaneProfileName},
         {"selected_water_trail_profile", document.selectedWaterTrailProfileName},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.waterCausticLookSettings)},
+        {"water_seepage_nodes", json::array()},
+        {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.waterSeepageDefaultLook)},
+        {"water_seepage_look_profiles", json::array()},
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
         {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.waterFieldTrailSettings)},
@@ -4124,6 +4497,9 @@ bool SaveProjectDocument(
     }
     for (const auto& state : document.sceneVisualStates) {
         projectJson["scene_visual_states"].push_back(SerializeScenePointVisualState(state));
+    }
+    for (const auto& group : document.scenePointCloudGroups) {
+        projectJson["scene_point_cloud_groups"].push_back(SerializeScenePointCloudGroup(group));
     }
     for (const auto& preset : document.exportPresets) {
         projectJson["export_presets"].push_back(SerializeExportPreset(preset));
@@ -4154,6 +4530,13 @@ bool SaveProjectDocument(
     }
     for (const auto& profile : document.waterTrailProfiles) {
         projectJson["water_trail_profiles"].push_back(SerializeWaterTrailProfile(profile));
+    }
+    for (const auto& node : document.waterSeepageNodes) {
+        projectJson["water_seepage_nodes"].push_back(SerializeWaterSeepageNode(node));
+    }
+    for (const auto& profile : document.waterSeepageLookProfiles) {
+        projectJson["water_seepage_look_profiles"].push_back(
+            SerializeWaterSeepageLookProfile(profile));
     }
     for (const auto& visual : document.waterPointVisuals) {
         projectJson["water_point_visuals"].push_back(SerializePointCloudVisual(visual));
@@ -4256,6 +4639,13 @@ std::optional<ProjectDocument> LoadProjectDocument(
             }
         }
     }
+    if (document.schemaVersion >= 33U &&
+        projectJson->contains("scene_point_cloud_groups") &&
+        projectJson->at("scene_point_cloud_groups").is_array()) {
+        for (const auto& groupJson : projectJson->at("scene_point_cloud_groups")) {
+            document.scenePointCloudGroups.push_back(ParseScenePointCloudGroup(groupJson));
+        }
+    }
     if (projectJson->contains("gsplat_visual_style")) {
         document.gsplatVisualStyle = ParseGaussianSplatStyle(projectJson->at("gsplat_visual_style"));
     }
@@ -4299,6 +4689,23 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (projectJson->contains("water_caustic_look_settings")) {
         document.waterCausticLookSettings =
             ParseWaterCausticLookSettings(projectJson->at("water_caustic_look_settings"));
+    }
+    if (projectJson->contains("water_seepage_default_look")) {
+        document.waterSeepageDefaultLook =
+            ParseWaterSeepageLookSettings(projectJson->at("water_seepage_default_look"));
+    }
+    if (projectJson->contains("water_seepage_look_profiles") &&
+        projectJson->at("water_seepage_look_profiles").is_array()) {
+        for (const auto& profileJson : projectJson->at("water_seepage_look_profiles")) {
+            document.waterSeepageLookProfiles.push_back(
+                ParseWaterSeepageLookProfile(profileJson));
+        }
+    }
+    if (projectJson->contains("water_seepage_nodes") &&
+        projectJson->at("water_seepage_nodes").is_array()) {
+        for (const auto& nodeJson : projectJson->at("water_seepage_nodes")) {
+            document.waterSeepageNodes.push_back(ParseWaterSeepageNode(nodeJson));
+        }
     }
     if (projectJson->contains("water_flow_trail_settings")) {
         document.waterFlowTrailSettings =
@@ -4475,6 +4882,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (!document.waterSceneStates.empty()) {
         const auto& activeSceneState = document.waterSceneStates.front();
         document.waterEmitters = activeSceneState.emitters;
+        document.waterSeepageNodes = activeSceneState.seepageNodes;
         document.waterRippleLayers = activeSceneState.rippleLayers;
         document.waterFieldLayers = activeSceneState.fieldLayers;
         document.waterPathCache = activeSceneState.pathCache;
@@ -4600,6 +5008,9 @@ std::optional<ProjectDocument> LoadProjectDocument(
             document.layers.push_back(ParseProjectLayer(layerJson));
         }
     }
+    if (document.schemaVersion < 33U) {
+        MigrateLegacyScenePointCloudGroups(&document);
+    }
     if (document.schemaVersion < 30U || document.pointVisuals.empty()) {
         MigrateLegacyLayerPointVisuals(&document);
     } else if (
@@ -4635,8 +5046,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
             document.waterEmitters.push_back(ParseWaterEmitter(emitterJson));
         }
     }
-    if (document.schemaVersion < 32U) {
-        document.schemaVersion = 32U;
+    if (document.schemaVersion < kProjectDocumentSchemaVersion) {
+        document.schemaVersion = kProjectDocumentSchemaVersion;
     }
 
     return document;
@@ -4664,6 +5075,9 @@ bool SaveWaterSourcesDocument(
         {"water_rain_settings", SerializeWaterRainSettings(document.rainSettings)},
         {"selected_water_rain_trail_profile", document.selectedRainTrailProfileName},
         {"water_emitters", json::array()},
+        {"water_seepage_nodes", json::array()},
+        {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.seepageDefaultLook)},
+        {"water_seepage_look_profiles", json::array()},
         {"water_ripple_layers", json::array()},
         {"water_field_layers", json::array()},
         {"water_ripple_runtime_caches", json::array()},
@@ -4704,6 +5118,13 @@ bool SaveWaterSourcesDocument(
     for (const auto& emitter : document.emitters) {
         sourcesJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
     }
+    for (const auto& node : document.seepageNodes) {
+        sourcesJson["water_seepage_nodes"].push_back(SerializeWaterSeepageNode(node));
+    }
+    for (const auto& profile : document.seepageLookProfiles) {
+        sourcesJson["water_seepage_look_profiles"].push_back(
+            SerializeWaterSeepageLookProfile(profile));
+    }
     for (const auto& layer : document.rippleLayers) {
         sourcesJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
@@ -4740,6 +5161,16 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_caustic_look_settings")) {
         document.causticLookSettings =
             ParseWaterCausticLookSettings(sourcesJson->at("water_caustic_look_settings"));
+    }
+    if (sourcesJson->contains("water_seepage_default_look")) {
+        document.seepageDefaultLook =
+            ParseWaterSeepageLookSettings(sourcesJson->at("water_seepage_default_look"));
+    }
+    if (sourcesJson->contains("water_seepage_look_profiles") &&
+        sourcesJson->at("water_seepage_look_profiles").is_array()) {
+        for (const auto& profileJson : sourcesJson->at("water_seepage_look_profiles")) {
+            document.seepageLookProfiles.push_back(ParseWaterSeepageLookProfile(profileJson));
+        }
     }
     if (sourcesJson->contains("water_flow_trail_settings")) {
         document.flowTrailSettings =
@@ -4859,6 +5290,12 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_emitters") && sourcesJson->at("water_emitters").is_array()) {
         for (const auto& emitterJson : sourcesJson->at("water_emitters")) {
             document.emitters.push_back(ParseWaterEmitter(emitterJson));
+        }
+    }
+    if (sourcesJson->contains("water_seepage_nodes") &&
+        sourcesJson->at("water_seepage_nodes").is_array()) {
+        for (const auto& nodeJson : sourcesJson->at("water_seepage_nodes")) {
+            document.seepageNodes.push_back(ParseWaterSeepageNode(nodeJson));
         }
     }
     const bool hasNativeRippleLayers = sourcesJson->contains("water_ripple_layers") &&
