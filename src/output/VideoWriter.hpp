@@ -58,6 +58,22 @@ std::filesystem::path BuildUniqueQuickMp4OutputPath(
     const RenderJobSettings& settings,
     std::string_view visualName = {},
     const std::vector<std::filesystem::path>& reservedPaths = {});
+std::filesystem::path BuildUniqueHevcAlphaMp4OutputPath(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    const RenderJobSettings& settings,
+    std::string_view visualName = {},
+    const std::vector<std::filesystem::path>& reservedPaths = {});
+std::filesystem::path BuildUniquePngStackOutputDirectory(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    const RenderJobSettings& settings,
+    std::string_view visualName = {},
+    const std::vector<std::filesystem::path>& reservedPaths = {});
+std::filesystem::path PngStackFramePath(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    std::uint32_t frameIndex);
 std::filesystem::path BuildUniqueVideoOutputPath(
     const std::filesystem::path& outputDirectory,
     std::string_view animationName,
@@ -135,6 +151,12 @@ std::filesystem::path BuildUniqueProRes4444XqVideoToolboxOutputPath(
     const std::vector<std::filesystem::path>& reservedPaths = {});
 
 std::string BuildFfmpegRawRgbaCommand(
+    const std::filesystem::path& executablePath,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t framesPerSecond,
+    const std::filesystem::path& outputPath);
+std::string BuildFfmpegHevcAlphaMp4Command(
     const std::filesystem::path& executablePath,
     std::uint32_t width,
     std::uint32_t height,

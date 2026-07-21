@@ -89,6 +89,39 @@ enum class PointCloudMaterialVariant {
     Unified
 };
 
+enum class PointCloudShorelineWaveAlgorithm {
+    FoamFronts,
+    HeightFoam
+};
+
+struct PointCloudHeightFoamShorelineSettings {
+    float runupZ = 1.55F;
+    float breakZ = 1.30F;
+    float offshoreReachMeters = 0.55F;
+    float edgeFadeMeters = 0.05F;
+    float directionX = 1.0F;
+    float directionY = 0.0F;
+    float patternScale = 1.0F;
+    float wavelengthMeters = 0.25F;
+    float speed = 0.55F;
+    float warp = 0.35F;
+    float turbulence = 0.06F;
+    float density = 0.55F;
+    float phase = 0.0F;
+    float intensity = 1.15F;
+    float offshoreFoamStrength = 0.30F;
+    float incomingStrength = 1.0F;
+    float returnStrength = 0.30F;
+    float emissionAdd = 0.65F;
+    float opacityAdd = 0.08F;
+    float opacityMultiply = 1.25F;
+    float pointSizeAdd = 0.0F;
+    float pointSizeMultiply = 1.35F;
+    float colourMix = 0.75F;
+    std::array<float, 3> colour{0.62F, 0.88F, 1.0F};
+    std::uint32_t seed = 1U;
+};
+
 struct PointCloudDensityCompensation {
     float footprintScale = 1.0F;
     float coverageCorrection = 1.0F;
@@ -137,6 +170,9 @@ struct PointCloudStyleState {
     bool flowAnimation = false;
     bool waterPathView = false;
     bool waterTrailOverlay = false;
+    // Compact animation-only Rain modulation; 1 preserves authored trail behaviour.
+    float waterRainLevel = 1.0F;
+    float waterRainSpeedScale = 1.0F;
     bool causticAnimation = false;
     float causticIntensity = 0.0F;
     float causticScale = 4.0F;
@@ -158,6 +194,9 @@ struct PointCloudStyleState {
     std::int32_t causticEdgeFieldSlot = -1;
     std::int32_t causticSeedFieldSlot = -1;
     bool shorelineWaveEnabled = false;
+    PointCloudShorelineWaveAlgorithm shorelineWaveAlgorithm =
+        PointCloudShorelineWaveAlgorithm::FoamFronts;
+    PointCloudHeightFoamShorelineSettings shorelineHeightFoam{};
     float shorelineBoundaryZ = 1.55F;
     float shorelineHeightReachMeters = 0.45F;
     float shorelineEdgeFadeMeters = 0.05F;
@@ -231,6 +270,11 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
     float reachMeters,
     float edgeFadeMeters,
     float worldZ);
+[[nodiscard]] float NormalizeHeightFoamBreakZ(
+    float runupZ,
+    float offshoreReachMeters,
+    float edgeFadeMeters,
+    float breakZ);
 [[nodiscard]] float WorldDiameterToScreenPointSizePixels(
     float diameterMeters,
     float viewDepth,

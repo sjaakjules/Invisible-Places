@@ -79,6 +79,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams2;
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
+    vec4 shorelineWaveParams5;
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
@@ -102,6 +103,7 @@ const uint kWaterTrailPointAgeFieldSlot = 14u;
 const uint kWaterTrailAgeFieldSlot = 15u;
 const uint kWaterTrailSpeedFieldSlot = 16u;
 const uint kWaterTrailStreakLengthFieldSlot = 18u;
+const uint kWaterTrailFeatureTypeFieldSlot = 21u;
 const uint kWaterTrailTangentZFieldSlot = 24u;
 const uint kWaterTrailLaneIndexFieldSlot = 25u;
 const uint kWaterTrailLaneCountFieldSlot = 26u;
@@ -109,6 +111,7 @@ const uint kWaterTrailLanePitchFieldSlot = 27u;
 const uint kWaterTrailLaneSpanFieldSlot = 28u;
 const uint kWaterTrailLaneCrossingFieldSlot = 29u;
 const uint kWaterTrailCrossSeedFieldSlot = 30u;
+const float kWaterTrailFeatureTypeRain = 4.0;
 
 float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -158,7 +161,8 @@ float WaterTrailTravelPhase(uint pointIndex) {
     const float trailDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailDistanceFieldSlot, pointIndex));
     const float trailAge = LoadScalarFieldValueForPoint(kWaterTrailAgeFieldSlot, pointIndex);
     const float baseStartPhase = LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, pointIndex);
-    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex));
+    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex)) *
+                        max(0.0, styleData.renderParams2.y);
     const float trailStartPhase = fract(
         baseStartPhase +
         trailAge +
@@ -185,6 +189,17 @@ float WaterTrailStreakLength(uint pointIndex) {
     return max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
 }
 
+bool WaterTrailIsRain(uint pointIndex) {
+    if (styleData.globalControl.z <= kWaterTrailFeatureTypeFieldSlot) {
+        return false;
+    }
+    const float featureType = LoadScalarFieldValueForPoint(
+        kWaterTrailFeatureTypeFieldSlot,
+        pointIndex);
+    return featureType > kWaterTrailFeatureTypeRain - 0.5 &&
+           featureType < kWaterTrailFeatureTypeRain + 0.5;
+}
+
 float WaterTrailVisibility(uint pointIndex) {
     if (LoadScalarFieldValueForPoint(kWaterTrailRoleFieldSlot, pointIndex) < 0.5) {
         return 0.0;
@@ -193,7 +208,19 @@ float WaterTrailVisibility(uint pointIndex) {
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.08);
-    return 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    float visibility = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    if (WaterTrailIsRain(pointIndex)) {
+        const float rainLevel = clamp(styleData.renderParams1.w, 0.0, 1.0);
+        const float selector = clamp(
+            LoadScalarFieldValueForPoint(kWaterTrailCrossSeedFieldSlot, pointIndex),
+            0.0,
+            1.0);
+        if (rainLevel <= 1e-5 || selector > rainLevel) {
+            return 0.0;
+        }
+        visibility *= 0.20 + rainLevel * 0.80;
+    }
+    return visibility;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {

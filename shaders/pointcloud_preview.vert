@@ -84,6 +84,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams2;
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
+    vec4 shorelineWaveParams5;
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
@@ -518,7 +519,8 @@ float WaterTrailTravelPhase(uint pointIndex) {
     const float trailDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailDistanceFieldSlot, pointIndex));
     const float trailAge = LoadScalarFieldValueForPoint(kWaterTrailAgeFieldSlot, pointIndex);
     const float baseStartPhase = LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, pointIndex);
-    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex));
+    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex)) *
+                        max(0.0, styleData.renderParams2.y);
     const float trailStartPhase = fract(
         baseStartPhase +
         trailAge +
@@ -590,7 +592,19 @@ float WaterTrailVisibility(uint pointIndex) {
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.08);
-    return 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    float visibility = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    if (WaterTrailIsRain(pointIndex)) {
+        const float rainLevel = clamp(styleData.renderParams1.w, 0.0, 1.0);
+        const float selector = clamp(
+            LoadScalarFieldValueForPoint(kWaterTrailCrossSeedFieldSlot, pointIndex),
+            0.0,
+            1.0);
+        if (rainLevel <= 1e-5 || selector > rainLevel) {
+            return 0.0;
+        }
+        visibility *= 0.20 + rainLevel * 0.80;
+    }
+    return visibility;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -611,6 +625,9 @@ vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition
     const vec3 p1 = pointPositions.positions[routeStart + p1Offset].xyz;
     const vec3 p2 = pointPositions.positions[routeStart + p2Offset].xyz;
     const vec3 p3 = pointPositions.positions[routeStart + p3Offset].xyz;
+    if (WaterTrailIsRain(pointIndex)) {
+        return mix(p1, p2, t);
+    }
     return CatmullRomWater(p0, p1, p2, p3, t);
 }
 

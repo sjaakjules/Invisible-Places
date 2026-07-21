@@ -9,6 +9,16 @@ layout(location = 4) in vec3 inPointNormal;
 
 layout(location = 0) out vec4 outColor;
 
+layout(set = 0, binding = 0) uniform FrameUniforms {
+    mat4 viewProjection;
+    mat4 view;
+    mat4 projection;
+    vec4 cameraPosition;
+    vec4 depthParameters;
+    vec4 viewportParameters;
+    vec4 depthOfFieldParameters;
+} uniforms;
+
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
     float values[];
 } scalarFieldValues;
@@ -60,6 +70,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams2;
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
+    vec4 shorelineWaveParams5;
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;

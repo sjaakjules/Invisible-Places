@@ -14,6 +14,8 @@ namespace {
 
 using invisible_places::serialization::ScenePointCloudGroupDocument;
 using invisible_places::serialization::ScenePointCloudRoleSourceDocument;
+using invisible_places::serialization::kProjectDocumentSchemaVersion;
+using invisible_places::serialization::kWaterSourcesDocumentSchemaVersion;
 
 const ScenePointCloudRoleSourceDocument *
 FindRoleSource(const ScenePointCloudGroupDocument &group,
@@ -43,18 +45,16 @@ struct TemporaryProjectFile {
 
 } // namespace
 
-TEST_CASE("Project schema v34 round-trips authoritative scene density groups",
+TEST_CASE("Current project schema round-trips authoritative scene density groups",
           "[project][serialization][density]") {
-  using invisible_places::serialization::kProjectDocumentSchemaVersion;
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::ProjectDocument;
   using invisible_places::serialization::ProjectLayerDocument;
   using invisible_places::serialization::SaveProjectDocument;
 
   ProjectDocument document;
-  CHECK(document.schemaVersion == 34U);
   CHECK(document.schemaVersion == kProjectDocumentSchemaVersion);
-  document.projectName = "density-v34";
+  document.projectName = "current-density-schema";
   document.scenePointCloudGroups.push_back({
       .sceneGroupName = "Scene1",
       .displaySpacingMeters = 0.005F,
@@ -83,14 +83,14 @@ TEST_CASE("Project schema v34 round-trips authoritative scene density groups",
   legacyMirror.visible = true;
   document.layers.push_back(legacyMirror);
 
-  TemporaryProjectFile file{"invisible_places_density_v34_round_trip.json"};
+  TemporaryProjectFile file{"invisible_places_density_current_round_trip.json"};
   std::string errorMessage;
   REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
 
   std::ifstream input{file.path};
   REQUIRE(input.is_open());
   const auto savedJson = nlohmann::json::parse(input);
-  CHECK(savedJson.at("schema_version") == 34U);
+  CHECK(savedJson.at("schema_version") == kProjectDocumentSchemaVersion);
   REQUIRE(savedJson.at("scene_point_cloud_groups").size() == 1U);
   CHECK(savedJson.at("scene_point_cloud_groups").front().at("scene_group") ==
         "Scene1");
@@ -113,6 +113,120 @@ TEST_CASE("Project schema v34 round-trips authoritative scene density groups",
   REQUIRE(loaded->layers.size() == 1U);
   CHECK(loaded->layers.front().selectedSceneVariantPath ==
         legacyMirror.selectedSceneVariantPath);
+}
+
+TEST_CASE("Manual Flow paths round-trip through project scenes and water-source documents",
+          "[project][serialization][water][manual-path]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::LoadWaterSourcesDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::SaveWaterSourcesDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+  using invisible_places::serialization::WaterSourcesDocument;
+  using invisible_places::water::WaterManualFlowPathSource;
+
+  WaterManualFlowPathSource waterfall;
+  waterfall.id = 27U;
+  waterfall.name = "Waterfall arc";
+  waterfall.laneProfileName = "Five Lanes";
+  waterfall.trailProfileName = "Fine Silver";
+  waterfall.controlPoints = {
+      {1.0F, 2.0F, 3.0F},
+      {1.5F, 2.2F, 2.0F},
+      {1.8F, 2.7F, 0.5F},
+  };
+  WaterManualFlowPathSource creek;
+  creek.id = 31U;
+  creek.name = "Creek bend";
+  creek.laneProfileName = "Wide Sheet";
+  creek.trailProfileName = "Blue Threads";
+  creek.controlPoints = {
+      {-2.0F, 0.0F, 0.2F},
+      {-1.0F, 0.4F, 0.1F},
+      {0.0F, 0.1F, 0.0F},
+      {1.0F, 0.8F, -0.1F},
+  };
+
+  ProjectDocument project;
+  project.projectName = "manual-paths-current";
+  WaterSceneStateDocument defaultScene;
+  defaultScene.sceneGroupName = "Default";
+  defaultScene.manualFlowPaths = {waterfall, creek};
+  WaterSceneStateDocument secondScene;
+  secondScene.sceneGroupName = "Gorge";
+  secondScene.manualFlowPaths = {creek};
+  project.waterSceneStates = {defaultScene, secondScene};
+
+  TemporaryProjectFile projectFile{"invisible_places_manual_paths_current.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(project, projectFile.path, &errorMessage));
+  const auto loadedProject = LoadProjectDocument(projectFile.path, &errorMessage);
+  REQUIRE(loadedProject.has_value());
+  CHECK(loadedProject->schemaVersion == kProjectDocumentSchemaVersion);
+  REQUIRE(loadedProject->waterSceneStates.size() == 2U);
+  REQUIRE(loadedProject->waterSceneStates[0].manualFlowPaths.size() == 2U);
+  REQUIRE(loadedProject->waterSceneStates[1].manualFlowPaths.size() == 1U);
+  REQUIRE(loadedProject->waterManualFlowPaths.size() == 2U);
+  const auto &loadedWaterfall = loadedProject->waterManualFlowPaths[0];
+  CHECK(loadedWaterfall.id == waterfall.id);
+  CHECK(loadedWaterfall.name == waterfall.name);
+  CHECK(loadedWaterfall.laneProfileName == waterfall.laneProfileName);
+  CHECK(loadedWaterfall.trailProfileName == waterfall.trailProfileName);
+  REQUIRE(loadedWaterfall.controlPoints.size() == waterfall.controlPoints.size());
+  CHECK(loadedWaterfall.controlPoints[1].z == Catch::Approx(2.0F));
+  CHECK(loadedProject->waterSceneStates[1].manualFlowPaths[0].id == creek.id);
+
+  ProjectDocument legacyDefaultProject;
+  legacyDefaultProject.projectName = "manual-path-default-state";
+  legacyDefaultProject.waterManualFlowPaths = {waterfall};
+  TemporaryProjectFile defaultProjectFile{"invisible_places_manual_path_default_current.json"};
+  REQUIRE(SaveProjectDocument(legacyDefaultProject, defaultProjectFile.path, &errorMessage));
+  const auto loadedDefaultProject = LoadProjectDocument(defaultProjectFile.path, &errorMessage);
+  REQUIRE(loadedDefaultProject.has_value());
+  REQUIRE(loadedDefaultProject->waterSceneStates.size() == 1U);
+  REQUIRE(loadedDefaultProject->waterSceneStates[0].manualFlowPaths.size() == 1U);
+  REQUIRE(loadedDefaultProject->waterManualFlowPaths.size() == 1U);
+  CHECK(loadedDefaultProject->waterManualFlowPaths[0].id == waterfall.id);
+
+  WaterSourcesDocument sources;
+  sources.manualFlowPaths = {waterfall, creek};
+  TemporaryProjectFile sourcesFile{"invisible_places_manual_paths_current_sources.json"};
+  REQUIRE(SaveWaterSourcesDocument(sources, sourcesFile.path, &errorMessage));
+  const auto loadedSources = LoadWaterSourcesDocument(sourcesFile.path, &errorMessage);
+  REQUIRE(loadedSources.has_value());
+  CHECK(loadedSources->schemaVersion == kWaterSourcesDocumentSchemaVersion);
+  REQUIRE(loadedSources->manualFlowPaths.size() == 2U);
+  CHECK(loadedSources->manualFlowPaths[0].id == waterfall.id);
+  CHECK(loadedSources->manualFlowPaths[0].controlPoints[2].z == Catch::Approx(0.5F));
+  CHECK(loadedSources->manualFlowPaths[1].trailProfileName == creek.trailProfileName);
+}
+
+TEST_CASE("Older project and water-source schemas load with no manual Flow paths",
+          "[project][serialization][water][manual-path][migration]") {
+  TemporaryProjectFile projectFile{"invisible_places_manual_paths_legacy_v34.json"};
+  {
+    std::ofstream output{projectFile.path};
+    output << nlohmann::json{{"schema_version", 34U}, {"project_name", "legacy"}}.dump(2);
+  }
+  std::string errorMessage;
+  const auto project = invisible_places::serialization::LoadProjectDocument(
+      projectFile.path, &errorMessage);
+  REQUIRE(project.has_value());
+  CHECK(project->schemaVersion == kProjectDocumentSchemaVersion);
+  CHECK(project->waterManualFlowPaths.empty());
+  CHECK(project->waterSceneStates.empty());
+
+  TemporaryProjectFile sourcesFile{"invisible_places_manual_paths_legacy_v11.json"};
+  {
+    std::ofstream output{sourcesFile.path};
+    output << nlohmann::json{{"schema_version", 11U}}.dump(2);
+  }
+  const auto sources = invisible_places::serialization::LoadWaterSourcesDocument(
+      sourcesFile.path, &errorMessage);
+  REQUIRE(sources.has_value());
+  CHECK(sources->schemaVersion == 11U);
+  CHECK(sources->manualFlowPaths.empty());
 }
 
 TEST_CASE("Project schema v32 migrates legacy selected variants into scene "
@@ -192,7 +306,7 @@ TEST_CASE("Project schema v32 migrates legacy selected variants into scene "
   std::string errorMessage;
   const auto loaded = LoadProjectDocument(file.path, &errorMessage);
   REQUIRE(loaded.has_value());
-  CHECK(loaded->schemaVersion == 34U);
+  CHECK(loaded->schemaVersion == kProjectDocumentSchemaVersion);
   REQUIRE(loaded->scenePointCloudGroups.size() == 1U);
   const auto &group = loaded->scenePointCloudGroups.front();
   CHECK(group.sceneGroupName == "Scene1");

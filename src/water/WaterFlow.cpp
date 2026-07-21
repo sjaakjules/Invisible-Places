@@ -662,20 +662,32 @@ std::uint32_t PackRgba8(std::uint8_t red, std::uint8_t green, std::uint8_t blue)
            (0xFFU << 24U);
 }
 
-glm::vec3 CatmullRomPosition(
+float CentripetalCatmullRomKnot(float previous, const glm::vec3& left, const glm::vec3& right) {
+    return previous + std::sqrt(std::max(glm::length(right - left), 1.0e-8F));
+}
+
+glm::vec3 InterpolateCentripetalCatmullRom(
     const glm::vec3& p0,
     const glm::vec3& p1,
     const glm::vec3& p2,
     const glm::vec3& p3,
     float amount) {
-    const float t = Clamp01(amount);
-    const float t2 = t * t;
-    const float t3 = t2 * t;
-    return 0.5F * (
-        (2.0F * p1) +
-        (-p0 + p2) * t +
-        ((2.0F * p0) - (5.0F * p1) + (4.0F * p2) - p3) * t2 +
-        (-p0 + (3.0F * p1) - (3.0F * p2) + p3) * t3);
+    const float t0 = 0.0F;
+    const float t1 = CentripetalCatmullRomKnot(t0, p0, p1);
+    const float t2 = CentripetalCatmullRomKnot(t1, p1, p2);
+    const float t3 = CentripetalCatmullRomKnot(t2, p2, p3);
+    const float t = t1 + (t2 - t1) * Clamp01(amount);
+    const auto blend = [](const glm::vec3& left, const glm::vec3& right, float leftT, float rightT, float valueT) {
+        const float denominator = std::max(1.0e-8F, rightT - leftT);
+        return left * ((rightT - valueT) / denominator) +
+               right * ((valueT - leftT) / denominator);
+    };
+    const glm::vec3 a1 = blend(p0, p1, t0, t1, t);
+    const glm::vec3 a2 = blend(p1, p2, t1, t2, t);
+    const glm::vec3 a3 = blend(p2, p3, t2, t3, t);
+    const glm::vec3 b1 = blend(a1, a2, t0, t2, t);
+    const glm::vec3 b2 = blend(a2, a3, t1, t3, t);
+    return blend(b1, b2, t1, t2, t);
 }
 
 void RecomputePathDistances(
@@ -743,10 +755,16 @@ std::vector<WaterOverlayPoint> BuildSplineViewSamples(
     samples.reserve(std::min<std::size_t>(maxSampleCount, anchors.size() * 4U));
     samples.push_back(anchors.front());
     for (std::size_t index = 0U; index + 1U < anchors.size() && samples.size() < maxSampleCount; ++index) {
-        const auto& p0 = anchors[index > 0U ? index - 1U : index];
         const auto& p1 = anchors[index];
         const auto& p2 = anchors[index + 1U];
-        const auto& p3 = anchors[index + 2U < anchors.size() ? index + 2U : index + 1U];
+        const glm::vec3 p1Position = ToGlm(p1.position);
+        const glm::vec3 p2Position = ToGlm(p2.position);
+        const glm::vec3 p0Position =
+            index > 0U ? ToGlm(anchors[index - 1U].position) : p1Position + (p1Position - p2Position);
+        const glm::vec3 p3Position =
+            index + 2U < anchors.size()
+                ? ToGlm(anchors[index + 2U].position)
+                : p2Position + (p2Position - p1Position);
         const float segmentLength = std::max(0.001F, p2.pathDistance - p1.pathDistance);
         const bool explicitSpacing = std::isfinite(sampleSpacingMeters) && sampleSpacingMeters > 0.0F;
         const float spacing = PositiveOr(sampleSpacingMeters, std::max(0.03F, segmentLength * 0.25F));
@@ -757,11 +775,11 @@ std::vector<WaterOverlayPoint> BuildSplineViewSamples(
         for (std::uint32_t step = 1U; step <= subdivisions && samples.size() < maxSampleCount; ++step) {
             const float t = static_cast<float>(step) / static_cast<float>(subdivisions);
             auto sample = BlendPathAnchor(p1, p2, t);
-            sample.position = FromGlm(CatmullRomPosition(
-                ToGlm(p0.position),
-                ToGlm(p1.position),
-                ToGlm(p2.position),
-                ToGlm(p3.position),
+            sample.position = FromGlm(InterpolateCentripetalCatmullRom(
+                p0Position,
+                p1Position,
+                p2Position,
+                p3Position,
                 t));
             samples.push_back(sample);
         }
@@ -2977,7 +2995,7 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
             settings.trailPointSpacingMeters = 0.16F;
             settings.trailWidthMeters = 0.0022F;
             settings.trailStreakLengthMeters = 0.055F;
-            settings.routeAnchorCount = 8U;
+            settings.routeAnchorCount = 12U;
             break;
         case WaterRainIntensityPreset::Rain:
             settings.dropCount = 900U;
@@ -2991,7 +3009,7 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
             settings.trailPointSpacingMeters = 0.18F;
             settings.trailWidthMeters = 0.004F;
             settings.trailStreakLengthMeters = 0.12F;
-            settings.routeAnchorCount = 10U;
+            settings.routeAnchorCount = 16U;
             break;
         case WaterRainIntensityPreset::HeavyDownpour:
             settings.dropCount = 2200U;
@@ -3005,7 +3023,7 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
             settings.trailPointSpacingMeters = 0.22F;
             settings.trailWidthMeters = 0.0065F;
             settings.trailStreakLengthMeters = 0.24F;
-            settings.routeAnchorCount = 12U;
+            settings.routeAnchorCount = 22U;
             break;
     }
     return settings;
@@ -3049,6 +3067,12 @@ constexpr float kSeepagePi = 3.14159265358979323846F;
 constexpr float kSeepageTwoPi = 2.0F * kSeepagePi;
 constexpr float kSeepageMaximumRainReachScale = 1.25F;
 constexpr float kSeepageMaximumRainWidthScale = 1.20F;
+constexpr float kSeepageMaximumScenarioReachScale = 1.50F;
+constexpr float kSeepageMaximumScenarioWidthScale = 1.35F;
+constexpr float kSeepageMaximumReachScale =
+    kSeepageMaximumRainReachScale * kSeepageMaximumScenarioReachScale;
+constexpr float kSeepageMaximumWidthScale =
+    kSeepageMaximumRainWidthScale * kSeepageMaximumScenarioWidthScale;
 
 struct MutableSeepageHashCell {
     std::int32_t x = 0;
@@ -3124,6 +3148,34 @@ WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
     look.turbulence = std::clamp(SeepageFiniteOr(look.turbulence, fallback.turbulence), 0.0F, 1.0F);
     look.phase = SeepageFiniteOr(look.phase, fallback.phase);
     look.rainResponse = std::clamp(SeepageFiniteOr(look.rainResponse, fallback.rainResponse), 0.0F, 1.0F);
+    look.featureSizeMeters = std::clamp(
+        SeepageFiniteOr(look.featureSizeMeters, fallback.featureSizeMeters),
+        0.005F,
+        20.0F);
+    look.contrast = std::clamp(SeepageFiniteOr(look.contrast, fallback.contrast), 0.0F, 1.0F);
+    look.evolution = std::clamp(SeepageFiniteOr(look.evolution, fallback.evolution), 0.0F, 4.0F);
+    look.roughness = std::clamp(SeepageFiniteOr(look.roughness, fallback.roughness), 0.02F, 1.0F);
+    look.angleResponse = std::clamp(
+        SeepageFiniteOr(look.angleResponse, fallback.angleResponse), 0.0F, 1.0F);
+    look.microNormalStrength = std::clamp(
+        SeepageFiniteOr(look.microNormalStrength, fallback.microNormalStrength), 0.0F, 1.0F);
+    look.glintDensity = std::clamp(
+        SeepageFiniteOr(look.glintDensity, fallback.glintDensity), 0.0F, 1.0F);
+    look.environmentAzimuthDegrees = std::remainder(
+        SeepageFiniteOr(look.environmentAzimuthDegrees, fallback.environmentAzimuthDegrees),
+        360.0F);
+    look.environmentElevationDegrees = std::clamp(
+        SeepageFiniteOr(look.environmentElevationDegrees, fallback.environmentElevationDegrees),
+        -89.0F,
+        89.0F);
+    look.curl = std::clamp(SeepageFiniteOr(look.curl, fallback.curl), 0.0F, 2.0F);
+    look.breakup = std::clamp(SeepageFiniteOr(look.breakup, fallback.breakup), 0.0F, 1.0F);
+    look.downhillDriftMetersPerSecond = std::clamp(
+        SeepageFiniteOr(
+            look.downhillDriftMetersPerSecond,
+            fallback.downhillDriftMetersPerSecond),
+        0.0F,
+        4.0F);
     look.response = SanitizeSeepageResponse(look.response, fallback.response);
     return look;
 }
@@ -3461,12 +3513,12 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
     const float lateralExtent =
         std::max(
             node.startHalfWidthMeters,
-            node.endHalfWidthMeters * kSeepageMaximumRainWidthScale) + feather;
+            node.endHalfWidthMeters * kSeepageMaximumWidthScale) + feather;
     const float depthExtent = node.depthToleranceMeters + feather;
     if (node.guideValid && node.guideSampleCount >= 2U) {
         const float maximumReach = std::max(
             1.0e-5F,
-            node.reachMeters * kSeepageMaximumRainReachScale);
+            node.reachMeters * kSeepageMaximumReachScale);
         for (std::size_t sampleIndex = 0U;
              sampleIndex < node.guideSampleCount;
              ++sampleIndex) {
@@ -3486,7 +3538,7 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
             const float progress = Clamp01(sample.station / maximumReach);
             const float halfWidth = std::lerp(
                 node.startHalfWidthMeters,
-                node.endHalfWidthMeters * kSeepageMaximumRainWidthScale,
+                node.endHalfWidthMeters * kSeepageMaximumWidthScale,
                 progress);
             const glm::vec3 extent =
                 glm::abs(lateral) * (halfWidth + feather) +
@@ -3499,7 +3551,7 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
     }
     const std::array<float, 2> longitudinal{
         -feather,
-        node.reachMeters * kSeepageMaximumRainReachScale + feather};
+        node.reachMeters * kSeepageMaximumReachScale + feather};
     const std::array<float, 2> lateral{-lateralExtent, lateralExtent};
     const std::array<float, 2> depth{-depthExtent, depthExtent};
     for (const float along : longitudinal) {
@@ -3570,11 +3622,129 @@ float SeepageFractalNoise(
     return weight > 0.0F ? value / weight : 0.0F;
 }
 
+struct SeepageNoise3Sample {
+    float value = 0.5F;
+    glm::vec3 gradient{0.0F};
+};
+
+glm::vec3 SeepageGradient3(std::uint32_t hash) {
+    constexpr std::array<glm::vec3, 12> gradients{{
+        {1.0F, 1.0F, 0.0F}, {-1.0F, 1.0F, 0.0F}, {1.0F, -1.0F, 0.0F}, {-1.0F, -1.0F, 0.0F},
+        {1.0F, 0.0F, 1.0F}, {-1.0F, 0.0F, 1.0F}, {1.0F, 0.0F, -1.0F}, {-1.0F, 0.0F, -1.0F},
+        {0.0F, 1.0F, 1.0F}, {0.0F, -1.0F, 1.0F}, {0.0F, 1.0F, -1.0F}, {0.0F, -1.0F, -1.0F},
+    }};
+    return gradients[hash % gradients.size()] * 0.70710678118F;
+}
+
+std::uint32_t SeepageHash3(const glm::ivec3& coordinate, std::uint32_t seed) {
+    std::uint32_t hash = SeepageSpatialHash(coordinate.x, coordinate.y, coordinate.z);
+    hash ^= seed * 0x9e3779b9U;
+    hash ^= hash >> 16U;
+    hash *= 0x7feb352dU;
+    hash ^= hash >> 15U;
+    hash *= 0x846ca68bU;
+    hash ^= hash >> 16U;
+    return hash;
+}
+
+SeepageNoise3Sample SeepageSimplexNoise3(glm::vec3 coordinate, std::uint32_t seed) {
+    constexpr float skew = 1.0F / 3.0F;
+    constexpr float unskew = 1.0F / 6.0F;
+    const float skewAmount = (coordinate.x + coordinate.y + coordinate.z) * skew;
+    const glm::ivec3 lattice = glm::ivec3(glm::floor(coordinate + skewAmount));
+    const float unskewAmount = static_cast<float>(lattice.x + lattice.y + lattice.z) * unskew;
+    const glm::vec3 x0 = coordinate - (glm::vec3(lattice) - unskewAmount);
+
+    glm::ivec3 i1{0};
+    glm::ivec3 i2{0};
+    if (x0.x >= x0.y) {
+        if (x0.y >= x0.z) {
+            i1 = {1, 0, 0};
+            i2 = {1, 1, 0};
+        } else if (x0.x >= x0.z) {
+            i1 = {1, 0, 0};
+            i2 = {1, 0, 1};
+        } else {
+            i1 = {0, 0, 1};
+            i2 = {1, 0, 1};
+        }
+    } else if (x0.y < x0.z) {
+        i1 = {0, 0, 1};
+        i2 = {0, 1, 1};
+    } else if (x0.x < x0.z) {
+        i1 = {0, 1, 0};
+        i2 = {0, 1, 1};
+    } else {
+        i1 = {0, 1, 0};
+        i2 = {1, 1, 0};
+    }
+
+    const std::array<glm::ivec3, 4> offsets{{glm::ivec3{0}, i1, i2, glm::ivec3{1}}};
+    const std::array<glm::vec3, 4> deltas{{
+        x0,
+        x0 - glm::vec3(i1) + unskew,
+        x0 - glm::vec3(i2) + 2.0F * unskew,
+        x0 - glm::vec3{1.0F} + 3.0F * unskew,
+    }};
+    float rawValue = 0.0F;
+    glm::vec3 rawGradient{0.0F};
+    for (std::size_t corner = 0U; corner < deltas.size(); ++corner) {
+        const glm::vec3 delta = deltas[corner];
+        const float attenuation = 0.60F - glm::dot(delta, delta);
+        if (attenuation <= 0.0F) {
+            continue;
+        }
+        const glm::vec3 gradient = SeepageGradient3(SeepageHash3(lattice + offsets[corner], seed));
+        const float gradientDot = glm::dot(gradient, delta);
+        const float attenuation2 = attenuation * attenuation;
+        const float attenuation3 = attenuation2 * attenuation;
+        const float attenuation4 = attenuation2 * attenuation2;
+        rawValue += attenuation4 * gradientDot;
+        rawGradient += attenuation4 * gradient - 8.0F * attenuation3 * gradientDot * delta;
+    }
+    constexpr float outputScale = 32.0F;
+    SeepageNoise3Sample result;
+    result.value = Clamp01(0.5F + 0.5F * rawValue * outputScale);
+    result.gradient = rawGradient * (0.5F * outputScale);
+    return result;
+}
+
+SeepageNoise3Sample SeepageFractalNoise3(
+    glm::vec3 coordinate,
+    std::uint32_t seed,
+    WaterSeepageQuality quality) {
+    const std::uint32_t octaveCount = quality == WaterSeepageQuality::Low
+                                          ? 1U
+                                          : (quality == WaterSeepageQuality::High ? 3U : 2U);
+    SeepageNoise3Sample result;
+    result.value = 0.0F;
+    result.gradient = glm::vec3{0.0F};
+    float amplitude = 1.0F;
+    float frequency = 1.0F;
+    float weight = 0.0F;
+    for (std::uint32_t octave = 0U; octave < octaveCount; ++octave) {
+        const auto sample = SeepageSimplexNoise3(coordinate, seed + octave * 1013U);
+        result.value += sample.value * amplitude;
+        result.gradient += sample.gradient * (amplitude * frequency);
+        weight += amplitude;
+        coordinate = coordinate * 2.03F + glm::vec3{17.0F, 31.0F, 47.0F};
+        frequency *= 2.03F;
+        amplitude *= 0.5F;
+    }
+    if (weight > 0.0F) {
+        result.value /= weight;
+        result.gradient /= weight;
+    }
+    return result;
+}
+
 struct SeepageFanSample {
     float mask = 0.0F;
     float downDistance = 0.0F;
     float lateralDistance = 0.0F;
     float signedLateralDistance = 0.0F;
+    glm::vec3 surfaceNormal{0.0F, 1.0F, 0.0F};
+    glm::vec3 downTangent{0.0F, 0.0F, -1.0F};
 };
 
 SeepageFanSample EvaluatePlanarSeepageFanMask(
@@ -3582,6 +3752,8 @@ SeepageFanSample EvaluatePlanarSeepageFanMask(
     const glm::vec3& position,
     const glm::vec3& pointNormal) {
     SeepageFanSample sample;
+    sample.surfaceNormal = node.surfaceNormal;
+    sample.downTangent = node.downAxis;
     const glm::vec3 relative = position - node.position;
     sample.downDistance = glm::dot(relative, node.downAxis);
     sample.signedLateralDistance = glm::dot(relative, node.lateralAxis);
@@ -3589,8 +3761,12 @@ SeepageFanSample EvaluatePlanarSeepageFanMask(
     const float depthDistance = std::abs(glm::dot(relative, node.surfaceNormal));
     const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
     const float rainGain = SeepageRainGain(node);
-    const float effectiveReach = node.reachMeters * (1.0F + 0.25F * rainGain);
-    const float effectiveEndHalfWidth = node.endHalfWidthMeters * (1.0F + 0.20F * rainGain);
+    const float scenarioReachScale = 1.0F + 0.50F * Clamp01(node.scenarioSpread);
+    const float scenarioWidthScale = 1.0F + 0.35F * Clamp01(node.scenarioSpread);
+    const float effectiveReach =
+        node.reachMeters * scenarioReachScale * (1.0F + 0.25F * rainGain);
+    const float effectiveEndHalfWidth =
+        node.endHalfWidthMeters * scenarioWidthScale * (1.0F + 0.20F * rainGain);
     if (sample.downDistance < -feather ||
         sample.downDistance > effectiveReach + feather ||
         depthDistance > node.depthToleranceMeters + feather) {
@@ -3679,6 +3855,7 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
         return sample;
     }
     const glm::vec3 tangent = segment / segmentLength;
+    sample.downTangent = tangent;
     const glm::vec3 center = start + segment * closestAmount;
     float stationAmount = closestAmount;
     if ((closestSegment == 0U && closestRawAmount < 0.0F) ||
@@ -3701,6 +3878,7 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
     } else {
         surfaceNormal = glm::normalize(surfaceNormal);
     }
+    sample.surfaceNormal = surfaceNormal;
     glm::vec3 lateral = glm::cross(surfaceNormal, tangent);
     if (!IsValidPoint(lateral) || glm::dot(lateral, lateral) <= kNormalEpsilon) {
         lateral = node.lateralAxis;
@@ -3716,9 +3894,11 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
     sample.lateralDistance = std::abs(sample.signedLateralDistance);
     const float depthDistance = std::abs(glm::dot(relative, surfaceNormal));
     const float rainGain = SeepageRainGain(node);
+    const float scenarioReachScale = 1.0F + 0.50F * Clamp01(node.scenarioSpread);
+    const float scenarioWidthScale = 1.0F + 0.35F * Clamp01(node.scenarioSpread);
     const float authoredReach = std::max(
         1.0e-5F,
-        node.reachMeters * (1.0F + 0.25F * rainGain));
+        node.reachMeters * scenarioReachScale * (1.0F + 0.25F * rainGain));
     const float lastStation = node.guideSamples[node.guideSampleCount - 1U].station;
     const float supportedReach = std::min({
         authoredReach,
@@ -3734,7 +3914,7 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
 
     const float progress = Clamp01(sample.downDistance / authoredReach);
     const float effectiveEndHalfWidth =
-        node.endHalfWidthMeters * (1.0F + 0.20F * rainGain);
+        node.endHalfWidthMeters * scenarioWidthScale * (1.0F + 0.20F * rainGain);
     const float halfWidth = std::lerp(
         node.startHalfWidthMeters,
         effectiveEndHalfWidth,
@@ -3786,6 +3966,238 @@ SeepageFanSample EvaluateSeepageFanMask(
         resolvedNormal = glm::normalize(resolvedNormal);
     }
     return EvaluatePlanarSeepageFanMask(node, position, resolvedNormal);
+}
+
+struct SeepagePatternSignals {
+    float damp = 0.0F;
+    float variation = 0.0F;
+    float glint = 0.0F;
+};
+
+glm::vec3 SeepageEnvironmentDirection(const WaterSeepageLookSettings& look);
+
+glm::vec3 ResolveSeepagePatternNormal(
+    const glm::vec3& pointNormal,
+    const SeepageFanSample& fan) {
+    if (IsValidPoint(pointNormal) && glm::dot(pointNormal, pointNormal) > kNormalEpsilon) {
+        return glm::normalize(pointNormal);
+    }
+    return SafeSeepageNormal(FromGlm(fan.surfaceNormal));
+}
+
+glm::vec3 ResolveSeepageViewDirection(
+    const glm::vec3& position,
+    const glm::vec3& environmentDirection,
+    const WaterSeepageViewContext& viewContext) {
+    if (viewContext.hasCameraPosition) {
+        const glm::vec3 view = ToGlm(viewContext.cameraPosition) - position;
+        if (IsValidPoint(view) && glm::dot(view, view) > kNormalEpsilon) {
+            return glm::normalize(view);
+        }
+    }
+    return -SafeSeepageNormal(FromGlm(environmentDirection));
+}
+
+float SeepageReflectionSignal(
+    const WaterSeepageLookSettings& look,
+    const glm::vec3& position,
+    const glm::vec3& baseNormal,
+    const glm::vec3& microGradient,
+    const glm::vec3& environmentDirection,
+    const WaterSeepageViewContext& viewContext,
+    float sparseGate) {
+    glm::vec3 tangentGradient = microGradient - baseNormal * glm::dot(microGradient, baseNormal);
+    const float tangentLength = glm::length(tangentGradient);
+    if (tangentLength > 1.0e-5F) {
+        tangentGradient /= tangentLength;
+    } else {
+        tangentGradient = glm::vec3{0.0F};
+    }
+    const glm::vec3 microNormal = glm::normalize(
+        baseNormal + tangentGradient * (look.microNormalStrength * 0.42F));
+    const glm::vec3 viewDirection = ResolveSeepageViewDirection(
+        position,
+        environmentDirection,
+        viewContext);
+    glm::vec3 halfVector = viewDirection + environmentDirection;
+    if (glm::dot(halfVector, halfVector) <= kNormalEpsilon) {
+        halfVector = environmentDirection;
+    }
+    halfVector = glm::normalize(halfVector);
+    const float roughness = std::clamp(look.roughness, 0.02F, 1.0F);
+    const float exponent = 2.0F + (1.0F - roughness) * (1.0F - roughness) * 126.0F;
+    const float specular = std::pow(
+        std::max(0.0F, glm::dot(microNormal, halfVector)),
+        exponent);
+    const float fresnel = std::pow(
+        Clamp01(1.0F - std::abs(glm::dot(microNormal, viewDirection))),
+        5.0F);
+    const float angleResponse = Clamp01(look.angleResponse);
+    return Clamp01(
+        specular * (0.35F + angleResponse * 1.15F) * (0.28F + sparseGate * 0.72F) +
+        fresnel * (0.08F + angleResponse * 0.32F));
+}
+
+SeepagePatternSignals EvaluateLegacySeepageSignals(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look,
+    const SeepageFanSample& fan,
+    float timeSeconds) {
+    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
+    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
+    const float density = Clamp01(look.density + 0.25F * rainGain);
+    const float wavelength = std::max(0.002F, look.wavelengthMeters);
+    const float spatialScale = std::clamp(look.patternScale, 0.05F, 100.0F) / wavelength;
+    const glm::vec2 noiseCoordinate{
+        fan.signedLateralDistance * spatialScale + look.warp * fan.downDistance,
+        fan.downDistance * spatialScale,
+    };
+    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
+    const float noise = SeepageFractalNoise(
+        noiseCoordinate * (0.42F + look.turbulence * 0.38F),
+        proceduralSeed,
+        node.resolvedQuality);
+    const float coverage = SmoothStep(1.0F - density - 0.12F, 1.0F - density + 0.12F, noise);
+    const float phase =
+        fan.downDistance * spatialScale + look.phase - std::max(0.0F, timeSeconds) * look.speed +
+        (noise - 0.5F) * look.warp;
+    const float rippleWave = 0.5F + 0.5F * std::sin(kSeepageTwoPi * phase);
+    const float ripplePeak = std::pow(
+        Clamp01(rippleWave),
+        node.resolvedQuality == WaterSeepageQuality::Low ? 2.0F : 3.5F);
+    const float glintWave = 0.5F + 0.5F * std::sin(
+        kSeepageTwoPi *
+        (phase * 1.73F + fan.signedLateralDistance * spatialScale * 0.37F + noise * 0.61F));
+    const float glintPeak = std::pow(
+        Clamp01(glintWave),
+        node.resolvedQuality == WaterSeepageQuality::High ? 7.0F : 5.0F);
+    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    return {
+        .damp = Clamp01(
+            strengthMask *
+            (wetness * (0.72F + noise * 0.28F) + coverage * (0.10F + rainGain * 0.12F))),
+        .variation = Clamp01(
+            strengthMask * coverage * ripplePeak * (0.30F + Clamp01(look.turbulence) * 0.70F)),
+        .glint = Clamp01(strengthMask * coverage * look.glisten * glintPeak),
+    };
+}
+
+SeepagePatternSignals EvaluateWetRockSeepageSignals(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look,
+    const SeepageFanSample& fan,
+    const glm::vec3& position,
+    const glm::vec3& pointNormal,
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext) {
+    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
+    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
+    const float density = Clamp01(look.density + 0.25F * rainGain);
+    const float featureSize = std::max(0.005F, look.featureSizeMeters);
+    const float time = std::max(0.0F, timeSeconds) * look.evolution;
+    glm::vec3 coordinate = node.noiseRotation * (position / featureSize);
+    coordinate += glm::vec3{0.071F, -0.053F, 0.037F} * time;
+    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
+    const auto noise = SeepageFractalNoise3(coordinate, proceduralSeed, node.resolvedQuality);
+    const float feather = std::lerp(0.24F, 0.035F, look.contrast);
+    const float threshold = 1.0F - density;
+    const float patch = SmoothStep(threshold - feather, threshold + feather, noise.value);
+    float sparseGate = noise.value;
+    if (node.resolvedQuality != WaterSeepageQuality::Low) {
+        sparseGate = SeepageSimplexNoise3(
+            coordinate * 3.73F + glm::vec3{13.0F, -7.0F, 19.0F},
+            proceduralSeed + 4099U).value;
+    }
+    sparseGate = SmoothStep(0.92F - look.glintDensity * 0.62F, 0.98F, sparseGate);
+    const glm::vec3 baseNormal = ResolveSeepagePatternNormal(pointNormal, fan);
+    const glm::vec3 environmentDirection = SeepageEnvironmentDirection(look);
+    const glm::vec3 worldGradient = glm::transpose(node.noiseRotation) * noise.gradient;
+    const float reflection = SeepageReflectionSignal(
+        look,
+        position,
+        baseNormal,
+        worldGradient,
+        environmentDirection,
+        viewContext,
+        sparseGate);
+    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    return {
+        .damp = Clamp01(strengthMask * wetness * (0.68F + noise.value * 0.22F + patch * 0.20F)),
+        .variation = Clamp01(strengthMask * patch * (0.08F + noise.value * 0.14F)),
+        .glint = Clamp01(strengthMask * patch * look.glisten * reflection),
+    };
+}
+
+SeepagePatternSignals EvaluateChaoticBloomSeepageSignals(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look,
+    const SeepageFanSample& fan,
+    const glm::vec3& position,
+    const glm::vec3& pointNormal,
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext) {
+    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
+    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
+    const float density = Clamp01(look.density + 0.25F * rainGain);
+    const float featureSize = std::max(0.005F, look.featureSizeMeters);
+    const float time = std::max(0.0F, timeSeconds);
+    const glm::vec3 advectedPosition =
+        position - fan.downTangent * (time * look.downhillDriftMetersPerSecond);
+    glm::vec3 coordinate = node.noiseRotation * (advectedPosition / featureSize);
+    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
+    const auto warpNoise = SeepageFractalNoise3(
+        coordinate * 0.53F + glm::vec3{0.031F, -0.047F, 0.023F} * (time * look.evolution),
+        proceduralSeed + 2053U,
+        node.resolvedQuality);
+    coordinate += warpNoise.gradient * (look.curl * 0.22F);
+    coordinate += glm::vec3{-0.029F, 0.041F, 0.017F} * (time * look.evolution);
+    const auto bodyNoise = SeepageFractalNoise3(coordinate, proceduralSeed, node.resolvedQuality);
+    const float ridge = 1.0F - std::abs(bodyNoise.value * 2.0F - 1.0F);
+    const float organic = Clamp01(ridge * 0.68F + bodyNoise.value * 0.32F);
+    const float threshold = 0.76F - density * 0.48F + look.breakup * 0.16F;
+    const float bloom = SmoothStep(threshold, threshold + 0.18F, organic);
+    const float sparseGate = SmoothStep(
+        0.90F - look.glintDensity * 0.58F,
+        0.98F,
+        warpNoise.value);
+    const glm::vec3 baseNormal = ResolveSeepagePatternNormal(pointNormal, fan);
+    const glm::vec3 environmentDirection = SeepageEnvironmentDirection(look);
+    const glm::vec3 worldGradient = glm::transpose(node.noiseRotation) * bodyNoise.gradient;
+    const float reflection = SeepageReflectionSignal(
+        look,
+        position,
+        baseNormal,
+        worldGradient,
+        environmentDirection,
+        viewContext,
+        sparseGate);
+    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    return {
+        .damp = Clamp01(
+            strengthMask *
+            (wetness * (0.60F + bodyNoise.value * 0.22F) + bloom * (0.16F + rainGain * 0.14F))),
+        .variation = Clamp01(strengthMask * bloom * (0.18F + organic * 0.42F)),
+        .glint = Clamp01(strengthMask * bloom * look.glisten * reflection),
+    };
+}
+
+WaterSeepageLookSettings SelectSeepageTransitionLook(
+    const WaterSeepageRuntimeNode& node,
+    const glm::vec3& position) {
+    if (!node.transitionLook.has_value() || node.transitionAmount <= 1.0e-6F) {
+        return node.look;
+    }
+    if (node.transitionAmount >= 1.0F - 1.0e-6F) {
+        return node.transitionLook.value();
+    }
+    const float cellSize = std::max(0.005F, std::min(
+        node.look.featureSizeMeters,
+        node.transitionLook->featureSizeMeters) * 0.18F);
+    const glm::ivec3 coordinate = glm::ivec3(glm::floor(position / cellSize));
+    const float selector = static_cast<float>(
+        SeepageHash3(coordinate, node.seed ^ node.id) & 0x00ffffffU) /
+        static_cast<float>(0x01000000U);
+    return selector < node.transitionAmount ? node.transitionLook.value() : node.look;
 }
 
 void BlendSeepageContribution(
@@ -3896,10 +4308,237 @@ std::string SeepageFingerprintString(std::uint64_t hash) {
     return stream.str();
 }
 
+float LerpSeepageAngle(float left, float right, float amount) {
+    const float delta = std::remainder(right - left, 360.0F);
+    return std::remainder(left + delta * amount, 360.0F);
+}
+
+WaterEffectResponseSettings LerpSeepageResponse(
+    const WaterEffectResponseSettings& left,
+    const WaterEffectResponseSettings& right,
+    float amount) {
+    WaterEffectResponseSettings result;
+    result.intensity = std::lerp(left.intensity, right.intensity, amount);
+    result.emissionAdd = std::lerp(left.emissionAdd, right.emissionAdd, amount);
+    result.opacityAdd = std::lerp(left.opacityAdd, right.opacityAdd, amount);
+    result.opacityMultiply = std::lerp(left.opacityMultiply, right.opacityMultiply, amount);
+    result.pointSizeAdd = std::lerp(left.pointSizeAdd, right.pointSizeAdd, amount);
+    result.pointSizeMultiply = std::lerp(left.pointSizeMultiply, right.pointSizeMultiply, amount);
+    result.hueShift = std::lerp(left.hueShift, right.hueShift, amount);
+    result.colouriseRed = std::lerp(left.colouriseRed, right.colouriseRed, amount);
+    result.colouriseGreen = std::lerp(left.colouriseGreen, right.colouriseGreen, amount);
+    result.colouriseBlue = std::lerp(left.colouriseBlue, right.colouriseBlue, amount);
+    result.colouriseAmount = std::lerp(left.colouriseAmount, right.colouriseAmount, amount);
+    result.gaussianSharpnessBias = std::lerp(
+        left.gaussianSharpnessBias,
+        right.gaussianSharpnessBias,
+        amount);
+    return result;
+}
+
+WaterSeepageLookSettings LerpSeepageLook(
+    const WaterSeepageLookSettings& left,
+    const WaterSeepageLookSettings& right,
+    float amount) {
+    amount = Clamp01(amount);
+    WaterSeepageLookSettings result = left;
+    result.quality = amount < 0.5F ? left.quality : right.quality;
+    result.pattern = left.pattern;
+    result.baseWetness = std::lerp(left.baseWetness, right.baseWetness, amount);
+    result.density = std::lerp(left.density, right.density, amount);
+    result.glisten = std::lerp(left.glisten, right.glisten, amount);
+    result.wavelengthMeters = std::lerp(left.wavelengthMeters, right.wavelengthMeters, amount);
+    result.patternScale = std::lerp(left.patternScale, right.patternScale, amount);
+    result.speed = std::lerp(left.speed, right.speed, amount);
+    result.warp = std::lerp(left.warp, right.warp, amount);
+    result.turbulence = std::lerp(left.turbulence, right.turbulence, amount);
+    result.phase = std::lerp(left.phase, right.phase, amount);
+    result.rainResponse = std::lerp(left.rainResponse, right.rainResponse, amount);
+    result.featureSizeMeters = std::lerp(left.featureSizeMeters, right.featureSizeMeters, amount);
+    result.contrast = std::lerp(left.contrast, right.contrast, amount);
+    result.evolution = std::lerp(left.evolution, right.evolution, amount);
+    result.roughness = std::lerp(left.roughness, right.roughness, amount);
+    result.angleResponse = std::lerp(left.angleResponse, right.angleResponse, amount);
+    result.microNormalStrength = std::lerp(
+        left.microNormalStrength,
+        right.microNormalStrength,
+        amount);
+    result.glintDensity = std::lerp(left.glintDensity, right.glintDensity, amount);
+    result.environmentAzimuthDegrees = LerpSeepageAngle(
+        left.environmentAzimuthDegrees,
+        right.environmentAzimuthDegrees,
+        amount);
+    result.environmentElevationDegrees = std::lerp(
+        left.environmentElevationDegrees,
+        right.environmentElevationDegrees,
+        amount);
+    result.curl = std::lerp(left.curl, right.curl, amount);
+    result.breakup = std::lerp(left.breakup, right.breakup, amount);
+    result.downhillDriftMetersPerSecond = std::lerp(
+        left.downhillDriftMetersPerSecond,
+        right.downhillDriftMetersPerSecond,
+        amount);
+    result.response = LerpSeepageResponse(left.response, right.response, amount);
+    result.blendMode = amount < 0.5F ? left.blendMode : right.blendMode;
+    return SanitizeSeepageLook(result);
+}
+
+glm::mat3 SeepageNoiseRotation(std::uint32_t seed) {
+    const float yaw = SeepageHash01(17, 29, seed ^ 0x45d9f3bU) * kSeepageTwoPi;
+    const float pitch = (SeepageHash01(31, 47, seed ^ 0x119de1f3U) - 0.5F) * 1.20F;
+    const glm::vec3 forward = glm::normalize(glm::vec3{
+        std::cos(yaw) * std::cos(pitch),
+        std::sin(yaw) * std::cos(pitch),
+        std::sin(pitch),
+    });
+    const glm::vec3 helper = std::abs(forward.z) < 0.92F
+                                 ? glm::vec3{0.0F, 0.0F, 1.0F}
+                                 : glm::vec3{0.0F, 1.0F, 0.0F};
+    const glm::vec3 right = glm::normalize(glm::cross(helper, forward));
+    const glm::vec3 up = glm::normalize(glm::cross(forward, right));
+    return glm::mat3{right, up, forward};
+}
+
+glm::vec3 SeepageEnvironmentDirection(const WaterSeepageLookSettings& look) {
+    constexpr float degreesToRadians = kSeepageTwoPi / 360.0F;
+    const float azimuth = look.environmentAzimuthDegrees * degreesToRadians;
+    const float elevation = look.environmentElevationDegrees * degreesToRadians;
+    return glm::normalize(glm::vec3{
+        std::cos(elevation) * std::cos(azimuth),
+        std::cos(elevation) * std::sin(azimuth),
+        std::sin(elevation),
+    });
+}
+
 }  // namespace
 
 WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
     return {};
+}
+
+std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
+    WaterScenarioDefinition historical;
+    historical.id = "pre-colonisation-wet";
+    historical.name = "Pre-Colonisation Wet";
+    historical.state.seepageLook = DefaultWaterSeepageLookSettings();
+    historical.state.seepageLook.pattern = WaterSeepagePattern::ChaoticBloom;
+    historical.state.seepageLook.baseWetness = 0.52F;
+    historical.state.seepageLook.density = 0.55F;
+    historical.state.seepageLook.glisten = 0.62F;
+    historical.state.seepageLook.featureSizeMeters = 0.20F;
+    historical.state.seepageLook.evolution = 0.08F;
+    historical.state.seepageLook.rainResponse = 0.90F;
+    historical.state.seepageLook.response.intensity = 0.90F;
+    historical.state.seepageLevel = 1.0F;
+    historical.state.seepageSpread = 0.60F;
+    historical.state.rainLevel = 0.0F;
+
+    WaterScenarioDefinition contemporary;
+    contemporary.id = "contemporary-managed";
+    contemporary.name = "Contemporary Managed";
+    contemporary.state.seepageLook = historical.state.seepageLook;
+    contemporary.state.seepageLook.baseWetness = 0.20F;
+    contemporary.state.seepageLook.density = 0.28F;
+    contemporary.state.seepageLook.glisten = 0.32F;
+    contemporary.state.seepageLook.evolution = 0.02F;
+    contemporary.state.seepageLook.rainResponse = 0.18F;
+    contemporary.state.seepageLook.response.intensity = 0.55F;
+    contemporary.state.seepageLevel = 0.50F;
+    contemporary.state.seepageSpread = 0.10F;
+    contemporary.state.rainLevel = 0.0F;
+    return {historical, contemporary};
+}
+
+WaterScenarioState EvaluateWaterScenarioTrack(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float normalizedPosition) {
+    WaterScenarioState result = definition.state;
+    result.transitionLook.reset();
+    result.transitionAmount = 0.0F;
+    if (track.keys.empty()) {
+        return result;
+    }
+    normalizedPosition = Clamp01(normalizedPosition);
+    std::vector<const WaterScenarioKey*> ordered;
+    ordered.reserve(track.keys.size());
+    for (const auto& key : track.keys) {
+        ordered.push_back(&key);
+    }
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const WaterScenarioKey* left, const WaterScenarioKey* right) {
+            return left->position < right->position;
+        });
+    if (normalizedPosition <= ordered.front()->position) {
+        return ordered.front()->state;
+    }
+    if (normalizedPosition >= ordered.back()->position) {
+        return ordered.back()->state;
+    }
+    for (std::size_t index = 0U; index + 1U < ordered.size(); ++index) {
+        const auto& left = *ordered[index];
+        const auto& right = *ordered[index + 1U];
+        if (normalizedPosition > right.position) {
+            continue;
+        }
+        const float span = std::max(1.0e-6F, right.position - left.position);
+        float amount = Clamp01((normalizedPosition - left.position) / span);
+        if (left.interpolation == WaterScenarioInterpolation::Hold) {
+            return left.state;
+        }
+        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+            amount = amount * amount * (3.0F - 2.0F * amount);
+        }
+        result.seepageLevel = std::lerp(left.state.seepageLevel, right.state.seepageLevel, amount);
+        result.seepageSpread = std::lerp(left.state.seepageSpread, right.state.seepageSpread, amount);
+        result.rainLevel = std::lerp(left.state.rainLevel, right.state.rainLevel, amount);
+        if (left.state.seepageLook.pattern == right.state.seepageLook.pattern) {
+            result.seepageLook = LerpSeepageLook(
+                left.state.seepageLook,
+                right.state.seepageLook,
+                amount);
+        } else {
+            result.seepageLook = SanitizeSeepageLook(left.state.seepageLook);
+            result.transitionLook = SanitizeSeepageLook(right.state.seepageLook);
+            result.transitionAmount = amount;
+        }
+        return result;
+    }
+    return ordered.back()->state;
+}
+
+void AddOrUpdateWaterScenarioKey(
+    WaterScenarioTrack* track,
+    WaterScenarioKey key,
+    float replacementTolerance) {
+    if (track == nullptr) {
+        return;
+    }
+    key.position = Clamp01(key.position);
+    replacementTolerance = std::max(0.0F, replacementTolerance);
+    const auto existing = std::find_if(
+        track->keys.begin(),
+        track->keys.end(),
+        [&](const WaterScenarioKey& candidate) {
+            return std::abs(candidate.position - key.position) <= replacementTolerance;
+        });
+    if (existing != track->keys.end()) {
+        const auto preservedId = existing->id;
+        *existing = std::move(key);
+        if (existing->id.empty()) {
+            existing->id = preservedId;
+        }
+    } else {
+        track->keys.push_back(std::move(key));
+    }
+    std::stable_sort(
+        track->keys.begin(),
+        track->keys.end(),
+        [](const WaterScenarioKey& left, const WaterScenarioKey& right) {
+            return left.position < right.position;
+        });
 }
 
 WaterSeepageQuality ResolveWaterSeepageQuality(
@@ -4001,7 +4640,8 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     bool forExport,
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
-    std::span<const WaterSeepageSurfaceGuide> guides) {
+    std::span<const WaterSeepageSurfaceGuide> guides,
+    const std::optional<WaterScenarioState>& scenarioState) {
     WaterSeepageSpatialGrid grid;
     grid.diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
         nodes.size(),
@@ -4013,7 +4653,10 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
         if (!enabled || !SeepageNodeTargetsRole(node, targetSceneRole) || !IsValidPoint(ToGlm(node.position))) {
             continue;
         }
-        auto look = ResolveWaterSeepageLook(node, profiles, defaultLook);
+        const auto authoredLook = ResolveWaterSeepageLook(node, profiles, defaultLook);
+        auto look = scenarioState.has_value()
+                        ? SanitizeSeepageLook(scenarioState->seepageLook)
+                        : authoredLook;
         const auto resolvedQuality = ResolveWaterSeepageQuality(look.quality, effectivePointInvocations);
         look.quality = resolvedQuality;
         WaterSeepageRuntimeNode runtime;
@@ -4039,6 +4682,8 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             runtime.lateralAxis = glm::cross(runtime.surfaceNormal, helper);
         }
         runtime.lateralAxis = glm::normalize(runtime.lateralAxis);
+        runtime.noiseRotation = SeepageNoiseRotation(node.seed ^ (node.id * 0x9e3779b9U));
+        runtime.environmentDirection = SeepageEnvironmentDirection(look);
         runtime.reachMeters = std::clamp(
             SeepageFiniteOr(node.reachMeters, 1.25F),
             0.001F,
@@ -4063,23 +4708,40 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             SeepageFiniteOr(node.normalAlignment, 0.20F),
             0.0F,
             1.0F);
-        runtime.strength = std::clamp(SeepageFiniteOr(node.strength, 1.0F), 0.0F, 8.0F);
-        runtime.rainVisualStrength = rainSettings.enabled
-                                         ? WaterRainPresetVisualStrength(rainSettings.intensityPreset)
-                                         : 0.0F;
+        runtime.authoredStrength = std::clamp(
+            SeepageFiniteOr(node.strength, 1.0F),
+            0.0F,
+            8.0F);
+        const float scenarioLevel = scenarioState.has_value()
+                                        ? std::clamp(scenarioState->seepageLevel, 0.0F, 1.0F)
+                                        : 1.0F;
+        runtime.strength = runtime.authoredStrength * scenarioLevel;
+        runtime.scenarioSpread = scenarioState.has_value()
+                                     ? std::clamp(scenarioState->seepageSpread, 0.0F, 1.0F)
+                                     : 0.0F;
+        runtime.rainVisualStrength = scenarioState.has_value()
+                                         ? std::clamp(scenarioState->rainLevel, 0.0F, 1.0F)
+                                         : (rainSettings.enabled
+                                                ? WaterRainPresetVisualStrength(rainSettings.intensityPreset)
+                                                : 0.0F);
         runtime.resolvedQuality = resolvedQuality;
+        runtime.authoredLook = authoredLook;
         runtime.look = look;
+        if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
+            runtime.transitionLook = SanitizeSeepageLook(scenarioState->transitionLook.value());
+            runtime.transitionAmount = std::clamp(scenarioState->transitionAmount, 0.0F, 1.0F);
+        }
         CopyWaterSeepageSurfaceGuide(
             FindWaterSeepageSurfaceGuide(guides, node.id),
             &runtime);
         largestSpan = std::max(
             largestSpan,
             std::max(
-                runtime.reachMeters * kSeepageMaximumRainReachScale +
+                runtime.reachMeters * kSeepageMaximumReachScale +
                     runtime.edgeFeatherMeters * 2.0F,
                 std::max(
                     runtime.startHalfWidthMeters,
-                    runtime.endHalfWidthMeters * kSeepageMaximumRainWidthScale) * 2.0F +
+                    runtime.endHalfWidthMeters * kSeepageMaximumWidthScale) * 2.0F +
                     runtime.edgeFeatherMeters * 2.0F));
         const auto nodeBounds = SeepageRuntimeNodeBounds(runtime);
         if (nodeBounds.valid) {
@@ -4198,11 +4860,55 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     return grid;
 }
 
+void ApplyWaterSeepageScenarioParameters(
+    WaterSeepageSpatialGrid* grid,
+    const std::optional<WaterScenarioState>& scenarioState,
+    const WaterRainSettings& rainSettings,
+    std::uint64_t effectivePointInvocations) {
+    if (grid == nullptr) {
+        return;
+    }
+    for (auto& node : grid->nodes) {
+        node.look = scenarioState.has_value()
+                        ? SanitizeSeepageLook(scenarioState->seepageLook)
+                        : SanitizeSeepageLook(node.authoredLook);
+        node.resolvedQuality = ResolveWaterSeepageQuality(
+            node.look.quality,
+            effectivePointInvocations);
+        node.look.quality = node.resolvedQuality;
+        node.environmentDirection = SeepageEnvironmentDirection(node.look);
+        node.strength = node.authoredStrength *
+                        (scenarioState.has_value()
+                             ? Clamp01(scenarioState->seepageLevel)
+                             : 1.0F);
+        node.scenarioSpread = scenarioState.has_value()
+                                  ? Clamp01(scenarioState->seepageSpread)
+                                  : 0.0F;
+        node.rainVisualStrength = scenarioState.has_value()
+                                      ? Clamp01(scenarioState->rainLevel)
+                                      : (rainSettings.enabled
+                                             ? WaterRainPresetVisualStrength(
+                                                   rainSettings.intensityPreset)
+                                             : 0.0F);
+        node.transitionLook.reset();
+        node.transitionAmount = 0.0F;
+        if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
+            node.transitionLook = SanitizeSeepageLook(
+                scenarioState->transitionLook.value());
+            node.transitionLook->quality = ResolveWaterSeepageQuality(
+                node.transitionLook->quality,
+                effectivePointInvocations);
+            node.transitionAmount = Clamp01(scenarioState->transitionAmount);
+        }
+    }
+}
+
 WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     const WaterSeepageRuntimeNode& node,
     const invisible_places::io::Float3& position,
     const invisible_places::io::Float3& normal,
-    float timeSeconds) {
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext) {
     WaterSeepageRuntimeContribution contribution;
     if (!IsValidPoint(ToGlm(position)) || node.reachMeters <= 0.0F || node.strength <= 0.0F) {
         return contribution;
@@ -4218,48 +4924,41 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
         return contribution;
     }
 
-    const auto look = SanitizeSeepageLook(node.look);
-    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
-    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
-    const float density = Clamp01(look.density + 0.25F * rainGain);
-    const float glisten = look.glisten;
-    const float wavelength = std::max(0.002F, look.wavelengthMeters);
-    const float spatialScale = std::clamp(look.patternScale, 0.05F, 100.0F) / wavelength;
-    const float signedLateral = fan.signedLateralDistance;
-    const glm::vec2 noiseCoordinate{
-        signedLateral * spatialScale + look.warp * fan.downDistance,
-        fan.downDistance * spatialScale,
-    };
-    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
-    const float noise = SeepageFractalNoise(
-        noiseCoordinate * (0.42F + look.turbulence * 0.38F),
-        proceduralSeed,
-        node.resolvedQuality);
-    const float coverage = SmoothStep(1.0F - density - 0.12F, 1.0F - density + 0.12F, noise);
-    const float time = std::max(0.0F, timeSeconds);
-    const float phase =
-        (fan.downDistance * spatialScale) +
-        look.phase -
-        time * look.speed +
-        (noise - 0.5F) * look.warp;
-    const float rippleWave = 0.5F + 0.5F * std::sin(kSeepageTwoPi * phase);
-    const float ripplePeak = std::pow(
-        Clamp01(rippleWave),
-        node.resolvedQuality == WaterSeepageQuality::Low ? 2.0F : 3.5F);
-    const float glintWave = 0.5F + 0.5F * std::sin(
-        kSeepageTwoPi *
-        (phase * 1.73F + signedLateral * spatialScale * 0.37F + noise * 0.61F));
-    const float glintPeak = std::pow(
-        Clamp01(glintWave),
-        node.resolvedQuality == WaterSeepageQuality::High ? 7.0F : 5.0F);
-    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    auto look = SanitizeSeepageLook(SelectSeepageTransitionLook(node, ToGlm(position)));
+    if (look.quality == WaterSeepageQuality::Auto) {
+        look.quality = node.resolvedQuality;
+    }
+    SeepagePatternSignals signals;
+    switch (look.pattern) {
+        case WaterSeepagePattern::WetRockSheen:
+            signals = EvaluateWetRockSeepageSignals(
+                node,
+                look,
+                fan,
+                ToGlm(position),
+                pointNormal,
+                timeSeconds,
+                viewContext);
+            break;
+        case WaterSeepagePattern::ChaoticBloom:
+            signals = EvaluateChaoticBloomSeepageSignals(
+                node,
+                look,
+                fan,
+                ToGlm(position),
+                pointNormal,
+                timeSeconds,
+                viewContext);
+            break;
+        case WaterSeepagePattern::LegacyRipples:
+            signals = EvaluateLegacySeepageSignals(node, look, fan, timeSeconds);
+            break;
+    }
     contribution.mask = fan.mask;
-    contribution.damp = Clamp01(
-        strengthMask *
-        (wetness * (0.72F + noise * 0.28F) + coverage * (0.10F + rainGain * 0.12F)));
-    contribution.ripple = Clamp01(
-        strengthMask * coverage * ripplePeak * (0.30F + Clamp01(look.turbulence) * 0.70F));
-    contribution.glint = Clamp01(strengthMask * coverage * glisten * glintPeak);
+    contribution.damp = signals.damp;
+    contribution.ripple = signals.variation;
+    contribution.glint = signals.glint;
+    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
     const float rainProminence = 1.0F + 0.65F * rainGain;
     contribution.scale = Clamp01(
         (contribution.damp * 0.58F + contribution.ripple * 0.34F + contribution.glint * 0.46F) *
@@ -4288,7 +4987,8 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
     const WaterSeepageSpatialGrid& grid,
     const invisible_places::io::Float3& position,
     const invisible_places::io::Float3& normal,
-    float timeSeconds) {
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext) {
     WaterSeepageRuntimeContribution result;
     if (grid.nodes.empty() ||
         grid.hashCells.empty() ||
@@ -4314,7 +5014,8 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
             grid.nodes[nodeIndex],
             position,
             normal,
-            timeSeconds);
+            timeSeconds,
+            viewContext);
         BlendSeepageContribution(&result, contribution, grid.nodes[nodeIndex].look.blendMode);
     }
     return result;
@@ -4385,16 +5086,9 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
 
 std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 1U);
-    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.nodes.size()));
-    for (const auto& node : grid.nodes) {
-        SeepageFingerprintU32(&hash, node.id);
-        SeepageFingerprintU32(&hash, node.seed);
-        SeepageFingerprintFloat(&hash, node.normalAlignment);
-        SeepageFingerprintFloat(&hash, node.strength);
-        SeepageFingerprintFloat(&hash, node.rainVisualStrength);
-        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(node.resolvedQuality));
-        const auto& look = node.look;
+    SeepageFingerprintU32(&hash, 2U);
+    const auto fingerprintLook = [&](const WaterSeepageLookSettings& look) {
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.pattern));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
         SeepageFingerprintFloat(&hash, look.baseWetness);
         SeepageFingerprintFloat(&hash, look.density);
@@ -4405,6 +5099,18 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, look.warp);
         SeepageFingerprintFloat(&hash, look.turbulence);
         SeepageFingerprintFloat(&hash, look.phase);
+        SeepageFingerprintFloat(&hash, look.featureSizeMeters);
+        SeepageFingerprintFloat(&hash, look.contrast);
+        SeepageFingerprintFloat(&hash, look.evolution);
+        SeepageFingerprintFloat(&hash, look.roughness);
+        SeepageFingerprintFloat(&hash, look.angleResponse);
+        SeepageFingerprintFloat(&hash, look.microNormalStrength);
+        SeepageFingerprintFloat(&hash, look.glintDensity);
+        SeepageFingerprintFloat(&hash, look.environmentAzimuthDegrees);
+        SeepageFingerprintFloat(&hash, look.environmentElevationDegrees);
+        SeepageFingerprintFloat(&hash, look.curl);
+        SeepageFingerprintFloat(&hash, look.breakup);
+        SeepageFingerprintFloat(&hash, look.downhillDriftMetersPerSecond);
         SeepageFingerprintFloat(&hash, look.rainResponse);
         SeepageFingerprintFloat(&hash, look.response.intensity);
         SeepageFingerprintFloat(&hash, look.response.emissionAdd);
@@ -4416,8 +5122,24 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, look.response.colouriseGreen);
         SeepageFingerprintFloat(&hash, look.response.colouriseBlue);
         SeepageFingerprintFloat(&hash, look.response.colouriseAmount);
+    };
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.nodes.size()));
+    for (const auto& node : grid.nodes) {
+        SeepageFingerprintU32(&hash, node.id);
+        SeepageFingerprintU32(&hash, node.seed);
+        SeepageFingerprintFloat(&hash, node.normalAlignment);
+        SeepageFingerprintFloat(&hash, node.strength);
+        SeepageFingerprintFloat(&hash, node.rainVisualStrength);
+        SeepageFingerprintFloat(&hash, node.scenarioSpread);
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(node.resolvedQuality));
+        fingerprintLook(node.look);
+        SeepageFingerprintFloat(&hash, node.transitionAmount);
+        SeepageFingerprintU32(&hash, node.transitionLook.has_value() ? 1U : 0U);
+        if (node.transitionLook.has_value()) {
+            fingerprintLook(node.transitionLook.value());
+        }
     }
-    return "water-seepage-params-v1-" + SeepageFingerprintString(hash);
+    return "water-seepage-params-v2-" + SeepageFingerprintString(hash);
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
@@ -5177,7 +5899,7 @@ WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceGuide(
     guide.requestedReachMeters = std::clamp(
         SeepageFiniteOr(node.reachMeters, 1.25F),
         0.001F,
-        1000.0F) * kSeepageMaximumRainReachScale;
+        1000.0F) * kSeepageMaximumReachScale;
     if (!SeepageGuideGraphSupportsNode(support, node)) {
         return guide;
     }
@@ -5494,7 +6216,7 @@ std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
                       .requestedReachMeters = std::clamp(
                           SeepageFiniteOr(node.reachMeters, 1.25F),
                           0.001F,
-                          1000.0F) * kSeepageMaximumRainReachScale,
+                          1000.0F) * kSeepageMaximumReachScale,
                   }
                 : TraceWaterSeepageSurfaceGuide(node, *selectedSupport));
     }
@@ -5609,7 +6331,12 @@ WaterOverlay BuildWaterPathAnchorsFromCache(
                 point.confidence = std::min(point.confidence, branch.confidence);
             }
         }
-        SmoothWaterPath(&path, sourceSettings.path.smoothing, std::max(0.001F, branch.length));
+        const float smoothing = Clamp01(sourceSettings.path.smoothing);
+        SmoothWaterPath(&path, smoothing, std::max(0.001F, branch.length));
+        if (smoothing > 1.0e-4F && path.size() >= 3U) {
+            path = BuildSplineViewSamples(path, 0.0F);
+            RecomputePathDistances(&path, std::max(0.001F, branch.length));
+        }
         IncludeWaterPathAnchorsOnly(&overlay, std::move(path));
     }
     return overlay;
@@ -7873,6 +8600,23 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
         const auto clampedIndex = std::min(laneIndex, laneCount - 1U);
         return (((static_cast<float>(clampedIndex) + 0.5F) / static_cast<float>(laneCount)) - 0.5F) * span;
     };
+    const auto centeredLaneIndex = [](
+        std::uint32_t trailOrdinal,
+        std::uint32_t laneCount,
+        bool positiveSideFirst) {
+        if (laneCount <= 1U) {
+            return 0U;
+        }
+        const std::uint32_t slot = trailOrdinal % laneCount;
+        const std::uint32_t centerLow = (laneCount - 1U) / 2U;
+        const std::uint32_t canonical =
+            slot == 0U
+                ? centerLow
+                : (slot % 2U == 1U
+                       ? centerLow + ((slot + 1U) / 2U)
+                       : centerLow - (slot / 2U));
+        return positiveSideFirst ? canonical : (laneCount - 1U) - canonical;
+    };
     std::uint32_t trailId = 1U;
 
     for (std::size_t pathIndex = 0; pathIndex < paths.size(); ++pathIndex) {
@@ -7957,15 +8701,12 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
         for (std::uint32_t laneIndex = 0; laneIndex < trailsForPath && trailId <= requestedTrailCount; ++laneIndex, ++trailId) {
             const float trailSeed = RegionHash01(seed + branchId, trailId, 7001U);
             const float laneSeed = RegionHash01(seed + branchId, trailId, 7003U);
-            const std::uint32_t centerLaneLow = (potentialLaneCount - 1U) / 2U;
-            const std::uint32_t centerLaneHigh = potentialLaneCount / 2U;
-            const bool analysedRoute = analysisBranch != nullptr;
-            const std::uint32_t baseLaneIndex =
-                analysedRoute
-                    ? std::min<std::uint32_t>(
-                          potentialLaneCount - 1U,
-                          static_cast<std::uint32_t>(std::floor(laneSeed * static_cast<float>(potentialLaneCount))))
-                    : (laneSeed < 0.5F ? centerLaneLow : centerLaneHigh);
+            const bool positiveSideFirst =
+                RegionHash01(seed + branchId, pathIndex + 1U, 7005U) >= 0.5F;
+            const std::uint32_t baseLaneIndex = centeredLaneIndex(
+                laneIndex,
+                potentialLaneCount,
+                positiveSideFirst);
             const float baseLaneCenter = laneCenter(baseLaneIndex, potentialLaneCount, laneSpan);
             const float baseLaneUnit = laneCenter(baseLaneIndex, potentialLaneCount, 1.0F);
             const float laneCellWidth =
@@ -8795,6 +9536,127 @@ std::string WaterFieldSettingsFingerprint(const WaterFieldSettings& settings) {
     return stream.str();
 }
 
+WaterOverlay BuildManualFlowPathAnchors(
+    const WaterManualFlowPathSource& source,
+    float sampleSpacingMeters) {
+    constexpr float kDuplicateDistance = 1.0e-5F;
+    constexpr std::size_t kMaxSampleCount = 32768U;
+    std::vector<glm::vec3> controls;
+    controls.reserve(source.controlPoints.size());
+    for (const auto& controlPoint : source.controlPoints) {
+        const glm::vec3 point = ToGlm(controlPoint);
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+            continue;
+        }
+        if (controls.empty() || glm::length(point - controls.back()) > kDuplicateDistance) {
+            controls.push_back(point);
+        }
+    }
+    if (controls.size() < 2U) {
+        return {};
+    }
+
+    const float spacing = std::clamp(
+        std::isfinite(sampleSpacingMeters) ? sampleSpacingMeters : 0.025F,
+        0.001F,
+        25.0F);
+    std::vector<glm::vec3> positions;
+    positions.reserve(std::min<std::size_t>(kMaxSampleCount, controls.size() * 16U));
+    positions.push_back(controls.front());
+    for (std::size_t segmentIndex = 0U;
+         segmentIndex + 1U < controls.size() && positions.size() < kMaxSampleCount;
+         ++segmentIndex) {
+        const glm::vec3 p1 = controls[segmentIndex];
+        const glm::vec3 p2 = controls[segmentIndex + 1U];
+        const glm::vec3 p0 = segmentIndex > 0U
+                                 ? controls[segmentIndex - 1U]
+                                 : p1 + (p1 - p2);
+        const glm::vec3 p3 = segmentIndex + 2U < controls.size()
+                                 ? controls[segmentIndex + 2U]
+                                 : p2 + (p2 - p1);
+        const float chordLength = glm::length(p2 - p1);
+        const std::uint32_t subdivisions = std::clamp<std::uint32_t>(
+            static_cast<std::uint32_t>(std::ceil(chordLength / spacing)),
+            controls.size() > 2U ? 4U : 1U,
+            256U);
+        for (std::uint32_t step = 1U;
+             step <= subdivisions && positions.size() < kMaxSampleCount;
+             ++step) {
+            const float t = static_cast<float>(step) / static_cast<float>(subdivisions);
+            const glm::vec3 position = controls.size() > 2U
+                                           ? InterpolateCentripetalCatmullRom(p0, p1, p2, p3, t)
+                                           : glm::mix(p1, p2, t);
+            if (glm::length(position - positions.back()) > kDuplicateDistance) {
+                positions.push_back(position);
+            }
+        }
+    }
+    if (positions.size() < 2U) {
+        return {};
+    }
+
+    std::vector<glm::vec3> tangents(positions.size(), glm::vec3{1.0F, 0.0F, 0.0F});
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        const glm::vec3 previous = positions[index > 0U ? index - 1U : index];
+        const glm::vec3 next = positions[index + 1U < positions.size() ? index + 1U : index];
+        const glm::vec3 difference = next - previous;
+        if (glm::dot(difference, difference) > kNormalEpsilon) {
+            tangents[index] = glm::normalize(difference);
+        } else if (index > 0U) {
+            tangents[index] = tangents[index - 1U];
+        }
+    }
+
+    std::vector<glm::vec3> normals(positions.size(), glm::vec3{0.0F, 0.0F, 1.0F});
+    const auto perpendicularNormal = [](const glm::vec3& tangent, const glm::vec3& preferred) {
+        glm::vec3 normal = preferred - tangent * glm::dot(preferred, tangent);
+        if (glm::dot(normal, normal) <= kNormalEpsilon) {
+            const glm::vec3 fallback = std::abs(tangent.x) < 0.75F
+                                           ? glm::vec3{1.0F, 0.0F, 0.0F}
+                                           : glm::vec3{0.0F, 1.0F, 0.0F};
+            normal = fallback - tangent * glm::dot(fallback, tangent);
+        }
+        return glm::normalize(normal);
+    };
+    normals.front() = perpendicularNormal(tangents.front(), glm::vec3{0.0F, 0.0F, 1.0F});
+    for (std::size_t index = 1U; index < normals.size(); ++index) {
+        normals[index] = perpendicularNormal(tangents[index], normals[index - 1U]);
+        if (glm::dot(normals[index], normals[index - 1U]) < 0.0F) {
+            normals[index] = -normals[index];
+        }
+    }
+
+    WaterOverlay overlay;
+    float distance = 0.0F;
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        if (index > 0U) {
+            distance += glm::length(positions[index] - positions[index - 1U]);
+        }
+        WaterOverlayPoint anchor;
+        anchor.position = FromGlm(positions[index]);
+        anchor.normal = FromGlm(normals[index]);
+        anchor.red = 58U;
+        anchor.green = 221U;
+        anchor.blue = 255U;
+        anchor.flowId = static_cast<float>(source.id);
+        anchor.emitterId = static_cast<float>(source.id);
+        anchor.pathDistance = distance;
+        anchor.phase = std::fmod((distance * 0.37F) + (static_cast<float>(source.id) * 0.173F), 1.0F);
+        anchor.speed = 1.0F;
+        anchor.width = 1.0F;
+        anchor.confidence = 1.0F;
+        anchor.accumulation = 0.0F;
+        anchor.pooling = 0.0F;
+        anchor.particleRole = 0.0F;
+        IncludeOverlayPoint(&overlay, anchor);
+    }
+    const float totalLength = std::max(distance, 1.0e-5F);
+    for (auto& anchor : overlay.points) {
+        anchor.accumulation = Clamp01(anchor.pathDistance / totalLength);
+    }
+    return overlay;
+}
+
 WaterTrailOverlay BuildAnimatedWaterTrailOverlay(
     const std::vector<WaterAnimatedTrailPath>& paths,
     const WaterAnimatedTrailBuildSettings& settings) {
@@ -8907,6 +9769,29 @@ bool RainRoleIsSand(std::string_view role) {
     return role == "SAND" || role == "sand" || role == "Sand";
 }
 
+bool RainRoleIsVegetation(std::string_view role) {
+    return role == "VEG" || role == "veg" || role == "Veg" ||
+           role == "VEGETATION" || role == "vegetation" || role == "Vegetation";
+}
+
+enum class RainSupportRoleQuery {
+    Any,
+    Sand,
+    Vegetation
+};
+
+bool RainSupportSampleMatchesRole(const RainSupportSample& sample, RainSupportRoleQuery role) {
+    switch (role) {
+        case RainSupportRoleQuery::Any:
+            return true;
+        case RainSupportRoleQuery::Sand:
+            return RainRoleIsSand(sample.role);
+        case RainSupportRoleQuery::Vegetation:
+            return RainRoleIsVegetation(sample.role);
+    }
+    return true;
+}
+
 RainSupportIndex BuildRainSupportIndex(
     std::span<const WaterSceneSupportLayer> supportLayers,
     const WaterRainSettings& settings) {
@@ -8941,13 +9826,14 @@ RainSupportIndex BuildRainSupportIndex(
     return index;
 }
 
-std::optional<std::uint32_t> FindRainSupportSample(
+std::optional<std::uint32_t> FindRainSupportRoleSample(
     const RainSupportIndex& index,
     const glm::vec2& xy,
     float radiusMeters,
-    bool requireSand,
+    RainSupportRoleQuery role,
     bool chooseLowest,
-    std::optional<float> maxZ = std::nullopt) {
+    std::optional<float> maxZ = std::nullopt,
+    std::optional<float> minZ = std::nullopt) {
     if (index.samples.empty()) {
         return std::nullopt;
     }
@@ -8970,10 +9856,13 @@ std::optional<std::uint32_t> FindRainSupportSample(
                     continue;
                 }
                 const auto& sample = index.samples[candidateIndex];
-                if (requireSand && !RainRoleIsSand(sample.role)) {
+                if (!RainSupportSampleMatchesRole(sample, role)) {
                     continue;
                 }
                 if (maxZ.has_value() && sample.position.z > maxZ.value()) {
+                    continue;
+                }
+                if (minZ.has_value() && sample.position.z < minZ.value()) {
                     continue;
                 }
                 const glm::vec2 delta{sample.position.x - xy.x, sample.position.y - xy.y};
@@ -8993,6 +9882,23 @@ std::optional<std::uint32_t> FindRainSupportSample(
         }
     }
     return bestIndex;
+}
+
+std::optional<std::uint32_t> FindRainSupportSample(
+    const RainSupportIndex& index,
+    const glm::vec2& xy,
+    float radiusMeters,
+    bool requireSand,
+    bool chooseLowest,
+    std::optional<float> maxZ = std::nullopt) {
+    return FindRainSupportRoleSample(
+        index,
+        xy,
+        radiusMeters,
+        requireSand ? RainSupportRoleQuery::Sand : RainSupportRoleQuery::Any,
+        chooseLowest,
+        maxZ,
+        std::nullopt);
 }
 
 bool RainVisitedSample(const std::vector<std::uint32_t>& visited, std::uint32_t sampleIndex) {
@@ -9129,6 +10035,120 @@ void AppendRainSupportAnchor(
         RainRoleIsSand(sample.role));
 }
 
+void AppendRainMeshAnchor(
+    std::vector<RainRouteAnchor>* route,
+    const MeshSurfaceProjection& projection,
+    float supportOffset,
+    bool sand) {
+    const glm::vec3 normal = SafeOverlayNormal(ToGlm(projection.normal));
+    AppendRainRouteAnchor(
+        route,
+        ToGlm(projection.position) + normal * supportOffset,
+        normal,
+        true,
+        sand);
+}
+
+float RainMeshCellSize(const MeshSurfaceCache& meshSurface) {
+    return std::clamp(meshSurface.settings.cacheCellSizeMeters, 0.005F, 5.0F);
+}
+
+float RainMeshRoleRadius(
+    const MeshSurfaceCache& meshSurface,
+    const WaterRainSettings& settings) {
+    return std::max({
+        settings.surfaceSearchRadiusMeters,
+        RainMeshCellSize(meshSurface) * 1.75F,
+        0.025F});
+}
+
+bool RainMeshProjectionIsSand(
+    const RainSupportIndex& support,
+    const MeshSurfaceCache& meshSurface,
+    const MeshSurfaceProjection& projection,
+    const WaterRainSettings& settings) {
+    if (!projection.hit || support.samples.empty()) {
+        return false;
+    }
+    const glm::vec3 position = ToGlm(projection.position);
+    const float roleRadius = RainMeshRoleRadius(meshSurface, settings);
+    const float verticalTolerance = std::max({
+        0.06F,
+        roleRadius * 1.15F,
+        RainMeshCellSize(meshSurface) * 2.25F});
+    const auto sandIndex = FindRainSupportRoleSample(
+        support,
+        {position.x, position.y},
+        roleRadius,
+        RainSupportRoleQuery::Sand,
+        false,
+        position.z + verticalTolerance,
+        position.z - verticalTolerance);
+    if (!sandIndex.has_value() || sandIndex.value() >= support.samples.size()) {
+        return false;
+    }
+    const auto& sand = support.samples[sandIndex.value()];
+    return std::abs(sand.position.z - position.z) <= verticalTolerance;
+}
+
+std::vector<std::uint32_t> FindRainVegetationInterruptions(
+    const RainSupportIndex& support,
+    const glm::vec3& spawn,
+    const glm::vec3& firstSurface,
+    const WaterRainSettings& settings) {
+    std::vector<std::uint32_t> result;
+    if (support.samples.empty()) {
+        return result;
+    }
+
+    const float roleRadius = std::max(0.025F, settings.surfaceSearchRadiusMeters * 0.85F);
+    const glm::vec3 segment = firstSurface - spawn;
+    if (glm::dot(segment, segment) <= kNormalEpsilon) {
+        return result;
+    }
+    const float zMin = std::min(spawn.z, firstSurface.z) + 0.035F;
+    const float zMax = std::max(spawn.z, firstSurface.z) - 0.035F;
+    if (zMax <= zMin) {
+        return result;
+    }
+
+    constexpr std::uint32_t kProbeCount = 9U;
+    for (std::uint32_t probeIndex = 1U; probeIndex + 1U < kProbeCount; ++probeIndex) {
+        if (result.size() >= 2U) {
+            break;
+        }
+        const float alpha = static_cast<float>(probeIndex) / static_cast<float>(kProbeCount - 1U);
+        const glm::vec3 probe = spawn + segment * alpha;
+        const auto vegIndex = FindRainSupportRoleSample(
+            support,
+            {probe.x, probe.y},
+            roleRadius,
+            RainSupportRoleQuery::Vegetation,
+            false,
+            zMax,
+            zMin);
+        if (!vegIndex.has_value()) {
+            continue;
+        }
+        const bool alreadyAdded = std::find(result.begin(), result.end(), vegIndex.value()) != result.end();
+        if (alreadyAdded) {
+            continue;
+        }
+        if (!result.empty() && vegIndex.value() < support.samples.size()) {
+            const auto& previous = support.samples[result.back()];
+            const auto& candidate = support.samples[vegIndex.value()];
+            if (std::abs(candidate.position.z - previous.position.z) < roleRadius * 1.4F) {
+                continue;
+            }
+        }
+        result.push_back(vegIndex.value());
+    }
+    std::sort(result.begin(), result.end(), [&](std::uint32_t left, std::uint32_t right) {
+        return support.samples[left].position.z > support.samples[right].position.z;
+    });
+    return result;
+}
+
 void AppendRainSyntheticSandRunAnchor(
     std::vector<RainRouteAnchor>* route,
     const glm::vec3& windDirection,
@@ -9212,7 +10232,7 @@ std::vector<RainRouteAnchor> BuildRainRouteAnchors(
     if (fallbackTermination != nullptr) {
         *fallbackTermination = false;
     }
-    const std::uint32_t routeCount = std::clamp<std::uint32_t>(settings.routeAnchorCount, 3U, 32U);
+    const std::uint32_t routeCount = std::clamp<std::uint32_t>(settings.routeAnchorCount, 3U, 48U);
     std::vector<RainRouteAnchor> route;
     route.reserve(routeCount);
 
@@ -9311,10 +10331,295 @@ std::vector<RainRouteAnchor> BuildRainRouteAnchors(
     return route;
 }
 
+glm::vec3 RainProjectedSurfaceDirection(
+    const glm::vec3& direction,
+    const glm::vec3& normal,
+    const glm::vec3& fallback) {
+    glm::vec3 projected = direction - normal * glm::dot(direction, normal);
+    if (glm::dot(projected, projected) <= kNormalEpsilon) {
+        projected = fallback - normal * glm::dot(fallback, normal);
+    }
+    if (glm::dot(projected, projected) <= kNormalEpsilon) {
+        projected = glm::cross(normal, glm::vec3{0.0F, 0.0F, 1.0F});
+    }
+    if (glm::dot(projected, projected) <= kNormalEpsilon) {
+        projected = {1.0F, 0.0F, 0.0F};
+    }
+    return glm::normalize(projected);
+}
+
+std::optional<glm::vec3> RainNearbySandDirection(
+    const RainSupportIndex& support,
+    const glm::vec3& position,
+    float radiusMeters) {
+    const auto sandIndex = FindRainSupportRoleSample(
+        support,
+        {position.x, position.y},
+        radiusMeters,
+        RainSupportRoleQuery::Sand,
+        false,
+        position.z + std::max(0.05F, radiusMeters * 0.4F),
+        position.z - std::max(0.12F, radiusMeters * 1.2F));
+    if (!sandIndex.has_value() || sandIndex.value() >= support.samples.size()) {
+        return std::nullopt;
+    }
+    glm::vec3 direction = support.samples[sandIndex.value()].position - position;
+    direction.z = 0.0F;
+    if (glm::dot(direction, direction) <= kNormalEpsilon) {
+        return std::nullopt;
+    }
+    return glm::normalize(direction);
+}
+
+struct RainMeshRunoffStep {
+    MeshSurfaceProjection projection{};
+    glm::vec3 direction{1.0F, 0.0F, 0.0F};
+    float travelled = 0.0F;
+    bool hit = false;
+};
+
+RainMeshRunoffStep FindRainMeshRunoffStep(
+    const MeshSurfaceCache& meshSurface,
+    const glm::vec3& position,
+    const glm::vec3& normal,
+    const glm::vec3& primaryDirection,
+    const glm::vec3& previousVelocity,
+    const glm::vec3& windDirection,
+    float stepMeters,
+    float cellSize) {
+    RainMeshRunoffStep best;
+    const float allowedRise = std::max(0.002F, cellSize * 0.12F);
+    const float minimumTravel = std::max(0.001F, cellSize * 0.02F);
+    glm::vec3 lateral = glm::cross(normal, primaryDirection);
+    if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
+        lateral = glm::cross(normal, previousVelocity);
+    }
+    if (glm::dot(lateral, lateral) > kNormalEpsilon) {
+        lateral = glm::normalize(lateral);
+    } else {
+        lateral = {0.0F, 0.0F, 0.0F};
+    }
+
+    const std::array<glm::vec3, 6> directions{
+        primaryDirection,
+        previousVelocity * 0.20F + primaryDirection * 0.80F,
+        primaryDirection + lateral * 0.30F,
+        primaryDirection - lateral * 0.30F,
+        previousVelocity * 0.10F + primaryDirection * 0.70F + windDirection * 0.20F,
+        windDirection,
+    };
+    constexpr std::array<float, 3> stepScales{1.0F, 0.58F, 0.32F};
+    float bestScore = std::numeric_limits<float>::max();
+    for (const auto& rawDirection : directions) {
+        const glm::vec3 direction = RainProjectedSurfaceDirection(rawDirection, normal, primaryDirection);
+        for (const float stepScale : stepScales) {
+            const glm::vec3 candidate = position + direction * (stepMeters * stepScale);
+            auto projection = ProjectToMeshSurface(meshSurface, FromGlm(candidate));
+            if (!projection.hit) {
+                continue;
+            }
+            const glm::vec3 nextPosition = ToGlm(projection.position);
+            const float travelled = glm::length(nextPosition - position);
+            if (travelled <= minimumTravel) {
+                continue;
+            }
+            const float rise = nextPosition.z - position.z;
+            if (rise > allowedRise) {
+                continue;
+            }
+            const float descent = std::max(0.0F, -rise);
+            const float flatPenalty = std::max(0.0F, rise) * 24.0F;
+            const float shortStepPenalty = (1.0F - stepScale) * cellSize * 0.35F;
+            const float score = flatPenalty - descent * 2.5F + shortStepPenalty;
+            if (!best.hit || score < bestScore) {
+                bestScore = score;
+                best.projection = projection;
+                best.direction = direction;
+                best.travelled = travelled;
+                best.hit = true;
+            }
+        }
+    }
+    return best;
+}
+
+std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
+    const glm::vec3& spawn,
+    const RainSupportIndex& support,
+    const MeshSurfaceCache& meshSurface,
+    const MeshSurfaceProjection& firstProjection,
+    const glm::vec3& noHitEnd,
+    const glm::vec3& windDirection,
+    const glm::vec3& fallDirection,
+    float supportOffset,
+    const WaterRainSettings& settings,
+    std::uint32_t dropIndex,
+    bool* sandTermination,
+    bool* fallbackTermination,
+    std::uint32_t* vegetationDripCount) {
+    if (sandTermination != nullptr) {
+        *sandTermination = false;
+    }
+    if (fallbackTermination != nullptr) {
+        *fallbackTermination = false;
+    }
+    if (vegetationDripCount != nullptr) {
+        *vegetationDripCount = 0U;
+    }
+
+    const std::uint32_t routeCount = std::clamp<std::uint32_t>(
+        std::max<std::uint32_t>(settings.routeAnchorCount, 5U),
+        5U,
+        48U);
+    std::vector<RainRouteAnchor> route;
+    route.reserve(routeCount);
+    AppendRainRouteAnchor(&route, spawn, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+
+    if (!firstProjection.hit) {
+        const glm::vec3 midpoint = glm::mix(spawn, noHitEnd, 0.54F);
+        AppendRainRouteAnchor(&route, midpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+        AppendRainRouteAnchor(&route, noHitEnd, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+        return route;
+    }
+
+    MeshSurfaceProjection projected = firstProjection;
+    const glm::vec3 firstSurface =
+        ToGlm(projected.position) + SafeOverlayNormal(ToGlm(projected.normal)) * supportOffset;
+    const auto vegetation = FindRainVegetationInterruptions(support, spawn, firstSurface, settings);
+    for (const auto vegIndex : vegetation) {
+        if (route.size() + 4U >= routeCount || vegIndex >= support.samples.size()) {
+            break;
+        }
+        const auto& veg = support.samples[vegIndex];
+        const glm::vec3 vegNormal = SafeOverlayNormal(veg.normal);
+        AppendRainRouteAnchor(
+            &route,
+            veg.position + vegNormal * supportOffset,
+            vegNormal,
+            false,
+            false);
+        const float dripDistance =
+            0.045F + RegionHash01(settings.seed + dropIndex, vegIndex, 9191U) * 0.075F;
+        glm::vec3 lateral = glm::cross(
+            std::abs(fallDirection.z) > 0.95F ? glm::vec3{0.0F, 1.0F, 0.0F} : fallDirection,
+            glm::vec3{0.0F, 0.0F, 1.0F});
+        if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
+            lateral = {1.0F, 0.0F, 0.0F};
+        } else {
+            lateral = glm::normalize(lateral);
+        }
+        const float lateralJitter =
+            (RegionHash01(settings.seed + dropIndex, vegIndex, 9199U) - 0.5F) *
+            std::max(0.01F, settings.surfaceSearchRadiusMeters * 0.28F);
+        AppendRainRouteAnchor(
+            &route,
+            veg.position + fallDirection * dripDistance + lateral * lateralJitter,
+            vegNormal,
+            false,
+            false);
+        if (vegetationDripCount != nullptr) {
+            ++(*vegetationDripCount);
+        }
+    }
+
+    if (route.size() + 2U < routeCount) {
+        const glm::vec3 airMidpoint = glm::mix(route.back().position, firstSurface, 0.58F);
+        AppendRainRouteAnchor(&route, airMidpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
+    }
+
+    bool currentSand = RainMeshProjectionIsSand(support, meshSurface, projected, settings);
+    AppendRainMeshAnchor(&route, projected, supportOffset, currentSand);
+
+    const float cellSize = RainMeshCellSize(meshSurface);
+    const float stepMeters = std::clamp(
+        std::max(cellSize * 1.25F, settings.surfaceSearchRadiusMeters * 0.55F),
+        0.012F,
+        std::max(0.04F, settings.downhillSearchRadiusMeters * 0.40F));
+    const float sandRunTarget = std::max(0.0F, settings.sandRunDistanceMeters);
+    float sandTravelDistance = 0.0F;
+    glm::vec3 velocity = RainProjectedSurfaceDirection(
+        ToGlm(projected.downhill),
+        SafeOverlayNormal(ToGlm(projected.normal)),
+        windDirection);
+
+    while (route.size() < routeCount) {
+        if (currentSand) {
+            if (sandTermination != nullptr) {
+                *sandTermination = true;
+            }
+            if (sandTravelDistance >= sandRunTarget) {
+                break;
+            }
+        }
+
+        glm::vec3 position = ToGlm(projected.position);
+        const glm::vec3 normal = SafeOverlayNormal(ToGlm(projected.normal));
+        glm::vec3 force = ToGlm(projected.downhill);
+        if (const auto sandDirection = RainNearbySandDirection(
+                support,
+                position,
+                std::max(settings.downhillSearchRadiusMeters, RainMeshRoleRadius(meshSurface, settings) * 3.0F));
+            sandDirection.has_value() && !currentSand) {
+            force = force * 0.72F + sandDirection.value() * 0.46F;
+        }
+        force = RainProjectedSurfaceDirection(force, normal, velocity);
+        const auto step = FindRainMeshRunoffStep(
+            meshSurface,
+            position,
+            normal,
+            force,
+            velocity,
+            windDirection,
+            stepMeters,
+            cellSize);
+        if (!step.hit) {
+            if (currentSand && sandTravelDistance < sandRunTarget) {
+                AppendRainSyntheticSandRunAnchor(&route, windDirection, sandRunTarget - sandTravelDistance);
+                if (sandTermination != nullptr) {
+                    *sandTermination = true;
+                }
+            } else if (fallbackTermination != nullptr && sandTermination != nullptr && !*sandTermination) {
+                *fallbackTermination = true;
+            }
+            break;
+        }
+
+        const float travelled = step.travelled;
+
+        velocity = step.direction;
+        projected = step.projection;
+        currentSand = RainMeshProjectionIsSand(support, meshSurface, projected, settings);
+        AppendRainMeshAnchor(&route, projected, supportOffset, currentSand);
+        if (currentSand) {
+            sandTravelDistance += travelled;
+        }
+    }
+
+    if (sandTermination != nullptr && !*sandTermination) {
+        const auto lastSand = !route.empty() && route.back().sand;
+        if (lastSand) {
+            *sandTermination = true;
+        }
+    }
+    if (fallbackTermination != nullptr && sandTermination != nullptr && !*sandTermination) {
+        *fallbackTermination = true;
+    }
+    return route;
+}
+
 }  // namespace
 
 WaterTrailOverlay BuildRainTrailOverlay(
     std::span<const WaterSceneSupportLayer> supportLayers,
+    const WaterRainCameraFrame& cameraFrame,
+    const WaterRainSettings& settings,
+    WaterRainDiagnostics* diagnostics) {
+    return BuildRainTrailOverlay(supportLayers, nullptr, cameraFrame, settings, diagnostics);
+}
+
+WaterTrailOverlay BuildRainTrailOverlay(
+    std::span<const WaterSceneSupportLayer> supportLayers,
+    const MeshSurfaceCache* meshSurface,
     const WaterRainCameraFrame& cameraFrame,
     const WaterRainSettings& settings,
     WaterRainDiagnostics* diagnostics) {
@@ -9323,12 +10628,31 @@ WaterTrailOverlay BuildRainTrailOverlay(
     if (diagnostics != nullptr) {
         *diagnostics = localDiagnostics;
     }
-    if (!settings.enabled || settings.dropCount == 0U || supportLayers.empty()) {
+    if (!settings.enabled || settings.dropCount == 0U ||
+        (supportLayers.empty() && (meshSurface == nullptr || meshSurface->cells.empty()))) {
         return {};
     }
 
     const auto support = BuildRainSupportIndex(supportLayers, settings);
-    if (support.samples.empty() || !support.bounds.valid) {
+    invisible_places::io::Bounds3f rainBounds = support.bounds;
+    if (meshSurface != nullptr && !meshSurface->cells.empty()) {
+        if (meshSurface->bounds.valid) {
+            rainBounds.Expand(meshSurface->bounds.minimum);
+            rainBounds.Expand(meshSurface->bounds.maximum);
+        } else {
+            for (const auto& cell : meshSurface->cells) {
+                rainBounds.Expand(cell.position);
+            }
+        }
+    }
+    if ((!meshSurface || meshSurface->cells.empty()) && (support.samples.empty() || !support.bounds.valid)) {
+        localDiagnostics.noSupportKillCount = settings.dropCount;
+        if (diagnostics != nullptr) {
+            *diagnostics = localDiagnostics;
+        }
+        return {};
+    }
+    if (!rainBounds.valid) {
         localDiagnostics.noSupportKillCount = settings.dropCount;
         if (diagnostics != nullptr) {
             *diagnostics = localDiagnostics;
@@ -9354,7 +10678,8 @@ WaterTrailOverlay BuildRainTrailOverlay(
 
     const glm::vec3 windDirection = SafeRainWindDirection(settings);
     const glm::vec3 fallDirection = RainFallDirection(settings);
-    const float sceneHeight = std::max(0.1F, support.bounds.maximum.z - support.bounds.minimum.z);
+    const bool meshRouting = meshSurface != nullptr && !meshSurface->cells.empty();
+    const float sceneHeight = std::max(0.1F, rainBounds.maximum.z - rainBounds.minimum.z);
     const float spawnHeight = std::clamp(settings.spawnHeightMeters, 0.05F, sceneHeight + 200.0F);
     const float targetDistance = std::max(1.0F, glm::length(cameraTarget - cameraPosition));
     const float tanHalfFov =
@@ -9388,23 +10713,42 @@ WaterTrailOverlay BuildRainTrailOverlay(
             false,
             false);
 
-        const bool hasSupportHit = firstHitIndex.has_value();
+        MeshSurfaceProjection meshFirstProjection;
+        if (meshRouting) {
+            meshFirstProjection = ProjectToMeshSurface(
+                *meshSurface,
+                {targetPoint.x, targetPoint.y, targetPoint.z});
+        }
+        const bool hasMeshHit = meshRouting && meshFirstProjection.hit;
+        const bool hasSupportHit = !hasMeshHit && firstHitIndex.has_value();
         const glm::vec3 fallTarget =
-            hasSupportHit && firstHitIndex.value() < support.samples.size()
-                ? support.samples[firstHitIndex.value()].position +
-                      support.samples[firstHitIndex.value()].normal * supportOffset
-                : glm::vec3{targetPoint.x, targetPoint.y, support.bounds.minimum.z};
+            hasMeshHit
+                ? ToGlm(meshFirstProjection.position) +
+                      SafeOverlayNormal(ToGlm(meshFirstProjection.normal)) * supportOffset
+                : hasSupportHit && firstHitIndex.value() < support.samples.size()
+                      ? support.samples[firstHitIndex.value()].position +
+                            support.samples[firstHitIndex.value()].normal * supportOffset
+                      : glm::vec3{targetPoint.x, targetPoint.y, rainBounds.minimum.z};
         const float spawnZ =
-            support.bounds.maximum.z + spawnHeight +
+            rainBounds.maximum.z + spawnHeight +
             RegionHash01(settings.seed, dropIndex, 9119U) * spawnHeight * 0.35F;
         const float verticalDrop = std::max(0.10F, spawnZ - fallTarget.z);
         const float windTravel = verticalDrop / std::max(0.05F, -fallDirection.z);
         const glm::vec3 spawn = glm::vec3{fallTarget.x, fallTarget.y, spawnZ} - fallDirection * windTravel;
+        if (hasMeshHit) {
+            const auto rayProjection = ProjectRayToMeshSurface(*meshSurface, FromGlm(spawn), FromGlm(fallDirection));
+            if (rayProjection.hit) {
+                meshFirstProjection = rayProjection;
+            }
+        }
         const glm::vec3 noHitEnd{
             targetPoint.x,
             targetPoint.y,
-            support.bounds.minimum.z - settings.killBelowSceneMeters};
-        if (hasSupportHit) {
+            rainBounds.minimum.z - settings.killBelowSceneMeters};
+        if (hasMeshHit) {
+            ++localDiagnostics.firstSupportHitCount;
+            ++localDiagnostics.meshSurfaceHitCount;
+        } else if (hasSupportHit) {
             ++localDiagnostics.firstSupportHitCount;
         } else {
             ++localDiagnostics.noSupportKillCount;
@@ -9412,16 +10756,33 @@ WaterTrailOverlay BuildRainTrailOverlay(
 
         bool sandTermination = false;
         bool fallbackTermination = false;
-        auto routeAnchors = BuildRainRouteAnchors(
-            spawn,
-            support,
-            firstHitIndex,
-            noHitEnd,
-            windDirection,
-            supportOffset,
-            settings,
-            &sandTermination,
-            &fallbackTermination);
+        std::uint32_t vegetationDripCount = 0U;
+        auto routeAnchors = hasMeshHit
+                                ? BuildRainMeshRouteAnchors(
+                                      spawn,
+                                      support,
+                                      *meshSurface,
+                                      meshFirstProjection,
+                                      noHitEnd,
+                                      windDirection,
+                                      fallDirection,
+                                      supportOffset,
+                                      settings,
+                                      dropIndex,
+                                      &sandTermination,
+                                      &fallbackTermination,
+                                      &vegetationDripCount)
+                                : BuildRainRouteAnchors(
+                                      spawn,
+                                      support,
+                                      firstHitIndex,
+                                      noHitEnd,
+                                      windDirection,
+                                      supportOffset,
+                                      settings,
+                                      &sandTermination,
+                                      &fallbackTermination);
+        localDiagnostics.vegetationDripCount += vegetationDripCount;
         if (sandTermination) {
             ++localDiagnostics.sandTerminationCount;
         } else if (fallbackTermination) {

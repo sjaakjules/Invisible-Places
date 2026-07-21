@@ -89,7 +89,8 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 pointMeta{0U, 0U, 0U, 0U};
     glm::uvec4 renderControl{0U, 1U, 0U, 0U};
     glm::vec4 renderParams0{1.0F, 0.55F, 4.0F, 1.6F};
-    // x: trail-style geometry, y: density footprint scale, z: density coverage correction.
+    // x: trail-style geometry, y: density footprint scale, z: density coverage correction,
+    // w: continuous Rain level.
     glm::vec4 renderParams1{0.0F, 1.0F, 1.0F, 0.0F};
     glm::vec4 renderParams2{1.0F, 0.0F, 1.0F, 0.0F};
     glm::vec4 renderParams3{0.0F, 1.0F, 64.0F, 0.0F};
@@ -124,6 +125,7 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 shorelineWaveParams2{0.55F, 0.35F, 0.06F, 0.55F};
     glm::vec4 shorelineWaveParams3{0.0F, 0.65F, 0.08F, 1.25F};
     glm::vec4 shorelineWaveParams4{0.0F, 1.35F, 0.75F, 0.0F};
+    glm::vec4 shorelineWaveParams5{1.30F, 0.30F, 1.0F, 0.30F};
     glm::vec4 shorelineWaveTint{0.62F, 0.88F, 1.0F, 1.0F};
     glm::vec4 gradientStartColor{0.05F, 0.28F, 0.95F, 1.0F};
     glm::vec4 gradientEndColor{0.96F, 0.94F, 0.58F, 1.0F};
@@ -158,21 +160,109 @@ struct alignas(16) SparseWaterRippleParamsGpu {
 struct alignas(16) WaterSeepageNodeGpu {
     static constexpr std::size_t kGuideSampleCapacity = 8U;
 
+    struct alignas(16) LookGpu {
+        // x: pattern, y: blend mode.
+        glm::uvec4 control{0U, 1U, 0U, 0U};
+        glm::vec4 legacy0{1.0F, 0.16F, 0.18F, 0.40F};
+        glm::vec4 legacy1{0.22F, 0.0F, 0.45F, 0.85F};
+        glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
+        glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
+        glm::vec4 response2{0.22F, 0.35F, 0.55F, 0.50F};
+        glm::vec4 organic0{0.20F, 0.55F, 0.06F, 0.45F};
+        glm::vec4 organic1{0.70F, 0.18F, 0.30F, 0.40F};
+        glm::vec4 organic2{0.45F, 0.025F, 0.0F, 0.0F};
+        glm::vec4 environmentDirection{0.0F, 0.0F, 1.0F, 0.0F};
+    };
+
     glm::uvec4 control{0U, 1U, 1U, 1U};
     glm::vec4 positionReach{0.0F, 0.0F, 0.0F, 1.25F};
     glm::vec4 normalSurface{0.0F, 1.0F, 0.0F, 0.15F};
     glm::vec4 downEdge{0.0F, 0.0F, -1.0F, 0.10F};
     glm::vec4 lateralStart{1.0F, 0.0F, 0.0F, 0.06F};
     glm::vec4 geometry{0.375F, 0.20F, 1.0F, 0.0F};
-    glm::vec4 pattern0{1.0F, 0.16F, 0.18F, 0.40F};
-    glm::vec4 pattern1{0.22F, 0.0F, 0.45F, 0.85F};
-    glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
-    glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
-    glm::vec4 response2{0.22F, 0.35F, 0.55F, 0.50F};
+    LookGpu look{};
+    LookGpu transitionLook{};
+    // x: scenario spread, y: transition amount.
+    glm::vec4 scenario{0.0F, 0.0F, 0.0F, 0.0F};
+    std::array<glm::vec4, 3> noiseBasis{};
     glm::uvec4 guideControl{0U, 0U, 0U, 0U};
     std::array<glm::vec4, kGuideSampleCapacity> guidePositionStation{};
     std::array<glm::vec4, kGuideSampleCapacity> guideNormalConfidence{};
 };
+
+WaterSeepageNodeGpu::LookGpu MakeWaterSeepageLookGpu(
+    const invisible_places::water::WaterSeepageLookSettings& look) {
+    WaterSeepageNodeGpu::LookGpu gpu;
+    gpu.control = glm::uvec4{
+        static_cast<std::uint32_t>(look.pattern),
+        static_cast<std::uint32_t>(look.blendMode),
+        0U,
+        0U,
+    };
+    gpu.legacy0 = glm::vec4{
+        std::clamp(look.patternScale, 0.05F, 100.0F),
+        std::max(0.002F, look.wavelengthMeters),
+        std::max(0.0F, look.speed),
+        std::max(0.0F, look.warp),
+    };
+    gpu.legacy1 = glm::vec4{
+        std::clamp(look.turbulence, 0.0F, 1.0F),
+        look.phase,
+        std::clamp(look.density, 0.0F, 1.0F),
+        std::max(0.0F, look.response.intensity),
+    };
+    gpu.response0 = glm::vec4{
+        std::max(0.0F, look.response.emissionAdd),
+        std::isfinite(look.response.opacityAdd) ? look.response.opacityAdd : 0.0F,
+        std::max(0.0F, look.response.opacityMultiply),
+        std::isfinite(look.response.pointSizeAdd) ? look.response.pointSizeAdd : 0.0F,
+    };
+    gpu.response1 = glm::vec4{
+        std::max(0.0F, look.response.pointSizeMultiply),
+        std::clamp(look.response.colouriseRed, 0.0F, 1.0F),
+        std::clamp(look.response.colouriseGreen, 0.0F, 1.0F),
+        std::clamp(look.response.colouriseBlue, 0.0F, 1.0F),
+    };
+    gpu.response2 = glm::vec4{
+        std::clamp(look.response.colouriseAmount, 0.0F, 1.0F),
+        std::clamp(look.baseWetness, 0.0F, 1.0F),
+        std::max(0.0F, look.glisten),
+        std::clamp(look.rainResponse, 0.0F, 1.0F),
+    };
+    gpu.organic0 = glm::vec4{
+        std::max(0.005F, look.featureSizeMeters),
+        std::clamp(look.contrast, 0.0F, 1.0F),
+        std::max(0.0F, look.evolution),
+        std::clamp(look.roughness, 0.02F, 1.0F),
+    };
+    gpu.organic1 = glm::vec4{
+        std::clamp(look.angleResponse, 0.0F, 1.0F),
+        std::clamp(look.microNormalStrength, 0.0F, 2.0F),
+        std::clamp(look.glintDensity, 0.0F, 1.0F),
+        std::clamp(look.curl, 0.0F, 2.0F),
+    };
+    gpu.organic2 = glm::vec4{
+        std::clamp(look.breakup, 0.0F, 1.0F),
+        std::max(0.0F, look.downhillDriftMetersPerSecond),
+        0.0F,
+        0.0F,
+    };
+    constexpr float degreesToRadians = 0.01745329251994329577F;
+    const float azimuth = look.environmentAzimuthDegrees * degreesToRadians;
+    const float elevation = look.environmentElevationDegrees * degreesToRadians;
+    glm::vec3 environmentDirection{
+        std::cos(elevation) * std::sin(azimuth),
+        std::cos(elevation) * std::cos(azimuth),
+        std::sin(elevation),
+    };
+    if (glm::dot(environmentDirection, environmentDirection) <= 1.0e-8F) {
+        environmentDirection = {0.0F, 0.0F, 1.0F};
+    } else {
+        environmentDirection = glm::normalize(environmentDirection);
+    }
+    gpu.environmentDirection = glm::vec4{environmentDirection, 0.0F};
+    return gpu;
+}
 
 struct alignas(16) WaterSeepageHashCellGpu {
     glm::ivec4 coordinate{0, 0, 0, 0};
@@ -315,36 +405,18 @@ WaterSeepageNodeGpu MakeWaterSeepageNodeGpu(
         std::max(0.0F, node.strength),
         std::clamp(node.rainVisualStrength, 0.0F, 1.0F),
     };
-    gpu.pattern0 = glm::vec4{
-        std::clamp(node.look.patternScale, 0.05F, 100.0F),
-        std::max(0.002F, node.look.wavelengthMeters),
-        std::max(0.0F, node.look.speed),
-        std::max(0.0F, node.look.warp),
+    gpu.look = MakeWaterSeepageLookGpu(node.look);
+    gpu.transitionLook = MakeWaterSeepageLookGpu(
+        node.transitionLook.value_or(node.look));
+    gpu.scenario = glm::vec4{
+        std::clamp(node.scenarioSpread, 0.0F, 1.0F),
+        std::clamp(node.transitionAmount, 0.0F, 1.0F),
+        0.0F,
+        0.0F,
     };
-    gpu.pattern1 = glm::vec4{
-        std::clamp(node.look.turbulence, 0.0F, 1.0F),
-        node.look.phase,
-        std::clamp(node.look.density, 0.0F, 1.0F),
-        std::max(0.0F, node.look.response.intensity),
-    };
-    gpu.response0 = glm::vec4{
-        std::max(0.0F, node.look.response.emissionAdd),
-        std::isfinite(node.look.response.opacityAdd) ? node.look.response.opacityAdd : 0.0F,
-        std::max(0.0F, node.look.response.opacityMultiply),
-        std::isfinite(node.look.response.pointSizeAdd) ? node.look.response.pointSizeAdd : 0.0F,
-    };
-    gpu.response1 = glm::vec4{
-        std::max(0.0F, node.look.response.pointSizeMultiply),
-        std::clamp(node.look.response.colouriseRed, 0.0F, 1.0F),
-        std::clamp(node.look.response.colouriseGreen, 0.0F, 1.0F),
-        std::clamp(node.look.response.colouriseBlue, 0.0F, 1.0F),
-    };
-    gpu.response2 = glm::vec4{
-        std::clamp(node.look.response.colouriseAmount, 0.0F, 1.0F),
-        std::clamp(node.look.baseWetness, 0.0F, 1.0F),
-        std::max(0.0F, node.look.glisten),
-        std::clamp(node.look.rainResponse, 0.0F, 1.0F),
-    };
+    for (std::size_t basisIndex = 0U; basisIndex < gpu.noiseBasis.size(); ++basisIndex) {
+        gpu.noiseBasis[basisIndex] = glm::vec4{node.noiseRotation[basisIndex], 0.0F};
+    }
     const auto guideSampleCount = node.guideValid
                                       ? std::min<std::size_t>(
                                             static_cast<std::size_t>(node.guideSampleCount),
@@ -7396,11 +7468,11 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.waterTrailStyleGeometry ? 1.0F : 0.0F,
         densityCompensation.footprintScale,
         densityCompensation.coverageCorrection,
-        0.0F,
+        std::clamp(layer.style.waterRainLevel, 0.0F, 1.0F),
     };
     styleGpu.renderParams2 = glm::vec4{
         kPointCloudAntialiasFeatherPixels,
-        0.0F,
+        std::clamp(layer.style.waterRainSpeedScale, 0.0F, 4.0F),
         std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
         renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
     };
@@ -7506,54 +7578,97 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         };
     }
     if (layer.style.shorelineWaveEnabled) {
-        const glm::vec2 directionInput{
-            layer.style.shorelineDirectionX,
-            layer.style.shorelineDirectionY,
-        };
+        const bool heightFoam =
+            layer.style.shorelineWaveAlgorithm ==
+            invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm::HeightFoam;
+        const auto& foam = layer.style.shorelineHeightFoam;
+        const glm::vec2 directionInput = heightFoam
+                                             ? glm::vec2{foam.directionX, foam.directionY}
+                                             : glm::vec2{
+                                                   layer.style.shorelineDirectionX,
+                                                   layer.style.shorelineDirectionY,
+                                               };
         const glm::vec2 shorelineDirection =
             glm::dot(directionInput, directionInput) > 1.0e-8F
                 ? glm::normalize(directionInput)
                 : glm::vec2{1.0F, 0.0F};
+        const float boundaryZ = heightFoam ? foam.runupZ : layer.style.shorelineBoundaryZ;
+        const float reachMeters = heightFoam
+                                      ? std::clamp(foam.offshoreReachMeters, 0.001F, 50.0F)
+                                      : std::clamp(layer.style.shorelineHeightReachMeters, 0.001F, 50.0F);
+        const float edgeFadeMeters = heightFoam
+                                         ? std::clamp(foam.edgeFadeMeters, 0.0F, 10.0F)
+                                         : std::clamp(layer.style.shorelineEdgeFadeMeters, 0.0F, 10.0F);
+        const float breakZ = heightFoam
+                                 ? invisible_places::renderer::pointcloud::NormalizeHeightFoamBreakZ(
+                                       boundaryZ,
+                                       reachMeters,
+                                       edgeFadeMeters,
+                                       foam.breakZ)
+                                 : boundaryZ;
         styleGpu.shorelineWaveControl = glm::uvec4{
             1U,
-            layer.style.shorelineSeed,
-            0U,
+            heightFoam ? foam.seed : layer.style.shorelineSeed,
+            heightFoam ? 1U : 0U,
             0U,
         };
         styleGpu.shorelineWaveParams0 = glm::vec4{
-            layer.style.shorelineBoundaryZ,
-            std::clamp(layer.style.shorelineHeightReachMeters, 0.001F, 50.0F),
-            std::clamp(layer.style.shorelineEdgeFadeMeters, 0.0F, 10.0F),
-            std::clamp(layer.style.shorelineIntensity, 0.0F, 5.0F),
+            boundaryZ,
+            reachMeters,
+            edgeFadeMeters,
+            heightFoam
+                ? std::clamp(foam.intensity, 0.0F, 5.0F)
+                : std::clamp(layer.style.shorelineIntensity, 0.0F, 5.0F),
         };
         styleGpu.shorelineWaveParams1 = glm::vec4{
             shorelineDirection.x,
             shorelineDirection.y,
-            std::clamp(layer.style.shorelinePatternScale, 0.01F, 50.0F),
-            std::clamp(layer.style.shorelineWavelengthMeters, 0.002F, 10.0F),
+            heightFoam
+                ? std::clamp(foam.patternScale, 0.01F, 50.0F)
+                : std::clamp(layer.style.shorelinePatternScale, 0.01F, 50.0F),
+            heightFoam
+                ? std::clamp(foam.wavelengthMeters, 0.002F, 10.0F)
+                : std::clamp(layer.style.shorelineWavelengthMeters, 0.002F, 10.0F),
         };
         styleGpu.shorelineWaveParams2 = glm::vec4{
-            std::clamp(layer.style.shorelineSpeed, 0.0F, 10.0F),
-            std::clamp(layer.style.shorelineWarp, 0.0F, 3.0F),
-            std::clamp(layer.style.shorelineTurbulence, 0.0F, 1.0F),
-            std::clamp(layer.style.shorelineDensity, 0.0F, 1.0F),
+            heightFoam ? std::clamp(foam.speed, 0.0F, 10.0F)
+                       : std::clamp(layer.style.shorelineSpeed, 0.0F, 10.0F),
+            heightFoam ? std::clamp(foam.warp, 0.0F, 3.0F)
+                       : std::clamp(layer.style.shorelineWarp, 0.0F, 3.0F),
+            heightFoam ? std::clamp(foam.turbulence, 0.0F, 1.0F)
+                       : std::clamp(layer.style.shorelineTurbulence, 0.0F, 1.0F),
+            heightFoam ? std::clamp(foam.density, 0.0F, 1.0F)
+                       : std::clamp(layer.style.shorelineDensity, 0.0F, 1.0F),
         };
         styleGpu.shorelineWaveParams3 = glm::vec4{
-            layer.style.shorelinePhase,
-            std::clamp(layer.style.shorelineEmissionAdd, 0.0F, 8.0F),
-            std::clamp(layer.style.shorelineOpacityAdd, -1.0F, 2.0F),
-            std::clamp(layer.style.shorelineOpacityMultiply, 0.0F, 8.0F),
+            heightFoam ? foam.phase : layer.style.shorelinePhase,
+            heightFoam ? std::clamp(foam.emissionAdd, 0.0F, 8.0F)
+                       : std::clamp(layer.style.shorelineEmissionAdd, 0.0F, 8.0F),
+            heightFoam ? std::clamp(foam.opacityAdd, -1.0F, 2.0F)
+                       : std::clamp(layer.style.shorelineOpacityAdd, -1.0F, 2.0F),
+            heightFoam ? std::clamp(foam.opacityMultiply, 0.0F, 8.0F)
+                       : std::clamp(layer.style.shorelineOpacityMultiply, 0.0F, 8.0F),
         };
         styleGpu.shorelineWaveParams4 = glm::vec4{
-            std::clamp(layer.style.shorelinePointSizeAdd, -256.0F, 512.0F),
-            std::clamp(layer.style.shorelinePointSizeMultiply, 0.0F, 8.0F),
-            std::clamp(layer.style.shorelineColourMix, 0.0F, 1.0F),
+            heightFoam ? std::clamp(foam.pointSizeAdd, -256.0F, 512.0F)
+                       : std::clamp(layer.style.shorelinePointSizeAdd, -256.0F, 512.0F),
+            heightFoam ? std::clamp(foam.pointSizeMultiply, 0.0F, 8.0F)
+                       : std::clamp(layer.style.shorelinePointSizeMultiply, 0.0F, 8.0F),
+            heightFoam ? std::clamp(foam.colourMix, 0.0F, 1.0F)
+                       : std::clamp(layer.style.shorelineColourMix, 0.0F, 1.0F),
             0.0F,
         };
+        styleGpu.shorelineWaveParams5 = glm::vec4{
+            breakZ,
+            heightFoam ? std::clamp(foam.offshoreFoamStrength, 0.0F, 3.0F) : 0.0F,
+            heightFoam ? std::clamp(foam.incomingStrength, 0.0F, 5.0F) : 1.0F,
+            heightFoam ? std::clamp(foam.returnStrength, 0.0F, 1.0F) : 0.0F,
+        };
+        const auto& shorelineColour = heightFoam ? foam.colour : layer.style.shorelineColour;
         styleGpu.shorelineWaveTint = glm::vec4{
-            std::clamp(layer.style.shorelineColour[0], 0.0F, 4.0F),
-            std::clamp(layer.style.shorelineColour[1], 0.0F, 4.0F),
-            std::clamp(layer.style.shorelineColour[2], 0.0F, 4.0F),
+            std::clamp(shorelineColour[0], 0.0F, 4.0F),
+            std::clamp(shorelineColour[1], 0.0F, 4.0F),
+            std::clamp(shorelineColour[2], 0.0F, 4.0F),
             1.0F,
         };
     }

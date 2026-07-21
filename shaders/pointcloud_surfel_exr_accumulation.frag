@@ -78,6 +78,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams2;
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
+    vec4 shorelineWaveParams5;
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;

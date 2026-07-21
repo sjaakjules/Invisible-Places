@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <glm/mat3x3.hpp>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 
@@ -134,6 +135,18 @@ enum class WaterSeepageQuality {
     High
 };
 
+enum class WaterSeepagePattern {
+    LegacyRipples,
+    WetRockSheen,
+    ChaoticBloom
+};
+
+enum class WaterScenarioInterpolation {
+    Smooth,
+    Linear,
+    Hold
+};
+
 enum class WaterFieldOutputMode {
     Trails,
     SurfaceMotion,
@@ -214,6 +227,7 @@ struct WaterEffectResponseSettings {
 
 struct WaterSeepageLookSettings {
     WaterSeepageQuality quality = WaterSeepageQuality::Auto;
+    WaterSeepagePattern pattern = WaterSeepagePattern::ChaoticBloom;
     float baseWetness = 0.35F;
     float density = 0.45F;
     float glisten = 0.55F;
@@ -224,6 +238,18 @@ struct WaterSeepageLookSettings {
     float turbulence = 0.22F;
     float phase = 0.0F;
     float rainResponse = 0.50F;
+    float featureSizeMeters = 0.20F;
+    float contrast = 0.55F;
+    float evolution = 0.06F;
+    float roughness = 0.45F;
+    float angleResponse = 0.70F;
+    float microNormalStrength = 0.18F;
+    float glintDensity = 0.30F;
+    float environmentAzimuthDegrees = 225.0F;
+    float environmentElevationDegrees = 55.0F;
+    float curl = 0.40F;
+    float breakup = 0.45F;
+    float downhillDriftMetersPerSecond = 0.025F;
     WaterEffectResponseSettings response{
         .intensity = 0.85F,
         .emissionAdd = 0.35F,
@@ -244,6 +270,40 @@ struct WaterSeepageLookSettings {
 struct WaterSeepageLookProfile {
     std::string name = "Default";
     WaterSeepageLookSettings settings{};
+};
+
+struct WaterScenarioState {
+    WaterSeepageLookSettings seepageLook{};
+    float seepageLevel = 1.0F;
+    float seepageSpread = 0.0F;
+    float rainLevel = 0.0F;
+    std::optional<WaterSeepageLookSettings> transitionLook;
+    float transitionAmount = 0.0F;
+};
+
+struct WaterScenarioDefinition {
+    std::string id;
+    std::string name;
+    WaterScenarioState state{};
+};
+
+struct WaterScenarioKey {
+    std::string id;
+    float position = 0.0F;
+    WaterScenarioState state{};
+    WaterScenarioInterpolation interpolation = WaterScenarioInterpolation::Smooth;
+};
+
+struct WaterScenarioTrack {
+    std::string scenarioId;
+    std::string scenarioName;
+    WaterScenarioDefinition fallbackScenario{};
+    std::vector<WaterScenarioKey> keys;
+};
+
+struct WaterSeepageViewContext {
+    invisible_places::io::Float3 cameraPosition{};
+    bool hasCameraPosition = false;
 };
 
 struct WaterSeepageNode {
@@ -294,6 +354,8 @@ struct WaterSeepageRuntimeNode {
     glm::vec3 surfaceNormal{0.0F, 1.0F, 0.0F};
     glm::vec3 downAxis{0.0F, 0.0F, -1.0F};
     glm::vec3 lateralAxis{1.0F, 0.0F, 0.0F};
+    glm::mat3 noiseRotation{1.0F};
+    glm::vec3 environmentDirection{0.0F, 0.0F, 1.0F};
     float reachMeters = 1.25F;
     float startHalfWidthMeters = 0.06F;
     float endHalfWidthMeters = 0.375F;
@@ -302,8 +364,13 @@ struct WaterSeepageRuntimeNode {
     float normalAlignment = 0.20F;
     float strength = 1.0F;
     float rainVisualStrength = 0.0F;
+    float scenarioSpread = 0.0F;
+    float authoredStrength = 1.0F;
     WaterSeepageQuality resolvedQuality = WaterSeepageQuality::Balanced;
+    WaterSeepageLookSettings authoredLook{};
     WaterSeepageLookSettings look{};
+    std::optional<WaterSeepageLookSettings> transitionLook;
+    float transitionAmount = 0.0F;
     std::uint32_t guideSampleCount = 0U;
     std::array<WaterSeepageGuideSample, kWaterSeepageMaximumGuideSamples> guideSamples{};
     float guideRequestedReachMeters = 0.0F;
@@ -576,6 +643,8 @@ struct WaterRainDiagnostics {
     std::uint32_t emittedSampleCount = 0;
     std::uint32_t routeAnchorCount = 0;
     std::uint32_t firstSupportHitCount = 0;
+    std::uint32_t meshSurfaceHitCount = 0;
+    std::uint32_t vegetationDripCount = 0;
     std::uint32_t sandTerminationCount = 0;
     std::uint32_t fallbackTerminationCount = 0;
     std::uint32_t noSupportKillCount = 0;
@@ -716,6 +785,15 @@ struct WaterDynamicMeshFlowDiagnostics {
 [[nodiscard]] float WaterRainPresetVisualStrength(WaterRainIntensityPreset preset);
 
 [[nodiscard]] WaterSeepageLookSettings DefaultWaterSeepageLookSettings();
+[[nodiscard]] std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions();
+[[nodiscard]] WaterScenarioState EvaluateWaterScenarioTrack(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float normalizedPosition);
+void AddOrUpdateWaterScenarioKey(
+    WaterScenarioTrack* track,
+    WaterScenarioKey key,
+    float replacementTolerance = 0.0001F);
 [[nodiscard]] WaterSeepageQuality ResolveWaterSeepageQuality(
     WaterSeepageQuality quality,
     std::uint64_t effectivePointInvocations);
@@ -741,17 +819,25 @@ struct WaterDynamicMeshFlowDiagnostics {
     bool forExport,
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
-    std::span<const WaterSeepageSurfaceGuide> guides = {});
+    std::span<const WaterSeepageSurfaceGuide> guides = {},
+    const std::optional<WaterScenarioState>& scenarioState = std::nullopt);
+void ApplyWaterSeepageScenarioParameters(
+    WaterSeepageSpatialGrid* grid,
+    const std::optional<WaterScenarioState>& scenarioState,
+    const WaterRainSettings& rainSettings,
+    std::uint64_t effectivePointInvocations);
 [[nodiscard]] WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     const WaterSeepageRuntimeNode& node,
     const invisible_places::io::Float3& position,
     const invisible_places::io::Float3& normal,
-    float timeSeconds);
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext = {});
 [[nodiscard]] WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
     const WaterSeepageSpatialGrid& grid,
     const invisible_places::io::Float3& position,
     const invisible_places::io::Float3& normal,
-    float timeSeconds);
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext = {});
 [[nodiscard]] std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid);
 [[nodiscard]] std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid);
 
@@ -1012,6 +1098,14 @@ struct WaterEmitter {
     std::optional<WaterSourceSettings> sourceSettings;
     std::optional<WaterSourceSettings> tempSourceSettings;
     std::string pathProfileName = "Global";
+    std::string laneProfileName = "Global";
+    std::string trailProfileName = "Global";
+};
+
+struct WaterManualFlowPathSource {
+    std::uint32_t id = 0;
+    std::string name = "Path Source";
+    std::vector<invisible_places::io::Float3> controlPoints;
     std::string laneProfileName = "Global";
     std::string trailProfileName = "Global";
 };
@@ -1373,6 +1467,9 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterOverlay& pathAnchors,
     const WaterFlowTrailSettings& settings,
     const WaterPathAnalysisCache* analysis);
+[[nodiscard]] WaterOverlay BuildManualFlowPathAnchors(
+    const WaterManualFlowPathSource& source,
+    float sampleSpacingMeters = 0.025F);
 [[nodiscard]] WaterFieldCache BuildFieldCacheFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFieldSettings& settings);
@@ -1389,6 +1486,12 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const std::vector<WaterEmitter>& emitters);
 [[nodiscard]] WaterTrailOverlay BuildRainTrailOverlay(
     std::span<const WaterSceneSupportLayer> supportLayers,
+    const WaterRainCameraFrame& cameraFrame,
+    const WaterRainSettings& settings,
+    WaterRainDiagnostics* diagnostics = nullptr);
+[[nodiscard]] WaterTrailOverlay BuildRainTrailOverlay(
+    std::span<const WaterSceneSupportLayer> supportLayers,
+    const MeshSurfaceCache* meshSurface,
     const WaterRainCameraFrame& cameraFrame,
     const WaterRainSettings& settings,
     WaterRainDiagnostics* diagnostics = nullptr);

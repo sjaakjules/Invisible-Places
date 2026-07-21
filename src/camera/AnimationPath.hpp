@@ -53,6 +53,8 @@ struct AnimationPath {
     float depthOfFieldMaxBlurPixels = 24.0F;
     AnimationExportSettings exportSettings{};
     std::vector<std::string> exportVisualNames;
+    std::string selectedWaterScenarioId;
+    std::vector<invisible_places::water::WaterScenarioTrack> waterScenarioTracks;
     std::optional<invisible_places::water::WaterAnimationTrailSettings> waterAnimationTrailSettings;
     std::optional<invisible_places::water::WaterAnimationTrailSettings> tempWaterAnimationTrailSettings;
     std::optional<invisible_places::renderer::pointcloud::PointCloudStyleState> waterPointVisualStyle;

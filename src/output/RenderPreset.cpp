@@ -140,6 +140,24 @@ ExportPreset MakeFastPreviewMp4ExportPreset() {
     return preset;
 }
 
+ExportPreset MakeHevcAlphaMp4ExportPreset() {
+    auto preset = MakeFastPreviewMp4ExportPreset();
+    preset.name = std::string{kHevcAlphaMp4PresetName};
+    preset.mode = AnimationExportMode::HevcAlphaMp4;
+    preset.settings.width = 3840;
+    preset.settings.height = 2160;
+    preset.settings.supersampleScale = 2;
+    preset.settings.spatialAntialiasing = true;
+    return preset;
+}
+
+ExportPreset MakePngStackExportPreset() {
+    auto preset = MakeHevcAlphaMp4ExportPreset();
+    preset.name = std::string{kPngStackPresetName};
+    preset.mode = AnimationExportMode::PngStack;
+    return preset;
+}
+
 ExportPreset MakeProRes4444ExportPreset() {
     ExportPreset preset;
     preset.name = std::string{kProRes4444PresetName};
@@ -209,6 +227,8 @@ ExportPreset MakeProRes4444XqVideoToolboxExportPreset() {
 std::vector<ExportPreset> BuiltInExportPresets() {
     return {
         MakeFastPreviewMp4ExportPreset(),
+        MakeHevcAlphaMp4ExportPreset(),
+        MakePngStackExportPreset(),
         MakeProRes422ExportPreset(),
         MakeProRes422HqExportPreset(),
         MakeProRes422VideoToolboxExportPreset(),
@@ -222,6 +242,8 @@ std::vector<ExportPreset> BuiltInExportPresets() {
 bool IsBuiltInExportPresetName(std::string_view name) {
     const auto normalized = NormalizeExportPresetName(name);
     return normalized == kFastPreviewMp4PresetName ||
+           normalized == kHevcAlphaMp4PresetName ||
+           normalized == kPngStackPresetName ||
            normalized == kProRes422PresetName ||
            normalized == kProRes422HqPresetName ||
            normalized == kProRes422VideoToolboxPresetName ||

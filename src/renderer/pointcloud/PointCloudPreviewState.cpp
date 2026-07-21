@@ -415,8 +415,16 @@ bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) 
 }
 
 bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style) {
-    return style.shorelineWaveEnabled &&
-           style.shorelineHeightReachMeters > kMaterialEpsilon &&
+    if (!style.shorelineWaveEnabled) {
+        return false;
+    }
+    if (style.shorelineWaveAlgorithm == PointCloudShorelineWaveAlgorithm::HeightFoam) {
+        return style.shorelineHeightFoam.offshoreReachMeters > kMaterialEpsilon &&
+               style.shorelineHeightFoam.wavelengthMeters > kMaterialEpsilon &&
+               style.shorelineHeightFoam.intensity > kMaterialEpsilon &&
+               style.shorelineHeightFoam.speed > kMaterialEpsilon;
+    }
+    return style.shorelineHeightReachMeters > kMaterialEpsilon &&
            style.shorelineWavelengthMeters > kMaterialEpsilon &&
            style.shorelineIntensity > kMaterialEpsilon &&
            style.shorelineSpeed > kMaterialEpsilon;
@@ -502,6 +510,22 @@ float ShorelineWaveHeightMask(
     return std::clamp(waterSide * reachFade, 0.0F, 1.0F);
 }
 
+float NormalizeHeightFoamBreakZ(
+    float runupZ,
+    float offshoreReachMeters,
+    float edgeFadeMeters,
+    float breakZ) {
+    const float safeReach = std::max(0.001F, offshoreReachMeters);
+    const float offshoreZ = runupZ - safeReach;
+    const float margin = std::min(std::max(0.001F, edgeFadeMeters), safeReach * 0.45F);
+    const float minimumBreakZ = offshoreZ + margin;
+    const float maximumBreakZ = runupZ - margin;
+    if (minimumBreakZ >= maximumBreakZ) {
+        return offshoreZ + safeReach * 0.5F;
+    }
+    return std::clamp(breakZ, minimumBreakZ, maximumBreakZ);
+}
+
 float WorldDiameterToScreenPointSizePixels(
     float diameterMeters,
     float viewDepth,
@@ -562,6 +586,30 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.causticMaskFieldSlot = sourceStyle.causticMaskFieldSlot;
     style.causticEdgeFieldSlot = sourceStyle.causticEdgeFieldSlot;
     style.causticSeedFieldSlot = sourceStyle.causticSeedFieldSlot;
+    style.shorelineWaveEnabled = sourceStyle.shorelineWaveEnabled;
+    style.shorelineWaveAlgorithm = sourceStyle.shorelineWaveAlgorithm;
+    style.shorelineHeightFoam = sourceStyle.shorelineHeightFoam;
+    style.shorelineBoundaryZ = sourceStyle.shorelineBoundaryZ;
+    style.shorelineHeightReachMeters = sourceStyle.shorelineHeightReachMeters;
+    style.shorelineEdgeFadeMeters = sourceStyle.shorelineEdgeFadeMeters;
+    style.shorelineDirectionX = sourceStyle.shorelineDirectionX;
+    style.shorelineDirectionY = sourceStyle.shorelineDirectionY;
+    style.shorelinePatternScale = sourceStyle.shorelinePatternScale;
+    style.shorelineWavelengthMeters = sourceStyle.shorelineWavelengthMeters;
+    style.shorelineSpeed = sourceStyle.shorelineSpeed;
+    style.shorelineWarp = sourceStyle.shorelineWarp;
+    style.shorelineTurbulence = sourceStyle.shorelineTurbulence;
+    style.shorelineDensity = sourceStyle.shorelineDensity;
+    style.shorelinePhase = sourceStyle.shorelinePhase;
+    style.shorelineIntensity = sourceStyle.shorelineIntensity;
+    style.shorelineEmissionAdd = sourceStyle.shorelineEmissionAdd;
+    style.shorelineOpacityAdd = sourceStyle.shorelineOpacityAdd;
+    style.shorelineOpacityMultiply = sourceStyle.shorelineOpacityMultiply;
+    style.shorelinePointSizeAdd = sourceStyle.shorelinePointSizeAdd;
+    style.shorelinePointSizeMultiply = sourceStyle.shorelinePointSizeMultiply;
+    style.shorelineColourMix = sourceStyle.shorelineColourMix;
+    style.shorelineColour = sourceStyle.shorelineColour;
+    style.shorelineSeed = sourceStyle.shorelineSeed;
     if (style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters) {
         invisible_places::style::SetScalarConstant(&style.pointSize, 1.0F);
         style.surfelDiameter = sourceStyle.surfelDiameter;

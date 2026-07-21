@@ -74,6 +74,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 shorelineWaveParams2;
     vec4 shorelineWaveParams3;
     vec4 shorelineWaveParams4;
+    vec4 shorelineWaveParams5;
     vec4 shorelineWaveTint;
     vec4 gradientStartColor;
     vec4 gradientEndColor;
@@ -525,7 +526,8 @@ float WaterTrailTravelPhase(uint pointIndex) {
     const float trailDistance = max(0.0, LoadScalarFieldValue(kWaterTrailDistanceFieldSlot, pointIndex));
     const float trailAge = LoadScalarFieldValue(kWaterTrailAgeFieldSlot, pointIndex);
     const float baseStartPhase = LoadScalarFieldValue(kWaterTrailStartPhaseFieldSlot, pointIndex);
-    const float speed = max(0.0, LoadScalarFieldValue(kWaterTrailSpeedFieldSlot, pointIndex));
+    const float speed = max(0.0, LoadScalarFieldValue(kWaterTrailSpeedFieldSlot, pointIndex)) *
+                        max(0.0, styleData.renderParams2.y);
     const float trailStartPhase = fract(
         baseStartPhase +
         trailAge +
@@ -615,7 +617,15 @@ float WaterTrailVisibility(uint pointIndex, vec3 center) {
     const float cameraFade = 1.0 - smoothstep(cameraDeathDistance * 0.82, cameraDeathDistance, cameraDistance);
     const float pointAge = clamp(LoadScalarFieldValue(kWaterTrailPointAgeFieldSlot, pointIndex), 0.0, 1.0);
     const float tailFade = 1.0 - smoothstep(0.86, 1.0, pointAge);
-    return birthFade * endFade * cameraFade * tailFade;
+    const float rainLevel = clamp(styleData.renderParams1.w, 0.0, 1.0);
+    const float selector = clamp(
+        LoadScalarFieldValue(kWaterTrailCrossSeedFieldSlot, pointIndex),
+        0.0,
+        1.0);
+    if (rainLevel <= 1e-5 || selector > rainLevel) {
+        return 0.0;
+    }
+    return birthFade * endFade * cameraFade * tailFade * (0.20 + rainLevel * 0.80);
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -636,6 +646,9 @@ vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition
     const vec3 p1 = surfelPositions.positions[routeStart + p1Offset].xyz;
     const vec3 p2 = surfelPositions.positions[routeStart + p2Offset].xyz;
     const vec3 p3 = surfelPositions.positions[routeStart + p3Offset].xyz;
+    if (WaterTrailIsRain(pointIndex)) {
+        return mix(p1, p2, t);
+    }
     return CatmullRomWater(p0, p1, p2, p3, t);
 }
 
@@ -682,6 +695,24 @@ vec3 WaterTrailRouteNormal(uint pointIndex, float phase) {
         surfelNormals.normals[routeStart + p2Offset].xyz,
         t);
     return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+}
+
+float WaterRainRunoffSurfaceGripFromTangent(vec3 routeTangent) {
+    if (dot(routeTangent, routeTangent) <= 1e-8) {
+        return 0.0;
+    }
+    const float verticalTravel = abs(normalize(routeTangent).z);
+    return 1.0 - smoothstep(0.62, 0.88, verticalTravel);
+}
+
+float WaterRainRunoffSurfaceGrip(uint pointIndex) {
+    if (!WaterTrailOverlayEnabled() ||
+        !WaterTrailIsRain(pointIndex) ||
+        LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex) < 0.5) {
+        return 0.0;
+    }
+    return WaterRainRunoffSurfaceGripFromTangent(
+        WaterTrailRouteTangent(pointIndex, WaterTrailTravelPhase(pointIndex)));
 }
 
 vec3 RainPseudoWindOffset(uint pointIndex, vec3 routePosition, vec3 routeTangent) {
@@ -935,6 +966,44 @@ vec3 CameraUp() {
     return normalize(vec3(uniforms.view[0][1], uniforms.view[1][1], uniforms.view[2][1]));
 }
 
+bool ResolveWaterRainRunoffBasis(
+    vec3 center,
+    uint pointIndex,
+    out vec3 tangent,
+    out vec3 bitangent,
+    out float surfaceAngleMask) {
+    if (!WaterTrailOverlayEnabled() ||
+        !WaterTrailIsRain(pointIndex) ||
+        LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex) < 0.5) {
+        return false;
+    }
+
+    const float phase = WaterTrailTravelPhase(pointIndex);
+    const vec3 routeTangent = WaterTrailRouteTangent(pointIndex, phase);
+    if (WaterRainRunoffSurfaceGripFromTangent(routeTangent) <= 0.15) {
+        return false;
+    }
+
+    vec3 routeNormal = WaterTrailRouteNormal(pointIndex, phase);
+    if (dot(routeNormal, routeNormal) <= 1e-8) {
+        return false;
+    }
+    routeNormal = normalize(routeNormal);
+
+    tangent = routeTangent - routeNormal * dot(routeTangent, routeNormal);
+    if (dot(tangent, tangent) <= 1e-8) {
+        return false;
+    }
+    tangent = normalize(tangent);
+    bitangent = normalize(cross(routeNormal, tangent));
+
+    const vec3 viewDirection = uniforms.cameraPosition.xyz - center;
+    surfaceAngleMask = dot(viewDirection, viewDirection) > 1e-8
+        ? clamp(1.0 - abs(dot(routeNormal, normalize(viewDirection))), 0.0, 1.0)
+        : 0.0;
+    return true;
+}
+
 void ResolveBasis(
     vec3 center,
     uint pointIndex,
@@ -948,6 +1017,10 @@ void ResolveBasis(
     vec3 normal = useNormal ? surfelNormals.normals[pointIndex].xyz : vec3(0.0);
     useNormal = useNormal && dot(normal, normal) > 1e-8;
     const float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
+
+    if (ResolveWaterRainRunoffBasis(center, pointIndex, tangent, bitangent, surfaceAngleMask)) {
+        return;
+    }
 
     if (!useNormal) {
         normal = uniforms.cameraPosition.xyz - center;
@@ -1073,7 +1146,8 @@ void main() {
             ? mix(1.0, max(0.0, WaterEffectField(styleData.waterEffectSlots0.y, pointIndex, 1.0)), waterEffectScale)
             : 1.0;
     const float sparseRipplePointSizeMultiply = sparseRipple.pointSizeMultiply;
-    const float authoredDiameter =
+    const float rainSurfaceGrip = WaterRainRunoffSurfaceGrip(pointIndex);
+    float authoredDiameter =
         ((WaterTrailOverlayEnabled()
               ? WaterTrailWidth(pointIndex)
               : max(0.0, EvaluateBinding(styleData.surfelDiameterBinding, pointIndex))) *
@@ -1084,14 +1158,18 @@ void main() {
              sparseRipplePointSizeMultiply) +
         waterEffectPointSizeAdd +
         sparseRipplePointSizeAdd;
+    authoredDiameter *= mix(1.0, 1.30, rainSurfaceGrip);
     const float diameter =
         authoredDiameter * max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
-        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
-    const float waterStreakAspect =
-        WaterTrailOverlayEnabled()
-            ? max(1.0, WaterTrailStreakLength(pointIndex) / max(diameter, 0.0001))
-            : (styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0);
+        ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x + rainSurfaceGrip * 1.25);
+    float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
+    if (WaterTrailOverlayEnabled()) {
+        const float trailStreakLength =
+            WaterTrailStreakLength(pointIndex) * mix(1.0, 0.45, rainSurfaceGrip);
+        waterStreakAspect = max(1.0, trailStreakLength / max(diameter, 0.0001));
+        waterStreakAspect = min(waterStreakAspect, mix(64.0, 12.0, rainSurfaceGrip));
+    }
     const vec3 offset = (tangent * corner.x * waterStreakAspect + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);
     const vec4 viewPosition = uniforms.view * worldPosition;

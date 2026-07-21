@@ -1,5 +1,6 @@
 #include "app/Application.hpp"
 
+#include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointVisualSelection.hpp"
 #include "app/WaterPathDiagnostics.hpp"
 #include "camera/AnimationPath.hpp"
@@ -100,6 +101,8 @@ using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointClou
 using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointCloudRendererMode;
+using PointCloudShorelineWaveAlgorithm =
+    invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
 using PointCloudDensityCompensation =
     invisible_places::renderer::pointcloud::PointCloudDensityCompensation;
 using PointCloudScreenSpriteSizeMode = invisible_places::renderer::pointcloud::PointCloudScreenSpriteSizeMode;
@@ -134,6 +137,7 @@ using WaterEffectPoint = invisible_places::water::WaterEffectPoint;
 using WaterEmitter = invisible_places::water::WaterEmitter;
 using WaterEmitterOrigin = invisible_places::water::WaterEmitterOrigin;
 using WaterEmitterStatus = invisible_places::water::WaterEmitterStatus;
+using WaterManualFlowPathSource = invisible_places::water::WaterManualFlowPathSource;
 using WaterFieldCache = invisible_places::water::WaterFieldCache;
 using WaterFieldOutputMode = invisible_places::water::WaterFieldOutputMode;
 using WaterFieldSettings = invisible_places::water::WaterFieldSettings;
@@ -162,6 +166,7 @@ using WaterRainSettings = invisible_places::water::WaterRainSettings;
 using WaterSeepageLookProfile = invisible_places::water::WaterSeepageLookProfile;
 using WaterSeepageLookSettings = invisible_places::water::WaterSeepageLookSettings;
 using WaterSeepageNode = invisible_places::water::WaterSeepageNode;
+using WaterSeepagePattern = invisible_places::water::WaterSeepagePattern;
 using WaterSeepageQuality = invisible_places::water::WaterSeepageQuality;
 using WaterSeepageSurfaceGuide = invisible_places::water::WaterSeepageSurfaceGuide;
 using WaterSeepageSpatialGrid = invisible_places::water::WaterSeepageSpatialGrid;
@@ -207,6 +212,7 @@ enum class PointCloudLoadPurpose : std::uint8_t {
     Interactive,
     AnalysisCpuOnly,
     StagedDisplay,
+    ExportGpu,
 };
 
 struct QueuedLayerLoad {
@@ -307,6 +313,8 @@ struct AnimationViewportDragState {
 
 struct QueuedQuickMp4Export {
     AnimationPath animationPath{};
+    std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
+    WaterRainSettings waterRainSettings{};
     invisible_places::output::AnimationExportMode mode =
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
     RenderJobSettings settings{};
@@ -315,6 +323,7 @@ struct QueuedQuickMp4Export {
     std::size_t visualSessionIndex = 0;
     PointCloudStyleState visualStyle{};
     std::filesystem::path videoOutputPath;
+    std::filesystem::path pngStackDirectory;
 };
 
 struct AnimationFramePreviewState {
@@ -365,6 +374,8 @@ struct AnimationPanelState {
     std::string fileRenameBuffer;
     bool focusFileRename = false;
     std::optional<std::size_t> selectedKeyIndex;
+    std::optional<std::size_t> selectedWaterKeyIndex;
+    std::optional<std::size_t> waterKeyCopySourceIndex;
     AnimationEditTarget editTarget = AnimationEditTarget::Camera;
     invisible_places::output::AnimationExportMode exportMode =
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
@@ -407,10 +418,13 @@ struct AnimationExportOutputOptions {
     bool writeExrStack = false;
     bool writePreviewMp4 = false;
     bool writeProResMov = false;
+    bool writePngStack = false;
     bool previewMp4Optional = false;
     std::uint32_t mp4SupersampleScale = 1;
     bool spatialAntialiasing = true;
     std::filesystem::path previewVideoPath;
+    std::filesystem::path pngStackDirectory;
+    std::string pngStackFrameStem;
     std::string previewVideoWarning;
 };
 
@@ -491,9 +505,12 @@ struct OfflineRenderJobState {
     std::chrono::steady_clock::time_point startedAt{};
     std::filesystem::path lastOutputPath;
     std::filesystem::path videoOutputPath;
+    std::filesystem::path pngStackDirectory;
+    std::string pngStackFrameStem;
     bool writeExrStack = false;
     bool writePreviewMp4 = false;
     bool writeProResMov = false;
+    bool writePngStack = false;
     bool optionalPreviewMp4 = false;
     std::uint32_t mp4SupersampleScale = 1;
     bool spatialAntialiasing = true;
@@ -515,6 +532,19 @@ struct OfflineRenderJobState {
     std::size_t quickMp4BatchTotal = 0;
     std::string animationName;
     std::optional<AnimationPath> animationPath;
+    struct FrozenSeepageLayer {
+        std::size_t layerId = 0U;
+        WaterSeepageSpatialGrid grid{};
+    };
+    struct FrozenRainLayer {
+        std::size_t layerId = 0U;
+        PointCloudStyleState baseStyle{};
+    };
+    std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
+    WaterRainSettings waterRainSettings{};
+    std::uint64_t effectiveSeepageInvocations = 0U;
+    std::vector<FrozenSeepageLayer> frozenSeepageLayers;
+    std::vector<FrozenRainLayer> frozenRainLayers;
     std::optional<invisible_places::camera::PreparedAnimationPathEvaluationContext> preparedAnimationPath;
     std::filesystem::path animationFilePath;
     std::string exportVisualName;
@@ -532,6 +562,19 @@ struct OfflineRenderJobState {
     bool writerWaitActive = false;
     std::chrono::steady_clock::time_point writerWaitStartedAt{};
 };
+
+struct PreviewRuntimeState;
+std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
+    PreviewRuntimeState* runtimeState,
+    std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
+    std::uint64_t effectiveInvocations);
+std::vector<OfflineRenderJobState::FrozenRainLayer> BuildFrozenAnimationRainLayers(
+    PreviewRuntimeState* runtimeState,
+    std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers);
+void UploadFrozenAnimationSeepageParameters(
+    OfflineRenderJobState* job,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    float sampleTimeSeconds);
 
 struct StillCameraPreviewLodPreparationRequest {
     std::size_t sessionIndex = 0;
@@ -587,6 +630,8 @@ void NormalizeAnimationRenderSettings(RenderJobSettings* settings);
 bool AnimationExportWritesMp4(invisible_places::output::AnimationExportMode mode);
 bool AnimationExportWritesVideo(invisible_places::output::AnimationExportMode mode);
 bool AnimationExportWritesExr(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportWritesPngStack(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportUsesSupersampledRgbaFrames(invisible_places::output::AnimationExportMode mode);
 const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMode mode);
 bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode);
 std::uint32_t ScaledRenderDimension(std::uint32_t dimension, std::uint32_t scale);
@@ -868,6 +913,39 @@ struct WaterRegionEditorState {
     bool consumedViewportInputThisFrame = false;
 };
 
+enum class ManualFlowPathGizmoDragKind {
+    None,
+    Axis,
+    Plane,
+    ViewPlane,
+};
+
+struct ManualFlowPathGizmoDragState {
+    ManualFlowPathGizmoDragKind kind = ManualFlowPathGizmoDragKind::None;
+    std::size_t nodeIndex = 0U;
+    invisible_places::io::Float3 startPoint{};
+    ImVec2 startMouse{};
+    glm::vec3 axis{1.0F, 0.0F, 0.0F};
+    glm::vec3 planeNormal{0.0F, 0.0F, 1.0F};
+    glm::vec3 startPlaneIntersection{0.0F, 0.0F, 0.0F};
+    ImVec2 axisScreenDirection{1.0F, 0.0F};
+    float pixelsPerWorldUnit = 1.0F;
+    float startAxisParameter = 0.0F;
+    bool axisUsesProjectedFallback = false;
+};
+
+struct ManualFlowPathEditorState {
+    bool active = false;
+    bool creating = false;
+    std::optional<std::size_t> sourceIndex;
+    WaterManualFlowPathSource draft{};
+    std::optional<std::size_t> selectedNodeIndex;
+    std::optional<std::size_t> hoveredNodeIndex;
+    ManualFlowPathGizmoDragState drag{};
+    bool pointerCapturedUntilRelease = false;
+    bool consumedViewportInputThisFrame = false;
+};
+
 enum WaterPathDebugDiagnosticMask : std::uint32_t {
     WaterPathDebugDiagnosticSlope = 1U << 0U,
     WaterPathDebugDiagnosticFlatness = 1U << 1U,
@@ -958,10 +1036,14 @@ struct WaterRegionPointPreviewJobState {
 
 struct WaterWorkflowState {
     std::vector<WaterEmitter> emitters;
+    std::vector<WaterManualFlowPathSource> manualFlowPaths;
     std::vector<WaterSeepageNode> seepageNodes;
     WaterSeepageLookSettings defaultSeepageLook =
         invisible_places::water::DefaultWaterSeepageLookSettings();
     std::vector<WaterSeepageLookProfile> seepageLookProfiles;
+    std::vector<invisible_places::water::WaterScenarioDefinition> seepageScenarios =
+        invisible_places::water::DefaultWaterScenarioDefinitions();
+    std::string selectedSeepageScenarioId;
     std::string seepageLookNameBuffer = "Default";
     std::vector<WaterEffectLayer> rippleLayers;
     std::vector<WaterEffectLayer> fieldLayers;
@@ -1009,8 +1091,10 @@ struct WaterWorkflowState {
         invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
     WaterRainSettings rainSettings = invisible_places::water::DefaultWaterRainSettings();
     WaterRainDiagnostics rainDiagnostics{};
+    bool rainMaximumScenarioFixturePrepared = false;
     WaterDynamicMeshFlowDiagnostics dynamicMeshFlowDiagnostics{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
+    bool showFlowSourceGuides = true;
     WaterOverlay pathAnchors{};
     WaterOverlay flowOverlay{};
     WaterTrailOverlay flowTrailOverlay{};
@@ -1023,6 +1107,9 @@ struct WaterWorkflowState {
     std::shared_ptr<MeshSurfaceCache> dynamicMeshSurfaceCache;
     std::filesystem::path dynamicMeshSurfaceCachePath;
     std::string dynamicMeshSurfaceCacheSignature;
+    std::shared_ptr<MeshSurfaceCache> rainMeshSurfaceCache;
+    std::filesystem::path rainMeshSurfaceCachePath;
+    std::string rainMeshSurfaceCacheSignature;
     DynamicMeshSurfaceCacheWarmupJob dynamicMeshSurfaceCacheWarmup;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
     std::uint64_t flowOverlayRevision = 0;
@@ -1057,6 +1144,8 @@ struct WaterWorkflowState {
     WaterRegionFeature activeRegionFeature = WaterRegionFeature::None;
     WaterRegionEditorState regionEditor{};
     std::optional<std::size_t> selectedEmitterIndex;
+    std::optional<std::size_t> selectedManualFlowPathIndex;
+    ManualFlowPathEditorState manualFlowPathEditor{};
     std::optional<std::size_t> movingEmitterIndex;
     std::optional<std::size_t> selectedSeepageNodeIndex;
     std::optional<std::size_t> movingSeepageNodeIndex;
@@ -1144,6 +1233,124 @@ bool SessionsShareSceneFolder(
 bool IsRenderablePointCloudSource(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session);
+std::uint64_t EffectiveWaterSeepageShaderInvocations(
+    const PreviewRuntimeState& runtimeState);
+std::uint64_t EffectiveExportWaterSeepageShaderInvocations(
+    const PreviewRuntimeState& runtimeState);
+
+const invisible_places::water::WaterScenarioDefinition* FindWaterScenarioDefinition(
+    const WaterWorkflowState& water,
+    std::string_view scenarioId) {
+    const auto scenarioIt = std::find_if(
+        water.seepageScenarios.begin(),
+        water.seepageScenarios.end(),
+        [&](const auto& scenario) { return scenario.id == scenarioId; });
+    return scenarioIt != water.seepageScenarios.end() ? &*scenarioIt : nullptr;
+}
+
+std::string WaterScenarioDisplayName(
+    std::span<const invisible_places::water::WaterScenarioDefinition> definitions,
+    const AnimationPath& animation) {
+    if (animation.selectedWaterScenarioId.empty()) {
+        return {};
+    }
+    const auto definitionIt = std::find_if(
+        definitions.begin(),
+        definitions.end(),
+        [&](const auto& definition) {
+            return definition.id == animation.selectedWaterScenarioId;
+        });
+    if (definitionIt != definitions.end() && !definitionIt->name.empty()) {
+        return definitionIt->name;
+    }
+    const auto trackIt = std::find_if(
+        animation.waterScenarioTracks.begin(),
+        animation.waterScenarioTracks.end(),
+        [&](const auto& track) {
+            return track.scenarioId == animation.selectedWaterScenarioId;
+        });
+    if (trackIt != animation.waterScenarioTracks.end()) {
+        if (!trackIt->scenarioName.empty()) {
+            return trackIt->scenarioName;
+        }
+        if (!trackIt->fallbackScenario.name.empty()) {
+            return trackIt->fallbackScenario.name;
+        }
+    }
+    return animation.selectedWaterScenarioId;
+}
+
+std::string AnimationNameWithWaterScenario(
+    std::string animationName,
+    std::span<const invisible_places::water::WaterScenarioDefinition> definitions,
+    const AnimationPath& animation) {
+    const auto scenarioName = WaterScenarioDisplayName(definitions, animation);
+    if (!scenarioName.empty()) {
+        animationName += " - " + scenarioName;
+    }
+    return animationName;
+}
+
+std::optional<invisible_places::water::WaterScenarioState> ResolveActiveWaterScenarioState(
+    const PreviewRuntimeState& runtimeState) {
+    const auto* animation = runtimeState.animationPanel.currentPath.has_value()
+                                ? &runtimeState.animationPanel.currentPath.value()
+                                : nullptr;
+    const std::string& scenarioId =
+        animation != nullptr && !animation->selectedWaterScenarioId.empty()
+            ? animation->selectedWaterScenarioId
+            : runtimeState.water.selectedSeepageScenarioId;
+    if (scenarioId.empty()) {
+        return std::nullopt;
+    }
+
+    const auto* definition = FindWaterScenarioDefinition(runtimeState.water, scenarioId);
+    const invisible_places::water::WaterScenarioTrack* track = nullptr;
+    if (animation != nullptr) {
+        const auto trackIt = std::find_if(
+            animation->waterScenarioTracks.begin(),
+            animation->waterScenarioTracks.end(),
+            [&](const auto& candidate) { return candidate.scenarioId == scenarioId; });
+        if (trackIt != animation->waterScenarioTracks.end()) {
+            track = &*trackIt;
+        }
+    }
+
+    const auto* fallbackDefinition = definition;
+    if (fallbackDefinition == nullptr && track != nullptr &&
+        !track->fallbackScenario.id.empty()) {
+        fallbackDefinition = &track->fallbackScenario;
+    }
+    if (fallbackDefinition == nullptr) {
+        return std::nullopt;
+    }
+    if (track != nullptr) {
+        return invisible_places::water::EvaluateWaterScenarioTrack(
+            *track,
+            *fallbackDefinition,
+            runtimeState.animationPanel.scrubAmount);
+    }
+    return fallbackDefinition->state;
+}
+
+std::string ActiveWaterScenarioDisplayName(const PreviewRuntimeState& runtimeState) {
+    if (runtimeState.animationPanel.currentPath.has_value() &&
+        !runtimeState.animationPanel.currentPath->selectedWaterScenarioId.empty()) {
+        return WaterScenarioDisplayName(
+            runtimeState.water.seepageScenarios,
+            runtimeState.animationPanel.currentPath.value());
+    }
+    if (runtimeState.water.selectedSeepageScenarioId.empty()) {
+        return {};
+    }
+    if (const auto* definition = FindWaterScenarioDefinition(
+            runtimeState.water,
+            runtimeState.water.selectedSeepageScenarioId);
+        definition != nullptr && !definition->name.empty()) {
+        return definition->name;
+    }
+    return runtimeState.water.selectedSeepageScenarioId;
+}
 
 std::filesystem::path ResolveDataDirectory(const std::filesystem::path& requested) {
     if (!requested.empty()) {
@@ -2115,6 +2322,38 @@ void HashBinding(std::uint64_t* seed, const RenderParameterBinding& binding) {
     HashCombine(seed, binding.fieldMap.flags);
 }
 
+void HashHeightFoamShorelineSettings(
+    std::uint64_t* seed,
+    const invisible_places::renderer::pointcloud::PointCloudHeightFoamShorelineSettings& settings) {
+    HashFloat(seed, settings.runupZ);
+    HashFloat(seed, settings.breakZ);
+    HashFloat(seed, settings.offshoreReachMeters);
+    HashFloat(seed, settings.edgeFadeMeters);
+    HashFloat(seed, settings.directionX);
+    HashFloat(seed, settings.directionY);
+    HashFloat(seed, settings.patternScale);
+    HashFloat(seed, settings.wavelengthMeters);
+    HashFloat(seed, settings.speed);
+    HashFloat(seed, settings.warp);
+    HashFloat(seed, settings.turbulence);
+    HashFloat(seed, settings.density);
+    HashFloat(seed, settings.phase);
+    HashFloat(seed, settings.intensity);
+    HashFloat(seed, settings.offshoreFoamStrength);
+    HashFloat(seed, settings.incomingStrength);
+    HashFloat(seed, settings.returnStrength);
+    HashFloat(seed, settings.emissionAdd);
+    HashFloat(seed, settings.opacityAdd);
+    HashFloat(seed, settings.opacityMultiply);
+    HashFloat(seed, settings.pointSizeAdd);
+    HashFloat(seed, settings.pointSizeMultiply);
+    HashFloat(seed, settings.colourMix);
+    for (const float value : settings.colour) {
+        HashFloat(seed, value);
+    }
+    HashCombine(seed, settings.seed);
+}
+
 void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashCombine(seed, static_cast<std::uint64_t>(style.geometryMode));
     HashCombine(seed, static_cast<std::uint64_t>(style.screenSpriteSizeMode));
@@ -2176,6 +2415,32 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashCombine(seed, static_cast<std::uint64_t>(style.causticMaskFieldSlot + 1));
     HashCombine(seed, static_cast<std::uint64_t>(style.causticEdgeFieldSlot + 1));
     HashCombine(seed, static_cast<std::uint64_t>(style.causticSeedFieldSlot + 1));
+    HashBool(seed, style.shorelineWaveEnabled);
+    HashCombine(seed, static_cast<std::uint64_t>(style.shorelineWaveAlgorithm));
+    HashHeightFoamShorelineSettings(seed, style.shorelineHeightFoam);
+    HashFloat(seed, style.shorelineBoundaryZ);
+    HashFloat(seed, style.shorelineHeightReachMeters);
+    HashFloat(seed, style.shorelineEdgeFadeMeters);
+    HashFloat(seed, style.shorelineDirectionX);
+    HashFloat(seed, style.shorelineDirectionY);
+    HashFloat(seed, style.shorelinePatternScale);
+    HashFloat(seed, style.shorelineWavelengthMeters);
+    HashFloat(seed, style.shorelineSpeed);
+    HashFloat(seed, style.shorelineWarp);
+    HashFloat(seed, style.shorelineTurbulence);
+    HashFloat(seed, style.shorelineDensity);
+    HashFloat(seed, style.shorelinePhase);
+    HashFloat(seed, style.shorelineIntensity);
+    HashFloat(seed, style.shorelineEmissionAdd);
+    HashFloat(seed, style.shorelineOpacityAdd);
+    HashFloat(seed, style.shorelineOpacityMultiply);
+    HashFloat(seed, style.shorelinePointSizeAdd);
+    HashFloat(seed, style.shorelinePointSizeMultiply);
+    HashFloat(seed, style.shorelineColourMix);
+    for (const float value : style.shorelineColour) {
+        HashFloat(seed, value);
+    }
+    HashCombine(seed, style.shorelineSeed);
     HashFloat(seed, style.exposure);
     HashFloat(seed, style.innerRadius);
     HashFloat(seed, style.gaussianSharpness);
@@ -2872,6 +3137,9 @@ std::optional<PointCloudStyleState> MakeProtectedWaterPointVisualStyle(
     const PreviewRuntimeState& runtimeState,
     std::string_view name);
 PointCloudStyleState MakeWaterTrailExportStyle(PointCloudStyleState style);
+PointCloudStyleState MakeWaterRainTrailSessionStyle(
+    const SavedWaterTrailProfileState& profile,
+    WaterRainIntensityPreset intensityPreset);
 void SaveWaterPointVisualStyle(PreviewRuntimeState* runtimeState, const PointCloudStyleState& style);
 void ApplyWaterPointVisualStyleToGeneratedSessions(PreviewRuntimeState* runtimeState);
 enum class WaterOverlayRefreshPersistence {
@@ -2886,8 +3154,17 @@ bool RefreshWaterOverlayFromAnchors(
 bool RefreshWaterRainOverlay(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport);
+void DrawWaterSeepageParameterTooltip(const char* text);
+bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
+std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
+    PreviewRuntimeState* runtimeState,
+    WaterDynamicMeshFlowDiagnostics* diagnostics);
+std::shared_ptr<MeshSurfaceCache> EnsureRainMeshSurfaceCache(
+    PreviewRuntimeState* runtimeState,
+    WaterDynamicMeshFlowDiagnostics* diagnostics);
 std::optional<std::size_t> ResolveWaterSupportSessionIndex(const PreviewRuntimeState& runtimeState);
+bool HasValidManualFlowPath(const WaterWorkflowState& water);
 WaterSourceSettings ActiveProfileDefaultWaterSourceSettings(const WaterWorkflowState& water);
 bool TryLoadWaterPathCacheForSupport(
     PreviewRuntimeState* runtimeState,
@@ -4739,15 +5016,43 @@ void ScaleRenderBindingOutputs(RenderParameterBinding* binding, float scale) {
     binding->fieldMap.outputMax *= scale;
 }
 
+PointCloudStyleState ApplyContinuousRainLevelToStyle(
+    PointCloudStyleState style,
+    float rainLevel) {
+    rainLevel = std::clamp(rainLevel, 0.0F, 1.0F);
+    style.waterRainLevel = rainLevel;
+    style.waterRainSpeedScale = std::lerp(0.65F, 1.25F, rainLevel);
+    const float visibilityScale = std::max(0.001F, 0.18F + rainLevel * 0.82F);
+    const float emissionScale = std::max(0.001F, 0.10F + rainLevel * 0.90F);
+    const float widthScale = 0.70F + rainLevel * 0.45F;
+    ScaleRenderBindingOutputs(&style.opacity, visibilityScale);
+    ScaleRenderBindingOutputs(&style.emissiveStrength, emissionScale);
+    ScaleRenderBindingOutputs(&style.pointSize, widthScale);
+    ScaleRenderBindingOutputs(&style.surfelDiameter, widthScale);
+    return style;
+}
+
+bool IsRainTrailSession(const PreviewLayerSession& session) {
+    const auto stem = session.sourcePath.stem().string();
+    return stem.ends_with("-RainTrails") ||
+           stem.find("-RainTrails-") != std::string::npos;
+}
+
 PointCloudStyleState MakeSceneRenderStyle(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session,
     PointCloudStyleState style) {
-    (void)runtimeState;
     ResolveProjectVisualStyleBindingsByFieldName(&style, session);
-    return invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole(
+    style = invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole(
         style,
         session.sceneRole);
+    if (IsRainTrailSession(session)) {
+        if (const auto scenario = ResolveActiveWaterScenarioState(runtimeState);
+            scenario.has_value()) {
+            style = ApplyContinuousRainLevelToStyle(style, scenario->rainLevel);
+        }
+    }
+    return style;
 }
 
 std::string NormalizeSceneRoleName(std::string_view role);
@@ -4846,6 +5151,8 @@ void CopyShorelineWaveSettings(PointCloudStyleState* target, const PointCloudSty
         return;
     }
     target->shorelineWaveEnabled = source.shorelineWaveEnabled;
+    target->shorelineWaveAlgorithm = source.shorelineWaveAlgorithm;
+    target->shorelineHeightFoam = source.shorelineHeightFoam;
     target->shorelineBoundaryZ = source.shorelineBoundaryZ;
     target->shorelineHeightReachMeters = source.shorelineHeightReachMeters;
     target->shorelineEdgeFadeMeters = source.shorelineEdgeFadeMeters;
@@ -6630,13 +6937,19 @@ bool ActivateLoadedPointCloud(
             const float tangentY = widthX >= widthY ? 0.0F : 1.0F;
             auto applyDefaultShorelineDirection = [&](PointCloudStyleState* style) {
                 if (style == nullptr ||
-                    !style->shorelineWaveEnabled ||
-                    std::abs(style->shorelineDirectionX - 1.0F) > 1.0e-5F ||
-                    std::abs(style->shorelineDirectionY) > 1.0e-5F) {
+                    !style->shorelineWaveEnabled) {
                     return;
                 }
-                style->shorelineDirectionX = tangentX;
-                style->shorelineDirectionY = tangentY;
+                if (std::abs(style->shorelineDirectionX - 1.0F) <= 1.0e-5F &&
+                    std::abs(style->shorelineDirectionY) <= 1.0e-5F) {
+                    style->shorelineDirectionX = tangentX;
+                    style->shorelineDirectionY = tangentY;
+                }
+                if (std::abs(style->shorelineHeightFoam.directionX - 1.0F) <= 1.0e-5F &&
+                    std::abs(style->shorelineHeightFoam.directionY) <= 1.0e-5F) {
+                    style->shorelineHeightFoam.directionX = tangentX;
+                    style->shorelineHeightFoam.directionY = tangentY;
+                }
             };
             applyDefaultShorelineDirection(&session.pointStyle);
             for (auto& visual : session.pointVisuals) {
@@ -6906,6 +7219,12 @@ void PollPendingLayerLoad(
             completedSessionIndex,
             purpose,
             sceneSwitchGeneration);
+        if (HasValidManualFlowPath(runtimeState->water)) {
+            RefreshWaterOverlayFromAnchors(
+                runtimeState,
+                viewport,
+                WaterOverlayRefreshPersistence::InMemoryOnly);
+        }
         RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
         QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
         return;
@@ -6973,7 +7292,9 @@ void PollPendingLayerLoad(
             runtimeState->errorMessage);
         return;
     }
-    if (runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCacheStale) {
+    const bool hasManualFlowPath = HasValidManualFlowPath(runtimeState->water);
+    if ((runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCacheStale) ||
+        hasManualFlowPath) {
         const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
         const bool completedAffectsSupport =
             supportIndex.has_value() &&
@@ -6986,14 +7307,20 @@ void PollPendingLayerLoad(
                   runtimeState->sessions[completedSessionIndex])));
         if (completedAffectsSupport) {
             const auto& supportSession = runtimeState->sessions[supportIndex.value()];
-            const auto expectedSignature = CombinedWaterSupportSignature(
-                *runtimeState,
-                supportSession,
-                ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path);
-            if (runtimeState->water.pathCache.supportSignature != expectedSignature) {
-                runtimeState->water.pathCacheStale = true;
-                runtimeState->water.pathDirty = true;
-            } else {
+            bool generatedCacheUsable = runtimeState->water.pathCacheLoaded &&
+                                        !runtimeState->water.pathCacheStale;
+            if (generatedCacheUsable) {
+                const auto expectedSignature = CombinedWaterSupportSignature(
+                    *runtimeState,
+                    supportSession,
+                    ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path);
+                if (runtimeState->water.pathCache.supportSignature != expectedSignature) {
+                    runtimeState->water.pathCacheStale = true;
+                    runtimeState->water.pathDirty = true;
+                    generatedCacheUsable = false;
+                }
+            }
+            if (generatedCacheUsable || hasManualFlowPath) {
                 RefreshWaterOverlayFromAnchors(
                     runtimeState,
                     viewport,
@@ -7568,6 +7895,9 @@ std::uint32_t NextWaterEmitterId(const PreviewRuntimeState& runtimeState) {
     std::uint32_t nextId = std::max<std::uint32_t>(1U, runtimeState.water.nextEmitterId);
     for (const auto& emitter : runtimeState.water.emitters) {
         nextId = std::max<std::uint32_t>(nextId, emitter.id + 1U);
+    }
+    for (const auto& path : runtimeState.water.manualFlowPaths) {
+        nextId = std::max<std::uint32_t>(nextId, path.id + 1U);
     }
     return nextId;
 }
@@ -9686,6 +10016,24 @@ SavedWaterTrailProfileState ResolveEmitterWaterTrailProfile(
     return WaterTrailProfileByName(runtimeState, emitter.trailProfileName);
 }
 
+WaterFlowTrailSettings ResolveManualFlowPathLaneSettings(
+    const WaterWorkflowState& water,
+    const WaterManualFlowPathSource& source) {
+    if (IsGlobalWaterProfileName(source.laneProfileName)) {
+        return ViewedGlobalWaterLaneSettings(water);
+    }
+    return WaterLaneProfileSettingsByName(water, source.laneProfileName);
+}
+
+SavedWaterTrailProfileState ResolveManualFlowPathTrailProfile(
+    const PreviewRuntimeState& runtimeState,
+    const WaterManualFlowPathSource& source) {
+    if (IsGlobalWaterProfileName(source.trailProfileName)) {
+        return ViewedGlobalWaterTrailProfile(runtimeState);
+    }
+    return WaterTrailProfileByName(runtimeState, source.trailProfileName);
+}
+
 WaterFlowTrailSettings MakeEmitterFlowSettings(
     const WaterWorkflowState& water,
     const WaterEmitter& emitter,
@@ -9770,11 +10118,21 @@ struct WaterTrailOverlayGroup {
 const invisible_places::water::WaterPathAnalysisCache* FlowPathAnalysisForLanes(
     const WaterWorkflowState& water) {
     if (!water.pathCacheLoaded ||
+        water.pathCacheStale ||
         !invisible_places::water::WaterPathAnalysisCacheCompatible(water.pathCache) ||
         !water.pathCache.analysis.has_value()) {
         return nullptr;
     }
     return &water.pathCache.analysis.value();
+}
+
+bool HasValidManualFlowPath(const WaterWorkflowState& water) {
+    return std::any_of(
+        water.manualFlowPaths.begin(),
+        water.manualFlowPaths.end(),
+        [](const WaterManualFlowPathSource& source) {
+            return invisible_places::water::BuildManualFlowPathAnchors(source).points.size() >= 2U;
+        });
 }
 
 std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
@@ -9802,30 +10160,56 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
         }
     };
 
-    bool usedEmitterAnchors = false;
-    for (const auto& emitter : runtimeState.water.emitters) {
-        WaterOverlay anchors;
-        for (const auto& point : runtimeState.water.pathAnchors.points) {
-            const auto pointEmitterId = static_cast<std::uint32_t>(
-                std::max(0.0F, std::floor(point.emitterId + 0.5F)));
-            if (pointEmitterId != emitter.id) {
+    bool usedRouteAnchors = false;
+    if (!runtimeState.water.pathCacheStale) {
+        for (const auto& emitter : runtimeState.water.emitters) {
+            WaterOverlay anchors;
+            for (const auto& point : runtimeState.water.pathAnchors.points) {
+                const auto pointEmitterId = static_cast<std::uint32_t>(
+                    std::max(0.0F, std::floor(point.emitterId + 0.5F)));
+                if (pointEmitterId != emitter.id) {
+                    continue;
+                }
+                anchors.bounds.Expand(point.position);
+                anchors.points.push_back(point);
+            }
+            if (anchors.points.empty()) {
                 continue;
             }
-            anchors.bounds.Expand(point.position);
-            anchors.points.push_back(point);
+            usedRouteAnchors = true;
+            const auto trailProfile = ResolveEmitterWaterTrailProfile(runtimeState, emitter);
+            const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile);
+            addOverlay(
+                trailProfile,
+                invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+                    anchors,
+                    flowSettings,
+                    pathAnalysis));
         }
-        if (anchors.points.empty()) {
-            continue;
-        }
-        usedEmitterAnchors = true;
-        const auto trailProfile = ResolveEmitterWaterTrailProfile(runtimeState, emitter);
-        const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile);
-        addOverlay(
-            trailProfile,
-            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, flowSettings, pathAnalysis));
     }
 
-    if (!usedEmitterAnchors) {
+    for (const auto& source : runtimeState.water.manualFlowPaths) {
+        const auto trailProfile = ResolveManualFlowPathTrailProfile(runtimeState, source);
+        auto flowSettings = invisible_places::water::ApplyWaterTrailGeometryToFlowTrailSettings(
+            ResolveManualFlowPathLaneSettings(runtimeState.water, source),
+            trailProfile.geometry);
+        const float anchorSpacing = std::clamp(
+            trailProfile.geometry.pointSpacingMeters * 2.0F,
+            0.005F,
+            0.05F);
+        const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, anchorSpacing);
+        if (anchors.points.size() < 2U) {
+            continue;
+        }
+        usedRouteAnchors = true;
+        addOverlay(
+            trailProfile,
+            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, flowSettings, nullptr));
+    }
+
+    if (!usedRouteAnchors &&
+        !runtimeState.water.pathCacheStale &&
+        !runtimeState.water.pathAnchors.points.empty()) {
         WaterEmitter fallbackEmitter;
         fallbackEmitter.id = 0U;
         fallbackEmitter.name = "Global";
@@ -11695,6 +12079,7 @@ void SaveWaterSources(PreviewRuntimeState* runtimeState) {
     }
     invisible_places::serialization::WaterSourcesDocument document;
     document.emitters = runtimeState->water.emitters;
+    document.manualFlowPaths = runtimeState->water.manualFlowPaths;
     document.seepageNodes = runtimeState->water.seepageNodes;
     document.seepageDefaultLook = runtimeState->water.defaultSeepageLook;
     document.seepageLookProfiles = runtimeState->water.seepageLookProfiles;
@@ -11764,6 +12149,7 @@ void LoadWaterSources(
     }
 
     runtimeState->water.emitters = document->emitters;
+    runtimeState->water.manualFlowPaths = document->manualFlowPaths;
     runtimeState->water.seepageNodes = document->seepageNodes;
     runtimeState->water.defaultSeepageLook = document->seepageDefaultLook;
     runtimeState->water.seepageLookProfiles = document->seepageLookProfiles;
@@ -11852,6 +12238,8 @@ void LoadWaterSources(
     runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
     runtimeState->water.nextFieldLayerId = NextWaterFieldLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.selectedManualFlowPathIndex.reset();
+    runtimeState->water.manualFlowPathEditor = {};
     runtimeState->water.selectedSeepageNodeIndex.reset();
     runtimeState->water.movingSeepageNodeIndex.reset();
     runtimeState->water.seepagePlacementArmed = false;
@@ -11890,7 +12278,19 @@ void LoadWaterSources(
         runtimeState->water.pathCache = {};
         runtimeState->water.pathCacheLoaded = false;
         runtimeState->water.pathCacheStale = false;
-        MarkWaterPathDirty(runtimeState);
+        runtimeState->water.pathAnchors = {};
+        if (runtimeState->water.emitters.empty()) {
+            runtimeState->water.pathDirty = false;
+            runtimeState->water.dirtyEmitterIds.clear();
+        } else {
+            MarkWaterPathDirty(runtimeState);
+        }
+    }
+    if (viewport != nullptr && HasValidManualFlowPath(runtimeState->water)) {
+        RefreshWaterOverlayFromAnchors(
+            runtimeState,
+            viewport,
+            WaterOverlayRefreshPersistence::InMemoryOnly);
     }
     std::size_t restoredRippleMemberships = 0U;
     std::size_t restoredRippleRegions = 0U;
@@ -11921,6 +12321,7 @@ void SelectWaterEmitterInViewport(
 
     const auto& emitter = runtimeState->water.emitters[emitterIndex];
     runtimeState->water.selectedEmitterIndex = emitterIndex;
+    runtimeState->water.selectedManualFlowPathIndex.reset();
     runtimeState->water.selectedSeepageNodeIndex.reset();
     runtimeState->water.movingSeepageNodeIndex.reset();
     runtimeState->water.seepagePlacementArmed = false;
@@ -11931,6 +12332,143 @@ void SelectWaterEmitterInViewport(
     runtimeState->cameraPlayback.active = false;
     runtimeState->statusMessage = "Selected water source " + emitter.name + " in the viewport.";
     runtimeState->errorMessage.clear();
+}
+
+void SelectManualFlowPathSource(PreviewRuntimeState* runtimeState, std::size_t sourceIndex) {
+    if (runtimeState == nullptr || sourceIndex >= runtimeState->water.manualFlowPaths.size()) {
+        return;
+    }
+    runtimeState->water.selectedManualFlowPathIndex = sourceIndex;
+    runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.selectedSeepageNodeIndex.reset();
+    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
+    runtimeState->water.movingEmitterIndex.reset();
+    runtimeState->water.placementArmed = false;
+    runtimeState->water.pathAttractorPlacementArmed = false;
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->cameraPlayback.active = false;
+    runtimeState->statusMessage =
+        "Selected manual Flow path " + runtimeState->water.manualFlowPaths[sourceIndex].name + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void BeginCreatingManualFlowPath(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    WaterManualFlowPathSource source;
+    source.id = NextWaterEmitterId(*runtimeState);
+    source.name = "Path Source " + std::to_string(source.id);
+    water.nextEmitterId = source.id + 1U;
+    water.manualFlowPathEditor = {};
+    water.manualFlowPathEditor.active = true;
+    water.manualFlowPathEditor.creating = true;
+    water.manualFlowPathEditor.draft = std::move(source);
+    water.selectedManualFlowPathIndex.reset();
+    water.selectedEmitterIndex.reset();
+    water.placementArmed = false;
+    water.movingEmitterIndex.reset();
+    water.seepagePlacementArmed = false;
+    water.movingSeepageNodeIndex.reset();
+    water.pathAttractorPlacementArmed = false;
+    water.dynamicMeshAttractorPlacementArmed = false;
+    water.rippleRegionPlacementArmed = false;
+    water.fieldRegionPlacementArmed = false;
+    water.activeRegionFeature = WaterRegionFeature::None;
+    water.regionEditor = {};
+    runtimeState->statusMessage = "Ctrl+left-click the viewport to add manual Flow path nodes.";
+    runtimeState->errorMessage.clear();
+}
+
+void BeginEditingManualFlowPath(PreviewRuntimeState* runtimeState, std::size_t sourceIndex) {
+    if (runtimeState == nullptr || sourceIndex >= runtimeState->water.manualFlowPaths.size()) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    water.manualFlowPathEditor = {};
+    water.manualFlowPathEditor.active = true;
+    water.manualFlowPathEditor.sourceIndex = sourceIndex;
+    water.manualFlowPathEditor.draft = water.manualFlowPaths[sourceIndex];
+    water.selectedManualFlowPathIndex = sourceIndex;
+    water.selectedEmitterIndex.reset();
+    water.placementArmed = false;
+    water.movingEmitterIndex.reset();
+    water.seepagePlacementArmed = false;
+    water.movingSeepageNodeIndex.reset();
+    water.pathAttractorPlacementArmed = false;
+    water.dynamicMeshAttractorPlacementArmed = false;
+    water.rippleRegionPlacementArmed = false;
+    water.fieldRegionPlacementArmed = false;
+    water.activeRegionFeature = WaterRegionFeature::None;
+    water.regionEditor = {};
+    runtimeState->statusMessage = "Editing " + water.manualFlowPaths[sourceIndex].name + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void CancelManualFlowPathEdit(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->water.manualFlowPathEditor.active) {
+        return;
+    }
+    const bool creating = runtimeState->water.manualFlowPathEditor.creating;
+    runtimeState->water.manualFlowPathEditor = {};
+    if (creating) {
+        runtimeState->water.selectedManualFlowPathIndex.reset();
+    }
+    runtimeState->statusMessage = creating ? "Cancelled new manual Flow path." : "Cancelled manual Flow path edits.";
+    runtimeState->errorMessage.clear();
+}
+
+bool SaveManualFlowPathEdit(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr || !runtimeState->water.manualFlowPathEditor.active) {
+        return false;
+    }
+    auto& editor = runtimeState->water.manualFlowPathEditor;
+    std::vector<invisible_places::io::Float3> cleaned;
+    cleaned.reserve(editor.draft.controlPoints.size());
+    for (const auto& point : editor.draft.controlPoints) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+            continue;
+        }
+        if (cleaned.empty() || glm::length(ToGlm(point) - ToGlm(cleaned.back())) > 1.0e-5F) {
+            cleaned.push_back(point);
+        }
+    }
+    editor.draft.controlPoints = std::move(cleaned);
+    if (editor.draft.controlPoints.size() < 2U) {
+        runtimeState->errorMessage = "A manual Flow path needs at least two distinct nodes.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    editor.draft.name = TrimText(editor.draft.name);
+    if (editor.draft.name.empty()) {
+        editor.draft.name = "Path Source " + std::to_string(editor.draft.id);
+    }
+
+    std::size_t savedIndex = 0U;
+    if (editor.sourceIndex.has_value() && editor.sourceIndex.value() < runtimeState->water.manualFlowPaths.size()) {
+        savedIndex = editor.sourceIndex.value();
+        runtimeState->water.manualFlowPaths[savedIndex] = editor.draft;
+    } else {
+        runtimeState->water.manualFlowPaths.push_back(editor.draft);
+        savedIndex = runtimeState->water.manualFlowPaths.size() - 1U;
+    }
+    runtimeState->water.selectedManualFlowPathIndex = savedIndex;
+    runtimeState->water.nextEmitterId = NextWaterEmitterId(*runtimeState);
+    const auto savedName = runtimeState->water.manualFlowPaths[savedIndex].name;
+    runtimeState->water.manualFlowPathEditor = {};
+    if (RefreshWaterOverlayFromAnchors(
+            runtimeState,
+            viewport,
+            WaterOverlayRefreshPersistence::InMemoryOnly)) {
+        runtimeState->statusMessage = "Saved manual Flow path " + savedName + " and refreshed trails.";
+    } else if (runtimeState->pendingLoad.has_value() || !ResolveWaterSupportSessionIndex(*runtimeState).has_value()) {
+        runtimeState->statusMessage = "Saved manual Flow path " + savedName + "; trails will rebuild when the scene is ready.";
+        runtimeState->errorMessage.clear();
+    }
+    return true;
 }
 
 void DeselectWaterEmitter(PreviewRuntimeState* runtimeState) {
@@ -12242,8 +12780,10 @@ bool RefreshWaterOverlayFromAnchors(
     }
     const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
     if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
-        runtimeState->water.pathDirty = true;
-        runtimeState->statusMessage = "Water path bake required.";
+        runtimeState->water.pathDirty = !runtimeState->water.emitters.empty();
+        runtimeState->statusMessage = runtimeState->water.emitters.empty()
+                                          ? "A loaded water support scene is required to build Flow trails."
+                                          : "Water path bake required.";
         runtimeState->errorMessage.clear();
         return false;
     }
@@ -12251,9 +12791,12 @@ bool RefreshWaterOverlayFromAnchors(
         invisible_places::water::EnsureWaterPathAnalysis(&runtimeState->water.pathCache);
         runtimeState->water.pathAnchors = WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
     }
-    if (runtimeState->water.pathAnchors.points.empty()) {
-        runtimeState->water.pathDirty = true;
-        runtimeState->statusMessage = "Water path bake required.";
+    const bool hasManualFlowPath = HasValidManualFlowPath(runtimeState->water);
+    if (runtimeState->water.pathAnchors.points.empty() && !hasManualFlowPath) {
+        runtimeState->water.pathDirty = !runtimeState->water.emitters.empty();
+        runtimeState->statusMessage = runtimeState->water.emitters.empty()
+                                          ? "No Flow sources are available."
+                                          : "Water path bake required.";
         runtimeState->errorMessage.clear();
         return false;
     }
@@ -12266,8 +12809,7 @@ bool RefreshWaterOverlayFromAnchors(
             return total + group.overlay.samples.size();
         });
     if (sampleCount == 0U) {
-        runtimeState->water.pathDirty = true;
-        runtimeState->errorMessage = "Water path bake exists, but no flow trail surfels were generated.";
+        runtimeState->errorMessage = "Flow sources exist, but no trail surfels were generated.";
         runtimeState->statusMessage.clear();
         return false;
     }
@@ -12280,6 +12822,10 @@ bool RefreshWaterOverlayFromAnchors(
         runtimeState->sessions[supportIndex.value()],
         groups);
     runtimeState->water.lastInstalledLaneSettings = ViewedGlobalWaterLaneSettings(runtimeState->water);
+    if (runtimeState->water.emitters.empty()) {
+        runtimeState->water.pathDirty = false;
+        runtimeState->water.dirtyEmitterIds.clear();
+    }
     runtimeState->statusMessage =
         "Water flow trails refreshed with " + FormatPointCount(sampleCount) + " surfels.";
     runtimeState->errorMessage.clear();
@@ -12819,6 +13365,7 @@ bool RefreshWaterRainOverlay(
         return false;
     }
     auto& water = runtimeState->water;
+    water.rainMaximumScenarioFixturePrepared = false;
     if (!water.rainSettings.enabled) {
         water.rainTrailOverlay = {};
         water.rainDiagnostics = {};
@@ -12847,8 +13394,11 @@ bool RefreshWaterRainOverlay(
     const auto profile = ViewedRainWaterTrailProfile(*runtimeState);
     auto rainSettings = RainSettingsWithTrailProfile(water.rainSettings, profile);
     WaterRainDiagnostics diagnostics;
+    WaterDynamicMeshFlowDiagnostics meshDiagnostics;
+    auto meshSurface = EnsureRainMeshSurfaceCache(runtimeState, &meshDiagnostics);
     auto overlay = invisible_places::water::BuildRainTrailOverlay(
         supportLayers,
+        meshSurface.get(),
         CurrentWaterRainCameraFrame(*runtimeState, *viewport),
         rainSettings,
         &diagnostics);
@@ -12865,7 +13415,7 @@ bool RefreshWaterRainOverlay(
     const auto outputPath = BuildWaterFeatureOverlayPath(*runtimeState, sourceSession, "-RainTrails.generated");
     water.lastRainOverlayPath = outputPath;
     water.rainTrailOverlay = overlay;
-    auto style = ApplyRainIntensityToTrailStyle(profile.style, rainSettings.intensityPreset);
+    auto style = MakeWaterRainTrailSessionStyle(profile, rainSettings.intensityPreset);
     AddOrRefreshWaterTrailOverlaySession(
         runtimeState,
         viewport,
@@ -12877,9 +13427,43 @@ bool RefreshWaterRainOverlay(
     runtimeState->statusMessage =
         "Generated rain: " + FormatPointCount(diagnostics.emittedDropCount) +
         " drops, " + FormatPointCount(diagnostics.emittedSampleCount) +
-        " visible samples.";
+        " visible samples" +
+        (diagnostics.meshSurfaceHitCount > 0U
+             ? ", " + FormatPointCount(diagnostics.meshSurfaceHitCount) + " mesh hits"
+             : std::string{}) +
+        (diagnostics.vegetationDripCount > 0U
+             ? ", " + FormatPointCount(diagnostics.vegetationDripCount) + " vegetation drips"
+             : std::string{}) +
+        ".";
     runtimeState->errorMessage.clear();
     return true;
+}
+
+bool EnsureMaximumScenarioRainFixture(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (runtimeState->water.rainMaximumScenarioFixturePrepared &&
+        !runtimeState->water.rainTrailOverlay.samples.empty()) {
+        return true;
+    }
+    const auto authoredSettings = runtimeState->water.rainSettings;
+    runtimeState->water.rainSettings = invisible_places::water::ApplyWaterRainIntensityPreset(
+        authoredSettings,
+        WaterRainIntensityPreset::HeavyDownpour);
+    runtimeState->water.rainSettings.enabled = true;
+    runtimeState->water.rainSettings.seed = authoredSettings.seed;
+    const bool generated = RefreshWaterRainOverlay(runtimeState, viewport);
+    runtimeState->water.rainSettings = authoredSettings;
+    if (generated) {
+        runtimeState->water.rainMaximumScenarioFixturePrepared = true;
+        runtimeState->statusMessage =
+            "Prepared the maximum deterministic Rain fixture for water-scenario playback.";
+        runtimeState->errorMessage.clear();
+    }
+    return generated;
 }
 
 std::string DynamicMeshSurfaceCacheSignature(
@@ -12903,6 +13487,23 @@ std::string DynamicMeshSurfaceCacheSignature(
         signature << "|mtime=" << static_cast<long long>(writeTimeSeconds);
     }
     return signature.str();
+}
+
+constexpr float kWaterRainMeshSurfaceCacheCellSizeMeters = 0.020F;
+
+WaterDynamicMeshFlowSettings RainMeshSurfaceCacheSettings(const WaterWorkflowState& water) {
+    auto settings = water.dynamicMeshFlowSettings;
+    settings.cacheCellSizeMeters = kWaterRainMeshSurfaceCacheCellSizeMeters;
+    settings.projectionSearchRadiusMeters = 0.08F;
+    settings.ambiguityHeightMeters = std::min(settings.ambiguityHeightMeters, 0.06F);
+    settings.gpuPreviewEnabled = false;
+    return settings;
+}
+
+std::string RainMeshSurfaceCacheSignature(
+    const WaterDynamicMeshFlowSettings& settings,
+    const std::filesystem::path& meshPath) {
+    return DynamicMeshSurfaceCacheSignature(settings, meshPath) + "|rain-surface-cache-v1";
 }
 
 std::filesystem::path DynamicMeshSurfaceCachePathForSettings(
@@ -13118,6 +13719,65 @@ bool FinishMatchingDynamicMeshSurfaceCacheWarmup(
         return false;
     }
     return InstallDynamicMeshSurfaceWarmupResult(runtimeState, std::move(result.value()), true);
+}
+
+void PopulateMeshSurfaceCacheDiagnostics(
+    const MeshSurfaceCache& cache,
+    WaterDynamicMeshFlowDiagnostics* diagnostics) {
+    if (diagnostics == nullptr) {
+        return;
+    }
+    diagnostics->cacheBuildMilliseconds = cache.buildMilliseconds;
+    diagnostics->sourceVertexCount = cache.sourceVertexCount;
+    diagnostics->sourceTriangleCount = cache.sourceTriangleCount;
+    diagnostics->cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        cache.cells.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+}
+
+std::shared_ptr<MeshSurfaceCache> EnsureRainMeshSurfaceCache(
+    PreviewRuntimeState* runtimeState,
+    WaterDynamicMeshFlowDiagnostics* diagnostics) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+    auto& water = runtimeState->water;
+    auto cacheSettings = RainMeshSurfaceCacheSettings(water);
+    auto meshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, cacheSettings);
+    if (meshPath.empty() || !std::filesystem::exists(meshPath)) {
+        return nullptr;
+    }
+    cacheSettings.meshPath = meshPath;
+    const auto signature = RainMeshSurfaceCacheSignature(cacheSettings, meshPath);
+    if (water.rainMeshSurfaceCache != nullptr &&
+        NormalizePathKey(water.rainMeshSurfaceCachePath) == NormalizePathKey(meshPath) &&
+        water.rainMeshSurfaceCacheSignature == signature) {
+        PopulateMeshSurfaceCacheDiagnostics(*water.rainMeshSurfaceCache, diagnostics);
+        return water.rainMeshSurfaceCache;
+    }
+
+    const auto loadStartedAt = std::chrono::steady_clock::now();
+    auto loadResult = invisible_places::io::LoadTriangleMesh(meshPath);
+    const double loadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - loadStartedAt).count();
+    if (!loadResult.success) {
+        return nullptr;
+    }
+
+    auto cache = std::make_shared<MeshSurfaceCache>(
+        invisible_places::water::BuildMeshSurfaceCache(loadResult.mesh, cacheSettings));
+    if (cache->cells.empty()) {
+        return nullptr;
+    }
+
+    water.rainMeshSurfaceCache = cache;
+    water.rainMeshSurfaceCachePath = meshPath;
+    water.rainMeshSurfaceCacheSignature = signature;
+    if (diagnostics != nullptr) {
+        diagnostics->meshLoadMilliseconds = loadMs;
+        PopulateMeshSurfaceCacheDiagnostics(*cache, diagnostics);
+    }
+    return cache;
 }
 
 std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
@@ -15122,9 +15782,12 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     }
     document.gsplatVisualStyle = runtimeState.projectSettings.gsplatVisualStyle;
     document.waterEmitters = runtimeState.water.emitters;
+    document.waterManualFlowPaths = runtimeState.water.manualFlowPaths;
     document.waterSeepageNodes = runtimeState.water.seepageNodes;
     document.waterSeepageDefaultLook = runtimeState.water.defaultSeepageLook;
     document.waterSeepageLookProfiles = runtimeState.water.seepageLookProfiles;
+    document.waterScenarios = runtimeState.water.seepageScenarios;
+    document.selectedWaterScenarioId = runtimeState.water.selectedSeepageScenarioId;
     document.waterRippleLayers = runtimeState.water.rippleLayers;
     document.waterFieldLayers = runtimeState.water.fieldLayers;
     document.waterFlowTrailSettings = runtimeState.water.flowTrailSettings;
@@ -15143,6 +15806,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
             }
         }
         waterSceneState.emitters = runtimeState.water.emitters;
+        waterSceneState.manualFlowPaths = runtimeState.water.manualFlowPaths;
         waterSceneState.seepageNodes = runtimeState.water.seepageNodes;
         waterSceneState.rippleLayers = runtimeState.water.rippleLayers;
         waterSceneState.fieldLayers = runtimeState.water.fieldLayers;
@@ -15372,6 +16036,135 @@ void StartQueuedLayerLoadIfIdle(PreviewRuntimeState* runtimeState) {
         runtimeState,
         nextLoad.purpose,
         nextLoad.sceneSwitchGeneration);
+}
+
+const SceneDisplayBundleRuntime* FinestSceneDisplayBundle(
+    const ScenePointCloudRuntime& scene) {
+    if (scene.displayBundles.empty()) {
+        return nullptr;
+    }
+    return &*std::min_element(
+        scene.displayBundles.begin(),
+        scene.displayBundles.end(),
+        [](const SceneDisplayBundleRuntime& left, const SceneDisplayBundleRuntime& right) {
+            if (left.spacingMicrometres != right.spacingMicrometres) {
+                return left.spacingMicrometres < right.spacingMicrometres;
+            }
+            return left.totalPointCount > right.totalPointCount;
+        });
+}
+
+std::array<std::optional<std::size_t>, invisible_places::scene::kScenePointCloudRoleCount>
+SceneFullDensityExportSessionIndices(const ScenePointCloudRuntime& scene) {
+    std::array<std::optional<std::size_t>, invisible_places::scene::kScenePointCloudRoleCount>
+        indices{};
+    if (const auto* finestBundle = FinestSceneDisplayBundle(scene); finestBundle != nullptr) {
+        for (std::size_t roleIndex = 0; roleIndex < finestBundle->sessionIndices.size(); ++roleIndex) {
+            indices[roleIndex] = finestBundle->sessionIndices[roleIndex];
+        }
+        return indices;
+    }
+    return scene.analysisSessionIndices;
+}
+
+bool SceneFullDensityExportUsesSession(
+    const ScenePointCloudRuntime& scene,
+    std::size_t sessionIndex) {
+    const auto exportIndices = SceneFullDensityExportSessionIndices(scene);
+    return std::any_of(
+        exportIndices.begin(),
+        exportIndices.end(),
+        [&](const std::optional<std::size_t>& candidate) {
+            return candidate.has_value() && candidate.value() == sessionIndex;
+        });
+}
+
+bool IsExportPointCloudSourceCandidate(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t sessionIndex) {
+    if (sessionIndex >= runtimeState.sessions.size()) {
+        return false;
+    }
+
+    const auto& session = runtimeState.sessions[sessionIndex];
+    if (session.kind != LayerKind::PointCloud) {
+        return false;
+    }
+    if (!IsSceneGroupedPointCloud(session)) {
+        return IsRenderablePointCloudSource(runtimeState, session);
+    }
+
+    const auto* scene = FindScenePointCloudRuntime(runtimeState, session);
+    if (scene == nullptr || !scene->displayLoaded || !scene->displayVisible) {
+        return false;
+    }
+
+    // Final exports ignore the live density switch. The viewport can stay on a
+    // coarse bundle, while output renders the finest complete scene bundle.
+    return SceneFullDensityExportUsesSession(*scene, sessionIndex);
+}
+
+bool IsExportPointCloudSourceReady(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t sessionIndex) {
+    if (!IsExportPointCloudSourceCandidate(runtimeState, sessionIndex)) {
+        return false;
+    }
+    const auto& session = runtimeState.sessions[sessionIndex];
+    return session.loaded &&
+           session.gpuResident &&
+           session.offlinePointCloud != nullptr;
+}
+
+bool EnsureFullDensityExportSourcesReady(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    if (runtimeState->pendingLoad.has_value()) {
+        runtimeState->statusMessage =
+            "Preparing full-density export point clouds; wait for the current layer load to finish.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
+
+    bool queuedAny = false;
+    std::size_t missingSourceCount = 0U;
+    for (const auto& scene : runtimeState->pointCloudScenes) {
+        if (!scene.displayLoaded || !scene.displayVisible) {
+            continue;
+        }
+        const auto exportIndices = SceneFullDensityExportSessionIndices(scene);
+        for (const auto sessionIndex : exportIndices) {
+            if (!sessionIndex.has_value() || sessionIndex.value() >= runtimeState->sessions.size()) {
+                ++missingSourceCount;
+                continue;
+            }
+
+            const auto index = sessionIndex.value();
+            auto& session = runtimeState->sessions[index];
+            if (session.loaded && session.gpuResident && session.offlinePointCloud != nullptr) {
+                continue;
+            }
+            QueueLayerLoad(runtimeState, index, PointCloudLoadPurpose::ExportGpu);
+            queuedAny = true;
+        }
+    }
+
+    if (missingSourceCount > 0U) {
+        runtimeState->errorMessage =
+            "The full-density export bundle is incomplete for one or more visible scenes.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    if (queuedAny) {
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        runtimeState->statusMessage =
+            "Preparing full-density export point clouds; start the export again when loading finishes.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
+    return true;
 }
 
 void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
@@ -15718,9 +16511,14 @@ bool ApplyProjectDocumentToRuntime(
     EnsureExportPresets(runtimeState);
     ApplyActiveExportPresetToRenderSettings(runtimeState);
     runtimeState->water.emitters = document.waterEmitters;
+    runtimeState->water.manualFlowPaths = document.waterManualFlowPaths;
     runtimeState->water.seepageNodes = document.waterSeepageNodes;
     runtimeState->water.defaultSeepageLook = document.waterSeepageDefaultLook;
     runtimeState->water.seepageLookProfiles = document.waterSeepageLookProfiles;
+    runtimeState->water.seepageScenarios = document.waterScenarios.empty()
+        ? invisible_places::water::DefaultWaterScenarioDefinitions()
+        : document.waterScenarios;
+    runtimeState->water.selectedSeepageScenarioId = document.selectedWaterScenarioId;
     runtimeState->water.rippleLayers = document.waterRippleLayers;
     runtimeState->water.fieldLayers = document.waterFieldLayers;
     runtimeState->water.flowTrailSettings = document.waterFlowTrailSettings;
@@ -15892,6 +16690,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.nextSeepageNodeId = NextWaterSeepageNodeId(*runtimeState);
     runtimeState->water.nextRippleLayerId = NextWaterRippleLayerId(*runtimeState);
     runtimeState->water.selectedEmitterIndex.reset();
+    runtimeState->water.selectedManualFlowPathIndex.reset();
+    runtimeState->water.manualFlowPathEditor = {};
     runtimeState->water.selectedSeepageNodeIndex.reset();
     runtimeState->water.movingSeepageNodeIndex.reset();
     runtimeState->water.seepagePlacementArmed = false;
@@ -15917,7 +16717,13 @@ bool ApplyProjectDocumentToRuntime(
         runtimeState->water.pathCache = {};
         runtimeState->water.pathCacheLoaded = false;
         runtimeState->water.pathCacheStale = false;
-        MarkWaterPathDirty(runtimeState);
+        runtimeState->water.pathAnchors = {};
+        if (runtimeState->water.emitters.empty()) {
+            runtimeState->water.pathDirty = false;
+            runtimeState->water.dirtyEmitterIds.clear();
+        } else {
+            MarkWaterPathDirty(runtimeState);
+        }
     }
     ValidateWaterSourceSettingLinks(runtimeState);
     runtimeState->cameraShots = document.cameraShots;
@@ -16104,7 +16910,9 @@ bool ApplyProjectDocumentToRuntime(
         EnsureWaterSupportCloud(runtimeState, supportSession, supportSettings);
         WaterTrailBuildDiagnostics prewarmDiagnostics;
         EnsureTrailSurfaceIndexForSupport(runtimeState, supportSession, &prewarmDiagnostics);
-        if (TryLoadWaterPathCacheForSupport(runtimeState, supportSession)) {
+        const bool loadedGeneratedPathCache =
+            TryLoadWaterPathCacheForSupport(runtimeState, supportSession);
+        if (loadedGeneratedPathCache || HasValidManualFlowPath(runtimeState->water)) {
             RefreshWaterOverlayFromAnchors(
                 runtimeState,
                 viewport,
@@ -17165,6 +17973,50 @@ void ApplyAnimationEvaluation(
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
 }
 
+void EmbedAnimationWaterScenarioFallbacks(
+    AnimationPath* path,
+    std::span<const invisible_places::water::WaterScenarioDefinition> definitions) {
+    if (path == nullptr) {
+        return;
+    }
+    for (auto& track : path->waterScenarioTracks) {
+        const auto definitionIt = std::find_if(
+            definitions.begin(),
+            definitions.end(),
+            [&](const auto& definition) { return definition.id == track.scenarioId; });
+        if (definitionIt != definitions.end()) {
+            track.scenarioName = definitionIt->name;
+            track.fallbackScenario = *definitionIt;
+        }
+    }
+    if (path->selectedWaterScenarioId.empty()) {
+        return;
+    }
+    const auto selectedTrackIt = std::find_if(
+        path->waterScenarioTracks.begin(),
+        path->waterScenarioTracks.end(),
+        [&](const auto& track) {
+            return track.scenarioId == path->selectedWaterScenarioId;
+        });
+    if (selectedTrackIt != path->waterScenarioTracks.end()) {
+        return;
+    }
+    const auto definitionIt = std::find_if(
+        definitions.begin(),
+        definitions.end(),
+        [&](const auto& definition) {
+            return definition.id == path->selectedWaterScenarioId;
+        });
+    if (definitionIt == definitions.end()) {
+        return;
+    }
+    invisible_places::water::WaterScenarioTrack track;
+    track.scenarioId = definitionIt->id;
+    track.scenarioName = definitionIt->name;
+    track.fallbackScenario = *definitionIt;
+    path->waterScenarioTracks.push_back(std::move(track));
+}
+
 bool SaveAnimationPathToFile(
     PreviewRuntimeState* runtimeState,
     const AnimationPath& path,
@@ -17181,6 +18033,9 @@ bool SaveAnimationPathToFile(
         pathToSave.waterAnimationTrailSettings = ViewedWaterAnimationTrailSettings(*runtimeState);
         pathToSave.tempWaterAnimationTrailSettings.reset();
     }
+    EmbedAnimationWaterScenarioFallbacks(
+        &pathToSave,
+        runtimeState->water.seepageScenarios);
     CanonicalizeAssociatedLayerPathsForSceneGroups(*runtimeState, &pathToSave.associatedLayerPaths);
     if (savingCurrentPath) {
         runtimeState->animationPanel.currentPath = pathToSave;
@@ -17928,12 +18783,14 @@ void BuildOfflineRippleRuntimeForSession(
 std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     PreviewRuntimeState& runtimeState) {
     std::vector<OfflinePointLayerSnapshot> layers;
+    const auto activeWaterScenario = ResolveActiveWaterScenarioState(runtimeState);
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     std::uint64_t effectiveSeepageInvocations = 0U;
-    for (const auto& session : runtimeState.sessions) {
-        if (!IsRenderablePointCloudSource(runtimeState, session) ||
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
             session.offlinePointCloud == nullptr ||
             IsGeneratedWaterOverlaySession(session)) {
             continue;
@@ -17956,8 +18813,9 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                 ? std::numeric_limits<std::uint64_t>::max()
                 : effectiveSeepageInvocations + contribution;
     }
-    for (const auto& session : runtimeState.sessions) {
-        if (!IsRenderablePointCloudSource(runtimeState, session) ||
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
             session.offlinePointCloud == nullptr) {
             continue;
         }
@@ -17992,7 +18850,8 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                 true,
                 runtimeState.water.rainSettings,
                 effectiveSeepageInvocations,
-                guideSpan);
+                guideSpan,
+                activeWaterScenario);
         }
         layers.push_back(
             {.cloud = session.offlinePointCloud,
@@ -18173,14 +19032,15 @@ std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers
 }
 
 bool HasOfflinePointLayers(const PreviewRuntimeState& runtimeState) {
-    return std::any_of(
-        runtimeState.sessions.begin(),
-        runtimeState.sessions.end(),
-        [&](const PreviewLayerSession& session) {
-            return IsRenderablePointCloudSource(runtimeState, session) &&
-                   session.offlinePointCloud != nullptr &&
-                   !session.offlinePointCloud->positions.empty();
-        });
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (IsExportPointCloudSourceReady(runtimeState, sessionIndex) &&
+            session.offlinePointCloud != nullptr &&
+            !session.offlinePointCloud->positions.empty()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 struct PointVisualExportOverride {
@@ -18246,7 +19106,7 @@ AnimationExportFrustumMaskSummary PrepareAnimationExportFrustumMasks(
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
         auto& session = runtimeState->sessions[sessionIndex];
-        if (!IsRenderablePointCloudSource(*runtimeState, session) ||
+        if (!IsExportPointCloudSourceReady(*runtimeState, sessionIndex) ||
             session.offlinePointCloud == nullptr ||
             session.totalPrimitives == 0) {
             continue;
@@ -18325,7 +19185,7 @@ BuildAnimationExportPointCloudLayerSnapshot(
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
-        if (!IsRenderablePointCloudSource(runtimeState, session) ||
+        if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
             session.totalPrimitives == 0) {
             continue;
         }
@@ -18498,6 +19358,9 @@ bool RenderCurrentAnimationFramePreview(
         runtimeState->statusMessage.clear();
         return false;
     }
+    if (!EnsureFullDensityExportSourcesReady(runtimeState)) {
+        return false;
+    }
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before rendering a frame preview.";
         runtimeState->statusMessage.clear();
@@ -18512,6 +19375,9 @@ bool RenderCurrentAnimationFramePreview(
     runtimeState->renderSettings = settings;
 
     auto& animationPath = panel.currentPath.value();
+    if (!animationPath.selectedWaterScenarioId.empty()) {
+        EnsureMaximumScenarioRainFixture(runtimeState, viewport);
+    }
     const auto preparedAnimationPath = invisible_places::camera::PrepareAnimationPathEvaluation(animationPath);
     if (!preparedAnimationPath.valid) {
         runtimeState->errorMessage = "Frame preview failed: animation path could not be prepared.";
@@ -18547,7 +19413,7 @@ bool RenderCurrentAnimationFramePreview(
             : runtimeState->projectSettings.pointCloudRendererMode;
 
     bool exportUsesPreviewDensity = false;
-    if (AnimationExportWritesMp4(activeMode)) {
+    if (AnimationExportWritesMp4(activeMode) || AnimationExportWritesPngStack(activeMode)) {
         const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
             runtimeState,
             viewport,
@@ -18582,8 +19448,29 @@ bool RenderCurrentAnimationFramePreview(
     job.setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y));
     job.previewDensity = exportUsesPreviewDensity;
     job.pointCloudRendererMode = exportRendererMode;
-    job.animationName = animationPath.name;
+    job.animationName = AnimationNameWithWaterScenario(
+        animationPath.name,
+        runtimeState->water.seepageScenarios,
+        animationPath);
     job.animationPath = animationPath;
+    EmbedAnimationWaterScenarioFallbacks(
+        &job.animationPath.value(),
+        runtimeState->water.seepageScenarios);
+    job.waterScenarios = runtimeState->water.seepageScenarios;
+    job.waterRainSettings = runtimeState->water.rainSettings;
+    job.effectiveSeepageInvocations = EffectiveExportWaterSeepageShaderInvocations(*runtimeState);
+    job.frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
+        runtimeState,
+        exportPointCloudLayers,
+        job.effectiveSeepageInvocations);
+    job.frozenRainLayers = BuildFrozenAnimationRainLayers(
+        runtimeState,
+        exportPointCloudLayers);
+    for (const auto& frozenLayer : job.frozenSeepageLayers) {
+        viewport->UploadWaterSeepageTopology(
+            frozenLayer.layerId,
+            frozenLayer.grid);
+    }
     job.exportBackgroundColor = glm::vec4{
         runtimeState->projectSettings.backgroundColor[0],
         runtimeState->projectSettings.backgroundColor[1],
@@ -18596,7 +19483,7 @@ bool RenderCurrentAnimationFramePreview(
     job.exportPointCloudLayers = exportPointCloudLayers;
 
     const auto renderScale =
-        AnimationExportWritesVideo(activeMode)
+        AnimationExportUsesSupersampledRgbaFrames(activeMode)
             ? std::max<std::uint32_t>(1U, settings.supersampleScale)
             : 1U;
     const auto renderWidth = ScaledRenderDimension(settings.width, renderScale);
@@ -18613,6 +19500,10 @@ bool RenderCurrentAnimationFramePreview(
         for (std::size_t sampleIndex = 0; sampleIndex < sampleCameras.size(); ++sampleIndex) {
             const auto& cameraState = sampleCameras[sampleIndex];
             const float sampleTimeSeconds = sampleTimesSeconds[sampleIndex];
+            UploadFrozenAnimationSeepageParameters(
+                &job,
+                viewport,
+                sampleTimeSeconds);
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
                 cameraState,
@@ -18675,12 +19566,15 @@ bool RenderCurrentAnimationFramePreview(
         panel.framePreview.displayRgba8 = std::move(displayBytes);
         panel.framePreview.exportMode = activeMode;
         panel.framePreview.renderSettings = settings;
-        panel.framePreview.animationName = animationPath.name;
+        panel.framePreview.animationName = AnimationNameWithWaterScenario(
+            animationPath.name,
+            runtimeState->water.seepageScenarios,
+            animationPath);
         panel.framePreview.open = true;
         panel.framePreview.closePending = false;
         panel.framePreview.savedPath.clear();
         panel.framePreview.saveStatus.clear();
-        panel.framePreview.title = "Frame Preview - " + animationPath.name;
+        panel.framePreview.title = "Frame Preview - " + panel.framePreview.animationName;
         panel.framePreview.summary =
             std::string{AnimationExportModeLabel(activeMode)} + " | " +
             std::to_string(settings.width) + " x " + std::to_string(settings.height) +
@@ -18912,6 +19806,8 @@ std::string FormatByteCount(std::uint64_t bytes) {
 
 bool AnimationExportWritesVideo(invisible_places::output::AnimationExportMode mode);
 bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportWritesPngStack(invisible_places::output::AnimationExportMode mode);
+bool AnimationExportUsesSupersampledRgbaFrames(invisible_places::output::AnimationExportMode mode);
 bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode);
 const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMode mode);
 std::uint32_t ScaledRenderDimension(std::uint32_t dimension, std::uint32_t scale);
@@ -18919,7 +19815,7 @@ std::uint32_t ScaledRenderDimension(std::uint32_t dimension, std::uint32_t scale
 std::uint64_t EstimateVideoExportWorkingSetBytes(
     invisible_places::output::AnimationExportMode mode,
     const RenderJobSettings& settings) {
-    if (!AnimationExportWritesVideo(mode)) {
+    if (!AnimationExportUsesSupersampledRgbaFrames(mode)) {
         return 0U;
     }
     const auto scale = std::max<std::uint32_t>(1U, settings.supersampleScale);
@@ -18940,9 +19836,11 @@ std::uint64_t EstimateVideoExportWorkingSetBytes(
         static_cast<std::uint64_t>(std::max<std::uint32_t>(1U, settings.height));
     const auto rawEncoderFrameBytes =
         deliveryPixelCount *
-        (AnimationExportPreservesAlpha(mode)
-             ? 4ULL * sizeof(std::uint16_t)
-             : AnimationExportWritesProRes(mode) ? 3ULL * sizeof(std::uint16_t) : 4ULL);
+        (AnimationExportWritesPngStack(mode)
+             ? 4ULL
+             : AnimationExportPreservesAlpha(mode)
+                   ? 4ULL * sizeof(std::uint16_t)
+                   : AnimationExportWritesProRes(mode) ? 3ULL * sizeof(std::uint16_t) : 4ULL);
     constexpr std::uint64_t kExportOverheadBytes = 512ULL * 1024ULL * 1024ULL;
     return sampleBytes + averagedFrameBytes + queuedFrameBytes + rawEncoderFrameBytes + kExportOverheadBytes;
 }
@@ -18951,7 +19849,7 @@ bool CheckVideoExportMemoryBudget(
     PreviewRuntimeState* runtimeState,
     invisible_places::output::AnimationExportMode mode,
     const RenderJobSettings& settings) {
-    if (runtimeState == nullptr || !AnimationExportWritesVideo(mode)) {
+    if (runtimeState == nullptr || !AnimationExportUsesSupersampledRgbaFrames(mode)) {
         return true;
     }
     const auto estimateBytes = EstimateVideoExportWorkingSetBytes(mode, settings);
@@ -19012,7 +19910,8 @@ std::string FormatLocalTime(
 }
 
 bool AnimationExportWritesMp4(invisible_places::output::AnimationExportMode mode) {
-    return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4;
+    return mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
+           mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4;
 }
 
 bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode mode) {
@@ -19027,6 +19926,8 @@ bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode m
         case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
             return true;
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+        case invisible_places::output::AnimationExportMode::PngStack:
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return false;
     }
@@ -19034,7 +19935,8 @@ bool AnimationExportWritesProRes(invisible_places::output::AnimationExportMode m
 }
 
 bool AnimationExportUsesVideoToolbox(invisible_places::output::AnimationExportMode mode) {
-    return mode == invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov ||
+    return mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4 ||
+           mode == invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov ||
            mode == invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov ||
            mode == invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov ||
            mode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov;
@@ -19047,6 +19949,8 @@ bool AnimationExportUsesProResXq(invisible_places::output::AnimationExportMode m
 
 bool AnimationExportPreservesAlpha(invisible_places::output::AnimationExportMode mode) {
     switch (mode) {
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+        case invisible_places::output::AnimationExportMode::PngStack:
         case invisible_places::output::AnimationExportMode::ProRes4444Mov:
         case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
         case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
@@ -19071,6 +19975,14 @@ bool AnimationExportWritesExr(invisible_places::output::AnimationExportMode mode
     return mode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
 }
 
+bool AnimationExportWritesPngStack(invisible_places::output::AnimationExportMode mode) {
+    return mode == invisible_places::output::AnimationExportMode::PngStack;
+}
+
+bool AnimationExportUsesSupersampledRgbaFrames(invisible_places::output::AnimationExportMode mode) {
+    return AnimationExportWritesVideo(mode) || AnimationExportWritesPngStack(mode);
+}
+
 std::uint32_t Mp4SupersampleScaleForSettings(const RenderJobSettings& settings) {
     constexpr std::uint32_t kScale = 2U;
     if (settings.width == 0 || settings.height == 0) {
@@ -19093,17 +20005,22 @@ AnimationExportOutputOptions MakeAnimationExportOutputOptions(
     const RenderJobSettings& settings,
     std::filesystem::path videoOutputPath,
     bool previewMp4Optional = false,
-    std::string previewVideoWarning = {}) {
+    std::string previewVideoWarning = {},
+    std::filesystem::path pngStackDirectory = {},
+    std::string pngStackFrameStem = {}) {
     AnimationExportOutputOptions options;
     options.writeExrStack = AnimationExportWritesExr(mode);
     options.writePreviewMp4 = AnimationExportWritesMp4(mode);
     options.writeProResMov = AnimationExportWritesProRes(mode);
+    options.writePngStack = AnimationExportWritesPngStack(mode);
     options.previewMp4Optional = previewMp4Optional;
-    options.mp4SupersampleScale = AnimationExportWritesVideo(mode)
+    options.mp4SupersampleScale = AnimationExportUsesSupersampledRgbaFrames(mode)
                                       ? std::max<std::uint32_t>(1U, settings.supersampleScale)
                                       : 1U;
     options.spatialAntialiasing = settings.spatialAntialiasing;
     options.previewVideoPath = std::move(videoOutputPath);
+    options.pngStackDirectory = std::move(pngStackDirectory);
+    options.pngStackFrameStem = std::move(pngStackFrameStem);
     options.previewVideoWarning = std::move(previewVideoWarning);
     return options;
 }
@@ -19112,6 +20029,10 @@ const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMo
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Quick MP4";
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+            return "H.265 Alpha MP4";
+        case invisible_places::output::AnimationExportMode::PngStack:
+            return "PNG Stack";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "HQ Preview-Density EXR";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
@@ -19139,6 +20060,10 @@ const char* AnimationExportCaptureLabel(invisible_places::output::AnimationExpor
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "MP4";
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+            return "H.265 Alpha MP4";
+        case invisible_places::output::AnimationExportMode::PngStack:
+            return "PNG";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "HQ EXR";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
@@ -19159,6 +20084,10 @@ const char* AnimationExportOverlayLabel(invisible_places::output::AnimationExpor
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Encoding Fast Preview MP4";
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+            return "Encoding H.265 Alpha MP4";
+        case invisible_places::output::AnimationExportMode::PngStack:
+            return "Writing PNG Stack";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "Rendering HQ Preview-Density EXR";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
@@ -19186,6 +20115,10 @@ const char* StillCameraExportOverlayLabel(invisible_places::output::AnimationExp
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "Exporting Still Camera MP4";
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+            return "Exporting Still Camera H.265 Alpha MP4";
+        case invisible_places::output::AnimationExportMode::PngStack:
+            return "Exporting Still Camera PNG Stack";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "Exporting Still Camera EXR Stack";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
@@ -19210,6 +20143,10 @@ const char* ExportLogPrefix(invisible_places::output::AnimationExportMode mode) 
     switch (mode) {
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             return "ExportLog_MP4_";
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+            return "ExportLog_HEVCAlphaMP4_";
+        case invisible_places::output::AnimationExportMode::PngStack:
+            return "ExportLog_PNGStack_";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return "ExportLog_EXR_";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
@@ -19296,6 +20233,8 @@ std::filesystem::path BuildUniqueProResOutputPathForMode(
                 reservedOutputPaths);
         case invisible_places::output::AnimationExportMode::ProRes4444Mov:
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+        case invisible_places::output::AnimationExportMode::PngStack:
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return invisible_places::output::BuildUniqueProRes4444OutputPath(
                 outputDirectory,
@@ -19330,6 +20269,14 @@ std::filesystem::path BuildUniqueAnimationVideoOutputPathForMode(
     }
     if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         return invisible_places::output::BuildUniqueQuickMp4OutputPath(
+            outputDirectory,
+            animationName,
+            settings,
+            visualName,
+            reservedOutputPaths);
+    }
+    if (mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4) {
+        return invisible_places::output::BuildUniqueHevcAlphaMp4OutputPath(
             outputDirectory,
             animationName,
             settings,
@@ -19432,6 +20379,8 @@ std::string BuildFfmpegProResCommandForMode(
                 outputPath);
         case invisible_places::output::AnimationExportMode::ProRes4444Mov:
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+        case invisible_places::output::AnimationExportMode::PngStack:
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             return invisible_places::output::BuildFfmpegProRes4444Command(
                 executablePath,
@@ -19604,6 +20553,9 @@ invisible_places::renderer::core::PointCloudExrReadbackMask ExportReadbackMaskFo
     if (job.writePreviewMp4) {
         return PointCloudExrReadbackMask::Color | PointCloudExrReadbackMask::Depth;
     }
+    if (job.writePngStack) {
+        return PointCloudExrReadbackMask::Color | PointCloudExrReadbackMask::Depth;
+    }
     if (job.writeProResMov) {
         auto mask = PointCloudExrReadbackMask::Color;
         if (ExportEyeDomeLightingActive(job)) {
@@ -19631,6 +20583,23 @@ std::uint64_t WrittenOutputByteCount(const OfflineRenderJobState& job) {
         for (std::uint32_t frameIndex = 0; frameIndex < job.writtenFrameCount; ++frameIndex) {
             const auto outputPath =
                 invisible_places::output::RenderFramePath(job.settings, job.settings.startFrame + frameIndex);
+            error.clear();
+            if (!std::filesystem::exists(outputPath, error)) {
+                continue;
+            }
+            error.clear();
+            const auto fileBytes = std::filesystem::file_size(outputPath, error);
+            if (!error) {
+                bytes += fileBytes;
+            }
+        }
+    }
+    if (job.writePngStack) {
+        for (std::uint32_t frameIndex = 0; frameIndex < job.writtenFrameCount; ++frameIndex) {
+            const auto outputPath = invisible_places::output::PngStackFramePath(
+                job.pngStackDirectory,
+                job.pngStackFrameStem.empty() ? job.animationName : job.pngStackFrameStem,
+                frameIndex);
             error.clear();
             if (!std::filesystem::exists(outputPath, error)) {
                 continue;
@@ -19686,9 +20655,11 @@ std::string WriteExportLog(
     const auto videoRawFrameBytes =
         static_cast<std::uint64_t>(job.settings.width) *
         static_cast<std::uint64_t>(job.settings.height) *
-        (AnimationExportPreservesAlpha(job.mode)
-             ? 4U * sizeof(std::uint16_t)
-             : job.writeProResMov ? 3U * sizeof(std::uint16_t) : 4U);
+        (job.writePngStack
+             ? 4U
+             : AnimationExportPreservesAlpha(job.mode)
+                   ? 4U * sizeof(std::uint16_t)
+                   : job.writeProResMov ? 3U * sizeof(std::uint16_t) : 4U);
     const auto outputBytes = WrittenOutputByteCount(job);
     const auto averageCaptureDuration =
         job.exportLog.capturedFrames > 0U
@@ -19740,9 +20711,14 @@ std::string WriteExportLog(
 
     log << "Output\n";
     if (job.writePreviewMp4) {
-        log << "MP4: " << job.videoOutputPath.string() << '\n';
+        log << AnimationExportModeLabel(job.mode) << ": " << job.videoOutputPath.string() << '\n';
     } else if (job.writeProResMov) {
         log << AnimationExportModeLabel(job.mode) << " MOV: " << job.videoOutputPath.string() << '\n';
+    } else if (job.writePngStack) {
+        log << "PNG folder: " << job.pngStackDirectory.string() << '\n';
+        if (!job.lastOutputPath.empty()) {
+            log << "Last PNG: " << job.lastOutputPath.string() << '\n';
+        }
     } else if (!job.previewVideoWarning.empty()) {
         log << "Video: " << job.previewVideoWarning << '\n';
     }
@@ -19775,11 +20751,14 @@ std::string WriteExportLog(
     if (job.exportEyeDomeLightingEnabled) {
         log << "Eye-Dome Lighting thickness: " << job.exportEyeDomeLightingThickness << " px\n";
     }
-    if (job.writePreviewMp4 || job.writeProResMov) {
-        if (job.writePreviewMp4) {
+    if (job.writePreviewMp4 || job.writeProResMov || job.writePngStack) {
+        if (job.mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
             log << "MP4 sparse point smoothing: yes\n";
         }
-        log << "Video supersample scale: " << std::max<std::uint32_t>(1U, job.mp4SupersampleScale) << "x\n";
+        if (AnimationExportPreservesAlpha(job.mode)) {
+            log << "Alpha preserved: yes\n";
+        }
+        log << "Output supersample scale: " << std::max<std::uint32_t>(1U, job.mp4SupersampleScale) << "x\n";
         log << "Spatial AA/downscale: " << (job.spatialAntialiasing ? "yes" : "no") << '\n';
         log << "Temporal supersampling: " << (job.settings.temporalSupersampling ? "yes" : "no") << '\n';
         log << "Temporal samples: " << job.settings.temporalSampleCount << '\n';
@@ -19821,9 +20800,9 @@ std::string WriteExportLog(
     log << "Process resident at finish: " << FormatByteCount(job.exportLog.endResidentMemoryBytes) << '\n';
     log << "Peak sampled process resident: " << FormatByteCount(job.exportLog.peakResidentMemoryBytes) << '\n';
     log << "GPU readback frame buffer: " << FormatByteCount(readbackBytes) << '\n';
-    if (job.writePreviewMp4 || job.writeProResMov) {
-        log << "Video supersampled GPU readback frame buffer: " << FormatByteCount(videoReadbackBytes) << '\n';
-        log << "Video raw encoder frame bytes: " << FormatByteCount(videoRawFrameBytes) << '\n';
+    if (job.writePreviewMp4 || job.writeProResMov || job.writePngStack) {
+        log << "Supersampled GPU readback frame buffer: " << FormatByteCount(videoReadbackBytes) << '\n';
+        log << "Raw output frame bytes: " << FormatByteCount(videoRawFrameBytes) << '\n';
     }
 
     return {};
@@ -20088,12 +21067,31 @@ void RunAnimationExportWriter(
     try {
         bool writesMp4 = outputOptions.writePreviewMp4 && !outputOptions.previewVideoPath.empty();
         bool writesProRes = outputOptions.writeProResMov && !outputOptions.previewVideoPath.empty();
+        const bool writesPng = outputOptions.writePngStack && !outputOptions.pngStackDirectory.empty();
         const bool writesExr = outputOptions.writeExrStack;
+        if (writesPng) {
+            std::error_code createError;
+            std::filesystem::create_directories(outputOptions.pngStackDirectory, createError);
+            if (createError) {
+                CompleteAnimationExportWriter(
+                    writerState,
+                    {},
+                    "Failed to create PNG Stack output directory: " + createError.message());
+                return;
+            }
+        }
         if (writesMp4 || writesProRes) {
             const auto command =
                 writesProRes
                     ? BuildFfmpegProResCommandForMode(
                           mode,
+                          invisible_places::output::DefaultFfmpegExecutablePath(),
+                          settings.width,
+                          settings.height,
+                          settings.framesPerSecond,
+                          outputOptions.previewVideoPath)
+                    : mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4
+                    ? invisible_places::output::BuildFfmpegHevcAlphaMp4Command(
                           invisible_places::output::DefaultFfmpegExecutablePath(),
                           settings.width,
                           settings.height,
@@ -20121,7 +21119,7 @@ void RunAnimationExportWriter(
             }
         }
 
-        if (!writesExr && !writesMp4 && !writesProRes) {
+        if (!writesExr && !writesMp4 && !writesProRes && !writesPng) {
             if (outputOptions.previewMp4Optional && !previewVideoWarning.empty()) {
                 CompleteAnimationExportWriter(
                     writerState,
@@ -20159,8 +21157,10 @@ void RunAnimationExportWriter(
                 status = "EXR stack complete: " + settings.outputDirectory + ".";
             } else if (writesProRes) {
                 status = videoLabel + " complete: " + outputOptions.previewVideoPath.string() + ".";
+            } else if (writesPng) {
+                status = "PNG stack complete: " + outputOptions.pngStackDirectory.string() + ".";
             } else {
-                status = "Fast Preview MP4 complete: " + outputOptions.previewVideoPath.string() + ".";
+                status = videoLabel + " complete: " + outputOptions.previewVideoPath.string() + ".";
             }
             if (!previewVideoWarning.empty()) {
                 status += " " + previewVideoWarning;
@@ -20168,6 +21168,7 @@ void RunAnimationExportWriter(
             return status;
         };
 
+        std::uint32_t pngSequenceFrameIndex = 0U;
         while (true) {
             AnimationExportFramePayload payload;
             bool hasPayload = false;
@@ -20214,6 +21215,40 @@ void RunAnimationExportWriter(
                 }
             }
 
+            if (writesPng) {
+                const auto& pngImage =
+                    payload.previewImage.rgbaHalf.empty() ? payload.image : payload.previewImage;
+                const auto frameBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
+                    pngImage,
+                    settings.width,
+                    settings.height,
+                    {},
+                    outputOptions.spatialAntialiasing);
+                if (frameBytes.empty()) {
+                    CompleteAnimationExportWriter(
+                        writerState,
+                        {},
+                        "GPU readback did not produce a valid PNG Stack frame.");
+                    return;
+                }
+                const auto pngPath = invisible_places::output::PngStackFramePath(
+                    outputOptions.pngStackDirectory,
+                    outputOptions.pngStackFrameStem,
+                    pngSequenceFrameIndex);
+                std::string errorMessage;
+                if (!invisible_places::output::WritePngRgba8(
+                        pngPath,
+                        settings.width,
+                        settings.height,
+                        frameBytes,
+                        &errorMessage)) {
+                    CompleteAnimationExportWriter(writerState, {}, errorMessage);
+                    return;
+                }
+                ++pngSequenceFrameIndex;
+                outputPath = pngPath;
+            }
+
             if (writesMp4 || writesProRes) {
                 const auto& mp4Image =
                     payload.previewImage.rgbaHalf.empty() ? payload.image : payload.previewImage;
@@ -20230,6 +21265,12 @@ void RunAnimationExportWriter(
                                     settings.width,
                                     settings.height,
                                     outputOptions.spatialAntialiasing)
+                        : mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4
+                        ? invisible_places::output::ConvertHalfRgbaToSrgbRgba16(
+                              mp4Image,
+                              settings.width,
+                              settings.height,
+                              outputOptions.spatialAntialiasing)
                         : invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
                               mp4Image,
                               settings.width,
@@ -20322,6 +21363,154 @@ void NormalizeAnimationRenderSettings(RenderJobSettings* settings) {
     }
 }
 
+std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
+    PreviewRuntimeState* runtimeState,
+    std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
+    std::uint64_t effectiveInvocations) {
+    std::vector<OfflineRenderJobState::FrozenSeepageLayer> frozen;
+    if (runtimeState == nullptr) {
+        return frozen;
+    }
+    frozen.reserve(exportLayers.size());
+    for (const auto& exportLayer : exportLayers) {
+        if (exportLayer.layerId >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto& session = runtimeState->sessions[exportLayer.layerId];
+        if (!IsExportPointCloudSourceReady(*runtimeState, exportLayer.layerId) ||
+            IsGeneratedWaterOverlaySession(session)) {
+            continue;
+        }
+        const auto* surfaceGuides = EnsureWaterSeepageSurfaceGuidesForSession(
+            runtimeState,
+            session);
+        const auto guideSpan = surfaceGuides == nullptr
+                                   ? std::span<const WaterSeepageSurfaceGuide>{}
+                                   : std::span<const WaterSeepageSurfaceGuide>{*surfaceGuides};
+        const auto guidedNodes = WaterSeepageNodesWithValidSurfaceGuides(
+            runtimeState->water.seepageNodes,
+            guideSpan);
+        frozen.push_back({
+            .layerId = exportLayer.layerId,
+            .grid = invisible_places::water::BuildWaterSeepageSpatialGrid(
+                guidedNodes,
+                runtimeState->water.seepageLookProfiles,
+                runtimeState->water.defaultSeepageLook,
+                session.sceneRole,
+                true,
+                runtimeState->water.rainSettings,
+                effectiveInvocations,
+                guideSpan,
+                std::nullopt),
+        });
+    }
+    return frozen;
+}
+
+std::vector<OfflineRenderJobState::FrozenRainLayer> BuildFrozenAnimationRainLayers(
+    PreviewRuntimeState* runtimeState,
+    std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers) {
+    std::vector<OfflineRenderJobState::FrozenRainLayer> frozen;
+    if (runtimeState == nullptr) {
+        return frozen;
+    }
+    for (const auto& exportLayer : exportLayers) {
+        if (exportLayer.layerId >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto& session = runtimeState->sessions[exportLayer.layerId];
+        if (!IsRainTrailSession(session)) {
+            continue;
+        }
+        auto baseStyle = MakeWaterTrailExportStyle(session.pointStyle);
+        ResolveProjectVisualStyleBindingsByFieldName(&baseStyle, session);
+        baseStyle = invisible_places::renderer::pointcloud::MakePointCloudStyleForSceneRole(
+            baseStyle,
+            session.sceneRole);
+        baseStyle.waterRainLevel = 1.0F;
+        baseStyle.waterRainSpeedScale = 1.0F;
+        frozen.push_back({
+            .layerId = exportLayer.layerId,
+            .baseStyle = std::move(baseStyle),
+        });
+    }
+    return frozen;
+}
+
+std::optional<invisible_places::water::WaterScenarioState> EvaluateFrozenAnimationWaterScenario(
+    const OfflineRenderJobState& job,
+    float sampleTimeSeconds) {
+    if (!job.animationPath.has_value() ||
+        job.animationPath->selectedWaterScenarioId.empty()) {
+        return std::nullopt;
+    }
+    const auto& path = job.animationPath.value();
+    const auto& scenarioId = path.selectedWaterScenarioId;
+    const auto definitionIt = std::find_if(
+        job.waterScenarios.begin(),
+        job.waterScenarios.end(),
+        [&](const auto& definition) { return definition.id == scenarioId; });
+    const auto trackIt = std::find_if(
+        path.waterScenarioTracks.begin(),
+        path.waterScenarioTracks.end(),
+        [&](const auto& track) { return track.scenarioId == scenarioId; });
+    const invisible_places::water::WaterScenarioDefinition* definition =
+        definitionIt != job.waterScenarios.end() ? &*definitionIt : nullptr;
+    if (definition == nullptr && trackIt != path.waterScenarioTracks.end() &&
+        !trackIt->fallbackScenario.id.empty()) {
+        definition = &trackIt->fallbackScenario;
+    }
+    if (definition == nullptr) {
+        return std::nullopt;
+    }
+    if (trackIt == path.waterScenarioTracks.end()) {
+        return definition->state;
+    }
+    const float durationSeconds = std::max(
+        1.0e-6F,
+        invisible_places::camera::AnimationPathDurationSeconds(path));
+    return invisible_places::water::EvaluateWaterScenarioTrack(
+        *trackIt,
+        *definition,
+        std::clamp(sampleTimeSeconds / durationSeconds, 0.0F, 1.0F));
+}
+
+void UploadFrozenAnimationSeepageParameters(
+    OfflineRenderJobState* job,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    float sampleTimeSeconds) {
+    if (job == nullptr || viewport == nullptr) {
+        return;
+    }
+    const auto scenarioState = EvaluateFrozenAnimationWaterScenario(
+        *job,
+        sampleTimeSeconds);
+    for (auto& frozenLayer : job->frozenSeepageLayers) {
+        invisible_places::water::ApplyWaterSeepageScenarioParameters(
+            &frozenLayer.grid,
+            scenarioState,
+            job->waterRainSettings,
+            job->effectiveSeepageInvocations);
+        viewport->UpdateWaterSeepageParams(
+            frozenLayer.layerId,
+            frozenLayer.grid);
+    }
+    const float rainLevel = scenarioState.has_value()
+                                ? std::clamp(scenarioState->rainLevel, 0.0F, 1.0F)
+                                : 1.0F;
+    for (const auto& frozenRain : job->frozenRainLayers) {
+        const auto layerIt = std::find_if(
+            job->exportPointCloudLayers.begin(),
+            job->exportPointCloudLayers.end(),
+            [&](const auto& layer) { return layer.layerId == frozenRain.layerId; });
+        if (layerIt != job->exportPointCloudLayers.end()) {
+            layerIt->style = ApplyContinuousRainLevelToStyle(
+                frozenRain.baseStyle,
+                rainLevel);
+        }
+    }
+}
+
 bool StartQuickMp4ExportJob(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -20330,12 +21519,19 @@ bool StartQuickMp4ExportJob(
         return false;
     }
 
+    EmbedAnimationWaterScenarioFallbacks(
+        &request.animationPath,
+        request.waterScenarios);
+
     auto settings = request.settings;
     NormalizeAnimationRenderSettings(&settings);
     if (!CheckVideoExportMemoryBudget(runtimeState, request.mode, settings)) {
         return false;
     }
 
+    if (!EnsureFullDensityExportSourcesReady(runtimeState)) {
+        return false;
+    }
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
         runtimeState->statusMessage.clear();
@@ -20347,6 +21543,9 @@ bool StartQuickMp4ExportJob(
                                      " has fewer than two keys and cannot be exported.";
         runtimeState->statusMessage.clear();
         return false;
+    }
+    if (!request.animationPath.selectedWaterScenarioId.empty() && viewport != nullptr) {
+        EnsureMaximumScenarioRainFixture(runtimeState, viewport);
     }
 
     if (request.visualSessionIndex >= runtimeState->sessions.size() ||
@@ -20369,7 +21568,8 @@ bool StartQuickMp4ExportJob(
     }
 
     const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
-    if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
+    if (AnimationExportWritesVideo(request.mode) &&
+        !invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
         runtimeState->errorMessage =
             std::string{AnimationExportModeLabel(request.mode)} +
             " export requires ffmpeg at " + ffmpegPath.string() + ".";
@@ -20384,6 +21584,16 @@ bool StartQuickMp4ExportJob(
             runtimeState->errorMessage =
                 "Failed to create " + std::string{AnimationExportModeLabel(request.mode)} +
                 " output directory: " + createError.message();
+            runtimeState->statusMessage.clear();
+            return false;
+        }
+    }
+    if (AnimationExportWritesPngStack(request.mode) && !request.pngStackDirectory.parent_path().empty()) {
+        createError.clear();
+        std::filesystem::create_directories(request.pngStackDirectory.parent_path(), createError);
+        if (createError) {
+            runtimeState->errorMessage =
+                "Failed to create PNG Stack parent directory: " + createError.message();
             runtimeState->statusMessage.clear();
             return false;
         }
@@ -20428,13 +21638,37 @@ bool StartQuickMp4ExportJob(
         runtimeState->statusMessage.clear();
         return false;
     }
+    const auto effectiveSeepageInvocations =
+        EffectiveExportWaterSeepageShaderInvocations(*runtimeState);
+    auto frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
+        runtimeState,
+        exportPointCloudLayers,
+        effectiveSeepageInvocations);
+    auto frozenRainLayers = BuildFrozenAnimationRainLayers(
+        runtimeState,
+        exportPointCloudLayers);
+    if (viewport != nullptr) {
+        for (const auto& frozenLayer : frozenSeepageLayers) {
+            viewport->UploadWaterSeepageTopology(
+                frozenLayer.layerId,
+                frozenLayer.grid);
+        }
+    }
 
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
     auto writerState = std::make_shared<AnimationExportWriterState>();
+    const auto outputAnimationName = AnimationNameWithWaterScenario(
+        request.animationPath.name,
+        request.waterScenarios,
+        request.animationPath);
     const auto outputOptions = MakeAnimationExportOutputOptions(
         request.mode,
         settings,
-        request.videoOutputPath);
+        request.videoOutputPath,
+        false,
+        {},
+        request.pngStackDirectory,
+        outputAnimationName);
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
@@ -20446,9 +21680,12 @@ bool StartQuickMp4ExportJob(
         .currentTile = 0,
         .startedAt = std::chrono::steady_clock::now(),
         .videoOutputPath = request.videoOutputPath,
+        .pngStackDirectory = request.pngStackDirectory,
+        .pngStackFrameStem = outputOptions.pngStackFrameStem,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
         .writeProResMov = outputOptions.writeProResMov,
+        .writePngStack = outputOptions.writePngStack,
         .optionalPreviewMp4 = outputOptions.previewMp4Optional,
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
         .spatialAntialiasing = outputOptions.spatialAntialiasing,
@@ -20463,12 +21700,19 @@ bool StartQuickMp4ExportJob(
         .quickMp4BatchJob = true,
         .quickMp4BatchIndex = runtimeState->animationPanel.quickMp4QueueCompleted + 1U,
         .quickMp4BatchTotal = runtimeState->animationPanel.quickMp4QueueTotal,
-        .animationName = request.animationPath.name,
+        .animationName = outputAnimationName,
         .animationPath = request.animationPath,
+        .waterScenarios = request.waterScenarios,
+        .waterRainSettings = request.waterRainSettings,
+        .effectiveSeepageInvocations = effectiveSeepageInvocations,
+        .frozenSeepageLayers = std::move(frozenSeepageLayers),
+        .frozenRainLayers = std::move(frozenRainLayers),
         .animationFilePath = request.animationFilePath,
         .exportVisualName = request.visualName,
         .exportLog = MakeExportLogState(
-            request.videoOutputPath.parent_path(),
+            request.pngStackDirectory.empty()
+                ? request.videoOutputPath.parent_path()
+                : request.pngStackDirectory.parent_path(),
             request.mode),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
@@ -20552,10 +21796,10 @@ void StartSelectedQuickMp4Batch(
     const auto activePreset = ViewedExportPreset(*runtimeState);
     const auto activeMode = activePreset.mode;
     panel.exportMode = activeMode;
-    if (!AnimationExportWritesVideo(activeMode)) {
+    if (!AnimationExportWritesVideo(activeMode) && !AnimationExportWritesPngStack(activeMode)) {
         runtimeState->errorMessage =
             std::string{AnimationExportModeLabel(activeMode)} +
-            " is not a saved-animation video preset.";
+            " is not a saved-animation export preset.";
         runtimeState->statusMessage.clear();
         return;
     }
@@ -20587,6 +21831,9 @@ void StartSelectedQuickMp4Batch(
 
     auto& visualSession = runtimeState->sessions[visualSessionIndex.value()];
     EnsurePointVisuals(&visualSession);
+    if (!EnsureFullDensityExportSourcesReady(runtimeState)) {
+        return;
+    }
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
         runtimeState->statusMessage.clear();
@@ -20594,7 +21841,8 @@ void StartSelectedQuickMp4Batch(
     }
 
     const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
-    if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
+    if (AnimationExportWritesVideo(activeMode) &&
+        !invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
         runtimeState->errorMessage =
             modeLabel + " export requires ffmpeg at " + ffmpegPath.string() + ".";
         runtimeState->statusMessage.clear();
@@ -20620,6 +21868,9 @@ void StartSelectedQuickMp4Batch(
         }
 
         auto animationPath = loadedAnimation.value();
+        EmbedAnimationWaterScenarioFallbacks(
+            &animationPath,
+            runtimeState->water.seepageScenarios);
         RemoveUnexportableVisualNames(&animationPath);
         if (animationPath.keys.size() < 2U || animationPath.exportVisualNames.empty()) {
             ++panel.quickMp4QueueSkipped;
@@ -20633,23 +21884,38 @@ void StartSelectedQuickMp4Batch(
                 continue;
             }
 
-            const auto outputPath = BuildUniqueAnimationVideoOutputPathForMode(
-                activeMode,
-                settings.outputDirectory,
+            const auto outputAnimationName = AnimationNameWithWaterScenario(
                 animationPath.name,
-                settings,
-                visual->name,
-                reservedOutputPaths);
+                runtimeState->water.seepageScenarios,
+                animationPath);
+            const auto outputPath =
+                AnimationExportWritesPngStack(activeMode)
+                    ? invisible_places::output::BuildUniquePngStackOutputDirectory(
+                          settings.outputDirectory,
+                          outputAnimationName,
+                          settings,
+                          visual->name,
+                          reservedOutputPaths)
+                    : BuildUniqueAnimationVideoOutputPathForMode(
+                          activeMode,
+                          settings.outputDirectory,
+                          outputAnimationName,
+                          settings,
+                          visual->name,
+                          reservedOutputPaths);
             reservedOutputPaths.push_back(outputPath);
             panel.quickMp4Queue.push_back(
                 {.animationPath = animationPath,
+                 .waterScenarios = runtimeState->water.seepageScenarios,
+                 .waterRainSettings = runtimeState->water.rainSettings,
                  .mode = activeMode,
                  .settings = settings,
                  .animationFilePath = animationFilePath,
                  .visualName = visual->name,
                  .visualSessionIndex = visualSessionIndex.value(),
                  .visualStyle = visual->style,
-                 .videoOutputPath = outputPath});
+                 .videoOutputPath = AnimationExportWritesPngStack(activeMode) ? std::filesystem::path{} : outputPath,
+                 .pngStackDirectory = AnimationExportWritesPngStack(activeMode) ? outputPath : std::filesystem::path{}});
         }
     }
 
@@ -20702,10 +21968,13 @@ void StartStillCameraExportCapture(
         .writeExrStack = job.writeExrStack,
         .writePreviewMp4 = job.writePreviewMp4,
         .writeProResMov = job.writeProResMov,
+        .writePngStack = job.writePngStack,
         .previewMp4Optional = job.optionalPreviewMp4,
         .mp4SupersampleScale = job.mp4SupersampleScale,
         .spatialAntialiasing = job.spatialAntialiasing,
         .previewVideoPath = job.videoOutputPath,
+        .pngStackDirectory = job.pngStackDirectory,
+        .pngStackFrameStem = job.pngStackFrameStem.empty() ? job.animationName : job.pngStackFrameStem,
         .previewVideoWarning = job.previewVideoWarning,
     };
     job.worker = std::jthread{
@@ -20813,6 +22082,9 @@ void StartStillCameraExportJob(
     NormalizeAnimationRenderSettings(&settings);
     runtimeState->renderSettings = settings;
 
+    if (!EnsureFullDensityExportSourcesReady(runtimeState)) {
+        return;
+    }
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting a still-camera render.";
         runtimeState->statusMessage.clear();
@@ -20823,13 +22095,35 @@ void StartStillCameraExportJob(
     if (!CheckVideoExportMemoryBudget(runtimeState, mode, settings)) {
         return;
     }
+    if (ResolveActiveWaterScenarioState(*runtimeState).has_value() && viewport != nullptr) {
+        EnsureMaximumScenarioRainFixture(runtimeState, viewport);
+    }
+    std::string stillName = "StillCamera";
+    if (const auto scenarioName = ActiveWaterScenarioDisplayName(*runtimeState);
+        !scenarioName.empty()) {
+        stillName += " - " + scenarioName;
+    }
     const auto outputRoot = std::filesystem::path{settings.outputDirectory};
     if (AnimationExportWritesExr(mode)) {
         settings.outputDirectory =
-            BuildUniqueAnimationExportDirectory(outputRoot, "StillCamera", mode, settings).string();
+            BuildUniqueAnimationExportDirectory(outputRoot, stillName, mode, settings).string();
     }
     std::filesystem::path videoOutputPath;
-    AnimationExportOutputOptions outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath);
+    std::filesystem::path pngStackDirectory;
+    if (AnimationExportWritesPngStack(mode)) {
+        pngStackDirectory = invisible_places::output::BuildUniquePngStackOutputDirectory(
+            outputRoot,
+            stillName,
+            settings);
+    }
+    AnimationExportOutputOptions outputOptions = MakeAnimationExportOutputOptions(
+        mode,
+        settings,
+        videoOutputPath,
+        false,
+        {},
+        pngStackDirectory,
+        stillName);
     const bool exrStackPreviewMp4 =
         mode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
     if (AnimationExportWritesVideo(mode) || exrStackPreviewMp4) {
@@ -20847,7 +22141,7 @@ void StartStillCameraExportJob(
             videoOutputPath = BuildUniqueAnimationVideoOutputPathForMode(
                 mode,
                 outputRoot,
-                "StillCamera",
+                stillName,
                 settings);
         }
         outputOptions = MakeAnimationExportOutputOptions(mode, settings, videoOutputPath, exrStackPreviewMp4);
@@ -20901,9 +22195,12 @@ void StartStillCameraExportJob(
         .currentTile = 0,
         .startedAt = std::chrono::steady_clock::now(),
         .videoOutputPath = videoOutputPath,
+        .pngStackDirectory = pngStackDirectory,
+        .pngStackFrameStem = outputOptions.pngStackFrameStem,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
         .writeProResMov = outputOptions.writeProResMov,
+        .writePngStack = outputOptions.writePngStack,
         .optionalPreviewMp4 = outputOptions.previewMp4Optional,
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
         .spatialAntialiasing = outputOptions.spatialAntialiasing,
@@ -20916,9 +22213,11 @@ void StartStillCameraExportJob(
         .exportFrustumMaskFullSourcePoints = frustumMaskSummary.fullSourcePoints,
         .pointCloudRendererMode = exportRendererMode,
         .stillCameraJob = true,
-        .animationName = "Still Camera",
+        .animationName = stillName,
         .exportVisualName = "Current View",
-        .exportLog = MakeExportLogState(settings.outputDirectory, mode),
+        .exportLog = MakeExportLogState(
+            pngStackDirectory.empty() ? std::filesystem::path{settings.outputDirectory} : pngStackDirectory.parent_path(),
+            mode),
         .exportBackgroundColor = glm::vec4{
             runtimeState->projectSettings.backgroundColor[0],
             runtimeState->projectSettings.backgroundColor[1],
@@ -20971,6 +22270,9 @@ void StartAnimationExportJob(
         return;
     }
 
+    if (!EnsureFullDensityExportSourcesReady(runtimeState)) {
+        return;
+    }
     if (!HasOfflinePointLayers(*runtimeState)) {
         runtimeState->errorMessage = "Load and show at least one LiDAR layer before exporting an animation.";
         runtimeState->statusMessage.clear();
@@ -20984,15 +22286,26 @@ void StartAnimationExportJob(
         return;
     }
 
+    auto animationPathSnapshot = runtimeState->animationPanel.currentPath.value();
+    EmbedAnimationWaterScenarioFallbacks(
+        &animationPathSnapshot,
+        runtimeState->water.seepageScenarios);
+    if (!animationPathSnapshot.selectedWaterScenarioId.empty() && viewport != nullptr) {
+        EnsureMaximumScenarioRainFixture(runtimeState, viewport);
+    }
     const auto outputRoot = std::filesystem::path{settings.outputDirectory};
-    const auto animationName = runtimeState->animationPanel.currentPath->name;
+    const auto animationName = AnimationNameWithWaterScenario(
+        animationPathSnapshot.name,
+        runtimeState->water.seepageScenarios,
+        animationPathSnapshot);
     if (AnimationExportWritesExr(activeMode)) {
         settings.outputDirectory =
             BuildUniqueAnimationExportDirectory(outputRoot, animationName, activeMode, settings).string();
     }
 
     std::filesystem::path videoOutputPath;
-    if (AnimationExportWritesProRes(activeMode)) {
+    std::filesystem::path pngStackDirectory;
+    if (AnimationExportWritesVideo(activeMode)) {
         const auto ffmpegPath = invisible_places::output::DefaultFfmpegExecutablePath();
         if (!invisible_places::output::FfmpegExecutableAvailable(ffmpegPath)) {
             runtimeState->errorMessage =
@@ -21007,6 +22320,12 @@ void StartAnimationExportJob(
             animationName,
             settings);
     }
+    if (AnimationExportWritesPngStack(activeMode)) {
+        pngStackDirectory = invisible_places::output::BuildUniquePngStackOutputDirectory(
+            outputRoot,
+            animationName,
+            settings);
+    }
     const bool exportUsesPreviewDensity =
         AnimationExportWritesExr(activeMode) && runtimeState->animationPanel.exportPreviewDensity;
     if (viewport != nullptr && exportUsesPreviewDensity) {
@@ -21014,7 +22333,7 @@ void StartAnimationExportJob(
     }
 
     auto frames = invisible_places::output::BuildAnimationRenderSequence(
-        runtimeState->animationPanel.currentPath.value(),
+        animationPathSnapshot,
         settings);
     if (frames.empty()) {
         runtimeState->errorMessage = "Animation path did not produce any output frames.";
@@ -21036,14 +22355,39 @@ void StartAnimationExportJob(
         runtimeState->statusMessage.clear();
         return;
     }
+    const auto effectiveSeepageInvocations =
+        EffectiveExportWaterSeepageShaderInvocations(*runtimeState);
+    auto frozenSeepageLayers = BuildFrozenAnimationSeepageLayers(
+        runtimeState,
+        exportPointCloudLayers,
+        effectiveSeepageInvocations);
+    auto frozenRainLayers = BuildFrozenAnimationRainLayers(
+        runtimeState,
+        exportPointCloudLayers);
+    if (viewport != nullptr) {
+        for (const auto& frozenLayer : frozenSeepageLayers) {
+            viewport->UploadWaterSeepageTopology(
+                frozenLayer.layerId,
+                frozenLayer.grid);
+        }
+    }
 
     const auto setupSize = viewport != nullptr ? CurrentFramebufferViewportSize(*viewport) : ImVec2{1.0F, 1.0F};
     auto writerState = std::make_shared<AnimationExportWriterState>();
     const auto outputOptions =
-        MakeAnimationExportOutputOptions(activeMode, settings, videoOutputPath);
-    const auto logDirectory = videoOutputPath.empty()
-                                  ? std::filesystem::path{settings.outputDirectory}
-                                  : videoOutputPath.parent_path();
+        MakeAnimationExportOutputOptions(
+            activeMode,
+            settings,
+            videoOutputPath,
+            false,
+            {},
+            pngStackDirectory,
+            animationName);
+    const auto logDirectory = !pngStackDirectory.empty()
+                                  ? pngStackDirectory.parent_path()
+                                  : videoOutputPath.empty()
+                                        ? std::filesystem::path{settings.outputDirectory}
+                                        : videoOutputPath.parent_path();
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
@@ -21055,9 +22399,12 @@ void StartAnimationExportJob(
         .currentTile = 0,
         .startedAt = std::chrono::steady_clock::now(),
         .videoOutputPath = videoOutputPath,
+        .pngStackDirectory = pngStackDirectory,
+        .pngStackFrameStem = outputOptions.pngStackFrameStem,
         .writeExrStack = outputOptions.writeExrStack,
         .writePreviewMp4 = outputOptions.writePreviewMp4,
         .writeProResMov = outputOptions.writeProResMov,
+        .writePngStack = outputOptions.writePngStack,
         .optionalPreviewMp4 = outputOptions.previewMp4Optional,
         .mp4SupersampleScale = outputOptions.mp4SupersampleScale,
         .spatialAntialiasing = outputOptions.spatialAntialiasing,
@@ -21066,8 +22413,13 @@ void StartAnimationExportJob(
         .setupViewportHeight = static_cast<std::uint32_t>(std::max(1.0F, setupSize.y)),
         .previewDensity = exportUsesPreviewDensity,
         .pointCloudRendererMode = exportRendererMode,
-        .animationName = runtimeState->animationPanel.currentPath->name,
-        .animationPath = runtimeState->animationPanel.currentPath.value(),
+        .animationName = animationName,
+        .animationPath = animationPathSnapshot,
+        .waterScenarios = runtimeState->water.seepageScenarios,
+        .waterRainSettings = runtimeState->water.rainSettings,
+        .effectiveSeepageInvocations = effectiveSeepageInvocations,
+        .frozenSeepageLayers = std::move(frozenSeepageLayers),
+        .frozenRainLayers = std::move(frozenRainLayers),
         .animationFilePath = runtimeState->animationPanel.currentFilePath.empty()
                                   ? std::filesystem::path{}
                                   : std::filesystem::path{runtimeState->animationPanel.currentFilePath},
@@ -21271,7 +22623,7 @@ void ProcessOfflineRenderJobStep(
             sampleOffsets.push_back(0.0F);
         }
         const auto videoScale =
-            (job.writePreviewMp4 || job.writeProResMov)
+            (job.writePreviewMp4 || job.writeProResMov || job.writePngStack)
                 ? std::max<std::uint32_t>(1U, job.mp4SupersampleScale)
                 : 1U;
         const auto videoWidth = ScaledRenderDimension(job.settings.width, videoScale);
@@ -21316,6 +22668,10 @@ void ProcessOfflineRenderJobStep(
             float sampleTimeSeconds,
             invisible_places::renderer::core::PointCloudExrReadbackMask readbackMask) {
             const auto cameraState = cameraForSampleTime(sampleTimeSeconds);
+            UploadFrozenAnimationSeepageParameters(
+                &job,
+                viewport,
+                sampleTimeSeconds);
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
                 cameraState,
@@ -21704,6 +23060,8 @@ void DrawAnimationExportSection(
 
     const char* exportModeLabels[] = {
         "Fast Preview MP4",
+        "H.265 Alpha MP4",
+        "PNG Stack",
         "HQ Preview-Density EXR",
         "ProRes 422 MOV",
         "ProRes 422 HQ MOV",
@@ -21719,37 +23077,45 @@ void DrawAnimationExportSection(
         case invisible_places::output::AnimationExportMode::FastPreviewMp4:
             exportModeIndex = 0;
             break;
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
             exportModeIndex = 1;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+        case invisible_places::output::AnimationExportMode::PngStack:
             exportModeIndex = 2;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
             exportModeIndex = 3;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
             exportModeIndex = 4;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
             exportModeIndex = 5;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
             exportModeIndex = 6;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
             exportModeIndex = 7;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
             exportModeIndex = 8;
             break;
-        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
             exportModeIndex = 9;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+            exportModeIndex = 10;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            exportModeIndex = 11;
             break;
     }
     if (ImGui::Combo("Preset Mode", &exportModeIndex, exportModeLabels, IM_ARRAYSIZE(exportModeLabels))) {
         const invisible_places::output::AnimationExportMode exportModes[] = {
             invisible_places::output::AnimationExportMode::FastPreviewMp4,
+            invisible_places::output::AnimationExportMode::HevcAlphaMp4,
+            invisible_places::output::AnimationExportMode::PngStack,
             invisible_places::output::AnimationExportMode::HqPreviewDensityExr,
             invisible_places::output::AnimationExportMode::ProRes422Mov,
             invisible_places::output::AnimationExportMode::ProRes422HqMov,
@@ -21767,6 +23133,11 @@ void DrawAnimationExportSection(
     }
     if (panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         ImGui::TextDisabled("Fast MP4: full-density camera-path frustum export, sparse-point smoothing, no AOVs.");
+    } else if (panel.exportMode == invisible_places::output::AnimationExportMode::HevcAlphaMp4) {
+        ImGui::TextDisabled(
+            "H.265 Alpha MP4: display-referred straight-alpha MP4 encoded with VideoToolbox HEVC.");
+    } else if (panel.exportMode == invisible_places::output::AnimationExportMode::PngStack) {
+        ImGui::TextDisabled("PNG Stack: display-referred RGBA frames in a folder beside video exports.");
     } else if (AnimationExportWritesProRes(panel.exportMode)) {
         ImGui::TextDisabled(
             AnimationExportPreservesAlpha(panel.exportMode)
@@ -21782,11 +23153,13 @@ void DrawAnimationExportSection(
 
     bool settingsChanged = false;
     settingsChanged |= InputTextString("Output Folder", &settings.outputDirectory);
-    if (AnimationExportWritesVideo(panel.exportMode)) {
+    if (AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)) {
         ImGui::TextDisabled(
-            AnimationExportWritesProRes(panel.exportMode)
-                ? "MOV names are generated as Animation_Visual_Format.mov."
-                : "MP4 names are generated as Animation_Visual.mp4.");
+            AnimationExportWritesPngStack(panel.exportMode)
+                ? "PNG Stack folders are generated beside video files as Animation_Visual_PNG_Settings."
+                : AnimationExportWritesProRes(panel.exportMode)
+                      ? "MOV names are generated as Animation_Visual_Format.mov."
+                      : "MP4 names are generated as Animation_Visual.mp4.");
     }
 
     int width = static_cast<int>(settings.width);
@@ -21855,7 +23228,7 @@ void DrawAnimationExportSection(
             settingsChanged = true;
         }
     }
-    if (AnimationExportWritesVideo(panel.exportMode)) {
+    if (AnimationExportUsesSupersampledRgbaFrames(panel.exportMode)) {
         ImGui::TextDisabled(
             "Internal render: %u x %u -> %u x %u.",
             ScaledRenderDimension(settings.width, settings.supersampleScale),
@@ -21888,7 +23261,7 @@ void DrawAnimationExportSection(
         MarkCurrentAnimationExportSettingsDirty(runtimeState);
         panel.exportMode = ViewedExportPreset(*runtimeState).mode;
     }
-    if (AnimationExportWritesVideo(panel.exportMode)) {
+    if (AnimationExportUsesSupersampledRgbaFrames(panel.exportMode)) {
         ImGui::TextDisabled("Point density: full source inside the export frustum; off-camera points are skipped when useful.");
     } else {
         ImGui::SameLine();
@@ -21914,7 +23287,7 @@ void DrawAnimationExportSection(
         ImGui::SetTooltip("Renders one frame at the current animation position using the active export preset.");
     }
 
-    if (AnimationExportWritesVideo(panel.exportMode) &&
+    if ((AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)) &&
         panel.currentPath.has_value()) {
         ImGui::Spacing();
         ImGui::TextUnformatted("Export Visuals");
@@ -21938,7 +23311,7 @@ void DrawAnimationExportSection(
                 }
             }
             if (exportableVisualCount == 0) {
-                ImGui::TextDisabled("No saved visuals are available for video export.");
+                ImGui::TextDisabled("No saved visuals are available for this export.");
             }
         }
     }
@@ -21958,11 +23331,9 @@ void DrawAnimationExportSection(
                                        : 0U;
     ImGui::TextDisabled(
         "%s: %zu frames.",
-        panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-            ? "MP4"
-            : AnimationExportWritesProRes(panel.exportMode)
-                  ? "MOV"
-                  : "EXR stack",
+        AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)
+            ? AnimationExportModeLabel(panel.exportMode)
+            : "EXR stack",
         previewFrameCount);
     if (AnimationExportWritesVideo(panel.exportMode) &&
         !invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath())) {
@@ -21999,7 +23370,7 @@ void DrawAnimationExportSection(
         if (!job.exportLog.path.empty()) {
             ImGui::TextWrapped("Log: %s", job.exportLog.path.string().c_str());
         }
-        if ((job.writePreviewMp4 || job.writeProResMov) && job.mp4SupersampleScale > 1U) {
+        if ((job.writePreviewMp4 || job.writeProResMov || job.writePngStack) && job.mp4SupersampleScale > 1U) {
             ImGui::Text(
                 "%s supersample: %ux -> %u x %u",
                 AnimationExportModeLabel(job.mode),
@@ -22028,11 +23399,11 @@ void DrawAnimationExportSection(
     if (!exportAvailable) {
         ImGui::BeginDisabled();
     }
-    const char* exportButtonLabel =
-        AnimationExportWritesProRes(panel.exportMode)
-            ? "Export Current ProRes MOV"
+    const std::string exportButtonLabel =
+        AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)
+            ? "Export Current " + std::string{AnimationExportModeLabel(panel.exportMode)}
             : "Export HQ EXR Stack";
-    if (ImGui::Button(exportButtonLabel)) {
+    if (ImGui::Button(exportButtonLabel.c_str())) {
         StartAnimationExportJob(runtimeState, viewport);
     }
     if (!exportAvailable) {
@@ -22040,11 +23411,15 @@ void DrawAnimationExportSection(
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            AnimationExportWritesProRes(panel.exportMode)
+            AnimationExportWritesPngStack(panel.exportMode)
+                ? "Writes a straight-alpha PNG image sequence from the current animation."
+                : AnimationExportWritesProRes(panel.exportMode)
                 ? AnimationExportPreservesAlpha(panel.exportMode)
                       ? "Writes a straight-alpha ProRes MOV from the current animation."
                       : "Writes an opaque ProRes MOV flattened over black from the current animation."
-                : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using the selected point-density mode.");
+                : AnimationExportWritesMp4(panel.exportMode)
+                      ? "Writes a straight-alpha MP4 from the current animation."
+                      : "Writes beauty.RGB, alpha.A, and depth.Z EXRs using the selected point-density mode.");
     }
     EndPanelSection();
 }
@@ -22193,7 +23568,7 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     } else {
         ImGui::TextUnformatted(job.previewDensity ? "Renderer: GPU preview density" : "Renderer: GPU full source");
     }
-    if ((job.writePreviewMp4 || job.writeProResMov) && job.mp4SupersampleScale > 1U) {
+    if ((job.writePreviewMp4 || job.writeProResMov || job.writePngStack) && job.mp4SupersampleScale > 1U) {
         ImGui::Text(
             "%s supersample: %ux -> %u x %u",
             AnimationExportModeLabel(job.mode),
@@ -22204,13 +23579,19 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     ImGui::Text(
         "Elapsed: %s",
         FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
-    ImGui::TextWrapped(
-        "Output: %s",
-        AnimationExportWritesVideo(job.mode)
-            ? job.videoOutputPath.string().c_str()
-            : job.settings.outputDirectory.c_str());
+    std::string outputPathLabel;
+    if (AnimationExportWritesVideo(job.mode)) {
+        outputPathLabel = job.videoOutputPath.string();
+    } else if (job.writePngStack) {
+        outputPathLabel = job.pngStackDirectory.string();
+    } else {
+        outputPathLabel = job.settings.outputDirectory;
+    }
+    ImGui::TextWrapped("Output: %s", outputPathLabel.c_str());
     if ((job.writePreviewMp4 || job.writeProResMov) && !job.videoOutputPath.empty()) {
         ImGui::TextWrapped("%s: %s", AnimationExportModeLabel(job.mode), job.videoOutputPath.string().c_str());
+    } else if (job.writePngStack && !job.pngStackDirectory.empty()) {
+        ImGui::TextWrapped("PNG Stack: %s", job.pngStackDirectory.string().c_str());
     } else if (!job.previewVideoWarning.empty()) {
         ImGui::TextWrapped("%s", job.previewVideoWarning.c_str());
     }
@@ -23019,6 +24400,569 @@ void DrawWaterRegionPointPreviewOverlay(
     (void)viewport;
 }
 
+std::optional<glm::vec3> IntersectManualFlowPathDragPlane(
+    const ScreenRay& ray,
+    const glm::vec3& planePoint,
+    const glm::vec3& planeNormal) {
+    return manual_flow_path::IntersectRayPlane(
+        manual_flow_path::Ray{.origin = ray.origin, .direction = ray.direction},
+        planePoint,
+        planeNormal);
+}
+
+std::optional<float> ManualFlowPathAxisParameter(
+    const ScreenRay& ray,
+    const glm::vec3& axisOrigin,
+    const glm::vec3& axis) {
+    return manual_flow_path::ClosestRayAxisParameter(
+        manual_flow_path::Ray{.origin = ray.origin, .direction = ray.direction},
+        axisOrigin,
+        axis);
+}
+
+float ManualFlowPathScreenSegmentAmount(ImVec2 point, ImVec2 start, ImVec2 end) {
+    const float dx = end.x - start.x;
+    const float dy = end.y - start.y;
+    const float lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared <= 1.0e-6F) {
+        return 0.0F;
+    }
+    return std::clamp(
+        (((point.x - start.x) * dx) + ((point.y - start.y) * dy)) / lengthSquared,
+        0.0F,
+        1.0F);
+}
+
+float ManualFlowPathTriangleSign(ImVec2 point, ImVec2 left, ImVec2 right) {
+    return (point.x - right.x) * (left.y - right.y) -
+           (left.x - right.x) * (point.y - right.y);
+}
+
+bool ManualFlowPathPointInQuad(ImVec2 point, const std::array<ImVec2, 4>& quad) {
+    const auto inTriangle = [](ImVec2 p, ImVec2 a, ImVec2 b, ImVec2 c) {
+        const float d1 = ManualFlowPathTriangleSign(p, a, b);
+        const float d2 = ManualFlowPathTriangleSign(p, b, c);
+        const float d3 = ManualFlowPathTriangleSign(p, c, a);
+        const bool hasNegative = d1 < 0.0F || d2 < 0.0F || d3 < 0.0F;
+        const bool hasPositive = d1 > 0.0F || d2 > 0.0F || d3 > 0.0F;
+        return !(hasNegative && hasPositive);
+    };
+    return inTriangle(point, quad[0], quad[1], quad[2]) ||
+           inTriangle(point, quad[0], quad[2], quad[3]);
+}
+
+struct ManualFlowPathCurveHit {
+    float screenDistance = std::numeric_limits<float>::max();
+    std::size_t controlSegmentIndex = 0U;
+    invisible_places::io::Float3 position{};
+};
+
+std::optional<ManualFlowPathCurveHit> PickManualFlowPathCurve(
+    const WaterManualFlowPathSource& source,
+    const WaterOverlay& anchors,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint,
+    float maximumDistance = 10.0F) {
+    if (source.controlPoints.size() < 2U || anchors.points.size() < 2U) {
+        return std::nullopt;
+    }
+    std::optional<ManualFlowPathCurveHit> best;
+    std::size_t controlSegment = 0U;
+    for (std::size_t index = 1U; index < anchors.points.size(); ++index) {
+        const auto projectedLeft = ProjectWorldPoint(matrices, viewport, ToGlm(anchors.points[index - 1U].position));
+        const auto projectedRight = ProjectWorldPoint(matrices, viewport, ToGlm(anchors.points[index].position));
+        if (projectedLeft.has_value() && projectedRight.has_value()) {
+            const float amount = ManualFlowPathScreenSegmentAmount(
+                screenPoint,
+                projectedLeft->screen,
+                projectedRight->screen);
+            const ImVec2 closest{
+                projectedLeft->screen.x + (projectedRight->screen.x - projectedLeft->screen.x) * amount,
+                projectedLeft->screen.y + (projectedRight->screen.y - projectedLeft->screen.y) * amount,
+            };
+            const float distance = ScreenDistance(screenPoint, closest);
+            if (distance <= maximumDistance && (!best.has_value() || distance < best->screenDistance)) {
+                best = ManualFlowPathCurveHit{
+                    .screenDistance = distance,
+                    .controlSegmentIndex = std::min(controlSegment, source.controlPoints.size() - 2U),
+                    .position = FromGlm(glm::mix(
+                        ToGlm(anchors.points[index - 1U].position),
+                        ToGlm(anchors.points[index].position),
+                        amount)),
+                };
+            }
+        }
+        if (controlSegment + 1U < source.controlPoints.size() &&
+            glm::length(
+                ToGlm(anchors.points[index].position) -
+                ToGlm(source.controlPoints[controlSegment + 1U])) <= 1.0e-3F) {
+            ++controlSegment;
+        }
+    }
+    return best;
+}
+
+void DrawManualFlowPathGuide(
+    ImDrawList* drawList,
+    const WaterManualFlowPathSource& source,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImU32 colour,
+    float width) {
+    if (drawList == nullptr) {
+        return;
+    }
+    const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source);
+    std::optional<ImVec2> previous;
+    for (const auto& anchor : anchors.points) {
+        const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(anchor.position));
+        if (!projected.has_value()) {
+            previous.reset();
+            continue;
+        }
+        if (previous.has_value()) {
+            drawList->AddLine(previous.value(), projected->screen, IM_COL32(0, 0, 0, 175), width + 2.8F);
+            drawList->AddLine(previous.value(), projected->screen, colour, width);
+        }
+        previous = projected->screen;
+    }
+}
+
+void DrawManualFlowPathOverlay(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState == nullptr || VisibleLayerCount(*runtimeState) == 0) {
+        return;
+    }
+
+    auto& water = runtimeState->water;
+    auto& editor = water.manualFlowPathEditor;
+    editor.consumedViewportInputThisFrame = false;
+    const auto matrices = runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+    const auto& io = ImGui::GetIO();
+
+    for (std::size_t index = 0; index < water.manualFlowPaths.size(); ++index) {
+        const bool selected = water.selectedManualFlowPathIndex.has_value() &&
+                              water.selectedManualFlowPathIndex.value() == index;
+        const bool pathView = water.overlayViewMode == WaterOverlayViewMode::Path;
+        const bool editingThisSource = editor.active && !editor.creating &&
+                                       editor.sourceIndex.has_value() &&
+                                       editor.sourceIndex.value() == index;
+        if (water.showFlowSourceGuides && (selected || pathView) && !editingThisSource) {
+            DrawManualFlowPathGuide(
+                drawList,
+                water.manualFlowPaths[index],
+                matrices,
+                viewport,
+                selected ? IM_COL32(72, 231, 255, 245) : IM_COL32(72, 205, 235, 180),
+                selected ? 3.0F : 2.1F);
+        }
+    }
+
+    if (!editor.active) {
+        return;
+    }
+
+    auto& draft = editor.draft;
+    auto& nodes = draft.controlPoints;
+    auto anchors = invisible_places::water::BuildManualFlowPathAnchors(draft);
+
+    if (!io.MouseDown[0] && editor.pointerCapturedUntilRelease) {
+        editor.drag = {};
+        editor.pointerCapturedUntilRelease = false;
+    }
+
+    if (editor.drag.kind != ManualFlowPathGizmoDragKind::None) {
+        editor.consumedViewportInputThisFrame = true;
+        editor.pointerCapturedUntilRelease = io.MouseDown[0];
+        if (!io.MouseDown[0] || editor.drag.nodeIndex >= nodes.size()) {
+            editor.drag = {};
+        } else if (const auto ray = MakeScreenRay(matrices, viewport, io.MousePos); ray.has_value()) {
+            glm::vec3 nextPoint = ToGlm(editor.drag.startPoint);
+            if (editor.drag.kind == ManualFlowPathGizmoDragKind::Axis &&
+                !editor.drag.axisUsesProjectedFallback) {
+                if (const auto parameter = ManualFlowPathAxisParameter(
+                        ray.value(),
+                        ToGlm(editor.drag.startPoint),
+                        editor.drag.axis);
+                    parameter.has_value()) {
+                    nextPoint += editor.drag.axis * (parameter.value() - editor.drag.startAxisParameter);
+                } else {
+                    nextPoint = manual_flow_path::ProjectedAxisDragPoint(
+                        nextPoint,
+                        editor.drag.axis,
+                        glm::vec2{editor.drag.startMouse.x, editor.drag.startMouse.y},
+                        glm::vec2{io.MousePos.x, io.MousePos.y},
+                        glm::vec2{
+                            editor.drag.axisScreenDirection.x,
+                            editor.drag.axisScreenDirection.y,
+                        },
+                        editor.drag.pixelsPerWorldUnit);
+                }
+            } else if (editor.drag.kind == ManualFlowPathGizmoDragKind::Axis) {
+                nextPoint = manual_flow_path::ProjectedAxisDragPoint(
+                    nextPoint,
+                    editor.drag.axis,
+                    glm::vec2{editor.drag.startMouse.x, editor.drag.startMouse.y},
+                    glm::vec2{io.MousePos.x, io.MousePos.y},
+                    glm::vec2{
+                        editor.drag.axisScreenDirection.x,
+                        editor.drag.axisScreenDirection.y,
+                    },
+                    editor.drag.pixelsPerWorldUnit);
+            } else if (const auto intersection = IntersectManualFlowPathDragPlane(
+                           ray.value(),
+                           ToGlm(editor.drag.startPoint),
+                           editor.drag.planeNormal);
+                       intersection.has_value()) {
+                nextPoint += intersection.value() - editor.drag.startPlaneIntersection;
+            }
+            if (std::isfinite(nextPoint.x) && std::isfinite(nextPoint.y) && std::isfinite(nextPoint.z)) {
+                nodes[editor.drag.nodeIndex] = FromGlm(nextPoint);
+                anchors = invisible_places::water::BuildManualFlowPathAnchors(draft);
+            }
+        }
+    }
+
+    DrawManualFlowPathGuide(
+        drawList,
+        draft,
+        matrices,
+        viewport,
+        IM_COL32(79, 232, 255, 255),
+        3.3F);
+
+    const bool canInteract =
+        (editor.drag.kind != ManualFlowPathGizmoDragKind::None) ||
+        (!viewport.UiWantsMouseCapture() && IsMouseOverRenderViewport(viewport));
+    editor.hoveredNodeIndex.reset();
+    float closestNodeDistance = 11.0F;
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(nodes[index]));
+        if (!projected.has_value()) {
+            continue;
+        }
+        if (canInteract && editor.drag.kind == ManualFlowPathGizmoDragKind::None) {
+            const float distance = ScreenDistance(io.MousePos, projected->screen);
+            if (distance < closestNodeDistance) {
+                closestNodeDistance = distance;
+                editor.hoveredNodeIndex = index;
+            }
+        }
+        const bool selected = editor.selectedNodeIndex.has_value() &&
+                              editor.selectedNodeIndex.value() == index;
+        const bool hovered = editor.hoveredNodeIndex.has_value() &&
+                             editor.hoveredNodeIndex.value() == index;
+        const float radius = index == 0U ? 7.5F : (selected ? 7.0F : 5.4F);
+        const ImU32 fill = index == 0U
+                               ? IM_COL32(255, 193, 62, 255)
+                               : (selected ? IM_COL32(255, 255, 255, 255)
+                                           : IM_COL32(66, 225, 250, hovered ? 255 : 225));
+        drawList->AddCircleFilled(projected->screen, radius + 3.0F, IM_COL32(0, 0, 0, 180), 24);
+        drawList->AddCircleFilled(projected->screen, radius, fill, 24);
+        drawList->AddCircle(
+            projected->screen,
+            radius + (selected ? 3.0F : 1.5F),
+            selected ? IM_COL32(255, 224, 126, 255) : IM_COL32(20, 88, 102, 235),
+            24,
+            selected ? 2.3F : 1.4F);
+        if (index == 0U) {
+            const ImVec2 labelPosition{projected->screen.x + 11.0F, projected->screen.y - 18.0F};
+            drawList->AddText(
+                ImVec2{labelPosition.x + 1.0F, labelPosition.y + 1.0F},
+                IM_COL32(0, 0, 0, 230),
+                "START");
+            drawList->AddText(labelPosition, IM_COL32(255, 211, 94, 255), "START");
+        }
+    }
+
+    struct AxisHandle {
+        glm::vec3 axis{};
+        ImVec2 start{};
+        ImVec2 end{};
+        ImU32 colour = 0;
+        float pixelsPerWorldUnit = 1.0F;
+    };
+    struct PlaneHandle {
+        glm::vec3 normal{};
+        std::array<ImVec2, 4> quad{};
+        ImU32 colour = 0;
+    };
+    std::vector<AxisHandle> axisHandles;
+    std::vector<PlaneHandle> planeHandles;
+    std::optional<ImVec2> selectedScreen;
+
+    if (editor.selectedNodeIndex.has_value() && editor.selectedNodeIndex.value() < nodes.size()) {
+        const glm::vec3 selectedPoint = ToGlm(nodes[editor.selectedNodeIndex.value()]);
+        const auto projectedCenter = ProjectWorldPoint(matrices, viewport, selectedPoint);
+        if (projectedCenter.has_value()) {
+            selectedScreen = projectedCenter->screen;
+            const float cameraDistance = glm::length(selectedPoint - matrices.position);
+            const float axisLength = std::max(0.05F, cameraDistance * 0.12F);
+            const std::array<glm::vec3, 3> axes{
+                glm::vec3{1.0F, 0.0F, 0.0F},
+                glm::vec3{0.0F, 1.0F, 0.0F},
+                glm::vec3{0.0F, 0.0F, 1.0F},
+            };
+            const std::array<ImU32, 3> colours{
+                IM_COL32(245, 67, 84, 255),
+                IM_COL32(115, 221, 62, 255),
+                IM_COL32(57, 145, 248, 255),
+            };
+            for (std::size_t axisIndex = 0; axisIndex < axes.size(); ++axisIndex) {
+                const glm::vec3 startPoint = selectedPoint + axes[axisIndex] * (axisLength * 0.18F);
+                const glm::vec3 endPoint = selectedPoint + axes[axisIndex] * axisLength;
+                const auto projectedStart = ProjectWorldPoint(matrices, viewport, startPoint);
+                const auto projectedEnd = ProjectWorldPoint(matrices, viewport, endPoint);
+                if (!projectedStart.has_value() || !projectedEnd.has_value()) {
+                    continue;
+                }
+                drawList->AddLine(projectedStart->screen, projectedEnd->screen, IM_COL32(0, 0, 0, 190), 6.0F);
+                drawList->AddLine(projectedStart->screen, projectedEnd->screen, colours[axisIndex], 3.2F);
+                const ImVec2 direction{
+                    projectedEnd->screen.x - projectedStart->screen.x,
+                    projectedEnd->screen.y - projectedStart->screen.y,
+                };
+                const float screenLength = std::max(
+                    1.0F,
+                    std::sqrt(direction.x * direction.x + direction.y * direction.y));
+                const ImVec2 normal{-direction.y / screenLength, direction.x / screenLength};
+                const ImVec2 backward{
+                    projectedEnd->screen.x - direction.x * (9.0F / screenLength),
+                    projectedEnd->screen.y - direction.y * (9.0F / screenLength),
+                };
+                drawList->AddTriangleFilled(
+                    projectedEnd->screen,
+                    ImVec2{backward.x + normal.x * 5.5F, backward.y + normal.y * 5.5F},
+                    ImVec2{backward.x - normal.x * 5.5F, backward.y - normal.y * 5.5F},
+                    colours[axisIndex]);
+                axisHandles.push_back(AxisHandle{
+                    .axis = axes[axisIndex],
+                    .start = projectedStart->screen,
+                    .end = projectedEnd->screen,
+                    .colour = colours[axisIndex],
+                    .pixelsPerWorldUnit = screenLength / std::max(1.0e-5F, axisLength * 0.82F),
+                });
+            }
+
+            struct PlaneAxes {
+                glm::vec3 first{};
+                glm::vec3 second{};
+                glm::vec3 normal{};
+                ImU32 colour = 0;
+            };
+            const std::array<PlaneAxes, 3> planes{
+                PlaneAxes{axes[0], axes[1], axes[2], IM_COL32(245, 214, 70, 205)},
+                PlaneAxes{axes[0], axes[2], axes[1], IM_COL32(232, 80, 205, 205)},
+                PlaneAxes{axes[1], axes[2], axes[0], IM_COL32(71, 220, 210, 205)},
+            };
+            for (const auto& plane : planes) {
+                constexpr float kNear = 0.24F;
+                constexpr float kFar = 0.43F;
+                const std::array<glm::vec3, 4> worldCorners{
+                    selectedPoint + (plane.first + plane.second) * (axisLength * kNear),
+                    selectedPoint + plane.first * (axisLength * kFar) + plane.second * (axisLength * kNear),
+                    selectedPoint + (plane.first + plane.second) * (axisLength * kFar),
+                    selectedPoint + plane.first * (axisLength * kNear) + plane.second * (axisLength * kFar),
+                };
+                std::array<ImVec2, 4> quad{};
+                bool visible = true;
+                for (std::size_t corner = 0; corner < worldCorners.size(); ++corner) {
+                    const auto projected = ProjectWorldPoint(matrices, viewport, worldCorners[corner]);
+                    if (!projected.has_value()) {
+                        visible = false;
+                        break;
+                    }
+                    quad[corner] = projected->screen;
+                }
+                if (!visible) {
+                    continue;
+                }
+                drawList->AddConvexPolyFilled(quad.data(), 4, plane.colour);
+                drawList->AddPolyline(quad.data(), 4, IM_COL32(255, 255, 255, 225), ImDrawFlags_Closed, 1.4F);
+                planeHandles.push_back(PlaneHandle{
+                    .normal = plane.normal,
+                    .quad = quad,
+                    .colour = plane.colour,
+                });
+            }
+            drawList->AddCircleFilled(projectedCenter->screen, 8.0F, IM_COL32(235, 235, 235, 255), 24);
+            drawList->AddCircle(projectedCenter->screen, 10.0F, IM_COL32(28, 28, 31, 255), 24, 2.0F);
+        }
+    }
+
+    if (!canInteract || editor.drag.kind != ManualFlowPathGizmoDragKind::None) {
+        return;
+    }
+
+    std::optional<std::size_t> hoveredAxis;
+    float closestAxisDistance = 9.0F;
+    for (std::size_t index = 0; index < axisHandles.size(); ++index) {
+        const float distance = DistanceToScreenSegment(io.MousePos, axisHandles[index].start, axisHandles[index].end);
+        if (distance < closestAxisDistance) {
+            closestAxisDistance = distance;
+            hoveredAxis = index;
+        }
+    }
+    std::optional<std::size_t> hoveredPlane;
+    for (std::size_t index = 0; index < planeHandles.size(); ++index) {
+        if (ManualFlowPathPointInQuad(io.MousePos, planeHandles[index].quad)) {
+            hoveredPlane = index;
+            break;
+        }
+    }
+    const bool hoveredCenter = selectedScreen.has_value() &&
+                               ScreenDistance(io.MousePos, selectedScreen.value()) <= 10.0F;
+    const auto curveHit = PickManualFlowPathCurve(draft, anchors, matrices, viewport, io.MousePos);
+    if (hoveredCenter || hoveredAxis.has_value() || hoveredPlane.has_value() ||
+        editor.hoveredNodeIndex.has_value() || curveHit.has_value()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+
+    const auto beginPlaneDrag = [&](ManualFlowPathGizmoDragKind kind, glm::vec3 planeNormal) {
+        if (!editor.selectedNodeIndex.has_value() || editor.selectedNodeIndex.value() >= nodes.size()) {
+            return false;
+        }
+        const auto ray = MakeScreenRay(matrices, viewport, io.MousePos);
+        if (!ray.has_value()) {
+            return false;
+        }
+        const glm::vec3 point = ToGlm(nodes[editor.selectedNodeIndex.value()]);
+        const auto intersection = IntersectManualFlowPathDragPlane(ray.value(), point, planeNormal);
+        if (!intersection.has_value()) {
+            return false;
+        }
+        editor.drag = {
+            .kind = kind,
+            .nodeIndex = editor.selectedNodeIndex.value(),
+            .startPoint = FromGlm(point),
+            .startMouse = io.MousePos,
+            .planeNormal = planeNormal,
+            .startPlaneIntersection = intersection.value(),
+        };
+        editor.pointerCapturedUntilRelease = true;
+        editor.consumedViewportInputThisFrame = true;
+        return true;
+    };
+
+    if (io.KeyCtrl && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        editor.consumedViewportInputThisFrame = true;
+        if (const auto pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, io.MousePos);
+            pivot.has_value()) {
+            const bool duplicateLast = !nodes.empty() &&
+                                       glm::length(ToGlm(nodes.back()) - ToGlm(pivot->point)) <= 1.0e-5F;
+            if (!duplicateLast) {
+                nodes.push_back(pivot->point);
+                editor.selectedNodeIndex = nodes.size() - 1U;
+                runtimeState->statusMessage = "Added manual flow path node.";
+                runtimeState->errorMessage.clear();
+            }
+        } else {
+            runtimeState->errorMessage = "No visible surface was found under the pointer.";
+        }
+        return;
+    }
+
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && curveHit.has_value()) {
+        const auto insertIndex = manual_flow_path::InsertControlPoint(
+            &nodes,
+            curveHit->controlSegmentIndex,
+            curveHit->position);
+        if (!insertIndex.has_value()) {
+            return;
+        }
+        editor.selectedNodeIndex = insertIndex.value();
+        editor.consumedViewportInputThisFrame = true;
+        editor.pointerCapturedUntilRelease = true;
+        runtimeState->statusMessage = "Inserted manual flow path node.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (hoveredCenter && editor.selectedNodeIndex.has_value()) {
+            glm::vec3 viewNormal = matrices.position - ToGlm(nodes[editor.selectedNodeIndex.value()]);
+            if (glm::length(viewNormal) > 1.0e-5F) {
+                beginPlaneDrag(ManualFlowPathGizmoDragKind::ViewPlane, glm::normalize(viewNormal));
+            }
+            return;
+        }
+        if (hoveredPlane.has_value()) {
+            beginPlaneDrag(
+                ManualFlowPathGizmoDragKind::Plane,
+                planeHandles[hoveredPlane.value()].normal);
+            return;
+        }
+        if (hoveredAxis.has_value() && editor.selectedNodeIndex.has_value()) {
+            const auto& handle = axisHandles[hoveredAxis.value()];
+            const auto ray = MakeScreenRay(matrices, viewport, io.MousePos);
+            const glm::vec3 point = ToGlm(nodes[editor.selectedNodeIndex.value()]);
+            const auto parameter = ray.has_value()
+                                       ? ManualFlowPathAxisParameter(ray.value(), point, handle.axis)
+                                       : std::nullopt;
+            const ImVec2 screenDirection{
+                handle.end.x - handle.start.x,
+                handle.end.y - handle.start.y,
+            };
+            const float screenLength = std::max(
+                1.0F,
+                std::sqrt(screenDirection.x * screenDirection.x + screenDirection.y * screenDirection.y));
+            editor.drag = {
+                .kind = ManualFlowPathGizmoDragKind::Axis,
+                .nodeIndex = editor.selectedNodeIndex.value(),
+                .startPoint = FromGlm(point),
+                .startMouse = io.MousePos,
+                .axis = handle.axis,
+                .axisScreenDirection = ImVec2{
+                    screenDirection.x / screenLength,
+                    screenDirection.y / screenLength,
+                },
+                .pixelsPerWorldUnit = handle.pixelsPerWorldUnit,
+                .startAxisParameter = parameter.value_or(0.0F),
+                .axisUsesProjectedFallback = !parameter.has_value(),
+            };
+            editor.pointerCapturedUntilRelease = true;
+            editor.consumedViewportInputThisFrame = true;
+            return;
+        }
+        if (editor.hoveredNodeIndex.has_value()) {
+            const std::size_t nodeIndex = editor.hoveredNodeIndex.value();
+            const bool alreadySelected = editor.selectedNodeIndex.has_value() &&
+                                         editor.selectedNodeIndex.value() == nodeIndex;
+            editor.selectedNodeIndex = nodeIndex;
+            editor.consumedViewportInputThisFrame = true;
+            if (alreadySelected) {
+                glm::vec3 viewNormal = matrices.position - ToGlm(nodes[nodeIndex]);
+                if (glm::length(viewNormal) > 1.0e-5F) {
+                    beginPlaneDrag(ManualFlowPathGizmoDragKind::ViewPlane, glm::normalize(viewNormal));
+                }
+            }
+            return;
+        }
+        if (curveHit.has_value()) {
+            editor.consumedViewportInputThisFrame = true;
+            return;
+        }
+    }
+
+    if (!viewport.UiWantsKeyboardCapture() && IsRenderViewportFocused() &&
+        editor.selectedNodeIndex.has_value() &&
+        (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+        const std::size_t nodeIndex = editor.selectedNodeIndex.value();
+        if (nodeIndex < nodes.size()) {
+            nodes.erase(nodes.begin() + static_cast<std::ptrdiff_t>(nodeIndex));
+            editor.selectedNodeIndex = nodes.empty()
+                                           ? std::nullopt
+                                           : std::optional<std::size_t>{std::min(nodeIndex, nodes.size() - 1U)};
+            editor.consumedViewportInputThisFrame = true;
+            runtimeState->statusMessage = "Deleted manual flow path node.";
+            runtimeState->errorMessage.clear();
+        }
+    }
+}
+
 ImU32 WaterEmitterMarkerColor(const WaterEmitter& emitter, bool selected) {
     if (selected) {
         return IM_COL32(255, 255, 255, 255);
@@ -23076,6 +25020,7 @@ void DrawWaterEmitterOverlay(
     const bool canPick =
         !viewport.UiWantsMouseCapture() &&
         renderViewportHovered &&
+        !runtimeState->water.manualFlowPathEditor.active &&
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path &&
         !runtimeState->water.placementArmed &&
         !runtimeState->water.seepagePlacementArmed &&
@@ -23086,6 +25031,10 @@ void DrawWaterEmitterOverlay(
         !runtimeState->water.movingEmitterIndex.has_value() &&
         !runtimeState->water.movingSeepageNodeIndex.has_value() &&
         !runtimeState->water.movingDynamicMeshAttractorIndex.has_value();
+    const bool sourceNodesVisible =
+        runtimeState->water.showFlowSourceGuides ||
+        runtimeState->water.placementArmed ||
+        runtimeState->water.movingEmitterIndex.has_value();
 
     const auto drawAttractorMarker = [&](const invisible_places::io::Float3& point, bool preview) {
         const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
@@ -23225,6 +25174,9 @@ void DrawWaterEmitterOverlay(
     }
 
     for (std::size_t index = 0; index < runtimeState->water.emitters.size(); ++index) {
+        if (!sourceNodesVisible) {
+            break;
+        }
         const auto& emitter = runtimeState->water.emitters[index];
         const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(emitter.position));
         if (!projected.has_value()) {
@@ -23273,7 +25225,7 @@ void DrawWaterEmitterOverlay(
             drawList->AddText(labelPosition, IM_COL32(220, 251, 255, 255), label.c_str());
         }
 
-        if (canPick) {
+        if (canPick && runtimeState->water.showFlowSourceGuides) {
             const float distance = ScreenDistance(io.MousePos, center);
             if (distance < nearestEmitterDistance) {
                 nearestEmitterDistance = distance;
@@ -24501,6 +26453,7 @@ bool HandleWaterPathViewInput(
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr ||
         viewport == nullptr ||
+        runtimeState->water.manualFlowPathEditor.active ||
         runtimeState->water.overlayViewMode != WaterOverlayViewMode::Path ||
         !runtimeState->water.pathCacheLoaded ||
         runtimeState->water.pathCache.branches.empty()) {
@@ -24849,6 +26802,7 @@ void DrawAnimationViewportOverlay(
     PreviewRuntimeState* runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
     if (runtimeState == nullptr ||
+        runtimeState->water.manualFlowPathEditor.active ||
         !runtimeState->animationPanel.showSplines ||
         !runtimeState->animationPanel.currentPath.has_value()) {
         return;
@@ -25805,87 +27759,204 @@ bool DrawPointCloudShorelineWavesSection(PreviewLayerSession* session) {
     changed |= ImGui::Checkbox("Enable Shoreline Waves", &style.shorelineWaveEnabled);
 
     if (style.shorelineWaveEnabled) {
-        changed |= DrawRangedFloatControl(
-            "Boundary Height",
-            &style.shorelineBoundaryZ,
-            {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
-        changed |= DrawRangedFloatControl(
-            "Height Reach",
-            &style.shorelineHeightReachMeters,
-            {.visualMin = 0.001F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.001F, .hardMax = 50.0F});
-        changed |= DrawRangedFloatControl(
-            "Edge Fade",
-            &style.shorelineEdgeFadeMeters,
-            {.visualMin = 0.0F, .visualMax = 0.50F, .format = "%.3f m", .hardMin = 0.0F, .hardMax = 10.0F});
-
-        constexpr float kPi = 3.14159265358979323846F;
-        float directionDegrees =
-            std::atan2(style.shorelineDirectionY, style.shorelineDirectionX) * 180.0F / kPi;
-        if (DrawRangedFloatControl(
-                "Wave Direction",
-                &directionDegrees,
-                {.visualMin = -180.0F, .visualMax = 180.0F, .format = "%.1f deg"})) {
-            const float radians = directionDegrees * kPi / 180.0F;
-            style.shorelineDirectionX = std::cos(radians);
-            style.shorelineDirectionY = std::sin(radians);
+        int algorithmIndex = static_cast<int>(style.shorelineWaveAlgorithm);
+        const char* algorithms[] = {"Foam Fronts (Current)", "Height Foam"};
+        if (DrawRightAlignedCombo("Algorithm", &algorithmIndex, algorithms, IM_ARRAYSIZE(algorithms))) {
+            style.shorelineWaveAlgorithm = static_cast<PointCloudShorelineWaveAlgorithm>(algorithmIndex);
             changed = true;
         }
 
-        changed |= DrawRangedFloatControl(
-            "Wavelength",
-            &style.shorelineWavelengthMeters,
-            {.visualMin = 0.002F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.002F, .hardMax = 10.0F});
-        changed |= DrawRangedFloatControl(
-            "Pattern Scale",
-            &style.shorelinePatternScale,
-            {.visualMin = 0.01F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.01F, .hardMax = 50.0F});
-        changed |= DrawRangedFloatControl(
-            "Speed",
-            &style.shorelineSpeed,
-            {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 10.0F});
-        changed |= DrawRangedFloatControl(
-            "Warp",
-            &style.shorelineWarp,
-            {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
-        changed |= DrawRangedFloatControl(
-            "Turbulence",
-            &style.shorelineTurbulence,
-            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-        changed |= DrawRangedFloatControl(
-            "Band Density",
-            &style.shorelineDensity,
-            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+        constexpr float kPi = 3.14159265358979323846F;
+        if (style.shorelineWaveAlgorithm == PointCloudShorelineWaveAlgorithm::HeightFoam) {
+            auto& foam = style.shorelineHeightFoam;
+            changed |= DrawRangedFloatControl(
+                "Run-up Height",
+                &foam.runupZ,
+                {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+            changed |= DrawRangedFloatControl(
+                "Break Height",
+                &foam.breakZ,
+                {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+            changed |= DrawRangedFloatControl(
+                "Offshore Reach",
+                &foam.offshoreReachMeters,
+                {.visualMin = 0.001F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.001F, .hardMax = 50.0F});
+            changed |= DrawRangedFloatControl(
+                "Edge Fade",
+                &foam.edgeFadeMeters,
+                {.visualMin = 0.0F, .visualMax = 0.50F, .format = "%.3f m", .hardMin = 0.0F, .hardMax = 10.0F});
 
-        ImGui::Spacing();
-        changed |= DrawRangedFloatControl(
-            "Intensity",
-            &style.shorelineIntensity,
-            {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
-        changed |= DrawRangedFloatControl(
-            "Emission Add",
-            &style.shorelineEmissionAdd,
-            {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
-        changed |= DrawRangedFloatControl(
-            "Opacity Add",
-            &style.shorelineOpacityAdd,
-            {.visualMin = -1.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = -1.0F, .hardMax = 2.0F});
-        changed |= DrawRangedFloatControl(
-            "Opacity Multiply",
-            &style.shorelineOpacityMultiply,
-            {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
-        changed |= DrawRangedFloatControl(
-            "Point Size Add",
-            &style.shorelinePointSizeAdd,
-            {.visualMin = -32.0F, .visualMax = 64.0F, .format = "%.1f", .hardMin = -256.0F, .hardMax = 512.0F});
-        changed |= DrawRangedFloatControl(
-            "Point Size Multiply",
-            &style.shorelinePointSizeMultiply,
-            {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
-        changed |= DrawRangedFloatControl(
-            "Colour Mix",
-            &style.shorelineColourMix,
-            {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
-        changed |= ImGui::ColorEdit3("Wave Colour", style.shorelineColour.data());
+            float directionDegrees = std::atan2(foam.directionY, foam.directionX) * 180.0F / kPi;
+            if (DrawRangedFloatControl(
+                    "Wave Direction",
+                    &directionDegrees,
+                    {.visualMin = -180.0F, .visualMax = 180.0F, .format = "%.1f deg"})) {
+                const float radians = directionDegrees * kPi / 180.0F;
+                foam.directionX = std::cos(radians);
+                foam.directionY = std::sin(radians);
+                changed = true;
+            }
+
+            changed |= DrawRangedFloatControl(
+                "Wavelength",
+                &foam.wavelengthMeters,
+                {.visualMin = 0.002F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.002F, .hardMax = 10.0F});
+            changed |= DrawRangedFloatControl(
+                "Pattern Scale",
+                &foam.patternScale,
+                {.visualMin = 0.01F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.01F, .hardMax = 50.0F});
+            changed |= DrawRangedFloatControl(
+                "Speed",
+                &foam.speed,
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 10.0F});
+            changed |= DrawRangedFloatControl(
+                "Warp",
+                &foam.warp,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+            changed |= DrawRangedFloatControl(
+                "Turbulence",
+                &foam.turbulence,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            changed |= DrawRangedFloatControl(
+                "Band Density",
+                &foam.density,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+
+            ImGui::Spacing();
+            changed |= DrawRangedFloatControl(
+                "Offshore Foam",
+                &foam.offshoreFoamStrength,
+                {.visualMin = 0.0F, .visualMax = 1.5F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+            changed |= DrawRangedFloatControl(
+                "Incoming Strength",
+                &foam.incomingStrength,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+            changed |= DrawRangedFloatControl(
+                "Return Strength",
+                &foam.returnStrength,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            changed |= DrawRangedFloatControl(
+                "Intensity",
+                &foam.intensity,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+            changed |= DrawRangedFloatControl(
+                "Emission Add",
+                &foam.emissionAdd,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+            changed |= DrawRangedFloatControl(
+                "Opacity Add",
+                &foam.opacityAdd,
+                {.visualMin = -1.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = -1.0F, .hardMax = 2.0F});
+            changed |= DrawRangedFloatControl(
+                "Opacity Multiply",
+                &foam.opacityMultiply,
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+            changed |= DrawRangedFloatControl(
+                "Point Size Add",
+                &foam.pointSizeAdd,
+                {.visualMin = -32.0F, .visualMax = 64.0F, .format = "%.1f", .hardMin = -256.0F, .hardMax = 512.0F});
+            changed |= DrawRangedFloatControl(
+                "Point Size Multiply",
+                &foam.pointSizeMultiply,
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+            changed |= DrawRangedFloatControl(
+                "Colour Mix",
+                &foam.colourMix,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            changed |= ImGui::ColorEdit3("Wave Colour", foam.colour.data());
+
+            const float normalizedBreakZ =
+                invisible_places::renderer::pointcloud::NormalizeHeightFoamBreakZ(
+                    foam.runupZ,
+                    foam.offshoreReachMeters,
+                    foam.edgeFadeMeters,
+                    foam.breakZ);
+            if (std::abs(normalizedBreakZ - foam.breakZ) > 1.0e-6F) {
+                foam.breakZ = normalizedBreakZ;
+                changed = true;
+            }
+        } else {
+            changed |= DrawRangedFloatControl(
+                "Boundary Height",
+                &style.shorelineBoundaryZ,
+                {.visualMin = 0.0F, .visualMax = 3.0F, .format = "%.3f m", .hardMin = -1000.0F, .hardMax = 1000.0F});
+            changed |= DrawRangedFloatControl(
+                "Height Reach",
+                &style.shorelineHeightReachMeters,
+                {.visualMin = 0.001F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.001F, .hardMax = 50.0F});
+            changed |= DrawRangedFloatControl(
+                "Edge Fade",
+                &style.shorelineEdgeFadeMeters,
+                {.visualMin = 0.0F, .visualMax = 0.50F, .format = "%.3f m", .hardMin = 0.0F, .hardMax = 10.0F});
+
+            float directionDegrees =
+                std::atan2(style.shorelineDirectionY, style.shorelineDirectionX) * 180.0F / kPi;
+            if (DrawRangedFloatControl(
+                    "Wave Direction",
+                    &directionDegrees,
+                    {.visualMin = -180.0F, .visualMax = 180.0F, .format = "%.1f deg"})) {
+                const float radians = directionDegrees * kPi / 180.0F;
+                style.shorelineDirectionX = std::cos(radians);
+                style.shorelineDirectionY = std::sin(radians);
+                changed = true;
+            }
+
+            changed |= DrawRangedFloatControl(
+                "Wavelength",
+                &style.shorelineWavelengthMeters,
+                {.visualMin = 0.002F, .visualMax = 2.0F, .format = "%.3f m", .hardMin = 0.002F, .hardMax = 10.0F});
+            changed |= DrawRangedFloatControl(
+                "Pattern Scale",
+                &style.shorelinePatternScale,
+                {.visualMin = 0.01F, .visualMax = 8.0F, .format = "%.2f", .hardMin = 0.01F, .hardMax = 50.0F});
+            changed |= DrawRangedFloatControl(
+                "Speed",
+                &style.shorelineSpeed,
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 10.0F});
+            changed |= DrawRangedFloatControl(
+                "Warp",
+                &style.shorelineWarp,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 3.0F});
+            changed |= DrawRangedFloatControl(
+                "Turbulence",
+                &style.shorelineTurbulence,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            changed |= DrawRangedFloatControl(
+                "Band Density",
+                &style.shorelineDensity,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+
+            ImGui::Spacing();
+            changed |= DrawRangedFloatControl(
+                "Intensity",
+                &style.shorelineIntensity,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 5.0F});
+            changed |= DrawRangedFloatControl(
+                "Emission Add",
+                &style.shorelineEmissionAdd,
+                {.visualMin = 0.0F, .visualMax = 2.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+            changed |= DrawRangedFloatControl(
+                "Opacity Add",
+                &style.shorelineOpacityAdd,
+                {.visualMin = -1.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = -1.0F, .hardMax = 2.0F});
+            changed |= DrawRangedFloatControl(
+                "Opacity Multiply",
+                &style.shorelineOpacityMultiply,
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+            changed |= DrawRangedFloatControl(
+                "Point Size Add",
+                &style.shorelinePointSizeAdd,
+                {.visualMin = -32.0F, .visualMax = 64.0F, .format = "%.1f", .hardMin = -256.0F, .hardMax = 512.0F});
+            changed |= DrawRangedFloatControl(
+                "Point Size Multiply",
+                &style.shorelinePointSizeMultiply,
+                {.visualMin = 0.0F, .visualMax = 4.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 8.0F});
+            changed |= DrawRangedFloatControl(
+                "Colour Mix",
+                &style.shorelineColourMix,
+                {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.2f", .hardMin = 0.0F, .hardMax = 1.0F});
+            changed |= ImGui::ColorEdit3("Wave Colour", style.shorelineColour.data());
+        }
     }
 
     EndPanelSection();
@@ -26146,13 +28217,41 @@ void DrawStillCameraExportSection(
         runtimeState->animationPanel.exportSizeInitialized = true;
     }
 
-    const char* stillExportLabels[] = {"Preview MP4", "EXR Stack"};
-    int stillExportIndex =
-        panel.stillExportMode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr ? 1 : 0;
+    const char* stillExportLabels[] = {"Preview MP4", "H.265 Alpha MP4", "PNG Stack", "EXR Stack"};
+    int stillExportIndex = 0;
+    switch (panel.stillExportMode) {
+        case invisible_places::output::AnimationExportMode::FastPreviewMp4:
+            stillExportIndex = 0;
+            break;
+        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
+            stillExportIndex = 1;
+            break;
+        case invisible_places::output::AnimationExportMode::PngStack:
+            stillExportIndex = 2;
+            break;
+        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
+            stillExportIndex = 3;
+            break;
+        case invisible_places::output::AnimationExportMode::ProRes422Mov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
+        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
+        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            stillExportIndex = 0;
+            break;
+    }
     if (ImGui::Combo("Format", &stillExportIndex, stillExportLabels, IM_ARRAYSIZE(stillExportLabels))) {
-        panel.stillExportMode = stillExportIndex == 1
-                                    ? invisible_places::output::AnimationExportMode::HqPreviewDensityExr
-                                    : invisible_places::output::AnimationExportMode::FastPreviewMp4;
+        const invisible_places::output::AnimationExportMode exportModes[] = {
+            invisible_places::output::AnimationExportMode::FastPreviewMp4,
+            invisible_places::output::AnimationExportMode::HevcAlphaMp4,
+            invisible_places::output::AnimationExportMode::PngStack,
+            invisible_places::output::AnimationExportMode::HqPreviewDensityExr,
+        };
+        const auto maxModeIndex = static_cast<int>(IM_ARRAYSIZE(exportModes) - 1);
+        panel.stillExportMode = exportModes[std::clamp(stillExportIndex, 0, maxModeIndex)];
     }
 
     bool settingsChanged = false;
@@ -26200,12 +28299,16 @@ void DrawStillCameraExportSection(
                 static_cast<float>(std::max<std::uint32_t>(1U, settings.framesPerSecond)))));
     ImGui::TextDisabled(
         "%s: %u frames from the current view.",
-        panel.stillExportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4
-            ? "Preview MP4"
+        AnimationExportWritesVideo(panel.stillExportMode) || AnimationExportWritesPngStack(panel.stillExportMode)
+            ? AnimationExportModeLabel(panel.stillExportMode)
             : "EXR stack",
         stillFrameCount);
     if (panel.stillExportMode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr) {
         ImGui::TextDisabled("EXR stack uses full-source point density to avoid preview sampling artifacts.");
+    } else if (panel.stillExportMode == invisible_places::output::AnimationExportMode::HevcAlphaMp4) {
+        ImGui::TextDisabled("H.265 Alpha MP4 preserves straight alpha for compositing in compatible Apple workflows.");
+    } else if (panel.stillExportMode == invisible_places::output::AnimationExportMode::PngStack) {
+        ImGui::TextDisabled("PNG Stack writes display-referred RGBA frames into a generated folder.");
     }
 
     auto& job = runtimeState->offlineRenderJob;
@@ -26264,7 +28367,7 @@ void DrawStillCameraExportSection(
     const bool ffmpegAvailable =
         invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath());
     const bool exportAvailable =
-        panel.stillExportMode != invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
+        !AnimationExportWritesVideo(panel.stillExportMode) ||
         ffmpegAvailable;
     if (!exportAvailable) {
         ImGui::BeginDisabled();
@@ -26275,7 +28378,8 @@ void DrawStillCameraExportSection(
     if (!exportAvailable) {
         ImGui::EndDisabled();
         ImGui::TextDisabled(
-            "Preview MP4 requires ffmpeg at %s.",
+            "%s requires ffmpeg at %s.",
+            AnimationExportModeLabel(panel.stillExportMode),
             invisible_places::output::DefaultFfmpegExecutablePath().string().c_str());
     }
     if (ImGui::IsItemHovered()) {
@@ -26753,12 +28857,11 @@ void DrawAnimationSection(
 
     const auto selectedQuickMp4Count = panel.selectedExportFiles.size();
     const auto selectedBatchMode = ActiveExportMode(runtimeState);
-    const bool selectedBatchModeIsVideo = AnimationExportWritesVideo(selectedBatchMode);
+    const bool selectedBatchModeCanBatchExport =
+        AnimationExportWritesVideo(selectedBatchMode) || AnimationExportWritesPngStack(selectedBatchMode);
     const std::string batchButtonLabel =
-        AnimationExportWritesProRes(selectedBatchMode)
-            ? "Export Selected " + std::string{AnimationExportModeLabel(selectedBatchMode)}
-            : "Export Selected Quick MP4";
-    const bool exportButtonDisabled = runtimeState->offlineRenderJob.active || !selectedBatchModeIsVideo;
+        "Export Selected " + std::string{AnimationExportModeLabel(selectedBatchMode)};
+    const bool exportButtonDisabled = runtimeState->offlineRenderJob.active || !selectedBatchModeCanBatchExport;
     if (exportButtonDisabled) {
         ImGui::BeginDisabled();
     }
@@ -27020,6 +29123,326 @@ void DrawAnimationSection(
         ImGui::TextDisabled("Modified");
     }
     EndPanelSection();
+    }
+
+    if (BeginPanelSection("Water Scenario Track")) {
+        const auto* selectedScenarioDefinition = FindWaterScenarioDefinition(
+            runtimeState->water,
+            animationPath.selectedWaterScenarioId);
+        const auto selectedScenarioName = WaterScenarioDisplayName(
+            runtimeState->water.seepageScenarios,
+            animationPath);
+        const char* selectedScenarioLabel = animationPath.selectedWaterScenarioId.empty()
+                                                ? "Authored Node Looks"
+                                                : selectedScenarioName.c_str();
+        const bool animationScenarioOpen = ImGui::BeginCombo(
+            "Animation Water Scenario",
+            selectedScenarioLabel);
+        DrawWaterSeepageParameterTooltip(
+            "Links this animation to one project scenario and its normalized water track. "
+            "Authored Node Looks leaves Seepage static and controlled by individual node looks.");
+        if (animationScenarioOpen) {
+            const bool authoredSelected = animationPath.selectedWaterScenarioId.empty();
+            if (ImGui::Selectable("Authored Node Looks", authoredSelected)) {
+                animationPath.selectedWaterScenarioId.clear();
+                runtimeState->water.selectedSeepageScenarioId.clear();
+                panel.selectedWaterKeyIndex.reset();
+                panel.dirty = true;
+                InvalidateWaterSeepageParams(&runtimeState->water);
+            }
+            for (const auto& scenario : runtimeState->water.seepageScenarios) {
+                const bool selected = animationPath.selectedWaterScenarioId == scenario.id;
+                if (ImGui::Selectable(scenario.name.c_str(), selected)) {
+                    animationPath.selectedWaterScenarioId = scenario.id;
+                    runtimeState->water.selectedSeepageScenarioId = scenario.id;
+                    panel.selectedWaterKeyIndex.reset();
+                    panel.dirty = true;
+                    EnsureMaximumScenarioRainFixture(runtimeState, &viewport);
+                    InvalidateWaterSeepageParams(&runtimeState->water);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (!animationPath.selectedWaterScenarioId.empty() &&
+            selectedScenarioDefinition == nullptr) {
+            ImGui::TextColored(
+                ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                "Linked project scenario is missing; using the animation's embedded snapshot.");
+        }
+
+        auto findCurrentTrack = [&]() -> invisible_places::water::WaterScenarioTrack* {
+            const auto trackIt = std::find_if(
+                animationPath.waterScenarioTracks.begin(),
+                animationPath.waterScenarioTracks.end(),
+                [&](const auto& track) {
+                    return track.scenarioId == animationPath.selectedWaterScenarioId;
+                });
+            return trackIt != animationPath.waterScenarioTracks.end() ? &*trackIt : nullptr;
+        };
+        auto ensureCurrentTrack = [&]() -> invisible_places::water::WaterScenarioTrack* {
+            if (animationPath.selectedWaterScenarioId.empty()) {
+                return nullptr;
+            }
+            if (auto* existing = findCurrentTrack(); existing != nullptr) {
+                return existing;
+            }
+            invisible_places::water::WaterScenarioTrack track;
+            track.scenarioId = animationPath.selectedWaterScenarioId;
+            if (const auto* definition = FindWaterScenarioDefinition(
+                    runtimeState->water,
+                    animationPath.selectedWaterScenarioId);
+                definition != nullptr) {
+                track.scenarioName = definition->name;
+                track.fallbackScenario = *definition;
+            } else {
+                track.scenarioName = animationPath.selectedWaterScenarioId;
+                track.fallbackScenario.id = animationPath.selectedWaterScenarioId;
+                track.fallbackScenario.name = track.scenarioName;
+                track.fallbackScenario.state.seepageLook = runtimeState->water.defaultSeepageLook;
+            }
+            animationPath.waterScenarioTracks.push_back(std::move(track));
+            return &animationPath.waterScenarioTracks.back();
+        };
+        auto addWaterKey = [&](invisible_places::water::WaterScenarioState state) {
+            auto* track = ensureCurrentTrack();
+            if (track == nullptr) {
+                return;
+            }
+            invisible_places::water::WaterScenarioKey key;
+            key.position = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+            key.state = std::move(state);
+            key.interpolation = invisible_places::water::WaterScenarioInterpolation::Smooth;
+            const auto existingIt = std::find_if(
+                track->keys.begin(),
+                track->keys.end(),
+                [&](const auto& candidate) {
+                    return std::abs(candidate.position - key.position) <= 0.0001F;
+                });
+            if (existingIt != track->keys.end()) {
+                key.id = existingIt->id;
+                key.interpolation = existingIt->interpolation;
+            } else {
+                std::size_t suffix = track->keys.size() + 1U;
+                do {
+                    key.id = "water_key_" + std::to_string(suffix++);
+                } while (std::any_of(
+                    track->keys.begin(),
+                    track->keys.end(),
+                    [&](const auto& candidate) { return candidate.id == key.id; }));
+            }
+            invisible_places::water::AddOrUpdateWaterScenarioKey(track, std::move(key));
+            const auto selectedIt = std::find_if(
+                track->keys.begin(),
+                track->keys.end(),
+                [&](const auto& candidate) {
+                    return std::abs(candidate.position - panel.scrubAmount) <= 0.0001F;
+                });
+            panel.selectedWaterKeyIndex = selectedIt != track->keys.end()
+                                              ? std::optional<std::size_t>{
+                                                    static_cast<std::size_t>(
+                                                        std::distance(track->keys.begin(), selectedIt))}
+                                              : std::nullopt;
+            panel.dirty = true;
+            InvalidateWaterSeepageParams(&runtimeState->water);
+        };
+
+        auto* currentTrack = findCurrentTrack();
+        if (animationPath.selectedWaterScenarioId.empty()) {
+            ImGui::TextDisabled("Choose a project scenario to create normalized water keys.");
+        } else {
+            if (currentTrack != nullptr && !currentTrack->keys.empty() &&
+                ImGui::BeginListBox("Water Keys", ImVec2{-FLT_MIN, 92.0F})) {
+                for (std::size_t index = 0U; index < currentTrack->keys.size(); ++index) {
+                    const auto& key = currentTrack->keys[index];
+                    const auto label = std::to_string(index + 1U) + "  t=" +
+                                       FormatFixed(key.position, 4);
+                    const bool selected = panel.selectedWaterKeyIndex.has_value() &&
+                                          panel.selectedWaterKeyIndex.value() == index;
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        panel.selectedWaterKeyIndex = index;
+                        panel.scrubAmount = key.position;
+                        if (panel.liveApply) {
+                            ApplyAnimationScrub(runtimeState);
+                        }
+                    }
+                }
+                ImGui::EndListBox();
+            }
+
+            const auto activeState = ResolveActiveWaterScenarioState(*runtimeState).value_or(
+                selectedScenarioDefinition != nullptr
+                    ? selectedScenarioDefinition->state
+                    : invisible_places::water::WaterScenarioState{});
+            if (ImGui::Button("Add/Update Key")) {
+                addWaterKey(activeState);
+                currentTrack = findCurrentTrack();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Capture Current Water State")) {
+                addWaterKey(activeState);
+                currentTrack = findCurrentTrack();
+            }
+            auto offState = activeState;
+            if (ImGui::Button("Set Seepage Off")) {
+                offState.seepageLevel = 0.0F;
+                addWaterKey(offState);
+                currentTrack = findCurrentTrack();
+            }
+            ImGui::SameLine();
+            offState = activeState;
+            if (ImGui::Button("Set Rain Off")) {
+                offState.rainLevel = 0.0F;
+                addWaterKey(offState);
+                currentTrack = findCurrentTrack();
+            }
+
+            if (currentTrack != nullptr && panel.selectedWaterKeyIndex.has_value() &&
+                panel.selectedWaterKeyIndex.value() < currentTrack->keys.size()) {
+                auto& selectedKey = currentTrack->keys[panel.selectedWaterKeyIndex.value()];
+                bool keyStateChanged = false;
+                keyStateChanged |= ImGui::SliderFloat(
+                    "Key Seepage Level",
+                    &selectedKey.state.seepageLevel,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Seepage strength captured at this normalized animation position. Numeric "
+                    "values interpolate toward the next key.");
+                keyStateChanged |= ImGui::SliderFloat(
+                    "Key Spread",
+                    &selectedKey.state.seepageSpread,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Fan expansion captured at this key. One maps to the pre-indexed 1.50x reach "
+                    "and 1.35x width limits.");
+                keyStateChanged |= ImGui::SliderFloat(
+                    "Key Rain Level",
+                    &selectedKey.state.rainLevel,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Continuous Rain amount captured at this key. Zero hides Rain and supplies no "
+                    "Seepage rain gain; higher values reveal and strengthen deterministic trails.");
+                if (ImGui::TreeNode("Key Seepage Look")) {
+                    keyStateChanged |= DrawWaterSeepageLookControls(
+                        &selectedKey.state.seepageLook);
+                    ImGui::TreePop();
+                }
+                if (keyStateChanged) {
+                    panel.dirty = true;
+                    InvalidateWaterSeepageParams(&runtimeState->water);
+                }
+                constexpr std::array<invisible_places::water::WaterScenarioInterpolation, 3> modes{{
+                    invisible_places::water::WaterScenarioInterpolation::Smooth,
+                    invisible_places::water::WaterScenarioInterpolation::Linear,
+                    invisible_places::water::WaterScenarioInterpolation::Hold,
+                }};
+                const auto interpolationLabel = [](auto mode) {
+                    switch (mode) {
+                        case invisible_places::water::WaterScenarioInterpolation::Smooth:
+                            return "Smooth";
+                        case invisible_places::water::WaterScenarioInterpolation::Linear:
+                            return "Linear";
+                        case invisible_places::water::WaterScenarioInterpolation::Hold:
+                            return "Hold";
+                    }
+                    return "Smooth";
+                };
+                const bool interpolationOpen = ImGui::BeginCombo(
+                    "Outgoing Interpolation",
+                    interpolationLabel(selectedKey.interpolation));
+                DrawWaterSeepageParameterTooltip(
+                    "Controls the segment from this key to the next. Smooth eases both ends, "
+                    "Linear changes uniformly, and Hold retains this complete water state until the next key.");
+                if (interpolationOpen) {
+                    for (const auto mode : modes) {
+                        const bool selected = selectedKey.interpolation == mode;
+                        if (ImGui::Selectable(interpolationLabel(mode), selected)) {
+                            selectedKey.interpolation = mode;
+                            panel.dirty = true;
+                            InvalidateWaterSeepageParams(&runtimeState->water);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (ImGui::Button("Delete Water Key")) {
+                    currentTrack->keys.erase(
+                        currentTrack->keys.begin() +
+                        static_cast<std::ptrdiff_t>(panel.selectedWaterKeyIndex.value()));
+                    panel.selectedWaterKeyIndex.reset();
+                    panel.dirty = true;
+                    InvalidateWaterSeepageParams(&runtimeState->water);
+                }
+            }
+        }
+
+        const char* copySourceLabel = "Choose animation...";
+        if (panel.waterKeyCopySourceIndex.has_value() &&
+            panel.waterKeyCopySourceIndex.value() < panel.availableFiles.size()) {
+            static std::string copySourceStorage;
+            copySourceStorage = AnimationDisplayNameFromPath(
+                panel.availableFiles[panel.waterKeyCopySourceIndex.value()]);
+            copySourceLabel = copySourceStorage.c_str();
+        }
+        const bool copyWaterOpen = ImGui::BeginCombo("Copy Water Keying From", copySourceLabel);
+        DrawWaterSeepageParameterTooltip(
+            "Chooses another saved animation whose normalized water tracks can be copied. "
+            "Camera keys, duration, and frame rate are not copied.");
+        if (copyWaterOpen) {
+            for (std::size_t index = 0U; index < panel.availableFiles.size(); ++index) {
+                if (!panel.currentFilePath.empty() &&
+                    PathsLexicallyEqual(panel.availableFiles[index], panel.currentFilePath)) {
+                    continue;
+                }
+                const auto label = AnimationDisplayNameFromPath(panel.availableFiles[index]);
+                const bool selected = panel.waterKeyCopySourceIndex.has_value() &&
+                                      panel.waterKeyCopySourceIndex.value() == index;
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    panel.waterKeyCopySourceIndex = index;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        const bool canCopy = panel.waterKeyCopySourceIndex.has_value() &&
+                             panel.waterKeyCopySourceIndex.value() <
+                                 panel.availableFileLoadedPaths.size() &&
+                             panel.availableFileLoadedPaths[panel.waterKeyCopySourceIndex.value()].has_value();
+        if (!canCopy) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Copy Water Keying")) {
+            const auto& source = panel.availableFileLoadedPaths[
+                panel.waterKeyCopySourceIndex.value()].value();
+            for (const auto& sourceTrack : source.waterScenarioTracks) {
+                const auto destinationIt = std::find_if(
+                    animationPath.waterScenarioTracks.begin(),
+                    animationPath.waterScenarioTracks.end(),
+                    [&](const auto& destinationTrack) {
+                        return destinationTrack.scenarioId == sourceTrack.scenarioId;
+                    });
+                if (destinationIt != animationPath.waterScenarioTracks.end()) {
+                    *destinationIt = sourceTrack;
+                } else {
+                    animationPath.waterScenarioTracks.push_back(sourceTrack);
+                }
+            }
+            panel.selectedWaterKeyIndex.reset();
+            panel.dirty = true;
+            InvalidateWaterSeepageParams(&runtimeState->water);
+        }
+        if (!canCopy) {
+            ImGui::EndDisabled();
+        }
+        ImGui::TextDisabled(
+            "Water keys use normalized 0-1 positions; duration and camera-key edits do not move them.");
+        EndPanelSection();
     }
 
     DrawAnimationExportSection(runtimeState, &viewport);
@@ -28716,6 +31139,18 @@ void DrawWaterFieldPanel(
     }
 }
 
+enum class WaterProfileKind {
+    Path,
+    Lane,
+    Trail
+};
+
+bool DrawWaterSourceProfileAssignmentCombo(
+    const WaterWorkflowState& water,
+    WaterProfileKind kind,
+    const char* label,
+    std::string* profileName);
+
 void DrawWaterSourceList(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -28724,26 +31159,30 @@ void DrawWaterSourceList(
     }
 
     auto& water = runtimeState->water;
-    if (water.emitters.empty()) {
+    if (water.emitters.empty() && water.manualFlowPaths.empty()) {
         ImGui::TextUnformatted("No water sources yet.");
         EndPanelSection();
         return;
     }
 
-    if (water.selectedEmitterIndex.has_value()) {
+    if (water.selectedEmitterIndex.has_value() || water.selectedManualFlowPathIndex.has_value()) {
         if (ImGui::Button("Deselect Source")) {
             DeselectWaterEmitter(runtimeState);
+            water.selectedManualFlowPathIndex.reset();
         }
         ImGui::Separator();
     }
 
+    if (!water.emitters.empty()) {
+        ImGui::TextDisabled("Point Sources");
+    }
     std::optional<std::size_t> deleteIndex;
     for (std::size_t index = 0; index < water.emitters.size(); ++index) {
         auto& emitter = water.emitters[index];
         ImGui::PushID(static_cast<int>(index));
         const bool selected = water.selectedEmitterIndex.has_value() && water.selectedEmitterIndex.value() == index;
         const std::string label =
-            emitter.name + "  [" + WaterSourceSettingsAssignmentLabel(emitter, water.emitters) + "]";
+            emitter.name + "  [Point | " + WaterSourceSettingsAssignmentLabel(emitter, water.emitters) + "]";
         if (ImGui::Selectable(label.c_str(), selected)) {
             SelectWaterEmitterInViewport(runtimeState, *viewport, index);
         }
@@ -28817,6 +31256,79 @@ void DrawWaterSourceList(
         RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
     }
 
+    if (!water.manualFlowPaths.empty()) {
+        ImGui::TextDisabled("Manual Path Sources");
+    }
+    std::optional<std::size_t> deleteManualPathIndex;
+    for (std::size_t index = 0; index < water.manualFlowPaths.size(); ++index) {
+        auto& source = water.manualFlowPaths[index];
+        ImGui::PushID(static_cast<int>(water.emitters.size() + index));
+        const bool selected =
+            water.selectedManualFlowPathIndex.has_value() &&
+            water.selectedManualFlowPathIndex.value() == index;
+        const std::string label = source.name + "  [Path]";
+        if (ImGui::Selectable(label.c_str(), selected) && !water.manualFlowPathEditor.active) {
+            SelectManualFlowPathSource(runtimeState, index);
+        }
+        if (selected) {
+            if (!water.manualFlowPathEditor.active) {
+                InputTextString("Name", &source.name);
+                bool refreshTrails = false;
+                refreshTrails |= DrawWaterSourceProfileAssignmentCombo(
+                    water,
+                    WaterProfileKind::Lane,
+                    "Lanes",
+                    &source.laneProfileName);
+                refreshTrails |= DrawWaterSourceProfileAssignmentCombo(
+                    water,
+                    WaterProfileKind::Trail,
+                    "Trail",
+                    &source.trailProfileName);
+                if (refreshTrails) {
+                    RefreshWaterOverlayFromAnchors(
+                        runtimeState,
+                        viewport,
+                        WaterOverlayRefreshPersistence::InMemoryOnly);
+                }
+                if (ImGui::Button("Edit Path")) {
+                    BeginEditingManualFlowPath(runtimeState, index);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Delete Source")) {
+                    deleteManualPathIndex = index;
+                }
+            } else {
+                ImGui::TextDisabled("Finish or cancel the active path edit first.");
+            }
+            ImGui::TextDisabled("Nodes: %zu", source.controlPoints.size());
+        }
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+
+    if (deleteManualPathIndex.has_value()) {
+        const auto index = deleteManualPathIndex.value();
+        const auto deletedName = water.manualFlowPaths[index].name;
+        water.manualFlowPaths.erase(water.manualFlowPaths.begin() + static_cast<std::ptrdiff_t>(index));
+        water.selectedManualFlowPathIndex.reset();
+        if (!RefreshWaterOverlayFromAnchors(
+                runtimeState,
+                viewport,
+                WaterOverlayRefreshPersistence::InMemoryOnly)) {
+            const bool hasGeneratedRoutes = !water.pathAnchors.points.empty();
+            const bool hasManualRoutes = std::any_of(
+                water.manualFlowPaths.begin(),
+                water.manualFlowPaths.end(),
+                [](const WaterManualFlowPathSource& source) { return source.controlPoints.size() >= 2U; });
+            if (!hasGeneratedRoutes && !hasManualRoutes) {
+                UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
+                water.flowTrailOverlay = {};
+                runtimeState->errorMessage.clear();
+            }
+        }
+        runtimeState->statusMessage = "Deleted manual Flow path " + deletedName + ".";
+    }
+
     EndPanelSection();
 }
 
@@ -28844,12 +31356,6 @@ constexpr std::string_view kBuiltInWaterRainTrailProfileNames[] = {
     "Rain Mist_preset",
     "Rain Fine Lines_preset",
     "Rain Downpour_preset",
-};
-
-enum class WaterProfileKind {
-    Path,
-    Lane,
-    Trail
 };
 
 bool DrawWaterSourceProfileAssignmentCombo(
@@ -29277,6 +31783,50 @@ std::size_t ApplyWaterTrailLiveVisualProfile(
     return updatedCount;
 }
 
+PointCloudStyleState MakeWaterRainTrailSessionStyle(
+    const SavedWaterTrailProfileState& profile,
+    WaterRainIntensityPreset intensityPreset) {
+    return ApplyRainIntensityToTrailStyle(
+        MakeWaterTrailSessionStyle(profile.style, profile.geometry),
+        intensityPreset);
+}
+
+bool WaterGeneratedRainTrailSessionMatchesLiveVisualTarget(
+    const PreviewLayerSession& session,
+    const SavedWaterTrailProfileState& profile) {
+    if (session.kind != LayerKind::PointCloud) {
+        return false;
+    }
+    const auto stem = session.sourcePath.stem().string();
+    return IsGeneratedWaterRainTrailOverlayStem(stem) &&
+           WaterTrailProfileNamesMatchForLiveVisuals(session.selectedPointVisualName, profile.name);
+}
+
+std::size_t ApplyWaterRainTrailLiveVisualProfile(
+    PreviewRuntimeState* runtimeState,
+    const SavedWaterTrailProfileState& profile) {
+    if (runtimeState == nullptr) {
+        return 0U;
+    }
+
+    std::size_t updatedCount = 0U;
+    const auto profileName = NormalizeWaterProfileName(profile.name);
+    const auto liveStyle = MakeWaterRainTrailSessionStyle(profile, runtimeState->water.rainSettings.intensityPreset);
+    for (auto& session : runtimeState->sessions) {
+        if (!WaterGeneratedRainTrailSessionMatchesLiveVisualTarget(session, profile)) {
+            continue;
+        }
+
+        session.pointStyle = liveStyle;
+        session.selectedPointVisualName = profileName;
+        session.pointVisualNameBuffer = BaseWaterProfileName(profileName);
+        EnsurePointVisuals(&session);
+        UpsertPointVisual(&session, session.selectedPointVisualName, session.pointStyle);
+        ++updatedCount;
+    }
+    return updatedCount;
+}
+
 void DrawWaterTrailStyleEditor(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -29683,42 +32233,58 @@ void DrawWaterRainTrailStyleEditor(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     SavedWaterTrailProfileState profile) {
     auto& water = runtimeState->water;
-    bool geometryChanged = false;
-    bool simpleGeometryChanged = false;
-    simpleGeometryChanged |= ImGui::SliderFloat(
+    const auto previousGeometry = profile.geometry;
+    bool generationChanged = false;
+    bool generationRefreshRequested = false;
+    bool visualChanged = false;
+    if (ImGui::SliderFloat(
         "Rain Trail Length",
         &profile.geometry.trailLengthMeters,
         0.03F,
         3.0F,
         "%.2f m",
-        ImGuiSliderFlags_Logarithmic);
-    simpleGeometryChanged |= ImGui::SliderFloat(
+        ImGuiSliderFlags_Logarithmic)) {
+        profile.geometry =
+            invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
+        generationChanged = true;
+        visualChanged = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        generationChanged = true;
+        generationRefreshRequested = true;
+    }
+    if (ImGui::SliderFloat(
         "Rain Trail Width",
         &profile.geometry.widthMeters,
         0.0005F,
         0.04F,
         "%.4f m",
-        ImGuiSliderFlags_Logarithmic);
-    if (simpleGeometryChanged) {
-        profile.geometry =
-            invisible_places::water::FitWaterTrailGeometryForContinuousLines(profile.geometry);
-        geometryChanged = true;
+        ImGuiSliderFlags_Logarithmic)) {
+        visualChanged = true;
     }
     if (ImGui::TreeNode("Advanced Rain Visual Controls")) {
-        geometryChanged |= ImGui::SliderFloat(
+        if (ImGui::SliderFloat(
             "Rain Point Spacing",
             &profile.geometry.pointSpacingMeters,
             0.01F,
             1.0F,
             "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        geometryChanged |= ImGui::SliderFloat(
+            ImGuiSliderFlags_Logarithmic)) {
+            generationChanged = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            generationChanged = true;
+            generationRefreshRequested = true;
+        }
+        if (ImGui::SliderFloat(
             "Rain Streak Length",
             &profile.geometry.streakLengthMeters,
             0.01F,
             1.0F,
             "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
+            ImGuiSliderFlags_Logarithmic)) {
+            visualChanged = true;
+        }
         ImGui::TreePop();
     }
     profile.geometry.trailLengthMeters = std::clamp(profile.geometry.trailLengthMeters, 0.001F, 20.0F);
@@ -29726,6 +32292,9 @@ void DrawWaterRainTrailStyleEditor(
     profile.geometry.widthMeters = std::clamp(profile.geometry.widthMeters, 0.0005F, 0.20F);
     profile.geometry.streakLengthMeters =
         std::max(profile.geometry.widthMeters, std::clamp(profile.geometry.streakLengthMeters, 0.001F, 3.0F));
+    visualChanged |= invisible_places::water::WaterTrailGeometryLiveVisualOnlyEdit(previousGeometry, profile.geometry);
+    generationChanged |=
+        !invisible_places::water::WaterTrailGeometryGenerationInputsEqual(previousGeometry, profile.geometry);
 
     PreviewLayerSession editSession;
     editSession.kind = LayerKind::PointCloud;
@@ -29749,13 +32318,21 @@ void DrawWaterRainTrailStyleEditor(
          .hardMax = 1.5F});
     styleChanged |= DrawPointCloudEmissionSection(&editSession);
 
-    if (geometryChanged || styleChanged) {
+    if (generationChanged || visualChanged || styleChanged) {
         const auto editedName = EditedWaterProfileName(water.selectedRainTrailProfileName);
         water.selectedRainTrailProfileName = editedName;
         water.rainTrailProfileNameBuffer = BaseWaterProfileName(editedName);
-        water.editedRainTrailProfile =
-            MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
-        RefreshWaterRainOverlay(runtimeState, viewport);
+        auto editedProfile = MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
+        water.editedRainTrailProfile = editedProfile;
+        if (generationRefreshRequested) {
+            RefreshWaterRainOverlay(runtimeState, viewport);
+        } else if (visualChanged || styleChanged) {
+            const auto updatedCount = ApplyWaterRainTrailLiveVisualProfile(runtimeState, editedProfile);
+            if (updatedCount > 0U) {
+                runtimeState->statusMessage = "Rain visuals updated without rebuilding drops.";
+                runtimeState->errorMessage.clear();
+            }
+        }
     }
 }
 
@@ -30331,8 +32908,8 @@ void DrawWaterRainPanel(
             "%.1f m",
             ImGuiSliderFlags_Logarithmic);
         int routeAnchors = static_cast<int>(water.rainSettings.routeAnchorCount);
-        if (ImGui::SliderInt("Route Anchors", &routeAnchors, 3, 32)) {
-            water.rainSettings.routeAnchorCount = static_cast<std::uint32_t>(std::clamp(routeAnchors, 3, 32));
+        if (ImGui::SliderInt("Route Anchors", &routeAnchors, 3, 48)) {
+            water.rainSettings.routeAnchorCount = static_cast<std::uint32_t>(std::clamp(routeAnchors, 3, 48));
         }
         int seed = static_cast<int>(water.rainSettings.seed);
         if (ImGui::InputInt("Seed", &seed)) {
@@ -30372,6 +32949,10 @@ void DrawWaterRainPanel(
                 water.rainDiagnostics.sandTerminationCount,
                 water.rainDiagnostics.fallbackTerminationCount,
                 water.rainDiagnostics.noSupportKillCount);
+            ImGui::TextDisabled(
+                "Rain mesh: surface hits %u  vegetation drips %u",
+                water.rainDiagnostics.meshSurfaceHitCount,
+                water.rainDiagnostics.vegetationDripCount);
         }
         EndPanelSection();
     }
@@ -30396,18 +32977,69 @@ const char* WaterSeepageQualityLabel(WaterSeepageQuality quality) {
     return "Auto";
 }
 
+const char* WaterSeepagePatternLabel(WaterSeepagePattern pattern) {
+    switch (pattern) {
+        case WaterSeepagePattern::LegacyRipples:
+            return "Legacy Ripples";
+        case WaterSeepagePattern::WetRockSheen:
+            return "Wet Rock Sheen";
+        case WaterSeepagePattern::ChaoticBloom:
+            return "Chaotic Bloom";
+    }
+    return "Legacy Ripples";
+}
+
+void DrawWaterSeepageParameterTooltip(const char* text) {
+    if (text == nullptr || !ImGui::IsItemHovered()) {
+        return;
+    }
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32.0F);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
 bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look) {
     if (look == nullptr) {
         return false;
     }
     bool changed = false;
+    const auto tooltip = [](const char* text) {
+        DrawWaterSeepageParameterTooltip(text);
+    };
+    const auto slider = [&](
+                            const char* label,
+                            float* value,
+                            float minimum,
+                            float maximum,
+                            const char* format,
+                            const char* help,
+                            ImGuiSliderFlags flags = ImGuiSliderFlags_None) {
+        const bool valueChanged = ImGui::SliderFloat(
+            label,
+            value,
+            minimum,
+            maximum,
+            format,
+            flags);
+        tooltip(help);
+        changed |= valueChanged;
+    };
+
+    ImGui::SeparatorText("Common Appearance");
     constexpr std::array<WaterSeepageQuality, 4> qualities{{
         WaterSeepageQuality::Auto,
         WaterSeepageQuality::Low,
         WaterSeepageQuality::Balanced,
         WaterSeepageQuality::High,
     }};
-    if (ImGui::BeginCombo("Quality", WaterSeepageQualityLabel(look->quality))) {
+    const bool qualityOpen = ImGui::BeginCombo("Quality", WaterSeepageQualityLabel(look->quality));
+    tooltip(
+        "Controls procedural noise detail. Auto selects High below 10M effective point "
+        "invocations, Balanced from 10-50M, and Low above 50M. World Surfels count as "
+        "six invocations per point.");
+    if (qualityOpen) {
         for (const auto quality : qualities) {
             const bool selected = look->quality == quality;
             if (ImGui::Selectable(WaterSeepageQualityLabel(quality), selected)) {
@@ -30420,23 +33052,244 @@ bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look) {
         }
         ImGui::EndCombo();
     }
-    changed |= ImGui::SliderFloat("Base Wetness", &look->baseWetness, 0.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Ripple Density", &look->density, 0.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Glisten", &look->glisten, 0.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat(
-        "Wavelength",
-        &look->wavelengthMeters,
-        0.005F,
-        2.0F,
-        "%.3f m",
-        ImGuiSliderFlags_Logarithmic);
-    changed |= ImGui::SliderFloat("Pattern Scale", &look->patternScale, 0.05F, 20.0F, "%.2f", ImGuiSliderFlags_Logarithmic);
-    changed |= ImGui::SliderFloat("Speed", &look->speed, 0.0F, 4.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Warp", &look->warp, 0.0F, 2.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Turbulence", &look->turbulence, 0.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Phase", &look->phase, -10.0F, 10.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Rain Response", &look->rainResponse, 0.0F, 1.0F, "%.2f");
+    constexpr std::array<WaterSeepagePattern, 3> patterns{{
+        WaterSeepagePattern::LegacyRipples,
+        WaterSeepagePattern::WetRockSheen,
+        WaterSeepagePattern::ChaoticBloom,
+    }};
+    const bool patternOpen = ImGui::BeginCombo("Pattern", WaterSeepagePatternLabel(look->pattern));
+    tooltip(
+        "Chooses the Seepage algorithm. Legacy Ripples uses warped bands; Wet Rock Sheen "
+        "uses stable world-space damp patches and angle-dependent reflection; Chaotic Bloom "
+        "uses irregular ridged lobes that evolve downhill.");
+    if (patternOpen) {
+        for (const auto pattern : patterns) {
+            const bool selected = look->pattern == pattern;
+            if (ImGui::Selectable(WaterSeepagePatternLabel(pattern), selected)) {
+                look->pattern = pattern;
+                changed = true;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    slider(
+        "Base Wetness",
+        &look->baseWetness,
+        0.0F,
+        1.0F,
+        "%.2f",
+        "Sets the persistent damp appearance inside the affected fan, including areas that "
+        "are not currently catching a highlight.");
+    slider(
+        "Coverage",
+        &look->density,
+        0.0F,
+        1.0F,
+        "%.2f",
+        "Controls how much of the fan is visibly wet. Low values leave isolated patches; "
+        "high values connect them into broader damp regions.");
+    slider(
+        "Glisten",
+        &look->glisten,
+        0.0F,
+        1.0F,
+        "%.2f",
+        "Controls the strength of bright moisture highlights. For Wet Rock and Chaotic "
+        "Bloom this responds to the camera and virtual environment direction.");
 
+    switch (look->pattern) {
+        case WaterSeepagePattern::LegacyRipples:
+            ImGui::SeparatorText("Legacy Ripple Pattern");
+            slider(
+            "Wavelength",
+            &look->wavelengthMeters,
+            0.005F,
+            2.0F,
+            "%.3f m",
+            "Sets the physical distance between successive ripple bands before Pattern Scale "
+            "is applied. Larger wavelengths create more widely separated bands.",
+            ImGuiSliderFlags_Logarithmic);
+            slider(
+                "Pattern Scale",
+                &look->patternScale,
+                0.05F,
+                20.0F,
+                "%.2f",
+                "Compresses or expands the entire legacy coordinate pattern, including its "
+                "lateral variation. Wavelength controls band spacing in metres; Pattern Scale "
+                "is a dimensionless overall frequency multiplier.",
+                ImGuiSliderFlags_Logarithmic);
+            slider(
+                "Speed",
+                &look->speed,
+                0.0F,
+                4.0F,
+                "%.2f",
+                "Controls how quickly ripple bands travel down the fan. Zero produces a static pattern.");
+            slider(
+                "Warp",
+                &look->warp,
+                0.0F,
+                2.0F,
+                "%.2f",
+                "Bends and offsets the regular ripple phase so bands do not remain straight.");
+            slider(
+                "Turbulence",
+                &look->turbulence,
+                0.0F,
+                1.0F,
+                "%.2f",
+                "Breaks continuous ripple bands into less regular fragments and modulates their intensity.");
+            slider(
+                "Phase",
+                &look->phase,
+                -10.0F,
+                10.0F,
+                "%.2f",
+                "Offsets the legacy animation cycle without moving the node or changing its fan.");
+            break;
+
+        case WaterSeepagePattern::WetRockSheen:
+            ImGui::SeparatorText("Wet Rock Pattern");
+            slider(
+            "Patch Size",
+            &look->featureSizeMeters,
+            0.01F,
+            4.0F,
+            "%.3f m",
+            "Sets the approximate world-space size of persistent damp patches. Because the "
+            "noise is three-dimensional, patches remain stable across differently oriented surfaces.",
+            ImGuiSliderFlags_Logarithmic);
+            slider(
+                "Contrast",
+                &look->contrast,
+                0.0F,
+                1.0F,
+                "%.2f",
+                "Controls the transition between damp and dry patches. Higher values create "
+                "more definite patch edges; lower values produce broad, soft moisture changes.");
+            slider(
+                "Evolution",
+                &look->evolution,
+                0.0F,
+                1.0F,
+                "%.3f",
+                "Adds slow non-directional change to the damp-patch noise. Keep this low for "
+                "stable rock whose main variation comes from camera-angle glisten.");
+            break;
+
+        case WaterSeepagePattern::ChaoticBloom:
+            ImGui::SeparatorText("Chaotic Bloom Pattern");
+            slider(
+                "Feature Size",
+                &look->featureSizeMeters,
+                0.01F,
+                4.0F,
+                "%.3f m",
+                "Sets the approximate world-space size of the irregular wet lobes. Larger "
+                "features read as broad damp regions; smaller features create finer variation.",
+                ImGuiSliderFlags_Logarithmic);
+            slider(
+                "Curl",
+                &look->curl,
+                0.0F,
+                2.0F,
+                "%.2f",
+                "Domain-warps the noise so lobes bend, swirl, split, and reconnect instead of "
+                "forming recognisable bands.");
+            slider(
+                "Breakup",
+                &look->breakup,
+                0.0F,
+                1.0F,
+                "%.2f",
+                "Raises the threshold between connected lobes. Higher values make the effect "
+                "sparser and more fragmented.");
+            slider(
+                "Downhill Drift",
+                &look->downhillDriftMetersPerSecond,
+                0.0F,
+                0.5F,
+                "%.3f m/s",
+                "Moves the evolving lobes along the surface guide's downhill tangent. This is "
+                "appearance-only advection and does not displace cloud points.");
+            slider(
+                "Evolution",
+                &look->evolution,
+                0.0F,
+                1.0F,
+                "%.3f",
+                "Controls internal multi-scale shape change in addition to downhill motion. "
+                "Low values suit subtle wet rock; higher values feel more flame-like.");
+            break;
+    }
+
+    if (look->pattern == WaterSeepagePattern::WetRockSheen ||
+        look->pattern == WaterSeepagePattern::ChaoticBloom) {
+        ImGui::SeparatorText("Angle-Dependent Reflection");
+        slider(
+            "Roughness",
+            &look->roughness,
+            0.02F,
+            1.0F,
+            "%.2f",
+            "Controls highlight width. Low roughness produces tighter, brighter glints; high "
+            "roughness produces broader, softer sheen.");
+        slider(
+            "Angle Response",
+            &look->angleResponse,
+            0.0F,
+            1.0F,
+            "%.2f",
+            "Controls how strongly the sheen changes as the camera pans across grazing and "
+            "facing surface angles.");
+        slider(
+            "Micro Detail",
+            &look->microNormalStrength,
+            0.0F,
+            2.0F,
+            "%.2f",
+            "Perturbs the reflection normal using the analytic 3D-noise gradient. It adds local "
+            "sparkle without changing point positions or stored normals.");
+        slider(
+            "Glint Density",
+            &look->glintDensity,
+            0.0F,
+            1.0F,
+            "%.2f",
+            "Controls how many wet locations may produce concentrated highlights. Glisten "
+            "controls their strength; this controls their spatial frequency.");
+        slider(
+            "Environment Azimuth",
+            &look->environmentAzimuthDegrees,
+            0.0F,
+            360.0F,
+            "%.0f deg",
+            "Rotates the virtual reflected environment direction around the world vertical axis. "
+            "Use this to choose where a slow camera pan catches the wet surface.");
+        slider(
+            "Environment Elevation",
+            &look->environmentElevationDegrees,
+            -90.0F,
+            90.0F,
+            "%.0f deg",
+            "Raises or lowers the virtual reflected environment direction. Higher angles favour "
+            "upward-facing facets; lower angles favour grazing cliff facets.");
+    }
+
+    slider(
+        "Rain Response",
+        &look->rainResponse,
+        0.0F,
+        1.0F,
+        "%.2f",
+        "Controls how strongly Rain Level increases Seepage reach, width, coverage, wetness, "
+        "and prominence. Zero keeps this look unchanged by rain.");
+
+    ImGui::SeparatorText("Visual Response");
     constexpr std::array<WaterEffectBlendMode, 5> blendModes{{
         WaterEffectBlendMode::Add,
         WaterEffectBlendMode::Max,
@@ -30444,7 +33297,11 @@ bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look) {
         WaterEffectBlendMode::Screen,
         WaterEffectBlendMode::Override,
     }};
-    if (ImGui::BeginCombo("Blend", WaterEffectBlendModeLabel(look->blendMode))) {
+    const bool blendOpen = ImGui::BeginCombo("Blend", WaterEffectBlendModeLabel(look->blendMode));
+    tooltip(
+        "Controls how overlapping Seepage nodes combine. Max is restrained and stable; Add "
+        "accumulates intensity; Multiply and Screen reshape overlap; Override favours the latest contribution.");
+    if (blendOpen) {
         for (const auto blendMode : blendModes) {
             const bool selected = look->blendMode == blendMode;
             if (ImGui::Selectable(WaterEffectBlendModeLabel(blendMode), selected)) {
@@ -30457,19 +33314,66 @@ bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look) {
         }
         ImGui::EndCombo();
     }
-    changed |= ImGui::SliderFloat("Prominence", &look->response.intensity, 0.0F, 3.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Emission Add", &look->response.emissionAdd, 0.0F, 4.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Opacity Add", &look->response.opacityAdd, -1.0F, 1.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Opacity Multiply", &look->response.opacityMultiply, 0.0F, 3.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Point Size Add", &look->response.pointSizeAdd, -2.0F, 8.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Point Size Multiply", &look->response.pointSizeMultiply, 0.0F, 4.0F, "%.2f");
-    changed |= ImGui::SliderFloat("Colour Mix", &look->response.colouriseAmount, 0.0F, 1.0F, "%.2f");
+    slider(
+        "Prominence",
+        &look->response.intensity,
+        0.0F,
+        3.0F,
+        "%.2f",
+        "Overall strength applied before colour, emission, opacity, and point-size responses.");
+    slider(
+        "Emission Add",
+        &look->response.emissionAdd,
+        0.0F,
+        4.0F,
+        "%.2f",
+        "Adds emissive brightness at wet points. Use sparingly for natural glisten; this does "
+        "not create scene lighting.");
+    slider(
+        "Opacity Add",
+        &look->response.opacityAdd,
+        -1.0F,
+        1.0F,
+        "%.2f",
+        "Adds to the base point opacity in affected areas. Negative values can make wet areas more transparent.");
+    slider(
+        "Opacity Multiply",
+        &look->response.opacityMultiply,
+        0.0F,
+        3.0F,
+        "%.2f",
+        "Multiplies base opacity toward this value according to Seepage strength. One leaves opacity unchanged.");
+    slider(
+        "Point Size Add",
+        &look->response.pointSizeAdd,
+        -2.0F,
+        8.0F,
+        "%.2f",
+        "Adds an absolute point-size response at wet locations after the base visual is evaluated.");
+    slider(
+        "Point Size Multiply",
+        &look->response.pointSizeMultiply,
+        0.0F,
+        4.0F,
+        "%.2f",
+        "Multiplies point size toward this value according to Seepage strength. One leaves size unchanged.");
+    slider(
+        "Colour Mix",
+        &look->response.colouriseAmount,
+        0.0F,
+        1.0F,
+        "%.2f",
+        "Controls how strongly Wet Tint mixes over the existing cloud colour at affected points.");
     float tint[3] = {
         look->response.colouriseRed,
         look->response.colouriseGreen,
         look->response.colouriseBlue,
     };
-    if (ImGui::ColorEdit3("Wet Tint", tint)) {
+    const bool tintChanged = ImGui::ColorEdit3("Wet Tint", tint);
+    tooltip(
+        "Colour applied by Colour Mix. A cool, desaturated tint usually reads as damp rock "
+        "without overpowering the source cloud colour.");
+    if (tintChanged) {
         look->response.colouriseRed = tint[0];
         look->response.colouriseGreen = tint[1];
         look->response.colouriseBlue = tint[2];
@@ -30508,6 +33412,96 @@ void DrawWaterSeepagePanel(
         return;
     }
     auto& water = runtimeState->water;
+    if (BeginPanelSection("Water Scenario")) {
+        const auto* selectedScenario = FindWaterScenarioDefinition(
+            water,
+            water.selectedSeepageScenarioId);
+        const char* selectedLabel = selectedScenario != nullptr
+                                        ? selectedScenario->name.c_str()
+                                        : "Authored Node Looks";
+        const bool scenarioOpen = ImGui::BeginCombo("Scenario", selectedLabel);
+        DrawWaterSeepageParameterTooltip(
+            "Selects one project-wide Seepage state for every node. Authored Node Looks uses "
+            "each node's assigned profile or local override instead.");
+        if (scenarioOpen) {
+            const bool authoredSelected = water.selectedSeepageScenarioId.empty();
+            if (ImGui::Selectable("Authored Node Looks", authoredSelected)) {
+                water.selectedSeepageScenarioId.clear();
+                if (runtimeState->animationPanel.currentPath.has_value()) {
+                    runtimeState->animationPanel.currentPath->selectedWaterScenarioId.clear();
+                    runtimeState->animationPanel.dirty = true;
+                }
+                InvalidateWaterSeepageParams(&water);
+            }
+            for (const auto& scenario : water.seepageScenarios) {
+                const bool selected = scenario.id == water.selectedSeepageScenarioId;
+                if (ImGui::Selectable(scenario.name.c_str(), selected)) {
+                    water.selectedSeepageScenarioId = scenario.id;
+                    if (runtimeState->animationPanel.currentPath.has_value()) {
+                        runtimeState->animationPanel.currentPath->selectedWaterScenarioId = scenario.id;
+                        runtimeState->animationPanel.dirty = true;
+                    }
+                    EnsureMaximumScenarioRainFixture(runtimeState, viewport);
+                    InvalidateWaterSeepageParams(&water);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (!water.selectedSeepageScenarioId.empty()) {
+            const auto scenarioIt = std::find_if(
+                water.seepageScenarios.begin(),
+                water.seepageScenarios.end(),
+                [&](const auto& scenario) {
+                    return scenario.id == water.selectedSeepageScenarioId;
+                });
+            if (scenarioIt != water.seepageScenarios.end()) {
+                bool scenarioChanged = false;
+                scenarioChanged |= ImGui::SliderFloat(
+                    "Seepage Level",
+                    &scenarioIt->state.seepageLevel,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Scales the strength of every enabled Seepage node while retaining each "
+                    "node's authored relative strength. Zero turns scenario Seepage off.");
+                scenarioChanged |= ImGui::SliderFloat(
+                    "Spread",
+                    &scenarioIt->state.seepageSpread,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Expands the active fan inside its pre-indexed bounds. At one, reach can "
+                    "grow to 1.50x and end width to 1.35x without rebuilding the spatial grid.");
+                scenarioChanged |= ImGui::SliderFloat(
+                    "Rain Level",
+                    &scenarioIt->state.rainLevel,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Continuous Rain amount for scenario preview and animation capture. It "
+                    "reveals a deterministic fraction of the prepared trails and drives each look's Rain Response.");
+                if (ImGui::TreeNode("Scenario Seepage Look")) {
+                    scenarioChanged |= DrawWaterSeepageLookControls(
+                        &scenarioIt->state.seepageLook);
+                    ImGui::TreePop();
+                }
+                if (scenarioChanged) {
+                    InvalidateWaterSeepageParams(&water);
+                }
+            } else {
+                ImGui::TextColored(
+                    ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                    "Scenario definition is missing; animation fallback will be used when available.");
+            }
+        }
+        EndPanelSection();
+    }
     if (BeginPanelSection("Seepage Nodes")) {
         if (ImGui::Button(water.seepagePlacementArmed ? "Click Viewport..." : "Place Seepage Node")) {
             const bool arm = !water.seepagePlacementArmed;
@@ -30560,13 +33554,20 @@ void DrawWaterSeepagePanel(
     if (BeginPanelSection("Selected Node")) {
         InputTextString("Name", &node->name);
         topologyChanged |= ImGui::Checkbox("Visible", &node->enabledInViewport);
+        DrawWaterSeepageParameterTooltip(
+            "Includes this node in viewport Seepage evaluation. The node remains saved when disabled.");
         ImGui::SameLine();
         topologyChanged |= ImGui::Checkbox("Include in Export", &node->enabledInExport);
+        DrawWaterSeepageParameterTooltip(
+            "Includes this node in still, EXR, video, and offline Seepage evaluation.");
         float position[3]{node->position.x, node->position.y, node->position.z};
         if (ImGui::InputFloat3("Position", position, "%.3f")) {
             node->position = {position[0], position[1], position[2]};
             topologyChanged = true;
         }
+        DrawWaterSeepageParameterTooltip(
+            "World-space source point for the fan. Move In View is preferred because it snaps "
+            "the node back to canonical surface support and refreshes its guide normal.");
         const auto selectedIndex = water.selectedSeepageNodeIndex.value();
         const bool moving = water.movingSeepageNodeIndex.has_value() &&
                             water.movingSeepageNodeIndex.value() == selectedIndex;
@@ -30585,18 +33586,40 @@ void DrawWaterSeepagePanel(
         deleteSelected = ImGui::Button("Delete Node");
 
         topologyChanged |= ImGui::SliderFloat("Downward Reach", &node->reachMeters, 0.05F, 50.0F, "%.2f m", ImGuiSliderFlags_Logarithmic);
+        DrawWaterSeepageParameterTooltip(
+            "Authored distance traced downhill across the surface guide. Scenario spread and "
+            "Rain may expand the visible reach inside pre-indexed maximum bounds.");
         topologyChanged |= ImGui::SliderFloat("Start Width", &node->startWidthMeters, 0.01F, 10.0F, "%.2f m", ImGuiSliderFlags_Logarithmic);
+        DrawWaterSeepageParameterTooltip(
+            "Full fan width at the source node before edge feathering.");
         topologyChanged |= ImGui::SliderFloat("End Width", &node->endWidthMeters, 0.02F, 25.0F, "%.2f m", ImGuiSliderFlags_Logarithmic);
+        DrawWaterSeepageParameterTooltip(
+            "Full fan width at the end of the authored reach. Larger values make dampness fan outward downhill.");
         topologyChanged |= ImGui::SliderFloat("Edge Feather", &node->edgeFeatherMeters, 0.0F, 5.0F, "%.2f m");
+        DrawWaterSeepageParameterTooltip(
+            "Softens the sides, start, end, and depth boundary of the affected region.");
         topologyChanged |= ImGui::SliderFloat("Surface Depth", &node->depthToleranceMeters, 0.005F, 2.0F, "%.3f m", ImGuiSliderFlags_Logarithmic);
+        DrawWaterSeepageParameterTooltip(
+            "Maximum distance a point may sit away from the traced surface guide before it is rejected.");
         paramsChanged |= ImGui::SliderFloat("Normal Alignment", &node->normalAlignment, 0.0F, 1.0F, "%.2f");
+        DrawWaterSeepageParameterTooltip(
+            "Controls rejection of points whose normals disagree with the local guide surface. "
+            "Zero ignores alignment; one applies the strongest filtering.");
         paramsChanged |= ImGui::SliderFloat("Node Strength", &node->strength, 0.0F, 3.0F, "%.2f");
+        DrawWaterSeepageParameterTooltip(
+            "Scales this node relative to other nodes. Project scenario level is applied on top without changing this value.");
         paramsChanged |= ImGui::InputScalar("Seed", ImGuiDataType_U32, &node->seed);
+        DrawWaterSeepageParameterTooltip(
+            "Selects a deterministic variation and 3D-noise rotation. The same seed remains stable across playback and export.");
         topologyChanged |= DrawWaterSeepageRoleToggle("ROCK", "ROCK", node);
+        DrawWaterSeepageParameterTooltip("Allows this node to affect ROCK-role points inside its fan.");
         ImGui::SameLine();
         topologyChanged |= DrawWaterSeepageRoleToggle("VEG", "VEG", node);
+        DrawWaterSeepageParameterTooltip("Allows this node to affect VEG-role points inside its fan.");
         ImGui::SameLine();
         topologyChanged |= DrawWaterSeepageRoleToggle("SAND", "SAND", node);
+        DrawWaterSeepageParameterTooltip(
+            "Allows this node to affect SAND-role points. This is off by default because Seepage normally targets rock and vegetation.");
         EndPanelSection();
     }
 
@@ -30613,7 +33636,11 @@ void DrawWaterSeepagePanel(
 
     if (BeginPanelSection("Seepage Look")) {
         const std::string assignmentLabel = WaterSeepageLookAssignmentLabel(*node);
-        if (ImGui::BeginCombo("Look Profile", assignmentLabel.c_str())) {
+        const bool lookProfileOpen = ImGui::BeginCombo("Look Profile", assignmentLabel.c_str());
+        DrawWaterSeepageParameterTooltip(
+            "Assigns the shared Default or a named Seepage look to this node. Editing an assigned "
+            "look creates a temporary node-local override until it is saved, discarded, or reverted.");
+        if (lookProfileOpen) {
             const auto selectProfile = [&](std::string_view profileName) {
                 const std::string normalized = TrimText(profileName).empty()
                                                    ? std::string{"Default"}
@@ -30807,6 +33834,12 @@ void DrawWaterPanel(
                 std::string{"Water viewport set to "} + WaterOverlayViewModeName(water.overlayViewMode) + ".";
             runtimeState->errorMessage.clear();
         }
+        ImGui::Checkbox("Show Source Nodes / Paths", &water.showFlowSourceGuides);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Show point-source markers and authored manual-path guides. "
+                "Path editing remains visible while this is off.");
+        }
         if (water.overlayViewMode == WaterOverlayViewMode::Path) {
             const auto* selectedOverlayLabel =
                 WaterPathDebugOverlayModeName(water.pathDebugOverlayMode);
@@ -30857,6 +33890,9 @@ void DrawWaterPanel(
 
         if (BeginPanelSection("Source Settings")) {
             auto* selectedEmitter = SelectedWaterEmitter(runtimeState);
+            if (water.manualFlowPathEditor.active) {
+                ImGui::BeginDisabled();
+            }
             if (ImGui::Button(water.placementArmed ? "Click Viewport..." : "Place Source")) {
                 const bool armPlacement = !water.placementArmed;
                 if (armPlacement) {
@@ -30879,13 +33915,62 @@ void DrawWaterPanel(
             if (ImGui::Button("Suggest Sources")) {
                 SuggestWaterEmittersForActiveLayer(runtimeState);
             }
+            if (water.manualFlowPathEditor.active) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            const bool pathEditorWasActive = water.manualFlowPathEditor.active;
+            if (pathEditorWasActive) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Add Path Source")) {
+                DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
+                BeginCreatingManualFlowPath(runtimeState);
+            }
+            if (pathEditorWasActive) {
+                ImGui::EndDisabled();
+            }
+
+            if (water.manualFlowPathEditor.active) {
+                auto& draft = water.manualFlowPathEditor.draft;
+                ImGui::SeparatorText(water.manualFlowPathEditor.creating ? "New Manual Path" : "Edit Manual Path");
+                InputTextString("Path Name", &draft.name);
+                DrawWaterSourceProfileAssignmentCombo(
+                    water,
+                    WaterProfileKind::Lane,
+                    "Path Lanes",
+                    &draft.laneProfileName);
+                DrawWaterSourceProfileAssignmentCombo(
+                    water,
+                    WaterProfileKind::Trail,
+                    "Path Trail",
+                    &draft.trailProfileName);
+                ImGui::TextDisabled("Nodes: %zu", draft.controlPoints.size());
+                ImGui::TextWrapped(
+                    "Ctrl+left-click adds surface nodes. Select a node for axis, plane, or camera-plane dragging. "
+                    "Double-click the spline to insert; Delete removes the selected node.");
+                const bool canSave = invisible_places::water::BuildManualFlowPathAnchors(draft).points.size() >= 2U;
+                if (!canSave) {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::Button("Save Path")) {
+                    SaveManualFlowPathEdit(runtimeState, viewport);
+                }
+                if (!canSave) {
+                    ImGui::EndDisabled();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel")) {
+                    CancelManualFlowPathEdit(runtimeState);
+                }
+            }
 
             if (!water.lastOverlayPath.empty()) {
                 ImGui::TextDisabled("Last overlay: %s", water.lastOverlayPath.filename().string().c_str());
             }
             ImGui::Separator();
 
-            if (selectedEmitter != nullptr) {
+            if (selectedEmitter != nullptr && !water.manualFlowPathEditor.active) {
                 InputTextString("Name", &selectedEmitter->name);
                 float position[3] = {
                     selectedEmitter->position.x,
@@ -30921,12 +34006,14 @@ void DrawWaterPanel(
                 ImGui::TextDisabled("No source selected; profile sections edit Global.");
             }
 
-            const bool hasSelectedSource = selectedEmitter != nullptr;
+            const bool hasSelectedSource =
+                selectedEmitter != nullptr || water.selectedManualFlowPathIndex.has_value();
             if (!hasSelectedSource) {
                 ImGui::BeginDisabled();
             }
             if (ImGui::Button("Deselect Source")) {
                 DeselectWaterEmitter(runtimeState);
+                water.selectedManualFlowPathIndex.reset();
                 selectedEmitter = nullptr;
             }
             if (!hasSelectedSource) {
@@ -31754,6 +34841,12 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
+    if (runtimeState->water.manualFlowPathEditor.consumedViewportInputThisFrame ||
+        runtimeState->water.manualFlowPathEditor.drag.kind != ManualFlowPathGizmoDragKind::None ||
+        runtimeState->water.manualFlowPathEditor.pointerCapturedUntilRelease) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
     const bool mouseButtonDown = io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2];
     const bool renderViewportHovered = IsMouseOverRenderViewport(viewport);
     if (!mouseButtonDown) {
@@ -31979,6 +35072,28 @@ std::uint64_t EffectiveWaterSeepageShaderInvocations(const PreviewRuntimeState& 
     return total;
 }
 
+std::uint64_t EffectiveExportWaterSeepageShaderInvocations(const PreviewRuntimeState& runtimeState) {
+    std::uint64_t total = 0U;
+    for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
+            IsGeneratedWaterOverlaySession(session)) {
+            continue;
+        }
+        const auto style = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
+        const std::uint64_t multiplier = style.geometryMode == PointCloudGeometryMode::WorldSurfels ? 6U : 1U;
+        const std::uint64_t points = EffectivePointDrawCount(runtimeState, session);
+        const std::uint64_t contribution =
+            points > std::numeric_limits<std::uint64_t>::max() / multiplier
+                ? std::numeric_limits<std::uint64_t>::max()
+                : points * multiplier;
+        total = contribution > std::numeric_limits<std::uint64_t>::max() - total
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : total + contribution;
+    }
+    return total;
+}
+
 void EnsureWaterSeepageRuntimeUpToDate(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -31986,6 +35101,7 @@ void EnsureWaterSeepageRuntimeUpToDate(
         return;
     }
     const auto effectiveInvocations = EffectiveWaterSeepageShaderInvocations(*runtimeState);
+    const auto activeWaterScenario = ResolveActiveWaterScenarioState(*runtimeState);
     std::size_t totalBytes = 0U;
     std::uint32_t overflowCells = 0U;
     std::unordered_set<std::string> activeKeys;
@@ -32023,7 +35139,8 @@ void EnsureWaterSeepageRuntimeUpToDate(
                 false,
                 runtimeState->water.rainSettings,
                 effectiveInvocations,
-                guideSpan);
+                guideSpan,
+                activeWaterScenario);
         }
         const auto topologyFingerprint = invisible_places::water::WaterSeepageTopologyFingerprint(grid);
         const auto paramsFingerprint = invisible_places::water::WaterSeepageParamsFingerprint(grid);
@@ -32245,6 +35362,7 @@ void PumpGuiSmokeFrame(
     viewport->BeginUiFrame();
     DrawWaterRegionOverlay(runtimeState, *viewport);
     DrawWaterRegionPointPreviewOverlay(runtimeState, *viewport);
+    DrawManualFlowPathOverlay(runtimeState, *viewport);
     DrawWaterSeepageOverlay(runtimeState, *viewport);
     viewport->SetDiagnosticsEnabled(true);
     viewport->SetSceneCachingEnabled(false);
@@ -33204,7 +36322,8 @@ int RunWaterSeepageSmoke(
         false,
         runtimeState->water.rainSettings,
         effectiveInvocations,
-        guideSpan);
+        guideSpan,
+        ResolveActiveWaterScenarioState(*runtimeState));
     if (!grid.nodes.empty() &&
         (!benchmark100M || grid.nodes.front().resolvedQuality == WaterSeepageQuality::Low)) {
         report.Pass(
@@ -33782,6 +36901,7 @@ int Application::Run(ApplicationRunOptions options) const {
                 DrawAnimationViewportOverlay(&runtimeState, viewport.value());
                 DrawWaterRegionOverlay(&runtimeState, viewport.value());
                 DrawWaterRegionPointPreviewOverlay(&runtimeState, viewport.value());
+                DrawManualFlowPathOverlay(&runtimeState, viewport.value());
                 UpdateCameraFromInput(&runtimeState, viewport.value());
                 UpdateAnimationPlayback(&runtimeState);
                 UpdateCameraShotPlayback(&runtimeState);

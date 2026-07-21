@@ -32,6 +32,24 @@ struct SparseRippleComposite {
     vec3 colour;
 };
 
+struct SeepageLook {
+    // x: pattern (0 legacy, 1 wet rock, 2 chaotic bloom), y: blend mode.
+    uvec4 control;
+    // Legacy-only parameters.
+    vec4 legacy0;
+    vec4 legacy1;
+    vec4 response0;
+    vec4 response1;
+    vec4 response2;
+    // x: feature size, y: contrast, z: evolution, w: roughness.
+    vec4 organic0;
+    // x: angle response, y: micro-normal strength, z: glint density, w: curl.
+    vec4 organic1;
+    // x: breakup, y: downhill drift.
+    vec4 organic2;
+    vec4 environmentDirection;
+};
+
 struct SeepageNode {
     // x: stable node id, y: quality (0 low, 1 balanced, 2 high), z: blend mode, w: seed.
     uvec4 control;
@@ -45,16 +63,11 @@ struct SeepageNode {
     vec4 lateralStart;
     // x: half-width at the tail, y: normal-alignment weight, z: strength, w: rain preset strength.
     vec4 geometry;
-    // x: pattern scale, y: wavelength, z: speed, w: warp.
-    vec4 pattern0;
-    // x: turbulence, y: phase, z: density, w: prominence/intensity.
-    vec4 pattern1;
-    // x: emission add, y: opacity add, z: opacity multiply, w: point-size add.
-    vec4 response0;
-    // x: point-size multiply, yzw: colour.
-    vec4 response1;
-    // x: colour mix, y: base wetness, z: glisten, w: rain response.
-    vec4 response2;
+    SeepageLook look;
+    SeepageLook transitionLook;
+    // x: scenario spread, y: pattern-transition amount.
+    vec4 scenario;
+    vec4 noiseBasis[3];
     // x: sample count, y: achieved reach as float bits, z: valid, w: complete.
     uvec4 guideControl;
     // xyz: surface-following guide position, w: cumulative downstream station.
@@ -625,6 +638,172 @@ float SandCloudShorelineWaveValue(vec2 uv, float shoreDistance, float edgeBlendW
     }
 
     return clamp(combined, 0.0, 1.0);
+}
+
+float HeightFoamShorelineWaveValue(
+    vec2 shoreUv,
+    float worldZ,
+    float runupZ,
+    float breakZ,
+    float offshoreReachMeters,
+    float edgeFadeMeters,
+    float patternScale,
+    float wavelength,
+    float warp,
+    float turbulence,
+    float density,
+    float offshoreFoamStrength,
+    float incomingStrength,
+    float returnStrength,
+    float seed,
+    float phase) {
+    const float safeReach = max(0.001, offshoreReachMeters);
+    const float offshoreZ = runupZ - safeReach;
+    const float safeWavelength = max(0.002, wavelength);
+    const float turbulence01 = clamp(turbulence, 0.0, 1.0);
+    const float density01 = clamp(density, 0.0, 1.0);
+    const float clampedWarp = clamp(warp, 0.0, 3.0);
+    const float safePatternScale = max(0.01, patternScale);
+    const vec2 patternUv = shoreUv * safePatternScale;
+    const float alongShore = patternUv.y;
+    const float heightCoordinate = patternUv.x;
+    const float breakFeather = max(edgeFadeMeters, safeWavelength * 0.16);
+    const float seaFoamMask =
+        1.0 - smoothstep(breakZ - breakFeather, breakZ + breakFeather, worldZ);
+    const float offshoreEdgeMask =
+        smoothstep(offshoreZ - max(edgeFadeMeters, 1.0e-5), offshoreZ + max(edgeFadeMeters, 1.0e-5), worldZ);
+
+    const float reservoirNoise = RippleSmoothBlockNoise(
+        vec2(
+            heightCoordinate * 0.58 + phase * (0.030 + turbulence01 * 0.018),
+            alongShore * 0.71 - phase * (0.019 + clampedWarp * 0.010)),
+        max(safeWavelength * 0.42, 0.006),
+        seed,
+        311.0);
+    const float reservoirMottle = RippleSmoothBlockNoise(
+        vec2(
+            heightCoordinate * 0.31 - phase * 0.017,
+            alongShore * 0.43 + phase * 0.013),
+        max(safeWavelength * 0.68, 0.008),
+        seed,
+        337.0);
+    const float reservoirWarp =
+        (sin(alongShore / max(safeWavelength * 1.35, 0.008) + seed * 0.71) * 0.62 +
+         sin(alongShore / max(safeWavelength * 0.63, 0.006) - seed * 0.37) * 0.28 +
+         (reservoirNoise - 0.5) * 0.85) *
+        safeWavelength * (0.08 + clampedWarp * 0.12 + turbulence01 * 0.08);
+    const float ridgePhaseA =
+        ((heightCoordinate + reservoirWarp) / safeWavelength) * 6.28318530718 - phase * 0.16;
+    const float ridgePhaseB =
+        ((heightCoordinate * 0.61 - reservoirWarp * 0.72) / safeWavelength) * 6.28318530718 + phase * 0.11 + 1.73;
+    const float ridgeThreshold = mix(0.78, 0.48, density01);
+    const float ridgeA = smoothstep(
+        ridgeThreshold,
+        0.98,
+        0.5 + 0.5 * sin(ridgePhaseA) + (reservoirNoise - 0.5) * (0.18 + turbulence01 * 0.18));
+    const float ridgeB = smoothstep(
+        min(0.92, ridgeThreshold + 0.08),
+        0.99,
+        0.5 + 0.5 * sin(ridgePhaseB) + (reservoirMottle - 0.5) * 0.22);
+    const float foamPotential =
+        max(ridgeA * 0.82, ridgeB * 0.58) * mix(0.55, 1.0, reservoirMottle);
+    const float persistentFoam =
+        foamPotential * seaFoamMask * offshoreEdgeMask * max(0.0, offshoreFoamStrength);
+
+    const float incomingShare = 0.60;
+    const float returnShare = 0.25;
+    const float activeEnd = incomingShare + returnShare;
+    const float waveRate = 0.058 + density01 * 0.044;
+    const float frontWidth = max(safeWavelength * (0.055 + turbulence01 * 0.035), 0.003);
+    const float trailLength = max(safeWavelength * (0.72 + turbulence01 * 0.58), frontWidth * 7.0);
+    float movingBands = 0.0;
+    float wakeClear = 0.0;
+
+    for (int waveIndex = 0; waveIndex < 4; ++waveIndex) {
+        const float slot = float(waveIndex);
+        const float slotSeed = seed + slot * 59.31;
+        const float timingNoise = RippleHash(slotSeed * 0.071 + 17.0);
+        const float speedNoise = mix(0.91, 1.09, RippleHash(slotSeed * 0.097 + 29.0));
+        const float waveGate = RippleHash(slotSeed * 0.113 + 43.0);
+        if (waveGate > mix(0.62, 1.0, density01)) {
+            continue;
+        }
+
+        const float offset =
+            slot * 0.235 +
+            (timingNoise - 0.5) * (0.10 + turbulence01 * 0.10) +
+            RippleSmoothBlockNoise(vec2(phase * 0.018, slotSeed), 0.23, seed, 359.0) * 0.08;
+        const float cycle = fract(phase * waveRate * speedNoise + offset);
+        if (cycle >= activeEnd) {
+            continue;
+        }
+
+        const float lateralNoise = RippleSmoothBlockNoise(
+            vec2(alongShore + slot * safeWavelength * 0.41, slotSeed * 0.19),
+            max(safeWavelength * 0.44, 0.007),
+            seed,
+            383.0 + slot * 17.0);
+        const float frontWarpZ =
+            (sin(alongShore / max(safeWavelength * 1.28, 0.008) + slotSeed * 0.13) * 0.58 +
+             sin(alongShore / max(safeWavelength * 0.57, 0.006) - slotSeed * 0.09) * 0.26 +
+             (lateralNoise - 0.5) * 1.08) *
+            safeWavelength * (0.05 + clampedWarp * 0.075 + turbulence01 * 0.045);
+
+        if (cycle < incomingShare) {
+            const float incomingProgress = smoothstep(0.0, 1.0, cycle / incomingShare);
+            const float frontZ = mix(offshoreZ, runupZ, incomingProgress) + frontWarpZ;
+            const float signedFrontDistance = worldZ - frontZ;
+            const float crest = RippleLine(signedFrontDistance, frontWidth);
+            const float crestHalo = RippleLine(signedFrontDistance, frontWidth * 1.75);
+            const float seaSideDistance = max(0.0, frontZ - worldZ);
+            const float foamTail =
+                exp(-seaSideDistance / max(trailLength * 0.48, 1.0e-4)) *
+                smoothstep(frontWidth * 0.30, frontWidth * 1.55, seaSideDistance) *
+                (1.0 - smoothstep(trailLength * 0.55, trailLength, seaSideDistance));
+            const float breakGain = smoothstep(
+                breakZ - breakFeather,
+                breakZ + breakFeather,
+                frontZ);
+            const float arrivalFade = smoothstep(0.01, 0.12, cycle);
+            const float finishFade = 1.0 - smoothstep(0.90, 1.0, incomingProgress) * 0.24;
+            const float gatherPotential = mix(0.62, 1.0, foamPotential);
+            const float incomingBand =
+                (crest * mix(0.48, 0.94, breakGain) * gatherPotential +
+                 crestHalo * mix(0.08, 0.16, breakGain) +
+                 foamTail * mix(0.20, 0.48, breakGain) * mix(0.70, 1.0, lateralNoise)) *
+                max(0.0, incomingStrength) * arrivalFade * finishFade;
+            movingBands = max(movingBands, incomingBand);
+
+            const float passedFront =
+                1.0 - smoothstep(-frontWidth * 0.25, frontWidth * 0.80, signedFrontDistance);
+            const float recentWake =
+                1.0 - smoothstep(frontWidth * 1.5, trailLength * 1.35, seaSideDistance);
+            wakeClear = max(wakeClear, passedFront * recentWake * smoothstep(0.08, 0.42, incomingProgress));
+        } else {
+            const float returnProgress =
+                smoothstep(0.0, 1.0, (cycle - incomingShare) / returnShare);
+            const float frontZ = mix(runupZ, offshoreZ, returnProgress) + frontWarpZ;
+            const float signedFrontDistance = worldZ - frontZ;
+            const float crest = RippleLine(signedFrontDistance, frontWidth * 1.08);
+            const float landSideDistance = max(0.0, worldZ - frontZ);
+            const float returnTail =
+                exp(-landSideDistance / max(trailLength * 0.45, 1.0e-4)) *
+                smoothstep(frontWidth * 0.30, frontWidth * 1.55, landSideDistance) *
+                (1.0 - smoothstep(trailLength * 0.48, trailLength * 0.92, landSideDistance));
+            const float returnFade = 1.0 - smoothstep(0.05, 1.0, returnProgress);
+            const float returnBand =
+                (crest * 0.52 + returnTail * 0.28) *
+                max(0.0, incomingStrength) * clamp(returnStrength, 0.0, 1.0) * returnFade;
+            movingBands = max(movingBands, returnBand);
+            wakeClear = max(
+                wakeClear,
+                (1.0 - smoothstep(-frontWidth, trailLength, signedFrontDistance)) *
+                    (1.0 - returnProgress) * 0.45);
+        }
+    }
+
+    const float recoveredReservoir = persistentFoam * (1.0 - clamp(wakeClear, 0.0, 1.0) * 0.68);
+    return clamp(max(recoveredReservoir, movingBands), 0.0, 1.0);
 }
 
 float RippleWetSheenValue(vec2 uv, vec3 normal, float wavelength, float warp, float turbulence, float density, float seed, float phase) {
@@ -1273,9 +1452,13 @@ float SeepageResolvedFanMask(
     lateralNormalised = 0.0;
     const float rainGain = clamp(
         seepageNodeData.seepageNodes[nodeIndex].geometry.w *
-            seepageNodeData.seepageNodes[nodeIndex].response2.w,
+            max(
+                seepageNodeData.seepageNodes[nodeIndex].look.response2.w,
+                seepageNodeData.seepageNodes[nodeIndex].transitionLook.response2.w),
         0.0,
         1.0);
+    const float scenarioWidthScale =
+        1.0 + clamp(seepageNodeData.seepageNodes[nodeIndex].scenario.x, 0.0, 1.0) * 0.35;
     const float surfaceThickness = max(
         1e-4,
         seepageNodeData.seepageNodes[nodeIndex].normalSurface.w);
@@ -1295,7 +1478,8 @@ float SeepageResolvedFanMask(
         seepageNodeData.seepageNodes[nodeIndex].lateralStart.w);
     const float tailHalfWidth = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].geometry.x) * (1.0 + rainGain * 0.20);
+        seepageNodeData.seepageNodes[nodeIndex].geometry.x) *
+        scenarioWidthScale * (1.0 + rainGain * 0.20);
     const float halfWidth = mix(startHalfWidth, tailHalfWidth, progress);
     if (abs(signedLateralDistance) > halfWidth + edgeFeather) {
         return 0.0;
@@ -1332,12 +1516,16 @@ float SeepagePlanarFanMask(
     vec3 pointNormal,
     out float downstreamDistance,
     out float lateralDistance,
-    out float lateralNormalised) {
+    out float lateralNormalised,
+    out vec3 resolvedSurfaceNormal,
+    out vec3 resolvedDownTangent) {
     const vec3 nodeNormal = RippleSafeNormal(
         seepageNodeData.seepageNodes[nodeIndex].normalSurface.xyz);
     vec3 down = seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz;
     down -= nodeNormal * dot(down, nodeNormal);
     down = dot(down, down) > 1e-8 ? normalize(down) : vec3(0.0, 0.0, -1.0);
+    resolvedSurfaceNormal = nodeNormal;
+    resolvedDownTangent = down;
     vec3 lateral = seepageNodeData.seepageNodes[nodeIndex].lateralStart.xyz;
     lateral -= nodeNormal * dot(lateral, nodeNormal);
     lateral -= down * dot(lateral, down);
@@ -1353,12 +1541,17 @@ float SeepagePlanarFanMask(
     const float planeDistance = abs(dot(relative, nodeNormal));
     const float rainGain = clamp(
         seepageNodeData.seepageNodes[nodeIndex].geometry.w *
-            seepageNodeData.seepageNodes[nodeIndex].response2.w,
+            max(
+                seepageNodeData.seepageNodes[nodeIndex].look.response2.w,
+                seepageNodeData.seepageNodes[nodeIndex].transitionLook.response2.w),
         0.0,
         1.0);
+    const float scenarioReachScale =
+        1.0 + clamp(seepageNodeData.seepageNodes[nodeIndex].scenario.x, 0.0, 1.0) * 0.50;
     const float authoredReach = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].positionReach.w) * (1.0 + rainGain * 0.25);
+        seepageNodeData.seepageNodes[nodeIndex].positionReach.w) *
+        scenarioReachScale * (1.0 + rainGain * 0.25);
     return SeepageResolvedFanMask(
         nodeIndex,
         pointNormal,
@@ -1377,10 +1570,16 @@ float SeepageFanMask(
     vec3 pointNormal,
     out float downstreamDistance,
     out float lateralDistance,
-    out float lateralNormalised) {
+    out float lateralNormalised,
+    out vec3 resolvedSurfaceNormal,
+    out vec3 resolvedDownTangent) {
     downstreamDistance = 0.0;
     lateralDistance = 0.0;
     lateralNormalised = 0.0;
+    resolvedSurfaceNormal = RippleSafeNormal(
+        seepageNodeData.seepageNodes[nodeIndex].normalSurface.xyz);
+    resolvedDownTangent = RippleSafeNormal(
+        seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz);
 
     const float edgeFeather = max(
         1e-4,
@@ -1400,7 +1599,9 @@ float SeepageFanMask(
             pointNormal,
             downstreamDistance,
             lateralDistance,
-            lateralNormalised);
+            lateralNormalised,
+            resolvedSurfaceNormal,
+            resolvedDownTangent);
     }
 
     float bestDistanceSquared = 3.402823466e+38;
@@ -1475,7 +1676,9 @@ float SeepageFanMask(
             pointNormal,
             downstreamDistance,
             lateralDistance,
-            lateralNormalised);
+            lateralNormalised,
+            resolvedSurfaceNormal,
+            resolvedDownTangent);
     }
 
     float stationAmount = bestAmount;
@@ -1489,14 +1692,22 @@ float SeepageFanMask(
         seepageNodeData.seepageNodes[nodeIndex].guidePositionStation[bestSegmentIndex + 1u];
     downstreamDistance = mix(stationStart.w, stationEnd.w, stationAmount);
     lateralDistance = bestLateralDistance;
+    resolvedSurfaceNormal = bestSurfaceNormal;
+    resolvedDownTangent = RippleSafeNormal(
+        stationEnd.xyz - stationStart.xyz);
     const float rainGain = clamp(
         seepageNodeData.seepageNodes[nodeIndex].geometry.w *
-            seepageNodeData.seepageNodes[nodeIndex].response2.w,
+            max(
+                seepageNodeData.seepageNodes[nodeIndex].look.response2.w,
+                seepageNodeData.seepageNodes[nodeIndex].transitionLook.response2.w),
         0.0,
         1.0);
+    const float scenarioReachScale =
+        1.0 + clamp(seepageNodeData.seepageNodes[nodeIndex].scenario.x, 0.0, 1.0) * 0.50;
     const float authoredReach = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].positionReach.w) * (1.0 + rainGain * 0.25);
+        seepageNodeData.seepageNodes[nodeIndex].positionReach.w) *
+        scenarioReachScale * (1.0 + rainGain * 0.25);
     const float achievedReach = max(
         0.0,
         uintBitsToFloat(seepageNodeData.seepageNodes[nodeIndex].guideControl.y));
@@ -1517,85 +1728,376 @@ float SeepageFanMask(
         lateralNormalised);
 }
 
+uvec4 SeepageLookControl(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.control
+               : seepageNodeData.seepageNodes[nodeIndex].look.control;
+}
+
+vec4 SeepageLookLegacy0(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.legacy0
+               : seepageNodeData.seepageNodes[nodeIndex].look.legacy0;
+}
+
+vec4 SeepageLookLegacy1(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.legacy1
+               : seepageNodeData.seepageNodes[nodeIndex].look.legacy1;
+}
+
+vec4 SeepageLookResponse0(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.response0
+               : seepageNodeData.seepageNodes[nodeIndex].look.response0;
+}
+
+vec4 SeepageLookResponse1(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.response1
+               : seepageNodeData.seepageNodes[nodeIndex].look.response1;
+}
+
+vec4 SeepageLookResponse2(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.response2
+               : seepageNodeData.seepageNodes[nodeIndex].look.response2;
+}
+
+vec4 SeepageLookOrganic0(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.organic0
+               : seepageNodeData.seepageNodes[nodeIndex].look.organic0;
+}
+
+vec4 SeepageLookOrganic1(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.organic1
+               : seepageNodeData.seepageNodes[nodeIndex].look.organic1;
+}
+
+vec4 SeepageLookOrganic2(uint nodeIndex, bool transition) {
+    return transition
+               ? seepageNodeData.seepageNodes[nodeIndex].transitionLook.organic2
+               : seepageNodeData.seepageNodes[nodeIndex].look.organic2;
+}
+
+vec3 SeepageLookEnvironment(uint nodeIndex, bool transition) {
+    const vec3 direction = transition
+                               ? seepageNodeData.seepageNodes[nodeIndex]
+                                     .transitionLook.environmentDirection.xyz
+                               : seepageNodeData.seepageNodes[nodeIndex]
+                                     .look.environmentDirection.xyz;
+    return RippleSafeNormal(direction);
+}
+
+uint SeepageHash3(ivec3 coordinate, uint seed) {
+    uint hash = SeepageCellHash(coordinate);
+    hash ^= seed * 0x9e3779b9u;
+    hash ^= hash >> 16u;
+    hash *= 0x7feb352du;
+    hash ^= hash >> 15u;
+    hash *= 0x846ca68bu;
+    hash ^= hash >> 16u;
+    return hash;
+}
+
+vec3 SeepageGradient3(uint hash) {
+    const uint index = hash % 12u;
+    vec3 gradient;
+    if (index == 0u) gradient = vec3(1.0, 1.0, 0.0);
+    else if (index == 1u) gradient = vec3(-1.0, 1.0, 0.0);
+    else if (index == 2u) gradient = vec3(1.0, -1.0, 0.0);
+    else if (index == 3u) gradient = vec3(-1.0, -1.0, 0.0);
+    else if (index == 4u) gradient = vec3(1.0, 0.0, 1.0);
+    else if (index == 5u) gradient = vec3(-1.0, 0.0, 1.0);
+    else if (index == 6u) gradient = vec3(1.0, 0.0, -1.0);
+    else if (index == 7u) gradient = vec3(-1.0, 0.0, -1.0);
+    else if (index == 8u) gradient = vec3(0.0, 1.0, 1.0);
+    else if (index == 9u) gradient = vec3(0.0, -1.0, 1.0);
+    else if (index == 10u) gradient = vec3(0.0, 1.0, -1.0);
+    else gradient = vec3(0.0, -1.0, -1.0);
+    return gradient * 0.70710678118;
+}
+
+struct SeepageNoise3Sample {
+    float value;
+    vec3 gradient;
+};
+
+void AccumulateSeepageSimplexCorner(
+    ivec3 lattice,
+    ivec3 offset,
+    vec3 delta,
+    uint seed,
+    inout float value,
+    inout vec3 derivative) {
+    const float attenuation = 0.60 - dot(delta, delta);
+    if (attenuation <= 0.0) {
+        return;
+    }
+    const vec3 gradient = SeepageGradient3(SeepageHash3(lattice + offset, seed));
+    const float gradientDot = dot(gradient, delta);
+    const float attenuation2 = attenuation * attenuation;
+    const float attenuation3 = attenuation2 * attenuation;
+    const float attenuation4 = attenuation2 * attenuation2;
+    value += attenuation4 * gradientDot;
+    derivative += attenuation4 * gradient - 8.0 * attenuation3 * gradientDot * delta;
+}
+
+SeepageNoise3Sample SeepageSimplexNoise3(vec3 coordinate, uint seed) {
+    const float skew = 1.0 / 3.0;
+    const float unskew = 1.0 / 6.0;
+    const float skewAmount = (coordinate.x + coordinate.y + coordinate.z) * skew;
+    const ivec3 lattice = ivec3(floor(coordinate + skewAmount));
+    const float unskewAmount = float(lattice.x + lattice.y + lattice.z) * unskew;
+    const vec3 x0 = coordinate - (vec3(lattice) - unskewAmount);
+    ivec3 i1;
+    ivec3 i2;
+    if (x0.x >= x0.y) {
+        if (x0.y >= x0.z) {
+            i1 = ivec3(1, 0, 0); i2 = ivec3(1, 1, 0);
+        } else if (x0.x >= x0.z) {
+            i1 = ivec3(1, 0, 0); i2 = ivec3(1, 0, 1);
+        } else {
+            i1 = ivec3(0, 0, 1); i2 = ivec3(1, 0, 1);
+        }
+    } else if (x0.y < x0.z) {
+        i1 = ivec3(0, 0, 1); i2 = ivec3(0, 1, 1);
+    } else if (x0.x < x0.z) {
+        i1 = ivec3(0, 1, 0); i2 = ivec3(0, 1, 1);
+    } else {
+        i1 = ivec3(0, 1, 0); i2 = ivec3(1, 1, 0);
+    }
+    float value = 0.0;
+    vec3 derivative = vec3(0.0);
+    AccumulateSeepageSimplexCorner(lattice, ivec3(0), x0, seed, value, derivative);
+    AccumulateSeepageSimplexCorner(lattice, i1, x0 - vec3(i1) + unskew, seed, value, derivative);
+    AccumulateSeepageSimplexCorner(lattice, i2, x0 - vec3(i2) + 2.0 * unskew, seed, value, derivative);
+    AccumulateSeepageSimplexCorner(lattice, ivec3(1), x0 - vec3(1.0) + 3.0 * unskew, seed, value, derivative);
+    SeepageNoise3Sample result;
+    result.value = clamp(0.5 + 0.5 * value * 32.0, 0.0, 1.0);
+    result.gradient = derivative * 16.0;
+    return result;
+}
+
+SeepageNoise3Sample SeepageFractalNoise3(vec3 coordinate, uint seed, uint quality) {
+    const uint octaveCount = quality == 0u ? 1u : (quality >= 2u ? 3u : 2u);
+    SeepageNoise3Sample result;
+    result.value = 0.0;
+    result.gradient = vec3(0.0);
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float weight = 0.0;
+    for (uint octave = 0u; octave < 3u; ++octave) {
+        if (octave >= octaveCount) break;
+        const SeepageNoise3Sample noiseSample = SeepageSimplexNoise3(
+            coordinate,
+            seed + octave * 1013u);
+        result.value += noiseSample.value * amplitude;
+        result.gradient += noiseSample.gradient * (amplitude * frequency);
+        weight += amplitude;
+        coordinate = coordinate * 2.03 + vec3(17.0, 31.0, 47.0);
+        frequency *= 2.03;
+        amplitude *= 0.5;
+    }
+    if (weight > 0.0) {
+        result.value /= weight;
+        result.gradient /= weight;
+    }
+    return result;
+}
+
+bool SeepageUsesTransition(uint nodeIndex, vec3 worldPosition) {
+    const float amount = clamp(
+        seepageNodeData.seepageNodes[nodeIndex].scenario.y,
+        0.0,
+        1.0);
+    if (amount <= 1e-6) return false;
+    if (amount >= 1.0 - 1e-6) return true;
+    const float featureSize = max(
+        0.005,
+        min(
+            seepageNodeData.seepageNodes[nodeIndex].look.organic0.x,
+            seepageNodeData.seepageNodes[nodeIndex].transitionLook.organic0.x) * 0.18);
+    const ivec3 cell = ivec3(floor(worldPosition / featureSize));
+    const uint selectorBits = SeepageHash3(
+        cell,
+        seepageNodeData.seepageNodes[nodeIndex].control.w ^
+            seepageNodeData.seepageNodes[nodeIndex].control.x) & 0x00ffffffu;
+    return float(selectorBits) / float(0x01000000u) < amount;
+}
+
+float SeepageReflectionSignal(
+    uint nodeIndex,
+    bool transition,
+    vec3 worldPosition,
+    vec3 baseNormal,
+    vec3 microGradient,
+    float sparseGate) {
+    const vec4 organic0 = SeepageLookOrganic0(nodeIndex, transition);
+    const vec4 organic1 = SeepageLookOrganic1(nodeIndex, transition);
+    vec3 tangentGradient = microGradient - baseNormal * dot(microGradient, baseNormal);
+    tangentGradient = dot(tangentGradient, tangentGradient) > 1e-10
+                          ? normalize(tangentGradient)
+                          : vec3(0.0);
+    const vec3 microNormal = RippleSafeNormal(
+        baseNormal + tangentGradient * (organic1.y * 0.42));
+    vec3 viewDirection = uniforms.cameraPosition.xyz - worldPosition;
+    viewDirection = dot(viewDirection, viewDirection) > 1e-10
+                        ? normalize(viewDirection)
+                        : -SeepageLookEnvironment(nodeIndex, transition);
+    const vec3 environmentDirection = SeepageLookEnvironment(nodeIndex, transition);
+    vec3 halfVector = viewDirection + environmentDirection;
+    halfVector = dot(halfVector, halfVector) > 1e-10
+                     ? normalize(halfVector)
+                     : environmentDirection;
+    const float roughness = clamp(organic0.w, 0.02, 1.0);
+    const float exponent = 2.0 + (1.0 - roughness) * (1.0 - roughness) * 126.0;
+    const float specular = pow(max(0.0, dot(microNormal, halfVector)), exponent);
+    const float fresnel = pow(clamp(1.0 - abs(dot(microNormal, viewDirection)), 0.0, 1.0), 5.0);
+    const float angleResponse = clamp(organic1.x, 0.0, 1.0);
+    return clamp(
+        specular * (0.35 + angleResponse * 1.15) * (0.28 + sparseGate * 0.72) +
+            fresnel * (0.08 + angleResponse * 0.32),
+        0.0,
+        1.0);
+}
+
 vec3 SeepagePatternSignals(
     uint nodeIndex,
+    bool transition,
+    vec3 worldPosition,
+    vec3 pointNormal,
+    vec3 surfaceNormal,
+    vec3 downTangent,
     float timeSeconds,
     float downstreamDistance,
     float signedLateralDistance,
     float fanMask) {
-    const float wavelength = max(
-        0.002,
-        seepageNodeData.seepageNodes[nodeIndex].pattern0.y);
-    const float spatialScale = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].pattern0.x,
-        0.05,
-        100.0) / wavelength;
-    const float speed = max(0.0, seepageNodeData.seepageNodes[nodeIndex].pattern0.z);
-    const float warp = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].pattern0.w,
-        0.0,
-        8.0);
-    const float turbulence = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].pattern1.x,
-        0.0,
-        4.0);
+    const uvec4 lookControl = SeepageLookControl(nodeIndex, transition);
+    const vec4 legacy0 = SeepageLookLegacy0(nodeIndex, transition);
+    const vec4 legacy1 = SeepageLookLegacy1(nodeIndex, transition);
+    const vec4 response2 = SeepageLookResponse2(nodeIndex, transition);
+    const vec4 organic0 = SeepageLookOrganic0(nodeIndex, transition);
+    const vec4 organic1 = SeepageLookOrganic1(nodeIndex, transition);
+    const vec4 organic2 = SeepageLookOrganic2(nodeIndex, transition);
     const float rainGain = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].geometry.w *
-            seepageNodeData.seepageNodes[nodeIndex].response2.w,
+        seepageNodeData.seepageNodes[nodeIndex].geometry.w * response2.w,
         0.0,
         1.0);
-    const float wetness = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].response2.y + rainGain * 0.30,
-        0.0,
-        1.0);
-    const float density = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].pattern1.z + rainGain * 0.25,
-        0.0,
-        1.0);
-    const float glisten = max(
-        0.0,
-        seepageNodeData.seepageNodes[nodeIndex].response2.z);
-    const vec2 noiseCoordinate = vec2(
-        signedLateralDistance * spatialScale + warp * downstreamDistance,
-        downstreamDistance * spatialScale);
-    const uint proceduralSeed =
-        seepageNodeData.seepageNodes[nodeIndex].control.w ^
-        (seepageNodeData.seepageNodes[nodeIndex].control.x * 0x9e3779b9u);
-    const float noise = SeepageFractalNoise(
-        noiseCoordinate * (0.42 + turbulence * 0.38),
-        proceduralSeed,
-        seepageNodeData.seepageNodes[nodeIndex].control.y);
-    const float coverage = smoothstep(1.0 - density - 0.12, 1.0 - density + 0.12, noise);
-    const float phase =
-        downstreamDistance * spatialScale +
-        seepageNodeData.seepageNodes[nodeIndex].pattern1.y -
-        max(0.0, timeSeconds) * speed +
-        (noise - 0.5) * warp;
-    const float rippleWave = 0.5 + 0.5 * sin(kRippleTwoPi * phase);
-    const float ripplePeak = pow(
-        clamp(rippleWave, 0.0, 1.0),
-        seepageNodeData.seepageNodes[nodeIndex].control.y == 0u ? 2.0 : 3.5);
-    const float glintWave = 0.5 + 0.5 * sin(
-        kRippleTwoPi *
-        (phase * 1.73 + signedLateralDistance * spatialScale * 0.37 + noise * 0.61));
-    const float glintPeak = pow(
-        clamp(glintWave, 0.0, 1.0),
-        seepageNodeData.seepageNodes[nodeIndex].control.y >= 2u ? 7.0 : 5.0);
+    const float wetness = clamp(response2.y + rainGain * 0.30, 0.0, 1.0);
+    const float density = clamp(legacy1.z + rainGain * 0.25, 0.0, 1.0);
     const float strengthMask = fanMask * clamp(
         seepageNodeData.seepageNodes[nodeIndex].geometry.z,
         0.0,
         8.0);
-    const float damp = clamp(
-        strengthMask *
-        (wetness * (0.72 + noise * 0.28) + coverage * (0.10 + rainGain * 0.12)),
-        0.0,
-        1.0);
-    const float ripple = clamp(
-        strengthMask * coverage * ripplePeak * (0.30 + clamp(turbulence, 0.0, 1.0) * 0.70),
-        0.0,
-        1.0);
-    const float glint = clamp(strengthMask * coverage * glisten * glintPeak, 0.0, 1.0);
-    return vec3(damp, ripple, glint);
+    const uint proceduralSeed =
+        seepageNodeData.seepageNodes[nodeIndex].control.w ^
+        (seepageNodeData.seepageNodes[nodeIndex].control.x * 0x9e3779b9u);
+    if (lookControl.x == 0u) {
+        const float wavelength = max(0.002, legacy0.y);
+        const float spatialScale = clamp(legacy0.x, 0.05, 100.0) / wavelength;
+        const float warp = clamp(legacy0.w, 0.0, 8.0);
+        const float turbulence = clamp(legacy1.x, 0.0, 4.0);
+        const vec2 noiseCoordinate = vec2(
+            signedLateralDistance * spatialScale + warp * downstreamDistance,
+            downstreamDistance * spatialScale);
+        const float noise = SeepageFractalNoise(
+            noiseCoordinate * (0.42 + turbulence * 0.38),
+            proceduralSeed,
+            seepageNodeData.seepageNodes[nodeIndex].control.y);
+        const float coverage = smoothstep(1.0 - density - 0.12, 1.0 - density + 0.12, noise);
+        const float phase = downstreamDistance * spatialScale + legacy1.y -
+                            max(0.0, timeSeconds) * max(0.0, legacy0.z) +
+                            (noise - 0.5) * warp;
+        const float ripplePeak = pow(
+            clamp(0.5 + 0.5 * sin(kRippleTwoPi * phase), 0.0, 1.0),
+            seepageNodeData.seepageNodes[nodeIndex].control.y == 0u ? 2.0 : 3.5);
+        const float glintPeak = pow(
+            clamp(
+                0.5 + 0.5 * sin(kRippleTwoPi *
+                    (phase * 1.73 + signedLateralDistance * spatialScale * 0.37 + noise * 0.61)),
+                0.0,
+                1.0),
+            seepageNodeData.seepageNodes[nodeIndex].control.y >= 2u ? 7.0 : 5.0);
+        return vec3(
+            clamp(strengthMask * (wetness * (0.72 + noise * 0.28) + coverage * (0.10 + rainGain * 0.12)), 0.0, 1.0),
+            clamp(strengthMask * coverage * ripplePeak * (0.30 + clamp(turbulence, 0.0, 1.0) * 0.70), 0.0, 1.0),
+            clamp(strengthMask * coverage * response2.z * glintPeak, 0.0, 1.0));
+    }
+
+    const float featureSize = max(0.005, organic0.x);
+    const float time = max(0.0, timeSeconds);
+    const mat3 noiseRotation = mat3(
+        seepageNodeData.seepageNodes[nodeIndex].noiseBasis[0].xyz,
+        seepageNodeData.seepageNodes[nodeIndex].noiseBasis[1].xyz,
+        seepageNodeData.seepageNodes[nodeIndex].noiseBasis[2].xyz);
+    vec3 coordinate;
+    SeepageNoise3Sample bodyNoise;
+    SeepageNoise3Sample warpNoise;
+    float patchOrBloom;
+    float sparseGate;
+    if (lookControl.x == 1u) {
+        coordinate = noiseRotation * (worldPosition / featureSize);
+        coordinate += vec3(0.071, -0.053, 0.037) * (time * organic0.z);
+        bodyNoise = SeepageFractalNoise3(
+            coordinate,
+            proceduralSeed,
+            seepageNodeData.seepageNodes[nodeIndex].control.y);
+        const float feather = mix(0.24, 0.035, organic0.y);
+        patchOrBloom = smoothstep(1.0 - density - feather, 1.0 - density + feather, bodyNoise.value);
+        sparseGate = bodyNoise.value;
+        if (seepageNodeData.seepageNodes[nodeIndex].control.y != 0u) {
+            sparseGate = SeepageSimplexNoise3(
+                coordinate * 3.73 + vec3(13.0, -7.0, 19.0),
+                proceduralSeed + 4099u).value;
+        }
+        sparseGate = smoothstep(0.92 - organic1.z * 0.62, 0.98, sparseGate);
+    } else {
+        const vec3 advectedPosition = worldPosition -
+            RippleSafeNormal(downTangent) * (time * organic2.y);
+        coordinate = noiseRotation * (advectedPosition / featureSize);
+        warpNoise = SeepageFractalNoise3(
+            coordinate * 0.53 + vec3(0.031, -0.047, 0.023) * (time * organic0.z),
+            proceduralSeed + 2053u,
+            seepageNodeData.seepageNodes[nodeIndex].control.y);
+        coordinate += warpNoise.gradient * (organic1.w * 0.22);
+        coordinate += vec3(-0.029, 0.041, 0.017) * (time * organic0.z);
+        bodyNoise = SeepageFractalNoise3(
+            coordinate,
+            proceduralSeed,
+            seepageNodeData.seepageNodes[nodeIndex].control.y);
+        const float ridge = 1.0 - abs(bodyNoise.value * 2.0 - 1.0);
+        const float organic = clamp(ridge * 0.68 + bodyNoise.value * 0.32, 0.0, 1.0);
+        const float threshold = 0.76 - density * 0.48 + organic2.x * 0.16;
+        patchOrBloom = smoothstep(threshold, threshold + 0.18, organic);
+        sparseGate = smoothstep(0.90 - organic1.z * 0.58, 0.98, warpNoise.value);
+    }
+    const vec3 resolvedNormal =
+        styleData.pointMeta.z != 0u && dot(pointNormal, pointNormal) > 1e-8
+            ? normalize(pointNormal)
+            : RippleSafeNormal(surfaceNormal);
+    const vec3 worldGradient = transpose(noiseRotation) * bodyNoise.gradient;
+    const float reflection = SeepageReflectionSignal(
+        nodeIndex,
+        transition,
+        worldPosition,
+        resolvedNormal,
+        worldGradient,
+        sparseGate);
+    if (lookControl.x == 1u) {
+        return vec3(
+            clamp(strengthMask * wetness * (0.68 + bodyNoise.value * 0.22 + patchOrBloom * 0.20), 0.0, 1.0),
+            clamp(strengthMask * patchOrBloom * (0.08 + bodyNoise.value * 0.14), 0.0, 1.0),
+            clamp(strengthMask * patchOrBloom * response2.z * reflection, 0.0, 1.0));
+    }
+    const float ridge = 1.0 - abs(bodyNoise.value * 2.0 - 1.0);
+    const float organic = clamp(ridge * 0.68 + bodyNoise.value * 0.32, 0.0, 1.0);
+    return vec3(
+        clamp(strengthMask * (wetness * (0.60 + bodyNoise.value * 0.22) + patchOrBloom * (0.16 + rainGain * 0.14)), 0.0, 1.0),
+        clamp(strengthMask * patchOrBloom * (0.18 + organic * 0.42), 0.0, 1.0),
+        clamp(strengthMask * patchOrBloom * response2.z * reflection, 0.0, 1.0));
 }
 
 SparseRippleComposite EvaluateSeepageContribution(
@@ -1608,29 +2110,43 @@ SparseRippleComposite EvaluateSeepageContribution(
     float downstreamDistance;
     float lateralDistance;
     float lateralNormalised;
+    vec3 surfaceNormal;
+    vec3 downTangent;
     const float fanMask = SeepageFanMask(
         nodeIndex,
         worldPosition,
         pointNormal,
         downstreamDistance,
         lateralDistance,
-        lateralNormalised);
+        lateralNormalised,
+        surfaceNormal,
+        downTangent);
     if (fanMask <= 1e-5) {
         return contribution;
     }
 
+    const bool transition = SeepageUsesTransition(nodeIndex, worldPosition);
+    const vec4 legacy1 = SeepageLookLegacy1(nodeIndex, transition);
+    const vec4 response0 = SeepageLookResponse0(nodeIndex, transition);
+    const vec4 response1 = SeepageLookResponse1(nodeIndex, transition);
+    const vec4 response2 = SeepageLookResponse2(nodeIndex, transition);
     const vec3 signals = SeepagePatternSignals(
         nodeIndex,
+        transition,
+        worldPosition,
+        pointNormal,
+        surfaceNormal,
+        downTangent,
         timeSeconds,
         downstreamDistance,
         lateralDistance,
         fanMask);
     const float scale = clamp(
         (signals.x * 0.58 + signals.y * 0.34 + signals.z * 0.46) *
-            max(0.0, seepageNodeData.seepageNodes[nodeIndex].pattern1.w) *
+            max(0.0, legacy1.w) *
             (1.0 + clamp(
                  seepageNodeData.seepageNodes[nodeIndex].geometry.w *
-                     seepageNodeData.seepageNodes[nodeIndex].response2.w,
+                     response2.w,
                  0.0,
                  1.0) * 0.65),
         0.0,
@@ -1641,26 +2157,26 @@ SparseRippleComposite EvaluateSeepageContribution(
 
     contribution.scale = scale;
     contribution.colourMix = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].response2.x * scale,
+        response2.x * scale,
         0.0,
         1.0);
     contribution.emissionAdd = max(
         0.0,
-        seepageNodeData.seepageNodes[nodeIndex].response0.x) * scale;
+        response0.x) * scale;
     contribution.opacityAdd =
-        seepageNodeData.seepageNodes[nodeIndex].response0.y * scale;
+        response0.y * scale;
     contribution.opacityMultiply = mix(
         1.0,
-        max(0.0, seepageNodeData.seepageNodes[nodeIndex].response0.z),
+        max(0.0, response0.z),
         scale);
     contribution.pointSizeAdd =
-        seepageNodeData.seepageNodes[nodeIndex].response0.w * scale;
+        response0.w * scale;
     contribution.pointSizeMultiply = mix(
         1.0,
-        max(0.0, seepageNodeData.seepageNodes[nodeIndex].response1.x),
+        max(0.0, response1.x),
         scale);
     contribution.colour = clamp(
-        seepageNodeData.seepageNodes[nodeIndex].response1.yzw,
+        response1.yzw,
         vec3(0.0),
         vec3(1.0));
     return contribution;
@@ -1701,16 +2217,37 @@ SparseRippleComposite EvaluateShorelineWaveContribution(vec3 worldPosition, vec3
         max(0.001, min(max(edgeFadeMeters, wavelength * 0.20), reachMeters * 0.45));
     const float timePhase =
         styleData.shorelineWaveParams3.x + (timeSeconds * max(0.0, styleData.shorelineWaveParams2.x));
-    const float pattern = SandCloudShorelineWaveValue(
-        vec2(shoreDistance, tangentCoordinate) * patternScale,
-        shoreDistance,
-        shorelineEdgeBlendWidth,
-        wavelength,
-        styleData.shorelineWaveParams2.y,
-        styleData.shorelineWaveParams2.z,
-        styleData.shorelineWaveParams2.w,
-        float(styleData.shorelineWaveControl.y),
-        timePhase);
+    float pattern = 0.0;
+    if (styleData.shorelineWaveControl.z == 1u) {
+        pattern = HeightFoamShorelineWaveValue(
+            vec2(shoreDistance, tangentCoordinate),
+            worldPosition.z,
+            boundaryZ,
+            styleData.shorelineWaveParams5.x,
+            reachMeters,
+            edgeFadeMeters,
+            patternScale,
+            wavelength,
+            styleData.shorelineWaveParams2.y,
+            styleData.shorelineWaveParams2.z,
+            styleData.shorelineWaveParams2.w,
+            styleData.shorelineWaveParams5.y,
+            styleData.shorelineWaveParams5.z,
+            styleData.shorelineWaveParams5.w,
+            float(styleData.shorelineWaveControl.y),
+            timePhase);
+    } else {
+        pattern = SandCloudShorelineWaveValue(
+            vec2(shoreDistance, tangentCoordinate) * patternScale,
+            shoreDistance,
+            shorelineEdgeBlendWidth,
+            wavelength,
+            styleData.shorelineWaveParams2.y,
+            styleData.shorelineWaveParams2.z,
+            styleData.shorelineWaveParams2.w,
+            float(styleData.shorelineWaveControl.y),
+            timePhase);
+    }
 
     const float normalMask =
         clamp(0.62 + 0.38 * abs(dot(RippleSafeNormal(pointNormal), vec3(0.0, 0.0, 1.0))), 0.0, 1.0);
@@ -1900,7 +2437,9 @@ void BlendSeepageContributions(
             BlendSparseRippleContribution(
                 target,
                 contribution,
-                seepageNodeData.seepageNodes[nodeIndex].control.z);
+                SeepageLookControl(
+                    nodeIndex,
+                    SeepageUsesTransition(nodeIndex, worldPosition)).y);
         }
         return;
     }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iomanip>
 #include <sstream>
 #include <string_view>
 
@@ -379,6 +380,10 @@ const char* AnimationExportModeFilenameToken(AnimationExportMode mode) {
     switch (mode) {
         case AnimationExportMode::FastPreviewMp4:
             return "fast";
+        case AnimationExportMode::HevcAlphaMp4:
+            return "HEVCAlpha";
+        case AnimationExportMode::PngStack:
+            return "PNG";
         case AnimationExportMode::HqPreviewDensityExr:
             return "HQ";
         case AnimationExportMode::ProRes422Mov:
@@ -509,6 +514,60 @@ std::filesystem::path BuildUniqueQuickMp4OutputPath(
         ".mp4",
         visualName,
         reservedPaths);
+}
+
+std::filesystem::path BuildUniqueHevcAlphaMp4OutputPath(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    const RenderJobSettings& settings,
+    std::string_view visualName,
+    const std::vector<std::filesystem::path>& reservedPaths) {
+    return BuildUniqueAnimationExportMediaOutputPath(
+        outputDirectory,
+        animationName,
+        AnimationExportMode::HevcAlphaMp4,
+        settings,
+        ".mp4",
+        visualName,
+        reservedPaths);
+}
+
+std::filesystem::path BuildUniquePngStackOutputDirectory(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    const RenderJobSettings& settings,
+    std::string_view visualName,
+    const std::vector<std::filesystem::path>& reservedPaths) {
+    const auto directory = outputDirectory.empty() ? std::filesystem::path{"."} : outputDirectory;
+    const auto fullStem = BuildAnimationExportFilenameStem(
+        animationName,
+        AnimationExportMode::PngStack,
+        settings,
+        visualName);
+    auto candidate = directory / fullStem;
+    const auto reserved = [&reservedPaths](const std::filesystem::path& path) {
+        const auto normalized = path.lexically_normal();
+        return std::any_of(
+            reservedPaths.begin(),
+            reservedPaths.end(),
+            [&normalized](const std::filesystem::path& reservedPath) {
+                return reservedPath.lexically_normal() == normalized;
+            });
+    };
+    for (std::uint32_t suffix = 1; std::filesystem::exists(candidate) || reserved(candidate); ++suffix) {
+        candidate = directory / (fullStem + "_" + std::to_string(suffix));
+    }
+    return candidate;
+}
+
+std::filesystem::path PngStackFramePath(
+    const std::filesystem::path& outputDirectory,
+    std::string_view animationName,
+    std::uint32_t frameIndex) {
+    const auto safeAnimationName = SanitizeFileStem(animationName, "Animation");
+    std::ostringstream filename;
+    filename << safeAnimationName << "_" << std::setw(4) << std::setfill('0') << (frameIndex + 1U) << ".png";
+    return outputDirectory / filename.str();
 }
 
 std::filesystem::path BuildUniqueVideoOutputPath(
@@ -753,6 +812,35 @@ std::string BuildFfmpegRawRgbaCommand(
             << " -preset veryfast"
             << " -crf 18"
             << " -pix_fmt yuv420p "
+            << ShellQuote(outputPath.string());
+    return command.str();
+}
+
+std::string BuildFfmpegHevcAlphaMp4Command(
+    const std::filesystem::path& executablePath,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t framesPerSecond,
+    const std::filesystem::path& outputPath) {
+    std::ostringstream command;
+    command << ShellQuote(executablePath.string())
+            << " -y"
+            << " -loglevel error"
+            << " -f rawvideo"
+            << " -pix_fmt rgba64le"
+            << " -s:v " << std::max<std::uint32_t>(1U, width) << "x" << std::max<std::uint32_t>(1U, height)
+            << " -r " << std::max<std::uint32_t>(1U, framesPerSecond)
+            << " -i -"
+            << " -an"
+            << " -vf format=ayuv"
+            << " -c:v hevc_videotoolbox"
+            << " -alpha_quality 1.0"
+            << " -tag:v hvc1"
+            << " -pix_fmt ayuv"
+            << " -allow_sw 1"
+            << " -color_primaries bt709"
+            << " -color_trc iec61966-2-1"
+            << " -colorspace bt709 "
             << ShellQuote(outputPath.string());
     return command.str();
 }

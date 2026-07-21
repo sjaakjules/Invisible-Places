@@ -18,7 +18,8 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 34U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 37U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 13U;
 
 enum class SerializedLayerKind {
     PointCloud,
@@ -81,6 +82,7 @@ struct WaterRippleRuntimeCacheDocument {
 struct WaterSceneStateDocument {
     std::string sceneGroupName = "Default";
     std::vector<invisible_places::water::WaterEmitter> emitters;
+    std::vector<invisible_places::water::WaterManualFlowPathSource> manualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
@@ -150,9 +152,12 @@ struct ProjectDocument {
     std::string selectedExportPresetName = std::string{invisible_places::output::kFastPreviewMp4PresetName};
     std::optional<invisible_places::output::ExportPreset> tempExportPreset;
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
+    std::vector<invisible_places::water::WaterManualFlowPathSource> waterManualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> waterSeepageNodes;
     invisible_places::water::WaterSeepageLookSettings waterSeepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> waterSeepageLookProfiles;
+    std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
+    std::string selectedWaterScenarioId;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;
@@ -195,14 +200,15 @@ struct ProjectDocument {
 };
 
 struct PointCloudStylePresetDocument {
-    std::uint32_t schemaVersion = 2;
+    std::uint32_t schemaVersion = 3;
     std::string presetName;
     invisible_places::renderer::pointcloud::PointCloudStyleState style{};
 };
 
 struct WaterSourcesDocument {
-    std::uint32_t schemaVersion = 11;
+    std::uint32_t schemaVersion = kWaterSourcesDocumentSchemaVersion;
     std::vector<invisible_places::water::WaterEmitter> emitters;
+    std::vector<invisible_places::water::WaterManualFlowPathSource> manualFlowPaths;
     std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
     invisible_places::water::WaterSeepageLookSettings seepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> seepageLookProfiles;
