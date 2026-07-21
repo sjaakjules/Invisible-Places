@@ -536,6 +536,16 @@ bool WaterTrailIsRain(uint pointIndex) {
     return featureType > kWaterTrailFeatureTypeRain - 0.5 && featureType < kWaterTrailFeatureTypeRain + 0.5;
 }
 
+float WaterRainGeometryScale(uint pointIndex, uint fieldSlot) {
+    if (!WaterTrailIsRain(pointIndex) ||
+        LoadScalarFieldValueForPoint(kWaterTrailRoleFieldSlot, pointIndex) < 0.5 ||
+        styleData.globalControl.z <= fieldSlot) {
+        return 1.0;
+    }
+    const float scale = LoadScalarFieldValueForPoint(fieldSlot, pointIndex);
+    return scale > 0.001 ? clamp(scale, 0.08, 2.5) : 1.0;
+}
+
 bool WaterTrailStyleGeometryAvailable() {
     return styleData.renderParams1.x > 0.5 &&
            styleData.surfelDiameterBinding.control.w != 0u &&
@@ -550,7 +560,9 @@ float WaterTrailStyleWidth() {
 
 float WaterTrailStreakLength(uint pointIndex) {
     if (WaterTrailStyleGeometryAvailable()) {
-        return WaterTrailStyleWidth() * max(1.0, styleData.renderParams2.z);
+        return WaterTrailStyleWidth() *
+               max(1.0, styleData.renderParams2.z) *
+               WaterRainGeometryScale(pointIndex, kWaterTrailLaneIndexFieldSlot);
     }
     return max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
 }

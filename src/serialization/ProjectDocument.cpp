@@ -3904,6 +3904,7 @@ json SerializeWaterRainSettings(const WaterRainSettings& settings) {
         {"enabled", settings.enabled},
         {"vegetation_interception_enabled", settings.vegetationInterceptionEnabled},
         {"surface_runoff_enabled", settings.surfaceRunoffEnabled},
+        {"splash_enabled", settings.splashEnabled},
         {"intensity_preset", invisible_places::water::WaterRainIntensityPresetNameForStorage(settings.intensityPreset)},
         {"drop_count", settings.dropCount},
         {"fall_speed_meters_per_second", settings.fallSpeedMetersPerSecond},
@@ -3916,6 +3917,9 @@ json SerializeWaterRainSettings(const WaterRainSettings& settings) {
         {"camera_death_distance_meters", settings.cameraDeathDistanceMeters},
         {"surface_run_speed_meters_per_second", settings.surfaceRunSpeedMetersPerSecond},
         {"sand_run_distance_meters", settings.sandRunDistanceMeters},
+        {"splash_strength", settings.splashStrength},
+        {"splash_max_distance_meters", settings.splashMaxDistanceMeters},
+        {"splash_droplet_limit", settings.splashDropletLimit},
         {"wind_direction_x", settings.windDirectionX},
         {"wind_direction_y", settings.windDirectionY},
         {"wind_strength_meters", settings.windStrengthMeters},
@@ -3938,6 +3942,7 @@ WaterRainSettings ParseWaterRainSettings(const json& settingsJson) {
         settingsJson.value("vegetation_interception_enabled", settings.vegetationInterceptionEnabled);
     settings.surfaceRunoffEnabled =
         settingsJson.value("surface_runoff_enabled", settings.surfaceRunoffEnabled);
+    settings.splashEnabled = settingsJson.value("splash_enabled", settings.splashEnabled);
     if (settingsJson.contains("intensity_preset")) {
         const auto preset = invisible_places::water::ParseWaterRainIntensityPresetName(
             settingsJson.at("intensity_preset").get<std::string>());
@@ -3962,6 +3967,10 @@ WaterRainSettings ParseWaterRainSettings(const json& settingsJson) {
     settings.surfaceRunSpeedMetersPerSecond =
         settingsJson.value("surface_run_speed_meters_per_second", settings.surfaceRunSpeedMetersPerSecond);
     settings.sandRunDistanceMeters = settingsJson.value("sand_run_distance_meters", settings.sandRunDistanceMeters);
+    settings.splashStrength = settingsJson.value("splash_strength", settings.splashStrength);
+    settings.splashMaxDistanceMeters =
+        settingsJson.value("splash_max_distance_meters", settings.splashMaxDistanceMeters);
+    settings.splashDropletLimit = settingsJson.value("splash_droplet_limit", settings.splashDropletLimit);
     settings.windDirectionX = settingsJson.value("wind_direction_x", settings.windDirectionX);
     settings.windDirectionY = settingsJson.value("wind_direction_y", settings.windDirectionY);
     settings.windStrengthMeters = settingsJson.value("wind_strength_meters", settings.windStrengthMeters);

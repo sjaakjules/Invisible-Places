@@ -543,6 +543,16 @@ bool WaterTrailIsRain(uint pointIndex) {
     return featureType > kWaterTrailFeatureTypeRain - 0.5 && featureType < kWaterTrailFeatureTypeRain + 0.5;
 }
 
+float WaterRainGeometryScale(uint pointIndex, uint fieldSlot) {
+    if (!WaterTrailIsRain(pointIndex) ||
+        LoadScalarFieldValue(kWaterTrailRoleFieldSlot, pointIndex) < 0.5 ||
+        styleData.globalControl.z <= fieldSlot) {
+        return 1.0;
+    }
+    const float scale = LoadScalarFieldValue(fieldSlot, pointIndex);
+    return scale > 0.001 ? clamp(scale, 0.08, 2.5) : 1.0;
+}
+
 bool WaterTrailStyleGeometryAvailable() {
     return styleData.renderParams1.x > 0.5 &&
            styleData.surfelDiameterBinding.control.w != 0u &&
@@ -557,14 +567,16 @@ float WaterTrailStyleWidth() {
 
 float WaterTrailWidth(uint pointIndex) {
     if (WaterTrailStyleGeometryAvailable()) {
-        return WaterTrailStyleWidth();
+        return WaterTrailStyleWidth() * WaterRainGeometryScale(pointIndex, kWaterTrailLaneCountFieldSlot);
     }
     return max(0.0001, LoadScalarFieldValue(kWaterTrailWidthFieldSlot, pointIndex));
 }
 
 float WaterTrailStreakLength(uint pointIndex) {
     if (WaterTrailStyleGeometryAvailable()) {
-        return WaterTrailStyleWidth() * max(1.0, styleData.renderParams2.z);
+        return WaterTrailStyleWidth() *
+               max(1.0, styleData.renderParams2.z) *
+               WaterRainGeometryScale(pointIndex, kWaterTrailLaneIndexFieldSlot);
     }
     return max(0.001, LoadScalarFieldValue(kWaterTrailStreakLengthFieldSlot, pointIndex));
 }
@@ -1158,7 +1170,7 @@ void main() {
              sparseRipplePointSizeMultiply) +
         waterEffectPointSizeAdd +
         sparseRipplePointSizeAdd;
-    authoredDiameter *= mix(1.0, 1.30, rainSurfaceGrip);
+    authoredDiameter *= mix(1.0, 0.86, rainSurfaceGrip);
     const float diameter =
         authoredDiameter * max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
@@ -1166,9 +1178,9 @@ void main() {
     float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
     if (WaterTrailOverlayEnabled()) {
         const float trailStreakLength =
-            WaterTrailStreakLength(pointIndex) * mix(1.0, 0.45, rainSurfaceGrip);
+            WaterTrailStreakLength(pointIndex) * mix(1.0, 0.24, rainSurfaceGrip);
         waterStreakAspect = max(1.0, trailStreakLength / max(diameter, 0.0001));
-        waterStreakAspect = min(waterStreakAspect, mix(64.0, 12.0, rainSurfaceGrip));
+        waterStreakAspect = min(waterStreakAspect, mix(64.0, 7.0, rainSurfaceGrip));
     }
     const vec3 offset = (tangent * corner.x * waterStreakAspect + bitangent * corner.y) * (diameter * 0.5);
     const vec4 worldPosition = vec4(center + offset, 1.0);

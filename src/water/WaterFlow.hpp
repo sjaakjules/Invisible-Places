@@ -606,6 +606,7 @@ struct WaterRainSettings {
     bool enabled = false;
     bool vegetationInterceptionEnabled = true;
     bool surfaceRunoffEnabled = true;
+    bool splashEnabled = false;
     WaterRainIntensityPreset intensityPreset = WaterRainIntensityPreset::Rain;
     std::uint32_t dropCount = 900;
     float fallSpeedMetersPerSecond = 8.0F;
@@ -618,6 +619,9 @@ struct WaterRainSettings {
     float cameraDeathDistanceMeters = 28.0F;
     float surfaceRunSpeedMetersPerSecond = 1.05F;
     float sandRunDistanceMeters = 0.65F;
+    float splashStrength = 0.75F;
+    float splashMaxDistanceMeters = 0.18F;
+    std::uint32_t splashDropletLimit = 4;
     float windDirectionX = 1.0F;
     float windDirectionY = 0.0F;
     float windStrengthMeters = 0.30F;
@@ -647,6 +651,7 @@ struct WaterRainDiagnostics {
     std::uint32_t firstSupportHitCount = 0;
     std::uint32_t meshSurfaceHitCount = 0;
     std::uint32_t vegetationDripCount = 0;
+    std::uint32_t splashDropletCount = 0;
     std::uint32_t sandTerminationCount = 0;
     std::uint32_t impactTerminationCount = 0;
     std::uint32_t fallbackTerminationCount = 0;

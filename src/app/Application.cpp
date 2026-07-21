@@ -32910,6 +32910,7 @@ void DrawWaterRainPanel(
         routeOptionsChanged |=
             ImGui::Checkbox("Vegetation Interception", &water.rainSettings.vegetationInterceptionEnabled);
         routeOptionsChanged |= ImGui::Checkbox("Surface Runoff", &water.rainSettings.surfaceRunoffEnabled);
+        routeOptionsChanged |= ImGui::Checkbox("Splash", &water.rainSettings.splashEnabled);
         if (routeOptionsChanged) {
             RefreshWaterRainOverlay(runtimeState, viewport);
         }
@@ -32943,6 +32944,24 @@ void DrawWaterRainPanel(
             "%.2f m",
             ImGuiSliderFlags_Logarithmic);
         if (!water.rainSettings.surfaceRunoffEnabled) {
+            ImGui::EndDisabled();
+        }
+        if (!water.rainSettings.splashEnabled) {
+            ImGui::BeginDisabled();
+        }
+        ImGui::SliderFloat("Splash Strength", &water.rainSettings.splashStrength, 0.0F, 2.0F, "%.2f");
+        ImGui::SliderFloat(
+            "Splash Reach",
+            &water.rainSettings.splashMaxDistanceMeters,
+            0.02F,
+            0.45F,
+            "%.2f m");
+        int splashLimit = static_cast<int>(water.rainSettings.splashDropletLimit);
+        if (ImGui::SliderInt("Splash Droplets", &splashLimit, 0, 8)) {
+            water.rainSettings.splashDropletLimit =
+                static_cast<std::uint32_t>(std::clamp(splashLimit, 0, 8));
+        }
+        if (!water.rainSettings.splashEnabled) {
             ImGui::EndDisabled();
         }
         float windDirection[2] = {water.rainSettings.windDirectionX, water.rainSettings.windDirectionY};
@@ -32987,6 +33006,11 @@ void DrawWaterRainPanel(
         water.rainSettings.spawnRadiusMeters = std::clamp(water.rainSettings.spawnRadiusMeters, 0.1F, 500.0F);
         water.rainSettings.cameraDeathDistanceMeters =
             std::clamp(water.rainSettings.cameraDeathDistanceMeters, 0.1F, 1000.0F);
+        water.rainSettings.splashStrength = std::clamp(water.rainSettings.splashStrength, 0.0F, 4.0F);
+        water.rainSettings.splashMaxDistanceMeters =
+            std::clamp(water.rainSettings.splashMaxDistanceMeters, 0.005F, 1.0F);
+        water.rainSettings.splashDropletLimit =
+            std::clamp<std::uint32_t>(water.rainSettings.splashDropletLimit, 0U, 16U);
         if (ImGui::Button("Regenerate Rain")) {
             RefreshWaterRainOverlay(runtimeState, viewport);
         }
@@ -33006,9 +33030,10 @@ void DrawWaterRainPanel(
                 water.rainDiagnostics.fallbackTerminationCount,
                 water.rainDiagnostics.noSupportKillCount);
             ImGui::TextDisabled(
-                "Rain mesh: surface hits %u  vegetation drips %u",
+                "Rain mesh: surface hits %u  vegetation drips %u  splashes %u",
                 water.rainDiagnostics.meshSurfaceHitCount,
-                water.rainDiagnostics.vegetationDripCount);
+                water.rainDiagnostics.vegetationDripCount,
+                water.rainDiagnostics.splashDropletCount);
         }
         EndPanelSection();
     }

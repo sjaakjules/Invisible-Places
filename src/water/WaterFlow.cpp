@@ -2986,8 +2986,8 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
         case WaterRainIntensityPreset::LightMist:
             settings.dropCount = 420U;
             settings.fallSpeedMetersPerSecond = 2.8F;
-            settings.surfaceRunSpeedMetersPerSecond = 0.38F;
-            settings.sandRunDistanceMeters = 0.35F;
+            settings.surfaceRunSpeedMetersPerSecond = 0.10F;
+            settings.sandRunDistanceMeters = 0.22F;
             settings.windStrengthMeters = 0.62F;
             settings.windNoise = 0.82F;
             settings.windResponse = 1.0F;
@@ -3000,8 +3000,8 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
         case WaterRainIntensityPreset::Rain:
             settings.dropCount = 900U;
             settings.fallSpeedMetersPerSecond = 8.0F;
-            settings.surfaceRunSpeedMetersPerSecond = 1.05F;
-            settings.sandRunDistanceMeters = 0.65F;
+            settings.surfaceRunSpeedMetersPerSecond = 0.24F;
+            settings.sandRunDistanceMeters = 0.46F;
             settings.windStrengthMeters = 0.30F;
             settings.windNoise = 0.45F;
             settings.windResponse = 0.50F;
@@ -3014,8 +3014,8 @@ WaterRainSettings ApplyWaterRainIntensityPreset(
         case WaterRainIntensityPreset::HeavyDownpour:
             settings.dropCount = 2200U;
             settings.fallSpeedMetersPerSecond = 13.5F;
-            settings.surfaceRunSpeedMetersPerSecond = 1.85F;
-            settings.sandRunDistanceMeters = 0.95F;
+            settings.surfaceRunSpeedMetersPerSecond = 0.58F;
+            settings.sandRunDistanceMeters = 0.78F;
             settings.windStrengthMeters = 0.12F;
             settings.windNoise = 0.18F;
             settings.windResponse = 0.16F;
@@ -10097,6 +10097,31 @@ bool RainMeshProjectionIsSand(
     return std::abs(sand.position.z - position.z) <= verticalTolerance;
 }
 
+bool RainMeshProjectionHasVegetation(
+    const RainSupportIndex& support,
+    const MeshSurfaceCache& meshSurface,
+    const MeshSurfaceProjection& projection,
+    const WaterRainSettings& settings) {
+    if (!projection.hit || support.samples.empty()) {
+        return false;
+    }
+    const glm::vec3 position = ToGlm(projection.position);
+    const float roleRadius = RainMeshRoleRadius(meshSurface, settings);
+    const float verticalTolerance = std::max({
+        0.05F,
+        roleRadius * 1.60F,
+        RainMeshCellSize(meshSurface) * 2.5F});
+    const auto vegetationIndex = FindRainSupportRoleSample(
+        support,
+        {position.x, position.y},
+        roleRadius,
+        RainSupportRoleQuery::Vegetation,
+        false,
+        position.z + verticalTolerance,
+        position.z - verticalTolerance);
+    return vegetationIndex.has_value();
+}
+
 std::vector<std::uint32_t> FindRainVegetationInterruptions(
     const RainSupportIndex& support,
     const glm::vec3& spawn,
@@ -10220,6 +10245,216 @@ void ComputeRainRouteTiming(
     if (effectiveRouteLength != nullptr) {
         *effectiveRouteLength = fallSpeed * totalTime;
     }
+}
+
+float RainPresetSplashGain(WaterRainIntensityPreset preset) {
+    switch (preset) {
+        case WaterRainIntensityPreset::LightMist:
+            return 0.35F;
+        case WaterRainIntensityPreset::Rain:
+            return 0.82F;
+        case WaterRainIntensityPreset::HeavyDownpour:
+            return 1.20F;
+    }
+    return 0.82F;
+}
+
+float RainSplashEnergy(const WaterRainSettings& settings) {
+    const float speedScale = std::sqrt(std::max(0.0F, settings.fallSpeedMetersPerSecond) / 8.0F);
+    const float sizeScale = std::sqrt(std::max(0.0001F, settings.trailWidthMeters) / 0.004F);
+    return std::max(0.0F, settings.splashStrength) *
+           speedScale *
+           sizeScale *
+           RainPresetSplashGain(settings.intensityPreset);
+}
+
+std::uint32_t RainSplashDropletCount(
+    const WaterRainSettings& settings,
+    float splashEnergy,
+    std::uint32_t dropIndex) {
+    const std::uint32_t dropletLimit = std::clamp<std::uint32_t>(settings.splashDropletLimit, 0U, 12U);
+    if (!settings.splashEnabled || dropletLimit == 0U || splashEnergy <= 0.20F) {
+        return 0U;
+    }
+    const float probability = SmoothStep(0.24F, 0.95F, splashEnergy);
+    if (RegionHash01(settings.seed, dropIndex, 9221U) > probability) {
+        return 0U;
+    }
+    const float expected = 1.0F + splashEnergy * 2.15F + RegionHash01(settings.seed, dropIndex, 9229U);
+    return std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(std::floor(expected)),
+        1U,
+        dropletLimit);
+}
+
+struct RainTrailRouteEmitSpec {
+    std::uint32_t pathId = 1U;
+    float branchId = 0.0F;
+    float visualStrength = 1.0F;
+    float supportConfidence = 1.0F;
+    float trailLengthMeters = 0.10F;
+    float trailPointSpacingMeters = 0.05F;
+    float trailWidthMeters = 0.002F;
+    float trailStreakLengthMeters = 0.025F;
+    float fallSpeedMetersPerSecond = 1.0F;
+    float surfaceRunSpeedMetersPerSecond = 0.20F;
+    float cameraDeathDistanceMeters = 20.0F;
+    float windStrengthMeters = 0.0F;
+    float windResponse = 0.0F;
+    float widthScale = 1.0F;
+    float streakScale = 1.0F;
+    float wetnessScale = 1.0F;
+    std::uint32_t visibleSampleCount = 1U;
+    std::uint32_t seed = 0U;
+    std::uint32_t seedIndex = 0U;
+    std::uint32_t seedSalt = 0U;
+};
+
+bool EmitRainTrailRoute(
+    WaterTrailOverlay* overlay,
+    WaterRainDiagnostics* diagnostics,
+    std::vector<RainRouteAnchor> routeAnchors,
+    const RainTrailRouteEmitSpec& spec) {
+    if (overlay == nullptr || routeAnchors.size() < 2U) {
+        return false;
+    }
+
+    float routeLength = 0.0F;
+    ComputeRainRouteTiming(
+        &routeAnchors,
+        spec.fallSpeedMetersPerSecond,
+        spec.surfaceRunSpeedMetersPerSecond,
+        &routeLength);
+    if (routeLength <= 1.0e-5F) {
+        for (std::size_t routeIndex = 1; routeIndex < routeAnchors.size(); ++routeIndex) {
+            routeLength += glm::length(routeAnchors[routeIndex].position - routeAnchors[routeIndex - 1U].position);
+        }
+    }
+    if (routeLength <= 1.0e-5F) {
+        return false;
+    }
+
+    const float safeWidthScale = std::clamp(spec.widthScale, 0.08F, 2.5F);
+    const float safeStreakScale = std::clamp(spec.streakScale, 0.08F, 2.5F);
+    const float safeWidth = std::max(0.0005F, spec.trailWidthMeters * safeWidthScale);
+    const float safeStreak = std::max(
+        safeWidth * 1.25F,
+        spec.trailStreakLengthMeters * safeStreakScale);
+    const float visibleSpacing = std::clamp(spec.trailPointSpacingMeters, 0.01F, 5.0F);
+    const std::uint32_t visibleSampleCount = std::clamp<std::uint32_t>(spec.visibleSampleCount, 1U, 10U);
+    const float visualStrength = std::max(0.0F, spec.visualStrength * spec.wetnessScale);
+    const glm::vec3 spawn = routeAnchors.front().position;
+    const glm::vec3 endPoint = routeAnchors.back().position;
+    const auto routeStartIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
+        overlay->samples.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+
+    float routeDistance = 0.0F;
+    for (std::size_t routeIndex = 0; routeIndex < routeAnchors.size(); ++routeIndex) {
+        if (routeIndex > 0U) {
+            routeDistance += glm::length(routeAnchors[routeIndex].position - routeAnchors[routeIndex - 1U].position);
+        }
+        const auto previousIndex = routeIndex > 0U ? routeIndex - 1U : routeIndex;
+        const auto nextIndex = std::min(routeIndex + 1U, routeAnchors.size() - 1U);
+        glm::vec3 tangent = routeAnchors[nextIndex].position - routeAnchors[previousIndex].position;
+        if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
+            tangent = {0.0F, 0.0F, -1.0F};
+        }
+        tangent = glm::normalize(tangent);
+
+        WaterTrailSample routeSample;
+        routeSample.position = FromGlm(routeAnchors[routeIndex].position);
+        routeSample.normal = FromGlm(routeAnchors[routeIndex].normal);
+        routeSample.tangent = FromGlm(tangent);
+        routeSample.red = 0U;
+        routeSample.green = 0U;
+        routeSample.blue = 0U;
+        routeSample.sourceId = 0.0F;
+        routeSample.pathId = static_cast<float>(spec.pathId);
+        routeSample.branchId = spec.branchId;
+        routeSample.trailDistance = routeDistance;
+        routeSample.trailLength = std::max(0.001F, spec.trailLengthMeters);
+        routeSample.trailSpeed = std::max(0.01F, spec.fallSpeedMetersPerSecond);
+        routeSample.trailWidth = safeWidth;
+        routeSample.trailStreakLength = safeStreak;
+        routeSample.trailConfidence = spec.supportConfidence * visualStrength;
+        routeSample.wetness = visualStrength;
+        routeSample.featureType = kWaterTrailFeatureTypeRain;
+        routeSample.trailRole = 0.0F;
+        routeSample.routeStartIndex = static_cast<float>(routeStartIndex);
+        routeSample.routePointCount = static_cast<float>(routeAnchors.size());
+        routeSample.routeLength = routeLength;
+        routeSample.trailStartPhase = routeAnchors[routeIndex].timeFraction;
+        routeSample.trailLaneCount = safeWidthScale;
+        routeSample.trailLaneIndex = safeStreakScale;
+        routeSample.trailLaneSpan = std::max(0.1F, spec.cameraDeathDistanceMeters);
+        routeSample.trailLaneCrossing = std::max(0.0F, spec.windResponse);
+        routeSample.trailCrossSeed = RegionHash01(spec.seed, spec.seedIndex, spec.seedSalt + 13U);
+        IncludeTrailSample(overlay, routeSample);
+    }
+
+    const float startPhase = RegionHash01(spec.seed, spec.seedIndex, spec.seedSalt + 23U);
+    const float speedJitter = 0.82F + RegionHash01(spec.seed, spec.seedIndex, spec.seedSalt + 31U) * 0.36F;
+    glm::vec3 visibleTangent = endPoint - spawn;
+    if (glm::dot(visibleTangent, visibleTangent) <= kNormalEpsilon) {
+        visibleTangent = {0.0F, 0.0F, -1.0F};
+    } else {
+        visibleTangent = glm::normalize(visibleTangent);
+    }
+    for (std::uint32_t sampleIndex = 0; sampleIndex < visibleSampleCount; ++sampleIndex) {
+        const float pointAge = visibleSampleCount <= 1U
+                                   ? 0.0F
+                                   : static_cast<float>(sampleIndex) /
+                                         static_cast<float>(visibleSampleCount - 1U);
+        const float localDistance = std::min(
+            routeLength * 0.35F,
+            static_cast<float>(sampleIndex) * visibleSpacing);
+        const float trailSeed = RegionHash01(spec.seed, spec.seedIndex + sampleIndex, spec.seedSalt + 41U);
+        const float pointSeed = RegionHash01(spec.seed, spec.seedIndex + sampleIndex, spec.seedSalt + 49U);
+        const float localWidthScale = safeWidthScale * (0.86F + trailSeed * 0.22F);
+        WaterTrailSample sample;
+        sample.position = FromGlm(spawn);
+        sample.normal = FromGlm(glm::vec3{0.0F, 0.0F, 1.0F});
+        sample.tangent = FromGlm(visibleTangent);
+        sample.red = TrailColorByte(0.72F + visualStrength * 0.16F);
+        sample.green = TrailColorByte(0.86F + visualStrength * 0.10F);
+        sample.blue = TrailColorByte(1.0F);
+        sample.trailId = static_cast<float>(spec.pathId);
+        sample.sourceId = 0.0F;
+        sample.pathId = static_cast<float>(spec.pathId);
+        sample.branchId = spec.branchId;
+        sample.trailSeed = trailSeed;
+        sample.pointSeed = pointSeed;
+        sample.trailDistance = localDistance;
+        sample.trailLength = std::max(0.001F, spec.trailLengthMeters);
+        sample.pointAge = pointAge;
+        sample.trailAge = RegionHash01(spec.seed, spec.seedIndex, spec.seedSalt + 53U);
+        sample.trailSpeed = std::max(0.01F, spec.fallSpeedMetersPerSecond * speedJitter);
+        sample.trailWidth = std::max(0.0005F, spec.trailWidthMeters * localWidthScale);
+        sample.trailStreakLength = std::max(sample.trailWidth * 1.25F, spec.trailStreakLengthMeters * safeStreakScale);
+        sample.trailConfidence = spec.supportConfidence * visualStrength * (0.70F + sample.pointSeed * 0.30F);
+        sample.wetness = visualStrength;
+        sample.featureType = kWaterTrailFeatureTypeRain;
+        sample.trailRole = 1.0F;
+        sample.routeStartIndex = static_cast<float>(routeStartIndex);
+        sample.routePointCount = static_cast<float>(routeAnchors.size());
+        sample.routeLength = routeLength;
+        sample.trailStartPhase = startPhase;
+        sample.trailLaneIndex = safeStreakScale;
+        sample.trailLaneCount = localWidthScale;
+        sample.trailLanePitch = std::max(0.0F, spec.windStrengthMeters);
+        sample.trailLaneSpan = std::max(0.1F, spec.cameraDeathDistanceMeters);
+        sample.trailLaneCrossing = std::max(0.0F, spec.windResponse);
+        sample.trailCrossSeed = RegionHash01(spec.seed, spec.seedIndex, spec.seedSalt + 61U);
+        IncludeTrailSample(overlay, sample);
+        if (diagnostics != nullptr) {
+            ++diagnostics->emittedSampleCount;
+        }
+    }
+    if (diagnostics != nullptr) {
+        diagnostics->routeAnchorCount += static_cast<std::uint32_t>(routeAnchors.size());
+    }
+    return true;
 }
 
 std::vector<RainRouteAnchor> BuildRainRouteAnchors(
@@ -10453,6 +10688,87 @@ RainMeshRunoffStep FindRainMeshRunoffStep(
         }
     }
     return best;
+}
+
+std::vector<RainRouteAnchor> BuildRainSplashRouteAnchors(
+    const RainSupportIndex& support,
+    const MeshSurfaceCache& meshSurface,
+    const MeshSurfaceProjection& impactProjection,
+    const glm::vec3& windDirection,
+    float supportOffset,
+    const WaterRainSettings& settings,
+    std::uint32_t dropIndex,
+    std::uint32_t splashIndex,
+    float splashEnergy) {
+    std::vector<RainRouteAnchor> route;
+    if (!settings.splashEnabled || !impactProjection.hit ||
+        RainMeshProjectionIsSand(support, meshSurface, impactProjection, settings) ||
+        RainMeshProjectionHasVegetation(support, meshSurface, impactProjection, settings)) {
+        return route;
+    }
+
+    const glm::vec3 impact = ToGlm(impactProjection.position);
+    const glm::vec3 normal = SafeOverlayNormal(ToGlm(impactProjection.normal));
+    const glm::vec3 downhill = RainProjectedSurfaceDirection(
+        ToGlm(impactProjection.downhill),
+        normal,
+        windDirection);
+    glm::vec3 side = glm::cross(normal, downhill);
+    if (glm::dot(side, side) <= kNormalEpsilon) {
+        side = SafeRainWindDirection(settings);
+        side -= normal * glm::dot(side, normal);
+    }
+    if (glm::dot(side, side) <= kNormalEpsilon) {
+        side = glm::cross(normal, glm::vec3{0.0F, 0.0F, 1.0F});
+    }
+    side = glm::dot(side, side) > kNormalEpsilon ? glm::normalize(side) : glm::vec3{1.0F, 0.0F, 0.0F};
+
+    const float angle = RegionHash01(settings.seed + dropIndex, splashIndex, 9239U) * 6.28318530718F;
+    const glm::vec3 radial = glm::normalize(
+        downhill * std::cos(angle) +
+        side * std::sin(angle));
+    glm::vec3 direction = radial * 0.64F + downhill * (0.36F + Clamp01(splashEnergy) * 0.10F);
+    direction -= normal * glm::dot(direction, normal);
+    if (glm::dot(direction, direction) <= kNormalEpsilon) {
+        direction = downhill;
+    } else {
+        direction = glm::normalize(direction);
+    }
+
+    const float maxReach = std::clamp(settings.splashMaxDistanceMeters, 0.005F, 1.0F);
+    const float reachScale =
+        std::clamp(0.22F + Clamp01(splashEnergy) * 0.58F, 0.16F, 0.86F) *
+        (0.55F + RegionHash01(settings.seed + dropIndex, splashIndex, 9247U) * 0.45F);
+    const float distance = std::clamp(maxReach * reachScale, 0.012F, maxReach);
+    const auto endProjection = ProjectToMeshSurface(meshSurface, FromGlm(impact + direction * distance));
+    if (!endProjection.hit ||
+        RainMeshProjectionIsSand(support, meshSurface, endProjection, settings) ||
+        RainMeshProjectionHasVegetation(support, meshSurface, endProjection, settings)) {
+        return route;
+    }
+
+    const glm::vec3 end = ToGlm(endProjection.position);
+    if (glm::length(end - impact) > maxReach * 1.18F) {
+        return route;
+    }
+    const glm::vec3 endNormal = SafeOverlayNormal(ToGlm(endProjection.normal));
+    const float arcHeight =
+        std::clamp(0.006F + settings.trailWidthMeters * 2.5F + splashEnergy * 0.014F, 0.006F, 0.040F) *
+        (0.70F + RegionHash01(settings.seed + dropIndex, splashIndex, 9257U) * 0.60F);
+    const glm::vec3 start = impact + normal * supportOffset;
+    const glm::vec3 midpoint =
+        glm::mix(start, end + endNormal * supportOffset, 0.48F) + normal * arcHeight;
+
+    if (settings.vegetationInterceptionEnabled &&
+        !FindRainVegetationInterruptions(support, start, end + endNormal * supportOffset, settings).empty()) {
+        return {};
+    }
+
+    route.reserve(3U);
+    AppendRainRouteAnchor(&route, start, normal, false, false);
+    AppendRainRouteAnchor(&route, midpoint, normal, false, false);
+    AppendRainRouteAnchor(&route, end + endNormal * supportOffset, endNormal, true, false);
+    return route;
 }
 
 std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
@@ -10821,124 +11137,96 @@ WaterTrailOverlay BuildRainTrailOverlay(
             continue;
         }
 
-        float routeLength = 0.0F;
-        ComputeRainRouteTiming(
-            &routeAnchors,
-            settings.fallSpeedMetersPerSecond,
-            settings.surfaceRunSpeedMetersPerSecond,
-            &routeLength);
-        if (routeLength <= 1.0e-5F) {
-            for (std::size_t routeIndex = 1; routeIndex < routeAnchors.size(); ++routeIndex) {
-                routeLength += glm::length(routeAnchors[routeIndex].position - routeAnchors[routeIndex - 1U].position);
-            }
-        }
-        if (routeLength <= 1.0e-5F) {
+        const float supportConfidence = hasSupportHit ? 1.0F : 0.55F;
+        const RainTrailRouteEmitSpec mainSpec{
+            .pathId = dropIndex + 1U,
+            .branchId = 0.0F,
+            .visualStrength = visualStrength,
+            .supportConfidence = supportConfidence,
+            .trailLengthMeters = std::max(0.001F, settings.trailLengthMeters),
+            .trailPointSpacingMeters = visibleSpacing,
+            .trailWidthMeters = std::max(0.0005F, settings.trailWidthMeters),
+            .trailStreakLengthMeters = std::max(settings.trailWidthMeters * 2.0F, settings.trailStreakLengthMeters),
+            .fallSpeedMetersPerSecond = std::max(0.01F, settings.fallSpeedMetersPerSecond),
+            .surfaceRunSpeedMetersPerSecond = std::max(0.01F, settings.surfaceRunSpeedMetersPerSecond),
+            .cameraDeathDistanceMeters = std::max(0.1F, settings.cameraDeathDistanceMeters),
+            .windStrengthMeters = std::max(0.0F, settings.windStrengthMeters),
+            .windResponse = effectiveWindResponse,
+            .widthScale = 1.0F,
+            .streakScale = 1.0F,
+            .wetnessScale = 1.0F,
+            .visibleSampleCount = visibleSamplesPerDrop,
+            .seed = settings.seed,
+            .seedIndex = dropIndex,
+            .seedSalt = 9143U,
+        };
+        if (!EmitRainTrailRoute(&overlay, &localDiagnostics, std::move(routeAnchors), mainSpec)) {
             continue;
         }
-        const float supportConfidence = hasSupportHit ? 1.0F : 0.55F;
-        const glm::vec3 endPoint = routeAnchors.back().position;
-
-        const auto routeStartIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
-            overlay.samples.size(),
-            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
-        float routeDistance = 0.0F;
-        for (std::size_t routeIndex = 0; routeIndex < routeAnchors.size(); ++routeIndex) {
-            if (routeIndex > 0U) {
-                routeDistance += glm::length(routeAnchors[routeIndex].position - routeAnchors[routeIndex - 1U].position);
-            }
-            const auto previousIndex = routeIndex > 0U ? routeIndex - 1U : routeIndex;
-            const auto nextIndex = std::min(routeIndex + 1U, routeAnchors.size() - 1U);
-            glm::vec3 tangent = routeAnchors[nextIndex].position - routeAnchors[previousIndex].position;
-            if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
-                tangent = {0.0F, 0.0F, -1.0F};
-            }
-            tangent = glm::normalize(tangent);
-
-            WaterTrailSample routeSample;
-            routeSample.position = FromGlm(routeAnchors[routeIndex].position);
-            routeSample.normal = FromGlm(routeAnchors[routeIndex].normal);
-            routeSample.tangent = FromGlm(tangent);
-            routeSample.red = 0U;
-            routeSample.green = 0U;
-            routeSample.blue = 0U;
-            routeSample.sourceId = 0.0F;
-            routeSample.pathId = static_cast<float>(dropIndex + 1U);
-            routeSample.branchId = 0.0F;
-            routeSample.trailDistance = routeDistance;
-            routeSample.trailLength = std::max(0.001F, settings.trailLengthMeters);
-            routeSample.trailSpeed = std::max(0.01F, settings.fallSpeedMetersPerSecond);
-            routeSample.trailWidth = std::max(0.0005F, settings.trailWidthMeters);
-            routeSample.trailStreakLength = std::max(routeSample.trailWidth * 2.0F, settings.trailStreakLengthMeters);
-            routeSample.trailConfidence = supportConfidence * visualStrength;
-            routeSample.wetness = visualStrength;
-            routeSample.featureType = kWaterTrailFeatureTypeRain;
-            routeSample.trailRole = 0.0F;
-            routeSample.routeStartIndex = static_cast<float>(routeStartIndex);
-            routeSample.routePointCount = static_cast<float>(routeAnchors.size());
-            routeSample.routeLength = routeLength;
-            routeSample.trailStartPhase = routeAnchors[routeIndex].timeFraction;
-            routeSample.trailLaneSpan = std::max(0.1F, settings.cameraDeathDistanceMeters);
-            routeSample.trailLaneCrossing = effectiveWindResponse;
-            routeSample.trailCrossSeed = RegionHash01(settings.seed, dropIndex, 9133U);
-            IncludeTrailSample(&overlay, routeSample);
-        }
-
-        const float startPhase = RegionHash01(settings.seed, dropIndex, 9143U);
-        const float speedJitter = 0.82F + RegionHash01(settings.seed, dropIndex, 9151U) * 0.36F;
-        for (std::uint32_t sampleIndex = 0; sampleIndex < visibleSamplesPerDrop; ++sampleIndex) {
-            const float pointAge = visibleSamplesPerDrop <= 1U
-                                       ? 0.0F
-                                       : static_cast<float>(sampleIndex) /
-                                             static_cast<float>(visibleSamplesPerDrop - 1U);
-            const float localDistance = std::min(
-                routeLength * 0.35F,
-                static_cast<float>(sampleIndex) * visibleSpacing);
-            WaterTrailSample sample;
-            sample.position = FromGlm(spawn);
-            sample.normal = FromGlm(glm::vec3{0.0F, 0.0F, 1.0F});
-            sample.tangent = FromGlm(glm::normalize(endPoint - spawn));
-            sample.red = TrailColorByte(0.72F + visualStrength * 0.16F);
-            sample.green = TrailColorByte(0.86F + visualStrength * 0.10F);
-            sample.blue = TrailColorByte(1.0F);
-            sample.trailId = static_cast<float>(dropIndex + 1U);
-            sample.sourceId = 0.0F;
-            sample.pathId = static_cast<float>(dropIndex + 1U);
-            sample.branchId = 0.0F;
-            sample.trailSeed = RegionHash01(settings.seed, dropIndex, 9161U);
-            sample.pointSeed = RegionHash01(settings.seed, dropIndex + sampleIndex, 9169U);
-            sample.trailDistance = localDistance;
-            sample.trailLength = std::max(0.001F, settings.trailLengthMeters);
-            sample.pointAge = pointAge;
-            sample.trailAge = RegionHash01(settings.seed, dropIndex, 9173U);
-            sample.trailSpeed = std::max(0.01F, settings.fallSpeedMetersPerSecond * speedJitter);
-            sample.trailWidth =
-                std::max(0.0005F, settings.trailWidthMeters * (0.72F + sample.trailSeed * 0.48F));
-            sample.trailStreakLength = std::max(sample.trailWidth * 2.0F, settings.trailStreakLengthMeters);
-            sample.trailConfidence = supportConfidence * visualStrength * (0.70F + sample.pointSeed * 0.30F);
-            sample.wetness = visualStrength;
-            sample.featureType = kWaterTrailFeatureTypeRain;
-            sample.trailRole = 1.0F;
-            sample.routeStartIndex = static_cast<float>(routeStartIndex);
-            sample.routePointCount = static_cast<float>(routeAnchors.size());
-            sample.routeLength = routeLength;
-            sample.trailStartPhase = startPhase;
-            sample.trailLaneIndex = 0.0F;
-            sample.trailLaneCount = 1.0F;
-            sample.trailLanePitch = std::max(0.0F, settings.windStrengthMeters);
-            sample.trailLaneSpan = std::max(0.1F, settings.cameraDeathDistanceMeters);
-            sample.trailLaneCrossing = effectiveWindResponse;
-            sample.trailCrossSeed = RegionHash01(settings.seed, dropIndex, 9181U);
-            IncludeTrailSample(&overlay, sample);
-            ++localDiagnostics.emittedSampleCount;
-        }
         ++localDiagnostics.emittedDropCount;
-        localDiagnostics.routeAnchorCount += static_cast<std::uint32_t>(routeAnchors.size());
+
+        const bool canSplash =
+            settings.splashEnabled &&
+            hasMeshHit &&
+            !vegetationStoppedBeforeMesh &&
+            !RainMeshProjectionIsSand(support, *meshSurface, meshFirstProjection, settings);
+        if (canSplash) {
+            const float splashEnergy = RainSplashEnergy(settings);
+            const std::uint32_t splashCount = RainSplashDropletCount(settings, splashEnergy, dropIndex);
+            for (std::uint32_t splashIndex = 0; splashIndex < splashCount; ++splashIndex) {
+                auto splashRoute = BuildRainSplashRouteAnchors(
+                    support,
+                    *meshSurface,
+                    meshFirstProjection,
+                    windDirection,
+                    supportOffset,
+                    settings,
+                    dropIndex,
+                    splashIndex,
+                    splashEnergy);
+                if (splashRoute.size() < 2U) {
+                    continue;
+                }
+                const float splashVisualScale = std::clamp(0.22F + splashEnergy * 0.12F, 0.20F, 0.42F);
+                const float splashWidthScale = std::clamp(0.28F + splashEnergy * 0.10F, 0.26F, 0.52F);
+                const float splashSpeed = std::clamp(
+                    settings.fallSpeedMetersPerSecond * (0.10F + splashEnergy * 0.08F),
+                    0.35F,
+                    2.40F);
+                const RainTrailRouteEmitSpec splashSpec{
+                    .pathId = settings.dropCount + localDiagnostics.splashDropletCount + 1U,
+                    .branchId = 1.0F,
+                    .visualStrength = visualStrength,
+                    .supportConfidence = 0.86F,
+                    .trailLengthMeters = std::max(0.025F, settings.trailLengthMeters * 0.16F),
+                    .trailPointSpacingMeters = std::max(0.018F, settings.trailPointSpacingMeters * 0.42F),
+                    .trailWidthMeters = std::max(0.0005F, settings.trailWidthMeters),
+                    .trailStreakLengthMeters = std::max(0.003F, settings.trailStreakLengthMeters),
+                    .fallSpeedMetersPerSecond = splashSpeed,
+                    .surfaceRunSpeedMetersPerSecond = std::max(0.05F, splashSpeed * 0.38F),
+                    .cameraDeathDistanceMeters = std::max(0.1F, settings.cameraDeathDistanceMeters),
+                    .windStrengthMeters = std::max(0.0F, settings.windStrengthMeters * 0.35F),
+                    .windResponse = effectiveWindResponse * 0.30F,
+                    .widthScale = splashWidthScale,
+                    .streakScale = splashVisualScale,
+                    .wetnessScale = std::clamp(0.32F + splashEnergy * 0.18F, 0.28F, 0.72F),
+                    .visibleSampleCount = 1U + static_cast<std::uint32_t>(splashEnergy > 1.05F),
+                    .seed = settings.seed,
+                    .seedIndex = dropIndex * 17U + splashIndex,
+                    .seedSalt = 9263U,
+                };
+                if (EmitRainTrailRoute(&overlay, &localDiagnostics, std::move(splashRoute), splashSpec)) {
+                    ++localDiagnostics.splashDropletCount;
+                }
+            }
+        }
     }
 
     if (diagnostics != nullptr) {
         *diagnostics = localDiagnostics;
     }
-    overlay.fieldDiagnostics.emittedPathCount = localDiagnostics.emittedDropCount;
+    overlay.fieldDiagnostics.emittedPathCount =
+        localDiagnostics.emittedDropCount + localDiagnostics.splashDropletCount;
     overlay.fieldDiagnostics.emittedSampleCount = localDiagnostics.emittedSampleCount;
     overlay.fieldDiagnostics.inputNodeCount = localDiagnostics.routeAnchorCount;
     return overlay;

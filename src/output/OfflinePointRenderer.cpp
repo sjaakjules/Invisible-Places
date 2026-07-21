@@ -480,6 +480,19 @@ bool WaterTrailIsRain(
            featureType < kWaterTrailFeatureTypeRain + 0.5F;
 }
 
+float WaterRainGeometryScale(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    std::size_t pointIndex,
+    std::size_t fieldSlot) {
+    if (!WaterTrailIsRain(cloud, pointIndex) ||
+        ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F ||
+        cloud.scalarFields.size() <= fieldSlot) {
+        return 1.0F;
+    }
+    const float scale = ScalarFieldValueBySlot(cloud, fieldSlot, pointIndex);
+    return scale > 0.001F ? std::clamp(scale, 0.08F, 2.5F) : 1.0F;
+}
+
 bool WaterTrailStyleGeometryAvailable(
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     return style.waterTrailStyleGeometry &&
@@ -494,7 +507,8 @@ float WaterTrailWidth(
     std::size_t pointIndex,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     if (WaterTrailStyleGeometryAvailable(style)) {
-        return std::max(0.0001F, style.surfelDiameter.constantValue[0]);
+        return std::max(0.0001F, style.surfelDiameter.constantValue[0]) *
+               WaterRainGeometryScale(cloud, pointIndex, kWaterTrailLaneCountFieldSlot);
     }
     return std::max(0.0001F, ScalarFieldValueBySlot(cloud, kWaterTrailWidthFieldSlot, pointIndex));
 }
@@ -504,7 +518,9 @@ float WaterTrailStreakLength(
     std::size_t pointIndex,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     if (WaterTrailStyleGeometryAvailable(style)) {
-        return WaterTrailWidth(cloud, pointIndex, style) * std::max(1.0F, style.waterStreakAspect);
+        return std::max(0.0001F, style.surfelDiameter.constantValue[0]) *
+               std::max(1.0F, style.waterStreakAspect) *
+               WaterRainGeometryScale(cloud, pointIndex, kWaterTrailLaneIndexFieldSlot);
     }
     return std::max(
         0.001F,
@@ -1973,7 +1989,7 @@ bool BuildOfflinePointSample(
                                 : 1.0F;
     if (waterTrails) {
         const float trailWidth = WaterTrailWidth(cloud, pointIndex, layer.style);
-        const float trailWidthScale = std::lerp(1.0F, 1.30F, rainSurfaceGrip);
+        const float trailWidthScale = std::lerp(1.0F, 0.86F, rainSurfaceGrip);
         sample->surfelDiameter =
             trailWidth * densityCompensation.footprintScale * trailWidthScale +
             2.0F * ScreenPixelWorldSpan(
@@ -1989,11 +2005,11 @@ bool BuildOfflinePointSample(
         const float trailStreakLength = std::max(
             sample->surfelDiameter,
             WaterTrailStreakLength(cloud, pointIndex, layer.style) *
-                std::lerp(1.0F, 0.45F, rainSurfaceGrip));
+                std::lerp(1.0F, 0.24F, rainSurfaceGrip));
         sample->surfelAspect = std::clamp(
             trailStreakLength / std::max(sample->surfelDiameter, 0.0001F),
             1.0F,
-            std::lerp(64.0F, 12.0F, rainSurfaceGrip));
+            std::lerp(64.0F, 7.0F, rainSurfaceGrip));
     }
     sample->opacity = Clamp01(
         (EvaluateBindingOrDefault(
