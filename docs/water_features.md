@@ -8,7 +8,7 @@ Water v2 exposes seven active water tabs, ordered by their authored workflow:
 - **Shoreline**: a separate SAND-role point-cloud shader effect that uses the sand cloud itself to simulate waves washing toward and away from the beach boundary.
 - **Seepage**: manually placed surface nodes that fan downward over ROCK/VEG points, producing persistent dampness, subtle ripples, and moisture glints without generating a stream.
 - **Rain**: camera-aware deterministic falling drops and surface-shedding trails over the scene, with Light Mist, Rain, and Heavy Downpour intensities.
-- **Flow**: emitter/point-source path caches plus generated world-aligned stream surfels for artist-directed small streams.
+- **Flow**: downhill emitter paths or manually authored open splines feeding generated world-aligned stream surfels for artist-directed small streams.
 - **Mesh Flow**: triangle-mesh-guided sources, attractors, and GPU-previewed surface routes for topology-aware flowing water.
 - **Field**: a second point-source/region approach that builds local vector fields to generate Field Streamlines and Field Surface Motion.
 
@@ -21,15 +21,16 @@ Basin and Runoff are removed from the public v2 workflow. Legacy code and tests 
 Implemented in the current repository:
 
 - Active Water tabs ordered Ripples, Shoreline, Seepage, Rain, Flow, Mesh Flow, and Field.
-- Project schema `34` with authoritative scene density groups, Seepage nodes/shared looks, v2 Ripple/Flow/Field settings, saved Flow caches, and legacy Caustics-to-Ripples migration.
+- Project schema `37` with authoritative scene density groups, manual Flow spline sources, Seepage nodes/shared looks, water scenarios, selectable Shoreline algorithms, v2 Ripple/Flow/Field settings, saved Flow caches, and legacy Caustics-to-Ripples migration.
 - Ripple `WaterEffectLayer` records and distinct shader/offline procedural patterns for all `WaterRippleOverlayType` values.
-- SAND-role shader Shoreline waves driven by point-cloud style settings, including boundary height, reach, edge fade, direction, pattern scale, wavelength, speed, warp, turbulence, density, seed, colour, opacity, emission, and point-size response.
+- SAND-role shader Shoreline waves with independent `Foam Fronts (Current)` and `Height Foam` tuning banks. Height Foam adds absolute run-up and break elevations, persistent offshore foam, incoming gather strength, and fading return strength while retaining the shared wave and response controls.
 - Canonical-surface Seepage placement and editing with compact surface-following downhill ribbons, ROCK/VEG/SAND role targeting, shared and local look profiles, rain-responsive dampness, compact spatial hashes, and topology-versus-parameter GPU upload separation.
 - Sparse Ripple membership uploads for selected region points, with pattern/response edits updating compact GPU params when region membership has not changed. This supports millisecond-scale live modifications instead of CPU-regenerating dense fields.
 - Shared region selection for Ripple and Field support, including selected base point indices, edge weights, normals, source scalar values, field vectors, and manual Field control flags.
-- Flow path cache reuse, branch hiding, and generated stream surfels with the v2 stream scalar contract.
+- Flow path cache reuse, branch hiding, centripetal Catmull-Rom presentation smoothing, and generated stream surfels with the v2 stream scalar contract.
 - Flow Bake Path performs source-level incremental cache reuse. Branches store per-emitter bake fingerprints, so moving or adding one source rebuilds that source while unchanged source branches are retained.
 - Flow Path supports an optional viewport-placed attractor with tunable strength. It biases path ranking in XY while Z remains the vertical downhill axis.
+- Flow supports persistent manual path sources authored as open centripetal Catmull-Rom splines. Manual routes bypass `GenerateWaterPathCache`, build stable 3D lane frames directly, and coexist with generated point-source branches.
 - Project-owned Flow emitters and point sources. Sources are no longer loaded from a separate global save into every project.
 - Saved Flow path cache data can reload baked paths and anchors when support/settings signatures still match.
 - Combined ROCK/SAND/VEG support sampling for grouped scenes. Flow sources and path baking use CPU-ready canonical ROCK 1 mm, SAND 2 mm, and VEG 1 mm analysis sources as one support surface; changing the visible density does not invalidate support or create a full merged GPU point buffer.
@@ -45,7 +46,7 @@ Implemented in the current repository:
 
 - `src/water/WaterFlow.hpp` and `src/water/WaterFlow.cpp`: v2 water structs, Seepage look resolution/spatial-grid evaluation, shared region selection, flow path generation, shared stream surfel generation, Field cache persistence/streamline generation, Ripple/Field sparse effect generation, legacy water helpers, and point-cloud conversion.
 - `src/app/Application.cpp`: Water panel UI, runtime `WaterWorkflowState`, emitter/node/region editing, Seepage GPU refresh orchestration, cache/bake orchestration, Rain generation, in-memory overlay sessions, and project/source document wiring.
-- `src/serialization/ProjectDocument.hpp` and `src/serialization/ProjectDocument.cpp`: schema-34 project state, schema-11 water-source state, Seepage nodes/looks, v2 water settings/layers, legacy migration, and path cache persistence.
+- `src/serialization/ProjectDocument.hpp` and `src/serialization/ProjectDocument.cpp`: schema-37 project state, schema-13 water-source state, manual Flow paths, Seepage nodes/looks, selectable Shoreline styles, v2 water settings/layers, legacy migration, and path cache persistence.
 - `src/renderer/pointcloud/PointCloudPreviewState.*`, `src/renderer/core/VulkanViewportShell.cpp`, and root `shaders/pointcloud_*`: water overlay render mode, SAND-role Shoreline wave uniforms/shading, compact Seepage buffers/hash evaluation, stream tangent/width/world-length scalar handling, and stream surfel shading.
 - `tests/AssetDiscoveryTests.cpp`, `tests/SeepageWaterTests.cpp`, `tests/SeepageOfflineRendererTests.cpp`, and `tests/SeepageSerializationTests.cpp`: serialization, legacy migration, deterministic generation, cache invalidation, bounded Seepage grid/runtime behavior, offline/Fast Basic parity, and shader/style contract coverage.
 
@@ -53,7 +54,7 @@ Implemented in the current repository:
 
 `WaterWorkflowState` in `src/app/Application.cpp` owns the live workflow state. The v2-relevant fields are:
 
-- `emitters`, `defaultSourceSettings`, `tempDefaultSourceSettings`, and per-emitter settings for Flow path generation.
+- `emitters`, `defaultSourceSettings`, `tempDefaultSourceSettings`, and per-emitter settings for Flow path generation; `manualFlowPaths` and the transactional manual path editor own authored spline routes.
 - `pathCache`, `pathAnchors`, path revisions, dirty flags, and hidden branch IDs for reusable Flow paths.
 - Path/Lanes/Trail profiles plus `flowStreamOverlay` for generated Flow trails. Internal `stream_*` names are retained for renderer/offline compatibility.
 - `rippleLayers` plus sparse runtime memberships/params for current Ripple evaluation. `rippleEffectOverlay` is kept as selected-region debug/evidence data, not as a generated visible Ripple layer.
@@ -93,11 +94,13 @@ Animation Trail Playback
 legacy trail particle controls
 ```
 
-Ripples exposes region/layer controls and procedural overlay settings. Shoreline owns the SAND boundary-wave look. Seepage exposes viewport node placement/selection/movement, fan geometry and role targeting, quality/density/prominence controls, shared look profiles, and local saved/temporary overrides. Rain exposes enablement, Light Mist/Rain/Heavy Downpour intensity, shared trail visual profile editing, seed/count/fall speed, surface run speed, sand run distance, wind/noise, spawn footprint, camera death distance, and regeneration controls. Flow exposes path baking, branch hiding, source profile assignments, Lanes controls, and Trail styling. Mesh Flow exposes mesh-guided sources, attractors, particle state, preview/final route controls, and mesh trail styling. Field exposes field build settings, stream settings, surface-motion output controls, and user-authored Field regions.
+Ripples exposes region/layer controls and procedural overlay settings. Shoreline owns the SAND boundary-wave look, with a dropdown for the unchanged Foam Fronts algorithm and the independently tuned Height Foam algorithm. Seepage exposes viewport node placement/selection/movement, fan geometry and role targeting, the Legacy Ripples/Wet Rock Sheen/Chaotic Bloom pattern selector, common moisture and response controls, pattern-specific controls, project scenarios, shared look profiles, and local saved/temporary overrides. Rain exposes enablement, Light Mist/Rain/Heavy Downpour intensity, shared trail visual profile editing, seed/count/fall speed, surface run speed, sand run distance, wind/noise, spawn footprint, camera death distance, and regeneration controls. Flow exposes point-path baking, branch hiding, manual spline creation/editing, source profile assignments, Lanes controls, Trail styling, and a Show Source Nodes / Paths toggle for clearing blue authoring guides from the trail view. Mesh Flow exposes mesh-guided sources, attractors, particle state, preview/final route controls, and mesh trail styling. Field exposes field build settings, stream settings, surface-motion output controls, and user-authored Field regions.
+
+The Animation panel uses the same global Seepage scenario selector and the active animation scrub position. Its water-track controls add or update a normalized key, capture the current water state, remove the selected key, set Seepage or Rain off at a key, choose Smooth/Linear/Hold outgoing interpolation, and copy complete water tracks from another animation without copying its duration or camera keys.
 
 ## Serialization Contract
 
-Project documents now use schema `34`. The authoritative grouped-density record remains:
+Project documents now use schema `37`. The authoritative grouped-density record remains:
 
 ```text
 scene_point_cloud_groups[]
@@ -121,9 +124,12 @@ point_spacing_meters
 point_spacing_manual_override
 selected_scene_variant_path
 water_emitters
+water_manual_flow_paths
 water_seepage_nodes
 water_seepage_default_look
 water_seepage_look_profiles
+water_scenarios
+selected_water_scenario
 water_source_settings
 water_path_cache
 water_path_profiles
@@ -143,9 +149,11 @@ Project saves also preserve `water_animation_trail_settings`, `water_animation_t
 
 Shoreline wave settings are serialized with the point-cloud style rather than in `water_ripple_layers`. The active style keys include `shoreline_wave_enabled`, `shoreline_boundary_z`, `shoreline_height_reach_meters`, `shoreline_edge_fade_meters`, direction, pattern scale, wavelength, speed, warp, turbulence, density, phase, intensity, response, tint, and seed fields.
 
-Seepage nodes are stored both in the active scene state and in the project compatibility mirror. Each node preserves its world position, surface normal, down axis, fan reach/width/feather/depth tolerance, normal alignment, strength, seed, viewport/export flags, target roles, assigned profile, committed local override, and temporary local override. Shared defaults and named profiles use `water_seepage_default_look` and `water_seepage_look_profiles`.
+Seepage nodes are stored both in the active scene state and in the project compatibility mirror. Each node preserves its world position, surface normal, down axis, fan reach/width/feather/depth tolerance, normal alignment, strength, seed, viewport/export flags, target roles, assigned profile, committed local override, and temporary local override. Shared defaults and named profiles use `water_seepage_default_look` and `water_seepage_look_profiles`. Every stored look includes its pattern and the corresponding legacy, noise, reflection, and response parameters.
 
-`water_sources.json` schema `11` mirrors the active source/layer/settings subset for reusable water setup, including Seepage nodes/looks, the same Ripple/Flow/Field/Rain settings, and the current Flow path cache when available.
+Project-owned `water_scenarios` preserve stable IDs, names, complete base looks, Seepage level, and spread; `selected_water_scenario` selects the preview override or remains empty for Authored Node Looks. Animation-path schema `8` stores `selected_water_scenario_id` and normalized `water_scenario_tracks`. Every track key contains a complete look snapshot, Seepage level, spread, continuous Rain level, and outgoing interpolation. Tracks also embed a fallback scenario definition so rendering remains reproducible when their linked project scenario is missing.
+
+`water_sources.json` schema `13` mirrors the active source/layer/settings subset for reusable water setup, including manual Flow paths, Seepage nodes/looks, the same Ripple/Flow/Field/Rain settings, and the current Flow path cache when available. Schema-11 and older files load with an empty manual-path list.
 
 New saves do not write:
 
@@ -162,7 +170,8 @@ Legacy loading rules:
 - Compatibility caustic look settings may still be parsed/written for old visual data, but caustic region geometry is no longer the active public save contract.
 - Existing `water_path_cache` records are preserved when their support/settings fingerprint matches.
 - Water emitters and point sources are stored inside the project document. Loading another project should not import sources from a previous project unless that project explicitly contains them.
-- Schema-33-and-earlier documents without Seepage keys load empty node/profile lists and the current subtle-damp default look.
+- Schema-33-and-earlier documents without Seepage keys load empty node/profile lists. A new project uses the restrained Chaotic Bloom default; a legacy saved look with no `pattern` field is explicitly restored as Legacy Ripples so its previous appearance is retained.
+- Animations without water scenario tracks continue to use the current static project water state. Unknown pattern names also fall back to Legacy Ripples.
 
 ## Ripples
 
@@ -220,15 +229,31 @@ Shoreline does not create `WaterEffectLayer` records, does not build region prev
 
 Water > Seepage represents persistent damp areas rather than full streams. `Place Seepage Node` uses the canonical analysis-surface picker shared with Flow sources. Each node stores the picked position and surface normal, then derives a transient, gravity-descending guide across the canonical 3D surface. At most eight stations describe the changing center, normal, and cumulative surface distance, letting the widening damp ribbon turn around cliff contours instead of remaining in the clicked tangent plane. Reach, start/end width, edge feather, surface-depth tolerance, normal alignment, strength, and deterministic seed remain authored controls. Nodes can be selected in the viewport or list, moved back onto support, renamed, role-targeted, hidden from the viewport or export, and deleted. ROCK and VEG are enabled by default; SAND remains an explicit option.
 
-The look separates authored topology from live visual parameters. `WaterSeepageLookSettings` exposes Auto/Low/Balanced/High quality, Base Wetness, Ripple Density, Glisten, Wavelength, Pattern Scale, Speed, Warp, Turbulence, Phase, Rain Response, Prominence, colour/opacity/point-size/emission response, and the shared add/max/multiply/screen/override blend modes. A node can use Default, a named shared profile, a committed local override, or a temporary edited override. Saving a look updates parameters without changing fan topology.
+The look separates authored topology from live visual parameters. Auto/Low/Balanced/High quality, Base Wetness, Coverage, Glisten, Rain Response, Prominence, colour/opacity/point-size/emission response, and the shared add/max/multiply/screen/override blend modes are common to every pattern. Pattern-specific controls are shown only when relevant:
 
-`BuildWaterSeepageSurfaceGuides` samples only a capped canonical support set, prefers ROCK substrate, follows locally projected gravity, rejects rising steps, and stops when trustworthy surface support ends. `BuildWaterSeepageSpatialGrid` filters the small authored node list by scene role and viewport/export enablement, resolves profiles and Auto quality, and builds a compact world-space hash over the swept ribbon bounds. Each occupied cell stores at most `WaterSeepageSpatialGrid::kMaxReferencesPerCell` node references and reports overflow rather than allocating work per point. `VulkanViewportShell` uploads node/guide, hash-cell, and reference buffers; topology fingerprints trigger full buffer replacement, while look/Rain parameter fingerprints update only the node buffer. Point shaders query the local cell, find the closest local ribbon segment, and evaluate dampness, animated ripple breakup, and moisture glints on the GPU, so the cost follows nearby node references instead of the full authored-node count.
+- `Legacy Ripples` preserves the original warped sinusoid and its Wavelength, Pattern Scale, Warp, Turbulence, Speed, and Phase controls.
+- `Wet Rock Sheen` samples deterministic seed-rotated world-space 3D gradient noise. Patch Size, Contrast, Evolution, Roughness, Angle Response, Micro Detail, Glint Density, and a virtual environment azimuth/elevation shape persistent damp patches, analytic micro-normal variation, broad grazing-angle sheen, and sparse glints.
+- `Chaotic Bloom` domain-warps ridged 3D gradient noise along the local surface-guide tangent. Feature Size, Curl, Breakup, Downhill Drift, Evolution, and the same reflection controls make irregular lobes split and reconnect without regular bands. A restrained form of this pattern is the new-project default.
+
+A node can use Default, a named shared profile, a committed local override, or a temporary edited override. Saving a look updates parameters without changing fan topology. If a point normal is unavailable or unreliable, both the shader and offline evaluator use the closest guide normal; analytic noise variation keeps the reflection from becoming uniform.
+
+`BuildWaterSeepageSurfaceGuides` samples only a capped canonical support set, prefers ROCK substrate, follows locally projected gravity, rejects rising steps, and stops when trustworthy surface support ends. `BuildWaterSeepageSpatialGrid` filters the small authored node list by scene role and viewport/export enablement, resolves profiles and Auto quality, and builds a compact world-space hash over maximum scenario-plus-Rain-expanded ribbon bounds. Each occupied cell stores at most `WaterSeepageSpatialGrid::kMaxReferencesPerCell` node references and reports overflow rather than allocating work per point. `VulkanViewportShell` uploads node/guide, hash-cell, and reference buffers; topology fingerprints trigger full buffer replacement, while look, reflection, scenario, track, and Rain changes update only the compact node/style parameters. Point shaders query the local cell, find the closest local ribbon segment, and evaluate the selected appearance on the GPU, so the cost follows nearby node references instead of the full authored-node count.
+
+During a change between two pattern algorithms, a deterministic point-cell selector cross-dissolves spatial coverage while evaluating only one algorithm for each point. Low quality uses one noise scale and inexpensive glints, Balanced adds a warp/detail scale, and High evaluates the complete stack. The CPU/offline path uses the same seed rotations, noise gradients, guide normals, real camera position, virtual environment direction, reflection response, quality choice, and pattern transition as the point shaders.
 
 The Seepage Nodes section provides a transient `Show Structure Overlay` viewport option. It defaults off so the authored node points and actual wet points remain visible without diagram clutter. Turning it on draws the evaluator-aligned affected ribbons, translucent regions, downhill centrelines, end caps, and support warnings for every viewport-enabled node; the selected node is emphasized. Node markers and the selected-node label remain visible in both states. This is an editor overlay only: it is not serialized and does not alter GPU Seepage topology, look parameters, stills, or animation exports. Incomplete support is capped and warned rather than represented by a misleading vertical fan.
 
-Auto quality resolves High at up to 10 million effective point invocations, Balanced through 50 million, and Low above 50 million; an explicit quality remains fixed. Rain presets raise Seepage visual moisture through `rainResponse` without changing the spatial topology because guides are pretraced to the maximum Rain reach. Seepage creates no generated PLY or growing point overlay: nodes/default/profile state serialize in the project and `water_sources.json`, while surface guides, the spatial grid, and GPU buffers are transient and derived after load.
+Auto quality resolves High below 10 million effective point invocations, Balanced from 10 through 50 million, and Low above 50 million; World Surfels count as six invocations per point and an explicit quality remains fixed. Scenario spread expands active reach by up to `1.50x` and width by up to `1.35x`. The pre-indexed maximum also includes Rain expansion, so neither scenario animation nor Rain response rebuilds guides or the spatial grid.
 
-GUI smoke scenarios `seepage-sample-terrestrial` and `seepage-site3-100m` exercise the real Flow-style click picker, canonical surface-guide tracing, Structure Overlay isolation, eight-node GPU upload, parameter-only look/Rain changes, memory bound, and screen-sprite frame overhead. On the checked-in 100,743,210-point fixture, surface-guided M1 Max reference runs resolved Auto to Low, measured 0.33–5.69% median overhead, completed look updates in 0.179–0.196 ms, and used 0.004 MiB of auxiliary Seepage data.
+Two editable project scenarios are seeded. `Pre-Colonisation Wet` uses Chaotic Bloom at full Seepage level with broader spread, wetter coverage, stronger evolution and reflection, and high Rain Response. `Contemporary Managed` uses the same nodes, seeds, noise coordinates, approximately `0.20 m` features, and `225 degrees / 55 degrees` environment direction, but halves the level, narrows spread, lowers damp coverage and glisten, and responds much less to Rain. `Authored Node Looks` restores the normal profile/local-look hierarchy.
+
+Water animation keys use normalized `0...1` positions, so duration, frame-rate, and camera-key edits do not move their timing. Smooth interpolation is the default; Linear interpolates directly and Hold retains the source key. Reflection azimuth follows the shortest arc, endpoint values hold outside the keyed interval, and adding within `0.0001` replaces the existing key. Scenario overrides retain node placement, role filters, seed, authored strength, and enablement. Missing linked scenarios use the track's embedded snapshot with a warning.
+
+Keyed Rain is continuous: zero hides Rain and contributes no Seepage gain, while increasing values reveal a deterministic fraction of a maximum prebuilt trail fixture and scale opacity, width, emission, speed, and the Seepage response. Preparing scenario playback builds that maximum fixture once; scrubbing and playback do not regenerate routes. Export jobs freeze the animation track, linked/fallback scenario, Rain settings, Seepage topology, and base Rain styles at queue time, evaluate the same normalized state for viewport/still/EXR/video samples, and append the scenario name to animation output filenames.
+
+Seepage creates no generated PLY or growing point overlay: nodes/default/profile/scenario state serialize in project data and nodes/looks serialize in `water_sources.json`, while surface guides, the spatial grid, and GPU buffers are transient and derived after load.
+
+GUI smoke scenarios `seepage-sample-terrestrial` and `seepage-site3-100m` exercise the real Flow-style click picker, canonical surface-guide tracing, Structure Overlay isolation, eight-node GPU upload, parameter-only look/Rain changes, memory bound, and screen-sprite frame overhead. On the checked-in 100,743,210-point fixture, the M1 Max reference run for eight default Chaotic Bloom nodes resolved Auto to Low, measured 6.14% median overhead, completed a look update in 0.211 ms, and used 0.007 MiB of auxiliary Seepage data.
 
 ### Future improvement: mesh-assisted surface guides (not implemented)
 
@@ -238,7 +263,7 @@ This requires a new orientation-independent 3D triangle index. The existing `Mes
 
 The mesh would participate only when a node is placed, moved, or given topology-changing geometry. The guide builder would project gravity through connected surface triangles, validate the route against nearby canonical point roles, and reduce the result to the same maximum eight transient guide stations already consumed by the viewport and offline evaluator. Validation should prefer ROCK support, allow VEG where the node enables it, and include SAND only when the node explicitly opts in. A route that disagrees materially with nearby ROCK points, encounters an invalid mesh region, or cannot establish a trustworthy triangle continuation should reject the questionable section or fall back to the current point-supported tracer.
 
-The full mesh must never be queried by each rendered point and must not be uploaded as part of the Seepage shader contract. Only the compact guide stations and existing spatial hash would reach the GPU, so mesh assistance is expected to add no steady-state Seepage shader cost and no display-density-specific point allocation. The conservative current 100M-point Seepage reference overhead is 5.69%; that remains the upper comparison baseline for a mesh-assisted implementation.
+The full mesh must never be queried by each rendered point and must not be uploaded as part of the Seepage shader contract. Only the compact guide stations and existing spatial hash would reach the GPU, so mesh assistance is expected to add no steady-state Seepage shader cost and no display-density-specific point allocation. The current default-Chaotic-Bloom 100M-point Seepage reference overhead is 6.14%; that remains the upper comparison baseline for a mesh-assisted implementation.
 
 The tradeoff is one-time CPU loading/index construction and retained scene-index memory. Site3's current mesh contains approximately 7.05 million vertices and 14.09 million triangles, so the index must use bounded, compact storage, expose its memory use, warm asynchronously without blocking ordinary point-cloud viewing, and be shared rather than duplicated per node. Existing mesh smoke measurements provide useful scale but are not yet Seepage measurements: the recorded cold mesh operation took about 32.75 seconds, while a warm cached move took about 0.34 ms. Any implementation should separately benchmark cold warm-up time, warm node-edit latency, peak/retained CPU memory, guide agreement with ROCK points, fallback frequency, and confirm that the current steady-state GPU overhead does not regress.
 
@@ -249,8 +274,14 @@ Flow is the point-source/emitter path approach for small streams over the site. 
 1. Emitters and source/path settings define bake inputs.
 2. `GenerateWaterPathCache` creates or refreshes `WaterPathCache`; Bake Path may merge unchanged cached branches with newly rebuilt branches for only the dirty emitters.
 3. `BuildWaterPathAnchorsFromCache` rebuilds visible anchors and applies hidden branch IDs.
-4. `BuildFlowStreamOverlayFromPathAnchors` converts path anchors into shared animated trail paths and generates deterministic trail surfels with legacy `stream_*` scalar names.
-5. `BuildWaterStreamOverlayPointCloud` exposes generated trails as in-memory point-cloud sessions grouped by resolved Trail profile.
+4. `BuildFlowTrailOverlayFromPathAnchors` converts path anchors into shared animated trail paths and generates deterministic trail surfels with legacy `stream_*` scalar names.
+5. `BuildWaterTrailOverlayPointCloud` exposes generated trails as in-memory point-cloud sessions grouped by resolved Trail profile.
+
+Manual path sources are a second Flow source type. Add Path Source starts a draft; Ctrl+left-click adds nodes on the visible canonical support surface. The draft and committed route are open centripetal Catmull-Rom splines passing through every control point, with the first point marked as animation start. Save Path requires at least two distinct nodes and calls `BuildManualFlowPathAnchors` to sample the curve deterministically with a stable rotation-minimizing frame. It then runs only the Lane and Trail stages above: it does not call `GenerateWaterPathCache`, seed Field, or participate in Mesh Flow. Cancel discards the draft without changing the committed source or its derived trail output.
+
+During editing, click a node to select it. Red, green, and blue arrows constrain movement to world X, Y, and Z; the XY/XZ/YZ squares constrain movement to those world planes; dragging the center uses a camera-facing plane fixed at drag start. Delete or Backspace removes the selected node while the viewport has keyboard focus. Double-clicking near the spline inserts a node into the clicked control segment. Spline/node/gizmo hits take editor priority, while empty-space drag keeps ordinary orbit/pan/zoom and double-click away from the spline keeps camera-pivot behavior. Outside editing, the authored guide is shown only for the selected source or in Path View and may be hidden together with point-source markers using Show Source Nodes / Paths. The active draft and gizmo remain visible while editing.
+
+Point and manual sources share the persistent source-ID namespace and may use different Lane and Trail profiles. Manual anchors stay separate from `WaterPathCache` and generated-path analysis; stale generated caches therefore cannot affect manual lane frames. Lane assignment proceeds deterministically from the centre outward, so profiles with enough trails populate every requested lane even without generated-path analysis. Generated point-source anchors use the same centripetal Catmull-Rom presentation interpolation after their profile smoothing pass, reducing angular path and trail segments without changing cached raw branches. Saving a manual edit refreshes trails in memory, while Bake Path continues to rebuild only point-source branches. After project or standalone-source load, valid manual routes regenerate their trail overlays once canonical support is available, including manual-only projects.
 
 Path-affecting changes dirty the path cache. Source movement, source insertion, and source deletion are tracked by emitter ID, so the next Bake Path rebuilds only the changed sources when the existing support signature still matches. Global Path profile edits, support setting changes, and attractor edits dirty all current source paths because they can change every route. Lane changes such as trail count, lane count, coverage width, crossing, turbulence, and speed refresh from existing anchors without dirtying the path cache. Trail geometry changes regenerate generated trail samples when needed; Trail colour, opacity, and emission are owned by Water > Flow, not the Visuals tab.
 
@@ -405,12 +436,12 @@ Cache metadata should include source layer signature, point count, bounds, norma
 Use these checks after water feature changes:
 
 - Sample scene: when `Data/SampleScene` exists, discovery validates the local ROCK/SAND/VEG sample files, inferred spacing, scalar fields, and grouping.
-- Serialization: schema-34 saves include authoritative scene density groups plus Seepage/Ripple/Flow/Mesh Flow/Field/Rain state, keep SAND Shoreline settings in point-cloud style data, and omit Basin/Runoff/Caustic region keys.
+- Serialization: schema-37 saves include authoritative scene density groups plus manual Flow path, Seepage/Ripple/Flow/Mesh Flow/Field/Rain state, keep both SAND Shoreline tuning banks in point-cloud style data, and omit Basin/Runoff/Caustic region keys.
 - Project ownership: water emitters/sources load from the active project only; new projects are allowed to have none.
 - Cache reload: saved Flow path caches and baked anchors reload only when support/settings signatures match; branch bake fingerprints permit per-source reuse when only a subset of emitters changed.
 - Density switch: 1/2/3/5 mm display changes leave analysis support signatures and path/field/trail caches unchanged; Ripple memberships stay within the exact committed display cloud, Seepage rebuilds compact per-role grids from world-space nodes, and Field presentation data is spatially remapped.
 - Legacy load: old Caustic regions become Ripple `Caustic Lace`; old Basin/Runoff records are ignored.
-- Flow: source-specific edits rebuild only changed source branches where possible; global Path settings and attractor edits dirty `WaterPathCache`; Lane and Trail refreshes preserve Trail profile/style state.
+- Flow: source-specific point edits rebuild only changed source branches where possible; global Path settings and attractor edits dirty `WaterPathCache`; manual sources bypass that cache and refresh on Save; Lane and Trail refreshes preserve Trail profile/style state.
 - Seepage: placement/movement and fan or role edits rebuild topology; quality/look/rain edits update compact node parameters when topology is unchanged; hash references remain bounded.
 - Stream schema: generated stream scalar fields match the exact order above.
 - Rendering: `waterStreamOverlay` styles compile and render tangent-aligned surfels.

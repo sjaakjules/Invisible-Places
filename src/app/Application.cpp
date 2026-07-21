@@ -22840,20 +22840,25 @@ void ProcessOfflineRenderJobStep(
     }
 }
 
-void DrawExportTimingSummary(const OfflineRenderJobState& job) {
-    if (job.frameSampleState.active) {
+void DrawExportTimingSummary(const OfflineRenderJobState& job, bool stableLayout = false) {
+    if (job.frameSampleState.active || stableLayout) {
         ImGui::Text(
             "Current frame samples: %zu / %zu",
-            std::min(ExportCompletedSamplePassCount(job), ExportTotalSamplePassCount(job)),
-            ExportTotalSamplePassCount(job));
+            job.frameSampleState.active
+                ? std::min(ExportCompletedSamplePassCount(job), ExportTotalSamplePassCount(job))
+                : std::size_t{0U},
+            job.frameSampleState.active ? ExportTotalSamplePassCount(job) : std::size_t{0U});
         if (job.frameSampleState.gpuSampleInFlight) {
             const auto inFlightDuration =
                 std::chrono::steady_clock::now() - job.frameSampleState.gpuSampleSubmittedAt;
             ImGui::TextDisabled(
                 "GPU sample in flight: %s",
                 FormatAdaptiveDuration(inFlightDuration).c_str());
+        } else if (stableLayout) {
+            ImGui::TextDisabled("GPU sample in flight: none");
         }
-        if (job.frameSampleState.lastGpuSampleDuration > std::chrono::steady_clock::duration{}) {
+        if (!stableLayout &&
+            job.frameSampleState.lastGpuSampleDuration > std::chrono::steady_clock::duration{}) {
             ImGui::Text(
                 "Last sample: GPU %s, readback %s, post %s",
                 FormatAdaptiveDuration(job.frameSampleState.lastGpuSampleDuration).c_str(),
@@ -22871,8 +22876,12 @@ void DrawExportTimingSummary(const OfflineRenderJobState& job) {
         const char* label,
         std::chrono::steady_clock::duration total,
         std::chrono::steady_clock::duration maxDuration,
-        std::uint32_t count) {
+        std::uint32_t count,
+        bool reserveLine) {
         if (count == 0U) {
+            if (reserveLine) {
+                ImGui::TextDisabled("%s avg/max: 0 sec / 0 sec", label);
+            }
             return;
         }
         const auto averageDuration = total / count;
@@ -22886,17 +22895,20 @@ void DrawExportTimingSummary(const OfflineRenderJobState& job) {
         "GPU sample",
         job.exportLog.gpuSampleTotal,
         job.exportLog.gpuSampleMax,
-        job.exportLog.gpuSampleCount);
+        job.exportLog.gpuSampleCount,
+        stableLayout);
     drawTimingBucket(
         "Readback",
         job.exportLog.readbackTotal,
         job.exportLog.readbackMax,
-        job.exportLog.readbackCount);
+        job.exportLog.readbackCount,
+        stableLayout);
     drawTimingBucket(
         "Post-process",
         job.exportLog.postProcessTotal,
         job.exportLog.postProcessMax,
-        job.exportLog.postProcessCount);
+        job.exportLog.postProcessCount,
+        stableLayout);
     if (job.writerState != nullptr) {
         std::size_t queueDepth = 0;
         {
@@ -22904,17 +22916,21 @@ void DrawExportTimingSummary(const OfflineRenderJobState& job) {
             queueDepth = job.writerState->pendingFrames.size();
         }
         ImGui::Text("Writer queue: %zu frame%s", queueDepth, queueDepth == 1U ? "" : "s");
+    } else if (stableLayout) {
+        ImGui::TextDisabled("Writer queue: 0 frames");
     }
     if (job.writerWaitActive) {
         ImGui::TextDisabled(
-            "Writer wait active: %s",
+            "Writer wait: active %s",
             FormatAdaptiveDuration(std::chrono::steady_clock::now() - job.writerWaitStartedAt).c_str());
     } else if (job.exportLog.writerWaitCount > 0U) {
         ImGui::Text(
-            "Writer wait total/max: %s / %s (%u events)",
+            "Writer wait: %s / %s (%u events)",
             FormatAdaptiveDuration(job.exportLog.writerWaitTotal).c_str(),
             FormatAdaptiveDuration(job.exportLog.writerWaitMax).c_str(),
             job.exportLog.writerWaitCount);
+    } else if (stableLayout) {
+        ImGui::TextDisabled("Writer wait: idle");
     }
     const auto remaining = RemainingExportRenderDuration(job);
     if (remaining.has_value()) {
@@ -22922,6 +22938,8 @@ void DrawExportTimingSummary(const OfflineRenderJobState& job) {
             "ETA: %s remaining (~%s)",
             FormatAdaptiveDuration(remaining.value()).c_str(),
             FormatEtaClock(remaining.value()).c_str());
+    } else if (stableLayout) {
+        ImGui::TextDisabled("ETA: calculating...");
     }
 }
 
@@ -23514,11 +23532,14 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     auto& job = runtimeState->offlineRenderJob;
     RefreshAnimationExportWriterProgress(&job);
     const auto& io = ImGui::GetIO();
+    constexpr float kExportProgressWindowWidth = 560.0F;
     constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse;
     ImGui::SetNextWindowPos(
-        ImVec2{std::max(20.0F, io.DisplaySize.x - 420.0F), 24.0F},
+        ImVec2{std::max(20.0F, io.DisplaySize.x - kExportProgressWindowWidth - 24.0F), 24.0F},
         ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2{340.0F, 0.0F}, ImVec2{520.0F, FLT_MAX});
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2{kExportProgressWindowWidth, 0.0F},
+        ImVec2{kExportProgressWindowWidth, FLT_MAX});
     ImGui::Begin("Export Progress", nullptr, flags);
 
     ImGui::TextUnformatted(OfflineRenderJobOverlayLabel(job));
@@ -23544,14 +23565,14 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
                                           ? 0.0F
                                           : static_cast<float>(completedRequests) /
                                                 static_cast<float>(totalRequests);
-        ImGui::ProgressBar(prepareProgress, ImVec2{360.0F, 0.0F});
+        ImGui::ProgressBar(prepareProgress, ImVec2{-FLT_MIN, 0.0F});
         ImGui::Text("Preparing samples: %zu / %zu", completedRequests, totalRequests);
         if (!currentLayerName.empty()) {
             ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
         }
     } else {
         const float frameProgress = ExportRenderProgressFraction(job);
-        ImGui::ProgressBar(frameProgress, ImVec2{360.0F, 0.0F});
+        ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
         ImGui::Text(
             "Captured: %u / %zu",
             std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
@@ -23561,7 +23582,7 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
             std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
             job.frames.size());
         ImGui::Text("Queued: %zu", job.pendingFrameCount);
-        DrawExportTimingSummary(job);
+        DrawExportTimingSummary(job, true);
     }
     if (job.exportFrustumMask) {
         ImGui::TextUnformatted("Renderer: GPU frustum mask, full visible density");
@@ -23579,24 +23600,45 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     ImGui::Text(
         "Elapsed: %s",
         FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
-    std::string outputPathLabel;
+
+    auto sameExportPath = [](const std::filesystem::path& left, const std::filesystem::path& right) {
+        return !left.empty() &&
+               !right.empty() &&
+               NormalizePathKey(left) == NormalizePathKey(right);
+    };
+    auto drawPathRow = [](const char* label, const std::filesystem::path& path) {
+        if (path.empty()) {
+            return;
+        }
+        ImGui::TextWrapped("%s: %s", label, path.string().c_str());
+    };
+
+    std::filesystem::path outputPath;
     if (AnimationExportWritesVideo(job.mode)) {
-        outputPathLabel = job.videoOutputPath.string();
+        outputPath = job.videoOutputPath;
     } else if (job.writePngStack) {
-        outputPathLabel = job.pngStackDirectory.string();
+        outputPath = job.pngStackDirectory;
     } else {
-        outputPathLabel = job.settings.outputDirectory;
+        outputPath = std::filesystem::path{job.settings.outputDirectory};
     }
-    ImGui::TextWrapped("Output: %s", outputPathLabel.c_str());
-    if ((job.writePreviewMp4 || job.writeProResMov) && !job.videoOutputPath.empty()) {
-        ImGui::TextWrapped("%s: %s", AnimationExportModeLabel(job.mode), job.videoOutputPath.string().c_str());
+    ImGui::Separator();
+    drawPathRow("Output", outputPath);
+    if ((job.writePreviewMp4 || job.writeProResMov) &&
+        !job.videoOutputPath.empty() &&
+        !sameExportPath(job.videoOutputPath, outputPath)) {
+        drawPathRow(AnimationExportModeLabel(job.mode), job.videoOutputPath);
     } else if (job.writePngStack && !job.pngStackDirectory.empty()) {
-        ImGui::TextWrapped("PNG Stack: %s", job.pngStackDirectory.string().c_str());
+        if (!sameExportPath(job.pngStackDirectory, outputPath)) {
+            drawPathRow("PNG Stack", job.pngStackDirectory);
+        }
     } else if (!job.previewVideoWarning.empty()) {
         ImGui::TextWrapped("%s", job.previewVideoWarning.c_str());
     }
-    if (!job.lastOutputPath.empty()) {
-        ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
+    if (!job.lastOutputPath.empty() &&
+        !sameExportPath(job.lastOutputPath, outputPath) &&
+        !sameExportPath(job.lastOutputPath, job.videoOutputPath) &&
+        !sameExportPath(job.lastOutputPath, job.pngStackDirectory)) {
+        drawPathRow("Last", job.lastOutputPath);
     }
     if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
         RequestOfflineRenderCancellation(&job);
