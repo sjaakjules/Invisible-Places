@@ -9774,10 +9774,16 @@ bool RainRoleIsVegetation(std::string_view role) {
            role == "VEGETATION" || role == "vegetation" || role == "Vegetation";
 }
 
+bool RainRoleIsRock(std::string_view role) {
+    return role == "ROCK" || role == "rock" || role == "Rock" ||
+           role == "ROCKS" || role == "rocks" || role == "Rocks";
+}
+
 enum class RainSupportRoleQuery {
     Any,
     Sand,
     Vegetation,
+    Rock,
     NonVegetation
 };
 
@@ -9789,6 +9795,8 @@ bool RainSupportSampleMatchesRole(const RainSupportSample& sample, RainSupportRo
             return RainRoleIsSand(sample.role);
         case RainSupportRoleQuery::Vegetation:
             return RainRoleIsVegetation(sample.role);
+        case RainSupportRoleQuery::Rock:
+            return RainRoleIsRock(sample.role);
         case RainSupportRoleQuery::NonVegetation:
             return !RainRoleIsVegetation(sample.role);
     }
@@ -10120,6 +10128,69 @@ bool RainMeshProjectionHasVegetation(
         position.z + verticalTolerance,
         position.z - verticalTolerance);
     return vegetationIndex.has_value();
+}
+
+float RainMeshVegetationRunoffRoughness(
+    const RainSupportIndex& support,
+    const MeshSurfaceCache& meshSurface,
+    const MeshSurfaceProjection& projection,
+    const WaterRainSettings& settings) {
+    if (!projection.hit || support.samples.empty()) {
+        return 0.0F;
+    }
+    const glm::vec3 position = ToGlm(projection.position);
+    const glm::vec2 xy{position.x, position.y};
+    const float cellSize = RainMeshCellSize(meshSurface);
+    const float roleRadius = RainMeshRoleRadius(meshSurface, settings);
+    const float rockRadius = std::max({
+        roleRadius * 1.20F,
+        cellSize * 4.0F,
+        0.045F});
+    const float rockVerticalTolerance = std::max({
+        0.070F,
+        rockRadius * 1.15F,
+        cellSize * 3.0F});
+    const auto rockIndex = FindRainSupportRoleSample(
+        support,
+        xy,
+        rockRadius,
+        RainSupportRoleQuery::Rock,
+        false,
+        position.z + rockVerticalTolerance,
+        position.z - rockVerticalTolerance);
+    if (rockIndex.has_value()) {
+        return 0.0F;
+    }
+
+    // Add lateral variation only below vegetation on otherwise smooth support;
+    // measured ROCK detail remains the authoritative runoff surface.
+    const float vegetationRadius = std::max({
+        settings.surfaceSearchRadiusMeters * 2.4F,
+        cellSize * 6.0F,
+        0.16F});
+    const float vegetationCeiling = position.z + std::max(0.70F, settings.spawnHeightMeters * 2.4F);
+    const float vegetationFloor = position.z + std::max(0.018F, cellSize * 0.75F);
+    const auto vegetationIndex = FindRainSupportRoleSample(
+        support,
+        xy,
+        vegetationRadius,
+        RainSupportRoleQuery::Vegetation,
+        false,
+        vegetationCeiling,
+        vegetationFloor);
+    if (!vegetationIndex.has_value() || vegetationIndex.value() >= support.samples.size()) {
+        return 0.0F;
+    }
+
+    const auto& vegetation = support.samples[vegetationIndex.value()];
+    const glm::vec2 delta{vegetation.position.x - position.x, vegetation.position.y - position.y};
+    const float horizontalDistance = std::sqrt(glm::dot(delta, delta));
+    const float horizontalWeight =
+        1.0F - SmoothStep(vegetationRadius * 0.35F, vegetationRadius, horizontalDistance);
+    const float verticalGap = std::max(0.0F, vegetation.position.z - position.z);
+    const float verticalWeight =
+        0.35F + (1.0F - SmoothStep(0.25F, std::max(0.75F, settings.spawnHeightMeters * 2.0F), verticalGap)) * 0.65F;
+    return Clamp01(0.18F + horizontalWeight * verticalWeight * 0.82F);
 }
 
 std::vector<std::uint32_t> FindRainVegetationInterruptions(
@@ -10852,7 +10923,7 @@ std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
                 ++(*vegetationDripCount);
             }
         }
-        if (vegetationIntercepted) {
+        if (vegetationIntercepted && !settings.surfaceRunoffEnabled) {
             return route;
         }
     }
@@ -10904,6 +10975,38 @@ std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
             force = force * 0.72F + sandDirection.value() * 0.46F;
         }
         force = RainProjectedSurfaceDirection(force, normal, velocity);
+        float localStepMeters = stepMeters;
+        const float vegetationRoughness =
+            currentSand ? 0.0F : RainMeshVegetationRunoffRoughness(support, meshSurface, projected, settings);
+        if (vegetationRoughness > 0.001F) {
+            glm::vec3 side = glm::cross(normal, force);
+            if (glm::dot(side, side) <= kNormalEpsilon) {
+                side = windDirection - normal * glm::dot(windDirection, normal);
+            }
+            if (glm::dot(side, side) <= kNormalEpsilon) {
+                side = glm::cross(normal, glm::vec3{0.0F, 0.0F, 1.0F});
+            }
+            if (glm::dot(side, side) > kNormalEpsilon) {
+                side = glm::normalize(side);
+                const auto routeIndex = static_cast<std::uint32_t>(route.size());
+                const float seedA = RegionHash01(settings.seed + dropIndex, routeIndex, 9271U);
+                const float seedB = RegionHash01(settings.seed + dropIndex, routeIndex, 9283U);
+                const float seedC = RegionHash01(settings.seed + dropIndex, routeIndex, 9293U);
+                const float broadWave =
+                    std::sin(position.x * 9.31F + position.y * 6.17F + seedB * 6.28318530718F);
+                const float fineWave =
+                    std::sin(position.x * -15.47F + position.y * 11.83F + seedC * 6.28318530718F);
+                const float wobble = std::clamp(
+                    (seedA - 0.5F) * 1.10F + broadWave * 0.46F + fineWave * 0.22F,
+                    -1.0F,
+                    1.0F);
+                force = RainProjectedSurfaceDirection(
+                    force + side * (wobble * vegetationRoughness * 1.15F),
+                    normal,
+                    velocity);
+                localStepMeters *= std::lerp(1.0F, 0.62F + seedB * 0.20F, vegetationRoughness);
+            }
+        }
         const auto step = FindRainMeshRunoffStep(
             meshSurface,
             position,
@@ -10911,7 +11014,7 @@ std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
             force,
             velocity,
             windDirection,
-            stepMeters,
+            localStepMeters,
             cellSize);
         if (!step.hit) {
             if (currentSand && sandTravelDistance < sandRunTarget) {
@@ -11121,7 +11224,10 @@ WaterTrailOverlay BuildRainTrailOverlay(
             ++localDiagnostics.noSupportKillCount;
         }
         const bool vegetationStoppedBeforeMesh =
-            hasMeshHit && settings.vegetationInterceptionEnabled && vegetationDripCount > 0U;
+            hasMeshHit &&
+            settings.vegetationInterceptionEnabled &&
+            !settings.surfaceRunoffEnabled &&
+            vegetationDripCount > 0U;
         if (hasMeshHit && !vegetationStoppedBeforeMesh) {
             ++localDiagnostics.meshSurfaceHitCount;
         }

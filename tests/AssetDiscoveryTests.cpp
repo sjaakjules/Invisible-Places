@@ -4767,9 +4767,42 @@ TEST_CASE("Water Rain mesh routing toggles vegetation interception and surface r
         return anchors;
     };
 
-    SECTION("vegetation interception stops drops before the mesh") {
+    SECTION("vegetation interception drips through to the mesh when runoff is enabled") {
         settings.vegetationInterceptionEnabled = true;
         settings.surfaceRunoffEnabled = true;
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto anchors = buildAnchors(settings, &diagnostics);
+        CHECK(diagnostics.emittedDropCount == 1U);
+        CHECK(diagnostics.firstSupportHitCount == 1U);
+        CHECK(diagnostics.meshSurfaceHitCount == 1U);
+        CHECK(diagnostics.vegetationDripCount >= 1U);
+        CHECK(diagnostics.impactTerminationCount == 0U);
+        CHECK(diagnostics.sandTerminationCount == 1U);
+        CHECK(diagnostics.noSupportKillCount == 0U);
+        REQUIRE(anchors.size() >= 6U);
+
+        const bool vegetationInterruptedFall = std::any_of(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) {
+                return sample.position.z > 0.95F && std::abs(sample.normal.x) < 0.05F;
+            });
+        CHECK(vegetationInterruptedFall);
+        const auto firstMeshAnchor = std::find_if(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) {
+                return sample.position.z < 0.70F && sample.normal.x > 0.15F;
+            });
+        REQUIRE(firstMeshAnchor != anchors.end());
+        CHECK(firstMeshAnchor->position.z < 0.80F);
+        CHECK(anchors.back().position.x > 0.36F);
+        CHECK(anchors.back().position.z < firstMeshAnchor->position.z);
+    }
+
+    SECTION("vegetation interception still stops drops when runoff is disabled") {
+        settings.vegetationInterceptionEnabled = true;
+        settings.surfaceRunoffEnabled = false;
         invisible_places::water::WaterRainDiagnostics diagnostics;
         const auto anchors = buildAnchors(settings, &diagnostics);
         CHECK(diagnostics.emittedDropCount == 1U);
@@ -4781,13 +4814,6 @@ TEST_CASE("Water Rain mesh routing toggles vegetation interception and surface r
         CHECK(diagnostics.noSupportKillCount == 0U);
         REQUIRE(anchors.size() >= 3U);
 
-        const bool vegetationInterruptedFall = std::any_of(
-            anchors.begin(),
-            anchors.end(),
-            [](const invisible_places::water::WaterTrailSample& sample) {
-                return sample.position.z > 0.95F && std::abs(sample.normal.x) < 0.05F;
-            });
-        CHECK(vegetationInterruptedFall);
         CHECK(anchors.back().position.z > 0.90F);
         CHECK(std::none_of(
             anchors.begin(),
@@ -4862,6 +4888,131 @@ TEST_CASE("Water Rain mesh routing toggles vegetation interception and surface r
             anchors.back().position.z ==
             Catch::Approx(heightAt(anchors.back().position.x, anchors.back().position.y)).margin(0.07F));
     }
+}
+
+TEST_CASE("Water Rain mesh runoff roughens smooth vegetation floors without disturbing rock detail", "[water][rain][mesh]") {
+    const auto meshPath = std::filesystem::temp_directory_path() / "invisible_places_rain_veg_roughness_mesh.ply";
+    const auto heightAt = [](float x, float) {
+        return 0.56F - x * 0.18F;
+    };
+    const std::vector<invisible_places::io::Float3> vertices{
+        {-0.20F, -0.35F, heightAt(-0.20F, -0.35F)},
+        {0.95F, -0.35F, heightAt(0.95F, -0.35F)},
+        {0.95F, 0.35F, heightAt(0.95F, 0.35F)},
+        {-0.20F, 0.35F, heightAt(-0.20F, 0.35F)},
+    };
+    WriteSyntheticTriangleMeshPly(meshPath, vertices, {{0U, 1U, 2U}, {0U, 2U, 3U}});
+    const auto loaded = invisible_places::io::LoadTriangleMesh(meshPath);
+    REQUIRE(loaded.success);
+
+    auto meshSettings = invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
+    meshSettings.cacheCellSizeMeters = 0.02F;
+    meshSettings.projectionSearchRadiusMeters = 0.08F;
+    meshSettings.ambiguityHeightMeters = 0.05F;
+    const auto cache = invisible_places::water::BuildMeshSurfaceCache(loaded.mesh, meshSettings);
+    REQUIRE_FALSE(cache.cells.empty());
+
+    const std::array<invisible_places::io::Float3, 7> vegetationPoints{
+        invisible_places::io::Float3{0.00F, 0.0F, heightAt(0.00F, 0.0F) + 0.82F},
+        invisible_places::io::Float3{0.09F, 0.0F, heightAt(0.09F, 0.0F) + 0.82F},
+        invisible_places::io::Float3{0.18F, 0.0F, heightAt(0.18F, 0.0F) + 0.82F},
+        invisible_places::io::Float3{0.27F, 0.0F, heightAt(0.27F, 0.0F) + 0.82F},
+        invisible_places::io::Float3{0.36F, 0.0F, heightAt(0.36F, 0.0F) + 0.82F},
+        invisible_places::io::Float3{0.45F, 0.0F, heightAt(0.45F, 0.0F) + 0.82F},
+        invisible_places::io::Float3{0.54F, 0.0F, heightAt(0.54F, 0.0F) + 0.82F},
+    };
+    const std::array<invisible_places::io::Float3, 7> rockPoints{
+        invisible_places::io::Float3{0.00F, 0.0F, heightAt(0.00F, 0.0F)},
+        invisible_places::io::Float3{0.09F, 0.0F, heightAt(0.09F, 0.0F)},
+        invisible_places::io::Float3{0.18F, 0.0F, heightAt(0.18F, 0.0F)},
+        invisible_places::io::Float3{0.27F, 0.0F, heightAt(0.27F, 0.0F)},
+        invisible_places::io::Float3{0.36F, 0.0F, heightAt(0.36F, 0.0F)},
+        invisible_places::io::Float3{0.45F, 0.0F, heightAt(0.45F, 0.0F)},
+        invisible_places::io::Float3{0.54F, 0.0F, heightAt(0.54F, 0.0F)},
+    };
+    const auto vegetation = MakeRainSupportLineCloud("rain-veg-roughness-veg", vegetationPoints);
+    const auto rock = MakeRainSupportLineCloud("rain-veg-roughness-rock", rockPoints);
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 1> vegetationLayers{
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &vegetation,
+            .role = "VEG",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+    };
+    const std::array<invisible_places::water::WaterSceneSupportLayer, 2> rockLayers{
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &vegetation,
+            .role = "VEG",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+        invisible_places::water::WaterSceneSupportLayer{
+            .cloud = &rock,
+            .role = "ROCK",
+            .pointSpacingMeters = 0.02F,
+            .samplingMultiplier = 1.0F},
+    };
+
+    auto frame = MakeRainFixtureCameraFrame();
+    frame.position = {0.0F, -0.82F, 0.98F};
+    frame.target = {0.0F, 0.0F, heightAt(0.0F, 0.0F)};
+    frame.fovDegrees = 5.0F;
+    auto settings = MakeRainFixtureSettings(1U);
+    settings.spawnHeightMeters = 0.85F;
+    settings.spawnRadiusMeters = 0.01F;
+    settings.spawnOutOfFrameMargin = 0.0F;
+    settings.surfaceSearchRadiusMeters = 0.07F;
+    settings.downhillSearchRadiusMeters = 0.22F;
+    settings.killBelowSceneMeters = 0.50F;
+    settings.windStrengthMeters = 0.0F;
+    settings.windNoise = 0.0F;
+    settings.windResponse = 0.0F;
+    settings.vegetationInterceptionEnabled = false;
+    settings.surfaceRunoffEnabled = true;
+    settings.sandRunDistanceMeters = 0.0F;
+    settings.routeAnchorCount = 18U;
+    settings.seed = 53U;
+
+    auto collectSurfaceAnchors = [&](std::span<const invisible_places::water::WaterSceneSupportLayer> layers) {
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto overlay = invisible_places::water::BuildRainTrailOverlay(
+            layers,
+            &cache,
+            frame,
+            settings,
+            &diagnostics);
+        REQUIRE_FALSE(overlay.samples.empty());
+        CHECK(diagnostics.meshSurfaceHitCount == 1U);
+
+        std::vector<invisible_places::water::WaterTrailSample> anchors;
+        for (const auto& sample : overlay.samples) {
+            if (sample.trailRole < 0.5F &&
+                sample.pathId == Catch::Approx(1.0F) &&
+                sample.normal.x > 0.08F) {
+                anchors.push_back(sample);
+            }
+        }
+        REQUIRE(anchors.size() >= 6U);
+        return anchors;
+    };
+    auto lateralRange = [](const std::vector<invisible_places::water::WaterTrailSample>& anchors) {
+        auto minmax = std::minmax_element(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& left,
+               const invisible_places::water::WaterTrailSample& right) {
+                return left.position.y < right.position.y;
+            });
+        return minmax.second->position.y - minmax.first->position.y;
+    };
+
+    const auto vegetationAnchors = collectSurfaceAnchors(vegetationLayers);
+    const auto rockAnchors = collectSurfaceAnchors(rockLayers);
+    const float vegetationRange = lateralRange(vegetationAnchors);
+    const float rockRange = lateralRange(rockAnchors);
+
+    CHECK(vegetationRange > 0.015F);
+    CHECK(rockRange < vegetationRange * 0.45F);
+    CHECK(rockRange < 0.010F);
 }
 
 TEST_CASE("Water Rain splash emits short rock-only droplets", "[water][rain][mesh][splash]") {
