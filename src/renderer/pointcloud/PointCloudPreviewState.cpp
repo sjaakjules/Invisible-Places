@@ -715,7 +715,7 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
          style.emissiveStrength.constantValue[0] <= kMaterialEpsilon);
     const bool noColorize = style.colorizeAmount <= kMaterialEpsilon;
 
-    if (style.flowAnimation || style.waterTrailOverlay) {
+    if (style.flowAnimation || style.waterTrailOverlay || style.rainImpactEffects) {
         return PointCloudMaterialVariant::Unified;
     }
 

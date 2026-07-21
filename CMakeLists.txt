@@ -61,6 +61,9 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
     shaders/dynamic_mesh_flow.comp
+    shaders/rain_simulation.comp
+    shaders/rain_particle.vert
+    shaders/rain_particle.frag
     shaders/gsplat_accumulation.vert
     shaders/gsplat_accumulation.frag
     shaders/gsplat_high_quality.vert
@@ -75,6 +78,7 @@ set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_caustics.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_rain_impact.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
 )
 
@@ -139,6 +143,7 @@ add_library(
     src/scene/SceneCatalog.cpp
     src/serialization/ProjectDocument.cpp
     src/style/RenderParameterBinding.cpp
+    src/water/RainSimulation.cpp
     src/water/WaterFlow.cpp
 )
 
@@ -223,6 +228,8 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/PointCloudDensityCompensationTests.cpp
             tests/PointCloudVariantsTests.cpp
             tests/ProjectDocumentSerializationTests.cpp
+            tests/RainOfflineRendererTests.cpp
+            tests/RainSimulationTests.cpp
             tests/RenderParameterBindingTests.cpp
             tests/SeepageOfflineRendererTests.cpp
             tests/SeepageSerializationTests.cpp

@@ -501,4 +501,97 @@ PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath) {
     return {.cloud = std::move(cloud), .success = true};
 }
 
+PointCloudStreamResult StreamPointCloudPositionsNormals(
+    const std::filesystem::path& filePath,
+    const PointCloudPositionNormalVisitor& visitor) {
+    const auto headerResult = ParsePlyHeader(filePath);
+    if (!headerResult.success) {
+        return {.errorMessage = headerResult.errorMessage};
+    }
+
+    const auto& header = headerResult.header;
+    if (header.format != "binary_little_endian") {
+        return {.errorMessage = "Only binary_little_endian PLY point clouds are supported."};
+    }
+
+    std::string layoutError;
+    const auto layout = BuildPointCloudLayout(header, &layoutError);
+    if (!layout.has_value()) {
+        return {.errorMessage = layoutError};
+    }
+
+    std::ifstream input{filePath, std::ios::binary};
+    if (!input.is_open()) {
+        return {.errorMessage = "Unable to open point cloud file."};
+    }
+
+    input.seekg(static_cast<std::streamoff>(header.dataOffsetBytes), std::ios::beg);
+    if (!input.good()) {
+        return {.errorMessage = "Failed to seek to PLY payload."};
+    }
+
+    PointCloudStreamResult result;
+    result.hasNormals = layout->hasNormals;
+    const auto pointsPerChunk = RecommendedPointsPerChunk(layout->recordSize);
+    std::vector<std::byte> chunkBuffer(pointsPerChunk * layout->recordSize);
+
+    for (std::uint64_t pointStart = 0; pointStart < header.vertexCount; pointStart += pointsPerChunk) {
+        const auto remaining = header.vertexCount - pointStart;
+        const auto pointsThisChunk = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, pointsPerChunk));
+        const auto bytesToRead = pointsThisChunk * layout->recordSize;
+
+        input.read(reinterpret_cast<char*>(chunkBuffer.data()), static_cast<std::streamsize>(bytesToRead));
+        if (input.gcount() != static_cast<std::streamsize>(bytesToRead)) {
+            result.errorMessage = "Unexpected EOF while reading point cloud payload.";
+            return result;
+        }
+
+        for (std::size_t localIndex = 0; localIndex < pointsThisChunk; ++localIndex) {
+            const auto globalIndex = pointStart + static_cast<std::uint64_t>(localIndex);
+            const auto* recordBytes = chunkBuffer.data() + (localIndex * layout->recordSize);
+            PointCloudPositionNormalSample sample;
+            sample.hasNormal = layout->hasNormals;
+
+            for (const auto& property : layout->properties) {
+                const auto* propertyBytes = recordBytes + property.offset;
+                switch (property.semantic) {
+                    case PropertySemantic::PositionX:
+                        sample.position.x = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::PositionY:
+                        sample.position.y = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::PositionZ:
+                        sample.position.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::NormalX:
+                        sample.normal.x = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::NormalY:
+                        sample.normal.y = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::NormalZ:
+                        sample.normal.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            if (sample.hasNormal) {
+                sample.normal = NormalizeNormal(sample.normal);
+            }
+            result.bounds.Expand(sample.position);
+            ++result.pointCount;
+            if (visitor && !visitor(sample, globalIndex)) {
+                result.cancelled = true;
+                return result;
+            }
+        }
+    }
+
+    result.success = true;
+    return result;
+}
+
 }  // namespace invisible_places::io

@@ -42,23 +42,14 @@ constexpr std::size_t kWaterTrailRouteCountFieldSlot = 10U;
 constexpr std::size_t kWaterTrailRouteLengthFieldSlot = 11U;
 constexpr std::size_t kWaterTrailStartPhaseFieldSlot = 12U;
 constexpr std::size_t kWaterTrailLateralOffsetFieldSlot = 13U;
-constexpr std::size_t kWaterTrailPointAgeFieldSlot = 14U;
 constexpr std::size_t kWaterTrailAgeFieldSlot = 15U;
 constexpr std::size_t kWaterTrailSpeedFieldSlot = 16U;
 constexpr std::size_t kWaterTrailWidthFieldSlot = 17U;
 constexpr std::size_t kWaterTrailStreakLengthFieldSlot = 18U;
-constexpr std::size_t kWaterTrailFeatureTypeFieldSlot = 21U;
 constexpr std::size_t kWaterTrailTangentXFieldSlot = 22U;
 constexpr std::size_t kWaterTrailTangentYFieldSlot = 23U;
 constexpr std::size_t kWaterTrailTangentZFieldSlot = 24U;
-constexpr std::size_t kWaterTrailLaneIndexFieldSlot = 25U;
-constexpr std::size_t kWaterTrailLaneCountFieldSlot = 26U;
-constexpr std::size_t kWaterTrailLanePitchFieldSlot = 27U;
-constexpr std::size_t kWaterTrailLaneSpanFieldSlot = 28U;
-constexpr std::size_t kWaterTrailLaneCrossingFieldSlot = 29U;
-constexpr std::size_t kWaterTrailCrossSeedFieldSlot = 30U;
 constexpr float kWaterParticleSpeedScale = 0.12F;
-constexpr float kWaterTrailFeatureTypeRain = 4.0F;
 constexpr float kPointCloudAntialiasFeatherPixels = 1.0F;
 
 float Clamp01(float value) {
@@ -69,6 +60,10 @@ float SmoothStep(float edge0, float edge1, float value);
 glm::vec3 SurfaceMotionNoiseVector(const glm::vec3& position, float time);
 
 glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
+    return {value.x, value.y, value.z};
+}
+
+invisible_places::io::Float3 FromGlm(const glm::vec3& value) {
     return {value.x, value.y, value.z};
 }
 
@@ -469,30 +464,6 @@ float WaterTrailTravelPhase(
     return trailStartPhase + trailDistance / routeLength;
 }
 
-bool WaterTrailIsRain(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    std::size_t pointIndex) {
-    if (cloud.scalarFields.size() <= kWaterTrailFeatureTypeFieldSlot) {
-        return false;
-    }
-    const float featureType = ScalarFieldValueBySlot(cloud, kWaterTrailFeatureTypeFieldSlot, pointIndex);
-    return featureType > kWaterTrailFeatureTypeRain - 0.5F &&
-           featureType < kWaterTrailFeatureTypeRain + 0.5F;
-}
-
-float WaterRainGeometryScale(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    std::size_t pointIndex,
-    std::size_t fieldSlot) {
-    if (!WaterTrailIsRain(cloud, pointIndex) ||
-        ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F ||
-        cloud.scalarFields.size() <= fieldSlot) {
-        return 1.0F;
-    }
-    const float scale = ScalarFieldValueBySlot(cloud, fieldSlot, pointIndex);
-    return scale > 0.001F ? std::clamp(scale, 0.08F, 2.5F) : 1.0F;
-}
-
 bool WaterTrailStyleGeometryAvailable(
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     return style.waterTrailStyleGeometry &&
@@ -507,8 +478,7 @@ float WaterTrailWidth(
     std::size_t pointIndex,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     if (WaterTrailStyleGeometryAvailable(style)) {
-        return std::max(0.0001F, style.surfelDiameter.constantValue[0]) *
-               WaterRainGeometryScale(cloud, pointIndex, kWaterTrailLaneCountFieldSlot);
+        return std::max(0.0001F, style.surfelDiameter.constantValue[0]);
     }
     return std::max(0.0001F, ScalarFieldValueBySlot(cloud, kWaterTrailWidthFieldSlot, pointIndex));
 }
@@ -519,8 +489,7 @@ float WaterTrailStreakLength(
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style) {
     if (WaterTrailStyleGeometryAvailable(style)) {
         return std::max(0.0001F, style.surfelDiameter.constantValue[0]) *
-               std::max(1.0F, style.waterStreakAspect) *
-               WaterRainGeometryScale(cloud, pointIndex, kWaterTrailLaneIndexFieldSlot);
+               std::max(1.0F, style.waterStreakAspect);
     }
     return std::max(
         0.001F,
@@ -531,9 +500,7 @@ float WaterTrailVisibility(
     const invisible_places::io::LoadedPointCloud& cloud,
     const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
     std::size_t pointIndex,
-    float timeSeconds,
-    const glm::vec3& worldCenter,
-    const glm::vec3& cameraPosition) {
+    float timeSeconds) {
     if (ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F) {
         return 0.0F;
     }
@@ -541,20 +508,7 @@ float WaterTrailVisibility(
     const float routeLength = std::max(0.001F, ScalarFieldValueBySlot(cloud, kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(cloud, pointIndex, style);
     const float endFeather = std::clamp(trailStreakLength / routeLength, 0.001F, 0.10F);
-    const float endFade = 1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase);
-    if (!WaterTrailIsRain(cloud, pointIndex)) {
-        return endFade;
-    }
-    const float birthFeather = std::clamp(trailStreakLength / routeLength, 0.003F, 0.12F);
-    const float birthFade = SmoothStep(0.0F, birthFeather, phase);
-    const float cameraDeathDistance =
-        std::max(0.1F, ScalarFieldValueBySlot(cloud, kWaterTrailLaneSpanFieldSlot, pointIndex));
-    const float cameraDistance = glm::length(worldCenter - cameraPosition);
-    const float cameraFade =
-        1.0F - SmoothStep(cameraDeathDistance * 0.82F, cameraDeathDistance, cameraDistance);
-    const float pointAge = Clamp01(ScalarFieldValueBySlot(cloud, kWaterTrailPointAgeFieldSlot, pointIndex));
-    const float tailFade = 1.0F - SmoothStep(0.86F, 1.0F, pointAge);
-    return birthFade * endFade * cameraFade * tailFade;
+    return 1.0F - SmoothStep(1.0F - endFeather, 1.0F, phase);
 }
 
 bool WaterTrailRouteValid(
@@ -569,8 +523,7 @@ bool WaterTrailRouteValid(
 std::pair<std::size_t, float> WaterTrailRouteSegment(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::size_t pointIndex,
-    float phase,
-    bool timedAnchors) {
+    float phase) {
     const auto routeStart = WaterTrailRouteStart(cloud, pointIndex);
     const auto routeCount = WaterTrailRouteCount(cloud, pointIndex);
     if (!WaterTrailRouteValid(cloud, routeStart, routeCount)) {
@@ -578,28 +531,6 @@ std::pair<std::size_t, float> WaterTrailRouteSegment(
     }
 
     const float routePhase = PositiveFract(phase);
-    if (timedAnchors) {
-        for (std::size_t offset = 0; offset + 1U < routeCount; ++offset) {
-            const float startPhase = std::clamp(
-                ScalarFieldValueBySlot(cloud, kWaterTrailStartPhaseFieldSlot, routeStart + offset),
-                0.0F,
-                1.0F);
-            const float rawEndPhase = std::clamp(
-                ScalarFieldValueBySlot(cloud, kWaterTrailStartPhaseFieldSlot, routeStart + offset + 1U),
-                0.0F,
-                1.0F);
-            const float endPhase = std::max(startPhase + 0.0001F, rawEndPhase);
-            if (routePhase <= endPhase || offset + 2U >= routeCount) {
-                const float t = std::clamp(
-                    (routePhase - startPhase) / std::max(0.0001F, endPhase - startPhase),
-                    0.0F,
-                    1.0F);
-                return {std::min<std::size_t>(offset, routeCount - 2U), t};
-            }
-        }
-        return {routeCount - 2U, 1.0F};
-    }
-
     const float routePosition = routePhase * static_cast<float>(routeCount - 1U);
     const auto anchorOffset = std::min<std::size_t>(
         static_cast<std::size_t>(std::floor(routePosition)),
@@ -618,16 +549,13 @@ glm::vec3 WaterTrailRoutePosition(
         return fallbackPosition;
     }
 
-    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase, WaterTrailIsRain(cloud, pointIndex));
+    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase);
     const auto p0Offset = anchorOffset > 0U ? anchorOffset - 1U : anchorOffset;
     const auto p1Offset = anchorOffset;
     const auto p2Offset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
     const auto p3Offset = std::min<std::size_t>(anchorOffset + 2U, routeCount - 1U);
     const glm::vec3 p1 = ToGlm(cloud.positions[routeStart + p1Offset]);
     const glm::vec3 p2 = ToGlm(cloud.positions[routeStart + p2Offset]);
-    if (WaterTrailIsRain(cloud, pointIndex)) {
-        return glm::mix(p1, p2, t);
-    }
     return CatmullRomWater(
         ToGlm(cloud.positions[routeStart + p0Offset]),
         p1,
@@ -650,7 +578,7 @@ glm::vec3 WaterTrailRouteTangent(
         return glm::dot(tangent, tangent) > 1.0e-8F ? glm::normalize(tangent) : glm::vec3{1.0F, 0.0F, 0.0F};
     }
 
-    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase, WaterTrailIsRain(cloud, pointIndex));
+    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase);
     (void)t;
     const auto previousOffset = anchorOffset;
     const auto nextOffset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
@@ -675,7 +603,7 @@ glm::vec3 WaterTrailRouteNormal(
         return glm::dot(normal, normal) > 1.0e-8F ? glm::normalize(normal) : glm::vec3{0.0F, 0.0F, 1.0F};
     }
 
-    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase, WaterTrailIsRain(cloud, pointIndex));
+    const auto [anchorOffset, t] = WaterTrailRouteSegment(cloud, pointIndex, phase);
     const auto p1Offset = anchorOffset;
     const auto p2Offset = std::min<std::size_t>(anchorOffset + 1U, routeCount - 1U);
     const glm::vec3 p1 = routeStart + p1Offset < cloud.normals.size()
@@ -686,54 +614,6 @@ glm::vec3 WaterTrailRouteNormal(
                              : glm::vec3{0.0F, 0.0F, 1.0F};
     const glm::vec3 normal = glm::mix(p1, p2, t);
     return glm::dot(normal, normal) > 1.0e-8F ? glm::normalize(normal) : glm::vec3{0.0F, 0.0F, 1.0F};
-}
-
-float WaterRainRunoffSurfaceGripFromTangent(const glm::vec3& routeTangent) {
-    if (glm::dot(routeTangent, routeTangent) <= 1.0e-8F) {
-        return 0.0F;
-    }
-    const float verticalTravel = std::abs(glm::normalize(routeTangent).z);
-    return 1.0F - SmoothStep(0.62F, 0.88F, verticalTravel);
-}
-
-glm::vec3 RainPseudoWindOffset(
-    const invisible_places::io::LoadedPointCloud& cloud,
-    std::size_t pointIndex,
-    const glm::vec3& routePosition,
-    const glm::vec3& routeTangent,
-    float timeSeconds) {
-    const float windStrength =
-        std::max(0.0F, ScalarFieldValueBySlot(cloud, kWaterTrailLanePitchFieldSlot, pointIndex));
-    const float windResponse =
-        std::clamp(ScalarFieldValueBySlot(cloud, kWaterTrailLaneCrossingFieldSlot, pointIndex), 0.0F, 2.0F);
-    const float maxOffset = std::clamp(windStrength * windResponse * 0.10F, 0.0F, 0.11F);
-    if (maxOffset <= 1.0e-5F) {
-        return {0.0F, 0.0F, 0.0F};
-    }
-
-    const float seed = ScalarFieldValueBySlot(cloud, kWaterTrailCrossSeedFieldSlot, pointIndex);
-    const float pointSeed =
-        ScalarFieldValueBySlot(cloud, kWaterTrailPointAgeFieldSlot, pointIndex) +
-        ScalarFieldValueBySlot(cloud, kWaterTrailDistanceFieldSlot, pointIndex) * 0.013F;
-    const float scale = 1.10F + windResponse * 0.45F;
-    const float speed = 0.35F + windResponse * 0.55F + seed * 0.15F;
-    const glm::vec3 noisePosition =
-        (routePosition + glm::vec3{seed * 19.7F, pointSeed * 7.1F, seed * 3.3F}) * scale;
-    glm::vec3 gust =
-        SurfaceMotionNoiseVector(noisePosition, std::max(0.0F, timeSeconds) * speed) -
-        SurfaceMotionNoiseVector(noisePosition, 0.0F);
-    const glm::vec3 tangent =
-        glm::dot(routeTangent, routeTangent) > 1.0e-8F ? glm::normalize(routeTangent)
-                                                       : glm::vec3{0.0F, 0.0F, -1.0F};
-    gust -= tangent * glm::dot(gust, tangent);
-    gust.z *= 0.25F;
-
-    glm::vec3 offset = gust * maxOffset * 0.65F;
-    const float offsetLength = glm::length(offset);
-    if (offsetLength > maxOffset) {
-        offset *= maxOffset / offsetLength;
-    }
-    return offset;
 }
 
 glm::vec3 ResolveWaterTrailPosition(
@@ -752,11 +632,7 @@ glm::vec3 ResolveWaterTrailPosition(
         lateral = glm::normalize(lateral);
     }
     const float lateralOffset = ScalarFieldValueBySlot(cloud, kWaterTrailLateralOffsetFieldSlot, pointIndex);
-    glm::vec3 position = routePosition + lateral * lateralOffset;
-    if (WaterTrailIsRain(cloud, pointIndex)) {
-        position += RainPseudoWindOffset(cloud, pointIndex, routePosition, routeTangent, timeSeconds);
-    }
-    return position;
+    return routePosition + lateral * lateralOffset;
 }
 
 glm::vec3 JitteredWaterAnchorPosition(
@@ -1786,15 +1662,9 @@ bool BuildOfflinePointSample(
         invisible_places::renderer::pointcloud::SanitizePointCloudDensityCompensation(
             layer.densityCompensation);
     const bool waterTrails = HasWaterTrailFields(cloud, layer.style);
-    const bool rainTrail = waterTrails && WaterTrailIsRain(cloud, pointIndex);
     float waterTrailPhase = 0.0F;
-    float rainSurfaceGrip = 0.0F;
     if (waterTrails) {
         waterTrailPhase = WaterTrailTravelPhase(cloud, pointIndex, stylisationTimeSeconds);
-        if (rainTrail && ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) >= 0.5F) {
-            rainSurfaceGrip = WaterRainRunoffSurfaceGripFromTangent(
-                WaterTrailRouteTangent(cloud, pointIndex, waterTrailPhase));
-        }
     }
     const bool waterParticles = HasWaterParticleFields(cloud, layer.style);
     float waterParticleRole = 0.0F;
@@ -1832,9 +1702,7 @@ bool BuildOfflinePointSample(
             cloud,
             layer.style,
             pointIndex,
-            stylisationTimeSeconds,
-            glm::vec3{normalizedWorld},
-            matrices.position) <= 0.0F) {
+            stylisationTimeSeconds) <= 0.0F) {
         return false;
     }
     const glm::vec4 viewPosition = matrices.view * normalizedWorld;
@@ -1922,6 +1790,23 @@ bool BuildOfflinePointSample(
         sample->worldCenter,
         stylisationTimeSeconds,
         matrices.position);
+    glm::vec3 rainImpactNormal{0.0F, 0.0F, 1.0F};
+    if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+        const auto localNormal = ToGlm(cloud.normals[pointIndex]);
+        if (glm::dot(localNormal, localNormal) > 1.0e-8F) {
+            rainImpactNormal = glm::normalize(
+                glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
+        }
+    }
+    const auto rainImpact =
+        layer.rainImpactGrid != nullptr && layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None
+            ? invisible_places::water::EvaluateRainImpact(
+                  *layer.rainImpactGrid,
+                  layer.rainCollisionRole,
+                  FromGlm(sample->worldCenter),
+                  FromGlm(rainImpactNormal),
+                  stylisationTimeSeconds)
+            : invisible_places::water::RainImpactEffect{};
     const float waterParticleSizeScale =
         waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
     const float authoredSurfelDiameter =
@@ -1933,7 +1818,8 @@ bool BuildOfflinePointSample(
              waterParticleSizeScale *
              (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
              waterEffectPointSizeMultiply *
-             sparseRipple.pointSizeMultiply) +
+             sparseRipple.pointSizeMultiply *
+             rainImpact.sizeScale) +
         waterEffectPointSizeAdd +
         sparseRipple.pointSizeAdd;
     const float authoredPointSize =
@@ -1945,7 +1831,8 @@ bool BuildOfflinePointSample(
              waterParticleSizeScale *
              (1.0F + caustic * std::max(0.0F, layer.style.causticPointSizeBoost)) *
              waterEffectPointSizeMultiply *
-             sparseRipple.pointSizeMultiply) +
+             sparseRipple.pointSizeMultiply *
+             rainImpact.sizeScale) +
         waterEffectPointSizeAdd +
         sparseRipple.pointSizeAdd;
     const float depthOfFieldBlurPixels = ResolveDepthOfFieldBlurPixels(cameraState, viewDepth);
@@ -1989,9 +1876,8 @@ bool BuildOfflinePointSample(
                                 : 1.0F;
     if (waterTrails) {
         const float trailWidth = WaterTrailWidth(cloud, pointIndex, layer.style);
-        const float trailWidthScale = std::lerp(1.0F, 0.86F, rainSurfaceGrip);
         sample->surfelDiameter =
-            trailWidth * densityCompensation.footprintScale * trailWidthScale +
+            trailWidth * densityCompensation.footprintScale +
             2.0F * ScreenPixelWorldSpan(
                        viewDepth,
                        depthOfFieldBlurPixels,
@@ -1999,17 +1885,16 @@ bool BuildOfflinePointSample(
                        static_cast<float>(image.height)) +
             ScreenPixelWorldSpan(
                 viewDepth,
-                kPointCloudAntialiasFeatherPixels + rainSurfaceGrip * 1.25F,
+                kPointCloudAntialiasFeatherPixels,
                 matrices.projection[1][1],
                 static_cast<float>(image.height));
         const float trailStreakLength = std::max(
             sample->surfelDiameter,
-            WaterTrailStreakLength(cloud, pointIndex, layer.style) *
-                std::lerp(1.0F, 0.24F, rainSurfaceGrip));
+            WaterTrailStreakLength(cloud, pointIndex, layer.style));
         sample->surfelAspect = std::clamp(
             trailStreakLength / std::max(sample->surfelDiameter, 0.0001F),
             1.0F,
-            std::lerp(64.0F, 7.0F, rainSurfaceGrip));
+            64.0F);
     }
     sample->opacity = Clamp01(
         (EvaluateBindingOrDefault(
@@ -2021,7 +1906,8 @@ bool BuildOfflinePointSample(
              waterEffectOpacityMultiply *
              sparseRipple.opacityMultiply) +
         waterEffectOpacityAdd +
-        sparseRipple.opacityAdd);
+        sparseRipple.opacityAdd +
+        rainImpact.opacity);
     if (waterParticles) {
         sample->opacity *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
     }
@@ -2045,6 +1931,7 @@ bool BuildOfflinePointSample(
         sample->emissive += caustic * std::max(0.0F, layer.style.causticEmissionBoost);
         sample->emissive += waterEffectEmissionAdd;
         sample->emissive += sparseRipple.emissionAdd;
+        sample->emissive += rainImpact.emission;
         sample->color = ResolvePointColor(layer, pointIndex);
         sample->color = glm::mix(
             sample->color,
@@ -2058,24 +1945,24 @@ bool BuildOfflinePointSample(
             sample->color,
             sparseRipple.colour,
             Clamp01(sparseRipple.colourMix));
+        const glm::vec3 rainImpactColour =
+            layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Vegetation
+                ? glm::vec3{0.54F, 0.80F, 0.82F}
+                : glm::vec3{0.24F, 0.48F, 0.62F};
+        sample->color = glm::mix(
+            sample->color,
+            rainImpactColour,
+            std::clamp(rainImpact.colourBlend, 0.0F, 0.72F));
     }
     sample->hasNormal = false;
-    if (rainTrail && rainSurfaceGrip > 0.15F) {
-        const glm::vec3 localNormal = WaterTrailRouteNormal(cloud, pointIndex, waterTrailPhase);
-        if (glm::dot(localNormal, localNormal) > 1.0e-8F) {
-            sample->normal = glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
-            sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
-        }
-    } else {
-        sample->hasNormal = cloud.hasNormals && pointIndex < cloud.normals.size();
+    sample->hasNormal = cloud.hasNormals && pointIndex < cloud.normals.size();
+    if (sample->hasNormal) {
+        const glm::vec3 localNormal = ToGlm(cloud.normals[pointIndex]);
+        sample->hasNormal = glm::dot(localNormal, localNormal) > 1.0e-8F;
         if (sample->hasNormal) {
-            const glm::vec3 localNormal = ToGlm(cloud.normals[pointIndex]);
-            sample->hasNormal = glm::dot(localNormal, localNormal) > 1.0e-8F;
-            if (sample->hasNormal) {
-                sample->normal =
-                    glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
-                sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
-            }
+            sample->normal =
+                glm::normalize(glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
+            sample->hasNormal = IsFinite(sample->normal) && glm::dot(sample->normal, sample->normal) > 1.0e-8F;
         }
     }
     sample->hasPreferredTangent = false;
@@ -2109,8 +1996,7 @@ bool BuildOfflinePointSample(
             sample,
             matrices,
             layer.style.geometryMode ==
-                    invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites &&
-                !(rainTrail && rainSurfaceGrip > 0.15F));
+                invisible_places::renderer::pointcloud::PointCloudGeometryMode::CameraFacingWorldSprites);
     }
     return sample->opacity > 0.0F;
 }
@@ -2323,6 +2209,46 @@ void InitializeExrImage(ExrImage* image, std::uint32_t width, std::uint32_t heig
     image->depth.assign(pixelCount, std::numeric_limits<float>::infinity());
 }
 
+void AdvanceOfflineRainFrame(
+    OfflineRainSimulationState* state,
+    const invisible_places::water::RainCollisionCache& collisionCache,
+    const invisible_places::water::RainRuntimeSettings& settings,
+    const invisible_places::water::WaterRainVisualSettings& visual,
+    const invisible_places::camera::CameraState& cameraState,
+    float timeSeconds,
+    float deltaSeconds) {
+    if (state == nullptr) {
+        return;
+    }
+
+    const auto& centre = cameraState.hasOrbitCenter ? cameraState.orbitCenter : cameraState.target;
+    invisible_places::water::RainSimulationFrame simulationFrame;
+    simulationFrame.settings = settings;
+    simulationFrame.visual = visual;
+    simulationFrame.cameraPosition = {
+        cameraState.position[0], cameraState.position[1], cameraState.position[2]};
+    simulationFrame.spawnCentre = {
+        centre[0],
+        centre[1],
+        collisionCache.bounds.valid ? collisionCache.bounds.maximum.z : centre[2]};
+    simulationFrame.timeSeconds = timeSeconds;
+    simulationFrame.deltaSeconds = deltaSeconds;
+    state->diagnostics = state->simulator.Advance(simulationFrame, collisionCache);
+    state->impactGrid = settings.enabled && settings.impactEffectsEnabled
+                            ? invisible_places::water::BuildRainImpactGrid(
+                                  state->simulator.Events(),
+                                  simulationFrame.cameraPosition,
+                                  timeSeconds,
+                                  invisible_places::water::RainImpactGridWorldSpan(settings))
+                            : invisible_places::water::RainImpactGrid{};
+    state->frame = {
+        .settings = settings,
+        .visual = visual,
+        .particles = state->simulator.Particles(),
+        .timeSeconds = timeSeconds,
+    };
+}
+
 std::vector<OfflineRenderTile> BuildOfflineRenderTiles(
     std::uint32_t width,
     std::uint32_t height,
@@ -2339,6 +2265,143 @@ std::vector<OfflineRenderTile> BuildOfflineRenderTiles(
         }
     }
     return tiles;
+}
+
+template <typename PixelCallback>
+void VisitOfflineRainPixels(
+    const OfflineRainFrame* rainFrame,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const OfflineRenderTile& tile,
+    const ExrImage& image,
+    PixelCallback&& callback) {
+    if (rainFrame == nullptr || !rainFrame->settings.enabled || rainFrame->particles.empty()) {
+        return;
+    }
+    const auto intensity = invisible_places::water::RainIntensityValues(
+        rainFrame->settings.intensityPreset);
+    const float widthMeters = std::max(
+        0.0001F,
+        rainFrame->visual.widthMeters * rainFrame->settings.dropletSizeScale * intensity.width);
+    const float streakLength = std::max(
+        widthMeters,
+        rainFrame->visual.streakLengthMeters * rainFrame->settings.dropletSizeScale * intensity.length);
+    const float opacity = Clamp01(
+        rainFrame->visual.opacity * rainFrame->settings.opacityScale * intensity.opacity);
+    const float emission = std::max(
+        0.0F,
+        rainFrame->visual.emission * rainFrame->settings.emissionScale * intensity.emission);
+    const glm::vec3 colour{
+        rainFrame->visual.colour[0],
+        rainFrame->visual.colour[1],
+        rainFrame->visual.colour[2],
+    };
+
+    for (const auto& particle : rainFrame->particles) {
+        if (!particle.active) {
+            continue;
+        }
+        const glm::vec3 head = ToGlm(particle.position);
+        const glm::vec3 velocity = ToGlm(particle.velocity);
+        if (glm::dot(velocity, velocity) <= 1.0e-8F) {
+            continue;
+        }
+        const glm::vec3 tail = head - glm::normalize(velocity) * streakLength;
+        float headX = 0.0F;
+        float headY = 0.0F;
+        float tailX = 0.0F;
+        float tailY = 0.0F;
+        if (!ProjectWorldToPixel(head, matrices, image, &headX, &headY) ||
+            !ProjectWorldToPixel(tail, matrices, image, &tailX, &tailY)) {
+            continue;
+        }
+        const float headDepth = -(matrices.view * glm::vec4{head, 1.0F}).z;
+        const float tailDepth = -(matrices.view * glm::vec4{tail, 1.0F}).z;
+        if (headDepth <= 0.0F || tailDepth <= 0.0F) {
+            continue;
+        }
+        const float viewDepth = 0.5F * (headDepth + tailDepth);
+        const float diameterPixels = std::clamp(
+            invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
+                widthMeters,
+                viewDepth,
+                matrices.projection[1][1],
+                static_cast<float>(image.height)),
+            std::max(0.0F, rainFrame->visual.minimumScreenPixels),
+            std::max(rainFrame->visual.minimumScreenPixels, rainFrame->visual.maximumScreenPixels));
+        const float radius = std::max(0.5F, diameterPixels * 0.5F);
+        const glm::vec2 start{tailX, tailY};
+        const glm::vec2 end{headX, headY};
+        const glm::vec2 segment = end - start;
+        const float segmentLengthSquared = std::max(1.0e-5F, glm::dot(segment, segment));
+        const int minimumX = std::max<int>(
+            static_cast<int>(tile.x0),
+            static_cast<int>(std::floor(std::min(start.x, end.x) - radius - 1.0F)));
+        const int maximumX = std::min<int>(
+            static_cast<int>(tile.x1) - 1,
+            static_cast<int>(std::ceil(std::max(start.x, end.x) + radius + 1.0F)));
+        const int minimumY = std::max<int>(
+            static_cast<int>(tile.y0),
+            static_cast<int>(std::floor(std::min(start.y, end.y) - radius - 1.0F)));
+        const int maximumY = std::min<int>(
+            static_cast<int>(tile.y1) - 1,
+            static_cast<int>(std::ceil(std::max(start.y, end.y) + radius + 1.0F)));
+        for (int y = minimumY; y <= maximumY; ++y) {
+            for (int x = minimumX; x <= maximumX; ++x) {
+                const glm::vec2 pixel{static_cast<float>(x) + 0.5F, static_cast<float>(y) + 0.5F};
+                const float along = std::clamp(glm::dot(pixel - start, segment) / segmentLengthSquared, 0.0F, 1.0F);
+                const float distance = glm::length(pixel - (start + segment * along));
+                if (distance > radius) {
+                    continue;
+                }
+                const float featherStart = std::lerp(
+                    0.90F,
+                    0.05F,
+                    std::clamp(rainFrame->visual.softness, 0.0F, 1.0F));
+                const float edge = 1.0F - SmoothStep(radius * featherStart, radius, distance);
+                const float endFade = SmoothStep(0.0F, 0.08F, along) *
+                                      (1.0F - SmoothStep(0.88F, 1.0F, along));
+                const float pixelAlpha = opacity * std::max(0.0F, particle.visibility) * edge * endFade;
+                if (pixelAlpha <= 1.0e-5F) {
+                    continue;
+                }
+                const float depth = std::lerp(tailDepth, headDepth, along);
+                const auto pixelIndex =
+                    static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width) +
+                    static_cast<std::size_t>(x);
+                callback(pixelIndex, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), depth,
+                         pixelAlpha, colour, emission);
+            }
+        }
+    }
+}
+
+void CompositeOfflineRainDirect(
+    const OfflineRainFrame* rainFrame,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const OfflineRenderTile& tile,
+    ExrImage* image) {
+    if (image == nullptr) {
+        return;
+    }
+    VisitOfflineRainPixels(
+        rainFrame,
+        matrices,
+        tile,
+        *image,
+        [&](std::size_t pixelIndex, std::uint32_t, std::uint32_t, float depth, float alpha,
+            const glm::vec3& colour, float emission) {
+            if (pixelIndex >= image->depth.size() || depth > image->depth[pixelIndex] + 0.02F) {
+                return;
+            }
+            const glm::vec3 source = colour * (1.0F + emission);
+            const glm::vec3 destination{
+                image->beautyR[pixelIndex], image->beautyG[pixelIndex], image->beautyB[pixelIndex]};
+            const float destinationAlpha = image->alpha[pixelIndex];
+            image->beautyR[pixelIndex] = source.r * alpha + destination.r * (1.0F - alpha);
+            image->beautyG[pixelIndex] = source.g * alpha + destination.g * (1.0F - alpha);
+            image->beautyB[pixelIndex] = source.b * alpha + destination.b * (1.0F - alpha);
+            image->alpha[pixelIndex] = alpha + destinationAlpha * (1.0F - alpha);
+        });
 }
 
 void RenderFastBasicPointCloudTile(
@@ -2400,9 +2463,7 @@ void RenderFastBasicPointCloudTile(
                     cloud,
                     layer.style,
                     pointIndex,
-                    stylisationTimeSeconds,
-                    worldPosition,
-                    matrices.position) <= 0.0F) {
+                    stylisationTimeSeconds) <= 0.0F) {
                 continue;
             }
             const glm::vec4 viewPosition = matrices.view * glm::vec4{worldPosition, 1.0F};
@@ -2424,16 +2485,40 @@ void RenderFastBasicPointCloudTile(
                 worldPosition,
                 stylisationTimeSeconds,
                 matrices.position);
-            const glm::vec3 color =
+            glm::vec3 rainNormal{0.0F, 0.0F, 1.0F};
+            if (cloud.hasNormals && pointIndex < cloud.normals.size()) {
+                const auto localNormal = ToGlm(cloud.normals[pointIndex]);
+                if (glm::dot(localNormal, localNormal) > 1.0e-8F) {
+                    rainNormal = glm::normalize(
+                        glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
+                }
+            }
+            const auto rainImpact =
+                layer.rainImpactGrid != nullptr &&
+                        layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None
+                    ? invisible_places::water::EvaluateRainImpact(
+                          *layer.rainImpactGrid,
+                          layer.rainCollisionRole,
+                          FromGlm(worldPosition),
+                          FromGlm(rainNormal),
+                          stylisationTimeSeconds)
+                    : invisible_places::water::RainImpactEffect{};
+            glm::vec3 color =
                 glm::mix(
                     ResolvePointColor(layer, pointIndex),
                     sparseRipple.colour,
                     Clamp01(sparseRipple.colourMix)) *
                 (1.0F + std::max(0.0F, sparseRipple.emissionAdd));
+            const glm::vec3 rainColour =
+                layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Vegetation
+                    ? glm::vec3{0.54F, 0.80F, 0.82F}
+                    : glm::vec3{0.24F, 0.48F, 0.62F};
+            color = glm::mix(color, rainColour, std::clamp(rainImpact.colourBlend, 0.0F, 0.72F));
+            color *= 1.0F + std::max(0.0F, rainImpact.emission);
             // Fast Basic intentionally ignores the authored material opacity,
             // while procedural water effects can still attenuate its opaque base.
             const float opacity = Clamp01(
-                sparseRipple.opacityMultiply + sparseRipple.opacityAdd);
+                sparseRipple.opacityMultiply + sparseRipple.opacityAdd + rainImpact.opacity);
             if (opacity <= 1.0e-5F) {
                 continue;
             }
@@ -2447,7 +2532,8 @@ void RenderFastBasicPointCloudTile(
                     : invisible_places::style::ScalarConstant(layer.style.pointSize);
             const float pointSize =
                 std::clamp(
-                    ((basePointSize * sparseRipple.pointSizeMultiply) + sparseRipple.pointSizeAdd) *
+                    ((basePointSize * sparseRipple.pointSizeMultiply * rainImpact.sizeScale) +
+                     sparseRipple.pointSizeAdd) *
                         footprintScale,
                     1.0F,
                     64.0F);
@@ -2529,7 +2615,8 @@ void RenderPointCloudTile(
     ExrImage* image,
     OfflinePointRenderDiagnostics* diagnostics,
     OfflinePointRenderScratch* scratch,
-    float stylisationTimeSeconds) {
+    float stylisationTimeSeconds,
+    const OfflineRainFrame* rainFrame) {
     if (image == nullptr || image->width == 0 || image->height == 0 || tile.x0 >= tile.x1 || tile.y0 >= tile.y1) {
         return;
     }
@@ -2550,6 +2637,7 @@ void RenderPointCloudTile(
         [](const OfflinePointLayer& layer) { return layer.fastBasic; });
     if (fastBasicOnly) {
         RenderFastBasicPointCloudTile(layers, matrices, tile, image, diagnostics, stylisationTimeSeconds);
+        CompositeOfflineRainDirect(rainFrame, matrices, tile, image);
         return;
     }
 
@@ -2756,6 +2844,31 @@ void RenderPointCloudTile(
             }
         }
     }
+
+    VisitOfflineRainPixels(
+        rainFrame,
+        matrices,
+        tile,
+        *image,
+        [&](std::size_t pixelIndex, std::uint32_t x, std::uint32_t y, float depth, float alpha,
+            const glm::vec3& colour, float emission) {
+            if (pixelIndex >= image->depth.size() || depth > image->depth[pixelIndex] + 0.02F) {
+                return;
+            }
+            const auto localIndex =
+                static_cast<std::size_t>(y - tile.y0) * static_cast<std::size_t>(tileWidth) +
+                static_cast<std::size_t>(x - tile.x0);
+            const float weight = WeightedAlphaWeight(alpha, depth, cameraState);
+            accumR[localIndex] += colour.r * alpha * weight;
+            accumG[localIndex] += colour.g * alpha * weight;
+            accumB[localIndex] += colour.b * alpha * weight;
+            accumA[localIndex] += alpha * weight;
+            revealage[localIndex] *= 1.0F - alpha;
+            emissionR[localIndex] += colour.r * alpha * emission;
+            emissionG[localIndex] += colour.g * alpha * emission;
+            emissionB[localIndex] += colour.b * alpha * emission;
+            emissionA[localIndex] += alpha * emission;
+        });
 
     const auto accumulationEnd = std::chrono::steady_clock::now();
     if (diagnostics != nullptr) {

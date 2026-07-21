@@ -6,6 +6,7 @@
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "water/RainSimulation.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <array>
@@ -69,6 +70,13 @@ struct ViewportDiagnostics {
     double frameSubmitMs = 0.0;
     double framePresentMs = 0.0;
     double framePlatformWindowsMs = 0.0;
+    std::uint32_t rainActiveParticleCount = 0U;
+    std::uint32_t rainImpactOverflowCount = 0U;
+    std::uint32_t rainEventsEmittedThisFrame = 0U;
+    std::uint64_t rainCollisionCacheRevision = 0U;
+    std::uint64_t rainCollisionUploadRevision = 0U;
+    std::uint32_t rainParticleCapacity = 0U;
+    std::uint32_t rainEventCapacity = 0U;
 };
 
 struct SceneRenderState {
@@ -89,6 +97,9 @@ struct SceneRenderState {
     float gaussianSplatFootprintBoost = 1.5F;
     float pointSizeScale = 1.0F;
     float flowTimeSeconds = 0.0F;
+    invisible_places::water::RainRuntimeSettings rainSettings{};
+    invisible_places::water::WaterRainVisualSettings rainVisual{};
+    glm::vec3 rainSpawnCentre{0.0F, 0.0F, 0.0F};
     renderer::pointcloud::PointCloudRendererMode pointCloudRendererMode =
         renderer::pointcloud::PointCloudRendererMode::Beauty;
 
@@ -99,6 +110,8 @@ struct SceneRenderState {
         bool hasSourceRgb = true;
         std::uint32_t drawPointCount = 0;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
+        invisible_places::water::RainCollisionRole rainCollisionRole =
+            invisible_places::water::RainCollisionRole::None;
     };
 
     struct GaussianSplatLayerState {
@@ -249,6 +262,9 @@ class VulkanViewportShell {
     void ClearPointHighlights(std::size_t layerId);
     void RemovePointCloud(std::size_t layerId);
     void ClearPointClouds();
+    void UploadRainCollisionCache(const invisible_places::water::RainCollisionCache& cache);
+    void ClearRainCollisionCache();
+    [[nodiscard]] std::uint64_t RainCollisionUploadRevision() const;
     void UploadGaussianSplats(std::size_t layerId, const invisible_places::io::LoadedGaussianSplat& splats);
     void RemoveGaussianSplats(std::size_t layerId);
     void ClearGaussianSplats();
@@ -443,6 +459,7 @@ class VulkanViewportShell {
         VkPipeline surfelDepthPipeline = VK_NULL_HANDLE;
         VkPipeline surfelAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline surfelConstantSimpleAccumulationPipeline = VK_NULL_HANDLE;
+        VkPipeline rainPipeline = VK_NULL_HANDLE;
         VkPipeline compositePipeline = VK_NULL_HANDLE;
         ImageAllocation colorImage{};
         ImageAllocation depthImage{};
@@ -459,6 +476,30 @@ class VulkanViewportShell {
         BufferAllocation normalReadbackBuffer{};
         BufferAllocation albedoReadbackBuffer{};
         BufferAllocation uniformBuffer{};
+    };
+
+    struct RainGpuResources {
+        BufferAllocation surfaceTableBuffer{};
+        BufferAllocation vegetationTableBuffer{};
+        BufferAllocation particleBuffer{};
+        BufferAllocation eventBuffer{};
+        BufferAllocation counterBuffer{};
+        BufferAllocation impactCountBuffer{};
+        BufferAllocation impactReferenceBuffer{};
+        std::array<BufferAllocation, kFramesInFlight> uniformBuffers{};
+        std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+        invisible_places::io::Bounds3f collisionBounds{};
+        std::uint32_t surfaceMask = 0U;
+        std::uint32_t vegetationMask = 0U;
+        std::uint32_t maximumProbeCount = 1U;
+        std::uint32_t resetEpoch = 1U;
+        std::uint64_t collisionCacheRevision = 0U;
+        std::uint64_t collisionUploadRevision = 0U;
+        std::uint32_t lastSeed = 0U;
+        float previousTimeSeconds = -std::numeric_limits<float>::infinity();
+        float frameDeltaSeconds = 1.0F / 30.0F;
+        bool previousRainEnabled = false;
+        bool collisionReady = false;
     };
 
     struct ImGuiPreviewImageTextureResources {
@@ -479,6 +520,7 @@ class VulkanViewportShell {
     void CreatePresentRenderPass();
     void CreatePointDescriptorSetLayout();
     void CreateDynamicMeshFlowDescriptorSetLayout();
+    void CreateRainDescriptorSetLayout();
     void CreateGaussianSplatDescriptorSetLayout();
     void CreateHighQualityGaussianSplatDescriptorSetLayout();
     void CreateCompositeDescriptorSetLayout();
@@ -486,8 +528,10 @@ class VulkanViewportShell {
     void CreateDescriptorPools();
     void CreatePostProcessSampler();
     void CreateUniformResources();
+    void CreateRainResources();
     void CreatePointPipelines();
     void CreateDynamicMeshFlowComputePipeline();
+    void CreateRainPipelines();
     void CreateGaussianSplatPipeline();
     void CreateHighQualityGaussianSplatPipeline();
     void CreateCompositePipeline();
@@ -506,6 +550,12 @@ class VulkanViewportShell {
     void CreateSyncObjects();
     void CreateImGuiResources();
     void UploadImGuiFonts();
+    void UpdateRainDescriptorSets();
+    void UpdateRainRuntimeTiming(const SceneRenderState& state);
+    void UploadRainUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);
+    void RecordRainCompute(VkCommandBuffer commandBuffer, std::size_t frameIndex);
+    void RecordRainDraw(VkCommandBuffer commandBuffer, std::size_t frameIndex, VkPipeline pipeline);
+    void CleanupRainResources();
     void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);
     void UpdateDynamicMeshFlowDescriptorSet(ActivePointCloudResources* resources, std::size_t liveSlot);
     void PrepareDynamicMeshFlowDispatchSlot(ActivePointCloudResources* resources, std::size_t liveSlot);
@@ -643,6 +693,7 @@ class VulkanViewportShell {
     VkRenderPass presentRenderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pointPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout dynamicMeshFlowPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout rainPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout gaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout highQualityGaussianSplatPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
@@ -653,6 +704,8 @@ class VulkanViewportShell {
     VkPipeline pointOpaqueHardDiscPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointFastBasicPipeline_ = VK_NULL_HANDLE;
     VkPipeline dynamicMeshFlowComputePipeline_ = VK_NULL_HANDLE;
+    VkPipeline rainComputePipeline_ = VK_NULL_HANDLE;
+    VkPipeline rainPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelDepthPrepassPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline surfelConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
@@ -663,6 +716,7 @@ class VulkanViewportShell {
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dynamicMeshFlowDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout rainDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
@@ -706,6 +760,7 @@ class VulkanViewportShell {
     std::vector<ActiveGaussianSplatResources> gaussianSplatResources_;
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
     ExrExportResources exrExportResources_{};
+    RainGpuResources rainResources_{};
     bool exrExportFrameInFlight_ = false;
     std::uint32_t exrExportInFlightWidth_ = 0;
     std::uint32_t exrExportInFlightHeight_ = 0;

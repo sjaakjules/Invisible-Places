@@ -2,6 +2,7 @@
 
 #include "io/MeshData.hpp"
 #include "io/PointCloudData.hpp"
+#include "water/RainSimulation.hpp"
 
 #include <array>
 #include <cstddef>
@@ -596,69 +597,9 @@ struct WaterFieldTrailSettings {
     bool fadeOnLowConfidence = true;
 };
 
-enum class WaterRainIntensityPreset {
-    LightMist,
-    Rain,
-    HeavyDownpour
-};
+using WaterRainIntensityPreset = RainIntensityPreset;
+using WaterRainSettings = RainRuntimeSettings;
 
-struct WaterRainSettings {
-    bool enabled = false;
-    bool vegetationInterceptionEnabled = true;
-    bool surfaceRunoffEnabled = true;
-    bool splashEnabled = false;
-    WaterRainIntensityPreset intensityPreset = WaterRainIntensityPreset::Rain;
-    std::uint32_t dropCount = 900;
-    float fallSpeedMetersPerSecond = 8.0F;
-    float spawnHeightMeters = 4.0F;
-    float spawnRadiusMeters = 6.0F;
-    float spawnOutOfFrameMargin = 0.18F;
-    float surfaceSearchRadiusMeters = 0.20F;
-    float downhillSearchRadiusMeters = 1.20F;
-    float killBelowSceneMeters = 3.0F;
-    float cameraDeathDistanceMeters = 28.0F;
-    float surfaceRunSpeedMetersPerSecond = 1.05F;
-    float sandRunDistanceMeters = 0.65F;
-    float splashStrength = 0.75F;
-    float splashMaxDistanceMeters = 0.18F;
-    std::uint32_t splashDropletLimit = 4;
-    float windDirectionX = 1.0F;
-    float windDirectionY = 0.0F;
-    float windStrengthMeters = 0.30F;
-    float windNoise = 0.45F;
-    float windResponse = 0.50F;
-    float trailLengthMeters = 0.75F;
-    float trailPointSpacingMeters = 0.18F;
-    float trailWidthMeters = 0.004F;
-    float trailStreakLengthMeters = 0.12F;
-    std::uint32_t routeAnchorCount = 10;
-    std::uint32_t supportSampleLimit = 250000;
-    std::uint32_t seed = 101U;
-};
-
-struct WaterRainCameraFrame {
-    invisible_places::io::Float3 position{};
-    invisible_places::io::Float3 target{};
-    float fovDegrees = 55.0F;
-    float aspectRatio = 1.0F;
-};
-
-struct WaterRainDiagnostics {
-    std::uint32_t requestedDropCount = 0;
-    std::uint32_t emittedDropCount = 0;
-    std::uint32_t emittedSampleCount = 0;
-    std::uint32_t routeAnchorCount = 0;
-    std::uint32_t firstSupportHitCount = 0;
-    std::uint32_t meshSurfaceHitCount = 0;
-    std::uint32_t vegetationDripCount = 0;
-    std::uint32_t splashDropletCount = 0;
-    std::uint32_t sandTerminationCount = 0;
-    std::uint32_t impactTerminationCount = 0;
-    std::uint32_t fallbackTerminationCount = 0;
-    std::uint32_t noSupportKillCount = 0;
-};
-
-inline constexpr float kWaterTrailFeatureTypeRain = 4.0F;
 inline constexpr float kWaterTrailFeatureTypeDynamicMesh = 5.0F;
 
 struct WaterDynamicMeshMotionKeyframe {
@@ -784,12 +725,6 @@ struct WaterDynamicMeshFlowDiagnostics {
     WaterDynamicMeshFlowSettings settings,
     std::string_view presetName);
 [[nodiscard]] std::string_view NormalizeWaterDynamicMeshParticlePresetName(std::string_view presetName);
-[[nodiscard]] WaterRainSettings ApplyWaterRainIntensityPreset(
-    WaterRainSettings settings,
-    WaterRainIntensityPreset preset);
-[[nodiscard]] float WaterRainEffectiveWindResponse(const WaterRainSettings& settings);
-[[nodiscard]] float WaterRainPseudoWindDisplacementMeters(const WaterRainSettings& settings);
-[[nodiscard]] float WaterRainFallAngleDegrees(const WaterRainSettings& settings);
 [[nodiscard]] float WaterRainPresetVisualStrength(WaterRainIntensityPreset preset);
 
 [[nodiscard]] WaterSeepageLookSettings DefaultWaterSeepageLookSettings();
@@ -1492,17 +1427,6 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterFieldCache& fieldCache,
     const WaterFieldTrailSettings& settings,
     const std::vector<WaterEmitter>& emitters);
-[[nodiscard]] WaterTrailOverlay BuildRainTrailOverlay(
-    std::span<const WaterSceneSupportLayer> supportLayers,
-    const WaterRainCameraFrame& cameraFrame,
-    const WaterRainSettings& settings,
-    WaterRainDiagnostics* diagnostics = nullptr);
-[[nodiscard]] WaterTrailOverlay BuildRainTrailOverlay(
-    std::span<const WaterSceneSupportLayer> supportLayers,
-    const MeshSurfaceCache* meshSurface,
-    const WaterRainCameraFrame& cameraFrame,
-    const WaterRainSettings& settings,
-    WaterRainDiagnostics* diagnostics = nullptr);
 [[nodiscard]] MeshSurfaceCache BuildMeshSurfaceCache(
     const invisible_places::io::LoadedTriangleMesh& mesh,
     const WaterDynamicMeshFlowSettings& settings);

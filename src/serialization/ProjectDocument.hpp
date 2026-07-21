@@ -5,6 +5,7 @@
 #include "output/RenderPreset.hpp"
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "water/RainSimulation.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <array>
@@ -18,8 +19,8 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 37U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 13U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 38U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 14U;
 
 enum class SerializedLayerKind {
     PointCloud,
@@ -190,9 +191,10 @@ struct ProjectDocument {
     invisible_places::water::WaterFieldSettings waterFieldSettings{};
     invisible_places::water::WaterFieldTrailSettings waterFieldTrailSettings{};
     invisible_places::water::WaterDynamicMeshFlowSettings waterDynamicMeshFlowSettings{};
-    invisible_places::water::WaterRainSettings waterRainSettings{};
-    std::string selectedWaterRainTrailProfileName = "Rain Fine Lines_preset";
-    std::optional<WaterTrailProfileDocument> tempWaterRainTrailProfile;
+    invisible_places::water::RainRuntimeSettings waterRainSettings =
+        invisible_places::water::DefaultRainRuntimeSettings();
+    invisible_places::water::WaterRainVisualSettings waterRainVisualSettings =
+        invisible_places::water::RainVisualPreset("Rain Fine Lines");
     std::vector<WaterSceneStateDocument> waterSceneStates;
     std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
@@ -236,9 +238,10 @@ struct WaterSourcesDocument {
     invisible_places::water::WaterFieldSettings fieldSettings{};
     invisible_places::water::WaterFieldTrailSettings fieldTrailSettings{};
     invisible_places::water::WaterDynamicMeshFlowSettings dynamicMeshFlowSettings{};
-    invisible_places::water::WaterRainSettings rainSettings{};
-    std::string selectedRainTrailProfileName = "Rain Fine Lines_preset";
-    std::optional<WaterTrailProfileDocument> tempRainTrailProfile;
+    invisible_places::water::RainRuntimeSettings rainSettings =
+        invisible_places::water::DefaultRainRuntimeSettings();
+    invisible_places::water::WaterRainVisualSettings rainVisualSettings =
+        invisible_places::water::RainVisualPreset("Rain Fine Lines");
     std::optional<invisible_places::water::WaterPathCache> pathCache;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
 };

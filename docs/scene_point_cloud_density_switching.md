@@ -19,7 +19,7 @@ Each project-loaded scene has two independent source classifications:
 
 When one file belongs to both sets, its CPU data is reused. Obsolete display CPU/GPU resources are released after commit unless they are canonical analysis sources. A staged target is neither a committed display source nor renderable.
 
-Pivot samples and the combined water support/trail-surface caches are prewarmed from the analysis set. Picking, region selection, source placement, flow/rain collision, field solving, water support signatures, and support-cache generation never fall back to a sparse display source. If a required analysis file is still loading or failed, the dependent action is disabled and reports the loading/error state.
+Pivot samples and combined Flow/Field support caches are prewarmed from the analysis set. Picking, region selection, source placement, flow solving, field solving, water support signatures, and support-cache generation never fall back to a sparse display source. Rain collision is display-independent too: it streams exact 5 mm role files, or each role's coarsest fallback, into a separate persisted 20 mm cache. If a required source is still loading or failed, the dependent action is disabled and reports the loading/error state.
 
 ## Density-Compensated Rendering
 
@@ -51,14 +51,14 @@ Scalar-field bindings follow field names across variants because numeric field s
 
 ## Water And Field Routing
 
-Display switching does not change simulation input. Combined water support, source placement, path/field caches, flow and rain routing, collision queries, and region analysis use only CPU-ready canonical analysis sources. Their support signatures and cached paths therefore remain stable while display density changes.
+Display switching does not change simulation input. Combined water support, source placement, path/field caches, Flow routing, and region analysis use CPU-ready canonical analysis sources. Rain collision queries use the scene's static 20 mm role-aware cache, whose source signature and GPU upload revision also remain stable while display density changes.
 
 Display-dependent payloads are handled separately:
 
 - Ripple memberships are rebuilt or restored for each exact display cloud because point indices differ between density variants.
 - Field simulation remains analysis-based, but presentation fields are remapped spatially to the target display cloud before upload. An analysis-cloud point index is never reused as a display-cloud index.
 - Target Ripple and Field payloads are prepared before a display switch commits.
-- Generated Flow, Field Streamline, and Rain overlay sessions are unchanged by the selector.
+- Generated Flow and Field Streamline sessions are unchanged by the selector; dedicated Rain particles reuse the same shared collision cache and world-space impacts.
 - SAND Shoreline settings remain authored once and are evaluated on the committed SAND display source.
 
 Viewport rendering, framing, frustum masks, still/animation snapshots, and offline export all use the committed-display predicate. CPU-only analysis sources and staged switch targets are excluded.

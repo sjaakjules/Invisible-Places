@@ -78,9 +78,12 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 seepageGridParams;
     vec4 seepageBoundsMin;
     vec4 seepageBoundsMax;
+    uvec4 rainImpactControl;
+    vec4 rainImpactGrid;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"
+#include "pointcloud_rain_impact.glsl"
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
@@ -303,11 +306,14 @@ vec3 ResolveBaseColor() {
     const float waterEffectScale = ResolveRippleEffectScale();
     const SparseRippleComposite sparseRipple =
         ResolveSparseRippleComposite(inWorldPosition, inPointNormal, inPointIndex, styleData.renderParams3.w);
-    return ApplySparseRippleColor(
-        ApplyWaterEffectColor(
-            mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
-            waterEffectScale),
-        sparseRipple);
+    const RainImpactComposite rainImpact = ResolveRainImpactComposite(inWorldPosition, inPointNormal);
+    return ApplyRainImpactColour(
+        ApplySparseRippleColor(
+            ApplyWaterEffectColor(
+                mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+                waterEffectScale),
+            sparseRipple),
+        rainImpact);
 }
 
 void main() {

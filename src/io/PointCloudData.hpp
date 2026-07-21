@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,27 @@ struct PointCloudLoadResult {
     bool success = false;
 };
 
+struct PointCloudPositionNormalSample {
+    Float3 position{};
+    Float3 normal{};
+    bool hasNormal = false;
+};
+
+struct PointCloudStreamResult {
+    Bounds3f bounds;
+    std::uint64_t pointCount = 0;
+    std::string errorMessage;
+    bool hasNormals = false;
+    bool success = false;
+    bool cancelled = false;
+};
+
+using PointCloudPositionNormalVisitor =
+    std::function<bool(const PointCloudPositionNormalSample&, std::uint64_t)>;
+
 PointCloudLoadResult LoadPointCloud(const std::filesystem::path& filePath);
+PointCloudStreamResult StreamPointCloudPositionsNormals(
+    const std::filesystem::path& filePath,
+    const PointCloudPositionNormalVisitor& visitor);
 
 }  // namespace invisible_places::io

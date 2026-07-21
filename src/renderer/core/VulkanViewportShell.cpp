@@ -89,8 +89,7 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 pointMeta{0U, 0U, 0U, 0U};
     glm::uvec4 renderControl{0U, 1U, 0U, 0U};
     glm::vec4 renderParams0{1.0F, 0.55F, 4.0F, 1.6F};
-    // x: trail-style geometry, y: density footprint scale, z: density coverage correction,
-    // w: continuous Rain level.
+    // x: trail-style geometry, y: density footprint scale, z: density coverage correction.
     glm::vec4 renderParams1{0.0F, 1.0F, 1.0F, 0.0F};
     glm::vec4 renderParams2{1.0F, 0.0F, 1.0F, 0.0F};
     glm::vec4 renderParams3{0.0F, 1.0F, 64.0F, 0.0F};
@@ -135,7 +134,69 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 seepageGridParams{0.50F, 2.0F, 1.0F, 0.0F};
     glm::vec4 seepageBoundsMin{0.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 seepageBoundsMax{0.0F, 0.0F, 0.0F, 0.0F};
+    // x: enabled, y: scene role, z: grid dimension, w: event capacity.
+    glm::uvec4 rainImpactControl{0U, 0U, 0U, 0U};
+    // xy: grid origin, z: cell size, w: animation time.
+    glm::vec4 rainImpactGrid{0.0F, 0.0F, 0.125F, 0.0F};
 };
+
+struct alignas(16) RainUniformsGpu {
+    glm::mat4 viewProjection{1.0F};
+    glm::mat4 view{1.0F};
+    glm::mat4 projection{1.0F};
+    glm::vec4 cameraTime{0.0F, 0.0F, 1.0F, 0.0F};
+    glm::vec4 spawnCentreRadius{0.0F, 0.0F, 4.0F, 6.0F};
+    glm::vec4 cacheBoundsMinResolution{0.0F, 0.0F, 0.0F, invisible_places::water::kRainCollisionResolutionMeters};
+    glm::vec4 cacheBoundsMaxDeathDistance{0.0F, 0.0F, 0.0F, 28.0F};
+    glm::vec4 weather0{1.0F, 0.0F, 0.3F, 0.45F};
+    glm::vec4 weather1{0.35F, 8.0F, 2.5F, 0.4F};
+    glm::vec4 weather2{12.0F, 1.5F, 1.0F / 30.0F, 8.0F};
+    glm::vec4 visual0{0.003F, 0.16F, 0.42F, 0.58F};
+    glm::vec4 visual1{0.68F, 0.82F, 0.92F, 0.16F};
+    glm::vec4 visual2{0.65F, 4.0F, 1.0F, 1.0F};
+    glm::uvec4 simulation0{0U, invisible_places::water::kRainParticleCapacity,
+                           invisible_places::water::kRainImpactEventCapacity, 101U};
+    glm::uvec4 simulation1{0U, 0U, 1U, 1U};
+    glm::uvec4 collision0{0U, 0U, 1U, invisible_places::water::kRainImpactGridDimension};
+    glm::vec4 impactGrid{0.0F, 0.0F, 0.125F, 32.0F};
+    glm::uvec4 effectToggles{1U, 1U, 1U, 0U};
+    glm::vec4 effectScales{1.0F, 1.0F, 1.0F, 0.0F};
+    glm::vec4 viewport{1.0F, 1.0F, 1.0F, 1.0F};
+};
+
+struct alignas(16) RainParticleGpu {
+    glm::vec4 positionAge{0.0F};
+    glm::vec4 previousActivity{0.0F};
+    glm::vec4 velocity{0.0F};
+    glm::uvec4 state{0U};
+};
+
+struct alignas(16) RainImpactEventGpu {
+    glm::vec4 positionBirth{0.0F};
+    glm::vec4 normalRadius{0.0F, 0.0F, 1.0F, 0.04F};
+    glm::vec4 lifetimeEnergy{0.0F};
+    glm::uvec4 control{0U};
+};
+
+struct alignas(16) RainCountersGpu {
+    glm::uvec4 values{0U};
+};
+
+static_assert(sizeof(RainParticleGpu) == 64U);
+static_assert(sizeof(RainImpactEventGpu) == 64U);
+static_assert(sizeof(invisible_places::water::RainGpuSurfaceSlot) == 32U);
+static_assert(sizeof(invisible_places::water::RainGpuVegetationSlot) == 16U);
+
+std::uint32_t ActiveRainParticleCount(const SceneRenderState& state) {
+    const auto intensity = invisible_places::water::RainIntensityValues(
+        state.rainSettings.intensityPreset);
+    return std::min<std::uint32_t>(
+        invisible_places::water::kRainParticleCapacity,
+        static_cast<std::uint32_t>(std::lround(
+            state.rainSettings.activeParticleCount *
+            std::clamp(state.rainSettings.rainLevel, 0.0F, 1.0F) *
+            std::clamp(state.rainSettings.density * intensity.density, 0.0F, 1.0F))));
+}
 
 struct alignas(8) SparseWaterRippleRangeGpu {
     glm::uvec2 range{0U, 0U};
@@ -1072,6 +1133,7 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreatePresentRenderPass();
     CreatePointDescriptorSetLayout();
     CreateDynamicMeshFlowDescriptorSetLayout();
+    CreateRainDescriptorSetLayout();
     CreateGaussianSplatDescriptorSetLayout();
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
@@ -1079,12 +1141,14 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateDescriptorPools();
     CreatePostProcessSampler();
     CreateUniformResources();
+    CreateRainResources();
     CreateSceneColorResources();
     CreateDepthResources();
     CreateAccumulationResources();
     CreateLinearDepthResources();
     CreatePointPipelines();
     CreateDynamicMeshFlowComputePipeline();
+    CreateRainPipelines();
     CreateGaussianSplatPipeline();
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
@@ -1124,6 +1188,7 @@ VulkanViewportShell::~VulkanViewportShell() {
     gaussianSplatResources_.clear();
     CleanupHighQualityGaussianScene();
     CleanupExrExportResources();
+    CleanupRainResources();
 
     CleanupSwapchain();
 
@@ -1166,6 +1231,12 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (dynamicMeshFlowComputePipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, dynamicMeshFlowComputePipeline_, nullptr);
     }
+    if (rainComputePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, rainComputePipeline_, nullptr);
+    }
+    if (rainPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, rainPipeline_, nullptr);
+    }
     if (surfelDepthPrepassPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, surfelDepthPrepassPipeline_, nullptr);
     }
@@ -1196,6 +1267,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (dynamicMeshFlowPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, dynamicMeshFlowPipelineLayout_, nullptr);
     }
+    if (rainPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, rainPipelineLayout_, nullptr);
+    }
     if (gaussianSplatPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, gaussianSplatPipelineLayout_, nullptr);
     }
@@ -1225,6 +1299,9 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
     if (dynamicMeshFlowDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, dynamicMeshFlowDescriptorSetLayout_, nullptr);
+    }
+    if (rainDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, rainDescriptorSetLayout_, nullptr);
     }
     if (gaussianSplatDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, gaussianSplatDescriptorSetLayout_, nullptr);
@@ -1483,8 +1560,38 @@ void VulkanViewportShell::SetSceneCachingEnabled(bool enabled) {
     }
 }
 
+void VulkanViewportShell::UpdateRainRuntimeTiming(const SceneRenderState& state) {
+    if (std::isfinite(rainResources_.previousTimeSeconds) &&
+        state.flowTimeSeconds >= rainResources_.previousTimeSeconds) {
+        rainResources_.frameDeltaSeconds = std::clamp(
+            state.flowTimeSeconds - rainResources_.previousTimeSeconds,
+            1.0F / 240.0F,
+            0.25F);
+    } else {
+        rainResources_.frameDeltaSeconds = 1.0F / 30.0F;
+    }
+    if ((!rainResources_.previousRainEnabled && state.rainSettings.enabled) ||
+        state.rainSettings.seed != rainResources_.lastSeed ||
+        state.flowTimeSeconds < rainResources_.previousTimeSeconds) {
+        ++rainResources_.resetEpoch;
+        if (rainResources_.resetEpoch == 0U) {
+            rainResources_.resetEpoch = 1U;
+        }
+    }
+    rainResources_.lastSeed = state.rainSettings.seed;
+    rainResources_.previousTimeSeconds = state.flowTimeSeconds;
+    rainResources_.previousRainEnabled = state.rainSettings.enabled;
+}
+
 void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
+    UpdateRainRuntimeTiming(state);
     renderState_ = state;
+    for (auto& layer : renderState_.pointCloudLayers) {
+        layer.style.rainImpactEffects =
+            renderState_.rainSettings.enabled &&
+            renderState_.rainSettings.impactEffectsEnabled &&
+            layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None;
+    }
     ++sceneRevision_;
 
     std::uint64_t pointCount = 0;
@@ -1512,6 +1619,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         pointSizeWeight > 0 ? static_cast<float>(pointSizeSum / static_cast<double>(pointSizeWeight)) : 0.0F;
     diagnostics_.accumulationWidth = swapchainWidth_;
     diagnostics_.accumulationHeight = swapchainHeight_;
+    diagnostics_.rainActiveParticleCount = ActiveRainParticleCount(renderState_);
     diagnostics_.pointRenderModes =
         pointCount == 0 ? ""
                         : (renderState_.pointCloudRendererMode ==
@@ -2703,6 +2811,58 @@ void VulkanViewportShell::ClearPointClouds() {
     pointCloudResources_.clear();
 }
 
+void VulkanViewportShell::UploadRainCollisionCache(
+    const invisible_places::water::RainCollisionCache& cache) {
+    const auto gpuData = invisible_places::water::BuildRainCollisionGpuData(cache);
+    if (gpuData.surfaceTable.empty() || gpuData.vegetationTable.empty()) {
+        throw std::runtime_error{"Rain collision cache did not produce GPU hash tables."};
+    }
+
+    WaitIdle();
+    auto& resources = rainResources_;
+    DestroyBuffer(&resources.surfaceTableBuffer);
+    DestroyBuffer(&resources.vegetationTableBuffer);
+    resources.surfaceTableBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(gpuData.surfaceTable.size()) * sizeof(gpuData.surfaceTable.front()),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.vegetationTableBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(gpuData.vegetationTable.size()) * sizeof(gpuData.vegetationTable.front()),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources.surfaceTableBuffer,
+        gpuData.surfaceTable.data(),
+        static_cast<VkDeviceSize>(gpuData.surfaceTable.size()) * sizeof(gpuData.surfaceTable.front()));
+    UploadBufferData(
+        resources.vegetationTableBuffer,
+        gpuData.vegetationTable.data(),
+        static_cast<VkDeviceSize>(gpuData.vegetationTable.size()) * sizeof(gpuData.vegetationTable.front()));
+    resources.collisionBounds = cache.bounds;
+    resources.surfaceMask = gpuData.surfaceMask;
+    resources.vegetationMask = gpuData.vegetationMask;
+    resources.maximumProbeCount = std::max(1U, gpuData.maximumProbeCount);
+    resources.collisionCacheRevision = cache.revision;
+    ++resources.collisionUploadRevision;
+    resources.collisionReady = cache.bounds.valid;
+    ++resources.resetEpoch;
+    UpdateRainDescriptorSets();
+    diagnostics_.rainCollisionCacheRevision = resources.collisionCacheRevision;
+    diagnostics_.rainCollisionUploadRevision = resources.collisionUploadRevision;
+    ++sceneRevision_;
+}
+
+void VulkanViewportShell::ClearRainCollisionCache() {
+    rainResources_.collisionReady = false;
+    rainResources_.collisionBounds = {};
+    rainResources_.collisionCacheRevision = 0U;
+    ++rainResources_.resetEpoch;
+    diagnostics_.rainCollisionCacheRevision = 0U;
+    ++sceneRevision_;
+}
+
+std::uint64_t VulkanViewportShell::RainCollisionUploadRevision() const {
+    return rainResources_.collisionUploadRevision;
+}
+
 void VulkanViewportShell::UploadGaussianSplats(
     std::size_t layerId,
     const invisible_places::io::LoadedGaussianSplat& splats) {
@@ -2866,7 +3026,14 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
     auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
 
     try {
+        UpdateRainRuntimeTiming(request.renderState);
         renderState_ = request.renderState;
+        for (auto& layer : renderState_.pointCloudLayers) {
+            layer.style.rainImpactEffects =
+                renderState_.rainSettings.enabled &&
+                renderState_.rainSettings.impactEffectsEnabled &&
+                layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None;
+        }
         for (auto& resources : pointCloudResources_) {
             UpdatePointCloudExrDescriptorSet(&resources, exrExportResources_.depthImage.view);
         }
@@ -3673,7 +3840,7 @@ void VulkanViewportShell::CreatePresentRenderPass() {
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 13> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -3722,6 +3889,25 @@ void VulkanViewportShell::CreateDynamicMeshFlowDescriptorSetLayout() {
     Check(
         vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &dynamicMeshFlowDescriptorSetLayout_),
         "vkCreateDescriptorSetLayout(dynamic mesh flow)");
+}
+
+void VulkanViewportShell::CreateRainDescriptorSetLayout() {
+    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
+    for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorCount = 1;
+        bindings[bindingIndex].descriptorType =
+            bindingIndex == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[bindingIndex].stageFlags =
+            VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    Check(
+        vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &rainDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(rain)");
 }
 
 void VulkanViewportShell::CreateGaussianSplatDescriptorSetLayout() {
@@ -3851,6 +4037,122 @@ void VulkanViewportShell::CreateUniformResources() {
     for (auto& frame : frameResources_) {
         DestroyBuffer(&frame.uniformBuffer);
         frame.uniformBuffer = CreateHostVisibleBuffer(sizeof(FrameUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+}
+
+void VulkanViewportShell::CreateRainResources() {
+    auto& resources = rainResources_;
+    resources.surfaceTableBuffer = CreateHostVisibleBuffer(
+        2U * sizeof(invisible_places::water::RainGpuSurfaceSlot),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.vegetationTableBuffer = CreateHostVisibleBuffer(
+        2U * sizeof(invisible_places::water::RainGpuVegetationSlot),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.particleBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(invisible_places::water::kRainParticleCapacity) * sizeof(RainParticleGpu),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.eventBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(invisible_places::water::kRainImpactEventCapacity) * sizeof(RainImpactEventGpu),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.counterBuffer = CreateHostVisibleBuffer(
+        sizeof(RainCountersGpu),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.impactCountBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(invisible_places::water::kRainImpactGridDimension) *
+            invisible_places::water::kRainImpactGridDimension * sizeof(glm::uvec4),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.impactReferenceBuffer = CreateHostVisibleBuffer(
+        static_cast<VkDeviceSize>(invisible_places::water::kRainImpactGridDimension) *
+            invisible_places::water::kRainImpactGridDimension *
+            (invisible_places::water::kRainSandEventsPerCell +
+             invisible_places::water::kRainRockEventsPerCell +
+             invisible_places::water::kRainVegetationEventsPerCell) * sizeof(std::uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (auto& uniformBuffer : resources.uniformBuffers) {
+        uniformBuffer = CreateHostVisibleBuffer(sizeof(RainUniformsGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+
+    std::memset(resources.surfaceTableBuffer.mapped, 0, static_cast<std::size_t>(resources.surfaceTableBuffer.size));
+    std::memset(resources.vegetationTableBuffer.mapped, 0, static_cast<std::size_t>(resources.vegetationTableBuffer.size));
+    std::memset(resources.particleBuffer.mapped, 0, static_cast<std::size_t>(resources.particleBuffer.size));
+    std::memset(resources.eventBuffer.mapped, 0, static_cast<std::size_t>(resources.eventBuffer.size));
+    std::memset(resources.counterBuffer.mapped, 0, static_cast<std::size_t>(resources.counterBuffer.size));
+    std::memset(resources.impactCountBuffer.mapped, 0, static_cast<std::size_t>(resources.impactCountBuffer.size));
+    std::memset(
+        resources.impactReferenceBuffer.mapped,
+        0,
+        static_cast<std::size_t>(resources.impactReferenceBuffer.size));
+
+    std::array<VkDescriptorSetLayout, kFramesInFlight> layouts{};
+    layouts.fill(rainDescriptorSetLayout_);
+    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocInfo.descriptorPool = descriptorPool_;
+    allocInfo.descriptorSetCount = static_cast<std::uint32_t>(layouts.size());
+    allocInfo.pSetLayouts = layouts.data();
+    Check(
+        vkAllocateDescriptorSets(device_, &allocInfo, resources.descriptorSets.data()),
+        "vkAllocateDescriptorSets(rain)");
+    UpdateRainDescriptorSets();
+
+    diagnostics_.rainParticleCapacity = invisible_places::water::kRainParticleCapacity;
+    diagnostics_.rainEventCapacity = invisible_places::water::kRainImpactEventCapacity;
+}
+
+void VulkanViewportShell::CleanupRainResources() {
+    auto& resources = rainResources_;
+    if (descriptorPool_ != VK_NULL_HANDLE && resources.descriptorSets[0] != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(
+            device_,
+            descriptorPool_,
+            static_cast<std::uint32_t>(resources.descriptorSets.size()),
+            resources.descriptorSets.data());
+    }
+    resources.descriptorSets.fill(VK_NULL_HANDLE);
+    for (auto& uniformBuffer : resources.uniformBuffers) {
+        DestroyBuffer(&uniformBuffer);
+    }
+    DestroyBuffer(&resources.surfaceTableBuffer);
+    DestroyBuffer(&resources.vegetationTableBuffer);
+    DestroyBuffer(&resources.particleBuffer);
+    DestroyBuffer(&resources.eventBuffer);
+    DestroyBuffer(&resources.counterBuffer);
+    DestroyBuffer(&resources.impactCountBuffer);
+    DestroyBuffer(&resources.impactReferenceBuffer);
+    resources = {};
+}
+
+void VulkanViewportShell::UpdateRainDescriptorSets() {
+    auto& resources = rainResources_;
+    for (std::size_t frameIndex = 0; frameIndex < kFramesInFlight; ++frameIndex) {
+        const auto descriptorSet = resources.descriptorSets[frameIndex];
+        if (descriptorSet == VK_NULL_HANDLE) {
+            continue;
+        }
+        std::array<VkDescriptorBufferInfo, 8> infos{};
+        infos[0] = {resources.uniformBuffers[frameIndex].buffer, 0, sizeof(RainUniformsGpu)};
+        infos[1] = {resources.particleBuffer.buffer, 0, resources.particleBuffer.size};
+        infos[2] = {resources.eventBuffer.buffer, 0, resources.eventBuffer.size};
+        infos[3] = {resources.counterBuffer.buffer, 0, resources.counterBuffer.size};
+        infos[4] = {resources.surfaceTableBuffer.buffer, 0, resources.surfaceTableBuffer.size};
+        infos[5] = {resources.vegetationTableBuffer.buffer, 0, resources.vegetationTableBuffer.size};
+        infos[6] = {resources.impactCountBuffer.buffer, 0, resources.impactCountBuffer.size};
+        infos[7] = {resources.impactReferenceBuffer.buffer, 0, resources.impactReferenceBuffer.size};
+        std::array<VkWriteDescriptorSet, 8> writes{};
+        for (std::uint32_t binding = 0U; binding < writes.size(); ++binding) {
+            writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[binding].dstSet = descriptorSet;
+            writes[binding].dstBinding = binding;
+            writes[binding].descriptorType =
+                binding == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[binding].descriptorCount = 1U;
+            writes[binding].pBufferInfo = &infos[binding];
+        }
+        vkUpdateDescriptorSets(
+            device_,
+            static_cast<std::uint32_t>(writes.size()),
+            writes.data(),
+            0U,
+            nullptr);
     }
 }
 
@@ -4234,6 +4536,102 @@ void VulkanViewportShell::CreateDynamicMeshFlowComputePipeline() {
         "vkCreateComputePipelines(dynamic mesh flow)");
 
     vkDestroyShaderModule(device_, shaderModule, nullptr);
+}
+
+void VulkanViewportShell::CreateRainPipelines() {
+    const auto computeCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_simulation.comp.spv").string());
+    const auto vertexCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_particle.vert.spv").string());
+    const auto fragmentCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_particle.frag.spv").string());
+    const auto computeModule = CreateShaderModule(device_, computeCode, "vkCreateShaderModule(rain compute)");
+    const auto vertexModule = CreateShaderModule(device_, vertexCode, "vkCreateShaderModule(rain vertex)");
+    const auto fragmentModule = CreateShaderModule(device_, fragmentCode, "vkCreateShaderModule(rain fragment)");
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0U;
+    pushConstantRange.size = sizeof(std::uint32_t);
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1U;
+    layoutInfo.pSetLayouts = &rainDescriptorSetLayout_;
+    layoutInfo.pushConstantRangeCount = 1U;
+    layoutInfo.pPushConstantRanges = &pushConstantRange;
+    Check(
+        vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &rainPipelineLayout_),
+        "vkCreatePipelineLayout(rain)");
+
+    VkPipelineShaderStageCreateInfo computeStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    computeStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    computeStage.module = computeModule;
+    computeStage.pName = "main";
+    VkComputePipelineCreateInfo computeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    computeInfo.stage = computeStage;
+    computeInfo.layout = rainPipelineLayout_;
+    Check(
+        vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1U, &computeInfo, nullptr, &rainComputePipeline_),
+        "vkCreateComputePipelines(rain)");
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertexModule;
+    stages[0].pName = "main";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragmentModule;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewportState.viewportCount = 1U;
+    viewportState.scissorCount = 1U;
+    VkPipelineRasterizationStateCreateInfo rasterization{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization.cullMode = VK_CULL_MODE_NONE;
+    rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization.lineWidth = 1.0F;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    const std::array blendAttachments = {
+        MakeAdditiveBlendAttachment(),
+        MakeRevealageBlendAttachment(),
+        MakeAdditiveBlendAttachment(),
+    };
+    VkPipelineColorBlendStateCreateInfo colourBlend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    colourBlend.attachmentCount = static_cast<std::uint32_t>(blendAttachments.size());
+    colourBlend.pAttachments = blendAttachments.data();
+    constexpr std::array dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamicState.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+    VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterization;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colourBlend;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = rainPipelineLayout_;
+    pipelineInfo.renderPass = renderPass_;
+    pipelineInfo.subpass = 1U;
+    Check(
+        vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1U, &pipelineInfo, nullptr, &rainPipeline_),
+        "vkCreateGraphicsPipelines(rain)");
+
+    vkDestroyShaderModule(device_, fragmentModule, nullptr);
+    vkDestroyShaderModule(device_, vertexModule, nullptr);
+    vkDestroyShaderModule(device_, computeModule, nullptr);
 }
 
 void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uint32_t height) {
@@ -4636,6 +5034,10 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_exr_constant_simple_accumulation.frag.spv").string());
     const auto surfelDepthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
+    const auto rainVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_particle.vert.spv").string());
+    const auto rainFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_particle.frag.spv").string());
 
     const auto vertexModule = CreateShaderModule(device_, vertexShaderCode, "vkCreateShaderModule(exr point vertex)");
     const auto accumulationFragmentModule =
@@ -4671,6 +5073,10 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
             "vkCreateShaderModule(exr surfel simple accumulation fragment)");
     const auto surfelDepthFragmentModule =
         CreateShaderModule(device_, surfelDepthFragmentShaderCode, "vkCreateShaderModule(exr surfel depth fragment)");
+    const auto rainVertexModule =
+        CreateShaderModule(device_, rainVertexShaderCode, "vkCreateShaderModule(exr rain vertex)");
+    const auto rainFragmentModule =
+        CreateShaderModule(device_, rainFragmentShaderCode, "vkCreateShaderModule(exr rain fragment)");
 
     VkPipelineShaderStageCreateInfo vertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -4928,6 +5334,62 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         "vkCreateGraphicsPipelines(exr surfel simple accumulation)",
         &resources->surfelConstantSimpleAccumulationPipeline);
 
+    VkPipelineShaderStageCreateInfo rainVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    rainVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    rainVertexStage.module = rainVertexModule;
+    rainVertexStage.pName = "main";
+    VkPipelineShaderStageCreateInfo rainFragmentStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    rainFragmentStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    rainFragmentStage.module = rainFragmentModule;
+    rainFragmentStage.pName = "main";
+    const std::array rainStages = {rainVertexStage, rainFragmentStage};
+    VkPipelineVertexInputStateCreateInfo rainVertexInput{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo rainInputAssembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    rainInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineDepthStencilStateCreateInfo rainDepthStencil{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    rainDepthStencil.depthTestEnable = VK_TRUE;
+    rainDepthStencil.depthWriteEnable = VK_FALSE;
+    rainDepthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    const std::array rainBlendAttachments = {
+        MakeAdditiveBlendAttachment(),
+        MakeRevealageBlendAttachment(),
+        MakeAdditiveBlendAttachment(),
+        MakeAdditiveBlendAttachment(),
+        MakeAdditiveBlendAttachment(),
+    };
+    VkPipelineColorBlendStateCreateInfo rainColourBlend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    rainColourBlend.attachmentCount = static_cast<std::uint32_t>(rainBlendAttachments.size());
+    rainColourBlend.pAttachments = rainBlendAttachments.data();
+    VkGraphicsPipelineCreateInfo rainPipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    rainPipelineInfo.stageCount = static_cast<std::uint32_t>(rainStages.size());
+    rainPipelineInfo.pStages = rainStages.data();
+    rainPipelineInfo.pVertexInputState = &rainVertexInput;
+    rainPipelineInfo.pInputAssemblyState = &rainInputAssembly;
+    rainPipelineInfo.pViewportState = &viewportState;
+    rainPipelineInfo.pRasterizationState = &rasterizer;
+    rainPipelineInfo.pMultisampleState = &multisampling;
+    rainPipelineInfo.pDepthStencilState = &rainDepthStencil;
+    rainPipelineInfo.pColorBlendState = &rainColourBlend;
+    rainPipelineInfo.pDynamicState = &dynamicState;
+    rainPipelineInfo.layout = rainPipelineLayout_;
+    rainPipelineInfo.renderPass = resources->renderPass;
+    rainPipelineInfo.subpass = 1U;
+    Check(
+        vkCreateGraphicsPipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1U,
+            &rainPipelineInfo,
+            nullptr,
+            &resources->rainPipeline),
+        "vkCreateGraphicsPipelines(exr rain)");
+
+    vkDestroyShaderModule(device_, rainFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, rainVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
@@ -5741,12 +6203,24 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
         resources->seepageNodeReferenceBuffer.buffer,
         0,
         resources->seepageNodeReferenceBuffer.size};
+    VkDescriptorBufferInfo rainImpactCountInfo{
+        rainResources_.impactCountBuffer.buffer,
+        0,
+        rainResources_.impactCountBuffer.size};
+    VkDescriptorBufferInfo rainImpactReferenceInfo{
+        rainResources_.impactReferenceBuffer.buffer,
+        0,
+        rainResources_.impactReferenceBuffer.size};
+    VkDescriptorBufferInfo rainImpactEventInfo{
+        rainResources_.eventBuffer.buffer,
+        0,
+        rainResources_.eventBuffer.size};
 
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 13> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -5837,6 +6311,24 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[12].descriptorCount = 1;
     writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+    writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[13].dstSet = descriptorSet;
+    writes[13].dstBinding = 13;
+    writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[13].descriptorCount = 1;
+    writes[13].pBufferInfo = &rainImpactCountInfo;
+    writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[14].dstSet = descriptorSet;
+    writes[14].dstBinding = 14;
+    writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[14].descriptorCount = 1;
+    writes[14].pBufferInfo = &rainImpactReferenceInfo;
+    writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[15].dstSet = descriptorSet;
+    writes[15].dstBinding = 15;
+    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[15].descriptorCount = 1;
+    writes[15].pBufferInfo = &rainImpactEventInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -6120,12 +6612,24 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
         resources->seepageNodeReferenceBuffer.buffer,
         0,
         resources->seepageNodeReferenceBuffer.size};
+    VkDescriptorBufferInfo rainImpactCountInfo{
+        rainResources_.impactCountBuffer.buffer,
+        0,
+        rainResources_.impactCountBuffer.size};
+    VkDescriptorBufferInfo rainImpactReferenceInfo{
+        rainResources_.impactReferenceBuffer.buffer,
+        0,
+        rainResources_.impactReferenceBuffer.size};
+    VkDescriptorBufferInfo rainImpactEventInfo{
+        rainResources_.eventBuffer.buffer,
+        0,
+        rainResources_.eventBuffer.size};
 
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 13> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -6216,6 +6720,24 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[12].descriptorCount = 1;
     writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+    writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[13].dstSet = descriptorSet;
+    writes[13].dstBinding = 13;
+    writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[13].descriptorCount = 1;
+    writes[13].pBufferInfo = &rainImpactCountInfo;
+    writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[14].dstSet = descriptorSet;
+    writes[14].dstBinding = 14;
+    writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[14].descriptorCount = 1;
+    writes[14].pBufferInfo = &rainImpactReferenceInfo;
+    writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[15].dstSet = descriptorSet;
+    writes[15].dstBinding = 15;
+    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[15].descriptorCount = 1;
+    writes[15].pBufferInfo = &rainImpactEventInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -6270,11 +6792,23 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         resources->seepageNodeReferenceBuffer.buffer,
         0,
         resources->seepageNodeReferenceBuffer.size};
+    VkDescriptorBufferInfo rainImpactCountInfo{
+        rainResources_.impactCountBuffer.buffer,
+        0,
+        rainResources_.impactCountBuffer.size};
+    VkDescriptorBufferInfo rainImpactReferenceInfo{
+        rainResources_.impactReferenceBuffer.buffer,
+        0,
+        rainResources_.impactReferenceBuffer.size};
+    VkDescriptorBufferInfo rainImpactEventInfo{
+        rainResources_.eventBuffer.buffer,
+        0,
+        rainResources_.eventBuffer.size};
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 13> writes{};
+    std::array<VkWriteDescriptorSet, 16> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = resources->exrDescriptorSet;
     writes[0].dstBinding = 0;
@@ -6365,6 +6899,24 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[12].descriptorCount = 1;
     writes[12].pBufferInfo = &seepageNodeReferenceInfo;
+    writes[13] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[13].dstSet = resources->exrDescriptorSet;
+    writes[13].dstBinding = 13;
+    writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[13].descriptorCount = 1;
+    writes[13].pBufferInfo = &rainImpactCountInfo;
+    writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[14].dstSet = resources->exrDescriptorSet;
+    writes[14].dstBinding = 14;
+    writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[14].descriptorCount = 1;
+    writes[14].pBufferInfo = &rainImpactReferenceInfo;
+    writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[15].dstSet = resources->exrDescriptorSet;
+    writes[15].dstBinding = 15;
+    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[15].descriptorCount = 1;
+    writes[15].pBufferInfo = &rainImpactEventInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -7260,6 +7812,9 @@ void VulkanViewportShell::CleanupExrExportResources() {
     if (resources.surfelConstantSimpleAccumulationPipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.surfelConstantSimpleAccumulationPipeline, nullptr);
     }
+    if (resources.rainPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, resources.rainPipeline, nullptr);
+    }
     if (resources.compositePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, resources.compositePipeline, nullptr);
     }
@@ -7468,11 +8023,11 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.waterTrailStyleGeometry ? 1.0F : 0.0F,
         densityCompensation.footprintScale,
         densityCompensation.coverageCorrection,
-        std::clamp(layer.style.waterRainLevel, 0.0F, 1.0F),
+        0.0F,
     };
     styleGpu.renderParams2 = glm::vec4{
         kPointCloudAntialiasFeatherPixels,
-        std::clamp(layer.style.waterRainSpeedScale, 0.0F, 4.0F),
+        0.0F,
         std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
         renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
     };
@@ -7793,6 +8348,34 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             0.0F,
         };
     }
+    const auto rainRole = static_cast<std::uint32_t>(layer.rainCollisionRole);
+    bool rainRoleEnabled = false;
+    if (layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Sand) {
+        rainRoleEnabled = renderState_.rainSettings.sandEffectsEnabled;
+    } else if (layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Rock) {
+        rainRoleEnabled = renderState_.rainSettings.rockEffectsEnabled;
+    } else if (layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Vegetation) {
+        rainRoleEnabled = renderState_.rainSettings.vegetationEffectsEnabled;
+    }
+    const bool rainImpactsEnabled =
+        renderState_.rainSettings.enabled &&
+        renderState_.rainSettings.impactEffectsEnabled &&
+        rainResources_.collisionReady &&
+        rainRoleEnabled;
+    const float rainGridWorldSpan = invisible_places::water::RainImpactGridWorldSpan(
+        renderState_.rainSettings);
+    styleGpu.rainImpactControl = glm::uvec4{
+        rainImpactsEnabled ? 1U : 0U,
+        rainRole,
+        invisible_places::water::kRainImpactGridDimension,
+        invisible_places::water::kRainImpactEventCapacity,
+    };
+    styleGpu.rainImpactGrid = glm::vec4{
+        renderState_.cameraPosition.x - rainGridWorldSpan * 0.5F,
+        renderState_.cameraPosition.y - rainGridWorldSpan * 0.5F,
+        rainGridWorldSpan / static_cast<float>(invisible_places::water::kRainImpactGridDimension),
+        std::max(0.0F, renderState_.flowTimeSeconds),
+    };
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,
         layer.scalarFields,
@@ -8103,15 +8686,17 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     clearValues[9].color = {{0.0F, 0.0F, 0.0F, 0.0F}};
 
     const bool fastBasicPointRenderer =
-        request.renderState.pointCloudRendererMode ==
+        renderState_.pointCloudRendererMode ==
         renderer::pointcloud::PointCloudRendererMode::FastBasic;
     const bool forceFullSource = !request.previewDensity && !fastBasicPointRenderer;
-    for (const auto& layer : request.renderState.pointCloudLayers) {
+    for (const auto& layer : renderState_.pointCloudLayers) {
         PointCloudDrawPlan plan;
         if (ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
             static_cast<void>(UploadPointCloudLayerStyle(layer, plan, 0U, true));
         }
     }
+    UploadRainUniforms(0U, request.width, request.height);
+    RecordRainCompute(resources.commandBuffer, 0U);
 
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderPassInfo.renderPass = resources.renderPass;
@@ -8135,7 +8720,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
-    for (const auto& layer : request.renderState.pointCloudLayers) {
+    for (const auto& layer : renderState_.pointCloudLayers) {
         if (fastBasicPointRenderer) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
@@ -8154,7 +8739,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             layer.densityCompensation);
         const bool opaqueHardDisc =
             materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
-        if (opaqueHardDisc || request.renderState.eyeDomeLightingEnabled) {
+        if (opaqueHardDisc || renderState_.eyeDomeLightingEnabled) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
@@ -8173,7 +8758,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
     if (!fastBasicPointRenderer) {
-    for (const auto& layer : request.renderState.pointCloudLayers) {
+    for (const auto& layer : renderState_.pointCloudLayers) {
         VkPipeline spritePipeline = resources.pointAccumulationPipeline;
         VkPipeline surfelPipeline = resources.surfelAccumulationPipeline;
         if (renderer::pointcloud::ResolvePointCloudMaterialVariant(
@@ -8195,6 +8780,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             true));
     }
     }
+    RecordRainDraw(resources.commandBuffer, 0U, resources.rainPipeline);
 
     vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
@@ -8219,7 +8805,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
     if (fastBasicPointRenderer) {
-        for (const auto& layer : request.renderState.pointCloudLayers) {
+        for (const auto& layer : renderState_.pointCloudLayers) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
@@ -8352,6 +8938,8 @@ void VulkanViewportShell::RecordCommandBuffer(
                 }
             }
         }
+        UploadRainUniforms(frameIndex, swapchainWidth_, swapchainHeight_);
+        RecordRainCompute(commandBuffer, frameIndex);
     }
 
     if (drawLiveScene) {
@@ -8488,6 +9076,10 @@ void VulkanViewportShell::RecordCommandBuffer(
                 }
             }
         }
+    }
+
+    if (drawLiveScene) {
+        RecordRainDraw(commandBuffer, frameIndex, rainPipeline_);
     }
 
     if (drawLiveScene && !renderState_.gaussianSplatLayers.empty()) {
@@ -8849,6 +9441,255 @@ void VulkanViewportShell::UploadFrameUniformsToBuffer(
     uniforms.inverseViewProjection = glm::inverse(renderState_.viewProjection);
 
     UploadBufferData(buffer, &uniforms, sizeof(uniforms));
+}
+
+void VulkanViewportShell::UploadRainUniforms(
+    std::size_t frameIndex,
+    std::uint32_t width,
+    std::uint32_t height) {
+    auto& resources = rainResources_;
+    if (frameIndex >= resources.uniformBuffers.size() ||
+        resources.uniformBuffers[frameIndex].buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const auto& settings = renderState_.rainSettings;
+    const auto& visual = renderState_.rainVisual;
+    const auto intensity = invisible_places::water::RainIntensityValues(settings.intensityPreset);
+    const auto activeParticleCount = ActiveRainParticleCount(renderState_);
+    const float worldSpan = invisible_places::water::RainImpactGridWorldSpan(settings);
+
+    RainUniformsGpu uniforms;
+    uniforms.viewProjection = renderState_.viewProjection;
+    uniforms.view = renderState_.view;
+    uniforms.projection = renderState_.projection;
+    uniforms.cameraTime = glm::vec4{renderState_.cameraPosition, std::max(0.0F, renderState_.flowTimeSeconds)};
+    const float collisionTop = resources.collisionBounds.valid
+                                   ? resources.collisionBounds.maximum.z
+                                   : renderState_.rainSpawnCentre.z;
+    uniforms.spawnCentreRadius = glm::vec4{
+        renderState_.rainSpawnCentre.x,
+        renderState_.rainSpawnCentre.y,
+        collisionTop + settings.spawnHeightMeters,
+        std::max(0.1F, settings.spawnRadiusMeters),
+    };
+    if (resources.collisionBounds.valid) {
+        uniforms.cacheBoundsMinResolution = glm::vec4{
+            resources.collisionBounds.minimum.x,
+            resources.collisionBounds.minimum.y,
+            resources.collisionBounds.minimum.z,
+            invisible_places::water::kRainCollisionResolutionMeters,
+        };
+        uniforms.cacheBoundsMaxDeathDistance = glm::vec4{
+            resources.collisionBounds.maximum.x,
+            resources.collisionBounds.maximum.y,
+            resources.collisionBounds.maximum.z,
+            std::max(1.0F, settings.cameraDeathDistanceMeters),
+        };
+    }
+    uniforms.weather0 = glm::vec4{
+        settings.windDirectionX,
+        settings.windDirectionY,
+        std::max(0.0F, settings.windSpeedMetersPerSecond) * intensity.windResponse,
+        std::max(0.0F, settings.turbulence) * intensity.windResponse,
+    };
+    uniforms.weather1 = glm::vec4{
+        std::max(0.0F, settings.gustStrength),
+        std::max(0.2F, settings.gustScaleMeters),
+        std::max(0.0F, settings.gustSpeedMetersPerSecond),
+        std::clamp(settings.weatherFrontStrength, 0.0F, 1.0F),
+    };
+    uniforms.weather2 = glm::vec4{
+        std::max(0.2F, settings.weatherFrontScaleMeters),
+        std::max(0.0F, settings.weatherFrontSpeedMetersPerSecond),
+        resources.frameDeltaSeconds,
+        std::max(0.1F, settings.fallSpeedMetersPerSecond) * intensity.speed,
+    };
+    uniforms.visual0 = glm::vec4{
+        std::max(0.0001F, visual.widthMeters) * intensity.width,
+        std::max(0.001F, visual.streakLengthMeters) * intensity.length,
+        std::clamp(visual.softness, 0.0F, 1.0F),
+        std::clamp(visual.opacity * settings.opacityScale * intensity.opacity, 0.0F, 1.0F),
+    };
+    uniforms.visual1 = glm::vec4{
+        visual.colour[0],
+        visual.colour[1],
+        visual.colour[2],
+        std::max(0.0F, visual.emission * settings.emissionScale * intensity.emission),
+    };
+    uniforms.visual2 = glm::vec4{
+        std::max(0.0F, visual.minimumScreenPixels),
+        std::max(visual.minimumScreenPixels, visual.maximumScreenPixels),
+        std::max(0.05F, settings.dropletSizeScale),
+        intensity.effectEnergy,
+    };
+    uniforms.simulation0 = glm::uvec4{
+        activeParticleCount,
+        invisible_places::water::kRainParticleCapacity,
+        invisible_places::water::kRainImpactEventCapacity,
+        settings.seed,
+    };
+    uniforms.simulation1 = glm::uvec4{
+        settings.enabled && resources.collisionReady ? 1U : 0U,
+        settings.impactEffectsEnabled ? 1U : 0U,
+        resources.resetEpoch,
+        static_cast<std::uint32_t>(settings.intensityPreset),
+    };
+    uniforms.collision0 = glm::uvec4{
+        resources.surfaceMask,
+        resources.vegetationMask,
+        resources.maximumProbeCount,
+        invisible_places::water::kRainImpactGridDimension,
+    };
+    uniforms.impactGrid = glm::vec4{
+        renderState_.cameraPosition.x - worldSpan * 0.5F,
+        renderState_.cameraPosition.y - worldSpan * 0.5F,
+        worldSpan / static_cast<float>(invisible_places::water::kRainImpactGridDimension),
+        worldSpan,
+    };
+    uniforms.effectToggles = glm::uvec4{
+        settings.sandEffectsEnabled ? 1U : 0U,
+        settings.rockEffectsEnabled ? 1U : 0U,
+        settings.vegetationEffectsEnabled ? 1U : 0U,
+        0U,
+    };
+    uniforms.effectScales = glm::vec4{
+        std::max(0.0F, settings.sandEffectScale),
+        std::max(0.0F, settings.rockEffectScale),
+        std::max(0.0F, settings.vegetationEffectScale),
+        0.0F,
+    };
+    uniforms.viewport = glm::vec4{
+        std::max(1U, width),
+        std::max(1U, height),
+        1.0F / static_cast<float>(std::max(1U, width)),
+        1.0F / static_cast<float>(std::max(1U, height)),
+    };
+    UploadBufferData(resources.uniformBuffers[frameIndex], &uniforms, sizeof(uniforms));
+
+    if (!settings.impactEffectsEnabled) {
+        diagnostics_.rainImpactOverflowCount = 0U;
+        diagnostics_.rainEventsEmittedThisFrame = 0U;
+    } else if (resources.counterBuffer.mapped != nullptr) {
+        const auto* counters = static_cast<const RainCountersGpu*>(resources.counterBuffer.mapped);
+        diagnostics_.rainImpactOverflowCount = counters->values.y;
+        diagnostics_.rainEventsEmittedThisFrame = counters->values.z;
+    }
+}
+
+void VulkanViewportShell::RecordRainCompute(VkCommandBuffer commandBuffer, std::size_t frameIndex) {
+    if (!renderState_.rainSettings.enabled || !rainResources_.collisionReady ||
+        rainComputePipeline_ == VK_NULL_HANDLE || frameIndex >= rainResources_.descriptorSets.size()) {
+        return;
+    }
+    const auto descriptorSet = rainResources_.descriptorSets[frameIndex];
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rainComputePipeline_);
+    vkCmdBindDescriptorSets(
+        commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        rainPipelineLayout_,
+        0U,
+        1U,
+        &descriptorSet,
+        0U,
+        nullptr);
+
+    const auto barrier = [&](VkPipelineStageFlags destinationStage, VkAccessFlags destinationAccess) {
+        VkMemoryBarrier memoryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        memoryBarrier.dstAccessMask = destinationAccess;
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            destinationStage,
+            0U,
+            1U,
+            &memoryBarrier,
+            0U,
+            nullptr,
+            0U,
+            nullptr);
+    };
+
+    if (renderState_.rainSettings.impactEffectsEnabled) {
+        constexpr std::uint32_t clearPhase = 0U;
+        vkCmdPushConstants(
+            commandBuffer,
+            rainPipelineLayout_,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0U,
+            sizeof(clearPhase),
+            &clearPhase);
+        vkCmdDispatch(
+            commandBuffer,
+            (invisible_places::water::kRainImpactGridDimension *
+                 invisible_places::water::kRainImpactGridDimension +
+             63U) /
+                64U,
+            1U,
+            1U);
+        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
+    constexpr std::uint32_t simulationPhase = 1U;
+    vkCmdPushConstants(
+        commandBuffer,
+        rainPipelineLayout_,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0U,
+        sizeof(simulationPhase),
+        &simulationPhase);
+    vkCmdDispatch(
+        commandBuffer,
+        (invisible_places::water::kRainParticleCapacity + 63U) / 64U,
+        1U,
+        1U);
+
+    if (renderState_.rainSettings.impactEffectsEnabled) {
+        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        constexpr std::uint32_t binPhase = 2U;
+        vkCmdPushConstants(
+            commandBuffer,
+            rainPipelineLayout_,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0U,
+            sizeof(binPhase),
+            &binPhase);
+        vkCmdDispatch(
+            commandBuffer,
+            (invisible_places::water::kRainImpactEventCapacity + 63U) / 64U,
+            1U,
+            1U);
+    }
+    barrier(
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+}
+
+void VulkanViewportShell::RecordRainDraw(
+    VkCommandBuffer commandBuffer,
+    std::size_t frameIndex,
+    VkPipeline pipeline) {
+    if (!renderState_.rainSettings.enabled || !rainResources_.collisionReady ||
+        pipeline == VK_NULL_HANDLE || frameIndex >= rainResources_.descriptorSets.size()) {
+        return;
+    }
+    const auto activeParticleCount = ActiveRainParticleCount(renderState_);
+    if (activeParticleCount == 0U) {
+        return;
+    }
+    const auto descriptorSet = rainResources_.descriptorSets[frameIndex];
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(
+        commandBuffer,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        rainPipelineLayout_,
+        0U,
+        1U,
+        &descriptorSet,
+        0U,
+        nullptr);
+    vkCmdDraw(commandBuffer, 6U, activeParticleCount, 0U, 0U);
 }
 
 VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuffer(

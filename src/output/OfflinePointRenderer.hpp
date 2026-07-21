@@ -4,10 +4,12 @@
 #include "io/PointCloudData.hpp"
 #include "output/ExrWriter.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
+#include "water/RainSimulation.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
@@ -39,8 +41,29 @@ struct OfflinePointLayer {
     std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
     std::vector<glm::uvec2> rippleMembershipRanges;
     invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
+    invisible_places::water::RainCollisionRole rainCollisionRole =
+        invisible_places::water::RainCollisionRole::None;
+    const invisible_places::water::RainImpactGrid* rainImpactGrid = nullptr;
     float roughnessMotionMinimum = 0.0F;
     float roughnessMotionInvRange = 1.0F;
+};
+
+struct OfflineRainFrame {
+    invisible_places::water::RainRuntimeSettings settings{};
+    invisible_places::water::WaterRainVisualSettings visual{};
+    std::span<const invisible_places::water::RainParticle> particles;
+    float timeSeconds = 0.0F;
+};
+
+struct OfflineRainSimulationState {
+    explicit OfflineRainSimulationState(
+        std::uint32_t particleCapacity = invisible_places::water::kRainParticleCapacity)
+        : simulator(particleCapacity) {}
+
+    invisible_places::water::RainSimulator simulator;
+    invisible_places::water::RainImpactGrid impactGrid;
+    invisible_places::water::RainSimulationDiagnostics diagnostics{};
+    OfflineRainFrame frame{};
 };
 
 struct OfflineRenderTile {
@@ -76,6 +99,14 @@ struct OfflinePointRenderScratch {
 };
 
 void InitializeExrImage(ExrImage* image, std::uint32_t width, std::uint32_t height);
+void AdvanceOfflineRainFrame(
+    OfflineRainSimulationState* state,
+    const invisible_places::water::RainCollisionCache& collisionCache,
+    const invisible_places::water::RainRuntimeSettings& settings,
+    const invisible_places::water::WaterRainVisualSettings& visual,
+    const invisible_places::camera::CameraState& cameraState,
+    float timeSeconds,
+    float deltaSeconds);
 std::vector<OfflineRenderTile> BuildOfflineRenderTiles(
     std::uint32_t width,
     std::uint32_t height,
@@ -87,6 +118,7 @@ void RenderPointCloudTile(
     ExrImage* image,
     OfflinePointRenderDiagnostics* diagnostics = nullptr,
     OfflinePointRenderScratch* scratch = nullptr,
-    float stylisationTimeSeconds = 0.0F);
+    float stylisationTimeSeconds = 0.0F,
+    const OfflineRainFrame* rainFrame = nullptr);
 
 }  // namespace invisible_places::output

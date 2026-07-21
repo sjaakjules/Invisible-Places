@@ -1,0 +1,452 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct RainParticle {
+    vec4 positionAge;
+    vec4 previousActivity;
+    vec4 velocity;
+    uvec4 state;
+};
+
+struct RainImpactEvent {
+    vec4 positionBirth;
+    vec4 normalRadius;
+    vec4 lifetimeEnergy;
+    uvec4 control;
+};
+
+struct RainSurfaceSlot {
+    ivec2 coordinate;
+    float rockHeight;
+    float sandHeight;
+    uint packedRockNormal;
+    uint packedSandNormal;
+    float rockConfidence;
+    float sandConfidence;
+};
+
+struct RainVegetationSlot {
+    ivec3 coordinate;
+    uint packedNormal;
+};
+
+layout(set = 0, binding = 0, std140) uniform RainUniforms {
+    mat4 viewProjection;
+    mat4 view;
+    mat4 projection;
+    vec4 cameraTime;
+    vec4 spawnCentreRadius;
+    vec4 cacheBoundsMinResolution;
+    vec4 cacheBoundsMaxDeathDistance;
+    vec4 weather0;
+    vec4 weather1;
+    vec4 weather2;
+    vec4 visual0;
+    vec4 visual1;
+    vec4 visual2;
+    uvec4 simulation0;
+    uvec4 simulation1;
+    uvec4 collision0;
+    vec4 impactGrid;
+    uvec4 effectToggles;
+    vec4 effectScales;
+    vec4 viewport;
+} rain;
+
+layout(set = 0, binding = 1, std430) buffer RainParticles {
+    RainParticle particles[];
+};
+
+layout(set = 0, binding = 2, std430) buffer RainEvents {
+    RainImpactEvent events[];
+};
+
+layout(set = 0, binding = 3, std430) buffer RainCounters {
+    uint eventWriteIndex;
+    uint overflowCount;
+    uint emittedThisFrame;
+    uint reservedCounter;
+} counters;
+
+layout(set = 0, binding = 4, std430) readonly buffer RainSurfaceTable {
+    RainSurfaceSlot surfaceSlots[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer RainVegetationTable {
+    RainVegetationSlot vegetationSlots[];
+};
+
+layout(set = 0, binding = 6, std430) buffer RainImpactCounts {
+    uvec4 impactCounts[];
+};
+
+layout(set = 0, binding = 7, std430) buffer RainImpactReferences {
+    uint impactReferences[];
+};
+
+layout(push_constant) uniform RainPushConstants {
+    uint phase;
+} pushConstants;
+
+const int kEmptyCoordinate = -2147483648;
+const uint kRoleRock = 1u;
+const uint kRoleSand = 2u;
+const uint kRoleVegetation = 3u;
+const uint kSandCapacity = 8u;
+const uint kRockCapacity = 8u;
+const uint kVegetationCapacity = 4u;
+const uint kReferencesPerCell = 20u;
+const float kPi = 3.14159265359;
+
+uint HashBits(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16u);
+}
+
+uint HashCell(ivec3 coordinate) {
+    uint hash = HashBits(uint(coordinate.x));
+    hash ^= (HashBits(uint(coordinate.y)) << 11u) | (HashBits(uint(coordinate.y)) >> 21u);
+    hash ^= (HashBits(uint(coordinate.z)) << 22u) | (HashBits(uint(coordinate.z)) >> 10u);
+    return HashBits(hash);
+}
+
+float Random01(uint value) {
+    return float(HashBits(value) & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 DecodeNormal(uint packed) {
+    vec3 normal = vec3(
+        float(packed & 1023u),
+        float((packed >> 10u) & 1023u),
+        float((packed >> 20u) & 1023u)) / 1023.0 * 2.0 - 1.0;
+    return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+}
+
+bool FindSurface(ivec2 coordinate, out RainSurfaceSlot result) {
+    const uint mask = rain.collision0.x;
+    const uint initial = HashCell(ivec3(coordinate, 0)) & mask;
+    for (uint probe = 0u; probe < min(32u, rain.collision0.z); ++probe) {
+        const RainSurfaceSlot candidate = surfaceSlots[(initial + probe) & mask];
+        if (candidate.coordinate.x == kEmptyCoordinate) {
+            return false;
+        }
+        if (all(equal(candidate.coordinate, coordinate))) {
+            result = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FindVegetation(ivec3 coordinate, out RainVegetationSlot result) {
+    const uint mask = rain.collision0.y;
+    const uint initial = HashCell(coordinate) & mask;
+    for (uint probe = 0u; probe < min(32u, rain.collision0.z); ++probe) {
+        const RainVegetationSlot candidate = vegetationSlots[(initial + probe) & mask];
+        if (candidate.coordinate.x == kEmptyCoordinate) {
+            return false;
+        }
+        if (all(equal(candidate.coordinate, coordinate))) {
+            result = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+float WeatherFrontWave(vec3 position) {
+    const float scale = max(0.2, rain.weather2.x);
+    const float phase =
+        (position.x + position.y) / scale - rain.cameraTime.w * rain.weather2.y / scale;
+    return 0.5 + 0.5 * sin(phase * 2.0 * kPi);
+}
+
+bool TraceCollision(vec3 start, vec3 end, out vec3 hitPosition, out vec3 hitNormal, out uint hitRole) {
+    const float resolution = max(0.001, rain.cacheBoundsMinResolution.w);
+    const vec3 delta = end - start;
+    ivec3 cell = ivec3(floor(start / resolution));
+    const ivec3 endCell = ivec3(floor(end / resolution));
+    const ivec3 cellStep = ivec3(
+        delta.x > 1e-7 ? 1 : (delta.x < -1e-7 ? -1 : 0),
+        delta.y > 1e-7 ? 1 : (delta.y < -1e-7 ? -1 : 0),
+        delta.z > 1e-7 ? 1 : (delta.z < -1e-7 ? -1 : 0));
+    const vec3 boundary = vec3(
+        float(cell.x + (cellStep.x > 0 ? 1 : 0)) * resolution,
+        float(cell.y + (cellStep.y > 0 ? 1 : 0)) * resolution,
+        float(cell.z + (cellStep.z > 0 ? 1 : 0)) * resolution);
+    vec3 maximumTime = vec3(
+        cellStep.x == 0 ? 3.402823466e38 : max(0.0, (boundary.x - start.x) / delta.x),
+        cellStep.y == 0 ? 3.402823466e38 : max(0.0, (boundary.y - start.y) / delta.y),
+        cellStep.z == 0 ? 3.402823466e38 : max(0.0, (boundary.z - start.z) / delta.z));
+    const vec3 timeDelta = vec3(
+        cellStep.x == 0 ? 3.402823466e38 : resolution / abs(delta.x),
+        cellStep.y == 0 ? 3.402823466e38 : resolution / abs(delta.y),
+        cellStep.z == 0 ? 3.402823466e38 : resolution / abs(delta.z));
+
+    float entryTime = 0.0;
+    for (uint traversal = 0u; traversal < 1024u; ++traversal) {
+        const float exitTime = min(1.0, min(maximumTime.x, min(maximumTime.y, maximumTime.z)));
+        RainVegetationSlot vegetation;
+        if (FindVegetation(cell, vegetation)) {
+            hitPosition = mix(start, end, entryTime);
+            hitNormal = DecodeNormal(vegetation.packedNormal);
+            hitRole = kRoleVegetation;
+            return true;
+        }
+
+        RainSurfaceSlot surface;
+        if (delta.z < -1e-7 && FindSurface(cell.xy, surface)) {
+            float bestTime = 2.0;
+            float height = 0.0;
+            uint role = 0u;
+            uint packedNormal = 0u;
+            const float rockTime = (surface.rockHeight - start.z) / delta.z;
+            if (!isinf(surface.rockHeight) && rockTime >= entryTime - 1e-6 &&
+                rockTime <= exitTime + 1e-6 && rockTime >= 0.0 && rockTime <= 1.0) {
+                const ivec2 hitCell = ivec2(floor(mix(start, end, rockTime).xy / resolution));
+                if (all(equal(hitCell, cell.xy))) {
+                    bestTime = rockTime;
+                    height = surface.rockHeight;
+                    role = kRoleRock;
+                    packedNormal = surface.packedRockNormal;
+                }
+            }
+            const float sandTime = (surface.sandHeight - start.z) / delta.z;
+            if (!isinf(surface.sandHeight) && sandTime >= entryTime - 1e-6 &&
+                sandTime <= exitTime + 1e-6 && sandTime >= 0.0 && sandTime <= 1.0 && sandTime < bestTime) {
+                const ivec2 hitCell = ivec2(floor(mix(start, end, sandTime).xy / resolution));
+                if (all(equal(hitCell, cell.xy))) {
+                    bestTime = sandTime;
+                    height = surface.sandHeight;
+                    role = kRoleSand;
+                    packedNormal = surface.packedSandNormal;
+                }
+            }
+            if (role != 0u) {
+                hitPosition = mix(start, end, bestTime);
+                hitPosition.z = height;
+                hitNormal = DecodeNormal(packedNormal);
+                hitRole = role;
+                return true;
+            }
+        }
+
+        if (exitTime >= 1.0 - 1e-6 || all(equal(cell, endCell))) {
+            break;
+        }
+        bool advanced = false;
+        if (maximumTime.x <= exitTime + 1e-6) {
+            cell.x += cellStep.x;
+            maximumTime.x += timeDelta.x;
+            advanced = true;
+        }
+        if (maximumTime.y <= exitTime + 1e-6) {
+            cell.y += cellStep.y;
+            maximumTime.y += timeDelta.y;
+            advanced = true;
+        }
+        if (maximumTime.z <= exitTime + 1e-6) {
+            cell.z += cellStep.z;
+            maximumTime.z += timeDelta.z;
+            advanced = true;
+        }
+        if (!advanced) {
+            break;
+        }
+        entryTime = clamp(exitTime, 0.0, 1.0);
+    }
+    return false;
+}
+
+void SpawnParticle(uint index, inout RainParticle particle) {
+    particle.state.y += 1u;
+    const uint base = rain.simulation0.w ^ HashBits(index + particle.state.y * 0x9e3779b9u);
+    const float angle = Random01(base + 1u) * 2.0 * kPi;
+    const float radius = sqrt(Random01(base + 2u)) * max(0.1, rain.spawnCentreRadius.w);
+    particle.positionAge = vec4(
+        rain.spawnCentreRadius.xyz + vec3(cos(angle) * radius, sin(angle) * radius, Random01(base + 3u) * 0.75),
+        0.0);
+    particle.previousActivity = vec4(particle.positionAge.xyz, 1.0);
+    particle.velocity = vec4(0.0);
+    const float frontProbability = mix(
+        1.0,
+        0.12 + WeatherFrontWave(particle.positionAge.xyz) * 0.88,
+        clamp(rain.weather1.w, 0.0, 1.0));
+    particle.state.x = Random01(base + 4u) <= frontProbability ? 1u : 0u;
+    particle.state.z = base;
+    particle.state.w = rain.simulation1.z;
+}
+
+bool RoleEffectEnabled(uint role) {
+    return (role == kRoleSand && rain.effectToggles.x != 0u) ||
+           (role == kRoleRock && rain.effectToggles.y != 0u) ||
+           (role == kRoleVegetation && rain.effectToggles.z != 0u);
+}
+
+void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
+    if (rain.simulation1.y == 0u || !RoleEffectEnabled(role)) {
+        return;
+    }
+    const float impactSpeed = max(0.1, length(particle.velocity.xyz));
+    const float dropWidth = max(0.0001, rain.visual0.x * rain.visual2.z);
+    float roleScale = role == kRoleSand ? rain.effectScales.x :
+                      (role == kRoleRock ? rain.effectScales.y : rain.effectScales.z);
+    float radius = role == kRoleSand
+        ? clamp(0.020 + dropWidth * 6.0 + impactSpeed * 0.0015, 0.025, 0.11)
+        : (role == kRoleRock
+            ? clamp(0.028 + dropWidth * 10.0 + impactSpeed * 0.0020, 0.035, 0.16)
+            : clamp(0.016 + dropWidth * 4.0, 0.018, 0.065));
+    float lifetime = role == kRoleSand
+        ? 0.48 + min(0.35, impactSpeed * 0.018)
+        : (role == kRoleRock
+            ? 3.8 + min(2.2, impactSpeed * 0.12)
+            : 1.1 + min(0.7, impactSpeed * 0.045));
+    const float energy = clamp(
+        (dropWidth / 0.003) * (impactSpeed / 8.0) * rain.visual2.w * roleScale,
+        0.05,
+        2.5);
+    const uint writeIndex = atomicAdd(counters.eventWriteIndex, 1u) % rain.simulation0.z;
+    events[writeIndex].positionBirth = vec4(position, rain.cameraTime.w);
+    events[writeIndex].normalRadius = vec4(normalize(normal), radius);
+    events[writeIndex].lifetimeEnergy = vec4(lifetime, energy, 0.0, 0.0);
+    events[writeIndex].control = uvec4(role, particle.state.z, rain.simulation1.z, 0u);
+    atomicAdd(counters.emittedThisFrame, 1u);
+}
+
+void AdvanceParticle(uint index) {
+    if (index >= rain.simulation0.y) {
+        return;
+    }
+    RainParticle particle = particles[index];
+    if (particle.state.w != rain.simulation1.z) {
+        particle = RainParticle(vec4(0.0), vec4(0.0), vec4(0.0), uvec4(0u, 0u, 0u, rain.simulation1.z));
+    }
+    if (rain.simulation1.x == 0u || index >= rain.simulation0.x) {
+        particle.state.x = 0u;
+        particles[index] = particle;
+        return;
+    }
+    if (particle.state.x == 0u) {
+        SpawnParticle(index, particle);
+        if (particle.state.x == 0u) {
+            particles[index] = particle;
+            return;
+        }
+    }
+
+    const float frontWave = WeatherFrontWave(particle.positionAge.xyz);
+    const float front = 1.0 + (frontWave * 2.0 - 1.0) * rain.weather1.w * 0.35;
+    const float gustScale = max(0.2, rain.weather1.y);
+    const float gustPhase =
+        (particle.positionAge.x * 0.73 + particle.positionAge.y * 0.41) / gustScale +
+        rain.cameraTime.w * rain.weather1.z / gustScale;
+    const float gustFrontScale = mix(0.65, 1.35, frontWave);
+    const float gust = 1.0 + sin(gustPhase * 2.0 * kPi + Random01(particle.state.z) * kPi) *
+        rain.weather1.x * gustFrontScale;
+    const vec2 turbulence = vec2(
+        sin(rain.cameraTime.w * 2.7 + Random01(particle.state.z + 11u) * 17.0),
+        cos(rain.cameraTime.w * 2.2 + Random01(particle.state.z + 19u) * 19.0)) * rain.weather0.w;
+    vec2 windDirection = rain.weather0.xy;
+    windDirection = dot(windDirection, windDirection) > 1e-8 ? normalize(windDirection) : vec2(1.0, 0.0);
+    particle.velocity = vec4(
+        windDirection * rain.weather0.z * gust + turbulence,
+        -rain.weather2.w * max(0.35, front),
+        0.0);
+    particle.previousActivity.xyz = particle.positionAge.xyz;
+    particle.previousActivity.w = clamp(front, 0.25, 1.5);
+    particle.positionAge.xyz += particle.velocity.xyz * clamp(rain.weather2.z, 0.0, 0.25);
+    particle.positionAge.w += clamp(rain.weather2.z, 0.0, 0.25);
+
+    vec3 hitPosition;
+    vec3 hitNormal;
+    uint hitRole;
+    if (TraceCollision(particle.previousActivity.xyz, particle.positionAge.xyz, hitPosition, hitNormal, hitRole)) {
+        EmitImpact(hitPosition, hitNormal, hitRole, particle);
+        SpawnParticle(index, particle);
+        particles[index] = particle;
+        return;
+    }
+
+    const vec3 cameraOffset = particle.positionAge.xyz - rain.cameraTime.xyz;
+    const float deathDistance = max(1.0, rain.cacheBoundsMaxDeathDistance.w);
+    const bool escaped = dot(cameraOffset, cameraOffset) > deathDistance * deathDistance ||
+        particle.positionAge.z < rain.cacheBoundsMinResolution.z - 1.0 ||
+        particle.positionAge.x < rain.cacheBoundsMinResolution.x - deathDistance ||
+        particle.positionAge.x > rain.cacheBoundsMaxDeathDistance.x + deathDistance ||
+        particle.positionAge.y < rain.cacheBoundsMinResolution.y - deathDistance ||
+        particle.positionAge.y > rain.cacheBoundsMaxDeathDistance.y + deathDistance;
+    if (escaped) {
+        SpawnParticle(index, particle);
+    }
+    particles[index] = particle;
+}
+
+void BinEvent(uint eventIndex) {
+    if (rain.simulation1.y == 0u || eventIndex >= rain.simulation0.z) {
+        return;
+    }
+    const RainImpactEvent event = events[eventIndex];
+    const float age = rain.cameraTime.w - event.positionBirth.w;
+    if (event.control.x == 0u || event.control.z != rain.simulation1.z || age < 0.0 ||
+        age > event.lifetimeEnergy.x || !RoleEffectEnabled(event.control.x)) {
+        return;
+    }
+    const float cellSize = max(0.01, rain.impactGrid.z);
+    const int dimension = int(rain.collision0.w);
+    const ivec2 minimumCell = ivec2(floor(
+        (event.positionBirth.xy - vec2(event.normalRadius.w) - rain.impactGrid.xy) / cellSize));
+    const ivec2 maximumCell = ivec2(floor(
+        (event.positionBirth.xy + vec2(event.normalRadius.w) - rain.impactGrid.xy) / cellSize));
+    for (int y = max(0, minimumCell.y); y <= min(dimension - 1, maximumCell.y); ++y) {
+        for (int x = max(0, minimumCell.x); x <= min(dimension - 1, maximumCell.x); ++x) {
+            const uint cellIndex = uint(y * dimension + x);
+            uint slot = 0u;
+            uint capacity = 0u;
+            uint offset = 0u;
+            if (event.control.x == kRoleSand) {
+                slot = atomicAdd(impactCounts[cellIndex].x, 1u);
+                capacity = kSandCapacity;
+                offset = 0u;
+            } else if (event.control.x == kRoleRock) {
+                slot = atomicAdd(impactCounts[cellIndex].y, 1u);
+                capacity = kRockCapacity;
+                offset = kSandCapacity;
+            } else {
+                slot = atomicAdd(impactCounts[cellIndex].z, 1u);
+                capacity = kVegetationCapacity;
+                offset = kSandCapacity + kRockCapacity;
+            }
+            if (slot < capacity) {
+                impactReferences[cellIndex * kReferencesPerCell + offset + slot] = eventIndex;
+            } else {
+                atomicAdd(counters.overflowCount, 1u);
+            }
+        }
+    }
+}
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (pushConstants.phase == 0u) {
+        const uint cellCount = rain.collision0.w * rain.collision0.w;
+        if (index < cellCount) {
+            impactCounts[index] = uvec4(0u);
+        }
+        if (index == 0u) {
+            if (counters.reservedCounter != rain.simulation1.z) {
+                counters.eventWriteIndex = 0u;
+                counters.reservedCounter = rain.simulation1.z;
+            }
+            counters.overflowCount = 0u;
+            counters.emittedThisFrame = 0u;
+        }
+    } else if (pushConstants.phase == 1u) {
+        AdvanceParticle(index);
+    } else {
+        BinEvent(index);
+    }
+}

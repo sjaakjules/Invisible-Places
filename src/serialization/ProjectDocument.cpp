@@ -78,7 +78,8 @@ using invisible_places::water::WaterPathCache;
 using invisible_places::water::WaterPathGenerationSettings;
 using invisible_places::water::WaterPathTerminationReason;
 using invisible_places::water::WaterRenderSettings;
-using invisible_places::water::WaterRainSettings;
+using invisible_places::water::RainRuntimeSettings;
+using invisible_places::water::WaterRainVisualSettings;
 using invisible_places::water::WaterRippleOverlayType;
 using invisible_places::water::WaterRipplePatternSettings;
 using invisible_places::water::WaterRippleRuntimeMembership;
@@ -127,8 +128,11 @@ json SerializeWaterFieldTrailSettings(const WaterFieldTrailSettings& settings);
 WaterFieldTrailSettings ParseWaterFieldTrailSettings(const json& settingsJson);
 json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& settings);
 WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& settingsJson);
-json SerializeWaterRainSettings(const WaterRainSettings& settings);
-WaterRainSettings ParseWaterRainSettings(const json& settingsJson);
+json SerializeWaterRainSettings(
+    const RainRuntimeSettings& settings,
+    const WaterRainVisualSettings& visual);
+RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson);
+WaterRainVisualSettings ParseWaterRainVisualSettings(const json& settingsJson);
 json SerializeWaterPathCache(const WaterPathCache& cache);
 WaterPathCache ParseWaterPathCache(const json& cacheJson);
 json SerializeWaterVisualSettings(const WaterVisualSettings& settings);
@@ -3899,93 +3903,136 @@ WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocum
     return state;
 }
 
-json SerializeWaterRainSettings(const WaterRainSettings& settings) {
+json SerializeWaterRainSettings(
+    const RainRuntimeSettings& settings,
+    const WaterRainVisualSettings& visual) {
     return json{
+        {"version", 2},
         {"enabled", settings.enabled},
-        {"vegetation_interception_enabled", settings.vegetationInterceptionEnabled},
-        {"surface_runoff_enabled", settings.surfaceRunoffEnabled},
-        {"splash_enabled", settings.splashEnabled},
-        {"intensity_preset", invisible_places::water::WaterRainIntensityPresetNameForStorage(settings.intensityPreset)},
-        {"drop_count", settings.dropCount},
+        {"impact_effects_enabled", settings.impactEffectsEnabled},
+        {"sand_effects_enabled", settings.sandEffectsEnabled},
+        {"rock_effects_enabled", settings.rockEffectsEnabled},
+        {"vegetation_effects_enabled", settings.vegetationEffectsEnabled},
+        {"intensity_preset", invisible_places::water::WaterRainIntensityPresetNameForStorage(
+                                 static_cast<invisible_places::water::WaterRainIntensityPreset>(
+                                     settings.intensityPreset))},
+        {"visual_profile_name", settings.visualProfileName},
+        {"active_particle_count", settings.activeParticleCount},
+        {"seed", settings.seed},
+        {"rain_level", settings.rainLevel},
+        {"density", settings.density},
         {"fall_speed_meters_per_second", settings.fallSpeedMetersPerSecond},
+        {"droplet_size_scale", settings.dropletSizeScale},
+        {"opacity_scale", settings.opacityScale},
+        {"emission_scale", settings.emissionScale},
         {"spawn_height_meters", settings.spawnHeightMeters},
         {"spawn_radius_meters", settings.spawnRadiusMeters},
-        {"spawn_out_of_frame_margin", settings.spawnOutOfFrameMargin},
-        {"surface_search_radius_meters", settings.surfaceSearchRadiusMeters},
-        {"downhill_search_radius_meters", settings.downhillSearchRadiusMeters},
-        {"kill_below_scene_meters", settings.killBelowSceneMeters},
         {"camera_death_distance_meters", settings.cameraDeathDistanceMeters},
-        {"surface_run_speed_meters_per_second", settings.surfaceRunSpeedMetersPerSecond},
-        {"sand_run_distance_meters", settings.sandRunDistanceMeters},
-        {"splash_strength", settings.splashStrength},
-        {"splash_max_distance_meters", settings.splashMaxDistanceMeters},
-        {"splash_droplet_limit", settings.splashDropletLimit},
         {"wind_direction_x", settings.windDirectionX},
         {"wind_direction_y", settings.windDirectionY},
-        {"wind_strength_meters", settings.windStrengthMeters},
-        {"wind_noise", settings.windNoise},
-        {"wind_response", settings.windResponse},
-        {"trail_length_meters", settings.trailLengthMeters},
-        {"trail_point_spacing_meters", settings.trailPointSpacingMeters},
-        {"trail_width_meters", settings.trailWidthMeters},
-        {"trail_streak_length_meters", settings.trailStreakLengthMeters},
-        {"route_anchor_count", settings.routeAnchorCount},
-        {"support_sample_limit", settings.supportSampleLimit},
-        {"seed", settings.seed},
+        {"wind_speed_meters_per_second", settings.windSpeedMetersPerSecond},
+        {"turbulence", settings.turbulence},
+        {"gust_strength", settings.gustStrength},
+        {"gust_scale_meters", settings.gustScaleMeters},
+        {"gust_speed_meters_per_second", settings.gustSpeedMetersPerSecond},
+        {"weather_front_strength", settings.weatherFrontStrength},
+        {"weather_front_scale_meters", settings.weatherFrontScaleMeters},
+        {"weather_front_speed_meters_per_second", settings.weatherFrontSpeedMetersPerSecond},
+        {"sand_effect_scale", settings.sandEffectScale},
+        {"rock_effect_scale", settings.rockEffectScale},
+        {"vegetation_effect_scale", settings.vegetationEffectScale},
+        {"visual_profile",
+         {{"colour", visual.colour},
+          {"width_meters", visual.widthMeters},
+          {"streak_length_meters", visual.streakLengthMeters},
+          {"softness", visual.softness},
+          {"opacity", visual.opacity},
+          {"emission", visual.emission},
+          {"minimum_screen_pixels", visual.minimumScreenPixels},
+          {"maximum_screen_pixels", visual.maximumScreenPixels}}},
     };
 }
 
-WaterRainSettings ParseWaterRainSettings(const json& settingsJson) {
-    WaterRainSettings settings = invisible_places::water::DefaultWaterRainSettings();
+RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
+    auto settings = invisible_places::water::DefaultRainRuntimeSettings();
+    settings.enabled = false;
+    if (!settingsJson.is_object() || settingsJson.value("version", 0) != 2) {
+        return settings;
+    }
     settings.enabled = settingsJson.value("enabled", settings.enabled);
-    settings.vegetationInterceptionEnabled =
-        settingsJson.value("vegetation_interception_enabled", settings.vegetationInterceptionEnabled);
-    settings.surfaceRunoffEnabled =
-        settingsJson.value("surface_runoff_enabled", settings.surfaceRunoffEnabled);
-    settings.splashEnabled = settingsJson.value("splash_enabled", settings.splashEnabled);
+    settings.impactEffectsEnabled =
+        settingsJson.value("impact_effects_enabled", settings.impactEffectsEnabled);
+    settings.sandEffectsEnabled = settingsJson.value("sand_effects_enabled", settings.sandEffectsEnabled);
+    settings.rockEffectsEnabled = settingsJson.value("rock_effects_enabled", settings.rockEffectsEnabled);
+    settings.vegetationEffectsEnabled =
+        settingsJson.value("vegetation_effects_enabled", settings.vegetationEffectsEnabled);
     if (settingsJson.contains("intensity_preset")) {
         const auto preset = invisible_places::water::ParseWaterRainIntensityPresetName(
             settingsJson.at("intensity_preset").get<std::string>());
         if (preset.has_value()) {
-            settings = invisible_places::water::ApplyWaterRainIntensityPreset(settings, preset.value());
+            settings.intensityPreset = static_cast<invisible_places::water::RainIntensityPreset>(preset.value());
         }
     }
-    settings.dropCount = settingsJson.value("drop_count", settings.dropCount);
+    settings.visualProfileName = settingsJson.value("visual_profile_name", settings.visualProfileName);
+    settings.activeParticleCount = settingsJson.value("active_particle_count", settings.activeParticleCount);
+    settings.seed = settingsJson.value("seed", settings.seed);
+    settings.rainLevel = settingsJson.value("rain_level", settings.rainLevel);
+    settings.density = settingsJson.value("density", settings.density);
     settings.fallSpeedMetersPerSecond =
         settingsJson.value("fall_speed_meters_per_second", settings.fallSpeedMetersPerSecond);
+    settings.dropletSizeScale = settingsJson.value("droplet_size_scale", settings.dropletSizeScale);
+    settings.opacityScale = settingsJson.value("opacity_scale", settings.opacityScale);
+    settings.emissionScale = settingsJson.value("emission_scale", settings.emissionScale);
     settings.spawnHeightMeters = settingsJson.value("spawn_height_meters", settings.spawnHeightMeters);
     settings.spawnRadiusMeters = settingsJson.value("spawn_radius_meters", settings.spawnRadiusMeters);
-    settings.spawnOutOfFrameMargin =
-        settingsJson.value("spawn_out_of_frame_margin", settings.spawnOutOfFrameMargin);
-    settings.surfaceSearchRadiusMeters =
-        settingsJson.value("surface_search_radius_meters", settings.surfaceSearchRadiusMeters);
-    settings.downhillSearchRadiusMeters =
-        settingsJson.value("downhill_search_radius_meters", settings.downhillSearchRadiusMeters);
-    settings.killBelowSceneMeters = settingsJson.value("kill_below_scene_meters", settings.killBelowSceneMeters);
     settings.cameraDeathDistanceMeters =
         settingsJson.value("camera_death_distance_meters", settings.cameraDeathDistanceMeters);
-    settings.surfaceRunSpeedMetersPerSecond =
-        settingsJson.value("surface_run_speed_meters_per_second", settings.surfaceRunSpeedMetersPerSecond);
-    settings.sandRunDistanceMeters = settingsJson.value("sand_run_distance_meters", settings.sandRunDistanceMeters);
-    settings.splashStrength = settingsJson.value("splash_strength", settings.splashStrength);
-    settings.splashMaxDistanceMeters =
-        settingsJson.value("splash_max_distance_meters", settings.splashMaxDistanceMeters);
-    settings.splashDropletLimit = settingsJson.value("splash_droplet_limit", settings.splashDropletLimit);
     settings.windDirectionX = settingsJson.value("wind_direction_x", settings.windDirectionX);
     settings.windDirectionY = settingsJson.value("wind_direction_y", settings.windDirectionY);
-    settings.windStrengthMeters = settingsJson.value("wind_strength_meters", settings.windStrengthMeters);
-    settings.windNoise = settingsJson.value("wind_noise", settings.windNoise);
-    settings.windResponse = settingsJson.value("wind_response", settings.windResponse);
-    settings.trailLengthMeters = settingsJson.value("trail_length_meters", settings.trailLengthMeters);
-    settings.trailPointSpacingMeters =
-        settingsJson.value("trail_point_spacing_meters", settings.trailPointSpacingMeters);
-    settings.trailWidthMeters = settingsJson.value("trail_width_meters", settings.trailWidthMeters);
-    settings.trailStreakLengthMeters =
-        settingsJson.value("trail_streak_length_meters", settings.trailStreakLengthMeters);
-    settings.routeAnchorCount = settingsJson.value("route_anchor_count", settings.routeAnchorCount);
-    settings.supportSampleLimit = settingsJson.value("support_sample_limit", settings.supportSampleLimit);
-    settings.seed = settingsJson.value("seed", settings.seed);
+    settings.windSpeedMetersPerSecond =
+        settingsJson.value("wind_speed_meters_per_second", settings.windSpeedMetersPerSecond);
+    settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
+    settings.gustStrength = settingsJson.value("gust_strength", settings.gustStrength);
+    settings.gustScaleMeters = settingsJson.value("gust_scale_meters", settings.gustScaleMeters);
+    settings.gustSpeedMetersPerSecond =
+        settingsJson.value("gust_speed_meters_per_second", settings.gustSpeedMetersPerSecond);
+    settings.weatherFrontStrength =
+        settingsJson.value("weather_front_strength", settings.weatherFrontStrength);
+    settings.weatherFrontScaleMeters =
+        settingsJson.value("weather_front_scale_meters", settings.weatherFrontScaleMeters);
+    settings.weatherFrontSpeedMetersPerSecond =
+        settingsJson.value("weather_front_speed_meters_per_second", settings.weatherFrontSpeedMetersPerSecond);
+    settings.sandEffectScale = settingsJson.value("sand_effect_scale", settings.sandEffectScale);
+    settings.rockEffectScale = settingsJson.value("rock_effect_scale", settings.rockEffectScale);
+    settings.vegetationEffectScale =
+        settingsJson.value("vegetation_effect_scale", settings.vegetationEffectScale);
     return settings;
+}
+
+WaterRainVisualSettings ParseWaterRainVisualSettings(const json& settingsJson) {
+    std::string profileName = "Rain Fine Lines";
+    if (settingsJson.is_object() && settingsJson.value("version", 0) == 2) {
+        profileName = settingsJson.value("visual_profile_name", profileName);
+    }
+    auto visual = invisible_places::water::RainVisualPreset(profileName);
+    if (!settingsJson.is_object() || settingsJson.value("version", 0) != 2 ||
+        !settingsJson.contains("visual_profile") || !settingsJson.at("visual_profile").is_object()) {
+        return visual;
+    }
+    const auto& visualJson = settingsJson.at("visual_profile");
+    if (visualJson.contains("colour")) {
+        visual.colour = visualJson.at("colour").get<std::array<float, 3>>();
+    }
+    visual.widthMeters = visualJson.value("width_meters", visual.widthMeters);
+    visual.streakLengthMeters = visualJson.value("streak_length_meters", visual.streakLengthMeters);
+    visual.softness = visualJson.value("softness", visual.softness);
+    visual.opacity = visualJson.value("opacity", visual.opacity);
+    visual.emission = visualJson.value("emission", visual.emission);
+    visual.minimumScreenPixels =
+        visualJson.value("minimum_screen_pixels", visual.minimumScreenPixels);
+    visual.maximumScreenPixels =
+        visualJson.value("maximum_screen_pixels", visual.maximumScreenPixels);
+    return visual;
 }
 
 json SerializeWaterPathGenerationSettings(const WaterPathGenerationSettings& settings) {
@@ -4924,8 +4971,8 @@ bool SaveProjectDocument(
         {"water_dynamic_mesh_flow_settings",
          SerializeWaterDynamicMeshFlowSettings(
              ProjectLevelWaterDynamicMeshFlowSettings(document.waterDynamicMeshFlowSettings))},
-        {"water_rain_settings", SerializeWaterRainSettings(document.waterRainSettings)},
-        {"selected_water_rain_trail_profile", document.selectedWaterRainTrailProfileName},
+        {"water_rain_settings",
+         SerializeWaterRainSettings(document.waterRainSettings, document.waterRainVisualSettings)},
         {"water_point_visuals", json::array()},
         {"selected_water_point_visual", document.selectedWaterPointVisualName},
         {"water_scene_states", json::array()},
@@ -5002,10 +5049,6 @@ bool SaveProjectDocument(
     if (document.tempWaterTrailProfile.has_value()) {
         projectJson["temp_water_trail_profile"] =
             SerializeWaterTrailProfile(document.tempWaterTrailProfile.value());
-    }
-    if (document.tempWaterRainTrailProfile.has_value()) {
-        projectJson["temp_water_rain_trail_profile"] =
-            SerializeWaterTrailProfile(document.tempWaterRainTrailProfile.value());
     }
     if (document.tempWaterCausticLookSettings.has_value()) {
         projectJson["temp_water_caustic_look_settings"] =
@@ -5186,6 +5229,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     if (projectJson->contains("water_rain_settings")) {
         document.waterRainSettings = ParseWaterRainSettings(projectJson->at("water_rain_settings"));
+        document.waterRainVisualSettings =
+            ParseWaterRainVisualSettings(projectJson->at("water_rain_settings"));
     }
     if (projectJson->contains("temp_water_animation_trail_settings")) {
         document.tempWaterAnimationTrailSettings =
@@ -5221,8 +5266,6 @@ std::optional<ProjectDocument> LoadProjectDocument(
         projectJson->value("selected_water_lane_profile", document.selectedWaterLaneProfileName);
     document.selectedWaterTrailProfileName =
         projectJson->value("selected_water_trail_profile", document.selectedWaterTrailProfileName);
-    document.selectedWaterRainTrailProfileName =
-        projectJson->value("selected_water_rain_trail_profile", document.selectedWaterRainTrailProfileName);
     if (projectJson->contains("temp_water_path_profile_settings")) {
         document.tempWaterPathProfileSettings =
             ParseWaterPathGenerationSettings(projectJson->at("temp_water_path_profile_settings"));
@@ -5233,10 +5276,6 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     if (projectJson->contains("temp_water_trail_profile")) {
         document.tempWaterTrailProfile = ParseWaterTrailProfile(projectJson->at("temp_water_trail_profile"));
-    }
-    if (projectJson->contains("temp_water_rain_trail_profile")) {
-        document.tempWaterRainTrailProfile =
-            ParseWaterTrailProfile(projectJson->at("temp_water_rain_trail_profile"));
     }
     if (projectJson->contains("temp_water_caustic_look_settings")) {
         document.tempWaterCausticLookSettings =
@@ -5532,8 +5571,7 @@ bool SaveWaterSourcesDocument(
         {"water_field_settings", SerializeWaterFieldSettings(document.fieldSettings)},
         {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.fieldTrailSettings)},
         {"water_dynamic_mesh_flow_settings", SerializeWaterDynamicMeshFlowSettings(document.dynamicMeshFlowSettings)},
-        {"water_rain_settings", SerializeWaterRainSettings(document.rainSettings)},
-        {"selected_water_rain_trail_profile", document.selectedRainTrailProfileName},
+        {"water_rain_settings", SerializeWaterRainSettings(document.rainSettings, document.rainVisualSettings)},
         {"water_emitters", json::array()},
         {"water_manual_flow_paths", json::array()},
         {"water_seepage_nodes", json::array()},
@@ -5562,10 +5600,6 @@ bool SaveWaterSourcesDocument(
     if (document.tempTrailProfile.has_value()) {
         sourcesJson["temp_water_trail_profile"] =
             SerializeWaterTrailProfile(document.tempTrailProfile.value());
-    }
-    if (document.tempRainTrailProfile.has_value()) {
-        sourcesJson["temp_water_rain_trail_profile"] =
-            SerializeWaterTrailProfile(document.tempRainTrailProfile.value());
     }
     for (const auto& profile : document.pathProfiles) {
         sourcesJson["water_path_profiles"].push_back(SerializeWaterPathProfile(profile));
@@ -5674,8 +5708,6 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
         sourcesJson->value("selected_water_lane_profile", document.selectedLaneProfileName);
     document.selectedTrailProfileName =
         sourcesJson->value("selected_water_trail_profile", document.selectedTrailProfileName);
-    document.selectedRainTrailProfileName =
-        sourcesJson->value("selected_water_rain_trail_profile", document.selectedRainTrailProfileName);
     if (sourcesJson->contains("temp_water_path_profile_settings")) {
         document.tempPathProfileSettings =
             ParseWaterPathGenerationSettings(sourcesJson->at("temp_water_path_profile_settings"));
@@ -5686,9 +5718,6 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     }
     if (sourcesJson->contains("temp_water_trail_profile")) {
         document.tempTrailProfile = ParseWaterTrailProfile(sourcesJson->at("temp_water_trail_profile"));
-    }
-    if (sourcesJson->contains("temp_water_rain_trail_profile")) {
-        document.tempRainTrailProfile = ParseWaterTrailProfile(sourcesJson->at("temp_water_rain_trail_profile"));
     }
     if (sourcesJson->contains("water_field_settings")) {
         document.fieldSettings = ParseWaterFieldSettings(sourcesJson->at("water_field_settings"));
@@ -5702,6 +5731,7 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     }
     if (sourcesJson->contains("water_rain_settings")) {
         document.rainSettings = ParseWaterRainSettings(sourcesJson->at("water_rain_settings"));
+        document.rainVisualSettings = ParseWaterRainVisualSettings(sourcesJson->at("water_rain_settings"));
     }
     if (sourcesJson->contains("water_dynamic_mesh_flow_settings")) {
         document.dynamicMeshFlowSettings =

@@ -85,6 +85,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 seepageGridParams;
     vec4 seepageBoundsMin;
     vec4 seepageBoundsMax;
+    uvec4 rainImpactControl;
+    vec4 rainImpactGrid;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"

@@ -2,12 +2,12 @@
 
 ## Goal
 
-Complete the Water feature integration so Ripples, SAND Shoreline, Rain, Flow, and Field share the same base-cloud, region, and trail concepts while preserving the active v2 workflow.
+Complete the Water feature integration so Ripples, SAND Shoreline, GPU collision Rain, Flow, and Field share one coherent base-cloud workflow while preserving the active v2 behavior.
 
 Target command:
 
 ```text
-/goal Complete WaterFeatures_GOAL.md: Ripples affect only the base cloud through sparse GPU/offline runtime memberships and live parameter updates, SAND Shoreline stays a point-style shader path, Flow/Field/Rain share one animated trail abstraction where applicable, region Field vector caches are saved/reused offline, and all behavior is verified by focused tests plus full water regression checks.
+/goal Complete WaterFeatures_GOAL.md: Ripples affect only the base cloud through sparse GPU/offline runtime memberships and live parameter updates, SAND Shoreline stays a point-style shader path, Rain uses a static role-aware collision cache plus dedicated GPU particles and impacts, Flow/Field share one animated trail abstraction, region Field vector caches are saved/reused offline, and all behavior is verified by focused tests plus full water regression checks.
 ```
 
 This goal follows the OpenAI Codex goal guidance: keep one durable objective, record evidence as work progresses, state constraints and blocker conditions explicitly, and finish only when validation evidence exists.
@@ -21,7 +21,7 @@ Reference guidance:
 
 - Ripples modify the active/base point cloud through sparse region memberships and compact procedural parameter buffers only. Ripple calculations may use sparse in-memory effect/debug points, but the active workflow must not create a visible `-Ripples.generated` particle/cloud session or dense active-cloud `water_effect_*`/`ripple_*` scalar uploads for ordinary Ripple recalculation.
 - Ripple pattern and contribution edits should be live-editable at millisecond-scale latency after membership exists. Region membership should upload only when the target layer, region boundary, visibility, or selected point set changes; pattern, response, blend, colour, opacity, size, emission, speed, and phase changes should update compact GPU/offline params.
-- Flow, Field, and Rain create animated generated trail clouds through one shared trail representation and point-cloud scalar schema. Flow trails follow baked path anchors, Field trails follow paths integrated from a vector field, and Rain trails follow camera-footprint falling/surface-shedding routes.
+- Flow and Field create animated generated trail clouds through one shared trail representation and point-cloud scalar schema. Rain instead uses persistent GPU particles, a static 20 mm role-aware collision cache, and bounded impact-event lookups on the displayed point cloud.
 - Flow Bake Path should stay responsive for artist edits by reusing unchanged per-source path-cache branches and rebuilding only moved, added, deleted, or profile-changed emitters where support signatures still match.
 - Flow Path can use an optional artist-placed attractor to bias horizontal route selection without changing the rule that Z is the vertical downhill axis.
 - Field regions can be drawn, converted into vector fields, saved to an offline cache, and reused when the source layer, region fingerprint, and field settings still match. Path-anchor Field caches may remain rebuildable from Flow anchors unless they become expensive enough to require their own persisted cache.
@@ -35,7 +35,7 @@ Reference guidance:
 - Preserve base-cloud scalar mappings as the visual source of truth.
 - Preserve interactive editing performance by minimizing CPU recomputation and GPU uploads. Prefer region-scoped support data and param-only updates when topology or selected membership has not changed.
 - Preserve legacy compatibility: old Caustics load as Ripple `Caustic Lace`; old Basin/Runoff records load harmlessly and are omitted from new saves.
-- Keep generated Flow, Field, and Rain output out of normal project layer persistence.
+- Keep generated Flow and Field output, Rain GPU runtime resources, and rain impact events out of normal project layer persistence.
 - Keep the existing stream scalar contract stable unless tests and renderer/offline consumers are updated together.
 - Keep changes scoped to water code, water UI orchestration, project/source serialization where needed, point-cloud renderer/offline hooks where needed, tests, and water docs.
 
@@ -56,10 +56,10 @@ Reference guidance:
    - Verify parameter-only live edits avoid dense scalar uploads when region membership has not changed.
    - Verify base Height/Intensity mappings remain active while Ripple and Field effects are applied.
 
-4. Shared Trails
-   - Add a shared generated-trail overlay abstraction for Flow, Field, and Rain.
+4. Shared Trails And Rain
+   - Keep the shared generated-trail overlay abstraction for Flow and Field, and isolate Rain in its dedicated compute/draw pipeline.
    - Keep shared scalar names, visualization, renderer style, and offline export behavior.
-   - Verify Flow, Field, and Rain trails animate through time without topology regeneration.
+   - Verify Flow and Field trails animate without topology regeneration, and Rain settings update uniforms without rebuilding its collision cache or persistent buffers.
 
 5. Field Cache Persistence
    - Save region Field vector caches to `Saved/water/<source-stem>-WaterFieldCache.bin`.
@@ -90,9 +90,9 @@ Focused tests must cover:
 - Ripple base-cloud-only active output,
 - Ripple parameter-only live update behavior and sparse upload counts,
 - SAND Shoreline shader behavior staying separate from region Ripple Shoreline,
-- shared Flow/Field/Rain generated trail scalar schema,
+- shared Flow/Field trail scalar schema and Rain feature isolation,
 - source-specific Flow path cache invalidation and attractor-biased path ranking,
-- Rain routing over lower support and SAND termination,
+- Rain collision-cache hits, deterministic respawn, and role-isolated impact effects,
 - Field cache save/load/invalidation,
 - Field source perturbation determinism and vector-following movement,
 - viewport/offline water motion rendering at different times.
@@ -101,7 +101,7 @@ Focused tests must cover:
 
 - Keep Ripples on the sparse runtime path: region changes may rebuild memberships, but visual edits should update params only.
 - Use Ripple as the performance template for Field Surface Motion where practical. Field region selection should bound CPU work to selected/cache nodes, and shader/offline-side evaluation should replace dense base-cloud field uploads for editable visual parameters when the implementation is ready.
-- Keep Flow, Field, and Rain stream overlays static-topology during playback; stream animation should come from route/scalar data, shader/offline time, and compact setting changes rather than regenerating points for every frame.
+- Keep Flow and Field stream overlays static-topology during playback. Keep Rain particle/event buffers permanently allocated and drive animation, weather, visibility, and impact controls through compact frame uniforms.
 
 ## Progress Policy
 

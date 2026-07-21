@@ -170,9 +170,8 @@ struct PointCloudStyleState {
     bool flowAnimation = false;
     bool waterPathView = false;
     bool waterTrailOverlay = false;
-    // Compact animation-only Rain modulation; 1 preserves authored trail behaviour.
-    float waterRainLevel = 1.0F;
-    float waterRainSpeedScale = 1.0F;
+    // Runtime-only: role-scoped rain reactions require the unified material path.
+    bool rainImpactEffects = false;
     bool causticAnimation = false;
     float causticIntensity = 0.0F;
     float causticScale = 4.0F;
