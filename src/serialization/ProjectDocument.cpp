@@ -3902,6 +3902,8 @@ WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocum
 json SerializeWaterRainSettings(const WaterRainSettings& settings) {
     return json{
         {"enabled", settings.enabled},
+        {"vegetation_interception_enabled", settings.vegetationInterceptionEnabled},
+        {"surface_runoff_enabled", settings.surfaceRunoffEnabled},
         {"intensity_preset", invisible_places::water::WaterRainIntensityPresetNameForStorage(settings.intensityPreset)},
         {"drop_count", settings.dropCount},
         {"fall_speed_meters_per_second", settings.fallSpeedMetersPerSecond},
@@ -3932,6 +3934,10 @@ json SerializeWaterRainSettings(const WaterRainSettings& settings) {
 WaterRainSettings ParseWaterRainSettings(const json& settingsJson) {
     WaterRainSettings settings = invisible_places::water::DefaultWaterRainSettings();
     settings.enabled = settingsJson.value("enabled", settings.enabled);
+    settings.vegetationInterceptionEnabled =
+        settingsJson.value("vegetation_interception_enabled", settings.vegetationInterceptionEnabled);
+    settings.surfaceRunoffEnabled =
+        settingsJson.value("surface_runoff_enabled", settings.surfaceRunoffEnabled);
     if (settingsJson.contains("intensity_preset")) {
         const auto preset = invisible_places::water::ParseWaterRainIntensityPresetName(
             settingsJson.at("intensity_preset").get<std::string>());

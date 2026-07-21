@@ -32906,6 +32906,13 @@ void DrawWaterRainPanel(
             }
             ImGui::EndCombo();
         }
+        bool routeOptionsChanged = false;
+        routeOptionsChanged |=
+            ImGui::Checkbox("Vegetation Interception", &water.rainSettings.vegetationInterceptionEnabled);
+        routeOptionsChanged |= ImGui::Checkbox("Surface Runoff", &water.rainSettings.surfaceRunoffEnabled);
+        if (routeOptionsChanged) {
+            RefreshWaterRainOverlay(runtimeState, viewport);
+        }
 
         int dropCount = static_cast<int>(water.rainSettings.dropCount);
         if (ImGui::SliderInt("Drop Count", &dropCount, 1, 8000)) {
@@ -32918,6 +32925,9 @@ void DrawWaterRainPanel(
             35.0F,
             "%.1f m/s",
             ImGuiSliderFlags_Logarithmic);
+        if (!water.rainSettings.surfaceRunoffEnabled) {
+            ImGui::BeginDisabled();
+        }
         ImGui::SliderFloat(
             "Surface Run Speed",
             &water.rainSettings.surfaceRunSpeedMetersPerSecond,
@@ -32932,6 +32942,9 @@ void DrawWaterRainPanel(
             5.0F,
             "%.2f m",
             ImGuiSliderFlags_Logarithmic);
+        if (!water.rainSettings.surfaceRunoffEnabled) {
+            ImGui::EndDisabled();
+        }
         float windDirection[2] = {water.rainSettings.windDirectionX, water.rainSettings.windDirectionY};
         if (ImGui::InputFloat2("Wind Direction", windDirection, "%.2f")) {
             water.rainSettings.windDirectionX = windDirection[0];
@@ -32987,8 +33000,9 @@ void DrawWaterRainPanel(
                 water.rainDiagnostics.emittedSampleCount,
                 water.rainDiagnostics.routeAnchorCount);
             ImGui::TextDisabled(
-                "Rain termination: sand %u  fallback %u  no support %u",
+                "Rain termination: sand %u  impact %u  fallback %u  no support %u",
                 water.rainDiagnostics.sandTerminationCount,
+                water.rainDiagnostics.impactTerminationCount,
                 water.rainDiagnostics.fallbackTerminationCount,
                 water.rainDiagnostics.noSupportKillCount);
             ImGui::TextDisabled(

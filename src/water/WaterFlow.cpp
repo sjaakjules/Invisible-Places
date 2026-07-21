@@ -9777,7 +9777,8 @@ bool RainRoleIsVegetation(std::string_view role) {
 enum class RainSupportRoleQuery {
     Any,
     Sand,
-    Vegetation
+    Vegetation,
+    NonVegetation
 };
 
 bool RainSupportSampleMatchesRole(const RainSupportSample& sample, RainSupportRoleQuery role) {
@@ -9788,6 +9789,8 @@ bool RainSupportSampleMatchesRole(const RainSupportSample& sample, RainSupportRo
             return RainRoleIsSand(sample.role);
         case RainSupportRoleQuery::Vegetation:
             return RainRoleIsVegetation(sample.role);
+        case RainSupportRoleQuery::NonVegetation:
+            return !RainRoleIsVegetation(sample.role);
     }
     return true;
 }
@@ -9890,12 +9893,15 @@ std::optional<std::uint32_t> FindRainSupportSample(
     float radiusMeters,
     bool requireSand,
     bool chooseLowest,
+    bool allowVegetation = true,
     std::optional<float> maxZ = std::nullopt) {
     return FindRainSupportRoleSample(
         index,
         xy,
         radiusMeters,
-        requireSand ? RainSupportRoleQuery::Sand : RainSupportRoleQuery::Any,
+        requireSand
+            ? RainSupportRoleQuery::Sand
+            : (allowVegetation ? RainSupportRoleQuery::Any : RainSupportRoleQuery::NonVegetation),
         chooseLowest,
         maxZ,
         std::nullopt);
@@ -10249,6 +10255,12 @@ std::vector<RainRouteAnchor> BuildRainRouteAnchors(
     const glm::vec3 airMidpoint = glm::mix(spawn, firstHit, 0.58F);
     AppendRainRouteAnchor(&route, airMidpoint, glm::vec3{0.0F, 0.0F, 1.0F}, false, false);
     AppendRainSupportAnchor(&route, first, supportOffset);
+    if (RainRoleIsSand(first.role) && sandTermination != nullptr) {
+        *sandTermination = true;
+    }
+    if (RainRoleIsVegetation(first.role) || !settings.surfaceRunoffEnabled) {
+        return route;
+    }
 
     std::vector<std::uint32_t> visited;
     visited.reserve(routeCount);
@@ -10485,40 +10497,47 @@ std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
     MeshSurfaceProjection projected = firstProjection;
     const glm::vec3 firstSurface =
         ToGlm(projected.position) + SafeOverlayNormal(ToGlm(projected.normal)) * supportOffset;
-    const auto vegetation = FindRainVegetationInterruptions(support, spawn, firstSurface, settings);
-    for (const auto vegIndex : vegetation) {
-        if (route.size() + 4U >= routeCount || vegIndex >= support.samples.size()) {
-            break;
+    if (settings.vegetationInterceptionEnabled) {
+        bool vegetationIntercepted = false;
+        const auto vegetation = FindRainVegetationInterruptions(support, spawn, firstSurface, settings);
+        for (const auto vegIndex : vegetation) {
+            if (route.size() + 4U >= routeCount || vegIndex >= support.samples.size()) {
+                break;
+            }
+            const auto& veg = support.samples[vegIndex];
+            const glm::vec3 vegNormal = SafeOverlayNormal(veg.normal);
+            AppendRainRouteAnchor(
+                &route,
+                veg.position + vegNormal * supportOffset,
+                vegNormal,
+                true,
+                false);
+            const float dripDistance =
+                0.045F + RegionHash01(settings.seed + dropIndex, vegIndex, 9191U) * 0.075F;
+            glm::vec3 lateral = glm::cross(
+                std::abs(fallDirection.z) > 0.95F ? glm::vec3{0.0F, 1.0F, 0.0F} : fallDirection,
+                glm::vec3{0.0F, 0.0F, 1.0F});
+            if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
+                lateral = {1.0F, 0.0F, 0.0F};
+            } else {
+                lateral = glm::normalize(lateral);
+            }
+            const float lateralJitter =
+                (RegionHash01(settings.seed + dropIndex, vegIndex, 9199U) - 0.5F) *
+                std::max(0.01F, settings.surfaceSearchRadiusMeters * 0.28F);
+            AppendRainRouteAnchor(
+                &route,
+                veg.position + fallDirection * dripDistance + lateral * lateralJitter,
+                vegNormal,
+                true,
+                false);
+            vegetationIntercepted = true;
+            if (vegetationDripCount != nullptr) {
+                ++(*vegetationDripCount);
+            }
         }
-        const auto& veg = support.samples[vegIndex];
-        const glm::vec3 vegNormal = SafeOverlayNormal(veg.normal);
-        AppendRainRouteAnchor(
-            &route,
-            veg.position + vegNormal * supportOffset,
-            vegNormal,
-            false,
-            false);
-        const float dripDistance =
-            0.045F + RegionHash01(settings.seed + dropIndex, vegIndex, 9191U) * 0.075F;
-        glm::vec3 lateral = glm::cross(
-            std::abs(fallDirection.z) > 0.95F ? glm::vec3{0.0F, 1.0F, 0.0F} : fallDirection,
-            glm::vec3{0.0F, 0.0F, 1.0F});
-        if (glm::dot(lateral, lateral) <= kNormalEpsilon) {
-            lateral = {1.0F, 0.0F, 0.0F};
-        } else {
-            lateral = glm::normalize(lateral);
-        }
-        const float lateralJitter =
-            (RegionHash01(settings.seed + dropIndex, vegIndex, 9199U) - 0.5F) *
-            std::max(0.01F, settings.surfaceSearchRadiusMeters * 0.28F);
-        AppendRainRouteAnchor(
-            &route,
-            veg.position + fallDirection * dripDistance + lateral * lateralJitter,
-            vegNormal,
-            false,
-            false);
-        if (vegetationDripCount != nullptr) {
-            ++(*vegetationDripCount);
+        if (vegetationIntercepted) {
+            return route;
         }
     }
 
@@ -10529,6 +10548,12 @@ std::vector<RainRouteAnchor> BuildRainMeshRouteAnchors(
 
     bool currentSand = RainMeshProjectionIsSand(support, meshSurface, projected, settings);
     AppendRainMeshAnchor(&route, projected, supportOffset, currentSand);
+    if (!settings.surfaceRunoffEnabled) {
+        if (currentSand && sandTermination != nullptr) {
+            *sandTermination = true;
+        }
+        return route;
+    }
 
     const float cellSize = RainMeshCellSize(meshSurface);
     const float stepMeters = std::clamp(
@@ -10711,7 +10736,8 @@ WaterTrailOverlay BuildRainTrailOverlay(
             targetXy,
             std::max(0.005F, settings.surfaceSearchRadiusMeters),
             false,
-            false);
+            false,
+            settings.vegetationInterceptionEnabled);
 
         MeshSurfaceProjection meshFirstProjection;
         if (meshRouting) {
@@ -10745,15 +10771,6 @@ WaterTrailOverlay BuildRainTrailOverlay(
             targetPoint.x,
             targetPoint.y,
             rainBounds.minimum.z - settings.killBelowSceneMeters};
-        if (hasMeshHit) {
-            ++localDiagnostics.firstSupportHitCount;
-            ++localDiagnostics.meshSurfaceHitCount;
-        } else if (hasSupportHit) {
-            ++localDiagnostics.firstSupportHitCount;
-        } else {
-            ++localDiagnostics.noSupportKillCount;
-        }
-
         bool sandTermination = false;
         bool fallbackTermination = false;
         std::uint32_t vegetationDripCount = 0U;
@@ -10782,11 +10799,23 @@ WaterTrailOverlay BuildRainTrailOverlay(
                                       settings,
                                       &sandTermination,
                                       &fallbackTermination);
+        if (hasMeshHit || hasSupportHit) {
+            ++localDiagnostics.firstSupportHitCount;
+        } else {
+            ++localDiagnostics.noSupportKillCount;
+        }
+        const bool vegetationStoppedBeforeMesh =
+            hasMeshHit && settings.vegetationInterceptionEnabled && vegetationDripCount > 0U;
+        if (hasMeshHit && !vegetationStoppedBeforeMesh) {
+            ++localDiagnostics.meshSurfaceHitCount;
+        }
         localDiagnostics.vegetationDripCount += vegetationDripCount;
         if (sandTermination) {
             ++localDiagnostics.sandTerminationCount;
         } else if (fallbackTermination) {
             ++localDiagnostics.fallbackTerminationCount;
+        } else if (hasMeshHit || hasSupportHit) {
+            ++localDiagnostics.impactTerminationCount;
         }
         if (routeAnchors.size() < 2U) {
             continue;

@@ -604,6 +604,8 @@ enum class WaterRainIntensityPreset {
 
 struct WaterRainSettings {
     bool enabled = false;
+    bool vegetationInterceptionEnabled = true;
+    bool surfaceRunoffEnabled = true;
     WaterRainIntensityPreset intensityPreset = WaterRainIntensityPreset::Rain;
     std::uint32_t dropCount = 900;
     float fallSpeedMetersPerSecond = 8.0F;
@@ -646,6 +648,7 @@ struct WaterRainDiagnostics {
     std::uint32_t meshSurfaceHitCount = 0;
     std::uint32_t vegetationDripCount = 0;
     std::uint32_t sandTerminationCount = 0;
+    std::uint32_t impactTerminationCount = 0;
     std::uint32_t fallbackTerminationCount = 0;
     std::uint32_t noSupportKillCount = 0;
 };

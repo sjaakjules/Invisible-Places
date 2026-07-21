@@ -4678,7 +4678,7 @@ TEST_CASE("Water Rain follows lower support points slowly after impact", "[water
     }
 }
 
-TEST_CASE("Water Rain mesh runoff uses mesh as ground while vegetation drips", "[water][rain][mesh]") {
+TEST_CASE("Water Rain mesh routing toggles vegetation interception and surface runoff", "[water][rain][mesh]") {
     const auto meshPath = std::filesystem::temp_directory_path() / "invisible_places_rain_mesh_runoff.ply";
     const auto heightAt = [](float x, float) {
         return 0.58F - x * 0.36F;
@@ -4743,60 +4743,119 @@ TEST_CASE("Water Rain mesh runoff uses mesh as ground while vegetation drips", "
     settings.routeAnchorCount = 18U;
     settings.seed = 29U;
 
-    invisible_places::water::WaterRainDiagnostics diagnostics;
-    const auto overlay = invisible_places::water::BuildRainTrailOverlay(
-        layers,
-        &cache,
-        frame,
-        settings,
-        &diagnostics);
-    REQUIRE_FALSE(overlay.samples.empty());
-    CHECK(diagnostics.emittedDropCount == 1U);
-    CHECK(diagnostics.firstSupportHitCount == 1U);
-    CHECK(diagnostics.meshSurfaceHitCount == 1U);
-    CHECK(diagnostics.vegetationDripCount >= 1U);
-    CHECK(diagnostics.sandTerminationCount == 1U);
-    CHECK(diagnostics.noSupportKillCount == 0U);
-
-    std::vector<invisible_places::water::WaterTrailSample> anchors;
-    for (const auto& sample : overlay.samples) {
-        if (sample.trailRole < 0.5F && sample.pathId == Catch::Approx(1.0F)) {
-            anchors.push_back(sample);
+    auto buildAnchors = [&](const invisible_places::water::WaterRainSettings& routeSettings,
+                            invisible_places::water::WaterRainDiagnostics* diagnostics) {
+        const auto overlay = invisible_places::water::BuildRainTrailOverlay(
+            layers,
+            &cache,
+            frame,
+            routeSettings,
+            diagnostics);
+        REQUIRE_FALSE(overlay.samples.empty());
+        std::vector<invisible_places::water::WaterTrailSample> anchors;
+        for (const auto& sample : overlay.samples) {
+            if (sample.trailRole < 0.5F && sample.pathId == Catch::Approx(1.0F)) {
+                anchors.push_back(sample);
+            }
         }
+        return anchors;
+    };
+
+    SECTION("vegetation interception stops drops before the mesh") {
+        settings.vegetationInterceptionEnabled = true;
+        settings.surfaceRunoffEnabled = true;
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto anchors = buildAnchors(settings, &diagnostics);
+        CHECK(diagnostics.emittedDropCount == 1U);
+        CHECK(diagnostics.firstSupportHitCount == 1U);
+        CHECK(diagnostics.meshSurfaceHitCount == 0U);
+        CHECK(diagnostics.vegetationDripCount >= 1U);
+        CHECK(diagnostics.impactTerminationCount == 1U);
+        CHECK(diagnostics.sandTerminationCount == 0U);
+        CHECK(diagnostics.noSupportKillCount == 0U);
+        REQUIRE(anchors.size() >= 3U);
+
+        const bool vegetationInterruptedFall = std::any_of(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) {
+                return sample.position.z > 0.95F && std::abs(sample.normal.x) < 0.05F;
+            });
+        CHECK(vegetationInterruptedFall);
+        CHECK(anchors.back().position.z > 0.90F);
+        CHECK(std::none_of(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) {
+                return sample.position.z < 0.70F && sample.normal.x > 0.15F;
+            }));
     }
-    REQUIRE(anchors.size() >= 8U);
 
-    const bool vegetationInterruptedFall = std::any_of(
-        anchors.begin(),
-        anchors.end(),
-        [](const invisible_places::water::WaterTrailSample& sample) {
-            return sample.position.z > 0.95F && std::abs(sample.normal.x) < 0.05F;
-        });
-    CHECK(vegetationInterruptedFall);
+    SECTION("vegetation disabled lets runoff follow the mesh to sand") {
+        settings.vegetationInterceptionEnabled = false;
+        settings.surfaceRunoffEnabled = true;
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto anchors = buildAnchors(settings, &diagnostics);
+        CHECK(diagnostics.emittedDropCount == 1U);
+        CHECK(diagnostics.firstSupportHitCount == 1U);
+        CHECK(diagnostics.meshSurfaceHitCount == 1U);
+        CHECK(diagnostics.vegetationDripCount == 0U);
+        CHECK(diagnostics.sandTerminationCount == 1U);
+        CHECK(diagnostics.impactTerminationCount == 0U);
+        CHECK(diagnostics.noSupportKillCount == 0U);
+        REQUIRE(anchors.size() >= 6U);
 
-    const auto firstMeshAnchor = std::find_if(
-        anchors.begin(),
-        anchors.end(),
-        [](const invisible_places::water::WaterTrailSample& sample) {
-            return sample.position.z < 0.70F && sample.normal.x > 0.15F;
-        });
-    REQUIRE(firstMeshAnchor != anchors.end());
-    const auto firstMeshAnchorIndex = static_cast<std::size_t>(
-        std::distance(anchors.begin(), firstMeshAnchor));
-    CHECK(
-        firstMeshAnchor->position.z ==
-        Catch::Approx(heightAt(firstMeshAnchor->position.x, firstMeshAnchor->position.y)).margin(0.07F));
-    CHECK(firstMeshAnchor->position.z < 0.80F);
-    for (std::size_t index = firstMeshAnchorIndex + 1U; index < anchors.size(); ++index) {
-        CHECK(anchors[index].position.z <= anchors[index - 1U].position.z + 0.006F);
+        const auto firstMeshAnchor = std::find_if(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) {
+                return sample.position.z < 0.70F && sample.normal.x > 0.15F;
+            });
+        REQUIRE(firstMeshAnchor != anchors.end());
+        const auto firstMeshAnchorIndex = static_cast<std::size_t>(
+            std::distance(anchors.begin(), firstMeshAnchor));
+        CHECK(
+            firstMeshAnchor->position.z ==
+            Catch::Approx(heightAt(firstMeshAnchor->position.x, firstMeshAnchor->position.y)).margin(0.07F));
+        CHECK(firstMeshAnchor->position.z < 0.80F);
+        for (std::size_t index = firstMeshAnchorIndex + 1U; index < anchors.size(); ++index) {
+            CHECK(anchors[index].position.z <= anchors[index - 1U].position.z + 0.006F);
+        }
+
+        const auto& finalAnchor = anchors.back();
+        CHECK(finalAnchor.position.x > 0.36F);
+        CHECK(finalAnchor.position.z < firstMeshAnchor->position.z);
+        CHECK(
+            finalAnchor.position.z ==
+            Catch::Approx(heightAt(finalAnchor.position.x, finalAnchor.position.y)).margin(0.10F));
     }
 
-    const auto& finalAnchor = anchors.back();
-    CHECK(finalAnchor.position.x > 0.36F);
-    CHECK(finalAnchor.position.z < firstMeshAnchor->position.z);
-    CHECK(
-        finalAnchor.position.z ==
-        Catch::Approx(heightAt(finalAnchor.position.x, finalAnchor.position.y)).margin(0.10F));
+    SECTION("runoff disabled stops at mesh impact") {
+        settings.vegetationInterceptionEnabled = false;
+        settings.surfaceRunoffEnabled = false;
+        invisible_places::water::WaterRainDiagnostics diagnostics;
+        const auto anchors = buildAnchors(settings, &diagnostics);
+        CHECK(diagnostics.emittedDropCount == 1U);
+        CHECK(diagnostics.firstSupportHitCount == 1U);
+        CHECK(diagnostics.meshSurfaceHitCount == 1U);
+        CHECK(diagnostics.vegetationDripCount == 0U);
+        CHECK(diagnostics.sandTerminationCount == 0U);
+        CHECK(diagnostics.impactTerminationCount == 1U);
+        CHECK(diagnostics.fallbackTerminationCount == 0U);
+        REQUIRE(anchors.size() >= 3U);
+
+        const auto firstMeshAnchor = std::find_if(
+            anchors.begin(),
+            anchors.end(),
+            [](const invisible_places::water::WaterTrailSample& sample) {
+                return sample.position.z < 0.70F && sample.normal.x > 0.15F;
+            });
+        REQUIRE(firstMeshAnchor != anchors.end());
+        CHECK(static_cast<std::size_t>(std::distance(anchors.begin(), firstMeshAnchor)) == anchors.size() - 1U);
+        CHECK(
+            anchors.back().position.z ==
+            Catch::Approx(heightAt(anchors.back().position.x, anchors.back().position.y)).margin(0.07F));
+    }
 }
 
 TEST_CASE("Water Rain terminates on fallback support or no-hit kill plane", "[water][rain]") {
@@ -10312,6 +10371,8 @@ TEST_CASE("Water Rain settings and trail profile selection round-trip in saved d
         invisible_places::water::DefaultWaterRainSettings(),
         invisible_places::water::WaterRainIntensityPreset::HeavyDownpour);
     rainSettings.enabled = true;
+    rainSettings.vegetationInterceptionEnabled = false;
+    rainSettings.surfaceRunoffEnabled = false;
     rainSettings.dropCount = 321U;
     rainSettings.fallSpeedMetersPerSecond = 12.25F;
     rainSettings.spawnHeightMeters = 6.5F;
@@ -10360,10 +10421,14 @@ TEST_CASE("Water Rain settings and trail profile selection round-trip in saved d
         CHECK(savedJson.contains("water_rain_settings"));
         CHECK(savedJson.contains("selected_water_rain_trail_profile"));
         CHECK(savedJson.contains("temp_water_rain_trail_profile"));
+        CHECK(savedJson.at("water_rain_settings").at("vegetation_interception_enabled").get<bool>() == false);
+        CHECK(savedJson.at("water_rain_settings").at("surface_runoff_enabled").get<bool>() == false);
     }
     const auto loadedProject = invisible_places::serialization::LoadProjectDocument(projectPath, &errorMessage);
     REQUIRE(loadedProject.has_value());
     CHECK(loadedProject->waterRainSettings.enabled);
+    CHECK_FALSE(loadedProject->waterRainSettings.vegetationInterceptionEnabled);
+    CHECK_FALSE(loadedProject->waterRainSettings.surfaceRunoffEnabled);
     CHECK(
         loadedProject->waterRainSettings.intensityPreset ==
         invisible_places::water::WaterRainIntensityPreset::HeavyDownpour);
@@ -10397,6 +10462,8 @@ TEST_CASE("Water Rain settings and trail profile selection round-trip in saved d
     const auto legacyProject = invisible_places::serialization::LoadProjectDocument(legacyProjectPath, &errorMessage);
     REQUIRE(legacyProject.has_value());
     CHECK_FALSE(legacyProject->waterRainSettings.enabled);
+    CHECK(legacyProject->waterRainSettings.vegetationInterceptionEnabled);
+    CHECK(legacyProject->waterRainSettings.surfaceRunoffEnabled);
     CHECK(
         legacyProject->waterRainSettings.intensityPreset ==
         invisible_places::water::WaterRainIntensityPreset::Rain);
@@ -10415,6 +10482,8 @@ TEST_CASE("Water Rain settings and trail profile selection round-trip in saved d
     const auto loadedSources = invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
     REQUIRE(loadedSources.has_value());
     CHECK(loadedSources->rainSettings.enabled);
+    CHECK_FALSE(loadedSources->rainSettings.vegetationInterceptionEnabled);
+    CHECK_FALSE(loadedSources->rainSettings.surfaceRunoffEnabled);
     CHECK(
         loadedSources->rainSettings.intensityPreset ==
         invisible_places::water::WaterRainIntensityPreset::HeavyDownpour);
