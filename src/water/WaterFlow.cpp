@@ -6655,6 +6655,76 @@ float PathLengthMeters(const std::vector<WaterOverlayPoint>& path) {
     return length;
 }
 
+struct PreparedFlowPath {
+    const std::vector<WaterOverlayPoint>* anchors = nullptr;
+    std::vector<float> cumulativeDistances;
+    float lengthMeters = 0.0F;
+};
+
+PreparedFlowPath PrepareFlowPath(const std::vector<WaterOverlayPoint>& path) {
+    PreparedFlowPath prepared;
+    prepared.anchors = &path;
+    prepared.cumulativeDistances.resize(path.size(), 0.0F);
+    for (std::size_t index = 1U; index < path.size(); ++index) {
+        prepared.lengthMeters +=
+            glm::length(ToGlm(path[index].position) - ToGlm(path[index - 1U].position));
+        prepared.cumulativeDistances[index] = prepared.lengthMeters;
+    }
+    return prepared;
+}
+
+WaterOverlayPoint InterpolatePreparedPathByArcLength(
+    const PreparedFlowPath& prepared,
+    float distanceMeters) {
+    if (prepared.anchors == nullptr || prepared.anchors->empty()) {
+        return {};
+    }
+    const auto& path = *prepared.anchors;
+    if (path.size() == 1U || distanceMeters <= 0.0F) {
+        return path.front();
+    }
+    if (distanceMeters >= prepared.lengthMeters) {
+        return path.back();
+    }
+
+    const auto distanceIt = std::lower_bound(
+        prepared.cumulativeDistances.begin() + 1,
+        prepared.cumulativeDistances.end(),
+        distanceMeters);
+    if (distanceIt == prepared.cumulativeDistances.end()) {
+        return path.back();
+    }
+    const auto index = static_cast<std::size_t>(
+        std::distance(prepared.cumulativeDistances.begin(), distanceIt));
+    const float previousDistance = prepared.cumulativeDistances[index - 1U];
+    const float segmentLength = *distanceIt - previousDistance;
+    if (segmentLength <= 1.0e-6F) {
+        return path[index];
+    }
+    const float t = std::clamp(
+        (distanceMeters - previousDistance) / segmentLength,
+        0.0F,
+        1.0F);
+    return BlendPathAnchor(path[index - 1U], path[index], t);
+}
+
+glm::vec3 TangentAtPreparedPathDistance(
+    const PreparedFlowPath& prepared,
+    float distanceMeters,
+    float probeMeters) {
+    const float safeProbe = std::max(0.005F, probeMeters);
+    const float beforeDistance = std::max(0.0F, distanceMeters - safeProbe);
+    const float afterDistance = distanceMeters + safeProbe;
+    const glm::vec3 before =
+        ToGlm(InterpolatePreparedPathByArcLength(prepared, beforeDistance).position);
+    const glm::vec3 after =
+        ToGlm(InterpolatePreparedPathByArcLength(prepared, afterDistance).position);
+    const glm::vec3 tangent = after - before;
+    return glm::dot(tangent, tangent) > kNormalEpsilon
+               ? glm::normalize(tangent)
+               : glm::vec3{1.0F, 0.0F, 0.0F};
+}
+
 WaterOverlayPoint InterpolatePathByArcLength(const std::vector<WaterOverlayPoint>& path, float distanceMeters) {
     if (path.empty()) {
         return {};
@@ -8464,11 +8534,15 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     float speedMetersPerSecond,
     std::uint32_t seed,
     float featureType,
-    const WaterPathAnalysisCache* analysisCache) {
+    const WaterPathAnalysisCache* analysisCache,
+    const WaterFlowTrailBuildOptions& buildOptions = {}) {
     WaterTrailOverlay overlay;
     if (paths.empty() || requestedTrailCount == 0U) {
         return overlay;
     }
+    const auto cancelled = [&buildOptions]() {
+        return buildOptions.stopToken != nullptr && buildOptions.stopToken->stop_requested();
+    };
 
     const float safeTrailWidth = std::max(0.0005F, trailWidthMeters);
     const float laneSpan = std::max(0.0F, laneSpreadMeters);
@@ -8476,6 +8550,8 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     const float analysisGuideInfluence =
         LaneAnalysisGuideInfluence(turbulence, laneCrossing, pathAttraction, trailLooseness);
 
+    std::vector<PreparedFlowPath> preparedPaths;
+    preparedPaths.reserve(paths.size());
     std::vector<float> pathLengths;
     pathLengths.reserve(paths.size());
     std::vector<const WaterPathBranchAnalysis*> pathAnalyses;
@@ -8485,7 +8561,12 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     float totalLength = 0.0F;
     float totalWeight = 0.0F;
     for (const auto& path : paths) {
-        const float length = PathLengthMeters(path);
+        if (cancelled()) {
+            return {};
+        }
+        auto preparedPath = PrepareFlowPath(path);
+        const float length = preparedPath.lengthMeters;
+        preparedPaths.push_back(std::move(preparedPath));
         pathLengths.push_back(length);
         const auto branchId =
             path.empty()
@@ -8549,7 +8630,11 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     std::uint32_t trailId = 1U;
 
     for (std::size_t pathIndex = 0; pathIndex < paths.size(); ++pathIndex) {
+        if (cancelled()) {
+            return {};
+        }
         const auto& path = paths[pathIndex];
+        const auto& preparedPath = preparedPaths[pathIndex];
         const float pathLength = pathLengths[pathIndex];
         if (path.size() < 2U || pathLength <= 1.0e-5F) {
             continue;
@@ -8572,13 +8657,18 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             std::max(0.0F, std::floor(path.front().emitterId + 0.5F)));
 
         for (std::uint32_t routeIndex = 0; routeIndex < routePointCount; ++routeIndex) {
+            if ((routeIndex & 255U) == 0U && cancelled()) {
+                return {};
+            }
             const float routeDistance = std::min(pathLength, static_cast<float>(routeIndex) * safeSpacing);
-            WaterOverlayPoint anchor = InterpolatePathByArcLength(path, routeDistance);
+            WaterOverlayPoint anchor = InterpolatePreparedPathByArcLength(preparedPath, routeDistance);
             const glm::vec3 normal = SafeOverlayNormal(ToGlm(anchor.normal));
-            glm::vec3 tangent = TangentAtPathDistance(path, routeDistance, safeSpacing * 2.0F);
+            glm::vec3 tangent =
+                TangentAtPreparedPathDistance(preparedPath, routeDistance, safeSpacing * 2.0F);
             tangent -= normal * glm::dot(tangent, normal);
             if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
-                tangent = TangentAtPathDistance(path, routeDistance, safeSpacing * 2.0F);
+                tangent =
+                    TangentAtPreparedPathDistance(preparedPath, routeDistance, safeSpacing * 2.0F);
             }
             tangent = glm::normalize(tangent);
             const auto localAnalysis = SampleLaneAnalysis(analysisBranch, routeDistance);
@@ -8628,6 +8718,9 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
         }
 
         for (std::uint32_t laneIndex = 0; laneIndex < trailsForPath && trailId <= requestedTrailCount; ++laneIndex, ++trailId) {
+            if (cancelled()) {
+                return {};
+            }
             const float trailSeed = RegionHash01(seed + branchId, trailId, 7001U);
             const float laneSeed = RegionHash01(seed + branchId, trailId, 7003U);
             const bool positiveSideFirst =
@@ -8657,17 +8750,22 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             const float startDistance = maxStart * std::clamp(startSlot, 0.0F, 1.0F);
             const float speed = std::max(0.01F, speedMetersPerSecond * (0.72F + trailSeed * 0.58F));
             for (std::uint32_t sampleIndex = 0; sampleIndex < samplesPerTrail; ++sampleIndex) {
+                if ((sampleIndex & 255U) == 0U && cancelled()) {
+                    return {};
+                }
                 const float localDistance = std::min(
                     safeLength,
                     static_cast<float>(sampleIndex) * safeSpacing);
                 const float pathDistance = std::min(pathLength, startDistance + localDistance);
-                WaterOverlayPoint anchor = InterpolatePathByArcLength(path, pathDistance);
+                WaterOverlayPoint anchor = InterpolatePreparedPathByArcLength(preparedPath, pathDistance);
                 glm::vec3 position = ToGlm(anchor.position);
                 const glm::vec3 normal = SafeOverlayNormal(ToGlm(anchor.normal));
-                glm::vec3 tangent = TangentAtPathDistance(path, pathDistance, safeSpacing * 2.0F);
+                glm::vec3 tangent =
+                    TangentAtPreparedPathDistance(preparedPath, pathDistance, safeSpacing * 2.0F);
                 tangent -= normal * glm::dot(tangent, normal);
                 if (glm::dot(tangent, tangent) <= kNormalEpsilon) {
-                    tangent = TangentAtPathDistance(path, pathDistance, safeSpacing * 2.0F);
+                    tangent =
+                        TangentAtPreparedPathDistance(preparedPath, pathDistance, safeSpacing * 2.0F);
                 }
                 tangent = glm::normalize(tangent);
                 glm::vec3 lateral = glm::cross(normal, tangent);
@@ -9627,6 +9725,14 @@ WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
     const WaterOverlay& pathAnchors,
     const WaterFlowTrailSettings& settings,
     const WaterPathAnalysisCache* analysis) {
+    return BuildFlowTrailOverlayFromPathAnchors(pathAnchors, settings, analysis, {});
+}
+
+WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
+    const WaterOverlay& pathAnchors,
+    const WaterFlowTrailSettings& settings,
+    const WaterPathAnalysisCache* analysis,
+    const WaterFlowTrailBuildOptions& options) {
     if (!settings.enabled) {
         return {};
     }
@@ -9668,7 +9774,8 @@ WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
         settings.speedMetersPerSecond,
         settings.seed,
         0.0F,
-        analysis);
+        analysis,
+        options);
 }
 
 MeshSurfaceCache BuildMeshSurfaceCache(
@@ -11913,6 +12020,14 @@ invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
     const WaterTrailOverlay& overlay,
     const std::filesystem::path& sourcePath,
     std::string_view layerName) {
+    return BuildWaterTrailOverlayPointCloud(overlay, sourcePath, layerName, nullptr);
+}
+
+invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
+    const WaterTrailOverlay& overlay,
+    const std::filesystem::path& sourcePath,
+    std::string_view layerName,
+    const std::stop_token* stopToken) {
     invisible_places::io::LoadedPointCloud cloud;
     cloud.sourcePath = sourcePath;
     cloud.layerName = std::string{layerName};
@@ -11922,7 +12037,12 @@ invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
     cloud.normals.reserve(overlay.samples.size());
     cloud.packedColors.reserve(overlay.samples.size());
     cloud.bounds = overlay.bounds;
+    std::size_t packedSampleIndex = 0U;
     for (const auto& sample : overlay.samples) {
+        if ((packedSampleIndex++ & 4095U) == 0U &&
+            stopToken != nullptr && stopToken->stop_requested()) {
+            return {};
+        }
         cloud.positions.push_back(sample.position);
         cloud.normals.push_back(sample.normal);
         cloud.packedColors.push_back(PackRgba8(sample.red, sample.green, sample.blue));
@@ -11981,9 +12101,17 @@ invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
     cloud.scalarFields.reserve(std::size(fields));
     cloud.scalarFieldValues.reserve(overlay.samples.size() * std::size(fields));
     for (const auto& field : fields) {
+        if (stopToken != nullptr && stopToken->stop_requested()) {
+            return {};
+        }
         invisible_places::io::ScalarFieldStats stats;
         stats.name = std::string{field.name};
+        std::size_t fieldSampleIndex = 0U;
         for (const auto& sample : overlay.samples) {
+            if ((fieldSampleIndex++ & 4095U) == 0U &&
+                stopToken != nullptr && stopToken->stop_requested()) {
+                return {};
+            }
             const float value = field.value(sample);
             cloud.scalarFieldValues.push_back(value);
             stats.Include(value);

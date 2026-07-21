@@ -1831,6 +1831,32 @@ void VulkanViewportShell::UploadPointCloudScalarFields(
     ++sceneRevision_;
 }
 
+void VulkanViewportShell::UploadPointCloudScalarFieldValues(
+    std::size_t layerId,
+    std::size_t scalarFieldIndex,
+    std::span<const float> values) {
+    auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr || resources->pointCount == 0U) {
+        throw std::runtime_error{"Cannot update a scalar field for an unloaded point cloud."};
+    }
+    if (scalarFieldIndex >= resources->scalarFieldCount ||
+        values.size() != static_cast<std::size_t>(resources->pointCount)) {
+        throw std::runtime_error{"Point-cloud scalar field update has an unexpected shape."};
+    }
+    const auto byteOffset = static_cast<VkDeviceSize>(
+        scalarFieldIndex * static_cast<std::size_t>(resources->pointCount) * sizeof(float));
+    const auto byteCount = static_cast<VkDeviceSize>(values.size() * sizeof(float));
+    if (resources->scalarFieldBuffer.mapped == nullptr ||
+        byteOffset + byteCount > resources->scalarFieldBuffer.size) {
+        throw std::runtime_error{"Point-cloud scalar field buffer is not directly writable."};
+    }
+
+    WaitIdle();
+    auto* destination = static_cast<std::byte*>(resources->scalarFieldBuffer.mapped) + byteOffset;
+    std::memcpy(destination, values.data(), static_cast<std::size_t>(byteCount));
+    ++sceneRevision_;
+}
+
 DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreviewPointCloud(
     std::size_t layerId,
     const invisible_places::water::MeshSurfaceCache& cache,

@@ -730,6 +730,78 @@ struct SavedWaterTrailProfileState {
     PointCloudStyleState style{};
 };
 
+struct WaterTrailOverlayGroup {
+    SavedWaterTrailProfileState trailProfile;
+    WaterTrailOverlay overlay;
+    std::optional<invisible_places::io::LoadedPointCloud> packedCloud;
+};
+
+struct WaterFlowTrailSourceBuildRequest {
+    std::uint32_t sourceId = 0U;
+    std::uint64_t fingerprint = 0U;
+    WaterOverlay anchors;
+    WaterFlowTrailSettings settings{};
+    SavedWaterTrailProfileState trailProfile;
+    std::shared_ptr<const WaterTrailOverlay> cachedOverlay;
+    bool usesPathAnalysis = false;
+};
+
+struct WaterFlowTrailSourceArtifact {
+    std::uint32_t sourceId = 0U;
+    std::uint64_t fingerprint = 0U;
+    SavedWaterTrailProfileState trailProfile;
+    std::shared_ptr<const WaterTrailOverlay> overlay;
+};
+
+struct WaterFlowTrailBuildRequest {
+    std::uint64_t requestId = 0U;
+    std::vector<WaterFlowTrailSourceBuildRequest> sources;
+    std::vector<std::uint32_t> activeSourceIds;
+    std::shared_ptr<const invisible_places::water::WaterPathAnalysisCache> pathAnalysis;
+    bool savePathCache = false;
+};
+
+struct WaterFlowTrailBuildJobResult {
+    std::uint64_t requestId = 0U;
+    std::vector<WaterTrailOverlayGroup> groups;
+    std::vector<WaterFlowTrailSourceArtifact> rebuiltArtifacts;
+    std::vector<std::uint32_t> activeSourceIds;
+    std::size_t sourceCount = 0U;
+    std::size_t rebuiltSourceCount = 0U;
+    std::size_t reusedSourceCount = 0U;
+    std::size_t sampleCount = 0U;
+    bool savePathCache = false;
+    bool cancelled = false;
+    std::string errorMessage;
+    double buildMs = 0.0;
+    double packMs = 0.0;
+};
+
+struct WaterFlowTrailBuildJobShared {
+    std::mutex mutex;
+    bool completed = false;
+    WaterFlowTrailBuildJobResult result;
+};
+
+struct WaterFlowTrailBuildJobState {
+    std::uint64_t nextRequestId = 1U;
+    std::uint64_t activeRequestId = 0U;
+    std::uint64_t cancellationCount = 0U;
+    std::jthread worker;
+    std::shared_ptr<WaterFlowTrailBuildJobShared> shared;
+    bool pendingCapture = false;
+    bool pendingSavePathCache = false;
+    std::uint64_t pendingRequestId = 0U;
+    std::chrono::steady_clock::time_point pendingNotBefore{};
+    std::size_t lastSourceCount = 0U;
+    std::size_t lastRebuiltSourceCount = 0U;
+    std::size_t lastReusedSourceCount = 0U;
+    std::size_t lastSampleCount = 0U;
+    double lastBuildMs = 0.0;
+    double lastPackMs = 0.0;
+    double lastUploadMs = 0.0;
+};
+
 struct PreviewLayerSession {
     LayerKind kind = LayerKind::PointCloud;
     std::filesystem::path sourcePath;
@@ -1157,6 +1229,7 @@ struct WaterWorkflowState {
     std::optional<std::uint32_t> hoveredPathBranchId;
     std::optional<std::uint32_t> selectedPathBranchId;
     std::vector<std::vector<std::uint32_t>> pathEditUndoHiddenBranchIds;
+    std::unordered_set<std::size_t> flowBranchMaskedSessionIndices;
     WaterRegionFeature activeRegionFeature = WaterRegionFeature::None;
     WaterRegionEditorState regionEditor{};
     std::optional<std::size_t> selectedEmitterIndex;
@@ -1204,6 +1277,10 @@ struct WaterWorkflowState {
     std::optional<std::uint64_t> pendingRippleLiveEffectKey;
     std::chrono::steady_clock::time_point pendingRippleLiveEffectAt{};
     WaterRegionPointPreviewJobState regionPointPreviewJob;
+    WaterFlowTrailBuildJobState flowTrailBuildJob;
+    std::unordered_map<std::uint32_t, WaterFlowTrailSourceArtifact> flowTrailSourceArtifacts;
+    std::shared_ptr<const invisible_places::water::WaterPathAnalysisCache> flowPathAnalysisSnapshot;
+    std::uint64_t flowPathAnalysisSnapshotFingerprint = 0U;
 };
 
 struct PreviewRuntimeState {
@@ -3218,6 +3295,12 @@ bool RefreshWaterOverlayFromAnchors(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     WaterOverlayRefreshPersistence persistence = WaterOverlayRefreshPersistence::InMemoryOnly,
     WaterTrailBuildQuality quality = WaterTrailBuildQuality::Preview);
+bool QueueWaterFlowTrailRefresh(
+    PreviewRuntimeState* runtimeState,
+    WaterOverlayRefreshPersistence persistence,
+    std::chrono::milliseconds debounce);
+WaterOverlay WaterPathAnchorsFromCacheWithProfileSettings(
+    const PreviewRuntimeState& runtimeState);
 void DrawWaterSeepageParameterTooltip(const char* text);
 bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
@@ -7236,10 +7319,10 @@ void PollPendingLayerLoad(
             purpose,
             sceneSwitchGeneration);
         if (HasValidManualFlowPath(runtimeState->water)) {
-            RefreshWaterOverlayFromAnchors(
+            QueueWaterFlowTrailRefresh(
                 runtimeState,
-                viewport,
-                WaterOverlayRefreshPersistence::InMemoryOnly);
+                WaterOverlayRefreshPersistence::InMemoryOnly,
+                std::chrono::milliseconds{0});
         }
         RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
         QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
@@ -7337,10 +7420,10 @@ void PollPendingLayerLoad(
                 }
             }
             if (generatedCacheUsable || hasManualFlowPath) {
-                RefreshWaterOverlayFromAnchors(
+                QueueWaterFlowTrailRefresh(
                     runtimeState,
-                    viewport,
-                    WaterOverlayRefreshPersistence::InMemoryOnly);
+                    WaterOverlayRefreshPersistence::InMemoryOnly,
+                    std::chrono::milliseconds{0});
             }
         }
     }
@@ -8170,7 +8253,15 @@ void ApplyWaterSourceSettingsTransition(
         return;
     }
     if (!WaterSourceRefreshInputsEqual(before, after) && viewport != nullptr) {
-        RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+        if (runtimeState->water.pathCacheLoaded &&
+            !runtimeState->water.pathCache.branches.empty()) {
+            runtimeState->water.pathAnchors =
+                WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
+        }
+        QueueWaterFlowTrailRefresh(
+            runtimeState,
+            WaterOverlayRefreshPersistence::InMemoryOnly,
+            std::chrono::milliseconds{0});
     }
 }
 
@@ -9982,19 +10073,16 @@ void AppendWaterTrailOverlay(
     }
 }
 
-struct WaterTrailOverlayGroup {
-    SavedWaterTrailProfileState trailProfile;
-    WaterTrailOverlay overlay;
-};
-
 const invisible_places::water::WaterPathAnalysisCache* FlowPathAnalysisForLanes(
     const WaterWorkflowState& water) {
     if (!water.pathCacheLoaded ||
-        water.pathCacheStale ||
         !invisible_places::water::WaterPathAnalysisCacheCompatible(water.pathCache) ||
         !water.pathCache.analysis.has_value()) {
         return nullptr;
     }
+    // `pathCacheStale` means newer Path inputs still need Bake Path. The last
+    // baked anchors and their matching analysis remain the correct snapshot for
+    // Lane/Trail-only edits, and must stay usable until that bake replaces them.
     return &water.pathCache.analysis.value();
 }
 
@@ -10003,61 +10091,112 @@ bool HasValidManualFlowPath(const WaterWorkflowState& water) {
         water.manualFlowPaths.begin(),
         water.manualFlowPaths.end(),
         [](const WaterManualFlowPathSource& source) {
-            return invisible_places::water::BuildManualFlowPathAnchors(source).points.size() >= 2U;
+            if (source.controlPoints.size() < 2U) {
+                return false;
+            }
+            const auto first = ToGlm(source.controlPoints.front());
+            return std::any_of(
+                source.controlPoints.begin() + 1,
+                source.controlPoints.end(),
+                [&](const invisible_places::io::Float3& point) {
+                    const auto delta = ToGlm(point) - first;
+                    return glm::dot(delta, delta) > 1.0e-10F;
+                });
         });
 }
 
+std::uint64_t WaterFlowTrailSourceFingerprint(
+    const PreviewRuntimeState& runtimeState,
+    std::uint32_t sourceId,
+    const WaterOverlay& anchors,
+    const WaterFlowTrailSettings& settings,
+    bool usesPathAnalysis);
+
+void AppendWaterTrailOverlayGroup(
+    std::vector<WaterTrailOverlayGroup>* groups,
+    const SavedWaterTrailProfileState& profile,
+    WaterTrailOverlay overlay) {
+    if (groups == nullptr || overlay.samples.empty()) {
+        return;
+    }
+    const auto normalized = NormalizeWaterProfileName(profile.name);
+    const auto groupIt = std::find_if(
+        groups->begin(),
+        groups->end(),
+        [&](const WaterTrailOverlayGroup& group) {
+            return NormalizeWaterProfileName(group.trailProfile.name) == normalized;
+        });
+    if (groupIt == groups->end()) {
+        WaterTrailOverlayGroup group;
+        group.trailProfile = profile;
+        AppendWaterTrailOverlay(&group.overlay, std::move(overlay));
+        groups->push_back(std::move(group));
+    } else {
+        AppendWaterTrailOverlay(&groupIt->overlay, std::move(overlay));
+    }
+}
+
 std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
-    const PreviewRuntimeState& runtimeState) {
+    PreviewRuntimeState& runtimeState) {
     std::vector<WaterTrailOverlayGroup> groups;
     const auto* pathAnalysis = FlowPathAnalysisForLanes(runtimeState.water);
-    const auto addOverlay = [&](const SavedWaterTrailProfileState& profile, WaterTrailOverlay overlay) {
-        if (overlay.samples.empty()) {
-            return;
-        }
-        const auto normalized = NormalizeWaterProfileName(profile.name);
-        const auto groupIt = std::find_if(
-            groups.begin(),
-            groups.end(),
-            [&](const WaterTrailOverlayGroup& group) {
-                return NormalizeWaterProfileName(group.trailProfile.name) == normalized;
+    std::unordered_set<std::uint32_t> activeSourceIds;
+    const auto addOverlay =
+        [&](std::uint32_t sourceId,
+            const WaterOverlay& anchors,
+            const WaterFlowTrailSettings& settings,
+            bool usesPathAnalysis,
+            const SavedWaterTrailProfileState& profile,
+            WaterTrailOverlay overlay) {
+        auto cachedOverlay = std::make_shared<WaterTrailOverlay>(overlay);
+        runtimeState.water.flowTrailSourceArtifacts.insert_or_assign(
+            sourceId,
+            WaterFlowTrailSourceArtifact{
+                .sourceId = sourceId,
+                .fingerprint = WaterFlowTrailSourceFingerprint(
+                    runtimeState,
+                    sourceId,
+                    anchors,
+                    settings,
+                    usesPathAnalysis),
+                .trailProfile = profile,
+                .overlay = std::move(cachedOverlay),
             });
-        if (groupIt == groups.end()) {
-            WaterTrailOverlayGroup group;
-            group.trailProfile = profile;
-            AppendWaterTrailOverlay(&group.overlay, std::move(overlay));
-            groups.push_back(std::move(group));
-        } else {
-            AppendWaterTrailOverlay(&groupIt->overlay, std::move(overlay));
-        }
+        activeSourceIds.insert(sourceId);
+        AppendWaterTrailOverlayGroup(&groups, profile, std::move(overlay));
     };
 
+    std::unordered_map<std::uint32_t, WaterOverlay> anchorsByEmitter;
+    anchorsByEmitter.reserve(runtimeState.water.emitters.size());
+    for (const auto& point : runtimeState.water.pathAnchors.points) {
+        const auto emitterId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(point.emitterId + 0.5F)));
+        auto& anchors = anchorsByEmitter[emitterId];
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
     bool usedRouteAnchors = false;
-    if (!runtimeState.water.pathCacheStale) {
-        for (const auto& emitter : runtimeState.water.emitters) {
-            WaterOverlay anchors;
-            for (const auto& point : runtimeState.water.pathAnchors.points) {
-                const auto pointEmitterId = static_cast<std::uint32_t>(
-                    std::max(0.0F, std::floor(point.emitterId + 0.5F)));
-                if (pointEmitterId != emitter.id) {
-                    continue;
-                }
-                anchors.bounds.Expand(point.position);
-                anchors.points.push_back(point);
-            }
-            if (anchors.points.empty()) {
-                continue;
-            }
-            usedRouteAnchors = true;
-            const auto trailProfile = ResolveEmitterWaterTrailProfile(runtimeState, emitter);
-            const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile);
-            addOverlay(
-                trailProfile,
-                invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
-                    anchors,
-                    flowSettings,
-                    pathAnalysis));
+    for (const auto& emitter : runtimeState.water.emitters) {
+        const auto anchorsIt = anchorsByEmitter.find(emitter.id);
+        if (anchorsIt == anchorsByEmitter.end() || anchorsIt->second.points.empty()) {
+            continue;
         }
+        usedRouteAnchors = true;
+        const auto trailProfile = ResolveEmitterWaterTrailProfile(runtimeState, emitter);
+        const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile);
+        auto overlay =
+            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+                anchorsIt->second,
+                flowSettings,
+                pathAnalysis);
+        addOverlay(
+            emitter.id,
+            anchorsIt->second,
+            flowSettings,
+            true,
+            trailProfile,
+            std::move(overlay));
     }
 
     for (const auto& source : runtimeState.water.manualFlowPaths) {
@@ -10074,27 +10213,388 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
             continue;
         }
         usedRouteAnchors = true;
+        auto overlay =
+            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, flowSettings, nullptr);
         addOverlay(
+            source.id,
+            anchors,
+            flowSettings,
+            false,
             trailProfile,
-            invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, flowSettings, nullptr));
+            std::move(overlay));
     }
 
-    if (!usedRouteAnchors &&
-        !runtimeState.water.pathCacheStale &&
-        !runtimeState.water.pathAnchors.points.empty()) {
+    if (!usedRouteAnchors && !runtimeState.water.pathAnchors.points.empty()) {
         WaterEmitter fallbackEmitter;
         fallbackEmitter.id = 0U;
         fallbackEmitter.name = "Global";
         const auto trailProfile = ViewedGlobalWaterTrailProfile(runtimeState);
         const auto flowSettings = MakeEmitterFlowSettings(runtimeState.water, fallbackEmitter, trailProfile);
-        addOverlay(
-            trailProfile,
+        auto overlay =
             invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
                 runtimeState.water.pathAnchors,
                 flowSettings,
-                pathAnalysis));
+                pathAnalysis);
+        addOverlay(
+            0U,
+            runtimeState.water.pathAnchors,
+            flowSettings,
+            true,
+            trailProfile,
+            std::move(overlay));
     }
+    std::erase_if(
+        runtimeState.water.flowTrailSourceArtifacts,
+        [&](const auto& entry) { return !activeSourceIds.contains(entry.first); });
     return groups;
+}
+
+std::uint64_t WaterFlowTrailSourceFingerprint(
+    const PreviewRuntimeState& runtimeState,
+    std::uint32_t sourceId,
+    const WaterOverlay& anchors,
+    const WaterFlowTrailSettings& settings,
+    bool usesPathAnalysis) {
+    std::uint64_t hash = 0x9E3779B97F4A7C15ULL;
+    HashCombine(&hash, sourceId);
+    HashBool(&hash, settings.enabled);
+    HashCombine(&hash, settings.trailCountTotal);
+    HashCombine(&hash, settings.laneCount);
+    HashFloat(&hash, settings.trailLengthMeters);
+    HashFloat(&hash, settings.trailPointSpacingMeters);
+    HashFloat(&hash, settings.trailWidthMeters);
+    HashFloat(&hash, settings.trailStreakLengthMeters);
+    HashFloat(&hash, settings.surfaceOffsetMeters);
+    HashFloat(&hash, settings.pathAttraction);
+    HashFloat(&hash, settings.laneSpreadMeters);
+    HashFloat(&hash, settings.laneCrossing);
+    HashFloat(&hash, settings.trailSmoothness);
+    HashFloat(&hash, settings.trailLooseness);
+    HashFloat(&hash, settings.turbulence);
+    HashFloat(&hash, settings.speedMetersPerSecond);
+    HashCombine(&hash, settings.seed);
+    HashCombine(&hash, anchors.points.size());
+    for (const auto& point : anchors.points) {
+        HashVec3(&hash, ToGlm(point.position));
+        HashVec3(&hash, ToGlm(point.normal));
+        HashFloat(&hash, point.flowId);
+        HashFloat(&hash, point.emitterId);
+        HashFloat(&hash, point.pathDistance);
+        HashFloat(&hash, point.confidence);
+        HashFloat(&hash, point.accumulation);
+    }
+    HashBool(&hash, usesPathAnalysis);
+    if (usesPathAnalysis) {
+        HashString(&hash, runtimeState.water.pathCache.supportSignature);
+        HashString(&hash, runtimeState.water.pathCache.emitterSettingsFingerprint);
+        HashCombine(&hash, runtimeState.water.pathCache.branches.size());
+    }
+    return hash;
+}
+
+void EnsureWaterFlowPathAnalysisSnapshot(WaterWorkflowState* water) {
+    if (water == nullptr || !water->pathCache.analysis.has_value()) {
+        if (water != nullptr) {
+            water->flowPathAnalysisSnapshot.reset();
+            water->flowPathAnalysisSnapshotFingerprint = 0U;
+        }
+        return;
+    }
+    const auto& analysis = water->pathCache.analysis.value();
+    std::uint64_t fingerprint = 0xD6E8FEB86659FD93ULL;
+    HashString(&fingerprint, water->pathCache.supportSignature);
+    HashString(&fingerprint, water->pathCache.emitterSettingsFingerprint);
+    HashCombine(&fingerprint, water->pathCache.branches.size());
+    HashCombine(&fingerprint, analysis.branches.size());
+    if (water->flowPathAnalysisSnapshot != nullptr &&
+        water->flowPathAnalysisSnapshotFingerprint == fingerprint) {
+        return;
+    }
+    water->flowPathAnalysisSnapshot =
+        std::make_shared<invisible_places::water::WaterPathAnalysisCache>(analysis);
+    water->flowPathAnalysisSnapshotFingerprint = fingerprint;
+}
+
+WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
+    PreviewRuntimeState& runtimeState,
+    std::uint64_t requestId,
+    bool savePathCache) {
+    WaterFlowTrailBuildRequest request;
+    request.requestId = requestId;
+    request.savePathCache = savePathCache;
+
+    std::unordered_set<std::uint32_t> hiddenBranchIds{
+        runtimeState.water.pathCache.hiddenBranchIds.begin(),
+        runtimeState.water.pathCache.hiddenBranchIds.end()};
+    std::unordered_map<std::uint32_t, WaterOverlay> anchorsByEmitter;
+    anchorsByEmitter.reserve(runtimeState.water.emitters.size());
+    // Lane/Trail profile assignments derive from the last baked route snapshot.
+    // A pending Path rebake must not turn a source-scoped refresh into an empty
+    // global publish that unloads every existing Flow session.
+    for (const auto& point : runtimeState.water.pathAnchors.points) {
+        const auto branchId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(point.flowId + 0.5F)));
+        if (hiddenBranchIds.contains(branchId)) {
+            continue;
+        }
+        const auto emitterId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(point.emitterId + 0.5F)));
+        auto& anchors = anchorsByEmitter[emitterId];
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    const auto appendSource = [&](
+        std::uint32_t sourceId,
+        WaterOverlay anchors,
+        WaterFlowTrailSettings settings,
+        SavedWaterTrailProfileState trailProfile,
+        bool usesPathAnalysis) {
+        WaterFlowTrailSourceBuildRequest sourceRequest;
+        sourceRequest.sourceId = sourceId;
+        sourceRequest.fingerprint = WaterFlowTrailSourceFingerprint(
+            runtimeState,
+            sourceId,
+            anchors,
+            settings,
+            usesPathAnalysis);
+        sourceRequest.anchors = std::move(anchors);
+        sourceRequest.settings = settings;
+        sourceRequest.trailProfile = std::move(trailProfile);
+        sourceRequest.usesPathAnalysis = usesPathAnalysis;
+        const auto cachedIt = runtimeState.water.flowTrailSourceArtifacts.find(sourceId);
+        if (cachedIt != runtimeState.water.flowTrailSourceArtifacts.end() &&
+            cachedIt->second.fingerprint == sourceRequest.fingerprint &&
+            cachedIt->second.overlay != nullptr) {
+            sourceRequest.cachedOverlay = cachedIt->second.overlay;
+        }
+        request.activeSourceIds.push_back(sourceId);
+        request.sources.push_back(std::move(sourceRequest));
+    };
+
+    bool usesGeneratedAnchors = false;
+    for (const auto& emitter : runtimeState.water.emitters) {
+        const auto anchorsIt = anchorsByEmitter.find(emitter.id);
+        if (anchorsIt == anchorsByEmitter.end() || anchorsIt->second.points.size() < 2U) {
+            continue;
+        }
+        const auto trailProfile = ResolveEmitterWaterTrailProfile(runtimeState, emitter);
+        appendSource(
+            emitter.id,
+            anchorsIt->second,
+            MakeEmitterFlowSettings(runtimeState.water, emitter, trailProfile),
+            trailProfile,
+            true);
+        usesGeneratedAnchors = true;
+    }
+
+    for (const auto& source : runtimeState.water.manualFlowPaths) {
+        const auto trailProfile = ResolveManualFlowPathTrailProfile(runtimeState, source);
+        const auto settings = invisible_places::water::ApplyWaterTrailGeometryToFlowTrailSettings(
+            ResolveManualFlowPathLaneSettings(runtimeState.water, source),
+            trailProfile.geometry);
+        const float anchorSpacing = std::clamp(
+            trailProfile.geometry.pointSpacingMeters * 2.0F,
+            0.005F,
+            0.05F);
+        auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, anchorSpacing);
+        if (anchors.points.size() < 2U) {
+            continue;
+        }
+        appendSource(
+            source.id,
+            std::move(anchors),
+            settings,
+            trailProfile,
+            false);
+    }
+
+    if (request.sources.empty() && !runtimeState.water.pathAnchors.points.empty()) {
+        WaterOverlay fallbackAnchors;
+        for (const auto& point : runtimeState.water.pathAnchors.points) {
+            const auto branchId = static_cast<std::uint32_t>(
+                std::max(0.0F, std::floor(point.flowId + 0.5F)));
+            if (hiddenBranchIds.contains(branchId)) {
+                continue;
+            }
+            fallbackAnchors.bounds.Expand(point.position);
+            fallbackAnchors.points.push_back(point);
+        }
+        if (fallbackAnchors.points.size() >= 2U) {
+            WaterEmitter fallbackEmitter;
+            fallbackEmitter.id = 0U;
+            fallbackEmitter.name = "Global";
+            const auto trailProfile = ViewedGlobalWaterTrailProfile(runtimeState);
+            appendSource(
+                0U,
+                std::move(fallbackAnchors),
+                MakeEmitterFlowSettings(runtimeState.water, fallbackEmitter, trailProfile),
+                trailProfile,
+                true);
+            usesGeneratedAnchors = true;
+        }
+    }
+
+    if (usesGeneratedAnchors) {
+        if (const auto* analysis = FlowPathAnalysisForLanes(runtimeState.water); analysis != nullptr) {
+            (void)analysis;
+            EnsureWaterFlowPathAnalysisSnapshot(&runtimeState.water);
+            request.pathAnalysis = runtimeState.water.flowPathAnalysisSnapshot;
+        }
+    }
+    return request;
+}
+
+void StartPendingWaterFlowTrailBuild(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        runtimeState->water.flowTrailBuildJob.worker.joinable() ||
+        !runtimeState->water.flowTrailBuildJob.pendingCapture ||
+        std::chrono::steady_clock::now() < runtimeState->water.flowTrailBuildJob.pendingNotBefore) {
+        return;
+    }
+
+    auto& job = runtimeState->water.flowTrailBuildJob;
+    auto request = CaptureWaterFlowTrailBuildRequest(
+        *runtimeState,
+        job.pendingRequestId,
+        job.pendingSavePathCache);
+    job.pendingCapture = false;
+    job.activeRequestId = request.requestId;
+    auto shared = std::make_shared<WaterFlowTrailBuildJobShared>();
+    job.shared = shared;
+    job.worker = std::jthread(
+        [shared, request = std::move(request)](std::stop_token stopToken) mutable {
+            WaterFlowTrailBuildJobResult result;
+            result.requestId = request.requestId;
+            result.sourceCount = request.sources.size();
+            result.activeSourceIds = request.activeSourceIds;
+            result.savePathCache = request.savePathCache;
+            try {
+                const auto buildStartedAt = std::chrono::steady_clock::now();
+                for (const auto& source : request.sources) {
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        break;
+                    }
+                    if (source.cachedOverlay != nullptr) {
+                        ++result.reusedSourceCount;
+                        AppendWaterTrailOverlayGroup(
+                            &result.groups,
+                            source.trailProfile,
+                            *source.cachedOverlay);
+                        continue;
+                    }
+                    const auto* analysis =
+                        source.usesPathAnalysis && request.pathAnalysis != nullptr
+                            ? request.pathAnalysis.get()
+                            : nullptr;
+                    auto overlay = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+                        source.anchors,
+                        source.settings,
+                        analysis,
+                        invisible_places::water::WaterFlowTrailBuildOptions{.stopToken = &stopToken});
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        break;
+                    }
+                    ++result.rebuiltSourceCount;
+                    auto cachedOverlay = std::make_shared<WaterTrailOverlay>(std::move(overlay));
+                    result.rebuiltArtifacts.push_back({
+                        .sourceId = source.sourceId,
+                        .fingerprint = source.fingerprint,
+                        .trailProfile = source.trailProfile,
+                        .overlay = cachedOverlay,
+                    });
+                    AppendWaterTrailOverlayGroup(
+                        &result.groups,
+                        source.trailProfile,
+                        *cachedOverlay);
+                }
+                result.buildMs = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - buildStartedAt)
+                                     .count();
+
+                if (!result.cancelled) {
+                    const auto packStartedAt = std::chrono::steady_clock::now();
+                    for (auto& group : result.groups) {
+                        if (stopToken.stop_requested()) {
+                            result.cancelled = true;
+                            break;
+                        }
+                        result.sampleCount += group.overlay.samples.size();
+                        group.packedCloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
+                            group.overlay,
+                            {},
+                            group.trailProfile.name,
+                            &stopToken);
+                        if (stopToken.stop_requested()) {
+                            result.cancelled = true;
+                            break;
+                        }
+                    }
+                    result.packMs = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - packStartedAt)
+                                        .count();
+                }
+            } catch (const std::exception& error) {
+                result.errorMessage = error.what();
+            }
+            {
+                std::lock_guard lock{shared->mutex};
+                shared->result = std::move(result);
+                shared->completed = true;
+            }
+        });
+}
+
+bool QueueWaterFlowTrailRefresh(
+    PreviewRuntimeState* runtimeState,
+    WaterOverlayRefreshPersistence persistence,
+    std::chrono::milliseconds debounce = std::chrono::milliseconds{0}) {
+    if (runtimeState == nullptr || runtimeState->pendingLoad.has_value()) {
+        return false;
+    }
+    auto& job = runtimeState->water.flowTrailBuildJob;
+    const auto requestId = job.nextRequestId++;
+    job.pendingCapture = true;
+    job.pendingSavePathCache =
+        persistence == WaterOverlayRefreshPersistence::SavePathCache;
+    job.pendingRequestId = requestId;
+    job.pendingNotBefore = std::chrono::steady_clock::now() + debounce;
+    if (job.worker.joinable()) {
+        if (!job.worker.get_stop_token().stop_requested()) {
+            job.worker.request_stop();
+            ++job.cancellationCount;
+        }
+    }
+    runtimeState->statusMessage = "Updating Flow lanes and trails in the background...";
+    runtimeState->errorMessage.clear();
+    StartPendingWaterFlowTrailBuild(runtimeState);
+    return true;
+}
+
+void CancelWaterFlowTrailBuildJob(WaterWorkflowState* water) {
+    if (water == nullptr) {
+        return;
+    }
+    auto& job = water->flowTrailBuildJob;
+    if (!job.pendingCapture && !job.worker.joinable() && job.shared == nullptr) {
+        return;
+    }
+
+    job.pendingCapture = false;
+    job.pendingSavePathCache = false;
+    job.pendingRequestId = 0U;
+    ++job.nextRequestId;
+    if (job.worker.joinable()) {
+        if (!job.worker.get_stop_token().stop_requested()) {
+            job.worker.request_stop();
+            ++job.cancellationCount;
+        }
+        job.worker = std::jthread{};
+    }
+    job.shared.reset();
+    job.activeRequestId = 0U;
 }
 
 PointCloudStyleState MakeEffectiveFastBasicStyle(
@@ -10251,7 +10751,8 @@ std::size_t AddOrRefreshWaterTrailOverlaySession(
     WaterTrailOverlay overlay,
     std::string_view visualName,
     bool storeAsFlowOverlay,
-    std::optional<PointCloudStyleState> defaultStyle = std::nullopt) {
+    std::optional<PointCloudStyleState> defaultStyle = std::nullopt,
+    std::optional<invisible_places::io::LoadedPointCloud> preparedCloud = std::nullopt) {
     if (runtimeState == nullptr || viewport == nullptr || overlay.samples.empty()) {
         return std::numeric_limits<std::size_t>::max();
     }
@@ -10297,10 +10798,14 @@ std::size_t AddOrRefreshWaterTrailOverlaySession(
         SeedWaterFlowBuiltInVisuals(runtimeState, &session);
     }
 
-    auto cloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
-        storeAsFlowOverlay ? runtimeState->water.flowTrailOverlay : overlay,
-        overlayPath,
-        session.displayName);
+    auto cloud = preparedCloud.has_value()
+                     ? std::move(preparedCloud.value())
+                     : invisible_places::water::BuildWaterTrailOverlayPointCloud(
+                           storeAsFlowOverlay ? runtimeState->water.flowTrailOverlay : overlay,
+                           overlayPath,
+                           session.displayName);
+    cloud.sourcePath = overlayPath;
+    cloud.layerName = session.displayName;
     if (!ActivateLoadedPointCloud(sessionIndex, std::move(cloud), runtimeState, viewport)) {
         return std::numeric_limits<std::size_t>::max();
     }
@@ -10419,7 +10924,7 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     const PreviewLayerSession& sourceSession,
-    const std::vector<WaterTrailOverlayGroup>& groups) {
+    std::vector<WaterTrailOverlayGroup> groups) {
     if (runtimeState == nullptr || viewport == nullptr || groups.empty()) {
         return 0U;
     }
@@ -10433,12 +10938,14 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
     ++runtimeState->water.pathDiagnosticRebuildCounters.laneBuilds;
     ++runtimeState->water.pathDiagnosticRebuildCounters.trailBuilds;
     StoreLiveWaterFlowTrailOverlay(runtimeState, combined);
-    UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
 
     bool setLastOverlayPath = false;
-    for (const auto& group : groups) {
+    std::unordered_set<std::string> activeOverlayPaths;
+    activeOverlayPaths.reserve(groups.size());
+    for (auto& group : groups) {
         const auto outputPath =
             BuildWaterTrailOverlayPath(*runtimeState, sourceSession, group.trailProfile.name);
+        activeOverlayPaths.insert(outputPath.lexically_normal().generic_string());
         if (!setLastOverlayPath) {
             runtimeState->water.lastOverlayPath = outputPath;
             setLastOverlayPath = true;
@@ -10450,7 +10957,18 @@ std::size_t InstallWaterFlowTrailOverlayGroups(
             group.overlay,
             group.trailProfile.name,
             false,
-            group.trailProfile.style);
+            group.trailProfile.style,
+            std::move(group.packedCloud));
+    }
+    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
+        auto& session = runtimeState->sessions[index];
+        if (!session.loaded ||
+            !IsGeneratedWaterFlowOverlaySession(session) ||
+            !IsGeneratedWaterFlowTrailOverlayStem(session.sourcePath.stem().string()) ||
+            activeOverlayPaths.contains(session.sourcePath.lexically_normal().generic_string())) {
+            continue;
+        }
+        UnloadLayerByIndex(runtimeState, viewport, index);
     }
     return sampleCount;
 }
@@ -10461,6 +10979,8 @@ bool ScaleWaterFlowTrailSpeedScalars(
     const WaterFlowTrailSettings& previousSettings,
     const WaterFlowTrailSettings& nextSettings) {
     if (runtimeState == nullptr || viewport == nullptr ||
+        runtimeState->water.flowTrailBuildJob.worker.joinable() ||
+        runtimeState->water.flowTrailBuildJob.pendingCapture ||
         previousSettings.speedMetersPerSecond <= 1.0e-6F ||
         nextSettings.speedMetersPerSecond <= 1.0e-6F ||
         !invisible_places::water::WaterFlowLaneSpeedOnlyEdit(previousSettings, nextSettings)) {
@@ -10472,8 +10992,27 @@ bool ScaleWaterFlowTrailSpeedScalars(
         return false;
     }
 
+    std::unordered_set<std::uint32_t> affectedSourceIds;
+    for (const auto& emitter : runtimeState->water.emitters) {
+        if (IsGlobalWaterProfileName(emitter.laneProfileName)) {
+            affectedSourceIds.insert(emitter.id);
+        }
+    }
+    for (const auto& source : runtimeState->water.manualFlowPaths) {
+        if (IsGlobalWaterProfileName(source.laneProfileName)) {
+            affectedSourceIds.insert(source.id);
+        }
+    }
+    if (affectedSourceIds.empty() && !runtimeState->water.pathAnchors.points.empty()) {
+        affectedSourceIds.insert(0U);
+    }
+
     for (auto& sample : runtimeState->water.flowTrailOverlay.samples) {
-        sample.trailSpeed = std::max(0.01F, sample.trailSpeed * speedScale);
+        const auto sourceId = static_cast<std::uint32_t>(
+            std::max(0.0F, std::floor(sample.sourceId + 0.5F)));
+        if (affectedSourceIds.contains(sourceId)) {
+            sample.trailSpeed = std::max(0.01F, sample.trailSpeed * speedScale);
+        }
     }
 
     bool updatedAny = false;
@@ -10488,7 +11027,8 @@ bool ScaleWaterFlowTrailSpeedScalars(
         }
         auto& cloud = *session.offlinePointCloud;
         const auto speedSlot = FindWaterTrailScalarFieldSlotByName(cloud.scalarFields, "trail_speed");
-        if (!speedSlot.has_value() || cloud.PointCount() == 0U) {
+        const auto sourceSlot = FindWaterTrailScalarFieldSlotByName(cloud.scalarFields, "source_id");
+        if (!speedSlot.has_value() || !sourceSlot.has_value() || cloud.PointCount() == 0U) {
             continue;
         }
         const std::size_t expectedValueCount = cloud.scalarFields.size() * cloud.PointCount();
@@ -10497,20 +11037,39 @@ bool ScaleWaterFlowTrailSpeedScalars(
         }
         invisible_places::io::ScalarFieldStats speedStats;
         speedStats.name = "trail_speed";
+        bool updatedSession = false;
         for (std::size_t pointIndex = 0; pointIndex < cloud.PointCount(); ++pointIndex) {
+            const auto sourceId = static_cast<std::uint32_t>(std::max(
+                0.0F,
+                std::floor(
+                    cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(
+                        static_cast<std::size_t>(sourceSlot.value()),
+                        pointIndex)] +
+                    0.5F)));
             const auto valueIndex = cloud.ScalarFieldValueIndex(
                 static_cast<std::size_t>(speedSlot.value()),
                 pointIndex);
-            cloud.scalarFieldValues[valueIndex] = std::max(0.01F, cloud.scalarFieldValues[valueIndex] * speedScale);
+            if (affectedSourceIds.contains(sourceId)) {
+                cloud.scalarFieldValues[valueIndex] =
+                    std::max(0.01F, cloud.scalarFieldValues[valueIndex] * speedScale);
+                updatedSession = true;
+            }
             speedStats.Include(cloud.scalarFieldValues[valueIndex]);
+        }
+        if (!updatedSession) {
+            continue;
         }
         cloud.scalarFields[static_cast<std::size_t>(speedSlot.value())] = speedStats;
         session.scalarFields = cloud.scalarFields;
         try {
-            viewport->UploadPointCloudScalarFields(
+            const auto speedOffset =
+                static_cast<std::size_t>(speedSlot.value()) * cloud.PointCount();
+            viewport->UploadPointCloudScalarFieldValues(
                 sessionIndex,
-                cloud.scalarFields,
-                cloud.scalarFieldValues);
+                static_cast<std::size_t>(speedSlot.value()),
+                std::span<const float>{
+                    cloud.scalarFieldValues.data() + speedOffset,
+                    cloud.PointCount()});
         } catch (const std::exception& error) {
             runtimeState->errorMessage = "Water flow speed scalar update failed: " + std::string{error.what()};
             return false;
@@ -10523,6 +11082,9 @@ bool ScaleWaterFlowTrailSpeedScalars(
     }
 
     runtimeState->water.lastInstalledLaneSettings = nextSettings;
+    for (const auto sourceId : affectedSourceIds) {
+        runtimeState->water.flowTrailSourceArtifacts.erase(sourceId);
+    }
     runtimeState->statusMessage =
         "Water flow speed updated without rebuilding lane routes.";
     runtimeState->errorMessage.clear();
@@ -11375,6 +11937,91 @@ bool SaveWaterPathCacheForSupport(
     return true;
 }
 
+void PollWaterFlowTrailBuildJob(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& job = runtimeState->water.flowTrailBuildJob;
+    std::optional<WaterFlowTrailBuildJobResult> completedResult;
+    if (job.shared != nullptr) {
+        std::lock_guard lock{job.shared->mutex};
+        if (job.shared->completed) {
+            completedResult = std::move(job.shared->result);
+        }
+    }
+
+    if (completedResult.has_value()) {
+        job.worker = std::jthread{};
+        job.shared.reset();
+        auto result = std::move(completedResult.value());
+        const auto latestRequestId = job.nextRequestId > 1U ? job.nextRequestId - 1U : 0U;
+        if (!result.cancelled &&
+            result.requestId == latestRequestId &&
+            result.errorMessage.empty()) {
+            const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+            if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
+                runtimeState->errorMessage = "Flow trail update finished after its support scene was unloaded.";
+                runtimeState->statusMessage.clear();
+            } else {
+                const std::unordered_set<std::uint32_t> activeSourceIds{
+                    result.activeSourceIds.begin(),
+                    result.activeSourceIds.end()};
+                std::erase_if(
+                    runtimeState->water.flowTrailSourceArtifacts,
+                    [&](const auto& entry) { return !activeSourceIds.contains(entry.first); });
+                for (auto& artifact : result.rebuiltArtifacts) {
+                    runtimeState->water.flowTrailSourceArtifacts.insert_or_assign(
+                        artifact.sourceId,
+                        std::move(artifact));
+                }
+                const auto uploadStartedAt = std::chrono::steady_clock::now();
+                if (result.savePathCache && runtimeState->water.pathCacheLoaded) {
+                    SaveWaterPathCacheForSupport(
+                        runtimeState,
+                        runtimeState->sessions[supportIndex.value()]);
+                }
+                if (result.groups.empty() || result.sampleCount == 0U) {
+                    UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
+                    StoreLiveWaterFlowTrailOverlay(runtimeState, {});
+                    runtimeState->statusMessage = "Flow trails hidden; no visible route branches remain.";
+                    runtimeState->errorMessage.clear();
+                } else {
+                    InstallWaterFlowTrailOverlayGroups(
+                        runtimeState,
+                        viewport,
+                        runtimeState->sessions[supportIndex.value()],
+                        std::move(result.groups));
+                    runtimeState->water.lastInstalledLaneSettings =
+                        ViewedGlobalWaterLaneSettings(runtimeState->water);
+                    runtimeState->statusMessage =
+                        "Flow trails updated in the background with " +
+                        FormatPointCount(result.sampleCount) + " surfels.";
+                    runtimeState->errorMessage.clear();
+                }
+                runtimeState->water.flowBranchMaskedSessionIndices.clear();
+                job.lastUploadMs = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - uploadStartedAt)
+                                       .count();
+                job.lastSourceCount = result.sourceCount;
+                job.lastRebuiltSourceCount = result.rebuiltSourceCount;
+                job.lastReusedSourceCount = result.reusedSourceCount;
+                job.lastSampleCount = result.sampleCount;
+                job.lastBuildMs = result.buildMs;
+                job.lastPackMs = result.packMs;
+            }
+        } else if (!result.cancelled &&
+                   result.requestId == latestRequestId &&
+                   !result.errorMessage.empty()) {
+            runtimeState->errorMessage = "Flow trail background update failed: " + result.errorMessage;
+            runtimeState->statusMessage.clear();
+        }
+    }
+
+    StartPendingWaterFlowTrailBuild(runtimeState);
+}
+
 bool ApplyWaterPathCacheForSupport(
     PreviewRuntimeState* runtimeState,
     const PreviewLayerSession& sourceSession,
@@ -11398,6 +12045,7 @@ bool ApplyWaterPathCacheForSupport(
     cache.stale = cache.stale || !matchesSupportAndSettings;
     runtimeState->water.pathCache = std::move(cache);
     runtimeState->water.pathCacheLoaded = true;
+    EnsureWaterFlowPathAnalysisSnapshot(&runtimeState->water);
     runtimeState->water.pathCacheStale = runtimeState->water.pathCache.stale;
     runtimeState->water.pathDirty = runtimeState->water.pathCacheStale;
     const auto supportKey = NormalizePathKey(sourceSession.sourcePath);
@@ -12016,6 +12664,8 @@ void LoadWaterSources(
         return;
     }
 
+    CancelWaterFlowTrailBuildJob(&runtimeState->water);
+
     runtimeState->water.emitters = document->emitters;
     runtimeState->water.manualFlowPaths = document->manualFlowPaths;
     runtimeState->water.seepageNodes = document->seepageNodes;
@@ -12130,10 +12780,7 @@ void LoadWaterSources(
             supportIndex.has_value() && supportIndex.value() < runtimeState->sessions.size() &&
             TryLoadWaterPathCacheForSupport(runtimeState, runtimeState->sessions[supportIndex.value()]) &&
             viewport != nullptr) {
-            RefreshWaterOverlayFromAnchors(
-                runtimeState,
-                viewport,
-                WaterOverlayRefreshPersistence::InMemoryOnly);
+            EnsureWaterFlowPathAnalysisSnapshot(&runtimeState->water);
         }
     } else {
         runtimeState->water.pathCache = {};
@@ -12147,10 +12794,10 @@ void LoadWaterSources(
             MarkWaterPathDirty(runtimeState);
         }
     }
-    if (viewport != nullptr && HasValidManualFlowPath(runtimeState->water)) {
-        RefreshWaterOverlayFromAnchors(
+    if (viewport != nullptr &&
+        (!runtimeState->water.pathAnchors.points.empty() || HasValidManualFlowPath(runtimeState->water))) {
+        QueueWaterFlowTrailRefresh(
             runtimeState,
-            viewport,
             WaterOverlayRefreshPersistence::InMemoryOnly);
     }
     std::size_t restoredRippleMemberships = 0U;
@@ -12320,14 +12967,15 @@ bool SaveManualFlowPathEdit(
     runtimeState->water.nextEmitterId = NextWaterEmitterId(*runtimeState);
     const auto savedName = runtimeState->water.manualFlowPaths[savedIndex].name;
     runtimeState->water.manualFlowPathEditor = {};
-    if (RefreshWaterOverlayFromAnchors(
-            runtimeState,
-            viewport,
-            WaterOverlayRefreshPersistence::InMemoryOnly)) {
-        runtimeState->statusMessage = "Saved manual Flow path " + savedName + " and refreshed trails.";
-    } else if (runtimeState->pendingLoad.has_value() || !ResolveWaterSupportSessionIndex(*runtimeState).has_value()) {
+    if (runtimeState->pendingLoad.has_value() || !ResolveWaterSupportSessionIndex(*runtimeState).has_value()) {
         runtimeState->statusMessage = "Saved manual Flow path " + savedName + "; trails will rebuild when the scene is ready.";
         runtimeState->errorMessage.clear();
+    } else {
+        QueueWaterFlowTrailRefresh(
+            runtimeState,
+            WaterOverlayRefreshPersistence::InMemoryOnly);
+        runtimeState->statusMessage =
+            "Saved manual Flow path " + savedName + "; updating trails in the background.";
     }
     return true;
 }
@@ -12389,6 +13037,7 @@ bool BakeWaterOverlayForActiveLayer(
         runtimeState->statusMessage.clear();
         return false;
     }
+    CancelWaterFlowTrailBuildJob(&runtimeState->water);
     const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
     if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
         runtimeState->errorMessage =
@@ -12574,6 +13223,7 @@ bool BakeWaterOverlayForActiveLayer(
     runtimeState->water.pathCacheLoaded = true;
     runtimeState->water.pathCacheStale = false;
     invisible_places::water::EnsureWaterPathAnalysis(&runtimeState->water.pathCache);
+    EnsureWaterFlowPathAnalysisSnapshot(&runtimeState->water);
     runtimeState->water.pathEditUndoHiddenBranchIds.clear();
     runtimeState->water.selectedPathBranchId.reset();
     runtimeState->water.hoveredPathBranchId.reset();
@@ -12639,6 +13289,7 @@ bool RefreshWaterOverlayFromAnchors(
     if (runtimeState->pendingLoad.has_value()) {
         return false;
     }
+    CancelWaterFlowTrailBuildJob(&runtimeState->water);
     const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
     if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
         runtimeState->water.pathDirty = !runtimeState->water.emitters.empty();
@@ -12650,6 +13301,7 @@ bool RefreshWaterOverlayFromAnchors(
     }
     if (runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCache.branches.empty()) {
         invisible_places::water::EnsureWaterPathAnalysis(&runtimeState->water.pathCache);
+        EnsureWaterFlowPathAnalysisSnapshot(&runtimeState->water);
         runtimeState->water.pathAnchors = WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
     }
     const bool hasManualFlowPath = HasValidManualFlowPath(runtimeState->water);
@@ -15950,6 +16602,13 @@ bool EnsureFullDensityExportSourcesReady(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return false;
     }
+    if (runtimeState->water.flowTrailBuildJob.worker.joinable() ||
+        runtimeState->water.flowTrailBuildJob.pendingCapture) {
+        runtimeState->statusMessage =
+            "Finishing the current Flow trail update before export.";
+        runtimeState->errorMessage.clear();
+        return false;
+    }
     if (runtimeState->pendingLoad.has_value()) {
         runtimeState->statusMessage =
             "Preparing full-density export point clouds; wait for the current layer load to finish.";
@@ -16016,6 +16675,11 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
         runtimeState->water.regionPointPreviewJob.worker.request_stop();
         runtimeState->water.regionPointPreviewJob.worker = std::jthread{};
     }
+    if (runtimeState->water.flowTrailBuildJob.worker.joinable()) {
+        runtimeState->water.flowTrailBuildJob.worker.request_stop();
+        runtimeState->water.flowTrailBuildJob.worker = std::jthread{};
+    }
+    runtimeState->water.flowTrailBuildJob.pendingCapture = false;
     if (runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.joinable()) {
         std::cout << "Waiting for dynamic mesh cache prewarm to finish before shutdown..." << std::endl;
         runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.request_stop();
@@ -16283,6 +16947,8 @@ bool ApplyProjectDocumentToRuntime(
         runtimeState->statusMessage = "Please wait for the current layer to finish loading before loading a project.";
         return false;
     }
+
+    CancelWaterFlowTrailBuildJob(&runtimeState->water);
 
     runtimeState->projectSettings.backgroundColor = document.backgroundColor;
     runtimeState->projectSettings.eyeDomeLightingEnabled = document.eyeDomeLightingEnabled;
@@ -16734,9 +17400,8 @@ bool ApplyProjectDocumentToRuntime(
         const bool loadedGeneratedPathCache =
             TryLoadWaterPathCacheForSupport(runtimeState, supportSession);
         if (loadedGeneratedPathCache || HasValidManualFlowPath(runtimeState->water)) {
-            RefreshWaterOverlayFromAnchors(
+            QueueWaterFlowTrailRefresh(
                 runtimeState,
-                viewport,
                 WaterOverlayRefreshPersistence::InMemoryOnly);
         }
     }
@@ -26207,6 +26872,97 @@ std::optional<std::uint32_t> PickWaterPathBranchAtScreenPoint(
     return bestBranchId;
 }
 
+void ApplyHiddenWaterPathBranchMask(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+
+    std::unordered_map<std::uint32_t, std::uint32_t> hiddenBranchEmitters;
+    hiddenBranchEmitters.reserve(runtimeState->water.pathCache.hiddenBranchIds.size());
+    for (const auto branchId : runtimeState->water.pathCache.hiddenBranchIds) {
+        const auto branchIt = std::find_if(
+            runtimeState->water.pathCache.branches.begin(),
+            runtimeState->water.pathCache.branches.end(),
+            [branchId](const WaterPathBranch& branch) { return branch.id == branchId; });
+        if (branchIt != runtimeState->water.pathCache.branches.end()) {
+            hiddenBranchEmitters.emplace(branchId, branchIt->emitterId);
+        }
+    }
+
+    for (std::size_t sessionIndex = 0U; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
+        auto& session = runtimeState->sessions[sessionIndex];
+        if (!session.loaded ||
+            !IsGeneratedWaterFlowOverlaySession(session) ||
+            !IsGeneratedWaterFlowTrailOverlayStem(session.sourcePath.stem().string()) ||
+            session.offlinePointCloud == nullptr) {
+            continue;
+        }
+        const auto& cloud = *session.offlinePointCloud;
+        const auto sourceSlot = FindWaterTrailScalarFieldSlotByName(cloud.scalarFields, "source_id");
+        const auto branchSlot = FindWaterTrailScalarFieldSlotByName(cloud.scalarFields, "branch_id");
+        if (!sourceSlot.has_value() ||
+            !branchSlot.has_value() ||
+            cloud.scalarFieldValues.size() != cloud.ScalarFieldCount() * cloud.PointCount()) {
+            continue;
+        }
+
+        std::vector<std::uint32_t> visibleIndices;
+        visibleIndices.reserve(cloud.PointCount());
+        bool hidAny = false;
+        for (std::size_t pointIndex = 0U; pointIndex < cloud.PointCount(); ++pointIndex) {
+            const auto sourceId = static_cast<std::uint32_t>(std::max(
+                0.0F,
+                std::floor(
+                    cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(
+                        static_cast<std::size_t>(sourceSlot.value()),
+                        pointIndex)] +
+                    0.5F)));
+            const auto branchId = static_cast<std::uint32_t>(std::max(
+                0.0F,
+                std::floor(
+                    cloud.scalarFieldValues[cloud.ScalarFieldValueIndex(
+                        static_cast<std::size_t>(branchSlot.value()),
+                        pointIndex)] +
+                    0.5F)));
+            const auto hiddenIt = hiddenBranchEmitters.find(branchId);
+            const bool hidden =
+                hiddenIt != hiddenBranchEmitters.end() && hiddenIt->second == sourceId;
+            if (hidden) {
+                hidAny = true;
+                continue;
+            }
+            visibleIndices.push_back(static_cast<std::uint32_t>(pointIndex));
+        }
+
+        const bool hadMask = runtimeState->water.flowBranchMaskedSessionIndices.contains(sessionIndex);
+        if (!hidAny) {
+            if (hadMask) {
+                viewport->UpdatePointBudget(sessionIndex, {});
+                runtimeState->water.flowBranchMaskedSessionIndices.erase(sessionIndex);
+            }
+            session.visible = true;
+            continue;
+        }
+        runtimeState->water.flowBranchMaskedSessionIndices.insert(sessionIndex);
+        if (visibleIndices.empty()) {
+            session.visible = false;
+            continue;
+        }
+        session.visible = true;
+        viewport->UpdatePointBudget(sessionIndex, visibleIndices);
+    }
+
+    if (runtimeState->water.pathDebugCacheRevision == runtimeState->water.flowOverlayRevision) {
+        std::erase_if(
+            runtimeState->water.pathDebugPolylines,
+            [&](const WaterPathDebugPolyline& polyline) {
+                return hiddenBranchEmitters.contains(polyline.branchId);
+            });
+    }
+}
+
 bool HideSelectedWaterPathBranch(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -26233,8 +26989,11 @@ bool HideSelectedWaterPathBranch(
         runtimeState->water.pathCache.hiddenBranchIds.end());
     runtimeState->water.selectedPathBranchId.reset();
     runtimeState->water.hoveredPathBranchId.reset();
-    RefreshWaterOverlayFromAnchors(runtimeState, viewport, WaterOverlayRefreshPersistence::SavePathCache);
-    runtimeState->statusMessage = "Hidden selected water path branch.";
+    ApplyHiddenWaterPathBranchMask(runtimeState, viewport);
+    QueueWaterFlowTrailRefresh(
+        runtimeState,
+        WaterOverlayRefreshPersistence::SavePathCache);
+    runtimeState->statusMessage = "Hidden selected water path branch; redistributing trails in the background.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -26251,10 +27010,38 @@ bool UndoWaterPathBranchEdit(
     runtimeState->water.pathCache.hiddenBranchIds =
         std::move(runtimeState->water.pathEditUndoHiddenBranchIds.back());
     runtimeState->water.pathEditUndoHiddenBranchIds.pop_back();
+    const std::unordered_set<std::uint32_t> visibleBranchIds = [&]() {
+        std::unordered_set<std::uint32_t> ids;
+        for (const auto& branch : runtimeState->water.pathCache.branches) {
+            if (!WaterPathBranchIsHidden(runtimeState->water.pathCache, branch.id)) {
+                ids.insert(branch.id);
+            }
+        }
+        return ids;
+    }();
+    const bool missingRestoredAnchors = std::any_of(
+        visibleBranchIds.begin(),
+        visibleBranchIds.end(),
+        [&](std::uint32_t branchId) {
+            return std::none_of(
+                runtimeState->water.pathAnchors.points.begin(),
+                runtimeState->water.pathAnchors.points.end(),
+                [branchId](const WaterOverlayPoint& point) {
+                    return static_cast<std::uint32_t>(
+                               std::max(0.0F, std::floor(point.flowId + 0.5F))) == branchId;
+                });
+        });
+    if (missingRestoredAnchors) {
+        runtimeState->water.pathAnchors =
+            WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
+    }
     runtimeState->water.selectedPathBranchId.reset();
     runtimeState->water.hoveredPathBranchId.reset();
-    RefreshWaterOverlayFromAnchors(runtimeState, viewport, WaterOverlayRefreshPersistence::SavePathCache);
-    runtimeState->statusMessage = "Restored last water path edit.";
+    ApplyHiddenWaterPathBranchMask(runtimeState, viewport);
+    QueueWaterFlowTrailRefresh(
+        runtimeState,
+        WaterOverlayRefreshPersistence::SavePathCache);
+    runtimeState->statusMessage = "Restored last water path edit; redistributing trails in the background.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -31095,9 +31882,8 @@ void DrawWaterSourceList(
                     "Trail",
                     &source.trailProfileName);
                 if (refreshTrails) {
-                    RefreshWaterOverlayFromAnchors(
+                    QueueWaterFlowTrailRefresh(
                         runtimeState,
-                        viewport,
                         WaterOverlayRefreshPersistence::InMemoryOnly);
                 }
                 if (ImGui::Button("Edit Path")) {
@@ -31121,22 +31907,11 @@ void DrawWaterSourceList(
         const auto deletedName = water.manualFlowPaths[index].name;
         water.manualFlowPaths.erase(water.manualFlowPaths.begin() + static_cast<std::ptrdiff_t>(index));
         water.selectedManualFlowPathIndex.reset();
-        if (!RefreshWaterOverlayFromAnchors(
-                runtimeState,
-                viewport,
-                WaterOverlayRefreshPersistence::InMemoryOnly)) {
-            const bool hasGeneratedRoutes = !water.pathAnchors.points.empty();
-            const bool hasManualRoutes = std::any_of(
-                water.manualFlowPaths.begin(),
-                water.manualFlowPaths.end(),
-                [](const WaterManualFlowPathSource& source) { return source.controlPoints.size() >= 2U; });
-            if (!hasGeneratedRoutes && !hasManualRoutes) {
-                UnloadGeneratedWaterFlowOverlaySessions(runtimeState, viewport);
-                water.flowTrailOverlay = {};
-                runtimeState->errorMessage.clear();
-            }
-        }
-        runtimeState->statusMessage = "Deleted manual Flow path " + deletedName + ".";
+        QueueWaterFlowTrailRefresh(
+            runtimeState,
+            WaterOverlayRefreshPersistence::InMemoryOnly);
+        runtimeState->statusMessage =
+            "Deleted manual Flow path " + deletedName + "; updating trails in the background.";
     }
 
     EndPanelSection();
@@ -31453,7 +32228,9 @@ void DrawWaterTrailProfileSelector(
         selectedName != NormalizeWaterProfileName(water.selectedTrailProfileName) ||
         hadEditedTrailProfile != water.editedTrailProfile.has_value();
     if (profileSelectionChanged) {
-        RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+        QueueWaterFlowTrailRefresh(
+            runtimeState,
+            WaterOverlayRefreshPersistence::InMemoryOnly);
     }
     InputTextString("Trail Name", &water.trailProfileNameBuffer);
     const auto currentProfile = ViewedGlobalWaterTrailProfile(*runtimeState);
@@ -31492,7 +32269,9 @@ void DrawWaterTrailProfileSelector(
             water.selectedTrailProfileName = UneditedWaterProfileName(water.selectedTrailProfileName);
             water.trailProfileNameBuffer = BaseWaterProfileName(water.selectedTrailProfileName);
             water.editedTrailProfile.reset();
-            RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+            QueueWaterFlowTrailRefresh(
+                runtimeState,
+                WaterOverlayRefreshPersistence::InMemoryOnly);
         }
     }
 }
@@ -31701,7 +32480,10 @@ void DrawWaterTrailStyleEditor(
         auto editedProfile = MakeWaterTrailProfile(editedName, profile.geometry, editSession.pointStyle);
         water.editedTrailProfile = editedProfile;
         if (generationRefreshRequested) {
-            RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+            QueueWaterFlowTrailRefresh(
+                runtimeState,
+                WaterOverlayRefreshPersistence::InMemoryOnly,
+                std::chrono::milliseconds{150});
         } else if (visualChanged || styleChanged) {
             const auto updatedCount = ApplyWaterTrailLiveVisualProfile(runtimeState, editedProfile, false);
             if (updatedCount > 0U) {
@@ -33611,7 +34393,9 @@ void DrawWaterPanel(
                     "Trail",
                     &selectedEmitter->trailProfileName);
                 if (refreshTrails) {
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+                    QueueWaterFlowTrailRefresh(
+                        runtimeState,
+                        WaterOverlayRefreshPersistence::InMemoryOnly);
                 }
             } else {
                 ImGui::TextDisabled("No source selected; profile sections edit Global.");
@@ -33761,7 +34545,13 @@ void DrawWaterPanel(
                     MarkWaterPathDirty(runtimeState);
                     runtimeState->statusMessage = "Water Path profile changed; path bake required.";
                 } else if (previousPathSettings.smoothing != pathSettings.smoothing) {
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+                    if (water.pathCacheLoaded && !water.pathCache.branches.empty()) {
+                        water.pathAnchors =
+                            WaterPathAnchorsFromCacheWithProfileSettings(*runtimeState);
+                    }
+                    QueueWaterFlowTrailRefresh(
+                        runtimeState,
+                        WaterOverlayRefreshPersistence::InMemoryOnly);
                 }
                 runtimeState->errorMessage.clear();
             }
@@ -33799,6 +34589,22 @@ void DrawWaterPanel(
                     FormatPointCount(trailDiagnostics.surfaceSampleCount).c_str(),
                     trailDiagnostics.emittedLaneCount,
                     trailDiagnostics.emittedParticleCount);
+            }
+            const auto& flowBuild = water.flowTrailBuildJob;
+            if (flowBuild.worker.joinable() || flowBuild.pendingCapture) {
+                ImGui::TextDisabled("Flow trails: background update pending...");
+            } else if (flowBuild.lastSourceCount > 0U || flowBuild.lastSampleCount > 0U) {
+                ImGui::TextDisabled(
+                    "Flow refresh: %.1f ms build  %.1f ms pack  %.1f ms upload",
+                    flowBuild.lastBuildMs,
+                    flowBuild.lastPackMs,
+                    flowBuild.lastUploadMs);
+                ImGui::TextDisabled(
+                    "Flow refresh: %zu rebuilt  %zu reused  %s samples  %llu cancelled",
+                    flowBuild.lastRebuiltSourceCount,
+                    flowBuild.lastReusedSourceCount,
+                    FormatPointCount(flowBuild.lastSampleCount).c_str(),
+                    static_cast<unsigned long long>(flowBuild.cancellationCount));
             }
             if (ImGui::Button("Bake Path")) {
                 BakeWaterOverlayForActiveLayer(runtimeState, viewport);
@@ -33930,6 +34736,14 @@ void DrawWaterPanel(
                 water.editedLaneProfileSettings = laneSettings;
                 water.selectedLaneProfileName = EditedWaterProfileName(water.selectedLaneProfileName);
                 water.laneProfileNameBuffer = BaseWaterProfileName(water.selectedLaneProfileName);
+                if (!invisible_places::water::WaterFlowLaneSpeedOnlyEdit(
+                        previousLaneSettings,
+                        laneSettings)) {
+                    QueueWaterFlowTrailRefresh(
+                        runtimeState,
+                        WaterOverlayRefreshPersistence::InMemoryOnly,
+                        std::chrono::milliseconds{150});
+                }
             }
             if (refreshLanes) {
                 const auto installedLaneSettings =
@@ -33939,11 +34753,15 @@ void DrawWaterPanel(
                         viewport,
                         installedLaneSettings,
                         laneSettings)) {
-                    RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+                    QueueWaterFlowTrailRefresh(
+                        runtimeState,
+                        WaterOverlayRefreshPersistence::InMemoryOnly);
                 }
             }
             if (ImGui::Button("Regenerate Lanes")) {
-                RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+                QueueWaterFlowTrailRefresh(
+                    runtimeState,
+                    WaterOverlayRefreshPersistence::InMemoryOnly);
             }
             EndPanelSection();
         }
@@ -33952,7 +34770,9 @@ void DrawWaterPanel(
             DrawWaterTrailProfileSelector(runtimeState, viewport);
             DrawWaterTrailStyleEditor(runtimeState, viewport, ViewedGlobalWaterTrailProfile(*runtimeState));
             if (ImGui::Button("Regenerate Trails")) {
-                RefreshWaterOverlayFromAnchors(runtimeState, viewport);
+                QueueWaterFlowTrailRefresh(
+                    runtimeState,
+                    WaterOverlayRefreshPersistence::InMemoryOnly);
             }
             EndPanelSection();
         }
@@ -34993,6 +35813,7 @@ void PumpGuiSmokeFrame(
     const auto frameStart = std::chrono::steady_clock::now();
     window->PollEvents();
     PollWaterRegionPointPreviewJob(runtimeState);
+    PollWaterFlowTrailBuildJob(runtimeState, viewport);
     PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
     SyncWaterRegionPointPreviewHighlights(runtimeState, viewport);
     EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
@@ -36900,6 +37721,7 @@ int Application::Run(ApplicationRunOptions options) const {
             PollDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
             EnsureRainCollisionCacheReady(&runtimeState, &viewport.value());
             PollWaterRegionPointPreviewJob(&runtimeState);
+            PollWaterFlowTrailBuildJob(&runtimeState, &viewport.value());
             PollWaterRippleLiveEffectRefresh(&runtimeState, &viewport.value());
             SyncWaterRegionPointPreviewHighlights(&runtimeState, &viewport.value());
             if (!runtimeState.offlineRenderJob.active) {

@@ -10,8 +10,10 @@
 #include "water/WaterFlow.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -220,6 +222,10 @@ class VulkanViewportShell {
         std::size_t layerId,
         const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
         const std::vector<float>& scalarFieldValues);
+    void UploadPointCloudScalarFieldValues(
+        std::size_t layerId,
+        std::size_t scalarFieldIndex,
+        std::span<const float> values);
     void UploadSparseWaterRippleMembership(
         std::size_t layerId,
         const std::vector<invisible_places::water::WaterRippleRuntimeMembership>& memberships,

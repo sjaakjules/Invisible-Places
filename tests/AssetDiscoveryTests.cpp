@@ -4221,6 +4221,63 @@ TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][
     CHECK_FALSE(invisible_places::water::WaterTrailGeometryLiveVisualOnlyEdit(geometry, generatedGeometry));
 }
 
+TEST_CASE("Water Flow trail builds cancel cleanly without publishing partial samples", "[water][flow][performance]") {
+    invisible_places::water::WaterOverlay anchors;
+    for (std::uint32_t index = 0U; index < 240U; ++index) {
+        invisible_places::water::WaterOverlayPoint point;
+        point.position = {
+            static_cast<float>(index) * 0.006F,
+            std::sin(static_cast<float>(index) * 0.08F) * 0.03F,
+            1.0F - static_cast<float>(index) * 0.004F,
+        };
+        point.normal = {0.0F, 0.0F, 1.0F};
+        point.flowId = 7.0F;
+        point.emitterId = 19.0F;
+        point.pathDistance = static_cast<float>(index) * 0.0075F;
+        point.confidence = 1.0F;
+        anchors.bounds.Expand(point.position);
+        anchors.points.push_back(point);
+    }
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 900U;
+    settings.trailLengthMeters = 0.65F;
+    settings.trailPointSpacingMeters = 0.008F;
+
+    std::stop_source stopSource;
+    stopSource.request_stop();
+    const auto stopToken = stopSource.get_token();
+    const auto cancelled = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+        anchors,
+        settings,
+        nullptr,
+        invisible_places::water::WaterFlowTrailBuildOptions{
+            .stopToken = &stopToken,
+        });
+    CHECK(cancelled.samples.empty());
+
+    settings.trailCountTotal = 8U;
+    const auto completed = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+        anchors,
+        settings);
+    REQUIRE_FALSE(completed.samples.empty());
+    const auto visibleTrailCount = std::count_if(
+        completed.samples.begin(),
+        completed.samples.end(),
+        [](const invisible_places::water::WaterTrailSample& sample) {
+            return sample.trailRole >= 0.5F && sample.pointAge <= 1.0e-6F;
+        });
+    CHECK(visibleTrailCount == 8);
+
+    const auto cancelledCloud = invisible_places::water::BuildWaterTrailOverlayPointCloud(
+        completed,
+        "cancelled-flow.generated",
+        "Cancelled Flow",
+        &stopToken);
+    CHECK(cancelledCloud.PointCount() == 0U);
+    CHECK(cancelledCloud.scalarFields.empty());
+}
+
 TEST_CASE("Manual Flow splines produce deterministic lane-ready anchors and trails", "[water][flow][manual-path]") {
     invisible_places::water::WaterManualFlowPathSource source;
     source.id = 417U;
@@ -9179,6 +9236,9 @@ TEST_CASE("Water path cache tags bridge gaps and round-trips hidden branches", "
     REQUIRE_FALSE(cache.branches.empty());
     REQUIRE(cache.analysis.has_value());
     CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(cache));
+    auto stalePathInputs = cache;
+    stalePathInputs.stale = true;
+    CHECK(invisible_places::water::WaterPathAnalysisCacheCompatible(stalePathInputs));
     CHECK(WaterPathAnalysisSamplesFinite(cache.analysis.value()));
     CHECK(std::any_of(cache.branches.begin(), cache.branches.end(), [](const auto& branch) {
         return branch.gapCount > 0U || branch.confidence < 0.95F;

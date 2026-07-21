@@ -532,6 +532,10 @@ struct WaterFlowTrailSettings {
     std::uint32_t seed = 1;
 };
 
+struct WaterFlowTrailBuildOptions {
+    const std::stop_token* stopToken = nullptr;
+};
+
 [[nodiscard]] bool WaterFlowLaneRouteInputsEqual(
     const WaterFlowTrailSettings& left,
     const WaterFlowTrailSettings& right);
@@ -1410,6 +1414,11 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterOverlay& pathAnchors,
     const WaterFlowTrailSettings& settings,
     const WaterPathAnalysisCache* analysis);
+[[nodiscard]] WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
+    const WaterOverlay& pathAnchors,
+    const WaterFlowTrailSettings& settings,
+    const WaterPathAnalysisCache* analysis,
+    const WaterFlowTrailBuildOptions& options);
 [[nodiscard]] WaterOverlay BuildManualFlowPathAnchors(
     const WaterManualFlowPathSource& source,
     float sampleSpacingMeters = 0.025F);
@@ -1464,6 +1473,11 @@ void EnsureWaterPathAnalysis(WaterPathCache* cache);
     const WaterTrailOverlay& overlay,
     const std::filesystem::path& sourcePath,
     std::string_view layerName);
+[[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterTrailOverlayPointCloud(
+    const WaterTrailOverlay& overlay,
+    const std::filesystem::path& sourcePath,
+    std::string_view layerName,
+    const std::stop_token* stopToken);
 [[nodiscard]] std::vector<invisible_places::io::ScalarFieldStats> WaterTrailOverlayScalarFieldsForPointCount(
     std::uint64_t pointCount);
 [[nodiscard]] invisible_places::io::LoadedPointCloud BuildWaterEffectOverlayPointCloud(
