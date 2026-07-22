@@ -6,6 +6,7 @@ layout(location = 0) in vec4 inSourceColor;
 layout(location = 2) flat in uint inPointIndex;
 layout(location = 3) in vec3 inWorldPosition;
 layout(location = 4) in vec3 inPointNormal;
+layout(location = 5) in float inFlowCoverage;
 
 layout(location = 0) out vec4 outColor;
 
@@ -316,10 +317,22 @@ vec3 ResolveBaseColor() {
         rainImpact);
 }
 
+float WaterFlowCoverageNoise() {
+    const vec2 spriteCell = floor(gl_PointCoord * 16.0);
+    const float hashInput =
+        float(inPointIndex) * 0.754877666 +
+        spriteCell.x * 12.9898 +
+        spriteCell.y * 78.233;
+    return fract(sin(hashInput) * 43758.5453);
+}
+
 void main() {
     float waterTrailFade = 1.0;
     if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterTrailTangentZFieldSlot) {
         if (LoadScalarFieldValue(kWaterTrailRoleFieldSlot) < 0.5) {
+            discard;
+        }
+        if (inFlowCoverage <= 0.0 || WaterFlowCoverageNoise() > clamp(inFlowCoverage, 0.0, 1.0)) {
             discard;
         }
         outColor = vec4(ResolveBaseColor(), 1.0);

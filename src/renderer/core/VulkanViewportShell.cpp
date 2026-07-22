@@ -89,8 +89,9 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 pointMeta{0U, 0U, 0U, 0U};
     glm::uvec4 renderControl{0U, 1U, 0U, 0U};
     glm::vec4 renderParams0{1.0F, 0.55F, 4.0F, 1.6F};
-    // x: trail-style geometry, y: density footprint scale, z: density coverage correction.
-    glm::vec4 renderParams1{0.0F, 1.0F, 1.0F, 0.0F};
+    // x: trail-style geometry, y: density footprint scale, z: density coverage
+    // correction, w: runtime Water Flow activity.
+    glm::vec4 renderParams1{0.0F, 1.0F, 1.0F, 1.0F};
     glm::vec4 renderParams2{1.0F, 0.0F, 1.0F, 0.0F};
     glm::vec4 renderParams3{0.0F, 1.0F, 64.0F, 0.0F};
     PointCloudBindingGpu pointSize{};
@@ -182,10 +183,20 @@ struct alignas(16) RainCountersGpu {
     glm::uvec4 values{0U};
 };
 
+struct alignas(16) WaterSurfacePreprocessUniformsGpu {
+    glm::uvec4 table{0U, 1U, 0U, 0U};
+    glm::vec4 parameters{
+        invisible_places::water::kRainCollisionResolutionMeters,
+        0.50F,
+        0.45F,
+        0.0F};
+};
+
 static_assert(sizeof(RainParticleGpu) == 64U);
 static_assert(sizeof(RainImpactEventGpu) == 64U);
 static_assert(sizeof(invisible_places::water::RainGpuSurfaceSlot) == 32U);
 static_assert(sizeof(invisible_places::water::RainGpuVegetationSlot) == 16U);
+static_assert(sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot) == 32U);
 
 std::uint32_t ActiveRainParticleCount(const SceneRenderState& state) {
     const auto intensity = invisible_places::water::RainIntensityValues(
@@ -218,42 +229,66 @@ struct alignas(16) SparseWaterRippleParamsGpu {
     glm::vec4 response2{0.35F, 0.0F, 0.0F, 0.0F};
 };
 
-struct alignas(16) WaterSeepageNodeGpu {
+struct alignas(16) WaterSeepageLookGpu {
+    // x: pattern, y: blend mode.
+    glm::uvec4 control{0U, 1U, 0U, 0U};
+    glm::vec4 legacy0{1.0F, 0.16F, 0.18F, 0.40F};
+    glm::vec4 legacy1{0.22F, 0.0F, 0.45F, 0.85F};
+    glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
+    glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
+    glm::vec4 response2{0.22F, 0.35F, 0.55F, 0.50F};
+    glm::vec4 organic0{0.20F, 0.55F, 0.06F, 0.45F};
+    glm::vec4 organic1{0.70F, 0.18F, 0.30F, 0.40F};
+    glm::vec4 organic2{0.45F, 0.025F, 0.35F, 0.018F};
+    glm::vec4 organic3{0.10F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 environmentDirection{0.0F, 0.0F, 1.0F, 0.0F};
+};
+
+// Geometry, orientation and surface-guide samples only change when Seepage
+// topology changes. Keeping them out of the live parameter record avoids
+// copying guide arrays for every animation key or rain-level update.
+struct alignas(16) WaterSeepageNodeTopologyGpu {
     static constexpr std::size_t kGuideSampleCapacity = 8U;
 
-    struct alignas(16) LookGpu {
-        // x: pattern, y: blend mode.
-        glm::uvec4 control{0U, 1U, 0U, 0U};
-        glm::vec4 legacy0{1.0F, 0.16F, 0.18F, 0.40F};
-        glm::vec4 legacy1{0.22F, 0.0F, 0.45F, 0.85F};
-        glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
-        glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
-        glm::vec4 response2{0.22F, 0.35F, 0.55F, 0.50F};
-        glm::vec4 organic0{0.20F, 0.55F, 0.06F, 0.45F};
-        glm::vec4 organic1{0.70F, 0.18F, 0.30F, 0.40F};
-        glm::vec4 organic2{0.45F, 0.025F, 0.0F, 0.0F};
-        glm::vec4 environmentDirection{0.0F, 0.0F, 1.0F, 0.0F};
-    };
-
-    glm::uvec4 control{0U, 1U, 1U, 1U};
+    // x: stable node id. Seed is live because authored seed edits are
+    // parameter-only and must not rebuild guides or the spatial hash.
+    glm::uvec4 control{0U, 0U, 0U, 0U};
     glm::vec4 positionReach{0.0F, 0.0F, 0.0F, 1.25F};
     glm::vec4 normalSurface{0.0F, 1.0F, 0.0F, 0.15F};
     glm::vec4 downEdge{0.0F, 0.0F, -1.0F, 0.10F};
     glm::vec4 lateralStart{1.0F, 0.0F, 0.0F, 0.06F};
-    glm::vec4 geometry{0.375F, 0.20F, 1.0F, 0.0F};
-    LookGpu look{};
-    LookGpu transitionLook{};
-    // x: scenario spread, y: transition amount.
-    glm::vec4 scenario{0.0F, 0.0F, 0.0F, 0.0F};
-    std::array<glm::vec4, 3> noiseBasis{};
+    // x: tail half-width.
+    glm::vec4 geometry{0.375F, 0.0F, 0.0F, 0.0F};
     glm::uvec4 guideControl{0U, 0U, 0U, 0U};
     std::array<glm::vec4, kGuideSampleCapacity> guidePositionStation{};
     std::array<glm::vec4, kGuideSampleCapacity> guideNormalConfidence{};
 };
 
-WaterSeepageNodeGpu::LookGpu MakeWaterSeepageLookGpu(
+// This is the only Seepage record rewritten while an animation is playing.
+// It intentionally retains the two complete looks required for deterministic
+// point-level pattern cross-dissolves, but contains no guide/topology data.
+struct alignas(16) WaterSeepageNodeParamsGpu {
+    // x: stable node id, y: quality, z: blend mode, w: seed.
+    glm::uvec4 control{0U, 1U, 1U, 1U};
+    // y: normal-alignment weight, z: effective strength,
+    // w: rain visual strength.
+    glm::vec4 geometry{0.0F, 0.20F, 1.0F, 0.0F};
+    WaterSeepageLookGpu look{};
+    WaterSeepageLookGpu transitionLook{};
+    // x: scenario/local spread, y: transition amount, z: wetting progress.
+    glm::vec4 scenario{0.0F, 0.0F, 1.0F, 0.0F};
+    // Seed-derived basis is live so changing a node seed immediately changes
+    // both noise orientation and procedural hashes.
+    std::array<glm::vec4, 3> noiseBasis{};
+};
+
+static_assert(sizeof(WaterSeepageLookGpu) == 176U);
+static_assert(sizeof(WaterSeepageNodeTopologyGpu) == 368U);
+static_assert(sizeof(WaterSeepageNodeParamsGpu) == 448U);
+
+WaterSeepageLookGpu MakeWaterSeepageLookGpu(
     const invisible_places::water::WaterSeepageLookSettings& look) {
-    WaterSeepageNodeGpu::LookGpu gpu;
+    WaterSeepageLookGpu gpu;
     gpu.control = glm::uvec4{
         static_cast<std::uint32_t>(look.pattern),
         static_cast<std::uint32_t>(look.blendMode),
@@ -290,8 +325,12 @@ WaterSeepageNodeGpu::LookGpu MakeWaterSeepageLookGpu(
         std::max(0.0F, look.glisten),
         std::clamp(look.rainResponse, 0.0F, 1.0F),
     };
+    const float organicFeatureSize =
+        look.pattern == invisible_places::water::WaterSeepagePattern::WettingTrickle
+            ? look.tricklePatchSizeMeters
+            : look.featureSizeMeters;
     gpu.organic0 = glm::vec4{
-        std::max(0.005F, look.featureSizeMeters),
+        std::max(0.005F, organicFeatureSize),
         std::clamp(look.contrast, 0.0F, 1.0F),
         std::max(0.0F, look.evolution),
         std::clamp(look.roughness, 0.02F, 1.0F),
@@ -305,6 +344,12 @@ WaterSeepageNodeGpu::LookGpu MakeWaterSeepageLookGpu(
     gpu.organic2 = glm::vec4{
         std::clamp(look.breakup, 0.0F, 1.0F),
         std::max(0.0F, look.downhillDriftMetersPerSecond),
+        std::max(0.005F, look.trickleLengthMeters),
+        std::max(0.002F, look.trickleWidthMeters),
+    };
+    gpu.organic3 = glm::vec4{
+        std::max(0.002F, look.trickleFrontSoftness),
+        0.0F,
         0.0F,
         0.0F,
     };
@@ -312,8 +357,8 @@ WaterSeepageNodeGpu::LookGpu MakeWaterSeepageLookGpu(
     const float azimuth = look.environmentAzimuthDegrees * degreesToRadians;
     const float elevation = look.environmentElevationDegrees * degreesToRadians;
     glm::vec3 environmentDirection{
-        std::cos(elevation) * std::sin(azimuth),
         std::cos(elevation) * std::cos(azimuth),
+        std::cos(elevation) * std::sin(azimuth),
         std::sin(elevation),
     };
     if (glm::dot(environmentDirection, environmentDirection) <= 1.0e-8F) {
@@ -341,6 +386,39 @@ struct alignas(16) DynamicMeshFlowUniformsGpu {
     glm::vec4 flow2{0.64F, 0.36F, 0.08F, 0.65F};
     glm::vec4 visual0{0.005F, 0.18F, 0.25F, 0.12F};
 };
+
+struct alignas(16) WaterFlowSourceUniformsGpu {
+    glm::uvec4 counts0{0U, 0U, 0U, 0U};
+    glm::uvec4 counts1{0U, 0U, 0U, 0U};
+    glm::uvec4 surface0{0U, 1U, 0U, 0U};
+    glm::uvec4 metadata{1U, 0U, 0U, 0U};
+    glm::uvec4 identity{0U, 1U, 0U, 0U};
+    glm::vec4 route0{0.0F, 0.010F, 0.020F, 0.004F};
+    glm::vec4 lane0{0.12F, 0.006F, 0.06F, 0.18F};
+    glm::vec4 guide0{0.85F, 0.35F, 0.65F, 0.85F};
+    glm::vec4 trail0{0.75F, 0.010F, 0.45F, 0.045F};
+    glm::vec4 shape0{0.22F, 0.85F, 0.08F, 0.0F};
+};
+
+struct alignas(16) WaterFlowInputPointGpu {
+    glm::vec4 positionDistance{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 normalConfidence{0.0F, 0.0F, 1.0F, 1.0F};
+    glm::vec4 outgoingArcDistances{0.0F, 0.0F, 0.0F, 0.0F};
+};
+
+// std430-compatible, source-local branch table. Route/trail output offsets are
+// precomputed on the CPU so both compute passes can dispatch one Y slice per
+// branch without searching or joining branch endpoints.
+struct alignas(16) WaterFlowBranchGpu {
+    glm::uvec4 inputRoute{0U, 0U, 0U, 0U};
+    glm::uvec4 trailLane{0U, 0U, 0U, 1U};
+    glm::uvec4 identity{0U, 0U, 1U, 0U};
+    glm::vec4 metrics{0.0F, 0.010F, 0.0F, 0.0F};
+};
+
+static_assert(sizeof(WaterFlowSourceUniformsGpu) == 160U);
+static_assert(sizeof(WaterFlowInputPointGpu) == 48U);
+static_assert(sizeof(WaterFlowBranchGpu) == 64U);
 
 struct alignas(16) DynamicMeshSurfaceCellGpu {
     glm::vec4 positionConfidence{0.0F, 0.0F, 0.0F, 0.0F};
@@ -439,9 +517,9 @@ glm::vec3 SafeSeepageDirection(glm::vec3 value, glm::vec3 fallback) {
     return glm::dot(value, value) > 1.0e-8F ? glm::normalize(value) : glm::vec3{0.0F, 0.0F, 1.0F};
 }
 
-WaterSeepageNodeGpu MakeWaterSeepageNodeGpu(
+WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
     const invisible_places::water::WaterSeepageRuntimeNode& node) {
-    WaterSeepageNodeGpu gpu;
+    WaterSeepageNodeTopologyGpu gpu;
     const glm::vec3 normal = SafeSeepageDirection(node.surfaceNormal, {0.0F, 1.0F, 0.0F});
     glm::vec3 down = node.downAxis - normal * glm::dot(node.downAxis, normal);
     down = SafeSeepageDirection(down, {0.0F, 0.0F, -1.0F});
@@ -452,9 +530,9 @@ WaterSeepageNodeGpu MakeWaterSeepageNodeGpu(
 
     gpu.control = glm::uvec4{
         node.id,
-        WaterSeepageQualityGpu(node.resolvedQuality),
-        static_cast<std::uint32_t>(node.look.blendMode),
-        node.seed,
+        0U,
+        0U,
+        0U,
     };
     gpu.positionReach = glm::vec4{node.position, std::max(0.001F, node.reachMeters)};
     gpu.normalSurface = glm::vec4{normal, std::max(0.001F, node.depthToleranceMeters)};
@@ -462,28 +540,16 @@ WaterSeepageNodeGpu MakeWaterSeepageNodeGpu(
     gpu.lateralStart = glm::vec4{lateral, std::max(0.001F, node.startHalfWidthMeters)};
     gpu.geometry = glm::vec4{
         std::max(0.001F, node.endHalfWidthMeters),
-        std::clamp(node.normalAlignment, 0.0F, 1.0F),
-        std::max(0.0F, node.strength),
-        std::clamp(node.rainVisualStrength, 0.0F, 1.0F),
-    };
-    gpu.look = MakeWaterSeepageLookGpu(node.look);
-    gpu.transitionLook = MakeWaterSeepageLookGpu(
-        node.transitionLook.value_or(node.look));
-    gpu.scenario = glm::vec4{
-        std::clamp(node.scenarioSpread, 0.0F, 1.0F),
-        std::clamp(node.transitionAmount, 0.0F, 1.0F),
+        0.0F,
         0.0F,
         0.0F,
     };
-    for (std::size_t basisIndex = 0U; basisIndex < gpu.noiseBasis.size(); ++basisIndex) {
-        gpu.noiseBasis[basisIndex] = glm::vec4{node.noiseRotation[basisIndex], 0.0F};
-    }
     const auto guideSampleCount = node.guideValid
                                       ? std::min<std::size_t>(
                                             static_cast<std::size_t>(node.guideSampleCount),
                                             std::min(
                                                 node.guideSamples.size(),
-                                                WaterSeepageNodeGpu::kGuideSampleCapacity))
+                                                WaterSeepageNodeTopologyGpu::kGuideSampleCapacity))
                                       : 0U;
     const float guideAchievedReach = std::max(
         0.0F,
@@ -529,6 +595,36 @@ WaterSeepageNodeGpu MakeWaterSeepageNodeGpu(
     return gpu;
 }
 
+WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
+    const invisible_places::water::WaterSeepageRuntimeNode& node) {
+    WaterSeepageNodeParamsGpu gpu;
+    gpu.control = glm::uvec4{
+        node.id,
+        WaterSeepageQualityGpu(node.resolvedQuality),
+        static_cast<std::uint32_t>(node.look.blendMode),
+        node.seed,
+    };
+    gpu.geometry = glm::vec4{
+        0.0F,
+        std::clamp(node.normalAlignment, 0.0F, 1.0F),
+        std::max(0.0F, node.strength),
+        std::clamp(node.rainVisualStrength, 0.0F, 1.0F),
+    };
+    gpu.look = MakeWaterSeepageLookGpu(node.look);
+    gpu.transitionLook = MakeWaterSeepageLookGpu(
+        node.transitionLook.value_or(node.look));
+    gpu.scenario = glm::vec4{
+        std::clamp(node.scenarioSpread, 0.0F, 1.0F),
+        std::clamp(node.transitionAmount, 0.0F, 1.0F),
+        std::clamp(node.wettingProgress, 0.0F, 1.0F),
+        0.0F,
+    };
+    for (std::size_t basisIndex = 0U; basisIndex < gpu.noiseBasis.size(); ++basisIndex) {
+        gpu.noiseBasis[basisIndex] = glm::vec4{node.noiseRotation[basisIndex], 0.0F};
+    }
+    return gpu;
+}
+
 std::uint32_t SeepageHashUint(std::uint32_t value) {
     value ^= value >> 16U;
     value *= 0x7feb352dU;
@@ -558,7 +654,8 @@ std::uint32_t NextSeepageHashCapacity(std::size_t occupiedCellCount) {
 }
 
 struct WaterSeepageGpuTopology {
-    std::vector<WaterSeepageNodeGpu> nodes;
+    std::vector<WaterSeepageNodeTopologyGpu> nodes;
+    std::vector<WaterSeepageNodeParamsGpu> params;
     std::vector<WaterSeepageHashCellGpu> hashCells;
     std::vector<std::uint32_t> nodeReferences;
     std::uint32_t occupiedCellCount = 0U;
@@ -573,8 +670,10 @@ WaterSeepageGpuTopology MakeWaterSeepageGpuTopology(
         throw std::runtime_error{"Seepage GPU payload exceeds the current 32-bit limit."};
     }
     result.nodes.reserve(grid.nodes.size());
+    result.params.reserve(grid.nodes.size());
     for (const auto& node : grid.nodes) {
-        result.nodes.push_back(MakeWaterSeepageNodeGpu(node));
+        result.nodes.push_back(MakeWaterSeepageNodeTopologyGpu(node));
+        result.params.push_back(MakeWaterSeepageNodeParamsGpu(node));
     }
 
     struct OccupiedCell {
@@ -638,7 +737,8 @@ WaterSeepageGpuTopology MakeWaterSeepageGpuTopology(
     result.occupiedCellCount = static_cast<std::uint32_t>(occupiedCells.size());
 
     if (result.nodes.empty()) {
-        result.nodes.push_back(WaterSeepageNodeGpu{});
+        result.nodes.push_back(WaterSeepageNodeTopologyGpu{});
+        result.params.push_back(WaterSeepageNodeParamsGpu{});
     }
     if (result.nodeReferences.empty()) {
         result.nodeReferences.push_back(0U);
@@ -734,7 +834,7 @@ constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
     std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
 
-std::vector<std::uint32_t> SanitizePointHighlightIndices(
+std::vector<std::uint32_t> SanitizePointIndices(
     const std::vector<std::uint32_t>& indices,
     std::uint32_t pointCount) {
     std::vector<std::uint32_t> sanitized;
@@ -1133,7 +1233,9 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreatePresentRenderPass();
     CreatePointDescriptorSetLayout();
     CreateDynamicMeshFlowDescriptorSetLayout();
+    CreateWaterFlowSourceDescriptorSetLayout();
     CreateRainDescriptorSetLayout();
+    CreateWaterSurfacePreprocessDescriptorSetLayout();
     CreateGaussianSplatDescriptorSetLayout();
     CreateHighQualityGaussianSplatDescriptorSetLayout();
     CreateCompositeDescriptorSetLayout();
@@ -1148,7 +1250,9 @@ VulkanViewportShell::VulkanViewportShell(GLFWwindow* window) : window_(window) {
     CreateLinearDepthResources();
     CreatePointPipelines();
     CreateDynamicMeshFlowComputePipeline();
+    CreateWaterFlowSourceComputePipelines();
     CreateRainPipelines();
+    CreateWaterSurfacePreprocessPipeline();
     CreateGaussianSplatPipeline();
     CreateHighQualityGaussianSplatPipeline();
     CreateCompositePipeline();
@@ -1231,8 +1335,17 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (dynamicMeshFlowComputePipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, dynamicMeshFlowComputePipeline_, nullptr);
     }
+    if (waterFlowRouteComputePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, waterFlowRouteComputePipeline_, nullptr);
+    }
+    if (waterFlowTrailComputePipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, waterFlowTrailComputePipeline_, nullptr);
+    }
     if (rainComputePipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, rainComputePipeline_, nullptr);
+    }
+    if (waterSurfacePreprocessPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, waterSurfacePreprocessPipeline_, nullptr);
     }
     if (rainPipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(device_, rainPipeline_, nullptr);
@@ -1267,8 +1380,14 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (dynamicMeshFlowPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, dynamicMeshFlowPipelineLayout_, nullptr);
     }
+    if (waterFlowSourcePipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, waterFlowSourcePipelineLayout_, nullptr);
+    }
     if (rainPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, rainPipelineLayout_, nullptr);
+    }
+    if (waterSurfacePreprocessPipelineLayout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device_, waterSurfacePreprocessPipelineLayout_, nullptr);
     }
     if (gaussianSplatPipelineLayout_ != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device_, gaussianSplatPipelineLayout_, nullptr);
@@ -1300,8 +1419,14 @@ VulkanViewportShell::~VulkanViewportShell() {
     if (dynamicMeshFlowDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, dynamicMeshFlowDescriptorSetLayout_, nullptr);
     }
+    if (waterFlowSourceDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, waterFlowSourceDescriptorSetLayout_, nullptr);
+    }
     if (rainDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, rainDescriptorSetLayout_, nullptr);
+    }
+    if (waterSurfacePreprocessDescriptorSetLayout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device_, waterSurfacePreprocessDescriptorSetLayout_, nullptr);
     }
     if (gaussianSplatDescriptorSetLayout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device_, gaussianSplatDescriptorSetLayout_, nullptr);
@@ -1345,6 +1470,13 @@ void VulkanViewportShell::BeginUiFrame() {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
+    // GLFW can create a Vulkan surface while macOS monitor enumeration is
+    // unavailable (remote/headless smoke sessions are the common case). ImGui
+    // asserts if multi-viewport mode remains enabled with no platform monitor;
+    // retain the main viewport and degrade gracefully instead.
+    if (ImGui::GetPlatformIO().Monitors.empty()) {
+        ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+    }
     ImGui::NewFrame();
     uiFrameBegun_ = true;
 }
@@ -1390,6 +1522,12 @@ void VulkanViewportShell::DrawFrame() {
 
     auto& frame = frameResources_[currentFrameIndex_];
     vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
+    PollWaterSurfacePreprocess();
+    PollWaterFlowSourceDispatches();
+    // This frame slot is no longer referenced by the GPU, so it is safe to
+    // publish the newest compact Seepage animation snapshot without waiting
+    // for any other in-flight frame.
+    FlushWaterSeepageParamsForFrame(currentFrameIndex_);
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
     if (AnySceneImageNeedsRender()) {
@@ -1753,11 +1891,30 @@ void VulkanViewportShell::UploadPointCloud(
         resources.sparseRippleParamsBuffer,
         &emptySparseRippleParams,
         sizeof(emptySparseRippleParams));
-    const WaterSeepageNodeGpu emptySeepageNode{};
+    const WaterSeepageNodeTopologyGpu emptySeepageNode{};
     resources.seepageNodeBuffer = CreateHostVisibleBuffer(
         sizeof(emptySeepageNode),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     UploadBufferData(resources.seepageNodeBuffer, &emptySeepageNode, sizeof(emptySeepageNode));
+    const WaterSeepageNodeParamsGpu emptySeepageParams{};
+    for (auto& paramsBuffer : resources.seepageParamsBuffers) {
+        paramsBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageParams),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(paramsBuffer, &emptySeepageParams, sizeof(emptySeepageParams));
+    }
+    resources.seepageExrParamsBuffer = CreateHostVisibleBuffer(
+        sizeof(emptySeepageParams),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources.seepageExrParamsBuffer,
+        &emptySeepageParams,
+        sizeof(emptySeepageParams));
+    resources.pendingSeepageParams.resize(sizeof(emptySeepageParams));
+    std::memcpy(
+        resources.pendingSeepageParams.data(),
+        &emptySeepageParams,
+        sizeof(emptySeepageParams));
     const WaterSeepageHashCellGpu emptySeepageHashCell{};
     resources.seepageHashCellBuffer = CreateHostVisibleBuffer(
         sizeof(emptySeepageHashCell),
@@ -2127,11 +2284,30 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
             sizeof(emptySparseRippleParams),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources->sparseRippleParamsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
-        const WaterSeepageNodeGpu emptySeepageNode{};
+        const WaterSeepageNodeTopologyGpu emptySeepageNode{};
         resources->seepageNodeBuffer = CreateHostVisibleBuffer(
             sizeof(emptySeepageNode),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources->seepageNodeBuffer, &emptySeepageNode, sizeof(emptySeepageNode));
+        const WaterSeepageNodeParamsGpu emptySeepageParams{};
+        for (auto& paramsBuffer : resources->seepageParamsBuffers) {
+            paramsBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySeepageParams),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(paramsBuffer, &emptySeepageParams, sizeof(emptySeepageParams));
+        }
+        resources->seepageExrParamsBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageParams),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->seepageExrParamsBuffer,
+            &emptySeepageParams,
+            sizeof(emptySeepageParams));
+        resources->pendingSeepageParams.resize(sizeof(emptySeepageParams));
+        std::memcpy(
+            resources->pendingSeepageParams.data(),
+            &emptySeepageParams,
+            sizeof(emptySeepageParams));
         const WaterSeepageHashCellGpu emptySeepageHashCell{};
         resources->seepageHashCellBuffer = CreateHostVisibleBuffer(
             sizeof(emptySeepageHashCell),
@@ -2311,6 +2487,435 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
         .reusedStaticBuffers = !rebuildStaticBuffers,
         .asynchronousDispatch = true,
     };
+}
+
+WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
+    std::size_t layerId,
+    const WaterFlowGpuSourceRequest& request) {
+    WaterFlowGpuSourceUploadResult result;
+    if (waterFlowRouteComputePipeline_ == VK_NULL_HANDLE ||
+        waterFlowTrailComputePipeline_ == VK_NULL_HANDLE ||
+        waterFlowSourcePipelineLayout_ == VK_NULL_HANDLE ||
+        waterFlowSourceDescriptorSetLayout_ == VK_NULL_HANDLE) {
+        return result;
+    }
+    // New cache preprocessing is submitted on the same queue. Deferring guided
+    // requests here guarantees every dispatch using the old immutable table is
+    // ordered before that table can enter the cache retirement path.
+    if (request.useSurfaceGuide && WaterSurfaceUploadPending()) {
+        result.diagnostics = WaterFlowGpuSourceState(layerId);
+        result.diagnostics.pending = true;
+        return result;
+    }
+
+    auto compactSourceInput = request.compactSourceInput;
+    if (compactSourceInput == nullptr || !compactSourceInput->Valid()) {
+        auto builtInput =
+            request.inputKind ==
+                    invisible_places::water::WaterFlowGpuInputKind::ManualCatmullRomControlPoints
+                ? invisible_places::water::BuildWaterFlowGpuManualSplineSourceInput(
+                      request.controlPoints,
+                      request.sourceId,
+                      1U)
+                : invisible_places::water::BuildWaterFlowGpuSampledSourceInput(
+                      request.sampledAnchors,
+                      request.settings,
+                      nullptr);
+        compactSourceInput =
+            std::make_shared<const invisible_places::water::WaterFlowGpuCompactSourceInput>(
+                std::move(builtInput));
+    }
+    if (!compactSourceInput->Valid()) {
+        return result;
+    }
+    std::vector<WaterFlowInputPointGpu> inputPoints;
+    inputPoints.reserve(compactSourceInput->points.size());
+    for (const auto& sourcePoint : compactSourceInput->points) {
+        WaterFlowInputPointGpu point;
+        point.positionDistance = glm::vec4{
+            sourcePoint.position.x,
+            sourcePoint.position.y,
+            sourcePoint.position.z,
+            sourcePoint.cumulativeDistanceMeters,
+        };
+        point.normalConfidence = glm::vec4{
+            sourcePoint.normal.x,
+            sourcePoint.normal.y,
+            sourcePoint.normal.z,
+            sourcePoint.confidence,
+        };
+        point.outgoingArcDistances = glm::vec4{
+            sourcePoint.outgoingSegmentArcDistancesMeters[0U],
+            sourcePoint.outgoingSegmentArcDistancesMeters[1U],
+            sourcePoint.outgoingSegmentArcDistancesMeters[2U],
+            sourcePoint.outgoingSegmentArcDistancesMeters[3U],
+        };
+        inputPoints.push_back(point);
+    }
+
+    auto* resources = FindPointCloudResources(layerId);
+    const std::uint32_t spareCapacity =
+        resources != nullptr && resources->waterFlowSourceActive
+            ? resources->waterFlowSparePointCapacity
+            : 0U;
+    result.layout = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        *compactSourceInput,
+        request.settings,
+        spareCapacity);
+    if (!result.layout.Valid()) {
+        return result;
+    }
+    VkPhysicalDeviceProperties physicalDeviceProperties{};
+    vkGetPhysicalDeviceProperties(physicalDevice_, &physicalDeviceProperties);
+    if (result.layout.branchCount >
+        physicalDeviceProperties.limits.maxComputeWorkGroupCount[1]) {
+        return result;
+    }
+
+    if (resources == nullptr) {
+        pointCloudResources_.push_back(ActivePointCloudResources{});
+        resources = &pointCloudResources_.back();
+        resources->layerId = layerId;
+    } else if (!resources->waterFlowSourceActive) {
+        WaitIdle();
+        CleanupPointCloudResources(resources);
+        resources->layerId = layerId;
+    }
+
+    const std::uint64_t newestRevision = std::max({
+        resources->waterFlowSourceRequestedRevision,
+        resources->waterFlowPendingRevision,
+        resources->waterFlowQueuedRevision,
+    });
+    if (resources->waterFlowSourceActive && request.sourceRevision <= newestRevision) {
+        result.diagnostics = WaterFlowGpuSourceState(layerId);
+        return result;
+    }
+
+    resources->waterFlowSourceActive = true;
+    resources->waterFlowDeletePending = false;
+    resources->waterFlowDeleteOutstandingFrameMask = 0U;
+    resources->waterFlowSourceId = request.sourceId;
+    resources->waterFlowSourceRequestedRevision = request.sourceRevision;
+    if (resources->waterFlowSourceDispatchPending) {
+        resources->waterFlowQueuedInputKind = request.inputKind;
+        resources->waterFlowQueuedCompactSourceInput = std::move(compactSourceInput);
+        resources->waterFlowQueuedSettings = request.settings;
+        resources->waterFlowQueuedRevision = request.sourceRevision;
+        resources->waterFlowQueuedSourceId = request.sourceId;
+        resources->waterFlowQueuedUseSurfaceGuide = request.useSurfaceGuide;
+        resources->waterFlowSourceQueued = true;
+        result.accepted = true;
+        result.asynchronousDispatch = true;
+        result.diagnostics = WaterFlowGpuSourceState(layerId);
+        return result;
+    }
+
+    const bool reusedOutputCapacity =
+        resources->waterFlowSparePointCapacity >= result.layout.pointCapacity &&
+        resources->waterFlowPendingPositionStorageBuffer.buffer != VK_NULL_HANDLE &&
+        resources->waterFlowPendingNormalBuffer.buffer != VK_NULL_HANDLE &&
+        resources->waterFlowPendingScalarFieldBuffer.buffer != VK_NULL_HANDLE;
+    if (!reusedOutputCapacity) {
+        DestroyBuffer(&resources->waterFlowPendingPositionBuffer);
+        DestroyBuffer(&resources->waterFlowPendingPositionStorageBuffer);
+        DestroyBuffer(&resources->waterFlowPendingColorBuffer);
+        DestroyBuffer(&resources->waterFlowPendingNormalBuffer);
+        DestroyBuffer(&resources->waterFlowPendingScalarFieldBuffer);
+        resources->waterFlowSparePointCapacity = result.layout.pointCapacity;
+        const VkDeviceSize capacity = result.layout.pointCapacity;
+        resources->waterFlowPendingPositionBuffer = CreateDeviceLocalBuffer(
+            capacity * sizeof(invisible_places::io::Float3),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        resources->waterFlowPendingPositionStorageBuffer = CreateDeviceLocalBuffer(
+            capacity * sizeof(glm::vec4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->waterFlowPendingNormalBuffer = CreateDeviceLocalBuffer(
+            capacity * sizeof(glm::vec4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->waterFlowPendingScalarFieldBuffer = CreateDeviceLocalBuffer(
+            capacity * invisible_places::water::kWaterTrailScalarFieldCount * sizeof(float),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->waterFlowPendingColorBuffer = CreateHostVisibleBuffer(
+            capacity * sizeof(std::uint32_t),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const std::uint32_t waterColor = static_cast<std::uint32_t>(190U) |
+                                         (static_cast<std::uint32_t>(230U) << 8U) |
+                                         (static_cast<std::uint32_t>(255U) << 16U) |
+                                         (0xFFU << 24U);
+        auto* packedColors = static_cast<std::uint32_t*>(resources->waterFlowPendingColorBuffer.mapped);
+        if (packedColors != nullptr) {
+            std::fill_n(packedColors, result.layout.pointCapacity, waterColor);
+            resources->waterFlowSourceBytesTransferred +=
+                static_cast<std::uint64_t>(result.layout.pointCapacity) * sizeof(std::uint32_t);
+        }
+    }
+
+    const std::uint32_t requiredInputCapacity = std::bit_ceil(std::max<std::uint32_t>(
+        2U,
+        static_cast<std::uint32_t>(inputPoints.size())));
+    if (resources->waterFlowSourceInputCapacity < requiredInputCapacity ||
+        resources->waterFlowSourceInputBuffer.buffer == VK_NULL_HANDLE) {
+        DestroyBuffer(&resources->waterFlowSourceInputBuffer);
+        resources->waterFlowSourceInputBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(requiredInputCapacity) * sizeof(WaterFlowInputPointGpu),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->waterFlowSourceInputCapacity = requiredInputCapacity;
+    }
+    std::vector<WaterFlowBranchGpu> gpuBranches;
+    gpuBranches.reserve(result.layout.branches.size());
+    for (const auto& branch : result.layout.branches) {
+        WaterFlowBranchGpu gpuBranch;
+        gpuBranch.inputRoute = glm::uvec4{
+            branch.inputStart,
+            branch.inputCount,
+            branch.routeStart,
+            branch.routePointsPerLane,
+        };
+        gpuBranch.trailLane = glm::uvec4{
+            branch.activeRouteLaneCount,
+            branch.trailOutputStart,
+            branch.trailCount,
+            branch.firstTrailId,
+        };
+        gpuBranch.identity = glm::uvec4{
+            branch.potentialLaneCount,
+            branch.branchId,
+            branch.pathId,
+            static_cast<std::uint32_t>(request.inputKind),
+        };
+        gpuBranch.metrics = glm::vec4{
+            branch.routeLengthMeters,
+            branch.routeSpacingMeters,
+            0.0F,
+            0.0F,
+        };
+        gpuBranches.push_back(gpuBranch);
+    }
+    const std::uint32_t requiredBranchCapacity = std::bit_ceil(
+        std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(gpuBranches.size())));
+    if (resources->waterFlowSourceBranchCapacity < requiredBranchCapacity ||
+        resources->waterFlowSourceBranchBuffer.buffer == VK_NULL_HANDLE) {
+        DestroyBuffer(&resources->waterFlowSourceBranchBuffer);
+        resources->waterFlowSourceBranchBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(requiredBranchCapacity) * sizeof(WaterFlowBranchGpu),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        resources->waterFlowSourceBranchCapacity = requiredBranchCapacity;
+    }
+    if (resources->waterFlowSourceUniformBuffer.buffer == VK_NULL_HANDLE) {
+        resources->waterFlowSourceUniformBuffer = CreateHostVisibleBuffer(
+            sizeof(WaterFlowSourceUniformsGpu),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+
+    if (resources->sparseRippleRangeBuffer.buffer == VK_NULL_HANDLE) {
+        const SparseWaterRippleRangeGpu emptySparseRippleRange{};
+        resources->sparseRippleRangeBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleRange), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->sparseRippleRangeBuffer,
+            &emptySparseRippleRange,
+            sizeof(emptySparseRippleRange));
+        const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
+        resources->sparseRippleMembershipBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleMembership), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->sparseRippleMembershipBuffer,
+            &emptySparseRippleMembership,
+            sizeof(emptySparseRippleMembership));
+        const SparseWaterRippleParamsGpu emptySparseRippleParams{};
+        resources->sparseRippleParamsBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->sparseRippleParamsBuffer,
+            &emptySparseRippleParams,
+            sizeof(emptySparseRippleParams));
+        const WaterSeepageNodeTopologyGpu emptySeepageNode{};
+        resources->seepageNodeBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageNode), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources->seepageNodeBuffer, &emptySeepageNode, sizeof(emptySeepageNode));
+        const WaterSeepageNodeParamsGpu emptySeepageParams{};
+        for (auto& paramsBuffer : resources->seepageParamsBuffers) {
+            paramsBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySeepageParams),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(paramsBuffer, &emptySeepageParams, sizeof(emptySeepageParams));
+        }
+        resources->seepageExrParamsBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageParams),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->seepageExrParamsBuffer,
+            &emptySeepageParams,
+            sizeof(emptySeepageParams));
+        resources->pendingSeepageParams.resize(sizeof(emptySeepageParams));
+        std::memcpy(
+            resources->pendingSeepageParams.data(),
+            &emptySeepageParams,
+            sizeof(emptySeepageParams));
+        const WaterSeepageHashCellGpu emptySeepageHashCell{};
+        resources->seepageHashCellBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySeepageHashCell), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->seepageHashCellBuffer,
+            &emptySeepageHashCell,
+            sizeof(emptySeepageHashCell));
+        const std::uint32_t emptyReference = 0U;
+        resources->seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
+            sizeof(emptyReference), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(
+            resources->seepageNodeReferenceBuffer,
+            &emptyReference,
+            sizeof(emptyReference));
+        for (auto& styleBuffer : resources->styleBuffers) {
+            styleBuffer = CreateHostVisibleBuffer(
+                sizeof(PointCloudStyleGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        }
+        resources->exrStyleBuffer = CreateHostVisibleBuffer(
+            sizeof(PointCloudStyleGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+
+    const auto surfaceView = WaterSurfaceFlowView();
+    const bool useSurfaceGuide =
+        request.useSurfaceGuide && surfaceView.valid && surfaceView.preprocessingComplete;
+    WaterFlowSourceUniformsGpu uniforms;
+    uniforms.counts0 = glm::uvec4{
+        result.layout.inputPointCount,
+        result.layout.branchCount,
+        result.layout.maxActiveRouteLaneCount,
+        result.layout.routePointCountTotal,
+    };
+    uniforms.counts1 = glm::uvec4{
+        result.layout.trailCount,
+        result.layout.samplesPerTrail,
+        result.layout.pointCount,
+        result.layout.pointCapacity,
+    };
+    uniforms.surface0 = glm::uvec4{
+        surfaceView.tableMask,
+        std::max(1U, surfaceView.maximumProbeCount),
+        useSurfaceGuide ? 1U : 0U,
+        request.sourceId,
+    };
+    uniforms.metadata = glm::uvec4{
+        request.settings.seed,
+        static_cast<std::uint32_t>(request.inputKind),
+        useSurfaceGuide ? 1U : 0U,
+        static_cast<std::uint32_t>(request.sourceRevision),
+    };
+    uniforms.identity = glm::uvec4{request.sourceId, 0U, 0U, 0U};
+    uniforms.route0 = glm::vec4{
+        result.layout.routeLengthMeters,
+        std::max(0.001F, request.settings.trailPointSpacingMeters),
+        surfaceView.valid ? surfaceView.resolutionMeters : 0.020F,
+        std::isfinite(request.settings.surfaceOffsetMeters)
+            ? request.settings.surfaceOffsetMeters
+            : 0.004F,
+    };
+    uniforms.lane0 = glm::vec4{
+        std::max(0.0F, request.settings.laneSpreadMeters),
+        std::max(0.0005F, request.settings.trailWidthMeters),
+        std::clamp(request.settings.turbulence, 0.0F, 1.0F),
+        std::max(0.005F, request.settings.turbulenceScaleMeters),
+    };
+    uniforms.guide0 = glm::vec4{
+        std::clamp(request.settings.surfaceFollow, 0.0F, 1.0F),
+        std::clamp(request.settings.downhillPull, 0.0F, 1.0F),
+        std::clamp(request.settings.terrainWidthResponse, 0.0F, 1.0F),
+        std::clamp(request.settings.pathAttraction, 0.0F, 1.0F),
+    };
+    uniforms.trail0 = glm::vec4{
+        std::max(0.02F, request.settings.trailLengthMeters),
+        std::max(0.001F, request.settings.trailPointSpacingMeters),
+        std::max(0.0F, request.settings.speedMetersPerSecond),
+        std::max(0.001F, request.settings.trailStreakLengthMeters),
+    };
+    uniforms.shape0 = glm::vec4{
+        std::clamp(request.settings.laneCrossing, 0.0F, 1.0F),
+        std::clamp(request.settings.trailSmoothness, 0.0F, 1.0F),
+        std::clamp(request.settings.trailLooseness, 0.0F, 1.0F),
+        0.0F,
+    };
+
+    UploadBufferData(
+        resources->waterFlowSourceInputBuffer,
+        inputPoints.data(),
+        static_cast<VkDeviceSize>(inputPoints.size() * sizeof(WaterFlowInputPointGpu)));
+    UploadBufferData(
+        resources->waterFlowSourceBranchBuffer,
+        gpuBranches.data(),
+        static_cast<VkDeviceSize>(gpuBranches.size() * sizeof(WaterFlowBranchGpu)));
+    UploadBufferData(
+        resources->waterFlowSourceUniformBuffer,
+        &uniforms,
+        sizeof(uniforms));
+    resources->waterFlowSourceBytesTransferred +=
+        static_cast<std::uint64_t>(inputPoints.size() * sizeof(WaterFlowInputPointGpu)) +
+        static_cast<std::uint64_t>(gpuBranches.size() * sizeof(WaterFlowBranchGpu)) +
+        sizeof(uniforms);
+    resources->waterFlowSourceSurfaceUploadRevision =
+        useSurfaceGuide ? surfaceView.uploadRevision : 0U;
+    resources->waterFlowSourceUseSurfaceGuide = useSurfaceGuide;
+
+    // Unguided sources must not retain a descriptor reference to the shared
+    // surface allocation. That allocation can be swapped independently when
+    // the active scene changes; bind the source input buffer as the shader's
+    // harmless dummy table unless this dispatch actually uses the surface.
+    UpdateWaterFlowSourceDescriptorSet(
+        resources,
+        useSurfaceGuide ? surfaceView : WaterSurfaceFlowGpuView{});
+    DispatchWaterFlowSourceCompute(resources, result.layout);
+    resources->waterFlowPendingLayout = result.layout;
+    resources->waterFlowPendingRevision = request.sourceRevision;
+    resources->waterFlowPendingSourceId = request.sourceId;
+    resources->waterFlowSourceDispatchPending = true;
+    ++resources->waterFlowSourceDispatchCount;
+    ++sceneRevision_;
+
+    result.accepted = true;
+    result.reusedOutputCapacity = reusedOutputCapacity;
+    result.asynchronousDispatch = true;
+    result.diagnostics = WaterFlowGpuSourceState(layerId);
+    return result;
+}
+
+WaterFlowGpuSourceDiagnostics VulkanViewportShell::WaterFlowGpuSourceState(
+    std::size_t layerId) const {
+    WaterFlowGpuSourceDiagnostics diagnostics;
+    const auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr || !resources->waterFlowSourceActive) {
+        return diagnostics;
+    }
+    diagnostics.sourceId = resources->waterFlowSourceId;
+    diagnostics.requestedRevision = resources->waterFlowSourceRequestedRevision;
+    diagnostics.completedRevision = resources->waterFlowSourceCompletedRevision;
+    diagnostics.surfaceUploadRevision = resources->waterFlowSourceSurfaceUploadRevision;
+    diagnostics.bytesTransferred = resources->waterFlowSourceBytesTransferred;
+    diagnostics.computeDispatchCount = resources->waterFlowSourceDispatchCount;
+    diagnostics.pointCapacity = std::max(
+        resources->pointCount,
+        resources->waterFlowPendingLayout.pointCapacity);
+    diagnostics.activePointCount = resources->waterFlowSettledPointCount;
+    diagnostics.pending =
+        resources->waterFlowSourceDispatchPending || resources->waterFlowSourceQueued;
+    diagnostics.usingSurfaceGuide = resources->waterFlowSourceUseSurfaceGuide;
+    return diagnostics;
+}
+
+void VulkanViewportShell::RemoveWaterFlowGpuSource(std::size_t layerId) {
+    auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr || !resources->waterFlowSourceActive) {
+        return;
+    }
+    resources->waterFlowDeletePending = true;
+    resources->waterFlowDeleteOutstandingFrameMask =
+        (1U << static_cast<std::uint32_t>(kFramesInFlight)) - 1U;
+    resources->waterFlowSourceQueued = false;
+    resources->waterFlowQueuedRevision = 0U;
+    resources->waterFlowQueuedCompactSourceInput.reset();
+    resources->waterFlowSettledPointCount = 0U;
+    resources->activePointCount = 0U;
+    ++sceneRevision_;
 }
 
 void VulkanViewportShell::UploadSparseWaterRippleMembership(
@@ -2507,12 +3112,38 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
 
     DestroyBuffer(&resources->seepageNodeBuffer);
     resources->seepageNodeBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(payload.nodes.size() * sizeof(WaterSeepageNodeGpu)),
+        static_cast<VkDeviceSize>(payload.nodes.size() * sizeof(WaterSeepageNodeTopologyGpu)),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     UploadBufferData(
         resources->seepageNodeBuffer,
         payload.nodes.data(),
         resources->seepageNodeBuffer.size);
+
+    const auto paramsBufferSize =
+        static_cast<VkDeviceSize>(payload.params.size() * sizeof(WaterSeepageNodeParamsGpu));
+    for (auto& paramsBuffer : resources->seepageParamsBuffers) {
+        DestroyBuffer(&paramsBuffer);
+        paramsBuffer = CreateHostVisibleBuffer(
+            paramsBufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(paramsBuffer, payload.params.data(), paramsBufferSize);
+    }
+    DestroyBuffer(&resources->seepageExrParamsBuffer);
+    resources->seepageExrParamsBuffer = CreateHostVisibleBuffer(
+        paramsBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    UploadBufferData(
+        resources->seepageExrParamsBuffer,
+        payload.params.data(),
+        paramsBufferSize);
+    resources->pendingSeepageParams.resize(static_cast<std::size_t>(paramsBufferSize));
+    std::memcpy(
+        resources->pendingSeepageParams.data(),
+        payload.params.data(),
+        static_cast<std::size_t>(paramsBufferSize));
+    ++resources->seepageParamsGeneration;
+    resources->seepageParamsFrameGenerations.fill(resources->seepageParamsGeneration);
+    resources->seepageParamsExrGeneration = resources->seepageParamsGeneration;
 
     DestroyBuffer(&resources->seepageHashCellBuffer);
     resources->seepageHashCellBuffer = CreateHostVisibleBuffer(
@@ -2533,6 +3164,11 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
         resources->seepageNodeReferenceBuffer.size);
 
     resources->seepageNodeCount = static_cast<std::uint32_t>(grid.nodes.size());
+    resources->seepageTopologyNodeIds.clear();
+    resources->seepageTopologyNodeIds.reserve(grid.nodes.size());
+    for (const auto& node : grid.nodes) {
+        resources->seepageTopologyNodeIds.push_back(node.id);
+    }
     resources->seepageHashCellCapacity =
         resources->seepageNodeCount > 0U && payload.occupiedCellCount > 0U
             ? static_cast<std::uint32_t>(payload.hashCells.size())
@@ -2569,22 +3205,78 @@ void VulkanViewportShell::UpdateWaterSeepageParams(
     if (grid.nodes.size() != resources->seepageNodeCount) {
         throw std::runtime_error{"Seepage node count changed without rebuilding topology."};
     }
+    for (std::size_t nodeIndex = 0U; nodeIndex < grid.nodes.size(); ++nodeIndex) {
+        if (nodeIndex >= resources->seepageTopologyNodeIds.size() ||
+            grid.nodes[nodeIndex].id != resources->seepageTopologyNodeIds[nodeIndex]) {
+            throw std::runtime_error{"Seepage node order changed without rebuilding topology."};
+        }
+    }
 
-    std::vector<WaterSeepageNodeGpu> nodes;
-    nodes.reserve(std::max<std::size_t>(grid.nodes.size(), 1U));
+    std::vector<WaterSeepageNodeParamsGpu> params;
+    params.reserve(std::max<std::size_t>(grid.nodes.size(), 1U));
     for (const auto& node : grid.nodes) {
-        nodes.push_back(MakeWaterSeepageNodeGpu(node));
+        params.push_back(MakeWaterSeepageNodeParamsGpu(node));
     }
-    if (nodes.empty()) {
-        nodes.push_back(WaterSeepageNodeGpu{});
+    if (params.empty()) {
+        params.push_back(WaterSeepageNodeParamsGpu{});
     }
-    const auto expectedSize = static_cast<VkDeviceSize>(nodes.size() * sizeof(WaterSeepageNodeGpu));
-    if (resources->seepageNodeBuffer.size != expectedSize) {
+    const auto expectedSize =
+        static_cast<VkDeviceSize>(params.size() * sizeof(WaterSeepageNodeParamsGpu));
+    const bool hasExpectedBuffers = std::all_of(
+        resources->seepageParamsBuffers.begin(),
+        resources->seepageParamsBuffers.end(),
+        [expectedSize](const BufferAllocation& buffer) { return buffer.size == expectedSize; });
+    if (!hasExpectedBuffers || resources->seepageExrParamsBuffer.size != expectedSize) {
         throw std::runtime_error{"Seepage params buffer has an unexpected size."};
     }
-    UploadBufferData(resources->seepageNodeBuffer, nodes.data(), expectedSize);
+    resources->pendingSeepageParams.resize(static_cast<std::size_t>(expectedSize));
+    std::memcpy(
+        resources->pendingSeepageParams.data(),
+        params.data(),
+        static_cast<std::size_t>(expectedSize));
+    ++resources->seepageParamsGeneration;
     ++resources->seepageParamsUploadRevision;
     ++sceneRevision_;
+}
+
+void VulkanViewportShell::FlushWaterSeepageParamsForFrame(std::size_t frameIndex) {
+    if (frameIndex >= kFramesInFlight) {
+        return;
+    }
+    for (auto& resources : pointCloudResources_) {
+        if (resources.seepageParamsFrameGenerations[frameIndex] ==
+                resources.seepageParamsGeneration ||
+            resources.pendingSeepageParams.empty()) {
+            continue;
+        }
+        auto& target = resources.seepageParamsBuffers[frameIndex];
+        if (target.size != resources.pendingSeepageParams.size()) {
+            throw std::runtime_error{"Seepage frame params buffer has an unexpected size."};
+        }
+        UploadBufferData(
+            target,
+            resources.pendingSeepageParams.data(),
+            target.size);
+        resources.seepageParamsFrameGenerations[frameIndex] =
+            resources.seepageParamsGeneration;
+    }
+}
+
+void VulkanViewportShell::FlushWaterSeepageParamsForExr() {
+    for (auto& resources : pointCloudResources_) {
+        if (resources.seepageParamsExrGeneration == resources.seepageParamsGeneration ||
+            resources.pendingSeepageParams.empty()) {
+            continue;
+        }
+        if (resources.seepageExrParamsBuffer.size != resources.pendingSeepageParams.size()) {
+            throw std::runtime_error{"Seepage EXR params buffer has an unexpected size."};
+        }
+        UploadBufferData(
+            resources.seepageExrParamsBuffer,
+            resources.pendingSeepageParams.data(),
+            resources.seepageExrParamsBuffer.size);
+        resources.seepageParamsExrGeneration = resources.seepageParamsGeneration;
+    }
 }
 
 std::size_t VulkanViewportShell::SparseWaterRippleEffectCount(std::size_t layerId) const {
@@ -2647,27 +3339,31 @@ void VulkanViewportShell::UpdatePointBudget(
     DestroyBuffer(&resources->interactiveSampledIndexBuffer);
     DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
     resources->usingSampledIndices = false;
-    resources->activePointCount = resources->pointCount;
+    const std::uint32_t validPointCount = resources->waterFlowSourceActive
+                                              ? resources->waterFlowSettledPointCount
+                                              : resources->pointCount;
+    resources->activePointCount = validPointCount;
     resources->interactiveSampledIndexCount = 0;
 
-    if (resources->pointCount == 0 ||
-        sampledIndices.empty() ||
-        sampledIndices.size() >= resources->pointCount) {
+    const auto sanitized = SanitizePointIndices(sampledIndices, validPointCount);
+    if (validPointCount == 0 ||
+        sanitized.empty() ||
+        sanitized.size() >= validPointCount) {
         return;
     }
 
     resources->sampledIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(sampledIndices.size() * sizeof(std::uint32_t)),
+        static_cast<VkDeviceSize>(sanitized.size() * sizeof(std::uint32_t)),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     UploadBufferData(
         resources->sampledIndexBuffer,
-        sampledIndices.data(),
+        sanitized.data(),
         resources->sampledIndexBuffer.size);
     resources->usingSampledIndices = true;
-    resources->activePointCount = static_cast<std::uint32_t>(sampledIndices.size());
+    resources->activePointCount = static_cast<std::uint32_t>(sanitized.size());
 
     const auto surfelIndices =
-        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledIndices);
+        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sanitized);
     if (!surfelIndices.empty()) {
         resources->sampledSurfelIndexBuffer = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
@@ -2694,22 +3390,26 @@ void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
     DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
     resources->interactiveSampledIndexCount = 0;
 
-    if (sampledIndices.empty() || sampledIndices.size() >= resources->pointCount) {
+    const std::uint32_t validPointCount = resources->waterFlowSourceActive
+                                              ? resources->waterFlowSettledPointCount
+                                              : resources->pointCount;
+    const auto sanitized = SanitizePointIndices(sampledIndices, validPointCount);
+    if (sanitized.empty() || sanitized.size() >= validPointCount) {
         return;
     }
 
     resources->interactiveSampledIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(sampledIndices.size() * sizeof(std::uint32_t)),
+        static_cast<VkDeviceSize>(sanitized.size() * sizeof(std::uint32_t)),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     UploadBufferData(
         resources->interactiveSampledIndexBuffer,
-        sampledIndices.data(),
+        sanitized.data(),
         resources->interactiveSampledIndexBuffer.size);
-    resources->interactiveSampledIndexCount = static_cast<std::uint32_t>(sampledIndices.size());
+    resources->interactiveSampledIndexCount = static_cast<std::uint32_t>(sanitized.size());
 
     if (includeSurfelIndices) {
         const auto surfelIndices =
-            invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledIndices);
+            invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sanitized);
         if (!surfelIndices.empty()) {
             resources->interactiveSurfelIndexBuffer = CreateHostVisibleBuffer(
                 static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
@@ -2730,11 +3430,17 @@ void VulkanViewportShell::UploadPointHighlightIndices(
     WaitIdle();
 
     auto* resources = FindPointCloudResources(layerId);
-    if (resources == nullptr || resources->pointCount == 0) {
+    if (resources == nullptr) {
         return;
     }
 
-    const auto sanitized = SanitizePointHighlightIndices(indices, resources->pointCount);
+    const std::uint32_t validPointCount = resources->waterFlowSourceActive
+                                              ? resources->waterFlowSettledPointCount
+                                              : resources->pointCount;
+    if (validPointCount == 0U) {
+        return;
+    }
+    const auto sanitized = SanitizePointIndices(indices, validPointCount);
     auto existingIt = std::find_if(
         resources->highlights.begin(),
         resources->highlights.end(),
@@ -2837,51 +3543,488 @@ void VulkanViewportShell::ClearPointClouds() {
     pointCloudResources_.clear();
 }
 
-void VulkanViewportShell::UploadRainCollisionCache(
-    const invisible_places::water::RainCollisionCache& cache) {
-    const auto gpuData = invisible_places::water::BuildRainCollisionGpuData(cache);
-    if (gpuData.surfaceTable.empty() || gpuData.vegetationTable.empty()) {
-        throw std::runtime_error{"Rain collision cache did not produce GPU hash tables."};
+void VulkanViewportShell::UploadWaterSurfaceCache(
+    const invisible_places::water::WaterSurfaceCache& cache) {
+    auto& resources = rainResources_;
+    auto cacheIdentity = cache.cacheIdentity;
+    if (!cacheIdentity.Valid() ||
+        cacheIdentity.sourceSignature != cache.signature ||
+        cache.gpuData.sourceRevision != cache.revision ||
+        cache.gpuData.sourceIdentity != cacheIdentity) {
+        cacheIdentity = invisible_places::water::BuildWaterSurfaceCacheIdentity(cache);
     }
 
-    WaitIdle();
-    auto& resources = rainResources_;
-    DestroyBuffer(&resources.surfaceTableBuffer);
-    DestroyBuffer(&resources.vegetationTableBuffer);
-    resources.surfaceTableBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(gpuData.surfaceTable.size()) * sizeof(gpuData.surfaceTable.front()),
+    // The shared cache is immutable for a scene signature. Avoid hash rebuilds,
+    // allocation, descriptor writes, and submissions when Application polls the
+    // same warmed cache more than once.
+    if (resources.collisionUploadRevision != 0U &&
+        resources.collisionCacheIdentity == cacheIdentity &&
+        resources.pendingSurfaceUpload.surfaceTableBuffer.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    if (resources.pendingSurfaceUpload.surfaceTableBuffer.buffer != VK_NULL_HANDLE &&
+        resources.pendingSurfaceUpload.cacheIdentity == cacheIdentity) {
+        return;
+    }
+
+    invisible_places::water::WaterSurfaceGpuData generatedGpuData;
+    const invisible_places::water::WaterSurfaceGpuData* gpuData = &cache.gpuData;
+    if (cache.gpuData.sourceRevision != cache.revision ||
+        cache.gpuData.sourceIdentity != cacheIdentity ||
+        cache.gpuData.surfaceTable.empty() ||
+        cache.gpuData.vegetationTable.empty() ||
+        cache.gpuData.flowSurfaceTable.empty()) {
+        generatedGpuData = invisible_places::water::BuildWaterSurfaceGpuData(cache);
+        gpuData = &generatedGpuData;
+    }
+    if (gpuData->surfaceTable.empty() || gpuData->vegetationTable.empty() ||
+        gpuData->flowSurfaceTable.empty()) {
+        throw std::runtime_error{"Water surface cache did not produce GPU hash tables."};
+    }
+    if (gpuData->surfaceTable.size() > std::numeric_limits<std::uint32_t>::max() ||
+        gpuData->vegetationTable.size() > std::numeric_limits<std::uint32_t>::max() ||
+        gpuData->flowSurfaceTable.size() > std::numeric_limits<std::uint32_t>::max() ||
+        cache.flowSurfaceSurfels.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Water surface cache exceeds the 32-bit GPU table limit."};
+    }
+
+    const VkDeviceSize rainSurfaceBytes =
+        static_cast<VkDeviceSize>(gpuData->surfaceTable.size()) *
+        sizeof(gpuData->surfaceTable.front());
+    const VkDeviceSize vegetationBytes =
+        static_cast<VkDeviceSize>(gpuData->vegetationTable.size()) *
+        sizeof(gpuData->vegetationTable.front());
+    const VkDeviceSize flowSurfaceBytes =
+        static_cast<VkDeviceSize>(gpuData->flowSurfaceTable.size()) *
+        sizeof(gpuData->flowSurfaceTable.front());
+
+    // A newer scene may arrive while the previous preprocessing dispatch is in
+    // flight. Keep that job alive until its own fence signals instead of
+    // blocking or invalidating resources referenced by the queue.
+    if (resources.pendingSurfaceUpload.surfaceTableBuffer.buffer != VK_NULL_HANDLE) {
+        resources.abandonedSurfaceUploads.push_back(resources.pendingSurfaceUpload);
+        resources.pendingSurfaceUpload = {};
+    }
+    auto& pending = resources.pendingSurfaceUpload;
+    pending.surfaceStagingBuffer = CreateHostVisibleBuffer(
+        rainSurfaceBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    pending.vegetationStagingBuffer = CreateHostVisibleBuffer(
+        vegetationBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    pending.flowSurfaceStagingBuffer = CreateHostVisibleBuffer(
+        flowSurfaceBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    pending.surfaceTableBuffer = CreateDeviceLocalBuffer(
+        rainSurfaceBytes,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    pending.vegetationTableBuffer = CreateDeviceLocalBuffer(
+        vegetationBytes,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    pending.flowSurfaceInputBuffer = CreateDeviceLocalBuffer(
+        flowSurfaceBytes,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    pending.flowSurfaceTableBuffer = CreateDeviceLocalBuffer(
+        flowSurfaceBytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    resources.vegetationTableBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(gpuData.vegetationTable.size()) * sizeof(gpuData.vegetationTable.front()),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    pending.preprocessUniformBuffer = CreateHostVisibleBuffer(
+        sizeof(WaterSurfacePreprocessUniformsGpu),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     UploadBufferData(
-        resources.surfaceTableBuffer,
-        gpuData.surfaceTable.data(),
-        static_cast<VkDeviceSize>(gpuData.surfaceTable.size()) * sizeof(gpuData.surfaceTable.front()));
+        pending.surfaceStagingBuffer,
+        gpuData->surfaceTable.data(),
+        rainSurfaceBytes);
     UploadBufferData(
-        resources.vegetationTableBuffer,
-        gpuData.vegetationTable.data(),
-        static_cast<VkDeviceSize>(gpuData.vegetationTable.size()) * sizeof(gpuData.vegetationTable.front()));
-    resources.collisionBounds = cache.bounds;
-    resources.surfaceMask = gpuData.surfaceMask;
-    resources.vegetationMask = gpuData.vegetationMask;
-    resources.maximumProbeCount = std::max(1U, gpuData.maximumProbeCount);
-    resources.collisionCacheRevision = cache.revision;
-    ++resources.collisionUploadRevision;
-    resources.collisionReady = cache.bounds.valid;
-    ++resources.resetEpoch;
-    UpdateRainDescriptorSets();
-    diagnostics_.rainCollisionCacheRevision = resources.collisionCacheRevision;
+        pending.vegetationStagingBuffer,
+        gpuData->vegetationTable.data(),
+        vegetationBytes);
+    UploadBufferData(
+        pending.flowSurfaceStagingBuffer,
+        gpuData->flowSurfaceTable.data(),
+        flowSurfaceBytes);
+
+    pending.bounds = cache.bounds;
+    pending.surfaceMask = gpuData->surfaceMask;
+    pending.vegetationMask = gpuData->vegetationMask;
+    pending.maximumProbeCount = std::max(1U, gpuData->maximumProbeCount);
+    pending.flowSurfaceMask = gpuData->flowSurfaceMask;
+    pending.flowMaximumProbeCount = std::max(1U, gpuData->flowMaximumProbeCount);
+    pending.flowSurfaceCellCount =
+        static_cast<std::uint32_t>(cache.flowSurfaceSurfels.size());
+    pending.flowSurfaceTableCapacity =
+        static_cast<std::uint32_t>(gpuData->flowSurfaceTable.size());
+    pending.resolutionMeters = std::max(0.001F, cache.resolutionMeters);
+    pending.cacheRevision = cache.revision;
+    pending.cacheIdentity = cacheIdentity;
+    pending.tableBytes = static_cast<std::uint64_t>(
+        rainSurfaceBytes + vegetationBytes + flowSurfaceBytes);
+    pending.uploadRevision = ++resources.collisionUploadRevision;
+
+    WaterSurfacePreprocessUniformsGpu preprocessUniforms;
+    preprocessUniforms.table = glm::uvec4{
+        pending.flowSurfaceMask,
+        pending.flowMaximumProbeCount,
+        pending.flowSurfaceTableCapacity,
+        pending.flowSurfaceCellCount,
+    };
+    preprocessUniforms.parameters.x = pending.resolutionMeters;
+    UploadBufferData(
+        pending.preprocessUniformBuffer,
+        &preprocessUniforms,
+        sizeof(preprocessUniforms));
+
+    std::array<VkDescriptorSetLayout, kFramesInFlight> rainLayouts{};
+    rainLayouts.fill(rainDescriptorSetLayout_);
+    VkDescriptorSetAllocateInfo rainAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    rainAllocInfo.descriptorPool = descriptorPool_;
+    rainAllocInfo.descriptorSetCount = static_cast<std::uint32_t>(rainLayouts.size());
+    rainAllocInfo.pSetLayouts = rainLayouts.data();
+    Check(
+        vkAllocateDescriptorSets(
+            device_,
+            &rainAllocInfo,
+            pending.rainDescriptorSets.data()),
+        "vkAllocateDescriptorSets(pending water surface rain)");
+    UpdateRainDescriptorSets(
+        pending.rainDescriptorSets,
+        pending.surfaceTableBuffer,
+        pending.vegetationTableBuffer);
+
+    VkDescriptorSetAllocateInfo preprocessAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    preprocessAllocInfo.descriptorPool = descriptorPool_;
+    preprocessAllocInfo.descriptorSetCount = 1U;
+    preprocessAllocInfo.pSetLayouts = &waterSurfacePreprocessDescriptorSetLayout_;
+    Check(
+        vkAllocateDescriptorSets(
+            device_,
+            &preprocessAllocInfo,
+            &pending.preprocessDescriptorSet),
+        "vkAllocateDescriptorSets(pending water surface preprocess)");
+    UpdateWaterSurfacePreprocessDescriptorSet(&pending);
+    DispatchWaterSurfacePreprocess(&pending);
+
     diagnostics_.rainCollisionUploadRevision = resources.collisionUploadRevision;
+    diagnostics_.waterSurfaceUploadRevision = resources.collisionUploadRevision;
+    diagnostics_.waterSurfaceGpuBytes = resources.residentTableBytes +
+        pending.tableBytes + static_cast<std::uint64_t>(flowSurfaceBytes) +
+        static_cast<std::uint64_t>(pending.surfaceStagingBuffer.size) +
+        static_cast<std::uint64_t>(pending.vegetationStagingBuffer.size) +
+        static_cast<std::uint64_t>(pending.flowSurfaceStagingBuffer.size);
+    diagnostics_.waterSurfacePreprocessDispatchCount = resources.preprocessDispatchCount;
+    diagnostics_.waterSurfacePreprocessPending = true;
+}
+
+void VulkanViewportShell::UploadRainCollisionCache(
+    const invisible_places::water::RainCollisionCache& cache) {
+    UploadWaterSurfaceCache(cache);
+}
+
+void VulkanViewportShell::ClearWaterSurfaceCache() {
+    auto& resources = rainResources_;
+    if (resources.pendingSurfaceUpload.surfaceTableBuffer.buffer != VK_NULL_HANDLE) {
+        resources.abandonedSurfaceUploads.push_back(resources.pendingSurfaceUpload);
+        resources.pendingSurfaceUpload = {};
+    }
+    resources.collisionReady = false;
+    resources.flowSurfaceReady = false;
+    resources.collisionBounds = {};
+    resources.collisionCacheRevision = 0U;
+    resources.collisionCacheIdentity = {};
+    ++resources.resetEpoch;
+    diagnostics_.rainCollisionCacheRevision = 0U;
+    diagnostics_.waterSurfaceCacheRevision = 0U;
+    diagnostics_.waterSurfaceSurfelCellCount = 0U;
+    diagnostics_.waterSurfacePreprocessPending = !resources.abandonedSurfaceUploads.empty();
     ++sceneRevision_;
 }
 
 void VulkanViewportShell::ClearRainCollisionCache() {
-    rainResources_.collisionReady = false;
-    rainResources_.collisionBounds = {};
-    rainResources_.collisionCacheRevision = 0U;
-    ++rainResources_.resetEpoch;
-    diagnostics_.rainCollisionCacheRevision = 0U;
+    ClearWaterSurfaceCache();
+}
+
+WaterSurfaceFlowGpuView VulkanViewportShell::WaterSurfaceFlowView() const {
+    const auto& resources = rainResources_;
+    return {
+        .buffer = resources.flowSurfaceTableBuffer.buffer,
+        .offset = 0U,
+        .range = resources.flowSurfaceTableBuffer.size,
+        .tableMask = resources.flowSurfaceMask,
+        .maximumProbeCount = resources.flowMaximumProbeCount,
+        .occupiedCellCount = resources.flowSurfaceCellCount,
+        .resolutionMeters = resources.surfaceResolutionMeters,
+        .cacheRevision = resources.collisionCacheRevision,
+        .uploadRevision = resources.flowSurfaceResidentUploadRevision,
+        .valid = resources.flowSurfaceReady,
+        .preprocessingComplete = resources.flowSurfaceReady,
+    };
+}
+
+bool VulkanViewportShell::WaterSurfaceUploadPending() const {
+    return rainResources_.pendingSurfaceUpload.surfaceTableBuffer.buffer != VK_NULL_HANDLE;
+}
+
+void VulkanViewportShell::DispatchWaterSurfacePreprocess(
+    WaterSurfacePendingGpuUpload* pending) {
+    if (pending == nullptr || pending->flowSurfaceTableCapacity == 0U ||
+        pending->preprocessDescriptorSet == VK_NULL_HANDLE ||
+        waterSurfacePreprocessPipeline_ == VK_NULL_HANDLE ||
+        waterSurfacePreprocessPipelineLayout_ == VK_NULL_HANDLE ||
+        commandPool_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = commandPool_;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1U;
+    Check(
+        vkAllocateCommandBuffers(
+            device_,
+            &allocInfo,
+            &pending->preprocessCommandBuffer),
+        "vkAllocateCommandBuffers(water surface preprocess)");
+
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    Check(
+        vkCreateFence(
+            device_,
+            &fenceInfo,
+            nullptr,
+            &pending->preprocessFence),
+        "vkCreateFence(water surface preprocess)");
+
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(
+        vkBeginCommandBuffer(pending->preprocessCommandBuffer, &beginInfo),
+        "vkBeginCommandBuffer(water surface preprocess)");
+
+    const auto copyStagingBuffer = [&](const BufferAllocation& staging,
+                                       const BufferAllocation& resident) {
+        VkBufferCopy copy{};
+        copy.size = std::min(staging.size, resident.size);
+        vkCmdCopyBuffer(
+            pending->preprocessCommandBuffer,
+            staging.buffer,
+            resident.buffer,
+            1U,
+            &copy);
+    };
+    copyStagingBuffer(pending->surfaceStagingBuffer, pending->surfaceTableBuffer);
+    copyStagingBuffer(pending->vegetationStagingBuffer, pending->vegetationTableBuffer);
+    copyStagingBuffer(pending->flowSurfaceStagingBuffer, pending->flowSurfaceInputBuffer);
+
+    std::array<VkBufferMemoryBarrier, 3> uploadBarriers{};
+    const std::array<VkBuffer, 3> uploadedBuffers = {
+        pending->surfaceTableBuffer.buffer,
+        pending->vegetationTableBuffer.buffer,
+        pending->flowSurfaceInputBuffer.buffer,
+    };
+    for (std::size_t index = 0U; index < uploadBarriers.size(); ++index) {
+        auto& barrier = uploadBarriers[index];
+        barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = uploadedBuffers[index];
+        barrier.offset = 0U;
+        barrier.size = VK_WHOLE_SIZE;
+    }
+    vkCmdPipelineBarrier(
+        pending->preprocessCommandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0U,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(uploadBarriers.size()),
+        uploadBarriers.data(),
+        0U,
+        nullptr);
+
+    vkCmdBindPipeline(
+        pending->preprocessCommandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        waterSurfacePreprocessPipeline_);
+    vkCmdBindDescriptorSets(
+        pending->preprocessCommandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        waterSurfacePreprocessPipelineLayout_,
+        0U,
+        1U,
+        &pending->preprocessDescriptorSet,
+        0U,
+        nullptr);
+    vkCmdDispatch(
+        pending->preprocessCommandBuffer,
+        (pending->flowSurfaceTableCapacity + 63U) / 64U,
+        1U,
+        1U);
+
+    VkBufferMemoryBarrier outputBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    outputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.buffer = pending->flowSurfaceTableBuffer.buffer;
+    outputBarrier.offset = 0U;
+    outputBarrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(
+        pending->preprocessCommandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0U,
+        0U,
+        nullptr,
+        1U,
+        &outputBarrier,
+        0U,
+        nullptr);
+    Check(
+        vkEndCommandBuffer(pending->preprocessCommandBuffer),
+        "vkEndCommandBuffer(water surface preprocess)");
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1U;
+    submitInfo.pCommandBuffers = &pending->preprocessCommandBuffer;
+    Check(
+        vkQueueSubmit(
+            graphicsQueue_,
+            1U,
+            &submitInfo,
+            pending->preprocessFence),
+        "vkQueueSubmit(water surface preprocess)");
+
+    ++rainResources_.preprocessDispatchCount;
+}
+
+void VulkanViewportShell::PollWaterSurfacePreprocess() {
+    auto& resources = rainResources_;
+
+    // This method is called immediately after currentFrameIndex_'s fence has
+    // signalled and before it is reset. That makes retired resource reclamation
+    // deterministic without a device-wide wait.
+    const std::uint32_t completedFrameBit = 1U << currentFrameIndex_;
+    for (auto& retired : resources.retiredSurfaceResources) {
+        retired.outstandingFrameMask &= ~completedFrameBit;
+    }
+    for (auto retiredIt = resources.retiredSurfaceResources.begin();
+         retiredIt != resources.retiredSurfaceResources.end();) {
+        if (retiredIt->outstandingFrameMask != 0U) {
+            ++retiredIt;
+            continue;
+        }
+        CleanupWaterSurfaceRetiredResources(&(*retiredIt));
+        retiredIt = resources.retiredSurfaceResources.erase(retiredIt);
+    }
+
+    for (auto abandonedIt = resources.abandonedSurfaceUploads.begin();
+         abandonedIt != resources.abandonedSurfaceUploads.end();) {
+        const VkResult status = abandonedIt->preprocessFence == VK_NULL_HANDLE
+            ? VK_SUCCESS
+            : vkGetFenceStatus(device_, abandonedIt->preprocessFence);
+        if (status == VK_NOT_READY) {
+            ++abandonedIt;
+            continue;
+        }
+        Check(status, "vkGetFenceStatus(abandoned water surface preprocess)");
+        CleanupWaterSurfacePendingUpload(&(*abandonedIt));
+        abandonedIt = resources.abandonedSurfaceUploads.erase(abandonedIt);
+    }
+
+    auto& pending = resources.pendingSurfaceUpload;
+    if (pending.surfaceTableBuffer.buffer == VK_NULL_HANDLE ||
+        pending.preprocessFence == VK_NULL_HANDLE) {
+        diagnostics_.waterSurfacePreprocessPending =
+            pending.surfaceTableBuffer.buffer != VK_NULL_HANDLE ||
+            !resources.abandonedSurfaceUploads.empty();
+        return;
+    }
+
+    const VkResult status = vkGetFenceStatus(device_, pending.preprocessFence);
+    if (status == VK_NOT_READY) {
+        diagnostics_.waterSurfacePreprocessPending = true;
+        return;
+    }
+    Check(status, "vkGetFenceStatus(water surface preprocess)");
+
+    if (pending.preprocessCommandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device_, commandPool_, 1U, &pending.preprocessCommandBuffer);
+        pending.preprocessCommandBuffer = VK_NULL_HANDLE;
+    }
+    vkDestroyFence(device_, pending.preprocessFence, nullptr);
+    pending.preprocessFence = VK_NULL_HANDLE;
+    if (descriptorPool_ != VK_NULL_HANDLE && pending.preprocessDescriptorSet != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(device_, descriptorPool_, 1U, &pending.preprocessDescriptorSet);
+        pending.preprocessDescriptorSet = VK_NULL_HANDLE;
+    }
+    DestroyBuffer(&pending.flowSurfaceInputBuffer);
+    DestroyBuffer(&pending.preprocessUniformBuffer);
+    DestroyBuffer(&pending.surfaceStagingBuffer);
+    DestroyBuffer(&pending.vegetationStagingBuffer);
+    DestroyBuffer(&pending.flowSurfaceStagingBuffer);
+
+    WaterSurfaceRetiredGpuResources retired;
+    retired.surfaceTableBuffer = resources.surfaceTableBuffer;
+    retired.vegetationTableBuffer = resources.vegetationTableBuffer;
+    retired.flowSurfaceTableBuffer = resources.flowSurfaceTableBuffer;
+    retired.rainDescriptorSets = resources.descriptorSets;
+    for (std::size_t frameIndex = 0U; frameIndex < kFramesInFlight; ++frameIndex) {
+        const auto fence = frameResources_[frameIndex].fence;
+        if (fence != VK_NULL_HANDLE && vkGetFenceStatus(device_, fence) == VK_NOT_READY) {
+            retired.outstandingFrameMask |= 1U << frameIndex;
+        }
+    }
+
+    resources.surfaceTableBuffer = pending.surfaceTableBuffer;
+    resources.vegetationTableBuffer = pending.vegetationTableBuffer;
+    resources.flowSurfaceTableBuffer = pending.flowSurfaceTableBuffer;
+    resources.descriptorSets = pending.rainDescriptorSets;
+    pending.surfaceTableBuffer = {};
+    pending.vegetationTableBuffer = {};
+    pending.flowSurfaceTableBuffer = {};
+    pending.rainDescriptorSets.fill(VK_NULL_HANDLE);
+
+    resources.collisionBounds = pending.bounds;
+    resources.surfaceMask = pending.surfaceMask;
+    resources.vegetationMask = pending.vegetationMask;
+    resources.maximumProbeCount = pending.maximumProbeCount;
+    resources.flowSurfaceMask = pending.flowSurfaceMask;
+    resources.flowMaximumProbeCount = pending.flowMaximumProbeCount;
+    resources.flowSurfaceCellCount = pending.flowSurfaceCellCount;
+    resources.flowSurfaceTableCapacity = pending.flowSurfaceTableCapacity;
+    resources.surfaceResolutionMeters = pending.resolutionMeters;
+    resources.collisionCacheRevision = pending.cacheRevision;
+    resources.collisionCacheIdentity = pending.cacheIdentity;
+    resources.flowSurfaceResidentUploadRevision = pending.uploadRevision;
+    resources.residentTableBytes = pending.tableBytes;
+    resources.collisionReady = pending.bounds.valid;
+    resources.flowSurfaceReady =
+        pending.bounds.valid && pending.flowSurfaceCellCount > 0U;
+    ++resources.resetEpoch;
+
+    resources.retiredSurfaceResources.push_back(retired);
+    pending = {};
+    if (resources.retiredSurfaceResources.back().outstandingFrameMask == 0U) {
+        CleanupWaterSurfaceRetiredResources(&resources.retiredSurfaceResources.back());
+        resources.retiredSurfaceResources.pop_back();
+    }
+
+    diagnostics_.rainCollisionCacheRevision = resources.collisionCacheRevision;
+    diagnostics_.rainCollisionUploadRevision = resources.collisionUploadRevision;
+    diagnostics_.waterSurfaceCacheRevision = resources.collisionCacheRevision;
+    diagnostics_.waterSurfaceUploadRevision = resources.collisionUploadRevision;
+    diagnostics_.waterSurfaceGpuBytes = resources.residentTableBytes;
+    diagnostics_.waterSurfaceSurfelCellCount = resources.flowSurfaceCellCount;
+    diagnostics_.waterSurfaceTableCapacity = resources.flowSurfaceTableCapacity;
+    diagnostics_.waterSurfaceMaximumProbeCount = resources.flowMaximumProbeCount;
+    diagnostics_.waterSurfacePreprocessDispatchCount = resources.preprocessDispatchCount;
+    diagnostics_.waterSurfacePreprocessPending = !resources.abandonedSurfaceUploads.empty();
     ++sceneRevision_;
 }
 
@@ -3047,6 +4190,9 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
         return false;
     }
     Check(existingFenceStatus, "vkGetFenceStatus(exr idle)");
+    // EXR owns a separate parameter snapshot. The fence above guarantees a
+    // previous asynchronous export is no longer reading it.
+    FlushWaterSeepageParamsForExr();
 
     const auto previousRenderState = renderState_;
     auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
@@ -3866,7 +5012,7 @@ void VulkanViewportShell::CreatePresentRenderPass() {
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 16> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 17> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -3917,6 +5063,24 @@ void VulkanViewportShell::CreateDynamicMeshFlowDescriptorSetLayout() {
         "vkCreateDescriptorSetLayout(dynamic mesh flow)");
 }
 
+void VulkanViewportShell::CreateWaterFlowSourceDescriptorSetLayout() {
+    std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+    for (std::uint32_t bindingIndex = 0U; bindingIndex < bindings.size(); ++bindingIndex) {
+        bindings[bindingIndex].binding = bindingIndex;
+        bindings[bindingIndex].descriptorCount = 1U;
+        bindings[bindingIndex].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[bindingIndex].descriptorType =
+            bindingIndex == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    Check(
+        vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &waterFlowSourceDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(water flow source)");
+}
+
 void VulkanViewportShell::CreateRainDescriptorSetLayout() {
     std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
     for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
@@ -3934,6 +5098,35 @@ void VulkanViewportShell::CreateRainDescriptorSetLayout() {
     Check(
         vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &rainDescriptorSetLayout_),
         "vkCreateDescriptorSetLayout(rain)");
+}
+
+void VulkanViewportShell::CreateWaterSurfacePreprocessDescriptorSetLayout() {
+    std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+    bindings[0] = {
+        0U,
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        1U,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        nullptr};
+    for (std::uint32_t binding = 1U; binding < bindings.size(); ++binding) {
+        bindings[binding] = {
+            binding,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            1U,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            nullptr};
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+    Check(
+        vkCreateDescriptorSetLayout(
+            device_,
+            &layoutInfo,
+            nullptr,
+            &waterSurfacePreprocessDescriptorSetLayout_),
+        "vkCreateDescriptorSetLayout(water surface preprocess)");
 }
 
 void VulkanViewportShell::CreateGaussianSplatDescriptorSetLayout() {
@@ -4074,6 +5267,9 @@ void VulkanViewportShell::CreateRainResources() {
     resources.vegetationTableBuffer = CreateHostVisibleBuffer(
         2U * sizeof(invisible_places::water::RainGpuVegetationSlot),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.flowSurfaceTableBuffer = CreateHostVisibleBuffer(
+        2U * sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     resources.particleBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(invisible_places::water::kRainParticleCapacity) * sizeof(RainParticleGpu),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -4100,6 +5296,10 @@ void VulkanViewportShell::CreateRainResources() {
 
     std::memset(resources.surfaceTableBuffer.mapped, 0, static_cast<std::size_t>(resources.surfaceTableBuffer.size));
     std::memset(resources.vegetationTableBuffer.mapped, 0, static_cast<std::size_t>(resources.vegetationTableBuffer.size));
+    std::memset(
+        resources.flowSurfaceTableBuffer.mapped,
+        0,
+        static_cast<std::size_t>(resources.flowSurfaceTableBuffer.size));
     std::memset(resources.particleBuffer.mapped, 0, static_cast<std::size_t>(resources.particleBuffer.size));
     std::memset(resources.eventBuffer.mapped, 0, static_cast<std::size_t>(resources.eventBuffer.size));
     std::memset(resources.counterBuffer.mapped, 0, static_cast<std::size_t>(resources.counterBuffer.size));
@@ -4118,6 +5318,7 @@ void VulkanViewportShell::CreateRainResources() {
     Check(
         vkAllocateDescriptorSets(device_, &allocInfo, resources.descriptorSets.data()),
         "vkAllocateDescriptorSets(rain)");
+
     UpdateRainDescriptorSets();
 
     diagnostics_.rainParticleCapacity = invisible_places::water::kRainParticleCapacity;
@@ -4126,6 +5327,15 @@ void VulkanViewportShell::CreateRainResources() {
 
 void VulkanViewportShell::CleanupRainResources() {
     auto& resources = rainResources_;
+    CleanupWaterSurfacePendingUpload(&resources.pendingSurfaceUpload);
+    for (auto& abandoned : resources.abandonedSurfaceUploads) {
+        CleanupWaterSurfacePendingUpload(&abandoned);
+    }
+    resources.abandonedSurfaceUploads.clear();
+    for (auto& retired : resources.retiredSurfaceResources) {
+        CleanupWaterSurfaceRetiredResources(&retired);
+    }
+    resources.retiredSurfaceResources.clear();
     if (descriptorPool_ != VK_NULL_HANDLE && resources.descriptorSets[0] != VK_NULL_HANDLE) {
         vkFreeDescriptorSets(
             device_,
@@ -4139,6 +5349,7 @@ void VulkanViewportShell::CleanupRainResources() {
     }
     DestroyBuffer(&resources.surfaceTableBuffer);
     DestroyBuffer(&resources.vegetationTableBuffer);
+    DestroyBuffer(&resources.flowSurfaceTableBuffer);
     DestroyBuffer(&resources.particleBuffer);
     DestroyBuffer(&resources.eventBuffer);
     DestroyBuffer(&resources.counterBuffer);
@@ -4147,10 +5358,80 @@ void VulkanViewportShell::CleanupRainResources() {
     resources = {};
 }
 
+void VulkanViewportShell::CleanupWaterSurfacePendingUpload(
+    WaterSurfacePendingGpuUpload* pending) {
+    if (pending == nullptr) {
+        return;
+    }
+    if (pending->preprocessCommandBuffer != VK_NULL_HANDLE &&
+        commandPool_ != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(
+            device_,
+            commandPool_,
+            1U,
+            &pending->preprocessCommandBuffer);
+    }
+    if (pending->preprocessFence != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, pending->preprocessFence, nullptr);
+    }
+    if (descriptorPool_ != VK_NULL_HANDLE &&
+        pending->preprocessDescriptorSet != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(
+            device_,
+            descriptorPool_,
+            1U,
+            &pending->preprocessDescriptorSet);
+    }
+    if (descriptorPool_ != VK_NULL_HANDLE && pending->rainDescriptorSets[0] != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(
+            device_,
+            descriptorPool_,
+            static_cast<std::uint32_t>(pending->rainDescriptorSets.size()),
+            pending->rainDescriptorSets.data());
+    }
+    DestroyBuffer(&pending->surfaceTableBuffer);
+    DestroyBuffer(&pending->vegetationTableBuffer);
+    DestroyBuffer(&pending->flowSurfaceInputBuffer);
+    DestroyBuffer(&pending->flowSurfaceTableBuffer);
+    DestroyBuffer(&pending->preprocessUniformBuffer);
+    DestroyBuffer(&pending->surfaceStagingBuffer);
+    DestroyBuffer(&pending->vegetationStagingBuffer);
+    DestroyBuffer(&pending->flowSurfaceStagingBuffer);
+    *pending = {};
+}
+
+void VulkanViewportShell::CleanupWaterSurfaceRetiredResources(
+    WaterSurfaceRetiredGpuResources* retired) {
+    if (retired == nullptr) {
+        return;
+    }
+    if (descriptorPool_ != VK_NULL_HANDLE && retired->rainDescriptorSets[0] != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(
+            device_,
+            descriptorPool_,
+            static_cast<std::uint32_t>(retired->rainDescriptorSets.size()),
+            retired->rainDescriptorSets.data());
+    }
+    DestroyBuffer(&retired->surfaceTableBuffer);
+    DestroyBuffer(&retired->vegetationTableBuffer);
+    DestroyBuffer(&retired->flowSurfaceTableBuffer);
+    *retired = {};
+}
+
 void VulkanViewportShell::UpdateRainDescriptorSets() {
-    auto& resources = rainResources_;
+    UpdateRainDescriptorSets(
+        rainResources_.descriptorSets,
+        rainResources_.surfaceTableBuffer,
+        rainResources_.vegetationTableBuffer);
+}
+
+void VulkanViewportShell::UpdateRainDescriptorSets(
+    const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets,
+    const BufferAllocation& surfaceTableBuffer,
+    const BufferAllocation& vegetationTableBuffer) {
+    const auto& resources = rainResources_;
     for (std::size_t frameIndex = 0; frameIndex < kFramesInFlight; ++frameIndex) {
-        const auto descriptorSet = resources.descriptorSets[frameIndex];
+        const auto descriptorSet = descriptorSets[frameIndex];
         if (descriptorSet == VK_NULL_HANDLE) {
             continue;
         }
@@ -4159,8 +5440,8 @@ void VulkanViewportShell::UpdateRainDescriptorSets() {
         infos[1] = {resources.particleBuffer.buffer, 0, resources.particleBuffer.size};
         infos[2] = {resources.eventBuffer.buffer, 0, resources.eventBuffer.size};
         infos[3] = {resources.counterBuffer.buffer, 0, resources.counterBuffer.size};
-        infos[4] = {resources.surfaceTableBuffer.buffer, 0, resources.surfaceTableBuffer.size};
-        infos[5] = {resources.vegetationTableBuffer.buffer, 0, resources.vegetationTableBuffer.size};
+        infos[4] = {surfaceTableBuffer.buffer, 0, surfaceTableBuffer.size};
+        infos[5] = {vegetationTableBuffer.buffer, 0, vegetationTableBuffer.size};
         infos[6] = {resources.impactCountBuffer.buffer, 0, resources.impactCountBuffer.size};
         infos[7] = {resources.impactReferenceBuffer.buffer, 0, resources.impactReferenceBuffer.size};
         std::array<VkWriteDescriptorSet, 8> writes{};
@@ -4180,6 +5461,47 @@ void VulkanViewportShell::UpdateRainDescriptorSets() {
             0U,
             nullptr);
     }
+}
+
+void VulkanViewportShell::UpdateWaterSurfacePreprocessDescriptorSet(
+    WaterSurfacePendingGpuUpload* pending) {
+    if (pending == nullptr || pending->preprocessDescriptorSet == VK_NULL_HANDLE ||
+        pending->preprocessUniformBuffer.buffer == VK_NULL_HANDLE ||
+        pending->flowSurfaceInputBuffer.buffer == VK_NULL_HANDLE ||
+        pending->flowSurfaceTableBuffer.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const std::array<VkDescriptorBufferInfo, 3> infos = {
+        VkDescriptorBufferInfo{
+            pending->preprocessUniformBuffer.buffer,
+            0U,
+            sizeof(WaterSurfacePreprocessUniformsGpu)},
+        VkDescriptorBufferInfo{
+            pending->flowSurfaceInputBuffer.buffer,
+            0U,
+            pending->flowSurfaceInputBuffer.size},
+        VkDescriptorBufferInfo{
+            pending->flowSurfaceTableBuffer.buffer,
+            0U,
+            pending->flowSurfaceTableBuffer.size},
+    };
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (std::uint32_t binding = 0U; binding < writes.size(); ++binding) {
+        writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[binding].dstSet = pending->preprocessDescriptorSet;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorType =
+            binding == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[binding].descriptorCount = 1U;
+        writes[binding].pBufferInfo = &infos[binding];
+    }
+    vkUpdateDescriptorSets(
+        device_,
+        static_cast<std::uint32_t>(writes.size()),
+        writes.data(),
+        0U,
+        nullptr);
 }
 
 void VulkanViewportShell::CreatePointPipelines() {
@@ -4564,6 +5886,55 @@ void VulkanViewportShell::CreateDynamicMeshFlowComputePipeline() {
     vkDestroyShaderModule(device_, shaderModule, nullptr);
 }
 
+void VulkanViewportShell::CreateWaterFlowSourceComputePipelines() {
+    const auto routeCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} /
+         "water_flow_routes.comp.spv")
+            .string());
+    const auto trailCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} /
+         "water_flow_trails.comp.spv")
+            .string());
+    const auto routeModule =
+        CreateShaderModule(device_, routeCode, "vkCreateShaderModule(water flow routes)");
+    const auto trailModule =
+        CreateShaderModule(device_, trailCode, "vkCreateShaderModule(water flow trails)");
+
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1U;
+    layoutInfo.pSetLayouts = &waterFlowSourceDescriptorSetLayout_;
+    Check(
+        vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &waterFlowSourcePipelineLayout_),
+        "vkCreatePipelineLayout(water flow source)");
+
+    const auto createPipeline = [this](
+                                    VkShaderModule module,
+                                    VkPipeline* pipeline,
+                                    const char* label) {
+        VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stageInfo.module = module;
+        stageInfo.pName = "main";
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = stageInfo;
+        pipelineInfo.layout = waterFlowSourcePipelineLayout_;
+        Check(
+            vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1U, &pipelineInfo, nullptr, pipeline),
+            label);
+    };
+    createPipeline(
+        routeModule,
+        &waterFlowRouteComputePipeline_,
+        "vkCreateComputePipelines(water flow routes)");
+    createPipeline(
+        trailModule,
+        &waterFlowTrailComputePipeline_,
+        "vkCreateComputePipelines(water flow trails)");
+
+    vkDestroyShaderModule(device_, trailModule, nullptr);
+    vkDestroyShaderModule(device_, routeModule, nullptr);
+}
+
 void VulkanViewportShell::CreateRainPipelines() {
     const auto computeCode = ReadBinaryFile(
         (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "rain_simulation.comp.spv").string());
@@ -4658,6 +6029,47 @@ void VulkanViewportShell::CreateRainPipelines() {
     vkDestroyShaderModule(device_, fragmentModule, nullptr);
     vkDestroyShaderModule(device_, vertexModule, nullptr);
     vkDestroyShaderModule(device_, computeModule, nullptr);
+}
+
+void VulkanViewportShell::CreateWaterSurfacePreprocessPipeline() {
+    const auto shaderCode = ReadBinaryFile(
+        (std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} /
+         "water_surface_preprocess.comp.spv")
+            .string());
+    const auto shaderModule = CreateShaderModule(
+        device_,
+        shaderCode,
+        "vkCreateShaderModule(water surface preprocess)");
+
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1U;
+    layoutInfo.pSetLayouts = &waterSurfacePreprocessDescriptorSetLayout_;
+    Check(
+        vkCreatePipelineLayout(
+            device_,
+            &layoutInfo,
+            nullptr,
+            &waterSurfacePreprocessPipelineLayout_),
+        "vkCreatePipelineLayout(water surface preprocess)");
+
+    VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stageInfo.module = shaderModule;
+    stageInfo.pName = "main";
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = stageInfo;
+    pipelineInfo.layout = waterSurfacePreprocessPipelineLayout_;
+    Check(
+        vkCreateComputePipelines(
+            device_,
+            VK_NULL_HANDLE,
+            1U,
+            &pipelineInfo,
+            nullptr,
+            &waterSurfacePreprocessPipeline_),
+        "vkCreateComputePipelines(water surface preprocess)");
+
+    vkDestroyShaderModule(device_, shaderModule, nullptr);
 }
 
 void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uint32_t height) {
@@ -6229,6 +7641,10 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
         resources->seepageNodeReferenceBuffer.buffer,
         0,
         resources->seepageNodeReferenceBuffer.size};
+    VkDescriptorBufferInfo seepageParamsInfo{
+        resources->seepageParamsBuffers[frameIndex].buffer,
+        0,
+        resources->seepageParamsBuffers[frameIndex].size};
     VkDescriptorBufferInfo rainImpactCountInfo{
         rainResources_.impactCountBuffer.buffer,
         0,
@@ -6246,7 +7662,7 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 16> writes{};
+    std::array<VkWriteDescriptorSet, 17> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -6355,6 +7771,12 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].descriptorCount = 1;
     writes[15].pBufferInfo = &rainImpactEventInfo;
+    writes[16] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[16].dstSet = descriptorSet;
+    writes[16].dstBinding = 16;
+    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[16].descriptorCount = 1;
+    writes[16].pBufferInfo = &seepageParamsInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -6538,6 +7960,396 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
         "vkQueueSubmit(dynamic mesh flow)");
 }
 
+void VulkanViewportShell::UpdateWaterFlowSourceDescriptorSet(
+    ActivePointCloudResources* resources,
+    const WaterSurfaceFlowGpuView& surfaceView) {
+    if (resources == nullptr) {
+        return;
+    }
+    auto& descriptorSet = resources->waterFlowSourceDescriptorSet;
+    if (descriptorSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = descriptorPool_;
+        allocInfo.descriptorSetCount = 1U;
+        allocInfo.pSetLayouts = &waterFlowSourceDescriptorSetLayout_;
+        Check(
+            vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet),
+            "vkAllocateDescriptorSets(water flow source)");
+    }
+
+    const bool hasSurface = surfaceView.valid && surfaceView.buffer != VK_NULL_HANDLE &&
+                            surfaceView.range > 0U;
+    std::array<VkDescriptorBufferInfo, 7> infos = {
+        VkDescriptorBufferInfo{
+            resources->waterFlowSourceUniformBuffer.buffer,
+            0U,
+            resources->waterFlowSourceUniformBuffer.size},
+        VkDescriptorBufferInfo{
+            resources->waterFlowSourceInputBuffer.buffer,
+            0U,
+            resources->waterFlowSourceInputBuffer.size},
+        VkDescriptorBufferInfo{
+            hasSurface ? surfaceView.buffer : resources->waterFlowSourceInputBuffer.buffer,
+            hasSurface ? surfaceView.offset : 0U,
+            hasSurface ? surfaceView.range : resources->waterFlowSourceInputBuffer.size},
+        VkDescriptorBufferInfo{
+            resources->waterFlowPendingPositionStorageBuffer.buffer,
+            0U,
+            resources->waterFlowPendingPositionStorageBuffer.size},
+        VkDescriptorBufferInfo{
+            resources->waterFlowPendingNormalBuffer.buffer,
+            0U,
+            resources->waterFlowPendingNormalBuffer.size},
+        VkDescriptorBufferInfo{
+            resources->waterFlowPendingScalarFieldBuffer.buffer,
+            0U,
+            resources->waterFlowPendingScalarFieldBuffer.size},
+        VkDescriptorBufferInfo{
+            resources->waterFlowSourceBranchBuffer.buffer,
+            0U,
+            resources->waterFlowSourceBranchBuffer.size},
+    };
+    std::array<VkWriteDescriptorSet, 7> writes{};
+    for (std::uint32_t bindingIndex = 0U; bindingIndex < writes.size(); ++bindingIndex) {
+        writes[bindingIndex] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[bindingIndex].dstSet = descriptorSet;
+        writes[bindingIndex].dstBinding = bindingIndex;
+        writes[bindingIndex].descriptorType =
+            bindingIndex == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[bindingIndex].descriptorCount = 1U;
+        writes[bindingIndex].pBufferInfo = &infos[bindingIndex];
+    }
+    vkUpdateDescriptorSets(
+        device_,
+        static_cast<std::uint32_t>(writes.size()),
+        writes.data(),
+        0U,
+        nullptr);
+}
+
+void VulkanViewportShell::DispatchWaterFlowSourceCompute(
+    ActivePointCloudResources* resources,
+    const invisible_places::water::WaterFlowGpuOutputLayout& layout) {
+    if (resources == nullptr || !layout.Valid() ||
+        resources->waterFlowSourceDescriptorSet == VK_NULL_HANDLE ||
+        commandPool_ == VK_NULL_HANDLE) {
+        return;
+    }
+    if (resources->waterFlowSourceDispatchFence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        Check(
+            vkCreateFence(device_, &fenceInfo, nullptr, &resources->waterFlowSourceDispatchFence),
+            "vkCreateFence(water flow source)");
+    }
+    if (resources->waterFlowSourceCommandBuffer != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(
+            device_,
+            commandPool_,
+            1U,
+            &resources->waterFlowSourceCommandBuffer);
+        resources->waterFlowSourceCommandBuffer = VK_NULL_HANDLE;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = commandPool_;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1U;
+    Check(
+        vkAllocateCommandBuffers(device_, &allocInfo, &resources->waterFlowSourceCommandBuffer),
+        "vkAllocateCommandBuffers(water flow source)");
+    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(
+        vkBeginCommandBuffer(resources->waterFlowSourceCommandBuffer, &beginInfo),
+        "vkBeginCommandBuffer(water flow source)");
+
+    vkCmdBindDescriptorSets(
+        resources->waterFlowSourceCommandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        waterFlowSourcePipelineLayout_,
+        0U,
+        1U,
+        &resources->waterFlowSourceDescriptorSet,
+        0U,
+        nullptr);
+    vkCmdBindPipeline(
+        resources->waterFlowSourceCommandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        waterFlowRouteComputePipeline_);
+    vkCmdDispatch(
+        resources->waterFlowSourceCommandBuffer,
+        (layout.maxActiveRouteLaneCount + 31U) / 32U,
+        layout.branchCount,
+        1U);
+
+    std::array<VkBufferMemoryBarrier, 3> barriers{};
+    const std::array<VkBuffer, 3> outputBuffers = {
+        resources->waterFlowPendingPositionStorageBuffer.buffer,
+        resources->waterFlowPendingNormalBuffer.buffer,
+        resources->waterFlowPendingScalarFieldBuffer.buffer,
+    };
+    for (std::size_t index = 0U; index < barriers.size(); ++index) {
+        barriers[index] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barriers[index].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[index].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[index].buffer = outputBuffers[index];
+        barriers[index].offset = 0U;
+        barriers[index].size = VK_WHOLE_SIZE;
+    }
+    vkCmdPipelineBarrier(
+        resources->waterFlowSourceCommandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0U,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(barriers.size()),
+        barriers.data(),
+        0U,
+        nullptr);
+
+    vkCmdBindPipeline(
+        resources->waterFlowSourceCommandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        waterFlowTrailComputePipeline_);
+    vkCmdDispatch(
+        resources->waterFlowSourceCommandBuffer,
+        (layout.maxTrailsPerBranch + 63U) / 64U,
+        layout.branchCount,
+        1U);
+    for (auto& barrier : barriers) {
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    }
+    vkCmdPipelineBarrier(
+        resources->waterFlowSourceCommandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        0U,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(barriers.size()),
+        barriers.data(),
+        0U,
+        nullptr);
+    Check(
+        vkEndCommandBuffer(resources->waterFlowSourceCommandBuffer),
+        "vkEndCommandBuffer(water flow source)");
+
+    VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1U;
+    submitInfo.pCommandBuffers = &resources->waterFlowSourceCommandBuffer;
+    Check(
+        vkResetFences(device_, 1U, &resources->waterFlowSourceDispatchFence),
+        "vkResetFences(water flow source)");
+    Check(
+        vkQueueSubmit(
+            graphicsQueue_,
+            1U,
+            &submitInfo,
+            resources->waterFlowSourceDispatchFence),
+        "vkQueueSubmit(water flow source)");
+}
+
+void VulkanViewportShell::PollWaterFlowSourceDispatches() {
+    struct QueuedRequest {
+        std::size_t layerId = 0U;
+        std::uint32_t sourceId = 0U;
+        std::uint64_t revision = 0U;
+        invisible_places::water::WaterFlowGpuInputKind inputKind =
+            invisible_places::water::WaterFlowGpuInputKind::SampledAnchors;
+        std::shared_ptr<const invisible_places::water::WaterFlowGpuCompactSourceInput>
+            compactSourceInput;
+        invisible_places::water::WaterFlowTrailSettings settings{};
+        bool useSurfaceGuide = false;
+    };
+    std::vector<QueuedRequest> queuedRequests;
+    std::vector<std::size_t> completedDeletes;
+
+    const std::uint32_t currentFrameBit = 1U << static_cast<std::uint32_t>(currentFrameIndex_);
+    for (auto& resources : pointCloudResources_) {
+        if ((resources.waterFlowDescriptorRefreshFrameMask & currentFrameBit) != 0U) {
+            if (!resources.waterFlowDeletePending && resources.pointCount > 0U) {
+                resources.descriptorSets[currentFrameIndex_].resize(
+                    depthImages_.size(), VK_NULL_HANDLE);
+                for (std::uint32_t imageIndex = 0U; imageIndex < depthImages_.size(); ++imageIndex) {
+                    UpdatePointCloudDescriptorSet(
+                        &resources,
+                        currentFrameIndex_,
+                        imageIndex,
+                        depthImages_[imageIndex].view);
+                }
+            }
+            resources.waterFlowDescriptorRefreshFrameMask &= ~currentFrameBit;
+        }
+        for (auto& retired : resources.waterFlowRetiredOutputs) {
+            if ((retired.outstandingFrameMask & currentFrameBit) != 0U) {
+                retired.outstandingFrameMask &= ~currentFrameBit;
+            }
+        }
+        for (auto retiredIt = resources.waterFlowRetiredOutputs.begin();
+             retiredIt != resources.waterFlowRetiredOutputs.end();) {
+            if (retiredIt->outstandingFrameMask != 0U) {
+                ++retiredIt;
+                continue;
+            }
+            if (!resources.waterFlowSourceDispatchPending &&
+                resources.waterFlowPendingPositionStorageBuffer.buffer == VK_NULL_HANDLE) {
+                resources.waterFlowPendingPositionBuffer = retiredIt->positionBuffer;
+                resources.waterFlowPendingPositionStorageBuffer = retiredIt->positionStorageBuffer;
+                resources.waterFlowPendingColorBuffer = retiredIt->colorBuffer;
+                resources.waterFlowPendingNormalBuffer = retiredIt->normalBuffer;
+                resources.waterFlowPendingScalarFieldBuffer = retiredIt->scalarFieldBuffer;
+                resources.waterFlowSparePointCapacity = retiredIt->pointCapacity;
+                retiredIt->positionBuffer = {};
+                retiredIt->positionStorageBuffer = {};
+                retiredIt->colorBuffer = {};
+                retiredIt->normalBuffer = {};
+                retiredIt->scalarFieldBuffer = {};
+            } else {
+                DestroyBuffer(&retiredIt->positionBuffer);
+                DestroyBuffer(&retiredIt->positionStorageBuffer);
+                DestroyBuffer(&retiredIt->colorBuffer);
+                DestroyBuffer(&retiredIt->normalBuffer);
+                DestroyBuffer(&retiredIt->scalarFieldBuffer);
+            }
+            retiredIt = resources.waterFlowRetiredOutputs.erase(retiredIt);
+        }
+
+        if (resources.waterFlowDeletePending) {
+            resources.waterFlowDeleteOutstandingFrameMask &= ~currentFrameBit;
+            const bool computeComplete =
+                resources.waterFlowSourceDispatchFence == VK_NULL_HANDLE ||
+                vkGetFenceStatus(device_, resources.waterFlowSourceDispatchFence) == VK_SUCCESS;
+            if (resources.waterFlowDeleteOutstandingFrameMask == 0U && computeComplete) {
+                completedDeletes.push_back(resources.layerId);
+            }
+        }
+    }
+
+    for (auto& resources : pointCloudResources_) {
+        if (!resources.waterFlowSourceActive || !resources.waterFlowSourceDispatchPending ||
+            resources.waterFlowSourceDispatchFence == VK_NULL_HANDLE) {
+            continue;
+        }
+        const VkResult status = vkGetFenceStatus(device_, resources.waterFlowSourceDispatchFence);
+        if (status == VK_NOT_READY) {
+            continue;
+        }
+        Check(status, "vkGetFenceStatus(water flow source)");
+        if (resources.waterFlowSourceCommandBuffer != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(
+                device_, commandPool_, 1U, &resources.waterFlowSourceCommandBuffer);
+            resources.waterFlowSourceCommandBuffer = VK_NULL_HANDLE;
+        }
+        resources.waterFlowSourceDispatchPending = false;
+
+        if (resources.waterFlowSourceQueued &&
+            resources.waterFlowQueuedRevision > resources.waterFlowPendingRevision) {
+            QueuedRequest queued;
+            queued.layerId = resources.layerId;
+            queued.sourceId = resources.waterFlowQueuedSourceId;
+            queued.revision = resources.waterFlowQueuedRevision;
+            queued.inputKind = resources.waterFlowQueuedInputKind;
+            queued.compactSourceInput =
+                std::move(resources.waterFlowQueuedCompactSourceInput);
+            queued.settings = resources.waterFlowQueuedSettings;
+            queued.useSurfaceGuide = resources.waterFlowQueuedUseSurfaceGuide;
+            queuedRequests.push_back(std::move(queued));
+            resources.waterFlowSourceQueued = false;
+            resources.waterFlowQueuedRevision = 0U;
+            resources.waterFlowPendingRevision = 0U;
+            resources.waterFlowPendingLayout = {};
+            resources.waterFlowSourceRequestedRevision = resources.waterFlowSourceCompletedRevision;
+            continue;
+        }
+
+        if (resources.waterFlowDeletePending) {
+            continue;
+        }
+        ActivePointCloudResources::WaterFlowRetiredOutputResources retired;
+        retired.positionBuffer = resources.positionBuffer;
+        retired.positionStorageBuffer = resources.positionStorageBuffer;
+        retired.colorBuffer = resources.colorBuffer;
+        retired.normalBuffer = resources.normalBuffer;
+        retired.scalarFieldBuffer = resources.scalarFieldBuffer;
+        retired.pointCapacity = resources.pointCount;
+        retired.outstandingFrameMask =
+            ((1U << static_cast<std::uint32_t>(kFramesInFlight)) - 1U) & ~currentFrameBit;
+        if (retired.positionStorageBuffer.buffer != VK_NULL_HANDLE) {
+            resources.waterFlowRetiredOutputs.push_back(retired);
+        }
+        resources.positionBuffer = resources.waterFlowPendingPositionBuffer;
+        resources.positionStorageBuffer = resources.waterFlowPendingPositionStorageBuffer;
+        resources.colorBuffer = resources.waterFlowPendingColorBuffer;
+        resources.normalBuffer = resources.waterFlowPendingNormalBuffer;
+        resources.scalarFieldBuffer = resources.waterFlowPendingScalarFieldBuffer;
+        resources.waterFlowPendingPositionBuffer = {};
+        resources.waterFlowPendingPositionStorageBuffer = {};
+        resources.waterFlowPendingColorBuffer = {};
+        resources.waterFlowPendingNormalBuffer = {};
+        resources.waterFlowPendingScalarFieldBuffer = {};
+        resources.waterFlowSparePointCapacity = 0U;
+        resources.pointCount = resources.waterFlowPendingLayout.pointCapacity;
+        resources.waterFlowSettledPointCount = resources.waterFlowPendingLayout.pointCount;
+        resources.activePointCount = resources.waterFlowPendingLayout.pointCount;
+        resources.scalarFieldCount = invisible_places::water::kWaterTrailScalarFieldCount;
+        resources.hasSourceRgb = true;
+        resources.hasNormals = true;
+        resources.usingSampledIndices = false;
+        resources.interactiveSampledIndexCount = 0U;
+        for (auto& highlight : resources.highlights) {
+            // Index buffers belong to the previous topology. Keep their
+            // allocations alive until normal resource cleanup, but prevent an
+            // in-flight source-local promotion from drawing stale indices.
+            highlight.indexCount = 0U;
+        }
+        resources.waterFlowSourceId = resources.waterFlowPendingSourceId;
+        resources.waterFlowSourceCompletedRevision = resources.waterFlowPendingRevision;
+        resources.waterFlowPendingRevision = 0U;
+        resources.waterFlowPendingLayout = {};
+        resources.descriptorSets[currentFrameIndex_].resize(depthImages_.size(), VK_NULL_HANDLE);
+        for (std::uint32_t imageIndex = 0U; imageIndex < depthImages_.size(); ++imageIndex) {
+            UpdatePointCloudDescriptorSet(
+                &resources,
+                currentFrameIndex_,
+                imageIndex,
+                depthImages_[imageIndex].view);
+        }
+        resources.waterFlowDescriptorRefreshFrameMask =
+            ((1U << static_cast<std::uint32_t>(kFramesInFlight)) - 1U) & ~currentFrameBit;
+        ++sceneRevision_;
+    }
+
+    for (auto& queued : queuedRequests) {
+        WaterFlowGpuSourceRequest request;
+        request.sourceId = queued.sourceId;
+        request.sourceRevision = queued.revision;
+        request.inputKind = queued.inputKind;
+        request.compactSourceInput = std::move(queued.compactSourceInput);
+        request.settings = queued.settings;
+        request.useSurfaceGuide = queued.useSurfaceGuide;
+        (void)UploadWaterFlowGpuSource(queued.layerId, request);
+    }
+
+    for (const auto layerId : completedDeletes) {
+        auto resourcesIt = std::find_if(
+            pointCloudResources_.begin(),
+            pointCloudResources_.end(),
+            [layerId](const ActivePointCloudResources& resources) {
+                return resources.layerId == layerId && resources.waterFlowDeletePending;
+            });
+        if (resourcesIt == pointCloudResources_.end()) {
+            continue;
+        }
+        CleanupPointCloudResources(&(*resourcesIt));
+        pointCloudResources_.erase(resourcesIt);
+    }
+}
+
 void VulkanViewportShell::UpdatePointHighlightDescriptorSets(
     ActivePointCloudResources* resources,
     ActivePointCloudResources::PointHighlightResources* highlight) {
@@ -6638,6 +8450,10 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
         resources->seepageNodeReferenceBuffer.buffer,
         0,
         resources->seepageNodeReferenceBuffer.size};
+    VkDescriptorBufferInfo seepageParamsInfo{
+        resources->seepageParamsBuffers[frameIndex].buffer,
+        0,
+        resources->seepageParamsBuffers[frameIndex].size};
     VkDescriptorBufferInfo rainImpactCountInfo{
         rainResources_.impactCountBuffer.buffer,
         0,
@@ -6655,7 +8471,7 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 16> writes{};
+    std::array<VkWriteDescriptorSet, 17> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -6764,6 +8580,12 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].descriptorCount = 1;
     writes[15].pBufferInfo = &rainImpactEventInfo;
+    writes[16] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[16].dstSet = descriptorSet;
+    writes[16].dstBinding = 16;
+    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[16].descriptorCount = 1;
+    writes[16].pBufferInfo = &seepageParamsInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -6818,6 +8640,10 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         resources->seepageNodeReferenceBuffer.buffer,
         0,
         resources->seepageNodeReferenceBuffer.size};
+    VkDescriptorBufferInfo seepageParamsInfo{
+        resources->seepageExrParamsBuffer.buffer,
+        0,
+        resources->seepageExrParamsBuffer.size};
     VkDescriptorBufferInfo rainImpactCountInfo{
         rainResources_.impactCountBuffer.buffer,
         0,
@@ -6834,7 +8660,7 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 16> writes{};
+    std::array<VkWriteDescriptorSet, 17> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = resources->exrDescriptorSet;
     writes[0].dstBinding = 0;
@@ -6943,6 +8769,12 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[15].descriptorCount = 1;
     writes[15].pBufferInfo = &rainImpactEventInfo;
+    writes[16] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[16].dstSet = resources->exrDescriptorSet;
+    writes[16].dstBinding = 16;
+    writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[16].descriptorCount = 1;
+    writes[16].pBufferInfo = &seepageParamsInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -7670,6 +9502,23 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
             fence = VK_NULL_HANDLE;
         }
     }
+    if (resources->waterFlowSourceDispatchFence != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        const VkResult status = vkGetFenceStatus(device_, resources->waterFlowSourceDispatchFence);
+        if (status == VK_NOT_READY) {
+            vkWaitForFences(
+                device_, 1U, &resources->waterFlowSourceDispatchFence, VK_TRUE, UINT64_MAX);
+        }
+    }
+    if (resources->waterFlowSourceCommandBuffer != VK_NULL_HANDLE &&
+        commandPool_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(
+            device_, commandPool_, 1U, &resources->waterFlowSourceCommandBuffer);
+        resources->waterFlowSourceCommandBuffer = VK_NULL_HANDLE;
+    }
+    if (resources->waterFlowSourceDispatchFence != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, resources->waterFlowSourceDispatchFence, nullptr);
+        resources->waterFlowSourceDispatchFence = VK_NULL_HANDLE;
+    }
     DestroyBuffer(&resources->positionBuffer);
     DestroyBuffer(&resources->positionStorageBuffer);
     DestroyBuffer(&resources->colorBuffer);
@@ -7679,6 +9528,10 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->sparseRippleMembershipBuffer);
     DestroyBuffer(&resources->sparseRippleParamsBuffer);
     DestroyBuffer(&resources->seepageNodeBuffer);
+    for (auto& paramsBuffer : resources->seepageParamsBuffers) {
+        DestroyBuffer(&paramsBuffer);
+    }
+    DestroyBuffer(&resources->seepageExrParamsBuffer);
     DestroyBuffer(&resources->seepageHashCellBuffer);
     DestroyBuffer(&resources->seepageNodeReferenceBuffer);
     for (auto& uniformBuffer : resources->dynamicMeshFlowUniformBuffers) {
@@ -7692,6 +9545,22 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     for (auto& attractorBuffer : resources->dynamicMeshFlowAttractorBuffers) {
         DestroyBuffer(&attractorBuffer);
     }
+    DestroyBuffer(&resources->waterFlowSourceUniformBuffer);
+    DestroyBuffer(&resources->waterFlowSourceInputBuffer);
+    DestroyBuffer(&resources->waterFlowSourceBranchBuffer);
+    DestroyBuffer(&resources->waterFlowPendingPositionBuffer);
+    DestroyBuffer(&resources->waterFlowPendingPositionStorageBuffer);
+    DestroyBuffer(&resources->waterFlowPendingColorBuffer);
+    DestroyBuffer(&resources->waterFlowPendingNormalBuffer);
+    DestroyBuffer(&resources->waterFlowPendingScalarFieldBuffer);
+    for (auto& retired : resources->waterFlowRetiredOutputs) {
+        DestroyBuffer(&retired.positionBuffer);
+        DestroyBuffer(&retired.positionStorageBuffer);
+        DestroyBuffer(&retired.colorBuffer);
+        DestroyBuffer(&retired.normalBuffer);
+        DestroyBuffer(&retired.scalarFieldBuffer);
+    }
+    resources->waterFlowRetiredOutputs.clear();
     for (auto& styleBuffer : resources->styleBuffers) {
         DestroyBuffer(&styleBuffer);
     }
@@ -7722,6 +9591,12 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
             vkFreeDescriptorSets(device_, descriptorPool_, 1, &descriptorSet);
             descriptorSet = VK_NULL_HANDLE;
         }
+    }
+    if (resources->waterFlowSourceDescriptorSet != VK_NULL_HANDLE &&
+        descriptorPool_ != VK_NULL_HANDLE && device_ != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(
+            device_, descriptorPool_, 1U, &resources->waterFlowSourceDescriptorSet);
+        resources->waterFlowSourceDescriptorSet = VK_NULL_HANDLE;
     }
     *resources = ActivePointCloudResources{};
 }
@@ -7927,7 +9802,9 @@ bool VulkanViewportShell::ResolvePointCloudDrawPlan(
 
     std::uint32_t drawPointCount = 0;
     if (forceFullSource) {
-        drawPointCount = resources->pointCount;
+        drawPointCount = resources->waterFlowSourceActive
+                             ? resources->waterFlowSettledPointCount
+                             : resources->pointCount;
     } else {
         drawPointCount = layer.drawPointCount > 0
                              ? std::min(layer.drawPointCount, resources->activePointCount)
@@ -8049,11 +9926,14 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         layer.style.waterTrailStyleGeometry ? 1.0F : 0.0F,
         densityCompensation.footprintScale,
         densityCompensation.coverageCorrection,
-        0.0F,
+        std::clamp(
+            std::isfinite(layer.style.waterFlowActivity) ? layer.style.waterFlowActivity : 1.0F,
+            0.0F,
+            1.0F),
     };
     styleGpu.renderParams2 = glm::vec4{
         kPointCloudAntialiasFeatherPixels,
-        0.0F,
+        renderer::pointcloud::SanitizeWaterFlowSpeedScale(layer.style.waterFlowSpeedScale),
         std::clamp(layer.style.waterStreakAspect, 1.0F, 32.0F),
         renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
     };
@@ -9751,6 +11631,42 @@ VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuff
     Check(
         vkMapMemory(device_, allocation.memory, 0, allocation.size, 0, &allocation.mapped),
         "vkMapMemory(persistent buffer)");
+    return allocation;
+}
+
+VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateDeviceLocalBuffer(
+    VkDeviceSize size,
+    VkBufferUsageFlags usage) const {
+    if (size == 0) {
+        size = 4;
+    }
+
+    BufferAllocation allocation;
+    allocation.size = size;
+
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    Check(
+        vkCreateBuffer(device_, &bufferInfo, nullptr, &allocation.buffer),
+        "vkCreateBuffer(device local)");
+
+    VkMemoryRequirements memoryRequirements{};
+    vkGetBufferMemoryRequirements(device_, allocation.buffer, &memoryRequirements);
+
+    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocInfo.allocationSize = memoryRequirements.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(
+        memoryRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Check(
+        vkAllocateMemory(device_, &allocInfo, nullptr, &allocation.memory),
+        "vkAllocateMemory(device local)");
+    Check(
+        vkBindBufferMemory(device_, allocation.buffer, allocation.memory, 0),
+        "vkBindBufferMemory(device local)");
     return allocation;
 }
 

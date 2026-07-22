@@ -2,6 +2,7 @@
 
 layout(location = 1) in float inViewDepth;
 layout(location = 2) flat in uint inPointIndex;
+layout(location = 5) in float inFlowCoverage;
 
 layout(location = 0) out float outLinearDepth;
 
@@ -53,9 +54,21 @@ float LoadScalarFieldValue(uint fieldSlot) {
     return scalarFieldValues.values[(fieldSlot * styleData.pointMeta.x) + inPointIndex];
 }
 
+float WaterFlowCoverageNoise() {
+    const vec2 spriteCell = floor(gl_PointCoord * 16.0);
+    const float hashInput =
+        float(inPointIndex) * 0.754877666 +
+        spriteCell.x * 12.9898 +
+        spriteCell.y * 78.233;
+    return fract(sin(hashInput) * 43758.5453);
+}
+
 void main() {
     if (styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterTrailTangentZFieldSlot) {
         if (LoadScalarFieldValue(kWaterTrailRoleFieldSlot) < 0.5) {
+            discard;
+        }
+        if (inFlowCoverage <= 0.0 || WaterFlowCoverageNoise() > clamp(inFlowCoverage, 0.0, 1.0)) {
             discard;
         }
         outLinearDepth = inViewDepth;

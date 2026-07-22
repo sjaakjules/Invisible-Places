@@ -9,6 +9,7 @@ layout(location = 1) out float outViewDepth;
 layout(location = 2) flat out uint outPointIndex;
 layout(location = 3) out vec3 outWorldPosition;
 layout(location = 4) out vec3 outPointNormal;
+layout(location = 5) out float outFlowCoverage;
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -95,6 +96,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 #include "pointcloud_rain_impact.glsl"
 
 const uint kWaterTrailRoleFieldSlot = 0u;
+const uint kWaterTrailSeedFieldSlot = 5u;
 const uint kWaterTrailDistanceFieldSlot = 7u;
 const uint kWaterTrailLengthFieldSlot = 8u;
 const uint kWaterTrailRouteStartFieldSlot = 9u;
@@ -105,6 +107,7 @@ const uint kWaterTrailLateralOffsetFieldSlot = 13u;
 const uint kWaterTrailPointAgeFieldSlot = 14u;
 const uint kWaterTrailAgeFieldSlot = 15u;
 const uint kWaterTrailSpeedFieldSlot = 16u;
+const uint kWaterTrailWidthFieldSlot = 17u;
 const uint kWaterTrailStreakLengthFieldSlot = 18u;
 const uint kWaterTrailFeatureTypeFieldSlot = 21u;
 const uint kWaterTrailTangentZFieldSlot = 24u;
@@ -163,7 +166,12 @@ float WaterTrailTravelPhase(uint pointIndex) {
     const float trailDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailDistanceFieldSlot, pointIndex));
     const float trailAge = LoadScalarFieldValueForPoint(kWaterTrailAgeFieldSlot, pointIndex);
     const float baseStartPhase = LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, pointIndex);
-    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex));
+    const float activity = clamp(styleData.renderParams1.w, 0.0, 1.0);
+    const float speedScale = mix(0.60, 1.0, activity);
+    const float speed =
+        max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex)) *
+        speedScale *
+        max(0.0, styleData.renderParams2.y);
     const float trailStartPhase = fract(
         baseStartPhase +
         trailAge +
@@ -183,12 +191,43 @@ float WaterTrailStyleWidth() {
     return max(0.0001, styleData.surfelDiameterBinding.constantValue.x);
 }
 
-float WaterTrailStreakLength(uint pointIndex) {
-    if (WaterTrailStyleGeometryAvailable()) {
-        return WaterTrailStyleWidth() *
-               max(1.0, styleData.renderParams2.z);
+float WaterFlowActivity() {
+    return clamp(styleData.renderParams1.w, 0.0, 1.0);
+}
+
+float WaterFlowAppearanceScale() {
+    return mix(0.30, 1.0, WaterFlowActivity());
+}
+
+float WaterTrailActivityGate(uint pointIndex) {
+    const float activity = WaterFlowActivity();
+    if (activity <= 0.0) {
+        return 0.0;
     }
-    return max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+    if (activity >= 1.0) {
+        return 1.0;
+    }
+    const float seed = clamp(
+        LoadScalarFieldValueForPoint(kWaterTrailSeedFieldSlot, pointIndex),
+        0.0,
+        1.0);
+    return smoothstep(seed - 0.035, seed + 0.035, activity);
+}
+
+float WaterTrailBaseWidth(uint pointIndex) {
+    return WaterTrailStyleGeometryAvailable()
+        ? WaterTrailStyleWidth()
+        : max(0.0001, LoadScalarFieldValueForPoint(kWaterTrailWidthFieldSlot, pointIndex));
+}
+
+float WaterTrailStreakLength(uint pointIndex) {
+    float streakLength = 0.0;
+    if (WaterTrailStyleGeometryAvailable()) {
+        streakLength = WaterTrailStyleWidth() * max(1.0, styleData.renderParams2.z);
+    } else {
+        streakLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+    }
+    return streakLength * mix(0.55, 1.0, WaterFlowActivity());
 }
 
 float WaterTrailVisibility(uint pointIndex) {
@@ -198,8 +237,9 @@ float WaterTrailVisibility(uint pointIndex) {
     const float phase = WaterTrailTravelPhase(pointIndex);
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
-    const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.08);
-    return 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.10);
+    const float routeEndFade = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    return WaterTrailActivityGate(pointIndex) * routeEndFade;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -277,7 +317,16 @@ vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
         lateral = normalize(lateral);
     }
     const float lateralOffset = LoadScalarFieldValueForPoint(kWaterTrailLateralOffsetFieldSlot, pointIndex);
-    return routePosition + lateral * lateralOffset;
+    const float trailSeed = clamp(
+        LoadScalarFieldValueForPoint(kWaterTrailSeedFieldSlot, pointIndex),
+        0.0,
+        1.0);
+    const float motionPhase =
+        (phase * 1.70 + trailSeed * 3.17 + max(0.0, uniforms.depthParameters.x) * 0.35) *
+        6.28318530718;
+    const float microMotion =
+        sin(motionPhase) * WaterTrailBaseWidth(pointIndex) * 0.15 * WaterFlowActivity();
+    return routePosition + lateral * (lateralOffset + microMotion);
 }
 
 float WorldDiameterToScreenPointSizePixels(float diameterMeters, float viewDepth) {
@@ -292,7 +341,15 @@ void main() {
     const float waterTrailVisibility = WaterTrailOverlayEnabled()
         ? WaterTrailVisibility(pointIndex)
         : 1.0;
-    const vec3 resolvedPosition = ResolveWaterTrailPosition(inPosition, pointIndex);
+    // Source-local GPU Flow owns positions in the storage buffer. In
+    // particular, route-role points return their base unchanged from the
+    // animation resolver and therefore cannot use the unpopulated Float3
+    // compatibility vertex allocation.
+    const vec3 basePosition =
+        WaterTrailOverlayEnabled() && pointIndex < styleData.pointMeta.x
+            ? pointPositions.positions[pointIndex].xyz
+            : inPosition;
+    const vec3 resolvedPosition = ResolveWaterTrailPosition(basePosition, pointIndex);
     vec4 worldPosition = vec4(resolvedPosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     gl_Position = uniforms.viewProjection * worldPosition;
@@ -309,10 +366,13 @@ void main() {
             ? WorldDiameterToScreenPointSizePixels(styleData.surfelDiameterBinding.constantValue.x, -viewPosition.z)
             : styleData.pointSizeBinding.constantValue.x;
     const float footprintScale = max(1.0e-6, styleData.renderParams1.y);
+    const float flowWidthScale = WaterTrailOverlayEnabled()
+        ? mix(0.65, 1.0, WaterFlowActivity())
+        : 1.0;
     gl_PointSize = waterTrailVisibility <= 0.0
         ? 0.0
         : clamp(
-              ((basePointSize * sparseRipple.pointSizeMultiply * rainImpact.pointSizeMultiply) +
+              ((basePointSize * flowWidthScale * sparseRipple.pointSizeMultiply * rainImpact.pointSizeMultiply) +
                    sparseRipple.pointSizeAdd) * footprintScale,
               max(1.0, styleData.renderParams3.y),
               max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
@@ -322,4 +382,7 @@ void main() {
     outWorldPosition = resolvedPosition;
     outPointNormal =
         dot(pointNormal, pointNormal) > 1e-8 ? normalize(pointNormal) : vec3(0.0, 0.0, 1.0);
+    outFlowCoverage = WaterTrailOverlayEnabled()
+        ? waterTrailVisibility * WaterFlowAppearanceScale()
+        : 1.0;
 }

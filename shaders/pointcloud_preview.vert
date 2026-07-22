@@ -114,6 +114,7 @@ const uint kWaterJitterSeedFieldSlot = 12u;
 const uint kWaterAgeFieldSlot = 13u;
 const uint kWaterFeatureTypeFieldSlot = 15u;
 const uint kWaterTrailRoleFieldSlot = 0u;
+const uint kWaterTrailSeedFieldSlot = 5u;
 const uint kWaterTrailDistanceFieldSlot = 7u;
 const uint kWaterTrailLengthFieldSlot = 8u;
 const uint kWaterTrailRouteStartFieldSlot = 9u;
@@ -521,7 +522,12 @@ float WaterTrailTravelPhase(uint pointIndex) {
     const float trailDistance = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailDistanceFieldSlot, pointIndex));
     const float trailAge = LoadScalarFieldValueForPoint(kWaterTrailAgeFieldSlot, pointIndex);
     const float baseStartPhase = LoadScalarFieldValueForPoint(kWaterTrailStartPhaseFieldSlot, pointIndex);
-    const float speed = max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex));
+    const float activity = clamp(styleData.renderParams1.w, 0.0, 1.0);
+    const float speedScale = mix(0.60, 1.0, activity);
+    const float speed =
+        max(0.0, LoadScalarFieldValueForPoint(kWaterTrailSpeedFieldSlot, pointIndex)) *
+        speedScale *
+        max(0.0, styleData.renderParams2.y);
     const float trailStartPhase = fract(
         baseStartPhase +
         trailAge +
@@ -541,12 +547,47 @@ float WaterTrailStyleWidth() {
     return max(0.0001, styleData.surfelDiameterBinding.constantValue.x);
 }
 
-float WaterTrailStreakLength(uint pointIndex) {
-    if (WaterTrailStyleGeometryAvailable()) {
-        return WaterTrailStyleWidth() *
-               max(1.0, styleData.renderParams2.z);
+float WaterFlowActivity() {
+    return clamp(styleData.renderParams1.w, 0.0, 1.0);
+}
+
+float WaterFlowWidthScale() {
+    return mix(0.65, 1.0, WaterFlowActivity());
+}
+
+float WaterFlowAppearanceScale() {
+    return mix(0.30, 1.0, WaterFlowActivity());
+}
+
+float WaterTrailActivityGate(uint pointIndex) {
+    const float activity = WaterFlowActivity();
+    if (activity <= 0.0) {
+        return 0.0;
     }
-    return max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+    if (activity >= 1.0) {
+        return 1.0;
+    }
+    const float seed = clamp(
+        LoadScalarFieldValueForPoint(kWaterTrailSeedFieldSlot, pointIndex),
+        0.0,
+        1.0);
+    return smoothstep(seed - 0.035, seed + 0.035, activity);
+}
+
+float WaterTrailBaseWidth(uint pointIndex) {
+    return WaterTrailStyleGeometryAvailable()
+        ? WaterTrailStyleWidth()
+        : max(0.0001, LoadScalarFieldValueForPoint(kWaterTrailWidthFieldSlot, pointIndex));
+}
+
+float WaterTrailStreakLength(uint pointIndex) {
+    float streakLength = 0.0;
+    if (WaterTrailStyleGeometryAvailable()) {
+        streakLength = WaterTrailStyleWidth() * max(1.0, styleData.renderParams2.z);
+    } else {
+        streakLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailStreakLengthFieldSlot, pointIndex));
+    }
+    return streakLength * mix(0.55, 1.0, WaterFlowActivity());
 }
 
 vec2 WaterTrailRouteSegment(uint pointIndex, float phase) {
@@ -566,8 +607,9 @@ float WaterTrailVisibility(uint pointIndex) {
     const float phase = WaterTrailTravelPhase(pointIndex);
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
-    const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.08);
-    return 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.10);
+    const float routeEndFade = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    return WaterTrailActivityGate(pointIndex) * routeEndFade;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -653,7 +695,16 @@ vec3 ResolveWaterTrailPosition(vec3 basePosition, uint pointIndex) {
         lateral = normalize(lateral);
     }
     const float lateralOffset = LoadScalarFieldValueForPoint(kWaterTrailLateralOffsetFieldSlot, pointIndex);
-    return routePosition + lateral * lateralOffset;
+    const float trailSeed = clamp(
+        LoadScalarFieldValueForPoint(kWaterTrailSeedFieldSlot, pointIndex),
+        0.0,
+        1.0);
+    const float motionPhase =
+        (phase * 1.70 + trailSeed * 3.17 + max(0.0, uniforms.depthParameters.x) * 0.35) *
+        6.28318530718;
+    const float microMotion =
+        sin(motionPhase) * WaterTrailBaseWidth(pointIndex) * 0.15 * WaterFlowActivity();
+    return routePosition + lateral * (lateralOffset + microMotion);
 }
 
 vec3 ResolveWaterFlowPosition(vec3 basePosition, uint pointIndex) {
@@ -727,7 +778,10 @@ vec2 ApplyWaterFlowAnimation(float opacity, float emissive, uint pointIndex) {
             return vec2(0.0);
         }
         const float trailVisibility = WaterTrailVisibility(pointIndex);
-        return vec2(opacity * trailVisibility, emissive * trailVisibility);
+        const float appearance = WaterFlowAppearanceScale();
+        return vec2(
+            opacity * trailVisibility * appearance,
+            emissive * trailVisibility * appearance);
     }
 
     if (styleData.pointMeta.w == 3u) {
@@ -865,7 +919,15 @@ vec3 ResolveAovNormal(uint pointIndex) {
 
 void main() {
     const uint pointIndex = uint(gl_VertexIndex);
-    const vec3 flowPosition = ResolveWaterFlowPosition(inPosition, pointIndex);
+    // GPU Flow writes its settled route/trail geometry directly to the vec4
+    // position SSBO. Its legacy Float3 vertex allocation is intentionally not
+    // read back or copied, so route-role points (which are not animated by
+    // ResolveWaterFlowPosition) must also start from the storage position.
+    const vec3 basePosition =
+        WaterTrailOverlayEnabled() && pointIndex < styleData.pointMeta.x
+            ? pointPositions.positions[pointIndex].xyz
+            : inPosition;
+    const vec3 flowPosition = ResolveWaterFlowPosition(basePosition, pointIndex);
     vec4 worldPosition = vec4(ResolveSurfaceMotionPosition(flowPosition, pointIndex), 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
@@ -901,10 +963,11 @@ void main() {
     const float sparseRippleEmissionAdd = sparseRipple.emissionAdd;
     const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
     const float footprintScale = max(1.0e-6, styleData.renderParams1.y);
+    const float flowWidthScale = WaterTrailOverlayEnabled() ? WaterFlowWidthScale() : 1.0;
     const float pointSizeBeforeDepthOfField =
         worldSizedScreenSprites
             ? WorldDiameterToScreenPointSizePixels(
-                  ((max(0.0, EvaluateBinding(styleData.surfelDiameterBinding)) *
+                  ((max(0.0, EvaluateBinding(styleData.surfelDiameterBinding)) * flowWidthScale *
                         WaterPathPointSizeScale(pointIndex) *
                         WaterSteamSizeScale(pointIndex) *
                         (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
@@ -915,7 +978,7 @@ void main() {
                        sparseRipplePointSizeAdd) *
                       footprintScale,
                   viewDepth)
-            : (((max(0.0, EvaluateBinding(styleData.pointSizeBinding)) *
+            : (((max(0.0, EvaluateBinding(styleData.pointSizeBinding)) * flowWidthScale *
                     WaterPathPointSizeScale(pointIndex) *
                     WaterSteamSizeScale(pointIndex) *
                     (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
@@ -949,21 +1012,24 @@ void main() {
         EvaluateBinding(styleData.opacityBinding),
         EvaluateBinding(styleData.emissiveBinding),
         pointIndex);
+    const float flowEffectVisibility = WaterTrailOverlayEnabled()
+        ? WaterTrailVisibility(pointIndex) * WaterFlowAppearanceScale()
+        : 1.0;
     outOpacity = clamp(
         (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
              waterEffectOpacityMultiply *
              sparseRippleOpacityMultiply) +
-            waterEffectOpacityAdd +
-            sparseRippleOpacityAdd +
-            rainImpact.opacityAdd,
+            (waterEffectOpacityAdd +
+             sparseRippleOpacityAdd +
+             rainImpact.opacityAdd) * flowEffectVisibility,
         0.0,
         4.0);
     outEmissive =
         animatedFlow.y +
-        caustic * max(0.0, styleData.causticParams1.y) +
-        waterEffectEmissionAdd +
-        sparseRippleEmissionAdd +
-        rainImpact.emissionAdd;
+        (caustic * max(0.0, styleData.causticParams1.y) +
+         waterEffectEmissionAdd +
+         sparseRippleEmissionAdd +
+         rainImpact.emissionAdd) * flowEffectVisibility;
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;
     outPointIndex = pointIndex;

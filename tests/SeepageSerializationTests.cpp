@@ -30,7 +30,7 @@ WaterSeepageLookSettings MakeLook(
                        ? WaterSeepagePattern::LegacyRipples
                        : (quality == WaterSeepageQuality::Balanced
                               ? WaterSeepagePattern::WetRockSheen
-                              : WaterSeepagePattern::ChaoticBloom);
+                              : WaterSeepagePattern::WettingTrickle);
     look.baseWetness = 0.11F + offset;
     look.density = 0.22F + offset;
     look.glisten = 0.33F + offset;
@@ -53,6 +53,10 @@ WaterSeepageLookSettings MakeLook(
     look.curl = 0.42F + offset;
     look.breakup = 0.53F + offset;
     look.downhillDriftMetersPerSecond = 0.026F + offset;
+    look.tricklePatchSizeMeters = 0.081F + offset;
+    look.trickleLengthMeters = 0.36F + offset;
+    look.trickleWidthMeters = 0.019F + offset;
+    look.trickleFrontSoftness = 0.11F + offset;
     look.blendMode = blendMode;
     look.response.intensity = 0.71F + offset;
     look.response.emissionAdd = 0.82F + offset;
@@ -98,6 +102,18 @@ void CheckLook(
     CHECK(
         actual.downhillDriftMetersPerSecond ==
         Catch::Approx(expected.downhillDriftMetersPerSecond));
+    CHECK(
+        actual.tricklePatchSizeMeters ==
+        Catch::Approx(expected.tricklePatchSizeMeters));
+    CHECK(
+        actual.trickleLengthMeters ==
+        Catch::Approx(expected.trickleLengthMeters));
+    CHECK(
+        actual.trickleWidthMeters ==
+        Catch::Approx(expected.trickleWidthMeters));
+    CHECK(
+        actual.trickleFrontSoftness ==
+        Catch::Approx(expected.trickleFrontSoftness));
     CHECK(actual.blendMode == expected.blendMode);
     CHECK(actual.response.intensity == Catch::Approx(expected.response.intensity));
     CHECK(actual.response.emissionAdd == Catch::Approx(expected.response.emissionAdd));
@@ -194,6 +210,9 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     };
     document.waterSeepageLookProfiles.push_back(profile);
     document.waterScenarios = invisible_places::water::DefaultWaterScenarioDefinitions();
+    document.waterScenarios.front().state.seepageRainDelaySeconds = 8.0F;
+    document.waterScenarios.front().state.seepageRainRiseSeconds = 14.0F;
+    document.waterScenarios.front().state.seepageRainRecessionSeconds = 35.0F;
     document.selectedWaterScenarioId = "pre-colonisation-wet";
     const auto node = MakeNode();
     document.waterSeepageNodes.push_back(node);
@@ -215,6 +234,7 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     CHECK(savedJson.find("\"selected_water_scenario\": \"pre-colonisation-wet\"") != std::string::npos);
     CHECK(savedJson.find("\"pattern\": \"wet_rock_sheen\"") != std::string::npos);
     CHECK(savedJson.find("\"pattern\": \"chaotic_bloom\"") != std::string::npos);
+    CHECK(savedJson.find("\"pattern\": \"wetting_trickle\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"auto\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"low\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"balanced\"") != std::string::npos);
@@ -234,6 +254,15 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     CHECK(
         loaded->waterScenarios.front().state.seepageLook.pattern ==
         WaterSeepagePattern::ChaoticBloom);
+    CHECK(
+        loaded->waterScenarios.front().state.seepageRainDelaySeconds ==
+        Catch::Approx(8.0F));
+    CHECK(
+        loaded->waterScenarios.front().state.seepageRainRiseSeconds ==
+        Catch::Approx(14.0F));
+    CHECK(
+        loaded->waterScenarios.front().state.seepageRainRecessionSeconds ==
+        Catch::Approx(35.0F));
     REQUIRE(loaded->waterSeepageNodes.size() == 1U);
     CheckNode(loaded->waterSeepageNodes.front(), node);
     REQUIRE(loaded->waterSceneStates.size() == 1U);
@@ -343,6 +372,87 @@ TEST_CASE("Seepage looks without a pattern retain Legacy Ripples", "[water][seep
     CHECK(loaded->seepageDefaultLook.pattern == WaterSeepagePattern::LegacyRipples);
     CHECK(loaded->seepageDefaultLook.baseWetness == Catch::Approx(0.41F));
     CHECK(loaded->seepageDefaultLook.density == Catch::Approx(0.52F));
+    CHECK(loaded->seepageDefaultLook.tricklePatchSizeMeters == Catch::Approx(0.08F));
+    CHECK(loaded->seepageDefaultLook.trickleLengthMeters == Catch::Approx(0.35F));
+    CHECK(loaded->seepageDefaultLook.trickleWidthMeters == Catch::Approx(0.018F));
+    CHECK(loaded->seepageDefaultLook.trickleFrontSoftness == Catch::Approx(0.10F));
+    std::filesystem::remove(sourcesPath);
+}
+
+TEST_CASE(
+    "Previous Seepage schemas load trickle and Rain timing defaults",
+    "[water][seepage][serialization][migration]") {
+    const auto projectPath =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_seepage_project_v40.json";
+    {
+        std::ofstream output{projectPath};
+        output << R"({
+  "schema_version": 40,
+  "water_seepage_default_look": {"pattern": "chaotic_bloom"},
+  "water_scenarios": [{
+    "id": "prior-scenario",
+    "name": "Prior scenario",
+    "state": {"rain_level": 0.5}
+  }]
+})";
+    }
+
+    std::string errorMessage;
+    const auto loadedProject = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &errorMessage);
+    REQUIRE(loadedProject.has_value());
+    CHECK(
+        loadedProject->schemaVersion ==
+        invisible_places::serialization::kProjectDocumentSchemaVersion);
+    CHECK(
+        loadedProject->waterSeepageDefaultLook.pattern ==
+        WaterSeepagePattern::ChaoticBloom);
+    CHECK(
+        loadedProject->waterSeepageDefaultLook.tricklePatchSizeMeters ==
+        Catch::Approx(0.08F));
+    REQUIRE(loadedProject->waterScenarios.size() == 1U);
+    CHECK(
+        loadedProject->waterScenarios.front().state.seepageRainDelaySeconds ==
+        Catch::Approx(0.0F));
+    CHECK(
+        loadedProject->waterScenarios.front().state.seepageRainRiseSeconds ==
+        Catch::Approx(0.0F));
+    CHECK(
+        loadedProject->waterScenarios.front().state.seepageRainRecessionSeconds ==
+        Catch::Approx(0.0F));
+
+    const auto sourcesPath =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_seepage_sources_v16.json";
+    {
+        std::ofstream output{sourcesPath};
+        output << R"({
+  "schema_version": 16,
+  "water_seepage_default_look": {"pattern": "chaotic_bloom"}
+})";
+    }
+    const auto loadedSources =
+        invisible_places::serialization::LoadWaterSourcesDocument(
+            sourcesPath,
+            &errorMessage);
+    REQUIRE(loadedSources.has_value());
+    CHECK(loadedSources->schemaVersion == 16U);
+    CHECK(
+        loadedSources->seepageDefaultLook.pattern ==
+        WaterSeepagePattern::ChaoticBloom);
+    CHECK(
+        loadedSources->seepageDefaultLook.trickleLengthMeters ==
+        Catch::Approx(0.35F));
+    CHECK(
+        loadedSources->seepageDefaultLook.trickleWidthMeters ==
+        Catch::Approx(0.018F));
+    CHECK(
+        loadedSources->seepageDefaultLook.trickleFrontSoftness ==
+        Catch::Approx(0.10F));
+
+    std::filesystem::remove(projectPath);
     std::filesystem::remove(sourcesPath);
 }
 
@@ -357,6 +467,9 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
     track.fallbackScenario = definitions.front();
     auto startState = definitions.front().state;
     auto endState = definitions.back().state;
+    startState.seepageRainDelaySeconds = 4.0F;
+    startState.seepageRainRiseSeconds = 12.0F;
+    startState.seepageRainRecessionSeconds = 30.0F;
     endState.seepageLook.pattern = WaterSeepagePattern::WetRockSheen;
     track.keys = {
         {
@@ -372,6 +485,31 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
             .interpolation = invisible_places::water::WaterScenarioInterpolation::Hold,
         },
     };
+    invisible_places::water::WaterSeepageNodeTrack nodeTrack;
+    nodeTrack.nodeId = 47U;
+    nodeTrack.keys = {
+        {
+            .id = "node_wet",
+            .position = 0.80F,
+            .state = {
+                .activity = 0.90F,
+                .localSpread = 0.65F,
+                .wettingProgress = 1.0F,
+            },
+            .interpolation = invisible_places::water::WaterScenarioInterpolation::Hold,
+        },
+        {
+            .id = "node_dry",
+            .position = 0.20F,
+            .state = {
+                .activity = 0.15F,
+                .localSpread = 0.05F,
+                .wettingProgress = 0.10F,
+            },
+            .interpolation = invisible_places::water::WaterScenarioInterpolation::Linear,
+        },
+    };
+    track.seepageNodeTracks.push_back(nodeTrack);
     path.waterScenarioTracks.push_back(track);
 
     const auto outputPath =
@@ -379,11 +517,13 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
     std::string errorMessage;
     REQUIRE(invisible_places::serialization::SaveAnimationPath(path, outputPath, &errorMessage));
     const auto savedJson = ReadTextFile(outputPath);
-    CHECK(savedJson.find("\"schema_version\": 8") != std::string::npos);
+    CHECK(savedJson.find("\"schema_version\": 10") != std::string::npos);
     CHECK(savedJson.find("\"water_scenario_tracks\"") != std::string::npos);
     CHECK(savedJson.find("\"position\": 1.0") != std::string::npos);
     CHECK(savedJson.find("\"interpolation\": \"hold\"") != std::string::npos);
     CHECK(savedJson.find("\"fallback_scenario\"") != std::string::npos);
+    CHECK(savedJson.find("\"seepage_node_tracks\"") != std::string::npos);
+    CHECK(savedJson.find("\"seepage_rain_delay_seconds\"") != std::string::npos);
 
     const auto loaded = invisible_places::serialization::LoadAnimationPath(
         outputPath,
@@ -403,5 +543,80 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
         loadedTrack.keys.back().state.seepageLook.pattern ==
         WaterSeepagePattern::WetRockSheen);
     CHECK(loadedTrack.fallbackScenario.id == "pre-colonisation-wet");
+    CHECK(
+        loadedTrack.keys.front().state.seepageRainDelaySeconds ==
+        Catch::Approx(4.0F));
+    CHECK(
+        loadedTrack.keys.front().state.seepageRainRiseSeconds ==
+        Catch::Approx(12.0F));
+    CHECK(
+        loadedTrack.keys.front().state.seepageRainRecessionSeconds ==
+        Catch::Approx(30.0F));
+    REQUIRE(loadedTrack.seepageNodeTracks.size() == 1U);
+    const auto& loadedNodeTrack = loadedTrack.seepageNodeTracks.front();
+    CHECK(loadedNodeTrack.nodeId == 47U);
+    REQUIRE(loadedNodeTrack.keys.size() == 2U);
+    CHECK(loadedNodeTrack.keys.front().id == "node_dry");
+    CHECK(loadedNodeTrack.keys.front().position == Catch::Approx(0.20F));
+    CHECK(loadedNodeTrack.keys.front().state.activity == Catch::Approx(0.15F));
+    CHECK(loadedNodeTrack.keys.front().state.localSpread == Catch::Approx(0.05F));
+    CHECK(loadedNodeTrack.keys.front().state.wettingProgress == Catch::Approx(0.10F));
+    CHECK(
+        loadedNodeTrack.keys.front().interpolation ==
+        invisible_places::water::WaterScenarioInterpolation::Linear);
+    CHECK(loadedNodeTrack.keys.back().id == "node_wet");
+    CHECK(loadedNodeTrack.keys.back().state.activity == Catch::Approx(0.90F));
+    CHECK(loadedNodeTrack.keys.back().state.localSpread == Catch::Approx(0.65F));
+    CHECK(loadedNodeTrack.keys.back().state.wettingProgress == Catch::Approx(1.0F));
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE(
+    "Schema-nine animations default missing Seepage node tracks and Rain timing",
+    "[water][seepage][serialization][animation][legacy]") {
+    const auto inputPath =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_legacy_seepage_animation_v9.json";
+    {
+        std::ofstream output{inputPath};
+        output << R"({
+  "schema_version": 9,
+  "name": "Legacy static seepage",
+  "water_scenario_tracks": [{
+    "scenario_id": "legacy",
+    "fallback_scenario": {
+      "id": "legacy",
+      "state": {"rain_level": 0.6}
+    },
+    "keys": [{
+      "id": "legacy_key",
+      "position": 0.5,
+      "state": {"rain_level": 0.8}
+    }]
+  }]
+})";
+    }
+
+    std::string errorMessage;
+    const auto loaded = invisible_places::serialization::LoadAnimationPath(
+        inputPath,
+        &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->waterScenarioTracks.size() == 1U);
+    const auto& track = loaded->waterScenarioTracks.front();
+    CHECK(track.seepageNodeTracks.empty());
+    CHECK(
+        track.fallbackScenario.state.seepageRainDelaySeconds ==
+        Catch::Approx(0.0F));
+    CHECK(
+        track.fallbackScenario.state.seepageRainRiseSeconds ==
+        Catch::Approx(0.0F));
+    CHECK(
+        track.fallbackScenario.state.seepageRainRecessionSeconds ==
+        Catch::Approx(0.0F));
+    REQUIRE(track.keys.size() == 1U);
+    CHECK(track.keys.front().state.seepageRainDelaySeconds == Catch::Approx(0.0F));
+    CHECK(track.keys.front().state.seepageRainRiseSeconds == Catch::Approx(0.0F));
+    CHECK(track.keys.front().state.seepageRainRecessionSeconds == Catch::Approx(0.0F));
+    std::filesystem::remove(inputPath);
 }

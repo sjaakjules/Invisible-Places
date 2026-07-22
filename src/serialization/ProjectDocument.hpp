@@ -19,8 +19,8 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 38U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 14U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 41U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 17U;
 
 enum class SerializedLayerKind {
     PointCloud,
@@ -150,7 +150,7 @@ struct ProjectDocument {
         invisible_places::renderer::pointcloud::PointCloudRendererMode::Beauty;
     invisible_places::output::RenderJobSettings renderJobSettings{};
     std::vector<invisible_places::output::ExportPreset> exportPresets;
-    std::string selectedExportPresetName = std::string{invisible_places::output::kFastPreviewMp4PresetName};
+    std::string selectedExportPresetName = std::string{invisible_places::output::kMp4PresetName};
     std::optional<invisible_places::output::ExportPreset> tempExportPreset;
     std::vector<invisible_places::water::WaterEmitter> waterEmitters;
     std::vector<invisible_places::water::WaterManualFlowPathSource> waterManualFlowPaths;

@@ -88,6 +88,9 @@ using invisible_places::water::WaterScaleMode;
 using invisible_places::water::WaterSeepageLookProfile;
 using invisible_places::water::WaterSeepageLookSettings;
 using invisible_places::water::WaterSeepageNode;
+using invisible_places::water::WaterSeepageNodeAnimationState;
+using invisible_places::water::WaterSeepageNodeKey;
+using invisible_places::water::WaterSeepageNodeTrack;
 using invisible_places::water::WaterSeepagePattern;
 using invisible_places::water::WaterSeepageQuality;
 using invisible_places::water::WaterScenarioDefinition;
@@ -102,6 +105,8 @@ using invisible_places::water::WaterTrailGeometrySettings;
 using invisible_places::water::WaterVisualSettings;
 
 constexpr std::uintmax_t kLargeJsonRippleCacheStripBytes = 32ULL * 1024ULL * 1024ULL;
+constexpr std::uint32_t kManualFlowSurfaceGuideProjectSchemaVersion = 40U;
+constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 
 constexpr std::string_view kProjectVisualEditedSuffix = "_edited";
 constexpr std::string_view kProjectVisualLegacyEditedSuffix = "_Edited";
@@ -2068,7 +2073,7 @@ WaterScenarioTrack ParseWaterScenarioTrack(const json& trackJson);
 
 json SerializeAnimationPath(const AnimationPath& path) {
     json pathJson{
-        {"schema_version", 8U},
+        {"schema_version", 10U},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
         {"associated_layer_paths", SerializePathArray(path.associatedLayerPaths)},
@@ -2277,12 +2282,18 @@ const char* AnimationExportModeName(AnimationExportMode mode) {
             return "hevc_alpha_mp4";
         case AnimationExportMode::PngStack:
             return "png_stack";
+        case AnimationExportMode::FastPngStack:
+            return "fast_png_stack";
         case AnimationExportMode::HqPreviewDensityExr:
             return "hq_preview_density_exr";
         case AnimationExportMode::ProRes422Mov:
             return "prores_422_mov";
         case AnimationExportMode::ProRes422HqMov:
             return "prores_422_hq_mov";
+        case AnimationExportMode::ProRes422AlphaMatteMov:
+            return "prores_422_alpha_matte_mov";
+        case AnimationExportMode::ProRes422HqAlphaMatteMov:
+            return "prores_422_hq_alpha_matte_mov";
         case AnimationExportMode::ProRes422VideoToolboxMov:
             return "prores_422_videotoolbox_mov";
         case AnimationExportMode::ProRes422HqVideoToolboxMov:
@@ -2300,6 +2311,29 @@ const char* AnimationExportModeName(AnimationExportMode mode) {
     return "fast_preview_mp4";
 }
 
+const char* AnimationExportQualityName(invisible_places::output::AnimationExportQuality quality) {
+    switch (quality) {
+        case invisible_places::output::AnimationExportQuality::Normal:
+            return "normal";
+        case invisible_places::output::AnimationExportQuality::Hq:
+            return "hq";
+        case invisible_places::output::AnimationExportQuality::Xq:
+            return "xq";
+    }
+    return "normal";
+}
+
+invisible_places::output::AnimationExportQuality ParseAnimationExportQuality(const json& qualityJson) {
+    const auto quality = qualityJson.is_string() ? qualityJson.get<std::string>() : std::string{"normal"};
+    if (quality == "hq" || quality == "high" || quality == "high_quality") {
+        return invisible_places::output::AnimationExportQuality::Hq;
+    }
+    if (quality == "xq" || quality == "extra_quality" || quality == "maximum") {
+        return invisible_places::output::AnimationExportQuality::Xq;
+    }
+    return invisible_places::output::AnimationExportQuality::Normal;
+}
+
 AnimationExportMode ParseAnimationExportMode(const json& modeJson) {
     const auto mode = modeJson.is_string()
                           ? modeJson.get<std::string>()
@@ -2313,11 +2347,26 @@ AnimationExportMode ParseAnimationExportMode(const json& modeJson) {
     if (mode == "png_stack" || mode == "png_sequence") {
         return AnimationExportMode::PngStack;
     }
+    if (mode == "fast_png_stack" || mode == "fast_png_sequence") {
+        return AnimationExportMode::FastPngStack;
+    }
     if (mode == "prores_422_mov" || mode == "prores_422") {
         return AnimationExportMode::ProRes422Mov;
     }
     if (mode == "prores_422_hq_mov" || mode == "prores_422_hq") {
         return AnimationExportMode::ProRes422HqMov;
+    }
+    if (mode == "prores_422_alpha_matte_mov" ||
+        mode == "prores_422_alpha_matte" ||
+        mode == "prores_422_alpha_mov" ||
+        mode == "prores_422_alpha") {
+        return AnimationExportMode::ProRes422AlphaMatteMov;
+    }
+    if (mode == "prores_422_hq_alpha_matte_mov" ||
+        mode == "prores_422_hq_alpha_matte" ||
+        mode == "prores_422_hq_alpha_mov" ||
+        mode == "prores_422_hq_alpha") {
+        return AnimationExportMode::ProRes422HqAlphaMatteMov;
     }
     if (mode == "prores_422_videotoolbox_mov" || mode == "prores_422_videotoolbox") {
         return AnimationExportMode::ProRes422VideoToolboxMov;
@@ -2344,6 +2393,9 @@ json SerializeExportPreset(const ExportPreset& preset) {
     return json{
         {"name", preset.name},
         {"mode", AnimationExportModeName(preset.mode)},
+        {"quality", AnimationExportQualityName(preset.quality)},
+        {"use_video_toolbox", preset.useVideoToolbox},
+        {"external_alpha_matte", preset.externalAlphaMatte},
         {"settings", SerializeRenderJobSettings(preset.settings)},
     };
 }
@@ -2354,10 +2406,15 @@ ExportPreset ParseExportPreset(const json& presetJson) {
     if (presetJson.contains("mode")) {
         preset.mode = ParseAnimationExportMode(presetJson.at("mode"));
     }
+    if (presetJson.contains("quality")) {
+        preset.quality = ParseAnimationExportQuality(presetJson.at("quality"));
+    }
+    preset.useVideoToolbox = presetJson.value("use_video_toolbox", preset.useVideoToolbox);
+    preset.externalAlphaMatte = presetJson.value("external_alpha_matte", preset.externalAlphaMatte);
     if (presetJson.contains("settings")) {
         preset.settings = ParseRenderJobSettings(presetJson.at("settings"));
     }
-    return preset;
+    return invisible_places::output::NormalizeExportPresetForCurrentSchema(std::move(preset));
 }
 
 json SerializeSavedAnimation(const ProjectDocument::SavedAnimation& animation) {
@@ -2459,6 +2516,11 @@ json SerializeWaterEmitter(const WaterEmitter& emitter) {
         {"path_profile", emitter.pathProfileName},
         {"lane_profile", emitter.laneProfileName},
         {"trail_profile", emitter.trailProfileName},
+        {"path_profile_locked", emitter.pathProfileLocked},
+        {"lane_profile_locked", emitter.laneProfileLocked},
+        {"trail_profile_locked", emitter.trailProfileLocked},
+        {"maximum_flow_strength", emitter.maximumFlowStrength},
+        {"rain_response", emitter.rainResponse},
     };
     if (emitter.parentId.has_value()) {
         emitterJson["parent_id"] = emitter.parentId.value();
@@ -2500,6 +2562,17 @@ WaterEmitter ParseWaterEmitter(const json& emitterJson) {
     emitter.pathProfileName = emitterJson.value("path_profile", emitter.pathProfileName);
     emitter.laneProfileName = emitterJson.value("lane_profile", emitter.laneProfileName);
     emitter.trailProfileName = emitterJson.value("trail_profile", emitter.trailProfileName);
+    emitter.pathProfileLocked = emitterJson.value("path_profile_locked", emitter.pathProfileLocked);
+    emitter.laneProfileLocked = emitterJson.value("lane_profile_locked", emitter.laneProfileLocked);
+    emitter.trailProfileLocked = emitterJson.value("trail_profile_locked", emitter.trailProfileLocked);
+    emitter.maximumFlowStrength = std::clamp(
+        emitterJson.value("maximum_flow_strength", emitter.maximumFlowStrength),
+        0.0F,
+        1.0F);
+    emitter.rainResponse = std::clamp(
+        emitterJson.value("rain_response", emitter.rainResponse),
+        0.0F,
+        1.0F);
     if (emitterJson.contains("parent_id")) {
         emitter.parentId = emitterJson.at("parent_id").get<std::uint32_t>();
     }
@@ -2534,6 +2607,11 @@ json SerializeWaterManualFlowPath(const WaterManualFlowPathSource& source) {
         {"name", source.name},
         {"lane_profile", source.laneProfileName},
         {"trail_profile", source.trailProfileName},
+        {"lane_profile_locked", source.laneProfileLocked},
+        {"trail_profile_locked", source.trailProfileLocked},
+        {"use_surface_guide", source.useSurfaceGuide},
+        {"maximum_flow_strength", source.maximumFlowStrength},
+        {"rain_response", source.rainResponse},
         {"control_points", json::array()},
     };
     for (const auto& point : source.controlPoints) {
@@ -2542,12 +2620,25 @@ json SerializeWaterManualFlowPath(const WaterManualFlowPathSource& source) {
     return sourceJson;
 }
 
-WaterManualFlowPathSource ParseWaterManualFlowPath(const json& sourceJson) {
+WaterManualFlowPathSource ParseWaterManualFlowPath(
+    const json& sourceJson,
+    bool defaultUseSurfaceGuide) {
     WaterManualFlowPathSource source;
     source.id = sourceJson.value("id", source.id);
     source.name = sourceJson.value("name", source.name);
     source.laneProfileName = sourceJson.value("lane_profile", source.laneProfileName);
     source.trailProfileName = sourceJson.value("trail_profile", source.trailProfileName);
+    source.laneProfileLocked = sourceJson.value("lane_profile_locked", source.laneProfileLocked);
+    source.trailProfileLocked = sourceJson.value("trail_profile_locked", source.trailProfileLocked);
+    source.useSurfaceGuide = sourceJson.value("use_surface_guide", defaultUseSurfaceGuide);
+    source.maximumFlowStrength = std::clamp(
+        sourceJson.value("maximum_flow_strength", source.maximumFlowStrength),
+        0.0F,
+        1.0F);
+    source.rainResponse = std::clamp(
+        sourceJson.value("rain_response", source.rainResponse),
+        0.0F,
+        1.0F);
     if (sourceJson.contains("control_points") && sourceJson.at("control_points").is_array()) {
         for (const auto& pointJson : sourceJson.at("control_points")) {
             if (!pointJson.is_array() || pointJson.size() != 3U) {
@@ -2783,6 +2874,8 @@ const char* WaterSeepagePatternName(WaterSeepagePattern pattern) {
             return "wet_rock_sheen";
         case WaterSeepagePattern::ChaoticBloom:
             return "chaotic_bloom";
+        case WaterSeepagePattern::WettingTrickle:
+            return "wetting_trickle";
     }
     return "legacy_ripples";
 }
@@ -2797,6 +2890,9 @@ WaterSeepagePattern ParseWaterSeepagePattern(const json& patternJson) {
     }
     if (name == "chaotic_bloom") {
         return WaterSeepagePattern::ChaoticBloom;
+    }
+    if (name == "wetting_trickle") {
+        return WaterSeepagePattern::WettingTrickle;
     }
     return WaterSeepagePattern::LegacyRipples;
 }
@@ -2827,6 +2923,10 @@ json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings)
         {"curl", settings.curl},
         {"breakup", settings.breakup},
         {"downhill_drift_meters_per_second", settings.downhillDriftMetersPerSecond},
+        {"trickle_patch_size_meters", settings.tricklePatchSizeMeters},
+        {"trickle_length_meters", settings.trickleLengthMeters},
+        {"trickle_width_meters", settings.trickleWidthMeters},
+        {"trickle_front_softness", settings.trickleFrontSoftness},
         {"blend_mode", WaterEffectBlendModeName(settings.blendMode)},
         {"response", SerializeWaterEffectResponseSettings(settings.response)},
     };
@@ -2873,6 +2973,18 @@ WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson)
     settings.downhillDriftMetersPerSecond = settingsJson.value(
         "downhill_drift_meters_per_second",
         settings.downhillDriftMetersPerSecond);
+    settings.tricklePatchSizeMeters = settingsJson.value(
+        "trickle_patch_size_meters",
+        settings.tricklePatchSizeMeters);
+    settings.trickleLengthMeters = settingsJson.value(
+        "trickle_length_meters",
+        settings.trickleLengthMeters);
+    settings.trickleWidthMeters = settingsJson.value(
+        "trickle_width_meters",
+        settings.trickleWidthMeters);
+    settings.trickleFrontSoftness = settingsJson.value(
+        "trickle_front_softness",
+        settings.trickleFrontSoftness);
     if (settingsJson.contains("blend_mode")) {
         settings.blendMode = ParseWaterEffectBlendMode(settingsJson.at("blend_mode"));
     }
@@ -2930,6 +3042,10 @@ json SerializeWaterScenarioState(const WaterScenarioState& state) {
         {"seepage_level", state.seepageLevel},
         {"seepage_spread", state.seepageSpread},
         {"rain_level", state.rainLevel},
+        {"flow_level", state.flowLevel},
+        {"seepage_rain_delay_seconds", state.seepageRainDelaySeconds},
+        {"seepage_rain_rise_seconds", state.seepageRainRiseSeconds},
+        {"seepage_rain_recession_seconds", state.seepageRainRecessionSeconds},
     };
 }
 
@@ -2941,9 +3057,26 @@ WaterScenarioState ParseWaterScenarioState(const json& stateJson) {
     state.seepageLevel = stateJson.value("seepage_level", state.seepageLevel);
     state.seepageSpread = stateJson.value("seepage_spread", state.seepageSpread);
     state.rainLevel = stateJson.value("rain_level", state.rainLevel);
+    state.flowLevel = stateJson.value("flow_level", state.flowLevel);
+    state.seepageRainDelaySeconds = stateJson.value(
+        "seepage_rain_delay_seconds",
+        state.seepageRainDelaySeconds);
+    state.seepageRainRiseSeconds = stateJson.value(
+        "seepage_rain_rise_seconds",
+        state.seepageRainRiseSeconds);
+    state.seepageRainRecessionSeconds = stateJson.value(
+        "seepage_rain_recession_seconds",
+        state.seepageRainRecessionSeconds);
     state.seepageLevel = std::clamp(state.seepageLevel, 0.0F, 1.0F);
     state.seepageSpread = std::clamp(state.seepageSpread, 0.0F, 1.0F);
     state.rainLevel = std::clamp(state.rainLevel, 0.0F, 1.0F);
+    state.flowLevel = std::clamp(state.flowLevel, 0.0F, 1.0F);
+    state.seepageRainDelaySeconds =
+        std::clamp(state.seepageRainDelaySeconds, 0.0F, 86'400.0F);
+    state.seepageRainRiseSeconds =
+        std::clamp(state.seepageRainRiseSeconds, 0.0F, 86'400.0F);
+    state.seepageRainRecessionSeconds =
+        std::clamp(state.seepageRainRecessionSeconds, 0.0F, 86'400.0F);
     return state;
 }
 
@@ -2987,15 +3120,97 @@ WaterScenarioKey ParseWaterScenarioKey(const json& keyJson) {
     return key;
 }
 
+json SerializeWaterSeepageNodeAnimationState(
+    const WaterSeepageNodeAnimationState& state) {
+    return json{
+        {"activity", std::clamp(state.activity, 0.0F, 1.0F)},
+        {"local_spread", std::clamp(state.localSpread, 0.0F, 1.0F)},
+        {"wetting_progress", std::clamp(state.wettingProgress, 0.0F, 1.0F)},
+    };
+}
+
+WaterSeepageNodeAnimationState ParseWaterSeepageNodeAnimationState(
+    const json& stateJson) {
+    WaterSeepageNodeAnimationState state;
+    state.activity = std::clamp(
+        stateJson.value("activity", state.activity),
+        0.0F,
+        1.0F);
+    state.localSpread = std::clamp(
+        stateJson.value("local_spread", state.localSpread),
+        0.0F,
+        1.0F);
+    state.wettingProgress = std::clamp(
+        stateJson.value("wetting_progress", state.wettingProgress),
+        0.0F,
+        1.0F);
+    return state;
+}
+
+json SerializeWaterSeepageNodeKey(const WaterSeepageNodeKey& key) {
+    return json{
+        {"id", key.id},
+        {"position", std::clamp(key.position, 0.0F, 1.0F)},
+        {"state", SerializeWaterSeepageNodeAnimationState(key.state)},
+        {"interpolation", WaterScenarioInterpolationName(key.interpolation)},
+    };
+}
+
+WaterSeepageNodeKey ParseWaterSeepageNodeKey(const json& keyJson) {
+    WaterSeepageNodeKey key;
+    key.id = keyJson.value("id", key.id);
+    key.position = std::clamp(keyJson.value("position", key.position), 0.0F, 1.0F);
+    if (keyJson.contains("state") && keyJson.at("state").is_object()) {
+        key.state = ParseWaterSeepageNodeAnimationState(keyJson.at("state"));
+    }
+    if (keyJson.contains("interpolation")) {
+        key.interpolation = ParseWaterScenarioInterpolation(keyJson.at("interpolation"));
+    }
+    return key;
+}
+
+json SerializeWaterSeepageNodeTrack(const WaterSeepageNodeTrack& track) {
+    json trackJson{
+        {"node_id", track.nodeId},
+        {"keys", json::array()},
+    };
+    for (const auto& key : track.keys) {
+        trackJson["keys"].push_back(SerializeWaterSeepageNodeKey(key));
+    }
+    return trackJson;
+}
+
+WaterSeepageNodeTrack ParseWaterSeepageNodeTrack(const json& trackJson) {
+    WaterSeepageNodeTrack track;
+    track.nodeId = trackJson.value("node_id", track.nodeId);
+    if (trackJson.contains("keys") && trackJson.at("keys").is_array()) {
+        for (const auto& keyJson : trackJson.at("keys")) {
+            track.keys.push_back(ParseWaterSeepageNodeKey(keyJson));
+        }
+        std::stable_sort(
+            track.keys.begin(),
+            track.keys.end(),
+            [](const WaterSeepageNodeKey& left, const WaterSeepageNodeKey& right) {
+                return left.position < right.position;
+            });
+    }
+    return track;
+}
+
 json SerializeWaterScenarioTrack(const WaterScenarioTrack& track) {
     json trackJson{
         {"scenario_id", track.scenarioId},
         {"scenario_name", track.scenarioName},
         {"fallback_scenario", SerializeWaterScenarioDefinition(track.fallbackScenario)},
         {"keys", json::array()},
+        {"seepage_node_tracks", json::array()},
     };
     for (const auto& key : track.keys) {
         trackJson["keys"].push_back(SerializeWaterScenarioKey(key));
+    }
+    for (const auto& nodeTrack : track.seepageNodeTracks) {
+        trackJson["seepage_node_tracks"].push_back(
+            SerializeWaterSeepageNodeTrack(nodeTrack));
     }
     return trackJson;
 }
@@ -3017,6 +3232,13 @@ WaterScenarioTrack ParseWaterScenarioTrack(const json& trackJson) {
             [](const WaterScenarioKey& left, const WaterScenarioKey& right) {
                 return left.position < right.position;
             });
+    }
+    if (trackJson.contains("seepage_node_tracks") &&
+        trackJson.at("seepage_node_tracks").is_array()) {
+        for (const auto& nodeTrackJson : trackJson.at("seepage_node_tracks")) {
+            track.seepageNodeTracks.push_back(
+                ParseWaterSeepageNodeTrack(nodeTrackJson));
+        }
     }
     return track;
 }
@@ -3408,6 +3630,10 @@ json SerializeWaterFlowTrailSettings(const WaterFlowTrailSettings& settings) {
         {"trail_smoothness", settings.trailSmoothness},
         {"trail_looseness", settings.trailLooseness},
         {"turbulence", settings.turbulence},
+        {"surface_follow", settings.surfaceFollow},
+        {"downhill_pull", settings.downhillPull},
+        {"terrain_width_response", settings.terrainWidthResponse},
+        {"turbulence_scale_meters", settings.turbulenceScaleMeters},
         {"speed_meters_per_second", settings.speedMetersPerSecond},
         {"seed", settings.seed},
     };
@@ -3443,6 +3669,34 @@ WaterFlowTrailSettings ParseWaterFlowTrailSettings(const json& settingsJson) {
         "trail_looseness",
         settingsJson.value("stream_looseness", settings.trailLooseness));
     settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
+    if (settingsJson.contains("surface_follow")) {
+        settings.surfaceFollow = std::clamp(
+            ParseFiniteFloat(settingsJson.at("surface_follow"), settings.surfaceFollow),
+            0.0F,
+            1.0F);
+    }
+    if (settingsJson.contains("downhill_pull")) {
+        settings.downhillPull = std::clamp(
+            ParseFiniteFloat(settingsJson.at("downhill_pull"), settings.downhillPull),
+            0.0F,
+            1.0F);
+    }
+    if (settingsJson.contains("terrain_width_response")) {
+        settings.terrainWidthResponse = std::clamp(
+            ParseFiniteFloat(
+                settingsJson.at("terrain_width_response"),
+                settings.terrainWidthResponse),
+            0.0F,
+            1.0F);
+    }
+    if (settingsJson.contains("turbulence_scale_meters")) {
+        settings.turbulenceScaleMeters = std::clamp(
+            ParseFiniteFloat(
+                settingsJson.at("turbulence_scale_meters"),
+                settings.turbulenceScaleMeters),
+            0.005F,
+            100.0F);
+    }
     settings.speedMetersPerSecond = settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond);
     settings.seed = settingsJson.value("seed", settings.seed);
     return settings;
@@ -3809,7 +4063,9 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
     return stateJson;
 }
 
-WaterSceneStateDocument ParseWaterSceneState(const json& stateJson) {
+WaterSceneStateDocument ParseWaterSceneState(
+    const json& stateJson,
+    bool defaultUseSurfaceGuide) {
     WaterSceneStateDocument state;
     state.sceneGroupName = stateJson.value("scene_group", state.sceneGroupName);
     if (state.sceneGroupName.empty()) {
@@ -3824,7 +4080,8 @@ WaterSceneStateDocument ParseWaterSceneState(const json& stateJson) {
     if (stateJson.contains("water_manual_flow_paths") &&
         stateJson.at("water_manual_flow_paths").is_array()) {
         for (const auto& sourceJson : stateJson.at("water_manual_flow_paths")) {
-            state.manualFlowPaths.push_back(ParseWaterManualFlowPath(sourceJson));
+            state.manualFlowPaths.push_back(
+                ParseWaterManualFlowPath(sourceJson, defaultUseSurfaceGuide));
         }
     }
     if (stateJson.contains("water_seepage_nodes") &&
@@ -5088,6 +5345,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
 
     ProjectDocument document;
     document.schemaVersion = projectJson->value("schema_version", 1U);
+    const bool defaultManualSurfaceGuide =
+        document.schemaVersion >= kManualFlowSurfaceGuideProjectSchemaVersion;
     document.projectName = projectJson->value("project_name", std::string{"Invisible Places"});
     document.selectedLayerPath = projectJson->value("selected_layer_path", std::string{});
     document.lastAnimationPath = projectJson->value("last_animation_path", std::string{});
@@ -5364,7 +5623,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     if (projectJson->contains("water_scene_states") && projectJson->at("water_scene_states").is_array()) {
         for (const auto& stateJson : projectJson->at("water_scene_states")) {
-            auto state = ParseWaterSceneState(stateJson);
+            auto state = ParseWaterSceneState(stateJson, defaultManualSurfaceGuide);
             if (WaterSceneStateHasPayload(state)) {
                 document.waterSceneStates.push_back(std::move(state));
             }
@@ -5542,7 +5801,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
         projectJson->contains("water_manual_flow_paths") &&
         projectJson->at("water_manual_flow_paths").is_array()) {
         for (const auto& sourceJson : projectJson->at("water_manual_flow_paths")) {
-            document.waterManualFlowPaths.push_back(ParseWaterManualFlowPath(sourceJson));
+            document.waterManualFlowPaths.push_back(
+                ParseWaterManualFlowPath(sourceJson, defaultManualSurfaceGuide));
         }
     }
     if (document.schemaVersion < kProjectDocumentSchemaVersion) {
@@ -5650,6 +5910,8 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
 
     WaterSourcesDocument document;
     document.schemaVersion = sourcesJson->value("schema_version", 1U);
+    const bool defaultManualSurfaceGuide =
+        document.schemaVersion >= kManualFlowSurfaceGuideSourcesSchemaVersion;
     if (sourcesJson->contains("water_source_settings")) {
         document.sourceSettings = ParseWaterSourceSettings(sourcesJson->at("water_source_settings"));
     }
@@ -5789,7 +6051,8 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_manual_flow_paths") &&
         sourcesJson->at("water_manual_flow_paths").is_array()) {
         for (const auto& sourceJson : sourcesJson->at("water_manual_flow_paths")) {
-            document.manualFlowPaths.push_back(ParseWaterManualFlowPath(sourceJson));
+            document.manualFlowPaths.push_back(
+                ParseWaterManualFlowPath(sourceJson, defaultManualSurfaceGuide));
         }
     }
     if (sourcesJson->contains("water_seepage_nodes") &&
