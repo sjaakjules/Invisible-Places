@@ -1,0 +1,221 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "water_flow_gpu_common.glsl"
+
+float FlowRouteField(uint slot, uint routeStart, uint lowerSample, uint upperSample, float amount) {
+    return mix(
+        FlowLoadField(slot, routeStart + lowerSample),
+        FlowLoadField(slot, routeStart + upperSample),
+        amount);
+}
+
+float FlowTrailEndpointFade(
+    float distanceMeters,
+    float routeLengthMeters) {
+    const float routeLength = max(routeLengthMeters, 1e-5);
+    const float fadeDistance = min(
+        routeLength * 0.25,
+        max(0.02, max(flow.lane0.w * 0.5, flow.trail0.y * 2.0)));
+    return smoothstep(
+        0.0,
+        fadeDistance,
+        max(0.0, min(distanceMeters, routeLength - distanceMeters)));
+}
+
+void main() {
+    const uint branchIndex = gl_WorkGroupID.y;
+    const uint localTrailIndex = gl_GlobalInvocationID.x;
+    if (branchIndex >= flow.counts0.y || flow.counts1.y < 2u) {
+        return;
+    }
+    const WaterFlowBranch branch = flowBranches.branches[branchIndex];
+    const uint activeRouteLaneCount = branch.trailLane.x;
+    const uint branchTrailCount = branch.trailLane.z;
+    const uint routePointCount = branch.inputRoute.w;
+    const uint potentialLaneCount = branch.identity.x;
+    if (localTrailIndex >= branchTrailCount || activeRouteLaneCount == 0u ||
+        routePointCount < 2u || potentialLaneCount == 0u) {
+        return;
+    }
+
+    const uint branchId = branch.identity.y;
+    const uint pathId = branch.identity.z;
+    const float routeLength = branch.metrics.x;
+    const uint trailId = branch.trailLane.w + localTrailIndex;
+    const uint regionSeed = flow.metadata.x + branchId;
+    const bool positiveSideFirst =
+        FlowHash01(regionSeed, pathId, 7005u) >= 0.5;
+    const uint laneIndex =
+        FlowCenteredLaneIndex(localTrailIndex, potentialLaneCount, positiveSideFirst);
+    const uint routeLaneOrdinal = localTrailIndex % activeRouteLaneCount;
+    const uint routeStart =
+        branch.inputRoute.z + routeLaneOrdinal * routePointCount;
+    const uint outputStart = branch.trailLane.y + localTrailIndex * flow.counts1.y;
+    const float trailSeed = FlowHash01(regionSeed, trailId, 7001u);
+    const float laneSeed = FlowHash01(regionSeed, trailId, 7003u);
+    const float laneJitterSeed = FlowHash01(regionSeed, trailId, 7011u);
+    const float crossSeed = FlowHash01(regionSeed, trailId, 7027u);
+    const float trailAge = FlowHash01(regionSeed, trailId, 7019u);
+    const float startJitter = FlowHash01(regionSeed, trailId, 7009u);
+    const float crossing = clamp(flow.shape0.x, 0.0, 1.0);
+    const float maximumStartDistance = max(0.0, routeLength - flow.trail0.x);
+    const float startSlot =
+        (float(localTrailIndex) + startJitter) / float(max(1u, branchTrailCount));
+    const float startDistance = maximumStartDistance * clamp(startSlot, 0.0, 1.0);
+    const float startPhase = routeLength > 1e-5
+        ? fract(startDistance / routeLength)
+        : 0.0;
+    const float trailSpeed = max(0.01, flow.trail0.z * (0.72 + trailSeed * 0.58));
+    const float trailWidth = max(0.0005, flow.lane0.y * (0.80 + trailSeed * 0.42));
+    const float trailStreakLength =
+        max(trailWidth * 2.0, max(flow.trail0.w, flow.trail0.y * 2.5));
+
+    for (uint sampleIndex = 0u; sampleIndex < flow.counts1.y; ++sampleIndex) {
+        const uint outputIndex = outputStart + sampleIndex;
+        const float trailDistance = min(
+            flow.trail0.x,
+            float(sampleIndex) * flow.trail0.y);
+        const float pointAge = flow.trail0.x > 1e-5
+            ? trailDistance / flow.trail0.x
+            : 0.0;
+        const float pathDistance = min(routeLength, startDistance + trailDistance);
+        const float routeCoordinate = routeLength > 1e-5
+            ? pathDistance / routeLength * float(routePointCount - 1u)
+            : 0.0;
+        const uint lowerSample = min(uint(floor(routeCoordinate)), routePointCount - 1u);
+        const uint upperSample = min(lowerSample + 1u, routePointCount - 1u);
+        const float routeAmount = clamp(routeCoordinate - float(lowerSample), 0.0, 1.0);
+        vec3 position = mix(
+            flowPositions.positions[routeStart + lowerSample].xyz,
+            flowPositions.positions[routeStart + upperSample].xyz,
+            routeAmount);
+        const vec3 normal = FlowSafeNormalize(
+            mix(
+                flowNormals.normals[routeStart + lowerSample].xyz,
+                flowNormals.normals[routeStart + upperSample].xyz,
+                routeAmount),
+            vec3(0.0, 0.0, 1.0));
+        const vec3 tangent = FlowSafeNormalize(
+            vec3(
+                FlowRouteField(
+                    kTangentXFieldSlot,
+                    routeStart,
+                    lowerSample,
+                    upperSample,
+                    routeAmount),
+                FlowRouteField(
+                    kTangentYFieldSlot,
+                    routeStart,
+                    lowerSample,
+                    upperSample,
+                    routeAmount),
+                FlowRouteField(
+                    kTangentZFieldSlot,
+                    routeStart,
+                    lowerSample,
+                    upperSample,
+                    routeAmount)),
+            vec3(1.0, 0.0, 0.0));
+        const vec3 lateral = FlowSafeNormalize(
+            cross(normal, tangent),
+            FlowSafeNormalize(cross(vec3(0.0, 0.0, 1.0), tangent), vec3(1.0, 0.0, 0.0)));
+        const float routeLateralOffset = FlowRouteField(
+            kTrailLateralOffsetFieldSlot,
+            routeStart,
+            lowerSample,
+            upperSample,
+            routeAmount);
+        const float lanePitch = FlowRouteField(
+            kLanePitchFieldSlot,
+            routeStart,
+            lowerSample,
+            upperSample,
+            routeAmount);
+        const float laneSpan = FlowRouteField(
+            kLaneSpanFieldSlot,
+            routeStart,
+            lowerSample,
+            upperSample,
+            routeAmount);
+        const float laneCellWidth = potentialLaneCount > 0u
+            ? laneSpan / float(potentialLaneCount)
+            : 0.0;
+        const float laneJitterAmplitude = potentialLaneCount <= 1u || laneSpan <= 1e-6
+            ? 0.0
+            : min(lanePitch, laneCellWidth) * 0.18;
+        const float endpointFade = FlowTrailEndpointFade(pathDistance, routeLength);
+        const float laneJitter =
+            (laneJitterSeed - 0.5) * 2.0 * laneJitterAmplitude * endpointFade;
+        const float turbulenceDrive = sqrt(max(0.0, flow.lane0.z));
+        const float wobbleAmplitude = min(
+            laneSpan * 0.22,
+            laneSpan * (0.035 + clamp(flow.shape0.z, 0.0, 1.5) * 0.060) *
+                turbulenceDrive);
+        const float turbulenceCoordinate = pathDistance / max(flow.lane0.w, 0.005);
+        const float turbulenceNoise =
+            sin(6.28318530718 * (turbulenceCoordinate + trailSeed)) * 0.68 +
+            sin(6.28318530718 * (turbulenceCoordinate * 2.07 + laneSeed)) * 0.32;
+        const float wobble = turbulenceNoise * wobbleAmplitude *
+                             (1.0 - clamp(flow.shape0.y, 0.0, 1.0) * 0.45) *
+                             endpointFade;
+        const float additionalLateralOffset = laneJitter + wobble;
+        const float lateralOffset = routeLateralOffset + additionalLateralOffset;
+        position += lateral * additionalLateralOffset;
+        const float routeConfidence = FlowRouteField(
+            kTrailConfidenceFieldSlot,
+            routeStart,
+            lowerSample,
+            upperSample,
+            routeAmount);
+        const float routeWetness = FlowRouteField(
+            kWetnessFieldSlot,
+            routeStart,
+            lowerSample,
+            upperSample,
+            routeAmount);
+
+        flowPositions.positions[outputIndex] = vec4(position, 1.0);
+        flowNormals.normals[outputIndex] = vec4(normal, 0.0);
+        FlowClearFields(outputIndex);
+        FlowStoreField(kTrailRoleFieldSlot, outputIndex, 1.0);
+        FlowStoreField(kTrailIdFieldSlot, outputIndex, float(trailId));
+        FlowStoreField(kSourceIdFieldSlot, outputIndex, float(flow.identity.x));
+        FlowStoreField(kPathIdFieldSlot, outputIndex, float(pathId));
+        FlowStoreField(kBranchIdFieldSlot, outputIndex, float(branchId));
+        FlowStoreField(kTrailSeedFieldSlot, outputIndex, trailSeed);
+        FlowStoreField(
+            kPointSeedFieldSlot,
+            outputIndex,
+            FlowHash01(regionSeed, trailId + sampleIndex, 7013u));
+        FlowStoreField(kTrailDistanceFieldSlot, outputIndex, trailDistance);
+        FlowStoreField(kTrailLengthFieldSlot, outputIndex, flow.trail0.x);
+        FlowStoreField(kRouteStartFieldSlot, outputIndex, float(routeStart));
+        FlowStoreField(kRouteCountFieldSlot, outputIndex, float(routePointCount));
+        FlowStoreField(kRouteLengthFieldSlot, outputIndex, routeLength);
+        FlowStoreField(kTrailStartPhaseFieldSlot, outputIndex, startPhase);
+        FlowStoreField(kTrailLateralOffsetFieldSlot, outputIndex, lateralOffset);
+        FlowStoreField(kPointAgeFieldSlot, outputIndex, pointAge);
+        FlowStoreField(kTrailAgeFieldSlot, outputIndex, trailAge);
+        FlowStoreField(kTrailSpeedFieldSlot, outputIndex, trailSpeed);
+        FlowStoreField(kTrailWidthFieldSlot, outputIndex, trailWidth);
+        FlowStoreField(kTrailStreakLengthFieldSlot, outputIndex, trailStreakLength);
+        FlowStoreField(
+            kTrailConfidenceFieldSlot,
+            outputIndex,
+            clamp(routeConfidence * (0.72 + 0.28 * trailSeed), 0.0, 1.0));
+        FlowStoreField(kWetnessFieldSlot, outputIndex, clamp(routeWetness, 0.0, 1.0));
+        FlowStoreField(kFeatureTypeFieldSlot, outputIndex, 0.0);
+        FlowStoreField(kTangentXFieldSlot, outputIndex, tangent.x);
+        FlowStoreField(kTangentYFieldSlot, outputIndex, tangent.y);
+        FlowStoreField(kTangentZFieldSlot, outputIndex, tangent.z);
+        FlowStoreField(kLaneIndexFieldSlot, outputIndex, float(laneIndex));
+        FlowStoreField(kLaneCountFieldSlot, outputIndex, float(potentialLaneCount));
+        FlowStoreField(kLanePitchFieldSlot, outputIndex, lanePitch);
+        FlowStoreField(kLaneSpanFieldSlot, outputIndex, laneSpan);
+        FlowStoreField(kLaneCrossingFieldSlot, outputIndex, crossing);
+        FlowStoreField(kCrossSeedFieldSlot, outputIndex, crossSeed);
+    }
+}

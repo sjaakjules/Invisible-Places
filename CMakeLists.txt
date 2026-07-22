@@ -61,6 +61,9 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
     shaders/dynamic_mesh_flow.comp
+    shaders/water_flow_routes.comp
+    shaders/water_flow_trails.comp
+    shaders/water_surface_preprocess.comp
     shaders/rain_simulation.comp
     shaders/rain_particle.vert
     shaders/rain_particle.frag
@@ -80,6 +83,7 @@ set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_rain_impact.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water_flow_gpu_common.glsl"
 )
 
 set(INVISIBLE_PLACES_SHADER_OUTPUTS)
@@ -213,6 +217,7 @@ if(APPLE)
         invisible_places_core
         PRIVATE
             "-framework AppKit"
+            "-framework Accelerate"
             "-framework CoreFoundation"
             "-framework IOKit"
             "-framework QuartzCore"

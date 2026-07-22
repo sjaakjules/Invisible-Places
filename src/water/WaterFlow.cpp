@@ -2787,6 +2787,444 @@ WaterFlowTrailSettings ApplyWaterTrailGeometryToFlowTrailSettings(
     return settings;
 }
 
+WaterFlowGpuCompactInput BuildWaterFlowGpuSampledInput(
+    std::span<const WaterOverlayPoint> anchors) {
+    constexpr float kDuplicateDistance = 1.0e-5F;
+    WaterFlowGpuCompactInput input;
+    input.points.reserve(anchors.size());
+    for (const auto& anchor : anchors) {
+        const glm::vec3 position = ToGlm(anchor.position);
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(position.z)) {
+            continue;
+        }
+        if (!input.points.empty()) {
+            const glm::vec3 previous = ToGlm(input.points.back().position);
+            if (glm::length(position - previous) <= kDuplicateDistance) {
+                continue;
+            }
+        }
+        WaterFlowGpuCompactInputPoint point;
+        point.position = anchor.position;
+        point.normal = FromGlm(SafeOverlayNormal(ToGlm(anchor.normal)));
+        point.confidence = std::clamp(
+            std::isfinite(anchor.confidence) ? anchor.confidence : 1.0F,
+            0.0F,
+            1.0F);
+        input.points.push_back(point);
+    }
+
+    float cumulativeDistance = 0.0F;
+    for (std::size_t index = 0U; index + 1U < input.points.size(); ++index) {
+        auto& point = input.points[index];
+        point.cumulativeDistanceMeters = cumulativeDistance;
+        const float segmentLength = glm::length(
+            ToGlm(input.points[index + 1U].position) - ToGlm(point.position));
+        point.outgoingSegmentArcDistancesMeters = {
+            segmentLength * 0.25F,
+            segmentLength * 0.50F,
+            segmentLength * 0.75F,
+            segmentLength,
+        };
+        cumulativeDistance += segmentLength;
+    }
+    if (!input.points.empty()) {
+        input.points.back().cumulativeDistanceMeters = cumulativeDistance;
+    }
+    input.routeLengthMeters = cumulativeDistance;
+    return input;
+}
+
+WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
+    std::span<const invisible_places::io::Float3> controlPoints) {
+    constexpr float kDuplicateDistance = 1.0e-5F;
+    constexpr std::uint32_t kArcLengthSubdivisions = 16U;
+    constexpr std::uint32_t kSubdivisionsPerCheckpoint = 4U;
+    WaterFlowGpuCompactInput input;
+    input.points.reserve(controlPoints.size());
+    for (const auto& controlPoint : controlPoints) {
+        const glm::vec3 position = ToGlm(controlPoint);
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(position.z)) {
+            continue;
+        }
+        if (!input.points.empty()) {
+            const glm::vec3 previous = ToGlm(input.points.back().position);
+            if (glm::length(position - previous) <= kDuplicateDistance) {
+                continue;
+            }
+        }
+        WaterFlowGpuCompactInputPoint point;
+        point.position = controlPoint;
+        input.points.push_back(point);
+    }
+
+    float cumulativeDistance = 0.0F;
+    for (std::size_t segmentIndex = 0U;
+         segmentIndex + 1U < input.points.size();
+         ++segmentIndex) {
+        auto& point = input.points[segmentIndex];
+        point.cumulativeDistanceMeters = cumulativeDistance;
+        const glm::vec3 p1 = ToGlm(point.position);
+        const glm::vec3 p2 = ToGlm(input.points[segmentIndex + 1U].position);
+        const glm::vec3 p0 = segmentIndex > 0U
+                                 ? ToGlm(input.points[segmentIndex - 1U].position)
+                                 : p1 + (p1 - p2);
+        const glm::vec3 p3 = segmentIndex + 2U < input.points.size()
+                                 ? ToGlm(input.points[segmentIndex + 2U].position)
+                                 : p2 + (p2 - p1);
+        float segmentDistance = 0.0F;
+        glm::vec3 previousPosition = p1;
+        for (std::uint32_t step = 1U; step <= kArcLengthSubdivisions; ++step) {
+            const float amount = static_cast<float>(step) /
+                                 static_cast<float>(kArcLengthSubdivisions);
+            const glm::vec3 position = input.points.size() > 2U
+                                           ? InterpolateCentripetalCatmullRom(
+                                                 p0,
+                                                 p1,
+                                                 p2,
+                                                 p3,
+                                                 amount)
+                                           : glm::mix(p1, p2, amount);
+            segmentDistance += glm::length(position - previousPosition);
+            previousPosition = position;
+            if ((step % kSubdivisionsPerCheckpoint) == 0U) {
+                const std::size_t checkpoint =
+                    static_cast<std::size_t>(step / kSubdivisionsPerCheckpoint - 1U);
+                point.outgoingSegmentArcDistancesMeters[checkpoint] = segmentDistance;
+            }
+        }
+        cumulativeDistance += segmentDistance;
+    }
+    if (!input.points.empty()) {
+        input.points.back().cumulativeDistanceMeters = cumulativeDistance;
+    }
+    input.routeLengthMeters = cumulativeDistance;
+    return input;
+}
+
+bool WaterFlowGpuCompactSourceInput::Valid() const {
+    if (points.size() < 2U || branches.empty() ||
+        points.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    std::uint64_t expectedInputStart = 0U;
+    for (const auto& branch : branches) {
+        const std::uint64_t inputEnd =
+            static_cast<std::uint64_t>(branch.inputStart) + branch.inputCount;
+        if (branch.inputStart != expectedInputStart || branch.inputCount < 2U ||
+            inputEnd > points.size() || branch.pathId == 0U ||
+            !std::isfinite(branch.routeLengthMeters) ||
+            branch.routeLengthMeters <= 1.0e-5F ||
+            !std::isfinite(branch.allocationWeight) ||
+            branch.allocationWeight < 0.0F) {
+            return false;
+        }
+        expectedInputStart = inputEnd;
+    }
+    return expectedInputStart == points.size();
+}
+
+namespace {
+
+std::vector<std::uint32_t> AllocateExactTrailCountsForPaths(
+    const std::vector<float>& pathLengths,
+    const std::vector<float>& pathWeights,
+    std::uint32_t requestedTrailCount) {
+    std::vector<std::uint32_t> allocations(pathLengths.size(), 0U);
+    if (requestedTrailCount == 0U || pathLengths.empty()) {
+        return allocations;
+    }
+
+    struct Candidate {
+        std::size_t index = 0U;
+        float weight = 0.0F;
+        double remainder = 0.0;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(pathLengths.size());
+    for (std::size_t index = 0U; index < pathLengths.size(); ++index) {
+        const float length = pathLengths[index];
+        if (length <= 1.0e-5F) {
+            continue;
+        }
+        const float weight =
+            index < pathWeights.size() ? std::max(0.0F, pathWeights[index]) : length;
+        candidates.push_back({
+            .index = index,
+            .weight = weight > 1.0e-5F ? weight : length,
+        });
+    }
+    if (candidates.empty()) {
+        return allocations;
+    }
+
+    const auto byWeight = [](const Candidate& left, const Candidate& right) {
+        if (left.weight != right.weight) {
+            return left.weight > right.weight;
+        }
+        return left.index < right.index;
+    };
+    std::sort(candidates.begin(), candidates.end(), byWeight);
+
+    const std::uint32_t initiallyAssigned = std::min<std::uint32_t>(
+        requestedTrailCount,
+        static_cast<std::uint32_t>(candidates.size()));
+    for (std::uint32_t index = 0U; index < initiallyAssigned; ++index) {
+        allocations[candidates[index].index] = 1U;
+    }
+    if (initiallyAssigned == requestedTrailCount) {
+        return allocations;
+    }
+
+    const std::uint32_t remaining = requestedTrailCount - initiallyAssigned;
+    double totalWeight = 0.0;
+    for (const auto& candidate : candidates) {
+        totalWeight += static_cast<double>(std::max(candidate.weight, 0.0F));
+    }
+    if (totalWeight <= 1.0e-9) {
+        totalWeight = static_cast<double>(candidates.size());
+        for (auto& candidate : candidates) {
+            candidate.weight = 1.0F;
+        }
+    }
+
+    std::uint32_t assignedExtra = 0U;
+    for (auto& candidate : candidates) {
+        const double exactShare =
+            (static_cast<double>(remaining) * static_cast<double>(candidate.weight)) /
+            totalWeight;
+        const auto extra = static_cast<std::uint32_t>(std::floor(exactShare));
+        allocations[candidate.index] += extra;
+        assignedExtra += extra;
+        candidate.remainder = exactShare - static_cast<double>(extra);
+    }
+
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const Candidate& left, const Candidate& right) {
+            if (left.remainder != right.remainder) {
+                return left.remainder > right.remainder;
+            }
+            if (left.weight != right.weight) {
+                return left.weight > right.weight;
+            }
+            return left.index < right.index;
+        });
+    for (std::uint32_t index = 0U; assignedExtra < remaining; ++index, ++assignedExtra) {
+        allocations[candidates[index % candidates.size()].index] += 1U;
+    }
+    return allocations;
+}
+
+std::uint32_t WaterFlowGpuPotentialLaneCount(
+    const WaterFlowTrailSettings& settings) {
+    if (settings.laneCount > 0U) {
+        return settings.laneCount;
+    }
+    const float width = std::clamp(
+        std::isfinite(settings.trailWidthMeters) ? settings.trailWidthMeters : 0.006F,
+        0.0005F,
+        1.0F);
+    const float span = std::clamp(
+        std::isfinite(settings.laneSpreadMeters) ? settings.laneSpreadMeters : 0.12F,
+        0.0F,
+        100.0F);
+    const float lanePitch = std::max(width * 0.5F, 0.00025F);
+    const std::uint32_t automaticLaneCount = static_cast<std::uint32_t>(std::max(
+        1.0F,
+        std::ceil(span / lanePitch)));
+    return std::max(1U, automaticLaneCount);
+}
+
+std::uint32_t WaterFlowGpuRoutePointCount(float routeLengthMeters, float spacingMeters) {
+    const float requested = std::ceil(routeLengthMeters / spacingMeters) + 1.0F;
+    if (!std::isfinite(requested) || requested >= 8192.0F) {
+        return 8192U;
+    }
+    return static_cast<std::uint32_t>(std::max(2.0F, requested));
+}
+
+WaterFlowGpuOutputLayout BuildWaterFlowGpuOutputLayoutForBranches(
+    std::uint32_t inputPointCount,
+    std::span<const WaterFlowGpuCompactBranch> inputBranches,
+    const WaterFlowTrailSettings& settings,
+    std::uint32_t currentPointCapacity,
+    std::uint32_t maximumPointCapacity) {
+    WaterFlowGpuOutputLayout layout;
+    layout.inputPointCount = inputPointCount;
+    layout.branchCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        inputBranches.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    if (!settings.enabled || inputPointCount < 2U || inputBranches.empty() ||
+        inputBranches.size() > std::numeric_limits<std::uint32_t>::max() ||
+        settings.trailCountTotal == 0U || maximumPointCapacity == 0U) {
+        return layout;
+    }
+
+    const float spacing = std::clamp(
+        std::isfinite(settings.trailPointSpacingMeters)
+            ? settings.trailPointSpacingMeters
+            : 0.010F,
+        0.001F,
+        5.0F);
+    layout.laneCount = WaterFlowGpuPotentialLaneCount(settings);
+    layout.samplesPerTrail = std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(std::ceil(
+            std::clamp(
+                std::isfinite(settings.trailLengthMeters)
+                    ? settings.trailLengthMeters
+                    : 0.75F,
+                0.02F,
+                100.0F) /
+            spacing)) +
+            1U,
+        2U,
+        8192U);
+
+    std::vector<float> routeLengths;
+    std::vector<float> allocationWeights;
+    routeLengths.reserve(inputBranches.size());
+    allocationWeights.reserve(inputBranches.size());
+    double totalRouteLength = 0.0;
+    for (const auto& branch : inputBranches) {
+        const float routeLength =
+            std::isfinite(branch.routeLengthMeters)
+                ? std::max(0.0F, branch.routeLengthMeters)
+                : 0.0F;
+        routeLengths.push_back(routeLength);
+        allocationWeights.push_back(
+            std::isfinite(branch.allocationWeight)
+                ? std::max(0.0F, branch.allocationWeight)
+                : 0.0F);
+        totalRouteLength += routeLength;
+    }
+    layout.routeLengthMeters = static_cast<float>(std::min<double>(
+        totalRouteLength,
+        std::numeric_limits<float>::max()));
+    const auto trailAllocations = AllocateExactTrailCountsForPaths(
+        routeLengths,
+        allocationWeights,
+        settings.trailCountTotal);
+
+    layout.branches.reserve(inputBranches.size());
+    std::uint64_t routePointCount = 0U;
+    std::uint64_t allocatedTrailCount = 0U;
+    std::uint64_t firstTrailId = 1U;
+    for (std::size_t index = 0U; index < inputBranches.size(); ++index) {
+        const auto& inputBranch = inputBranches[index];
+        const std::uint32_t branchTrailCount = trailAllocations[index];
+        const std::uint32_t routePointsPerLane =
+            WaterFlowGpuRoutePointCount(routeLengths[index], spacing);
+        const std::uint32_t activeRouteLaneCount =
+            std::min(layout.laneCount, branchTrailCount);
+
+        WaterFlowGpuBranchLayout branch;
+        branch.inputStart = inputBranch.inputStart;
+        branch.inputCount = inputBranch.inputCount;
+        branch.routePointsPerLane = routePointsPerLane;
+        branch.activeRouteLaneCount = activeRouteLaneCount;
+        branch.trailCount = branchTrailCount;
+        branch.firstTrailId = static_cast<std::uint32_t>(firstTrailId);
+        branch.potentialLaneCount = layout.laneCount;
+        branch.branchId = inputBranch.branchId;
+        branch.pathId = inputBranch.pathId;
+        branch.routeLengthMeters = routeLengths[index];
+        branch.routeSpacingMeters = spacing;
+        layout.branches.push_back(branch);
+
+        routePointCount +=
+            static_cast<std::uint64_t>(routePointsPerLane) * activeRouteLaneCount;
+        allocatedTrailCount += branchTrailCount;
+        firstTrailId += branchTrailCount;
+        if (activeRouteLaneCount > 0U) {
+            layout.routePointCountPerLane =
+                std::max(layout.routePointCountPerLane, routePointsPerLane);
+        }
+        layout.maxActiveRouteLaneCount =
+            std::max(layout.maxActiveRouteLaneCount, activeRouteLaneCount);
+        layout.maxTrailsPerBranch =
+            std::max(layout.maxTrailsPerBranch, branchTrailCount);
+    }
+    if (allocatedTrailCount != settings.trailCountTotal ||
+        routePointCount > std::numeric_limits<std::uint32_t>::max()) {
+        return layout;
+    }
+
+    const std::uint64_t trailPointCount =
+        allocatedTrailCount * layout.samplesPerTrail;
+    const std::uint64_t pointCount = routePointCount + trailPointCount;
+    if (trailPointCount > std::numeric_limits<std::uint32_t>::max() ||
+        pointCount > maximumPointCapacity ||
+        pointCount > std::numeric_limits<std::uint32_t>::max()) {
+        return layout;
+    }
+    layout.routePointCountTotal = static_cast<std::uint32_t>(routePointCount);
+    layout.trailCount = static_cast<std::uint32_t>(allocatedTrailCount);
+    layout.trailPointCountTotal = static_cast<std::uint32_t>(trailPointCount);
+    layout.pointCount = static_cast<std::uint32_t>(pointCount);
+
+    std::uint32_t routeStart = 0U;
+    std::uint32_t trailOutputStart = layout.routePointCountTotal;
+    for (auto& branch : layout.branches) {
+        branch.routeStart = routeStart;
+        branch.trailOutputStart = trailOutputStart;
+        routeStart += branch.routePointsPerLane * branch.activeRouteLaneCount;
+        trailOutputStart += branch.trailCount * layout.samplesPerTrail;
+    }
+
+    if (currentPointCapacity >= layout.pointCount && currentPointCapacity <= maximumPointCapacity) {
+        layout.pointCapacity = currentPointCapacity;
+        return layout;
+    }
+    const std::uint32_t minimumCapacity = std::max(1024U, layout.pointCount);
+    layout.pointCapacity = std::bit_ceil(minimumCapacity);
+    if (layout.pointCapacity < minimumCapacity || layout.pointCapacity > maximumPointCapacity) {
+        layout.pointCapacity = maximumPointCapacity;
+    }
+    return layout;
+}
+
+}  // namespace
+
+WaterFlowGpuOutputLayout BuildWaterFlowGpuOutputLayout(
+    const WaterFlowGpuCompactSourceInput& input,
+    const WaterFlowTrailSettings& settings,
+    std::uint32_t currentPointCapacity,
+    std::uint32_t maximumPointCapacity) {
+    if (!input.Valid() || input.points.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return {};
+    }
+    return BuildWaterFlowGpuOutputLayoutForBranches(
+        static_cast<std::uint32_t>(input.points.size()),
+        input.branches,
+        settings,
+        currentPointCapacity,
+        maximumPointCapacity);
+}
+
+WaterFlowGpuOutputLayout BuildWaterFlowGpuOutputLayout(
+    std::uint32_t inputPointCount,
+    float routeLengthMeters,
+    const WaterFlowTrailSettings& settings,
+    std::uint32_t currentPointCapacity,
+    std::uint32_t maximumPointCapacity) {
+    WaterFlowGpuCompactBranch branch;
+    branch.inputCount = inputPointCount;
+    branch.pathId = 1U;
+    branch.routeLengthMeters =
+        std::isfinite(routeLengthMeters) ? std::max(0.0F, routeLengthMeters) : 0.0F;
+    branch.allocationWeight = branch.routeLengthMeters;
+    return BuildWaterFlowGpuOutputLayoutForBranches(
+        inputPointCount,
+        std::span<const WaterFlowGpuCompactBranch>{&branch, 1U},
+        settings,
+        currentPointCapacity,
+        maximumPointCapacity);
+}
+
 bool WaterTrailGeometryGenerationInputsEqual(
     const WaterTrailGeometrySettings& left,
     const WaterTrailGeometrySettings& right) {
@@ -2817,6 +3255,10 @@ bool WaterFlowLaneRouteInputsEqual(
            left.trailSmoothness == right.trailSmoothness &&
            left.trailLooseness == right.trailLooseness &&
            left.turbulence == right.turbulence &&
+           left.surfaceFollow == right.surfaceFollow &&
+           left.downhillPull == right.downhillPull &&
+           left.terrainWidthResponse == right.terrainWidthResponse &&
+           left.turbulenceScaleMeters == right.turbulenceScaleMeters &&
            left.seed == right.seed;
 }
 
@@ -3061,6 +3503,16 @@ WaterEffectResponseSettings SanitizeSeepageResponse(
 
 WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
     const WaterSeepageLookSettings fallback{};
+    switch (look.pattern) {
+        case WaterSeepagePattern::LegacyRipples:
+        case WaterSeepagePattern::WetRockSheen:
+        case WaterSeepagePattern::ChaoticBloom:
+        case WaterSeepagePattern::WettingTrickle:
+            break;
+        default:
+            look.pattern = WaterSeepagePattern::LegacyRipples;
+            break;
+    }
     look.baseWetness = std::clamp(SeepageFiniteOr(look.baseWetness, fallback.baseWetness), 0.0F, 1.0F);
     look.density = std::clamp(SeepageFiniteOr(look.density, fallback.density), 0.0F, 1.0F);
     look.glisten = std::clamp(SeepageFiniteOr(look.glisten, fallback.glisten), 0.0F, 1.0F);
@@ -3105,6 +3557,22 @@ WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
             fallback.downhillDriftMetersPerSecond),
         0.0F,
         4.0F);
+    look.tricklePatchSizeMeters = std::clamp(
+        SeepageFiniteOr(look.tricklePatchSizeMeters, fallback.tricklePatchSizeMeters),
+        0.005F,
+        20.0F);
+    look.trickleLengthMeters = std::clamp(
+        SeepageFiniteOr(look.trickleLengthMeters, fallback.trickleLengthMeters),
+        0.005F,
+        1000.0F);
+    look.trickleWidthMeters = std::clamp(
+        SeepageFiniteOr(look.trickleWidthMeters, fallback.trickleWidthMeters),
+        0.001F,
+        100.0F);
+    look.trickleFrontSoftness = std::clamp(
+        SeepageFiniteOr(look.trickleFrontSoftness, fallback.trickleFrontSoftness),
+        0.001F,
+        10.0F);
     look.response = SanitizeSeepageResponse(look.response, fallback.response);
     return look;
 }
@@ -3234,8 +3702,10 @@ bool SeepageNodeReferencePreferred(
     }
     const auto& left = nodes[leftIndex];
     const auto& right = nodes[rightIndex];
-    if (std::abs(left.strength - right.strength) > 1.0e-6F) {
-        return left.strength > right.strength;
+    // Candidate membership is topology. Rank with authored maximum strength so
+    // keyed activity changes never require rebuilding overlapping cells.
+    if (std::abs(left.authoredStrength - right.authoredStrength) > 1.0e-6F) {
+        return left.authoredStrength > right.authoredStrength;
     }
     const glm::vec3 cellCenter{
         (static_cast<float>(cellX) + 0.5F) * cellSizeMeters,
@@ -4110,6 +4580,109 @@ SeepagePatternSignals EvaluateChaoticBloomSeepageSignals(
     };
 }
 
+SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageLookSettings& look,
+    const SeepageFanSample& fan,
+    const glm::vec3& position,
+    const glm::vec3& pointNormal,
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext) {
+    const float progress = Clamp01(node.wettingProgress);
+    if (progress <= 1.0e-6F) {
+        return {};
+    }
+
+    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
+    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
+    const float density = Clamp01(look.density + 0.25F * rainGain);
+    const float patchSize = std::max(0.005F, look.tricklePatchSizeMeters);
+    const float trickleWidth = std::max(0.001F, look.trickleWidthMeters);
+    const float trickleLength = std::max(
+        0.005F,
+        look.trickleLengthMeters *
+            (1.0F + 0.50F * Clamp01(node.scenarioSpread)) *
+            (1.0F + 0.25F * rainGain));
+    const float frontSoftness = std::max(0.001F, look.trickleFrontSoftness);
+    const float downDistance = std::max(0.0F, fan.downDistance);
+    const float time = std::max(0.0F, timeSeconds);
+    const glm::vec3 advectedPosition =
+        position - fan.downTangent * (time * look.downhillDriftMetersPerSecond);
+    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
+
+    glm::vec3 patchCoordinate = node.noiseRotation * (advectedPosition / patchSize);
+    patchCoordinate += glm::vec3{0.019F, -0.031F, 0.023F} * (time * look.evolution);
+    const auto patchNoise = SeepageFractalNoise3(
+        patchCoordinate,
+        proceduralSeed + 6151U,
+        node.resolvedQuality);
+    const float patchFeather = std::lerp(0.26F, 0.055F, Clamp01(look.contrast));
+    const float patchThreshold = 0.78F - density * 0.46F;
+    const float patch = SmoothStep(
+        patchThreshold - patchFeather,
+        patchThreshold + patchFeather,
+        patchNoise.value);
+
+    const float frontVariation =
+        (patchNoise.value - 0.5F) * frontSoftness * (0.35F + look.breakup * 1.15F);
+    const float frontDistance = trickleLength * progress + frontVariation;
+    const float frontMask = 1.0F - SmoothStep(
+        frontDistance,
+        frontDistance + frontSoftness,
+        downDistance);
+    const float tailMask = 1.0F - SmoothStep(
+        trickleLength,
+        trickleLength + frontSoftness,
+        downDistance);
+    const float arrivalMask = Clamp01(frontMask * tailMask);
+    if (arrivalMask <= 1.0e-6F) {
+        return {};
+    }
+
+    glm::vec3 fingerCoordinate{
+        fan.signedLateralDistance / trickleWidth,
+        downDistance / std::max(patchSize * 1.75F, trickleWidth),
+        time * look.evolution * 0.37F,
+    };
+    fingerCoordinate += patchNoise.gradient * (look.curl * 0.18F);
+    const auto fingerNoise = SeepageFractalNoise3(
+        fingerCoordinate,
+        proceduralSeed + 12289U,
+        node.resolvedQuality);
+    const float ridge = 1.0F - std::abs(fingerNoise.value * 2.0F - 1.0F);
+    const float fingerThreshold = 0.46F + Clamp01(look.breakup) * 0.22F;
+    const float fingers = SmoothStep(fingerThreshold, 0.94F, ridge);
+    const float seededPatch = Clamp01(
+        patch * (0.58F + fingers * 0.42F) + fingers * density * 0.24F);
+    const glm::vec3 baseNormal = ResolveSeepagePatternNormal(pointNormal, fan);
+    const glm::vec3 environmentDirection = SeepageEnvironmentDirection(look);
+    const glm::vec3 worldGradient = glm::transpose(node.noiseRotation) * patchNoise.gradient;
+    const float sparseGate = SmoothStep(
+        0.90F - look.glintDensity * 0.58F,
+        0.98F,
+        fingerNoise.value);
+    const float reflection = SeepageReflectionSignal(
+        look,
+        position,
+        baseNormal,
+        worldGradient,
+        environmentDirection,
+        viewContext,
+        sparseGate);
+    const float strengthMask =
+        fan.mask * arrivalMask * std::clamp(node.strength, 0.0F, 8.0F);
+    return {
+        .damp = Clamp01(
+            strengthMask *
+            (wetness * (0.58F + seededPatch * 0.38F) +
+             fingers * (0.08F + rainGain * 0.12F))),
+        .variation = Clamp01(
+            strengthMask * fingers * (0.16F + seededPatch * 0.34F)),
+        .glint = Clamp01(
+            strengthMask * seededPatch * look.glisten * reflection),
+    };
+}
+
 WaterSeepageLookSettings SelectSeepageTransitionLook(
     const WaterSeepageRuntimeNode& node,
     const glm::vec3& position) {
@@ -4307,6 +4880,22 @@ WaterSeepageLookSettings LerpSeepageLook(
         left.downhillDriftMetersPerSecond,
         right.downhillDriftMetersPerSecond,
         amount);
+    result.tricklePatchSizeMeters = std::lerp(
+        left.tricklePatchSizeMeters,
+        right.tricklePatchSizeMeters,
+        amount);
+    result.trickleLengthMeters = std::lerp(
+        left.trickleLengthMeters,
+        right.trickleLengthMeters,
+        amount);
+    result.trickleWidthMeters = std::lerp(
+        left.trickleWidthMeters,
+        right.trickleWidthMeters,
+        amount);
+    result.trickleFrontSoftness = std::lerp(
+        left.trickleFrontSoftness,
+        right.trickleFrontSoftness,
+        amount);
     result.response = LerpSeepageResponse(left.response, right.response, amount);
     result.blendMode = amount < 0.5F ? left.blendMode : right.blendMode;
     return SanitizeSeepageLook(result);
@@ -4339,6 +4928,119 @@ glm::vec3 SeepageEnvironmentDirection(const WaterSeepageLookSettings& look) {
     });
 }
 
+float SanitizeSeepageTimingSeconds(float value) {
+    return std::isfinite(value) ? std::max(0.0F, value) : 0.0F;
+}
+
+WaterScenarioState SanitizeWaterScenarioSeepageTiming(WaterScenarioState state) {
+    state.seepageRainDelaySeconds = SanitizeSeepageTimingSeconds(
+        state.seepageRainDelaySeconds);
+    state.seepageRainRiseSeconds = SanitizeSeepageTimingSeconds(
+        state.seepageRainRiseSeconds);
+    state.seepageRainRecessionSeconds = SanitizeSeepageTimingSeconds(
+        state.seepageRainRecessionSeconds);
+    return state;
+}
+
+WaterSeepageNodeAnimationState SanitizeSeepageNodeAnimationState(
+    WaterSeepageNodeAnimationState state) {
+    state.activity = Clamp01(SeepageFiniteOr(state.activity, 1.0F));
+    state.localSpread = Clamp01(SeepageFiniteOr(state.localSpread, 0.0F));
+    state.wettingProgress = Clamp01(SeepageFiniteOr(state.wettingProgress, 1.0F));
+    return state;
+}
+
+WaterSeepageNodeAnimationState LerpSeepageNodeAnimationState(
+    const WaterSeepageNodeAnimationState& left,
+    const WaterSeepageNodeAnimationState& right,
+    float amount) {
+    amount = Clamp01(amount);
+    return SanitizeSeepageNodeAnimationState({
+        .activity = std::lerp(left.activity, right.activity, amount),
+        .localSpread = std::lerp(left.localSpread, right.localSpread, amount),
+        .wettingProgress = std::lerp(left.wettingProgress, right.wettingProgress, amount),
+    });
+}
+
+void SeepageFingerprintText(std::uint64_t* hash, std::string_view value) {
+    SeepageFingerprintU32(hash, static_cast<std::uint32_t>(std::min<std::size_t>(
+        value.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))));
+    for (const char character : value) {
+        SeepageFingerprintByte(hash, static_cast<std::uint8_t>(character));
+    }
+}
+
+WaterSeepageNodeAnimationState FindSeepageNodeAnimationState(
+    std::span<const WaterSeepageNodeAnimationStateEntry> states,
+    std::uint32_t nodeId) {
+    const auto found = std::find_if(
+        states.begin(),
+        states.end(),
+        [nodeId](const WaterSeepageNodeAnimationStateEntry& candidate) {
+            return candidate.nodeId == nodeId;
+        });
+    return found == states.end()
+               ? WaterSeepageNodeAnimationState{}
+               : SanitizeSeepageNodeAnimationState(found->state);
+}
+
+void ApplySeepageRuntimeScenarioAndAnimation(
+    WaterSeepageRuntimeNode* node,
+    const std::optional<WaterScenarioState>& scenarioState,
+    const WaterRainSettings& rainSettings,
+    std::uint64_t effectivePointInvocations,
+    const WaterSeepageNodeAnimationState& rawNodeState) {
+    if (node == nullptr) {
+        return;
+    }
+    const auto nodeState = SanitizeSeepageNodeAnimationState(rawNodeState);
+    node->look = scenarioState.has_value()
+                     ? SanitizeSeepageLook(scenarioState->seepageLook)
+                     : SanitizeSeepageLook(node->authoredLook);
+    node->resolvedQuality = ResolveWaterSeepageQuality(
+        node->look.quality,
+        effectivePointInvocations);
+    node->look.quality = node->resolvedQuality;
+    node->environmentDirection = SeepageEnvironmentDirection(node->look);
+    const float scenarioLevel = scenarioState.has_value()
+                                    ? Clamp01(SeepageFiniteOr(
+                                          scenarioState->seepageLevel,
+                                          1.0F))
+                                    : 1.0F;
+    const float globalSpread = scenarioState.has_value()
+                                   ? Clamp01(SeepageFiniteOr(
+                                         scenarioState->seepageSpread,
+                                         0.0F))
+                                   : 0.0F;
+    node->effectiveActivity = nodeState.activity;
+    node->localSpread = nodeState.localSpread;
+    node->wettingProgress = nodeState.wettingProgress;
+    node->strength = node->authoredStrength * scenarioLevel * node->effectiveActivity;
+    node->scenarioSpread = Clamp01(
+        1.0F - (1.0F - globalSpread) * (1.0F - node->localSpread));
+    node->rainVisualStrength = scenarioState.has_value()
+                                   ? Clamp01(SeepageFiniteOr(
+                                         scenarioState->rainLevel,
+                                         0.0F))
+                                   : (rainSettings.enabled
+                                          ? WaterRainPresetVisualStrength(
+                                                rainSettings.intensityPreset)
+                                          : 0.0F);
+    node->transitionLook.reset();
+    node->transitionAmount = 0.0F;
+    if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
+        node->transitionLook = SanitizeSeepageLook(
+            scenarioState->transitionLook.value());
+        node->transitionLook->quality = ResolveWaterSeepageQuality(
+            node->transitionLook->quality,
+            effectivePointInvocations);
+        node->transitionAmount = Clamp01(SeepageFiniteOr(
+            scenarioState->transitionAmount,
+            0.0F));
+    }
+}
+
 }  // namespace
 
 WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
@@ -4361,6 +5063,9 @@ std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
     historical.state.seepageLevel = 1.0F;
     historical.state.seepageSpread = 0.60F;
     historical.state.rainLevel = 0.0F;
+    historical.state.seepageRainDelaySeconds = 4.0F;
+    historical.state.seepageRainRiseSeconds = 12.0F;
+    historical.state.seepageRainRecessionSeconds = 60.0F;
 
     WaterScenarioDefinition contemporary;
     contemporary.id = "contemporary-managed";
@@ -4375,6 +5080,9 @@ std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
     contemporary.state.seepageLevel = 0.50F;
     contemporary.state.seepageSpread = 0.10F;
     contemporary.state.rainLevel = 0.0F;
+    contemporary.state.seepageRainDelaySeconds = 1.0F;
+    contemporary.state.seepageRainRiseSeconds = 4.0F;
+    contemporary.state.seepageRainRecessionSeconds = 15.0F;
     return {historical, contemporary};
 }
 
@@ -4382,7 +5090,7 @@ WaterScenarioState EvaluateWaterScenarioTrack(
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
     float normalizedPosition) {
-    WaterScenarioState result = definition.state;
+    WaterScenarioState result = SanitizeWaterScenarioSeepageTiming(definition.state);
     result.transitionLook.reset();
     result.transitionAmount = 0.0F;
     if (track.keys.empty()) {
@@ -4401,10 +5109,10 @@ WaterScenarioState EvaluateWaterScenarioTrack(
             return left->position < right->position;
         });
     if (normalizedPosition <= ordered.front()->position) {
-        return ordered.front()->state;
+        return SanitizeWaterScenarioSeepageTiming(ordered.front()->state);
     }
     if (normalizedPosition >= ordered.back()->position) {
-        return ordered.back()->state;
+        return SanitizeWaterScenarioSeepageTiming(ordered.back()->state);
     }
     for (std::size_t index = 0U; index + 1U < ordered.size(); ++index) {
         const auto& left = *ordered[index];
@@ -4415,7 +5123,7 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         const float span = std::max(1.0e-6F, right.position - left.position);
         float amount = Clamp01((normalizedPosition - left.position) / span);
         if (left.interpolation == WaterScenarioInterpolation::Hold) {
-            return left.state;
+            return SanitizeWaterScenarioSeepageTiming(left.state);
         }
         if (left.interpolation == WaterScenarioInterpolation::Smooth) {
             amount = amount * amount * (3.0F - 2.0F * amount);
@@ -4423,6 +5131,19 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         result.seepageLevel = std::lerp(left.state.seepageLevel, right.state.seepageLevel, amount);
         result.seepageSpread = std::lerp(left.state.seepageSpread, right.state.seepageSpread, amount);
         result.rainLevel = std::lerp(left.state.rainLevel, right.state.rainLevel, amount);
+        result.flowLevel = std::lerp(left.state.flowLevel, right.state.flowLevel, amount);
+        result.seepageRainDelaySeconds = std::lerp(
+            SanitizeSeepageTimingSeconds(left.state.seepageRainDelaySeconds),
+            SanitizeSeepageTimingSeconds(right.state.seepageRainDelaySeconds),
+            amount);
+        result.seepageRainRiseSeconds = std::lerp(
+            SanitizeSeepageTimingSeconds(left.state.seepageRainRiseSeconds),
+            SanitizeSeepageTimingSeconds(right.state.seepageRainRiseSeconds),
+            amount);
+        result.seepageRainRecessionSeconds = std::lerp(
+            SanitizeSeepageTimingSeconds(left.state.seepageRainRecessionSeconds),
+            SanitizeSeepageTimingSeconds(right.state.seepageRainRecessionSeconds),
+            amount);
         if (left.state.seepageLook.pattern == right.state.seepageLook.pattern) {
             result.seepageLook = LerpSeepageLook(
                 left.state.seepageLook,
@@ -4433,9 +5154,276 @@ WaterScenarioState EvaluateWaterScenarioTrack(
             result.transitionLook = SanitizeSeepageLook(right.state.seepageLook);
             result.transitionAmount = amount;
         }
-        return result;
+        return SanitizeWaterScenarioSeepageTiming(result);
     }
-    return ordered.back()->state;
+    return SanitizeWaterScenarioSeepageTiming(ordered.back()->state);
+}
+
+WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
+    const WaterScenarioTrack& track,
+    std::uint32_t nodeId,
+    float normalizedPosition) {
+    const auto nodeTrack = std::find_if(
+        track.seepageNodeTracks.begin(),
+        track.seepageNodeTracks.end(),
+        [nodeId](const WaterSeepageNodeTrack& candidate) {
+            return candidate.nodeId == nodeId;
+        });
+    if (nodeTrack == track.seepageNodeTracks.end() || nodeTrack->keys.empty()) {
+        return {};
+    }
+
+    normalizedPosition = Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
+    std::vector<const WaterSeepageNodeKey*> ordered;
+    ordered.reserve(nodeTrack->keys.size());
+    for (const auto& key : nodeTrack->keys) {
+        ordered.push_back(&key);
+    }
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const WaterSeepageNodeKey* left, const WaterSeepageNodeKey* right) {
+            return left->position < right->position;
+        });
+    if (normalizedPosition <= ordered.front()->position) {
+        return SanitizeSeepageNodeAnimationState(ordered.front()->state);
+    }
+    if (normalizedPosition >= ordered.back()->position) {
+        return SanitizeSeepageNodeAnimationState(ordered.back()->state);
+    }
+    for (std::size_t index = 0U; index + 1U < ordered.size(); ++index) {
+        const auto& left = *ordered[index];
+        const auto& right = *ordered[index + 1U];
+        if (normalizedPosition > right.position) {
+            continue;
+        }
+        if (left.interpolation == WaterScenarioInterpolation::Hold) {
+            return SanitizeSeepageNodeAnimationState(left.state);
+        }
+        const float span = std::max(1.0e-6F, right.position - left.position);
+        float amount = Clamp01((normalizedPosition - left.position) / span);
+        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+            amount = amount * amount * (3.0F - 2.0F * amount);
+        }
+        return LerpSeepageNodeAnimationState(left.state, right.state, amount);
+    }
+    return SanitizeSeepageNodeAnimationState(ordered.back()->state);
+}
+
+std::vector<WaterSeepageNodeAnimationStateEntry> EvaluateWaterSeepageNodeAnimationTracks(
+    const WaterScenarioTrack& track,
+    float normalizedPosition) {
+    std::vector<WaterSeepageNodeAnimationStateEntry> states;
+    states.reserve(track.seepageNodeTracks.size());
+    std::unordered_set<std::uint32_t> emitted;
+    emitted.reserve(track.seepageNodeTracks.size());
+    for (const auto& nodeTrack : track.seepageNodeTracks) {
+        if (!emitted.insert(nodeTrack.nodeId).second) {
+            continue;
+        }
+        states.push_back({
+            .nodeId = nodeTrack.nodeId,
+            .state = EvaluateWaterSeepageNodeAnimationTrack(
+                track,
+                nodeTrack.nodeId,
+                normalizedPosition),
+        });
+    }
+    std::sort(
+        states.begin(),
+        states.end(),
+        [](const WaterSeepageNodeAnimationStateEntry& left,
+           const WaterSeepageNodeAnimationStateEntry& right) {
+            return left.nodeId < right.nodeId;
+        });
+    return states;
+}
+
+void AddOrUpdateWaterSeepageNodeKey(
+    WaterScenarioTrack* track,
+    std::uint32_t nodeId,
+    WaterSeepageNodeKey key,
+    float replacementTolerance) {
+    if (track == nullptr) {
+        return;
+    }
+    auto nodeTrack = std::find_if(
+        track->seepageNodeTracks.begin(),
+        track->seepageNodeTracks.end(),
+        [nodeId](const WaterSeepageNodeTrack& candidate) {
+            return candidate.nodeId == nodeId;
+        });
+    if (nodeTrack == track->seepageNodeTracks.end()) {
+        track->seepageNodeTracks.push_back({.nodeId = nodeId});
+        nodeTrack = std::prev(track->seepageNodeTracks.end());
+    }
+    key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
+    key.state = SanitizeSeepageNodeAnimationState(key.state);
+    replacementTolerance = std::max(
+        0.0F,
+        SeepageFiniteOr(replacementTolerance, 0.0001F));
+    const auto existing = std::find_if(
+        nodeTrack->keys.begin(),
+        nodeTrack->keys.end(),
+        [&](const WaterSeepageNodeKey& candidate) {
+            return std::abs(candidate.position - key.position) <= replacementTolerance;
+        });
+    if (existing != nodeTrack->keys.end()) {
+        const auto preservedId = existing->id;
+        *existing = std::move(key);
+        if (existing->id.empty()) {
+            existing->id = preservedId;
+        }
+    } else {
+        nodeTrack->keys.push_back(std::move(key));
+    }
+    std::stable_sort(
+        nodeTrack->keys.begin(),
+        nodeTrack->keys.end(),
+        [](const WaterSeepageNodeKey& left, const WaterSeepageNodeKey& right) {
+            return left.position < right.position;
+        });
+}
+
+std::string WaterSeepageRainEnvelopeFingerprint(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintText(&hash, definition.id);
+    SeepageFingerprintText(&hash, track.scenarioId);
+    SeepageFingerprintFloat(
+        &hash,
+        std::max(0.0F, SeepageFiniteOr(durationSeconds, 0.0F)));
+    const auto fingerprintState = [&](const WaterScenarioState& rawState) {
+        const auto state = SanitizeWaterScenarioSeepageTiming(rawState);
+        SeepageFingerprintFloat(&hash, Clamp01(SeepageFiniteOr(state.rainLevel, 0.0F)));
+        SeepageFingerprintFloat(&hash, state.seepageRainDelaySeconds);
+        SeepageFingerprintFloat(&hash, state.seepageRainRiseSeconds);
+        SeepageFingerprintFloat(&hash, state.seepageRainRecessionSeconds);
+    };
+    fingerprintState(definition.state);
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(std::min<std::size_t>(
+        track.keys.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))));
+    for (const auto& key : track.keys) {
+        SeepageFingerprintText(&hash, key.id);
+        SeepageFingerprintFloat(&hash, SeepageFiniteOr(key.position, 0.0F));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(key.interpolation));
+        fingerprintState(key.state);
+    }
+    return "water-seepage-rain-envelope-v1-" + SeepageFingerprintString(hash);
+}
+
+WaterSeepageRainEnvelope BuildWaterSeepageRainEnvelope(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds,
+    float sampleRateHz,
+    std::size_t maxSamples) {
+    WaterSeepageRainEnvelope envelope;
+    envelope.durationSeconds = std::max(
+        0.0F,
+        SeepageFiniteOr(durationSeconds, 0.0F));
+    const float requestedRate = std::clamp(
+        SeepageFiniteOr(sampleRateHz, 120.0F),
+        1.0F,
+        10'000.0F);
+    const std::size_t safeMaximumSamples = std::max<std::size_t>(1U, maxSamples);
+    const double requestedIntervals = std::ceil(
+        static_cast<double>(envelope.durationSeconds) *
+        static_cast<double>(requestedRate));
+    const std::size_t intervalCount = static_cast<std::size_t>(std::min(
+        requestedIntervals,
+        static_cast<double>(safeMaximumSamples - 1U)));
+    const std::size_t sampleCount = intervalCount + 1U;
+    envelope.sampleRateHz = envelope.durationSeconds > 0.0F && intervalCount > 0U
+                                ? static_cast<float>(intervalCount) /
+                                      envelope.durationSeconds
+                                : requestedRate;
+    envelope.samples.resize(sampleCount, 0.0F);
+    envelope.fingerprint = WaterSeepageRainEnvelopeFingerprint(
+        track,
+        definition,
+        envelope.durationSeconds);
+
+    const float timeStep = sampleCount > 1U
+                               ? envelope.durationSeconds /
+                                     static_cast<float>(sampleCount - 1U)
+                               : 0.0F;
+    float filtered = 0.0F;
+    for (std::size_t index = 0U; index < sampleCount; ++index) {
+        const float timeSeconds = timeStep * static_cast<float>(index);
+        const float normalizedPosition = envelope.durationSeconds > 1.0e-6F
+                                             ? timeSeconds / envelope.durationSeconds
+                                             : 0.0F;
+        const auto timingState = EvaluateWaterScenarioTrack(
+            track,
+            definition,
+            normalizedPosition);
+        const float delayedTime = std::max(
+            0.0F,
+            timeSeconds - timingState.seepageRainDelaySeconds);
+        const float delayedPosition = envelope.durationSeconds > 1.0e-6F
+                                          ? delayedTime / envelope.durationSeconds
+                                          : 0.0F;
+        const float target = Clamp01(SeepageFiniteOr(
+            EvaluateWaterScenarioTrack(track, definition, delayedPosition).rainLevel,
+            0.0F));
+        const float responseSeconds = target >= filtered
+                                          ? timingState.seepageRainRiseSeconds
+                                          : timingState.seepageRainRecessionSeconds;
+        if (responseSeconds <= 1.0e-6F || timeStep <= 0.0F) {
+            filtered = target;
+        } else if (index == 0U) {
+            filtered = 0.0F;
+        } else {
+            const float response = 1.0F - std::exp(-timeStep / responseSeconds);
+            filtered = std::lerp(filtered, target, Clamp01(response));
+        }
+        envelope.samples[index] = Clamp01(filtered);
+    }
+    return envelope;
+}
+
+float EvaluateWaterSeepageRainEnvelope(
+    const WaterSeepageRainEnvelope& envelope,
+    float timeSeconds) {
+    if (envelope.samples.empty()) {
+        return 0.0F;
+    }
+    if (envelope.samples.size() == 1U || envelope.durationSeconds <= 1.0e-6F) {
+        return Clamp01(SeepageFiniteOr(envelope.samples.front(), 0.0F));
+    }
+    const float clampedTime = std::clamp(
+        SeepageFiniteOr(timeSeconds, 0.0F),
+        0.0F,
+        envelope.durationSeconds);
+    const float sampleCoordinate =
+        clampedTime * static_cast<float>(envelope.samples.size() - 1U) /
+        envelope.durationSeconds;
+    const auto leftIndex = static_cast<std::size_t>(std::floor(sampleCoordinate));
+    const auto rightIndex = std::min<std::size_t>(leftIndex + 1U, envelope.samples.size() - 1U);
+    const float amount = sampleCoordinate - static_cast<float>(leftIndex);
+    return Clamp01(std::lerp(
+        SeepageFiniteOr(envelope.samples[leftIndex], 0.0F),
+        SeepageFiniteOr(envelope.samples[rightIndex], 0.0F),
+        amount));
+}
+
+float EffectiveWaterFlowActivity(
+    const WaterScenarioState& state,
+    float maximumFlowStrength,
+    float rainResponse) {
+    const float flowLevel = std::isfinite(state.flowLevel) ? Clamp01(state.flowLevel) : 1.0F;
+    const float rainLevel = std::isfinite(state.rainLevel) ? Clamp01(state.rainLevel) : 0.0F;
+    const float maximumStrength =
+        std::isfinite(maximumFlowStrength) ? Clamp01(maximumFlowStrength) : 1.0F;
+    const float response = std::isfinite(rainResponse) ? Clamp01(rainResponse) : 0.0F;
+    return Clamp01(
+        maximumStrength *
+        (flowLevel + (1.0F - flowLevel) * rainLevel * response));
 }
 
 void AddOrUpdateWaterScenarioKey(
@@ -4570,7 +5558,8 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
     std::span<const WaterSeepageSurfaceGuide> guides,
-    const std::optional<WaterScenarioState>& scenarioState) {
+    const std::optional<WaterScenarioState>& scenarioState,
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates) {
     WaterSeepageSpatialGrid grid;
     grid.diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
         nodes.size(),
@@ -4583,11 +5572,6 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             continue;
         }
         const auto authoredLook = ResolveWaterSeepageLook(node, profiles, defaultLook);
-        auto look = scenarioState.has_value()
-                        ? SanitizeSeepageLook(scenarioState->seepageLook)
-                        : authoredLook;
-        const auto resolvedQuality = ResolveWaterSeepageQuality(look.quality, effectivePointInvocations);
-        look.quality = resolvedQuality;
         WaterSeepageRuntimeNode runtime;
         runtime.id = node.id;
         runtime.seed = node.seed;
@@ -4612,7 +5596,6 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
         }
         runtime.lateralAxis = glm::normalize(runtime.lateralAxis);
         runtime.noiseRotation = SeepageNoiseRotation(node.seed ^ (node.id * 0x9e3779b9U));
-        runtime.environmentDirection = SeepageEnvironmentDirection(look);
         runtime.reachMeters = std::clamp(
             SeepageFiniteOr(node.reachMeters, 1.25F),
             0.001F,
@@ -4641,25 +5624,13 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             SeepageFiniteOr(node.strength, 1.0F),
             0.0F,
             8.0F);
-        const float scenarioLevel = scenarioState.has_value()
-                                        ? std::clamp(scenarioState->seepageLevel, 0.0F, 1.0F)
-                                        : 1.0F;
-        runtime.strength = runtime.authoredStrength * scenarioLevel;
-        runtime.scenarioSpread = scenarioState.has_value()
-                                     ? std::clamp(scenarioState->seepageSpread, 0.0F, 1.0F)
-                                     : 0.0F;
-        runtime.rainVisualStrength = scenarioState.has_value()
-                                         ? std::clamp(scenarioState->rainLevel, 0.0F, 1.0F)
-                                         : (rainSettings.enabled
-                                                ? WaterRainPresetVisualStrength(rainSettings.intensityPreset)
-                                                : 0.0F);
-        runtime.resolvedQuality = resolvedQuality;
         runtime.authoredLook = authoredLook;
-        runtime.look = look;
-        if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
-            runtime.transitionLook = SanitizeSeepageLook(scenarioState->transitionLook.value());
-            runtime.transitionAmount = std::clamp(scenarioState->transitionAmount, 0.0F, 1.0F);
-        }
+        ApplySeepageRuntimeScenarioAndAnimation(
+            &runtime,
+            scenarioState,
+            rainSettings,
+            effectivePointInvocations,
+            FindSeepageNodeAnimationState(nodeAnimationStates, node.id));
         CopyWaterSeepageSurfaceGuide(
             FindWaterSeepageSurfaceGuide(guides, node.id),
             &runtime);
@@ -4789,46 +5760,67 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     return grid;
 }
 
+void ApplyWaterSeepageRuntimeParameters(
+    WaterSeepageSpatialGrid* grid,
+    std::span<const WaterSeepageNode> nodes,
+    std::span<const WaterSeepageLookProfile> profiles,
+    const WaterSeepageLookSettings& defaultLook,
+    const std::optional<WaterScenarioState>& scenarioState,
+    const WaterRainSettings& rainSettings,
+    std::uint64_t effectivePointInvocations,
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates) {
+    if (grid == nullptr) {
+        return;
+    }
+    for (auto& runtime : grid->nodes) {
+        const auto authored = std::find_if(
+            nodes.begin(),
+            nodes.end(),
+            [&](const WaterSeepageNode& candidate) {
+                return candidate.id == runtime.id;
+            });
+        if (authored != nodes.end()) {
+            runtime.seed = authored->seed;
+            runtime.noiseRotation = SeepageNoiseRotation(
+                authored->seed ^ (authored->id * 0x9e3779b9U));
+            runtime.normalAlignment = std::clamp(
+                SeepageFiniteOr(authored->normalAlignment, 0.20F),
+                0.0F,
+                1.0F);
+            runtime.authoredStrength = std::clamp(
+                SeepageFiniteOr(authored->strength, 1.0F),
+                0.0F,
+                8.0F);
+            runtime.authoredLook = ResolveWaterSeepageLook(
+                *authored,
+                profiles,
+                defaultLook);
+        }
+        ApplySeepageRuntimeScenarioAndAnimation(
+            &runtime,
+            scenarioState,
+            rainSettings,
+            effectivePointInvocations,
+            FindSeepageNodeAnimationState(nodeAnimationStates, runtime.id));
+    }
+}
+
 void ApplyWaterSeepageScenarioParameters(
     WaterSeepageSpatialGrid* grid,
     const std::optional<WaterScenarioState>& scenarioState,
     const WaterRainSettings& rainSettings,
-    std::uint64_t effectivePointInvocations) {
+    std::uint64_t effectivePointInvocations,
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates) {
     if (grid == nullptr) {
         return;
     }
     for (auto& node : grid->nodes) {
-        node.look = scenarioState.has_value()
-                        ? SanitizeSeepageLook(scenarioState->seepageLook)
-                        : SanitizeSeepageLook(node.authoredLook);
-        node.resolvedQuality = ResolveWaterSeepageQuality(
-            node.look.quality,
-            effectivePointInvocations);
-        node.look.quality = node.resolvedQuality;
-        node.environmentDirection = SeepageEnvironmentDirection(node.look);
-        node.strength = node.authoredStrength *
-                        (scenarioState.has_value()
-                             ? Clamp01(scenarioState->seepageLevel)
-                             : 1.0F);
-        node.scenarioSpread = scenarioState.has_value()
-                                  ? Clamp01(scenarioState->seepageSpread)
-                                  : 0.0F;
-        node.rainVisualStrength = scenarioState.has_value()
-                                      ? Clamp01(scenarioState->rainLevel)
-                                      : (rainSettings.enabled
-                                             ? WaterRainPresetVisualStrength(
-                                                   rainSettings.intensityPreset)
-                                             : 0.0F);
-        node.transitionLook.reset();
-        node.transitionAmount = 0.0F;
-        if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
-            node.transitionLook = SanitizeSeepageLook(
-                scenarioState->transitionLook.value());
-            node.transitionLook->quality = ResolveWaterSeepageQuality(
-                node.transitionLook->quality,
-                effectivePointInvocations);
-            node.transitionAmount = Clamp01(scenarioState->transitionAmount);
-        }
+        ApplySeepageRuntimeScenarioAndAnimation(
+            &node,
+            scenarioState,
+            rainSettings,
+            effectivePointInvocations,
+            FindSeepageNodeAnimationState(nodeAnimationStates, node.id));
     }
 }
 
@@ -4839,7 +5831,8 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     float timeSeconds,
     const WaterSeepageViewContext& viewContext) {
     WaterSeepageRuntimeContribution contribution;
-    if (!IsValidPoint(ToGlm(position)) || node.reachMeters <= 0.0F || node.strength <= 0.0F) {
+    if (!IsValidPoint(ToGlm(position)) || node.reachMeters <= 0.0F ||
+        node.strength <= 0.0F || node.effectiveActivity <= 0.0F) {
         return contribution;
     }
     glm::vec3 pointNormal = ToGlm(normal);
@@ -4857,6 +5850,10 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     if (look.quality == WaterSeepageQuality::Auto) {
         look.quality = node.resolvedQuality;
     }
+    if (look.pattern == WaterSeepagePattern::WettingTrickle &&
+        node.wettingProgress <= 1.0e-6F) {
+        return contribution;
+    }
     SeepagePatternSignals signals;
     switch (look.pattern) {
         case WaterSeepagePattern::WetRockSheen:
@@ -4871,6 +5868,16 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
             break;
         case WaterSeepagePattern::ChaoticBloom:
             signals = EvaluateChaoticBloomSeepageSignals(
+                node,
+                look,
+                fan,
+                ToGlm(position),
+                pointNormal,
+                timeSeconds,
+                viewContext);
+            break;
+        case WaterSeepagePattern::WettingTrickle:
+            signals = EvaluateWettingTrickleSeepageSignals(
                 node,
                 look,
                 fan,
@@ -5015,7 +6022,7 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
 
 std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 2U);
+    SeepageFingerprintU32(&hash, 3U);
     const auto fingerprintLook = [&](const WaterSeepageLookSettings& look) {
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.pattern));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
@@ -5040,6 +6047,10 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, look.curl);
         SeepageFingerprintFloat(&hash, look.breakup);
         SeepageFingerprintFloat(&hash, look.downhillDriftMetersPerSecond);
+        SeepageFingerprintFloat(&hash, look.tricklePatchSizeMeters);
+        SeepageFingerprintFloat(&hash, look.trickleLengthMeters);
+        SeepageFingerprintFloat(&hash, look.trickleWidthMeters);
+        SeepageFingerprintFloat(&hash, look.trickleFrontSoftness);
         SeepageFingerprintFloat(&hash, look.rainResponse);
         SeepageFingerprintFloat(&hash, look.response.intensity);
         SeepageFingerprintFloat(&hash, look.response.emissionAdd);
@@ -5060,6 +6071,9 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, node.strength);
         SeepageFingerprintFloat(&hash, node.rainVisualStrength);
         SeepageFingerprintFloat(&hash, node.scenarioSpread);
+        SeepageFingerprintFloat(&hash, node.effectiveActivity);
+        SeepageFingerprintFloat(&hash, node.localSpread);
+        SeepageFingerprintFloat(&hash, node.wettingProgress);
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(node.resolvedQuality));
         fingerprintLook(node.look);
         SeepageFingerprintFloat(&hash, node.transitionAmount);
@@ -5068,7 +6082,7 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
             fingerprintLook(node.transitionLook.value());
         }
     }
-    return "water-seepage-params-v2-" + SeepageFingerprintString(hash);
+    return "water-seepage-params-v3-" + SeepageFingerprintString(hash);
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
@@ -6067,6 +7081,297 @@ WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceGuide(
     return guide;
 }
 
+std::uint32_t SeepageSurfaceGuideRoleMask(const WaterSeepageNode& node) {
+    bool prefersRock = false;
+    bool allowsSand = false;
+    for (const auto& role : node.targetSceneRoles) {
+        const auto normalized = NormalizeSeepageRole(role);
+        prefersRock = prefersRock || normalized == "rock" || normalized == "veg";
+        allowsSand = allowsSand || normalized == "sand";
+    }
+    if (prefersRock) {
+        return kWaterSurfaceRockRoleMask;
+    }
+    return allowsSand ? kWaterSurfaceSandRoleMask : 0U;
+}
+
+WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceCacheGuide(
+    const WaterSeepageNode& node,
+    const WaterSurfaceCache& cache) {
+    WaterSeepageSurfaceGuide guide;
+    guide.nodeId = node.id;
+    guide.requestedReachMeters = std::clamp(
+        SeepageFiniteOr(node.reachMeters, 1.25F),
+        0.001F,
+        1000.0F) * kSeepageMaximumReachScale;
+    const std::uint32_t roleMask = SeepageSurfaceGuideRoleMask(node);
+    if (roleMask == 0U || cache.flowSurfaceSurfels.empty() ||
+        !std::isfinite(cache.resolutionMeters) || cache.resolutionMeters <= 0.0F ||
+        !IsValidPoint(ToGlm(node.position))) {
+        return guide;
+    }
+
+    const float resolution = std::clamp(cache.resolutionMeters, 0.001F, 1.0F);
+    const float startRadius = std::clamp(
+        std::max(resolution * 2.25F, std::min(node.depthToleranceMeters, 0.12F)),
+        resolution,
+        0.25F);
+    const auto start = QueryWaterSurfaceCache(
+        cache,
+        node.position,
+        startRadius,
+        node.surfaceNormal,
+        roleMask);
+    if (!start.hit || start.surfel.confidence < 0.10F ||
+        start.surfel.normalCoherence < 0.10F) {
+        return guide;
+    }
+
+    std::vector<WaterSeepageGuideSample> rawSamples;
+    rawSamples.reserve(std::min<std::size_t>(
+        2050U,
+        static_cast<std::size_t>(std::ceil(
+            std::min(2048.0F, guide.requestedReachMeters / resolution))) + 2U));
+    glm::vec3 currentPosition = ToGlm(node.position);
+    glm::vec3 currentNormal = SafeSeepageNormal(start.surfel.normal);
+    glm::vec3 nodeNormal = SafeSeepageNormal(node.surfaceNormal);
+    if (glm::dot(currentNormal, nodeNormal) < 0.0F) {
+        currentNormal = -currentNormal;
+    }
+    glm::vec3 previousDirection = ToGlm(node.downAxis);
+    previousDirection -= currentNormal * glm::dot(previousDirection, currentNormal);
+    if (!IsValidPoint(previousDirection) ||
+        glm::dot(previousDirection, previousDirection) <= kNormalEpsilon) {
+        previousDirection = kGravity - currentNormal * glm::dot(kGravity, currentNormal);
+    }
+    if (!IsValidPoint(previousDirection) ||
+        glm::dot(previousDirection, previousDirection) <= kNormalEpsilon) {
+        previousDirection = kGravity;
+    } else {
+        previousDirection = glm::normalize(previousDirection);
+    }
+    rawSamples.push_back({
+        .position = node.position,
+        .normal = FromGlm(currentNormal),
+        .station = 0.0F,
+        .confidence = Clamp01(start.surfel.confidence *
+                              (0.45F + 0.55F * start.surfel.normalCoherence)),
+    });
+
+    std::unordered_set<GridKey, GridKeyHash> visited;
+    visited.insert({start.surfel.cellX, start.surfel.cellY, start.surfel.cellZ});
+    const float stepMeters = resolution * 1.20F;
+    const float riseTolerance = std::clamp(resolution * 0.30F, 0.0005F, 0.008F);
+    const double requestedSteps = std::ceil(
+        static_cast<double>(guide.requestedReachMeters) /
+        static_cast<double>(std::max(0.001F, resolution))) * 3.0 + 8.0;
+    const std::uint32_t maximumSteps = static_cast<std::uint32_t>(std::clamp(
+        requestedSteps,
+        2.0,
+        2048.0));
+    float station = 0.0F;
+    for (std::uint32_t step = 0U;
+         step < maximumSteps && station < guide.requestedReachMeters;
+         ++step) {
+        glm::vec3 gravityTangent =
+            kGravity - currentNormal * glm::dot(kGravity, currentNormal);
+        if (!IsValidPoint(gravityTangent) ||
+            glm::dot(gravityTangent, gravityTangent) <= kNormalEpsilon) {
+            gravityTangent = previousDirection -
+                             currentNormal * glm::dot(previousDirection, currentNormal);
+        }
+        if (!IsValidPoint(gravityTangent) ||
+            glm::dot(gravityTangent, gravityTangent) <= kNormalEpsilon) {
+            break;
+        }
+        gravityTangent = glm::normalize(gravityTangent);
+        glm::vec3 guidedDirection = glm::mix(previousDirection, gravityTangent, 0.72F);
+        guidedDirection -= currentNormal * glm::dot(guidedDirection, currentNormal);
+        if (glm::dot(guidedDirection, guidedDirection) <= kNormalEpsilon) {
+            guidedDirection = gravityTangent;
+        } else {
+            guidedDirection = glm::normalize(guidedDirection);
+        }
+        glm::vec3 lateral = glm::cross(currentNormal, guidedDirection);
+        if (!IsValidPoint(lateral) || glm::dot(lateral, lateral) <= kNormalEpsilon) {
+            lateral = glm::cross(currentNormal, nodeNormal);
+        }
+        if (IsValidPoint(lateral) && glm::dot(lateral, lateral) > kNormalEpsilon) {
+            lateral = glm::normalize(lateral);
+        } else {
+            lateral = glm::vec3{0.0F};
+        }
+
+        WaterSurfaceQueryResult selected;
+        float selectedScore = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t lookAhead = 1U; lookAhead <= 2U && !selected.hit; ++lookAhead) {
+            const float directionOffset = lookAhead == 1U ? 0.32F : 0.18F;
+            const std::array<glm::vec3, 3> directions{{
+                guidedDirection,
+                glm::normalize(guidedDirection + lateral * directionOffset),
+                glm::normalize(guidedDirection - lateral * directionOffset),
+            }};
+            for (const auto& direction : directions) {
+                const float lookAheadDistance = stepMeters * static_cast<float>(lookAhead);
+                const glm::vec3 expectedPosition = currentPosition +
+                                                   direction * lookAheadDistance;
+                const auto candidate = QueryWaterSurfaceCache(
+                    cache,
+                    FromGlm(expectedPosition),
+                    resolution * (lookAhead == 1U ? 1.05F : 1.25F),
+                    FromGlm(currentNormal),
+                    roleMask);
+                if (!candidate.hit || candidate.surfel.confidence < 0.10F ||
+                    candidate.surfel.normalCoherence < 0.10F ||
+                    visited.contains({
+                        candidate.surfel.cellX,
+                        candidate.surfel.cellY,
+                        candidate.surfel.cellZ})) {
+                    continue;
+                }
+                const glm::vec3 candidatePosition = ToGlm(candidate.surfel.centroid);
+                const glm::vec3 segment = candidatePosition - currentPosition;
+                const float segmentLength = glm::length(segment);
+                if (!IsValidPoint(segment) || segmentLength <= 1.0e-5F ||
+                    candidatePosition.z > currentPosition.z + riseTolerance ||
+                    candidatePosition.z > ToGlm(node.position).z + riseTolerance) {
+                    continue;
+                }
+                glm::vec3 candidateNormal = SafeSeepageNormal(candidate.surfel.normal);
+                if (glm::dot(candidateNormal, currentNormal) < 0.0F) {
+                    candidateNormal = -candidateNormal;
+                }
+                const float normalAgreement = Clamp01(glm::dot(candidateNormal, currentNormal));
+                if (normalAgreement < 0.20F) {
+                    continue;
+                }
+                const float directionAgreement = glm::dot(
+                    segment / segmentLength,
+                    guidedDirection);
+                if (directionAgreement < -0.10F) {
+                    continue;
+                }
+                const float drop = std::max(0.0F, currentPosition.z - candidatePosition.z);
+                const float score =
+                    directionAgreement * 1.8F +
+                    std::min(1.0F, drop / resolution) * 0.55F +
+                    Clamp01(candidate.surfel.confidence) * 0.35F +
+                    Clamp01(candidate.surfel.normalCoherence) * 0.35F +
+                    normalAgreement * 0.45F -
+                    Clamp01(candidate.surfel.roughness) * 0.15F -
+                    glm::length(candidatePosition - expectedPosition) /
+                        std::max(resolution, 1.0e-5F) * 0.12F;
+                if (!selected.hit || score > selectedScore) {
+                    selected = candidate;
+                    selected.surfel.normal = FromGlm(candidateNormal);
+                    selectedScore = score;
+                }
+            }
+        }
+        if (!selected.hit) {
+            break;
+        }
+
+        const glm::vec3 nextPosition = ToGlm(selected.surfel.centroid);
+        const glm::vec3 segment = nextPosition - currentPosition;
+        const float segmentLength = glm::length(segment);
+        if (segmentLength <= 1.0e-5F) {
+            break;
+        }
+        glm::vec3 nextNormal = SafeSeepageNormal(selected.surfel.normal);
+        if (glm::dot(nextNormal, currentNormal) < 0.0F) {
+            nextNormal = -nextNormal;
+        }
+        const float remaining = guide.requestedReachMeters - station;
+        if (segmentLength >= remaining) {
+            const float amount = remaining / segmentLength;
+            glm::vec3 endNormal = glm::mix(currentNormal, nextNormal, amount);
+            endNormal = glm::dot(endNormal, endNormal) > kNormalEpsilon
+                            ? glm::normalize(endNormal)
+                            : currentNormal;
+            rawSamples.push_back({
+                .position = FromGlm(currentPosition + segment * amount),
+                .normal = FromGlm(endNormal),
+                .station = guide.requestedReachMeters,
+                .confidence = Clamp01(selected.surfel.confidence *
+                                      (0.45F + 0.55F *
+                                                   selected.surfel.normalCoherence)),
+            });
+            station = guide.requestedReachMeters;
+            break;
+        }
+
+        station += segmentLength;
+        rawSamples.push_back({
+            .position = selected.surfel.centroid,
+            .normal = FromGlm(nextNormal),
+            .station = station,
+            .confidence = Clamp01(selected.surfel.confidence *
+                                  (0.45F + 0.55F * selected.surfel.normalCoherence)),
+        });
+        visited.insert({
+            selected.surfel.cellX,
+            selected.surfel.cellY,
+            selected.surfel.cellZ});
+        previousDirection = segment / segmentLength;
+        currentPosition = nextPosition;
+        currentNormal = nextNormal;
+    }
+
+    guide.achievedReachMeters = station;
+    guide.complete = station + resolution >= guide.requestedReachMeters;
+    if (rawSamples.size() < 2U || station <= resolution * 0.25F) {
+        return guide;
+    }
+
+    const std::size_t outputCount = std::min<std::size_t>(
+        kWaterSeepageMaximumGuideSamples,
+        std::max<std::size_t>(2U, rawSamples.size()));
+    std::size_t rawSegment = 0U;
+    glm::vec3 previousOutputNormal = SafeSeepageNormal(rawSamples.front().normal);
+    for (std::size_t outputIndex = 0U; outputIndex < outputCount; ++outputIndex) {
+        const float targetStation = outputIndex + 1U == outputCount
+                                        ? station
+                                        : station * static_cast<float>(outputIndex) /
+                                              static_cast<float>(outputCount - 1U);
+        while (rawSegment + 1U < rawSamples.size() &&
+               rawSamples[rawSegment + 1U].station < targetStation) {
+            ++rawSegment;
+        }
+        const auto& left = rawSamples[rawSegment];
+        const auto& right = rawSamples[std::min<std::size_t>(
+            rawSegment + 1U,
+            rawSamples.size() - 1U)];
+        const float stationSpan = std::max(1.0e-5F, right.station - left.station);
+        const float amount = Clamp01((targetStation - left.station) / stationSpan);
+        glm::vec3 leftNormal = SafeSeepageNormal(left.normal);
+        glm::vec3 rightNormal = SafeSeepageNormal(right.normal);
+        if (glm::dot(leftNormal, rightNormal) < 0.0F) {
+            rightNormal = -rightNormal;
+        }
+        glm::vec3 normal = glm::mix(leftNormal, rightNormal, amount);
+        normal = glm::dot(normal, normal) > kNormalEpsilon
+                     ? glm::normalize(normal)
+                     : previousOutputNormal;
+        if (glm::dot(normal, previousOutputNormal) < 0.0F) {
+            normal = -normal;
+        }
+        guide.samples[outputIndex] = {
+            .position = FromGlm(glm::mix(
+                ToGlm(left.position),
+                ToGlm(right.position),
+                amount)),
+            .normal = FromGlm(normal),
+            .station = targetStation,
+            .confidence = std::lerp(left.confidence, right.confidence, amount),
+        };
+        previousOutputNormal = normal;
+    }
+    guide.sampleCount = static_cast<std::uint32_t>(outputCount);
+    guide.valid = true;
+    return guide;
+}
+
 }  // namespace
 
 std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
@@ -6148,6 +7453,17 @@ std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
                           1000.0F) * kSeepageMaximumReachScale,
                   }
                 : TraceWaterSeepageSurfaceGuide(node, *selectedSupport));
+    }
+    return guides;
+}
+
+std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
+    std::span<const WaterSeepageNode> nodes,
+    const WaterSurfaceCache& surfaceCache) {
+    std::vector<WaterSeepageSurfaceGuide> guides;
+    guides.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        guides.push_back(TraceWaterSeepageSurfaceCacheGuide(node, surfaceCache));
     }
     return guides;
 }
@@ -6621,27 +7937,48 @@ void IncludeEffectPoint(WaterEffectOverlay* overlay, WaterEffectPoint point) {
     overlay->points.push_back(point);
 }
 
-std::vector<std::vector<WaterOverlayPoint>> GroupAnchorPaths(const WaterOverlay& pathAnchors) {
-    std::vector<std::vector<WaterOverlayPoint>> paths;
+template <typename IncludePath>
+void ForEachAnchorPath(
+    std::span<const WaterOverlayPoint> anchorPoints,
+    IncludePath&& includePath) {
     std::vector<WaterOverlayPoint> currentPath;
     float currentFlowId = -1.0F;
-    for (const auto& point : pathAnchors.points) {
+    std::size_t pathIndex = 0U;
+    const auto flushPath = [&]() {
+        if (currentPath.size() >= 2U) {
+            includePath(
+                std::span<const WaterOverlayPoint>{currentPath},
+                pathIndex++);
+        }
+        currentPath.clear();
+    };
+    for (const auto& point : anchorPoints) {
         if (point.particleRole >= 0.5F) {
             continue;
         }
         if (!currentPath.empty() && std::abs(point.flowId - currentFlowId) > 1.0e-4F) {
-            if (currentPath.size() >= 2U) {
-                paths.push_back(std::move(currentPath));
-            }
-            currentPath.clear();
+            flushPath();
         }
         currentFlowId = point.flowId;
         currentPath.push_back(point);
     }
-    if (currentPath.size() >= 2U) {
-        paths.push_back(std::move(currentPath));
-    }
+    flushPath();
+}
+
+std::vector<std::vector<WaterOverlayPoint>> GroupAnchorPaths(
+    std::span<const WaterOverlayPoint> anchorPoints) {
+    std::vector<std::vector<WaterOverlayPoint>> paths;
+    ForEachAnchorPath(
+        anchorPoints,
+        [&](std::span<const WaterOverlayPoint> path, std::size_t) {
+            paths.emplace_back(path.begin(), path.end());
+        });
     return paths;
+}
+
+std::vector<std::vector<WaterOverlayPoint>> GroupAnchorPaths(
+    const WaterOverlay& pathAnchors) {
+    return GroupAnchorPaths(pathAnchors.points);
 }
 
 float PathLengthMeters(const std::vector<WaterOverlayPoint>& path) {
@@ -8430,90 +9767,164 @@ float LaneAnalysisWeight(
     return 1.0F + (analysisWeight - 1.0F) * std::clamp(analysisInfluence, 0.0F, 1.0F);
 }
 
-std::vector<std::uint32_t> AllocateExactTrailCountsForPaths(
-    const std::vector<float>& pathLengths,
-    const std::vector<float>& pathWeights,
-    std::uint32_t requestedTrailCount) {
-    std::vector<std::uint32_t> allocations(pathLengths.size(), 0U);
-    if (requestedTrailCount == 0U || pathLengths.empty()) {
-        return allocations;
+float FlowEndpointFade(float pathDistance, float pathLength, float fadeScaleMeters) {
+    if (pathLength <= 1.0e-5F) {
+        return 0.0F;
+    }
+    const float endpointDistance = std::max(
+        0.0F,
+        std::min(pathDistance, pathLength - pathDistance));
+    const float fadeDistance = std::min(
+        pathLength * 0.25F,
+        std::max(0.02F, fadeScaleMeters));
+    return SmoothStep(0.0F, fadeDistance, endpointDistance);
+}
+
+float TwoOctaveFlowTurbulence(
+    float worldArcDistanceMeters,
+    float scaleMeters,
+    float primarySeed,
+    float secondarySeed) {
+    constexpr float kTau = 6.28318530718F;
+    const float coordinate = worldArcDistanceMeters / std::max(0.005F, scaleMeters);
+    const float primary = std::sin(kTau * (coordinate + primarySeed));
+    const float secondary = std::sin(kTau * (coordinate * 2.07F + secondarySeed));
+    return primary * 0.68F + secondary * 0.32F;
+}
+
+std::vector<WaterOverlayPoint> BuildSurfaceGuidedFlowPath(
+    const PreparedFlowPath& authoredPath,
+    float sampleSpacingMeters,
+    float laneSpanMeters,
+    float surfaceFollow,
+    float downhillPull,
+    float terrainWidthResponse,
+    const WaterFlowTrailBuildOptions& options) {
+    const auto* cache = options.surfaceCache;
+    if (!options.useSurfaceGuide || cache == nullptr || cache->flowSurfaceSurfels.empty() ||
+        authoredPath.anchors == nullptr || authoredPath.anchors->size() < 2U ||
+        authoredPath.lengthMeters <= 1.0e-5F || surfaceFollow <= 1.0e-5F) {
+        return {};
     }
 
-    struct Candidate {
-        std::size_t index = 0U;
-        float weight = 0.0F;
-        double remainder = 0.0;
+    const auto cancelled = [&options]() {
+        return options.stopToken != nullptr && options.stopToken->stop_requested();
     };
+    const float resolution = std::clamp(cache->resolutionMeters, 0.001F, 1.0F);
+    const float laneHalfWidth = std::max(0.0F, laneSpanMeters) * 0.5F;
+    // Authored nodes are surface-snapped, so only query the immediately local
+    // sheet. Keeping this independent of a very wide lane cover prevents a
+    // large cubic neighbourhood scan in the CPU reference implementation.
+    const float localLaneSupport = std::min(laneHalfWidth, resolution * 2.0F);
+    const float searchRadius = std::clamp(
+        std::max(resolution * 2.5F, localLaneSupport),
+        resolution,
+        std::max(resolution, 0.10F));
+    const float spacing = std::max(0.001F, sampleSpacingMeters);
+    const std::uint32_t pointCount = std::max<std::uint32_t>(
+        2U,
+        static_cast<std::uint32_t>(std::ceil(authoredPath.lengthMeters / spacing)) + 1U);
 
-    std::vector<Candidate> candidates;
-    candidates.reserve(pathLengths.size());
-    for (std::size_t index = 0U; index < pathLengths.size(); ++index) {
-        const float length = pathLengths[index];
-        if (length <= 1.0e-5F) {
+    std::vector<WaterOverlayPoint> guided;
+    guided.reserve(pointCount);
+    glm::vec3 previousSurfaceNormal{0.0F, 0.0F, 0.0F};
+    bool hasPreviousSurfaceNormal = false;
+    bool foundSupport = false;
+    for (std::uint32_t index = 0U; index < pointCount; ++index) {
+        if ((index & 255U) == 0U && cancelled()) {
+            return {};
+        }
+        const float distance = std::min(
+            authoredPath.lengthMeters,
+            static_cast<float>(index) * spacing);
+        auto anchor = InterpolatePreparedPathByArcLength(authoredPath, distance);
+        anchor.width = 1.0F;
+        const glm::vec3 authoredPosition = ToGlm(anchor.position);
+        const glm::vec3 authoredNormal = SafeOverlayNormal(ToGlm(anchor.normal));
+        const glm::vec3 referenceNormal =
+            hasPreviousSurfaceNormal ? previousSurfaceNormal : authoredNormal;
+        const auto query = QueryWaterSurfaceCache(
+            *cache,
+            anchor.position,
+            searchRadius,
+            FromGlm(referenceNormal));
+        if (!query.hit) {
+            guided.push_back(anchor);
             continue;
         }
-        const float weight = index < pathWeights.size() ? std::max(0.0F, pathWeights[index]) : length;
-        candidates.push_back({.index = index, .weight = weight > 1.0e-5F ? weight : length});
-    }
-    if (candidates.empty()) {
-        return allocations;
-    }
 
-    auto byWeight = [](const Candidate& left, const Candidate& right) {
-        if (left.weight != right.weight) {
-            return left.weight > right.weight;
+        foundSupport = true;
+        glm::vec3 surfaceNormal = SafeOverlayNormal(ToGlm(query.surfel.normal));
+        if (glm::dot(surfaceNormal, referenceNormal) < 0.0F) {
+            surfaceNormal = -surfaceNormal;
         }
-        return left.index < right.index;
-    };
-    std::sort(candidates.begin(), candidates.end(), byWeight);
+        previousSurfaceNormal = surfaceNormal;
+        hasPreviousSurfaceNormal = true;
 
-    const std::uint32_t initiallyAssigned =
-        std::min<std::uint32_t>(requestedTrailCount, static_cast<std::uint32_t>(candidates.size()));
-    for (std::uint32_t index = 0U; index < initiallyAssigned; ++index) {
-        allocations[candidates[index].index] = 1U;
-    }
-    if (initiallyAssigned == requestedTrailCount) {
-        return allocations;
-    }
-
-    const std::uint32_t remaining = requestedTrailCount - initiallyAssigned;
-    double totalWeight = 0.0;
-    for (const auto& candidate : candidates) {
-        totalWeight += static_cast<double>(std::max(candidate.weight, 0.0F));
-    }
-    if (totalWeight <= 1.0e-9) {
-        totalWeight = static_cast<double>(candidates.size());
-        for (auto& candidate : candidates) {
-            candidate.weight = 1.0F;
+        glm::vec3 authoredTangent = TangentAtPreparedPathDistance(
+            authoredPath,
+            distance,
+            spacing * 2.0F);
+        if (glm::dot(authoredTangent, authoredTangent) <= kNormalEpsilon) {
+            authoredTangent = {1.0F, 0.0F, 0.0F};
+        } else {
+            authoredTangent = glm::normalize(authoredTangent);
         }
+
+        glm::vec3 displacement = ToGlm(query.surfel.centroid) - authoredPosition;
+        // Surface guidance may move across the authored corridor but never back
+        // along it, preserving the first-to-last route direction.
+        displacement -= authoredTangent * glm::dot(displacement, authoredTangent);
+        glm::vec3 projectedGravity = kGravity - surfaceNormal * glm::dot(kGravity, surfaceNormal);
+        projectedGravity -= authoredTangent * glm::dot(projectedGravity, authoredTangent);
+        if (laneHalfWidth > 1.0e-6F && glm::dot(projectedGravity, projectedGravity) > kNormalEpsilon) {
+            displacement += glm::normalize(projectedGravity) * laneHalfWidth * 0.5F *
+                            std::clamp(downhillPull, 0.0F, 1.0F);
+        }
+        if (laneHalfWidth <= 1.0e-6F) {
+            displacement = {0.0F, 0.0F, 0.0F};
+        } else {
+            const float displacementLength = glm::length(displacement);
+            if (displacementLength > laneHalfWidth) {
+                displacement *= laneHalfWidth / displacementLength;
+            }
+        }
+
+        const float roughness = Clamp01(query.surfel.roughness);
+        const float coherence = Clamp01(query.surfel.normalCoherence);
+        const float confidence = Clamp01(query.surfel.confidence);
+        const float support = std::clamp(
+            confidence * (0.40F + coherence * 0.60F) * (1.0F - roughness * 0.35F),
+            0.0F,
+            1.0F);
+        const float endpointFade = FlowEndpointFade(
+            distance,
+            authoredPath.lengthMeters,
+            std::max(resolution * 2.0F, spacing * 2.0F));
+        const float follow = std::clamp(surfaceFollow, 0.0F, 1.0F) * support * endpointFade;
+        anchor.position = FromGlm(authoredPosition + displacement * follow);
+        anchor.normal = FromGlm(SafeOverlayNormal(glm::mix(authoredNormal, surfaceNormal, follow)));
+        anchor.confidence = std::clamp(
+            anchor.confidence * (1.0F + (support - 1.0F) * follow),
+            0.0F,
+            1.0F);
+        anchor.surfaceSteepness = std::max(
+            anchor.surfaceSteepness,
+            Clamp01(1.0F - std::abs(surfaceNormal.z)) * follow);
+
+        // Well-supported, coherent sheets retain the requested lane cover;
+        // rough or weak support bunches lanes without exceeding that cover.
+        const float terrainSpanScale = std::clamp(
+            0.50F + confidence * 0.25F + coherence * 0.30F - roughness * 0.20F,
+            0.45F,
+            1.0F);
+        const float widthInfluence =
+            std::clamp(terrainWidthResponse, 0.0F, 1.0F) * follow;
+        anchor.width = 1.0F + (terrainSpanScale - 1.0F) * widthInfluence;
+        guided.push_back(anchor);
     }
 
-    std::uint32_t assignedExtra = 0U;
-    for (auto& candidate : candidates) {
-        const double exactShare =
-            (static_cast<double>(remaining) * static_cast<double>(candidate.weight)) / totalWeight;
-        const auto extra = static_cast<std::uint32_t>(std::floor(exactShare));
-        allocations[candidate.index] += extra;
-        assignedExtra += extra;
-        candidate.remainder = exactShare - static_cast<double>(extra);
-    }
-
-    std::sort(
-        candidates.begin(),
-        candidates.end(),
-        [](const Candidate& left, const Candidate& right) {
-            if (left.remainder != right.remainder) {
-                return left.remainder > right.remainder;
-            }
-            if (left.weight != right.weight) {
-                return left.weight > right.weight;
-            }
-            return left.index < right.index;
-        });
-    for (std::uint32_t index = 0U; assignedExtra < remaining; ++index, ++assignedExtra) {
-        allocations[candidates[index % candidates.size()].index] += 1U;
-    }
-    return allocations;
+    return foundSupport ? guided : std::vector<WaterOverlayPoint>{};
 }
 
 WaterTrailOverlay BuildTrailOverlayFromPaths(
@@ -8527,6 +9938,10 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     float laneSpreadMeters,
     std::uint32_t requestedLaneCount,
     float turbulence,
+    float surfaceFollow,
+    float downhillPull,
+    float terrainWidthResponse,
+    float turbulenceScaleMeters,
     float laneCrossing,
     float pathAttraction,
     float trailSmoothness,
@@ -8547,6 +9962,20 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
     const float safeTrailWidth = std::max(0.0005F, trailWidthMeters);
     const float laneSpan = std::max(0.0F, laneSpreadMeters);
     const float lanePitch = std::max(safeTrailWidth * 0.5F, 0.00025F);
+    const float safeSurfaceFollow =
+        std::clamp(std::isfinite(surfaceFollow) ? surfaceFollow : 0.85F, 0.0F, 1.0F);
+    const float safeDownhillPull =
+        std::clamp(std::isfinite(downhillPull) ? downhillPull : 0.35F, 0.0F, 1.0F);
+    const float safeTerrainWidthResponse = std::clamp(
+        std::isfinite(terrainWidthResponse) ? terrainWidthResponse : 0.65F,
+        0.0F,
+        1.0F);
+    const float safeTurbulenceScaleMeters = std::clamp(
+        std::isfinite(turbulenceScaleMeters) ? turbulenceScaleMeters : 0.18F,
+        0.005F,
+        100.0F);
+    const float signedSurfaceOffsetMeters =
+        std::isfinite(surfaceOffsetMeters) ? surfaceOffsetMeters : 0.0F;
     const float analysisGuideInfluence =
         LaneAnalysisGuideInfluence(turbulence, laneCrossing, pathAttraction, trailLooseness);
 
@@ -8634,14 +10063,31 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             return {};
         }
         const auto& path = paths[pathIndex];
-        const auto& preparedPath = preparedPaths[pathIndex];
-        const float pathLength = pathLengths[pathIndex];
-        if (path.size() < 2U || pathLength <= 1.0e-5F) {
+        const auto& authoredPreparedPath = preparedPaths[pathIndex];
+        const float authoredPathLength = pathLengths[pathIndex];
+        if (path.size() < 2U || authoredPathLength <= 1.0e-5F) {
             continue;
         }
         const std::uint32_t trailsForPath =
             pathIndex < trailAllocations.size() ? trailAllocations[pathIndex] : 0U;
         if (trailsForPath == 0U) {
+            continue;
+        }
+        auto surfaceGuidedPath = BuildSurfaceGuidedFlowPath(
+            authoredPreparedPath,
+            safeSpacing,
+            laneSpan,
+            safeSurfaceFollow,
+            safeDownhillPull,
+            safeTerrainWidthResponse,
+            buildOptions);
+        auto surfaceGuidedPreparedPath = surfaceGuidedPath.empty()
+                                             ? PreparedFlowPath{}
+                                             : PrepareFlowPath(surfaceGuidedPath);
+        const PreparedFlowPath& preparedPath =
+            surfaceGuidedPath.empty() ? authoredPreparedPath : surfaceGuidedPreparedPath;
+        const float pathLength = preparedPath.lengthMeters;
+        if (pathLength <= 1.0e-5F) {
             continue;
         }
         const auto routeStartIndex = static_cast<std::uint32_t>(std::min<std::size_t>(
@@ -8672,8 +10118,12 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             }
             tangent = glm::normalize(tangent);
             const auto localAnalysis = SampleLaneAnalysis(analysisBranch, routeDistance);
-            const float localSpan =
+            float localSpan =
                 LaneAnalysisSpan(localAnalysis, laneSpan, safeTrailWidth, analysisGuideInfluence);
+            if (!surfaceGuidedPath.empty()) {
+                localSpan = std::min(localSpan, laneSpan) *
+                            std::clamp(anchor.width, 0.45F, 1.0F);
+            }
             const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
             const float localSpeed = std::max(
                 0.01F,
@@ -8682,7 +10132,8 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                     : speedMetersPerSecond);
 
             WaterTrailSample routeSample;
-            routeSample.position = FromGlm(ToGlm(anchor.position) + normal * std::max(0.0F, surfaceOffsetMeters));
+            routeSample.position =
+                FromGlm(ToGlm(anchor.position) + normal * signedSurfaceOffsetMeters);
             routeSample.normal = FromGlm(normal);
             routeSample.tangent = FromGlm(tangent);
             routeSample.red = 0U;
@@ -8734,7 +10185,9 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
             const float laneCellWidth =
                 potentialLaneCount > 0U ? laneSpan / static_cast<float>(potentialLaneCount) : 0.0F;
             const float laneJitterAmplitude =
-                laneSpan <= 1.0e-6F ? 0.0F : std::min(lanePitch, laneCellWidth) * 0.18F;
+                potentialLaneCount <= 1U || laneSpan <= 1.0e-6F
+                    ? 0.0F
+                    : std::min(lanePitch, laneCellWidth) * 0.18F;
             const float laneJitter =
                 (RegionHash01(seed + branchId, trailId, 7011U) - 0.5F) * 2.0F * laneJitterAmplitude;
             const float laneJitterUnit =
@@ -8776,8 +10229,12 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                 }
                 const float pointAge = safeLength > 1.0e-5F ? localDistance / safeLength : 0.0F;
                 const auto localAnalysis = SampleLaneAnalysis(analysisBranch, pathDistance);
-                const float localSpan =
+                float localSpan =
                     LaneAnalysisSpan(localAnalysis, laneSpan, safeTrailWidth, analysisGuideInfluence);
+                if (!surfaceGuidedPath.empty()) {
+                    localSpan = std::min(localSpan, laneSpan) *
+                                std::clamp(anchor.width, 0.45F, 1.0F);
+                }
                 const float localPitch = LaneAnalysisPitch(localAnalysis, lanePitch, localSpan, potentialLaneCount);
                 const float localTurbulence =
                     localAnalysis.available
@@ -8803,26 +10260,33 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                 const float dynamicBaseOffset =
                     localAnalysis.available
                         ? (baseLaneUnit + laneJitterUnit) * localSpan * (1.0F - attraction * 0.18F)
-                        : laneOffset;
-                const float wavePhase =
-                    static_cast<float>(sampleIndex) *
-                        (0.43F + localAnalysis.ripplePotential * 0.32F * analysisGuideInfluence) +
-                    trailSeed * 6.28318530718F +
-                    pathDistance * (1.7F + localAnalysis.curvature * 2.2F * analysisGuideInfluence);
-                const float wobbleAmplitude =
-                    localAnalysis.available
-                        ? localSpan * (0.015F + motionLooseness * 0.035F) *
-                              (0.25F + localTurbulence +
-                               localAnalysis.ripplePotential * 0.85F * analysisGuideInfluence)
-                        : std::min(lanePitch * 0.35F, safeTrailWidth * 0.20F) * localTurbulence;
-                const float wobble = std::sin(wavePhase) * wobbleAmplitude * (1.0F - smoothness * 0.45F);
+                        : (!surfaceGuidedPath.empty()
+                               ? (baseLaneUnit + laneJitterUnit) * localSpan
+                               : laneOffset);
+                const float turbulenceDrive =
+                    std::sqrt(std::max(0.0F, localTurbulence)) +
+                    localAnalysis.ripplePotential * 0.65F * analysisGuideInfluence;
+                const float wobbleAmplitude = std::min(
+                    localSpan * 0.22F,
+                    localSpan * (0.035F + motionLooseness * 0.060F) * turbulenceDrive);
+                const float turbulenceNoise = TwoOctaveFlowTurbulence(
+                    pathDistance,
+                    safeTurbulenceScaleMeters,
+                    trailSeed,
+                    laneSeed);
+                const float endpointFade = FlowEndpointFade(
+                    pathDistance,
+                    pathLength,
+                    std::max(safeTurbulenceScaleMeters * 0.50F, safeSpacing * 2.0F));
+                const float wobble = turbulenceNoise * wobbleAmplitude *
+                                     (1.0F - smoothness * 0.45F) * endpointFade;
                 const float curl =
                     localAnalysis.available
                         ? std::cos(
                               pathDistance * (2.1F + localAnalysis.eddyPotential * 4.0F) +
                               trailCrossSeed * 6.28318530718F) *
                               localSpan * 0.12F * localAnalysis.eddyPotential *
-                              (0.35F + localTurbulence) * analysisGuideInfluence
+                              (0.35F + localTurbulence) * analysisGuideInfluence * endpointFade
                         : 0.0F;
                 const float crossing =
                     localAnalysis.available
@@ -8831,7 +10295,7 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                               trailCrossSeed * 6.28318530718F) *
                               localSpan * 0.10F * laneCrossingAmount *
                               std::max({localAnalysis.confluence, localAnalysis.ripplePotential, localTurbulence}) *
-                              analysisGuideInfluence
+                              analysisGuideInfluence * endpointFade
                         : 0.0F;
                 const float lateralLimit =
                     localAnalysis.available
@@ -8839,11 +10303,14 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
                               (1.0F + laneCrossingAmount * 0.18F *
                                            std::max({localAnalysis.confluence, localAnalysis.ripplePotential, localTurbulence}) *
                                            analysisGuideInfluence)
-                        : std::numeric_limits<float>::max();
+                        : localSpan * 0.5F;
                 const float lateralOffset =
-                    std::clamp(dynamicBaseOffset + wobble + curl + crossing, -lateralLimit, lateralLimit);
+                    std::clamp(
+                        dynamicBaseOffset * endpointFade + wobble + curl + crossing,
+                        -lateralLimit,
+                        lateralLimit);
                 position += lateral * lateralOffset;
-                position += normal * std::max(0.0F, surfaceOffsetMeters);
+                position += normal * signedSurfaceOffsetMeters;
 
                 WaterTrailSample sample;
                 sample.position = FromGlm(position);
@@ -8908,6 +10375,83 @@ WaterTrailOverlay BuildTrailOverlayFromPaths(
 }
 
 }  // namespace
+
+WaterFlowGpuCompactSourceInput BuildWaterFlowGpuSampledSourceInput(
+    std::span<const WaterOverlayPoint> anchors,
+    const WaterFlowTrailSettings& settings,
+    const WaterPathAnalysisCache* analysis) {
+    WaterFlowGpuCompactSourceInput source;
+    source.points.reserve(anchors.size());
+    const float analysisGuideInfluence = LaneAnalysisGuideInfluence(
+        settings.turbulence,
+        settings.laneCrossing,
+        settings.pathAttraction,
+        settings.trailLooseness);
+    const float laneSpan = std::max(0.0F, settings.laneSpreadMeters);
+    bool overflowed = false;
+
+    ForEachAnchorPath(anchors, [&](std::span<const WaterOverlayPoint> path, std::size_t pathIndex) {
+        if (overflowed) {
+            return;
+        }
+        auto compact = BuildWaterFlowGpuSampledInput(path);
+        if (!compact.Valid()) {
+            return;
+        }
+        if (source.points.size() > std::numeric_limits<std::uint32_t>::max() ||
+            compact.points.size() >
+                std::numeric_limits<std::uint32_t>::max() - source.points.size()) {
+            overflowed = true;
+            return;
+        }
+
+        const std::uint32_t branchId = path.empty()
+                                           ? 0U
+                                           : static_cast<std::uint32_t>(std::max(
+                                                 0.0F,
+                                                 std::floor(path.front().flowId + 0.5F)));
+        const auto* analysisBranch = FindPathAnalysisBranch(analysis, branchId);
+        WaterFlowGpuCompactBranch branch;
+        branch.inputStart = static_cast<std::uint32_t>(source.points.size());
+        branch.inputCount = static_cast<std::uint32_t>(compact.points.size());
+        branch.branchId = branchId;
+        branch.pathId = static_cast<std::uint32_t>(pathIndex + 1U);
+        branch.routeLengthMeters = compact.routeLengthMeters;
+        branch.allocationWeight =
+            compact.routeLengthMeters *
+            LaneAnalysisWeight(analysisBranch, laneSpan, analysisGuideInfluence);
+        source.branches.push_back(branch);
+        source.points.insert(
+            source.points.end(),
+            compact.points.begin(),
+            compact.points.end());
+    });
+    if (overflowed) {
+        return {};
+    }
+    return source.Valid() ? source : WaterFlowGpuCompactSourceInput{};
+}
+
+WaterFlowGpuCompactSourceInput BuildWaterFlowGpuManualSplineSourceInput(
+    std::span<const invisible_places::io::Float3> controlPoints,
+    std::uint32_t branchId,
+    std::uint32_t pathId) {
+    WaterFlowGpuCompactSourceInput source;
+    auto compact = BuildWaterFlowGpuManualSplineInput(controlPoints);
+    if (!compact.Valid() || compact.points.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return source;
+    }
+    source.points = std::move(compact.points);
+    source.branches.push_back({
+        .inputStart = 0U,
+        .inputCount = static_cast<std::uint32_t>(source.points.size()),
+        .branchId = branchId,
+        .pathId = std::max(1U, pathId),
+        .routeLengthMeters = compact.routeLengthMeters,
+        .allocationWeight = compact.routeLengthMeters,
+    });
+    return source;
+}
 
 std::array<WaterRippleOverlayType, 11> AllWaterRippleOverlayTypes() {
     return {
@@ -9705,6 +11249,10 @@ WaterTrailOverlay BuildAnimatedWaterTrailOverlay(
         settings.laneSpreadMeters,
         settings.laneCount,
         settings.turbulence,
+        settings.surfaceFollow,
+        settings.downhillPull,
+        settings.terrainWidthResponse,
+        settings.turbulenceScaleMeters,
         settings.laneCrossing,
         settings.pathAttraction,
         settings.trailSmoothness,
@@ -9767,6 +11315,10 @@ WaterTrailOverlay BuildFlowTrailOverlayFromPathAnchors(
         settings.laneSpreadMeters,
         settings.laneCount,
         settings.turbulence,
+        settings.surfaceFollow,
+        settings.downhillPull,
+        settings.terrainWidthResponse,
+        settings.turbulenceScaleMeters,
         settings.laneCrossing,
         settings.pathAttraction,
         settings.trailSmoothness,

@@ -127,6 +127,16 @@ struct PointCloudDensityCompensation {
     float coverageCorrection = 1.0F;
 };
 
+struct WaterFlowActivityScales {
+    float activity = 1.0F;
+    float trailVisibility = 1.0F;
+    float appearance = 1.0F;
+    float width = 1.0F;
+    float speed = 1.0F;
+    float visibleLength = 1.0F;
+    float lateralMotion = 0.15F;
+};
+
 struct PointCloudStyleState {
     PointCloudStyleState();
 
@@ -166,6 +176,11 @@ struct PointCloudStyleState {
     float featherPower = 1.6F;
     float waterStreakAspect = 1.0F;
     bool waterTrailStyleGeometry = false;
+    // Runtime-only effective activity for one Water Flow trail source.
+    float waterFlowActivity = 1.0F;
+    // Runtime-only multiplier for authored Water Flow trail speed. This is kept
+    // out of the stream scalar payload so speed-only edits can be uniform-only.
+    float waterFlowSpeedScale = 1.0F;
     bool solidCenters = true;
     bool flowAnimation = false;
     bool waterPathView = false;
@@ -264,6 +279,10 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style);
+[[nodiscard]] WaterFlowActivityScales ResolveWaterFlowActivityScales(
+    float effectiveActivity,
+    float trailSeed);
+[[nodiscard]] float SanitizeWaterFlowSpeedScale(float speedScale);
 [[nodiscard]] float ShorelineWaveHeightMask(
     float boundaryZ,
     float reachMeters,

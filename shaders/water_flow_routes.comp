@@ -1,0 +1,250 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#include "water_flow_gpu_common.glsl"
+
+void main() {
+    const uint branchIndex = gl_WorkGroupID.y;
+    const uint laneOrdinal = gl_GlobalInvocationID.x;
+    if (branchIndex >= flow.counts0.y) {
+        return;
+    }
+    const WaterFlowBranch branch = flowBranches.branches[branchIndex];
+    const uint activeLaneCount = branch.trailLane.x;
+    const uint routePointCount = branch.inputRoute.w;
+    const uint potentialLaneCount = branch.identity.x;
+    if (laneOrdinal >= activeLaneCount || routePointCount < 2u ||
+        potentialLaneCount == 0u) {
+        return;
+    }
+    const uint branchId = branch.identity.y;
+    const uint pathId = branch.identity.z;
+    const bool positiveSideFirst =
+        FlowHash01(flow.metadata.x + branchId, pathId, 7005u) >= 0.5;
+    const uint laneIndex = FlowCenteredLaneIndex(
+        laneOrdinal,
+        potentialLaneCount,
+        positiveSideFirst);
+
+    // Match the CPU lane-centre contract: routes sit at cell centres inside
+    // the requested cover instead of placing the outer routes on its edges.
+    const float laneCoordinate = potentialLaneCount <= 1u
+        ? 0.0
+        : ((float(laneIndex) + 0.5) / float(potentialLaneCount)) - 0.5;
+    vec3 previousNormal = vec3(0.0, 0.0, 1.0);
+    vec3 previousSurfacePosition = vec3(0.0);
+    vec3 previousSurfaceNormal = vec3(0.0, 0.0, 1.0);
+    uint previousSurfaceRole = 0u;
+    bool hasPreviousSurface = false;
+    const uint routeStart = branch.inputRoute.z + laneOrdinal * routePointCount;
+    const float routeLength = branch.metrics.x;
+    const float routeSpacing = max(branch.metrics.y, 0.001);
+    for (uint routeIndex = 0u; routeIndex < routePointCount; ++routeIndex) {
+        const float routeT = float(routeIndex) / float(routePointCount - 1u);
+        const float distanceMeters = routeLength * routeT;
+        vec3 authoredPosition;
+        vec3 authoredNormal;
+        float confidence;
+        FlowEvaluateAuthored(
+            distanceMeters,
+            branch,
+            authoredPosition,
+            authoredNormal,
+            confidence);
+
+        vec3 previousPosition;
+        vec3 nextPosition;
+        vec3 unusedNormal;
+        float unusedConfidence;
+        FlowEvaluateAuthored(
+            max(0.0, distanceMeters - routeSpacing),
+            branch,
+            previousPosition,
+            unusedNormal,
+            unusedConfidence);
+        FlowEvaluateAuthored(
+            min(routeLength, distanceMeters + routeSpacing),
+            branch,
+            nextPosition,
+            unusedNormal,
+            unusedConfidence);
+        vec3 tangent = FlowSafeNormalize(nextPosition - previousPosition, vec3(1.0, 0.0, 0.0));
+        const vec3 frameSeed = routeIndex == 0u ? authoredNormal : previousNormal;
+        vec3 transportedNormal = frameSeed - tangent * dot(frameSeed, tangent);
+        if (dot(transportedNormal, transportedNormal) <= 1e-8) {
+            const vec3 tangentAbs = abs(tangent);
+            const vec3 leastAlignedAxis =
+                tangentAbs.x <= tangentAbs.y && tangentAbs.x <= tangentAbs.z
+                    ? vec3(1.0, 0.0, 0.0)
+                    : (tangentAbs.y <= tangentAbs.z
+                           ? vec3(0.0, 1.0, 0.0)
+                           : vec3(0.0, 0.0, 1.0));
+            transportedNormal =
+                leastAlignedAxis - tangent * dot(leastAlignedAxis, tangent);
+        }
+        authoredNormal = FlowSafeNormalize(transportedNormal, vec3(1.0, 0.0, 0.0));
+        if (dot(authoredNormal, previousNormal) < 0.0) {
+            authoredNormal = -authoredNormal;
+        }
+        vec3 lateral = FlowSafeNormalize(
+            cross(authoredNormal, tangent),
+            FlowSafeNormalize(cross(vec3(0.0, 0.0, 1.0), tangent), vec3(1.0, 0.0, 0.0)));
+
+        const float endpointFade = FlowEndpointFade(
+            distanceMeters,
+            routeLength,
+            routeSpacing);
+        const float halfSpan = max(0.0, flow.lane0.x) * 0.5;
+        float routeLaneSpan = max(0.0, flow.lane0.x);
+        float localLaneOffset = laneCoordinate * routeLaneSpan * endpointFade;
+        vec3 routePosition = authoredPosition + lateral * localLaneOffset;
+        vec3 routeNormal = authoredNormal;
+
+        if (flow.metadata.z != 0u && flow.surface0.z != 0u) {
+            const float searchRadius = clamp(
+                max(flow.route0.z * 1.75, halfSpan + flow.route0.z * 0.75),
+                flow.route0.z,
+                0.5);
+            const vec3 surfaceReferenceNormal = hasPreviousSurface
+                ? previousSurfaceNormal
+                : routeNormal;
+            const FlowSurfaceQuery support = FlowQuerySurface(
+                routePosition,
+                previousSurfacePosition,
+                surfaceReferenceNormal,
+                tangent,
+                lateral,
+                previousSurfaceRole,
+                hasPreviousSurface,
+                searchRadius);
+            if (support.hit) {
+                vec3 supportNormal = support.normal;
+                if (dot(supportNormal, surfaceReferenceNormal) < 0.0) {
+                    supportNormal = -supportNormal;
+                }
+                const float supportWeight = clamp(
+                    support.confidence * (0.4 + support.coherence * 0.6) *
+                        (1.0 - support.roughness * 0.35) *
+                        (0.72 + support.planarity * 0.28),
+                    0.0,
+                    1.0);
+                // Broad, planar support permits the full authored cover. Weak
+                // transverse support and groove-like concavity bunch lanes,
+                // but terrain can never expand beyond Lane Cover Width.
+                const float widthScale = clamp(
+                    0.50 + support.planarity * 0.24 +
+                        support.transverseSupport * 0.30 -
+                        support.concavity * 0.34 - support.roughness * 0.12,
+                    0.35,
+                    1.0);
+                const float terrainWidth = mix(
+                    1.0,
+                    widthScale,
+                    clamp(flow.guide0.z, 0.0, 1.0) * supportWeight);
+                routeLaneSpan = max(0.0, flow.lane0.x) * terrainWidth;
+                localLaneOffset =
+                    laneCoordinate * routeLaneSpan * endpointFade;
+                routePosition = authoredPosition + lateral * localLaneOffset;
+
+                vec3 displacement = support.position - routePosition;
+                displacement -= tangent * dot(displacement, tangent);
+                vec3 downhill = support.projectedGravity;
+                downhill -= tangent * dot(downhill, tangent);
+                if (dot(downhill, downhill) > 1e-8) {
+                    displacement += normalize(downhill) * halfSpan * 0.5 *
+                                    clamp(flow.guide0.y, 0.0, 1.0) *
+                                    support.gravityStrength;
+                }
+                const float displacementLength = length(displacement);
+                if (halfSpan <= 1e-6) {
+                    displacement = vec3(0.0);
+                } else if (displacementLength > halfSpan) {
+                    displacement *= halfSpan / displacementLength;
+                }
+                const float follow = clamp(flow.guide0.x, 0.0, 1.0) *
+                                     supportWeight * endpointFade;
+                routePosition += displacement * follow;
+                routeNormal = FlowSafeNormalize(mix(authoredNormal, supportNormal, follow), authoredNormal);
+                confidence *= mix(1.0, supportWeight, follow);
+
+                // Keep the accepted sheet identity independent from the
+                // authored corridor blend. The next query uses this centroid,
+                // normal and role for spatial/role hysteresis.
+                if (supportWeight > 0.04) {
+                    previousSurfacePosition = support.position;
+                    previousSurfaceNormal = supportNormal;
+                    previousSurfaceRole = support.role;
+                    hasPreviousSurface = true;
+                } else {
+                    hasPreviousSurface = false;
+                    previousSurfaceRole = 0u;
+                }
+            } else {
+                // Unsupported spans return to the authored rotation-minimising
+                // frame and do not drag a stale sheet identity across a gap.
+                hasPreviousSurface = false;
+                previousSurfaceRole = 0u;
+            }
+        }
+
+        const float corridorLimit = halfSpan;
+        const vec3 corridorDelta = routePosition - authoredPosition;
+        const float corridorDistance = length(corridorDelta);
+        if (corridorLimit > 1e-6 && corridorDistance > corridorLimit) {
+            routePosition = authoredPosition + corridorDelta * (corridorLimit / corridorDistance);
+        }
+
+        // Every lane begins and ends at the authored endpoints.
+        if (routeIndex == 0u || routeIndex + 1u == routePointCount) {
+            routePosition = authoredPosition;
+            routeNormal = authoredNormal;
+        }
+        if (dot(routeNormal, previousNormal) < 0.0) {
+            routeNormal = -routeNormal;
+        }
+        previousNormal = routeNormal;
+        routePosition += routeNormal * flow.route0.w;
+
+        const uint outputIndex = routeStart + routeIndex;
+        flowPositions.positions[outputIndex] = vec4(routePosition, 1.0);
+        flowNormals.normals[outputIndex] = vec4(routeNormal, 0.0);
+        FlowClearFields(outputIndex);
+        FlowStoreField(kTrailRoleFieldSlot, outputIndex, 0.0);
+        FlowStoreField(kSourceIdFieldSlot, outputIndex, float(flow.identity.x));
+        FlowStoreField(kPathIdFieldSlot, outputIndex, float(pathId));
+        FlowStoreField(kBranchIdFieldSlot, outputIndex, float(branchId));
+        FlowStoreField(kTrailDistanceFieldSlot, outputIndex, distanceMeters);
+        FlowStoreField(kTrailLengthFieldSlot, outputIndex, flow.trail0.x);
+        FlowStoreField(kRouteStartFieldSlot, outputIndex, float(routeStart));
+        FlowStoreField(kRouteCountFieldSlot, outputIndex, float(routePointCount));
+        FlowStoreField(kRouteLengthFieldSlot, outputIndex, routeLength);
+        FlowStoreField(kTrailStartPhaseFieldSlot, outputIndex, routeT);
+        FlowStoreField(kTrailLateralOffsetFieldSlot, outputIndex, localLaneOffset);
+        FlowStoreField(kTrailSpeedFieldSlot, outputIndex, max(0.01, flow.trail0.z));
+        FlowStoreField(kTrailWidthFieldSlot, outputIndex, max(0.0005, flow.lane0.y));
+        FlowStoreField(
+            kTrailStreakLengthFieldSlot,
+            outputIndex,
+            max(max(flow.lane0.y * 2.0, flow.trail0.w), flow.trail0.y * 2.5));
+        FlowStoreField(kTrailConfidenceFieldSlot, outputIndex, confidence);
+        FlowStoreField(kWetnessFieldSlot, outputIndex, clamp(0.35 + routeT * 0.65, 0.0, 1.0));
+        FlowStoreField(kFeatureTypeFieldSlot, outputIndex, 0.0);
+        FlowStoreField(kTangentXFieldSlot, outputIndex, tangent.x);
+        FlowStoreField(kTangentYFieldSlot, outputIndex, tangent.y);
+        FlowStoreField(kTangentZFieldSlot, outputIndex, tangent.z);
+        FlowStoreField(kLaneIndexFieldSlot, outputIndex, float(laneIndex));
+        FlowStoreField(kLaneCountFieldSlot, outputIndex, float(potentialLaneCount));
+        FlowStoreField(
+            kLanePitchFieldSlot,
+            outputIndex,
+            max(flow.lane0.y * 0.5, 0.00025));
+        FlowStoreField(kLaneSpanFieldSlot, outputIndex, routeLaneSpan);
+        FlowStoreField(kLaneCrossingFieldSlot, outputIndex, flow.shape0.x);
+        FlowStoreField(
+            kCrossSeedFieldSlot,
+            outputIndex,
+            FlowHash01(flow.metadata.x + branchId, routeIndex, 7029u));
+    }
+}

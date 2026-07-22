@@ -488,6 +488,41 @@ bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& styl
            style.screenSpriteSizeMode == PointCloudScreenSpriteSizeMode::WorldMillimeters;
 }
 
+WaterFlowActivityScales ResolveWaterFlowActivityScales(
+    float effectiveActivity,
+    float trailSeed) {
+    WaterFlowActivityScales scales;
+    scales.activity = std::clamp(
+        std::isfinite(effectiveActivity) ? effectiveActivity : 1.0F,
+        0.0F,
+        1.0F);
+    const float seed = std::clamp(std::isfinite(trailSeed) ? trailSeed : 0.0F, 0.0F, 1.0F);
+    if (scales.activity <= 0.0F) {
+        scales.trailVisibility = 0.0F;
+    } else if (scales.activity >= 1.0F) {
+        scales.trailVisibility = 1.0F;
+    } else {
+        constexpr float kSoftGateHalfWidth = 0.035F;
+        const float edge0 = seed - kSoftGateHalfWidth;
+        const float edge1 = seed + kSoftGateHalfWidth;
+        const float t = std::clamp(
+            (scales.activity - edge0) / (edge1 - edge0),
+            0.0F,
+            1.0F);
+        scales.trailVisibility = t * t * (3.0F - 2.0F * t);
+    }
+    scales.appearance = 0.30F + 0.70F * scales.activity;
+    scales.width = 0.65F + 0.35F * scales.activity;
+    scales.speed = 0.60F + 0.40F * scales.activity;
+    scales.visibleLength = 0.55F + 0.45F * scales.activity;
+    scales.lateralMotion = 0.15F * scales.activity;
+    return scales;
+}
+
+float SanitizeWaterFlowSpeedScale(float speedScale) {
+    return std::isfinite(speedScale) ? std::max(0.0F, speedScale) : 1.0F;
+}
+
 float ShorelineWaveHeightMask(
     float boundaryZ,
     float reachMeters,
@@ -563,6 +598,8 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.roughnessMotionStrength = 0.0F;
     style.waterStreakAspect = sourceStyle.waterStreakAspect;
     style.waterTrailStyleGeometry = sourceStyle.waterTrailStyleGeometry;
+    style.waterFlowActivity = sourceStyle.waterFlowActivity;
+    style.waterFlowSpeedScale = sourceStyle.waterFlowSpeedScale;
     style.flowAnimation = false;
     style.waterPathView = false;
     style.waterTrailOverlay = false;

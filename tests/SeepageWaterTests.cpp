@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -54,7 +56,9 @@ WaterSeepageSpatialGrid BuildGrid(
     WaterRainSettings rain = {},
     std::uint64_t effectiveInvocations = 12'000'000ULL,
     const WaterSeepageLookSettings& defaultLook = {},
-    std::span<const WaterSeepageSurfaceGuide> guides = {}) {
+    std::span<const WaterSeepageSurfaceGuide> guides = {},
+    const std::optional<invisible_places::water::WaterScenarioState>& scenario = std::nullopt,
+    std::span<const invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates = {}) {
     return invisible_places::water::BuildWaterSeepageSpatialGrid(
         nodes,
         std::span<const WaterSeepageLookProfile>{},
@@ -63,7 +67,9 @@ WaterSeepageSpatialGrid BuildGrid(
         forExport,
         rain,
         effectiveInvocations,
-        guides);
+        guides,
+        scenario,
+        nodeStates);
 }
 
 bool IsPowerOfTwo(std::size_t value) {
@@ -90,6 +96,10 @@ TEST_CASE("Seepage defaults describe a subtle damp fan", "[water][seepage][defau
     CHECK(look.turbulence == Approx(0.22F));
     CHECK(look.phase == Approx(0.0F));
     CHECK(look.rainResponse == Approx(0.50F));
+    CHECK(look.tricklePatchSizeMeters == Approx(0.08F));
+    CHECK(look.trickleLengthMeters == Approx(0.35F));
+    CHECK(look.trickleWidthMeters == Approx(0.018F));
+    CHECK(look.trickleFrontSoftness == Approx(0.10F));
     CHECK(look.response.intensity == Approx(0.85F));
     CHECK(look.response.emissionAdd == Approx(0.35F));
     CHECK(look.response.opacityAdd == Approx(0.04F));
@@ -133,6 +143,12 @@ TEST_CASE("Historical Seepage scenarios share visual language but differ in mois
     CHECK(contemporary.state.seepageLevel == Approx(0.50F));
     CHECK(historical.state.seepageSpread == Approx(0.60F));
     CHECK(contemporary.state.seepageSpread == Approx(0.10F));
+    CHECK(historical.state.seepageRainDelaySeconds == Approx(4.0F));
+    CHECK(historical.state.seepageRainRiseSeconds == Approx(12.0F));
+    CHECK(historical.state.seepageRainRecessionSeconds == Approx(60.0F));
+    CHECK(contemporary.state.seepageRainDelaySeconds == Approx(1.0F));
+    CHECK(contemporary.state.seepageRainRiseSeconds == Approx(4.0F));
+    CHECK(contemporary.state.seepageRainRecessionSeconds == Approx(15.0F));
     CHECK(historical.state.seepageLook.rainResponse > contemporary.state.seepageLook.rainResponse);
 }
 
@@ -794,7 +810,8 @@ TEST_CASE("All Seepage patterns are deterministic and organic modes respond in w
     for (const auto pattern : {
              WaterSeepagePattern::LegacyRipples,
              WaterSeepagePattern::WetRockSheen,
-             WaterSeepagePattern::ChaoticBloom}) {
+             WaterSeepagePattern::ChaoticBloom,
+             WaterSeepagePattern::WettingTrickle}) {
         WaterSeepageLookSettings look;
         look.pattern = pattern;
         look.quality = WaterSeepageQuality::High;
@@ -806,6 +823,7 @@ TEST_CASE("All Seepage patterns are deterministic and organic modes respond in w
         look.microNormalStrength = 0.75F;
         look.evolution = 0.18F;
         look.downhillDriftMetersPerSecond = 0.08F;
+        look.trickleLengthMeters = 1.0F;
         const auto grid = BuildGrid(
             {MakeSeepageNode()},
             "ROCK",
@@ -907,6 +925,7 @@ TEST_CASE("Chaotic Bloom lobes advect downhill along the surface guide", "[water
 TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap reflection angles", "[water][seepage][scenario][animation]") {
     using Catch::Approx;
     using invisible_places::water::AddOrUpdateWaterScenarioKey;
+    using invisible_places::water::EffectiveWaterFlowActivity;
     using invisible_places::water::EvaluateWaterScenarioTrack;
     using invisible_places::water::WaterScenarioInterpolation;
     using invisible_places::water::WaterScenarioKey;
@@ -919,11 +938,27 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     auto startState = definition.state;
     startState.seepageLevel = 0.20F;
     startState.rainLevel = 0.10F;
+    startState.flowLevel = 0.10F;
+    startState.seepageRainDelaySeconds = 0.0F;
+    startState.seepageRainRiseSeconds = 0.0F;
+    startState.seepageRainRecessionSeconds = 2.0F;
     startState.seepageLook.environmentAzimuthDegrees = 350.0F;
+    startState.seepageLook.tricklePatchSizeMeters = 0.05F;
+    startState.seepageLook.trickleLengthMeters = 0.20F;
+    startState.seepageLook.trickleWidthMeters = 0.01F;
+    startState.seepageLook.trickleFrontSoftness = 0.02F;
     auto endState = definition.state;
     endState.seepageLevel = 0.80F;
     endState.rainLevel = 0.90F;
+    endState.flowLevel = 0.90F;
+    endState.seepageRainDelaySeconds = 2.0F;
+    endState.seepageRainRiseSeconds = 4.0F;
+    endState.seepageRainRecessionSeconds = 6.0F;
     endState.seepageLook.environmentAzimuthDegrees = 10.0F;
+    endState.seepageLook.tricklePatchSizeMeters = 0.15F;
+    endState.seepageLook.trickleLengthMeters = 0.60F;
+    endState.seepageLook.trickleWidthMeters = 0.03F;
+    endState.seepageLook.trickleFrontSoftness = 0.10F;
     AddOrUpdateWaterScenarioKey(
         &track,
         WaterScenarioKey{
@@ -942,12 +977,22 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     const auto middle = EvaluateWaterScenarioTrack(track, definition, 0.50F);
     CHECK(middle.seepageLevel == Approx(0.50F));
     CHECK(middle.rainLevel == Approx(0.50F));
+    CHECK(middle.flowLevel == Approx(0.50F));
+    CHECK(middle.seepageRainDelaySeconds == Approx(1.0F));
+    CHECK(middle.seepageRainRiseSeconds == Approx(2.0F));
+    CHECK(middle.seepageRainRecessionSeconds == Approx(4.0F));
+    CHECK(middle.seepageLook.tricklePatchSizeMeters == Approx(0.10F));
+    CHECK(middle.seepageLook.trickleLengthMeters == Approx(0.40F));
+    CHECK(middle.seepageLook.trickleWidthMeters == Approx(0.02F));
+    CHECK(middle.seepageLook.trickleFrontSoftness == Approx(0.06F));
+    CHECK(EffectiveWaterFlowActivity(middle, 0.80F, 0.75F) == Approx(0.55F));
     CHECK(std::abs(middle.seepageLook.environmentAzimuthDegrees) < 0.01F);
     CHECK(EvaluateWaterScenarioTrack(track, definition, -1.0F).seepageLevel == Approx(0.20F));
     CHECK(EvaluateWaterScenarioTrack(track, definition, 2.0F).seepageLevel == Approx(0.80F));
 
     track.keys.front().interpolation = WaterScenarioInterpolation::Hold;
     CHECK(EvaluateWaterScenarioTrack(track, definition, 0.75F).seepageLevel == Approx(0.20F));
+    CHECK(EvaluateWaterScenarioTrack(track, definition, 0.75F).flowLevel == Approx(0.10F));
 
     auto replacement = track.keys.front();
     replacement.id.clear();
@@ -968,6 +1013,29 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     CHECK(transition.transitionAmount == Approx(0.5F).margin(0.0001F));
 }
 
+TEST_CASE("Water Flow activity combines keyed level and Rain response deterministically", "[water][flow][scenario][animation]") {
+    using Catch::Approx;
+    using invisible_places::water::EffectiveWaterFlowActivity;
+    using invisible_places::water::WaterScenarioState;
+
+    WaterScenarioState state;
+    CHECK(state.flowLevel == Approx(1.0F));
+    CHECK(EffectiveWaterFlowActivity(state, 0.70F, 1.0F) == Approx(0.70F));
+
+    state.flowLevel = 0.20F;
+    state.rainLevel = 0.50F;
+    CHECK(EffectiveWaterFlowActivity(state, 0.80F, 0.75F) == Approx(0.40F));
+
+    state.flowLevel = 0.0F;
+    state.rainLevel = 1.0F;
+    CHECK(EffectiveWaterFlowActivity(state, 0.35F, 1.0F) == Approx(0.35F));
+    CHECK(EffectiveWaterFlowActivity(state, 0.35F, 0.0F) == Approx(0.0F));
+
+    state.flowLevel = 2.0F;
+    state.rainLevel = -1.0F;
+    CHECK(EffectiveWaterFlowActivity(state, 2.0F, -1.0F) == Approx(1.0F));
+}
+
 TEST_CASE("Applying scenario keys changes only compact Seepage parameters", "[water][seepage][scenario][topology]") {
     using invisible_places::water::ApplyWaterSeepageScenarioParameters;
     using invisible_places::water::WaterSeepageParamsFingerprint;
@@ -985,4 +1053,260 @@ TEST_CASE("Applying scenario keys changes only compact Seepage parameters", "[wa
     CHECK(grid.nodes.front().resolvedQuality == WaterSeepageQuality::Low);
     CHECK(grid.nodes.front().scenarioSpread == Catch::Approx(0.60F));
     CHECK(grid.nodes.front().rainVisualStrength == Catch::Approx(0.72F));
+}
+
+TEST_CASE("Wetting Trickle reveals short deterministic fingers behind a keyed front", "[water][seepage][patterns][trickle]") {
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
+
+    WaterSeepageLookSettings look;
+    look.pattern = WaterSeepagePattern::WettingTrickle;
+    look.quality = WaterSeepageQuality::High;
+    look.baseWetness = 0.75F;
+    look.density = 0.80F;
+    look.glisten = 0.0F;
+    look.tricklePatchSizeMeters = 0.08F;
+    look.trickleLengthMeters = 0.40F;
+    look.trickleWidthMeters = 0.018F;
+    look.trickleFrontSoftness = 0.025F;
+    look.evolution = 0.04F;
+
+    const std::vector<WaterSeepageNodeAnimationStateEntry> dryState{{
+        .nodeId = 1U,
+        .state = {.activity = 1.0F, .localSpread = 0.0F, .wettingProgress = 0.0F},
+    }};
+    const std::vector<WaterSeepageNodeAnimationStateEntry> halfState{{
+        .nodeId = 1U,
+        .state = {.activity = 1.0F, .localSpread = 0.0F, .wettingProgress = 0.50F},
+    }};
+    const std::vector<WaterSeepageNodeAnimationStateEntry> fullState{{
+        .nodeId = 1U,
+        .state = {.activity = 1.0F, .localSpread = 0.0F, .wettingProgress = 1.0F},
+    }};
+    const auto dryGrid = BuildGrid(
+        {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, look, {}, std::nullopt, dryState);
+    const auto halfGrid = BuildGrid(
+        {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, look, {}, std::nullopt, halfState);
+    const auto fullGrid = BuildGrid(
+        {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, look, {}, std::nullopt, fullState);
+
+    const invisible_places::io::Float3 nearPoint{0.0F, 0.0F, -0.08F};
+    const invisible_places::io::Float3 farPoint{0.0F, 0.0F, -0.32F};
+    const invisible_places::io::Float3 normal{0.0F, 1.0F, 0.0F};
+    CHECK(EvaluateWaterSeepageGridContribution(dryGrid, nearPoint, normal, 2.0F).scale ==
+          Catch::Approx(0.0F));
+    CHECK(EvaluateWaterSeepageGridContribution(halfGrid, nearPoint, normal, 2.0F).scale > 0.0F);
+    CHECK(EvaluateWaterSeepageGridContribution(halfGrid, farPoint, normal, 2.0F).scale ==
+          Catch::Approx(0.0F).margin(1.0e-6F));
+    const auto full = EvaluateWaterSeepageGridContribution(fullGrid, farPoint, normal, 2.0F);
+    const auto repeated = EvaluateWaterSeepageGridContribution(fullGrid, farPoint, normal, 2.0F);
+    CHECK(full.scale > 0.0F);
+    CHECK(full.scale == Catch::Approx(repeated.scale).margin(1.0e-7F));
+    CHECK(full.ripple == Catch::Approx(repeated.ripple).margin(1.0e-7F));
+}
+
+TEST_CASE("Per-node Seepage keys compose activity spread and wetting without topology changes", "[water][seepage][scenario][node-animation]") {
+    using Catch::Approx;
+    using invisible_places::water::AddOrUpdateWaterSeepageNodeKey;
+    using invisible_places::water::ApplyWaterSeepageRuntimeParameters;
+    using invisible_places::water::ApplyWaterSeepageScenarioParameters;
+    using invisible_places::water::EvaluateWaterSeepageNodeAnimationTrack;
+    using invisible_places::water::EvaluateWaterSeepageNodeAnimationTracks;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterScenarioTrack;
+    using invisible_places::water::WaterSeepageNodeKey;
+    using invisible_places::water::WaterSeepageParamsFingerprint;
+    using invisible_places::water::WaterSeepageTopologyFingerprint;
+
+    WaterScenarioTrack track;
+    AddOrUpdateWaterSeepageNodeKey(
+        &track,
+        1U,
+        WaterSeepageNodeKey{
+            .id = "dry",
+            .position = 0.0F,
+            .state = {.activity = 0.0F, .localSpread = 0.0F, .wettingProgress = 0.0F},
+            .interpolation = WaterScenarioInterpolation::Linear,
+        });
+    AddOrUpdateWaterSeepageNodeKey(
+        &track,
+        1U,
+        WaterSeepageNodeKey{
+            .id = "wet",
+            .position = 1.0F,
+            .state = {.activity = 1.0F, .localSpread = 1.0F, .wettingProgress = 1.0F},
+        });
+    const auto middle = EvaluateWaterSeepageNodeAnimationTrack(track, 1U, 0.5F);
+    CHECK(middle.activity == Approx(0.5F));
+    CHECK(middle.localSpread == Approx(0.5F));
+    CHECK(middle.wettingProgress == Approx(0.5F));
+    CHECK(EvaluateWaterSeepageNodeAnimationTrack(track, 999U, 0.5F).activity == Approx(1.0F));
+
+    auto replacement = track.seepageNodeTracks.front().keys.front();
+    replacement.id.clear();
+    replacement.position = 0.00005F;
+    replacement.state.activity = 0.2F;
+    AddOrUpdateWaterSeepageNodeKey(&track, 1U, replacement);
+    REQUIRE(track.seepageNodeTracks.front().keys.size() == 2U);
+    CHECK(track.seepageNodeTracks.front().keys.front().id == "dry");
+
+    const auto nodeStates = EvaluateWaterSeepageNodeAnimationTracks(track, 0.5F);
+    REQUIRE(nodeStates.size() == 1U);
+    auto scenario = invisible_places::water::DefaultWaterScenarioDefinitions().front().state;
+    scenario.seepageLevel = 0.80F;
+    scenario.seepageSpread = 0.25F;
+    auto grid = BuildGrid(
+        {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, {}, {}, scenario, nodeStates);
+    REQUIRE(grid.nodes.size() == 1U);
+    CHECK(grid.nodes.front().strength == Approx(0.48F).margin(5.0e-5F));
+    CHECK(grid.nodes.front().scenarioSpread == Approx(0.625F).margin(5.0e-5F));
+    CHECK(grid.nodes.front().wettingProgress == Approx(0.5F).margin(5.0e-5F));
+
+    const auto topology = WaterSeepageTopologyFingerprint(grid);
+    const auto params = WaterSeepageParamsFingerprint(grid);
+    const std::vector<invisible_places::water::WaterSeepageNodeAnimationStateEntry> changed{{
+        .nodeId = 1U,
+        .state = {.activity = 0.25F, .localSpread = 0.20F, .wettingProgress = 0.90F},
+    }};
+    ApplyWaterSeepageScenarioParameters(
+        &grid,
+        scenario,
+        {},
+        1'000'000ULL,
+        changed);
+    CHECK(WaterSeepageTopologyFingerprint(grid) == topology);
+    CHECK(WaterSeepageParamsFingerprint(grid) != params);
+    CHECK(grid.nodes.front().strength == Approx(0.20F));
+    CHECK(grid.nodes.front().scenarioSpread == Approx(0.40F));
+    CHECK(grid.nodes.front().wettingProgress == Approx(0.90F));
+
+    auto editedNode = MakeSeepageNode();
+    editedNode.seed = 991U;
+    editedNode.strength = 1.75F;
+    editedNode.normalAlignment = 0.82F;
+    editedNode.lookOverride = WaterSeepageLookSettings{};
+    editedNode.lookOverride->pattern = WaterSeepagePattern::WettingTrickle;
+    editedNode.lookOverride->tricklePatchSizeMeters = 0.12F;
+    ApplyWaterSeepageRuntimeParameters(
+        &grid,
+        std::span<const WaterSeepageNode>{&editedNode, 1U},
+        {},
+        {},
+        scenario,
+        {},
+        1'000'000ULL,
+        changed);
+    CHECK(WaterSeepageTopologyFingerprint(grid) == topology);
+    CHECK(grid.nodes.front().seed == 991U);
+    CHECK(grid.nodes.front().normalAlignment == Approx(0.82F));
+    CHECK(grid.nodes.front().authoredStrength == Approx(1.75F));
+    CHECK(grid.nodes.front().authoredLook.pattern == WaterSeepagePattern::WettingTrickle);
+}
+
+TEST_CASE("Seepage Rain envelopes are immediate by default and deterministic when delayed", "[water][seepage][rain][animation]") {
+    using Catch::Approx;
+    using invisible_places::water::AddOrUpdateWaterScenarioKey;
+    using invisible_places::water::BuildWaterSeepageRainEnvelope;
+    using invisible_places::water::EvaluateWaterScenarioTrack;
+    using invisible_places::water::EvaluateWaterSeepageRainEnvelope;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterScenarioKey;
+    using invisible_places::water::WaterScenarioTrack;
+
+    auto definition = invisible_places::water::DefaultWaterScenarioDefinitions().front();
+    definition.state.seepageRainDelaySeconds = 0.0F;
+    definition.state.seepageRainRiseSeconds = 0.0F;
+    definition.state.seepageRainRecessionSeconds = 0.0F;
+    WaterScenarioTrack track;
+    auto dry = definition.state;
+    dry.rainLevel = 0.0F;
+    auto wet = definition.state;
+    wet.rainLevel = 1.0F;
+    AddOrUpdateWaterScenarioKey(
+        &track,
+        WaterScenarioKey{
+            .id = "dry",
+            .position = 0.0F,
+            .state = dry,
+            .interpolation = WaterScenarioInterpolation::Linear,
+        });
+    AddOrUpdateWaterScenarioKey(
+        &track,
+        WaterScenarioKey{.id = "wet", .position = 1.0F, .state = wet});
+
+    const auto immediate = BuildWaterSeepageRainEnvelope(track, definition, 10.0F, 10.0F);
+    REQUIRE(immediate.samples.size() == 101U);
+    CHECK(EvaluateWaterSeepageRainEnvelope(immediate, 2.5F) == Approx(0.25F).margin(1.0e-5F));
+    CHECK(EvaluateWaterSeepageRainEnvelope(immediate, 5.0F) == Approx(0.50F).margin(1.0e-5F));
+    CHECK(immediate.fingerprint ==
+          invisible_places::water::WaterSeepageRainEnvelopeFingerprint(
+              track, definition, 10.0F));
+
+    for (auto& key : track.keys) {
+        key.state.seepageRainDelaySeconds = 2.0F;
+        key.state.seepageRainRiseSeconds = 1.0F;
+        key.state.seepageRainRecessionSeconds = 3.0F;
+    }
+    const auto delayed = BuildWaterSeepageRainEnvelope(track, definition, 10.0F, 20.0F);
+    const float delayedMiddle = EvaluateWaterSeepageRainEnvelope(delayed, 5.0F);
+    CHECK(delayedMiddle > 0.0F);
+    CHECK(delayedMiddle < 0.50F);
+    CHECK(delayed.fingerprint != immediate.fingerprint);
+
+    const auto bounded = BuildWaterSeepageRainEnvelope(
+        track, definition, 120.0F, 120.0F, 16U);
+    REQUIRE(bounded.samples.size() == 16U);
+    CHECK(bounded.durationSeconds == Approx(120.0F));
+    CHECK(std::isfinite(EvaluateWaterSeepageRainEnvelope(bounded, 999.0F)));
+
+    track.keys.front().state.seepageRainDelaySeconds = -2.0F;
+    track.keys.front().state.seepageRainRiseSeconds =
+        std::numeric_limits<float>::quiet_NaN();
+    const auto sanitized = EvaluateWaterScenarioTrack(track, definition, 0.0F);
+    CHECK(sanitized.seepageRainDelaySeconds == Approx(0.0F));
+    CHECK(sanitized.seepageRainRiseSeconds == Approx(0.0F));
+}
+
+TEST_CASE("Seepage surface-cache guides follow a vertical ROCK sheet", "[water][seepage][surface-cache][guide]") {
+    using invisible_places::water::BuildWaterSeepageSurfaceGuides;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::RainCollisionRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    for (std::uint32_t station = 0U; station < 32U; ++station) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    0.001F + static_cast<float>(sample) * 0.0002F,
+                    0.002F + static_cast<float>(sample) * 0.0010F,
+                    -0.001F - static_cast<float>(station) * 0.020F,
+                },
+                .normal = {1.0F, 0.0F, 0.0F},
+                .role = RainCollisionRole::Rock,
+            });
+        }
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.020F);
+    auto node = MakeSeepageNode();
+    node.position = {0.001F, 0.005F, -0.001F};
+    node.surfaceNormal = {1.0F, 0.0F, 0.0F};
+    node.downAxis = {0.0F, 0.0F, -1.0F};
+    node.reachMeters = 0.30F;
+    const auto guides = BuildWaterSeepageSurfaceGuides(
+        std::span<const WaterSeepageNode>{&node, 1U},
+        cache);
+    REQUIRE(guides.size() == 1U);
+    REQUIRE(guides.front().valid);
+    CHECK(guides.front().sampleCount >= 2U);
+    CHECK(guides.front().sampleCount <=
+          invisible_places::water::kWaterSeepageMaximumGuideSamples);
+    CHECK(guides.front().achievedReachMeters > 0.25F);
+    CHECK(guides.front().samples[guides.front().sampleCount - 1U].position.z < -0.20F);
+    for (std::uint32_t index = 1U; index < guides.front().sampleCount; ++index) {
+        CHECK(guides.front().samples[index].station >
+              guides.front().samples[index - 1U].station);
+        CHECK(guides.front().samples[index].position.z <=
+              guides.front().samples[index - 1U].position.z + 0.008F);
+    }
 }

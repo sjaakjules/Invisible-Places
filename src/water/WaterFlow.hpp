@@ -139,7 +139,8 @@ enum class WaterSeepageQuality {
 enum class WaterSeepagePattern {
     LegacyRipples,
     WetRockSheen,
-    ChaoticBloom
+    ChaoticBloom,
+    WettingTrickle
 };
 
 enum class WaterScenarioInterpolation {
@@ -251,6 +252,10 @@ struct WaterSeepageLookSettings {
     float curl = 0.40F;
     float breakup = 0.45F;
     float downhillDriftMetersPerSecond = 0.025F;
+    float tricklePatchSizeMeters = 0.08F;
+    float trickleLengthMeters = 0.35F;
+    float trickleWidthMeters = 0.018F;
+    float trickleFrontSoftness = 0.10F;
     WaterEffectResponseSettings response{
         .intensity = 0.85F,
         .emissionAdd = 0.35F,
@@ -278,6 +283,10 @@ struct WaterScenarioState {
     float seepageLevel = 1.0F;
     float seepageSpread = 0.0F;
     float rainLevel = 0.0F;
+    float flowLevel = 1.0F;
+    float seepageRainDelaySeconds = 0.0F;
+    float seepageRainRiseSeconds = 0.0F;
+    float seepageRainRecessionSeconds = 0.0F;
     std::optional<WaterSeepageLookSettings> transitionLook;
     float transitionAmount = 0.0F;
 };
@@ -295,11 +304,42 @@ struct WaterScenarioKey {
     WaterScenarioInterpolation interpolation = WaterScenarioInterpolation::Smooth;
 };
 
+struct WaterSeepageNodeAnimationState {
+    float activity = 1.0F;
+    float localSpread = 0.0F;
+    float wettingProgress = 1.0F;
+};
+
+struct WaterSeepageNodeKey {
+    std::string id;
+    float position = 0.0F;
+    WaterSeepageNodeAnimationState state{};
+    WaterScenarioInterpolation interpolation = WaterScenarioInterpolation::Smooth;
+};
+
+struct WaterSeepageNodeTrack {
+    std::uint32_t nodeId = 0U;
+    std::vector<WaterSeepageNodeKey> keys;
+};
+
+struct WaterSeepageNodeAnimationStateEntry {
+    std::uint32_t nodeId = 0U;
+    WaterSeepageNodeAnimationState state{};
+};
+
 struct WaterScenarioTrack {
     std::string scenarioId;
     std::string scenarioName;
     WaterScenarioDefinition fallbackScenario{};
     std::vector<WaterScenarioKey> keys;
+    std::vector<WaterSeepageNodeTrack> seepageNodeTracks;
+};
+
+struct WaterSeepageRainEnvelope {
+    float sampleRateHz = 120.0F;
+    float durationSeconds = 0.0F;
+    std::vector<float> samples;
+    std::string fingerprint;
 };
 
 struct WaterSeepageViewContext {
@@ -366,6 +406,9 @@ struct WaterSeepageRuntimeNode {
     float strength = 1.0F;
     float rainVisualStrength = 0.0F;
     float scenarioSpread = 0.0F;
+    float effectiveActivity = 1.0F;
+    float localSpread = 0.0F;
+    float wettingProgress = 1.0F;
     float authoredStrength = 1.0F;
     WaterSeepageQuality resolvedQuality = WaterSeepageQuality::Balanced;
     WaterSeepageLookSettings authoredLook{};
@@ -528,13 +571,175 @@ struct WaterFlowTrailSettings {
     float trailSmoothness = 0.85F;
     float trailLooseness = 0.08F;
     float turbulence = 0.06F;
+    float surfaceFollow = 0.85F;
+    float downhillPull = 0.35F;
+    float terrainWidthResponse = 0.65F;
+    float turbulenceScaleMeters = 0.18F;
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
 };
 
 struct WaterFlowTrailBuildOptions {
     const std::stop_token* stopToken = nullptr;
+    // CPU reference/fallback hook. GPU Flow uses the resident cache directly.
+    const WaterSurfaceCache* surfaceCache = nullptr;
+    bool useSurfaceGuide = false;
 };
+
+// Keep this value in lock-step with WaterTrailSample serialization and every
+// GPU Flow writer. Scalar storage is field-major: field * pointCapacity + point.
+inline constexpr std::uint32_t kWaterTrailScalarFieldCount = 31U;
+
+enum class WaterFlowGpuInputKind : std::uint32_t {
+    SampledAnchors = 0U,
+    ManualCatmullRomControlPoints = 1U,
+};
+
+struct WaterOverlayPoint;
+struct WaterPathAnalysisCache;
+
+// Compact, deterministic source input shared by the CPU reference path and
+// the GPU route pass. Manual splines retain only four cumulative arc-length
+// checkpoints per outgoing segment, avoiding a dense sampled-curve upload on
+// every control-point edit while still allowing distance-based evaluation.
+struct WaterFlowGpuCompactInputPoint {
+    invisible_places::io::Float3 position{};
+    invisible_places::io::Float3 normal{0.0F, 0.0F, 1.0F};
+    float confidence = 1.0F;
+    float cumulativeDistanceMeters = 0.0F;
+    std::array<float, 4> outgoingSegmentArcDistancesMeters{};
+};
+
+struct WaterFlowGpuCompactInput {
+    std::vector<WaterFlowGpuCompactInputPoint> points;
+    float routeLengthMeters = 0.0F;
+
+    [[nodiscard]] bool Valid() const {
+        return points.size() >= 2U && routeLengthMeters > 1.0e-5F;
+    }
+};
+
+// One authored/generated route inside a source-local compact input. Points for
+// every branch live in one flat allocation, while this table retains the CPU
+// path grouping and scalar identities used by the trail builder.
+struct WaterFlowGpuCompactBranch {
+    std::uint32_t inputStart = 0U;
+    std::uint32_t inputCount = 0U;
+    std::uint32_t branchId = 0U;
+    std::uint32_t pathId = 0U;
+    float routeLengthMeters = 0.0F;
+    float allocationWeight = 0.0F;
+};
+
+struct WaterFlowGpuCompactSourceInput {
+    std::vector<WaterFlowGpuCompactInputPoint> points;
+    std::vector<WaterFlowGpuCompactBranch> branches;
+
+    [[nodiscard]] bool Valid() const;
+};
+
+[[nodiscard]] WaterFlowGpuCompactInput BuildWaterFlowGpuSampledInput(
+    std::span<const WaterOverlayPoint> anchors);
+[[nodiscard]] WaterFlowGpuCompactInput BuildWaterFlowGpuManualSplineInput(
+    std::span<const invisible_places::io::Float3> controlPoints);
+
+// Generated point sources can contain several consecutive path branches. This
+// contract flattens them without joining branch endpoints and carries the same
+// exact trail-allocation weights as the deterministic CPU builder.
+[[nodiscard]] WaterFlowGpuCompactSourceInput BuildWaterFlowGpuSampledSourceInput(
+    std::span<const WaterOverlayPoint> anchors,
+    const WaterFlowTrailSettings& settings,
+    const WaterPathAnalysisCache* analysis = nullptr);
+[[nodiscard]] WaterFlowGpuCompactSourceInput BuildWaterFlowGpuManualSplineSourceInput(
+    std::span<const invisible_places::io::Float3> controlPoints,
+    std::uint32_t branchId = 0U,
+    std::uint32_t pathId = 1U);
+
+struct WaterFlowGpuBranchLayout {
+    std::uint32_t inputStart = 0U;
+    std::uint32_t inputCount = 0U;
+    std::uint32_t routeStart = 0U;
+    std::uint32_t routePointsPerLane = 0U;
+    std::uint32_t activeRouteLaneCount = 0U;
+    std::uint32_t trailOutputStart = 0U;
+    std::uint32_t trailCount = 0U;
+    std::uint32_t firstTrailId = 1U;
+    std::uint32_t potentialLaneCount = 0U;
+    std::uint32_t branchId = 0U;
+    std::uint32_t pathId = 0U;
+    float routeLengthMeters = 0.0F;
+    float routeSpacingMeters = 0.0F;
+};
+
+struct WaterFlowGpuOutputLayout {
+    std::vector<WaterFlowGpuBranchLayout> branches;
+    std::uint32_t branchCount = 0U;
+    std::uint32_t inputPointCount = 0U;
+    std::uint32_t laneCount = 0U;
+    std::uint32_t maxActiveRouteLaneCount = 0U;
+    std::uint32_t maxTrailsPerBranch = 0U;
+    std::uint32_t routePointCountPerLane = 0U;
+    std::uint32_t routePointCountTotal = 0U;
+    std::uint32_t trailCount = 0U;
+    std::uint32_t samplesPerTrail = 0U;
+    std::uint32_t trailPointCountTotal = 0U;
+    std::uint32_t pointCount = 0U;
+    std::uint32_t pointCapacity = 0U;
+    float routeLengthMeters = 0.0F;
+
+    [[nodiscard]] bool Valid() const {
+        if (inputPointCount < 2U || laneCount == 0U || routePointCountPerLane < 2U ||
+            trailCount == 0U || samplesPerTrail < 2U || pointCount == 0U ||
+            pointCapacity < pointCount || branchCount == 0U ||
+            branchCount != branches.size()) {
+            return false;
+        }
+        std::uint64_t expectedTrailId = 1U;
+        std::uint64_t allocatedTrails = 0U;
+        std::uint64_t expectedRouteStart = 0U;
+        std::uint64_t expectedTrailStart = routePointCountTotal;
+        for (const auto& branch : branches) {
+            const std::uint64_t inputEnd =
+                static_cast<std::uint64_t>(branch.inputStart) + branch.inputCount;
+            const std::uint64_t routeEnd =
+                static_cast<std::uint64_t>(branch.routeStart) +
+                static_cast<std::uint64_t>(branch.routePointsPerLane) *
+                    branch.activeRouteLaneCount;
+            const std::uint64_t trailEnd =
+                static_cast<std::uint64_t>(branch.trailOutputStart) +
+                static_cast<std::uint64_t>(branch.trailCount) * samplesPerTrail;
+            if (branch.inputCount < 2U || inputEnd > inputPointCount ||
+                branch.routePointsPerLane < 2U ||
+                branch.routeStart != expectedRouteStart || routeEnd > routePointCountTotal ||
+                branch.trailOutputStart != expectedTrailStart || trailEnd > pointCount ||
+                branch.firstTrailId != expectedTrailId ||
+                branch.activeRouteLaneCount > branch.potentialLaneCount ||
+                branch.activeRouteLaneCount > branch.trailCount) {
+                return false;
+            }
+            expectedTrailId += branch.trailCount;
+            allocatedTrails += branch.trailCount;
+            expectedRouteStart = routeEnd;
+            expectedTrailStart = trailEnd;
+        }
+        return allocatedTrails == trailCount && expectedRouteStart == routePointCountTotal &&
+               expectedTrailStart == pointCount;
+    }
+};
+
+// Deterministic sizing contract shared by the renderer and tests. Capacity is
+// geometric and never shrinks while currentPointCapacity can satisfy the edit.
+[[nodiscard]] WaterFlowGpuOutputLayout BuildWaterFlowGpuOutputLayout(
+    const WaterFlowGpuCompactSourceInput& input,
+    const WaterFlowTrailSettings& settings,
+    std::uint32_t currentPointCapacity = 0U,
+    std::uint32_t maximumPointCapacity = 1'200'000U);
+[[nodiscard]] WaterFlowGpuOutputLayout BuildWaterFlowGpuOutputLayout(
+    std::uint32_t inputPointCount,
+    float routeLengthMeters,
+    const WaterFlowTrailSettings& settings,
+    std::uint32_t currentPointCapacity = 0U,
+    std::uint32_t maximumPointCapacity = 1'200'000U);
 
 [[nodiscard]] bool WaterFlowLaneRouteInputsEqual(
     const WaterFlowTrailSettings& left,
@@ -737,6 +942,36 @@ struct WaterDynamicMeshFlowDiagnostics {
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
     float normalizedPosition);
+[[nodiscard]] WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
+    const WaterScenarioTrack& track,
+    std::uint32_t nodeId,
+    float normalizedPosition);
+[[nodiscard]] std::vector<WaterSeepageNodeAnimationStateEntry>
+EvaluateWaterSeepageNodeAnimationTracks(
+    const WaterScenarioTrack& track,
+    float normalizedPosition);
+void AddOrUpdateWaterSeepageNodeKey(
+    WaterScenarioTrack* track,
+    std::uint32_t nodeId,
+    WaterSeepageNodeKey key,
+    float replacementTolerance = 0.0001F);
+[[nodiscard]] WaterSeepageRainEnvelope BuildWaterSeepageRainEnvelope(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds,
+    float sampleRateHz = 120.0F,
+    std::size_t maxSamples = 1'000'000U);
+[[nodiscard]] float EvaluateWaterSeepageRainEnvelope(
+    const WaterSeepageRainEnvelope& envelope,
+    float timeSeconds);
+[[nodiscard]] std::string WaterSeepageRainEnvelopeFingerprint(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds);
+[[nodiscard]] float EffectiveWaterFlowActivity(
+    const WaterScenarioState& state,
+    float maximumFlowStrength,
+    float rainResponse);
 void AddOrUpdateWaterScenarioKey(
     WaterScenarioTrack* track,
     WaterScenarioKey key,
@@ -767,12 +1002,23 @@ void AddOrUpdateWaterScenarioKey(
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
     std::span<const WaterSeepageSurfaceGuide> guides = {},
-    const std::optional<WaterScenarioState>& scenarioState = std::nullopt);
+    const std::optional<WaterScenarioState>& scenarioState = std::nullopt,
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
+void ApplyWaterSeepageRuntimeParameters(
+    WaterSeepageSpatialGrid* grid,
+    std::span<const WaterSeepageNode> nodes,
+    std::span<const WaterSeepageLookProfile> profiles,
+    const WaterSeepageLookSettings& defaultLook,
+    const std::optional<WaterScenarioState>& scenarioState,
+    const WaterRainSettings& rainSettings,
+    std::uint64_t effectivePointInvocations,
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
 void ApplyWaterSeepageScenarioParameters(
     WaterSeepageSpatialGrid* grid,
     const std::optional<WaterScenarioState>& scenarioState,
     const WaterRainSettings& rainSettings,
-    std::uint64_t effectivePointInvocations);
+    std::uint64_t effectivePointInvocations,
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
 [[nodiscard]] WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     const WaterSeepageRuntimeNode& node,
     const invisible_places::io::Float3& position,
@@ -1047,6 +1293,12 @@ struct WaterEmitter {
     std::string pathProfileName = "Global";
     std::string laneProfileName = "Global";
     std::string trailProfileName = "Global";
+    // Locked assignments resolve the saved profile instead of its matching temporary edit.
+    bool pathProfileLocked = false;
+    bool laneProfileLocked = false;
+    bool trailProfileLocked = false;
+    float maximumFlowStrength = 1.0F;
+    float rainResponse = 0.0F;
 };
 
 struct WaterManualFlowPathSource {
@@ -1055,6 +1307,14 @@ struct WaterManualFlowPathSource {
     std::vector<invisible_places::io::Float3> controlPoints;
     std::string laneProfileName = "Global";
     std::string trailProfileName = "Global";
+    // Manual paths share the same saved-versus-live profile assignment rule.
+    bool laneProfileLocked = false;
+    bool trailProfileLocked = false;
+    // New sources opt in. Project/source schema migration disables this for
+    // legacy manual paths until the user explicitly enables it.
+    bool useSurfaceGuide = true;
+    float maximumFlowStrength = 1.0F;
+    float rainResponse = 0.0F;
 };
 
 struct WaterSceneSupportLayer {
@@ -1122,6 +1382,10 @@ struct WaterAnimatedTrailBuildSettings {
     float laneCrossing = 0.22F;
     float trailSmoothness = 0.85F;
     float trailLooseness = 0.08F;
+    float surfaceFollow = 0.85F;
+    float downhillPull = 0.35F;
+    float terrainWidthResponse = 0.65F;
+    float turbulenceScaleMeters = 0.18F;
     float speedMetersPerSecond = 0.45F;
     std::uint32_t seed = 1;
     float featureType = 0.0F;
@@ -1316,6 +1580,9 @@ struct WaterPathCache {
     std::span<const WaterSeepageNode> nodes,
     std::span<const WaterSceneSupportLayer> supportLayers,
     std::size_t sampleLimit = 300'000U);
+[[nodiscard]] std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
+    std::span<const WaterSeepageNode> nodes,
+    const WaterSurfaceCache& surfaceCache);
 
 [[nodiscard]] WaterPathAnalysisCache BuildWaterPathAnalysis(const WaterPathCache& cache);
 [[nodiscard]] bool WaterPathAnalysisCacheCompatible(const WaterPathCache& cache);
