@@ -369,13 +369,16 @@ void main() {
     const float flowWidthScale = WaterTrailOverlayEnabled()
         ? mix(0.65, 1.0, WaterFlowActivity())
         : 1.0;
+    const float minPointSize = max(1.0, styleData.renderParams3.y);
+    const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
+    const float resolvedPointSize =
+        ((basePointSize * flowWidthScale * sparseRipple.pointSizeMultiply *
+          rainImpact.pointSizeMultiply) + sparseRipple.pointSizeAdd) * footprintScale;
     gl_PointSize = waterTrailVisibility <= 0.0
         ? 0.0
-        : clamp(
-              ((basePointSize * flowWidthScale * sparseRipple.pointSizeMultiply * rainImpact.pointSizeMultiply) +
-                   sparseRipple.pointSizeAdd) * footprintScale,
-              max(1.0, styleData.renderParams3.y),
-              max(max(1.0, styleData.renderParams3.y), styleData.renderParams3.z));
+        : RippleFiniteFloat(resolvedPointSize)
+              ? clamp(resolvedPointSize, minPointSize, maxPointSize)
+              : minPointSize;
     outSourceColor = inColor;
     outViewDepth = -viewPosition.z;
     outPointIndex = pointIndex;

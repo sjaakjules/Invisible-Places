@@ -288,6 +288,13 @@ static_assert(sizeof(WaterSeepageNodeParamsGpu) == 448U);
 
 WaterSeepageLookGpu MakeWaterSeepageLookGpu(
     const invisible_places::water::WaterSeepageLookSettings& look) {
+    const invisible_places::water::WaterSeepageLookSettings fallback{};
+    const auto finiteOr = [](float value, float fallback) {
+        return std::isfinite(value) ? value : fallback;
+    };
+    const auto finiteClamp = [&finiteOr](float value, float minimum, float maximum, float fallback) {
+        return std::clamp(finiteOr(value, fallback), minimum, maximum);
+    };
     WaterSeepageLookGpu gpu;
     gpu.control = glm::uvec4{
         static_cast<std::uint32_t>(look.pattern),
@@ -296,66 +303,140 @@ WaterSeepageLookGpu MakeWaterSeepageLookGpu(
         0U,
     };
     gpu.legacy0 = glm::vec4{
-        std::clamp(look.patternScale, 0.05F, 100.0F),
-        std::max(0.002F, look.wavelengthMeters),
-        std::max(0.0F, look.speed),
-        std::max(0.0F, look.warp),
+        finiteClamp(look.patternScale, 0.05F, 100.0F, fallback.patternScale),
+        finiteClamp(look.wavelengthMeters, 0.002F, 50.0F, fallback.wavelengthMeters),
+        finiteClamp(look.speed, 0.0F, 20.0F, fallback.speed),
+        finiteClamp(look.warp, 0.0F, 8.0F, fallback.warp),
     };
     gpu.legacy1 = glm::vec4{
-        std::clamp(look.turbulence, 0.0F, 1.0F),
-        look.phase,
-        std::clamp(look.density, 0.0F, 1.0F),
-        std::max(0.0F, look.response.intensity),
+        finiteClamp(look.turbulence, 0.0F, 1.0F, fallback.turbulence),
+        finiteOr(look.phase, fallback.phase),
+        finiteClamp(look.density, 0.0F, 1.0F, fallback.density),
+        finiteClamp(
+            look.response.intensity,
+            0.0F,
+            8.0F,
+            fallback.response.intensity),
     };
     gpu.response0 = glm::vec4{
-        std::max(0.0F, look.response.emissionAdd),
-        std::isfinite(look.response.opacityAdd) ? look.response.opacityAdd : 0.0F,
-        std::max(0.0F, look.response.opacityMultiply),
-        std::isfinite(look.response.pointSizeAdd) ? look.response.pointSizeAdd : 0.0F,
+        finiteClamp(
+            look.response.emissionAdd,
+            0.0F,
+            16.0F,
+            fallback.response.emissionAdd),
+        finiteClamp(
+            look.response.opacityAdd,
+            -1.0F,
+            4.0F,
+            fallback.response.opacityAdd),
+        finiteClamp(
+            look.response.opacityMultiply,
+            0.0F,
+            16.0F,
+            fallback.response.opacityMultiply),
+        finiteClamp(
+            look.response.pointSizeAdd,
+            -256.0F,
+            512.0F,
+            fallback.response.pointSizeAdd),
     };
     gpu.response1 = glm::vec4{
-        std::max(0.0F, look.response.pointSizeMultiply),
-        std::clamp(look.response.colouriseRed, 0.0F, 1.0F),
-        std::clamp(look.response.colouriseGreen, 0.0F, 1.0F),
-        std::clamp(look.response.colouriseBlue, 0.0F, 1.0F),
+        finiteClamp(
+            look.response.pointSizeMultiply,
+            0.0F,
+            16.0F,
+            fallback.response.pointSizeMultiply),
+        finiteClamp(
+            look.response.colouriseRed,
+            0.0F,
+            1.0F,
+            fallback.response.colouriseRed),
+        finiteClamp(
+            look.response.colouriseGreen,
+            0.0F,
+            1.0F,
+            fallback.response.colouriseGreen),
+        finiteClamp(
+            look.response.colouriseBlue,
+            0.0F,
+            1.0F,
+            fallback.response.colouriseBlue),
     };
     gpu.response2 = glm::vec4{
-        std::clamp(look.response.colouriseAmount, 0.0F, 1.0F),
-        std::clamp(look.baseWetness, 0.0F, 1.0F),
-        std::max(0.0F, look.glisten),
-        std::clamp(look.rainResponse, 0.0F, 1.0F),
+        finiteClamp(
+            look.response.colouriseAmount,
+            0.0F,
+            1.0F,
+            fallback.response.colouriseAmount),
+        finiteClamp(look.baseWetness, 0.0F, 1.0F, fallback.baseWetness),
+        finiteClamp(look.glisten, 0.0F, 1.0F, fallback.glisten),
+        finiteClamp(look.rainResponse, 0.0F, 1.0F, fallback.rainResponse),
     };
     const float organicFeatureSize =
         look.pattern == invisible_places::water::WaterSeepagePattern::WettingTrickle
             ? look.tricklePatchSizeMeters
             : look.featureSizeMeters;
+    const float organicFeatureFallback =
+        look.pattern == invisible_places::water::WaterSeepagePattern::WettingTrickle
+            ? fallback.tricklePatchSizeMeters
+            : fallback.featureSizeMeters;
     gpu.organic0 = glm::vec4{
-        std::max(0.005F, organicFeatureSize),
-        std::clamp(look.contrast, 0.0F, 1.0F),
-        std::max(0.0F, look.evolution),
-        std::clamp(look.roughness, 0.02F, 1.0F),
+        finiteClamp(organicFeatureSize, 0.005F, 20.0F, organicFeatureFallback),
+        finiteClamp(look.contrast, 0.0F, 1.0F, fallback.contrast),
+        finiteClamp(look.evolution, 0.0F, 4.0F, fallback.evolution),
+        finiteClamp(look.roughness, 0.02F, 1.0F, fallback.roughness),
     };
     gpu.organic1 = glm::vec4{
-        std::clamp(look.angleResponse, 0.0F, 1.0F),
-        std::clamp(look.microNormalStrength, 0.0F, 2.0F),
-        std::clamp(look.glintDensity, 0.0F, 1.0F),
-        std::clamp(look.curl, 0.0F, 2.0F),
+        finiteClamp(look.angleResponse, 0.0F, 1.0F, fallback.angleResponse),
+        finiteClamp(
+            look.microNormalStrength,
+            0.0F,
+            1.0F,
+            fallback.microNormalStrength),
+        finiteClamp(look.glintDensity, 0.0F, 1.0F, fallback.glintDensity),
+        finiteClamp(look.curl, 0.0F, 2.0F, fallback.curl),
     };
     gpu.organic2 = glm::vec4{
-        std::clamp(look.breakup, 0.0F, 1.0F),
-        std::max(0.0F, look.downhillDriftMetersPerSecond),
-        std::max(0.005F, look.trickleLengthMeters),
-        std::max(0.002F, look.trickleWidthMeters),
+        finiteClamp(look.breakup, 0.0F, 1.0F, fallback.breakup),
+        finiteClamp(
+            look.downhillDriftMetersPerSecond,
+            0.0F,
+            4.0F,
+            fallback.downhillDriftMetersPerSecond),
+        finiteClamp(
+            look.trickleLengthMeters,
+            0.005F,
+            1000.0F,
+            fallback.trickleLengthMeters),
+        finiteClamp(
+            look.trickleWidthMeters,
+            0.001F,
+            100.0F,
+            fallback.trickleWidthMeters),
     };
     gpu.organic3 = glm::vec4{
-        std::max(0.002F, look.trickleFrontSoftness),
+        finiteClamp(
+            look.trickleFrontSoftness,
+            0.001F,
+            10.0F,
+            fallback.trickleFrontSoftness),
         0.0F,
         0.0F,
         0.0F,
     };
     constexpr float degreesToRadians = 0.01745329251994329577F;
-    const float azimuth = look.environmentAzimuthDegrees * degreesToRadians;
-    const float elevation = look.environmentElevationDegrees * degreesToRadians;
+    const float azimuth = std::remainder(
+                              finiteOr(
+                                  look.environmentAzimuthDegrees,
+                                  fallback.environmentAzimuthDegrees),
+                              360.0F) *
+                          degreesToRadians;
+    const float elevation = finiteClamp(
+                                look.environmentElevationDegrees,
+                                -89.0F,
+                                89.0F,
+                                fallback.environmentElevationDegrees) *
+                            degreesToRadians;
     glm::vec3 environmentDirection{
         std::cos(elevation) * std::cos(azimuth),
         std::cos(elevation) * std::sin(azimuth),
@@ -520,6 +601,12 @@ std::uint32_t WaterSeepageQualityGpu(invisible_places::water::WaterSeepageQualit
 }
 
 glm::vec3 SafeSeepageDirection(glm::vec3 value, glm::vec3 fallback) {
+    if (!std::isfinite(value.x) || !std::isfinite(value.y) || !std::isfinite(value.z)) {
+        value = fallback;
+    }
+    if (!std::isfinite(fallback.x) || !std::isfinite(fallback.y) || !std::isfinite(fallback.z)) {
+        fallback = {0.0F, 0.0F, 1.0F};
+    }
     if (glm::dot(value, value) <= 1.0e-8F) {
         value = fallback;
     }
@@ -528,6 +615,14 @@ glm::vec3 SafeSeepageDirection(glm::vec3 value, glm::vec3 fallback) {
 
 WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
     const invisible_places::water::WaterSeepageRuntimeNode& node) {
+    const auto finiteOr = [](float value, float fallback) {
+        return std::isfinite(value) ? value : fallback;
+    };
+    const glm::vec3 safePosition{
+        finiteOr(node.position.x, 0.0F),
+        finiteOr(node.position.y, 0.0F),
+        finiteOr(node.position.z, 0.0F),
+    };
     WaterSeepageNodeTopologyGpu gpu;
     const glm::vec3 normal = SafeSeepageDirection(node.surfaceNormal, {0.0F, 1.0F, 0.0F});
     glm::vec3 down = node.downAxis - normal * glm::dot(node.downAxis, normal);
@@ -543,12 +638,12 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
         0U,
         0U,
     };
-    gpu.positionReach = glm::vec4{node.position, std::max(0.001F, node.reachMeters)};
-    gpu.normalSurface = glm::vec4{normal, std::max(0.001F, node.depthToleranceMeters)};
-    gpu.downEdge = glm::vec4{down, std::max(0.001F, node.edgeFeatherMeters)};
-    gpu.lateralStart = glm::vec4{lateral, std::max(0.001F, node.startHalfWidthMeters)};
+    gpu.positionReach = glm::vec4{safePosition, std::max(0.001F, finiteOr(node.reachMeters, 1.25F))};
+    gpu.normalSurface = glm::vec4{normal, std::max(0.001F, finiteOr(node.depthToleranceMeters, 0.15F))};
+    gpu.downEdge = glm::vec4{down, std::max(0.001F, finiteOr(node.edgeFeatherMeters, 0.10F))};
+    gpu.lateralStart = glm::vec4{lateral, std::max(0.001F, finiteOr(node.startHalfWidthMeters, 0.06F))};
     gpu.geometry = glm::vec4{
-        std::max(0.001F, node.endHalfWidthMeters),
+        std::max(0.001F, finiteOr(node.endHalfWidthMeters, 0.375F)),
         0.0F,
         0.0F,
         0.0F,
@@ -572,13 +667,14 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
         node.guideComplete ? 1U : 0U,
     };
     glm::vec3 previousGuideNormal = normal;
+    glm::vec3 previousGuidePosition = safePosition;
     float previousStation = 0.0F;
     for (std::size_t sampleIndex = 0U; sampleIndex < guideSampleCount; ++sampleIndex) {
         const auto& sample = node.guideSamples[sampleIndex];
         const glm::vec3 position{
-            sample.position.x,
-            sample.position.y,
-            sample.position.z,
+            finiteOr(sample.position.x, previousGuidePosition.x),
+            finiteOr(sample.position.y, previousGuidePosition.y),
+            finiteOr(sample.position.z, previousGuidePosition.z),
         };
         glm::vec3 sampleNormal{
             sample.normal.x,
@@ -598,6 +694,7 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
             1.0F);
         gpu.guidePositionStation[sampleIndex] = glm::vec4{position, station};
         gpu.guideNormalConfidence[sampleIndex] = glm::vec4{sampleNormal, confidence};
+        previousGuidePosition = position;
         previousGuideNormal = sampleNormal;
         previousStation = station;
     }
@@ -606,6 +703,12 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
 
 WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
     const invisible_places::water::WaterSeepageRuntimeNode& node) {
+    const auto finiteOr = [](float value, float fallback) {
+        return std::isfinite(value) ? value : fallback;
+    };
+    const auto finiteClamp = [&finiteOr](float value, float minimum, float maximum, float fallback) {
+        return std::clamp(finiteOr(value, fallback), minimum, maximum);
+    };
     WaterSeepageNodeParamsGpu gpu;
     gpu.control = glm::uvec4{
         node.id,
@@ -615,21 +718,26 @@ WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
     };
     gpu.geometry = glm::vec4{
         0.0F,
-        std::clamp(node.normalAlignment, 0.0F, 1.0F),
-        std::max(0.0F, node.strength),
-        std::clamp(node.rainVisualStrength, 0.0F, 1.0F),
+        finiteClamp(node.normalAlignment, 0.0F, 1.0F, 0.20F),
+        finiteClamp(node.strength, 0.0F, 8.0F, 0.0F),
+        finiteClamp(node.rainVisualStrength, 0.0F, 1.0F, 0.0F),
     };
     gpu.look = MakeWaterSeepageLookGpu(node.look);
     gpu.transitionLook = MakeWaterSeepageLookGpu(
         node.transitionLook.value_or(node.look));
     gpu.scenario = glm::vec4{
-        std::clamp(node.scenarioSpread, 0.0F, 1.0F),
-        std::clamp(node.transitionAmount, 0.0F, 1.0F),
-        std::clamp(node.wettingProgress, 0.0F, 1.0F),
+        finiteClamp(node.scenarioSpread, 0.0F, 1.0F, 0.0F),
+        finiteClamp(node.transitionAmount, 0.0F, 1.0F, 0.0F),
+        finiteClamp(node.wettingProgress, 0.0F, 1.0F, 1.0F),
         0.0F,
     };
     for (std::size_t basisIndex = 0U; basisIndex < gpu.noiseBasis.size(); ++basisIndex) {
-        gpu.noiseBasis[basisIndex] = glm::vec4{node.noiseRotation[basisIndex], 0.0F};
+        glm::vec3 basis = node.noiseRotation[basisIndex];
+        if (!std::isfinite(basis.x) || !std::isfinite(basis.y) || !std::isfinite(basis.z)) {
+            basis = glm::vec3{0.0F};
+            basis[basisIndex] = 1.0F;
+        }
+        gpu.noiseBasis[basisIndex] = glm::vec4{basis, 0.0F};
     }
     return gpu;
 }
@@ -1576,6 +1684,7 @@ void VulkanViewportShell::DrawFrame() {
     if (imageIndex < swapchainImagesInFlight_.size()) {
         swapchainImagesInFlight_[imageIndex] = frame.fence;
     }
+    const bool submittedLiveScene = SceneImageNeedsRender(imageIndex);
 
     Check(vkResetFences(device_, 1, &frame.fence), "vkResetFences");
     Check(vkResetCommandBuffer(frame.commandBuffer, 0), "vkResetCommandBuffer");
@@ -1616,6 +1725,35 @@ void VulkanViewportShell::DrawFrame() {
 
     Check(presentResult, "vkQueuePresentKHR");
     UpdateImGuiPlatformWindowsIfNeeded();
+    bool seepageActivationAdvanced = false;
+    if (submittedLiveScene) {
+        for (auto& resources : pointCloudResources_) {
+            if (resources.seepageActivationFramesRemaining == 0U) {
+                continue;
+            }
+            const auto submittedLayer = std::find_if(
+                renderState_.pointCloudLayers.begin(),
+                renderState_.pointCloudLayers.end(),
+                [&](const SceneRenderState::PointCloudLayerState& layer) {
+                    return layer.layerId == resources.layerId;
+                });
+            PointCloudDrawPlan plan;
+            if (submittedLayer == renderState_.pointCloudLayers.end() ||
+                !ResolvePointCloudDrawPlan(*submittedLayer, false, &plan) ||
+                plan.resources != &resources) {
+                // A hidden/preloaded layer must retain its arming state until
+                // it has actually participated in a live base-cloud frame.
+                continue;
+            }
+            --resources.seepageActivationFramesRemaining;
+            seepageActivationAdvanced = true;
+        }
+    }
+    if (seepageActivationAdvanced) {
+        // Force cached swapchain images to receive the same settled Seepage
+        // activation once the two base-cloud arming frames have been submitted.
+        ++sceneRevision_;
+    }
     const auto frameEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
     if (collectDiagnostics) {
@@ -3218,7 +3356,24 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
     if (grid.nodes.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error{"Seepage node count exceeds the current 32-bit limit."};
     }
+    const auto finitePoint = [](const invisible_places::io::Float3& point) {
+        return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+    };
+    const auto orderedBounds = [](const invisible_places::io::Bounds3f& bounds) {
+        return bounds.minimum.x <= bounds.maximum.x &&
+               bounds.minimum.y <= bounds.maximum.y &&
+               bounds.minimum.z <= bounds.maximum.z;
+    };
+    if (!grid.nodes.empty() &&
+        (!std::isfinite(grid.cellSizeMeters) || grid.cellSizeMeters <= 0.0F ||
+         !grid.unionBounds.valid || !finitePoint(grid.unionBounds.minimum) ||
+         !finitePoint(grid.unionBounds.maximum) || !orderedBounds(grid.unionBounds))) {
+        // Keep the previously settled topology active instead of publishing a
+        // malformed startup grid into every point-cloud descriptor.
+        throw std::runtime_error{"Seepage topology contains invalid bounds or cell spacing."};
+    }
 
+    const bool firstEnable = resources->seepageNodeCount == 0U && !grid.nodes.empty();
     WaitIdle();
     const auto payload = MakeWaterSeepageGpuTopology(grid);
 
@@ -3293,6 +3448,9 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
     resources->seepageHashProbeLimit = payload.probeLimit;
     resources->seepageCellSizeMeters = std::max(0.001F, grid.cellSizeMeters);
     resources->seepageUnionBounds = grid.unionBounds;
+    resources->seepageActivationFramesRemaining =
+        firstEnable ? static_cast<std::uint32_t>(kFramesInFlight)
+                    : (grid.nodes.empty() ? 0U : resources->seepageActivationFramesRemaining);
     ++resources->seepageTopologyUploadRevision;
     ++resources->seepageParamsUploadRevision;
 
@@ -3458,6 +3616,29 @@ std::uint64_t VulkanViewportShell::WaterSeepageTopologyUploadRevision(std::size_
 std::uint64_t VulkanViewportShell::WaterSeepageParamsUploadRevision(std::size_t layerId) const {
     const auto* resources = FindPointCloudResources(layerId);
     return resources != nullptr ? resources->seepageParamsUploadRevision : 0U;
+}
+
+WaterEffectFramePublicationDiagnostics
+VulkanViewportShell::WaterSeepageParamsPublicationState(std::size_t layerId) const {
+    WaterEffectFramePublicationDiagnostics diagnostics;
+    const auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr) {
+        return diagnostics;
+    }
+    diagnostics.requestedGeneration = resources->seepageParamsGeneration;
+    diagnostics.liveFrameGenerations = resources->seepageParamsFrameGenerations;
+    diagnostics.exrGeneration = resources->seepageParamsExrGeneration;
+    diagnostics.activationFramesRemaining = resources->seepageActivationFramesRemaining;
+    const auto firstLiveBuffer = resources->seepageParamsBuffers[0].buffer;
+    const auto secondLiveBuffer = resources->seepageParamsBuffers[1].buffer;
+    diagnostics.liveBuffersDistinct =
+        firstLiveBuffer != VK_NULL_HANDLE && secondLiveBuffer != VK_NULL_HANDLE &&
+        firstLiveBuffer != secondLiveBuffer;
+    const auto exrBuffer = resources->seepageExrParamsBuffer.buffer;
+    diagnostics.exrBufferDistinct =
+        exrBuffer != VK_NULL_HANDLE && exrBuffer != firstLiveBuffer &&
+        exrBuffer != secondLiveBuffer;
+    return diagnostics;
 }
 
 void VulkanViewportShell::UpdatePointBudget(
@@ -10591,7 +10772,8 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             0U,
         };
     }
-    if (resources->seepageNodeCount > 0U &&
+    if ((exrStyle || resources->seepageActivationFramesRemaining == 0U) &&
+        resources->seepageNodeCount > 0U &&
         resources->seepageHashCellCapacity > 0U &&
         resources->seepageNodeReferenceCount > 0U &&
         resources->seepageUnionBounds.valid) {

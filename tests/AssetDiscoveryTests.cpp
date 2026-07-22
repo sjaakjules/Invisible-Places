@@ -1578,6 +1578,37 @@ TEST_CASE("Shoreline shader layouts reserve Height Foam parameters consistently"
     }
 }
 
+TEST_CASE("Seepage cannot publish non-finite point material outputs", "[water][seepage][shader]") {
+    const auto shaderRoot = DataRoot().parent_path() / "shaders";
+    const auto readShader = [](const std::filesystem::path& path) {
+        std::ifstream input{path};
+        REQUIRE(input.good());
+        return std::string{
+            std::istreambuf_iterator<char>{input},
+            std::istreambuf_iterator<char>{}};
+    };
+
+    const auto sparseRipple = readShader(shaderRoot / "pointcloud_sparse_ripple.glsl");
+    CHECK(sparseRipple.find("SparseRippleComposite SanitizeSparseRippleComposite(") !=
+          std::string::npos);
+    CHECK(sparseRipple.find("return SanitizeSparseRippleComposite(result);") !=
+          std::string::npos);
+    CHECK(sparseRipple.find("RippleFiniteFloat(styleData.seepageGridParams.x)") !=
+          std::string::npos);
+    CHECK(sparseRipple.find("RippleFiniteVec3(styleData.seepageBoundsMin.xyz)") !=
+          std::string::npos);
+    CHECK(sparseRipple.find("const uint available = styleData.seepageControl.w - start;") !=
+          std::string::npos);
+
+    const auto preview = readShader(shaderRoot / "pointcloud_preview.vert");
+    CHECK(preview.find("RippleFiniteFloat(resolvedPointSize)") != std::string::npos);
+    CHECK(preview.find("RippleFiniteFloat(resolvedOpacity)") != std::string::npos);
+    CHECK(preview.find("RippleFiniteFloat(resolvedEmissive)") != std::string::npos);
+
+    const auto fastBasic = readShader(shaderRoot / "pointcloud_fast_basic.vert");
+    CHECK(fastBasic.find("RippleFiniteFloat(resolvedPointSize)") != std::string::npos);
+}
+
 TEST_CASE("Shoreline wave defaults are visible when enabled", "[water][shoreline][pointcloud]") {
     invisible_places::renderer::pointcloud::PointCloudStyleState style;
     style.shorelineWaveEnabled = true;

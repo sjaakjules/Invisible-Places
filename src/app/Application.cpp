@@ -40348,7 +40348,8 @@ WaterFrameState PumpWaterIntegrationSmokeFrame(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     float simulatedSeconds,
-    bool drawFrame = true) {
+    bool drawFrame = true,
+    bool sceneCachingEnabled = false) {
     if (window == nullptr || runtimeState == nullptr || viewport == nullptr) {
         return {};
     }
@@ -40371,7 +40372,7 @@ WaterFrameState PumpWaterIntegrationSmokeFrame(
     if (drawFrame) {
         viewport->BeginUiFrame();
         viewport->SetDiagnosticsEnabled(true);
-        viewport->SetSceneCachingEnabled(false);
+        viewport->SetSceneCachingEnabled(sceneCachingEnabled);
         viewport->SetLiveSceneRenderingEnabled(true);
         viewport->UpdateRenderState(
             BuildRenderState(
@@ -42451,6 +42452,14 @@ int RunWaterSeepageSmoke(
         sampleScene->displayVisible = true;
         session.committedDisplaySource = true;
         session.visible = true;
+        // This focused smoke intentionally loads only the 3 mm display bundle.
+        // Make that resident bundle the smoke's export bundle so the production
+        // snapshot builder is exercised without loading unrelated finer sources.
+        std::erase_if(
+            sampleScene->displayBundles,
+            [](const SceneDisplayBundleRuntime& bundle) {
+                return bundle.spacingMicrometres != 3000U;
+            });
     }
     session.pointStyle.geometryMode = PointCloudGeometryMode::ScreenSprites;
     runtimeState->projectSettings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
@@ -42537,7 +42546,8 @@ int RunWaterSeepageSmoke(
         exportSnapshots.begin(),
         exportSnapshots.end(),
         [&](const OfflinePointLayerSnapshot& snapshot) {
-            return snapshot.cloud == session.offlinePointCloud && snapshot.seepageGrid.nodes.size() == 8U;
+            return snapshot.cloud == session.offlinePointCloud &&
+                   snapshot.seepageGrid.nodes.size() == 8U;
         });
     const bool exportGridReady = exportGridIt != exportSnapshots.end();
     if (exportGridReady) {
@@ -42598,7 +42608,8 @@ int RunWaterSeepageSmoke(
         exportSnapshotsAfterStructureToggle.begin(),
         exportSnapshotsAfterStructureToggle.end(),
         [&](const OfflinePointLayerSnapshot& snapshot) {
-            return snapshot.cloud == session.offlinePointCloud && snapshot.seepageGrid.nodes.size() == 8U;
+            return snapshot.cloud == session.offlinePointCloud &&
+                   snapshot.seepageGrid.nodes.size() == 8U;
         });
     const bool exportUnchanged =
         exportGridReady && exportGridAfterStructureIt != exportSnapshotsAfterStructureToggle.end() &&
@@ -43528,7 +43539,14 @@ int RunWaterIntegrationSmoke(
             std::to_string(loadedTopView.exportSettings.framesPerSecond) + " fps, " +
             FormatFixed(topViewDurationSeconds, 3) + " seconds).");
     }
-    InstallWaterIntegrationScenario(runtimeState);
+    // Exercise the real project startup state before installing the synthetic
+    // 120-second acceptance track. The reported flicker occurs with authored
+    // Seepage at full strength and Rain disabled, while the old smoke started
+    // Seepage at only 3% effective strength and therefore missed it.
+    runtimeState->water.collisionRainSettings.enabled = false;
+    runtimeState->water.selectedSeepageScenarioId.clear();
+    runtimeState->animationPanel.currentPath->selectedWaterScenarioId.clear();
+    InvalidateWaterSeepageParams(&runtimeState->water);
     StartQueuedLayerLoadIfIdle(runtimeState);
 
     const std::string expectedSceneName = sampleScene ? "SampleScene" : "Scene1";
@@ -43570,14 +43588,83 @@ int RunWaterIntegrationSmoke(
                 return !session.cpuResident && !session.gpuResident && !session.loaded;
             });
     };
+    const auto findCommittedRockSession = [&](const ScenePointCloudRuntime& scene)
+        -> std::optional<std::size_t> {
+        for (const auto& sessionIndex : scene.committedDisplaySessionIndices) {
+            if (sessionIndex.has_value() &&
+                sessionIndex.value() < runtimeState->sessions.size() &&
+                SceneRoleIs(
+                    runtimeState->sessions[sessionIndex.value()].sceneRole,
+                    "ROCK")) {
+                return sessionIndex;
+            }
+        }
+        return std::nullopt;
+    };
+
+    bool sawStartupSeepageArming = false;
+    bool startupSeepageActivationSequence = true;
+    bool startupSeepageSettled = false;
+    std::uint32_t startupSeepageBaseDraws = 0U;
+    std::optional<std::uint32_t> previousStartupSeepageActivation;
+    const auto observeStartupSeepagePublication = [&](const ScenePointCloudRuntime& scene) {
+        const auto rockSessionIndex = findCommittedRockSession(scene);
+        if (!rockSessionIndex.has_value()) {
+            return;
+        }
+        const auto publication =
+            viewport->WaterSeepageParamsPublicationState(rockSessionIndex.value());
+        if (publication.requestedGeneration == 0U) {
+            return;
+        }
+        const auto activationFrames = publication.activationFramesRemaining;
+        const auto frameSlotCount = static_cast<std::uint32_t>(
+            publication.liveFrameGenerations.size());
+        const auto& diagnostics = viewport->Diagnostics();
+        const bool livePointDrawSubmitted =
+            diagnostics.sceneRenderedThisFrame && diagnostics.pointDrawCalls > 0U &&
+            diagnostics.pointSubmittedCount > 0U;
+
+        if (!previousStartupSeepageActivation.has_value()) {
+            if (activationFrames == frameSlotCount) {
+                sawStartupSeepageArming = true;
+            } else if (activationFrames + 1U == frameSlotCount) {
+                sawStartupSeepageArming = true;
+                startupSeepageActivationSequence =
+                    startupSeepageActivationSequence && livePointDrawSubmitted;
+                startupSeepageBaseDraws = 1U;
+            } else {
+                startupSeepageActivationSequence = false;
+            }
+        } else if (activationFrames < previousStartupSeepageActivation.value()) {
+            const auto advanced =
+                previousStartupSeepageActivation.value() - activationFrames;
+            startupSeepageActivationSequence =
+                startupSeepageActivationSequence && advanced == 1U &&
+                livePointDrawSubmitted;
+            startupSeepageBaseDraws += advanced;
+        } else if (activationFrames > previousStartupSeepageActivation.value() ||
+                   (activationFrames > 0U && diagnostics.sceneRenderedThisFrame)) {
+            startupSeepageActivationSequence = false;
+        }
+
+        previousStartupSeepageActivation = activationFrames;
+        if (sawStartupSeepageArming && activationFrames == 0U &&
+            startupSeepageBaseDraws == frameSlotCount) {
+            startupSeepageSettled = true;
+        }
+    };
 
     bool sawDisplay = false;
     bool cacheReady = false;
     const auto startupTimeout = sampleScene ? std::chrono::seconds{90} : std::chrono::seconds{240};
     const auto startupDeadline = startupStartedAt + startupTimeout;
     while (std::chrono::steady_clock::now() < startupDeadline && !window->ShouldClose()) {
-        PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true);
+        PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true, true);
         auto* scene = findExpectedScene();
+        if (scene != nullptr) {
+            observeStartupSeepagePublication(*scene);
+        }
         if (scene != nullptr && !sawDisplay && displayReady(*scene)) {
             sawDisplay = true;
             report.displayVisibleBeforeAnalysis = analysisNonresident(*scene);
@@ -43717,6 +43804,169 @@ int RunWaterIntegrationSmoke(
     } else {
         report.Fail("Cold cache build did not scan exactly three 5 mm roles once.");
     }
+
+    const auto startupSeepageIt = std::find_if(
+        runtimeState->water.seepageNodes.begin(),
+        runtimeState->water.seepageNodes.end(),
+        [](const auto& node) { return node.name == "SampleSeepage"; });
+    const auto startupRockSessionIndex = findCommittedRockSession(*scene);
+    if (startupSeepageIt == runtimeState->water.seepageNodes.end() ||
+        !startupRockSessionIndex.has_value()) {
+        report.Fail("The authored startup Seepage node or 3 mm ROCK display layer was unavailable.");
+    } else {
+        const auto rockLayerId = startupRockSessionIndex.value();
+        const auto initialTopologyRevision =
+            viewport->WaterSeepageTopologyUploadRevision(rockLayerId);
+        const auto initialNodeCount = viewport->WaterSeepageNodeCount(rockLayerId);
+        const auto initialOccupiedCellCount =
+            viewport->WaterSeepageOccupiedCellCount(rockLayerId);
+        const auto initialReferenceCount =
+            viewport->WaterSeepageNodeReferenceCount(rockLayerId);
+        auto initialPublication =
+            viewport->WaterSeepageParamsPublicationState(rockLayerId);
+        for (std::size_t frame = 0U;
+             frame < 4U && initialPublication.activationFramesRemaining > 0U;
+             ++frame) {
+            PumpWaterIntegrationSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.0F,
+                true,
+                true);
+            observeStartupSeepagePublication(*scene);
+            initialPublication =
+                viewport->WaterSeepageParamsPublicationState(rockLayerId);
+        }
+        const bool initialPublicationSettled =
+            initialTopologyRevision > 0U && initialNodeCount == 1U &&
+            initialOccupiedCellCount > 0U && initialReferenceCount > 0U &&
+            initialPublication.requestedGeneration > 0U &&
+            initialPublication.liveFrameGenerations[0] ==
+                initialPublication.requestedGeneration &&
+            initialPublication.liveFrameGenerations[1] ==
+                initialPublication.requestedGeneration &&
+            initialPublication.exrGeneration ==
+                initialPublication.requestedGeneration &&
+            initialPublication.liveBuffersDistinct &&
+            initialPublication.exrBufferDistinct &&
+            initialPublication.activationFramesRemaining == 0U &&
+            sawStartupSeepageArming && startupSeepageActivationSequence &&
+            startupSeepageSettled;
+        const auto startupGridKey =
+            NormalizePathKey(runtimeState->sessions[rockLayerId].sourcePath) +
+            "|layer=" + std::to_string(rockLayerId);
+        const auto seepageTopologyFingerprint = [&]() {
+            const auto grid = runtimeState->water.seepageRuntimeGrids.find(startupGridKey);
+            return grid != runtimeState->water.seepageRuntimeGrids.end()
+                       ? invisible_places::water::WaterSeepageTopologyFingerprint(grid->second)
+                       : std::string{};
+        };
+        const auto initialSeepageTopologyFingerprint = seepageTopologyFingerprint();
+        startupSeepageIt->enabledInViewport = false;
+        InvalidateWaterSeepageTopology(&runtimeState->water);
+        for (std::size_t frame = 0U; frame < 3U; ++frame) {
+            PumpWaterIntegrationSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.0F,
+                true,
+                true);
+        }
+
+        startupSeepageIt->enabledInViewport = true;
+        InvalidateWaterSeepageTopology(&runtimeState->water);
+        EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+        auto reenabledPublication =
+            viewport->WaterSeepageParamsPublicationState(rockLayerId);
+        const auto reenabledFrameSlotCount = static_cast<std::uint32_t>(
+            reenabledPublication.liveFrameGenerations.size());
+        bool reenabledActivationSequence =
+            reenabledPublication.activationFramesRemaining ==
+            reenabledFrameSlotCount;
+        std::uint32_t reenabledBaseDraws = 0U;
+        std::uint32_t previousActivationFrames =
+            reenabledPublication.activationFramesRemaining;
+        for (std::size_t frame = 0U; frame < 5U; ++frame) {
+            PumpWaterIntegrationSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.0F,
+                true,
+                true);
+            reenabledPublication =
+                viewport->WaterSeepageParamsPublicationState(rockLayerId);
+            const auto& diagnostics = viewport->Diagnostics();
+            const bool livePointDrawSubmitted =
+                diagnostics.sceneRenderedThisFrame && diagnostics.pointDrawCalls > 0U &&
+                diagnostics.pointSubmittedCount > 0U;
+            if (previousActivationFrames > 0U) {
+                if (reenabledPublication.activationFramesRemaining + 1U ==
+                    previousActivationFrames) {
+                    reenabledActivationSequence =
+                        reenabledActivationSequence && livePointDrawSubmitted;
+                    ++reenabledBaseDraws;
+                } else if (
+                    reenabledPublication.activationFramesRemaining !=
+                        previousActivationFrames ||
+                    diagnostics.sceneRenderedThisFrame) {
+                    reenabledActivationSequence = false;
+                }
+            }
+            previousActivationFrames =
+                reenabledPublication.activationFramesRemaining;
+            if (reenabledPublication.activationFramesRemaining == 0U &&
+                viewport->WaterSeepageNodeCount(rockLayerId) == initialNodeCount) {
+                break;
+            }
+        }
+        const bool reenabledPublicationSettled =
+            reenabledPublication.requestedGeneration > 0U &&
+            reenabledPublication.liveFrameGenerations[0] ==
+                reenabledPublication.requestedGeneration &&
+            reenabledPublication.liveFrameGenerations[1] ==
+                reenabledPublication.requestedGeneration &&
+            reenabledPublication.exrGeneration ==
+                reenabledPublication.requestedGeneration &&
+            reenabledPublication.activationFramesRemaining == 0U &&
+            reenabledActivationSequence &&
+            reenabledBaseDraws == reenabledFrameSlotCount &&
+            viewport->WaterSeepageNodeCount(rockLayerId) == initialNodeCount &&
+            viewport->WaterSeepageOccupiedCellCount(rockLayerId) ==
+                initialOccupiedCellCount &&
+            viewport->WaterSeepageNodeReferenceCount(rockLayerId) ==
+                initialReferenceCount &&
+            viewport->WaterSeepageTopologyUploadRevision(rockLayerId) ==
+                initialTopologyRevision + 2U &&
+            !initialSeepageTopologyFingerprint.empty() &&
+            seepageTopologyFingerprint() == initialSeepageTopologyFingerprint;
+        if (initialPublicationSettled && reenabledPublicationSettled) {
+            report.Pass(
+                "Full-strength authored Seepage armed both live frame slots while ROCK remained in the live draw plan; off/on rebuilt the same compact topology.");
+        } else {
+            std::ostringstream detail;
+            detail << "Seepage startup publication or ROCK draw-plan arming was not stable across initial enable and off/on rebuild"
+                   << " (initial_publication=" << (initialPublicationSettled ? 1 : 0)
+                   << ",reenabled_publication=" << (reenabledPublicationSettled ? 1 : 0)
+                   << ",startup_arming_seen=" << (sawStartupSeepageArming ? 1 : 0)
+                   << ",startup_sequence=" << (startupSeepageActivationSequence ? 1 : 0)
+                   << ",startup_base_draws=" << startupSeepageBaseDraws
+                   << ",reenabled_sequence=" << (reenabledActivationSequence ? 1 : 0)
+                   << ",reenabled_base_draws=" << reenabledBaseDraws
+                   << ",topology_revision="
+                   << viewport->WaterSeepageTopologyUploadRevision(rockLayerId)
+                   << '/' << (initialTopologyRevision + 2U);
+            detail << ").";
+            report.Fail(detail.str());
+        }
+    }
+
+    InstallWaterIntegrationScenario(runtimeState);
+    runtimeState->animationPanel.scrubAmount = 0.0F;
+    ApplyAnimationScrub(runtimeState);
+    InvalidateWaterSeepageParams(&runtimeState->water);
 
     const auto flowPointIt = std::find_if(
         runtimeState->water.emitters.begin(),

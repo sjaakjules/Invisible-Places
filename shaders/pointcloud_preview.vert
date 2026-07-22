@@ -990,10 +990,12 @@ void main() {
                   footprintScale);
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
-    gl_PointSize = clamp(
-        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth) + max(0.0, styleData.renderParams2.x),
-        minPointSize,
-        maxPointSize);
+    const float resolvedPointSize =
+        pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth) +
+        max(0.0, styleData.renderParams2.x);
+    gl_PointSize = RippleFiniteFloat(resolvedPointSize)
+        ? clamp(resolvedPointSize, minPointSize, maxPointSize)
+        : minPointSize;
 
     const float causticColorSignal = CausticColorSignal(caustic, previewTint);
     outSourceColor =
@@ -1012,24 +1014,34 @@ void main() {
         EvaluateBinding(styleData.opacityBinding),
         EvaluateBinding(styleData.emissiveBinding),
         pointIndex);
+    const float safeBaseOpacity = RippleFiniteFloat(animatedFlow.x)
+        ? clamp(animatedFlow.x, 0.0, 4.0)
+        : 1.0;
+    const float safeBaseEmissive = RippleFiniteFloat(animatedFlow.y)
+        ? max(0.0, animatedFlow.y)
+        : 0.0;
     const float flowEffectVisibility = WaterTrailOverlayEnabled()
         ? WaterTrailVisibility(pointIndex) * WaterFlowAppearanceScale()
         : 1.0;
-    outOpacity = clamp(
+    const float resolvedOpacity =
         (animatedFlow.x * (1.0 + caustic * max(0.0, styleData.causticParams1.z)) *
              waterEffectOpacityMultiply *
              sparseRippleOpacityMultiply) +
             (waterEffectOpacityAdd +
              sparseRippleOpacityAdd +
-             rainImpact.opacityAdd) * flowEffectVisibility,
-        0.0,
-        4.0);
-    outEmissive =
+             rainImpact.opacityAdd) * flowEffectVisibility;
+    outOpacity = RippleFiniteFloat(resolvedOpacity)
+        ? clamp(resolvedOpacity, 0.0, 4.0)
+        : safeBaseOpacity;
+    const float resolvedEmissive =
         animatedFlow.y +
         (caustic * max(0.0, styleData.causticParams1.y) +
          waterEffectEmissionAdd +
          sparseRippleEmissionAdd +
          rainImpact.emissionAdd) * flowEffectVisibility;
+    outEmissive = RippleFiniteFloat(resolvedEmissive)
+        ? max(0.0, resolvedEmissive)
+        : safeBaseEmissive;
     outDepthFade = EvaluateBinding(styleData.depthFadeBinding);
     outViewDepth = viewDepth;
     outPointIndex = pointIndex;

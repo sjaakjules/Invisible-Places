@@ -124,6 +124,14 @@ layout(set = 0, binding = 16, std430) readonly buffer SeepageNodeParamsBuffer {
     SeepageNodeParams seepageParams[];
 } seepageParamData;
 
+bool RippleFiniteFloat(float value) {
+    return !isnan(value) && !isinf(value);
+}
+
+bool RippleFiniteVec3(vec3 value) {
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
 bool HasSparseRippleEffects() {
     return styleData.rippleEffectSlots3.x != 0u &&
            styleData.rippleEffectSlots3.y != 0u &&
@@ -143,16 +151,24 @@ bool HasShorelineWaveEffect() {
 }
 
 bool HasSeepageEffect() {
+    const uint capacity = styleData.seepageControl.z;
     return styleData.seepageControl.x != 0u &&
            styleData.seepageControl.y != 0u &&
-           styleData.seepageControl.z != 0u &&
+           capacity != 0u &&
+           (capacity & (capacity - 1u)) == 0u &&
            styleData.seepageControl.w != 0u &&
            styleData.seepageControl.y <= uint(seepageNodeData.seepageNodes.length()) &&
            styleData.seepageControl.y <= uint(seepageParamData.seepageParams.length()) &&
-           styleData.seepageControl.z <= uint(seepageHashCellData.seepageHashCells.length()) &&
+           capacity <= uint(seepageHashCellData.seepageHashCells.length()) &&
            styleData.seepageControl.w <=
                uint(seepageNodeReferenceData.seepageNodeReferences.length()) &&
-           styleData.seepageGridParams.x > 1e-6;
+           RippleFiniteFloat(styleData.seepageGridParams.x) &&
+           styleData.seepageGridParams.x > 1e-6 &&
+           RippleFiniteVec3(styleData.seepageBoundsMin.xyz) &&
+           RippleFiniteVec3(styleData.seepageBoundsMax.xyz) &&
+           all(lessThanEqual(
+               styleData.seepageBoundsMin.xyz,
+               styleData.seepageBoundsMax.xyz));
 }
 
 uint SeepageHashUint(uint value) {
@@ -1429,6 +1445,29 @@ SparseRippleComposite EmptySparseRippleComposite() {
     return result;
 }
 
+SparseRippleComposite SanitizeSparseRippleComposite(SparseRippleComposite value) {
+    // A malformed or only-partially-published effect must never poison the
+    // base point pass. NaN point sizes and opacity values have undefined
+    // rasterisation/blending behaviour and can make an otherwise valid ROCK
+    // cloud disappear for an entire in-flight frame.
+    if (!RippleFiniteFloat(value.scale) ||
+        !RippleFiniteFloat(value.colourMix) ||
+        !RippleFiniteFloat(value.emissionAdd) ||
+        !RippleFiniteFloat(value.opacityAdd) ||
+        !RippleFiniteFloat(value.opacityMultiply) ||
+        !RippleFiniteFloat(value.pointSizeAdd) ||
+        !RippleFiniteFloat(value.pointSizeMultiply) ||
+        !RippleFiniteVec3(value.colour)) {
+        return EmptySparseRippleComposite();
+    }
+    // Preserve the established finite composition ranges. This helper is a
+    // failure-containment boundary, not a new visual limiter.
+    value.colourMix = clamp(value.colourMix, 0.0, 1.0);
+    value.opacityMultiply = max(0.0, value.opacityMultiply);
+    value.pointSizeMultiply = max(0.0, value.pointSizeMultiply);
+    return value;
+}
+
 float SeepageNoiseHash01(int x, int y, uint seed) {
     uint hash = SeepageCellHash(ivec3(x, y, int(seed)));
     hash ^= seed * 0x9e3779b9u;
@@ -2608,6 +2647,7 @@ void BlendSeepageContributions(
     uint pointIndex,
     float timeSeconds) {
     if (!HasSeepageEffect() ||
+        !RippleFiniteVec3(worldPosition) ||
         any(lessThan(worldPosition, styleData.seepageBoundsMin.xyz)) ||
         any(greaterThan(worldPosition, styleData.seepageBoundsMax.xyz))) {
         return;
@@ -2638,7 +2678,8 @@ void BlendSeepageContributions(
         if (count == 0u || start >= styleData.seepageControl.w) {
             return;
         }
-        const uint cappedEnd = min(start + count, styleData.seepageControl.w);
+        const uint available = styleData.seepageControl.w - start;
+        const uint cappedEnd = start + min(count, available);
         for (uint referenceIndex = start; referenceIndex < cappedEnd; ++referenceIndex) {
             const uint nodeIndex = seepageNodeReferenceData.seepageNodeReferences[referenceIndex];
             if (nodeIndex >= styleData.seepageControl.y) {
@@ -2665,21 +2706,19 @@ SparseRippleComposite ResolveSparseRippleComposite(vec3 worldPosition, vec3 poin
     SparseRippleComposite result = EvaluateShorelineWaveContribution(worldPosition, pointNormal, timeSeconds);
     BlendSeepageContributions(result, worldPosition, pointNormal, pointIndex, timeSeconds);
     if (!HasSparseRippleEffects()) {
-        result.opacityMultiply = max(0.0, result.opacityMultiply);
-        result.pointSizeMultiply = max(0.0, result.pointSizeMultiply);
-        result.colourMix = clamp(result.colourMix, 0.0, 1.0);
-        return result;
+        return SanitizeSparseRippleComposite(result);
     }
     if (styleData.pointMeta.x == 0u || pointIndex >= styleData.pointMeta.x) {
-        return result;
+        return SanitizeSparseRippleComposite(result);
     }
     const SparseRippleRange pointRange = sparseRippleRangeData.sparseRippleRanges[pointIndex];
     const uint start = pointRange.range.x;
     const uint count = pointRange.range.y;
     if (count == 0u || start >= styleData.rippleEffectSlots3.y) {
-        return result;
+        return SanitizeSparseRippleComposite(result);
     }
-    const uint cappedEnd = min(start + count, styleData.rippleEffectSlots3.y);
+    const uint available = styleData.rippleEffectSlots3.y - start;
+    const uint cappedEnd = start + min(count, available);
     for (uint entryIndex = start; entryIndex < cappedEnd; ++entryIndex) {
         const SparseRippleMembership membership = sparseRippleMembershipData.sparseRippleMemberships[entryIndex];
         const uint paramIndex = membership.control.x;
@@ -2691,10 +2730,7 @@ SparseRippleComposite ResolveSparseRippleComposite(vec3 worldPosition, vec3 poin
             EvaluateSparseRippleContribution(membership, params, worldPosition, pointNormal, timeSeconds);
         BlendSparseRippleContribution(result, contribution, params.control.y);
     }
-    result.opacityMultiply = max(0.0, result.opacityMultiply);
-    result.pointSizeMultiply = max(0.0, result.pointSizeMultiply);
-    result.colourMix = clamp(result.colourMix, 0.0, 1.0);
-    return result;
+    return SanitizeSparseRippleComposite(result);
 }
 
 vec3 ApplySparseRippleColor(vec3 baseColor, SparseRippleComposite ripple) {

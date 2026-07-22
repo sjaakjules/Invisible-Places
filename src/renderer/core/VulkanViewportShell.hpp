@@ -100,6 +100,7 @@ struct WaterEffectFramePublicationDiagnostics {
     std::uint64_t exrGeneration = 0U;
     bool liveBuffersDistinct = false;
     bool exrBufferDistinct = false;
+    std::uint32_t activationFramesRemaining = 0U;
 };
 
 struct SceneRenderState {
@@ -339,6 +340,8 @@ class VulkanViewportShell {
     [[nodiscard]] std::size_t WaterSeepageNodeReferenceCount(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t WaterSeepageTopologyUploadRevision(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t WaterSeepageParamsUploadRevision(std::size_t layerId) const;
+    [[nodiscard]] WaterEffectFramePublicationDiagnostics WaterSeepageParamsPublicationState(
+        std::size_t layerId) const;
     void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
     void UpdateInteractivePointSampleBuffer(
         std::size_t layerId,
@@ -501,6 +504,11 @@ class VulkanViewportShell {
         std::uint64_t seepageParamsGeneration = 0;
         std::array<std::uint64_t, kFramesInFlight> seepageParamsFrameGenerations{};
         std::uint64_t seepageParamsExrGeneration = 0;
+        // A newly enabled Seepage topology is armed only after each live frame
+        // slot has submitted one base-cloud frame. This keeps the first
+        // descriptor publication out of the same presentation cycle that
+        // commits a newly loaded display bundle.
+        std::uint32_t seepageActivationFramesRemaining = 0U;
         std::vector<std::byte> pendingSeepageParams;
         std::vector<std::uint32_t> seepageTopologyNodeIds;
         const invisible_places::water::MeshSurfaceCache* dynamicMeshFlowCacheIdentity = nullptr;
