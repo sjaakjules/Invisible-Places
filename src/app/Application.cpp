@@ -15351,10 +15351,17 @@ void PollRainCollisionCacheWarmup(
 void EnsureRainCollisionCacheReady(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    PollRainCollisionCacheWarmup(runtimeState, viewport);
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
+    // Point-cloud loads and uploads have large transient allocations on unified-memory
+    // systems. Do not build, materialise, or upload the optional shared water cache
+    // until the serial layer-load pipeline is idle.
+    if (runtimeState->pendingLoad.has_value() ||
+        !runtimeState->persistence.queuedLoads.empty()) {
+        return;
+    }
+    PollRainCollisionCacheWarmup(runtimeState, viewport);
     const auto* scene = ActiveRainCollisionScene(*runtimeState);
     if (scene != nullptr) {
         StartRainCollisionCacheWarmup(runtimeState, viewport, *scene);
@@ -15461,6 +15468,15 @@ void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool 
         return;
     }
     auto& water = runtimeState->water;
+    // This cache is only useful to the enabled Mesh Flow feature. In particular,
+    // avoid parsing and indexing a multi-million-triangle mesh in parallel with
+    // startup point-cloud loads.
+    if (!water.dynamicMeshFlowSettings.enabled ||
+        runtimeState->pendingLoad.has_value() ||
+        !runtimeState->persistence.queuedLoads.empty() ||
+        water.rainCollisionCacheWarmup.worker.joinable()) {
+        return;
+    }
     const auto meshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, water.dynamicMeshFlowSettings);
     if (meshPath.empty()) {
         return;
@@ -42170,6 +42186,7 @@ int Application::Run(ApplicationRunOptions options) const {
             if (!runtimeState.offlineRenderJob.active) {
                 CommitReadySceneDisplaySwitches(&runtimeState, &viewport.value());
                 StartQueuedLayerLoadIfIdle(&runtimeState);
+                StartDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
             }
             viewport->BeginUiFrame();
             const bool pauseLiveViewport =

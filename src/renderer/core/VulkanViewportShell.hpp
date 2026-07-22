@@ -523,7 +523,6 @@ class VulkanViewportShell {
         bool usingSampledIndices = false;
         bool hasSourceRgb = false;
         bool hasNormals = false;
-        std::vector<invisible_places::io::Float3> cpuPositions;
         std::vector<std::uint32_t> activeSparseRipplePointIndices;
         std::vector<PointHighlightResources> highlights;
         std::vector<WaterFlowRetiredOutputResources> waterFlowRetiredOutputs;

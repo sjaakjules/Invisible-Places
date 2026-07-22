@@ -1804,7 +1804,6 @@ void VulkanViewportShell::UploadPointCloud(
     resources.scalarFieldCount = static_cast<std::uint32_t>(cloud.ScalarFieldCount());
     resources.hasSourceRgb = cloud.hasSourceRgb;
     resources.hasNormals = cloud.hasNormals && cloud.normals.size() == cloud.positions.size();
-    resources.cpuPositions = cloud.positions;
 
     resources.positionBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(invisible_places::io::Float3)),
@@ -1814,18 +1813,17 @@ void VulkanViewportShell::UploadPointCloud(
         cloud.positions.data(),
         resources.positionBuffer.size);
 
-    std::vector<glm::vec4> storagePositions;
-    storagePositions.reserve(cloud.positions.size());
-    for (const auto& position : cloud.positions) {
-        storagePositions.emplace_back(position.x, position.y, position.z, 1.0F);
-    }
     resources.positionStorageBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(storagePositions.size() * sizeof(glm::vec4)),
+        static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(glm::vec4)),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources.positionStorageBuffer,
-        storagePositions.data(),
-        resources.positionStorageBuffer.size);
+    auto* storagePositions = static_cast<glm::vec4*>(resources.positionStorageBuffer.mapped);
+    if (storagePositions == nullptr) {
+        throw std::runtime_error{"Point-cloud position storage buffer is not host visible."};
+    }
+    for (std::size_t pointIndex = 0; pointIndex < cloud.positions.size(); ++pointIndex) {
+        const auto& position = cloud.positions[pointIndex];
+        storagePositions[pointIndex] = glm::vec4{position.x, position.y, position.z, 1.0F};
+    }
 
     resources.colorBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(cloud.packedColors.size() * sizeof(std::uint32_t)),
@@ -1835,22 +1833,25 @@ void VulkanViewportShell::UploadPointCloud(
         cloud.packedColors.data(),
         resources.colorBuffer.size);
 
-    std::vector<glm::vec4> storageNormals;
     if (resources.hasNormals) {
-        storageNormals.reserve(cloud.normals.size());
-        for (const auto& normal : cloud.normals) {
-            storageNormals.emplace_back(normal.x, normal.y, normal.z, 0.0F);
+        resources.normalBuffer = CreateHostVisibleBuffer(
+            static_cast<VkDeviceSize>(cloud.normals.size() * sizeof(glm::vec4)),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto* storageNormals = static_cast<glm::vec4*>(resources.normalBuffer.mapped);
+        if (storageNormals == nullptr) {
+            throw std::runtime_error{"Point-cloud normal storage buffer is not host visible."};
+        }
+        for (std::size_t pointIndex = 0; pointIndex < cloud.normals.size(); ++pointIndex) {
+            const auto& normal = cloud.normals[pointIndex];
+            storageNormals[pointIndex] = glm::vec4{normal.x, normal.y, normal.z, 0.0F};
         }
     } else {
-        storageNormals.emplace_back(0.0F, 0.0F, 0.0F, 0.0F);
+        const glm::vec4 fallbackNormal{0.0F, 0.0F, 0.0F, 0.0F};
+        resources.normalBuffer = CreateHostVisibleBuffer(
+            sizeof(fallbackNormal),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(resources.normalBuffer, &fallbackNormal, sizeof(fallbackNormal));
     }
-    resources.normalBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(storageNormals.size() * sizeof(glm::vec4)),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    UploadBufferData(
-        resources.normalBuffer,
-        storageNormals.data(),
-        resources.normalBuffer.size);
 
     if (!cloud.scalarFieldValues.empty()) {
         resources.scalarFieldBuffer = CreateHostVisibleBuffer(
@@ -2215,7 +2216,6 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
         resources->scalarFieldCount = 31U;
         resources->hasSourceRgb = true;
         resources->hasNormals = true;
-        resources->cpuPositions.clear();
         resources->dynamicMeshFlowCacheIdentity = &cache;
         resources->dynamicMeshFlowParticleCount = particleCount;
         resources->dynamicMeshFlowRouteAnchorCount = routeAnchorCount;
