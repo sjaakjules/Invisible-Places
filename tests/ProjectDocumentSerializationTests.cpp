@@ -1,3 +1,4 @@
+#include "InvisiblePlacesBuildConfig.hpp"
 #include "serialization/ProjectDocument.hpp"
 
 #include <catch2/catch_approx.hpp>
@@ -43,6 +44,49 @@ struct TemporaryProjectFile {
   std::filesystem::path path;
 };
 
+struct TemporaryProjectDirectory {
+  explicit TemporaryProjectDirectory(std::string dirname)
+      : path(std::filesystem::temp_directory_path() / std::move(dirname)) {
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+    std::filesystem::create_directories(path);
+  }
+
+  ~TemporaryProjectDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+  }
+
+  std::filesystem::path path;
+};
+
+struct SettledFlowCacheFixture {
+  invisible_places::water::WaterEmitter emitter;
+  invisible_places::water::WaterPathCache cache;
+};
+
+SettledFlowCacheFixture MakeSettledFlowCacheFixture() {
+  SettledFlowCacheFixture fixture;
+  fixture.emitter.id = 17U;
+  fixture.emitter.name = "Settled source";
+
+  invisible_places::water::WaterPathBranch branch;
+  branch.id = 31U;
+  branch.emitterId = fixture.emitter.id;
+  branch.bakeFingerprint = "emitter=17|settled";
+  branch.rawAnchors.resize(2U);
+  branch.rawAnchors[0].emitterId = 17.0F;
+  branch.rawAnchors[1].emitterId = 17.0F;
+  branch.rawAnchors[1].pathDistance = 1.25F;
+
+  fixture.cache.supportLayerPath = "Data/Scene1/Site1-ROCK-1mm.ply";
+  fixture.cache.supportSignature = "scene1-support";
+  fixture.cache.emitterSettingsFingerprint = "emitter-17-settings";
+  fixture.cache.branches = {branch};
+  fixture.cache.stale = false;
+  return fixture;
+}
+
 } // namespace
 
 TEST_CASE("Current project schema round-trips authoritative scene density groups",
@@ -73,6 +117,17 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
                .displaySourcePath = "Data/Scene1/Scene1-VEG-5mm.ply"},
           },
   });
+  document.scenePointCloudGroups.front().waterSurfaceCache =
+      invisible_places::serialization::WaterSurfaceCacheManifestDocument{
+          .relativePath = ".invisible_places/cache/water/scene1.surfacecache",
+          .cacheSchema = invisible_places::water::kWaterSurfaceCacheSchemaVersion,
+          .algorithmId = "water-surface-v3",
+          .sourceFingerprint = "scene1-5mm-static",
+          .payloadBytes = 204ULL * 1024ULL * 1024ULL,
+          .checksum = {1U, 2U, 3U, 4U},
+          .requestedRebuildGeneration = 7U,
+          .builtRebuildGeneration = 7U,
+      };
 
   ProjectLayerDocument legacyMirror;
   legacyMirror.sourcePath = "Data/Scene1/Scene1-ROCK-2mm.ply";
@@ -94,6 +149,10 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   REQUIRE(savedJson.at("scene_point_cloud_groups").size() == 1U);
   CHECK(savedJson.at("scene_point_cloud_groups").front().at("scene_group") ==
         "Scene1");
+  CHECK(savedJson.at("scene_point_cloud_groups")
+            .front()
+            .at("water_surface_cache")
+            .at("source_fingerprint") == "scene1-5mm-static");
   CHECK(savedJson.at("layers").front().at("selected_scene_variant_path") ==
         "Data/Scene1/Scene1-ROCK-2mm.ply");
 
@@ -106,6 +165,13 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   CHECK(group.displayLoaded);
   CHECK_FALSE(group.displayVisible);
   REQUIRE(group.roleSources.size() == 3U);
+  REQUIRE(group.waterSurfaceCache.has_value());
+  CHECK(group.waterSurfaceCache->algorithmId == "water-surface-v3");
+  CHECK(group.waterSurfaceCache->payloadBytes == 204ULL * 1024ULL * 1024ULL);
+  CHECK(group.waterSurfaceCache->checksum ==
+        std::array<std::uint64_t, 4>{1U, 2U, 3U, 4U});
+  CHECK(group.waterSurfaceCache->requestedRebuildGeneration == 7U);
+  CHECK(group.waterSurfaceCache->builtRebuildGeneration == 7U);
   const auto *rock = FindRoleSource(group, "ROCK");
   REQUIRE(rock != nullptr);
   CHECK(rock->analysisSourcePath == "Data/Scene1/Scene1-ROCK-1mm.ply");
@@ -113,6 +179,413 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   REQUIRE(loaded->layers.size() == 1U);
   CHECK(loaded->layers.front().selectedSceneVariantPath ==
         legacyMirror.selectedSceneVariantPath);
+}
+
+TEST_CASE("Schema 42 externalizes clean Flow path caches and prunes orphaned data",
+          "[project][serialization][water][path-cache][sidecar]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+  using invisible_places::water::WaterEmitter;
+  using invisible_places::water::WaterPathBranch;
+  using invisible_places::water::WaterPathCache;
+
+  WaterEmitter emitter;
+  emitter.id = 17U;
+  emitter.name = "Settled source";
+  WaterPathBranch branch;
+  branch.id = 31U;
+  branch.emitterId = emitter.id;
+  branch.bakeFingerprint = "emitter=17|settled";
+  branch.rawAnchors.resize(2U);
+  branch.rawAnchors[0].emitterId = 17.0F;
+  branch.rawAnchors[1].emitterId = 17.0F;
+  branch.rawAnchors[1].pathDistance = 1.25F;
+
+  WaterPathCache cache;
+  cache.supportLayerPath = "Data/Scene1/Site1-ROCK-1mm.ply";
+  cache.supportSignature = "scene1-support";
+  cache.emitterSettingsFingerprint = "emitter-17-settings";
+  cache.branches = {branch};
+  cache.hiddenBranchIds = {999U};
+  cache.stale = false;
+
+  WaterSceneStateDocument state;
+  state.sceneGroupName = "Scene1";
+  state.emitters = {emitter};
+  state.pathCache = cache;
+  ProjectDocument document;
+  document.projectName = "flow-sidecar";
+  document.waterSceneStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_flow_sidecar_schema42.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  nlohmann::json savedJson;
+  {
+    std::ifstream input{file.path};
+    REQUIRE(input.is_open());
+    savedJson = nlohmann::json::parse(input);
+  }
+  REQUIRE(savedJson.at("water_scene_states").size() == 1U);
+  const auto &savedState = savedJson.at("water_scene_states").front();
+  CHECK(savedState.contains("water_path_cache_manifest"));
+  CHECK_FALSE(savedState.contains("water_path_cache"));
+  CHECK(savedJson.dump().find("raw_anchors") == std::string::npos);
+
+  const auto relativeSidecar = std::filesystem::path{
+      savedState.at("water_path_cache_manifest").at("relative_path").get<std::string>()};
+  const auto sidecarPath = relativeSidecar.is_absolute()
+                               ? relativeSidecar
+                               : (file.path.parent_path() / relativeSidecar).lexically_normal();
+  CHECK(sidecarPath.extension() == ".flowpathcache");
+  REQUIRE(std::filesystem::is_regular_file(sidecarPath));
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterSceneStates.size() == 1U);
+  REQUIRE(loaded->waterSceneStates.front().pathCacheManifest.has_value());
+  REQUIRE(loaded->waterSceneStates.front().pathCache.has_value());
+  REQUIRE(loaded->waterSceneStates.front().pathCache->branches.size() == 1U);
+  CHECK(loaded->waterSceneStates.front().pathCache->branches.front().bakeFingerprint ==
+        branch.bakeFingerprint);
+  CHECK(loaded->waterSceneStates.front().pathCache->hiddenBranchIds.empty());
+  REQUIRE(loaded->waterPathCache.has_value());
+
+  const auto oversizedHeaderPath = sidecarPath.parent_path() /
+                                   "declared-large-truncated.flowpathcache";
+  REQUIRE(std::filesystem::copy_file(sidecarPath, oversizedHeaderPath));
+  {
+    std::fstream corruptHeader{
+        oversizedHeaderPath, std::ios::binary | std::ios::in | std::ios::out};
+    REQUIRE(corruptHeader.is_open());
+    constexpr std::streamoff payloadLengthOffset = 8 + sizeof(std::uint32_t);
+    constexpr std::uint64_t declaredPayloadBytes =
+        invisible_places::serialization::kMaximumPersistedWaterCacheBytes;
+    corruptHeader.seekp(payloadLengthOffset);
+    corruptHeader.write(
+        reinterpret_cast<const char *>(&declaredPayloadBytes),
+        sizeof(declaredPayloadBytes));
+    REQUIRE(corruptHeader.good());
+  }
+  CHECK_FALSE(invisible_places::serialization::LoadWaterPathCacheDocument(
+                  oversizedHeaderPath, &errorMessage)
+                  .has_value());
+
+  std::error_code cleanupError;
+  std::filesystem::remove(sidecarPath, cleanupError);
+  std::filesystem::remove(oversizedHeaderPath, cleanupError);
+}
+
+TEST_CASE("Flow sidecars resolve relative scene sources beside the movable project",
+          "[project][serialization][water][path-cache][sidecar][portability]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_flow_sidecar_portability"};
+  const auto originalRoot = temporary.path / "original";
+  const auto sceneRoot = originalRoot / "Data" / "SampleScene";
+  std::filesystem::create_directories(sceneRoot);
+  const auto relativeSupport = std::filesystem::path{"Data"} / "SampleScene" /
+                               "Site1-ROCK-1mm.Sample.ply";
+  {
+    std::ofstream source{originalRoot / relativeSupport};
+    REQUIRE(source.is_open());
+    source << "ply\n";
+  }
+
+  auto flow = MakeSettledFlowCacheFixture();
+  flow.cache.supportLayerPath = relativeSupport;
+  WaterSceneStateDocument state;
+  state.sceneGroupName = "SampleScene";
+  state.emitters = {flow.emitter};
+  state.pathCache = flow.cache;
+
+  ProjectDocument document;
+  document.projectName = "portable-flow-sidecar";
+  document.scenePointCloudGroups = {{
+      .sceneGroupName = "SampleScene",
+      .roleSources = {{
+          .sceneRole = "ROCK",
+          .analysisSourcePath = relativeSupport,
+          .displaySourcePath =
+              std::filesystem::path{"Data"} / "SampleScene" /
+              "Site1-ROCK-3mm.Sample.ply",
+      }},
+  }};
+  document.waterSceneStates = {state};
+
+  const auto projectPath = originalRoot / "portable_project.json";
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, projectPath, &errorMessage));
+  std::ifstream savedInput{projectPath};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  const auto manifestPath = std::filesystem::path{
+      savedJson.at("water_scene_states")
+          .front()
+          .at("water_path_cache_manifest")
+          .at("relative_path")
+          .get<std::string>()};
+  CHECK_FALSE(manifestPath.is_absolute());
+  const auto sidecarPath = (originalRoot / manifestPath).lexically_normal();
+  CHECK(sidecarPath.parent_path() ==
+        sceneRoot / ".invisible_places" / "cache" / "flow");
+  REQUIRE(std::filesystem::is_regular_file(sidecarPath));
+
+  const auto movedRoot = temporary.path / "moved";
+  std::filesystem::rename(originalRoot, movedRoot);
+  const auto loaded =
+      LoadProjectDocument(movedRoot / projectPath.filename(), &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterSceneStates.size() == 1U);
+  REQUIRE(loaded->waterSceneStates.front().pathCache.has_value());
+  CHECK(loaded->waterSceneStates.front().pathCache->branches.size() == 1U);
+}
+
+TEST_CASE("Flow sidecars are immutable and addressed by the complete settled payload",
+          "[project][serialization][water][path-cache][sidecar][content-addressed]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_flow_sidecar_content_addressed"};
+  auto firstFlow = MakeSettledFlowCacheFixture();
+  firstFlow.cache.hiddenBranchIds = {31U};
+  auto secondFlow = firstFlow;
+  secondFlow.cache.hiddenBranchIds.clear();
+  secondFlow.cache.branches.front().rawAnchors.back().phase = 0.75F;
+
+  const auto makeProject = [](const SettledFlowCacheFixture &flow,
+                              std::string name) {
+    WaterSceneStateDocument state;
+    state.sceneGroupName = "SharedScene";
+    state.emitters = {flow.emitter};
+    state.pathCache = flow.cache;
+    ProjectDocument project;
+    project.projectName = std::move(name);
+    project.waterSceneStates = {std::move(state)};
+    return project;
+  };
+  const auto firstProject = makeProject(firstFlow, "first-flow-project");
+  const auto secondProject = makeProject(secondFlow, "second-flow-project");
+  const auto firstProjectPath = temporary.path / "first.json";
+  const auto secondProjectPath = temporary.path / "second.json";
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(firstProject, firstProjectPath, &errorMessage));
+  REQUIRE(SaveProjectDocument(secondProject, secondProjectPath, &errorMessage));
+
+  const auto manifestPath = [](const std::filesystem::path &projectPath) {
+    std::ifstream input{projectPath};
+    REQUIRE(input.is_open());
+    const auto document = nlohmann::json::parse(input);
+    return std::filesystem::path{
+        document.at("water_scene_states")
+            .front()
+            .at("water_path_cache_manifest")
+            .at("relative_path")
+            .get<std::string>()};
+  };
+  const auto firstRelativePath = manifestPath(firstProjectPath);
+  const auto secondRelativePath = manifestPath(secondProjectPath);
+  CHECK(firstRelativePath != secondRelativePath);
+  CHECK(firstRelativePath.filename().string().size() == 64U +
+                                                        std::string{".flowpathcache"}.size());
+  const auto firstSidecar =
+      (firstProjectPath.parent_path() / firstRelativePath).lexically_normal();
+  REQUIRE(std::filesystem::is_regular_file(firstSidecar));
+  REQUIRE(std::filesystem::is_regular_file(
+      (secondProjectPath.parent_path() / secondRelativePath).lexically_normal()));
+
+  {
+    std::fstream corrupt{
+        firstSidecar, std::ios::binary | std::ios::in | std::ios::out};
+    REQUIRE(corrupt.is_open());
+    corrupt.seekg(-1, std::ios::end);
+    char lastByte = 0;
+    corrupt.read(&lastByte, 1);
+    REQUIRE(corrupt.good());
+    lastByte ^= 0x1;
+    corrupt.seekp(-1, std::ios::end);
+    corrupt.write(&lastByte, 1);
+    REQUIRE(corrupt.good());
+  }
+  REQUIRE(SaveProjectDocument(firstProject, firstProjectPath, &errorMessage));
+
+  const auto loadedFirst = LoadProjectDocument(firstProjectPath, &errorMessage);
+  const auto loadedSecond = LoadProjectDocument(secondProjectPath, &errorMessage);
+  REQUIRE(loadedFirst.has_value());
+  REQUIRE(loadedSecond.has_value());
+  REQUIRE(loadedFirst->waterSceneStates.front().pathCache.has_value());
+  REQUIRE(loadedSecond->waterSceneStates.front().pathCache.has_value());
+  CHECK(loadedFirst->waterSceneStates.front().pathCache->hiddenBranchIds ==
+        std::vector<std::uint32_t>{31U});
+  CHECK(loadedSecond->waterSceneStates.front().pathCache->hiddenBranchIds.empty());
+  CHECK(loadedSecond->waterSceneStates.front()
+            .pathCache->branches.front()
+            .rawAnchors.back()
+            .phase == Catch::Approx(0.75F));
+}
+
+TEST_CASE("Legacy embedded Flow caches are pruned and migrated on settled save",
+          "[project][serialization][water][path-cache][migration]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::LoadWaterPathCacheDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::SaveWaterPathCacheDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_legacy_embedded_flow_cache"};
+  auto flow = MakeSettledFlowCacheFixture();
+  auto orphan = flow.cache.branches.front();
+  orphan.id = 32U;
+  orphan.emitterId = 999U;
+  orphan.parentId = 999U;
+  flow.cache.branches.push_back(orphan);
+  flow.cache.hiddenBranchIds = {31U, 32U, 999U};
+
+  WaterSceneStateDocument state;
+  state.sceneGroupName = "Scene1";
+  state.emitters = {flow.emitter};
+  ProjectDocument authored;
+  authored.projectName = "legacy-embedded-flow";
+  authored.waterSceneStates = {state};
+
+  const auto legacyPath = temporary.path / "legacy_project.json";
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(authored, legacyPath, &errorMessage));
+  const auto cacheJsonPath = temporary.path / "legacy_cache.json";
+  REQUIRE(SaveWaterPathCacheDocument(flow.cache, cacheJsonPath, &errorMessage));
+
+  nlohmann::json legacyJson;
+  nlohmann::json cacheJson;
+  {
+    std::ifstream projectInput{legacyPath};
+    std::ifstream cacheInput{cacheJsonPath};
+    REQUIRE(projectInput.is_open());
+    REQUIRE(cacheInput.is_open());
+    legacyJson = nlohmann::json::parse(projectInput);
+    cacheJson = nlohmann::json::parse(cacheInput);
+  }
+  legacyJson["schema_version"] = 41U;
+  legacyJson["water_scene_states"].front()["water_path_cache"] = cacheJson;
+  legacyJson["water_scene_states"].front().erase("water_path_cache_manifest");
+  {
+    std::ofstream legacyOutput{legacyPath, std::ios::trunc};
+    REQUIRE(legacyOutput.is_open());
+    legacyOutput << legacyJson.dump(2);
+  }
+
+  const auto loaded = LoadProjectDocument(legacyPath, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterSceneStates.size() == 1U);
+  REQUIRE(loaded->waterSceneStates.front().pathCache.has_value());
+  const auto &pruned = loaded->waterSceneStates.front().pathCache.value();
+  REQUIRE(pruned.branches.size() == 1U);
+  CHECK(pruned.branches.front().id == 31U);
+  CHECK(pruned.hiddenBranchIds == std::vector<std::uint32_t>{31U});
+
+  const auto migratedPath = temporary.path / "migrated_project.json";
+  REQUIRE(SaveProjectDocument(loaded.value(), migratedPath, &errorMessage));
+  std::ifstream migratedInput{migratedPath};
+  REQUIRE(migratedInput.is_open());
+  const auto migratedJson = nlohmann::json::parse(migratedInput);
+  CHECK(migratedJson.at("schema_version") == kProjectDocumentSchemaVersion);
+  const auto &migratedState = migratedJson.at("water_scene_states").front();
+  CHECK_FALSE(migratedState.contains("water_path_cache"));
+  REQUIRE(migratedState.contains("water_path_cache_manifest"));
+  const auto relativeSidecar = std::filesystem::path{
+      migratedState.at("water_path_cache_manifest")
+          .at("relative_path")
+          .get<std::string>()};
+  const auto migratedSidecar = relativeSidecar.is_absolute()
+                                   ? relativeSidecar
+                                   : (temporary.path / relativeSidecar).lexically_normal();
+  const auto migratedCache =
+      LoadWaterPathCacheDocument(migratedSidecar, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(migratedCache.has_value());
+  REQUIRE(migratedCache->branches.size() == 1U);
+  CHECK(migratedCache->branches.front().id == 31U);
+  CHECK(migratedCache->hiddenBranchIds == std::vector<std::uint32_t>{31U});
+}
+
+TEST_CASE("Invalid Flow manifests cannot fall back to embedded derived data",
+          "[project][serialization][water][path-cache][migration][corrupt]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::SaveWaterPathCacheDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_invalid_flow_manifest"};
+  auto flow = MakeSettledFlowCacheFixture();
+  WaterSceneStateDocument state;
+  state.sceneGroupName = "Scene1";
+  state.emitters = {flow.emitter};
+  ProjectDocument authored;
+  authored.waterSceneStates = {state};
+
+  const auto projectPath = temporary.path / "invalid_manifest_project.json";
+  const auto cacheJsonPath = temporary.path / "embedded_cache.json";
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(authored, projectPath, &errorMessage));
+  REQUIRE(SaveWaterPathCacheDocument(flow.cache, cacheJsonPath, &errorMessage));
+
+  nlohmann::json projectJson;
+  nlohmann::json cacheJson;
+  {
+    std::ifstream projectInput{projectPath};
+    std::ifstream cacheInput{cacheJsonPath};
+    REQUIRE(projectInput.is_open());
+    REQUIRE(cacheInput.is_open());
+    projectJson = nlohmann::json::parse(projectInput);
+    cacheJson = nlohmann::json::parse(cacheInput);
+  }
+  auto &savedState = projectJson["water_scene_states"].front();
+  savedState["water_path_cache"] = cacheJson;
+  savedState["water_path_cache_manifest"] = {
+      {"relative_path", "missing.flowpathcache"},
+      {"cache_schema", 1U},
+      {"support_signature", flow.cache.supportSignature},
+      {"emitter_settings_fingerprint", flow.cache.emitterSettingsFingerprint},
+      {"payload_bytes", 123U},
+      {"checksum", nlohmann::json::array({1U, 2U})},
+  };
+  {
+    std::ofstream projectOutput{projectPath, std::ios::trunc};
+    REQUIRE(projectOutput.is_open());
+    projectOutput << projectJson.dump(2);
+  }
+
+  const auto loaded = LoadProjectDocument(projectPath, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterSceneStates.size() == 1U);
+  CHECK_FALSE(loaded->waterSceneStates.front().pathCache.has_value());
+  REQUIRE(loaded->waterSceneStates.front().pathCacheManifest.has_value());
+  CHECK(loaded->waterSceneStates.front().pathCacheManifest->checksum ==
+        std::array<std::uint64_t, 4>{});
+
+  const auto cleanedPath = temporary.path / "cleaned_project.json";
+  REQUIRE(SaveProjectDocument(loaded.value(), cleanedPath, &errorMessage));
+  std::ifstream cleanedInput{cleanedPath};
+  REQUIRE(cleanedInput.is_open());
+  const auto cleanedJson = nlohmann::json::parse(cleanedInput);
+  const auto &cleanedState = cleanedJson.at("water_scene_states").front();
+  CHECK_FALSE(cleanedState.contains("water_path_cache"));
+  CHECK_FALSE(cleanedState.contains("water_path_cache_manifest"));
 }
 
 TEST_CASE("Manual Flow paths round-trip through project scenes and water-source documents",
@@ -251,6 +724,185 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   CHECK(loadedSources->flowTrailSettings.downhillPull == Catch::Approx(0.18F));
   CHECK(loadedSources->flowTrailSettings.terrainWidthResponse == Catch::Approx(0.47F));
   CHECK(loadedSources->flowTrailSettings.turbulenceScaleMeters == Catch::Approx(0.31F));
+}
+
+TEST_CASE("SampleScene authored water fixture is current, canonical, and cache free",
+          "[project][serialization][water][sample][fixture]") {
+  using invisible_places::serialization::LoadWaterSourcesDocument;
+  using invisible_places::serialization::SaveWaterSourcesDocument;
+
+  const auto fixturePath =
+      std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR}.parent_path() /
+      "tests" / "fixtures" / "sample_scene_water_sources.json";
+  REQUIRE(std::filesystem::is_regular_file(fixturePath));
+
+  std::ifstream fixtureInput{fixturePath};
+  REQUIRE(fixtureInput.is_open());
+  const auto fixtureJson = nlohmann::json::parse(fixtureInput);
+  CHECK(fixtureJson.at("schema_version") == kWaterSourcesDocumentSchemaVersion);
+  REQUIRE(fixtureJson.contains("fixture_metadata"));
+  CHECK(fixtureJson.at("fixture_metadata").at("scene_group") == "SampleScene");
+  CHECK(fixtureJson.at("fixture_metadata").at("display_spacing_micrometres") == 3'000U);
+  CHECK(fixtureJson.at("fixture_metadata").at("water_surface_cache_spacing_micrometres") == 5'000U);
+  CHECK_FALSE(fixtureJson.at("fixture_metadata").at("derived_caches_included").get<bool>());
+  CHECK_FALSE(fixtureJson.contains("water_path_cache"));
+  CHECK_FALSE(fixtureJson.contains("water_path_cache_manifest"));
+  REQUIRE(fixtureJson.at("water_ripple_runtime_caches").empty());
+  REQUIRE(fixtureJson.at("water_emitters").size() == 1U);
+  CHECK_FALSE(fixtureJson.at("water_emitters").front().contains("cached_path"));
+  CHECK_FALSE(fixtureJson.at("water_emitters").front().contains("generated_path"));
+
+  std::string errorMessage;
+  const auto fixture = LoadWaterSourcesDocument(fixturePath, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(fixture.has_value());
+  CHECK(fixture->schemaVersion == kWaterSourcesDocumentSchemaVersion);
+  CHECK_FALSE(fixture->pathCache.has_value());
+  CHECK(fixture->rippleRuntimeCaches.empty());
+
+  REQUIRE(fixture->emitters.size() == 1U);
+  const auto &emitter = fixture->emitters.front();
+  CHECK(emitter.id == 1U);
+  CHECK(emitter.name == "SampleFlowPoint");
+  CHECK(emitter.position.x == Catch::Approx(307.6824951171875F));
+  CHECK(emitter.position.y == Catch::Approx(102.49331665039063F));
+  CHECK(emitter.position.z == Catch::Approx(2.113636016845703F));
+  CHECK(emitter.laneProfileName == "Nice Flow");
+
+  REQUIRE(fixture->manualFlowPaths.size() == 1U);
+  const auto &manualPath = fixture->manualFlowPaths.front();
+  CHECK(manualPath.id == 10U);
+  CHECK(manualPath.name == "SampleFlowPath");
+  CHECK(manualPath.useSurfaceGuide);
+  REQUIRE(manualPath.controlPoints.size() == 11U);
+  CHECK(manualPath.controlPoints.front().z == Catch::Approx(2.2442665100097656F));
+  CHECK(manualPath.controlPoints.back().z == Catch::Approx(1.5622873306274414F));
+
+  REQUIRE(fixture->seepageNodes.size() == 1U);
+  const auto &seepage = fixture->seepageNodes.front();
+  CHECK(seepage.id == 1U);
+  CHECK(seepage.name == "SampleSeepage");
+  CHECK(seepage.position.x == Catch::Approx(307.64752197265625F));
+  CHECK(seepage.position.y == Catch::Approx(102.98605346679688F));
+  CHECK(seepage.position.z == Catch::Approx(2.3077430725097656F));
+
+  const auto niceFlow = std::find_if(
+      fixture->laneProfiles.begin(), fixture->laneProfiles.end(),
+      [](const auto &profile) { return profile.name == "Nice Flow"; });
+  REQUIRE(niceFlow != fixture->laneProfiles.end());
+  const auto streamFlow = std::find_if(
+      fixture->trailProfiles.begin(), fixture->trailProfiles.end(),
+      [](const auto &profile) { return profile.name == "StreamFlow Good"; });
+  REQUIRE(streamFlow != fixture->trailProfiles.end());
+
+  TemporaryProjectFile roundTripFile{
+      "invisible_places_sample_scene_water_sources_round_trip.json"};
+  REQUIRE(SaveWaterSourcesDocument(fixture.value(), roundTripFile.path, &errorMessage));
+  std::ifstream roundTripInput{roundTripFile.path};
+  REQUIRE(roundTripInput.is_open());
+  const auto roundTripJson = nlohmann::json::parse(roundTripInput);
+  CHECK(roundTripJson.at("water_emitters") == fixtureJson.at("water_emitters"));
+  CHECK(roundTripJson.at("water_manual_flow_paths") ==
+        fixtureJson.at("water_manual_flow_paths"));
+  CHECK(roundTripJson.at("water_seepage_nodes") ==
+        fixtureJson.at("water_seepage_nodes"));
+  CHECK(roundTripJson.at("water_path_profiles") ==
+        fixtureJson.at("water_path_profiles"));
+  CHECK(roundTripJson.at("water_lane_profiles") ==
+        fixtureJson.at("water_lane_profiles"));
+  CHECK(roundTripJson.at("water_trail_profiles") ==
+        fixtureJson.at("water_trail_profiles"));
+  const auto roundTrip = LoadWaterSourcesDocument(roundTripFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(roundTrip.has_value());
+  REQUIRE(roundTrip->emitters.size() == 1U);
+  REQUIRE(roundTrip->manualFlowPaths.size() == 1U);
+  REQUIRE(roundTrip->seepageNodes.size() == 1U);
+  CHECK(roundTrip->emitters.front().name == "SampleFlowPoint");
+  CHECK(roundTrip->manualFlowPaths.front().name == "SampleFlowPath");
+  CHECK(roundTrip->seepageNodes.front().name == "SampleSeepage");
+  CHECK_FALSE(roundTrip->pathCache.has_value());
+}
+
+TEST_CASE("Generated SampleScene validation project round-trips schema 42 without derived caches",
+          "[project][serialization][water][sample][validation]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  const auto validationPath =
+      std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR}.parent_path() /
+      "Saved" / "validation" / "SampleSceneValidation_project.json";
+  if (!std::filesystem::is_regular_file(validationPath)) {
+    SKIP("Run scripts/generate_sample_scene_validation.py to create the local validation project.");
+  }
+
+  std::ifstream validationInput{validationPath};
+  REQUIRE(validationInput.is_open());
+  const auto validationJson = nlohmann::json::parse(validationInput);
+  CHECK(validationJson.at("schema_version") == kProjectDocumentSchemaVersion);
+  CHECK_FALSE(validationJson.contains("water_path_cache"));
+  CHECK_FALSE(validationJson.contains("water_path_cache_manifest"));
+  REQUIRE(validationJson.at("water_ripple_runtime_caches").empty());
+  REQUIRE(validationJson.at("water_scene_states").size() == 1U);
+  CHECK_FALSE(validationJson.at("water_scene_states").front().contains("water_path_cache"));
+  CHECK_FALSE(validationJson.at("water_scene_states").front().contains(
+      "water_path_cache_manifest"));
+  REQUIRE(validationJson.at("water_scene_states").front()
+              .at("water_ripple_runtime_caches")
+              .empty());
+  REQUIRE(validationJson.at("scene_point_cloud_groups").size() == 1U);
+  CHECK_FALSE(validationJson.at("scene_point_cloud_groups").front().contains(
+      "water_surface_cache"));
+
+  std::string errorMessage;
+  const auto validation = LoadProjectDocument(validationPath, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(validation.has_value());
+  CHECK(validation->schemaVersion == kProjectDocumentSchemaVersion);
+  REQUIRE(validation->scenePointCloudGroups.size() == 1U);
+  const auto &group = validation->scenePointCloudGroups.front();
+  CHECK(group.sceneGroupName == "SampleScene");
+  CHECK(group.displaySpacingMeters == Catch::Approx(0.003F));
+  CHECK(group.displayLoaded);
+  CHECK(group.displayVisible);
+  REQUIRE(group.roleSources.size() == 3U);
+  const auto *rock = FindRoleSource(group, "ROCK");
+  const auto *sand = FindRoleSource(group, "SAND");
+  const auto *vegetation = FindRoleSource(group, "VEG");
+  REQUIRE(rock != nullptr);
+  REQUIRE(sand != nullptr);
+  REQUIRE(vegetation != nullptr);
+  CHECK(rock->analysisSourcePath.filename() == "Site1-ROCK-1mm.Sample.ply");
+  CHECK(sand->analysisSourcePath.filename() == "Site1-SAND-2mm.Sample.ply");
+  CHECK(vegetation->analysisSourcePath.filename() == "Site1-VEG-1mm.Sample.ply");
+  CHECK(rock->displaySourcePath.filename() == "Site1-ROCK-3mm.Sample.ply");
+  CHECK(sand->displaySourcePath.filename() == "Site1-SAND-3mm.Sample.ply");
+  CHECK(vegetation->displaySourcePath.filename() == "Site1-VEG-3mm.Sample.ply");
+
+  REQUIRE(validation->waterSceneStates.size() == 1U);
+  const auto &water = validation->waterSceneStates.front();
+  REQUIRE(water.emitters.size() == 1U);
+  REQUIRE(water.manualFlowPaths.size() == 1U);
+  REQUIRE(water.seepageNodes.size() == 1U);
+  CHECK(water.emitters.front().name == "SampleFlowPoint");
+  CHECK(water.manualFlowPaths.front().name == "SampleFlowPath");
+  CHECK(water.seepageNodes.front().name == "SampleSeepage");
+  CHECK_FALSE(water.pathCache.has_value());
+  CHECK_FALSE(water.pathCacheManifest.has_value());
+
+  TemporaryProjectFile roundTripFile{
+      "invisible_places_sample_scene_validation_round_trip.json"};
+  REQUIRE(SaveProjectDocument(validation.value(), roundTripFile.path, &errorMessage));
+  const auto roundTrip = LoadProjectDocument(roundTripFile.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(roundTrip.has_value());
+  CHECK(roundTrip->schemaVersion == kProjectDocumentSchemaVersion);
+  REQUIRE(roundTrip->scenePointCloudGroups.size() == 1U);
+  CHECK(roundTrip->scenePointCloudGroups.front().displaySpacingMeters ==
+        Catch::Approx(0.003F));
+  REQUIRE(roundTrip->waterSceneStates.size() == 1U);
+  CHECK_FALSE(roundTrip->waterSceneStates.front().pathCache.has_value());
+  CHECK_FALSE(roundTrip->waterSceneStates.front().pathCacheManifest.has_value());
 }
 
 TEST_CASE("Older project and water-source schemas default Flow activity fields",

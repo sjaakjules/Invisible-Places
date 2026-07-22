@@ -7,17 +7,17 @@
 #include <vector>
 
 TEST_CASE("offline rain advances once before all tiles consume the frame", "[water][rain][offline]") {
-    std::vector<invisible_places::water::RainCollisionSample> samples;
+    std::vector<invisible_places::water::WaterSurfaceSample> samples;
     for (int y = -10; y <= 10; ++y) {
         for (int x = -10; x <= 10; ++x) {
             samples.push_back({
                 {x * 0.02F, y * 0.02F, 0.0F},
                 {0.0F, 0.0F, 1.0F},
-                invisible_places::water::RainCollisionRole::Rock,
+                invisible_places::water::WaterSurfaceRole::Rock,
             });
         }
     }
-    const auto cache = invisible_places::water::BuildRainCollisionCacheFromSamples(samples);
+    const auto cache = invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
     auto settings = invisible_places::water::DefaultRainRuntimeSettings();
     settings.enabled = true;
     settings.impactEffectsEnabled = true;

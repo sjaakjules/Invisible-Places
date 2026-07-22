@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Refresh the local SampleScene validation project from its durable fixture.
+
+The tracked schema-17 fixture is authoritative, so validation keeps working
+after the authored objects are removed from the ignored exhibition project.
+An explicit option can refresh that fixture while those objects still exist.
+The helper builds a lightweight SampleScene project around the explicit 3 mm
+display bundle and canonicalises the legacy SampleScene filenames and object
+names in the local main project.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+from typing import Any
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MAIN_PROJECT = REPOSITORY_ROOT / "Saved" / "exhibitionScene_project.json"
+DEFAULT_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "sample_scene_water_sources.json"
+DEFAULT_VALIDATION_PROJECT = (
+    REPOSITORY_ROOT / "Saved" / "validation" / "SampleSceneValidation_project.json"
+)
+
+PATH_RENAMES = {
+    "Site3-Mesh-Sample.ply": "Site1-Mesh-Sample.ply",
+    "Site3-ROCK-1mm.Sample.ply": "Site1-ROCK-1mm.Sample.ply",
+    "Site3-SAND-2mm.Sample.ply": "Site1-SAND-2mm.Sample.ply",
+    "Site3-VEG-1mm.Sample.ply": "Site1-VEG-1mm.Sample.ply",
+}
+
+NAME_RENAMES = {
+    "SampleFowPoint": "SampleFlowPoint",
+    "SampleSeepageNode": "SampleSeepage",
+}
+
+SAMPLE_ASSETS = {
+    "Site1-Mesh-Sample.ply": (None, None),
+    "Site1-ROCK-1mm.Sample.ply": ("ROCK", 1_000),
+    "Site1-ROCK-2mm.Sample.ply": ("ROCK", 2_000),
+    "Site1-ROCK-3mm.Sample.ply": ("ROCK", 3_000),
+    "Site1-ROCK-5mm.Sample.ply": ("ROCK", 5_000),
+    "Site1-SAND-1mm.Sample.ply": ("SAND", 1_000),
+    "Site1-SAND-2mm.Sample.ply": ("SAND", 2_000),
+    "Site1-SAND-3mm.Sample.ply": ("SAND", 3_000),
+    "Site1-SAND-5mm.Sample.ply": ("SAND", 5_000),
+    "Site1-VEG-1mm.Sample.ply": ("VEG", 1_000),
+    "Site1-VEG-2mm.Sample.ply": ("VEG", 2_000),
+    "Site1-VEG-3mm.Sample.ply": ("VEG", 3_000),
+    "Site1-VEG-5mm.Sample.ply": ("VEG", 5_000),
+}
+
+ANALYSIS_SPACING = {"ROCK": 1_000, "SAND": 2_000, "VEG": 1_000}
+DISPLAY_SPACING = 3_000
+CACHE_SPACING = 5_000
+
+STATE_WATER_KEYS = (
+    "water_emitters",
+    "water_manual_flow_paths",
+    "water_seepage_nodes",
+    "water_ripple_layers",
+    "water_field_layers",
+    "water_ripple_runtime_caches",
+)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as source:
+        value = json.load(source)
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return value
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output_mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(value, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary_path, output_mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def canonicalise(value: Any) -> Any:
+    if isinstance(value, dict):
+        canonical = {key: canonicalise(item) for key, item in value.items()}
+        if canonical.get("name") in NAME_RENAMES:
+            canonical["name"] = NAME_RENAMES[canonical["name"]]
+        return canonical
+    if isinstance(value, list):
+        return [canonicalise(item) for item in value]
+    if isinstance(value, str):
+        for old_name, new_name in PATH_RENAMES.items():
+            value = value.replace(old_name, new_name)
+        return value
+    return value
+
+
+def named_object(values: list[dict[str, Any]], expected_name: str) -> dict[str, Any]:
+    matches = [value for value in values if value.get("name") == expected_name]
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one {expected_name!r}; found {len(matches)}")
+    return matches[0]
+
+
+def authored_state(
+    project: dict[str, Any], *, required: bool = True
+) -> dict[str, Any] | None:
+    candidates = []
+    for state in project.get("water_scene_states", []):
+        emitter_names = {value.get("name") for value in state.get("water_emitters", [])}
+        path_names = {value.get("name") for value in state.get("water_manual_flow_paths", [])}
+        seepage_names = {value.get("name") for value in state.get("water_seepage_nodes", [])}
+        if (
+            "SampleFlowPoint" in emitter_names
+            and "SampleFlowPath" in path_names
+            and "SampleSeepage" in seepage_names
+        ):
+            candidates.append(state)
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates and not required:
+        return None
+    if len(candidates) != 1:
+        raise ValueError(
+            "Expected exactly one water scene state containing SampleFlowPoint, "
+            f"SampleFlowPath, and SampleSeepage; found {len(candidates)}"
+        )
+    return None
+
+
+def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
+    project["schema_version"] = 42
+    state = authored_state(project, required=False)
+    if state is not None:
+        state.pop("water_path_cache", None)
+        state.pop("water_path_cache_manifest", None)
+    project.pop("water_path_cache", None)
+    project.pop("water_path_cache_manifest", None)
+
+    sample_groups = [
+        group
+        for group in project.get("scene_point_cloud_groups", [])
+        if group.get("scene_group") == "SampleScene"
+    ]
+    if len(sample_groups) != 1:
+        raise ValueError(f"Expected one SampleScene density group; found {len(sample_groups)}")
+    sample_group = sample_groups[0]
+    sample_group["display_spacing_meters"] = DISPLAY_SPACING / 1_000_000.0
+    role_sources = {
+        source.get("scene_role"): source for source in sample_group.get("roles", [])
+    }
+    if set(role_sources) != {"ROCK", "SAND", "VEG"}:
+        raise ValueError("SampleScene density group must contain ROCK, SAND, and VEG roles")
+    for role, source in role_sources.items():
+        source["analysis_source_path"] = sample_asset_path(
+            f"Site1-{role}-{ANALYSIS_SPACING[role] // 1_000}mm.Sample.ply"
+        )
+        source["display_source_path"] = sample_asset_path(
+            f"Site1-{role}-{DISPLAY_SPACING // 1_000}mm.Sample.ply"
+        )
+    return project
+
+
+def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    emitter = copy.deepcopy(named_object(state["water_emitters"], "SampleFlowPoint"))
+    manual_path = copy.deepcopy(
+        named_object(state["water_manual_flow_paths"], "SampleFlowPath")
+    )
+    seepage = copy.deepcopy(named_object(state["water_seepage_nodes"], "SampleSeepage"))
+
+    fixture: dict[str, Any] = {
+        "schema_version": 17,
+        "fixture_metadata": {
+            "scene_group": "SampleScene",
+            "display_spacing_micrometres": DISPLAY_SPACING,
+            "water_surface_cache_spacing_micrometres": CACHE_SPACING,
+            "derived_caches_included": False,
+            "canonical_object_names": [
+                "SampleFlowPoint",
+                "SampleFlowPath",
+                "SampleSeepage",
+            ],
+        },
+        "water_source_settings": copy.deepcopy(project["water_source_settings"]),
+        "water_caustic_look_settings": copy.deepcopy(project["water_caustic_look_settings"]),
+        "water_flow_trail_settings": copy.deepcopy(project["water_flow_trail_settings"]),
+        "water_trail_geometry": copy.deepcopy(project["water_trail_geometry"]),
+        "water_path_profiles": copy.deepcopy(project.get("water_path_profiles", [])),
+        "water_lane_profiles": copy.deepcopy(project.get("water_lane_profiles", [])),
+        "water_trail_profiles": copy.deepcopy(project.get("water_trail_profiles", [])),
+        "selected_water_path_profile": project.get("selected_water_path_profile", "Default"),
+        "selected_water_lane_profile": project.get("selected_water_lane_profile", "Default"),
+        "selected_water_trail_profile": project.get("selected_water_trail_profile", "Default"),
+        "water_field_settings": copy.deepcopy(project["water_field_settings"]),
+        "water_field_trail_settings": copy.deepcopy(project["water_field_trail_settings"]),
+        "water_dynamic_mesh_flow_settings": copy.deepcopy(
+            project["water_dynamic_mesh_flow_settings"]
+        ),
+        "water_rain_settings": copy.deepcopy(project["water_rain_settings"]),
+        "water_emitters": [emitter],
+        "water_manual_flow_paths": [manual_path],
+        "water_seepage_nodes": [seepage],
+        "water_seepage_default_look": copy.deepcopy(project["water_seepage_default_look"]),
+        "water_seepage_look_profiles": copy.deepcopy(
+            project.get("water_seepage_look_profiles", [])
+        ),
+        "water_ripple_layers": copy.deepcopy(state.get("water_ripple_layers", [])),
+        "water_field_layers": copy.deepcopy(state.get("water_field_layers", [])),
+        "water_ripple_runtime_caches": [],
+    }
+    for optional_key in (
+        "temp_water_source_settings",
+        "temp_water_caustic_look_settings",
+        "temp_water_path_profile_settings",
+        "temp_water_lane_profile_settings",
+        "temp_water_trail_profile",
+    ):
+        if optional_key in project:
+            fixture[optional_key] = copy.deepcopy(project[optional_key])
+    return fixture
+
+
+def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
+    if fixture.get("schema_version") != 17:
+        raise ValueError("SampleScene water fixture must use water-source schema 17")
+    metadata = fixture.get("fixture_metadata")
+    if not isinstance(metadata, dict) or metadata.get("scene_group") != "SampleScene":
+        raise ValueError("SampleScene water fixture has invalid fixture metadata")
+    named_object(fixture.get("water_emitters", []), "SampleFlowPoint")
+    named_object(fixture.get("water_manual_flow_paths", []), "SampleFlowPath")
+    named_object(fixture.get("water_seepage_nodes", []), "SampleSeepage")
+    if "water_path_cache" in fixture or "water_path_cache_manifest" in fixture:
+        raise ValueError("SampleScene water fixture must not contain a derived Flow cache")
+    if fixture.get("water_ripple_runtime_caches"):
+        raise ValueError("SampleScene water fixture must not contain ripple runtime caches")
+    return fixture
+
+
+def sample_asset_path(filename: str) -> str:
+    return str(REPOSITORY_ROOT / "Data" / "SampleScene" / filename)
+
+
+def ply_vertex_count(path: Path) -> int:
+    with path.open("rb") as source:
+        for raw_line in source:
+            line = raw_line.decode("ascii").strip()
+            if line.startswith("element vertex "):
+                return int(line.removeprefix("element vertex "))
+            if line == "end_header":
+                break
+    raise ValueError(f"PLY header has no vertex count: {path}")
+
+
+def clone_sample_layers(project: dict[str, Any]) -> list[dict[str, Any]]:
+    current_layers = [
+        layer
+        for layer in project.get("layers", [])
+        if "/SampleScene/" in layer.get("source_path", "")
+    ]
+    mesh_templates = [
+        layer for layer in current_layers if not layer.get("scene_group")
+    ]
+    role_templates = {
+        role: next(
+            (layer for layer in current_layers if layer.get("scene_role") == role),
+            None,
+        )
+        for role in ("ROCK", "SAND", "VEG")
+    }
+    if not mesh_templates or any(template is None for template in role_templates.values()):
+        raise ValueError("The main project does not contain the four canonical SampleScene layers")
+
+    layers: list[dict[str, Any]] = []
+    for filename, (role, spacing) in SAMPLE_ASSETS.items():
+        template = mesh_templates[0] if role is None else role_templates[role]
+        layer = copy.deepcopy(template)
+        source_path = sample_asset_path(filename)
+        layer["source_path"] = source_path
+        layer["selected_scene_variant_path"] = source_path
+        layer["point_budget_active_points"] = ply_vertex_count(Path(source_path))
+        if role is None:
+            layer["loaded"] = False
+            layer["visible"] = False
+        else:
+            spacing_metres = spacing / 1_000_000.0
+            layer["scene_group"] = "SampleScene"
+            layer["scene_role"] = role
+            layer["inferred_point_spacing_meters"] = spacing_metres
+            layer["point_spacing_meters"] = spacing_metres
+            layer["loaded"] = spacing == DISPLAY_SPACING
+            layer["visible"] = spacing == DISPLAY_SPACING
+        layers.append(layer)
+    return layers
+
+
+def build_validation_project(
+    project: dict[str, Any], fixture: dict[str, Any]
+) -> dict[str, Any]:
+    validation = copy.deepcopy(project)
+    validation["schema_version"] = 42
+    validation["project_name"] = "SampleScene Validation"
+    validation["layers"] = clone_sample_layers(project)
+    validation["selected_layer_path"] = sample_asset_path("Site1-ROCK-3mm.Sample.ply")
+    validation["scene_point_cloud_groups"] = [
+        {
+            "scene_group": "SampleScene",
+            "display_spacing_meters": DISPLAY_SPACING / 1_000_000.0,
+            "display_loaded": True,
+            "display_visible": True,
+            "roles": [
+                {
+                    "scene_role": role,
+                    "analysis_source_path": sample_asset_path(
+                        f"Site1-{role}-{ANALYSIS_SPACING[role] // 1_000}mm.Sample.ply"
+                    ),
+                    "display_source_path": sample_asset_path(
+                        f"Site1-{role}-{DISPLAY_SPACING // 1_000}mm.Sample.ply"
+                    ),
+                }
+                for role in ("ROCK", "SAND", "VEG")
+            ],
+        }
+    ]
+    validation["scene_visual_states"] = [
+        copy.deepcopy(visual)
+        for visual in project.get("scene_visual_states", [])
+        if visual.get("scene_group") == "SampleScene"
+    ]
+
+    for key, value in fixture.items():
+        if key not in {"schema_version", "fixture_metadata", *STATE_WATER_KEYS}:
+            validation[key] = copy.deepcopy(value)
+
+    validation_state = {
+        "scene_group": fixture["fixture_metadata"]["scene_group"],
+        "water_emitters": copy.deepcopy(fixture["water_emitters"]),
+        "water_manual_flow_paths": copy.deepcopy(
+            fixture["water_manual_flow_paths"]
+        ),
+        "water_seepage_nodes": copy.deepcopy(fixture["water_seepage_nodes"]),
+        "water_ripple_layers": copy.deepcopy(
+            fixture.get("water_ripple_layers", [])
+        ),
+        "water_field_layers": copy.deepcopy(fixture.get("water_field_layers", [])),
+        "water_ripple_runtime_caches": [],
+        "dynamic_mesh_path": "",
+        "dynamic_mesh_attractors": [],
+        "dynamic_mesh_emitter_motions": [],
+    }
+    validation["water_scene_states"] = [validation_state]
+    validation["water_seepage_nodes"] = copy.deepcopy(
+        validation_state["water_seepage_nodes"]
+    )
+    validation.pop("water_path_cache", None)
+    validation.pop("water_path_cache_manifest", None)
+    validation.pop("water_emitters", None)
+    validation.pop("water_manual_flow_paths", None)
+    validation["water_ripple_layers"] = copy.deepcopy(
+        validation_state["water_ripple_layers"]
+    )
+    validation["water_field_layers"] = copy.deepcopy(
+        validation_state["water_field_layers"]
+    )
+    validation["water_ripple_runtime_caches"] = []
+
+    for entry in validation.get("camera_shots", []):
+        entry["associated_layer_paths"] = ["__scene_group__/SampleScene"]
+    for entry in validation.get("saved_animations", []):
+        entry["associated_layer_paths"] = ["__scene_group__/SampleScene"]
+    return validation
+
+
+def create_backup(path: Path) -> Path:
+    backup_root = REPOSITORY_ROOT / "Saved" / "validation" / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = backup_root / f"{path.stem}.before_sample_scene_validation.{timestamp}{path.suffix}"
+    sequence = 1
+    while candidate.exists():
+        candidate = backup_root / (
+            f"{path.stem}.before_sample_scene_validation.{timestamp}.{sequence}{path.suffix}"
+        )
+        sequence += 1
+    shutil.copy2(path, candidate)
+    return candidate
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--main-project", type=Path, default=DEFAULT_MAIN_PROJECT)
+    parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
+    parser.add_argument(
+        "--validation-project", type=Path, default=DEFAULT_VALIDATION_PROJECT
+    )
+    parser.add_argument(
+        "--skip-main-update",
+        action="store_true",
+        help="Generate copies without rewriting or backing up the ignored main project.",
+    )
+    parser.add_argument(
+        "--refresh-fixture-from-main",
+        action="store_true",
+        help=(
+            "Recopy the three authored water objects and their settings from the "
+            "main project before generating validation."
+        ),
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    main_project = arguments.main_project.resolve()
+    original_project = load_json(main_project)
+    project = migrate_main_project(canonicalise(original_project))
+    fixture_path = arguments.fixture.resolve()
+    if arguments.refresh_fixture_from_main:
+        state = authored_state(project)
+        if state is None:
+            raise ValueError("The main project no longer contains the authored fixture objects")
+        fixture = build_water_fixture(project, state)
+        atomic_write_json(fixture_path, fixture)
+    else:
+        fixture = validate_water_fixture(load_json(fixture_path))
+
+    validation = build_validation_project(project, fixture)
+    atomic_write_json(arguments.validation_project.resolve(), validation)
+
+    if arguments.skip_main_update:
+        print(f"Fixture: {arguments.fixture.resolve()}")
+        print(f"Validation project: {arguments.validation_project.resolve()}")
+        return 0
+
+    if project != original_project:
+        backup = create_backup(main_project)
+        atomic_write_json(main_project, project)
+        print(f"Backup: {backup}")
+        print(f"Updated main project: {main_project}")
+    else:
+        print(f"Main project already canonical: {main_project}")
+    print(f"Fixture: {arguments.fixture.resolve()}")
+    print(f"Validation project: {arguments.validation_project.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

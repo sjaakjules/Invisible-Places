@@ -1,15 +1,9 @@
 #pragma once
 
-#include "io/PointCloudData.hpp"
-#include "io/TransformMatrix.hpp"
-#include "scene/PointCloudVariants.hpp"
+#include "water/WaterSurfaceCache.hpp"
 
-#include <algorithm>
 #include <array>
-#include <atomic>
-#include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <limits>
 #include <span>
 #include <string>
@@ -18,29 +12,12 @@
 
 namespace invisible_places::water {
 
-inline constexpr float kRainCollisionResolutionMeters = 0.020F;
-inline constexpr float kWaterSurfaceResolutionMeters = kRainCollisionResolutionMeters;
-inline constexpr std::uint32_t kWaterSurfaceCacheSchemaVersion = 2U;
 inline constexpr std::uint32_t kRainParticleCapacity = 32'768U;
 inline constexpr std::uint32_t kRainImpactEventCapacity = 65'536U;
 inline constexpr std::uint32_t kRainImpactGridDimension = 256U;
 inline constexpr std::uint32_t kRainSandEventsPerCell = 8U;
 inline constexpr std::uint32_t kRainRockEventsPerCell = 8U;
 inline constexpr std::uint32_t kRainVegetationEventsPerCell = 4U;
-
-enum class RainCollisionRole : std::uint32_t {
-    None = 0U,
-    Rock = 1U,
-    Sand = 2U,
-    Vegetation = 3U,
-};
-
-inline constexpr std::uint32_t kWaterSurfaceRockRoleMask =
-    1U << static_cast<std::uint32_t>(RainCollisionRole::Rock);
-inline constexpr std::uint32_t kWaterSurfaceSandRoleMask =
-    1U << static_cast<std::uint32_t>(RainCollisionRole::Sand);
-inline constexpr std::uint32_t kWaterSurfaceDefaultRoleMask =
-    kWaterSurfaceRockRoleMask | kWaterSurfaceSandRoleMask;
 
 enum class RainIntensityPreset : std::uint32_t {
     LightMist = 0U,
@@ -110,255 +87,18 @@ struct RainIntensityMultipliers {
 [[nodiscard]] std::array<std::string_view, 3> RainVisualPresetNames();
 [[nodiscard]] float RainImpactGridWorldSpan(const RainRuntimeSettings& settings);
 
-struct RainCollisionSource {
-    std::filesystem::path sourcePath;
-    RainCollisionRole role = RainCollisionRole::None;
-    io::Matrix4d localToWorld{};
-    std::uint32_t spacingMicrometres = 0U;
-    bool hasTransform = false;
-    bool isFallback = false;
-};
-
-struct RainCollisionSourceMetadata {
-    std::filesystem::path sourcePath;
-    RainCollisionRole role = RainCollisionRole::None;
-    std::uint32_t spacingMicrometres = 0U;
-    std::uint64_t fileSize = 0U;
-    std::int64_t modificationTicks = 0;
-    bool isFallback = false;
-};
-
-struct RainCollisionSample {
-    io::Float3 position{};
-    io::Float3 normal{0.0F, 0.0F, 1.0F};
-    RainCollisionRole role = RainCollisionRole::None;
-    float roughness = 0.0F;
-    bool hasRoughness = false;
-};
-
-struct RainSurfaceCell {
-    std::int32_t cellX = 0;
-    std::int32_t cellY = 0;
-    float rockHeight = -std::numeric_limits<float>::infinity();
-    float sandHeight = -std::numeric_limits<float>::infinity();
-    io::Float3 rockNormal{0.0F, 0.0F, 1.0F};
-    io::Float3 sandNormal{0.0F, 0.0F, 1.0F};
-    float rockConfidence = 0.0F;
-    float sandConfidence = 0.0F;
-    std::uint32_t rockSampleCount = 0U;
-    std::uint32_t sandSampleCount = 0U;
-};
-
-struct RainVegetationVoxel {
-    std::int32_t cellX = 0;
-    std::int32_t cellY = 0;
-    std::int32_t cellZ = 0;
-    io::Float3 normal{0.0F, 0.0F, 1.0F};
-    std::uint32_t sampleCount = 0U;
-};
-
-// An orientation-independent ROCK/SAND surface aggregate. Unlike RainSurfaceCell,
-// this retains all three cell coordinates and can therefore represent vertical and
-// overhanging surfaces for Flow without changing Rain's top-height collision view.
-struct WaterSurfaceSurfel {
-    std::int32_t cellX = 0;
-    std::int32_t cellY = 0;
-    std::int32_t cellZ = 0;
-    RainCollisionRole role = RainCollisionRole::None;
-    io::Float3 centroid{};
-    io::Float3 normal{0.0F, 0.0F, 1.0F};
-    float confidence = 0.0F;
-    float normalCoherence = 0.0F;
-    float roughness = 0.0F;
-    float normalVariance = 0.0F;
-    std::uint32_t sampleCount = 0U;
-};
-
-struct RainGpuSurfaceSlot {
-    std::int32_t cellX = std::numeric_limits<std::int32_t>::min();
-    std::int32_t cellY = std::numeric_limits<std::int32_t>::min();
-    float rockHeight = -std::numeric_limits<float>::infinity();
-    float sandHeight = -std::numeric_limits<float>::infinity();
-    std::uint32_t packedRockNormal = 0U;
-    std::uint32_t packedSandNormal = 0U;
-    float rockConfidence = 0.0F;
-    float sandConfidence = 0.0F;
-};
-
-static_assert(sizeof(RainGpuSurfaceSlot) == 32U);
-
-struct RainGpuVegetationSlot {
-    std::int32_t cellX = std::numeric_limits<std::int32_t>::min();
-    std::int32_t cellY = std::numeric_limits<std::int32_t>::min();
-    std::int32_t cellZ = std::numeric_limits<std::int32_t>::min();
-    std::uint32_t packedNormal = 0U;
-};
-
-static_assert(sizeof(RainGpuVegetationSlot) == 16U);
-
-// A compact 32-byte std430-friendly slot. The low 8 bits of roleAndSampleCount
-// hold RainCollisionRole and the upper 24 bits hold the saturated sample count.
-// The centroid is 10:10:10 UNORM relative to its 20 mm cell. Confidence/coherence
-// are UNORM16 pairs; roughness/normal variance are IEEE half-float pairs.
-struct alignas(16) WaterGpuSurfaceSurfelSlot {
-    std::int32_t cellX = std::numeric_limits<std::int32_t>::min();
-    std::int32_t cellY = std::numeric_limits<std::int32_t>::min();
-    std::int32_t cellZ = std::numeric_limits<std::int32_t>::min();
-    std::uint32_t roleAndSampleCount = 0U;
-    std::uint32_t packedCentroid = 0U;
-    std::uint32_t packedNormal = 0U;
-    std::uint32_t packedConfidenceCoherence = 0U;
-    std::uint32_t packedRoughnessVariance = 0U;
-};
-
-static_assert(sizeof(WaterGpuSurfaceSurfelSlot) == 32U);
-
-// Runtime residency must not use the compact diagnostic revision as a cache
-// key: that value is intentionally small and legacy in-memory caches commonly
-// share revision 1. The complete source signature keeps file-backed scene
-// identity exact, while the digest covers the immutable GPU payload and cache
-// metadata for source-less/in-memory caches.
-struct WaterSurfaceCacheIdentity {
-    std::string sourceSignature;
-    std::array<std::uint64_t, 4> contentDigest{};
-
-    [[nodiscard]] bool Valid() const {
-        return std::any_of(
-            contentDigest.begin(),
-            contentDigest.end(),
-            [](std::uint64_t word) { return word != 0U; });
-    }
-
-    bool operator==(const WaterSurfaceCacheIdentity&) const = default;
-};
-
-struct RainCollisionGpuData {
-    std::vector<RainGpuSurfaceSlot> surfaceTable;
-    std::vector<RainGpuVegetationSlot> vegetationTable;
-    std::vector<WaterGpuSurfaceSurfelSlot> flowSurfaceTable;
-    std::uint32_t surfaceMask = 0U;
-    std::uint32_t vegetationMask = 0U;
-    std::uint32_t flowSurfaceMask = 0U;
-    std::uint32_t maximumProbeCount = 0U;
-    std::uint32_t flowMaximumProbeCount = 0U;
-    std::uint64_t sourceRevision = 0U;
-    WaterSurfaceCacheIdentity sourceIdentity;
-};
-
-struct RainCollisionCache {
-    std::uint32_t schemaVersion = kWaterSurfaceCacheSchemaVersion;
-    float resolutionMeters = kRainCollisionResolutionMeters;
-    std::string signature;
-    std::vector<RainCollisionSourceMetadata> sources;
-    std::vector<RainSurfaceCell> surfaceCells;
-    std::vector<RainVegetationVoxel> vegetationVoxels;
-    std::vector<WaterSurfaceSurfel> flowSurfaceSurfels;
-    RainCollisionGpuData gpuData;
-    io::Bounds3f bounds;
-    std::uint64_t sourcePointCount = 0U;
-    double buildMilliseconds = 0.0;
-    std::uint64_t revision = 0U;
-    WaterSurfaceCacheIdentity cacheIdentity;
-};
-
-struct RainCollisionBuildResult {
-    RainCollisionCache cache;
-    std::vector<std::string> warnings;
-    std::string errorMessage;
-    bool loadedFromDisk = false;
-    bool success = false;
-    bool cancelled = false;
-};
-
 struct RainCollisionHit {
     io::Float3 position{};
     io::Float3 normal{0.0F, 0.0F, 1.0F};
-    RainCollisionRole role = RainCollisionRole::None;
+    WaterSurfaceRole role = WaterSurfaceRole::None;
     float segmentTime = 1.0F;
     bool hit = false;
 };
 
-struct WaterSurfaceQueryResult {
-    WaterSurfaceSurfel surfel{};
-    float distanceMeters = std::numeric_limits<float>::infinity();
-    float score = std::numeric_limits<float>::infinity();
-    bool hit = false;
-};
-
-// Shared names for new Rain + Flow call sites. The legacy names remain the
-// canonical storage ABI so existing Rain code does not need a flag-day rename.
-using WaterSurfaceSource = RainCollisionSource;
-using WaterSurfaceSourceMetadata = RainCollisionSourceMetadata;
-using WaterSurfaceSample = RainCollisionSample;
-using WaterSurfaceCache = RainCollisionCache;
-using WaterSurfaceBuildResult = RainCollisionBuildResult;
-using WaterSurfaceGpuData = RainCollisionGpuData;
-
-[[nodiscard]] std::vector<RainCollisionSource> SelectRainCollisionSources(
-    const scene::ScenePointCloudGroup& group,
-    std::uint32_t preferredSpacingMicrometres = 5'000U);
-[[nodiscard]] std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
-    const scene::ScenePointCloudGroup& group,
-    std::uint32_t preferredSpacingMicrometres = 5'000U);
-[[nodiscard]] std::string RainCollisionCacheSignature(
-    std::span<const RainCollisionSource> sources,
-    float resolutionMeters = kRainCollisionResolutionMeters);
-[[nodiscard]] std::filesystem::path RainCollisionCachePath(
-    const std::filesystem::path& cacheRoot,
-    std::string_view signature);
-[[nodiscard]] RainCollisionBuildResult BuildRainCollisionCache(
-    std::span<const RainCollisionSource> sources,
-    const std::filesystem::path& cacheRoot = {},
-    const std::atomic_bool* cancelRequested = nullptr);
-[[nodiscard]] RainCollisionCache BuildRainCollisionCacheFromSamples(
-    std::span<const RainCollisionSample> samples,
-    float resolutionMeters = kRainCollisionResolutionMeters);
-[[nodiscard]] bool SaveRainCollisionCache(
-    const RainCollisionCache& cache,
-    const std::filesystem::path& filePath,
-    std::string* errorMessage = nullptr);
-[[nodiscard]] bool LoadRainCollisionCache(
-    const std::filesystem::path& filePath,
-    std::string_view expectedSignature,
-    RainCollisionCache* cache,
-    std::string* errorMessage = nullptr);
 [[nodiscard]] RainCollisionHit TraceRainCollision(
-    const RainCollisionCache& cache,
+    const WaterSurfaceCache& cache,
     const io::Float3& segmentStart,
     const io::Float3& segmentEnd);
-[[nodiscard]] RainCollisionGpuData BuildRainCollisionGpuData(const RainCollisionCache& cache);
-
-[[nodiscard]] std::string WaterSurfaceCacheSignature(
-    std::span<const WaterSurfaceSource> sources,
-    float resolutionMeters = kRainCollisionResolutionMeters);
-[[nodiscard]] std::filesystem::path WaterSurfaceCachePath(
-    const std::filesystem::path& cacheRoot,
-    std::string_view signature);
-[[nodiscard]] WaterSurfaceBuildResult BuildWaterSurfaceCache(
-    std::span<const WaterSurfaceSource> sources,
-    const std::filesystem::path& cacheRoot = {},
-    const std::atomic_bool* cancelRequested = nullptr);
-[[nodiscard]] WaterSurfaceCache BuildWaterSurfaceCacheFromSamples(
-    std::span<const WaterSurfaceSample> samples,
-    float resolutionMeters = kRainCollisionResolutionMeters);
-[[nodiscard]] bool SaveWaterSurfaceCache(
-    const WaterSurfaceCache& cache,
-    const std::filesystem::path& filePath,
-    std::string* errorMessage = nullptr);
-[[nodiscard]] bool LoadWaterSurfaceCache(
-    const std::filesystem::path& filePath,
-    std::string_view expectedSignature,
-    WaterSurfaceCache* cache,
-    std::string* errorMessage = nullptr);
-[[nodiscard]] WaterSurfaceGpuData BuildWaterSurfaceGpuData(const WaterSurfaceCache& cache);
-[[nodiscard]] WaterSurfaceCacheIdentity BuildWaterSurfaceCacheIdentity(
-    const WaterSurfaceCache& cache);
-[[nodiscard]] WaterSurfaceQueryResult QueryWaterSurfaceCache(
-    const WaterSurfaceCache& cache,
-    const io::Float3& position,
-    float maximumDistanceMeters,
-    const io::Float3& referenceNormal = {},
-    std::uint32_t roleMask = kWaterSurfaceDefaultRoleMask);
 
 struct RainParticle {
     io::Float3 position{};
@@ -376,7 +116,7 @@ struct RainImpactEvent {
     float birthTimeSeconds = 0.0F;
     io::Float3 normal{0.0F, 0.0F, 1.0F};
     float radiusMeters = 0.04F;
-    RainCollisionRole role = RainCollisionRole::None;
+    WaterSurfaceRole role = WaterSurfaceRole::None;
     float lifetimeSeconds = 1.0F;
     float energy = 1.0F;
     std::uint32_t seed = 0U;
@@ -409,12 +149,14 @@ public:
     void Reset(std::uint32_t seed = 0U);
     [[nodiscard]] RainSimulationDiagnostics Advance(
         const RainSimulationFrame& frame,
-        const RainCollisionCache& collisionCache);
+        const WaterSurfaceCache& surfaceCache);
 
     [[nodiscard]] std::span<const RainParticle> Particles() const { return particles_; }
     [[nodiscard]] std::span<const RainImpactEvent> Events() const { return events_; }
     [[nodiscard]] std::uint32_t EventWriteIndex() const { return eventWriteIndex_; }
-    [[nodiscard]] std::uint32_t Capacity() const { return static_cast<std::uint32_t>(particles_.size()); }
+    [[nodiscard]] std::uint32_t Capacity() const {
+        return static_cast<std::uint32_t>(particles_.size());
+    }
 
 private:
     void SpawnParticle(std::uint32_t index, const RainSimulationFrame& frame);
@@ -463,7 +205,7 @@ struct RainImpactEffect {
     float worldSpanMeters = 32.0F);
 [[nodiscard]] RainImpactEffect EvaluateRainImpact(
     const RainImpactGrid& grid,
-    RainCollisionRole pointRole,
+    WaterSurfaceRole pointRole,
     const io::Float3& point,
     const io::Float3& normal,
     float timeSeconds);

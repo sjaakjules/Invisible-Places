@@ -6,7 +6,7 @@ A grouped LiDAR scene is a folder containing role-named point clouds. The switch
 
 Discovery quantizes spacing to integer micrometres before comparing variants. A spacing is offered in **Visuals > Visible Point Cloud** only when the scene folder contains exactly one file at that spacing for every required role. A missing role or duplicate `(role, spacing)` file makes that spacing unavailable. Scene1 therefore exposes exactly 1, 2, 3, and 5 mm. Standalone point clouds and generated water overlays remain independent layers and are not included in the selector.
 
-The selector sits between **Cloud** and **Saved Visuals** and is scene-wide. Changing it replaces ROCK, SAND, and VEG as one display bundle; it is not a per-role variant control. The former role-level Variant controls are read-only analysis-source status. The UI reports the spacing, total point count, loading progress, and any error. The old committed bundle remains visible while a target bundle is loaded, uploaded, and prepared. All roles commit together. A failed or superseded switch discards staged resources and leaves the previous bundle unchanged. Switching is disabled during an active export, and exports include only the committed display bundle.
+The selector sits between **Cloud** and **Saved Visuals** and is scene-wide. Changing it replaces ROCK, SAND, and VEG as one display bundle; it is not a per-role variant control. The former role-level Variant controls are read-only analysis-source status. The UI reports the spacing, total point count, loading progress, and any error. The old committed bundle remains visible while a target bundle is loaded and uploaded. All roles commit together. A failed or superseded switch discards staged resources and leaves the previous bundle unchanged. Switching is disabled during an active export, and exports include only the committed display bundle.
 
 New scenes select the finest complete bundle. A scene with no complete bundle retains its existing role selection as a non-switchable `Mixed` display.
 
@@ -14,12 +14,14 @@ New scenes select the finest complete bundle. A scene with no complete bundle re
 
 Each project-loaded scene has two independent source classifications:
 
-- **Analysis sources:** ROCK 1 mm, SAND 2 mm, and VEG 1 mm. These canonical files are loaded CPU-only at startup and remain resident while the scene is active.
+- **Analysis sources:** ROCK 1 mm, SAND 2 mm, and VEG 1 mm. These canonical files are catalogued at startup but load CPU-only on demand for explicit Bake Path and analysis-based Ripple/Field operations; they are not a startup prerequisite.
 - **Committed display sources:** the complete density bundle selected in the Visuals tab. Only these scene sources are renderable and GPU-resident after a switch completes.
 
-When one file belongs to both sets, its CPU data is reused. Obsolete display CPU/GPU resources are released after commit unless they are canonical analysis sources. A staged target is neither a committed display source nor renderable.
+When one file belongs to both sets, ready CPU data can be reused. Obsolete display CPU/GPU resources are released after commit when no active purpose owns them. A staged target is neither a committed display source nor renderable.
 
-Pivot samples and combined Flow/Field support caches are prewarmed from the analysis set. Picking, region selection, source placement, flow solving, field solving, water support signatures, and support-cache generation never fall back to a sparse display source. Rain collision is display-independent too: it streams exact 5 mm role files, or each role's coarsest fallback, into a separate persisted 20 mm cache. If a required source is still loading or failed, the dependent action is disabled and reports the loading/error state.
+Ordinary framing, placement, and editing can use the committed runtime display support. Explicit canonical operations queue their required analysis roles and resume when those CPU sources are ready; missing analysis never blocks the first visible display. The display-independent shared `WaterSurfaceCache` separately streams exact 5 mm role files, or each role's coarsest fallback, into one persisted 20 mm Rain/Flow/Seepage cache after the display upload completes.
+
+Point-cloud loading, shared-surface build/load plus GPU preprocessing, and dynamic-mesh cache warmup use one exclusive high-memory slot. The active display commits first; the shared surface cache then takes the slot before inactive queued loads, and the remaining work resumes only after preprocessing completes.
 
 ## Density-Compensated Rendering
 
@@ -51,21 +53,20 @@ Scalar-field bindings follow field names across variants because numeric field s
 
 ## Water And Field Routing
 
-Display switching does not change simulation input. Combined water support, source placement, path/field caches, Flow routing, and region analysis use CPU-ready canonical analysis sources. Rain collision queries use the scene's static 20 mm role-aware cache, whose source signature and GPU upload revision also remain stable while display density changes.
+Display switching changes presentation only. Explicit Flow/Field analysis uses CPU-ready canonical sources, while placement and responsive runtime editing can use committed support. Rain, surface-guided Flow, and Seepage use the scene's static 20 mm shared surface cache, whose source signature and GPU upload revision remain stable while display density changes.
 
 Display-dependent payloads are handled separately:
 
-- Ripple memberships are rebuilt or restored for each exact display cloud because point indices differ between density variants.
-- Field simulation remains analysis-based, but presentation fields are remapped spatially to the target display cloud before upload. An analysis-cloud point index is never reused as a display-cloud index.
-- Target Ripple and Field payloads are prepared before a display switch commits.
-- Generated Flow and Field Streamline sessions are unchanged by the selector; dedicated Rain particles reuse the same shared collision cache and world-space impacts.
+- Ripple memberships and Field presentation are display-source-specific because point indices differ between density variants; indices are never copied across variants.
+- A display commit performs no Ripple, Field, Flow, or Seepage topology scan. Missing display-specific Ripple/Field state remains dirty until an explicit recalculation; settled Flow and compact Seepage topology stay active.
+- Generated Flow and Field Streamline sessions are unchanged by the selector; dedicated Rain particles reuse the same shared surface cache and world-space impacts.
 - SAND Shoreline settings remain authored once and are evaluated on the committed SAND display source.
 
 Viewport rendering, framing, frustum masks, still/animation snapshots, and offline export all use the committed-display predicate. CPU-only analysis sources and staged switch targets are excluded.
 
-## Project Schema 33
+## Project Schema 42
 
-Schema 33 adds an authoritative `scene_point_cloud_groups` array. Each group records the committed display state and the per-role analysis/display paths:
+The authoritative `scene_point_cloud_groups` array records committed display state and per-role analysis/display paths. Schema 42 additionally stores an optional compact `water_surface_cache` manifest per group:
 
 ```json
 {
@@ -75,6 +76,13 @@ Schema 33 adds an authoritative `scene_point_cloud_groups` array. Each group rec
       "display_spacing_meters": 0.005,
       "display_loaded": true,
       "display_visible": true,
+      "water_surface_cache": {
+        "relative_path": "../Data/Scene1/.invisible_places/cache/water/example.surfacecache",
+        "cache_schema": 3,
+        "algorithm_id": "water-surface-v3",
+        "requested_rebuild_generation": 1,
+        "built_rebuild_generation": 1
+      },
       "roles": [
         {
           "scene_role": "ROCK",
@@ -87,7 +95,9 @@ Schema 33 adds an authoritative `scene_point_cloud_groups` array. Each group rec
 }
 ```
 
-The example abbreviates the `roles` array; a normal complete scene stores ROCK, SAND, and VEG records. Legacy per-layer grouping, selected-variant, loaded, and visible fields remain compatibility mirrors, but the group record is authoritative when present.
+The example abbreviates the `roles` array and cache fingerprint/checksum fields; a normal complete scene stores ROCK, SAND, and VEG records. Schema-3 payloads live at `<scene>/.invisible_places/cache/water/<signature>.surfacecache`, fall back beside the project when scene storage is unavailable, and can migrate legacy schema-2 `.raincache` files. Requested/built generations make **Rebuild Cache** durable while the last settled GPU cache remains active until replacement.
+
+Clean generated Flow branches are similarly externalized to scene-local `.invisible_places/cache/flow/*.flowpathcache` sidecars with a compact `water_path_cache_manifest`; stale or orphaned derived arrays are not embedded in schema-42 project JSON.
 
 When loading a schema-32-or-earlier project, legacy selected paths are preserved as analysis-source candidates. The loader derives the display spacing from the visible primary/ROCK selection when that spacing forms a complete bundle. Otherwise it chooses the nearest complete bundle, preferring the denser bundle on a tie. If no complete bundle exists, it retains a non-switchable `Mixed` selection. Missing saved paths fall back through the same catalog validation instead of substituting a sparse display source for analysis.
 

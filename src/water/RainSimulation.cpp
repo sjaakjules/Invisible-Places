@@ -18,9 +18,13 @@ namespace invisible_places::water {
 
 namespace {
 
-constexpr std::uint32_t kRainCacheSchemaVersion = kWaterSurfaceCacheSchemaVersion;
-constexpr std::string_view kRainCacheMagic = "IPWSC002";
-constexpr std::string_view kWaterSurfaceIdentityTrailerMagic = "WSCID002";
+constexpr std::uint32_t kWaterSurfaceWriterSchemaVersion =
+    kWaterSurfaceCacheSchemaVersion;
+constexpr std::string_view kWaterSurfaceCacheMagic = "IPWSC003";
+constexpr std::string_view kLegacyRainCacheMagic = "IPWSC002";
+constexpr std::string_view kWaterSurfaceIdentityTrailerMagic = "WSCID003";
+constexpr std::string_view kLegacyWaterSurfaceIdentityTrailerMagic = "WSCID002";
+constexpr std::uint64_t kWaterSurfacePayloadIoChunkBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint32_t kMaximumHashProbeCount = 32U;
 constexpr float kPi = 3.14159265358979323846F;
 
@@ -68,7 +72,7 @@ struct Cell3Hash {
 
 struct FlowCellKey {
     Cell3 cell{};
-    RainCollisionRole role = RainCollisionRole::None;
+    WaterSurfaceRole role = WaterSurfaceRole::None;
 
     bool operator==(const FlowCellKey&) const = default;
 };
@@ -129,7 +133,7 @@ Cell3 PositionCell3(const io::Float3& position, float resolution) {
     };
 }
 
-io::Float3 TransformPosition(const io::Float3& point, const RainCollisionSource& source) {
+io::Float3 TransformPosition(const io::Float3& point, const WaterSurfaceSource& source) {
     if (!source.hasTransform) {
         return point;
     }
@@ -150,7 +154,7 @@ io::Float3 TransformPosition(const io::Float3& point, const RainCollisionSource&
     };
 }
 
-io::Float3 TransformNormal(const io::Float3& normal, const RainCollisionSource& source) {
+io::Float3 TransformNormal(const io::Float3& normal, const WaterSurfaceSource& source) {
     if (!source.hasTransform) {
         return Normalize(normal);
     }
@@ -194,14 +198,14 @@ class CollisionAccumulator {
 public:
     explicit CollisionAccumulator(float resolution) : resolution_(std::max(0.001F, resolution)) {}
 
-    void AddSample(const RainCollisionSample& sample) {
-        if (sample.role == RainCollisionRole::None) {
+    void AddSample(const WaterSurfaceSample& sample) {
+        if (sample.role == WaterSurfaceRole::None) {
             return;
         }
         bounds_.Expand(sample.position);
         ++pointCount_;
         const auto normal = Normalize(sample.normal);
-        if (sample.role == RainCollisionRole::Vegetation) {
+        if (sample.role == WaterSurfaceRole::Vegetation) {
             auto& target = vegetation_[PositionCell3(sample.position, resolution_)];
             target.normalSum = Add(target.normalSum, normal);
             ++target.count;
@@ -227,7 +231,7 @@ public:
         ++flowTarget.count;
 
         auto& cell = surfaces_[PositionCell2(sample.position, resolution_)];
-        auto& target = sample.role == RainCollisionRole::Sand ? cell.sand : cell.rock;
+        auto& target = sample.role == WaterSurfaceRole::Sand ? cell.sand : cell.rock;
         if (sample.position.z > target.height + resolution_) {
             target.height = sample.position.z;
             target.normalSum = normal;
@@ -242,9 +246,9 @@ public:
         }
     }
 
-    RainCollisionCache Finish() {
-        RainCollisionCache cache;
-        cache.schemaVersion = kRainCacheSchemaVersion;
+    WaterSurfaceCache Finish() {
+        WaterSurfaceCache cache;
+        cache.schemaVersion = kWaterSurfaceWriterSchemaVersion;
         cache.resolutionMeters = resolution_;
         cache.bounds = bounds_;
         cache.sourcePointCount = pointCount_;
@@ -322,7 +326,7 @@ public:
     }
 
 private:
-    float resolution_ = kRainCollisionResolutionMeters;
+    float resolution_ = kWaterSurfaceResolutionMeters;
     std::unordered_map<Cell2, SurfaceAccumulator, Cell2Hash> surfaces_;
     std::unordered_map<Cell3, VegetationAccumulator, Cell3Hash> vegetation_;
     std::unordered_map<FlowCellKey, FlowSurfaceAccumulator, FlowCellKeyHash> flowSurfaces_;
@@ -330,16 +334,16 @@ private:
     std::uint64_t pointCount_ = 0U;
 };
 
-RainCollisionRole CollisionRoleForSceneRole(scene::ScenePointCloudRole role) {
+WaterSurfaceRole CollisionRoleForSceneRole(scene::ScenePointCloudRole role) {
     switch (role) {
         case scene::ScenePointCloudRole::Rock:
-            return RainCollisionRole::Rock;
+            return WaterSurfaceRole::Rock;
         case scene::ScenePointCloudRole::Sand:
-            return RainCollisionRole::Sand;
+            return WaterSurfaceRole::Sand;
         case scene::ScenePointCloudRole::Vegetation:
-            return RainCollisionRole::Vegetation;
+            return WaterSurfaceRole::Vegetation;
     }
-    return RainCollisionRole::None;
+    return WaterSurfaceRole::None;
 }
 
 template <typename T>
@@ -440,9 +444,180 @@ private:
     std::size_t byteCount_ = 0U;
 };
 
+class WaterSurfacePayloadChecksumBuilder {
+public:
+    template <typename T>
+    void AddPod(const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        AddBytes(&value, sizeof(value));
+    }
+
+    void AddBytes(const void* data, std::size_t size) {
+        if (data == nullptr || size == 0U) {
+            return;
+        }
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        hashedByteCount_ += static_cast<std::uint64_t>(size);
+        if (tailSize_ != 0U) {
+            const auto copied = std::min(size, tail_.size() - tailSize_);
+            std::memcpy(tail_.data() + tailSize_, bytes, copied);
+            tailSize_ += copied;
+            bytes += copied;
+            size -= copied;
+            if (tailSize_ == tail_.size()) {
+                std::uint64_t word = 0U;
+                std::memcpy(&word, tail_.data(), sizeof(word));
+                MixWord(word);
+                tailSize_ = 0U;
+            }
+        }
+        while (size >= sizeof(std::uint64_t)) {
+            std::uint64_t word = 0U;
+            std::memcpy(&word, bytes, sizeof(word));
+            MixWord(word);
+            bytes += sizeof(word);
+            size -= sizeof(word);
+        }
+        if (size != 0U) {
+            std::memcpy(tail_.data(), bytes, size);
+            tailSize_ = size;
+        }
+    }
+
+    [[nodiscard]] WaterSurfaceCachePayloadChecksum Finish() const {
+        auto first = first_;
+        auto second = second_;
+        if (tailSize_ != 0U) {
+            std::uint64_t tailWord = 0U;
+            std::memcpy(&tailWord, tail_.data(), tailSize_);
+            tailWord ^= static_cast<std::uint64_t>(tailSize_) << 56U;
+            MixWordInto(&first, &second, tailWord, wordCount_);
+        }
+        const auto finalise = [this](std::uint64_t value, std::uint64_t salt) {
+            value ^= hashedByteCount_ + salt;
+            value ^= value >> 30U;
+            value *= 0xBF58476D1CE4E5B9ULL;
+            value ^= value >> 27U;
+            value *= 0x94D049BB133111EBULL;
+            return value ^ (value >> 31U);
+        };
+        return {
+            .words = {
+                finalise(first, 0x9E3779B97F4A7C15ULL),
+                finalise(second, 0xD6E8FEB86659FD93ULL),
+            },
+            .hashedByteCount = static_cast<std::uint64_t>(hashedByteCount_),
+        };
+    }
+
+private:
+    static void MixWordInto(
+        std::uint64_t* first,
+        std::uint64_t* second,
+        std::uint64_t word,
+        std::uint64_t wordIndex) {
+        const auto mixed = word + 0x9E3779B97F4A7C15ULL * (wordIndex + 1U);
+        *first = std::rotl(*first ^ mixed, 27) * 0x3C79AC492BA7B653ULL;
+        *second = std::rotl(*second + (mixed ^ (*first >> 17U)), 31) *
+                  0x1C69B3F74AC4AE35ULL;
+    }
+
+    void MixWord(std::uint64_t word) {
+        MixWordInto(&first_, &second_, word, wordCount_);
+        ++wordCount_;
+    }
+
+    std::uint64_t first_ = 0x243F6A8885A308D3ULL;
+    std::uint64_t second_ = 0x13198A2E03707344ULL;
+    std::uint64_t wordCount_ = 0U;
+    std::uint64_t hashedByteCount_ = 0U;
+    std::array<std::uint8_t, sizeof(std::uint64_t)> tail_{};
+    std::size_t tailSize_ = 0U;
+};
+
+template <typename T>
+void AddWaterSurfacePayloadArray(
+    WaterSurfacePayloadChecksumBuilder* checksum,
+    std::uint64_t tag,
+    const std::vector<T>& values) {
+    checksum->AddPod(tag);
+    checksum->AddPod(static_cast<std::uint64_t>(values.size()));
+    if (!values.empty()) {
+        checksum->AddBytes(values.data(), values.size() * sizeof(T));
+    }
+}
+
+WaterSurfaceCachePayloadChecksum CalculateWaterSurfacePayloadChecksum(
+    const WaterSurfaceCache& cache,
+    const WaterSurfaceGpuData& gpuData) {
+    WaterSurfacePayloadChecksumBuilder checksum;
+    AddWaterSurfacePayloadArray(&checksum, 1U, cache.surfaceCells);
+    AddWaterSurfacePayloadArray(&checksum, 2U, cache.vegetationVoxels);
+    AddWaterSurfacePayloadArray(&checksum, 3U, cache.flowSurfaceSurfels);
+    AddWaterSurfacePayloadArray(&checksum, 4U, gpuData.surfaceTable);
+    AddWaterSurfacePayloadArray(&checksum, 5U, gpuData.vegetationTable);
+    AddWaterSurfacePayloadArray(&checksum, 6U, gpuData.flowSurfaceTable);
+    return checksum.Finish();
+}
+
 WaterSurfaceCacheIdentity MakeWaterSurfaceCacheIdentity(
-    const RainCollisionCache& cache,
-    const RainCollisionGpuData& gpuData) {
+    const WaterSurfaceCache& cache,
+    const WaterSurfaceGpuData& gpuData,
+    std::uint32_t schemaVersion = kWaterSurfaceCacheSchemaVersion,
+    const WaterSurfaceCachePayloadChecksum* checksumOverride = nullptr) {
+    WaterSurfaceIdentityDigestBuilder digest;
+    digest.AddString("InvisiblePlaces.WaterSurfaceCache.Identity.v3");
+    digest.AddPod(schemaVersion);
+    digest.AddPod(cache.resolutionMeters);
+    digest.AddString(cache.signature);
+    digest.AddPod(cache.bounds.minimum.x);
+    digest.AddPod(cache.bounds.minimum.y);
+    digest.AddPod(cache.bounds.minimum.z);
+    digest.AddPod(cache.bounds.maximum.x);
+    digest.AddPod(cache.bounds.maximum.y);
+    digest.AddPod(cache.bounds.maximum.z);
+    digest.AddPod(static_cast<std::uint8_t>(cache.bounds.valid ? 1U : 0U));
+    digest.AddPod(cache.sourcePointCount);
+    digest.AddPod(cache.revision);
+
+    digest.AddPod(static_cast<std::uint64_t>(cache.sources.size()));
+    for (const auto& source : cache.sources) {
+        digest.AddString(
+            schemaVersion <= kWaterSurfaceCacheLegacySchemaVersion
+                ? source.sourcePath.generic_string()
+                : source.sourcePath.filename().generic_string());
+        digest.AddPod(static_cast<std::uint32_t>(source.role));
+        digest.AddPod(source.spacingMicrometres);
+        digest.AddPod(source.fileSize);
+        digest.AddPod(source.modificationTicks);
+        digest.AddPod(static_cast<std::uint8_t>(source.isFallback ? 1U : 0U));
+    }
+
+    digest.AddPod(static_cast<std::uint64_t>(cache.surfaceCells.size()));
+    digest.AddPod(static_cast<std::uint64_t>(cache.vegetationVoxels.size()));
+    digest.AddPod(static_cast<std::uint64_t>(cache.flowSurfaceSurfels.size()));
+    digest.AddPod(gpuData.surfaceMask);
+    digest.AddPod(gpuData.vegetationMask);
+    digest.AddPod(gpuData.flowSurfaceMask);
+    digest.AddPod(gpuData.maximumProbeCount);
+    digest.AddPod(gpuData.flowMaximumProbeCount);
+    digest.AddPod(gpuData.sourceRevision);
+    const auto& payloadChecksum = checksumOverride != nullptr
+        ? *checksumOverride
+        : gpuData.payloadChecksum;
+    digest.AddPod(payloadChecksum.words[0]);
+    digest.AddPod(payloadChecksum.words[1]);
+    digest.AddPod(payloadChecksum.hashedByteCount);
+
+    return {
+        .sourceSignature = cache.signature,
+        .contentDigest = digest.Finish(),
+    };
+}
+
+WaterSurfaceCacheIdentity MakeLegacyWaterSurfaceCacheIdentity(
+    const WaterSurfaceCache& cache,
+    const WaterSurfaceGpuData& gpuData) {
     WaterSurfaceIdentityDigestBuilder digest;
     digest.AddString("InvisiblePlaces.WaterSurfaceCache.Identity.v2");
     digest.AddPod(cache.schemaVersion);
@@ -487,7 +662,6 @@ WaterSurfaceCacheIdentity MakeWaterSurfaceCacheIdentity(
     addTable(gpuData.surfaceTable);
     addTable(gpuData.vegetationTable);
     addTable(gpuData.flowSurfaceTable);
-
     return {
         .sourceSignature = cache.signature,
         .contentDigest = digest.Finish(),
@@ -495,7 +669,7 @@ WaterSurfaceCacheIdentity MakeWaterSurfaceCacheIdentity(
 }
 
 std::optional<RainSurfaceCell> FindSurfaceCell(
-    const RainCollisionCache& cache,
+    const WaterSurfaceCache& cache,
     std::int32_t cellX,
     std::int32_t cellY) {
     const auto found = std::lower_bound(
@@ -512,7 +686,7 @@ std::optional<RainSurfaceCell> FindSurfaceCell(
 }
 
 std::optional<RainVegetationVoxel> FindVegetationVoxel(
-    const RainCollisionCache& cache,
+    const WaterSurfaceCache& cache,
     std::int32_t cellX,
     std::int32_t cellY,
     std::int32_t cellZ) {
@@ -531,11 +705,11 @@ std::optional<RainVegetationVoxel> FindVegetationVoxel(
 }
 
 const WaterSurfaceSurfel* FindFlowSurfaceSurfel(
-    const RainCollisionCache& cache,
+    const WaterSurfaceCache& cache,
     std::int32_t cellX,
     std::int32_t cellY,
     std::int32_t cellZ,
-    RainCollisionRole role) {
+    WaterSurfaceRole role) {
     const auto key = std::tuple{cellX, cellY, cellZ, role};
     const auto found = std::lower_bound(
         cache.flowSurfaceSurfels.begin(),
@@ -637,7 +811,7 @@ float SmoothStep(float edge0, float edge1, float value) {
 
 bool EventActive(const RainImpactEvent& event, float timeSeconds) {
     const float age = timeSeconds - event.birthTimeSeconds;
-    return event.role != RainCollisionRole::None && age >= 0.0F && age <= event.lifetimeSeconds;
+    return event.role != WaterSurfaceRole::None && age >= 0.0F && age <= event.lifetimeSeconds;
 }
 
 io::Float3 RainImpactRandomDirection2D(std::uint32_t seed) {
@@ -730,6 +904,161 @@ float RainFrontSpawnProbability(
     return std::lerp(1.0F, 0.12F + wave * 0.88F, std::clamp(settings.weatherFrontStrength, 0.0F, 1.0F));
 }
 
+std::string WaterSurfaceCacheSignatureForSchema(
+    std::span<const WaterSurfaceSource> sources,
+    float resolutionMeters,
+    std::uint32_t schemaVersion) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    HashBytes(&hash, &schemaVersion, sizeof(schemaVersion));
+    HashBytes(&hash, &resolutionMeters, sizeof(resolutionMeters));
+    std::filesystem::path commonSourceParent;
+    if (schemaVersion > kWaterSurfaceCacheLegacySchemaVersion && !sources.empty()) {
+        commonSourceParent = sources.front().sourcePath.lexically_normal().parent_path();
+        const auto isWithin = [](const std::filesystem::path& path,
+                                 const std::filesystem::path& parent) {
+            if (parent.empty()) {
+                return false;
+            }
+            const auto relative = path.lexically_normal().lexically_relative(parent);
+            if (relative.empty() || relative.is_absolute()) {
+                return false;
+            }
+            const auto first = relative.begin();
+            return first == relative.end() || *first != "..";
+        };
+        for (const auto& source : sources) {
+            while (!commonSourceParent.empty() &&
+                   !isWithin(source.sourcePath, commonSourceParent)) {
+                const auto parent = commonSourceParent.parent_path();
+                if (parent == commonSourceParent) {
+                    commonSourceParent.clear();
+                    break;
+                }
+                commonSourceParent = parent;
+            }
+        }
+    }
+    for (const auto& source : sources) {
+        std::error_code error;
+        if (schemaVersion <= kWaterSurfaceCacheLegacySchemaVersion) {
+            const auto normalizedPath =
+                std::filesystem::weakly_canonical(source.sourcePath, error).generic_string();
+            HashString(
+                &hash,
+                error ? source.sourcePath.lexically_normal().generic_string() : normalizedPath);
+        } else {
+            // Preserve nested source paths without coupling the signature to an
+            // installation's absolute scene location.
+            auto relativePath = source.sourcePath.lexically_normal().lexically_relative(
+                commonSourceParent);
+            if (relativePath.empty() || relativePath.is_absolute() ||
+                (!relativePath.empty() && *relativePath.begin() == "..")) {
+                relativePath = source.sourcePath.filename();
+            }
+            HashString(&hash, relativePath.generic_string());
+        }
+        const auto role = static_cast<std::uint32_t>(source.role);
+        HashBytes(&hash, &role, sizeof(role));
+        HashBytes(&hash, &source.spacingMicrometres, sizeof(source.spacingMicrometres));
+        HashBytes(&hash, &source.hasTransform, sizeof(source.hasTransform));
+        HashBytes(
+            &hash,
+            source.localToWorld.values.data(),
+            source.localToWorld.values.size() * sizeof(double));
+        const auto size = std::filesystem::file_size(source.sourcePath, error);
+        const auto safeSize = error ? 0U : size;
+        HashBytes(&hash, &safeSize, sizeof(safeSize));
+        error.clear();
+        const auto writeTime = std::filesystem::last_write_time(source.sourcePath, error);
+        const auto ticks =
+            error ? 0LL : static_cast<long long>(writeTime.time_since_epoch().count());
+        HashBytes(&hash, &ticks, sizeof(ticks));
+    }
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return stream.str();
+}
+
+template <typename T>
+bool ReadWaterSurfacePayloadArray(
+    std::ifstream& input,
+    std::vector<T>* values,
+    std::uint64_t tag,
+    WaterSurfacePayloadChecksumBuilder* checksum) {
+    if (values == nullptr || checksum == nullptr) {
+        return false;
+    }
+    checksum->AddPod(tag);
+    checksum->AddPod(static_cast<std::uint64_t>(values->size()));
+    const std::size_t maximumChunkElements = std::max<std::size_t>(
+        1U,
+        static_cast<std::size_t>(kWaterSurfacePayloadIoChunkBytes / sizeof(T)));
+    std::size_t offset = 0U;
+    while (offset < values->size()) {
+        const auto chunkElements = std::min(maximumChunkElements, values->size() - offset);
+        const auto chunkBytes = chunkElements * sizeof(T);
+        input.read(
+            reinterpret_cast<char*>(values->data() + offset),
+            static_cast<std::streamsize>(chunkBytes));
+        if (!input.good()) {
+            return false;
+        }
+        checksum->AddBytes(values->data() + offset, chunkBytes);
+        offset += chunkElements;
+    }
+    return true;
+}
+
+std::uint64_t SaturatingAdd(std::uint64_t left, std::uint64_t right) {
+    return right > std::numeric_limits<std::uint64_t>::max() - left
+        ? std::numeric_limits<std::uint64_t>::max()
+        : left + right;
+}
+
+std::uint64_t SaturatingMultiply(std::uint64_t left, std::uint64_t right) {
+    if (left == 0U || right == 0U) {
+        return 0U;
+    }
+    return left > std::numeric_limits<std::uint64_t>::max() / right
+        ? std::numeric_limits<std::uint64_t>::max()
+        : left * right;
+}
+
+std::uint64_t WaterSurfaceCachePersistenceBytes(
+    const WaterSurfaceCache& cache,
+    std::uint64_t gpuSurfaceCount,
+    std::uint64_t gpuVegetationCount,
+    std::uint64_t gpuFlowSurfaceCount) {
+    std::uint64_t bytes = 0U;
+    const auto add = [&bytes](std::uint64_t amount) {
+        bytes = SaturatingAdd(bytes, amount);
+    };
+    add(kWaterSurfaceCacheMagic.size());
+    add(sizeof(std::uint32_t) + sizeof(float));
+    add(sizeof(std::uint32_t) + cache.signature.size());
+    add(sizeof(cache.bounds) + sizeof(cache.sourcePointCount) + sizeof(cache.revision));
+    add(sizeof(std::uint32_t));
+    for (const auto& source : cache.sources) {
+        add(sizeof(std::uint32_t) + source.sourcePath.generic_string().size());
+        add(sizeof(std::uint32_t) * 2U + sizeof(std::uint64_t) + sizeof(std::int64_t) +
+            sizeof(bool));
+    }
+    add(3U * sizeof(std::uint64_t));
+    add(SaturatingMultiply(cache.surfaceCells.size(), sizeof(RainSurfaceCell)));
+    add(SaturatingMultiply(cache.vegetationVoxels.size(), sizeof(RainVegetationVoxel)));
+    add(SaturatingMultiply(cache.flowSurfaceSurfels.size(), sizeof(WaterSurfaceSurfel)));
+    add(3U * sizeof(std::uint64_t));
+    add(5U * sizeof(std::uint32_t) + sizeof(std::uint64_t));
+    add(SaturatingMultiply(gpuSurfaceCount, sizeof(RainGpuSurfaceSlot)));
+    add(SaturatingMultiply(gpuVegetationCount, sizeof(RainGpuVegetationSlot)));
+    add(SaturatingMultiply(gpuFlowSurfaceCount, sizeof(WaterGpuSurfaceSurfelSlot)));
+    add(kWaterSurfaceIdentityTrailerMagic.size());
+    add(sizeof(std::uint32_t) + cache.signature.size());
+    add(4U * sizeof(std::uint64_t));
+    add(3U * sizeof(std::uint64_t));
+    return bytes;
+}
+
 }  // namespace
 
 RainRuntimeSettings DefaultRainRuntimeSettings() {
@@ -802,10 +1131,10 @@ float RainImpactGridWorldSpan(const RainRuntimeSettings& settings) {
     return std::clamp(std::max(settings.spawnRadiusMeters * 2.4F, 16.0F), 16.0F, 256.0F);
 }
 
-std::vector<RainCollisionSource> SelectRainCollisionSources(
+std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
     const scene::ScenePointCloudGroup& group,
     std::uint32_t preferredSpacingMicrometres) {
-    std::vector<RainCollisionSource> selected;
+    std::vector<WaterSurfaceSource> selected;
     selected.reserve(scene::kScenePointCloudRoleCount);
     for (std::size_t roleIndex = 0; roleIndex < scene::kScenePointCloudRoleCount; ++roleIndex) {
         const auto role = static_cast<scene::ScenePointCloudRole>(roleIndex);
@@ -830,90 +1159,130 @@ std::vector<RainCollisionSource> SelectRainCollisionSources(
     return selected;
 }
 
-std::string RainCollisionCacheSignature(
-    std::span<const RainCollisionSource> sources,
+std::string WaterSurfaceCacheSignature(
+    std::span<const WaterSurfaceSource> sources,
     float resolutionMeters) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    HashBytes(&hash, &kRainCacheSchemaVersion, sizeof(kRainCacheSchemaVersion));
-    HashBytes(&hash, &resolutionMeters, sizeof(resolutionMeters));
-    for (const auto& source : sources) {
-        std::error_code error;
-        const auto normalizedPath = std::filesystem::weakly_canonical(source.sourcePath, error).generic_string();
-        HashString(&hash, error ? source.sourcePath.lexically_normal().generic_string() : normalizedPath);
-        const auto role = static_cast<std::uint32_t>(source.role);
-        HashBytes(&hash, &role, sizeof(role));
-        HashBytes(&hash, &source.spacingMicrometres, sizeof(source.spacingMicrometres));
-        HashBytes(&hash, &source.hasTransform, sizeof(source.hasTransform));
-        HashBytes(&hash, source.localToWorld.values.data(), source.localToWorld.values.size() * sizeof(double));
-        const auto size = std::filesystem::file_size(source.sourcePath, error);
-        const auto safeSize = error ? 0U : size;
-        HashBytes(&hash, &safeSize, sizeof(safeSize));
-        error.clear();
-        const auto writeTime = std::filesystem::last_write_time(source.sourcePath, error);
-        const auto ticks = error ? 0LL : static_cast<long long>(writeTime.time_since_epoch().count());
-        HashBytes(&hash, &ticks, sizeof(ticks));
-    }
-    std::ostringstream stream;
-    stream << std::hex << std::setfill('0') << std::setw(16) << hash;
-    return stream.str();
+    return WaterSurfaceCacheSignatureForSchema(
+        sources,
+        resolutionMeters,
+        kWaterSurfaceCacheSchemaVersion);
 }
 
-std::filesystem::path RainCollisionCachePath(
+static std::filesystem::path LegacyRainCachePath(
     const std::filesystem::path& cacheRoot,
     std::string_view signature) {
     return cacheRoot / "cache" / "rain" / (std::string{signature} + ".raincache");
 }
 
-RainCollisionBuildResult BuildRainCollisionCache(
-    std::span<const RainCollisionSource> sources,
+WaterSurfaceBuildResult BuildWaterSurfaceCache(
+    std::span<const WaterSurfaceSource> sources,
     const std::filesystem::path& cacheRoot,
     const std::atomic_bool* cancelRequested) {
-    RainCollisionBuildResult result;
+    WaterSurfaceBuildResult result;
     if (sources.empty()) {
-        result.errorMessage = "Rain collision cache has no role sources.";
+        result.errorMessage = "Water surface cache has no role sources.";
         return result;
     }
 
-    const auto signature = RainCollisionCacheSignature(sources);
-    const auto cachePath = cacheRoot.empty() ? std::filesystem::path{} : RainCollisionCachePath(cacheRoot, signature);
-    if (!cachePath.empty() && std::filesystem::exists(cachePath)) {
-        if (LoadRainCollisionCache(cachePath, signature, &result.cache, &result.errorMessage)) {
+    const auto signature = WaterSurfaceCacheSignature(sources);
+    const auto cachePath = cacheRoot.empty()
+        ? std::filesystem::path{}
+        : WaterSurfaceCachePath(cacheRoot, signature);
+    if (!cachePath.empty()) {
+        const auto legacySignature = WaterSurfaceCacheSignatureForSchema(
+            sources,
+            kWaterSurfaceResolutionMeters,
+            kWaterSurfaceCacheLegacySchemaVersion);
+        const std::array<std::pair<std::filesystem::path, std::string>, 3> candidates{{
+            {cachePath, signature},
+            {LegacyRainCachePath(cacheRoot, signature), signature},
+            {LegacyRainCachePath(cacheRoot, legacySignature), legacySignature},
+        }};
+        for (const auto& [candidatePath, candidateSignature] : candidates) {
+            std::error_code candidateError;
+            if (!std::filesystem::is_regular_file(candidatePath, candidateError) ||
+                candidateError ||
+                !LoadWaterSurfaceCache(
+                    candidatePath,
+                    candidateSignature,
+                    &result.cache,
+                    &result.errorMessage,
+                    &result.diagnostics)) {
+                result.errorMessage.clear();
+                continue;
+            }
+
+            const bool needsSchemaUpgrade =
+                result.cache.schemaVersion != kWaterSurfaceCacheSchemaVersion ||
+                result.cache.signature != signature;
+            if (needsSchemaUpgrade) {
+                result.cache.schemaVersion = kWaterSurfaceCacheSchemaVersion;
+                result.cache.signature = signature;
+                result.cache.revision = HashBits(
+                    static_cast<std::uint32_t>(std::hash<std::string>{}(signature)));
+                result.cache.gpuData.sourceRevision = result.cache.revision;
+                if (!result.cache.gpuData.payloadChecksum.Valid()) {
+                    result.cache.gpuData.payloadChecksum =
+                        CalculateWaterSurfacePayloadChecksum(
+                            result.cache,
+                            result.cache.gpuData);
+                }
+                result.cache.cacheIdentity = MakeWaterSurfaceCacheIdentity(
+                    result.cache,
+                    result.cache.gpuData);
+                result.cache.gpuData.sourceIdentity = result.cache.cacheIdentity;
+            }
+            if (candidatePath != cachePath || needsSchemaUpgrade) {
+                std::string migrationError;
+                if (!SaveWaterSurfaceCache(result.cache, cachePath, &migrationError)) {
+                    result.warnings.push_back(
+                        "Water surface cache migration could not be persisted: " +
+                        migrationError);
+                } else {
+                    result.persistedPath = cachePath;
+                }
+            } else {
+                result.persistedPath = candidatePath;
+            }
             result.loadedFromDisk = true;
             result.success = true;
             return result;
         }
-        result.errorMessage.clear();
     }
 
     const auto startedAt = std::chrono::steady_clock::now();
-    CollisionAccumulator accumulator{kRainCollisionResolutionMeters};
+    CollisionAccumulator accumulator{kWaterSurfaceResolutionMeters};
     result.cache.sources.reserve(sources.size());
     for (const auto& source : sources) {
         if (cancelRequested != nullptr && cancelRequested->load(std::memory_order_relaxed)) {
             result.cancelled = true;
             return result;
         }
-        if (source.role == RainCollisionRole::None) {
+        if (source.role == WaterSurfaceRole::None) {
             continue;
         }
         if (source.isFallback) {
             result.warnings.push_back(
-                "Rain collision cache is using fallback " + std::to_string(source.spacingMicrometres / 1000U) +
+                "Water surface cache is using fallback " + std::to_string(source.spacingMicrometres / 1000U) +
                 " mm data for " + source.sourcePath.filename().string() + ".");
         }
 
-        std::error_code error;
-        const auto size = std::filesystem::file_size(source.sourcePath, error);
-        const auto writeTime = std::filesystem::last_write_time(source.sourcePath, error);
+        std::error_code sizeError;
+        const auto size = std::filesystem::file_size(source.sourcePath, sizeError);
+        std::error_code timeError;
+        const auto writeTime = std::filesystem::last_write_time(source.sourcePath, timeError);
         result.cache.sources.push_back({
             .sourcePath = source.sourcePath,
             .role = source.role,
             .spacingMicrometres = source.spacingMicrometres,
-            .fileSize = error ? 0U : size,
-            .modificationTicks = error ? 0LL : static_cast<std::int64_t>(writeTime.time_since_epoch().count()),
+            .fileSize = sizeError ? 0U : size,
+            .modificationTicks = timeError
+                ? 0LL
+                : static_cast<std::int64_t>(writeTime.time_since_epoch().count()),
             .isFallback = source.isFallback,
         });
 
+        ++result.diagnostics.sourceScanCount;
         const auto streamResult = io::StreamPointCloudPositionsNormals(
             source.sourcePath,
             [&](const io::PointCloudPositionNormalSample& sample, std::uint64_t) {
@@ -943,27 +1312,30 @@ RainCollisionBuildResult BuildRainCollisionCache(
     cache.signature = signature;
     cache.sources = std::move(result.cache.sources);
     cache.revision = HashBits(static_cast<std::uint32_t>(std::hash<std::string>{}(signature)));
-    cache.gpuData = BuildRainCollisionGpuData(cache);
+    cache.gpuData = BuildWaterSurfaceGpuData(cache);
+    ++result.diagnostics.gpuTableBuildCount;
     cache.cacheIdentity = cache.gpuData.sourceIdentity;
     cache.buildMilliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - startedAt).count();
     result.cache = std::move(cache);
     if (result.cache.surfaceCells.empty() && result.cache.vegetationVoxels.empty()) {
-        result.errorMessage = "Rain collision cache did not contain any occupied cells.";
+        result.errorMessage = "Water surface cache did not contain any occupied cells.";
         return result;
     }
     if (!cachePath.empty()) {
         std::string saveError;
-        if (!SaveRainCollisionCache(result.cache, cachePath, &saveError)) {
-            result.warnings.push_back("Rain collision cache could not be persisted: " + saveError);
+        if (!SaveWaterSurfaceCache(result.cache, cachePath, &saveError)) {
+            result.warnings.push_back("Water surface cache could not be persisted: " + saveError);
+        } else {
+            result.persistedPath = cachePath;
         }
     }
     result.success = true;
     return result;
 }
 
-RainCollisionCache BuildRainCollisionCacheFromSamples(
-    std::span<const RainCollisionSample> samples,
+WaterSurfaceCache BuildWaterSurfaceCacheFromSamples(
+    std::span<const WaterSurfaceSample> samples,
     float resolutionMeters) {
     CollisionAccumulator accumulator{resolutionMeters};
     for (const auto& sample : samples) {
@@ -972,23 +1344,82 @@ RainCollisionCache BuildRainCollisionCacheFromSamples(
     auto cache = accumulator.Finish();
     cache.signature = "memory";
     cache.revision = 1U;
-    cache.gpuData = BuildRainCollisionGpuData(cache);
+    cache.gpuData = BuildWaterSurfaceGpuData(cache);
     cache.cacheIdentity = cache.gpuData.sourceIdentity;
     return cache;
 }
 
-bool SaveRainCollisionCache(
-    const RainCollisionCache& cache,
+bool SaveWaterSurfaceCache(
+    const WaterSurfaceCache& cache,
     const std::filesystem::path& filePath,
     std::string* errorMessage) {
+    if (!WaterSurfaceCacheFitsPersistenceLimit(cache)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water surface cache exceeds the 5 GiB persistence limit.";
+        }
+        return false;
+    }
     std::error_code error;
-    std::filesystem::create_directories(filePath.parent_path(), error);
+    if (!filePath.parent_path().empty()) {
+        std::filesystem::create_directories(filePath.parent_path(), error);
+    }
     if (error) {
         if (errorMessage != nullptr) {
             *errorMessage = error.message();
         }
         return false;
     }
+    const auto sourceCount = static_cast<std::uint32_t>(cache.sources.size());
+    const auto surfaceCount = static_cast<std::uint64_t>(cache.surfaceCells.size());
+    const auto vegetationCount = static_cast<std::uint64_t>(cache.vegetationVoxels.size());
+    const auto flowSurfaceCount = static_cast<std::uint64_t>(cache.flowSurfaceSurfels.size());
+    WaterSurfaceGpuData generatedGpuData;
+    const WaterSurfaceGpuData* gpuData = &cache.gpuData;
+    if (cache.gpuData.sourceRevision != cache.revision || cache.gpuData.surfaceTable.empty() ||
+        cache.gpuData.vegetationTable.empty() || cache.gpuData.flowSurfaceTable.empty()) {
+        try {
+            generatedGpuData = BuildWaterSurfaceGpuData(cache);
+        } catch (const std::exception& buildError) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Water surface GPU-table preparation failed: " +
+                                std::string{buildError.what()};
+            }
+            return false;
+        }
+        gpuData = &generatedGpuData;
+    }
+    const auto gpuSurfaceCount = static_cast<std::uint64_t>(gpuData->surfaceTable.size());
+    const auto gpuVegetationCount = static_cast<std::uint64_t>(gpuData->vegetationTable.size());
+    const auto gpuFlowSurfaceCount = static_cast<std::uint64_t>(gpuData->flowSurfaceTable.size());
+    auto payloadChecksum = gpuData->payloadChecksum;
+    if (!payloadChecksum.Valid()) {
+        payloadChecksum = CalculateWaterSurfacePayloadChecksum(cache, *gpuData);
+    }
+    const bool canReuseIdentity =
+        cache.schemaVersion == kWaterSurfaceCacheSchemaVersion &&
+        cache.cacheIdentity.Valid() &&
+        cache.cacheIdentity.sourceSignature == cache.signature &&
+        gpuData->sourceIdentity == cache.cacheIdentity &&
+        gpuData->payloadChecksum == payloadChecksum;
+    const auto cacheIdentity = canReuseIdentity
+        ? cache.cacheIdentity
+        : MakeWaterSurfaceCacheIdentity(
+              cache,
+              *gpuData,
+              kWaterSurfaceCacheSchemaVersion,
+              &payloadChecksum);
+    const auto persistenceBytes = WaterSurfaceCachePersistenceBytes(
+        cache,
+        gpuSurfaceCount,
+        gpuVegetationCount,
+        gpuFlowSurfaceCount);
+    if (!WaterSurfaceCachePersistenceSizeAllowed(persistenceBytes)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water surface cache exceeds the 5 GiB persistence limit.";
+        }
+        return false;
+    }
+
     const auto temporaryPath = filePath.string() + ".tmp";
     std::ofstream output{temporaryPath, std::ios::binary | std::ios::trunc};
     if (!output.is_open()) {
@@ -997,23 +1428,11 @@ bool SaveRainCollisionCache(
         }
         return false;
     }
-    output.write(kRainCacheMagic.data(), static_cast<std::streamsize>(kRainCacheMagic.size()));
-    const auto sourceCount = static_cast<std::uint32_t>(cache.sources.size());
-    const auto surfaceCount = static_cast<std::uint64_t>(cache.surfaceCells.size());
-    const auto vegetationCount = static_cast<std::uint64_t>(cache.vegetationVoxels.size());
-    const auto flowSurfaceCount = static_cast<std::uint64_t>(cache.flowSurfaceSurfels.size());
-    RainCollisionGpuData generatedGpuData;
-    const RainCollisionGpuData* gpuData = &cache.gpuData;
-    if (cache.gpuData.sourceRevision != cache.revision || cache.gpuData.surfaceTable.empty() ||
-        cache.gpuData.vegetationTable.empty() || cache.gpuData.flowSurfaceTable.empty()) {
-        generatedGpuData = BuildRainCollisionGpuData(cache);
-        gpuData = &generatedGpuData;
-    }
-    const auto gpuSurfaceCount = static_cast<std::uint64_t>(gpuData->surfaceTable.size());
-    const auto gpuVegetationCount = static_cast<std::uint64_t>(gpuData->vegetationTable.size());
-    const auto gpuFlowSurfaceCount = static_cast<std::uint64_t>(gpuData->flowSurfaceTable.size());
-    const auto cacheIdentity = MakeWaterSurfaceCacheIdentity(cache, *gpuData);
-    bool ok = WritePod(output, cache.schemaVersion) && WritePod(output, cache.resolutionMeters) &&
+    output.write(
+        kWaterSurfaceCacheMagic.data(),
+        static_cast<std::streamsize>(kWaterSurfaceCacheMagic.size()));
+    bool ok = WritePod(output, kWaterSurfaceCacheSchemaVersion) &&
+              WritePod(output, cache.resolutionMeters) &&
               WriteString(output, cache.signature) && WritePod(output, cache.bounds) &&
               WritePod(output, cache.sourcePointCount) && WritePod(output, cache.revision) &&
               WritePod(output, sourceCount);
@@ -1074,55 +1493,90 @@ bool SaveRainCollisionCache(
         for (const auto word : cacheIdentity.contentDigest) {
             ok = ok && WritePod(output, word);
         }
+        for (const auto word : payloadChecksum.words) {
+            ok = ok && WritePod(output, word);
+        }
+        ok = ok && WritePod(output, payloadChecksum.hashedByteCount);
+    }
+    if (ok) {
+        output.flush();
+        ok = output.good();
     }
     output.close();
+    ok = ok && !output.fail();
     if (!ok) {
         std::filesystem::remove(temporaryPath, error);
         if (errorMessage != nullptr) {
-            *errorMessage = "Failed while writing rain collision cache.";
+            *errorMessage = "Failed while writing water surface cache.";
         }
         return false;
     }
     std::filesystem::rename(temporaryPath, filePath, error);
     if (error) {
-        std::filesystem::remove(filePath, error);
-        error.clear();
-        std::filesystem::rename(temporaryPath, filePath, error);
-    }
-    if (error) {
+        const auto renameError = error;
+        std::error_code cleanupError;
+        std::filesystem::remove(temporaryPath, cleanupError);
         if (errorMessage != nullptr) {
-            *errorMessage = error.message();
+            *errorMessage = renameError.message();
         }
         return false;
     }
     return true;
 }
 
-bool LoadRainCollisionCache(
+bool LoadWaterSurfaceCache(
     const std::filesystem::path& filePath,
     std::string_view expectedSignature,
-    RainCollisionCache* cache,
-    std::string* errorMessage) {
+    WaterSurfaceCache* cache,
+    std::string* errorMessage,
+    WaterSurfaceBuildDiagnostics* diagnostics) {
     if (cache == nullptr) {
+        return false;
+    }
+    std::error_code fileError;
+    const auto fileBytes = std::filesystem::file_size(filePath, fileError);
+    if (fileError || !WaterSurfaceCachePersistenceSizeAllowed(fileBytes)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = fileError
+                                ? "Unable to inspect the water surface cache file."
+                                : "Water surface cache exceeds the 5 GiB persistence limit.";
+        }
         return false;
     }
     std::ifstream input{filePath, std::ios::binary};
     if (!input.is_open()) {
         if (errorMessage != nullptr) {
-            *errorMessage = "Unable to open rain collision cache.";
+            *errorMessage = "Unable to open water surface cache.";
         }
         return false;
     }
-    std::array<char, kRainCacheMagic.size()> magic{};
+    const auto unreadFileBytes = [&]() -> std::optional<std::uint64_t> {
+        const auto position = input.tellg();
+        if (position == std::ifstream::pos_type{-1}) {
+            return std::nullopt;
+        }
+        const auto consumed = static_cast<std::streamoff>(position);
+        if (consumed < 0 || static_cast<std::uint64_t>(consumed) > fileBytes) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint64_t>(fileBytes) -
+               static_cast<std::uint64_t>(consumed);
+    };
+    std::array<char, kWaterSurfaceCacheMagic.size()> magic{};
     input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
-    RainCollisionCache loaded;
-    if (!input.good() || std::string_view{magic.data(), magic.size()} != kRainCacheMagic ||
-        !ReadPod(input, &loaded.schemaVersion) || loaded.schemaVersion != kRainCacheSchemaVersion ||
+    WaterSurfaceCache loaded;
+    const auto magicView = std::string_view{magic.data(), magic.size()};
+    const bool legacySchema = magicView == kLegacyRainCacheMagic;
+    const bool currentSchema = magicView == kWaterSurfaceCacheMagic;
+    if (!input.good() || (!legacySchema && !currentSchema) ||
+        !ReadPod(input, &loaded.schemaVersion) ||
+        (legacySchema && loaded.schemaVersion != kWaterSurfaceCacheLegacySchemaVersion) ||
+        (currentSchema && loaded.schemaVersion != kWaterSurfaceCacheSchemaVersion) ||
         !ReadPod(input, &loaded.resolutionMeters) || !ReadString(input, &loaded.signature) ||
         loaded.signature != expectedSignature || !ReadPod(input, &loaded.bounds) ||
         !ReadPod(input, &loaded.sourcePointCount) || !ReadPod(input, &loaded.revision)) {
         if (errorMessage != nullptr) {
-            *errorMessage = "Rain collision cache header is invalid or stale.";
+            *errorMessage = "Water surface cache header is invalid or stale.";
         }
         return false;
     }
@@ -1132,17 +1586,17 @@ bool LoadRainCollisionCache(
     }
     loaded.sources.reserve(sourceCount);
     for (std::uint32_t index = 0; index < sourceCount; ++index) {
-        RainCollisionSourceMetadata source;
+        WaterSurfaceSourceMetadata source;
         std::string path;
         std::uint32_t role = 0U;
         if (!ReadString(input, &path) || !ReadPod(input, &role) ||
-            role > static_cast<std::uint32_t>(RainCollisionRole::Vegetation) ||
+            role > static_cast<std::uint32_t>(WaterSurfaceRole::Vegetation) ||
             !ReadPod(input, &source.spacingMicrometres) || !ReadPod(input, &source.fileSize) ||
             !ReadPod(input, &source.modificationTicks) || !ReadPod(input, &source.isFallback)) {
             return false;
         }
         source.sourcePath = path;
-        source.role = static_cast<RainCollisionRole>(role);
+        source.role = static_cast<WaterSurfaceRole>(role);
         loaded.sources.push_back(std::move(source));
     }
     std::uint64_t surfaceCount = 0U;
@@ -1152,6 +1606,20 @@ bool LoadRainCollisionCache(
     if (!ReadPod(input, &surfaceCount) || !ReadPod(input, &vegetationCount) ||
         !ReadPod(input, &flowSurfaceCount) || surfaceCount > maximumCacheCells ||
         vegetationCount > maximumCacheCells || flowSurfaceCount > maximumCacheCells) {
+        return false;
+    }
+    const auto cpuPayloadBytes = SaturatingAdd(
+        SaturatingMultiply(surfaceCount, sizeof(RainSurfaceCell)),
+        SaturatingAdd(
+            SaturatingMultiply(vegetationCount, sizeof(RainVegetationVoxel)),
+            SaturatingMultiply(flowSurfaceCount, sizeof(WaterSurfaceSurfel))));
+    const auto unreadBeforeCpuPayload = unreadFileBytes();
+    if (!unreadBeforeCpuPayload.has_value() ||
+        cpuPayloadBytes > unreadBeforeCpuPayload.value() ||
+        !WaterSurfaceCachePersistenceSizeAllowed(cpuPayloadBytes)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water surface cache CPU payload is invalid.";
+        }
         return false;
     }
     try {
@@ -1164,15 +1632,27 @@ bool LoadRainCollisionCache(
         }
         return false;
     }
-    input.read(
-        reinterpret_cast<char*>(loaded.surfaceCells.data()),
-        static_cast<std::streamsize>(surfaceCount * sizeof(RainSurfaceCell)));
-    input.read(
-        reinterpret_cast<char*>(loaded.vegetationVoxels.data()),
-        static_cast<std::streamsize>(vegetationCount * sizeof(RainVegetationVoxel)));
-    input.read(
-        reinterpret_cast<char*>(loaded.flowSurfaceSurfels.data()),
-        static_cast<std::streamsize>(flowSurfaceCount * sizeof(WaterSurfaceSurfel)));
+    WaterSurfacePayloadChecksumBuilder payloadChecksumBuilder;
+    if (!ReadWaterSurfacePayloadArray(
+            input,
+            &loaded.surfaceCells,
+            1U,
+            &payloadChecksumBuilder) ||
+        !ReadWaterSurfacePayloadArray(
+            input,
+            &loaded.vegetationVoxels,
+            2U,
+            &payloadChecksumBuilder) ||
+        !ReadWaterSurfacePayloadArray(
+            input,
+            &loaded.flowSurfaceSurfels,
+            3U,
+            &payloadChecksumBuilder)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water surface cache CPU payload is truncated.";
+        }
+        return false;
+    }
     std::uint64_t gpuSurfaceCount = 0U;
     std::uint64_t gpuVegetationCount = 0U;
     std::uint64_t gpuFlowSurfaceCount = 0U;
@@ -1187,7 +1667,7 @@ bool LoadRainCollisionCache(
         !ReadPod(input, &loaded.gpuData.flowMaximumProbeCount) ||
         !ReadPod(input, &loaded.gpuData.sourceRevision)) {
         if (errorMessage != nullptr) {
-            *errorMessage = "Rain collision cache payload is truncated.";
+            *errorMessage = "Water surface cache payload is truncated.";
         }
         return false;
     }
@@ -1201,7 +1681,23 @@ bool LoadRainCollisionCache(
         loaded.gpuData.flowMaximumProbeCount > kMaximumHashProbeCount ||
         loaded.gpuData.sourceRevision != loaded.revision) {
         if (errorMessage != nullptr) {
-            *errorMessage = "Rain collision cache GPU table header is invalid.";
+            *errorMessage = "Water surface cache GPU table header is invalid.";
+        }
+        return false;
+    }
+    const auto gpuPayloadBytes = SaturatingAdd(
+        SaturatingMultiply(gpuSurfaceCount, sizeof(RainGpuSurfaceSlot)),
+        SaturatingAdd(
+            SaturatingMultiply(gpuVegetationCount, sizeof(RainGpuVegetationSlot)),
+            SaturatingMultiply(
+                gpuFlowSurfaceCount,
+                sizeof(WaterGpuSurfaceSurfelSlot))));
+    const auto unreadBeforeGpuPayload = unreadFileBytes();
+    if (!unreadBeforeGpuPayload.has_value() ||
+        gpuPayloadBytes > unreadBeforeGpuPayload.value() ||
+        !WaterSurfaceCachePersistenceSizeAllowed(gpuPayloadBytes)) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water surface cache GPU payload is invalid.";
         }
         return false;
     }
@@ -1215,25 +1711,39 @@ bool LoadRainCollisionCache(
         }
         return false;
     }
-    input.read(
-        reinterpret_cast<char*>(loaded.gpuData.surfaceTable.data()),
-        static_cast<std::streamsize>(gpuSurfaceCount * sizeof(RainGpuSurfaceSlot)));
-    input.read(
-        reinterpret_cast<char*>(loaded.gpuData.vegetationTable.data()),
-        static_cast<std::streamsize>(gpuVegetationCount * sizeof(RainGpuVegetationSlot)));
-    input.read(
-        reinterpret_cast<char*>(loaded.gpuData.flowSurfaceTable.data()),
-        static_cast<std::streamsize>(gpuFlowSurfaceCount * sizeof(WaterGpuSurfaceSurfelSlot)));
-    if (!input.good()) {
+    if (!ReadWaterSurfacePayloadArray(
+            input,
+            &loaded.gpuData.surfaceTable,
+            4U,
+            &payloadChecksumBuilder) ||
+        !ReadWaterSurfacePayloadArray(
+            input,
+            &loaded.gpuData.vegetationTable,
+            5U,
+            &payloadChecksumBuilder) ||
+        !ReadWaterSurfacePayloadArray(
+            input,
+            &loaded.gpuData.flowSurfaceTable,
+            6U,
+            &payloadChecksumBuilder)) {
         if (errorMessage != nullptr) {
-            *errorMessage = "Rain collision cache GPU table payload is truncated.";
+            *errorMessage = "Water surface cache GPU table payload is truncated.";
         }
         return false;
     }
-    const auto derivedIdentity = MakeWaterSurfaceCacheIdentity(loaded, loaded.gpuData);
-    if (input.peek() != std::char_traits<char>::eof()) {
+    loaded.gpuData.payloadChecksum = payloadChecksumBuilder.Finish();
+
+    WaterSurfaceCacheIdentity derivedIdentity;
+    if (currentSchema) {
+        if (input.peek() == std::char_traits<char>::eof()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Water surface cache checksum trailer is missing.";
+            }
+            return false;
+        }
         std::array<char, kWaterSurfaceIdentityTrailerMagic.size()> trailerMagic{};
         WaterSurfaceCacheIdentity persistedIdentity;
+        WaterSurfaceCachePayloadChecksum persistedChecksum;
         input.read(trailerMagic.data(), static_cast<std::streamsize>(trailerMagic.size()));
         bool identityOk = input.good() &&
                           std::string_view{trailerMagic.data(), trailerMagic.size()} ==
@@ -1242,12 +1752,45 @@ bool LoadRainCollisionCache(
         for (auto& word : persistedIdentity.contentDigest) {
             identityOk = identityOk && ReadPod(input, &word);
         }
-        if (!identityOk || persistedIdentity != derivedIdentity ||
+        for (auto& word : persistedChecksum.words) {
+            identityOk = identityOk && ReadPod(input, &word);
+        }
+        identityOk = identityOk && ReadPod(input, &persistedChecksum.hashedByteCount);
+        derivedIdentity = MakeWaterSurfaceCacheIdentity(loaded, loaded.gpuData);
+        if (!identityOk || persistedChecksum != loaded.gpuData.payloadChecksum ||
+            persistedIdentity != derivedIdentity ||
             input.peek() != std::char_traits<char>::eof()) {
             if (errorMessage != nullptr) {
-                *errorMessage = "Water surface cache identity trailer is invalid.";
+                *errorMessage = "Water surface cache checksum or identity trailer is invalid.";
             }
             return false;
+        }
+    } else {
+        // Schema 2 used an expensive four-lane byte digest and allowed files
+        // without a trailer. Pay that cost only for the one-time legacy read;
+        // BuildWaterSurfaceCache migrates the result to schema 3 afterwards.
+        if (diagnostics != nullptr) {
+            ++diagnostics->fullPayloadHashPassCount;
+        }
+        derivedIdentity = MakeLegacyWaterSurfaceCacheIdentity(loaded, loaded.gpuData);
+        if (input.peek() != std::char_traits<char>::eof()) {
+            std::array<char, kLegacyWaterSurfaceIdentityTrailerMagic.size()> trailerMagic{};
+            WaterSurfaceCacheIdentity persistedIdentity;
+            input.read(trailerMagic.data(), static_cast<std::streamsize>(trailerMagic.size()));
+            bool identityOk = input.good() &&
+                              std::string_view{trailerMagic.data(), trailerMagic.size()} ==
+                                  kLegacyWaterSurfaceIdentityTrailerMagic &&
+                              ReadString(input, &persistedIdentity.sourceSignature);
+            for (auto& word : persistedIdentity.contentDigest) {
+                identityOk = identityOk && ReadPod(input, &word);
+            }
+            if (!identityOk || persistedIdentity != derivedIdentity ||
+                input.peek() != std::char_traits<char>::eof()) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = "Legacy water surface cache identity trailer is invalid.";
+                }
+                return false;
+            }
         }
     }
     loaded.cacheIdentity = derivedIdentity;
@@ -1257,7 +1800,7 @@ bool LoadRainCollisionCache(
 }
 
 RainCollisionHit TraceRainCollision(
-    const RainCollisionCache& cache,
+    const WaterSurfaceCache& cache,
     const io::Float3& segmentStart,
     const io::Float3& segmentEnd) {
     if (cache.resolutionMeters <= 0.0F ||
@@ -1302,7 +1845,7 @@ RainCollisionHit TraceRainCollision(
             return {
                 .position = Lerp(segmentStart, segmentEnd, entryTime),
                 .normal = vegetation->normal,
-                .role = RainCollisionRole::Vegetation,
+                .role = WaterSurfaceRole::Vegetation,
                 .segmentTime = entryTime,
                 .hit = true,
             };
@@ -1311,7 +1854,7 @@ RainCollisionHit TraceRainCollision(
         const auto surface = FindSurfaceCell(cache, cell.x, cell.y);
         if (surface.has_value() && delta.z < -1.0e-7F) {
             RainCollisionHit bestSurface;
-            const auto testSurface = [&](float height, const io::Float3& normal, RainCollisionRole role) {
+            const auto testSurface = [&](float height, const io::Float3& normal, WaterSurfaceRole role) {
                 if (!std::isfinite(height)) {
                     return;
                 }
@@ -1334,8 +1877,8 @@ RainCollisionHit TraceRainCollision(
                     .hit = true,
                 };
             };
-            testSurface(surface->rockHeight, surface->rockNormal, RainCollisionRole::Rock);
-            testSurface(surface->sandHeight, surface->sandNormal, RainCollisionRole::Sand);
+            testSurface(surface->rockHeight, surface->rockNormal, WaterSurfaceRole::Rock);
+            testSurface(surface->sandHeight, surface->sandNormal, WaterSurfaceRole::Sand);
             if (bestSurface.hit) {
                 return bestSurface;
             }
@@ -1368,15 +1911,23 @@ RainCollisionHit TraceRainCollision(
     return {};
 }
 
-RainCollisionGpuData BuildRainCollisionGpuData(const RainCollisionCache& cache) {
+WaterSurfaceGpuData BuildWaterSurfaceGpuData(const WaterSurfaceCache& cache) {
     if (cache.gpuData.sourceRevision == cache.revision &&
         !cache.gpuData.surfaceTable.empty() && !cache.gpuData.vegetationTable.empty() &&
         !cache.gpuData.flowSurfaceTable.empty()) {
         auto gpu = cache.gpuData;
-        gpu.sourceIdentity = MakeWaterSurfaceCacheIdentity(cache, gpu);
+        if (!gpu.payloadChecksum.Valid()) {
+            gpu.payloadChecksum = CalculateWaterSurfacePayloadChecksum(cache, gpu);
+        }
+        if (!gpu.sourceIdentity.Valid() ||
+            gpu.sourceIdentity.sourceSignature != cache.signature) {
+            gpu.sourceIdentity = cache.schemaVersion == kWaterSurfaceCacheLegacySchemaVersion
+                ? MakeLegacyWaterSurfaceCacheIdentity(cache, gpu)
+                : MakeWaterSurfaceCacheIdentity(cache, gpu);
+        }
         return gpu;
     }
-    RainCollisionGpuData gpu;
+    WaterSurfaceGpuData gpu;
     gpu.sourceRevision = cache.revision;
     auto surfaceCapacity = RequiredHashCapacity(cache.surfaceCells.size());
     auto vegetationCapacity = RequiredHashCapacity(cache.vegetationVoxels.size());
@@ -1501,69 +2052,93 @@ RainCollisionGpuData BuildRainCollisionGpuData(const RainCollisionCache& cache) 
         }
         flowSurfaceCapacity *= 2U;
     }
+    gpu.payloadChecksum = CalculateWaterSurfacePayloadChecksum(cache, gpu);
     gpu.sourceIdentity = MakeWaterSurfaceCacheIdentity(cache, gpu);
     return gpu;
-}
-
-std::string WaterSurfaceCacheSignature(
-    std::span<const WaterSurfaceSource> sources,
-    float resolutionMeters) {
-    return RainCollisionCacheSignature(sources, resolutionMeters);
-}
-
-std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
-    const scene::ScenePointCloudGroup& group,
-    std::uint32_t preferredSpacingMicrometres) {
-    return SelectRainCollisionSources(group, preferredSpacingMicrometres);
 }
 
 std::filesystem::path WaterSurfaceCachePath(
     const std::filesystem::path& cacheRoot,
     std::string_view signature) {
-    return RainCollisionCachePath(cacheRoot, signature);
+    return cacheRoot / ".invisible_places" / "cache" / "water" /
+           (std::string{signature} + ".surfacecache");
 }
 
-WaterSurfaceBuildResult BuildWaterSurfaceCache(
-    std::span<const WaterSurfaceSource> sources,
-    const std::filesystem::path& cacheRoot,
-    const std::atomic_bool* cancelRequested) {
-    return BuildRainCollisionCache(sources, cacheRoot, cancelRequested);
+std::filesystem::path WaterSurfaceSceneCacheDirectory(
+    const std::filesystem::path& sceneDirectory) {
+    return sceneDirectory / ".invisible_places" / "cache" / "water";
 }
 
-WaterSurfaceCache BuildWaterSurfaceCacheFromSamples(
-    std::span<const WaterSurfaceSample> samples,
-    float resolutionMeters) {
-    return BuildRainCollisionCacheFromSamples(samples, resolutionMeters);
+std::filesystem::path WaterSurfaceSceneCachePath(
+    const std::filesystem::path& sceneDirectory,
+    std::string_view signature) {
+    return WaterSurfaceSceneCacheDirectory(sceneDirectory) /
+           (std::string{signature} + ".surfacecache");
 }
 
-bool SaveWaterSurfaceCache(
+std::uint64_t WaterSurfaceCacheEstimatedPersistenceBytes(
+    const WaterSurfaceCache& cache) {
+    const bool hasGpuTables =
+        cache.gpuData.sourceRevision == cache.revision &&
+        !cache.gpuData.surfaceTable.empty() &&
+        !cache.gpuData.vegetationTable.empty() &&
+        !cache.gpuData.flowSurfaceTable.empty();
+    const auto surfaceCount = hasGpuTables
+        ? static_cast<std::uint64_t>(cache.gpuData.surfaceTable.size())
+        : static_cast<std::uint64_t>(RequiredHashCapacity(cache.surfaceCells.size()));
+    const auto vegetationCount = hasGpuTables
+        ? static_cast<std::uint64_t>(cache.gpuData.vegetationTable.size())
+        : static_cast<std::uint64_t>(RequiredHashCapacity(cache.vegetationVoxels.size()));
+    const auto flowSurfaceCount = hasGpuTables
+        ? static_cast<std::uint64_t>(cache.gpuData.flowSurfaceTable.size())
+        : static_cast<std::uint64_t>(RequiredFlowHashCapacity(cache.flowSurfaceSurfels.size()));
+    return WaterSurfaceCachePersistenceBytes(
+        cache,
+        surfaceCount,
+        vegetationCount,
+        flowSurfaceCount);
+}
+
+bool WaterSurfaceCacheFitsPersistenceLimit(
     const WaterSurfaceCache& cache,
-    const std::filesystem::path& filePath,
-    std::string* errorMessage) {
-    return SaveRainCollisionCache(cache, filePath, errorMessage);
+    std::uint64_t maximumBytes) {
+    return WaterSurfaceCachePersistenceSizeAllowed(
+        WaterSurfaceCacheEstimatedPersistenceBytes(cache),
+        maximumBytes);
 }
 
-bool LoadWaterSurfaceCache(
-    const std::filesystem::path& filePath,
-    std::string_view expectedSignature,
-    WaterSurfaceCache* cache,
-    std::string* errorMessage) {
-    return LoadRainCollisionCache(filePath, expectedSignature, cache, errorMessage);
-}
-
-WaterSurfaceGpuData BuildWaterSurfaceGpuData(const WaterSurfaceCache& cache) {
-    return BuildRainCollisionGpuData(cache);
+bool WaterSurfaceCachePersistenceSizeAllowed(
+    std::uintmax_t byteCount,
+    std::uint64_t maximumBytes) {
+    return byteCount <= static_cast<std::uintmax_t>(maximumBytes);
 }
 
 WaterSurfaceCacheIdentity BuildWaterSurfaceCacheIdentity(
     const WaterSurfaceCache& cache) {
+    if (cache.cacheIdentity.Valid() &&
+        cache.cacheIdentity.sourceSignature == cache.signature &&
+        cache.gpuData.sourceRevision == cache.revision &&
+        cache.gpuData.sourceIdentity == cache.cacheIdentity) {
+        return cache.cacheIdentity;
+    }
     if (cache.gpuData.sourceRevision == cache.revision &&
         !cache.gpuData.surfaceTable.empty() &&
         !cache.gpuData.vegetationTable.empty() &&
         !cache.gpuData.flowSurfaceTable.empty()) {
-        return MakeWaterSurfaceCacheIdentity(cache, cache.gpuData);
+        if (cache.schemaVersion == kWaterSurfaceCacheLegacySchemaVersion) {
+            return MakeLegacyWaterSurfaceCacheIdentity(cache, cache.gpuData);
+        }
+        auto checksum = cache.gpuData.payloadChecksum;
+        if (!checksum.Valid()) {
+            checksum = CalculateWaterSurfacePayloadChecksum(cache, cache.gpuData);
+        }
+        return MakeWaterSurfaceCacheIdentity(
+            cache,
+            cache.gpuData,
+            kWaterSurfaceCacheSchemaVersion,
+            &checksum);
     }
-    const auto gpuData = BuildRainCollisionGpuData(cache);
+    const auto gpuData = BuildWaterSurfaceGpuData(cache);
     return gpuData.sourceIdentity;
 }
 
@@ -1592,9 +2167,9 @@ WaterSurfaceQueryResult QueryWaterSurfaceCache(
         hasReference ? Scale(referenceNormal, 1.0F / referenceLength) : io::Float3{};
     const float maximumDistanceSquared = maximumDistanceMeters * maximumDistanceMeters;
     const float resolutionSquared = resolution * resolution;
-    constexpr std::array<RainCollisionRole, 2> roles{
-        RainCollisionRole::Rock,
-        RainCollisionRole::Sand,
+    constexpr std::array<WaterSurfaceRole, 2> roles{
+        WaterSurfaceRole::Rock,
+        WaterSurfaceRole::Sand,
     };
 
     for (std::int32_t cellZ = minimumCell.z; cellZ <= maximumCell.z; ++cellZ) {
@@ -1694,28 +2269,28 @@ void RainSimulator::EmitImpact(
     float lifetime = 1.0F;
     bool enabled = true;
     switch (hit.role) {
-        case RainCollisionRole::Sand:
+        case WaterSurfaceRole::Sand:
             enabled = frame.settings.sandEffectsEnabled;
             roleScale = frame.settings.sandEffectScale;
             radius = std::clamp(0.020F + dropWidth * 6.0F + impactSpeed * 0.0015F, 0.025F, 0.11F);
             lifetime = 0.48F + std::min(0.35F, impactSpeed * 0.018F);
             ++diagnostics->sandEvents;
             break;
-        case RainCollisionRole::Rock:
+        case WaterSurfaceRole::Rock:
             enabled = frame.settings.rockEffectsEnabled;
             roleScale = frame.settings.rockEffectScale;
             radius = std::clamp(0.028F + dropWidth * 10.0F + impactSpeed * 0.0020F, 0.035F, 0.16F);
             lifetime = 3.8F + std::min(2.2F, impactSpeed * 0.12F);
             ++diagnostics->rockEvents;
             break;
-        case RainCollisionRole::Vegetation:
+        case WaterSurfaceRole::Vegetation:
             enabled = frame.settings.vegetationEffectsEnabled;
             roleScale = frame.settings.vegetationEffectScale;
             radius = std::clamp(0.016F + dropWidth * 4.0F, 0.018F, 0.065F);
             lifetime = 1.1F + std::min(0.7F, impactSpeed * 0.045F);
             ++diagnostics->vegetationEvents;
             break;
-        case RainCollisionRole::None:
+        case WaterSurfaceRole::None:
             return;
     }
     if (!enabled) {
@@ -1741,7 +2316,7 @@ void RainSimulator::EmitImpact(
 
 RainSimulationDiagnostics RainSimulator::Advance(
     const RainSimulationFrame& frame,
-    const RainCollisionCache& collisionCache) {
+    const WaterSurfaceCache& surfaceCache) {
     RainSimulationDiagnostics diagnostics;
     if (frame.settings.seed != seed_ || frame.timeSeconds < previousTimeSeconds_) {
         Reset(frame.settings.seed);
@@ -1805,7 +2380,7 @@ RainSimulationDiagnostics RainSimulator::Advance(
         particle.visibility = std::clamp(front, 0.25F, 1.5F);
         ++diagnostics.activeParticles;
 
-        const auto hit = TraceRainCollision(collisionCache, particle.previousPosition, particle.position);
+        const auto hit = TraceRainCollision(surfaceCache, particle.previousPosition, particle.position);
         if (hit.hit) {
             ++diagnostics.collisionCount;
             if (frame.settings.impactEffectsEnabled) {
@@ -1819,12 +2394,12 @@ RainSimulationDiagnostics RainSimulator::Advance(
         const auto cameraOffset = Subtract(particle.position, frame.cameraPosition);
         const float cameraDistanceSquared = Dot(cameraOffset, cameraOffset);
         const float deathDistance = std::max(1.0F, frame.settings.cameraDeathDistanceMeters);
-        const bool outsideCache = collisionCache.bounds.valid &&
-            (particle.position.z < collisionCache.bounds.minimum.z - 1.0F ||
-             particle.position.x < collisionCache.bounds.minimum.x - deathDistance ||
-             particle.position.x > collisionCache.bounds.maximum.x + deathDistance ||
-             particle.position.y < collisionCache.bounds.minimum.y - deathDistance ||
-             particle.position.y > collisionCache.bounds.maximum.y + deathDistance);
+        const bool outsideCache = surfaceCache.bounds.valid &&
+            (particle.position.z < surfaceCache.bounds.minimum.z - 1.0F ||
+             particle.position.x < surfaceCache.bounds.minimum.x - deathDistance ||
+             particle.position.x > surfaceCache.bounds.maximum.x + deathDistance ||
+             particle.position.y < surfaceCache.bounds.minimum.y - deathDistance ||
+             particle.position.y > surfaceCache.bounds.maximum.y + deathDistance);
         if (outsideCache || cameraDistanceSquared > deathDistance * deathDistance) {
             ++diagnostics.escapedParticles;
             SpawnParticle(index, frame);
@@ -1868,25 +2443,25 @@ RainImpactGrid BuildRainImpactGrid(
                 auto& cell = grid.cells[static_cast<std::size_t>(y) * grid.dimension + static_cast<std::size_t>(x)];
                 bool inserted = false;
                 switch (event.role) {
-                    case RainCollisionRole::Sand:
+                    case WaterSurfaceRole::Sand:
                         if (cell.sandCount < cell.sand.size()) {
                             cell.sand[cell.sandCount++] = eventIndex;
                             inserted = true;
                         }
                         break;
-                    case RainCollisionRole::Rock:
+                    case WaterSurfaceRole::Rock:
                         if (cell.rockCount < cell.rock.size()) {
                             cell.rock[cell.rockCount++] = eventIndex;
                             inserted = true;
                         }
                         break;
-                    case RainCollisionRole::Vegetation:
+                    case WaterSurfaceRole::Vegetation:
                         if (cell.vegetationCount < cell.vegetation.size()) {
                             cell.vegetation[cell.vegetationCount++] = eventIndex;
                             inserted = true;
                         }
                         break;
-                    case RainCollisionRole::None:
+                    case WaterSurfaceRole::None:
                         break;
                 }
                 if (!inserted) {
@@ -1900,12 +2475,12 @@ RainImpactGrid BuildRainImpactGrid(
 
 RainImpactEffect EvaluateRainImpact(
     const RainImpactGrid& grid,
-    RainCollisionRole pointRole,
+    WaterSurfaceRole pointRole,
     const io::Float3& point,
     const io::Float3& normal,
     float timeSeconds) {
     RainImpactEffect effect;
-    if (pointRole == RainCollisionRole::None || grid.cells.empty()) {
+    if (pointRole == WaterSurfaceRole::None || grid.cells.empty()) {
         return effect;
     }
     const auto cellX = static_cast<std::int32_t>(std::floor((point.x - grid.origin.x) / grid.cellSizeMeters));
@@ -1922,14 +2497,14 @@ RainImpactEffect EvaluateRainImpact(
         const float age = timeSeconds - event.birthTimeSeconds;
         const float life = std::clamp(age / std::max(0.001F, event.lifetimeSeconds), 0.0F, 1.0F);
         float value = 0.0F;
-        if (pointRole == RainCollisionRole::Sand) {
+        if (pointRole == WaterSurfaceRole::Sand) {
             const float distance = std::hypot(point.x - event.position.x, point.y - event.position.y);
             const float ringRadius = event.radiusMeters * (0.12F + 0.88F * life);
             const float thickness = std::max(0.003F, event.radiusMeters * 0.14F);
             const float ringDistance = std::abs(distance - ringRadius);
             value = std::exp(-(ringDistance * ringDistance) / (thickness * thickness)) *
                     SmoothStep(1.0F, 0.72F, life);
-        } else if (pointRole == RainCollisionRole::Rock) {
+        } else if (pointRole == WaterSurfaceRole::Rock) {
             const auto offset = Subtract(point, event.position);
             const auto eventNormal = Normalize(event.normal);
             const float normalDistance = std::abs(Dot(offset, eventNormal));
@@ -1945,28 +2520,28 @@ RainImpactEffect EvaluateRainImpact(
                          growth + edgeWidth,
                          normalizedDistance)) *
                     (1.0F - SmoothStep(0.55F, 1.0F, life));
-        } else if (pointRole == RainCollisionRole::Vegetation) {
+        } else if (pointRole == WaterSurfaceRole::Vegetation) {
             value = EvaluateVegetationSprinkle(event, point, age);
         }
         value *= event.energy;
-        const bool vegetation = pointRole == RainCollisionRole::Vegetation;
+        const bool vegetation = pointRole == WaterSurfaceRole::Vegetation;
         effect.opacity = std::max(effect.opacity, value * (vegetation ? 0.08F : 0.18F));
-        effect.emission = std::max(effect.emission, value * (pointRole == RainCollisionRole::Vegetation ? 0.24F : 0.11F));
+        effect.emission = std::max(effect.emission, value * (pointRole == WaterSurfaceRole::Vegetation ? 0.24F : 0.11F));
         effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * (vegetation ? 0.07F : 0.16F));
         effect.colourBlend = std::max(
             effect.colourBlend,
-            value * (pointRole == RainCollisionRole::Rock ? 0.42F : (vegetation ? 0.09F : 0.20F)));
+            value * (pointRole == WaterSurfaceRole::Rock ? 0.42F : (vegetation ? 0.09F : 0.20F)));
     };
 
-    if (pointRole == RainCollisionRole::Sand) {
+    if (pointRole == WaterSurfaceRole::Sand) {
         for (std::uint32_t index = 0; index < cell.sandCount; ++index) {
             evaluateEvent(grid.events[cell.sand[index]]);
         }
-    } else if (pointRole == RainCollisionRole::Rock) {
+    } else if (pointRole == WaterSurfaceRole::Rock) {
         for (std::uint32_t index = 0; index < cell.rockCount; ++index) {
             evaluateEvent(grid.events[cell.rock[index]]);
         }
-    } else if (pointRole == RainCollisionRole::Vegetation) {
+    } else if (pointRole == WaterSurfaceRole::Vegetation) {
         for (std::uint32_t index = 0; index < cell.vegetationCount; ++index) {
             evaluateEvent(grid.events[cell.vegetation[index]]);
         }

@@ -127,7 +127,12 @@ layout(set = 0, binding = 16, std430) readonly buffer SeepageNodeParamsBuffer {
 bool HasSparseRippleEffects() {
     return styleData.rippleEffectSlots3.x != 0u &&
            styleData.rippleEffectSlots3.y != 0u &&
-           styleData.rippleEffectSlots3.z != 0u;
+           styleData.rippleEffectSlots3.z != 0u &&
+           styleData.pointMeta.x <= uint(sparseRippleRangeData.sparseRippleRanges.length()) &&
+           styleData.rippleEffectSlots3.y <=
+               uint(sparseRippleMembershipData.sparseRippleMemberships.length()) &&
+           styleData.rippleEffectSlots3.z <=
+               uint(sparseRippleParamData.sparseRippleParams.length());
 }
 
 bool HasShorelineWaveEffect() {
@@ -142,6 +147,11 @@ bool HasSeepageEffect() {
            styleData.seepageControl.y != 0u &&
            styleData.seepageControl.z != 0u &&
            styleData.seepageControl.w != 0u &&
+           styleData.seepageControl.y <= uint(seepageNodeData.seepageNodes.length()) &&
+           styleData.seepageControl.y <= uint(seepageParamData.seepageParams.length()) &&
+           styleData.seepageControl.z <= uint(seepageHashCellData.seepageHashCells.length()) &&
+           styleData.seepageControl.w <=
+               uint(seepageNodeReferenceData.seepageNodeReferences.length()) &&
            styleData.seepageGridParams.x > 1e-6;
 }
 

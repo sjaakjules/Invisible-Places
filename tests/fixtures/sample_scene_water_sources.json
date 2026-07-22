@@ -1,0 +1,1895 @@
+{
+  "schema_version": 17,
+  "fixture_metadata": {
+    "scene_group": "SampleScene",
+    "display_spacing_micrometres": 3000,
+    "water_surface_cache_spacing_micrometres": 5000,
+    "derived_caches_included": false,
+    "canonical_object_names": [
+      "SampleFlowPoint",
+      "SampleFlowPath",
+      "SampleSeepage"
+    ]
+  },
+  "water_source_settings": {
+    "path_generation": {
+      "attractor_enabled": false,
+      "attractor_position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "attractor_strength": 0.0,
+      "auto_tune": true,
+      "branching": 1.0,
+      "coverage": 0.9100000262260437,
+      "gap_tolerance": 0.9399999976158142,
+      "max_bridge_distance": 0.5669999718666077,
+      "max_steps": 20000,
+      "path_length": 17.299999237060547,
+      "path_sample_spacing": 0.012000000104308128,
+      "smoothing": 0.8999999761581421,
+      "support_sample_limit": 261946,
+      "support_voxel_size": 0.009999999776482582
+    },
+    "trail_shape": {
+      "normal_turbulence_response": 1.659999966621399,
+      "particle_jitter": 0.12999999523162842,
+      "spline_anchor_spacing": 0.20999999344348907,
+      "trail_lane_count": 7,
+      "trail_looseness": 0.8669999837875366,
+      "trail_momentum": 0.9800000190734863,
+      "trail_smoothness": 0.550000011920929,
+      "trail_turbulence": 1.0800000429153442
+    }
+  },
+  "water_caustic_look_settings": {
+    "cell_size_meters": 0.05000000074505806,
+    "emission_boost": 1.600000023841858,
+    "enabled": true,
+    "feather_meters": 0.0010000000474974513,
+    "intensity": 0.27000001072883606,
+    "line_sharpness": 0.7407407760620117,
+    "line_width_meters": 0.003000000026077032,
+    "opacity_boost": 0.15000000596046448,
+    "point_size_boost": 0.0,
+    "scale": 20.0,
+    "speed": 0.550000011920929,
+    "surface_point_spacing_meters": 0.0010000000474974513,
+    "tint": [
+      1.0,
+      0.9572152495384216,
+      0.8047945499420166
+    ],
+    "warp": 2.440000057220459,
+    "warp_amplitude_meters": 0.061000000685453415
+  },
+  "water_flow_trail_settings": {
+    "downhill_pull": 0.3499999940395355,
+    "enabled": true,
+    "lane_count": 0,
+    "lane_crossing": 1.0,
+    "lane_spread_meters": 0.03999999910593033,
+    "path_attraction": 0.8500000238418579,
+    "seed": 0,
+    "speed_meters_per_second": 0.20000000298023224,
+    "surface_follow": 0.8500000238418579,
+    "surface_offset_meters": 0.004000000189989805,
+    "terrain_width_response": 0.6499999761581421,
+    "trail_count_total": 76,
+    "trail_length_meters": 0.23999999463558197,
+    "trail_looseness": 0.07999999821186066,
+    "trail_point_spacing_meters": 0.003000000026077032,
+    "trail_smoothness": 0.8500000238418579,
+    "trail_streak_length_meters": 0.02199999988079071,
+    "trail_width_meters": 0.004000000189989805,
+    "turbulence": 0.3499999940395355,
+    "turbulence_scale_meters": 0.18000000715255737
+  },
+  "water_trail_geometry": {
+    "point_spacing_meters": 0.003000000026077032,
+    "streak_length_meters": 0.02199999988079071,
+    "trail_length_meters": 0.23999999463558197,
+    "width_meters": 0.004000000189989805
+  },
+  "water_path_profiles": [],
+  "water_lane_profiles": [
+    {
+      "name": "DenseNarrow",
+      "settings": {
+        "downhill_pull": 0.3499999940395355,
+        "enabled": true,
+        "lane_count": 39,
+        "lane_crossing": 1.0,
+        "lane_spread_meters": 0.029999999329447746,
+        "path_attraction": 0.8500000238418579,
+        "seed": 37,
+        "speed_meters_per_second": 0.17000000178813934,
+        "surface_follow": 0.8500000238418579,
+        "surface_offset_meters": 0.004000000189989805,
+        "terrain_width_response": 0.6499999761581421,
+        "trail_count_total": 1100,
+        "trail_length_meters": 0.75,
+        "trail_looseness": 0.07999999821186066,
+        "trail_point_spacing_meters": 0.009999999776482582,
+        "trail_smoothness": 0.8500000238418579,
+        "trail_streak_length_meters": 0.04500000178813934,
+        "trail_width_meters": 0.006000000052154064,
+        "turbulence": 0.0,
+        "turbulence_scale_meters": 0.18000000715255737
+      }
+    },
+    {
+      "name": "Nice Flow",
+      "settings": {
+        "downhill_pull": 0.3499999940395355,
+        "enabled": true,
+        "lane_count": 24,
+        "lane_crossing": 0.9800000190734863,
+        "lane_spread_meters": 0.029999999329447746,
+        "path_attraction": 0.8500000238418579,
+        "seed": 13,
+        "speed_meters_per_second": 0.23999999463558197,
+        "surface_follow": 0.8500000238418579,
+        "surface_offset_meters": 0.004000000189989805,
+        "terrain_width_response": 0.6499999761581421,
+        "trail_count_total": 290,
+        "trail_length_meters": 0.75,
+        "trail_looseness": 0.07999999821186066,
+        "trail_point_spacing_meters": 0.009999999776482582,
+        "trail_smoothness": 0.8500000238418579,
+        "trail_streak_length_meters": 0.04500000178813934,
+        "trail_width_meters": 0.006000000052154064,
+        "turbulence": 0.49000000953674316,
+        "turbulence_scale_meters": 0.18000000715255737
+      }
+    },
+    {
+      "name": "Wide seep",
+      "settings": {
+        "downhill_pull": 0.3499999940395355,
+        "enabled": true,
+        "lane_count": 24,
+        "lane_crossing": 0.9800000190734863,
+        "lane_spread_meters": 0.17000000178813934,
+        "path_attraction": 0.8500000238418579,
+        "seed": 13,
+        "speed_meters_per_second": 0.23999999463558197,
+        "surface_follow": 0.8500000238418579,
+        "surface_offset_meters": 0.004000000189989805,
+        "terrain_width_response": 0.6499999761581421,
+        "trail_count_total": 290,
+        "trail_length_meters": 0.75,
+        "trail_looseness": 0.07999999821186066,
+        "trail_point_spacing_meters": 0.009999999776482582,
+        "trail_smoothness": 0.8500000238418579,
+        "trail_streak_length_meters": 0.04500000178813934,
+        "trail_width_meters": 0.006000000052154064,
+        "turbulence": 0.49000000953674316,
+        "turbulence_scale_meters": 0.18000000715255737
+      }
+    },
+    {
+      "name": "Trickle",
+      "settings": {
+        "downhill_pull": 0.3499999940395355,
+        "enabled": true,
+        "lane_count": 1,
+        "lane_crossing": 1.0,
+        "lane_spread_meters": 0.05000000074505806,
+        "path_attraction": 0.8500000238418579,
+        "seed": 13,
+        "speed_meters_per_second": 0.23999999463558197,
+        "surface_follow": 0.8500000238418579,
+        "surface_offset_meters": 0.02800000086426735,
+        "terrain_width_response": 0.6499999761581421,
+        "trail_count_total": 40,
+        "trail_length_meters": 0.75,
+        "trail_looseness": 0.07999999821186066,
+        "trail_point_spacing_meters": 0.009999999776482582,
+        "trail_smoothness": 0.8500000238418579,
+        "trail_streak_length_meters": 0.04500000178813934,
+        "trail_width_meters": 0.006000000052154064,
+        "turbulence": 0.6600000262260437,
+        "turbulence_scale_meters": 0.18000000715255737
+      }
+    }
+  ],
+  "water_trail_profiles": [
+    {
+      "geometry": {
+        "point_spacing_meters": 0.003000000026077032,
+        "streak_length_meters": 0.02199999988079071,
+        "trail_length_meters": 0.23999999463558197,
+        "width_meters": 0.004000000189989805
+      },
+      "name": "Water Flow",
+      "style": {
+        "brush_aspect": 2.200000047683716,
+        "caustic_animation": false,
+        "caustic_cell_size_meters": 0.20000000298023224,
+        "caustic_edge_field_slot": -1,
+        "caustic_emission_boost": 1.149999976158142,
+        "caustic_feather_meters": 0.006000000052154064,
+        "caustic_intensity": 0.0,
+        "caustic_line_sharpness": 0.7200000286102295,
+        "caustic_line_width_meters": 0.014999999664723873,
+        "caustic_mask_field_slot": -1,
+        "caustic_opacity_boost": 0.07999999821186066,
+        "caustic_point_size_boost": 0.0,
+        "caustic_scale": 4.0,
+        "caustic_seed_field_slot": -1,
+        "caustic_speed": 0.550000011920929,
+        "caustic_surface_point_spacing_meters": 0.004999999888241291,
+        "caustic_tint": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "caustic_warp": 0.3499999940395355,
+        "caustic_warp_amplitude_meters": 0.04500000178813934,
+        "color_mode": "source_rgb",
+        "colorize_amount": 0.0,
+        "colorize_color": [
+          0.05000000074505806,
+          0.8199999928474426,
+          1.0
+        ],
+        "colormap": "viridis",
+        "colormap_position": {
+          "active": true,
+          "constant_value": [
+            0.5,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "depth_fade": {
+          "active": false,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "emissive_strength": {
+          "active": false,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "wetness",
+            "field_slot": 20,
+            "flags": 1,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 0.3499999940395355,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "exposure": 1.7999999523162842,
+        "falloff_profile": "gaussian",
+        "feather_power": 1.600000023841858,
+        "flow_animation": true,
+        "gaussian_sharpness": 1.649999976158142,
+        "geometry_mode": "camera_facing_world_sprites",
+        "gradient_end_color": [
+          0.9599999785423279,
+          0.9399999976158142,
+          0.5799999833106995
+        ],
+        "gradient_start_color": [
+          0.05000000074505806,
+          0.2800000011920929,
+          0.949999988079071
+        ],
+        "granulation_angle_strength": 0.0,
+        "hatch_strength": 0.0,
+        "inner_radius": 0.550000011920929,
+        "npr_preset": "watercolor",
+        "opacity": {
+          "active": false,
+          "constant_value": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "stream_confidence",
+            "field_slot": 19,
+            "flags": 1,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 0.23999999463558197,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "pigment_animation_speed": 0.0,
+        "pigment_variation": 0.0,
+        "point_size": {
+          "active": true,
+          "constant_value": [
+            4.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "roughness_motion_ground_id": 1.0,
+        "roughness_motion_scale": 1.5,
+        "roughness_motion_speed": 0.3499999940395355,
+        "roughness_motion_strength": 0.0,
+        "roughness_motion_threshold": 0.5799999833106995,
+        "screen_sprite_size_mode": "pixels",
+        "shoreline_boundary_z": 1.5499999523162842,
+        "shoreline_colour": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "shoreline_colour_mix": 0.75,
+        "shoreline_density": 0.550000011920929,
+        "shoreline_direction": [
+          1.0,
+          0.0
+        ],
+        "shoreline_edge_fade_meters": 0.05000000074505806,
+        "shoreline_emission_add": 0.6499999761581421,
+        "shoreline_height_foam": {
+          "break_z": 1.2999999523162842,
+          "colour": [
+            0.6200000047683716,
+            0.8799999952316284,
+            1.0
+          ],
+          "colour_mix": 0.75,
+          "density": 0.550000011920929,
+          "direction": [
+            1.0,
+            0.0
+          ],
+          "edge_fade_meters": 0.05000000074505806,
+          "emission_add": 0.6499999761581421,
+          "incoming_strength": 1.0,
+          "intensity": 1.149999976158142,
+          "offshore_foam_strength": 0.30000001192092896,
+          "offshore_reach_meters": 0.550000011920929,
+          "opacity_add": 0.07999999821186066,
+          "opacity_multiply": 1.25,
+          "pattern_scale": 1.0,
+          "phase": 0.0,
+          "point_size_add": 0.0,
+          "point_size_multiply": 1.350000023841858,
+          "return_strength": 0.30000001192092896,
+          "runup_z": 1.5499999523162842,
+          "seed": 1,
+          "speed": 0.550000011920929,
+          "turbulence": 0.05999999865889549,
+          "warp": 0.3499999940395355,
+          "wavelength_meters": 0.25
+        },
+        "shoreline_height_reach_meters": 0.44999998807907104,
+        "shoreline_intensity": 1.149999976158142,
+        "shoreline_opacity_add": 0.07999999821186066,
+        "shoreline_opacity_multiply": 1.25,
+        "shoreline_pattern_scale": 1.0,
+        "shoreline_phase": 0.0,
+        "shoreline_point_size_add": 0.0,
+        "shoreline_point_size_multiply": 1.350000023841858,
+        "shoreline_seed": 1,
+        "shoreline_speed": 0.550000011920929,
+        "shoreline_turbulence": 0.05999999865889549,
+        "shoreline_warp": 0.3499999940395355,
+        "shoreline_wave_algorithm": "foam_fronts",
+        "shoreline_wave_enabled": false,
+        "shoreline_wavelength_meters": 0.25,
+        "solid_centers": true,
+        "solid_color": [
+          0.03999999910593033,
+          0.7400000095367432,
+          1.0,
+          1.0
+        ],
+        "stroke_jitter": 0.3499999940395355,
+        "stroke_opacity_variance": 0.25,
+        "stylisation_color_levels": 5.0,
+        "stylisation_ink_strength": 0.3499999940395355,
+        "stylisation_mode": "off",
+        "stylisation_paper_grain": 0.3499999940395355,
+        "stylisation_pigment_bleed": 0.44999998807907104,
+        "stylisation_strength": 1.0,
+        "surfel_diameter": {
+          "active": true,
+          "constant_value": [
+            0.004000000189989805,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "water_path_view": false,
+        "water_streak_aspect": 5.499999523162842,
+        "water_trail_overlay": true
+      }
+    },
+    {
+      "geometry": {
+        "point_spacing_meters": 0.003000000026077032,
+        "streak_length_meters": 0.02199999988079071,
+        "trail_length_meters": 0.23999999463558197,
+        "width_meters": 0.004000000189989805
+      },
+      "name": "Soft Mist Lines",
+      "style": {
+        "brush_aspect": 2.200000047683716,
+        "caustic_animation": false,
+        "caustic_cell_size_meters": 0.20000000298023224,
+        "caustic_edge_field_slot": -1,
+        "caustic_emission_boost": 1.149999976158142,
+        "caustic_feather_meters": 0.006000000052154064,
+        "caustic_intensity": 0.0,
+        "caustic_line_sharpness": 0.7200000286102295,
+        "caustic_line_width_meters": 0.014999999664723873,
+        "caustic_mask_field_slot": -1,
+        "caustic_opacity_boost": 0.07999999821186066,
+        "caustic_point_size_boost": 0.0,
+        "caustic_scale": 4.0,
+        "caustic_seed_field_slot": -1,
+        "caustic_speed": 0.550000011920929,
+        "caustic_surface_point_spacing_meters": 0.004999999888241291,
+        "caustic_tint": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "caustic_warp": 0.3499999940395355,
+        "caustic_warp_amplitude_meters": 0.04500000178813934,
+        "color_mode": "scalar_colormap",
+        "colorize_amount": 1.0,
+        "colorize_color": [
+          0.7054794430732727,
+          0.5902052521705627,
+          0.5097813606262207
+        ],
+        "colormap": "custom_gradient",
+        "colormap_position": {
+          "active": true,
+          "constant_value": [
+            0.5,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "trail_age",
+            "field_slot": 13,
+            "flags": 5,
+            "gamma": 0.9012500047683716,
+            "input_max": 0.9795918464660645,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "depth_fade": {
+          "active": false,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "emissive_strength": {
+          "active": true,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "jitter_seed",
+            "field_slot": 12,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 0.999992847442627,
+            "input_min": 0.00014865399862173945,
+            "output_max": 1.0824999809265137,
+            "output_min": 0.18000000715255737
+          },
+          "mode": "field_mapped"
+        },
+        "exposure": 1.4500000476837158,
+        "falloff_profile": "gaussian",
+        "feather_power": 1.600000023841858,
+        "flow_animation": true,
+        "gaussian_sharpness": 16.0,
+        "geometry_mode": "camera_facing_world_sprites",
+        "gradient_end_color": [
+          0.9452054500579834,
+          0.9047650694847107,
+          0.7606961727142334
+        ],
+        "gradient_start_color": [
+          0.6780822277069092,
+          0.422719806432724,
+          0.1044989824295044
+        ],
+        "granulation_angle_strength": 0.0,
+        "hatch_strength": 0.0,
+        "inner_radius": 0.550000011920929,
+        "npr_preset": "watercolor",
+        "opacity": {
+          "active": true,
+          "constant_value": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "trail_age",
+            "field_slot": 13,
+            "flags": 1,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 0.04999999701976776,
+            "output_min": 0.21000000834465027
+          },
+          "mode": "field_mapped"
+        },
+        "pigment_animation_speed": 0.0,
+        "pigment_variation": 0.0,
+        "point_size": {
+          "active": true,
+          "constant_value": [
+            4.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "roughness_motion_ground_id": 1.0,
+        "roughness_motion_scale": 1.5,
+        "roughness_motion_speed": 0.3499999940395355,
+        "roughness_motion_strength": 0.0,
+        "roughness_motion_threshold": 0.5799999833106995,
+        "screen_sprite_size_mode": "pixels",
+        "shoreline_boundary_z": 1.5499999523162842,
+        "shoreline_colour": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "shoreline_colour_mix": 0.75,
+        "shoreline_density": 0.550000011920929,
+        "shoreline_direction": [
+          1.0,
+          0.0
+        ],
+        "shoreline_edge_fade_meters": 0.05000000074505806,
+        "shoreline_emission_add": 0.6499999761581421,
+        "shoreline_height_foam": {
+          "break_z": 1.2999999523162842,
+          "colour": [
+            0.6200000047683716,
+            0.8799999952316284,
+            1.0
+          ],
+          "colour_mix": 0.75,
+          "density": 0.550000011920929,
+          "direction": [
+            1.0,
+            0.0
+          ],
+          "edge_fade_meters": 0.05000000074505806,
+          "emission_add": 0.6499999761581421,
+          "incoming_strength": 1.0,
+          "intensity": 1.149999976158142,
+          "offshore_foam_strength": 0.30000001192092896,
+          "offshore_reach_meters": 0.550000011920929,
+          "opacity_add": 0.07999999821186066,
+          "opacity_multiply": 1.25,
+          "pattern_scale": 1.0,
+          "phase": 0.0,
+          "point_size_add": 0.0,
+          "point_size_multiply": 1.350000023841858,
+          "return_strength": 0.30000001192092896,
+          "runup_z": 1.5499999523162842,
+          "seed": 1,
+          "speed": 0.550000011920929,
+          "turbulence": 0.05999999865889549,
+          "warp": 0.3499999940395355,
+          "wavelength_meters": 0.25
+        },
+        "shoreline_height_reach_meters": 0.44999998807907104,
+        "shoreline_intensity": 1.149999976158142,
+        "shoreline_opacity_add": 0.07999999821186066,
+        "shoreline_opacity_multiply": 1.25,
+        "shoreline_pattern_scale": 1.0,
+        "shoreline_phase": 0.0,
+        "shoreline_point_size_add": 0.0,
+        "shoreline_point_size_multiply": 1.350000023841858,
+        "shoreline_seed": 1,
+        "shoreline_speed": 0.550000011920929,
+        "shoreline_turbulence": 0.05999999865889549,
+        "shoreline_warp": 0.3499999940395355,
+        "shoreline_wave_algorithm": "foam_fronts",
+        "shoreline_wave_enabled": false,
+        "shoreline_wavelength_meters": 0.25,
+        "solid_centers": false,
+        "solid_color": [
+          0.8199999928474426,
+          0.9100000262260437,
+          1.0,
+          1.0
+        ],
+        "stroke_jitter": 0.3499999940395355,
+        "stroke_opacity_variance": 0.25,
+        "stylisation_color_levels": 5.0,
+        "stylisation_ink_strength": 0.3499999940395355,
+        "stylisation_mode": "off",
+        "stylisation_paper_grain": 0.3499999940395355,
+        "stylisation_pigment_bleed": 0.44999998807907104,
+        "stylisation_strength": 1.0,
+        "surfel_diameter": {
+          "active": true,
+          "constant_value": [
+            0.004000000189989805,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "water_path_view": false,
+        "water_streak_aspect": 5.499999523162842,
+        "water_trail_overlay": true
+      }
+    },
+    {
+      "geometry": {
+        "point_spacing_meters": 0.008249999955296516,
+        "streak_length_meters": 0.03749999776482582,
+        "trail_length_meters": 0.5600000023841858,
+        "width_meters": 0.004999999888241291
+      },
+      "name": "White Needle Glow",
+      "style": {
+        "brush_aspect": 2.200000047683716,
+        "caustic_animation": false,
+        "caustic_cell_size_meters": 0.20000000298023224,
+        "caustic_edge_field_slot": -1,
+        "caustic_emission_boost": 1.149999976158142,
+        "caustic_feather_meters": 0.006000000052154064,
+        "caustic_intensity": 0.0,
+        "caustic_line_sharpness": 0.7200000286102295,
+        "caustic_line_width_meters": 0.014999999664723873,
+        "caustic_mask_field_slot": -1,
+        "caustic_opacity_boost": 0.07999999821186066,
+        "caustic_point_size_boost": 0.0,
+        "caustic_scale": 4.0,
+        "caustic_seed_field_slot": -1,
+        "caustic_speed": 0.550000011920929,
+        "caustic_surface_point_spacing_meters": 0.004999999888241291,
+        "caustic_tint": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "caustic_warp": 0.3499999940395355,
+        "caustic_warp_amplitude_meters": 0.04500000178813934,
+        "color_mode": "solid_color",
+        "colorize_amount": 0.0,
+        "colorize_color": [
+          0.9200000166893005,
+          0.9800000190734863,
+          1.0
+        ],
+        "colormap": "viridis",
+        "colormap_position": {
+          "active": true,
+          "constant_value": [
+            0.5,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "depth_fade": {
+          "active": false,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "emissive_strength": {
+          "active": true,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "wetness",
+            "field_slot": 20,
+            "flags": 1,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 2.200000047683716,
+            "output_min": 0.8500000238418579
+          },
+          "mode": "field_mapped"
+        },
+        "exposure": 2.1500000953674316,
+        "falloff_profile": "gaussian",
+        "feather_power": 1.600000023841858,
+        "flow_animation": true,
+        "gaussian_sharpness": 2.3499999046325684,
+        "geometry_mode": "camera_facing_world_sprites",
+        "gradient_end_color": [
+          0.9599999785423279,
+          0.9399999976158142,
+          0.5799999833106995
+        ],
+        "gradient_start_color": [
+          0.05000000074505806,
+          0.2800000011920929,
+          0.949999988079071
+        ],
+        "granulation_angle_strength": 0.0,
+        "hatch_strength": 0.0,
+        "inner_radius": 0.550000011920929,
+        "npr_preset": "watercolor",
+        "opacity": {
+          "active": true,
+          "constant_value": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "point_age",
+            "field_slot": 14,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 0.014999999664723873,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "pigment_animation_speed": 0.0,
+        "pigment_variation": 0.0,
+        "point_size": {
+          "active": true,
+          "constant_value": [
+            5.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "roughness_motion_ground_id": 1.0,
+        "roughness_motion_scale": 1.5,
+        "roughness_motion_speed": 0.3499999940395355,
+        "roughness_motion_strength": 0.0,
+        "roughness_motion_threshold": 0.5799999833106995,
+        "screen_sprite_size_mode": "pixels",
+        "shoreline_boundary_z": 1.5499999523162842,
+        "shoreline_colour": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "shoreline_colour_mix": 0.75,
+        "shoreline_density": 0.550000011920929,
+        "shoreline_direction": [
+          1.0,
+          0.0
+        ],
+        "shoreline_edge_fade_meters": 0.05000000074505806,
+        "shoreline_emission_add": 0.6499999761581421,
+        "shoreline_height_foam": {
+          "break_z": 1.2999999523162842,
+          "colour": [
+            0.6200000047683716,
+            0.8799999952316284,
+            1.0
+          ],
+          "colour_mix": 0.75,
+          "density": 0.550000011920929,
+          "direction": [
+            1.0,
+            0.0
+          ],
+          "edge_fade_meters": 0.05000000074505806,
+          "emission_add": 0.6499999761581421,
+          "incoming_strength": 1.0,
+          "intensity": 1.149999976158142,
+          "offshore_foam_strength": 0.30000001192092896,
+          "offshore_reach_meters": 0.550000011920929,
+          "opacity_add": 0.07999999821186066,
+          "opacity_multiply": 1.25,
+          "pattern_scale": 1.0,
+          "phase": 0.0,
+          "point_size_add": 0.0,
+          "point_size_multiply": 1.350000023841858,
+          "return_strength": 0.30000001192092896,
+          "runup_z": 1.5499999523162842,
+          "seed": 1,
+          "speed": 0.550000011920929,
+          "turbulence": 0.05999999865889549,
+          "warp": 0.3499999940395355,
+          "wavelength_meters": 0.25
+        },
+        "shoreline_height_reach_meters": 0.44999998807907104,
+        "shoreline_intensity": 1.149999976158142,
+        "shoreline_opacity_add": 0.07999999821186066,
+        "shoreline_opacity_multiply": 1.25,
+        "shoreline_pattern_scale": 1.0,
+        "shoreline_phase": 0.0,
+        "shoreline_point_size_add": 0.0,
+        "shoreline_point_size_multiply": 1.350000023841858,
+        "shoreline_seed": 1,
+        "shoreline_speed": 0.550000011920929,
+        "shoreline_turbulence": 0.05999999865889549,
+        "shoreline_warp": 0.3499999940395355,
+        "shoreline_wave_algorithm": "foam_fronts",
+        "shoreline_wave_enabled": false,
+        "shoreline_wavelength_meters": 0.25,
+        "solid_centers": false,
+        "solid_color": [
+          0.9599999785423279,
+          0.9800000190734863,
+          1.0,
+          1.0
+        ],
+        "stroke_jitter": 0.3499999940395355,
+        "stroke_opacity_variance": 0.25,
+        "stylisation_color_levels": 5.0,
+        "stylisation_ink_strength": 0.3499999940395355,
+        "stylisation_mode": "off",
+        "stylisation_paper_grain": 0.3499999940395355,
+        "stylisation_pigment_bleed": 0.44999998807907104,
+        "stylisation_strength": 1.0,
+        "surfel_diameter": {
+          "active": true,
+          "constant_value": [
+            0.004999999888241291,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "water_path_view": false,
+        "water_streak_aspect": 7.499999523162842,
+        "water_trail_overlay": true
+      }
+    },
+    {
+      "geometry": {
+        "point_spacing_meters": 0.008249999955296516,
+        "streak_length_meters": 0.03749999776482582,
+        "trail_length_meters": 0.5600000023841858,
+        "width_meters": 0.004999999888241291
+      },
+      "name": "StreamFlow Good",
+      "style": {
+        "brush_aspect": 2.200000047683716,
+        "caustic_animation": false,
+        "caustic_cell_size_meters": 0.20000000298023224,
+        "caustic_edge_field_slot": -1,
+        "caustic_emission_boost": 1.149999976158142,
+        "caustic_feather_meters": 0.006000000052154064,
+        "caustic_intensity": 0.0,
+        "caustic_line_sharpness": 0.7200000286102295,
+        "caustic_line_width_meters": 0.014999999664723873,
+        "caustic_mask_field_slot": -1,
+        "caustic_opacity_boost": 0.07999999821186066,
+        "caustic_point_size_boost": 0.0,
+        "caustic_scale": 4.0,
+        "caustic_seed_field_slot": -1,
+        "caustic_speed": 0.550000011920929,
+        "caustic_surface_point_spacing_meters": 0.004999999888241291,
+        "caustic_tint": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "caustic_warp": 0.3499999940395355,
+        "caustic_warp_amplitude_meters": 0.04500000178813934,
+        "color_mode": "solid_color",
+        "colorize_amount": 0.0,
+        "colorize_color": [
+          0.9200000166893005,
+          0.9800000190734863,
+          1.0
+        ],
+        "colormap": "viridis",
+        "colormap_position": {
+          "active": true,
+          "constant_value": [
+            0.5,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "depth_fade": {
+          "active": false,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "emissive_strength": {
+          "active": true,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "wetness",
+            "field_slot": 20,
+            "flags": 1,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 2.200000047683716,
+            "output_min": 0.8500000238418579
+          },
+          "mode": "field_mapped"
+        },
+        "exposure": 2.1500000953674316,
+        "falloff_profile": "gaussian",
+        "feather_power": 1.600000023841858,
+        "flow_animation": true,
+        "gaussian_sharpness": 2.3499999046325684,
+        "geometry_mode": "camera_facing_world_sprites",
+        "gradient_end_color": [
+          0.9599999785423279,
+          0.9399999976158142,
+          0.5799999833106995
+        ],
+        "gradient_start_color": [
+          0.05000000074505806,
+          0.2800000011920929,
+          0.949999988079071
+        ],
+        "granulation_angle_strength": 0.0,
+        "hatch_strength": 0.0,
+        "inner_radius": 0.550000011920929,
+        "npr_preset": "watercolor",
+        "opacity": {
+          "active": true,
+          "constant_value": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "point_age",
+            "field_slot": 14,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 0.014999999664723873,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "pigment_animation_speed": 0.0,
+        "pigment_variation": 0.0,
+        "point_size": {
+          "active": true,
+          "constant_value": [
+            5.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "roughness_motion_ground_id": 1.0,
+        "roughness_motion_scale": 1.5,
+        "roughness_motion_speed": 0.3499999940395355,
+        "roughness_motion_strength": 0.0,
+        "roughness_motion_threshold": 0.5799999833106995,
+        "screen_sprite_size_mode": "pixels",
+        "shoreline_boundary_z": 1.5499999523162842,
+        "shoreline_colour": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "shoreline_colour_mix": 0.75,
+        "shoreline_density": 0.550000011920929,
+        "shoreline_direction": [
+          1.0,
+          0.0
+        ],
+        "shoreline_edge_fade_meters": 0.05000000074505806,
+        "shoreline_emission_add": 0.6499999761581421,
+        "shoreline_height_foam": {
+          "break_z": 1.2999999523162842,
+          "colour": [
+            0.6200000047683716,
+            0.8799999952316284,
+            1.0
+          ],
+          "colour_mix": 0.75,
+          "density": 0.550000011920929,
+          "direction": [
+            1.0,
+            0.0
+          ],
+          "edge_fade_meters": 0.05000000074505806,
+          "emission_add": 0.6499999761581421,
+          "incoming_strength": 1.0,
+          "intensity": 1.149999976158142,
+          "offshore_foam_strength": 0.30000001192092896,
+          "offshore_reach_meters": 0.550000011920929,
+          "opacity_add": 0.07999999821186066,
+          "opacity_multiply": 1.25,
+          "pattern_scale": 1.0,
+          "phase": 0.0,
+          "point_size_add": 0.0,
+          "point_size_multiply": 1.350000023841858,
+          "return_strength": 0.30000001192092896,
+          "runup_z": 1.5499999523162842,
+          "seed": 1,
+          "speed": 0.550000011920929,
+          "turbulence": 0.05999999865889549,
+          "warp": 0.3499999940395355,
+          "wavelength_meters": 0.25
+        },
+        "shoreline_height_reach_meters": 0.44999998807907104,
+        "shoreline_intensity": 1.149999976158142,
+        "shoreline_opacity_add": 0.07999999821186066,
+        "shoreline_opacity_multiply": 1.25,
+        "shoreline_pattern_scale": 1.0,
+        "shoreline_phase": 0.0,
+        "shoreline_point_size_add": 0.0,
+        "shoreline_point_size_multiply": 1.350000023841858,
+        "shoreline_seed": 1,
+        "shoreline_speed": 0.550000011920929,
+        "shoreline_turbulence": 0.05999999865889549,
+        "shoreline_warp": 0.3499999940395355,
+        "shoreline_wave_algorithm": "foam_fronts",
+        "shoreline_wave_enabled": false,
+        "shoreline_wavelength_meters": 0.25,
+        "solid_centers": false,
+        "solid_color": [
+          0.9599999785423279,
+          0.9800000190734863,
+          1.0,
+          1.0
+        ],
+        "stroke_jitter": 0.3499999940395355,
+        "stroke_opacity_variance": 0.25,
+        "stylisation_color_levels": 5.0,
+        "stylisation_ink_strength": 0.3499999940395355,
+        "stylisation_mode": "off",
+        "stylisation_paper_grain": 0.3499999940395355,
+        "stylisation_pigment_bleed": 0.44999998807907104,
+        "stylisation_strength": 1.0,
+        "surfel_diameter": {
+          "active": true,
+          "constant_value": [
+            0.004999999888241291,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "water_path_view": false,
+        "water_streak_aspect": 7.499999523162842,
+        "water_trail_overlay": true
+      }
+    },
+    {
+      "geometry": {
+        "point_spacing_meters": 0.008249999955296516,
+        "streak_length_meters": 0.03749999776482582,
+        "trail_length_meters": 0.8799999952316284,
+        "width_meters": 0.004999999888241291
+      },
+      "name": "StreamFlow ver2",
+      "style": {
+        "brush_aspect": 2.200000047683716,
+        "caustic_animation": false,
+        "caustic_cell_size_meters": 0.20000000298023224,
+        "caustic_edge_field_slot": -1,
+        "caustic_emission_boost": 1.149999976158142,
+        "caustic_feather_meters": 0.006000000052154064,
+        "caustic_intensity": 0.0,
+        "caustic_line_sharpness": 0.7200000286102295,
+        "caustic_line_width_meters": 0.014999999664723873,
+        "caustic_mask_field_slot": -1,
+        "caustic_opacity_boost": 0.07999999821186066,
+        "caustic_point_size_boost": 0.0,
+        "caustic_scale": 4.0,
+        "caustic_seed_field_slot": -1,
+        "caustic_speed": 0.550000011920929,
+        "caustic_surface_point_spacing_meters": 0.004999999888241291,
+        "caustic_tint": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "caustic_warp": 0.3499999940395355,
+        "caustic_warp_amplitude_meters": 0.04500000178813934,
+        "color_mode": "scalar_colormap",
+        "colorize_amount": 0.07000000029802322,
+        "colorize_color": [
+          0.9726027250289917,
+          0.9133093953132629,
+          0.5962187647819519
+        ],
+        "colormap": "custom_gradient",
+        "colormap_position": {
+          "active": true,
+          "constant_value": [
+            0.5,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "point_seed",
+            "field_slot": 6,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 0.9999450445175171,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "depth_fade": {
+          "active": false,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "emissive_strength": {
+          "active": true,
+          "constant_value": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "wetness",
+            "field_slot": 20,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 0.9601245522499084,
+            "input_min": 0.3499999940395355,
+            "output_max": 2.200000047683716,
+            "output_min": 0.8500000238418579
+          },
+          "mode": "field_mapped"
+        },
+        "exposure": 2.1500000953674316,
+        "falloff_profile": "gaussian",
+        "feather_power": 1.600000023841858,
+        "flow_animation": true,
+        "gaussian_sharpness": 2.3499999046325684,
+        "geometry_mode": "camera_facing_world_sprites",
+        "gradient_end_color": [
+          0.5799999237060547,
+          0.6945206522941589,
+          0.9599999785423279
+        ],
+        "gradient_start_color": [
+          0.050000034272670746,
+          0.7280821800231934,
+          0.949999988079071
+        ],
+        "granulation_angle_strength": 0.0,
+        "hatch_strength": 0.0,
+        "inner_radius": 0.550000011920929,
+        "npr_preset": "watercolor",
+        "opacity": {
+          "active": true,
+          "constant_value": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "point_age",
+            "field_slot": 14,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 0.014999999664723873,
+            "output_min": 0.0
+          },
+          "mode": "field_mapped"
+        },
+        "pigment_animation_speed": 0.0,
+        "pigment_variation": 0.0,
+        "point_size": {
+          "active": true,
+          "constant_value": [
+            5.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "roughness_motion_ground_id": 1.0,
+        "roughness_motion_scale": 1.5,
+        "roughness_motion_speed": 0.3499999940395355,
+        "roughness_motion_strength": 0.0,
+        "roughness_motion_threshold": 0.5799999833106995,
+        "screen_sprite_size_mode": "pixels",
+        "shoreline_boundary_z": 1.5499999523162842,
+        "shoreline_colour": [
+          0.6200000047683716,
+          0.8799999952316284,
+          1.0
+        ],
+        "shoreline_colour_mix": 0.75,
+        "shoreline_density": 0.550000011920929,
+        "shoreline_direction": [
+          1.0,
+          0.0
+        ],
+        "shoreline_edge_fade_meters": 0.05000000074505806,
+        "shoreline_emission_add": 0.6499999761581421,
+        "shoreline_height_foam": {
+          "break_z": 1.2999999523162842,
+          "colour": [
+            0.6200000047683716,
+            0.8799999952316284,
+            1.0
+          ],
+          "colour_mix": 0.75,
+          "density": 0.550000011920929,
+          "direction": [
+            1.0,
+            0.0
+          ],
+          "edge_fade_meters": 0.05000000074505806,
+          "emission_add": 0.6499999761581421,
+          "incoming_strength": 1.0,
+          "intensity": 1.149999976158142,
+          "offshore_foam_strength": 0.30000001192092896,
+          "offshore_reach_meters": 0.550000011920929,
+          "opacity_add": 0.07999999821186066,
+          "opacity_multiply": 1.25,
+          "pattern_scale": 1.0,
+          "phase": 0.0,
+          "point_size_add": 0.0,
+          "point_size_multiply": 1.350000023841858,
+          "return_strength": 0.30000001192092896,
+          "runup_z": 1.5499999523162842,
+          "seed": 1,
+          "speed": 0.550000011920929,
+          "turbulence": 0.05999999865889549,
+          "warp": 0.3499999940395355,
+          "wavelength_meters": 0.25
+        },
+        "shoreline_height_reach_meters": 0.44999998807907104,
+        "shoreline_intensity": 1.149999976158142,
+        "shoreline_opacity_add": 0.07999999821186066,
+        "shoreline_opacity_multiply": 1.25,
+        "shoreline_pattern_scale": 1.0,
+        "shoreline_phase": 0.0,
+        "shoreline_point_size_add": 0.0,
+        "shoreline_point_size_multiply": 1.350000023841858,
+        "shoreline_seed": 1,
+        "shoreline_speed": 0.550000011920929,
+        "shoreline_turbulence": 0.05999999865889549,
+        "shoreline_warp": 0.3499999940395355,
+        "shoreline_wave_algorithm": "foam_fronts",
+        "shoreline_wave_enabled": false,
+        "shoreline_wavelength_meters": 0.25,
+        "solid_centers": false,
+        "solid_color": [
+          0.9599999785423279,
+          0.9800000190734863,
+          1.0,
+          1.0
+        ],
+        "stroke_jitter": 0.3499999940395355,
+        "stroke_opacity_variance": 0.25,
+        "stylisation_color_levels": 5.0,
+        "stylisation_ink_strength": 0.3499999940395355,
+        "stylisation_mode": "off",
+        "stylisation_paper_grain": 0.3499999940395355,
+        "stylisation_pigment_bleed": 0.44999998807907104,
+        "stylisation_strength": 1.0,
+        "surfel_diameter": {
+          "active": true,
+          "constant_value": [
+            0.004999999888241291,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "field_map": {
+            "field_name": "",
+            "field_slot": -1,
+            "flags": 5,
+            "gamma": 1.0,
+            "input_max": 1.0,
+            "input_min": 0.0,
+            "output_max": 1.0,
+            "output_min": 0.0
+          },
+          "mode": "constant"
+        },
+        "water_path_view": false,
+        "water_streak_aspect": 7.499999523162842,
+        "water_trail_overlay": true
+      }
+    }
+  ],
+  "selected_water_path_profile": "Default_edited",
+  "selected_water_lane_profile": "Default",
+  "selected_water_trail_profile": "StreamFlow Good",
+  "water_field_settings": {
+    "bridge_aggression": 0.44999998807907104,
+    "corridor_radius_meters": 0.3499999940395355,
+    "downhill_weight": 0.44999998807907104,
+    "enabled": false,
+    "field_resolution_meters": 0.012000000104308128,
+    "field_smoothing": 0.3499999940395355,
+    "graph_weight": 0.800000011920929,
+    "guide_weight": 0.6000000238418579,
+    "lateral_weight": 0.10000000149011612,
+    "max_bridge_distance_meters": 0.07999999821186066,
+    "output_mode": "both",
+    "projection_resolution_meters": 0.004999999888241291,
+    "seed": 7,
+    "surface_confidence_threshold": 0.25,
+    "surface_offset_meters": 0.004000000189989805,
+    "turbulence": 0.07999999821186066,
+    "wetness_spread": 0.550000011920929
+  },
+  "water_field_trail_settings": {
+    "enabled": true,
+    "fade_on_low_confidence": true,
+    "max_turn_angle_degrees": 12.0,
+    "momentum": 0.8399999737739563,
+    "seed_spacing_meters": 0.02500000037252903,
+    "speed_meters_per_second": 0.3799999952316284,
+    "trail_count": 850,
+    "trail_length_meters": 0.8500000238418579,
+    "trail_point_spacing_meters": 0.012000000104308128,
+    "trail_streak_length_meters": 0.04500000178813934,
+    "trail_width_meters": 0.004999999888241291
+  },
+  "water_dynamic_mesh_flow_settings": {
+    "ambiguity_height_meters": 0.18000000715255737,
+    "animation_duration_seconds": 4.0,
+    "attractor_weight": 1.0,
+    "branching_strength": 0.36000001430511475,
+    "cache_cell_size_meters": 0.07999999821186066,
+    "curl_strength": 0.10000000149011612,
+    "downhill_weight": 0.8500000238418579,
+    "eddy_strength": 0.07999999821186066,
+    "enabled": false,
+    "final_particle_limit": 2400,
+    "gpu_preview_enabled": true,
+    "inertia": 0.699999988079071,
+    "particle_preset_name": "Default",
+    "preview_particle_limit": 7166,
+    "projection_search_radius_meters": 0.23999999463558197,
+    "seed": 29,
+    "source_velocity_weight": 0.3499999940395355,
+    "speed_meters_per_second": 0.41999998688697815,
+    "step_meters": 0.03500000014901161,
+    "surface_offset_meters": 0.004000000189989805,
+    "topology_response": 0.6499999761581421,
+    "trail_length_meters": 0.949999988079071,
+    "trail_profile_name": "Default_edited",
+    "trail_streak_length_meters": 0.05000000074505806,
+    "trail_width_meters": 0.004999999888241291
+  },
+  "water_rain_settings": {
+    "active_particle_count": 9000,
+    "camera_death_distance_meters": 28.0,
+    "density": 0.550000011920929,
+    "droplet_size_scale": 1.0,
+    "emission_scale": 1.0,
+    "enabled": true,
+    "fall_speed_meters_per_second": 8.0,
+    "gust_scale_meters": 8.0,
+    "gust_speed_meters_per_second": 2.5,
+    "gust_strength": 0.3499999940395355,
+    "impact_effects_enabled": true,
+    "intensity_preset": "rain",
+    "opacity_scale": 1.0,
+    "rain_level": 1.0,
+    "rock_effect_scale": 1.0,
+    "rock_effects_enabled": false,
+    "sand_effect_scale": 1.0,
+    "sand_effects_enabled": false,
+    "seed": 101,
+    "spawn_height_meters": 4.0,
+    "spawn_radius_meters": 6.0,
+    "turbulence": 0.44999998807907104,
+    "vegetation_effect_scale": 3.0,
+    "vegetation_effects_enabled": true,
+    "version": 2,
+    "visual_profile": {
+      "colour": [
+        0.6800000071525574,
+        0.8199999928474426,
+        0.9200000166893005
+      ],
+      "emission": 0.1599999964237213,
+      "maximum_screen_pixels": 4.0,
+      "minimum_screen_pixels": 0.6499999761581421,
+      "opacity": 0.5799999833106995,
+      "softness": 0.41999998688697815,
+      "streak_length_meters": 0.1599999964237213,
+      "width_meters": 0.003000000026077032
+    },
+    "visual_profile_name": "Rain Fine Lines",
+    "weather_front_scale_meters": 12.0,
+    "weather_front_speed_meters_per_second": 1.5,
+    "weather_front_strength": 0.4000000059604645,
+    "wind_direction_x": 1.0,
+    "wind_direction_y": 0.0,
+    "wind_speed_meters_per_second": 0.30000001192092896
+  },
+  "water_emitters": [
+    {
+      "confidence": 1.0,
+      "id": 1,
+      "lane_profile": "Nice Flow",
+      "lane_profile_locked": false,
+      "maximum_flow_strength": 1.0,
+      "name": "SampleFlowPoint",
+      "origin": "manual",
+      "path_profile": "Global",
+      "path_profile_locked": false,
+      "position": [
+        307.6824951171875,
+        102.49331665039062,
+        2.113636016845703
+      ],
+      "radius": 0.42524999380111694,
+      "rain_response": 0.0,
+      "settings_assignment": "default",
+      "speed": 1.0,
+      "status": "accepted",
+      "strength": 1.0,
+      "trail_profile": "Global",
+      "trail_profile_locked": false
+    }
+  ],
+  "water_manual_flow_paths": [
+    {
+      "control_points": [
+        [
+          307.6756286621094,
+          103.08917236328125,
+          2.2442665100097656
+        ],
+        [
+          307.6042175292969,
+          103.28070831298828,
+          2.0866432189941406
+        ],
+        [
+          307.5531005859375,
+          103.54625701904297,
+          1.9722814559936523
+        ],
+        [
+          307.35565185546875,
+          103.60794830322266,
+          1.9195222854614258
+        ],
+        [
+          307.2048645019531,
+          103.669189453125,
+          1.9217815399169922
+        ],
+        [
+          307.0480651855469,
+          103.65330505371094,
+          1.902029037475586
+        ],
+        [
+          306.9885559082031,
+          103.5687484741211,
+          1.8307304382324219
+        ],
+        [
+          306.9559631347656,
+          103.49744415283203,
+          1.6349372863769531
+        ],
+        [
+          306.86346435546875,
+          103.38552856445312,
+          1.6303472518920898
+        ],
+        [
+          306.76080322265625,
+          103.33111572265625,
+          1.6056232452392578
+        ],
+        [
+          306.58740234375,
+          103.55294036865234,
+          1.5622873306274414
+        ]
+      ],
+      "id": 10,
+      "lane_profile": "Global",
+      "lane_profile_locked": false,
+      "maximum_flow_strength": 1.0,
+      "name": "SampleFlowPath",
+      "rain_response": 0.0,
+      "trail_profile": "Global",
+      "trail_profile_locked": false,
+      "use_surface_guide": true
+    }
+  ],
+  "water_seepage_nodes": [
+    {
+      "depth_tolerance_meters": 0.15000000596046448,
+      "down_axis": [
+        -0.27744078636169434,
+        0.014908351004123688,
+        -0.960627019405365
+      ],
+      "edge_feather_meters": 0.10000000149011612,
+      "enabled_in_export": true,
+      "enabled_in_viewport": true,
+      "end_width_meters": 0.75,
+      "id": 1,
+      "look_profile_name": "Default",
+      "name": "SampleSeepage",
+      "normal_alignment": 0.20000000298023224,
+      "position": [
+        307.64752197265625,
+        102.98605346679688,
+        2.3077430725097656
+      ],
+      "reach_meters": 1.25,
+      "seed": 2654435761,
+      "start_width_meters": 0.11999999731779099,
+      "strength": 1.0,
+      "surface_normal": [
+        -0.9592431783676147,
+        0.05154517665505409,
+        0.27784106135368347
+      ],
+      "target_scene_roles": [
+        "ROCK",
+        "VEG"
+      ]
+    }
+  ],
+  "water_seepage_default_look": {
+    "angle_response": 0.699999988079071,
+    "base_wetness": 0.3499999940395355,
+    "blend_mode": "max",
+    "breakup": 0.44999998807907104,
+    "contrast": 0.550000011920929,
+    "curl": 0.4000000059604645,
+    "density": 0.44999998807907104,
+    "downhill_drift_meters_per_second": 0.02500000037252903,
+    "environment_azimuth_degrees": 225.0,
+    "environment_elevation_degrees": 55.0,
+    "evolution": 0.05999999865889549,
+    "feature_size_meters": 0.20000000298023224,
+    "glint_density": 0.30000001192092896,
+    "glisten": 0.550000011920929,
+    "micro_normal_strength": 0.18000000715255737,
+    "pattern": "legacy_ripples",
+    "pattern_scale": 1.0,
+    "phase": 0.0,
+    "quality": "auto",
+    "rain_response": 0.5,
+    "response": {
+      "colourise": [
+        0.2800000011920929,
+        0.41999998688697815,
+        0.46000000834465027
+      ],
+      "colourise_amount": 0.2199999988079071,
+      "emission_add": 0.3499999940395355,
+      "gaussian_sharpness_bias": 0.0,
+      "hue_shift": 0.0,
+      "intensity": 0.8500000238418579,
+      "opacity_add": 0.03999999910593033,
+      "opacity_multiply": 1.1200000047683716,
+      "point_size_add": 0.0,
+      "point_size_multiply": 1.0800000429153442
+    },
+    "roughness": 0.44999998807907104,
+    "speed": 0.18000000715255737,
+    "trickle_front_softness": 0.10000000149011612,
+    "trickle_length_meters": 0.3499999940395355,
+    "trickle_patch_size_meters": 0.07999999821186066,
+    "trickle_width_meters": 0.017999999225139618,
+    "turbulence": 0.2199999988079071,
+    "warp": 0.4000000059604645,
+    "wavelength_meters": 0.1599999964237213
+  },
+  "water_seepage_look_profiles": [],
+  "water_ripple_layers": [],
+  "water_field_layers": [],
+  "water_ripple_runtime_caches": [],
+  "temp_water_source_settings": {
+    "path_generation": {
+      "attractor_enabled": false,
+      "attractor_position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "attractor_strength": 0.0,
+      "auto_tune": true,
+      "branching": 1.0,
+      "coverage": 0.9100000262260437,
+      "gap_tolerance": 0.9399999976158142,
+      "max_bridge_distance": 0.5669999718666077,
+      "max_steps": 20000,
+      "path_length": 17.299999237060547,
+      "path_sample_spacing": 0.012000000104308128,
+      "smoothing": 1.0,
+      "support_sample_limit": 261946,
+      "support_voxel_size": 0.009999999776482582
+    },
+    "trail_shape": {
+      "normal_turbulence_response": 1.4500000476837158,
+      "particle_jitter": 0.0,
+      "spline_anchor_spacing": 0.8500000238418579,
+      "trail_lane_count": 7,
+      "trail_looseness": 0.9303333163261414,
+      "trail_momentum": 0.8199999928474426,
+      "trail_smoothness": 0.550000011920929,
+      "trail_turbulence": 1.8300000429153442
+    }
+  },
+  "temp_water_path_profile_settings": {
+    "attractor_enabled": false,
+    "attractor_position": [
+      306.7921447753906,
+      103.36567687988281,
+      1.6124534606933594
+    ],
+    "attractor_strength": 0.0,
+    "auto_tune": true,
+    "branching": 0.7400000095367432,
+    "coverage": 0.8700000047683716,
+    "gap_tolerance": 1.0,
+    "max_bridge_distance": 0.5669999718666077,
+    "max_steps": 20000,
+    "path_length": 7.900000095367432,
+    "path_sample_spacing": 0.012000000104308128,
+    "smoothing": 0.9399999976158142,
+    "support_sample_limit": 5000000,
+    "support_voxel_size": 0.009999999776482582
+  }
+}

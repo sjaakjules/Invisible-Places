@@ -308,5 +308,35 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             dynamic-mesh-flow-site3-gui-smoke
             PROPERTIES LABELS gui_smoke
         )
+        add_test(
+            NAME water-integration-sample-scene
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke water-integration-sample-scene
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-integration-smoke/sample-scene"
+        )
+        set_tests_properties(
+            water-integration-sample-scene
+            PROPERTIES
+                LABELS "gui_smoke;water_integration"
+                RUN_SERIAL TRUE
+                TIMEOUT 360
+        )
+        add_test(
+            NAME water-integration-scene1-top-view
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke water-integration-scene1-top-view
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-integration-smoke/scene1-top-view"
+        )
+        set_tests_properties(
+            water-integration-scene1-top-view
+            PROPERTIES
+                LABELS "gui_smoke;water_integration"
+                RUN_SERIAL TRUE
+                TIMEOUT 600
+        )
     endif()
 endif()

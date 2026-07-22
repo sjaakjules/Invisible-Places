@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -105,6 +106,7 @@ using invisible_places::water::WaterTrailGeometrySettings;
 using invisible_places::water::WaterVisualSettings;
 
 constexpr std::uintmax_t kLargeJsonRippleCacheStripBytes = 32ULL * 1024ULL * 1024ULL;
+constexpr std::array<char, 8> kWaterPathCacheSidecarMagic{'I', 'P', 'F', 'L', 'O', 'W', 'C', '1'};
 constexpr std::uint32_t kManualFlowSurfaceGuideProjectSchemaVersion = 40U;
 constexpr std::uint32_t kManualFlowSurfaceGuideSourcesSchemaVersion = 16U;
 
@@ -143,6 +145,76 @@ WaterPathCache ParseWaterPathCache(const json& cacheJson);
 json SerializeWaterVisualSettings(const WaterVisualSettings& settings);
 WaterVisualSettings ParseWaterVisualSettings(const json& settingsJson);
 PointCloudStyleState MakeLegacyWaterPointVisualStyle(const WaterVisualSettings& visualSettings);
+
+json SerializeWaterPathCacheManifest(const WaterPathCacheManifestDocument& manifest) {
+    return json{
+        {"relative_path", manifest.relativePath.generic_string()},
+        {"cache_schema", manifest.cacheSchema},
+        {"support_signature", manifest.supportSignature},
+        {"emitter_settings_fingerprint", manifest.emitterSettingsFingerprint},
+        {"payload_bytes", manifest.payloadBytes},
+        {"checksum", manifest.checksum},
+    };
+}
+
+WaterPathCacheManifestDocument ParseWaterPathCacheManifest(const json& manifestJson) {
+    WaterPathCacheManifestDocument manifest;
+    manifest.relativePath = manifestJson.value("relative_path", std::string{});
+    manifest.cacheSchema = manifestJson.value("cache_schema", manifest.cacheSchema);
+    manifest.supportSignature = manifestJson.value("support_signature", std::string{});
+    manifest.emitterSettingsFingerprint =
+        manifestJson.value("emitter_settings_fingerprint", std::string{});
+    manifest.payloadBytes = manifestJson.value("payload_bytes", 0ULL);
+    if (manifestJson.contains("checksum") && manifestJson.at("checksum").is_array() &&
+        manifestJson.at("checksum").size() == manifest.checksum.size()) {
+        try {
+            manifest.checksum =
+                manifestJson.at("checksum").get<std::array<std::uint64_t, 4>>();
+        } catch (const json::exception&) {
+            // A malformed derived-cache checksum must not make the authored
+            // project unreadable. The zero checksum below will fail normal
+            // sidecar validation and the manifest will be retired on save.
+            manifest.checksum = {};
+        }
+    }
+    return manifest;
+}
+
+json SerializeWaterSurfaceCacheManifest(const WaterSurfaceCacheManifestDocument& manifest) {
+    return json{
+        {"relative_path", manifest.relativePath.generic_string()},
+        {"cache_schema", manifest.cacheSchema},
+        {"algorithm_id", manifest.algorithmId},
+        {"source_fingerprint", manifest.sourceFingerprint},
+        {"payload_bytes", manifest.payloadBytes},
+        {"checksum", manifest.checksum},
+        {"requested_rebuild_generation", manifest.requestedRebuildGeneration},
+        {"built_rebuild_generation", manifest.builtRebuildGeneration},
+    };
+}
+
+WaterSurfaceCacheManifestDocument ParseWaterSurfaceCacheManifest(const json& manifestJson) {
+    WaterSurfaceCacheManifestDocument manifest;
+    manifest.relativePath = manifestJson.value("relative_path", std::string{});
+    manifest.cacheSchema = manifestJson.value("cache_schema", manifest.cacheSchema);
+    manifest.algorithmId = manifestJson.value("algorithm_id", manifest.algorithmId);
+    manifest.sourceFingerprint = manifestJson.value("source_fingerprint", std::string{});
+    manifest.payloadBytes = manifestJson.value("payload_bytes", 0ULL);
+    if (manifestJson.contains("checksum") && manifestJson.at("checksum").is_array() &&
+        manifestJson.at("checksum").size() == manifest.checksum.size()) {
+        try {
+            manifest.checksum =
+                manifestJson.at("checksum").get<std::array<std::uint64_t, 4>>();
+        } catch (const json::exception&) {
+            manifest.checksum = {};
+        }
+    }
+    manifest.requestedRebuildGeneration =
+        manifestJson.value("requested_rebuild_generation", 0ULL);
+    manifest.builtRebuildGeneration =
+        manifestJson.value("built_rebuild_generation", 0ULL);
+    return manifest;
+}
 
 enum class LegacyPointCloudRenderMode {
     Solid,
@@ -1331,6 +1403,10 @@ json SerializeScenePointCloudGroup(const ScenePointCloudGroupDocument &group) {
   for (const auto &source : group.roleSources) {
     groupJson["roles"].push_back(SerializeScenePointCloudRoleSource(source));
   }
+  if (group.waterSurfaceCache.has_value()) {
+    groupJson["water_surface_cache"] =
+        SerializeWaterSurfaceCacheManifest(group.waterSurfaceCache.value());
+  }
   return groupJson;
 }
 
@@ -1344,6 +1420,11 @@ ScenePointCloudGroupDocument ParseScenePointCloudGroup(const json &groupJson) {
     for (const auto &sourceJson : groupJson.at("roles")) {
       group.roleSources.push_back(ParseScenePointCloudRoleSource(sourceJson));
     }
+  }
+  if (groupJson.contains("water_surface_cache") &&
+      groupJson.at("water_surface_cache").is_object()) {
+    group.waterSurfaceCache =
+        ParseWaterSurfaceCacheManifest(groupJson.at("water_surface_cache"));
   }
   return group;
 }
@@ -4046,7 +4127,13 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
     for (const auto& layer : state.fieldLayers) {
         stateJson["water_field_layers"].push_back(SerializeWaterEffectLayer(layer));
     }
-    if (state.pathCache.has_value() && !state.pathCache->branches.empty()) {
+    if (state.pathCacheManifest.has_value()) {
+        stateJson["water_path_cache_manifest"] =
+            SerializeWaterPathCacheManifest(state.pathCacheManifest.value());
+    } else if (state.pathCache.has_value() && !state.pathCache->branches.empty() &&
+               !state.pathCache->stale) {
+        // Kept only as a compatibility fallback. Schema-42 project saves prepare
+        // a binary sidecar and populate the manifest before reaching this point.
         stateJson["water_path_cache"] = SerializeWaterPathCache(state.pathCache.value());
     }
     for (const auto& cache : state.rippleRuntimeCaches) {
@@ -4107,6 +4194,11 @@ WaterSceneStateDocument ParseWaterSceneState(
     if (stateJson.contains("water_path_cache")) {
         state.pathCache = ParseWaterPathCache(stateJson.at("water_path_cache"));
     }
+    if (stateJson.contains("water_path_cache_manifest") &&
+        stateJson.at("water_path_cache_manifest").is_object()) {
+        state.pathCacheManifest =
+            ParseWaterPathCacheManifest(stateJson.at("water_path_cache_manifest"));
+    }
     if (stateJson.contains("water_ripple_runtime_caches") &&
         stateJson.at("water_ripple_runtime_caches").is_array()) {
         for (const auto& cacheJson : stateJson.at("water_ripple_runtime_caches")) {
@@ -4138,6 +4230,7 @@ bool WaterSceneStateHasPayload(const WaterSceneStateDocument& state) {
            !state.rippleLayers.empty() ||
            !state.fieldLayers.empty() ||
            (state.pathCache.has_value() && !state.pathCache->branches.empty()) ||
+           state.pathCacheManifest.has_value() ||
            !state.rippleRuntimeCaches.empty() ||
            !state.dynamicMeshPath.empty() ||
            !state.dynamicMeshAttractors.empty() ||
@@ -4153,6 +4246,7 @@ WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocum
     state.rippleLayers = document.waterRippleLayers;
     state.fieldLayers = document.waterFieldLayers;
     state.pathCache = document.waterPathCache;
+    state.pathCacheManifest = document.waterPathCacheManifest;
     state.rippleRuntimeCaches = document.waterRippleRuntimeCaches;
     state.dynamicMeshPath = document.waterDynamicMeshFlowSettings.meshPath;
     state.dynamicMeshAttractors = document.waterDynamicMeshFlowSettings.attractors;
@@ -5117,6 +5211,241 @@ WaterPathCache ParseWaterPathCache(const json& cacheJson) {
     return cache;
 }
 
+std::array<std::uint64_t, 4> MakeWaterPathCachePayloadDigest() {
+    return {
+        1469598103934665603ULL,
+        1099511628211ULL,
+        0x9E3779B97F4A7C15ULL,
+        0xD6E8FEB86659FD93ULL,
+    };
+}
+
+void UpdateWaterPathCachePayloadDigest(
+    std::array<std::uint64_t, 4>* digest,
+    const std::uint8_t* bytes,
+    std::size_t byteCount) {
+    if (digest == nullptr || bytes == nullptr) {
+        return;
+    }
+    constexpr std::array<std::uint64_t, 4> primes{
+        1099511628211ULL,
+        0x100000001B3ULL,
+        0x9E3779B185EBCA87ULL,
+        0xC2B2AE3D27D4EB4FULL,
+    };
+    for (std::size_t index = 0U; index < byteCount; ++index) {
+        for (std::size_t lane = 0U; lane < digest->size(); ++lane) {
+            (*digest)[lane] ^= static_cast<std::uint64_t>(bytes[index]) + lane * 0x9DU;
+            (*digest)[lane] *= primes[lane];
+            (*digest)[lane] ^= (*digest)[lane] >> 31U;
+        }
+    }
+}
+
+std::array<std::uint64_t, 4> DigestWaterPathCachePayload(
+    const std::vector<std::uint8_t>& payload) {
+    auto digest = MakeWaterPathCachePayloadDigest();
+    UpdateWaterPathCachePayloadDigest(&digest, payload.data(), payload.size());
+    return digest;
+}
+
+bool WaterPathCacheMayFitPersistenceCeiling(const WaterPathCache& cache) {
+    // CBOR retains the descriptive object keys for every point. This deliberately
+    // conservative bound rejects pathological caches before constructing either
+    // the full JSON DOM or the encoded payload.
+    std::uint64_t estimate = 64ULL * 1024ULL;
+    auto add = [&](std::uint64_t count, std::uint64_t bytesPerItem) {
+        if (count > (kMaximumPersistedWaterCacheBytes -
+                     std::min(estimate, kMaximumPersistedWaterCacheBytes)) /
+                        bytesPerItem) {
+            estimate = kMaximumPersistedWaterCacheBytes + 1ULL;
+            return;
+        }
+        estimate += count * bytesPerItem;
+    };
+    add(cache.supportLayerPath.generic_string().size(), 4ULL);
+    add(cache.supportSignature.size(), 4ULL);
+    add(cache.emitterSettingsFingerprint.size(), 4ULL);
+    add(cache.diagnostics.summary.size(), 4ULL);
+    add(cache.hiddenBranchIds.size(), 16ULL);
+    for (const auto& branch : cache.branches) {
+        add(1ULL, 4096ULL);
+        add(branch.bakeFingerprint.size(), 4ULL);
+        add(branch.rawAnchors.size(), 1024ULL);
+    }
+    if (cache.analysis.has_value()) {
+        for (const auto& branch : cache.analysis->branches) {
+            add(1ULL, 512ULL);
+            add(branch.samples.size(), 512ULL);
+        }
+    }
+    return estimate <= kMaximumPersistedWaterCacheBytes;
+}
+
+struct EncodedWaterPathCache {
+    std::vector<std::uint8_t> payload;
+    std::array<std::uint64_t, 4> checksum{};
+};
+
+std::optional<EncodedWaterPathCache> EncodeWaterPathCache(
+    const WaterPathCache& document,
+    std::string* errorMessage) {
+    if (!WaterPathCacheMayFitPersistenceCeiling(document)) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "Water path cache estimate exceeds the 5 GiB persistence ceiling.";
+        }
+        return std::nullopt;
+    }
+    try {
+        EncodedWaterPathCache encoded;
+        encoded.payload = json::to_cbor(SerializeWaterPathCache(document));
+        if (encoded.payload.size() > kMaximumPersistedWaterCacheBytes) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Water path cache exceeds the 5 GiB persistence ceiling.";
+            }
+            return std::nullopt;
+        }
+        encoded.checksum = DigestWaterPathCachePayload(encoded.payload);
+        return encoded;
+    } catch (const std::exception& error) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to encode water path cache sidecar: " +
+                            std::string{error.what()};
+        }
+        return std::nullopt;
+    }
+}
+
+std::string WaterPathCacheChecksumToken(
+    const std::array<std::uint64_t, 4>& checksum) {
+    std::ostringstream token;
+    token << std::hex << std::setfill('0');
+    for (const auto lane : checksum) {
+        token << std::setw(16) << lane;
+    }
+    return token.str();
+}
+
+bool ExistingWaterPathCacheMatches(
+    const std::filesystem::path& outputPath,
+    const EncodedWaterPathCache& encoded) {
+    std::error_code sizeError;
+    const auto fileBytes = std::filesystem::file_size(outputPath, sizeError);
+    const std::uint64_t headerBytes =
+        kWaterPathCacheSidecarMagic.size() + sizeof(std::uint32_t) +
+        sizeof(std::uint64_t) + encoded.checksum.size() * sizeof(encoded.checksum.front());
+    if (sizeError || fileBytes != headerBytes + encoded.payload.size()) {
+        return false;
+    }
+    std::ifstream input{outputPath, std::ios::binary};
+    std::array<char, kWaterPathCacheSidecarMagic.size()> magic{};
+    std::uint32_t schema = 0U;
+    std::uint64_t payloadBytes = 0U;
+    std::array<std::uint64_t, 4> checksum{};
+    input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+    input.read(reinterpret_cast<char*>(&schema), sizeof(schema));
+    input.read(reinterpret_cast<char*>(&payloadBytes), sizeof(payloadBytes));
+    input.read(
+        reinterpret_cast<char*>(checksum.data()),
+        static_cast<std::streamsize>(checksum.size() * sizeof(checksum.front())));
+    if (!input.good() || magic != kWaterPathCacheSidecarMagic ||
+        schema != kWaterPathCacheSidecarSchemaVersion ||
+        payloadBytes != encoded.payload.size() || checksum != encoded.checksum) {
+        return false;
+    }
+    auto streamedChecksum = MakeWaterPathCachePayloadDigest();
+    std::array<std::uint8_t, 64U * 1024U> buffer{};
+    std::uint64_t remaining = payloadBytes;
+    while (remaining > 0U) {
+        const auto chunk = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, buffer.size()));
+        input.read(
+            reinterpret_cast<char*>(buffer.data()),
+            static_cast<std::streamsize>(chunk));
+        if (input.gcount() != static_cast<std::streamsize>(chunk)) {
+            return false;
+        }
+        UpdateWaterPathCachePayloadDigest(&streamedChecksum, buffer.data(), chunk);
+        remaining -= chunk;
+    }
+    return streamedChecksum == encoded.checksum &&
+           input.peek() == std::char_traits<char>::eof();
+}
+
+bool WriteEncodedWaterPathCache(
+    const WaterPathCache& document,
+    const EncodedWaterPathCache& encoded,
+    const std::filesystem::path& outputPath,
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest) {
+    if (const auto parent = outputPath.parent_path(); !parent.empty()) {
+        std::error_code createError;
+        std::filesystem::create_directories(parent, createError);
+        if (createError) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Failed to create water path cache directory: " +
+                                createError.message();
+            }
+            return false;
+        }
+    }
+    if (!ExistingWaterPathCacheMatches(outputPath, encoded)) {
+        const auto temporaryPath = outputPath.string() + ".tmp";
+        std::ofstream output{temporaryPath, std::ios::binary | std::ios::trunc};
+        if (!output.is_open()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = "Failed to open water path cache sidecar for writing.";
+            }
+            return false;
+        }
+        const std::uint32_t schema = kWaterPathCacheSidecarSchemaVersion;
+        const std::uint64_t payloadBytes = encoded.payload.size();
+        output.write(kWaterPathCacheSidecarMagic.data(), kWaterPathCacheSidecarMagic.size());
+        output.write(reinterpret_cast<const char*>(&schema), sizeof(schema));
+        output.write(reinterpret_cast<const char*>(&payloadBytes), sizeof(payloadBytes));
+        output.write(
+            reinterpret_cast<const char*>(encoded.checksum.data()),
+            static_cast<std::streamsize>(
+                encoded.checksum.size() * sizeof(encoded.checksum.front())));
+        output.write(
+            reinterpret_cast<const char*>(encoded.payload.data()),
+            static_cast<std::streamsize>(encoded.payload.size()));
+        output.flush();
+        bool writeSucceeded = output.good();
+        output.close();
+        writeSucceeded = writeSucceeded && !output.fail();
+        if (!writeSucceeded) {
+            std::error_code cleanupError;
+            std::filesystem::remove(temporaryPath, cleanupError);
+            if (errorMessage != nullptr) {
+                *errorMessage = "Failed to write complete water path cache sidecar.";
+            }
+            return false;
+        }
+        std::error_code renameError;
+        std::filesystem::rename(temporaryPath, outputPath, renameError);
+        if (renameError) {
+            std::error_code cleanupError;
+            std::filesystem::remove(temporaryPath, cleanupError);
+            if (errorMessage != nullptr) {
+                *errorMessage = "Failed to atomically replace water path cache sidecar: " +
+                                renameError.message();
+            }
+            return false;
+        }
+    }
+    if (manifest != nullptr) {
+        manifest->relativePath = outputPath;
+        manifest->cacheSchema = kWaterPathCacheSidecarSchemaVersion;
+        manifest->supportSignature = document.supportSignature;
+        manifest->emitterSettingsFingerprint = document.emitterSettingsFingerprint;
+        manifest->payloadBytes = encoded.payload.size();
+        manifest->checksum = encoded.checksum;
+    }
+    return true;
+}
+
 template <typename TDocument>
 bool WriteJsonDocument(
     const TDocument& document,
@@ -5135,7 +5464,8 @@ bool WriteJsonDocument(
         }
     }
 
-    std::ofstream output{outputPath, std::ios::trunc};
+    const auto temporaryPath = outputPath.string() + ".tmp";
+    std::ofstream output{temporaryPath, std::ios::trunc};
     if (!output.is_open()) {
         if (errorMessage != nullptr) {
             *errorMessage = "Failed to open output file for writing.";
@@ -5144,6 +5474,28 @@ bool WriteJsonDocument(
     }
 
     output << documentJson.dump(2);
+    output.flush();
+    bool writeSucceeded = output.good();
+    output.close();
+    writeSucceeded = writeSucceeded && !output.fail();
+    if (!writeSucceeded) {
+        std::error_code cleanupError;
+        std::filesystem::remove(temporaryPath, cleanupError);
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to write complete output file.";
+        }
+        return false;
+    }
+    std::error_code renameError;
+    std::filesystem::rename(temporaryPath, outputPath, renameError);
+    if (renameError) {
+        std::error_code cleanupError;
+        std::filesystem::remove(temporaryPath, cleanupError);
+        if (errorMessage != nullptr) {
+            *errorMessage = "Failed to atomically replace output file: " + renameError.message();
+        }
+        return false;
+    }
     return true;
 }
 
@@ -5175,6 +5527,217 @@ std::optional<json> ReadJsonDocument(const std::filesystem::path& inputPath, std
     }
 }
 
+std::optional<WaterPathCache> PruneSettledWaterPathCache(
+    WaterPathCache cache,
+    const std::vector<WaterEmitter>& emitters) {
+    if (cache.stale || cache.branches.empty()) {
+        return std::nullopt;
+    }
+    std::unordered_set<std::uint32_t> emitterIds;
+    emitterIds.reserve(emitters.size());
+    for (const auto& emitter : emitters) {
+        emitterIds.insert(emitter.id);
+    }
+    std::erase_if(cache.branches, [&](const WaterPathBranch& branch) {
+        return branch.emitterId != 0U && !emitterIds.contains(branch.emitterId);
+    });
+    if (cache.branches.empty()) {
+        return std::nullopt;
+    }
+    std::unordered_set<std::uint32_t> branchIds;
+    branchIds.reserve(cache.branches.size());
+    for (const auto& branch : cache.branches) {
+        branchIds.insert(branch.id);
+    }
+    for (auto& branch : cache.branches) {
+        if (branch.parentId.has_value() && !branchIds.contains(branch.parentId.value())) {
+            branch.parentId.reset();
+        }
+    }
+    std::erase_if(cache.hiddenBranchIds, [&](std::uint32_t branchId) {
+        return !branchIds.contains(branchId);
+    });
+    if (cache.analysis.has_value()) {
+        std::erase_if(cache.analysis->branches, [&](const WaterPathBranchAnalysis& branch) {
+            return !branchIds.contains(branch.branchId);
+        });
+    }
+    cache.diagnostics.branchCount = static_cast<std::uint32_t>(cache.branches.size());
+    cache.stale = false;
+    return cache;
+}
+
+const ScenePointCloudGroupDocument* FindSceneGroupDocument(
+    const ProjectDocument& document,
+    std::string_view sceneGroupName) {
+    const auto it = std::find_if(
+        document.scenePointCloudGroups.begin(),
+        document.scenePointCloudGroups.end(),
+        [&](const ScenePointCloudGroupDocument& group) {
+            return group.sceneGroupName == sceneGroupName;
+        });
+    return it == document.scenePointCloudGroups.end() ? nullptr : &*it;
+}
+
+std::filesystem::path SceneCacheRootForWaterState(
+    const ProjectDocument& document,
+    const WaterSceneStateDocument& state,
+    const std::filesystem::path& projectPath) {
+    if (const auto* group = FindSceneGroupDocument(document, state.sceneGroupName); group != nullptr) {
+        for (const auto& role : group->roleSources) {
+            const auto& sourcePath = !role.analysisSourcePath.empty()
+                                         ? role.analysisSourcePath
+                                         : role.displaySourcePath;
+            if (!sourcePath.empty() && !sourcePath.parent_path().empty()) {
+                const auto resolvedSourcePath =
+                    sourcePath.is_absolute()
+                        ? sourcePath
+                        : (projectPath.parent_path() / sourcePath).lexically_normal();
+                return resolvedSourcePath.parent_path() /
+                       ".invisible_places" / "cache" / "flow";
+            }
+        }
+    }
+    return projectPath.parent_path() / ".invisible_places" / "cache" / "flow";
+}
+
+std::filesystem::path ManifestPathRelativeToProject(
+    const std::filesystem::path& sidecarPath,
+    const std::filesystem::path& projectPath) {
+    std::error_code relativeError;
+    auto relative = std::filesystem::relative(sidecarPath, projectPath.parent_path(), relativeError);
+    return relativeError || relative.empty() ? sidecarPath : relative;
+}
+
+WaterSceneStateDocument PrepareWaterSceneStateForSave(
+    const ProjectDocument& document,
+    const WaterSceneStateDocument& sourceState,
+    const std::filesystem::path& projectPath) {
+    // Copy authored state first, but deliberately leave the potentially very
+    // large derived path cache behind until it has passed the persistence
+    // preflight. This keeps a pathological cache from being duplicated in RAM
+    // merely because the user saves the project.
+    WaterSceneStateDocument state;
+    state.sceneGroupName = sourceState.sceneGroupName;
+    state.emitters = sourceState.emitters;
+    state.manualFlowPaths = sourceState.manualFlowPaths;
+    state.seepageNodes = sourceState.seepageNodes;
+    state.rippleLayers = sourceState.rippleLayers;
+    state.fieldLayers = sourceState.fieldLayers;
+    state.pathCacheManifest = sourceState.pathCacheManifest;
+    state.rippleRuntimeCaches = sourceState.rippleRuntimeCaches;
+    state.dynamicMeshPath = sourceState.dynamicMeshPath;
+    state.dynamicMeshAttractors = sourceState.dynamicMeshAttractors;
+    state.dynamicMeshEmitterMotions = sourceState.dynamicMeshEmitterMotions;
+
+    if (!sourceState.pathCache.has_value()) {
+        // A manifest without its validated payload is only a reference to
+        // missing or corrupt derived data. Do not perpetuate it on the next
+        // settled save.
+        state.pathCacheManifest.reset();
+        return state;
+    }
+    if (!WaterPathCacheMayFitPersistenceCeiling(sourceState.pathCache.value())) {
+        // Authored Flow sources remain saveable even when a corrupt or
+        // pathological derived cache is too large to persist safely.
+        state.pathCacheManifest.reset();
+        return state;
+    }
+    state.pathCache = sourceState.pathCache;
+    const auto pruned = PruneSettledWaterPathCache(
+        std::move(state.pathCache.value()),
+        state.emitters);
+    if (!pruned.has_value()) {
+        state.pathCache.reset();
+        state.pathCacheManifest.reset();
+        return state;
+    }
+
+    auto sidecarDirectory = SceneCacheRootForWaterState(document, state, projectPath);
+    std::filesystem::path sidecarPath;
+    WaterPathCacheManifestDocument manifest;
+    std::string sidecarError;
+    if (!SaveContentAddressedWaterPathCacheDocument(
+            pruned.value(),
+            sidecarDirectory,
+            &sidecarError,
+            &manifest,
+            &sidecarPath)) {
+        sidecarDirectory =
+            projectPath.parent_path() / ".invisible_places" / "cache" / "flow";
+        sidecarError.clear();
+        if (!SaveContentAddressedWaterPathCacheDocument(
+                pruned.value(),
+                sidecarDirectory,
+                &sidecarError,
+                &manifest,
+                &sidecarPath)) {
+            // Authored source data remains in the project; omit only the derived cache
+            // when neither the scene nor project cache location is writable.
+            state.pathCache.reset();
+            state.pathCacheManifest.reset();
+            return state;
+        }
+    }
+    manifest.relativePath = ManifestPathRelativeToProject(sidecarPath, projectPath);
+    manifest.supportSignature = pruned->supportSignature;
+    manifest.emitterSettingsFingerprint = pruned->emitterSettingsFingerprint;
+    state.pathCacheManifest = std::move(manifest);
+    state.pathCache.reset();
+    return state;
+}
+
+std::filesystem::path ResolveManifestPath(
+    const std::filesystem::path& projectPath,
+    const std::filesystem::path& manifestPath) {
+    return manifestPath.is_absolute()
+               ? manifestPath
+               : (projectPath.parent_path() / manifestPath).lexically_normal();
+}
+
+void LoadWaterPathSidecars(
+    const std::filesystem::path& projectPath,
+    ProjectDocument* document) {
+    if (document == nullptr) {
+        return;
+    }
+    for (auto& state : document->waterSceneStates) {
+        if (!state.pathCacheManifest.has_value()) {
+            if (state.pathCache.has_value()) {
+                state.pathCache = PruneSettledWaterPathCache(
+                    std::move(state.pathCache.value()),
+                    state.emitters);
+            }
+            continue;
+        }
+
+        // A schema-42 manifest is authoritative. Never fall back to an
+        // embedded cache if its referenced sidecar is absent or invalid.
+        state.pathCache.reset();
+        if (state.pathCacheManifest->relativePath.empty()) {
+            continue;
+        }
+        WaterPathCacheManifestDocument loadedManifest;
+        std::string loadError;
+        auto loaded = LoadWaterPathCacheDocument(
+            ResolveManifestPath(projectPath, state.pathCacheManifest->relativePath),
+            &loadError,
+            &loadedManifest);
+        if (!loaded.has_value() || loaded->stale ||
+            loadedManifest.cacheSchema != state.pathCacheManifest->cacheSchema ||
+            loadedManifest.payloadBytes != state.pathCacheManifest->payloadBytes ||
+            loadedManifest.checksum != state.pathCacheManifest->checksum ||
+            loaded->supportSignature != state.pathCacheManifest->supportSignature ||
+            loaded->emitterSettingsFingerprint !=
+                state.pathCacheManifest->emitterSettingsFingerprint) {
+            continue;
+        }
+        state.pathCache = PruneSettledWaterPathCache(
+            std::move(loaded.value()),
+            state.emitters);
+    }
+}
+
 }  // namespace
 
 bool SaveProjectDocument(
@@ -5182,7 +5745,7 @@ bool SaveProjectDocument(
     const std::filesystem::path& outputPath,
     std::string* errorMessage) {
     json projectJson{
-        {"schema_version", document.schemaVersion},
+        {"schema_version", kProjectDocumentSchemaVersion},
         {"project_name", document.projectName},
         {"selected_layer_path", document.selectedLayerPath.generic_string()},
         {"last_animation_path", document.lastAnimationPath.generic_string()},
@@ -5251,14 +5814,18 @@ bool SaveProjectDocument(
     }
     if (!document.waterSceneStates.empty()) {
         for (const auto& state : document.waterSceneStates) {
-            if (WaterSceneStateHasPayload(state)) {
-                projectJson["water_scene_states"].push_back(SerializeWaterSceneState(state));
+            auto preparedState = PrepareWaterSceneStateForSave(document, state, outputPath);
+            if (WaterSceneStateHasPayload(preparedState)) {
+                projectJson["water_scene_states"].push_back(
+                    SerializeWaterSceneState(preparedState));
             }
         }
     } else {
-        const auto fallbackSceneState = MakeDefaultWaterSceneStateFromProject(document);
+        auto fallbackSceneState = MakeDefaultWaterSceneStateFromProject(document);
+        fallbackSceneState = PrepareWaterSceneStateForSave(document, fallbackSceneState, outputPath);
         if (WaterSceneStateHasPayload(fallbackSceneState)) {
-            projectJson["water_scene_states"].push_back(SerializeWaterSceneState(fallbackSceneState));
+            projectJson["water_scene_states"].push_back(
+                SerializeWaterSceneState(fallbackSceneState));
         }
     }
     for (const auto& profile : document.waterAnimationTrailProfiles) {
@@ -5629,6 +6196,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
             }
         }
     }
+    LoadWaterPathSidecars(inputPath, &document);
     if (!document.waterSceneStates.empty()) {
         const auto& activeSceneState = document.waterSceneStates.front();
         document.waterEmitters = activeSceneState.emitters;
@@ -5637,6 +6205,7 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterRippleLayers = activeSceneState.rippleLayers;
         document.waterFieldLayers = activeSceneState.fieldLayers;
         document.waterPathCache = activeSceneState.pathCache;
+        document.waterPathCacheManifest = activeSceneState.pathCacheManifest;
         document.waterRippleRuntimeCaches = activeSceneState.rippleRuntimeCaches;
         document.waterDynamicMeshFlowSettings.meshPath = activeSceneState.dynamicMeshPath;
         document.waterDynamicMeshFlowSettings.attractors = activeSceneState.dynamicMeshAttractors;
@@ -5805,6 +6374,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
                 ParseWaterManualFlowPath(sourceJson, defaultManualSurfaceGuide));
         }
     }
+    if (document.waterSceneStates.empty() && document.waterPathCache.has_value()) {
+        document.waterPathCache = PruneSettledWaterPathCache(
+            document.waterPathCache.value(),
+            document.waterEmitters);
+    }
     if (document.schemaVersion < kProjectDocumentSchemaVersion) {
         document.schemaVersion = kProjectDocumentSchemaVersion;
     }
@@ -5894,8 +6468,13 @@ bool SaveWaterSourcesDocument(
             sourcesJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
         }
     }
-    if (document.pathCache.has_value() && !document.pathCache->branches.empty()) {
-        sourcesJson["water_path_cache"] = SerializeWaterPathCache(document.pathCache.value());
+    if (document.pathCache.has_value()) {
+        const auto pruned = PruneSettledWaterPathCache(
+            document.pathCache.value(),
+            document.emitters);
+        if (pruned.has_value()) {
+            sourcesJson["water_path_cache"] = SerializeWaterPathCache(pruned.value());
+        }
     }
     return WriteJsonDocument(document, sourcesJson, outputPath, errorMessage);
 }
@@ -6185,13 +6764,140 @@ std::optional<PointCloudStylePresetDocument> LoadPointCloudStylePreset(
 bool SaveWaterPathCacheDocument(
     const invisible_places::water::WaterPathCache& document,
     const std::filesystem::path& outputPath,
-    std::string* errorMessage) {
-    return WriteJsonDocument(document, SerializeWaterPathCache(document), outputPath, errorMessage);
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest) {
+    if (outputPath.extension() != ".flowpathcache") {
+        return WriteJsonDocument(document, SerializeWaterPathCache(document), outputPath, errorMessage);
+    }
+    const auto encoded = EncodeWaterPathCache(document, errorMessage);
+    return encoded.has_value() &&
+           WriteEncodedWaterPathCache(
+               document,
+               encoded.value(),
+               outputPath,
+               errorMessage,
+               manifest);
+}
+
+bool SaveContentAddressedWaterPathCacheDocument(
+    const invisible_places::water::WaterPathCache& document,
+    const std::filesystem::path& outputDirectory,
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest,
+    std::filesystem::path* outputPath) {
+    const auto encoded = EncodeWaterPathCache(document, errorMessage);
+    if (!encoded.has_value()) {
+        return false;
+    }
+    const auto resolvedPath = outputDirectory /
+                              (WaterPathCacheChecksumToken(encoded->checksum) +
+                               ".flowpathcache");
+    if (!WriteEncodedWaterPathCache(
+            document,
+            encoded.value(),
+            resolvedPath,
+            errorMessage,
+            manifest)) {
+        return false;
+    }
+    if (outputPath != nullptr) {
+        *outputPath = resolvedPath;
+    }
+    return true;
 }
 
 std::optional<invisible_places::water::WaterPathCache> LoadWaterPathCacheDocument(
     const std::filesystem::path& inputPath,
-    std::string* errorMessage) {
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest) {
+    std::error_code inputSizeError;
+    const auto inputBytes = std::filesystem::file_size(inputPath, inputSizeError);
+    constexpr std::uint64_t maximumSidecarBytes =
+        kMaximumPersistedWaterCacheBytes + kWaterPathCacheSidecarMagic.size() +
+        sizeof(std::uint32_t) + sizeof(std::uint64_t) +
+        4U * sizeof(std::uint64_t);
+    if (!inputSizeError && inputBytes > maximumSidecarBytes) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water path cache file exceeds the 5 GiB persistence ceiling.";
+        }
+        return std::nullopt;
+    }
+    std::ifstream binaryInput{inputPath, std::ios::binary};
+    if (binaryInput.is_open()) {
+        std::array<char, kWaterPathCacheSidecarMagic.size()> magic{};
+        binaryInput.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+        if (binaryInput.gcount() == static_cast<std::streamsize>(magic.size()) &&
+            magic == kWaterPathCacheSidecarMagic) {
+            std::uint32_t schema = 0U;
+            std::uint64_t payloadBytes = 0U;
+            std::array<std::uint64_t, 4> expectedChecksum{};
+            binaryInput.read(reinterpret_cast<char*>(&schema), sizeof(schema));
+            binaryInput.read(reinterpret_cast<char*>(&payloadBytes), sizeof(payloadBytes));
+            binaryInput.read(
+                reinterpret_cast<char*>(expectedChecksum.data()),
+                static_cast<std::streamsize>(expectedChecksum.size() * sizeof(expectedChecksum.front())));
+            if (!binaryInput.good() || schema != kWaterPathCacheSidecarSchemaVersion ||
+                payloadBytes > kMaximumPersistedWaterCacheBytes ||
+                payloadBytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = "Water path cache sidecar header is invalid.";
+                }
+                return std::nullopt;
+            }
+            std::error_code sizeError;
+            const auto fileBytes = std::filesystem::file_size(inputPath, sizeError);
+            const std::uint64_t headerBytes =
+                static_cast<std::uint64_t>(magic.size()) + sizeof(schema) +
+                sizeof(payloadBytes) +
+                expectedChecksum.size() * sizeof(expectedChecksum.front());
+            if (sizeError || fileBytes != headerBytes + payloadBytes) {
+                if (errorMessage != nullptr) {
+                    *errorMessage =
+                        "Water path cache sidecar payload length does not match the file.";
+                }
+                return std::nullopt;
+            }
+            try {
+                std::vector<std::uint8_t> payload(
+                    static_cast<std::size_t>(payloadBytes));
+                binaryInput.read(
+                    reinterpret_cast<char*>(payload.data()),
+                    static_cast<std::streamsize>(payload.size()));
+                if (!binaryInput.good() ||
+                    binaryInput.peek() != std::char_traits<char>::eof()) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage =
+                            "Water path cache sidecar payload is truncated or has trailing data.";
+                    }
+                    return std::nullopt;
+                }
+                const auto checksum = DigestWaterPathCachePayload(payload);
+                if (checksum != expectedChecksum) {
+                    if (errorMessage != nullptr) {
+                        *errorMessage = "Water path cache sidecar checksum is invalid.";
+                    }
+                    return std::nullopt;
+                }
+                auto cache = ParseWaterPathCache(json::from_cbor(payload));
+                if (manifest != nullptr) {
+                    manifest->relativePath = inputPath;
+                    manifest->cacheSchema = schema;
+                    manifest->supportSignature = cache.supportSignature;
+                    manifest->emitterSettingsFingerprint = cache.emitterSettingsFingerprint;
+                    manifest->payloadBytes = payloadBytes;
+                    manifest->checksum = checksum;
+                }
+                return cache;
+            } catch (const std::exception& error) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = "Failed to allocate or decode water path cache sidecar: " +
+                                    std::string{error.what()};
+                }
+                return std::nullopt;
+            }
+        }
+    }
+
     const auto cacheJson = ReadJsonDocument(inputPath, errorMessage);
     if (!cacheJson.has_value()) {
         return std::nullopt;

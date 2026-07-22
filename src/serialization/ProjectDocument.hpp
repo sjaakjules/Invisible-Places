@@ -19,8 +19,10 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 41U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 42U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 17U;
+inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
+inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
 enum class SerializedLayerKind {
     PointCloud,
@@ -80,6 +82,26 @@ struct WaterRippleRuntimeCacheDocument {
     bool stale = false;
 };
 
+struct WaterPathCacheManifestDocument {
+    std::filesystem::path relativePath;
+    std::uint32_t cacheSchema = kWaterPathCacheSidecarSchemaVersion;
+    std::string supportSignature;
+    std::string emitterSettingsFingerprint;
+    std::uint64_t payloadBytes = 0U;
+    std::array<std::uint64_t, 4> checksum{};
+};
+
+struct WaterSurfaceCacheManifestDocument {
+    std::filesystem::path relativePath;
+    std::uint32_t cacheSchema = invisible_places::water::kWaterSurfaceCacheSchemaVersion;
+    std::string algorithmId = "water-surface-v3";
+    std::string sourceFingerprint;
+    std::uint64_t payloadBytes = 0U;
+    std::array<std::uint64_t, 4> checksum{};
+    std::uint64_t requestedRebuildGeneration = 0U;
+    std::uint64_t builtRebuildGeneration = 0U;
+};
+
 struct WaterSceneStateDocument {
     std::string sceneGroupName = "Default";
     std::vector<invisible_places::water::WaterEmitter> emitters;
@@ -88,6 +110,7 @@ struct WaterSceneStateDocument {
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     std::optional<invisible_places::water::WaterPathCache> pathCache;
+    std::optional<WaterPathCacheManifestDocument> pathCacheManifest;
     std::vector<WaterRippleRuntimeCacheDocument> rippleRuntimeCaches;
     std::filesystem::path dynamicMeshPath;
     std::vector<invisible_places::water::WaterDynamicMeshAttractor> dynamicMeshAttractors;
@@ -111,6 +134,7 @@ struct ScenePointCloudGroupDocument {
     bool displayLoaded = false;
     bool displayVisible = false;
     std::vector<ScenePointCloudRoleSourceDocument> roleSources;
+    std::optional<WaterSurfaceCacheManifestDocument> waterSurfaceCache;
 };
 
 struct ProjectDocument {
@@ -198,6 +222,7 @@ struct ProjectDocument {
     std::vector<WaterSceneStateDocument> waterSceneStates;
     std::vector<invisible_places::water::WaterEffectLayer> waterFieldLayers;
     std::optional<invisible_places::water::WaterPathCache> waterPathCache;
+    std::optional<WaterPathCacheManifestDocument> waterPathCacheManifest;
     std::vector<WaterRippleRuntimeCacheDocument> waterRippleRuntimeCaches;
 };
 
@@ -277,9 +302,17 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
 bool SaveWaterPathCacheDocument(
     const invisible_places::water::WaterPathCache& document,
     const std::filesystem::path& outputPath,
-    std::string* errorMessage);
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest = nullptr);
+bool SaveContentAddressedWaterPathCacheDocument(
+    const invisible_places::water::WaterPathCache& document,
+    const std::filesystem::path& outputDirectory,
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest = nullptr,
+    std::filesystem::path* outputPath = nullptr);
 std::optional<invisible_places::water::WaterPathCache> LoadWaterPathCacheDocument(
     const std::filesystem::path& inputPath,
-    std::string* errorMessage);
+    std::string* errorMessage,
+    WaterPathCacheManifestDocument* manifest = nullptr);
 
 }  // namespace invisible_places::serialization

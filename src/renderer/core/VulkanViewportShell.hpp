@@ -6,7 +6,7 @@
 #include "renderer/gsplat/GsplatLayer.hpp"
 #include "renderer/gsplat/HighQualityGaussianScene.hpp"
 #include "renderer/pointcloud/PointCloudPreviewState.hpp"
-#include "water/RainSimulation.hpp"
+#include "water/WaterSurfaceCache.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <array>
@@ -27,6 +27,9 @@
 struct GLFWwindow;
 
 namespace invisible_places::renderer::core {
+
+inline constexpr std::uint64_t kWaterSurfaceUploadStagingLimitBytes =
+    64ULL * 1024ULL * 1024ULL;
 
 struct ViewportDiagnostics {
     std::string rendererName;
@@ -81,6 +84,7 @@ struct ViewportDiagnostics {
     std::uint64_t waterSurfaceCacheRevision = 0U;
     std::uint64_t waterSurfaceUploadRevision = 0U;
     std::uint64_t waterSurfaceGpuBytes = 0U;
+    std::uint64_t waterSurfacePeakStagingBytes = 0U;
     std::uint32_t waterSurfaceSurfelCellCount = 0U;
     std::uint32_t waterSurfaceTableCapacity = 0U;
     std::uint32_t waterSurfaceMaximumProbeCount = 0U;
@@ -88,6 +92,14 @@ struct ViewportDiagnostics {
     bool waterSurfacePreprocessPending = false;
     std::uint32_t rainParticleCapacity = 0U;
     std::uint32_t rainEventCapacity = 0U;
+};
+
+struct WaterEffectFramePublicationDiagnostics {
+    std::uint64_t requestedGeneration = 0U;
+    std::array<std::uint64_t, 2> liveFrameGenerations{};
+    std::uint64_t exrGeneration = 0U;
+    bool liveBuffersDistinct = false;
+    bool exrBufferDistinct = false;
 };
 
 struct SceneRenderState {
@@ -121,8 +133,8 @@ struct SceneRenderState {
         bool hasSourceRgb = true;
         std::uint32_t drawPointCount = 0;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
-        invisible_places::water::RainCollisionRole rainCollisionRole =
-            invisible_places::water::RainCollisionRole::None;
+        invisible_places::water::WaterSurfaceRole rainCollisionRole =
+            invisible_places::water::WaterSurfaceRole::None;
     };
 
     struct GaussianSplatLayerState {
@@ -212,6 +224,7 @@ struct WaterSurfaceFlowGpuView {
     float resolutionMeters = 0.020F;
     std::uint64_t cacheRevision = 0U;
     std::uint64_t uploadRevision = 0U;
+    const invisible_places::water::WaterSurfaceCacheIdentity* cacheIdentity = nullptr;
     bool valid = false;
     bool preprocessingComplete = false;
 };
@@ -319,6 +332,8 @@ class VulkanViewportShell {
     [[nodiscard]] std::size_t SparseWaterRippleRegionCount(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t SparseWaterRippleMembershipUploadRevision(std::size_t layerId) const;
     [[nodiscard]] std::uint64_t SparseWaterRippleParamsUploadRevision(std::size_t layerId) const;
+    [[nodiscard]] WaterEffectFramePublicationDiagnostics SparseWaterRippleParamsPublicationState(
+        std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageNodeCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageOccupiedCellCount(std::size_t layerId) const;
     [[nodiscard]] std::size_t WaterSeepageNodeReferenceCount(std::size_t layerId) const;
@@ -342,9 +357,7 @@ class VulkanViewportShell {
     void ClearWaterSurfaceCache();
     [[nodiscard]] WaterSurfaceFlowGpuView WaterSurfaceFlowView() const;
     [[nodiscard]] bool WaterSurfaceUploadPending() const;
-    void UploadRainCollisionCache(const invisible_places::water::RainCollisionCache& cache);
-    void ClearRainCollisionCache();
-    [[nodiscard]] std::uint64_t RainCollisionUploadRevision() const;
+    [[nodiscard]] std::uint64_t WaterSurfaceUploadRevision() const;
     void UploadGaussianSplats(std::size_t layerId, const invisible_places::io::LoadedGaussianSplat& splats);
     void RemoveGaussianSplats(std::size_t layerId);
     void ClearGaussianSplats();
@@ -412,6 +425,7 @@ class VulkanViewportShell {
             BufferAllocation scalarFieldBuffer{};
             std::uint32_t pointCapacity = 0U;
             std::uint32_t outstandingFrameMask = 0U;
+            bool outstandingExr = false;
         };
 
         std::size_t layerId = 0;
@@ -422,9 +436,11 @@ class VulkanViewportShell {
         BufferAllocation scalarFieldBuffer{};
         BufferAllocation sparseRippleRangeBuffer{};
         BufferAllocation sparseRippleMembershipBuffer{};
-        BufferAllocation sparseRippleParamsBuffer{};
-        // Immutable node geometry and surface guides. Animated look/state lives
-        // in one parameter buffer per in-flight frame plus an EXR snapshot.
+        // Animated Ripple and Seepage state is published only after the target
+        // frame fence signals. Dedicated EXR snapshots keep asynchronous export
+        // reads isolated from live viewport updates.
+        std::array<BufferAllocation, kFramesInFlight> sparseRippleParamsBuffers{};
+        BufferAllocation sparseRippleExrParamsBuffer{};
         BufferAllocation seepageNodeBuffer{};
         std::array<BufferAllocation, kFramesInFlight> seepageParamsBuffers{};
         BufferAllocation seepageExrParamsBuffer{};
@@ -469,6 +485,10 @@ class VulkanViewportShell {
         std::uint32_t sparseRippleParamCount = 0;
         std::uint64_t sparseRippleMembershipUploadRevision = 0;
         std::uint64_t sparseRippleParamsUploadRevision = 0;
+        std::uint64_t sparseRippleParamsGeneration = 0;
+        std::array<std::uint64_t, kFramesInFlight> sparseRippleParamsFrameGenerations{};
+        std::uint64_t sparseRippleParamsExrGeneration = 0;
+        std::vector<std::byte> pendingSparseRippleParams;
         std::uint32_t seepageNodeCount = 0;
         std::uint32_t seepageHashCellCapacity = 0;
         std::uint32_t seepageOccupiedCellCount = 0;
@@ -620,12 +640,9 @@ class VulkanViewportShell {
     };
 
     struct WaterSurfacePendingGpuUpload {
-        // Short-lived mapped sources for the immutable cache upload. The
-        // resident tables below are device-local and are swapped into Rain and
-        // Flow descriptors only after this upload's fence signals.
-        BufferAllocation surfaceStagingBuffer{};
-        BufferAllocation vegetationStagingBuffer{};
-        BufferAllocation flowSurfaceStagingBuffer{};
+        // Resident tables are swapped into Rain and Flow descriptors only
+        // after preprocessing signals. Upload staging is bounded and released
+        // before this pending job is retained.
         BufferAllocation surfaceTableBuffer{};
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceInputBuffer{};
@@ -648,6 +665,7 @@ class VulkanViewportShell {
         invisible_places::water::WaterSurfaceCacheIdentity cacheIdentity{};
         std::uint64_t uploadRevision = 0U;
         std::uint64_t tableBytes = 0U;
+        std::uint64_t peakStagingBytes = 0U;
     };
 
     struct WaterSurfaceRetiredGpuResources {
@@ -656,6 +674,7 @@ class VulkanViewportShell {
         BufferAllocation flowSurfaceTableBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
         std::uint32_t outstandingFrameMask = 0U;
+        bool outstandingExr = false;
     };
 
     struct RainGpuResources {
@@ -665,10 +684,13 @@ class VulkanViewportShell {
         BufferAllocation particleBuffer{};
         BufferAllocation eventBuffer{};
         BufferAllocation counterBuffer{};
+        std::array<BufferAllocation, kFramesInFlight> counterReadbackBuffers{};
         BufferAllocation impactCountBuffer{};
         BufferAllocation impactReferenceBuffer{};
         std::array<BufferAllocation, kFramesInFlight> uniformBuffers{};
+        BufferAllocation exrUniformBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+        VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
         WaterSurfacePendingGpuUpload pendingSurfaceUpload{};
         std::vector<WaterSurfacePendingGpuUpload> abandonedSurfaceUploads;
         std::vector<WaterSurfaceRetiredGpuResources> retiredSurfaceResources;
@@ -687,6 +709,7 @@ class VulkanViewportShell {
         std::uint64_t collisionUploadRevision = 0U;
         std::uint64_t flowSurfaceResidentUploadRevision = 0U;
         std::uint64_t residentTableBytes = 0U;
+        std::uint64_t peakStagingBytes = 0U;
         std::uint32_t preprocessDispatchCount = 0U;
         std::uint32_t lastSeed = 0U;
         float previousTimeSeconds = -std::numeric_limits<float>::infinity();
@@ -753,16 +776,33 @@ class VulkanViewportShell {
         const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets,
         const BufferAllocation& surfaceTableBuffer,
         const BufferAllocation& vegetationTableBuffer);
+    void UpdateRainExrDescriptorSet(
+        const BufferAllocation& surfaceTableBuffer,
+        const BufferAllocation& vegetationTableBuffer);
     void UpdateWaterSurfacePreprocessDescriptorSet(WaterSurfacePendingGpuUpload* pending);
-    void DispatchWaterSurfacePreprocess(WaterSurfacePendingGpuUpload* pending);
+    bool DispatchWaterSurfacePreprocess(WaterSurfacePendingGpuUpload* pending);
     void PollWaterSurfacePreprocess();
     void CleanupWaterSurfacePendingUpload(WaterSurfacePendingGpuUpload* pending);
     void CleanupWaterSurfaceRetiredResources(WaterSurfaceRetiredGpuResources* retired);
     void UpdateRainRuntimeTiming(const SceneRenderState& state);
     void UploadRainUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);
+    void UploadRainUniformsToBuffer(
+        const BufferAllocation& target,
+        std::uint32_t width,
+        std::uint32_t height);
     void RecordRainCompute(VkCommandBuffer commandBuffer, std::size_t frameIndex);
+    void RecordRainComputeWithDescriptor(
+        VkCommandBuffer commandBuffer,
+        VkDescriptorSet descriptorSet,
+        const BufferAllocation* counterReadback);
     void RecordRainDraw(VkCommandBuffer commandBuffer, std::size_t frameIndex, VkPipeline pipeline);
+    void RecordRainDrawWithDescriptor(
+        VkCommandBuffer commandBuffer,
+        VkDescriptorSet descriptorSet,
+        VkPipeline pipeline);
     void CleanupRainResources();
+    void FlushSparseWaterRippleParamsForFrame(std::size_t frameIndex);
+    void FlushSparseWaterRippleParamsForExr();
     void FlushWaterSeepageParamsForFrame(std::size_t frameIndex);
     void FlushWaterSeepageParamsForExr();
     void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);

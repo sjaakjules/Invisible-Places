@@ -1865,7 +1865,7 @@ bool BuildOfflinePointSample(
         }
     }
     const auto rainImpact =
-        layer.rainImpactGrid != nullptr && layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None
+        layer.rainImpactGrid != nullptr && layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None
             ? invisible_places::water::EvaluateRainImpact(
                   *layer.rainImpactGrid,
                   layer.rainCollisionRole,
@@ -2018,7 +2018,7 @@ bool BuildOfflinePointSample(
             sparseRipple.colour,
             Clamp01(sparseRipple.colourMix));
         const glm::vec3 rainImpactColour =
-            layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Vegetation
+            layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Vegetation
                 ? glm::vec3{0.54F, 0.80F, 0.82F}
                 : glm::vec3{0.24F, 0.48F, 0.62F};
         sample->color = glm::mix(
@@ -2283,7 +2283,7 @@ void InitializeExrImage(ExrImage* image, std::uint32_t width, std::uint32_t heig
 
 void AdvanceOfflineRainFrame(
     OfflineRainSimulationState* state,
-    const invisible_places::water::RainCollisionCache& collisionCache,
+    const invisible_places::water::WaterSurfaceCache& surfaceCache,
     const invisible_places::water::RainRuntimeSettings& settings,
     const invisible_places::water::WaterRainVisualSettings& visual,
     const invisible_places::camera::CameraState& cameraState,
@@ -2302,10 +2302,10 @@ void AdvanceOfflineRainFrame(
     simulationFrame.spawnCentre = {
         centre[0],
         centre[1],
-        collisionCache.bounds.valid ? collisionCache.bounds.maximum.z : centre[2]};
+        surfaceCache.bounds.valid ? surfaceCache.bounds.maximum.z : centre[2]};
     simulationFrame.timeSeconds = timeSeconds;
     simulationFrame.deltaSeconds = deltaSeconds;
-    state->diagnostics = state->simulator.Advance(simulationFrame, collisionCache);
+    state->diagnostics = state->simulator.Advance(simulationFrame, surfaceCache);
     state->impactGrid = settings.enabled && settings.impactEffectsEnabled
                             ? invisible_places::water::BuildRainImpactGrid(
                                   state->simulator.Events(),
@@ -2579,7 +2579,7 @@ void RenderFastBasicPointCloudTile(
             }
             const auto rainImpact =
                 layer.rainImpactGrid != nullptr &&
-                        layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None
+                        layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None
                     ? invisible_places::water::EvaluateRainImpact(
                           *layer.rainImpactGrid,
                           layer.rainCollisionRole,
@@ -2594,7 +2594,7 @@ void RenderFastBasicPointCloudTile(
                     Clamp01(sparseRipple.colourMix)) *
                 (1.0F + std::max(0.0F, sparseRipple.emissionAdd));
             const glm::vec3 rainColour =
-                layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Vegetation
+                layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Vegetation
                     ? glm::vec3{0.54F, 0.80F, 0.82F}
                     : glm::vec3{0.24F, 0.48F, 0.62F};
             color = glm::mix(color, rainColour, std::clamp(rainImpact.colourBlend, 0.0F, 0.72F));

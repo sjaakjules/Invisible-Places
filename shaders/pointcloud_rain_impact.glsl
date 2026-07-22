@@ -139,6 +139,9 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         return composite;
     }
     const uint cellIndex = uint(coordinate.y) * dimension + uint(coordinate.x);
+    if (cellIndex >= uint(rainImpactCounts.length())) {
+        return composite;
+    }
     const uvec4 counts = rainImpactCounts[cellIndex];
     uint count = 0u;
     uint offset = 0u;
@@ -156,8 +159,14 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
 
     const float time = styleData.rainImpactGrid.w;
     for (uint localIndex = 0u; localIndex < count; ++localIndex) {
-        const uint eventIndex = rainImpactReferences[cellIndex * kRainReferencesPerCell + offset + localIndex];
-        if (eventIndex >= styleData.rainImpactControl.w) {
+        const uint referenceIndex =
+            cellIndex * kRainReferencesPerCell + offset + localIndex;
+        if (referenceIndex >= uint(rainImpactReferences.length())) {
+            break;
+        }
+        const uint eventIndex = rainImpactReferences[referenceIndex];
+        if (eventIndex >= styleData.rainImpactControl.w ||
+            eventIndex >= uint(rainImpactEvents.length())) {
             continue;
         }
         const RainImpactEventGpu event = rainImpactEvents[eventIndex];

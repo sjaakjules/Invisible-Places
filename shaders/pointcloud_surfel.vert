@@ -1062,10 +1062,21 @@ void main() {
              rainImpact.pointSizeMultiply) +
         waterEffectPointSizeAdd +
         sparseRipplePointSizeAdd;
-    const float diameter =
+    const float unboundedDiameter =
         authoredDiameter * max(1.0e-6, styleData.renderParams1.y) +
         (ResolveDepthOfFieldWorldRadius(centerDepth) * 2.0) +
         ScreenPixelWorldSpan(centerDepth, styleData.renderParams2.x);
+    const float maximumDiameter = max(
+        1.0e-6,
+        ScreenPixelWorldSpan(
+            centerDepth,
+            max(1.0, styleData.renderParams3.z)));
+    // Invalid effect data must not expand one surfel into a screen-sized quad.
+    // Screen-sprite paths already apply this maximum through gl_PointSize.
+    const float diameter =
+        (isnan(unboundedDiameter) || isinf(unboundedDiameter))
+            ? 0.0
+            : clamp(unboundedDiameter, 0.0, maximumDiameter);
     float waterStreakAspect = styleData.pointMeta.w != 0u ? max(1.0, styleData.renderParams2.z) : 1.0;
     if (WaterTrailOverlayEnabled()) {
         const float trailStreakLength = WaterTrailStreakLength(pointIndex);

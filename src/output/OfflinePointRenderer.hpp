@@ -41,8 +41,8 @@ struct OfflinePointLayer {
     std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
     std::vector<glm::uvec2> rippleMembershipRanges;
     invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
-    invisible_places::water::RainCollisionRole rainCollisionRole =
-        invisible_places::water::RainCollisionRole::None;
+    invisible_places::water::WaterSurfaceRole rainCollisionRole =
+        invisible_places::water::WaterSurfaceRole::None;
     const invisible_places::water::RainImpactGrid* rainImpactGrid = nullptr;
     float roughnessMotionMinimum = 0.0F;
     float roughnessMotionInvRange = 1.0F;
@@ -101,7 +101,7 @@ struct OfflinePointRenderScratch {
 void InitializeExrImage(ExrImage* image, std::uint32_t width, std::uint32_t height);
 void AdvanceOfflineRainFrame(
     OfflineRainSimulationState* state,
-    const invisible_places::water::RainCollisionCache& collisionCache,
+    const invisible_places::water::WaterSurfaceCache& surfaceCache,
     const invisible_places::water::RainRuntimeSettings& settings,
     const invisible_places::water::WaterRainVisualSettings& visual,
     const invisible_places::camera::CameraState& cameraState,

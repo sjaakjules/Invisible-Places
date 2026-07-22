@@ -1270,7 +1270,7 @@ TEST_CASE("Seepage Rain envelopes are immediate by default and deterministic whe
 TEST_CASE("Seepage surface-cache guides follow a vertical ROCK sheet", "[water][seepage][surface-cache][guide]") {
     using invisible_places::water::BuildWaterSeepageSurfaceGuides;
     using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
-    using invisible_places::water::RainCollisionRole;
+    using invisible_places::water::WaterSurfaceRole;
     using invisible_places::water::WaterSurfaceSample;
 
     std::vector<WaterSurfaceSample> samples;
@@ -1283,7 +1283,7 @@ TEST_CASE("Seepage surface-cache guides follow a vertical ROCK sheet", "[water][
                     -0.001F - static_cast<float>(station) * 0.020F,
                 },
                 .normal = {1.0F, 0.0F, 0.0F},
-                .role = RainCollisionRole::Rock,
+                .role = WaterSurfaceRole::Rock,
             });
         }
     }

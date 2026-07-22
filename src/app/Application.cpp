@@ -33,6 +33,7 @@
 #include "style/RenderParameterBinding.hpp"
 #include "ui/SidePanelState.hpp"
 #include "water/RainSimulation.hpp"
+#include "water/WaterSurfaceCache.hpp"
 #include "water/WaterFlow.hpp"
 
 #include <imgui.h>
@@ -123,6 +124,8 @@ using FieldMapFlags = invisible_places::style::FieldMapFlags;
 using ProjectDocument = invisible_places::serialization::ProjectDocument;
 using ProjectLayerDocument = invisible_places::serialization::ProjectLayerDocument;
 using PointCloudStylePresetDocument = invisible_places::serialization::PointCloudStylePresetDocument;
+using WaterSurfaceCacheManifestDocument =
+    invisible_places::serialization::WaterSurfaceCacheManifestDocument;
 using WaterRippleRuntimeCacheDocument = invisible_places::serialization::WaterRippleRuntimeCacheDocument;
 using WaterLaneProfileDocument = invisible_places::serialization::WaterLaneProfileDocument;
 using WaterPathProfileDocument = invisible_places::serialization::WaterPathProfileDocument;
@@ -164,11 +167,12 @@ using WaterPathGenerationSettings = invisible_places::water::WaterPathGeneration
 using WaterRenderSettings = invisible_places::water::WaterRenderSettings;
 using WaterRainIntensityPreset = invisible_places::water::WaterRainIntensityPreset;
 using WaterRainSettings = invisible_places::water::WaterRainSettings;
-using RainCollisionCache = invisible_places::water::RainCollisionCache;
-using RainCollisionBuildResult = invisible_places::water::RainCollisionBuildResult;
 using WaterSurfaceCache = invisible_places::water::WaterSurfaceCache;
-using RainCollisionRole = invisible_places::water::RainCollisionRole;
-using RainCollisionSource = invisible_places::water::RainCollisionSource;
+using WaterSurfaceBuildResult = invisible_places::water::WaterSurfaceBuildResult;
+using WaterSurfaceCacheRuntimeStatus =
+    invisible_places::water::WaterSurfaceCacheRuntimeStatus;
+using WaterSurfaceRole = invisible_places::water::WaterSurfaceRole;
+using WaterSurfaceSource = invisible_places::water::WaterSurfaceSource;
 using RainRuntimeSettings = invisible_places::water::RainRuntimeSettings;
 using WaterRainVisualSettings = invisible_places::water::WaterRainVisualSettings;
 using WaterSeepageLookProfile = invisible_places::water::WaterSeepageLookProfile;
@@ -642,6 +646,7 @@ struct OfflineRenderJobState {
 };
 
 struct PreviewRuntimeState;
+struct WaterFrameState;
 std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepageLayers(
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
@@ -652,13 +657,16 @@ std::vector<OfflineRenderJobState::FrozenFlowSourceLayer> BuildFrozenAnimationFl
 std::optional<invisible_places::water::WaterScenarioState> EvaluateFrozenAnimationWaterScenario(
     const OfflineRenderJobState& job,
     float sampleTimeSeconds);
+WaterFrameState ResolveFrozenWaterFrameState(
+    const OfflineRenderJobState& job,
+    float sampleTimeSeconds);
 invisible_places::water::WaterSeepageRainEnvelope BuildFrozenAnimationSeepageRainEnvelope(
     const std::optional<AnimationPath>& animationPath,
     std::span<const invisible_places::water::WaterScenarioDefinition> definitions);
 void UploadFrozenAnimationSeepageParameters(
     OfflineRenderJobState* job,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
-    float sampleTimeSeconds);
+    const WaterFrameState& frameState);
 
 struct StillCameraPreviewLodPreparationRequest {
     std::size_t sessionIndex = 0;
@@ -701,7 +709,7 @@ struct OfflineRenderProgressState {
 struct PreviewLayerSession;
 struct PreviewRuntimeState;
 struct WaterWorkflowState;
-RainCollisionRole RainCollisionRoleForSession(const PreviewLayerSession& session);
+WaterSurfaceRole RainCollisionRoleForSession(const PreviewLayerSession& session);
 void InvalidateWaterSeepageTopology(WaterWorkflowState* water);
 
 void EnsureCameraShotSelections(CameraPanelState* panelState, std::size_t shotCount);
@@ -795,7 +803,7 @@ struct OfflinePointLayerSnapshot {
     std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
     std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
     invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
-    RainCollisionRole rainCollisionRole = RainCollisionRole::None;
+    WaterSurfaceRole rainCollisionRole = WaterSurfaceRole::None;
 };
 
 using SavedPointVisualState = invisible_places::app::point_visual::VisualState;
@@ -1033,15 +1041,20 @@ struct DynamicMeshSurfaceCacheWarmupJob {
     std::chrono::steady_clock::time_point startedAt{};
 };
 
-struct RainCollisionCacheWarmupShared {
+struct WaterSurfaceCacheWarmupResult {
+    WaterSurfaceBuildResult build;
+    std::filesystem::path cachePath;
+};
+
+struct WaterSurfaceCacheWarmupShared {
     std::mutex mutex;
-    std::optional<RainCollisionBuildResult> result;
+    std::optional<WaterSurfaceCacheWarmupResult> result;
     std::atomic_bool cancelRequested{false};
     std::string stage;
 };
 
-struct RainCollisionCacheWarmupJob {
-    std::shared_ptr<RainCollisionCacheWarmupShared> shared;
+struct WaterSurfaceCacheWarmupJob {
+    std::shared_ptr<WaterSurfaceCacheWarmupShared> shared;
     std::jthread worker;
     std::string sceneGroupName;
     std::string signature;
@@ -1067,11 +1080,26 @@ struct SceneDisplayBundleRuntime {
     std::uint64_t totalPointCount = 0U;
 };
 
+enum class DeferredSceneAnalysisAction : std::uint8_t {
+    None = 0U,
+    BakeWaterPath = 1U << 0U,
+    RefreshWaterField = 1U << 1U,
+    RefreshWaterRipple = 1U << 2U,
+    RefreshRegionPreviews = 1U << 3U,
+};
+
+constexpr std::uint8_t DeferredSceneAnalysisActionBit(DeferredSceneAnalysisAction action) {
+    return static_cast<std::uint8_t>(action);
+}
+
 struct ScenePointCloudRuntime {
     std::string sceneGroupName;
     std::filesystem::path sourceFolder;
-    std::vector<RainCollisionSource> rainCollisionSources;
-    std::string rainCollisionSignature;
+    std::vector<WaterSurfaceSource> waterSurfaceSources;
+    std::string waterSurfaceSignature;
+    std::optional<WaterSurfaceCacheManifestDocument> waterSurfaceCache;
+    WaterSurfaceCacheRuntimeStatus waterSurfaceCacheStatus =
+        WaterSurfaceCacheRuntimeStatus::Missing;
     std::array<std::optional<std::size_t>, invisible_places::scene::kScenePointCloudRoleCount>
         analysisSessionIndices{};
     std::vector<SceneDisplayBundleRuntime> displayBundles;
@@ -1087,6 +1115,7 @@ struct ScenePointCloudRuntime {
     bool mixedDisplay = false;
     std::uint64_t switchGeneration = 0U;
     std::size_t stagedReadyCount = 0U;
+    std::uint8_t deferredAnalysisActions = 0U;
     std::string switchError;
 };
 
@@ -1336,12 +1365,21 @@ struct WaterWorkflowState {
         invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
     RainRuntimeSettings collisionRainSettings = invisible_places::water::DefaultRainRuntimeSettings();
     WaterRainVisualSettings rainVisual = invisible_places::water::RainVisualPreset("Rain Fine Lines");
-    std::shared_ptr<WaterSurfaceCache> rainCollisionCache;
-    std::string rainCollisionSceneGroupName;
-    std::string rainCollisionCacheSignature;
+    std::shared_ptr<WaterSurfaceCache> waterSurfaceCache;
+    std::string waterSurfaceSceneGroupName;
+    std::string waterSurfaceCacheSignature;
     bool waterSurfaceCacheLoadedFromDisk = false;
-    std::vector<std::string> rainCollisionWarnings;
-    RainCollisionCacheWarmupJob rainCollisionCacheWarmup;
+    bool waterSurfaceCachePreprocessPending = false;
+    std::vector<std::string> waterSurfaceCacheWarnings;
+    WaterSurfaceCacheWarmupJob waterSurfaceCacheWarmup;
+    // Monotonic acceptance diagnostics. These count actual background/GPU
+    // work across project loads so parameter-only animation can prove that it
+    // did not silently rescan or rebuild immutable terrain data.
+    std::uint64_t waterSurfaceSourceScanCount = 0U;
+    std::uint64_t waterSurfaceGpuTableBuildCount = 0U;
+    std::uint64_t waterSurfaceFullPayloadHashPassCount = 0U;
+    std::uint64_t waterSurfaceCacheBuildCount = 0U;
+    std::uint64_t waterSurfaceCacheInstallCount = 0U;
     WaterDynamicMeshFlowDiagnostics dynamicMeshFlowDiagnostics{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
     bool showFlowSourceGuides = true;
@@ -1419,7 +1457,12 @@ struct WaterWorkflowState {
     std::unordered_map<std::string, std::string> seepageRuntimeGuideKeys;
     std::unordered_map<std::string, std::vector<WaterSeepageSurfaceGuide>> seepageSurfaceGuides;
     std::unordered_map<std::string, std::string> seepageSurfaceGuideFingerprints;
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::uint32_t, std::string>>
+        seepageSurfaceGuideNodeFingerprints;
     std::string seepageSurfaceGuideWarning;
+    std::uint64_t seepageSurfaceGuideBuildCount = 0U;
     std::uint64_t seepageTopologyUploadRevision = 0U;
     std::uint64_t seepageParamsUploadRevision = 0U;
     std::size_t seepageGpuBytes = 0U;
@@ -1440,6 +1483,8 @@ struct WaterWorkflowState {
     std::chrono::steady_clock::time_point pendingRippleLiveEffectAt{};
     WaterRegionPointPreviewJobState regionPointPreviewJob;
     WaterFlowTrailBuildJobState flowTrailBuildJob;
+    std::uint64_t flowGpuComputeDispatchCount = 0U;
+    std::unordered_map<std::uint32_t, std::uint64_t> flowGpuComputeDispatchCountBySource;
     std::unordered_map<std::uint32_t, WaterFlowTrailSourceArtifact> flowTrailSourceArtifacts;
     // Compact, immutable per-source capture state. A source-scoped edit
     // replaces only its entry; unchanged source requests share their anchor
@@ -1471,7 +1516,7 @@ struct PreviewRuntimeState {
     ProjectSettings projectSettings{};
     ProjectPointVisualLibraryState pointVisualLibrary{};
     PersistenceState persistence{};
-    std::filesystem::path rainCollisionCacheRoot;
+    std::filesystem::path waterSurfaceCacheRoot;
     invisible_places::platform::ScopedPowerAssertion exportPowerAssertion{};
     bool showDiagnosticsPanel = false;
     bool pauseLiveViewportDuringExport = true;
@@ -1589,23 +1634,32 @@ std::optional<invisible_places::water::WaterScenarioState> ResolveActiveWaterSce
     return fallbackDefinition->state;
 }
 
-struct ActiveWaterSeepageRuntimeState {
-    std::optional<invisible_places::water::WaterScenarioState> scenarioState;
+struct WaterFrameState {
+    float normalizedTime = 0.0F;
+    float sampleTimeSeconds = 0.0F;
+    std::optional<invisible_places::water::WaterScenarioState> rawScenarioState;
+    std::optional<invisible_places::water::WaterScenarioState> seepageScenarioState;
     std::vector<invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates;
 };
 
-ActiveWaterSeepageRuntimeState ResolveActiveWaterSeepageRuntimeState(
+WaterFrameState ResolveWaterFrameState(
     PreviewRuntimeState* runtimeState) {
-    ActiveWaterSeepageRuntimeState result;
+    WaterFrameState result;
     if (runtimeState == nullptr) {
         return result;
     }
-    result.scenarioState = ResolveActiveWaterScenarioState(*runtimeState);
+    result.normalizedTime = std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
+    result.rawScenarioState = ResolveActiveWaterScenarioState(*runtimeState);
+    result.seepageScenarioState = result.rawScenarioState;
     if (!runtimeState->animationPanel.currentPath.has_value()) {
         return result;
     }
 
     const auto& animation = runtimeState->animationPanel.currentPath.value();
+    const float durationSeconds = std::max(
+        1.0e-6F,
+        invisible_places::camera::AnimationPathDurationSeconds(animation));
+    result.sampleTimeSeconds = result.normalizedTime * durationSeconds;
     if (animation.selectedWaterScenarioId.empty()) {
         return result;
     }
@@ -1621,20 +1675,17 @@ ActiveWaterSeepageRuntimeState ResolveActiveWaterSeepageRuntimeState(
 
     result.nodeStates = invisible_places::water::EvaluateWaterSeepageNodeAnimationTracks(
         *trackIt,
-        runtimeState->animationPanel.scrubAmount);
+        result.normalizedTime);
     const auto* definition = FindWaterScenarioDefinition(
         runtimeState->water,
         animation.selectedWaterScenarioId);
     if (definition == nullptr && !trackIt->fallbackScenario.id.empty()) {
         definition = &trackIt->fallbackScenario;
     }
-    if (definition == nullptr || !result.scenarioState.has_value()) {
+    if (definition == nullptr || !result.seepageScenarioState.has_value()) {
         return result;
     }
 
-    const float durationSeconds = std::max(
-        1.0e-6F,
-        invisible_places::camera::AnimationPathDurationSeconds(animation));
     const auto envelopeFingerprint =
         invisible_places::water::WaterSeepageRainEnvelopeFingerprint(
             *trackIt,
@@ -1647,11 +1698,10 @@ ActiveWaterSeepageRuntimeState ResolveActiveWaterSeepageRuntimeState(
             *definition,
             durationSeconds);
     }
-    result.scenarioState->rainLevel =
+    result.seepageScenarioState->rainLevel =
         invisible_places::water::EvaluateWaterSeepageRainEnvelope(
             envelope,
-            std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F) *
-                durationSeconds);
+            result.sampleTimeSeconds);
     return result;
 }
 
@@ -1787,6 +1837,23 @@ double PercentileValue(std::vector<double> values, double percentile) {
 
 std::string NormalizePathKey(const std::filesystem::path& path) {
     return path.lexically_normal().generic_string();
+}
+
+bool PathsReferToSameLocation(
+    const std::filesystem::path& left,
+    const std::filesystem::path& right) {
+    if (left.empty() || right.empty()) {
+        return false;
+    }
+    if (NormalizePathKey(left) == NormalizePathKey(right)) {
+        return true;
+    }
+    std::error_code leftError;
+    std::error_code rightError;
+    const auto absoluteLeft = std::filesystem::absolute(left, leftError);
+    const auto absoluteRight = std::filesystem::absolute(right, rightError);
+    return !leftError && !rightError &&
+           NormalizePathKey(absoluteLeft) == NormalizePathKey(absoluteRight);
 }
 
 std::string LowercaseAsciiCopy(std::string value) {
@@ -3610,6 +3677,13 @@ std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
     PreviewRuntimeState* runtimeState,
     WaterDynamicMeshFlowDiagnostics* diagnostics);
 std::optional<std::size_t> ResolveWaterSupportSessionIndex(const PreviewRuntimeState& runtimeState);
+std::optional<std::size_t> ResolveWaterRuntimeSessionIndex(const PreviewRuntimeState& runtimeState);
+bool BakeWaterOverlayForActiveLayer(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport);
+bool RefreshWaterFieldOverlays(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport);
 bool HasValidManualFlowPath(const WaterWorkflowState& water);
 WaterSourceSettings ActiveProfileDefaultWaterSourceSettings(const WaterWorkflowState& water);
 bool TryLoadWaterPathCacheForSupport(
@@ -5274,6 +5348,12 @@ bool IsSceneGroupedPointCloud(const PreviewLayerSession& session) {
            !session.sceneRole.empty();
 }
 
+bool IsAuthoredWaterTerrainSession(const PreviewLayerSession& session) {
+    return session.kind == LayerKind::PointCloud &&
+           !IsGeneratedWaterOverlaySession(session) &&
+           invisible_places::scene::ParseScenePointCloudRole(session.sceneRole).has_value();
+}
+
 bool SessionsShareSceneFolder(
     const PreviewLayerSession& left,
     const PreviewLayerSession& right) {
@@ -5326,9 +5406,8 @@ void AssignDefaultSceneVariantSelections(std::vector<PreviewLayerSession>* sessi
 std::optional<std::size_t> SessionIndexForSourcePath(
     const std::vector<PreviewLayerSession>& sessions,
     const std::filesystem::path& sourcePath) {
-    const auto sourceKey = NormalizePathKey(sourcePath);
     for (std::size_t index = 0; index < sessions.size(); ++index) {
-        if (NormalizePathKey(sessions[index].sourcePath) == sourceKey) {
+        if (PathsReferToSameLocation(sessions[index].sourcePath, sourcePath)) {
             return index;
         }
     }
@@ -5349,10 +5428,10 @@ std::vector<ScenePointCloudRuntime> BuildScenePointCloudRuntimeStates(
         ScenePointCloudRuntime scene;
         scene.sceneGroupName = group.name;
         scene.sourceFolder = group.sourceFolder;
-        scene.rainCollisionSources = invisible_places::water::SelectRainCollisionSources(group);
-        if (!scene.rainCollisionSources.empty()) {
-            scene.rainCollisionSignature = invisible_places::water::RainCollisionCacheSignature(
-                scene.rainCollisionSources);
+        scene.waterSurfaceSources = invisible_places::water::SelectWaterSurfaceSources(group);
+        if (!scene.waterSurfaceSources.empty()) {
+            scene.waterSurfaceSignature = invisible_places::water::WaterSurfaceCacheSignature(
+                scene.waterSurfaceSources);
         }
 
         for (std::size_t roleIndex = 0;
@@ -6930,6 +7009,18 @@ std::vector<std::size_t> SurfacePivotCandidateSessionIndices(
                     indices.push_back(analysisIndex.value());
                 }
             }
+            if (indices.empty()) {
+                for (const auto displayIndex : scene->committedDisplaySessionIndices) {
+                    if (displayIndex.has_value() &&
+                        displayIndex.value() < runtimeState.sessions.size() &&
+                        IsCommittedDisplayPointCloudReady(
+                            runtimeState,
+                            runtimeState.sessions[displayIndex.value()]) &&
+                        runtimeState.sessions[displayIndex.value()].offlinePointCloud != nullptr) {
+                        indices.push_back(displayIndex.value());
+                    }
+                }
+            }
             return indices;
         }
     }
@@ -6938,7 +7029,9 @@ std::vector<std::size_t> SurfacePivotCandidateSessionIndices(
     for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
         const auto& session = runtimeState.sessions[index];
         const bool usable = IsSceneGroupedPointCloud(session)
-                                ? IsCpuReadyAnalysisPointCloudSource(session)
+                                ? (IsCpuReadyAnalysisPointCloudSource(session) ||
+                                   (IsCommittedDisplayPointCloudReady(runtimeState, session) &&
+                                    session.offlinePointCloud != nullptr))
                                 : (session.loaded && session.visible);
         if (!usable || session.pivotSamples.empty() ||
             IsGeneratedWaterOverlaySession(session)) {
@@ -6981,7 +7074,9 @@ std::optional<ResolvedPivot> ResolveSurfacePivot(
             }
             const auto& session = runtimeState.sessions[sessionIndex];
             const bool usable = IsSceneGroupedPointCloud(session)
-                                    ? IsCpuReadyAnalysisPointCloudSource(session)
+                                    ? (IsCpuReadyAnalysisPointCloudSource(session) ||
+                                       (IsCommittedDisplayPointCloudReady(runtimeState, session) &&
+                                        session.offlinePointCloud != nullptr))
                                     : (session.loaded && session.visible);
             if (!usable || session.pivotSamples.empty() ||
                 IsGeneratedWaterOverlaySession(session)) {
@@ -7494,6 +7589,33 @@ void BeginLayerLoad(
         return;
     }
 
+    const bool exclusiveHighMemoryWorkActive =
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ||
+        runtimeState->water.waterSurfaceCachePreprocessPending ||
+        runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.joinable();
+    if (exclusiveHighMemoryWorkActive) {
+        const auto alreadyQueued = std::any_of(
+            runtimeState->persistence.queuedLoads.begin(),
+            runtimeState->persistence.queuedLoads.end(),
+            [&](const QueuedLayerLoad& queued) {
+                return queued.sessionIndex == sessionIndex &&
+                       queued.purpose == purpose &&
+                       queued.sceneSwitchGeneration == sceneSwitchGeneration;
+            });
+        if (!alreadyQueued) {
+            runtimeState->persistence.queuedLoads.push_back({
+                .sessionIndex = sessionIndex,
+                .purpose = purpose,
+                .sceneSwitchGeneration = sceneSwitchGeneration,
+            });
+        }
+        runtimeState->statusMessage =
+            "Queued " + session.displayName +
+            " until the active shared-cache or mesh high-memory slot completes.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
     if (session.kind == LayerKind::PointCloud && session.cpuResident && session.offlinePointCloud != nullptr) {
         runtimeState->pendingLoad = PendingLayerLoad{
             .sessionIndex = sessionIndex,
@@ -7550,9 +7672,6 @@ void BeginLayerLoad(
         .showUploadOverlayFrame = false,
         .startedAt = std::chrono::steady_clock::now(),
     };
-    if (purpose != PointCloudLoadPurpose::StagedDisplay) {
-        StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
-    }
 }
 
 void PollPendingLayerLoad(
@@ -7636,14 +7755,16 @@ void PollPendingLayerLoad(
             completedSessionIndex,
             purpose,
             sceneSwitchGeneration);
-        if (HasValidManualFlowPath(runtimeState->water)) {
+        if (purpose == PointCloudLoadPurpose::Interactive &&
+            HasValidManualFlowPath(runtimeState->water)) {
             QueueWaterFlowTrailRefresh(
                 runtimeState,
                 WaterOverlayRefreshPersistence::InMemoryOnly,
                 std::chrono::milliseconds{0});
         }
-        RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
-        QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
+        if (purpose == PointCloudLoadPurpose::Interactive) {
+            RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
+        }
         return;
     }
 
@@ -7710,8 +7831,9 @@ void PollPendingLayerLoad(
         return;
     }
     const bool hasManualFlowPath = HasValidManualFlowPath(runtimeState->water);
-    if ((runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCacheStale) ||
-        hasManualFlowPath) {
+    if (completedPurpose == PointCloudLoadPurpose::Interactive &&
+        ((runtimeState->water.pathCacheLoaded && !runtimeState->water.pathCacheStale) ||
+         hasManualFlowPath)) {
         const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
         const bool completedAffectsSupport =
             supportIndex.has_value() &&
@@ -7745,8 +7867,9 @@ void PollPendingLayerLoad(
             }
         }
     }
-    RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
-    QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
+    if (completedPurpose == PointCloudLoadPurpose::Interactive) {
+        RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
+    }
 }
 
 void UnloadLayerByIndex(
@@ -7884,6 +8007,58 @@ bool QueueSceneAnalysisSourceLoads(
     return true;
 }
 
+ScenePointCloudRuntime* ActiveSceneForDeferredAnalysis(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+    if (runtimeState->selectedSessionIndex.has_value() &&
+        runtimeState->selectedSessionIndex.value() < runtimeState->sessions.size()) {
+        if (auto* scene = FindScenePointCloudRuntime(
+                runtimeState,
+                runtimeState->sessions[runtimeState->selectedSessionIndex.value()]);
+            scene != nullptr) {
+            return scene;
+        }
+    }
+    if (runtimeState->water.activeSupportSessionIndex.has_value() &&
+        runtimeState->water.activeSupportSessionIndex.value() < runtimeState->sessions.size()) {
+        if (auto* scene = FindScenePointCloudRuntime(
+                runtimeState,
+                runtimeState->sessions[runtimeState->water.activeSupportSessionIndex.value()]);
+            scene != nullptr) {
+            return scene;
+        }
+    }
+    const auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const ScenePointCloudRuntime& scene) {
+            return scene.displayLoaded && scene.displayVisible;
+        });
+    return sceneIt == runtimeState->pointCloudScenes.end() ? nullptr : &*sceneIt;
+}
+
+bool EnsureSceneAnalysisReadyForAction(
+    PreviewRuntimeState* runtimeState,
+    DeferredSceneAnalysisAction action,
+    std::string_view actionLabel) {
+    auto* scene = ActiveSceneForDeferredAnalysis(runtimeState);
+    if (scene == nullptr || SceneAnalysisSourcesReady(*runtimeState, *scene)) {
+        return true;
+    }
+    if (!QueueSceneAnalysisSourceLoads(runtimeState, scene)) {
+        runtimeState->errorMessage = scene->switchError;
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    scene->deferredAnalysisActions |= DeferredSceneAnalysisActionBit(action);
+    runtimeState->statusMessage =
+        "Loading canonical analysis sources for " + std::string{actionLabel} +
+        "; the action will resume automatically.";
+    runtimeState->errorMessage.clear();
+    return false;
+}
+
 void RollBackSceneDisplaySwitch(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -7929,8 +8104,7 @@ bool CommitSceneDisplaySwitch(
     ScenePointCloudRuntime* scene) {
     if (runtimeState == nullptr || viewport == nullptr || scene == nullptr ||
         runtimeState->offlineRenderJob.active ||
-        (!scene->pendingDisplaySpacingMicrometres.has_value() && !scene->pendingMixedDisplay) ||
-        !SceneAnalysisSourcesReady(*runtimeState, *scene)) {
+        (!scene->pendingDisplaySpacingMicrometres.has_value() && !scene->pendingMixedDisplay)) {
         return false;
     }
     for (const auto sessionIndex : scene->pendingDisplaySessionIndices) {
@@ -7941,30 +8115,6 @@ bool CommitSceneDisplaySwitch(
     }
     const bool hadVisibleLayersBefore = VisibleLayerCount(*runtimeState) > 0U;
     const bool sceneWasLoaded = scene->displayLoaded;
-
-    if (!runtimeState->water.rippleLayers.empty() &&
-        !RefreshWaterRippleEffects(runtimeState, viewport)) {
-        const auto message = runtimeState->errorMessage.empty()
-                                 ? std::string{"Could not prepare display-specific Ripple membership."}
-                                 : runtimeState->errorMessage;
-        RollBackSceneDisplaySwitch(runtimeState, viewport, scene, message);
-        return false;
-    }
-    const auto fieldOverlays = CurrentFilteredWaterEffectOverlays(runtimeState->water);
-    const auto analysisIndex = scene->analysisSessionIndices.front();
-    if (!analysisIndex.has_value() ||
-        !ApplyWaterEffectCompositionToDisplaySources(
-            runtimeState,
-            viewport,
-            runtimeState->sessions[analysisIndex.value()],
-            fieldOverlays,
-            true)) {
-        const auto message = runtimeState->errorMessage.empty()
-                                 ? std::string{"Could not remap Field presentation to the staged display bundle."}
-                                 : runtimeState->errorMessage;
-        RollBackSceneDisplaySwitch(runtimeState, viewport, scene, message);
-        return false;
-    }
 
     const auto previousDisplay = scene->committedDisplaySessionIndices;
     const auto nextDisplay = scene->pendingDisplaySessionIndices;
@@ -8026,17 +8176,16 @@ bool CommitSceneDisplaySwitch(
                 kStartupFocusDistanceScale);
         }
     }
-    runtimeState->statusMessage = committedMixedDisplay
-                                      ? "Loaded the saved Mixed display set for " +
-                                            scene->sceneGroupName + "."
-                                      : "Visible point cloud switched to " +
-                                            FormatFixed(
-                                                static_cast<double>(
-                                                    scene->committedDisplaySpacingMicrometres.value()) /
-                                                    1000.0,
-                                                3) +
-                                            " mm for " + scene->sceneGroupName + ".";
-    runtimeState->errorMessage.clear();
+    const std::string committedStatus = committedMixedDisplay
+                                            ? "Loaded the saved Mixed display set for " +
+                                                  scene->sceneGroupName + "."
+                                            : "Visible point cloud switched to " +
+                                                  FormatFixed(
+                                                      static_cast<double>(
+                                                          scene->committedDisplaySpacingMicrometres.value()) /
+                                                          1000.0,
+                                                      3) +
+                                                  " mm for " + scene->sceneGroupName + ".";
     if (scene->committedDisplaySessionIndices.front().has_value()) {
         const auto& visualSession = runtimeState->sessions[
             scene->committedDisplaySessionIndices.front().value()];
@@ -8051,8 +8200,17 @@ bool CommitSceneDisplaySwitch(
 
     // Memberships and presentation fields are source-indexed, so restore/rebuild
     // them only after the exact display bundle becomes committed.
-    RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
-    QueueWaterRegionPointPreviewsForAllRegions(runtimeState, viewport);
+    const auto restoredRippleSessions =
+        RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
+    if (!runtimeState->water.rippleLayers.empty() && restoredRippleSessions == 0U) {
+        runtimeState->water.rippleEffectsDirty = true;
+    }
+    if (!runtimeState->water.fieldLayers.empty() ||
+        !runtimeState->water.fieldSurfaceEffectOverlay.points.empty()) {
+        runtimeState->water.fieldEffectsDirty = true;
+    }
+    runtimeState->statusMessage = committedStatus;
+    runtimeState->errorMessage.clear();
     return true;
 }
 
@@ -8065,8 +8223,7 @@ void CommitReadySceneDisplaySwitches(
     }
     for (auto& scene : runtimeState->pointCloudScenes) {
         if ((scene.pendingDisplaySpacingMicrometres.has_value() || scene.pendingMixedDisplay) &&
-            scene.stagedReadyCount == invisible_places::scene::kScenePointCloudRoleCount &&
-            SceneAnalysisSourcesReady(*runtimeState, scene)) {
+            scene.stagedReadyCount == invisible_places::scene::kScenePointCloudRoleCount) {
             CommitSceneDisplaySwitch(runtimeState, viewport, &scene);
         }
     }
@@ -8091,10 +8248,6 @@ bool RequestSceneDisplaySwitch(
     const auto* bundle = FindSceneDisplayBundle(*scene, spacingMicrometres);
     if (bundle == nullptr) {
         runtimeState->errorMessage = "That density is incomplete or ambiguous for this scene.";
-        return false;
-    }
-    if (!QueueSceneAnalysisSourceLoads(runtimeState, scene)) {
-        runtimeState->errorMessage = scene->switchError;
         return false;
     }
     if (scene->displayLoaded &&
@@ -8131,8 +8284,7 @@ bool RequestSceneDisplaySwitch(
                                   FormatFixed(static_cast<double>(spacingMicrometres) / 1000.0, 3) +
                                   " mm display bundle for " + scene->sceneGroupName + "...";
     runtimeState->errorMessage.clear();
-    if (scene->stagedReadyCount == invisible_places::scene::kScenePointCloudRoleCount &&
-        SceneAnalysisSourcesReady(*runtimeState, *scene)) {
+    if (scene->stagedReadyCount == invisible_places::scene::kScenePointCloudRoleCount) {
         return CommitSceneDisplaySwitch(runtimeState, viewport, scene);
     }
     return true;
@@ -8149,8 +8301,7 @@ bool RequestSceneMixedDisplayLoad(
         scene->pendingDisplaySpacingMicrometres.has_value() || scene->pendingMixedDisplay) {
         return false;
     }
-    if (!QueueSceneAnalysisSourceLoads(runtimeState, scene) ||
-        std::any_of(
+    if (std::any_of(
             displaySessionIndices.begin(),
             displaySessionIndices.end(),
             [](const std::optional<std::size_t>& index) { return !index.has_value(); })) {
@@ -8177,8 +8328,7 @@ bool RequestSceneMixedDisplayLoad(
     }
     runtimeState->statusMessage = "Loading saved Mixed display set for " + scene->sceneGroupName + "...";
     runtimeState->errorMessage.clear();
-    if (scene->stagedReadyCount == invisible_places::scene::kScenePointCloudRoleCount &&
-        SceneAnalysisSourcesReady(*runtimeState, *scene)) {
+    if (scene->stagedReadyCount == invisible_places::scene::kScenePointCloudRoleCount) {
         return CommitSceneDisplaySwitch(runtimeState, viewport, scene);
     }
     return true;
@@ -8197,21 +8347,29 @@ void HandleScenePurposeLoadCompleted(
     if (purpose == PointCloudLoadPurpose::AnalysisCpuOnly) {
         if (SceneAnalysisSourcesReady(*runtimeState, *scene)) {
             scene->switchError.clear();
-            const auto supportIndex = scene->analysisSessionIndices.front();
-            if (supportIndex.has_value()) {
-                auto& supportSession = runtimeState->sessions[supportIndex.value()];
-                const auto supportSettings =
-                    ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path;
-                EnsureWaterSupportCloud(runtimeState, supportSession, supportSettings);
-                WaterTrailBuildDiagnostics prewarmDiagnostics;
-                EnsureTrailSurfaceIndexForSupport(
-                    runtimeState,
-                    supportSession,
-                    &prewarmDiagnostics);
-                TryLoadWaterPathCacheForSupport(runtimeState, supportSession);
+            const auto deferredActions = scene->deferredAnalysisActions;
+            scene->deferredAnalysisActions = 0U;
+            if ((deferredActions & DeferredSceneAnalysisActionBit(
+                                       DeferredSceneAnalysisAction::BakeWaterPath)) != 0U) {
+                BakeWaterOverlayForActiveLayer(runtimeState, viewport);
             }
-            StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
-            CommitSceneDisplaySwitch(runtimeState, viewport, scene);
+            if ((deferredActions & DeferredSceneAnalysisActionBit(
+                                       DeferredSceneAnalysisAction::RefreshWaterField)) != 0U) {
+                RefreshWaterFieldOverlays(runtimeState, viewport);
+            }
+            if ((deferredActions & DeferredSceneAnalysisActionBit(
+                                       DeferredSceneAnalysisAction::RefreshWaterRipple)) != 0U) {
+                RefreshWaterRippleEffects(runtimeState, viewport);
+            }
+            if ((deferredActions & DeferredSceneAnalysisActionBit(
+                                       DeferredSceneAnalysisAction::RefreshRegionPreviews)) != 0U) {
+                QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
+            }
+            if (deferredActions == 0U) {
+                runtimeState->statusMessage =
+                    "Canonical analysis sources are ready for " + scene->sceneGroupName + ".";
+                runtimeState->errorMessage.clear();
+            }
         }
         return;
     }
@@ -8253,9 +8411,19 @@ void HandleScenePurposeLoadFailed(
         RollBackSceneDisplaySwitch(runtimeState, viewport, scene, errorMessage);
     } else if (purpose == PointCloudLoadPurpose::AnalysisCpuOnly) {
         scene->switchError = "Analysis source unavailable: " + std::string{errorMessage};
-        if (scene->pendingDisplaySpacingMicrometres.has_value() || scene->pendingMixedDisplay) {
-            RollBackSceneDisplaySwitch(runtimeState, viewport, scene, scene->switchError);
-        }
+        scene->deferredAnalysisActions = 0U;
+        std::erase_if(
+            runtimeState->persistence.queuedLoads,
+            [&](const QueuedLayerLoad& queued) {
+                return queued.purpose == PointCloudLoadPurpose::AnalysisCpuOnly &&
+                       std::find(
+                           scene->analysisSessionIndices.begin(),
+                           scene->analysisSessionIndices.end(),
+                           std::optional<std::size_t>{queued.sessionIndex}) !=
+                           scene->analysisSessionIndices.end();
+            });
+        runtimeState->errorMessage = scene->switchError;
+        runtimeState->statusMessage.clear();
     }
 }
 
@@ -9264,6 +9432,75 @@ std::optional<std::size_t> ResolveWaterSupportSessionIndex(const PreviewRuntimeS
         }
     }
 
+    return std::nullopt;
+}
+
+std::optional<std::size_t> ResolveWaterRuntimeSessionIndex(const PreviewRuntimeState& runtimeState) {
+    if (const auto canonical = ResolveWaterSupportSessionIndex(runtimeState); canonical.has_value()) {
+        return canonical;
+    }
+
+    const auto committedSceneSupport =
+        [&](const ScenePointCloudRuntime& scene) -> std::optional<std::size_t> {
+        const auto usable = [&](const std::optional<std::size_t>& index) {
+            if (!index.has_value() || index.value() >= runtimeState.sessions.size()) {
+                return false;
+            }
+            const auto& session = runtimeState.sessions[index.value()];
+            return IsCommittedDisplayPointCloudReady(runtimeState, session) &&
+                   session.offlinePointCloud != nullptr &&
+                   !IsGeneratedWaterOverlaySession(session);
+        };
+        const auto rockRoleIndex = invisible_places::scene::ScenePointCloudRoleIndex(
+            invisible_places::scene::ScenePointCloudRole::Rock);
+        if (usable(scene.committedDisplaySessionIndices[rockRoleIndex])) {
+            return scene.committedDisplaySessionIndices[rockRoleIndex];
+        }
+        for (const auto index : scene.committedDisplaySessionIndices) {
+            if (usable(index)) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto resolveCandidate = [&](std::size_t index) -> std::optional<std::size_t> {
+        if (index >= runtimeState.sessions.size()) {
+            return std::nullopt;
+        }
+        const auto& session = runtimeState.sessions[index];
+        if (const auto* scene = FindScenePointCloudRuntime(runtimeState, session); scene != nullptr) {
+            return committedSceneSupport(*scene);
+        }
+        return session.kind == LayerKind::PointCloud && session.loaded && session.visible &&
+                       session.offlinePointCloud != nullptr &&
+                       !IsGeneratedWaterOverlaySession(session)
+                   ? std::optional<std::size_t>{index}
+                   : std::nullopt;
+    };
+
+    if (runtimeState.selectedSessionIndex.has_value()) {
+        const auto selectedIndex = runtimeState.selectedSessionIndex.value();
+        const auto resolved = resolveCandidate(selectedIndex);
+        if (resolved.has_value()) {
+            return resolved;
+        }
+        if (selectedIndex < runtimeState.sessions.size() &&
+            IsSceneGroupedPointCloud(runtimeState.sessions[selectedIndex])) {
+            return std::nullopt;
+        }
+    }
+    if (runtimeState.water.activeSupportSessionIndex.has_value()) {
+        if (const auto resolved = resolveCandidate(
+                runtimeState.water.activeSupportSessionIndex.value());
+            resolved.has_value()) {
+            return resolved;
+        }
+    }
+    for (std::size_t index = 0U; index < runtimeState.sessions.size(); ++index) {
+        if (const auto resolved = resolveCandidate(index); resolved.has_value()) {
+            return resolved;
+        }
+    }
     return std::nullopt;
 }
 
@@ -10715,7 +10952,7 @@ std::vector<WaterTrailOverlayGroup> BuildFlowTrailOverlayGroups(
                 flowSettings,
                 nullptr,
                 invisible_places::water::WaterFlowTrailBuildOptions{
-                    .surfaceCache = runtimeState.water.rainCollisionCache.get(),
+                    .surfaceCache = runtimeState.water.waterSurfaceCache.get(),
                     .useSurfaceGuide = source.useSurfaceGuide,
                 });
         addOverlay(
@@ -10796,11 +11033,11 @@ std::uint64_t WaterFlowTrailSourceFingerprint(
     HashBool(&hash, usesPathAnalysis);
     HashBool(&hash, useSurfaceGuide);
     if (useSurfaceGuide) {
-        HashString(&hash, runtimeState.water.rainCollisionCacheSignature);
+        HashString(&hash, runtimeState.water.waterSurfaceCacheSignature);
         HashCombine(
             &hash,
-            runtimeState.water.rainCollisionCache != nullptr
-                ? runtimeState.water.rainCollisionCache->revision
+            runtimeState.water.waterSurfaceCache != nullptr
+                ? runtimeState.water.waterSurfaceCache->revision
                 : 0U);
     }
     if (usesPathAnalysis) {
@@ -10845,7 +11082,7 @@ WaterFlowTrailBuildRequest CaptureWaterFlowTrailBuildRequest(
     request.requestId = requestId;
     request.savePathCache = savePathCache;
     request.gpuSnapshotOnly = gpuSnapshotOnly;
-    request.surfaceCache = runtimeState.water.rainCollisionCache;
+    request.surfaceCache = runtimeState.water.waterSurfaceCache;
 
     std::unordered_set<std::uint32_t> hiddenBranchIds{
         runtimeState.water.pathCache.hiddenBranchIds.begin(),
@@ -12176,14 +12413,18 @@ std::filesystem::path BuildWaterOverlayPath(
     return waterDirectory / (sourceSession.sourcePath.stem().string() + suffix);
 }
 
-std::filesystem::path BuildWaterPathCachePath(
+std::filesystem::path BuildWaterPathCacheDirectory(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& sourceSession) {
     const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
-    const auto waterDirectory = projectPath.empty()
-                                    ? std::filesystem::path{"Saved"} / "water"
-                                    : projectPath.parent_path() / "water";
-    return waterDirectory / (sourceSession.sourcePath.stem().string() + "-WaterPathCache.json");
+    const auto cacheDirectory = !sourceSession.sourcePath.parent_path().empty()
+                                    ? sourceSession.sourcePath.parent_path() /
+                                          ".invisible_places" / "cache" / "flow"
+                                    : (projectPath.empty()
+                                           ? std::filesystem::path{"Saved"} / "water"
+                                           : projectPath.parent_path() /
+                                                 ".invisible_places" / "cache" / "flow");
+    return cacheDirectory;
 }
 
 std::filesystem::path BuildWaterFieldCachePath(
@@ -12363,42 +12604,145 @@ std::string WaterSeepageSurfaceGuideSupportKey(
     return key.str();
 }
 
+std::string WaterSeepageSurfaceGuideNodeFingerprint(
+    const WaterSeepageNode& node) {
+    std::ostringstream fingerprint;
+    fingerprint << std::setprecision(std::numeric_limits<float>::max_digits10);
+    fingerprint << "id=" << node.id
+                << ",p=" << node.position.x << "," << node.position.y << "," << node.position.z
+                << ",n=" << node.surfaceNormal.x << "," << node.surfaceNormal.y << "," << node.surfaceNormal.z
+                << ",d=" << node.downAxis.x << "," << node.downAxis.y << "," << node.downAxis.z
+                << ",reach=" << node.reachMeters;
+    std::vector<std::string> roles;
+    roles.reserve(node.targetSceneRoles.size());
+    for (const auto& role : node.targetSceneRoles) {
+        roles.push_back(NormalizeSceneRoleName(role));
+    }
+    std::sort(roles.begin(), roles.end());
+    roles.erase(std::unique(roles.begin(), roles.end()), roles.end());
+    for (const auto& role : roles) {
+        fingerprint << ",role=" << role;
+    }
+    return fingerprint.str();
+}
+
 std::string WaterSeepageSurfaceGuideNodesFingerprint(
     std::span<const WaterSeepageNode> nodes) {
     std::ostringstream fingerprint;
-    fingerprint << std::setprecision(std::numeric_limits<float>::max_digits10);
     for (const auto& node : nodes) {
-        fingerprint << "|id=" << node.id
-                    << ",p=" << node.position.x << "," << node.position.y << "," << node.position.z
-                    << ",n=" << node.surfaceNormal.x << "," << node.surfaceNormal.y << "," << node.surfaceNormal.z
-                    << ",d=" << node.downAxis.x << "," << node.downAxis.y << "," << node.downAxis.z
-                    << ",reach=" << node.reachMeters;
-        std::vector<std::string> roles;
-        roles.reserve(node.targetSceneRoles.size());
-        for (const auto& role : node.targetSceneRoles) {
-            roles.push_back(NormalizeSceneRoleName(role));
-        }
-        std::sort(roles.begin(), roles.end());
-        roles.erase(std::unique(roles.begin(), roles.end()), roles.end());
-        for (const auto& role : roles) {
-            fingerprint << ",role=" << role;
-        }
+        fingerprint << '|' << WaterSeepageSurfaceGuideNodeFingerprint(node);
     }
     return fingerprint.str();
+}
+
+template <typename BuildGuides>
+const std::vector<WaterSeepageSurfaceGuide>* UpdateWaterSeepageSurfaceGuidesPerNode(
+    WaterWorkflowState* water,
+    std::string_view supportKey,
+    BuildGuides&& buildGuides) {
+    if (water == nullptr) {
+        return nullptr;
+    }
+    auto& guides = water->seepageSurfaceGuides[std::string{supportKey}];
+    auto& fingerprints =
+        water->seepageSurfaceGuideNodeFingerprints[std::string{supportKey}];
+    std::unordered_set<std::uint32_t> activeNodeIds;
+    activeNodeIds.reserve(water->seepageNodes.size());
+    for (const auto& node : water->seepageNodes) {
+        activeNodeIds.insert(node.id);
+    }
+    std::erase_if(
+        guides,
+        [&](const WaterSeepageSurfaceGuide& guide) {
+            return !activeNodeIds.contains(guide.nodeId);
+        });
+    std::erase_if(
+        fingerprints,
+        [&](const auto& entry) {
+            return !activeNodeIds.contains(entry.first);
+        });
+
+    std::vector<WaterSeepageNode> changedNodes;
+    changedNodes.reserve(water->seepageNodes.size());
+    for (const auto& node : water->seepageNodes) {
+        const auto fingerprint = WaterSeepageSurfaceGuideNodeFingerprint(node);
+        const auto existingGuide = std::find_if(
+            guides.begin(),
+            guides.end(),
+            [&](const WaterSeepageSurfaceGuide& guide) {
+                return guide.nodeId == node.id;
+            });
+        const auto existingFingerprint = fingerprints.find(node.id);
+        if (existingGuide != guides.end() &&
+            existingFingerprint != fingerprints.end() &&
+            existingFingerprint->second == fingerprint) {
+            continue;
+        }
+        changedNodes.push_back(node);
+    }
+
+    if (!changedNodes.empty()) {
+        auto rebuilt = buildGuides(std::span<const WaterSeepageNode>{changedNodes});
+        for (const auto& node : changedNodes) {
+            WaterSeepageSurfaceGuide replacement;
+            replacement.nodeId = node.id;
+            if (const auto rebuiltGuide = std::find_if(
+                    rebuilt.begin(),
+                    rebuilt.end(),
+                    [&](const WaterSeepageSurfaceGuide& candidate) {
+                        return candidate.nodeId == node.id;
+                    });
+                rebuiltGuide != rebuilt.end()) {
+                replacement = std::move(*rebuiltGuide);
+            }
+            if (const auto existingGuide = std::find_if(
+                    guides.begin(),
+                    guides.end(),
+                    [&](const WaterSeepageSurfaceGuide& guide) {
+                        return guide.nodeId == node.id;
+                    });
+                existingGuide == guides.end()) {
+                guides.push_back(std::move(replacement));
+            } else {
+                *existingGuide = std::move(replacement);
+            }
+            fingerprints[node.id] = WaterSeepageSurfaceGuideNodeFingerprint(node);
+        }
+        water->seepageSurfaceGuideBuildCount += changedNodes.size();
+    }
+
+    std::vector<WaterSeepageSurfaceGuide> ordered;
+    ordered.reserve(guides.size());
+    for (const auto& node : water->seepageNodes) {
+        const auto guide = std::find_if(
+            guides.begin(),
+            guides.end(),
+            [&](const WaterSeepageSurfaceGuide& candidate) {
+                return candidate.nodeId == node.id;
+            });
+        if (guide != guides.end()) {
+            ordered.push_back(*guide);
+        }
+    }
+    guides = std::move(ordered);
+    water->seepageSurfaceGuideFingerprints[std::string{supportKey}] =
+        WaterSeepageSurfaceGuideNodesFingerprint(water->seepageNodes);
+    return &guides;
 }
 
 const std::vector<WaterSeepageSurfaceGuide>* EnsureWaterSeepageSurfaceGuidesForSession(
     PreviewRuntimeState* runtimeState,
     const PreviewLayerSession& sourceSession,
     std::string* resolvedSupportKey = nullptr) {
-    if (runtimeState == nullptr || runtimeState->water.seepageNodes.empty()) {
+    if (runtimeState == nullptr || runtimeState->water.seepageNodes.empty() ||
+        !IsAuthoredWaterTerrainSession(sourceSession)) {
         return nullptr;
     }
 
     // Prefer the shared orientation-independent 20 mm surface aggregate. It
     // is built once from the stable ROCK/SAND analysis layers and avoids ever
     // walking the visible high-density cloud to trace a Seepage guide.
-    const auto& surfaceCache = runtimeState->water.rainCollisionCache;
+    const auto& surfaceCache = runtimeState->water.waterSurfaceCache;
     const auto sourceFolderKey = NormalizePathKey(sourceSession.sourcePath.parent_path());
     const bool surfaceCacheMatchesSession =
         surfaceCache != nullptr &&
@@ -12416,32 +12760,24 @@ const std::vector<WaterSeepageSurfaceGuide>* EnsureWaterSeepageSurfaceGuidesForS
         if (resolvedSupportKey != nullptr) {
             *resolvedSupportKey = supportKey;
         }
-        const auto nodeFingerprint = WaterSeepageSurfaceGuideNodesFingerprint(
-            runtimeState->water.seepageNodes);
-        const auto existing = runtimeState->water.seepageSurfaceGuides.find(supportKey);
-        const auto existingFingerprint =
-            runtimeState->water.seepageSurfaceGuideFingerprints.find(supportKey);
-        if (existing != runtimeState->water.seepageSurfaceGuides.end() &&
-            existingFingerprint != runtimeState->water.seepageSurfaceGuideFingerprints.end() &&
-            existingFingerprint->second == nodeFingerprint) {
-            return &existing->second;
-        }
-
-        auto& cachedGuides = runtimeState->water.seepageSurfaceGuides[supportKey];
-        cachedGuides = invisible_places::water::BuildWaterSeepageSurfaceGuides(
-            runtimeState->water.seepageNodes,
-            *surfaceCache);
-        runtimeState->water.seepageSurfaceGuideFingerprints[supportKey] = nodeFingerprint;
+        const auto* cachedGuides = UpdateWaterSeepageSurfaceGuidesPerNode(
+            &runtimeState->water,
+            supportKey,
+            [&](std::span<const WaterSeepageNode> changedNode) {
+                return invisible_places::water::BuildWaterSeepageSurfaceGuides(
+                    changedNode,
+                    *surfaceCache);
+            });
         runtimeState->water.seepageSurfaceGuideWarning.clear();
-        return &cachedGuides;
+        return cachedGuides;
     }
 
     // A grouped scene starts warming the shared cache as soon as it is loaded.
     // Do not fall back to a multi-million-point scan while that compact cache
     // is still being prepared; the nodes become visible when warm-up commits.
     if (!sourceSession.sceneGroupName.empty() &&
-        runtimeState->water.rainCollisionCacheWarmup.worker.joinable() &&
-        runtimeState->water.rainCollisionCacheWarmup.sceneGroupName == sourceSession.sceneGroupName) {
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() &&
+        runtimeState->water.waterSurfaceCacheWarmup.sceneGroupName == sourceSession.sceneGroupName) {
         runtimeState->water.seepageSurfaceGuideWarning =
             "Seepage surface guides are waiting for the shared 20 mm surface cache.";
         return nullptr;
@@ -12456,25 +12792,15 @@ const std::vector<WaterSeepageSurfaceGuide>* EnsureWaterSeepageSurfaceGuidesForS
     if (resolvedSupportKey != nullptr) {
         *resolvedSupportKey = supportKey;
     }
-    const auto nodeFingerprint = WaterSeepageSurfaceGuideNodesFingerprint(
-        runtimeState->water.seepageNodes);
-    const auto existing = runtimeState->water.seepageSurfaceGuides.find(supportKey);
-    const auto existingFingerprint =
-        runtimeState->water.seepageSurfaceGuideFingerprints.find(supportKey);
-    if (existing != runtimeState->water.seepageSurfaceGuides.end() &&
-        existingFingerprint != runtimeState->water.seepageSurfaceGuideFingerprints.end() &&
-        existingFingerprint->second == nodeFingerprint) {
-        return &existing->second;
-    }
-
-    auto guides = invisible_places::water::BuildWaterSeepageSurfaceGuides(
-        runtimeState->water.seepageNodes,
-        supportLayers,
-        kWaterSeepageSurfaceGuideSampleLimit);
-    auto& cachedGuides = runtimeState->water.seepageSurfaceGuides[supportKey];
-    cachedGuides = std::move(guides);
-    runtimeState->water.seepageSurfaceGuideFingerprints[supportKey] = nodeFingerprint;
-    return &cachedGuides;
+    return UpdateWaterSeepageSurfaceGuidesPerNode(
+        &runtimeState->water,
+        supportKey,
+        [&](std::span<const WaterSeepageNode> changedNode) {
+            return invisible_places::water::BuildWaterSeepageSurfaceGuides(
+                changedNode,
+                supportLayers,
+                kWaterSeepageSurfaceGuideSampleLimit);
+        });
 }
 
 const WaterSeepageSurfaceGuide* FindWaterSeepageSurfaceGuide(
@@ -12569,7 +12895,7 @@ std::optional<ResolvedPivot> ResolveWaterSourceSupportPivot(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
     ImVec2 screenPoint) {
-    const auto supportIndex = ResolveWaterSupportSessionIndex(runtimeState);
+    const auto supportIndex = ResolveWaterRuntimeSessionIndex(runtimeState);
     if (!supportIndex.has_value() || supportIndex.value() >= runtimeState.sessions.size()) {
         return std::nullopt;
     }
@@ -13007,7 +13333,7 @@ bool SaveWaterPathCacheForSupport(
     if (runtimeState == nullptr || runtimeState->water.pathCache.branches.empty()) {
         return false;
     }
-    auto cache = runtimeState->water.pathCache;
+    auto& cache = runtimeState->water.pathCache;
     cache.supportLayerPath = sourceSession.sourcePath;
     cache.supportSignature =
         CombinedWaterSupportSignature(
@@ -13016,9 +13342,53 @@ bool SaveWaterPathCacheForSupport(
             ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path);
     cache.emitterSettingsFingerprint = WaterEmitterSettingsFingerprint(*runtimeState);
     cache.stale = runtimeState->water.pathCacheStale;
-    runtimeState->water.pathCache = std::move(cache);
     runtimeState->water.pathCacheLoaded = true;
     return true;
+}
+
+bool PersistSettledWaterPathCache(
+    PreviewRuntimeState* runtimeState,
+    const PreviewLayerSession& sourceSession,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr || runtimeState->water.pathCacheStale ||
+        runtimeState->water.pathCache.stale ||
+        runtimeState->water.pathCache.branches.empty()) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Only a clean settled Flow path cache can be persisted.";
+        }
+        return false;
+    }
+
+    const auto outputDirectory = BuildWaterPathCacheDirectory(*runtimeState, sourceSession);
+    invisible_places::serialization::WaterPathCacheManifestDocument manifest;
+    std::filesystem::path outputPath;
+    if (invisible_places::serialization::SaveContentAddressedWaterPathCacheDocument(
+            runtimeState->water.pathCache,
+            outputDirectory,
+            errorMessage,
+            &manifest,
+            &outputPath)) {
+        return true;
+    }
+
+    const std::filesystem::path projectPath{runtimeState->persistence.projectFilePath};
+    if (projectPath.empty()) {
+        return false;
+    }
+    const auto fallbackDirectory = projectPath.parent_path() /
+                                   ".invisible_places" / "cache" / "flow";
+    if (NormalizePathKey(fallbackDirectory) == NormalizePathKey(outputDirectory)) {
+        return false;
+    }
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return invisible_places::serialization::SaveContentAddressedWaterPathCacheDocument(
+        runtimeState->water.pathCache,
+        fallbackDirectory,
+        errorMessage,
+        &manifest,
+        &outputPath);
 }
 
 enum class WaterFlowGpuPreviewDispatchResult {
@@ -13054,16 +13424,23 @@ WaterFlowGpuPreviewDispatchResult TryDispatchPendingWaterFlowGpuPreview(
             });
     const auto surfaceView = viewport->WaterSurfaceFlowView();
     const bool surfaceCacheExpected =
-        runtimeState->water.rainCollisionCache != nullptr ||
-        runtimeState->water.rainCollisionCacheWarmup.worker.joinable();
+        runtimeState->water.waterSurfaceCache != nullptr ||
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable();
+    const bool expectedSurfaceResident =
+        runtimeState->water.waterSurfaceCache == nullptr ||
+        (surfaceView.cacheIdentity != nullptr &&
+         *surfaceView.cacheIdentity ==
+             runtimeState->water.waterSurfaceCache->cacheIdentity);
     if (needsSurfaceGuide && surfaceCacheExpected &&
-        (!surfaceView.valid || !surfaceView.preprocessingComplete)) {
+        (viewport->WaterSurfaceUploadPending() ||
+         !surfaceView.valid || !surfaceView.preprocessingComplete ||
+         !expectedSurfaceResident)) {
         job.pendingNotBefore =
             std::chrono::steady_clock::now() + std::chrono::milliseconds{33};
         return WaterFlowGpuPreviewDispatchResult::Deferred;
     }
 
-    const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+    const auto supportIndex = ResolveWaterRuntimeSessionIndex(*runtimeState);
     if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
         return WaterFlowGpuPreviewDispatchResult::Unavailable;
     }
@@ -13161,10 +13538,14 @@ WaterFlowGpuPreviewDispatchResult TryDispatchPendingWaterFlowGpuPreview(
                                 : (sessionIndex < runtimeState->sessions.size()
                                        ? runtimeState->sessions[sessionIndex].totalPrimitives
                                        : 0U);
-        dispatchCount +=
+        const auto sourceDispatchCount =
             upload.diagnostics.computeDispatchCount >= previousGpuDiagnostics.computeDispatchCount
                 ? upload.diagnostics.computeDispatchCount - previousGpuDiagnostics.computeDispatchCount
                 : upload.diagnostics.computeDispatchCount;
+        dispatchCount += sourceDispatchCount;
+        runtimeState->water.flowGpuComputeDispatchCount += sourceDispatchCount;
+        runtimeState->water.flowGpuComputeDispatchCountBySource[source.sourceId] +=
+            sourceDispatchCount;
         bytesTransferred +=
             upload.diagnostics.bytesTransferred >= previousGpuDiagnostics.bytesTransferred
                 ? upload.diagnostics.bytesTransferred - previousGpuDiagnostics.bytesTransferred
@@ -13300,7 +13681,7 @@ void PollWaterFlowTrailBuildJob(
         } else if (!result.cancelled &&
             result.requestId == latestRequestId &&
             result.errorMessage.empty()) {
-            const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+            const auto supportIndex = ResolveWaterRuntimeSessionIndex(*runtimeState);
             if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
                 runtimeState->errorMessage = "Flow trail update finished after its support scene was unloaded.";
                 runtimeState->statusMessage.clear();
@@ -13422,6 +13803,11 @@ bool TryLoadWaterPathCacheForSupport(
         cache.stale = false;
         return ApplyWaterPathCacheForSupport(runtimeState, sourceSession, std::move(cache));
     }
+
+    // A disk sidecar is only authoritative through the checksum-bearing
+    // project manifest loaded into the in-memory cache above. Directory scans
+    // cannot choose safely between multiple projects that share terrain and
+    // emitter settings but retain different authored hidden-branch state.
     return false;
 }
 
@@ -13432,6 +13818,9 @@ std::optional<WaterPathCache> CurrentWaterPathCacheForDocument(const PreviewRunt
 
     auto cache = runtimeState.water.pathCache;
     cache.stale = runtimeState.water.pathCacheStale || cache.stale;
+    if (cache.stale) {
+        return std::nullopt;
+    }
     const auto supportIndex = ResolveWaterSupportSessionIndex(runtimeState);
     if (supportIndex.has_value() && supportIndex.value() < runtimeState.sessions.size()) {
         const auto& sourceSession = runtimeState.sessions[supportIndex.value()];
@@ -14109,6 +14498,7 @@ void LoadWaterSources(
     runtimeState->water.seepageRuntimeGuideKeys.clear();
     runtimeState->water.seepageSurfaceGuides.clear();
     runtimeState->water.seepageSurfaceGuideFingerprints.clear();
+    runtimeState->water.seepageSurfaceGuideNodeFingerprints.clear();
     runtimeState->water.seepageSurfaceGuideWarning.clear();
     runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
     runtimeState->water.selectedRippleLayerIndex.reset();
@@ -14167,7 +14557,6 @@ void LoadWaterSources(
     }
     runtimeState->errorMessage.clear();
     ValidateWaterSourceSettingLinks(runtimeState);
-    QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
 }
 
 void SelectWaterEmitterInViewport(
@@ -14318,7 +14707,7 @@ bool SaveManualFlowPathEdit(
     runtimeState->water.nextEmitterId = NextWaterEmitterId(*runtimeState);
     const auto savedName = runtimeState->water.manualFlowPaths[savedIndex].name;
     runtimeState->water.manualFlowPathEditor = {};
-    if (runtimeState->pendingLoad.has_value() || !ResolveWaterSupportSessionIndex(*runtimeState).has_value()) {
+    if (runtimeState->pendingLoad.has_value() || !ResolveWaterRuntimeSessionIndex(*runtimeState).has_value()) {
         runtimeState->statusMessage = "Saved manual Flow path " + savedName + "; trails will rebuild when the scene is ready.";
         runtimeState->errorMessage.clear();
     } else {
@@ -14385,6 +14774,12 @@ bool BakeWaterOverlayForActiveLayer(
     if (runtimeState == nullptr || viewport == nullptr) {
         return false;
     }
+    if (!EnsureSceneAnalysisReadyForAction(
+            runtimeState,
+            DeferredSceneAnalysisAction::BakeWaterPath,
+            "Bake Path")) {
+        return false;
+    }
     if (runtimeState->pendingLoad.has_value()) {
         runtimeState->errorMessage = "Please wait for the current layer load before generating water flow.";
         runtimeState->statusMessage.clear();
@@ -14429,11 +14824,19 @@ bool BakeWaterOverlayForActiveLayer(
         }
         runtimeState->water.pathDirty = false;
         runtimeState->water.dirtyEmitterIds.clear();
+        std::string cacheSaveError;
+        const bool cachePersisted = PersistSettledWaterPathCache(
+            runtimeState,
+            sourceSession,
+            &cacheSaveError);
         runtimeState->statusMessage =
             "Reused cached water main paths with " +
             FormatPointCount(runtimeState->water.pathAnchors.points.size()) + " path anchors and " +
             FormatPointCount(runtimeState->water.pathCache.branches.size()) +
             " branches; updating source-local lanes and trails asynchronously.";
+        if (!cachePersisted && !cacheSaveError.empty()) {
+            runtimeState->statusMessage += " Flow cache was not persisted: " + cacheSaveError;
+        }
         runtimeState->errorMessage.clear();
         return true;
     }
@@ -14614,6 +15017,11 @@ bool BakeWaterOverlayForActiveLayer(
         FormatPointCount(runtimeState->water.pathAnchors.points.size()) + " path anchors across " +
         FormatPointCount(runtimeState->water.pathCache.branches.size()) +
         " branches; updating source-local lanes and trails asynchronously.";
+    std::string cacheSaveError;
+    if (!PersistSettledWaterPathCache(runtimeState, sourceSession, &cacheSaveError) &&
+        !cacheSaveError.empty()) {
+        runtimeState->statusMessage += " Flow cache was not persisted: " + cacheSaveError;
+    }
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -14630,7 +15038,7 @@ bool RefreshWaterOverlayFromAnchors(
     if (runtimeState->pendingLoad.has_value()) {
         return false;
     }
-    const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+    const auto supportIndex = ResolveWaterRuntimeSessionIndex(*runtimeState);
     if (!supportIndex.has_value() || supportIndex.value() >= runtimeState->sessions.size()) {
         runtimeState->water.pathDirty = !runtimeState->water.emitters.empty();
         runtimeState->statusMessage = runtimeState->water.emitters.empty()
@@ -14834,6 +15242,12 @@ bool RefreshWaterRippleEffects(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (!EnsureSceneAnalysisReadyForAction(
+            runtimeState,
+            DeferredSceneAnalysisAction::RefreshWaterRipple,
+            "Ripple Recalculate Effects")) {
         return false;
     }
     if (runtimeState->pendingLoad.has_value()) {
@@ -15156,48 +15570,51 @@ void PollWaterRippleLiveEffectRefresh(
     }
 }
 
-bool SceneHasActiveRainDisplay(
+bool SceneHasCommittedWaterSurfaceDisplay(
     const PreviewRuntimeState& runtimeState,
     const ScenePointCloudRuntime& scene) {
-    const auto sessionIsActive = [&](const std::optional<std::size_t>& index) {
+    if (!scene.displayLoaded) {
+        return false;
+    }
+    const auto sessionIsCommitted = [&](const std::optional<std::size_t>& index) {
         if (!index.has_value() || index.value() >= runtimeState.sessions.size()) {
             return false;
         }
-        const auto& session = runtimeState.sessions[index.value()];
-        return session.visible || session.gpuResident || session.pendingDisplaySource ||
-               session.committedDisplaySource;
+        return IsCommittedDisplayPointCloudReady(
+            runtimeState,
+            runtimeState.sessions[index.value()]);
     };
     return std::any_of(
-               scene.pendingDisplaySessionIndices.begin(),
-               scene.pendingDisplaySessionIndices.end(),
-               sessionIsActive) ||
-           std::any_of(
-               scene.committedDisplaySessionIndices.begin(),
-               scene.committedDisplaySessionIndices.end(),
-               sessionIsActive);
+        scene.committedDisplaySessionIndices.begin(),
+        scene.committedDisplaySessionIndices.end(),
+        sessionIsCommitted);
 }
 
-const ScenePointCloudRuntime* ActiveRainCollisionScene(const PreviewRuntimeState& runtimeState) {
-    if (runtimeState.selectedSessionIndex.has_value() &&
-        runtimeState.selectedSessionIndex.value() < runtimeState.sessions.size()) {
-        const auto* selectedScene = FindScenePointCloudRuntime(
+ScenePointCloudRuntime* ActiveWaterSurfaceScene(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return nullptr;
+    }
+    if (runtimeState->selectedSessionIndex.has_value() &&
+        runtimeState->selectedSessionIndex.value() < runtimeState->sessions.size()) {
+        auto* selectedScene = FindScenePointCloudRuntime(
             runtimeState,
-            runtimeState.sessions[runtimeState.selectedSessionIndex.value()]);
-        if (selectedScene != nullptr && SceneHasActiveRainDisplay(runtimeState, *selectedScene)) {
+            runtimeState->sessions[runtimeState->selectedSessionIndex.value()]);
+        if (selectedScene != nullptr &&
+            SceneHasCommittedWaterSurfaceDisplay(*runtimeState, *selectedScene)) {
             return selectedScene;
         }
     }
     const auto sceneIt = std::find_if(
-        runtimeState.pointCloudScenes.begin(),
-        runtimeState.pointCloudScenes.end(),
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
         [&](const ScenePointCloudRuntime& scene) {
-            return SceneHasActiveRainDisplay(runtimeState, scene);
+            return SceneHasCommittedWaterSurfaceDisplay(*runtimeState, scene);
         });
-    return sceneIt == runtimeState.pointCloudScenes.end() ? nullptr : &*sceneIt;
+    return sceneIt == runtimeState->pointCloudScenes.end() ? nullptr : &*sceneIt;
 }
 
-std::optional<RainCollisionBuildResult> TakeRainCollisionWarmupResult(
-    const std::shared_ptr<RainCollisionCacheWarmupShared>& shared) {
+std::optional<WaterSurfaceCacheWarmupResult> TakeWaterSurfaceCacheWarmupResult(
+    const std::shared_ptr<WaterSurfaceCacheWarmupShared>& shared) {
     if (shared == nullptr) {
         return std::nullopt;
     }
@@ -15210,85 +15627,259 @@ std::optional<RainCollisionBuildResult> TakeRainCollisionWarmupResult(
     return result;
 }
 
-void CancelRainCollisionCacheWarmup(WaterWorkflowState* water) {
-    if (water == nullptr || !water->rainCollisionCacheWarmup.worker.joinable()) {
+void CancelWaterSurfaceCacheWarmup(WaterWorkflowState* water) {
+    if (water == nullptr || !water->waterSurfaceCacheWarmup.worker.joinable()) {
         return;
     }
-    if (water->rainCollisionCacheWarmup.shared != nullptr) {
-        water->rainCollisionCacheWarmup.shared->cancelRequested.store(true);
+    if (water->waterSurfaceCacheWarmup.shared != nullptr) {
+        water->waterSurfaceCacheWarmup.shared->cancelRequested.store(true);
     }
-    water->rainCollisionCacheWarmup.worker.request_stop();
-    water->rainCollisionCacheWarmup = {};
+    water->waterSurfaceCacheWarmup.worker.request_stop();
+    water->waterSurfaceCacheWarmup = {};
 }
 
-void StartRainCollisionCacheWarmup(
+std::filesystem::path WaterSurfaceCacheRootForScene(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    if (!scene.sourceFolder.empty()) {
+        return scene.sourceFolder;
+    }
+    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
+    return projectPath.empty() ? runtimeState.waterSurfaceCacheRoot : projectPath.parent_path();
+}
+
+std::filesystem::path WaterSurfaceProjectFallbackRoot(
+    const PreviewRuntimeState& runtimeState) {
+    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
+    return projectPath.empty() ? runtimeState.waterSurfaceCacheRoot : projectPath.parent_path();
+}
+
+std::filesystem::path WaterSurfaceManifestPath(
+    const PreviewRuntimeState& runtimeState,
+    const WaterSurfaceCacheManifestDocument& manifest) {
+    if (manifest.relativePath.is_absolute()) {
+        return manifest.relativePath;
+    }
+    const std::filesystem::path projectPath{runtimeState.persistence.projectFilePath};
+    return projectPath.empty()
+               ? manifest.relativePath
+               : (projectPath.parent_path() / manifest.relativePath).lexically_normal();
+}
+
+WaterSurfaceCacheRuntimeStatus InitialWaterSurfaceCacheStatus(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    if (!scene.waterSurfaceCache.has_value()) {
+        return WaterSurfaceCacheRuntimeStatus::Missing;
+    }
+    const auto& manifest = scene.waterSurfaceCache.value();
+    const auto manifestPath = WaterSurfaceManifestPath(runtimeState, manifest);
+    std::error_code sizeError;
+    const auto payloadBytes = manifestPath.empty()
+                                  ? 0U
+                                  : std::filesystem::file_size(manifestPath, sizeError);
+    if (manifest.cacheSchema != invisible_places::water::kWaterSurfaceCacheSchemaVersion ||
+        manifest.algorithmId != "water-surface-v3" ||
+        manifest.sourceFingerprint != scene.waterSurfaceSignature ||
+        manifest.requestedRebuildGeneration != manifest.builtRebuildGeneration ||
+        manifestPath.empty() || sizeError ||
+        (manifest.payloadBytes != 0U && manifest.payloadBytes != payloadBytes)) {
+        return WaterSurfaceCacheRuntimeStatus::Stale;
+    }
+    // The sidecar is a valid warm-load candidate, but it becomes Valid only
+    // after its payload has been verified and uploaded for this process.
+    return WaterSurfaceCacheRuntimeStatus::Missing;
+}
+
+void StartWaterSurfaceCacheWarmup(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
-    const ScenePointCloudRuntime& scene) {
-    if (runtimeState == nullptr || viewport == nullptr || scene.rainCollisionSources.empty()) {
+    ScenePointCloudRuntime* scene) {
+    if (runtimeState == nullptr || viewport == nullptr || scene == nullptr ||
+        scene->waterSurfaceSources.empty()) {
         return;
     }
     auto& water = runtimeState->water;
-    const auto& signature = scene.rainCollisionSignature;
-    if (water.rainCollisionCache != nullptr &&
-        water.rainCollisionSceneGroupName == scene.sceneGroupName &&
-        water.rainCollisionCacheSignature == signature) {
+    const auto& signature = scene->waterSurfaceSignature;
+    const auto requestedGeneration = scene->waterSurfaceCache.has_value()
+                                         ? scene->waterSurfaceCache->requestedRebuildGeneration
+                                         : 0U;
+    const auto builtGeneration = scene->waterSurfaceCache.has_value()
+                                     ? scene->waterSurfaceCache->builtRebuildGeneration
+                                     : 0U;
+    const bool forceRebuild = requestedGeneration > builtGeneration;
+    if (water.waterSurfaceCache != nullptr &&
+        water.waterSurfaceSceneGroupName == scene->sceneGroupName &&
+        water.waterSurfaceCacheSignature == signature &&
+        !forceRebuild) {
+        scene->waterSurfaceCacheStatus = water.waterSurfaceCachePreprocessPending
+                                             ? WaterSurfaceCacheRuntimeStatus::Building
+                                             : WaterSurfaceCacheRuntimeStatus::Valid;
         return;
     }
-    if (water.rainCollisionCacheWarmup.worker.joinable()) {
-        if (water.rainCollisionCacheWarmup.sceneGroupName == scene.sceneGroupName &&
-            water.rainCollisionCacheWarmup.signature == signature) {
+    if (water.waterSurfaceCacheWarmup.worker.joinable()) {
+        if (water.waterSurfaceCacheWarmup.sceneGroupName == scene->sceneGroupName &&
+            water.waterSurfaceCacheWarmup.signature == signature) {
+            scene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Building;
             return;
         }
-        CancelRainCollisionCacheWarmup(&water);
+        CancelWaterSurfaceCacheWarmup(&water);
     }
 
-    if (water.rainCollisionCache != nullptr &&
-        water.rainCollisionSceneGroupName != scene.sceneGroupName) {
+    if (water.waterSurfaceCache != nullptr &&
+        water.waterSurfaceSceneGroupName != scene->sceneGroupName) {
         viewport->ClearWaterSurfaceCache();
-        water.rainCollisionCache.reset();
-        water.rainCollisionCacheSignature.clear();
-        water.rainCollisionSceneGroupName.clear();
+        water.waterSurfaceCache.reset();
+        water.waterSurfaceCacheSignature.clear();
+        water.waterSurfaceSceneGroupName.clear();
         water.waterSurfaceCacheLoadedFromDisk = false;
-        InvalidateWaterSeepageTopology(&water);
+        water.waterSurfaceCachePreprocessPending = false;
     }
 
-    auto shared = std::make_shared<RainCollisionCacheWarmupShared>();
+    auto shared = std::make_shared<WaterSurfaceCacheWarmupShared>();
     {
         std::scoped_lock lock(shared->mutex);
         shared->stage = "Reading shared 5 mm role sources";
     }
-    const auto sources = scene.rainCollisionSources;
-    const auto cacheRoot = runtimeState->rainCollisionCacheRoot;
+    const auto sources = scene->waterSurfaceSources;
+    const auto cacheRoot = WaterSurfaceCacheRootForScene(*runtimeState, *scene);
+    const auto fallbackRoot = WaterSurfaceProjectFallbackRoot(*runtimeState);
+    const bool fallbackCacheCandidate = [&]() {
+        if (fallbackRoot.empty() ||
+            NormalizePathKey(fallbackRoot) == NormalizePathKey(cacheRoot)) {
+            return false;
+        }
+        std::error_code currentCacheError;
+        if (std::filesystem::is_regular_file(
+                invisible_places::water::WaterSurfaceCachePath(fallbackRoot, signature),
+                currentCacheError) &&
+            !currentCacheError) {
+            return true;
+        }
+        const auto legacyDirectory = fallbackRoot / "cache" / "rain";
+        std::error_code directoryError;
+        if (!std::filesystem::is_directory(legacyDirectory, directoryError) || directoryError) {
+            return false;
+        }
+        for (std::filesystem::directory_iterator iterator{
+                 legacyDirectory,
+                 std::filesystem::directory_options::skip_permission_denied,
+                 directoryError};
+             !directoryError && iterator != std::filesystem::directory_iterator{};
+             iterator.increment(directoryError)) {
+            std::error_code entryError;
+            if (iterator->is_regular_file(entryError) && !entryError &&
+                iterator->path().extension() == ".raincache") {
+                return true;
+            }
+        }
+        return false;
+    }();
     std::jthread worker{
-        [shared, sources, cacheRoot](std::stop_token) {
-            auto result = invisible_places::water::BuildWaterSurfaceCache(
-                sources,
-                cacheRoot,
-                &shared->cancelRequested);
+        [shared,
+         sources,
+         cacheRoot,
+         fallbackRoot,
+         signature,
+         forceRebuild,
+         fallbackCacheCandidate](std::stop_token) {
+            invisible_places::water::WaterSurfaceBuildResult result;
+            std::filesystem::path persistedPath;
+            try {
+                const auto primaryPath = invisible_places::water::WaterSurfaceCachePath(
+                    cacheRoot,
+                    signature);
+                std::error_code primaryError;
+                const bool primaryPresent =
+                    std::filesystem::is_regular_file(primaryPath, primaryError) &&
+                    !primaryError;
+                const auto buildRoot = !forceRebuild && !primaryPresent &&
+                                               !primaryError && fallbackCacheCandidate
+                                           ? fallbackRoot
+                                           : cacheRoot;
+                result = invisible_places::water::BuildWaterSurfaceCache(
+                    sources,
+                    forceRebuild ? std::filesystem::path{} : buildRoot,
+                    &shared->cancelRequested);
+                persistedPath = result.persistedPath;
+                if (result.success && !result.cancelled && persistedPath.empty()) {
+                    std::string saveError;
+                    if (invisible_places::water::SaveWaterSurfaceCache(
+                            result.cache,
+                            primaryPath,
+                            &saveError)) {
+                        persistedPath = primaryPath;
+                    } else {
+                        const auto primarySaveError = saveError;
+                        const auto fallbackPath =
+                            invisible_places::water::WaterSurfaceCachePath(
+                                fallbackRoot,
+                                signature);
+                        const bool distinctFallback =
+                            !fallbackRoot.empty() &&
+                            NormalizePathKey(fallbackPath) != NormalizePathKey(primaryPath);
+                        saveError.clear();
+                        if (distinctFallback &&
+                            invisible_places::water::SaveWaterSurfaceCache(
+                                result.cache,
+                                fallbackPath,
+                                &saveError)) {
+                            persistedPath = fallbackPath;
+                        } else {
+                            result.warnings.push_back(
+                                "Water surface cache could not be persisted: " +
+                                (saveError.empty() ? primarySaveError : saveError));
+                        }
+                    }
+                }
+                if (result.success && !result.cancelled && !persistedPath.empty()) {
+                    std::error_code persistedError;
+                    if (persistedPath.extension() != ".surfacecache" ||
+                        !std::filesystem::is_regular_file(persistedPath, persistedError) ||
+                        persistedError) {
+                        result.warnings.push_back(
+                            "Water surface cache persistence did not leave a current sidecar.");
+                        persistedPath.clear();
+                    }
+                }
+                result.persistedPath = persistedPath;
+            } catch (const std::exception& error) {
+                result = {};
+                result.errorMessage =
+                    "Water surface cache warm-up failed: " + std::string{error.what()};
+                persistedPath.clear();
+            } catch (...) {
+                result = {};
+                result.errorMessage = "Water surface cache warm-up failed unexpectedly.";
+                persistedPath.clear();
+            }
             std::scoped_lock lock(shared->mutex);
             shared->stage = result.cancelled ? "Cancelled" : (result.success ? "Ready" : "Failed");
-            shared->result = std::move(result);
+            shared->result = WaterSurfaceCacheWarmupResult{
+                .build = std::move(result),
+                .cachePath = std::move(persistedPath),
+            };
         }};
-    water.rainCollisionCacheWarmup = {
+    water.waterSurfaceCacheWarmup = {
         .shared = std::move(shared),
         .worker = std::move(worker),
-        .sceneGroupName = scene.sceneGroupName,
+        .sceneGroupName = scene->sceneGroupName,
         .signature = signature,
         .startedAt = std::chrono::steady_clock::now(),
     };
+    scene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Building;
 }
 
-void PollRainCollisionCacheWarmup(
+void PollWaterSurfaceCacheWarmup(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
     auto& water = runtimeState->water;
-    auto& job = water.rainCollisionCacheWarmup;
-    auto result = TakeRainCollisionWarmupResult(job.shared);
-    if (!result.has_value()) {
+    auto& job = water.waterSurfaceCacheWarmup;
+    auto completed = TakeWaterSurfaceCacheWarmupResult(job.shared);
+    if (!completed.has_value()) {
         return;
     }
     if (job.worker.joinable()) {
@@ -15297,31 +15888,86 @@ void PollRainCollisionCacheWarmup(
     const auto completedScene = job.sceneGroupName;
     const auto completedSignature = job.signature;
     job = {};
-    if (result->cancelled) {
+    auto& result = completed->build;
+    water.waterSurfaceSourceScanCount += result.diagnostics.sourceScanCount;
+    water.waterSurfaceGpuTableBuildCount += result.diagnostics.gpuTableBuildCount;
+    water.waterSurfaceFullPayloadHashPassCount +=
+        result.diagnostics.fullPayloadHashPassCount;
+    if (result.success && !result.cancelled && !result.loadedFromDisk) {
+        ++water.waterSurfaceCacheBuildCount;
+    }
+    if (result.cancelled) {
         return;
     }
-    const auto* activeScene = ActiveRainCollisionScene(*runtimeState);
+    auto* activeScene = ActiveWaterSurfaceScene(runtimeState);
     if (activeScene == nullptr || activeScene->sceneGroupName != completedScene ||
-        activeScene->rainCollisionSignature != completedSignature) {
+        activeScene->waterSurfaceSignature != completedSignature) {
         return;
     }
-    if (!result->success) {
-        runtimeState->errorMessage = "Water surface cache failed: " + result->errorMessage;
+    if (!result.success) {
+        activeScene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Failed;
+        runtimeState->errorMessage = "Water surface cache failed: " + result.errorMessage;
         runtimeState->statusMessage.clear();
         return;
     }
     try {
-        viewport->UploadWaterSurfaceCache(result->cache);
+        viewport->UploadWaterSurfaceCache(result.cache);
     } catch (const std::exception& error) {
+        activeScene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Failed;
         runtimeState->errorMessage = "Water surface cache upload failed: " + std::string{error.what()};
         runtimeState->statusMessage.clear();
         return;
     }
-    water.rainCollisionCache = std::make_shared<WaterSurfaceCache>(std::move(result->cache));
-    water.rainCollisionSceneGroupName = completedScene;
-    water.rainCollisionCacheSignature = completedSignature;
-    water.waterSurfaceCacheLoadedFromDisk = result->loadedFromDisk;
-    water.rainCollisionWarnings = std::move(result->warnings);
+
+    WaterSurfaceCacheManifestDocument manifest =
+        activeScene->waterSurfaceCache.value_or(WaterSurfaceCacheManifestDocument{});
+    manifest.cacheSchema = result.cache.schemaVersion;
+    manifest.algorithmId = "water-surface-v3";
+    manifest.sourceFingerprint = completedSignature;
+    if (!completed->cachePath.empty()) {
+        std::error_code sizeError;
+        manifest.payloadBytes = std::filesystem::file_size(completed->cachePath, sizeError);
+        if (sizeError) {
+            manifest.payloadBytes = invisible_places::water::WaterSurfaceCacheEstimatedPersistenceBytes(
+                result.cache);
+        }
+        const std::filesystem::path projectPath{runtimeState->persistence.projectFilePath};
+        std::error_code relativeError;
+        manifest.relativePath = projectPath.empty()
+                                    ? completed->cachePath
+                                    : std::filesystem::relative(
+                                          completed->cachePath,
+                                          projectPath.parent_path(),
+                                          relativeError);
+        if (relativeError || manifest.relativePath.empty()) {
+            manifest.relativePath = completed->cachePath;
+        }
+    } else {
+        // A runtime-only cache (for example one above the persistence ceiling)
+        // must not inherit a previously valid sidecar path.
+        manifest.relativePath.clear();
+        manifest.payloadBytes = 0U;
+    }
+    const auto identity = invisible_places::water::BuildWaterSurfaceCacheIdentity(result.cache);
+    manifest.checksum = identity.contentDigest;
+    manifest.builtRebuildGeneration = manifest.requestedRebuildGeneration;
+    activeScene->waterSurfaceCache = std::move(manifest);
+    activeScene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Building;
+
+    auto installedCache = std::make_shared<WaterSurfaceCache>(std::move(result.cache));
+    installedCache->gpuData.surfaceTable.clear();
+    installedCache->gpuData.surfaceTable.shrink_to_fit();
+    installedCache->gpuData.vegetationTable.clear();
+    installedCache->gpuData.vegetationTable.shrink_to_fit();
+    installedCache->gpuData.flowSurfaceTable.clear();
+    installedCache->gpuData.flowSurfaceTable.shrink_to_fit();
+    water.waterSurfaceCache = std::move(installedCache);
+    water.waterSurfaceSceneGroupName = completedScene;
+    water.waterSurfaceCacheSignature = completedSignature;
+    water.waterSurfaceCacheLoadedFromDisk = result.loadedFromDisk;
+    water.waterSurfaceCachePreprocessPending = true;
+    water.waterSurfaceCacheWarnings = std::move(result.warnings);
+    ++water.waterSurfaceCacheInstallCount;
     // Re-trace the small node guide set against the newly committed immutable
     // surfel cache; no rendered-cloud membership is rebuilt.
     InvalidateWaterSeepageTopology(&water);
@@ -15340,32 +15986,101 @@ void PollRainCollisionCacheWarmup(
             WaterOverlayRefreshPersistence::InMemoryOnly);
     }
     runtimeState->statusMessage =
-        std::string{result->loadedFromDisk ? "Loaded" : "Built"} +
+        std::string{result.loadedFromDisk ? "Loaded" : "Built"} +
         " shared water surface cache for " + completedScene + " (" +
-        FormatPointCount(water.rainCollisionCache->surfaceCells.size()) + " surface cells, " +
-        FormatPointCount(water.rainCollisionCache->vegetationVoxels.size()) + " vegetation voxels, " +
-        FormatPointCount(water.rainCollisionCache->flowSurfaceSurfels.size()) + " Flow surfels).";
+        FormatPointCount(water.waterSurfaceCache->surfaceCells.size()) + " surface cells, " +
+        FormatPointCount(water.waterSurfaceCache->vegetationVoxels.size()) + " vegetation voxels, " +
+        FormatPointCount(water.waterSurfaceCache->flowSurfaceSurfels.size()) + " Flow surfels).";
     runtimeState->errorMessage.clear();
 }
 
-void EnsureRainCollisionCacheReady(
+void EnsureWaterSurfaceCacheReady(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
-    // Point-cloud loads and uploads have large transient allocations on unified-memory
-    // systems. Do not build, materialise, or upload the optional shared water cache
-    // until the serial layer-load pipeline is idle.
-    if (runtimeState->pendingLoad.has_value() ||
-        !runtimeState->persistence.queuedLoads.empty()) {
+    PollWaterSurfaceCacheWarmup(runtimeState, viewport);
+    if (const auto* scene = ActiveWaterSurfaceScene(runtimeState);
+        scene != nullptr &&
+        scene->waterSurfaceCacheStatus == WaterSurfaceCacheRuntimeStatus::Failed) {
+        // Keep a failed build settled until the user explicitly requests a
+        // replacement; otherwise a bad source would launch an unbounded CPU
+        // rebuild loop on every frame.
         return;
     }
-    PollRainCollisionCacheWarmup(runtimeState, viewport);
-    const auto* scene = ActiveRainCollisionScene(*runtimeState);
-    if (scene != nullptr) {
-        StartRainCollisionCacheWarmup(runtimeState, viewport, *scene);
+    if (runtimeState->water.waterSurfaceCachePreprocessPending) {
+        const auto surfaceView = viewport->WaterSurfaceFlowView();
+        const auto& installedCache = runtimeState->water.waterSurfaceCache;
+        if (viewport->WaterSurfaceUploadPending() ||
+            installedCache == nullptr ||
+            !surfaceView.valid || !surfaceView.preprocessingComplete ||
+            surfaceView.cacheIdentity == nullptr ||
+            *surfaceView.cacheIdentity != installedCache->cacheIdentity) {
+            return;
+        }
+        runtimeState->water.waterSurfaceCachePreprocessPending = false;
+        if (auto* scene = ActiveWaterSurfaceScene(runtimeState); scene != nullptr) {
+            scene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Valid;
+        }
     }
+    if (runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ||
+        runtimeState->pendingLoad.has_value() ||
+        runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.joinable()) {
+        return;
+    }
+    auto* scene = ActiveWaterSurfaceScene(runtimeState);
+    if (scene != nullptr) {
+        StartWaterSurfaceCacheWarmup(runtimeState, viewport, scene);
+    }
+}
+
+const char* WaterSurfaceCacheRuntimeStatusLabel(
+    WaterSurfaceCacheRuntimeStatus status) {
+    switch (status) {
+        case WaterSurfaceCacheRuntimeStatus::Missing:
+            return "missing";
+        case WaterSurfaceCacheRuntimeStatus::Valid:
+            return "valid";
+        case WaterSurfaceCacheRuntimeStatus::Stale:
+            return "stale";
+        case WaterSurfaceCacheRuntimeStatus::Building:
+            return "building";
+        case WaterSurfaceCacheRuntimeStatus::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
+bool RequestWaterSurfaceCacheRebuild(PreviewRuntimeState* runtimeState) {
+    auto* scene = ActiveWaterSurfaceScene(runtimeState);
+    if (runtimeState == nullptr || scene == nullptr ||
+        scene->waterSurfaceSources.empty() ||
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable()) {
+        return false;
+    }
+
+    auto manifest = scene->waterSurfaceCache.value_or(
+        WaterSurfaceCacheManifestDocument{});
+    manifest.cacheSchema = invisible_places::water::kWaterSurfaceCacheSchemaVersion;
+    manifest.algorithmId = "water-surface-v3";
+    manifest.sourceFingerprint = scene->waterSurfaceSignature;
+    const auto generation = std::max(
+        manifest.requestedRebuildGeneration,
+        manifest.builtRebuildGeneration);
+    if (generation == std::numeric_limits<std::uint64_t>::max()) {
+        manifest.requestedRebuildGeneration = 1U;
+        manifest.builtRebuildGeneration = 0U;
+    } else {
+        manifest.requestedRebuildGeneration = generation + 1U;
+    }
+    scene->waterSurfaceCache = std::move(manifest);
+    scene->waterSurfaceCacheStatus = WaterSurfaceCacheRuntimeStatus::Stale;
+    runtimeState->statusMessage =
+        "Queued a clean water surface cache rebuild for " +
+        scene->sceneGroupName + ". The settled cache remains active until the replacement is ready.";
+    runtimeState->errorMessage.clear();
+    return true;
 }
 
 std::string DynamicMeshSurfaceCacheSignature(
@@ -15397,7 +16112,9 @@ std::filesystem::path DynamicMeshSurfaceCachePathForSettings(
     if (const auto sceneMeshPath = ResolveDynamicMeshSceneSurfacePath(runtimeState); sceneMeshPath.has_value()) {
         return sceneMeshPath.value();
     }
-    if (!settings.meshPath.empty() && std::filesystem::exists(settings.meshPath)) {
+    std::error_code meshStatusError;
+    if (!settings.meshPath.empty() &&
+        std::filesystem::is_regular_file(settings.meshPath, meshStatusError)) {
         return settings.meshPath;
     }
     return {};
@@ -15474,16 +16191,20 @@ void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool 
     if (!water.dynamicMeshFlowSettings.enabled ||
         runtimeState->pendingLoad.has_value() ||
         !runtimeState->persistence.queuedLoads.empty() ||
-        water.rainCollisionCacheWarmup.worker.joinable()) {
+        water.waterSurfaceCacheWarmup.worker.joinable() ||
+        water.waterSurfaceCachePreprocessPending) {
         return;
     }
     const auto meshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, water.dynamicMeshFlowSettings);
     if (meshPath.empty()) {
         return;
     }
-    if (!std::filesystem::exists(meshPath)) {
+    std::error_code meshStatusError;
+    if (!std::filesystem::is_regular_file(meshPath, meshStatusError)) {
         if (publishStatus) {
-            runtimeState->errorMessage = "Dynamic mesh flow surface was not found: " + meshPath.string();
+            runtimeState->errorMessage =
+                "Dynamic mesh flow surface was not found or was not readable: " +
+                meshPath.string();
             runtimeState->statusMessage.clear();
         }
         return;
@@ -15510,51 +16231,66 @@ void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool 
             DynamicMeshSurfaceCacheWarmupResult result;
             result.meshPath = meshPath;
             result.signature = signature;
-
-            const auto loadStartedAt = std::chrono::steady_clock::now();
-            auto loadResult = invisible_places::io::LoadTriangleMesh(meshPath);
-            result.diagnostics.meshLoadMilliseconds = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - loadStartedAt).count();
-            if (stopToken.stop_requested()) {
-                return;
-            }
-            if (!loadResult.success) {
-                result.errorMessage = loadResult.errorMessage;
+            const auto publishResult = [&](std::string stage) {
                 std::scoped_lock lock(shared->mutex);
-                shared->stage = "Failed";
+                shared->stage = std::move(stage);
                 shared->result = std::move(result);
-                return;
-            }
+            };
+            try {
+                const auto loadStartedAt = std::chrono::steady_clock::now();
+                auto loadResult = invisible_places::io::LoadTriangleMesh(meshPath);
+                result.diagnostics.meshLoadMilliseconds = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - loadStartedAt).count();
+                if (stopToken.stop_requested()) {
+                    result.errorMessage = "Dynamic mesh cache prewarm was cancelled.";
+                    publishResult("Cancelled");
+                    return;
+                }
+                if (!loadResult.success) {
+                    result.errorMessage = loadResult.errorMessage;
+                    publishResult("Failed");
+                    return;
+                }
 
-            {
-                std::scoped_lock lock(shared->mutex);
-                shared->stage = "Building surface cache";
-            }
-            auto cache = std::make_shared<MeshSurfaceCache>(
-                invisible_places::water::BuildMeshSurfaceCache(loadResult.mesh, settings));
-            if (stopToken.stop_requested()) {
-                return;
-            }
-            if (cache->cells.empty()) {
-                result.errorMessage = "Dynamic mesh flow cache did not produce surface cells.";
-                std::scoped_lock lock(shared->mutex);
-                shared->stage = "Failed";
-                shared->result = std::move(result);
-                return;
-            }
+                {
+                    std::scoped_lock lock(shared->mutex);
+                    shared->stage = "Building surface cache";
+                }
+                auto cache = std::make_shared<MeshSurfaceCache>(
+                    invisible_places::water::BuildMeshSurfaceCache(loadResult.mesh, settings));
+                if (stopToken.stop_requested()) {
+                    result.errorMessage = "Dynamic mesh cache prewarm was cancelled.";
+                    publishResult("Cancelled");
+                    return;
+                }
+                if (cache->cells.empty()) {
+                    result.errorMessage = "Dynamic mesh flow cache did not produce surface cells.";
+                    publishResult("Failed");
+                    return;
+                }
 
-            result.success = true;
-            result.diagnostics.cacheBuildMilliseconds = cache->buildMilliseconds;
-            result.diagnostics.sourceVertexCount = cache->sourceVertexCount;
-            result.diagnostics.sourceTriangleCount = cache->sourceTriangleCount;
-            result.diagnostics.cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
-                cache->cells.size(),
-                static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
-            result.cache = std::move(cache);
-
-            std::scoped_lock lock(shared->mutex);
-            shared->stage = "Ready";
-            shared->result = std::move(result);
+                result.success = true;
+                result.diagnostics.cacheBuildMilliseconds = cache->buildMilliseconds;
+                result.diagnostics.sourceVertexCount = cache->sourceVertexCount;
+                result.diagnostics.sourceTriangleCount = cache->sourceTriangleCount;
+                result.diagnostics.cacheCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+                    cache->cells.size(),
+                    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+                result.cache = std::move(cache);
+                publishResult("Ready");
+            } catch (const std::exception& error) {
+                result.success = false;
+                result.cache.reset();
+                result.errorMessage =
+                    "Unexpected dynamic mesh cache prewarm failure: " +
+                    std::string{error.what()};
+                publishResult("Failed");
+            } catch (...) {
+                result.success = false;
+                result.cache.reset();
+                result.errorMessage = "Unknown dynamic mesh cache prewarm failure.";
+                publishResult("Failed");
+            }
         }};
 
     water.dynamicMeshSurfaceCacheWarmup = DynamicMeshSurfaceCacheWarmupJob{
@@ -15642,7 +16378,8 @@ std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
         runtimeState->statusMessage.clear();
         return nullptr;
     }
-    if (!std::filesystem::exists(meshPath)) {
+    std::error_code meshStatusError;
+    if (!std::filesystem::is_regular_file(meshPath, meshStatusError)) {
         runtimeState->errorMessage = "Dynamic mesh flow surface was not found: " + meshPath.string();
         runtimeState->statusMessage.clear();
         return nullptr;
@@ -15904,6 +16641,12 @@ bool RefreshWaterFieldOverlays(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    if (!EnsureSceneAnalysisReadyForAction(
+            runtimeState,
+            DeferredSceneAnalysisAction::RefreshWaterField,
+            "Field Recalculate Effects")) {
         return false;
     }
     if (runtimeState->pendingLoad.has_value()) {
@@ -16731,6 +17474,13 @@ bool QueueWaterRegionPointPreviewForLayers(
     PreviewRuntimeState* runtimeState,
     const std::vector<WaterEffectLayer>& layers,
     const invisible_places::renderer::core::VulkanViewportShell* viewport = nullptr) {
+    if (!layers.empty() &&
+        !EnsureSceneAnalysisReadyForAction(
+            runtimeState,
+            DeferredSceneAnalysisAction::RefreshRegionPreviews,
+            "region point preview")) {
+        return false;
+    }
     return StartWaterRegionPointPreviewJob(
         runtimeState,
         BuildWaterRegionPointPreviewRequests(runtimeState, layers, viewport));
@@ -17171,7 +17921,7 @@ std::optional<std::filesystem::path> SelectedCausticTargetLayerPath(const Previe
             return session.sourcePath;
         }
     }
-    const auto supportIndex = ResolveWaterSupportSessionIndex(runtimeState);
+    const auto supportIndex = ResolveWaterRuntimeSessionIndex(runtimeState);
     if (supportIndex.has_value() && supportIndex.value() < runtimeState.sessions.size()) {
         const auto& session = runtimeState.sessions[supportIndex.value()];
         if ((session.loaded || IsCpuReadyAnalysisPointCloudSource(session)) &&
@@ -17191,7 +17941,7 @@ bool AddWaterRippleVertexAtScreenPoint(
     }
     const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint, true);
     if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No CPU-ready canonical analysis surface was available for ripple placement.";
+        runtimeState->errorMessage = "No CPU-ready surface was available for ripple placement.";
         runtimeState->statusMessage.clear();
         return false;
     }
@@ -17236,7 +17986,7 @@ bool AddWaterFieldVertexAtScreenPoint(
     }
     const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint, true);
     if (!pivot.has_value()) {
-        runtimeState->errorMessage = "No CPU-ready canonical analysis surface was available for field region placement.";
+        runtimeState->errorMessage = "No CPU-ready surface was available for field region placement.";
         runtimeState->statusMessage.clear();
         return false;
     }
@@ -17650,7 +18400,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     {
         invisible_places::serialization::WaterSceneStateDocument waterSceneState;
         waterSceneState.sceneGroupName = "Default";
-        if (const auto supportIndex = ResolveWaterSupportSessionIndex(runtimeState);
+        if (const auto supportIndex = ResolveWaterRuntimeSessionIndex(runtimeState);
             supportIndex.has_value() && supportIndex.value() < runtimeState.sessions.size()) {
             const auto sceneKey = ProjectVisualSceneKey(runtimeState.sessions[supportIndex.value()]);
             if (!sceneKey.empty()) {
@@ -17794,6 +18544,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
                 : 0.0F;
         groupDocument.displayLoaded = scene.displayLoaded;
         groupDocument.displayVisible = scene.displayVisible;
+        groupDocument.waterSurfaceCache = scene.waterSurfaceCache;
         for (std::size_t roleIndex = 0;
              roleIndex < invisible_places::scene::kScenePointCloudRoleCount;
              ++roleIndex) {
@@ -17858,9 +18609,10 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
 std::optional<std::size_t> FindSessionIndexBySourcePath(
     const PreviewRuntimeState& runtimeState,
     const std::filesystem::path& sourcePath) {
-    const auto targetKey = NormalizePathKey(sourcePath);
     for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
-        if (NormalizePathKey(runtimeState.sessions[index].sourcePath) == targetKey) {
+        if (PathsReferToSameLocation(
+                runtimeState.sessions[index].sourcePath,
+                sourcePath)) {
             return index;
         }
     }
@@ -17871,6 +18623,9 @@ std::optional<std::size_t> FindSessionIndexBySourcePath(
 void StartQueuedLayerLoadIfIdle(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr ||
         runtimeState->pendingLoad.has_value() ||
+        runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ||
+        runtimeState->water.waterSurfaceCachePreprocessPending ||
+        runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.joinable() ||
         runtimeState->persistence.queuedLoads.empty()) {
         return;
     }
@@ -18097,7 +18852,7 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
         runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.request_stop();
         runtimeState->water.dynamicMeshSurfaceCacheWarmup = {};
     }
-    CancelRainCollisionCacheWarmup(&runtimeState->water);
+    CancelWaterSurfaceCacheWarmup(&runtimeState->water);
 
     if (!runtimeState->pendingLoad.has_value()) {
         return;
@@ -18181,15 +18936,18 @@ bool ApplyScenePointCloudGroupDocuments(
                 if (group.sceneGroupName != scene.sceneGroupName) {
                     return false;
                 }
-                const auto sceneFolderKey = NormalizePathKey(scene.sourceFolder);
                 const bool hasFolderQualifiedPath = std::any_of(
                     group.roleSources.begin(),
                     group.roleSources.end(),
                     [&](const invisible_places::serialization::ScenePointCloudRoleSourceDocument& source) {
                         return (!source.analysisSourcePath.empty() &&
-                                NormalizePathKey(source.analysisSourcePath.parent_path()) == sceneFolderKey) ||
+                                PathsReferToSameLocation(
+                                    source.analysisSourcePath.parent_path(),
+                                    scene.sourceFolder)) ||
                                (!source.displaySourcePath.empty() &&
-                                NormalizePathKey(source.displaySourcePath.parent_path()) == sceneFolderKey);
+                                PathsReferToSameLocation(
+                                    source.displaySourcePath.parent_path(),
+                                    scene.sourceFolder));
                     });
                 const bool hasAnySourcePath = std::any_of(
                     group.roleSources.begin(),
@@ -18206,7 +18964,9 @@ bool ApplyScenePointCloudGroupDocuments(
 
         for (auto& session : runtimeState->sessions) {
             if (IsSceneGroupedPointCloud(session) &&
-                NormalizePathKey(session.sourcePath.parent_path()) == NormalizePathKey(scene.sourceFolder)) {
+                PathsReferToSameLocation(
+                    session.sourcePath.parent_path(),
+                    scene.sourceFolder)) {
                 session.analysisSource = false;
             }
         }
@@ -18221,8 +18981,9 @@ bool ApplyScenePointCloudGroupDocuments(
                     runtimeState->sessions,
                     roleDocument->analysisSourcePath);
                 if (savedIndex.has_value() &&
-                    NormalizePathKey(runtimeState->sessions[savedIndex.value()].sourcePath.parent_path()) ==
-                        NormalizePathKey(scene.sourceFolder)) {
+                    PathsReferToSameLocation(
+                        runtimeState->sessions[savedIndex.value()].sourcePath.parent_path(),
+                        scene.sourceFolder)) {
                     analysisIndex = savedIndex;
                 } else {
                     scene.switchError = "Saved analysis source is missing; using the canonical scene source where available.";
@@ -18234,7 +18995,9 @@ bool ApplyScenePointCloudGroupDocuments(
                 analysisSession.analysisSource = true;
                 for (auto& session : runtimeState->sessions) {
                     if (IsSceneGroupedPointCloud(session) &&
-                        NormalizePathKey(session.sourcePath.parent_path()) == NormalizePathKey(scene.sourceFolder) &&
+                        PathsReferToSameLocation(
+                            session.sourcePath.parent_path(),
+                            scene.sourceFolder) &&
                         NormalizeSceneRoleName(session.sceneRole) ==
                             NormalizeSceneRoleName(analysisSession.sceneRole)) {
                         session.selectedSceneVariantPath = analysisSession.sourcePath;
@@ -18244,6 +19007,10 @@ bool ApplyScenePointCloudGroupDocuments(
         }
 
         scene.displayVisible = groupIt->displayVisible;
+        scene.waterSurfaceCache = groupIt->waterSurfaceCache;
+        scene.waterSurfaceCacheStatus = InitialWaterSurfaceCacheStatus(
+            *runtimeState,
+            scene);
         const bool shouldLoadDisplay = groupIt->displayLoaded;
 
         const SceneDisplayBundleRuntime* desiredBundle = nullptr;
@@ -18260,8 +19027,10 @@ bool ApplyScenePointCloudGroupDocuments(
                      ++roleIndex) {
                     const auto role = static_cast<invisible_places::scene::ScenePointCloudRole>(roleIndex);
                     const auto* roleDocument = FindSceneRoleSourceDocument(*groupIt, role);
-                    pathsMatch &= roleDocument != nullptr && !roleDocument->displaySourcePath.empty() &&
-                                  NormalizePathKey(roleDocument->displaySourcePath) == NormalizePathKey(
+                    pathsMatch &= roleDocument != nullptr &&
+                                  !roleDocument->displaySourcePath.empty() &&
+                                  PathsReferToSameLocation(
+                                      roleDocument->displaySourcePath,
                                       runtimeState->sessions[bundle.sessionIndices[roleIndex]].sourcePath);
                 }
                 if (pathsMatch) {
@@ -18602,6 +19371,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.seepageRuntimeGuideKeys.clear();
     runtimeState->water.seepageSurfaceGuides.clear();
     runtimeState->water.seepageSurfaceGuideFingerprints.clear();
+    runtimeState->water.seepageSurfaceGuideNodeFingerprints.clear();
     runtimeState->water.seepageSurfaceGuideWarning.clear();
     runtimeState->water.selectedRippleLayerIndex.reset();
     runtimeState->water.placementArmed = false;
@@ -18695,7 +19465,9 @@ bool ApplyProjectDocumentToRuntime(
             document.layers.begin(),
             document.layers.end(),
             [&session](const ProjectLayerDocument& layerDocument) {
-                return NormalizePathKey(layerDocument.sourcePath) == NormalizePathKey(session.sourcePath);
+                return PathsReferToSameLocation(
+                    layerDocument.sourcePath,
+                    session.sourcePath);
             });
 
         if (layerIt == document.layers.end()) {
@@ -18805,22 +19577,6 @@ bool ApplyProjectDocumentToRuntime(
         runtimeState->camera.ApplyState(document.cameraState.value());
         SyncPivotOverlayToCamera(runtimeState);
     }
-    if (const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
-        supportIndex.has_value() && supportIndex.value() < runtimeState->sessions.size()) {
-        auto& supportSession = runtimeState->sessions[supportIndex.value()];
-        const auto supportSettings =
-            ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path;
-        EnsureWaterSupportCloud(runtimeState, supportSession, supportSettings);
-        WaterTrailBuildDiagnostics prewarmDiagnostics;
-        EnsureTrailSurfaceIndexForSupport(runtimeState, supportSession, &prewarmDiagnostics);
-        const bool loadedGeneratedPathCache =
-            TryLoadWaterPathCacheForSupport(runtimeState, supportSession);
-        if (loadedGeneratedPathCache || HasValidManualFlowPath(runtimeState->water)) {
-            QueueWaterFlowTrailRefresh(
-                runtimeState,
-                WaterOverlayRefreshPersistence::InMemoryOnly);
-        }
-    }
     runtimeState->preserveProjectCameraOnNextLayerActivation =
         hasProjectCamera && requestedLoadedLayer && VisibleLayerCount(*runtimeState) == 0;
     std::size_t restoredRippleMemberships = 0U;
@@ -18830,9 +19586,6 @@ bool ApplyProjectDocumentToRuntime(
         viewport,
         &restoredRippleMemberships,
         &restoredRippleRegions);
-    QueueWaterRegionPointPreviewsForDirtyRegions(runtimeState, viewport);
-    StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
-
     runtimeState->statusMessage =
         "Loaded project with " + FormatPointCount(document.layers.size()) + " layer settings.";
     if (restoredRippleSessions > 0U) {
@@ -20685,8 +21438,8 @@ void BuildOfflineRippleRuntimeForSession(
 std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     PreviewRuntimeState& runtimeState) {
     std::vector<OfflinePointLayerSnapshot> layers;
-    const auto activeWater = ResolveActiveWaterSeepageRuntimeState(&runtimeState);
-    const auto& activeWaterScenario = activeWater.scenarioState;
+    const auto activeWater = ResolveWaterFrameState(&runtimeState);
+    const auto& activeWaterScenario = activeWater.rawScenarioState;
     const bool fastBasicRenderer =
         FastBasicPointRendererActive(runtimeState.projectSettings) &&
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
@@ -20695,7 +21448,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         const auto& session = runtimeState.sessions[sessionIndex];
         if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
             session.offlinePointCloud == nullptr ||
-            IsGeneratedWaterOverlaySession(session)) {
+            !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
         auto invocationStyle = IsGeneratedWaterOverlaySession(session)
@@ -20740,7 +21493,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             &rippleMemberships,
             &rippleParams);
         WaterSeepageSpatialGrid seepageGrid;
-        if (!IsGeneratedWaterOverlaySession(session)) {
+        if (IsAuthoredWaterTerrainSession(session)) {
             const auto* surfaceGuides = EnsureWaterSeepageSurfaceGuidesForSession(
                 &runtimeState,
                 session);
@@ -20759,7 +21512,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                 runtimeState.water.collisionRainSettings,
                 effectiveSeepageInvocations,
                 guideSpan,
-                activeWaterScenario,
+                activeWater.seepageScenarioState,
                 activeWater.nodeStates);
         }
         layers.push_back(
@@ -20788,17 +21541,17 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
              .rainCollisionRole = [&]() {
                  const auto role = invisible_places::scene::ParseScenePointCloudRole(session.sceneRole);
                  if (!role.has_value()) {
-                     return RainCollisionRole::None;
+                     return WaterSurfaceRole::None;
                  }
                  switch (role.value()) {
                      case invisible_places::scene::ScenePointCloudRole::Rock:
-                         return RainCollisionRole::Rock;
+                         return WaterSurfaceRole::Rock;
                      case invisible_places::scene::ScenePointCloudRole::Sand:
-                         return RainCollisionRole::Sand;
+                         return WaterSurfaceRole::Sand;
                      case invisible_places::scene::ScenePointCloudRole::Vegetation:
-                         return RainCollisionRole::Vegetation;
+                         return WaterSurfaceRole::Vegetation;
                  }
-                 return RainCollisionRole::None;
+                 return WaterSurfaceRole::None;
              }()});
     }
     return layers;
@@ -21186,7 +21939,8 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     const invisible_places::camera::CameraState& cameraState,
     std::uint32_t width,
     std::uint32_t height,
-    float flowTimeSeconds) {
+    float flowTimeSeconds,
+    const WaterFrameState& waterFrame) {
     invisible_places::renderer::core::SceneRenderState renderState;
     invisible_places::camera::OrbitCamera camera;
     camera.ApplyState(cameraState);
@@ -21225,10 +21979,9 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     renderState.rainVisual = job.waterRainVisual;
     renderState.rainSpawnCentre = camera.OrbitCenter();
     renderState.pointCloudLayers = job.exportPointCloudLayers;
-    const auto evaluatedScenario = EvaluateFrozenAnimationWaterScenario(job, flowTimeSeconds);
-    const auto scenarioState = evaluatedScenario.value_or(
+    const auto scenarioState = waterFrame.rawScenarioState.value_or(
         invisible_places::water::WaterScenarioState{});
-    if (evaluatedScenario.has_value()) {
+    if (waterFrame.rawScenarioState.has_value()) {
         renderState.rainSettings.rainLevel = std::clamp(scenarioState.rainLevel, 0.0F, 1.0F);
         renderState.rainSettings.enabled = renderState.rainSettings.rainLevel > 1.0e-5F;
     }
@@ -21483,16 +22236,20 @@ bool RenderCurrentAnimationFramePreview(
         for (std::size_t sampleIndex = 0; sampleIndex < sampleCameras.size(); ++sampleIndex) {
             const auto& cameraState = sampleCameras[sampleIndex];
             const float sampleTimeSeconds = sampleTimesSeconds[sampleIndex];
+            const auto waterFrame = ResolveFrozenWaterFrameState(
+                job,
+                sampleTimeSeconds);
             UploadFrozenAnimationSeepageParameters(
                 &job,
                 viewport,
-                sampleTimeSeconds);
+                waterFrame);
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
                 cameraState,
                 renderWidth,
                 renderHeight,
-                sampleTimeSeconds);
+                sampleTimeSeconds,
+                waterFrame);
             const invisible_places::renderer::core::PointCloudExrFrameRequest request{
                 .renderState = renderState,
                 .width = renderWidth,
@@ -24122,7 +24879,7 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
         }
         const auto& session = runtimeState->sessions[exportLayer.layerId];
         if (!IsExportPointCloudSourceReady(*runtimeState, exportLayer.layerId) ||
-            IsGeneratedWaterOverlaySession(session)) {
+            !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
         const auto* surfaceGuides = EnsureWaterSeepageSurfaceGuidesForSession(
@@ -24253,26 +25010,41 @@ std::optional<invisible_places::water::WaterScenarioState> EvaluateFrozenAnimati
         std::clamp(sampleTimeSeconds / durationSeconds, 0.0F, 1.0F));
 }
 
-void UploadFrozenAnimationSeepageParameters(
-    OfflineRenderJobState* job,
-    invisible_places::renderer::core::VulkanViewportShell* viewport,
+WaterFrameState ResolveFrozenWaterFrameState(
+    const OfflineRenderJobState& job,
     float sampleTimeSeconds) {
-    if (job == nullptr || viewport == nullptr) {
-        return;
+    WaterFrameState result;
+    result.sampleTimeSeconds = std::max(0.0F, sampleTimeSeconds);
+    if (job.animationPath.has_value()) {
+        const float durationSeconds = std::max(
+            1.0e-6F,
+            invisible_places::camera::AnimationPathDurationSeconds(
+                job.animationPath.value()));
+        result.sampleTimeSeconds = std::clamp(
+            result.sampleTimeSeconds,
+            0.0F,
+            durationSeconds);
+        result.normalizedTime = std::clamp(
+            result.sampleTimeSeconds / durationSeconds,
+            0.0F,
+            1.0F);
     }
-    auto scenarioState = EvaluateFrozenAnimationWaterScenario(
-        *job,
-        sampleTimeSeconds);
-    if (scenarioState.has_value() && !job->seepageRainEnvelope.samples.empty()) {
-        scenarioState->rainLevel =
+
+    result.rawScenarioState = EvaluateFrozenAnimationWaterScenario(
+        job,
+        result.sampleTimeSeconds);
+    result.seepageScenarioState = result.rawScenarioState;
+    if (result.seepageScenarioState.has_value() &&
+        !job.seepageRainEnvelope.samples.empty()) {
+        result.seepageScenarioState->rainLevel =
             invisible_places::water::EvaluateWaterSeepageRainEnvelope(
-                job->seepageRainEnvelope,
-                sampleTimeSeconds);
+                job.seepageRainEnvelope,
+                result.sampleTimeSeconds);
     }
-    std::vector<invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates;
-    if (job->animationPath.has_value() &&
-        !job->animationPath->selectedWaterScenarioId.empty()) {
-        const auto& path = job->animationPath.value();
+
+    if (job.animationPath.has_value() &&
+        !job.animationPath->selectedWaterScenarioId.empty()) {
+        const auto& path = job.animationPath.value();
         const auto trackIt = std::find_if(
             path.waterScenarioTracks.begin(),
             path.waterScenarioTracks.end(),
@@ -24280,21 +25052,29 @@ void UploadFrozenAnimationSeepageParameters(
                 return track.scenarioId == path.selectedWaterScenarioId;
             });
         if (trackIt != path.waterScenarioTracks.end()) {
-            const float durationSeconds = std::max(
-                1.0e-6F,
-                invisible_places::camera::AnimationPathDurationSeconds(path));
-            nodeStates = invisible_places::water::EvaluateWaterSeepageNodeAnimationTracks(
-                *trackIt,
-                std::clamp(sampleTimeSeconds / durationSeconds, 0.0F, 1.0F));
+            result.nodeStates =
+                invisible_places::water::EvaluateWaterSeepageNodeAnimationTracks(
+                    *trackIt,
+                    result.normalizedTime);
         }
+    }
+    return result;
+}
+
+void UploadFrozenAnimationSeepageParameters(
+    OfflineRenderJobState* job,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFrameState& frameState) {
+    if (job == nullptr || viewport == nullptr) {
+        return;
     }
     for (auto& frozenLayer : job->frozenSeepageLayers) {
         invisible_places::water::ApplyWaterSeepageScenarioParameters(
             &frozenLayer.grid,
-            scenarioState,
+            frameState.seepageScenarioState,
             job->waterRainSettings,
             job->effectiveSeepageInvocations,
-            nodeStates);
+            frameState.nodeStates);
         viewport->UpdateWaterSeepageParams(
             frozenLayer.layerId,
             frozenLayer.grid);
@@ -25662,16 +26442,20 @@ void ProcessOfflineRenderJobStep(
             float sampleTimeSeconds,
             invisible_places::renderer::core::PointCloudExrReadbackMask readbackMask) {
             const auto cameraState = cameraForSampleTime(sampleTimeSeconds);
+            const auto waterFrame = ResolveFrozenWaterFrameState(
+                job,
+                sampleTimeSeconds);
             UploadFrozenAnimationSeepageParameters(
                 &job,
                 viewport,
-                sampleTimeSeconds);
+                waterFrame);
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
                 cameraState,
                 width,
                 height,
-                sampleTimeSeconds);
+                sampleTimeSeconds,
+                waterFrame);
             if (renderState.pointCloudLayers.empty()) {
                 throw std::runtime_error{"No visible loaded LiDAR layers are available for rendering."};
             }
@@ -28363,7 +29147,8 @@ void DrawDashedWaterOverlayLine(
 
 void DrawWaterSeepageOverlay(
     PreviewRuntimeState* runtimeState,
-    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const WaterFrameState* frameState = nullptr) {
     if (runtimeState != nullptr) {
         runtimeState->water.seepageOverlayMarkerCount = 0U;
         runtimeState->water.seepageOverlayStructureCount = 0U;
@@ -28375,7 +29160,10 @@ void DrawWaterSeepageOverlay(
     const auto matrices = runtimeState->camera.Matrices(CurrentAspectRatio(viewport));
     auto* drawList = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const auto& io = ImGui::GetIO();
-    const auto activeWater = ResolveActiveWaterSeepageRuntimeState(runtimeState);
+    const auto evaluatedWaterFrame = frameState == nullptr
+                                         ? ResolveWaterFrameState(runtimeState)
+                                         : WaterFrameState{};
+    const auto& activeWater = frameState != nullptr ? *frameState : evaluatedWaterFrame;
     const auto nodeAnimationState = [&](std::uint32_t nodeId) {
         const auto stateIt = std::find_if(
             activeWater.nodeStates.begin(),
@@ -28401,7 +29189,7 @@ void DrawWaterSeepageOverlay(
 
     const std::vector<WaterSeepageSurfaceGuide>* surfaceGuides = nullptr;
     if (runtimeState->water.showSeepageStructure) {
-        const auto supportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+        const auto supportIndex = ResolveWaterRuntimeSessionIndex(*runtimeState);
         if (supportIndex.has_value() && supportIndex.value() < runtimeState->sessions.size()) {
             surfaceGuides = EnsureWaterSeepageSurfaceGuidesForSession(
                 runtimeState,
@@ -28456,12 +29244,12 @@ void DrawWaterSeepageOverlay(
             }
             const glm::vec3 origin = ToGlm(node.position);
             const auto state = nodeAnimationState(node.id);
-            const auto look = activeWater.scenarioState.has_value()
-                                  ? activeWater.scenarioState->seepageLook
+            const auto look = activeWater.seepageScenarioState.has_value()
+                                  ? activeWater.seepageScenarioState->seepageLook
                                   : ViewedWaterSeepageLook(runtimeState->water, node);
-            const float rainLevel = activeWater.scenarioState.has_value()
+            const float rainLevel = activeWater.seepageScenarioState.has_value()
                                         ? std::clamp(
-                                              activeWater.scenarioState->rainLevel,
+                                              activeWater.seepageScenarioState->rainLevel,
                                               0.0F,
                                               1.0F)
                                         : runtimeState->water.collisionRainSettings.enabled
@@ -28472,9 +29260,9 @@ void DrawWaterSeepageOverlay(
                 rainLevel * look.rainResponse,
                 0.0F,
                 1.0F);
-            const float globalSpread = activeWater.scenarioState.has_value()
+            const float globalSpread = activeWater.seepageScenarioState.has_value()
                                            ? std::clamp(
-                                                 activeWater.scenarioState->seepageSpread,
+                                                 activeWater.seepageScenarioState->seepageSpread,
                                                  0.0F,
                                                  1.0F)
                                            : 0.0F;
@@ -36520,16 +37308,17 @@ void DrawWaterGpuRainPanel(
 
     if (BeginPanelSection("Water Surface Cache (Rain + Flow + Seepage)")) {
         const auto& diagnostics = viewport->Diagnostics();
-        if (water.rainCollisionCacheWarmup.shared != nullptr) {
+        auto* activeCacheScene = ActiveWaterSurfaceScene(runtimeState);
+        if (water.waterSurfaceCacheWarmup.shared != nullptr) {
             std::string stage;
             {
-                std::scoped_lock lock(water.rainCollisionCacheWarmup.shared->mutex);
-                stage = water.rainCollisionCacheWarmup.shared->stage;
+                std::scoped_lock lock(water.waterSurfaceCacheWarmup.shared->mutex);
+                stage = water.waterSurfaceCacheWarmup.shared->stage;
             }
             ImGui::TextDisabled("Build/load status: %s", stage.c_str());
-        } else if (water.rainCollisionCache != nullptr) {
+        } else if (water.waterSurfaceCache != nullptr) {
             std::uint32_t sourceSpacingMicrometres = 0U;
-            for (const auto& source : water.rainCollisionCache->sources) {
+            for (const auto& source : water.waterSurfaceCache->sources) {
                 if (source.spacingMicrometres == 0U) {
                     continue;
                 }
@@ -36543,13 +37332,45 @@ void DrawWaterGpuRainPanel(
                 static_cast<float>(sourceSpacingMicrometres) / 1000.0F);
             ImGui::TextDisabled(
                 "20 mm Rain: %s surface / %s vegetation",
-                FormatPointCount(water.rainCollisionCache->surfaceCells.size()).c_str(),
-                FormatPointCount(water.rainCollisionCache->vegetationVoxels.size()).c_str());
+                FormatPointCount(water.waterSurfaceCache->surfaceCells.size()).c_str(),
+                FormatPointCount(water.waterSurfaceCache->vegetationVoxels.size()).c_str());
             ImGui::TextDisabled(
                 "20 mm 3D Surface: %s surfels",
-                FormatPointCount(water.rainCollisionCache->flowSurfaceSurfels.size()).c_str());
+                FormatPointCount(water.waterSurfaceCache->flowSurfaceSurfels.size()).c_str());
         } else {
             ImGui::TextDisabled("Waiting for an active grouped scene");
+        }
+        if (activeCacheScene != nullptr) {
+            const auto requestedGeneration = activeCacheScene->waterSurfaceCache.has_value()
+                                                 ? activeCacheScene->waterSurfaceCache
+                                                       ->requestedRebuildGeneration
+                                                 : 0U;
+            const auto builtGeneration = activeCacheScene->waterSurfaceCache.has_value()
+                                             ? activeCacheScene->waterSurfaceCache
+                                                   ->builtRebuildGeneration
+                                             : 0U;
+            ImGui::TextDisabled(
+                "Manifest: %s  generation %llu / %llu",
+                WaterSurfaceCacheRuntimeStatusLabel(
+                    activeCacheScene->waterSurfaceCacheStatus),
+                static_cast<unsigned long long>(builtGeneration),
+                static_cast<unsigned long long>(requestedGeneration));
+        }
+        const bool rebuildUnavailable =
+            activeCacheScene == nullptr || activeCacheScene->waterSurfaceSources.empty() ||
+            water.waterSurfaceCacheWarmup.worker.joinable();
+        if (rebuildUnavailable) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Rebuild Cache##WaterSurface")) {
+            RequestWaterSurfaceCacheRebuild(runtimeState);
+        }
+        if (rebuildUnavailable) {
+            ImGui::EndDisabled();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Build a clean replacement from the source clouds. The current GPU cache remains active until the replacement is ready.");
         }
         ImGui::TextDisabled(
             "GPU: %u particles / %u impacts / %u saturated",
@@ -36568,7 +37389,7 @@ void DrawWaterGpuRainPanel(
             diagnostics.waterSurfaceMaximumProbeCount,
             diagnostics.waterSurfacePreprocessPending ? "pending" : "ready",
             diagnostics.waterSurfacePreprocessDispatchCount);
-        for (const auto& warning : water.rainCollisionWarnings) {
+        for (const auto& warning : water.waterSurfaceCacheWarnings) {
             ImGui::TextDisabled("%s", warning.c_str());
         }
         EndPanelSection();
@@ -37476,12 +38297,15 @@ void DrawWaterPanel(
     }
 
     auto& water = runtimeState->water;
-    const bool analysisReady = ResolveWaterSupportSessionIndex(*runtimeState).has_value();
-    if (!analysisReady) {
-        ImGui::TextColored(
-            ImVec4{0.75F, 0.20F, 0.18F, 1.0F},
-            "Canonical analysis sources are loading or unavailable; picking and simulations are disabled.");
+    const bool canonicalAnalysisReady =
+        ResolveWaterSupportSessionIndex(*runtimeState).has_value();
+    if (!canonicalAnalysisReady) {
+        ImGui::TextDisabled(
+            "Canonical analysis is unloaded; Bake Path and Recalculate Effects load it on demand.");
     }
+    // Live parameter/style controls operate on already committed display buffers.
+    // Only the explicit topology entry points above request canonical analysis.
+    const bool analysisReady = true;
     if (!ImGui::BeginTabBar("WaterFeatureTabs")) {
         return;
     }
@@ -37688,7 +38512,7 @@ void DrawWaterPanel(
         EndPanelSection();
     }
     if (BeginPanelSection("Water Sources")) {
-        auto activeSupportIndex = ResolveWaterSupportSessionIndex(*runtimeState);
+        auto activeSupportIndex = ResolveWaterRuntimeSessionIndex(*runtimeState);
         if (activeSupportIndex.has_value()) {
             const auto& supportSession = runtimeState->sessions[activeSupportIndex.value()];
             const auto activeLabel = WaterSupportDisplayName(*runtimeState, supportSession);
@@ -39096,7 +39920,7 @@ std::uint64_t EffectiveWaterSeepageShaderInvocations(const PreviewRuntimeState& 
     std::uint64_t total = 0U;
     for (const auto& session : runtimeState.sessions) {
         if (!IsRenderablePointCloudSource(runtimeState, session) ||
-            IsGeneratedWaterOverlaySession(session)) {
+            !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
         const auto style = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
@@ -39118,7 +39942,7 @@ std::uint64_t EffectiveExportWaterSeepageShaderInvocations(const PreviewRuntimeS
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
         if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
-            IsGeneratedWaterOverlaySession(session)) {
+            !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
         const auto style = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
@@ -39137,12 +39961,29 @@ std::uint64_t EffectiveExportWaterSeepageShaderInvocations(const PreviewRuntimeS
 
 void EnsureWaterSeepageRuntimeUpToDate(
     PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFrameState* frameState = nullptr) {
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
+    if (const auto* activeScene = ActiveWaterSurfaceScene(runtimeState);
+        activeScene != nullptr && !activeScene->waterSurfaceSources.empty() &&
+        (runtimeState->water.waterSurfaceCache == nullptr ||
+         runtimeState->water.waterSurfaceSceneGroupName != activeScene->sceneGroupName ||
+         runtimeState->water.waterSurfaceCacheSignature != activeScene->waterSurfaceSignature ||
+         runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ||
+         runtimeState->water.waterSurfaceCachePreprocessPending)) {
+        // Preserve the last settled topology while the one immutable surface
+        // artifact for this scene is still loading/preprocessing. Installation
+        // invalidates once, avoiding a display-cloud fallback build followed by
+        // an immediate second topology build.
+        return;
+    }
     const auto effectiveInvocations = EffectiveWaterSeepageShaderInvocations(*runtimeState);
-    const auto activeWater = ResolveActiveWaterSeepageRuntimeState(runtimeState);
+    const auto evaluatedWaterFrame = frameState == nullptr
+                                         ? ResolveWaterFrameState(runtimeState)
+                                         : WaterFrameState{};
+    const auto& activeWater = frameState != nullptr ? *frameState : evaluatedWaterFrame;
     std::size_t totalBytes = 0U;
     std::uint32_t overflowCells = 0U;
     std::unordered_set<std::string> activeKeys;
@@ -39157,8 +39998,7 @@ void EnsureWaterSeepageRuntimeUpToDate(
         // as Seepage support would call the terrain-only upload API during
         // that valid pending state.
         if (!IsRenderablePointCloudSource(*runtimeState, session) ||
-            session.kind != LayerKind::PointCloud ||
-            IsGeneratedWaterOverlaySession(session)) {
+            !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
         const std::string key = NormalizePathKey(session.sourcePath) +
@@ -39187,7 +40027,7 @@ void EnsureWaterSeepageRuntimeUpToDate(
                 runtimeState->water.collisionRainSettings,
                 effectiveInvocations,
                 guideSpan,
-                activeWater.scenarioState,
+                activeWater.seepageScenarioState,
                 activeWater.nodeStates);
             gridIt = runtimeState->water.seepageRuntimeGrids.emplace(
                 key,
@@ -39203,7 +40043,7 @@ void EnsureWaterSeepageRuntimeUpToDate(
                 runtimeState->water.seepageNodes,
                 runtimeState->water.seepageLookProfiles,
                 runtimeState->water.defaultSeepageLook,
-                activeWater.scenarioState,
+                activeWater.seepageScenarioState,
                 runtimeState->water.collisionRainSettings,
                 effectiveInvocations,
                 activeWater.nodeStates);
@@ -39270,6 +40110,9 @@ void EnsureWaterSeepageRuntimeUpToDate(
     std::erase_if(
         runtimeState->water.seepageSurfaceGuideFingerprints,
         [&](const auto& entry) { return !activeGuideKeys.contains(entry.first); });
+    std::erase_if(
+        runtimeState->water.seepageSurfaceGuideNodeFingerprints,
+        [&](const auto& entry) { return !activeGuideKeys.contains(entry.first); });
     runtimeState->water.seepageGpuBytes = totalBytes;
     runtimeState->water.seepageOverflowCellCount = overflowCells;
 }
@@ -39311,26 +40154,27 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     return false;
 }
 
-RainCollisionRole RainCollisionRoleForSession(const PreviewLayerSession& session) {
+WaterSurfaceRole RainCollisionRoleForSession(const PreviewLayerSession& session) {
     const auto role = invisible_places::scene::ParseScenePointCloudRole(session.sceneRole);
     if (!role.has_value()) {
-        return RainCollisionRole::None;
+        return WaterSurfaceRole::None;
     }
     switch (role.value()) {
         case invisible_places::scene::ScenePointCloudRole::Rock:
-            return RainCollisionRole::Rock;
+            return WaterSurfaceRole::Rock;
         case invisible_places::scene::ScenePointCloudRole::Sand:
-            return RainCollisionRole::Sand;
+            return WaterSurfaceRole::Sand;
         case invisible_places::scene::ScenePointCloudRole::Vegetation:
-            return RainCollisionRole::Vegetation;
+            return WaterSurfaceRole::Vegetation;
     }
-    return RainCollisionRole::None;
+    return WaterSurfaceRole::None;
 }
 
 invisible_places::renderer::core::SceneRenderState BuildRenderState(
-    const PreviewRuntimeState& runtimeState,
+    PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
-    float flowTimeSeconds) {
+    float flowTimeSeconds,
+    const WaterFrameState* frameState = nullptr) {
     invisible_places::renderer::core::SceneRenderState renderState;
     const auto aspectRatio = CurrentAspectRatio(viewport);
     const auto matrices = runtimeState.camera.Matrices(aspectRatio);
@@ -39367,7 +40211,11 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     renderState.flowTimeSeconds = flowTimeSeconds;
     renderState.pointSizeScale = 1.0F;
     renderState.rainSettings = runtimeState.water.collisionRainSettings;
-    const auto activeWaterScenario = ResolveActiveWaterScenarioState(runtimeState);
+    const auto evaluatedWaterFrame = frameState == nullptr
+                                         ? ResolveWaterFrameState(&runtimeState)
+                                         : WaterFrameState{};
+    const auto& waterFrame = frameState != nullptr ? *frameState : evaluatedWaterFrame;
+    const auto& activeWaterScenario = waterFrame.rawScenarioState;
     if (activeWaterScenario.has_value()) {
         renderState.rainSettings.rainLevel = std::clamp(activeWaterScenario->rainLevel, 0.0F, 1.0F);
         // A selected scenario owns Rain visibility: zero is truly off, while
@@ -39468,7 +40316,7 @@ void PumpGuiSmokeFrame(
     }
     const auto frameStart = std::chrono::steady_clock::now();
     window->PollEvents();
-    EnsureRainCollisionCacheReady(runtimeState, viewport);
+    EnsureWaterSurfaceCacheReady(runtimeState, viewport);
     PollWaterRegionPointPreviewJob(runtimeState);
     PollWaterFlowTrailBuildJob(runtimeState, viewport);
     PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
@@ -39490,6 +40338,50 @@ void PumpGuiSmokeFrame(
         frameTimesMs->push_back(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count());
     }
+}
+
+// Acceptance smokes use the same queued display/cache ordering as the live
+// application. The single WaterFrameState produced here is deliberately
+// shared by Seepage and the viewport render for the sampled animation frame.
+WaterFrameState PumpWaterIntegrationSmokeFrame(
+    platform::Window* window,
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    float simulatedSeconds,
+    bool drawFrame = true) {
+    if (window == nullptr || runtimeState == nullptr || viewport == nullptr) {
+        return {};
+    }
+
+    window->PollEvents();
+    PollPendingLayerLoad(runtimeState, viewport);
+    PollDynamicMeshSurfaceCacheWarmup(runtimeState, false);
+    EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+    PollWaterRegionPointPreviewJob(runtimeState);
+    PollWaterFlowTrailBuildJob(runtimeState, viewport);
+    PollWaterRippleLiveEffectRefresh(runtimeState, viewport);
+    SyncWaterRegionPointPreviewHighlights(runtimeState, viewport);
+    CommitReadySceneDisplaySwitches(runtimeState, viewport);
+    EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+    StartQueuedLayerLoadIfIdle(runtimeState);
+    StartDynamicMeshSurfaceCacheWarmup(runtimeState, false);
+
+    const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+    EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport, &waterFrameState);
+    if (drawFrame) {
+        viewport->BeginUiFrame();
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->UpdateRenderState(
+            BuildRenderState(
+                *runtimeState,
+                *viewport,
+                simulatedSeconds,
+                &waterFrameState));
+        viewport->DrawFrame();
+    }
+    return waterFrameState;
 }
 
 void PumpExportBenchmarkFrame(
@@ -40586,7 +41478,11 @@ bool WriteRipplePatternContactSheet(
                 }
                 sum += value;
                 maxValue = std::max<double>(maxValue, value);
-                if (value > 0.02F) {
+                // Sparse shoreline bands are intentionally much subtler than
+                // caustics and foam; count a sample once it is visibly above
+                // the contact-sheet floor instead of imposing one strong-
+                // effect threshold on every pattern family.
+                if (value > 0.001F) {
                     ++active;
                 }
                 const auto pixelX = static_cast<std::uint32_t>(
@@ -40920,6 +41816,7 @@ int RunWaterRegionSampleTerrestrialSmoke(
             viewport->SparseWaterRippleParamsUploadRevision(sampleSessionIndex);
         std::vector<double> patternParamsUpdateSamplesMs;
         patternParamsUpdateSamplesMs.reserve(invisible_places::water::AllWaterRippleOverlayTypes().size());
+        bool frameSafePublication = true;
         for (const auto type : invisible_places::water::AllWaterRippleOverlayTypes()) {
             rippleLayer.rippleOverlayType = type;
             invisible_places::water::ApplyWaterRipplePatternSettings(
@@ -40938,6 +41835,34 @@ int RunWaterRegionSampleTerrestrialSmoke(
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - patternParamsStart).count();
             patternParamsUpdateSamplesMs.push_back(elapsedMs);
             report.patternParamsUpdateTotalMs += elapsedMs;
+
+            const auto queuedPublication =
+                viewport->SparseWaterRippleParamsPublicationState(sampleSessionIndex);
+            frameSafePublication =
+                frameSafePublication &&
+                queuedPublication.liveBuffersDistinct &&
+                queuedPublication.exrBufferDistinct &&
+                std::all_of(
+                    queuedPublication.liveFrameGenerations.begin(),
+                    queuedPublication.liveFrameGenerations.end(),
+                    [&queuedPublication](std::uint64_t generation) {
+                        return generation < queuedPublication.requestedGeneration;
+                    });
+
+            // Exercise both live frame slots between parameter changes. The
+            // snapshots must publish only after each slot's fence has signalled.
+            PumpGuiSmokeFrame(window, runtimeState, viewport, &frameTimesMs);
+            PumpGuiSmokeFrame(window, runtimeState, viewport, &frameTimesMs);
+            const auto publishedState =
+                viewport->SparseWaterRippleParamsPublicationState(sampleSessionIndex);
+            frameSafePublication =
+                frameSafePublication &&
+                std::all_of(
+                    publishedState.liveFrameGenerations.begin(),
+                    publishedState.liveFrameGenerations.end(),
+                    [&publishedState](std::uint64_t generation) {
+                        return generation == publishedState.requestedGeneration;
+                    });
         }
         report.patternParamsUpdateP50Ms = PercentileValue(patternParamsUpdateSamplesMs, 0.50);
         report.patternParamsUpdateP95Ms = PercentileValue(patternParamsUpdateSamplesMs, 0.95);
@@ -40954,6 +41879,11 @@ int RunWaterRegionSampleTerrestrialSmoke(
             report.Pass("Cycling all Ripple overlay defaults updated params only.");
         } else {
             report.Fail("Cycling Ripple overlay defaults rebuilt membership.");
+        }
+        if (frameSafePublication) {
+            report.Pass("Ripple params used distinct fence-published buffers for both live frames and EXR.");
+        } else {
+            report.Fail("Ripple params were not isolated across both live frame slots and EXR.");
         }
         if (report.patternParamsUpdateMaxMs < 1000.0) {
             report.Pass(
@@ -41005,7 +41935,7 @@ int RunWaterRegionSampleTerrestrialSmoke(
                 report.patternMetrics.begin(),
                 report.patternMetrics.end(),
                 [](const GuiSmokeReport::RipplePatternMetric& metric) {
-                    return metric.max > 0.02 && metric.activeSampleCount > 0U;
+                    return metric.max > 0.001 && metric.activeSampleCount > 0U;
                 })) {
             report.Pass("Every Ripple overlay produced active visual contact-sheet samples.");
         } else {
@@ -41180,8 +42110,8 @@ int RunGpuCollisionRainSmoke(
 
     const auto cacheStartedAt = std::chrono::steady_clock::now();
     auto cacheResult = invisible_places::water::BuildWaterSurfaceCache(
-        scene.rainCollisionSources,
-        runtimeState->rainCollisionCacheRoot);
+        scene.waterSurfaceSources,
+        WaterSurfaceCacheRootForScene(*runtimeState, scene));
     report.recalculateEffectsMs = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - cacheStartedAt)
                                       .count();
@@ -41189,14 +42119,13 @@ int RunGpuCollisionRainSmoke(
         report.Fail(targetSceneFolder + " rain collision cache failed: " + cacheResult.errorMessage);
         return finish();
     }
-    if (scene1ThreeMillimetre &&
-        std::none_of(
-            scene.rainCollisionSources.begin(),
-            scene.rainCollisionSources.end(),
-            [](const RainCollisionSource& source) { return source.isFallback; }) &&
+    if (std::none_of(
+            scene.waterSurfaceSources.begin(),
+            scene.waterSurfaceSources.end(),
+            [](const WaterSurfaceSource& source) { return source.isFallback; }) &&
         cacheResult.warnings.empty()) {
-        report.Pass("Scene1 collision used the exact 5 mm ROCK, SAND, and VEG sources.");
-    } else if (cacheResult.warnings.size() == scene.rainCollisionSources.size()) {
+        report.Pass(targetSceneFolder + " collision used exact 5 mm ROCK, SAND, and VEG sources.");
+    } else if (cacheResult.warnings.size() == scene.waterSurfaceSources.size()) {
         report.Pass("SampleScene used one explicit coarsest-source fallback warning per role.");
     } else if (cacheResult.loadedFromDisk) {
         report.Pass("SampleScene loaded its previously validated fallback collision cache.");
@@ -41204,7 +42133,7 @@ int RunGpuCollisionRainSmoke(
         report.Fail(targetSceneFolder + " collision-source diagnostics did not match the selected role files.");
     }
 
-    const auto uploadRevisionBefore = viewport->RainCollisionUploadRevision();
+    const auto uploadRevisionBefore = viewport->WaterSurfaceUploadRevision();
     const auto uploadStartedAt = std::chrono::steady_clock::now();
     try {
         viewport->UploadWaterSurfaceCache(cacheResult.cache);
@@ -41215,14 +42144,31 @@ int RunGpuCollisionRainSmoke(
     report.gpuUploadMs = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - uploadStartedAt)
                              .count();
-    runtimeState->water.rainCollisionCache =
-        std::make_shared<RainCollisionCache>(std::move(cacheResult.cache));
-    runtimeState->water.rainCollisionSceneGroupName = scene.sceneGroupName;
-    runtimeState->water.rainCollisionCacheSignature = scene.rainCollisionSignature;
-    if (viewport->RainCollisionUploadRevision() == uploadRevisionBefore + 1U) {
+    auto installedSurfaceCache =
+        std::make_shared<WaterSurfaceCache>(std::move(cacheResult.cache));
+    installedSurfaceCache->gpuData.surfaceTable.clear();
+    installedSurfaceCache->gpuData.surfaceTable.shrink_to_fit();
+    installedSurfaceCache->gpuData.vegetationTable.clear();
+    installedSurfaceCache->gpuData.vegetationTable.shrink_to_fit();
+    installedSurfaceCache->gpuData.flowSurfaceTable.clear();
+    installedSurfaceCache->gpuData.flowSurfaceTable.shrink_to_fit();
+    runtimeState->water.waterSurfaceCache = std::move(installedSurfaceCache);
+    runtimeState->water.waterSurfaceSceneGroupName = scene.sceneGroupName;
+    runtimeState->water.waterSurfaceCacheSignature = scene.waterSurfaceSignature;
+    if (viewport->WaterSurfaceUploadRevision() == uploadRevisionBefore + 1U) {
         report.Pass("The shared role-aware collision cache uploaded exactly once.");
     } else {
         report.Fail("The collision upload revision did not advance exactly once.");
+    }
+    const auto peakSurfaceStagingBytes = viewport->Diagnostics().waterSurfacePeakStagingBytes;
+    if (peakSurfaceStagingBytes > 0U &&
+        peakSurfaceStagingBytes <=
+            invisible_places::renderer::core::kWaterSurfaceUploadStagingLimitBytes) {
+        report.Pass(
+            "Water surface upload peak staging stayed within " +
+            FormatByteCount(invisible_places::renderer::core::kWaterSurfaceUploadStagingLimitBytes) + ".");
+    } else {
+        report.Fail("Water surface upload peak staging exceeded or bypassed the bounded staging path.");
     }
 
     auto& settings = runtimeState->water.collisionRainSettings;
@@ -41241,7 +42187,7 @@ int RunGpuCollisionRainSmoke(
     for (int frame = 0; frame < 6; ++frame) {
         PumpGuiSmokeFrame(window, runtimeState, viewport, &frameTimesMs);
     }
-    const auto liveEditRevisionBefore = viewport->RainCollisionUploadRevision();
+    const auto liveEditRevisionBefore = viewport->WaterSurfaceUploadRevision();
 
     settings.intensityPreset = WaterRainIntensityPreset::HeavyDownpour;
     settings.visualProfileName = "Rain Downpour";
@@ -41285,7 +42231,7 @@ int RunGpuCollisionRainSmoke(
         PumpGuiSmokeFrame(window, runtimeState, viewport, &frameTimesMs);
     }
     viewport->WaitIdle();
-    if (viewport->RainCollisionUploadRevision() == liveEditRevisionBefore) {
+    if (viewport->WaterSurfaceUploadRevision() == liveEditRevisionBefore) {
         report.Pass("Every weather, visual, amount, seed, role, and effect edit remained uniform-only.");
     } else {
         report.Fail("A live rain edit unexpectedly rebuilt or re-uploaded collision data.");
@@ -41411,7 +42357,7 @@ int RunGpuCollisionRainSmoke(
     } else if (comparisonsRendered) {
         report.Fail("Rain comparison renders were not visually distinct at the byte level.");
     }
-    if (viewport->RainCollisionUploadRevision() == liveEditRevisionBefore) {
+    if (viewport->WaterSurfaceUploadRevision() == liveEditRevisionBefore) {
         report.Pass("GPU comparison renders reused the same collision upload.");
     } else {
         report.Fail("GPU comparison rendering changed the collision upload revision.");
@@ -41457,9 +42403,12 @@ int RunWaterSeepageSmoke(
     }
 
     runtimeState->sessions = BuildSessions(assetCatalog);
+    runtimeState->pointCloudScenes = BuildScenePointCloudRuntimeStates(
+        assetCatalog,
+        &runtimeState->sessions);
     const auto targetFilename = benchmark100M
                                     ? std::filesystem::path{"Site3-Mid-1mm100M.ply"}
-                                    : std::filesystem::path{"Site3-Sample-Terrestrial.ply"};
+                                    : std::filesystem::path{"Site1-ROCK-3mm.Sample.ply"};
     const auto targetSessionIt = std::find_if(
         runtimeState->sessions.begin(),
         runtimeState->sessions.end(),
@@ -41489,6 +42438,20 @@ int RunWaterSeepageSmoke(
     report.gpuUploadMs =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uploadStart).count();
     auto& session = runtimeState->sessions[targetSessionIndex];
+    if (benchmark100M) {
+        // The large legacy benchmark is a terrain-only ROCK fixture even
+        // though its historical filename predates scene-role metadata.
+        session.sceneRole = "ROCK";
+    } else if (auto* sampleScene = FindScenePointCloudRuntime(runtimeState, session);
+               sampleScene != nullptr) {
+        const auto rockRoleIndex = invisible_places::scene::ScenePointCloudRoleIndex(
+            invisible_places::scene::ScenePointCloudRole::Rock);
+        sampleScene->committedDisplaySessionIndices[rockRoleIndex] = targetSessionIndex;
+        sampleScene->displayLoaded = true;
+        sampleScene->displayVisible = true;
+        session.committedDisplaySource = true;
+        session.visible = true;
+    }
     session.pointStyle.geometryMode = PointCloudGeometryMode::ScreenSprites;
     runtimeState->projectSettings.pointCloudRendererMode = PointCloudRendererMode::Beauty;
     FocusSessionLayer(runtimeState, *viewport, targetSessionIndex, 0.65F);
@@ -41715,6 +42678,45 @@ int RunWaterSeepageSmoke(
         report.Pass("Rain changed Seepage parameters without rebuilding topology.");
     } else {
         report.Fail("Rain unexpectedly rebuilt Seepage topology.");
+    }
+
+    const auto editedNodeId = runtimeState->water.seepageNodes.front().id;
+    const auto guideBuildsBeforeGeometryEdit =
+        runtimeState->water.seepageSurfaceGuideBuildCount;
+    const auto nodeGuideFingerprintsBeforeGeometryEdit =
+        runtimeState->water.seepageSurfaceGuideNodeFingerprints;
+    runtimeState->water.seepageNodes.front().reachMeters += 0.01F;
+    InvalidateWaterSeepageTopology(&runtimeState->water);
+    EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+    bool unchangedNodeGuidesPreserved = true;
+    bool editedNodeGuideChanged = false;
+    for (const auto& [supportKey, previousFingerprints] :
+         nodeGuideFingerprintsBeforeGeometryEdit) {
+        const auto currentSupport =
+            runtimeState->water.seepageSurfaceGuideNodeFingerprints.find(supportKey);
+        if (currentSupport ==
+            runtimeState->water.seepageSurfaceGuideNodeFingerprints.end()) {
+            unchangedNodeGuidesPreserved = false;
+            continue;
+        }
+        for (const auto& [nodeId, previousFingerprint] : previousFingerprints) {
+            const auto currentFingerprint = currentSupport->second.find(nodeId);
+            if (currentFingerprint == currentSupport->second.end()) {
+                unchangedNodeGuidesPreserved = false;
+            } else if (nodeId == editedNodeId) {
+                editedNodeGuideChanged |=
+                    currentFingerprint->second != previousFingerprint;
+            } else if (currentFingerprint->second != previousFingerprint) {
+                unchangedNodeGuidesPreserved = false;
+            }
+        }
+    }
+    if (editedNodeGuideChanged && unchangedNodeGuidesPreserved &&
+        runtimeState->water.seepageSurfaceGuideBuildCount ==
+            guideBuildsBeforeGeometryEdit + 1U) {
+        report.Pass("A Seepage reach edit retraced only the changed node guide before one compact topology replacement.");
+    } else {
+        report.Fail("A one-node Seepage geometry edit retraced unaffected node guides.");
     }
 
     // A GPU Flow-spline session is marked loaded and renderable before its
@@ -41958,6 +42960,1099 @@ int RunDynamicMeshFlowSite3Smoke(
     return finish();
 }
 
+struct WaterIntegrationCounterSnapshot {
+    std::uint64_t sourceScans = 0U;
+    std::uint64_t gpuTableBuilds = 0U;
+    std::uint64_t fullPayloadHashPasses = 0U;
+    std::uint64_t cacheBuilds = 0U;
+    std::uint64_t cacheInstalls = 0U;
+    std::uint64_t cacheUploads = 0U;
+    std::uint64_t cachePreprocessDispatches = 0U;
+    std::uint64_t pathBakes = 0U;
+    std::uint64_t seepageGuideBuilds = 0U;
+    std::uint64_t seepageTopologyUploads = 0U;
+    std::uint64_t flowComputeDispatches = 0U;
+    std::unordered_map<std::uint32_t, std::uint64_t> flowComputeDispatchesBySource;
+};
+
+WaterIntegrationCounterSnapshot CaptureWaterIntegrationCounters(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const auto& water = runtimeState.water;
+    const auto& diagnostics = viewport.Diagnostics();
+    return {
+        .sourceScans = water.waterSurfaceSourceScanCount,
+        .gpuTableBuilds = water.waterSurfaceGpuTableBuildCount,
+        .fullPayloadHashPasses = water.waterSurfaceFullPayloadHashPassCount,
+        .cacheBuilds = water.waterSurfaceCacheBuildCount,
+        .cacheInstalls = water.waterSurfaceCacheInstallCount,
+        .cacheUploads = diagnostics.waterSurfaceUploadRevision,
+        .cachePreprocessDispatches = diagnostics.waterSurfacePreprocessDispatchCount,
+        .pathBakes = water.pathDiagnosticRebuildCounters.pathBakes,
+        .seepageGuideBuilds = water.seepageSurfaceGuideBuildCount,
+        .seepageTopologyUploads = water.seepageTopologyUploadRevision,
+        .flowComputeDispatches = water.flowGpuComputeDispatchCount,
+        .flowComputeDispatchesBySource = water.flowGpuComputeDispatchCountBySource,
+    };
+}
+
+struct WaterIntegrationSmokeReport {
+    std::string scenario;
+    std::filesystem::path projectPath;
+    std::filesystem::path animationPath;
+    std::filesystem::path outputPath;
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    double startupMs = 0.0;
+    double displayVisibleMs = 0.0;
+    double cacheReadyMs = 0.0;
+    double parameterP50Ms = 0.0;
+    double parameterP95Ms = 0.0;
+    double parameterMaxMs = 0.0;
+    std::size_t parameterSamples = 0U;
+    bool displayVisibleBeforeAnalysis = false;
+    bool cacheLoadedFromDisk = false;
+    bool exactFiveMillimetreSources = false;
+    bool offlineComparisonIncluded = false;
+    std::uint64_t peakStagingBytes = 0U;
+    std::uint64_t cachePayloadBytes = 0U;
+    double cacheValidationUploadMs = 0.0;
+    WaterIntegrationCounterSnapshot startupCounters{};
+    WaterIntegrationCounterSnapshot animationCountersBefore{};
+    WaterIntegrationCounterSnapshot animationCountersAfter{};
+    std::vector<std::filesystem::path> frameExrPaths;
+    std::vector<std::filesystem::path> framePpmPaths;
+    std::filesystem::path contactSheetPpmPath;
+    std::filesystem::path offlineFrameExrPath;
+    std::filesystem::path offlineFramePpmPath;
+    std::filesystem::path offlineComparisonContactSheetPpmPath;
+
+    void Pass(std::string message) { passes.push_back(std::move(message)); }
+    void Fail(std::string message) { failures.push_back(std::move(message)); }
+    [[nodiscard]] bool Passed() const { return failures.empty(); }
+};
+
+void WriteWaterIntegrationCounterSnapshot(
+    std::ostream& output,
+    const WaterIntegrationCounterSnapshot& counters) {
+    output << "{"
+           << "\"source_scans\":" << counters.sourceScans << ','
+           << "\"gpu_table_builds\":" << counters.gpuTableBuilds << ','
+           << "\"full_payload_hash_passes\":" << counters.fullPayloadHashPasses << ','
+           << "\"cache_builds\":" << counters.cacheBuilds << ','
+           << "\"cache_installs\":" << counters.cacheInstalls << ','
+           << "\"cache_uploads\":" << counters.cacheUploads << ','
+           << "\"cache_preprocess_dispatches\":" << counters.cachePreprocessDispatches << ','
+           << "\"path_bakes\":" << counters.pathBakes << ','
+           << "\"seepage_guide_builds\":" << counters.seepageGuideBuilds << ','
+           << "\"seepage_topology_uploads\":" << counters.seepageTopologyUploads << ','
+           << "\"flow_compute_dispatches\":" << counters.flowComputeDispatches << ','
+           << "\"flow_compute_dispatches_by_source\":{";
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> ordered{
+        counters.flowComputeDispatchesBySource.begin(),
+        counters.flowComputeDispatchesBySource.end()};
+    std::sort(ordered.begin(), ordered.end());
+    for (std::size_t index = 0U; index < ordered.size(); ++index) {
+        if (index > 0U) {
+            output << ',';
+        }
+        output << '"' << ordered[index].first << "\":" << ordered[index].second;
+    }
+    output << "}}";
+}
+
+bool WriteWaterIntegrationSmokeReport(const WaterIntegrationSmokeReport& report) {
+    std::error_code error;
+    std::filesystem::create_directories(report.outputPath.parent_path(), error);
+    std::ofstream output{report.outputPath, std::ios::trunc};
+    if (!output.is_open()) {
+        return false;
+    }
+    auto writeStrings = [&output](std::string_view label, const std::vector<std::string>& values) {
+        output << "  \"" << label << "\": [";
+        for (std::size_t index = 0U; index < values.size(); ++index) {
+            if (index > 0U) {
+                output << ", ";
+            }
+            output << '"' << JsonEscape(values[index]) << '"';
+        }
+        output << ']';
+    };
+    auto writePaths = [&output](std::string_view label, const std::vector<std::filesystem::path>& paths) {
+        output << "  \"" << label << "\": [";
+        for (std::size_t index = 0U; index < paths.size(); ++index) {
+            if (index > 0U) {
+                output << ", ";
+            }
+            output << '"' << JsonEscape(paths[index].string()) << '"';
+        }
+        output << ']';
+    };
+    output << "{\n"
+           << "  \"scenario\": \"" << JsonEscape(report.scenario) << "\",\n"
+           << "  \"passed\": " << (report.Passed() ? "true" : "false") << ",\n"
+           << "  \"project\": \"" << JsonEscape(report.projectPath.string()) << "\",\n"
+           << "  \"animation\": \"" << JsonEscape(report.animationPath.string()) << "\",\n"
+           << "  \"startup_ms\": " << FormatFixed(report.startupMs, 3) << ",\n"
+           << "  \"display_visible_ms\": " << FormatFixed(report.displayVisibleMs, 3) << ",\n"
+           << "  \"cache_ready_ms\": " << FormatFixed(report.cacheReadyMs, 3) << ",\n"
+           << "  \"parameter_samples\": " << report.parameterSamples << ",\n"
+           << "  \"parameter_p50_ms\": " << FormatFixed(report.parameterP50Ms, 3) << ",\n"
+           << "  \"parameter_p95_ms\": " << FormatFixed(report.parameterP95Ms, 3) << ",\n"
+           << "  \"parameter_max_ms\": " << FormatFixed(report.parameterMaxMs, 3) << ",\n"
+           << "  \"display_visible_before_analysis\": "
+           << (report.displayVisibleBeforeAnalysis ? "true" : "false") << ",\n"
+           << "  \"cache_loaded_from_disk\": "
+           << (report.cacheLoadedFromDisk ? "true" : "false") << ",\n"
+           << "  \"exact_five_millimetre_sources\": "
+           << (report.exactFiveMillimetreSources ? "true" : "false") << ",\n"
+           << "  \"offline_comparison_included\": "
+           << (report.offlineComparisonIncluded ? "true" : "false") << ",\n"
+           << "  \"peak_staging_bytes\": " << report.peakStagingBytes << ",\n"
+           << "  \"cache_payload_bytes\": " << report.cachePayloadBytes << ",\n"
+           << "  \"cache_validation_upload_ms\": "
+           << FormatFixed(report.cacheValidationUploadMs, 3) << ",\n"
+           << "  \"contact_sheet_ppm\": \""
+           << JsonEscape(report.contactSheetPpmPath.string()) << "\",\n"
+           << "  \"offline_frame_exr\": \""
+           << JsonEscape(report.offlineFrameExrPath.string()) << "\",\n"
+           << "  \"offline_frame_ppm\": \""
+           << JsonEscape(report.offlineFramePpmPath.string()) << "\",\n"
+           << "  \"offline_comparison_contact_sheet_ppm\": \""
+           << JsonEscape(report.offlineComparisonContactSheetPpmPath.string()) << "\",\n"
+           << "  \"startup_counters\": ";
+    WriteWaterIntegrationCounterSnapshot(output, report.startupCounters);
+    output << ",\n  \"animation_counters_before\": ";
+    WriteWaterIntegrationCounterSnapshot(output, report.animationCountersBefore);
+    output << ",\n  \"animation_counters_after\": ";
+    WriteWaterIntegrationCounterSnapshot(output, report.animationCountersAfter);
+    output << ",\n";
+    writePaths("frame_exr", report.frameExrPaths);
+    output << ",\n";
+    writePaths("frame_ppm", report.framePpmPaths);
+    output << ",\n";
+    writeStrings("passes", report.passes);
+    output << ",\n";
+    writeStrings("failures", report.failures);
+    output << "\n}\n";
+    return true;
+}
+
+bool WaterFlowIntegrationJobsSettled(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const auto& job = runtimeState.water.flowTrailBuildJob;
+    if (job.pendingCapture || job.worker.joinable() || job.shared != nullptr) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < runtimeState.sessions.size(); ++index) {
+        const auto& session = runtimeState.sessions[index];
+        if (session.loaded && session.waterFlowGpuPreview &&
+            viewport.WaterFlowGpuSourceState(index).pending) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void InstallWaterIntegrationScenario(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+    constexpr std::string_view kScenarioId = "water-integration-smoke";
+    invisible_places::water::WaterScenarioDefinition definition;
+    definition.id = std::string{kScenarioId};
+    definition.name = "Water Integration Smoke";
+    definition.state.seepageLook = runtimeState->water.defaultSeepageLook;
+    definition.state.rainLevel = 0.0F;
+    definition.state.flowLevel = 0.25F;
+    definition.state.seepageLevel = 0.20F;
+    definition.state.seepageSpread = 0.10F;
+    std::erase_if(
+        runtimeState->water.seepageScenarios,
+        [kScenarioId](const auto& candidate) { return candidate.id == kScenarioId; });
+    runtimeState->water.seepageScenarios.push_back(definition);
+
+    invisible_places::water::WaterScenarioTrack track;
+    track.scenarioId = definition.id;
+    track.scenarioName = definition.name;
+    track.fallbackScenario = definition;
+    const std::array<float, 5> positions{{0.0F, 0.25F, 0.5F, 0.75F, 1.0F}};
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        auto state = definition.state;
+        state.rainLevel = std::array<float, 5>{{0.0F, 0.35F, 0.90F, 0.45F, 0.10F}}[index];
+        state.flowLevel = std::array<float, 5>{{0.25F, 0.70F, 1.0F, 0.55F, 0.20F}}[index];
+        state.seepageLevel = std::array<float, 5>{{0.20F, 0.45F, 0.95F, 0.70F, 0.25F}}[index];
+        state.seepageSpread = std::array<float, 5>{{0.10F, 0.30F, 0.80F, 0.55F, 0.15F}}[index];
+        state.seepageRainDelaySeconds = 1.0F;
+        state.seepageRainRiseSeconds = 2.0F;
+        state.seepageRainRecessionSeconds = 4.0F;
+        track.keys.push_back({
+            .id = "water-integration-" + std::to_string(index),
+            .position = positions[index],
+            .state = state,
+            .interpolation = invisible_places::water::WaterScenarioInterpolation::Smooth,
+        });
+    }
+    if (!runtimeState->water.seepageNodes.empty()) {
+        invisible_places::water::WaterSeepageNodeTrack nodeTrack;
+        nodeTrack.nodeId = runtimeState->water.seepageNodes.front().id;
+        for (std::size_t index = 0U; index < positions.size(); ++index) {
+            nodeTrack.keys.push_back({
+                .id = "water-integration-node-" + std::to_string(index),
+                .position = positions[index],
+                .state = {
+                    .activity = std::array<float, 5>{{0.15F, 0.55F, 1.0F, 0.65F, 0.25F}}[index],
+                    .localSpread = std::array<float, 5>{{0.0F, 0.20F, 0.70F, 0.40F, 0.10F}}[index],
+                    .wettingProgress = positions[index],
+                },
+                .interpolation = invisible_places::water::WaterScenarioInterpolation::Smooth,
+            });
+        }
+        track.seepageNodeTracks.push_back(std::move(nodeTrack));
+    }
+    auto& animation = runtimeState->animationPanel.currentPath.value();
+    std::erase_if(
+        animation.waterScenarioTracks,
+        [kScenarioId](const auto& candidate) { return candidate.scenarioId == kScenarioId; });
+    animation.waterScenarioTracks.push_back(std::move(track));
+    animation.selectedWaterScenarioId = std::string{kScenarioId};
+    runtimeState->water.selectedSeepageScenarioId = std::string{kScenarioId};
+    runtimeState->animationPanel.seepageRainEnvelopeCache = {};
+}
+
+struct WaterIntegrationCapturedFrame {
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    std::vector<std::uint8_t> rgb;
+};
+
+std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFrameState& frameState,
+    float simulatedSeconds,
+    const std::filesystem::path& exrPath,
+    const std::filesystem::path& ppmPath,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water integration frame capture has no viewport.";
+        }
+        return std::nullopt;
+    }
+    invisible_places::renderer::core::PointCloudExrFrameRequest request{
+        .renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            simulatedSeconds,
+            &frameState),
+        .width = 640U,
+        .height = 360U,
+        .previewDensity = true,
+        .readbackMask = invisible_places::renderer::core::PointCloudExrReadbackMask::All,
+    };
+    auto image = viewport->RenderPointCloudExrFrame(request);
+    if (!invisible_places::output::WriteExrImage(image, exrPath, errorMessage)) {
+        return std::nullopt;
+    }
+    const auto rgba = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image);
+    if (rgba.size() != static_cast<std::size_t>(image.width) * image.height * 4U) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water integration EXR readback had an invalid display buffer.";
+        }
+        return std::nullopt;
+    }
+    WaterIntegrationCapturedFrame captured{
+        .width = image.width,
+        .height = image.height,
+    };
+    captured.rgb.reserve(static_cast<std::size_t>(image.width) * image.height * 3U);
+    for (std::size_t pixel = 0U; pixel < rgba.size(); pixel += 4U) {
+        captured.rgb.insert(
+            captured.rgb.end(),
+            {rgba[pixel], rgba[pixel + 1U], rgba[pixel + 2U]});
+    }
+    if (!WritePpmImage(ppmPath, captured.width, captured.height, captured.rgb, errorMessage)) {
+        return std::nullopt;
+    }
+    return captured;
+}
+
+bool WriteWaterIntegrationContactSheet(
+    const std::filesystem::path& outputPath,
+    std::span<const WaterIntegrationCapturedFrame> frames,
+    std::string* errorMessage) {
+    if (frames.empty() || frames.front().width == 0U || frames.front().height == 0U) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water integration contact sheet has no frames.";
+        }
+        return false;
+    }
+    const auto width = frames.front().width;
+    const auto height = frames.front().height;
+    if (!std::all_of(
+            frames.begin(),
+            frames.end(),
+            [&](const auto& frame) {
+                return frame.width == width && frame.height == height &&
+                       frame.rgb.size() == static_cast<std::size_t>(width) * height * 3U;
+            })) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "Water integration contact-sheet frames do not have matching dimensions.";
+        }
+        return false;
+    }
+    const auto sheetWidth = width * static_cast<std::uint32_t>(frames.size());
+    std::vector<std::uint8_t> sheet(
+        static_cast<std::size_t>(sheetWidth) * height * 3U,
+        0U);
+    for (std::size_t frameIndex = 0U; frameIndex < frames.size(); ++frameIndex) {
+        for (std::uint32_t row = 0U; row < height; ++row) {
+            const auto sourceOffset = static_cast<std::size_t>(row) * width * 3U;
+            const auto destinationOffset =
+                (static_cast<std::size_t>(row) * sheetWidth + frameIndex * width) * 3U;
+            std::copy_n(
+                frames[frameIndex].rgb.begin() + static_cast<std::ptrdiff_t>(sourceOffset),
+                static_cast<std::size_t>(width) * 3U,
+                sheet.begin() + static_cast<std::ptrdiff_t>(destinationOffset));
+        }
+    }
+    return WritePpmImage(outputPath, sheetWidth, height, sheet, errorMessage);
+}
+
+std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineComparison(
+    PreviewRuntimeState* runtimeState,
+    const ScenePointCloudRuntime& scene,
+    const invisible_places::camera::CameraState& cameraState,
+    const WaterFrameState& frameState,
+    const std::filesystem::path& exrPath,
+    const std::filesystem::path& ppmPath,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr || runtimeState->water.waterSurfaceCache == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The resident display or compact surface cache is unavailable.";
+        }
+        return std::nullopt;
+    }
+    constexpr std::uint32_t kWidth = 320U;
+    constexpr std::uint32_t kHeight = 180U;
+    constexpr std::uint64_t kMaximumPointsPerRole = 250'000U;
+    std::vector<invisible_places::output::OfflinePointLayer> layers;
+    layers.reserve(invisible_places::scene::kScenePointCloudRoleCount);
+    for (const auto& sessionIndex : scene.committedDisplaySessionIndices) {
+        if (!sessionIndex.has_value() || sessionIndex.value() >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto& session = runtimeState->sessions[sessionIndex.value()];
+        if (!session.loaded || !session.visible || session.offlinePointCloud == nullptr ||
+            session.offlinePointCloud->positions.empty()) {
+            continue;
+        }
+        auto style = MakeSceneRenderStyle(*runtimeState, session, session.pointStyle);
+        style = MakeEffectiveFastBasicStyle(style, session.hasSourceRgb, false);
+        invisible_places::output::OfflinePointLayer layer{
+            .cloud = session.offlinePointCloud.get(),
+            .style = style,
+            .hasSourceRgb = session.hasSourceRgb,
+            .fastBasic = true,
+            .drawPointCount = std::min<std::uint64_t>(
+                session.offlinePointCloud->PointCount(),
+                kMaximumPointsPerRole),
+            .localToWorld = glm::mat4{1.0F},
+            .densityCompensation = ResolveSessionDensityCompensation(*runtimeState, session),
+            .rainCollisionRole = RainCollisionRoleForSession(session),
+        };
+        const auto gridKey = NormalizePathKey(session.sourcePath) +
+                             "|layer=" + std::to_string(sessionIndex.value());
+        if (const auto gridIt = runtimeState->water.seepageRuntimeGrids.find(gridKey);
+            gridIt != runtimeState->water.seepageRuntimeGrids.end()) {
+            layer.seepageGrid = gridIt->second;
+        }
+        layers.push_back(std::move(layer));
+    }
+    if (layers.size() != invisible_places::scene::kScenePointCloudRoleCount) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The complete resident 3 mm display snapshot is unavailable.";
+        }
+        return std::nullopt;
+    }
+
+    auto rainSettings = runtimeState->water.collisionRainSettings;
+    if (frameState.rawScenarioState.has_value()) {
+        rainSettings.rainLevel = frameState.rawScenarioState->rainLevel;
+        rainSettings.enabled = rainSettings.rainLevel > 1.0e-5F;
+    }
+    invisible_places::output::OfflineRainSimulationState rainState;
+    constexpr float kDeltaSeconds = 1.0F / 30.0F;
+    for (std::uint32_t step = 0U; step < 12U; ++step) {
+        invisible_places::output::AdvanceOfflineRainFrame(
+            &rainState,
+            *runtimeState->water.waterSurfaceCache,
+            rainSettings,
+            runtimeState->water.rainVisual,
+            cameraState,
+            60.0F + (static_cast<float>(step) * kDeltaSeconds),
+            kDeltaSeconds);
+    }
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, kWidth, kHeight);
+    invisible_places::output::OfflinePointRenderScratch scratch;
+    invisible_places::output::OfflinePointRenderDiagnostics diagnostics;
+    const auto tiles = invisible_places::output::BuildOfflineRenderTiles(kWidth, kHeight, 180U);
+    for (const auto& tile : tiles) {
+        invisible_places::output::RenderPointCloudTile(
+            layers,
+            cameraState,
+            tile,
+            &image,
+            &diagnostics,
+            &scratch,
+            60.0F,
+            &rainState.frame);
+    }
+    if (!invisible_places::output::WriteExrImage(image, exrPath, errorMessage)) {
+        return std::nullopt;
+    }
+    WaterIntegrationCapturedFrame captured{
+        .width = kWidth,
+        .height = kHeight,
+    };
+    captured.rgb.reserve(static_cast<std::size_t>(kWidth) * kHeight * 3U);
+    const glm::vec3 background{
+        runtimeState->projectSettings.backgroundColor[0],
+        runtimeState->projectSettings.backgroundColor[1],
+        runtimeState->projectSettings.backgroundColor[2],
+    };
+    auto toSrgb8 = [](float linear) {
+        const float clamped = std::clamp(linear, 0.0F, 1.0F);
+        const float srgb = clamped <= 0.0031308F
+                               ? 12.92F * clamped
+                               : (1.055F * std::pow(clamped, 1.0F / 2.4F)) - 0.055F;
+        return static_cast<std::uint8_t>(
+            std::clamp(std::lround(srgb * 255.0F), 0L, 255L));
+    };
+    for (std::size_t pixel = 0U; pixel < image.alpha.size(); ++pixel) {
+        const float alpha = std::clamp(image.alpha[pixel], 0.0F, 1.0F);
+        captured.rgb.push_back(toSrgb8(image.beautyR[pixel] + background.r * (1.0F - alpha)));
+        captured.rgb.push_back(toSrgb8(image.beautyG[pixel] + background.g * (1.0F - alpha)));
+        captured.rgb.push_back(toSrgb8(image.beautyB[pixel] + background.b * (1.0F - alpha)));
+    }
+    if (!WritePpmImage(ppmPath, kWidth, kHeight, captured.rgb, errorMessage)) {
+        return std::nullopt;
+    }
+    return captured;
+}
+
+int RunWaterIntegrationSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState,
+    const std::filesystem::path& dataRoot) {
+    const bool sampleScene = options.scenario == "water-integration-sample-scene";
+    const auto outputDirectory =
+        options.outputDirectory.empty()
+            ? DefaultRenderOutputDirectory(dataRoot) / "water-integration" /
+                  (sampleScene ? "sample-scene" : "scene1-top-view")
+            : options.outputDirectory;
+    WaterIntegrationSmokeReport report{
+        .scenario = options.scenario,
+        .projectPath = sampleScene
+                           ? dataRoot.parent_path() / "Saved" / "validation" /
+                                 "SampleSceneValidation_project.json"
+                           : dataRoot.parent_path() / "Saved" /
+                                 "exhibitionScene_project.json",
+        .animationPath = DefaultAnimationDirectory(dataRoot) / "Top_View.ipanim.json",
+        .outputPath = outputDirectory / "water-integration-report.json",
+    };
+    const auto finish = [&]() {
+        if (!WriteWaterIntegrationSmokeReport(report)) {
+            std::cerr << "Failed to write water integration report: "
+                      << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "Water integration report: " << report.outputPath.string() << "\n";
+        for (const auto& failure : report.failures) {
+            std::cerr << "Water integration failure: " << failure << "\n";
+        }
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        report.Fail("The integration runner requires a live window, viewport, and runtime.");
+        return finish();
+    }
+
+    std::error_code createError;
+    std::filesystem::create_directories(outputDirectory, createError);
+    if (createError) {
+        report.Fail("Could not create smoke output directory: " + createError.message());
+        return finish();
+    }
+
+    runtimeState->persistence.projectFilePath = report.projectPath.string();
+    std::string loadError;
+    const auto project = invisible_places::serialization::LoadProjectDocument(
+        report.projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        report.Fail("Could not load validation project: " + loadError);
+        return finish();
+    }
+    const auto startupStartedAt = std::chrono::steady_clock::now();
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        report.Fail(
+            "Could not apply validation project: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    if (!LoadAnimationPathFromFile(runtimeState, report.animationPath)) {
+        report.Fail("Could not load Top_View: " + runtimeState->errorMessage);
+        return finish();
+    }
+    const auto& loadedTopView = runtimeState->animationPanel.currentPath.value();
+    const auto topViewDurationSeconds =
+        invisible_places::camera::AnimationPathDurationSeconds(loadedTopView);
+    if (loadedTopView.name == "Top_View" &&
+        loadedTopView.durationFrames == 3600U &&
+        loadedTopView.exportSettings.framesPerSecond == 30U &&
+        std::abs(topViewDurationSeconds - 120.0F) <= 1.0e-4F) {
+        report.Pass("Loaded Top_View as the authored 3,600-frame, 30 fps, 120-second pan.");
+    } else {
+        report.Fail(
+            "Top_View was not the authored 3,600-frame, 30 fps, 120-second pan (" +
+            std::to_string(loadedTopView.durationFrames) + " frames, " +
+            std::to_string(loadedTopView.exportSettings.framesPerSecond) + " fps, " +
+            FormatFixed(topViewDurationSeconds, 3) + " seconds).");
+    }
+    InstallWaterIntegrationScenario(runtimeState);
+    StartQueuedLayerLoadIfIdle(runtimeState);
+
+    const std::string expectedSceneName = sampleScene ? "SampleScene" : "Scene1";
+    auto findExpectedScene = [&]() -> ScenePointCloudRuntime* {
+        const auto sceneIt = std::find_if(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [&](const auto& scene) { return scene.sceneGroupName == expectedSceneName; });
+        return sceneIt == runtimeState->pointCloudScenes.end() ? nullptr : &*sceneIt;
+    };
+    auto displayReady = [&](const ScenePointCloudRuntime& scene) {
+        if (!scene.displayLoaded || !scene.displayVisible ||
+            scene.committedDisplaySpacingMicrometres != 3000U) {
+            return false;
+        }
+        return std::all_of(
+            scene.committedDisplaySessionIndices.begin(),
+            scene.committedDisplaySessionIndices.end(),
+            [&](const auto& sessionIndex) {
+                if (!sessionIndex.has_value() ||
+                    sessionIndex.value() >= runtimeState->sessions.size()) {
+                    return false;
+                }
+                const auto& session = runtimeState->sessions[sessionIndex.value()];
+                return session.loaded && session.gpuResident && session.visible &&
+                       session.committedDisplaySource;
+            });
+    };
+    auto analysisNonresident = [&](const ScenePointCloudRuntime& scene) {
+        return std::all_of(
+            scene.analysisSessionIndices.begin(),
+            scene.analysisSessionIndices.end(),
+            [&](const auto& sessionIndex) {
+                if (!sessionIndex.has_value() ||
+                    sessionIndex.value() >= runtimeState->sessions.size()) {
+                    return false;
+                }
+                const auto& session = runtimeState->sessions[sessionIndex.value()];
+                return !session.cpuResident && !session.gpuResident && !session.loaded;
+            });
+    };
+
+    bool sawDisplay = false;
+    bool cacheReady = false;
+    const auto startupTimeout = sampleScene ? std::chrono::seconds{90} : std::chrono::seconds{240};
+    const auto startupDeadline = startupStartedAt + startupTimeout;
+    while (std::chrono::steady_clock::now() < startupDeadline && !window->ShouldClose()) {
+        PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true);
+        auto* scene = findExpectedScene();
+        if (scene != nullptr && !sawDisplay && displayReady(*scene)) {
+            sawDisplay = true;
+            report.displayVisibleBeforeAnalysis = analysisNonresident(*scene);
+            report.displayVisibleMs = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - startupStartedAt)
+                                          .count();
+        }
+        if (scene != nullptr && sawDisplay &&
+            scene->waterSurfaceCacheStatus == WaterSurfaceCacheRuntimeStatus::Valid &&
+            runtimeState->water.waterSurfaceCache != nullptr &&
+            viewport->WaterSurfaceFlowView().valid &&
+            viewport->WaterSurfaceFlowView().preprocessingComplete) {
+            cacheReady = true;
+            report.cacheReadyMs = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - startupStartedAt)
+                                      .count();
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    report.startupMs = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - startupStartedAt)
+                           .count();
+    auto* scene = findExpectedScene();
+    const auto startupStateSummary = [&]() {
+        std::ostringstream summary;
+        summary << "queued=" << runtimeState->persistence.queuedLoads.size()
+                << ",pending=" << (runtimeState->pendingLoad.has_value() ? 1 : 0)
+                << ",surface_worker="
+                << (runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() ? 1 : 0)
+                << ",surface_preprocess="
+                << (runtimeState->water.waterSurfaceCachePreprocessPending ? 1 : 0)
+                << ",mesh_worker="
+                << (runtimeState->water.dynamicMeshSurfaceCacheWarmup.worker.joinable() ? 1 : 0);
+        if (scene != nullptr) {
+            summary << ",display_loaded=" << (scene->displayLoaded ? 1 : 0)
+                    << ",pending_display="
+                    << (scene->pendingDisplaySpacingMicrometres.has_value() ||
+                                scene->pendingMixedDisplay
+                            ? 1
+                            : 0)
+                    << ",staged=" << scene->stagedReadyCount;
+        }
+        if (!runtimeState->errorMessage.empty()) {
+            summary << ",error=" << runtimeState->errorMessage;
+        } else if (!runtimeState->statusMessage.empty()) {
+            summary << ",status=" << runtimeState->statusMessage;
+        }
+        return summary.str();
+    };
+    if (scene == nullptr) {
+        report.Fail("The project did not resolve the expected " + expectedSceneName + " group.");
+        return finish();
+    }
+    if (sawDisplay && report.displayVisibleBeforeAnalysis) {
+        report.Pass("The complete 3 mm display became visible before canonical analysis residency.");
+    } else if (!sawDisplay) {
+        report.Fail(
+            "The complete 3 mm display did not become visible before the startup deadline (" +
+            startupStateSummary() + ").");
+    } else {
+        report.Fail("Canonical analysis data was resident when the 3 mm display first became visible.");
+    }
+    if (cacheReady) {
+        report.Pass("The shared surface cache installed and completed GPU preprocessing.");
+    } else {
+        report.Fail(
+            "The shared surface cache did not become valid before the startup deadline (" +
+            startupStateSummary() + ").");
+        return finish();
+    }
+
+    report.exactFiveMillimetreSources =
+        scene->waterSurfaceSources.size() == invisible_places::scene::kScenePointCloudRoleCount &&
+        std::all_of(
+            scene->waterSurfaceSources.begin(),
+            scene->waterSurfaceSources.end(),
+            [](const auto& source) {
+                return source.spacingMicrometres == 5000U && !source.isFallback;
+            });
+    if (report.exactFiveMillimetreSources) {
+        report.Pass("The cache used the exact authored 5 mm ROCK/SAND/VEG sources.");
+    } else {
+        report.Fail("The cache source set was not the exact authored 5 mm three-role bundle.");
+    }
+    report.cacheLoadedFromDisk = runtimeState->water.waterSurfaceCacheLoadedFromDisk;
+    report.peakStagingBytes = viewport->Diagnostics().waterSurfacePeakStagingBytes;
+    report.cachePayloadBytes = scene->waterSurfaceCache.has_value()
+                                   ? scene->waterSurfaceCache->payloadBytes
+                                   : 0U;
+    report.cacheValidationUploadMs =
+        std::max(0.0, report.cacheReadyMs - report.displayVisibleMs);
+    report.startupCounters = CaptureWaterIntegrationCounters(*runtimeState, *viewport);
+    if (report.startupCounters.cacheInstalls == 1U &&
+        report.startupCounters.cacheUploads == 1U &&
+        report.startupCounters.cachePreprocessDispatches == 1U) {
+        report.Pass("Startup installed, uploaded, and preprocessed the shared cache exactly once.");
+    } else {
+        report.Fail("Startup did not perform exactly one cache install/upload/preprocess.");
+    }
+    if (report.peakStagingBytes <=
+        invisible_places::renderer::core::kWaterSurfaceUploadStagingLimitBytes) {
+        report.Pass("Transient cache staging stayed at or below 64 MiB.");
+    } else {
+        report.Fail("Transient cache staging exceeded the 64 MiB cap.");
+    }
+    if (!sampleScene) {
+        constexpr std::uint64_t minimumExpectedScene1CacheBytes = 190ULL * 1024ULL * 1024ULL;
+        constexpr std::uint64_t maximumExpectedScene1CacheBytes = 220ULL * 1024ULL * 1024ULL;
+        if (report.cachePayloadBytes >= minimumExpectedScene1CacheBytes &&
+            report.cachePayloadBytes <= maximumExpectedScene1CacheBytes) {
+            report.Pass("Scene1 installed the expected approximately 204 MiB shared cache payload.");
+        } else {
+            report.Fail(
+                "Scene1 shared cache payload was outside the expected 190-220 MiB acceptance band (" +
+                FormatByteCount(report.cachePayloadBytes) + ").");
+        }
+    }
+    if (report.cacheLoadedFromDisk) {
+        if (report.startupCounters.sourceScans == 0U &&
+            report.startupCounters.gpuTableBuilds == 0U &&
+            report.startupCounters.fullPayloadHashPasses == 0U) {
+            report.Pass("Warm cache load performed no PLY scan, table rebuild, or second full-payload hash.");
+        } else {
+            report.Fail("Warm cache load performed source scans, table rebuilds, or extra full-payload hashing.");
+        }
+        if (!sampleScene && report.cacheValidationUploadMs <= 3000.0) {
+            report.Pass("Warm Scene1 cache validation/upload completed within three seconds.");
+        } else if (!sampleScene) {
+            report.Fail(
+                "Warm Scene1 cache validation/upload exceeded three seconds (" +
+                FormatFixed(report.cacheValidationUploadMs, 3) + " ms).");
+        }
+    } else if (report.startupCounters.sourceScans == 3U &&
+               report.startupCounters.cacheBuilds == 1U) {
+        report.Pass("Cold cache build scanned each exact 5 mm role once and built once.");
+    } else {
+        report.Fail("Cold cache build did not scan exactly three 5 mm roles once.");
+    }
+
+    const auto flowPointIt = std::find_if(
+        runtimeState->water.emitters.begin(),
+        runtimeState->water.emitters.end(),
+        [](const auto& source) { return source.name == "SampleFlowPoint"; });
+    const auto flowPathIt = std::find_if(
+        runtimeState->water.manualFlowPaths.begin(),
+        runtimeState->water.manualFlowPaths.end(),
+        [](const auto& source) { return source.name == "SampleFlowPath"; });
+    const auto seepageIt = std::find_if(
+        runtimeState->water.seepageNodes.begin(),
+        runtimeState->water.seepageNodes.end(),
+        [](const auto& node) { return node.name == "SampleSeepage"; });
+    if (flowPointIt != runtimeState->water.emitters.end() &&
+        flowPathIt != runtimeState->water.manualFlowPaths.end() &&
+        seepageIt != runtimeState->water.seepageNodes.end()) {
+        report.Pass("SampleFlowPoint, SampleFlowPath, and SampleSeepage loaded from the project.");
+    } else {
+        report.Fail("One or more named Sample water objects were missing from the loaded project.");
+        return finish();
+    }
+
+    auto hasGeneratedFlowSources = [&](std::initializer_list<std::uint32_t> sourceIds) {
+        return std::all_of(
+            sourceIds.begin(),
+            sourceIds.end(),
+            [&](const auto sourceId) {
+                return std::any_of(
+                    runtimeState->sessions.begin(),
+                    runtimeState->sessions.end(),
+                    [&](const auto& session) {
+                        return session.loaded && session.visible &&
+                               session.waterFlowGpuPreview &&
+                               session.waterFlowSourceId == sourceId;
+                    });
+            });
+    };
+    if (sampleScene) {
+        // Point sources intentionally require an explicit Bake Path. Perform
+        // that operation only after proving deferred-analysis startup, then
+        // establish both source ids before the parameter-only baseline.
+        const auto pathBakesBeforeExplicitBake =
+            runtimeState->water.pathDiagnosticRebuildCounters.pathBakes;
+        BakeWaterOverlayForActiveLayer(runtimeState, viewport);
+        const auto flowDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{90};
+        while (std::chrono::steady_clock::now() < flowDeadline &&
+               (!WaterFlowIntegrationJobsSettled(*runtimeState, *viewport) ||
+                !hasGeneratedFlowSources({flowPointIt->id, flowPathIt->id}))) {
+            PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        const auto pathBakeDelta =
+            runtimeState->water.pathDiagnosticRebuildCounters.pathBakes -
+            pathBakesBeforeExplicitBake;
+        if (!WaterFlowIntegrationJobsSettled(*runtimeState, *viewport) ||
+            !hasGeneratedFlowSources({flowPointIt->id, flowPathIt->id}) ||
+            pathBakeDelta > 1U) {
+            report.Fail("Explicit SampleFlowPoint Bake Path did not settle source ids 1 and 10 from one cold bake or a warm sidecar reuse.");
+            return finish();
+        }
+        report.Pass(
+            std::string{"Explicit Bake Path activated SampleFlowPoint id 1 alongside SampleFlowPath id 10 via "} +
+            (pathBakeDelta == 0U ? "the settled Flow sidecar." : "one cold source-local bake."));
+    } else {
+        // Scene1 startup remains bounded and never requests canonical analysis.
+        // Its authored manual path can be prepared from the compact cache.
+        if (WaterFlowIntegrationJobsSettled(*runtimeState, *viewport) &&
+            !hasGeneratedFlowSources({flowPathIt->id})) {
+            QueueWaterFlowTrailRefresh(
+                runtimeState,
+                WaterOverlayRefreshPersistence::InMemoryOnly,
+                std::chrono::milliseconds{0},
+                flowPathIt->id);
+        }
+        const auto flowDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{45};
+        while (std::chrono::steady_clock::now() < flowDeadline &&
+               (!WaterFlowIntegrationJobsSettled(*runtimeState, *viewport) ||
+                !hasGeneratedFlowSources({flowPathIt->id}))) {
+            PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        if (!WaterFlowIntegrationJobsSettled(*runtimeState, *viewport) ||
+            !hasGeneratedFlowSources({flowPathIt->id})) {
+            report.Fail("Initial source-local GPU Flow baseline did not settle.");
+            return finish();
+        }
+    }
+    // One final frame settles compact Seepage guides/parameters before the
+    // parameter-only counter baseline is captured.
+    PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true);
+
+    report.animationCountersBefore = CaptureWaterIntegrationCounters(*runtimeState, *viewport);
+    std::vector<double> parameterTimesMs;
+    parameterTimesMs.reserve(121U);
+    std::vector<WaterIntegrationCapturedFrame> capturedFrames;
+    capturedFrames.reserve(3U);
+    for (std::size_t sample = 0U; sample <= 120U; ++sample) {
+        const float amount = static_cast<float>(sample) / 120.0F;
+        runtimeState->animationPanel.scrubAmount = amount;
+        const auto parameterStartedAt = std::chrono::steady_clock::now();
+        ApplyAnimationScrub(runtimeState);
+        runtimeState->water.collisionRainSettings.enabled = true;
+        runtimeState->water.collisionRainSettings.density = 0.25F + (0.65F * amount);
+        runtimeState->water.rainVisual.opacity = 0.25F + (0.55F * amount);
+        runtimeState->water.rainVisual.emission = 0.05F + (0.35F * amount);
+        runtimeState->water.rainVisual.widthMeters = 0.003F + (0.004F * amount);
+        runtimeState->water.rainVisual.streakLengthMeters = 0.08F + (0.20F * amount);
+        for (auto& session : runtimeState->sessions) {
+            if (!session.loaded || !session.waterFlowGpuPreview) {
+                continue;
+            }
+            session.pointStyle.waterFlowActivity = 0.20F + (0.80F * amount);
+            session.pointStyle.waterFlowSpeedScale = 0.60F + (0.80F * amount);
+            session.pointStyle.waterStreakAspect = 3.0F + (8.0F * amount);
+            invisible_places::style::SetScalarConstant(
+                &session.pointStyle.surfelDiameter,
+                0.006F + (0.006F * amount));
+        }
+        const auto waterFrame = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport, &waterFrame);
+        viewport->UpdateRenderState(
+            BuildRenderState(
+                *runtimeState,
+                *viewport,
+                static_cast<float>(sample),
+                &waterFrame));
+        parameterTimesMs.push_back(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - parameterStartedAt)
+                .count());
+
+        if (sample == 0U || sample == 60U || sample == 120U) {
+            const std::string stem = sample == 0U ? "start" : (sample == 60U ? "mid" : "end");
+            const auto exrPath = outputDirectory / (stem + ".exr");
+            const auto ppmPath = outputDirectory / (stem + ".ppm");
+            std::string captureError;
+            auto captured = CaptureWaterIntegrationFrame(
+                runtimeState,
+                viewport,
+                waterFrame,
+                static_cast<float>(sample),
+                exrPath,
+                ppmPath,
+                &captureError);
+            if (!captured.has_value()) {
+                report.Fail("Could not render " + stem + " Vulkan comparison frame: " + captureError);
+            } else {
+                report.frameExrPaths.push_back(exrPath);
+                report.framePpmPaths.push_back(ppmPath);
+                capturedFrames.push_back(std::move(captured.value()));
+            }
+        }
+    }
+    report.parameterSamples = parameterTimesMs.size();
+    report.parameterP50Ms = PercentileValue(parameterTimesMs, 0.50);
+    report.parameterP95Ms = PercentileValue(parameterTimesMs, 0.95);
+    report.parameterMaxMs = parameterTimesMs.empty()
+                                ? 0.0
+                                : *std::max_element(parameterTimesMs.begin(), parameterTimesMs.end());
+
+    // Poll once after cycling so an accidentally queued job cannot hide behind
+    // a debounce deadline when counters are inspected.
+    std::this_thread::sleep_for(std::chrono::milliseconds{40});
+    PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 120.0F, true);
+    report.animationCountersAfter = CaptureWaterIntegrationCounters(*runtimeState, *viewport);
+    const auto& before = report.animationCountersBefore;
+    const auto& after = report.animationCountersAfter;
+    if (after.sourceScans == before.sourceScans &&
+        after.gpuTableBuilds == before.gpuTableBuilds &&
+        after.fullPayloadHashPasses == before.fullPayloadHashPasses &&
+        after.cacheBuilds == before.cacheBuilds &&
+        after.cacheInstalls == before.cacheInstalls &&
+        after.cacheUploads == before.cacheUploads &&
+        after.cachePreprocessDispatches == before.cachePreprocessDispatches &&
+        after.pathBakes == before.pathBakes &&
+        after.seepageGuideBuilds == before.seepageGuideBuilds &&
+        after.seepageTopologyUploads == before.seepageTopologyUploads &&
+        after.flowComputeDispatches == before.flowComputeDispatches) {
+        report.Pass("The 120-second Rain/Flow/Seepage cycle performed parameter updates only.");
+    } else {
+        report.Fail("The parameter-only cycle advanced a scan/build/upload/bake/topology/Flow counter.");
+    }
+    if (report.parameterP95Ms < 10.0 && report.parameterMaxMs < 100.0) {
+        report.Pass("Parameter-update p95 stayed below 10 ms and the hard maximum below 100 ms.");
+    } else {
+        report.Fail(
+            "Parameter updates exceeded the latency bounds (p95 " +
+            FormatFixed(report.parameterP95Ms, 3) + " ms, max " +
+            FormatFixed(report.parameterMaxMs, 3) + " ms).");
+    }
+    if (capturedFrames.size() == 3U) {
+        report.contactSheetPpmPath = outputDirectory / "water-integration-contact-sheet.ppm";
+        std::string sheetError;
+        if (WriteWaterIntegrationContactSheet(
+                report.contactSheetPpmPath,
+                capturedFrames,
+                &sheetError)) {
+            report.Pass("Rendered start/mid/end Vulkan frames and a PPM contact sheet.");
+        } else {
+            report.Fail("Could not write the Vulkan contact sheet: " + sheetError);
+        }
+    }
+    if (sampleScene && capturedFrames.size() == 3U) {
+        // Reuse the already resident committed display snapshots directly;
+        // do not call the export snapshot resolver, which intentionally
+        // selects canonical analysis density.
+        runtimeState->animationPanel.scrubAmount = 0.5F;
+        ApplyAnimationScrub(runtimeState);
+        runtimeState->water.collisionRainSettings.enabled = true;
+        runtimeState->water.collisionRainSettings.density = 0.575F;
+        runtimeState->water.rainVisual.opacity = 0.525F;
+        runtimeState->water.rainVisual.emission = 0.225F;
+        runtimeState->water.rainVisual.widthMeters = 0.005F;
+        runtimeState->water.rainVisual.streakLengthMeters = 0.18F;
+        for (auto& session : runtimeState->sessions) {
+            if (!session.loaded || !session.waterFlowGpuPreview) {
+                continue;
+            }
+            session.pointStyle.waterFlowActivity = 0.60F;
+            session.pointStyle.waterFlowSpeedScale = 1.0F;
+            session.pointStyle.waterStreakAspect = 7.0F;
+            invisible_places::style::SetScalarConstant(
+                &session.pointStyle.surfelDiameter,
+                0.009F);
+        }
+        const auto offlineWaterFrame = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport, &offlineWaterFrame);
+        report.offlineFrameExrPath = outputDirectory / "mid-offline.exr";
+        report.offlineFramePpmPath = outputDirectory / "mid-offline.ppm";
+        std::string offlineError;
+        auto offlineFrame = RenderWaterIntegrationOfflineComparison(
+            runtimeState,
+            *scene,
+            runtimeState->camera.CaptureState(),
+            offlineWaterFrame,
+            report.offlineFrameExrPath,
+            report.offlineFramePpmPath,
+            &offlineError);
+        if (!offlineFrame.has_value()) {
+            report.Fail("Could not render the bounded resident-display offline comparison: " + offlineError);
+        } else {
+            report.offlineComparisonIncluded = true;
+            WaterIntegrationCapturedFrame downsampledGpu{
+                .width = offlineFrame->width,
+                .height = offlineFrame->height,
+            };
+            downsampledGpu.rgb.reserve(offlineFrame->rgb.size());
+            const auto& gpuMid = capturedFrames[1U];
+            for (std::uint32_t y = 0U; y < downsampledGpu.height; ++y) {
+                for (std::uint32_t x = 0U; x < downsampledGpu.width; ++x) {
+                    const auto sourceX = std::min(
+                        gpuMid.width - 1U,
+                        x * gpuMid.width / downsampledGpu.width);
+                    const auto sourceY = std::min(
+                        gpuMid.height - 1U,
+                        y * gpuMid.height / downsampledGpu.height);
+                    const auto sourceOffset =
+                        (static_cast<std::size_t>(sourceY) * gpuMid.width + sourceX) * 3U;
+                    downsampledGpu.rgb.insert(
+                        downsampledGpu.rgb.end(),
+                        {gpuMid.rgb[sourceOffset],
+                         gpuMid.rgb[sourceOffset + 1U],
+                         gpuMid.rgb[sourceOffset + 2U]});
+                }
+            }
+            const std::array<WaterIntegrationCapturedFrame, 2> comparisonFrames{{
+                std::move(downsampledGpu),
+                std::move(offlineFrame.value()),
+            }};
+            report.offlineComparisonContactSheetPpmPath =
+                outputDirectory / "mid-vulkan-offline-contact-sheet.ppm";
+            if (!WriteWaterIntegrationContactSheet(
+                    report.offlineComparisonContactSheetPpmPath,
+                    comparisonFrames,
+                    &offlineError)) {
+                report.Fail("Could not write the Vulkan/offline comparison sheet: " + offlineError);
+            } else {
+                report.Pass("Rendered a bounded 320x180 offline frame from resident 3 mm display snapshots and a Vulkan/offline contact sheet.");
+            }
+        }
+    }
+
+    const auto manualPathIndex = static_cast<std::size_t>(
+        std::distance(runtimeState->water.manualFlowPaths.begin(), flowPathIt));
+    const auto dispatchesBeforeEdit =
+        runtimeState->water.flowGpuComputeDispatchCountBySource;
+    BeginEditingManualFlowPath(runtimeState, manualPathIndex);
+    auto& draft = runtimeState->water.manualFlowPathEditor.draft;
+    if (draft.controlPoints.size() >= 3U) {
+        draft.controlPoints[draft.controlPoints.size() / 2U].x += 0.00025F;
+    }
+    if (!SaveManualFlowPathEdit(runtimeState, viewport)) {
+        report.Fail("Could not save the source-local SampleFlowPath topology edit.");
+        return finish();
+    }
+    const auto editDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (std::chrono::steady_clock::now() < editDeadline &&
+           !WaterFlowIntegrationJobsSettled(*runtimeState, *viewport)) {
+        PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 120.0F, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    bool onlyManualPathDispatched = WaterFlowIntegrationJobsSettled(*runtimeState, *viewport);
+    std::uint64_t manualPathDispatchDelta = 0U;
+    std::ostringstream dispatchDeltaSummary;
+    for (const auto& [sourceId, dispatchCount] :
+         runtimeState->water.flowGpuComputeDispatchCountBySource) {
+        const auto beforeIt = dispatchesBeforeEdit.find(sourceId);
+        const auto previous = beforeIt == dispatchesBeforeEdit.end() ? 0U : beforeIt->second;
+        const auto delta = dispatchCount >= previous ? dispatchCount - previous : dispatchCount;
+        if (dispatchDeltaSummary.tellp() > 0) {
+            dispatchDeltaSummary << ", ";
+        }
+        dispatchDeltaSummary << sourceId << ':' << delta;
+        if (sourceId == flowPathIt->id) {
+            manualPathDispatchDelta = delta;
+        } else if (delta != 0U) {
+            onlyManualPathDispatched = false;
+        }
+    }
+    onlyManualPathDispatched = onlyManualPathDispatched &&
+                               flowPathIt->id == 10U &&
+                               manualPathDispatchDelta > 0U;
+    if (onlyManualPathDispatched) {
+        report.Pass(
+            "A manual topology edit dispatched only SampleFlowPath id 10 (dispatch delta " +
+            std::to_string(manualPathDispatchDelta) + ").");
+    } else {
+        report.Fail(
+            "The manual topology edit was not isolated to id 10 (source deltas " +
+            dispatchDeltaSummary.str() + ").");
+    }
+
+    viewport->WaitIdle();
+    return finish();
+}
+
 }  // namespace
 
 Application::Application(std::filesystem::path dataRoot)
@@ -42024,7 +44119,7 @@ int Application::Run(ApplicationRunOptions options) const {
     runtimeState.sidePanel.pinned = false;
     runtimeState.sidePanel.panelWidth = 410.0F;
     runtimeState.persistence.projectFilePath = DefaultProjectFilePath(dataRoot_).string();
-    runtimeState.rainCollisionCacheRoot = DefaultProjectFilePath(dataRoot_).parent_path();
+    runtimeState.waterSurfaceCacheRoot = DefaultProjectFilePath(dataRoot_).parent_path();
     runtimeState.persistence.pointStylePresetPath = DefaultPointStylePresetPath(dataRoot_).string();
     runtimeState.persistence.animationDirectoryPath = DefaultAnimationDirectory(dataRoot_).string();
     runtimeState.renderSettings.outputDirectory = DefaultRenderOutputDirectory(dataRoot_).string();
@@ -42079,6 +44174,18 @@ int Application::Run(ApplicationRunOptions options) const {
                 &window,
                 &viewport.value(),
                 &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "water-integration-sample-scene" ||
+            options.guiSmoke->scenario == "water-integration-scene1-top-view") {
+            const auto smokeExitCode = RunWaterIntegrationSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState,
+                dataRoot_);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;
@@ -42146,8 +44253,8 @@ int Application::Run(ApplicationRunOptions options) const {
         } else {
             runtimeState.errorMessage = "No point clouds or gSplats were discovered in the Data directory.";
         }
+        EnsureWaterSurfaceCacheReady(&runtimeState, &viewport.value());
         StartDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
-        EnsureRainCollisionCacheReady(&runtimeState, &viewport.value());
     } else if (runtimeState.sessions.empty()) {
         runtimeState.errorMessage = "No point clouds or gSplats were discovered in the Data directory.";
     }
@@ -42178,13 +44285,14 @@ int Application::Run(ApplicationRunOptions options) const {
         if (viewport.has_value()) {
             PollPendingLayerLoad(&runtimeState, &viewport.value());
             PollDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
-            EnsureRainCollisionCacheReady(&runtimeState, &viewport.value());
+            EnsureWaterSurfaceCacheReady(&runtimeState, &viewport.value());
             PollWaterRegionPointPreviewJob(&runtimeState);
             PollWaterFlowTrailBuildJob(&runtimeState, &viewport.value());
             PollWaterRippleLiveEffectRefresh(&runtimeState, &viewport.value());
             SyncWaterRegionPointPreviewHighlights(&runtimeState, &viewport.value());
             if (!runtimeState.offlineRenderJob.active) {
                 CommitReadySceneDisplaySwitches(&runtimeState, &viewport.value());
+                EnsureWaterSurfaceCacheReady(&runtimeState, &viewport.value());
                 StartQueuedLayerLoadIfIdle(&runtimeState);
                 StartDynamicMeshSurfaceCacheWarmup(&runtimeState, false);
             }
@@ -42207,16 +44315,23 @@ int Application::Run(ApplicationRunOptions options) const {
                 UpdateCameraShotPlayback(&runtimeState);
                 UpdatePerformanceInteractionState(&runtimeState, viewport.value());
             }
+            const auto waterFrameState = ResolveWaterFrameState(&runtimeState);
             // Playback advances compact water parameters. Upload Seepage after
             // that evaluation so the current frame never renders the previous
             // animation sample; paused export still receives panel edits.
-            EnsureWaterSeepageRuntimeUpToDate(&runtimeState, &viewport.value());
+            EnsureWaterSeepageRuntimeUpToDate(
+                &runtimeState,
+                &viewport.value(),
+                &waterFrameState);
             PrunePreviewLodSampleCaches(&runtimeState);
             if (!pauseLiveViewport) {
                 DrawPivotOverlay(runtimeState, viewport.value());
                 DrawWaterPathDebugOverlay(&runtimeState, viewport.value());
                 DrawWaterEmitterOverlay(&runtimeState, viewport.value());
-                DrawWaterSeepageOverlay(&runtimeState, viewport.value());
+                DrawWaterSeepageOverlay(
+                    &runtimeState,
+                    viewport.value(),
+                    &waterFrameState);
             }
             viewport->SetDiagnosticsEnabled(true);
             viewport->SetSceneCachingEnabled(!runtimeState.projectSettings.constantUpdateView);
@@ -42233,7 +44348,8 @@ int Application::Run(ApplicationRunOptions options) const {
                 const auto renderState = BuildRenderState(
                     runtimeState,
                     viewport.value(),
-                    previewFlowTimeSeconds);
+                    previewFlowTimeSeconds,
+                    &waterFrameState);
                 const auto renderStateSignature = RenderStateSignature(renderState);
                 const bool renderStateChanged =
                     !runtimeState.previewRenderStateSignatureValid ||

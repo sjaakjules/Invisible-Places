@@ -147,7 +147,7 @@ struct alignas(16) RainUniformsGpu {
     glm::mat4 projection{1.0F};
     glm::vec4 cameraTime{0.0F, 0.0F, 1.0F, 0.0F};
     glm::vec4 spawnCentreRadius{0.0F, 0.0F, 4.0F, 6.0F};
-    glm::vec4 cacheBoundsMinResolution{0.0F, 0.0F, 0.0F, invisible_places::water::kRainCollisionResolutionMeters};
+    glm::vec4 cacheBoundsMinResolution{0.0F, 0.0F, 0.0F, invisible_places::water::kWaterSurfaceResolutionMeters};
     glm::vec4 cacheBoundsMaxDeathDistance{0.0F, 0.0F, 0.0F, 28.0F};
     glm::vec4 weather0{1.0F, 0.0F, 0.3F, 0.45F};
     glm::vec4 weather1{0.35F, 8.0F, 2.5F, 0.4F};
@@ -186,7 +186,7 @@ struct alignas(16) RainCountersGpu {
 struct alignas(16) WaterSurfacePreprocessUniformsGpu {
     glm::uvec4 table{0U, 1U, 0U, 0U};
     glm::vec4 parameters{
-        invisible_places::water::kRainCollisionResolutionMeters,
+        invisible_places::water::kWaterSurfaceResolutionMeters,
         0.50F,
         0.45F,
         0.0F};
@@ -438,6 +438,12 @@ struct alignas(16) DynamicMeshFlowAttractorGpu {
 
 SparseWaterRippleParamsGpu MakeSparseWaterRippleParamsGpu(
     const invisible_places::water::WaterRippleRuntimeParams& params) {
+    const auto finiteOr = [](float value, float fallback) {
+        return std::isfinite(value) ? value : fallback;
+    };
+    const auto finiteClamp = [&finiteOr](float value, float minimum, float maximum, float fallback) {
+        return std::clamp(finiteOr(value, fallback), minimum, maximum);
+    };
     SparseWaterRippleParamsGpu gpu;
     gpu.control = glm::uvec4{
         static_cast<std::uint32_t>(params.overlayType),
@@ -446,13 +452,16 @@ SparseWaterRippleParamsGpu MakeSparseWaterRippleParamsGpu(
         params.layerId,
     };
     gpu.region0 = glm::vec4{
-        params.regionCenter.x,
-        params.regionCenter.y,
-        params.regionCenter.z,
-        std::clamp(params.regionStrength, 0.0F, 1.0F),
+        finiteOr(params.regionCenter.x, 0.0F),
+        finiteOr(params.regionCenter.y, 0.0F),
+        finiteOr(params.regionCenter.z, 0.0F),
+        finiteClamp(params.regionStrength, 0.0F, 1.0F, 0.0F),
     };
     glm::vec3 direction = params.direction;
-    if (glm::dot(direction, direction) <= 1.0e-8F) {
+    if (!std::isfinite(direction.x) ||
+        !std::isfinite(direction.y) ||
+        !std::isfinite(direction.z) ||
+        glm::dot(direction, direction) <= 1.0e-8F) {
         direction = {1.0F, 0.0F, 0.0F};
     } else {
         direction = glm::normalize(direction);
@@ -461,34 +470,34 @@ SparseWaterRippleParamsGpu MakeSparseWaterRippleParamsGpu(
         direction.x,
         direction.y,
         direction.z,
-        std::max(1.0e-5F, params.edgeBlendWidth),
+        std::max(1.0e-5F, finiteOr(params.edgeBlendWidth, 1.0e-5F)),
     };
     gpu.pattern0 = glm::vec4{
-        std::clamp(params.patternScale, 0.05F, 100.0F),
-        std::max(0.005F, params.wavelengthMeters),
-        std::max(0.0F, params.speed),
-        std::max(0.0F, params.warp),
+        finiteClamp(params.patternScale, 0.05F, 100.0F, 1.0F),
+        std::max(0.005F, finiteOr(params.wavelengthMeters, 0.25F)),
+        std::max(0.0F, finiteOr(params.speed, 0.0F)),
+        std::max(0.0F, finiteOr(params.warp, 0.0F)),
     };
     gpu.pattern1 = glm::vec4{
-        std::max(0.0F, params.turbulence),
-        params.phase,
-        std::max(0.0F, params.response.intensity),
-        std::clamp(params.density, 0.0F, 1.0F),
+        std::max(0.0F, finiteOr(params.turbulence, 0.0F)),
+        finiteOr(params.phase, 0.0F),
+        std::max(0.0F, finiteOr(params.response.intensity, 0.0F)),
+        finiteClamp(params.density, 0.0F, 1.0F, 0.0F),
     };
     gpu.response0 = glm::vec4{
-        std::max(0.0F, params.response.emissionAdd),
-        std::isfinite(params.response.opacityAdd) ? params.response.opacityAdd : 0.0F,
-        std::max(0.0F, params.response.opacityMultiply),
-        std::isfinite(params.response.pointSizeAdd) ? params.response.pointSizeAdd : 0.0F,
+        std::max(0.0F, finiteOr(params.response.emissionAdd, 0.0F)),
+        finiteOr(params.response.opacityAdd, 0.0F),
+        std::max(0.0F, finiteOr(params.response.opacityMultiply, 1.0F)),
+        finiteOr(params.response.pointSizeAdd, 0.0F),
     };
     gpu.response1 = glm::vec4{
-        std::max(0.0F, params.response.pointSizeMultiply),
-        std::clamp(params.response.colouriseRed, 0.0F, 1.0F),
-        std::clamp(params.response.colouriseGreen, 0.0F, 1.0F),
-        std::clamp(params.response.colouriseBlue, 0.0F, 1.0F),
+        std::max(0.0F, finiteOr(params.response.pointSizeMultiply, 1.0F)),
+        finiteClamp(params.response.colouriseRed, 0.0F, 1.0F, 0.62F),
+        finiteClamp(params.response.colouriseGreen, 0.0F, 1.0F, 0.88F),
+        finiteClamp(params.response.colouriseBlue, 0.0F, 1.0F, 1.0F),
     };
     gpu.response2 = glm::vec4{
-        std::clamp(params.response.colouriseAmount, 0.0F, 1.0F),
+        finiteClamp(params.response.colouriseAmount, 0.0F, 1.0F, 0.0F),
         0.0F,
         0.0F,
         0.0F,
@@ -1525,8 +1534,9 @@ void VulkanViewportShell::DrawFrame() {
     PollWaterSurfacePreprocess();
     PollWaterFlowSourceDispatches();
     // This frame slot is no longer referenced by the GPU, so it is safe to
-    // publish the newest compact Seepage animation snapshot without waiting
-    // for any other in-flight frame.
+    // publish the newest compact water-effect snapshots without waiting for
+    // any other in-flight frame.
+    FlushSparseWaterRippleParamsForFrame(currentFrameIndex_);
     FlushWaterSeepageParamsForFrame(currentFrameIndex_);
     const auto fenceEnd = collectDiagnostics ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
@@ -1728,7 +1738,7 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
         layer.style.rainImpactEffects =
             renderState_.rainSettings.enabled &&
             renderState_.rainSettings.impactEffectsEnabled &&
-            layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None;
+            layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None;
     }
     ++sceneRevision_;
 
@@ -1885,11 +1895,17 @@ void VulkanViewportShell::UploadPointCloud(
         &emptySparseRippleMembership,
         sizeof(emptySparseRippleMembership));
     const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-    resources.sparseRippleParamsBuffer = CreateHostVisibleBuffer(
+    for (auto& paramsBuffer : resources.sparseRippleParamsBuffers) {
+        paramsBuffer = CreateHostVisibleBuffer(
+            sizeof(emptySparseRippleParams),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        UploadBufferData(paramsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
+    }
+    resources.sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
         sizeof(emptySparseRippleParams),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     UploadBufferData(
-        resources.sparseRippleParamsBuffer,
+        resources.sparseRippleExrParamsBuffer,
         &emptySparseRippleParams,
         sizeof(emptySparseRippleParams));
     const WaterSeepageNodeTopologyGpu emptySeepageNode{};
@@ -2280,10 +2296,19 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
             &emptySparseRippleMembership,
             sizeof(emptySparseRippleMembership));
         const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-        resources->sparseRippleParamsBuffer = CreateHostVisibleBuffer(
+        for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
+            paramsBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySparseRippleParams),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(paramsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
+        }
+        resources->sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
             sizeof(emptySparseRippleParams),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadBufferData(resources->sparseRippleParamsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
+        UploadBufferData(
+            resources->sparseRippleExrParamsBuffer,
+            &emptySparseRippleParams,
+            sizeof(emptySparseRippleParams));
         const WaterSeepageNodeTopologyGpu emptySeepageNode{};
         resources->seepageNodeBuffer = CreateHostVisibleBuffer(
             sizeof(emptySeepageNode),
@@ -2724,10 +2749,15 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
             &emptySparseRippleMembership,
             sizeof(emptySparseRippleMembership));
         const SparseWaterRippleParamsGpu emptySparseRippleParams{};
-        resources->sparseRippleParamsBuffer = CreateHostVisibleBuffer(
+        for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
+            paramsBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(paramsBuffer, &emptySparseRippleParams, sizeof(emptySparseRippleParams));
+        }
+        resources->sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
             sizeof(emptySparseRippleParams), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(
-            resources->sparseRippleParamsBuffer,
+            resources->sparseRippleExrParamsBuffer,
             &emptySparseRippleParams,
             sizeof(emptySparseRippleParams));
         const WaterSeepageNodeTopologyGpu emptySeepageNode{};
@@ -3019,16 +3049,42 @@ void VulkanViewportShell::UploadSparseWaterRippleMembership(
     }
     const auto paramsBufferSize =
         static_cast<VkDeviceSize>(gpuParams.size() * sizeof(SparseWaterRippleParamsGpu));
-    if (resources->sparseRippleParamsBuffer.size != paramsBufferSize) {
-        DestroyBuffer(&resources->sparseRippleParamsBuffer);
-        resources->sparseRippleParamsBuffer = CreateHostVisibleBuffer(
+    const bool paramsBuffersMatch = std::all_of(
+        resources->sparseRippleParamsBuffers.begin(),
+        resources->sparseRippleParamsBuffers.end(),
+        [paramsBufferSize](const BufferAllocation& buffer) {
+            return buffer.size == paramsBufferSize;
+        });
+    if (!paramsBuffersMatch ||
+        resources->sparseRippleExrParamsBuffer.size != paramsBufferSize) {
+        for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
+            DestroyBuffer(&paramsBuffer);
+            paramsBuffer = CreateHostVisibleBuffer(
+                paramsBufferSize,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
+        DestroyBuffer(&resources->sparseRippleExrParamsBuffer);
+        resources->sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
             paramsBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
+    for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
+        UploadBufferData(paramsBuffer, gpuParams.data(), paramsBufferSize);
+    }
     UploadBufferData(
-        resources->sparseRippleParamsBuffer,
+        resources->sparseRippleExrParamsBuffer,
         gpuParams.data(),
-        resources->sparseRippleParamsBuffer.size);
+        paramsBufferSize);
+    resources->pendingSparseRippleParams.resize(static_cast<std::size_t>(paramsBufferSize));
+    std::memcpy(
+        resources->pendingSparseRippleParams.data(),
+        gpuParams.data(),
+        static_cast<std::size_t>(paramsBufferSize));
+    ++resources->sparseRippleParamsGeneration;
+    resources->sparseRippleParamsFrameGenerations.fill(
+        resources->sparseRippleParamsGeneration);
+    resources->sparseRippleParamsExrGeneration =
+        resources->sparseRippleParamsGeneration;
 
     resources->activeSparseRipplePointIndices.clear();
     resources->activeSparseRipplePointIndices.reserve(sanitized.size());
@@ -3058,6 +3114,10 @@ void VulkanViewportShell::UploadSparseWaterRippleMembership(
     for (auto& highlight : resources->highlights) {
         UpdatePointHighlightDescriptorSets(resources, &highlight);
     }
+    if (resources->exrDescriptorSet != VK_NULL_HANDLE &&
+        exrExportResources_.depthImage.view != VK_NULL_HANDLE) {
+        UpdatePointCloudExrDescriptorSet(resources, exrExportResources_.depthImage.view);
+    }
     ++sceneRevision_;
 }
 
@@ -3085,15 +3145,67 @@ void VulkanViewportShell::UpdateSparseWaterRippleParams(
     }
     const auto paramsBufferSize =
         static_cast<VkDeviceSize>(gpuParams.size() * sizeof(SparseWaterRippleParamsGpu));
-    if (resources->sparseRippleParamsBuffer.size != paramsBufferSize) {
+    const bool hasExpectedBuffers = std::all_of(
+        resources->sparseRippleParamsBuffers.begin(),
+        resources->sparseRippleParamsBuffers.end(),
+        [paramsBufferSize](const BufferAllocation& buffer) {
+            return buffer.size == paramsBufferSize;
+        });
+    if (!hasExpectedBuffers ||
+        resources->sparseRippleExrParamsBuffer.size != paramsBufferSize) {
         throw std::runtime_error{"Sparse Ripple params buffer has an unexpected size."};
     }
-    UploadBufferData(
-        resources->sparseRippleParamsBuffer,
+    resources->pendingSparseRippleParams.resize(static_cast<std::size_t>(paramsBufferSize));
+    std::memcpy(
+        resources->pendingSparseRippleParams.data(),
         gpuParams.data(),
-        resources->sparseRippleParamsBuffer.size);
+        static_cast<std::size_t>(paramsBufferSize));
+    ++resources->sparseRippleParamsGeneration;
     ++resources->sparseRippleParamsUploadRevision;
     ++sceneRevision_;
+}
+
+void VulkanViewportShell::FlushSparseWaterRippleParamsForFrame(std::size_t frameIndex) {
+    if (frameIndex >= kFramesInFlight) {
+        return;
+    }
+    for (auto& resources : pointCloudResources_) {
+        if (resources.sparseRippleParamsFrameGenerations[frameIndex] ==
+                resources.sparseRippleParamsGeneration ||
+            resources.pendingSparseRippleParams.empty()) {
+            continue;
+        }
+        auto& target = resources.sparseRippleParamsBuffers[frameIndex];
+        if (target.size != resources.pendingSparseRippleParams.size()) {
+            throw std::runtime_error{"Sparse Ripple frame params buffer has an unexpected size."};
+        }
+        UploadBufferData(
+            target,
+            resources.pendingSparseRippleParams.data(),
+            target.size);
+        resources.sparseRippleParamsFrameGenerations[frameIndex] =
+            resources.sparseRippleParamsGeneration;
+    }
+}
+
+void VulkanViewportShell::FlushSparseWaterRippleParamsForExr() {
+    for (auto& resources : pointCloudResources_) {
+        if (resources.sparseRippleParamsExrGeneration ==
+                resources.sparseRippleParamsGeneration ||
+            resources.pendingSparseRippleParams.empty()) {
+            continue;
+        }
+        if (resources.sparseRippleExrParamsBuffer.size !=
+            resources.pendingSparseRippleParams.size()) {
+            throw std::runtime_error{"Sparse Ripple EXR params buffer has an unexpected size."};
+        }
+        UploadBufferData(
+            resources.sparseRippleExrParamsBuffer,
+            resources.pendingSparseRippleParams.data(),
+            resources.sparseRippleExrParamsBuffer.size);
+        resources.sparseRippleParamsExrGeneration =
+            resources.sparseRippleParamsGeneration;
+    }
 }
 
 void VulkanViewportShell::UploadWaterSeepageTopology(
@@ -3297,6 +3409,30 @@ std::uint64_t VulkanViewportShell::SparseWaterRippleMembershipUploadRevision(std
 std::uint64_t VulkanViewportShell::SparseWaterRippleParamsUploadRevision(std::size_t layerId) const {
     const auto* resources = FindPointCloudResources(layerId);
     return resources != nullptr ? resources->sparseRippleParamsUploadRevision : 0U;
+}
+
+WaterEffectFramePublicationDiagnostics
+VulkanViewportShell::SparseWaterRippleParamsPublicationState(std::size_t layerId) const {
+    WaterEffectFramePublicationDiagnostics diagnostics;
+    const auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr) {
+        return diagnostics;
+    }
+    diagnostics.requestedGeneration = resources->sparseRippleParamsGeneration;
+    diagnostics.liveFrameGenerations = resources->sparseRippleParamsFrameGenerations;
+    diagnostics.exrGeneration = resources->sparseRippleParamsExrGeneration;
+    const auto firstLiveBuffer = resources->sparseRippleParamsBuffers[0].buffer;
+    const auto secondLiveBuffer = resources->sparseRippleParamsBuffers[1].buffer;
+    diagnostics.liveBuffersDistinct =
+        firstLiveBuffer != VK_NULL_HANDLE &&
+        secondLiveBuffer != VK_NULL_HANDLE &&
+        firstLiveBuffer != secondLiveBuffer;
+    const auto exrBuffer = resources->sparseRippleExrParamsBuffer.buffer;
+    diagnostics.exrBufferDistinct =
+        exrBuffer != VK_NULL_HANDLE &&
+        exrBuffer != firstLiveBuffer &&
+        exrBuffer != secondLiveBuffer;
+    return diagnostics;
 }
 
 std::size_t VulkanViewportShell::WaterSeepageNodeCount(std::size_t layerId) const {
@@ -3606,117 +3742,216 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
         resources.pendingSurfaceUpload = {};
     }
     auto& pending = resources.pendingSurfaceUpload;
-    pending.surfaceStagingBuffer = CreateHostVisibleBuffer(
-        rainSurfaceBytes,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    pending.vegetationStagingBuffer = CreateHostVisibleBuffer(
-        vegetationBytes,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    pending.flowSurfaceStagingBuffer = CreateHostVisibleBuffer(
-        flowSurfaceBytes,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    pending.surfaceTableBuffer = CreateDeviceLocalBuffer(
-        rainSurfaceBytes,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    pending.vegetationTableBuffer = CreateDeviceLocalBuffer(
-        vegetationBytes,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    pending.flowSurfaceInputBuffer = CreateDeviceLocalBuffer(
-        flowSurfaceBytes,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    pending.flowSurfaceTableBuffer = CreateDeviceLocalBuffer(
-        flowSurfaceBytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    pending.preprocessUniformBuffer = CreateHostVisibleBuffer(
-        sizeof(WaterSurfacePreprocessUniformsGpu),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    UploadBufferData(
-        pending.surfaceStagingBuffer,
-        gpuData->surfaceTable.data(),
-        rainSurfaceBytes);
-    UploadBufferData(
-        pending.vegetationStagingBuffer,
-        gpuData->vegetationTable.data(),
-        vegetationBytes);
-    UploadBufferData(
-        pending.flowSurfaceStagingBuffer,
-        gpuData->flowSurfaceTable.data(),
-        flowSurfaceBytes);
-
-    pending.bounds = cache.bounds;
-    pending.surfaceMask = gpuData->surfaceMask;
-    pending.vegetationMask = gpuData->vegetationMask;
-    pending.maximumProbeCount = std::max(1U, gpuData->maximumProbeCount);
-    pending.flowSurfaceMask = gpuData->flowSurfaceMask;
-    pending.flowMaximumProbeCount = std::max(1U, gpuData->flowMaximumProbeCount);
-    pending.flowSurfaceCellCount =
-        static_cast<std::uint32_t>(cache.flowSurfaceSurfels.size());
-    pending.flowSurfaceTableCapacity =
-        static_cast<std::uint32_t>(gpuData->flowSurfaceTable.size());
-    pending.resolutionMeters = std::max(0.001F, cache.resolutionMeters);
-    pending.cacheRevision = cache.revision;
-    pending.cacheIdentity = cacheIdentity;
-    pending.tableBytes = static_cast<std::uint64_t>(
-        rainSurfaceBytes + vegetationBytes + flowSurfaceBytes);
-    pending.uploadRevision = ++resources.collisionUploadRevision;
-
-    WaterSurfacePreprocessUniformsGpu preprocessUniforms;
-    preprocessUniforms.table = glm::uvec4{
-        pending.flowSurfaceMask,
-        pending.flowMaximumProbeCount,
-        pending.flowSurfaceTableCapacity,
-        pending.flowSurfaceCellCount,
+    // Keep host-visible transient memory bounded even for multi-gigabyte scene
+    // caches. A single mapped buffer is reused after each queue-local transfer
+    // fence; resident buffers remain device-local. This startup-only path may
+    // briefly wait for copies, but it avoids retaining three full cache-sized
+    // staging allocations alongside the CPU and device payloads.
+    BufferAllocation uploadStagingBuffer{};
+    VkCommandBuffer uploadCommandBuffer = VK_NULL_HANDLE;
+    VkFence uploadFence = VK_NULL_HANDLE;
+    const auto cleanupUpload = [&]() {
+        if (uploadCommandBuffer != VK_NULL_HANDLE && commandPool_ != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device_, commandPool_, 1U, &uploadCommandBuffer);
+            uploadCommandBuffer = VK_NULL_HANDLE;
+        }
+        if (uploadFence != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, uploadFence, nullptr);
+            uploadFence = VK_NULL_HANDLE;
+        }
+        DestroyBuffer(&uploadStagingBuffer);
     };
-    preprocessUniforms.parameters.x = pending.resolutionMeters;
-    UploadBufferData(
-        pending.preprocessUniformBuffer,
-        &preprocessUniforms,
-        sizeof(preprocessUniforms));
+    try {
+        pending.surfaceTableBuffer = CreateDeviceLocalBuffer(
+            rainSurfaceBytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        pending.vegetationTableBuffer = CreateDeviceLocalBuffer(
+            vegetationBytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        pending.flowSurfaceInputBuffer = CreateDeviceLocalBuffer(
+            flowSurfaceBytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        pending.flowSurfaceTableBuffer = CreateDeviceLocalBuffer(
+            flowSurfaceBytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    std::array<VkDescriptorSetLayout, kFramesInFlight> rainLayouts{};
-    rainLayouts.fill(rainDescriptorSetLayout_);
-    VkDescriptorSetAllocateInfo rainAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    rainAllocInfo.descriptorPool = descriptorPool_;
-    rainAllocInfo.descriptorSetCount = static_cast<std::uint32_t>(rainLayouts.size());
-    rainAllocInfo.pSetLayouts = rainLayouts.data();
-    Check(
-        vkAllocateDescriptorSets(
-            device_,
-            &rainAllocInfo,
-            pending.rainDescriptorSets.data()),
-        "vkAllocateDescriptorSets(pending water surface rain)");
-    UpdateRainDescriptorSets(
-        pending.rainDescriptorSets,
-        pending.surfaceTableBuffer,
-        pending.vegetationTableBuffer);
+        const VkDeviceSize largestUpload =
+            std::max({rainSurfaceBytes, vegetationBytes, flowSurfaceBytes});
+        uploadStagingBuffer = CreateHostVisibleBuffer(
+            std::min(largestUpload, kWaterSurfaceUploadStagingLimitBytes),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        pending.peakStagingBytes =
+            static_cast<std::uint64_t>(uploadStagingBuffer.size);
 
-    VkDescriptorSetAllocateInfo preprocessAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    preprocessAllocInfo.descriptorPool = descriptorPool_;
-    preprocessAllocInfo.descriptorSetCount = 1U;
-    preprocessAllocInfo.pSetLayouts = &waterSurfacePreprocessDescriptorSetLayout_;
-    Check(
-        vkAllocateDescriptorSets(
-            device_,
-            &preprocessAllocInfo,
-            &pending.preprocessDescriptorSet),
-        "vkAllocateDescriptorSets(pending water surface preprocess)");
-    UpdateWaterSurfacePreprocessDescriptorSet(&pending);
-    DispatchWaterSurfacePreprocess(&pending);
+        VkCommandBufferAllocateInfo uploadAllocInfo{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        uploadAllocInfo.commandPool = commandPool_;
+        uploadAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        uploadAllocInfo.commandBufferCount = 1U;
+        Check(
+            vkAllocateCommandBuffers(
+                device_,
+                &uploadAllocInfo,
+                &uploadCommandBuffer),
+            "vkAllocateCommandBuffers(water surface chunk upload)");
+        VkFenceCreateInfo uploadFenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(
+            vkCreateFence(device_, &uploadFenceInfo, nullptr, &uploadFence),
+            "vkCreateFence(water surface chunk upload)");
+
+        bool commandBufferSubmitted = false;
+        const auto uploadInChunks = [&](const void* sourceData,
+                                        VkDeviceSize sourceBytes,
+                                        const BufferAllocation& destination) {
+            const auto* source = static_cast<const std::byte*>(sourceData);
+            VkDeviceSize destinationOffset = 0U;
+            while (destinationOffset < sourceBytes) {
+                const auto chunkBytes = std::min(
+                    uploadStagingBuffer.size,
+                    sourceBytes - destinationOffset);
+                UploadBufferData(
+                    uploadStagingBuffer,
+                    source + static_cast<std::size_t>(destinationOffset),
+                    chunkBytes);
+                if (commandBufferSubmitted) {
+                    Check(
+                        vkResetFences(device_, 1U, &uploadFence),
+                        "vkResetFences(water surface chunk upload)");
+                    Check(
+                        vkResetCommandBuffer(uploadCommandBuffer, 0U),
+                        "vkResetCommandBuffer(water surface chunk upload)");
+                }
+
+                VkCommandBufferBeginInfo beginInfo{
+                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                Check(
+                    vkBeginCommandBuffer(uploadCommandBuffer, &beginInfo),
+                    "vkBeginCommandBuffer(water surface chunk upload)");
+                VkBufferCopy copy{};
+                copy.dstOffset = destinationOffset;
+                copy.size = chunkBytes;
+                vkCmdCopyBuffer(
+                    uploadCommandBuffer,
+                    uploadStagingBuffer.buffer,
+                    destination.buffer,
+                    1U,
+                    &copy);
+                Check(
+                    vkEndCommandBuffer(uploadCommandBuffer),
+                    "vkEndCommandBuffer(water surface chunk upload)");
+                VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                submitInfo.commandBufferCount = 1U;
+                submitInfo.pCommandBuffers = &uploadCommandBuffer;
+                Check(
+                    vkQueueSubmit(graphicsQueue_, 1U, &submitInfo, uploadFence),
+                    "vkQueueSubmit(water surface chunk upload)");
+                commandBufferSubmitted = true;
+                Check(
+                    vkWaitForFences(
+                        device_,
+                        1U,
+                        &uploadFence,
+                        VK_TRUE,
+                        std::numeric_limits<std::uint64_t>::max()),
+                    "vkWaitForFences(water surface chunk upload)");
+                destinationOffset += chunkBytes;
+            }
+        };
+        uploadInChunks(
+            gpuData->surfaceTable.data(),
+            rainSurfaceBytes,
+            pending.surfaceTableBuffer);
+        uploadInChunks(
+            gpuData->vegetationTable.data(),
+            vegetationBytes,
+            pending.vegetationTableBuffer);
+        uploadInChunks(
+            gpuData->flowSurfaceTable.data(),
+            flowSurfaceBytes,
+            pending.flowSurfaceInputBuffer);
+        cleanupUpload();
+
+        pending.preprocessUniformBuffer = CreateHostVisibleBuffer(
+            sizeof(WaterSurfacePreprocessUniformsGpu),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+        pending.bounds = cache.bounds;
+        pending.surfaceMask = gpuData->surfaceMask;
+        pending.vegetationMask = gpuData->vegetationMask;
+        pending.maximumProbeCount = std::max(1U, gpuData->maximumProbeCount);
+        pending.flowSurfaceMask = gpuData->flowSurfaceMask;
+        pending.flowMaximumProbeCount = std::max(1U, gpuData->flowMaximumProbeCount);
+        pending.flowSurfaceCellCount =
+            static_cast<std::uint32_t>(cache.flowSurfaceSurfels.size());
+        pending.flowSurfaceTableCapacity =
+            static_cast<std::uint32_t>(gpuData->flowSurfaceTable.size());
+        pending.resolutionMeters = std::max(0.001F, cache.resolutionMeters);
+        pending.cacheRevision = cache.revision;
+        pending.cacheIdentity = cacheIdentity;
+        pending.tableBytes = static_cast<std::uint64_t>(
+            rainSurfaceBytes + vegetationBytes + flowSurfaceBytes);
+        pending.uploadRevision = resources.collisionUploadRevision + 1U;
+
+        WaterSurfacePreprocessUniformsGpu preprocessUniforms;
+        preprocessUniforms.table = glm::uvec4{
+            pending.flowSurfaceMask,
+            pending.flowMaximumProbeCount,
+            pending.flowSurfaceTableCapacity,
+            pending.flowSurfaceCellCount,
+        };
+        preprocessUniforms.parameters.x = pending.resolutionMeters;
+        UploadBufferData(
+            pending.preprocessUniformBuffer,
+            &preprocessUniforms,
+            sizeof(preprocessUniforms));
+
+        std::array<VkDescriptorSetLayout, kFramesInFlight> rainLayouts{};
+        rainLayouts.fill(rainDescriptorSetLayout_);
+        VkDescriptorSetAllocateInfo rainAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        rainAllocInfo.descriptorPool = descriptorPool_;
+        rainAllocInfo.descriptorSetCount = static_cast<std::uint32_t>(rainLayouts.size());
+        rainAllocInfo.pSetLayouts = rainLayouts.data();
+        Check(
+            vkAllocateDescriptorSets(
+                device_,
+                &rainAllocInfo,
+                pending.rainDescriptorSets.data()),
+            "vkAllocateDescriptorSets(pending water surface rain)");
+        UpdateRainDescriptorSets(
+            pending.rainDescriptorSets,
+            pending.surfaceTableBuffer,
+            pending.vegetationTableBuffer);
+
+        VkDescriptorSetAllocateInfo preprocessAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        preprocessAllocInfo.descriptorPool = descriptorPool_;
+        preprocessAllocInfo.descriptorSetCount = 1U;
+        preprocessAllocInfo.pSetLayouts = &waterSurfacePreprocessDescriptorSetLayout_;
+        Check(
+            vkAllocateDescriptorSets(
+                device_,
+                &preprocessAllocInfo,
+                &pending.preprocessDescriptorSet),
+            "vkAllocateDescriptorSets(pending water surface preprocess)");
+        UpdateWaterSurfacePreprocessDescriptorSet(&pending);
+        if (!DispatchWaterSurfacePreprocess(&pending)) {
+            throw std::runtime_error{
+                "Water surface preprocess pipeline was unavailable."};
+        }
+        resources.collisionUploadRevision = pending.uploadRevision;
+    } catch (...) {
+        cleanupUpload();
+        CleanupWaterSurfacePendingUpload(&pending);
+        throw;
+    }
 
     diagnostics_.rainCollisionUploadRevision = resources.collisionUploadRevision;
     diagnostics_.waterSurfaceUploadRevision = resources.collisionUploadRevision;
     diagnostics_.waterSurfaceGpuBytes = resources.residentTableBytes +
-        pending.tableBytes + static_cast<std::uint64_t>(flowSurfaceBytes) +
-        static_cast<std::uint64_t>(pending.surfaceStagingBuffer.size) +
-        static_cast<std::uint64_t>(pending.vegetationStagingBuffer.size) +
-        static_cast<std::uint64_t>(pending.flowSurfaceStagingBuffer.size);
+        pending.tableBytes + static_cast<std::uint64_t>(flowSurfaceBytes);
+    diagnostics_.waterSurfacePeakStagingBytes = pending.peakStagingBytes;
     diagnostics_.waterSurfacePreprocessDispatchCount = resources.preprocessDispatchCount;
     diagnostics_.waterSurfacePreprocessPending = true;
-}
-
-void VulkanViewportShell::UploadRainCollisionCache(
-    const invisible_places::water::RainCollisionCache& cache) {
-    UploadWaterSurfaceCache(cache);
 }
 
 void VulkanViewportShell::ClearWaterSurfaceCache() {
@@ -3730,16 +3965,14 @@ void VulkanViewportShell::ClearWaterSurfaceCache() {
     resources.collisionBounds = {};
     resources.collisionCacheRevision = 0U;
     resources.collisionCacheIdentity = {};
+    resources.peakStagingBytes = 0U;
     ++resources.resetEpoch;
     diagnostics_.rainCollisionCacheRevision = 0U;
     diagnostics_.waterSurfaceCacheRevision = 0U;
+    diagnostics_.waterSurfacePeakStagingBytes = 0U;
     diagnostics_.waterSurfaceSurfelCellCount = 0U;
     diagnostics_.waterSurfacePreprocessPending = !resources.abandonedSurfaceUploads.empty();
     ++sceneRevision_;
-}
-
-void VulkanViewportShell::ClearRainCollisionCache() {
-    ClearWaterSurfaceCache();
 }
 
 WaterSurfaceFlowGpuView VulkanViewportShell::WaterSurfaceFlowView() const {
@@ -3754,6 +3987,7 @@ WaterSurfaceFlowGpuView VulkanViewportShell::WaterSurfaceFlowView() const {
         .resolutionMeters = resources.surfaceResolutionMeters,
         .cacheRevision = resources.collisionCacheRevision,
         .uploadRevision = resources.flowSurfaceResidentUploadRevision,
+        .cacheIdentity = &resources.collisionCacheIdentity,
         .valid = resources.flowSurfaceReady,
         .preprocessingComplete = resources.flowSurfaceReady,
     };
@@ -3763,14 +3997,14 @@ bool VulkanViewportShell::WaterSurfaceUploadPending() const {
     return rainResources_.pendingSurfaceUpload.surfaceTableBuffer.buffer != VK_NULL_HANDLE;
 }
 
-void VulkanViewportShell::DispatchWaterSurfacePreprocess(
+bool VulkanViewportShell::DispatchWaterSurfacePreprocess(
     WaterSurfacePendingGpuUpload* pending) {
     if (pending == nullptr || pending->flowSurfaceTableCapacity == 0U ||
         pending->preprocessDescriptorSet == VK_NULL_HANDLE ||
         waterSurfacePreprocessPipeline_ == VK_NULL_HANDLE ||
         waterSurfacePreprocessPipelineLayout_ == VK_NULL_HANDLE ||
         commandPool_ == VK_NULL_HANDLE) {
-        return;
+        return false;
     }
 
     VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -3799,21 +4033,9 @@ void VulkanViewportShell::DispatchWaterSurfacePreprocess(
         vkBeginCommandBuffer(pending->preprocessCommandBuffer, &beginInfo),
         "vkBeginCommandBuffer(water surface preprocess)");
 
-    const auto copyStagingBuffer = [&](const BufferAllocation& staging,
-                                       const BufferAllocation& resident) {
-        VkBufferCopy copy{};
-        copy.size = std::min(staging.size, resident.size);
-        vkCmdCopyBuffer(
-            pending->preprocessCommandBuffer,
-            staging.buffer,
-            resident.buffer,
-            1U,
-            &copy);
-    };
-    copyStagingBuffer(pending->surfaceStagingBuffer, pending->surfaceTableBuffer);
-    copyStagingBuffer(pending->vegetationStagingBuffer, pending->vegetationTableBuffer);
-    copyStagingBuffer(pending->flowSurfaceStagingBuffer, pending->flowSurfaceInputBuffer);
-
+    // Chunked transfers were completed on this same queue before this command
+    // buffer was recorded. Establish visibility for Rain reads and the Flow
+    // preprocessing dispatch without keeping cache-sized staging buffers alive.
     std::array<VkBufferMemoryBarrier, 3> uploadBarriers{};
     const std::array<VkBuffer, 3> uploadedBuffers = {
         pending->surfaceTableBuffer.buffer,
@@ -3901,6 +4123,7 @@ void VulkanViewportShell::DispatchWaterSurfacePreprocess(
         "vkQueueSubmit(water surface preprocess)");
 
     ++rainResources_.preprocessDispatchCount;
+    return true;
 }
 
 void VulkanViewportShell::PollWaterSurfacePreprocess() {
@@ -3912,10 +4135,18 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     const std::uint32_t completedFrameBit = 1U << currentFrameIndex_;
     for (auto& retired : resources.retiredSurfaceResources) {
         retired.outstandingFrameMask &= ~completedFrameBit;
+        if (retired.outstandingExr && exrExportResources_.fence != VK_NULL_HANDLE) {
+            const VkResult exrStatus = vkGetFenceStatus(device_, exrExportResources_.fence);
+            if (exrStatus == VK_SUCCESS) {
+                retired.outstandingExr = false;
+            } else if (exrStatus != VK_NOT_READY) {
+                Check(exrStatus, "vkGetFenceStatus(retired water surface EXR)");
+            }
+        }
     }
     for (auto retiredIt = resources.retiredSurfaceResources.begin();
          retiredIt != resources.retiredSurfaceResources.end();) {
-        if (retiredIt->outstandingFrameMask != 0U) {
+        if (retiredIt->outstandingFrameMask != 0U || retiredIt->outstandingExr) {
             ++retiredIt;
             continue;
         }
@@ -3965,9 +4196,6 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     }
     DestroyBuffer(&pending.flowSurfaceInputBuffer);
     DestroyBuffer(&pending.preprocessUniformBuffer);
-    DestroyBuffer(&pending.surfaceStagingBuffer);
-    DestroyBuffer(&pending.vegetationStagingBuffer);
-    DestroyBuffer(&pending.flowSurfaceStagingBuffer);
 
     WaterSurfaceRetiredGpuResources retired;
     retired.surfaceTableBuffer = resources.surfaceTableBuffer;
@@ -3978,6 +4206,14 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
         const auto fence = frameResources_[frameIndex].fence;
         if (fence != VK_NULL_HANDLE && vkGetFenceStatus(device_, fence) == VK_NOT_READY) {
             retired.outstandingFrameMask |= 1U << frameIndex;
+        }
+    }
+    if (exrExportResources_.fence != VK_NULL_HANDLE) {
+        const VkResult exrStatus = vkGetFenceStatus(device_, exrExportResources_.fence);
+        if (exrStatus == VK_NOT_READY) {
+            retired.outstandingExr = true;
+        } else if (exrStatus != VK_SUCCESS) {
+            Check(exrStatus, "vkGetFenceStatus(water surface promotion EXR)");
         }
     }
 
@@ -4003,6 +4239,7 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     resources.collisionCacheIdentity = pending.cacheIdentity;
     resources.flowSurfaceResidentUploadRevision = pending.uploadRevision;
     resources.residentTableBytes = pending.tableBytes;
+    resources.peakStagingBytes = pending.peakStagingBytes;
     resources.collisionReady = pending.bounds.valid;
     resources.flowSurfaceReady =
         pending.bounds.valid && pending.flowSurfaceCellCount > 0U;
@@ -4010,7 +4247,8 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
 
     resources.retiredSurfaceResources.push_back(retired);
     pending = {};
-    if (resources.retiredSurfaceResources.back().outstandingFrameMask == 0U) {
+    if (resources.retiredSurfaceResources.back().outstandingFrameMask == 0U &&
+        !resources.retiredSurfaceResources.back().outstandingExr) {
         CleanupWaterSurfaceRetiredResources(&resources.retiredSurfaceResources.back());
         resources.retiredSurfaceResources.pop_back();
     }
@@ -4020,6 +4258,7 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     diagnostics_.waterSurfaceCacheRevision = resources.collisionCacheRevision;
     diagnostics_.waterSurfaceUploadRevision = resources.collisionUploadRevision;
     diagnostics_.waterSurfaceGpuBytes = resources.residentTableBytes;
+    diagnostics_.waterSurfacePeakStagingBytes = resources.peakStagingBytes;
     diagnostics_.waterSurfaceSurfelCellCount = resources.flowSurfaceCellCount;
     diagnostics_.waterSurfaceTableCapacity = resources.flowSurfaceTableCapacity;
     diagnostics_.waterSurfaceMaximumProbeCount = resources.flowMaximumProbeCount;
@@ -4028,7 +4267,7 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     ++sceneRevision_;
 }
 
-std::uint64_t VulkanViewportShell::RainCollisionUploadRevision() const {
+std::uint64_t VulkanViewportShell::WaterSurfaceUploadRevision() const {
     return rainResources_.collisionUploadRevision;
 }
 
@@ -4192,7 +4431,14 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
     Check(existingFenceStatus, "vkGetFenceStatus(exr idle)");
     // EXR owns a separate parameter snapshot. The fence above guarantees a
     // previous asynchronous export is no longer reading it.
+    FlushSparseWaterRippleParamsForExr();
     FlushWaterSeepageParamsForExr();
+    // The EXR descriptor is separate from both live frame descriptors. It is
+    // rebound only after its own fence so surface-cache promotion cannot
+    // mutate descriptor state used by an asynchronous export.
+    UpdateRainExrDescriptorSet(
+        rainResources_.surfaceTableBuffer,
+        rainResources_.vegetationTableBuffer);
 
     const auto previousRenderState = renderState_;
     auto restoreRenderState = [&]() { renderState_ = previousRenderState; };
@@ -4204,7 +4450,7 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
             layer.style.rainImpactEffects =
                 renderState_.rainSettings.enabled &&
                 renderState_.rainSettings.impactEffectsEnabled &&
-                layer.rainCollisionRole != invisible_places::water::RainCollisionRole::None;
+                layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None;
         }
         for (auto& resources : pointCloudResources_) {
             UpdatePointCloudExrDescriptorSet(&resources, exrExportResources_.depthImage.view);
@@ -5278,7 +5524,12 @@ void VulkanViewportShell::CreateRainResources() {
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     resources.counterBuffer = CreateHostVisibleBuffer(
         sizeof(RainCountersGpu),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    for (auto& counterReadback : resources.counterReadbackBuffers) {
+        counterReadback = CreateHostVisibleBuffer(
+            sizeof(RainCountersGpu),
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
     resources.impactCountBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(invisible_places::water::kRainImpactGridDimension) *
             invisible_places::water::kRainImpactGridDimension * sizeof(glm::uvec4),
@@ -5293,6 +5544,9 @@ void VulkanViewportShell::CreateRainResources() {
     for (auto& uniformBuffer : resources.uniformBuffers) {
         uniformBuffer = CreateHostVisibleBuffer(sizeof(RainUniformsGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
+    resources.exrUniformBuffer = CreateHostVisibleBuffer(
+        sizeof(RainUniformsGpu),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
     std::memset(resources.surfaceTableBuffer.mapped, 0, static_cast<std::size_t>(resources.surfaceTableBuffer.size));
     std::memset(resources.vegetationTableBuffer.mapped, 0, static_cast<std::size_t>(resources.vegetationTableBuffer.size));
@@ -5303,6 +5557,12 @@ void VulkanViewportShell::CreateRainResources() {
     std::memset(resources.particleBuffer.mapped, 0, static_cast<std::size_t>(resources.particleBuffer.size));
     std::memset(resources.eventBuffer.mapped, 0, static_cast<std::size_t>(resources.eventBuffer.size));
     std::memset(resources.counterBuffer.mapped, 0, static_cast<std::size_t>(resources.counterBuffer.size));
+    for (auto& counterReadback : resources.counterReadbackBuffers) {
+        std::memset(
+            counterReadback.mapped,
+            0,
+            static_cast<std::size_t>(counterReadback.size));
+    }
     std::memset(resources.impactCountBuffer.mapped, 0, static_cast<std::size_t>(resources.impactCountBuffer.size));
     std::memset(
         resources.impactReferenceBuffer.mapped,
@@ -5319,7 +5579,18 @@ void VulkanViewportShell::CreateRainResources() {
         vkAllocateDescriptorSets(device_, &allocInfo, resources.descriptorSets.data()),
         "vkAllocateDescriptorSets(rain)");
 
+    VkDescriptorSetAllocateInfo exrAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    exrAllocInfo.descriptorPool = descriptorPool_;
+    exrAllocInfo.descriptorSetCount = 1U;
+    exrAllocInfo.pSetLayouts = &rainDescriptorSetLayout_;
+    Check(
+        vkAllocateDescriptorSets(device_, &exrAllocInfo, &resources.exrDescriptorSet),
+        "vkAllocateDescriptorSets(rain exr)");
+
     UpdateRainDescriptorSets();
+    UpdateRainExrDescriptorSet(
+        resources.surfaceTableBuffer,
+        resources.vegetationTableBuffer);
 
     diagnostics_.rainParticleCapacity = invisible_places::water::kRainParticleCapacity;
     diagnostics_.rainEventCapacity = invisible_places::water::kRainImpactEventCapacity;
@@ -5344,8 +5615,20 @@ void VulkanViewportShell::CleanupRainResources() {
             resources.descriptorSets.data());
     }
     resources.descriptorSets.fill(VK_NULL_HANDLE);
+    if (descriptorPool_ != VK_NULL_HANDLE && resources.exrDescriptorSet != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(
+            device_,
+            descriptorPool_,
+            1U,
+            &resources.exrDescriptorSet);
+    }
+    resources.exrDescriptorSet = VK_NULL_HANDLE;
     for (auto& uniformBuffer : resources.uniformBuffers) {
         DestroyBuffer(&uniformBuffer);
+    }
+    DestroyBuffer(&resources.exrUniformBuffer);
+    for (auto& counterReadback : resources.counterReadbackBuffers) {
+        DestroyBuffer(&counterReadback);
     }
     DestroyBuffer(&resources.surfaceTableBuffer);
     DestroyBuffer(&resources.vegetationTableBuffer);
@@ -5394,9 +5677,6 @@ void VulkanViewportShell::CleanupWaterSurfacePendingUpload(
     DestroyBuffer(&pending->flowSurfaceInputBuffer);
     DestroyBuffer(&pending->flowSurfaceTableBuffer);
     DestroyBuffer(&pending->preprocessUniformBuffer);
-    DestroyBuffer(&pending->surfaceStagingBuffer);
-    DestroyBuffer(&pending->vegetationStagingBuffer);
-    DestroyBuffer(&pending->flowSurfaceStagingBuffer);
     *pending = {};
 }
 
@@ -5461,6 +5741,40 @@ void VulkanViewportShell::UpdateRainDescriptorSets(
             0U,
             nullptr);
     }
+}
+
+void VulkanViewportShell::UpdateRainExrDescriptorSet(
+    const BufferAllocation& surfaceTableBuffer,
+    const BufferAllocation& vegetationTableBuffer) {
+    const auto& resources = rainResources_;
+    if (resources.exrDescriptorSet == VK_NULL_HANDLE) {
+        return;
+    }
+    std::array<VkDescriptorBufferInfo, 8> infos{};
+    infos[0] = {resources.exrUniformBuffer.buffer, 0, sizeof(RainUniformsGpu)};
+    infos[1] = {resources.particleBuffer.buffer, 0, resources.particleBuffer.size};
+    infos[2] = {resources.eventBuffer.buffer, 0, resources.eventBuffer.size};
+    infos[3] = {resources.counterBuffer.buffer, 0, resources.counterBuffer.size};
+    infos[4] = {surfaceTableBuffer.buffer, 0, surfaceTableBuffer.size};
+    infos[5] = {vegetationTableBuffer.buffer, 0, vegetationTableBuffer.size};
+    infos[6] = {resources.impactCountBuffer.buffer, 0, resources.impactCountBuffer.size};
+    infos[7] = {resources.impactReferenceBuffer.buffer, 0, resources.impactReferenceBuffer.size};
+    std::array<VkWriteDescriptorSet, 8> writes{};
+    for (std::uint32_t binding = 0U; binding < writes.size(); ++binding) {
+        writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[binding].dstSet = resources.exrDescriptorSet;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorType =
+            binding == 0U ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[binding].descriptorCount = 1U;
+        writes[binding].pBufferInfo = &infos[binding];
+    }
+    vkUpdateDescriptorSets(
+        device_,
+        static_cast<std::uint32_t>(writes.size()),
+        writes.data(),
+        0U,
+        nullptr);
 }
 
 void VulkanViewportShell::UpdateWaterSurfacePreprocessDescriptorSet(
@@ -7625,9 +7939,9 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(
     sparseRippleMembershipInfo.range = resources->sparseRippleMembershipBuffer.size;
 
     VkDescriptorBufferInfo sparseRippleParamsInfo{};
-    sparseRippleParamsInfo.buffer = resources->sparseRippleParamsBuffer.buffer;
+    sparseRippleParamsInfo.buffer = resources->sparseRippleParamsBuffers[frameIndex].buffer;
     sparseRippleParamsInfo.offset = 0;
-    sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffer.size;
+    sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffers[frameIndex].size;
 
     VkDescriptorBufferInfo seepageNodeInfo{
         resources->seepageNodeBuffer.buffer,
@@ -7917,14 +8231,43 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
         &resources->dynamicMeshFlowDescriptorSets[liveSlot],
         0,
         nullptr);
-    vkCmdDispatch(commandBuffer, (particleCount + 63U) / 64U, 1U, 1U);
 
-    std::array<VkBufferMemoryBarrier, 3> barriers{};
-    VkBuffer outputBuffers[] = {
+    const std::array<VkBuffer, 3> outputBuffers = {
         resources->positionStorageBuffer.buffer,
         resources->normalBuffer.buffer,
         resources->scalarFieldBuffer.buffer,
     };
+    std::array<VkBufferMemoryBarrier, 3> priorFrameBarriers{};
+    for (std::size_t index = 0; index < priorFrameBarriers.size(); ++index) {
+        auto& bufferBarrier = priorFrameBarriers[index];
+        bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bufferBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        bufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bufferBarrier.buffer = outputBuffers[index];
+        bufferBarrier.offset = 0U;
+        bufferBarrier.size = VK_WHOLE_SIZE;
+    }
+    // Live tuning reuses settled output buffers. Serialize only those buffers
+    // against older frame reads before this source-local compute update writes
+    // them; the input-slot fence alone does not protect render consumers.
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0U,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(priorFrameBarriers.size()),
+        priorFrameBarriers.data(),
+        0U,
+        nullptr);
+    vkCmdDispatch(commandBuffer, (particleCount + 63U) / 64U, 1U, 1U);
+
+    std::array<VkBufferMemoryBarrier, 3> barriers{};
     for (std::size_t index = 0; index < barriers.size(); ++index) {
         barriers[index] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         barriers[index].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -8169,6 +8512,15 @@ void VulkanViewportShell::PollWaterFlowSourceDispatches() {
     std::vector<QueuedRequest> queuedRequests;
     std::vector<std::size_t> completedDeletes;
 
+    bool exrPending = false;
+    if (exrExportResources_.fence != VK_NULL_HANDLE) {
+        const VkResult exrStatus = vkGetFenceStatus(device_, exrExportResources_.fence);
+        exrPending = exrStatus == VK_NOT_READY;
+        if (!exrPending && exrStatus != VK_SUCCESS) {
+            Check(exrStatus, "vkGetFenceStatus(water flow retirement EXR)");
+        }
+    }
+
     const std::uint32_t currentFrameBit = 1U << static_cast<std::uint32_t>(currentFrameIndex_);
     for (auto& resources : pointCloudResources_) {
         if ((resources.waterFlowDescriptorRefreshFrameMask & currentFrameBit) != 0U) {
@@ -8189,10 +8541,13 @@ void VulkanViewportShell::PollWaterFlowSourceDispatches() {
             if ((retired.outstandingFrameMask & currentFrameBit) != 0U) {
                 retired.outstandingFrameMask &= ~currentFrameBit;
             }
+            if (retired.outstandingExr && !exrPending) {
+                retired.outstandingExr = false;
+            }
         }
         for (auto retiredIt = resources.waterFlowRetiredOutputs.begin();
              retiredIt != resources.waterFlowRetiredOutputs.end();) {
-            if (retiredIt->outstandingFrameMask != 0U) {
+            if (retiredIt->outstandingFrameMask != 0U || retiredIt->outstandingExr) {
                 ++retiredIt;
                 continue;
             }
@@ -8224,7 +8579,9 @@ void VulkanViewportShell::PollWaterFlowSourceDispatches() {
             const bool computeComplete =
                 resources.waterFlowSourceDispatchFence == VK_NULL_HANDLE ||
                 vkGetFenceStatus(device_, resources.waterFlowSourceDispatchFence) == VK_SUCCESS;
-            if (resources.waterFlowDeleteOutstandingFrameMask == 0U && computeComplete) {
+            if (resources.waterFlowDeleteOutstandingFrameMask == 0U &&
+                computeComplete &&
+                !exrPending) {
                 completedDeletes.push_back(resources.layerId);
             }
         }
@@ -8279,6 +8636,7 @@ void VulkanViewportShell::PollWaterFlowSourceDispatches() {
         retired.pointCapacity = resources.pointCount;
         retired.outstandingFrameMask =
             ((1U << static_cast<std::uint32_t>(kFramesInFlight)) - 1U) & ~currentFrameBit;
+        retired.outstandingExr = exrPending;
         if (retired.positionStorageBuffer.buffer != VK_NULL_HANDLE) {
             resources.waterFlowRetiredOutputs.push_back(retired);
         }
@@ -8434,9 +8792,9 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     sparseRippleMembershipInfo.range = resources->sparseRippleMembershipBuffer.size;
 
     VkDescriptorBufferInfo sparseRippleParamsInfo{};
-    sparseRippleParamsInfo.buffer = resources->sparseRippleParamsBuffer.buffer;
+    sparseRippleParamsInfo.buffer = resources->sparseRippleParamsBuffers[frameIndex].buffer;
     sparseRippleParamsInfo.offset = 0;
-    sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffer.size;
+    sparseRippleParamsInfo.range = resources->sparseRippleParamsBuffers[frameIndex].size;
 
     VkDescriptorBufferInfo seepageNodeInfo{
         resources->seepageNodeBuffer.buffer,
@@ -8625,9 +8983,9 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         0,
         resources->sparseRippleMembershipBuffer.size};
     VkDescriptorBufferInfo sparseRippleParamsInfo{
-        resources->sparseRippleParamsBuffer.buffer,
+        resources->sparseRippleExrParamsBuffer.buffer,
         0,
-        resources->sparseRippleParamsBuffer.size};
+        resources->sparseRippleExrParamsBuffer.size};
     VkDescriptorBufferInfo seepageNodeInfo{
         resources->seepageNodeBuffer.buffer,
         0,
@@ -9526,7 +9884,10 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyBuffer(&resources->scalarFieldBuffer);
     DestroyBuffer(&resources->sparseRippleRangeBuffer);
     DestroyBuffer(&resources->sparseRippleMembershipBuffer);
-    DestroyBuffer(&resources->sparseRippleParamsBuffer);
+    for (auto& paramsBuffer : resources->sparseRippleParamsBuffers) {
+        DestroyBuffer(&paramsBuffer);
+    }
+    DestroyBuffer(&resources->sparseRippleExrParamsBuffer);
     DestroyBuffer(&resources->seepageNodeBuffer);
     for (auto& paramsBuffer : resources->seepageParamsBuffers) {
         DestroyBuffer(&paramsBuffer);
@@ -9898,11 +10259,17 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         resources->scalarFieldCount,
         layer.hasSourceRgb ? 1U : 0U,
     };
+    // Source-local GPU Flow owns positions in its vec4 storage output; the
+    // legacy Float3 vertex allocation is intentionally never populated.
+    // Preserve that resource invariant even if a caller supplies a plain
+    // point style while a topology update is settling.
+    const bool waterTrailOverlay =
+        layer.style.waterTrailOverlay || resources->waterFlowSourceActive;
     styleGpu.pointMeta = glm::uvec4{
         resources->pointCount,
         plan.drawPointCount,
         resources->hasNormals ? 1U : 0U,
-        layer.style.waterTrailOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
+        waterTrailOverlay ? 3U : (layer.style.flowAnimation ? (layer.style.waterPathView ? 2U : 1U) : 0U),
     };
     const auto densityCompensation =
         renderer::pointcloud::SanitizePointCloudDensityCompensation(layer.densityCompensation);
@@ -10256,11 +10623,11 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     }
     const auto rainRole = static_cast<std::uint32_t>(layer.rainCollisionRole);
     bool rainRoleEnabled = false;
-    if (layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Sand) {
+    if (layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Sand) {
         rainRoleEnabled = renderState_.rainSettings.sandEffectsEnabled;
-    } else if (layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Rock) {
+    } else if (layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Rock) {
         rainRoleEnabled = renderState_.rainSettings.rockEffectsEnabled;
-    } else if (layer.rainCollisionRole == invisible_places::water::RainCollisionRole::Vegetation) {
+    } else if (layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Vegetation) {
         rainRoleEnabled = renderState_.rainSettings.vegetationEffectsEnabled;
     }
     const bool rainImpactsEnabled =
@@ -10601,8 +10968,14 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             static_cast<void>(UploadPointCloudLayerStyle(layer, plan, 0U, true));
         }
     }
-    UploadRainUniforms(0U, request.width, request.height);
-    RecordRainCompute(resources.commandBuffer, 0U);
+    UploadRainUniformsToBuffer(
+        rainResources_.exrUniformBuffer,
+        request.width,
+        request.height);
+    RecordRainComputeWithDescriptor(
+        resources.commandBuffer,
+        rainResources_.exrDescriptorSet,
+        nullptr);
 
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderPassInfo.renderPass = resources.renderPass;
@@ -10686,7 +11059,10 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             true));
     }
     }
-    RecordRainDraw(resources.commandBuffer, 0U, resources.rainPipeline);
+    RecordRainDrawWithDescriptor(
+        resources.commandBuffer,
+        rainResources_.exrDescriptorSet,
+        resources.rainPipeline);
 
     vkCmdNextSubpass(resources.commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
@@ -11359,6 +11735,30 @@ void VulkanViewportShell::UploadRainUniforms(
         return;
     }
 
+    if (!renderState_.rainSettings.impactEffectsEnabled) {
+        diagnostics_.rainImpactOverflowCount = 0U;
+        diagnostics_.rainEventsEmittedThisFrame = 0U;
+    } else if (resources.counterReadbackBuffers[frameIndex].mapped != nullptr) {
+        // DrawFrame has already waited this frame slot's fence. Read the
+        // slot-owned transfer snapshot rather than racing the shared compute
+        // counter buffer used by another live or EXR submission.
+        const auto* counters = static_cast<const RainCountersGpu*>(
+            resources.counterReadbackBuffers[frameIndex].mapped);
+        diagnostics_.rainImpactOverflowCount = counters->values.y;
+        diagnostics_.rainEventsEmittedThisFrame = counters->values.z;
+    }
+    UploadRainUniformsToBuffer(resources.uniformBuffers[frameIndex], width, height);
+}
+
+void VulkanViewportShell::UploadRainUniformsToBuffer(
+    const BufferAllocation& target,
+    std::uint32_t width,
+    std::uint32_t height) {
+    if (target.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    auto& resources = rainResources_;
+
     const auto& settings = renderState_.rainSettings;
     const auto& visual = renderState_.rainVisual;
     const auto intensity = invisible_places::water::RainIntensityValues(settings.intensityPreset);
@@ -11384,7 +11784,7 @@ void VulkanViewportShell::UploadRainUniforms(
             resources.collisionBounds.minimum.x,
             resources.collisionBounds.minimum.y,
             resources.collisionBounds.minimum.z,
-            invisible_places::water::kRainCollisionResolutionMeters,
+            invisible_places::water::kWaterSurfaceResolutionMeters,
         };
         uniforms.cacheBoundsMaxDeathDistance = glm::vec4{
             resources.collisionBounds.maximum.x,
@@ -11471,24 +11871,27 @@ void VulkanViewportShell::UploadRainUniforms(
         1.0F / static_cast<float>(std::max(1U, width)),
         1.0F / static_cast<float>(std::max(1U, height)),
     };
-    UploadBufferData(resources.uniformBuffers[frameIndex], &uniforms, sizeof(uniforms));
-
-    if (!settings.impactEffectsEnabled) {
-        diagnostics_.rainImpactOverflowCount = 0U;
-        diagnostics_.rainEventsEmittedThisFrame = 0U;
-    } else if (resources.counterBuffer.mapped != nullptr) {
-        const auto* counters = static_cast<const RainCountersGpu*>(resources.counterBuffer.mapped);
-        diagnostics_.rainImpactOverflowCount = counters->values.y;
-        diagnostics_.rainEventsEmittedThisFrame = counters->values.z;
-    }
+    UploadBufferData(target, &uniforms, sizeof(uniforms));
 }
 
 void VulkanViewportShell::RecordRainCompute(VkCommandBuffer commandBuffer, std::size_t frameIndex) {
-    if (!renderState_.rainSettings.enabled || !rainResources_.collisionReady ||
-        rainComputePipeline_ == VK_NULL_HANDLE || frameIndex >= rainResources_.descriptorSets.size()) {
+    if (frameIndex >= rainResources_.descriptorSets.size()) {
         return;
     }
-    const auto descriptorSet = rainResources_.descriptorSets[frameIndex];
+    RecordRainComputeWithDescriptor(
+        commandBuffer,
+        rainResources_.descriptorSets[frameIndex],
+        &rainResources_.counterReadbackBuffers[frameIndex]);
+}
+
+void VulkanViewportShell::RecordRainComputeWithDescriptor(
+    VkCommandBuffer commandBuffer,
+    VkDescriptorSet descriptorSet,
+    const BufferAllocation* counterReadback) {
+    if (!renderState_.rainSettings.enabled || !rainResources_.collisionReady ||
+        rainComputePipeline_ == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE) {
+        return;
+    }
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rainComputePipeline_);
     vkCmdBindDescriptorSets(
         commandBuffer,
@@ -11497,6 +11900,48 @@ void VulkanViewportShell::RecordRainCompute(VkCommandBuffer commandBuffer, std::
         0U,
         1U,
         &descriptorSet,
+        0U,
+        nullptr);
+
+    // Rain simulation and impact grids intentionally persist across frames.
+    // A later submission may otherwise begin its compute writes while the
+    // previous frame is still reading the same buffers for ROCK/SAND/VEG
+    // vertices or fragments. Keep the dependency buffer-local so unrelated
+    // point-cloud and cache resources can continue independently.
+    const std::array<const BufferAllocation*, 5> sharedRainBuffers = {
+        &rainResources_.particleBuffer,
+        &rainResources_.eventBuffer,
+        &rainResources_.counterBuffer,
+        &rainResources_.impactCountBuffer,
+        &rainResources_.impactReferenceBuffer,
+    };
+    std::array<VkBufferMemoryBarrier, 5> priorFrameBarriers{};
+    for (std::size_t index = 0; index < sharedRainBuffers.size(); ++index) {
+        auto& bufferBarrier = priorFrameBarriers[index];
+        bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bufferBarrier.srcAccessMask =
+            VK_ACCESS_SHADER_READ_BIT |
+            VK_ACCESS_SHADER_WRITE_BIT |
+            VK_ACCESS_TRANSFER_READ_BIT;
+        bufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bufferBarrier.buffer = sharedRainBuffers[index]->buffer;
+        bufferBarrier.offset = 0U;
+        bufferBarrier.size = sharedRainBuffers[index]->size;
+    }
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0U,
+        0U,
+        nullptr,
+        static_cast<std::uint32_t>(priorFrameBarriers.size()),
+        priorFrameBarriers.data(),
         0U,
         nullptr);
 
@@ -11567,6 +12012,58 @@ void VulkanViewportShell::RecordRainCompute(VkCommandBuffer commandBuffer, std::
             1U,
             1U);
     }
+    if (counterReadback != nullptr &&
+        counterReadback->buffer != VK_NULL_HANDLE &&
+        counterReadback->size >= sizeof(RainCountersGpu)) {
+        VkBufferMemoryBarrier counterToTransfer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        counterToTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        counterToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        counterToTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        counterToTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        counterToTransfer.buffer = rainResources_.counterBuffer.buffer;
+        counterToTransfer.offset = 0U;
+        counterToTransfer.size = sizeof(RainCountersGpu);
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0U,
+            0U,
+            nullptr,
+            1U,
+            &counterToTransfer,
+            0U,
+            nullptr);
+
+        VkBufferCopy counterCopy{};
+        counterCopy.size = sizeof(RainCountersGpu);
+        vkCmdCopyBuffer(
+            commandBuffer,
+            rainResources_.counterBuffer.buffer,
+            counterReadback->buffer,
+            1U,
+            &counterCopy);
+
+        VkBufferMemoryBarrier readbackToHost{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        readbackToHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        readbackToHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        readbackToHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readbackToHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readbackToHost.buffer = counterReadback->buffer;
+        readbackToHost.offset = 0U;
+        readbackToHost.size = sizeof(RainCountersGpu);
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0U,
+            0U,
+            nullptr,
+            1U,
+            &readbackToHost,
+            0U,
+            nullptr);
+    }
     barrier(
         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         VK_ACCESS_SHADER_READ_BIT);
@@ -11576,15 +12073,27 @@ void VulkanViewportShell::RecordRainDraw(
     VkCommandBuffer commandBuffer,
     std::size_t frameIndex,
     VkPipeline pipeline) {
+    if (frameIndex >= rainResources_.descriptorSets.size()) {
+        return;
+    }
+    RecordRainDrawWithDescriptor(
+        commandBuffer,
+        rainResources_.descriptorSets[frameIndex],
+        pipeline);
+}
+
+void VulkanViewportShell::RecordRainDrawWithDescriptor(
+    VkCommandBuffer commandBuffer,
+    VkDescriptorSet descriptorSet,
+    VkPipeline pipeline) {
     if (!renderState_.rainSettings.enabled || !rainResources_.collisionReady ||
-        pipeline == VK_NULL_HANDLE || frameIndex >= rainResources_.descriptorSets.size()) {
+        pipeline == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE) {
         return;
     }
     const auto activeParticleCount = ActiveRainParticleCount(renderState_);
     if (activeParticleCount == 0U) {
         return;
     }
-    const auto descriptorSet = rainResources_.descriptorSets[frameIndex];
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdBindDescriptorSets(
         commandBuffer,
@@ -11613,25 +12122,38 @@ VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateHostVisibleBuff
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    Check(vkCreateBuffer(device_, &bufferInfo, nullptr, &allocation.buffer), "vkCreateBuffer");
+    try {
+        Check(vkCreateBuffer(device_, &bufferInfo, nullptr, &allocation.buffer), "vkCreateBuffer");
 
-    VkMemoryRequirements memoryRequirements{};
-    vkGetBufferMemoryRequirements(device_, allocation.buffer, &memoryRequirements);
+        VkMemoryRequirements memoryRequirements{};
+        vkGetBufferMemoryRequirements(device_, allocation.buffer, &memoryRequirements);
 
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = memoryRequirements.size;
-    allocInfo.memoryTypeIndex = FindMemoryType(
-        memoryRequirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocInfo.allocationSize = memoryRequirements.size;
+        allocInfo.memoryTypeIndex = FindMemoryType(
+            memoryRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    Check(vkAllocateMemory(device_, &allocInfo, nullptr, &allocation.memory), "vkAllocateMemory");
-    Check(vkBindBufferMemory(device_, allocation.buffer, allocation.memory, 0), "vkBindBufferMemory");
-    Check(
-        vkMapMemory(device_, allocation.memory, 0, allocation.size, 0, &allocation.mapped),
-        "vkMapMemory(persistent buffer)");
-    return allocation;
+        Check(vkAllocateMemory(device_, &allocInfo, nullptr, &allocation.memory), "vkAllocateMemory");
+        Check(vkBindBufferMemory(device_, allocation.buffer, allocation.memory, 0), "vkBindBufferMemory");
+        Check(
+            vkMapMemory(device_, allocation.memory, 0, allocation.size, 0, &allocation.mapped),
+            "vkMapMemory(persistent buffer)");
+        return allocation;
+    } catch (...) {
+        if (allocation.memory != VK_NULL_HANDLE && allocation.mapped != nullptr) {
+            vkUnmapMemory(device_, allocation.memory);
+        }
+        if (allocation.buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, allocation.buffer, nullptr);
+        }
+        if (allocation.memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, allocation.memory, nullptr);
+        }
+        throw;
+    }
 }
 
 VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateDeviceLocalBuffer(
@@ -11648,26 +12170,36 @@ VulkanViewportShell::BufferAllocation VulkanViewportShell::CreateDeviceLocalBuff
     bufferInfo.size = size;
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    Check(
-        vkCreateBuffer(device_, &bufferInfo, nullptr, &allocation.buffer),
-        "vkCreateBuffer(device local)");
+    try {
+        Check(
+            vkCreateBuffer(device_, &bufferInfo, nullptr, &allocation.buffer),
+            "vkCreateBuffer(device local)");
 
-    VkMemoryRequirements memoryRequirements{};
-    vkGetBufferMemoryRequirements(device_, allocation.buffer, &memoryRequirements);
+        VkMemoryRequirements memoryRequirements{};
+        vkGetBufferMemoryRequirements(device_, allocation.buffer, &memoryRequirements);
 
-    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocInfo.allocationSize = memoryRequirements.size;
-    allocInfo.memoryTypeIndex = FindMemoryType(
-        memoryRequirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    Check(
-        vkAllocateMemory(device_, &allocInfo, nullptr, &allocation.memory),
-        "vkAllocateMemory(device local)");
-    Check(
-        vkBindBufferMemory(device_, allocation.buffer, allocation.memory, 0),
-        "vkBindBufferMemory(device local)");
-    return allocation;
+        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocInfo.allocationSize = memoryRequirements.size;
+        allocInfo.memoryTypeIndex = FindMemoryType(
+            memoryRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(
+            vkAllocateMemory(device_, &allocInfo, nullptr, &allocation.memory),
+            "vkAllocateMemory(device local)");
+        Check(
+            vkBindBufferMemory(device_, allocation.buffer, allocation.memory, 0),
+            "vkBindBufferMemory(device local)");
+        return allocation;
+    } catch (...) {
+        if (allocation.buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, allocation.buffer, nullptr);
+        }
+        if (allocation.memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, allocation.memory, nullptr);
+        }
+        throw;
+    }
 }
 
 void VulkanViewportShell::UploadBufferData(
