@@ -47,6 +47,7 @@ struct PropertyLayout {
     std::uint32_t offset = 0;
     std::uint32_t size = 0;
     std::uint32_t scalarFieldIndex = 0;
+    bool isRoughness = false;
 };
 
 std::optional<ScalarType> ParseScalarType(std::string_view typeName) {
@@ -157,6 +158,7 @@ struct PointCloudLayout {
     std::uint32_t recordSize = 0;
     std::uint32_t scalarFieldCount = 0;
     bool hasNormals = false;
+    bool hasRoughness = false;
 };
 
 constexpr std::size_t kMaxFocusSamples = 16384;
@@ -219,6 +221,9 @@ std::optional<PointCloudLayout> BuildPointCloudLayout(const PlyHeader& header, s
         } else if (StartsWith(property.name, "scalar_")) {
             layoutEntry.semantic = PropertySemantic::ScalarField;
             layoutEntry.scalarFieldIndex = scalarFieldIndex++;
+            layoutEntry.isRoughness =
+                property.name == "scalar_Roughness" || property.name == "scalar_roughness";
+            layout.hasRoughness = layout.hasRoughness || layoutEntry.isRoughness;
         }
 
         layout.recordSize += layoutEntry.size;
@@ -532,6 +537,7 @@ PointCloudStreamResult StreamPointCloudPositionsNormals(
 
     PointCloudStreamResult result;
     result.hasNormals = layout->hasNormals;
+    result.hasRoughness = layout->hasRoughness;
     const auto pointsPerChunk = RecommendedPointsPerChunk(layout->recordSize);
     std::vector<std::byte> chunkBuffer(pointsPerChunk * layout->recordSize);
 
@@ -572,6 +578,13 @@ PointCloudStreamResult StreamPointCloudPositionsNormals(
                         break;
                     case PropertySemantic::NormalZ:
                         sample.normal.z = static_cast<float>(ReadScalarAsDouble(propertyBytes, property.type));
+                        break;
+                    case PropertySemantic::ScalarField:
+                        if (property.isRoughness) {
+                            sample.roughness = static_cast<float>(
+                                ReadScalarAsDouble(propertyBytes, property.type));
+                            sample.hasRoughness = std::isfinite(sample.roughness);
+                        }
                         break;
                     default:
                         break;

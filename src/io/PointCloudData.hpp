@@ -64,6 +64,8 @@ struct PointCloudPositionNormalSample {
     Float3 position{};
     Float3 normal{};
     bool hasNormal = false;
+    float roughness = 0.0F;
+    bool hasRoughness = false;
 };
 
 struct PointCloudStreamResult {
@@ -71,6 +73,7 @@ struct PointCloudStreamResult {
     std::uint64_t pointCount = 0;
     std::string errorMessage;
     bool hasNormals = false;
+    bool hasRoughness = false;
     bool success = false;
     bool cancelled = false;
 };

@@ -1,0 +1,197 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// This layout exactly matches water::WaterGpuSurfaceSurfelSlot (32 bytes).
+struct WaterSurfaceSurfelSlot {
+    ivec3 coordinate;
+    uint roleAndSampleCount;
+    uvec4 packed;
+};
+
+layout(set = 0, binding = 0, std140) uniform WaterSurfacePreprocessUniforms {
+    // x: table mask, y: maximum probe count, z: table capacity,
+    // w: occupied surfel count.
+    uvec4 table;
+    // x: cell resolution, y: minimum normal agreement,
+    // z: plane-residual falloff in cells, w: reserved.
+    vec4 parameters;
+} surface;
+
+layout(set = 0, binding = 1, std430) readonly buffer WaterSurfaceInputTable {
+    WaterSurfaceSurfelSlot inputSlots[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer WaterSurfaceOutputTable {
+    WaterSurfaceSurfelSlot outputSlots[];
+};
+
+const int kEmptyCoordinate = -2147483648;
+
+uint HashBits(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16u);
+}
+
+uint RotateLeft(uint value, uint count) {
+    return (value << count) | (value >> (32u - count));
+}
+
+uint HashCell(ivec3 coordinate) {
+    uint hash = HashBits(uint(coordinate.x));
+    hash ^= RotateLeft(HashBits(uint(coordinate.y)), 11u);
+    hash ^= RotateLeft(HashBits(uint(coordinate.z)), 22u);
+    return HashBits(hash);
+}
+
+uint SlotRole(WaterSurfaceSurfelSlot slot) {
+    return slot.roleAndSampleCount & 0xffu;
+}
+
+vec3 DecodeNormal(uint packedNormal) {
+    vec3 value = vec3(
+        float(packedNormal & 1023u),
+        float((packedNormal >> 10u) & 1023u),
+        float((packedNormal >> 20u) & 1023u)) / 1023.0;
+    vec3 normal = value * 2.0 - 1.0;
+    return dot(normal, normal) > 1e-10 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
+}
+
+uint EncodeNormal(vec3 normal) {
+    vec3 unitNormal = dot(normal, normal) > 1e-10
+        ? normalize(normal)
+        : vec3(0.0, 0.0, 1.0);
+    uvec3 encoded = uvec3(round(clamp(unitNormal * 0.5 + 0.5, 0.0, 1.0) * 1023.0));
+    return encoded.x | (encoded.y << 10u) | (encoded.z << 20u);
+}
+
+vec3 DecodeCentroid(WaterSurfaceSurfelSlot slot) {
+    const uint packedCentroid = slot.packed.x;
+    vec3 localPosition = vec3(
+        float(packedCentroid & 1023u),
+        float((packedCentroid >> 10u) & 1023u),
+        float((packedCentroid >> 20u) & 1023u)) / 1023.0;
+    return (vec3(slot.coordinate) + localPosition) * surface.parameters.x;
+}
+
+bool FindSurfel(ivec3 coordinate, uint role, out WaterSurfaceSurfelSlot result) {
+    const uint initial = HashBits(HashCell(coordinate) ^ HashBits(role)) & surface.table.x;
+    const uint probeLimit = min(32u, max(1u, surface.table.y));
+    for (uint probe = 0u; probe < probeLimit; ++probe) {
+        WaterSurfaceSurfelSlot candidate = inputSlots[(initial + probe) & surface.table.x];
+        if (candidate.coordinate.x == kEmptyCoordinate) {
+            return false;
+        }
+        if (all(equal(candidate.coordinate, coordinate)) && SlotRole(candidate) == role) {
+            result = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    const uint tableIndex = gl_GlobalInvocationID.x;
+    if (tableIndex >= surface.table.z) {
+        return;
+    }
+
+    WaterSurfaceSurfelSlot centre = inputSlots[tableIndex];
+    if (centre.coordinate.x == kEmptyCoordinate) {
+        outputSlots[tableIndex] = centre;
+        return;
+    }
+
+    const uint role = SlotRole(centre);
+    const vec3 centrePosition = DecodeCentroid(centre);
+    const vec3 centreNormal = DecodeNormal(centre.packed.y);
+    const vec2 centreConfidenceCoherence = unpackUnorm2x16(centre.packed.z);
+    const vec2 centreRoughnessVariance = unpackHalf2x16(centre.packed.w);
+    const float resolution = max(surface.parameters.x, 0.001);
+    const float minimumNormalAgreement = clamp(surface.parameters.y, 0.0, 0.98);
+    const float planeFalloff = max(surface.parameters.z, 0.05);
+
+    vec3 normalSum = centreNormal * max(0.25, centreConfidenceCoherence.x);
+    float weightSum = max(0.25, centreConfidenceCoherence.x);
+    float squaredPlaneResidualSum = 0.0;
+    float supportWeight = weightSum;
+
+    for (int z = -1; z <= 1; ++z) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                const ivec3 offset = ivec3(x, y, z);
+                if (all(equal(offset, ivec3(0)))) {
+                    continue;
+                }
+
+                WaterSurfaceSurfelSlot neighbour;
+                if (!FindSurfel(centre.coordinate + offset, role, neighbour)) {
+                    continue;
+                }
+
+                vec3 neighbourNormal = DecodeNormal(neighbour.packed.y);
+                float signedAgreement = dot(centreNormal, neighbourNormal);
+                if (signedAgreement < 0.0) {
+                    neighbourNormal = -neighbourNormal;
+                    signedAgreement = -signedAgreement;
+                }
+                if (signedAgreement <= minimumNormalAgreement) {
+                    continue;
+                }
+
+                const vec3 delta = DecodeCentroid(neighbour) - centrePosition;
+                const float distanceCells = length(delta) / resolution;
+                const float planeResidualCells = abs(dot(delta, centreNormal)) / resolution;
+                const vec2 neighbourConfidenceCoherence = unpackUnorm2x16(neighbour.packed.z);
+                const float distanceWeight = exp(-0.5 * distanceCells * distanceCells);
+                const float normalWeight = smoothstep(minimumNormalAgreement, 1.0, signedAgreement);
+                const float planeWeight = exp(
+                    -0.5 * planeResidualCells * planeResidualCells /
+                    (planeFalloff * planeFalloff));
+                const float confidenceWeight = mix(0.25, 1.0, neighbourConfidenceCoherence.x);
+                const float weight = distanceWeight * normalWeight * planeWeight * confidenceWeight;
+                if (weight <= 1e-5) {
+                    continue;
+                }
+
+                normalSum += neighbourNormal * weight;
+                weightSum += weight;
+                supportWeight += distanceWeight * confidenceWeight;
+                squaredPlaneResidualSum += planeResidualCells * planeResidualCells * weight;
+            }
+        }
+    }
+
+    const float normalLength = length(normalSum);
+    const vec3 filteredNormal = normalLength > 1e-8 ? normalSum / normalLength : centreNormal;
+    const float neighbourhoodCoherence = clamp(normalLength / max(weightSum, 1e-5), 0.0, 1.0);
+    const float filteredCoherence = clamp(
+        mix(centreConfidenceCoherence.y, neighbourhoodCoherence, 0.65),
+        0.0,
+        1.0);
+    // Keep the compact persisted/GPU ABI: packed.w stores filtered plane
+    // roughness and angular variance. Flow derives planarity, projected
+    // gravity, transverse support and concavity from these values plus the
+    // immediate prefiltered neighbour field at query time.
+    const float filteredVariance = clamp(
+        mix(centreRoughnessVariance.y, 1.0 - neighbourhoodCoherence, 0.65),
+        0.0,
+        1.0);
+    const float planeRoughness = sqrt(squaredPlaneResidualSum / max(weightSum, 1e-5));
+    const float filteredRoughness = max(
+        0.0,
+        mix(centreRoughnessVariance.x, planeRoughness, 0.35));
+    const float filteredConfidence = clamp(
+        max(centreConfidenceCoherence.x, supportWeight / 8.0),
+        0.0,
+        1.0);
+
+    WaterSurfaceSurfelSlot result = centre;
+    result.packed.y = EncodeNormal(filteredNormal);
+    result.packed.z = packUnorm2x16(vec2(filteredConfidence, filteredCoherence));
+    result.packed.w = packHalf2x16(vec2(filteredRoughness, filteredVariance));
+    outputSlots[tableIndex] = result;
+}

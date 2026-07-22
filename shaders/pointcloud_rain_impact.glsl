@@ -50,6 +50,81 @@ uint RainImpactHashCell(ivec3 coordinate) {
     return RainImpactHashBits(hash);
 }
 
+vec2 RainImpactRandomDirection2D(uint seed) {
+    const vec2 direction = vec2(
+        RainImpactRandom01(seed + 0x68bc21ebu),
+        RainImpactRandom01(seed + 0x02e5be93u)) * 2.0 - 1.0;
+    return dot(direction, direction) > 1e-8 ? normalize(direction) : vec2(1.0, 0.0);
+}
+
+float RainVegetationSprinkleValue(
+    RainImpactEventGpu event,
+    vec3 point,
+    float age) {
+    if (point.z > event.positionBirth.z + 0.01) {
+        return 0.0;
+    }
+
+    const float downwardSpeed = 1.35;
+    const float verticalDistance = max(0.0, event.positionBirth.z - point.z);
+    const float maximumDepth = max(0.18, event.lifetimeEnergy.x * downwardSpeed);
+    if (verticalDistance > maximumDepth) {
+        return 0.0;
+    }
+
+    const float depthFraction = clamp(verticalDistance / maximumDepth, 0.0, 1.0);
+    const float bandCoordinate = verticalDistance / 0.09;
+    const uint bandIndex = uint(floor(bandCoordinate));
+    const float bandMix = smoothstep(0.0, 1.0, fract(bandCoordinate));
+    const uint pointHash = RainImpactHashCell(ivec3(floor(point / 0.005)));
+    // Point-to-stream assignment keeps three visible paths at one path evaluation per event.
+    const uint streamIndex = RainImpactHashBits(
+        event.control.y ^ pointHash ^ 0x27d4eb2du) % 3u;
+    const uint streamSeed = event.control.y ^
+        RainImpactHashBits(0x9e3779b9u * (streamIndex + 1u));
+    const vec2 branchDirection = RainImpactRandomDirection2D(streamSeed);
+    const float spread = event.normalRadius.w * (0.08 + 0.52 * depthFraction) *
+        (0.65 + 0.35 * RainImpactRandom01(streamSeed + 5u));
+    const vec2 wanderA = RainImpactRandomDirection2D(
+        streamSeed ^ RainImpactHashBits(bandIndex + 0xa511e9b3u));
+    const vec2 wanderB = RainImpactRandomDirection2D(
+        streamSeed ^ RainImpactHashBits(bandIndex + 1u + 0xa511e9b3u));
+    const vec2 wanderDirection = mix(wanderA, wanderB, bandMix);
+    const float wanderScale = event.normalRadius.w * 0.12 *
+        smoothstep(0.0, 0.18, verticalDistance);
+    const vec2 pathCentre = event.positionBirth.xy +
+        branchDirection * spread + wanderDirection * wanderScale;
+    const float streamWidth = max(
+        0.0022,
+        event.normalRadius.w * (0.08 + 0.015 * RainImpactRandom01(streamSeed + 7u)));
+    const float path = 1.0 - smoothstep(
+        streamWidth,
+        streamWidth * 2.0,
+        length(point.xy - pathCentre));
+    if (path <= 0.0) {
+        return 0.0;
+    }
+
+    const uint sparkleSeed = event.control.y ^ pointHash ^
+        RainImpactHashBits(0x85ebca6bu * (streamIndex + 1u));
+    const float selectedPoint = smoothstep(
+        0.62,
+        0.94,
+        RainImpactRandom01(sparkleSeed));
+    if (selectedPoint <= 0.0) {
+        return 0.0;
+    }
+    const float timeJitter =
+        (RainImpactRandom01(sparkleSeed + 0xc2b2ae35u) - 0.5) * 0.12;
+    const float streamDelay = float(streamIndex) * 0.035 +
+        RainImpactRandom01(streamSeed + 19u) * 0.04;
+    const float localAge = age - verticalDistance / downwardSpeed -
+        streamDelay - timeJitter;
+    const float pulse = smoothstep(0.0, 0.035, localAge) *
+        (1.0 - smoothstep(0.085, 0.24, localAge));
+    return path * selectedPoint * pulse;
+}
+
 RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
     RainImpactComposite composite = RainImpactComposite(0.0, 0.0, 1.0, 0.0);
     const uint role = styleData.rainImpactControl.y;
@@ -112,32 +187,31 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             const float normalizedDistance =
                 sqrt(dot(tangent, tangent) + normalDistance * normalDistance * 4.0) /
                 max(0.001, event.normalRadius.w);
-            value = (1.0 - smoothstep(0.45, 1.0, normalizedDistance)) *
+            const float growthSeconds = clamp(lifetime * 0.18, 0.55, 0.95);
+            const float growth = smoothstep(0.0, growthSeconds, age);
+            const float edgeWidth = 0.07 + (1.0 - growth) * 0.09;
+            value = (1.0 - smoothstep(
+                         max(0.0, growth - edgeWidth),
+                         growth + edgeWidth,
+                         normalizedDistance)) *
                     (1.0 - smoothstep(0.55, 1.0, life));
-        } else if (point.z <= event.positionBirth.z + 0.01) {
-            const float xyDistance = length(point.xy - event.positionBirth.xy);
-            const float column = 1.0 - smoothstep(
-                event.normalRadius.w * 0.55,
-                event.normalRadius.w,
-                xyDistance);
-            const float verticalDistance = max(0.0, event.positionBirth.z - point.z);
-            const ivec3 variationCell = ivec3(floor(point / 0.04));
-            const float variation = (
-                RainImpactRandom01(event.control.y ^ RainImpactHashCell(variationCell)) - 0.5) * 0.12;
-            const float localAge = age - verticalDistance / 1.6 - variation;
-            if (localAge >= 0.0) {
-                const float localLife = localAge / max(0.15, lifetime * 0.65);
-                value = column * smoothstep(0.0, 0.12, localLife) *
-                        (1.0 - smoothstep(0.35, 1.0, localLife));
-            }
+        } else {
+            value = RainVegetationSprinkleValue(event, point, age);
         }
         value *= event.lifetimeEnergy.y;
-        composite.opacityAdd = max(composite.opacityAdd, value * 0.18);
+        const bool vegetation = role == kRainRoleVegetation;
+        composite.opacityAdd = max(
+            composite.opacityAdd,
+            value * (vegetation ? 0.08 : 0.18));
         composite.emissionAdd = max(
             composite.emissionAdd,
-            value * (role == kRainRoleVegetation ? 0.24 : 0.11));
-        composite.pointSizeMultiply = max(composite.pointSizeMultiply, 1.0 + value * 0.16);
-        composite.colourMix = max(composite.colourMix, value * (role == kRainRoleRock ? 0.42 : 0.20));
+            value * (vegetation ? 0.24 : 0.11));
+        composite.pointSizeMultiply = max(
+            composite.pointSizeMultiply,
+            1.0 + value * (vegetation ? 0.07 : 0.16));
+        composite.colourMix = max(
+            composite.colourMix,
+            value * (role == kRainRoleRock ? 0.42 : (vegetation ? 0.09 : 0.20)));
     }
     return composite;
 }
