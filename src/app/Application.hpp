@@ -11,8 +11,14 @@ struct GuiSmokeOptions {
     std::filesystem::path outputDirectory;
 };
 
+struct ExportBenchmarkOptions {
+    std::string scenario;
+    std::filesystem::path outputDirectory;
+};
+
 struct ApplicationRunOptions {
     std::optional<GuiSmokeOptions> guiSmoke;
+    std::optional<ExportBenchmarkOptions> exportBenchmark;
 };
 
 class Application {

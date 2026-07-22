@@ -45,9 +45,12 @@ enum class AnimationExportMode {
     FastPreviewMp4,
     HevcAlphaMp4,
     PngStack,
+    FastPngStack,
     HqPreviewDensityExr,
     ProRes422Mov,
     ProRes422HqMov,
+    ProRes422AlphaMatteMov,
+    ProRes422HqAlphaMatteMov,
     ProRes422VideoToolboxMov,
     ProRes422HqVideoToolboxMov,
     ProRes4444Mov,
@@ -56,17 +59,31 @@ enum class AnimationExportMode {
     ProRes4444XqVideoToolboxMov,
 };
 
+enum class AnimationExportQuality {
+    Normal,
+    Hq,
+    Xq,
+};
+
 struct ExportPreset {
     std::string name;
     AnimationExportMode mode = AnimationExportMode::FastPreviewMp4;
+    AnimationExportQuality quality = AnimationExportQuality::Normal;
+    bool useVideoToolbox = true;
+    bool externalAlphaMatte = true;
     RenderJobSettings settings{};
 };
 
+constexpr std::string_view kMp4PresetName = "MP4_preset";
 constexpr std::string_view kFastPreviewMp4PresetName = "Fast Preview MP4_preset";
 constexpr std::string_view kHevcAlphaMp4PresetName = "H.265 Alpha MP4_preset";
 constexpr std::string_view kPngStackPresetName = "PNG Stack_preset";
+constexpr std::string_view kFastPngStackPresetName = "Fast PNG Stack_preset";
+constexpr std::string_view kHqPreviewDensityExrPresetName = "HQ Preview-Density EXR_preset";
 constexpr std::string_view kProRes422PresetName = "ProRes 422_preset";
 constexpr std::string_view kProRes422HqPresetName = "ProRes 422 HQ_preset";
+constexpr std::string_view kProRes422AlphaMattePresetName = "ProRes 422 Alpha Matte Pair_preset";
+constexpr std::string_view kProRes422HqAlphaMattePresetName = "ProRes 422 HQ Alpha Matte Pair_preset";
 constexpr std::string_view kProRes422VideoToolboxPresetName = "ProRes 422 VideoToolbox_preset";
 constexpr std::string_view kProRes422HqVideoToolboxPresetName = "ProRes 422 HQ VideoToolbox_preset";
 constexpr std::string_view kProRes4444PresetName = "ProRes 4444_preset";
@@ -75,16 +92,22 @@ constexpr std::string_view kProRes4444VideoToolboxPresetName = "ProRes 4444 Vide
 constexpr std::string_view kProRes4444XqVideoToolboxPresetName = "ProRes 4444 XQ VideoToolbox_preset";
 
 [[nodiscard]] ExportPreset MakeFastPreviewMp4ExportPreset();
+[[nodiscard]] ExportPreset MakeMp4ExportPreset();
 [[nodiscard]] ExportPreset MakeHevcAlphaMp4ExportPreset();
 [[nodiscard]] ExportPreset MakePngStackExportPreset();
+[[nodiscard]] ExportPreset MakeFastPngStackExportPreset();
+[[nodiscard]] ExportPreset MakeHqPreviewDensityExrExportPreset();
 [[nodiscard]] ExportPreset MakeProRes422ExportPreset();
 [[nodiscard]] ExportPreset MakeProRes422HqExportPreset();
+[[nodiscard]] ExportPreset MakeProRes422AlphaMatteExportPreset();
+[[nodiscard]] ExportPreset MakeProRes422HqAlphaMatteExportPreset();
 [[nodiscard]] ExportPreset MakeProRes422VideoToolboxExportPreset();
 [[nodiscard]] ExportPreset MakeProRes422HqVideoToolboxExportPreset();
 [[nodiscard]] ExportPreset MakeProRes4444ExportPreset();
 [[nodiscard]] ExportPreset MakeProRes4444XqExportPreset();
 [[nodiscard]] ExportPreset MakeProRes4444VideoToolboxExportPreset();
 [[nodiscard]] ExportPreset MakeProRes4444XqVideoToolboxExportPreset();
+[[nodiscard]] ExportPreset NormalizeExportPresetForCurrentSchema(ExportPreset preset);
 [[nodiscard]] std::vector<ExportPreset> BuiltInExportPresets();
 [[nodiscard]] bool IsBuiltInExportPresetName(std::string_view name);
 [[nodiscard]] bool IsEditedExportPresetName(std::string_view name);

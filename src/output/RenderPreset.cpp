@@ -118,17 +118,56 @@ std::string NormalizeExportPresetName(std::string_view name) {
     while (!normalized.empty() && normalized.back() == ' ') {
         normalized.pop_back();
     }
-    return normalized.empty() ? std::string{kFastPreviewMp4PresetName} : normalized;
+    return normalized.empty() ? std::string{kMp4PresetName} : normalized;
+}
+
+std::string CompactBuiltInExportPresetBaseName(std::string_view name) {
+    const auto normalized = NormalizeExportPresetName(name);
+    if (normalized == kFastPreviewMp4PresetName || normalized == kHevcAlphaMp4PresetName) {
+        return std::string{kMp4PresetName};
+    }
+    if (normalized == kProRes422HqPresetName ||
+        normalized == kProRes422AlphaMattePresetName ||
+        normalized == kProRes422HqAlphaMattePresetName ||
+        normalized == kProRes422VideoToolboxPresetName ||
+        normalized == kProRes422HqVideoToolboxPresetName) {
+        return std::string{kProRes422PresetName};
+    }
+    if (normalized == kProRes4444XqPresetName ||
+        normalized == kProRes4444VideoToolboxPresetName ||
+        normalized == kProRes4444XqVideoToolboxPresetName) {
+        return std::string{kProRes4444PresetName};
+    }
+    return normalized;
+}
+
+std::string CompactBuiltInExportPresetName(std::string_view name) {
+    constexpr std::string_view suffix = "_edited";
+    auto normalized = NormalizeExportPresetName(name);
+    const bool edited =
+        normalized.size() > suffix.size() &&
+        std::string_view{normalized}.substr(normalized.size() - suffix.size()) == suffix;
+    if (edited) {
+        normalized.erase(normalized.size() - suffix.size());
+    }
+    auto compact = CompactBuiltInExportPresetBaseName(normalized);
+    if (edited) {
+        compact += suffix;
+    }
+    return compact;
 }
 
 }  // namespace
 
-ExportPreset MakeFastPreviewMp4ExportPreset() {
+ExportPreset MakeMp4ExportPreset() {
     ExportPreset preset;
-    preset.name = std::string{kFastPreviewMp4PresetName};
+    preset.name = std::string{kMp4PresetName};
     preset.mode = AnimationExportMode::FastPreviewMp4;
-    preset.settings.width = 1920;
-    preset.settings.height = 1080;
+    preset.quality = AnimationExportQuality::Normal;
+    preset.useVideoToolbox = true;
+    preset.externalAlphaMatte = true;
+    preset.settings.width = 3840;
+    preset.settings.height = 2160;
     preset.settings.framesPerSecond = 30;
     preset.settings.supersampleScale = 2;
     preset.settings.spatialAntialiasing = true;
@@ -140,14 +179,13 @@ ExportPreset MakeFastPreviewMp4ExportPreset() {
     return preset;
 }
 
+ExportPreset MakeFastPreviewMp4ExportPreset() {
+    return MakeMp4ExportPreset();
+}
+
 ExportPreset MakeHevcAlphaMp4ExportPreset() {
-    auto preset = MakeFastPreviewMp4ExportPreset();
-    preset.name = std::string{kHevcAlphaMp4PresetName};
-    preset.mode = AnimationExportMode::HevcAlphaMp4;
-    preset.settings.width = 3840;
-    preset.settings.height = 2160;
-    preset.settings.supersampleScale = 2;
-    preset.settings.spatialAntialiasing = true;
+    auto preset = MakeMp4ExportPreset();
+    preset.quality = AnimationExportQuality::Hq;
     return preset;
 }
 
@@ -155,6 +193,26 @@ ExportPreset MakePngStackExportPreset() {
     auto preset = MakeHevcAlphaMp4ExportPreset();
     preset.name = std::string{kPngStackPresetName};
     preset.mode = AnimationExportMode::PngStack;
+    preset.quality = AnimationExportQuality::Normal;
+    preset.useVideoToolbox = false;
+    preset.externalAlphaMatte = false;
+    return preset;
+}
+
+ExportPreset MakeFastPngStackExportPreset() {
+    auto preset = MakePngStackExportPreset();
+    preset.name = std::string{kFastPngStackPresetName};
+    preset.mode = AnimationExportMode::FastPngStack;
+    return preset;
+}
+
+ExportPreset MakeHqPreviewDensityExrExportPreset() {
+    auto preset = MakeMp4ExportPreset();
+    preset.name = std::string{kHqPreviewDensityExrPresetName};
+    preset.mode = AnimationExportMode::HqPreviewDensityExr;
+    preset.quality = AnimationExportQuality::Normal;
+    preset.useVideoToolbox = false;
+    preset.externalAlphaMatte = false;
     return preset;
 }
 
@@ -162,13 +220,16 @@ ExportPreset MakeProRes4444ExportPreset() {
     ExportPreset preset;
     preset.name = std::string{kProRes4444PresetName};
     preset.mode = AnimationExportMode::ProRes4444Mov;
+    preset.quality = AnimationExportQuality::Normal;
+    preset.useVideoToolbox = false;
+    preset.externalAlphaMatte = true;
     preset.settings.width = 3840;
     preset.settings.height = 2160;
     preset.settings.framesPerSecond = 30;
     preset.settings.supersampleScale = 2;
     preset.settings.spatialAntialiasing = true;
-    preset.settings.temporalSupersampling = true;
-    preset.settings.temporalSampleCount = 4;
+    preset.settings.temporalSupersampling = false;
+    preset.settings.temporalSampleCount = 1;
     preset.settings.motionBlur = false;
     preset.settings.motionBlurSampleCount = 4;
     preset.settings.motionBlurShutterAngleDegrees = 180.0F;
@@ -179,73 +240,159 @@ ExportPreset MakeProRes422ExportPreset() {
     auto preset = MakeProRes4444ExportPreset();
     preset.name = std::string{kProRes422PresetName};
     preset.mode = AnimationExportMode::ProRes422Mov;
+    preset.quality = AnimationExportQuality::Hq;
     return preset;
 }
 
 ExportPreset MakeProRes422HqExportPreset() {
     auto preset = MakeProRes422ExportPreset();
-    preset.name = std::string{kProRes422HqPresetName};
-    preset.mode = AnimationExportMode::ProRes422HqMov;
+    preset.quality = AnimationExportQuality::Hq;
+    return preset;
+}
+
+ExportPreset MakeProRes422AlphaMatteExportPreset() {
+    auto preset = MakeProRes422ExportPreset();
+    preset.quality = AnimationExportQuality::Normal;
+    preset.externalAlphaMatte = true;
+    return preset;
+}
+
+ExportPreset MakeProRes422HqAlphaMatteExportPreset() {
+    auto preset = MakeProRes422HqExportPreset();
+    preset.externalAlphaMatte = true;
     return preset;
 }
 
 ExportPreset MakeProRes422VideoToolboxExportPreset() {
     auto preset = MakeProRes422ExportPreset();
-    preset.name = std::string{kProRes422VideoToolboxPresetName};
-    preset.mode = AnimationExportMode::ProRes422VideoToolboxMov;
+    preset.quality = AnimationExportQuality::Normal;
+    preset.useVideoToolbox = true;
     return preset;
 }
 
 ExportPreset MakeProRes422HqVideoToolboxExportPreset() {
     auto preset = MakeProRes422HqExportPreset();
-    preset.name = std::string{kProRes422HqVideoToolboxPresetName};
-    preset.mode = AnimationExportMode::ProRes422HqVideoToolboxMov;
+    preset.useVideoToolbox = true;
     return preset;
 }
 
 ExportPreset MakeProRes4444XqExportPreset() {
     auto preset = MakeProRes4444ExportPreset();
-    preset.name = std::string{kProRes4444XqPresetName};
-    preset.mode = AnimationExportMode::ProRes4444XqMov;
+    preset.quality = AnimationExportQuality::Xq;
     return preset;
 }
 
 ExportPreset MakeProRes4444VideoToolboxExportPreset() {
     auto preset = MakeProRes4444ExportPreset();
-    preset.name = std::string{kProRes4444VideoToolboxPresetName};
-    preset.mode = AnimationExportMode::ProRes4444VideoToolboxMov;
+    preset.useVideoToolbox = true;
     return preset;
 }
 
 ExportPreset MakeProRes4444XqVideoToolboxExportPreset() {
     auto preset = MakeProRes4444ExportPreset();
-    preset.name = std::string{kProRes4444XqVideoToolboxPresetName};
-    preset.mode = AnimationExportMode::ProRes4444XqVideoToolboxMov;
+    preset.quality = AnimationExportQuality::Xq;
+    preset.useVideoToolbox = true;
+    return preset;
+}
+
+ExportPreset NormalizeExportPresetForCurrentSchema(ExportPreset preset) {
+    preset.name = CompactBuiltInExportPresetName(preset.name);
+
+    switch (preset.mode) {
+        case AnimationExportMode::HevcAlphaMp4:
+            preset.mode = AnimationExportMode::FastPreviewMp4;
+            preset.quality = AnimationExportQuality::Hq;
+            preset.useVideoToolbox = true;
+            preset.externalAlphaMatte = true;
+            break;
+        case AnimationExportMode::ProRes422HqMov:
+            preset.mode = AnimationExportMode::ProRes422Mov;
+            preset.quality = AnimationExportQuality::Hq;
+            break;
+        case AnimationExportMode::ProRes422AlphaMatteMov:
+            preset.mode = AnimationExportMode::ProRes422Mov;
+            preset.quality = AnimationExportQuality::Normal;
+            preset.externalAlphaMatte = true;
+            break;
+        case AnimationExportMode::ProRes422HqAlphaMatteMov:
+            preset.mode = AnimationExportMode::ProRes422Mov;
+            preset.quality = AnimationExportQuality::Hq;
+            preset.externalAlphaMatte = true;
+            break;
+        case AnimationExportMode::ProRes422VideoToolboxMov:
+            preset.mode = AnimationExportMode::ProRes422Mov;
+            preset.quality = AnimationExportQuality::Normal;
+            preset.useVideoToolbox = true;
+            break;
+        case AnimationExportMode::ProRes422HqVideoToolboxMov:
+            preset.mode = AnimationExportMode::ProRes422Mov;
+            preset.quality = AnimationExportQuality::Hq;
+            preset.useVideoToolbox = true;
+            break;
+        case AnimationExportMode::ProRes4444XqMov:
+            preset.mode = AnimationExportMode::ProRes4444Mov;
+            preset.quality = AnimationExportQuality::Xq;
+            break;
+        case AnimationExportMode::ProRes4444VideoToolboxMov:
+            preset.mode = AnimationExportMode::ProRes4444Mov;
+            preset.quality = AnimationExportQuality::Normal;
+            preset.useVideoToolbox = true;
+            break;
+        case AnimationExportMode::ProRes4444XqVideoToolboxMov:
+            preset.mode = AnimationExportMode::ProRes4444Mov;
+            preset.quality = AnimationExportQuality::Xq;
+            preset.useVideoToolbox = true;
+            break;
+        case AnimationExportMode::FastPreviewMp4:
+            break;
+        case AnimationExportMode::PngStack:
+        case AnimationExportMode::FastPngStack:
+        case AnimationExportMode::HqPreviewDensityExr:
+        case AnimationExportMode::ProRes422Mov:
+        case AnimationExportMode::ProRes4444Mov:
+            break;
+    }
+
+    if (preset.mode == AnimationExportMode::PngStack ||
+        preset.mode == AnimationExportMode::FastPngStack ||
+        preset.mode == AnimationExportMode::HqPreviewDensityExr) {
+        preset.externalAlphaMatte = false;
+        preset.useVideoToolbox = false;
+        preset.quality = AnimationExportQuality::Normal;
+    } else if (preset.mode == AnimationExportMode::FastPreviewMp4) {
+        if (preset.quality == AnimationExportQuality::Xq) {
+            preset.quality = AnimationExportQuality::Hq;
+        }
+    } else if (preset.mode == AnimationExportMode::ProRes422Mov) {
+        if (preset.quality == AnimationExportQuality::Xq) {
+            preset.quality = AnimationExportQuality::Hq;
+        }
+    }
     return preset;
 }
 
 std::vector<ExportPreset> BuiltInExportPresets() {
     return {
-        MakeFastPreviewMp4ExportPreset(),
-        MakeHevcAlphaMp4ExportPreset(),
+        MakeMp4ExportPreset(),
         MakePngStackExportPreset(),
+        MakeFastPngStackExportPreset(),
         MakeProRes422ExportPreset(),
-        MakeProRes422HqExportPreset(),
-        MakeProRes422VideoToolboxExportPreset(),
-        MakeProRes422HqVideoToolboxExportPreset(),
         MakeProRes4444ExportPreset(),
-        MakeProRes4444XqExportPreset(),
-        MakeProRes4444VideoToolboxExportPreset(),
-        MakeProRes4444XqVideoToolboxExportPreset()};
+        MakeHqPreviewDensityExrExportPreset()};
 }
 
 bool IsBuiltInExportPresetName(std::string_view name) {
     const auto normalized = NormalizeExportPresetName(name);
-    return normalized == kFastPreviewMp4PresetName ||
+    return normalized == kMp4PresetName ||
+           normalized == kFastPreviewMp4PresetName ||
            normalized == kHevcAlphaMp4PresetName ||
            normalized == kPngStackPresetName ||
+           normalized == kFastPngStackPresetName ||
+           normalized == kHqPreviewDensityExrPresetName ||
            normalized == kProRes422PresetName ||
            normalized == kProRes422HqPresetName ||
+           normalized == kProRes422AlphaMattePresetName ||
+           normalized == kProRes422HqAlphaMattePresetName ||
            normalized == kProRes422VideoToolboxPresetName ||
            normalized == kProRes422HqVideoToolboxPresetName ||
            normalized == kProRes4444PresetName ||

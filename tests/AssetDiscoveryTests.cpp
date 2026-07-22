@@ -2083,6 +2083,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     proRes422HqPreset.name = "Base ProRes 422 HQ";
     proRes422HqPreset.settings.outputDirectory = "Saved/renders/BaseHQ";
     document.exportPresets.push_back(proRes422HqPreset);
+    auto proRes422HqMattePreset = invisible_places::output::MakeProRes422HqAlphaMatteExportPreset();
+    proRes422HqMattePreset.name = "Matte ProRes 422 HQ";
+    proRes422HqMattePreset.settings.outputDirectory = "Saved/renders/MatteHQ";
+    proRes422HqMattePreset.settings.motionBlur = true;
+    proRes422HqMattePreset.settings.motionBlurSampleCount = 7;
+    document.exportPresets.push_back(proRes422HqMattePreset);
     auto hevcAlphaPreset = invisible_places::output::MakeHevcAlphaMp4ExportPreset();
     hevcAlphaPreset.name = "H265 Alpha Review";
     hevcAlphaPreset.settings.outputDirectory = "Saved/renders/Alpha";
@@ -2095,6 +2101,12 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pngStackPreset.settings.motionBlur = true;
     pngStackPreset.settings.motionBlurSampleCount = 5;
     document.exportPresets.push_back(pngStackPreset);
+    auto fastPngStackPreset = invisible_places::output::MakeFastPngStackExportPreset();
+    fastPngStackPreset.name = "Fast PNG Review";
+    fastPngStackPreset.settings.outputDirectory = "Saved/renders/FastPNG";
+    fastPngStackPreset.settings.temporalSupersampling = true;
+    fastPngStackPreset.settings.temporalSampleCount = 2;
+    document.exportPresets.push_back(fastPngStackPreset);
     document.selectedExportPresetName = proResPreset.name;
     auto editedExportPreset = invisible_places::output::MakeFastPreviewMp4ExportPreset();
     editedExportPreset.name =
@@ -2203,7 +2215,17 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     waterEmitter.pathProfileName = "Shelf Path";
     waterEmitter.laneProfileName = "Braided Custom";
     waterEmitter.trailProfileName = "Silver Trail";
+    waterEmitter.pathProfileLocked = true;
+    waterEmitter.trailProfileLocked = true;
     document.waterEmitters.push_back(waterEmitter);
+    invisible_places::water::WaterManualFlowPathSource manualFlowPath;
+    manualFlowPath.id = 18U;
+    manualFlowPath.name = "Pool edge";
+    manualFlowPath.controlPoints = {{0.0F, 0.0F, 1.0F}, {1.0F, 0.5F, 0.5F}};
+    manualFlowPath.laneProfileName = "Braided Custom";
+    manualFlowPath.trailProfileName = "Silver Trail";
+    manualFlowPath.laneProfileLocked = true;
+    document.waterManualFlowPaths.push_back(manualFlowPath);
     invisible_places::water::WaterPathCache projectPathCache;
     projectPathCache.supportLayerPath = "Data/Site2 -5mm.ply";
     projectPathCache.supportSignature = "Data/Site2 -5mm.ply|points=2048";
@@ -2468,6 +2490,9 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"path_profile\"") != std::string::npos);
         CHECK(savedJson.find("\"lane_profile\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"path_profile_locked\"") != std::string::npos);
+        CHECK(savedJson.find("\"lane_profile_locked\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_profile_locked\"") != std::string::npos);
         CHECK(savedJson.find("\"water_streak_aspect\"") != std::string::npos);
         CHECK(savedJson.find("\"water_point_visuals\"") != std::string::npos);
         CHECK(savedJson.find("\"selected_water_point_visual\"") != std::string::npos);
@@ -2509,10 +2534,20 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"export_presets\"") != std::string::npos);
         CHECK(savedJson.find("\"selected_export_preset\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_export_preset\"") != std::string::npos);
-        CHECK(savedJson.find("\"prores_422_videotoolbox_mov\"") != std::string::npos);
-        CHECK(savedJson.find("\"prores_422_hq_mov\"") != std::string::npos);
-        CHECK(savedJson.find("\"prores_4444_xq_videotoolbox_mov\"") != std::string::npos);
-        CHECK(savedJson.find("\"hevc_alpha_mp4\"") != std::string::npos);
+        CHECK(savedJson.find("\"mode\": \"prores_422_mov\"") != std::string::npos);
+        CHECK(savedJson.find("\"mode\": \"prores_4444_mov\"") != std::string::npos);
+        CHECK(savedJson.find("\"mode\": \"fast_preview_mp4\"") != std::string::npos);
+        CHECK(savedJson.find("\"quality\"") != std::string::npos);
+        CHECK(savedJson.find("\"normal\"") != std::string::npos);
+        CHECK(savedJson.find("\"hq\"") != std::string::npos);
+        CHECK(savedJson.find("\"xq\"") != std::string::npos);
+        CHECK(savedJson.find("\"use_video_toolbox\"") != std::string::npos);
+        CHECK(savedJson.find("\"external_alpha_matte\"") != std::string::npos);
+        CHECK(savedJson.find("\"prores_422_videotoolbox_mov\"") == std::string::npos);
+        CHECK(savedJson.find("\"prores_422_hq_mov\"") == std::string::npos);
+        CHECK(savedJson.find("\"prores_422_hq_alpha_matte_mov\"") == std::string::npos);
+        CHECK(savedJson.find("\"prores_4444_xq_videotoolbox_mov\"") == std::string::npos);
+        CHECK(savedJson.find("\"hevc_alpha_mp4\"") == std::string::npos);
         CHECK(savedJson.find("\"png_stack\"") != std::string::npos);
         CHECK(savedJson.find("\"supersample_scale\"") != std::string::npos);
         CHECK(savedJson.find("\"temporal_supersampling\"") != std::string::npos);
@@ -2577,11 +2612,16 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->renderJobSettings.motionBlur);
     CHECK(loadedDocument->renderJobSettings.motionBlurSampleCount == 6U);
     CHECK(loadedDocument->renderJobSettings.motionBlurShutterAngleDegrees == Catch::Approx(180.0F));
-    REQUIRE(loadedDocument->exportPresets.size() == 5U);
+    REQUIRE(loadedDocument->exportPresets.size() == 7U);
     CHECK(loadedDocument->exportPresets.front().name == "AE ProRes XQ VT");
     CHECK(
         loadedDocument->exportPresets.front().mode ==
-        invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov);
+        invisible_places::output::AnimationExportMode::ProRes4444Mov);
+    CHECK(
+        loadedDocument->exportPresets.front().quality ==
+        invisible_places::output::AnimationExportQuality::Xq);
+    CHECK(loadedDocument->exportPresets.front().useVideoToolbox);
+    CHECK(loadedDocument->exportPresets.front().externalAlphaMatte);
     CHECK(loadedDocument->exportPresets.front().settings.width == 3840U);
     CHECK(loadedDocument->exportPresets.front().settings.height == 2160U);
     CHECK(loadedDocument->exportPresets.front().settings.supersampleScale == 2U);
@@ -2591,32 +2631,74 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->exportPresets[1].name == "Base ProRes 422 VT");
     CHECK(
         loadedDocument->exportPresets[1].mode ==
-        invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov);
+        invisible_places::output::AnimationExportMode::ProRes422Mov);
+    CHECK(
+        loadedDocument->exportPresets[1].quality ==
+        invisible_places::output::AnimationExportQuality::Normal);
+    CHECK(loadedDocument->exportPresets[1].useVideoToolbox);
+    CHECK(loadedDocument->exportPresets[1].externalAlphaMatte);
     CHECK(loadedDocument->exportPresets[1].settings.outputDirectory == "Saved/renders/Base");
     CHECK(loadedDocument->exportPresets[2].name == "Base ProRes 422 HQ");
     CHECK(
         loadedDocument->exportPresets[2].mode ==
-        invisible_places::output::AnimationExportMode::ProRes422HqMov);
+        invisible_places::output::AnimationExportMode::ProRes422Mov);
+    CHECK(
+        loadedDocument->exportPresets[2].quality ==
+        invisible_places::output::AnimationExportQuality::Hq);
+    CHECK_FALSE(loadedDocument->exportPresets[2].useVideoToolbox);
+    CHECK(loadedDocument->exportPresets[2].externalAlphaMatte);
     CHECK(loadedDocument->exportPresets[2].settings.outputDirectory == "Saved/renders/BaseHQ");
-    CHECK(loadedDocument->exportPresets[3].name == "H265 Alpha Review");
+    CHECK(loadedDocument->exportPresets[3].name == "Matte ProRes 422 HQ");
     CHECK(
         loadedDocument->exportPresets[3].mode ==
-        invisible_places::output::AnimationExportMode::HevcAlphaMp4);
-    CHECK(loadedDocument->exportPresets[3].settings.outputDirectory == "Saved/renders/Alpha");
-    CHECK(loadedDocument->exportPresets[3].settings.temporalSupersampling);
-    CHECK(loadedDocument->exportPresets[3].settings.temporalSampleCount == 3U);
-    CHECK(loadedDocument->exportPresets[4].name == "Premiere PNG Stack");
+        invisible_places::output::AnimationExportMode::ProRes422Mov);
+    CHECK(
+        loadedDocument->exportPresets[3].quality ==
+        invisible_places::output::AnimationExportQuality::Hq);
+    CHECK_FALSE(loadedDocument->exportPresets[3].useVideoToolbox);
+    CHECK(loadedDocument->exportPresets[3].externalAlphaMatte);
+    CHECK(loadedDocument->exportPresets[3].settings.outputDirectory == "Saved/renders/MatteHQ");
+    CHECK(loadedDocument->exportPresets[3].settings.motionBlur);
+    CHECK(loadedDocument->exportPresets[3].settings.motionBlurSampleCount == 7U);
+    CHECK(loadedDocument->exportPresets[4].name == "H265 Alpha Review");
     CHECK(
         loadedDocument->exportPresets[4].mode ==
+        invisible_places::output::AnimationExportMode::FastPreviewMp4);
+    CHECK(
+        loadedDocument->exportPresets[4].quality ==
+        invisible_places::output::AnimationExportQuality::Hq);
+    CHECK(loadedDocument->exportPresets[4].useVideoToolbox);
+    CHECK(loadedDocument->exportPresets[4].externalAlphaMatte);
+    CHECK(loadedDocument->exportPresets[4].settings.outputDirectory == "Saved/renders/Alpha");
+    CHECK(loadedDocument->exportPresets[4].settings.temporalSupersampling);
+    CHECK(loadedDocument->exportPresets[4].settings.temporalSampleCount == 3U);
+    CHECK(loadedDocument->exportPresets[5].name == "Premiere PNG Stack");
+    CHECK(
+        loadedDocument->exportPresets[5].mode ==
         invisible_places::output::AnimationExportMode::PngStack);
-    CHECK(loadedDocument->exportPresets[4].settings.outputDirectory == "Saved/renders/PNG");
-    CHECK(loadedDocument->exportPresets[4].settings.motionBlur);
-    CHECK(loadedDocument->exportPresets[4].settings.motionBlurSampleCount == 5U);
+    CHECK(loadedDocument->exportPresets[5].settings.outputDirectory == "Saved/renders/PNG");
+    CHECK(loadedDocument->exportPresets[5].settings.motionBlur);
+    CHECK(loadedDocument->exportPresets[5].settings.motionBlurSampleCount == 5U);
+    CHECK(loadedDocument->exportPresets[6].name == "Fast PNG Review");
+    CHECK(
+        loadedDocument->exportPresets[6].mode ==
+        invisible_places::output::AnimationExportMode::FastPngStack);
+    CHECK(loadedDocument->exportPresets[6].settings.outputDirectory == "Saved/renders/FastPNG");
+    CHECK(loadedDocument->exportPresets[6].settings.temporalSupersampling);
+    CHECK(loadedDocument->exportPresets[6].settings.temporalSampleCount == 2U);
     CHECK(loadedDocument->selectedExportPresetName == "AE ProRes XQ VT");
     REQUIRE(loadedDocument->tempExportPreset.has_value());
     CHECK(
         loadedDocument->tempExportPreset->name ==
-        invisible_places::output::EditedExportPresetName(invisible_places::output::kFastPreviewMp4PresetName));
+        invisible_places::output::EditedExportPresetName(invisible_places::output::kMp4PresetName));
+    CHECK(
+        loadedDocument->tempExportPreset->mode ==
+        invisible_places::output::AnimationExportMode::FastPreviewMp4);
+    CHECK(
+        loadedDocument->tempExportPreset->quality ==
+        invisible_places::output::AnimationExportQuality::Normal);
+    CHECK(loadedDocument->tempExportPreset->useVideoToolbox);
+    CHECK(loadedDocument->tempExportPreset->externalAlphaMatte);
     CHECK(loadedDocument->tempExportPreset->settings.width == 1280U);
     CHECK(loadedDocument->waterSourceSettings.path.pathLength == Catch::Approx(4.25F));
     CHECK(loadedDocument->waterSourceSettings.path.attractorEnabled);
@@ -2713,6 +2795,13 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedDocument->waterEmitters[0].pathProfileName == "Shelf Path");
     CHECK(loadedDocument->waterEmitters[0].laneProfileName == "Braided Custom");
     CHECK(loadedDocument->waterEmitters[0].trailProfileName == "Silver Trail");
+    CHECK(loadedDocument->waterEmitters[0].pathProfileLocked);
+    CHECK_FALSE(loadedDocument->waterEmitters[0].laneProfileLocked);
+    CHECK(loadedDocument->waterEmitters[0].trailProfileLocked);
+    REQUIRE(loadedDocument->waterManualFlowPaths.size() == 1U);
+    CHECK(loadedDocument->waterManualFlowPaths[0].name == "Pool edge");
+    CHECK(loadedDocument->waterManualFlowPaths[0].laneProfileLocked);
+    CHECK_FALSE(loadedDocument->waterManualFlowPaths[0].trailProfileLocked);
     REQUIRE(loadedDocument->waterPathCache.has_value());
     CHECK(loadedDocument->waterPathCache->supportLayerPath == std::filesystem::path{"Data/Site2 -5mm.ply"});
     CHECK(loadedDocument->waterPathCache->supportSignature == "Data/Site2 -5mm.ply|points=2048");
@@ -4206,6 +4295,18 @@ TEST_CASE("Water Flow lane edits stay outside path bake inputs", "[water][flow][
     routeChanging.laneSpreadMeters *= 2.0F;
     CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
     CHECK_FALSE(invisible_places::water::WaterFlowLaneSpeedOnlyEdit(lanes, routeChanging));
+    routeChanging = lanes;
+    routeChanging.surfaceFollow *= 0.5F;
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
+    routeChanging = lanes;
+    routeChanging.downhillPull *= 0.5F;
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
+    routeChanging = lanes;
+    routeChanging.terrainWidthResponse *= 0.5F;
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
+    routeChanging = lanes;
+    routeChanging.turbulenceScaleMeters *= 2.0F;
+    CHECK_FALSE(invisible_places::water::WaterFlowLaneRouteInputsEqual(lanes, routeChanging));
     CHECK(invisible_places::water::WaterSourceBakeInputsEqual(source, source));
 
     invisible_places::water::WaterTrailGeometrySettings geometry;
@@ -4276,6 +4377,263 @@ TEST_CASE("Water Flow trail builds cancel cleanly without publishing partial sam
         &stopToken);
     CHECK(cancelledCloud.PointCount() == 0U);
     CHECK(cancelledCloud.scalarFields.empty());
+}
+
+TEST_CASE("GPU Flow output layout is deterministic and grows source-locally", "[water][flow][gpu]") {
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 12U;
+    settings.laneCount = 3U;
+    settings.trailLengthMeters = 0.20F;
+    settings.trailPointSpacingMeters = 0.010F;
+
+    const auto first = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        5U,
+        1.0F,
+        settings);
+    REQUIRE(first.Valid());
+    CHECK(first.inputPointCount == 5U);
+    CHECK(first.laneCount == 3U);
+    CHECK(first.routePointCountPerLane == 101U);
+    CHECK(first.routePointCountTotal == 303U);
+    CHECK(first.samplesPerTrail == 21U);
+    CHECK(first.trailPointCountTotal == 252U);
+    CHECK(first.pointCount == 555U);
+    CHECK(first.pointCapacity == 1024U);
+
+    const auto reused = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        5U,
+        1.0F,
+        settings,
+        2048U);
+    REQUIRE(reused.Valid());
+    CHECK(reused.pointCount == first.pointCount);
+    CHECK(reused.pointCapacity == 2048U);
+    CHECK(invisible_places::water::kWaterTrailScalarFieldCount == 31U);
+
+    const auto capped = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        5U,
+        1.0F,
+        settings,
+        0U,
+        500U);
+    CHECK_FALSE(capped.Valid());
+}
+
+TEST_CASE("GPU Flow manual spline input is compact and arc-length aware", "[water][flow][gpu]") {
+    const std::vector<invisible_places::io::Float3> controls = {
+        {0.0F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 0.0F},
+        {0.35F, 0.55F, 0.10F},
+        {0.80F, -0.30F, 0.65F},
+        {1.20F, 0.10F, 1.10F},
+    };
+    const auto compact =
+        invisible_places::water::BuildWaterFlowGpuManualSplineInput(controls);
+    const auto repeated =
+        invisible_places::water::BuildWaterFlowGpuManualSplineInput(controls);
+    REQUIRE(compact.Valid());
+    REQUIRE(compact.points.size() == 4U);
+    REQUIRE(repeated.points.size() == compact.points.size());
+    CHECK(sizeof(invisible_places::water::WaterFlowGpuCompactInputPoint) <= 64U);
+    CHECK(compact.routeLengthMeters == Catch::Approx(repeated.routeLengthMeters));
+
+    float controlChordLength = 0.0F;
+    for (std::size_t index = 0U; index + 1U < compact.points.size(); ++index) {
+        const auto& point = compact.points[index];
+        const auto& next = compact.points[index + 1U];
+        CHECK(point.cumulativeDistanceMeters < next.cumulativeDistanceMeters);
+        CHECK(point.outgoingSegmentArcDistancesMeters[0U] > 0.0F);
+        for (std::size_t checkpoint = 1U; checkpoint < 4U; ++checkpoint) {
+            CHECK(
+                point.outgoingSegmentArcDistancesMeters[checkpoint] >
+                point.outgoingSegmentArcDistancesMeters[checkpoint - 1U]);
+        }
+        CHECK(
+            next.cumulativeDistanceMeters ==
+            Catch::Approx(
+                point.cumulativeDistanceMeters +
+                point.outgoingSegmentArcDistancesMeters[3U]));
+        const float dx = next.position.x - point.position.x;
+        const float dy = next.position.y - point.position.y;
+        const float dz = next.position.z - point.position.z;
+        controlChordLength += std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    CHECK(compact.routeLengthMeters >= controlChordLength);
+    CHECK(
+        compact.points.back().cumulativeDistanceMeters ==
+        Catch::Approx(compact.routeLengthMeters));
+
+    const auto compactSource =
+        invisible_places::water::BuildWaterFlowGpuManualSplineSourceInput(
+            controls,
+            77U,
+            9U);
+    REQUIRE(compactSource.Valid());
+    REQUIRE(compactSource.branches.size() == 1U);
+    CHECK(compactSource.branches.front().branchId == 77U);
+    CHECK(compactSource.branches.front().pathId == 9U);
+    CHECK(compactSource.branches.front().inputStart == 0U);
+    CHECK(compactSource.branches.front().inputCount == compactSource.points.size());
+    CHECK(
+        compactSource.branches.front().routeLengthMeters ==
+        Catch::Approx(compact.routeLengthMeters));
+
+    invisible_places::water::WaterManualFlowPathSource source;
+    source.id = 901U;
+    source.controlPoints = controls;
+    const auto reference =
+        invisible_places::water::BuildManualFlowPathAnchors(source, 0.002F);
+    REQUIRE_FALSE(reference.points.empty());
+    CHECK(
+        compact.routeLengthMeters ==
+        Catch::Approx(reference.points.back().pathDistance).epsilon(0.01F));
+}
+
+TEST_CASE(
+    "GPU Flow compact source keeps branch identities and exact disjoint output ranges",
+    "[water][flow][gpu]") {
+    invisible_places::water::WaterOverlay anchors;
+    const auto addBranch = [&](std::uint32_t branchId, float y, std::uint32_t pointCount) {
+        for (std::uint32_t index = 0U; index < pointCount; ++index) {
+            invisible_places::water::WaterOverlayPoint point;
+            point.position = {static_cast<float>(index) * 0.050F, y, 0.0F};
+            point.normal = {0.0F, 0.0F, 1.0F};
+            point.flowId = static_cast<float>(branchId);
+            point.emitterId = 12.0F;
+            point.pathDistance = static_cast<float>(index) * 0.050F;
+            point.speed = 1.0F;
+            point.width = 0.030F;
+            point.confidence = 1.0F;
+            point.accumulation = 0.75F;
+            anchors.points.push_back(point);
+        }
+    };
+    addBranch(301U, 0.0F, 28U);
+    addBranch(302U, 0.25F, 9U);
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 5U;
+    settings.laneCount = 4U;
+    settings.laneSpreadMeters = 0.030F;
+    settings.laneCrossing = 0.45F;
+    settings.turbulence = 0.0F;
+    settings.speedMetersPerSecond = 0.22F;
+    settings.surfaceOffsetMeters = 0.004F;
+    settings.seed = 71U;
+    settings.trailLengthMeters = 0.18F;
+    settings.trailPointSpacingMeters = 0.006F;
+    settings.trailWidthMeters = 0.006F;
+    settings.trailStreakLengthMeters = 0.030F;
+
+    const auto compact = invisible_places::water::BuildWaterFlowGpuSampledSourceInput(
+        anchors.points,
+        settings);
+    REQUIRE(compact.Valid());
+    REQUIRE(compact.branches.size() == 2U);
+    CHECK(compact.points.size() == 37U);
+    CHECK(compact.branches[0U].inputStart == 0U);
+    CHECK(compact.branches[0U].inputCount == 28U);
+    CHECK(compact.branches[0U].branchId == 301U);
+    CHECK(compact.branches[0U].pathId == 1U);
+    CHECK(compact.branches[1U].inputStart == 28U);
+    CHECK(compact.branches[1U].inputCount == 9U);
+    CHECK(compact.branches[1U].branchId == 302U);
+    CHECK(compact.branches[1U].pathId == 2U);
+
+    const auto layout = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        compact,
+        settings);
+    const auto repeated = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        compact,
+        settings);
+    REQUIRE(layout.Valid());
+    REQUIRE(repeated.Valid());
+    REQUIRE(layout.branches.size() == 2U);
+    CHECK(layout.branchCount == 2U);
+    CHECK(layout.trailCount == settings.trailCountTotal);
+    CHECK(layout.branches[0U].trailCount == 3U);
+    CHECK(layout.branches[1U].trailCount == 2U);
+    CHECK(layout.branches[0U].firstTrailId == 1U);
+    CHECK(layout.branches[1U].firstTrailId == 4U);
+    CHECK(layout.branches[0U].activeRouteLaneCount == 3U);
+    CHECK(layout.branches[1U].activeRouteLaneCount == 2U);
+    CHECK(layout.maxActiveRouteLaneCount == 3U);
+    CHECK(layout.maxTrailsPerBranch == 3U);
+
+    std::uint32_t expectedRouteStart = 0U;
+    std::uint32_t expectedTrailStart = layout.routePointCountTotal;
+    for (std::size_t index = 0U; index < layout.branches.size(); ++index) {
+        const auto& branch = layout.branches[index];
+        const auto& repeatedBranch = repeated.branches[index];
+        CHECK(branch.routeStart == expectedRouteStart);
+        CHECK(branch.trailOutputStart == expectedTrailStart);
+        CHECK(branch.inputStart == compact.branches[index].inputStart);
+        CHECK(branch.inputCount == compact.branches[index].inputCount);
+        CHECK(branch.branchId == compact.branches[index].branchId);
+        CHECK(branch.pathId == compact.branches[index].pathId);
+        CHECK(branch.firstTrailId == repeatedBranch.firstTrailId);
+        CHECK(branch.trailCount == repeatedBranch.trailCount);
+        CHECK(branch.routeStart == repeatedBranch.routeStart);
+        CHECK(branch.trailOutputStart == repeatedBranch.trailOutputStart);
+        expectedRouteStart += branch.routePointsPerLane * branch.activeRouteLaneCount;
+        expectedTrailStart += branch.trailCount * layout.samplesPerTrail;
+    }
+    CHECK(expectedRouteStart == layout.routePointCountTotal);
+    CHECK(expectedTrailStart == layout.pointCount);
+
+    const auto cpuOverlay = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+        anchors,
+        settings);
+    std::unordered_map<std::uint32_t, std::set<std::uint32_t>> cpuTrailIdsByBranch;
+    for (const auto& sample : cpuOverlay.samples) {
+        if (sample.trailRole < 0.5F) {
+            continue;
+        }
+        cpuTrailIdsByBranch[static_cast<std::uint32_t>(std::floor(sample.branchId + 0.5F))]
+            .insert(static_cast<std::uint32_t>(std::floor(sample.trailId + 0.5F)));
+    }
+    REQUIRE(cpuTrailIdsByBranch.contains(301U));
+    REQUIRE(cpuTrailIdsByBranch.contains(302U));
+    CHECK(cpuTrailIdsByBranch.at(301U).size() == layout.branches[0U].trailCount);
+    CHECK(cpuTrailIdsByBranch.at(302U).size() == layout.branches[1U].trailCount);
+
+    settings.trailCountTotal = 1U;
+    const auto oneTrailCompact =
+        invisible_places::water::BuildWaterFlowGpuSampledSourceInput(
+            anchors.points,
+            settings);
+    const auto oneTrailLayout = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        oneTrailCompact,
+        settings);
+    REQUIRE(oneTrailLayout.Valid());
+    REQUIRE(oneTrailLayout.branches.size() == 2U);
+    CHECK(oneTrailLayout.branches[0U].trailCount == 1U);
+    CHECK(oneTrailLayout.branches[0U].firstTrailId == 1U);
+    CHECK(oneTrailLayout.branches[1U].trailCount == 0U);
+    CHECK(oneTrailLayout.branches[1U].firstTrailId == 2U);
+    CHECK(oneTrailLayout.branches[1U].activeRouteLaneCount == 0U);
+    CHECK(
+        oneTrailLayout.branches[1U].routeStart ==
+        oneTrailLayout.routePointCountTotal);
+    CHECK(oneTrailLayout.branches[1U].trailOutputStart == oneTrailLayout.pointCount);
+
+    settings.trailCountTotal = 2U;
+    settings.laneCount = 128U;
+    const auto wideLaneCompact =
+        invisible_places::water::BuildWaterFlowGpuSampledSourceInput(
+            anchors.points,
+            settings);
+    const auto wideLaneLayout = invisible_places::water::BuildWaterFlowGpuOutputLayout(
+        wideLaneCompact,
+        settings);
+    REQUIRE(wideLaneLayout.Valid());
+    CHECK(wideLaneLayout.laneCount == 128U);
+    REQUIRE(wideLaneLayout.branches.size() == 2U);
+    for (const auto& branch : wideLaneLayout.branches) {
+        CHECK(branch.potentialLaneCount == 128U);
+        CHECK(branch.trailCount == 1U);
+        CHECK(branch.activeRouteLaneCount == 1U);
+    }
 }
 
 TEST_CASE("Manual Flow splines produce deterministic lane-ready anchors and trails", "[water][flow][manual-path]") {
@@ -4405,6 +4763,211 @@ TEST_CASE("Manual Flow splines produce deterministic lane-ready anchors and trai
     CHECK(minimumLaneOffset < -settings.laneSpreadMeters * 0.25F);
     CHECK(maximumLaneOffset > settings.laneSpreadMeters * 0.25F);
     CHECK(checkedStartDirection);
+}
+
+TEST_CASE("Manual Flow turbulence is arc-distance stable and independent of sprite width",
+          "[water][flow][manual-path][turbulence]") {
+    invisible_places::water::WaterManualFlowPathSource source;
+    source.id = 518U;
+    source.controlPoints = {
+        {0.0F, 0.0F, 0.0F},
+        {0.5F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+    };
+    const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, 0.01F);
+    REQUIRE_FALSE(anchors.points.empty());
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 1U;
+    settings.laneCount = 1U;
+    settings.trailLengthMeters = 1.0F;
+    settings.trailPointSpacingMeters = 0.01F;
+    settings.trailWidthMeters = 0.001F;
+    settings.trailStreakLengthMeters = 0.02F;
+    settings.surfaceOffsetMeters = 0.0F;
+    settings.laneSpreadMeters = 0.20F;
+    settings.laneCrossing = 0.0F;
+    settings.trailSmoothness = 0.0F;
+    settings.trailLooseness = 0.0F;
+    settings.turbulence = 0.80F;
+    settings.turbulenceScaleMeters = 0.18F;
+    settings.seed = 73U;
+
+    const auto visibleSamples = [](const auto& overlay) {
+        std::vector<invisible_places::water::WaterTrailSample> samples;
+        for (const auto& sample : overlay.samples) {
+            if (sample.trailRole >= 0.5F) {
+                samples.push_back(sample);
+            }
+        }
+        return samples;
+    };
+
+    const auto fine = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
+    const auto repeat = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
+    const auto fineSamples = visibleSamples(fine);
+    const auto repeatSamples = visibleSamples(repeat);
+    REQUIRE(fineSamples.size() == 101U);
+    REQUIRE(repeatSamples.size() == fineSamples.size());
+    float maximumWobble = 0.0F;
+    for (std::size_t index = 0U; index < fineSamples.size(); ++index) {
+        CHECK(fineSamples[index].position.x == Catch::Approx(repeatSamples[index].position.x));
+        CHECK(fineSamples[index].position.y == Catch::Approx(repeatSamples[index].position.y));
+        CHECK(fineSamples[index].trailLateralOffset ==
+              Catch::Approx(repeatSamples[index].trailLateralOffset));
+        maximumWobble = std::max(maximumWobble, std::abs(fineSamples[index].trailLateralOffset));
+    }
+    CHECK(maximumWobble > 0.001F);
+    CHECK(fineSamples.front().trailLateralOffset == Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(fineSamples.back().trailLateralOffset == Catch::Approx(0.0F).margin(1.0e-6F));
+
+    auto coarseSettings = settings;
+    coarseSettings.trailPointSpacingMeters = 0.02F;
+    const auto coarseSamples = visibleSamples(
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, coarseSettings));
+    REQUIRE(coarseSamples.size() == 51U);
+    for (std::size_t index = 0U; index < coarseSamples.size(); ++index) {
+        CAPTURE(index);
+        CHECK(coarseSamples[index].trailLateralOffset ==
+              Catch::Approx(fineSamples[index * 2U].trailLateralOffset).margin(2.0e-5F));
+    }
+
+    auto wideSpriteSettings = settings;
+    wideSpriteSettings.trailWidthMeters = 0.020F;
+    const auto wideSpriteSamples = visibleSamples(
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, wideSpriteSettings));
+    REQUIRE(wideSpriteSamples.size() == fineSamples.size());
+    for (std::size_t index = 0U; index < fineSamples.size(); ++index) {
+        CHECK(wideSpriteSamples[index].trailLateralOffset ==
+              Catch::Approx(fineSamples[index].trailLateralOffset).margin(1.0e-6F));
+    }
+}
+
+TEST_CASE("Flow surface offset remains signed for routes and trails",
+          "[water][flow][surface-offset]") {
+    invisible_places::water::WaterManualFlowPathSource source;
+    source.id = 520U;
+    source.controlPoints = {
+        {0.0F, 0.0F, 0.0F},
+        {0.5F, 0.0F, 0.0F},
+    };
+    const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, 0.02F);
+    REQUIRE(anchors.points.size() >= 2U);
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 1U;
+    settings.laneCount = 1U;
+    settings.trailLengthMeters = 0.25F;
+    settings.trailPointSpacingMeters = 0.02F;
+    settings.laneSpreadMeters = 0.0F;
+    settings.turbulence = 0.0F;
+    settings.surfaceOffsetMeters = -0.025F;
+
+    const auto overlay =
+        invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(anchors, settings);
+    REQUIRE_FALSE(overlay.samples.empty());
+    for (const auto& sample : overlay.samples) {
+        CHECK(sample.position.z == Catch::Approx(-0.025F).margin(1.0e-5F));
+    }
+}
+
+TEST_CASE("Manual Flow CPU routes use the shared surface cache with bounded fallback",
+          "[water][flow][manual-path][surface-guide]") {
+    using invisible_places::water::RainCollisionRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> surfaceSamples;
+    for (std::uint32_t station = 0U; station <= 25U; ++station) {
+        const float x = static_cast<float>(station) * 0.02F;
+        for (std::uint32_t duplicate = 0U; duplicate < 8U; ++duplicate) {
+            surfaceSamples.push_back({
+                .position = {x, 0.0F, 0.0F},
+                .normal = {0.0F, 0.0F, 1.0F},
+                .role = RainCollisionRole::Rock,
+                .roughness = 1.0F,
+                .hasRoughness = true,
+            });
+        }
+    }
+    const auto surfaceCache = invisible_places::water::BuildWaterSurfaceCacheFromSamples(
+        surfaceSamples,
+        0.02F);
+    REQUIRE_FALSE(surfaceCache.flowSurfaceSurfels.empty());
+
+    invisible_places::water::WaterManualFlowPathSource source;
+    source.id = 519U;
+    source.controlPoints = {
+        {0.0F, 0.0F, 0.04F},
+        {0.5F, 0.0F, 0.04F},
+        {1.0F, 0.0F, 0.04F},
+    };
+    const auto anchors = invisible_places::water::BuildManualFlowPathAnchors(source, 0.02F);
+
+    invisible_places::water::WaterFlowTrailSettings settings;
+    settings.trailCountTotal = 1U;
+    settings.laneCount = 1U;
+    settings.trailLengthMeters = 1.0F;
+    settings.trailPointSpacingMeters = 0.02F;
+    settings.trailWidthMeters = 0.004F;
+    settings.trailStreakLengthMeters = 0.02F;
+    settings.surfaceOffsetMeters = 0.0F;
+    settings.laneSpreadMeters = 0.12F;
+    settings.turbulence = 0.0F;
+    settings.surfaceFollow = 1.0F;
+    settings.downhillPull = 0.0F;
+    settings.terrainWidthResponse = 1.0F;
+
+    const auto guided = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+        anchors,
+        settings,
+        nullptr,
+        invisible_places::water::WaterFlowTrailBuildOptions{
+            .surfaceCache = &surfaceCache,
+            .useSurfaceGuide = true,
+        });
+    std::vector<invisible_places::water::WaterTrailSample> route;
+    for (const auto& sample : guided.samples) {
+        if (sample.trailRole < 0.5F) {
+            route.push_back(sample);
+        }
+    }
+    REQUIRE(route.size() > 40U);
+    CHECK(route.front().position.z == Catch::Approx(0.04F).margin(1.0e-5F));
+    CHECK(route.back().position.z == Catch::Approx(0.04F).margin(1.0e-5F));
+
+    float supportedMinimumZ = std::numeric_limits<float>::max();
+    float supportedMinimumSpan = settings.laneSpreadMeters;
+    bool checkedUnsupportedFallback = false;
+    for (const auto& sample : route) {
+        if (sample.position.x > 0.15F && sample.position.x < 0.40F) {
+            supportedMinimumZ = std::min(supportedMinimumZ, sample.position.z);
+            supportedMinimumSpan = std::min(supportedMinimumSpan, sample.trailLaneSpan);
+        }
+        if (sample.position.x > 0.75F && sample.position.x < 0.90F) {
+            CHECK(sample.position.z == Catch::Approx(0.04F).margin(1.0e-4F));
+            checkedUnsupportedFallback = true;
+        }
+        CHECK(sample.position.x >= -1.0e-5F);
+        CHECK(sample.position.x <= 1.0F + 1.0e-5F);
+        CHECK(sample.normal.z > 0.0F);
+    }
+    CHECK(supportedMinimumZ < 0.02F);
+    CHECK(supportedMinimumSpan < settings.laneSpreadMeters);
+    CHECK(checkedUnsupportedFallback);
+
+    const auto unguided = invisible_places::water::BuildFlowTrailOverlayFromPathAnchors(
+        anchors,
+        settings,
+        nullptr,
+        invisible_places::water::WaterFlowTrailBuildOptions{
+            .surfaceCache = &surfaceCache,
+            .useSurfaceGuide = false,
+        });
+    for (const auto& sample : unguided.samples) {
+        if (sample.trailRole < 0.5F) {
+            CHECK(sample.position.z == Catch::Approx(0.04F).margin(1.0e-5F));
+        }
+    }
 }
 
 TEST_CASE("Manual Flow path gizmo math constrains axes and planes and preserves insertion order",
@@ -9376,7 +9939,18 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     emitter.pathProfileName = "Source Path";
     emitter.laneProfileName = "Sheet Lanes";
     emitter.trailProfileName = "Mist Trail";
+    emitter.pathProfileLocked = true;
+    emitter.trailProfileLocked = true;
     document.emitters.push_back(emitter);
+
+    invisible_places::water::WaterManualFlowPathSource manualFlowPath;
+    manualFlowPath.id = 45U;
+    manualFlowPath.name = "Authored channel";
+    manualFlowPath.controlPoints = {{1.0F, 2.0F, 3.0F}, {2.0F, 2.5F, 2.0F}};
+    manualFlowPath.laneProfileName = "Sheet Lanes";
+    manualFlowPath.trailProfileName = "Mist Trail";
+    manualFlowPath.laneProfileLocked = true;
+    document.manualFlowPaths.push_back(manualFlowPath);
 
     invisible_places::water::WaterEmitter linkedEmitter;
     linkedEmitter.id = 43;
@@ -9506,6 +10080,9 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         CHECK(savedJson.find("\"path_profile\"") != std::string::npos);
         CHECK(savedJson.find("\"lane_profile\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_profile\"") != std::string::npos);
+        CHECK(savedJson.find("\"path_profile_locked\"") != std::string::npos);
+        CHECK(savedJson.find("\"lane_profile_locked\"") != std::string::npos);
+        CHECK(savedJson.find("\"trail_profile_locked\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_lane_count\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_smoothness\"") != std::string::npos);
         CHECK(savedJson.find("\"trail_turbulence\"") != std::string::npos);
@@ -9588,6 +10165,13 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->emitters[0].pathProfileName == "Source Path");
     CHECK(loaded->emitters[0].laneProfileName == "Sheet Lanes");
     CHECK(loaded->emitters[0].trailProfileName == "Mist Trail");
+    CHECK(loaded->emitters[0].pathProfileLocked);
+    CHECK_FALSE(loaded->emitters[0].laneProfileLocked);
+    CHECK(loaded->emitters[0].trailProfileLocked);
+    REQUIRE(loaded->manualFlowPaths.size() == 1U);
+    CHECK(loaded->manualFlowPaths[0].name == "Authored channel");
+    CHECK(loaded->manualFlowPaths[0].laneProfileLocked);
+    CHECK_FALSE(loaded->manualFlowPaths[0].trailProfileLocked);
     REQUIRE(loaded->emitters[0].parentId.has_value());
     CHECK(loaded->emitters[0].parentId.value() == 7U);
     REQUIRE(loaded->emitters[0].sourceSettings.has_value());
@@ -9643,7 +10227,14 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
   "water_dynamic_mesh_flow_settings": {
     "enabled": true,
     "mesh_path": "Data/LegacyScene/Legacy-MESH.ply"
-  }
+  },
+  "water_emitters": [{"id": 91, "path_profile": "Default"}],
+  "water_manual_flow_paths": [{
+    "id": 92,
+    "control_points": [[0, 0, 0], [1, 0, 0]],
+    "lane_profile": "Default",
+    "trail_profile": "Default"
+  }]
 })";
     }
     const auto legacySources =
@@ -9651,6 +10242,13 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     REQUIRE(legacySources.has_value());
     CHECK(legacySources->dynamicMeshFlowSettings.meshPath.generic_string() ==
           "Data/LegacyScene/Legacy-MESH.ply");
+    REQUIRE(legacySources->emitters.size() == 1U);
+    CHECK_FALSE(legacySources->emitters[0].pathProfileLocked);
+    CHECK_FALSE(legacySources->emitters[0].laneProfileLocked);
+    CHECK_FALSE(legacySources->emitters[0].trailProfileLocked);
+    REQUIRE(legacySources->manualFlowPaths.size() == 1U);
+    CHECK_FALSE(legacySources->manualFlowPaths[0].laneProfileLocked);
+    CHECK_FALSE(legacySources->manualFlowPaths[0].trailProfileLocked);
     CHECK(loaded->causticLookSettings.enabled);
     CHECK(loaded->causticLookSettings.intensity == Catch::Approx(1.4F));
     CHECK(loaded->causticLookSettings.opacityBoost == Catch::Approx(0.22F));
@@ -10829,7 +11427,7 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedAnimation},
             std::istreambuf_iterator<char>{}};
-    CHECK(savedJson.find("\"schema_version\": 8") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 10") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"still_camera_duration_seconds\"") != std::string::npos);
         CHECK(savedJson.find("\"linked_camera_id\": \"camera_entry\"") != std::string::npos);
@@ -11362,7 +11960,7 @@ TEST_CASE("Point-cloud EXR readback masks keep AOV channels independent", "[rend
     CHECK(HasPointCloudExrReadback(defaultRequest.readbackMask, PointCloudExrReadbackMask::Albedo));
 }
 
-TEST_CASE("Built-in export presets include alpha MP4 PNG Stack and opaque ProRes 422 modes", "[output][video]") {
+TEST_CASE("Built-in export presets use compact codec settings with legacy aliases", "[output][video]") {
     const auto presets = invisible_places::output::BuiltInExportPresets();
     const auto findPreset = [&presets](std::string_view name) {
         return std::find_if(presets.begin(), presets.end(), [&](const auto& preset) {
@@ -11375,54 +11973,80 @@ TEST_CASE("Built-in export presets include alpha MP4 PNG Stack and opaque ProRes
         });
     };
 
+    REQUIRE(presets.size() == 6U);
     CHECK(containsPreset(
-        invisible_places::output::kHevcAlphaMp4PresetName,
-        invisible_places::output::AnimationExportMode::HevcAlphaMp4));
+        invisible_places::output::kMp4PresetName,
+        invisible_places::output::AnimationExportMode::FastPreviewMp4));
     CHECK(containsPreset(
         invisible_places::output::kPngStackPresetName,
         invisible_places::output::AnimationExportMode::PngStack));
     CHECK(containsPreset(
+        invisible_places::output::kFastPngStackPresetName,
+        invisible_places::output::AnimationExportMode::FastPngStack));
+    CHECK(containsPreset(
         invisible_places::output::kProRes422PresetName,
         invisible_places::output::AnimationExportMode::ProRes422Mov));
     CHECK(containsPreset(
-        invisible_places::output::kProRes422HqPresetName,
-        invisible_places::output::AnimationExportMode::ProRes422HqMov));
+        invisible_places::output::kProRes4444PresetName,
+        invisible_places::output::AnimationExportMode::ProRes4444Mov));
     CHECK(containsPreset(
-        invisible_places::output::kProRes422VideoToolboxPresetName,
-        invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov));
-    CHECK(containsPreset(
-        invisible_places::output::kProRes422HqVideoToolboxPresetName,
-        invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov));
+        invisible_places::output::kHqPreviewDensityExrPresetName,
+        invisible_places::output::AnimationExportMode::HqPreviewDensityExr));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kMp4PresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kHevcAlphaMp4PresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kPngStackPresetName));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kFastPngStackPresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kProRes422PresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kProRes422HqPresetName));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(
+        invisible_places::output::kProRes422AlphaMattePresetName));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(
+        invisible_places::output::kProRes422HqAlphaMattePresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(
         invisible_places::output::kProRes422VideoToolboxPresetName));
     CHECK(invisible_places::output::IsBuiltInExportPresetName(
         invisible_places::output::kProRes422HqVideoToolboxPresetName));
-    const auto hevcAlpha = findPreset(invisible_places::output::kHevcAlphaMp4PresetName);
-    REQUIRE(hevcAlpha != presets.end());
-    CHECK(hevcAlpha->settings.width == 3840U);
-    CHECK(hevcAlpha->settings.height == 2160U);
-    CHECK(hevcAlpha->settings.supersampleScale == 2U);
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(invisible_places::output::kProRes4444XqPresetName));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(
+        invisible_places::output::kProRes4444VideoToolboxPresetName));
+    CHECK(invisible_places::output::IsBuiltInExportPresetName(
+        invisible_places::output::kProRes4444XqVideoToolboxPresetName));
+    const auto mp4 = findPreset(invisible_places::output::kMp4PresetName);
+    REQUIRE(mp4 != presets.end());
+    CHECK(mp4->settings.width == 3840U);
+    CHECK(mp4->settings.height == 2160U);
+    CHECK(mp4->settings.supersampleScale == 2U);
+    CHECK(mp4->quality == invisible_places::output::AnimationExportQuality::Normal);
+    CHECK(mp4->useVideoToolbox);
+    CHECK(mp4->externalAlphaMatte);
     const auto pngStack = findPreset(invisible_places::output::kPngStackPresetName);
     REQUIRE(pngStack != presets.end());
     CHECK(pngStack->settings.width == 3840U);
     CHECK(pngStack->settings.height == 2160U);
     CHECK(pngStack->settings.supersampleScale == 2U);
+    CHECK_FALSE(pngStack->externalAlphaMatte);
+    const auto fastPngStack = findPreset(invisible_places::output::kFastPngStackPresetName);
+    REQUIRE(fastPngStack != presets.end());
+    CHECK(fastPngStack->settings.width == 3840U);
+    CHECK(fastPngStack->settings.height == 2160U);
+    CHECK(fastPngStack->settings.supersampleScale == 2U);
     const auto proRes422 = findPreset(invisible_places::output::kProRes422PresetName);
     REQUIRE(proRes422 != presets.end());
     CHECK(proRes422->settings.width == 3840U);
     CHECK(proRes422->settings.height == 2160U);
-    const auto proRes422Hq = findPreset(invisible_places::output::kProRes422HqPresetName);
-    REQUIRE(proRes422Hq != presets.end());
-    CHECK(proRes422Hq->settings.width == 3840U);
-    CHECK(proRes422Hq->settings.height == 2160U);
+    CHECK(proRes422->quality == invisible_places::output::AnimationExportQuality::Hq);
+    CHECK(proRes422->externalAlphaMatte);
+    const auto proRes4444 = findPreset(invisible_places::output::kProRes4444PresetName);
+    REQUIRE(proRes4444 != presets.end());
+    CHECK(proRes4444->settings.width == 3840U);
+    CHECK(proRes4444->settings.height == 2160U);
+    CHECK(proRes4444->quality == invisible_places::output::AnimationExportQuality::Normal);
+    CHECK(proRes4444->externalAlphaMatte);
 }
 
 TEST_CASE("Quick MP4 output paths include mode settings visual names and collision suffixes", "[output][video]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_quick_mp4_names";
+    std::filesystem::remove_all(outputDirectory);
     std::filesystem::create_directories(outputDirectory);
     invisible_places::output::RenderJobSettings settings;
     settings.width = 3840;
@@ -11434,7 +12058,7 @@ TEST_CASE("Quick MP4 output paths include mode settings visual names and collisi
     settings.motionBlur = true;
     settings.motionBlurSampleCount = 3;
     settings.motionBlurShutterAngleDegrees = 90.0F;
-    const auto stem = std::string{"Site_1_fast_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty"};
+    const auto stem = std::string{"Site_1_MP4_Normal_VT_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty"};
     const auto firstPath = outputDirectory / (stem + ".mp4");
     const auto secondPath = outputDirectory / (stem + "_1.mp4");
     const auto reservedPath = outputDirectory / (stem + "_2.mp4");
@@ -11456,10 +12080,7 @@ TEST_CASE("Quick MP4 output paths include mode settings visual names and collisi
         {reservedPath});
     CHECK(uniquePath == outputDirectory / (stem + "_3.mp4"));
 
-    std::filesystem::remove(firstPath);
-    std::filesystem::remove(secondPath);
-    std::filesystem::remove(outputDirectory / (stem + "_3.mp4"));
-    std::filesystem::remove(outputDirectory);
+    std::filesystem::remove_all(outputDirectory);
 }
 
 TEST_CASE("PNG Stack output directories include mode settings visual names and collision suffixes", "[output][png]") {
@@ -11494,11 +12115,44 @@ TEST_CASE("PNG Stack output directories include mode settings visual names and c
     CHECK(
         invisible_places::output::PngStackFramePath(uniqueDirectory, "Site 1", 41) ==
         uniqueDirectory / "Site_1_0042.png");
+    const auto fastStem = std::string{"Site_1_FastPNG_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty"};
+    const auto fastDirectory = invisible_places::output::BuildUniquePngStackOutputDirectory(
+        outputDirectory,
+        "Site 1",
+        settings,
+        "Painty",
+        {},
+        invisible_places::output::AnimationExportMode::FastPngStack);
+    CHECK(fastDirectory == outputDirectory / fastStem);
+    CHECK(
+        invisible_places::output::PngStackFramePattern(fastDirectory, "Site 1") ==
+        fastDirectory / "Site_1_%04d.png");
+
+    const auto outputPattern = invisible_places::output::PngStackFramePattern(fastDirectory, "Site 1");
+    const auto command = invisible_places::output::BuildFfmpegPngStackCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        24,
+        outputPattern);
+    CHECK(command.find("'/opt/homebrew/bin/ffmpeg'") != std::string::npos);
+    CHECK(command.find("-f rawvideo") != std::string::npos);
+    CHECK(command.find("-pix_fmt rgba") != std::string::npos);
+    CHECK(command.find("-s:v 3840x2160") != std::string::npos);
+    CHECK(command.find("-r 24") != std::string::npos);
+    CHECK(command.find("-i -") != std::string::npos);
+    CHECK(command.find("-threads 0") != std::string::npos);
+    CHECK(command.find("-c:v png") != std::string::npos);
+    CHECK(command.find("-pred mixed") != std::string::npos);
+    CHECK(command.find("-compression_level 3") != std::string::npos);
+    CHECK(command.find("-start_number 1") != std::string::npos);
+    CHECK(command.find("-f image2") != std::string::npos);
+    CHECK(command.find("'" + outputPattern.string() + "'") != std::string::npos);
 
     std::filesystem::remove_all(outputDirectory);
 }
 
-TEST_CASE("H.265 alpha MP4 output paths and ffmpeg command preserve alpha", "[output][video]") {
+TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[output][video]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_hevc_alpha_names";
     invisible_places::output::RenderJobSettings settings;
     settings.width = 3840;
@@ -11518,34 +12172,88 @@ TEST_CASE("H.265 alpha MP4 output paths and ffmpeg command preserve alpha", "[ou
         "Painty");
     CHECK(
         path ==
-        outputDirectory / "Site_1_HEVCAlpha_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty.mp4");
+        outputDirectory / "Site_1_MP4_HQ_VT_Alpha_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty_color.mp4");
+    const auto outputPaths = invisible_places::output::BuildUniqueHevcAlphaMp4OutputPaths(
+        outputDirectory,
+        "Site 1",
+        settings,
+        "Painty");
+    CHECK(outputPaths.colorPath == path);
+    CHECK(
+        outputPaths.alphaMattePath ==
+        outputDirectory / "Site_1_MP4_HQ_VT_Alpha_3840x2160_24fps_SS2x_AA_TS4_MB3_90deg_Painty_alpha.mp4");
 
-    const auto command = invisible_places::output::BuildFfmpegHevcAlphaMp4Command(
+    const auto colorCommand = invisible_places::output::BuildFfmpegHevcColorMp4Command(
         "/opt/homebrew/bin/ffmpeg",
         3840,
         2160,
         24,
-        "/tmp/Invisible Places/final alpha.mp4");
-    CHECK(command.find("'/opt/homebrew/bin/ffmpeg'") != std::string::npos);
-    CHECK(command.find("-f rawvideo") != std::string::npos);
-    CHECK(command.find("-pix_fmt rgba64le") != std::string::npos);
-    CHECK(command.find("-s:v 3840x2160") != std::string::npos);
-    CHECK(command.find("-r 24") != std::string::npos);
-    CHECK(command.find("-i -") != std::string::npos);
-    CHECK(command.find("-vf format=ayuv") != std::string::npos);
-    CHECK(command.find("-c:v hevc_videotoolbox") != std::string::npos);
-    CHECK(command.find("-alpha_quality 1.0") != std::string::npos);
-    CHECK(command.find("-tag:v hvc1") != std::string::npos);
-    CHECK(command.find("-pix_fmt ayuv") != std::string::npos);
-    CHECK(command.find("-allow_sw 1") != std::string::npos);
-    CHECK(command.find("-color_primaries bt709") != std::string::npos);
-    CHECK(command.find("-color_trc iec61966-2-1") != std::string::npos);
-    CHECK(command.find("-colorspace bt709") != std::string::npos);
-    CHECK(command.find("'/tmp/Invisible Places/final alpha.mp4'") != std::string::npos);
+        "/tmp/Invisible Places/final color.mp4");
+    CHECK(colorCommand.find("'/opt/homebrew/bin/ffmpeg'") != std::string::npos);
+    CHECK(colorCommand.find("-f rawvideo") != std::string::npos);
+    CHECK(colorCommand.find("-pix_fmt rgba64le") != std::string::npos);
+    CHECK(colorCommand.find("-s:v 3840x2160") != std::string::npos);
+    CHECK(colorCommand.find("-r 24") != std::string::npos);
+    CHECK(colorCommand.find("-i -") != std::string::npos);
+    CHECK(colorCommand.find("-vf format=p210le") != std::string::npos);
+    CHECK(colorCommand.find("-c:v hevc_videotoolbox") != std::string::npos);
+    CHECK(colorCommand.find("-profile:v main42210") != std::string::npos);
+    CHECK(colorCommand.find("-b:v 300000k") != std::string::npos);
+    CHECK(colorCommand.find("-maxrate 450000k") != std::string::npos);
+    CHECK(colorCommand.find("-tag:v hvc1") != std::string::npos);
+    CHECK(colorCommand.find("-pix_fmt p210le") != std::string::npos);
+    CHECK(colorCommand.find("-allow_sw 1") != std::string::npos);
+    CHECK(colorCommand.find("-prio_speed 0") != std::string::npos);
+    CHECK(colorCommand.find("-color_primaries bt709") != std::string::npos);
+    CHECK(colorCommand.find("-color_trc iec61966-2-1") != std::string::npos);
+    CHECK(colorCommand.find("-colorspace bt709") != std::string::npos);
+    CHECK(colorCommand.find("'/tmp/Invisible Places/final color.mp4'") != std::string::npos);
+
+    const auto matteCommand = invisible_places::output::BuildFfmpegHevcAlphaMatteMp4Command(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        24,
+        "/tmp/Invisible Places/final alpha matte.mp4");
+    CHECK(matteCommand.find("-f rawvideo") != std::string::npos);
+    CHECK(matteCommand.find("-pix_fmt gray16le") != std::string::npos);
+    CHECK(matteCommand.find("-vf scale=in_range=full:out_range=full,format=p210le") != std::string::npos);
+    CHECK(matteCommand.find("-c:v hevc_videotoolbox") != std::string::npos);
+    CHECK(matteCommand.find("-profile:v main42210") != std::string::npos);
+    CHECK(matteCommand.find("-b:v 90000k") != std::string::npos);
+    CHECK(matteCommand.find("-maxrate 135000k") != std::string::npos);
+    CHECK(matteCommand.find("-pix_fmt p210le") != std::string::npos);
+    CHECK(matteCommand.find("-prio_speed 0") != std::string::npos);
+    CHECK(matteCommand.find("-color_range pc") != std::string::npos);
+    CHECK(matteCommand.find("'/tmp/Invisible Places/final alpha matte.mp4'") != std::string::npos);
+
+    const auto combinedCommand = invisible_places::output::BuildFfmpegMp4ColorAndAlphaMatteCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        24,
+        "/tmp/Invisible Places/final color.mp4",
+        "/tmp/Invisible Places/final alpha matte.mp4",
+        invisible_places::output::AnimationExportQuality::Hq,
+        true);
+    CHECK(combinedCommand.find("-pix_fmt rgba64le") != std::string::npos);
+    CHECK(combinedCommand.find("-filter_complex") != std::string::npos);
+    CHECK(combinedCommand.find("alphaextract") != std::string::npos);
+    CHECK(combinedCommand.find("[color_out]") != std::string::npos);
+    CHECK(combinedCommand.find("[alpha_out]") != std::string::npos);
+    CHECK(combinedCommand.find("format=p210le") != std::string::npos);
+    CHECK(combinedCommand.find("-profile:v main42210") != std::string::npos);
+    CHECK(combinedCommand.find("-b:v 300000k") != std::string::npos);
+    CHECK(combinedCommand.find("-b:v 90000k") != std::string::npos);
+    CHECK(combinedCommand.find("-prio_speed 0") != std::string::npos);
+    CHECK(combinedCommand.find("'/tmp/Invisible Places/final color.mp4'") != std::string::npos);
+    CHECK(combinedCommand.find("'/tmp/Invisible Places/final alpha matte.mp4'") != std::string::npos);
+    CHECK(combinedCommand.find("-i -") == combinedCommand.rfind("-i -"));
 }
 
 TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output][video]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_prores_names";
+    std::filesystem::remove_all(outputDirectory);
     invisible_places::output::RenderJobSettings settings;
     settings.width = 4096;
     settings.height = 2160;
@@ -11556,25 +12264,33 @@ TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output
         "Scene Take",
         settings,
         "Glow Pass");
-    CHECK(proResPath == outputDirectory / "Scene_Take_ProRes_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+    CHECK(
+        proResPath ==
+        outputDirectory / "Scene_Take_ProRes4444_Normal_CPU_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
     const auto proResXqPath = invisible_places::output::BuildUniqueProRes4444XqOutputPath(
         outputDirectory,
         "Scene Take",
         settings,
         "Glow Pass");
-    CHECK(proResXqPath == outputDirectory / "Scene_Take_ProResXQ_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+    CHECK(
+        proResXqPath ==
+        outputDirectory / "Scene_Take_ProRes4444_XQ_CPU_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
     const auto proResVtPath = invisible_places::output::BuildUniqueProRes4444VideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
         settings,
         "Glow Pass");
-    CHECK(proResVtPath == outputDirectory / "Scene_Take_ProResM1_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+    CHECK(
+        proResVtPath ==
+        outputDirectory / "Scene_Take_ProRes4444_Normal_VT_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
     const auto proResXqVtPath = invisible_places::output::BuildUniqueProRes4444XqVideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
         settings,
         "Glow Pass");
-    CHECK(proResXqVtPath == outputDirectory / "Scene_Take_ProResXQM1_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
+    CHECK(
+        proResXqVtPath ==
+        outputDirectory / "Scene_Take_ProRes4444_XQ_VT_4096x2160_30fps_SS2x_AA_Glow_Pass.mov");
 
     const auto command = invisible_places::output::BuildFfmpegProRes4444Command(
         "/opt/homebrew/bin/ffmpeg",
@@ -11629,10 +12345,32 @@ TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output
     CHECK(xqVideoToolboxCommand.find("-c:v prores_videotoolbox") != std::string::npos);
     CHECK(xqVideoToolboxCommand.find("-profile:v 5") != std::string::npos);
     CHECK(xqVideoToolboxCommand.find("-pix_fmt ayuv64le") != std::string::npos);
+
+    const auto combinedCommand = invisible_places::output::BuildFfmpegProRes4444ColorAndAlphaMatteCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        4096,
+        2160,
+        30,
+        "/tmp/Invisible Places/final alpha.mov",
+        "/tmp/Invisible Places/final alpha matte.mov",
+        invisible_places::output::AnimationExportQuality::Xq,
+        false);
+    CHECK(combinedCommand.find("-pix_fmt rgba64le") != std::string::npos);
+    CHECK(combinedCommand.find("-filter_complex") != std::string::npos);
+    CHECK(combinedCommand.find("alphaextract") != std::string::npos);
+    CHECK(combinedCommand.find("format=yuva444p10le") != std::string::npos);
+    CHECK(combinedCommand.find("format=yuv422p10le") != std::string::npos);
+    CHECK(combinedCommand.find("-profile:v 5") != std::string::npos);
+    CHECK(combinedCommand.find("-profile:v 3") != std::string::npos);
+    CHECK(combinedCommand.find("-alpha_bits 16") != std::string::npos);
+    CHECK(combinedCommand.find("'/tmp/Invisible Places/final alpha.mov'") != std::string::npos);
+    CHECK(combinedCommand.find("'/tmp/Invisible Places/final alpha matte.mov'") != std::string::npos);
+    CHECK(combinedCommand.find("-i -") == combinedCommand.rfind("-i -"));
 }
 
 TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][video]") {
     const auto outputDirectory = std::filesystem::temp_directory_path() / "invisible_places_prores_422_names";
+    std::filesystem::remove_all(outputDirectory);
     invisible_places::output::RenderJobSettings settings;
     settings.width = 4096;
     settings.height = 2160;
@@ -11644,19 +12382,47 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Scene Take",
         settings,
         "Base Layer");
-    CHECK(proRes422Path == outputDirectory / "Scene_Take_ProRes422_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+    CHECK(
+        proRes422Path ==
+        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
     const auto proRes422HqPath = invisible_places::output::BuildUniqueProRes422HqOutputPath(
         outputDirectory,
         "Scene Take",
         settings,
         "Base Layer");
-    CHECK(proRes422HqPath == outputDirectory / "Scene_Take_ProRes422HQ_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+    CHECK(
+        proRes422HqPath ==
+        outputDirectory / "Scene_Take_ProRes422_HQ_CPU_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+    const auto proRes422AlphaPaths = invisible_places::output::BuildUniqueProRes422AlphaMatteOutputPaths(
+        outputDirectory,
+        "Scene Take",
+        settings,
+        "Base Layer");
+    CHECK(
+        proRes422AlphaPaths.colorPath ==
+        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_color.mov");
+    CHECK(
+        proRes422AlphaPaths.alphaMattePath ==
+        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_alpha.mov");
+    const auto proRes422HqAlphaPaths = invisible_places::output::BuildUniqueProRes422HqAlphaMatteOutputPaths(
+        outputDirectory,
+        "Scene Take",
+        settings,
+        "Base Layer");
+    CHECK(
+        proRes422HqAlphaPaths.colorPath ==
+        outputDirectory / "Scene_Take_ProRes422_HQ_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_color.mov");
+    CHECK(
+        proRes422HqAlphaPaths.alphaMattePath ==
+        outputDirectory / "Scene_Take_ProRes422_HQ_CPU_Alpha_4096x2160_30fps_SS2x_AA_Base_Layer_alpha.mov");
     const auto proRes422VtPath = invisible_places::output::BuildUniqueProRes422VideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
         settings,
         "Base Layer");
-    CHECK(proRes422VtPath == outputDirectory / "Scene_Take_ProRes422M1_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+    CHECK(
+        proRes422VtPath ==
+        outputDirectory / "Scene_Take_ProRes422_Normal_VT_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
     const auto proRes422HqVtPath = invisible_places::output::BuildUniqueProRes422HqVideoToolboxOutputPath(
         outputDirectory,
         "Scene Take",
@@ -11664,10 +12430,10 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         "Base Layer");
     CHECK(
         proRes422HqVtPath ==
-        outputDirectory / "Scene_Take_ProRes422HQM1_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
+        outputDirectory / "Scene_Take_ProRes422_HQ_VT_4096x2160_30fps_SS2x_AA_Base_Layer.mov");
 
     const auto reservedPath =
-        outputDirectory / "Scene_Take_ProRes422_4096x2160_30fps_SS2x_AA_Base_Layer_1.mov";
+        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_4096x2160_30fps_SS2x_AA_Base_Layer_1.mov";
     std::filesystem::create_directories(outputDirectory);
     {
         std::ofstream existing{proRes422Path, std::ios::trunc};
@@ -11679,9 +12445,10 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
         settings,
         "Base Layer",
         {reservedPath});
-    CHECK(collisionPath == outputDirectory / "Scene_Take_ProRes422_4096x2160_30fps_SS2x_AA_Base_Layer_2.mov");
-    std::filesystem::remove(proRes422Path);
-    std::filesystem::remove(outputDirectory);
+    CHECK(
+        collisionPath ==
+        outputDirectory / "Scene_Take_ProRes422_Normal_CPU_4096x2160_30fps_SS2x_AA_Base_Layer_2.mov");
+    std::filesystem::remove_all(outputDirectory);
 
     const auto command = invisible_places::output::BuildFfmpegProRes422Command(
         "/opt/homebrew/bin/ffmpeg",
@@ -11739,6 +12506,26 @@ TEST_CASE("ProRes 422 output paths and ffmpeg commands are opaque", "[output][vi
     CHECK(hqVideoToolboxCommand.find("-allow_sw 1") != std::string::npos);
     CHECK(hqVideoToolboxCommand.find("-alpha_bits") == std::string::npos);
     CHECK(hqVideoToolboxCommand.find("ayuv64le") == std::string::npos);
+
+    const auto combinedCommand = invisible_places::output::BuildFfmpegProRes422ColorAndAlphaMatteCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        4096,
+        2160,
+        30,
+        "/tmp/Invisible Places/base layer.mov",
+        "/tmp/Invisible Places/base layer alpha.mov",
+        invisible_places::output::AnimationExportQuality::Hq,
+        true);
+    CHECK(combinedCommand.find("-pix_fmt rgba64le") != std::string::npos);
+    CHECK(combinedCommand.find("-filter_complex") != std::string::npos);
+    CHECK(combinedCommand.find("alphaextract") != std::string::npos);
+    CHECK(combinedCommand.find("format=p210le") != std::string::npos);
+    CHECK(combinedCommand.find("-c:v prores_videotoolbox") != std::string::npos);
+    CHECK(combinedCommand.find("-profile:v 3") != std::string::npos);
+    CHECK(combinedCommand.find("-color_range pc") != std::string::npos);
+    CHECK(combinedCommand.find("'/tmp/Invisible Places/base layer.mov'") != std::string::npos);
+    CHECK(combinedCommand.find("'/tmp/Invisible Places/base layer alpha.mov'") != std::string::npos);
+    CHECK(combinedCommand.find("-i -") == combinedCommand.rfind("-i -"));
 }
 
 TEST_CASE("Fast preview MP4 ffmpeg command uses raw RGBA video input", "[output][video]") {
@@ -11818,6 +12605,72 @@ TEST_CASE("ProRes conversion downsamples straight alpha without transparent RGB 
     CHECK(static_cast<int>(readWord(6)) == Catch::Approx(16384).margin(1));
 }
 
+TEST_CASE("SS2x conversion resolves parallel rows without changing uniform color", "[output][video]") {
+    const auto zero = Imath::half{0.0F}.bits();
+    const auto half = Imath::half{0.5F}.bits();
+    const auto one = Imath::half{1.0F}.bits();
+
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = 128;
+    image.height = 128;
+    image.rgbaHalf.resize(static_cast<std::size_t>(image.width) * image.height * 4U);
+    for (std::size_t pixelIndex = 0; pixelIndex < image.rgbaHalf.size() / 4U; ++pixelIndex) {
+        const auto offset = pixelIndex * 4U;
+        image.rgbaHalf[offset + 0U] = one;
+        image.rgbaHalf[offset + 1U] = half;
+        image.rgbaHalf[offset + 2U] = zero;
+        image.rgbaHalf[offset + 3U] = half;
+    }
+
+    const auto bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(
+        image,
+        64,
+        64,
+        {},
+        true);
+    REQUIRE(bytes.size() == 64U * 64U * 4U);
+    for (std::size_t pixelIndex = 0; pixelIndex < bytes.size() / 4U; ++pixelIndex) {
+        const auto offset = pixelIndex * 4U;
+        CHECK(bytes[offset + 0U] == 255U);
+        CHECK(bytes[offset + 1U] == 188U);
+        CHECK(bytes[offset + 2U] == 0U);
+        CHECK(bytes[offset + 3U] == 128U);
+    }
+}
+
+TEST_CASE("Non-SS2x conversion preserves uniform half-float RGBA", "[output][video]") {
+    const auto quarter = Imath::half{0.25F}.bits();
+    const auto half = Imath::half{0.5F}.bits();
+    const auto one = Imath::half{1.0F}.bits();
+
+    invisible_places::output::HalfRgbaExrImage image;
+    image.width = 9;
+    image.height = 9;
+    image.rgbaHalf.resize(static_cast<std::size_t>(image.width) * image.height * 4U);
+    for (std::size_t pixelIndex = 0; pixelIndex < image.rgbaHalf.size() / 4U; ++pixelIndex) {
+        const auto offset = pixelIndex * 4U;
+        image.rgbaHalf[offset + 0U] = quarter;
+        image.rgbaHalf[offset + 1U] = half;
+        image.rgbaHalf[offset + 2U] = one;
+        image.rgbaHalf[offset + 3U] = half;
+    }
+
+    const auto bytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba16(image, 3, 3, true);
+    REQUIRE(bytes.size() == 3U * 3U * 8U);
+    const auto readWord = [&bytes](std::size_t offset) {
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(bytes[offset]) |
+            (static_cast<std::uint16_t>(bytes[offset + 1U]) << 8U));
+    };
+    for (std::size_t pixelIndex = 0; pixelIndex < bytes.size() / 8U; ++pixelIndex) {
+        const auto offset = pixelIndex * 8U;
+        CHECK(static_cast<int>(readWord(offset + 0U)) == Catch::Approx(35199).margin(8));
+        CHECK(static_cast<int>(readWord(offset + 2U)) == Catch::Approx(48192).margin(8));
+        CHECK(readWord(offset + 4U) == 65535U);
+        CHECK(static_cast<int>(readWord(offset + 6U)) == Catch::Approx(32768).margin(8));
+    }
+}
+
 TEST_CASE("ProRes 422 conversion flattens alpha over black", "[output][video]") {
     const auto zero = Imath::half{0.0F}.bits();
     const auto half = Imath::half{0.5F}.bits();
@@ -11852,7 +12705,7 @@ TEST_CASE("ProRes 422 conversion flattens alpha over black", "[output][video]") 
     CHECK(readWord(10) == 0U);
 }
 
-TEST_CASE("Fast preview MP4 smoothing fills sparse transparent point gaps", "[output][video]") {
+TEST_CASE("Legacy MP4 smoothing setting does not alter pixels", "[output][video]") {
     const auto zero = Imath::half{0.0F}.bits();
     const auto one = Imath::half{1.0F}.bits();
 
@@ -11875,20 +12728,16 @@ TEST_CASE("Fast preview MP4 smoothing fills sparse transparent point gaps", "[ou
     };
     image.depth = {2.0F, 0.0F, 2.0F};
 
-    invisible_places::output::Mp4SparsePointSmoothingSettings disabledSmoothing;
-    disabledSmoothing.enabled = false;
-    const auto unsmoothedBytes =
-        invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image, disabledSmoothing);
-    REQUIRE(unsmoothedBytes.size() == 12U);
-    CHECK(unsmoothedBytes[4] == 0U);
-    CHECK(unsmoothedBytes[7] == 0U);
+    const auto defaultBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image);
+    REQUIRE(defaultBytes.size() == 12U);
+    CHECK(defaultBytes[4] == 0U);
+    CHECK(defaultBytes[7] == 0U);
 
-    const auto smoothedBytes = invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image);
-    REQUIRE(smoothedBytes.size() == 12U);
-    CHECK(smoothedBytes[4] > 200U);
-    CHECK(smoothedBytes[5] == 0U);
-    CHECK(smoothedBytes[6] == 0U);
-    CHECK(smoothedBytes[7] == 0U);
+    invisible_places::output::Mp4SparsePointSmoothingSettings legacySmoothing;
+    legacySmoothing.enabled = true;
+    const auto legacyBytes =
+        invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image, legacySmoothing);
+    CHECK(legacyBytes == defaultBytes);
 }
 
 TEST_CASE("Fast preview MP4 conversion downsamples supersampled half-float frames", "[output][video]") {
@@ -11918,10 +12767,8 @@ TEST_CASE("Fast preview MP4 conversion downsamples supersampled half-float frame
     };
     image.depth = {1.0F, 1.0F, 1.0F, 1.0F};
 
-    invisible_places::output::Mp4SparsePointSmoothingSettings disabledSmoothing;
-    disabledSmoothing.enabled = false;
     const auto bytes =
-        invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image, 1, 1, disabledSmoothing);
+        invisible_places::output::ConvertHalfRgbaToSrgbRgba8(image, 1, 1);
     REQUIRE(bytes.size() == 4U);
     CHECK(bytes[0] == 188U);
     CHECK(bytes[1] == 188U);
