@@ -991,12 +991,18 @@ TEST_CASE("rain impact grid bounds work and isolates scene roles", "[water][rain
     CHECK(vegetationTopMaximum > vegetationLowerEarly.emission);
 }
 
-TEST_CASE("rock rain impact expands from its contact point", "[water][rain][effects]") {
+TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][rain][effects]") {
+    constexpr float radius = 0.12F;
+    const float effectiveRadius = radius * std::sqrt(2.0F / 3.0F);
+    constexpr float pi = 3.14159265358979323846F;
+    CHECK(
+        pi * effectiveRadius * effectiveRadius ==
+        Catch::Approx((2.0F / 3.0F) * pi * radius * radius).epsilon(1.0e-6F));
     const std::vector<invisible_places::water::RainImpactEvent> events{
         {.position = {0.0F, 0.0F, 0.0F},
          .birthTimeSeconds = 0.0F,
          .normal = {0.0F, 0.0F, 1.0F},
-         .radiusMeters = 0.12F,
+         .radiusMeters = radius,
          .role = WaterSurfaceRole::Rock,
          .lifetimeSeconds = 5.0F,
          .energy = 1.0F,
@@ -1005,14 +1011,192 @@ TEST_CASE("rock rain impact expands from its contact point", "[water][rain][effe
     const auto grid = invisible_places::water::BuildRainImpactGrid(events, {}, 1.0F, 2.0F);
     const auto centreAtBirth = invisible_places::water::EvaluateRainImpact(
         grid, WaterSurfaceRole::Rock, {0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.08F);
-    const auto outerAtBirth = invisible_places::water::EvaluateRainImpact(
-        grid, WaterSurfaceRole::Rock, {0.09F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.08F);
-    const auto outerAfterGrowth = invisible_places::water::EvaluateRainImpact(
-        grid, WaterSurfaceRole::Rock, {0.09F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.90F);
+    const auto outerAtOldGrowthTime = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {effectiveRadius * 0.70F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        0.90F);
+    const auto outerAtDoubledGrowthTime = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {effectiveRadius * 0.70F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.80F);
+    const auto insideReducedFootprint = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {effectiveRadius * 0.90F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.80F);
+    const auto insideOldButOutsideReducedFootprint = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {radius * 0.95F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.80F);
+    const auto evaluatorInsideReducedEdge =
+        invisible_places::water::EvaluateRockRainImpactValue(
+            events.front(),
+            {effectiveRadius * 0.975F, 0.0F, 0.0F},
+            {0.0F, 0.0F, 1.0F},
+            1.80F);
+    const auto evaluatorOutsideReducedEdge =
+        invisible_places::water::EvaluateRockRainImpactValue(
+            events.front(),
+            {effectiveRadius * 1.025F, 0.0F, 0.0F},
+            {0.0F, 0.0F, 1.0F},
+            1.80F);
+    const auto flatLeftLate = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {-effectiveRadius * 0.40F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        4.0F);
+    const auto flatRightLate = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {effectiveRadius * 0.40F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        4.0F);
 
     CHECK(centreAtBirth.colourBlend > 0.30F);
-    CHECK(outerAtBirth.colourBlend < 0.01F);
-    CHECK(outerAfterGrowth.colourBlend > 0.30F);
+    CHECK(outerAtOldGrowthTime.colourBlend < 0.01F);
+    CHECK(outerAtDoubledGrowthTime.colourBlend > 0.30F);
+    CHECK(insideReducedFootprint.colourBlend > 0.30F);
+    CHECK(insideOldButOutsideReducedFootprint.colourBlend < 0.01F);
+    CHECK(evaluatorInsideReducedEdge > 0.79F);
+    CHECK(evaluatorOutsideReducedEdge == Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(flatLeftLate.colourBlend == Catch::Approx(flatRightLate.colourBlend));
+}
+
+TEST_CASE("rock rain impact favours lower points and settles downhill", "[water][rain][effects]") {
+    constexpr float radius = 0.12F;
+    constexpr float lifetime = 5.0F;
+    const float effectiveRadius = radius * std::sqrt(2.0F / 3.0F);
+    const std::vector<invisible_places::water::RainImpactEvent> verticalEvents{
+        {.position = {0.0F, 0.0F, 0.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {1.0F, 0.0F, 0.0F},
+         .radiusMeters = radius,
+         .role = WaterSurfaceRole::Rock,
+         .lifetimeSeconds = lifetime,
+         .energy = 1.0F,
+         .seed = 92U},
+    };
+    const auto verticalGrid = invisible_places::water::BuildRainImpactGrid(
+        verticalEvents,
+        {},
+        1.8F,
+        2.0F);
+    const auto highAtGrowth = invisible_places::water::EvaluateRainImpact(
+        verticalGrid,
+        WaterSurfaceRole::Rock,
+        {0.0F, 0.0F, effectiveRadius * 0.50F},
+        {1.0F, 0.0F, 0.0F},
+        1.80F);
+    const auto centreAtGrowth = invisible_places::water::EvaluateRainImpact(
+        verticalGrid,
+        WaterSurfaceRole::Rock,
+        {0.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+        1.80F);
+    const auto lowAtGrowth = invisible_places::water::EvaluateRainImpact(
+        verticalGrid,
+        WaterSurfaceRole::Rock,
+        {0.0F, 0.0F, -effectiveRadius * 0.50F},
+        {1.0F, 0.0F, 0.0F},
+        1.80F);
+    const auto highAfterEarlyFade = invisible_places::water::EvaluateRainImpact(
+        verticalGrid,
+        WaterSurfaceRole::Rock,
+        {0.0F, 0.0F, effectiveRadius * 0.50F},
+        {1.0F, 0.0F, 0.0F},
+        3.0F);
+    const auto lowBeforeLateFade = invisible_places::water::EvaluateRainImpact(
+        verticalGrid,
+        WaterSurfaceRole::Rock,
+        {0.0F, 0.0F, -effectiveRadius * 0.50F},
+        {1.0F, 0.0F, 0.0F},
+        3.0F);
+
+    CHECK(highAtGrowth.colourBlend == Catch::Approx(0.42F * 0.8F).margin(0.002F));
+    CHECK(centreAtGrowth.colourBlend == Catch::Approx(0.42F).margin(0.002F));
+    CHECK(lowAtGrowth.colourBlend == Catch::Approx(0.42F * 1.2F).margin(0.002F));
+    CHECK(lowBeforeLateFade.colourBlend > highAfterEarlyFade.colourBlend * 1.8F);
+
+    constexpr float inverseSqrtTwo = 0.70710678118F;
+    const std::vector<invisible_places::water::RainImpactEvent> slopedEvents{
+        {.position = {0.0F, 0.0F, 0.0F},
+         .birthTimeSeconds = 0.0F,
+         .normal = {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+         .radiusMeters = radius,
+         .role = WaterSurfaceRole::Rock,
+         .lifetimeSeconds = lifetime,
+         .energy = 1.0F,
+         .seed = 93U},
+    };
+    const auto slopedGrid = invisible_places::water::BuildRainImpactGrid(
+        slopedEvents,
+        {},
+        4.5F,
+        2.0F);
+    const float probeDistance = effectiveRadius * 1.05F;
+    const Float3 downhillProbe{
+        inverseSqrtTwo * probeDistance,
+        0.0F,
+        -inverseSqrtTwo * probeDistance,
+    };
+    const Float3 uphillProbe{
+        -downhillProbe.x,
+        0.0F,
+        -downhillProbe.z,
+    };
+    const auto downhillAtGrowth = invisible_places::water::EvaluateRainImpact(
+        slopedGrid,
+        WaterSurfaceRole::Rock,
+        downhillProbe,
+        {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+        1.80F);
+    const auto downhillLate = invisible_places::water::EvaluateRainImpact(
+        slopedGrid,
+        WaterSurfaceRole::Rock,
+        downhillProbe,
+        {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+        4.50F);
+    const auto uphillLate = invisible_places::water::EvaluateRainImpact(
+        slopedGrid,
+        WaterSurfaceRole::Rock,
+        uphillProbe,
+        {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+        4.50F);
+    const auto expired = invisible_places::water::EvaluateRainImpact(
+        slopedGrid,
+        WaterSurfaceRole::Rock,
+        downhillProbe,
+        {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+        5.01F);
+    const auto insideBroadPhase = invisible_places::water::EvaluateRockRainImpactValue(
+        slopedEvents.front(),
+        {inverseSqrtTwo * radius * 0.99F,
+         0.0F,
+         -inverseSqrtTwo * radius * 0.99F},
+        {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+        4.50F);
+    const auto outsideBroadPhase = invisible_places::water::EvaluateRockRainImpactValue(
+        slopedEvents.front(),
+        {inverseSqrtTwo * radius * 1.001F,
+         0.0F,
+         -inverseSqrtTwo * radius * 1.001F},
+        {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
+        4.50F);
+
+    CHECK(downhillAtGrowth.colourBlend < 0.04F);
+    CHECK(downhillLate.colourBlend > downhillAtGrowth.colourBlend * 3.0F);
+    CHECK(uphillLate.colourBlend < 0.005F);
+    CHECK(expired.colourBlend == Catch::Approx(0.0F));
+    CHECK(insideBroadPhase > 0.0F);
+    CHECK(outsideBroadPhase == Catch::Approx(0.0F).margin(1.0e-6F));
 }
 
 TEST_CASE("vegetation rain impacts form sparse wandering downward sparkles", "[water][rain][effects]") {

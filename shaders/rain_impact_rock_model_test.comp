@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "rain_impact_rock_model.glsl"
+
+struct RockRainImpactTestInput {
+    vec4 eventPositionRadius;
+    vec4 eventNormalLifetime;
+    vec4 pointAge;
+    vec4 pointNormal;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer TestInputs {
+    RockRainImpactTestInput inputs[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly buffer TestOutputs {
+    float outputs[];
+};
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(inputs.length()) || index >= uint(outputs.length())) {
+        return;
+    }
+    const RockRainImpactTestInput inputValue = inputs[index];
+    outputs[index] = EvaluateRockRainImpactValue(
+        inputValue.eventPositionRadius.xyz,
+        inputValue.eventNormalLifetime.xyz,
+        inputValue.eventPositionRadius.w,
+        inputValue.eventNormalLifetime.w,
+        inputValue.pointAge.xyz,
+        inputValue.pointNormal.xyz,
+        inputValue.pointAge.w);
+}

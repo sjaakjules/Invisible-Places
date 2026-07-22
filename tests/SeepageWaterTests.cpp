@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -177,6 +178,73 @@ TEST_CASE("Seepage resolves quality from effective point invocations", "[water][
     CHECK(lowGrid.nodes.front().resolvedQuality == WaterSeepageQuality::Low);
     CHECK(WaterSeepageTopologyFingerprint(highGrid) == WaterSeepageTopologyFingerprint(lowGrid));
     CHECK(WaterSeepageParamsFingerprint(highGrid) != WaterSeepageParamsFingerprint(lowGrid));
+}
+
+TEST_CASE("Authored Seepage topology identity is role-local and excludes live parameters", "[water][seepage][fingerprint]") {
+    using invisible_places::water::WaterSeepageAuthoredTopologyFingerprint;
+
+    auto rockNode = MakeSeepageNode(1U);
+    rockNode.targetSceneRoles = {"ROCK", "vegetation"};
+    auto sandNode = MakeSeepageNode(2U);
+    sandNode.position = {2.0F, 0.0F, 0.0F};
+    sandNode.targetSceneRoles = {"SAND"};
+    const std::vector<WaterSeepageNode> authored{rockNode, sandNode};
+    const auto rockFingerprint = WaterSeepageAuthoredTopologyFingerprint(authored, "ROCK");
+    const auto vegetationFingerprint =
+        WaterSeepageAuthoredTopologyFingerprint(authored, "VEG");
+    const auto sandFingerprint = WaterSeepageAuthoredTopologyFingerprint(authored, "SAND");
+
+    auto reordered = authored;
+    std::reverse(reordered.begin(), reordered.end());
+    reordered.back().targetSceneRoles = {"VEG", "rock", "ROCK"};
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(reordered, "rock") == rockFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(reordered, "vegetation") ==
+          vegetationFingerprint);
+
+    auto liveParameterEdit = authored;
+    liveParameterEdit.front().name = "Renamed";
+    liveParameterEdit.front().enabledInViewport = false;
+    liveParameterEdit.front().enabledInExport = false;
+    liveParameterEdit.front().strength = 0.0F;
+    liveParameterEdit.front().normalAlignment = 0.95F;
+    liveParameterEdit.front().seed += 1000U;
+    liveParameterEdit.front().lookProfileName = "Alternate";
+    liveParameterEdit.front().lookOverride = WaterSeepageLookSettings{};
+    liveParameterEdit.front().lookOverride->density = 0.91F;
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(liveParameterEdit, "ROCK") ==
+          rockFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(liveParameterEdit, "SAND") ==
+          sandFingerprint);
+
+    auto sandGeometryEdit = authored;
+    sandGeometryEdit.back().reachMeters += 0.25F;
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(sandGeometryEdit, "ROCK") ==
+          rockFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(sandGeometryEdit, "SAND") !=
+          sandFingerprint);
+
+    auto rockGeometryEdit = authored;
+    rockGeometryEdit.front().position.z -= 0.10F;
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(rockGeometryEdit, "ROCK") !=
+          rockFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(rockGeometryEdit, "SAND") ==
+          sandFingerprint);
+
+    auto roleEdit = authored;
+    roleEdit.front().targetSceneRoles = {"VEG"};
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(roleEdit, "ROCK") != rockFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(roleEdit, "VEG") ==
+          vegetationFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(roleEdit, "SAND") == sandFingerprint);
+
+    auto addedUnrelatedRole = authored;
+    addedUnrelatedRole.front().targetSceneRoles.push_back("SAND");
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(addedUnrelatedRole, "ROCK") ==
+          rockFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(addedUnrelatedRole, "VEG") ==
+          vegetationFingerprint);
+    CHECK(WaterSeepageAuthoredTopologyFingerprint(addedUnrelatedRole, "SAND") !=
+          sandFingerprint);
 }
 
 TEST_CASE("Seepage look resolution honors profile and local edit precedence", "[water][seepage][profiles]") {
@@ -586,6 +654,12 @@ TEST_CASE("Seepage can require matching cliff normals", "[water][seepage][fan][n
 }
 
 TEST_CASE("Seepage grid filters roles and viewport export enablement", "[water][seepage][roles]") {
+    using invisible_places::water::ApplyWaterSeepageRuntimeParameters;
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::WaterSeepageGridHasActiveViewportEffect;
+    using invisible_places::water::WaterSeepageParamsFingerprint;
+    using invisible_places::water::WaterSeepageTopologyFingerprint;
+
     auto node = MakeSeepageNode();
     CHECK(BuildGrid({node}, "ROCK").nodes.size() == 1U);
     CHECK(BuildGrid({node}, "VEG").nodes.size() == 1U);
@@ -604,8 +678,142 @@ TEST_CASE("Seepage grid filters roles and viewport export enablement", "[water][
 
     node.enabledInViewport = false;
     node.enabledInExport = true;
-    CHECK(BuildGrid({node}, "ROCK", false).nodes.empty());
+    auto viewportGrid = BuildGrid({node}, "ROCK", false);
+    REQUIRE(viewportGrid.nodes.size() == 1U);
+    CHECK(viewportGrid.nodes.front().enabledFactor == Catch::Approx(0.0F));
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(viewportGrid));
+    CHECK(EvaluateWaterSeepageGridContribution(
+              viewportGrid,
+              {0.0F, 0.0F, -0.55F},
+              {0.0F, 1.0F, 0.0F},
+              0.0F)
+              .scale == 0.0F);
     CHECK(BuildGrid({node}, "ROCK", true).nodes.size() == 1U);
+
+    const auto topologyBefore = WaterSeepageTopologyFingerprint(viewportGrid);
+    const auto paramsBefore = WaterSeepageParamsFingerprint(viewportGrid);
+    node.enabledInViewport = true;
+    const std::vector<WaterSeepageNode> enabledNodes{node};
+    ApplyWaterSeepageRuntimeParameters(
+        &viewportGrid,
+        enabledNodes,
+        {},
+        {},
+        std::nullopt,
+        {},
+        12'000'000ULL);
+    CHECK(viewportGrid.nodes.front().enabledFactor == Catch::Approx(1.0F));
+    CHECK(WaterSeepageGridHasActiveViewportEffect(viewportGrid));
+    CHECK(WaterSeepageTopologyFingerprint(viewportGrid) == topologyBefore);
+    CHECK(WaterSeepageParamsFingerprint(viewportGrid) != paramsBefore);
+    CHECK(EvaluateWaterSeepageGridContribution(
+              viewportGrid,
+              {0.0F, 0.0F, -0.55F},
+              {0.0F, 1.0F, 0.0F},
+              0.0F)
+              .scale > 0.0F);
+}
+
+TEST_CASE("Inactive Seepage runtime parameters settle without requesting live redraw", "[water][seepage][redraw]") {
+    using invisible_places::water::WaterScenarioState;
+    using invisible_places::water::WaterSeepageGridHasActiveViewportEffect;
+    using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
+
+    const auto node = MakeSeepageNode();
+    CHECK(WaterSeepageGridHasActiveViewportEffect(BuildGrid({node})));
+
+    auto zeroStrength = node;
+    zeroStrength.strength = 0.0F;
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid({zeroStrength})));
+
+    WaterScenarioState inactiveScenario;
+    inactiveScenario.seepageLevel = 0.0F;
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        {},
+        {},
+        inactiveScenario)));
+
+    const std::array<WaterSeepageNodeAnimationStateEntry, 1U> inactiveAnimation{{
+        {
+            .nodeId = node.id,
+            .state = {
+                .activity = 0.0F,
+                .localSpread = 0.0F,
+                .wettingProgress = 1.0F,
+            },
+        },
+    }};
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        {},
+        {},
+        std::nullopt,
+        inactiveAnimation)));
+
+    WaterSeepageLookSettings noResponse;
+    noResponse.response.intensity = 0.0F;
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        noResponse)));
+
+    WaterScenarioState fullyInactiveTransition;
+    fullyInactiveTransition.transitionLook = noResponse;
+    fullyInactiveTransition.transitionAmount = 1.0F;
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        {},
+        {},
+        fullyInactiveTransition)));
+    fullyInactiveTransition.transitionAmount = 0.5F;
+    CHECK(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        {},
+        {},
+        fullyInactiveTransition)));
+
+    WaterSeepageLookSettings trickle;
+    trickle.pattern = WaterSeepagePattern::WettingTrickle;
+    const std::array<WaterSeepageNodeAnimationStateEntry, 1U> dryTrickleAnimation{{
+        {
+            .nodeId = node.id,
+            .state = {
+                .activity = 1.0F,
+                .localSpread = 0.0F,
+                .wettingProgress = 0.0F,
+            },
+        },
+    }};
+    CHECK_FALSE(WaterSeepageGridHasActiveViewportEffect(BuildGrid(
+        {node},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        trickle,
+        {},
+        std::nullopt,
+        dryTrickleAnimation)));
 }
 
 TEST_CASE("Rain presets strengthen seepage without changing topology", "[water][seepage][rain]") {
@@ -696,9 +904,28 @@ TEST_CASE("Seepage grid remains compact and reports bounded cell overflow", "[wa
         REQUIRE(reference < grid.nodes.size());
         retainedIds.push_back(grid.nodes[reference].id);
     }
-    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 1U) == retainedIds.end());
-    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 2U) == retainedIds.end());
-    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 10U) != retainedIds.end());
+    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 1U) != retainedIds.end());
+    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 2U) != retainedIds.end());
+    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 9U) == retainedIds.end());
+    CHECK(std::find(retainedIds.begin(), retainedIds.end(), 10U) == retainedIds.end());
+
+    auto parameterEditedNodes = nodes;
+    for (std::size_t index = 0U; index < parameterEditedNodes.size(); ++index) {
+        parameterEditedNodes[index].strength =
+            static_cast<float>(parameterEditedNodes.size() - index) * 0.73F;
+        parameterEditedNodes[index].enabledInViewport = index % 2U == 0U;
+        parameterEditedNodes[index].seed += static_cast<std::uint32_t>(1000U + index);
+    }
+    const auto parameterEditedGrid = BuildGrid(
+        parameterEditedNodes,
+        "ROCK",
+        false,
+        {},
+        100'000'000ULL);
+    CHECK(parameterEditedGrid.nodeReferences == grid.nodeReferences);
+    CHECK(
+        invisible_places::water::WaterSeepageTopologyFingerprint(grid) ==
+        invisible_places::water::WaterSeepageTopologyFingerprint(parameterEditedGrid));
 
     std::reverse(nodes.begin(), nodes.end());
     const auto reversedGrid = BuildGrid(nodes, "ROCK", false, {}, 100'000'000ULL);

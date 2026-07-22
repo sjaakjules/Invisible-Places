@@ -198,6 +198,15 @@ struct RainImpactEffect {
     float colourBlend = 0.0F;
 };
 
+// Pure narrow-phase ROCK evaluator used by the offline renderer and by the
+// deterministic Vulkan shader-equivalence test. The result is before event
+// energy and material response coefficients are applied.
+[[nodiscard]] float EvaluateRockRainImpactValue(
+    const RainImpactEvent& event,
+    const io::Float3& point,
+    const io::Float3& pointNormal,
+    float timeSeconds);
+
 [[nodiscard]] RainImpactGrid BuildRainImpactGrid(
     std::span<const RainImpactEvent> events,
     const io::Float3& cameraPosition,

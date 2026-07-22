@@ -65,6 +65,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/water_flow_trails.comp
     shaders/water_surface_preprocess.comp
     shaders/rain_simulation.comp
+    shaders/rain_impact_rock_model_test.comp
     shaders/rain_particle.vert
     shaders/rain_particle.frag
     shaders/gsplat_accumulation.vert
@@ -82,6 +83,7 @@ set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_rain_impact.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rain_impact_rock_model.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water_flow_gpu_common.glsl"
 )
@@ -233,6 +235,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/PointCloudDensityCompensationTests.cpp
             tests/PointCloudVariantsTests.cpp
             tests/ProjectDocumentSerializationTests.cpp
+            tests/RainImpactGpuEquivalenceTests.cpp
             tests/RainOfflineRendererTests.cpp
             tests/RainSimulationTests.cpp
             tests/RenderParameterBindingTests.cpp

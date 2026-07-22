@@ -92,6 +92,8 @@ struct ViewportDiagnostics {
     bool waterSurfacePreprocessPending = false;
     std::uint32_t rainParticleCapacity = 0U;
     std::uint32_t rainEventCapacity = 0U;
+    std::uint64_t pointDescriptorGenerationsAllocated = 0U;
+    std::uint64_t pointDescriptorGenerationsRetired = 0U;
 };
 
 struct WaterEffectFramePublicationDiagnostics {
@@ -100,7 +102,28 @@ struct WaterEffectFramePublicationDiagnostics {
     std::uint64_t exrGeneration = 0U;
     bool liveBuffersDistinct = false;
     bool exrBufferDistinct = false;
+    // Seepage topology is published as an immutable descriptor generation.
+    // Keeping the per-swapchain-image values visible makes startup and density
+    // switch smoke tests able to prove that every submitted descriptor refers
+    // to the same settled topology.
+    std::uint64_t topologyGeneration = 0U;
+    std::array<std::vector<std::uint64_t>, 2> liveDescriptorGenerations{};
+    std::uint64_t exrDescriptorGeneration = 0U;
+    std::uint32_t descriptorGenerationMismatchCount = 0U;
+    bool exrParamsPublicationRequired = false;
+    bool descriptorGenerationReady = false;
+    // Retained for source compatibility with older diagnostics consumers.
+    // Activation is generation-based now, so this is always zero.
     std::uint32_t activationFramesRemaining = 0U;
+};
+
+struct LiveSceneReadback {
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    std::uint32_t submittedFrameSlot = 0U;
+    std::uint32_t swapchainImageIndex = 0U;
+    std::vector<std::uint8_t> colorRgba8;
+    std::vector<float> linearDepth;
 };
 
 struct SceneRenderState {
@@ -252,6 +275,9 @@ struct WaterFlowGpuSourceDiagnostics {
     std::uint64_t completedRevision = 0U;
     std::uint64_t surfaceUploadRevision = 0U;
     std::uint64_t bytesTransferred = 0U;
+    std::uint64_t computeDescriptorGeneration = 0U;
+    std::uint64_t pointDescriptorGeneration = 0U;
+    std::uint64_t residentBytes = 0U;
     std::uint32_t computeDispatchCount = 0U;
     std::uint32_t pointCapacity = 0U;
     std::uint32_t activePointCount = 0U;
@@ -296,6 +322,22 @@ class VulkanViewportShell {
         std::size_t layerId,
         const invisible_places::io::LoadedPointCloud& cloud,
         const std::vector<std::uint32_t>& sampledIndices);
+    // A density transaction can bracket several remove/upload/attachment
+    // operations so executable point command buffers are settled and reset
+    // exactly once. Calls may be nested; only the outer pair owns the settle.
+    void BeginPointCloudMutationBatch();
+    void EndPointCloudMutationBatch();
+    void SetSmokeFailNextPointCloudUploadAfterPartialAllocation(bool enabled = true);
+    void SetSmokeFailNextWaterFlowUploadAfterPartialAllocation(bool enabled = true);
+    [[nodiscard]] bool HasPointCloudResources(std::size_t layerId) const;
+    // Geometry residency includes active/pending/retired position, colour,
+    // normal, scalar, and sampled-index buffers. Compact effect/style and
+    // descriptor allocations are intentionally excluded from this bound.
+    [[nodiscard]] std::uint64_t PointCloudLayerResidentBytes(std::size_t layerId) const;
+    [[nodiscard]] std::uint64_t PointCloudResidentBytes() const;
+    [[nodiscard]] std::uint64_t PointCloudPeakResidentBytes() const;
+    [[nodiscard]] std::uint64_t LastPointCloudMutationBatchPeakResidentBytes() const;
+    [[nodiscard]] std::uint32_t LastPointCloudMutationBatchWaitCount() const;
     void UploadPointCloudScalarFields(
         std::size_t layerId,
         const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
@@ -366,6 +408,10 @@ class VulkanViewportShell {
     void ClearGaussianSplats();
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage RenderPointCloudExrFrame(
         const PointCloudExrFrameRequest& request);
+    // Synchronous smoke/diagnostic readback of the most recently presented
+    // live scene attachments. This deliberately does not use the independent
+    // EXR descriptor/render path.
+    [[nodiscard]] LiveSceneReadback ReadLiveSceneFrame();
     [[nodiscard]] bool BeginPointCloudExrFrame(const PointCloudExrFrameRequest& request);
     [[nodiscard]] PointCloudExrFrameStatus PollPointCloudExrFrame();
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage CompletePointCloudExrFrame();
@@ -388,6 +434,13 @@ class VulkanViewportShell {
     [[nodiscard]] bool DiagnosticsEnabled() const { return diagnosticsEnabled_; }
     void SetLiveSceneRenderingEnabled(bool enabled) { liveSceneRenderingEnabled_ = enabled; }
     [[nodiscard]] bool LiveSceneRenderingEnabled() const { return liveSceneRenderingEnabled_; }
+    // Smoke diagnostics can arm the existing live depth prepass even when the
+    // selected visual renderer does not otherwise need it. Normal viewport
+    // rendering pays no additional point-cloud pass.
+    void SetLiveSceneReadbackCaptureEnabled(bool enabled);
+    [[nodiscard]] bool LiveSceneReadbackCaptureEnabled() const {
+        return liveSceneReadbackCaptureEnabled_;
+    }
     void SetSceneCachingEnabled(bool enabled);
     [[nodiscard]] bool SceneCachingEnabled() const { return sceneCachingEnabled_; }
 
@@ -416,6 +469,8 @@ class VulkanViewportShell {
             BufferAllocation surfelIndexBuffer{};
             std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
             std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+            std::array<std::vector<std::uint64_t>, kFramesInFlight>
+                seepageDescriptorGenerations{};
             std::uint32_t indexCount = 0;
             PointHighlightStyle style{};
         };
@@ -432,6 +487,12 @@ class VulkanViewportShell {
         };
 
         std::size_t layerId = 0;
+        // Base, highlight, and EXR point descriptors are one immutable
+        // generation owned by this pool. Shape changes replace the complete
+        // pool after all command buffers referencing the prior generation are
+        // retired.
+        VkDescriptorPool pointDescriptorPool = VK_NULL_HANDLE;
+        std::uint64_t pointDescriptorGeneration = 0U;
         BufferAllocation positionBuffer{};
         BufferAllocation positionStorageBuffer{};
         BufferAllocation colorBuffer{};
@@ -457,6 +518,8 @@ class VulkanViewportShell {
         std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
         BufferAllocation exrStyleBuffer{};
         std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+        std::array<std::vector<std::uint64_t>, kFramesInFlight>
+            seepageDescriptorGenerations{};
         std::array<VkDescriptorSet, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDescriptorSets{};
         std::array<VkFence, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDispatchFences{};
         std::array<VkCommandBuffer, kDynamicMeshFlowLiveSlots> dynamicMeshFlowCommandBuffers{};
@@ -468,10 +531,15 @@ class VulkanViewportShell {
         BufferAllocation waterFlowPendingColorBuffer{};
         BufferAllocation waterFlowPendingNormalBuffer{};
         BufferAllocation waterFlowPendingScalarFieldBuffer{};
+        // The source-compute descriptor is an immutable one-set generation.
+        // Its pool is retired only after the dispatch fence has signalled and
+        // the command buffer retaining MoltenVK's resolved bindings is freed.
+        VkDescriptorPool waterFlowSourceDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet waterFlowSourceDescriptorSet = VK_NULL_HANDLE;
         VkFence waterFlowSourceDispatchFence = VK_NULL_HANDLE;
         VkCommandBuffer waterFlowSourceCommandBuffer = VK_NULL_HANDLE;
         VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
+        std::uint64_t seepageExrDescriptorGeneration = 0U;
         BufferAllocation sampledIndexBuffer{};
         BufferAllocation sampledSurfelIndexBuffer{};
         BufferAllocation interactiveSampledIndexBuffer{};
@@ -504,11 +572,7 @@ class VulkanViewportShell {
         std::uint64_t seepageParamsGeneration = 0;
         std::array<std::uint64_t, kFramesInFlight> seepageParamsFrameGenerations{};
         std::uint64_t seepageParamsExrGeneration = 0;
-        // A newly enabled Seepage topology is armed only after each live frame
-        // slot has submitted one base-cloud frame. This keeps the first
-        // descriptor publication out of the same presentation cycle that
-        // commits a newly loaded display bundle.
-        std::uint32_t seepageActivationFramesRemaining = 0U;
+        std::uint64_t seepageTopologyGeneration = 0U;
         std::vector<std::byte> pendingSeepageParams;
         std::vector<std::uint32_t> seepageTopologyNodeIds;
         const invisible_places::water::MeshSurfaceCache* dynamicMeshFlowCacheIdentity = nullptr;
@@ -532,6 +596,7 @@ class VulkanViewportShell {
         std::uint64_t waterFlowSourceCompletedRevision = 0U;
         std::uint64_t waterFlowSourceSurfaceUploadRevision = 0U;
         std::uint64_t waterFlowSourceBytesTransferred = 0U;
+        std::uint64_t waterFlowSourceDescriptorGeneration = 0U;
         invisible_places::water::WaterFlowGpuOutputLayout waterFlowPendingLayout{};
         std::uint32_t waterFlowSparePointCapacity = 0U;
         std::uint64_t waterFlowPendingRevision = 0U;
@@ -554,7 +619,6 @@ class VulkanViewportShell {
         std::vector<std::uint32_t> activeSparseRipplePointIndices;
         std::vector<PointHighlightResources> highlights;
         std::vector<WaterFlowRetiredOutputResources> waterFlowRetiredOutputs;
-        std::uint32_t waterFlowDescriptorRefreshFrameMask = 0U;
         std::uint32_t waterFlowDeleteOutstandingFrameMask = 0U;
         bool waterFlowDeletePending = false;
     };
@@ -619,6 +683,10 @@ class VulkanViewportShell {
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        // The EXR composite descriptor binds this generation's attachments,
+        // so it is retired with the attachments instead of accumulating in
+        // the long-lived viewport descriptor pool.
+        VkDescriptorPool compositeDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet compositeDescriptorSet = VK_NULL_HANDLE;
         VkPipeline pointDepthPipeline = VK_NULL_HANDLE;
         VkPipeline pointAccumulationPipeline = VK_NULL_HANDLE;
@@ -647,6 +715,16 @@ class VulkanViewportShell {
         BufferAllocation uniformBuffer{};
     };
 
+    struct PendingPointDescriptorGeneration {
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
+        std::array<std::vector<std::uint64_t>, kFramesInFlight> seepageDescriptorGenerations{};
+        std::vector<std::array<std::vector<VkDescriptorSet>, kFramesInFlight>> highlightDescriptorSets;
+        std::vector<std::array<std::vector<std::uint64_t>, kFramesInFlight>> highlightSeepageDescriptorGenerations;
+        VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
+        std::uint64_t seepageExrDescriptorGeneration = 0U;
+    };
+
     struct WaterSurfacePendingGpuUpload {
         // Resident tables are swapped into Rain and Flow descriptors only
         // after preprocessing signals. Upload staging is bounded and released
@@ -657,7 +735,9 @@ class VulkanViewportShell {
         BufferAllocation flowSurfaceTableBuffer{};
         BufferAllocation preprocessUniformBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
+        VkDescriptorPool rainDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet preprocessDescriptorSet = VK_NULL_HANDLE;
+        VkDescriptorPool preprocessDescriptorPool = VK_NULL_HANDLE;
         VkCommandBuffer preprocessCommandBuffer = VK_NULL_HANDLE;
         VkFence preprocessFence = VK_NULL_HANDLE;
         invisible_places::io::Bounds3f bounds{};
@@ -681,6 +761,7 @@ class VulkanViewportShell {
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
+        VkDescriptorPool rainDescriptorPool = VK_NULL_HANDLE;
         std::uint32_t outstandingFrameMask = 0U;
         bool outstandingExr = false;
     };
@@ -698,7 +779,9 @@ class VulkanViewportShell {
         std::array<BufferAllocation, kFramesInFlight> uniformBuffers{};
         BufferAllocation exrUniformBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet exrDescriptorSet = VK_NULL_HANDLE;
+        VkDescriptorPool exrDescriptorPool = VK_NULL_HANDLE;
         WaterSurfacePendingGpuUpload pendingSurfaceUpload{};
         std::vector<WaterSurfacePendingGpuUpload> abandonedSurfaceUploads;
         std::vector<WaterSurfaceRetiredGpuResources> retiredSurfaceResources;
@@ -794,73 +877,68 @@ class VulkanViewportShell {
     void CleanupWaterSurfaceRetiredResources(WaterSurfaceRetiredGpuResources* retired);
     void UpdateRainRuntimeTiming(const SceneRenderState& state);
     void UploadRainUniforms(std::size_t frameIndex, std::uint32_t width, std::uint32_t height);
-    void UploadRainUniformsToBuffer(
-        const BufferAllocation& target,
-        std::uint32_t width,
-        std::uint32_t height);
+    void UploadRainUniformsToBuffer(const BufferAllocation& target, std::uint32_t width, std::uint32_t height);
     void RecordRainCompute(VkCommandBuffer commandBuffer, std::size_t frameIndex);
-    void RecordRainComputeWithDescriptor(
-        VkCommandBuffer commandBuffer,
-        VkDescriptorSet descriptorSet,
-        const BufferAllocation* counterReadback);
+    void RecordRainComputeWithDescriptor(VkCommandBuffer commandBuffer, VkDescriptorSet descriptorSet,
+                                         const BufferAllocation* counterReadback);
     void RecordRainDraw(VkCommandBuffer commandBuffer, std::size_t frameIndex, VkPipeline pipeline);
-    void RecordRainDrawWithDescriptor(
-        VkCommandBuffer commandBuffer,
-        VkDescriptorSet descriptorSet,
-        VkPipeline pipeline);
+    void RecordRainDrawWithDescriptor(VkCommandBuffer commandBuffer, VkDescriptorSet descriptorSet,
+                                      VkPipeline pipeline);
     void CleanupRainResources();
     void FlushSparseWaterRippleParamsForFrame(std::size_t frameIndex);
     void FlushSparseWaterRippleParamsForExr();
     void FlushWaterSeepageParamsForFrame(std::size_t frameIndex);
     void FlushWaterSeepageParamsForExr();
-    void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources);
+    void UpdatePointCloudDescriptorSets(ActivePointCloudResources* resources,
+                                        VkDescriptorPool allocationPool = VK_NULL_HANDLE);
+    void ReplacePointCloudDescriptorSets(ActivePointCloudResources* resources);
+    [[nodiscard]] PendingPointDescriptorGeneration BuildPointDescriptorGeneration(ActivePointCloudResources* resources,
+                                                                                  VkImageView exrDepthView);
+    void InstallPointDescriptorGeneration(ActivePointCloudResources* resources,
+                                          PendingPointDescriptorGeneration* generation);
+    void DestroyPointDescriptorGeneration(PendingPointDescriptorGeneration* generation);
+    [[nodiscard]] VkDescriptorPool CreatePointDescriptorPool(std::size_t highlightCount, bool includeExrDescriptor);
+    void DestroyPointDescriptorPool(VkDescriptorPool* descriptorPool);
+    void ResetPointCloudReferencingCommandBuffers();
+    void SettlePointCloudMutation();
+    [[nodiscard]] std::uint64_t PointCloudResourceResidentBytes(const ActivePointCloudResources& resources) const;
+    void TrackPointCloudResidentPeak(std::uint64_t unpublishedBytes = 0U);
+    void DestroyPointCloudResources(ActivePointCloudResources* resources);
+    void RetirePointCloudDescriptorSets(std::array<std::vector<VkDescriptorSet>, kFramesInFlight>* descriptorSets);
     void UpdateDynamicMeshFlowDescriptorSet(ActivePointCloudResources* resources, std::size_t liveSlot);
-    void UpdateWaterFlowSourceDescriptorSet(
-        ActivePointCloudResources* resources,
-        const WaterSurfaceFlowGpuView& surfaceView);
-    void DispatchWaterFlowSourceCompute(
-        ActivePointCloudResources* resources,
-        const invisible_places::water::WaterFlowGpuOutputLayout& layout);
+    void UpdateWaterFlowSourceDescriptorSet(ActivePointCloudResources* resources,
+                                            const WaterSurfaceFlowGpuView& surfaceView);
+    void CreateWaterFlowDummyPointResources(ActivePointCloudResources* resources);
+    void RetireWaterFlowSourceComputeGeneration(ActivePointCloudResources* resources);
+    [[nodiscard]] VkDescriptorPool CreateWaterFlowSourceDescriptorPool();
+    void DispatchWaterFlowSourceCompute(ActivePointCloudResources* resources,
+                                        const invisible_places::water::WaterFlowGpuOutputLayout& layout);
     void PollWaterFlowSourceDispatches();
     void PrepareDynamicMeshFlowDispatchSlot(ActivePointCloudResources* resources, std::size_t liveSlot);
-    void DispatchDynamicMeshFlowCompute(
-        ActivePointCloudResources* resources,
-        std::uint32_t particleCount,
-        std::size_t liveSlot);
-    void UpdatePointCloudDescriptorSet(
-        ActivePointCloudResources* resources,
-        std::size_t frameIndex,
-        std::uint32_t imageIndex,
-        VkImageView sceneDepthView);
-    void UpdatePointHighlightDescriptorSets(
-        ActivePointCloudResources* resources,
-        ActivePointCloudResources::PointHighlightResources* highlight);
-    void UpdatePointHighlightDescriptorSet(
-        ActivePointCloudResources* resources,
-        ActivePointCloudResources::PointHighlightResources* highlight,
-        std::size_t frameIndex,
-        std::uint32_t imageIndex,
-        VkImageView sceneDepthView);
-    void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView);
+    void DispatchDynamicMeshFlowCompute(ActivePointCloudResources* resources, std::uint32_t particleCount,
+                                        std::size_t liveSlot);
+    void UpdatePointCloudDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex,
+                                       std::uint32_t imageIndex, VkImageView sceneDepthView,
+                                       VkDescriptorPool allocationPool = VK_NULL_HANDLE);
+    void UpdatePointHighlightDescriptorSets(ActivePointCloudResources* resources,
+                                            ActivePointCloudResources::PointHighlightResources* highlight,
+                                            VkDescriptorPool allocationPool = VK_NULL_HANDLE);
+    void UpdatePointHighlightDescriptorSet(ActivePointCloudResources* resources,
+                                           ActivePointCloudResources::PointHighlightResources* highlight,
+                                           std::size_t frameIndex, std::uint32_t imageIndex, VkImageView sceneDepthView,
+                                           VkDescriptorPool allocationPool = VK_NULL_HANDLE);
+    void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView,
+                                          VkDescriptorPool allocationPool = VK_NULL_HANDLE);
     void CreateOrUpdateCompositeDescriptorSet();
-    void CreateOrUpdateCompositeDescriptorSet(
-        VkDescriptorSet* descriptorSet,
-        VkImageView accumulationView,
-        VkImageView revealageView,
-        VkImageView emissiveView);
-    void CreateOrUpdateCompositeDescriptorSet(
-        VkDescriptorSet* descriptorSet,
-        VkImageView accumulationView,
-        VkImageView revealageView,
-        VkImageView emissiveView,
-        VkImageView normalAccumulationView,
-        VkImageView albedoAccumulationView);
+    void CreateOrUpdateCompositeDescriptorSet(VkDescriptorSet* descriptorSet, VkImageView accumulationView,
+                                              VkImageView revealageView, VkImageView emissiveView);
+    void CreateOrUpdateCompositeDescriptorSet(VkDescriptorSet* descriptorSet, VkImageView accumulationView,
+                                              VkImageView revealageView, VkImageView emissiveView,
+                                              VkImageView normalAccumulationView, VkImageView albedoAccumulationView);
     void CreateOrUpdatePostProcessDescriptorSets();
     void UpdateGaussianSplatDescriptorSets(ActiveGaussianSplatResources* resources);
-    void UpdateGaussianSplatDescriptorSet(
-        ActiveGaussianSplatResources* resources,
-        std::size_t frameIndex,
-        std::uint32_t imageIndex);
+    void UpdateGaussianSplatDescriptorSet(ActiveGaussianSplatResources* resources, std::size_t frameIndex,
+                                          std::uint32_t imageIndex);
     void UpdateHighQualityGaussianDescriptorSet(std::size_t frameIndex);
     void RefreshHighQualityGaussianScene(std::size_t frameIndex);
     void CleanupSwapchain();
@@ -868,14 +946,13 @@ class VulkanViewportShell {
     void CleanupPointHighlightResources(ActivePointCloudResources::PointHighlightResources* highlight);
     void CleanupGaussianSplatResources(ActiveGaussianSplatResources* resources);
     void CleanupHighQualityGaussianScene();
+    void DestroyExrExportResources(ExrExportResources* resources);
     void CleanupExrExportResources();
     void RecreateSwapchain();
     void RecordCommandBuffer(VkCommandBuffer commandBuffer, std::uint32_t imageIndex, std::size_t frameIndex);
     void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
-    [[nodiscard]] invisible_places::output::HalfRgbaExrImage ReadCompletedExrExportFrame(
-        PointCloudExrReadbackMask readbackMask,
-        std::uint32_t width,
-        std::uint32_t height);
+    [[nodiscard]] invisible_places::output::HalfRgbaExrImage
+    ReadCompletedExrExportFrame(PointCloudExrReadbackMask readbackMask, std::uint32_t width, std::uint32_t height);
     [[nodiscard]] bool SceneImageNeedsRender(std::uint32_t imageIndex) const;
     [[nodiscard]] bool AnySceneImageNeedsRender() const;
     [[nodiscard]] bool ResolvePointCloudDrawPlan(
@@ -886,8 +963,10 @@ class VulkanViewportShell {
         const SceneRenderState::PointCloudLayerState& layer,
         const PointCloudDrawPlan& plan,
         std::size_t frameIndex,
+        std::uint32_t imageIndex,
         bool exrStyle,
-        const BufferAllocation* styleBufferOverride = nullptr);
+        const BufferAllocation* styleBufferOverride = nullptr,
+        const bool* seepageDescriptorReadyOverride = nullptr);
     [[nodiscard]] bool RecordPointCloudLayerDraw(
         VkCommandBuffer commandBuffer,
         const SceneRenderState::PointCloudLayerState& layer,
@@ -1035,6 +1114,10 @@ class VulkanViewportShell {
     HighQualityGaussianSceneResources highQualityGaussianScene_{};
     ExrExportResources exrExportResources_{};
     RainGpuResources rainResources_{};
+    BufferAllocation liveSceneReadbackBuffer_{};
+    std::uint32_t lastSubmittedFrameSlot_ = 0U;
+    std::uint32_t lastSubmittedImageIndex_ = 0U;
+    bool lastSubmittedSceneImageValid_ = false;
     bool exrExportFrameInFlight_ = false;
     std::uint32_t exrExportInFlightWidth_ = 0;
     std::uint32_t exrExportInFlightHeight_ = 0;
@@ -1045,7 +1128,16 @@ class VulkanViewportShell {
     ViewportDiagnostics diagnostics_{};
     bool diagnosticsEnabled_ = false;
     bool liveSceneRenderingEnabled_ = true;
+    bool liveSceneReadbackCaptureEnabled_ = false;
     bool sceneCachingEnabled_ = false;
+    std::uint32_t pointCloudMutationBatchDepth_ = 0U;
+    std::uint32_t pointCloudMutationBatchWaitCount_ = 0U;
+    std::uint32_t lastPointCloudMutationBatchWaitCount_ = 0U;
+    std::uint64_t pointCloudResidentPeakBytes_ = 0U;
+    std::uint64_t pointCloudMutationBatchPeakBytes_ = 0U;
+    std::uint64_t lastPointCloudMutationBatchPeakBytes_ = 0U;
+    bool smokeFailNextPointCloudUploadAfterPartialAllocation_ = false;
+    bool smokeFailNextWaterFlowUploadAfterPartialAllocation_ = false;
     std::uint64_t sceneRevision_ = 1;
     std::vector<std::uint64_t> sceneImageRevisions_;
     bool diagnosticsTimingInitialized_ = false;

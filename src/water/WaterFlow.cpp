@@ -3702,11 +3702,9 @@ bool SeepageNodeReferencePreferred(
     }
     const auto& left = nodes[leftIndex];
     const auto& right = nodes[rightIndex];
-    // Candidate membership is topology. Rank with authored maximum strength so
-    // keyed activity changes never require rebuilding overlapping cells.
-    if (std::abs(left.authoredStrength - right.authoredStrength) > 1.0e-6F) {
-        return left.authoredStrength > right.authoredStrength;
-    }
+    // Candidate membership is immutable topology. Rank only by authored
+    // geometry and stable identity so strength, visibility, seed, look, and
+    // animation edits cannot change an overflowing cell's retained set.
     const glm::vec3 cellCenter{
         (static_cast<float>(cellX) + 0.5F) * cellSizeMeters,
         (static_cast<float>(cellY) + 0.5F) * cellSizeMeters,
@@ -3719,9 +3717,6 @@ bool SeepageNodeReferencePreferred(
     }
     if (left.id != right.id) {
         return left.id < right.id;
-    }
-    if (left.seed != right.seed) {
-        return left.seed < right.seed;
     }
     return leftIndex < rightIndex;
 }
@@ -5568,7 +5563,12 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     float largestSpan = 0.0F;
     for (const auto& node : nodes) {
         const bool enabled = forExport ? node.enabledInExport : node.enabledInViewport;
-        if (!enabled || !SeepageNodeTargetsRole(node, targetSceneRole) || !IsValidPoint(ToGlm(node.position))) {
+        // Export snapshots retain their established filtering semantics. Live
+        // viewport topology keeps disabled nodes indexed and publishes their
+        // visibility through the parameter record instead.
+        if ((forExport && !enabled) ||
+            !SeepageNodeTargetsRole(node, targetSceneRole) ||
+            !IsValidPoint(ToGlm(node.position))) {
             continue;
         }
         const auto authoredLook = ResolveWaterSeepageLook(node, profiles, defaultLook);
@@ -5624,6 +5624,7 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             SeepageFiniteOr(node.strength, 1.0F),
             0.0F,
             8.0F);
+        runtime.enabledFactor = enabled ? 1.0F : 0.0F;
         runtime.authoredLook = authoredLook;
         ApplySeepageRuntimeScenarioAndAnimation(
             &runtime,
@@ -5791,6 +5792,7 @@ void ApplyWaterSeepageRuntimeParameters(
                 SeepageFiniteOr(authored->strength, 1.0F),
                 0.0F,
                 8.0F);
+            runtime.enabledFactor = authored->enabledInViewport ? 1.0F : 0.0F;
             runtime.authoredLook = ResolveWaterSeepageLook(
                 *authored,
                 profiles,
@@ -5831,7 +5833,7 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     float timeSeconds,
     const WaterSeepageViewContext& viewContext) {
     WaterSeepageRuntimeContribution contribution;
-    if (!IsValidPoint(ToGlm(position)) || node.reachMeters <= 0.0F ||
+    if (!IsValidPoint(ToGlm(position)) || node.enabledFactor <= 0.0F || node.reachMeters <= 0.0F ||
         node.strength <= 0.0F || node.effectiveActivity <= 0.0F) {
         return contribution;
     }
@@ -5957,6 +5959,80 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
     return result;
 }
 
+std::string WaterSeepageAuthoredTopologyFingerprint(
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetSceneRole) {
+    const auto normalizedTargetRole = NormalizeSeepageRole(targetSceneRole);
+    std::vector<std::string> nodeFingerprints;
+    nodeFingerprints.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        if (!SeepageNodeTargetsRole(node, normalizedTargetRole)) {
+            continue;
+        }
+
+        std::uint64_t nodeHash = 1469598103934665603ULL;
+        SeepageFingerprintU32(&nodeHash, 1U);
+        SeepageFingerprintU32(&nodeHash, node.id);
+        SeepageFingerprintFloat(&nodeHash, node.position.x);
+        SeepageFingerprintFloat(&nodeHash, node.position.y);
+        SeepageFingerprintFloat(&nodeHash, node.position.z);
+        SeepageFingerprintFloat(&nodeHash, node.surfaceNormal.x);
+        SeepageFingerprintFloat(&nodeHash, node.surfaceNormal.y);
+        SeepageFingerprintFloat(&nodeHash, node.surfaceNormal.z);
+        SeepageFingerprintFloat(&nodeHash, node.downAxis.x);
+        SeepageFingerprintFloat(&nodeHash, node.downAxis.y);
+        SeepageFingerprintFloat(&nodeHash, node.downAxis.z);
+        SeepageFingerprintFloat(&nodeHash, node.reachMeters);
+        SeepageFingerprintFloat(&nodeHash, node.startWidthMeters);
+        SeepageFingerprintFloat(&nodeHash, node.endWidthMeters);
+        SeepageFingerprintFloat(&nodeHash, node.edgeFeatherMeters);
+        SeepageFingerprintFloat(&nodeHash, node.depthToleranceMeters);
+        nodeFingerprints.push_back(SeepageFingerprintString(nodeHash));
+    }
+    std::sort(nodeFingerprints.begin(), nodeFingerprints.end());
+
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintText(&hash, normalizedTargetRole);
+    SeepageFingerprintU32(
+        &hash,
+        static_cast<std::uint32_t>(nodeFingerprints.size()));
+    for (const auto& fingerprint : nodeFingerprints) {
+        SeepageFingerprintText(&hash, fingerprint);
+    }
+    return "water-seepage-authored-topology-v1-" + SeepageFingerprintString(hash);
+}
+
+bool WaterSeepageGridHasActiveViewportEffect(
+    const WaterSeepageSpatialGrid& grid) {
+    constexpr float activeThreshold = 1.0e-6F;
+    return std::any_of(
+        grid.nodes.begin(),
+        grid.nodes.end(),
+        [](const WaterSeepageRuntimeNode& node) {
+            if (node.enabledFactor <= activeThreshold ||
+                node.reachMeters <= activeThreshold ||
+                node.strength <= activeThreshold ||
+                node.effectiveActivity <= activeThreshold) {
+                return false;
+            }
+            const auto lookCanContribute = [&](const WaterSeepageLookSettings& look) {
+                return look.response.intensity > activeThreshold &&
+                       (look.pattern != WaterSeepagePattern::WettingTrickle ||
+                        node.wettingProgress > activeThreshold);
+            };
+            if (!node.transitionLook.has_value() ||
+                node.transitionAmount <= activeThreshold) {
+                return lookCanContribute(node.look);
+            }
+            if (node.transitionAmount >= 1.0F - activeThreshold) {
+                return lookCanContribute(node.transitionLook.value());
+            }
+            return lookCanContribute(node.look) ||
+                   lookCanContribute(node.transitionLook.value());
+        });
+}
+
 std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
     SeepageFingerprintU32(&hash, 2U);
@@ -6022,7 +6098,7 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
 
 std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 3U);
+    SeepageFingerprintU32(&hash, 4U);
     const auto fingerprintLook = [&](const WaterSeepageLookSettings& look) {
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.pattern));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
@@ -6072,6 +6148,7 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, node.rainVisualStrength);
         SeepageFingerprintFloat(&hash, node.scenarioSpread);
         SeepageFingerprintFloat(&hash, node.effectiveActivity);
+        SeepageFingerprintFloat(&hash, node.enabledFactor);
         SeepageFingerprintFloat(&hash, node.localSpread);
         SeepageFingerprintFloat(&hash, node.wettingProgress);
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(node.resolvedQuality));
@@ -6082,7 +6159,7 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
             fingerprintLook(node.transitionLook.value());
         }
     }
-    return "water-seepage-params-v3-" + SeepageFingerprintString(hash);
+    return "water-seepage-params-v4-" + SeepageFingerprintString(hash);
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {

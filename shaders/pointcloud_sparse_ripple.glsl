@@ -76,7 +76,8 @@ struct SeepageNodeTopology {
 struct SeepageNodeParams {
     // x: stable node id, y: quality (0 low, 1 balanced, 2 high), z: blend mode, w: seed.
     uvec4 control;
-    // y: normal-alignment weight, z: animation-composed strength,
+    // x: viewport enabled factor, y: normal-alignment weight,
+    // z: animation-composed strength,
     // w: rain visual strength.
     vec4 geometry;
     SeepageLook look;
@@ -2322,9 +2323,11 @@ SparseRippleComposite EvaluateSeepageContribution(
     uint pointIndex,
     float timeSeconds) {
     SparseRippleComposite contribution = EmptySparseRippleComposite();
-    // Strength is an animation-updated scalar. Reject inactive nodes before the
-    // surface-guide search and all procedural noise/reflection work.
-    if (seepageParamData.seepageParams[nodeIndex].geometry.z <= 1e-5) {
+    // Visibility and strength are animation-updated scalars. Reject inactive
+    // nodes before the surface-guide search and all procedural work, keeping a
+    // Visible toggle parameter-only.
+    if (seepageParamData.seepageParams[nodeIndex].geometry.x <= 1e-5 ||
+        seepageParamData.seepageParams[nodeIndex].geometry.z <= 1e-5) {
         return contribution;
     }
     float downstreamDistance;

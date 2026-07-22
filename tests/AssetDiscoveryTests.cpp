@@ -1599,6 +1599,9 @@ TEST_CASE("Seepage cannot publish non-finite point material outputs", "[water][s
           std::string::npos);
     CHECK(sparseRipple.find("const uint available = styleData.seepageControl.w - start;") !=
           std::string::npos);
+    CHECK(sparseRipple.find(
+              "seepageParamData.seepageParams[nodeIndex].geometry.x <= 1e-5") !=
+          std::string::npos);
 
     const auto preview = readShader(shaderRoot / "pointcloud_preview.vert");
     CHECK(preview.find("RippleFiniteFloat(resolvedPointSize)") != std::string::npos);

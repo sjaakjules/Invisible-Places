@@ -2473,6 +2473,82 @@ RainImpactGrid BuildRainImpactGrid(
     return grid;
 }
 
+float EvaluateRockRainImpactValue(
+    const RainImpactEvent& event,
+    const io::Float3& point,
+    const io::Float3& pointNormal,
+    float timeSeconds) {
+    const float age = timeSeconds - event.birthTimeSeconds;
+    if (event.role != WaterSurfaceRole::Rock || age < 0.0F ||
+        age > event.lifetimeSeconds) {
+        return 0.0F;
+    }
+
+    io::Float3 eventNormal;
+    if (Dot(event.normal, event.normal) > 1.0e-8F) {
+        eventNormal = Normalize(event.normal);
+    } else if (Dot(pointNormal, pointNormal) > 1.0e-8F) {
+        eventNormal = Normalize(pointNormal);
+    } else {
+        eventNormal = {0.0F, 0.0F, 1.0F};
+    }
+
+    const float safeLifetime = std::max(0.001F, event.lifetimeSeconds);
+    const float life = std::clamp(age / safeLifetime, 0.0F, 1.0F);
+    const float effectiveRadius = std::max(
+        0.001F,
+        event.radiusMeters * std::sqrt(2.0F / 3.0F));
+    const float growthSeconds =
+        2.0F * std::clamp(event.lifetimeSeconds * 0.18F, 0.55F, 0.95F);
+    const float growth = SmoothStep(0.0F, growthSeconds, age);
+
+    const io::Float3 gravity{0.0F, 0.0F, -1.0F};
+    const auto projectedGravity = Subtract(
+        gravity,
+        Scale(eventNormal, Dot(gravity, eventNormal)));
+    const float projectedGravityLengthSquared =
+        Dot(projectedGravity, projectedGravity);
+    const auto downhill = projectedGravityLengthSquared > 1.0e-8F
+        ? Scale(projectedGravity, 1.0F / std::sqrt(projectedGravityLengthSquared))
+        : io::Float3{};
+    const float driftStartLife = std::clamp(
+        growthSeconds / safeLifetime,
+        0.0F,
+        0.9F);
+    const float drift = driftStartLife < 0.9F
+        ? SmoothStep(driftStartLife, 0.9F, life)
+        : 0.0F;
+    const auto impactCentre = Add(
+        event.position,
+        Scale(downhill, effectiveRadius * 0.2F * drift));
+
+    const auto offset = Subtract(point, impactCentre);
+    const float normalDistance = std::abs(Dot(offset, eventNormal));
+    const auto tangentOffset = Subtract(
+        offset,
+        Scale(eventNormal, Dot(offset, eventNormal)));
+    const float normalizedDistance =
+        std::sqrt(
+            Dot(tangentOffset, tangentOffset) +
+            normalDistance * normalDistance * 4.0F) /
+        effectiveRadius;
+    // Retain the original broad-phase cells: once downhill drift begins, the
+    // late feather plus the 20% centre travel still fits inside eventRadius.
+    const float edgeWidth = 0.02F + (1.0F - growth) * 0.14F;
+    const float lowerPointWeight = SmoothStep(
+        -0.45F,
+        0.45F,
+        (event.position.z - point.z) / effectiveRadius);
+    const float heightGain = std::lerp(0.8F, 1.2F, lowerPointWeight);
+    const float fadeStart = std::lerp(0.4F, 0.7F, lowerPointWeight);
+    return (1.0F - SmoothStep(
+                       std::max(0.0F, growth - edgeWidth),
+                       growth + edgeWidth,
+                       normalizedDistance)) *
+           (1.0F - SmoothStep(fadeStart, 1.0F, life)) *
+           heightGain;
+}
+
 RainImpactEffect EvaluateRainImpact(
     const RainImpactGrid& grid,
     WaterSurfaceRole pointRole,
@@ -2505,21 +2581,11 @@ RainImpactEffect EvaluateRainImpact(
             value = std::exp(-(ringDistance * ringDistance) / (thickness * thickness)) *
                     SmoothStep(1.0F, 0.72F, life);
         } else if (pointRole == WaterSurfaceRole::Rock) {
-            const auto offset = Subtract(point, event.position);
-            const auto eventNormal = Normalize(event.normal);
-            const float normalDistance = std::abs(Dot(offset, eventNormal));
-            const auto tangentOffset = Subtract(offset, Scale(eventNormal, Dot(offset, eventNormal)));
-            const float normalizedDistance =
-                std::sqrt(Dot(tangentOffset, tangentOffset) + normalDistance * normalDistance * 4.0F) /
-                std::max(0.001F, event.radiusMeters);
-            const float growthSeconds = std::clamp(event.lifetimeSeconds * 0.18F, 0.55F, 0.95F);
-            const float growth = SmoothStep(0.0F, growthSeconds, age);
-            const float edgeWidth = 0.07F + (1.0F - growth) * 0.09F;
-            value = (1.0F - SmoothStep(
-                         std::max(0.0F, growth - edgeWidth),
-                         growth + edgeWidth,
-                         normalizedDistance)) *
-                    (1.0F - SmoothStep(0.55F, 1.0F, life));
+            value = EvaluateRockRainImpactValue(
+                event,
+                point,
+                normal,
+                timeSeconds);
         } else if (pointRole == WaterSurfaceRole::Vegetation) {
             value = EvaluateVegetationSprinkle(event, point, age);
         }
@@ -2546,7 +2612,6 @@ RainImpactEffect EvaluateRainImpact(
             evaluateEvent(grid.events[cell.vegetation[index]]);
         }
     }
-    (void)normal;
     return effect;
 }
 

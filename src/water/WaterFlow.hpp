@@ -407,6 +407,10 @@ struct WaterSeepageRuntimeNode {
     float rainVisualStrength = 0.0F;
     float scenarioSpread = 0.0F;
     float effectiveActivity = 1.0F;
+    // Viewport visibility is a compact live parameter. Disabled viewport
+    // nodes remain in the spatial topology so toggling them cannot require a
+    // descriptor or hash-grid rebuild.
+    float enabledFactor = 1.0F;
     float localSpread = 0.0F;
     float wettingProgress = 1.0F;
     float authoredStrength = 1.0F;
@@ -1031,6 +1035,14 @@ void ApplyWaterSeepageScenarioParameters(
     const invisible_places::io::Float3& normal,
     float timeSeconds,
     const WaterSeepageViewContext& viewContext = {});
+// Stable authored identity for the compact topology of one terrain role.
+// Live look, visibility, strength, seed, and animation parameters are
+// deliberately excluded so they remain parameter-ring updates.
+[[nodiscard]] std::string WaterSeepageAuthoredTopologyFingerprint(
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetSceneRole);
+[[nodiscard]] bool WaterSeepageGridHasActiveViewportEffect(
+    const WaterSeepageSpatialGrid& grid);
 [[nodiscard]] std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid);
 [[nodiscard]] std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid);
 

@@ -993,6 +993,10 @@ struct PreviewLayerSession {
     bool hasNormals = false;
     bool hasFocusPoint = false;
     std::uint64_t totalPrimitives = 0;
+    // Monotonic identity for the CPU payload installed in this session. It is
+    // runtime-only and prevents standalone Seepage guides from surviving an
+    // unload/reload of different content at the same path.
+    std::uint64_t pointCloudContentGeneration = 0U;
     invisible_places::io::Bounds3f localBounds{};
     invisible_places::io::Bounds3f bounds{};
     invisible_places::io::Float3 localFocusPoint{};
@@ -1115,6 +1119,12 @@ struct ScenePointCloudRuntime {
     bool mixedDisplay = false;
     std::uint64_t switchGeneration = 0U;
     std::size_t stagedReadyCount = 0U;
+    std::uint64_t lastSwitchOldGpuResidentBytes = 0U;
+    std::uint64_t lastSwitchTargetGpuResidentBytes = 0U;
+    std::uint64_t lastSwitchPeakGpuResidentBytes = 0U;
+    std::uint32_t lastSwitchGpuSettleCount = 0U;
+    bool lastSwitchFailedTargetResourcesClean = true;
+    std::optional<std::size_t> smokeInjectedUploadFailureRoleIndex;
     std::uint8_t deferredAnalysisActions = 0U;
     std::string switchError;
 };
@@ -1451,8 +1461,9 @@ struct WaterWorkflowState {
     std::uint32_t maxAutoSuggestions = 8;
     std::unordered_map<std::string, std::string> seepageTopologyFingerprints;
     std::unordered_map<std::string, std::string> seepageParamsFingerprints;
-    // Topology is retained per rendered layer. Animation and look edits mutate
-    // only the compact node parameters instead of rebuilding the spatial hash.
+    // Semantic topology is retained per scene role and shared by density
+    // variants. The fingerprint maps above are per-layer GPU attachments.
+    // Animation, visibility, and look edits mutate only compact parameters.
     std::unordered_map<std::string, WaterSeepageSpatialGrid> seepageRuntimeGrids;
     std::unordered_map<std::string, std::string> seepageRuntimeGuideKeys;
     std::unordered_map<std::string, std::vector<WaterSeepageSurfaceGuide>> seepageSurfaceGuides;
@@ -1463,6 +1474,8 @@ struct WaterWorkflowState {
         seepageSurfaceGuideNodeFingerprints;
     std::string seepageSurfaceGuideWarning;
     std::uint64_t seepageSurfaceGuideBuildCount = 0U;
+    std::uint64_t seepageTopologyBuildRevision = 0U;
+    std::uint64_t seepageDescriptorAttachmentRevision = 0U;
     std::uint64_t seepageTopologyUploadRevision = 0U;
     std::uint64_t seepageParamsUploadRevision = 0U;
     std::size_t seepageGpuBytes = 0U;
@@ -1496,6 +1509,7 @@ struct WaterWorkflowState {
 
 struct PreviewRuntimeState {
     std::vector<PreviewLayerSession> sessions;
+    std::uint64_t nextPointCloudContentGeneration = 1U;
     std::vector<ScenePointCloudRuntime> pointCloudScenes;
     std::optional<std::size_t> selectedSessionIndex;
     std::optional<PendingLayerLoad> pendingLoad;
@@ -1538,6 +1552,9 @@ std::uint64_t EffectiveWaterSeepageShaderInvocations(
     const PreviewRuntimeState& runtimeState);
 std::uint64_t EffectiveExportWaterSeepageShaderInvocations(
     const PreviewRuntimeState& runtimeState);
+void ForgetWaterSeepageLayerAttachment(
+    WaterWorkflowState* water,
+    std::size_t sessionIndex);
 
 const invisible_places::water::WaterScenarioDefinition* FindWaterScenarioDefinition(
     const WaterWorkflowState& water,
@@ -7430,6 +7447,12 @@ bool ActivateLoadedPointCloud(
     session.hasFocusPoint = cloud.hasFocusPoint;
     session.pivotSamples = BuildPivotSamples(cloud.positions, cloud.bounds);
     session.cpuResident = true;
+    session.pointCloudContentGeneration =
+        runtimeState->nextPointCloudContentGeneration;
+    if (runtimeState->nextPointCloudContentGeneration <
+        std::numeric_limits<std::uint64_t>::max()) {
+        ++runtimeState->nextPointCloudContentGeneration;
+    }
 
     session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
         cloud,
@@ -7484,8 +7507,8 @@ bool ActivateLoadedPointCloud(
         session.loaded = false;
         session.gpuResident = false;
         session.visible = false;
-        runtimeState->statusMessage = "Loaded analysis source " + session.displayName +
-                                      " to CPU memory (" +
+        runtimeState->statusMessage = "Loaded point-cloud data " + session.displayName +
+                                      " into CPU memory (" +
                                       FormatPointCount(session.totalPrimitives) + " points).";
         runtimeState->errorMessage.clear();
         std::cout << runtimeState->statusMessage << std::endl;
@@ -7580,9 +7603,9 @@ void BeginLayerLoad(
         return;
     }
 
-    const bool alreadyReady = purpose == PointCloudLoadPurpose::AnalysisCpuOnly
-                                  ? session.cpuResident
-                                  : session.gpuResident;
+    const bool cpuOnlyLoad = purpose == PointCloudLoadPurpose::AnalysisCpuOnly ||
+                             purpose == PointCloudLoadPurpose::StagedDisplay;
+    const bool alreadyReady = cpuOnlyLoad ? session.cpuResident : session.gpuResident;
     if (alreadyReady) {
         runtimeState->statusMessage = session.displayName + " is already loaded.";
         runtimeState->errorMessage.clear();
@@ -7629,7 +7652,9 @@ void BeginLayerLoad(
             .showUploadOverlayFrame = true,
             .startedAt = std::chrono::steady_clock::now(),
         };
-        runtimeState->statusMessage = "Uploading resident " + session.displayName + " to the GPU...";
+        runtimeState->statusMessage = cpuOnlyLoad
+                                          ? "Preparing resident " + session.displayName + " in CPU memory..."
+                                          : "Uploading resident " + session.displayName + " to the GPU...";
         runtimeState->errorMessage.clear();
         return;
     }
@@ -7707,9 +7732,13 @@ void PollPendingLayerLoad(
         pendingLoad.completedResult = std::move(completedResult);
         pendingLoad.phase = PendingLoadPhase::UploadPending;
         pendingLoad.showUploadOverlayFrame = true;
-        runtimeState->statusMessage = pendingLoad.purpose == PointCloudLoadPurpose::AnalysisCpuOnly
-                                          ? "Preparing analysis source " +
-                                                runtimeState->sessions[pendingLoad.sessionIndex].displayName + "..."
+        const bool cpuOnlyLoad =
+            pendingLoad.purpose == PointCloudLoadPurpose::AnalysisCpuOnly ||
+            pendingLoad.purpose == PointCloudLoadPurpose::StagedDisplay;
+        runtimeState->statusMessage = cpuOnlyLoad
+                                          ? "Preparing " +
+                                                runtimeState->sessions[pendingLoad.sessionIndex].displayName +
+                                                " in CPU memory..."
                                           : "Uploading " +
                                                 runtimeState->sessions[pendingLoad.sessionIndex].displayName +
                                                 " to the GPU...";
@@ -7725,13 +7754,15 @@ void PollPendingLayerLoad(
         const auto purpose = pendingLoad.purpose;
         const auto completedSessionIndex = pendingLoad.sessionIndex;
         const auto sceneSwitchGeneration = pendingLoad.sceneSwitchGeneration;
+        const bool cpuOnlyLoad = purpose == PointCloudLoadPurpose::AnalysisCpuOnly ||
+                                 purpose == PointCloudLoadPurpose::StagedDisplay;
         const PointCloudActivationOptions options{
-            .uploadToGpu = purpose != PointCloudLoadPurpose::AnalysisCpuOnly,
+            .uploadToGpu = !cpuOnlyLoad,
             .makeVisible = purpose == PointCloudLoadPurpose::Interactive,
             .selectSession = purpose == PointCloudLoadPurpose::Interactive,
             .focusWhenFirstVisible = purpose == PointCloudLoadPurpose::Interactive,
         };
-        const bool succeeded = purpose == PointCloudLoadPurpose::AnalysisCpuOnly
+        const bool succeeded = cpuOnlyLoad
                                    ? true
                                    : UploadResidentPointCloud(
                                          completedSessionIndex,
@@ -7790,8 +7821,11 @@ void PollPendingLayerLoad(
             }
 
             if constexpr (std::is_same_v<LoadType, invisible_places::io::PointCloudLoadResult>) {
+                const bool cpuOnlyLoad =
+                    completedPurpose == PointCloudLoadPurpose::AnalysisCpuOnly ||
+                    completedPurpose == PointCloudLoadPurpose::StagedDisplay;
                 const PointCloudActivationOptions options{
-                    .uploadToGpu = completedPurpose != PointCloudLoadPurpose::AnalysisCpuOnly,
+                    .uploadToGpu = !cpuOnlyLoad,
                     .makeVisible = completedPurpose == PointCloudLoadPurpose::Interactive,
                     .selectSession = completedPurpose == PointCloudLoadPurpose::Interactive,
                     .focusWhenFirstVisible = completedPurpose == PointCloudLoadPurpose::Interactive,
@@ -7890,6 +7924,7 @@ void UnloadLayerByIndex(
             session.pivotSamples.clear();
             session.offlinePointCloud.reset();
         }
+        ForgetWaterSeepageLayerAttachment(&runtimeState->water, sessionIndex);
         ClearPreviewLodSampleCache(&session);
         return;
     }
@@ -7912,6 +7947,7 @@ void UnloadLayerByIndex(
         session.pivotSamples.clear();
         session.offlinePointCloud.reset();
     }
+    ForgetWaterSeepageLayerAttachment(&runtimeState->water, sessionIndex);
     ClearPreviewLodSampleCache(&session);
 }
 
@@ -7922,6 +7958,132 @@ ScenePointCloudRuntime* FindScenePointCloudRuntimeContainingSession(
         return nullptr;
     }
     return FindScenePointCloudRuntime(runtimeState, runtimeState->sessions[sessionIndex]);
+}
+
+std::string WaterSeepageLayerAttachmentKey(std::size_t sessionIndex) {
+    return "layer=" + std::to_string(sessionIndex);
+}
+
+void ForgetWaterSeepageLayerAttachment(
+    WaterWorkflowState* water,
+    std::size_t sessionIndex) {
+    if (water == nullptr) {
+        return;
+    }
+    const auto key = WaterSeepageLayerAttachmentKey(sessionIndex);
+    water->seepageTopologyFingerprints.erase(key);
+    water->seepageParamsFingerprints.erase(key);
+}
+
+std::string WaterSeepageSurfaceCacheIdentityKey(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session,
+    const ScenePointCloudRuntime* scene) {
+    const auto& cache = runtimeState.water.waterSurfaceCache;
+    const auto sourceFolderKey = NormalizePathKey(session.sourcePath.parent_path());
+    const bool cacheMatchesSession =
+        cache != nullptr &&
+        ((scene != nullptr &&
+          runtimeState.water.waterSurfaceSceneGroupName == scene->sceneGroupName &&
+          runtimeState.water.waterSurfaceCacheSignature == scene->waterSurfaceSignature) ||
+         (scene == nullptr &&
+          std::any_of(
+              cache->sources.begin(),
+              cache->sources.end(),
+              [&](const auto& source) {
+                  return NormalizePathKey(source.sourcePath.parent_path()) == sourceFolderKey;
+              })));
+    if (cacheMatchesSession) {
+        const auto& identity = cache->cacheIdentity;
+        std::ostringstream value;
+        value << (identity.sourceSignature.empty()
+                      ? cache->signature
+                      : identity.sourceSignature);
+        if (identity.Valid()) {
+            value << ":" << std::hex << std::setfill('0');
+            for (const auto word : identity.contentDigest) {
+                value << std::setw(16) << word;
+            }
+        }
+        return value.str();
+    }
+    if (scene != nullptr && !scene->waterSurfaceSignature.empty()) {
+        return scene->waterSurfaceSignature;
+    }
+    std::ostringstream fallback;
+    fallback << std::setprecision(std::numeric_limits<double>::max_digits10)
+             << "standalone:" << NormalizePathKey(session.sourcePath)
+             << "|load=" << session.pointCloudContentGeneration
+             << "|points=" << session.totalPrimitives
+             << "|transform=" << NormalizePathKey(session.transformPath);
+    for (const auto value : session.localToWorld.values) {
+        fallback << ',' << value;
+    }
+    if (session.localBounds.valid) {
+        fallback << "|local_bounds="
+                 << session.localBounds.minimum.x << ','
+                 << session.localBounds.minimum.y << ','
+                 << session.localBounds.minimum.z << ','
+                 << session.localBounds.maximum.x << ','
+                 << session.localBounds.maximum.y << ','
+                 << session.localBounds.maximum.z;
+    }
+    return fallback.str();
+}
+
+std::string WaterSeepageSemanticTopologyKey(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& session) {
+    const auto* scene = FindScenePointCloudRuntime(runtimeState, session);
+    auto role = NormalizeSceneRoleName(session.sceneRole);
+    if (role == "VEGETATION") {
+        role = "VEG";
+    }
+    std::ostringstream key;
+    key << "seepage-role-topology-v2|scene="
+        << (scene != nullptr ? scene->sceneGroupName : session.sceneGroupName)
+        << "|folder="
+        << NormalizePathKey(
+               scene != nullptr ? scene->sourceFolder : session.sourcePath.parent_path())
+        << "|surface="
+        << WaterSeepageSurfaceCacheIdentityKey(runtimeState, session, scene)
+        << "|role=" << role
+        << "|authored="
+        << invisible_places::water::WaterSeepageAuthoredTopologyFingerprint(
+               runtimeState.water.seepageNodes,
+               role);
+    return key.str();
+}
+
+// A newly uploaded density variant receives the already-settled semantic
+// topology before it can become visible. This is a descriptor attachment, not
+// a guide trace or spatial-grid build.
+void AttachCachedWaterSeepageTopologyToSession(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::size_t sessionIndex) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        sessionIndex >= runtimeState->sessions.size()) {
+        return;
+    }
+    const auto& session = runtimeState->sessions[sessionIndex];
+    if (!IsAuthoredWaterTerrainSession(session)) {
+        return;
+    }
+    const auto semanticKey = WaterSeepageSemanticTopologyKey(*runtimeState, session);
+    const auto gridIt = runtimeState->water.seepageRuntimeGrids.find(semanticKey);
+    if (gridIt == runtimeState->water.seepageRuntimeGrids.end()) {
+        return;
+    }
+    const auto attachmentKey = WaterSeepageLayerAttachmentKey(sessionIndex);
+    viewport->UploadWaterSeepageTopology(sessionIndex, gridIt->second);
+    runtimeState->water.seepageTopologyFingerprints[attachmentKey] =
+        invisible_places::water::WaterSeepageTopologyFingerprint(gridIt->second);
+    runtimeState->water.seepageParamsFingerprints[attachmentKey] =
+        invisible_places::water::WaterSeepageParamsFingerprint(gridIt->second);
+    ++runtimeState->water.seepageDescriptorAttachmentRevision;
+    ++runtimeState->water.seepageTopologyUploadRevision;
+    ++runtimeState->water.seepageParamsUploadRevision;
 }
 
 const SceneDisplayBundleRuntime* FindSceneDisplayBundle(
@@ -8098,6 +8260,40 @@ void RollBackSceneDisplaySwitch(
     runtimeState->statusMessage.clear();
 }
 
+class PointCloudMutationBatchScope {
+  public:
+    explicit PointCloudMutationBatchScope(
+        invisible_places::renderer::core::VulkanViewportShell* viewport)
+        : viewport_{viewport} {
+        viewport_->BeginPointCloudMutationBatch();
+    }
+
+    PointCloudMutationBatchScope(const PointCloudMutationBatchScope&) = delete;
+    PointCloudMutationBatchScope& operator=(const PointCloudMutationBatchScope&) = delete;
+
+    ~PointCloudMutationBatchScope() noexcept {
+        if (viewport_ == nullptr) {
+            return;
+        }
+        try {
+            viewport_->EndPointCloudMutationBatch();
+        } catch (...) {
+            // The explicit Finish() path reports failures. During unwinding,
+            // preserving the original transaction exception takes priority.
+        }
+    }
+
+    void Finish() {
+        auto* viewport = std::exchange(viewport_, nullptr);
+        if (viewport != nullptr) {
+            viewport->EndPointCloudMutationBatch();
+        }
+    }
+
+  private:
+    invisible_places::renderer::core::VulkanViewportShell* viewport_ = nullptr;
+};
+
 bool CommitSceneDisplaySwitch(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -8109,7 +8305,8 @@ bool CommitSceneDisplaySwitch(
     }
     for (const auto sessionIndex : scene->pendingDisplaySessionIndices) {
         if (!sessionIndex.has_value() || sessionIndex.value() >= runtimeState->sessions.size() ||
-            !runtimeState->sessions[sessionIndex.value()].gpuResident) {
+            !runtimeState->sessions[sessionIndex.value()].cpuResident ||
+            runtimeState->sessions[sessionIndex.value()].offlinePointCloud == nullptr) {
             return false;
         }
     }
@@ -8118,6 +8315,181 @@ bool CommitSceneDisplaySwitch(
 
     const auto previousDisplay = scene->committedDisplaySessionIndices;
     const auto nextDisplay = scene->pendingDisplaySessionIndices;
+    scene->lastSwitchOldGpuResidentBytes = viewport->PointCloudResidentBytes();
+    scene->lastSwitchTargetGpuResidentBytes = 0U;
+    scene->lastSwitchPeakGpuResidentBytes = scene->lastSwitchOldGpuResidentBytes;
+    scene->lastSwitchGpuSettleCount = 0U;
+    scene->lastSwitchFailedTargetResourcesClean = true;
+
+    // The target bundle is staged in CPU memory. Settle once, retire the old
+    // GPU bundle, then upload all target roles hidden. No frame is submitted
+    // inside this transaction, so rendering can observe only a complete old or
+    // complete new role set. Nested resource mutations share this batch's one
+    // device settle, and the guard balances it if any Vulkan operation throws.
+    std::optional<PointCloudMutationBatchScope> mutationBatch;
+    try {
+        mutationBatch.emplace(viewport);
+    } catch (const std::exception& error) {
+        RollBackSceneDisplaySwitch(
+            runtimeState,
+            viewport,
+            scene,
+            "Could not settle the prior scene display before replacement: " +
+                std::string{error.what()});
+        return false;
+    }
+    std::vector<std::size_t> retiredPreviousSessions;
+    std::string transactionError;
+    for (const auto sessionIndex : previousDisplay) {
+        if (!sessionIndex.has_value() ||
+            std::find(nextDisplay.begin(), nextDisplay.end(), sessionIndex) != nextDisplay.end()) {
+            continue;
+        }
+        auto& session = runtimeState->sessions[sessionIndex.value()];
+        session.visible = false;
+        if (session.gpuResident) {
+            // Retain CPU data until every target role and its cached Seepage
+            // attachment succeeds, so rollback never rescans a PLY file.
+            retiredPreviousSessions.push_back(sessionIndex.value());
+            try {
+                UnloadLayerByIndex(runtimeState, viewport, sessionIndex.value(), false);
+            } catch (const std::exception& error) {
+                transactionError =
+                    "GPU retirement failed while replacing the scene display bundle: " +
+                    std::string{error.what()};
+                break;
+            }
+        }
+    }
+
+    std::vector<std::size_t> uploadedTargetSessions;
+    for (std::size_t roleIndex = 0U; roleIndex < nextDisplay.size(); ++roleIndex) {
+        if (!transactionError.empty()) {
+            break;
+        }
+        const auto sessionIndex = nextDisplay[roleIndex];
+        auto& session = runtimeState->sessions[sessionIndex.value()];
+        const bool alreadyInPreviousDisplay =
+            std::find(previousDisplay.begin(), previousDisplay.end(), sessionIndex) !=
+            previousDisplay.end();
+        if (!session.gpuResident) {
+            if (scene->smokeInjectedUploadFailureRoleIndex == roleIndex) {
+                scene->smokeInjectedUploadFailureRoleIndex.reset();
+                viewport->SetSmokeFailNextPointCloudUploadAfterPartialAllocation();
+            }
+            const bool uploaded = UploadResidentPointCloud(
+                sessionIndex.value(),
+                runtimeState,
+                viewport,
+                PointCloudActivationOptions{
+                    .uploadToGpu = true,
+                    .makeVisible = false,
+                    .selectSession = false,
+                    .focusWhenFirstVisible = false,
+                });
+            if (!uploaded) {
+                transactionError = runtimeState->errorMessage.empty()
+                                       ? "GPU upload failed while replacing the scene display bundle."
+                                       : runtimeState->errorMessage;
+                break;
+            }
+            uploadedTargetSessions.push_back(sessionIndex.value());
+        }
+        if (alreadyInPreviousDisplay) {
+            continue;
+        }
+        try {
+            AttachCachedWaterSeepageTopologyToSession(
+                runtimeState,
+                viewport,
+                sessionIndex.value());
+        } catch (const std::exception& error) {
+            transactionError =
+                "Seepage attachment failed while replacing the scene display bundle: " +
+                std::string{error.what()};
+            break;
+        }
+    }
+
+    if (!transactionError.empty()) {
+        for (const auto sessionIndex : uploadedTargetSessions) {
+            try {
+                UnloadLayerByIndex(runtimeState, viewport, sessionIndex, false);
+            } catch (const std::exception& error) {
+                transactionError +=
+                    " Partial target cleanup also failed: " + std::string{error.what()};
+            }
+        }
+
+        std::string restoreError;
+        for (const auto sessionIndex : retiredPreviousSessions) {
+            auto& session = runtimeState->sessions[sessionIndex];
+            if (!viewport->HasPointCloudResources(sessionIndex)) {
+                if (!UploadResidentPointCloud(
+                        sessionIndex,
+                        runtimeState,
+                        viewport,
+                        PointCloudActivationOptions{
+                            .uploadToGpu = true,
+                            .makeVisible = false,
+                            .selectSession = false,
+                            .focusWhenFirstVisible = false,
+                        })) {
+                    restoreError = runtimeState->errorMessage;
+                    continue;
+                }
+            } else {
+                session.loaded = true;
+                session.gpuResident = true;
+            }
+            try {
+                AttachCachedWaterSeepageTopologyToSession(
+                    runtimeState,
+                    viewport,
+                    sessionIndex);
+            } catch (const std::exception& error) {
+                restoreError = error.what();
+            }
+        }
+        for (const auto sessionIndex : previousDisplay) {
+            if (sessionIndex.has_value()) {
+                runtimeState->sessions[sessionIndex.value()].visible =
+                    scene->displayVisible &&
+                    runtimeState->sessions[sessionIndex.value()].gpuResident;
+            }
+        }
+        if (!restoreError.empty()) {
+            transactionError += " Previous display restoration also failed: " + restoreError;
+        }
+        RollBackSceneDisplaySwitch(runtimeState, viewport, scene, transactionError);
+        // The partial target has been removed and the complete prior bundle is
+        // resident again. Only now may its source-indexed Ripple bindings be
+        // restored; they are never rebound against a mixed display.
+        try {
+            RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
+        } catch (const std::exception& error) {
+            scene->switchError +=
+                " Ripple restoration also failed: " + std::string{error.what()};
+            runtimeState->errorMessage = scene->switchError;
+        }
+        scene->lastSwitchFailedTargetResourcesClean = std::all_of(
+            nextDisplay.begin(),
+            nextDisplay.end(),
+            [&](const auto sessionIndex) {
+                return std::find(previousDisplay.begin(), previousDisplay.end(), sessionIndex) !=
+                           previousDisplay.end() ||
+                       !viewport->HasPointCloudResources(sessionIndex.value());
+            });
+        mutationBatch->Finish();
+        scene->lastSwitchTargetGpuResidentBytes = viewport->PointCloudResidentBytes();
+        scene->lastSwitchPeakGpuResidentBytes =
+            viewport->LastPointCloudMutationBatchPeakResidentBytes();
+        scene->lastSwitchGpuSettleCount =
+            viewport->LastPointCloudMutationBatchWaitCount();
+        runtimeState->previewRenderStateSignatureValid = false;
+        return false;
+    }
+
     for (const auto sessionIndex : nextDisplay) {
         auto& session = runtimeState->sessions[sessionIndex.value()];
         session.pendingDisplaySource = false;
@@ -8131,13 +8503,10 @@ bool CommitSceneDisplaySwitch(
         }
         auto& session = runtimeState->sessions[sessionIndex.value()];
         session.committedDisplaySource = false;
-        session.visible = false;
-        if (session.gpuResident || session.cpuResident) {
-            UnloadLayerByIndex(
-                runtimeState,
-                viewport,
-                sessionIndex.value(),
-                !session.analysisSource);
+        // GPU resources were retired before target upload. Release CPU data
+        // only after the transaction commits, unless analysis still owns it.
+        if (!session.analysisSource) {
+            UnloadLayerByIndex(runtimeState, viewport, sessionIndex.value(), true);
         }
     }
 
@@ -8200,8 +8569,15 @@ bool CommitSceneDisplaySwitch(
 
     // Memberships and presentation fields are source-indexed, so restore/rebuild
     // them only after the exact display bundle becomes committed.
-    const auto restoredRippleSessions =
-        RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
+    std::size_t restoredRippleSessions = 0U;
+    try {
+        restoredRippleSessions =
+            RestoreWaterRippleRuntimeCachesForLoadedSessions(runtimeState, viewport);
+    } catch (const std::exception& error) {
+        runtimeState->water.rippleEffectsDirty = true;
+        std::cerr << "Ripple restoration after density commit failed: "
+                  << error.what() << std::endl;
+    }
     if (!runtimeState->water.rippleLayers.empty() && restoredRippleSessions == 0U) {
         runtimeState->water.rippleEffectsDirty = true;
     }
@@ -8209,6 +8585,13 @@ bool CommitSceneDisplaySwitch(
         !runtimeState->water.fieldSurfaceEffectOverlay.points.empty()) {
         runtimeState->water.fieldEffectsDirty = true;
     }
+    mutationBatch->Finish();
+    scene->lastSwitchTargetGpuResidentBytes = viewport->PointCloudResidentBytes();
+    scene->lastSwitchPeakGpuResidentBytes =
+        viewport->LastPointCloudMutationBatchPeakResidentBytes();
+    scene->lastSwitchGpuSettleCount =
+        viewport->LastPointCloudMutationBatchWaitCount();
+    runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->statusMessage = committedStatus;
     runtimeState->errorMessage.clear();
     return true;
@@ -8270,7 +8653,7 @@ bool RequestSceneDisplaySwitch(
         scene->pendingDisplaySessionIndices[roleIndex] = sessionIndex;
         auto& session = runtimeState->sessions[sessionIndex];
         session.pendingDisplaySource = true;
-        if (session.gpuResident) {
+        if (session.cpuResident && session.offlinePointCloud != nullptr) {
             ++scene->stagedReadyCount;
         } else {
             QueueLayerLoad(
@@ -8316,7 +8699,7 @@ bool RequestSceneMixedDisplayLoad(
     for (const auto sessionIndex : displaySessionIndices) {
         auto& session = runtimeState->sessions[sessionIndex.value()];
         session.pendingDisplaySource = true;
-        if (session.gpuResident) {
+        if (session.cpuResident && session.offlinePointCloud != nullptr) {
             ++scene->stagedReadyCount;
         } else {
             QueueLayerLoad(
@@ -8390,7 +8773,9 @@ void HandleScenePurposeLoadCompleted(
         scene->pendingDisplaySessionIndices.begin(),
         scene->pendingDisplaySessionIndices.end(),
         [&](const std::optional<std::size_t>& index) {
-            return index.has_value() && runtimeState->sessions[index.value()].gpuResident;
+            return index.has_value() &&
+                   runtimeState->sessions[index.value()].cpuResident &&
+                   runtimeState->sessions[index.value()].offlinePointCloud != nullptr;
         }));
     CommitSceneDisplaySwitch(runtimeState, viewport, scene);
 }
@@ -12581,6 +12966,11 @@ std::string WaterSeepageSurfaceGuideSupportKey(
                 ? NormalizePathKey(sourceSession.sourcePath)
                 : sourceSession.sceneGroupName + "|" +
                       NormalizePathKey(sourceSession.sourcePath.parent_path()));
+    auto targetRole = NormalizeSceneRoleName(sourceSession.sceneRole);
+    if (targetRole == "VEGETATION") {
+        targetRole = "VEG";
+    }
+    key << "|target_role=" << targetRole;
     for (const auto& layer : supportLayers) {
         key << "|role=" << layer.role
             << ",spacing=" << layer.pointSpacingMeters
@@ -12604,33 +12994,61 @@ std::string WaterSeepageSurfaceGuideSupportKey(
     return key.str();
 }
 
+std::string NormalizeWaterSeepageRoleName(std::string_view role) {
+    auto normalized = NormalizeSceneRoleName(role);
+    if (normalized == "VEGETATION") {
+        normalized = "VEG";
+    }
+    return normalized;
+}
+
+std::vector<WaterSeepageNode> WaterSeepageNodesForRole(
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetRole) {
+    const auto normalizedTarget = NormalizeWaterSeepageRoleName(targetRole);
+    std::vector<WaterSeepageNode> result;
+    result.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        const bool targetsRole = std::any_of(
+            node.targetSceneRoles.begin(),
+            node.targetSceneRoles.end(),
+            [&](const auto& role) {
+                return NormalizeWaterSeepageRoleName(role) == normalizedTarget;
+            });
+        if (!targetsRole) {
+            continue;
+        }
+        result.push_back(node);
+        // Guide tracing is role-local. Adding or removing an unrelated target
+        // role must not change this role's cached guide.
+        result.back().targetSceneRoles = {std::string{targetRole}};
+    }
+    return result;
+}
+
 std::string WaterSeepageSurfaceGuideNodeFingerprint(
-    const WaterSeepageNode& node) {
+    const WaterSeepageNode& node,
+    std::string_view targetRole) {
     std::ostringstream fingerprint;
     fingerprint << std::setprecision(std::numeric_limits<float>::max_digits10);
     fingerprint << "id=" << node.id
                 << ",p=" << node.position.x << "," << node.position.y << "," << node.position.z
                 << ",n=" << node.surfaceNormal.x << "," << node.surfaceNormal.y << "," << node.surfaceNormal.z
                 << ",d=" << node.downAxis.x << "," << node.downAxis.y << "," << node.downAxis.z
-                << ",reach=" << node.reachMeters;
-    std::vector<std::string> roles;
-    roles.reserve(node.targetSceneRoles.size());
-    for (const auto& role : node.targetSceneRoles) {
-        roles.push_back(NormalizeSceneRoleName(role));
-    }
-    std::sort(roles.begin(), roles.end());
-    roles.erase(std::unique(roles.begin(), roles.end()), roles.end());
-    for (const auto& role : roles) {
-        fingerprint << ",role=" << role;
-    }
+                << ",reach=" << node.reachMeters
+                << ",depth=" << node.depthToleranceMeters
+                << ",edge=" << node.edgeFeatherMeters
+                << ",role=" << NormalizeWaterSeepageRoleName(targetRole);
     return fingerprint.str();
 }
 
 std::string WaterSeepageSurfaceGuideNodesFingerprint(
-    std::span<const WaterSeepageNode> nodes) {
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetRole) {
     std::ostringstream fingerprint;
     for (const auto& node : nodes) {
-        fingerprint << '|' << WaterSeepageSurfaceGuideNodeFingerprint(node);
+        fingerprint << '|'
+                    << WaterSeepageSurfaceGuideNodeFingerprint(node, targetRole);
     }
     return fingerprint.str();
 }
@@ -12639,6 +13057,8 @@ template <typename BuildGuides>
 const std::vector<WaterSeepageSurfaceGuide>* UpdateWaterSeepageSurfaceGuidesPerNode(
     WaterWorkflowState* water,
     std::string_view supportKey,
+    std::span<const WaterSeepageNode> nodes,
+    std::string_view targetRole,
     BuildGuides&& buildGuides) {
     if (water == nullptr) {
         return nullptr;
@@ -12647,8 +13067,8 @@ const std::vector<WaterSeepageSurfaceGuide>* UpdateWaterSeepageSurfaceGuidesPerN
     auto& fingerprints =
         water->seepageSurfaceGuideNodeFingerprints[std::string{supportKey}];
     std::unordered_set<std::uint32_t> activeNodeIds;
-    activeNodeIds.reserve(water->seepageNodes.size());
-    for (const auto& node : water->seepageNodes) {
+    activeNodeIds.reserve(nodes.size());
+    for (const auto& node : nodes) {
         activeNodeIds.insert(node.id);
     }
     std::erase_if(
@@ -12663,9 +13083,10 @@ const std::vector<WaterSeepageSurfaceGuide>* UpdateWaterSeepageSurfaceGuidesPerN
         });
 
     std::vector<WaterSeepageNode> changedNodes;
-    changedNodes.reserve(water->seepageNodes.size());
-    for (const auto& node : water->seepageNodes) {
-        const auto fingerprint = WaterSeepageSurfaceGuideNodeFingerprint(node);
+    changedNodes.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        const auto fingerprint =
+            WaterSeepageSurfaceGuideNodeFingerprint(node, targetRole);
         const auto existingGuide = std::find_if(
             guides.begin(),
             guides.end(),
@@ -12706,14 +13127,15 @@ const std::vector<WaterSeepageSurfaceGuide>* UpdateWaterSeepageSurfaceGuidesPerN
             } else {
                 *existingGuide = std::move(replacement);
             }
-            fingerprints[node.id] = WaterSeepageSurfaceGuideNodeFingerprint(node);
+            fingerprints[node.id] =
+                WaterSeepageSurfaceGuideNodeFingerprint(node, targetRole);
         }
         water->seepageSurfaceGuideBuildCount += changedNodes.size();
     }
 
     std::vector<WaterSeepageSurfaceGuide> ordered;
     ordered.reserve(guides.size());
-    for (const auto& node : water->seepageNodes) {
+    for (const auto& node : nodes) {
         const auto guide = std::find_if(
             guides.begin(),
             guides.end(),
@@ -12726,7 +13148,7 @@ const std::vector<WaterSeepageSurfaceGuide>* UpdateWaterSeepageSurfaceGuidesPerN
     }
     guides = std::move(ordered);
     water->seepageSurfaceGuideFingerprints[std::string{supportKey}] =
-        WaterSeepageSurfaceGuideNodesFingerprint(water->seepageNodes);
+        WaterSeepageSurfaceGuideNodesFingerprint(nodes, targetRole);
     return &guides;
 }
 
@@ -12738,6 +13160,10 @@ const std::vector<WaterSeepageSurfaceGuide>* EnsureWaterSeepageSurfaceGuidesForS
         !IsAuthoredWaterTerrainSession(sourceSession)) {
         return nullptr;
     }
+    const auto targetRole = NormalizeWaterSeepageRoleName(sourceSession.sceneRole);
+    const auto roleNodes = WaterSeepageNodesForRole(
+        runtimeState->water.seepageNodes,
+        targetRole);
 
     // Prefer the shared orientation-independent 20 mm surface aggregate. It
     // is built once from the stable ROCK/SAND analysis layers and avoids ever
@@ -12755,14 +13181,20 @@ const std::vector<WaterSeepageSurfaceGuide>* EnsureWaterSeepageSurfaceGuidesForS
             });
     if (surfaceCacheMatchesSession) {
         const auto supportKey =
-            "seepage-surface-cache-v2|scene=" + sourceSession.sceneGroupName +
-            "|signature=" + surfaceCache->signature;
+            "seepage-surface-cache-v3|scene=" + sourceSession.sceneGroupName +
+            "|identity=" + WaterSeepageSurfaceCacheIdentityKey(
+                                *runtimeState,
+                                sourceSession,
+                                FindScenePointCloudRuntime(*runtimeState, sourceSession)) +
+            "|target_role=" + targetRole;
         if (resolvedSupportKey != nullptr) {
             *resolvedSupportKey = supportKey;
         }
         const auto* cachedGuides = UpdateWaterSeepageSurfaceGuidesPerNode(
             &runtimeState->water,
             supportKey,
+            roleNodes,
+            targetRole,
             [&](std::span<const WaterSeepageNode> changedNode) {
                 return invisible_places::water::BuildWaterSeepageSurfaceGuides(
                     changedNode,
@@ -12795,6 +13227,8 @@ const std::vector<WaterSeepageSurfaceGuide>* EnsureWaterSeepageSurfaceGuidesForS
     return UpdateWaterSeepageSurfaceGuidesPerNode(
         &runtimeState->water,
         supportKey,
+        roleNodes,
+        targetRole,
         [&](std::span<const WaterSeepageNode> changedNode) {
             return invisible_places::water::BuildWaterSeepageSurfaceGuides(
                 changedNode,
@@ -17666,10 +18100,10 @@ void InvalidateWaterSeepageTopology(WaterWorkflowState* water) {
     if (water == nullptr) {
         return;
     }
-    water->seepageTopologyFingerprints.clear();
-    water->seepageParamsFingerprints.clear();
-    water->seepageRuntimeGrids.clear();
-    water->seepageRuntimeGuideKeys.clear();
+    // The semantic key is derived from authored geometry, target role, and
+    // immutable surface identity. Keep unaffected role grids and per-node
+    // guides alive; the next maintenance pass builds only new keys and prunes
+    // superseded entries after every active role has been visited.
     water->seepageSurfaceGuideWarning.clear();
 }
 
@@ -38088,14 +38522,15 @@ void DrawWaterSeepagePanel(
 
     bool topologyChanged = false;
     bool paramsChanged = false;
+    bool exportChanged = false;
     bool deleteSelected = false;
     if (BeginPanelSection("Selected Node")) {
         InputTextString("Name", &node->name);
-        topologyChanged |= ImGui::Checkbox("Visible", &node->enabledInViewport);
+        paramsChanged |= ImGui::Checkbox("Visible", &node->enabledInViewport);
         DrawWaterSeepageParameterTooltip(
             "Includes this node in viewport Seepage evaluation. The node remains saved when disabled.");
         ImGui::SameLine();
-        topologyChanged |= ImGui::Checkbox("Include in Export", &node->enabledInExport);
+        exportChanged |= ImGui::Checkbox("Include in Export", &node->enabledInExport);
         DrawWaterSeepageParameterTooltip(
             "Includes this node in still, EXR, video, and offline Seepage evaluation.");
         float position[3]{node->position.x, node->position.y, node->position.z};
@@ -38271,6 +38706,9 @@ void DrawWaterSeepagePanel(
     } else if (paramsChanged) {
         InvalidateWaterSeepageParams(&water);
     }
+    if (exportChanged) {
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
     if (water.showSeepageStructure && !water.seepageSurfaceGuideWarning.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{0.98F, 0.67F, 0.24F, 1.0F});
         ImGui::TextWrapped("%s", water.seepageSurfaceGuideWarning.c_str());
@@ -38286,6 +38724,10 @@ void DrawWaterSeepagePanel(
         ImGui::TextDisabled(
             "Seepage GPU data: %.2f MiB",
             static_cast<double>(water.seepageGpuBytes) / (1024.0 * 1024.0));
+        ImGui::TextDisabled(
+            "Semantic topology builds: %llu  Descriptor attachments: %llu",
+            static_cast<unsigned long long>(water.seepageTopologyBuildRevision),
+            static_cast<unsigned long long>(water.seepageDescriptorAttachmentRevision));
     }
 }
 
@@ -39986,7 +40428,8 @@ void EnsureWaterSeepageRuntimeUpToDate(
     const auto& activeWater = frameState != nullptr ? *frameState : evaluatedWaterFrame;
     std::size_t totalBytes = 0U;
     std::uint32_t overflowCells = 0U;
-    std::unordered_set<std::string> activeKeys;
+    std::unordered_set<std::string> activeAttachmentKeys;
+    std::unordered_set<std::string> activeSemanticKeys;
     std::unordered_set<std::string> activeGuideKeys;
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState->sessions.size(); ++sessionIndex) {
@@ -40001,10 +40444,11 @@ void EnsureWaterSeepageRuntimeUpToDate(
             !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
-        const std::string key = NormalizePathKey(session.sourcePath) +
-                                "|layer=" + std::to_string(sessionIndex);
-        activeKeys.insert(key);
-        auto gridIt = runtimeState->water.seepageRuntimeGrids.find(key);
+        const auto attachmentKey = WaterSeepageLayerAttachmentKey(sessionIndex);
+        const auto semanticKey = WaterSeepageSemanticTopologyKey(*runtimeState, session);
+        activeAttachmentKeys.insert(attachmentKey);
+        const bool firstSemanticUse = activeSemanticKeys.insert(semanticKey).second;
+        auto gridIt = runtimeState->water.seepageRuntimeGrids.find(semanticKey);
         if (gridIt == runtimeState->water.seepageRuntimeGrids.end()) {
             WaterSeepageSpatialGrid grid;
             std::string surfaceGuideKey;
@@ -40030,10 +40474,11 @@ void EnsureWaterSeepageRuntimeUpToDate(
                 activeWater.seepageScenarioState,
                 activeWater.nodeStates);
             gridIt = runtimeState->water.seepageRuntimeGrids.emplace(
-                key,
+                semanticKey,
                 std::move(grid)).first;
+            ++runtimeState->water.seepageTopologyBuildRevision;
             if (!surfaceGuideKey.empty()) {
-                runtimeState->water.seepageRuntimeGuideKeys[key] = surfaceGuideKey;
+                runtimeState->water.seepageRuntimeGuideKeys[semanticKey] = surfaceGuideKey;
             }
         } else {
             // This touches only one compact record per active node. The hash
@@ -40048,26 +40493,27 @@ void EnsureWaterSeepageRuntimeUpToDate(
                 effectiveInvocations,
                 activeWater.nodeStates);
         }
-        if (const auto guideKey = runtimeState->water.seepageRuntimeGuideKeys.find(key);
+        if (const auto guideKey = runtimeState->water.seepageRuntimeGuideKeys.find(semanticKey);
             guideKey != runtimeState->water.seepageRuntimeGuideKeys.end()) {
             activeGuideKeys.insert(guideKey->second);
         }
         auto& grid = gridIt->second;
         const auto topologyFingerprint = invisible_places::water::WaterSeepageTopologyFingerprint(grid);
         const auto paramsFingerprint = invisible_places::water::WaterSeepageParamsFingerprint(grid);
-        const auto topologyIt = runtimeState->water.seepageTopologyFingerprints.find(key);
+        const auto topologyIt = runtimeState->water.seepageTopologyFingerprints.find(attachmentKey);
         const bool topologyCurrent = topologyIt != runtimeState->water.seepageTopologyFingerprints.end() &&
                                      topologyIt->second == topologyFingerprint &&
                                      viewport->WaterSeepageNodeCount(sessionIndex) == grid.nodes.size();
         try {
             if (!topologyCurrent) {
                 viewport->UploadWaterSeepageTopology(sessionIndex, grid);
-                runtimeState->water.seepageTopologyFingerprints[key] = topologyFingerprint;
-                runtimeState->water.seepageParamsFingerprints[key] = paramsFingerprint;
+                runtimeState->water.seepageTopologyFingerprints[attachmentKey] = topologyFingerprint;
+                runtimeState->water.seepageParamsFingerprints[attachmentKey] = paramsFingerprint;
+                ++runtimeState->water.seepageDescriptorAttachmentRevision;
                 ++runtimeState->water.seepageTopologyUploadRevision;
                 ++runtimeState->water.seepageParamsUploadRevision;
             } else {
-                const auto paramsIt = runtimeState->water.seepageParamsFingerprints.find(key);
+                const auto paramsIt = runtimeState->water.seepageParamsFingerprints.find(attachmentKey);
                 if (paramsIt == runtimeState->water.seepageParamsFingerprints.end() ||
                     paramsIt->second != paramsFingerprint) {
                     try {
@@ -40075,10 +40521,11 @@ void EnsureWaterSeepageRuntimeUpToDate(
                         ++runtimeState->water.seepageParamsUploadRevision;
                     } catch (const std::exception&) {
                         viewport->UploadWaterSeepageTopology(sessionIndex, grid);
+                        ++runtimeState->water.seepageDescriptorAttachmentRevision;
                         ++runtimeState->water.seepageTopologyUploadRevision;
                         ++runtimeState->water.seepageParamsUploadRevision;
                     }
-                    runtimeState->water.seepageParamsFingerprints[key] = paramsFingerprint;
+                    runtimeState->water.seepageParamsFingerprints[attachmentKey] = paramsFingerprint;
                 }
             }
         } catch (const std::exception& error) {
@@ -40086,24 +40533,26 @@ void EnsureWaterSeepageRuntimeUpToDate(
             runtimeState->statusMessage.clear();
             continue;
         }
-        totalBytes += grid.nodes.size() * sizeof(invisible_places::water::WaterSeepageRuntimeNode);
-        totalBytes += grid.hashCells.size() * sizeof(invisible_places::water::WaterSeepageSpatialHashCell);
-        totalBytes += grid.nodeReferences.size() * sizeof(std::uint32_t);
-        overflowCells += grid.diagnostics.overflowCellCount;
+        if (firstSemanticUse) {
+            totalBytes += grid.nodes.size() * sizeof(invisible_places::water::WaterSeepageRuntimeNode);
+            totalBytes += grid.hashCells.size() * sizeof(invisible_places::water::WaterSeepageSpatialHashCell);
+            totalBytes += grid.nodeReferences.size() * sizeof(std::uint32_t);
+            overflowCells += grid.diagnostics.overflowCellCount;
+        }
     }
 
     std::erase_if(
         runtimeState->water.seepageTopologyFingerprints,
-        [&](const auto& entry) { return !activeKeys.contains(entry.first); });
+        [&](const auto& entry) { return !activeAttachmentKeys.contains(entry.first); });
     std::erase_if(
         runtimeState->water.seepageParamsFingerprints,
-        [&](const auto& entry) { return !activeKeys.contains(entry.first); });
+        [&](const auto& entry) { return !activeAttachmentKeys.contains(entry.first); });
     std::erase_if(
         runtimeState->water.seepageRuntimeGrids,
-        [&](const auto& entry) { return !activeKeys.contains(entry.first); });
+        [&](const auto& entry) { return !activeSemanticKeys.contains(entry.first); });
     std::erase_if(
         runtimeState->water.seepageRuntimeGuideKeys,
-        [&](const auto& entry) { return !activeKeys.contains(entry.first); });
+        [&](const auto& entry) { return !activeSemanticKeys.contains(entry.first); });
     std::erase_if(
         runtimeState->water.seepageSurfaceGuides,
         [&](const auto& entry) { return !activeGuideKeys.contains(entry.first); });
@@ -40117,10 +40566,34 @@ void EnsureWaterSeepageRuntimeUpToDate(
     runtimeState->water.seepageOverflowCellCount = overflowCells;
 }
 
+bool PreviewWaterSeepageRequiresSceneRedraw(
+    const PreviewRuntimeState& runtimeState) {
+    std::unordered_set<std::string> visitedSemanticKeys;
+    for (const auto& session : runtimeState.sessions) {
+        if (!IsRenderablePointCloudSource(runtimeState, session) ||
+            !IsAuthoredWaterTerrainSession(session)) {
+            continue;
+        }
+        const auto semanticKey = WaterSeepageSemanticTopologyKey(runtimeState, session);
+        if (!visitedSemanticKeys.insert(semanticKey).second) {
+            continue;
+        }
+        const auto grid = runtimeState.water.seepageRuntimeGrids.find(semanticKey);
+        if (grid != runtimeState.water.seepageRuntimeGrids.end() &&
+            invisible_places::water::WaterSeepageGridHasActiveViewportEffect(grid->second)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool PreviewLiveVisualEffectsRequireSceneRedraw(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
     if (runtimeState.water.collisionRainSettings.enabled) {
+        return true;
+    }
+    if (PreviewWaterSeepageRequiresSceneRedraw(runtimeState)) {
         return true;
     }
     const bool fastBasicRenderer =
@@ -40134,9 +40607,6 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         }
         const auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
         if (invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves(renderStyle)) {
-            return true;
-        }
-        if (viewport.WaterSeepageNodeCount(sessionIndex) > 0U) {
             return true;
         }
         if (!runtimeState.projectSettings.liveVisualEffects ||
@@ -42696,38 +43166,55 @@ int RunWaterSeepageSmoke(
         runtimeState->water.seepageSurfaceGuideBuildCount;
     const auto nodeGuideFingerprintsBeforeGeometryEdit =
         runtimeState->water.seepageSurfaceGuideNodeFingerprints;
-    runtimeState->water.seepageNodes.front().reachMeters += 0.01F;
+    runtimeState->water.seepageNodes.front().depthToleranceMeters += 0.01F;
     InvalidateWaterSeepageTopology(&runtimeState->water);
     EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
-    bool unchangedNodeGuidesPreserved = true;
-    bool editedNodeGuideChanged = false;
-    for (const auto& [supportKey, previousFingerprints] :
-         nodeGuideFingerprintsBeforeGeometryEdit) {
-        const auto currentSupport =
-            runtimeState->water.seepageSurfaceGuideNodeFingerprints.find(supportKey);
-        if (currentSupport ==
-            runtimeState->water.seepageSurfaceGuideNodeFingerprints.end()) {
-            unchangedNodeGuidesPreserved = false;
-            continue;
-        }
-        for (const auto& [nodeId, previousFingerprint] : previousFingerprints) {
-            const auto currentFingerprint = currentSupport->second.find(nodeId);
-            if (currentFingerprint == currentSupport->second.end()) {
-                unchangedNodeGuidesPreserved = false;
-            } else if (nodeId == editedNodeId) {
-                editedNodeGuideChanged |=
-                    currentFingerprint->second != previousFingerprint;
-            } else if (currentFingerprint->second != previousFingerprint) {
-                unchangedNodeGuidesPreserved = false;
+    const auto onlyEditedNodeGuideChanged =
+        [&](const auto& previousBySupport) {
+            bool unchangedNodeGuidesPreserved = true;
+            bool editedNodeGuideChanged = false;
+            for (const auto& [supportKey, previousFingerprints] : previousBySupport) {
+                const auto currentSupport =
+                    runtimeState->water.seepageSurfaceGuideNodeFingerprints.find(supportKey);
+                if (currentSupport ==
+                    runtimeState->water.seepageSurfaceGuideNodeFingerprints.end()) {
+                    unchangedNodeGuidesPreserved = false;
+                    continue;
+                }
+                for (const auto& [nodeId, previousFingerprint] : previousFingerprints) {
+                    const auto currentFingerprint = currentSupport->second.find(nodeId);
+                    if (currentFingerprint == currentSupport->second.end()) {
+                        unchangedNodeGuidesPreserved = false;
+                    } else if (nodeId == editedNodeId) {
+                        editedNodeGuideChanged |=
+                            currentFingerprint->second != previousFingerprint;
+                    } else if (currentFingerprint->second != previousFingerprint) {
+                        unchangedNodeGuidesPreserved = false;
+                    }
+                }
             }
-        }
-    }
-    if (editedNodeGuideChanged && unchangedNodeGuidesPreserved &&
+            return editedNodeGuideChanged && unchangedNodeGuidesPreserved;
+        };
+    const bool depthEditWasRoleLocal =
+        onlyEditedNodeGuideChanged(nodeGuideFingerprintsBeforeGeometryEdit) &&
         runtimeState->water.seepageSurfaceGuideBuildCount ==
-            guideBuildsBeforeGeometryEdit + 1U) {
-        report.Pass("A Seepage reach edit retraced only the changed node guide before one compact topology replacement.");
+            guideBuildsBeforeGeometryEdit + 1U;
+
+    const auto guideBuildsBeforeEdgeEdit =
+        runtimeState->water.seepageSurfaceGuideBuildCount;
+    const auto nodeGuideFingerprintsBeforeEdgeEdit =
+        runtimeState->water.seepageSurfaceGuideNodeFingerprints;
+    runtimeState->water.seepageNodes.front().edgeFeatherMeters += 0.005F;
+    InvalidateWaterSeepageTopology(&runtimeState->water);
+    EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+    const bool edgeEditWasRoleLocal =
+        onlyEditedNodeGuideChanged(nodeGuideFingerprintsBeforeEdgeEdit) &&
+        runtimeState->water.seepageSurfaceGuideBuildCount ==
+            guideBuildsBeforeEdgeEdit + 1U;
+    if (depthEditWasRoleLocal && edgeEditWasRoleLocal) {
+        report.Pass("Seepage surface-depth and edge-feather edits each retraced only the changed node guide before one compact topology replacement.");
     } else {
-        report.Fail("A one-node Seepage geometry edit retraced unaffected node guides.");
+        report.Fail("A one-node Seepage surface-depth or edge-feather edit retraced unaffected node guides.");
     }
 
     // A GPU Flow-spline session is marked loaded and renderable before its
@@ -42981,6 +43468,8 @@ struct WaterIntegrationCounterSnapshot {
     std::uint64_t cachePreprocessDispatches = 0U;
     std::uint64_t pathBakes = 0U;
     std::uint64_t seepageGuideBuilds = 0U;
+    std::uint64_t seepageTopologyBuilds = 0U;
+    std::uint64_t seepageDescriptorAttachments = 0U;
     std::uint64_t seepageTopologyUploads = 0U;
     std::uint64_t flowComputeDispatches = 0U;
     std::unordered_map<std::uint32_t, std::uint64_t> flowComputeDispatchesBySource;
@@ -43001,6 +43490,8 @@ WaterIntegrationCounterSnapshot CaptureWaterIntegrationCounters(
         .cachePreprocessDispatches = diagnostics.waterSurfacePreprocessDispatchCount,
         .pathBakes = water.pathDiagnosticRebuildCounters.pathBakes,
         .seepageGuideBuilds = water.seepageSurfaceGuideBuildCount,
+        .seepageTopologyBuilds = water.seepageTopologyBuildRevision,
+        .seepageDescriptorAttachments = water.seepageDescriptorAttachmentRevision,
         .seepageTopologyUploads = water.seepageTopologyUploadRevision,
         .flowComputeDispatches = water.flowGpuComputeDispatchCount,
         .flowComputeDispatchesBySource = water.flowGpuComputeDispatchCountBySource,
@@ -43028,6 +43519,25 @@ struct WaterIntegrationSmokeReport {
     std::uint64_t peakStagingBytes = 0U;
     std::uint64_t cachePayloadBytes = 0U;
     double cacheValidationUploadMs = 0.0;
+    std::size_t liveSceneReadbackPresentations = 0U;
+    std::size_t liveSceneDescriptorPairsCovered = 0U;
+    std::size_t liveSceneExpectedDescriptorPairs = 0U;
+    double liveSceneMedianDepthCoverage = 0.0;
+    double liveSceneMinimumDepthCoverage = 0.0;
+    std::uint32_t liveSceneMaximumRgbStep = 0U;
+    std::uint64_t densityTransactionPeakGpuResidentBytes = 0U;
+    std::uint64_t densityTransactionResidencyCeilingBytes = 0U;
+    std::uint64_t densityRollbackExpectedGpuResidentBytes = 0U;
+    std::uint64_t densityRollbackActualGpuResidentBytes = 0U;
+    std::uint32_t densityTransactionCount = 0U;
+    std::uint32_t densityTransactionTotalSettleCount = 0U;
+    std::uint32_t densityTransactionMaxSettleCount = 0U;
+    bool densityRollbackFailedTargetResourcesClean = false;
+    std::uint64_t densityDescriptorGenerationsAllocated = 0U;
+    std::uint64_t densityDescriptorGenerationsRetired = 0U;
+    std::uint64_t densityDescriptorGenerationsLive = 0U;
+    std::size_t densityRendererPointLayerCount = 0U;
+    bool densityDescriptorGenerationsBounded = true;
     WaterIntegrationCounterSnapshot startupCounters{};
     WaterIntegrationCounterSnapshot animationCountersBefore{};
     WaterIntegrationCounterSnapshot animationCountersAfter{};
@@ -43056,6 +43566,9 @@ void WriteWaterIntegrationCounterSnapshot(
            << "\"cache_preprocess_dispatches\":" << counters.cachePreprocessDispatches << ','
            << "\"path_bakes\":" << counters.pathBakes << ','
            << "\"seepage_guide_builds\":" << counters.seepageGuideBuilds << ','
+           << "\"seepage_topology_builds\":" << counters.seepageTopologyBuilds << ','
+           << "\"seepage_descriptor_attachments\":"
+           << counters.seepageDescriptorAttachments << ','
            << "\"seepage_topology_uploads\":" << counters.seepageTopologyUploads << ','
            << "\"flow_compute_dispatches\":" << counters.flowComputeDispatches << ','
            << "\"flow_compute_dispatches_by_source\":{";
@@ -43123,6 +43636,46 @@ bool WriteWaterIntegrationSmokeReport(const WaterIntegrationSmokeReport& report)
            << "  \"cache_payload_bytes\": " << report.cachePayloadBytes << ",\n"
            << "  \"cache_validation_upload_ms\": "
            << FormatFixed(report.cacheValidationUploadMs, 3) << ",\n"
+           << "  \"live_scene_readback_presentations\": "
+           << report.liveSceneReadbackPresentations << ",\n"
+           << "  \"live_scene_descriptor_pairs_covered\": "
+           << report.liveSceneDescriptorPairsCovered << ",\n"
+           << "  \"live_scene_expected_descriptor_pairs\": "
+           << report.liveSceneExpectedDescriptorPairs << ",\n"
+           << "  \"live_scene_median_depth_coverage\": "
+           << FormatFixed(report.liveSceneMedianDepthCoverage, 6) << ",\n"
+           << "  \"live_scene_minimum_depth_coverage\": "
+           << FormatFixed(report.liveSceneMinimumDepthCoverage, 6) << ",\n"
+           << "  \"live_scene_maximum_rgb_step\": "
+           << report.liveSceneMaximumRgbStep << ",\n"
+           << "  \"density_transaction_peak_gpu_resident_bytes\": "
+           << report.densityTransactionPeakGpuResidentBytes << ",\n"
+           << "  \"density_transaction_residency_ceiling_bytes\": "
+           << report.densityTransactionResidencyCeilingBytes << ",\n"
+           << "  \"density_rollback_expected_gpu_resident_bytes\": "
+           << report.densityRollbackExpectedGpuResidentBytes << ",\n"
+           << "  \"density_rollback_actual_gpu_resident_bytes\": "
+           << report.densityRollbackActualGpuResidentBytes << ",\n"
+           << "  \"density_transaction_count\": "
+           << report.densityTransactionCount << ",\n"
+           << "  \"density_transaction_total_settle_count\": "
+           << report.densityTransactionTotalSettleCount << ",\n"
+           << "  \"density_transaction_max_settle_count\": "
+           << report.densityTransactionMaxSettleCount << ",\n"
+           << "  \"density_rollback_failed_target_resources_clean\": "
+           << (report.densityRollbackFailedTargetResourcesClean ? "true" : "false")
+           << ",\n"
+           << "  \"density_descriptor_generations_allocated\": "
+           << report.densityDescriptorGenerationsAllocated << ",\n"
+           << "  \"density_descriptor_generations_retired\": "
+           << report.densityDescriptorGenerationsRetired << ",\n"
+           << "  \"density_descriptor_generations_live\": "
+           << report.densityDescriptorGenerationsLive << ",\n"
+           << "  \"density_renderer_point_layer_count\": "
+           << report.densityRendererPointLayerCount << ",\n"
+           << "  \"density_descriptor_generations_bounded\": "
+           << (report.densityDescriptorGenerationsBounded ? "true" : "false")
+           << ",\n"
            << "  \"contact_sheet_ppm\": \""
            << JsonEscape(report.contactSheetPpmPath.string()) << "\",\n"
            << "  \"offline_frame_exr\": \""
@@ -43374,8 +43927,7 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
             .densityCompensation = ResolveSessionDensityCompensation(*runtimeState, session),
             .rainCollisionRole = RainCollisionRoleForSession(session),
         };
-        const auto gridKey = NormalizePathKey(session.sourcePath) +
-                             "|layer=" + std::to_string(sessionIndex.value());
+        const auto gridKey = WaterSeepageSemanticTopologyKey(*runtimeState, session);
         if (const auto gridIt = runtimeState->water.seepageRuntimeGrids.find(gridKey);
             gridIt != runtimeState->water.seepageRuntimeGrids.end()) {
             layer.seepageGrid = gridIt->second;
@@ -43602,11 +44154,9 @@ int RunWaterIntegrationSmoke(
         return std::nullopt;
     };
 
-    bool sawStartupSeepageArming = false;
-    bool startupSeepageActivationSequence = true;
-    bool startupSeepageSettled = false;
-    std::uint32_t startupSeepageBaseDraws = 0U;
-    std::optional<std::uint32_t> previousStartupSeepageActivation;
+    bool startupSeepageDescriptorGenerationsReady = true;
+    std::uint32_t startupSeepageDescriptorMismatchCount = 0U;
+    std::uint32_t startupSeepagePresentationCount = 0U;
     const auto observeStartupSeepagePublication = [&](const ScenePointCloudRuntime& scene) {
         const auto rockSessionIndex = findCommittedRockSession(scene);
         if (!rockSessionIndex.has_value()) {
@@ -43614,44 +44164,21 @@ int RunWaterIntegrationSmoke(
         }
         const auto publication =
             viewport->WaterSeepageParamsPublicationState(rockSessionIndex.value());
-        if (publication.requestedGeneration == 0U) {
+        if (publication.requestedGeneration == 0U ||
+            publication.topologyGeneration == 0U) {
             return;
         }
-        const auto activationFrames = publication.activationFramesRemaining;
-        const auto frameSlotCount = static_cast<std::uint32_t>(
-            publication.liveFrameGenerations.size());
         const auto& diagnostics = viewport->Diagnostics();
         const bool livePointDrawSubmitted =
             diagnostics.sceneRenderedThisFrame && diagnostics.pointDrawCalls > 0U &&
             diagnostics.pointSubmittedCount > 0U;
-
-        if (!previousStartupSeepageActivation.has_value()) {
-            if (activationFrames == frameSlotCount) {
-                sawStartupSeepageArming = true;
-            } else if (activationFrames + 1U == frameSlotCount) {
-                sawStartupSeepageArming = true;
-                startupSeepageActivationSequence =
-                    startupSeepageActivationSequence && livePointDrawSubmitted;
-                startupSeepageBaseDraws = 1U;
-            } else {
-                startupSeepageActivationSequence = false;
-            }
-        } else if (activationFrames < previousStartupSeepageActivation.value()) {
-            const auto advanced =
-                previousStartupSeepageActivation.value() - activationFrames;
-            startupSeepageActivationSequence =
-                startupSeepageActivationSequence && advanced == 1U &&
-                livePointDrawSubmitted;
-            startupSeepageBaseDraws += advanced;
-        } else if (activationFrames > previousStartupSeepageActivation.value() ||
-                   (activationFrames > 0U && diagnostics.sceneRenderedThisFrame)) {
-            startupSeepageActivationSequence = false;
-        }
-
-        previousStartupSeepageActivation = activationFrames;
-        if (sawStartupSeepageArming && activationFrames == 0U &&
-            startupSeepageBaseDraws == frameSlotCount) {
-            startupSeepageSettled = true;
+        if (livePointDrawSubmitted) {
+            ++startupSeepagePresentationCount;
+            startupSeepageDescriptorGenerationsReady =
+                startupSeepageDescriptorGenerationsReady &&
+                publication.descriptorGenerationReady;
+            startupSeepageDescriptorMismatchCount +=
+                publication.descriptorGenerationMismatchCount;
         }
     };
 
@@ -43824,19 +44351,240 @@ int RunWaterIntegrationSmoke(
             viewport->WaterSeepageNodeReferenceCount(rockLayerId);
         auto initialPublication =
             viewport->WaterSeepageParamsPublicationState(rockLayerId);
-        for (std::size_t frame = 0U;
-             frame < 4U && initialPublication.activationFramesRemaining > 0U;
-             ++frame) {
-            PumpWaterIntegrationSmokeFrame(
-                window,
-                runtimeState,
-                viewport,
-                0.0F,
-                true,
-                true);
-            observeStartupSeepagePublication(*scene);
-            initialPublication =
-                viewport->WaterSeepageParamsPublicationState(rockLayerId);
+        // Validate the attachment actually used by the live presentation path,
+        // not the independent EXR render target. Keep the settled semantic
+        // topology attached while temporarily isolating ROCK, and do not run
+        // topology maintenance while the other authored roles are hidden.
+        startupSeepageIt->enabledInViewport = true;
+        runtimeState->water.collisionRainSettings.enabled = false;
+        InvalidateWaterSeepageParams(&runtimeState->water);
+        const auto settledStartupFrameState = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(
+            runtimeState,
+            viewport,
+            &settledStartupFrameState);
+
+        std::vector<std::uint8_t> savedSessionVisibility;
+        savedSessionVisibility.reserve(runtimeState->sessions.size());
+        for (std::size_t sessionIndex = 0U;
+             sessionIndex < runtimeState->sessions.size();
+             ++sessionIndex) {
+            auto& session = runtimeState->sessions[sessionIndex];
+            savedSessionVisibility.push_back(session.visible ? 1U : 0U);
+            session.visible = sessionIndex == rockLayerId;
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+
+        const auto startupDiagnostics = viewport->Diagnostics();
+        const std::uint32_t expectedFrameSlots =
+            std::max(1U, startupDiagnostics.framesInFlight);
+        const std::uint32_t expectedSwapchainImages =
+            std::max(1U, startupDiagnostics.swapchainImageCount);
+        std::vector<std::size_t> descriptorPairPresentations(
+            static_cast<std::size_t>(expectedFrameSlots) * expectedSwapchainImages,
+            0U);
+        std::vector<std::size_t> depthCoverageSamples;
+        std::vector<std::uint8_t> minimumRgb;
+        std::vector<std::uint8_t> maximumRgb;
+        std::uint32_t readbackWidth = 0U;
+        std::uint32_t readbackHeight = 0U;
+        float maximumReadbackDepth = 0.0F;
+        bool liveReadbackValid = true;
+        std::string liveReadbackError;
+        const auto everyDescriptorPairPresentedTwice = [&]() {
+            return std::all_of(
+                descriptorPairPresentations.begin(),
+                descriptorPairPresentations.end(),
+                [](std::size_t count) { return count >= 2U; });
+        };
+
+        // Cover every live frame-slot/swapchain-image descriptor combination
+        // at least twice and capture at least 24 real presentations at a fixed
+        // time. Readiness is generation-based; no activation countdown is
+        // permitted to alter the presented ROCK cloud.
+        viewport->SetLiveSceneReadbackCaptureEnabled(true);
+        startupSeepageDescriptorGenerationsReady = true;
+        startupSeepageDescriptorMismatchCount = 0U;
+        startupSeepagePresentationCount = 0U;
+        constexpr std::size_t kMinimumLiveReadbackPresentations = 24U;
+        const std::size_t maximumReadbackAttempts = std::max<std::size_t>(
+            96U,
+            descriptorPairPresentations.size() * 16U);
+        std::size_t readbackAttempts = 0U;
+        try {
+            while ((depthCoverageSamples.size() < kMinimumLiveReadbackPresentations ||
+                    !everyDescriptorPairPresentedTwice()) &&
+                   readbackAttempts < maximumReadbackAttempts &&
+                   !window->ShouldClose()) {
+                ++readbackAttempts;
+                window->PollEvents();
+                const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+                viewport->BeginUiFrame();
+                viewport->SetDiagnosticsEnabled(true);
+                viewport->SetSceneCachingEnabled(false);
+                viewport->SetLiveSceneRenderingEnabled(true);
+                viewport->UpdateRenderState(BuildRenderState(
+                    *runtimeState,
+                    *viewport,
+                    0.0F,
+                    &waterFrameState));
+                viewport->DrawFrame();
+                initialPublication =
+                    viewport->WaterSeepageParamsPublicationState(rockLayerId);
+                // A parameter generation is published one fenced frame slot
+                // at a time. Do not count the intentional ring warm-up as a
+                // presentation of the fully settled generation; all measured
+                // frames below require the complete descriptor/parameter ring.
+                if (!initialPublication.descriptorGenerationReady) {
+                    continue;
+                }
+                observeStartupSeepagePublication(*scene);
+
+                const auto readback = viewport->ReadLiveSceneFrame();
+                const std::size_t pixelCount =
+                    static_cast<std::size_t>(readback.width) * readback.height;
+                if (readback.width == 0U || readback.height == 0U ||
+                    readback.colorRgba8.size() != pixelCount * 4U ||
+                    readback.linearDepth.size() != pixelCount) {
+                    liveReadbackValid = false;
+                    liveReadbackError = "live readback returned inconsistent attachment dimensions";
+                    break;
+                }
+                if (readback.submittedFrameSlot >= expectedFrameSlots ||
+                    readback.swapchainImageIndex >= expectedSwapchainImages) {
+                    liveReadbackValid = false;
+                    liveReadbackError = "live readback returned an out-of-range descriptor pair";
+                    break;
+                }
+                if (readbackWidth == 0U) {
+                    readbackWidth = readback.width;
+                    readbackHeight = readback.height;
+                    minimumRgb = readback.colorRgba8;
+                    maximumRgb = readback.colorRgba8;
+                } else if (readback.width != readbackWidth ||
+                           readback.height != readbackHeight ||
+                           readback.colorRgba8.size() != minimumRgb.size()) {
+                    liveReadbackValid = false;
+                    liveReadbackError = "live readback extent changed during the fixed-time capture";
+                    break;
+                } else {
+                    for (std::size_t component = 0U;
+                         component < readback.colorRgba8.size();
+                         ++component) {
+                        minimumRgb[component] = std::min(
+                            minimumRgb[component],
+                            readback.colorRgba8[component]);
+                        maximumRgb[component] = std::max(
+                            maximumRgb[component],
+                            readback.colorRgba8[component]);
+                    }
+                }
+
+                const auto descriptorPairIndex =
+                    static_cast<std::size_t>(readback.submittedFrameSlot) *
+                        expectedSwapchainImages +
+                    readback.swapchainImageIndex;
+                ++descriptorPairPresentations[descriptorPairIndex];
+                depthCoverageSamples.push_back(static_cast<std::size_t>(std::count_if(
+                    readback.linearDepth.begin(),
+                    readback.linearDepth.end(),
+                    [](float depth) { return std::isfinite(depth) && depth > 0.0F; })));
+                for (const float depth : readback.linearDepth) {
+                    if (std::isfinite(depth)) {
+                        maximumReadbackDepth = std::max(maximumReadbackDepth, depth);
+                    }
+                }
+            }
+        } catch (const std::exception& error) {
+            liveReadbackValid = false;
+            liveReadbackError = error.what();
+        }
+
+        for (std::size_t sessionIndex = 0U;
+             sessionIndex < savedSessionVisibility.size() &&
+             sessionIndex < runtimeState->sessions.size();
+             ++sessionIndex) {
+            runtimeState->sessions[sessionIndex].visible =
+                savedSessionVisibility[sessionIndex] != 0U;
+        }
+        viewport->SetLiveSceneReadbackCaptureEnabled(false);
+        runtimeState->previewRenderStateSignatureValid = false;
+
+        report.liveSceneReadbackPresentations = depthCoverageSamples.size();
+        report.liveSceneExpectedDescriptorPairs = descriptorPairPresentations.size();
+        report.liveSceneDescriptorPairsCovered = static_cast<std::size_t>(std::count_if(
+            descriptorPairPresentations.begin(),
+            descriptorPairPresentations.end(),
+            [](std::size_t count) { return count >= 2U; }));
+        double medianDepthCoverage = 0.0;
+        std::size_t minimumDepthCoverage = 0U;
+        if (!depthCoverageSamples.empty()) {
+            auto orderedCoverage = depthCoverageSamples;
+            std::sort(orderedCoverage.begin(), orderedCoverage.end());
+            minimumDepthCoverage = orderedCoverage.front();
+            const auto middle = orderedCoverage.size() / 2U;
+            medianDepthCoverage = orderedCoverage.size() % 2U == 0U
+                                      ? 0.5 * static_cast<double>(
+                                                  orderedCoverage[middle - 1U] +
+                                                  orderedCoverage[middle])
+                                      : static_cast<double>(orderedCoverage[middle]);
+        }
+        const double readbackPixelCount =
+            static_cast<double>(readbackWidth) * readbackHeight;
+        if (readbackPixelCount > 0.0) {
+            report.liveSceneMedianDepthCoverage =
+                medianDepthCoverage / readbackPixelCount;
+            report.liveSceneMinimumDepthCoverage =
+                static_cast<double>(minimumDepthCoverage) / readbackPixelCount;
+        }
+        std::uint32_t maximumRgbStep = 0U;
+        for (std::size_t component = 0U;
+             component < minimumRgb.size();
+             ++component) {
+            if (component % 4U == 3U) {
+                continue;
+            }
+            maximumRgbStep = std::max(
+                maximumRgbStep,
+                static_cast<std::uint32_t>(maximumRgb[component]) -
+                    minimumRgb[component]);
+        }
+        report.liveSceneMaximumRgbStep = maximumRgbStep;
+        const bool everyPairCovered =
+            report.liveSceneDescriptorPairsCovered ==
+            report.liveSceneExpectedDescriptorPairs;
+        const bool depthCoverageStable =
+            medianDepthCoverage > 0.0 &&
+            static_cast<double>(minimumDepthCoverage) >=
+                medianDepthCoverage * 0.98;
+        const bool liveSceneStable =
+            liveReadbackValid &&
+            depthCoverageSamples.size() >= kMinimumLiveReadbackPresentations &&
+            everyPairCovered && depthCoverageStable && maximumRgbStep <= 1U;
+        if (liveSceneStable) {
+            report.Pass(
+                "Live ROCK scene attachments (not EXR) remained stable across " +
+                std::to_string(depthCoverageSamples.size()) +
+                " fixed-time presentations; every frame-slot/image pair appeared twice, depth coverage stayed within 2%, and RGB varied by at most one step.");
+        } else {
+            std::ostringstream detail;
+            detail << "Live ROCK attachment stability failed"
+                   << " (samples=" << depthCoverageSamples.size()
+                   << ",descriptor_pairs="
+                   << report.liveSceneDescriptorPairsCovered << '/'
+                   << report.liveSceneExpectedDescriptorPairs
+                   << ",minimum_depth_ratio="
+                   << FormatFixed(report.liveSceneMinimumDepthCoverage, 6)
+                   << ",median_depth_ratio="
+                   << FormatFixed(report.liveSceneMedianDepthCoverage, 6)
+                   << ",maximum_depth=" << maximumReadbackDepth
+                   << ",depth_layers=" << viewport->Diagnostics().pointDepthLayerCount
+                   << ",maximum_rgb_step=" << maximumRgbStep;
+            if (!liveReadbackError.empty()) {
+                detail << ",error=" << liveReadbackError;
+            }
+            detail << ").";
+            report.Fail(detail.str());
         }
         const bool initialPublicationSettled =
             initialTopologyRevision > 0U && initialNodeCount == 1U &&
@@ -43846,16 +44594,15 @@ int RunWaterIntegrationSmoke(
                 initialPublication.requestedGeneration &&
             initialPublication.liveFrameGenerations[1] ==
                 initialPublication.requestedGeneration &&
-            initialPublication.exrGeneration ==
-                initialPublication.requestedGeneration &&
             initialPublication.liveBuffersDistinct &&
-            initialPublication.exrBufferDistinct &&
-            initialPublication.activationFramesRemaining == 0U &&
-            sawStartupSeepageArming && startupSeepageActivationSequence &&
-            startupSeepageSettled;
-        const auto startupGridKey =
-            NormalizePathKey(runtimeState->sessions[rockLayerId].sourcePath) +
-            "|layer=" + std::to_string(rockLayerId);
+            initialPublication.descriptorGenerationReady &&
+            initialPublication.descriptorGenerationMismatchCount == 0U &&
+            startupSeepageDescriptorGenerationsReady &&
+            startupSeepageDescriptorMismatchCount == 0U &&
+            startupSeepagePresentationCount >= 24U;
+        const auto startupGridKey = WaterSeepageSemanticTopologyKey(
+            *runtimeState,
+            runtimeState->sessions[rockLayerId]);
         const auto seepageTopologyFingerprint = [&]() {
             const auto grid = runtimeState->water.seepageRuntimeGrids.find(startupGridKey);
             return grid != runtimeState->water.seepageRuntimeGrids.end()
@@ -43863,8 +44610,19 @@ int RunWaterIntegrationSmoke(
                        : std::string{};
         };
         const auto initialSeepageTopologyFingerprint = seepageTopologyFingerprint();
-        startupSeepageIt->enabledInViewport = false;
-        InvalidateWaterSeepageTopology(&runtimeState->water);
+        const auto topologyBuildsBeforeVisibilityToggle =
+            runtimeState->water.seepageTopologyBuildRevision;
+        const auto descriptorAttachmentsBeforeVisibilityToggle =
+            runtimeState->water.seepageDescriptorAttachmentRevision;
+        const auto paramsRevisionBeforeVisibilityToggle =
+            viewport->WaterSeepageParamsUploadRevision(rockLayerId);
+        std::vector<std::uint8_t> savedSeepageVisibility;
+        savedSeepageVisibility.reserve(runtimeState->water.seepageNodes.size());
+        for (auto& node : runtimeState->water.seepageNodes) {
+            savedSeepageVisibility.push_back(node.enabledInViewport ? 1U : 0U);
+            node.enabledInViewport = false;
+        }
+        InvalidateWaterSeepageParams(&runtimeState->water);
         for (std::size_t frame = 0U; frame < 3U; ++frame) {
             PumpWaterIntegrationSmokeFrame(
                 window,
@@ -43874,20 +44632,17 @@ int RunWaterIntegrationSmoke(
                 true,
                 true);
         }
+        const bool disabledSeepageSettledWithoutContinuousRedraw =
+            !PreviewWaterSeepageRequiresSceneRedraw(*runtimeState);
 
+        for (std::size_t nodeIndex = 0U;
+             nodeIndex < runtimeState->water.seepageNodes.size();
+             ++nodeIndex) {
+            runtimeState->water.seepageNodes[nodeIndex].enabledInViewport =
+                savedSeepageVisibility[nodeIndex] != 0U;
+        }
         startupSeepageIt->enabledInViewport = true;
-        InvalidateWaterSeepageTopology(&runtimeState->water);
-        EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
-        auto reenabledPublication =
-            viewport->WaterSeepageParamsPublicationState(rockLayerId);
-        const auto reenabledFrameSlotCount = static_cast<std::uint32_t>(
-            reenabledPublication.liveFrameGenerations.size());
-        bool reenabledActivationSequence =
-            reenabledPublication.activationFramesRemaining ==
-            reenabledFrameSlotCount;
-        std::uint32_t reenabledBaseDraws = 0U;
-        std::uint32_t previousActivationFrames =
-            reenabledPublication.activationFramesRemaining;
+        InvalidateWaterSeepageParams(&runtimeState->water);
         for (std::size_t frame = 0U; frame < 5U; ++frame) {
             PumpWaterIntegrationSmokeFrame(
                 window,
@@ -43896,71 +44651,375 @@ int RunWaterIntegrationSmoke(
                 0.0F,
                 true,
                 true);
-            reenabledPublication =
-                viewport->WaterSeepageParamsPublicationState(rockLayerId);
-            const auto& diagnostics = viewport->Diagnostics();
-            const bool livePointDrawSubmitted =
-                diagnostics.sceneRenderedThisFrame && diagnostics.pointDrawCalls > 0U &&
-                diagnostics.pointSubmittedCount > 0U;
-            if (previousActivationFrames > 0U) {
-                if (reenabledPublication.activationFramesRemaining + 1U ==
-                    previousActivationFrames) {
-                    reenabledActivationSequence =
-                        reenabledActivationSequence && livePointDrawSubmitted;
-                    ++reenabledBaseDraws;
-                } else if (
-                    reenabledPublication.activationFramesRemaining !=
-                        previousActivationFrames ||
-                    diagnostics.sceneRenderedThisFrame) {
-                    reenabledActivationSequence = false;
-                }
-            }
-            previousActivationFrames =
-                reenabledPublication.activationFramesRemaining;
-            if (reenabledPublication.activationFramesRemaining == 0U &&
-                viewport->WaterSeepageNodeCount(rockLayerId) == initialNodeCount) {
-                break;
-            }
         }
-        const bool reenabledPublicationSettled =
-            reenabledPublication.requestedGeneration > 0U &&
-            reenabledPublication.liveFrameGenerations[0] ==
-                reenabledPublication.requestedGeneration &&
-            reenabledPublication.liveFrameGenerations[1] ==
-                reenabledPublication.requestedGeneration &&
-            reenabledPublication.exrGeneration ==
-                reenabledPublication.requestedGeneration &&
-            reenabledPublication.activationFramesRemaining == 0U &&
-            reenabledActivationSequence &&
-            reenabledBaseDraws == reenabledFrameSlotCount &&
+        const bool enabledSeepageRequestsContinuousRedraw =
+            PreviewWaterSeepageRequiresSceneRedraw(*runtimeState);
+        const bool visibilityWasParameterOnly =
             viewport->WaterSeepageNodeCount(rockLayerId) == initialNodeCount &&
             viewport->WaterSeepageOccupiedCellCount(rockLayerId) ==
                 initialOccupiedCellCount &&
             viewport->WaterSeepageNodeReferenceCount(rockLayerId) ==
                 initialReferenceCount &&
             viewport->WaterSeepageTopologyUploadRevision(rockLayerId) ==
-                initialTopologyRevision + 2U &&
+                initialTopologyRevision &&
+            viewport->WaterSeepageParamsUploadRevision(rockLayerId) >
+                paramsRevisionBeforeVisibilityToggle &&
+            runtimeState->water.seepageTopologyBuildRevision ==
+                topologyBuildsBeforeVisibilityToggle &&
+            runtimeState->water.seepageDescriptorAttachmentRevision ==
+                descriptorAttachmentsBeforeVisibilityToggle &&
+            disabledSeepageSettledWithoutContinuousRedraw &&
+            enabledSeepageRequestsContinuousRedraw &&
             !initialSeepageTopologyFingerprint.empty() &&
             seepageTopologyFingerprint() == initialSeepageTopologyFingerprint;
-        if (initialPublicationSettled && reenabledPublicationSettled) {
+        if (initialPublicationSettled && visibilityWasParameterOnly) {
             report.Pass(
-                "Full-strength authored Seepage armed both live frame slots while ROCK remained in the live draw plan; off/on rebuilt the same compact topology.");
+                "Seepage off/on updated only compact parameters while ROCK kept the same semantic topology and descriptor attachment.");
         } else {
             std::ostringstream detail;
-            detail << "Seepage startup publication or ROCK draw-plan arming was not stable across initial enable and off/on rebuild"
+            detail << "Seepage startup publication or parameter-only off/on stability failed"
                    << " (initial_publication=" << (initialPublicationSettled ? 1 : 0)
-                   << ",reenabled_publication=" << (reenabledPublicationSettled ? 1 : 0)
-                   << ",startup_arming_seen=" << (sawStartupSeepageArming ? 1 : 0)
-                   << ",startup_sequence=" << (startupSeepageActivationSequence ? 1 : 0)
-                   << ",startup_base_draws=" << startupSeepageBaseDraws
-                   << ",reenabled_sequence=" << (reenabledActivationSequence ? 1 : 0)
-                   << ",reenabled_base_draws=" << reenabledBaseDraws
+                   << ",parameter_only=" << (visibilityWasParameterOnly ? 1 : 0)
+                   << ",startup_presentations=" << startupSeepagePresentationCount
+                   << ",descriptor_ready="
+                   << (startupSeepageDescriptorGenerationsReady ? 1 : 0)
+                   << ",descriptor_mismatches="
+                   << startupSeepageDescriptorMismatchCount
+                   << ",requested_generation="
+                   << initialPublication.requestedGeneration
+                   << ",live_generations="
+                   << initialPublication.liveFrameGenerations[0] << '/'
+                   << initialPublication.liveFrameGenerations[1]
+                   << ",exr_generation=" << initialPublication.exrGeneration
+                   << ",topology_generation="
+                   << initialPublication.topologyGeneration
+                   << ",exr_descriptor_generation="
+                   << initialPublication.exrDescriptorGeneration
+                   << ",exr_params_required="
+                   << (initialPublication.exrParamsPublicationRequired ? 1 : 0)
                    << ",topology_revision="
                    << viewport->WaterSeepageTopologyUploadRevision(rockLayerId)
-                   << '/' << (initialTopologyRevision + 2U);
+                   << '/' << initialTopologyRevision
+                   << ",semantic_builds="
+                   << runtimeState->water.seepageTopologyBuildRevision
+                   << '/' << topologyBuildsBeforeVisibilityToggle
+                   << ",attachments="
+                   << runtimeState->water.seepageDescriptorAttachmentRevision
+                   << '/' << descriptorAttachmentsBeforeVisibilityToggle
+                   << ",disabled_redraw="
+                   << (disabledSeepageSettledWithoutContinuousRedraw ? 0 : 1)
+                   << ",enabled_redraw="
+                   << (enabledSeepageRequestsContinuousRedraw ? 1 : 0);
             detail << ").";
             report.Fail(detail.str());
         }
+    }
+
+    const auto committedBundleMatches = [&](const ScenePointCloudRuntime& targetScene,
+                                            const SceneDisplayBundleRuntime& bundle) {
+        for (std::size_t roleIndex = 0U; roleIndex < bundle.sessionIndices.size(); ++roleIndex) {
+            const auto committed = targetScene.committedDisplaySessionIndices[roleIndex];
+            if (!committed.has_value() || committed.value() != bundle.sessionIndices[roleIndex]) {
+                return false;
+            }
+            const auto& session = runtimeState->sessions[committed.value()];
+            if (!session.loaded || !session.gpuResident || !session.visible ||
+                !session.committedDisplaySource) {
+                return false;
+            }
+        }
+        return !targetScene.mixedDisplay;
+    };
+    std::unordered_map<invisible_places::scene::PointSpacingMicrometres, std::uint64_t>
+        settledResidentBytesBySpacing;
+    if (scene->committedDisplaySpacingMicrometres.has_value()) {
+        settledResidentBytesBySpacing.emplace(
+            scene->committedDisplaySpacingMicrometres.value(),
+            viewport->PointCloudResidentBytes());
+    }
+    const auto descriptorGenerationsBounded = [&]() {
+        const auto& diagnostics = viewport->Diagnostics();
+        const auto liveGenerations =
+            diagnostics.pointDescriptorGenerationsAllocated >=
+                    diagnostics.pointDescriptorGenerationsRetired
+                ? diagnostics.pointDescriptorGenerationsAllocated -
+                      diagnostics.pointDescriptorGenerationsRetired
+                : std::numeric_limits<std::uint64_t>::max();
+        std::size_t rendererPointLayerCount = 0U;
+        for (std::size_t sessionIndex = 0U;
+             sessionIndex < runtimeState->sessions.size();
+             ++sessionIndex) {
+            rendererPointLayerCount +=
+                viewport->HasPointCloudResources(sessionIndex) ? 1U : 0U;
+        }
+        report.densityDescriptorGenerationsAllocated =
+            diagnostics.pointDescriptorGenerationsAllocated;
+        report.densityDescriptorGenerationsRetired =
+            diagnostics.pointDescriptorGenerationsRetired;
+        report.densityDescriptorGenerationsLive = liveGenerations;
+        report.densityRendererPointLayerCount = rendererPointLayerCount;
+        const bool bounded =
+            liveGenerations == static_cast<std::uint64_t>(rendererPointLayerCount);
+        report.densityDescriptorGenerationsBounded =
+            report.densityDescriptorGenerationsBounded && bounded;
+        return bounded;
+    };
+    const auto switchDisplayDensityForSmoke = [&](
+                                                  invisible_places::scene::PointSpacingMicrometres spacing) {
+        const auto* targetBundle = FindSceneDisplayBundle(*scene, spacing);
+        if (targetBundle == nullptr) {
+            report.Fail(
+                "The " + FormatFixed(static_cast<double>(spacing) / 1000.0, 3) +
+                " mm density bundle was unavailable for transaction validation.");
+            return false;
+        }
+        const auto targetSessionIndices = targetBundle->sessionIndices;
+        const auto previousSessionIndices = scene->committedDisplaySessionIndices;
+        const auto countersBefore = CaptureWaterIntegrationCounters(*runtimeState, *viewport);
+        if (!RequestSceneDisplaySwitch(runtimeState, viewport, scene, spacing)) {
+            report.Fail(
+                "Could not request the " +
+                FormatFixed(static_cast<double>(spacing) / 1000.0, 3) +
+                " mm density transaction: " + runtimeState->errorMessage);
+            return false;
+        }
+
+        bool observedPartialCommit = false;
+        const auto switchDeadline = std::chrono::steady_clock::now() +
+                                    (sampleScene ? std::chrono::seconds{120}
+                                                 : std::chrono::seconds{360});
+        while (std::chrono::steady_clock::now() < switchDeadline && !window->ShouldClose()) {
+            PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true, true);
+            const bool committedOld =
+                scene->committedDisplaySessionIndices == previousSessionIndices;
+            const bool committedTarget =
+                std::equal(
+                    scene->committedDisplaySessionIndices.begin(),
+                    scene->committedDisplaySessionIndices.end(),
+                    targetSessionIndices.begin(),
+                    [](const auto& committed, std::size_t target) {
+                        return committed.has_value() && committed.value() == target;
+                    });
+            observedPartialCommit |= !committedOld && !committedTarget;
+            if (!scene->pendingDisplaySpacingMicrometres.has_value() &&
+                !scene->pendingMixedDisplay) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+
+        const auto* settledBundle = FindSceneDisplayBundle(*scene, spacing);
+        const auto countersAfter = CaptureWaterIntegrationCounters(*runtimeState, *viewport);
+        const std::size_t changedRoleCount = static_cast<std::size_t>(std::count_if(
+            targetSessionIndices.begin(),
+            targetSessionIndices.end(),
+            [&](std::size_t target) {
+                return std::find(
+                           previousSessionIndices.begin(),
+                           previousSessionIndices.end(),
+                           std::optional<std::size_t>{target}) ==
+                       previousSessionIndices.end();
+            }));
+        const bool noSemanticWork =
+            countersAfter.sourceScans == countersBefore.sourceScans &&
+            countersAfter.gpuTableBuilds == countersBefore.gpuTableBuilds &&
+            countersAfter.fullPayloadHashPasses == countersBefore.fullPayloadHashPasses &&
+            countersAfter.cacheBuilds == countersBefore.cacheBuilds &&
+            countersAfter.cacheInstalls == countersBefore.cacheInstalls &&
+            countersAfter.cacheUploads == countersBefore.cacheUploads &&
+            countersAfter.cachePreprocessDispatches == countersBefore.cachePreprocessDispatches &&
+            countersAfter.pathBakes == countersBefore.pathBakes &&
+            countersAfter.seepageGuideBuilds == countersBefore.seepageGuideBuilds &&
+            countersAfter.seepageTopologyBuilds == countersBefore.seepageTopologyBuilds &&
+            countersAfter.flowComputeDispatches == countersBefore.flowComputeDispatches;
+        const bool attachmentsExact =
+            countersAfter.seepageDescriptorAttachments ==
+            countersBefore.seepageDescriptorAttachments + changedRoleCount;
+        const auto residencyCeiling = std::max(
+            scene->lastSwitchOldGpuResidentBytes,
+            scene->lastSwitchTargetGpuResidentBytes);
+        const bool residencyBounded =
+            scene->lastSwitchPeakGpuResidentBytes <= residencyCeiling;
+        const bool settledExactlyOnce = scene->lastSwitchGpuSettleCount == 1U;
+        const bool descriptorGenerationCountBounded = descriptorGenerationsBounded();
+        ++report.densityTransactionCount;
+        report.densityTransactionTotalSettleCount += scene->lastSwitchGpuSettleCount;
+        report.densityTransactionMaxSettleCount = std::max(
+            report.densityTransactionMaxSettleCount,
+            scene->lastSwitchGpuSettleCount);
+        report.densityTransactionPeakGpuResidentBytes = std::max(
+            report.densityTransactionPeakGpuResidentBytes,
+            scene->lastSwitchPeakGpuResidentBytes);
+        report.densityTransactionResidencyCeilingBytes = std::max(
+            report.densityTransactionResidencyCeilingBytes,
+            residencyCeiling);
+        const bool committed =
+            settledBundle != nullptr && committedBundleMatches(*scene, *settledBundle) &&
+            scene->committedDisplaySpacingMicrometres == spacing;
+        const bool descriptorsReady = std::all_of(
+            targetSessionIndices.begin(),
+            targetSessionIndices.end(),
+            [&](std::size_t sessionIndex) {
+                const auto publication =
+                    viewport->WaterSeepageParamsPublicationState(sessionIndex);
+                return publication.descriptorGenerationReady &&
+                       publication.descriptorGenerationMismatchCount == 0U;
+            });
+        if (committed && !observedPartialCommit && noSemanticWork &&
+            attachmentsExact && residencyBounded && settledExactlyOnce &&
+            descriptorsReady && descriptorGenerationCountBounded) {
+            settledResidentBytesBySpacing[spacing] =
+                scene->lastSwitchTargetGpuResidentBytes;
+            report.Pass(
+                "Density transaction committed the complete " +
+                FormatFixed(static_cast<double>(spacing) / 1000.0, 3) +
+                " mm bundle with CPU-only staging, one GPU settle, exact descriptor attachments, reused Seepage topology, and byte-bounded GPU residency.");
+            return true;
+        }
+        report.Fail(
+            "Density transaction validation failed for " +
+            FormatFixed(static_cast<double>(spacing) / 1000.0, 3) +
+            " mm (committed=" + std::to_string(committed ? 1 : 0) +
+            ",partial=" + std::to_string(observedPartialCommit ? 1 : 0) +
+            ",semantic_reuse=" + std::to_string(noSemanticWork ? 1 : 0) +
+            ",attachments=" + std::to_string(attachmentsExact ? 1 : 0) +
+            ",residency=" + std::to_string(residencyBounded ? 1 : 0) +
+            ",settles=" + std::to_string(scene->lastSwitchGpuSettleCount) +
+            ",peak_bytes=" + std::to_string(scene->lastSwitchPeakGpuResidentBytes) +
+            ",ceiling_bytes=" + std::to_string(residencyCeiling) +
+            ",descriptor_pools=" +
+            std::to_string(descriptorGenerationCountBounded ? 1 : 0) +
+            ",descriptors=" + std::to_string(descriptorsReady ? 1 : 0) + ").");
+        return false;
+    };
+
+    bool densityCyclePassed = true;
+    for (const auto spacing : std::array<invisible_places::scene::PointSpacingMicrometres, 3>{
+             2000U,
+             3000U,
+             2000U}) {
+        densityCyclePassed = switchDisplayDensityForSmoke(spacing) && densityCyclePassed;
+    }
+    if (densityCyclePassed) {
+        report.Pass("Completed the 3 mm -> 2 mm -> 3 mm -> 2 mm Seepage-enabled density cycle.");
+    }
+
+    if (scene->committedDisplaySpacingMicrometres == 2000U) {
+        const auto previousDisplay = scene->committedDisplaySessionIndices;
+        const auto selectedSessionBeforeFailure = runtimeState->selectedSessionIndex;
+        const auto topologyBuildsBeforeFailure =
+            runtimeState->water.seepageTopologyBuildRevision;
+        const auto expectedResidentBytesAfterRollback =
+            viewport->PointCloudResidentBytes();
+        scene->smokeInjectedUploadFailureRoleIndex = 1U;
+        const bool requestedFailure = RequestSceneDisplaySwitch(
+            runtimeState,
+            viewport,
+            scene,
+            3000U);
+        const auto failureDeadline = std::chrono::steady_clock::now() +
+                                     (sampleScene ? std::chrono::seconds{120}
+                                                  : std::chrono::seconds{360});
+        while (requestedFailure &&
+               std::chrono::steady_clock::now() < failureDeadline &&
+               (scene->pendingDisplaySpacingMicrometres.has_value() ||
+                scene->pendingMixedDisplay) &&
+               !window->ShouldClose()) {
+            PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        ++report.densityTransactionCount;
+        report.densityTransactionTotalSettleCount += scene->lastSwitchGpuSettleCount;
+        report.densityTransactionMaxSettleCount = std::max(
+            report.densityTransactionMaxSettleCount,
+            scene->lastSwitchGpuSettleCount);
+        report.densityTransactionPeakGpuResidentBytes = std::max(
+            report.densityTransactionPeakGpuResidentBytes,
+            scene->lastSwitchPeakGpuResidentBytes);
+        const auto expectedFailedTargetBytesIt =
+            settledResidentBytesBySpacing.find(3000U);
+        const auto failureResidencyCeiling = std::max(
+            scene->lastSwitchOldGpuResidentBytes,
+            expectedFailedTargetBytesIt != settledResidentBytesBySpacing.end()
+                ? expectedFailedTargetBytesIt->second
+                : scene->lastSwitchTargetGpuResidentBytes);
+        report.densityTransactionResidencyCeilingBytes = std::max(
+            report.densityTransactionResidencyCeilingBytes,
+            failureResidencyCeiling);
+        report.densityRollbackExpectedGpuResidentBytes =
+            expectedResidentBytesAfterRollback;
+        report.densityRollbackActualGpuResidentBytes =
+            viewport->PointCloudResidentBytes();
+        report.densityRollbackFailedTargetResourcesClean =
+            scene->lastSwitchFailedTargetResourcesClean;
+        const bool rollbackDescriptorGenerationsBounded =
+            descriptorGenerationsBounded();
+        bool restoredCompleteBundle =
+            scene->committedDisplaySessionIndices == previousDisplay &&
+            scene->committedDisplaySpacingMicrometres == 2000U &&
+            runtimeState->selectedSessionIndex == selectedSessionBeforeFailure &&
+            report.densityRollbackActualGpuResidentBytes ==
+                expectedResidentBytesAfterRollback &&
+            scene->lastSwitchGpuSettleCount == 1U &&
+            scene->lastSwitchPeakGpuResidentBytes <=
+                failureResidencyCeiling &&
+            scene->lastSwitchFailedTargetResourcesClean &&
+            rollbackDescriptorGenerationsBounded;
+        for (const auto sessionIndex : previousDisplay) {
+            restoredCompleteBundle =
+                restoredCompleteBundle && sessionIndex.has_value() &&
+                runtimeState->sessions[sessionIndex.value()].loaded &&
+                runtimeState->sessions[sessionIndex.value()].gpuResident &&
+                runtimeState->sessions[sessionIndex.value()].visible;
+        }
+        if (const auto* failedTarget = FindSceneDisplayBundle(*scene, 3000U);
+            failedTarget != nullptr) {
+            for (const auto targetSessionIndex : failedTarget->sessionIndices) {
+                if (std::find(
+                        previousDisplay.begin(),
+                        previousDisplay.end(),
+                        std::optional<std::size_t>{targetSessionIndex}) ==
+                    previousDisplay.end()) {
+                    restoredCompleteBundle =
+                        restoredCompleteBundle &&
+                        !runtimeState->sessions[targetSessionIndex].gpuResident &&
+                        !viewport->HasPointCloudResources(targetSessionIndex);
+                }
+            }
+        }
+        const bool rollbackPassed =
+            restoredCompleteBundle &&
+            !scene->pendingDisplaySpacingMicrometres.has_value() &&
+            runtimeState->water.seepageTopologyBuildRevision ==
+                topologyBuildsBeforeFailure &&
+            scene->switchError.find(
+                "Injected point-cloud upload failure after partial allocation") !=
+                std::string::npos;
+        if (rollbackPassed) {
+            report.Pass(
+                "Injected second-role failure after partial Vulkan allocation released every failed target resource and restored the byte-identical prior GPU bundle with one settle and no Seepage topology rebuild.");
+        } else {
+            report.Fail(
+                "Second-role partial-allocation failure did not restore the complete prior density bundle (settles=" +
+                std::to_string(scene->lastSwitchGpuSettleCount) +
+                ",expected_bytes=" +
+                std::to_string(expectedResidentBytesAfterRollback) +
+                ",actual_bytes=" +
+                std::to_string(report.densityRollbackActualGpuResidentBytes) +
+                ",failed_target_clean=" +
+                std::to_string(scene->lastSwitchFailedTargetResourcesClean ? 1 : 0) +
+                ",descriptor_pools=" +
+                std::to_string(rollbackDescriptorGenerationsBounded ? 1 : 0) +
+                ").");
+        }
+        scene->smokeInjectedUploadFailureRoleIndex.reset();
+        runtimeState->errorMessage.clear();
+    } else {
+        report.Fail("Density rollback injection was skipped because the 2 mm bundle was not committed.");
+    }
+    if (scene->committedDisplaySpacingMicrometres == 2000U &&
+        switchDisplayDensityForSmoke(3000U)) {
+        report.Pass("Restored the authored 3 mm display for the remaining Top_View validation.");
     }
 
     InstallWaterIntegrationScenario(runtimeState);
@@ -44054,6 +45113,187 @@ int RunWaterIntegrationSmoke(
             return finish();
         }
     }
+
+    if (sampleScene) {
+        // Exercise the renderer's real source-local upload transaction with the
+        // exact immutable input that produced the settled SampleFlowPath. A
+        // failed staging allocation must be observationally invisible before
+        // the same revision is retried normally.
+        const auto flowSessionIndex =
+            FindLoadedWaterFlowSourceSessionIndex(*runtimeState, flowPathIt->id);
+        const auto sourceRequestIt =
+            runtimeState->water.flowTrailSourceRequests.find(flowPathIt->id);
+        const auto surfaceView = viewport->WaterSurfaceFlowView();
+        std::string unavailableReason;
+        if (!flowSessionIndex.has_value()) {
+            unavailableReason = "the settled SampleFlowPath renderer session was unavailable";
+        } else if (sourceRequestIt == runtimeState->water.flowTrailSourceRequests.end()) {
+            unavailableReason = "the settled SampleFlowPath immutable source request was unavailable";
+        } else if (sourceRequestIt->second.anchors == nullptr ||
+                   sourceRequestIt->second.anchors->points.size() < 2U ||
+                   sourceRequestIt->second.gpuCompactSourceInput == nullptr ||
+                   !sourceRequestIt->second.gpuCompactSourceInput->Valid() ||
+                   !sourceRequestIt->second.gpuPreviewEligible) {
+            unavailableReason = "the settled SampleFlowPath source request was not GPU-valid";
+        } else if (sourceRequestIt->second.useSurfaceGuide &&
+                   (!surfaceView.valid || !surfaceView.preprocessingComplete)) {
+            unavailableReason = "the settled SampleFlowPath surface-cache view was unavailable";
+        }
+
+        if (!unavailableReason.empty()) {
+            report.Fail(
+                "Could not run the Flow partial-allocation transaction smoke because " +
+                unavailableReason + ".");
+            return finish();
+        }
+
+        const auto sessionIndex = flowSessionIndex.value();
+        const auto& sourceRequest = sourceRequestIt->second;
+        const auto beforeFailure = viewport->WaterFlowGpuSourceState(sessionIndex);
+        const bool settledBaseline =
+            viewport->HasPointCloudResources(sessionIndex) &&
+            beforeFailure.sourceId == flowPathIt->id &&
+            beforeFailure.requestedRevision > 0U &&
+            beforeFailure.completedRevision == beforeFailure.requestedRevision &&
+            !beforeFailure.pending && beforeFailure.pointCapacity > 0U &&
+            beforeFailure.activePointCount > 0U &&
+            beforeFailure.computeDescriptorGeneration > 0U &&
+            beforeFailure.pointDescriptorGeneration > 0U &&
+            beforeFailure.residentBytes > 0U;
+        if (!settledBaseline) {
+            report.Fail(
+                "Could not run the Flow partial-allocation transaction smoke because SampleFlowPath was not settled.");
+            return finish();
+        }
+
+        invisible_places::renderer::core::WaterFlowGpuSourceRequest smokeRequest;
+        smokeRequest.sourceId = sourceRequest.sourceId;
+        smokeRequest.sourceRevision =
+            runtimeState->water.flowTrailBuildJob.nextGpuSourceRevision++;
+        smokeRequest.inputKind = sourceRequest.gpuInputKind;
+        smokeRequest.sampledAnchors = sourceRequest.anchors->points;
+        smokeRequest.controlPoints = sourceRequest.gpuControlPoints != nullptr
+                                         ? std::span<const invisible_places::io::Float3>{
+                                               *sourceRequest.gpuControlPoints}
+                                         : std::span<const invisible_places::io::Float3>{};
+        smokeRequest.compactSourceInput = sourceRequest.gpuCompactSourceInput;
+        smokeRequest.settings = sourceRequest.settings;
+        smokeRequest.useSurfaceGuide = sourceRequest.useSurfaceGuide;
+
+        constexpr std::string_view kInjectedFlowFailure =
+            "Injected Water Flow upload failure after partial allocation.";
+        bool exactInjectedFailureCaught = false;
+        std::string injectedFailureMessage;
+        viewport->SetSmokeFailNextWaterFlowUploadAfterPartialAllocation();
+        try {
+            (void)viewport->UploadWaterFlowGpuSource(sessionIndex, smokeRequest);
+        } catch (const std::exception& error) {
+            injectedFailureMessage = error.what();
+            exactInjectedFailureCaught = injectedFailureMessage == kInjectedFlowFailure;
+        } catch (...) {
+            injectedFailureMessage = "non-standard exception";
+        }
+
+        // Submit a normal presentation after the exception so stale or
+        // partially published point descriptors cannot hide behind the
+        // diagnostics-only checks below.
+        PumpWaterIntegrationSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.0F,
+            true,
+            true);
+        const auto afterFailure = viewport->WaterFlowGpuSourceState(sessionIndex);
+        const bool diagnosticsUnchanged =
+            afterFailure.requestedRevision == beforeFailure.requestedRevision &&
+            afterFailure.completedRevision == beforeFailure.completedRevision &&
+            afterFailure.pending == beforeFailure.pending &&
+            afterFailure.pointCapacity == beforeFailure.pointCapacity &&
+            afterFailure.activePointCount == beforeFailure.activePointCount &&
+            afterFailure.computeDescriptorGeneration ==
+                beforeFailure.computeDescriptorGeneration &&
+            afterFailure.pointDescriptorGeneration ==
+                beforeFailure.pointDescriptorGeneration &&
+            afterFailure.residentBytes == beforeFailure.residentBytes &&
+            afterFailure.computeDispatchCount == beforeFailure.computeDispatchCount &&
+            afterFailure.bytesTransferred == beforeFailure.bytesTransferred;
+        const bool rendererIntact =
+            viewport->HasPointCloudResources(sessionIndex) &&
+            afterFailure.sourceId == beforeFailure.sourceId &&
+            afterFailure.usingSurfaceGuide == beforeFailure.usingSurfaceGuide;
+        if (!exactInjectedFailureCaught || !diagnosticsUnchanged || !rendererIntact) {
+            std::ostringstream detail;
+            detail << "Flow partial-allocation failure was not atomic"
+                   << " (caught_exact=" << (exactInjectedFailureCaught ? 1 : 0)
+                   << ",message=" << injectedFailureMessage
+                   << ",diagnostics_unchanged=" << (diagnosticsUnchanged ? 1 : 0)
+                   << ",renderer_intact=" << (rendererIntact ? 1 : 0)
+                   << ",requested=" << beforeFailure.requestedRevision << '/'
+                   << afterFailure.requestedRevision
+                   << ",completed=" << beforeFailure.completedRevision << '/'
+                   << afterFailure.completedRevision
+                   << ",compute_generation="
+                   << beforeFailure.computeDescriptorGeneration << '/'
+                   << afterFailure.computeDescriptorGeneration
+                   << ",point_generation="
+                   << beforeFailure.pointDescriptorGeneration << '/'
+                   << afterFailure.pointDescriptorGeneration
+                   << ",resident_bytes=" << beforeFailure.residentBytes << '/'
+                   << afterFailure.residentBytes
+                   << ",dispatches=" << beforeFailure.computeDispatchCount << '/'
+                   << afterFailure.computeDispatchCount
+                   << ",transferred_bytes=" << beforeFailure.bytesTransferred << '/'
+                   << afterFailure.bytesTransferred << ").";
+            report.Fail(detail.str());
+            return finish();
+        }
+
+        const auto retryResult =
+            viewport->UploadWaterFlowGpuSource(sessionIndex, smokeRequest);
+        const auto acceptedDiagnostics =
+            viewport->WaterFlowGpuSourceState(sessionIndex);
+        const bool retryAcceptedWithFreshComputeGeneration =
+            retryResult.accepted && acceptedDiagnostics.pending &&
+            acceptedDiagnostics.requestedRevision == smokeRequest.sourceRevision &&
+            acceptedDiagnostics.computeDescriptorGeneration >
+                beforeFailure.computeDescriptorGeneration;
+        if (!retryAcceptedWithFreshComputeGeneration) {
+            report.Fail(
+                "The normal SampleFlowPath retry was not accepted with a fresh compute descriptor generation.");
+            return finish();
+        }
+
+        const auto retryDeadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds{30};
+        while (std::chrono::steady_clock::now() < retryDeadline &&
+               viewport->WaterFlowGpuSourceState(sessionIndex).pending &&
+               !window->ShouldClose()) {
+            PumpWaterIntegrationSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.0F,
+                true,
+                true);
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        const auto settledRetry = viewport->WaterFlowGpuSourceState(sessionIndex);
+        if (settledRetry.completedRevision != smokeRequest.sourceRevision ||
+            settledRetry.pending ||
+            settledRetry.computeDescriptorGeneration <=
+                beforeFailure.computeDescriptorGeneration ||
+            settledRetry.activePointCount != beforeFailure.activePointCount ||
+            settledRetry.pointCapacity != beforeFailure.pointCapacity) {
+            report.Fail(
+                "The accepted SampleFlowPath retry did not settle the same source output cleanly.");
+            return finish();
+        }
+        runtimeState->sessions[sessionIndex].waterFlowGpuRevision =
+            smokeRequest.sourceRevision;
+        report.Pass(
+            "Injected SampleFlowPath partial-allocation failure preserved every settled Flow diagnostic and rendered resource; retrying the same immutable source advanced a fresh compute descriptor generation and settled normally.");
+    }
     // One final frame settles compact Seepage guides/parameters before the
     // parameter-only counter baseline is captured.
     PumpWaterIntegrationSmokeFrame(window, runtimeState, viewport, 0.0F, true);
@@ -44143,6 +45383,8 @@ int RunWaterIntegrationSmoke(
         after.cachePreprocessDispatches == before.cachePreprocessDispatches &&
         after.pathBakes == before.pathBakes &&
         after.seepageGuideBuilds == before.seepageGuideBuilds &&
+        after.seepageTopologyBuilds == before.seepageTopologyBuilds &&
+        after.seepageDescriptorAttachments == before.seepageDescriptorAttachments &&
         after.seepageTopologyUploads == before.seepageTopologyUploads &&
         after.flowComputeDispatches == before.flowComputeDispatches) {
         report.Pass("The 120-second Rain/Flow/Seepage cycle performed parameter updates only.");

@@ -1,3 +1,5 @@
+#include "rain_impact_rock_model.glsl"
+
 struct RainImpactEventGpu {
     vec4 positionBirth;
     vec4 normalRadius;
@@ -188,22 +190,14 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             value = exp(-(ringDistance * ringDistance) / (thickness * thickness)) *
                     (1.0 - smoothstep(0.72, 1.0, life));
         } else if (role == kRainRoleRock) {
-            vec3 eventNormal = event.normalRadius.xyz;
-            eventNormal = dot(eventNormal, eventNormal) > 1e-8 ? normalize(eventNormal) : normalize(pointNormal);
-            const vec3 delta = point - event.positionBirth.xyz;
-            const float normalDistance = abs(dot(delta, eventNormal));
-            const vec3 tangent = delta - eventNormal * dot(delta, eventNormal);
-            const float normalizedDistance =
-                sqrt(dot(tangent, tangent) + normalDistance * normalDistance * 4.0) /
-                max(0.001, event.normalRadius.w);
-            const float growthSeconds = clamp(lifetime * 0.18, 0.55, 0.95);
-            const float growth = smoothstep(0.0, growthSeconds, age);
-            const float edgeWidth = 0.07 + (1.0 - growth) * 0.09;
-            value = (1.0 - smoothstep(
-                         max(0.0, growth - edgeWidth),
-                         growth + edgeWidth,
-                         normalizedDistance)) *
-                    (1.0 - smoothstep(0.55, 1.0, life));
+            value = EvaluateRockRainImpactValue(
+                event.positionBirth.xyz,
+                event.normalRadius.xyz,
+                event.normalRadius.w,
+                event.lifetimeEnergy.x,
+                point,
+                pointNormal,
+                age);
         } else {
             value = RainVegetationSprinkleValue(event, point, age);
         }
