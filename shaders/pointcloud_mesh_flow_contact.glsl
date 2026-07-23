@@ -6,7 +6,7 @@ struct MeshFlowContactEventGpu {
     vec4 normalRadius;       // xyz averaged normal, w response radius
     uvec4 metadata;          // particle, Ground flags, packed tint, ROCK/VEG
     vec4 response;           // opacity, emission, persistence, VEG twinkle
-    vec4 vegetationExtra;    // x downward stream depth
+    vec4 vegetationExtra;    // stream depth, moisture, convergence, seed
 };
 
 struct MeshFlowContactComposite {
@@ -71,7 +71,8 @@ bool MeshFlowContactRoleMatches(uint eventRole) {
     // ROCK = 1, SAND = 2, VEG = 3. Ground contacts intentionally ignore SAND.
     const uint pointRole = styleData.rainImpactControl.y;
     return (eventRole == kMeshFlowContactRoleRock && pointRole == 1u) ||
-           (eventRole == kMeshFlowContactRoleVegetation && pointRole == 3u);
+           (eventRole == kMeshFlowContactRoleVegetation &&
+            (pointRole == 1u || pointRole == 3u));
 }
 
 void BlendMeshFlowContact(
@@ -101,76 +102,139 @@ void BlendMeshFlowContact(
     const bool vegetation =
         event.metadata.w == kMeshFlowContactRoleVegetation &&
         (event.metadata.y & kMeshFlowGroundVegetationSupportedFlag) != 0u;
-    float spatial = 0.0;
-    float pointTwinkle = 0.0;
-    if (!vegetation) {
-        const float distanceToContact = length(delta);
-        if (distanceToContact > radius) {
-            return;
-        }
-        const float radial = 1.0 - smoothstep(radius * 0.20, radius, distanceToContact);
-        const float belowWeight = mix(
-            0.72,
-            1.18,
-            smoothstep(-radius * 0.20, radius * 0.65, -delta.z));
-        spatial = radial * belowWeight;
-        pointTwinkle = spatial * 0.08;
-    } else {
-        if (planarDistance > radius || delta.z > radius * 0.10) {
-            return;
-        }
-        const float streamDepth = max(radius, event.vegetationExtra.x);
-        const float downwardDepth = max(0.0, -delta.z);
-        if (downwardDepth > streamDepth) {
-            return;
-        }
-        const float streamWidth = max(0.006, radius * mix(
-            0.44,
-            0.18,
-            clamp(downwardDepth / streamDepth, 0.0, 1.0)));
-        const uint pointSeed = MeshFlowContactHashBits(
-            event.metadata.x ^
-            MeshFlowContactHashBits(uint(floor(point.x / 0.01))) ^
-            MeshFlowContactHashBits(uint(floor(point.y / 0.01))) ^
-            MeshFlowContactHashBits(uint(floor(point.z / 0.01))));
-        const vec2 wanderDirection = normalize(
-            vec2(
-                MeshFlowContactHash01(pointSeed + 0x68bc21ebu),
-                MeshFlowContactHash01(pointSeed + 0x02e5be93u)) *
-                2.0 -
-            1.0 +
-            vec2(1.0e-4, 0.0));
-        const vec2 wanderingCentre =
-            wanderDirection *
-            sin(downwardDepth * 31.0 + float(event.metadata.x) * 0.73) *
-            radius * 0.16;
-        const float streamDistance = length(delta.xy - wanderingCentre);
-        const float streamMask =
-            1.0 - smoothstep(streamWidth, streamWidth * 2.5, streamDistance);
-        const float crownMask =
-            (1.0 - smoothstep(radius * 0.20, radius, planarDistance)) *
-            (1.0 - smoothstep(0.0, radius * 0.50, downwardDepth));
-        const float depthFade =
-            1.0 - smoothstep(streamDepth * 0.72, streamDepth, downwardDepth);
-        const float twinklePhase =
-            timeSeconds * 7.0 -
-            downwardDepth * 24.0 +
-            MeshFlowContactHash01(pointSeed + 0x9e3779b9u) * 6.28318530718;
-        const float pulse = pow(
-            clamp(0.5 + 0.5 * sin(twinklePhase), 0.0, 1.0),
-            3.0);
-        const float twinkleStrength = max(0.0, event.response.w);
-        spatial = max(crownMask, streamMask * depthFade * (0.38 + 0.62 * pulse));
-        pointTwinkle =
-            streamMask * depthFade * pulse * min(2.5, twinkleStrength) * 0.16;
+    const float streamDepth = max(radius, event.vegetationExtra.x);
+    const float downwardDepth = max(0.0, -delta.z);
+    if (planarDistance > radius || delta.z > radius * 0.12 ||
+        downwardDepth > streamDepth) {
+        return;
     }
 
-    const float lifeFade =
-        1.0 - smoothstep(persistence * 0.48, persistence, age);
+    // Use event-level hashes for the filament centres. Point-level randomness
+    // is reserved for twinkle, so neighbouring cloud points describe coherent
+    // gravity-led fingers rather than unrelated speckles.
+    const uint eventSeed = MeshFlowContactHashBits(
+        event.metadata.x ^
+        floatBitsToUint(event.vegetationExtra.w) ^
+        0x9e3779b9u);
     vec3 eventNormal = event.normalRadius.xyz;
     eventNormal = dot(eventNormal, eventNormal) > 1.0e-8
         ? normalize(eventNormal)
         : vec3(0.0, 0.0, 1.0);
+    const vec3 projectedGravity =
+        vec3(0.0, 0.0, -1.0) -
+        eventNormal * dot(vec3(0.0, 0.0, -1.0), eventNormal);
+    const float fallbackAngle =
+        MeshFlowContactHash01(eventSeed + 0x68bc21ebu) * 6.28318530718;
+    const vec2 projectedDirection = projectedGravity.xy;
+    const vec2 mainDirection =
+        dot(projectedDirection, projectedDirection) > 1.0e-8
+            ? normalize(projectedDirection)
+            : vec2(cos(fallbackAngle), sin(fallbackAngle));
+    const float branchOffset =
+        mix(
+            -0.20943951024,
+            0.20943951024,
+            MeshFlowContactHash01(eventSeed + 0x02e5be93u));
+    const float branchCos = cos(branchOffset);
+    const float branchSin = sin(branchOffset);
+    const vec2 crossDirection = vec2(-mainDirection.y, mainDirection.x);
+    const vec2 branchDirection = vec2(
+        mainDirection.x * branchCos -
+            mainDirection.y * branchSin,
+        mainDirection.x * branchSin +
+            mainDirection.y * branchCos);
+    const float depthT = clamp(downwardDepth / streamDepth, 0.0, 1.0);
+    const float moisture = clamp(event.vegetationExtra.y, 0.0, 1.0);
+    const float convergence = clamp(event.vegetationExtra.z, 0.0, 1.0);
+    const float flowEnergy =
+        clamp(0.42 + 0.30 * moisture + 0.28 * convergence, 0.0, 1.0);
+    const float eventPhase =
+        MeshFlowContactHash01(eventSeed + 0x85ebca6bu) * 6.28318530718;
+    const float wanderAmplitude =
+        radius * mix(0.025, 0.075, flowEnergy) *
+        (0.25 + 0.75 * depthT);
+    const vec2 mainCentre =
+        mainDirection *
+            sin(downwardDepth * mix(19.0, 29.0, flowEnergy) + eventPhase) *
+            wanderAmplitude +
+        crossDirection *
+            sin(downwardDepth * 13.0 + eventPhase * 1.37) *
+            wanderAmplitude * 0.28;
+    const float branchProbability = mix(0.20, 0.55, moisture);
+    const float branchEnabled =
+        MeshFlowContactHash01(eventSeed + 0x27d4eb2fu) <
+                branchProbability
+            ? 1.0
+            : 0.0;
+    const float branchGate =
+        branchEnabled * smoothstep(0.18, 0.42, depthT);
+    const vec2 branchCentre =
+        mainCentre +
+        branchDirection *
+            (downwardDepth - streamDepth * 0.12) *
+            0.08 * branchGate;
+
+    const float mainWidth = max(
+        0.005,
+        radius * mix(
+            vegetation ? 0.24 : 0.17,
+            vegetation ? 0.10 : 0.065,
+            depthT));
+    const float branchWidth = max(0.004, mainWidth * 0.70);
+    const float mainDistance = length(delta.xy - mainCentre);
+    const float branchDistance = length(delta.xy - branchCentre);
+    const float mainStream =
+        1.0 - smoothstep(mainWidth, mainWidth * 2.15, mainDistance);
+    const float branchStream =
+        (1.0 - smoothstep(
+            branchWidth,
+            branchWidth * 2.20,
+            branchDistance)) *
+        branchGate;
+    const float streamMask = max(mainStream, branchStream * 0.82);
+
+    const float crownMask =
+        (1.0 - smoothstep(radius * 0.16, radius, planarDistance)) *
+        (1.0 - smoothstep(radius * 0.08, radius * 0.72, downwardDepth));
+    const float belowWeight = mix(
+        0.70,
+        1.18,
+        smoothstep(-radius * 0.12, radius * 0.72, -delta.z));
+    const float depthFade =
+        1.0 - smoothstep(streamDepth * 0.72, streamDepth, downwardDepth);
+    const float pulsePhase =
+        timeSeconds * mix(5.2, 7.2, moisture) -
+        downwardDepth * mix(19.0, 28.0, flowEnergy) +
+        eventPhase;
+    const float pulse = pow(
+        clamp(0.5 + 0.5 * sin(pulsePhase), 0.0, 1.0),
+        3.0);
+    const float descendingFront =
+        smoothstep(
+            depthT * persistence * 0.32,
+            depthT * persistence * 0.32 + max(0.08, persistence * 0.10),
+            age);
+    const float streamSignal =
+        streamMask * depthFade * descendingFront *
+        (0.26 + 0.74 * pulse) * mix(0.72, 1.0, flowEnergy);
+    const float spatial = max(crownMask * belowWeight, streamSignal);
+
+    const uint pointSeed = MeshFlowContactHashBits(
+        eventSeed ^
+        MeshFlowContactHashBits(uint(floor(point.x / 0.01))) ^
+        MeshFlowContactHashBits(uint(floor(point.y / 0.01))) ^
+        MeshFlowContactHashBits(uint(floor(point.z / 0.01))));
+    const float pointVariation =
+        0.78 + 0.22 * MeshFlowContactHash01(pointSeed + 0xc2b2ae35u);
+    const float twinkleStrength = vegetation
+        ? max(0.0, event.response.w)
+        : 0.65;
+    const float pointTwinkle =
+        streamMask * depthFade * descendingFront * pulse *
+        min(2.5, twinkleStrength) * 0.16 * pointVariation;
+
+    const float lifeFade =
+        1.0 - smoothstep(persistence * 0.48, persistence, age);
     vec3 normalizedPointNormal = pointNormal;
     normalizedPointNormal = dot(normalizedPointNormal, normalizedPointNormal) > 1.0e-8
         ? normalize(normalizedPointNormal)

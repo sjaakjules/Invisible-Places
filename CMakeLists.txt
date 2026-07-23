@@ -85,6 +85,7 @@ set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_rain_impact.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_mesh_flow_contact.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rain_impact_rock_model.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rain_impact_sand_model.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water_flow_gpu_common.glsl"
 )
@@ -311,6 +312,21 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
         set_tests_properties(
             dynamic-mesh-flow-ground-gui-smoke
             PROPERTIES LABELS gui_smoke
+        )
+        add_test(
+            NAME dynamic-mesh-flow-scene1-visual-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke dynamic-mesh-flow-scene1-visual
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke/scene1-mesh-flow-visual"
+        )
+        set_tests_properties(
+            dynamic-mesh-flow-scene1-visual-gui-smoke
+            PROPERTIES
+                LABELS "gui_smoke;water_integration"
+                RUN_SERIAL TRUE
+                TIMEOUT 600
         )
         add_test(
             NAME water-integration-sample-scene

@@ -242,7 +242,6 @@ struct DynamicMeshFlowGpuUploadResult {
 // frame without replacing descriptors or simulation storage.
 struct DynamicMeshFlowGpuFrameRequest {
     invisible_places::water::WaterDynamicMeshFlowSettings settings{};
-    std::span<const invisible_places::water::WaterEmitter> authoredEmitters{};
     float activity = 1.0F;
     float moisture = 0.0F;
     float timeSeconds = 0.0F;
@@ -256,6 +255,16 @@ struct DynamicMeshFlowGpuUpdateResult {
     std::uint32_t historyLength = 0U;
     std::uint32_t activeParticles = 0U;
     std::uint32_t contactEvents = 0U;
+    std::uint32_t entryCandidateCount = 0U;
+    std::uint32_t rainSeedCount = 0U;
+    std::uint32_t usedRainSeedParticleCount = 0U;
+    std::uint32_t routeSampleCount = 0U;
+    float routeWithinGroundBoundsFraction = 0.0F;
+    float routeWithinSurfaceToleranceFraction = 0.0F;
+    float maximumRenderedSegmentMeters = 0.0F;
+    std::uint32_t longSegmentCount = 0U;
+    std::uint32_t unexplainedVerticalJumpCount = 0U;
+    float medianTangentDownhillAlignment = 0.0F;
     std::uint64_t allocationRevision = 0U;
     std::uint64_t parameterRevision = 0U;
     std::uint64_t descriptorGeneration = 0U;
@@ -311,6 +320,13 @@ struct WaterGroundFlowGpuView {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0U;
     VkDeviceSize range = 0U;
+    // Cache-owned, vegetation-supported cells in the highest +X band of each
+    // connected Ground component. Mesh Flow samples this immutable table
+    // directly; ordinary authored Flow sources never enter the simulation.
+    VkBuffer entryCandidateBuffer = VK_NULL_HANDLE;
+    VkDeviceSize entryCandidateOffset = 0U;
+    VkDeviceSize entryCandidateRange = 0U;
+    std::uint32_t entryCandidateCount = 0U;
     std::uint32_t tableMask = 0U;
     std::uint32_t maximumProbeCount = 0U;
     std::uint32_t occupiedCellCount = 0U;
@@ -683,6 +699,16 @@ class VulkanViewportShell {
         std::uint32_t dynamicMeshFlowResetEpoch = 1U;
         std::uint32_t dynamicMeshFlowLastActiveParticleCount = 0U;
         std::uint32_t dynamicMeshFlowLastContactEventCount = 0U;
+        std::uint32_t dynamicMeshFlowLastRainSeedCount = 0U;
+        std::uint32_t dynamicMeshFlowLastRainSeedParticleCount = 0U;
+        std::uint32_t dynamicMeshFlowLastRouteSampleCount = 0U;
+        std::uint32_t dynamicMeshFlowLastRouteWithinBoundsCount = 0U;
+        std::uint32_t dynamicMeshFlowLastRouteNearSurfaceCount = 0U;
+        std::uint32_t dynamicMeshFlowLastLongSegmentCount = 0U;
+        std::uint32_t dynamicMeshFlowLastVerticalJumpCount = 0U;
+        float dynamicMeshFlowLastMaximumSegmentMeters = 0.0F;
+        std::array<std::uint32_t, 8>
+            dynamicMeshFlowLastAlignmentHistogram{};
         std::uint32_t dynamicMeshFlowEventCapacity = 0U;
         std::uint32_t dynamicMeshFlowContactGridMask = 0U;
         float dynamicMeshFlowContactGridCellSizeMeters = 0.10F;
@@ -832,6 +858,7 @@ class VulkanViewportShell {
         BufferAllocation flowSurfaceInputBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
         BufferAllocation groundTableBuffer{};
+        BufferAllocation groundEntryCandidateBuffer{};
         BufferAllocation preprocessUniformBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
         VkDescriptorPool rainDescriptorPool = VK_NULL_HANDLE;
@@ -850,6 +877,7 @@ class VulkanViewportShell {
         std::uint32_t groundMask = 0U;
         std::uint32_t groundMaximumProbeCount = 1U;
         std::uint32_t groundCellCount = 0U;
+        std::uint32_t groundEntryCandidateCount = 0U;
         float resolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
         std::uint64_t cacheRevision = 0U;
         invisible_places::water::WaterSurfaceCacheIdentity cacheIdentity{};
@@ -863,6 +891,7 @@ class VulkanViewportShell {
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
         BufferAllocation groundTableBuffer{};
+        BufferAllocation groundEntryCandidateBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
         VkDescriptorPool rainDescriptorPool = VK_NULL_HANDLE;
         std::uint32_t outstandingFrameMask = 0U;
@@ -875,6 +904,10 @@ class VulkanViewportShell {
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
         BufferAllocation groundTableBuffer{};
+        BufferAllocation groundEntryCandidateBuffer{};
+        // Header plus a fixed 1,024-entry GPU-only ring. Rain writes VEG
+        // impacts; Mesh Flow consumes the preceding completed submission.
+        BufferAllocation dynamicMeshFlowRainSeedBuffer{};
         BufferAllocation dynamicMeshFlowDummyContactEventBuffer{};
         BufferAllocation dynamicMeshFlowDummyContactGridBuffer{};
         BufferAllocation particleBuffer{};
@@ -903,6 +936,7 @@ class VulkanViewportShell {
         std::uint32_t groundMask = 0U;
         std::uint32_t groundMaximumProbeCount = 1U;
         std::uint32_t groundCellCount = 0U;
+        std::uint32_t groundEntryCandidateCount = 0U;
         float surfaceResolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
         std::uint32_t resetEpoch = 1U;
         std::uint64_t collisionCacheRevision = 0U;

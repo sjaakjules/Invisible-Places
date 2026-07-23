@@ -432,10 +432,19 @@ public:
                 }
             }
 
+            // Near-surface VEG retains the legacy component-seed semantics:
+            // this is the only vegetation test allowed to change Ground
+            // membership. Elevated canopy association happens after component
+            // retention so it can feed Rain/Mesh Flow without admitting
+            // otherwise disconnected sampled surfaces.
             const auto groundCellZ =
                 CellCoordinate(accumulator.maximumHeight, resolution_);
             for (std::int32_t zOffset = -2; zOffset <= 2; ++zOffset) {
-                if (vegetation_.contains({cell.x, cell.y, groundCellZ + zOffset})) {
+                if (vegetation_.contains({
+                        cell.x,
+                        cell.y,
+                        groundCellZ + zOffset,
+                    })) {
                     flags |= kWaterGroundVegetationSupportedFlag;
                     break;
                 }
@@ -540,6 +549,39 @@ public:
                 cache.groundCells[index].cellY,
             }] = index;
         }
+
+        // Elevated VEG is a post-retention flag association. It therefore
+        // enriches the already approved Ground topology without allowing a
+        // canopy point to retain a new disconnected component. Exact-column
+        // ownership and a finite vertical reach keep the join deterministic
+        // and prevent lateral or vertically unrelated acquisitions linking.
+        for (const auto& [vegetationCell, vegetation] : vegetation_) {
+            const auto retainedIt = retainedByCell.find({
+                vegetationCell.x,
+                vegetationCell.y,
+            });
+            if (retainedIt == retainedByCell.end() ||
+                vegetation.count == 0U) {
+                continue;
+            }
+            auto& ground = cache.groundCells[retainedIt->second];
+            const float vegetationMinimumHeight =
+                static_cast<float>(vegetationCell.z) * resolution_;
+            const float vegetationMaximumHeight =
+                vegetationMinimumHeight + resolution_;
+            if (vegetationMaximumHeight <
+                ground.height - kTerrainContactToleranceMeters) {
+                continue;
+            }
+            const float verticalDistance = std::max(
+                0.0F,
+                vegetationMinimumHeight - ground.height);
+            if (verticalDistance <=
+                kWaterGroundVegetationAssociationMaximumHeightMeters) {
+                ground.flags |= kWaterGroundVegetationSupportedFlag;
+            }
+        }
+
         for (auto& cell : cache.groundCells) {
             for (std::size_t neighbourIndex = 0U;
                  neighbourIndex < kGroundNeighbours.size();
@@ -3207,6 +3249,112 @@ RainImpactGrid BuildRainImpactGrid(
     grid.rockImpact = rockImpact;
     grid.vegetationImpact = vegetationImpact;
 
+    const auto rockPriorityKey = [&](const RainImpactEvent& event,
+                                     std::uint32_t eventIndex,
+                                     std::int32_t cellX,
+                                     std::int32_t cellY) {
+        const float cellMinimumX =
+            grid.origin.x + static_cast<float>(cellX) * grid.cellSizeMeters;
+        const float cellMinimumY =
+            grid.origin.y + static_cast<float>(cellY) * grid.cellSizeMeters;
+        const float cellMaximumX = cellMinimumX + grid.cellSizeMeters;
+        const float cellMaximumY = cellMinimumY + grid.cellSizeMeters;
+        const float distanceX = std::max(
+            {cellMinimumX - event.position.x,
+             0.0F,
+             event.position.x - cellMaximumX});
+        const float distanceY = std::max(
+            {cellMinimumY - event.position.y,
+             0.0F,
+             event.position.y - cellMaximumY});
+        // Compare physical distance, not distance relative to each event's
+        // radius. Otherwise a farther large drop can displace a nearer small
+        // drop even though both overlap this cell. Generated ROCK impacts are
+        // capped at 160 mm; 250 mm also covers the corner of their square
+        // broad phase while preserving sub-millimetre priority resolution.
+        constexpr float kRockReservoirDistanceRangeMeters = 0.25F;
+        const float normalizedDistance = std::clamp(
+            std::hypot(distanceX, distanceY) /
+                kRockReservoirDistanceRangeMeters,
+            0.0F,
+            1.0F);
+        const float age = timeSeconds - event.birthTimeSeconds;
+        // Age is likewise compared in seconds. Normalizing by each event's
+        // lifetime could rank an older long-lived event ahead of a younger
+        // short-lived one.
+        constexpr float kRockReservoirAgeRangeSeconds = 6.0F;
+        const float agePriority = std::clamp(
+            age / kRockReservoirAgeRangeSeconds,
+            0.0F,
+            1.0F);
+        const float inverseEnergy =
+            1.0F - std::clamp(event.energy / 2.5F, 0.0F, 1.0F);
+
+        // Preserve the requested ordering within one 16-bit priority:
+        // distance to the cell AABB, then age, then inverse energy. The event
+        // index in the low 16 bits is the final deterministic tie-breaker.
+        const auto distanceKey = static_cast<std::uint32_t>(
+            std::floor(normalizedDistance * 1'023.0F + 0.5F));
+        const auto ageKey = static_cast<std::uint32_t>(
+            std::floor(agePriority * 7.0F + 0.5F));
+        const auto energyKey = static_cast<std::uint32_t>(
+            std::floor(inverseEnergy * 7.0F + 0.5F));
+        const auto priority = std::min(
+            (distanceKey << 6U) | (ageKey << 3U) | energyKey,
+            65'534U);
+        return (priority << 16U) | (eventIndex & 0xFFFFU);
+    };
+    const auto insertFreeSlot = [&](auto& references,
+                                    std::uint32_t* count,
+                                    std::uint32_t* occupiedMask,
+                                    std::uint32_t eventIndex) {
+        if (*count >= references.size()) {
+            ++grid.overflowCount;
+            return false;
+        }
+        const auto lane = *count;
+        references[lane] = eventIndex;
+        *occupiedMask |= 1U << lane;
+        ++(*count);
+        return true;
+    };
+    const auto insertRock = [&](RainImpactGridCell* cell,
+                                std::uint32_t eventIndex,
+                                std::int32_t cellX,
+                                std::int32_t cellY) {
+        std::uint32_t carriedIndex = eventIndex;
+        auto carriedKey = rockPriorityKey(
+            grid.events[carriedIndex],
+            carriedIndex,
+            cellX,
+            cellY);
+        for (std::uint32_t lane = 0U; lane < cell->rockCount; ++lane) {
+            const auto retainedIndex = cell->rock[lane];
+            const auto retainedKey = rockPriorityKey(
+                grid.events[retainedIndex],
+                retainedIndex,
+                cellX,
+                cellY);
+            if (carriedKey >= retainedKey) {
+                continue;
+            }
+            std::swap(carriedIndex, cell->rock[lane]);
+            carriedKey = retainedKey;
+        }
+
+        if (cell->rockCount < cell->rock.size()) {
+            cell->rock[cell->rockCount] = carriedIndex;
+            ++cell->rockCount;
+            cell->rockMask =
+                (1U << static_cast<std::uint32_t>(cell->rockCount)) - 1U;
+            return;
+        }
+
+        // A full reservoir always discards exactly one event: either this
+        // candidate or the lowest-priority event displaced by it.
+        ++grid.overflowCount;
+    };
+
     for (std::uint32_t eventIndex = 0; eventIndex < grid.events.size(); ++eventIndex) {
         const auto& event = grid.events[eventIndex];
         if (!EventActive(event, timeSeconds)) {
@@ -3226,30 +3374,32 @@ RainImpactGrid BuildRainImpactGrid(
                 bool inserted = false;
                 switch (event.role) {
                     case WaterSurfaceRole::Sand:
-                        if (cell.sandCount < cell.sand.size()) {
-                            cell.sand[cell.sandCount++] = eventIndex;
-                            inserted = true;
-                        }
+                        inserted = insertFreeSlot(
+                            cell.sand,
+                            &cell.sandCount,
+                            &cell.sandMask,
+                            eventIndex);
                         break;
                     case WaterSurfaceRole::Rock:
-                        if (cell.rockCount < cell.rock.size()) {
-                            cell.rock[cell.rockCount++] = eventIndex;
-                            inserted = true;
-                        }
+                        insertRock(
+                            &cell,
+                            eventIndex,
+                            x,
+                            y);
+                        inserted = true;
                         break;
                     case WaterSurfaceRole::Vegetation:
-                        if (cell.vegetationCount < cell.vegetation.size()) {
-                            cell.vegetation[cell.vegetationCount++] = eventIndex;
-                            inserted = true;
-                        }
+                        inserted = insertFreeSlot(
+                            cell.vegetation,
+                            &cell.vegetationCount,
+                            &cell.vegetationMask,
+                            eventIndex);
                         break;
                     case WaterSurfaceRole::Ground:
                     case WaterSurfaceRole::None:
                         break;
                 }
-                if (!inserted) {
-                    ++grid.overflowCount;
-                }
+                (void)inserted;
             }
         }
     }
@@ -3352,13 +3502,79 @@ float EvaluateRockRainImpactValue(
         std::max(0.0F, growth - edgeWidth),
         growth + edgeWidth,
         normalizedDistance);
+    // Match the shared GLSL evaluator: a smooth radial rolloff reads as a wet
+    // gradient rather than a uniformly coloured stamped region.
+    const float radialFade =
+        1.0F - SmoothStep(0.0F, 1.0F, normalizedDistance);
+    const float centreFalloffAmount =
+        std::sqrt(std::clamp(settings.centreFalloff, 0.0F, 1.0F));
     const float centreWeight = std::lerp(
         1.0F,
-        std::sqrt(std::clamp(1.0F - normalizedDistance, 0.0F, 1.0F)),
-        std::clamp(settings.centreFalloff, 0.0F, 1.0F));
+        radialFade,
+        centreFalloffAmount);
     return footprint *
            (1.0F - SmoothStep(fadeStart, 1.0F, life)) *
            heightGain * centreWeight;
+}
+
+float EvaluateSandRainImpactValue(
+    const RainImpactEvent& event,
+    const io::Float3& point,
+    float timeSeconds,
+    float sandWaterMask) {
+    const float age = timeSeconds - event.birthTimeSeconds;
+    if (event.role != WaterSurfaceRole::Sand || age < 0.0F ||
+        age > event.lifetimeSeconds) {
+        return 0.0F;
+    }
+
+    const float safeLifetime = std::max(0.001F, event.lifetimeSeconds);
+    const float life = std::clamp(age / safeLifetime, 0.0F, 1.0F);
+    const float planarDistance =
+        std::hypot(point.x - event.position.x, point.y - event.position.y);
+
+    const float wetRadius = std::max(0.001F, event.radiusMeters);
+    const float wetNormalizedDistance = planarDistance / wetRadius;
+    const float ringRadius = wetRadius * (0.12F + 0.88F * life);
+    const float ringThickness = std::max(0.003F, wetRadius * 0.14F);
+    const float ringDistance = std::abs(planarDistance - ringRadius);
+    const float wetRadialFade =
+        1.0F - SmoothStep(0.0F, 1.0F, wetNormalizedDistance);
+    const float wetValue =
+        std::exp(
+            -(ringDistance * ringDistance) /
+            (ringThickness * ringThickness)) *
+        (1.0F - SmoothStep(0.72F, 1.0F, life)) *
+        std::sqrt(std::max(0.0F, wetRadialFade));
+
+    const float dryRadius =
+        std::clamp(event.radiusMeters * 0.22F, 0.005F, 0.025F);
+    const float dryNormalizedDistance = planarDistance / dryRadius;
+    const float dryGrowthSeconds = std::min(0.14F, safeLifetime * 0.28F);
+    const float dryGrowth = SmoothStep(0.0F, dryGrowthSeconds, age);
+    const float dryEdgeWidth = 0.10F + (1.0F - dryGrowth) * 0.18F;
+    const float dryFootprint = 1.0F - SmoothStep(
+        std::max(0.0F, dryGrowth - dryEdgeWidth),
+        dryGrowth + dryEdgeWidth,
+        dryNormalizedDistance);
+    const float dryRadialFade =
+        1.0F - SmoothStep(0.0F, 1.0F, dryNormalizedDistance);
+    const float lowerPointWeight = SmoothStep(
+        -0.35F,
+        0.35F,
+        (event.position.z - point.z) / dryRadius);
+    const float dryHeightGain =
+        std::lerp(0.78F, 1.16F, lowerPointWeight);
+    const float dryValue =
+        dryFootprint *
+        dryRadialFade *
+        dryHeightGain *
+        (1.0F - SmoothStep(0.55F, 1.0F, life));
+
+    return std::lerp(
+        dryValue,
+        wetValue,
+        std::clamp(sandWaterMask, 0.0F, 1.0F));
 }
 
 RainImpactEffect EvaluateRainImpact(
@@ -3366,7 +3582,8 @@ RainImpactEffect EvaluateRainImpact(
     WaterSurfaceRole pointRole,
     const io::Float3& point,
     const io::Float3& normal,
-    float timeSeconds) {
+    float timeSeconds,
+    float sandWaterMask) {
     RainImpactEffect effect;
     if (pointRole == WaterSurfaceRole::None || grid.cells.empty()) {
         return effect;
@@ -3378,20 +3595,20 @@ RainImpactEffect EvaluateRainImpact(
         return effect;
     }
     const auto& cell = grid.cells[static_cast<std::size_t>(cellY) * grid.dimension + static_cast<std::size_t>(cellX)];
+    float rockPeak = 0.0F;
+    float rockRemaining = 1.0F;
     const auto evaluateEvent = [&](const RainImpactEvent& event) {
         if (!EventActive(event, timeSeconds) || event.role != pointRole) {
             return;
         }
         const float age = timeSeconds - event.birthTimeSeconds;
-        const float life = std::clamp(age / std::max(0.001F, event.lifetimeSeconds), 0.0F, 1.0F);
         float value = 0.0F;
         if (pointRole == WaterSurfaceRole::Sand) {
-            const float distance = std::hypot(point.x - event.position.x, point.y - event.position.y);
-            const float ringRadius = event.radiusMeters * (0.12F + 0.88F * life);
-            const float thickness = std::max(0.003F, event.radiusMeters * 0.14F);
-            const float ringDistance = std::abs(distance - ringRadius);
-            value = std::exp(-(ringDistance * ringDistance) / (thickness * thickness)) *
-                    SmoothStep(1.0F, 0.72F, life);
+            value = EvaluateSandRainImpactValue(
+                event,
+                point,
+                timeSeconds,
+                sandWaterMask);
         } else if (pointRole == WaterSurfaceRole::Rock) {
             value = EvaluateRockRainImpactValue(
                 event,
@@ -3408,6 +3625,14 @@ RainImpactEffect EvaluateRainImpact(
                 grid.vegetationImpact);
         }
         value *= event.energy;
+        if (pointRole == WaterSurfaceRole::Rock) {
+            // Peak-preserving soft union: one impact remains bit-for-bit
+            // equivalent to its narrow-phase value, while every additional
+            // retained impact can only strengthen the wet response.
+            rockPeak = std::max(rockPeak, value);
+            rockRemaining *= 1.0F - std::clamp(value, 0.0F, 1.0F);
+            return;
+        }
         const bool vegetation = pointRole == WaterSurfaceRole::Vegetation;
         effect.opacity = std::max(effect.opacity, value * (vegetation ? 0.14F : 0.18F));
         effect.emission = std::max(effect.emission, value * (pointRole == WaterSurfaceRole::Vegetation ? 0.48F : 0.11F));
@@ -3418,17 +3643,30 @@ RainImpactEffect EvaluateRainImpact(
     };
 
     if (pointRole == WaterSurfaceRole::Sand) {
-        for (std::uint32_t index = 0; index < cell.sandCount; ++index) {
-            evaluateEvent(grid.events[cell.sand[index]]);
+        for (std::uint32_t index = 0; index < cell.sand.size(); ++index) {
+            if ((cell.sandMask & (1U << index)) != 0U) {
+                evaluateEvent(grid.events[cell.sand[index]]);
+            }
         }
     } else if (pointRole == WaterSurfaceRole::Rock) {
-        for (std::uint32_t index = 0; index < cell.rockCount; ++index) {
-            evaluateEvent(grid.events[cell.rock[index]]);
+        for (std::uint32_t index = 0; index < cell.rock.size(); ++index) {
+            if ((cell.rockMask & (1U << index)) != 0U) {
+                evaluateEvent(grid.events[cell.rock[index]]);
+            }
         }
     } else if (pointRole == WaterSurfaceRole::Vegetation) {
-        for (std::uint32_t index = 0; index < cell.vegetationCount; ++index) {
-            evaluateEvent(grid.events[cell.vegetation[index]]);
+        for (std::uint32_t index = 0; index < cell.vegetation.size(); ++index) {
+            if ((cell.vegetationMask & (1U << index)) != 0U) {
+                evaluateEvent(grid.events[cell.vegetation[index]]);
+            }
         }
+    }
+    if (pointRole == WaterSurfaceRole::Rock) {
+        const float value = std::max(rockPeak, 1.0F - rockRemaining);
+        effect.opacity = value * 0.18F;
+        effect.emission = value * 0.11F;
+        effect.sizeScale = 1.0F + value * 0.16F;
+        effect.colourBlend = value * 0.42F;
     }
     return effect;
 }

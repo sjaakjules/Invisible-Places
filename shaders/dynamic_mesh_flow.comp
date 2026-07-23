@@ -37,6 +37,11 @@ const uint kCrossSeedFieldSlot = 30u;
 const int kEmptyCoordinate = -2147483648;
 const uint kTerminalContactFlag = 1u << 0u;
 const uint kVegetationSupportedFlag = 1u << 2u;
+const uint kRainSeedCapacity = 1024u;
+const uint kParticleInactive = 0u;
+const uint kParticleFlowing = 1u;
+const uint kParticleFading = 2u;
+const uint kParticleWaiting = 3u;
 
 struct WaterGroundSlot {
     int cellX;
@@ -56,9 +61,15 @@ struct MeshFlowParticle {
     uvec4 metadata;
 };
 
-struct MeshFlowEmitter {
-    vec4 positionRadius;
-    vec4 strengthSpeedIdSeed;
+struct MeshFlowGroundEntry {
+    ivec2 coordinate;
+    float edgeDistanceMeters;
+    float edgeDistanceFraction;
+};
+
+struct MeshFlowRainSeed {
+    vec4 positionBirth;
+    uvec4 metadata; // packed normal, event seed, Rain reset epoch, valid
 };
 
 struct MeshFlowContactEvent {
@@ -72,11 +83,11 @@ struct MeshFlowContactEvent {
 layout(set = 0, binding = 0, std140) uniform DynamicMeshFlowUniforms {
     uvec4 capacities;              // particles, history, output points, events
     uvec4 ground;                  // mask, max probes, occupied, seed
-    uvec4 control;                 // reset epoch, automatic, show trails, emitters
+    uvec4 control;                 // reset epoch, show trails, entry count, Rain reset epoch
     uvec4 contactGrid;             // mask, capacity, unused, unused
     vec4 timing;                   // time, dt, activity, moisture
     vec4 boundsMinimumResolution;  // xyz minimum, cell resolution
-    vec4 boundsMaximumBand;        // xyz maximum, automatic source-band width
+    vec4 boundsMaximumBand;        // xyz maximum, reserved
     vec4 motion0;                  // speed, downhill weight, inertia, surface offset
     vec4 particleNoise;            // strength, scale, speed, dry convergence focus
     vec4 sharedWind;               // strength, scale, speed, rain spread
@@ -86,7 +97,7 @@ layout(set = 0, binding = 0, std140) uniform DynamicMeshFlowUniforms {
     vec4 rockColour;               // rgb colourise, amount
     vec4 vegetationResponse;       // radius, opacity, emission, persistence
     vec4 vegetationColour;         // rgb colourise, amount
-    vec4 vegetationExtra;          // twinkle, stream depth, unused, unused
+    vec4 vegetationExtra;          // twinkle, stream depth, reserved, rain source fraction
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer GroundTable {
@@ -97,9 +108,9 @@ layout(set = 0, binding = 2, std430) buffer ParticleStates {
     MeshFlowParticle particles[];
 } particleStates;
 
-layout(set = 0, binding = 3, std430) readonly buffer AuthoredEmitters {
-    MeshFlowEmitter emitters[];
-} authoredEmitters;
+layout(set = 0, binding = 3, std430) readonly buffer GroundEntries {
+    MeshFlowGroundEntry entries[];
+} groundEntries;
 
 layout(set = 0, binding = 4, std430) buffer ContactEvents {
     MeshFlowContactEvent events[];
@@ -113,7 +124,23 @@ layout(set = 0, binding = 6, std430) buffer DispatchCounters {
     uint activeParticleCount;
     uint contactEventCount;
     uint terminalContactCount;
-    uint reserved;
+    uint rainSeedParticleCount;
+    uint availableRainSeedCount;
+    uint routeSampleCount;
+    uint routeWithinBoundsCount;
+    uint routeNearSurfaceCount;
+    uint longSegmentCount;
+    uint verticalJumpCount;
+    uint maximumSegmentBits;
+    uint alignmentBin0;
+    uint alignmentBin1;
+    uint alignmentBin2;
+    uint alignmentBin3;
+    uint alignmentBin4;
+    uint alignmentBin5;
+    uint alignmentBin6;
+    uint alignmentBin7;
+    uint reserved0;
 } counters;
 
 layout(set = 0, binding = 7, std430) buffer OutputPositions {
@@ -128,6 +155,11 @@ layout(set = 0, binding = 9, std430) buffer OutputScalarFields {
     float values[];
 } outputScalars;
 
+layout(set = 0, binding = 10, std430) readonly buffer RainVegetationSeeds {
+    uvec4 header; // monotonically increasing write count, reserved...
+    MeshFlowRainSeed seeds[];
+} rainVegetationSeeds;
+
 struct GroundQuery {
     vec3 position;
     vec3 normal;
@@ -136,7 +168,18 @@ struct GroundQuery {
     float confidence;
     uint flags;
     uint component;
+    uint connectivity;
+    ivec2 coordinate;
+    uint slotIndex;
     uint valid;
+};
+
+struct MeshFlowVisualWeights {
+    float spawnAcceptance;
+    float noiseScale;
+    float trailProminence;
+    float trailWidthScale;
+    float trailStreakScale;
 };
 
 uint HashBits(uint value) {
@@ -181,23 +224,61 @@ vec3 DecodeDirection(uint packed) {
         vec3(0.0, 0.0, 1.0));
 }
 
-bool FindGroundSlot(ivec2 coordinate, out WaterGroundSlot result) {
+bool FindGroundSlotIndexed(
+    ivec2 coordinate,
+    out WaterGroundSlot result,
+    out uint slotIndex) {
     const uint mask = uniforms.ground.x;
     const uint initial = HashCell(coordinate) & mask;
     const uint probeLimit = min(64u, max(1u, uniforms.ground.y));
     for (uint probe = 0u; probe < probeLimit; ++probe) {
+        const uint candidateIndex = (initial + probe) & mask;
         const WaterGroundSlot candidate =
-            groundTable.slots[(initial + probe) & mask];
+            groundTable.slots[candidateIndex];
         if (candidate.cellX == kEmptyCoordinate) {
             return false;
         }
         if (candidate.cellX == coordinate.x &&
             candidate.cellY == coordinate.y) {
             result = candidate;
+            slotIndex = candidateIndex;
             return true;
         }
     }
     return false;
+}
+
+bool FindGroundSlot(ivec2 coordinate, out WaterGroundSlot result) {
+    uint ignoredSlotIndex = 0u;
+    return FindGroundSlotIndexed(
+        coordinate,
+        result,
+        ignoredSlotIndex);
+}
+
+GroundQuery GroundFromSlot(
+    ivec2 coordinate,
+    WaterGroundSlot slot,
+    uint slotIndex) {
+    GroundQuery result;
+    const float resolution =
+        max(0.001, uniforms.boundsMinimumResolution.w);
+    result.position = vec3(
+        (vec2(coordinate) + vec2(0.5)) * resolution,
+        slot.height + max(0.0, uniforms.motion0.w));
+    result.normal = DecodeDirection(slot.packedNormal);
+    result.downhill = DecodeDirection(slot.packedDownhill);
+    const vec2 convergenceConfidence =
+        unpackUnorm2x16(slot.packedConvergenceConfidence);
+    result.convergence = convergenceConfidence.x;
+    result.confidence = convergenceConfidence.y;
+    result.flags = slot.flagsAndSampleCount & 0xffu;
+    result.component = slot.componentAndConnectivity >> 8u;
+    result.connectivity = slot.componentAndConnectivity & 0xffu;
+    result.coordinate = coordinate;
+    result.slotIndex = slotIndex;
+    result.valid = 1u;
+    return result;
 }
 
 GroundQuery QueryGround(vec2 xy, int requestedRadius) {
@@ -209,6 +290,9 @@ GroundQuery QueryGround(vec2 xy, int requestedRadius) {
     result.confidence = 0.0;
     result.flags = 0u;
     result.component = 0u;
+    result.connectivity = 0u;
+    result.coordinate = ivec2(0);
+    result.slotIndex = 0u;
     result.valid = 0u;
 
     const float resolution =
@@ -217,12 +301,17 @@ GroundQuery QueryGround(vec2 xy, int requestedRadius) {
     const int radius = clamp(requestedRadius, 0, 12);
     float bestDistanceSquared = 3.402823466e38;
     WaterGroundSlot bestSlot;
+    uint bestSlotIndex = 0u;
     ivec2 bestCoordinate = centre;
     for (int dy = -radius; dy <= radius; ++dy) {
         for (int dx = -radius; dx <= radius; ++dx) {
             const ivec2 coordinate = centre + ivec2(dx, dy);
             WaterGroundSlot candidate;
-            if (!FindGroundSlot(coordinate, candidate)) {
+            uint candidateSlotIndex = 0u;
+            if (!FindGroundSlotIndexed(
+                    coordinate,
+                    candidate,
+                    candidateSlotIndex)) {
                 continue;
             }
             const vec2 centrePosition =
@@ -232,6 +321,7 @@ GroundQuery QueryGround(vec2 xy, int requestedRadius) {
             if (distanceSquared < bestDistanceSquared) {
                 bestDistanceSquared = distanceSquared;
                 bestSlot = candidate;
+                bestSlotIndex = candidateSlotIndex;
                 bestCoordinate = coordinate;
                 result.valid = 1u;
             }
@@ -241,18 +331,261 @@ GroundQuery QueryGround(vec2 xy, int requestedRadius) {
         return result;
     }
 
-    result.position = vec3(
-        (vec2(bestCoordinate) + vec2(0.5)) * resolution,
-        bestSlot.height + max(0.0, uniforms.motion0.w));
-    result.normal = DecodeDirection(bestSlot.packedNormal);
-    result.downhill = DecodeDirection(bestSlot.packedDownhill);
-    const vec2 convergenceConfidence =
-        unpackUnorm2x16(bestSlot.packedConvergenceConfidence);
-    result.convergence = convergenceConfidence.x;
-    result.confidence = convergenceConfidence.y;
-    result.flags = bestSlot.flagsAndSampleCount & 0xffu;
-    result.component = bestSlot.componentAndConnectivity >> 8u;
+    return GroundFromSlot(
+        bestCoordinate,
+        bestSlot,
+        bestSlotIndex);
+}
+
+MeshFlowVisualWeights EvaluateVisualWeights(
+    float convergence,
+    float moisture,
+    float surfaceConfidence) {
+    const float wet = clamp(moisture, 0.0, 1.0);
+    const float confidence = clamp(surfaceConfidence, 0.0, 1.0);
+    const float rill =
+        smoothstep(0.18, 0.82, clamp(convergence, 0.0, 1.0));
+    const float authoredFocus =
+        clamp(uniforms.particleNoise.w, 0.0, 1.0);
+    const float focused =
+        1.0 - (1.0 - authoredFocus) * (1.0 - authoredFocus);
+    const float dryFocus = focused * (1.0 - wet);
+    const float concavityAcceptance = 0.02 + 0.98 * rill;
+    const float rillCoherence = rill * mix(0.68, 0.92, wet);
+    // Activity and the dry appearance uniforms already provide sparsity.
+    // Preserve sub-pixel coverage on the flat +X entry band, while making
+    // dry convergent cells substantially more persistent than open Ground.
+    const float openProminence = 0.12;
+    const float rillProminence = mix(0.90, 0.70, wet);
+
+    MeshFlowVisualWeights result;
+    result.spawnAcceptance =
+        mix(1.0, concavityAcceptance, dryFocus);
+    result.noiseScale =
+        mix(1.0, 0.25, rillCoherence);
+    result.trailProminence =
+        mix(openProminence, rillProminence, rill) *
+        (0.68 + 0.32 * confidence);
+    result.trailWidthScale =
+        mix(0.72, 1.15, rill) * mix(0.90, 1.04, wet);
+    result.trailStreakScale =
+        mix(0.78, 1.05, rill) * mix(0.94, 1.03, wet);
     return result;
+}
+
+void RecordRouteAlignment(float alignment) {
+    const uint bin = min(
+        7u,
+        uint(floor(clamp(alignment, 0.0, 1.0) * 8.0)));
+    switch (bin) {
+        case 0u:
+            atomicAdd(counters.alignmentBin0, 1u);
+            break;
+        case 1u:
+            atomicAdd(counters.alignmentBin1, 1u);
+            break;
+        case 2u:
+            atomicAdd(counters.alignmentBin2, 1u);
+            break;
+        case 3u:
+            atomicAdd(counters.alignmentBin3, 1u);
+            break;
+        case 4u:
+            atomicAdd(counters.alignmentBin4, 1u);
+            break;
+        case 5u:
+            atomicAdd(counters.alignmentBin5, 1u);
+            break;
+        case 6u:
+            atomicAdd(counters.alignmentBin6, 1u);
+            break;
+        default:
+            atomicAdd(counters.alignmentBin7, 1u);
+            break;
+    }
+}
+
+GroundQuery QueryVegetationGroundBelow(
+    vec3 seedPosition,
+    int requestedRadius) {
+    GroundQuery best = QueryGround(seedPosition.xy, 0);
+    best.valid = 0u;
+    const float resolution =
+        max(0.001, uniforms.boundsMinimumResolution.w);
+    const ivec2 centre =
+        ivec2(floor(seedPosition.xy / resolution));
+    const int radius = clamp(requestedRadius, 0, 12);
+    float bestScore = 3.402823466e38;
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            const ivec2 coordinate = centre + ivec2(dx, dy);
+            WaterGroundSlot slot;
+            uint slotIndex = 0u;
+            if (!FindGroundSlotIndexed(
+                    coordinate,
+                    slot,
+                    slotIndex)) {
+                continue;
+            }
+            const GroundQuery candidate =
+                GroundFromSlot(coordinate, slot, slotIndex);
+            if ((candidate.flags & kVegetationSupportedFlag) == 0u ||
+                candidate.position.z > seedPosition.z + 0.02) {
+                continue;
+            }
+            const vec2 delta = candidate.position.xy - seedPosition.xy;
+            const float planarDistanceSquared = dot(delta, delta);
+            // Prefer the closest vegetation-supported column, then the
+            // highest Ground surfel beneath the leaf collision.
+            const float heightPenalty =
+                max(0.0, seedPosition.z - candidate.position.z) *
+                resolution * 0.01;
+            const float score = planarDistanceSquared + heightPenalty;
+            if (score < bestScore) {
+                bestScore = score;
+                best = candidate;
+            }
+        }
+    }
+    return best;
+}
+
+bool SelectConnectedGroundStep(
+    GroundQuery current,
+    vec3 previousVelocity,
+    uint particleIndex,
+    float particleSeed,
+    out GroundQuery selected,
+    out bool terminalContact) {
+    const ivec2 offsets[8] = ivec2[8](
+        ivec2(0, 1),
+        ivec2(1, 1),
+        ivec2(1, 0),
+        ivec2(1, -1),
+        ivec2(0, -1),
+        ivec2(-1, -1),
+        ivec2(-1, 0),
+        ivec2(-1, 1));
+    selected = current;
+    terminalContact = false;
+    bool found = false;
+    float bestScore = -3.402823466e38;
+    const vec2 downhill = SafeNormalize(
+        vec3(current.downhill.xy, 0.0),
+        vec3(1.0, 0.0, 0.0)).xy;
+    const vec2 prior = SafeNormalize(
+        vec3(previousVelocity.xy, 0.0),
+        vec3(downhill, 0.0)).xy;
+    const vec2 crossSlope = vec2(-downhill.y, downhill.x);
+    const float particlePhase =
+        dot(
+            current.position.xy /
+                max(0.001, uniforms.particleNoise.y),
+            vec2(0.754877666, 0.569840296)) +
+        uniforms.timing.x * uniforms.particleNoise.z +
+        particleSeed * 6.28318530718;
+    const float sharedPhase =
+        dot(
+            current.position.xy /
+                max(0.001, uniforms.sharedWind.y),
+            vec2(0.371, 0.819)) +
+        uniforms.timing.x * uniforms.sharedWind.z;
+    const MeshFlowVisualWeights currentWeights =
+        EvaluateVisualWeights(
+            current.convergence,
+            uniforms.timing.w,
+            current.confidence);
+    const float signedCrossNoise = clamp(
+        (sin(particlePhase) * uniforms.particleNoise.x +
+         sin(sharedPhase) * uniforms.sharedWind.x) *
+            currentWeights.noiseScale,
+        -1.0,
+        1.0);
+
+    for (uint neighbourIndex = 0u;
+         neighbourIndex < 8u;
+         ++neighbourIndex) {
+        if ((current.connectivity & (1u << neighbourIndex)) == 0u) {
+            continue;
+        }
+        const ivec2 coordinate =
+            current.coordinate + offsets[neighbourIndex];
+        WaterGroundSlot slot;
+        uint slotIndex = 0u;
+        if (!FindGroundSlotIndexed(
+                coordinate,
+                slot,
+                slotIndex)) {
+            continue;
+        }
+        const GroundQuery candidate =
+            GroundFromSlot(coordinate, slot, slotIndex);
+        if (candidate.component != current.component) {
+            continue;
+        }
+        const vec3 delta = candidate.position - current.position;
+        if (delta.z > 0.010) {
+            continue;
+        }
+        const vec2 direction = SafeNormalize(
+            vec3(delta.xy, 0.0),
+            vec3(downhill, 0.0)).xy;
+        const float downhillAlignment = dot(direction, downhill);
+        // Noise and wind only choose between cross-slope downhill options;
+        // neither can turn a particle back uphill.
+        if (downhillAlignment < -0.001) {
+            continue;
+        }
+        const float inertiaAlignment =
+            max(0.0, dot(direction, prior));
+        const float tunedDownhillAlignment = pow(
+            clamp(downhillAlignment, 0.0, 1.0),
+            clamp(
+                1.75 / max(0.05, uniforms.motion0.y),
+                0.35,
+                3.0));
+        const float tunedInertiaAlignment = mix(
+            0.5,
+            inertiaAlignment,
+            clamp(uniforms.motion0.z, 0.0, 0.98));
+        const float crossAlignment =
+            dot(direction, crossSlope);
+        const float noisePreference =
+            0.5 + 0.5 * crossAlignment * signedCrossNoise;
+        const float score =
+            0.55 * tunedDownhillAlignment +
+            0.25 * tunedInertiaAlignment +
+            0.15 * clamp(candidate.convergence, 0.0, 1.0) +
+            0.05 * clamp(noisePreference, 0.0, 1.0) +
+            Hash01(
+                uniforms.ground.w,
+                particleIndex,
+                neighbourIndex + 101u) *
+                1.0e-5;
+
+        const float normalZ =
+            abs(current.normal.z) > 0.15
+                ? current.normal.z
+                : (current.normal.z < 0.0 ? -0.15 : 0.15);
+        const float predictedDeltaZ =
+            -(current.normal.x * delta.x +
+              current.normal.y * delta.y) /
+            normalZ;
+        const float actualDrop = max(0.0, -delta.z);
+        const float maximumExpectedDrop =
+            max(0.030, max(0.0, -predictedDeltaZ) + 0.020);
+        const bool candidateContact =
+            ((current.flags | candidate.flags) &
+             kTerminalContactFlag) != 0u ||
+            actualDrop > maximumExpectedDrop;
+        if (!found || score > bestScore) {
+            found = true;
+            bestScore = score;
+            selected = candidate;
+            terminalContact = candidateContact;
+        }
+    }
+    return found;
 }
 
 void StoreField(uint slot, uint pointIndex, float value) {
@@ -260,6 +593,14 @@ void StoreField(uint slot, uint pointIndex, float value) {
         outputScalars.values[
             slot * uniforms.capacities.z + pointIndex] = value;
     }
+}
+
+float LoadField(uint slot, uint pointIndex, float fallback) {
+    if (slot < 31u && pointIndex < uniforms.capacities.z) {
+        return outputScalars.values[
+            slot * uniforms.capacities.z + pointIndex];
+    }
+    return fallback;
 }
 
 void StoreTrailPoint(
@@ -277,6 +618,8 @@ void StoreTrailPoint(
     float pointAge,
     float speed,
     float confidence,
+    float widthScale,
+    float streakScale,
     vec3 tangent,
     float seed) {
     if (pointIndex >= uniforms.capacities.z) {
@@ -302,8 +645,14 @@ void StoreTrailPoint(
     StoreField(kPointAgeFieldSlot, pointIndex, pointAge);
     StoreField(kTrailAgeFieldSlot, pointIndex, pointAge);
     StoreField(kTrailSpeedFieldSlot, pointIndex, max(0.01, speed));
-    StoreField(kTrailWidthFieldSlot, pointIndex, max(0.0005, uniforms.visual.x));
-    StoreField(kTrailStreakLengthFieldSlot, pointIndex, max(0.001, uniforms.visual.y));
+    StoreField(
+        kTrailWidthFieldSlot,
+        pointIndex,
+        max(0.0005, uniforms.visual.x * max(0.10, widthScale)));
+    StoreField(
+        kTrailStreakLengthFieldSlot,
+        pointIndex,
+        max(0.001, uniforms.visual.y * max(0.10, streakScale)));
     StoreField(kTrailConfidenceFieldSlot, pointIndex, clamp(confidence, 0.0, 1.0));
     StoreField(kWetnessFieldSlot, pointIndex, clamp(uniforms.timing.w, 0.0, 1.0));
     StoreField(kFeatureTypeFieldSlot, pointIndex, uniforms.visual.z);
@@ -338,6 +687,8 @@ void HideParticleRange(uint particleIndex, vec3 fallbackPosition) {
             1.0,
             0.01,
             0.0,
+            1.0,
+            1.0,
             vec3(1.0, 0.0, 0.0),
             Hash01(uniforms.ground.w, particleIndex, 7u));
     }
@@ -345,85 +696,228 @@ void HideParticleRange(uint particleIndex, vec3 fallbackPosition) {
 
 GroundQuery SpawnParticle(
     uint particleIndex,
+    uint previousSourceKind,
+    uint previousSourceSlot,
     out vec3 initialVelocity,
     out uint sourceId,
-    out uint automaticSource) {
-    const uint emitterCount = uniforms.control.w;
-    const bool useAutomatic =
-        uniforms.control.y != 0u &&
-        (emitterCount == 0u || (particleIndex % 3u) != 0u);
-    vec2 sourcePosition;
-    int searchRadius;
-    if (useAutomatic) {
-        const vec2 minimum = uniforms.boundsMinimumResolution.xy;
-        const vec2 maximum = uniforms.boundsMaximumBand.xy;
-        const float moistureSpread =
-            0.35 + clamp(uniforms.timing.w * uniforms.sharedWind.w, 0.0, 1.65);
-        const float bandWidth =
-            min(maximum.x - minimum.x, max(
-                uniforms.boundsMinimumResolution.w,
-                uniforms.boundsMaximumBand.w * moistureSpread));
-        sourcePosition = vec2(
-            clamp(
-                maximum.x -
-                    Hash01(uniforms.ground.w, particleIndex, 11u) *
-                        bandWidth,
-                minimum.x,
-                maximum.x),
-            mix(
-                minimum.y,
-                maximum.y,
-                Hash01(uniforms.ground.w, particleIndex, 13u)));
-        initialVelocity = vec3(1.0, 0.0, 0.0);
-        sourceId = 0u;
-        automaticSource = 1u;
-        searchRadius = 12;
-    } else if (emitterCount > 0u) {
-        const uint emitterIndex = particleIndex % emitterCount;
-        const MeshFlowEmitter emitter =
-            authoredEmitters.emitters[emitterIndex];
-        const float angle =
-            Hash01(uniforms.ground.w, particleIndex, 17u) *
-            6.28318530718;
-        const float radius =
-            sqrt(Hash01(uniforms.ground.w, particleIndex, 19u)) *
-            max(0.0, emitter.positionRadius.w);
-        sourcePosition =
-            emitter.positionRadius.xy +
-            vec2(cos(angle), sin(angle)) * radius;
-        initialVelocity = vec3(1.0, 0.0, 0.0);
-        sourceId = uint(max(0.0, emitter.strengthSpeedIdSeed.z));
-        automaticSource = 0u;
-        searchRadius = 12;
-    } else {
-        GroundQuery miss;
-        miss.valid = 0u;
-        initialVelocity = vec3(1.0, 0.0, 0.0);
-        sourceId = 0u;
-        automaticSource = 0u;
-        return miss;
-    }
-    GroundQuery spawn = QueryGround(sourcePosition, searchRadius);
-    if (spawn.valid != 0u && automaticSource != 0u) {
-        // In dry states only a subset of the stable population emerges away
-        // from convergent hollows. Rain relaxes this gate, so the same fixed
-        // particle allocation progressively fills the whole +X source band
-        // without rebuilding topology or shuffling stream identities.
-        const float dryFocus =
-            clamp(
-                uniforms.particleNoise.w *
-                    (1.0 - clamp(uniforms.timing.w, 0.0, 1.0)),
-                0.0,
-                1.0);
-        const float concavityAcceptance =
-            0.10 + 0.90 * sqrt(clamp(spawn.convergence, 0.0, 1.0));
-        const float acceptance =
-            mix(1.0, concavityAcceptance, dryFocus);
-        if (Hash01(uniforms.ground.w, particleIndex, 23u) > acceptance) {
-            spawn.valid = 0u;
+    out uint sourceKind) {
+    initialVelocity = vec3(1.0, 0.0, 0.0);
+    sourceId = 0u;
+    sourceKind = 0u;
+
+    // Preserve rain-fed emergence across the moisture recession without
+    // rescanning the seed ring.  The hash-table slot is stable for the
+    // lifetime of the installed Ground revision; a cache replacement also
+    // advances the Mesh reset epoch and clears this remembered slot.
+    if (previousSourceKind == 1u &&
+        uniforms.timing.w > 0.001 &&
+        previousSourceSlot <
+            uint(groundTable.slots.length())) {
+        const WaterGroundSlot rememberedSlot =
+            groundTable.slots[previousSourceSlot];
+        if (rememberedSlot.cellX != kEmptyCoordinate) {
+            const ivec2 rememberedCoordinate =
+                ivec2(
+                    rememberedSlot.cellX,
+                    rememberedSlot.cellY);
+            const GroundQuery remembered =
+                GroundFromSlot(
+                    rememberedCoordinate,
+                    rememberedSlot,
+                    previousSourceSlot);
+            if ((remembered.flags &
+                    kVegetationSupportedFlag) != 0u) {
+                initialVelocity = remembered.downhill;
+                sourceId = previousSourceSlot;
+                sourceKind = 1u;
+                return remembered;
+            }
         }
     }
-    return spawn;
+
+    // Rain-fed emergence samples a bounded fixed ring written by the Rain
+    // compute pass. Each particle checks at most four deterministic entries;
+    // stale reset epochs and impacts outside the installed Ground disappear
+    // without a CPU readback or a per-frame seed upload.
+    const uint writeCount = rainVegetationSeeds.header.x;
+    const uint availableRainSeeds =
+        min(writeCount, kRainSeedCapacity);
+    const float rainSourceFraction =
+        clamp(uniforms.vegetationExtra.w, 0.0, 1.0) *
+        clamp(uniforms.timing.w, 0.0, 1.0);
+    const bool preferRainSource =
+        availableRainSeeds > 0u &&
+        Hash01(uniforms.ground.w, particleIndex, 37u) <
+            rainSourceFraction;
+    if (preferRainSource) {
+        const float rainSpawnSpread =
+            clamp(uniforms.sharedWind.w, 0.0, 1.0);
+        const uint rainAttemptCount =
+            1u + uint(round(rainSpawnSpread * 3.0));
+        for (uint attempt = 0u; attempt < 4u; ++attempt) {
+            if (attempt >= rainAttemptCount) {
+                break;
+            }
+            const float ageSample = Hash01(
+                uniforms.ground.w,
+                particleIndex,
+                attempt + 41u);
+            const float distributedAgeSample = mix(
+                ageSample * ageSample * ageSample,
+                ageSample,
+                rainSpawnSpread);
+            const uint ageIndex =
+                uint(floor(
+                    distributedAgeSample *
+                    float(availableRainSeeds)));
+            const uint logicalIndex =
+                writeCount - 1u -
+                min(ageIndex, availableRainSeeds - 1u);
+            const MeshFlowRainSeed rainSeed =
+                rainVegetationSeeds.seeds[
+                    logicalIndex % kRainSeedCapacity];
+            const float seedAge =
+                uniforms.timing.x - rainSeed.positionBirth.w;
+            if (rainSeed.metadata.w == 0u ||
+                rainSeed.metadata.z != uniforms.control.w ||
+                seedAge < 0.0 ||
+                seedAge > 120.0) {
+                continue;
+            }
+            const float spreadAngle =
+                Hash01(
+                    rainSeed.metadata.y,
+                    particleIndex,
+                    attempt + 151u) *
+                6.28318530718;
+            const float spreadRadius =
+                sqrt(
+                    Hash01(
+                        rainSeed.metadata.y,
+                        particleIndex,
+                        attempt + 157u)) *
+                rainSpawnSpread * 0.12;
+            vec3 distributedSeedPosition =
+                rainSeed.positionBirth.xyz;
+            distributedSeedPosition.xy +=
+                vec2(cos(spreadAngle), sin(spreadAngle)) *
+                spreadRadius;
+            const int groundSearchRadius =
+                2 + int(round(rainSpawnSpread * 10.0));
+            GroundQuery rainSpawn =
+                QueryVegetationGroundBelow(
+                    distributedSeedPosition,
+                    groundSearchRadius);
+            if (rainSpawn.valid == 0u) {
+                continue;
+            }
+            // The VEG crown remains the first visible response.  Do not
+            // emerge onto Ground until the existing leaf-to-leaf propagation
+            // could have descended from the collision to this surfel.
+            const float leafDescentMeters =
+                max(
+                    0.0,
+                    rainSeed.positionBirth.z -
+                        rainSpawn.position.z);
+            const float leafDescentSeconds =
+                leafDescentMeters / 0.65;
+            if (seedAge < leafDescentSeconds) {
+                continue;
+            }
+            initialVelocity = rainSpawn.downhill;
+            sourceId = rainSpawn.slotIndex;
+            sourceKind = 1u;
+            return rainSpawn;
+        }
+    }
+
+    const uint entryCount = min(
+        uniforms.control.z,
+        uint(groundEntries.entries.length()));
+    GroundQuery best = QueryGround(
+        uniforms.boundsMinimumResolution.xy,
+        0);
+    best.valid = 0u;
+    GroundQuery fallback = best;
+    float bestScore = -3.402823466e38;
+    float fallbackScore = -3.402823466e38;
+    const uint sampleCount = min(8u, entryCount);
+    for (uint sampleIndex = 0u;
+         sampleIndex < sampleCount;
+         ++sampleIndex) {
+        const float entrySample = Hash01(
+            uniforms.ground.w,
+            particleIndex,
+            sampleIndex + 71u);
+        const uint candidateIndex = min(
+            entryCount - 1u,
+            uint(
+                floor(
+                    entrySample * entrySample * entrySample *
+                    float(entryCount))));
+        const MeshFlowGroundEntry entry =
+            groundEntries.entries[candidateIndex];
+        WaterGroundSlot slot;
+        uint slotIndex = 0u;
+        if (!FindGroundSlotIndexed(
+                entry.coordinate,
+                slot,
+                slotIndex)) {
+            continue;
+        }
+        const GroundQuery candidate =
+            GroundFromSlot(
+                entry.coordinate,
+                slot,
+                slotIndex);
+        if ((candidate.flags & kVegetationSupportedFlag) == 0u) {
+            continue;
+        }
+        const MeshFlowVisualWeights candidateWeights =
+            EvaluateVisualWeights(
+                candidate.convergence,
+                uniforms.timing.w,
+                candidate.confidence);
+        const float spawnSelection = Hash01(
+            uniforms.ground.w ^ candidate.slotIndex,
+            particleIndex,
+            sampleIndex + 83u);
+        const float score =
+            candidate.convergence * 0.78 +
+            candidate.confidence * 0.12 +
+            Hash01(
+                uniforms.ground.w,
+                particleIndex,
+                sampleIndex + 61u) *
+                0.10;
+        // The dry focus is a source-location weighting, not a population
+        // throttle. Prefer candidates which pass the deterministic
+        // acceptance gate, but fall back to the strongest sampled rill so the
+        // activity² population budget remains stable and visible.
+        const float weightedFallbackScore =
+            score +
+            candidateWeights.spawnAcceptance * 0.35;
+        if (weightedFallbackScore > fallbackScore) {
+            fallbackScore = weightedFallbackScore;
+            fallback = candidate;
+        }
+        if (spawnSelection >
+            candidateWeights.spawnAcceptance) {
+            continue;
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            best = candidate;
+        }
+    }
+    if (best.valid == 0u) {
+        best = fallback;
+    }
+    if (best.valid != 0u) {
+        initialVelocity = best.downhill;
+        sourceId = best.slotIndex;
+    }
+    return best;
 }
 
 void main() {
@@ -434,6 +928,10 @@ void main() {
         uniforms.capacities.z == 0u ||
         uniforms.ground.z == 0u) {
         return;
+    }
+    if (particleIndex == 0u) {
+        counters.availableRainSeedCount =
+            min(rainVegetationSeeds.header.x, kRainSeedCapacity);
     }
 
     MeshFlowParticle particle = particleStates.particles[particleIndex];
@@ -459,38 +957,54 @@ void main() {
         atomicAdd(counters.contactEventCount, 1u);
     }
 
-    const uint activeLimit = uint(
-        floor(float(particleCapacity) *
-              clamp(uniforms.timing.z, 0.0, 1.0)));
-    if (particleIndex >= activeLimit ||
-        (uniforms.control.y == 0u && uniforms.control.w == 0u)) {
-        particle.metadata.x = 0u;
-        particleStates.particles[particleIndex] = particle;
-        HideParticleRange(particleIndex, particle.positionAge.xyz);
-        return;
+    const float activity =
+        clamp(uniforms.timing.z, 0.0, 1.0);
+    const float moisture =
+        clamp(uniforms.timing.w, 0.0, 1.0);
+    const float populationFraction =
+        activity * activity * mix(0.125, 0.50, moisture);
+    const bool populationEligible =
+        Hash01(uniforms.ground.w, particleIndex, 31u) <
+        populationFraction;
+    if (populationEligible) {
+        // Report the stable hashed population, including staggered births and
+        // terminal fades. This is the settled population budget; transient
+        // lifecycle states must not produce a synchronized count flash.
+        atomicAdd(counters.activeParticleCount, 1u);
     }
-
-    const bool authoredLane =
-        uniforms.control.w > 0u &&
-        (uniforms.control.y == 0u || (particleIndex % 3u) == 0u);
-    float sourceSpeedScale = 1.0;
-    if (authoredLane) {
-        const MeshFlowEmitter emitter =
-            authoredEmitters.emitters[particleIndex % uniforms.control.w];
-        const float sourceStrength =
-            clamp(emitter.strengthSpeedIdSeed.x, 0.0, 1.0);
-        sourceSpeedScale =
-            max(0.01, emitter.strengthSpeedIdSeed.y);
-        if (Hash01(uniforms.ground.w, particleIndex, 31u) >
-            sourceStrength) {
-            particle.metadata.x = 0u;
+    if (!populationEligible) {
+        if (particle.metadata.x == kParticleFlowing) {
+            particle.metadata.x = kParticleFading;
+            particle.positionAge.w = 0.0;
+        } else if (particle.metadata.x != kParticleFading) {
+            particle.metadata.x = kParticleInactive;
             particleStates.particles[particleIndex] = particle;
-            HideParticleRange(particleIndex, particle.positionAge.xyz);
+            HideParticleRange(
+                particleIndex,
+                particle.positionAge.xyz);
             return;
         }
     }
 
-    if (particle.metadata.x == 2u) {
+    if (particle.metadata.x == kParticleInactive) {
+        particle.metadata.x = kParticleWaiting;
+        particle.positionAge.w =
+            now +
+            Hash01(uniforms.ground.w, particleIndex, 33u) * 2.0;
+        particleStates.particles[particleIndex] = particle;
+        HideParticleRange(particleIndex, particle.positionAge.xyz);
+        return;
+    }
+    if (particle.metadata.x == kParticleWaiting) {
+        if (now < particle.positionAge.w) {
+            particleStates.particles[particleIndex] = particle;
+            HideParticleRange(particleIndex, particle.positionAge.xyz);
+            return;
+        }
+        particle.metadata.x = kParticleInactive;
+    }
+
+    if (particle.metadata.x == kParticleFading) {
         const float fadeDuration = max(0.01, uniforms.visual.w);
         particle.positionAge.w += max(0.0, uniforms.timing.y);
         const float terminalFade =
@@ -504,31 +1018,38 @@ void main() {
             StoreField(
                 kTrailRoleFieldSlot,
                 fadeStart + anchor,
-                uniforms.control.z != 0u ? 1.0 : 0.0);
+                uniforms.control.y != 0u ? 1.0 : 0.0);
             StoreField(
                 kTrailConfidenceFieldSlot,
                 fadeStart + anchor,
-                terminalFade);
+                min(
+                    terminalFade,
+                    LoadField(
+                        kTrailConfidenceFieldSlot,
+                        fadeStart + anchor,
+                        terminalFade)));
         }
         if (particle.positionAge.w >= fadeDuration) {
-            particle.metadata.x = 0u;
+            particle.metadata.x = kParticleInactive;
         }
         particleStates.particles[particleIndex] = particle;
         return;
     }
 
     bool spawned = false;
-    if (particle.metadata.x == 0u || reset) {
+    if (particle.metadata.x == kParticleInactive) {
         vec3 initialVelocity;
         uint sourceId;
-        uint automaticSource;
+        uint sourceKind;
         const GroundQuery spawn = SpawnParticle(
             particleIndex,
+            particle.metadata.y,
+            particle.metadata.z,
             initialVelocity,
             sourceId,
-            automaticSource);
+            sourceKind);
         if (spawn.valid == 0u) {
-            particle.metadata.x = 0u;
+            particle.metadata.x = kParticleInactive;
             particleStates.particles[particleIndex] = particle;
             HideParticleRange(
                 particleIndex,
@@ -541,9 +1062,13 @@ void main() {
                 SafeNormalize(spawn.downhill, initialVelocity),
                 0.0);
         particle.normalConfidence =
-            vec4(spawn.normal, spawn.confidence);
+            vec4(spawn.normal, 0.0);
         particle.metadata =
-            uvec4(1u, automaticSource, sourceId, uniforms.control.x);
+            uvec4(
+                kParticleFlowing,
+                sourceKind,
+                sourceId,
+                uniforms.control.x);
         spawned = true;
     }
 
@@ -556,19 +1081,12 @@ void main() {
             outputNormals.normals[routeStart + anchor] =
                 vec4(particle.normalConfidence.xyz, 0.0);
         }
-    } else if (uniforms.timing.y > 1.0e-6) {
-        for (uint anchor = 0u; anchor + 1u < historyLength; ++anchor) {
-            outputPositions.positions[routeStart + anchor] =
-                outputPositions.positions[routeStart + anchor + 1u];
-            outputNormals.normals[routeStart + anchor] =
-                outputNormals.normals[routeStart + anchor + 1u];
-        }
     }
 
     const GroundQuery current =
         QueryGround(particle.positionAge.xy, 2);
     if (current.valid == 0u) {
-        particle.metadata.x = 0u;
+        particle.metadata.x = kParticleInactive;
         particleStates.particles[particleIndex] = particle;
         HideParticleRange(particleIndex, particle.positionAge.xyz);
         return;
@@ -576,83 +1094,125 @@ void main() {
 
     const float seed =
         Hash01(uniforms.ground.w, particleIndex, 29u);
-    const float particlePhase =
-        dot(
-            particle.positionAge.xy /
-                max(0.001, uniforms.particleNoise.y),
-            vec2(0.754877666, 0.569840296)) +
-        uniforms.timing.x * uniforms.particleNoise.z +
-        seed * 6.28318530718;
-    const vec2 particleNoiseDirection =
-        vec2(cos(particlePhase), sin(particlePhase));
-    const float sharedPhase =
-        dot(
-            particle.positionAge.xy /
-                max(0.001, uniforms.sharedWind.y),
-            vec2(0.371, 0.819)) +
-        uniforms.timing.x * uniforms.sharedWind.z;
-    const vec2 sharedWindDirection =
-        vec2(cos(sharedPhase), sin(sharedPhase));
-
-    const float dryConvergence =
-        current.convergence *
-        uniforms.particleNoise.w *
-        (1.0 - clamp(uniforms.timing.w, 0.0, 1.0));
-    vec3 force =
-        current.downhill * max(0.0, uniforms.motion0.y) *
-            (0.55 + current.convergence + dryConvergence) +
-        vec3(
-            particleNoiseDirection * uniforms.particleNoise.x +
-            sharedWindDirection * uniforms.sharedWind.x,
-            0.0);
-    force -= current.normal * dot(force, current.normal);
-    force = SafeNormalize(
-        force,
-        SafeNormalize(particle.velocityDistance.xyz, vec3(1.0, 0.0, 0.0)));
     const vec3 previousVelocity = SafeNormalize(
         particle.velocityDistance.xyz,
-        force);
-    vec3 velocity = SafeNormalize(
-        previousVelocity * clamp(uniforms.motion0.z, 0.0, 0.98) +
-        force * (1.0 - clamp(uniforms.motion0.z, 0.0, 0.98)),
-        force);
+        current.downhill);
     const float speed =
         max(0.001, uniforms.motion0.x) *
-        sourceSpeedScale *
-        mix(0.72, 1.35, current.convergence) *
-        (1.0 + clamp(uniforms.timing.w, 0.0, 1.0) *
-                   uniforms.sharedWind.w * 0.35);
-    const vec2 targetXY =
-        particle.positionAge.xy +
-        velocity.xy * speed * max(0.0, uniforms.timing.y);
-    const GroundQuery next = QueryGround(targetXY, 2);
-    if (next.valid == 0u ||
-        (next.component != current.component &&
-         current.component != 0u &&
-         next.component != 0u)) {
-        particle.metadata.x = 0u;
-        particleStates.particles[particleIndex] = particle;
-        HideParticleRange(particleIndex, particle.positionAge.xyz);
-        return;
+        mix(0.72, 1.35, current.convergence);
+    const float resolution =
+        max(0.001, uniforms.boundsMinimumResolution.w);
+    float stepBudget =
+        particle.normalConfidence.w +
+        speed * max(0.0, uniforms.timing.y);
+    GroundQuery next = current;
+    bool terminalContact =
+        (current.flags & kTerminalContactFlag) != 0u;
+    bool selectedNext = false;
+    if (!terminalContact && stepBudget >= resolution) {
+        selectedNext = SelectConnectedGroundStep(
+            current,
+            previousVelocity,
+            particleIndex,
+            seed,
+            next,
+            terminalContact);
+        if (!selectedNext) {
+            particle.metadata.x = kParticleInactive;
+            particleStates.particles[particleIndex] = particle;
+            HideParticleRange(particleIndex, particle.positionAge.xyz);
+            return;
+        }
     }
 
-    const vec3 oldPosition = particle.positionAge.xyz;
-    const float stepDistance = length(next.position - oldPosition);
-    velocity = SafeNormalize(next.position - oldPosition, velocity);
-    particle.positionAge =
-        vec4(next.position, particle.positionAge.w + uniforms.timing.y);
-    particle.velocityDistance =
-        vec4(
-            velocity,
-            particle.velocityDistance.w + stepDistance);
-    particle.normalConfidence =
-        vec4(next.normal, next.confidence);
+    vec3 velocity = previousVelocity;
+    GroundQuery trailSurface = current;
+    vec3 renderedStepDelta = vec3(0.0);
+    float renderedStepLength = 0.0;
+    if (selectedNext && !terminalContact) {
+        for (uint anchor = 0u; anchor + 1u < historyLength; ++anchor) {
+            outputPositions.positions[routeStart + anchor] =
+                outputPositions.positions[routeStart + anchor + 1u];
+            outputNormals.normals[routeStart + anchor] =
+                outputNormals.normals[routeStart + anchor + 1u];
+        }
+        const float stepDistance =
+            length(next.position - current.position);
+        renderedStepDelta =
+            next.position - current.position;
+        renderedStepLength = stepDistance;
+        velocity = SafeNormalize(
+            next.position - current.position,
+            previousVelocity);
+        particle.positionAge =
+            vec4(
+                next.position,
+                particle.positionAge.w + uniforms.timing.y);
+        particle.velocityDistance =
+            vec4(
+                velocity,
+                particle.velocityDistance.w + stepDistance);
+        particle.normalConfidence =
+            vec4(
+                next.normal,
+                max(0.0, stepBudget - max(resolution, stepDistance)));
+        trailSurface = next;
+    } else {
+        particle.positionAge.w += max(0.0, uniforms.timing.y);
+        particle.normalConfidence.w = stepBudget;
+    }
     outputPositions.positions[
         routeStart + historyLength - 1u] =
-        vec4(next.position, 1.0);
+        vec4(trailSurface.position, 1.0);
     outputNormals.normals[
         routeStart + historyLength - 1u] =
-        vec4(next.normal, 0.0);
+        vec4(trailSurface.normal, 0.0);
+
+    atomicAdd(counters.routeSampleCount, 1u);
+    const vec3 boundsPadding = vec3(0.015);
+    if (all(greaterThanEqual(
+            trailSurface.position,
+            uniforms.boundsMinimumResolution.xyz -
+                boundsPadding)) &&
+        all(lessThanEqual(
+            trailSurface.position,
+            uniforms.boundsMaximumBand.xyz +
+                boundsPadding))) {
+        atomicAdd(counters.routeWithinBoundsCount, 1u);
+    }
+    const GroundQuery diagnosticSurface =
+        QueryGround(trailSurface.position.xy, 1);
+    if (diagnosticSurface.valid != 0u &&
+        abs(
+            diagnosticSurface.position.z -
+            trailSurface.position.z) <= 0.015) {
+        atomicAdd(counters.routeNearSurfaceCount, 1u);
+    }
+    if (renderedStepLength > 0.0) {
+        atomicMax(
+            counters.maximumSegmentBits,
+            floatBitsToUint(renderedStepLength));
+        if (renderedStepLength > 0.10) {
+            atomicAdd(counters.longSegmentCount, 1u);
+        }
+        const float planarStep =
+            length(renderedStepDelta.xy);
+        if (abs(renderedStepDelta.z) > 0.030 &&
+            abs(renderedStepDelta.z) >
+                planarStep * 1.5) {
+            atomicAdd(counters.verticalJumpCount, 1u);
+        }
+    }
+    const vec2 diagnosticTangent = SafeNormalize(
+        vec3(velocity.xy, 0.0),
+        vec3(1.0, 0.0, 0.0)).xy;
+    const vec2 diagnosticDownhill = SafeNormalize(
+        vec3(trailSurface.downhill.xy, 0.0),
+        vec3(diagnosticTangent, 0.0)).xy;
+    RecordRouteAlignment(
+        max(0.0, dot(
+            diagnosticTangent,
+            diagnosticDownhill)));
 
     float routeLength = 0.0;
     for (uint anchor = 1u; anchor < historyLength; ++anchor) {
@@ -663,6 +1223,11 @@ void main() {
     routeLength = max(0.001, routeLength);
     const float trailId = float(particleIndex + 1u);
     const float sourceId = float(particle.metadata.z);
+    MeshFlowVisualWeights nextWeights =
+        EvaluateVisualWeights(
+            trailSurface.convergence,
+            uniforms.timing.w,
+            trailSurface.confidence);
     for (uint anchor = 0u; anchor < historyLength; ++anchor) {
         const uint previousAnchor =
             anchor > 0u ? anchor - 1u : anchor;
@@ -678,7 +1243,7 @@ void main() {
             routeStart + anchor,
             outputPositions.positions[routeStart + anchor].xyz,
             outputNormals.normals[routeStart + anchor].xyz,
-            uniforms.control.z != 0u ? 1.0 : 0.0,
+            uniforms.control.y != 0u ? 1.0 : 0.0,
             trailId,
             sourceId,
             float(routeStart),
@@ -688,16 +1253,18 @@ void main() {
             anchorT,
             1.0 - anchorT,
             speed,
-            next.confidence,
+            nextWeights.trailProminence,
+            nextWeights.trailWidthScale,
+            nextWeights.trailStreakScale,
             tangent,
             seed);
     }
 
     StoreTrailPoint(
         routeStart + historyLength,
-        next.position,
-        next.normal,
-        uniforms.control.z != 0u ? 1.0 : 0.0,
+        trailSurface.position,
+        trailSurface.normal,
+        uniforms.control.y != 0u ? 1.0 : 0.0,
         trailId,
         sourceId,
         float(routeStart),
@@ -707,12 +1274,12 @@ void main() {
         seed,
         0.0,
         speed,
-        next.confidence,
+        nextWeights.trailProminence,
+        nextWeights.trailWidthScale,
+        nextWeights.trailStreakScale,
         velocity,
         seed);
 
-    bool terminalContact =
-        (next.flags & kTerminalContactFlag) != 0u;
     if (terminalContact) {
         const bool vegetation =
             (next.flags & kVegetationSupportedFlag) != 0u;
@@ -736,10 +1303,12 @@ void main() {
             max(0.01, response.w),
             vegetation ? max(0.0, uniforms.vegetationExtra.x) : 0.0);
         event.vegetationExtra = vec4(
-            vegetation ? max(0.0, uniforms.vegetationExtra.y) : 0.0,
-            0.0,
-            0.0,
-            0.0);
+            vegetation
+                ? max(0.0, uniforms.vegetationExtra.y)
+                : max(response.x * 2.6, 0.16),
+            clamp(uniforms.timing.w, 0.0, 1.0),
+            clamp(next.convergence, 0.0, 1.0),
+            seed);
         contactEvents.events[particleIndex] = event;
         const float contactCellSize =
             max(0.05, uniforms.responsePersistence.z);
@@ -771,10 +1340,12 @@ void main() {
         if (!previousEventActive) {
             atomicAdd(counters.contactEventCount, 1u);
         }
-        particle.metadata.x = 2u;
+        particle.metadata.x = kParticleFading;
         particle.positionAge.w = 0.0;
     } else {
-        atomicAdd(counters.activeParticleCount, 1u);
+        if (particle.metadata.y == 1u) {
+            atomicAdd(counters.rainSeedParticleCount, 1u);
+        }
     }
     particleStates.particles[particleIndex] = particle;
 }

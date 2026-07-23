@@ -277,6 +277,11 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
     PointCloudStyleState style,
     std::string_view sceneRole);
 [[nodiscard]] bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style);
+// True when an authored shoreline still defines a flooded/dry spatial region,
+// even if its animation speed is paused. Rain uses this predicate so viewport
+// and offline SAND impacts agree at a held shoreline frame.
+[[nodiscard]] bool PointCloudStyleHasShorelineWaveRegion(
+    const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleHasActiveCaustics(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style);
 [[nodiscard]] WaterFlowActivityScales ResolveWaterFlowActivityScales(

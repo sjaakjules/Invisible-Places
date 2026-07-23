@@ -147,6 +147,7 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   REQUIRE(input.is_open());
   const auto savedJson = nlohmann::json::parse(input);
   CHECK(savedJson.at("schema_version") == kProjectDocumentSchemaVersion);
+  CHECK(savedJson.at("active_water_scene_group") == "Scene1");
   REQUIRE(savedJson.at("scene_point_cloud_groups").size() == 1U);
   CHECK(savedJson.at("scene_point_cloud_groups").front().at("scene_group") ==
         "Scene1");
@@ -160,6 +161,7 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   const auto loaded = LoadProjectDocument(file.path, &errorMessage);
   REQUIRE(loaded.has_value());
   REQUIRE(loaded->scenePointCloudGroups.size() == 1U);
+  CHECK(loaded->activeWaterSceneGroupName == "Scene1");
   const auto &group = loaded->scenePointCloudGroups.front();
   CHECK(group.sceneGroupName == "Scene1");
   CHECK(group.displaySpacingMeters == Catch::Approx(0.005F));
@@ -182,6 +184,74 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   REQUIRE(loaded->layers.size() == 1U);
   CHECK(loaded->layers.front().selectedSceneVariantPath ==
         legacyMirror.selectedSceneVariantPath);
+}
+
+TEST_CASE("Schema 45 selects the explicit matching water scene instead of the first state",
+          "[project][serialization][water][scene-ownership]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+  using invisible_places::water::WaterEmitter;
+
+  WaterEmitter sampleEmitter;
+  sampleEmitter.id = 1U;
+  sampleEmitter.name = "SampleFlowPoint";
+  WaterEmitter sceneEmitter;
+  sceneEmitter.id = 2U;
+  sceneEmitter.name = "Scene1FlowPoint";
+
+  WaterSceneStateDocument sampleState;
+  sampleState.sceneGroupName = "SampleScene";
+  sampleState.emitters = {sampleEmitter};
+  WaterSceneStateDocument sceneState;
+  sceneState.sceneGroupName = "Scene1";
+  sceneState.emitters = {sceneEmitter};
+
+  ProjectDocument document;
+  document.projectName = "explicit-water-scene";
+  document.activeWaterSceneGroupName = "Scene1";
+  document.waterSceneStates = {sampleState, sceneState};
+
+  TemporaryProjectFile file{"invisible_places_active_water_scene_schema45.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream input{file.path};
+  REQUIRE(input.is_open());
+  auto saved = nlohmann::json::parse(input);
+  CHECK(saved.at("active_water_scene_group") == "Scene1");
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->activeWaterSceneGroupName == "Scene1");
+  REQUIRE(loaded->waterSceneStates.size() == 2U);
+  REQUIRE(loaded->waterEmitters.size() == 1U);
+  CHECK(loaded->waterEmitters.front().name == "Scene1FlowPoint");
+
+  // Schema-44 input has no explicit owner. The selected scene layer is the
+  // compatibility signal and must still win over array order.
+  saved["schema_version"] = 44U;
+  saved.erase("active_water_scene_group");
+  saved["selected_layer_path"] = "Data/Scene1/Site1-ROCK-3mm.ply";
+  saved["layers"] = nlohmann::json::array({
+      {
+          {"kind", "point_cloud"},
+          {"source_path", "Data/Scene1/Site1-ROCK-3mm.ply"},
+          {"scene_group", "Scene1"},
+          {"scene_role", "ROCK"},
+      },
+  });
+  {
+    std::ofstream output{file.path};
+    REQUIRE(output.is_open());
+    output << saved.dump(2);
+  }
+  const auto migrated = LoadProjectDocument(file.path, &errorMessage);
+  REQUIRE(migrated.has_value());
+  CHECK(migrated->activeWaterSceneGroupName == "Scene1");
+  REQUIRE(migrated->waterEmitters.size() == 1U);
+  CHECK(migrated->waterEmitters.front().name == "Scene1FlowPoint");
 }
 
 TEST_CASE("Schema 43 externalizes clean Flow path caches and prunes orphaned data",
@@ -294,7 +364,7 @@ TEST_CASE("Flow sidecars resolve relative scene sources beside the movable proje
   const auto sceneRoot = originalRoot / "Data" / "SampleScene";
   std::filesystem::create_directories(sceneRoot);
   const auto relativeSupport = std::filesystem::path{"Data"} / "SampleScene" /
-                               "Site1-ROCK-1mm.Sample.ply";
+                               "Site1-ROCK-1mm. SampleScene.ply";
   {
     std::ofstream source{originalRoot / relativeSupport};
     REQUIRE(source.is_open());
@@ -317,7 +387,7 @@ TEST_CASE("Flow sidecars resolve relative scene sources beside the movable proje
           .analysisSourcePath = relativeSupport,
           .displaySourcePath =
               std::filesystem::path{"Data"} / "SampleScene" /
-              "Site1-ROCK-3mm.Sample.ply",
+              "Site1-ROCK-3mm. SampleScene.ply",
       }},
   }};
   document.waterSceneStates = {state};
@@ -768,6 +838,15 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   REQUIRE(fixtureJson.at("water_emitters").size() == 1U);
   CHECK_FALSE(fixtureJson.at("water_emitters").front().contains("cached_path"));
   CHECK_FALSE(fixtureJson.at("water_emitters").front().contains("generated_path"));
+  const auto &fixtureMesh =
+      fixtureJson.at("water_dynamic_mesh_flow_settings");
+  CHECK_FALSE(fixtureMesh.contains("automatic_sources"));
+  CHECK_FALSE(fixtureMesh.contains("attractors"));
+  CHECK_FALSE(fixtureMesh.contains("emitter_motions"));
+  CHECK_FALSE(fixtureMesh.contains("source_band_width_meters"));
+  CHECK_FALSE(fixtureMesh.contains("source_band_fraction"));
+  CHECK(fixtureMesh.at("rain_distributed_source_fraction") ==
+        Catch::Approx(0.55F));
 
   std::string errorMessage;
   const auto fixture = LoadWaterSourcesDocument(fixturePath, &errorMessage);
@@ -887,6 +966,7 @@ TEST_CASE("Generated SampleScene validation project round-trips current schema w
   REQUIRE(validationInput.is_open());
   const auto validationJson = nlohmann::json::parse(validationInput);
   CHECK(validationJson.at("schema_version") == kProjectDocumentSchemaVersion);
+  CHECK(validationJson.at("active_water_scene_group") == "SampleScene");
   CHECK_FALSE(validationJson.contains("water_path_cache"));
   CHECK_FALSE(validationJson.contains("water_path_cache_manifest"));
   REQUIRE(validationJson.at("water_ripple_runtime_caches").empty());
@@ -894,18 +974,31 @@ TEST_CASE("Generated SampleScene validation project round-trips current schema w
   CHECK_FALSE(validationJson.at("water_scene_states").front().contains("water_path_cache"));
   CHECK_FALSE(validationJson.at("water_scene_states").front().contains(
       "water_path_cache_manifest"));
+  CHECK_FALSE(validationJson.at("water_scene_states").front().contains(
+      "dynamic_mesh_attractors"));
+  CHECK_FALSE(validationJson.at("water_scene_states").front().contains(
+      "dynamic_mesh_emitter_motions"));
   REQUIRE(validationJson.at("water_scene_states").front()
               .at("water_ripple_runtime_caches")
               .empty());
   REQUIRE(validationJson.at("scene_point_cloud_groups").size() == 1U);
   CHECK_FALSE(validationJson.at("scene_point_cloud_groups").front().contains(
       "water_surface_cache"));
+  for (const auto &layer : validationJson.at("layers")) {
+    CAPTURE(layer.at("source_path"));
+    CHECK(std::filesystem::is_regular_file(
+        layer.at("source_path").get<std::filesystem::path>()));
+  }
+  CHECK(std::filesystem::is_regular_file(
+      std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR} /
+      "SampleScene" / "Site1-MeshSampled-5mm-SampleScene.ply"));
 
   std::string errorMessage;
   const auto validation = LoadProjectDocument(validationPath, &errorMessage);
   INFO(errorMessage);
   REQUIRE(validation.has_value());
   CHECK(validation->schemaVersion == kProjectDocumentSchemaVersion);
+  CHECK(validation->activeWaterSceneGroupName == "SampleScene");
   REQUIRE(validation->scenePointCloudGroups.size() == 1U);
   const auto &group = validation->scenePointCloudGroups.front();
   CHECK(group.sceneGroupName == "SampleScene");
@@ -919,12 +1012,18 @@ TEST_CASE("Generated SampleScene validation project round-trips current schema w
   REQUIRE(rock != nullptr);
   REQUIRE(sand != nullptr);
   REQUIRE(vegetation != nullptr);
-  CHECK(rock->analysisSourcePath.filename() == "Site1-ROCK-1mm.Sample.ply");
-  CHECK(sand->analysisSourcePath.filename() == "Site1-SAND-2mm.Sample.ply");
-  CHECK(vegetation->analysisSourcePath.filename() == "Site1-VEG-1mm.Sample.ply");
-  CHECK(rock->displaySourcePath.filename() == "Site1-ROCK-3mm.Sample.ply");
-  CHECK(sand->displaySourcePath.filename() == "Site1-SAND-3mm.Sample.ply");
-  CHECK(vegetation->displaySourcePath.filename() == "Site1-VEG-3mm.Sample.ply");
+  CHECK(rock->analysisSourcePath.filename() ==
+        "Site1-ROCK-1mm. SampleScene.ply");
+  CHECK(sand->analysisSourcePath.filename() ==
+        "Site1-SAND-2mm. SampleScene.ply");
+  CHECK(vegetation->analysisSourcePath.filename() ==
+        "Site1-VEG-1mm. SampleScene.ply");
+  CHECK(rock->displaySourcePath.filename() ==
+        "Site1-ROCK-3mm. SampleScene.ply");
+  CHECK(sand->displaySourcePath.filename() ==
+        "Site1-SAND-3mm. SampleScene.ply");
+  CHECK(vegetation->displaySourcePath.filename() ==
+        "Site1-VEG-3mm. SampleScene.ply");
 
   REQUIRE(validation->waterSceneStates.size() == 1U);
   CHECK(validation->waterShowFlowTrails);
@@ -1194,7 +1293,7 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
         Catch::Approx(1.0F));
 }
 
-TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
+TEST_CASE("Project schema 45 round-trips automatic fixed-capacity Mesh Flow controls",
           "[project][serialization][water][mesh-flow]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::ProjectDocument;
@@ -1209,8 +1308,15 @@ TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
   settings.particleCapacity = 8192U;
   settings.historyLength = 48U;
   settings.sourceBandWidthMeters = 0.52F;
+  settings.sourceBandFraction = 0.06F;
   settings.dryConcavityFocus = 0.62F;
   settings.rainSpawnSpread = 1.15F;
+  settings.rainDistributedSourceFraction = 0.47F;
+  settings.trailOpacityDry = 0.03F;
+  settings.trailOpacityWet = 0.16F;
+  settings.trailEmissionDry = 0.05F;
+  settings.trailEmissionWet = 0.50F;
+  settings.trailExposure = 1.4F;
   settings.speedMetersPerSecond = 0.31F;
   settings.surfaceOffsetMeters = 0.009F;
   settings.particleNoiseStrength = 0.44F;
@@ -1235,7 +1341,7 @@ TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
   scenario.state.meshFlowRainRecessionSeconds = 64.0F;
   document.waterScenarios = {scenario};
 
-  TemporaryProjectFile projectFile{"invisible_places_mesh_flow_schema_44.json"};
+  TemporaryProjectFile projectFile{"invisible_places_mesh_flow_schema_45.json"};
   std::string errorMessage;
   REQUIRE(SaveProjectDocument(document, projectFile.path, &errorMessage));
   {
@@ -1245,10 +1351,21 @@ TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
     CHECK(saved.at("schema_version") ==
           invisible_places::serialization::kProjectDocumentSchemaVersion);
     const auto& mesh = saved.at("water_dynamic_mesh_flow_settings");
-    CHECK(mesh.at("particle_capacity") == 8192U);
-    CHECK(mesh.at("history_length") == 48U);
+    CHECK(mesh.at("particle_capacity") == 4096U);
+    CHECK(mesh.at("history_length") == 24U);
     CHECK_FALSE(mesh.at("show_trails").get<bool>());
-    CHECK_FALSE(mesh.at("automatic_sources").get<bool>());
+    CHECK_FALSE(mesh.contains("automatic_sources"));
+    CHECK_FALSE(mesh.contains("attractors"));
+    CHECK_FALSE(mesh.contains("emitter_motions"));
+    CHECK_FALSE(mesh.contains("source_band_width_meters"));
+    CHECK_FALSE(mesh.contains("source_band_fraction"));
+    CHECK(mesh.at("rain_distributed_source_fraction") ==
+          Catch::Approx(0.47F));
+    CHECK(mesh.at("trail_opacity_dry") == Catch::Approx(0.03F));
+    CHECK(mesh.at("trail_opacity_wet") == Catch::Approx(0.16F));
+    CHECK(mesh.at("trail_emission_dry") == Catch::Approx(0.05F));
+    CHECK(mesh.at("trail_emission_wet") == Catch::Approx(0.50F));
+    CHECK(mesh.at("trail_exposure") == Catch::Approx(1.4F));
     CHECK(mesh.at("rock_response").at("persistence_seconds") ==
           Catch::Approx(4.5F));
     CHECK(mesh.at("vegetation_response").at("twinkle") ==
@@ -1263,10 +1380,17 @@ TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
   REQUIRE(loaded.has_value());
   const auto& loadedSettings = loaded->waterDynamicMeshFlowSettings;
   CHECK_FALSE(loadedSettings.showTrails);
-  CHECK_FALSE(loadedSettings.automaticSources);
-  CHECK(loadedSettings.particleCapacity == 8192U);
-  CHECK(loadedSettings.historyLength == 48U);
-  CHECK(loadedSettings.sourceBandWidthMeters == Catch::Approx(0.52F));
+  CHECK(loadedSettings.automaticSources);
+  CHECK(loadedSettings.particleCapacity == 4096U);
+  CHECK(loadedSettings.historyLength == 24U);
+  CHECK(loadedSettings.sourceBandWidthMeters == Catch::Approx(0.75F));
+  CHECK(loadedSettings.sourceBandFraction == Catch::Approx(0.04F));
+  CHECK(loadedSettings.rainDistributedSourceFraction == Catch::Approx(0.47F));
+  CHECK(loadedSettings.trailOpacityDry == Catch::Approx(0.03F));
+  CHECK(loadedSettings.trailOpacityWet == Catch::Approx(0.16F));
+  CHECK(loadedSettings.trailEmissionDry == Catch::Approx(0.05F));
+  CHECK(loadedSettings.trailEmissionWet == Catch::Approx(0.50F));
+  CHECK(loadedSettings.trailExposure == Catch::Approx(1.4F));
   CHECK(loadedSettings.particleNoiseStrength == Catch::Approx(0.44F));
   CHECK(loadedSettings.sharedWindScaleMeters == Catch::Approx(3.1F));
   CHECK(loadedSettings.contactFadeSeconds == Catch::Approx(1.25F));
@@ -1296,6 +1420,23 @@ TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
              {"enabled", true},
              {"speed_meters_per_second", 0.62F},
              {"preview_particle_limit", 560U},
+             {"automatic_sources", false},
+             {"attractors",
+              nlohmann::json::array({
+                  {
+                      {"id", 7U},
+                      {"name", "Legacy attractor"},
+                      {"position", {1.0F, 2.0F, 3.0F}},
+                  },
+              })},
+             {"emitter_motions",
+              nlohmann::json::array({
+                  {
+                      {"emitter_id", 11U},
+                      {"name", "Legacy motion"},
+                      {"enabled", true},
+                  },
+              })},
          }},
         {"water_scenarios",
          nlohmann::json::array({
@@ -1315,12 +1456,45 @@ TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
   CHECK(legacy->waterDynamicMeshFlowSettings.particleCapacity == 4096U);
   CHECK(legacy->waterDynamicMeshFlowSettings.historyLength == 24U);
   CHECK(legacy->waterDynamicMeshFlowSettings.speedMetersPerSecond ==
-        Catch::Approx(0.62F));
+        Catch::Approx(0.26F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.sourceBandWidthMeters ==
+        Catch::Approx(0.75F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.sourceBandFraction ==
+        Catch::Approx(0.04F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.dryConcavityFocus ==
+        Catch::Approx(0.90F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.rainSpawnSpread ==
+        Catch::Approx(0.75F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.trailWidthMeters ==
+        Catch::Approx(0.0025F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.trailStreakLengthMeters ==
+        Catch::Approx(0.030F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.inertia ==
+        Catch::Approx(0.88F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.particleNoiseStrength ==
+        Catch::Approx(0.10F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.sharedWindStrength ==
+        Catch::Approx(0.035F));
+  CHECK(legacy->waterDynamicMeshFlowSettings.automaticSources);
+  CHECK(legacy->waterDynamicMeshFlowSettings.attractors.empty());
+  CHECK(legacy->waterDynamicMeshFlowSettings.emitterMotions.empty());
   REQUIRE(legacy->waterScenarios.size() == 1U);
   CHECK(legacy->waterScenarios[0].state.meshFlowLevel == Catch::Approx(1.0F));
   CHECK(legacy->waterScenarios[0].state.meshFlowRainGain == Catch::Approx(0.0F));
   CHECK(legacy->waterScenarios[0].state.meshFlowPersistenceScale ==
         Catch::Approx(1.0F));
+
+  TemporaryProjectFile migratedFile{
+      "invisible_places_mesh_flow_legacy_sources_migrated.json"};
+  REQUIRE(SaveProjectDocument(legacy.value(), migratedFile.path, &errorMessage));
+  std::ifstream migratedInput{migratedFile.path};
+  REQUIRE(migratedInput.is_open());
+  const auto migratedJson = nlohmann::json::parse(migratedInput);
+  const auto& migratedMesh =
+      migratedJson.at("water_dynamic_mesh_flow_settings");
+  CHECK_FALSE(migratedMesh.contains("automatic_sources"));
+  CHECK_FALSE(migratedMesh.contains("attractors"));
+  CHECK_FALSE(migratedMesh.contains("emitter_motions"));
 }
 
 TEST_CASE("Project schema v32 migrates legacy selected variants into scene "

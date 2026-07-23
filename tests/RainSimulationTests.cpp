@@ -657,6 +657,116 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "sampled Ground associates elevated VEG support by bounded vertical column",
+    "[water][cache][ground][vegetation]") {
+    constexpr float maximumAssociation = invisible_places::water::
+        kWaterGroundVegetationAssociationMaximumHeightMeters;
+    std::vector<WaterSurfaceSample> samples{
+        // Authored terrain retains this upper two-cell Ground component. A
+        // canopy point two metres above marks only its own retained column.
+        {{0.001F, 0.001F, 2.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Vegetation},
+        {{0.001F, 0.001F, -0.050F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Rock},
+        {{0.001F, 0.001F, 0.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Ground},
+        {{0.011F, 0.001F, 0.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Ground},
+
+        // A separate authored upper column just inside the vertical cap is
+        // independently flagged and receives a different component identity.
+        {{0.201F, 0.001F, 0.501F + maximumAssociation - 0.010F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Vegetation},
+        {{0.201F, 0.001F, 0.450F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Rock},
+        {{0.201F, 0.001F, 0.501F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Ground},
+
+        // Unrelated vertically stacked and below-Ground VEG must not seed
+        // their disconnected Ground candidates.
+        {{0.401F, 0.001F, maximumAssociation + 0.011F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Vegetation},
+        {{0.401F, 0.001F, 0.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Ground},
+        {{0.601F, 0.001F, 0.901F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Vegetation},
+        {{0.601F, 0.001F, 1.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Ground},
+
+        // Elevated association enriches retained topology only. It must not
+        // admit a new component that lacks the legacy upper/near-VEG seed.
+        {{0.801F, 0.001F, 2.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Vegetation},
+        {{0.801F, 0.001F, 0.001F},
+         {0.0F, 0.0F, 1.0F},
+         WaterSurfaceRole::Ground},
+    };
+
+    const auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    auto reversedSamples = samples;
+    std::reverse(reversedSamples.begin(), reversedSamples.end());
+    const auto reversed =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(
+            reversedSamples);
+
+    REQUIRE(cache.groundCells.size() == 3U);
+    REQUIRE(reversed.groundCells.size() == cache.groundCells.size());
+    for (std::size_t index = 0U; index < cache.groundCells.size(); ++index) {
+        CHECK(cache.groundCells[index].cellX ==
+              reversed.groundCells[index].cellX);
+        CHECK(cache.groundCells[index].cellY ==
+              reversed.groundCells[index].cellY);
+        CHECK(cache.groundCells[index].flags ==
+              reversed.groundCells[index].flags);
+        CHECK(cache.groundCells[index].componentId ==
+              reversed.groundCells[index].componentId);
+        CHECK(cache.groundCells[index].connectivityMask ==
+              reversed.groundCells[index].connectivityMask);
+    }
+
+    const auto& canopyColumn = cache.groundCells[0];
+    const auto& connectedNeighbour = cache.groundCells[1];
+    const auto& cappedColumn = cache.groundCells[2];
+    CHECK(canopyColumn.cellX == 0);
+    CHECK(
+        (canopyColumn.flags &
+         invisible_places::water::kWaterGroundVegetationSupportedFlag) != 0U);
+    CHECK(
+        (connectedNeighbour.flags &
+         invisible_places::water::kWaterGroundVegetationSupportedFlag) == 0U);
+    CHECK(canopyColumn.componentId == connectedNeighbour.componentId);
+    CHECK(canopyColumn.connectivityMask == (1U << 2U));
+    CHECK(connectedNeighbour.connectivityMask == (1U << 6U));
+    CHECK(cappedColumn.cellX == 20);
+    CHECK(
+        (cappedColumn.flags &
+         invisible_places::water::kWaterGroundVegetationSupportedFlag) != 0U);
+    CHECK(cappedColumn.componentId != canopyColumn.componentId);
+
+    CHECK(std::none_of(
+        cache.groundCells.begin(),
+        cache.groundCells.end(),
+        [](const auto& cell) {
+            return cell.cellX == 40 ||
+                   cell.cellX == 60 ||
+                   cell.cellX == 80;
+        }));
+}
+
+TEST_CASE(
     "sampled Ground convergence and GPU hash ABI are bounded",
     "[water][cache][ground][gpu]") {
     std::vector<WaterSurfaceSample> samples{{
@@ -815,17 +925,20 @@ TEST_CASE("SampleScene water sources select exact two millimetre normal support"
     const auto* displayBundle = sampleScene->FindCompleteDisplayBundle(3'000U);
     REQUIRE(displayBundle != nullptr);
     CHECK(displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Rock).sourcePath.filename() ==
-          "Site1-ROCK-3mm.Sample.ply");
+          "Site1-ROCK-3mm. SampleScene.ply");
     CHECK(displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Sand).sourcePath.filename() ==
-          "Site1-SAND-3mm.Sample.ply");
+          "Site1-SAND-3mm. SampleScene.ply");
     CHECK(displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Vegetation).sourcePath.filename() ==
-          "Site1-VEG-3mm.Sample.ply");
+          "Site1-VEG-3mm. SampleScene.ply");
 
     const auto sources = invisible_places::water::SelectWaterSurfaceSources(*sampleScene);
     REQUIRE(sources.size() == 3U);
-    CHECK(sources[0].sourcePath.filename() == "Site1-ROCK-2mm.Sample.ply");
-    CHECK(sources[1].sourcePath.filename() == "Site1-SAND-2mm.Sample.ply");
-    CHECK(sources[2].sourcePath.filename() == "Site1-VEG-2mm.Sample.ply");
+    CHECK(sources[0].sourcePath.filename() ==
+          "Site1-ROCK-2mm. SampleScene.ply");
+    CHECK(sources[1].sourcePath.filename() ==
+          "Site1-SAND-2mm. SampleScene.ply");
+    CHECK(sources[2].sourcePath.filename() ==
+          "Site1-VEG-2mm. SampleScene.ply");
     for (const auto& source : sources) {
         CHECK(source.spacingMicrometres == 2'000U);
         CHECK_FALSE(source.isFallback);
@@ -1334,7 +1447,7 @@ TEST_CASE("water surface signatures invalidate for every terrain source input",
     }};
     const auto baseline = invisible_places::water::WaterSurfaceCacheSignature(sources);
     CHECK(invisible_places::water::kWaterSurfaceCacheAlgorithmId ==
-          std::string_view{"water-surface-10mm-normal-average-ground-v2"});
+          std::string_view{"water-surface-10mm-normal-average-ground-v3"});
     CHECK(invisible_places::water::WaterSurfaceCacheSignature(sources, 0.020F) != baseline);
 
     auto changedRole = sources;
@@ -1650,7 +1763,7 @@ TEST_CASE("rain simulator respawns particles outside the camera range", "[water]
 
 TEST_CASE("rain impact grid bounds work and isolates scene roles", "[water][rain][effects]") {
     std::vector<invisible_places::water::RainImpactEvent> events;
-    for (std::uint32_t index = 0; index < 12U; ++index) {
+    for (std::uint32_t index = 0; index < 20U; ++index) {
         events.push_back({
             .position = {0.0F, 0.0F, 0.0F},
             .birthTimeSeconds = 0.0F,
@@ -1707,6 +1820,568 @@ TEST_CASE("rain impact grid bounds work and isolates scene roles", "[water][rain
     CHECK(rock.colourBlend > 0.0F);
     CHECK(sandAtRock.opacity == Catch::Approx(0.0F));
     CHECK(vegetationTopMaximum > vegetationLowerEarly.emission);
+}
+
+TEST_CASE(
+    "ROCK impact reservoir compacts event indices that share a modulo lane",
+    "[water][rain][effects][grid]") {
+    std::vector<invisible_places::water::RainImpactEvent> events(17U);
+    const invisible_places::water::RainImpactEvent impact{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.10F,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = 5.0F,
+        .energy = 1.0F,
+        .seed = 3U,
+    };
+    events[0] = impact;
+    events[16] = impact;
+    events[16].position.x = 0.005F;
+    events[16].seed = 19U;
+
+    const auto grid = invisible_places::water::BuildRainImpactGrid(
+        events,
+        {},
+        0.5F,
+        4.0F);
+    const auto cellX = static_cast<std::uint32_t>(
+        std::floor((0.0F - grid.origin.x) / grid.cellSizeMeters));
+    const auto cellY = static_cast<std::uint32_t>(
+        std::floor((0.0F - grid.origin.y) / grid.cellSizeMeters));
+    const auto& cell = grid.cells[
+        static_cast<std::size_t>(cellY) * grid.dimension + cellX];
+
+    CHECK(grid.overflowCount == 0U);
+    CHECK(cell.rockCount == 2U);
+    CHECK(cell.rockMask == 0x3U);
+    CHECK(std::find(cell.rock.begin(), cell.rock.end(), 0U) !=
+          cell.rock.end());
+    CHECK(std::find(cell.rock.begin(), cell.rock.end(), 16U) !=
+          cell.rock.end());
+}
+
+TEST_CASE(
+    "SAND impact storage keeps sparse event indices until capacity is full",
+    "[water][rain][effects][grid][sand]") {
+    std::vector<invisible_places::water::RainImpactEvent> events(9U);
+    const invisible_places::water::RainImpactEvent impact{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.10F,
+        .role = WaterSurfaceRole::Sand,
+        .lifetimeSeconds = 1.0F,
+        .energy = 1.0F,
+        .seed = 3U,
+    };
+    events[0] = impact;
+    events[8] = impact;
+    events[8].position.x = 0.005F;
+    events[8].seed = 11U;
+
+    const auto grid = invisible_places::water::BuildRainImpactGrid(
+        events,
+        {},
+        0.25F,
+        4.0F);
+    const auto cellX = static_cast<std::uint32_t>(
+        std::floor((0.0F - grid.origin.x) / grid.cellSizeMeters));
+    const auto cellY = static_cast<std::uint32_t>(
+        std::floor((0.0F - grid.origin.y) / grid.cellSizeMeters));
+    const auto& cell = grid.cells[
+        static_cast<std::size_t>(cellY) * grid.dimension + cellX];
+
+    CHECK(grid.overflowCount == 0U);
+    CHECK(cell.sandCount == 2U);
+    CHECK(cell.sandMask == 0x3U);
+    CHECK(std::find(cell.sand.begin(), cell.sand.end(), 0U) !=
+          cell.sand.end());
+    CHECK(std::find(cell.sand.begin(), cell.sand.end(), 8U) !=
+          cell.sand.end());
+}
+
+TEST_CASE(
+    "VEG impact storage keeps sparse event indices until capacity is full",
+    "[water][rain][effects][grid][vegetation]") {
+    std::vector<invisible_places::water::RainImpactEvent> events(5U);
+    const invisible_places::water::RainImpactEvent impact{
+        .position = {0.0F, 0.0F, 0.5F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.10F,
+        .role = WaterSurfaceRole::Vegetation,
+        .lifetimeSeconds = 2.0F,
+        .energy = 1.0F,
+        .seed = 5U,
+    };
+    events[0] = impact;
+    events[4] = impact;
+    events[4].position.x = 0.005F;
+    events[4].seed = 9U;
+
+    const auto grid = invisible_places::water::BuildRainImpactGrid(
+        events,
+        {},
+        0.25F,
+        4.0F);
+    const auto cellX = static_cast<std::uint32_t>(
+        std::floor((0.0F - grid.origin.x) / grid.cellSizeMeters));
+    const auto cellY = static_cast<std::uint32_t>(
+        std::floor((0.0F - grid.origin.y) / grid.cellSizeMeters));
+    const auto& cell = grid.cells[
+        static_cast<std::size_t>(cellY) * grid.dimension + cellX];
+
+    CHECK(grid.overflowCount == 0U);
+    CHECK(cell.vegetationCount == 2U);
+    CHECK(cell.vegetationMask == 0x3U);
+    CHECK(
+        std::find(cell.vegetation.begin(), cell.vegetation.end(), 0U) !=
+        cell.vegetation.end());
+    CHECK(
+        std::find(cell.vegetation.begin(), cell.vegetation.end(), 4U) !=
+        cell.vegetation.end());
+}
+
+TEST_CASE(
+    "ROCK impact reservoir ranks physical distance then age energy and index",
+    "[water][rain][effects][grid][reservoir]") {
+    using invisible_places::water::RainImpactEvent;
+    using invisible_places::water::WaterSurfaceRole;
+
+    constexpr float kWorldSpanMeters = 4.0F;
+    constexpr float kCellSizeMeters =
+        kWorldSpanMeters /
+        static_cast<float>(
+            invisible_places::water::kRainImpactGridDimension);
+    constexpr float kCellMinimum = 0.0F;
+    constexpr float kCellMaximum = kCellMinimum + kCellSizeMeters;
+    constexpr float kCellCentre =
+        (kCellMinimum + kCellMaximum) * 0.5F;
+    constexpr float kTimeSeconds = 5.0F;
+
+    const RainImpactEvent base{
+        .position = {kCellCentre, kCellCentre, 0.0F},
+        .birthTimeSeconds = kTimeSeconds,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.16F,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = 6.0F,
+        .energy = 2.5F,
+        .seed = 1U,
+    };
+    const auto targetCell = [](const auto& grid) -> const auto& {
+        const auto cellX = static_cast<std::uint32_t>(std::floor(
+            (kCellCentre - grid.origin.x) / grid.cellSizeMeters));
+        const auto cellY = static_cast<std::uint32_t>(std::floor(
+            (kCellCentre - grid.origin.y) / grid.cellSizeMeters));
+        return grid.cells[
+            static_cast<std::size_t>(cellY) * grid.dimension + cellX];
+    };
+    const auto contains = [](const auto& cell, std::uint32_t eventIndex) {
+        return std::find(
+                   cell.rock.begin(),
+                   cell.rock.begin() + cell.rockCount,
+                   eventIndex) !=
+               cell.rock.begin() + cell.rockCount;
+    };
+    const auto makeDominantEvents = [&]() {
+        return std::vector<RainImpactEvent>(15U, base);
+    };
+    const auto build = [&](std::span<const RainImpactEvent> events) {
+        return invisible_places::water::BuildRainImpactGrid(
+            events,
+            {},
+            kTimeSeconds,
+            kWorldSpanMeters);
+    };
+
+    SECTION("physical cell-bound distance is independent of drop radius") {
+        auto events = makeDominantEvents();
+        auto nearerSmall = base;
+        nearerSmall.position.x = kCellMaximum + 0.020F;
+        nearerSmall.radiusMeters = 0.025F;
+        nearerSmall.seed = 15U;
+        auto fartherLarge = base;
+        fartherLarge.position.x = kCellMaximum + 0.030F;
+        fartherLarge.radiusMeters = 0.16F;
+        fartherLarge.seed = 16U;
+        events.push_back(nearerSmall);
+        events.push_back(fartherLarge);
+
+        const auto grid = build(events);
+        const auto& cell = targetCell(grid);
+        REQUIRE(cell.rockCount == 16U);
+        CHECK(cell.rockMask == 0xFFFFU);
+        CHECK(contains(cell, 15U));
+        CHECK_FALSE(contains(cell, 16U));
+        CHECK(grid.overflowCount > 0U);
+    }
+
+    SECTION("absolute age is independent of event lifetime") {
+        auto events = makeDominantEvents();
+        auto youngerShortLived = base;
+        youngerShortLived.birthTimeSeconds = kTimeSeconds - 1.0F;
+        youngerShortLived.lifetimeSeconds = 1.2F;
+        youngerShortLived.seed = 15U;
+        auto olderLongLived = base;
+        olderLongLived.birthTimeSeconds = kTimeSeconds - 2.0F;
+        olderLongLived.lifetimeSeconds = 6.0F;
+        olderLongLived.seed = 16U;
+        events.push_back(youngerShortLived);
+        events.push_back(olderLongLived);
+
+        const auto grid = build(events);
+        const auto& cell = targetCell(grid);
+        REQUIRE(cell.rockCount == 16U);
+        CHECK(contains(cell, 15U));
+        CHECK_FALSE(contains(cell, 16U));
+    }
+
+    SECTION("higher energy wins after equal distance and age") {
+        auto events = makeDominantEvents();
+        auto higherEnergy = base;
+        higherEnergy.energy = 2.0F;
+        higherEnergy.seed = 15U;
+        auto lowerEnergy = base;
+        lowerEnergy.energy = 0.2F;
+        lowerEnergy.seed = 16U;
+        events.push_back(higherEnergy);
+        events.push_back(lowerEnergy);
+
+        const auto grid = build(events);
+        const auto& cell = targetCell(grid);
+        REQUIRE(cell.rockCount == 16U);
+        CHECK(contains(cell, 15U));
+        CHECK_FALSE(contains(cell, 16U));
+    }
+
+    SECTION("event index is the final deterministic tie break") {
+        std::vector<RainImpactEvent> events(17U, base);
+        const auto grid = build(events);
+        const auto& cell = targetCell(grid);
+        REQUIRE(cell.rockCount == 16U);
+        CHECK(contains(cell, 0U));
+        CHECK(contains(cell, 15U));
+        CHECK_FALSE(contains(cell, 16U));
+    }
+
+    SECTION("overflow begins only after all sixteen ROCK slots are occupied") {
+        std::vector<RainImpactEvent> sixteen(16U, base);
+        const auto settled = build(sixteen);
+        CHECK(targetCell(settled).rockCount == 16U);
+        CHECK(settled.overflowCount == 0U);
+
+        sixteen.push_back(base);
+        const auto saturated = build(sixteen);
+        CHECK(targetCell(saturated).rockCount == 16U);
+        CHECK(saturated.overflowCount > 0U);
+    }
+}
+
+TEST_CASE(
+    "overlapping ROCK impacts form an order-independent peak-preserving soft union",
+    "[water][rain][effects][rock]") {
+    auto settings = invisible_places::water::RainRockImpactSettings{};
+    settings.edgeBreakup = 0.0F;
+    settings.spreadSpeed = 6.0F;
+    settings.centreFalloff = 1.0F;
+    settings.heightBias = 0.0F;
+    const invisible_places::water::RainImpactEvent first{
+        .position = {-0.010F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.12F,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = 5.0F,
+        .energy = 0.55F,
+        .seed = 7U,
+    };
+    auto second = first;
+    second.position.x = 0.010F;
+    second.seed = 11U;
+    const std::vector<invisible_places::water::RainImpactEvent> firstOnly{
+        first};
+    const std::vector<invisible_places::water::RainImpactEvent> both{
+        first,
+        second};
+    const std::vector<invisible_places::water::RainImpactEvent> reversed{
+        second,
+        first};
+    const auto firstGrid = invisible_places::water::BuildRainImpactGrid(
+        firstOnly,
+        {},
+        1.0F,
+        4.0F,
+        settings);
+    const auto bothGrid = invisible_places::water::BuildRainImpactGrid(
+        both,
+        {},
+        1.0F,
+        4.0F,
+        settings);
+    const auto reversedGrid = invisible_places::water::BuildRainImpactGrid(
+        reversed,
+        {},
+        1.0F,
+        4.0F,
+        settings);
+    const Float3 point{0.0F, 0.0F, 0.0F};
+    const Float3 normal{0.0F, 0.0F, 1.0F};
+    const auto single = invisible_places::water::EvaluateRainImpact(
+        firstGrid,
+        WaterSurfaceRole::Rock,
+        point,
+        normal,
+        1.0F);
+    const auto combined = invisible_places::water::EvaluateRainImpact(
+        bothGrid,
+        WaterSurfaceRole::Rock,
+        point,
+        normal,
+        1.0F);
+    const auto combinedReversed = invisible_places::water::EvaluateRainImpact(
+        reversedGrid,
+        WaterSurfaceRole::Rock,
+        point,
+        normal,
+        1.0F);
+    const float firstValue =
+        invisible_places::water::EvaluateRockRainImpactValue(
+            first,
+            point,
+            normal,
+            1.0F,
+            settings) *
+        first.energy;
+    const float secondValue =
+        invisible_places::water::EvaluateRockRainImpactValue(
+            second,
+            point,
+            normal,
+            1.0F,
+            settings) *
+        second.energy;
+    const float expectedUnion = std::max(
+        std::max(firstValue, secondValue),
+        1.0F -
+            (1.0F - std::clamp(firstValue, 0.0F, 1.0F)) *
+                (1.0F - std::clamp(secondValue, 0.0F, 1.0F)));
+
+    CHECK(single.opacity == Catch::Approx(firstValue * 0.18F));
+    CHECK(single.emission == Catch::Approx(firstValue * 0.11F));
+    CHECK(single.sizeScale == Catch::Approx(1.0F + firstValue * 0.16F));
+    CHECK(single.colourBlend == Catch::Approx(firstValue * 0.42F));
+    CHECK(combined.opacity == Catch::Approx(expectedUnion * 0.18F));
+    CHECK(combined.emission == Catch::Approx(expectedUnion * 0.11F));
+    CHECK(combined.sizeScale ==
+          Catch::Approx(1.0F + expectedUnion * 0.16F));
+    CHECK(combined.colourBlend ==
+          Catch::Approx(expectedUnion * 0.42F));
+    CHECK(combined.opacity > single.opacity);
+    CHECK(combined.emission > single.emission);
+    CHECK(combined.sizeScale > single.sizeScale);
+    CHECK(combined.colourBlend > single.colourBlend);
+    CHECK(combined.opacity ==
+          Catch::Approx(combinedReversed.opacity).margin(1.0e-6F));
+    CHECK(combined.emission ==
+          Catch::Approx(combinedReversed.emission).margin(1.0e-6F));
+    CHECK(combined.sizeScale ==
+          Catch::Approx(combinedReversed.sizeScale).margin(1.0e-6F));
+    CHECK(combined.colourBlend ==
+          Catch::Approx(combinedReversed.colourBlend).margin(1.0e-6F));
+
+    for (const float time : {0.65F, 1.0F, 2.5F, 4.0F}) {
+        const auto singleAtTime =
+            invisible_places::water::BuildRainImpactGrid(
+                firstOnly,
+                {},
+                time,
+                4.0F,
+                settings);
+        const auto bothAtTime =
+            invisible_places::water::BuildRainImpactGrid(
+                both,
+                {},
+                time,
+                4.0F,
+                settings);
+        for (int sample = -6; sample <= 6; ++sample) {
+            const Float3 samplePoint{
+                static_cast<float>(sample) * 0.01F,
+                0.0F,
+                0.0F};
+            const auto prior = invisible_places::water::EvaluateRainImpact(
+                singleAtTime,
+                WaterSurfaceRole::Rock,
+                samplePoint,
+                normal,
+                time);
+            const auto added = invisible_places::water::EvaluateRainImpact(
+                bothAtTime,
+                WaterSurfaceRole::Rock,
+                samplePoint,
+                normal,
+                time);
+            INFO("time=" << time << ", sample=" << sample);
+            CHECK(added.opacity + 1.0e-7F >= prior.opacity);
+            CHECK(added.emission + 1.0e-7F >= prior.emission);
+            CHECK(added.sizeScale + 1.0e-7F >= prior.sizeScale);
+            CHECK(added.colourBlend + 1.0e-7F >= prior.colourBlend);
+        }
+    }
+
+    auto highEnergy = first;
+    highEnergy.position = {};
+    highEnergy.energy = 2.5F;
+    const std::vector<invisible_places::water::RainImpactEvent> highEvents{
+        highEnergy};
+    const auto highGrid = invisible_places::water::BuildRainImpactGrid(
+        highEvents,
+        {},
+        0.8F,
+        4.0F,
+        settings);
+    const float raw = invisible_places::water::EvaluateRockRainImpactValue(
+        highEnergy,
+        {},
+        normal,
+        0.8F,
+        settings) * highEnergy.energy;
+    REQUIRE(raw > 1.0F);
+    const auto high = invisible_places::water::EvaluateRainImpact(
+        highGrid,
+        WaterSurfaceRole::Rock,
+        {},
+        normal,
+        0.8F);
+    CHECK(high.opacity == Catch::Approx(raw * 0.18F));
+    CHECK(high.emission == Catch::Approx(raw * 0.11F));
+    CHECK(high.sizeScale == Catch::Approx(1.0F + raw * 0.16F));
+    CHECK(high.colourBlend == Catch::Approx(raw * 0.42F));
+}
+
+TEST_CASE(
+    "saturated ROCK cells retain a continuous high-priority impact across grid boundaries",
+    "[water][rain][effects][grid]") {
+    std::vector<invisible_places::water::RainImpactEvent> events;
+    constexpr float y = 0.007F;
+    for (std::uint32_t index = 0U; index < 20U; ++index) {
+        events.push_back({
+            .position = {-0.020F, y, 0.0F},
+            .birthTimeSeconds = 0.0F,
+            .normal = {0.0F, 0.0F, 1.0F},
+            .radiusMeters = 0.019F,
+            .role = WaterSurfaceRole::Rock,
+            .lifetimeSeconds = 5.0F,
+            .energy = 0.05F,
+            .seed = index,
+        });
+    }
+    const auto primaryIndex = static_cast<std::uint32_t>(events.size());
+    events.push_back({
+        .position = {0.0F, y, 0.0F},
+        .birthTimeSeconds = 0.20F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.10F,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = 5.0F,
+        .energy = 2.5F,
+        .seed = 77U,
+    });
+
+    auto smooth = invisible_places::water::RainRockImpactSettings{};
+    smooth.edgeBreakup = 0.0F;
+    smooth.spreadSpeed = 6.0F;
+    smooth.centreFalloff = 1.0F;
+    const auto grid = invisible_places::water::BuildRainImpactGrid(
+        events,
+        {},
+        1.0F,
+        4.0F,
+        smooth);
+    REQUIRE(grid.overflowCount > 0U);
+    const auto cellAt = [&](float x) -> const auto& {
+        const auto cellX = static_cast<std::uint32_t>(
+            std::floor((x - grid.origin.x) / grid.cellSizeMeters));
+        const auto cellY = static_cast<std::uint32_t>(
+            std::floor((y - grid.origin.y) / grid.cellSizeMeters));
+        return grid.cells[
+            static_cast<std::size_t>(cellY) * grid.dimension + cellX];
+    };
+    const auto containsPrimary = [&](const auto& cell) {
+        return std::find(
+                   cell.rock.begin(),
+                   cell.rock.end(),
+                   primaryIndex) !=
+               cell.rock.end();
+    };
+    CHECK(containsPrimary(cellAt(-0.001F)));
+    CHECK(containsPrimary(cellAt(0.001F)));
+
+    const auto left = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {-0.001F, y, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.0F);
+    const auto right = invisible_places::water::EvaluateRainImpact(
+        grid,
+        WaterSurfaceRole::Rock,
+        {0.001F, y, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.0F);
+    CHECK(left.colourBlend > 0.05F);
+    CHECK(right.colourBlend > 0.05F);
+    CHECK(left.colourBlend == Catch::Approx(right.colourBlend).margin(0.01F));
+}
+
+TEST_CASE(
+    "SAND rain separates flooded ripples from compact dry uphill splashes",
+    "[water][rain][effects][sand]") {
+    const invisible_places::water::RainImpactEvent event{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.10F,
+        .role = WaterSurfaceRole::Sand,
+        .lifetimeSeconds = 1.0F,
+        .energy = 1.0F,
+        .seed = 11U,
+    };
+    constexpr float time = 0.20F;
+    const auto wetRing = invisible_places::water::EvaluateSandRainImpactValue(
+        event,
+        {0.030F, 0.0F, 0.0F},
+        time,
+        1.0F);
+    const auto dryCentre = invisible_places::water::EvaluateSandRainImpactValue(
+        event,
+        {0.0F, 0.0F, 0.0F},
+        time,
+        0.0F);
+    const auto dryMid = invisible_places::water::EvaluateSandRainImpactValue(
+        event,
+        {0.012F, 0.0F, -0.001F},
+        time,
+        0.0F);
+    const auto dryOutside = invisible_places::water::EvaluateSandRainImpactValue(
+        event,
+        {0.026F, 0.0F, 0.0F},
+        time,
+        0.0F);
+    const auto blended = invisible_places::water::EvaluateSandRainImpactValue(
+        event,
+        {0.030F, 0.0F, 0.0F},
+        time,
+        0.5F);
+    CHECK(wetRing > 0.25F);
+    CHECK(dryCentre > dryMid);
+    CHECK(dryMid > dryOutside);
+    CHECK(dryOutside == Catch::Approx(0.0F).margin(1.0e-5F));
+    CHECK(blended > dryOutside);
+    CHECK(blended < wetRing);
 }
 
 TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][rain][effects]") {
@@ -1796,6 +2471,49 @@ TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][r
     CHECK(evaluatorInsideReducedEdge > 0.79F);
     CHECK(evaluatorOutsideReducedEdge == Catch::Approx(0.0F).margin(1.0e-6F));
     CHECK(flatLeftLate.colourBlend == Catch::Approx(flatRightLate.colourBlend));
+}
+
+TEST_CASE(
+    "ROCK rain response fades smoothly from impact centre to edge",
+    "[water][rain][effects][rock]") {
+    invisible_places::water::RainRockImpactSettings settings;
+    settings.edgeBreakup = 0.0F;
+    settings.spreadSpeed = 6.0F;
+    settings.centreFalloff = 1.0F;
+    settings.heightBias = 0.0F;
+    const invisible_places::water::RainImpactEvent event{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = 0.12F,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = 5.0F,
+        .energy = 1.0F,
+        .seed = 4U,
+    };
+    const float effectiveRadius =
+        event.radiusMeters * std::sqrt(2.0F / 3.0F);
+    const float centre = invisible_places::water::EvaluateRockRainImpactValue(
+        event,
+        {0.0F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.5F,
+        settings);
+    const float middle = invisible_places::water::EvaluateRockRainImpactValue(
+        event,
+        {effectiveRadius * 0.45F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.5F,
+        settings);
+    const float edge = invisible_places::water::EvaluateRockRainImpactValue(
+        event,
+        {effectiveRadius * 0.82F, 0.0F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        1.5F,
+        settings);
+    CHECK(centre > middle);
+    CHECK(middle > edge);
+    CHECK(edge >= 0.0F);
 }
 
 TEST_CASE("rock rain edge breakup is seeded, irregular, and inward only", "[water][rain][effects]") {

@@ -133,7 +133,7 @@ json SerializeWaterFieldSettings(const WaterFieldSettings& settings);
 WaterFieldSettings ParseWaterFieldSettings(const json& settingsJson);
 json SerializeWaterFieldTrailSettings(const WaterFieldTrailSettings& settings);
 WaterFieldTrailSettings ParseWaterFieldTrailSettings(const json& settingsJson);
-json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& settings);
+json SerializeWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings);
 WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& settingsJson);
 json SerializeWaterRainSettings(
     const RainRuntimeSettings& settings,
@@ -3410,7 +3410,7 @@ WaterSeepageNode ParseWaterSeepageNode(const json& nodeJson) {
         node.widthMeters = std::max(legacyStartWidth, legacyEndWidth);
     }
     node.widthMeters = std::max(0.0F, node.widthMeters);
-    // These aliases keep old code paths readable during migration; schema-18
+    // These aliases keep old code paths readable during migration; schema-19
     // writes only the live width and explicit topology limits above.
     node.startWidthMeters = node.widthMeters;
     node.endWidthMeters = node.widthMeters;
@@ -4013,26 +4013,32 @@ invisible_places::water::WaterDynamicMeshEmitterMotion ParseWaterDynamicMeshEmit
     return motion;
 }
 
-json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& settings) {
+json SerializeWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings) {
+    settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+        std::move(settings));
     json settingsJson{
         {"enabled", settings.enabled},
         {"gpu_preview_enabled", settings.gpuPreviewEnabled},
         {"show_trails", settings.showTrails},
-        {"automatic_sources", settings.automaticSources},
         {"cache_cell_size_meters", settings.cacheCellSizeMeters},
         {"projection_search_radius_meters", settings.projectionSearchRadiusMeters},
         {"ambiguity_height_meters", settings.ambiguityHeightMeters},
         {"particle_capacity", settings.particleCapacity},
         {"history_length", settings.historyLength},
-        {"source_band_width_meters", settings.sourceBandWidthMeters},
         {"dry_concavity_focus", settings.dryConcavityFocus},
         {"rain_spawn_spread", settings.rainSpawnSpread},
+        {"rain_distributed_source_fraction", settings.rainDistributedSourceFraction},
         {"preview_particle_limit", settings.previewParticleLimit},
         {"final_particle_limit", settings.finalParticleLimit},
         {"trail_length_meters", settings.trailLengthMeters},
         {"step_meters", settings.stepMeters},
         {"trail_width_meters", settings.trailWidthMeters},
         {"trail_streak_length_meters", settings.trailStreakLengthMeters},
+        {"trail_opacity_dry", settings.trailOpacityDry},
+        {"trail_opacity_wet", settings.trailOpacityWet},
+        {"trail_emission_dry", settings.trailEmissionDry},
+        {"trail_emission_wet", settings.trailEmissionWet},
+        {"trail_exposure", settings.trailExposure},
         {"surface_offset_meters", settings.surfaceOffsetMeters},
         {"speed_meters_per_second", settings.speedMetersPerSecond},
         {"downhill_weight", settings.downhillWeight},
@@ -4085,18 +4091,6 @@ json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& s
         {"particle_preset_name", settings.particlePresetName},
         {"trail_profile_name", settings.trailProfileName},
     };
-    if (!settings.attractors.empty()) {
-        settingsJson["attractors"] = json::array();
-        for (const auto& attractor : settings.attractors) {
-            settingsJson["attractors"].push_back(SerializeWaterDynamicMeshAttractor(attractor));
-        }
-    }
-    if (!settings.emitterMotions.empty()) {
-        settingsJson["emitter_motions"] = json::array();
-        for (const auto& motion : settings.emitterMotions) {
-            settingsJson["emitter_motions"].push_back(SerializeWaterDynamicMeshEmitterMotion(motion));
-        }
-    }
     return settingsJson;
 }
 
@@ -4130,12 +4124,18 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
     settings.sourceBandWidthMeters = settingsJson.value(
         "source_band_width_meters",
         settings.sourceBandWidthMeters);
+    settings.sourceBandFraction = settingsJson.value(
+        "source_band_fraction",
+        settings.sourceBandFraction);
     settings.dryConcavityFocus = settingsJson.value(
         "dry_concavity_focus",
         settings.dryConcavityFocus);
     settings.rainSpawnSpread = settingsJson.value(
         "rain_spawn_spread",
         settings.rainSpawnSpread);
+    settings.rainDistributedSourceFraction = settingsJson.value(
+        "rain_distributed_source_fraction",
+        settings.rainDistributedSourceFraction);
     settings.previewParticleLimit = std::clamp<std::uint32_t>(
         settingsJson.value("preview_particle_limit", settings.previewParticleLimit),
         1U,
@@ -4157,6 +4157,21 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
         settingsJson.value("trail_streak_length_meters", settings.trailStreakLengthMeters),
         0.001F,
         5.0F);
+    settings.trailOpacityDry = settingsJson.value(
+        "trail_opacity_dry",
+        settings.trailOpacityDry);
+    settings.trailOpacityWet = settingsJson.value(
+        "trail_opacity_wet",
+        settings.trailOpacityWet);
+    settings.trailEmissionDry = settingsJson.value(
+        "trail_emission_dry",
+        settings.trailEmissionDry);
+    settings.trailEmissionWet = settingsJson.value(
+        "trail_emission_wet",
+        settings.trailEmissionWet);
+    settings.trailExposure = settingsJson.value(
+        "trail_exposure",
+        settings.trailExposure);
     settings.surfaceOffsetMeters = std::clamp(
         settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters),
         -1.0F,
@@ -4300,6 +4315,43 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
         std::move(settings));
 }
 
+WaterDynamicMeshFlowSettings MigrateLegacyAutomaticMeshFlowDefaults(
+    WaterDynamicMeshFlowSettings settings) {
+    // Pre-schema-45 Mesh Flow allowed ordinary Flow emitters and inherited
+    // aggressive path/profile values. Once sources become scene-wide and
+    // automatic those values create the bright, SampleScene-sized burst that
+    // this migration is intended to retire. Preserve authored enablement,
+    // capacity, contact response, and scenario state while adopting the new
+    // subtle fixed-capacity routing/presentation defaults.
+    settings.automaticSources = true;
+    settings.attractors.clear();
+    settings.emitterMotions.clear();
+    settings.sourceBandWidthMeters = 0.75F;
+    settings.sourceBandFraction = 0.04F;
+    settings.dryConcavityFocus = 0.90F;
+    settings.rainSpawnSpread = 0.75F;
+    settings.rainDistributedSourceFraction = 0.55F;
+    settings.trailWidthMeters = 0.0025F;
+    settings.trailStreakLengthMeters = 0.030F;
+    settings.surfaceOffsetMeters = 0.003F;
+    settings.trailOpacityDry = 0.025F;
+    settings.trailOpacityWet = 0.14F;
+    settings.trailEmissionDry = 0.04F;
+    settings.trailEmissionWet = 0.45F;
+    settings.trailExposure = 1.25F;
+    settings.speedMetersPerSecond = 0.26F;
+    settings.downhillWeight = 1.75F;
+    settings.inertia = 0.88F;
+    settings.particleNoiseStrength = 0.10F;
+    settings.particleNoiseScaleMeters = 0.45F;
+    settings.particleNoiseSpeed = 0.18F;
+    settings.sharedWindStrength = 0.035F;
+    settings.sharedWindScaleMeters = 3.0F;
+    settings.sharedWindSpeed = 0.025F;
+    return invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+        std::move(settings));
+}
+
 WaterDynamicMeshFlowSettings ProjectLevelWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings) {
     settings.meshPath.clear();
     settings.attractors.clear();
@@ -4317,8 +4369,6 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
         {"water_field_layers", json::array()},
         {"water_ripple_runtime_caches", json::array()},
         {"dynamic_mesh_path", state.dynamicMeshPath.generic_string()},
-        {"dynamic_mesh_attractors", json::array()},
-        {"dynamic_mesh_emitter_motions", json::array()},
     };
     for (const auto& emitter : state.emitters) {
         stateJson["water_emitters"].push_back(SerializeWaterEmitter(emitter));
@@ -4348,12 +4398,6 @@ json SerializeWaterSceneState(const WaterSceneStateDocument& state) {
         if (ShouldSerializeWaterRippleRuntimeCache(cache)) {
             stateJson["water_ripple_runtime_caches"].push_back(SerializeWaterRippleRuntimeCache(cache));
         }
-    }
-    for (const auto& attractor : state.dynamicMeshAttractors) {
-        stateJson["dynamic_mesh_attractors"].push_back(SerializeWaterDynamicMeshAttractor(attractor));
-    }
-    for (const auto& motion : state.dynamicMeshEmitterMotions) {
-        stateJson["dynamic_mesh_emitter_motions"].push_back(SerializeWaterDynamicMeshEmitterMotion(motion));
     }
     return stateJson;
 }
@@ -4440,9 +4484,7 @@ bool WaterSceneStateHasPayload(const WaterSceneStateDocument& state) {
            (state.pathCache.has_value() && !state.pathCache->branches.empty()) ||
            state.pathCacheManifest.has_value() ||
            !state.rippleRuntimeCaches.empty() ||
-           !state.dynamicMeshPath.empty() ||
-           !state.dynamicMeshAttractors.empty() ||
-           !state.dynamicMeshEmitterMotions.empty();
+           !state.dynamicMeshPath.empty();
 }
 
 WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocument& document) {
@@ -4457,8 +4499,6 @@ WaterSceneStateDocument MakeDefaultWaterSceneStateFromProject(const ProjectDocum
     state.pathCacheManifest = document.waterPathCacheManifest;
     state.rippleRuntimeCaches = document.waterRippleRuntimeCaches;
     state.dynamicMeshPath = document.waterDynamicMeshFlowSettings.meshPath;
-    state.dynamicMeshAttractors = document.waterDynamicMeshFlowSettings.attractors;
-    state.dynamicMeshEmitterMotions = document.waterDynamicMeshFlowSettings.emitterMotions;
     return state;
 }
 
@@ -5859,6 +5899,112 @@ const ScenePointCloudGroupDocument* FindSceneGroupDocument(
     return it == document.scenePointCloudGroups.end() ? nullptr : &*it;
 }
 
+std::string SelectedLayerSceneGroupName(const ProjectDocument& document) {
+    if (document.selectedLayerPath.empty()) {
+        return {};
+    }
+    const auto layerIt = std::find_if(
+        document.layers.begin(),
+        document.layers.end(),
+        [&](const ProjectLayerDocument& layer) {
+            return SerializedPathsMatch(layer.sourcePath, document.selectedLayerPath) ||
+                   SerializedPathsMatch(
+                       layer.selectedSceneVariantPath,
+                       document.selectedLayerPath);
+        });
+    return layerIt == document.layers.end()
+               ? std::string{}
+               : TrimAsciiWhitespace(layerIt->sceneGroupName);
+}
+
+std::string UniqueVisibleSceneGroupName(const ProjectDocument& document) {
+    const ScenePointCloudGroupDocument* visibleGroup = nullptr;
+    for (const auto& group : document.scenePointCloudGroups) {
+        if (!group.displayVisible || TrimAsciiWhitespace(group.sceneGroupName).empty()) {
+            continue;
+        }
+        if (visibleGroup != nullptr) {
+            return {};
+        }
+        visibleGroup = &group;
+    }
+    return visibleGroup == nullptr
+               ? std::string{}
+               : TrimAsciiWhitespace(visibleGroup->sceneGroupName);
+}
+
+std::string ResolveActiveWaterSceneGroupName(const ProjectDocument& document) {
+    if (auto explicitScene =
+            TrimAsciiWhitespace(document.activeWaterSceneGroupName);
+        !explicitScene.empty()) {
+        return explicitScene;
+    }
+    if (auto selectedScene = SelectedLayerSceneGroupName(document);
+        !selectedScene.empty()) {
+        return selectedScene;
+    }
+    if (auto visibleScene = UniqueVisibleSceneGroupName(document);
+        !visibleScene.empty()) {
+        return visibleScene;
+    }
+    const auto defaultIt = std::find_if(
+        document.waterSceneStates.begin(),
+        document.waterSceneStates.end(),
+        [](const WaterSceneStateDocument& state) {
+            return TrimAsciiWhitespace(state.sceneGroupName) == "Default";
+        });
+    if (defaultIt != document.waterSceneStates.end()) {
+        return "Default";
+    }
+    if (!document.waterSceneStates.empty()) {
+        return TrimAsciiWhitespace(document.waterSceneStates.front().sceneGroupName);
+    }
+    if (document.scenePointCloudGroups.size() == 1U) {
+        return TrimAsciiWhitespace(
+            document.scenePointCloudGroups.front().sceneGroupName);
+    }
+    return "Default";
+}
+
+const WaterSceneStateDocument* FindActiveWaterSceneState(
+    const ProjectDocument& document) {
+    const auto sceneGroupName = ResolveActiveWaterSceneGroupName(document);
+    const auto it = std::find_if(
+        document.waterSceneStates.begin(),
+        document.waterSceneStates.end(),
+        [&](const WaterSceneStateDocument& state) {
+            return TrimAsciiWhitespace(state.sceneGroupName) == sceneGroupName;
+        });
+    return it == document.waterSceneStates.end() ? nullptr : &*it;
+}
+
+void ApplyActiveWaterSceneState(ProjectDocument* document) {
+    if (document == nullptr) {
+        return;
+    }
+    document->activeWaterSceneGroupName =
+        ResolveActiveWaterSceneGroupName(*document);
+    const auto* activeSceneState = FindActiveWaterSceneState(*document);
+    if (activeSceneState == nullptr) {
+        return;
+    }
+    document->waterEmitters = activeSceneState->emitters;
+    document->waterManualFlowPaths = activeSceneState->manualFlowPaths;
+    document->waterSeepageNodes = activeSceneState->seepageNodes;
+    document->waterRippleLayers = activeSceneState->rippleLayers;
+    document->waterFieldLayers = activeSceneState->fieldLayers;
+    document->waterPathCache = activeSceneState->pathCache;
+    document->waterPathCacheManifest = activeSceneState->pathCacheManifest;
+    document->waterRippleRuntimeCaches = activeSceneState->rippleRuntimeCaches;
+    document->waterDynamicMeshFlowSettings.meshPath =
+        activeSceneState->dynamicMeshPath;
+    // Authored Mesh Flow attractors and ordinary Flow-emitter motions are
+    // migration-only input. Automatic Ground emergence must never acquire
+    // those legacy source overrides when a scene state becomes active.
+    document->waterDynamicMeshFlowSettings.attractors.clear();
+    document->waterDynamicMeshFlowSettings.emitterMotions.clear();
+}
+
 std::filesystem::path SceneCacheRootForWaterState(
     const ProjectDocument& document,
     const WaterSceneStateDocument& state,
@@ -5907,8 +6053,6 @@ WaterSceneStateDocument PrepareWaterSceneStateForSave(
     state.pathCacheManifest = sourceState.pathCacheManifest;
     state.rippleRuntimeCaches = sourceState.rippleRuntimeCaches;
     state.dynamicMeshPath = sourceState.dynamicMeshPath;
-    state.dynamicMeshAttractors = sourceState.dynamicMeshAttractors;
-    state.dynamicMeshEmitterMotions = sourceState.dynamicMeshEmitterMotions;
 
     if (!sourceState.pathCache.has_value()) {
         // A manifest without its validated payload is only a reference to
@@ -6024,9 +6168,12 @@ bool SaveProjectDocument(
     const ProjectDocument& document,
     const std::filesystem::path& outputPath,
     std::string* errorMessage) {
+    const auto activeWaterSceneGroupName =
+        ResolveActiveWaterSceneGroupName(document);
     json projectJson{
         {"schema_version", kProjectDocumentSchemaVersion},
         {"project_name", document.projectName},
+        {"active_water_scene_group", activeWaterSceneGroupName},
         {"selected_layer_path", document.selectedLayerPath.generic_string()},
         {"last_animation_path", document.lastAnimationPath.generic_string()},
         {"background_color", document.backgroundColor},
@@ -6103,6 +6250,7 @@ bool SaveProjectDocument(
         }
     } else {
         auto fallbackSceneState = MakeDefaultWaterSceneStateFromProject(document);
+        fallbackSceneState.sceneGroupName = activeWaterSceneGroupName;
         fallbackSceneState = PrepareWaterSceneStateForSave(document, fallbackSceneState, outputPath);
         if (WaterSceneStateHasPayload(fallbackSceneState)) {
             projectJson["water_scene_states"].push_back(
@@ -6196,6 +6344,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
     const bool defaultManualSurfaceGuide =
         document.schemaVersion >= kManualFlowSurfaceGuideProjectSchemaVersion;
     document.projectName = projectJson->value("project_name", std::string{"Invisible Places"});
+    document.activeWaterSceneGroupName = TrimAsciiWhitespace(
+        projectJson->value("active_water_scene_group", std::string{}));
     document.selectedLayerPath = projectJson->value("selected_layer_path", std::string{});
     document.lastAnimationPath = projectJson->value("last_animation_path", std::string{});
     document.backgroundColor =
@@ -6336,6 +6486,11 @@ std::optional<ProjectDocument> LoadProjectDocument(
     if (projectJson->contains("water_dynamic_mesh_flow_settings")) {
         document.waterDynamicMeshFlowSettings =
             ParseWaterDynamicMeshFlowSettings(projectJson->at("water_dynamic_mesh_flow_settings"));
+        if (document.schemaVersion < 45U) {
+            document.waterDynamicMeshFlowSettings =
+                MigrateLegacyAutomaticMeshFlowDefaults(
+                    std::move(document.waterDynamicMeshFlowSettings));
+        }
     }
     if (projectJson->contains("water_rain_settings")) {
         document.waterRainSettings = ParseWaterRainSettings(projectJson->at("water_rain_settings"));
@@ -6481,20 +6636,6 @@ std::optional<ProjectDocument> LoadProjectDocument(
         }
     }
     LoadWaterPathSidecars(inputPath, &document);
-    if (!document.waterSceneStates.empty()) {
-        const auto& activeSceneState = document.waterSceneStates.front();
-        document.waterEmitters = activeSceneState.emitters;
-        document.waterManualFlowPaths = activeSceneState.manualFlowPaths;
-        document.waterSeepageNodes = activeSceneState.seepageNodes;
-        document.waterRippleLayers = activeSceneState.rippleLayers;
-        document.waterFieldLayers = activeSceneState.fieldLayers;
-        document.waterPathCache = activeSceneState.pathCache;
-        document.waterPathCacheManifest = activeSceneState.pathCacheManifest;
-        document.waterRippleRuntimeCaches = activeSceneState.rippleRuntimeCaches;
-        document.waterDynamicMeshFlowSettings.meshPath = activeSceneState.dynamicMeshPath;
-        document.waterDynamicMeshFlowSettings.attractors = activeSceneState.dynamicMeshAttractors;
-        document.waterDynamicMeshFlowSettings.emitterMotions = activeSceneState.dynamicMeshEmitterMotions;
-    }
     if (projectJson->contains("water_visual_settings")) {
         document.waterVisualSettings = ParseWaterVisualSettings(projectJson->at("water_visual_settings"));
         if (!projectJson->contains("water_animation_trail_settings")) {
@@ -6662,6 +6803,9 @@ std::optional<ProjectDocument> LoadProjectDocument(
         document.waterPathCache = PruneSettledWaterPathCache(
             document.waterPathCache.value(),
             document.waterEmitters);
+    }
+    if (!document.waterSceneStates.empty()) {
+        ApplyActiveWaterSceneState(&document);
     }
     if (document.schemaVersion < kProjectDocumentSchemaVersion) {
         document.schemaVersion = kProjectDocumentSchemaVersion;
@@ -6865,6 +7009,11 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
     if (sourcesJson->contains("water_dynamic_mesh_flow_settings")) {
         document.dynamicMeshFlowSettings =
             ParseWaterDynamicMeshFlowSettings(sourcesJson->at("water_dynamic_mesh_flow_settings"));
+        if (document.schemaVersion < 19U) {
+            document.dynamicMeshFlowSettings =
+                MigrateLegacyAutomaticMeshFlowDefaults(
+                    std::move(document.dynamicMeshFlowSettings));
+        }
     }
     if (sourcesJson->contains("temp_water_caustic_look_settings")) {
         document.tempCausticLookSettings =

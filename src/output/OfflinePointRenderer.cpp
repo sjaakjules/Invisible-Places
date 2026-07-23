@@ -60,6 +60,37 @@ float Clamp01(float value) {
 float SmoothStep(float edge0, float edge1, float value);
 glm::vec3 SurfaceMotionNoiseVector(const glm::vec3& position, float time);
 
+float SandRainWaterMask(
+    const invisible_places::renderer::pointcloud::PointCloudStyleState& style,
+    float worldZ) {
+    if (!invisible_places::renderer::pointcloud::
+            PointCloudStyleHasShorelineWaveRegion(style)) {
+        return 1.0F;
+    }
+    const bool heightFoam =
+        style.shorelineWaveAlgorithm ==
+        invisible_places::renderer::pointcloud::
+            PointCloudShorelineWaveAlgorithm::HeightFoam;
+    const float boundaryZ = heightFoam
+        ? style.shorelineHeightFoam.runupZ
+        : style.shorelineBoundaryZ;
+    const float edgeFade = std::max(
+        0.001F,
+        heightFoam
+            ? std::clamp(
+                  style.shorelineHeightFoam.edgeFadeMeters,
+                  0.0F,
+                  10.0F)
+            : std::clamp(
+                  style.shorelineEdgeFadeMeters,
+                  0.0F,
+                  10.0F));
+    return SmoothStep(
+        -edgeFade,
+        edgeFade,
+        boundaryZ - worldZ);
+}
+
 glm::vec3 ToGlm(const invisible_places::io::Float3& value) {
     return {value.x, value.y, value.z};
 }
@@ -1871,7 +1902,13 @@ bool BuildOfflinePointSample(
                   layer.rainCollisionRole,
                   FromGlm(sample->worldCenter),
                   FromGlm(rainImpactNormal),
-                  stylisationTimeSeconds)
+                  stylisationTimeSeconds,
+                  layer.rainCollisionRole ==
+                          invisible_places::water::WaterSurfaceRole::Sand
+                      ? SandRainWaterMask(
+                            layer.style,
+                            sample->worldCenter.z)
+                      : 1.0F)
             : invisible_places::water::RainImpactEffect{};
     const float waterParticleSizeScale =
         waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
@@ -2645,7 +2682,13 @@ void RenderFastBasicPointCloudTile(
                           layer.rainCollisionRole,
                           FromGlm(worldPosition),
                           FromGlm(rainNormal),
-                          stylisationTimeSeconds)
+                          stylisationTimeSeconds,
+                          layer.rainCollisionRole ==
+                                  invisible_places::water::WaterSurfaceRole::Sand
+                              ? SandRainWaterMask(
+                                    layer.style,
+                                    worldPosition.z)
+                              : 1.0F)
                     : invisible_places::water::RainImpactEffect{};
             glm::vec3 color =
                 glm::mix(

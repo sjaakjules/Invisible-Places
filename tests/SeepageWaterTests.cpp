@@ -1373,6 +1373,91 @@ TEST_CASE("Mesh Flow Rain envelopes preserve scenario rise and recession",
               longerPersistence) == Approx(5.0F));
 }
 
+TEST_CASE("Mesh Flow export sampling uses deterministic fixed ticks and bounded seek pre-roll",
+          "[water][mesh-flow][animation][export]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterMeshFlowSampleTimeline;
+    using invisible_places::water::WaterMeshFlowSampleTick;
+
+    constexpr float stepSeconds = 1.0F / 30.0F;
+    const auto direct = BuildWaterMeshFlowSampleTimeline(
+        std::nullopt,
+        60.0F,
+        24U,
+        stepSeconds);
+    REQUIRE(direct.size() == 25U);
+    CHECK(direct.front().resetSimulation);
+    CHECK(direct.front().deltaSeconds == Approx(0.0F));
+    CHECK(direct.front().timeSeconds == Approx(59.2F).margin(1.0e-4F));
+    CHECK_FALSE(direct.back().resetSimulation);
+    CHECK(direct.back().deltaSeconds == Approx(stepSeconds));
+    CHECK(direct.back().timeSeconds == Approx(60.0F).margin(1.0e-4F));
+
+    const auto targetTick = WaterMeshFlowSampleTick(60.0F, stepSeconds);
+    CHECK(targetTick == 1'800U);
+    CHECK(BuildWaterMeshFlowSampleTimeline(
+              targetTick,
+              60.0F,
+              24U,
+              stepSeconds)
+              .empty());
+
+    const auto forward = BuildWaterMeshFlowSampleTimeline(
+        targetTick,
+        60.1F,
+        24U,
+        stepSeconds);
+    REQUIRE(forward.size() == 3U);
+    CHECK(std::none_of(
+        forward.begin(),
+        forward.end(),
+        [](const auto& step) {
+            return step.resetSimulation;
+        }));
+    CHECK(forward.back().timeSeconds == Approx(60.1F).margin(1.0e-4F));
+
+    const auto backward = BuildWaterMeshFlowSampleTimeline(
+        WaterMeshFlowSampleTick(60.1F, stepSeconds),
+        12.0F,
+        24U,
+        stepSeconds);
+    REQUIRE(backward.size() == 25U);
+    CHECK(backward.front().resetSimulation);
+    CHECK(backward.back().timeSeconds == Approx(12.0F).margin(1.0e-4F));
+
+    // Asking for intermediate temporal samples cannot change the fixed tick
+    // sequence needed to reach the final sample.
+    const auto whole = BuildWaterMeshFlowSampleTimeline(
+        WaterMeshFlowSampleTick(2.0F, stepSeconds),
+        2.2F,
+        24U,
+        stepSeconds);
+    const auto firstHalf = BuildWaterMeshFlowSampleTimeline(
+        WaterMeshFlowSampleTick(2.0F, stepSeconds),
+        2.1F,
+        24U,
+        stepSeconds);
+    const auto secondHalf = BuildWaterMeshFlowSampleTimeline(
+        WaterMeshFlowSampleTick(2.1F, stepSeconds),
+        2.2F,
+        24U,
+        stepSeconds);
+    std::vector<float> splitTimes;
+    for (const auto& step : firstHalf) {
+        splitTimes.push_back(step.timeSeconds);
+    }
+    for (const auto& step : secondHalf) {
+        splitTimes.push_back(step.timeSeconds);
+    }
+    REQUIRE(splitTimes.size() == whole.size());
+    for (std::size_t index = 0U;
+         index < whole.size();
+         ++index) {
+        CHECK(splitTimes[index] ==
+              Approx(whole[index].timeSeconds).margin(1.0e-6F));
+    }
+}
+
 TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live controls",
           "[water][mesh-flow][settings]") {
     using Catch::Approx;
@@ -1383,9 +1468,17 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     const auto defaults = DefaultWaterDynamicMeshFlowSettings();
     CHECK(defaults.particleCapacity == 4096U);
     CHECK(defaults.historyLength == 24U);
-    CHECK(defaults.speedMetersPerSecond == Approx(0.22F));
-    CHECK(defaults.surfaceOffsetMeters == Approx(0.006F));
-    CHECK(defaults.inertia == Approx(0.76F));
+    CHECK(defaults.sourceBandWidthMeters == Approx(0.75F));
+    CHECK(defaults.sourceBandFraction == Approx(0.04F));
+    CHECK(defaults.rainDistributedSourceFraction == Approx(0.55F));
+    CHECK(defaults.speedMetersPerSecond == Approx(0.26F));
+    CHECK(defaults.surfaceOffsetMeters == Approx(0.003F));
+    CHECK(defaults.inertia == Approx(0.88F));
+    CHECK(defaults.trailOpacityDry == Approx(0.025F));
+    CHECK(defaults.trailOpacityWet == Approx(0.14F));
+    CHECK(defaults.trailEmissionDry == Approx(0.04F));
+    CHECK(defaults.trailEmissionWet == Approx(0.45F));
+    CHECK(defaults.trailExposure == Approx(1.25F));
     CHECK(defaults.rockResponse.persistenceSeconds == Approx(2.5F));
     CHECK(defaults.vegetationResponse.twinkle == Approx(1.4F));
 
@@ -1398,9 +1491,9 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     invalid.vegetationResponse.twinkle = 9.0F;
     invalid.vegetationResponse.streamDepthMeters = 8.0F;
     const auto sanitized = SanitizeWaterDynamicMeshFlowSettings(invalid);
-    CHECK(sanitized.particleCapacity == 1U);
-    CHECK(sanitized.historyLength == 2U);
-    CHECK(sanitized.sourceBandWidthMeters == Approx(0.0F));
+    CHECK(sanitized.particleCapacity == 4096U);
+    CHECK(sanitized.historyLength == 24U);
+    CHECK(sanitized.sourceBandWidthMeters == Approx(0.75F));
     CHECK(sanitized.rockResponse.radiusMeters == Approx(0.75F));
     CHECK(sanitized.rockResponse.colourise.x == Approx(0.0F));
     CHECK(sanitized.vegetationResponse.twinkle == Approx(4.0F));
@@ -1418,6 +1511,153 @@ TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live contr
     changed.rockResponse.emissionAdd += 0.01F;
     CHECK(defaultFingerprint !=
           WaterDynamicMeshFlowSettingsFingerprint(changed));
+    changed = defaults;
+    changed.trailOpacityWet += 0.01F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
+
+    auto legacySources = defaults;
+    legacySources.automaticSources = false;
+    legacySources.particleCapacity = 8192U;
+    legacySources.historyLength = 48U;
+    legacySources.attractors.push_back({
+        .id = 17U,
+        .name = "Legacy Mesh attractor",
+        .position = {12.0F, 8.0F, 4.0F},
+        .radiusMeters = 2.0F,
+        .strength = 3.0F,
+        .enabled = true,
+    });
+    legacySources.emitterMotions.push_back({
+        .emitterId = 91U,
+        .name = "Legacy ordinary-Flow emitter motion",
+        .enabled = true,
+        .keyframes = {{
+            .timeSeconds = 1.0F,
+            .position = {40.0F, 30.0F, 20.0F},
+        }},
+    });
+    const auto automatic = SanitizeWaterDynamicMeshFlowSettings(legacySources);
+    CHECK(automatic.automaticSources);
+    CHECK(automatic.attractors.empty());
+    CHECK(automatic.emitterMotions.empty());
+    CHECK(automatic.particleCapacity == 4096U);
+    CHECK(automatic.historyLength == 24U);
+    CHECK(defaultFingerprint ==
+          WaterDynamicMeshFlowSettingsFingerprint(legacySources));
+}
+
+TEST_CASE("Mesh Flow light and heavy visual regimes preserve rills without topology work",
+          "[water][mesh-flow][visual][gpu]") {
+    using Catch::Approx;
+    using invisible_places::water::DefaultWaterDynamicMeshFlowSettings;
+    using invisible_places::water::EvaluateWaterDynamicMeshFlowVisualWeights;
+
+    const auto settings = DefaultWaterDynamicMeshFlowSettings();
+    const auto dryOpen = EvaluateWaterDynamicMeshFlowVisualWeights(
+        settings,
+        0.0F,
+        0.0F,
+        1.0F);
+    const auto dryRill = EvaluateWaterDynamicMeshFlowVisualWeights(
+        settings,
+        1.0F,
+        0.0F,
+        1.0F);
+    const auto heavyOpen = EvaluateWaterDynamicMeshFlowVisualWeights(
+        settings,
+        0.0F,
+        1.0F,
+        1.0F);
+    const auto heavyRill = EvaluateWaterDynamicMeshFlowVisualWeights(
+        settings,
+        1.0F,
+        1.0F,
+        1.0F);
+
+    // Light flow is overwhelmingly selected from convergent/concave cells.
+    CHECK(dryRill.automaticSpawnAcceptance >
+          dryOpen.automaticSpawnAcceptance * 10.0F);
+    CHECK(dryRill.trailProminence >
+          dryOpen.trailProminence * 7.0F);
+
+    // Heavy flow admits distributed understory trickles while preserving a
+    // clearly stronger, wider, longer rill signal in convergent cells.
+    CHECK(heavyOpen.automaticSpawnAcceptance == Approx(1.0F));
+    CHECK(heavyRill.automaticSpawnAcceptance == Approx(1.0F));
+    // The flat +X entry band keeps a stable sub-pixel coverage floor; the
+    // fixed dry/wet opacity and emission controls provide the intensity
+    // separation without a second visibility suppression.
+    CHECK(heavyOpen.trailProminence ==
+          Approx(dryOpen.trailProminence));
+    CHECK(heavyRill.trailProminence >
+          heavyOpen.trailProminence * 2.0F);
+    CHECK(heavyRill.trailWidthScale > heavyOpen.trailWidthScale * 1.5F);
+    CHECK(heavyRill.trailStreakScale > heavyOpen.trailStreakScale * 1.3F);
+
+    // Rill noise is suppressed rather than removed, keeping paths coherent
+    // without turning them into regular splines.
+    CHECK(heavyRill.directionalNoiseScale < dryRill.directionalNoiseScale);
+    CHECK(heavyRill.directionalNoiseScale > 0.20F);
+    CHECK(heavyOpen.directionalNoiseScale == Approx(1.0F));
+
+    const auto weakCacheRill = EvaluateWaterDynamicMeshFlowVisualWeights(
+        settings,
+        1.0F,
+        1.0F,
+        0.0F);
+    CHECK(weakCacheRill.trailProminence < heavyRill.trailProminence);
+    CHECK(weakCacheRill.trailProminence > 0.45F);
+}
+
+TEST_CASE("Mesh Flow dry entries follow the vegetation-supported positive-X edge",
+          "[water][mesh-flow][ground][entry]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterDynamicMeshFlowGroundEntries;
+    using invisible_places::water::WaterGroundCell;
+    using invisible_places::water::WaterSurfaceCache;
+    using invisible_places::water::kWaterGroundVegetationSupportedFlag;
+
+    WaterSurfaceCache cache;
+    cache.resolutionMeters = 0.010F;
+    const auto cell =
+        [](std::int32_t x,
+           std::int32_t y,
+           std::uint32_t component,
+           bool vegetationSupported) {
+            WaterGroundCell result;
+            result.cellX = x;
+            result.cellY = y;
+            result.componentId = component;
+            result.flags = vegetationSupported
+                               ? kWaterGroundVegetationSupportedFlag
+                               : 0U;
+            result.connectivityMask = 1U;
+            return result;
+        };
+    cache.groundCells = {
+        cell(0, 0, 1U, false),
+        cell(50, 0, 1U, true),
+        cell(60, 0, 1U, true),
+        // Bare sampled Ground continues 1.40 m beyond the vegetation. The
+        // former component-wide +X anchor incorrectly discarded both valid
+        // vegetation-supported entries.
+        cell(200, 0, 1U, false),
+        cell(220, 0, 2U, false),
+        // A vegetation-supported but disconnected column is not a valid
+        // automatic route source even when it is the local +X extreme.
+        cell(300, 0, 3U, true),
+    };
+    cache.groundCells.back().connectivityMask = 0U;
+
+    const auto entries = BuildWaterDynamicMeshFlowGroundEntries(cache);
+    REQUIRE(entries.size() == 2U);
+    CHECK(entries[0].cellX == 60);
+    CHECK(entries[0].edgeDistanceMeters == Approx(0.0F));
+    CHECK(entries[1].cellX == 50);
+    CHECK(entries[1].edgeDistanceMeters == Approx(0.10F));
+    CHECK(entries[1].edgeDistanceFraction ==
+          Approx(10.0F / 201.0F));
 }
 
 TEST_CASE("Water Flow activity combines keyed level and Rain response deterministically", "[water][flow][scenario][animation]") {

@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "rain_impact_rock_model.glsl"
+#include "rain_impact_sand_model.glsl"
 
 struct RockRainImpactTestInput {
     vec4 eventPositionRadius;
@@ -29,15 +30,35 @@ void main() {
         return;
     }
     const RockRainImpactTestInput inputValue = inputs[index];
-    outputs[index] = EvaluateRockRainImpactValue(
-        inputValue.eventPositionRadius.xyz,
-        inputValue.eventNormalLifetime.xyz,
-        inputValue.eventPositionRadius.w,
-        inputValue.eventNormalLifetime.w,
-        inputValue.control.x,
-        inputValue.rockImpact0,
-        inputValue.rockImpact1,
-        inputValue.pointAge.xyz,
-        inputValue.pointNormal.xyz,
-        inputValue.pointAge.w);
+    if (inputValue.control.y == 2u) {
+        float peak = 0.0;
+        float remaining = 1.0;
+        const uint count = min(inputValue.control.z, 4u);
+        for (uint valueIndex = 0u; valueIndex < count; ++valueIndex) {
+            const float value = inputValue.eventPositionRadius[valueIndex];
+            peak = max(peak, value);
+            remaining *= 1.0 - clamp(value, 0.0, 1.0);
+        }
+        outputs[index] = max(peak, 1.0 - remaining);
+    } else if (inputValue.control.y == 1u) {
+        outputs[index] = EvaluateSandRainImpactValue(
+            inputValue.eventPositionRadius.xyz,
+            inputValue.eventPositionRadius.w,
+            inputValue.eventNormalLifetime.w,
+            inputValue.pointAge.xyz,
+            inputValue.pointAge.w,
+            inputValue.rockImpact0.x);
+    } else {
+        outputs[index] = EvaluateRockRainImpactValue(
+            inputValue.eventPositionRadius.xyz,
+            inputValue.eventNormalLifetime.xyz,
+            inputValue.eventPositionRadius.w,
+            inputValue.eventNormalLifetime.w,
+            inputValue.control.x,
+            inputValue.rockImpact0,
+            inputValue.rockImpact1,
+            inputValue.pointAge.xyz,
+            inputValue.pointNormal.xyz,
+            inputValue.pointAge.w);
+    }
 }

@@ -1,4 +1,5 @@
 #include "rain_impact_rock_model.glsl"
+#include "rain_impact_sand_model.glsl"
 
 struct RainImpactEventGpu {
     vec4 positionBirth;
@@ -29,7 +30,10 @@ layout(set = 0, binding = 15, std430) readonly buffer RainImpactEventsBuffer {
 const uint kRainRoleRock = 1u;
 const uint kRainRoleSand = 2u;
 const uint kRainRoleVegetation = 3u;
-const uint kRainReferencesPerCell = 20u;
+const uint kRainSandReferenceCapacity = 8u;
+const uint kRainRockReferenceCapacity = 16u;
+const uint kRainVegetationReferenceCapacity = 4u;
+const uint kRainReferencesPerCell = 28u;
 
 uint RainImpactHashBits(uint value) {
     value ^= value >> 16u;
@@ -230,28 +234,56 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         return composite;
     }
     const uvec4 counts = rainImpactCounts[cellIndex];
-    uint count = 0u;
+    uint occupiedMask = 0u;
+    uint capacity = 0u;
     uint offset = 0u;
     if (role == kRainRoleSand) {
-        count = min(counts.x, 8u);
+        occupiedMask = counts.x;
+        capacity = kRainSandReferenceCapacity;
     } else if (role == kRainRoleRock) {
-        count = min(counts.y, 8u);
-        offset = 8u;
+        occupiedMask = counts.y;
+        capacity = kRainRockReferenceCapacity;
+        offset = kRainSandReferenceCapacity;
     } else if (role == kRainRoleVegetation) {
-        count = min(counts.z, 4u);
-        offset = 16u;
+        occupiedMask = counts.z;
+        capacity = kRainVegetationReferenceCapacity;
+        offset =
+            kRainSandReferenceCapacity +
+            kRainRockReferenceCapacity;
     } else {
         return composite;
     }
 
     const float time = styleData.rainImpactGrid.w;
-    for (uint localIndex = 0u; localIndex < count; ++localIndex) {
+    float rockPeak = 0.0;
+    float rockRemaining = 1.0;
+    float sandWaterMask = 1.0;
+    if (role == kRainRoleSand && HasShorelineWaveEffect()) {
+        const float boundaryZ = styleData.shorelineWaveParams0.x;
+        const float edgeFade = max(
+            0.001,
+            styleData.shorelineWaveParams0.z);
+        // The shoreline boundary is the authored high-water wavefront. Only
+        // its flooded/downhill side receives the broad expanding ring.
+        sandWaterMask = smoothstep(
+            -edgeFade,
+            edgeFade,
+            boundaryZ - point.z);
+    }
+    for (uint localIndex = 0u; localIndex < capacity; ++localIndex) {
+        if ((occupiedMask & (1u << localIndex)) == 0u) {
+            continue;
+        }
         const uint referenceIndex =
             cellIndex * kRainReferencesPerCell + offset + localIndex;
         if (referenceIndex >= uint(rainImpactReferences.length())) {
             break;
         }
-        const uint eventIndex = rainImpactReferences[referenceIndex];
+        const uint packedReference = rainImpactReferences[referenceIndex];
+        if (packedReference == 0xffffffffu) {
+            continue;
+        }
+        const uint eventIndex = packedReference & 0xffffu;
         if (eventIndex >= styleData.rainImpactControl.w ||
             eventIndex >= uint(rainImpactEvents.length())) {
             continue;
@@ -265,15 +297,15 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         if (age < 0.0 || age > lifetime) {
             continue;
         }
-        const float life = clamp(age / lifetime, 0.0, 1.0);
         float value = 0.0;
         if (role == kRainRoleSand) {
-            const float distance = length(point.xy - event.positionBirth.xy);
-            const float ringRadius = event.normalRadius.w * (0.12 + 0.88 * life);
-            const float thickness = max(0.003, event.normalRadius.w * 0.14);
-            const float ringDistance = abs(distance - ringRadius);
-            value = exp(-(ringDistance * ringDistance) / (thickness * thickness)) *
-                    (1.0 - smoothstep(0.72, 1.0, life));
+            value = EvaluateSandRainImpactValue(
+                event.positionBirth.xyz,
+                event.normalRadius.w,
+                event.lifetimeEnergy.x,
+                point,
+                age,
+                sandWaterMask);
         } else if (role == kRainRoleRock) {
             value = EvaluateRockRainImpactValue(
                 event.positionBirth.xyz,
@@ -290,6 +322,14 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             value = RainVegetationSprinkleValue(event, point, pointNormal, age);
         }
         value *= event.lifetimeEnergy.y;
+        if (role == kRainRoleRock) {
+            // Preserve the strongest individual contribution while softly
+            // filling overlap. Adding another retained impact therefore
+            // cannot cut a darker boundary through an existing wet region.
+            rockPeak = max(rockPeak, value);
+            rockRemaining *= 1.0 - clamp(value, 0.0, 1.0);
+            continue;
+        }
         const bool vegetation = role == kRainRoleVegetation;
         composite.opacityAdd = max(
             composite.opacityAdd,
@@ -303,6 +343,13 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         composite.colourMix = max(
             composite.colourMix,
             value * (role == kRainRoleRock ? 0.42 : (vegetation ? 0.18 : 0.20)));
+    }
+    if (role == kRainRoleRock) {
+        const float value = max(rockPeak, 1.0 - rockRemaining);
+        composite.opacityAdd = value * 0.18;
+        composite.emissionAdd = value * 0.11;
+        composite.pointSizeMultiply = 1.0 + value * 0.16;
+        composite.colourMix = value * 0.42;
     }
     return composite;
 }

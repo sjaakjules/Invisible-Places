@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,6 +23,13 @@ struct LayerSummary {
     std::filesystem::path auxiliaryPath;
     std::uint64_t primitiveCount = 0;
 };
+
+// Discovers the one qualifying 5 mm MESH-sampled Ground point cloud in a
+// scene-local directory. Ambiguity is an error: callers must never bind the
+// lexically first candidate to an otherwise unrelated active scene.
+[[nodiscard]] std::optional<std::filesystem::path> FindSampledGroundSurfaceInDirectory(
+    const std::filesystem::path& directory,
+    std::string* errorMessage = nullptr);
 
 class SceneCatalog {
   public:

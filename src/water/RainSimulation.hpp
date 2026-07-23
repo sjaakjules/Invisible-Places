@@ -16,7 +16,7 @@ inline constexpr std::uint32_t kRainParticleCapacity = 32'768U;
 inline constexpr std::uint32_t kRainImpactEventCapacity = 65'536U;
 inline constexpr std::uint32_t kRainImpactGridDimension = 256U;
 inline constexpr std::uint32_t kRainSandEventsPerCell = 8U;
-inline constexpr std::uint32_t kRainRockEventsPerCell = 8U;
+inline constexpr std::uint32_t kRainRockEventsPerCell = 16U;
 inline constexpr std::uint32_t kRainVegetationEventsPerCell = 4U;
 
 enum class RainIntensityPreset : std::uint32_t {
@@ -226,6 +226,9 @@ struct RainImpactGridCell {
     std::uint32_t sandCount = 0U;
     std::uint32_t rockCount = 0U;
     std::uint32_t vegetationCount = 0U;
+    std::uint32_t sandMask = 0U;
+    std::uint32_t rockMask = 0U;
+    std::uint32_t vegetationMask = 0U;
 };
 
 struct RainImpactGrid {
@@ -256,6 +259,14 @@ struct RainImpactEffect {
     float timeSeconds,
     const RainRockImpactSettings& settings = {});
 
+// Pure SAND narrow phase. sandWaterMask is one on the flooded/downhill side
+// of the shoreline and zero on dry, uphill sand.
+[[nodiscard]] float EvaluateSandRainImpactValue(
+    const RainImpactEvent& event,
+    const io::Float3& point,
+    float timeSeconds,
+    float sandWaterMask = 1.0F);
+
 [[nodiscard]] RainImpactGrid BuildRainImpactGrid(
     std::span<const RainImpactEvent> events,
     const io::Float3& cameraPosition,
@@ -268,6 +279,7 @@ struct RainImpactEffect {
     WaterSurfaceRole pointRole,
     const io::Float3& point,
     const io::Float3& normal,
-    float timeSeconds);
+    float timeSeconds,
+    float sandWaterMask = 1.0F);
 
 }  // namespace invisible_places::water

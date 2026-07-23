@@ -3345,20 +3345,30 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         finiteOr(settings.ambiguityHeightMeters, 0.18F),
         0.0F,
         25.0F);
-    settings.particleCapacity = std::clamp(settings.particleCapacity, 1U, 262'144U);
-    settings.historyLength = std::clamp(settings.historyLength, 2U, 256U);
-    settings.sourceBandWidthMeters = std::clamp(
-        finiteOr(settings.sourceBandWidthMeters, 0.35F),
-        0.0F,
-        10.0F);
+    settings.particleCapacity = 4'096U;
+    settings.historyLength = 24U;
+    // Schema-45 Mesh Flow is always automatic. The legacy switch remains in
+    // memory only so older project documents can be read without a bespoke
+    // settings type.
+    settings.automaticSources = true;
+    settings.attractors.clear();
+    settings.emitterMotions.clear();
+    // The cache owns one physically compact highest-+X table. Legacy band
+    // values stay readable, but schema-45 always uses the fixed plan band.
+    settings.sourceBandWidthMeters = 0.75F;
+    settings.sourceBandFraction = 0.04F;
     settings.dryConcavityFocus = std::clamp(
-        finiteOr(settings.dryConcavityFocus, 0.75F),
+        finiteOr(settings.dryConcavityFocus, 0.90F),
         0.0F,
         1.0F);
     settings.rainSpawnSpread = std::clamp(
-        finiteOr(settings.rainSpawnSpread, 0.80F),
+        finiteOr(settings.rainSpawnSpread, 0.75F),
         0.0F,
         4.0F);
+    settings.rainDistributedSourceFraction = std::clamp(
+        finiteOr(settings.rainDistributedSourceFraction, 0.55F),
+        0.0F,
+        1.0F);
     settings.previewParticleLimit = std::clamp(
         settings.previewParticleLimit,
         1U,
@@ -3376,23 +3386,43 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         0.002F,
         5.0F);
     settings.trailWidthMeters = std::clamp(
-        finiteOr(settings.trailWidthMeters, 0.005F),
+        finiteOr(settings.trailWidthMeters, 0.0025F),
         0.0005F,
         1.0F);
     settings.trailStreakLengthMeters = std::clamp(
-        finiteOr(settings.trailStreakLengthMeters, 0.18F),
+        finiteOr(settings.trailStreakLengthMeters, 0.030F),
         0.001F,
         5.0F);
     settings.surfaceOffsetMeters = std::clamp(
-        finiteOr(settings.surfaceOffsetMeters, 0.006F),
+        finiteOr(settings.surfaceOffsetMeters, 0.003F),
         -1.0F,
         1.0F);
+    settings.trailOpacityDry = std::clamp(
+        finiteOr(settings.trailOpacityDry, 0.025F),
+        0.0F,
+        1.0F);
+    settings.trailOpacityWet = std::clamp(
+        finiteOr(settings.trailOpacityWet, 0.14F),
+        0.0F,
+        1.0F);
+    settings.trailEmissionDry = std::clamp(
+        finiteOr(settings.trailEmissionDry, 0.04F),
+        0.0F,
+        4.0F);
+    settings.trailEmissionWet = std::clamp(
+        finiteOr(settings.trailEmissionWet, 0.45F),
+        0.0F,
+        4.0F);
+    settings.trailExposure = std::clamp(
+        finiteOr(settings.trailExposure, 1.25F),
+        0.0F,
+        8.0F);
     settings.speedMetersPerSecond = std::clamp(
-        finiteOr(settings.speedMetersPerSecond, 0.22F),
+        finiteOr(settings.speedMetersPerSecond, 0.26F),
         0.001F,
         100.0F);
     settings.downhillWeight = std::clamp(
-        finiteOr(settings.downhillWeight, 1.35F),
+        finiteOr(settings.downhillWeight, 1.75F),
         0.0F,
         10.0F);
     settings.attractorWeight = std::clamp(
@@ -3420,31 +3450,31 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         0.0F,
         10.0F);
     settings.inertia = std::clamp(
-        finiteOr(settings.inertia, 0.76F),
+        finiteOr(settings.inertia, 0.88F),
         0.0F,
         0.98F);
     settings.particleNoiseStrength = std::clamp(
-        finiteOr(settings.particleNoiseStrength, 0.32F),
+        finiteOr(settings.particleNoiseStrength, 0.10F),
         0.0F,
         4.0F);
     settings.particleNoiseScaleMeters = std::clamp(
-        finiteOr(settings.particleNoiseScaleMeters, 0.18F),
+        finiteOr(settings.particleNoiseScaleMeters, 0.45F),
         0.001F,
         100.0F);
     settings.particleNoiseSpeed = std::clamp(
-        finiteOr(settings.particleNoiseSpeed, 0.40F),
+        finiteOr(settings.particleNoiseSpeed, 0.18F),
         0.0F,
         10.0F);
     settings.sharedWindStrength = std::clamp(
-        finiteOr(settings.sharedWindStrength, 0.18F),
+        finiteOr(settings.sharedWindStrength, 0.035F),
         0.0F,
         4.0F);
     settings.sharedWindScaleMeters = std::clamp(
-        finiteOr(settings.sharedWindScaleMeters, 2.4F),
+        finiteOr(settings.sharedWindScaleMeters, 3.0F),
         0.001F,
         100.0F);
     settings.sharedWindSpeed = std::clamp(
-        finiteOr(settings.sharedWindSpeed, 0.06F),
+        finiteOr(settings.sharedWindSpeed, 0.025F),
         0.0F,
         10.0F);
     settings.contactFadeSeconds = std::clamp(
@@ -3519,6 +3549,168 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         0.0F,
         2.0F);
     return settings;
+}
+
+WaterDynamicMeshFlowVisualWeights EvaluateWaterDynamicMeshFlowVisualWeights(
+    const WaterDynamicMeshFlowSettings& rawSettings,
+    float convergence,
+    float moisture,
+    float surfaceConfidence) {
+    const auto settings = SanitizeWaterDynamicMeshFlowSettings(rawSettings);
+    const auto clamp01 = [](float value) {
+        return std::clamp(
+            std::isfinite(value) ? value : 0.0F,
+            0.0F,
+            1.0F);
+    };
+    const auto smoothStep = [](float edge0, float edge1, float value) {
+        const float amount = std::clamp(
+            (value - edge0) / std::max(1.0e-6F, edge1 - edge0),
+            0.0F,
+            1.0F);
+        return amount * amount * (3.0F - 2.0F * amount);
+    };
+    const auto lerp = [](float left, float right, float amount) {
+        return left + ((right - left) * amount);
+    };
+
+    const float wet = clamp01(moisture);
+    const float confidence = clamp01(surfaceConfidence);
+    const float rill = smoothStep(0.18F, 0.82F, clamp01(convergence));
+
+    // Give the top end of the authored focus control useful precision.  At the
+    // default 0.75, a dry low-convergence cell accepts only about 8% of the
+    // stable population; Rain progressively relaxes the gate to one.
+    const float authoredFocus = clamp01(settings.dryConcavityFocus);
+    const float focused = 1.0F - ((1.0F - authoredFocus) *
+                                  (1.0F - authoredFocus));
+    const float dryFocus = focused * (1.0F - wet);
+    const float concavityAcceptance = 0.02F + (0.98F * rill);
+
+    WaterDynamicMeshFlowVisualWeights result;
+    result.automaticSpawnAcceptance =
+        lerp(1.0F, concavityAcceptance, dryFocus);
+
+    // Convergent rills remain coherent while isolated trickles retain enough
+    // individual and shared noise to avoid appearing as regular splines.
+    const float rillCoherence = rill * lerp(0.68F, 0.92F, wet);
+    result.directionalNoiseScale =
+        lerp(1.0F, 0.25F, rillCoherence);
+
+    // Population count plus the authored dry opacity/emission already make
+    // dry flow sparse and faint. Keep enough coverage on the flat +X entry
+    // band for those filaments to survive one-pixel rasterization, then make
+    // convergent dry cells markedly more persistent. Rain broadens the
+    // population and appearance without turning open Ground into a sheet.
+    const float openProminence = 0.12F;
+    const float rillProminence = lerp(0.90F, 0.70F, wet);
+    result.trailProminence =
+        lerp(openProminence, rillProminence, rill) *
+        (0.68F + (0.32F * confidence));
+    result.trailWidthScale =
+        lerp(0.72F, 1.15F, rill) *
+        lerp(0.90F, 1.04F, wet);
+    result.trailStreakScale =
+        lerp(0.78F, 1.05F, rill) *
+        lerp(0.94F, 1.03F, wet);
+    return result;
+}
+
+std::vector<WaterDynamicMeshFlowGroundEntry>
+BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache) {
+    struct ComponentExtent {
+        std::int32_t minimumX = std::numeric_limits<std::int32_t>::max();
+        std::int32_t maximumX = std::numeric_limits<std::int32_t>::min();
+        std::int32_t vegetationMaximumX =
+            std::numeric_limits<std::int32_t>::min();
+        bool valid = false;
+        bool hasVegetationSupport = false;
+    };
+
+    std::uint32_t maximumComponent = 0U;
+    for (const auto& cell : cache.groundCells) {
+        maximumComponent = std::max(maximumComponent, cell.componentId);
+    }
+    std::vector<ComponentExtent> extents(
+        static_cast<std::size_t>(maximumComponent) + 1U);
+    for (const auto& cell : cache.groundCells) {
+        if (cell.componentId == 0U) {
+            continue;
+        }
+        auto& extent = extents[cell.componentId];
+        extent.minimumX = std::min(extent.minimumX, cell.cellX);
+        extent.maximumX = std::max(extent.maximumX, cell.cellX);
+        extent.valid = true;
+        if ((cell.flags & kWaterGroundVegetationSupportedFlag) != 0U) {
+            extent.vegetationMaximumX =
+                std::max(extent.vegetationMaximumX, cell.cellX);
+            extent.hasVegetationSupport = true;
+        }
+    }
+
+    const float resolution = std::max(0.001F, cache.resolutionMeters);
+    std::vector<WaterDynamicMeshFlowGroundEntry> result;
+    result.reserve(std::min<std::size_t>(cache.groundCells.size(), 262'144U));
+    for (const auto& cell : cache.groundCells) {
+        if (cell.componentId == 0U ||
+            cell.componentId >= extents.size() ||
+            (cell.flags & kWaterGroundVegetationSupportedFlag) == 0U ||
+            (cell.flags & kWaterGroundTerminalContactFlag) != 0U ||
+            cell.connectivityMask == 0U) {
+            continue;
+        }
+        const auto& extent = extents[cell.componentId];
+        if (!extent.valid || !extent.hasVegetationSupport) {
+            continue;
+        }
+        const auto componentCells =
+            static_cast<std::int64_t>(extent.maximumX) -
+            static_cast<std::int64_t>(extent.minimumX) + 1LL;
+        const auto edgeCells = std::max<std::int64_t>(
+            0LL,
+            static_cast<std::int64_t>(extent.vegetationMaximumX) -
+                static_cast<std::int64_t>(cell.cellX));
+        const float componentExtentMeters =
+            static_cast<float>(
+                std::max<std::int64_t>(0LL, componentCells - 1LL)) *
+            resolution;
+        const float edgeDistanceMeters =
+            static_cast<float>(edgeCells) * resolution;
+        const float fixedEntryBandMeters =
+            std::max(0.75F, componentExtentMeters * 0.04F);
+        if (edgeDistanceMeters > fixedEntryBandMeters) {
+            continue;
+        }
+        result.push_back({
+            .cellX = cell.cellX,
+            .cellY = cell.cellY,
+            .edgeDistanceMeters = edgeDistanceMeters,
+            .edgeDistanceFraction =
+                static_cast<float>(edgeCells) /
+                static_cast<float>(
+                    std::max<std::int64_t>(1LL, componentCells)),
+        });
+    }
+
+    // The immutable entry band is measured back from the highest supported
+    // vegetation cell, not an unrelated bare-Ground tail of the component.
+    // This preserves automatic dry trickles when vegetation ends before the
+    // sampled Ground's geometric +X extreme.
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const WaterDynamicMeshFlowGroundEntry& left,
+           const WaterDynamicMeshFlowGroundEntry& right) {
+            const float leftRank = std::min(
+                left.edgeDistanceMeters / 0.75F,
+                left.edgeDistanceFraction / 0.04F);
+            const float rightRank = std::min(
+                right.edgeDistanceMeters / 0.75F,
+                right.edgeDistanceFraction / 0.04F);
+            return std::tie(leftRank, left.cellX, left.cellY) <
+                   std::tie(rightRank, right.cellX, right.cellY);
+        });
+    return result;
 }
 
 std::array<WaterDynamicMeshParticlePreset, 4> AllWaterDynamicMeshParticlePresets() {
@@ -5297,16 +5489,15 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     fingerprintBool(settings.enabled);
     fingerprintBool(settings.gpuPreviewEnabled);
     fingerprintBool(settings.showTrails);
-    fingerprintBool(settings.automaticSources);
     SeepageFingerprintText(&hash, settings.meshPath.generic_string());
     SeepageFingerprintFloat(&hash, settings.cacheCellSizeMeters);
     SeepageFingerprintFloat(&hash, settings.projectionSearchRadiusMeters);
     SeepageFingerprintFloat(&hash, settings.ambiguityHeightMeters);
     SeepageFingerprintU32(&hash, settings.particleCapacity);
     SeepageFingerprintU32(&hash, settings.historyLength);
-    SeepageFingerprintFloat(&hash, settings.sourceBandWidthMeters);
     SeepageFingerprintFloat(&hash, settings.dryConcavityFocus);
     SeepageFingerprintFloat(&hash, settings.rainSpawnSpread);
+    SeepageFingerprintFloat(&hash, settings.rainDistributedSourceFraction);
     SeepageFingerprintU32(&hash, settings.previewParticleLimit);
     SeepageFingerprintU32(&hash, settings.finalParticleLimit);
     SeepageFingerprintFloat(&hash, settings.trailLengthMeters);
@@ -5314,6 +5505,11 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     SeepageFingerprintFloat(&hash, settings.trailWidthMeters);
     SeepageFingerprintFloat(&hash, settings.trailStreakLengthMeters);
     SeepageFingerprintFloat(&hash, settings.surfaceOffsetMeters);
+    SeepageFingerprintFloat(&hash, settings.trailOpacityDry);
+    SeepageFingerprintFloat(&hash, settings.trailOpacityWet);
+    SeepageFingerprintFloat(&hash, settings.trailEmissionDry);
+    SeepageFingerprintFloat(&hash, settings.trailEmissionWet);
+    SeepageFingerprintFloat(&hash, settings.trailExposure);
     SeepageFingerprintFloat(&hash, settings.speedMetersPerSecond);
     SeepageFingerprintFloat(&hash, settings.downhillWeight);
     SeepageFingerprintFloat(&hash, settings.attractorWeight);
@@ -5347,49 +5543,7 @@ std::string WaterDynamicMeshFlowSettingsFingerprint(
     SeepageFingerprintFloat(&hash, settings.animationDurationSeconds);
     SeepageFingerprintU32(&hash, settings.seed);
     SeepageFingerprintText(&hash, settings.particlePresetName);
-    SeepageFingerprintText(&hash, settings.trailProfileName);
-    SeepageFingerprintU32(
-        &hash,
-        static_cast<std::uint32_t>(std::min<std::size_t>(
-            settings.attractors.size(),
-            std::numeric_limits<std::uint32_t>::max())));
-    for (const auto& attractor : settings.attractors) {
-        SeepageFingerprintU32(&hash, attractor.id);
-        SeepageFingerprintText(&hash, attractor.name);
-        fingerprintPoint(attractor.position);
-        SeepageFingerprintFloat(&hash, attractor.radiusMeters);
-        SeepageFingerprintFloat(&hash, attractor.strength);
-        fingerprintBool(attractor.enabled);
-        SeepageFingerprintU32(
-            &hash,
-            static_cast<std::uint32_t>(std::min<std::size_t>(
-                attractor.keyframes.size(),
-                std::numeric_limits<std::uint32_t>::max())));
-        for (const auto& keyframe : attractor.keyframes) {
-            SeepageFingerprintFloat(&hash, keyframe.timeSeconds);
-            fingerprintPoint(keyframe.position);
-        }
-    }
-    SeepageFingerprintU32(
-        &hash,
-        static_cast<std::uint32_t>(std::min<std::size_t>(
-            settings.emitterMotions.size(),
-            std::numeric_limits<std::uint32_t>::max())));
-    for (const auto& motion : settings.emitterMotions) {
-        SeepageFingerprintU32(&hash, motion.emitterId);
-        SeepageFingerprintText(&hash, motion.name);
-        fingerprintBool(motion.enabled);
-        SeepageFingerprintU32(
-            &hash,
-            static_cast<std::uint32_t>(std::min<std::size_t>(
-                motion.keyframes.size(),
-                std::numeric_limits<std::uint32_t>::max())));
-        for (const auto& keyframe : motion.keyframes) {
-            SeepageFingerprintFloat(&hash, keyframe.timeSeconds);
-            fingerprintPoint(keyframe.position);
-        }
-    }
-    return "water-dynamic-mesh-flow-settings-v1-" + SeepageFingerprintString(hash);
+    return "water-dynamic-mesh-flow-settings-v2-" + SeepageFingerprintString(hash);
 }
 
 WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
@@ -5936,6 +6090,84 @@ float EvaluateWaterMeshFlowRainEnvelope(
         SeepageFiniteOr(envelope.samples[leftIndex], 0.0F),
         SeepageFiniteOr(envelope.samples[rightIndex], 0.0F),
         amount));
+}
+
+std::uint64_t WaterMeshFlowSampleTick(
+    float sampleTimeSeconds,
+    float fixedStepSeconds) {
+    const float fixedStep = std::clamp(
+        SeepageFiniteOr(fixedStepSeconds, 1.0F / 30.0F),
+        1.0F / 240.0F,
+        1.0F / 15.0F);
+    const double sampleTime = static_cast<double>(std::clamp(
+        SeepageFiniteOr(sampleTimeSeconds, 0.0F),
+        0.0F,
+        86'400.0F));
+    const double coordinate =
+        sampleTime / static_cast<double>(fixedStep);
+    const double nearestTick = std::round(coordinate);
+    if (std::abs(coordinate - nearestTick) <= 1.0e-3) {
+        return static_cast<std::uint64_t>(
+            std::max(0.0, nearestTick));
+    }
+    return static_cast<std::uint64_t>(
+        std::floor(coordinate));
+}
+
+std::vector<WaterMeshFlowTimelineStep> BuildWaterMeshFlowSampleTimeline(
+    std::optional<std::uint64_t> previousCompletedTick,
+    float targetSampleTimeSeconds,
+    std::uint32_t historyLength,
+    float fixedStepSeconds) {
+    const float fixedStep = std::clamp(
+        SeepageFiniteOr(fixedStepSeconds, 1.0F / 30.0F),
+        1.0F / 240.0F,
+        1.0F / 15.0F);
+    const std::uint32_t safeHistoryLength =
+        std::clamp(historyLength, 2U, 128U);
+    const std::uint64_t targetTick =
+        WaterMeshFlowSampleTick(
+            targetSampleTimeSeconds,
+            fixedStep);
+    if (previousCompletedTick == targetTick) {
+        return {};
+    }
+
+    const bool reset =
+        !previousCompletedTick.has_value() ||
+        targetTick < previousCompletedTick.value() ||
+        targetTick - previousCompletedTick.value() >
+            safeHistoryLength;
+    const std::uint64_t startTick =
+        reset
+            ? targetTick > safeHistoryLength
+                  ? targetTick - safeHistoryLength
+                  : 0U
+            : previousCompletedTick.value();
+
+    std::vector<WaterMeshFlowTimelineStep> steps;
+    if (reset) {
+        steps.push_back({
+            .timeSeconds =
+                static_cast<float>(startTick) * fixedStep,
+            .deltaSeconds = 0.0F,
+            .resetSimulation = true,
+        });
+    }
+    steps.reserve(
+        steps.size() +
+        static_cast<std::size_t>(targetTick - startTick));
+    for (std::uint64_t tick = startTick + 1U;
+         tick <= targetTick;
+         ++tick) {
+        steps.push_back({
+            .timeSeconds =
+                static_cast<float>(tick) * fixedStep,
+            .deltaSeconds = fixedStep,
+            .resetSimulation = false,
+        });
+    }
+    return steps;
 }
 
 float EffectiveWaterDynamicMeshFlowLevel(

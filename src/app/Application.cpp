@@ -337,6 +337,7 @@ struct QueuedQuickMp4Export {
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
     WaterRainSettings waterRainSettings{};
     WaterRainVisualSettings waterRainVisual{};
+    WaterDynamicMeshFlowSettings dynamicMeshFlowSettings{};
     invisible_places::output::AnimationExportMode mode =
         invisible_places::output::AnimationExportMode::FastPreviewMp4;
     invisible_places::output::AnimationExportQuality quality =
@@ -627,11 +628,20 @@ struct OfflineRenderJobState {
     WaterRainVisualSettings waterRainVisual{};
     std::optional<invisible_places::water::WaterScenarioState> frozenPreviewWaterScenario;
     invisible_places::water::WaterSeepageRainEnvelope seepageRainEnvelope{};
+    invisible_places::water::WaterMeshFlowRainEnvelope meshFlowRainEnvelope{};
     std::uint64_t effectiveSeepageInvocations = 0U;
     std::vector<FrozenSeepageLayer> frozenSeepageLayers;
     // Source parameters are frozen with an export, while keyed Flow/Rain levels
     // are evaluated per sample. This keeps animation scrubbing uniform-only.
     std::vector<FrozenFlowSourceLayer> frozenFlowSourceLayers;
+    WaterDynamicMeshFlowSettings frozenDynamicMeshFlowSettings{};
+    std::optional<std::size_t> frozenDynamicMeshFlowLayerId;
+    bool frozenDynamicMeshFlowLayerExported = false;
+    std::string frozenDynamicMeshFlowSceneGroupName;
+    std::string frozenDynamicMeshFlowCacheSignature;
+    invisible_places::water::WaterSurfaceCacheIdentity
+        frozenDynamicMeshFlowCacheIdentity{};
+    std::optional<std::uint64_t> dynamicMeshFlowCompletedTick;
     std::optional<invisible_places::camera::PreparedAnimationPathEvaluationContext> preparedAnimationPath;
     std::filesystem::path animationFilePath;
     std::string exportVisualName;
@@ -668,6 +678,20 @@ WaterFrameState ResolveFrozenWaterFrameState(
 invisible_places::water::WaterSeepageRainEnvelope BuildFrozenAnimationSeepageRainEnvelope(
     const std::optional<AnimationPath>& animationPath,
     std::span<const invisible_places::water::WaterScenarioDefinition> definitions);
+invisible_places::water::WaterMeshFlowRainEnvelope BuildFrozenAnimationMeshFlowRainEnvelope(
+    const std::optional<AnimationPath>& animationPath,
+    std::span<const invisible_places::water::WaterScenarioDefinition> definitions);
+void FreezeAnimationDynamicMeshFlow(
+    OfflineRenderJobState* job,
+    const PreviewRuntimeState& runtimeState,
+    std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState>
+        exportLayers,
+    const WaterDynamicMeshFlowSettings* settingsOverride = nullptr);
+bool UpdateFrozenAnimationDynamicMeshFlow(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    OfflineRenderJobState* job,
+    float sampleTimeSeconds);
 void UploadFrozenAnimationSeepageParameters(
     OfflineRenderJobState* job,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -978,6 +1002,7 @@ struct PreviewLayerSession {
     // records the speed encoded in the immutable scalar/output buffer.
     float waterFlowBakedSpeedMetersPerSecond = 0.45F;
     bool waterFlowGpuPreview = false;
+    bool dynamicMeshFlowGpuPreview = false;
     float inferredPointSpacingMeters = 0.0F;
     float pointSpacingMeters = 0.0F;
     bool pointSpacingManualOverride = false;
@@ -1132,6 +1157,7 @@ struct ScenePointCloudRuntime {
     std::optional<std::size_t> smokeInjectedUploadFailureRoleIndex;
     std::uint8_t deferredAnalysisActions = 0U;
     std::string switchError;
+    std::string waterSurfaceSourceError;
 };
 
 struct CameraInteractionState {
@@ -1407,6 +1433,14 @@ struct WaterWorkflowState {
     std::uint32_t dynamicMeshFlowContactEventCount = 0U;
     RainRuntimeSettings collisionRainSettings = invisible_places::water::DefaultRainRuntimeSettings();
     WaterRainVisualSettings rainVisual = invisible_places::water::RainVisualPreset("Rain Fine Lines");
+    // Currently resolved owner of the water-surface lifecycle. Generated Flow
+    // selection does not alter this scene-local association.
+    std::string activeWaterSurfaceSceneGroupName;
+    // A persisted project owner (or a later explicit UI selection) is an
+    // authority, not merely a hint. Project restoration may stage several
+    // saved scenes concurrently; none of those transient requests/commits may
+    // replace this name while the authoritative scene is still loading.
+    std::string authoritativeWaterSurfaceSceneGroupName;
     std::shared_ptr<WaterSurfaceCache> waterSurfaceCache;
     std::string waterSurfaceSceneGroupName;
     std::string waterSurfaceCacheSignature;
@@ -5470,76 +5504,6 @@ bool SessionsShareSceneFolder(
                NormalizePathKey(right.sourcePath.parent_path());
 }
 
-std::optional<std::filesystem::path> FindSampledGroundSurfaceInDirectory(
-    const std::filesystem::path& directory) {
-    if (directory.empty()) {
-        return std::nullopt;
-    }
-    std::error_code directoryError;
-    if (!std::filesystem::is_directory(directory, directoryError) || directoryError) {
-        return std::nullopt;
-    }
-
-    std::vector<std::filesystem::path> candidates;
-    for (std::filesystem::directory_iterator iterator{
-             directory,
-             std::filesystem::directory_options::skip_permission_denied,
-             directoryError};
-         !directoryError && iterator != std::filesystem::directory_iterator{};
-         iterator.increment(directoryError)) {
-        std::error_code entryError;
-        if (!iterator->is_regular_file(entryError) || entryError ||
-            LowercaseAsciiCopy(iterator->path().extension().string()) != ".ply") {
-            continue;
-        }
-        std::string compactStem;
-        for (const char character : LowercaseAsciiCopy(iterator->path().stem().string())) {
-            if (std::isalnum(static_cast<unsigned char>(character)) != 0) {
-                compactStem.push_back(character);
-            }
-        }
-        if (compactStem.find("meshsampled") == std::string::npos ||
-            std::fabs(
-                invisible_places::io::InferPointSpacingMetersFromName(
-                    iterator->path().stem().string()) -
-                0.005F) >
-                1.0e-6F) {
-            continue;
-        }
-        const auto header = invisible_places::io::ParsePlyHeader(iterator->path());
-        if (!header.success || header.header.faceCount != 0U ||
-            !header.header.LooksLikePointCloud() ||
-            !header.header.HasProperty("nx") ||
-            !header.header.HasProperty("ny") ||
-            !header.header.HasProperty("nz")) {
-            continue;
-        }
-        const auto scalarFields = header.header.ScalarFieldNames();
-        const bool hasDip = std::any_of(
-            scalarFields.begin(),
-            scalarFields.end(),
-            [](const std::string& name) {
-                return LowercaseAsciiCopy(name).find("dip") != std::string::npos;
-            });
-        const bool hasDirection = std::any_of(
-            scalarFields.begin(),
-            scalarFields.end(),
-            [](const std::string& name) {
-                return LowercaseAsciiCopy(name).find("direction") != std::string::npos;
-            });
-        if (hasDip && hasDirection) {
-            candidates.push_back(iterator->path());
-        }
-    }
-    if (candidates.empty()) {
-        return std::nullopt;
-    }
-    std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
-        return NormalizePathKey(left) < NormalizePathKey(right);
-    });
-    return candidates.front();
-}
-
 void AssignDefaultSceneVariantSelections(std::vector<PreviewLayerSession>* sessions) {
     if (sessions == nullptr) {
         return;
@@ -5606,7 +5570,10 @@ std::vector<ScenePointCloudRuntime> BuildScenePointCloudRuntimeStates(
         scene.sceneGroupName = group.name;
         scene.sourceFolder = group.sourceFolder;
         scene.waterSurfaceSources = invisible_places::water::SelectWaterSurfaceSources(group);
-        if (const auto groundPath = FindSampledGroundSurfaceInDirectory(group.sourceFolder);
+        if (const auto groundPath =
+                invisible_places::scene::FindSampledGroundSurfaceInDirectory(
+                group.sourceFolder,
+                &scene.waterSurfaceSourceError);
             groundPath.has_value()) {
             scene.waterSurfaceSources.push_back({
                 .sourcePath = groundPath.value(),
@@ -8735,6 +8702,12 @@ bool CommitSceneDisplaySwitch(
     scene->mixedDisplay = committedMixedDisplay;
     scene->stagedReadyCount = 0U;
     scene->switchError.clear();
+    if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
+        runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
+            scene->sceneGroupName) {
+        runtimeState->water.activeWaterSurfaceSceneGroupName =
+            scene->sceneGroupName;
+    }
     const bool selectCommittedScene =
         !runtimeState->selectedSessionIndex.has_value() ||
         (runtimeState->selectedSessionIndex.value() < runtimeState->sessions.size() &&
@@ -8846,6 +8819,12 @@ bool RequestSceneDisplaySwitch(
         runtimeState->errorMessage = "That density is incomplete or ambiguous for this scene.";
         return false;
     }
+    if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
+        runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
+            scene->sceneGroupName) {
+        runtimeState->water.activeWaterSurfaceSceneGroupName =
+            scene->sceneGroupName;
+    }
     if (scene->displayLoaded &&
         scene->committedDisplaySpacingMicrometres == spacingMicrometres) {
         for (const auto sessionIndex : scene->committedDisplaySessionIndices) {
@@ -8903,6 +8882,12 @@ bool RequestSceneMixedDisplayLoad(
             [](const std::optional<std::size_t>& index) { return !index.has_value(); })) {
         scene->switchError = "The saved Mixed display set is incomplete and cannot be loaded.";
         return false;
+    }
+    if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
+        runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
+            scene->sceneGroupName) {
+        runtimeState->water.activeWaterSurfaceSceneGroupName =
+            scene->sceneGroupName;
     }
 
     ++scene->switchGeneration;
@@ -10384,6 +10369,56 @@ PointCloudStyleState MakeWaterEffectOverlayStyle(std::string_view visualName) {
         ConfigureWaterFieldBinding(&style.emissiveStrength, 16, "field_surface_confidence", 0.04F, 0.52F);
     }
     return style;
+}
+
+PointCloudStyleState MakeDynamicMeshFlowTrailStyle(
+    const WaterDynamicMeshFlowSettings& rawSettings) {
+    const auto settings =
+        invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+            rawSettings);
+    PointCloudStyleState style;
+    style.geometryMode = PointCloudGeometryMode::CameraFacingWorldSprites;
+    style.falloffProfile = PointCloudFalloffProfile::Gaussian;
+    style.colorMode = PointCloudColorMode::SolidColor;
+    style.solidColor = {0.72F, 0.88F, 0.96F, 1.0F};
+    style.colorizeColor = {0.58F, 0.82F, 0.94F};
+    style.colorizeAmount = 0.0F;
+    style.exposure = settings.trailExposure;
+    style.gaussianSharpness = 1.15F;
+    style.innerRadius = 0.0F;
+    style.solidCenters = false;
+    style.flowAnimation = true;
+    style.waterTrailOverlay = true;
+    style.waterPathView = false;
+    // Geometry comes from each Ground route's immutable scalar fields. This
+    // keeps live appearance edits uniform-only and prevents an ordinary Flow
+    // profile from stretching the subtle Mesh filaments into bright needles.
+    style.waterTrailStyleGeometry = false;
+    ConfigureWaterFieldBinding(
+        &style.opacity,
+        kWaterTrailFieldWetness,
+        "wetness",
+        settings.trailOpacityDry,
+        settings.trailOpacityWet);
+    invisible_places::style::SetFieldMapFlag(
+        &style.opacity.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    ConfigureWaterFieldBinding(
+        &style.emissiveStrength,
+        kWaterTrailFieldWetness,
+        "wetness",
+        settings.trailEmissionDry,
+        settings.trailEmissionWet);
+    invisible_places::style::SetFieldMapFlag(
+        &style.emissiveStrength.fieldMap,
+        invisible_places::style::FieldMapFlagUseLayerStats,
+        false);
+    invisible_places::style::SetScalarConstant(
+        &style.surfelDiameter,
+        settings.trailWidthMeters);
+    invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+    return MakeWaterTrailExportStyle(style);
 }
 
 PointCloudStyleState MakeWaterOverlayStyle(
@@ -16241,7 +16276,7 @@ void PollWaterRippleLiveEffectRefresh(
 bool SceneHasCommittedWaterSurfaceDisplay(
     const PreviewRuntimeState& runtimeState,
     const ScenePointCloudRuntime& scene) {
-    if (!scene.displayLoaded) {
+    if (!scene.displayLoaded || !scene.displayVisible) {
         return false;
     }
     const auto sessionIsCommitted = [&](const std::optional<std::size_t>& index) {
@@ -16262,23 +16297,103 @@ ScenePointCloudRuntime* ActiveWaterSurfaceScene(PreviewRuntimeState* runtimeStat
     if (runtimeState == nullptr) {
         return nullptr;
     }
+    const auto findSceneByName =
+        [&](std::string_view sceneGroupName) -> ScenePointCloudRuntime* {
+        if (sceneGroupName.empty()) {
+            return nullptr;
+        }
+        const auto found = std::find_if(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [&](const ScenePointCloudRuntime& scene) {
+                return scene.sceneGroupName == sceneGroupName;
+            });
+        return found == runtimeState->pointCloudScenes.end() ? nullptr : &*found;
+    };
+    const auto resolveSessionScene =
+        [&](std::size_t sessionIndex) -> ScenePointCloudRuntime* {
+        if (sessionIndex >= runtimeState->sessions.size()) {
+            return nullptr;
+        }
+        const auto& session = runtimeState->sessions[sessionIndex];
+        if (auto* scene = FindScenePointCloudRuntime(runtimeState, session);
+            scene != nullptr) {
+            return scene;
+        }
+        // Generated Mesh Flow sessions deliberately have no terrain role, but
+        // carry their owning scene group so selecting the overlay cannot make
+        // cache selection drift to another loaded scene.
+        if (auto* scene = findSceneByName(session.sceneGroupName);
+            scene != nullptr &&
+            NormalizePathKey(scene->sourceFolder) ==
+                NormalizePathKey(session.sourcePath.parent_path())) {
+            return scene;
+        }
+        return nullptr;
+    };
+    const auto acceptExplicitScene =
+        [&](ScenePointCloudRuntime* scene) -> ScenePointCloudRuntime* {
+        if (scene == nullptr ||
+            !SceneHasCommittedWaterSurfaceDisplay(*runtimeState, *scene)) {
+            return nullptr;
+        }
+        runtimeState->water.activeWaterSurfaceSceneGroupName =
+            scene->sceneGroupName;
+        return scene;
+    };
+    // A project-persisted or user-selected scene remains authoritative even
+    // while its display bundle is pending. Returning no terrain here is
+    // intentional: adopting a temporarily visible SampleScene would install
+    // trails against the wrong Ground table and could remain sticky after the
+    // intended scene finishes loading.
+    if (!runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty()) {
+        return acceptExplicitScene(
+            findSceneByName(
+                runtimeState->water.authoritativeWaterSurfaceSceneGroupName));
+    }
+    // With no persisted/user authority, keep the last successfully resolved
+    // scene sticky ahead of a stale selected session.
+    if (auto* stickyScene = acceptExplicitScene(
+            findSceneByName(
+                runtimeState->water.activeWaterSurfaceSceneGroupName));
+        stickyScene != nullptr) {
+        return stickyScene;
+    }
     if (runtimeState->selectedSessionIndex.has_value() &&
         runtimeState->selectedSessionIndex.value() < runtimeState->sessions.size()) {
-        auto* selectedScene = FindScenePointCloudRuntime(
-            runtimeState,
-            runtimeState->sessions[runtimeState->selectedSessionIndex.value()]);
-        if (selectedScene != nullptr &&
-            SceneHasCommittedWaterSurfaceDisplay(*runtimeState, *selectedScene)) {
+        if (auto* selectedScene = acceptExplicitScene(
+                resolveSessionScene(runtimeState->selectedSessionIndex.value()));
+            selectedScene != nullptr) {
             return selectedScene;
         }
     }
-    const auto sceneIt = std::find_if(
-        runtimeState->pointCloudScenes.begin(),
-        runtimeState->pointCloudScenes.end(),
-        [&](const ScenePointCloudRuntime& scene) {
-            return SceneHasCommittedWaterSurfaceDisplay(*runtimeState, scene);
-        });
-    return sceneIt == runtimeState->pointCloudScenes.end() ? nullptr : &*sceneIt;
+    if (runtimeState->water.activeSupportSessionIndex.has_value()) {
+        if (auto* supportScene = acceptExplicitScene(
+                resolveSessionScene(
+                    runtimeState->water.activeSupportSessionIndex.value()));
+            supportScene != nullptr) {
+            return supportScene;
+        }
+    }
+
+    // A unique visible scene is safe to infer. If several scenes are visible,
+    // require an explicit scene/session owner instead of silently binding the
+    // first catalog entry.
+    ScenePointCloudRuntime* uniqueVisibleScene = nullptr;
+    for (auto& scene : runtimeState->pointCloudScenes) {
+        if (!SceneHasCommittedWaterSurfaceDisplay(*runtimeState, scene)) {
+            continue;
+        }
+        if (uniqueVisibleScene != nullptr) {
+            return nullptr;
+        }
+        uniqueVisibleScene = &scene;
+    }
+    if (uniqueVisibleScene != nullptr) {
+        runtimeState->water.activeWaterSurfaceSceneGroupName =
+            uniqueVisibleScene->sceneGroupName;
+    }
+    return uniqueVisibleScene;
 }
 
 std::optional<WaterSurfaceCacheWarmupResult> TakeWaterSurfaceCacheWarmupResult(
@@ -16412,6 +16527,7 @@ void StartWaterSurfaceCacheWarmup(
         water.waterSurfaceSceneGroupName.clear();
         water.waterSurfaceCacheLoadedFromDisk = false;
         water.waterSurfaceCachePreprocessPending = false;
+        water.dynamicMeshFlowResetRequested = true;
     }
 
     auto shared = std::make_shared<WaterSurfaceCacheWarmupShared>();
@@ -16647,6 +16763,7 @@ void PollWaterSurfaceCacheWarmup(
     water.waterSurfaceCacheLoadedFromDisk = result.loadedFromDisk;
     water.waterSurfaceCachePreprocessPending = true;
     water.waterSurfaceCacheWarnings = std::move(result.warnings);
+    water.dynamicMeshFlowResetRequested = true;
     ++water.waterSurfaceCacheInstallCount;
     // Cancel any selection still reading the retired cache snapshot. The
     // settled descriptor/grid remains visible until a new identity-keyed
@@ -17247,20 +17364,63 @@ bool RefreshWaterDynamicMeshFlowOverlay(
 // Mesh Flow is a persistent GPU simulation over the installed shared Ground
 // table. This per-frame call only rotates parameter buffers unless the cache
 // identity or the two explicit capacity controls changed.
+struct WaterDynamicMeshFlowUpdateOptions {
+    const WaterDynamicMeshFlowSettings* settings = nullptr;
+    std::optional<std::size_t> sessionIndex;
+    std::optional<float> deltaSeconds;
+    bool resetSimulation = false;
+};
+
 bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     const WaterFrameState& frameState,
-    float timeSeconds) {
+    float timeSeconds,
+    const WaterDynamicMeshFlowUpdateOptions* updateOptions = nullptr) {
     if (runtimeState == nullptr || viewport == nullptr) {
         return false;
     }
     auto& water = runtimeState->water;
-    auto& settings = water.dynamicMeshFlowSettings;
+    auto& liveSettings = water.dynamicMeshFlowSettings;
+    auto settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+        updateOptions != nullptr && updateOptions->settings != nullptr
+            ? *updateOptions->settings
+            : liveSettings);
     const auto groundView = viewport->WaterGroundFlowView();
+    ScenePointCloudRuntime* scene = nullptr;
+    if (updateOptions != nullptr &&
+        updateOptions->sessionIndex.has_value() &&
+        updateOptions->sessionIndex.value() < runtimeState->sessions.size()) {
+        const auto& frozenSession =
+            runtimeState->sessions[updateOptions->sessionIndex.value()];
+        const auto sceneIt = std::find_if(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [&](const ScenePointCloudRuntime& candidate) {
+                return candidate.sceneGroupName == frozenSession.sceneGroupName &&
+                       NormalizePathKey(candidate.sourceFolder) ==
+                           NormalizePathKey(
+                               frozenSession.sourcePath.parent_path());
+            });
+        if (sceneIt != runtimeState->pointCloudScenes.end() &&
+            SceneHasCommittedWaterSurfaceDisplay(*runtimeState, *sceneIt)) {
+            scene = &*sceneIt;
+        }
+    } else {
+        scene = ActiveWaterSurfaceScene(runtimeState);
+    }
+    const bool cacheMatchesActiveScene =
+        scene != nullptr &&
+        water.waterSurfaceCache != nullptr &&
+        water.waterSurfaceSceneGroupName == scene->sceneGroupName &&
+        water.waterSurfaceCacheSignature == scene->waterSurfaceSignature &&
+        water.waterSurfaceCache->signature == scene->waterSurfaceSignature &&
+        groundView.cacheIdentity != nullptr &&
+        *groundView.cacheIdentity == water.waterSurfaceCache->cacheIdentity;
     if (!settings.enabled || !groundView.valid ||
         water.waterSurfaceCache == nullptr ||
-        water.waterSurfaceCachePreprocessPending) {
+        water.waterSurfaceCachePreprocessPending ||
+        !cacheMatchesActiveScene) {
         if (water.dynamicMeshFlowGpuSessionIndex.has_value() &&
             water.dynamicMeshFlowGpuSessionIndex.value() < runtimeState->sessions.size()) {
             runtimeState->sessions[water.dynamicMeshFlowGpuSessionIndex.value()].visible = false;
@@ -17268,19 +17428,22 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
         return false;
     }
 
-    const auto* scene = ActiveWaterSurfaceScene(runtimeState);
-    if (scene == nullptr) {
-        return false;
-    }
     const auto overlayPath =
         scene->sourceFolder /
         (scene->sceneGroupName + "-DynamicMeshTrails.generated");
-    auto sessionIndex = water.dynamicMeshFlowGpuSessionIndex;
+    auto sessionIndex =
+        updateOptions != nullptr && updateOptions->sessionIndex.has_value()
+            ? updateOptions->sessionIndex
+            : water.dynamicMeshFlowGpuSessionIndex;
     if (!sessionIndex.has_value() ||
         sessionIndex.value() >= runtimeState->sessions.size() ||
         !PathsReferToSameLocation(
             runtimeState->sessions[sessionIndex.value()].sourcePath,
             overlayPath)) {
+        if (updateOptions != nullptr &&
+            updateOptions->sessionIndex.has_value()) {
+            return false;
+        }
         if (sessionIndex.has_value() &&
             sessionIndex.value() < runtimeState->sessions.size()) {
             runtimeState->sessions[sessionIndex.value()].visible = false;
@@ -17293,6 +17456,7 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
         session.kind = LayerKind::PointCloud;
         session.sourcePath = overlayPath;
         session.displayName = scene->sceneGroupName + " Ground Mesh Flow";
+        session.sceneGroupName = scene->sceneGroupName;
         runtimeState->sessions.push_back(std::move(session));
         sessionIndex = runtimeState->sessions.size() - 1U;
         water.dynamicMeshFlowResetRequested = true;
@@ -17305,24 +17469,36 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
             activeScenario,
             frameState.meshFlowMoisture);
     const float deltaSeconds =
-        water.dynamicMeshFlowLastUpdateSeconds > 0.0F && timeSeconds >= water.dynamicMeshFlowLastUpdateSeconds
+        updateOptions != nullptr &&
+                updateOptions->deltaSeconds.has_value()
             ? std::clamp(
-                  timeSeconds - water.dynamicMeshFlowLastUpdateSeconds,
-                  1.0F / 240.0F,
-                  1.0F / 15.0F)
-            : 1.0F / 30.0F;
+                  updateOptions->deltaSeconds.value(),
+                  0.0F,
+                  0.10F)
+            : (water.dynamicMeshFlowLastUpdateSeconds > 0.0F &&
+                       timeSeconds >=
+                           water.dynamicMeshFlowLastUpdateSeconds
+                   ? std::clamp(
+                         timeSeconds -
+                             water.dynamicMeshFlowLastUpdateSeconds,
+                         1.0F / 240.0F,
+                         1.0F / 15.0F)
+                   : 1.0F / 30.0F);
     const bool timeDiscontinuity =
         water.dynamicMeshFlowLastUpdateSeconds > 0.0F &&
         (timeSeconds < water.dynamicMeshFlowLastUpdateSeconds ||
          timeSeconds - water.dynamicMeshFlowLastUpdateSeconds > 0.50F);
     invisible_places::renderer::core::DynamicMeshFlowGpuFrameRequest request{
-        .settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(settings),
-        .authoredEmitters = water.emitters,
+        .settings = settings,
         .activity = activity,
         .moisture = frameState.meshFlowMoisture,
         .timeSeconds = timeSeconds,
         .deltaSeconds = deltaSeconds,
-        .resetSimulation = water.dynamicMeshFlowResetRequested || timeDiscontinuity,
+        .resetSimulation =
+            water.dynamicMeshFlowResetRequested ||
+            timeDiscontinuity ||
+            (updateOptions != nullptr &&
+             updateOptions->resetSimulation),
     };
 
     invisible_places::renderer::core::DynamicMeshFlowGpuUpdateResult result;
@@ -17340,7 +17516,10 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
         return false;
     }
 
-    settings = request.settings;
+    if (updateOptions == nullptr ||
+        updateOptions->settings == nullptr) {
+        liveSettings = request.settings;
+    }
     water.dynamicMeshFlowGpuSessionIndex = sessionIndex;
     water.dynamicMeshFlowLastUpdateSeconds = timeSeconds;
     water.dynamicMeshFlowResetRequested = false;
@@ -17356,6 +17535,26 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     water.dynamicMeshFlowDiagnostics.cacheCellCount = groundView.occupiedCellCount;
     water.dynamicMeshFlowDiagnostics.emittedPathCount = result.activeParticles;
     water.dynamicMeshFlowDiagnostics.emittedSampleCount = result.pointCount;
+    water.dynamicMeshFlowDiagnostics.automaticEntryCandidateCount =
+        result.entryCandidateCount;
+    water.dynamicMeshFlowDiagnostics.availableRainSeedCount =
+        result.rainSeedCount;
+    water.dynamicMeshFlowDiagnostics.rainSeedParticleCount =
+        result.usedRainSeedParticleCount;
+    water.dynamicMeshFlowDiagnostics.routeSampleCount =
+        result.routeSampleCount;
+    water.dynamicMeshFlowDiagnostics.routeWithinGroundBoundsFraction =
+        result.routeWithinGroundBoundsFraction;
+    water.dynamicMeshFlowDiagnostics.routeWithinSurfaceToleranceFraction =
+        result.routeWithinSurfaceToleranceFraction;
+    water.dynamicMeshFlowDiagnostics.maximumRenderedSegmentMeters =
+        result.maximumRenderedSegmentMeters;
+    water.dynamicMeshFlowDiagnostics.longSegmentCount =
+        result.longSegmentCount;
+    water.dynamicMeshFlowDiagnostics.unexplainedVerticalJumpCount =
+        result.unexplainedVerticalJumpCount;
+    water.dynamicMeshFlowDiagnostics.medianTangentDownhillAlignment =
+        result.medianTangentDownhillAlignment;
     water.dynamicMeshFlowDiagnostics.gpuStaticBuffersReused =
         !result.allocatedThisUpdate;
     water.dynamicMeshFlowDiagnostics.gpuAsynchronousDispatch =
@@ -17372,8 +17571,10 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     session.kind = LayerKind::PointCloud;
     session.sourcePath = overlayPath;
     session.displayName = scene->sceneGroupName + " Ground Mesh Flow";
+    session.sceneGroupName = scene->sceneGroupName;
     session.hasSourceRgb = true;
     session.hasNormals = true;
+    session.dynamicMeshFlowGpuPreview = true;
     session.totalPrimitives = result.pointCount;
     session.scalarFields =
         invisible_places::water::WaterTrailOverlayScalarFieldsForPointCount(
@@ -17400,12 +17601,11 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     session.pointBudget = invisible_places::renderer::pointcloud::MakePointBudgetState(
         result.pointCount,
         result.pointCount);
-    const auto profile = ViewedDynamicMeshWaterTrailProfile(*runtimeState);
-    session.pointStyle = MakeWaterTrailExportStyle(profile.style);
+    session.pointStyle = MakeDynamicMeshFlowTrailStyle(settings);
     session.pointStyle.flowAnimation = true;
     session.pointStyle.waterTrailOverlay = true;
     session.pointStyle.waterFlowActivity = activity;
-    session.selectedPointVisualName = NormalizeWaterProfileName(profile.name);
+    session.selectedPointVisualName = "Subtle Ground Trickles";
     session.pointVisualNameBuffer =
         BaseWaterProfileName(session.selectedPointVisualName);
     if (session.pointVisuals.empty()) {
@@ -17432,7 +17632,6 @@ bool RefreshWaterDynamicMeshFlowOverlayIfWarm(
         !viewport->WaterGroundFlowView().valid) {
         return false;
     }
-    runtimeState->water.dynamicMeshFlowResetRequested = true;
     runtimeState->previewRenderStateSignatureValid = false;
     return true;
 }
@@ -17448,10 +17647,10 @@ bool RefreshWaterDynamicMeshFlowOverlayFromUiEdit(
     }
     (void)viewport;
     ++runtimeState->water.dynamicMeshFlowParameterUpdateCount;
-    runtimeState->water.dynamicMeshFlowResetRequested = true;
     runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->statusMessage =
-        "Updated resident Mesh Flow parameters; the shared Ground cache remains settled.";
+        "Updated resident Mesh Flow parameters without resetting particles; "
+        "the shared Ground cache remains settled.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -18800,41 +18999,27 @@ bool PlaceWaterEmitterAtScreenPoint(
         return false;
     }
 
-    std::optional<ResolvedPivot> pivot;
-    std::optional<invisible_places::io::Float3> placedPoint;
-    if (runtimeState->water.dynamicMeshFlowSettings.enabled) {
-        placedPoint = ProjectScreenPointToDynamicMeshSurfaceForPlacement(
-            runtimeState,
-            viewport,
-            screenPoint,
-            "water source");
-        if (!placedPoint.has_value()) {
-            return false;
-        }
-    } else {
-        pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
-        if (!pivot.has_value()) {
-            runtimeState->errorMessage = "No CPU-ready canonical analysis surface was available for water source placement.";
-            runtimeState->statusMessage.clear();
-            return false;
-        }
-        placedPoint = pivot->point;
+    const auto pivot =
+        ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
+    if (!pivot.has_value()) {
+        runtimeState->errorMessage =
+            "No CPU-ready canonical analysis surface was available for water "
+            "source placement.";
+        runtimeState->statusMessage.clear();
+        return false;
     }
 
     WaterEmitter emitter;
     emitter.id = NextWaterEmitterId(*runtimeState);
     emitter.name = "Source " + std::to_string(emitter.id);
     const auto pathSettings = ActiveProfileDefaultWaterSourceSettings(runtimeState->water).path;
-    emitter.position = placedPoint.value();
+    emitter.position = pivot->point;
     emitter.radius = std::max(0.05F, pathSettings.maxBridgeDistance * 0.75F);
     emitter.strength = 1.0F;
     emitter.speed = 1.0F;
     emitter.origin = WaterEmitterOrigin::Manual;
     emitter.status = WaterEmitterStatus::Accepted;
-    const bool placedOnSurface =
-        runtimeState->water.dynamicMeshFlowSettings.enabled ||
-        (pivot.has_value() && pivot->matchedSurface);
-    emitter.confidence = placedOnSurface ? 1.0F : 0.55F;
+    emitter.confidence = pivot->matchedSurface ? 1.0F : 0.55F;
     const auto placedEmitterId = emitter.id;
     const auto placedPosition = emitter.position;
     runtimeState->water.nextEmitterId = emitter.id + 1U;
@@ -18851,9 +19036,7 @@ bool PlaceWaterEmitterAtScreenPoint(
     runtimeState->pivotOverlay.pivot = placedPosition;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
     runtimeState->statusMessage =
-        runtimeState->water.dynamicMeshFlowSettings.enabled
-            ? "Placed a local Mesh Flow source on the resident Ground surface."
-            : "Placed water source from viewport; path bake required.";
+        "Placed water source from viewport; path bake required.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -19028,33 +19211,20 @@ bool MoveWaterEmitterAtScreenPoint(
         return false;
     }
 
-    std::optional<ResolvedPivot> pivot;
-    std::optional<invisible_places::io::Float3> movedPoint;
-    if (runtimeState->water.dynamicMeshFlowSettings.enabled) {
-        movedPoint = ProjectScreenPointToDynamicMeshSurfaceForPlacement(
-            runtimeState,
-            viewport,
-            screenPoint,
-            "water source");
-        if (!movedPoint.has_value()) {
-            return false;
-        }
-    } else {
-        pivot = ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
-        if (!pivot.has_value()) {
-            runtimeState->errorMessage = "No CPU-ready canonical analysis surface was available for moving the water source.";
-            runtimeState->statusMessage.clear();
-            return false;
-        }
-        movedPoint = pivot->point;
+    const auto pivot =
+        ResolveWaterSourcePlacementPivot(*runtimeState, viewport, screenPoint);
+    if (!pivot.has_value()) {
+        runtimeState->errorMessage =
+            "No CPU-ready canonical analysis surface was available for moving "
+            "the water source.";
+        runtimeState->statusMessage.clear();
+        return false;
     }
 
     auto& emitter = runtimeState->water.emitters[emitterIndex];
-    emitter.position = movedPoint.value();
-    const bool movedOnSurface =
-        runtimeState->water.dynamicMeshFlowSettings.enabled ||
-        (pivot.has_value() && pivot->matchedSurface);
-    emitter.confidence = std::max(emitter.confidence, movedOnSurface ? 0.85F : 0.55F);
+    emitter.position = pivot->point;
+    emitter.confidence =
+        std::max(emitter.confidence, pivot->matchedSurface ? 0.85F : 0.55F);
     runtimeState->water.selectedEmitterIndex = emitterIndex;
     runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
     runtimeState->water.movingEmitterIndex.reset();
@@ -19067,9 +19237,7 @@ bool MoveWaterEmitterAtScreenPoint(
     runtimeState->pivotOverlay.pivot = emitter.position;
     runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
     runtimeState->statusMessage =
-        runtimeState->water.dynamicMeshFlowSettings.enabled
-            ? "Moved Mesh Flow source " + emitter.name + " on the resident Ground surface."
-            : "Moved water source " + emitter.name + "; path bake required.";
+        "Moved water source " + emitter.name + "; path bake required.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -19384,14 +19552,27 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.waterDynamicMeshFlowSettings = runtimeState.water.dynamicMeshFlowSettings;
     document.waterRainSettings = runtimeState.water.collisionRainSettings;
     document.waterRainVisualSettings = runtimeState.water.rainVisual;
+    document.activeWaterSceneGroupName =
+        runtimeState.water.authoritativeWaterSurfaceSceneGroupName.empty()
+            ? runtimeState.water.activeWaterSurfaceSceneGroupName
+            : runtimeState.water.authoritativeWaterSurfaceSceneGroupName;
     {
         invisible_places::serialization::WaterSceneStateDocument waterSceneState;
-        waterSceneState.sceneGroupName = "Default";
-        if (const auto supportIndex = ResolveWaterRuntimeSessionIndex(runtimeState);
-            supportIndex.has_value() && supportIndex.value() < runtimeState.sessions.size()) {
-            const auto sceneKey = ProjectVisualSceneKey(runtimeState.sessions[supportIndex.value()]);
-            if (!sceneKey.empty()) {
-                waterSceneState.sceneGroupName = sceneKey;
+        waterSceneState.sceneGroupName =
+            document.activeWaterSceneGroupName.empty()
+                ? std::string{"Default"}
+                : document.activeWaterSceneGroupName;
+        if (document.activeWaterSceneGroupName.empty()) {
+            const auto supportIndex =
+                ResolveWaterRuntimeSessionIndex(runtimeState);
+            if (supportIndex.has_value() &&
+                supportIndex.value() < runtimeState.sessions.size()) {
+                const auto sceneKey = ProjectVisualSceneKey(
+                    runtimeState.sessions[supportIndex.value()]);
+                if (!sceneKey.empty()) {
+                    waterSceneState.sceneGroupName = sceneKey;
+                    document.activeWaterSceneGroupName = sceneKey;
+                }
             }
         }
         waterSceneState.emitters = runtimeState.water.emitters;
@@ -19402,8 +19583,6 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         waterSceneState.pathCache = CurrentWaterPathCacheForDocument(runtimeState);
         waterSceneState.rippleRuntimeCaches = CurrentWaterRippleRuntimeCachesForDocument(runtimeState);
         waterSceneState.dynamicMeshPath = runtimeState.water.dynamicMeshFlowSettings.meshPath;
-        waterSceneState.dynamicMeshAttractors = runtimeState.water.dynamicMeshFlowSettings.attractors;
-        waterSceneState.dynamicMeshEmitterMotions = runtimeState.water.dynamicMeshFlowSettings.emitterMotions;
         document.waterSceneStates.push_back(std::move(waterSceneState));
     }
     document.waterSourceSettings = runtimeState.water.defaultSourceSettings;
@@ -19701,6 +19880,24 @@ bool IsExportPointCloudSourceReady(
     return session.loaded &&
            session.gpuResident &&
            session.offlinePointCloud != nullptr;
+}
+
+bool IsGpuAnimationExportPointCloudSourceReady(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t sessionIndex) {
+    if (IsExportPointCloudSourceReady(runtimeState, sessionIndex)) {
+        return true;
+    }
+    if (!IsExportPointCloudSourceCandidate(runtimeState, sessionIndex) ||
+        sessionIndex >= runtimeState.sessions.size()) {
+        return false;
+    }
+    const auto& session = runtimeState.sessions[sessionIndex];
+    return runtimeState.water.dynamicMeshFlowGpuSessionIndex == sessionIndex &&
+           session.dynamicMeshFlowGpuPreview &&
+           session.loaded &&
+           session.gpuResident &&
+           session.totalPrimitives > 0U;
 }
 
 bool EnsureFullDensityExportSourcesReady(
@@ -20197,6 +20394,17 @@ bool ApplyProjectDocumentToRuntime(
             runtimeState->water.dynamicMeshFlowSettings.particlePresetName)};
     runtimeState->water.dynamicMeshTrailProfileNameBuffer =
         BaseWaterProfileName(runtimeState->water.dynamicMeshFlowSettings.trailProfileName);
+    // Schema-45 Mesh Flow has no authored attractor/source interaction.
+    // Loading a project also clears any legacy in-memory placement state so
+    // ordinary Flow emitters remain the only source markers handled by the
+    // reachable viewport UI.
+    runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
+    runtimeState->water.movingDynamicMeshAttractorIndex.reset();
+    runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
+    runtimeState->water.activeWaterSurfaceSceneGroupName =
+        document.activeWaterSceneGroupName;
+    runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
+        document.activeWaterSceneGroupName;
     runtimeState->water.dynamicMeshFlowGpuSessionIndex.reset();
     runtimeState->water.dynamicMeshFlowLastUpdateSeconds = 0.0F;
     runtimeState->water.dynamicMeshFlowResetRequested = true;
@@ -22909,7 +23117,9 @@ BuildAnimationExportPointCloudLayerSnapshot(
         !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
-        if (!IsExportPointCloudSourceReady(runtimeState, sessionIndex) ||
+        if (!IsGpuAnimationExportPointCloudSourceReady(
+                runtimeState,
+                sessionIndex) ||
             session.totalPrimitives == 0) {
             continue;
         }
@@ -23018,6 +23228,27 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
             frozenSource.rainResponse,
             frozenSource.sourceShowTrail,
             frozenSource.globalShowTrails);
+    }
+    if (job.frozenDynamicMeshFlowLayerExported &&
+        job.frozenDynamicMeshFlowLayerId.has_value()) {
+        const auto layerIt = std::find_if(
+            renderState.pointCloudLayers.begin(),
+            renderState.pointCloudLayers.end(),
+            [&](const auto& layer) {
+                return layer.layerId ==
+                       job.frozenDynamicMeshFlowLayerId.value();
+            });
+        if (layerIt != renderState.pointCloudLayers.end()) {
+            const float activity =
+                invisible_places::water::
+                    EffectiveWaterDynamicMeshFlowLevel(
+                        scenarioState,
+                        waterFrame.meshFlowMoisture);
+            layerIt->style.waterFlowActivity =
+                job.frozenDynamicMeshFlowSettings.showTrails
+                    ? activity
+                    : 0.0F;
+        }
     }
 
     return renderState;
@@ -23223,6 +23454,10 @@ bool RenderCurrentAnimationFramePreview(
     job.frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         exportPointCloudLayers);
+    FreezeAnimationDynamicMeshFlow(
+        &job,
+        *runtimeState,
+        exportPointCloudLayers);
     for (const auto& frozenLayer : job.frozenSeepageLayers) {
         viewport->UploadWaterSeepageTopology(
             frozenLayer.layerId,
@@ -23264,6 +23499,16 @@ bool RenderCurrentAnimationFramePreview(
                 &job,
                 viewport,
                 waterFrame);
+            if (!UpdateFrozenAnimationDynamicMeshFlow(
+                    runtimeState,
+                    viewport,
+                    &job,
+                    sampleTimeSeconds)) {
+                throw std::runtime_error{
+                    runtimeState->errorMessage.empty()
+                        ? "GPU Mesh Flow export sampling failed."
+                        : runtimeState->errorMessage};
+            }
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
                 cameraState,
@@ -23289,10 +23534,15 @@ bool RenderCurrentAnimationFramePreview(
             samples.push_back(std::move(renderedImage));
         }
     } catch (const std::exception& error) {
+        runtimeState->water.dynamicMeshFlowLastUpdateSeconds =
+            0.0F;
+        runtimeState->water.dynamicMeshFlowResetRequested = true;
         runtimeState->errorMessage = "Frame preview failed: " + std::string{error.what()};
         runtimeState->statusMessage.clear();
         return false;
     }
+    runtimeState->water.dynamicMeshFlowLastUpdateSeconds = 0.0F;
+    runtimeState->water.dynamicMeshFlowResetRequested = true;
 
     auto previewImage = samples.size() == 1U
                             ? std::move(samples.front())
@@ -26007,6 +26257,103 @@ invisible_places::water::WaterSeepageRainEnvelope BuildFrozenAnimationSeepageRai
             invisible_places::camera::AnimationPathDurationSeconds(path)));
 }
 
+invisible_places::water::WaterMeshFlowRainEnvelope
+BuildFrozenAnimationMeshFlowRainEnvelope(
+    const std::optional<AnimationPath>& animationPath,
+    std::span<const invisible_places::water::WaterScenarioDefinition>
+        definitions) {
+    if (!animationPath.has_value() ||
+        animationPath->selectedWaterScenarioId.empty()) {
+        return {};
+    }
+    const auto& path = animationPath.value();
+    const auto trackIt = std::find_if(
+        path.waterScenarioTracks.begin(),
+        path.waterScenarioTracks.end(),
+        [&](const auto& track) {
+            return track.scenarioId == path.selectedWaterScenarioId;
+        });
+    if (trackIt == path.waterScenarioTracks.end()) {
+        return {};
+    }
+    const auto definitionIt = std::find_if(
+        definitions.begin(),
+        definitions.end(),
+        [&](const auto& definition) {
+            return definition.id == path.selectedWaterScenarioId;
+        });
+    const invisible_places::water::WaterScenarioDefinition* definition =
+        definitionIt == definitions.end() ? nullptr : &*definitionIt;
+    if (definition == nullptr &&
+        !trackIt->fallbackScenario.id.empty()) {
+        definition = &trackIt->fallbackScenario;
+    }
+    if (definition == nullptr) {
+        return {};
+    }
+    return invisible_places::water::BuildWaterMeshFlowRainEnvelope(
+        *trackIt,
+        *definition,
+        std::max(
+            1.0e-6F,
+            invisible_places::camera::AnimationPathDurationSeconds(path)));
+}
+
+void FreezeAnimationDynamicMeshFlow(
+    OfflineRenderJobState* job,
+    const PreviewRuntimeState& runtimeState,
+    std::span<const invisible_places::renderer::core::SceneRenderState::
+                  PointCloudLayerState> exportLayers,
+    const WaterDynamicMeshFlowSettings* settingsOverride) {
+    if (job == nullptr) {
+        return;
+    }
+    job->frozenDynamicMeshFlowSettings =
+        invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+            settingsOverride != nullptr
+                ? *settingsOverride
+                : runtimeState.water.dynamicMeshFlowSettings);
+    job->meshFlowRainEnvelope =
+        BuildFrozenAnimationMeshFlowRainEnvelope(
+            job->animationPath,
+            job->waterScenarios);
+    job->frozenDynamicMeshFlowLayerId.reset();
+    job->frozenDynamicMeshFlowLayerExported = false;
+    job->frozenDynamicMeshFlowSceneGroupName.clear();
+    job->frozenDynamicMeshFlowCacheSignature.clear();
+    job->frozenDynamicMeshFlowCacheIdentity = {};
+    job->dynamicMeshFlowCompletedTick.reset();
+
+    const auto layerId =
+        runtimeState.water.dynamicMeshFlowGpuSessionIndex;
+    if (!job->frozenDynamicMeshFlowSettings.enabled ||
+        !layerId.has_value() ||
+        layerId.value() >= runtimeState.sessions.size() ||
+        runtimeState.water.waterSurfaceCache == nullptr) {
+        return;
+    }
+    const auto& session = runtimeState.sessions[layerId.value()];
+    if (!session.dynamicMeshFlowGpuPreview ||
+        !session.loaded ||
+        !session.gpuResident) {
+        return;
+    }
+    job->frozenDynamicMeshFlowLayerId = layerId;
+    job->frozenDynamicMeshFlowLayerExported =
+        std::any_of(
+            exportLayers.begin(),
+            exportLayers.end(),
+            [&](const auto& layer) {
+                return layer.layerId == layerId.value();
+            });
+    job->frozenDynamicMeshFlowSceneGroupName =
+        session.sceneGroupName;
+    job->frozenDynamicMeshFlowCacheSignature =
+        runtimeState.water.waterSurfaceCacheSignature;
+    job->frozenDynamicMeshFlowCacheIdentity =
+        runtimeState.water.waterSurfaceCache->cacheIdentity;
+}
+
 std::optional<invisible_places::water::WaterScenarioState> EvaluateFrozenAnimationWaterScenario(
     const OfflineRenderJobState& job,
     float sampleTimeSeconds) {
@@ -26069,6 +26416,18 @@ WaterFrameState ResolveFrozenWaterFrameState(
         job,
         result.sampleTimeSeconds);
     result.seepageScenarioState = result.rawScenarioState;
+    if (result.rawScenarioState.has_value()) {
+        result.meshFlowMoisture = std::clamp(
+            result.rawScenarioState->rainLevel,
+            0.0F,
+            1.0F);
+    }
+    if (!job.meshFlowRainEnvelope.samples.empty()) {
+        result.meshFlowMoisture =
+            invisible_places::water::EvaluateWaterMeshFlowRainEnvelope(
+                job.meshFlowRainEnvelope,
+                result.sampleTimeSeconds);
+    }
     if (result.seepageScenarioState.has_value() &&
         !job.seepageRainEnvelope.samples.empty()) {
         result.seepageScenarioState->rainLevel =
@@ -26094,6 +26453,81 @@ WaterFrameState ResolveFrozenWaterFrameState(
         }
     }
     return result;
+}
+
+bool UpdateFrozenAnimationDynamicMeshFlow(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    OfflineRenderJobState* job,
+    float sampleTimeSeconds) {
+    if (runtimeState == nullptr || viewport == nullptr || job == nullptr) {
+        return false;
+    }
+    if (!job->frozenDynamicMeshFlowSettings.enabled ||
+        !job->frozenDynamicMeshFlowLayerId.has_value()) {
+        return true;
+    }
+
+    auto& water = runtimeState->water;
+    const auto layerId =
+        job->frozenDynamicMeshFlowLayerId.value();
+    const bool frozenResourcesStillMatch =
+        layerId < runtimeState->sessions.size() &&
+        runtimeState->sessions[layerId].dynamicMeshFlowGpuPreview &&
+        runtimeState->sessions[layerId].sceneGroupName ==
+            job->frozenDynamicMeshFlowSceneGroupName &&
+        water.waterSurfaceCache != nullptr &&
+        water.waterSurfaceSceneGroupName ==
+            job->frozenDynamicMeshFlowSceneGroupName &&
+        water.waterSurfaceCacheSignature ==
+            job->frozenDynamicMeshFlowCacheSignature &&
+        water.waterSurfaceCache->signature ==
+            job->frozenDynamicMeshFlowCacheSignature &&
+        water.waterSurfaceCache->cacheIdentity ==
+            job->frozenDynamicMeshFlowCacheIdentity;
+    if (!frozenResourcesStillMatch) {
+        runtimeState->errorMessage =
+            "The active Ground cache or GPU Mesh Flow layer changed during "
+            "offline export.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    const auto settings =
+        invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+            job->frozenDynamicMeshFlowSettings);
+    const auto steps =
+        invisible_places::water::BuildWaterMeshFlowSampleTimeline(
+            job->dynamicMeshFlowCompletedTick,
+            sampleTimeSeconds,
+            settings.historyLength);
+    for (const auto& step : steps) {
+        const auto waterFrame = ResolveFrozenWaterFrameState(
+            *job,
+            step.timeSeconds);
+        const WaterDynamicMeshFlowUpdateOptions updateOptions{
+            .settings = &job->frozenDynamicMeshFlowSettings,
+            .sessionIndex = layerId,
+            .deltaSeconds = step.deltaSeconds,
+            .resetSimulation = step.resetSimulation,
+        };
+        // Offline export exclusively owns this stateful simulation. Ignore a
+        // panel-side reset requested after the job snapshot; live preview is
+        // reset once the job finishes.
+        water.dynamicMeshFlowResetRequested = false;
+        if (!EnsureWaterDynamicMeshFlowGpuUpToDate(
+                runtimeState,
+                viewport,
+                waterFrame,
+                step.timeSeconds,
+                &updateOptions)) {
+            return false;
+        }
+    }
+    job->dynamicMeshFlowCompletedTick =
+        invisible_places::water::WaterMeshFlowSampleTick(
+            sampleTimeSeconds);
+    return true;
 }
 
 void UploadFrozenAnimationSeepageParameters(
@@ -26359,6 +26793,11 @@ bool StartQuickMp4ExportJob(
         BuildFrozenAnimationSeepageRainEnvelope(
             runtimeState->offlineRenderJob.animationPath,
             runtimeState->offlineRenderJob.waterScenarios);
+    FreezeAnimationDynamicMeshFlow(
+        &runtimeState->offlineRenderJob,
+        *runtimeState,
+        runtimeState->offlineRenderJob.exportPointCloudLayers,
+        &request.dynamicMeshFlowSettings);
     runtimeState->offlineRenderJob.exportLog.writerQueueFrameLimit = writerState->maxQueuedFrames;
     runtimeState->offlineRenderJob.exportLog.writerQueueMemoryBudgetBytes = writerState->queueMemoryBudgetBytes;
     runtimeState->offlineRenderJob.exportLog.writerMemoryStopThresholdBytes = writerState->memoryStopThresholdBytes;
@@ -26580,6 +27019,8 @@ void StartSelectedQuickMp4Batch(
                  .waterScenarios = runtimeState->water.seepageScenarios,
                  .waterRainSettings = runtimeState->water.collisionRainSettings,
                  .waterRainVisual = runtimeState->water.rainVisual,
+                 .dynamicMeshFlowSettings =
+                     runtimeState->water.dynamicMeshFlowSettings,
                  .mode = activeMode,
                  .quality = activeQuality,
                  .useVideoToolbox = activeUseVideoToolbox,
@@ -26642,6 +27083,10 @@ void StartStillCameraExportCapture(
         job.exportPointCloudLayers,
         job.effectiveSeepageInvocations);
     job.frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
+        *runtimeState,
+        job.exportPointCloudLayers);
+    FreezeAnimationDynamicMeshFlow(
+        &job,
         *runtimeState,
         job.exportPointCloudLayers);
     if (viewport != nullptr) {
@@ -27236,6 +27681,10 @@ void StartAnimationExportJob(
         BuildFrozenAnimationSeepageRainEnvelope(
             runtimeState->offlineRenderJob.animationPath,
             runtimeState->offlineRenderJob.waterScenarios);
+    FreezeAnimationDynamicMeshFlow(
+        &runtimeState->offlineRenderJob,
+        *runtimeState,
+        runtimeState->offlineRenderJob.exportPointCloudLayers);
     runtimeState->offlineRenderJob.exportLog.writerQueueFrameLimit = writerState->maxQueuedFrames;
     runtimeState->offlineRenderJob.exportLog.writerQueueMemoryBudgetBytes = writerState->queueMemoryBudgetBytes;
     runtimeState->offlineRenderJob.exportLog.writerMemoryStopThresholdBytes = writerState->memoryStopThresholdBytes;
@@ -27307,6 +27756,8 @@ void FinishOfflineRenderJob(
     }
 
     runtimeState->exportPowerAssertion.Reset();
+    runtimeState->water.dynamicMeshFlowLastUpdateSeconds = 0.0F;
+    runtimeState->water.dynamicMeshFlowResetRequested = true;
     job.active = false;
     job.cancelRequested = false;
     job.writerFinishRequested = false;
@@ -27484,6 +27935,16 @@ void ProcessOfflineRenderJobStep(
                 &job,
                 viewport,
                 waterFrame);
+            if (!UpdateFrozenAnimationDynamicMeshFlow(
+                    runtimeState,
+                    viewport,
+                    &job,
+                    sampleTimeSeconds)) {
+                throw std::runtime_error{
+                    runtimeState->errorMessage.empty()
+                        ? "GPU Mesh Flow export sampling failed."
+                        : runtimeState->errorMessage};
+            }
             const auto renderState = BuildPointCloudExrRenderState(
                 job,
                 cameraState,
@@ -29896,23 +30357,9 @@ void DrawWaterEmitterOverlay(
         std::isfinite(pathSettings.attractorPosition.x) &&
         std::isfinite(pathSettings.attractorPosition.y) &&
         std::isfinite(pathSettings.attractorPosition.z);
-    const bool dynamicAttractorVisible =
-        runtimeState->water.dynamicMeshFlowSettings.enabled &&
-        std::any_of(
-            runtimeState->water.dynamicMeshFlowSettings.attractors.begin(),
-            runtimeState->water.dynamicMeshFlowSettings.attractors.end(),
-            [](const WaterDynamicMeshAttractor& attractor) {
-                return attractor.enabled &&
-                       std::isfinite(attractor.position.x) &&
-                       std::isfinite(attractor.position.y) &&
-                       std::isfinite(attractor.position.z);
-            });
     if (runtimeState->water.emitters.empty() &&
         !attractorVisible &&
-        !runtimeState->water.pathAttractorPlacementArmed &&
-        !dynamicAttractorVisible &&
-        !runtimeState->water.dynamicMeshAttractorPlacementArmed &&
-        !runtimeState->water.movingDynamicMeshAttractorIndex.has_value()) {
+        !runtimeState->water.pathAttractorPlacementArmed) {
         return;
     }
 
@@ -29928,12 +30375,10 @@ void DrawWaterEmitterOverlay(
         !runtimeState->water.placementArmed &&
         !runtimeState->water.seepagePlacementArmed &&
         !runtimeState->water.pathAttractorPlacementArmed &&
-        !runtimeState->water.dynamicMeshAttractorPlacementArmed &&
         !runtimeState->water.rippleRegionPlacementArmed &&
         !runtimeState->water.fieldRegionPlacementArmed &&
         !runtimeState->water.movingEmitterIndex.has_value() &&
-        !runtimeState->water.movingSeepageNodeIndex.has_value() &&
-        !runtimeState->water.movingDynamicMeshAttractorIndex.has_value();
+        !runtimeState->water.movingSeepageNodeIndex.has_value();
     const bool sourceNodesVisible =
         runtimeState->water.showFlowSourceGuides ||
         runtimeState->water.placementArmed ||
@@ -29967,49 +30412,6 @@ void DrawWaterEmitterOverlay(
         drawList->AddText(labelPosition, line, label.c_str());
     };
 
-    const auto drawMeshAttractorMarker = [&](
-        const invisible_places::io::Float3& point,
-        std::string_view label,
-        bool selected,
-        bool moving,
-        bool preview) {
-        const auto projected = ProjectWorldPoint(matrices, viewport, ToGlm(point));
-        if (!projected.has_value()) {
-            return std::optional<ImVec2>{};
-        }
-        const ImVec2 center = projected->screen;
-        const float pulse = moving ? static_cast<float>(0.74 + (0.26 * std::sin(ImGui::GetTime() * 8.0))) : 1.0F;
-        const float radius = preview ? 7.5F : (selected ? 8.5F : 6.2F);
-        const ImU32 fill = preview
-                               ? IM_COL32(255, 210, 78, 190)
-                               : (selected ? IM_COL32(255, 255, 255, 250) : IM_COL32(255, 118, 222, 238));
-        const ImU32 ring = preview ? IM_COL32(255, 255, 214, 245) : IM_COL32(45, 255, 220, 235);
-        drawList->AddCircleFilled(center, (radius + 4.0F) * pulse, IM_COL32(0, 0, 0, preview ? 105 : 145), 30);
-        drawList->AddCircle(center, (radius + 3.0F) * pulse, ring, 30, selected || moving ? 2.5F : 1.8F);
-        drawList->AddCircleFilled(center, radius * 0.48F * pulse, fill, 24);
-        drawList->AddLine(
-            ImVec2{center.x - radius - 5.0F, center.y},
-            ImVec2{center.x + radius + 5.0F, center.y},
-            ring,
-            1.3F);
-        drawList->AddLine(
-            ImVec2{center.x, center.y - radius - 5.0F},
-            ImVec2{center.x, center.y + radius + 5.0F},
-            ring,
-            1.3F);
-        if (selected || moving || preview) {
-            const std::string displayLabel =
-                preview ? "Mesh attractor preview" : (moving ? std::string{label} + "  click new mesh point" : std::string{label});
-            const ImVec2 labelPosition{center.x + 13.0F, center.y - 14.0F};
-            drawList->AddText(
-                ImVec2{labelPosition.x + 1.0F, labelPosition.y + 1.0F},
-                IM_COL32(0, 0, 0, 220),
-                displayLabel.c_str());
-            drawList->AddText(labelPosition, ring, displayLabel.c_str());
-        }
-        return std::optional<ImVec2>{center};
-    };
-
     if (attractorVisible) {
         drawAttractorMarker(pathSettings.attractorPosition, false);
     }
@@ -30021,60 +30423,8 @@ void DrawWaterEmitterOverlay(
             drawAttractorMarker(pivot->point, true);
         }
     }
-	    if ((runtimeState->water.dynamicMeshAttractorPlacementArmed ||
-	         runtimeState->water.movingDynamicMeshAttractorIndex.has_value()) &&
-	        renderViewportHovered &&
-	        !viewport.UiWantsMouseCapture()) {
-	        if (runtimeState->water.dynamicMeshSurfaceCache != nullptr &&
-	            runtimeState->water.dynamicMeshFlowSettings.enabled) {
-	            const auto previewPoint = ProjectScreenRayToDynamicMeshSurface(
-	                *runtimeState,
-	                viewport,
-	                *runtimeState->water.dynamicMeshSurfaceCache,
-	                io.MousePos);
-	            if (previewPoint.has_value()) {
-	                drawMeshAttractorMarker(previewPoint.value(), "Mesh attractor", true, true, true);
-	            }
-	        }
-	    }
-
     std::optional<std::size_t> nearestEmitterIndex;
     float nearestEmitterDistance = 13.0F;
-    std::optional<std::size_t> nearestDynamicMeshAttractorIndex;
-    float nearestDynamicMeshAttractorDistance = 13.0F;
-
-    if (runtimeState->water.dynamicMeshFlowSettings.enabled) {
-        const auto& attractors = runtimeState->water.dynamicMeshFlowSettings.attractors;
-        for (std::size_t index = 0; index < attractors.size(); ++index) {
-            const auto& attractor = attractors[index];
-            const bool selected =
-                runtimeState->water.selectedDynamicMeshAttractorIndex.has_value() &&
-                runtimeState->water.selectedDynamicMeshAttractorIndex.value() == index;
-            if ((!attractor.enabled && !selected) ||
-                !std::isfinite(attractor.position.x) ||
-                !std::isfinite(attractor.position.y) ||
-                !std::isfinite(attractor.position.z)) {
-                continue;
-            }
-            const bool moving =
-                runtimeState->water.movingDynamicMeshAttractorIndex.has_value() &&
-                runtimeState->water.movingDynamicMeshAttractorIndex.value() == index;
-            const std::string markerLabel = attractor.name.empty() ? "Mesh attractor" : attractor.name;
-            const auto markerCenter = drawMeshAttractorMarker(
-                attractor.position,
-                markerLabel,
-                selected,
-                moving,
-                false);
-            if (canPick && markerCenter.has_value()) {
-                const float distance = ScreenDistance(io.MousePos, markerCenter.value());
-                if (distance < nearestDynamicMeshAttractorDistance) {
-                    nearestDynamicMeshAttractorDistance = distance;
-                    nearestDynamicMeshAttractorIndex = index;
-                }
-            }
-        }
-    }
 
     for (std::size_t index = 0; index < runtimeState->water.emitters.size(); ++index) {
         if (!sourceNodesVisible) {
@@ -30140,8 +30490,6 @@ void DrawWaterEmitterOverlay(
     if (canPick && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         if (nearestEmitterIndex.has_value()) {
             SelectWaterEmitterInViewport(runtimeState, viewport, nearestEmitterIndex.value());
-        } else if (nearestDynamicMeshAttractorIndex.has_value()) {
-            SelectDynamicMeshAttractorInViewport(runtimeState, viewport, nearestDynamicMeshAttractorIndex.value());
         } else {
             return;
         }
@@ -35406,6 +35754,10 @@ void DrawVisiblePointCloudSelector(
                                    3) +
                                " mm — " + FormatPointCount(bundle.totalPointCount) + " points";
             if (ImGui::Selectable(label.c_str(), selected)) {
+                runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
+                    scene->sceneGroupName;
+                runtimeState->water.activeWaterSurfaceSceneGroupName =
+                    scene->sceneGroupName;
                 RequestSceneDisplaySwitch(
                     runtimeState,
                     viewport,
@@ -35570,6 +35922,12 @@ void DrawLidarPanel(
                 }
                 if (ImGui::Checkbox("Visible", &visible)) {
                     scene.displayVisible = visible;
+                    if (visible) {
+                        runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
+                            scene.sceneGroupName;
+                        runtimeState->water.activeWaterSurfaceSceneGroupName =
+                            scene.sceneGroupName;
+                    }
                     for (const auto sessionIndex : scene.committedDisplaySessionIndices) {
                         if (sessionIndex.has_value() && runtimeState->sessions[sessionIndex.value()].gpuResident) {
                             runtimeState->sessions[sessionIndex.value()].visible = visible;
@@ -35589,6 +35947,10 @@ void DrawLidarPanel(
                     (scene.committedDisplaySpacingMicrometres.has_value() || mixedLoadAvailable)) {
                     if (ImGui::Button("Load Scene")) {
                         scene.displayVisible = true;
+                        runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
+                            scene.sceneGroupName;
+                        runtimeState->water.activeWaterSurfaceSceneGroupName =
+                            scene.sceneGroupName;
                         if (scene.committedDisplaySpacingMicrometres.has_value()) {
                             RequestSceneDisplaySwitch(
                                 runtimeState,
@@ -36845,7 +37207,6 @@ void DrawWaterSourceList(
             }
             if (emitterChanged) {
                 MarkWaterPathDirty(runtimeState, emitter.id);
-                RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
             }
         }
         ImGui::Separator();
@@ -36881,7 +37242,6 @@ void DrawWaterSourceList(
         }
         MarkWaterPathDirty(runtimeState, deletedEmitterId);
         ValidateWaterSourceSettingLinks(runtimeState);
-        RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
     }
 
     if (!water.manualFlowPaths.empty()) {
@@ -37910,7 +38270,6 @@ void DrawWaterDynamicMeshFlowPanel(
     settings.particlePresetName = std::string{
         invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(settings.particlePresetName)};
     bool liveChanged = false;
-    bool allocationChanged = false;
 
     if (BeginPanelSection("Active Scene Ground")) {
         const auto* scene = ActiveWaterSurfaceScene(runtimeState);
@@ -37926,19 +38285,45 @@ void DrawWaterDynamicMeshFlowPanel(
         if (scene == nullptr) {
             ImGui::TextDisabled("No active grouped scene.");
         } else if (groundSource == scene->waterSurfaceSources.end()) {
+            const auto message =
+                scene->waterSurfaceSourceError.empty()
+                    ? "No 5 mm MESH-sampled Ground cloud was found for " +
+                          scene->sceneGroupName + "."
+                    : scene->waterSurfaceSourceError;
             ImGui::TextColored(
                 ImVec4{0.94F, 0.56F, 0.18F, 1.0F},
-                "No 5 mm MESH-sampled Ground cloud was found for %s.",
-                scene->sceneGroupName.c_str());
+                "%s",
+                message.c_str());
         } else {
-            ImGui::TextWrapped("Ground: %s", groundSource->sourcePath.filename().string().c_str());
+            ImGui::TextWrapped(
+                "Ground: %s",
+                groundSource->sourcePath.generic_string().c_str());
             ImGui::TextDisabled(
                 "Shared cache: %s  •  10 mm",
                 WaterSurfaceCacheRuntimeStatusLabel(scene->waterSurfaceCacheStatus));
             if (water.waterSurfaceCache != nullptr) {
                 ImGui::TextDisabled(
-                    "%s connected Ground cells",
-                    FormatPointCount(water.waterSurfaceCache->groundCells.size()).c_str());
+                    "%s sampled points  •  %s connected Ground cells",
+                    FormatPointCount(
+                        water.waterSurfaceCache->groundSourcePointCount)
+                        .c_str(),
+                    FormatPointCount(
+                        water.waterSurfaceCache->groundCells.size())
+                        .c_str());
+                if (water.waterSurfaceCache->bounds.valid) {
+                    ImGui::TextDisabled(
+                        "Bounds [%.3f, %.3f, %.3f] - [%.3f, %.3f, %.3f]",
+                        water.waterSurfaceCache->bounds.minimum.x,
+                        water.waterSurfaceCache->bounds.minimum.y,
+                        water.waterSurfaceCache->bounds.minimum.z,
+                        water.waterSurfaceCache->bounds.maximum.x,
+                        water.waterSurfaceCache->bounds.maximum.y,
+                        water.waterSurfaceCache->bounds.maximum.z);
+                }
+                ImGui::TextWrapped(
+                    "Owner %s  •  signature %s",
+                    water.waterSurfaceSceneGroupName.c_str(),
+                    water.waterSurfaceCacheSignature.c_str());
             }
             if (water.dynamicMeshFlowAllocationRevision > 0U) {
                 ImGui::TextDisabled(
@@ -37957,6 +38342,33 @@ void DrawWaterDynamicMeshFlowPanel(
                     FormatPointCount(
                         water.dynamicMeshFlowContactEventCount)
                         .c_str());
+                ImGui::TextDisabled(
+                    "+X entries %s  •  Rain seeds %s  •  Rain-fed particles %s",
+                    FormatPointCount(
+                        water.dynamicMeshFlowDiagnostics
+                            .automaticEntryCandidateCount)
+                        .c_str(),
+                    FormatPointCount(
+                        water.dynamicMeshFlowDiagnostics
+                            .availableRainSeedCount)
+                        .c_str(),
+                    FormatPointCount(
+                        water.dynamicMeshFlowDiagnostics
+                            .rainSeedParticleCount)
+                        .c_str());
+                ImGui::TextDisabled(
+                    "Route in bounds %.1f%%  •  near surface %.1f%%  •  "
+                    "max segment %.3f m  •  downhill %.2f",
+                    water.dynamicMeshFlowDiagnostics
+                            .routeWithinGroundBoundsFraction *
+                        100.0F,
+                    water.dynamicMeshFlowDiagnostics
+                            .routeWithinSurfaceToleranceFraction *
+                        100.0F,
+                    water.dynamicMeshFlowDiagnostics
+                        .maximumRenderedSegmentMeters,
+                    water.dynamicMeshFlowDiagnostics
+                        .medianTangentDownhillAlignment);
             }
         }
         ImGui::TextDisabled(
@@ -37967,17 +38379,18 @@ void DrawWaterDynamicMeshFlowPanel(
     if (BeginPanelSection("Activity and Sources")) {
         liveChanged |= ImGui::Checkbox("Enabled##DynamicMeshFlowGpu", &settings.enabled);
         liveChanged |= ImGui::Checkbox("Show Trails", &settings.showTrails);
-        liveChanged |= ImGui::Checkbox("Automatic +X Sources", &settings.automaticSources);
-        liveChanged |= ImGui::SliderFloat(
-            "Source Edge Band",
-            &settings.sourceBandWidthMeters,
-            0.02F,
-            2.0F,
-            "%.2f m",
-            ImGuiSliderFlags_Logarithmic);
+        ImGui::TextDisabled(
+            "Dry entry: vegetation-supported cells within max(0.75 m, 4%%) "
+            "of each component's highest +X edge.");
         liveChanged |= ImGui::SliderFloat(
             "Dry Concavity Focus",
             &settings.dryConcavityFocus,
+            0.0F,
+            1.0F,
+            "%.2f");
+        liveChanged |= ImGui::SliderFloat(
+            "Rain-Fed Source Share",
+            &settings.rainDistributedSourceFraction,
             0.0F,
             1.0F,
             "%.2f");
@@ -38002,23 +38415,6 @@ void DrawWaterDynamicMeshFlowPanel(
         if (ImGui::Button("Reset GPU Particles")) {
             water.dynamicMeshFlowResetRequested = true;
         }
-        EndPanelSection();
-    }
-
-    if (BeginPanelSection("Authored Source Overrides")) {
-        if (ImGui::Button(water.placementArmed ? "Click Viewport..." : "Place Source")) {
-            const bool armPlacement = !water.placementArmed;
-            DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
-            water.placementArmed = armPlacement;
-            water.movingEmitterIndex.reset();
-            runtimeState->statusMessage = armPlacement
-                                              ? "Click the viewport to add a local Mesh Flow source."
-                                              : "Mesh Flow source placement cancelled.";
-            runtimeState->errorMessage.clear();
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s overrides", FormatPointCount(water.emitters.size()).c_str());
-        DrawWaterSourceList(runtimeState, viewport);
         EndPanelSection();
     }
 
@@ -38072,20 +38468,10 @@ void DrawWaterDynamicMeshFlowPanel(
     }
 
     if (BeginPanelSection("Fixed GPU Capacity")) {
-        int particleCapacity = static_cast<int>(settings.particleCapacity);
-        if (ImGui::SliderInt("Particle Capacity", &particleCapacity, 256, 16'384)) {
-            settings.particleCapacity =
-                static_cast<std::uint32_t>(std::max(256, particleCapacity));
-            allocationChanged = true;
-        }
-        int historyLength = static_cast<int>(settings.historyLength);
-        if (ImGui::SliderInt("Trail History", &historyLength, 4, 64)) {
-            settings.historyLength =
-                static_cast<std::uint32_t>(std::max(4, historyLength));
-            allocationChanged = true;
-        }
         ImGui::TextDisabled(
-            "Capacity changes replace one settled GPU generation. Controls below are parameter-only.");
+            "4,096 particles  •  24 history samples");
+        ImGui::TextDisabled(
+            "Activity changes expose a stable subset; they never resize or replace GPU storage.");
         EndPanelSection();
     }
 
@@ -38168,6 +38554,36 @@ void DrawWaterDynamicMeshFlowPanel(
             8.0F,
             "%.2f s",
             ImGuiSliderFlags_Logarithmic);
+        liveChanged |= ImGui::SliderFloat(
+            "Dry Opacity",
+            &settings.trailOpacityDry,
+            0.0F,
+            0.50F,
+            "%.3f");
+        liveChanged |= ImGui::SliderFloat(
+            "Wet Opacity",
+            &settings.trailOpacityWet,
+            0.0F,
+            0.75F,
+            "%.3f");
+        liveChanged |= ImGui::SliderFloat(
+            "Dry Emission",
+            &settings.trailEmissionDry,
+            0.0F,
+            2.0F,
+            "%.3f");
+        liveChanged |= ImGui::SliderFloat(
+            "Wet Emission",
+            &settings.trailEmissionWet,
+            0.0F,
+            3.0F,
+            "%.3f");
+        liveChanged |= ImGui::SliderFloat(
+            "Exposure",
+            &settings.trailExposure,
+            0.0F,
+            4.0F,
+            "%.2f");
         EndPanelSection();
     }
 
@@ -38228,476 +38644,12 @@ void DrawWaterDynamicMeshFlowPanel(
         EndPanelSection();
     }
 
-    if (liveChanged || allocationChanged) {
+    if (liveChanged) {
         settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(settings);
         ++water.dynamicMeshFlowParameterUpdateCount;
         runtimeState->previewRenderStateSignatureValid = false;
     }
-    if (allocationChanged) {
-        water.dynamicMeshFlowResetRequested = true;
-    }
     return;
-
-    bool dynamicPreviewDirty = false;
-
-    if (BeginPanelSection("Mesh Surface")) {
-        if (ImGui::Checkbox("Enabled##DynamicMeshFlow", &settings.enabled)) {
-            if (!settings.enabled) {
-                RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport);
-            } else {
-                RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
-            }
-        }
-        if (ImGui::Checkbox("GPU Preview", &settings.gpuPreviewEnabled)) {
-            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
-        }
-
-        bool cacheChanged = false;
-        const auto sceneMeshPath = ResolveDynamicMeshSceneSurfacePath(*runtimeState);
-        const auto resolvedMeshPath = DynamicMeshSurfaceCachePathForSettings(*runtimeState, settings);
-        if (!resolvedMeshPath.empty()) {
-            ImGui::TextDisabled(
-                "%s: %s",
-                sceneMeshPath.has_value() ? "Auto Scene Mesh" : "Legacy Mesh Fallback",
-                resolvedMeshPath.generic_string().c_str());
-        } else {
-            ImGui::TextDisabled("Auto Scene Mesh: no mesh PLY found in the active scene folder");
-        }
-        if (!settings.meshPath.empty() && sceneMeshPath.has_value()) {
-            ImGui::TextDisabled("Legacy saved mesh path ignored: %s", settings.meshPath.generic_string().c_str());
-            if (ImGui::Button("Clear Legacy Mesh Path")) {
-                settings.meshPath.clear();
-                cacheChanged = true;
-            }
-        }
-        cacheChanged |= ImGui::SliderFloat(
-            "Cache Cell",
-            &settings.cacheCellSizeMeters,
-            0.01F,
-            0.50F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        cacheChanged |= ImGui::SliderFloat(
-            "Projection Radius",
-            &settings.projectionSearchRadiusMeters,
-            0.02F,
-            1.50F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        cacheChanged |= ImGui::SliderFloat(
-            "Ambiguity Height",
-            &settings.ambiguityHeightMeters,
-            0.0F,
-            1.0F,
-            "%.2f m");
-        if (cacheChanged) {
-            water.dynamicMeshSurfaceCache.reset();
-            water.dynamicMeshSurfaceCachePath.clear();
-            water.dynamicMeshSurfaceCacheSignature.clear();
-            StartDynamicMeshSurfaceCacheWarmup(runtimeState, true);
-            dynamicPreviewDirty = true;
-        }
-        if (water.dynamicMeshSurfaceCache != nullptr) {
-            ImGui::TextDisabled(
-                "Mesh cache: %s cells  %.1f ms",
-                FormatPointCount(water.dynamicMeshSurfaceCache->cells.size()).c_str(),
-                water.dynamicMeshSurfaceCache->buildMilliseconds);
-        } else if (DynamicMeshSurfaceWarmupActive(water)) {
-            std::string warmupStage = "Working";
-            if (water.dynamicMeshSurfaceCacheWarmup.shared != nullptr) {
-                std::scoped_lock lock(water.dynamicMeshSurfaceCacheWarmup.shared->mutex);
-                if (!water.dynamicMeshSurfaceCacheWarmup.shared->stage.empty()) {
-                    warmupStage = water.dynamicMeshSurfaceCacheWarmup.shared->stage;
-                }
-            }
-            ImGui::TextDisabled(
-                "Mesh cache: %s for %s",
-                warmupStage.c_str(),
-                FormatElapsedTime(std::chrono::steady_clock::now() - water.dynamicMeshSurfaceCacheWarmup.startedAt).c_str());
-        }
-        if (DynamicMeshSurfaceWarmupActive(water)) {
-            ImGui::BeginDisabled();
-        }
-        if (ImGui::Button("Clear Mesh Cache")) {
-            water.dynamicMeshSurfaceCache.reset();
-            water.dynamicMeshSurfaceCachePath.clear();
-            water.dynamicMeshSurfaceCacheSignature.clear();
-            runtimeState->statusMessage = "Dynamic mesh flow cache cleared.";
-            runtimeState->errorMessage.clear();
-        }
-        if (DynamicMeshSurfaceWarmupActive(water)) {
-            ImGui::EndDisabled();
-        }
-        EndPanelSection();
-    }
-
-    if (BeginPanelSection("Mesh Sources")) {
-        if (ImGui::Button(water.placementArmed ? "Click Viewport..." : "Place Source")) {
-            const bool armPlacement = !water.placementArmed;
-            if (armPlacement) {
-                DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
-                water.placementArmed = true;
-                water.movingEmitterIndex.reset();
-                water.pathAttractorPlacementArmed = false;
-                water.dynamicMeshAttractorPlacementArmed = false;
-                water.movingDynamicMeshAttractorIndex.reset();
-            } else {
-                water.placementArmed = false;
-            }
-            runtimeState->statusMessage =
-                water.placementArmed
-                    ? "Click the viewport to place a water source on the dynamic mesh surface."
-                    : "Water source placement cancelled.";
-            runtimeState->errorMessage.clear();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Suggest Sources")) {
-            SuggestWaterEmittersForActiveLayer(runtimeState);
-            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
-        }
-        ImGui::TextDisabled("Sources: %s", FormatPointCount(water.emitters.size()).c_str());
-        EndPanelSection();
-    }
-    DrawWaterSourceList(runtimeState, viewport);
-
-    if (BeginPanelSection("Mesh Source Motion")) {
-        if (const auto* selectedEmitter = SelectedWaterEmitter(runtimeState); selectedEmitter != nullptr) {
-            ImGui::TextDisabled("Selected emitter motion: %s", selectedEmitter->name.c_str());
-            auto motionIt = std::find_if(
-                settings.emitterMotions.begin(),
-                settings.emitterMotions.end(),
-                [selectedEmitter](const WaterDynamicMeshEmitterMotion& motion) {
-                    return motion.emitterId == selectedEmitter->id;
-                });
-            if (motionIt == settings.emitterMotions.end()) {
-                if (ImGui::Button("Add Emitter Motion")) {
-                    WaterDynamicMeshEmitterMotion motion;
-                    motion.emitterId = selectedEmitter->id;
-                    motion.name = selectedEmitter->name;
-                    motion.keyframes.push_back({0.0F, selectedEmitter->position});
-                    motion.keyframes.push_back(
-                        {std::max(1.0F, settings.animationDurationSeconds), selectedEmitter->position});
-                    settings.emitterMotions.push_back(std::move(motion));
-                    dynamicPreviewDirty = true;
-                }
-            } else {
-                auto& motion = *motionIt;
-                dynamicPreviewDirty |= ImGui::Checkbox("Emitter Motion Enabled", &motion.enabled);
-                InputTextString("Emitter Motion Name", &motion.name);
-                if (ImGui::Button("Add Emitter Key")) {
-                    WaterDynamicMeshMotionKeyframe keyframe;
-                    keyframe.timeSeconds = motion.keyframes.empty()
-                                               ? 0.0F
-                                               : std::min(
-                                                     settings.animationDurationSeconds,
-                                                     motion.keyframes.back().timeSeconds + 1.0F);
-                    keyframe.position = selectedEmitter->position;
-                    motion.keyframes.push_back(keyframe);
-                    dynamicPreviewDirty = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Remove Emitter Motion")) {
-                    settings.emitterMotions.erase(motionIt);
-                    dynamicPreviewDirty = true;
-                } else {
-                    for (std::size_t keyIndex = 0; keyIndex < motion.keyframes.size(); ++keyIndex) {
-                        auto& keyframe = motion.keyframes[keyIndex];
-                        ImGui::PushID(static_cast<int>(1000 + keyIndex));
-                        dynamicPreviewDirty |=
-                            ImGui::InputFloat("Motion Time", &keyframe.timeSeconds, 0.0F, 0.0F, "%.2f");
-                        float keyPosition[3] = {keyframe.position.x, keyframe.position.y, keyframe.position.z};
-                        if (ImGui::InputFloat3("Motion Position", keyPosition, "%.3f")) {
-                            keyframe.position = {keyPosition[0], keyPosition[1], keyPosition[2]};
-                            dynamicPreviewDirty = true;
-                        }
-                        if (ImGui::Button("Remove Motion Key")) {
-                            motion.keyframes.erase(motion.keyframes.begin() + static_cast<std::ptrdiff_t>(keyIndex));
-                            dynamicPreviewDirty = true;
-                            ImGui::PopID();
-                            break;
-                        }
-                        ImGui::Separator();
-                        ImGui::PopID();
-                    }
-                }
-            }
-        } else {
-            ImGui::TextDisabled("Select a source to edit emitter motion.");
-        }
-        EndPanelSection();
-    }
-
-    if (BeginPanelSection("Mesh Nodes")) {
-        if (ImGui::Button(water.dynamicMeshAttractorPlacementArmed ? "Click Attractor..." : "Place Attractor")) {
-            const bool armPlacement = !water.dynamicMeshAttractorPlacementArmed;
-            if (armPlacement) {
-                DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
-                water.placementArmed = false;
-                water.movingEmitterIndex.reset();
-                water.pathAttractorPlacementArmed = false;
-                water.dynamicMeshAttractorPlacementArmed = true;
-                water.movingDynamicMeshAttractorIndex.reset();
-                runtimeState->statusMessage = "Click the viewport to place a dynamic mesh attractor.";
-            } else {
-                water.dynamicMeshAttractorPlacementArmed = false;
-                runtimeState->statusMessage = "Dynamic mesh attractor placement cancelled.";
-            }
-            runtimeState->errorMessage.clear();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("New Attractor")) {
-            WaterDynamicMeshAttractor attractor;
-            attractor.id = NextDynamicMeshAttractorId(settings);
-            attractor.name = "Attractor " + std::to_string(attractor.id);
-            if (const auto* selectedEmitter = SelectedWaterEmitter(runtimeState); selectedEmitter != nullptr) {
-                attractor.position = selectedEmitter->position;
-            }
-            settings.attractors.push_back(std::move(attractor));
-            water.selectedDynamicMeshAttractorIndex = settings.attractors.size() - 1U;
-            water.selectedEmitterIndex.reset();
-            dynamicPreviewDirty = true;
-        }
-        for (std::size_t index = 0; index < settings.attractors.size(); ++index) {
-            auto& attractor = settings.attractors[index];
-            const bool selected =
-                water.selectedDynamicMeshAttractorIndex.has_value() &&
-                water.selectedDynamicMeshAttractorIndex.value() == index;
-            const std::string label =
-                attractor.name.empty() ? "Attractor " + std::to_string(index + 1U) : attractor.name;
-            ImGuiTreeNodeFlags nodeFlags = selected ? ImGuiTreeNodeFlags_Selected : ImGuiTreeNodeFlags_None;
-            const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), nodeFlags);
-            if (ImGui::IsItemClicked()) {
-                water.selectedDynamicMeshAttractorIndex = index;
-                water.selectedEmitterIndex.reset();
-            }
-            if (nodeOpen) {
-                InputTextString("Attractor Name", &attractor.name);
-                dynamicPreviewDirty |= ImGui::Checkbox("Attractor Enabled", &attractor.enabled);
-                float position[3] = {attractor.position.x, attractor.position.y, attractor.position.z};
-                if (ImGui::InputFloat3("Attractor Position", position, "%.3f")) {
-                    attractor.position = {position[0], position[1], position[2]};
-                    dynamicPreviewDirty = true;
-                }
-                const bool movingSelected =
-                    water.movingDynamicMeshAttractorIndex.has_value() &&
-                    water.movingDynamicMeshAttractorIndex.value() == index;
-                if (ImGui::Button(movingSelected ? "Cancel Move" : "Move In View")) {
-                    if (movingSelected) {
-                        water.movingDynamicMeshAttractorIndex.reset();
-                        runtimeState->statusMessage = "Dynamic mesh attractor move cancelled.";
-                    } else {
-                        DisarmWaterRegionPlacementForModeSwitch(runtimeState, viewport);
-                        water.placementArmed = false;
-                        water.movingEmitterIndex.reset();
-                        water.pathAttractorPlacementArmed = false;
-                        water.dynamicMeshAttractorPlacementArmed = false;
-                        water.movingDynamicMeshAttractorIndex = index;
-                        water.selectedDynamicMeshAttractorIndex = index;
-                        water.selectedEmitterIndex.reset();
-                        runtimeState->statusMessage = "Click the viewport to move " + label + ".";
-                    }
-                    runtimeState->errorMessage.clear();
-                }
-                dynamicPreviewDirty |=
-                    ImGui::SliderFloat("Attractor Radius", &attractor.radiusMeters, 0.01F, 8.0F, "%.2f m");
-                dynamicPreviewDirty |=
-                    ImGui::SliderFloat("Attractor Strength", &attractor.strength, 0.0F, 5.0F, "%.2f");
-                if (ImGui::TreeNode("Attractor Keyframes")) {
-                    if (ImGui::Button("Add Attractor Key")) {
-                        WaterDynamicMeshMotionKeyframe keyframe;
-                        keyframe.timeSeconds = attractor.keyframes.empty()
-                                                   ? 0.0F
-                                                   : std::min(
-                                                         settings.animationDurationSeconds,
-                                                         attractor.keyframes.back().timeSeconds + 1.0F);
-                        keyframe.position = attractor.position;
-                        attractor.keyframes.push_back(keyframe);
-                        dynamicPreviewDirty = true;
-                    }
-                    for (std::size_t keyIndex = 0; keyIndex < attractor.keyframes.size(); ++keyIndex) {
-                        auto& keyframe = attractor.keyframes[keyIndex];
-                        ImGui::PushID(static_cast<int>(keyIndex));
-                        dynamicPreviewDirty |= ImGui::InputFloat("Time", &keyframe.timeSeconds, 0.0F, 0.0F, "%.2f");
-                        float keyPosition[3] = {keyframe.position.x, keyframe.position.y, keyframe.position.z};
-                        if (ImGui::InputFloat3("Position", keyPosition, "%.3f")) {
-                            keyframe.position = {keyPosition[0], keyPosition[1], keyPosition[2]};
-                            dynamicPreviewDirty = true;
-                        }
-                        if (ImGui::Button("Remove Key")) {
-                            attractor.keyframes.erase(
-                                attractor.keyframes.begin() + static_cast<std::ptrdiff_t>(keyIndex));
-                            dynamicPreviewDirty = true;
-                            ImGui::PopID();
-                            break;
-                        }
-                        ImGui::Separator();
-                        ImGui::PopID();
-                    }
-                    ImGui::TreePop();
-                }
-                if (ImGui::Button("Remove Attractor")) {
-                    settings.attractors.erase(settings.attractors.begin() + static_cast<std::ptrdiff_t>(index));
-                    if (water.selectedDynamicMeshAttractorIndex.has_value()) {
-                        if (settings.attractors.empty() ||
-                            water.selectedDynamicMeshAttractorIndex.value() == index) {
-                            water.selectedDynamicMeshAttractorIndex.reset();
-                        } else if (water.selectedDynamicMeshAttractorIndex.value() > index) {
-                            water.selectedDynamicMeshAttractorIndex =
-                                water.selectedDynamicMeshAttractorIndex.value() - 1U;
-                        }
-                    }
-                    if (water.movingDynamicMeshAttractorIndex.has_value()) {
-                        if (settings.attractors.empty() ||
-                            water.movingDynamicMeshAttractorIndex.value() == index) {
-                            water.movingDynamicMeshAttractorIndex.reset();
-                        } else if (water.movingDynamicMeshAttractorIndex.value() > index) {
-                            water.movingDynamicMeshAttractorIndex =
-                                water.movingDynamicMeshAttractorIndex.value() - 1U;
-                        }
-                    }
-                    dynamicPreviewDirty = true;
-                    ImGui::TreePop();
-                    break;
-                }
-                ImGui::TreePop();
-            }
-        }
-        EndPanelSection();
-    }
-
-    if (BeginPanelSection("Mesh Particle Controls")) {
-        if (ImGui::BeginCombo("Particle State", settings.particlePresetName.c_str())) {
-            for (const auto& preset : invisible_places::water::AllWaterDynamicMeshParticlePresets()) {
-                const bool selected = settings.particlePresetName == preset.name;
-                if (ImGui::Selectable(preset.label.data(), selected)) {
-                    settings = invisible_places::water::ApplyWaterDynamicMeshParticlePreset(settings, preset.name);
-                    dynamicPreviewDirty = true;
-                }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            ImGui::EndCombo();
-        }
-        int previewParticles = static_cast<int>(settings.previewParticleLimit);
-        if (ImGui::SliderInt("Preview Particles", &previewParticles, 1, 8000)) {
-            settings.previewParticleLimit = static_cast<std::uint32_t>(std::max(1, previewParticles));
-            dynamicPreviewDirty = true;
-        }
-        int finalParticles = static_cast<int>(settings.finalParticleLimit);
-        if (ImGui::SliderInt("Final Particles", &finalParticles, 1, 30000)) {
-            settings.finalParticleLimit = static_cast<std::uint32_t>(std::max(1, finalParticles));
-            dynamicPreviewDirty = true;
-        }
-        dynamicPreviewDirty |=
-            ImGui::SliderFloat("Mesh Surface Offset", &settings.surfaceOffsetMeters, -0.05F, 0.10F, "%.3f m");
-        dynamicPreviewDirty |= ImGui::SliderFloat(
-            "Route Length",
-            &settings.trailLengthMeters,
-            0.5F,
-            60.0F,
-            "%.1f m",
-            ImGuiSliderFlags_Logarithmic);
-        dynamicPreviewDirty |= ImGui::SliderFloat(
-            "Route Step",
-            &settings.stepMeters,
-            0.02F,
-            0.75F,
-            "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        dynamicPreviewDirty |= ImGui::SliderFloat(
-            "Mesh Speed",
-            &settings.speedMetersPerSecond,
-            0.01F,
-            4.0F,
-            "%.2f m/s",
-            ImGuiSliderFlags_Logarithmic);
-        dynamicPreviewDirty |= ImGui::SliderFloat("Downhill", &settings.downhillWeight, 0.0F, 3.0F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat("Attraction", &settings.attractorWeight, 0.0F, 3.0F, "%.2f");
-        dynamicPreviewDirty |=
-            ImGui::SliderFloat("Source Velocity", &settings.sourceVelocityWeight, 0.0F, 3.0F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat("Curl", &settings.curlStrength, 0.0F, 1.5F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat("Branching", &settings.branchingStrength, 0.0F, 2.0F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat("Eddy Backflow", &settings.eddyStrength, 0.0F, 2.0F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat("Topology Response", &settings.topologyResponse, 0.0F, 2.0F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat("Inertia", &settings.inertia, 0.0F, 0.98F, "%.2f");
-        dynamicPreviewDirty |= ImGui::SliderFloat(
-            "Mesh Duration",
-            &settings.animationDurationSeconds,
-            0.0F,
-            30.0F,
-            "%.2f s");
-        int seed = static_cast<int>(settings.seed);
-        if (ImGui::InputInt("Mesh Seed", &seed)) {
-            settings.seed = static_cast<std::uint32_t>(std::max(0, seed));
-            dynamicPreviewDirty = true;
-        }
-        EndPanelSection();
-    }
-
-    settings.cacheCellSizeMeters = std::clamp(settings.cacheCellSizeMeters, 0.005F, 5.0F);
-    settings.projectionSearchRadiusMeters = std::clamp(settings.projectionSearchRadiusMeters, 0.005F, 25.0F);
-    settings.ambiguityHeightMeters = std::clamp(settings.ambiguityHeightMeters, 0.0F, 25.0F);
-    settings.trailLengthMeters = std::clamp(settings.trailLengthMeters, 0.02F, 100.0F);
-    settings.stepMeters = std::clamp(settings.stepMeters, 0.002F, 5.0F);
-    settings.sourceVelocityWeight = std::clamp(settings.sourceVelocityWeight, 0.0F, 10.0F);
-    settings.branchingStrength = std::clamp(settings.branchingStrength, 0.0F, 10.0F);
-    settings.eddyStrength = std::clamp(settings.eddyStrength, 0.0F, 10.0F);
-    settings.topologyResponse = std::clamp(settings.topologyResponse, 0.0F, 10.0F);
-    settings.animationDurationSeconds = std::clamp(settings.animationDurationSeconds, 0.0F, 86400.0F);
-    settings.inertia = std::clamp(settings.inertia, 0.0F, 0.98F);
-
-    if (dynamicPreviewDirty) {
-        RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, viewport);
-    }
-
-    if (BeginPanelSection("Mesh Visual")) {
-        DrawWaterDynamicMeshTrailProfileSelector(runtimeState, viewport);
-        DrawWaterDynamicMeshTrailStyleEditor(runtimeState, viewport, ViewedDynamicMeshWaterTrailProfile(*runtimeState));
-        EndPanelSection();
-    }
-
-    if (BeginPanelSection("Mesh Output")) {
-        if (ImGui::Button("Preview Mesh Flow")) {
-            RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Preview);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Final Mesh Flow")) {
-            RefreshWaterDynamicMeshFlowOverlay(runtimeState, viewport, WaterTrailBuildQuality::Final);
-        }
-        if (!water.lastDynamicMeshTrailOverlayPath.empty()) {
-            ImGui::TextDisabled(
-                "Mesh trails: %s",
-                water.lastDynamicMeshTrailOverlayPath.filename().string().c_str());
-        }
-        if (water.dynamicMeshFlowDiagnostics.cacheCellCount > 0U ||
-            water.dynamicMeshFlowDiagnostics.emittedSampleCount > 0U) {
-            const auto& diagnostics = water.dynamicMeshFlowDiagnostics;
-            ImGui::TextDisabled(
-                "Mesh source: %s vertices  %s triangles",
-                FormatPointCount(diagnostics.sourceVertexCount).c_str(),
-                FormatPointCount(diagnostics.sourceTriangleCount).c_str());
-            ImGui::TextDisabled(
-                "Mesh output: paths %u  samples %u  misses %u  ambiguous %u",
-                diagnostics.emittedPathCount,
-                diagnostics.emittedSampleCount,
-                diagnostics.projectionMissCount,
-                diagnostics.ambiguousHitCount);
-            ImGui::TextDisabled(
-                "Mesh timing: load %.1f ms  cache %.1f ms  solve %.1f ms",
-                diagnostics.meshLoadMilliseconds,
-                diagnostics.cacheBuildMilliseconds,
-                diagnostics.solveMilliseconds);
-            ImGui::TextDisabled(
-                "GPU update: static %.2f ms  live %.2f ms  dispatch %.2f ms  %s %s",
-                diagnostics.gpuStaticUploadMilliseconds,
-                diagnostics.gpuLiveUploadMilliseconds,
-                diagnostics.gpuDispatchMilliseconds,
-                diagnostics.gpuStaticBuffersReused ? "warm" : "rebuilt",
-                diagnostics.gpuAsynchronousDispatch ? "async" : "sync");
-        }
-        EndPanelSection();
-    }
 }
 
 void DrawWaterGpuRainPanel(
@@ -41394,36 +41346,11 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
-    if (runtimeState->water.movingDynamicMeshAttractorIndex.has_value() &&
-        renderViewportHovered &&
-        !viewport.UiWantsMouseCapture() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        if (MoveDynamicMeshAttractorAtScreenPoint(runtimeState, viewport, io.MousePos) &&
-            runtimeState->water.dynamicMeshFlowSettings.enabled) {
-            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, &viewport);
-        }
-        runtimeState->cameraInteraction.navigationActive = false;
-        return;
-    }
-    if (runtimeState->water.dynamicMeshAttractorPlacementArmed &&
-        renderViewportHovered &&
-        !viewport.UiWantsMouseCapture() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        if (PlaceDynamicMeshAttractorAtScreenPoint(runtimeState, viewport, io.MousePos) &&
-            runtimeState->water.dynamicMeshFlowSettings.enabled) {
-            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, &viewport);
-        }
-        runtimeState->cameraInteraction.navigationActive = false;
-        return;
-    }
     if (runtimeState->water.movingEmitterIndex.has_value() &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        if (MoveWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos) &&
-            runtimeState->water.dynamicMeshFlowSettings.enabled) {
-            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, &viewport);
-        }
+        MoveWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos);
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
@@ -41431,10 +41358,7 @@ void UpdateCameraFromInput(
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        if (PlaceWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos) &&
-            runtimeState->water.dynamicMeshFlowSettings.enabled) {
-            RefreshWaterDynamicMeshFlowOverlayFromUiEdit(runtimeState, &viewport);
-        }
+        PlaceWaterEmitterAtScreenPoint(runtimeState, viewport, io.MousePos);
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
@@ -43275,6 +43199,28 @@ struct GuiSmokeReport {
     std::filesystem::path patternContactSheetExrPath;
     double patternContactSheetMs = 0.0;
     std::vector<RipplePatternMetric> patternMetrics;
+    std::string meshFlowGroundSource;
+    std::string meshFlowGroundBounds;
+    std::size_t meshFlowGroundCellCount = 0U;
+    double meshFlowLightExpectedOccupancy = 0.0;
+    double meshFlowHeavyExpectedOccupancy = 0.0;
+    double meshFlowLightWeightedConvergence = 0.0;
+    double meshFlowHeavyWeightedConvergence = 0.0;
+    double meshFlowHeavyRillProminenceRatio = 0.0;
+    double meshFlowLightChangedPixelOccupancy = 0.0;
+    double meshFlowHeavyChangedPixelOccupancy = 0.0;
+    double meshFlowRecessionChangedPixelOccupancy = 0.0;
+    double meshFlowSaturatedWhitePixelFraction = 0.0;
+    double meshFlowHeavyToLightTileRatio = 0.0;
+    double meshFlowRecessionSpatialOverlap = 0.0;
+    double meshFlowMaximumPopulationChangeFraction = 0.0;
+    std::uint32_t meshFlowAutomaticEntryCandidateCount = 0U;
+    std::array<std::uint32_t, 3> meshFlowVisualActiveParticles{};
+    std::uint32_t meshFlowMaximumAvailableRainSeeds = 0U;
+    std::uint32_t meshFlowMaximumRainFedParticles = 0U;
+    std::filesystem::path meshFlowVisualContactSheetPpmPath;
+    std::vector<std::filesystem::path> meshFlowVisualFramePpmPaths;
+    std::vector<std::filesystem::path> meshFlowVisualFrameExrPaths;
 
     void Pass(std::string message) { passes.push_back(std::move(message)); }
     void Fail(std::string message) { failures.push_back(std::move(message)); }
@@ -43349,6 +43295,76 @@ bool WriteGuiSmokeReport(const GuiSmokeReport& report) {
                << ",\"active_sample_count\":" << metric.activeSampleCount
                << ",\"mean_temporal_delta\":" << FormatFixed(metric.meanTemporalDelta, 6)
                << '}';
+    }
+    output << "],\n";
+    output << "  \"mesh_flow_ground_source\": \""
+           << JsonEscape(report.meshFlowGroundSource) << "\",\n";
+    output << "  \"mesh_flow_ground_bounds\": \""
+           << JsonEscape(report.meshFlowGroundBounds) << "\",\n";
+    output << "  \"mesh_flow_ground_cell_count\": "
+           << report.meshFlowGroundCellCount << ",\n";
+    output << "  \"mesh_flow_light_expected_occupancy\": "
+           << FormatFixed(report.meshFlowLightExpectedOccupancy, 6) << ",\n";
+    output << "  \"mesh_flow_heavy_expected_occupancy\": "
+           << FormatFixed(report.meshFlowHeavyExpectedOccupancy, 6) << ",\n";
+    output << "  \"mesh_flow_light_weighted_convergence\": "
+           << FormatFixed(report.meshFlowLightWeightedConvergence, 6) << ",\n";
+    output << "  \"mesh_flow_heavy_weighted_convergence\": "
+           << FormatFixed(report.meshFlowHeavyWeightedConvergence, 6) << ",\n";
+    output << "  \"mesh_flow_heavy_rill_prominence_ratio\": "
+           << FormatFixed(report.meshFlowHeavyRillProminenceRatio, 6) << ",\n";
+    output << "  \"mesh_flow_light_changed_pixel_occupancy\": "
+           << FormatFixed(report.meshFlowLightChangedPixelOccupancy, 6) << ",\n";
+    output << "  \"mesh_flow_heavy_changed_pixel_occupancy\": "
+           << FormatFixed(report.meshFlowHeavyChangedPixelOccupancy, 6) << ",\n";
+    output << "  \"mesh_flow_recession_changed_pixel_occupancy\": "
+           << FormatFixed(report.meshFlowRecessionChangedPixelOccupancy, 6)
+           << ",\n";
+    output << "  \"mesh_flow_saturated_white_pixel_fraction\": "
+           << FormatFixed(report.meshFlowSaturatedWhitePixelFraction, 6)
+           << ",\n";
+    output << "  \"mesh_flow_heavy_to_light_tile_ratio\": "
+           << FormatFixed(report.meshFlowHeavyToLightTileRatio, 6) << ",\n";
+    output << "  \"mesh_flow_recession_spatial_overlap\": "
+           << FormatFixed(report.meshFlowRecessionSpatialOverlap, 6) << ",\n";
+    output << "  \"mesh_flow_maximum_population_change_fraction\": "
+           << FormatFixed(report.meshFlowMaximumPopulationChangeFraction, 6)
+           << ",\n";
+    output << "  \"mesh_flow_automatic_entry_candidate_count\": "
+           << report.meshFlowAutomaticEntryCandidateCount << ",\n";
+    output << "  \"mesh_flow_visual_active_particles\": ["
+           << report.meshFlowVisualActiveParticles[0] << ", "
+           << report.meshFlowVisualActiveParticles[1] << ", "
+           << report.meshFlowVisualActiveParticles[2] << "],\n";
+    output << "  \"mesh_flow_maximum_available_rain_seeds\": "
+           << report.meshFlowMaximumAvailableRainSeeds << ",\n";
+    output << "  \"mesh_flow_maximum_rain_fed_particles\": "
+           << report.meshFlowMaximumRainFedParticles << ",\n";
+    output << "  \"mesh_flow_visual_contact_sheet_ppm\": \""
+           << JsonEscape(report.meshFlowVisualContactSheetPpmPath.string())
+           << "\",\n";
+    output << "  \"mesh_flow_visual_frame_ppm\": [";
+    for (std::size_t index = 0U;
+         index < report.meshFlowVisualFramePpmPaths.size();
+         ++index) {
+        if (index > 0U) {
+            output << ", ";
+        }
+        output << '"'
+               << JsonEscape(report.meshFlowVisualFramePpmPaths[index].string())
+               << '"';
+    }
+    output << "],\n";
+    output << "  \"mesh_flow_visual_frame_exr\": [";
+    for (std::size_t index = 0U;
+         index < report.meshFlowVisualFrameExrPaths.size();
+         ++index) {
+        if (index > 0U) {
+            output << ", ";
+        }
+        output << '"'
+               << JsonEscape(report.meshFlowVisualFrameExrPaths[index].string())
+               << '"';
     }
     output << "],\n";
     writeStringArray("passes", report.passes);
@@ -44421,17 +44437,28 @@ int RunWaterSeepageSmoke(
     runtimeState->pointCloudScenes = BuildScenePointCloudRuntimeStates(
         assetCatalog,
         &runtimeState->sessions);
-    const auto targetFilename = benchmark100M
-                                    ? std::filesystem::path{"Site3-Mid-1mm100M.ply"}
-                                    : std::filesystem::path{"Site1-ROCK-3mm.Sample.ply"};
     const auto targetSessionIt = std::find_if(
         runtimeState->sessions.begin(),
         runtimeState->sessions.end(),
-        [&](const PreviewLayerSession& session) { return session.sourcePath.filename() == targetFilename; });
+        [&](const PreviewLayerSession& session) {
+            if (benchmark100M) {
+                return session.sourcePath.filename() ==
+                       "Site3-Mid-1mm100M.ply";
+            }
+            return session.sceneGroupName == "SampleScene" &&
+                   NormalizeSceneRoleName(session.sceneRole) == "ROCK" &&
+                   std::fabs(
+                       EffectivePointSpacingMeters(session) - 0.003F) <=
+                       1.0e-6F;
+        });
     if (targetSessionIt == runtimeState->sessions.end()) {
-        report.Fail(targetFilename.string() + " was not discovered.");
+        report.Fail(
+            benchmark100M
+                ? "Site3-Mid-1mm100M.ply was not discovered."
+                : "SampleScene did not provide a 3 mm ROCK display source.");
         return finish();
     }
+    const auto targetFilename = targetSessionIt->sourcePath.filename();
     const auto targetSessionIndex = static_cast<std::size_t>(
         std::distance(runtimeState->sessions.begin(), targetSessionIt));
 
@@ -44489,6 +44516,45 @@ int RunWaterSeepageSmoke(
     }
     const double baselineMedianMs = PercentileValue(baselineTimes, 0.50);
 
+    if (!benchmark100M) {
+        // Connected Seepage support is selected from the immutable shared
+        // surface cache.  This legacy focused smoke loads its display cloud
+        // directly, so install the matching SampleScene cache explicitly
+        // before asking the production topology path to resolve its nodes.
+        runtimeState->water.activeWaterSurfaceSceneGroupName =
+            session.sceneGroupName;
+        const auto cacheDeadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds{90};
+        while (std::chrono::steady_clock::now() < cacheDeadline &&
+               !window->ShouldClose()) {
+            EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+            PumpGuiSmokeFrame(window, runtimeState, viewport, nullptr);
+            const auto* activeScene = ActiveWaterSurfaceScene(runtimeState);
+            if (activeScene != nullptr &&
+                activeScene->waterSurfaceCacheStatus ==
+                    WaterSurfaceCacheRuntimeStatus::Valid &&
+                runtimeState->water.waterSurfaceCache != nullptr &&
+                viewport->WaterSurfaceFlowView().valid &&
+                viewport->WaterSurfaceFlowView().preprocessingComplete) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        const auto* activeScene = ActiveWaterSurfaceScene(runtimeState);
+        if (activeScene == nullptr ||
+            activeScene->waterSurfaceCacheStatus !=
+                WaterSurfaceCacheRuntimeStatus::Valid ||
+            runtimeState->water.waterSurfaceCache == nullptr) {
+            report.Fail(
+                "SampleScene shared surface cache was not ready for connected "
+                "Seepage support.");
+            return finish();
+        }
+        report.Pass(
+            "Installed the SampleScene shared surface cache before resolving "
+            "connected Seepage support.");
+    }
+
     if (!PlaceWaterSeepageNodeAtScreenPoint(
             runtimeState,
             *viewport,
@@ -44507,7 +44573,24 @@ int RunWaterSeepageSmoke(
     }
     InvalidateWaterSeepageTopology(&runtimeState->water);
     const auto topologyUploadStart = std::chrono::steady_clock::now();
-    EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+    const auto settleSeepageRuntime = [&](const auto& ready) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds{30};
+        do {
+            EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+            PumpGuiSmokeFrame(window, runtimeState, viewport, nullptr);
+            if (ready() &&
+                !runtimeState->water.seepageSupportJob.worker.joinable()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        } while (std::chrono::steady_clock::now() < deadline &&
+                 !window->ShouldClose());
+        return false;
+    };
+    settleSeepageRuntime([&]() {
+        return viewport->WaterSeepageNodeCount(targetSessionIndex) == 8U;
+    });
     report.recalculateEffectsMs = std::chrono::duration<double, std::milli>(
                                       std::chrono::steady_clock::now() - topologyUploadStart)
                                       .count();
@@ -44526,6 +44609,14 @@ int RunWaterSeepageSmoke(
             " MiB.");
     } else {
         report.Fail("Seepage auxiliary data exceeded 4 MiB.");
+    }
+
+    // Let every fenced parameter-ring slot observe the newly attached
+    // topology before taking the overlay-only revision baseline. Otherwise a
+    // normal first-use slot publication can be misattributed to the Structure
+    // Overlay toggle below.
+    for (int frame = 0; frame < 8; ++frame) {
+        PumpGuiSmokeFrame(window, runtimeState, viewport, nullptr);
     }
 
     const auto effectiveInvocations = EffectiveWaterSeepageShaderInvocations(*runtimeState);
@@ -44581,6 +44672,8 @@ int RunWaterSeepageSmoke(
         viewport->WaterSeepageParamsUploadRevision(targetSessionIndex);
     const auto structureGuideFingerprintsBefore =
         runtimeState->water.seepageSurfaceGuideFingerprints;
+    const auto structureSupportFingerprintsBefore =
+        runtimeState->water.seepageSupportNodeFingerprints;
     const auto selectedSeepageNodeBefore = runtimeState->water.selectedSeepageNodeIndex;
     const auto exportTopologyFingerprintBefore =
         exportGridReady
@@ -44640,11 +44733,30 @@ int RunWaterSeepageSmoke(
     const bool guideCacheUnchanged =
         runtimeState->water.seepageSurfaceGuideFingerprints ==
         structureGuideFingerprintsBefore;
-    if (exportUnchanged && revisionsUnchanged && guideCacheUnchanged &&
+    const bool supportCacheUnchanged =
+        runtimeState->water.seepageSupportNodeFingerprints ==
+        structureSupportFingerprintsBefore;
+    const bool topologyCacheUnchanged =
+        benchmark100M ? guideCacheUnchanged : supportCacheUnchanged;
+    if (exportUnchanged && revisionsUnchanged && topologyCacheUnchanged &&
         runtimeState->water.selectedSeepageNodeIndex == selectedSeepageNodeBefore) {
-        report.Pass("Structure Overlay remained a viewport-only preference with unchanged GPU, guide, and export data.");
+        report.Pass(
+            "Structure Overlay remained a viewport-only preference with "
+            "unchanged GPU, support, and export data.");
     } else {
-        report.Fail("Structure Overlay changed Seepage runtime, guide, selection, or export state.");
+        report.Fail(
+            "Structure Overlay changed Seepage runtime, support, selection, or "
+            "export state (export=" +
+            std::to_string(exportUnchanged ? 1 : 0) +
+            ", revisions=" + std::to_string(revisionsUnchanged ? 1 : 0) +
+            ", support=" + std::to_string(topologyCacheUnchanged ? 1 : 0) +
+            ", selection=" +
+            std::to_string(
+                runtimeState->water.selectedSeepageNodeIndex ==
+                        selectedSeepageNodeBefore
+                    ? 1
+                    : 0) +
+            ").");
     }
 
     std::vector<double> seepageTimes;
@@ -44705,60 +44817,56 @@ int RunWaterSeepageSmoke(
         report.Fail("Rain unexpectedly rebuilt Seepage topology.");
     }
 
-    const auto editedNodeId = runtimeState->water.seepageNodes.front().id;
+    const auto supportBuildsBeforeGeometryEdit =
+        runtimeState->water.seepageSupportBuildRevision;
     const auto guideBuildsBeforeGeometryEdit =
         runtimeState->water.seepageSurfaceGuideBuildCount;
-    const auto nodeGuideFingerprintsBeforeGeometryEdit =
-        runtimeState->water.seepageSurfaceGuideNodeFingerprints;
+    const auto topologyBeforeGeometryEdit =
+        viewport->WaterSeepageTopologyUploadRevision(targetSessionIndex);
     runtimeState->water.seepageNodes.front().depthToleranceMeters += 0.01F;
     InvalidateWaterSeepageTopology(&runtimeState->water);
-    EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
-    const auto onlyEditedNodeGuideChanged =
-        [&](const auto& previousBySupport) {
-            bool unchangedNodeGuidesPreserved = true;
-            bool editedNodeGuideChanged = false;
-            for (const auto& [supportKey, previousFingerprints] : previousBySupport) {
-                const auto currentSupport =
-                    runtimeState->water.seepageSurfaceGuideNodeFingerprints.find(supportKey);
-                if (currentSupport ==
-                    runtimeState->water.seepageSurfaceGuideNodeFingerprints.end()) {
-                    unchangedNodeGuidesPreserved = false;
-                    continue;
-                }
-                for (const auto& [nodeId, previousFingerprint] : previousFingerprints) {
-                    const auto currentFingerprint = currentSupport->second.find(nodeId);
-                    if (currentFingerprint == currentSupport->second.end()) {
-                        unchangedNodeGuidesPreserved = false;
-                    } else if (nodeId == editedNodeId) {
-                        editedNodeGuideChanged |=
-                            currentFingerprint->second != previousFingerprint;
-                    } else if (currentFingerprint->second != previousFingerprint) {
-                        unchangedNodeGuidesPreserved = false;
-                    }
-                }
-            }
-            return editedNodeGuideChanged && unchangedNodeGuidesPreserved;
-        };
+    settleSeepageRuntime([&]() {
+        return runtimeState->water.seepageSupportBuildRevision >
+                   supportBuildsBeforeGeometryEdit &&
+               viewport->WaterSeepageNodeCount(targetSessionIndex) == 8U;
+    });
     const bool depthEditWasRoleLocal =
-        onlyEditedNodeGuideChanged(nodeGuideFingerprintsBeforeGeometryEdit) &&
+        runtimeState->water.seepageSupportBuildRevision ==
+            supportBuildsBeforeGeometryEdit + 1U &&
         runtimeState->water.seepageSurfaceGuideBuildCount ==
-            guideBuildsBeforeGeometryEdit + 1U;
+            guideBuildsBeforeGeometryEdit &&
+        viewport->WaterSeepageTopologyUploadRevision(targetSessionIndex) >
+            topologyBeforeGeometryEdit;
 
+    const auto supportBuildsBeforeEdgeEdit =
+        runtimeState->water.seepageSupportBuildRevision;
     const auto guideBuildsBeforeEdgeEdit =
         runtimeState->water.seepageSurfaceGuideBuildCount;
-    const auto nodeGuideFingerprintsBeforeEdgeEdit =
-        runtimeState->water.seepageSurfaceGuideNodeFingerprints;
+    const auto topologyBeforeEdgeEdit =
+        viewport->WaterSeepageTopologyUploadRevision(targetSessionIndex);
     runtimeState->water.seepageNodes.front().edgeFeatherMeters += 0.005F;
     InvalidateWaterSeepageTopology(&runtimeState->water);
-    EnsureWaterSeepageRuntimeUpToDate(runtimeState, viewport);
+    settleSeepageRuntime([&]() {
+        return runtimeState->water.seepageSupportBuildRevision >
+                   supportBuildsBeforeEdgeEdit &&
+               viewport->WaterSeepageNodeCount(targetSessionIndex) == 8U;
+    });
     const bool edgeEditWasRoleLocal =
-        onlyEditedNodeGuideChanged(nodeGuideFingerprintsBeforeEdgeEdit) &&
+        runtimeState->water.seepageSupportBuildRevision ==
+            supportBuildsBeforeEdgeEdit + 1U &&
         runtimeState->water.seepageSurfaceGuideBuildCount ==
-            guideBuildsBeforeEdgeEdit + 1U;
+            guideBuildsBeforeEdgeEdit &&
+        viewport->WaterSeepageTopologyUploadRevision(targetSessionIndex) >
+            topologyBeforeEdgeEdit;
     if (depthEditWasRoleLocal && edgeEditWasRoleLocal) {
-        report.Pass("Seepage surface-depth and edge-feather edits each retraced only the changed node guide before one compact topology replacement.");
+        report.Pass(
+            "Seepage surface-depth and edge-feather edits each rebuilt only "
+            "the changed node's connected cache support before one compact "
+            "topology replacement.");
     } else {
-        report.Fail("A one-node Seepage surface-depth or edge-feather edit retraced unaffected node guides.");
+        report.Fail(
+            "A one-node Seepage surface-depth or edge-feather edit rebuilt "
+            "unaffected connected support.");
     }
 
     // A GPU Flow-spline session is marked loaded and renderable before its
@@ -44809,6 +44917,26 @@ int RunWaterSeepageSmoke(
     return finish();
 }
 
+struct WaterIntegrationCapturedFrame {
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    std::vector<std::uint8_t> rgb;
+};
+
+std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFrameState& frameState,
+    float simulatedSeconds,
+    const std::filesystem::path& exrPath,
+    const std::filesystem::path& ppmPath,
+    std::string* errorMessage);
+
+bool WriteWaterIntegrationContactSheet(
+    const std::filesystem::path& outputPath,
+    std::span<const WaterIntegrationCapturedFrame> frames,
+    std::string* errorMessage);
+
 int RunDynamicMeshFlowGroundSmoke(
     const GuiSmokeOptions& options,
     const invisible_places::io::AssetCatalog& assetCatalog,
@@ -44817,10 +44945,17 @@ int RunDynamicMeshFlowGroundSmoke(
     PreviewRuntimeState* runtimeState) {
     GuiSmokeReport report;
     report.scenario = options.scenario;
+    const bool scene1Visual =
+        options.scenario == "dynamic-mesh-flow-scene1-visual";
+    const std::string expectedSceneName =
+        scene1Visual ? "Scene1" : "SampleScene";
     const auto outputDirectory = options.outputDirectory.empty()
                                      ? std::filesystem::path{"build/macos-debug/water-region-smoke"}
                                      : options.outputDirectory;
-    report.outputPath = outputDirectory / "dynamic-mesh-flow-ground.json";
+    report.outputPath = outputDirectory /
+        (scene1Visual
+             ? "dynamic-mesh-flow-scene1-visual.json"
+             : "dynamic-mesh-flow-ground.json");
 
     auto finish = [&]() {
         if (!WriteGuiSmokeReport(report)) {
@@ -44835,9 +44970,11 @@ int RunDynamicMeshFlowGroundSmoke(
         return finish();
     }
 
-    const auto projectPath =
-        assetCatalog.dataRoot.parent_path() / "Saved" / "validation" /
-        "SampleSceneValidation_project.json";
+    const auto projectPath = scene1Visual
+        ? assetCatalog.dataRoot.parent_path() / "Saved" /
+              "exhibitionScene_project.json"
+        : assetCatalog.dataRoot.parent_path() / "Saved" / "validation" /
+              "SampleSceneValidation_project.json";
     std::string loadError;
     const auto project =
         invisible_places::serialization::LoadProjectDocument(
@@ -44845,17 +44982,30 @@ int RunDynamicMeshFlowGroundSmoke(
             &loadError);
     if (!project.has_value()) {
         report.Fail(
-            "The schema-44 SampleScene validation project did not load: " +
+            "The schema-45 " + expectedSceneName +
+            " validation project did not load: " +
             loadError);
         return finish();
     }
     if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
         report.Fail(
-            "The SampleScene validation project could not be applied: " +
+            "The " + expectedSceneName +
+            " validation project could not be applied: " +
             (runtimeState->errorMessage.empty()
                  ? runtimeState->statusMessage
                  : runtimeState->errorMessage));
         return finish();
+    }
+    if (scene1Visual) {
+        const auto topViewPath =
+            DefaultAnimationDirectory(assetCatalog.dataRoot) /
+            "Top_View.ipanim.json";
+        if (!LoadAnimationPathFromFile(runtimeState, topViewPath)) {
+            report.Fail(
+                "Scene1 Mesh Flow visual smoke could not load Top_View: " +
+                runtimeState->errorMessage);
+            return finish();
+        }
     }
 
     auto& water = runtimeState->water;
@@ -44865,25 +45015,35 @@ int RunDynamicMeshFlowGroundSmoke(
     water.dynamicMeshFlowSettings.showTrails = true;
     water.dynamicMeshFlowSettings.automaticSources = true;
     water.dynamicMeshFlowResetRequested = true;
-    // The first phase deliberately has no authored source. Automatic +X-edge
-    // spawning is the default aquifer/runoff behaviour; authored points are
-    // optional local overrides and must not be required to start the solver.
-    runtimeState->water.emitters.clear();
+    water.collisionRainSettings.enabled = false;
+    // Keep every ordinary Flow source loaded. They remain independently
+    // editable and exportable, but the automatic Mesh request has no source
+    // list and therefore cannot consume SampleFlowPoint (or any other
+    // WaterEmitter) as a seed.
+    if (water.emitters.empty()) {
+        WaterEmitter ordinaryFlowProbe;
+        ordinaryFlowProbe.id = 9001U;
+        ordinaryFlowProbe.name = "SampleFlowPoint";
+        ordinaryFlowProbe.status = WaterEmitterStatus::Accepted;
+        ordinaryFlowProbe.strength = 1.0F;
+        water.emitters.push_back(std::move(ordinaryFlowProbe));
+    }
+    const std::size_t ordinaryFlowSourceCount = water.emitters.size();
     StartQueuedLayerLoadIfIdle(runtimeState);
 
-    auto findSampleScene = [&]() -> ScenePointCloudRuntime* {
+    auto findExpectedScene = [&]() -> ScenePointCloudRuntime* {
         const auto found = std::find_if(
             runtimeState->pointCloudScenes.begin(),
             runtimeState->pointCloudScenes.end(),
-            [](const auto& scene) {
-                return scene.sceneGroupName == "SampleScene";
+            [&](const auto& scene) {
+                return scene.sceneGroupName == expectedSceneName;
             });
         return found == runtimeState->pointCloudScenes.end() ? nullptr : &*found;
     };
 
     const auto startupStartedAt = std::chrono::steady_clock::now();
-    const auto startupDeadline =
-        startupStartedAt + std::chrono::seconds{120};
+    const auto startupDeadline = startupStartedAt +
+        (scene1Visual ? std::chrono::seconds{300} : std::chrono::seconds{120});
     std::vector<double> frameTimesMs;
     std::size_t startupFrame = 0U;
     while (std::chrono::steady_clock::now() < startupDeadline &&
@@ -44900,7 +45060,7 @@ int RunDynamicMeshFlowGroundSmoke(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frameStartedAt)
                 .count());
-        const auto* scene = findSampleScene();
+        const auto* scene = findExpectedScene();
         const bool displayReady =
             scene != nullptr && scene->displayLoaded &&
             scene->displayVisible &&
@@ -44921,12 +45081,13 @@ int RunDynamicMeshFlowGroundSmoke(
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
     }
 
-    auto* scene = findSampleScene();
+    auto* scene = findExpectedScene();
     if (scene == nullptr || water.waterSurfaceCache == nullptr ||
         !viewport->WaterGroundFlowView().valid ||
         !water.dynamicMeshFlowGpuSessionIndex.has_value()) {
         report.Fail(
-            "SampleScene display, schema-4 Ground cache, or GPU Mesh Flow "
+            expectedSceneName +
+            " display, schema-4 Ground cache, or GPU Mesh Flow "
             "did not become ready before the deadline: " +
             (runtimeState->errorMessage.empty()
                  ? runtimeState->statusMessage
@@ -44948,24 +45109,156 @@ int RunDynamicMeshFlowGroundSmoke(
                    !source.isFallback;
         });
     const auto groundView = viewport->WaterGroundFlowView();
+    const std::string expectedGroundFilename = scene1Visual
+        ? "Site1-MESHSampled-5mm.ply"
+        : "Site1-MeshSampled-5mm-SampleScene.ply";
+    const float groundSpanX =
+        groundView.bounds.maximum.x - groundView.bounds.minimum.x;
+    const float groundSpanY =
+        groundView.bounds.maximum.y - groundView.bounds.minimum.y;
+    const auto approximately = [](float value, float expected) {
+        return std::abs(value - expected) <= 0.025F;
+    };
+    const bool sceneScaleReady =
+        !scene1Visual ||
+        (water.waterSurfaceCache->groundSourcePointCount == 6'110'899U &&
+         water.waterSurfaceCache->groundCells.size() == 1'613'855U &&
+         groundView.bounds.valid &&
+         groundSpanX > 15.0F &&
+         groundSpanY > 25.0F &&
+         approximately(groundView.bounds.minimum.x, 298.415F) &&
+         approximately(groundView.bounds.minimum.y, 87.788F) &&
+         approximately(groundView.bounds.minimum.z, 0.157F) &&
+         approximately(groundView.bounds.maximum.x, 318.181F) &&
+         approximately(groundView.bounds.maximum.y, 119.530F) &&
+         approximately(groundView.bounds.maximum.z, 12.531F));
     const bool groundContractReady =
         groundSource != scene->waterSurfaceSources.end() &&
+        groundSource->sourcePath.filename() == expectedGroundFilename &&
+        NormalizePathKey(groundSource->sourcePath.parent_path()) ==
+            NormalizePathKey(scene->sourceFolder) &&
+        water.waterSurfaceSceneGroupName == scene->sceneGroupName &&
+        water.waterSurfaceCacheSignature == scene->waterSurfaceSignature &&
+        water.waterSurfaceCache->signature == scene->waterSurfaceSignature &&
+        groundView.cacheIdentity != nullptr &&
+        *groundView.cacheIdentity == water.waterSurfaceCache->cacheIdentity &&
         water.waterSurfaceCache->schemaVersion ==
             invisible_places::water::kWaterSurfaceCacheSchemaVersion &&
         !water.waterSurfaceCache->groundCells.empty() &&
         water.waterSurfaceCache->groundSourcePointCount > 0U &&
         groundView.occupiedCellCount ==
             water.waterSurfaceCache->groundCells.size() &&
-        std::abs(groundView.resolutionMeters - 0.010F) <= 1.0e-6F;
+        std::abs(groundView.resolutionMeters - 0.010F) <= 1.0e-6F &&
+        sceneScaleReady;
     if (groundContractReady) {
         report.Pass(
-            "SampleScene used its active 5 mm MESHSampled cloud through "
+            expectedSceneName +
+            " used its active 5 mm MESHSampled cloud through "
             "the persisted schema-4 10 mm Ground table.");
     } else {
         report.Fail(
             "The active-scene sampled Ground source or 10 mm GPU hash did "
             "not satisfy the shared-cache contract.");
         return finish();
+    }
+    report.meshFlowGroundSource =
+        groundSource->sourcePath.lexically_normal().generic_string();
+    report.meshFlowGroundCellCount =
+        water.waterSurfaceCache->groundCells.size();
+    {
+        std::ostringstream bounds;
+        bounds << '['
+               << FormatFixed(groundView.bounds.minimum.x, 3) << ','
+               << FormatFixed(groundView.bounds.minimum.y, 3) << ','
+               << FormatFixed(groundView.bounds.minimum.z, 3) << "]-["
+               << FormatFixed(groundView.bounds.maximum.x, 3) << ','
+               << FormatFixed(groundView.bounds.maximum.y, 3) << ','
+               << FormatFixed(groundView.bounds.maximum.z, 3) << ']';
+        report.meshFlowGroundBounds = bounds.str();
+    }
+
+    // Evaluate the same scalar regime used by the compute shader over resident
+    // Ground metadata. This is diagnostic-only: it does not scan a PLY, alter
+    // topology, or upload another table.
+    double lightAcceptance = 0.0;
+    double heavyAcceptance = 0.0;
+    double lightConvergenceWeight = 0.0;
+    double lightWeight = 0.0;
+    double heavyConvergenceWeight = 0.0;
+    double heavyWeight = 0.0;
+    double openProminence = 0.0;
+    double rillProminence = 0.0;
+    std::size_t openCount = 0U;
+    std::size_t rillCount = 0U;
+    for (const auto& cell : water.waterSurfaceCache->groundCells) {
+        const auto light =
+            invisible_places::water::EvaluateWaterDynamicMeshFlowVisualWeights(
+                water.dynamicMeshFlowSettings,
+                cell.convergence,
+                0.0F,
+                cell.confidence);
+        const auto heavy =
+            invisible_places::water::EvaluateWaterDynamicMeshFlowVisualWeights(
+                water.dynamicMeshFlowSettings,
+                cell.convergence,
+                1.0F,
+                cell.confidence);
+        lightAcceptance += light.automaticSpawnAcceptance;
+        heavyAcceptance += heavy.automaticSpawnAcceptance;
+        const double lightCellWeight =
+            static_cast<double>(light.automaticSpawnAcceptance) *
+            light.trailProminence;
+        const double heavyCellWeight =
+            static_cast<double>(heavy.automaticSpawnAcceptance) *
+            heavy.trailProminence;
+        lightConvergenceWeight += cell.convergence * lightCellWeight;
+        lightWeight += lightCellWeight;
+        heavyConvergenceWeight += cell.convergence * heavyCellWeight;
+        heavyWeight += heavyCellWeight;
+        if (cell.convergence <= 0.20F) {
+            openProminence += heavy.trailProminence;
+            ++openCount;
+        }
+        if (cell.convergence >= 0.60F) {
+            rillProminence += heavy.trailProminence;
+            ++rillCount;
+        }
+    }
+    const double groundCellCount =
+        static_cast<double>(water.waterSurfaceCache->groundCells.size());
+    if (groundCellCount > 0.0) {
+        report.meshFlowLightExpectedOccupancy =
+            lightAcceptance / groundCellCount;
+        report.meshFlowHeavyExpectedOccupancy =
+            heavyAcceptance / groundCellCount;
+    }
+    if (lightWeight > 0.0) {
+        report.meshFlowLightWeightedConvergence =
+            lightConvergenceWeight / lightWeight;
+    }
+    if (heavyWeight > 0.0) {
+        report.meshFlowHeavyWeightedConvergence =
+            heavyConvergenceWeight / heavyWeight;
+    }
+    if (openCount > 0U && rillCount > 0U) {
+        report.meshFlowHeavyRillProminenceRatio =
+            (rillProminence / static_cast<double>(rillCount)) /
+            std::max(
+                1.0e-6,
+                openProminence / static_cast<double>(openCount));
+    }
+    if (report.meshFlowLightWeightedConvergence >
+            report.meshFlowHeavyWeightedConvergence * 1.10 &&
+        report.meshFlowHeavyExpectedOccupancy >
+            report.meshFlowLightExpectedOccupancy * 1.35 &&
+        report.meshFlowHeavyRillProminenceRatio > 1.35) {
+        report.Pass(
+            "Ground metadata predicts a convergence-biased light mode and a "
+            "broader heavy mode whose rills remain distinctly prominent.");
+    } else {
+        report.Fail(
+            "Ground visual weights did not distinguish concavity-biased light "
+            "flow from broader, rill-emphasized heavy flow.");
     }
 
     const auto sessionIndex =
@@ -44984,6 +45277,7 @@ int RunDynamicMeshFlowGroundSmoke(
     if (initialSession.loaded && initialSession.gpuResident &&
         initialSession.visible && initialSession.cpuResident == false &&
         initialSession.offlinePointCloud == nullptr &&
+        initialSession.sceneGroupName == scene->sceneGroupName &&
         initialSession.totalPrimitives == expectedPointCount &&
         initialSession.sourcePath.stem().string().ends_with(
             "-DynamicMeshTrails")) {
@@ -44994,6 +45288,75 @@ int RunDynamicMeshFlowGroundSmoke(
         report.Fail(
             "The active Mesh Flow session was not the expected GPU-only "
             "fixed-capacity history.");
+        return finish();
+    }
+
+    // Reproduce the former cross-scene failure without allocating another
+    // display bundle: make one foreign scene look committed while the
+    // generated Mesh Flow overlay is selected. Explicit overlay ownership
+    // must keep the active shared cache on its scene, regardless of catalog
+    // order or how many other displays are resident.
+    const auto selectedSessionBeforeOwnershipCheck =
+        runtimeState->selectedSessionIndex;
+    runtimeState->selectedSessionIndex = sessionIndex;
+    ScenePointCloudRuntime* foreignScene = nullptr;
+    PreviewLayerSession* foreignSession = nullptr;
+    bool foreignDisplayLoaded = false;
+    bool foreignDisplayVisible = false;
+    bool foreignSessionLoaded = false;
+    bool foreignSessionGpuResident = false;
+    bool foreignSessionCommitted = false;
+    for (auto& candidate : runtimeState->pointCloudScenes) {
+        if (candidate.sceneGroupName == scene->sceneGroupName) {
+            continue;
+        }
+        const auto committed = std::find_if(
+            candidate.committedDisplaySessionIndices.begin(),
+            candidate.committedDisplaySessionIndices.end(),
+            [](const std::optional<std::size_t>& index) {
+                return index.has_value();
+            });
+        if (committed == candidate.committedDisplaySessionIndices.end() ||
+            committed->value() >= runtimeState->sessions.size()) {
+            continue;
+        }
+        foreignScene = &candidate;
+        foreignSession = &runtimeState->sessions[committed->value()];
+        foreignDisplayLoaded = candidate.displayLoaded;
+        foreignDisplayVisible = candidate.displayVisible;
+        foreignSessionLoaded = foreignSession->loaded;
+        foreignSessionGpuResident = foreignSession->gpuResident;
+        foreignSessionCommitted = foreignSession->committedDisplaySource;
+        candidate.displayLoaded = true;
+        candidate.displayVisible = true;
+        foreignSession->loaded = true;
+        foreignSession->gpuResident = true;
+        foreignSession->committedDisplaySource = true;
+        break;
+    }
+    const auto* resolvedOverlayScene =
+        ActiveWaterSurfaceScene(runtimeState);
+    if (foreignScene != nullptr) {
+        foreignScene->displayLoaded = foreignDisplayLoaded;
+        foreignScene->displayVisible = foreignDisplayVisible;
+    }
+    if (foreignSession != nullptr) {
+        foreignSession->loaded = foreignSessionLoaded;
+        foreignSession->gpuResident = foreignSessionGpuResident;
+        foreignSession->committedDisplaySource = foreignSessionCommitted;
+    }
+    runtimeState->selectedSessionIndex =
+        selectedSessionBeforeOwnershipCheck;
+    if (foreignScene != nullptr && resolvedOverlayScene == scene) {
+        report.Pass(
+            "Selecting generated Mesh Flow retained its explicit " +
+            expectedSceneName +
+            " "
+            "cache owner while another scene was also committed and visible.");
+    } else {
+        report.Fail(
+            "Generated Mesh Flow selection did not preserve an explicit "
+            "scene-local cache owner with multiple loaded scenes.");
         return finish();
     }
 
@@ -45021,54 +45384,55 @@ int RunDynamicMeshFlowGroundSmoke(
     const auto parametersBefore =
         water.dynamicMeshFlowParameterRevision;
 
-    std::vector<double> parameterSamplesMs;
-    parameterSamplesMs.reserve(121U);
-    for (std::size_t sample = 0U; sample <= 120U; ++sample) {
-        const float amount = static_cast<float>(sample) / 120.0F;
-        auto& settings = water.dynamicMeshFlowSettings;
-        settings.particleNoiseStrength = 0.18F + 0.36F * amount;
-        settings.sharedWindStrength =
-            0.08F + 0.28F * std::sin(amount * 3.14159265359F);
-        settings.rainSpawnSpread = 0.25F + 0.70F * amount;
-        settings.speedMetersPerSecond = 0.14F + 0.22F * amount;
-        settings.trailWidthMeters = 0.004F + 0.008F * amount;
-
-        // Halfway through, add one authored local override. The fixed emitter
-        // buffer must absorb this without replacing particle/history storage.
-        if (sample == 60U && !water.waterSurfaceCache->groundCells.empty()) {
-            const auto& cell =
-                water.waterSurfaceCache->groundCells.front();
-            WaterEmitter overrideSource;
-            overrideSource.id = 9001U;
-            overrideSource.name = "Mesh Flow Smoke Override";
-            overrideSource.position = {
-                (static_cast<float>(cell.cellX) + 0.5F) *
-                    groundView.resolutionMeters,
-                (static_cast<float>(cell.cellY) + 0.5F) *
-                    groundView.resolutionMeters,
-                cell.height,
-            };
-            overrideSource.radius = 0.08F;
-            overrideSource.strength = 0.85F;
-            overrideSource.speed = 1.0F;
-            overrideSource.status = WaterEmitterStatus::Accepted;
-            water.emitters.push_back(std::move(overrideSource));
-        }
-
+    const auto meshFlowTimelineState = [&](float seconds) {
         auto frameState = ResolveWaterFrameState(runtimeState);
         auto scenario = frameState.rawScenarioState.value_or(
             invisible_places::water::WaterScenarioState{});
-        scenario.meshFlowLevel = 0.18F;
-        scenario.meshFlowRainGain = 0.90F;
+        float moisture = 0.0F;
+        if (seconds < 30.0F) {
+            const float settle = std::clamp(seconds / 30.0F, 0.0F, 1.0F);
+            scenario.meshFlowLevel = 0.005F + 0.015F * settle;
+            scenario.rainLevel = 0.0F;
+        } else if (seconds < 60.0F) {
+            const float rise =
+                std::clamp((seconds - 30.0F) / 30.0F, 0.0F, 1.0F);
+            scenario.meshFlowLevel = 0.06F + 0.29F * rise;
+            scenario.rainLevel = 0.0F;
+        } else if (seconds < 75.0F) {
+            const float rainRise =
+                std::clamp((seconds - 60.0F) / 15.0F, 0.0F, 1.0F);
+            scenario.meshFlowLevel = 0.35F;
+            scenario.rainLevel = rainRise;
+            moisture = 0.20F + 0.80F * rainRise;
+        } else {
+            const float recession =
+                1.0F -
+                std::clamp((seconds - 75.0F) / 45.0F, 0.0F, 1.0F);
+            scenario.meshFlowLevel = 0.18F + 0.17F * recession;
+            scenario.rainLevel = 0.0F;
+            moisture = 0.15F + 0.85F * recession;
+        }
+        scenario.meshFlowRainGain = 0.75F;
         scenario.meshFlowPersistenceScale = 1.4F;
         frameState.rawScenarioState = scenario;
-        frameState.meshFlowMoisture =
-            std::clamp(
-                amount < 0.70F
-                    ? amount / 0.70F
-                    : 1.0F - ((amount - 0.70F) / 0.30F),
-                0.0F,
-                1.0F);
+        frameState.meshFlowMoisture = moisture;
+        return frameState;
+    };
+
+    std::vector<double> parameterSamplesMs;
+    parameterSamplesMs.reserve(121U);
+    float parameterSimulationSeconds = 1.0F;
+    for (std::size_t sample = 0U; sample <= 120U; ++sample) {
+        auto frameState =
+            meshFlowTimelineState(static_cast<float>(sample));
+        const float moisture = frameState.meshFlowMoisture;
+        auto& settings = water.dynamicMeshFlowSettings;
+        settings.particleNoiseStrength = 0.24F + 0.14F * moisture;
+        settings.sharedWindStrength =
+            0.08F + 0.16F * moisture;
+        settings.rainSpawnSpread = 0.80F;
+        settings.speedMetersPerSecond = 0.24F + 0.18F * moisture;
+        settings.trailWidthMeters = 0.004F + 0.003F * moisture;
 
         const auto updateStartedAt =
             std::chrono::steady_clock::now();
@@ -45076,7 +45440,7 @@ int RunDynamicMeshFlowGroundSmoke(
                 runtimeState,
                 viewport,
                 frameState,
-                static_cast<float>(sample))) {
+                parameterSimulationSeconds)) {
             report.Fail(
                 "A parameter-only Mesh Flow update failed: " +
                 runtimeState->errorMessage);
@@ -45098,20 +45462,94 @@ int RunDynamicMeshFlowGroundSmoke(
             BuildRenderState(
                 *runtimeState,
                 *viewport,
-                static_cast<float>(sample),
+                parameterSimulationSeconds,
                 &frameState));
         viewport->DrawFrame();
+        parameterSimulationSeconds += 1.0F / 30.0F;
     }
 
-    // Sparse timeline samples above intentionally behave like seeks. Run a
-    // bounded presentation-cadence phase as well, proving that persistent GPU
-    // particles can reach terminal Ground cells and publish cloud-response
-    // events without a CPU route bake.
+    // A stable hashed population must settle without a synchronized flash.
+    // Rain is disabled here so the still-loaded ordinary Flow sources also
+    // prove that they cannot enter the GPU VEG-impact seed path.
+    std::vector<std::uint32_t> stablePopulationCounts;
+    stablePopulationCounts.reserve(90U);
+    auto stableFrame = meshFlowTimelineState(52.0F);
+    auto stableScenario = stableFrame.rawScenarioState.value_or(
+        invisible_places::water::WaterScenarioState{});
+    stableScenario.meshFlowLevel = 0.55F;
+    stableScenario.meshFlowRainGain = 0.0F;
+    stableScenario.rainLevel = 0.0F;
+    stableFrame.rawScenarioState = stableScenario;
+    stableFrame.meshFlowMoisture = 0.35F;
+    for (std::uint32_t frame = 0U; frame < 90U; ++frame) {
+        if (!EnsureWaterDynamicMeshFlowGpuUpToDate(
+                runtimeState,
+                viewport,
+                stableFrame,
+                parameterSimulationSeconds)) {
+            report.Fail(
+                "The 90-frame Mesh Flow population-stability sequence failed: " +
+                runtimeState->errorMessage);
+            return finish();
+        }
+        stablePopulationCounts.push_back(
+            water.dynamicMeshFlowDiagnostics.emittedPathCount);
+        viewport->BeginUiFrame();
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->UpdateRenderState(
+            BuildRenderState(
+                *runtimeState,
+                *viewport,
+                parameterSimulationSeconds,
+                &stableFrame));
+        viewport->DrawFrame();
+        parameterSimulationSeconds += 1.0F / 30.0F;
+    }
+    for (std::size_t index = 4U;
+         index < stablePopulationCounts.size();
+         ++index) {
+        const auto previous = stablePopulationCounts[index - 1U];
+        const auto current = stablePopulationCounts[index];
+        const double change =
+            static_cast<double>(
+                previous > current ? previous - current : current - previous) /
+            static_cast<double>(std::max<std::uint32_t>(1U, previous));
+        report.meshFlowMaximumPopulationChangeFraction =
+            std::max(
+                report.meshFlowMaximumPopulationChangeFraction,
+                change);
+    }
+    if (report.meshFlowMaximumPopulationChangeFraction < 0.10) {
+        report.Pass(
+            "The 90-frame fixed-camera population remained stable with no "
+            "synchronized flash or per-frame change of 10%.");
+    } else {
+        report.Fail(
+            "The fixed-camera Mesh Flow population changed by 10% or more "
+            "without an explicit reset.");
+    }
+    if (ordinaryFlowSourceCount > 0U &&
+        water.dynamicMeshFlowDiagnostics.availableRainSeedCount == 0U &&
+        water.dynamicMeshFlowDiagnostics.rainSeedParticleCount == 0U) {
+        report.Pass(
+            "SampleFlowPoint and all ordinary Flow sources produced zero "
+            "automatic Mesh Flow seeds while Rain was disabled.");
+    } else {
+        report.Fail(
+            "An ordinary Flow source entered the automatic Mesh Flow seed "
+            "path, or a stale Rain seed survived the disabled-Rain phase.");
+    }
+
+    // Run a bounded presentation-cadence phase as well, proving that
+    // persistent automatic particles can reach terminal Ground cells and
+    // publish cloud-response events without a CPU route bake.
     water.dynamicMeshFlowSettings.speedMetersPerSecond = 1.0F;
     water.dynamicMeshFlowSettings.particleNoiseStrength = 0.12F;
     water.dynamicMeshFlowSettings.sharedWindStrength = 0.08F;
     for (std::size_t frame = 0U;
-         frame < 360U &&
+         frame < 1'200U &&
          water.dynamicMeshFlowContactEventCount == 0U;
          ++frame) {
         auto contactFrame = ResolveWaterFrameState(runtimeState);
@@ -45125,15 +45563,444 @@ int RunDynamicMeshFlowGroundSmoke(
                 runtimeState,
                 viewport,
                 contactFrame,
-                121.0F + static_cast<float>(frame) / 30.0F)) {
+                parameterSimulationSeconds)) {
             report.Fail(
                 "The continuous Mesh Flow terminal-contact phase failed: " +
                 runtimeState->errorMessage);
             return finish();
         }
+        // Exercise the compute dispatch at the same presentation cadence used
+        // by the application. This also advances graphics-queue fences before
+        // the next slot reads its mapped contact counters; dispatch-only loops
+        // can otherwise leave the final completed slot unobserved.
+        viewport->BeginUiFrame();
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->UpdateRenderState(
+            BuildRenderState(
+                *runtimeState,
+                *viewport,
+                parameterSimulationSeconds,
+                &contactFrame));
+        viewport->DrawFrame();
+        parameterSimulationSeconds += 1.0F / 30.0F;
     }
     const auto observedContactEventCount =
         water.dynamicMeshFlowContactEventCount;
+    const auto& routeDiagnostics =
+        water.dynamicMeshFlowDiagnostics;
+    if (routeDiagnostics.routeSampleCount > 0U &&
+        routeDiagnostics.routeWithinGroundBoundsFraction >= 0.99F &&
+        routeDiagnostics.routeWithinSurfaceToleranceFraction >= 0.99F &&
+        routeDiagnostics.maximumRenderedSegmentMeters <= 0.10F &&
+        routeDiagnostics.longSegmentCount == 0U &&
+        routeDiagnostics.unexplainedVerticalJumpCount == 0U &&
+        routeDiagnostics.medianTangentDownhillAlignment >= 0.75F) {
+        report.Pass(
+            "GPU route aggregates kept at least 99% of particles inside and "
+            "within 15 mm of " + expectedSceneName +
+            " Ground, with short downhill-tangent "
+            "segments and no unexplained vertical jump.");
+    } else {
+        report.Fail(
+            "GPU route aggregates detected an out-of-bounds/off-surface "
+            "particle, a long or vertical segment, or weak downhill "
+            "alignment.");
+    }
+
+    if (scene1Visual) {
+        std::error_code outputError;
+        std::filesystem::create_directories(outputDirectory, outputError);
+        if (outputError) {
+            report.Fail(
+                "Could not create the Scene1 Mesh Flow visual directory: " +
+                outputError.message());
+            return finish();
+        }
+
+        // Render three deliberately isolated states at one diagnostic camera.
+        // The simulation clock remains frame-continuous; only live water
+        // parameters change, so pixel occupancy and recession overlap are
+        // meaningful rather than camera-motion differences.
+        struct VisualPhase {
+            std::string_view label;
+            std::uint32_t settleFrames;
+            float meshLevel;
+            float moisture;
+            float rainLevel;
+        };
+        const std::array<VisualPhase, 3> visualPhases{{
+            // The dedicated diagnostic camera includes the authored +X entry
+            // band. Five seconds settles the deterministic two-second birth
+            // stagger and shows the first surface-bound rill segments before
+            // they travel out of this deliberately close comparison frame.
+            {"light-concavity", 150U, 1.0F, 0.0F, 0.0F},
+            {"rain-heavy-rills", 180U, 1.0F, 1.0F, 1.0F},
+            {"post-rain-recession", 2U, 0.85F, 0.65F, 0.0F},
+        }};
+        std::vector<WaterIntegrationCapturedFrame> capturedFrames;
+        capturedFrames.reserve(visualPhases.size());
+        std::vector<WaterIntegrationCapturedFrame> baselineFrames;
+        baselineFrames.reserve(visualPhases.size());
+        water.dynamicMeshFlowSettings =
+            invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
+        water.dynamicMeshFlowSettings.enabled = true;
+        water.dynamicMeshFlowSettings.showTrails = true;
+        // Earlier routing/contact stress phases intentionally leave arbitrary
+        // particle ages. Start this isolated visual comparison with one
+        // explicit test reset, then keep light, Rain, and recession fully
+        // continuous: none of their parameter changes may respawn particles.
+        water.dynamicMeshFlowResetRequested = true;
+        // Rain stays resident throughout the comparison. A zero Rain Level is
+        // dry, the middle phase writes real VEG collision seeds, and the final
+        // zero-level phase exercises moisture recession without invalidating
+        // the seed epoch.
+        water.collisionRainSettings.enabled = true;
+        float simulationClock = parameterSimulationSeconds;
+        runtimeState->animationPanel.scrubAmount = 68.0F / 120.0F;
+        ApplyAnimationScrub(runtimeState);
+        // Top_View's middle pan sees almost none of the automatic +X entry
+        // table. Frame the dense Scene1 vegetation-supported entry band and
+        // its first several downhill metres so light/heavy comparisons measure
+        // the authored automatic population rather than camera coincidence.
+        invisible_places::camera::CameraState meshFlowDiagnosticCamera;
+        meshFlowDiagnosticCamera.position = {312.5F, 84.0F, 13.5F};
+        meshFlowDiagnosticCamera.orientation = {0.0F, 0.0F, 0.0F, 0.0F};
+        meshFlowDiagnosticCamera.target = {312.0F, 90.8F, 5.8F};
+        meshFlowDiagnosticCamera.orbitCenter =
+            meshFlowDiagnosticCamera.target;
+        meshFlowDiagnosticCamera.hasOrbitCenter = false;
+        meshFlowDiagnosticCamera.hasDepthOfField = false;
+        meshFlowDiagnosticCamera.fovDegrees = 45.0F;
+        meshFlowDiagnosticCamera.nearPlane = 0.01F;
+        meshFlowDiagnosticCamera.farPlane = 100.0F;
+        runtimeState->camera.ApplyState(meshFlowDiagnosticCamera);
+        runtimeState->previewRenderStateSignatureValid = false;
+        for (std::size_t phaseIndex = 0U;
+             phaseIndex < visualPhases.size();
+             ++phaseIndex) {
+            const auto& phase = visualPhases[phaseIndex];
+            auto visualState = ResolveWaterFrameState(runtimeState);
+            auto visualScenario =
+                visualState.rawScenarioState.value_or(
+                    invisible_places::water::WaterScenarioState{});
+            visualScenario.meshFlowLevel = phase.meshLevel;
+            visualScenario.meshFlowRainGain = 0.0F;
+            visualScenario.rainLevel = phase.rainLevel;
+            visualState.rawScenarioState = visualScenario;
+            visualState.meshFlowMoisture = phase.moisture;
+            for (std::uint32_t frame = 0U;
+                 frame < phase.settleFrames && !window->ShouldClose();
+                 ++frame) {
+                window->PollEvents();
+                if (!EnsureWaterDynamicMeshFlowGpuUpToDate(
+                        runtimeState,
+                        viewport,
+                        visualState,
+                        simulationClock)) {
+                    report.Fail(
+                        "Scene1 visual phase '" +
+                        std::string{phase.label} +
+                        "' failed to update the fixed-capacity simulation: " +
+                        runtimeState->errorMessage);
+                    return finish();
+                }
+                viewport->BeginUiFrame();
+                viewport->SetDiagnosticsEnabled(true);
+                viewport->SetSceneCachingEnabled(false);
+                viewport->SetLiveSceneRenderingEnabled(true);
+                viewport->UpdateRenderState(
+                    BuildRenderState(
+                        *runtimeState,
+                        *viewport,
+                        simulationClock,
+                        &visualState));
+                viewport->DrawFrame();
+                report.meshFlowMaximumAvailableRainSeeds =
+                    std::max(
+                        report.meshFlowMaximumAvailableRainSeeds,
+                        water.dynamicMeshFlowDiagnostics
+                            .availableRainSeedCount);
+                report.meshFlowMaximumRainFedParticles =
+                    std::max(
+                        report.meshFlowMaximumRainFedParticles,
+                        water.dynamicMeshFlowDiagnostics
+                            .rainSeedParticleCount);
+                report.meshFlowAutomaticEntryCandidateCount =
+                    std::max(
+                        report.meshFlowAutomaticEntryCandidateCount,
+                        water.dynamicMeshFlowDiagnostics
+                            .automaticEntryCandidateCount);
+                report.meshFlowVisualActiveParticles[phaseIndex] =
+                    water.dynamicMeshFlowDiagnostics.emittedPathCount;
+                simulationClock += 1.0F / 30.0F;
+            }
+
+            const auto exrPath =
+                outputDirectory / (std::string{phase.label} + ".exr");
+            const auto ppmPath =
+                outputDirectory / (std::string{phase.label} + ".ppm");
+            std::string captureError;
+            auto captured = CaptureWaterIntegrationFrame(
+                runtimeState,
+                viewport,
+                visualState,
+                simulationClock,
+                exrPath,
+                ppmPath,
+                &captureError);
+            if (!captured.has_value()) {
+                report.Fail(
+                    "Could not capture Scene1 Mesh Flow phase '" +
+                    std::string{phase.label} + "': " + captureError);
+                return finish();
+            }
+            report.meshFlowVisualFrameExrPaths.push_back(exrPath);
+            report.meshFlowVisualFramePpmPaths.push_back(ppmPath);
+            capturedFrames.push_back(std::move(captured.value()));
+
+            // Capture a same-time Mesh-off baseline. Visibility is a
+            // parameter-only style change; particle history, Rain, camera,
+            // Ground descriptors, and contact state remain identical.
+            water.dynamicMeshFlowSettings.showTrails = false;
+            if (!EnsureWaterDynamicMeshFlowGpuUpToDate(
+                    runtimeState,
+                    viewport,
+                    visualState,
+                    simulationClock)) {
+                report.Fail(
+                    "Could not hide Mesh Flow for the phase baseline: " +
+                    runtimeState->errorMessage);
+                return finish();
+            }
+            const auto baselineExrPath =
+                outputDirectory /
+                (std::string{phase.label} + "-mesh-off.exr");
+            const auto baselinePpmPath =
+                outputDirectory /
+                (std::string{phase.label} + "-mesh-off.ppm");
+            auto baseline = CaptureWaterIntegrationFrame(
+                runtimeState,
+                viewport,
+                visualState,
+                simulationClock,
+                baselineExrPath,
+                baselinePpmPath,
+                &captureError);
+            if (!baseline.has_value()) {
+                report.Fail(
+                    "Could not capture the Mesh-off baseline for '" +
+                    std::string{phase.label} + "': " + captureError);
+                return finish();
+            }
+            baselineFrames.push_back(std::move(baseline.value()));
+            water.dynamicMeshFlowSettings.showTrails = true;
+            if (!EnsureWaterDynamicMeshFlowGpuUpToDate(
+                    runtimeState,
+                    viewport,
+                    visualState,
+                    simulationClock)) {
+                report.Fail(
+                    "Could not restore Mesh Flow after the phase baseline: " +
+                    runtimeState->errorMessage);
+                return finish();
+            }
+        }
+
+        struct MeshFlowVisualDifference {
+            double occupancy = 0.0;
+            double saturatedWhiteFraction = 0.0;
+            std::size_t occupiedTileCount = 0U;
+            std::vector<std::uint8_t> changedMask;
+            std::array<std::uint8_t, 32U * 18U> occupiedTileMask{};
+        };
+        const auto compareWithBaseline =
+            [](const WaterIntegrationCapturedFrame& enabled,
+               const WaterIntegrationCapturedFrame& baseline) {
+                MeshFlowVisualDifference result;
+                if (enabled.width == 0U ||
+                    enabled.height == 0U ||
+                    enabled.width != baseline.width ||
+                    enabled.height != baseline.height ||
+                    enabled.rgb.size() != baseline.rgb.size()) {
+                    return result;
+                }
+                const auto pixelCount =
+                    static_cast<std::size_t>(enabled.width) *
+                    enabled.height;
+                result.changedMask.resize(pixelCount, 0U);
+                constexpr std::size_t kTileColumns = 32U;
+                constexpr std::size_t kTileRows = 18U;
+                std::array<bool, kTileColumns * kTileRows> occupiedTiles{};
+                std::size_t changedCount = 0U;
+                std::size_t saturatedCount = 0U;
+                for (std::size_t pixel = 0U;
+                     pixel < pixelCount;
+                     ++pixel) {
+                    const auto offset = pixel * 3U;
+                    const auto difference = std::max({
+                        std::abs(
+                            static_cast<int>(enabled.rgb[offset]) -
+                            static_cast<int>(baseline.rgb[offset])),
+                        std::abs(
+                            static_cast<int>(enabled.rgb[offset + 1U]) -
+                            static_cast<int>(baseline.rgb[offset + 1U])),
+                        std::abs(
+                            static_cast<int>(enabled.rgb[offset + 2U]) -
+                            static_cast<int>(baseline.rgb[offset + 2U])),
+                    });
+                    if (difference <= 1) {
+                        continue;
+                    }
+                    result.changedMask[pixel] = 1U;
+                    ++changedCount;
+                    if (enabled.rgb[offset] >= 250U &&
+                        enabled.rgb[offset + 1U] >= 250U &&
+                        enabled.rgb[offset + 2U] >= 250U) {
+                        ++saturatedCount;
+                    }
+                    const std::size_t x =
+                        pixel % static_cast<std::size_t>(enabled.width);
+                    const std::size_t y =
+                        pixel / static_cast<std::size_t>(enabled.width);
+                    const std::size_t tileX = std::min(
+                        kTileColumns - 1U,
+                        x * kTileColumns /
+                            static_cast<std::size_t>(enabled.width));
+                    const std::size_t tileY = std::min(
+                        kTileRows - 1U,
+                        y * kTileRows /
+                            static_cast<std::size_t>(enabled.height));
+                    occupiedTiles[tileY * kTileColumns + tileX] = true;
+                }
+                result.occupancy =
+                    static_cast<double>(changedCount) /
+                    static_cast<double>(std::max<std::size_t>(1U, pixelCount));
+                result.saturatedWhiteFraction =
+                    static_cast<double>(saturatedCount) /
+                    static_cast<double>(std::max<std::size_t>(1U, pixelCount));
+                result.occupiedTileCount = static_cast<std::size_t>(
+                    std::count(
+                        occupiedTiles.begin(),
+                        occupiedTiles.end(),
+                        true));
+                std::transform(
+                    occupiedTiles.begin(),
+                    occupiedTiles.end(),
+                    result.occupiedTileMask.begin(),
+                    [](bool occupied) {
+                        return occupied ? std::uint8_t{1U}
+                                        : std::uint8_t{0U};
+                    });
+                return result;
+            };
+
+        if (capturedFrames.size() == 3U &&
+            baselineFrames.size() == capturedFrames.size()) {
+            const auto lightDifference =
+                compareWithBaseline(capturedFrames[0], baselineFrames[0]);
+            const auto heavyDifference =
+                compareWithBaseline(capturedFrames[1], baselineFrames[1]);
+            const auto recessionDifference =
+                compareWithBaseline(capturedFrames[2], baselineFrames[2]);
+            report.meshFlowLightChangedPixelOccupancy =
+                lightDifference.occupancy;
+            report.meshFlowHeavyChangedPixelOccupancy =
+                heavyDifference.occupancy;
+            report.meshFlowRecessionChangedPixelOccupancy =
+                recessionDifference.occupancy;
+            report.meshFlowSaturatedWhitePixelFraction = std::max({
+                lightDifference.saturatedWhiteFraction,
+                heavyDifference.saturatedWhiteFraction,
+                recessionDifference.saturatedWhiteFraction,
+            });
+            report.meshFlowHeavyToLightTileRatio =
+                static_cast<double>(heavyDifference.occupiedTileCount) /
+                static_cast<double>(
+                    std::max<std::size_t>(
+                        1U,
+                        lightDifference.occupiedTileCount));
+
+            // Individual filaments advance between the heavy and recession
+            // captures. Exact-pixel overlap therefore measures particle
+            // phase, not whether recession remains on the same terrain.
+            // Coarse occupied tiles retain the spatial-coherence contract
+            // while allowing a surface-bound trail to move within a region.
+            std::size_t recessionOverlapTileCount = 0U;
+            for (std::size_t tile = 0U;
+                 tile < heavyDifference.occupiedTileMask.size();
+                 ++tile) {
+                recessionOverlapTileCount +=
+                    heavyDifference.occupiedTileMask[tile] != 0U &&
+                    recessionDifference.occupiedTileMask[tile] != 0U
+                        ? 1U
+                        : 0U;
+            }
+            report.meshFlowRecessionSpatialOverlap =
+                static_cast<double>(recessionOverlapTileCount) /
+                static_cast<double>(
+                    std::max<std::size_t>(
+                        1U,
+                        std::min(
+                            heavyDifference.occupiedTileCount,
+                            recessionDifference.occupiedTileCount)));
+            const double recessionRetention =
+                recessionDifference.occupancy /
+                std::max(1.0e-9, heavyDifference.occupancy);
+            const bool visualOccupancyAccepted =
+                lightDifference.occupancy >= 0.0005 &&
+                lightDifference.occupancy <= 0.010 &&
+                heavyDifference.occupancy >= 0.003 &&
+                heavyDifference.occupancy <= 0.040 &&
+                report.meshFlowSaturatedWhitePixelFraction < 0.0005 &&
+                report.meshFlowHeavyToLightTileRatio >= 3.0 &&
+                recessionRetention >= 0.20 &&
+                recessionRetention <= 0.60 &&
+                report.meshFlowRecessionSpatialOverlap >= 0.55;
+            if (visualOccupancyAccepted) {
+                report.Pass(
+                    "Live Mesh-off readbacks confirmed sparse light trickles, "
+                    "broader rill-weighted heavy flow, controlled highlights, "
+                    "and spatially coherent recession.");
+            } else {
+                report.Fail(
+                    "Live Mesh-off comparison metrics fell outside the "
+                    "approved light/heavy/recession visual envelope.");
+            }
+        } else {
+            report.Fail(
+                "The Scene1 visual smoke did not capture three matching "
+                "Mesh-on/Mesh-off frame pairs.");
+        }
+        if (report.meshFlowMaximumAvailableRainSeeds > 0U &&
+            report.meshFlowMaximumRainFedParticles > 0U) {
+            report.Pass(
+                "Real VEG Rain collisions populated the GPU seed ring and "
+                "spawned distributed rain-fed surface particles.");
+        } else {
+            report.Fail(
+                "The heavy-Rain phase produced no usable VEG seed or "
+                "rain-fed Mesh Flow particle.");
+        }
+
+        report.meshFlowVisualContactSheetPpmPath =
+            outputDirectory / "mesh-flow-light-heavy-recession.ppm";
+        std::string sheetError;
+        if (!WriteWaterIntegrationContactSheet(
+                report.meshFlowVisualContactSheetPpmPath,
+                capturedFrames,
+                &sheetError)) {
+            report.Fail(
+                "Could not write the Scene1 Mesh Flow visual contact sheet: " +
+                sheetError);
+            return finish();
+        }
+        report.Pass(
+            "Rendered Top_View light-concavity, rain-heavy-rill, and post-Rain "
+            "recession frames plus a live Vulkan contact sheet.");
+    }
+
     report.dynamicMeshWarmMoveCount = parameterSamplesMs.size();
     if (!parameterSamplesMs.empty()) {
         report.dynamicMeshWarmMoveAverageMs =
@@ -45185,7 +46052,7 @@ int RunDynamicMeshFlowGroundSmoke(
         report.dynamicMeshWarmMoveAsyncDispatchCount =
             report.dynamicMeshWarmMoveCount;
         report.Pass(
-            "The dry-to-rain-to-recession cycle and authored override used "
+            "The automatic dry-to-rain-to-recession cycle used "
             "parameter/compute updates only; Ground, descriptors, and fixed "
             "history stayed settled.");
     } else {
@@ -45618,12 +46485,6 @@ void InstallWaterIntegrationScenario(PreviewRuntimeState* runtimeState) {
     runtimeState->animationPanel.seepageRainEnvelopeCache = {};
     runtimeState->animationPanel.meshFlowRainEnvelopeCache = {};
 }
-
-struct WaterIntegrationCapturedFrame {
-    std::uint32_t width = 0U;
-    std::uint32_t height = 0U;
-    std::vector<std::uint8_t> rgb;
-};
 
 std::optional<WaterIntegrationCapturedFrame> CaptureWaterIntegrationFrame(
     PreviewRuntimeState* runtimeState,
@@ -46204,16 +47065,43 @@ int RunWaterIntegrationSmoke(
         std::all_of(
             scene->waterSurfaceSources.begin(),
             scene->waterSurfaceSources.end(),
-            [](const auto& source) {
-                return source.role == invisible_places::water::WaterSurfaceRole::Ground ||
-                       (source.spacingMicrometres == 2'000U && !source.isFallback);
+            [&](const auto& source) {
+                return NormalizePathKey(source.sourcePath.parent_path()) ==
+                           NormalizePathKey(scene->sourceFolder) &&
+                       (source.role ==
+                            invisible_places::water::WaterSurfaceRole::Ground ||
+                        (source.spacingMicrometres == 2'000U &&
+                         !source.isFallback));
             });
-    if (report.exactTwoMillimetreSources) {
+    const auto groundSource = std::find_if(
+        scene->waterSurfaceSources.begin(),
+        scene->waterSurfaceSources.end(),
+        [](const auto& source) {
+            return source.role ==
+                   invisible_places::water::WaterSurfaceRole::Ground;
+        });
+    const bool cacheBoundToExpectedScene =
+        report.exactTwoMillimetreSources &&
+        groundSource != scene->waterSurfaceSources.end() &&
+        runtimeState->water.waterSurfaceSceneGroupName ==
+            scene->sceneGroupName &&
+        runtimeState->water.waterSurfaceCacheSignature ==
+            scene->waterSurfaceSignature &&
+        runtimeState->water.waterSurfaceCache != nullptr &&
+        runtimeState->water.waterSurfaceCache->signature ==
+            scene->waterSurfaceSignature &&
+        viewport->WaterGroundFlowView().cacheIdentity != nullptr &&
+        *viewport->WaterGroundFlowView().cacheIdentity ==
+            runtimeState->water.waterSurfaceCache->cacheIdentity;
+    if (cacheBoundToExpectedScene) {
         report.Pass(
-            "The cache used the exact authored 2 mm ROCK/SAND/VEG bundle and active-scene 5 mm sampled Ground.");
+            "The cache used the exact authored 2 mm ROCK/SAND/VEG bundle and "
+            "scene-local 5 mm sampled Ground, bound to " +
+            expectedSceneName + ".");
     } else {
         report.Fail(
-            "The cache source set was not the exact 2 mm terrain bundle plus 5 mm sampled Ground.");
+            "The cache source set or installed Ground identity was not local "
+            "to the expected scene.");
     }
     if (!sampleScene && runtimeState->water.waterSurfaceCache != nullptr) {
         constexpr std::uint64_t expectedScene1SourcePoints = 39'409'886ULL;
@@ -47645,7 +48533,9 @@ int Application::Run(ApplicationRunOptions options) const {
             return smokeExitCode;
         }
         if (options.guiSmoke->scenario == "dynamic-mesh-flow-ground" ||
-            options.guiSmoke->scenario == "dynamic-mesh-flow-site3") {
+            options.guiSmoke->scenario == "dynamic-mesh-flow-site3" ||
+            options.guiSmoke->scenario ==
+                "dynamic-mesh-flow-scene1-visual") {
             const auto smokeExitCode = RunDynamicMeshFlowGroundSmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
@@ -47824,13 +48714,16 @@ int Application::Run(ApplicationRunOptions options) const {
                 &waterFrameState);
             const float liveWaterTimeSeconds =
                 std::chrono::duration<float>(
-                    std::chrono::steady_clock::now() - runtimeState.startedAt)
+                    std::chrono::steady_clock::now() -
+                    runtimeState.startedAt)
                     .count();
-            EnsureWaterDynamicMeshFlowGpuUpToDate(
-                &runtimeState,
-                &viewport.value(),
-                waterFrameState,
-                liveWaterTimeSeconds);
+            if (!runtimeState.offlineRenderJob.active) {
+                EnsureWaterDynamicMeshFlowGpuUpToDate(
+                    &runtimeState,
+                    &viewport.value(),
+                    waterFrameState,
+                    liveWaterTimeSeconds);
+            }
             PrunePreviewLodSampleCaches(&runtimeState);
             if (!pauseLiveViewport) {
                 DrawPivotOverlay(runtimeState, viewport.value());

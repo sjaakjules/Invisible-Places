@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Refresh the local SampleScene validation project from its durable fixture.
 
-The tracked schema-18 fixture is authoritative, so validation keeps working
+The tracked schema-19 fixture is authoritative, so validation keeps working
 after the authored objects are removed from the ignored exhibition project.
 An explicit option can refresh that fixture while those objects still exist.
 The helper builds a lightweight SampleScene project around the explicit 3 mm
 display bundle and canonicalises the legacy SampleScene filenames and object
-names in the local main project.
+names in the local main project. The current authored filenames use the
+`SampleScene` suffix, including a space after the density delimiter.
 """
 
 from __future__ import annotations
@@ -30,11 +31,23 @@ DEFAULT_VALIDATION_PROJECT = (
 )
 
 PATH_RENAMES = {
-    "Site3-Mesh-Sample.ply": "Site1-Mesh-Sample.ply",
-    "Site3-ROCK-1mm.Sample.ply": "Site1-ROCK-1mm.Sample.ply",
-    "Site3-SAND-2mm.Sample.ply": "Site1-SAND-2mm.Sample.ply",
-    "Site3-VEG-1mm.Sample.ply": "Site1-VEG-1mm.Sample.ply",
+    "Site3-Mesh-Sample.ply": "Site1-Mesh-SampleScene.ply",
+    "Site1-Mesh-Sample.ply": "Site1-Mesh-SampleScene.ply",
+    "Site1-MeshSampled-Sample-5mm.ply": "Site1-MeshSampled-5mm-SampleScene.ply",
+    "Site1-MeshSampled-5mm-Sample.ply": "Site1-MeshSampled-5mm-SampleScene.ply",
+    "Site1-MeshSampled-SampleScene-5mm.ply": "Site1-MeshSampled-5mm-SampleScene.ply",
+    "Site3-ROCK-1mm.Sample.ply": "Site1-ROCK-1mm. SampleScene.ply",
+    "Site3-SAND-2mm.Sample.ply": "Site1-SAND-2mm. SampleScene.ply",
+    "Site3-VEG-1mm.Sample.ply": "Site1-VEG-1mm. SampleScene.ply",
 }
+PATH_RENAMES.update(
+    {
+        f"Site1-{role}-{spacing}mm.Sample.ply":
+            f"Site1-{role}-{spacing}mm. SampleScene.ply"
+        for role in ("ROCK", "SAND", "VEG")
+        for spacing in (1, 2, 3, 5)
+    }
+)
 
 NAME_RENAMES = {
     "SampleFowPoint": "SampleFlowPoint",
@@ -42,20 +55,21 @@ NAME_RENAMES = {
 }
 
 SAMPLE_ASSETS = {
-    "Site1-Mesh-Sample.ply": (None, None),
-    "Site1-ROCK-1mm.Sample.ply": ("ROCK", 1_000),
-    "Site1-ROCK-2mm.Sample.ply": ("ROCK", 2_000),
-    "Site1-ROCK-3mm.Sample.ply": ("ROCK", 3_000),
-    "Site1-ROCK-5mm.Sample.ply": ("ROCK", 5_000),
-    "Site1-SAND-1mm.Sample.ply": ("SAND", 1_000),
-    "Site1-SAND-2mm.Sample.ply": ("SAND", 2_000),
-    "Site1-SAND-3mm.Sample.ply": ("SAND", 3_000),
-    "Site1-SAND-5mm.Sample.ply": ("SAND", 5_000),
-    "Site1-VEG-1mm.Sample.ply": ("VEG", 1_000),
-    "Site1-VEG-2mm.Sample.ply": ("VEG", 2_000),
-    "Site1-VEG-3mm.Sample.ply": ("VEG", 3_000),
-    "Site1-VEG-5mm.Sample.ply": ("VEG", 5_000),
+    "Site1-Mesh-SampleScene.ply": (None, None),
+    "Site1-ROCK-1mm. SampleScene.ply": ("ROCK", 1_000),
+    "Site1-ROCK-2mm. SampleScene.ply": ("ROCK", 2_000),
+    "Site1-ROCK-3mm. SampleScene.ply": ("ROCK", 3_000),
+    "Site1-ROCK-5mm. SampleScene.ply": ("ROCK", 5_000),
+    "Site1-SAND-1mm. SampleScene.ply": ("SAND", 1_000),
+    "Site1-SAND-2mm. SampleScene.ply": ("SAND", 2_000),
+    "Site1-SAND-3mm. SampleScene.ply": ("SAND", 3_000),
+    "Site1-SAND-5mm. SampleScene.ply": ("SAND", 5_000),
+    "Site1-VEG-1mm. SampleScene.ply": ("VEG", 1_000),
+    "Site1-VEG-2mm. SampleScene.ply": ("VEG", 2_000),
+    "Site1-VEG-3mm. SampleScene.ply": ("VEG", 3_000),
+    "Site1-VEG-5mm. SampleScene.ply": ("VEG", 5_000),
 }
+SAMPLED_GROUND_ASSET = "Site1-MeshSampled-5mm-SampleScene.ply"
 
 ANALYSIS_SPACING = {"ROCK": 1_000, "SAND": 2_000, "VEG": 1_000}
 DISPLAY_SPACING = 3_000
@@ -72,7 +86,7 @@ STATE_WATER_KEYS = (
 
 
 def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
-    """Apply the schema-44/18 parameter-only visibility and tuning migration."""
+    """Apply the schema-45/19 automatic Mesh Flow contract."""
 
     value["water_show_flow_trails" if project else "show_flow_trails"] = value.get(
         "water_show_flow_trails" if project else "show_flow_trails", True
@@ -113,18 +127,30 @@ def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
     mesh_flow = value.get("water_dynamic_mesh_flow_settings")
     if isinstance(mesh_flow, dict):
         mesh_flow.setdefault("show_trails", True)
-        mesh_flow.setdefault("automatic_sources", True)
         mesh_flow.setdefault("particle_capacity", 4096)
         mesh_flow.setdefault("history_length", 24)
-        mesh_flow.setdefault("source_band_width_meters", 0.35)
-        mesh_flow.setdefault("dry_concavity_focus", 0.75)
-        mesh_flow.setdefault("rain_spawn_spread", 0.80)
-        mesh_flow.setdefault("particle_noise_strength", 0.32)
-        mesh_flow.setdefault("particle_noise_scale_meters", 0.18)
-        mesh_flow.setdefault("particle_noise_speed", 0.40)
-        mesh_flow.setdefault("shared_wind_strength", 0.18)
-        mesh_flow.setdefault("shared_wind_scale_meters", 2.4)
-        mesh_flow.setdefault("shared_wind_speed", 0.06)
+        mesh_flow.pop("source_band_width_meters", None)
+        mesh_flow.pop("source_band_fraction", None)
+        mesh_flow["dry_concavity_focus"] = 0.90
+        mesh_flow["rain_spawn_spread"] = 0.75
+        mesh_flow["rain_distributed_source_fraction"] = 0.55
+        mesh_flow["trail_width_meters"] = 0.0025
+        mesh_flow["trail_streak_length_meters"] = 0.030
+        mesh_flow["surface_offset_meters"] = 0.003
+        mesh_flow["trail_opacity_dry"] = 0.025
+        mesh_flow["trail_opacity_wet"] = 0.14
+        mesh_flow["trail_emission_dry"] = 0.04
+        mesh_flow["trail_emission_wet"] = 0.45
+        mesh_flow["trail_exposure"] = 1.25
+        mesh_flow["speed_meters_per_second"] = 0.26
+        mesh_flow["downhill_weight"] = 1.75
+        mesh_flow["inertia"] = 0.88
+        mesh_flow["particle_noise_strength"] = 0.10
+        mesh_flow["particle_noise_scale_meters"] = 0.45
+        mesh_flow["particle_noise_speed"] = 0.18
+        mesh_flow["shared_wind_strength"] = 0.035
+        mesh_flow["shared_wind_scale_meters"] = 3.0
+        mesh_flow["shared_wind_speed"] = 0.025
         mesh_flow.setdefault("contact_fade_seconds", 0.8)
         mesh_flow.setdefault(
             "rock_response",
@@ -150,6 +176,16 @@ def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
                 "stream_depth_meters": 0.45,
             },
         )
+        mesh_flow.pop("automatic_sources", None)
+        mesh_flow.pop("attractors", None)
+        mesh_flow.pop("emitter_motions", None)
+
+    if project:
+        for state in value.get("water_scene_states", []):
+            if not isinstance(state, dict):
+                continue
+            state.pop("dynamic_mesh_attractors", None)
+            state.pop("dynamic_mesh_emitter_motions", None)
 
     for scenario in value.get("water_scenarios", []):
         if not isinstance(scenario, dict):
@@ -286,7 +322,7 @@ def authored_state(
 
 
 def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
-    project["schema_version"] = 44
+    project["schema_version"] = 45
     upgrade_water_contract(project, project=True)
     state = authored_state(project, required=False)
     if state is not None:
@@ -311,11 +347,30 @@ def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("SampleScene density group must contain ROCK, SAND, and VEG roles")
     for role, source in role_sources.items():
         source["analysis_source_path"] = sample_asset_path(
-            f"Site1-{role}-{ANALYSIS_SPACING[role] // 1_000}mm.Sample.ply"
+            sample_role_filename(role, ANALYSIS_SPACING[role])
         )
         source["display_source_path"] = sample_asset_path(
-            f"Site1-{role}-{DISPLAY_SPACING // 1_000}mm.Sample.ply"
+            sample_role_filename(role, DISPLAY_SPACING)
         )
+    if not project.get("active_water_scene_group"):
+        selected_path = project.get("selected_layer_path", "")
+        selected_layer = next(
+            (
+                layer
+                for layer in project.get("layers", [])
+                if selected_path
+                in {
+                    layer.get("source_path", ""),
+                    layer.get("selected_scene_variant_path", ""),
+                }
+            ),
+            None,
+        )
+        project["active_water_scene_group"] = (
+            selected_layer.get("scene_group")
+            if isinstance(selected_layer, dict)
+            else None
+        ) or "SampleScene"
     return project
 
 
@@ -327,7 +382,7 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
     seepage = copy.deepcopy(named_object(state["water_seepage_nodes"], "SampleSeepage"))
 
     fixture: dict[str, Any] = {
-        "schema_version": 18,
+        "schema_version": 19,
         "fixture_metadata": {
             "scene_group": "SampleScene",
             "display_spacing_micrometres": DISPLAY_SPACING,
@@ -381,8 +436,8 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
 
 
 def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
-    if fixture.get("schema_version") != 18:
-        raise ValueError("SampleScene water fixture must use water-source schema 18")
+    if fixture.get("schema_version") != 19:
+        raise ValueError("SampleScene water fixture must use water-source schema 19")
     metadata = fixture.get("fixture_metadata")
     if not isinstance(metadata, dict) or metadata.get("scene_group") != "SampleScene":
         raise ValueError("SampleScene water fixture has invalid fixture metadata")
@@ -400,6 +455,13 @@ def sample_asset_path(filename: str) -> str:
     return str(REPOSITORY_ROOT / "Data" / "SampleScene" / filename)
 
 
+def sample_role_filename(role: str, spacing_micrometres: int) -> str:
+    return (
+        f"Site1-{role}-{spacing_micrometres // 1_000}mm. "
+        "SampleScene.ply"
+    )
+
+
 def ply_vertex_count(path: Path) -> int:
     with path.open("rb") as source:
         for raw_line in source:
@@ -409,6 +471,22 @@ def ply_vertex_count(path: Path) -> int:
             if line == "end_header":
                 break
     raise ValueError(f"PLY header has no vertex count: {path}")
+
+
+def validate_sample_assets() -> None:
+    required = [*SAMPLE_ASSETS, SAMPLED_GROUND_ASSET]
+    missing = [
+        filename
+        for filename in required
+        if not Path(sample_asset_path(filename)).is_file()
+    ]
+    if missing:
+        raise ValueError(
+            "SampleScene is missing its current authored assets: " +
+            ", ".join(missing)
+        )
+    if ply_vertex_count(Path(sample_asset_path(SAMPLED_GROUND_ASSET))) <= 0:
+        raise ValueError("SampleScene sampled Ground cloud has no vertices")
 
 
 def clone_sample_layers(project: dict[str, Any]) -> list[dict[str, Any]]:
@@ -457,11 +535,14 @@ def build_validation_project(
     project: dict[str, Any], fixture: dict[str, Any]
 ) -> dict[str, Any]:
     validation = copy.deepcopy(project)
-    validation["schema_version"] = 44
+    validation["schema_version"] = 45
     upgrade_water_contract(validation, project=True)
     validation["project_name"] = "SampleScene Validation"
+    validation["active_water_scene_group"] = "SampleScene"
     validation["layers"] = clone_sample_layers(project)
-    validation["selected_layer_path"] = sample_asset_path("Site1-ROCK-3mm.Sample.ply")
+    validation["selected_layer_path"] = sample_asset_path(
+        sample_role_filename("ROCK", DISPLAY_SPACING)
+    )
     validation["scene_point_cloud_groups"] = [
         {
             "scene_group": "SampleScene",
@@ -472,10 +553,10 @@ def build_validation_project(
                 {
                     "scene_role": role,
                     "analysis_source_path": sample_asset_path(
-                        f"Site1-{role}-{ANALYSIS_SPACING[role] // 1_000}mm.Sample.ply"
+                        sample_role_filename(role, ANALYSIS_SPACING[role])
                     ),
                     "display_source_path": sample_asset_path(
-                        f"Site1-{role}-{DISPLAY_SPACING // 1_000}mm.Sample.ply"
+                        sample_role_filename(role, DISPLAY_SPACING)
                     ),
                 }
                 for role in ("ROCK", "SAND", "VEG")
@@ -492,7 +573,7 @@ def build_validation_project(
         if key not in {"schema_version", "fixture_metadata", *STATE_WATER_KEYS}:
             validation[key] = copy.deepcopy(value)
     # Fixture-owned project settings are copied after the main-project
-    # migration so apply the schema-44 defaults to the final merged document.
+    # migration so apply the schema-45 defaults to the final merged document.
     upgrade_water_contract(validation, project=True)
 
     validation_state = {
@@ -508,8 +589,6 @@ def build_validation_project(
         "water_field_layers": copy.deepcopy(fixture.get("water_field_layers", [])),
         "water_ripple_runtime_caches": [],
         "dynamic_mesh_path": "",
-        "dynamic_mesh_attractors": [],
-        "dynamic_mesh_emitter_motions": [],
     }
     validation["water_scene_states"] = [validation_state]
     validation["water_seepage_nodes"] = copy.deepcopy(
@@ -575,6 +654,7 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_arguments()
     main_project = arguments.main_project.resolve()
+    validate_sample_assets()
     original_project = load_json(main_project)
     project = migrate_main_project(canonicalise(original_project))
     fixture_path = arguments.fixture.resolve()

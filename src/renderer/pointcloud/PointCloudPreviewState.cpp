@@ -415,19 +415,27 @@ bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style) 
 }
 
 bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style) {
+    if (!PointCloudStyleHasShorelineWaveRegion(style)) {
+        return false;
+    }
+    if (style.shorelineWaveAlgorithm == PointCloudShorelineWaveAlgorithm::HeightFoam) {
+        return style.shorelineHeightFoam.speed > kMaterialEpsilon;
+    }
+    return style.shorelineSpeed > kMaterialEpsilon;
+}
+
+bool PointCloudStyleHasShorelineWaveRegion(const PointCloudStyleState& style) {
     if (!style.shorelineWaveEnabled) {
         return false;
     }
     if (style.shorelineWaveAlgorithm == PointCloudShorelineWaveAlgorithm::HeightFoam) {
         return style.shorelineHeightFoam.offshoreReachMeters > kMaterialEpsilon &&
                style.shorelineHeightFoam.wavelengthMeters > kMaterialEpsilon &&
-               style.shorelineHeightFoam.intensity > kMaterialEpsilon &&
-               style.shorelineHeightFoam.speed > kMaterialEpsilon;
+               style.shorelineHeightFoam.intensity > kMaterialEpsilon;
     }
     return style.shorelineHeightReachMeters > kMaterialEpsilon &&
            style.shorelineWavelengthMeters > kMaterialEpsilon &&
-           style.shorelineIntensity > kMaterialEpsilon &&
-           style.shorelineSpeed > kMaterialEpsilon;
+           style.shorelineIntensity > kMaterialEpsilon;
 }
 
 bool PointCloudSceneRoleAllowsRoughnessMotion(std::string_view sceneRole) {

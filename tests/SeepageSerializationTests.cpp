@@ -513,7 +513,7 @@ TEST_CASE(
     REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(
         loaded.value(), migratedPath, &errorMessage));
     const auto migratedJson = ReadTextFile(migratedPath);
-    CHECK(migratedJson.find("\"schema_version\": 18") != std::string::npos);
+    CHECK(migratedJson.find("\"schema_version\": 19") != std::string::npos);
     CHECK(migratedJson.find("\"width_meters\": 1.5") != std::string::npos);
     CHECK(migratedJson.find("\"selection_reach_limit_meters\": 3.75") !=
           std::string::npos);

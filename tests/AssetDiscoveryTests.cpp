@@ -179,6 +179,24 @@ void WriteTinyPointCloudPly(const std::filesystem::path& path) {
            << "0 1 0 0 0 255\n";
 }
 
+void WriteTinySampledGroundPointCloudPly(const std::filesystem::path& path) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream output{path};
+    output << "ply\n"
+           << "format ascii 1.0\n"
+           << "element vertex 1\n"
+           << "property float x\n"
+           << "property float y\n"
+           << "property float z\n"
+           << "property float nx\n"
+           << "property float ny\n"
+           << "property float nz\n"
+           << "property float scalar_dip\n"
+           << "property float scalar_dip_direction\n"
+           << "end_header\n"
+           << "0 0 0 0 0 1 12 180\n";
+}
+
 void WriteLookAtOrientation(invisible_places::camera::CameraState* state) {
     if (state == nullptr) {
         return;
@@ -741,19 +759,20 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
 
     const auto catalog = invisible_places::io::DiscoverAssets(DataRoot());
     const std::set<std::string> requiredFilenames{
-        "Site1-Mesh-Sample.ply",
-        "Site1-ROCK-1mm.Sample.ply",
-        "Site1-ROCK-2mm.Sample.ply",
-        "Site1-ROCK-3mm.Sample.ply",
-        "Site1-ROCK-5mm.Sample.ply",
-        "Site1-SAND-1mm.Sample.ply",
-        "Site1-SAND-2mm.Sample.ply",
-        "Site1-SAND-3mm.Sample.ply",
-        "Site1-SAND-5mm.Sample.ply",
-        "Site1-VEG-1mm.Sample.ply",
-        "Site1-VEG-2mm.Sample.ply",
-        "Site1-VEG-3mm.Sample.ply",
-        "Site1-VEG-5mm.Sample.ply",
+        "Site1-Mesh-SampleScene.ply",
+        "Site1-MeshSampled-5mm-SampleScene.ply",
+        "Site1-ROCK-1mm. SampleScene.ply",
+        "Site1-ROCK-2mm. SampleScene.ply",
+        "Site1-ROCK-3mm. SampleScene.ply",
+        "Site1-ROCK-5mm. SampleScene.ply",
+        "Site1-SAND-1mm. SampleScene.ply",
+        "Site1-SAND-2mm. SampleScene.ply",
+        "Site1-SAND-3mm. SampleScene.ply",
+        "Site1-SAND-5mm. SampleScene.ply",
+        "Site1-VEG-1mm. SampleScene.ply",
+        "Site1-VEG-2mm. SampleScene.ply",
+        "Site1-VEG-3mm. SampleScene.ply",
+        "Site1-VEG-5mm. SampleScene.ply",
     };
     std::vector<invisible_places::io::PointCloudAsset> sampleAssets;
     std::copy_if(
@@ -769,6 +788,7 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
     std::set<std::string> roles;
     std::set<std::string> filenames;
     bool foundMeshFixture = false;
+    bool foundSampledGroundFixture = false;
     for (const auto& asset : sampleAssets) {
         filenames.insert(asset.filePath.filename().string());
         CHECK(asset.header.LooksLikePointCloud());
@@ -777,11 +797,32 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
         CHECK(asset.header.HasProperty("ny"));
         CHECK(asset.header.HasProperty("nz"));
 
-        if (asset.filePath.filename() == "Site1-Mesh-Sample.ply") {
+        if (asset.filePath.filename() == "Site1-Mesh-SampleScene.ply") {
             foundMeshFixture = true;
             CHECK(asset.sceneRole.empty());
             CHECK(asset.header.faceCount > 0U);
             CHECK(asset.header.vertexCount > 500'000ULL);
+            continue;
+        }
+        if (asset.filePath.filename() ==
+            "Site1-MeshSampled-5mm-SampleScene.ply") {
+            foundSampledGroundFixture = true;
+            CHECK(asset.sceneRole.empty());
+            CHECK(asset.header.faceCount == 0U);
+            CHECK(asset.header.vertexCount > 2'000'000ULL);
+            const auto scalarFields = asset.header.ScalarFieldNames();
+            CHECK(std::any_of(
+                scalarFields.begin(),
+                scalarFields.end(),
+                [](const std::string& name) {
+                    return name.find("Dip") != std::string::npos;
+                }));
+            CHECK(std::any_of(
+                scalarFields.begin(),
+                scalarFields.end(),
+                [](const std::string& name) {
+                    return name.find("direction") != std::string::npos;
+                }));
             continue;
         }
 
@@ -811,6 +852,7 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
 
     CHECK(roles == std::set<std::string>{"ROCK", "SAND", "VEG"});
     CHECK(foundMeshFixture);
+    CHECK(foundSampledGroundFixture);
     CHECK(filenames == requiredFilenames);
     CHECK_FALSE(filenames.contains("Site3-ROCK-1mm.Sample.ply"));
     CHECK_FALSE(filenames.contains("Site3-SAND-2mm.Sample.ply"));
@@ -838,11 +880,11 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
     REQUIRE(sampleScene->AnalysisSource(ScenePointCloudRole::Sand) != nullptr);
     REQUIRE(sampleScene->AnalysisSource(ScenePointCloudRole::Vegetation) != nullptr);
     CHECK(sampleScene->AnalysisSource(ScenePointCloudRole::Rock)->sourcePath.filename() ==
-          "Site1-ROCK-1mm.Sample.ply");
+          "Site1-ROCK-1mm. SampleScene.ply");
     CHECK(sampleScene->AnalysisSource(ScenePointCloudRole::Sand)->sourcePath.filename() ==
-          "Site1-SAND-2mm.Sample.ply");
+          "Site1-SAND-2mm. SampleScene.ply");
     CHECK(sampleScene->AnalysisSource(ScenePointCloudRole::Vegetation)->sourcePath.filename() ==
-          "Site1-VEG-1mm.Sample.ply");
+          "Site1-VEG-1mm. SampleScene.ply");
 }
 
 TEST_CASE("SampleScene authored water controls lie on 3 mm ROCK display support",
@@ -863,7 +905,8 @@ TEST_CASE("SampleScene authored water controls lie on 3 mm ROCK display support"
     REQUIRE(displayBundle != nullptr);
     const auto& rock = displayBundle->Find(
         invisible_places::scene::ScenePointCloudRole::Rock);
-    REQUIRE(rock.sourcePath.filename() == "Site1-ROCK-3mm.Sample.ply");
+    REQUIRE(rock.sourcePath.filename() ==
+            "Site1-ROCK-3mm. SampleScene.ply");
 
     const auto rockResult = invisible_places::io::LoadPointCloud(rock.sourcePath);
     REQUIRE(rockResult.success);
@@ -942,7 +985,8 @@ TEST_CASE("SampleScene shoreline waves animate over time", "[discovery][scene][s
     const auto* displayBundle = sampleScene->FindCompleteDisplayBundle(3'000U);
     REQUIRE(displayBundle != nullptr);
     const auto& sand = displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Sand);
-    CHECK(sand.sourcePath.filename() == "Site1-SAND-3mm.Sample.ply");
+    CHECK(sand.sourcePath.filename() ==
+          "Site1-SAND-3mm. SampleScene.ply");
     CHECK(sand.spacingMicrometres == 3'000U);
 
     PointCloudStyleState style;
@@ -1069,6 +1113,39 @@ TEST_CASE("Discovery groups role-named sibling PLY files by folder", "[discovery
     REQUIRE(standaloneIt != catalog.pointClouds.end());
     CHECK(standaloneIt->sceneGroupName.empty());
     CHECK(standaloneIt->sceneRole.empty());
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE(
+    "Sampled Ground discovery rejects ambiguous scene-local candidates",
+    "[discovery][scene][ground]") {
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_ambiguous_sampled_ground_test";
+    std::filesystem::remove_all(root);
+    const auto lexicalFirst = root / "Site1-MESHSampled-A-5mm.ply";
+    const auto lexicalSecond = root / "Site1-MESHSampled-B-5mm.ply";
+    WriteTinySampledGroundPointCloudPly(lexicalFirst);
+
+    std::string errorMessage;
+    const auto unique =
+        invisible_places::scene::FindSampledGroundSurfaceInDirectory(
+            root,
+            &errorMessage);
+    REQUIRE(unique.has_value());
+    CHECK(unique.value() == lexicalFirst);
+    CHECK(errorMessage.empty());
+
+    WriteTinySampledGroundPointCloudPly(lexicalSecond);
+    const auto ambiguous =
+        invisible_places::scene::FindSampledGroundSurfaceInDirectory(
+            root,
+            &errorMessage);
+    CHECK_FALSE(ambiguous.has_value());
+    CHECK(errorMessage.find("Multiple qualifying 5 mm MESH-sampled Ground clouds") !=
+          std::string::npos);
+    CHECK(errorMessage.find(root.generic_string()) != std::string::npos);
+
     std::filesystem::remove_all(root);
 }
 
@@ -1463,6 +1540,7 @@ TEST_CASE("Height Foam shoreline keeps independent defaults and clamps break hei
     using invisible_places::renderer::pointcloud::NormalizeHeightFoamBreakZ;
     using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
     using invisible_places::renderer::pointcloud::PointCloudStyleHasActiveShorelineWaves;
+    using invisible_places::renderer::pointcloud::PointCloudStyleHasShorelineWaveRegion;
     using invisible_places::renderer::pointcloud::PointCloudStyleState;
 
     PointCloudStyleState style;
@@ -1487,7 +1565,11 @@ TEST_CASE("Height Foam shoreline keeps independent defaults and clamps break hei
 
     style.shorelineHeightFoam.speed = 0.0F;
     CHECK_FALSE(PointCloudStyleHasActiveShorelineWaves(style));
+    CHECK(PointCloudStyleHasShorelineWaveRegion(style));
     CHECK(style.shorelineSpeed == Catch::Approx(0.55F));
+
+    style.shorelineWaveEnabled = false;
+    CHECK_FALSE(PointCloudStyleHasShorelineWaveRegion(style));
 }
 
 TEST_CASE("Sand-cloud shoreline waves use dedicated foam helper", "[water][shoreline][shader]") {
@@ -8387,7 +8469,8 @@ TEST_CASE("Mesh surface ray projection lands on hidden cache under cursor", "[me
 }
 
 TEST_CASE("SampleScene dynamic mesh cache follows mixed triangle scales", "[mesh][water][sample][.]") {
-    const auto meshPath = DataRoot() / "SampleScene" / "Site1-Mesh-Sample.ply";
+    const auto meshPath =
+        DataRoot() / "SampleScene" / "Site1-Mesh-SampleScene.ply";
     if (!std::filesystem::exists(meshPath)) {
         SKIP("SampleScene mesh fixture is not present in the local Data directory.");
     }
@@ -8718,8 +8801,8 @@ TEST_CASE("Dynamic mesh flow settings roundtrip through project JSON", "[mesh][w
         CHECK(savedJson.find("\"emitter_motions\"") == std::string::npos);
         CHECK(savedJson.find("\"water_scene_states\"") != std::string::npos);
         CHECK(savedJson.find("\"dynamic_mesh_path\"") != std::string::npos);
-        CHECK(savedJson.find("\"dynamic_mesh_attractors\"") != std::string::npos);
-        CHECK(savedJson.find("\"dynamic_mesh_emitter_motions\"") != std::string::npos);
+        CHECK(savedJson.find("\"dynamic_mesh_attractors\"") == std::string::npos);
+        CHECK(savedJson.find("\"dynamic_mesh_emitter_motions\"") == std::string::npos);
     }
     const auto loaded = invisible_places::serialization::LoadProjectDocument(projectPath, &errorMessage);
     REQUIRE(loaded.has_value());
@@ -8734,17 +8817,10 @@ TEST_CASE("Dynamic mesh flow settings roundtrip through project JSON", "[mesh][w
     CHECK(loaded->waterDynamicMeshFlowSettings.eddyStrength == Catch::Approx(0.35F));
     CHECK(loaded->waterDynamicMeshFlowSettings.topologyResponse == Catch::Approx(0.9F));
     CHECK(loaded->waterDynamicMeshFlowSettings.trailProfileName == "White Needle Glow_preset");
-    REQUIRE(loaded->waterDynamicMeshFlowSettings.attractors.size() == 1U);
-    CHECK(loaded->waterDynamicMeshFlowSettings.attractors.front().name == "moving pull");
-    CHECK(loaded->waterDynamicMeshFlowSettings.attractors.front().position.y == Catch::Approx(2.0F));
-    REQUIRE(loaded->waterDynamicMeshFlowSettings.attractors.front().keyframes.size() == 2U);
-    CHECK(loaded->waterDynamicMeshFlowSettings.attractors.front().keyframes.back().position.x == Catch::Approx(4.0F));
+    CHECK(loaded->waterDynamicMeshFlowSettings.attractors.empty());
     CHECK(loaded->waterDynamicMeshFlowSettings.animationDurationSeconds == Catch::Approx(1.5F));
     CHECK(loaded->waterDynamicMeshFlowSettings.sourceVelocityWeight == Catch::Approx(0.7F));
-    REQUIRE(loaded->waterDynamicMeshFlowSettings.emitterMotions.size() == 1U);
-    CHECK(loaded->waterDynamicMeshFlowSettings.emitterMotions.front().emitterId == 9U);
-    REQUIRE(loaded->waterDynamicMeshFlowSettings.emitterMotions.front().keyframes.size() == 2U);
-    CHECK(loaded->waterDynamicMeshFlowSettings.emitterMotions.front().keyframes.back().position.y == Catch::Approx(4.0F));
+    CHECK(loaded->waterDynamicMeshFlowSettings.emitterMotions.empty());
 
     const auto legacyProjectPath =
         std::filesystem::temp_directory_path() / "invisible_places_dynamic_mesh_flow_legacy_project.json";
@@ -9758,9 +9834,12 @@ TEST_CASE("SampleScene combined water support source descends in Z", "[water][sa
     const auto& rockVariant = displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Rock);
     const auto& sandVariant = displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Sand);
     const auto& vegVariant = displayBundle->Find(invisible_places::scene::ScenePointCloudRole::Vegetation);
-    CHECK(rockVariant.sourcePath.filename() == "Site1-ROCK-3mm.Sample.ply");
-    CHECK(sandVariant.sourcePath.filename() == "Site1-SAND-3mm.Sample.ply");
-    CHECK(vegVariant.sourcePath.filename() == "Site1-VEG-3mm.Sample.ply");
+    CHECK(rockVariant.sourcePath.filename() ==
+          "Site1-ROCK-3mm. SampleScene.ply");
+    CHECK(sandVariant.sourcePath.filename() ==
+          "Site1-SAND-3mm. SampleScene.ply");
+    CHECK(vegVariant.sourcePath.filename() ==
+          "Site1-VEG-3mm. SampleScene.ply");
 
     const auto rockResult = invisible_places::io::LoadPointCloud(rockVariant.sourcePath);
     const auto sandResult = invisible_places::io::LoadPointCloud(sandVariant.sourcePath);
@@ -10338,6 +10417,9 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
         CHECK(savedJson.find("\"water_field_trail_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_dynamic_mesh_flow_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"mesh_path\"") == std::string::npos);
+        CHECK(savedJson.find("\"automatic_sources\"") == std::string::npos);
+        CHECK(savedJson.find("\"attractors\"") == std::string::npos);
+        CHECK(savedJson.find("\"emitter_motions\"") == std::string::npos);
         CHECK(savedJson.find("\"water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"temp_water_caustic_look_settings\"") != std::string::npos);
         CHECK(savedJson.find("\"water_path_cache\"") != std::string::npos);
@@ -10448,12 +10530,12 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->dynamicMeshFlowSettings.previewParticleLimit == 444U);
     CHECK(loaded->dynamicMeshFlowSettings.gpuPreviewEnabled);
     CHECK_FALSE(loaded->dynamicMeshFlowSettings.showTrails);
-    CHECK_FALSE(loaded->dynamicMeshFlowSettings.automaticSources);
-    CHECK(loaded->dynamicMeshFlowSettings.particleCapacity == 6144U);
-    CHECK(loaded->dynamicMeshFlowSettings.historyLength == 36U);
+    CHECK(loaded->dynamicMeshFlowSettings.automaticSources);
+    CHECK(loaded->dynamicMeshFlowSettings.particleCapacity == 4096U);
+    CHECK(loaded->dynamicMeshFlowSettings.historyLength == 24U);
     CHECK(
         loaded->dynamicMeshFlowSettings.sourceBandWidthMeters ==
-        Catch::Approx(0.48F));
+        Catch::Approx(0.75F));
     CHECK(
         loaded->dynamicMeshFlowSettings.sharedWindStrength ==
         Catch::Approx(0.29F));
@@ -10467,9 +10549,8 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->dynamicMeshFlowSettings.branchingStrength == Catch::Approx(0.7F));
     CHECK(loaded->dynamicMeshFlowSettings.eddyStrength == Catch::Approx(0.8F));
     CHECK(loaded->dynamicMeshFlowSettings.topologyResponse == Catch::Approx(1.1F));
-    REQUIRE(loaded->dynamicMeshFlowSettings.attractors.size() == 1U);
-    CHECK(loaded->dynamicMeshFlowSettings.attractors.front().name == "field pull");
-    CHECK(loaded->dynamicMeshFlowSettings.attractors.front().position.z == Catch::Approx(3.0F));
+    CHECK(loaded->dynamicMeshFlowSettings.attractors.empty());
+    CHECK(loaded->dynamicMeshFlowSettings.emitterMotions.empty());
 
     const auto legacySourcesPath =
         std::filesystem::temp_directory_path() / "invisible_places_water_sources_legacy_mesh_path.json";
@@ -10499,6 +10580,24 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(legacySources->dynamicMeshFlowSettings.automaticSources);
     CHECK(legacySources->dynamicMeshFlowSettings.particleCapacity == 4096U);
     CHECK(legacySources->dynamicMeshFlowSettings.historyLength == 24U);
+    CHECK(
+        legacySources->dynamicMeshFlowSettings.sourceBandWidthMeters ==
+        Catch::Approx(0.75F));
+    CHECK(
+        legacySources->dynamicMeshFlowSettings.sourceBandFraction ==
+        Catch::Approx(0.04F));
+    CHECK(
+        legacySources->dynamicMeshFlowSettings.trailWidthMeters ==
+        Catch::Approx(0.0025F));
+    CHECK(
+        legacySources->dynamicMeshFlowSettings.speedMetersPerSecond ==
+        Catch::Approx(0.26F));
+    CHECK(
+        legacySources->dynamicMeshFlowSettings.particleNoiseStrength ==
+        Catch::Approx(0.10F));
+    CHECK(
+        legacySources->dynamicMeshFlowSettings.sharedWindStrength ==
+        Catch::Approx(0.035F));
     REQUIRE(legacySources->emitters.size() == 1U);
     CHECK_FALSE(legacySources->emitters[0].pathProfileLocked);
     CHECK_FALSE(legacySources->emitters[0].laneProfileLocked);

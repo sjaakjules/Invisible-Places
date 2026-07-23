@@ -107,10 +107,16 @@ float EvaluateRockRainImpactValue(
         max(0.0, growth - edgeWidth),
         growth + edgeWidth,
         normalizedDistance);
+    // A continuous centre-to-edge rolloff prevents the wet response from
+    // reading as a uniformly coloured stamped region.
+    const float radialFade =
+        1.0 - smoothstep(0.0, 1.0, normalizedDistance);
+    const float centreFalloffAmount =
+        sqrt(clamp(rockImpact0.z, 0.0, 1.0));
     const float centreWeight = mix(
         1.0,
-        sqrt(clamp(1.0 - normalizedDistance, 0.0, 1.0)),
-        clamp(rockImpact0.z, 0.0, 1.0));
+        radialFade,
+        centreFalloffAmount);
     return footprint *
            (1.0 - smoothstep(fadeStart, 1.0, life)) *
            heightGain * centreWeight;

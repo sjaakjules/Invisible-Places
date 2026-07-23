@@ -80,7 +80,7 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
       "water_surface_cache": {
         "relative_path": "../Data/Scene1/.invisible_places/cache/water/example.surfacecache",
         "cache_schema": 4,
-        "algorithm_id": "water-surface-10mm-normal-average-ground-v2",
+        "algorithm_id": "water-surface-10mm-normal-average-ground-v3",
         "requested_rebuild_generation": 1,
         "built_rebuild_generation": 1
       },
@@ -98,7 +98,7 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
 
 The example abbreviates the `roles` array and cache fingerprint/checksum fields; a normal complete scene stores ROCK, SAND, and VEG records plus the active scene's 5 mm `MESHSampled` Ground source when available. Schema-4 payloads live at `<scene>/.invisible_places/cache/water/<signature>.surfacecache`, fall back beside the project when scene storage is unavailable, and can read schema-3 `.surfacecache` and schema-2 `.raincache` files as legacy inputs. The current Ground algorithm makes an older sidecar stale, so it is rebuilt atomically while the last settled GPU cache remains active. Requested/built generations make **Rebuild Cache** durable.
 
-Clean generated Flow branches are similarly externalized to scene-local `.invisible_places/cache/flow/*.flowpathcache` sidecars with a compact `water_path_cache_manifest`; stale or orphaned derived arrays are not embedded in schema-44 project JSON.
+Clean generated Flow branches are similarly externalized to scene-local `.invisible_places/cache/flow/*.flowpathcache` sidecars with a compact `water_path_cache_manifest`; stale or orphaned derived arrays are not embedded in schema-45 project JSON.
 
 The Ground tier is independent of the selected display density. A scene-wide 1/2/3/5 mm ROCK/SAND/VEG switch reuses the same resident 10 mm Ground hash and fixed-capacity GPU Mesh Flow resources. Mesh Flow style, activity, Rain response, spawning, noise, wind, and contact-response edits update parameters only; they do not warm a triangle `MeshSurfaceCache`, scan the display cloud, or create a generated CPU point-cloud layer.
 

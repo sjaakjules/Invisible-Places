@@ -711,6 +711,75 @@ std::vector<RockRainCase> BuildEquivalenceCases() {
     return cases;
 }
 
+struct SandRainCase {
+    RockRainGpuInput gpu{};
+    RainImpactEvent event{};
+    Float3 point{};
+    float timeSeconds = 0.0F;
+    float waterMask = 1.0F;
+};
+
+std::vector<SandRainCase> BuildSandEquivalenceCases() {
+    std::vector<SandRainCase> cases;
+    constexpr Float3 eventPosition{0.31F, -0.27F, 0.83F};
+    for (const float radius : {0.025F, 0.070F, 0.11F}) {
+        for (const float lifetime : {0.48F, 0.70F, 0.83F}) {
+            for (const float waterMask : {0.0F, 0.25F, 0.5F, 1.0F}) {
+                for (const float age : {-0.01F,
+                                        0.0F,
+                                        0.06F,
+                                        0.14F,
+                                        lifetime * 0.5F,
+                                        lifetime * 0.8F,
+                                        lifetime,
+                                        lifetime + 0.01F}) {
+                    for (const float distanceScale :
+                         {0.0F, 0.08F, 0.20F, 0.45F, 0.75F, 1.0F, 1.2F}) {
+                        SandRainCase result;
+                        result.point = {
+                            eventPosition.x + radius * distanceScale,
+                            eventPosition.y,
+                            eventPosition.z -
+                                radius * distanceScale * 0.08F};
+                        result.waterMask = waterMask;
+                        result.event = {
+                            .position = eventPosition,
+                            .birthTimeSeconds = 1.25F,
+                            .normal = {0.0F, 0.0F, 1.0F},
+                            .radiusMeters = radius,
+                            .role = WaterSurfaceRole::Sand,
+                            .lifetimeSeconds = lifetime,
+                            .energy = 1.0F,
+                            .seed = 17U,
+                        };
+                        result.timeSeconds =
+                            result.event.birthTimeSeconds + age;
+                        result.gpu.eventPositionRadius = {
+                            eventPosition.x,
+                            eventPosition.y,
+                            eventPosition.z,
+                            radius};
+                        result.gpu.eventNormalLifetime = {
+                            0.0F,
+                            0.0F,
+                            1.0F,
+                            lifetime};
+                        result.gpu.pointAge = {
+                            result.point.x,
+                            result.point.y,
+                            result.point.z,
+                            age};
+                        result.gpu.control = {0U, 1U, 0U, 0U};
+                        result.gpu.rockImpact0[0] = waterMask;
+                        cases.push_back(result);
+                    }
+                }
+            }
+        }
+    }
+    return cases;
+}
+
 }  // namespace
 
 TEST_CASE(
@@ -729,7 +798,7 @@ TEST_CASE(
     CHECK(invisible_places::water::kRainImpactEventCapacity == 65'536U);
     CHECK(invisible_places::water::kRainImpactGridDimension == 256U);
     CHECK(invisible_places::water::kRainSandEventsPerCell == 8U);
-    CHECK(invisible_places::water::kRainRockEventsPerCell == 8U);
+    CHECK(invisible_places::water::kRainRockEventsPerCell == 16U);
     CHECK(invisible_places::water::kRainVegetationEventsPerCell == 4U);
 
     std::vector<float> gpuValues;
@@ -763,4 +832,144 @@ TEST_CASE(
     }
     CHECK(maximumAbsoluteError < 2.5e-4F);
 
+}
+
+TEST_CASE(
+    "ROCK Rain soft union CPU and GLSL accumulators remain equivalent",
+    "[water][rain][gpu][equivalence][rock][union]") {
+    struct UnionCase {
+        std::array<float, 4> values{};
+        std::uint32_t count = 0U;
+    };
+    const std::array cases{
+        UnionCase{{0.0F, 0.0F, 0.0F, 0.0F}, 0U},
+        UnionCase{{0.25F, 0.0F, 0.0F, 0.0F}, 1U},
+        UnionCase{{0.25F, 0.50F, 0.0F, 0.0F}, 2U},
+        UnionCase{{0.50F, 0.25F, 0.0F, 0.0F}, 2U},
+        UnionCase{{0.20F, 0.30F, 0.40F, 0.50F}, 4U},
+        UnionCase{{0.50F, 0.40F, 0.30F, 0.20F}, 4U},
+        UnionCase{{1.40F, 0.20F, 0.70F, 0.0F}, 3U},
+        UnionCase{{0.20F, 0.70F, 1.40F, 0.0F}, 3U},
+    };
+    std::vector<RockRainGpuInput> gpuInputs;
+    gpuInputs.reserve(cases.size());
+    for (const auto& testCase : cases) {
+        RockRainGpuInput input;
+        input.eventPositionRadius = testCase.values;
+        input.control = {0U, 2U, testCase.count, 0U};
+        gpuInputs.push_back(input);
+    }
+
+    std::vector<float> gpuValues;
+    try {
+        RockRainVulkanHarness harness;
+        gpuValues = harness.Evaluate(gpuInputs);
+    } catch (const VulkanComputeUnavailable& unavailable) {
+        WARN(unavailable.what());
+        SUCCEED("ROCK Rain soft-union GLSL dispatch was unavailable on this test host.");
+        return;
+    }
+    REQUIRE(gpuValues.size() == cases.size());
+
+    for (std::size_t caseIndex = 0U;
+         caseIndex < cases.size();
+         ++caseIndex) {
+        auto settings =
+            invisible_places::water::RainRockImpactSettings{};
+        settings.edgeBreakup = 0.0F;
+        settings.spreadSpeed = 6.0F;
+        settings.centreFalloff = 1.0F;
+        settings.heightBias = 0.0F;
+        std::vector<RainImpactEvent> events;
+        events.reserve(cases[caseIndex].count);
+        for (std::uint32_t valueIndex = 0U;
+             valueIndex < cases[caseIndex].count;
+             ++valueIndex) {
+            events.push_back({
+                .position = {},
+                .birthTimeSeconds = 0.0F,
+                .normal = {0.0F, 0.0F, 1.0F},
+                .radiusMeters = 0.12F,
+                .role = WaterSurfaceRole::Rock,
+                .lifetimeSeconds = 5.0F,
+                .energy = cases[caseIndex].values[valueIndex],
+                .seed = valueIndex,
+            });
+        }
+        const auto grid = invisible_places::water::BuildRainImpactGrid(
+            events,
+            {},
+            0.8F,
+            4.0F,
+            settings);
+        const auto cpuEffect = invisible_places::water::EvaluateRainImpact(
+            grid,
+            WaterSurfaceRole::Rock,
+            {},
+            {0.0F, 0.0F, 1.0F},
+            0.8F);
+        float peak = 0.0F;
+        float remaining = 1.0F;
+        for (std::uint32_t valueIndex = 0U;
+             valueIndex < cases[caseIndex].count;
+             ++valueIndex) {
+            const float value = cases[caseIndex].values[valueIndex];
+            peak = std::max(peak, value);
+            remaining *=
+                1.0F - std::clamp(value, 0.0F, 1.0F);
+        }
+        const float expected = std::max(peak, 1.0F - remaining);
+        INFO("ROCK soft-union equivalence case " << caseIndex);
+        CHECK(cpuEffect.opacity / 0.18F ==
+              Catch::Approx(expected).margin(1.0e-6F));
+        CHECK(gpuValues[caseIndex] ==
+              Catch::Approx(cpuEffect.opacity / 0.18F).margin(1.0e-6F));
+    }
+    CHECK(gpuValues[2] == Catch::Approx(gpuValues[3]).margin(1.0e-6F));
+    CHECK(gpuValues[4] == Catch::Approx(gpuValues[5]).margin(1.0e-6F));
+    CHECK(gpuValues[6] == Catch::Approx(gpuValues[7]).margin(1.0e-6F));
+    CHECK(gpuValues[6] == Catch::Approx(1.40F).margin(1.0e-6F));
+}
+
+TEST_CASE(
+    "SAND Rain CPU and GLSL evaluators remain numerically equivalent",
+    "[water][rain][gpu][equivalence][sand]") {
+    const auto cases = BuildSandEquivalenceCases();
+    REQUIRE(cases.size() >= 2'000U);
+    std::vector<RockRainGpuInput> gpuInputs;
+    gpuInputs.reserve(cases.size());
+    for (const auto& testCase : cases) {
+        gpuInputs.push_back(testCase.gpu);
+    }
+
+    std::vector<float> gpuValues;
+    try {
+        RockRainVulkanHarness harness;
+        gpuValues = harness.Evaluate(gpuInputs);
+    } catch (const VulkanComputeUnavailable& unavailable) {
+        WARN(unavailable.what());
+        SUCCEED("SAND Rain GLSL dispatch was unavailable on this test host.");
+        return;
+    }
+    REQUIRE(gpuValues.size() == cases.size());
+
+    float maximumAbsoluteError = 0.0F;
+    for (std::size_t index = 0U; index < cases.size(); ++index) {
+        const auto& testCase = cases[index];
+        const float cpuValue =
+            invisible_places::water::EvaluateSandRainImpactValue(
+                testCase.event,
+                testCase.point,
+                testCase.timeSeconds,
+                testCase.waterMask);
+        const float gpuValue = gpuValues[index];
+        REQUIRE(std::isfinite(cpuValue));
+        REQUIRE(std::isfinite(gpuValue));
+        maximumAbsoluteError = std::max(
+            maximumAbsoluteError,
+            std::abs(cpuValue - gpuValue));
+        INFO("SAND Rain equivalence case " << index);
+        CHECK(gpuValue == Catch::Approx(cpuValue).margin(2.5e-4F));
+    }
+    CHECK(maximumAbsoluteError < 2.5e-4F);
 }

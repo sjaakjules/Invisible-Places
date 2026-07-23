@@ -362,6 +362,15 @@ struct WaterMeshFlowRainEnvelope {
     std::string fingerprint;
 };
 
+// Bounded fixed-step schedule used when a stateful GPU Mesh Flow simulation is
+// sampled by an offline render. Sequential samples advance from the settled
+// state; seeks rebuild only the visible history window.
+struct WaterMeshFlowTimelineStep {
+    float timeSeconds = 0.0F;
+    float deltaSeconds = 0.0F;
+    bool resetSimulation = false;
+};
+
 struct WaterSeepageViewContext {
     invisible_places::io::Float3 cameraPosition{};
     bool hasCameraPosition = false;
@@ -998,6 +1007,8 @@ struct WaterDynamicMeshFlowSettings {
     bool enabled = false;
     bool gpuPreviewEnabled = true;
     bool showTrails = true;
+    // Retained only so schema-44 projects can be parsed. Mesh Flow is
+    // automatic in schema 45 and never consumes ordinary Flow emitters.
     bool automaticSources = true;
     std::filesystem::path meshPath{};
     float cacheCellSizeMeters = 0.08F;
@@ -1007,31 +1018,38 @@ struct WaterDynamicMeshFlowSettings {
     // parameters; it does not resize buffers while a frame is in flight.
     std::uint32_t particleCapacity = 4096U;
     std::uint32_t historyLength = 24U;
-    float sourceBandWidthMeters = 0.35F;
-    float dryConcavityFocus = 0.75F;
-    float rainSpawnSpread = 0.80F;
+    float sourceBandWidthMeters = 0.75F;
+    float sourceBandFraction = 0.04F;
+    float dryConcavityFocus = 0.90F;
+    float rainSpawnSpread = 0.75F;
+    float rainDistributedSourceFraction = 0.55F;
     std::uint32_t previewParticleLimit = 560;
     std::uint32_t finalParticleLimit = 2400;
     float trailLengthMeters = 18.0F;
     float stepMeters = 0.12F;
-    float trailWidthMeters = 0.005F;
-    float trailStreakLengthMeters = 0.18F;
-    float surfaceOffsetMeters = 0.006F;
-    float speedMetersPerSecond = 0.22F;
-    float downhillWeight = 1.35F;
+    float trailWidthMeters = 0.0025F;
+    float trailStreakLengthMeters = 0.030F;
+    float surfaceOffsetMeters = 0.003F;
+    float trailOpacityDry = 0.025F;
+    float trailOpacityWet = 0.14F;
+    float trailEmissionDry = 0.04F;
+    float trailEmissionWet = 0.45F;
+    float trailExposure = 1.25F;
+    float speedMetersPerSecond = 0.26F;
+    float downhillWeight = 1.75F;
     float attractorWeight = 1.0F;
     float sourceVelocityWeight = 0.35F;
     float curlStrength = 0.18F;
     float branchingStrength = 0.36F;
     float eddyStrength = 0.08F;
     float topologyResponse = 0.65F;
-    float inertia = 0.76F;
-    float particleNoiseStrength = 0.32F;
-    float particleNoiseScaleMeters = 0.18F;
-    float particleNoiseSpeed = 0.40F;
-    float sharedWindStrength = 0.18F;
-    float sharedWindScaleMeters = 2.4F;
-    float sharedWindSpeed = 0.06F;
+    float inertia = 0.88F;
+    float particleNoiseStrength = 0.10F;
+    float particleNoiseScaleMeters = 0.45F;
+    float particleNoiseSpeed = 0.18F;
+    float sharedWindStrength = 0.035F;
+    float sharedWindScaleMeters = 3.0F;
+    float sharedWindSpeed = 0.025F;
     float contactFadeSeconds = 0.8F;
     WaterDynamicMeshRockResponseSettings rockResponse{};
     WaterDynamicMeshVegetationResponseSettings vegetationResponse{};
@@ -1042,6 +1060,29 @@ struct WaterDynamicMeshFlowSettings {
     std::vector<WaterDynamicMeshAttractor> attractors;
     std::vector<WaterDynamicMeshEmitterMotion> emitterMotions;
 };
+
+// CPU mirror of the bounded GPU regime weights.  This is deliberately compact:
+// timeline changes evaluate these scalars and rotate the live uniform ring; they
+// never rebuild Ground topology or resize the fixed particle/history buffers.
+struct WaterDynamicMeshFlowVisualWeights {
+    float automaticSpawnAcceptance = 1.0F;
+    float directionalNoiseScale = 1.0F;
+    float trailProminence = 1.0F;
+    float trailWidthScale = 1.0F;
+    float trailStreakScale = 1.0F;
+};
+
+// Cache-owned automatic source at the vegetation-supported highest-+X edge
+// of a connected Ground component. The 16-byte layout is also the std430 GPU
+// entry ABI; live Mesh Flow parameters only select from this immutable table.
+struct alignas(16) WaterDynamicMeshFlowGroundEntry {
+    std::int32_t cellX = 0;
+    std::int32_t cellY = 0;
+    float edgeDistanceMeters = 0.0F;
+    float edgeDistanceFraction = 0.0F;
+};
+
+static_assert(sizeof(WaterDynamicMeshFlowGroundEntry) == 16U);
 
 struct MeshSurfaceCacheCell {
     invisible_places::io::Float3 position{};
@@ -1091,6 +1132,16 @@ struct WaterDynamicMeshFlowDiagnostics {
     std::uint32_t cacheCellCount = 0;
     std::uint32_t emittedPathCount = 0;
     std::uint32_t emittedSampleCount = 0;
+    std::uint32_t automaticEntryCandidateCount = 0;
+    std::uint32_t availableRainSeedCount = 0;
+    std::uint32_t rainSeedParticleCount = 0;
+    std::uint32_t routeSampleCount = 0;
+    float routeWithinGroundBoundsFraction = 0.0F;
+    float routeWithinSurfaceToleranceFraction = 0.0F;
+    float maximumRenderedSegmentMeters = 0.0F;
+    std::uint32_t longSegmentCount = 0;
+    std::uint32_t unexplainedVerticalJumpCount = 0;
+    float medianTangentDownhillAlignment = 0.0F;
     std::uint32_t projectionMissCount = 0;
     std::uint32_t ambiguousHitCount = 0;
     bool gpuStaticBuffersReused = false;
@@ -1105,6 +1156,14 @@ struct WaterDynamicMeshFlowDiagnostics {
 [[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
 [[nodiscard]] WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
     WaterDynamicMeshFlowSettings settings);
+[[nodiscard]] WaterDynamicMeshFlowVisualWeights
+EvaluateWaterDynamicMeshFlowVisualWeights(
+    const WaterDynamicMeshFlowSettings& settings,
+    float convergence,
+    float moisture,
+    float surfaceConfidence = 1.0F);
+[[nodiscard]] std::vector<WaterDynamicMeshFlowGroundEntry>
+BuildWaterDynamicMeshFlowGroundEntries(const WaterSurfaceCache& cache);
 [[nodiscard]] std::string WaterDynamicMeshFlowSettingsFingerprint(
     const WaterDynamicMeshFlowSettings& settings);
 [[nodiscard]] std::array<WaterDynamicMeshParticlePreset, 4> AllWaterDynamicMeshParticlePresets();
@@ -1143,6 +1202,15 @@ struct WaterDynamicMeshFlowDiagnostics {
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
     float durationSeconds);
+[[nodiscard]] std::uint64_t WaterMeshFlowSampleTick(
+    float sampleTimeSeconds,
+    float fixedStepSeconds = 1.0F / 30.0F);
+[[nodiscard]] std::vector<WaterMeshFlowTimelineStep>
+BuildWaterMeshFlowSampleTimeline(
+    std::optional<std::uint64_t> previousCompletedTick,
+    float targetSampleTimeSeconds,
+    std::uint32_t historyLength,
+    float fixedStepSeconds = 1.0F / 30.0F);
 [[nodiscard]] WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
     const WaterScenarioTrack& track,
     std::uint32_t nodeId,

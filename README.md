@@ -20,7 +20,7 @@ The central idea is that data already present in the point cloud can become visu
 - **Data-driven art direction:** render parameters can be constant values or field-mapped controls with input/output ranges, layer statistics, clamp, invert, and gamma shaping.
 - **Hybrid capture scenes:** point-cloud layers and Gaussian splat layers share the same camera, scene, and project workflow, so survey geometry and photogrammetric/3DGS material can be composed together.
 - **Postproduction-friendly output:** preview-density EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
-- **Portable project state:** schema-44 JSON stores authored scenes, animation, styles, water controls, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
+- **Portable project state:** schema-45 project JSON and schema-19 standalone water-source JSON store authored scenes, explicit active water-scene ownership, animation, styles, water controls, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
 
 ## Current capabilities
 
@@ -81,11 +81,11 @@ The central idea is that data already present in the point cloud can become visu
 
 ### Export and persistence
 
-- Saves and reloads schema-44 project JSON containing authoritative scene density groups, point-cloud styles, camera shots, animation paths, saved visuals, water state/cache manifests, and export selections.
+- Saves and reloads schema-45 project JSON containing authoritative scene density groups, explicit active water-scene ownership, point-cloud styles, camera shots, animation paths, saved visuals, water state/cache manifests, and export selections. Standalone water-source documents use schema 19.
 - Persists the shared schema-4 water surface cache as a scene-local `.surfacecache` and settled generated Flow branches as `.flowpathcache`, with project-local fallback paths when scene storage is unavailable.
-- Builds the shared 10 mm Rain/Flow/Seepage surface from one complete 2 mm ROCK/SAND/VEG bundle (or the nearest complete fallback bundle), and folds the active scene's 5 mm `MESHSampled` point cloud into a separate Ground tier for Mesh Flow. Density changes and effect tuning therefore do not rescan or mix role sources.
+- Builds the shared 10 mm Rain/Flow/Seepage surface from one complete 2 mm ROCK/SAND/VEG bundle (or the nearest complete fallback bundle), and folds the explicitly active scene's unambiguous 5 mm `MESHSampled` point cloud into a separate Ground-v3 tier for Mesh Flow. Density changes and effect tuning therefore do not rescan or mix role sources.
 - Keeps Rain near-surface squish, ROCK/VEG response tuning, Flow trail visibility, and Seepage reach/width/prominence as live parameter updates over settled cache-derived support.
-- Runs Mesh Flow as a fixed-capacity GPU simulation over the resident Ground table. Automatic sources begin near the scene's +X edge and shift between dry concavity focus and wider Rain-driven spawning; authored emitters and the Mesh Flow Rain envelope remain available for shot-specific control without generating a CPU point cloud.
+- Runs Mesh Flow automatically over the active scene's resident Ground table with a fixed 4,096-particle, 24-history GPU allocation. Dry particles emerge from vegetation-supported, convergent cells along each connected component's highest-+X edge; VEG Rain impacts feed a bounded GPU seed ring for distributed downhill emergence and recession. Ordinary Flow sources never seed Mesh Flow, and live activity, moisture, and appearance edits neither rebuild the cache nor resize GPU storage.
 - Exports selected saved animations and saved visuals as batched Quick MP4 files.
 - Exports preview-density EXR animation stacks.
 - Writes EXR `beauty.RGB`, `alpha.A`, and `depth.Z` channels.
@@ -175,12 +175,12 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 - Multi-cloud scene folders may contain sibling role-named point clouds. `ROCK`, `SAND`, and `VEG` tokens define the role; `1mm`, `2mm`, and similar tokens define inferred point spacing in meters.
 - A display spacing is selectable only when exactly one ROCK, SAND, and VEG file exists at that spacing. Incomplete or duplicate density sets are rejected rather than mixed during switching.
 - `Data/ExhibitionScene` is the default full scene when `Saved/exhibitionScene_project.json` exists. Canonical analysis uses variants such as `Site3-ROCK-1mm.ply`, `Site3-SAND-2mm.ply`, and `Site3-VEG-1mm.ply`; complete same-spacing sets provide the selectable display densities.
-- `Data/SampleScene` is the local validation fixture for the same multi-cloud contract. It contains complete `Site1-{ROCK,SAND,VEG}-{1,2,3,5}mm.Sample.ply` display bundles plus `Site1-Mesh-Sample.ply`; validation displays the 3 mm bundle, keeps canonical 1/2/1 mm paths available for on-demand analysis, and streams the complete 2 mm bundle into the shared 10 mm water-surface cache.
+- `Data/SampleScene` is the local validation fixture for the same multi-cloud contract. It contains complete `Site1-{ROCK,SAND,VEG}-{1,2,3,5}mm. SampleScene.ply` display bundles, `Site1-Mesh-SampleScene.ply`, and the 5 mm `Site1-MeshSampled-5mm-SampleScene.ply` Ground input; validation displays the 3 mm bundle, keeps canonical 1/2/1 mm paths available for on-demand analysis, and streams the complete 2 mm terrain bundle plus the scene-local sampled Ground cloud into the shared 10 mm water-surface cache.
 - Gaussian splat files are PLY files whose filename starts with `gSplat-` and whose header exposes Gaussian attributes such as `f_dc_0`, `opacity`, `scale_0`, and `rot_0`.
 - Each gSplat file is paired with a same-stem `.txt` file containing a 4x4 transform matrix.
 - `ffmpeg` is expected at `/opt/homebrew/bin/ffmpeg` for Fast Preview / Quick MP4 export.
 
-See [Scene-Wide Point-Cloud Density Switching](docs/scene_point_cloud_density_switching.md) for the scene catalog, transactional loading, rendering compensation, water routing, and schema-44 contracts.
+See [Scene-Wide Point-Cloud Density Switching](docs/scene_point_cloud_density_switching.md) for the scene catalog, transactional loading, rendering compensation, water routing, and schema-45 contracts.
 
 ## Current status
 
