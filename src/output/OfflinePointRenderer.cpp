@@ -2308,10 +2308,12 @@ void AdvanceOfflineRainFrame(
     state->diagnostics = state->simulator.Advance(simulationFrame, surfaceCache);
     state->impactGrid = settings.enabled && settings.impactEffectsEnabled
                             ? invisible_places::water::BuildRainImpactGrid(
-                                  state->simulator.Events(),
-                                  simulationFrame.cameraPosition,
-                                  timeSeconds,
-                                  invisible_places::water::RainImpactGridWorldSpan(settings))
+                              state->simulator.Events(),
+                              simulationFrame.cameraPosition,
+                              timeSeconds,
+                              invisible_places::water::RainImpactGridWorldSpan(settings),
+                              settings.rockImpact,
+                              settings.vegetationImpact)
                             : invisible_places::water::RainImpactGrid{};
     state->frame = {
         .settings = settings,
@@ -2354,9 +2356,8 @@ void VisitOfflineRainPixels(
     const float widthMeters = std::max(
         0.0001F,
         rainFrame->visual.widthMeters * rainFrame->settings.dropletSizeScale * intensity.width);
-    const float streakLength = std::max(
-        widthMeters,
-        rainFrame->visual.streakLengthMeters * rainFrame->settings.dropletSizeScale * intensity.length);
+    const float authoredStreakLength =
+        rainFrame->visual.streakLengthMeters * rainFrame->settings.dropletSizeScale * intensity.length;
     const float opacity = Clamp01(
         rainFrame->visual.opacity * rainFrame->settings.opacityScale * intensity.opacity);
     const float emission = std::max(
@@ -2377,16 +2378,64 @@ void VisitOfflineRainPixels(
         if (glm::dot(velocity, velocity) <= 1.0e-8F) {
             continue;
         }
-        const glm::vec3 tail = head - glm::normalize(velocity) * streakLength;
+        const float proximity = std::clamp(particle.surfaceProximity, 0.0F, 1.0F);
+        const float alignment = std::clamp(
+            rainFrame->settings.nearSurface.normalAlignment,
+            0.0F,
+            1.0F) * proximity;
+        glm::vec3 direction = glm::normalize(velocity);
+        glm::vec3 surfaceNormal = ToGlm(particle.surfaceNormal);
+        surfaceNormal = glm::dot(surfaceNormal, surfaceNormal) > 1.0e-8F
+            ? glm::normalize(surfaceNormal)
+            : glm::vec3{0.0F, 0.0F, 1.0F};
+        glm::vec3 viewDirection = head - matrices.position;
+        viewDirection = glm::dot(viewDirection, viewDirection) > 1.0e-8F
+            ? glm::normalize(viewDirection)
+            : glm::vec3{0.0F, 1.0F, 0.0F};
+        glm::vec3 surfaceForward =
+            direction - surfaceNormal * glm::dot(direction, surfaceNormal);
+        if (glm::dot(surfaceForward, surfaceForward) <= 1.0e-8F) {
+            glm::vec3 surfaceSideFallback = glm::cross(surfaceNormal, viewDirection);
+            if (glm::dot(surfaceSideFallback, surfaceSideFallback) <= 1.0e-8F) {
+                const glm::vec3 basis = std::abs(surfaceNormal.z) < 0.90F
+                    ? glm::vec3{0.0F, 0.0F, 1.0F}
+                    : glm::vec3{1.0F, 0.0F, 0.0F};
+                surfaceSideFallback = glm::cross(surfaceNormal, basis);
+            }
+            surfaceSideFallback = glm::normalize(surfaceSideFallback);
+            surfaceForward = glm::normalize(glm::cross(surfaceSideFallback, surfaceNormal));
+        } else {
+            surfaceForward = glm::normalize(surfaceForward);
+        }
+        const glm::vec3 alignedDirection = glm::mix(direction, surfaceForward, alignment);
+        if (glm::dot(alignedDirection, alignedDirection) > 1.0e-8F) {
+            direction = glm::normalize(alignedDirection);
+        }
+        const auto particleShape =
+            invisible_places::water::EvaluateRainParticleVisualShape(
+                widthMeters,
+                authoredStreakLength,
+                proximity,
+                rainFrame->settings.nearSurface);
+        const float particleWidthMeters = particleShape.widthMeters;
+        const float streakLength = particleShape.lengthMeters;
+        const glm::vec3 tail = glm::mix(
+            head - direction * streakLength,
+            head - direction * streakLength * 0.5F,
+            particleShape.ellipseBlend);
+        const glm::vec3 tip = glm::mix(
+            head,
+            head + direction * streakLength * 0.5F,
+            particleShape.ellipseBlend);
         float headX = 0.0F;
         float headY = 0.0F;
         float tailX = 0.0F;
         float tailY = 0.0F;
-        if (!ProjectWorldToPixel(head, matrices, image, &headX, &headY) ||
+        if (!ProjectWorldToPixel(tip, matrices, image, &headX, &headY) ||
             !ProjectWorldToPixel(tail, matrices, image, &tailX, &tailY)) {
             continue;
         }
-        const float headDepth = -(matrices.view * glm::vec4{head, 1.0F}).z;
+        const float headDepth = -(matrices.view * glm::vec4{tip, 1.0F}).z;
         const float tailDepth = -(matrices.view * glm::vec4{tail, 1.0F}).z;
         if (headDepth <= 0.0F || tailDepth <= 0.0F) {
             continue;
@@ -2394,7 +2443,7 @@ void VisitOfflineRainPixels(
         const float viewDepth = 0.5F * (headDepth + tailDepth);
         const float diameterPixels = std::clamp(
             invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels(
-                widthMeters,
+                particleWidthMeters,
                 viewDepth,
                 matrices.projection[1][1],
                 static_cast<float>(image.height)),
@@ -2432,7 +2481,18 @@ void VisitOfflineRainPixels(
                 const float edge = 1.0F - SmoothStep(radius * featherStart, radius, distance);
                 const float endFade = SmoothStep(0.0F, 0.08F, along) *
                                       (1.0F - SmoothStep(0.88F, 1.0F, along));
-                const float pixelAlpha = opacity * std::max(0.0F, particle.visibility) * edge * endFade;
+                const float ellipseDistance = std::hypot(
+                    distance / std::max(0.5F, radius),
+                    (along - 0.5F) * 2.0F);
+                const float ellipseCoverage = 1.0F - SmoothStep(
+                    featherStart,
+                    1.0F,
+                    ellipseDistance);
+                const float coverage = std::lerp(
+                    edge * endFade,
+                    ellipseCoverage,
+                    particleShape.ellipseBlend);
+                const float pixelAlpha = opacity * std::max(0.0F, particle.visibility) * coverage;
                 if (pixelAlpha <= 1.0e-5F) {
                     continue;
                 }

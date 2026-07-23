@@ -740,16 +740,32 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
     }
 
     const auto catalog = invisible_places::io::DiscoverAssets(DataRoot());
+    const std::set<std::string> requiredFilenames{
+        "Site1-Mesh-Sample.ply",
+        "Site1-ROCK-1mm.Sample.ply",
+        "Site1-ROCK-2mm.Sample.ply",
+        "Site1-ROCK-3mm.Sample.ply",
+        "Site1-ROCK-5mm.Sample.ply",
+        "Site1-SAND-1mm.Sample.ply",
+        "Site1-SAND-2mm.Sample.ply",
+        "Site1-SAND-3mm.Sample.ply",
+        "Site1-SAND-5mm.Sample.ply",
+        "Site1-VEG-1mm.Sample.ply",
+        "Site1-VEG-2mm.Sample.ply",
+        "Site1-VEG-3mm.Sample.ply",
+        "Site1-VEG-5mm.Sample.ply",
+    };
     std::vector<invisible_places::io::PointCloudAsset> sampleAssets;
     std::copy_if(
         catalog.pointClouds.begin(),
         catalog.pointClouds.end(),
         std::back_inserter(sampleAssets),
-        [](const auto& asset) {
-            return asset.filePath.parent_path().filename() == "SampleScene";
+        [&requiredFilenames](const auto& asset) {
+            return asset.filePath.parent_path().filename() == "SampleScene" &&
+                   requiredFilenames.contains(asset.filePath.filename().string());
         });
 
-    REQUIRE(sampleAssets.size() == 13U);
+    REQUIRE(sampleAssets.size() == requiredFilenames.size());
     std::set<std::string> roles;
     std::set<std::string> filenames;
     bool foundMeshFixture = false;
@@ -795,21 +811,6 @@ TEST_CASE("SampleScene validates local multi-cloud shoreline fixture", "[discove
 
     CHECK(roles == std::set<std::string>{"ROCK", "SAND", "VEG"});
     CHECK(foundMeshFixture);
-    const std::set<std::string> requiredFilenames{
-        "Site1-Mesh-Sample.ply",
-        "Site1-ROCK-1mm.Sample.ply",
-        "Site1-ROCK-2mm.Sample.ply",
-        "Site1-ROCK-3mm.Sample.ply",
-        "Site1-ROCK-5mm.Sample.ply",
-        "Site1-SAND-1mm.Sample.ply",
-        "Site1-SAND-2mm.Sample.ply",
-        "Site1-SAND-3mm.Sample.ply",
-        "Site1-SAND-5mm.Sample.ply",
-        "Site1-VEG-1mm.Sample.ply",
-        "Site1-VEG-2mm.Sample.ply",
-        "Site1-VEG-3mm.Sample.ply",
-        "Site1-VEG-5mm.Sample.ply",
-    };
     CHECK(filenames == requiredFilenames);
     CHECK_FALSE(filenames.contains("Site3-ROCK-1mm.Sample.ply"));
     CHECK_FALSE(filenames.contains("Site3-SAND-2mm.Sample.ply"));
@@ -10531,6 +10532,26 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
     rain.gustStrength = 0.62F;
     rain.weatherFrontStrength = 0.48F;
     rain.rockEffectScale = 1.35F;
+    rain.nearSurface = {
+        .approachDistanceMeters = 0.41F,
+        .minimumSpeedFactor = 0.22F,
+        .squish = 0.83F,
+        .normalAlignment = 0.61F,
+    };
+    rain.rockImpact = {
+        .edgeBreakup = 0.58F,
+        .spreadSpeed = 0.92F,
+        .centreFalloff = 0.44F,
+        .heightBias = 1.30F,
+        .persistence = 2.20F,
+    };
+    rain.vegetationImpact = {
+        .twinkle = 2.70F,
+        .propagationMetersPerSecond = 0.80F,
+        .hopSpacingMeters = 0.055F,
+        .streamWidthMeters = 0.012F,
+        .streamSpread = 1.10F,
+    };
 
     auto visual = invisible_places::water::RainVisualPreset("Rain Downpour");
     visual.colour = {0.31F, 0.52F, 0.86F};
@@ -10553,7 +10574,12 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
         input >> savedJson;
     }
     const auto& rainJson = savedJson.at("water_rain_settings");
-    CHECK(rainJson.at("version").get<int>() == 2);
+    CHECK(rainJson.at("version").get<int>() == 3);
+    CHECK(rainJson.at("near_surface").at("squish").get<float>() == Catch::Approx(0.83F));
+    CHECK(rainJson.at("rock_impact").at("edge_breakup").get<float>() == Catch::Approx(0.58F));
+    CHECK(
+        rainJson.at("vegetation_impact").at("stream_width_meters").get<float>() ==
+        Catch::Approx(0.012F));
     CHECK_FALSE(savedJson.contains("selected_water_rain_trail_profile"));
     CHECK_FALSE(savedJson.contains("temp_water_rain_trail_profile"));
     CHECK_FALSE(rainJson.contains("surface_runoff_enabled"));
@@ -10568,9 +10594,51 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
     CHECK(loaded->waterRainSettings.activeParticleCount == 18'432U);
     CHECK(loaded->waterRainSettings.rainLevel == Catch::Approx(0.73F));
     CHECK(loaded->waterRainSettings.windSpeedMetersPerSecond == Catch::Approx(1.75F));
+    CHECK(loaded->waterRainSettings.nearSurface.approachDistanceMeters == Catch::Approx(0.41F));
+    CHECK(loaded->waterRainSettings.nearSurface.minimumSpeedFactor == Catch::Approx(0.22F));
+    CHECK(loaded->waterRainSettings.nearSurface.squish == Catch::Approx(0.83F));
+    CHECK(loaded->waterRainSettings.nearSurface.normalAlignment == Catch::Approx(0.61F));
+    CHECK(loaded->waterRainSettings.rockImpact.edgeBreakup == Catch::Approx(0.58F));
+    CHECK(loaded->waterRainSettings.rockImpact.spreadSpeed == Catch::Approx(0.92F));
+    CHECK(loaded->waterRainSettings.rockImpact.centreFalloff == Catch::Approx(0.44F));
+    CHECK(loaded->waterRainSettings.rockImpact.heightBias == Catch::Approx(1.30F));
+    CHECK(loaded->waterRainSettings.rockImpact.persistence == Catch::Approx(2.20F));
+    CHECK(loaded->waterRainSettings.vegetationImpact.twinkle == Catch::Approx(2.70F));
+    CHECK(
+        loaded->waterRainSettings.vegetationImpact.propagationMetersPerSecond ==
+        Catch::Approx(0.80F));
+    CHECK(loaded->waterRainSettings.vegetationImpact.hopSpacingMeters == Catch::Approx(0.055F));
+    CHECK(loaded->waterRainSettings.vegetationImpact.streamWidthMeters == Catch::Approx(0.012F));
+    CHECK(loaded->waterRainSettings.vegetationImpact.streamSpread == Catch::Approx(1.10F));
     CHECK(loaded->waterRainVisualSettings.widthMeters == Catch::Approx(0.007F));
     CHECK(loaded->waterRainVisualSettings.streakLengthMeters == Catch::Approx(0.29F));
     CHECK(loaded->waterRainVisualSettings.colour[2] == Catch::Approx(0.86F));
+
+    const auto versionTwoPath =
+        std::filesystem::temp_directory_path() / "invisible_places_gpu_rain_v2_project.json";
+    auto versionTwoJson = savedJson;
+    auto& versionTwoRain = versionTwoJson["water_rain_settings"];
+    versionTwoRain["version"] = 2;
+    versionTwoRain.erase("near_surface");
+    versionTwoRain.erase("rock_impact");
+    versionTwoRain.erase("vegetation_impact");
+    {
+        std::ofstream output{versionTwoPath, std::ios::trunc};
+        output << versionTwoJson.dump(2);
+    }
+    const auto versionTwo =
+        invisible_places::serialization::LoadProjectDocument(versionTwoPath, &errorMessage);
+    REQUIRE(versionTwo.has_value());
+    const auto defaults = invisible_places::water::DefaultRainRuntimeSettings();
+    CHECK(
+        versionTwo->waterRainSettings.nearSurface.approachDistanceMeters ==
+        Catch::Approx(defaults.nearSurface.approachDistanceMeters));
+    CHECK(
+        versionTwo->waterRainSettings.rockImpact.edgeBreakup ==
+        Catch::Approx(defaults.rockImpact.edgeBreakup));
+    CHECK(
+        versionTwo->waterRainSettings.vegetationImpact.twinkle ==
+        Catch::Approx(defaults.vegetationImpact.twinkle));
 
     const auto legacyPath =
         std::filesystem::temp_directory_path() / "invisible_places_route_rain_legacy.json";
@@ -10600,9 +10668,13 @@ TEST_CASE("GPU rain settings and visual profile round-trip while route rain stay
         invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
     REQUIRE(loadedSources.has_value());
     CHECK(loadedSources->rainSettings.seed == 9876U);
+    CHECK(loadedSources->rainSettings.nearSurface.squish == Catch::Approx(0.83F));
+    CHECK(loadedSources->rainSettings.rockImpact.persistence == Catch::Approx(2.20F));
+    CHECK(loadedSources->rainSettings.vegetationImpact.streamSpread == Catch::Approx(1.10F));
     CHECK(loadedSources->rainVisualSettings.opacity == Catch::Approx(0.77F));
 
     std::filesystem::remove(projectPath);
+    std::filesystem::remove(versionTwoPath);
     std::filesystem::remove(legacyPath);
     std::filesystem::remove(sourcesPath);
 }
@@ -11655,7 +11727,7 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedAnimation},
             std::istreambuf_iterator<char>{}};
-        CHECK(savedJson.find("\"schema_version\": 10") != std::string::npos);
+        CHECK(savedJson.find("\"schema_version\": 11") != std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"still_camera_duration_seconds\"") != std::string::npos);
         CHECK(savedJson.find("\"linked_camera_id\": \"camera_entry\"") != std::string::npos);

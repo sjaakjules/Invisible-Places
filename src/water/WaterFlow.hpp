@@ -308,6 +308,12 @@ struct WaterSeepageNodeAnimationState {
     float activity = 1.0F;
     float localSpread = 0.0F;
     float wettingProgress = 1.0F;
+    // Live node dimensions and prominence are normalized multipliers. They
+    // are deliberately parameters rather than topology inputs so playback
+    // never rebuilds cache-derived support.
+    float reachScale = 1.0F;
+    float widthScale = 1.0F;
+    float prominence = 1.0F;
 };
 
 struct WaterSeepageNodeKey {
@@ -354,8 +360,18 @@ struct WaterSeepageNode {
     invisible_places::io::Float3 surfaceNormal{0.0F, 1.0F, 0.0F};
     invisible_places::io::Float3 downAxis{0.0F, 0.0F, -1.0F};
     float reachMeters = 1.25F;
+    // Width is the live full-width threshold used by connected support. The
+    // legacy start/end fields remain readable during the staged migration,
+    // but new topology and parameter fingerprints use widthMeters.
+    float widthMeters = 0.75F;
     float startWidthMeters = 0.12F;
     float endWidthMeters = 0.75F;
+    float prominence = 1.0F;
+    // Cache-cell support is authored to fixed limits. Reach/width edits inside
+    // these limits remain parameter-only; increasing a limit is the explicit
+    // topology-changing operation.
+    float selectionReachLimitMeters = 2.34375F;
+    float selectionWidthLimitMeters = 1.215F;
     float edgeFeatherMeters = 0.10F;
     float depthToleranceMeters = 0.15F;
     float normalAlignment = 0.20F;
@@ -398,6 +414,14 @@ struct WaterSeepageRuntimeNode {
     glm::mat3 noiseRotation{1.0F};
     glm::vec3 environmentDirection{0.0F, 0.0F, 1.0F};
     float reachMeters = 1.25F;
+    float widthMeters = 0.75F;
+    float selectionReachLimitMeters = 2.34375F;
+    float selectionWidthLimitMeters = 1.215F;
+    float prominence = 1.0F;
+    float authoredReachMeters = 1.25F;
+    float authoredWidthMeters = 0.75F;
+    float authoredProminence = 1.0F;
+    float authoredStartHalfWidthMeters = 0.06F;
     float startHalfWidthMeters = 0.06F;
     float endHalfWidthMeters = 0.375F;
     float edgeFeatherMeters = 0.10F;
@@ -425,7 +449,88 @@ struct WaterSeepageRuntimeNode {
     float guideAchievedReachMeters = 0.0F;
     bool guideValid = false;
     bool guideComplete = false;
+    bool usesConnectedSupport = false;
 };
+
+inline constexpr float kWaterSeepageSupportCellSizeMeters = 0.010F;
+inline constexpr std::size_t kWaterSeepageMaximumSupportCellsPerNode = 262'144U;
+
+// One density-independent cache cell selected beneath an authored node. The
+// metrics are evaluated against live node parameters and therefore do not
+// change while an animation is playing.
+struct WaterSeepageSupportCell {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
+    float downwardDistanceMeters = 0.0F;
+    float lateralDistanceMeters = 0.0F;
+    invisible_places::io::Float3 surfaceNormal{0.0F, 0.0F, 1.0F};
+    float confidence = 0.0F;
+};
+
+struct WaterSeepageSupportSelectionDiagnostics {
+    std::uint32_t visitedSurfelCount = 0U;
+    std::uint32_t acceptedSurfelCount = 0U;
+    std::uint32_t emittedCellCount = 0U;
+    std::uint32_t rejectedAboveNodeCount = 0U;
+    std::uint32_t rejectedReachCount = 0U;
+    std::uint32_t rejectedWidthCount = 0U;
+    std::uint32_t rejectedContinuityCount = 0U;
+    bool cellLimitExceeded = false;
+};
+
+struct WaterSeepageSupportSelection {
+    std::uint32_t nodeId = 0U;
+    std::string targetSceneRole;
+    WaterSurfaceRole sourceRole = WaterSurfaceRole::None;
+    float cellSizeMeters = kWaterSeepageSupportCellSizeMeters;
+    float reachLimitMeters = 0.0F;
+    float widthLimitMeters = 0.0F;
+    std::vector<WaterSeepageSupportCell> cells;
+    invisible_places::io::Bounds3f bounds{};
+    std::string fingerprint;
+};
+
+struct WaterSeepageSupportBuildOptions {
+    std::size_t maximumSupportCells = kWaterSeepageMaximumSupportCellsPerNode;
+    std::size_t maximumVisitedSurfels = kWaterSeepageMaximumSupportCellsPerNode;
+    const std::stop_token* stopToken = nullptr;
+};
+
+struct WaterSeepageSupportBuildResult {
+    WaterSeepageSupportSelection selection;
+    WaterSeepageSupportSelectionDiagnostics diagnostics{};
+    std::string errorMessage;
+    bool success = false;
+    bool cancelled = false;
+};
+
+struct alignas(16) WaterSeepageSupportReference {
+    std::uint32_t nodeIndex = 0U;
+    float downwardDistanceMeters = 0.0F;
+    float lateralDistanceMeters = 0.0F;
+    // Octahedral normal (10+10 bits), confidence (8 bits), authored terrain
+    // role (2 bits), and flags (2 bits). Keeping this record exactly 16 bytes
+    // lets the CPU and std430 GPU paths share one bounded reference payload.
+    std::uint32_t packedNormalRoleConfidenceFlags = 0U;
+};
+
+static_assert(sizeof(WaterSeepageSupportReference) == 16U);
+
+struct WaterSeepageSupportReferenceMetadata {
+    invisible_places::io::Float3 surfaceNormal{0.0F, 0.0F, 1.0F};
+    WaterSurfaceRole sourceRole = WaterSurfaceRole::None;
+    float confidence = 0.0F;
+    std::uint32_t flags = 0U;
+};
+
+[[nodiscard]] std::uint32_t PackWaterSeepageSupportReferenceMetadata(
+    const invisible_places::io::Float3& surfaceNormal,
+    WaterSurfaceRole sourceRole,
+    float confidence,
+    std::uint32_t flags = 0U);
+[[nodiscard]] WaterSeepageSupportReferenceMetadata
+UnpackWaterSeepageSupportReferenceMetadata(std::uint32_t packed);
 
 struct WaterSeepageSpatialHashCell {
     std::int32_t x = 0;
@@ -445,6 +550,12 @@ struct WaterSeepageSpatialGridDiagnostics {
     std::uint32_t overflowCellCount = 0U;
     std::uint32_t droppedNodeReferenceCount = 0U;
     std::uint32_t maxReferencesPerCell = 8U;
+    std::uint32_t supportSelectionCount = 0U;
+    std::uint32_t supportOccupiedCellCount = 0U;
+    std::uint32_t supportHashCellCapacity = 0U;
+    std::uint32_t supportReferenceCount = 0U;
+    std::uint32_t supportOverflowCellCount = 0U;
+    std::uint32_t droppedSupportReferenceCount = 0U;
 };
 
 struct WaterSeepageSpatialGrid {
@@ -453,8 +564,15 @@ struct WaterSeepageSpatialGrid {
     std::vector<WaterSeepageRuntimeNode> nodes;
     std::vector<WaterSeepageSpatialHashCell> hashCells;
     std::vector<std::uint32_t> nodeReferences;
+    // When populated, this exact 10 mm hash replaces fan membership. The
+    // coarse node grid remains available as the legacy/fallback path while
+    // callers migrate to connected support selections.
+    std::vector<WaterSeepageSpatialHashCell> supportHashCells;
+    std::vector<WaterSeepageSupportReference> supportReferences;
     invisible_places::io::Bounds3f unionBounds{};
+    invisible_places::io::Bounds3f supportUnionBounds{};
     float cellSizeMeters = 0.50F;
+    float supportCellSizeMeters = kWaterSeepageSupportCellSizeMeters;
     WaterSeepageSpatialGridDiagnostics diagnostics{};
 };
 
@@ -975,7 +1093,9 @@ void AddOrUpdateWaterSeepageNodeKey(
 [[nodiscard]] float EffectiveWaterFlowActivity(
     const WaterScenarioState& state,
     float maximumFlowStrength,
-    float rainResponse);
+    float rainResponse,
+    bool sourceShowTrail = true,
+    bool globalShowTrails = true);
 void AddOrUpdateWaterScenarioKey(
     WaterScenarioTrack* track,
     WaterScenarioKey key,
@@ -1007,7 +1127,18 @@ void AddOrUpdateWaterScenarioKey(
     std::uint64_t effectivePointInvocations,
     std::span<const WaterSeepageSurfaceGuide> guides = {},
     const std::optional<WaterScenarioState>& scenarioState = std::nullopt,
-    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {},
+    std::span<const WaterSeepageSupportSelection> supportSelections = {});
+[[nodiscard]] WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
+    const WaterSeepageNode& node,
+    std::string_view targetSceneRole,
+    const WaterSurfaceCache& surfaceCache,
+    const WaterSeepageSupportBuildOptions& options = {});
+// A failed/cancelled/capped candidate never replaces the last settled
+// selection. This explicit commit seam keeps asynchronous callers atomic.
+[[nodiscard]] bool CommitWaterSeepageSupportSelection(
+    const WaterSeepageSupportBuildResult& candidate,
+    WaterSeepageSupportSelection* settledSelection);
 void ApplyWaterSeepageRuntimeParameters(
     WaterSeepageSpatialGrid* grid,
     std::span<const WaterSeepageNode> nodes,
@@ -1311,6 +1442,7 @@ struct WaterEmitter {
     bool trailProfileLocked = false;
     float maximumFlowStrength = 1.0F;
     float rainResponse = 0.0F;
+    bool showTrail = true;
 };
 
 struct WaterManualFlowPathSource {
@@ -1327,6 +1459,7 @@ struct WaterManualFlowPathSource {
     bool useSurfaceGuide = true;
     float maximumFlowStrength = 1.0F;
     float rainResponse = 0.0F;
+    bool showTrail = true;
 };
 
 struct WaterSceneSupportLayer {

@@ -84,6 +84,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 seepageBoundsMax;
     uvec4 rainImpactControl;
     vec4 rainImpactGrid;
+    vec4 rainImpactRock0;
+    vec4 rainImpactRock1;
+    vec4 rainImpactVegetation0;
+    vec4 rainImpactVegetation1;
 } styleData;
 
 #include "pointcloud_sparse_ripple.glsl"

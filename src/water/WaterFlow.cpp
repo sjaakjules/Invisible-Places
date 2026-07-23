@@ -12,11 +12,15 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -3905,14 +3909,10 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
     invisible_places::io::Bounds3f bounds;
     const float feather = std::max(0.0F, node.edgeFeatherMeters);
     const float lateralExtent =
-        std::max(
-            node.startHalfWidthMeters,
-            node.endHalfWidthMeters * kSeepageMaximumWidthScale) + feather;
+        std::max(node.startHalfWidthMeters, node.selectionWidthLimitMeters * 0.5F) + feather;
     const float depthExtent = node.depthToleranceMeters + feather;
     if (node.guideValid && node.guideSampleCount >= 2U) {
-        const float maximumReach = std::max(
-            1.0e-5F,
-            node.reachMeters * kSeepageMaximumReachScale);
+        const float maximumReach = std::max(1.0e-5F, node.selectionReachLimitMeters);
         for (std::size_t sampleIndex = 0U;
              sampleIndex < node.guideSampleCount;
              ++sampleIndex) {
@@ -3932,7 +3932,7 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
             const float progress = Clamp01(sample.station / maximumReach);
             const float halfWidth = std::lerp(
                 node.startHalfWidthMeters,
-                node.endHalfWidthMeters * kSeepageMaximumWidthScale,
+                node.selectionWidthLimitMeters * 0.5F,
                 progress);
             const glm::vec3 extent =
                 glm::abs(lateral) * (halfWidth + feather) +
@@ -3945,7 +3945,7 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
     }
     const std::array<float, 2> longitudinal{
         -feather,
-        node.reachMeters * kSeepageMaximumReachScale + feather};
+        node.selectionReachLimitMeters + feather};
     const std::array<float, 2> lateral{-lateralExtent, lateralExtent};
     const std::array<float, 2> depth{-depthExtent, depthExtent};
     for (const float along : longitudinal) {
@@ -4154,13 +4154,8 @@ SeepageFanSample EvaluatePlanarSeepageFanMask(
     sample.lateralDistance = std::abs(sample.signedLateralDistance);
     const float depthDistance = std::abs(glm::dot(relative, node.surfaceNormal));
     const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
-    const float rainGain = SeepageRainGain(node);
-    const float scenarioReachScale = 1.0F + 0.50F * Clamp01(node.scenarioSpread);
-    const float scenarioWidthScale = 1.0F + 0.35F * Clamp01(node.scenarioSpread);
-    const float effectiveReach =
-        node.reachMeters * scenarioReachScale * (1.0F + 0.25F * rainGain);
-    const float effectiveEndHalfWidth =
-        node.endHalfWidthMeters * scenarioWidthScale * (1.0F + 0.20F * rainGain);
+    const float effectiveReach = node.reachMeters;
+    const float effectiveEndHalfWidth = node.widthMeters * 0.5F;
     if (sample.downDistance < -feather ||
         sample.downDistance > effectiveReach + feather ||
         depthDistance > node.depthToleranceMeters + feather) {
@@ -4287,12 +4282,7 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
     sample.signedLateralDistance = glm::dot(relative, lateral);
     sample.lateralDistance = std::abs(sample.signedLateralDistance);
     const float depthDistance = std::abs(glm::dot(relative, surfaceNormal));
-    const float rainGain = SeepageRainGain(node);
-    const float scenarioReachScale = 1.0F + 0.50F * Clamp01(node.scenarioSpread);
-    const float scenarioWidthScale = 1.0F + 0.35F * Clamp01(node.scenarioSpread);
-    const float authoredReach = std::max(
-        1.0e-5F,
-        node.reachMeters * scenarioReachScale * (1.0F + 0.25F * rainGain));
+    const float authoredReach = std::max(1.0e-5F, node.reachMeters);
     const float lastStation = node.guideSamples[node.guideSampleCount - 1U].station;
     const float supportedReach = std::min({
         authoredReach,
@@ -4307,8 +4297,7 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
     }
 
     const float progress = Clamp01(sample.downDistance / authoredReach);
-    const float effectiveEndHalfWidth =
-        node.endHalfWidthMeters * scenarioWidthScale * (1.0F + 0.20F * rainGain);
+    const float effectiveEndHalfWidth = node.widthMeters * 0.5F;
     const float halfWidth = std::lerp(
         node.startHalfWidthMeters,
         effectiveEndHalfWidth,
@@ -4762,17 +4751,17 @@ bool SeepageBoundsContain(
 }
 
 const WaterSeepageSpatialHashCell* FindSeepageHashCell(
-    const WaterSeepageSpatialGrid& grid,
+    std::span<const WaterSeepageSpatialHashCell> hashCells,
     std::int32_t x,
     std::int32_t y,
     std::int32_t z) {
-    if (grid.hashCells.empty() || (grid.hashCells.size() & (grid.hashCells.size() - 1U)) != 0U) {
+    if (hashCells.empty() || (hashCells.size() & (hashCells.size() - 1U)) != 0U) {
         return nullptr;
     }
-    const auto mask = grid.hashCells.size() - 1U;
+    const auto mask = hashCells.size() - 1U;
     std::size_t slot = static_cast<std::size_t>(SeepageSpatialHash(x, y, z)) & mask;
-    for (std::size_t probe = 0U; probe < grid.hashCells.size(); ++probe) {
-        const auto& cell = grid.hashCells[slot];
+    for (std::size_t probe = 0U; probe < hashCells.size(); ++probe) {
+        const auto& cell = hashCells[slot];
         if (!cell.occupied) {
             return nullptr;
         }
@@ -4782,6 +4771,14 @@ const WaterSeepageSpatialHashCell* FindSeepageHashCell(
         slot = (slot + 1U) & mask;
     }
     return nullptr;
+}
+
+const WaterSeepageSpatialHashCell* FindSeepageHashCell(
+    const WaterSeepageSpatialGrid& grid,
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z) {
+    return FindSeepageHashCell(grid.hashCells, x, y, z);
 }
 
 void SeepageFingerprintByte(std::uint64_t* hash, std::uint8_t value) {
@@ -4942,6 +4939,9 @@ WaterSeepageNodeAnimationState SanitizeSeepageNodeAnimationState(
     state.activity = Clamp01(SeepageFiniteOr(state.activity, 1.0F));
     state.localSpread = Clamp01(SeepageFiniteOr(state.localSpread, 0.0F));
     state.wettingProgress = Clamp01(SeepageFiniteOr(state.wettingProgress, 1.0F));
+    state.reachScale = std::clamp(SeepageFiniteOr(state.reachScale, 1.0F), 0.0F, 8.0F);
+    state.widthScale = std::clamp(SeepageFiniteOr(state.widthScale, 1.0F), 0.0F, 8.0F);
+    state.prominence = std::clamp(SeepageFiniteOr(state.prominence, 1.0F), 0.0F, 8.0F);
     return state;
 }
 
@@ -4954,6 +4954,9 @@ WaterSeepageNodeAnimationState LerpSeepageNodeAnimationState(
         .activity = std::lerp(left.activity, right.activity, amount),
         .localSpread = std::lerp(left.localSpread, right.localSpread, amount),
         .wettingProgress = std::lerp(left.wettingProgress, right.wettingProgress, amount),
+        .reachScale = std::lerp(left.reachScale, right.reachScale, amount),
+        .widthScale = std::lerp(left.widthScale, right.widthScale, amount),
+        .prominence = std::lerp(left.prominence, right.prominence, amount),
     });
 }
 
@@ -5022,6 +5025,27 @@ void ApplySeepageRuntimeScenarioAndAnimation(
                                           ? WaterRainPresetVisualStrength(
                                                 rainSettings.intensityPreset)
                                           : 0.0F);
+    const float rainGain = SeepageRainGain(*node);
+    const float reachScale =
+        (1.0F + 0.50F * node->scenarioSpread) * (1.0F + 0.25F * rainGain);
+    const float widthScale =
+        (1.0F + 0.35F * node->scenarioSpread) * (1.0F + 0.20F * rainGain);
+    node->reachMeters = std::clamp(
+        node->authoredReachMeters * nodeState.reachScale * reachScale,
+        0.0F,
+        std::max(0.0F, node->selectionReachLimitMeters));
+    node->widthMeters = std::clamp(
+        node->authoredWidthMeters * nodeState.widthScale * widthScale,
+        0.0F,
+        std::max(0.0F, node->selectionWidthLimitMeters));
+    node->prominence = std::clamp(
+        node->authoredProminence * nodeState.prominence,
+        0.0F,
+        8.0F);
+    node->endHalfWidthMeters = node->widthMeters * 0.5F;
+    node->startHalfWidthMeters = std::min(
+        node->authoredStartHalfWidthMeters * nodeState.widthScale * widthScale,
+        node->endHalfWidthMeters);
     node->transitionLook.reset();
     node->transitionAmount = 0.0F;
     if (scenarioState.has_value() && scenarioState->transitionLook.has_value()) {
@@ -5410,7 +5434,12 @@ float EvaluateWaterSeepageRainEnvelope(
 float EffectiveWaterFlowActivity(
     const WaterScenarioState& state,
     float maximumFlowStrength,
-    float rainResponse) {
+    float rainResponse,
+    bool sourceShowTrail,
+    bool globalShowTrails) {
+    if (!sourceShowTrail || !globalShowTrails) {
+        return 0.0F;
+    }
     const float flowLevel = std::isfinite(state.flowLevel) ? Clamp01(state.flowLevel) : 1.0F;
     const float rainLevel = std::isfinite(state.rainLevel) ? Clamp01(state.rainLevel) : 0.0F;
     const float maximumStrength =
@@ -5544,6 +5573,67 @@ invisible_places::io::Float3 DeriveWaterSeepageDownAxis(
     return FromGlm(down);
 }
 
+std::uint32_t PackWaterSeepageSupportReferenceMetadata(
+    const invisible_places::io::Float3& surfaceNormal,
+    WaterSurfaceRole sourceRole,
+    float confidence,
+    std::uint32_t flags) {
+    glm::vec3 normal = SafeSeepageNormal(surfaceNormal);
+    normal /= std::max(
+        1.0e-6F,
+        std::abs(normal.x) + std::abs(normal.y) + std::abs(normal.z));
+    glm::vec2 octahedral{normal.x, normal.y};
+    if (normal.z < 0.0F) {
+        const glm::vec2 original = octahedral;
+        octahedral.x = (1.0F - std::abs(original.y)) *
+                       (original.x < 0.0F ? -1.0F : 1.0F);
+        octahedral.y = (1.0F - std::abs(original.x)) *
+                       (original.y < 0.0F ? -1.0F : 1.0F);
+    }
+    const auto quantizeNormal = [](float value) {
+        return static_cast<std::uint32_t>(std::lround(
+            std::clamp(value * 0.5F + 0.5F, 0.0F, 1.0F) * 1023.0F));
+    };
+    const auto packedConfidence = static_cast<std::uint32_t>(std::lround(
+        Clamp01(SeepageFiniteOr(confidence, 0.0F)) * 255.0F));
+    return quantizeNormal(octahedral.x) |
+           (quantizeNormal(octahedral.y) << 10U) |
+           (packedConfidence << 20U) |
+           ((static_cast<std::uint32_t>(sourceRole) & 0x3U) << 28U) |
+           ((flags & 0x3U) << 30U);
+}
+
+WaterSeepageSupportReferenceMetadata UnpackWaterSeepageSupportReferenceMetadata(
+    std::uint32_t packed) {
+    const auto decodeNormal = [](std::uint32_t value) {
+        return static_cast<float>(value) / 1023.0F * 2.0F - 1.0F;
+    };
+    glm::vec3 normal{
+        decodeNormal(packed & 0x3ffU),
+        decodeNormal((packed >> 10U) & 0x3ffU),
+        0.0F,
+    };
+    normal.z = 1.0F - std::abs(normal.x) - std::abs(normal.y);
+    if (normal.z < 0.0F) {
+        const glm::vec2 original{normal.x, normal.y};
+        normal.x = (1.0F - std::abs(original.y)) *
+                   (original.x < 0.0F ? -1.0F : 1.0F);
+        normal.y = (1.0F - std::abs(original.x)) *
+                   (original.y < 0.0F ? -1.0F : 1.0F);
+    }
+    if (!IsValidPoint(normal) || glm::dot(normal, normal) <= kNormalEpsilon) {
+        normal = {0.0F, 0.0F, 1.0F};
+    } else {
+        normal = glm::normalize(normal);
+    }
+    return {
+        .surfaceNormal = FromGlm(normal),
+        .sourceRole = static_cast<WaterSurfaceRole>((packed >> 28U) & 0x3U),
+        .confidence = static_cast<float>((packed >> 20U) & 0xffU) / 255.0F,
+        .flags = (packed >> 30U) & 0x3U,
+    };
+}
+
 WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     std::span<const WaterSeepageNode> nodes,
     std::span<const WaterSeepageLookProfile> profiles,
@@ -5554,7 +5644,8 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     std::uint64_t effectivePointInvocations,
     std::span<const WaterSeepageSurfaceGuide> guides,
     const std::optional<WaterScenarioState>& scenarioState,
-    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates) {
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates,
+    std::span<const WaterSeepageSupportSelection> supportSelections) {
     WaterSeepageSpatialGrid grid;
     grid.diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
         nodes.size(),
@@ -5596,18 +5687,35 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
         }
         runtime.lateralAxis = glm::normalize(runtime.lateralAxis);
         runtime.noiseRotation = SeepageNoiseRotation(node.seed ^ (node.id * 0x9e3779b9U));
-        runtime.reachMeters = std::clamp(
+        runtime.authoredReachMeters = std::clamp(
             SeepageFiniteOr(node.reachMeters, 1.25F),
             0.001F,
             1000.0F);
-        runtime.startHalfWidthMeters = 0.5F * std::clamp(
+        runtime.authoredWidthMeters = std::clamp(
+            SeepageFiniteOr(node.widthMeters, 0.75F),
+            0.002F,
+            1000.0F);
+        runtime.authoredProminence = std::clamp(
+            SeepageFiniteOr(node.prominence, 1.0F),
+            0.0F,
+            8.0F);
+        runtime.selectionReachLimitMeters = std::clamp(
+            SeepageFiniteOr(node.selectionReachLimitMeters, 2.34375F),
+            0.001F,
+            1000.0F);
+        runtime.selectionWidthLimitMeters = std::clamp(
+            SeepageFiniteOr(node.selectionWidthLimitMeters, 1.215F),
+            0.002F,
+            1000.0F);
+        runtime.authoredStartHalfWidthMeters = 0.5F * std::clamp(
             SeepageFiniteOr(node.startWidthMeters, 0.12F),
             0.002F,
             1000.0F);
-        runtime.endHalfWidthMeters = 0.5F * std::clamp(
-            SeepageFiniteOr(node.endWidthMeters, 0.75F),
-            0.002F,
-            1000.0F);
+        runtime.reachMeters = runtime.authoredReachMeters;
+        runtime.widthMeters = runtime.authoredWidthMeters;
+        runtime.prominence = runtime.authoredProminence;
+        runtime.startHalfWidthMeters = runtime.authoredStartHalfWidthMeters;
+        runtime.endHalfWidthMeters = runtime.authoredWidthMeters * 0.5F;
         runtime.edgeFeatherMeters = std::clamp(
             SeepageFiniteOr(node.edgeFeatherMeters, 0.10F),
             0.001F,
@@ -5638,11 +5746,10 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
         largestSpan = std::max(
             largestSpan,
             std::max(
-                runtime.reachMeters * kSeepageMaximumReachScale +
+                runtime.selectionReachLimitMeters +
                     runtime.edgeFeatherMeters * 2.0F,
-                std::max(
-                    runtime.startHalfWidthMeters,
-                    runtime.endHalfWidthMeters * kSeepageMaximumWidthScale) * 2.0F +
+                std::max(runtime.startHalfWidthMeters,
+                         runtime.selectionWidthLimitMeters * 0.5F) * 2.0F +
                     runtime.edgeFeatherMeters * 2.0F));
         const auto nodeBounds = SeepageRuntimeNodeBounds(runtime);
         if (nodeBounds.valid) {
@@ -5670,6 +5777,130 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             }
             return left.seed < right.seed;
         });
+
+    // Connected selections are immutable topology derived from the shared
+    // surface cache. Build their exact 10 mm hash independently of the coarse
+    // fallback fan grid so live reach/width/prominence edits remain compact
+    // parameter writes.
+    using SupportKey = std::tuple<std::int32_t, std::int32_t, std::int32_t>;
+    struct PendingSupportReference {
+        std::uint32_t nodeIndex = 0U;
+        WaterSeepageSupportCell cell{};
+        WaterSurfaceRole sourceRole = WaterSurfaceRole::None;
+    };
+    std::map<SupportKey, std::vector<PendingSupportReference>> supportByCell;
+    const auto normalizedTargetRole = NormalizeSeepageRole(targetSceneRole);
+    for (std::size_t nodeIndex = 0U; nodeIndex < grid.nodes.size(); ++nodeIndex) {
+        auto& runtime = grid.nodes[nodeIndex];
+        const auto selection = std::find_if(
+            supportSelections.begin(),
+            supportSelections.end(),
+            [&](const WaterSeepageSupportSelection& candidate) {
+                return candidate.nodeId == runtime.id &&
+                       NormalizeSeepageRole(candidate.targetSceneRole) == normalizedTargetRole &&
+                       std::abs(candidate.cellSizeMeters -
+                                kWaterSeepageSupportCellSizeMeters) <= 1.0e-6F &&
+                       !candidate.cells.empty() && !candidate.fingerprint.empty();
+            });
+        if (selection == supportSelections.end()) {
+            continue;
+        }
+        runtime.usesConnectedSupport = true;
+        ++grid.diagnostics.supportSelectionCount;
+        for (const auto& cell : selection->cells) {
+            if (!std::isfinite(cell.downwardDistanceMeters) ||
+                !std::isfinite(cell.lateralDistanceMeters)) {
+                continue;
+            }
+            supportByCell[{cell.x, cell.y, cell.z}].push_back({
+                .nodeIndex = static_cast<std::uint32_t>(nodeIndex),
+                .cell = cell,
+                .sourceRole = normalizedTargetRole == "veg"
+                                  ? WaterSurfaceRole::Vegetation
+                                  : selection->sourceRole,
+            });
+        }
+        if (selection->bounds.valid) {
+            grid.supportUnionBounds.Expand(selection->bounds.minimum);
+            grid.supportUnionBounds.Expand(selection->bounds.maximum);
+        }
+    }
+
+    if (!supportByCell.empty()) {
+        std::size_t supportCapacity = 16U;
+        while (supportByCell.size() * 10U >= supportCapacity * 7U) {
+            supportCapacity *= 2U;
+        }
+        grid.supportHashCells.resize(supportCapacity);
+        grid.supportCellSizeMeters = kWaterSeepageSupportCellSizeMeters;
+        for (auto& [key, references] : supportByCell) {
+            std::sort(
+                references.begin(),
+                references.end(),
+                [&](const PendingSupportReference& left,
+                    const PendingSupportReference& right) {
+                    const auto& leftNode = grid.nodes[left.nodeIndex];
+                    const auto& rightNode = grid.nodes[right.nodeIndex];
+                    if (leftNode.id != rightNode.id) {
+                        return leftNode.id < rightNode.id;
+                    }
+                    if (left.cell.confidence != right.cell.confidence) {
+                        return left.cell.confidence > right.cell.confidence;
+                    }
+                    return left.nodeIndex < right.nodeIndex;
+                });
+            references.erase(
+                std::unique(
+                    references.begin(),
+                    references.end(),
+                    [](const PendingSupportReference& left,
+                       const PendingSupportReference& right) {
+                        return left.nodeIndex == right.nodeIndex;
+                    }),
+                references.end());
+            if (references.size() > WaterSeepageSpatialGrid::kMaxReferencesPerCell) {
+                ++grid.diagnostics.supportOverflowCellCount;
+                grid.diagnostics.droppedSupportReferenceCount +=
+                    static_cast<std::uint32_t>(
+                        references.size() - WaterSeepageSpatialGrid::kMaxReferencesPerCell);
+                references.resize(WaterSeepageSpatialGrid::kMaxReferencesPerCell);
+            }
+
+            const auto [x, y, z] = key;
+            const auto mask = grid.supportHashCells.size() - 1U;
+            std::size_t slot = static_cast<std::size_t>(SeepageSpatialHash(x, y, z)) & mask;
+            while (grid.supportHashCells[slot].occupied) {
+                slot = (slot + 1U) & mask;
+            }
+            auto& hashCell = grid.supportHashCells[slot];
+            hashCell.x = x;
+            hashCell.y = y;
+            hashCell.z = z;
+            hashCell.referenceOffset =
+                static_cast<std::uint32_t>(grid.supportReferences.size());
+            hashCell.referenceCount = static_cast<std::uint32_t>(references.size());
+            hashCell.occupied = true;
+            for (const auto& reference : references) {
+                grid.supportReferences.push_back({
+                    .nodeIndex = reference.nodeIndex,
+                    .downwardDistanceMeters = reference.cell.downwardDistanceMeters,
+                    .lateralDistanceMeters = reference.cell.lateralDistanceMeters,
+                    .packedNormalRoleConfidenceFlags =
+                        PackWaterSeepageSupportReferenceMetadata(
+                            reference.cell.surfaceNormal,
+                            reference.sourceRole,
+                            reference.cell.confidence,
+                            1U),
+                });
+            }
+        }
+        grid.diagnostics.supportOccupiedCellCount =
+            static_cast<std::uint32_t>(supportByCell.size());
+        grid.diagnostics.supportHashCellCapacity =
+            static_cast<std::uint32_t>(grid.supportHashCells.size());
+        grid.diagnostics.supportReferenceCount =
+            static_cast<std::uint32_t>(grid.supportReferences.size());
+    }
 
     grid.cellSizeMeters = std::max(
         preferredCellSize,
@@ -5792,6 +6023,22 @@ void ApplyWaterSeepageRuntimeParameters(
                 SeepageFiniteOr(authored->strength, 1.0F),
                 0.0F,
                 8.0F);
+            runtime.authoredReachMeters = std::clamp(
+                SeepageFiniteOr(authored->reachMeters, 1.25F),
+                0.001F,
+                std::max(0.001F, runtime.selectionReachLimitMeters));
+            runtime.authoredWidthMeters = std::clamp(
+                SeepageFiniteOr(authored->widthMeters, 0.75F),
+                0.002F,
+                std::max(0.002F, runtime.selectionWidthLimitMeters));
+            runtime.authoredProminence = std::clamp(
+                SeepageFiniteOr(authored->prominence, 1.0F),
+                0.0F,
+                8.0F);
+            runtime.authoredStartHalfWidthMeters = 0.5F * std::clamp(
+                SeepageFiniteOr(authored->startWidthMeters, 0.12F),
+                0.002F,
+                1000.0F);
             runtime.enabledFactor = authored->enabledInViewport ? 1.0F : 0.0F;
             runtime.authoredLook = ResolveWaterSeepageLook(
                 *authored,
@@ -5826,24 +6073,16 @@ void ApplyWaterSeepageScenarioParameters(
     }
 }
 
-WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
+namespace {
+
+WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
     const WaterSeepageRuntimeNode& node,
     const invisible_places::io::Float3& position,
-    const invisible_places::io::Float3& normal,
+    const glm::vec3& pointNormal,
+    const SeepageFanSample& fan,
     float timeSeconds,
     const WaterSeepageViewContext& viewContext) {
     WaterSeepageRuntimeContribution contribution;
-    if (!IsValidPoint(ToGlm(position)) || node.enabledFactor <= 0.0F || node.reachMeters <= 0.0F ||
-        node.strength <= 0.0F || node.effectiveActivity <= 0.0F) {
-        return contribution;
-    }
-    glm::vec3 pointNormal = ToGlm(normal);
-    if (!IsValidPoint(pointNormal) || glm::dot(pointNormal, pointNormal) <= kNormalEpsilon) {
-        pointNormal = glm::vec3{0.0F};
-    } else {
-        pointNormal = glm::normalize(pointNormal);
-    }
-    const auto fan = EvaluateSeepageFanMask(node, ToGlm(position), pointNormal);
     if (fan.mask <= 1.0e-6F) {
         return contribution;
     }
@@ -5900,7 +6139,7 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     const float rainProminence = 1.0F + 0.65F * rainGain;
     contribution.scale = Clamp01(
         (contribution.damp * 0.58F + contribution.ripple * 0.34F + contribution.glint * 0.46F) *
-        look.response.intensity * rainProminence);
+        look.response.intensity * rainProminence * node.prominence);
     contribution.colourMix = Clamp01(look.response.colouriseAmount * contribution.scale);
     contribution.emissionAdd = std::max(0.0F, look.response.emissionAdd) * contribution.scale;
     contribution.opacityAdd = look.response.opacityAdd * contribution.scale;
@@ -5921,6 +6160,78 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     return contribution;
 }
 
+SeepageFanSample EvaluateConnectedSeepageSupportMask(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageSupportReference& reference,
+    const invisible_places::io::Float3& position,
+    const glm::vec3& pointNormal) {
+    SeepageFanSample sample;
+    const auto metadata = UnpackWaterSeepageSupportReferenceMetadata(
+        reference.packedNormalRoleConfidenceFlags);
+    sample.downDistance = reference.downwardDistanceMeters;
+    sample.lateralDistance = reference.lateralDistanceMeters;
+    sample.signedLateralDistance = glm::dot(ToGlm(position) - node.position, node.lateralAxis);
+    sample.surfaceNormal = SafeSeepageNormal(metadata.surfaceNormal);
+    sample.downTangent = node.downAxis;
+    const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
+    const float halfWidth = node.widthMeters * 0.5F;
+    if (sample.downDistance < -feather ||
+        sample.downDistance > node.reachMeters + feather ||
+        sample.lateralDistance > halfWidth + feather) {
+        return sample;
+    }
+    const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
+    const float endMask = 1.0F - SmoothStep(
+        node.reachMeters - feather,
+        node.reachMeters + feather,
+        sample.downDistance);
+    const float lateralMask = 1.0F - SmoothStep(
+        halfWidth,
+        halfWidth + feather,
+        sample.lateralDistance);
+    const bool normalValid = IsValidPoint(pointNormal) &&
+                             glm::dot(pointNormal, pointNormal) > kNormalEpsilon;
+    const glm::vec3 resolvedNormal = normalValid
+                                         ? glm::normalize(pointNormal)
+                                         : sample.surfaceNormal;
+    const float normalAgreement = std::abs(glm::dot(resolvedNormal, sample.surfaceNormal));
+    const float aligned = SmoothStep(0.15F, 0.85F, normalAgreement);
+    const float normalMask = std::lerp(1.0F, aligned, Clamp01(node.normalAlignment));
+    const float confidenceMask = std::lerp(0.65F, 1.0F, Clamp01(metadata.confidence));
+    sample.mask = Clamp01(
+        startMask * endMask * lateralMask * normalMask * confidenceMask);
+    return sample;
+}
+
+}  // namespace
+
+WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
+    const WaterSeepageRuntimeNode& node,
+    const invisible_places::io::Float3& position,
+    const invisible_places::io::Float3& normal,
+    float timeSeconds,
+    const WaterSeepageViewContext& viewContext) {
+    if (!IsValidPoint(ToGlm(position)) || node.enabledFactor <= 0.0F ||
+        node.reachMeters <= 0.0F || node.widthMeters <= 0.0F ||
+        node.prominence <= 0.0F || node.strength <= 0.0F ||
+        node.effectiveActivity <= 0.0F) {
+        return {};
+    }
+    glm::vec3 pointNormal = ToGlm(normal);
+    if (!IsValidPoint(pointNormal) || glm::dot(pointNormal, pointNormal) <= kNormalEpsilon) {
+        pointNormal = glm::vec3{0.0F};
+    } else {
+        pointNormal = glm::normalize(pointNormal);
+    }
+    return EvaluateWaterSeepageRuntimeContributionWithFan(
+        node,
+        position,
+        pointNormal,
+        EvaluateSeepageFanMask(node, ToGlm(position), pointNormal),
+        timeSeconds,
+        viewContext);
+}
+
 WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
     const WaterSeepageSpatialGrid& grid,
     const invisible_places::io::Float3& position,
@@ -5928,33 +6239,92 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
     float timeSeconds,
     const WaterSeepageViewContext& viewContext) {
     WaterSeepageRuntimeContribution result;
-    if (grid.nodes.empty() ||
-        grid.hashCells.empty() ||
-        !SeepageBoundsContain(grid.unionBounds, position)) {
+    if (grid.nodes.empty()) {
         return result;
     }
-    const auto x = SeepageCellCoordinate(position.x, grid.cellSizeMeters);
-    const auto y = SeepageCellCoordinate(position.y, grid.cellSizeMeters);
-    const auto z = SeepageCellCoordinate(position.z, grid.cellSizeMeters);
-    const auto* cell = FindSeepageHashCell(grid, x, y, z);
-    if (cell == nullptr || cell->referenceOffset >= grid.nodeReferences.size()) {
-        return result;
+
+    glm::vec3 pointNormal = ToGlm(normal);
+    if (!IsValidPoint(pointNormal) || glm::dot(pointNormal, pointNormal) <= kNormalEpsilon) {
+        pointNormal = glm::vec3{0.0F};
+    } else {
+        pointNormal = glm::normalize(pointNormal);
     }
-    const std::size_t end = std::min<std::size_t>(
-        grid.nodeReferences.size(),
-        static_cast<std::size_t>(cell->referenceOffset) + cell->referenceCount);
-    for (std::size_t referenceIndex = cell->referenceOffset; referenceIndex < end; ++referenceIndex) {
-        const auto nodeIndex = grid.nodeReferences[referenceIndex];
-        if (nodeIndex >= grid.nodes.size()) {
-            continue;
+
+    if (!grid.supportHashCells.empty() &&
+        SeepageBoundsContain(grid.supportUnionBounds, position)) {
+        const auto supportX = SeepageCellCoordinate(position.x, grid.supportCellSizeMeters);
+        const auto supportY = SeepageCellCoordinate(position.y, grid.supportCellSizeMeters);
+        const auto supportZ = SeepageCellCoordinate(position.z, grid.supportCellSizeMeters);
+        const auto* supportCell = FindSeepageHashCell(
+            grid.supportHashCells,
+            supportX,
+            supportY,
+            supportZ);
+        if (supportCell != nullptr &&
+            supportCell->referenceOffset < grid.supportReferences.size()) {
+            const std::size_t supportEnd = std::min<std::size_t>(
+                grid.supportReferences.size(),
+                static_cast<std::size_t>(supportCell->referenceOffset) +
+                    supportCell->referenceCount);
+            for (std::size_t referenceIndex = supportCell->referenceOffset;
+                 referenceIndex < supportEnd;
+                 ++referenceIndex) {
+                const auto& reference = grid.supportReferences[referenceIndex];
+                if (reference.nodeIndex >= grid.nodes.size()) {
+                    continue;
+                }
+                const auto& node = grid.nodes[reference.nodeIndex];
+                if (node.enabledFactor <= 0.0F || node.reachMeters <= 0.0F ||
+                    node.widthMeters <= 0.0F || node.prominence <= 0.0F ||
+                    node.strength <= 0.0F || node.effectiveActivity <= 0.0F) {
+                    continue;
+                }
+                const auto contribution = EvaluateWaterSeepageRuntimeContributionWithFan(
+                    node,
+                    position,
+                    pointNormal,
+                    EvaluateConnectedSeepageSupportMask(
+                        node,
+                        reference,
+                        position,
+                        pointNormal),
+                    timeSeconds,
+                    viewContext);
+                BlendSeepageContribution(&result, contribution, node.look.blendMode);
+            }
         }
-        const auto contribution = EvaluateWaterSeepageRuntimeContribution(
-            grid.nodes[nodeIndex],
-            position,
-            normal,
-            timeSeconds,
-            viewContext);
-        BlendSeepageContribution(&result, contribution, grid.nodes[nodeIndex].look.blendMode);
+    }
+
+    if (grid.supportHashCells.empty() && !grid.hashCells.empty() &&
+        SeepageBoundsContain(grid.unionBounds, position)) {
+        const auto x = SeepageCellCoordinate(position.x, grid.cellSizeMeters);
+        const auto y = SeepageCellCoordinate(position.y, grid.cellSizeMeters);
+        const auto z = SeepageCellCoordinate(position.z, grid.cellSizeMeters);
+        const auto* cell = FindSeepageHashCell(grid, x, y, z);
+        if (cell != nullptr && cell->referenceOffset < grid.nodeReferences.size()) {
+            const std::size_t end = std::min<std::size_t>(
+                grid.nodeReferences.size(),
+                static_cast<std::size_t>(cell->referenceOffset) + cell->referenceCount);
+            for (std::size_t referenceIndex = cell->referenceOffset;
+                 referenceIndex < end;
+                 ++referenceIndex) {
+                const auto nodeIndex = grid.nodeReferences[referenceIndex];
+                if (nodeIndex >= grid.nodes.size() ||
+                    grid.nodes[nodeIndex].usesConnectedSupport) {
+                    continue;
+                }
+                const auto contribution = EvaluateWaterSeepageRuntimeContribution(
+                    grid.nodes[nodeIndex],
+                    position,
+                    normal,
+                    timeSeconds,
+                    viewContext);
+                BlendSeepageContribution(
+                    &result,
+                    contribution,
+                    grid.nodes[nodeIndex].look.blendMode);
+            }
+        }
     }
     return result;
 }
@@ -5971,7 +6341,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
         }
 
         std::uint64_t nodeHash = 1469598103934665603ULL;
-        SeepageFingerprintU32(&nodeHash, 1U);
+        SeepageFingerprintU32(&nodeHash, 2U);
         SeepageFingerprintU32(&nodeHash, node.id);
         SeepageFingerprintFloat(&nodeHash, node.position.x);
         SeepageFingerprintFloat(&nodeHash, node.position.y);
@@ -5982,9 +6352,8 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
         SeepageFingerprintFloat(&nodeHash, node.downAxis.x);
         SeepageFingerprintFloat(&nodeHash, node.downAxis.y);
         SeepageFingerprintFloat(&nodeHash, node.downAxis.z);
-        SeepageFingerprintFloat(&nodeHash, node.reachMeters);
-        SeepageFingerprintFloat(&nodeHash, node.startWidthMeters);
-        SeepageFingerprintFloat(&nodeHash, node.endWidthMeters);
+        SeepageFingerprintFloat(&nodeHash, node.selectionReachLimitMeters);
+        SeepageFingerprintFloat(&nodeHash, node.selectionWidthLimitMeters);
         SeepageFingerprintFloat(&nodeHash, node.edgeFeatherMeters);
         SeepageFingerprintFloat(&nodeHash, node.depthToleranceMeters);
         nodeFingerprints.push_back(SeepageFingerprintString(nodeHash));
@@ -5992,7 +6361,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     std::sort(nodeFingerprints.begin(), nodeFingerprints.end());
 
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintU32(&hash, 2U);
     SeepageFingerprintText(&hash, normalizedTargetRole);
     SeepageFingerprintU32(
         &hash,
@@ -6000,7 +6369,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     for (const auto& fingerprint : nodeFingerprints) {
         SeepageFingerprintText(&hash, fingerprint);
     }
-    return "water-seepage-authored-topology-v1-" + SeepageFingerprintString(hash);
+    return "water-seepage-authored-topology-v2-" + SeepageFingerprintString(hash);
 }
 
 bool WaterSeepageGridHasActiveViewportEffect(
@@ -6012,6 +6381,8 @@ bool WaterSeepageGridHasActiveViewportEffect(
         [](const WaterSeepageRuntimeNode& node) {
             if (node.enabledFactor <= activeThreshold ||
                 node.reachMeters <= activeThreshold ||
+                node.widthMeters <= activeThreshold ||
+                node.prominence <= activeThreshold ||
                 node.strength <= activeThreshold ||
                 node.effectiveActivity <= activeThreshold) {
                 return false;
@@ -6035,7 +6406,7 @@ bool WaterSeepageGridHasActiveViewportEffect(
 
 std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 2U);
+    SeepageFingerprintU32(&hash, 3U);
     SeepageFingerprintFloat(&hash, grid.cellSizeMeters);
     SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.nodes.size()));
     for (const auto& node : grid.nodes) {
@@ -6052,30 +6423,32 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
         SeepageFingerprintFloat(&hash, node.lateralAxis.x);
         SeepageFingerprintFloat(&hash, node.lateralAxis.y);
         SeepageFingerprintFloat(&hash, node.lateralAxis.z);
-        SeepageFingerprintFloat(&hash, node.reachMeters);
-        SeepageFingerprintFloat(&hash, node.startHalfWidthMeters);
-        SeepageFingerprintFloat(&hash, node.endHalfWidthMeters);
+        SeepageFingerprintFloat(&hash, node.selectionReachLimitMeters);
+        SeepageFingerprintFloat(&hash, node.selectionWidthLimitMeters);
         SeepageFingerprintFloat(&hash, node.edgeFeatherMeters);
         SeepageFingerprintFloat(&hash, node.depthToleranceMeters);
-        SeepageFingerprintU32(&hash, node.guideSampleCount);
-        SeepageFingerprintU32(&hash, node.guideValid ? 1U : 0U);
-        SeepageFingerprintU32(&hash, node.guideComplete ? 1U : 0U);
-        SeepageFingerprintFloat(&hash, node.guideRequestedReachMeters);
-        SeepageFingerprintFloat(&hash, node.guideAchievedReachMeters);
-        for (std::size_t sampleIndex = 0U;
-             sampleIndex < std::min<std::size_t>(
-                 node.guideSampleCount,
-                 kWaterSeepageMaximumGuideSamples);
-             ++sampleIndex) {
-            const auto& sample = node.guideSamples[sampleIndex];
-            SeepageFingerprintFloat(&hash, sample.position.x);
-            SeepageFingerprintFloat(&hash, sample.position.y);
-            SeepageFingerprintFloat(&hash, sample.position.z);
-            SeepageFingerprintFloat(&hash, sample.normal.x);
-            SeepageFingerprintFloat(&hash, sample.normal.y);
-            SeepageFingerprintFloat(&hash, sample.normal.z);
-            SeepageFingerprintFloat(&hash, sample.station);
-            SeepageFingerprintFloat(&hash, sample.confidence);
+        SeepageFingerprintU32(&hash, node.usesConnectedSupport ? 1U : 0U);
+        if (!node.usesConnectedSupport) {
+            SeepageFingerprintU32(&hash, node.guideSampleCount);
+            SeepageFingerprintU32(&hash, node.guideValid ? 1U : 0U);
+            SeepageFingerprintU32(&hash, node.guideComplete ? 1U : 0U);
+            SeepageFingerprintFloat(&hash, node.guideRequestedReachMeters);
+            SeepageFingerprintFloat(&hash, node.guideAchievedReachMeters);
+            for (std::size_t sampleIndex = 0U;
+                 sampleIndex < std::min<std::size_t>(
+                     node.guideSampleCount,
+                     kWaterSeepageMaximumGuideSamples);
+                 ++sampleIndex) {
+                const auto& sample = node.guideSamples[sampleIndex];
+                SeepageFingerprintFloat(&hash, sample.position.x);
+                SeepageFingerprintFloat(&hash, sample.position.y);
+                SeepageFingerprintFloat(&hash, sample.position.z);
+                SeepageFingerprintFloat(&hash, sample.normal.x);
+                SeepageFingerprintFloat(&hash, sample.normal.y);
+                SeepageFingerprintFloat(&hash, sample.normal.z);
+                SeepageFingerprintFloat(&hash, sample.station);
+                SeepageFingerprintFloat(&hash, sample.confidence);
+            }
         }
     }
     SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.hashCells.size()));
@@ -6093,12 +6466,31 @@ std::string WaterSeepageTopologyFingerprint(const WaterSeepageSpatialGrid& grid)
     for (const auto reference : grid.nodeReferences) {
         SeepageFingerprintU32(&hash, reference);
     }
-    return "water-seepage-topology-v2-" + SeepageFingerprintString(hash);
+    SeepageFingerprintFloat(&hash, grid.supportCellSizeMeters);
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(grid.supportHashCells.size()));
+    for (const auto& cell : grid.supportHashCells) {
+        SeepageFingerprintU32(&hash, cell.occupied ? 1U : 0U);
+        if (!cell.occupied) {
+            continue;
+        }
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.x));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.y));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.z));
+        SeepageFingerprintU32(&hash, cell.referenceOffset);
+        SeepageFingerprintU32(&hash, cell.referenceCount);
+    }
+    for (const auto& reference : grid.supportReferences) {
+        SeepageFingerprintU32(&hash, reference.nodeIndex);
+        SeepageFingerprintFloat(&hash, reference.downwardDistanceMeters);
+        SeepageFingerprintFloat(&hash, reference.lateralDistanceMeters);
+        SeepageFingerprintU32(&hash, reference.packedNormalRoleConfidenceFlags);
+    }
+    return "water-seepage-topology-v3-" + SeepageFingerprintString(hash);
 }
 
 std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 4U);
+    SeepageFingerprintU32(&hash, 5U);
     const auto fingerprintLook = [&](const WaterSeepageLookSettings& look) {
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.pattern));
         SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(look.blendMode));
@@ -6143,6 +6535,12 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
     for (const auto& node : grid.nodes) {
         SeepageFingerprintU32(&hash, node.id);
         SeepageFingerprintU32(&hash, node.seed);
+        SeepageFingerprintFloat(&hash, node.reachMeters);
+        SeepageFingerprintFloat(&hash, node.widthMeters);
+        SeepageFingerprintFloat(&hash, node.prominence);
+        SeepageFingerprintFloat(&hash, node.startHalfWidthMeters);
+        SeepageFingerprintFloat(&hash, node.edgeFeatherMeters);
+        SeepageFingerprintFloat(&hash, node.depthToleranceMeters);
         SeepageFingerprintFloat(&hash, node.normalAlignment);
         SeepageFingerprintFloat(&hash, node.strength);
         SeepageFingerprintFloat(&hash, node.rainVisualStrength);
@@ -6159,7 +6557,7 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
             fingerprintLook(node.transitionLook.value());
         }
     }
-    return "water-seepage-params-v4-" + SeepageFingerprintString(hash);
+    return "water-seepage-params-v5-" + SeepageFingerprintString(hash);
 }
 
 WaterSettingsBundle DefaultWaterSettingsBundle(WaterScaleMode mode) {
@@ -6925,6 +7323,7 @@ WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceGuide(
     }
 
     const glm::vec3 nodePosition = ToGlm(node.position);
+    const glm::vec3 nodeNormal = SafeSeepageNormal(node.surfaceNormal);
     const auto startIndex = FindSeepageGuideStartIndex(support, node);
     if (!startIndex.has_value() || startIndex.value() >= support.graph.points.size()) {
         return guide;
@@ -7449,7 +7848,619 @@ WaterSeepageSurfaceGuide TraceWaterSeepageSurfaceCacheGuide(
     return guide;
 }
 
+using SeepageSupportSourceKey =
+    std::tuple<std::int32_t, std::int32_t, std::int32_t, WaterSurfaceRole>;
+using SeepageSupportCellKey = std::tuple<std::int32_t, std::int32_t, std::int32_t>;
+
+const WaterSurfaceSurfel* FindSeepageSupportSurfel(
+    const WaterSurfaceCache& cache,
+    const SeepageSupportSourceKey& key) {
+    const auto found = std::lower_bound(
+        cache.flowSurfaceSurfels.begin(),
+        cache.flowSurfaceSurfels.end(),
+        key,
+        [](const WaterSurfaceSurfel& surfel, const SeepageSupportSourceKey& candidate) {
+            return std::tie(surfel.cellX, surfel.cellY, surfel.cellZ, surfel.role) < candidate;
+        });
+    if (found == cache.flowSurfaceSurfels.end() ||
+        std::tie(found->cellX, found->cellY, found->cellZ, found->role) != key) {
+        return nullptr;
+    }
+    return &*found;
+}
+
+std::optional<WaterSurfaceRole> SeepageSupportSourceRole(
+    const WaterSeepageNode& node,
+    std::string_view targetSceneRole) {
+    if (!SeepageNodeTargetsRole(node, targetSceneRole)) {
+        return std::nullopt;
+    }
+    const auto normalized = NormalizeSeepageRole(targetSceneRole);
+    if (normalized == "sand") {
+        return WaterSurfaceRole::Sand;
+    }
+    // Vegetation deliberately follows its ROCK substrate. The shared cache's
+    // VEG voxels remain Rain occupancy rather than a surface graph.
+    if (normalized == "rock" || normalized == "veg") {
+        return WaterSurfaceRole::Rock;
+    }
+    return std::nullopt;
+}
+
+struct PendingSeepageSupportSurfel {
+    const WaterSurfaceSurfel* surfel = nullptr;
+    float distanceFromNodeSquared = 0.0F;
+};
+
+struct PendingSeepageSupportSurfelGreater {
+    bool operator()(
+        const PendingSeepageSupportSurfel& left,
+        const PendingSeepageSupportSurfel& right) const {
+        if (left.distanceFromNodeSquared != right.distanceFromNodeSquared) {
+            return left.distanceFromNodeSquared > right.distanceFromNodeSquared;
+        }
+        return std::tie(
+                   left.surfel->cellX,
+                   left.surfel->cellY,
+                   left.surfel->cellZ,
+                   left.surfel->role) >
+               std::tie(
+                   right.surfel->cellX,
+                   right.surfel->cellY,
+                   right.surfel->cellZ,
+                   right.surfel->role);
+    }
+};
+
+std::string WaterSeepageSupportSelectionFingerprint(
+    const WaterSeepageSupportSelection& selection,
+    const WaterSurfaceCache& cache,
+    const WaterSeepageNode& node) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintU32(&hash, selection.nodeId);
+    SeepageFingerprintText(&hash, selection.targetSceneRole);
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(selection.sourceRole));
+    SeepageFingerprintFloat(&hash, selection.cellSizeMeters);
+    SeepageFingerprintFloat(&hash, selection.reachLimitMeters);
+    SeepageFingerprintFloat(&hash, selection.widthLimitMeters);
+    SeepageFingerprintFloat(&hash, node.edgeFeatherMeters);
+    SeepageFingerprintFloat(&hash, node.depthToleranceMeters);
+    SeepageFingerprintText(
+        &hash,
+        cache.cacheIdentity.sourceSignature.empty()
+            ? std::string_view{cache.signature}
+            : std::string_view{cache.cacheIdentity.sourceSignature});
+    for (const auto word : cache.cacheIdentity.contentDigest) {
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(word));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(word >> 32U));
+    }
+    SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(selection.cells.size()));
+    for (const auto& cell : selection.cells) {
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.x));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.y));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(cell.z));
+        SeepageFingerprintFloat(&hash, cell.downwardDistanceMeters);
+        SeepageFingerprintFloat(&hash, cell.lateralDistanceMeters);
+        SeepageFingerprintFloat(&hash, cell.surfaceNormal.x);
+        SeepageFingerprintFloat(&hash, cell.surfaceNormal.y);
+        SeepageFingerprintFloat(&hash, cell.surfaceNormal.z);
+        SeepageFingerprintFloat(&hash, cell.confidence);
+    }
+    return "water-seepage-support-v1-" + SeepageFingerprintString(hash);
+}
+
 }  // namespace
+
+WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
+    const WaterSeepageNode& node,
+    std::string_view targetSceneRole,
+    const WaterSurfaceCache& surfaceCache,
+    const WaterSeepageSupportBuildOptions& options) {
+    WaterSeepageSupportBuildResult result;
+    result.selection.nodeId = node.id;
+    result.selection.targetSceneRole = NormalizeSeepageRole(targetSceneRole);
+    // The selection grid is deliberately fixed. It is shared by every display
+    // density, so a density switch never changes semantic support membership.
+    result.selection.cellSizeMeters = kWaterSeepageSupportCellSizeMeters;
+    result.selection.reachLimitMeters = std::clamp(
+        SeepageFiniteOr(node.selectionReachLimitMeters, 2.34375F),
+        result.selection.cellSizeMeters,
+        1000.0F);
+    result.selection.widthLimitMeters = std::clamp(
+        SeepageFiniteOr(node.selectionWidthLimitMeters, 1.215F),
+        result.selection.cellSizeMeters,
+        1000.0F);
+
+    const auto sourceRole = SeepageSupportSourceRole(node, targetSceneRole);
+    if (!sourceRole.has_value()) {
+        result.errorMessage = "The Seepage node does not target a supported authored terrain role.";
+        return result;
+    }
+    result.selection.sourceRole = sourceRole.value();
+    if (surfaceCache.flowSurfaceSurfels.empty() ||
+        !std::isfinite(surfaceCache.resolutionMeters) ||
+        surfaceCache.resolutionMeters <= 0.0F ||
+        !IsValidPoint(ToGlm(node.position))) {
+        result.errorMessage = "The shared Water surface cache has no usable connected surfels.";
+        return result;
+    }
+
+    const std::size_t maximumCells = std::clamp<std::size_t>(
+        options.maximumSupportCells,
+        1U,
+        kWaterSeepageMaximumSupportCellsPerNode);
+    const std::size_t maximumVisited = std::clamp<std::size_t>(
+        options.maximumVisitedSurfels,
+        1U,
+        kWaterSeepageMaximumSupportCellsPerNode);
+    const float sourceResolution = surfaceCache.resolutionMeters;
+    const std::uint32_t roleMask = sourceRole.value() == WaterSurfaceRole::Sand
+                                       ? kWaterSurfaceSandRoleMask
+                                       : kWaterSurfaceRockRoleMask;
+    const float startRadius = std::clamp(
+        std::max(sourceResolution * 2.25F, 0.05F),
+        sourceResolution,
+        0.25F);
+    const auto start = QueryWaterSurfaceCache(
+        surfaceCache,
+        node.position,
+        startRadius,
+        node.surfaceNormal,
+        roleMask);
+    if (!start.hit || start.surfel.role != sourceRole.value()) {
+        result.errorMessage = "No matching shared-cache surface cell was found beneath the Seepage node.";
+        return result;
+    }
+
+    const glm::vec3 nodePosition = ToGlm(node.position);
+    const glm::vec3 nodeNormal = SafeSeepageNormal(node.surfaceNormal);
+    glm::vec3 downAxis = ToGlm(DeriveWaterSeepageDownAxis(
+        node.surfaceNormal,
+        node.downAxis));
+    if (!IsValidPoint(downAxis) || glm::dot(downAxis, downAxis) <= kNormalEpsilon) {
+        downAxis = kGravity;
+    } else {
+        downAxis = glm::normalize(downAxis);
+    }
+    glm::vec3 lateralAxis = glm::cross(nodeNormal, downAxis);
+    if (!IsValidPoint(lateralAxis) || glm::dot(lateralAxis, lateralAxis) <= kNormalEpsilon) {
+        const glm::vec3 helper = std::abs(nodeNormal.x) < 0.8F
+                                     ? glm::vec3{1.0F, 0.0F, 0.0F}
+                                     : glm::vec3{0.0F, 1.0F, 0.0F};
+        lateralAxis = glm::cross(nodeNormal, helper);
+    }
+    lateralAxis = glm::normalize(lateralAxis);
+
+    // Trace the immutable maximum-downhill centreline once, then measure the
+    // connected flood against that path. This preserves turns in authored
+    // terrain instead of treating support as a straight polygonal fan. The
+    // guide is topology-only and is compacted to at most eight stations.
+    auto guideNode = node;
+    guideNode.reachMeters = result.selection.reachLimitMeters /
+                            std::max(1.0e-6F, kSeepageMaximumReachScale);
+    guideNode.targetSceneRoles = {
+        sourceRole.value() == WaterSurfaceRole::Sand ? "SAND" : "ROCK"};
+    const auto centreline = TraceWaterSeepageSurfaceCacheGuide(
+        guideNode,
+        surfaceCache);
+    const auto supportMetrics = [&](const glm::vec3& position) {
+        const glm::vec3 nodeDelta = position - nodePosition;
+        std::pair<float, float> metrics{
+            glm::dot(nodeDelta, downAxis),
+            std::abs(glm::dot(nodeDelta, lateralAxis)),
+        };
+        if (!centreline.valid || centreline.sampleCount < 2U) {
+            return metrics;
+        }
+
+        float bestDistanceSquared = std::numeric_limits<float>::infinity();
+        float bestStation = metrics.first;
+        const auto sampleCount = std::min<std::size_t>(
+            centreline.sampleCount,
+            centreline.samples.size());
+        for (std::size_t sampleIndex = 0U;
+             sampleIndex + 1U < sampleCount;
+             ++sampleIndex) {
+            const auto& left = centreline.samples[sampleIndex];
+            const auto& right = centreline.samples[sampleIndex + 1U];
+            const glm::vec3 leftPosition = ToGlm(left.position);
+            const glm::vec3 segment = ToGlm(right.position) - leftPosition;
+            const float segmentLengthSquared = glm::dot(segment, segment);
+            if (!std::isfinite(segmentLengthSquared) ||
+                segmentLengthSquared <= kNormalEpsilon) {
+                continue;
+            }
+            const float rawAmount =
+                glm::dot(position - leftPosition, segment) /
+                segmentLengthSquared;
+            // Extend the final tangent so the reach threshold still clips a
+            // centreline that ended one cache cell short of the authored
+            // limit. Earlier segments remain finite and cannot fold back.
+            const float amount = sampleIndex + 2U == sampleCount
+                                     ? std::max(0.0F, rawAmount)
+                                     : std::clamp(rawAmount, 0.0F, 1.0F);
+            const glm::vec3 closest = leftPosition + segment * amount;
+            const glm::vec3 separation = position - closest;
+            const float distanceSquared = glm::dot(separation, separation);
+            const float station = std::lerp(left.station, right.station, amount);
+            if (distanceSquared < bestDistanceSquared - 1.0e-8F ||
+                (std::abs(distanceSquared - bestDistanceSquared) <= 1.0e-8F &&
+                 station < bestStation)) {
+                bestDistanceSquared = distanceSquared;
+                bestStation = station;
+            }
+        }
+        if (std::isfinite(bestDistanceSquared)) {
+            metrics.first = bestStation;
+            metrics.second = std::sqrt(std::max(0.0F, bestDistanceSquared));
+        }
+        return metrics;
+    };
+    const float depthTolerance = std::clamp(
+        SeepageFiniteOr(node.depthToleranceMeters, 0.15F),
+        sourceResolution * 0.50F,
+        2.0F);
+    const float edgeAllowance = std::clamp(
+        SeepageFiniteOr(node.edgeFeatherMeters, 0.10F),
+        0.0F,
+        std::max(result.selection.reachLimitMeters,
+                 result.selection.widthLimitMeters));
+    const float riseTolerance = std::max(
+        sourceResolution * 0.50F,
+        std::min(depthTolerance, sourceResolution * 2.0F));
+    const float reachLimit = result.selection.reachLimitMeters;
+    const float halfWidthLimit = result.selection.widthLimitMeters * 0.5F;
+    const float continuityDistance = std::clamp(
+        depthTolerance,
+        sourceResolution * 1.75F,
+        sourceResolution * 6.0F);
+    const float continuityDistanceSquared = continuityDistance * continuityDistance;
+
+    std::priority_queue<
+        PendingSeepageSupportSurfel,
+        std::vector<PendingSeepageSupportSurfel>,
+        PendingSeepageSupportSurfelGreater>
+        pending;
+    std::set<SeepageSupportSourceKey> queued;
+    std::set<SeepageSupportSourceKey> visited;
+    std::map<SeepageSupportCellKey, WaterSeepageSupportCell> emitted;
+    std::vector<const WaterSurfaceSurfel*> acceptedSubstrateSurfels;
+    const bool targetIsVegetation =
+        NormalizeSeepageRole(targetSceneRole) == "veg";
+    const auto emitSourceCell = [&](std::int32_t sourceX,
+                                    std::int32_t sourceY,
+                                    std::int32_t sourceZ,
+                                    float downwardDistance,
+                                    float lateralDistance,
+                                    const invisible_places::io::Float3& surfaceNormal,
+                                    float confidence) {
+        const auto childMinimum = [&](std::int32_t sourceCoordinate) {
+            return static_cast<std::int32_t>(std::floor(
+                static_cast<double>(sourceCoordinate) * sourceResolution /
+                result.selection.cellSizeMeters));
+        };
+        const auto childMaximum = [&](std::int32_t sourceCoordinate) {
+            const double sourceMinimum =
+                static_cast<double>(sourceCoordinate) * sourceResolution;
+            return static_cast<std::int32_t>(std::ceil(
+                       (sourceMinimum + sourceResolution) /
+                       result.selection.cellSizeMeters) -
+                   1.0);
+        };
+        const auto minX = childMinimum(sourceX);
+        const auto minY = childMinimum(sourceY);
+        const auto minZ = childMinimum(sourceZ);
+        const auto maxX = childMaximum(sourceX);
+        const auto maxY = childMaximum(sourceY);
+        const auto maxZ = childMaximum(sourceZ);
+        for (std::int64_t z = minZ; z <= static_cast<std::int64_t>(maxZ); ++z) {
+            for (std::int64_t y = minY; y <= static_cast<std::int64_t>(maxY); ++y) {
+                for (std::int64_t x = minX; x <= static_cast<std::int64_t>(maxX); ++x) {
+                    const auto key = SeepageSupportCellKey{
+                        static_cast<std::int32_t>(x),
+                        static_cast<std::int32_t>(y),
+                        static_cast<std::int32_t>(z),
+                    };
+                    const WaterSeepageSupportCell cell{
+                        .x = static_cast<std::int32_t>(x),
+                        .y = static_cast<std::int32_t>(y),
+                        .z = static_cast<std::int32_t>(z),
+                        .downwardDistanceMeters = downwardDistance,
+                        .lateralDistanceMeters = lateralDistance,
+                        .surfaceNormal = surfaceNormal,
+                        .confidence = Clamp01(confidence),
+                    };
+                    const auto [it, inserted] = emitted.emplace(key, cell);
+                    if (!inserted && cell.confidence > it->second.confidence) {
+                        it->second = cell;
+                    }
+                    if (emitted.size() > maximumCells) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    const auto startKey = SeepageSupportSourceKey{
+        start.surfel.cellX,
+        start.surfel.cellY,
+        start.surfel.cellZ,
+        sourceRole.value(),
+    };
+    const auto* startSurfel = FindSeepageSupportSurfel(surfaceCache, startKey);
+    if (startSurfel == nullptr) {
+        result.errorMessage = "The shared-cache Seepage seed cell was not addressable.";
+        return result;
+    }
+    pending.push({.surfel = startSurfel, .distanceFromNodeSquared = 0.0F});
+    queued.insert(startKey);
+
+    while (!pending.empty()) {
+        if (options.stopToken != nullptr && options.stopToken->stop_requested()) {
+            result.cancelled = true;
+            result.errorMessage = "Connected Seepage support selection was cancelled.";
+            return result;
+        }
+        if (visited.size() >= maximumVisited) {
+            result.diagnostics.cellLimitExceeded = true;
+            result.errorMessage =
+                "Connected Seepage support exceeded its bounded surfel budget; "
+                "reduce Selection Reach/Width limits.";
+            return result;
+        }
+        const auto current = pending.top();
+        pending.pop();
+        const auto& surfel = *current.surfel;
+        const auto currentKey = SeepageSupportSourceKey{
+            surfel.cellX,
+            surfel.cellY,
+            surfel.cellZ,
+            surfel.role,
+        };
+        if (!visited.insert(currentKey).second) {
+            continue;
+        }
+        ++result.diagnostics.visitedSurfelCount;
+
+        const glm::vec3 centroid = ToGlm(surfel.centroid);
+        const glm::vec3 delta = centroid - nodePosition;
+        const float axialDistance = glm::dot(delta, downAxis);
+        const auto [downwardDistance, lateralDistance] = supportMetrics(centroid);
+        bool accepted = true;
+        if (centroid.z > nodePosition.z + riseTolerance) {
+            ++result.diagnostics.rejectedAboveNodeCount;
+            accepted = false;
+        } else if (axialDistance < -riseTolerance ||
+                   downwardDistance > reachLimit + edgeAllowance) {
+            ++result.diagnostics.rejectedReachCount;
+            accepted = false;
+        } else if (lateralDistance > halfWidthLimit + edgeAllowance) {
+            ++result.diagnostics.rejectedWidthCount;
+            accepted = false;
+        } else if (surfel.confidence < 0.10F || surfel.normalCoherence < 0.10F) {
+            ++result.diagnostics.rejectedContinuityCount;
+            accepted = false;
+        }
+
+        if (accepted) {
+            ++result.diagnostics.acceptedSurfelCount;
+            acceptedSubstrateSurfels.push_back(&surfel);
+            if (!targetIsVegetation &&
+                !emitSourceCell(
+                    surfel.cellX,
+                    surfel.cellY,
+                    surfel.cellZ,
+                    downwardDistance,
+                    lateralDistance,
+                    surfel.normal,
+                    surfel.confidence *
+                        (0.45F + 0.55F * surfel.normalCoherence))) {
+                result.diagnostics.cellLimitExceeded = true;
+                result.errorMessage =
+                    "Connected Seepage support exceeded its bounded 10 mm cell budget; "
+                    "reduce Selection Reach/Width limits.";
+                return result;
+            }
+        }
+
+        // Rejected cells terminate that branch. This prevents the traversal
+        // from crossing above-node or out-of-envelope terrain and re-entering
+        // the selected region from the far side.
+        if (!accepted) {
+            continue;
+        }
+        const glm::vec3 currentNormal = SafeSeepageNormal(surfel.normal);
+        for (std::int32_t dz = -1; dz <= 1; ++dz) {
+            for (std::int32_t dy = -1; dy <= 1; ++dy) {
+                for (std::int32_t dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    const auto key = SeepageSupportSourceKey{
+                        surfel.cellX + dx,
+                        surfel.cellY + dy,
+                        surfel.cellZ + dz,
+                        sourceRole.value(),
+                    };
+                    if (queued.contains(key) || visited.contains(key)) {
+                        continue;
+                    }
+                    const auto* neighbour = FindSeepageSupportSurfel(surfaceCache, key);
+                    if (neighbour == nullptr) {
+                        continue;
+                    }
+                    const glm::vec3 neighbourDelta = ToGlm(neighbour->centroid) - centroid;
+                    const float distanceSquared = glm::dot(neighbourDelta, neighbourDelta);
+                    const glm::vec3 neighbourNormal = SafeSeepageNormal(neighbour->normal);
+                    if (!std::isfinite(distanceSquared) ||
+                        distanceSquared > continuityDistanceSquared ||
+                        std::abs(glm::dot(currentNormal, neighbourNormal)) < 0.20F) {
+                        ++result.diagnostics.rejectedContinuityCount;
+                        continue;
+                    }
+                    const glm::vec3 fromNode = ToGlm(neighbour->centroid) - nodePosition;
+                    pending.push({
+                        .surfel = neighbour,
+                        .distanceFromNodeSquared = glm::dot(fromNode, fromNode),
+                    });
+                    queued.insert(key);
+                }
+            }
+        }
+    }
+
+    if (targetIsVegetation && !acceptedSubstrateSurfels.empty()) {
+        // VEG uses the connected ROCK sheet as its semantic substrate, then
+        // projects that settled downstream metric onto nearby authored VEG
+        // occupancy. This keeps leaf points addressable in their own 3-D
+        // cells without allowing vegetation to bridge disconnected rock.
+        SupportGraph substrateGraph;
+        substrateGraph.cellSize = std::max(0.05F, sourceResolution * 4.0F);
+        substrateGraph.points.reserve(acceptedSubstrateSurfels.size());
+        for (const auto* substrate : acceptedSubstrateSurfels) {
+            const auto index = static_cast<std::uint32_t>(substrateGraph.points.size());
+            substrateGraph.points.push_back({
+                .sourceIndex = index,
+                .position = ToGlm(substrate->centroid),
+                .normal = SafeSeepageNormal(substrate->normal),
+                .confidence = Clamp01(
+                    substrate->confidence *
+                    (0.45F + 0.55F * substrate->normalCoherence)),
+                .hasNormal = true,
+            });
+            substrateGraph.grid[
+                MakeGridKey(substrateGraph.points.back().position, substrateGraph.cellSize)]
+                .push_back(index);
+        }
+
+        const float associationDistance = std::clamp(
+            sourceResolution * 8.0F,
+            0.12F,
+            0.30F);
+        const float associationDistanceSquared =
+            associationDistance * associationDistance;
+        const float selectionRadius =
+            reachLimit + halfWidthLimit + associationDistance;
+        const auto minimumCellX = SeepageCellCoordinate(
+            nodePosition.x - selectionRadius,
+            sourceResolution);
+        const auto maximumCellX = SeepageCellCoordinate(
+            nodePosition.x + selectionRadius,
+            sourceResolution);
+        auto vegetation = std::lower_bound(
+            surfaceCache.vegetationVoxels.begin(),
+            surfaceCache.vegetationVoxels.end(),
+            minimumCellX,
+            [](const RainVegetationVoxel& voxel, std::int32_t x) {
+                return voxel.cellX < x;
+            });
+        std::size_t vegetationScanCount = 0U;
+        for (; vegetation != surfaceCache.vegetationVoxels.end() &&
+               vegetation->cellX <= maximumCellX;
+             ++vegetation) {
+            if ((++vegetationScanCount & 0x3ffU) == 0U &&
+                options.stopToken != nullptr &&
+                options.stopToken->stop_requested()) {
+                result.cancelled = true;
+                result.errorMessage =
+                    "Connected Seepage VEG association was cancelled.";
+                return result;
+            }
+            const glm::vec3 vegetationPosition{
+                (static_cast<float>(vegetation->cellX) + 0.5F) * sourceResolution,
+                (static_cast<float>(vegetation->cellY) + 0.5F) * sourceResolution,
+                (static_cast<float>(vegetation->cellZ) + 0.5F) * sourceResolution,
+            };
+            const glm::vec3 vegetationDelta = vegetationPosition - nodePosition;
+            if (glm::dot(vegetationDelta, vegetationDelta) >
+                selectionRadius * selectionRadius) {
+                continue;
+            }
+            const auto nearby = NearbySupportIndices(
+                substrateGraph,
+                vegetationPosition,
+                associationDistance);
+            std::optional<std::uint32_t> closestIndex;
+            float closestDistanceSquared = associationDistanceSquared;
+            for (const auto candidateIndex : nearby) {
+                if (candidateIndex >= substrateGraph.points.size()) {
+                    continue;
+                }
+                const auto delta = substrateGraph.points[candidateIndex].position -
+                                   vegetationPosition;
+                const float distanceSquared = glm::dot(delta, delta);
+                if (distanceSquared <= closestDistanceSquared) {
+                    closestDistanceSquared = distanceSquared;
+                    closestIndex = candidateIndex;
+                }
+            }
+            if (!closestIndex.has_value()) {
+                continue;
+            }
+            const auto& substrate = substrateGraph.points[*closestIndex];
+            const auto [downwardDistance, lateralDistance] =
+                supportMetrics(substrate.position);
+            const float vegetationConfidence = std::clamp(
+                static_cast<float>(vegetation->sampleCount) / 8.0F,
+                0.0F,
+                1.0F);
+            if (!emitSourceCell(
+                    vegetation->cellX,
+                    vegetation->cellY,
+                    vegetation->cellZ,
+                    downwardDistance,
+                    lateralDistance,
+                    FromGlm(substrate.normal),
+                    substrate.confidence * (0.50F + 0.50F * vegetationConfidence))) {
+                result.diagnostics.cellLimitExceeded = true;
+                result.errorMessage =
+                    "Connected Seepage VEG support exceeded its bounded 10 mm cell budget; "
+                    "reduce Selection Reach/Width limits.";
+                return result;
+            }
+        }
+    }
+
+    if (emitted.empty()) {
+        result.errorMessage = "No connected shared-cache cells were accepted beneath the Seepage node.";
+        return result;
+    }
+    result.selection.cells.reserve(emitted.size());
+    const float halfCell = result.selection.cellSizeMeters * 0.5F;
+    for (const auto& [_, cell] : emitted) {
+        result.selection.cells.push_back(cell);
+        const invisible_places::io::Float3 centre{
+            (static_cast<float>(cell.x) + 0.5F) * result.selection.cellSizeMeters,
+            (static_cast<float>(cell.y) + 0.5F) * result.selection.cellSizeMeters,
+            (static_cast<float>(cell.z) + 0.5F) * result.selection.cellSizeMeters,
+        };
+        result.selection.bounds.Expand({centre.x - halfCell, centre.y - halfCell, centre.z - halfCell});
+        result.selection.bounds.Expand({centre.x + halfCell, centre.y + halfCell, centre.z + halfCell});
+    }
+    result.diagnostics.emittedCellCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+        result.selection.cells.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())));
+    result.selection.fingerprint = WaterSeepageSupportSelectionFingerprint(
+        result.selection,
+        surfaceCache,
+        node);
+    result.success = true;
+    return result;
+}
+
+bool CommitWaterSeepageSupportSelection(
+    const WaterSeepageSupportBuildResult& candidate,
+    WaterSeepageSupportSelection* settledSelection) {
+    if (settledSelection == nullptr || !candidate.success || candidate.cancelled ||
+        candidate.diagnostics.cellLimitExceeded || candidate.selection.cells.empty() ||
+        candidate.selection.fingerprint.empty()) {
+        return false;
+    }
+    *settledSelection = candidate.selection;
+    return true;
+}
 
 std::vector<WaterSeepageSurfaceGuide> BuildWaterSeepageSurfaceGuides(
     std::span<const WaterSeepageNode> nodes,
@@ -8307,6 +9318,21 @@ std::uint32_t RippleOverlayTypeSalt(WaterRippleOverlayType type) {
     return 101U;
 }
 
+int RippleCellCoordinate(float value) {
+    // Ripple hashes use signed 32-bit cell coordinates to match their shader
+    // counterparts. Leave enough headroom for every neighbouring-cell probe;
+    // extreme authored coordinates are bounded deterministically instead of
+    // overflowing during float-to-int conversion or neighbour arithmetic.
+    constexpr int kNeighbourHeadroom = 8;
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    const double floored = std::floor(static_cast<double>(value));
+    const double minimum = static_cast<double>(std::numeric_limits<int>::min() + kNeighbourHeadroom);
+    const double maximum = static_cast<double>(std::numeric_limits<int>::max() - kNeighbourHeadroom);
+    return static_cast<int>(std::clamp(floored, minimum, maximum));
+}
+
 float RippleCellHash(int cellX, int cellY, std::uint32_t seed, std::uint32_t salt) {
     const auto x = static_cast<std::uint32_t>(cellX);
     const auto y = static_cast<std::uint32_t>(cellY);
@@ -8322,8 +9348,8 @@ glm::vec2 RippleCellHash2(int cellX, int cellY, std::uint32_t seed, std::uint32_
 
 float RippleBlockNoise(const glm::vec2& uv, float cellSize, std::uint32_t seed, std::uint32_t salt) {
     const float safeCellSize = std::max(0.001F, cellSize);
-    const auto cellX = static_cast<int>(std::floor(uv.x / safeCellSize));
-    const auto cellY = static_cast<int>(std::floor(uv.y / safeCellSize));
+    const int cellX = RippleCellCoordinate(uv.x / safeCellSize);
+    const int cellY = RippleCellCoordinate(uv.y / safeCellSize);
     return RippleCellHash(cellX, cellY, seed, salt);
 }
 
@@ -8336,8 +9362,8 @@ float RippleCausticLaceValue(const glm::vec2& uv, const WaterEffectLayer& layer,
              std::cos((p.x + RegionHash01(seed, 2U, 23U)) * 2.41F)}
          * warp * 0.22F;
 
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     float nearest = std::numeric_limits<float>::max();
     float secondNearest = std::numeric_limits<float>::max();
     for (int dy = -1; dy <= 1; ++dy) {
@@ -8371,8 +9397,8 @@ float RippleRainRingValue(const glm::vec2& uv, const WaterEffectLayer& layer, st
     const float densityCurve = std::sqrt(density01);
     const float cellSize = std::max(wavelength * 1.45F, std::lerp(0.34F, 0.115F, densityCurve));
     const glm::vec2 p = uv / cellSize;
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     const float t = -layer.phase;
     const float rainDensity = std::clamp(0.10F + density01 * 0.78F, 0.06F, 0.92F);
     const float width = std::max(wavelength * (0.026F + turbulence * 0.024F), 0.0022F);
@@ -8435,8 +9461,8 @@ float RippleDropletValue(const glm::vec2& uv, const WaterEffectLayer& layer, std
     const float wavelength = std::max(0.005F, layer.wavelengthMeters);
     const float cellSize = std::max(wavelength * 1.65F, 0.025F);
     const glm::vec2 p = uv / cellSize;
-    const int cellX = static_cast<int>(std::floor(p.x));
-    const int cellY = static_cast<int>(std::floor(p.y));
+    const int cellX = RippleCellCoordinate(p.x);
+    const int cellY = RippleCellCoordinate(p.y);
     const glm::vec2 center =
         (glm::vec2{static_cast<float>(cellX), static_cast<float>(cellY)} +
          RippleCellHash2(cellX, cellY, seed, 83U)) *
@@ -8503,16 +9529,16 @@ glm::vec2 RuntimeRippleCellHash2(int cellX, int cellY, float seed, float salt) {
 
 float RuntimeRippleBlockNoise(const glm::vec2& uv, float cellSize, float seed, float salt) {
     const float safeCellSize = std::max(0.001F, cellSize);
-    const auto cellX = static_cast<int>(std::floor(uv.x / safeCellSize));
-    const auto cellY = static_cast<int>(std::floor(uv.y / safeCellSize));
+    const int cellX = RippleCellCoordinate(uv.x / safeCellSize);
+    const int cellY = RippleCellCoordinate(uv.y / safeCellSize);
     return RuntimeRippleCellHash(cellX, cellY, seed, salt);
 }
 
 float RuntimeRippleSmoothBlockNoise(const glm::vec2& uv, float cellSize, float seed, float salt) {
     const float safeCellSize = std::max(0.001F, cellSize);
     const glm::vec2 p = uv / safeCellSize;
-    const auto cellX = static_cast<int>(std::floor(p.x));
-    const auto cellY = static_cast<int>(std::floor(p.y));
+    const int cellX = RippleCellCoordinate(p.x);
+    const int cellY = RippleCellCoordinate(p.y);
     const glm::vec2 f{Fract01(p.x), Fract01(p.y)};
     const glm::vec2 u = f * f * (glm::vec2{3.0F, 3.0F} - 2.0F * f);
     const float a = RuntimeRippleCellHash(cellX, cellY, seed, salt);
@@ -8543,8 +9569,8 @@ float RuntimeRippleCausticLaceValue(
                  0.5F * std::sin((p.x * 1.57F + seed * 0.47F + t * 0.18F) * 1.67F)}
          * (0.08F + warpAmount * 0.18F);
 
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     float nearest = std::numeric_limits<float>::max();
     float secondNearest = std::numeric_limits<float>::max();
     for (int dy = -1; dy <= 1; ++dy) {
@@ -8601,8 +9627,8 @@ float RuntimeRippleRainRingValue(
     const float densityCurve = std::sqrt(density01);
     const float cellSize = std::max(wavelength * 1.45F, std::lerp(0.34F, 0.115F, densityCurve));
     const glm::vec2 p = uv / cellSize;
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     const float t = -phase;
     const float rainDensity = std::clamp(0.10F + density01 * 0.78F, 0.06F, 0.92F);
     const float width = std::max(wavelength * (0.026F + turbulence * 0.024F), 0.0022F);
@@ -8867,8 +9893,8 @@ float RuntimeRippleDripTrailValue(
     const float densityCurve = std::sqrt(density01);
     const float cellSize = std::max(wavelength * 1.45F, std::lerp(0.34F, 0.115F, densityCurve));
     const glm::vec2 p = uv / cellSize;
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     const float t = -phase;
     const float originDensity = std::clamp(0.10F + density01 * 0.78F, 0.06F, 0.92F);
     const float originSoftMargin = 0.12F + std::clamp(turbulence, 0.0F, 1.0F) * 0.14F;
@@ -8999,10 +10025,10 @@ float RuntimeRippleSaltMineralShimmerValue(
          mineralAcross * wavelength * (0.42F + normalBias * 0.26F) * (splitBlend * 2.0F - 1.0F) +
          normalFlow * wavelength * 0.16F * reconnect) /
         veinCell;
-    const auto baseAX = static_cast<int>(std::floor(pA.x));
-    const auto baseAY = static_cast<int>(std::floor(pA.y));
-    const auto baseBX = static_cast<int>(std::floor(pB.x));
-    const auto baseBY = static_cast<int>(std::floor(pB.y));
+    const int baseAX = RippleCellCoordinate(pA.x);
+    const int baseAY = RippleCellCoordinate(pA.y);
+    const int baseBX = RippleCellCoordinate(pB.x);
+    const int baseBY = RippleCellCoordinate(pB.y);
     float nearestA = std::numeric_limits<float>::max();
     float secondA = std::numeric_limits<float>::max();
     float nearestB = std::numeric_limits<float>::max();
@@ -9113,8 +10139,8 @@ float RuntimeRippleDropletValue(
     const float safeWavelength = std::max(wavelength, 0.005F);
     const float cellSize = std::max(safeWavelength * 1.45F, 0.018F);
     const glm::vec2 p = uv / cellSize;
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     const float t = -phase;
     const float normalBias = Clamp01(glm::length(glm::vec2{normal.x, normal.y}));
     const float geometryBias = 0.64F + normalBias * (0.24F + std::clamp(warp, 0.0F, 2.0F) * 0.06F);
@@ -9197,8 +10223,8 @@ float RuntimeRippleCurrentThreadsValue(
     currentUv.y += std::sin(uv.x / std::max(wavelength * 0.47F, 0.006F) - seed * 0.73F - t * 0.19F) *
                   wavelength * turbulence * 0.055F;
     const glm::vec2 p{currentUv.x / cellXSize, currentUv.y / cellYSize};
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     const float originDensity = std::clamp(0.16F + density * 0.66F + normalBias * 0.16F, 0.10F, 0.92F);
     float best = 0.0F;
     for (int dy = -1; dy <= 1; ++dy) {
@@ -9321,8 +10347,8 @@ float RuntimeRippleFoamSparkleValue(
         regionUv + drift + lowWarp * wavelength * driftAmount * (0.28F + driftAmount * 0.24F + turbulence01 * 0.18F);
     const float patchCellSize = std::max(wavelength * (0.98F + density01 * 0.56F), 0.018F);
     const glm::vec2 p = foamUv / patchCellSize;
-    const auto baseX = static_cast<int>(std::floor(p.x));
-    const auto baseY = static_cast<int>(std::floor(p.y));
+    const int baseX = RippleCellCoordinate(p.x);
+    const int baseY = RippleCellCoordinate(p.y);
     float nearest = std::numeric_limits<float>::max();
     float secondNearest = std::numeric_limits<float>::max();
     float thirdNearest = std::numeric_limits<float>::max();

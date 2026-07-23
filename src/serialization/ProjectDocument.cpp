@@ -2154,7 +2154,7 @@ WaterScenarioTrack ParseWaterScenarioTrack(const json& trackJson);
 
 json SerializeAnimationPath(const AnimationPath& path) {
     json pathJson{
-        {"schema_version", 10U},
+        {"schema_version", kAnimationDocumentSchemaVersion},
         {"name", path.name},
         {"duration_frames", path.durationFrames},
         {"associated_layer_paths", SerializePathArray(path.associatedLayerPaths)},
@@ -2602,6 +2602,7 @@ json SerializeWaterEmitter(const WaterEmitter& emitter) {
         {"trail_profile_locked", emitter.trailProfileLocked},
         {"maximum_flow_strength", emitter.maximumFlowStrength},
         {"rain_response", emitter.rainResponse},
+        {"show_trail", emitter.showTrail},
     };
     if (emitter.parentId.has_value()) {
         emitterJson["parent_id"] = emitter.parentId.value();
@@ -2654,6 +2655,7 @@ WaterEmitter ParseWaterEmitter(const json& emitterJson) {
         emitterJson.value("rain_response", emitter.rainResponse),
         0.0F,
         1.0F);
+    emitter.showTrail = emitterJson.value("show_trail", emitter.showTrail);
     if (emitterJson.contains("parent_id")) {
         emitter.parentId = emitterJson.at("parent_id").get<std::uint32_t>();
     }
@@ -2693,6 +2695,7 @@ json SerializeWaterManualFlowPath(const WaterManualFlowPathSource& source) {
         {"use_surface_guide", source.useSurfaceGuide},
         {"maximum_flow_strength", source.maximumFlowStrength},
         {"rain_response", source.rainResponse},
+        {"show_trail", source.showTrail},
         {"control_points", json::array()},
     };
     for (const auto& point : source.controlPoints) {
@@ -2720,6 +2723,7 @@ WaterManualFlowPathSource ParseWaterManualFlowPath(
         sourceJson.value("rain_response", source.rainResponse),
         0.0F,
         1.0F);
+    source.showTrail = sourceJson.value("show_trail", source.showTrail);
     if (sourceJson.contains("control_points") && sourceJson.at("control_points").is_array()) {
         for (const auto& pointJson : sourceJson.at("control_points")) {
             if (!pointJson.is_array() || pointJson.size() != 3U) {
@@ -3207,6 +3211,9 @@ json SerializeWaterSeepageNodeAnimationState(
         {"activity", std::clamp(state.activity, 0.0F, 1.0F)},
         {"local_spread", std::clamp(state.localSpread, 0.0F, 1.0F)},
         {"wetting_progress", std::clamp(state.wettingProgress, 0.0F, 1.0F)},
+        {"reach_scale", std::max(0.0F, state.reachScale)},
+        {"width_scale", std::max(0.0F, state.widthScale)},
+        {"prominence", std::max(0.0F, state.prominence)},
     };
 }
 
@@ -3225,6 +3232,15 @@ WaterSeepageNodeAnimationState ParseWaterSeepageNodeAnimationState(
         stateJson.value("wetting_progress", state.wettingProgress),
         0.0F,
         1.0F);
+    state.reachScale = std::max(
+        0.0F,
+        stateJson.value("reach_scale", state.reachScale));
+    state.widthScale = std::max(
+        0.0F,
+        stateJson.value("width_scale", state.widthScale));
+    state.prominence = std::max(
+        0.0F,
+        stateJson.value("prominence", state.prominence));
     return state;
 }
 
@@ -3332,8 +3348,10 @@ json SerializeWaterSeepageNode(const WaterSeepageNode& node) {
         {"surface_normal", {node.surfaceNormal.x, node.surfaceNormal.y, node.surfaceNormal.z}},
         {"down_axis", {node.downAxis.x, node.downAxis.y, node.downAxis.z}},
         {"reach_meters", node.reachMeters},
-        {"start_width_meters", node.startWidthMeters},
-        {"end_width_meters", node.endWidthMeters},
+        {"width_meters", node.widthMeters},
+        {"prominence", node.prominence},
+        {"selection_reach_limit_meters", node.selectionReachLimitMeters},
+        {"selection_width_limit_meters", node.selectionWidthLimitMeters},
         {"edge_feather_meters", node.edgeFeatherMeters},
         {"depth_tolerance_meters", node.depthToleranceMeters},
         {"normal_alignment", node.normalAlignment},
@@ -3371,8 +3389,34 @@ WaterSeepageNode ParseWaterSeepageNode(const json& nodeJson) {
         node.downAxis = {downAxis[0], downAxis[1], downAxis[2]};
     }
     node.reachMeters = nodeJson.value("reach_meters", node.reachMeters);
-    node.startWidthMeters = nodeJson.value("start_width_meters", node.startWidthMeters);
-    node.endWidthMeters = nodeJson.value("end_width_meters", node.endWidthMeters);
+    const bool hasLiveWidth = nodeJson.contains("width_meters");
+    if (hasLiveWidth) {
+        node.widthMeters = nodeJson.value("width_meters", node.widthMeters);
+    } else {
+        const float legacyStartWidth =
+            nodeJson.value("start_width_meters", node.startWidthMeters);
+        const float legacyEndWidth =
+            nodeJson.value("end_width_meters", node.endWidthMeters);
+        node.widthMeters = std::max(legacyStartWidth, legacyEndWidth);
+    }
+    node.widthMeters = std::max(0.0F, node.widthMeters);
+    // These aliases keep old code paths readable during migration; schema-18
+    // writes only the live width and explicit topology limits above.
+    node.startWidthMeters = node.widthMeters;
+    node.endWidthMeters = node.widthMeters;
+    node.prominence = std::max(
+        0.0F,
+        nodeJson.value("prominence", node.prominence));
+    node.selectionReachLimitMeters = std::max(
+        node.reachMeters,
+        nodeJson.value(
+            "selection_reach_limit_meters",
+            node.reachMeters * 1.875F));
+    node.selectionWidthLimitMeters = std::max(
+        node.widthMeters,
+        nodeJson.value(
+            "selection_width_limit_meters",
+            node.widthMeters * 1.62F));
     node.edgeFeatherMeters = nodeJson.value("edge_feather_meters", node.edgeFeatherMeters);
     node.depthToleranceMeters =
         nodeJson.value("depth_tolerance_meters", node.depthToleranceMeters);
@@ -4258,7 +4302,7 @@ json SerializeWaterRainSettings(
     const RainRuntimeSettings& settings,
     const WaterRainVisualSettings& visual) {
     return json{
-        {"version", 2},
+        {"version", 3},
         {"enabled", settings.enabled},
         {"impact_effects_enabled", settings.impactEffectsEnabled},
         {"sand_effects_enabled", settings.sandEffectsEnabled},
@@ -4292,6 +4336,23 @@ json SerializeWaterRainSettings(
         {"sand_effect_scale", settings.sandEffectScale},
         {"rock_effect_scale", settings.rockEffectScale},
         {"vegetation_effect_scale", settings.vegetationEffectScale},
+        {"near_surface",
+         {{"approach_distance_meters", settings.nearSurface.approachDistanceMeters},
+          {"minimum_speed_factor", settings.nearSurface.minimumSpeedFactor},
+          {"squish", settings.nearSurface.squish},
+          {"normal_alignment", settings.nearSurface.normalAlignment}}},
+        {"rock_impact",
+         {{"edge_breakup", settings.rockImpact.edgeBreakup},
+          {"spread_speed", settings.rockImpact.spreadSpeed},
+          {"centre_falloff", settings.rockImpact.centreFalloff},
+          {"height_bias", settings.rockImpact.heightBias},
+          {"persistence", settings.rockImpact.persistence}}},
+        {"vegetation_impact",
+         {{"twinkle", settings.vegetationImpact.twinkle},
+          {"propagation_meters_per_second", settings.vegetationImpact.propagationMetersPerSecond},
+          {"hop_spacing_meters", settings.vegetationImpact.hopSpacingMeters},
+          {"stream_width_meters", settings.vegetationImpact.streamWidthMeters},
+          {"stream_spread", settings.vegetationImpact.streamSpread}}},
         {"visual_profile",
          {{"colour", visual.colour},
           {"width_meters", visual.widthMeters},
@@ -4307,7 +4368,8 @@ json SerializeWaterRainSettings(
 RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
     auto settings = invisible_places::water::DefaultRainRuntimeSettings();
     settings.enabled = false;
-    if (!settingsJson.is_object() || settingsJson.value("version", 0) != 2) {
+    const int version = settingsJson.is_object() ? settingsJson.value("version", 0) : 0;
+    if (version < 2 || version > 3) {
         return settings;
     }
     settings.enabled = settingsJson.value("enabled", settings.enabled);
@@ -4357,16 +4419,70 @@ RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
     settings.rockEffectScale = settingsJson.value("rock_effect_scale", settings.rockEffectScale);
     settings.vegetationEffectScale =
         settingsJson.value("vegetation_effect_scale", settings.vegetationEffectScale);
+    if (version >= 3 && settingsJson.contains("near_surface") &&
+        settingsJson.at("near_surface").is_object()) {
+        const auto& tuning = settingsJson.at("near_surface");
+        settings.nearSurface.approachDistanceMeters = std::max(
+            0.0F,
+            tuning.value("approach_distance_meters", settings.nearSurface.approachDistanceMeters));
+        settings.nearSurface.minimumSpeedFactor = std::clamp(
+            tuning.value("minimum_speed_factor", settings.nearSurface.minimumSpeedFactor),
+            0.0F,
+            1.0F);
+        settings.nearSurface.squish = std::clamp(
+            tuning.value("squish", settings.nearSurface.squish),
+            0.0F,
+            1.0F);
+        settings.nearSurface.normalAlignment = std::clamp(
+            tuning.value("normal_alignment", settings.nearSurface.normalAlignment),
+            0.0F,
+            1.0F);
+    }
+    if (version >= 3 && settingsJson.contains("rock_impact") &&
+        settingsJson.at("rock_impact").is_object()) {
+        const auto& tuning = settingsJson.at("rock_impact");
+        settings.rockImpact.edgeBreakup = std::clamp(
+            tuning.value("edge_breakup", settings.rockImpact.edgeBreakup), 0.0F, 1.0F);
+        settings.rockImpact.spreadSpeed = std::max(
+            0.0F, tuning.value("spread_speed", settings.rockImpact.spreadSpeed));
+        settings.rockImpact.centreFalloff = std::clamp(
+            tuning.value("centre_falloff", settings.rockImpact.centreFalloff), 0.0F, 1.0F);
+        settings.rockImpact.heightBias = std::clamp(
+            tuning.value("height_bias", settings.rockImpact.heightBias), 0.0F, 2.0F);
+        settings.rockImpact.persistence = std::max(
+            0.05F, tuning.value("persistence", settings.rockImpact.persistence));
+    }
+    if (version >= 3 && settingsJson.contains("vegetation_impact") &&
+        settingsJson.at("vegetation_impact").is_object()) {
+        const auto& tuning = settingsJson.at("vegetation_impact");
+        settings.vegetationImpact.twinkle = std::max(
+            0.0F, tuning.value("twinkle", settings.vegetationImpact.twinkle));
+        settings.vegetationImpact.propagationMetersPerSecond = std::max(
+            0.0F,
+            tuning.value(
+                "propagation_meters_per_second",
+                settings.vegetationImpact.propagationMetersPerSecond));
+        settings.vegetationImpact.hopSpacingMeters = std::max(
+            0.001F,
+            tuning.value("hop_spacing_meters", settings.vegetationImpact.hopSpacingMeters));
+        settings.vegetationImpact.streamWidthMeters = std::max(
+            0.0001F,
+            tuning.value("stream_width_meters", settings.vegetationImpact.streamWidthMeters));
+        settings.vegetationImpact.streamSpread = std::clamp(
+            tuning.value("stream_spread", settings.vegetationImpact.streamSpread), 0.0F, 2.0F);
+    }
     return settings;
 }
 
 WaterRainVisualSettings ParseWaterRainVisualSettings(const json& settingsJson) {
     std::string profileName = "Rain Fine Lines";
-    if (settingsJson.is_object() && settingsJson.value("version", 0) == 2) {
+    if (settingsJson.is_object() && settingsJson.value("version", 0) >= 2 &&
+        settingsJson.value("version", 0) <= 3) {
         profileName = settingsJson.value("visual_profile_name", profileName);
     }
     auto visual = invisible_places::water::RainVisualPreset(profileName);
-    if (!settingsJson.is_object() || settingsJson.value("version", 0) != 2 ||
+    if (!settingsJson.is_object() || settingsJson.value("version", 0) < 2 ||
+        settingsJson.value("version", 0) > 3 ||
         !settingsJson.contains("visual_profile") || !settingsJson.at("visual_profile").is_object()) {
         return visual;
     }
@@ -5711,7 +5827,7 @@ void LoadWaterPathSidecars(
             continue;
         }
 
-        // A schema-42 manifest is authoritative. Never fall back to an
+        // A schema-43 manifest is authoritative. Never fall back to an
         // embedded cache if its referenced sidecar is absent or invalid.
         state.pathCache.reset();
         if (state.pathCacheManifest->relativePath.empty()) {
@@ -5786,6 +5902,7 @@ bool SaveProjectDocument(
         {"water_scenarios", json::array()},
         {"selected_water_scenario", document.selectedWaterScenarioId},
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
+        {"water_show_flow_trails", document.waterShowFlowTrails},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
         {"water_field_trail_settings", SerializeWaterFieldTrailSettings(document.waterFieldTrailSettings)},
         {"water_dynamic_mesh_flow_settings",
@@ -6028,6 +6145,9 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     document.selectedWaterScenarioId =
         projectJson->value("selected_water_scenario", std::string{});
+    document.waterShowFlowTrails = projectJson->value(
+        "water_show_flow_trails",
+        document.waterShowFlowTrails);
     if (projectJson->contains("water_flow_trail_settings")) {
         document.waterFlowTrailSettings =
             ParseWaterFlowTrailSettings(projectJson->at("water_flow_trail_settings"));
@@ -6391,10 +6511,11 @@ bool SaveWaterSourcesDocument(
     const std::filesystem::path& outputPath,
     std::string* errorMessage) {
     json sourcesJson{
-        {"schema_version", document.schemaVersion},
+        {"schema_version", kWaterSourcesDocumentSchemaVersion},
         {"water_source_settings", SerializeWaterSourceSettings(document.sourceSettings)},
         {"water_caustic_look_settings", SerializeWaterCausticLookSettings(document.causticLookSettings)},
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.flowTrailSettings)},
+        {"show_flow_trails", document.showFlowTrails},
         {"water_trail_geometry", SerializeWaterTrailGeometrySettings(document.trailGeometry)},
         {"water_path_profiles", json::array()},
         {"water_lane_profiles", json::array()},
@@ -6518,6 +6639,9 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
         document.flowTrailSettings =
             ParseWaterFlowTrailSettings(sourcesJson->at("water_flow_stream_settings"));
     }
+    document.showFlowTrails = sourcesJson->value(
+        "show_flow_trails",
+        document.showFlowTrails);
     if (sourcesJson->contains("water_trail_geometry")) {
         document.trailGeometry =
             ParseWaterTrailGeometrySettings(sourcesJson->at("water_trail_geometry"));

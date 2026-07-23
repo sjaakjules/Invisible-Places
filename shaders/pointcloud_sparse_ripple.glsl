@@ -55,15 +55,15 @@ struct SeepageLook {
 struct SeepageNodeTopology {
     // x: stable node id. Seed and noise rotation are live parameters.
     uvec4 control;
-    // xyz: clicked surface position, w: downstream reach in metres.
+    // xyz: clicked surface position, w: topology selection reach limit.
     vec4 positionReach;
     // xyz: clicked surface normal, w: accepted surface-plane thickness in metres.
     vec4 normalSurface;
     // xyz: gravity projected onto the clicked surface, w: fan edge feather in metres.
     vec4 downEdge;
-    // xyz: lateral fan direction, w: half-width at the source in metres.
+    // xyz: lateral fan direction, w: legacy topology source half-width.
     vec4 lateralStart;
-    // x: half-width at the tail.
+    // x: topology selection half-width limit.
     vec4 geometry;
     // x: sample count, y: achieved reach as float bits, z: valid, w: complete.
     uvec4 guideControl;
@@ -84,6 +84,9 @@ struct SeepageNodeParams {
     SeepageLook transitionLook;
     // x: scenario/local spread, y: pattern-transition amount, z: wetting progress.
     vec4 scenario;
+    // x: live reach, y: live full width, z: live prominence,
+    // w: live source half-width.
+    vec4 liveGeometry;
     // Seed-derived, orientation-independent world-noise rotation.
     vec4 noiseBasis[3];
 };
@@ -93,6 +96,13 @@ struct SeepageHashCell {
     ivec4 coordinate;
     // x: first node-reference index, y: node-reference count.
     uvec4 range;
+};
+
+struct SeepageNodeReference {
+    uint nodeIndex;
+    float downstreamDistance;
+    float lateralDistance;
+    uint packedNormalRoleConfidenceFlags;
 };
 
 layout(set = 0, binding = 7, std430) readonly buffer SparseRippleRanges {
@@ -116,7 +126,7 @@ layout(set = 0, binding = 11, std430) readonly buffer SeepageHashCellsBuffer {
 } seepageHashCellData;
 
 layout(set = 0, binding = 12, std430) readonly buffer SeepageNodeReferencesBuffer {
-    uint seepageNodeReferences[];
+    SeepageNodeReference seepageNodeReferences[];
 } seepageNodeReferenceData;
 
 // Live Seepage parameters are separate from the immutable guide topology and
@@ -1517,15 +1527,6 @@ float SeepageResolvedFanMask(
     float widthProgressReach,
     out float lateralNormalised) {
     lateralNormalised = 0.0;
-    const float rainGain = clamp(
-        seepageParamData.seepageParams[nodeIndex].geometry.w *
-            max(
-                seepageParamData.seepageParams[nodeIndex].look.response2.w,
-                seepageParamData.seepageParams[nodeIndex].transitionLook.response2.w),
-        0.0,
-        1.0);
-    const float scenarioWidthScale =
-        1.0 + clamp(seepageParamData.seepageParams[nodeIndex].scenario.x, 0.0, 1.0) * 0.35;
     const float surfaceThickness = max(
         1e-4,
         seepageNodeData.seepageNodes[nodeIndex].normalSurface.w);
@@ -1542,11 +1543,10 @@ float SeepageResolvedFanMask(
     const float progress = clamp(downstreamDistance / widthProgressReach, 0.0, 1.0);
     const float startHalfWidth = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].lateralStart.w);
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.w);
     const float tailHalfWidth = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].geometry.x) *
-        scenarioWidthScale * (1.0 + rainGain * 0.20);
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.y * 0.5);
     const float halfWidth = mix(startHalfWidth, tailHalfWidth, progress);
     if (abs(signedLateralDistance) > halfWidth + edgeFeather) {
         return 0.0;
@@ -1606,19 +1606,9 @@ float SeepagePlanarFanMask(
     downstreamDistance = dot(relative, down);
     lateralDistance = dot(relative, lateral);
     const float planeDistance = abs(dot(relative, nodeNormal));
-    const float rainGain = clamp(
-        seepageParamData.seepageParams[nodeIndex].geometry.w *
-            max(
-                seepageParamData.seepageParams[nodeIndex].look.response2.w,
-                seepageParamData.seepageParams[nodeIndex].transitionLook.response2.w),
-        0.0,
-        1.0);
-    const float scenarioReachScale =
-        1.0 + clamp(seepageParamData.seepageParams[nodeIndex].scenario.x, 0.0, 1.0) * 0.50;
     const float authoredReach = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].positionReach.w) *
-        scenarioReachScale * (1.0 + rainGain * 0.25);
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
     return SeepageResolvedFanMask(
         nodeIndex,
         pointNormal,
@@ -1762,19 +1752,9 @@ float SeepageFanMask(
     resolvedSurfaceNormal = bestSurfaceNormal;
     resolvedDownTangent = RippleSafeNormal(
         stationEnd.xyz - stationStart.xyz);
-    const float rainGain = clamp(
-        seepageParamData.seepageParams[nodeIndex].geometry.w *
-            max(
-                seepageParamData.seepageParams[nodeIndex].look.response2.w,
-                seepageParamData.seepageParams[nodeIndex].transitionLook.response2.w),
-        0.0,
-        1.0);
-    const float scenarioReachScale =
-        1.0 + clamp(seepageParamData.seepageParams[nodeIndex].scenario.x, 0.0, 1.0) * 0.50;
     const float authoredReach = max(
         1e-4,
-        seepageNodeData.seepageNodes[nodeIndex].positionReach.w) *
-        scenarioReachScale * (1.0 + rainGain * 0.25);
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
     const float achievedReach = max(
         0.0,
         uintBitsToFloat(seepageNodeData.seepageNodes[nodeIndex].guideControl.y));
@@ -1793,6 +1773,62 @@ float SeepageFanMask(
         min(authoredReach, min(achievedReach, lastStation)),
         authoredReach,
         lateralNormalised);
+}
+
+vec3 DecodeSeepageSupportNormal(uint packed) {
+    vec2 octahedral = vec2(
+        float(packed & 0x3ffu),
+        float((packed >> 10u) & 0x3ffu)) / 1023.0 * 2.0 - 1.0;
+    vec3 normal = vec3(
+        octahedral,
+        1.0 - abs(octahedral.x) - abs(octahedral.y));
+    if (normal.z < 0.0) {
+        const vec2 original = normal.xy;
+        normal.x = (1.0 - abs(original.y)) * (original.x < 0.0 ? -1.0 : 1.0);
+        normal.y = (1.0 - abs(original.x)) * (original.y < 0.0 ? -1.0 : 1.0);
+    }
+    return RippleSafeNormal(normal);
+}
+
+float SeepageConnectedSupportMask(
+    uint nodeIndex,
+    SeepageNodeReference reference,
+    vec3 worldPosition,
+    vec3 pointNormal,
+    out float downstreamDistance,
+    out float lateralDistance,
+    out float lateralNormalised,
+    out vec3 resolvedSurfaceNormal,
+    out vec3 resolvedDownTangent) {
+    downstreamDistance = reference.downstreamDistance;
+    const vec3 lateralAxis = RippleSafeNormal(
+        seepageNodeData.seepageNodes[nodeIndex].lateralStart.xyz);
+    const float lateralSign = dot(
+            worldPosition - seepageNodeData.seepageNodes[nodeIndex].positionReach.xyz,
+            lateralAxis) < 0.0
+        ? -1.0
+        : 1.0;
+    lateralDistance = reference.lateralDistance * lateralSign;
+    resolvedSurfaceNormal = DecodeSeepageSupportNormal(
+        reference.packedNormalRoleConfidenceFlags);
+    resolvedDownTangent = RippleSafeNormal(
+        seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz);
+    const float liveReach = max(
+        0.0,
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
+    const float mask = SeepageResolvedFanMask(
+        nodeIndex,
+        pointNormal,
+        downstreamDistance,
+        lateralDistance,
+        0.0,
+        resolvedSurfaceNormal,
+        liveReach,
+        max(liveReach, 1e-4),
+        lateralNormalised);
+    const float confidence =
+        float((reference.packedNormalRoleConfidenceFlags >> 20u) & 0xffu) / 255.0;
+    return mask * mix(0.65, 1.0, confidence);
 }
 
 uvec4 SeepageLookControl(uint nodeIndex, bool transition) {
@@ -2146,10 +2182,10 @@ vec3 SeepagePatternSignals(
 
         const float startHalfWidth = max(
             1e-4,
-            seepageNodeData.seepageNodes[nodeIndex].lateralStart.w);
+            seepageParamData.seepageParams[nodeIndex].liveGeometry.w);
         const float tailHalfWidth = max(
             startHalfWidth,
-            seepageNodeData.seepageNodes[nodeIndex].geometry.x);
+            seepageParamData.seepageParams[nodeIndex].liveGeometry.y * 0.5);
         const float fanHalfWidth = mix(startHalfWidth, tailHalfWidth, distanceProgress);
         const float lateralWander =
             (trickleNoise.value - 0.5) * featureSize * mix(0.16, 0.85, breakup);
@@ -2318,6 +2354,8 @@ vec3 SeepagePatternSignals(
 
 SparseRippleComposite EvaluateSeepageContribution(
     uint nodeIndex,
+    bool usesConnectedSupport,
+    SeepageNodeReference supportReference,
     vec3 worldPosition,
     vec3 pointNormal,
     uint pointIndex,
@@ -2335,15 +2373,26 @@ SparseRippleComposite EvaluateSeepageContribution(
     float lateralNormalised;
     vec3 surfaceNormal;
     vec3 downTangent;
-    const float fanMask = SeepageFanMask(
-        nodeIndex,
-        worldPosition,
-        pointNormal,
-        downstreamDistance,
-        lateralDistance,
-        lateralNormalised,
-        surfaceNormal,
-        downTangent);
+    const float fanMask = usesConnectedSupport
+        ? SeepageConnectedSupportMask(
+              nodeIndex,
+              supportReference,
+              worldPosition,
+              pointNormal,
+              downstreamDistance,
+              lateralDistance,
+              lateralNormalised,
+              surfaceNormal,
+              downTangent)
+        : SeepageFanMask(
+              nodeIndex,
+              worldPosition,
+              pointNormal,
+              downstreamDistance,
+              lateralDistance,
+              lateralNormalised,
+              surfaceNormal,
+              downTangent);
     if (fanMask <= 1e-5) {
         return contribution;
     }
@@ -2362,19 +2411,9 @@ SparseRippleComposite EvaluateSeepageContribution(
         return contribution;
     }
     if (wettingProgress < 1.0 - 1e-6) {
-        const float rainGain = clamp(
-            seepageParamData.seepageParams[nodeIndex].geometry.w * response2.w,
-            0.0,
-            1.0);
-        const float scenarioReachScale =
-            1.0 + clamp(
-                seepageParamData.seepageParams[nodeIndex].scenario.x,
-                0.0,
-                1.0) * 0.50;
         const float effectiveReach = max(
             1e-4,
-            seepageNodeData.seepageNodes[nodeIndex].positionReach.w) *
-            scenarioReachScale * (1.0 + rainGain * 0.25);
+            seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
         const float frontSoftness = max(
             seepageNodeData.seepageNodes[nodeIndex].downEdge.w,
             SeepageLookOrganic3(nodeIndex, transition).x);
@@ -2402,6 +2441,7 @@ SparseRippleComposite EvaluateSeepageContribution(
     const float scale = clamp(
         (signals.x * 0.58 + signals.y * 0.34 + signals.z * 0.46) *
             max(0.0, legacy1.w) *
+            max(0.0, seepageParamData.seepageParams[nodeIndex].liveGeometry.z) *
             (1.0 + clamp(
                  seepageParamData.seepageParams[nodeIndex].geometry.w *
                      response2.w,
@@ -2683,13 +2723,18 @@ void BlendSeepageContributions(
         }
         const uint available = styleData.seepageControl.w - start;
         const uint cappedEnd = start + min(count, available);
+        const bool usesConnectedSupport = styleData.seepageGridParams.w > 0.5;
         for (uint referenceIndex = start; referenceIndex < cappedEnd; ++referenceIndex) {
-            const uint nodeIndex = seepageNodeReferenceData.seepageNodeReferences[referenceIndex];
+            const SeepageNodeReference supportReference =
+                seepageNodeReferenceData.seepageNodeReferences[referenceIndex];
+            const uint nodeIndex = supportReference.nodeIndex;
             if (nodeIndex >= styleData.seepageControl.y) {
                 continue;
             }
             const SparseRippleComposite contribution = EvaluateSeepageContribution(
                 nodeIndex,
+                usesConnectedSupport,
+                supportReference,
                 worldPosition,
                 pointNormal,
                 pointIndex,

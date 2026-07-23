@@ -18,7 +18,9 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -103,6 +105,58 @@ std::vector<WaterSurfaceSample> MakeCollisionSamples() {
     };
 }
 
+invisible_places::water::WaterSurfaceCachePayloadChecksum
+ReadPersistedGpuStreamChecksum(
+    const invisible_places::water::WaterSurfacePersistedGpuTables& tables) {
+    std::ifstream input{tables.filePath, std::ios::binary};
+    if (!input.is_open()) {
+        throw std::runtime_error{"Unable to open persisted GPU tables."};
+    }
+    invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder checksum;
+    std::array<std::byte, 23U> scratch{};
+    const auto readSection = [&](std::uint64_t offset,
+                                 std::uint64_t tag,
+                                 std::uint64_t count,
+                                 std::uint64_t elementBytes) {
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!input.good()) {
+            throw std::runtime_error{"Invalid persisted GPU table offset."};
+        }
+        checksum.AddPod(tag);
+        checksum.AddPod(count);
+        std::uint64_t remaining = count * elementBytes;
+        while (remaining > 0U) {
+            const auto chunkBytes = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, scratch.size()));
+            input.read(
+                reinterpret_cast<char*>(scratch.data()),
+                static_cast<std::streamsize>(chunkBytes));
+            if (!input.good()) {
+                throw std::runtime_error{"Truncated persisted GPU table."};
+            }
+            checksum.AddBytes(scratch.data(), chunkBytes);
+            remaining -= chunkBytes;
+        }
+    };
+    readSection(
+        tables.surfaceOffset,
+        4U,
+        tables.surfaceCount,
+        sizeof(invisible_places::water::RainGpuSurfaceSlot));
+    readSection(
+        tables.vegetationOffset,
+        5U,
+        tables.vegetationCount,
+        sizeof(invisible_places::water::RainGpuVegetationSlot));
+    readSection(
+        tables.flowSurfaceOffset,
+        6U,
+        tables.flowSurfaceCount,
+        sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot));
+    return checksum.Finish();
+}
+
 }  // namespace
 
 TEST_CASE("rain collision input streams only positions and normals", "[water][rain][cache]") {
@@ -156,15 +210,15 @@ TEST_CASE("water surface input streams optional roughness in the same pass", "[w
 
 TEST_CASE("shared water cache consumes roughness during its source scan", "[water][rain][flow][cache]") {
     TemporaryDirectory temporary;
-    const auto path = temporary.path / "rock-5mm.ply";
+    const auto path = temporary.path / "rock-2mm.ply";
     WritePointPlyWithRoughness(path, {
         {0.002F, 0.004F, 0.006F, 0.0F, 0.0F, 1.0F, 0.10F},
-        {0.010F, 0.012F, 0.014F, 0.0F, 0.0F, 1.0F, 0.30F},
+        {0.008F, 0.008F, 0.008F, 0.0F, 0.0F, 1.0F, 0.30F},
     });
     const std::vector<invisible_places::water::WaterSurfaceSource> sources{{
         .sourcePath = path,
         .role = WaterSurfaceRole::Rock,
-        .spacingMicrometres = 5'000U,
+        .spacingMicrometres = 2'000U,
     }};
 
     const auto result = invisible_places::water::BuildWaterSurfaceCache(sources);
@@ -185,15 +239,15 @@ TEST_CASE("shared water cache retains orientation independent role surfels", "[w
          .role = WaterSurfaceRole::Rock,
          .roughness = 0.20F,
          .hasRoughness = true},
-        {.position = {0.010F, 0.012F, 0.014F},
+        {.position = {0.008F, 0.008F, 0.008F},
          .normal = {0.0F, 0.0F, -1.0F},
          .role = WaterSurfaceRole::Rock,
          .roughness = 0.40F,
          .hasRoughness = true},
-        {.position = {0.006F, 0.006F, 0.010F},
+        {.position = {0.006F, 0.006F, 0.008F},
          .normal = {1.0F, 0.0F, 0.0F},
          .role = WaterSurfaceRole::Sand},
-        {.position = {0.006F, 0.006F, 0.046F},
+        {.position = {0.006F, 0.006F, 0.026F},
          .normal = {1.0F, 0.0F, 0.0F},
          .role = WaterSurfaceRole::Rock},
     };
@@ -202,7 +256,7 @@ TEST_CASE("shared water cache retains orientation independent role surfels", "[w
     CHECK(cache.schemaVersion == invisible_places::water::kWaterSurfaceCacheSchemaVersion);
     // Rain still retains one top-height cell per XY coordinate and role.
     REQUIRE(cache.surfaceCells.size() == 1U);
-    CHECK(cache.surfaceCells[0].rockHeight == Catch::Approx(0.046F));
+    CHECK(cache.surfaceCells[0].rockHeight == Catch::Approx(0.026F));
     // Flow retains both surface sheets and keeps ROCK/SAND separate in a shared voxel.
     REQUIRE(cache.flowSurfaceSurfels.size() == 3U);
     const auto firstRock = std::find_if(
@@ -212,14 +266,62 @@ TEST_CASE("shared water cache retains orientation independent role surfels", "[w
             return surfel.cellZ == 0 && surfel.role == WaterSurfaceRole::Rock;
         });
     REQUIRE(firstRock != cache.flowSurfaceSurfels.end());
-    CHECK(firstRock->centroid.x == Catch::Approx(0.006F));
-    CHECK(firstRock->centroid.y == Catch::Approx(0.008F));
-    CHECK(firstRock->centroid.z == Catch::Approx(0.010F));
+    CHECK(firstRock->centroid.x == Catch::Approx(0.005F));
+    CHECK(firstRock->centroid.y == Catch::Approx(0.006F));
+    CHECK(firstRock->centroid.z == Catch::Approx(0.007F));
     CHECK(firstRock->normal.z == Catch::Approx(1.0F));
     CHECK(firstRock->normalCoherence == Catch::Approx(1.0F));
     CHECK(firstRock->normalVariance == Catch::Approx(0.0F));
     CHECK(firstRock->roughness == Catch::Approx(0.30F));
     CHECK(firstRock->sampleCount == 2U);
+}
+
+TEST_CASE("ten millimetre cache averages unoriented two millimetre normals deterministically",
+          "[water][rain][flow][cache][normals]") {
+    const std::vector<WaterSurfaceSample> samples{
+        {{0.002F, 0.002F, 0.002F}, {0.6F, 0.0F, 0.8F}, WaterSurfaceRole::Rock},
+        {{0.004F, 0.004F, 0.004F}, {-0.6F, 0.0F, -0.8F}, WaterSurfaceRole::Rock},
+        {{0.002F, 0.002F, 0.012F}, {0.0F, 1.0F, 0.0F}, WaterSurfaceRole::Rock},
+        {{0.004F, 0.004F, 0.014F}, {0.0F, -1.0F, 0.0F}, WaterSurfaceRole::Rock},
+        {{0.006F, 0.006F, 0.002F}, {1.0F, 0.0F, 0.0F}, WaterSurfaceRole::Vegetation},
+        {{0.008F, 0.008F, 0.004F}, {-1.0F, 0.0F, 0.0F}, WaterSurfaceRole::Vegetation},
+    };
+    auto reversedSamples = samples;
+    std::reverse(reversedSamples.begin(), reversedSamples.end());
+
+    const auto cache = invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    const auto reversed =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(reversedSamples);
+
+    CHECK(cache.resolutionMeters == Catch::Approx(0.010F));
+    REQUIRE(cache.surfaceCells.size() == 1U);
+    REQUIRE(reversed.surfaceCells.size() == cache.surfaceCells.size());
+    CHECK(cache.surfaceCells[0].rockHeight == Catch::Approx(0.014F));
+    CHECK(cache.surfaceCells[0].rockNormal.x == Catch::Approx(0.0F));
+    CHECK(cache.surfaceCells[0].rockNormal.y == Catch::Approx(1.0F));
+    CHECK(cache.surfaceCells[0].rockNormal.z == Catch::Approx(0.0F));
+    CHECK(cache.surfaceCells[0].rockSampleCount == 2U);
+    CHECK(reversed.surfaceCells[0].rockNormal.y ==
+          Catch::Approx(cache.surfaceCells[0].rockNormal.y));
+
+    REQUIRE(cache.flowSurfaceSurfels.size() == 2U);
+    REQUIRE(reversed.flowSurfaceSurfels.size() == cache.flowSurfaceSurfels.size());
+    const auto& lowerRock = cache.flowSurfaceSurfels[0];
+    const auto& upperRock = cache.flowSurfaceSurfels[1];
+    CHECK(lowerRock.cellZ == 0);
+    CHECK(lowerRock.normal.x == Catch::Approx(0.6F));
+    CHECK(lowerRock.normal.z == Catch::Approx(0.8F));
+    CHECK(lowerRock.sampleCount == 2U);
+    CHECK(upperRock.cellZ == 1);
+    CHECK(upperRock.normal.y == Catch::Approx(1.0F));
+    CHECK(upperRock.sampleCount == 2U);
+    CHECK(reversed.flowSurfaceSurfels[0].normal.x == Catch::Approx(lowerRock.normal.x));
+    CHECK(reversed.flowSurfaceSurfels[1].normal.y == Catch::Approx(upperRock.normal.y));
+
+    REQUIRE(cache.vegetationVoxels.size() == 1U);
+    CHECK(cache.vegetationVoxels[0].normal.x == Catch::Approx(1.0F));
+    CHECK(cache.vegetationVoxels[0].sampleCount == 2U);
+    CHECK(reversed.vegetationVoxels[0].normal.x == Catch::Approx(1.0F));
 }
 
 TEST_CASE("water surface residency identity distinguishes legacy revision collisions", "[water][rain][flow][cache][identity]") {
@@ -313,11 +415,12 @@ TEST_CASE("water surface CPU queries preserve the continuous surface sheet", "[w
     CHECK_FALSE(outsideSupport.hit);
 }
 
-TEST_CASE("rain sources prefer exact five millimetre data per role", "[water][rain][cache]") {
+TEST_CASE("water surface sources prefer exact two millimetre complete bundles",
+          "[water][rain][cache]") {
     invisible_places::scene::ScenePointCloudGroup group;
     group.variantsByRole[0] = {
         {.role = invisible_places::scene::ScenePointCloudRole::Rock, .spacingMicrometres = 1'000U, .sourcePath = "rock1.ply"},
-        {.role = invisible_places::scene::ScenePointCloudRole::Rock, .spacingMicrometres = 5'000U, .sourcePath = "rock5.ply"},
+        {.role = invisible_places::scene::ScenePointCloudRole::Rock, .spacingMicrometres = 2'000U, .sourcePath = "rock2.ply"},
     };
     group.variantsByRole[1] = {
         {.role = invisible_places::scene::ScenePointCloudRole::Sand, .spacingMicrometres = 2'000U, .sourcePath = "sand2.ply"},
@@ -327,17 +430,66 @@ TEST_CASE("rain sources prefer exact five millimetre data per role", "[water][ra
         {.role = invisible_places::scene::ScenePointCloudRole::Vegetation, .spacingMicrometres = 3'000U, .sourcePath = "veg3.ply"},
     };
 
+    CHECK(invisible_places::water::SelectWaterSurfaceSources(group).empty());
+
+    group.completeDisplayBundles.push_back({
+        .spacingMicrometres = 3'000U,
+        .byRole = {{
+            {.role = invisible_places::scene::ScenePointCloudRole::Rock,
+             .spacingMicrometres = 3'000U,
+             .sourcePath = "rock3.ply"},
+            {.role = invisible_places::scene::ScenePointCloudRole::Sand,
+             .spacingMicrometres = 3'000U,
+             .sourcePath = "sand3.ply"},
+            {.role = invisible_places::scene::ScenePointCloudRole::Vegetation,
+             .spacingMicrometres = 3'000U,
+             .sourcePath = "veg3.ply"},
+        }},
+    });
+    auto distantBundle = group.completeDisplayBundles.back();
+    distantBundle.spacingMicrometres = 5'000U;
+    for (auto& variant : distantBundle.byRole) {
+        variant.spacingMicrometres = 5'000U;
+    }
+    group.completeDisplayBundles.insert(
+        group.completeDisplayBundles.begin(),
+        std::move(distantBundle));
+    const auto fallbackSources = invisible_places::water::SelectWaterSurfaceSources(group);
+    REQUIRE(fallbackSources.size() == 3U);
+    for (const auto& source : fallbackSources) {
+        CHECK(source.spacingMicrometres == 3'000U);
+        CHECK(source.isFallback);
+    }
+
+    group.completeDisplayBundles.push_back({
+        .spacingMicrometres = 2'000U,
+        .byRole = {{
+            {.role = invisible_places::scene::ScenePointCloudRole::Rock,
+             .spacingMicrometres = 2'000U,
+             .sourcePath = "rock2.ply"},
+            {.role = invisible_places::scene::ScenePointCloudRole::Sand,
+             .spacingMicrometres = 2'000U,
+             .sourcePath = "sand2.ply"},
+            {.role = invisible_places::scene::ScenePointCloudRole::Vegetation,
+             .spacingMicrometres = 2'000U,
+             .sourcePath = "veg2.ply"},
+        }},
+    });
     const auto sources = invisible_places::water::SelectWaterSurfaceSources(group);
     REQUIRE(sources.size() == 3U);
-    CHECK(sources[0].sourcePath == "rock5.ply");
+    CHECK(sources[0].sourcePath == "rock2.ply");
     CHECK_FALSE(sources[0].isFallback);
     CHECK(sources[1].sourcePath == "sand2.ply");
-    CHECK(sources[1].isFallback);
-    CHECK(sources[2].sourcePath == "veg3.ply");
-    CHECK(sources[2].isFallback);
+    CHECK_FALSE(sources[1].isFallback);
+    CHECK(sources[2].sourcePath == "veg2.ply");
+    CHECK_FALSE(sources[2].isFallback);
+    for (const auto& source : sources) {
+        CHECK(source.spacingMicrometres == 2'000U);
+    }
 }
 
-TEST_CASE("SampleScene rain sources select exact five millimetre support", "[water][rain][cache][sample]") {
+TEST_CASE("SampleScene water sources select exact two millimetre normal support",
+          "[water][rain][cache][sample]") {
     const auto dataRoot = std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR};
     if (!std::filesystem::exists(dataRoot / "SampleScene")) {
         SKIP("SampleScene fixture is not present in the local Data directory.");
@@ -358,11 +510,11 @@ TEST_CASE("SampleScene rain sources select exact five millimetre support", "[wat
 
     const auto sources = invisible_places::water::SelectWaterSurfaceSources(*sampleScene);
     REQUIRE(sources.size() == 3U);
-    CHECK(sources[0].sourcePath.filename() == "Site1-ROCK-5mm.Sample.ply");
-    CHECK(sources[1].sourcePath.filename() == "Site1-SAND-5mm.Sample.ply");
-    CHECK(sources[2].sourcePath.filename() == "Site1-VEG-5mm.Sample.ply");
+    CHECK(sources[0].sourcePath.filename() == "Site1-ROCK-2mm.Sample.ply");
+    CHECK(sources[1].sourcePath.filename() == "Site1-SAND-2mm.Sample.ply");
+    CHECK(sources[2].sourcePath.filename() == "Site1-VEG-2mm.Sample.ply");
     for (const auto& source : sources) {
-        CHECK(source.spacingMicrometres == 5'000U);
+        CHECK(source.spacingMicrometres == 2'000U);
         CHECK_FALSE(source.isFallback);
     }
 }
@@ -446,15 +598,83 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
           Catch::Approx(cache.flowSurfaceSurfels[0].centroid.x));
     CHECK(loaded.flowSurfaceSurfels[0].normalCoherence ==
           Catch::Approx(cache.flowSurfaceSurfels[0].normalCoherence));
-    CHECK(loaded.gpuData.surfaceTable.size() == cache.gpuData.surfaceTable.size());
-    CHECK(loaded.gpuData.vegetationTable.size() == cache.gpuData.vegetationTable.size());
-    CHECK(loaded.gpuData.flowSurfaceTable.size() == cache.gpuData.flowSurfaceTable.size());
+    CHECK(loaded.gpuData.surfaceTable.empty());
+    CHECK(loaded.gpuData.vegetationTable.empty());
+    CHECK(loaded.gpuData.flowSurfaceTable.empty());
+    CAPTURE(
+        loaded.gpuData.persistedTables.filePath,
+        loaded.gpuData.persistedTables.fileSize,
+        loaded.gpuData.persistedTables.surfaceCount,
+        loaded.gpuData.persistedTables.vegetationCount,
+        loaded.gpuData.persistedTables.flowSurfaceCount,
+        loaded.gpuData.persistedTables.streamChecksum.hashedByteCount,
+        loaded.gpuData.persistedTables.streamChecksum.words[0],
+        loaded.gpuData.persistedTables.streamChecksum.words[1]);
+    REQUIRE(loaded.gpuData.persistedTables.Valid());
+    CHECK(loaded.gpuData.persistedTables.filePath == path);
+    CHECK(loaded.gpuData.persistedTables.fileSize ==
+          std::filesystem::file_size(path));
+    CHECK(loaded.gpuData.persistedTables.modificationTicks ==
+          static_cast<std::int64_t>(
+              std::filesystem::last_write_time(path).time_since_epoch().count()));
+    CHECK(loaded.gpuData.persistedTables.surfaceCount == cache.gpuData.surfaceTable.size());
+    CHECK(loaded.gpuData.persistedTables.vegetationCount == cache.gpuData.vegetationTable.size());
+    CHECK(loaded.gpuData.persistedTables.flowSurfaceCount == cache.gpuData.flowSurfaceTable.size());
+    CHECK(loaded.gpuData.persistedTables.surfaceOffset <
+          loaded.gpuData.persistedTables.vegetationOffset);
+    CHECK(loaded.gpuData.persistedTables.vegetationOffset <
+          loaded.gpuData.persistedTables.flowSurfaceOffset);
+    CHECK(ReadPersistedGpuStreamChecksum(loaded.gpuData.persistedTables) ==
+          loaded.gpuData.persistedTables.streamChecksum);
     CHECK(loaded.gpuData.flowSurfaceMask == cache.gpuData.flowSurfaceMask);
     CHECK(loaded.gpuData.sourceRevision == cache.revision);
     CHECK(loaded.gpuData.payloadChecksum.Valid());
     CHECK(loaded.cacheIdentity == expectedIdentity);
     CHECK(loaded.gpuData.sourceIdentity == expectedIdentity);
     CHECK_FALSE(invisible_places::water::LoadWaterSurfaceCache(path, "changed", &loaded, &error));
+
+    // A renderer may reopen the sidecar after asynchronous validation. Even
+    // if an in-place edit preserves both size and timestamp, the direct
+    // staging stream checksum must distinguish it before hidden resources are
+    // promoted.
+    const auto changedDuringUploadPath =
+        temporary.path / "changed-during-upload.surfacecache";
+    REQUIRE(std::filesystem::copy_file(path, changedDuringUploadPath));
+    invisible_places::water::WaterSurfaceCache changedDuringUpload;
+    REQUIRE(invisible_places::water::LoadWaterSurfaceCache(
+        changedDuringUploadPath,
+        "expected",
+        &changedDuringUpload,
+        &error));
+    const auto unchangedWriteTime =
+        std::filesystem::last_write_time(changedDuringUploadPath);
+    {
+        std::fstream edited{
+            changedDuringUploadPath,
+            std::ios::binary | std::ios::in | std::ios::out};
+        REQUIRE(edited.is_open());
+        edited.seekg(static_cast<std::streamoff>(
+            changedDuringUpload.gpuData.persistedTables.surfaceOffset));
+        char value = 0;
+        edited.read(&value, 1U);
+        REQUIRE(edited.good());
+        value ^= static_cast<char>(0x5A);
+        edited.seekp(static_cast<std::streamoff>(
+            changedDuringUpload.gpuData.persistedTables.surfaceOffset));
+        edited.write(&value, 1U);
+        REQUIRE(edited.good());
+    }
+    std::filesystem::last_write_time(changedDuringUploadPath, unchangedWriteTime);
+    CHECK(changedDuringUpload.gpuData.persistedTables.fileSize ==
+          std::filesystem::file_size(changedDuringUploadPath));
+    CHECK(changedDuringUpload.gpuData.persistedTables.modificationTicks ==
+          static_cast<std::int64_t>(
+              std::filesystem::last_write_time(changedDuringUploadPath)
+                  .time_since_epoch()
+                  .count()));
+    CHECK(ReadPersistedGpuStreamChecksum(
+              changedDuringUpload.gpuData.persistedTables) !=
+          changedDuringUpload.gpuData.persistedTables.streamChecksum);
 
     // Schema 3 requires its checksum trailer; truncation cannot silently turn a
     // current cache into a trusted warm-load payload.
@@ -522,6 +742,8 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
     CHECK(loaded.schemaVersion == invisible_places::water::kWaterSurfaceCacheLegacySchemaVersion);
     CHECK(loaded.cacheIdentity.Valid());
     CHECK(loaded.gpuData.payloadChecksum.Valid());
+    CHECK_FALSE(loaded.gpuData.persistedTables.Valid());
+    CHECK_FALSE(loaded.gpuData.surfaceTable.empty());
     CHECK(legacyDiagnostics.sourceScanCount == 0U);
     CHECK(legacyDiagnostics.gpuTableBuildCount == 0U);
     CHECK(legacyDiagnostics.fullPayloadHashPassCount == 1U);
@@ -532,9 +754,9 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     const auto sceneDirectory = temporary.path / "Scene";
     std::filesystem::create_directories(sceneDirectory);
     const std::array<std::pair<std::string_view, WaterSurfaceRole>, 3> files{{
-        {"rock-5mm.ply", WaterSurfaceRole::Rock},
-        {"sand-5mm.ply", WaterSurfaceRole::Sand},
-        {"vegetation-5mm.ply", WaterSurfaceRole::Vegetation},
+        {"rock-2mm.ply", WaterSurfaceRole::Rock},
+        {"sand-2mm.ply", WaterSurfaceRole::Sand},
+        {"vegetation-2mm.ply", WaterSurfaceRole::Vegetation},
     }};
     std::vector<invisible_places::water::WaterSurfaceSource> sources;
     for (std::size_t index = 0U; index < files.size(); ++index) {
@@ -550,7 +772,7 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
         sources.push_back({
             .sourcePath = path,
             .role = files[index].second,
-            .spacingMicrometres = 5'000U,
+            .spacingMicrometres = 2'000U,
         });
     }
 
@@ -559,6 +781,11 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
         sceneDirectory);
     REQUIRE(cold.success);
     CHECK_FALSE(cold.loadedFromDisk);
+    CHECK(cold.cache.resolutionMeters == Catch::Approx(0.010F));
+    REQUIRE(cold.cache.sources.size() == 3U);
+    for (const auto& source : cold.cache.sources) {
+        CHECK(source.spacingMicrometres == 2'000U);
+    }
     CHECK(cold.diagnostics.sourceScanCount == 3U);
     CHECK(cold.diagnostics.gpuTableBuildCount == 1U);
     CHECK(cold.diagnostics.fullPayloadHashPassCount == 0U);
@@ -576,6 +803,14 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     CHECK(warm.diagnostics.sourceScanCount == 0U);
     CHECK(warm.diagnostics.gpuTableBuildCount == 0U);
     CHECK(warm.diagnostics.fullPayloadHashPassCount == 0U);
+    CHECK(warm.cache.gpuData.persistedTables.Valid());
+    CHECK(warm.cache.gpuData.surfaceTable.empty());
+    CHECK(warm.cache.gpuData.vegetationTable.empty());
+    CHECK(warm.cache.gpuData.flowSurfaceTable.empty());
+    REQUIRE(warm.cache.sources.size() == cold.cache.sources.size());
+    for (const auto& source : warm.cache.sources) {
+        CHECK(source.spacingMicrometres == 2'000U);
+    }
     CHECK(warm.cache.cacheIdentity == cold.cache.cacheIdentity);
     CHECK(warm.persistedPath == cachePath);
 }
@@ -588,16 +823,16 @@ TEST_CASE("failed cold persistence never publishes a stale surface sidecar path"
     std::vector<invisible_places::water::WaterSurfaceSource> sources;
     for (const auto& [filename, role] :
          std::array<std::pair<std::string_view, WaterSurfaceRole>, 3>{{
-             {"rock-5mm.ply", WaterSurfaceRole::Rock},
-             {"sand-5mm.ply", WaterSurfaceRole::Sand},
-             {"vegetation-5mm.ply", WaterSurfaceRole::Vegetation},
+             {"rock-2mm.ply", WaterSurfaceRole::Rock},
+             {"sand-2mm.ply", WaterSurfaceRole::Sand},
+             {"vegetation-2mm.ply", WaterSurfaceRole::Vegetation},
          }}) {
         const auto path = sceneDirectory / filename;
         WritePointPly(path, {{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F}});
         sources.push_back({
             .sourcePath = path,
             .role = role,
-            .spacingMicrometres = 5'000U,
+            .spacingMicrometres = 2'000U,
         });
     }
     const auto signature = invisible_places::water::WaterSurfaceCacheSignature(sources);
@@ -741,6 +976,9 @@ TEST_CASE("water surface signatures invalidate for every terrain source input",
         .spacingMicrometres = 5'000U,
     }};
     const auto baseline = invisible_places::water::WaterSurfaceCacheSignature(sources);
+    CHECK(invisible_places::water::kWaterSurfaceCacheAlgorithmId ==
+          std::string_view{"water-surface-10mm-normal-average-v1"});
+    CHECK(invisible_places::water::WaterSurfaceCacheSignature(sources, 0.020F) != baseline);
 
     auto changedRole = sources;
     changedRole.front().role = WaterSurfaceRole::Sand;
@@ -831,6 +1069,20 @@ TEST_CASE("rain intensity modifies visuals without touching collision data", "[w
     cache.revision = 19U;
     const auto before = invisible_places::water::BuildWaterSurfaceGpuData(cache);
     auto settings = invisible_places::water::DefaultRainRuntimeSettings();
+    CHECK(settings.nearSurface.approachDistanceMeters == Catch::Approx(0.18F));
+    CHECK(settings.nearSurface.minimumSpeedFactor == Catch::Approx(0.30F));
+    CHECK(settings.nearSurface.squish == Catch::Approx(0.65F));
+    CHECK(settings.nearSurface.normalAlignment == Catch::Approx(0.75F));
+    CHECK(settings.rockImpact.edgeBreakup == Catch::Approx(0.35F));
+    CHECK(settings.rockImpact.spreadSpeed == Catch::Approx(1.60F));
+    CHECK(settings.rockImpact.centreFalloff == Catch::Approx(0.65F));
+    CHECK(settings.rockImpact.heightBias == Catch::Approx(0.75F));
+    CHECK(settings.rockImpact.persistence == Catch::Approx(1.35F));
+    CHECK(settings.vegetationImpact.twinkle == Catch::Approx(1.80F));
+    CHECK(settings.vegetationImpact.propagationMetersPerSecond == Catch::Approx(0.65F));
+    CHECK(settings.vegetationImpact.hopSpacingMeters == Catch::Approx(0.070F));
+    CHECK(settings.vegetationImpact.streamWidthMeters == Catch::Approx(0.010F));
+    CHECK(settings.vegetationImpact.streamSpread == Catch::Approx(0.65F));
     settings.density = 0.12F;
     settings.windSpeedMetersPerSecond = 3.0F;
     settings.opacityScale = 0.2F;
@@ -852,6 +1104,39 @@ TEST_CASE("rain intensity modifies visuals without touching collision data", "[w
     auto gridSettings = invisible_places::water::DefaultRainRuntimeSettings();
     gridSettings.spawnRadiusMeters = 80.0F;
     CHECK(invisible_places::water::RainImpactGridWorldSpan(gridSettings) == Catch::Approx(192.0F));
+}
+
+TEST_CASE("near-surface rain becomes a slowed widened ellipse", "[water][rain][visual]") {
+    const invisible_places::water::RainNearSurfaceSettings settings{};
+    const auto airborne = invisible_places::water::EvaluateRainParticleVisualShape(
+        0.003F,
+        0.16F,
+        0.0F,
+        settings);
+    const auto approaching = invisible_places::water::EvaluateRainParticleVisualShape(
+        0.003F,
+        0.16F,
+        1.0F,
+        settings);
+
+    CHECK(airborne.widthMeters == Catch::Approx(0.003F));
+    CHECK(airborne.lengthMeters == Catch::Approx(0.16F));
+    CHECK(airborne.ellipseBlend == Catch::Approx(0.0F));
+    CHECK(approaching.widthMeters == Catch::Approx(0.00495F));
+    CHECK(approaching.lengthMeters < airborne.lengthMeters * 0.07F);
+    CHECK(approaching.lengthMeters < approaching.widthMeters * 2.0F);
+    CHECK(approaching.ellipseBlend > 0.70F);
+
+    auto fullSquish = settings;
+    fullSquish.squish = 1.0F;
+    const auto settled = invisible_places::water::EvaluateRainParticleVisualShape(
+        0.003F,
+        0.16F,
+        1.0F,
+        fullSquish);
+    CHECK(settled.widthMeters == Catch::Approx(0.006F));
+    CHECK(settled.lengthMeters == Catch::Approx(settled.widthMeters));
+    CHECK(settled.ellipseBlend == Catch::Approx(1.0F));
 }
 
 TEST_CASE("rain simulator is deterministic and skips events when effects are off", "[water][rain][simulation]") {
@@ -901,6 +1186,61 @@ TEST_CASE("rain simulator is deterministic and skips events when effects are off
     }
     CHECK(collisionCount > 0U);
     CHECK(eventCount == 0U);
+}
+
+TEST_CASE("rain slows once near cached terrain and keeps the averaged normal", "[water][rain][simulation]") {
+    std::vector<WaterSurfaceSample> samples;
+    for (int y = -30; y <= 30; ++y) {
+        for (int x = -30; x <= 30; ++x) {
+            samples.push_back({
+                {x * 0.02F, y * 0.02F, 0.0F},
+                {0.60F, 0.0F, 0.80F},
+                WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache = invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    invisible_places::water::RainSimulationFrame frame;
+    frame.settings.enabled = true;
+    frame.settings.activeParticleCount = 1U;
+    frame.settings.density = 1.0F;
+    frame.settings.weatherFrontStrength = 0.0F;
+    frame.settings.windSpeedMetersPerSecond = 0.0F;
+    frame.settings.turbulence = 0.0F;
+    frame.settings.gustStrength = 0.0F;
+    frame.settings.spawnRadiusMeters = 0.10F;
+    frame.settings.spawnHeightMeters = 0.10F;
+    frame.settings.cameraDeathDistanceMeters = 100.0F;
+    frame.settings.nearSurface.approachDistanceMeters = 0.24F;
+    frame.settings.nearSurface.minimumSpeedFactor = 0.25F;
+    frame.spawnCentre = {0.0F, 0.0F, 0.0F};
+    frame.cameraPosition = {0.0F, 0.0F, 2.0F};
+    frame.deltaSeconds = 0.01F;
+
+    invisible_places::water::RainSimulator simulator{1U};
+    bool observedApproach = false;
+    bool observedCollision = false;
+    for (int step = 0; step < 160; ++step) {
+        const auto previous = simulator.Particles().front();
+        frame.timeSeconds = step * frame.deltaSeconds;
+        const auto diagnostics = simulator.Advance(frame, cache);
+        const auto particle = simulator.Particles().front();
+        if (particle.surfaceProximity > 0.01F && diagnostics.collisionCount == 0U &&
+            previous.active && particle.generation == previous.generation) {
+            observedApproach = true;
+            const float fullStep = frame.settings.fallSpeedMetersPerSecond * frame.deltaSeconds;
+            CHECK(previous.position.z - particle.position.z < fullStep - 1.0e-4F);
+            CHECK(particle.surfaceNormal.x > 0.50F);
+            CHECK(particle.surfaceNormal.z > 0.70F);
+        }
+        if (diagnostics.collisionCount > 0U) {
+            observedCollision = true;
+            CHECK(diagnostics.emittedEvents == 1U);
+            break;
+        }
+    }
+    CHECK(observedApproach);
+    CHECK(observedCollision);
 }
 
 TEST_CASE("rain simulator respawns particles outside the camera range", "[water][rain][simulation]") {
@@ -1008,7 +1348,15 @@ TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][r
          .energy = 1.0F,
          .seed = 91U},
     };
-    const auto grid = invisible_places::water::BuildRainImpactGrid(events, {}, 1.0F, 2.0F);
+    auto smoothRock = invisible_places::water::RainRockImpactSettings{};
+    smoothRock.edgeBreakup = 0.0F;
+    smoothRock.centreFalloff = 0.0F;
+    const auto grid = invisible_places::water::BuildRainImpactGrid(
+        events,
+        {},
+        1.0F,
+        2.0F,
+        smoothRock);
     const auto centreAtBirth = invisible_places::water::EvaluateRainImpact(
         grid, WaterSurfaceRole::Rock, {0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, 0.08F);
     const auto outerAtOldGrowthTime = invisible_places::water::EvaluateRainImpact(
@@ -1040,13 +1388,15 @@ TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][r
             events.front(),
             {effectiveRadius * 0.975F, 0.0F, 0.0F},
             {0.0F, 0.0F, 1.0F},
-            1.80F);
+            1.80F,
+            smoothRock);
     const auto evaluatorOutsideReducedEdge =
         invisible_places::water::EvaluateRockRainImpactValue(
             events.front(),
             {effectiveRadius * 1.025F, 0.0F, 0.0F},
             {0.0F, 0.0F, 1.0F},
-            1.80F);
+            1.80F,
+            smoothRock);
     const auto flatLeftLate = invisible_places::water::EvaluateRainImpact(
         grid,
         WaterSurfaceRole::Rock,
@@ -1070,10 +1420,73 @@ TEST_CASE("rock rain impact uses the reduced slow-growing footprint", "[water][r
     CHECK(flatLeftLate.colourBlend == Catch::Approx(flatRightLate.colourBlend));
 }
 
+TEST_CASE("rock rain edge breakup is seeded, irregular, and inward only", "[water][rain][effects]") {
+    constexpr float pi = 3.14159265358979323846F;
+    constexpr float radius = 0.12F;
+    const float effectiveRadius = radius * std::sqrt(2.0F / 3.0F);
+    invisible_places::water::RainImpactEvent event{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {0.0F, 0.0F, 1.0F},
+        .radiusMeters = radius,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = 5.0F,
+        .energy = 1.0F,
+        .seed = 0xA51U,
+    };
+    const auto settings = invisible_places::water::RainRockImpactSettings{};
+    float minimumEdge = std::numeric_limits<float>::infinity();
+    float maximumEdge = 0.0F;
+    float seedDifference = 0.0F;
+    for (int sample = 0; sample < 64; ++sample) {
+        const float angle = 2.0F * pi * static_cast<float>(sample) / 64.0F;
+        const Float3 point{
+            std::cos(angle) * effectiveRadius * 0.92F,
+            std::sin(angle) * effectiveRadius * 0.92F,
+            0.0F,
+        };
+        const float first = invisible_places::water::EvaluateRockRainImpactValue(
+            event,
+            point,
+            {0.0F, 0.0F, 1.0F},
+            1.80F,
+            settings);
+        auto secondEvent = event;
+        secondEvent.seed ^= 0x9E3779B9U;
+        const float second = invisible_places::water::EvaluateRockRainImpactValue(
+            secondEvent,
+            point,
+            {0.0F, 0.0F, 1.0F},
+            1.80F,
+            settings);
+        minimumEdge = std::min(minimumEdge, first);
+        maximumEdge = std::max(maximumEdge, first);
+        seedDifference = std::max(seedDifference, std::abs(first - second));
+
+        const Float3 outside{
+            std::cos(angle) * radius * 1.001F,
+            std::sin(angle) * radius * 1.001F,
+            0.0F,
+        };
+        CHECK(invisible_places::water::EvaluateRockRainImpactValue(
+                  event,
+                  outside,
+                  {0.0F, 0.0F, 1.0F},
+                  1.80F,
+                  settings) == Catch::Approx(0.0F).margin(1.0e-6F));
+    }
+    CHECK(maximumEdge > 0.10F);
+    CHECK(minimumEdge < maximumEdge * 0.35F);
+    CHECK(seedDifference > 0.10F);
+}
+
 TEST_CASE("rock rain impact favours lower points and settles downhill", "[water][rain][effects]") {
     constexpr float radius = 0.12F;
     constexpr float lifetime = 5.0F;
     const float effectiveRadius = radius * std::sqrt(2.0F / 3.0F);
+    auto smoothRock = invisible_places::water::RainRockImpactSettings{};
+    smoothRock.edgeBreakup = 0.0F;
+    smoothRock.centreFalloff = 0.0F;
     const std::vector<invisible_places::water::RainImpactEvent> verticalEvents{
         {.position = {0.0F, 0.0F, 0.0F},
          .birthTimeSeconds = 0.0F,
@@ -1088,7 +1501,8 @@ TEST_CASE("rock rain impact favours lower points and settles downhill", "[water]
         verticalEvents,
         {},
         1.8F,
-        2.0F);
+        2.0F,
+        smoothRock);
     const auto highAtGrowth = invisible_places::water::EvaluateRainImpact(
         verticalGrid,
         WaterSurfaceRole::Rock,
@@ -1140,7 +1554,8 @@ TEST_CASE("rock rain impact favours lower points and settles downhill", "[water]
         slopedEvents,
         {},
         4.5F,
-        2.0F);
+        2.0F,
+        smoothRock);
     const float probeDistance = effectiveRadius * 1.05F;
     const Float3 downhillProbe{
         inverseSqrtTwo * probeDistance,
@@ -1180,16 +1595,18 @@ TEST_CASE("rock rain impact favours lower points and settles downhill", "[water]
         slopedEvents.front(),
         {inverseSqrtTwo * radius * 0.99F,
          0.0F,
-         -inverseSqrtTwo * radius * 0.99F},
+        -inverseSqrtTwo * radius * 0.99F},
         {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
-        4.50F);
+        4.50F,
+        smoothRock);
     const auto outsideBroadPhase = invisible_places::water::EvaluateRockRainImpactValue(
         slopedEvents.front(),
         {inverseSqrtTwo * radius * 1.001F,
          0.0F,
-         -inverseSqrtTwo * radius * 1.001F},
+        -inverseSqrtTwo * radius * 1.001F},
         {inverseSqrtTwo, 0.0F, inverseSqrtTwo},
-        4.50F);
+        4.50F,
+        smoothRock);
 
     CHECK(downhillAtGrowth.colourBlend < 0.04F);
     CHECK(downhillLate.colourBlend > downhillAtGrowth.colourBlend * 3.0F);
@@ -1199,7 +1616,7 @@ TEST_CASE("rock rain impact favours lower points and settles downhill", "[water]
     CHECK(outsideBroadPhase == Catch::Approx(0.0F).margin(1.0e-6F));
 }
 
-TEST_CASE("vegetation rain impacts form sparse wandering downward sparkles", "[water][rain][effects]") {
+TEST_CASE("vegetation rain impacts form visible crown hops and downward streams", "[water][rain][effects]") {
     constexpr float radius = 0.065F;
     const std::vector<invisible_places::water::RainImpactEvent> events{
         {.position = {0.0F, 0.0F, 1.0F},
@@ -1261,14 +1678,17 @@ TEST_CASE("vegetation rain impacts form sparse wandering downward sparkles", "[w
 
     const auto topEarly = scanPlane(0.96F, 0.10F);
     const auto lowerEarly = scanPlane(0.45F, 0.10F);
-    const auto lowerLater = scanPlane(0.45F, 0.60F);
+    const auto lowerLater = scanPlane(0.45F, 1.05F);
+    const auto lowerExpired = scanPlane(0.45F, 2.01F);
     CHECK(topEarly.active > 0U);
-    CHECK(topEarly.active < topEarly.candidates / 4U);
+    CHECK(topEarly.active < topEarly.candidates / 3U);
     CHECK(lowerEarly.active == 0U);
     CHECK(lowerLater.active > 3U);
     CHECK(std::count(lowerLater.activeSectors.begin(), lowerLater.activeSectors.end(), true) >= 2);
     CHECK(lowerLater.maximumOpacity < lowerLater.maximumEmission);
-    CHECK(lowerLater.maximumSize < 1.08F);
+    CHECK(lowerLater.maximumEmission > 0.20F);
+    CHECK(lowerLater.maximumSize > 1.08F);
+    CHECK(lowerExpired.active == 0U);
 }
 
 TEST_CASE("rain impact lifetimes produce a short sand ring and slow rock fade", "[water][rain][effects]") {
@@ -1302,18 +1722,18 @@ TEST_CASE("rain impact lifetimes produce a short sand ring and slow rock fade", 
     CHECK(rockEarly.colourBlend > rockLate.colourBlend);
 }
 
-TEST_CASE("Scene1 builds and reloads the exact five millimetre rain cache", "[.rain-data]") {
+TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cache", "[.rain-data]") {
     const auto sceneDirectory = std::filesystem::path{INVISIBLE_PLACES_DEFAULT_DATA_DIR} / "Scene1";
     const std::vector<invisible_places::water::WaterSurfaceSource> sources{
-        {.sourcePath = sceneDirectory / "Site1-ROCK-5mm.ply",
+        {.sourcePath = sceneDirectory / "Site1-ROCK-2mm.ply",
          .role = WaterSurfaceRole::Rock,
-         .spacingMicrometres = 5'000U},
-        {.sourcePath = sceneDirectory / "Site1-SAND-5mm.ply",
+         .spacingMicrometres = 2'000U},
+        {.sourcePath = sceneDirectory / "Site1-SAND-2mm.ply",
          .role = WaterSurfaceRole::Sand,
-         .spacingMicrometres = 5'000U},
-        {.sourcePath = sceneDirectory / "Site1-VEG-5mm.ply",
+         .spacingMicrometres = 2'000U},
+        {.sourcePath = sceneDirectory / "Site1-VEG-2mm.ply",
          .role = WaterSurfaceRole::Vegetation,
-         .spacingMicrometres = 5'000U},
+         .spacingMicrometres = 2'000U},
     };
     for (const auto& source : sources) {
         REQUIRE(std::filesystem::is_regular_file(source.sourcePath));
@@ -1324,10 +1744,11 @@ TEST_CASE("Scene1 builds and reloads the exact five millimetre rain cache", "[.r
     const auto first = invisible_places::water::BuildWaterSurfaceCache(sources, savedDirectory);
     REQUIRE(first.success);
     CHECK(first.cache.bounds.valid);
-    CHECK(first.cache.resolutionMeters == Catch::Approx(0.020F));
+    CHECK(first.cache.resolutionMeters == Catch::Approx(0.010F));
     CHECK_FALSE(first.cache.surfaceCells.empty());
     CHECK_FALSE(first.cache.vegetationVoxels.empty());
     CHECK(first.cache.sourcePointCount > 0U);
+    CHECK(first.cache.sourcePointCount == 39'409'886U);
     CHECK(first.cache.sources.size() == 3U);
 
     const auto gpu = invisible_places::water::BuildWaterSurfaceGpuData(first.cache);

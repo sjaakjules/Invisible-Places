@@ -19,8 +19,9 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 42U;
-inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 17U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 43U;
+inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 18U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 11U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -94,7 +95,7 @@ struct WaterPathCacheManifestDocument {
 struct WaterSurfaceCacheManifestDocument {
     std::filesystem::path relativePath;
     std::uint32_t cacheSchema = invisible_places::water::kWaterSurfaceCacheSchemaVersion;
-    std::string algorithmId = "water-surface-v3";
+    std::string algorithmId = std::string{invisible_places::water::kWaterSurfaceCacheAlgorithmId};
     std::string sourceFingerprint;
     std::uint64_t payloadBytes = 0U;
     std::array<std::uint64_t, 4> checksum{};
@@ -212,6 +213,7 @@ struct ProjectDocument {
     invisible_places::water::WaterBakeSettings waterBakeSettings{};
     invisible_places::water::WaterRenderSettings waterRenderSettings{};
     invisible_places::water::WaterFlowTrailSettings waterFlowTrailSettings{};
+    bool waterShowFlowTrails = true;
     invisible_places::water::WaterFieldSettings waterFieldSettings{};
     invisible_places::water::WaterFieldTrailSettings waterFieldTrailSettings{};
     invisible_places::water::WaterDynamicMeshFlowSettings waterDynamicMeshFlowSettings{};
@@ -259,6 +261,7 @@ struct WaterSourcesDocument {
     invisible_places::water::WaterBakeSettings bakeSettings{};
     invisible_places::water::WaterRenderSettings renderSettings{};
     invisible_places::water::WaterFlowTrailSettings flowTrailSettings{};
+    bool showFlowTrails = true;
     invisible_places::water::WaterTrailGeometrySettings trailGeometry{};
     invisible_places::water::WaterFieldSettings fieldSettings{};
     invisible_places::water::WaterFieldTrailSettings fieldTrailSettings{};

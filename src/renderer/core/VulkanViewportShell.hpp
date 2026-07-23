@@ -79,6 +79,9 @@ struct ViewportDiagnostics {
     std::uint32_t rainActiveParticleCount = 0U;
     std::uint32_t rainImpactOverflowCount = 0U;
     std::uint32_t rainEventsEmittedThisFrame = 0U;
+    std::uint32_t rainSandImpactsThisFrame = 0U;
+    std::uint32_t rainRockImpactsThisFrame = 0U;
+    std::uint32_t rainVegetationImpactsThisFrame = 0U;
     std::uint64_t rainCollisionCacheRevision = 0U;
     std::uint64_t rainCollisionUploadRevision = 0U;
     std::uint64_t waterSurfaceCacheRevision = 0U;
@@ -245,7 +248,7 @@ struct WaterSurfaceFlowGpuView {
     std::uint32_t tableMask = 0U;
     std::uint32_t maximumProbeCount = 0U;
     std::uint32_t occupiedCellCount = 0U;
-    float resolutionMeters = 0.020F;
+    float resolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
     std::uint64_t cacheRevision = 0U;
     std::uint64_t uploadRevision = 0U;
     const invisible_places::water::WaterSurfaceCacheIdentity* cacheIdentity = nullptr;
@@ -565,6 +568,7 @@ class VulkanViewportShell {
         std::uint32_t seepageOccupiedCellCount = 0;
         std::uint32_t seepageNodeReferenceCount = 0;
         std::uint32_t seepageHashProbeLimit = 1;
+        bool seepageUsesConnectedSupport = false;
         float seepageCellSizeMeters = 0.50F;
         invisible_places::io::Bounds3f seepageUnionBounds{};
         std::uint64_t seepageTopologyUploadRevision = 0;
@@ -748,7 +752,7 @@ class VulkanViewportShell {
         std::uint32_t flowMaximumProbeCount = 1U;
         std::uint32_t flowSurfaceCellCount = 0U;
         std::uint32_t flowSurfaceTableCapacity = 0U;
-        float resolutionMeters = 0.020F;
+        float resolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
         std::uint64_t cacheRevision = 0U;
         invisible_places::water::WaterSurfaceCacheIdentity cacheIdentity{};
         std::uint64_t uploadRevision = 0U;
@@ -793,7 +797,7 @@ class VulkanViewportShell {
         std::uint32_t flowMaximumProbeCount = 1U;
         std::uint32_t flowSurfaceCellCount = 0U;
         std::uint32_t flowSurfaceTableCapacity = 0U;
-        float surfaceResolutionMeters = 0.020F;
+        float surfaceResolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
         std::uint32_t resetEpoch = 1U;
         std::uint64_t collisionCacheRevision = 0U;
         invisible_places::water::WaterSurfaceCacheIdentity collisionCacheIdentity{};

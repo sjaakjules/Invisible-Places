@@ -7,18 +7,24 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace invisible_places::water {
 
-inline constexpr float kWaterSurfaceResolutionMeters = 0.020F;
+inline constexpr float kWaterSurfaceResolutionMeters = 0.010F;
+inline constexpr std::uint32_t kWaterSurfaceNormalSourceSpacingMicrometres = 2'000U;
+inline constexpr std::string_view kWaterSurfaceCacheAlgorithmId =
+    "water-surface-10mm-normal-average-v1";
 inline constexpr std::uint32_t kWaterSurfaceCacheSchemaVersion = 3U;
 inline constexpr std::uint32_t kWaterSurfaceCacheLegacySchemaVersion = 2U;
 inline constexpr std::uint64_t kWaterSurfaceCacheMaximumPersistenceBytes =
@@ -172,6 +178,125 @@ struct WaterSurfaceCachePayloadChecksum {
     bool operator==(const WaterSurfaceCachePayloadChecksum&) const = default;
 };
 
+// A chunk-boundary-independent checksum used while schema-3 GPU table bytes
+// move directly from the sidecar into the mapped staging allocation. Keeping
+// this tiny builder shared by the loader and renderer lets the renderer reject
+// a sidecar that changed after validation without retaining a second table
+// copy or performing another disk pass.
+class WaterSurfaceGpuStreamChecksumBuilder {
+public:
+    template <typename T>
+    void AddPod(const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        AddBytes(&value, sizeof(value));
+    }
+
+    void AddBytes(const void* data, std::size_t size) {
+        if (data == nullptr || size == 0U) {
+            return;
+        }
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        hashedByteCount_ += static_cast<std::uint64_t>(size);
+        if (tailSize_ != 0U) {
+            const auto copied = std::min(size, tail_.size() - tailSize_);
+            std::memcpy(tail_.data() + tailSize_, bytes, copied);
+            tailSize_ += copied;
+            bytes += copied;
+            size -= copied;
+            if (tailSize_ == tail_.size()) {
+                std::uint64_t word = 0U;
+                std::memcpy(&word, tail_.data(), sizeof(word));
+                MixWord(word);
+                tailSize_ = 0U;
+            }
+        }
+        while (size >= sizeof(std::uint64_t)) {
+            std::uint64_t word = 0U;
+            std::memcpy(&word, bytes, sizeof(word));
+            MixWord(word);
+            bytes += sizeof(word);
+            size -= sizeof(word);
+        }
+        if (size != 0U) {
+            std::memcpy(tail_.data(), bytes, size);
+            tailSize_ = size;
+        }
+    }
+
+    [[nodiscard]] WaterSurfaceCachePayloadChecksum Finish() const {
+        auto first = first_;
+        auto second = second_;
+        if (tailSize_ != 0U) {
+            std::uint64_t tailWord = 0U;
+            std::memcpy(&tailWord, tail_.data(), tailSize_);
+            tailWord ^= static_cast<std::uint64_t>(tailSize_) << 56U;
+            MixWordInto(&first, &second, tailWord, wordCount_);
+        }
+        const auto finalise = [this](std::uint64_t value, std::uint64_t salt) {
+            value ^= hashedByteCount_ + salt;
+            value ^= value >> 30U;
+            value *= 0xBF58476D1CE4E5B9ULL;
+            value ^= value >> 27U;
+            value *= 0x94D049BB133111EBULL;
+            return value ^ (value >> 31U);
+        };
+        return {
+            .words = {
+                finalise(first, 0x9E3779B97F4A7C15ULL),
+                finalise(second, 0xD6E8FEB86659FD93ULL),
+            },
+            .hashedByteCount = hashedByteCount_,
+        };
+    }
+
+private:
+    static void MixWordInto(
+        std::uint64_t* first,
+        std::uint64_t* second,
+        std::uint64_t word,
+        std::uint64_t wordIndex) {
+        const auto mixed = word + 0x9E3779B97F4A7C15ULL * (wordIndex + 1U);
+        *first = std::rotl(*first ^ mixed, 27) * 0x3C79AC492BA7B653ULL;
+        *second = std::rotl(*second + (mixed ^ (*first >> 17U)), 31) *
+                  0x1C69B3F74AC4AE35ULL;
+    }
+
+    void MixWord(std::uint64_t word) {
+        MixWordInto(&first_, &second_, word, wordCount_);
+        ++wordCount_;
+    }
+
+    std::uint64_t first_ = 0x243F6A8885A308D3ULL;
+    std::uint64_t second_ = 0x13198A2E03707344ULL;
+    std::uint64_t wordCount_ = 0U;
+    std::uint64_t hashedByteCount_ = 0U;
+    std::array<std::uint8_t, sizeof(std::uint64_t)> tail_{};
+    std::size_t tailSize_ = 0U;
+};
+
+// A schema-3 warm load keeps the queryable CPU aggregates resident but leaves
+// the already-built GPU tables in the validated sidecar. The renderer reads
+// these three contiguous sections directly through its reusable 64 MiB
+// staging allocation, avoiding another cache-sized CPU table allocation.
+struct WaterSurfacePersistedGpuTables {
+    std::filesystem::path filePath;
+    std::uint64_t fileSize = 0U;
+    std::int64_t modificationTicks = 0;
+    std::uint64_t surfaceOffset = 0U;
+    std::uint64_t vegetationOffset = 0U;
+    std::uint64_t flowSurfaceOffset = 0U;
+    std::uint64_t surfaceCount = 0U;
+    std::uint64_t vegetationCount = 0U;
+    std::uint64_t flowSurfaceCount = 0U;
+    WaterSurfaceCachePayloadChecksum streamChecksum;
+
+    [[nodiscard]] bool Valid() const {
+        return !filePath.empty() && fileSize > 0U && surfaceCount > 0U &&
+               vegetationCount > 0U && flowSurfaceCount > 0U &&
+               streamChecksum.Valid();
+    }
+};
+
 struct WaterSurfaceGpuData {
     std::vector<RainGpuSurfaceSlot> surfaceTable;
     std::vector<RainGpuVegetationSlot> vegetationTable;
@@ -184,6 +309,7 @@ struct WaterSurfaceGpuData {
     std::uint64_t sourceRevision = 0U;
     WaterSurfaceCacheIdentity sourceIdentity;
     WaterSurfaceCachePayloadChecksum payloadChecksum;
+    WaterSurfacePersistedGpuTables persistedTables;
 };
 
 struct WaterSurfaceCache {
@@ -228,7 +354,8 @@ struct WaterSurfaceQueryResult {
 
 [[nodiscard]] std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
     const scene::ScenePointCloudGroup& group,
-    std::uint32_t preferredSpacingMicrometres = 5'000U);
+    std::uint32_t preferredSpacingMicrometres =
+        kWaterSurfaceNormalSourceSpacingMicrometres);
 [[nodiscard]] std::string WaterSurfaceCacheSignature(
     std::span<const WaterSurfaceSource> sources,
     float resolutionMeters = kWaterSurfaceResolutionMeters);

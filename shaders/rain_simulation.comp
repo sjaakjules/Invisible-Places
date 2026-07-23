@@ -51,6 +51,7 @@ layout(set = 0, binding = 0, std140) uniform RainUniforms {
     vec4 impactGrid;
     uvec4 effectToggles;
     vec4 effectScales;
+    vec4 nearSurface;
     vec4 viewport;
 } rain;
 
@@ -66,6 +67,10 @@ layout(set = 0, binding = 3, std430) buffer RainCounters {
     uint eventWriteIndex;
     uint overflowCount;
     uint emittedThisFrame;
+    uint initializedGeneration;
+    uint sandImpactsThisFrame;
+    uint rockImpactsThisFrame;
+    uint vegetationImpactsThisFrame;
     uint reservedCounter;
 } counters;
 
@@ -126,6 +131,14 @@ vec3 DecodeNormal(uint packed) {
     return dot(normal, normal) > 1e-8 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
 }
 
+uint EncodeNormal(vec3 candidate) {
+    const vec3 normal = dot(candidate, candidate) > 1e-8
+        ? normalize(candidate)
+        : vec3(0.0, 0.0, 1.0);
+    const uvec3 encoded = uvec3(round(clamp(normal * 0.5 + 0.5, 0.0, 1.0) * 1023.0));
+    return encoded.x | (encoded.y << 10u) | (encoded.z << 20u);
+}
+
 bool FindSurface(ivec2 coordinate, out RainSurfaceSlot result) {
     const uint mask = rain.collision0.x;
     const uint initial = HashCell(ivec3(coordinate, 0)) & mask;
@@ -165,7 +178,13 @@ float WeatherFrontWave(vec3 position) {
     return 0.5 + 0.5 * sin(phase * 2.0 * kPi);
 }
 
-bool TraceCollision(vec3 start, vec3 end, out vec3 hitPosition, out vec3 hitNormal, out uint hitRole) {
+bool TraceCollision(
+    vec3 start,
+    vec3 end,
+    out vec3 hitPosition,
+    out vec3 hitNormal,
+    out uint hitRole,
+    out float hitTime) {
     const float resolution = max(0.001, rain.cacheBoundsMinResolution.w);
     const vec3 delta = end - start;
     ivec3 cell = ivec3(floor(start / resolution));
@@ -195,6 +214,7 @@ bool TraceCollision(vec3 start, vec3 end, out vec3 hitPosition, out vec3 hitNorm
             hitPosition = mix(start, end, entryTime);
             hitNormal = DecodeNormal(vegetation.packedNormal);
             hitRole = kRoleVegetation;
+            hitTime = entryTime;
             return true;
         }
 
@@ -231,6 +251,7 @@ bool TraceCollision(vec3 start, vec3 end, out vec3 hitPosition, out vec3 hitNorm
                 hitPosition.z = height;
                 hitNormal = DecodeNormal(packedNormal);
                 hitRole = role;
+                hitTime = bestTime;
                 return true;
             }
         }
@@ -271,7 +292,7 @@ void SpawnParticle(uint index, inout RainParticle particle) {
         rain.spawnCentreRadius.xyz + vec3(cos(angle) * radius, sin(angle) * radius, Random01(base + 3u) * 0.75),
         0.0);
     particle.previousActivity = vec4(particle.positionAge.xyz, 1.0);
-    particle.velocity = vec4(0.0);
+    particle.velocity = vec4(0.0, 0.0, 0.0, uintBitsToFloat(EncodeNormal(vec3(0.0, 0.0, 1.0))));
     const float frontProbability = mix(
         1.0,
         0.12 + WeatherFrontWave(particle.positionAge.xyz) * 0.88,
@@ -315,6 +336,13 @@ void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
     events[writeIndex].lifetimeEnergy = vec4(lifetime, energy, 0.0, 0.0);
     events[writeIndex].control = uvec4(role, particle.state.z, rain.simulation1.z, 0u);
     atomicAdd(counters.emittedThisFrame, 1u);
+    if (role == kRoleSand) {
+        atomicAdd(counters.sandImpactsThisFrame, 1u);
+    } else if (role == kRoleRock) {
+        atomicAdd(counters.rockImpactsThisFrame, 1u);
+    } else if (role == kRoleVegetation) {
+        atomicAdd(counters.vegetationImpactsThisFrame, 1u);
+    }
 }
 
 void AdvanceParticle(uint index) {
@@ -352,19 +380,53 @@ void AdvanceParticle(uint index) {
         cos(rain.cameraTime.w * 2.2 + Random01(particle.state.z + 19u) * 19.0)) * rain.weather0.w;
     vec2 windDirection = rain.weather0.xy;
     windDirection = dot(windDirection, windDirection) > 1e-8 ? normalize(windDirection) : vec2(1.0, 0.0);
-    particle.velocity = vec4(
+    particle.velocity.xyz = vec3(
         windDirection * rain.weather0.z * gust + turbulence,
-        -rain.weather2.w * max(0.35, front),
-        0.0);
+        -rain.weather2.w * max(0.35, front));
     particle.previousActivity.xyz = particle.positionAge.xyz;
     particle.previousActivity.w = clamp(front, 0.25, 1.5);
-    particle.positionAge.xyz += particle.velocity.xyz * clamp(rain.weather2.z, 0.0, 0.25);
-    particle.positionAge.w += clamp(rain.weather2.z, 0.0, 0.25);
+    const float deltaSeconds = clamp(rain.weather2.z, 0.0, 0.25);
+    const float particleSpeed = length(particle.velocity.xyz);
+    const float stepDistance = particleSpeed * deltaSeconds;
+    const float approachDistance = clamp(rain.nearSurface.x, 0.0, 1.0);
+    const vec3 travelDirection = particleSpeed > 1e-7
+        ? particle.velocity.xyz / particleSpeed
+        : vec3(0.0, 0.0, -1.0);
+    const float probeDistance = max(stepDistance, approachDistance);
+    const vec3 probeEnd = particle.previousActivity.xyz + travelDirection * probeDistance;
 
     vec3 hitPosition;
     vec3 hitNormal;
     uint hitRole;
-    if (TraceCollision(particle.previousActivity.xyz, particle.positionAge.xyz, hitPosition, hitNormal, hitRole)) {
+    float hitTime;
+    const bool futureHit = probeDistance > 1e-7 && TraceCollision(
+        particle.previousActivity.xyz,
+        probeEnd,
+        hitPosition,
+        hitNormal,
+        hitRole,
+        hitTime);
+    float speedFactor = 1.0;
+    float hitDistance = 3.402823466e38;
+    if (futureHit) {
+        hitDistance = clamp(hitTime, 0.0, 1.0) * probeDistance;
+        const float proximity = approachDistance > 1e-6
+            ? 1.0 - smoothstep(0.0, approachDistance, hitDistance)
+            : 0.0;
+        particle.positionAge.w = proximity;
+        particle.velocity.w = uintBitsToFloat(EncodeNormal(hitNormal));
+        speedFactor = mix(1.0, clamp(rain.nearSurface.y, 0.05, 1.0), proximity);
+    } else {
+        particle.positionAge.w = 0.0;
+        particle.velocity.w = uintBitsToFloat(EncodeNormal(vec3(0.0, 0.0, 1.0)));
+    }
+    const float travelledDistance = stepDistance * speedFactor;
+    particle.positionAge.xyz = particle.previousActivity.xyz + travelDirection * travelledDistance;
+
+    // One extended collision walk replaces the old actual-segment query. A
+    // future hit is retained visually until slowed travel reaches it.
+    if (futureHit && hitDistance <= travelledDistance + 1e-6) {
+        particle.positionAge.xyz = hitPosition;
         EmitImpact(hitPosition, hitNormal, hitRole, particle);
         SpawnParticle(index, particle);
         particles[index] = particle;
@@ -437,12 +499,16 @@ void main() {
             impactCounts[index] = uvec4(0u);
         }
         if (index == 0u) {
-            if (counters.reservedCounter != rain.simulation1.z) {
+            if (counters.initializedGeneration != rain.simulation1.z) {
                 counters.eventWriteIndex = 0u;
-                counters.reservedCounter = rain.simulation1.z;
+                counters.initializedGeneration = rain.simulation1.z;
             }
             counters.overflowCount = 0u;
             counters.emittedThisFrame = 0u;
+            counters.sandImpactsThisFrame = 0u;
+            counters.rockImpactsThisFrame = 0u;
+            counters.vegetationImpactsThisFrame = 0u;
+            counters.reservedCounter = 0u;
         }
     } else if (pushConstants.phase == 1u) {
         AdvanceParticle(index);

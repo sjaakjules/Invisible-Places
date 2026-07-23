@@ -121,8 +121,9 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
       invisible_places::serialization::WaterSurfaceCacheManifestDocument{
           .relativePath = ".invisible_places/cache/water/scene1.surfacecache",
           .cacheSchema = invisible_places::water::kWaterSurfaceCacheSchemaVersion,
-          .algorithmId = "water-surface-v3",
-          .sourceFingerprint = "scene1-5mm-static",
+          .algorithmId = std::string{
+              invisible_places::water::kWaterSurfaceCacheAlgorithmId},
+          .sourceFingerprint = "scene1-complete-2mm-static",
           .payloadBytes = 204ULL * 1024ULL * 1024ULL,
           .checksum = {1U, 2U, 3U, 4U},
           .requestedRebuildGeneration = 7U,
@@ -152,7 +153,7 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   CHECK(savedJson.at("scene_point_cloud_groups")
             .front()
             .at("water_surface_cache")
-            .at("source_fingerprint") == "scene1-5mm-static");
+            .at("source_fingerprint") == "scene1-complete-2mm-static");
   CHECK(savedJson.at("layers").front().at("selected_scene_variant_path") ==
         "Data/Scene1/Scene1-ROCK-2mm.ply");
 
@@ -166,7 +167,9 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
   CHECK_FALSE(group.displayVisible);
   REQUIRE(group.roleSources.size() == 3U);
   REQUIRE(group.waterSurfaceCache.has_value());
-  CHECK(group.waterSurfaceCache->algorithmId == "water-surface-v3");
+  CHECK(
+      group.waterSurfaceCache->algorithmId ==
+      invisible_places::water::kWaterSurfaceCacheAlgorithmId);
   CHECK(group.waterSurfaceCache->payloadBytes == 204ULL * 1024ULL * 1024ULL);
   CHECK(group.waterSurfaceCache->checksum ==
         std::array<std::uint64_t, 4>{1U, 2U, 3U, 4U});
@@ -181,7 +184,7 @@ TEST_CASE("Current project schema round-trips authoritative scene density groups
         legacyMirror.selectedSceneVariantPath);
 }
 
-TEST_CASE("Schema 42 externalizes clean Flow path caches and prunes orphaned data",
+TEST_CASE("Schema 43 externalizes clean Flow path caches and prunes orphaned data",
           "[project][serialization][water][path-cache][sidecar]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::ProjectDocument;
@@ -605,6 +608,7 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   spring.name = "Spring source";
   spring.maximumFlowStrength = 0.72F;
   spring.rainResponse = 0.45F;
+  spring.showTrail = false;
   WaterManualFlowPathSource waterfall;
   waterfall.id = 27U;
   waterfall.name = "Waterfall arc";
@@ -613,6 +617,7 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   waterfall.useSurfaceGuide = true;
   waterfall.maximumFlowStrength = 0.64F;
   waterfall.rainResponse = 0.80F;
+  waterfall.showTrail = true;
   waterfall.controlPoints = {
       {1.0F, 2.0F, 3.0F},
       {1.5F, 2.2F, 2.0F},
@@ -626,6 +631,7 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   creek.useSurfaceGuide = false;
   creek.maximumFlowStrength = 0.30F;
   creek.rainResponse = 0.15F;
+  creek.showTrail = false;
   creek.controlPoints = {
       {-2.0F, 0.0F, 0.2F},
       {-1.0F, 0.4F, 0.1F},
@@ -635,6 +641,7 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
 
   ProjectDocument project;
   project.projectName = "manual-paths-current";
+  project.waterShowFlowTrails = false;
   project.waterFlowTrailSettings.surfaceFollow = 0.71F;
   project.waterFlowTrailSettings.downhillPull = 0.29F;
   project.waterFlowTrailSettings.terrainWidthResponse = 0.58F;
@@ -663,6 +670,8 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
         Catch::Approx(spring.maximumFlowStrength));
   CHECK(loadedProject->waterEmitters[0].rainResponse ==
         Catch::Approx(spring.rainResponse));
+  CHECK_FALSE(loadedProject->waterShowFlowTrails);
+  CHECK_FALSE(loadedProject->waterEmitters[0].showTrail);
   const auto &loadedWaterfall = loadedProject->waterManualFlowPaths[0];
   CHECK(loadedWaterfall.id == waterfall.id);
   CHECK(loadedWaterfall.name == waterfall.name);
@@ -672,10 +681,12 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   CHECK(loadedWaterfall.maximumFlowStrength ==
         Catch::Approx(waterfall.maximumFlowStrength));
   CHECK(loadedWaterfall.rainResponse == Catch::Approx(waterfall.rainResponse));
+  CHECK(loadedWaterfall.showTrail);
   REQUIRE(loadedWaterfall.controlPoints.size() == waterfall.controlPoints.size());
   CHECK(loadedWaterfall.controlPoints[1].z == Catch::Approx(2.0F));
   CHECK(loadedProject->waterSceneStates[1].manualFlowPaths[0].id == creek.id);
   CHECK_FALSE(loadedProject->waterSceneStates[1].manualFlowPaths[0].useSurfaceGuide);
+  CHECK_FALSE(loadedProject->waterSceneStates[1].manualFlowPaths[0].showTrail);
   CHECK(loadedProject->waterFlowTrailSettings.surfaceFollow == Catch::Approx(0.71F));
   CHECK(loadedProject->waterFlowTrailSettings.downhillPull == Catch::Approx(0.29F));
   CHECK(loadedProject->waterFlowTrailSettings.terrainWidthResponse == Catch::Approx(0.58F));
@@ -694,6 +705,7 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
   CHECK(loadedDefaultProject->waterManualFlowPaths[0].id == waterfall.id);
 
   WaterSourcesDocument sources;
+  sources.showFlowTrails = false;
   sources.emitters = {spring};
   sources.manualFlowPaths = {waterfall, creek};
   sources.flowTrailSettings.surfaceFollow = 0.66F;
@@ -710,12 +722,16 @@ TEST_CASE("Manual Flow paths round-trip through project scenes and water-source 
         Catch::Approx(spring.maximumFlowStrength));
   CHECK(loadedSources->emitters[0].rainResponse ==
         Catch::Approx(spring.rainResponse));
+  CHECK_FALSE(loadedSources->showFlowTrails);
+  CHECK_FALSE(loadedSources->emitters[0].showTrail);
   REQUIRE(loadedSources->manualFlowPaths.size() == 2U);
   CHECK(loadedSources->manualFlowPaths[0].id == waterfall.id);
   CHECK(loadedSources->manualFlowPaths[0].controlPoints[2].z == Catch::Approx(0.5F));
   CHECK(loadedSources->manualFlowPaths[0].useSurfaceGuide);
+  CHECK(loadedSources->manualFlowPaths[0].showTrail);
   CHECK(loadedSources->manualFlowPaths[1].trailProfileName == creek.trailProfileName);
   CHECK_FALSE(loadedSources->manualFlowPaths[1].useSurfaceGuide);
+  CHECK_FALSE(loadedSources->manualFlowPaths[1].showTrail);
   CHECK(loadedSources->manualFlowPaths[1].maximumFlowStrength ==
         Catch::Approx(creek.maximumFlowStrength));
   CHECK(loadedSources->manualFlowPaths[1].rainResponse ==
@@ -743,7 +759,8 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   REQUIRE(fixtureJson.contains("fixture_metadata"));
   CHECK(fixtureJson.at("fixture_metadata").at("scene_group") == "SampleScene");
   CHECK(fixtureJson.at("fixture_metadata").at("display_spacing_micrometres") == 3'000U);
-  CHECK(fixtureJson.at("fixture_metadata").at("water_surface_cache_spacing_micrometres") == 5'000U);
+  CHECK(fixtureJson.at("fixture_metadata").at("water_surface_cache_spacing_micrometres") == 2'000U);
+  CHECK(fixtureJson.at("show_flow_trails").get<bool>());
   CHECK_FALSE(fixtureJson.at("fixture_metadata").at("derived_caches_included").get<bool>());
   CHECK_FALSE(fixtureJson.contains("water_path_cache"));
   CHECK_FALSE(fixtureJson.contains("water_path_cache_manifest"));
@@ -768,12 +785,14 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK(emitter.position.y == Catch::Approx(102.49331665039063F));
   CHECK(emitter.position.z == Catch::Approx(2.113636016845703F));
   CHECK(emitter.laneProfileName == "Nice Flow");
+  CHECK(emitter.showTrail);
 
   REQUIRE(fixture->manualFlowPaths.size() == 1U);
   const auto &manualPath = fixture->manualFlowPaths.front();
   CHECK(manualPath.id == 10U);
   CHECK(manualPath.name == "SampleFlowPath");
   CHECK(manualPath.useSurfaceGuide);
+  CHECK(manualPath.showTrail);
   REQUIRE(manualPath.controlPoints.size() == 11U);
   CHECK(manualPath.controlPoints.front().z == Catch::Approx(2.2442665100097656F));
   CHECK(manualPath.controlPoints.back().z == Catch::Approx(1.5622873306274414F));
@@ -785,6 +804,10 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK(seepage.position.x == Catch::Approx(307.64752197265625F));
   CHECK(seepage.position.y == Catch::Approx(102.98605346679688F));
   CHECK(seepage.position.z == Catch::Approx(2.3077430725097656F));
+  CHECK(seepage.widthMeters == Catch::Approx(0.75F));
+  CHECK(seepage.prominence == Catch::Approx(1.0F));
+  CHECK(seepage.selectionReachLimitMeters == Catch::Approx(2.34375F));
+  CHECK(seepage.selectionWidthLimitMeters == Catch::Approx(1.215F));
 
   const auto niceFlow = std::find_if(
       fixture->laneProfiles.begin(), fixture->laneProfiles.end(),
@@ -804,8 +827,22 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK(roundTripJson.at("water_emitters") == fixtureJson.at("water_emitters"));
   CHECK(roundTripJson.at("water_manual_flow_paths") ==
         fixtureJson.at("water_manual_flow_paths"));
-  CHECK(roundTripJson.at("water_seepage_nodes") ==
-        fixtureJson.at("water_seepage_nodes"));
+  REQUIRE(roundTripJson.at("water_seepage_nodes").size() == 1U);
+  const auto &roundTripSeepage = roundTripJson.at("water_seepage_nodes").front();
+  const auto &fixtureSeepage = fixtureJson.at("water_seepage_nodes").front();
+  CHECK(roundTripSeepage.at("id") == fixtureSeepage.at("id"));
+  CHECK(roundTripSeepage.at("name") == fixtureSeepage.at("name"));
+  CHECK(
+      roundTripSeepage.at("width_meters").get<float>() ==
+      Catch::Approx(fixtureSeepage.at("width_meters").get<float>()));
+  CHECK(
+      roundTripSeepage.at("selection_reach_limit_meters").get<float>() ==
+      Catch::Approx(
+          fixtureSeepage.at("selection_reach_limit_meters").get<float>()));
+  CHECK(
+      roundTripSeepage.at("selection_width_limit_meters").get<float>() ==
+      Catch::Approx(
+          fixtureSeepage.at("selection_width_limit_meters").get<float>()));
   CHECK(roundTripJson.at("water_path_profiles") ==
         fixtureJson.at("water_path_profiles"));
   CHECK(roundTripJson.at("water_lane_profiles") ==
@@ -824,7 +861,7 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK_FALSE(roundTrip->pathCache.has_value());
 }
 
-TEST_CASE("Generated SampleScene validation project round-trips schema 42 without derived caches",
+TEST_CASE("Generated SampleScene validation project round-trips schema 43 without derived caches",
           "[project][serialization][water][sample][validation]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
@@ -880,12 +917,15 @@ TEST_CASE("Generated SampleScene validation project round-trips schema 42 withou
   CHECK(vegetation->displaySourcePath.filename() == "Site1-VEG-3mm.Sample.ply");
 
   REQUIRE(validation->waterSceneStates.size() == 1U);
+  CHECK(validation->waterShowFlowTrails);
   const auto &water = validation->waterSceneStates.front();
   REQUIRE(water.emitters.size() == 1U);
   REQUIRE(water.manualFlowPaths.size() == 1U);
   REQUIRE(water.seepageNodes.size() == 1U);
   CHECK(water.emitters.front().name == "SampleFlowPoint");
+  CHECK(water.emitters.front().showTrail);
   CHECK(water.manualFlowPaths.front().name == "SampleFlowPath");
+  CHECK(water.manualFlowPaths.front().showTrail);
   CHECK(water.seepageNodes.front().name == "SampleSeepage");
   CHECK_FALSE(water.pathCache.has_value());
   CHECK_FALSE(water.pathCacheManifest.has_value());
@@ -905,8 +945,8 @@ TEST_CASE("Generated SampleScene validation project round-trips schema 42 withou
   CHECK_FALSE(roundTrip->waterSceneStates.front().pathCacheManifest.has_value());
 }
 
-TEST_CASE("Older project and water-source schemas default Flow activity fields",
-          "[project][serialization][water][flow-activity][migration]") {
+TEST_CASE("Older project and water-source schemas default Flow activity and visibility",
+          "[project][serialization][water][flow-activity][flow-visibility][migration]") {
   TemporaryProjectFile projectFile{"invisible_places_flow_activity_legacy_v39.json"};
   {
     std::ofstream output{projectFile.path};
@@ -932,10 +972,13 @@ TEST_CASE("Older project and water-source schemas default Flow activity fields",
   REQUIRE(project->waterEmitters.size() == 1U);
   CHECK(project->waterEmitters[0].maximumFlowStrength == Catch::Approx(1.0F));
   CHECK(project->waterEmitters[0].rainResponse == Catch::Approx(0.0F));
+  CHECK(project->waterShowFlowTrails);
+  CHECK(project->waterEmitters[0].showTrail);
   REQUIRE(project->waterManualFlowPaths.size() == 1U);
   CHECK(project->waterManualFlowPaths[0].maximumFlowStrength == Catch::Approx(1.0F));
   CHECK(project->waterManualFlowPaths[0].rainResponse == Catch::Approx(0.0F));
   CHECK_FALSE(project->waterManualFlowPaths[0].useSurfaceGuide);
+  CHECK(project->waterManualFlowPaths[0].showTrail);
   CHECK(project->waterSceneStates.empty());
 
   TemporaryProjectFile sourcesFile{"invisible_places_flow_activity_legacy_v15.json"};
@@ -961,10 +1004,13 @@ TEST_CASE("Older project and water-source schemas default Flow activity fields",
   REQUIRE(sources->emitters.size() == 1U);
   CHECK(sources->emitters[0].maximumFlowStrength == Catch::Approx(1.0F));
   CHECK(sources->emitters[0].rainResponse == Catch::Approx(0.0F));
+  CHECK(sources->showFlowTrails);
+  CHECK(sources->emitters[0].showTrail);
   REQUIRE(sources->manualFlowPaths.size() == 1U);
   CHECK(sources->manualFlowPaths[0].maximumFlowStrength == Catch::Approx(1.0F));
   CHECK(sources->manualFlowPaths[0].rainResponse == Catch::Approx(0.0F));
   CHECK_FALSE(sources->manualFlowPaths[0].useSurfaceGuide);
+  CHECK(sources->manualFlowPaths[0].showTrail);
 }
 
 TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy defaults",
@@ -1011,14 +1057,16 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
   animation.selectedWaterScenarioId = definition.id;
   animation.waterScenarioTracks = {track};
 
-  TemporaryProjectFile currentFile{"invisible_places_flow_activity_animation_v10.json"};
+  TemporaryProjectFile currentFile{"invisible_places_flow_activity_animation_v11.json"};
   std::string errorMessage;
   REQUIRE(SaveAnimationPath(animation, currentFile.path, &errorMessage));
   {
     std::ifstream input{currentFile.path};
     REQUIRE(input.is_open());
     const auto savedJson = nlohmann::json::parse(input);
-    CHECK(savedJson.at("schema_version") == 10U);
+    CHECK(
+        savedJson.at("schema_version") ==
+        invisible_places::serialization::kAnimationDocumentSchemaVersion);
     CHECK(savedJson.at("water_scenario_tracks")[0]
               .at("fallback_scenario")
               .at("state")

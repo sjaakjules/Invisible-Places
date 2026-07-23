@@ -1,9 +1,9 @@
 {
-  "schema_version": 17,
+  "schema_version": 18,
   "fixture_metadata": {
     "scene_group": "SampleScene",
     "display_spacing_micrometres": 3000,
-    "water_surface_cache_spacing_micrometres": 5000,
+    "water_surface_cache_spacing_micrometres": 2000,
     "derived_caches_included": false,
     "canonical_object_names": [
       "SampleFlowPoint",
@@ -86,6 +86,7 @@
     "turbulence": 0.3499999940395355,
     "turbulence_scale_meters": 0.18000000715255737
   },
+  "show_flow_trails": true,
   "water_trail_geometry": {
     "point_spacing_meters": 0.003000000026077032,
     "streak_length_meters": 0.02199999988079071,
@@ -1634,7 +1635,7 @@
     "turbulence": 0.44999998807907104,
     "vegetation_effect_scale": 3.0,
     "vegetation_effects_enabled": true,
-    "version": 2,
+    "version": 3,
     "visual_profile": {
       "colour": [
         0.6800000071525574,
@@ -1655,7 +1656,27 @@
     "weather_front_strength": 0.4000000059604645,
     "wind_direction_x": 1.0,
     "wind_direction_y": 0.0,
-    "wind_speed_meters_per_second": 0.30000001192092896
+    "wind_speed_meters_per_second": 0.30000001192092896,
+    "near_surface": {
+      "approach_distance_meters": 0.18,
+      "minimum_speed_factor": 0.3,
+      "squish": 0.65,
+      "normal_alignment": 0.75
+    },
+    "rock_impact": {
+      "edge_breakup": 0.35,
+      "spread_speed": 1.6,
+      "centre_falloff": 0.65,
+      "height_bias": 0.75,
+      "persistence": 1.35
+    },
+    "vegetation_impact": {
+      "twinkle": 1.8,
+      "propagation_meters_per_second": 0.65,
+      "hop_spacing_meters": 0.07,
+      "stream_width_meters": 0.01,
+      "stream_spread": 0.65
+    }
   },
   "water_emitters": [
     {
@@ -1680,7 +1701,8 @@
       "status": "accepted",
       "strength": 1.0,
       "trail_profile": "Global",
-      "trail_profile_locked": false
+      "trail_profile_locked": false,
+      "show_trail": true
     }
   ],
   "water_manual_flow_paths": [
@@ -1750,7 +1772,8 @@
       "rain_response": 0.0,
       "trail_profile": "Global",
       "trail_profile_locked": false,
-      "use_surface_guide": true
+      "use_surface_guide": true,
+      "show_trail": true
     }
   ],
   "water_seepage_nodes": [
@@ -1764,7 +1787,6 @@
       "edge_feather_meters": 0.10000000149011612,
       "enabled_in_export": true,
       "enabled_in_viewport": true,
-      "end_width_meters": 0.75,
       "id": 1,
       "look_profile_name": "Default",
       "name": "SampleSeepage",
@@ -1776,7 +1798,6 @@
       ],
       "reach_meters": 1.25,
       "seed": 2654435761,
-      "start_width_meters": 0.11999999731779099,
       "strength": 1.0,
       "surface_normal": [
         -0.9592431783676147,
@@ -1786,7 +1807,11 @@
       "target_scene_roles": [
         "ROCK",
         "VEG"
-      ]
+      ],
+      "width_meters": 0.75,
+      "prominence": 1.0,
+      "selection_reach_limit_meters": 2.34375,
+      "selection_width_limit_meters": 1.215
     }
   ],
   "water_seepage_default_look": {

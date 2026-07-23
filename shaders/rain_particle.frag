@@ -5,6 +5,7 @@ layout(location = 1) in vec4 inColourOpacity;
 layout(location = 2) in float inEmission;
 layout(location = 3) in float inViewDepth;
 layout(location = 4) in float inSoftness;
+layout(location = 5) in float inEllipseBlend;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
@@ -13,10 +14,20 @@ layout(location = 2) out vec4 outEmission;
 void main() {
     const float lateral = abs(inUv.x);
     const float featherStart = mix(0.90, 0.05, clamp(inSoftness, 0.0, 1.0));
-    const float softness = 1.0 - smoothstep(featherStart, 1.0, lateral);
+    const float lateralSoftness = 1.0 - smoothstep(featherStart, 1.0, lateral);
     const float headFade = smoothstep(0.0, 0.08, inUv.y);
     const float tailFade = 1.0 - smoothstep(0.72, 1.0, inUv.y);
-    const float alpha = clamp(inColourOpacity.a * softness * headFade * tailFade, 0.0, 0.995);
+    const float streakCoverage = lateralSoftness * headFade * tailFade;
+    const vec2 ellipseUv = vec2(inUv.x, inUv.y * 2.0 - 1.0);
+    const float ellipseCoverage = 1.0 - smoothstep(
+        featherStart,
+        1.0,
+        length(ellipseUv));
+    const float coverage = mix(
+        streakCoverage,
+        ellipseCoverage,
+        clamp(inEllipseBlend, 0.0, 1.0));
+    const float alpha = clamp(inColourOpacity.a * coverage, 0.0, 0.995);
     if (alpha <= 1e-5) {
         discard;
     }

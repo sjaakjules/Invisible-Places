@@ -101,6 +101,14 @@ float Dot(const io::Float3& left, const io::Float3& right) {
     return (left.x * right.x) + (left.y * right.y) + (left.z * right.z);
 }
 
+io::Float3 Cross(const io::Float3& left, const io::Float3& right) {
+    return {
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    };
+}
+
 float Length(const io::Float3& value) {
     return std::sqrt(std::max(0.0F, Dot(value, value)));
 }
@@ -111,6 +119,21 @@ io::Float3 Normalize(const io::Float3& value, const io::Float3& fallback = {0.0F
         return fallback;
     }
     return Scale(value, 1.0F / length);
+}
+
+io::Float3 CanonicalHemisphereNormal(const io::Float3& value) {
+    const auto normal = Normalize(value);
+    constexpr float orientationEpsilon = 1.0e-6F;
+    // Point-cloud normals describe an unoriented surface plane. Prefer the
+    // upward hemisphere for terrain; exactly vertical planes use Y then X as
+    // deterministic tie-breakers. This keeps consistently upward slopes
+    // continuous while making arbitrary per-point flips order-independent.
+    const float orientation = std::abs(normal.z) > orientationEpsilon
+                                  ? normal.z
+                                  : (std::abs(normal.y) > orientationEpsilon
+                                         ? normal.y
+                                         : normal.x);
+    return orientation < 0.0F ? Scale(normal, -1.0F) : normal;
 }
 
 io::Float3 Lerp(const io::Float3& left, const io::Float3& right, float amount) {
@@ -187,8 +210,8 @@ struct VegetationAccumulator {
 
 struct FlowSurfaceAccumulator {
     io::Float3 positionSum{};
-    io::Float3 normalReference{0.0F, 0.0F, 1.0F};
     io::Float3 normalSum{};
+    float maximumHeight = -std::numeric_limits<float>::infinity();
     double roughnessSum = 0.0;
     std::uint32_t count = 0U;
     std::uint32_t roughnessCount = 0U;
@@ -204,7 +227,7 @@ public:
         }
         bounds_.Expand(sample.position);
         ++pointCount_;
-        const auto normal = Normalize(sample.normal);
+        const auto normal = CanonicalHemisphereNormal(sample.normal);
         if (sample.role == WaterSurfaceRole::Vegetation) {
             auto& target = vegetation_[PositionCell3(sample.position, resolution_)];
             target.normalSum = Add(target.normalSum, normal);
@@ -216,34 +239,14 @@ public:
             .cell = PositionCell3(sample.position, resolution_),
             .role = sample.role,
         }];
-        auto flowNormal = normal;
-        if (flowTarget.count == 0U) {
-            flowTarget.normalReference = flowNormal;
-        } else if (Dot(flowNormal, flowTarget.normalReference) < 0.0F) {
-            flowNormal = Scale(flowNormal, -1.0F);
-        }
         flowTarget.positionSum = Add(flowTarget.positionSum, sample.position);
-        flowTarget.normalSum = Add(flowTarget.normalSum, flowNormal);
+        flowTarget.normalSum = Add(flowTarget.normalSum, normal);
+        flowTarget.maximumHeight = std::max(flowTarget.maximumHeight, sample.position.z);
         if (sample.hasRoughness && std::isfinite(sample.roughness)) {
             flowTarget.roughnessSum += std::max(0.0F, sample.roughness);
             ++flowTarget.roughnessCount;
         }
         ++flowTarget.count;
-
-        auto& cell = surfaces_[PositionCell2(sample.position, resolution_)];
-        auto& target = sample.role == WaterSurfaceRole::Sand ? cell.sand : cell.rock;
-        if (sample.position.z > target.height + resolution_) {
-            target.height = sample.position.z;
-            target.normalSum = normal;
-            target.count = 1U;
-        } else if (sample.position.z > target.height) {
-            target.height = sample.position.z;
-            target.normalSum = Add(target.normalSum, normal);
-            ++target.count;
-        } else if ((target.height - sample.position.z) <= resolution_) {
-            target.normalSum = Add(target.normalSum, normal);
-            ++target.count;
-        }
     }
 
     WaterSurfaceCache Finish() {
@@ -252,20 +255,45 @@ public:
         cache.resolutionMeters = resolution_;
         cache.bounds = bounds_;
         cache.sourcePointCount = pointCount_;
-        cache.surfaceCells.reserve(surfaces_.size());
-        for (const auto& [key, accumulator] : surfaces_) {
-            RainSurfaceCell cell;
-            cell.cellX = key.x;
-            cell.cellY = key.y;
-            cell.rockHeight = accumulator.rock.height;
-            cell.sandHeight = accumulator.sand.height;
-            cell.rockNormal = Normalize(accumulator.rock.normalSum);
-            cell.sandNormal = Normalize(accumulator.sand.normalSum);
-            cell.rockSampleCount = accumulator.rock.count;
-            cell.sandSampleCount = accumulator.sand.count;
-            cell.rockConfidence = std::clamp(static_cast<float>(accumulator.rock.count) / 8.0F, 0.0F, 1.0F);
-            cell.sandConfidence = std::clamp(static_cast<float>(accumulator.sand.count) / 8.0F, 0.0F, 1.0F);
-            cache.surfaceCells.push_back(cell);
+        // Rain consumes one top sheet per XY cell and terrain role. Derive it
+        // from the highest occupied 3D surfel so its normal is the same
+        // deterministic 10 mm average used by Flow/Seepage, independent of PLY
+        // point order. This also avoids a second hash lookup for every source
+        // point during the one-time cold build.
+        {
+            std::unordered_map<Cell2, SurfaceAccumulator, Cell2Hash> surfaces;
+            surfaces.reserve(flowSurfaces_.size());
+            for (const auto& [key, accumulator] : flowSurfaces_) {
+                auto& cell = surfaces[{key.cell.x, key.cell.y}];
+                auto& target = key.role == WaterSurfaceRole::Sand ? cell.sand : cell.rock;
+                if (accumulator.maximumHeight > target.height) {
+                    target.height = accumulator.maximumHeight;
+                    target.normalSum = accumulator.normalSum;
+                    target.count = accumulator.count;
+                }
+            }
+
+            cache.surfaceCells.reserve(surfaces.size());
+            for (const auto& [key, accumulator] : surfaces) {
+                RainSurfaceCell cell;
+                cell.cellX = key.x;
+                cell.cellY = key.y;
+                cell.rockHeight = accumulator.rock.height;
+                cell.sandHeight = accumulator.sand.height;
+                cell.rockNormal = Normalize(accumulator.rock.normalSum);
+                cell.sandNormal = Normalize(accumulator.sand.normalSum);
+                cell.rockSampleCount = accumulator.rock.count;
+                cell.sandSampleCount = accumulator.sand.count;
+                cell.rockConfidence = std::clamp(
+                    static_cast<float>(accumulator.rock.count) / 8.0F,
+                    0.0F,
+                    1.0F);
+                cell.sandConfidence = std::clamp(
+                    static_cast<float>(accumulator.sand.count) / 8.0F,
+                    0.0F,
+                    1.0F);
+                cache.surfaceCells.push_back(cell);
+            }
         }
         std::sort(cache.surfaceCells.begin(), cache.surfaceCells.end(), [](const auto& left, const auto& right) {
             return std::tie(left.cellX, left.cellY) < std::tie(right.cellX, right.cellY);
@@ -307,7 +335,7 @@ public:
                 .cellZ = key.cell.z,
                 .role = key.role,
                 .centroid = Scale(accumulator.positionSum, inverseCount),
-                .normal = Normalize(accumulator.normalSum, accumulator.normalReference),
+                .normal = Normalize(accumulator.normalSum),
                 .confidence = std::clamp(static_cast<float>(accumulator.count) / 8.0F, 0.0F, 1.0F),
                 .normalCoherence = coherence,
                 .roughness = roughness,
@@ -327,7 +355,6 @@ public:
 
 private:
     float resolution_ = kWaterSurfaceResolutionMeters;
-    std::unordered_map<Cell2, SurfaceAccumulator, Cell2Hash> surfaces_;
     std::unordered_map<Cell3, VegetationAccumulator, Cell3Hash> vegetation_;
     std::unordered_map<FlowCellKey, FlowSurfaceAccumulator, FlowCellKeyHash> flowSurfaces_;
     io::Bounds3f bounds_;
@@ -826,23 +853,38 @@ io::Float3 RainImpactRandomDirection2D(std::uint32_t seed) {
 float EvaluateVegetationSprinkle(
     const RainImpactEvent& event,
     const io::Float3& point,
-    float age) {
+    const io::Float3& pointNormal,
+    float age,
+    const RainVegetationImpactSettings& settings) {
     if (point.z > event.position.z + 0.01F) {
         return 0.0F;
     }
 
-    constexpr std::uint32_t kStreamCount = 3U;
-    constexpr float kDownwardSpeedMetersPerSecond = 1.35F;
-    constexpr float kWanderBandMeters = 0.09F;
+    constexpr std::uint32_t kStreamCount = 4U;
     constexpr float kSparkleCellMeters = 0.005F;
+    const float downwardSpeed = std::clamp(
+        settings.propagationMetersPerSecond,
+        0.05F,
+        6.0F);
+    const float hopSpacing = std::clamp(settings.hopSpacingMeters, 0.010F, 0.30F);
+    const float streamSpread = std::clamp(settings.streamSpread, 0.0F, 2.0F);
+    const float twinkle = std::clamp(settings.twinkle, 0.0F, 4.0F);
+    const float authoredWidth = std::clamp(
+        settings.streamWidthMeters,
+        0.0010F,
+        std::max(0.0010F, event.radiusMeters * 0.20F));
+    // Account for crown widening and the smooth feather when clamping every
+    // hop centre. No visible VEG support can leave the event broad phase.
+    const float maximumPathOffset = std::max(
+        0.0F,
+        event.radiusMeters - authoredWidth * 4.10F);
     const float verticalDistance = std::max(0.0F, event.position.z - point.z);
-    const float maximumDepth = std::max(0.18F, event.lifetimeSeconds * kDownwardSpeedMetersPerSecond);
+    const float maximumDepth = std::max(0.18F, event.lifetimeSeconds * downwardSpeed);
     if (verticalDistance > maximumDepth) {
         return 0.0F;
     }
 
-    const float depthFraction = std::clamp(verticalDistance / maximumDepth, 0.0F, 1.0F);
-    const float bandCoordinate = verticalDistance / kWanderBandMeters;
+    const float bandCoordinate = verticalDistance / hopSpacing;
     const auto bandIndex = static_cast<std::uint32_t>(std::floor(bandCoordinate));
     const float bandMix = SmoothStep(0.0F, 1.0F, bandCoordinate - std::floor(bandCoordinate));
     const auto pointHash = HashCell(
@@ -850,43 +892,90 @@ float EvaluateVegetationSprinkle(
         CellCoordinate(point.y, kSparkleCellMeters),
         CellCoordinate(point.z, kSparkleCellMeters));
 
-    // Assign each point to one of three paths so dense vegetation pays for one path evaluation per event.
+    // Assign each point to one path. More visible crown branches therefore do
+    // not add another per-point path loop.
     const auto streamIndex = HashBits(event.seed ^ pointHash ^ 0x27D4EB2DU) % kStreamCount;
     const auto streamSeed = event.seed ^ HashBits(0x9E3779B9U * (streamIndex + 1U));
-    const auto branchDirection = RainImpactRandomDirection2D(streamSeed);
-    const float spread = event.radiusMeters * (0.08F + 0.52F * depthFraction) *
-                         (0.65F + 0.35F * Random01(streamSeed + 5U));
 
-    const auto wanderA = RainImpactRandomDirection2D(
-        streamSeed ^ HashBits(bandIndex + 0xA511E9B3U));
-    const auto wanderB = RainImpactRandomDirection2D(
-        streamSeed ^ HashBits(bandIndex + 1U + 0xA511E9B3U));
-    const auto wanderDirection = Lerp(wanderA, wanderB, bandMix);
-    const float wanderScale = event.radiusMeters * 0.12F *
-                              SmoothStep(0.0F, 0.18F, verticalDistance);
-    const float pathX = event.position.x + branchDirection.x * spread + wanderDirection.x * wanderScale;
-    const float pathY = event.position.y + branchDirection.y * spread + wanderDirection.y * wanderScale;
-    const float pathDistance = std::hypot(point.x - pathX, point.y - pathY);
-    const float streamWidth = std::max(
-        0.0022F,
-        event.radiusMeters * (0.08F + 0.015F * Random01(streamSeed + 7U)));
+    const auto eventNormal = Normalize(event.normal);
+    const auto basisReference = std::abs(eventNormal.z) < 0.90F
+        ? io::Float3{0.0F, 0.0F, 1.0F}
+        : io::Float3{1.0F, 0.0F, 0.0F};
+    const auto tangentX = Normalize(Cross(basisReference, eventNormal), {1.0F, 0.0F, 0.0F});
+    const auto tangentY = Normalize(Cross(eventNormal, tangentX), {0.0F, 1.0F, 0.0F});
+    const auto branchDirection = RainImpactRandomDirection2D(streamSeed);
+    const auto anchorOffset = [&](std::uint32_t index) {
+        const float anchorDepth = static_cast<float>(index) * hopSpacing;
+        const float anchorDepthFraction = std::clamp(anchorDepth / maximumDepth, 0.0F, 1.0F);
+        const float branchScale = event.radiusMeters * streamSpread *
+                                  (0.06F + 0.76F * anchorDepthFraction) *
+                                  (0.65F + 0.35F * Random01(streamSeed + 5U));
+        const auto wander = RainImpactRandomDirection2D(
+            streamSeed ^ HashBits(index + 0xA511E9B3U));
+        const float wanderScale = event.radiusMeters * 0.16F *
+                                  SmoothStep(0.0F, hopSpacing * 2.0F, anchorDepth);
+        io::Float3 result{
+            branchDirection.x * branchScale + wander.x * wanderScale,
+            branchDirection.y * branchScale + wander.y * wanderScale,
+            0.0F,
+        };
+        const float offsetLength = std::hypot(result.x, result.y);
+        if (offsetLength > maximumPathOffset && offsetLength > 1.0e-7F) {
+            result.x *= maximumPathOffset / offsetLength;
+            result.y *= maximumPathOffset / offsetLength;
+        }
+        return result;
+    };
+    const auto anchorA = anchorOffset(bandIndex);
+    const auto anchorB = anchorOffset(bandIndex + 1U);
+    auto pathOffset = Lerp(anchorA, anchorB, bandMix);
+    const float hopSide = (streamIndex & 1U) == 0U ? 1.0F : -1.0F;
+    const float hopArc = std::sin(kPi * std::clamp(bandCoordinate - std::floor(bandCoordinate), 0.0F, 1.0F)) *
+                         event.radiusMeters * 0.055F * hopSide;
+    pathOffset.x += -branchDirection.y * hopArc;
+    pathOffset.y += branchDirection.x * hopArc;
+    const float pathOffsetLength = std::hypot(pathOffset.x, pathOffset.y);
+    if (pathOffsetLength > maximumPathOffset && pathOffsetLength > 1.0e-7F) {
+        pathOffset.x *= maximumPathOffset / pathOffsetLength;
+        pathOffset.y *= maximumPathOffset / pathOffsetLength;
+    }
+    const auto pathCentre = Add(
+        Add(
+            {event.position.x, event.position.y, event.position.z - verticalDistance},
+            Scale(tangentX, pathOffset.x)),
+        Scale(tangentY, pathOffset.y));
+    const auto pointOffset = Subtract(point, pathCentre);
+    const auto tangentPointOffset = Subtract(
+        pointOffset,
+        Scale(eventNormal, Dot(pointOffset, eventNormal)));
+    const float pathDistance = Length(tangentPointOffset);
+    const float crownWidth = std::lerp(
+        1.75F,
+        1.0F,
+        SmoothStep(0.0F, hopSpacing * 2.0F, verticalDistance));
+    const float streamWidth = authoredWidth * crownWidth *
+                              (0.85F + 0.30F * Random01(streamSeed + 7U));
     const float path = 1.0F - SmoothStep(streamWidth, streamWidth * 2.0F, pathDistance);
     if (path <= 0.0F) {
         return 0.0F;
     }
 
     const auto sparkleSeed = event.seed ^ pointHash ^ HashBits(0x85EBCA6BU * (streamIndex + 1U));
-    const float selectedPoint = SmoothStep(0.62F, 0.94F, Random01(sparkleSeed));
+    const float selectedPoint = SmoothStep(0.52F, 0.92F, Random01(sparkleSeed));
     if (selectedPoint <= 0.0F) {
         return 0.0F;
     }
-    const float timeJitter = (Random01(sparkleSeed + 0xC2B2AE35U) - 0.5F) * 0.12F;
-    const float streamDelay = streamIndex * 0.035F + Random01(streamSeed + 19U) * 0.04F;
-    const float localAge = age - verticalDistance / kDownwardSpeedMetersPerSecond -
+    const float timeJitter = (Random01(sparkleSeed + 0xC2B2AE35U) - 0.5F) * 0.10F;
+    const float streamDelay = streamIndex * 0.026F + Random01(streamSeed + 19U) * 0.035F;
+    const float localAge = age - verticalDistance / downwardSpeed -
                            streamDelay - timeJitter;
-    const float pulse = SmoothStep(0.0F, 0.035F, localAge) *
-                        (1.0F - SmoothStep(0.085F, 0.24F, localAge));
-    return path * selectedPoint * pulse;
+    const float pulse = SmoothStep(0.0F, 0.030F, localAge) *
+                        (1.0F - SmoothStep(0.12F, 0.31F, localAge));
+    const float delayedGlint = SmoothStep(0.15F, 0.20F, localAge) *
+                               (1.0F - SmoothStep(0.28F, 0.47F, localAge)) * 0.62F;
+    const auto normalizedPointNormal = Normalize(pointNormal);
+    const float leafFacing = 0.72F + 0.28F * std::abs(Dot(normalizedPointNormal, eventNormal));
+    return path * selectedPoint * std::max(pulse, delayedGlint) * twinkle * leafFacing;
 }
 
 float RainFrontWave(const RainRuntimeSettings& settings, const io::Float3& position, float timeSeconds) {
@@ -910,6 +999,12 @@ std::string WaterSurfaceCacheSignatureForSchema(
     std::uint32_t schemaVersion) {
     std::uint64_t hash = 1469598103934665603ULL;
     HashBytes(&hash, &schemaVersion, sizeof(schemaVersion));
+    if (schemaVersion > kWaterSurfaceCacheLegacySchemaVersion) {
+        // Cache schema describes the persisted ABI; the algorithm id describes
+        // aggregation semantics. Hash both so an algorithm-only revision never
+        // reuses a structurally compatible but semantically stale sidecar.
+        HashString(&hash, kWaterSurfaceCacheAlgorithmId);
+    }
     HashBytes(&hash, &resolutionMeters, sizeof(resolutionMeters));
     std::filesystem::path commonSourceParent;
     if (schemaVersion > kWaterSurfaceCacheLegacySchemaVersion && !sources.empty()) {
@@ -1065,6 +1160,33 @@ RainRuntimeSettings DefaultRainRuntimeSettings() {
     return {};
 }
 
+RainParticleVisualShape EvaluateRainParticleVisualShape(
+    float authoredWidthMeters,
+    float authoredLengthMeters,
+    float surfaceProximity,
+    const RainNearSurfaceSettings& settings) {
+    const float proximity = std::clamp(surfaceProximity, 0.0F, 1.0F);
+    const float squishAmount =
+        std::clamp(settings.squish, 0.0F, 1.0F) * proximity;
+    const float approachSpeed = std::lerp(
+        1.0F,
+        std::clamp(settings.minimumSpeedFactor, 0.05F, 1.0F),
+        proximity);
+    // Motion blur contracts with the slowed drop. Squaring the remaining
+    // unsquished span lets the default 0.65 setting become a readable oval at
+    // the surface while retaining the authored streak away from it.
+    const float unsquishedSpan = std::max(0.05F, 1.0F - 0.85F * squishAmount);
+    RainParticleVisualShape shape;
+    shape.widthMeters =
+        std::max(0.0001F, authoredWidthMeters) * (1.0F + squishAmount);
+    shape.lengthMeters = std::max(
+        shape.widthMeters,
+        std::max(0.001F, authoredLengthMeters) * approachSpeed *
+            unsquishedSpan * unsquishedSpan);
+    shape.ellipseBlend = SmoothStep(0.0F, 1.0F, squishAmount);
+    return shape;
+}
+
 RainIntensityMultipliers RainIntensityValues(RainIntensityPreset preset) {
     switch (preset) {
         case RainIntensityPreset::LightMist:
@@ -1135,25 +1257,43 @@ std::vector<WaterSurfaceSource> SelectWaterSurfaceSources(
     const scene::ScenePointCloudGroup& group,
     std::uint32_t preferredSpacingMicrometres) {
     std::vector<WaterSurfaceSource> selected;
+    const auto exactBundle = group.FindCompleteDisplayBundle(preferredSpacingMicrometres);
+    const auto nearestBundle = std::min_element(
+        group.completeDisplayBundles.begin(),
+        group.completeDisplayBundles.end(),
+        [preferredSpacingMicrometres](const auto& left, const auto& right) {
+            const auto spacingDistance = [preferredSpacingMicrometres](std::uint32_t spacing) {
+                return spacing > preferredSpacingMicrometres
+                           ? spacing - preferredSpacingMicrometres
+                           : preferredSpacingMicrometres - spacing;
+            };
+            const auto leftDistance = spacingDistance(left.spacingMicrometres);
+            const auto rightDistance = spacingDistance(right.spacingMicrometres);
+            if (leftDistance != rightDistance) {
+                return leftDistance < rightDistance;
+            }
+            // Prefer the coarser complete bundle on an exact tie to bound the
+            // one-time fallback scan without ever mixing role spacings.
+            return left.spacingMicrometres > right.spacingMicrometres;
+        });
+    const auto* bundle = exactBundle != nullptr
+                             ? exactBundle
+                             : (nearestBundle == group.completeDisplayBundles.end()
+                                    ? nullptr
+                                    : &*nearestBundle);
+    if (bundle == nullptr) {
+        return selected;
+    }
+    const bool isFallback = bundle->spacingMicrometres != preferredSpacingMicrometres;
     selected.reserve(scene::kScenePointCloudRoleCount);
     for (std::size_t roleIndex = 0; roleIndex < scene::kScenePointCloudRoleCount; ++roleIndex) {
         const auto role = static_cast<scene::ScenePointCloudRole>(roleIndex);
-        const auto& variants = group.Variants(role);
-        if (variants.empty()) {
-            continue;
-        }
-        const auto exact = std::find_if(variants.begin(), variants.end(), [&](const auto& variant) {
-            return variant.spacingMicrometres == preferredSpacingMicrometres;
-        });
-        const auto coarsest = std::max_element(variants.begin(), variants.end(), [](const auto& left, const auto& right) {
-            return left.spacingMicrometres < right.spacingMicrometres;
-        });
-        const auto& variant = exact != variants.end() ? *exact : *coarsest;
+        const auto& variant = bundle->Find(role);
         selected.push_back({
             .sourcePath = variant.sourcePath,
             .role = CollisionRoleForSceneRole(role),
             .spacingMicrometres = variant.spacingMicrometres,
-            .isFallback = exact == variants.end(),
+            .isFallback = isFallback,
         });
     }
     return selected;
@@ -1535,9 +1675,12 @@ bool LoadWaterSurfaceCache(
     }
     std::error_code fileError;
     const auto fileBytes = std::filesystem::file_size(filePath, fileError);
-    if (fileError || !WaterSurfaceCachePersistenceSizeAllowed(fileBytes)) {
+    std::error_code writeTimeError;
+    const auto fileWriteTime = std::filesystem::last_write_time(filePath, writeTimeError);
+    if (fileError || writeTimeError ||
+        !WaterSurfaceCachePersistenceSizeAllowed(fileBytes)) {
         if (errorMessage != nullptr) {
-            *errorMessage = fileError
+            *errorMessage = fileError || writeTimeError
                                 ? "Unable to inspect the water surface cache file."
                                 : "Water surface cache exceeds the 5 GiB persistence limit.";
         }
@@ -1701,31 +1844,106 @@ bool LoadWaterSurfaceCache(
         }
         return false;
     }
-    try {
-        loaded.gpuData.surfaceTable.resize(static_cast<std::size_t>(gpuSurfaceCount));
-        loaded.gpuData.vegetationTable.resize(static_cast<std::size_t>(gpuVegetationCount));
-        loaded.gpuData.flowSurfaceTable.resize(static_cast<std::size_t>(gpuFlowSurfaceCount));
-    } catch (const std::exception& error) {
-        if (errorMessage != nullptr) {
-            *errorMessage = error.what();
+    bool gpuPayloadRead = true;
+    if (currentSchema) {
+        std::vector<std::byte> scratch;
+        WaterSurfaceGpuStreamChecksumBuilder gpuStreamChecksumBuilder;
+        try {
+            scratch.resize(static_cast<std::size_t>(std::min<std::uint64_t>(
+                kWaterSurfacePayloadIoChunkBytes,
+                std::max<std::uint64_t>(1U, gpuPayloadBytes))));
+        } catch (const std::exception& error) {
+            if (errorMessage != nullptr) {
+                *errorMessage = error.what();
+            }
+            return false;
         }
-        return false;
+        loaded.gpuData.persistedTables.filePath = filePath;
+        loaded.gpuData.persistedTables.fileSize =
+            static_cast<std::uint64_t>(fileBytes);
+        loaded.gpuData.persistedTables.modificationTicks =
+            static_cast<std::int64_t>(fileWriteTime.time_since_epoch().count());
+        loaded.gpuData.persistedTables.surfaceCount = gpuSurfaceCount;
+        loaded.gpuData.persistedTables.vegetationCount = gpuVegetationCount;
+        loaded.gpuData.persistedTables.flowSurfaceCount = gpuFlowSurfaceCount;
+        const auto readPersistedSection = [&](std::uint64_t count,
+                                              std::uint64_t elementBytes,
+                                              std::uint64_t tag,
+                                              std::uint64_t* fileOffset) {
+            const auto position = input.tellg();
+            if (fileOffset == nullptr || position == std::ifstream::pos_type{-1}) {
+                return false;
+            }
+            *fileOffset = static_cast<std::uint64_t>(
+                static_cast<std::streamoff>(position));
+            payloadChecksumBuilder.AddPod(tag);
+            payloadChecksumBuilder.AddPod(count);
+            gpuStreamChecksumBuilder.AddPod(tag);
+            gpuStreamChecksumBuilder.AddPod(count);
+            std::uint64_t remaining = SaturatingMultiply(count, elementBytes);
+            while (remaining > 0U) {
+                const auto chunkBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    remaining,
+                    scratch.size()));
+                input.read(
+                    reinterpret_cast<char*>(scratch.data()),
+                    static_cast<std::streamsize>(chunkBytes));
+                if (!input.good()) {
+                    return false;
+                }
+                payloadChecksumBuilder.AddBytes(scratch.data(), chunkBytes);
+                gpuStreamChecksumBuilder.AddBytes(scratch.data(), chunkBytes);
+                remaining -= chunkBytes;
+            }
+            return true;
+        };
+        gpuPayloadRead =
+            readPersistedSection(
+                gpuSurfaceCount,
+                sizeof(RainGpuSurfaceSlot),
+                4U,
+                &loaded.gpuData.persistedTables.surfaceOffset) &&
+            readPersistedSection(
+                gpuVegetationCount,
+                sizeof(RainGpuVegetationSlot),
+                5U,
+                &loaded.gpuData.persistedTables.vegetationOffset) &&
+            readPersistedSection(
+                gpuFlowSurfaceCount,
+                sizeof(WaterGpuSurfaceSurfelSlot),
+                6U,
+                &loaded.gpuData.persistedTables.flowSurfaceOffset);
+        loaded.gpuData.persistedTables.streamChecksum =
+            gpuStreamChecksumBuilder.Finish();
+    } else {
+        try {
+            loaded.gpuData.surfaceTable.resize(static_cast<std::size_t>(gpuSurfaceCount));
+            loaded.gpuData.vegetationTable.resize(static_cast<std::size_t>(gpuVegetationCount));
+            loaded.gpuData.flowSurfaceTable.resize(static_cast<std::size_t>(gpuFlowSurfaceCount));
+        } catch (const std::exception& error) {
+            if (errorMessage != nullptr) {
+                *errorMessage = error.what();
+            }
+            return false;
+        }
+        gpuPayloadRead =
+            ReadWaterSurfacePayloadArray(
+                input,
+                &loaded.gpuData.surfaceTable,
+                4U,
+                &payloadChecksumBuilder) &&
+            ReadWaterSurfacePayloadArray(
+                input,
+                &loaded.gpuData.vegetationTable,
+                5U,
+                &payloadChecksumBuilder) &&
+            ReadWaterSurfacePayloadArray(
+                input,
+                &loaded.gpuData.flowSurfaceTable,
+                6U,
+                &payloadChecksumBuilder);
     }
-    if (!ReadWaterSurfacePayloadArray(
-            input,
-            &loaded.gpuData.surfaceTable,
-            4U,
-            &payloadChecksumBuilder) ||
-        !ReadWaterSurfacePayloadArray(
-            input,
-            &loaded.gpuData.vegetationTable,
-            5U,
-            &payloadChecksumBuilder) ||
-        !ReadWaterSurfacePayloadArray(
-            input,
-            &loaded.gpuData.flowSurfaceTable,
-            6U,
-            &payloadChecksumBuilder)) {
+    if (!gpuPayloadRead) {
         if (errorMessage != nullptr) {
             *errorMessage = "Water surface cache GPU table payload is truncated.";
         }
@@ -1795,6 +2013,25 @@ bool LoadWaterSurfaceCache(
     }
     loaded.cacheIdentity = derivedIdentity;
     loaded.gpuData.sourceIdentity = derivedIdentity;
+    if (currentSchema) {
+        // The renderer will reopen this path later and stream the tables
+        // directly. Capture a stable snapshot now so an atomic replacement or
+        // in-place edit between validation and upload cannot be mistaken for
+        // the payload that produced the identity above.
+        std::error_code finalSizeError;
+        const auto finalFileBytes = std::filesystem::file_size(filePath, finalSizeError);
+        std::error_code finalWriteTimeError;
+        const auto finalWriteTime =
+            std::filesystem::last_write_time(filePath, finalWriteTimeError);
+        if (finalSizeError || finalWriteTimeError || finalFileBytes != fileBytes ||
+            finalWriteTime != fileWriteTime) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "Water surface cache changed while it was being validated.";
+            }
+            return false;
+        }
+    }
     *cache = std::move(loaded);
     return true;
 }
@@ -2252,6 +2489,8 @@ void RainSimulator::SpawnParticle(std::uint32_t index, const RainSimulationFrame
     particle.randomState = base;
     particle.ageSeconds = 0.0F;
     particle.visibility = 1.0F;
+    particle.surfaceNormal = {0.0F, 0.0F, 1.0F};
+    particle.surfaceProximity = 0.0F;
     particle.active = Random01(base + 4U) <=
                       RainFrontSpawnProbability(frame.settings, particle.position, frame.timeSeconds);
 }
@@ -2375,13 +2614,49 @@ RainSimulationDiagnostics RainSimulator::Advance(
             -frame.settings.fallSpeedMetersPerSecond * multipliers.speed * std::max(0.35F, front),
         };
         particle.previousPosition = particle.position;
-        particle.position = Add(particle.position, Scale(particle.velocity, deltaSeconds));
+        const float particleSpeed = Length(particle.velocity);
+        const float stepDistance = particleSpeed * deltaSeconds;
+        const float approachDistance = std::clamp(
+            frame.settings.nearSurface.approachDistanceMeters,
+            0.0F,
+            1.0F);
+        const auto travelDirection = Normalize(particle.velocity, {0.0F, 0.0F, -1.0F});
+        const float probeDistance = std::max(stepDistance, approachDistance);
+        const auto probeEnd = Add(
+            particle.previousPosition,
+            Scale(travelDirection, probeDistance));
+        const auto hit = probeDistance > 1.0e-7F
+            ? TraceRainCollision(surfaceCache, particle.previousPosition, probeEnd)
+            : RainCollisionHit{};
+        float speedFactor = 1.0F;
+        float hitDistance = std::numeric_limits<float>::infinity();
+        if (hit.hit) {
+            hitDistance = std::clamp(hit.segmentTime, 0.0F, 1.0F) * probeDistance;
+            particle.surfaceNormal = Normalize(hit.normal);
+            particle.surfaceProximity = approachDistance > 1.0e-6F
+                ? 1.0F - SmoothStep(0.0F, approachDistance, hitDistance)
+                : 0.0F;
+            speedFactor = std::lerp(
+                1.0F,
+                std::clamp(frame.settings.nearSurface.minimumSpeedFactor, 0.05F, 1.0F),
+                particle.surfaceProximity);
+        } else {
+            particle.surfaceNormal = {0.0F, 0.0F, 1.0F};
+            particle.surfaceProximity = 0.0F;
+        }
+        const float travelledDistance = stepDistance * speedFactor;
+        particle.position = Add(
+            particle.previousPosition,
+            Scale(travelDirection, travelledDistance));
         particle.ageSeconds += deltaSeconds;
         particle.visibility = std::clamp(front, 0.25F, 1.5F);
         ++diagnostics.activeParticles;
 
-        const auto hit = TraceRainCollision(surfaceCache, particle.previousPosition, particle.position);
-        if (hit.hit) {
+        // The extended query replaces the old second, actual-step query. A
+        // future hit remains cached on the particle until slowed travel reaches
+        // it, preserving one bounded collision walk per particle and frame.
+        if (hit.hit && hitDistance <= travelledDistance + 1.0e-6F) {
+            particle.position = hit.position;
             ++diagnostics.collisionCount;
             if (frame.settings.impactEffectsEnabled) {
                 EmitImpact(hit, frame, particle, &diagnostics);
@@ -2413,7 +2688,9 @@ RainImpactGrid BuildRainImpactGrid(
     std::span<const RainImpactEvent> events,
     const io::Float3& cameraPosition,
     float timeSeconds,
-    float worldSpanMeters) {
+    float worldSpanMeters,
+    const RainRockImpactSettings& rockImpact,
+    const RainVegetationImpactSettings& vegetationImpact) {
     RainImpactGrid grid;
     grid.dimension = kRainImpactGridDimension;
     grid.cellSizeMeters = std::max(0.01F, worldSpanMeters / static_cast<float>(grid.dimension));
@@ -2424,6 +2701,8 @@ RainImpactGrid BuildRainImpactGrid(
     };
     grid.cells.resize(static_cast<std::size_t>(grid.dimension) * grid.dimension);
     grid.events.assign(events.begin(), events.end());
+    grid.rockImpact = rockImpact;
+    grid.vegetationImpact = vegetationImpact;
 
     for (std::uint32_t eventIndex = 0; eventIndex < grid.events.size(); ++eventIndex) {
         const auto& event = grid.events[eventIndex];
@@ -2477,7 +2756,8 @@ float EvaluateRockRainImpactValue(
     const RainImpactEvent& event,
     const io::Float3& point,
     const io::Float3& pointNormal,
-    float timeSeconds) {
+    float timeSeconds,
+    const RainRockImpactSettings& settings) {
     const float age = timeSeconds - event.birthTimeSeconds;
     if (event.role != WaterSurfaceRole::Rock || age < 0.0F ||
         age > event.lifetimeSeconds) {
@@ -2499,7 +2779,8 @@ float EvaluateRockRainImpactValue(
         0.001F,
         event.radiusMeters * std::sqrt(2.0F / 3.0F));
     const float growthSeconds =
-        2.0F * std::clamp(event.lifetimeSeconds * 0.18F, 0.55F, 0.95F);
+        std::clamp(event.lifetimeSeconds * 0.18F, 0.55F, 0.95F) *
+        (3.20F / std::clamp(settings.spreadSpeed, 0.10F, 6.0F));
     const float growth = SmoothStep(0.0F, growthSeconds, age);
 
     const io::Float3 gravity{0.0F, 0.0F, -1.0F};
@@ -2527,11 +2808,27 @@ float EvaluateRockRainImpactValue(
     const auto tangentOffset = Subtract(
         offset,
         Scale(eventNormal, Dot(offset, eventNormal)));
-    const float normalizedDistance =
+    const auto basisReference = std::abs(eventNormal.z) < 0.90F
+        ? io::Float3{0.0F, 0.0F, 1.0F}
+        : io::Float3{1.0F, 0.0F, 0.0F};
+    const auto tangentX = Normalize(Cross(basisReference, eventNormal), {1.0F, 0.0F, 0.0F});
+    const auto tangentY = Normalize(Cross(eventNormal, tangentX), {0.0F, 1.0F, 0.0F});
+    const float angle = std::atan2(Dot(tangentOffset, tangentY), Dot(tangentOffset, tangentX));
+    const float breakupPhase = Random01(event.seed ^ 0xD1B54A35U) * 2.0F * kPi;
+    const float breakupNoise = std::clamp(
+        0.5F + 0.31F * std::sin(angle * 5.0F + breakupPhase) +
+            0.19F * std::sin(angle * 9.0F - breakupPhase * 1.7F),
+        0.0F,
+        1.0F);
+    // Break the edge only inward. The original event radius therefore remains
+    // a conservative broad phase even at maximum configured breakup.
+    const float irregularRadiusScale = 1.0F -
+        0.35F * std::clamp(settings.edgeBreakup, 0.0F, 1.0F) * breakupNoise;
+    const float normalizedDistance = (
         std::sqrt(
             Dot(tangentOffset, tangentOffset) +
             normalDistance * normalDistance * 4.0F) /
-        effectiveRadius;
+        effectiveRadius) / std::max(0.65F, irregularRadiusScale);
     // Retain the original broad-phase cells: once downhill drift begins, the
     // late feather plus the 20% centre travel still fits inside eventRadius.
     const float edgeWidth = 0.02F + (1.0F - growth) * 0.14F;
@@ -2539,14 +2836,25 @@ float EvaluateRockRainImpactValue(
         -0.45F,
         0.45F,
         (event.position.z - point.z) / effectiveRadius);
-    const float heightGain = std::lerp(0.8F, 1.2F, lowerPointWeight);
-    const float fadeStart = std::lerp(0.4F, 0.7F, lowerPointWeight);
-    return (1.0F - SmoothStep(
-                       std::max(0.0F, growth - edgeWidth),
-                       growth + edgeWidth,
-                       normalizedDistance)) *
+    const float heightBias = std::clamp(settings.heightBias * (0.20F / 0.75F), 0.0F, 0.55F);
+    const float heightGain = std::lerp(1.0F - heightBias, 1.0F + heightBias, lowerPointWeight);
+    const float fadeDifference = std::clamp(heightBias * 0.75F, 0.0F, 0.30F);
+    const float fadeStart = std::clamp(
+        std::lerp(0.55F - fadeDifference, 0.55F + fadeDifference, lowerPointWeight) *
+            std::clamp(settings.persistence / 1.35F, 0.10F, 2.25F),
+        0.05F,
+        0.95F);
+    const float footprint = 1.0F - SmoothStep(
+        std::max(0.0F, growth - edgeWidth),
+        growth + edgeWidth,
+        normalizedDistance);
+    const float centreWeight = std::lerp(
+        1.0F,
+        std::sqrt(std::clamp(1.0F - normalizedDistance, 0.0F, 1.0F)),
+        std::clamp(settings.centreFalloff, 0.0F, 1.0F));
+    return footprint *
            (1.0F - SmoothStep(fadeStart, 1.0F, life)) *
-           heightGain;
+           heightGain * centreWeight;
 }
 
 RainImpactEffect EvaluateRainImpact(
@@ -2585,18 +2893,24 @@ RainImpactEffect EvaluateRainImpact(
                 event,
                 point,
                 normal,
-                timeSeconds);
+                timeSeconds,
+                grid.rockImpact);
         } else if (pointRole == WaterSurfaceRole::Vegetation) {
-            value = EvaluateVegetationSprinkle(event, point, age);
+            value = EvaluateVegetationSprinkle(
+                event,
+                point,
+                normal,
+                age,
+                grid.vegetationImpact);
         }
         value *= event.energy;
         const bool vegetation = pointRole == WaterSurfaceRole::Vegetation;
-        effect.opacity = std::max(effect.opacity, value * (vegetation ? 0.08F : 0.18F));
-        effect.emission = std::max(effect.emission, value * (pointRole == WaterSurfaceRole::Vegetation ? 0.24F : 0.11F));
-        effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * (vegetation ? 0.07F : 0.16F));
+        effect.opacity = std::max(effect.opacity, value * (vegetation ? 0.14F : 0.18F));
+        effect.emission = std::max(effect.emission, value * (pointRole == WaterSurfaceRole::Vegetation ? 0.48F : 0.11F));
+        effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * (vegetation ? 0.12F : 0.16F));
         effect.colourBlend = std::max(
             effect.colourBlend,
-            value * (pointRole == WaterSurfaceRole::Rock ? 0.42F : (vegetation ? 0.09F : 0.20F)));
+            value * (pointRole == WaterSurfaceRole::Rock ? 0.42F : (vegetation ? 0.18F : 0.20F)));
     };
 
     if (pointRole == WaterSurfaceRole::Sand) {

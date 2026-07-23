@@ -139,6 +139,10 @@ struct alignas(16) PointCloudStyleGpu {
     glm::uvec4 rainImpactControl{0U, 0U, 0U, 0U};
     // xy: grid origin, z: cell size, w: animation time.
     glm::vec4 rainImpactGrid{0.0F, 0.0F, 0.125F, 0.0F};
+    glm::vec4 rainImpactRock0{0.35F, 1.60F, 0.65F, 0.75F};
+    glm::vec4 rainImpactRock1{1.35F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 rainImpactVegetation0{1.80F, 0.65F, 0.070F, 0.010F};
+    glm::vec4 rainImpactVegetation1{0.65F, 0.0F, 0.0F, 0.0F};
 };
 
 struct alignas(16) RainUniformsGpu {
@@ -162,6 +166,7 @@ struct alignas(16) RainUniformsGpu {
     glm::vec4 impactGrid{0.0F, 0.0F, 0.125F, 32.0F};
     glm::uvec4 effectToggles{1U, 1U, 1U, 0U};
     glm::vec4 effectScales{1.0F, 1.0F, 1.0F, 0.0F};
+    glm::vec4 nearSurface{0.18F, 0.30F, 0.65F, 0.75F};
     glm::vec4 viewport{1.0F, 1.0F, 1.0F, 1.0F};
 };
 
@@ -181,6 +186,7 @@ struct alignas(16) RainImpactEventGpu {
 
 struct alignas(16) RainCountersGpu {
     glm::uvec4 values{0U};
+    glm::uvec4 roleValues{0U};
 };
 
 struct alignas(16) WaterSurfacePreprocessUniformsGpu {
@@ -194,6 +200,7 @@ struct alignas(16) WaterSurfacePreprocessUniformsGpu {
 
 static_assert(sizeof(RainParticleGpu) == 64U);
 static_assert(sizeof(RainImpactEventGpu) == 64U);
+static_assert(sizeof(RainCountersGpu) == 32U);
 static_assert(sizeof(invisible_places::water::RainGpuSurfaceSlot) == 32U);
 static_assert(sizeof(invisible_places::water::RainGpuVegetationSlot) == 16U);
 static_assert(sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot) == 32U);
@@ -278,6 +285,9 @@ struct alignas(16) WaterSeepageNodeParamsGpu {
     WaterSeepageLookGpu transitionLook{};
     // x: scenario/local spread, y: transition amount, z: wetting progress.
     glm::vec4 scenario{0.0F, 0.0F, 1.0F, 0.0F};
+    // x: live reach, y: live full width, z: live prominence,
+    // w: live source half-width. These values never rebuild topology.
+    glm::vec4 liveGeometry{1.25F, 0.75F, 1.0F, 0.06F};
     // Seed-derived basis is live so changing a node seed immediately changes
     // both noise orientation and procedural hashes.
     std::array<glm::vec4, 3> noiseBasis{};
@@ -285,7 +295,7 @@ struct alignas(16) WaterSeepageNodeParamsGpu {
 
 static_assert(sizeof(WaterSeepageLookGpu) == 176U);
 static_assert(sizeof(WaterSeepageNodeTopologyGpu) == 368U);
-static_assert(sizeof(WaterSeepageNodeParamsGpu) == 448U);
+static_assert(sizeof(WaterSeepageNodeParamsGpu) == 464U);
 
 WaterSeepageLookGpu MakeWaterSeepageLookGpu(
     const invisible_places::water::WaterSeepageLookSettings& look) {
@@ -639,12 +649,16 @@ WaterSeepageNodeTopologyGpu MakeWaterSeepageNodeTopologyGpu(
         0U,
         0U,
     };
-    gpu.positionReach = glm::vec4{safePosition, std::max(0.001F, finiteOr(node.reachMeters, 1.25F))};
+    gpu.positionReach = glm::vec4{
+        safePosition,
+        std::max(0.001F, finiteOr(node.selectionReachLimitMeters, 2.34375F))};
     gpu.normalSurface = glm::vec4{normal, std::max(0.001F, finiteOr(node.depthToleranceMeters, 0.15F))};
     gpu.downEdge = glm::vec4{down, std::max(0.001F, finiteOr(node.edgeFeatherMeters, 0.10F))};
     gpu.lateralStart = glm::vec4{lateral, std::max(0.001F, finiteOr(node.startHalfWidthMeters, 0.06F))};
     gpu.geometry = glm::vec4{
-        std::max(0.001F, finiteOr(node.endHalfWidthMeters, 0.375F)),
+        std::max(
+            0.001F,
+            finiteOr(node.selectionWidthLimitMeters, 1.215F) * 0.5F),
         0.0F,
         0.0F,
         0.0F,
@@ -732,6 +746,12 @@ WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
         finiteClamp(node.wettingProgress, 0.0F, 1.0F, 1.0F),
         0.0F,
     };
+    gpu.liveGeometry = glm::vec4{
+        finiteClamp(node.reachMeters, 0.0F, 1000.0F, 1.25F),
+        finiteClamp(node.widthMeters, 0.0F, 1000.0F, 0.75F),
+        finiteClamp(node.prominence, 0.0F, 8.0F, 1.0F),
+        finiteClamp(node.startHalfWidthMeters, 0.0F, 500.0F, 0.06F),
+    };
     for (std::size_t basisIndex = 0U; basisIndex < gpu.noiseBasis.size(); ++basisIndex) {
         glm::vec3 basis = node.noiseRotation[basisIndex];
         if (!std::isfinite(basis.x) || !std::isfinite(basis.y) || !std::isfinite(basis.z)) {
@@ -775,18 +795,35 @@ struct WaterSeepageGpuTopology {
     std::vector<WaterSeepageNodeTopologyGpu> nodes;
     std::vector<WaterSeepageNodeParamsGpu> params;
     std::vector<WaterSeepageHashCellGpu> hashCells;
-    std::vector<std::uint32_t> nodeReferences;
+    std::vector<invisible_places::water::WaterSeepageSupportReference> nodeReferences;
     std::uint32_t occupiedCellCount = 0U;
     std::uint32_t probeLimit = 1U;
+    bool usesConnectedSupport = false;
+    float cellSizeMeters = 0.50F;
+    invisible_places::io::Bounds3f unionBounds{};
 };
 
 WaterSeepageGpuTopology MakeWaterSeepageGpuTopology(
     const invisible_places::water::WaterSeepageSpatialGrid& grid) {
     WaterSeepageGpuTopology result;
+    const bool usesConnectedSupport = !grid.supportHashCells.empty() &&
+                                      !grid.supportReferences.empty();
+    const auto& sourceHashCells = usesConnectedSupport
+                                      ? grid.supportHashCells
+                                      : grid.hashCells;
     if (grid.nodes.size() > std::numeric_limits<std::uint32_t>::max() ||
-        grid.nodeReferences.size() > std::numeric_limits<std::uint32_t>::max()) {
+        (usesConnectedSupport ? grid.supportReferences.size()
+                              : grid.nodeReferences.size()) >
+            std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error{"Seepage GPU payload exceeds the current 32-bit limit."};
     }
+    result.usesConnectedSupport = usesConnectedSupport;
+    result.cellSizeMeters = usesConnectedSupport
+                                ? grid.supportCellSizeMeters
+                                : grid.cellSizeMeters;
+    result.unionBounds = usesConnectedSupport
+                             ? grid.supportUnionBounds
+                             : grid.unionBounds;
     result.nodes.reserve(grid.nodes.size());
     result.params.reserve(grid.nodes.size());
     for (const auto& node : grid.nodes) {
@@ -802,21 +839,33 @@ WaterSeepageGpuTopology MakeWaterSeepageGpuTopology(
         std::uint32_t referenceCount = 0U;
     };
     std::vector<OccupiedCell> occupiedCells;
-    occupiedCells.reserve(grid.hashCells.size());
-    result.nodeReferences.reserve(grid.nodeReferences.size());
-    for (const auto& cell : grid.hashCells) {
+    occupiedCells.reserve(sourceHashCells.size());
+    result.nodeReferences.reserve(
+        usesConnectedSupport ? grid.supportReferences.size()
+                             : grid.nodeReferences.size());
+    for (const auto& cell : sourceHashCells) {
         if (!cell.occupied || cell.referenceCount == 0U ||
-            cell.referenceOffset >= grid.nodeReferences.size()) {
+            cell.referenceOffset >= (usesConnectedSupport
+                                         ? grid.supportReferences.size()
+                                         : grid.nodeReferences.size())) {
             continue;
         }
         const std::size_t sourceEnd = std::min<std::size_t>(
-            grid.nodeReferences.size(),
+            usesConnectedSupport ? grid.supportReferences.size()
+                                 : grid.nodeReferences.size(),
             static_cast<std::size_t>(cell.referenceOffset) + static_cast<std::size_t>(cell.referenceCount));
         const auto targetOffset = static_cast<std::uint32_t>(result.nodeReferences.size());
         for (std::size_t referenceIndex = cell.referenceOffset; referenceIndex < sourceEnd; ++referenceIndex) {
-            const auto nodeIndex = grid.nodeReferences[referenceIndex];
+            const auto nodeIndex = usesConnectedSupport
+                                       ? grid.supportReferences[referenceIndex].nodeIndex
+                                       : grid.nodeReferences[referenceIndex];
             if (nodeIndex < result.nodes.size()) {
-                result.nodeReferences.push_back(nodeIndex);
+                if (usesConnectedSupport) {
+                    result.nodeReferences.push_back(
+                        grid.supportReferences[referenceIndex]);
+                } else {
+                    result.nodeReferences.push_back({.nodeIndex = nodeIndex});
+                }
             }
         }
         const auto targetCount = static_cast<std::uint32_t>(result.nodeReferences.size()) - targetOffset;
@@ -859,7 +908,7 @@ WaterSeepageGpuTopology MakeWaterSeepageGpuTopology(
         result.params.push_back(WaterSeepageNodeParamsGpu{});
     }
     if (result.nodeReferences.empty()) {
-        result.nodeReferences.push_back(0U);
+        result.nodeReferences.push_back({});
     }
     return result;
 }
@@ -2358,7 +2407,8 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
         resources.seepageHashCellBuffer =
             CreateHostVisibleBuffer(sizeof(emptySeepageHashCell), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources.seepageHashCellBuffer, &emptySeepageHashCell, sizeof(emptySeepageHashCell));
-        const std::uint32_t emptySeepageNodeReference = 0U;
+        const invisible_places::water::WaterSeepageSupportReference
+            emptySeepageNodeReference{};
         resources.seepageNodeReferenceBuffer =
             CreateHostVisibleBuffer(sizeof(emptySeepageNodeReference), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources.seepageNodeReferenceBuffer, &emptySeepageNodeReference,
@@ -2819,7 +2869,8 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
             resources->seepageHashCellBuffer,
             &emptySeepageHashCell,
             sizeof(emptySeepageHashCell));
-        const std::uint32_t emptySeepageNodeReference = 0U;
+        const invisible_places::water::WaterSeepageSupportReference
+            emptySeepageNodeReference{};
         resources->seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
             sizeof(emptySeepageNodeReference),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -3170,7 +3221,9 @@ WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
     uniforms.route0 = glm::vec4{
         result.layout.routeLengthMeters,
         std::max(0.001F, request.settings.trailPointSpacingMeters),
-        surfaceView.valid ? surfaceView.resolutionMeters : 0.020F,
+        surfaceView.valid
+            ? surfaceView.resolutionMeters
+            : invisible_places::water::kWaterSurfaceResolutionMeters,
         std::isfinite(request.settings.surfaceOffsetMeters)
             ? request.settings.surfaceOffsetMeters
             : 0.004F,
@@ -3790,10 +3843,18 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
                bounds.minimum.y <= bounds.maximum.y &&
                bounds.minimum.z <= bounds.maximum.z;
     };
+    const bool usesConnectedSupport = !grid.supportHashCells.empty() &&
+                                      !grid.supportReferences.empty();
+    const float selectedCellSize = usesConnectedSupport
+                                       ? grid.supportCellSizeMeters
+                                       : grid.cellSizeMeters;
+    const auto& selectedBounds = usesConnectedSupport
+                                     ? grid.supportUnionBounds
+                                     : grid.unionBounds;
     if (!grid.nodes.empty() &&
-        (!std::isfinite(grid.cellSizeMeters) || grid.cellSizeMeters <= 0.0F ||
-         !grid.unionBounds.valid || !finitePoint(grid.unionBounds.minimum) ||
-         !finitePoint(grid.unionBounds.maximum) || !orderedBounds(grid.unionBounds))) {
+        (!std::isfinite(selectedCellSize) || selectedCellSize <= 0.0F ||
+         !selectedBounds.valid || !finitePoint(selectedBounds.minimum) ||
+         !finitePoint(selectedBounds.maximum) || !orderedBounds(selectedBounds))) {
         // Keep the previously settled topology active instead of publishing a
         // malformed startup grid into every point-cloud descriptor.
         throw std::runtime_error{"Seepage topology contains invalid bounds or cell spacing."};
@@ -3863,7 +3924,8 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
             pending.hashCells.size);
         pending.nodeReferences = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(
-                payload.nodeReferences.size() * sizeof(std::uint32_t)),
+                payload.nodeReferences.size() *
+                sizeof(invisible_places::water::WaterSeepageSupportReference)),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(
             pending.nodeReferences,
@@ -3924,8 +3986,9 @@ void VulkanViewportShell::UploadWaterSeepageTopology(
             ? static_cast<std::uint32_t>(payload.nodeReferences.size())
             : 0U;
     resources->seepageHashProbeLimit = payload.probeLimit;
-    resources->seepageCellSizeMeters = std::max(0.001F, grid.cellSizeMeters);
-    resources->seepageUnionBounds = grid.unionBounds;
+    resources->seepageUsesConnectedSupport = payload.usesConnectedSupport;
+    resources->seepageCellSizeMeters = std::max(0.001F, payload.cellSizeMeters);
+    resources->seepageUnionBounds = payload.unionBounds;
     ++resources->seepageTopologyUploadRevision;
     ++resources->seepageParamsUploadRevision;
     ++sceneRevision_;
@@ -4490,34 +4553,68 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
 
     invisible_places::water::WaterSurfaceGpuData generatedGpuData;
     const invisible_places::water::WaterSurfaceGpuData* gpuData = &cache.gpuData;
+    const bool hasPersistedGpuTables = cache.gpuData.persistedTables.Valid();
     if (cache.gpuData.sourceRevision != cache.revision ||
         cache.gpuData.sourceIdentity != cacheIdentity ||
-        cache.gpuData.surfaceTable.empty() ||
-        cache.gpuData.vegetationTable.empty() ||
-        cache.gpuData.flowSurfaceTable.empty()) {
+        (!hasPersistedGpuTables &&
+         (cache.gpuData.surfaceTable.empty() ||
+          cache.gpuData.vegetationTable.empty() ||
+          cache.gpuData.flowSurfaceTable.empty()))) {
         generatedGpuData = invisible_places::water::BuildWaterSurfaceGpuData(cache);
         gpuData = &generatedGpuData;
     }
-    if (gpuData->surfaceTable.empty() || gpuData->vegetationTable.empty() ||
-        gpuData->flowSurfaceTable.empty()) {
+    const bool streamsPersistedTables = gpuData->persistedTables.Valid();
+    const auto surfaceTableCount = streamsPersistedTables
+                                       ? gpuData->persistedTables.surfaceCount
+                                       : static_cast<std::uint64_t>(gpuData->surfaceTable.size());
+    const auto vegetationTableCount = streamsPersistedTables
+                                          ? gpuData->persistedTables.vegetationCount
+                                          : static_cast<std::uint64_t>(gpuData->vegetationTable.size());
+    const auto flowSurfaceTableCount = streamsPersistedTables
+                                           ? gpuData->persistedTables.flowSurfaceCount
+                                           : static_cast<std::uint64_t>(gpuData->flowSurfaceTable.size());
+    if (surfaceTableCount == 0U || vegetationTableCount == 0U ||
+        flowSurfaceTableCount == 0U) {
         throw std::runtime_error{"Water surface cache did not produce GPU hash tables."};
     }
-    if (gpuData->surfaceTable.size() > std::numeric_limits<std::uint32_t>::max() ||
-        gpuData->vegetationTable.size() > std::numeric_limits<std::uint32_t>::max() ||
-        gpuData->flowSurfaceTable.size() > std::numeric_limits<std::uint32_t>::max() ||
+    if (surfaceTableCount > std::numeric_limits<std::uint32_t>::max() ||
+        vegetationTableCount > std::numeric_limits<std::uint32_t>::max() ||
+        flowSurfaceTableCount > std::numeric_limits<std::uint32_t>::max() ||
         cache.flowSurfaceSurfels.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error{"Water surface cache exceeds the 32-bit GPU table limit."};
     }
 
     const VkDeviceSize rainSurfaceBytes =
-        static_cast<VkDeviceSize>(gpuData->surfaceTable.size()) *
-        sizeof(gpuData->surfaceTable.front());
+        static_cast<VkDeviceSize>(surfaceTableCount) *
+        sizeof(invisible_places::water::RainGpuSurfaceSlot);
     const VkDeviceSize vegetationBytes =
-        static_cast<VkDeviceSize>(gpuData->vegetationTable.size()) *
-        sizeof(gpuData->vegetationTable.front());
+        static_cast<VkDeviceSize>(vegetationTableCount) *
+        sizeof(invisible_places::water::RainGpuVegetationSlot);
     const VkDeviceSize flowSurfaceBytes =
-        static_cast<VkDeviceSize>(gpuData->flowSurfaceTable.size()) *
-        sizeof(gpuData->flowSurfaceTable.front());
+        static_cast<VkDeviceSize>(flowSurfaceTableCount) *
+        sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot);
+    const auto persistedFileMatchesSnapshot = [&]() {
+        if (!streamsPersistedTables) {
+            return true;
+        }
+        std::error_code sizeError;
+        const auto fileSize = std::filesystem::file_size(
+            gpuData->persistedTables.filePath,
+            sizeError);
+        std::error_code writeTimeError;
+        const auto writeTime = std::filesystem::last_write_time(
+            gpuData->persistedTables.filePath,
+            writeTimeError);
+        return !sizeError && !writeTimeError &&
+               static_cast<std::uint64_t>(fileSize) ==
+                   gpuData->persistedTables.fileSize &&
+               static_cast<std::int64_t>(writeTime.time_since_epoch().count()) ==
+                   gpuData->persistedTables.modificationTicks;
+    };
+    if (!persistedFileMatchesSnapshot()) {
+        throw std::runtime_error{
+            "Validated water surface sidecar changed before GPU upload."};
+    }
 
     // A newer scene may arrive while the previous preprocessing dispatch is in
     // flight. Keep that job alive until its own fence signals instead of
@@ -4585,19 +4682,9 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
             "vkCreateFence(water surface chunk upload)");
 
         bool commandBufferSubmitted = false;
-        const auto uploadInChunks = [&](const void* sourceData,
-                                        VkDeviceSize sourceBytes,
-                                        const BufferAllocation& destination) {
-            const auto* source = static_cast<const std::byte*>(sourceData);
-            VkDeviceSize destinationOffset = 0U;
-            while (destinationOffset < sourceBytes) {
-                const auto chunkBytes = std::min(
-                    uploadStagingBuffer.size,
-                    sourceBytes - destinationOffset);
-                UploadBufferData(
-                    uploadStagingBuffer,
-                    source + static_cast<std::size_t>(destinationOffset),
-                    chunkBytes);
+        const auto submitStagedChunk = [&](VkDeviceSize chunkBytes,
+                                           VkDeviceSize destinationOffset,
+                                           const BufferAllocation& destination) {
                 if (commandBufferSubmitted) {
                     Check(
                         vkResetFences(device_, 1U, &uploadFence),
@@ -4640,21 +4727,116 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
                         VK_TRUE,
                         std::numeric_limits<std::uint64_t>::max()),
                     "vkWaitForFences(water surface chunk upload)");
+        };
+        const auto uploadInChunks = [&](const void* sourceData,
+                                        VkDeviceSize sourceBytes,
+                                        const BufferAllocation& destination) {
+            const auto* source = static_cast<const std::byte*>(sourceData);
+            VkDeviceSize destinationOffset = 0U;
+            while (destinationOffset < sourceBytes) {
+                const auto chunkBytes = std::min(
+                    uploadStagingBuffer.size,
+                    sourceBytes - destinationOffset);
+                UploadBufferData(
+                    uploadStagingBuffer,
+                    source + static_cast<std::size_t>(destinationOffset),
+                    chunkBytes);
+                submitStagedChunk(chunkBytes, destinationOffset, destination);
                 destinationOffset += chunkBytes;
             }
         };
-        uploadInChunks(
-            gpuData->surfaceTable.data(),
-            rainSurfaceBytes,
-            pending.surfaceTableBuffer);
-        uploadInChunks(
-            gpuData->vegetationTable.data(),
-            vegetationBytes,
-            pending.vegetationTableBuffer);
-        uploadInChunks(
-            gpuData->flowSurfaceTable.data(),
-            flowSurfaceBytes,
-            pending.flowSurfaceInputBuffer);
+        const auto uploadPersistedSection = [&](std::ifstream* source,
+                                                std::uint64_t fileOffset,
+                                                std::uint64_t sectionTag,
+                                                std::uint64_t elementCount,
+                                                VkDeviceSize sourceBytes,
+                                                const BufferAllocation& destination,
+                                                invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder*
+                                                    streamChecksum) {
+            if (source == nullptr || !source->is_open()) {
+                throw std::runtime_error{"Water surface sidecar stream is unavailable."};
+            }
+            if (streamChecksum == nullptr) {
+                throw std::runtime_error{"Water surface sidecar verifier is unavailable."};
+            }
+            source->clear();
+            source->seekg(static_cast<std::streamoff>(fileOffset), std::ios::beg);
+            if (!source->good()) {
+                throw std::runtime_error{"Water surface sidecar table offset is invalid."};
+            }
+            streamChecksum->AddPod(sectionTag);
+            streamChecksum->AddPod(elementCount);
+            VkDeviceSize destinationOffset = 0U;
+            while (destinationOffset < sourceBytes) {
+                const auto chunkBytes = std::min(
+                    uploadStagingBuffer.size,
+                    sourceBytes - destinationOffset);
+                source->read(
+                    static_cast<char*>(uploadStagingBuffer.mapped),
+                    static_cast<std::streamsize>(chunkBytes));
+                if (!source->good()) {
+                    throw std::runtime_error{"Water surface sidecar GPU table is truncated."};
+                }
+                streamChecksum->AddBytes(
+                    uploadStagingBuffer.mapped,
+                    static_cast<std::size_t>(chunkBytes));
+                submitStagedChunk(chunkBytes, destinationOffset, destination);
+                destinationOffset += chunkBytes;
+            }
+        };
+        if (streamsPersistedTables) {
+            invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder
+                streamChecksum;
+            std::ifstream persistedInput{
+                gpuData->persistedTables.filePath,
+                std::ios::binary};
+            if (!persistedInput.is_open()) {
+                throw std::runtime_error{"Validated Water surface sidecar could not be reopened for GPU upload."};
+            }
+            uploadPersistedSection(
+                &persistedInput,
+                gpuData->persistedTables.surfaceOffset,
+                4U,
+                surfaceTableCount,
+                rainSurfaceBytes,
+                pending.surfaceTableBuffer,
+                &streamChecksum);
+            uploadPersistedSection(
+                &persistedInput,
+                gpuData->persistedTables.vegetationOffset,
+                5U,
+                vegetationTableCount,
+                vegetationBytes,
+                pending.vegetationTableBuffer,
+                &streamChecksum);
+            uploadPersistedSection(
+                &persistedInput,
+                gpuData->persistedTables.flowSurfaceOffset,
+                6U,
+                flowSurfaceTableCount,
+                flowSurfaceBytes,
+                pending.flowSurfaceInputBuffer,
+                &streamChecksum);
+            if (streamChecksum.Finish() !=
+                    gpuData->persistedTables.streamChecksum ||
+                !persistedFileMatchesSnapshot()) {
+                throw std::runtime_error{
+                    "Water surface sidecar changed during GPU upload."};
+            }
+        } else {
+            uploadInChunks(
+                gpuData->surfaceTable.data(),
+                rainSurfaceBytes,
+                pending.surfaceTableBuffer);
+            uploadInChunks(
+                gpuData->vegetationTable.data(),
+                vegetationBytes,
+                pending.vegetationTableBuffer);
+            uploadInChunks(
+                gpuData->flowSurfaceTable.data(),
+                flowSurfaceBytes,
+                pending.flowSurfaceInputBuffer);
+        }
         cleanupUpload();
 
         pending.preprocessUniformBuffer = CreateHostVisibleBuffer(
@@ -4670,7 +4852,7 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
         pending.flowSurfaceCellCount =
             static_cast<std::uint32_t>(cache.flowSurfaceSurfels.size());
         pending.flowSurfaceTableCapacity =
-            static_cast<std::uint32_t>(gpuData->flowSurfaceTable.size());
+            static_cast<std::uint32_t>(flowSurfaceTableCount);
         pending.resolutionMeters = std::max(0.001F, cache.resolutionMeters);
         pending.cacheRevision = cache.revision;
         pending.cacheIdentity = cacheIdentity;
@@ -9461,7 +9643,7 @@ void VulkanViewportShell::CreateWaterFlowDummyPointResources(
         resources->seepageHashCellBuffer,
         &emptySeepageHashCell,
         sizeof(emptySeepageHashCell));
-    const std::uint32_t emptyReference = 0U;
+    const invisible_places::water::WaterSeepageSupportReference emptyReference{};
     resources->seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
         sizeof(emptyReference), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     UploadBufferData(
@@ -11886,7 +12068,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
             cellSize,
             1.0F / cellSize,
             static_cast<float>(std::max(1U, resources->seepageHashProbeLimit)),
-            0.0F,
+            resources->seepageUsesConnectedSupport ? 1.0F : 0.0F,
         };
         styleGpu.seepageBoundsMin = glm::vec4{
             resources->seepageUnionBounds.minimum.x,
@@ -11928,6 +12110,32 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         renderState_.cameraPosition.y - rainGridWorldSpan * 0.5F,
         rainGridWorldSpan / static_cast<float>(invisible_places::water::kRainImpactGridDimension),
         std::max(0.0F, renderState_.flowTimeSeconds),
+    };
+    const auto& rockImpact = renderState_.rainSettings.rockImpact;
+    styleGpu.rainImpactRock0 = glm::vec4{
+        std::clamp(rockImpact.edgeBreakup, 0.0F, 1.0F),
+        std::clamp(rockImpact.spreadSpeed, 0.10F, 6.0F),
+        std::clamp(rockImpact.centreFalloff, 0.0F, 1.0F),
+        std::clamp(rockImpact.heightBias, 0.0F, 2.0F),
+    };
+    styleGpu.rainImpactRock1 = glm::vec4{
+        std::clamp(rockImpact.persistence, 0.25F, 3.0F),
+        0.0F,
+        0.0F,
+        0.0F,
+    };
+    const auto& vegetationImpact = renderState_.rainSettings.vegetationImpact;
+    styleGpu.rainImpactVegetation0 = glm::vec4{
+        std::clamp(vegetationImpact.twinkle, 0.0F, 4.0F),
+        std::clamp(vegetationImpact.propagationMetersPerSecond, 0.05F, 6.0F),
+        std::clamp(vegetationImpact.hopSpacingMeters, 0.010F, 0.30F),
+        std::max(0.001F, vegetationImpact.streamWidthMeters),
+    };
+    styleGpu.rainImpactVegetation1 = glm::vec4{
+        std::clamp(vegetationImpact.streamSpread, 0.0F, 2.0F),
+        0.0F,
+        0.0F,
+        0.0F,
     };
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,
@@ -13036,6 +13244,9 @@ void VulkanViewportShell::UploadRainUniforms(
     if (!renderState_.rainSettings.impactEffectsEnabled) {
         diagnostics_.rainImpactOverflowCount = 0U;
         diagnostics_.rainEventsEmittedThisFrame = 0U;
+        diagnostics_.rainSandImpactsThisFrame = 0U;
+        diagnostics_.rainRockImpactsThisFrame = 0U;
+        diagnostics_.rainVegetationImpactsThisFrame = 0U;
     } else if (resources.counterReadbackBuffers[frameIndex].mapped != nullptr) {
         // DrawFrame has already waited this frame slot's fence. Read the
         // slot-owned transfer snapshot rather than racing the shared compute
@@ -13044,6 +13255,9 @@ void VulkanViewportShell::UploadRainUniforms(
             resources.counterReadbackBuffers[frameIndex].mapped);
         diagnostics_.rainImpactOverflowCount = counters->values.y;
         diagnostics_.rainEventsEmittedThisFrame = counters->values.z;
+        diagnostics_.rainSandImpactsThisFrame = counters->roleValues.x;
+        diagnostics_.rainRockImpactsThisFrame = counters->roleValues.y;
+        diagnostics_.rainVegetationImpactsThisFrame = counters->roleValues.z;
     }
     UploadRainUniformsToBuffer(resources.uniformBuffers[frameIndex], width, height);
 }
@@ -13082,7 +13296,9 @@ void VulkanViewportShell::UploadRainUniformsToBuffer(
             resources.collisionBounds.minimum.x,
             resources.collisionBounds.minimum.y,
             resources.collisionBounds.minimum.z,
-            invisible_places::water::kWaterSurfaceResolutionMeters,
+            std::max(
+                1.0e-6F,
+                resources.surfaceResolutionMeters),
         };
         uniforms.cacheBoundsMaxDeathDistance = glm::vec4{
             resources.collisionBounds.maximum.x,
@@ -13126,6 +13342,12 @@ void VulkanViewportShell::UploadRainUniformsToBuffer(
         std::max(visual.minimumScreenPixels, visual.maximumScreenPixels),
         std::max(0.05F, settings.dropletSizeScale),
         intensity.effectEnergy,
+    };
+    uniforms.nearSurface = glm::vec4{
+        std::clamp(settings.nearSurface.approachDistanceMeters, 0.0F, 1.0F),
+        std::clamp(settings.nearSurface.minimumSpeedFactor, 0.05F, 1.0F),
+        std::clamp(settings.nearSurface.squish, 0.0F, 1.0F),
+        std::clamp(settings.nearSurface.normalAlignment, 0.0F, 1.0F),
     };
     uniforms.simulation0 = glm::uvec4{
         activeParticleCount,

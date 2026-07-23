@@ -59,7 +59,8 @@ WaterSeepageSpatialGrid BuildGrid(
     const WaterSeepageLookSettings& defaultLook = {},
     std::span<const WaterSeepageSurfaceGuide> guides = {},
     const std::optional<invisible_places::water::WaterScenarioState>& scenario = std::nullopt,
-    std::span<const invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates = {}) {
+    std::span<const invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates = {},
+    std::span<const invisible_places::water::WaterSeepageSupportSelection> support = {}) {
     return invisible_places::water::BuildWaterSeepageSpatialGrid(
         nodes,
         std::span<const WaterSeepageLookProfile>{},
@@ -70,7 +71,8 @@ WaterSeepageSpatialGrid BuildGrid(
         effectiveInvocations,
         guides,
         scenario,
-        nodeStates);
+        nodeStates,
+        support);
 }
 
 bool IsPowerOfTwo(std::size_t value) {
@@ -115,6 +117,10 @@ TEST_CASE("Seepage defaults describe a subtle damp fan", "[water][seepage][defau
 
     const WaterSeepageNode node;
     CHECK(node.reachMeters == Approx(1.25F));
+    CHECK(node.widthMeters == Approx(0.75F));
+    CHECK(node.prominence == Approx(1.0F));
+    CHECK(node.selectionReachLimitMeters == Approx(2.34375F));
+    CHECK(node.selectionWidthLimitMeters == Approx(1.215F));
     CHECK(node.startWidthMeters == Approx(0.12F));
     CHECK(node.endWidthMeters == Approx(0.75F));
     CHECK(node.edgeFeatherMeters == Approx(0.10F));
@@ -206,6 +212,9 @@ TEST_CASE("Authored Seepage topology identity is role-local and excludes live pa
     liveParameterEdit.front().enabledInViewport = false;
     liveParameterEdit.front().enabledInExport = false;
     liveParameterEdit.front().strength = 0.0F;
+    liveParameterEdit.front().reachMeters = 0.25F;
+    liveParameterEdit.front().widthMeters = 0.30F;
+    liveParameterEdit.front().prominence = 2.0F;
     liveParameterEdit.front().normalAlignment = 0.95F;
     liveParameterEdit.front().seed += 1000U;
     liveParameterEdit.front().lookProfileName = "Alternate";
@@ -217,7 +226,7 @@ TEST_CASE("Authored Seepage topology identity is role-local and excludes live pa
           sandFingerprint);
 
     auto sandGeometryEdit = authored;
-    sandGeometryEdit.back().reachMeters += 0.25F;
+    sandGeometryEdit.back().selectionReachLimitMeters += 0.25F;
     CHECK(WaterSeepageAuthoredTopologyFingerprint(sandGeometryEdit, "ROCK") ==
           rockFingerprint);
     CHECK(WaterSeepageAuthoredTopologyFingerprint(sandGeometryEdit, "SAND") !=
@@ -1261,6 +1270,15 @@ TEST_CASE("Water Flow activity combines keyed level and Rain response determinis
     state.flowLevel = 2.0F;
     state.rainLevel = -1.0F;
     CHECK(EffectiveWaterFlowActivity(state, 2.0F, -1.0F) == Approx(1.0F));
+
+    CHECK(EffectiveWaterFlowActivity(state, 1.0F, 1.0F, false, true) == Approx(0.0F));
+    CHECK(EffectiveWaterFlowActivity(state, 1.0F, 1.0F, true, false) == Approx(0.0F));
+    CHECK(EffectiveWaterFlowActivity(state, 1.0F, 1.0F, true, true) == Approx(1.0F));
+
+    const invisible_places::water::WaterEmitter emitter;
+    const invisible_places::water::WaterManualFlowPathSource manual;
+    CHECK(emitter.showTrail);
+    CHECK(manual.showTrail);
 }
 
 TEST_CASE("Applying scenario keys changes only compact Seepage parameters", "[water][seepage][scenario][topology]") {
@@ -1536,4 +1554,323 @@ TEST_CASE("Seepage surface-cache guides follow a vertical ROCK sheet", "[water][
         CHECK(guides.front().samples[index].position.z <=
               guides.front().samples[index - 1U].position.z + 0.008F);
     }
+}
+
+TEST_CASE("Connected Seepage support is deterministic bounded and transactional",
+          "[water][seepage][surface-cache][connected]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::CommitWaterSeepageSupportSelection;
+    using invisible_places::water::WaterSeepageSupportBuildOptions;
+    using invisible_places::water::WaterSeepageSupportSelection;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    const auto addCell = [&](float x, float y, float z, WaterSurfaceRole role) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    x + static_cast<float>(sample) * 0.0001F,
+                    y + static_cast<float>(sample) * 0.0001F,
+                    z,
+                },
+                .normal = {0.0F, 1.0F, 0.0F},
+                .role = role,
+            });
+        }
+    };
+    for (std::uint32_t station = 0U; station < 7U; ++station) {
+        addCell(0.005F, 0.005F, -0.005F - station * 0.020F, WaterSurfaceRole::Rock);
+    }
+    // Within the authored envelope but separated by empty cache cells: it
+    // must not bridge into the connected selection.
+    addCell(0.085F, 0.005F, -0.045F, WaterSurfaceRole::Rock);
+    addCell(0.005F, 0.005F, 0.025F, WaterSurfaceRole::Rock);
+    for (std::uint32_t station = 0U; station < 4U; ++station) {
+        addCell(0.005F, 0.005F, -0.005F - station * 0.020F, WaterSurfaceRole::Sand);
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.020F);
+
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.selectionReachLimitMeters = 0.13F;
+    node.selectionWidthLimitMeters = 0.30F;
+    const auto first = BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(first.success);
+    REQUIRE_FALSE(first.selection.cells.empty());
+    CHECK(first.selection.cellSizeMeters == Catch::Approx(0.010F));
+    CHECK(first.selection.sourceRole == WaterSurfaceRole::Rock);
+    CHECK(first.selection.cells.size() <=
+          invisible_places::water::kWaterSeepageMaximumSupportCellsPerNode);
+    CHECK(std::none_of(
+        first.selection.cells.begin(),
+        first.selection.cells.end(),
+        [](const auto& cell) { return cell.x >= 8; }));
+
+    auto reversed = samples;
+    std::reverse(reversed.begin(), reversed.end());
+    const auto reversedCache = BuildWaterSurfaceCacheFromSamples(reversed, 0.020F);
+    const auto repeated = BuildWaterSeepageSupportSelection(node, "rock", cache);
+    REQUIRE(repeated.success);
+    CHECK(repeated.selection.fingerprint == first.selection.fingerprint);
+    const auto reordered = BuildWaterSeepageSupportSelection(node, "rock", reversedCache);
+    REQUIRE(reordered.success);
+    REQUIRE(reordered.selection.cells.size() == first.selection.cells.size());
+    REQUIRE(repeated.selection.cells.size() == first.selection.cells.size());
+    for (std::size_t index = 0U; index < first.selection.cells.size(); ++index) {
+        CHECK(repeated.selection.cells[index].x == first.selection.cells[index].x);
+        CHECK(repeated.selection.cells[index].y == first.selection.cells[index].y);
+        CHECK(repeated.selection.cells[index].z == first.selection.cells[index].z);
+        CHECK(reordered.selection.cells[index].x == first.selection.cells[index].x);
+        CHECK(reordered.selection.cells[index].y == first.selection.cells[index].y);
+        CHECK(reordered.selection.cells[index].z == first.selection.cells[index].z);
+    }
+
+    WaterSeepageSupportSelection settled = first.selection;
+    const auto settledFingerprint = settled.fingerprint;
+    const auto capped = BuildWaterSeepageSupportSelection(
+        node,
+        "ROCK",
+        cache,
+        WaterSeepageSupportBuildOptions{
+            .maximumSupportCells = 4U,
+            .maximumVisitedSurfels = 100U,
+        });
+    CHECK_FALSE(capped.success);
+    CHECK(capped.diagnostics.cellLimitExceeded);
+    CHECK_FALSE(CommitWaterSeepageSupportSelection(capped, &settled));
+    CHECK(settled.fingerprint == settledFingerprint);
+
+    std::vector<WaterSeepageNode> overlappingNodes;
+    std::vector<WaterSeepageSupportSelection> overlappingSelections;
+    for (std::uint32_t id = 1U; id <= 10U; ++id) {
+        auto overlappingNode = node;
+        overlappingNode.id = id;
+        overlappingNodes.push_back(overlappingNode);
+        auto overlappingSelection = first.selection;
+        overlappingSelection.nodeId = id;
+        overlappingSelection.fingerprint += "-" + std::to_string(id);
+        overlappingSelections.push_back(std::move(overlappingSelection));
+    }
+    const auto overlappingGrid = BuildGrid(
+        overlappingNodes,
+        "ROCK",
+        false,
+        {},
+        1'000'000ULL,
+        {},
+        {},
+        std::nullopt,
+        {},
+        overlappingSelections);
+    CHECK(overlappingGrid.diagnostics.supportOverflowCellCount > 0U);
+    CHECK(overlappingGrid.diagnostics.droppedSupportReferenceCount > 0U);
+    for (const auto& cell : overlappingGrid.supportHashCells) {
+        CHECK(cell.referenceCount <= WaterSeepageSpatialGrid::kMaxReferencesPerCell);
+    }
+
+    auto sandNode = node;
+    CHECK_FALSE(BuildWaterSeepageSupportSelection(sandNode, "SAND", cache).success);
+    sandNode.targetSceneRoles.push_back("SAND");
+    const auto sand = BuildWaterSeepageSupportSelection(sandNode, "SAND", cache);
+    REQUIRE(sand.success);
+    CHECK(sand.selection.sourceRole == WaterSurfaceRole::Sand);
+}
+
+TEST_CASE("VEG Seepage maps connected ROCK metrics onto VEG occupancy cells",
+          "[water][seepage][surface-cache][connected][vegetation]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    for (std::uint32_t station = 0U; station < 6U; ++station) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {0.005F, 0.005F, -0.005F - station * 0.020F},
+                .normal = {0.0F, 1.0F, 0.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+        samples.push_back({
+            .position = {0.005F, 0.105F, -0.045F},
+            .normal = {0.0F, 1.0F, 0.0F},
+            .role = WaterSurfaceRole::Vegetation,
+        });
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.020F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.selectionReachLimitMeters = 0.12F;
+    node.selectionWidthLimitMeters = 0.20F;
+
+    const auto selection = BuildWaterSeepageSupportSelection(node, "VEG", cache);
+    REQUIRE(selection.success);
+    CHECK(selection.selection.sourceRole == WaterSurfaceRole::Rock);
+    REQUIRE_FALSE(selection.selection.cells.empty());
+    CHECK(std::all_of(
+        selection.selection.cells.begin(),
+        selection.selection.cells.end(),
+        [](const auto& cell) { return cell.y >= 10; }));
+    CHECK(std::any_of(
+        selection.selection.cells.begin(),
+        selection.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.downwardDistanceMeters > 0.02F;
+        }));
+}
+
+TEST_CASE("Connected Seepage support follows a turning maximum-downhill centreline",
+          "[water][seepage][surface-cache][connected][centreline]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    std::vector<WaterSurfaceSample> samples;
+    const std::array path{
+        invisible_places::io::Float3{0.005F, 0.005F, -0.005F},
+        invisible_places::io::Float3{0.005F, 0.005F, -0.015F},
+        invisible_places::io::Float3{0.005F, 0.005F, -0.025F},
+        invisible_places::io::Float3{0.015F, 0.005F, -0.035F},
+        invisible_places::io::Float3{0.025F, 0.005F, -0.045F},
+        invisible_places::io::Float3{0.035F, 0.005F, -0.055F},
+        invisible_places::io::Float3{0.045F, 0.005F, -0.065F},
+    };
+    for (const auto& position : path) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {
+                    position.x + static_cast<float>(sample) * 0.00001F,
+                    position.y,
+                    position.z,
+                },
+                .normal = {0.0F, 1.0F, 0.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = path.front();
+    node.reachMeters = 0.08F;
+    node.widthMeters = 0.03F;
+    node.selectionReachLimitMeters = 0.10F;
+    node.selectionWidthLimitMeters = 0.03F;
+    node.edgeFeatherMeters = 0.005F;
+
+    const auto support = BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(support.success);
+    const auto turnedCell = std::find_if(
+        support.selection.cells.begin(),
+        support.selection.cells.end(),
+        [](const auto& cell) { return cell.x >= 4 && cell.z <= -7; });
+    REQUIRE(turnedCell != support.selection.cells.end());
+    CHECK(turnedCell->lateralDistanceMeters < 0.015F);
+    CHECK(turnedCell->downwardDistanceMeters > 0.05F);
+}
+
+TEST_CASE("Connected Seepage support keeps live dimensions parameter-only",
+          "[water][seepage][surface-cache][connected][parameters]") {
+    using invisible_places::water::ApplyWaterSeepageScenarioParameters;
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::PackWaterSeepageSupportReferenceMetadata;
+    using invisible_places::water::UnpackWaterSeepageSupportReferenceMetadata;
+    using invisible_places::water::WaterSeepageNodeAnimationStateEntry;
+    using invisible_places::water::WaterSeepageParamsFingerprint;
+    using invisible_places::water::WaterSeepageTopologyFingerprint;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    const auto packed = PackWaterSeepageSupportReferenceMetadata(
+        {0.0F, 1.0F, 0.0F},
+        WaterSurfaceRole::Rock,
+        0.73F,
+        1U);
+    const auto unpacked = UnpackWaterSeepageSupportReferenceMetadata(packed);
+    CHECK(unpacked.sourceRole == WaterSurfaceRole::Rock);
+    CHECK(unpacked.confidence == Catch::Approx(0.73F).margin(0.005F));
+    CHECK(unpacked.surfaceNormal.y == Catch::Approx(1.0F).margin(0.005F));
+    CHECK(unpacked.flags == 1U);
+    STATIC_REQUIRE(sizeof(invisible_places::water::WaterSeepageSupportReference) == 16U);
+
+    std::vector<WaterSurfaceSample> samples;
+    for (std::uint32_t station = 0U; station < 7U; ++station) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {0.005F, 0.005F, -0.005F - station * 0.020F},
+                .normal = {0.0F, 1.0F, 0.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.020F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    node.reachMeters = 0.11F;
+    node.widthMeters = 0.12F;
+    node.selectionReachLimitMeters = 0.13F;
+    node.selectionWidthLimitMeters = 0.20F;
+    const auto built = BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(built.success);
+    const std::array selections{built.selection};
+    auto grid = BuildGrid(
+        {node}, "ROCK", false, {}, 1'000'000ULL, {}, {}, std::nullopt, {}, selections);
+    REQUIRE(grid.nodes.size() == 1U);
+    REQUIRE_FALSE(grid.supportHashCells.empty());
+    REQUIRE_FALSE(grid.supportReferences.empty());
+    CHECK(grid.nodes.front().usesConnectedSupport);
+    CHECK(grid.diagnostics.supportReferenceCount == grid.supportReferences.size());
+    for (const auto& cell : grid.supportHashCells) {
+        CHECK(cell.referenceCount <= WaterSeepageSpatialGrid::kMaxReferencesPerCell);
+    }
+
+    const auto selectedCell = std::find_if(
+        built.selection.cells.begin(),
+        built.selection.cells.end(),
+        [](const auto& cell) {
+            return cell.downwardDistanceMeters > 0.03F &&
+                   cell.downwardDistanceMeters < 0.08F;
+        });
+    REQUIRE(selectedCell != built.selection.cells.end());
+    const invisible_places::io::Float3 selectedPoint{
+        (selectedCell->x + 0.5F) * built.selection.cellSizeMeters,
+        (selectedCell->y + 0.5F) * built.selection.cellSizeMeters,
+        (selectedCell->z + 0.5F) * built.selection.cellSizeMeters,
+    };
+    CHECK(EvaluateWaterSeepageGridContribution(
+              grid, selectedPoint, {0.0F, 1.0F, 0.0F}, 0.31F)
+              .scale > 0.0F);
+    auto unsupportedPoint = selectedPoint;
+    unsupportedPoint.y += 0.04F;
+    CHECK(EvaluateWaterSeepageGridContribution(
+              grid, unsupportedPoint, {0.0F, 1.0F, 0.0F}, 0.31F)
+              .scale == Catch::Approx(0.0F));
+
+    const auto topology = WaterSeepageTopologyFingerprint(grid);
+    const auto params = WaterSeepageParamsFingerprint(grid);
+    const std::array<WaterSeepageNodeAnimationStateEntry, 1U> animation{{{
+        .nodeId = node.id,
+        .state = {
+            .activity = 1.0F,
+            .localSpread = 0.0F,
+            .wettingProgress = 1.0F,
+            .reachScale = 0.50F,
+            .widthScale = 0.50F,
+            .prominence = 0.40F,
+        },
+    }}};
+    ApplyWaterSeepageScenarioParameters(
+        &grid, std::nullopt, {}, 1'000'000ULL, animation);
+    CHECK(WaterSeepageTopologyFingerprint(grid) == topology);
+    CHECK(WaterSeepageParamsFingerprint(grid) != params);
+    CHECK(grid.nodes.front().reachMeters == Catch::Approx(0.055F));
+    CHECK(grid.nodes.front().widthMeters == Catch::Approx(0.060F));
+    CHECK(grid.nodes.front().prominence == Catch::Approx(0.40F));
 }

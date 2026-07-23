@@ -8,6 +8,9 @@ struct RockRainImpactTestInput {
     vec4 eventNormalLifetime;
     vec4 pointAge;
     vec4 pointNormal;
+    uvec4 control;
+    vec4 rockImpact0;
+    vec4 rockImpact1;
 };
 
 layout(set = 0, binding = 0, std430) readonly buffer TestInputs {
@@ -31,6 +34,9 @@ void main() {
         inputValue.eventNormalLifetime.xyz,
         inputValue.eventPositionRadius.w,
         inputValue.eventNormalLifetime.w,
+        inputValue.control.x,
+        inputValue.rockImpact0,
+        inputValue.rockImpact1,
         inputValue.pointAge.xyz,
         inputValue.pointNormal.xyz,
         inputValue.pointAge.w);

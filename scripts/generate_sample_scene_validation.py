@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Refresh the local SampleScene validation project from its durable fixture.
 
-The tracked schema-17 fixture is authoritative, so validation keeps working
+The tracked schema-18 fixture is authoritative, so validation keeps working
 after the authored objects are removed from the ignored exhibition project.
 An explicit option can refresh that fixture while those objects still exist.
 The helper builds a lightweight SampleScene project around the explicit 3 mm
@@ -59,7 +59,7 @@ SAMPLE_ASSETS = {
 
 ANALYSIS_SPACING = {"ROCK": 1_000, "SAND": 2_000, "VEG": 1_000}
 DISPLAY_SPACING = 3_000
-CACHE_SPACING = 5_000
+CACHE_SPACING = 2_000
 
 STATE_WATER_KEYS = (
     "water_emitters",
@@ -69,6 +69,77 @@ STATE_WATER_KEYS = (
     "water_field_layers",
     "water_ripple_runtime_caches",
 )
+
+
+def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
+    """Apply the schema-43/18 parameter-only visibility and tuning migration."""
+
+    value["water_show_flow_trails" if project else "show_flow_trails"] = value.get(
+        "water_show_flow_trails" if project else "show_flow_trails", True
+    )
+    rain = value.get("water_rain_settings")
+    if isinstance(rain, dict):
+        rain["version"] = 3
+        rain.setdefault(
+            "near_surface",
+            {
+                "approach_distance_meters": 0.18,
+                "minimum_speed_factor": 0.30,
+                "squish": 0.65,
+                "normal_alignment": 0.75,
+            },
+        )
+        rain.setdefault(
+            "rock_impact",
+            {
+                "edge_breakup": 0.35,
+                "spread_speed": 1.60,
+                "centre_falloff": 0.65,
+                "height_bias": 0.75,
+                "persistence": 1.35,
+            },
+        )
+        rain.setdefault(
+            "vegetation_impact",
+            {
+                "twinkle": 1.80,
+                "propagation_meters_per_second": 0.65,
+                "hop_spacing_meters": 0.07,
+                "stream_width_meters": 0.010,
+                "stream_spread": 0.65,
+            },
+        )
+
+    containers = [value]
+    containers.extend(
+        state
+        for state in value.get("water_scene_states", [])
+        if isinstance(state, dict)
+    )
+    for container in containers:
+        for source_key in ("water_emitters", "water_manual_flow_paths"):
+            for source in container.get(source_key, []):
+                if isinstance(source, dict):
+                    source.setdefault("show_trail", True)
+        for node in container.get("water_seepage_nodes", []):
+            if not isinstance(node, dict):
+                continue
+            width = float(
+                node.get(
+                    "width_meters",
+                    max(
+                        float(node.get("start_width_meters", 0.12)),
+                        float(node.get("end_width_meters", 0.75)),
+                    ),
+                )
+            )
+            reach = float(node.get("reach_meters", 1.25))
+            node["width_meters"] = width
+            node.setdefault("prominence", 1.0)
+            node.setdefault("selection_reach_limit_meters", reach * 1.875)
+            node.setdefault("selection_width_limit_meters", width * 1.62)
+            node.pop("start_width_meters", None)
+            node.pop("end_width_meters", None)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -148,7 +219,8 @@ def authored_state(
 
 
 def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
-    project["schema_version"] = 42
+    project["schema_version"] = 43
+    upgrade_water_contract(project, project=True)
     state = authored_state(project, required=False)
     if state is not None:
         state.pop("water_path_cache", None)
@@ -188,7 +260,7 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
     seepage = copy.deepcopy(named_object(state["water_seepage_nodes"], "SampleSeepage"))
 
     fixture: dict[str, Any] = {
-        "schema_version": 17,
+        "schema_version": 18,
         "fixture_metadata": {
             "scene_group": "SampleScene",
             "display_spacing_micrometres": DISPLAY_SPACING,
@@ -203,6 +275,7 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
         "water_source_settings": copy.deepcopy(project["water_source_settings"]),
         "water_caustic_look_settings": copy.deepcopy(project["water_caustic_look_settings"]),
         "water_flow_trail_settings": copy.deepcopy(project["water_flow_trail_settings"]),
+        "show_flow_trails": project.get("water_show_flow_trails", True),
         "water_trail_geometry": copy.deepcopy(project["water_trail_geometry"]),
         "water_path_profiles": copy.deepcopy(project.get("water_path_profiles", [])),
         "water_lane_profiles": copy.deepcopy(project.get("water_lane_profiles", [])),
@@ -236,12 +309,13 @@ def build_water_fixture(project: dict[str, Any], state: dict[str, Any]) -> dict[
     ):
         if optional_key in project:
             fixture[optional_key] = copy.deepcopy(project[optional_key])
+    upgrade_water_contract(fixture, project=False)
     return fixture
 
 
 def validate_water_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
-    if fixture.get("schema_version") != 17:
-        raise ValueError("SampleScene water fixture must use water-source schema 17")
+    if fixture.get("schema_version") != 18:
+        raise ValueError("SampleScene water fixture must use water-source schema 18")
     metadata = fixture.get("fixture_metadata")
     if not isinstance(metadata, dict) or metadata.get("scene_group") != "SampleScene":
         raise ValueError("SampleScene water fixture has invalid fixture metadata")
@@ -316,7 +390,8 @@ def build_validation_project(
     project: dict[str, Any], fixture: dict[str, Any]
 ) -> dict[str, Any]:
     validation = copy.deepcopy(project)
-    validation["schema_version"] = 42
+    validation["schema_version"] = 43
+    upgrade_water_contract(validation, project=True)
     validation["project_name"] = "SampleScene Validation"
     validation["layers"] = clone_sample_layers(project)
     validation["selected_layer_path"] = sample_asset_path("Site1-ROCK-3mm.Sample.ply")

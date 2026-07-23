@@ -139,8 +139,12 @@ WaterSeepageNode MakeNode() {
     node.surfaceNormal = {0.15F, 0.97F, 0.19F};
     node.downAxis = {0.08F, -0.12F, -0.99F};
     node.reachMeters = 2.4F;
-    node.startWidthMeters = 0.18F;
-    node.endWidthMeters = 1.35F;
+    node.widthMeters = 1.35F;
+    node.startWidthMeters = node.widthMeters;
+    node.endWidthMeters = node.widthMeters;
+    node.prominence = 1.27F;
+    node.selectionReachLimitMeters = 4.8F;
+    node.selectionWidthLimitMeters = 2.4F;
     node.edgeFeatherMeters = 0.21F;
     node.depthToleranceMeters = 0.32F;
     node.normalAlignment = 0.67F;
@@ -168,8 +172,16 @@ void CheckNode(const WaterSeepageNode& actual, const WaterSeepageNode& expected)
     CHECK(actual.downAxis.y == Catch::Approx(expected.downAxis.y));
     CHECK(actual.downAxis.z == Catch::Approx(expected.downAxis.z));
     CHECK(actual.reachMeters == Catch::Approx(expected.reachMeters));
-    CHECK(actual.startWidthMeters == Catch::Approx(expected.startWidthMeters));
-    CHECK(actual.endWidthMeters == Catch::Approx(expected.endWidthMeters));
+    CHECK(actual.widthMeters == Catch::Approx(expected.widthMeters));
+    CHECK(actual.startWidthMeters == Catch::Approx(expected.widthMeters));
+    CHECK(actual.endWidthMeters == Catch::Approx(expected.widthMeters));
+    CHECK(actual.prominence == Catch::Approx(expected.prominence));
+    CHECK(
+        actual.selectionReachLimitMeters ==
+        Catch::Approx(expected.selectionReachLimitMeters));
+    CHECK(
+        actual.selectionWidthLimitMeters ==
+        Catch::Approx(expected.selectionWidthLimitMeters));
     CHECK(actual.edgeFeatherMeters == Catch::Approx(expected.edgeFeatherMeters));
     CHECK(actual.depthToleranceMeters == Catch::Approx(expected.depthToleranceMeters));
     CHECK(actual.normalAlignment == Catch::Approx(expected.normalAlignment));
@@ -239,6 +251,12 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     CHECK(savedJson.find("\"quality\": \"low\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"balanced\"") != std::string::npos);
     CHECK(savedJson.find("\"quality\": \"high\"") != std::string::npos);
+    CHECK(savedJson.find("\"width_meters\"") != std::string::npos);
+    CHECK(savedJson.find("\"prominence\"") != std::string::npos);
+    CHECK(savedJson.find("\"selection_reach_limit_meters\"") != std::string::npos);
+    CHECK(savedJson.find("\"selection_width_limit_meters\"") != std::string::npos);
+    CHECK(savedJson.find("\"start_width_meters\"") == std::string::npos);
+    CHECK(savedJson.find("\"end_width_meters\"") == std::string::npos);
     CHECK(savedJson.find("\"depth_tolerance_meters\"") != std::string::npos);
 
     const auto loaded =
@@ -456,6 +474,56 @@ TEST_CASE(
     std::filesystem::remove(sourcesPath);
 }
 
+TEST_CASE(
+    "Schema-17 Seepage fans migrate to live dimensions and connected-selection limits",
+    "[water][seepage][serialization][migration]") {
+    const auto sourcesPath =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_seepage_sources_v17_fan.json";
+    {
+        std::ofstream output{sourcesPath};
+        output << R"({
+  "schema_version": 17,
+  "water_seepage_nodes": [{
+    "id": 73,
+    "reach_meters": 2.0,
+    "start_width_meters": 0.2,
+    "end_width_meters": 1.5
+  }]
+})";
+    }
+
+    std::string errorMessage;
+    const auto loaded = invisible_places::serialization::LoadWaterSourcesDocument(
+        sourcesPath,
+        &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->seepageNodes.size() == 1U);
+    const auto& node = loaded->seepageNodes.front();
+    CHECK(node.widthMeters == Catch::Approx(1.5F));
+    CHECK(node.startWidthMeters == Catch::Approx(1.5F));
+    CHECK(node.endWidthMeters == Catch::Approx(1.5F));
+    CHECK(node.prominence == Catch::Approx(1.0F));
+    CHECK(node.selectionReachLimitMeters == Catch::Approx(3.75F));
+    CHECK(node.selectionWidthLimitMeters == Catch::Approx(2.43F));
+
+    const auto migratedPath =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_seepage_sources_v18_connected.json";
+    REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(
+        loaded.value(), migratedPath, &errorMessage));
+    const auto migratedJson = ReadTextFile(migratedPath);
+    CHECK(migratedJson.find("\"schema_version\": 18") != std::string::npos);
+    CHECK(migratedJson.find("\"width_meters\": 1.5") != std::string::npos);
+    CHECK(migratedJson.find("\"selection_reach_limit_meters\": 3.75") !=
+          std::string::npos);
+    CHECK(migratedJson.find("\"start_width_meters\"") == std::string::npos);
+    CHECK(migratedJson.find("\"end_width_meters\"") == std::string::npos);
+
+    std::filesystem::remove(sourcesPath);
+    std::filesystem::remove(migratedPath);
+}
+
 TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[water][seepage][serialization][animation]") {
     invisible_places::camera::AnimationPath path;
     path.name = "Historical water comparison";
@@ -495,6 +563,9 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
                 .activity = 0.90F,
                 .localSpread = 0.65F,
                 .wettingProgress = 1.0F,
+                .reachScale = 1.30F,
+                .widthScale = 1.45F,
+                .prominence = 1.60F,
             },
             .interpolation = invisible_places::water::WaterScenarioInterpolation::Hold,
         },
@@ -505,6 +576,9 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
                 .activity = 0.15F,
                 .localSpread = 0.05F,
                 .wettingProgress = 0.10F,
+                .reachScale = 0.35F,
+                .widthScale = 0.25F,
+                .prominence = 0.40F,
             },
             .interpolation = invisible_places::water::WaterScenarioInterpolation::Linear,
         },
@@ -517,12 +591,20 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
     std::string errorMessage;
     REQUIRE(invisible_places::serialization::SaveAnimationPath(path, outputPath, &errorMessage));
     const auto savedJson = ReadTextFile(outputPath);
-    CHECK(savedJson.find("\"schema_version\": 10") != std::string::npos);
+    CHECK(
+        savedJson.find(
+            "\"schema_version\": " +
+            std::to_string(
+                invisible_places::serialization::kAnimationDocumentSchemaVersion)) !=
+        std::string::npos);
     CHECK(savedJson.find("\"water_scenario_tracks\"") != std::string::npos);
     CHECK(savedJson.find("\"position\": 1.0") != std::string::npos);
     CHECK(savedJson.find("\"interpolation\": \"hold\"") != std::string::npos);
     CHECK(savedJson.find("\"fallback_scenario\"") != std::string::npos);
     CHECK(savedJson.find("\"seepage_node_tracks\"") != std::string::npos);
+    CHECK(savedJson.find("\"reach_scale\"") != std::string::npos);
+    CHECK(savedJson.find("\"width_scale\"") != std::string::npos);
+    CHECK(savedJson.find("\"prominence\"") != std::string::npos);
     CHECK(savedJson.find("\"seepage_rain_delay_seconds\"") != std::string::npos);
 
     const auto loaded = invisible_places::serialization::LoadAnimationPath(
@@ -561,6 +643,9 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
     CHECK(loadedNodeTrack.keys.front().state.activity == Catch::Approx(0.15F));
     CHECK(loadedNodeTrack.keys.front().state.localSpread == Catch::Approx(0.05F));
     CHECK(loadedNodeTrack.keys.front().state.wettingProgress == Catch::Approx(0.10F));
+    CHECK(loadedNodeTrack.keys.front().state.reachScale == Catch::Approx(0.35F));
+    CHECK(loadedNodeTrack.keys.front().state.widthScale == Catch::Approx(0.25F));
+    CHECK(loadedNodeTrack.keys.front().state.prominence == Catch::Approx(0.40F));
     CHECK(
         loadedNodeTrack.keys.front().interpolation ==
         invisible_places::water::WaterScenarioInterpolation::Linear);
@@ -568,7 +653,58 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
     CHECK(loadedNodeTrack.keys.back().state.activity == Catch::Approx(0.90F));
     CHECK(loadedNodeTrack.keys.back().state.localSpread == Catch::Approx(0.65F));
     CHECK(loadedNodeTrack.keys.back().state.wettingProgress == Catch::Approx(1.0F));
+    CHECK(loadedNodeTrack.keys.back().state.reachScale == Catch::Approx(1.30F));
+    CHECK(loadedNodeTrack.keys.back().state.widthScale == Catch::Approx(1.45F));
+    CHECK(loadedNodeTrack.keys.back().state.prominence == Catch::Approx(1.60F));
     std::filesystem::remove(outputPath);
+}
+
+TEST_CASE(
+    "Schema-ten Seepage animation keeps Local Spread and defaults connected factors",
+    "[water][seepage][serialization][animation][legacy]") {
+    const auto inputPath =
+        std::filesystem::temp_directory_path() /
+        "invisible_places_legacy_seepage_animation_v10.json";
+    {
+        std::ofstream output{inputPath};
+        output << R"({
+  "schema_version": 10,
+  "water_scenario_tracks": [{
+    "scenario_id": "legacy",
+    "seepage_node_tracks": [{
+      "node_id": 47,
+      "keys": [{
+        "id": "legacy_spread",
+        "position": 0.5,
+        "state": {
+          "activity": 0.6,
+          "local_spread": 0.7,
+          "wetting_progress": 0.8
+        }
+      }]
+    }]
+  }]
+})";
+    }
+
+    std::string errorMessage;
+    const auto loaded = invisible_places::serialization::LoadAnimationPath(
+        inputPath,
+        &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->waterScenarioTracks.size() == 1U);
+    REQUIRE(loaded->waterScenarioTracks.front().seepageNodeTracks.size() == 1U);
+    const auto& state = loaded->waterScenarioTracks.front()
+                            .seepageNodeTracks.front()
+                            .keys.front()
+                            .state;
+    CHECK(state.activity == Catch::Approx(0.6F));
+    CHECK(state.localSpread == Catch::Approx(0.7F));
+    CHECK(state.wettingProgress == Catch::Approx(0.8F));
+    CHECK(state.reachScale == Catch::Approx(1.0F));
+    CHECK(state.widthScale == Catch::Approx(1.0F));
+    CHECK(state.prominence == Catch::Approx(1.0F));
+    std::filesystem::remove(inputPath);
 }
 
 TEST_CASE(

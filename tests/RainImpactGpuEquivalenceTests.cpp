@@ -81,9 +81,12 @@ struct alignas(16) RockRainGpuInput {
     std::array<float, 4> eventNormalLifetime{};
     std::array<float, 4> pointAge{};
     std::array<float, 4> pointNormal{};
+    std::array<std::uint32_t, 4> control{};
+    std::array<float, 4> rockImpact0{};
+    std::array<float, 4> rockImpact1{};
 };
 
-static_assert(sizeof(RockRainGpuInput) == 64U);
+static_assert(sizeof(RockRainGpuInput) == 112U);
 
 class RockRainVulkanHarness {
 public:
@@ -565,6 +568,7 @@ struct RockRainCase {
     Float3 point{};
     Float3 pointNormal{};
     float timeSeconds = 0.0F;
+    invisible_places::water::RainRockImpactSettings settings{};
 };
 
 RockRainCase MakeCase(
@@ -574,7 +578,9 @@ RockRainCase MakeCase(
     float lifetime,
     const Float3& point,
     const Float3& pointNormal,
-    float age) {
+    float age,
+    std::uint32_t seed,
+    const invisible_places::water::RainRockImpactSettings& settings) {
     RockRainCase result;
     result.gpu.eventPositionRadius = {
         eventPosition.x,
@@ -592,6 +598,13 @@ RockRainCase MakeCase(
         pointNormal.y,
         pointNormal.z,
         0.0F};
+    result.gpu.control = {seed, 0U, 0U, 0U};
+    result.gpu.rockImpact0 = {
+        settings.edgeBreakup,
+        settings.spreadSpeed,
+        settings.centreFalloff,
+        settings.heightBias};
+    result.gpu.rockImpact1 = {settings.persistence, 0.0F, 0.0F, 0.0F};
     result.event = {
         .position = eventPosition,
         .birthTimeSeconds = 1.25F,
@@ -600,11 +613,12 @@ RockRainCase MakeCase(
         .role = WaterSurfaceRole::Rock,
         .lifetimeSeconds = lifetime,
         .energy = 1.0F,
-        .seed = 417U,
+        .seed = seed,
     };
     result.point = point;
     result.pointNormal = pointNormal;
     result.timeSeconds = result.event.birthTimeSeconds + age;
+    result.settings = settings;
     return result;
 }
 
@@ -619,6 +633,16 @@ std::vector<RockRainCase> BuildEquivalenceCases() {
     const std::array<float, 3> radii{0.035F, 0.12F, 0.31F};
     const std::array<float, 3> lifetimes{1.2F, 5.0F, 8.0F};
     const Float3 eventPosition{0.31F, -0.27F, 0.83F};
+    auto smoothFast = invisible_places::water::RainRockImpactSettings{};
+    smoothFast.edgeBreakup = 0.0F;
+    smoothFast.spreadSpeed = 3.20F;
+    smoothFast.centreFalloff = 0.0F;
+    smoothFast.heightBias = 0.0F;
+    smoothFast.persistence = 0.675F;
+    const std::array<invisible_places::water::RainRockImpactSettings, 2> impactSettings{{
+        invisible_places::water::RainRockImpactSettings{},
+        smoothFast,
+    }};
     std::vector<RockRainCase> cases;
     for (const auto& eventNormal : eventNormals) {
         const Float3 pointNormal =
@@ -644,34 +668,41 @@ std::vector<RockRainCase> BuildEquivalenceCases() {
                  -effectiveRadius * 0.20F},
                 {radius * 0.95F, 0.0F, 0.0F},
             }};
-            for (const float lifetime : lifetimes) {
-                const float growthSeconds =
-                    2.0F * std::clamp(lifetime * 0.18F, 0.55F, 0.95F);
-                const std::array<float, 12> ages{{
-                    -0.01F,
-                    0.0F,
-                    growthSeconds * 0.25F,
-                    growthSeconds * 0.50F,
-                    growthSeconds,
-                    lifetime * 0.40F,
-                    lifetime * 0.55F,
-                    lifetime * 0.70F,
-                    lifetime * 0.90F,
-                    lifetime * 0.999F,
-                    lifetime,
-                    lifetime + 0.01F,
-                }};
-                for (const auto& offset : offsets) {
-                    const auto point = Add(eventPosition, offset);
-                    for (const float age : ages) {
-                        cases.push_back(MakeCase(
-                            eventPosition,
-                            eventNormal,
-                            radius,
-                            lifetime,
-                            point,
-                            pointNormal,
-                            age));
+            for (const auto& settings : impactSettings) {
+                for (const float lifetime : lifetimes) {
+                    const float growthSeconds =
+                        std::clamp(lifetime * 0.18F, 0.55F, 0.95F) *
+                        (3.20F / std::clamp(settings.spreadSpeed, 0.10F, 6.0F));
+                    const std::array<float, 12> ages{{
+                        -0.01F,
+                        0.0F,
+                        growthSeconds * 0.25F,
+                        growthSeconds * 0.50F,
+                        growthSeconds,
+                        lifetime * 0.40F,
+                        lifetime * 0.55F,
+                        lifetime * 0.70F,
+                        lifetime * 0.90F,
+                        lifetime * 0.999F,
+                        lifetime,
+                        lifetime + 0.01F,
+                    }};
+                    for (const auto& offset : offsets) {
+                        const auto point = Add(eventPosition, offset);
+                        for (const float age : ages) {
+                            const auto seed = 417U ^ static_cast<std::uint32_t>(
+                                cases.size() * 0x9E3779B9ULL);
+                            cases.push_back(MakeCase(
+                                eventPosition,
+                                eventNormal,
+                                radius,
+                                lifetime,
+                                point,
+                                pointNormal,
+                                age,
+                                seed,
+                                settings));
+                        }
                     }
                 }
             }
@@ -719,7 +750,8 @@ TEST_CASE(
             testCase.event,
             testCase.point,
             testCase.pointNormal,
-            testCase.timeSeconds);
+            testCase.timeSeconds,
+            testCase.settings);
         const float gpuValue = gpuValues[index];
         REQUIRE(std::isfinite(cpuValue));
         REQUIRE(std::isfinite(gpuValue));

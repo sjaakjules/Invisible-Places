@@ -36,6 +36,47 @@ struct WaterRainVisualSettings {
     float maximumScreenPixels = 4.0F;
 };
 
+// These controls are evaluated from the already-resident Rain collision
+// tables. They deliberately do not alter particle/event capacities, cache
+// identity, or any point-cloud topology.
+struct RainNearSurfaceSettings {
+    float approachDistanceMeters = 0.18F;
+    float minimumSpeedFactor = 0.30F;
+    float squish = 0.65F;
+    float normalAlignment = 0.75F;
+};
+
+// World-space dimensions shared by the CPU/offline path and mirrored in the
+// Rain vertex shader. Slowdown shortens the motion streak while squish widens
+// it and progressively changes its coverage from a streak to an ellipse.
+struct RainParticleVisualShape {
+    float widthMeters = 0.003F;
+    float lengthMeters = 0.16F;
+    float ellipseBlend = 0.0F;
+};
+
+[[nodiscard]] RainParticleVisualShape EvaluateRainParticleVisualShape(
+    float authoredWidthMeters,
+    float authoredLengthMeters,
+    float surfaceProximity,
+    const RainNearSurfaceSettings& settings);
+
+struct RainRockImpactSettings {
+    float edgeBreakup = 0.35F;
+    float spreadSpeed = 1.60F;
+    float centreFalloff = 0.65F;
+    float heightBias = 0.75F;
+    float persistence = 1.35F;
+};
+
+struct RainVegetationImpactSettings {
+    float twinkle = 1.80F;
+    float propagationMetersPerSecond = 0.65F;
+    float hopSpacingMeters = 0.070F;
+    float streamWidthMeters = 0.010F;
+    float streamSpread = 0.65F;
+};
+
 struct RainRuntimeSettings {
     bool enabled = false;
     bool impactEffectsEnabled = true;
@@ -68,6 +109,9 @@ struct RainRuntimeSettings {
     float sandEffectScale = 1.0F;
     float rockEffectScale = 1.0F;
     float vegetationEffectScale = 1.0F;
+    RainNearSurfaceSettings nearSurface{};
+    RainRockImpactSettings rockImpact{};
+    RainVegetationImpactSettings vegetationImpact{};
 };
 
 struct RainIntensityMultipliers {
@@ -106,6 +150,8 @@ struct RainParticle {
     io::Float3 velocity{};
     float ageSeconds = 0.0F;
     float visibility = 1.0F;
+    io::Float3 surfaceNormal{0.0F, 0.0F, 1.0F};
+    float surfaceProximity = 0.0F;
     std::uint32_t generation = 0U;
     std::uint32_t randomState = 0U;
     bool active = false;
@@ -188,6 +234,8 @@ struct RainImpactGrid {
     std::uint32_t dimension = kRainImpactGridDimension;
     std::vector<RainImpactGridCell> cells;
     std::vector<RainImpactEvent> events;
+    RainRockImpactSettings rockImpact{};
+    RainVegetationImpactSettings vegetationImpact{};
     std::uint32_t overflowCount = 0U;
 };
 
@@ -205,13 +253,16 @@ struct RainImpactEffect {
     const RainImpactEvent& event,
     const io::Float3& point,
     const io::Float3& pointNormal,
-    float timeSeconds);
+    float timeSeconds,
+    const RainRockImpactSettings& settings = {});
 
 [[nodiscard]] RainImpactGrid BuildRainImpactGrid(
     std::span<const RainImpactEvent> events,
     const io::Float3& cameraPosition,
     float timeSeconds,
-    float worldSpanMeters = 32.0F);
+    float worldSpanMeters = 32.0F,
+    const RainRockImpactSettings& rockImpact = {},
+    const RainVegetationImpactSettings& vegetationImpact = {});
 [[nodiscard]] RainImpactEffect EvaluateRainImpact(
     const RainImpactGrid& grid,
     WaterSurfaceRole pointRole,

@@ -19,7 +19,7 @@ Each project-loaded scene has two independent source classifications:
 
 When one file belongs to both sets, ready CPU data can be reused. Obsolete display CPU/GPU resources are released after commit when no active purpose owns them. A staged target is CPU-only, neither a committed display source nor renderable. The transaction never holds complete old and new point buffers at the same time, bounding measured point-buffer bytes to the larger bundle plus fixed upload/descriptor staging. Native diagnostics report the transaction's settle count and byte high-water mark rather than estimating residency from point counts.
 
-Ordinary framing, placement, and editing can use the committed runtime display support. Explicit canonical operations queue their required analysis roles and resume when those CPU sources are ready; missing analysis never blocks the first visible display. The display-independent shared `WaterSurfaceCache` separately streams exact 5 mm role files, or each role's coarsest fallback, into one persisted 20 mm Rain/Flow/Seepage cache after the display upload completes.
+Ordinary framing, placement, and editing can use the committed runtime display support. Explicit canonical operations queue their required analysis roles and resume when those CPU sources are ready; missing analysis never blocks the first visible display. The display-independent shared `WaterSurfaceCache` separately streams the exact complete 2 mm ROCK/SAND/VEG bundle into one persisted 10 mm Rain/Flow/Seepage cache after the display upload completes. A scene without 2 mm uses its nearest complete bundle and reports the fallback; role spacings are never mixed.
 
 Point-cloud loading, shared-surface build/load plus GPU preprocessing, and dynamic-mesh cache warmup use one exclusive high-memory slot. The active display commits first; the shared surface cache then takes the slot before inactive queued loads, and the remaining work resumes only after preprocessing completes.
 
@@ -53,21 +53,21 @@ Scalar-field bindings follow field names across variants because numeric field s
 
 ## Water And Field Routing
 
-Display switching changes presentation only. Explicit Flow/Field analysis uses CPU-ready canonical sources, while placement and responsive runtime editing can use committed support. Rain, surface-guided Flow, and Seepage use the scene's static 20 mm shared surface cache, whose source signature and GPU upload revision remain stable while display density changes.
+Display switching changes presentation only. Explicit Flow/Field analysis uses CPU-ready canonical sources, while placement and responsive runtime editing can use committed support. Rain, surface-guided Flow, and connected-cell Seepage use the scene's static 10 mm shared surface cache, whose source signature and GPU upload revision remain stable while display density changes.
 
 Display-dependent payloads are handled separately:
 
 - Ripple memberships and Field presentation are display-source-specific because point indices differ between density variants; indices are never copied across variants.
-- A display commit performs no Ripple, Field, Flow, or Seepage topology scan. Missing display-specific Ripple/Field state remains dirty until an explicit recalculation; settled Flow stays active, while compact Seepage topology is shared by scene role and surface-cache identity and only attached to each newly uploaded density layer.
-- Seepage node **Visible** state lives in the compact parameter ring. Disabled viewport nodes remain in the semantic spatial topology with a zero enabled factor, so off/on changes neither guides, hash cells, nor descriptors. Export enablement retains its independent snapshot filtering.
+- A display commit performs no Ripple, Field, Flow, or Seepage topology scan. Missing display-specific Ripple/Field state remains dirty until an explicit recalculation; settled Flow stays active, while compact connected cache-cell Seepage support is shared by scene role and surface-cache identity and only attached to each newly uploaded density layer.
+- Seepage node **Visible** state lives in the compact parameter ring. Disabled viewport nodes remain in the semantic spatial topology with a zero enabled factor, so off/on changes neither connected support, hash cells, nor descriptors. Export enablement retains its independent snapshot filtering.
 - Generated Flow and Field Streamline sessions are unchanged by the selector; dedicated Rain particles reuse the same shared surface cache and world-space impacts.
 - SAND Shoreline settings remain authored once and are evaluated on the committed SAND display source.
 
 Viewport rendering, framing, frustum masks, still/animation snapshots, and offline export all use the committed-display predicate. CPU-only analysis sources and staged switch targets are excluded.
 
-## Project Schema 42
+## Project Schema 43
 
-The authoritative `scene_point_cloud_groups` array records committed display state and per-role analysis/display paths. Schema 42 additionally stores an optional compact `water_surface_cache` manifest per group:
+The authoritative `scene_point_cloud_groups` array records committed display state and per-role analysis/display paths. Schema 43 additionally stores an optional compact `water_surface_cache` manifest per group:
 
 ```json
 {
@@ -80,7 +80,7 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
       "water_surface_cache": {
         "relative_path": "../Data/Scene1/.invisible_places/cache/water/example.surfacecache",
         "cache_schema": 3,
-        "algorithm_id": "water-surface-v3",
+        "algorithm_id": "water-surface-10mm-normal-average-v1",
         "requested_rebuild_generation": 1,
         "built_rebuild_generation": 1
       },
@@ -98,7 +98,7 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
 
 The example abbreviates the `roles` array and cache fingerprint/checksum fields; a normal complete scene stores ROCK, SAND, and VEG records. Schema-3 payloads live at `<scene>/.invisible_places/cache/water/<signature>.surfacecache`, fall back beside the project when scene storage is unavailable, and can migrate legacy schema-2 `.raincache` files. Requested/built generations make **Rebuild Cache** durable while the last settled GPU cache remains active until replacement.
 
-Clean generated Flow branches are similarly externalized to scene-local `.invisible_places/cache/flow/*.flowpathcache` sidecars with a compact `water_path_cache_manifest`; stale or orphaned derived arrays are not embedded in schema-42 project JSON.
+Clean generated Flow branches are similarly externalized to scene-local `.invisible_places/cache/flow/*.flowpathcache` sidecars with a compact `water_path_cache_manifest`; stale or orphaned derived arrays are not embedded in schema-43 project JSON.
 
 When loading a schema-32-or-earlier project, legacy selected paths are preserved as analysis-source candidates. The loader derives the display spacing from the visible primary/ROCK selection when that spacing forms a complete bundle. Otherwise it chooses the nearest complete bundle, preferring the denser bundle on a tie. If no complete bundle exists, it retains a non-switchable `Mixed` selection. Missing saved paths fall back through the same catalog validation instead of substituting a sparse display source for analysis.
 
