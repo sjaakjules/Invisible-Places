@@ -3128,6 +3128,11 @@ json SerializeWaterScenarioState(const WaterScenarioState& state) {
         {"seepage_spread", state.seepageSpread},
         {"rain_level", state.rainLevel},
         {"flow_level", state.flowLevel},
+        {"mesh_flow_level", state.meshFlowLevel},
+        {"mesh_flow_rain_gain", state.meshFlowRainGain},
+        {"mesh_flow_persistence_scale", state.meshFlowPersistenceScale},
+        {"mesh_flow_rain_rise_seconds", state.meshFlowRainRiseSeconds},
+        {"mesh_flow_rain_recession_seconds", state.meshFlowRainRecessionSeconds},
         {"seepage_rain_delay_seconds", state.seepageRainDelaySeconds},
         {"seepage_rain_rise_seconds", state.seepageRainRiseSeconds},
         {"seepage_rain_recession_seconds", state.seepageRainRecessionSeconds},
@@ -3143,6 +3148,21 @@ WaterScenarioState ParseWaterScenarioState(const json& stateJson) {
     state.seepageSpread = stateJson.value("seepage_spread", state.seepageSpread);
     state.rainLevel = stateJson.value("rain_level", state.rainLevel);
     state.flowLevel = stateJson.value("flow_level", state.flowLevel);
+    state.meshFlowLevel = stateJson.value(
+        "mesh_flow_level",
+        state.meshFlowLevel);
+    state.meshFlowRainGain = stateJson.value(
+        "mesh_flow_rain_gain",
+        state.meshFlowRainGain);
+    state.meshFlowPersistenceScale = stateJson.value(
+        "mesh_flow_persistence_scale",
+        state.meshFlowPersistenceScale);
+    state.meshFlowRainRiseSeconds = stateJson.value(
+        "mesh_flow_rain_rise_seconds",
+        state.meshFlowRainRiseSeconds);
+    state.meshFlowRainRecessionSeconds = stateJson.value(
+        "mesh_flow_rain_recession_seconds",
+        state.meshFlowRainRecessionSeconds);
     state.seepageRainDelaySeconds = stateJson.value(
         "seepage_rain_delay_seconds",
         state.seepageRainDelaySeconds);
@@ -3152,17 +3172,7 @@ WaterScenarioState ParseWaterScenarioState(const json& stateJson) {
     state.seepageRainRecessionSeconds = stateJson.value(
         "seepage_rain_recession_seconds",
         state.seepageRainRecessionSeconds);
-    state.seepageLevel = std::clamp(state.seepageLevel, 0.0F, 1.0F);
-    state.seepageSpread = std::clamp(state.seepageSpread, 0.0F, 1.0F);
-    state.rainLevel = std::clamp(state.rainLevel, 0.0F, 1.0F);
-    state.flowLevel = std::clamp(state.flowLevel, 0.0F, 1.0F);
-    state.seepageRainDelaySeconds =
-        std::clamp(state.seepageRainDelaySeconds, 0.0F, 86'400.0F);
-    state.seepageRainRiseSeconds =
-        std::clamp(state.seepageRainRiseSeconds, 0.0F, 86'400.0F);
-    state.seepageRainRecessionSeconds =
-        std::clamp(state.seepageRainRecessionSeconds, 0.0F, 86'400.0F);
-    return state;
+    return invisible_places::water::SanitizeWaterScenarioState(std::move(state));
 }
 
 json SerializeWaterScenarioDefinition(const WaterScenarioDefinition& definition) {
@@ -4007,9 +4017,16 @@ json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& s
     json settingsJson{
         {"enabled", settings.enabled},
         {"gpu_preview_enabled", settings.gpuPreviewEnabled},
+        {"show_trails", settings.showTrails},
+        {"automatic_sources", settings.automaticSources},
         {"cache_cell_size_meters", settings.cacheCellSizeMeters},
         {"projection_search_radius_meters", settings.projectionSearchRadiusMeters},
         {"ambiguity_height_meters", settings.ambiguityHeightMeters},
+        {"particle_capacity", settings.particleCapacity},
+        {"history_length", settings.historyLength},
+        {"source_band_width_meters", settings.sourceBandWidthMeters},
+        {"dry_concavity_focus", settings.dryConcavityFocus},
+        {"rain_spawn_spread", settings.rainSpawnSpread},
         {"preview_particle_limit", settings.previewParticleLimit},
         {"final_particle_limit", settings.finalParticleLimit},
         {"trail_length_meters", settings.trailLengthMeters},
@@ -4026,6 +4043,43 @@ json SerializeWaterDynamicMeshFlowSettings(const WaterDynamicMeshFlowSettings& s
         {"eddy_strength", settings.eddyStrength},
         {"topology_response", settings.topologyResponse},
         {"inertia", settings.inertia},
+        {"particle_noise_strength", settings.particleNoiseStrength},
+        {"particle_noise_scale_meters", settings.particleNoiseScaleMeters},
+        {"particle_noise_speed", settings.particleNoiseSpeed},
+        {"shared_wind_strength", settings.sharedWindStrength},
+        {"shared_wind_scale_meters", settings.sharedWindScaleMeters},
+        {"shared_wind_speed", settings.sharedWindSpeed},
+        {"contact_fade_seconds", settings.contactFadeSeconds},
+        {"rock_response",
+         {
+             {"radius_meters", settings.rockResponse.radiusMeters},
+             {"opacity_add", settings.rockResponse.opacityAdd},
+             {"emission_add", settings.rockResponse.emissionAdd},
+             {"colourise",
+              {
+                  settings.rockResponse.colourise.x,
+                  settings.rockResponse.colourise.y,
+                  settings.rockResponse.colourise.z,
+              }},
+             {"colourise_amount", settings.rockResponse.colouriseAmount},
+             {"persistence_seconds", settings.rockResponse.persistenceSeconds},
+         }},
+        {"vegetation_response",
+         {
+             {"radius_meters", settings.vegetationResponse.radiusMeters},
+             {"opacity_add", settings.vegetationResponse.opacityAdd},
+             {"emission_add", settings.vegetationResponse.emissionAdd},
+             {"colourise",
+              {
+                  settings.vegetationResponse.colourise.x,
+                  settings.vegetationResponse.colourise.y,
+                  settings.vegetationResponse.colourise.z,
+              }},
+             {"colourise_amount", settings.vegetationResponse.colouriseAmount},
+             {"persistence_seconds", settings.vegetationResponse.persistenceSeconds},
+             {"twinkle", settings.vegetationResponse.twinkle},
+             {"stream_depth_meters", settings.vegetationResponse.streamDepthMeters},
+         }},
         {"animation_duration_seconds", settings.animationDurationSeconds},
         {"seed", settings.seed},
         {"particle_preset_name", settings.particlePresetName},
@@ -4050,6 +4104,10 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
     auto settings = invisible_places::water::DefaultWaterDynamicMeshFlowSettings();
     settings.enabled = settingsJson.value("enabled", settings.enabled);
     settings.gpuPreviewEnabled = settingsJson.value("gpu_preview_enabled", settings.gpuPreviewEnabled);
+    settings.showTrails = settingsJson.value("show_trails", settings.showTrails);
+    settings.automaticSources = settingsJson.value(
+        "automatic_sources",
+        settings.automaticSources);
     settings.meshPath = settingsJson.value("mesh_path", settings.meshPath.generic_string());
     settings.cacheCellSizeMeters = std::clamp(
         settingsJson.value("cache_cell_size_meters", settings.cacheCellSizeMeters),
@@ -4063,6 +4121,21 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
         settingsJson.value("ambiguity_height_meters", settings.ambiguityHeightMeters),
         0.0F,
         25.0F);
+    settings.particleCapacity = settingsJson.value(
+        "particle_capacity",
+        settings.particleCapacity);
+    settings.historyLength = settingsJson.value(
+        "history_length",
+        settings.historyLength);
+    settings.sourceBandWidthMeters = settingsJson.value(
+        "source_band_width_meters",
+        settings.sourceBandWidthMeters);
+    settings.dryConcavityFocus = settingsJson.value(
+        "dry_concavity_focus",
+        settings.dryConcavityFocus);
+    settings.rainSpawnSpread = settingsJson.value(
+        "rain_spawn_spread",
+        settings.rainSpawnSpread);
     settings.previewParticleLimit = std::clamp<std::uint32_t>(
         settingsJson.value("preview_particle_limit", settings.previewParticleLimit),
         1U,
@@ -4112,6 +4185,96 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
         0.0F,
         10.0F);
     settings.inertia = std::clamp(settingsJson.value("inertia", settings.inertia), 0.0F, 0.98F);
+    settings.particleNoiseStrength = settingsJson.value(
+        "particle_noise_strength",
+        settings.particleNoiseStrength);
+    settings.particleNoiseScaleMeters = settingsJson.value(
+        "particle_noise_scale_meters",
+        settings.particleNoiseScaleMeters);
+    settings.particleNoiseSpeed = settingsJson.value(
+        "particle_noise_speed",
+        settings.particleNoiseSpeed);
+    settings.sharedWindStrength = settingsJson.value(
+        "shared_wind_strength",
+        settings.sharedWindStrength);
+    settings.sharedWindScaleMeters = settingsJson.value(
+        "shared_wind_scale_meters",
+        settings.sharedWindScaleMeters);
+    settings.sharedWindSpeed = settingsJson.value(
+        "shared_wind_speed",
+        settings.sharedWindSpeed);
+    settings.contactFadeSeconds = settingsJson.value(
+        "contact_fade_seconds",
+        settings.contactFadeSeconds);
+    const auto parseColour = [](const json& value,
+                                invisible_places::io::Float3 fallback) {
+        if (!value.is_array() || value.size() != 3U) {
+            return fallback;
+        }
+        try {
+            return invisible_places::io::Float3{
+                value.at(0).get<float>(),
+                value.at(1).get<float>(),
+                value.at(2).get<float>(),
+            };
+        } catch (const json::exception&) {
+            return fallback;
+        }
+    };
+    if (settingsJson.contains("rock_response") &&
+        settingsJson.at("rock_response").is_object()) {
+        const auto& response = settingsJson.at("rock_response");
+        settings.rockResponse.radiusMeters = response.value(
+            "radius_meters",
+            settings.rockResponse.radiusMeters);
+        settings.rockResponse.opacityAdd = response.value(
+            "opacity_add",
+            settings.rockResponse.opacityAdd);
+        settings.rockResponse.emissionAdd = response.value(
+            "emission_add",
+            settings.rockResponse.emissionAdd);
+        if (response.contains("colourise")) {
+            settings.rockResponse.colourise = parseColour(
+                response.at("colourise"),
+                settings.rockResponse.colourise);
+        }
+        settings.rockResponse.colouriseAmount = response.value(
+            "colourise_amount",
+            settings.rockResponse.colouriseAmount);
+        settings.rockResponse.persistenceSeconds = response.value(
+            "persistence_seconds",
+            settings.rockResponse.persistenceSeconds);
+    }
+    if (settingsJson.contains("vegetation_response") &&
+        settingsJson.at("vegetation_response").is_object()) {
+        const auto& response = settingsJson.at("vegetation_response");
+        settings.vegetationResponse.radiusMeters = response.value(
+            "radius_meters",
+            settings.vegetationResponse.radiusMeters);
+        settings.vegetationResponse.opacityAdd = response.value(
+            "opacity_add",
+            settings.vegetationResponse.opacityAdd);
+        settings.vegetationResponse.emissionAdd = response.value(
+            "emission_add",
+            settings.vegetationResponse.emissionAdd);
+        if (response.contains("colourise")) {
+            settings.vegetationResponse.colourise = parseColour(
+                response.at("colourise"),
+                settings.vegetationResponse.colourise);
+        }
+        settings.vegetationResponse.colouriseAmount = response.value(
+            "colourise_amount",
+            settings.vegetationResponse.colouriseAmount);
+        settings.vegetationResponse.persistenceSeconds = response.value(
+            "persistence_seconds",
+            settings.vegetationResponse.persistenceSeconds);
+        settings.vegetationResponse.twinkle = response.value(
+            "twinkle",
+            settings.vegetationResponse.twinkle);
+        settings.vegetationResponse.streamDepthMeters = response.value(
+            "stream_depth_meters",
+            settings.vegetationResponse.streamDepthMeters);
+    }
     settings.animationDurationSeconds = std::clamp(
         settingsJson.value("animation_duration_seconds", settings.animationDurationSeconds),
         0.0F,
@@ -4133,7 +4296,8 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
             settings.emitterMotions.push_back(ParseWaterDynamicMeshEmitterMotion(motionJson));
         }
     }
-    return settings;
+    return invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+        std::move(settings));
 }
 
 WaterDynamicMeshFlowSettings ProjectLevelWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings) {

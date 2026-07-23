@@ -20,7 +20,7 @@ The central idea is that data already present in the point cloud can become visu
 - **Data-driven art direction:** render parameters can be constant values or field-mapped controls with input/output ranges, layer statistics, clamp, invert, and gamma shaping.
 - **Hybrid capture scenes:** point-cloud layers and Gaussian splat layers share the same camera, scene, and project workflow, so survey geometry and photogrammetric/3DGS material can be composed together.
 - **Postproduction-friendly output:** preview-density EXR stacks currently write `beauty.RGB`, `alpha.A`, and `depth.Z`, while Quick MP4 export gives fast review movies through `ffmpeg`.
-- **Portable project state:** schema-43 JSON stores authored scenes, animation, styles, water controls, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
+- **Portable project state:** schema-44 JSON stores authored scenes, animation, styles, water controls, and compact cache manifests; derived shared-surface and settled Flow-path payloads live in validated sidecars rather than bloating the project file.
 
 ## Current capabilities
 
@@ -81,10 +81,11 @@ The central idea is that data already present in the point cloud can become visu
 
 ### Export and persistence
 
-- Saves and reloads schema-43 project JSON containing authoritative scene density groups, point-cloud styles, camera shots, animation paths, saved visuals, water state/cache manifests, and export selections.
-- Persists the shared schema-3 water surface cache as a scene-local `.surfacecache` and settled generated Flow branches as `.flowpathcache`, with project-local fallback paths when scene storage is unavailable.
-- Builds the shared 10 mm Rain/Flow/Seepage surface from one complete 2 mm ROCK/SAND/VEG bundle (or the nearest complete fallback bundle), so density changes and effect tuning do not rescan or mix role sources.
+- Saves and reloads schema-44 project JSON containing authoritative scene density groups, point-cloud styles, camera shots, animation paths, saved visuals, water state/cache manifests, and export selections.
+- Persists the shared schema-4 water surface cache as a scene-local `.surfacecache` and settled generated Flow branches as `.flowpathcache`, with project-local fallback paths when scene storage is unavailable.
+- Builds the shared 10 mm Rain/Flow/Seepage surface from one complete 2 mm ROCK/SAND/VEG bundle (or the nearest complete fallback bundle), and folds the active scene's 5 mm `MESHSampled` point cloud into a separate Ground tier for Mesh Flow. Density changes and effect tuning therefore do not rescan or mix role sources.
 - Keeps Rain near-surface squish, ROCK/VEG response tuning, Flow trail visibility, and Seepage reach/width/prominence as live parameter updates over settled cache-derived support.
+- Runs Mesh Flow as a fixed-capacity GPU simulation over the resident Ground table. Automatic sources begin near the scene's +X edge and shift between dry concavity focus and wider Rain-driven spawning; authored emitters and the Mesh Flow Rain envelope remain available for shot-specific control without generating a CPU point cloud.
 - Exports selected saved animations and saved visuals as batched Quick MP4 files.
 - Exports preview-density EXR animation stacks.
 - Writes EXR `beauty.RGB`, `alpha.A`, and `depth.Z` channels.
@@ -179,7 +180,7 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 - Each gSplat file is paired with a same-stem `.txt` file containing a 4x4 transform matrix.
 - `ffmpeg` is expected at `/opt/homebrew/bin/ffmpeg` for Fast Preview / Quick MP4 export.
 
-See [Scene-Wide Point-Cloud Density Switching](docs/scene_point_cloud_density_switching.md) for the scene catalog, transactional loading, rendering compensation, water routing, and schema-43 contracts.
+See [Scene-Wide Point-Cloud Density Switching](docs/scene_point_cloud_density_switching.md) for the scene catalog, transactional loading, rendering compensation, water routing, and schema-44 contracts.
 
 ## Current status
 

@@ -72,7 +72,7 @@ STATE_WATER_KEYS = (
 
 
 def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
-    """Apply the schema-43/18 parameter-only visibility and tuning migration."""
+    """Apply the schema-44/18 parameter-only visibility and tuning migration."""
 
     value["water_show_flow_trails" if project else "show_flow_trails"] = value.get(
         "water_show_flow_trails" if project else "show_flow_trails", True
@@ -108,6 +108,73 @@ def upgrade_water_contract(value: dict[str, Any], *, project: bool) -> None:
                 "stream_width_meters": 0.010,
                 "stream_spread": 0.65,
             },
+        )
+
+    mesh_flow = value.get("water_dynamic_mesh_flow_settings")
+    if isinstance(mesh_flow, dict):
+        mesh_flow.setdefault("show_trails", True)
+        mesh_flow.setdefault("automatic_sources", True)
+        mesh_flow.setdefault("particle_capacity", 4096)
+        mesh_flow.setdefault("history_length", 24)
+        mesh_flow.setdefault("source_band_width_meters", 0.35)
+        mesh_flow.setdefault("dry_concavity_focus", 0.75)
+        mesh_flow.setdefault("rain_spawn_spread", 0.80)
+        mesh_flow.setdefault("particle_noise_strength", 0.32)
+        mesh_flow.setdefault("particle_noise_scale_meters", 0.18)
+        mesh_flow.setdefault("particle_noise_speed", 0.40)
+        mesh_flow.setdefault("shared_wind_strength", 0.18)
+        mesh_flow.setdefault("shared_wind_scale_meters", 2.4)
+        mesh_flow.setdefault("shared_wind_speed", 0.06)
+        mesh_flow.setdefault("contact_fade_seconds", 0.8)
+        mesh_flow.setdefault(
+            "rock_response",
+            {
+                "radius_meters": 0.12,
+                "opacity_add": 0.16,
+                "emission_add": 0.35,
+                "colourise": [0.18, 0.42, 0.55],
+                "colourise_amount": 0.45,
+                "persistence_seconds": 2.5,
+            },
+        )
+        mesh_flow.setdefault(
+            "vegetation_response",
+            {
+                "radius_meters": 0.18,
+                "opacity_add": 0.14,
+                "emission_add": 0.55,
+                "colourise": [0.18, 0.55, 0.48],
+                "colourise_amount": 0.50,
+                "persistence_seconds": 3.0,
+                "twinkle": 1.4,
+                "stream_depth_meters": 0.45,
+            },
+        )
+
+    for scenario in value.get("water_scenarios", []):
+        if not isinstance(scenario, dict):
+            continue
+        state = scenario.get("state")
+        if not isinstance(state, dict):
+            continue
+        scenario_name = (
+            str(scenario.get("id", "")) + " " +
+            str(scenario.get("name", ""))
+        ).lower()
+        contemporary = "contemporary" in scenario_name
+        state.setdefault("mesh_flow_level", 0.18 if contemporary else 0.45)
+        state.setdefault(
+            "mesh_flow_rain_gain",
+            0.30 if contemporary else 1.0,
+        )
+        state.setdefault("mesh_flow_persistence_scale", 1.0)
+        state.setdefault(
+            "mesh_flow_rain_rise_seconds",
+            3.0 if contemporary else 8.0,
+        )
+        state.setdefault(
+            "mesh_flow_rain_recession_seconds",
+            18.0 if contemporary else 75.0,
         )
 
     containers = [value]
@@ -219,7 +286,7 @@ def authored_state(
 
 
 def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
-    project["schema_version"] = 43
+    project["schema_version"] = 44
     upgrade_water_contract(project, project=True)
     state = authored_state(project, required=False)
     if state is not None:
@@ -390,7 +457,7 @@ def build_validation_project(
     project: dict[str, Any], fixture: dict[str, Any]
 ) -> dict[str, Any]:
     validation = copy.deepcopy(project)
-    validation["schema_version"] = 43
+    validation["schema_version"] = 44
     upgrade_water_contract(validation, project=True)
     validation["project_name"] = "SampleScene Validation"
     validation["layers"] = clone_sample_layers(project)
@@ -424,6 +491,9 @@ def build_validation_project(
     for key, value in fixture.items():
         if key not in {"schema_version", "fixture_metadata", *STATE_WATER_KEYS}:
             validation[key] = copy.deepcopy(value)
+    # Fixture-owned project settings are copied after the main-project
+    # migration so apply the schema-44 defaults to the final merged document.
+    upgrade_water_contract(validation, project=True)
 
     validation_state = {
         "scene_group": fixture["fixture_metadata"]["scene_group"],
@@ -513,9 +583,12 @@ def main() -> int:
         if state is None:
             raise ValueError("The main project no longer contains the authored fixture objects")
         fixture = build_water_fixture(project, state)
+        upgrade_water_contract(fixture, project=False)
         atomic_write_json(fixture_path, fixture)
     else:
         fixture = validate_water_fixture(load_json(fixture_path))
+        upgrade_water_contract(fixture, project=False)
+        atomic_write_json(fixture_path, fixture)
 
     validation = build_validation_project(project, fixture)
     atomic_write_json(arguments.validation_project.resolve(), validation)

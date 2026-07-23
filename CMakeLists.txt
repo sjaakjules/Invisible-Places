@@ -83,6 +83,7 @@ set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_rain_impact.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_mesh_flow_contact.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rain_impact_rock_model.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_stylisation.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/water_flow_gpu_common.glsl"
@@ -300,15 +301,15 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             PROPERTIES LABELS gui_smoke
         )
         add_test(
-            NAME dynamic-mesh-flow-site3-gui-smoke
+            NAME dynamic-mesh-flow-ground-gui-smoke
             COMMAND
                 $<TARGET_FILE:invisible_places>
                 "${CMAKE_CURRENT_SOURCE_DIR}/Data"
-                --gui-smoke dynamic-mesh-flow-site3
+                --gui-smoke dynamic-mesh-flow-ground
                 --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke"
         )
         set_tests_properties(
-            dynamic-mesh-flow-site3-gui-smoke
+            dynamic-mesh-flow-ground-gui-smoke
             PROPERTIES LABELS gui_smoke
         )
         add_test(

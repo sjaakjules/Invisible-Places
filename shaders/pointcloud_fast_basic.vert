@@ -98,6 +98,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
+#include "pointcloud_mesh_flow_contact.glsl"
 
 const uint kWaterTrailRoleFieldSlot = 0u;
 const uint kWaterTrailSeedFieldSlot = 5u;
@@ -113,6 +114,7 @@ const uint kWaterTrailAgeFieldSlot = 15u;
 const uint kWaterTrailSpeedFieldSlot = 16u;
 const uint kWaterTrailWidthFieldSlot = 17u;
 const uint kWaterTrailStreakLengthFieldSlot = 18u;
+const uint kWaterTrailConfidenceFieldSlot = 19u;
 const uint kWaterTrailFeatureTypeFieldSlot = 21u;
 const uint kWaterTrailTangentZFieldSlot = 24u;
 const uint kWaterTrailLaneIndexFieldSlot = 25u;
@@ -243,7 +245,16 @@ float WaterTrailVisibility(uint pointIndex) {
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.10);
     const float routeEndFade = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
-    return WaterTrailActivityGate(pointIndex) * routeEndFade;
+    const float meshTerminalFade =
+        abs(LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex) - 5.0) < 0.5
+            ? clamp(
+                  LoadScalarFieldValueForPoint(
+                      kWaterTrailConfidenceFieldSlot,
+                      pointIndex),
+                  0.0,
+                  1.0)
+            : 1.0;
+    return WaterTrailActivityGate(pointIndex) * routeEndFade * meshTerminalFade;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -364,6 +375,11 @@ void main() {
     const SparseRippleComposite sparseRipple =
         ResolveSparseRippleComposite(resolvedPosition, pointNormal, pointIndex, uniforms.depthParameters.x);
     const RainImpactComposite rainImpact = ResolveRainImpactComposite(resolvedPosition, pointNormal);
+    const MeshFlowContactComposite meshFlowContact =
+        ResolveMeshFlowContactComposite(
+            resolvedPosition,
+            pointNormal,
+            uniforms.depthParameters.x);
     const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
     const float basePointSize =
         worldSizedScreenSprites
@@ -375,9 +391,27 @@ void main() {
         : 1.0;
     const float minPointSize = max(1.0, styleData.renderParams3.y);
     const float maxPointSize = max(minPointSize, styleData.renderParams3.z);
+    const float meshTerminalSizeFade =
+        WaterTrailOverlayEnabled() &&
+                abs(
+                    LoadScalarFieldValueForPoint(
+                        kWaterTrailFeatureTypeFieldSlot,
+                        pointIndex) -
+                    5.0) <
+                    0.5
+            ? sqrt(
+                  clamp(
+                      LoadScalarFieldValueForPoint(
+                          kWaterTrailConfidenceFieldSlot,
+                          pointIndex),
+                      0.0,
+                      1.0))
+            : 1.0;
     const float resolvedPointSize =
         ((basePointSize * flowWidthScale * sparseRipple.pointSizeMultiply *
-          rainImpact.pointSizeMultiply) + sparseRipple.pointSizeAdd) * footprintScale;
+          rainImpact.pointSizeMultiply *
+          meshFlowContact.pointSizeMultiply) + sparseRipple.pointSizeAdd) *
+        footprintScale * meshTerminalSizeFade;
     gl_PointSize = waterTrailVisibility <= 0.0
         ? 0.0
         : RippleFiniteFloat(resolvedPointSize)

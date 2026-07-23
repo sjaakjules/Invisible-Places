@@ -89,6 +89,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
+#include "pointcloud_mesh_flow_contact.glsl"
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
@@ -312,13 +313,27 @@ vec3 ResolveBaseColor() {
     const SparseRippleComposite sparseRipple =
         ResolveSparseRippleComposite(inWorldPosition, inPointNormal, inPointIndex, styleData.renderParams3.w);
     const RainImpactComposite rainImpact = ResolveRainImpactComposite(inWorldPosition, inPointNormal);
-    return ApplyRainImpactColour(
-        ApplySparseRippleColor(
-            ApplyWaterEffectColor(
-                mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
-                waterEffectScale),
-            sparseRipple),
-        rainImpact);
+    const MeshFlowContactComposite meshFlowContact =
+        ResolveMeshFlowContactComposite(
+            inWorldPosition,
+            inPointNormal,
+            uniforms.depthParameters.x);
+    const vec3 composedColour =
+        ApplyMeshFlowContactColour(
+            ApplyRainImpactColour(
+                ApplySparseRippleColor(
+                    ApplyWaterEffectColor(
+                        mix(baseColor, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+                        waterEffectScale),
+                    sparseRipple),
+                rainImpact),
+            meshFlowContact);
+    // Fast Basic is intentionally opaque and has no separate emission target;
+    // represent Mesh Flow contact emission as a bounded colour lift.
+    return composedColour +
+           meshFlowContact.tint *
+               min(1.0, meshFlowContact.emissionAdd) *
+               0.35;
 }
 
 float WaterFlowCoverageNoise() {

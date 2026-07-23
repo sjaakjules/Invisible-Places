@@ -10267,6 +10267,14 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     document.dynamicMeshFlowSettings.meshPath = "Data/ExhibitionScene/Site3-MESH.ply";
     document.dynamicMeshFlowSettings.previewParticleLimit = 444U;
     document.dynamicMeshFlowSettings.gpuPreviewEnabled = true;
+    document.dynamicMeshFlowSettings.showTrails = false;
+    document.dynamicMeshFlowSettings.automaticSources = false;
+    document.dynamicMeshFlowSettings.particleCapacity = 6144U;
+    document.dynamicMeshFlowSettings.historyLength = 36U;
+    document.dynamicMeshFlowSettings.sourceBandWidthMeters = 0.48F;
+    document.dynamicMeshFlowSettings.sharedWindStrength = 0.29F;
+    document.dynamicMeshFlowSettings.rockResponse.persistenceSeconds = 5.0F;
+    document.dynamicMeshFlowSettings.vegetationResponse.twinkle = 2.1F;
     document.dynamicMeshFlowSettings.particlePresetName = "Turbulent";
     document.dynamicMeshFlowSettings.branchingStrength = 0.7F;
     document.dynamicMeshFlowSettings.eddyStrength = 0.8F;
@@ -10439,6 +10447,22 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     CHECK(loaded->dynamicMeshFlowSettings.meshPath.empty());
     CHECK(loaded->dynamicMeshFlowSettings.previewParticleLimit == 444U);
     CHECK(loaded->dynamicMeshFlowSettings.gpuPreviewEnabled);
+    CHECK_FALSE(loaded->dynamicMeshFlowSettings.showTrails);
+    CHECK_FALSE(loaded->dynamicMeshFlowSettings.automaticSources);
+    CHECK(loaded->dynamicMeshFlowSettings.particleCapacity == 6144U);
+    CHECK(loaded->dynamicMeshFlowSettings.historyLength == 36U);
+    CHECK(
+        loaded->dynamicMeshFlowSettings.sourceBandWidthMeters ==
+        Catch::Approx(0.48F));
+    CHECK(
+        loaded->dynamicMeshFlowSettings.sharedWindStrength ==
+        Catch::Approx(0.29F));
+    CHECK(
+        loaded->dynamicMeshFlowSettings.rockResponse.persistenceSeconds ==
+        Catch::Approx(5.0F));
+    CHECK(
+        loaded->dynamicMeshFlowSettings.vegetationResponse.twinkle ==
+        Catch::Approx(2.1F));
     CHECK(loaded->dynamicMeshFlowSettings.particlePresetName == "Turbulent");
     CHECK(loaded->dynamicMeshFlowSettings.branchingStrength == Catch::Approx(0.7F));
     CHECK(loaded->dynamicMeshFlowSettings.eddyStrength == Catch::Approx(0.8F));
@@ -10471,6 +10495,10 @@ TEST_CASE("Water source documents round-trip independently from projects", "[wat
     REQUIRE(legacySources.has_value());
     CHECK(legacySources->dynamicMeshFlowSettings.meshPath.generic_string() ==
           "Data/LegacyScene/Legacy-MESH.ply");
+    CHECK(legacySources->dynamicMeshFlowSettings.showTrails);
+    CHECK(legacySources->dynamicMeshFlowSettings.automaticSources);
+    CHECK(legacySources->dynamicMeshFlowSettings.particleCapacity == 4096U);
+    CHECK(legacySources->dynamicMeshFlowSettings.historyLength == 24U);
     REQUIRE(legacySources->emitters.size() == 1U);
     CHECK_FALSE(legacySources->emitters[0].pathProfileLocked);
     CHECK_FALSE(legacySources->emitters[0].laneProfileLocked);
@@ -11727,7 +11755,12 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
         const std::string savedJson{
             std::istreambuf_iterator<char>{savedAnimation},
             std::istreambuf_iterator<char>{}};
-        CHECK(savedJson.find("\"schema_version\": 11") != std::string::npos);
+        CHECK(
+            savedJson.find(
+                "\"schema_version\": " +
+                std::to_string(
+                    invisible_places::serialization::kAnimationDocumentSchemaVersion)) !=
+            std::string::npos);
         CHECK(savedJson.find("\"associated_layer_paths\"") != std::string::npos);
         CHECK(savedJson.find("\"still_camera_duration_seconds\"") != std::string::npos);
         CHECK(savedJson.find("\"linked_camera_id\": \"camera_entry\"") != std::string::npos);

@@ -19,9 +19,9 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 43U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 44U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 18U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 11U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 12U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 

@@ -284,6 +284,13 @@ struct WaterScenarioState {
     float seepageSpread = 0.0F;
     float rainLevel = 0.0F;
     float flowLevel = 1.0F;
+    // Mesh Flow has an independent dry baseline and Rain gain. Keeping the
+    // legacy defaults at one/zero preserves projects written before schema 44.
+    float meshFlowLevel = 1.0F;
+    float meshFlowRainGain = 0.0F;
+    float meshFlowPersistenceScale = 1.0F;
+    float meshFlowRainRiseSeconds = 0.0F;
+    float meshFlowRainRecessionSeconds = 0.0F;
     float seepageRainDelaySeconds = 0.0F;
     float seepageRainRiseSeconds = 0.0F;
     float seepageRainRecessionSeconds = 0.0F;
@@ -342,6 +349,13 @@ struct WaterScenarioTrack {
 };
 
 struct WaterSeepageRainEnvelope {
+    float sampleRateHz = 120.0F;
+    float durationSeconds = 0.0F;
+    std::vector<float> samples;
+    std::string fingerprint;
+};
+
+struct WaterMeshFlowRainEnvelope {
     float sampleRateHz = 120.0F;
     float durationSeconds = 0.0F;
     std::vector<float> samples;
@@ -960,21 +974,50 @@ struct WaterDynamicMeshParticlePreset {
     std::string_view label;
 };
 
+struct WaterDynamicMeshRockResponseSettings {
+    float radiusMeters = 0.12F;
+    float opacityAdd = 0.16F;
+    float emissionAdd = 0.35F;
+    invisible_places::io::Float3 colourise{0.18F, 0.42F, 0.55F};
+    float colouriseAmount = 0.45F;
+    float persistenceSeconds = 2.5F;
+};
+
+struct WaterDynamicMeshVegetationResponseSettings {
+    float radiusMeters = 0.18F;
+    float opacityAdd = 0.14F;
+    float emissionAdd = 0.55F;
+    invisible_places::io::Float3 colourise{0.18F, 0.55F, 0.48F};
+    float colouriseAmount = 0.50F;
+    float persistenceSeconds = 3.0F;
+    float twinkle = 1.4F;
+    float streamDepthMeters = 0.45F;
+};
+
 struct WaterDynamicMeshFlowSettings {
     bool enabled = false;
     bool gpuPreviewEnabled = true;
+    bool showTrails = true;
+    bool automaticSources = true;
     std::filesystem::path meshPath{};
     float cacheCellSizeMeters = 0.08F;
     float projectionSearchRadiusMeters = 1.25F;
     float ambiguityHeightMeters = 0.18F;
+    // The fixed-capacity runtime changes active particle/history counts through
+    // parameters; it does not resize buffers while a frame is in flight.
+    std::uint32_t particleCapacity = 4096U;
+    std::uint32_t historyLength = 24U;
+    float sourceBandWidthMeters = 0.35F;
+    float dryConcavityFocus = 0.75F;
+    float rainSpawnSpread = 0.80F;
     std::uint32_t previewParticleLimit = 560;
     std::uint32_t finalParticleLimit = 2400;
     float trailLengthMeters = 18.0F;
     float stepMeters = 0.12F;
     float trailWidthMeters = 0.005F;
     float trailStreakLengthMeters = 0.18F;
-    float surfaceOffsetMeters = 0.020F;
-    float speedMetersPerSecond = 0.62F;
+    float surfaceOffsetMeters = 0.006F;
+    float speedMetersPerSecond = 0.22F;
     float downhillWeight = 1.35F;
     float attractorWeight = 1.0F;
     float sourceVelocityWeight = 0.35F;
@@ -982,7 +1025,16 @@ struct WaterDynamicMeshFlowSettings {
     float branchingStrength = 0.36F;
     float eddyStrength = 0.08F;
     float topologyResponse = 0.65F;
-    float inertia = 0.64F;
+    float inertia = 0.76F;
+    float particleNoiseStrength = 0.32F;
+    float particleNoiseScaleMeters = 0.18F;
+    float particleNoiseSpeed = 0.40F;
+    float sharedWindStrength = 0.18F;
+    float sharedWindScaleMeters = 2.4F;
+    float sharedWindSpeed = 0.06F;
+    float contactFadeSeconds = 0.8F;
+    WaterDynamicMeshRockResponseSettings rockResponse{};
+    WaterDynamicMeshVegetationResponseSettings vegetationResponse{};
     float animationDurationSeconds = 4.0F;
     std::uint32_t seed = 29U;
     std::string particlePresetName = "Default";
@@ -1051,6 +1103,10 @@ struct WaterDynamicMeshFlowDiagnostics {
 [[nodiscard]] std::optional<WaterRainIntensityPreset> ParseWaterRainIntensityPresetName(std::string_view value);
 [[nodiscard]] WaterRainSettings DefaultWaterRainSettings();
 [[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
+[[nodiscard]] WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
+    WaterDynamicMeshFlowSettings settings);
+[[nodiscard]] std::string WaterDynamicMeshFlowSettingsFingerprint(
+    const WaterDynamicMeshFlowSettings& settings);
 [[nodiscard]] std::array<WaterDynamicMeshParticlePreset, 4> AllWaterDynamicMeshParticlePresets();
 [[nodiscard]] WaterDynamicMeshFlowSettings ApplyWaterDynamicMeshParticlePreset(
     WaterDynamicMeshFlowSettings settings,
@@ -1060,10 +1116,33 @@ struct WaterDynamicMeshFlowDiagnostics {
 
 [[nodiscard]] WaterSeepageLookSettings DefaultWaterSeepageLookSettings();
 [[nodiscard]] std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions();
+[[nodiscard]] WaterScenarioState SanitizeWaterScenarioState(WaterScenarioState state);
 [[nodiscard]] WaterScenarioState EvaluateWaterScenarioTrack(
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
     float normalizedPosition);
+[[nodiscard]] float EffectiveWaterDynamicMeshFlowLevel(
+    const WaterScenarioState& state,
+    float effectiveRainLevel);
+[[nodiscard]] float EffectiveWaterDynamicMeshPersistenceSeconds(
+    float authoredPersistenceSeconds,
+    const WaterScenarioState& state);
+[[nodiscard]] std::string WaterDynamicMeshFlowScenarioFingerprint(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition);
+[[nodiscard]] WaterMeshFlowRainEnvelope BuildWaterMeshFlowRainEnvelope(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds,
+    float sampleRateHz = 120.0F,
+    std::size_t maxSamples = 1'000'000U);
+[[nodiscard]] float EvaluateWaterMeshFlowRainEnvelope(
+    const WaterMeshFlowRainEnvelope& envelope,
+    float timeSeconds);
+[[nodiscard]] std::string WaterMeshFlowRainEnvelopeFingerprint(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds);
 [[nodiscard]] WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
     const WaterScenarioTrack& track,
     std::uint32_t nodeId,

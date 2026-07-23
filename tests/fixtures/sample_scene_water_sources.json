@@ -1608,7 +1608,47 @@
     "trail_length_meters": 0.949999988079071,
     "trail_profile_name": "Default_edited",
     "trail_streak_length_meters": 0.05000000074505806,
-    "trail_width_meters": 0.004999999888241291
+    "trail_width_meters": 0.004999999888241291,
+    "show_trails": true,
+    "automatic_sources": true,
+    "particle_capacity": 4096,
+    "history_length": 24,
+    "source_band_width_meters": 0.35,
+    "dry_concavity_focus": 0.75,
+    "rain_spawn_spread": 0.8,
+    "particle_noise_strength": 0.32,
+    "particle_noise_scale_meters": 0.18,
+    "particle_noise_speed": 0.4,
+    "shared_wind_strength": 0.18,
+    "shared_wind_scale_meters": 2.4,
+    "shared_wind_speed": 0.06,
+    "contact_fade_seconds": 0.8,
+    "rock_response": {
+      "radius_meters": 0.12,
+      "opacity_add": 0.16,
+      "emission_add": 0.35,
+      "colourise": [
+        0.18,
+        0.42,
+        0.55
+      ],
+      "colourise_amount": 0.45,
+      "persistence_seconds": 2.5
+    },
+    "vegetation_response": {
+      "radius_meters": 0.18,
+      "opacity_add": 0.14,
+      "emission_add": 0.55,
+      "colourise": [
+        0.18,
+        0.55,
+        0.48
+      ],
+      "colourise_amount": 0.5,
+      "persistence_seconds": 3.0,
+      "twinkle": 1.4,
+      "stream_depth_meters": 0.45
+    }
   },
   "water_rain_settings": {
     "active_particle_count": 9000,

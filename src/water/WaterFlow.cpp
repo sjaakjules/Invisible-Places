@@ -3328,6 +3328,199 @@ WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings() {
     return {};
 }
 
+WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
+    WaterDynamicMeshFlowSettings settings) {
+    const auto finiteOr = [](float value, float fallback) {
+        return std::isfinite(value) ? value : fallback;
+    };
+    settings.cacheCellSizeMeters = std::clamp(
+        finiteOr(settings.cacheCellSizeMeters, 0.08F),
+        0.005F,
+        5.0F);
+    settings.projectionSearchRadiusMeters = std::clamp(
+        finiteOr(settings.projectionSearchRadiusMeters, 1.25F),
+        0.005F,
+        25.0F);
+    settings.ambiguityHeightMeters = std::clamp(
+        finiteOr(settings.ambiguityHeightMeters, 0.18F),
+        0.0F,
+        25.0F);
+    settings.particleCapacity = std::clamp(settings.particleCapacity, 1U, 262'144U);
+    settings.historyLength = std::clamp(settings.historyLength, 2U, 256U);
+    settings.sourceBandWidthMeters = std::clamp(
+        finiteOr(settings.sourceBandWidthMeters, 0.35F),
+        0.0F,
+        10.0F);
+    settings.dryConcavityFocus = std::clamp(
+        finiteOr(settings.dryConcavityFocus, 0.75F),
+        0.0F,
+        1.0F);
+    settings.rainSpawnSpread = std::clamp(
+        finiteOr(settings.rainSpawnSpread, 0.80F),
+        0.0F,
+        4.0F);
+    settings.previewParticleLimit = std::clamp(
+        settings.previewParticleLimit,
+        1U,
+        100'000U);
+    settings.finalParticleLimit = std::clamp(
+        settings.finalParticleLimit,
+        1U,
+        250'000U);
+    settings.trailLengthMeters = std::clamp(
+        finiteOr(settings.trailLengthMeters, 18.0F),
+        0.02F,
+        100.0F);
+    settings.stepMeters = std::clamp(
+        finiteOr(settings.stepMeters, 0.12F),
+        0.002F,
+        5.0F);
+    settings.trailWidthMeters = std::clamp(
+        finiteOr(settings.trailWidthMeters, 0.005F),
+        0.0005F,
+        1.0F);
+    settings.trailStreakLengthMeters = std::clamp(
+        finiteOr(settings.trailStreakLengthMeters, 0.18F),
+        0.001F,
+        5.0F);
+    settings.surfaceOffsetMeters = std::clamp(
+        finiteOr(settings.surfaceOffsetMeters, 0.006F),
+        -1.0F,
+        1.0F);
+    settings.speedMetersPerSecond = std::clamp(
+        finiteOr(settings.speedMetersPerSecond, 0.22F),
+        0.001F,
+        100.0F);
+    settings.downhillWeight = std::clamp(
+        finiteOr(settings.downhillWeight, 1.35F),
+        0.0F,
+        10.0F);
+    settings.attractorWeight = std::clamp(
+        finiteOr(settings.attractorWeight, 1.0F),
+        0.0F,
+        10.0F);
+    settings.sourceVelocityWeight = std::clamp(
+        finiteOr(settings.sourceVelocityWeight, 0.35F),
+        0.0F,
+        10.0F);
+    settings.curlStrength = std::clamp(
+        finiteOr(settings.curlStrength, 0.18F),
+        0.0F,
+        10.0F);
+    settings.branchingStrength = std::clamp(
+        finiteOr(settings.branchingStrength, 0.36F),
+        0.0F,
+        10.0F);
+    settings.eddyStrength = std::clamp(
+        finiteOr(settings.eddyStrength, 0.08F),
+        0.0F,
+        10.0F);
+    settings.topologyResponse = std::clamp(
+        finiteOr(settings.topologyResponse, 0.65F),
+        0.0F,
+        10.0F);
+    settings.inertia = std::clamp(
+        finiteOr(settings.inertia, 0.76F),
+        0.0F,
+        0.98F);
+    settings.particleNoiseStrength = std::clamp(
+        finiteOr(settings.particleNoiseStrength, 0.32F),
+        0.0F,
+        4.0F);
+    settings.particleNoiseScaleMeters = std::clamp(
+        finiteOr(settings.particleNoiseScaleMeters, 0.18F),
+        0.001F,
+        100.0F);
+    settings.particleNoiseSpeed = std::clamp(
+        finiteOr(settings.particleNoiseSpeed, 0.40F),
+        0.0F,
+        10.0F);
+    settings.sharedWindStrength = std::clamp(
+        finiteOr(settings.sharedWindStrength, 0.18F),
+        0.0F,
+        4.0F);
+    settings.sharedWindScaleMeters = std::clamp(
+        finiteOr(settings.sharedWindScaleMeters, 2.4F),
+        0.001F,
+        100.0F);
+    settings.sharedWindSpeed = std::clamp(
+        finiteOr(settings.sharedWindSpeed, 0.06F),
+        0.0F,
+        10.0F);
+    settings.contactFadeSeconds = std::clamp(
+        finiteOr(settings.contactFadeSeconds, 0.8F),
+        0.0F,
+        30.0F);
+    settings.animationDurationSeconds = std::clamp(
+        finiteOr(settings.animationDurationSeconds, 4.0F),
+        0.0F,
+        86'400.0F);
+
+    const auto sanitizeColour = [&](invisible_places::io::Float3 value,
+                                    invisible_places::io::Float3 fallback) {
+        value.x = std::clamp(finiteOr(value.x, fallback.x), 0.0F, 1.0F);
+        value.y = std::clamp(finiteOr(value.y, fallback.y), 0.0F, 1.0F);
+        value.z = std::clamp(finiteOr(value.z, fallback.z), 0.0F, 1.0F);
+        return value;
+    };
+    settings.rockResponse.radiusMeters = std::clamp(
+        finiteOr(settings.rockResponse.radiusMeters, 0.12F),
+        0.0F,
+        0.75F);
+    settings.rockResponse.opacityAdd = std::clamp(
+        finiteOr(settings.rockResponse.opacityAdd, 0.16F),
+        0.0F,
+        4.0F);
+    settings.rockResponse.emissionAdd = std::clamp(
+        finiteOr(settings.rockResponse.emissionAdd, 0.35F),
+        0.0F,
+        4.0F);
+    settings.rockResponse.colourise = sanitizeColour(
+        settings.rockResponse.colourise,
+        {0.18F, 0.42F, 0.55F});
+    settings.rockResponse.colouriseAmount = std::clamp(
+        finiteOr(settings.rockResponse.colouriseAmount, 0.45F),
+        0.0F,
+        1.0F);
+    settings.rockResponse.persistenceSeconds = std::clamp(
+        finiteOr(settings.rockResponse.persistenceSeconds, 2.5F),
+        0.0F,
+        30.0F);
+
+    settings.vegetationResponse.radiusMeters = std::clamp(
+        finiteOr(settings.vegetationResponse.radiusMeters, 0.18F),
+        0.0F,
+        0.75F);
+    settings.vegetationResponse.opacityAdd = std::clamp(
+        finiteOr(settings.vegetationResponse.opacityAdd, 0.14F),
+        0.0F,
+        4.0F);
+    settings.vegetationResponse.emissionAdd = std::clamp(
+        finiteOr(settings.vegetationResponse.emissionAdd, 0.55F),
+        0.0F,
+        4.0F);
+    settings.vegetationResponse.colourise = sanitizeColour(
+        settings.vegetationResponse.colourise,
+        {0.18F, 0.55F, 0.48F});
+    settings.vegetationResponse.colouriseAmount = std::clamp(
+        finiteOr(settings.vegetationResponse.colouriseAmount, 0.50F),
+        0.0F,
+        1.0F);
+    settings.vegetationResponse.persistenceSeconds = std::clamp(
+        finiteOr(settings.vegetationResponse.persistenceSeconds, 3.0F),
+        0.0F,
+        30.0F);
+    settings.vegetationResponse.twinkle = std::clamp(
+        finiteOr(settings.vegetationResponse.twinkle, 1.4F),
+        0.0F,
+        4.0F);
+    settings.vegetationResponse.streamDepthMeters = std::clamp(
+        finiteOr(settings.vegetationResponse.streamDepthMeters, 0.45F),
+        0.0F,
+        2.0F);
+    return settings;
+}
+
 std::array<WaterDynamicMeshParticlePreset, 4> AllWaterDynamicMeshParticlePresets() {
     return {{
         {.name = "Default", .label = "Default"},
@@ -3412,7 +3605,8 @@ WaterDynamicMeshFlowSettings ApplyWaterDynamicMeshParticlePreset(
     settings.finalParticleLimit = 2400U;
     settings.trailLengthMeters = 18.0F;
     settings.stepMeters = 0.12F;
-    settings.speedMetersPerSecond = 0.62F;
+    settings.speedMetersPerSecond = 0.22F;
+    settings.surfaceOffsetMeters = 0.006F;
     settings.downhillWeight = 1.35F;
     settings.attractorWeight = 1.0F;
     settings.sourceVelocityWeight = 0.35F;
@@ -3420,7 +3614,7 @@ WaterDynamicMeshFlowSettings ApplyWaterDynamicMeshParticlePreset(
     settings.branchingStrength = 0.36F;
     settings.eddyStrength = 0.08F;
     settings.topologyResponse = 0.65F;
-    settings.inertia = 0.64F;
+    settings.inertia = 0.76F;
     return settings;
 }
 
@@ -4921,16 +5115,37 @@ glm::vec3 SeepageEnvironmentDirection(const WaterSeepageLookSettings& look) {
 }
 
 float SanitizeSeepageTimingSeconds(float value) {
-    return std::isfinite(value) ? std::max(0.0F, value) : 0.0F;
+    return std::clamp(
+        std::isfinite(value) ? value : 0.0F,
+        0.0F,
+        86'400.0F);
 }
 
-WaterScenarioState SanitizeWaterScenarioSeepageTiming(WaterScenarioState state) {
+WaterScenarioState SanitizeWaterScenarioStateImpl(WaterScenarioState state) {
+    state.seepageLevel = Clamp01(SeepageFiniteOr(state.seepageLevel, 1.0F));
+    state.seepageSpread = Clamp01(SeepageFiniteOr(state.seepageSpread, 0.0F));
+    state.rainLevel = Clamp01(SeepageFiniteOr(state.rainLevel, 0.0F));
+    state.flowLevel = Clamp01(SeepageFiniteOr(state.flowLevel, 1.0F));
+    state.meshFlowLevel = Clamp01(SeepageFiniteOr(state.meshFlowLevel, 1.0F));
+    state.meshFlowRainGain = std::clamp(
+        SeepageFiniteOr(state.meshFlowRainGain, 0.0F),
+        0.0F,
+        4.0F);
+    state.meshFlowPersistenceScale = std::clamp(
+        SeepageFiniteOr(state.meshFlowPersistenceScale, 1.0F),
+        0.0F,
+        8.0F);
+    state.meshFlowRainRiseSeconds = SanitizeSeepageTimingSeconds(
+        state.meshFlowRainRiseSeconds);
+    state.meshFlowRainRecessionSeconds = SanitizeSeepageTimingSeconds(
+        state.meshFlowRainRecessionSeconds);
     state.seepageRainDelaySeconds = SanitizeSeepageTimingSeconds(
         state.seepageRainDelaySeconds);
     state.seepageRainRiseSeconds = SanitizeSeepageTimingSeconds(
         state.seepageRainRiseSeconds);
     state.seepageRainRecessionSeconds = SanitizeSeepageTimingSeconds(
         state.seepageRainRecessionSeconds);
+    state.transitionAmount = Clamp01(SeepageFiniteOr(state.transitionAmount, 0.0F));
     return state;
 }
 
@@ -5062,6 +5277,121 @@ void ApplySeepageRuntimeScenarioAndAnimation(
 
 }  // namespace
 
+WaterScenarioState SanitizeWaterScenarioState(WaterScenarioState state) {
+    return SanitizeWaterScenarioStateImpl(std::move(state));
+}
+
+std::string WaterDynamicMeshFlowSettingsFingerprint(
+    const WaterDynamicMeshFlowSettings& rawSettings) {
+    const auto settings = SanitizeWaterDynamicMeshFlowSettings(rawSettings);
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    const auto fingerprintBool = [&](bool value) {
+        SeepageFingerprintU32(&hash, value ? 1U : 0U);
+    };
+    const auto fingerprintPoint = [&](const invisible_places::io::Float3& point) {
+        SeepageFingerprintFloat(&hash, point.x);
+        SeepageFingerprintFloat(&hash, point.y);
+        SeepageFingerprintFloat(&hash, point.z);
+    };
+    fingerprintBool(settings.enabled);
+    fingerprintBool(settings.gpuPreviewEnabled);
+    fingerprintBool(settings.showTrails);
+    fingerprintBool(settings.automaticSources);
+    SeepageFingerprintText(&hash, settings.meshPath.generic_string());
+    SeepageFingerprintFloat(&hash, settings.cacheCellSizeMeters);
+    SeepageFingerprintFloat(&hash, settings.projectionSearchRadiusMeters);
+    SeepageFingerprintFloat(&hash, settings.ambiguityHeightMeters);
+    SeepageFingerprintU32(&hash, settings.particleCapacity);
+    SeepageFingerprintU32(&hash, settings.historyLength);
+    SeepageFingerprintFloat(&hash, settings.sourceBandWidthMeters);
+    SeepageFingerprintFloat(&hash, settings.dryConcavityFocus);
+    SeepageFingerprintFloat(&hash, settings.rainSpawnSpread);
+    SeepageFingerprintU32(&hash, settings.previewParticleLimit);
+    SeepageFingerprintU32(&hash, settings.finalParticleLimit);
+    SeepageFingerprintFloat(&hash, settings.trailLengthMeters);
+    SeepageFingerprintFloat(&hash, settings.stepMeters);
+    SeepageFingerprintFloat(&hash, settings.trailWidthMeters);
+    SeepageFingerprintFloat(&hash, settings.trailStreakLengthMeters);
+    SeepageFingerprintFloat(&hash, settings.surfaceOffsetMeters);
+    SeepageFingerprintFloat(&hash, settings.speedMetersPerSecond);
+    SeepageFingerprintFloat(&hash, settings.downhillWeight);
+    SeepageFingerprintFloat(&hash, settings.attractorWeight);
+    SeepageFingerprintFloat(&hash, settings.sourceVelocityWeight);
+    SeepageFingerprintFloat(&hash, settings.curlStrength);
+    SeepageFingerprintFloat(&hash, settings.branchingStrength);
+    SeepageFingerprintFloat(&hash, settings.eddyStrength);
+    SeepageFingerprintFloat(&hash, settings.topologyResponse);
+    SeepageFingerprintFloat(&hash, settings.inertia);
+    SeepageFingerprintFloat(&hash, settings.particleNoiseStrength);
+    SeepageFingerprintFloat(&hash, settings.particleNoiseScaleMeters);
+    SeepageFingerprintFloat(&hash, settings.particleNoiseSpeed);
+    SeepageFingerprintFloat(&hash, settings.sharedWindStrength);
+    SeepageFingerprintFloat(&hash, settings.sharedWindScaleMeters);
+    SeepageFingerprintFloat(&hash, settings.sharedWindSpeed);
+    SeepageFingerprintFloat(&hash, settings.contactFadeSeconds);
+    SeepageFingerprintFloat(&hash, settings.rockResponse.radiusMeters);
+    SeepageFingerprintFloat(&hash, settings.rockResponse.opacityAdd);
+    SeepageFingerprintFloat(&hash, settings.rockResponse.emissionAdd);
+    fingerprintPoint(settings.rockResponse.colourise);
+    SeepageFingerprintFloat(&hash, settings.rockResponse.colouriseAmount);
+    SeepageFingerprintFloat(&hash, settings.rockResponse.persistenceSeconds);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.radiusMeters);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.opacityAdd);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.emissionAdd);
+    fingerprintPoint(settings.vegetationResponse.colourise);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.colouriseAmount);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.persistenceSeconds);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.twinkle);
+    SeepageFingerprintFloat(&hash, settings.vegetationResponse.streamDepthMeters);
+    SeepageFingerprintFloat(&hash, settings.animationDurationSeconds);
+    SeepageFingerprintU32(&hash, settings.seed);
+    SeepageFingerprintText(&hash, settings.particlePresetName);
+    SeepageFingerprintText(&hash, settings.trailProfileName);
+    SeepageFingerprintU32(
+        &hash,
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            settings.attractors.size(),
+            std::numeric_limits<std::uint32_t>::max())));
+    for (const auto& attractor : settings.attractors) {
+        SeepageFingerprintU32(&hash, attractor.id);
+        SeepageFingerprintText(&hash, attractor.name);
+        fingerprintPoint(attractor.position);
+        SeepageFingerprintFloat(&hash, attractor.radiusMeters);
+        SeepageFingerprintFloat(&hash, attractor.strength);
+        fingerprintBool(attractor.enabled);
+        SeepageFingerprintU32(
+            &hash,
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                attractor.keyframes.size(),
+                std::numeric_limits<std::uint32_t>::max())));
+        for (const auto& keyframe : attractor.keyframes) {
+            SeepageFingerprintFloat(&hash, keyframe.timeSeconds);
+            fingerprintPoint(keyframe.position);
+        }
+    }
+    SeepageFingerprintU32(
+        &hash,
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            settings.emitterMotions.size(),
+            std::numeric_limits<std::uint32_t>::max())));
+    for (const auto& motion : settings.emitterMotions) {
+        SeepageFingerprintU32(&hash, motion.emitterId);
+        SeepageFingerprintText(&hash, motion.name);
+        fingerprintBool(motion.enabled);
+        SeepageFingerprintU32(
+            &hash,
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                motion.keyframes.size(),
+                std::numeric_limits<std::uint32_t>::max())));
+        for (const auto& keyframe : motion.keyframes) {
+            SeepageFingerprintFloat(&hash, keyframe.timeSeconds);
+            fingerprintPoint(keyframe.position);
+        }
+    }
+    return "water-dynamic-mesh-flow-settings-v1-" + SeepageFingerprintString(hash);
+}
+
 WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
     return {};
 }
@@ -5082,6 +5412,11 @@ std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
     historical.state.seepageLevel = 1.0F;
     historical.state.seepageSpread = 0.60F;
     historical.state.rainLevel = 0.0F;
+    historical.state.meshFlowLevel = 0.45F;
+    historical.state.meshFlowRainGain = 1.0F;
+    historical.state.meshFlowPersistenceScale = 1.0F;
+    historical.state.meshFlowRainRiseSeconds = 8.0F;
+    historical.state.meshFlowRainRecessionSeconds = 75.0F;
     historical.state.seepageRainDelaySeconds = 4.0F;
     historical.state.seepageRainRiseSeconds = 12.0F;
     historical.state.seepageRainRecessionSeconds = 60.0F;
@@ -5099,6 +5434,11 @@ std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
     contemporary.state.seepageLevel = 0.50F;
     contemporary.state.seepageSpread = 0.10F;
     contemporary.state.rainLevel = 0.0F;
+    contemporary.state.meshFlowLevel = 0.18F;
+    contemporary.state.meshFlowRainGain = 0.30F;
+    contemporary.state.meshFlowPersistenceScale = 1.0F;
+    contemporary.state.meshFlowRainRiseSeconds = 3.0F;
+    contemporary.state.meshFlowRainRecessionSeconds = 18.0F;
     contemporary.state.seepageRainDelaySeconds = 1.0F;
     contemporary.state.seepageRainRiseSeconds = 4.0F;
     contemporary.state.seepageRainRecessionSeconds = 15.0F;
@@ -5109,7 +5449,7 @@ WaterScenarioState EvaluateWaterScenarioTrack(
     const WaterScenarioTrack& track,
     const WaterScenarioDefinition& definition,
     float normalizedPosition) {
-    WaterScenarioState result = SanitizeWaterScenarioSeepageTiming(definition.state);
+    WaterScenarioState result = SanitizeWaterScenarioStateImpl(definition.state);
     result.transitionLook.reset();
     result.transitionAmount = 0.0F;
     if (track.keys.empty()) {
@@ -5128,10 +5468,10 @@ WaterScenarioState EvaluateWaterScenarioTrack(
             return left->position < right->position;
         });
     if (normalizedPosition <= ordered.front()->position) {
-        return SanitizeWaterScenarioSeepageTiming(ordered.front()->state);
+        return SanitizeWaterScenarioStateImpl(ordered.front()->state);
     }
     if (normalizedPosition >= ordered.back()->position) {
-        return SanitizeWaterScenarioSeepageTiming(ordered.back()->state);
+        return SanitizeWaterScenarioStateImpl(ordered.back()->state);
     }
     for (std::size_t index = 0U; index + 1U < ordered.size(); ++index) {
         const auto& left = *ordered[index];
@@ -5142,7 +5482,7 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         const float span = std::max(1.0e-6F, right.position - left.position);
         float amount = Clamp01((normalizedPosition - left.position) / span);
         if (left.interpolation == WaterScenarioInterpolation::Hold) {
-            return SanitizeWaterScenarioSeepageTiming(left.state);
+            return SanitizeWaterScenarioStateImpl(left.state);
         }
         if (left.interpolation == WaterScenarioInterpolation::Smooth) {
             amount = amount * amount * (3.0F - 2.0F * amount);
@@ -5151,6 +5491,26 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         result.seepageSpread = std::lerp(left.state.seepageSpread, right.state.seepageSpread, amount);
         result.rainLevel = std::lerp(left.state.rainLevel, right.state.rainLevel, amount);
         result.flowLevel = std::lerp(left.state.flowLevel, right.state.flowLevel, amount);
+        result.meshFlowLevel = std::lerp(
+            left.state.meshFlowLevel,
+            right.state.meshFlowLevel,
+            amount);
+        result.meshFlowRainGain = std::lerp(
+            left.state.meshFlowRainGain,
+            right.state.meshFlowRainGain,
+            amount);
+        result.meshFlowPersistenceScale = std::lerp(
+            left.state.meshFlowPersistenceScale,
+            right.state.meshFlowPersistenceScale,
+            amount);
+        result.meshFlowRainRiseSeconds = std::lerp(
+            SanitizeSeepageTimingSeconds(left.state.meshFlowRainRiseSeconds),
+            SanitizeSeepageTimingSeconds(right.state.meshFlowRainRiseSeconds),
+            amount);
+        result.meshFlowRainRecessionSeconds = std::lerp(
+            SanitizeSeepageTimingSeconds(left.state.meshFlowRainRecessionSeconds),
+            SanitizeSeepageTimingSeconds(right.state.meshFlowRainRecessionSeconds),
+            amount);
         result.seepageRainDelaySeconds = std::lerp(
             SanitizeSeepageTimingSeconds(left.state.seepageRainDelaySeconds),
             SanitizeSeepageTimingSeconds(right.state.seepageRainDelaySeconds),
@@ -5173,9 +5533,9 @@ WaterScenarioState EvaluateWaterScenarioTrack(
             result.transitionLook = SanitizeSeepageLook(right.state.seepageLook);
             result.transitionAmount = amount;
         }
-        return SanitizeWaterScenarioSeepageTiming(result);
+        return SanitizeWaterScenarioStateImpl(result);
     }
-    return SanitizeWaterScenarioSeepageTiming(ordered.back()->state);
+    return SanitizeWaterScenarioStateImpl(ordered.back()->state);
 }
 
 WaterSeepageNodeAnimationState EvaluateWaterSeepageNodeAnimationTrack(
@@ -5316,7 +5676,7 @@ std::string WaterSeepageRainEnvelopeFingerprint(
         &hash,
         std::max(0.0F, SeepageFiniteOr(durationSeconds, 0.0F)));
     const auto fingerprintState = [&](const WaterScenarioState& rawState) {
-        const auto state = SanitizeWaterScenarioSeepageTiming(rawState);
+        const auto state = SanitizeWaterScenarioStateImpl(rawState);
         SeepageFingerprintFloat(&hash, Clamp01(SeepageFiniteOr(state.rainLevel, 0.0F)));
         SeepageFingerprintFloat(&hash, state.seepageRainDelaySeconds);
         SeepageFingerprintFloat(&hash, state.seepageRainRiseSeconds);
@@ -5333,6 +5693,58 @@ std::string WaterSeepageRainEnvelopeFingerprint(
         fingerprintState(key.state);
     }
     return "water-seepage-rain-envelope-v1-" + SeepageFingerprintString(hash);
+}
+
+std::string WaterDynamicMeshFlowScenarioFingerprint(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintText(&hash, definition.id);
+    SeepageFingerprintText(&hash, track.scenarioId);
+    const auto fingerprintState = [&](const WaterScenarioState& rawState) {
+        const auto state = SanitizeWaterScenarioStateImpl(rawState);
+        SeepageFingerprintFloat(&hash, state.rainLevel);
+        SeepageFingerprintFloat(&hash, state.meshFlowLevel);
+        SeepageFingerprintFloat(&hash, state.meshFlowRainGain);
+        SeepageFingerprintFloat(&hash, state.meshFlowPersistenceScale);
+        SeepageFingerprintFloat(&hash, state.meshFlowRainRiseSeconds);
+        SeepageFingerprintFloat(&hash, state.meshFlowRainRecessionSeconds);
+    };
+    fingerprintState(definition.state);
+    SeepageFingerprintU32(
+        &hash,
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            track.keys.size(),
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))));
+    for (const auto& key : track.keys) {
+        SeepageFingerprintText(&hash, key.id);
+        SeepageFingerprintFloat(
+            &hash,
+            Clamp01(SeepageFiniteOr(key.position, 0.0F)));
+        SeepageFingerprintU32(&hash, static_cast<std::uint32_t>(key.interpolation));
+        fingerprintState(key.state);
+    }
+    return "water-dynamic-mesh-flow-scenario-v1-" +
+           SeepageFingerprintString(hash);
+}
+
+std::string WaterMeshFlowRainEnvelopeFingerprint(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    SeepageFingerprintU32(&hash, 1U);
+    SeepageFingerprintText(
+        &hash,
+        WaterDynamicMeshFlowScenarioFingerprint(track, definition));
+    SeepageFingerprintFloat(
+        &hash,
+        std::clamp(
+            SeepageFiniteOr(durationSeconds, 0.0F),
+            0.0F,
+            86'400.0F));
+    return "water-mesh-flow-rain-envelope-v1-" + SeepageFingerprintString(hash);
 }
 
 WaterSeepageRainEnvelope BuildWaterSeepageRainEnvelope(
@@ -5431,6 +5843,122 @@ float EvaluateWaterSeepageRainEnvelope(
         amount));
 }
 
+WaterMeshFlowRainEnvelope BuildWaterMeshFlowRainEnvelope(
+    const WaterScenarioTrack& track,
+    const WaterScenarioDefinition& definition,
+    float durationSeconds,
+    float sampleRateHz,
+    std::size_t maxSamples) {
+    WaterMeshFlowRainEnvelope envelope;
+    envelope.durationSeconds = std::clamp(
+        SeepageFiniteOr(durationSeconds, 0.0F),
+        0.0F,
+        86'400.0F);
+    const float requestedRate = std::clamp(
+        SeepageFiniteOr(sampleRateHz, 120.0F),
+        1.0F,
+        10'000.0F);
+    const std::size_t safeMaximumSamples = std::max<std::size_t>(1U, maxSamples);
+    const double requestedIntervals = std::ceil(
+        static_cast<double>(envelope.durationSeconds) *
+        static_cast<double>(requestedRate));
+    const std::size_t intervalCount = static_cast<std::size_t>(std::min(
+        requestedIntervals,
+        static_cast<double>(safeMaximumSamples - 1U)));
+    const std::size_t sampleCount = intervalCount + 1U;
+    envelope.sampleRateHz = envelope.durationSeconds > 0.0F && intervalCount > 0U
+                                ? static_cast<float>(intervalCount) /
+                                      envelope.durationSeconds
+                                : requestedRate;
+    envelope.samples.resize(sampleCount, 0.0F);
+    envelope.fingerprint = WaterMeshFlowRainEnvelopeFingerprint(
+        track,
+        definition,
+        envelope.durationSeconds);
+
+    const float timeStep = sampleCount > 1U
+                               ? envelope.durationSeconds /
+                                     static_cast<float>(sampleCount - 1U)
+                               : 0.0F;
+    float filtered = 0.0F;
+    for (std::size_t index = 0U; index < sampleCount; ++index) {
+        const float timeSeconds = timeStep * static_cast<float>(index);
+        const float normalizedPosition = envelope.durationSeconds > 1.0e-6F
+                                             ? timeSeconds / envelope.durationSeconds
+                                             : 0.0F;
+        const auto state = EvaluateWaterScenarioTrack(
+            track,
+            definition,
+            normalizedPosition);
+        const float target = state.rainLevel;
+        const float responseSeconds = std::clamp(
+            (target >= filtered
+                 ? state.meshFlowRainRiseSeconds
+                 : state.meshFlowRainRecessionSeconds) *
+                state.meshFlowPersistenceScale,
+            0.0F,
+            86'400.0F);
+        if (responseSeconds <= 1.0e-6F || timeStep <= 0.0F) {
+            filtered = target;
+        } else if (index == 0U) {
+            filtered = 0.0F;
+        } else {
+            const float response = 1.0F - std::exp(-timeStep / responseSeconds);
+            filtered = std::lerp(filtered, target, Clamp01(response));
+        }
+        envelope.samples[index] = Clamp01(filtered);
+    }
+    return envelope;
+}
+
+float EvaluateWaterMeshFlowRainEnvelope(
+    const WaterMeshFlowRainEnvelope& envelope,
+    float timeSeconds) {
+    if (envelope.samples.empty()) {
+        return 0.0F;
+    }
+    if (envelope.samples.size() == 1U || envelope.durationSeconds <= 1.0e-6F) {
+        return Clamp01(SeepageFiniteOr(envelope.samples.front(), 0.0F));
+    }
+    const float clampedTime = std::clamp(
+        SeepageFiniteOr(timeSeconds, 0.0F),
+        0.0F,
+        envelope.durationSeconds);
+    const float sampleCoordinate =
+        clampedTime * static_cast<float>(envelope.samples.size() - 1U) /
+        envelope.durationSeconds;
+    const auto leftIndex = static_cast<std::size_t>(std::floor(sampleCoordinate));
+    const auto rightIndex = std::min<std::size_t>(
+        leftIndex + 1U,
+        envelope.samples.size() - 1U);
+    const float amount = sampleCoordinate - static_cast<float>(leftIndex);
+    return Clamp01(std::lerp(
+        SeepageFiniteOr(envelope.samples[leftIndex], 0.0F),
+        SeepageFiniteOr(envelope.samples[rightIndex], 0.0F),
+        amount));
+}
+
+float EffectiveWaterDynamicMeshFlowLevel(
+    const WaterScenarioState& rawState,
+    float effectiveRainLevel) {
+    const auto state = SanitizeWaterScenarioStateImpl(rawState);
+    const float rain = Clamp01(SeepageFiniteOr(effectiveRainLevel, 0.0F));
+    return Clamp01(
+        state.meshFlowLevel +
+        (1.0F - state.meshFlowLevel) * rain * state.meshFlowRainGain);
+}
+
+float EffectiveWaterDynamicMeshPersistenceSeconds(
+    float authoredPersistenceSeconds,
+    const WaterScenarioState& rawState) {
+    const auto state = SanitizeWaterScenarioStateImpl(rawState);
+    const float authored = std::clamp(
+        SeepageFiniteOr(authoredPersistenceSeconds, 0.0F),
+        0.0F,
+        86'400.0F);
+    return std::min(86'400.0F, authored * state.meshFlowPersistenceScale);
+}
+
 float EffectiveWaterFlowActivity(
     const WaterScenarioState& state,
     float maximumFlowStrength,
@@ -5457,7 +5985,8 @@ void AddOrUpdateWaterScenarioKey(
     if (track == nullptr) {
         return;
     }
-    key.position = Clamp01(key.position);
+    key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
+    key.state = SanitizeWaterScenarioStateImpl(std::move(key.state));
     replacementTolerance = std::max(0.0F, replacementTolerance);
     const auto existing = std::find_if(
         track->keys.begin(),

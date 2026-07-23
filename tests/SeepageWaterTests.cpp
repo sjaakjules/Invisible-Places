@@ -1175,6 +1175,11 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     startState.seepageLevel = 0.20F;
     startState.rainLevel = 0.10F;
     startState.flowLevel = 0.10F;
+    startState.meshFlowLevel = 0.20F;
+    startState.meshFlowRainGain = 0.40F;
+    startState.meshFlowPersistenceScale = 0.50F;
+    startState.meshFlowRainRiseSeconds = 2.0F;
+    startState.meshFlowRainRecessionSeconds = 12.0F;
     startState.seepageRainDelaySeconds = 0.0F;
     startState.seepageRainRiseSeconds = 0.0F;
     startState.seepageRainRecessionSeconds = 2.0F;
@@ -1187,6 +1192,11 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     endState.seepageLevel = 0.80F;
     endState.rainLevel = 0.90F;
     endState.flowLevel = 0.90F;
+    endState.meshFlowLevel = 0.80F;
+    endState.meshFlowRainGain = 1.20F;
+    endState.meshFlowPersistenceScale = 1.50F;
+    endState.meshFlowRainRiseSeconds = 8.0F;
+    endState.meshFlowRainRecessionSeconds = 72.0F;
     endState.seepageRainDelaySeconds = 2.0F;
     endState.seepageRainRiseSeconds = 4.0F;
     endState.seepageRainRecessionSeconds = 6.0F;
@@ -1214,6 +1224,11 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     CHECK(middle.seepageLevel == Approx(0.50F));
     CHECK(middle.rainLevel == Approx(0.50F));
     CHECK(middle.flowLevel == Approx(0.50F));
+    CHECK(middle.meshFlowLevel == Approx(0.50F));
+    CHECK(middle.meshFlowRainGain == Approx(0.80F));
+    CHECK(middle.meshFlowPersistenceScale == Approx(1.0F));
+    CHECK(middle.meshFlowRainRiseSeconds == Approx(5.0F));
+    CHECK(middle.meshFlowRainRecessionSeconds == Approx(42.0F));
     CHECK(middle.seepageRainDelaySeconds == Approx(1.0F));
     CHECK(middle.seepageRainRiseSeconds == Approx(2.0F));
     CHECK(middle.seepageRainRecessionSeconds == Approx(4.0F));
@@ -1229,6 +1244,8 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     track.keys.front().interpolation = WaterScenarioInterpolation::Hold;
     CHECK(EvaluateWaterScenarioTrack(track, definition, 0.75F).seepageLevel == Approx(0.20F));
     CHECK(EvaluateWaterScenarioTrack(track, definition, 0.75F).flowLevel == Approx(0.10F));
+    CHECK(EvaluateWaterScenarioTrack(track, definition, 0.75F).meshFlowLevel ==
+          Approx(0.20F));
 
     auto replacement = track.keys.front();
     replacement.id.clear();
@@ -1247,6 +1264,160 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     CHECK(transition.seepageLook.pattern == WaterSeepagePattern::WetRockSheen);
     CHECK(transition.transitionLook->pattern == WaterSeepagePattern::ChaoticBloom);
     CHECK(transition.transitionAmount == Approx(0.5F).margin(0.0001F));
+}
+
+TEST_CASE("Mesh Flow Rain envelopes preserve scenario rise and recession",
+          "[water][mesh-flow][scenario][animation]") {
+    using Catch::Approx;
+    using invisible_places::water::BuildWaterMeshFlowRainEnvelope;
+    using invisible_places::water::EffectiveWaterDynamicMeshFlowLevel;
+    using invisible_places::water::EffectiveWaterDynamicMeshPersistenceSeconds;
+    using invisible_places::water::EvaluateWaterMeshFlowRainEnvelope;
+    using invisible_places::water::WaterDynamicMeshFlowScenarioFingerprint;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterScenarioKey;
+    using invisible_places::water::WaterScenarioTrack;
+
+    const auto definitions = invisible_places::water::DefaultWaterScenarioDefinitions();
+    REQUIRE(definitions.size() == 2U);
+    const auto& historical = definitions[0];
+    const auto& contemporary = definitions[1];
+    CHECK(historical.state.meshFlowLevel == Approx(0.45F));
+    CHECK(historical.state.meshFlowRainGain == Approx(1.0F));
+    CHECK(historical.state.meshFlowRainRiseSeconds == Approx(8.0F));
+    CHECK(historical.state.meshFlowRainRecessionSeconds == Approx(75.0F));
+    CHECK(contemporary.state.meshFlowLevel == Approx(0.18F));
+    CHECK(contemporary.state.meshFlowRainGain == Approx(0.30F));
+    CHECK(contemporary.state.meshFlowRainRiseSeconds == Approx(3.0F));
+    CHECK(contemporary.state.meshFlowRainRecessionSeconds == Approx(18.0F));
+
+    const auto makePulseTrack = [](const invisible_places::water::WaterScenarioDefinition& definition) {
+        WaterScenarioTrack track;
+        track.scenarioId = definition.id;
+        track.fallbackScenario = definition;
+        auto dry = definition.state;
+        dry.rainLevel = 0.0F;
+        auto wet = definition.state;
+        wet.rainLevel = 1.0F;
+        track.keys = {
+            WaterScenarioKey{
+                .id = "dry-start",
+                .position = 0.0F,
+                .state = dry,
+                .interpolation = WaterScenarioInterpolation::Hold,
+            },
+            WaterScenarioKey{
+                .id = "rain-on",
+                .position = 0.10F,
+                .state = wet,
+                .interpolation = WaterScenarioInterpolation::Hold,
+            },
+            WaterScenarioKey{
+                .id = "rain-off",
+                .position = 0.50F,
+                .state = dry,
+                .interpolation = WaterScenarioInterpolation::Hold,
+            },
+            WaterScenarioKey{
+                .id = "dry-end",
+                .position = 1.0F,
+                .state = dry,
+                .interpolation = WaterScenarioInterpolation::Hold,
+            },
+        };
+        return track;
+    };
+
+    const auto historicalTrack = makePulseTrack(historical);
+    const auto contemporaryTrack = makePulseTrack(contemporary);
+    const auto historicalEnvelope = BuildWaterMeshFlowRainEnvelope(
+        historicalTrack,
+        historical,
+        120.0F,
+        20.0F);
+    const auto historicalRepeat = BuildWaterMeshFlowRainEnvelope(
+        historicalTrack,
+        historical,
+        120.0F,
+        20.0F);
+    const auto contemporaryEnvelope = BuildWaterMeshFlowRainEnvelope(
+        contemporaryTrack,
+        contemporary,
+        120.0F,
+        20.0F);
+    CHECK(historicalEnvelope.fingerprint == historicalRepeat.fingerprint);
+    CHECK(historicalEnvelope.samples == historicalRepeat.samples);
+    CHECK(
+        WaterDynamicMeshFlowScenarioFingerprint(historicalTrack, historical) !=
+        WaterDynamicMeshFlowScenarioFingerprint(contemporaryTrack, contemporary));
+
+    // The contemporary scenario rises more quickly, while the historical
+    // scenario retains substantially more moisture after Rain ends.
+    CHECK(EvaluateWaterMeshFlowRainEnvelope(contemporaryEnvelope, 20.0F) >
+          EvaluateWaterMeshFlowRainEnvelope(historicalEnvelope, 20.0F));
+    CHECK(EvaluateWaterMeshFlowRainEnvelope(historicalEnvelope, 90.0F) >
+          EvaluateWaterMeshFlowRainEnvelope(contemporaryEnvelope, 90.0F));
+
+    const float historicalMoisture =
+        EvaluateWaterMeshFlowRainEnvelope(historicalEnvelope, 30.0F);
+    CHECK(EffectiveWaterDynamicMeshFlowLevel(
+              historical.state,
+              historicalMoisture) >= historical.state.meshFlowLevel);
+    CHECK(EffectiveWaterDynamicMeshPersistenceSeconds(
+              2.5F,
+              historical.state) == Approx(2.5F));
+    auto longerPersistence = historical.state;
+    longerPersistence.meshFlowPersistenceScale = 2.0F;
+    CHECK(EffectiveWaterDynamicMeshPersistenceSeconds(
+              2.5F,
+              longerPersistence) == Approx(5.0F));
+}
+
+TEST_CASE("Mesh Flow fixed-capacity settings sanitize and fingerprint live controls",
+          "[water][mesh-flow][settings]") {
+    using Catch::Approx;
+    using invisible_places::water::DefaultWaterDynamicMeshFlowSettings;
+    using invisible_places::water::SanitizeWaterDynamicMeshFlowSettings;
+    using invisible_places::water::WaterDynamicMeshFlowSettingsFingerprint;
+
+    const auto defaults = DefaultWaterDynamicMeshFlowSettings();
+    CHECK(defaults.particleCapacity == 4096U);
+    CHECK(defaults.historyLength == 24U);
+    CHECK(defaults.speedMetersPerSecond == Approx(0.22F));
+    CHECK(defaults.surfaceOffsetMeters == Approx(0.006F));
+    CHECK(defaults.inertia == Approx(0.76F));
+    CHECK(defaults.rockResponse.persistenceSeconds == Approx(2.5F));
+    CHECK(defaults.vegetationResponse.twinkle == Approx(1.4F));
+
+    auto invalid = defaults;
+    invalid.particleCapacity = 0U;
+    invalid.historyLength = 1U;
+    invalid.sourceBandWidthMeters = -1.0F;
+    invalid.rockResponse.radiusMeters = 5.0F;
+    invalid.rockResponse.colourise.x = -2.0F;
+    invalid.vegetationResponse.twinkle = 9.0F;
+    invalid.vegetationResponse.streamDepthMeters = 8.0F;
+    const auto sanitized = SanitizeWaterDynamicMeshFlowSettings(invalid);
+    CHECK(sanitized.particleCapacity == 1U);
+    CHECK(sanitized.historyLength == 2U);
+    CHECK(sanitized.sourceBandWidthMeters == Approx(0.0F));
+    CHECK(sanitized.rockResponse.radiusMeters == Approx(0.75F));
+    CHECK(sanitized.rockResponse.colourise.x == Approx(0.0F));
+    CHECK(sanitized.vegetationResponse.twinkle == Approx(4.0F));
+    CHECK(sanitized.vegetationResponse.streamDepthMeters == Approx(2.0F));
+
+    const auto defaultFingerprint =
+        WaterDynamicMeshFlowSettingsFingerprint(defaults);
+    CHECK(defaultFingerprint ==
+          WaterDynamicMeshFlowSettingsFingerprint(defaults));
+    auto changed = defaults;
+    changed.sharedWindStrength += 0.01F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
+    changed = defaults;
+    changed.rockResponse.emissionAdd += 0.01F;
+    CHECK(defaultFingerprint !=
+          WaterDynamicMeshFlowSettingsFingerprint(changed));
 }
 
 TEST_CASE("Water Flow activity combines keyed level and Rain response deterministically", "[water][flow][scenario][animation]") {

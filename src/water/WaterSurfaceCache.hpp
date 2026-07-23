@@ -23,9 +23,11 @@ namespace invisible_places::water {
 
 inline constexpr float kWaterSurfaceResolutionMeters = 0.010F;
 inline constexpr std::uint32_t kWaterSurfaceNormalSourceSpacingMicrometres = 2'000U;
+inline constexpr std::uint32_t kWaterGroundSourceSpacingMicrometres = 5'000U;
 inline constexpr std::string_view kWaterSurfaceCacheAlgorithmId =
-    "water-surface-10mm-normal-average-v1";
-inline constexpr std::uint32_t kWaterSurfaceCacheSchemaVersion = 3U;
+    "water-surface-10mm-normal-average-ground-v2";
+inline constexpr std::uint32_t kWaterSurfaceCacheSchemaVersion = 4U;
+inline constexpr std::uint32_t kWaterSurfaceCachePreviousSchemaVersion = 3U;
 inline constexpr std::uint32_t kWaterSurfaceCacheLegacySchemaVersion = 2U;
 inline constexpr std::uint64_t kWaterSurfaceCacheMaximumPersistenceBytes =
     5ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -35,6 +37,7 @@ enum class WaterSurfaceRole : std::uint32_t {
     Rock = 1U,
     Sand = 2U,
     Vegetation = 3U,
+    Ground = 4U,
 };
 
 enum class WaterSurfaceCacheRuntimeStatus : std::uint32_t {
@@ -51,6 +54,12 @@ inline constexpr std::uint32_t kWaterSurfaceSandRoleMask =
     1U << static_cast<std::uint32_t>(WaterSurfaceRole::Sand);
 inline constexpr std::uint32_t kWaterSurfaceDefaultRoleMask =
     kWaterSurfaceRockRoleMask | kWaterSurfaceSandRoleMask;
+inline constexpr std::uint32_t kWaterSurfaceGroundRoleMask =
+    1U << static_cast<std::uint32_t>(WaterSurfaceRole::Ground);
+
+inline constexpr std::uint32_t kWaterGroundTerminalContactFlag = 1U << 0U;
+inline constexpr std::uint32_t kWaterGroundUpperFlag = 1U << 1U;
+inline constexpr std::uint32_t kWaterGroundVegetationSupportedFlag = 1U << 2U;
 
 struct WaterSurfaceSource {
     std::filesystem::path sourcePath;
@@ -115,6 +124,23 @@ struct WaterSurfaceSurfel {
     std::uint32_t sampleCount = 0U;
 };
 
+// Highest occupied sampled-Ground cell for one 10 mm XY coordinate. Ground is
+// kept separate from authored ROCK/SAND/VEG classification: it supplies a
+// connected flow surface without becoming Rain or Seepage terrain.
+struct WaterGroundCell {
+    std::int32_t cellX = 0;
+    std::int32_t cellY = 0;
+    float height = 0.0F;
+    io::Float3 normal{0.0F, 0.0F, 1.0F};
+    io::Float3 downhill{};
+    float convergence = 0.0F;
+    float confidence = 0.0F;
+    std::uint32_t sampleCount = 0U;
+    std::uint32_t flags = 0U;
+    std::uint32_t componentId = 0U;
+    std::uint32_t connectivityMask = 0U;
+};
+
 struct RainGpuSurfaceSlot {
     std::int32_t cellX = std::numeric_limits<std::int32_t>::min();
     std::int32_t cellY = std::numeric_limits<std::int32_t>::min();
@@ -150,6 +176,22 @@ struct alignas(16) WaterGpuSurfaceSurfelSlot {
 
 static_assert(sizeof(WaterGpuSurfaceSurfelSlot) == 32U);
 
+// Mesh Flow consumes this fixed 32-byte hash-table ABI. The final word packs
+// the 8-connected neighbour mask in its low byte and a 24-bit component id in
+// the remaining bits.
+struct alignas(16) WaterGpuGroundSlot {
+    std::int32_t cellX = std::numeric_limits<std::int32_t>::min();
+    std::int32_t cellY = std::numeric_limits<std::int32_t>::min();
+    float height = 0.0F;
+    std::uint32_t packedNormal = 0U;
+    std::uint32_t packedDownhill = 0U;
+    std::uint32_t packedConvergenceConfidence = 0U;
+    std::uint32_t flagsAndSampleCount = 0U;
+    std::uint32_t componentAndConnectivity = 0U;
+};
+
+static_assert(sizeof(WaterGpuGroundSlot) == 32U);
+
 struct WaterSurfaceCacheIdentity {
     std::string sourceSignature;
     std::array<std::uint64_t, 4> contentDigest{};
@@ -178,7 +220,7 @@ struct WaterSurfaceCachePayloadChecksum {
     bool operator==(const WaterSurfaceCachePayloadChecksum&) const = default;
 };
 
-// A chunk-boundary-independent checksum used while schema-3 GPU table bytes
+// A chunk-boundary-independent checksum used while schema-3/4 GPU table bytes
 // move directly from the sidecar into the mapped staging allocation. Keeping
 // this tiny builder shared by the loader and renderer lets the renderer reject
 // a sidecar that changed after validation without retaining a second table
@@ -274,10 +316,10 @@ private:
     std::size_t tailSize_ = 0U;
 };
 
-// A schema-3 warm load keeps the queryable CPU aggregates resident but leaves
+// A schema-3/4 warm load keeps the queryable CPU aggregates resident but leaves
 // the already-built GPU tables in the validated sidecar. The renderer reads
-// these three contiguous sections directly through its reusable 64 MiB
-// staging allocation, avoiding another cache-sized CPU table allocation.
+// these contiguous sections directly through its reusable 64 MiB staging
+// allocation, avoiding another cache-sized CPU table allocation.
 struct WaterSurfacePersistedGpuTables {
     std::filesystem::path filePath;
     std::uint64_t fileSize = 0U;
@@ -285,9 +327,11 @@ struct WaterSurfacePersistedGpuTables {
     std::uint64_t surfaceOffset = 0U;
     std::uint64_t vegetationOffset = 0U;
     std::uint64_t flowSurfaceOffset = 0U;
+    std::uint64_t groundOffset = 0U;
     std::uint64_t surfaceCount = 0U;
     std::uint64_t vegetationCount = 0U;
     std::uint64_t flowSurfaceCount = 0U;
+    std::uint64_t groundCount = 0U;
     WaterSurfaceCachePayloadChecksum streamChecksum;
 
     [[nodiscard]] bool Valid() const {
@@ -295,17 +339,24 @@ struct WaterSurfacePersistedGpuTables {
                vegetationCount > 0U && flowSurfaceCount > 0U &&
                streamChecksum.Valid();
     }
+
+    [[nodiscard]] bool GroundValid() const {
+        return Valid() && groundOffset > flowSurfaceOffset && groundCount > 0U;
+    }
 };
 
 struct WaterSurfaceGpuData {
     std::vector<RainGpuSurfaceSlot> surfaceTable;
     std::vector<RainGpuVegetationSlot> vegetationTable;
     std::vector<WaterGpuSurfaceSurfelSlot> flowSurfaceTable;
+    std::vector<WaterGpuGroundSlot> groundTable;
     std::uint32_t surfaceMask = 0U;
     std::uint32_t vegetationMask = 0U;
     std::uint32_t flowSurfaceMask = 0U;
+    std::uint32_t groundMask = 0U;
     std::uint32_t maximumProbeCount = 0U;
     std::uint32_t flowMaximumProbeCount = 0U;
+    std::uint32_t groundMaximumProbeCount = 0U;
     std::uint64_t sourceRevision = 0U;
     WaterSurfaceCacheIdentity sourceIdentity;
     WaterSurfaceCachePayloadChecksum payloadChecksum;
@@ -320,9 +371,11 @@ struct WaterSurfaceCache {
     std::vector<RainSurfaceCell> surfaceCells;
     std::vector<RainVegetationVoxel> vegetationVoxels;
     std::vector<WaterSurfaceSurfel> flowSurfaceSurfels;
+    std::vector<WaterGroundCell> groundCells;
     WaterSurfaceGpuData gpuData;
     io::Bounds3f bounds;
     std::uint64_t sourcePointCount = 0U;
+    std::uint64_t groundSourcePointCount = 0U;
     double buildMilliseconds = 0.0;
     std::uint64_t revision = 0U;
     WaterSurfaceCacheIdentity cacheIdentity;
@@ -349,6 +402,12 @@ struct WaterSurfaceQueryResult {
     WaterSurfaceSurfel surfel{};
     float distanceMeters = std::numeric_limits<float>::infinity();
     float score = std::numeric_limits<float>::infinity();
+    bool hit = false;
+};
+
+struct WaterGroundQueryResult {
+    WaterGroundCell cell{};
+    float distanceMeters = std::numeric_limits<float>::infinity();
     bool hit = false;
 };
 
@@ -402,5 +461,9 @@ struct WaterSurfaceQueryResult {
     float maximumDistanceMeters,
     const io::Float3& referenceNormal = {},
     std::uint32_t roleMask = kWaterSurfaceDefaultRoleMask);
+[[nodiscard]] WaterGroundQueryResult QueryWaterGroundCache(
+    const WaterSurfaceCache& cache,
+    const io::Float3& position,
+    float maximumDistanceMeters);
 
 }  // namespace invisible_places::water

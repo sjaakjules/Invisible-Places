@@ -237,6 +237,54 @@ struct DynamicMeshFlowGpuUploadResult {
     bool asynchronousDispatch = false;
 };
 
+// One live Mesh Flow update. Capacity/history are settled allocation controls;
+// every other member is copied into the parameter ring and may change each
+// frame without replacing descriptors or simulation storage.
+struct DynamicMeshFlowGpuFrameRequest {
+    invisible_places::water::WaterDynamicMeshFlowSettings settings{};
+    std::span<const invisible_places::water::WaterEmitter> authoredEmitters{};
+    float activity = 1.0F;
+    float moisture = 0.0F;
+    float timeSeconds = 0.0F;
+    float deltaSeconds = 1.0F / 30.0F;
+    bool resetSimulation = false;
+};
+
+struct DynamicMeshFlowGpuUpdateResult {
+    std::uint32_t pointCount = 0U;
+    std::uint32_t particleCapacity = 0U;
+    std::uint32_t historyLength = 0U;
+    std::uint32_t activeParticles = 0U;
+    std::uint32_t contactEvents = 0U;
+    std::uint64_t allocationRevision = 0U;
+    std::uint64_t parameterRevision = 0U;
+    std::uint64_t descriptorGeneration = 0U;
+    std::uint64_t sharedGroundUploadRevision = 0U;
+    std::uint32_t dispatchCount = 0U;
+    double allocationMilliseconds = 0.0;
+    double parameterUploadMilliseconds = 0.0;
+    double dispatchMilliseconds = 0.0;
+    bool allocatedThisUpdate = false;
+    bool parametersOnly = false;
+    bool asynchronousDispatch = false;
+    bool sharedGroundReady = false;
+};
+
+struct DynamicMeshFlowContactGpuView {
+    VkBuffer eventBuffer = VK_NULL_HANDLE;
+    VkDeviceSize eventOffset = 0U;
+    VkDeviceSize eventRange = 0U;
+    VkBuffer gridBuffer = VK_NULL_HANDLE;
+    VkDeviceSize gridOffset = 0U;
+    VkDeviceSize gridRange = 0U;
+    std::uint32_t eventCapacity = 0U;
+    std::uint32_t gridMask = 0U;
+    float gridCellSizeMeters = 0.10F;
+    std::uint64_t allocationRevision = 0U;
+    std::uint64_t descriptorGeneration = 0U;
+    bool valid = false;
+};
+
 // Immutable view of the shared, orientation-independent ROCK/SAND surface
 // table. The buffer contains WaterGpuSurfaceSurfelSlot entries in the hash
 // layout produced by BuildWaterSurfaceGpuData(). It remains owned by the
@@ -254,6 +302,24 @@ struct WaterSurfaceFlowGpuView {
     const invisible_places::water::WaterSurfaceCacheIdentity* cacheIdentity = nullptr;
     bool valid = false;
     bool preprocessingComplete = false;
+};
+
+// Immutable view of the schema-4 Ground hash table shared by Mesh Flow. The
+// viewport owns the buffer; callers must treat an upload-revision change as a
+// settled topology change.
+struct WaterGroundFlowGpuView {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0U;
+    VkDeviceSize range = 0U;
+    std::uint32_t tableMask = 0U;
+    std::uint32_t maximumProbeCount = 0U;
+    std::uint32_t occupiedCellCount = 0U;
+    float resolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
+    std::uint64_t cacheRevision = 0U;
+    std::uint64_t uploadRevision = 0U;
+    const invisible_places::water::WaterSurfaceCacheIdentity* cacheIdentity = nullptr;
+    invisible_places::io::Bounds3f bounds{};
+    bool valid = false;
 };
 
 struct WaterFlowGpuSourceRequest {
@@ -359,6 +425,12 @@ class VulkanViewportShell {
         const std::vector<invisible_places::water::WaterEmitter>& emitters,
         const invisible_places::water::WaterDynamicMeshFlowSettings& settings,
         invisible_places::water::WaterTrailBuildQuality quality);
+    [[nodiscard]] DynamicMeshFlowGpuUpdateResult UpdateDynamicMeshFlowGpuSimulation(
+        std::size_t layerId,
+        const DynamicMeshFlowGpuFrameRequest& request);
+    [[nodiscard]] DynamicMeshFlowContactGpuView DynamicMeshFlowContactView(
+        std::size_t layerId) const;
+    void ClearDynamicMeshFlowGpuSimulation(std::size_t layerId);
     [[nodiscard]] WaterFlowGpuSourceUploadResult UploadWaterFlowGpuSource(
         std::size_t layerId,
         const WaterFlowGpuSourceRequest& request);
@@ -404,6 +476,7 @@ class VulkanViewportShell {
     void UploadWaterSurfaceCache(const invisible_places::water::WaterSurfaceCache& cache);
     void ClearWaterSurfaceCache();
     [[nodiscard]] WaterSurfaceFlowGpuView WaterSurfaceFlowView() const;
+    [[nodiscard]] WaterGroundFlowGpuView WaterGroundFlowView() const;
     [[nodiscard]] bool WaterSurfaceUploadPending() const;
     [[nodiscard]] std::uint64_t WaterSurfaceUploadRevision() const;
     void UploadGaussianSplats(std::size_t layerId, const invisible_places::io::LoadedGaussianSplat& splats);
@@ -513,11 +586,19 @@ class VulkanViewportShell {
         BufferAllocation seepageExrParamsBuffer{};
         BufferAllocation seepageHashCellBuffer{};
         BufferAllocation seepageNodeReferenceBuffer{};
+        // Mesh Flow owns only its fixed-capacity simulation/output storage.
+        // The schema-4 Ground table is borrowed immutably from RainGpuResources
+        // and is kept alive by its upload revision until these descriptors
+        // retire.
+        BufferAllocation dynamicMeshFlowParticleBuffer{};
+        BufferAllocation dynamicMeshFlowContactEventBuffer{};
+        BufferAllocation dynamicMeshFlowContactGridBuffer{};
         BufferAllocation dynamicMeshFlowCellBuffer{};
         BufferAllocation dynamicMeshFlowGridBuffer{};
         std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowUniformBuffers{};
         std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowEmitterBuffers{};
         std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowAttractorBuffers{};
+        std::array<BufferAllocation, kDynamicMeshFlowLiveSlots> dynamicMeshFlowCounterBuffers{};
         std::array<BufferAllocation, kFramesInFlight> styleBuffers{};
         BufferAllocation exrStyleBuffer{};
         std::array<std::vector<VkDescriptorSet>, kFramesInFlight> descriptorSets{};
@@ -526,6 +607,7 @@ class VulkanViewportShell {
         std::array<VkDescriptorSet, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDescriptorSets{};
         std::array<VkFence, kDynamicMeshFlowLiveSlots> dynamicMeshFlowDispatchFences{};
         std::array<VkCommandBuffer, kDynamicMeshFlowLiveSlots> dynamicMeshFlowCommandBuffers{};
+        VkDescriptorPool dynamicMeshFlowDescriptorPool = VK_NULL_HANDLE;
         BufferAllocation waterFlowSourceUniformBuffer{};
         BufferAllocation waterFlowSourceInputBuffer{};
         BufferAllocation waterFlowSourceBranchBuffer{};
@@ -592,6 +674,18 @@ class VulkanViewportShell {
         int dynamicMeshFlowMinCellY = 0;
         float dynamicMeshFlowCellSize = 0.0F;
         std::size_t dynamicMeshFlowNextLiveSlot = 0;
+        invisible_places::water::WaterSurfaceCacheIdentity dynamicMeshFlowGroundIdentity{};
+        std::uint64_t dynamicMeshFlowGroundUploadRevision = 0U;
+        std::uint64_t dynamicMeshFlowAllocationRevision = 0U;
+        std::uint64_t dynamicMeshFlowParameterRevision = 0U;
+        std::uint64_t dynamicMeshFlowDescriptorGeneration = 0U;
+        std::uint32_t dynamicMeshFlowDispatchCount = 0U;
+        std::uint32_t dynamicMeshFlowResetEpoch = 1U;
+        std::uint32_t dynamicMeshFlowLastActiveParticleCount = 0U;
+        std::uint32_t dynamicMeshFlowLastContactEventCount = 0U;
+        std::uint32_t dynamicMeshFlowEventCapacity = 0U;
+        std::uint32_t dynamicMeshFlowContactGridMask = 0U;
+        float dynamicMeshFlowContactGridCellSizeMeters = 0.10F;
         std::uint32_t waterFlowSourceId = 0U;
         std::uint32_t waterFlowSourceInputCapacity = 0U;
         std::uint32_t waterFlowSourceBranchCapacity = 0U;
@@ -737,6 +831,7 @@ class VulkanViewportShell {
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceInputBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
+        BufferAllocation groundTableBuffer{};
         BufferAllocation preprocessUniformBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
         VkDescriptorPool rainDescriptorPool = VK_NULL_HANDLE;
@@ -752,6 +847,9 @@ class VulkanViewportShell {
         std::uint32_t flowMaximumProbeCount = 1U;
         std::uint32_t flowSurfaceCellCount = 0U;
         std::uint32_t flowSurfaceTableCapacity = 0U;
+        std::uint32_t groundMask = 0U;
+        std::uint32_t groundMaximumProbeCount = 1U;
+        std::uint32_t groundCellCount = 0U;
         float resolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
         std::uint64_t cacheRevision = 0U;
         invisible_places::water::WaterSurfaceCacheIdentity cacheIdentity{};
@@ -764,16 +862,21 @@ class VulkanViewportShell {
         BufferAllocation surfaceTableBuffer{};
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
+        BufferAllocation groundTableBuffer{};
         std::array<VkDescriptorSet, kFramesInFlight> rainDescriptorSets{};
         VkDescriptorPool rainDescriptorPool = VK_NULL_HANDLE;
         std::uint32_t outstandingFrameMask = 0U;
         bool outstandingExr = false;
+        std::uint64_t uploadRevision = 0U;
     };
 
     struct RainGpuResources {
         BufferAllocation surfaceTableBuffer{};
         BufferAllocation vegetationTableBuffer{};
         BufferAllocation flowSurfaceTableBuffer{};
+        BufferAllocation groundTableBuffer{};
+        BufferAllocation dynamicMeshFlowDummyContactEventBuffer{};
+        BufferAllocation dynamicMeshFlowDummyContactGridBuffer{};
         BufferAllocation particleBuffer{};
         BufferAllocation eventBuffer{};
         BufferAllocation counterBuffer{};
@@ -797,12 +900,16 @@ class VulkanViewportShell {
         std::uint32_t flowMaximumProbeCount = 1U;
         std::uint32_t flowSurfaceCellCount = 0U;
         std::uint32_t flowSurfaceTableCapacity = 0U;
+        std::uint32_t groundMask = 0U;
+        std::uint32_t groundMaximumProbeCount = 1U;
+        std::uint32_t groundCellCount = 0U;
         float surfaceResolutionMeters = invisible_places::water::kWaterSurfaceResolutionMeters;
         std::uint32_t resetEpoch = 1U;
         std::uint64_t collisionCacheRevision = 0U;
         invisible_places::water::WaterSurfaceCacheIdentity collisionCacheIdentity{};
         std::uint64_t collisionUploadRevision = 0U;
         std::uint64_t flowSurfaceResidentUploadRevision = 0U;
+        std::uint64_t groundResidentUploadRevision = 0U;
         std::uint64_t residentTableBytes = 0U;
         std::uint64_t peakStagingBytes = 0U;
         std::uint32_t preprocessDispatchCount = 0U;
@@ -907,9 +1014,13 @@ class VulkanViewportShell {
     void SettlePointCloudMutation();
     [[nodiscard]] std::uint64_t PointCloudResourceResidentBytes(const ActivePointCloudResources& resources) const;
     void TrackPointCloudResidentPeak(std::uint64_t unpublishedBytes = 0U);
+    void RetirePointCloudRenderDescriptors(ActivePointCloudResources* resources);
     void DestroyPointCloudResources(ActivePointCloudResources* resources);
     void RetirePointCloudDescriptorSets(std::array<std::vector<VkDescriptorSet>, kFramesInFlight>* descriptorSets);
-    void UpdateDynamicMeshFlowDescriptorSet(ActivePointCloudResources* resources, std::size_t liveSlot);
+    void UpdateDynamicMeshFlowDescriptorSet(ActivePointCloudResources* resources,
+                                            std::size_t liveSlot,
+                                            const WaterGroundFlowGpuView& groundView);
+    [[nodiscard]] VkDescriptorPool CreateDynamicMeshFlowDescriptorPool();
     void UpdateWaterFlowSourceDescriptorSet(ActivePointCloudResources* resources,
                                             const WaterSurfaceFlowGpuView& surfaceView);
     void CreateWaterFlowDummyPointResources(ActivePointCloudResources* resources);
@@ -921,6 +1032,9 @@ class VulkanViewportShell {
     void PrepareDynamicMeshFlowDispatchSlot(ActivePointCloudResources* resources, std::size_t liveSlot);
     void DispatchDynamicMeshFlowCompute(ActivePointCloudResources* resources, std::uint32_t particleCount,
                                         std::size_t liveSlot);
+    [[nodiscard]] DynamicMeshFlowContactGpuView
+    PointDescriptorDynamicMeshFlowContactView(
+        const ActivePointCloudResources* targetResources) const;
     void UpdatePointCloudDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex,
                                        std::uint32_t imageIndex, VkImageView sceneDepthView,
                                        VkDescriptorPool allocationPool = VK_NULL_HANDLE);
@@ -1078,6 +1192,8 @@ class VulkanViewportShell {
     VkDescriptorSetLayout highQualityGaussianSplatDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout postProcessDescriptorSetLayout_ = VK_NULL_HANDLE;
+    std::optional<DynamicMeshFlowContactGpuView>
+        pointDescriptorDynamicMeshFlowContactOverride_;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool gaussianSplatDescriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorPool imguiDescriptorPool_ = VK_NULL_HANDLE;

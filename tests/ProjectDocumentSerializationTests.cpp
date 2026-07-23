@@ -776,6 +776,16 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK(fixture->schemaVersion == kWaterSourcesDocumentSchemaVersion);
   CHECK_FALSE(fixture->pathCache.has_value());
   CHECK(fixture->rippleRuntimeCaches.empty());
+  CHECK(fixture->dynamicMeshFlowSettings.showTrails);
+  CHECK(fixture->dynamicMeshFlowSettings.automaticSources);
+  CHECK(fixture->dynamicMeshFlowSettings.particleCapacity == 4096U);
+  CHECK(fixture->dynamicMeshFlowSettings.historyLength == 24U);
+  CHECK(
+      fixture->dynamicMeshFlowSettings.rockResponse.persistenceSeconds ==
+      Catch::Approx(2.5F));
+  CHECK(
+      fixture->dynamicMeshFlowSettings.vegetationResponse.twinkle ==
+      Catch::Approx(1.4F));
 
   REQUIRE(fixture->emitters.size() == 1U);
   const auto &emitter = fixture->emitters.front();
@@ -861,7 +871,7 @@ TEST_CASE("SampleScene authored water fixture is current, canonical, and cache f
   CHECK_FALSE(roundTrip->pathCache.has_value());
 }
 
-TEST_CASE("Generated SampleScene validation project round-trips schema 43 without derived caches",
+TEST_CASE("Generated SampleScene validation project round-trips current schema without derived caches",
           "[project][serialization][water][sample][validation]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
@@ -929,6 +939,35 @@ TEST_CASE("Generated SampleScene validation project round-trips schema 43 withou
   CHECK(water.seepageNodes.front().name == "SampleSeepage");
   CHECK_FALSE(water.pathCache.has_value());
   CHECK_FALSE(water.pathCacheManifest.has_value());
+  CHECK(validation->waterDynamicMeshFlowSettings.showTrails);
+  CHECK(validation->waterDynamicMeshFlowSettings.automaticSources);
+  CHECK(validation->waterDynamicMeshFlowSettings.particleCapacity == 4096U);
+  CHECK(validation->waterDynamicMeshFlowSettings.historyLength == 24U);
+  REQUIRE(validation->waterScenarios.size() == 2U);
+  const auto preColonisation = std::find_if(
+      validation->waterScenarios.begin(),
+      validation->waterScenarios.end(),
+      [](const auto &scenario) {
+        return scenario.id == "pre-colonisation-wet";
+      });
+  const auto contemporary = std::find_if(
+      validation->waterScenarios.begin(),
+      validation->waterScenarios.end(),
+      [](const auto &scenario) {
+        return scenario.id == "contemporary-managed";
+      });
+  REQUIRE(preColonisation != validation->waterScenarios.end());
+  REQUIRE(contemporary != validation->waterScenarios.end());
+  CHECK(preColonisation->state.meshFlowLevel == Catch::Approx(0.45F));
+  CHECK(preColonisation->state.meshFlowRainGain == Catch::Approx(1.0F));
+  CHECK(
+      preColonisation->state.meshFlowRainRecessionSeconds ==
+      Catch::Approx(75.0F));
+  CHECK(contemporary->state.meshFlowLevel == Catch::Approx(0.18F));
+  CHECK(contemporary->state.meshFlowRainGain == Catch::Approx(0.30F));
+  CHECK(
+      contemporary->state.meshFlowRainRecessionSeconds ==
+      Catch::Approx(18.0F));
 
   TemporaryProjectFile roundTripFile{
       "invisible_places_sample_scene_validation_round_trip.json"};
@@ -1028,10 +1067,20 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
   definition.name = "Storm";
   definition.state.flowLevel = 0.25F;
   definition.state.rainLevel = 0.10F;
+  definition.state.meshFlowLevel = 0.20F;
+  definition.state.meshFlowRainGain = 0.40F;
+  definition.state.meshFlowPersistenceScale = 0.75F;
+  definition.state.meshFlowRainRiseSeconds = 3.0F;
+  definition.state.meshFlowRainRecessionSeconds = 18.0F;
 
   auto endState = definition.state;
   endState.flowLevel = 0.90F;
   endState.rainLevel = 0.80F;
+  endState.meshFlowLevel = 0.70F;
+  endState.meshFlowRainGain = 1.20F;
+  endState.meshFlowPersistenceScale = 1.50F;
+  endState.meshFlowRainRiseSeconds = 9.0F;
+  endState.meshFlowRainRecessionSeconds = 75.0F;
 
   WaterScenarioTrack track;
   track.scenarioId = definition.id;
@@ -1057,7 +1106,7 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
   animation.selectedWaterScenarioId = definition.id;
   animation.waterScenarioTracks = {track};
 
-  TemporaryProjectFile currentFile{"invisible_places_flow_activity_animation_v11.json"};
+  TemporaryProjectFile currentFile{"invisible_places_flow_activity_animation_v12.json"};
   std::string errorMessage;
   REQUIRE(SaveAnimationPath(animation, currentFile.path, &errorMessage));
   {
@@ -1075,6 +1124,14 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
               .at("keys")[1]
               .at("state")
               .at("flow_level") == Catch::Approx(0.90F));
+    const auto& meshState = savedJson.at("water_scenario_tracks")[0]
+                                .at("keys")[1]
+                                .at("state");
+    CHECK(meshState.at("mesh_flow_level") == Catch::Approx(0.70F));
+    CHECK(meshState.at("mesh_flow_rain_gain") == Catch::Approx(1.20F));
+    CHECK(meshState.at("mesh_flow_persistence_scale") == Catch::Approx(1.50F));
+    CHECK(meshState.at("mesh_flow_rain_rise_seconds") == Catch::Approx(9.0F));
+    CHECK(meshState.at("mesh_flow_rain_recession_seconds") == Catch::Approx(75.0F));
   }
   const auto loaded = LoadAnimationPath(currentFile.path, &errorMessage);
   REQUIRE(loaded.has_value());
@@ -1084,6 +1141,16 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
   REQUIRE(loaded->waterScenarioTracks[0].keys.size() == 2U);
   CHECK(loaded->waterScenarioTracks[0].keys[1].state.flowLevel ==
         Catch::Approx(0.90F));
+  CHECK(loaded->waterScenarioTracks[0].keys[1].state.meshFlowLevel ==
+        Catch::Approx(0.70F));
+  CHECK(loaded->waterScenarioTracks[0].keys[1].state.meshFlowRainGain ==
+        Catch::Approx(1.20F));
+  CHECK(loaded->waterScenarioTracks[0].keys[1].state.meshFlowPersistenceScale ==
+        Catch::Approx(1.50F));
+  CHECK(loaded->waterScenarioTracks[0].keys[1].state.meshFlowRainRiseSeconds ==
+        Catch::Approx(9.0F));
+  CHECK(loaded->waterScenarioTracks[0].keys[1].state.meshFlowRainRecessionSeconds ==
+        Catch::Approx(75.0F));
 
   TemporaryProjectFile legacyFile{"invisible_places_flow_activity_animation_v8.json"};
   {
@@ -1110,8 +1177,149 @@ TEST_CASE("Animation paths round-trip keyed Flow activity and migrate legacy def
   REQUIRE(legacy->waterScenarioTracks.size() == 1U);
   CHECK(legacy->waterScenarioTracks[0].fallbackScenario.state.flowLevel ==
         Catch::Approx(1.0F));
+  CHECK(legacy->waterScenarioTracks[0].fallbackScenario.state.meshFlowLevel ==
+        Catch::Approx(1.0F));
+  CHECK(legacy->waterScenarioTracks[0].fallbackScenario.state.meshFlowRainGain ==
+        Catch::Approx(0.0F));
+  CHECK(legacy->waterScenarioTracks[0].fallbackScenario.state.meshFlowPersistenceScale ==
+        Catch::Approx(1.0F));
   REQUIRE(legacy->waterScenarioTracks[0].keys.size() == 1U);
   CHECK(legacy->waterScenarioTracks[0].keys[0].state.flowLevel ==
+        Catch::Approx(1.0F));
+  CHECK(legacy->waterScenarioTracks[0].keys[0].state.meshFlowLevel ==
+        Catch::Approx(1.0F));
+  CHECK(legacy->waterScenarioTracks[0].keys[0].state.meshFlowRainGain ==
+        Catch::Approx(0.0F));
+  CHECK(legacy->waterScenarioTracks[0].keys[0].state.meshFlowPersistenceScale ==
+        Catch::Approx(1.0F));
+}
+
+TEST_CASE("Project schema 44 round-trips fixed-capacity Mesh Flow controls",
+          "[project][serialization][water][mesh-flow]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  ProjectDocument document;
+  document.projectName = "Mesh Flow fixed capacity";
+  auto& settings = document.waterDynamicMeshFlowSettings;
+  settings.enabled = true;
+  settings.showTrails = false;
+  settings.automaticSources = false;
+  settings.particleCapacity = 8192U;
+  settings.historyLength = 48U;
+  settings.sourceBandWidthMeters = 0.52F;
+  settings.dryConcavityFocus = 0.62F;
+  settings.rainSpawnSpread = 1.15F;
+  settings.speedMetersPerSecond = 0.31F;
+  settings.surfaceOffsetMeters = 0.009F;
+  settings.particleNoiseStrength = 0.44F;
+  settings.particleNoiseScaleMeters = 0.22F;
+  settings.particleNoiseSpeed = 0.58F;
+  settings.sharedWindStrength = 0.27F;
+  settings.sharedWindScaleMeters = 3.1F;
+  settings.sharedWindSpeed = 0.08F;
+  settings.contactFadeSeconds = 1.25F;
+  settings.rockResponse.radiusMeters = 0.24F;
+  settings.rockResponse.colourise = {0.10F, 0.30F, 0.60F};
+  settings.rockResponse.persistenceSeconds = 4.5F;
+  settings.vegetationResponse.radiusMeters = 0.32F;
+  settings.vegetationResponse.twinkle = 2.4F;
+  settings.vegetationResponse.streamDepthMeters = 0.82F;
+
+  auto scenario = invisible_places::water::DefaultWaterScenarioDefinitions().front();
+  scenario.state.meshFlowLevel = 0.36F;
+  scenario.state.meshFlowRainGain = 1.35F;
+  scenario.state.meshFlowPersistenceScale = 1.8F;
+  scenario.state.meshFlowRainRiseSeconds = 7.0F;
+  scenario.state.meshFlowRainRecessionSeconds = 64.0F;
+  document.waterScenarios = {scenario};
+
+  TemporaryProjectFile projectFile{"invisible_places_mesh_flow_schema_44.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, projectFile.path, &errorMessage));
+  {
+    std::ifstream input{projectFile.path};
+    REQUIRE(input.is_open());
+    const auto saved = nlohmann::json::parse(input);
+    CHECK(saved.at("schema_version") ==
+          invisible_places::serialization::kProjectDocumentSchemaVersion);
+    const auto& mesh = saved.at("water_dynamic_mesh_flow_settings");
+    CHECK(mesh.at("particle_capacity") == 8192U);
+    CHECK(mesh.at("history_length") == 48U);
+    CHECK_FALSE(mesh.at("show_trails").get<bool>());
+    CHECK_FALSE(mesh.at("automatic_sources").get<bool>());
+    CHECK(mesh.at("rock_response").at("persistence_seconds") ==
+          Catch::Approx(4.5F));
+    CHECK(mesh.at("vegetation_response").at("twinkle") ==
+          Catch::Approx(2.4F));
+    const auto& savedScenario = saved.at("water_scenarios")[0].at("state");
+    CHECK(savedScenario.at("mesh_flow_level") == Catch::Approx(0.36F));
+    CHECK(savedScenario.at("mesh_flow_rain_recession_seconds") ==
+          Catch::Approx(64.0F));
+  }
+
+  const auto loaded = LoadProjectDocument(projectFile.path, &errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& loadedSettings = loaded->waterDynamicMeshFlowSettings;
+  CHECK_FALSE(loadedSettings.showTrails);
+  CHECK_FALSE(loadedSettings.automaticSources);
+  CHECK(loadedSettings.particleCapacity == 8192U);
+  CHECK(loadedSettings.historyLength == 48U);
+  CHECK(loadedSettings.sourceBandWidthMeters == Catch::Approx(0.52F));
+  CHECK(loadedSettings.particleNoiseStrength == Catch::Approx(0.44F));
+  CHECK(loadedSettings.sharedWindScaleMeters == Catch::Approx(3.1F));
+  CHECK(loadedSettings.contactFadeSeconds == Catch::Approx(1.25F));
+  CHECK(loadedSettings.rockResponse.colourise.z == Catch::Approx(0.60F));
+  CHECK(loadedSettings.rockResponse.persistenceSeconds == Catch::Approx(4.5F));
+  CHECK(loadedSettings.vegetationResponse.twinkle == Catch::Approx(2.4F));
+  CHECK(loadedSettings.vegetationResponse.streamDepthMeters ==
+        Catch::Approx(0.82F));
+  REQUIRE(loaded->waterScenarios.size() == 1U);
+  CHECK(loaded->waterScenarios[0].state.meshFlowLevel == Catch::Approx(0.36F));
+  CHECK(loaded->waterScenarios[0].state.meshFlowRainGain == Catch::Approx(1.35F));
+  CHECK(loaded->waterScenarios[0].state.meshFlowPersistenceScale ==
+        Catch::Approx(1.8F));
+  CHECK(loaded->waterScenarios[0].state.meshFlowRainRiseSeconds ==
+        Catch::Approx(7.0F));
+  CHECK(loaded->waterScenarios[0].state.meshFlowRainRecessionSeconds ==
+        Catch::Approx(64.0F));
+
+  TemporaryProjectFile legacyFile{"invisible_places_mesh_flow_schema_43.json"};
+  {
+    std::ofstream output{legacyFile.path};
+    const nlohmann::json legacy{
+        {"schema_version", 43U},
+        {"project_name", "legacy mesh flow"},
+        {"water_dynamic_mesh_flow_settings",
+         {
+             {"enabled", true},
+             {"speed_meters_per_second", 0.62F},
+             {"preview_particle_limit", 560U},
+         }},
+        {"water_scenarios",
+         nlohmann::json::array({
+             {
+                 {"id", "legacy"},
+                 {"name", "Legacy"},
+                 {"state", {{"rain_level", 0.25F}}},
+             },
+         })},
+    };
+    output << legacy.dump(2);
+  }
+  const auto legacy = LoadProjectDocument(legacyFile.path, &errorMessage);
+  REQUIRE(legacy.has_value());
+  CHECK(legacy->waterDynamicMeshFlowSettings.showTrails);
+  CHECK(legacy->waterDynamicMeshFlowSettings.automaticSources);
+  CHECK(legacy->waterDynamicMeshFlowSettings.particleCapacity == 4096U);
+  CHECK(legacy->waterDynamicMeshFlowSettings.historyLength == 24U);
+  CHECK(legacy->waterDynamicMeshFlowSettings.speedMetersPerSecond ==
+        Catch::Approx(0.62F));
+  REQUIRE(legacy->waterScenarios.size() == 1U);
+  CHECK(legacy->waterScenarios[0].state.meshFlowLevel == Catch::Approx(1.0F));
+  CHECK(legacy->waterScenarios[0].state.meshFlowRainGain == Catch::Approx(0.0F));
+  CHECK(legacy->waterScenarios[0].state.meshFlowPersistenceScale ==
         Catch::Approx(1.0F));
 }
 

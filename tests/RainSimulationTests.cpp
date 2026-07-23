@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -154,7 +155,159 @@ ReadPersistedGpuStreamChecksum(
         6U,
         tables.flowSurfaceCount,
         sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot));
+    if (tables.GroundValid()) {
+        readSection(
+            tables.groundOffset,
+            8U,
+            tables.groundCount,
+            sizeof(invisible_places::water::WaterGpuGroundSlot));
+    }
     return checksum.Finish();
+}
+
+template <typename T>
+bool WriteTestPod(std::ofstream& output, const T& value) {
+    output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    return output.good();
+}
+
+bool WriteTestString(std::ofstream& output, std::string_view value) {
+    const auto size = static_cast<std::uint32_t>(value.size());
+    return WriteTestPod(output, size) &&
+           (output.write(
+                value.data(),
+                static_cast<std::streamsize>(value.size())),
+            output.good());
+}
+
+template <typename T>
+void AddTestChecksumArray(
+    invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder* checksum,
+    std::uint64_t tag,
+    const std::vector<T>& values) {
+    checksum->AddPod(tag);
+    checksum->AddPod(static_cast<std::uint64_t>(values.size()));
+    if (!values.empty()) {
+        checksum->AddBytes(values.data(), values.size() * sizeof(T));
+    }
+}
+
+template <typename T>
+bool WriteTestArray(std::ofstream& output, const std::vector<T>& values) {
+    if (!values.empty()) {
+        output.write(
+            reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(values.size() * sizeof(T)));
+    }
+    return output.good();
+}
+
+invisible_places::water::WaterSurfaceCachePayloadChecksum
+Schema3PayloadChecksum(
+    const invisible_places::water::WaterSurfaceCache& cache) {
+    invisible_places::water::WaterSurfaceGpuStreamChecksumBuilder checksum;
+    AddTestChecksumArray(&checksum, 1U, cache.surfaceCells);
+    AddTestChecksumArray(&checksum, 2U, cache.vegetationVoxels);
+    AddTestChecksumArray(&checksum, 3U, cache.flowSurfaceSurfels);
+    AddTestChecksumArray(&checksum, 4U, cache.gpuData.surfaceTable);
+    AddTestChecksumArray(&checksum, 5U, cache.gpuData.vegetationTable);
+    AddTestChecksumArray(&checksum, 6U, cache.gpuData.flowSurfaceTable);
+    return checksum.Finish();
+}
+
+void WritePreGroundSurfaceCache(
+    const std::filesystem::path& path,
+    const invisible_places::water::WaterSurfaceCache& source,
+    std::uint32_t schemaVersion) {
+    auto cache = source;
+    cache.schemaVersion = schemaVersion;
+    cache.groundCells.clear();
+    cache.groundSourcePointCount = 0U;
+    cache.gpuData = {};
+    cache.gpuData = invisible_places::water::BuildWaterSurfaceGpuData(cache);
+    const auto payloadChecksum = Schema3PayloadChecksum(cache);
+    cache.gpuData.payloadChecksum = payloadChecksum;
+    cache.cacheIdentity = {};
+    cache.gpuData.sourceIdentity = {};
+    const auto identity =
+        invisible_places::water::BuildWaterSurfaceCacheIdentity(cache);
+
+    std::ofstream output{path, std::ios::binary | std::ios::trunc};
+    REQUIRE(output.is_open());
+    const std::string_view magic = schemaVersion ==
+            invisible_places::water::kWaterSurfaceCachePreviousSchemaVersion
+        ? "IPWSC003"
+        : "IPWSC002";
+    output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    const auto sourceCount = static_cast<std::uint32_t>(cache.sources.size());
+    REQUIRE((
+        WriteTestPod(output, schemaVersion) &&
+        WriteTestPod(output, cache.resolutionMeters) &&
+        WriteTestString(output, cache.signature) &&
+        WriteTestPod(output, cache.bounds) &&
+        WriteTestPod(output, cache.sourcePointCount) &&
+        WriteTestPod(output, cache.revision) &&
+        WriteTestPod(output, sourceCount)));
+    for (const auto& sourceMetadata : cache.sources) {
+        const auto role = static_cast<std::uint32_t>(sourceMetadata.role);
+        REQUIRE((
+            WriteTestString(
+                output,
+                sourceMetadata.sourcePath.generic_string()) &&
+            WriteTestPod(output, role) &&
+            WriteTestPod(output, sourceMetadata.spacingMicrometres) &&
+            WriteTestPod(output, sourceMetadata.fileSize) &&
+            WriteTestPod(output, sourceMetadata.modificationTicks) &&
+            WriteTestPod(output, sourceMetadata.isFallback)));
+    }
+    const auto surfaceCount =
+        static_cast<std::uint64_t>(cache.surfaceCells.size());
+    const auto vegetationCount =
+        static_cast<std::uint64_t>(cache.vegetationVoxels.size());
+    const auto flowCount =
+        static_cast<std::uint64_t>(cache.flowSurfaceSurfels.size());
+    const auto gpuSurfaceCount =
+        static_cast<std::uint64_t>(cache.gpuData.surfaceTable.size());
+    const auto gpuVegetationCount =
+        static_cast<std::uint64_t>(cache.gpuData.vegetationTable.size());
+    const auto gpuFlowCount =
+        static_cast<std::uint64_t>(cache.gpuData.flowSurfaceTable.size());
+    REQUIRE((
+        WriteTestPod(output, surfaceCount) &&
+        WriteTestPod(output, vegetationCount) &&
+        WriteTestPod(output, flowCount) &&
+        WriteTestArray(output, cache.surfaceCells) &&
+        WriteTestArray(output, cache.vegetationVoxels) &&
+        WriteTestArray(output, cache.flowSurfaceSurfels) &&
+        WriteTestPod(output, gpuSurfaceCount) &&
+        WriteTestPod(output, gpuVegetationCount) &&
+        WriteTestPod(output, gpuFlowCount) &&
+        WriteTestPod(output, cache.gpuData.surfaceMask) &&
+        WriteTestPod(output, cache.gpuData.vegetationMask) &&
+        WriteTestPod(output, cache.gpuData.flowSurfaceMask) &&
+        WriteTestPod(output, cache.gpuData.maximumProbeCount) &&
+        WriteTestPod(output, cache.gpuData.flowMaximumProbeCount) &&
+        WriteTestPod(output, cache.gpuData.sourceRevision) &&
+        WriteTestArray(output, cache.gpuData.surfaceTable) &&
+        WriteTestArray(output, cache.gpuData.vegetationTable) &&
+        WriteTestArray(output, cache.gpuData.flowSurfaceTable)));
+    if (schemaVersion ==
+        invisible_places::water::kWaterSurfaceCachePreviousSchemaVersion) {
+        constexpr std::string_view trailerMagic = "WSCID003";
+        output.write(
+            trailerMagic.data(),
+            static_cast<std::streamsize>(trailerMagic.size()));
+        REQUIRE(WriteTestString(output, identity.sourceSignature));
+        for (const auto word : identity.contentDigest) {
+            REQUIRE(WriteTestPod(output, word));
+        }
+        for (const auto word : payloadChecksum.words) {
+            REQUIRE(WriteTestPod(output, word));
+        }
+        REQUIRE(WriteTestPod(output, payloadChecksum.hashedByteCount));
+    }
+    output.flush();
+    REQUIRE(output.good());
 }
 
 }  // namespace
@@ -415,6 +568,166 @@ TEST_CASE("water surface CPU queries preserve the continuous surface sheet", "[w
     CHECK_FALSE(outsideSupport.hit);
 }
 
+TEST_CASE(
+    "sampled Ground retains deterministic connected upper and vegetation-supported cells",
+    "[water][cache][ground]") {
+    std::vector<WaterSurfaceSample> samples{
+        // Authored point totals remain separate from the sampled Ground total.
+        {{0.001F, 0.001F, 0.100F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Rock},
+        {{0.031F, 0.001F, 0.100F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Rock},
+        {{0.101F, 0.001F, 0.100F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Rock},
+        {{0.201F, 0.001F, 0.301F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Vegetation},
+
+        // Only the highest occupied Z cell at XY=(0,0) contributes. Its two
+        // opposing scanner normals hemisphere-align to the same slope.
+        {{0.001F, 0.001F, 0.145F}, {0.6F, 0.0F, 0.8F}, WaterSurfaceRole::Ground},
+        {{0.002F, 0.002F, 0.149F}, {-0.6F, 0.0F, -0.8F}, WaterSurfaceRole::Ground},
+        {{0.003F, 0.003F, 0.115F}, {-0.8F, 0.0F, 0.6F}, WaterSurfaceRole::Ground},
+        // No authored terrain is required once a cell is connected to an
+        // upper/vegetation-supported component seed.
+        {{0.011F, 0.001F, 0.140F}, {0.6F, 0.0F, 0.8F}, WaterSurfaceRole::Ground},
+        {{0.021F, 0.001F, 0.140F}, {0.6F, 0.0F, 0.8F}, WaterSurfaceRole::Ground},
+        // More than 20 mm below authored terrain is rejected.
+        {{0.031F, 0.001F, 0.050F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Ground},
+        // A disconnected terminal-only component has no upstream seed.
+        {{0.101F, 0.001F, 0.110F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Ground},
+        // A disconnected vegetation-supported sample is retained.
+        {{0.201F, 0.001F, 0.301F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Ground},
+    };
+
+    const auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    auto reversedSamples = samples;
+    std::reverse(reversedSamples.begin(), reversedSamples.end());
+    const auto reversed =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(
+            reversedSamples);
+
+    CHECK(cache.sourcePointCount == 4U);
+    CHECK(cache.groundSourcePointCount == 8U);
+    REQUIRE(cache.groundCells.size() == 4U);
+    REQUIRE(reversed.groundCells.size() == cache.groundCells.size());
+    for (std::size_t index = 0U; index < cache.groundCells.size(); ++index) {
+        const auto& cell = cache.groundCells[index];
+        const auto& reverseCell = reversed.groundCells[index];
+        CHECK(cell.cellX == reverseCell.cellX);
+        CHECK(cell.cellY == reverseCell.cellY);
+        CHECK(cell.height == Catch::Approx(reverseCell.height));
+        CHECK(cell.normal.x == Catch::Approx(reverseCell.normal.x));
+        CHECK(cell.normal.y == Catch::Approx(reverseCell.normal.y));
+        CHECK(cell.normal.z == Catch::Approx(reverseCell.normal.z));
+        CHECK(cell.downhill.x == Catch::Approx(reverseCell.downhill.x));
+        CHECK(cell.downhill.y == Catch::Approx(reverseCell.downhill.y));
+        CHECK(cell.downhill.z == Catch::Approx(reverseCell.downhill.z));
+        CHECK(cell.flags == reverseCell.flags);
+        CHECK(cell.componentId == reverseCell.componentId);
+        CHECK(cell.connectivityMask == reverseCell.connectivityMask);
+    }
+
+    const auto& upper = cache.groundCells[0];
+    CHECK(upper.cellX == 0);
+    CHECK(upper.height == Catch::Approx(0.149F));
+    CHECK(upper.sampleCount == 2U);
+    CHECK((upper.flags & invisible_places::water::kWaterGroundUpperFlag) != 0U);
+    CHECK(upper.normal.x == Catch::Approx(0.6F).margin(1.0e-5F));
+    CHECK(upper.normal.z == Catch::Approx(0.8F).margin(1.0e-5F));
+    CHECK(upper.downhill.x == Catch::Approx(0.8F).margin(1.0e-5F));
+    CHECK(upper.downhill.z == Catch::Approx(-0.6F).margin(1.0e-5F));
+    CHECK(upper.connectivityMask == (1U << 2U));
+    CHECK(cache.groundCells[1].connectivityMask ==
+          ((1U << 2U) | (1U << 6U)));
+    CHECK(cache.groundCells[2].connectivityMask == (1U << 6U));
+    CHECK(
+        (cache.groundCells[3].flags &
+         invisible_places::water::kWaterGroundVegetationSupportedFlag) != 0U);
+    CHECK(cache.groundCells[3].componentId != upper.componentId);
+
+    const auto query = invisible_places::water::QueryWaterGroundCache(
+        cache,
+        {0.015F, 0.005F, 0.140F},
+        0.012F);
+    REQUIRE(query.hit);
+    CHECK(query.cell.cellX == 1);
+    CHECK(query.distanceMeters <= 0.012F);
+    CHECK_FALSE(invisible_places::water::QueryWaterGroundCache(
+                    cache,
+                    {1.0F, 1.0F, 1.0F},
+                    0.01F)
+                    .hit);
+}
+
+TEST_CASE(
+    "sampled Ground convergence and GPU hash ABI are bounded",
+    "[water][cache][ground][gpu]") {
+    std::vector<WaterSurfaceSample> samples{{
+        {0.001F, 0.001F, 0.0F},
+        {0.0F, 0.0F, 1.0F},
+        WaterSurfaceRole::Rock,
+    }};
+    for (std::int32_t y = -1; y <= 1; ++y) {
+        for (std::int32_t x = -1; x <= 1; ++x) {
+            const float horizontalLength =
+                std::sqrt(static_cast<float>(x * x + y * y));
+            const Float3 normal = horizontalLength > 0.0F
+                ? Float3{
+                      -static_cast<float>(x) / horizontalLength * 0.6F,
+                      -static_cast<float>(y) / horizontalLength * 0.6F,
+                      0.8F,
+                  }
+                : Float3{0.0F, 0.0F, 1.0F};
+            samples.push_back({
+                {
+                    (static_cast<float>(x) + 0.5F) * 0.010F,
+                    (static_cast<float>(y) + 0.5F) * 0.010F,
+                    0.100F,
+                },
+                normal,
+                WaterSurfaceRole::Ground,
+            });
+        }
+    }
+    const auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    REQUIRE(cache.groundCells.size() == 9U);
+    const auto centre = std::find_if(
+        cache.groundCells.begin(),
+        cache.groundCells.end(),
+        [](const auto& cell) {
+            return cell.cellX == 0 && cell.cellY == 0;
+        });
+    REQUIRE(centre != cache.groundCells.end());
+    CHECK(centre->convergence > 0.45F);
+    CHECK(centre->connectivityMask == 0xFFU);
+
+    const auto gpu =
+        invisible_places::water::BuildWaterSurfaceGpuData(cache);
+    static_assert(
+        sizeof(invisible_places::water::WaterGpuGroundSlot) == 32U);
+    REQUIRE_FALSE(gpu.groundTable.empty());
+    CHECK(std::has_single_bit(gpu.groundTable.size()));
+    CHECK(gpu.groundMask == gpu.groundTable.size() - 1U);
+    CHECK(gpu.groundMaximumProbeCount <= 32U);
+    const auto populated = std::count_if(
+        gpu.groundTable.begin(),
+        gpu.groundTable.end(),
+        [](const auto& slot) {
+            return slot.cellX != std::numeric_limits<std::int32_t>::min();
+        });
+    CHECK(
+        populated ==
+        static_cast<std::ptrdiff_t>(cache.groundCells.size()));
+    const auto packedCentre = std::find_if(
+        gpu.groundTable.begin(),
+        gpu.groundTable.end(),
+        [](const auto& slot) {
+            return slot.cellX == 0 && slot.cellY == 0;
+        });
+    REQUIRE(packedCentre != gpu.groundTable.end());
+    CHECK((packedCentre->componentAndConnectivity & 0xFFU) == 0xFFU);
+    CHECK((packedCentre->flagsAndSampleCount >> 8U) == 1U);
+    CHECK(packedCentre->packedConvergenceConfidence != 0U);
+}
+
 TEST_CASE("water surface sources prefer exact two millimetre complete bundles",
           "[water][rain][cache]") {
     invisible_places::scene::ScenePointCloudGroup group;
@@ -580,7 +893,14 @@ TEST_CASE("rain collision chooses the first role surface", "[water][rain][cache]
 
 TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][rain][cache]") {
     TemporaryDirectory temporary;
-    auto cache = invisible_places::water::BuildWaterSurfaceCacheFromSamples(MakeCollisionSamples());
+    auto samples = MakeCollisionSamples();
+    samples.push_back({
+        {0.011F, 0.011F, 0.25F},
+        {0.35F, 0.0F, 0.94F},
+        WaterSurfaceRole::Ground,
+    });
+    auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
     cache.signature = "expected";
     const auto expectedIdentity =
         invisible_places::water::BuildWaterSurfaceCacheIdentity(cache);
@@ -594,6 +914,9 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
     CHECK(loaded.surfaceCells.size() == cache.surfaceCells.size());
     CHECK(loaded.vegetationVoxels.size() == cache.vegetationVoxels.size());
     REQUIRE(loaded.flowSurfaceSurfels.size() == cache.flowSurfaceSurfels.size());
+    REQUIRE(loaded.groundCells.size() == cache.groundCells.size());
+    CHECK(loaded.sourcePointCount == cache.sourcePointCount);
+    CHECK(loaded.groundSourcePointCount == cache.groundSourcePointCount);
     CHECK(loaded.flowSurfaceSurfels[0].centroid.x ==
           Catch::Approx(cache.flowSurfaceSurfels[0].centroid.x));
     CHECK(loaded.flowSurfaceSurfels[0].normalCoherence ==
@@ -601,12 +924,14 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
     CHECK(loaded.gpuData.surfaceTable.empty());
     CHECK(loaded.gpuData.vegetationTable.empty());
     CHECK(loaded.gpuData.flowSurfaceTable.empty());
+    CHECK(loaded.gpuData.groundTable.empty());
     CAPTURE(
         loaded.gpuData.persistedTables.filePath,
         loaded.gpuData.persistedTables.fileSize,
         loaded.gpuData.persistedTables.surfaceCount,
         loaded.gpuData.persistedTables.vegetationCount,
         loaded.gpuData.persistedTables.flowSurfaceCount,
+        loaded.gpuData.persistedTables.groundCount,
         loaded.gpuData.persistedTables.streamChecksum.hashedByteCount,
         loaded.gpuData.persistedTables.streamChecksum.words[0],
         loaded.gpuData.persistedTables.streamChecksum.words[1]);
@@ -620,10 +945,15 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
     CHECK(loaded.gpuData.persistedTables.surfaceCount == cache.gpuData.surfaceTable.size());
     CHECK(loaded.gpuData.persistedTables.vegetationCount == cache.gpuData.vegetationTable.size());
     CHECK(loaded.gpuData.persistedTables.flowSurfaceCount == cache.gpuData.flowSurfaceTable.size());
+    CHECK(loaded.gpuData.persistedTables.groundCount ==
+          cache.gpuData.groundTable.size());
     CHECK(loaded.gpuData.persistedTables.surfaceOffset <
           loaded.gpuData.persistedTables.vegetationOffset);
     CHECK(loaded.gpuData.persistedTables.vegetationOffset <
           loaded.gpuData.persistedTables.flowSurfaceOffset);
+    CHECK(loaded.gpuData.persistedTables.flowSurfaceOffset <
+          loaded.gpuData.persistedTables.groundOffset);
+    CHECK(loaded.gpuData.persistedTables.GroundValid());
     CHECK(ReadPersistedGpuStreamChecksum(loaded.gpuData.persistedTables) ==
           loaded.gpuData.persistedTables.streamChecksum);
     CHECK(loaded.gpuData.flowSurfaceMask == cache.gpuData.flowSurfaceMask);
@@ -676,15 +1006,15 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
               changedDuringUpload.gpuData.persistedTables) !=
           changedDuringUpload.gpuData.persistedTables.streamChecksum);
 
-    // Schema 3 requires its checksum trailer; truncation cannot silently turn a
+    // Schema 4 requires its checksum trailer; truncation cannot silently turn a
     // current cache into a trusted warm-load payload.
     const auto truncatedPath = temporary.path / "truncated.surfacecache";
     REQUIRE(std::filesystem::copy_file(path, truncatedPath));
-    constexpr std::uintmax_t schema3TrailerBytes =
+    constexpr std::uintmax_t schema4TrailerBytes =
         8U + sizeof(std::uint32_t) + 8U + 4U * sizeof(std::uint64_t) +
         3U * sizeof(std::uint64_t);
     const auto savedSize = std::filesystem::file_size(truncatedPath);
-    REQUIRE(savedSize > schema3TrailerBytes);
+    REQUIRE(savedSize > schema4TrailerBytes);
 
     const auto corruptedPath = temporary.path / "corrupted.surfacecache";
     REQUIRE(std::filesystem::copy_file(path, corruptedPath));
@@ -694,7 +1024,7 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
             std::ios::binary | std::ios::in | std::ios::out};
         REQUIRE(corrupted.is_open());
         const auto payloadByte = static_cast<std::streamoff>(
-            savedSize - schema3TrailerBytes - 1U);
+            savedSize - schema4TrailerBytes - 1U);
         corrupted.seekg(payloadByte);
         char value = 0;
         corrupted.read(&value, 1U);
@@ -708,30 +1038,44 @@ TEST_CASE("rain collision cache persistence rejects stale signatures", "[water][
         &loaded,
         &error));
 
-    std::filesystem::resize_file(truncatedPath, savedSize - schema3TrailerBytes);
+    std::filesystem::resize_file(truncatedPath, savedSize - schema4TrailerBytes);
     CHECK_FALSE(invisible_places::water::LoadWaterSurfaceCache(
         truncatedPath,
         "expected",
         &loaded,
         &error));
 
-    // Schema-2 files without the optional identity trailer remain readable as
-    // migration input. Their legacy identity is recovered once, while schema 3
-    // also records the fast payload checksum used by a subsequent migration.
+    // Schema 3 remains recoverable through its validated streaming reader, but
+    // has no Ground payload and therefore cannot alias a schema-4 sidecar.
+    const auto previousPath = temporary.path / "previous.surfacecache";
+    WritePreGroundSurfaceCache(
+        previousPath,
+        cache,
+        invisible_places::water::kWaterSurfaceCachePreviousSchemaVersion);
+    invisible_places::water::WaterSurfaceBuildDiagnostics previousDiagnostics;
+    REQUIRE(invisible_places::water::LoadWaterSurfaceCache(
+        previousPath,
+        "expected",
+        &loaded,
+        &error,
+        &previousDiagnostics));
+    CHECK(
+        loaded.schemaVersion ==
+        invisible_places::water::kWaterSurfaceCachePreviousSchemaVersion);
+    CHECK(loaded.groundCells.empty());
+    CHECK(loaded.groundSourcePointCount == 0U);
+    CHECK(loaded.cacheIdentity.Valid());
+    CHECK(loaded.gpuData.persistedTables.Valid());
+    CHECK_FALSE(loaded.gpuData.persistedTables.GroundValid());
+    CHECK(previousDiagnostics.fullPayloadHashPassCount == 0U);
+
+    // Schema-2 files without the optional identity trailer remain directly
+    // readable as one-time recovery input.
     const auto legacyPath = temporary.path / "legacy.raincache";
-    REQUIRE(std::filesystem::copy_file(path, legacyPath));
-    std::filesystem::resize_file(legacyPath, savedSize - schema3TrailerBytes);
-    {
-        std::fstream legacy{legacyPath, std::ios::binary | std::ios::in | std::ios::out};
-        REQUIRE(legacy.is_open());
-        constexpr std::string_view legacyMagic = "IPWSC002";
-        legacy.write(legacyMagic.data(), static_cast<std::streamsize>(legacyMagic.size()));
-        constexpr std::uint32_t legacySchema =
-            invisible_places::water::kWaterSurfaceCacheLegacySchemaVersion;
-        legacy.write(
-            reinterpret_cast<const char*>(&legacySchema),
-            sizeof(legacySchema));
-    }
+    WritePreGroundSurfaceCache(
+        legacyPath,
+        cache,
+        invisible_places::water::kWaterSurfaceCacheLegacySchemaVersion);
     invisible_places::water::WaterSurfaceBuildDiagnostics legacyDiagnostics;
     REQUIRE(invisible_places::water::LoadWaterSurfaceCache(
         legacyPath,
@@ -753,18 +1097,20 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     TemporaryDirectory temporary;
     const auto sceneDirectory = temporary.path / "Scene";
     std::filesystem::create_directories(sceneDirectory);
-    const std::array<std::pair<std::string_view, WaterSurfaceRole>, 3> files{{
+    const std::array<std::pair<std::string_view, WaterSurfaceRole>, 4> files{{
         {"rock-2mm.ply", WaterSurfaceRole::Rock},
         {"sand-2mm.ply", WaterSurfaceRole::Sand},
         {"vegetation-2mm.ply", WaterSurfaceRole::Vegetation},
+        {"ground-5mm.ply", WaterSurfaceRole::Ground},
     }};
     std::vector<invisible_places::water::WaterSurfaceSource> sources;
     for (std::size_t index = 0U; index < files.size(); ++index) {
         const auto path = sceneDirectory / files[index].first;
+        const bool isGround = files[index].second == WaterSurfaceRole::Ground;
         WritePointPly(path, {{
-            static_cast<float>(index) * 0.02F,
+            isGround ? 0.0F : static_cast<float>(index) * 0.02F,
             0.0F,
-            static_cast<float>(index) * 0.01F,
+            isGround ? 0.10F : static_cast<float>(index) * 0.01F,
             0.0F,
             0.0F,
             1.0F,
@@ -772,7 +1118,10 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
         sources.push_back({
             .sourcePath = path,
             .role = files[index].second,
-            .spacingMicrometres = 2'000U,
+            .spacingMicrometres =
+                isGround
+                    ? 5'000U
+                    : 2'000U,
         });
     }
 
@@ -782,11 +1131,15 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     REQUIRE(cold.success);
     CHECK_FALSE(cold.loadedFromDisk);
     CHECK(cold.cache.resolutionMeters == Catch::Approx(0.010F));
-    REQUIRE(cold.cache.sources.size() == 3U);
+    REQUIRE(cold.cache.sources.size() == 4U);
     for (const auto& source : cold.cache.sources) {
-        CHECK(source.spacingMicrometres == 2'000U);
+        CHECK(
+            source.spacingMicrometres ==
+            (source.role == WaterSurfaceRole::Ground ? 5'000U : 2'000U));
     }
-    CHECK(cold.diagnostics.sourceScanCount == 3U);
+    CHECK(cold.cache.sourcePointCount == 3U);
+    CHECK(cold.cache.groundSourcePointCount == 1U);
+    CHECK(cold.diagnostics.sourceScanCount == 4U);
     CHECK(cold.diagnostics.gpuTableBuildCount == 1U);
     CHECK(cold.diagnostics.fullPayloadHashPassCount == 0U);
     const auto cachePath = invisible_places::water::WaterSurfaceCachePath(
@@ -807,9 +1160,13 @@ TEST_CASE("water surface warm loads do not rescan or rebuild tables", "[water][r
     CHECK(warm.cache.gpuData.surfaceTable.empty());
     CHECK(warm.cache.gpuData.vegetationTable.empty());
     CHECK(warm.cache.gpuData.flowSurfaceTable.empty());
+    CHECK(warm.cache.gpuData.groundTable.empty());
+    CHECK(warm.cache.gpuData.persistedTables.GroundValid());
     REQUIRE(warm.cache.sources.size() == cold.cache.sources.size());
     for (const auto& source : warm.cache.sources) {
-        CHECK(source.spacingMicrometres == 2'000U);
+        CHECK(
+            source.spacingMicrometres ==
+            (source.role == WaterSurfaceRole::Ground ? 5'000U : 2'000U));
     }
     CHECK(warm.cache.cacheIdentity == cold.cache.cacheIdentity);
     CHECK(warm.persistedPath == cachePath);
@@ -977,7 +1334,7 @@ TEST_CASE("water surface signatures invalidate for every terrain source input",
     }};
     const auto baseline = invisible_places::water::WaterSurfaceCacheSignature(sources);
     CHECK(invisible_places::water::kWaterSurfaceCacheAlgorithmId ==
-          std::string_view{"water-surface-10mm-normal-average-v1"});
+          std::string_view{"water-surface-10mm-normal-average-ground-v2"});
     CHECK(invisible_places::water::WaterSurfaceCacheSignature(sources, 0.020F) != baseline);
 
     auto changedRole = sources;
@@ -987,6 +1344,27 @@ TEST_CASE("water surface signatures invalidate for every terrain source input",
     auto changedSpacing = sources;
     changedSpacing.front().spacingMicrometres = 3'000U;
     CHECK(invisible_places::water::WaterSurfaceCacheSignature(changedSpacing) != baseline);
+
+    const auto groundPath =
+        sourcePath.parent_path() / "mesh-sampled-5mm.ply";
+    WritePointPly(
+        groundPath,
+        {{0.0F, 0.0F, 0.1F, 0.0F, 0.0F, 1.0F}});
+    auto withGround = sources;
+    withGround.push_back({
+        .sourcePath = groundPath,
+        .role = WaterSurfaceRole::Ground,
+        .spacingMicrometres =
+            invisible_places::water::kWaterGroundSourceSpacingMicrometres,
+    });
+    const auto withGroundSignature =
+        invisible_places::water::WaterSurfaceCacheSignature(withGround);
+    CHECK(withGroundSignature != baseline);
+    auto changedGroundSpacing = withGround;
+    changedGroundSpacing.back().spacingMicrometres = 10'000U;
+    CHECK(
+        invisible_places::water::WaterSurfaceCacheSignature(
+            changedGroundSpacing) != withGroundSignature);
 
     auto changedTransform = sources;
     changedTransform.front().hasTransform = true;
@@ -1734,6 +2112,9 @@ TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cach
         {.sourcePath = sceneDirectory / "Site1-VEG-2mm.ply",
          .role = WaterSurfaceRole::Vegetation,
          .spacingMicrometres = 2'000U},
+        {.sourcePath = sceneDirectory / "Site1-MESHSampled-5mm.ply",
+         .role = WaterSurfaceRole::Ground,
+         .spacingMicrometres = 5'000U},
     };
     for (const auto& source : sources) {
         REQUIRE(std::filesystem::is_regular_file(source.sourcePath));
@@ -1749,12 +2130,17 @@ TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cach
     CHECK_FALSE(first.cache.vegetationVoxels.empty());
     CHECK(first.cache.sourcePointCount > 0U);
     CHECK(first.cache.sourcePointCount == 39'409'886U);
-    CHECK(first.cache.sources.size() == 3U);
+    CHECK(first.cache.groundSourcePointCount > 0U);
+    CHECK(first.cache.sources.size() == 4U);
+    CHECK_FALSE(first.cache.groundCells.empty());
 
     const auto gpu = invisible_places::water::BuildWaterSurfaceGpuData(first.cache);
     CHECK(first.cache.surfaceCells.size() <= static_cast<std::size_t>(gpu.surfaceTable.size() * 0.65F));
     CHECK(first.cache.vegetationVoxels.size() <= static_cast<std::size_t>(gpu.vegetationTable.size() * 0.65F));
+    CHECK(first.cache.groundCells.size() <=
+          static_cast<std::size_t>(gpu.groundTable.size() * 0.80F));
     CHECK(gpu.maximumProbeCount <= 32U);
+    CHECK(gpu.groundMaximumProbeCount <= 32U);
 
     const auto second = invisible_places::water::BuildWaterSurfaceCache(sources, savedDirectory);
     REQUIRE(second.success);
@@ -1763,7 +2149,13 @@ TEST_CASE("Scene1 builds and reloads the exact two millimetre water surface cach
     CHECK(second.cache.surfaceCells.size() == first.cache.surfaceCells.size());
     CHECK(second.cache.vegetationVoxels.size() == first.cache.vegetationVoxels.size());
     CHECK(second.cache.flowSurfaceSurfels.size() == first.cache.flowSurfaceSurfels.size());
-    CHECK(second.cache.gpuData.surfaceTable.size() == first.cache.gpuData.surfaceTable.size());
-    CHECK(second.cache.gpuData.vegetationTable.size() == first.cache.gpuData.vegetationTable.size());
-    CHECK(second.cache.gpuData.flowSurfaceTable.size() == first.cache.gpuData.flowSurfaceTable.size());
+    CHECK(second.cache.groundCells.size() == first.cache.groundCells.size());
+    CHECK(second.cache.gpuData.persistedTables.surfaceCount ==
+          first.cache.gpuData.surfaceTable.size());
+    CHECK(second.cache.gpuData.persistedTables.vegetationCount ==
+          first.cache.gpuData.vegetationTable.size());
+    CHECK(second.cache.gpuData.persistedTables.flowSurfaceCount ==
+          first.cache.gpuData.flowSurfaceTable.size());
+    CHECK(second.cache.gpuData.persistedTables.groundCount ==
+          first.cache.gpuData.groundTable.size());
 }

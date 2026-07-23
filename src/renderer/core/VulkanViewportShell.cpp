@@ -468,15 +468,45 @@ struct alignas(16) WaterSeepageHashCellGpu {
 };
 
 struct alignas(16) DynamicMeshFlowUniformsGpu {
-    glm::uvec4 counts0{0U, 0U, 0U, 0U};
-    glm::uvec4 counts1{0U, 0U, 0U, 0U};
-    glm::vec4 surface0{0.08F, 0.24F, 0.020F, invisible_places::water::kWaterTrailFeatureTypeDynamicMesh};
-    glm::ivec4 grid0{0, 0, 1, 0};
-    glm::uvec4 grid1{1U, 1U, 0U, 0U};
-    glm::vec4 flow0{18.0F, 0.12F, 0.62F, 4.0F};
-    glm::vec4 flow1{1.35F, 1.0F, 0.35F, 0.18F};
-    glm::vec4 flow2{0.64F, 0.36F, 0.08F, 0.65F};
-    glm::vec4 visual0{0.005F, 0.18F, 0.25F, 0.12F};
+    glm::uvec4 capacities{0U, 0U, 0U, 0U};
+    glm::uvec4 ground{0U, 1U, 0U, 0U};
+    glm::uvec4 control{1U, 0U, 1U, 0U};
+    glm::uvec4 contactGrid{0U, 0U, 0U, 0U};
+    glm::vec4 timing{0.0F, 1.0F / 30.0F, 1.0F, 0.0F};
+    glm::vec4 boundsMinimumResolution{0.0F, 0.0F, 0.0F, 0.010F};
+    glm::vec4 boundsMaximumBand{0.0F, 0.0F, 0.0F, 0.35F};
+    glm::vec4 motion0{0.22F, 1.35F, 0.76F, 0.006F};
+    glm::vec4 particleNoise{0.32F, 0.18F, 0.40F, 0.75F};
+    glm::vec4 sharedWind{0.18F, 2.4F, 0.06F, 0.80F};
+    glm::vec4 visual{0.005F, 0.18F, invisible_places::water::kWaterTrailFeatureTypeDynamicMesh, 0.8F};
+    glm::vec4 responsePersistence{2.5F, 3.0F, 0.0F, 0.0F};
+    glm::vec4 rockResponse{0.12F, 0.16F, 0.35F, 2.5F};
+    glm::vec4 rockColour{0.18F, 0.42F, 0.55F, 0.45F};
+    glm::vec4 vegetationResponse{0.18F, 0.14F, 0.55F, 3.0F};
+    glm::vec4 vegetationColour{0.18F, 0.55F, 0.48F, 0.50F};
+    glm::vec4 vegetationExtra{1.4F, 0.45F, 0.0F, 0.0F};
+};
+
+struct alignas(16) DynamicMeshFlowParticleGpu {
+    glm::vec4 positionAge{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 velocityDistance{1.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 normalConfidence{0.0F, 0.0F, 1.0F, 0.0F};
+    glm::uvec4 metadata{0U, 0U, 0U, 0U};
+};
+
+struct alignas(16) DynamicMeshFlowContactEventGpu {
+    glm::vec4 positionTime{0.0F, 0.0F, 0.0F, -1.0F};
+    glm::vec4 normalRadius{0.0F, 0.0F, 1.0F, 0.0F};
+    glm::uvec4 metadata{0U, 0U, 0U, 0U};
+    glm::vec4 response{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 vegetationExtra{0.0F, 0.0F, 0.0F, 0.0F};
+};
+
+struct alignas(16) DynamicMeshFlowCountersGpu {
+    std::uint32_t activeParticleCount = 0U;
+    std::uint32_t contactEventCount = 0U;
+    std::uint32_t terminalContactCount = 0U;
+    std::uint32_t reserved = 0U;
 };
 
 struct alignas(16) WaterFlowSourceUniformsGpu {
@@ -522,6 +552,11 @@ struct alignas(16) DynamicMeshFlowEmitterGpu {
     glm::vec4 positionRadius{0.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 strengthSpeedIdSeed{1.0F, 1.0F, 0.0F, 0.0F};
 };
+
+static_assert(sizeof(DynamicMeshFlowUniformsGpu) == 272U);
+static_assert(sizeof(DynamicMeshFlowParticleGpu) == 64U);
+static_assert(sizeof(DynamicMeshFlowContactEventGpu) == 80U);
+static_assert(sizeof(DynamicMeshFlowCountersGpu) == 16U);
 
 struct alignas(16) DynamicMeshFlowAttractorGpu {
     glm::vec4 positionRadius{0.0F, 0.0F, 0.0F, 0.0F};
@@ -1450,6 +1485,9 @@ VulkanViewportShell::~VulkanViewportShell() {
 
     ResetPointCloudReferencingCommandBuffers();
     for (auto& resources : pointCloudResources_) {
+        RetirePointCloudRenderDescriptors(&resources);
+    }
+    for (auto& resources : pointCloudResources_) {
         DestroyPointCloudResources(&resources);
     }
     pointCloudResources_.clear();
@@ -2229,6 +2267,9 @@ std::uint64_t VulkanViewportShell::PointCloudResourceResidentBytes(
     add(resources.sampledSurfelIndexBuffer);
     add(resources.interactiveSampledIndexBuffer);
     add(resources.interactiveSurfelIndexBuffer);
+    add(resources.dynamicMeshFlowParticleBuffer);
+    add(resources.dynamicMeshFlowContactEventBuffer);
+    add(resources.dynamicMeshFlowContactGridBuffer);
     add(resources.waterFlowPendingPositionBuffer);
     add(resources.waterFlowPendingPositionStorageBuffer);
     add(resources.waterFlowPendingColorBuffer);
@@ -2566,6 +2607,31 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
     const std::vector<invisible_places::water::WaterEmitter>& emitters,
     const invisible_places::water::WaterDynamicMeshFlowSettings& settings,
     invisible_places::water::WaterTrailBuildQuality quality) {
+    (void)cache;
+    (void)quality;
+    DynamicMeshFlowGpuFrameRequest request;
+    request.settings = settings;
+    request.authoredEmitters = emitters;
+    request.activity = settings.enabled ? 1.0F : 0.0F;
+    request.moisture = 0.0F;
+    request.resetSimulation = false;
+    const auto update = UpdateDynamicMeshFlowGpuSimulation(layerId, request);
+    return {
+        .pointCount = update.pointCount,
+        .particleCount = update.particleCapacity,
+        .routeAnchorCount = update.historyLength,
+        .visibleSampleCount = update.particleCapacity,
+        .solveMilliseconds =
+            update.allocationMilliseconds +
+            update.parameterUploadMilliseconds +
+            update.dispatchMilliseconds,
+        .staticUploadMilliseconds = update.allocationMilliseconds,
+        .liveUploadMilliseconds = update.parameterUploadMilliseconds,
+        .dispatchMilliseconds = update.dispatchMilliseconds,
+        .reusedStaticBuffers = !update.allocatedThisUpdate,
+        .asynchronousDispatch = update.asynchronousDispatch,
+    };
+#if 0
     const auto startedAt = std::chrono::steady_clock::now();
     if (!settings.enabled || cache.cells.empty()) {
         throw std::runtime_error{"Dynamic mesh flow GPU upload requires an enabled settings object and a warm cache."};
@@ -3038,6 +3104,725 @@ DynamicMeshFlowGpuUploadResult VulkanViewportShell::UploadDynamicMeshFlowPreview
         .reusedStaticBuffers = !rebuildStaticBuffers,
         .asynchronousDispatch = true,
     };
+#endif
+}
+
+DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimulation(
+    std::size_t layerId,
+    const DynamicMeshFlowGpuFrameRequest& request) {
+    constexpr std::uint32_t kScalarFieldCount = 31U;
+    constexpr std::uint32_t kMaximumParticleCapacity = 65'536U;
+    constexpr std::uint32_t kMaximumHistoryLength = 128U;
+    constexpr std::uint32_t kMaximumPointCount = 4'000'000U;
+    constexpr std::uint32_t kAuthoredEmitterCapacity = 256U;
+
+    DynamicMeshFlowGpuUpdateResult result;
+    const auto groundView = WaterGroundFlowView();
+    result.sharedGroundReady = groundView.valid;
+    result.sharedGroundUploadRevision = groundView.uploadRevision;
+    if (!groundView.valid ||
+        dynamicMeshFlowComputePipeline_ == VK_NULL_HANDLE ||
+        dynamicMeshFlowPipelineLayout_ == VK_NULL_HANDLE ||
+        dynamicMeshFlowDescriptorSetLayout_ == VK_NULL_HANDLE) {
+        return result;
+    }
+
+    const auto particleCapacity = std::clamp(
+        request.settings.particleCapacity,
+        1U,
+        kMaximumParticleCapacity);
+    const auto historyLength = std::clamp(
+        request.settings.historyLength,
+        2U,
+        kMaximumHistoryLength);
+    const std::uint64_t pointCount64 =
+        static_cast<std::uint64_t>(particleCapacity) *
+        static_cast<std::uint64_t>(historyLength + 1U);
+    if (pointCount64 > kMaximumPointCount ||
+        pointCount64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{
+            "Dynamic Mesh Flow fixed history exceeds the GPU point budget."};
+    }
+    const auto pointCount = static_cast<std::uint32_t>(pointCount64);
+    std::uint32_t contactGridCapacity = 1U;
+    while (contactGridCapacity < particleCapacity * 2U) {
+        contactGridCapacity <<= 1U;
+    }
+
+    std::array<DynamicMeshFlowEmitterGpu, kAuthoredEmitterCapacity> emitterUpload{};
+    std::uint32_t emitterCount = 0U;
+    for (const auto& emitter : request.authoredEmitters) {
+        if (emitterCount >= emitterUpload.size()) {
+            break;
+        }
+        if (emitter.status == invisible_places::water::WaterEmitterStatus::Disabled ||
+            emitter.strength <= 0.0F) {
+            continue;
+        }
+        auto& gpuEmitter = emitterUpload[emitterCount++];
+        gpuEmitter.positionRadius = glm::vec4{
+            emitter.position.x,
+            emitter.position.y,
+            emitter.position.z,
+            std::max(0.0F, emitter.radius),
+        };
+        gpuEmitter.strengthSpeedIdSeed = glm::vec4{
+            std::max(0.0F, emitter.strength),
+            std::max(0.01F, emitter.speed),
+            static_cast<float>(emitter.id),
+            static_cast<float>(
+                request.settings.seed ^ (emitter.id * 2654435761U)),
+        };
+    }
+
+    auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr) {
+        pointCloudResources_.push_back(ActivePointCloudResources{});
+        resources = &pointCloudResources_.back();
+    }
+    const bool groundIdentityChanged =
+        resources->dynamicMeshFlowGroundUploadRevision != groundView.uploadRevision ||
+        resources->dynamicMeshFlowGroundIdentity != *groundView.cacheIdentity;
+    const bool needsAllocation =
+        resources->dynamicMeshFlowAllocationRevision == 0U ||
+        resources->layerId != layerId ||
+        resources->dynamicMeshFlowParticleCount != particleCapacity ||
+        resources->dynamicMeshFlowRouteAnchorCount != historyLength ||
+        resources->pointCount != pointCount ||
+        groundIdentityChanged ||
+        resources->dynamicMeshFlowParticleBuffer.buffer == VK_NULL_HANDLE ||
+        resources->dynamicMeshFlowContactEventBuffer.buffer == VK_NULL_HANDLE ||
+        resources->dynamicMeshFlowContactGridBuffer.buffer == VK_NULL_HANDLE ||
+        resources->dynamicMeshFlowDescriptorPool == VK_NULL_HANDLE ||
+        resources->positionStorageBuffer.buffer == VK_NULL_HANDLE ||
+        resources->normalBuffer.buffer == VK_NULL_HANDLE ||
+        resources->scalarFieldBuffer.buffer == VK_NULL_HANDLE;
+
+    if (needsAllocation) {
+        const auto allocationStartedAt = std::chrono::steady_clock::now();
+        ActivePointCloudResources staged;
+        staged.layerId = layerId;
+        staged.pointCount = pointCount;
+        staged.activePointCount = pointCount;
+        staged.scalarFieldCount = kScalarFieldCount;
+        staged.hasSourceRgb = true;
+        staged.hasNormals = true;
+        staged.dynamicMeshFlowGroundIdentity = *groundView.cacheIdentity;
+        staged.dynamicMeshFlowGroundUploadRevision = groundView.uploadRevision;
+        staged.dynamicMeshFlowParticleCount = particleCapacity;
+        staged.dynamicMeshFlowRouteAnchorCount = historyLength;
+        staged.dynamicMeshFlowVisibleSampleCount = particleCapacity;
+        staged.dynamicMeshFlowEmitterCapacity = kAuthoredEmitterCapacity;
+        staged.dynamicMeshFlowEventCapacity = particleCapacity;
+        staged.dynamicMeshFlowContactGridMask =
+            contactGridCapacity - 1U;
+        staged.dynamicMeshFlowCellSize = groundView.resolutionMeters;
+        staged.dynamicMeshFlowAllocationRevision =
+            resources->dynamicMeshFlowAllocationRevision + 1U;
+        staged.dynamicMeshFlowDescriptorGeneration =
+            resources->dynamicMeshFlowDescriptorGeneration + 1U;
+        staged.dynamicMeshFlowResetEpoch = 1U;
+
+        try {
+            staged.positionBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(pointCount) *
+                    sizeof(invisible_places::io::Float3),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            staged.positionStorageBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(pointCount) * sizeof(glm::vec4),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            staged.normalBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(pointCount) * sizeof(glm::vec4),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            staged.scalarFieldBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(pointCount) *
+                    kScalarFieldCount * sizeof(float),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            staged.dynamicMeshFlowParticleBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(particleCapacity) *
+                    sizeof(DynamicMeshFlowParticleGpu),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            staged.dynamicMeshFlowContactEventBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(particleCapacity) *
+                    sizeof(DynamicMeshFlowContactEventGpu),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            staged.dynamicMeshFlowContactGridBuffer =
+                CreateHostVisibleBuffer(
+                    static_cast<VkDeviceSize>(contactGridCapacity) *
+                        sizeof(glm::uvec4),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+            for (const auto* allocation : {
+                     &staged.positionBuffer,
+                     &staged.positionStorageBuffer,
+                     &staged.normalBuffer,
+                     &staged.scalarFieldBuffer,
+                     &staged.dynamicMeshFlowParticleBuffer,
+                     &staged.dynamicMeshFlowContactEventBuffer,
+                     &staged.dynamicMeshFlowContactGridBuffer}) {
+                if (allocation->mapped != nullptr) {
+                    std::memset(
+                        allocation->mapped,
+                        0,
+                        static_cast<std::size_t>(allocation->size));
+                }
+            }
+
+            const std::uint32_t waterColor =
+                static_cast<std::uint32_t>(190U) |
+                (static_cast<std::uint32_t>(230U) << 8U) |
+                (static_cast<std::uint32_t>(255U) << 16U) |
+                (0xFFU << 24U);
+            std::vector<std::uint32_t> packedColors(pointCount, waterColor);
+            staged.colorBuffer = CreateHostVisibleBuffer(
+                static_cast<VkDeviceSize>(packedColors.size()) *
+                    sizeof(std::uint32_t),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.colorBuffer,
+                packedColors.data(),
+                staged.colorBuffer.size);
+
+            const SparseWaterRippleRangeGpu emptySparseRippleRange{};
+            staged.sparseRippleRangeBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySparseRippleRange),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.sparseRippleRangeBuffer,
+                &emptySparseRippleRange,
+                sizeof(emptySparseRippleRange));
+            const SparseWaterRippleMembershipGpu emptySparseRippleMembership{};
+            staged.sparseRippleMembershipBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySparseRippleMembership),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.sparseRippleMembershipBuffer,
+                &emptySparseRippleMembership,
+                sizeof(emptySparseRippleMembership));
+            const SparseWaterRippleParamsGpu emptySparseRippleParams{};
+            for (auto& paramsBuffer : staged.sparseRippleParamsBuffers) {
+                paramsBuffer = CreateHostVisibleBuffer(
+                    sizeof(emptySparseRippleParams),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                UploadBufferData(
+                    paramsBuffer,
+                    &emptySparseRippleParams,
+                    sizeof(emptySparseRippleParams));
+            }
+            staged.sparseRippleExrParamsBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySparseRippleParams),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.sparseRippleExrParamsBuffer,
+                &emptySparseRippleParams,
+                sizeof(emptySparseRippleParams));
+
+            const WaterSeepageNodeTopologyGpu emptySeepageNode{};
+            staged.seepageNodeBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySeepageNode),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.seepageNodeBuffer,
+                &emptySeepageNode,
+                sizeof(emptySeepageNode));
+            const WaterSeepageNodeParamsGpu emptySeepageParams{};
+            for (auto& paramsBuffer : staged.seepageParamsBuffers) {
+                paramsBuffer = CreateHostVisibleBuffer(
+                    sizeof(emptySeepageParams),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                UploadBufferData(
+                    paramsBuffer,
+                    &emptySeepageParams,
+                    sizeof(emptySeepageParams));
+            }
+            staged.seepageExrParamsBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySeepageParams),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.seepageExrParamsBuffer,
+                &emptySeepageParams,
+                sizeof(emptySeepageParams));
+            staged.pendingSeepageParams.resize(sizeof(emptySeepageParams));
+            std::memcpy(
+                staged.pendingSeepageParams.data(),
+                &emptySeepageParams,
+                sizeof(emptySeepageParams));
+            const WaterSeepageHashCellGpu emptySeepageHashCell{};
+            staged.seepageHashCellBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySeepageHashCell),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.seepageHashCellBuffer,
+                &emptySeepageHashCell,
+                sizeof(emptySeepageHashCell));
+            const invisible_places::water::WaterSeepageSupportReference
+                emptySeepageNodeReference{};
+            staged.seepageNodeReferenceBuffer = CreateHostVisibleBuffer(
+                sizeof(emptySeepageNodeReference),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            UploadBufferData(
+                staged.seepageNodeReferenceBuffer,
+                &emptySeepageNodeReference,
+                sizeof(emptySeepageNodeReference));
+
+            for (auto& styleBuffer : staged.styleBuffers) {
+                styleBuffer = CreateHostVisibleBuffer(
+                    sizeof(PointCloudStyleGpu),
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            }
+            staged.exrStyleBuffer = CreateHostVisibleBuffer(
+                sizeof(PointCloudStyleGpu),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+            for (std::size_t liveSlot = 0U;
+                 liveSlot < kDynamicMeshFlowLiveSlots;
+                 ++liveSlot) {
+                staged.dynamicMeshFlowUniformBuffers[liveSlot] =
+                    CreateHostVisibleBuffer(
+                        sizeof(DynamicMeshFlowUniformsGpu),
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+                staged.dynamicMeshFlowEmitterBuffers[liveSlot] =
+                    CreateHostVisibleBuffer(
+                        static_cast<VkDeviceSize>(kAuthoredEmitterCapacity) *
+                            sizeof(DynamicMeshFlowEmitterGpu),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                staged.dynamicMeshFlowCounterBuffers[liveSlot] =
+                    CreateHostVisibleBuffer(
+                        sizeof(DynamicMeshFlowCountersGpu),
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            }
+            staged.dynamicMeshFlowDescriptorPool =
+                CreateDynamicMeshFlowDescriptorPool();
+            for (std::size_t liveSlot = 0U;
+                 liveSlot < kDynamicMeshFlowLiveSlots;
+                 ++liveSlot) {
+                UpdateDynamicMeshFlowDescriptorSet(
+                    &staged,
+                    liveSlot,
+                    groundView);
+            }
+            auto stagedPointGeneration = BuildPointDescriptorGeneration(
+                &staged,
+                exrExportResources_.depthImage.view);
+            InstallPointDescriptorGeneration(
+                &staged,
+                &stagedPointGeneration);
+        } catch (...) {
+            DestroyPointCloudResources(&staged);
+            throw;
+        }
+
+        struct PendingBaseContactGeneration {
+            std::size_t resourceIndex = 0U;
+            PendingPointDescriptorGeneration generation{};
+        };
+        std::vector<PendingBaseContactGeneration> pendingBaseGenerations;
+        pointDescriptorDynamicMeshFlowContactOverride_ =
+            PointDescriptorDynamicMeshFlowContactView(&staged);
+        try {
+            for (std::size_t resourceIndex = 0U;
+                 resourceIndex < pointCloudResources_.size();
+                 ++resourceIndex) {
+                auto& candidate = pointCloudResources_[resourceIndex];
+                if (&candidate == resources ||
+                    candidate.dynamicMeshFlowAllocationRevision != 0U ||
+                    candidate.pointDescriptorPool == VK_NULL_HANDLE) {
+                    continue;
+                }
+                PendingBaseContactGeneration pendingBase;
+                pendingBase.resourceIndex = resourceIndex;
+                pendingBase.generation = BuildPointDescriptorGeneration(
+                    &candidate,
+                    exrExportResources_.depthImage.view);
+                pendingBaseGenerations.push_back(
+                    std::move(pendingBase));
+            }
+        } catch (...) {
+            pointDescriptorDynamicMeshFlowContactOverride_.reset();
+            for (auto& pendingBase : pendingBaseGenerations) {
+                DestroyPointDescriptorGeneration(
+                    &pendingBase.generation);
+            }
+            DestroyPointCloudResources(&staged);
+            throw;
+        }
+        pointDescriptorDynamicMeshFlowContactOverride_.reset();
+
+        // Descriptor and buffer generations become visible together. The old
+        // generation remains fully bound until the one settle immediately
+        // before the swap, so failed staging cannot disturb the last frame.
+        TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(staged));
+        try {
+            SettlePointCloudMutation();
+        } catch (...) {
+            for (auto& pendingBase : pendingBaseGenerations) {
+                DestroyPointDescriptorGeneration(
+                    &pendingBase.generation);
+            }
+            DestroyPointCloudResources(&staged);
+            throw;
+        }
+        std::swap(*resources, staged);
+        for (auto& pendingBase : pendingBaseGenerations) {
+            InstallPointDescriptorGeneration(
+                &pointCloudResources_[pendingBase.resourceIndex],
+                &pendingBase.generation);
+        }
+        DestroyPointCloudResources(&staged);
+        result.allocatedThisUpdate = true;
+        result.allocationMilliseconds = MillisecondsBetween(
+            allocationStartedAt,
+            std::chrono::steady_clock::now());
+    }
+
+    if (request.resetSimulation) {
+        ++resources->dynamicMeshFlowResetEpoch;
+        if (resources->dynamicMeshFlowResetEpoch == 0U) {
+            resources->dynamicMeshFlowResetEpoch = 1U;
+        }
+    }
+
+    const auto parameterStartedAt = std::chrono::steady_clock::now();
+    const auto liveSlot =
+        resources->dynamicMeshFlowNextLiveSlot % kDynamicMeshFlowLiveSlots;
+    resources->dynamicMeshFlowNextLiveSlot =
+        (resources->dynamicMeshFlowNextLiveSlot + 1U) %
+        kDynamicMeshFlowLiveSlots;
+    PrepareDynamicMeshFlowDispatchSlot(resources, liveSlot);
+
+    if (resources->dynamicMeshFlowCounterBuffers[liveSlot].mapped != nullptr) {
+        DynamicMeshFlowCountersGpu completedCounters;
+        std::memcpy(
+            &completedCounters,
+            resources->dynamicMeshFlowCounterBuffers[liveSlot].mapped,
+            sizeof(completedCounters));
+        resources->dynamicMeshFlowLastActiveParticleCount =
+            std::min(completedCounters.activeParticleCount, particleCapacity);
+        resources->dynamicMeshFlowLastContactEventCount =
+            std::min(
+                completedCounters.contactEventCount,
+                resources->dynamicMeshFlowEventCapacity);
+    }
+
+    DynamicMeshFlowUniformsGpu uniforms;
+    uniforms.capacities = glm::uvec4{
+        particleCapacity,
+        historyLength,
+        pointCount,
+        resources->dynamicMeshFlowEventCapacity,
+    };
+    uniforms.ground = glm::uvec4{
+        groundView.tableMask,
+        std::max(1U, groundView.maximumProbeCount),
+        groundView.occupiedCellCount,
+        request.settings.seed,
+    };
+    uniforms.control = glm::uvec4{
+        resources->dynamicMeshFlowResetEpoch,
+        request.settings.automaticSources ? 1U : 0U,
+        request.settings.showTrails ? 1U : 0U,
+        emitterCount,
+    };
+    const float activity =
+        request.settings.enabled
+            ? std::clamp(
+                  std::isfinite(request.activity) ? request.activity : 0.0F,
+                  0.0F,
+                  1.0F)
+            : 0.0F;
+    const float moisture = std::clamp(
+        std::isfinite(request.moisture) ? request.moisture : 0.0F,
+        0.0F,
+        1.0F);
+    uniforms.timing = glm::vec4{
+        std::isfinite(request.timeSeconds) ? request.timeSeconds : 0.0F,
+        std::clamp(
+            std::isfinite(request.deltaSeconds)
+                ? request.deltaSeconds
+                : 1.0F / 30.0F,
+            0.0F,
+            0.10F),
+        activity,
+        moisture,
+    };
+    // Fixed authored maximum response radius. Consumers derive table lengths
+    // from SSBO runtime arrays and can hash contacts without another mutable
+    // control/uniform binding.
+    constexpr float kContactGridCellSizeMeters = 0.75F;
+    const float contactGridCellSize = kContactGridCellSizeMeters;
+    resources->dynamicMeshFlowContactGridCellSizeMeters =
+        contactGridCellSize;
+    uniforms.contactGrid = glm::uvec4{
+        resources->dynamicMeshFlowContactGridMask,
+        resources->dynamicMeshFlowContactGridMask + 1U,
+        0U,
+        0U,
+    };
+    uniforms.boundsMinimumResolution = glm::vec4{
+        groundView.bounds.minimum.x,
+        groundView.bounds.minimum.y,
+        groundView.bounds.minimum.z,
+        std::max(0.001F, groundView.resolutionMeters),
+    };
+    uniforms.boundsMaximumBand = glm::vec4{
+        groundView.bounds.maximum.x,
+        groundView.bounds.maximum.y,
+        groundView.bounds.maximum.z,
+        std::max(
+            groundView.resolutionMeters,
+            request.settings.sourceBandWidthMeters),
+    };
+    uniforms.motion0 = glm::vec4{
+        std::max(0.001F, request.settings.speedMetersPerSecond),
+        std::max(0.0F, request.settings.downhillWeight),
+        std::clamp(request.settings.inertia, 0.0F, 0.98F),
+        std::max(0.0F, request.settings.surfaceOffsetMeters),
+    };
+    uniforms.particleNoise = glm::vec4{
+        std::max(0.0F, request.settings.particleNoiseStrength),
+        std::max(0.001F, request.settings.particleNoiseScaleMeters),
+        std::max(0.0F, request.settings.particleNoiseSpeed),
+        std::clamp(request.settings.dryConcavityFocus, 0.0F, 2.0F),
+    };
+    uniforms.sharedWind = glm::vec4{
+        std::max(0.0F, request.settings.sharedWindStrength),
+        std::max(0.001F, request.settings.sharedWindScaleMeters),
+        std::max(0.0F, request.settings.sharedWindSpeed),
+        std::clamp(request.settings.rainSpawnSpread, 0.0F, 2.0F),
+    };
+    uniforms.visual = glm::vec4{
+        std::max(0.0005F, request.settings.trailWidthMeters),
+        std::max(0.001F, request.settings.trailStreakLengthMeters),
+        invisible_places::water::kWaterTrailFeatureTypeDynamicMesh,
+        std::max(0.01F, request.settings.contactFadeSeconds),
+    };
+    uniforms.responsePersistence = glm::vec4{
+        std::max(
+            request.settings.contactFadeSeconds,
+            request.settings.rockResponse.persistenceSeconds),
+        std::max(
+            request.settings.contactFadeSeconds,
+            request.settings.vegetationResponse.persistenceSeconds),
+        contactGridCellSize,
+        0.0F,
+    };
+    uniforms.rockResponse = glm::vec4{
+        std::max(0.0F, request.settings.rockResponse.radiusMeters),
+        std::max(0.0F, request.settings.rockResponse.opacityAdd),
+        std::max(0.0F, request.settings.rockResponse.emissionAdd),
+        std::max(0.01F, request.settings.rockResponse.persistenceSeconds),
+    };
+    uniforms.rockColour = glm::vec4{
+        request.settings.rockResponse.colourise.x,
+        request.settings.rockResponse.colourise.y,
+        request.settings.rockResponse.colourise.z,
+        request.settings.rockResponse.colouriseAmount,
+    };
+    uniforms.vegetationResponse = glm::vec4{
+        std::max(0.0F, request.settings.vegetationResponse.radiusMeters),
+        std::max(0.0F, request.settings.vegetationResponse.opacityAdd),
+        std::max(0.0F, request.settings.vegetationResponse.emissionAdd),
+        std::max(
+            0.01F,
+            request.settings.vegetationResponse.persistenceSeconds),
+    };
+    uniforms.vegetationColour = glm::vec4{
+        request.settings.vegetationResponse.colourise.x,
+        request.settings.vegetationResponse.colourise.y,
+        request.settings.vegetationResponse.colourise.z,
+        request.settings.vegetationResponse.colouriseAmount,
+    };
+    uniforms.vegetationExtra = glm::vec4{
+        std::max(0.0F, request.settings.vegetationResponse.twinkle),
+        std::max(
+            0.0F,
+            request.settings.vegetationResponse.streamDepthMeters),
+        0.0F,
+        0.0F,
+    };
+
+    const DynamicMeshFlowCountersGpu emptyCounters{};
+    UploadBufferData(
+        resources->dynamicMeshFlowUniformBuffers[liveSlot],
+        &uniforms,
+        sizeof(uniforms));
+    if (emitterCount > 0U) {
+        UploadBufferData(
+            resources->dynamicMeshFlowEmitterBuffers[liveSlot],
+            emitterUpload.data(),
+            static_cast<VkDeviceSize>(emitterCount) *
+                sizeof(DynamicMeshFlowEmitterGpu));
+    }
+    UploadBufferData(
+        resources->dynamicMeshFlowCounterBuffers[liveSlot],
+        &emptyCounters,
+        sizeof(emptyCounters));
+    ++resources->dynamicMeshFlowParameterRevision;
+    result.parameterUploadMilliseconds = MillisecondsBetween(
+        parameterStartedAt,
+        std::chrono::steady_clock::now());
+
+    const auto dispatchStartedAt = std::chrono::steady_clock::now();
+    DispatchDynamicMeshFlowCompute(resources, particleCapacity, liveSlot);
+    ++resources->dynamicMeshFlowDispatchCount;
+    result.dispatchMilliseconds = MillisecondsBetween(
+        dispatchStartedAt,
+        std::chrono::steady_clock::now());
+
+    ++sceneRevision_;
+    result.pointCount = pointCount;
+    result.particleCapacity = particleCapacity;
+    result.historyLength = historyLength;
+    result.activeParticles =
+        resources->dynamicMeshFlowLastActiveParticleCount > 0U
+            ? resources->dynamicMeshFlowLastActiveParticleCount
+            : static_cast<std::uint32_t>(
+                  std::floor(static_cast<float>(particleCapacity) * activity));
+    result.contactEvents = resources->dynamicMeshFlowLastContactEventCount;
+    result.allocationRevision =
+        resources->dynamicMeshFlowAllocationRevision;
+    result.parameterRevision =
+        resources->dynamicMeshFlowParameterRevision;
+    result.descriptorGeneration =
+        resources->dynamicMeshFlowDescriptorGeneration;
+    result.dispatchCount = resources->dynamicMeshFlowDispatchCount;
+    result.parametersOnly = !result.allocatedThisUpdate;
+    result.asynchronousDispatch = true;
+    return result;
+}
+
+DynamicMeshFlowContactGpuView
+VulkanViewportShell::DynamicMeshFlowContactView(
+    std::size_t layerId) const {
+    const auto* resources = FindPointCloudResources(layerId);
+    if (resources == nullptr) {
+        return {};
+    }
+    return {
+        .eventBuffer =
+            resources->dynamicMeshFlowContactEventBuffer.buffer,
+        .eventOffset = 0U,
+        .eventRange =
+            resources->dynamicMeshFlowContactEventBuffer.size,
+        .gridBuffer =
+            resources->dynamicMeshFlowContactGridBuffer.buffer,
+        .gridOffset = 0U,
+        .gridRange =
+            resources->dynamicMeshFlowContactGridBuffer.size,
+        .eventCapacity = resources->dynamicMeshFlowEventCapacity,
+        .gridMask = resources->dynamicMeshFlowContactGridMask,
+        .gridCellSizeMeters =
+            resources->dynamicMeshFlowContactGridCellSizeMeters,
+        .allocationRevision =
+            resources->dynamicMeshFlowAllocationRevision,
+        .descriptorGeneration =
+            resources->dynamicMeshFlowDescriptorGeneration,
+        .valid =
+            resources->dynamicMeshFlowAllocationRevision != 0U &&
+            resources->dynamicMeshFlowContactEventBuffer.buffer !=
+                VK_NULL_HANDLE &&
+            resources->dynamicMeshFlowContactGridBuffer.buffer !=
+                VK_NULL_HANDLE,
+    };
+}
+
+void VulkanViewportShell::ClearDynamicMeshFlowGpuSimulation(
+    std::size_t layerId) {
+    const auto found = std::find_if(
+        pointCloudResources_.begin(),
+        pointCloudResources_.end(),
+        [layerId](const ActivePointCloudResources& resources) {
+            return resources.layerId == layerId &&
+                   resources.dynamicMeshFlowAllocationRevision != 0U;
+        });
+    if (found == pointCloudResources_.end()) {
+        return;
+    }
+
+    struct PendingBaseContactGeneration {
+        std::size_t resourceIndex = 0U;
+        PendingPointDescriptorGeneration generation{};
+    };
+    std::vector<PendingBaseContactGeneration> pendingBaseGenerations;
+    DynamicMeshFlowContactGpuView replacementContactView{
+        .eventBuffer =
+            rainResources_
+                .dynamicMeshFlowDummyContactEventBuffer.buffer,
+        .eventOffset = 0U,
+        .eventRange =
+            rainResources_
+                .dynamicMeshFlowDummyContactEventBuffer.size,
+        .gridBuffer =
+            rainResources_
+                .dynamicMeshFlowDummyContactGridBuffer.buffer,
+        .gridOffset = 0U,
+        .gridRange =
+            rainResources_
+                .dynamicMeshFlowDummyContactGridBuffer.size,
+        .eventCapacity = 1U,
+        .gridMask = 0U,
+        .gridCellSizeMeters = 0.75F,
+        .valid = false,
+    };
+    for (const auto& candidate : pointCloudResources_) {
+        if (&candidate == &(*found) ||
+            candidate.dynamicMeshFlowAllocationRevision == 0U) {
+            continue;
+        }
+        const auto candidateView =
+            PointDescriptorDynamicMeshFlowContactView(&candidate);
+        if (candidateView.valid) {
+            replacementContactView = candidateView;
+            break;
+        }
+    }
+    pointDescriptorDynamicMeshFlowContactOverride_ =
+        replacementContactView;
+    try {
+        for (std::size_t resourceIndex = 0U;
+             resourceIndex < pointCloudResources_.size();
+             ++resourceIndex) {
+            auto& candidate = pointCloudResources_[resourceIndex];
+            if (&candidate == &(*found) ||
+                candidate.dynamicMeshFlowAllocationRevision != 0U ||
+                candidate.pointDescriptorPool == VK_NULL_HANDLE) {
+                continue;
+            }
+            PendingBaseContactGeneration pendingBase;
+            pendingBase.resourceIndex = resourceIndex;
+            pendingBase.generation = BuildPointDescriptorGeneration(
+                &candidate,
+                exrExportResources_.depthImage.view);
+            pendingBaseGenerations.push_back(
+                std::move(pendingBase));
+        }
+    } catch (...) {
+        pointDescriptorDynamicMeshFlowContactOverride_.reset();
+        for (auto& pendingBase : pendingBaseGenerations) {
+            DestroyPointDescriptorGeneration(
+                &pendingBase.generation);
+        }
+        throw;
+    }
+    pointDescriptorDynamicMeshFlowContactOverride_.reset();
+    try {
+        SettlePointCloudMutation();
+    } catch (...) {
+        for (auto& pendingBase : pendingBaseGenerations) {
+            DestroyPointDescriptorGeneration(
+                &pendingBase.generation);
+        }
+        throw;
+    }
+    for (auto& pendingBase : pendingBaseGenerations) {
+        InstallPointDescriptorGeneration(
+            &pointCloudResources_[pendingBase.resourceIndex],
+            &pendingBase.generation);
+    }
+    DestroyPointCloudResources(&(*found));
+    pointCloudResources_.erase(found);
+    ++sceneRevision_;
 }
 
 WaterFlowGpuSourceUploadResult VulkanViewportShell::UploadWaterFlowGpuSource(
@@ -4514,6 +5299,10 @@ void VulkanViewportShell::RemovePointCloud(std::size_t layerId) {
     if (resourcesIt == pointCloudResources_.end()) {
         return;
     }
+    if (resourcesIt->dynamicMeshFlowAllocationRevision != 0U) {
+        ClearDynamicMeshFlowGpuSimulation(layerId);
+        return;
+    }
 
     CleanupPointCloudResources(&(*resourcesIt));
     pointCloudResources_.erase(resourcesIt);
@@ -4521,6 +5310,12 @@ void VulkanViewportShell::RemovePointCloud(std::size_t layerId) {
 
 void VulkanViewportShell::ClearPointClouds() {
     SettlePointCloudMutation();
+    // Base layers may bind a Mesh Flow contact generation owned by another
+    // point resource. Retire every render descriptor before destroying any
+    // resource so teardown cannot leave a cross-resource buffer reference.
+    for (auto& resources : pointCloudResources_) {
+        RetirePointCloudRenderDescriptors(&resources);
+    }
     for (auto& resources : pointCloudResources_) {
         DestroyPointCloudResources(&resources);
     }
@@ -4554,16 +5349,22 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
     invisible_places::water::WaterSurfaceGpuData generatedGpuData;
     const invisible_places::water::WaterSurfaceGpuData* gpuData = &cache.gpuData;
     const bool hasPersistedGpuTables = cache.gpuData.persistedTables.Valid();
+    const bool hasPersistedGroundTable =
+        cache.gpuData.persistedTables.GroundValid();
     if (cache.gpuData.sourceRevision != cache.revision ||
         cache.gpuData.sourceIdentity != cacheIdentity ||
         (!hasPersistedGpuTables &&
          (cache.gpuData.surfaceTable.empty() ||
           cache.gpuData.vegetationTable.empty() ||
-          cache.gpuData.flowSurfaceTable.empty()))) {
+          cache.gpuData.flowSurfaceTable.empty() ||
+          (!hasPersistedGroundTable &&
+           cache.gpuData.groundTable.empty())))) {
         generatedGpuData = invisible_places::water::BuildWaterSurfaceGpuData(cache);
         gpuData = &generatedGpuData;
     }
     const bool streamsPersistedTables = gpuData->persistedTables.Valid();
+    const bool streamsPersistedGroundTable =
+        gpuData->persistedTables.GroundValid();
     const auto surfaceTableCount = streamsPersistedTables
                                        ? gpuData->persistedTables.surfaceCount
                                        : static_cast<std::uint64_t>(gpuData->surfaceTable.size());
@@ -4573,14 +5374,19 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
     const auto flowSurfaceTableCount = streamsPersistedTables
                                            ? gpuData->persistedTables.flowSurfaceCount
                                            : static_cast<std::uint64_t>(gpuData->flowSurfaceTable.size());
+    const auto groundTableCount = streamsPersistedGroundTable
+                                      ? gpuData->persistedTables.groundCount
+                                      : static_cast<std::uint64_t>(gpuData->groundTable.size());
     if (surfaceTableCount == 0U || vegetationTableCount == 0U ||
-        flowSurfaceTableCount == 0U) {
+        flowSurfaceTableCount == 0U || groundTableCount == 0U) {
         throw std::runtime_error{"Water surface cache did not produce GPU hash tables."};
     }
     if (surfaceTableCount > std::numeric_limits<std::uint32_t>::max() ||
         vegetationTableCount > std::numeric_limits<std::uint32_t>::max() ||
         flowSurfaceTableCount > std::numeric_limits<std::uint32_t>::max() ||
-        cache.flowSurfaceSurfels.size() > std::numeric_limits<std::uint32_t>::max()) {
+        groundTableCount > std::numeric_limits<std::uint32_t>::max() ||
+        cache.flowSurfaceSurfels.size() > std::numeric_limits<std::uint32_t>::max() ||
+        cache.groundCells.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error{"Water surface cache exceeds the 32-bit GPU table limit."};
     }
 
@@ -4593,6 +5399,9 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
     const VkDeviceSize flowSurfaceBytes =
         static_cast<VkDeviceSize>(flowSurfaceTableCount) *
         sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot);
+    const VkDeviceSize groundBytes =
+        static_cast<VkDeviceSize>(groundTableCount) *
+        sizeof(invisible_places::water::WaterGpuGroundSlot);
     const auto persistedFileMatchesSnapshot = [&]() {
         if (!streamsPersistedTables) {
             return true;
@@ -4656,9 +5465,17 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
         pending.flowSurfaceTableBuffer = CreateDeviceLocalBuffer(
             flowSurfaceBytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        pending.groundTableBuffer = CreateDeviceLocalBuffer(
+            groundBytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
         const VkDeviceSize largestUpload =
-            std::max({rainSurfaceBytes, vegetationBytes, flowSurfaceBytes});
+            std::max(
+                {rainSurfaceBytes,
+                 vegetationBytes,
+                 flowSurfaceBytes,
+                 groundBytes});
         uploadStagingBuffer = CreateHostVisibleBuffer(
             std::min(largestUpload, kWaterSurfaceUploadStagingLimitBytes),
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -4817,6 +5634,16 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
                 flowSurfaceBytes,
                 pending.flowSurfaceInputBuffer,
                 &streamChecksum);
+            if (streamsPersistedGroundTable) {
+                uploadPersistedSection(
+                    &persistedInput,
+                    gpuData->persistedTables.groundOffset,
+                    8U,
+                    groundTableCount,
+                    groundBytes,
+                    pending.groundTableBuffer,
+                    &streamChecksum);
+            }
             if (streamChecksum.Finish() !=
                     gpuData->persistedTables.streamChecksum ||
                 !persistedFileMatchesSnapshot()) {
@@ -4837,6 +5664,17 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
                 flowSurfaceBytes,
                 pending.flowSurfaceInputBuffer);
         }
+        if (streamsPersistedTables && !streamsPersistedGroundTable) {
+            uploadInChunks(
+                gpuData->groundTable.data(),
+                groundBytes,
+                pending.groundTableBuffer);
+        } else if (!streamsPersistedTables) {
+            uploadInChunks(
+                gpuData->groundTable.data(),
+                groundBytes,
+                pending.groundTableBuffer);
+        }
         cleanupUpload();
 
         pending.preprocessUniformBuffer = CreateHostVisibleBuffer(
@@ -4853,11 +5691,17 @@ void VulkanViewportShell::UploadWaterSurfaceCache(
             static_cast<std::uint32_t>(cache.flowSurfaceSurfels.size());
         pending.flowSurfaceTableCapacity =
             static_cast<std::uint32_t>(flowSurfaceTableCount);
+        pending.groundMask = gpuData->groundMask;
+        pending.groundMaximumProbeCount =
+            std::max(1U, gpuData->groundMaximumProbeCount);
+        pending.groundCellCount =
+            static_cast<std::uint32_t>(cache.groundCells.size());
         pending.resolutionMeters = std::max(0.001F, cache.resolutionMeters);
         pending.cacheRevision = cache.revision;
         pending.cacheIdentity = cacheIdentity;
         pending.tableBytes = static_cast<std::uint64_t>(
-            rainSurfaceBytes + vegetationBytes + flowSurfaceBytes);
+            rainSurfaceBytes + vegetationBytes + flowSurfaceBytes +
+            groundBytes);
         pending.uploadRevision = resources.collisionUploadRevision + 1U;
 
         WaterSurfacePreprocessUniformsGpu preprocessUniforms;
@@ -4994,6 +5838,27 @@ WaterSurfaceFlowGpuView VulkanViewportShell::WaterSurfaceFlowView() const {
         .cacheIdentity = &resources.collisionCacheIdentity,
         .valid = resources.flowSurfaceReady,
         .preprocessingComplete = resources.flowSurfaceReady,
+    };
+}
+
+WaterGroundFlowGpuView VulkanViewportShell::WaterGroundFlowView() const {
+    const auto& resources = rainResources_;
+    return {
+        .buffer = resources.groundTableBuffer.buffer,
+        .offset = 0U,
+        .range = resources.groundTableBuffer.size,
+        .tableMask = resources.groundMask,
+        .maximumProbeCount = resources.groundMaximumProbeCount,
+        .occupiedCellCount = resources.groundCellCount,
+        .resolutionMeters = resources.surfaceResolutionMeters,
+        .cacheRevision = resources.collisionCacheRevision,
+        .uploadRevision = resources.groundResidentUploadRevision,
+        .cacheIdentity = &resources.collisionCacheIdentity,
+        .bounds = resources.collisionBounds,
+        .valid =
+            resources.collisionReady &&
+            resources.groundTableBuffer.buffer != VK_NULL_HANDLE &&
+            resources.groundCellCount > 0U,
     };
 }
 
@@ -5155,7 +6020,18 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     }
     for (auto retiredIt = resources.retiredSurfaceResources.begin();
          retiredIt != resources.retiredSurfaceResources.end();) {
-        if (retiredIt->outstandingFrameMask != 0U || retiredIt->outstandingExr) {
+        const bool borrowedByMeshFlow = std::any_of(
+            pointCloudResources_.begin(),
+            pointCloudResources_.end(),
+            [retiredIt](const ActivePointCloudResources& pointResources) {
+                return retiredIt->uploadRevision != 0U &&
+                       pointResources.dynamicMeshFlowAllocationRevision != 0U &&
+                       pointResources.dynamicMeshFlowGroundUploadRevision ==
+                           retiredIt->uploadRevision;
+            });
+        if (retiredIt->outstandingFrameMask != 0U ||
+            retiredIt->outstandingExr ||
+            borrowedByMeshFlow) {
             ++retiredIt;
             continue;
         }
@@ -5211,6 +6087,8 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     retired.surfaceTableBuffer = resources.surfaceTableBuffer;
     retired.vegetationTableBuffer = resources.vegetationTableBuffer;
     retired.flowSurfaceTableBuffer = resources.flowSurfaceTableBuffer;
+    retired.groundTableBuffer = resources.groundTableBuffer;
+    retired.uploadRevision = resources.groundResidentUploadRevision;
     retired.rainDescriptorSets = resources.descriptorSets;
     retired.rainDescriptorPool = resources.descriptorPool;
     // A signalled fence is not enough on MoltenVK: an executable command
@@ -5227,11 +6105,13 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     resources.surfaceTableBuffer = pending.surfaceTableBuffer;
     resources.vegetationTableBuffer = pending.vegetationTableBuffer;
     resources.flowSurfaceTableBuffer = pending.flowSurfaceTableBuffer;
+    resources.groundTableBuffer = pending.groundTableBuffer;
     resources.descriptorSets = pending.rainDescriptorSets;
     resources.descriptorPool = pending.rainDescriptorPool;
     pending.surfaceTableBuffer = {};
     pending.vegetationTableBuffer = {};
     pending.flowSurfaceTableBuffer = {};
+    pending.groundTableBuffer = {};
     pending.rainDescriptorSets.fill(VK_NULL_HANDLE);
     pending.rainDescriptorPool = VK_NULL_HANDLE;
 
@@ -5243,10 +6123,15 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     resources.flowMaximumProbeCount = pending.flowMaximumProbeCount;
     resources.flowSurfaceCellCount = pending.flowSurfaceCellCount;
     resources.flowSurfaceTableCapacity = pending.flowSurfaceTableCapacity;
+    resources.groundMask = pending.groundMask;
+    resources.groundMaximumProbeCount =
+        pending.groundMaximumProbeCount;
+    resources.groundCellCount = pending.groundCellCount;
     resources.surfaceResolutionMeters = pending.resolutionMeters;
     resources.collisionCacheRevision = pending.cacheRevision;
     resources.collisionCacheIdentity = pending.cacheIdentity;
     resources.flowSurfaceResidentUploadRevision = pending.uploadRevision;
+    resources.groundResidentUploadRevision = pending.uploadRevision;
     resources.residentTableBytes = pending.tableBytes;
     resources.peakStagingBytes = pending.peakStagingBytes;
     resources.collisionReady = pending.bounds.valid;
@@ -5257,7 +6142,15 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
     resources.retiredSurfaceResources.push_back(retired);
     pending = {};
     if (resources.retiredSurfaceResources.back().outstandingFrameMask == 0U &&
-        !resources.retiredSurfaceResources.back().outstandingExr) {
+        !resources.retiredSurfaceResources.back().outstandingExr &&
+        !std::any_of(
+            pointCloudResources_.begin(),
+            pointCloudResources_.end(),
+            [&resources](const ActivePointCloudResources& pointResources) {
+                return pointResources.dynamicMeshFlowAllocationRevision != 0U &&
+                       pointResources.dynamicMeshFlowGroundUploadRevision ==
+                           resources.retiredSurfaceResources.back().uploadRevision;
+            })) {
         CleanupWaterSurfaceRetiredResources(&resources.retiredSurfaceResources.back());
         resources.retiredSurfaceResources.pop_back();
     }
@@ -6272,7 +7165,7 @@ void VulkanViewportShell::CreatePresentRenderPass() {
 }
 
 void VulkanViewportShell::CreatePointDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 17> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 19> bindings{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -6306,7 +7199,7 @@ void VulkanViewportShell::CreatePointDescriptorSetLayout() {
 }
 
 void VulkanViewportShell::CreateDynamicMeshFlowDescriptorSetLayout() {
-    std::array<VkDescriptorSetLayoutBinding, 8> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 10> bindings{};
     for (std::uint32_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
         bindings[bindingIndex].binding = bindingIndex;
         bindings[bindingIndex].descriptorCount = 1;
@@ -6533,6 +7426,14 @@ void VulkanViewportShell::CreateRainResources() {
     resources.flowSurfaceTableBuffer = CreateHostVisibleBuffer(
         2U * sizeof(invisible_places::water::WaterGpuSurfaceSurfelSlot),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.dynamicMeshFlowDummyContactEventBuffer =
+        CreateHostVisibleBuffer(
+            sizeof(DynamicMeshFlowContactEventGpu),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    resources.dynamicMeshFlowDummyContactGridBuffer =
+        CreateHostVisibleBuffer(
+            sizeof(glm::uvec4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     resources.particleBuffer = CreateHostVisibleBuffer(
         static_cast<VkDeviceSize>(invisible_places::water::kRainParticleCapacity) * sizeof(RainParticleGpu),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -6571,6 +7472,16 @@ void VulkanViewportShell::CreateRainResources() {
         resources.flowSurfaceTableBuffer.mapped,
         0,
         static_cast<std::size_t>(resources.flowSurfaceTableBuffer.size));
+    std::memset(
+        resources.dynamicMeshFlowDummyContactEventBuffer.mapped,
+        0,
+        static_cast<std::size_t>(
+            resources.dynamicMeshFlowDummyContactEventBuffer.size));
+    std::memset(
+        resources.dynamicMeshFlowDummyContactGridBuffer.mapped,
+        0,
+        static_cast<std::size_t>(
+            resources.dynamicMeshFlowDummyContactGridBuffer.size));
     std::memset(resources.particleBuffer.mapped, 0, static_cast<std::size_t>(resources.particleBuffer.size));
     std::memset(resources.eventBuffer.mapped, 0, static_cast<std::size_t>(resources.eventBuffer.size));
     std::memset(resources.counterBuffer.mapped, 0, static_cast<std::size_t>(resources.counterBuffer.size));
@@ -6678,6 +7589,9 @@ void VulkanViewportShell::CleanupRainResources() {
     DestroyBuffer(&resources.surfaceTableBuffer);
     DestroyBuffer(&resources.vegetationTableBuffer);
     DestroyBuffer(&resources.flowSurfaceTableBuffer);
+    DestroyBuffer(&resources.dynamicMeshFlowDummyContactEventBuffer);
+    DestroyBuffer(&resources.dynamicMeshFlowDummyContactGridBuffer);
+    DestroyBuffer(&resources.groundTableBuffer);
     DestroyBuffer(&resources.particleBuffer);
     DestroyBuffer(&resources.eventBuffer);
     DestroyBuffer(&resources.counterBuffer);
@@ -6716,6 +7630,7 @@ void VulkanViewportShell::CleanupWaterSurfacePendingUpload(
     DestroyBuffer(&pending->vegetationTableBuffer);
     DestroyBuffer(&pending->flowSurfaceInputBuffer);
     DestroyBuffer(&pending->flowSurfaceTableBuffer);
+    DestroyBuffer(&pending->groundTableBuffer);
     DestroyBuffer(&pending->preprocessUniformBuffer);
     *pending = {};
 }
@@ -6733,6 +7648,7 @@ void VulkanViewportShell::CleanupWaterSurfaceRetiredResources(
     DestroyBuffer(&retired->surfaceTableBuffer);
     DestroyBuffer(&retired->vegetationTableBuffer);
     DestroyBuffer(&retired->flowSurfaceTableBuffer);
+    DestroyBuffer(&retired->groundTableBuffer);
     *retired = {};
 }
 
@@ -8921,13 +9837,13 @@ VkDescriptorPool VulkanViewportShell::CreatePointDescriptorPool(std::size_t high
         layerCount * static_cast<std::uint64_t>(kFramesInFlight) * static_cast<std::uint64_t>(depthImages_.size());
     const std::uint64_t exrSetCount = includeExrDescriptor ? 1U : 0U;
     const std::uint64_t setCount64 = std::max<std::uint64_t>(1U, liveSetCount + exrSetCount);
-    if (setCount64 > std::numeric_limits<std::uint32_t>::max() / 14U) {
+    if (setCount64 > std::numeric_limits<std::uint32_t>::max() / 16U) {
         throw std::runtime_error{"Point descriptor generation exceeds Vulkan pool limits."};
     }
     const auto setCount = static_cast<std::uint32_t>(setCount64);
     const std::array<VkDescriptorPoolSize, 3> poolSizes = {
         MakePoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setCount * 2U),
-        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setCount * 14U),
+        MakePoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setCount * 16U),
         MakePoolSize(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, setCount),
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -9137,6 +10053,74 @@ void VulkanViewportShell::DestroyPointDescriptorGeneration(PendingPointDescripto
     *generation = {};
 }
 
+DynamicMeshFlowContactGpuView
+VulkanViewportShell::PointDescriptorDynamicMeshFlowContactView(
+    const ActivePointCloudResources* targetResources) const {
+    if (pointDescriptorDynamicMeshFlowContactOverride_.has_value()) {
+        return pointDescriptorDynamicMeshFlowContactOverride_.value();
+    }
+    const auto makeView =
+        [](const ActivePointCloudResources& resources) {
+            return DynamicMeshFlowContactGpuView{
+                .eventBuffer =
+                    resources.dynamicMeshFlowContactEventBuffer.buffer,
+                .eventOffset = 0U,
+                .eventRange =
+                    resources.dynamicMeshFlowContactEventBuffer.size,
+                .gridBuffer =
+                    resources.dynamicMeshFlowContactGridBuffer.buffer,
+                .gridOffset = 0U,
+                .gridRange =
+                    resources.dynamicMeshFlowContactGridBuffer.size,
+                .eventCapacity =
+                    resources.dynamicMeshFlowEventCapacity,
+                .gridMask =
+                    resources.dynamicMeshFlowContactGridMask,
+                .gridCellSizeMeters =
+                    resources.dynamicMeshFlowContactGridCellSizeMeters,
+                .allocationRevision =
+                    resources.dynamicMeshFlowAllocationRevision,
+                .descriptorGeneration =
+                    resources.dynamicMeshFlowDescriptorGeneration,
+                .valid =
+                    resources.dynamicMeshFlowAllocationRevision != 0U &&
+                    resources.dynamicMeshFlowContactEventBuffer.buffer !=
+                        VK_NULL_HANDLE &&
+                    resources.dynamicMeshFlowContactGridBuffer.buffer !=
+                        VK_NULL_HANDLE,
+            };
+        };
+    if (targetResources != nullptr &&
+        targetResources->dynamicMeshFlowAllocationRevision != 0U) {
+        const auto targetView = makeView(*targetResources);
+        if (targetView.valid) {
+            return targetView;
+        }
+    }
+    for (const auto& resources : pointCloudResources_) {
+        const auto activeView = makeView(resources);
+        if (activeView.valid) {
+            return activeView;
+        }
+    }
+    return {
+        .eventBuffer =
+            rainResources_.dynamicMeshFlowDummyContactEventBuffer.buffer,
+        .eventOffset = 0U,
+        .eventRange =
+            rainResources_.dynamicMeshFlowDummyContactEventBuffer.size,
+        .gridBuffer =
+            rainResources_.dynamicMeshFlowDummyContactGridBuffer.buffer,
+        .gridOffset = 0U,
+        .gridRange =
+            rainResources_.dynamicMeshFlowDummyContactGridBuffer.size,
+        .eventCapacity = 1U,
+        .gridMask = 0U,
+        .gridCellSizeMeters = 0.75F,
+        .valid = false,
+    };
+}
+
 void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResources* resources, std::size_t frameIndex,
                                                         std::uint32_t imageIndex, VkImageView sceneDepthView,
                                                         VkDescriptorPool allocationPool) {
@@ -9234,12 +10218,22 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResource
         rainResources_.eventBuffer.buffer,
         0,
         rainResources_.eventBuffer.size};
+    const auto meshFlowContactView =
+        PointDescriptorDynamicMeshFlowContactView(resources);
+    VkDescriptorBufferInfo meshFlowContactEventInfo{
+        meshFlowContactView.eventBuffer,
+        meshFlowContactView.eventOffset,
+        meshFlowContactView.eventRange};
+    VkDescriptorBufferInfo meshFlowContactGridInfo{
+        meshFlowContactView.gridBuffer,
+        meshFlowContactView.gridOffset,
+        meshFlowContactView.gridRange};
 
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 17> writes{};
+    std::array<VkWriteDescriptorSet, 19> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -9354,20 +10348,36 @@ void VulkanViewportShell::UpdatePointCloudDescriptorSet(ActivePointCloudResource
     writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[16].descriptorCount = 1;
     writes[16].pBufferInfo = &seepageParamsInfo;
+    writes[17] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[17].dstSet = descriptorSet;
+    writes[17].dstBinding = 17;
+    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[17].descriptorCount = 1;
+    writes[17].pBufferInfo = &meshFlowContactEventInfo;
+    writes[18] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[18].dstSet = descriptorSet;
+    writes[18].dstBinding = 18;
+    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[18].descriptorCount = 1;
+    writes[18].pBufferInfo = &meshFlowContactGridInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void VulkanViewportShell::UpdateDynamicMeshFlowDescriptorSet(
     ActivePointCloudResources* resources,
-    std::size_t liveSlot) {
-    if (resources == nullptr || liveSlot >= kDynamicMeshFlowLiveSlots) {
+    std::size_t liveSlot,
+    const WaterGroundFlowGpuView& groundView) {
+    if (resources == nullptr ||
+        liveSlot >= kDynamicMeshFlowLiveSlots ||
+        !groundView.valid ||
+        resources->dynamicMeshFlowDescriptorPool == VK_NULL_HANDLE) {
         return;
     }
     auto& descriptorSet = resources->dynamicMeshFlowDescriptorSets[liveSlot];
     if (descriptorSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        allocInfo.descriptorPool = descriptorPool_;
+        allocInfo.descriptorPool = resources->dynamicMeshFlowDescriptorPool;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &dynamicMeshFlowDescriptorSetLayout_;
         Check(
@@ -9379,22 +10389,30 @@ void VulkanViewportShell::UpdateDynamicMeshFlowDescriptorSet(
         resources->dynamicMeshFlowUniformBuffers[liveSlot].buffer,
         0,
         resources->dynamicMeshFlowUniformBuffers[liveSlot].size};
-    VkDescriptorBufferInfo cellInfo{
-        resources->dynamicMeshFlowCellBuffer.buffer,
+    VkDescriptorBufferInfo groundInfo{
+        groundView.buffer,
+        groundView.offset,
+        groundView.range};
+    VkDescriptorBufferInfo particleInfo{
+        resources->dynamicMeshFlowParticleBuffer.buffer,
         0,
-        resources->dynamicMeshFlowCellBuffer.size};
-    VkDescriptorBufferInfo gridInfo{
-        resources->dynamicMeshFlowGridBuffer.buffer,
-        0,
-        resources->dynamicMeshFlowGridBuffer.size};
+        resources->dynamicMeshFlowParticleBuffer.size};
     VkDescriptorBufferInfo emitterInfo{
         resources->dynamicMeshFlowEmitterBuffers[liveSlot].buffer,
         0,
         resources->dynamicMeshFlowEmitterBuffers[liveSlot].size};
-    VkDescriptorBufferInfo attractorInfo{
-        resources->dynamicMeshFlowAttractorBuffers[liveSlot].buffer,
+    VkDescriptorBufferInfo contactEventInfo{
+        resources->dynamicMeshFlowContactEventBuffer.buffer,
         0,
-        resources->dynamicMeshFlowAttractorBuffers[liveSlot].size};
+        resources->dynamicMeshFlowContactEventBuffer.size};
+    VkDescriptorBufferInfo contactGridInfo{
+        resources->dynamicMeshFlowContactGridBuffer.buffer,
+        0,
+        resources->dynamicMeshFlowContactGridBuffer.size};
+    VkDescriptorBufferInfo counterInfo{
+        resources->dynamicMeshFlowCounterBuffers[liveSlot].buffer,
+        0,
+        resources->dynamicMeshFlowCounterBuffers[liveSlot].size};
     VkDescriptorBufferInfo positionInfo{
         resources->positionStorageBuffer.buffer,
         0,
@@ -9408,13 +10426,15 @@ void VulkanViewportShell::UpdateDynamicMeshFlowDescriptorSet(
         0,
         resources->scalarFieldBuffer.size};
 
-    std::array<VkWriteDescriptorSet, 8> writes{};
+    std::array<VkWriteDescriptorSet, 10> writes{};
     VkDescriptorBufferInfo* infos[] = {
         &uniformInfo,
-        &cellInfo,
-        &gridInfo,
+        &groundInfo,
+        &particleInfo,
         &emitterInfo,
-        &attractorInfo,
+        &contactEventInfo,
+        &contactGridInfo,
+        &counterInfo,
         &positionInfo,
         &normalInfo,
         &scalarInfo,
@@ -9429,6 +10449,33 @@ void VulkanViewportShell::UpdateDynamicMeshFlowDescriptorSet(
         writes[bindingIndex].pBufferInfo = infos[bindingIndex];
     }
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+VkDescriptorPool VulkanViewportShell::CreateDynamicMeshFlowDescriptorPool() {
+    const std::array<VkDescriptorPoolSize, 2> poolSizes = {
+        MakePoolSize(
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            static_cast<std::uint32_t>(kDynamicMeshFlowLiveSlots)),
+        MakePoolSize(
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            static_cast<std::uint32_t>(kDynamicMeshFlowLiveSlots * 9U)),
+    };
+    VkDescriptorPoolCreateInfo poolInfo{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets =
+        static_cast<std::uint32_t>(kDynamicMeshFlowLiveSlots);
+    poolInfo.poolSizeCount =
+        static_cast<std::uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    Check(
+        vkCreateDescriptorPool(
+            device_,
+            &poolInfo,
+            nullptr,
+            &descriptorPool),
+        "vkCreateDescriptorPool(dynamic mesh flow generation)");
+    return descriptorPool;
 }
 
 void VulkanViewportShell::PrepareDynamicMeshFlowDispatchSlot(
@@ -9495,12 +10542,15 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
         0,
         nullptr);
 
-    const std::array<VkBuffer, 3> outputBuffers = {
+    const std::array<VkBuffer, 6> outputBuffers = {
+        resources->dynamicMeshFlowParticleBuffer.buffer,
+        resources->dynamicMeshFlowContactEventBuffer.buffer,
+        resources->dynamicMeshFlowContactGridBuffer.buffer,
         resources->positionStorageBuffer.buffer,
         resources->normalBuffer.buffer,
         resources->scalarFieldBuffer.buffer,
     };
-    std::array<VkBufferMemoryBarrier, 3> priorFrameBarriers{};
+    std::array<VkBufferMemoryBarrier, 6> priorFrameBarriers{};
     for (std::size_t index = 0; index < priorFrameBarriers.size(); ++index) {
         auto& bufferBarrier = priorFrameBarriers[index];
         bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -9530,7 +10580,7 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
         nullptr);
     vkCmdDispatch(commandBuffer, (particleCount + 63U) / 64U, 1U, 1U);
 
-    std::array<VkBufferMemoryBarrier, 3> barriers{};
+    std::array<VkBufferMemoryBarrier, 6> barriers{};
     for (std::size_t index = 0; index < barriers.size(); ++index) {
         barriers[index] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         barriers[index].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -9544,7 +10594,10 @@ void VulkanViewportShell::DispatchDynamicMeshFlowCompute(
     vkCmdPipelineBarrier(
         commandBuffer,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
         0,
         0,
         nullptr,
@@ -10251,12 +11304,22 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
         rainResources_.eventBuffer.buffer,
         0,
         rainResources_.eventBuffer.size};
+    const auto meshFlowContactView =
+        PointDescriptorDynamicMeshFlowContactView(resources);
+    VkDescriptorBufferInfo meshFlowContactEventInfo{
+        meshFlowContactView.eventBuffer,
+        meshFlowContactView.eventOffset,
+        meshFlowContactView.eventRange};
+    VkDescriptorBufferInfo meshFlowContactGridInfo{
+        meshFlowContactView.gridBuffer,
+        meshFlowContactView.gridOffset,
+        meshFlowContactView.gridRange};
 
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 17> writes{};
+    std::array<VkWriteDescriptorSet, 19> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = descriptorSet;
     writes[0].dstBinding = 0;
@@ -10371,6 +11434,18 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
     writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[16].descriptorCount = 1;
     writes[16].pBufferInfo = &seepageParamsInfo;
+    writes[17] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[17].dstSet = descriptorSet;
+    writes[17].dstBinding = 17;
+    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[17].descriptorCount = 1;
+    writes[17].pBufferInfo = &meshFlowContactEventInfo;
+    writes[18] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[18].dstSet = descriptorSet;
+    writes[18].dstBinding = 18;
+    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[18].descriptorCount = 1;
+    writes[18].pBufferInfo = &meshFlowContactGridInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -10448,11 +11523,21 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
         rainResources_.eventBuffer.buffer,
         0,
         rainResources_.eventBuffer.size};
+    const auto meshFlowContactView =
+        PointDescriptorDynamicMeshFlowContactView(resources);
+    VkDescriptorBufferInfo meshFlowContactEventInfo{
+        meshFlowContactView.eventBuffer,
+        meshFlowContactView.eventOffset,
+        meshFlowContactView.eventRange};
+    VkDescriptorBufferInfo meshFlowContactGridInfo{
+        meshFlowContactView.gridBuffer,
+        meshFlowContactView.gridOffset,
+        meshFlowContactView.gridRange};
     VkDescriptorImageInfo sceneDepthInfo{};
     sceneDepthInfo.imageView = sceneDepthView;
     sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 17> writes{};
+    std::array<VkWriteDescriptorSet, 19> writes{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = resources->exrDescriptorSet;
     writes[0].dstBinding = 0;
@@ -10567,6 +11652,18 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     writes[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[16].descriptorCount = 1;
     writes[16].pBufferInfo = &seepageParamsInfo;
+    writes[17] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[17].dstSet = resources->exrDescriptorSet;
+    writes[17].dstBinding = 17;
+    writes[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[17].descriptorCount = 1;
+    writes[17].pBufferInfo = &meshFlowContactEventInfo;
+    writes[18] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[18].dstSet = resources->exrDescriptorSet;
+    writes[18].dstBinding = 18;
+    writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[18].descriptorCount = 1;
+    writes[18].pBufferInfo = &meshFlowContactGridInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     resources->seepageExrDescriptorGeneration =
@@ -11295,11 +12392,11 @@ void VulkanViewportShell::CleanupPointCloudResources(ActivePointCloudResources* 
     DestroyPointCloudResources(resources);
 }
 
-void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* resources) {
+void VulkanViewportShell::RetirePointCloudRenderDescriptors(
+    ActivePointCloudResources* resources) {
     if (resources == nullptr) {
         return;
     }
-
     RetirePointCloudDescriptorSets(&resources->descriptorSets);
     resources->seepageDescriptorGenerations = {};
     for (auto& highlight : resources->highlights) {
@@ -11309,6 +12406,14 @@ void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* 
     resources->exrDescriptorSet = VK_NULL_HANDLE;
     resources->seepageExrDescriptorGeneration = 0U;
     DestroyPointDescriptorPool(&resources->pointDescriptorPool);
+}
+
+void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* resources) {
+    if (resources == nullptr) {
+        return;
+    }
+
+    RetirePointCloudRenderDescriptors(resources);
 
     for (std::size_t liveSlot = 0; liveSlot < kDynamicMeshFlowLiveSlots; ++liveSlot) {
         auto& fence = resources->dynamicMeshFlowDispatchFences[liveSlot];
@@ -11336,12 +12441,26 @@ void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* 
     // buffer. Retire them before releasing any of those allocations; doing the
     // reverse leaves MoltenVK with stale buffer bookkeeping during a later
     // descriptor allocation/update.
-    for (auto& descriptorSet : resources->dynamicMeshFlowDescriptorSets) {
-        if (descriptorSet != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
-            Check(
-                vkFreeDescriptorSets(device_, descriptorPool_, 1U, &descriptorSet),
-                "vkFreeDescriptorSets(dynamic mesh flow retirement)");
-            descriptorSet = VK_NULL_HANDLE;
+    if (resources->dynamicMeshFlowDescriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(
+            device_,
+            resources->dynamicMeshFlowDescriptorPool,
+            nullptr);
+        resources->dynamicMeshFlowDescriptorPool = VK_NULL_HANDLE;
+        resources->dynamicMeshFlowDescriptorSets.fill(VK_NULL_HANDLE);
+    } else {
+        for (auto& descriptorSet : resources->dynamicMeshFlowDescriptorSets) {
+            if (descriptorSet != VK_NULL_HANDLE &&
+                descriptorPool_ != VK_NULL_HANDLE) {
+                Check(
+                    vkFreeDescriptorSets(
+                        device_,
+                        descriptorPool_,
+                        1U,
+                        &descriptorSet),
+                    "vkFreeDescriptorSets(dynamic mesh flow retirement)");
+                descriptorSet = VK_NULL_HANDLE;
+            }
         }
     }
 
@@ -11371,6 +12490,9 @@ void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* 
     for (auto& uniformBuffer : resources->dynamicMeshFlowUniformBuffers) {
         DestroyBuffer(&uniformBuffer);
     }
+    DestroyBuffer(&resources->dynamicMeshFlowParticleBuffer);
+    DestroyBuffer(&resources->dynamicMeshFlowContactEventBuffer);
+    DestroyBuffer(&resources->dynamicMeshFlowContactGridBuffer);
     DestroyBuffer(&resources->dynamicMeshFlowCellBuffer);
     DestroyBuffer(&resources->dynamicMeshFlowGridBuffer);
     for (auto& emitterBuffer : resources->dynamicMeshFlowEmitterBuffers) {
@@ -11378,6 +12500,9 @@ void VulkanViewportShell::DestroyPointCloudResources(ActivePointCloudResources* 
     }
     for (auto& attractorBuffer : resources->dynamicMeshFlowAttractorBuffers) {
         DestroyBuffer(&attractorBuffer);
+    }
+    for (auto& counterBuffer : resources->dynamicMeshFlowCounterBuffers) {
+        DestroyBuffer(&counterBuffer);
     }
     DestroyBuffer(&resources->waterFlowSourceUniformBuffer);
     DestroyBuffer(&resources->waterFlowSourceInputBuffer);

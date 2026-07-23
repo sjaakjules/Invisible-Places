@@ -102,6 +102,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
+#include "pointcloud_mesh_flow_contact.glsl"
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
@@ -131,6 +132,7 @@ const uint kWaterTrailAgeFieldSlot = 15u;
 const uint kWaterTrailSpeedFieldSlot = 16u;
 const uint kWaterTrailWidthFieldSlot = 17u;
 const uint kWaterTrailStreakLengthFieldSlot = 18u;
+const uint kWaterTrailConfidenceFieldSlot = 19u;
 const uint kWaterTrailFeatureTypeFieldSlot = 21u;
 const uint kWaterTrailTangentXFieldSlot = 22u;
 const uint kWaterTrailTangentYFieldSlot = 23u;
@@ -613,7 +615,16 @@ float WaterTrailVisibility(uint pointIndex) {
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.10);
     const float routeEndFade = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
-    return WaterTrailActivityGate(pointIndex) * routeEndFade;
+    const float meshTerminalFade =
+        abs(LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex) - 5.0) < 0.5
+            ? clamp(
+                  LoadScalarFieldValueForPoint(
+                      kWaterTrailConfidenceFieldSlot,
+                      pointIndex),
+                  0.0,
+                  1.0)
+            : 1.0;
+    return WaterTrailActivityGate(pointIndex) * routeEndFade * meshTerminalFade;
 }
 
 vec3 WaterTrailRoutePosition(uint pointIndex, float phase, vec3 fallbackPosition) {
@@ -944,6 +955,11 @@ void main() {
     const RainImpactComposite rainImpact = ResolveRainImpactComposite(
         worldPosition.xyz,
         ResolveAovNormal(pointIndex));
+    const MeshFlowContactComposite meshFlowContact =
+        ResolveMeshFlowContactComposite(
+            worldPosition.xyz,
+            ResolveAovNormal(pointIndex),
+            uniforms.depthParameters.x);
     const float waterEffectPointSizeAdd =
         HasWaterEffectComposition() ? WaterEffectField(styleData.waterEffectSlots0.x, pointIndex, 0.0) * waterEffectScale : 0.0;
     const float sparseRipplePointSizeAdd = sparseRipple.pointSizeAdd;
@@ -977,7 +993,8 @@ void main() {
                         (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
                         waterEffectPointSizeMultiply *
                         sparseRipplePointSizeMultiply *
-                        rainImpact.pointSizeMultiply) +
+                        rainImpact.pointSizeMultiply *
+                        meshFlowContact.pointSizeMultiply) +
                        waterEffectPointSizeAdd +
                        sparseRipplePointSizeAdd) *
                       footprintScale,
@@ -988,7 +1005,8 @@ void main() {
                     (1.0 + caustic * max(0.0, styleData.causticParams1.w)) *
                     waterEffectPointSizeMultiply *
                     sparseRipplePointSizeMultiply *
-                    rainImpact.pointSizeMultiply) +
+                    rainImpact.pointSizeMultiply *
+                    meshFlowContact.pointSizeMultiply) +
                    waterEffectPointSizeAdd +
                    sparseRipplePointSizeAdd) *
                   footprintScale);
@@ -1004,14 +1022,16 @@ void main() {
     const float causticColorSignal = CausticColorSignal(caustic, previewTint);
     outSourceColor =
         vec4(
-            ApplyRainImpactColour(
-                ApplySparseRippleColor(
-                    ApplyWaterEffectColor(
-                        mix(inColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
-                        pointIndex,
-                        waterEffectScale),
-                    sparseRipple),
-                rainImpact),
+            ApplyMeshFlowContactColour(
+                ApplyRainImpactColour(
+                    ApplySparseRippleColor(
+                        ApplyWaterEffectColor(
+                            mix(inColor.rgb, styleData.causticTint.rgb, CausticColorMixAmount(caustic, previewTint)),
+                            pointIndex,
+                            waterEffectScale),
+                        sparseRipple),
+                    rainImpact),
+                meshFlowContact),
             inColor.a);
     outColormapValue = EvaluateBinding(styleData.colormapPositionBinding);
     const vec2 animatedFlow = ApplyWaterFlowAnimation(
@@ -1033,7 +1053,8 @@ void main() {
              sparseRippleOpacityMultiply) +
             (waterEffectOpacityAdd +
              sparseRippleOpacityAdd +
-             rainImpact.opacityAdd) * flowEffectVisibility;
+             rainImpact.opacityAdd +
+             meshFlowContact.opacityAdd) * flowEffectVisibility;
     outOpacity = RippleFiniteFloat(resolvedOpacity)
         ? clamp(resolvedOpacity, 0.0, 4.0)
         : safeBaseOpacity;
@@ -1042,7 +1063,8 @@ void main() {
         (caustic * max(0.0, styleData.causticParams1.y) +
          waterEffectEmissionAdd +
          sparseRippleEmissionAdd +
-         rainImpact.emissionAdd) * flowEffectVisibility;
+         rainImpact.emissionAdd +
+         meshFlowContact.emissionAdd) * flowEffectVisibility;
     outEmissive = RippleFiniteFloat(resolvedEmissive)
         ? max(0.0, resolvedEmissive)
         : safeBaseEmissive;
