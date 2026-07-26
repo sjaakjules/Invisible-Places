@@ -276,13 +276,6 @@ struct PersistenceState {
     std::vector<QueuedLayerLoad> queuedLoads;
 };
 
-enum class AssociationFilterMode {
-    Visible,
-    Any,
-    Unassociated,
-    Layer
-};
-
 struct CameraPanelState {
     std::string draftShotName = "Shot_001";
     std::optional<std::size_t> selectedShotIndex;
@@ -297,15 +290,7 @@ struct CameraPanelState {
     float blendAmount = 0.0F;
     std::uint32_t pathDurationFrames = 180;
     bool liveBlend = true;
-    AssociationFilterMode associationFilterMode = AssociationFilterMode::Visible;
-    std::filesystem::path associationFilterLayerPath;
     std::vector<std::string> multiEditAllowedCameraIds;
-    invisible_places::output::AnimationExportMode stillExportMode =
-        invisible_places::output::AnimationExportMode::FastPreviewMp4;
-    invisible_places::output::AnimationExportQuality stillExportQuality =
-        invisible_places::output::AnimationExportQuality::Normal;
-    bool stillExportUseVideoToolbox = true;
-    bool stillExportExternalAlphaMatte = true;
 };
 
 struct CameraPlaybackState {
@@ -426,8 +411,6 @@ struct AnimationPanelState {
     bool showSplines = true;
     bool exportPreviewDensity = true;
     bool exportSizeInitialized = false;
-    AssociationFilterMode associationFilterMode = AssociationFilterMode::Visible;
-    std::filesystem::path associationFilterLayerPath;
     std::filesystem::path lastHoudiniCameraScriptPath;
     std::filesystem::path lastHoudiniCameraExportDirectory;
     bool showHoudiniCameraExportNotice = false;
@@ -4939,89 +4922,6 @@ void DeleteCurrentScenePointVisual(PreviewRuntimeState* runtimeState, PreviewLay
     runtimeState->errorMessage.clear();
 }
 
-bool IsExportablePointVisualName(std::string_view name) {
-    const auto normalized = NormalizePointVisualName(name);
-    return !normalized.empty() && !IsEditedPointVisualName(normalized);
-}
-
-bool AnimationPathHasExportVisual(const AnimationPath& path, std::string_view name) {
-    const auto normalized = NormalizePointVisualName(name);
-    return std::any_of(
-        path.exportVisualNames.begin(),
-        path.exportVisualNames.end(),
-        [&normalized](const std::string& visualName) {
-            return NormalizePointVisualName(visualName) == normalized;
-        });
-}
-
-void SetAnimationPathExportVisual(AnimationPath* path, std::string_view name, bool enabled) {
-    if (path == nullptr) {
-        return;
-    }
-
-    const auto normalized = NormalizePointVisualName(name);
-    if (!IsExportablePointVisualName(normalized)) {
-        return;
-    }
-
-    auto existing = std::find_if(
-        path->exportVisualNames.begin(),
-        path->exportVisualNames.end(),
-        [&normalized](const std::string& visualName) {
-            return NormalizePointVisualName(visualName) == normalized;
-        });
-    if (enabled) {
-        if (existing == path->exportVisualNames.end()) {
-            path->exportVisualNames.push_back(normalized);
-        }
-        return;
-    }
-
-    if (existing != path->exportVisualNames.end()) {
-        path->exportVisualNames.erase(existing);
-    }
-}
-
-void RemoveUnexportableVisualNames(AnimationPath* path) {
-    if (path == nullptr) {
-        return;
-    }
-
-    for (auto& visualName : path->exportVisualNames) {
-        visualName = NormalizePointVisualName(visualName);
-    }
-    path->exportVisualNames.erase(
-        std::remove_if(
-            path->exportVisualNames.begin(),
-            path->exportVisualNames.end(),
-            [](const std::string& visualName) {
-                return !IsExportablePointVisualName(visualName);
-            }),
-        path->exportVisualNames.end());
-    std::sort(path->exportVisualNames.begin(), path->exportVisualNames.end());
-    path->exportVisualNames.erase(
-        std::unique(path->exportVisualNames.begin(), path->exportVisualNames.end()),
-        path->exportVisualNames.end());
-}
-
-const SavedPointVisualState* FindExportablePointVisual(
-    const PreviewLayerSession& session,
-    std::string_view name) {
-    const auto normalized = NormalizePointVisualName(name);
-    if (!IsExportablePointVisualName(normalized)) {
-        return nullptr;
-    }
-
-    const auto visualIt = std::find_if(
-        session.pointVisuals.begin(),
-        session.pointVisuals.end(),
-        [&normalized](const SavedPointVisualState& visual) {
-            return NormalizePointVisualName(visual.name) == normalized &&
-                   IsExportablePointVisualName(visual.name);
-        });
-    return visualIt == session.pointVisuals.end() ? nullptr : &*visualIt;
-}
-
 bool DrawSectionHeader(
     const char* label,
     bool defaultOpen = true,
@@ -6603,33 +6503,6 @@ bool AssociatedLayerPathsIntersect(
     return AssociatedLayerPathsIntersect(canonicalLeft, canonicalRight);
 }
 
-bool AssociationMatchesFilter(
-    const PreviewRuntimeState& runtimeState,
-    const std::vector<std::filesystem::path>& associatedLayerPaths,
-    AssociationFilterMode filterMode,
-    const std::filesystem::path& filterLayerPath) {
-    auto canonicalAssociatedLayerPaths = associatedLayerPaths;
-    CanonicalizeAssociatedLayerPathsForSceneGroups(runtimeState, &canonicalAssociatedLayerPaths);
-
-    switch (filterMode) {
-        case AssociationFilterMode::Any:
-            return true;
-        case AssociationFilterMode::Unassociated:
-            return canonicalAssociatedLayerPaths.empty();
-        case AssociationFilterMode::Layer:
-            return !filterLayerPath.empty() &&
-                   AssociatedLayerPathsContain(runtimeState, canonicalAssociatedLayerPaths, filterLayerPath);
-        case AssociationFilterMode::Visible:
-        default: {
-            const auto visibleLayerPaths = VisibleAssociatedLidarLayerPaths(runtimeState);
-            if (visibleLayerPaths.empty()) {
-                return canonicalAssociatedLayerPaths.empty();
-            }
-            return AssociatedLayerPathsIntersect(runtimeState, canonicalAssociatedLayerPaths, visibleLayerPaths);
-        }
-    }
-}
-
 std::string AssociationDisplayName(
     const PreviewRuntimeState& runtimeState,
     const std::filesystem::path& path) {
@@ -6648,179 +6521,6 @@ std::string AssociationDisplayName(
     return name.empty() ? canonicalPath.filename().string() : name;
 }
 
-std::string FormatAssociationSummary(
-    const PreviewRuntimeState& runtimeState,
-    const std::vector<std::filesystem::path>& associatedLayerPaths) {
-    auto canonicalAssociatedLayerPaths = associatedLayerPaths;
-    CanonicalizeAssociatedLayerPathsForSceneGroups(runtimeState, &canonicalAssociatedLayerPaths);
-    if (canonicalAssociatedLayerPaths.empty()) {
-        return "Unassociated";
-    }
-
-    std::vector<std::string> names;
-    names.reserve(canonicalAssociatedLayerPaths.size());
-    for (const auto& path : canonicalAssociatedLayerPaths) {
-        names.push_back(AssociationDisplayName(runtimeState, path));
-    }
-    std::sort(names.begin(), names.end());
-    names.erase(std::unique(names.begin(), names.end()), names.end());
-
-    std::string summary;
-    for (std::size_t index = 0; index < names.size(); ++index) {
-        if (index > 0) {
-            summary += ", ";
-        }
-        summary += names[index];
-    }
-    return summary;
-}
-
-std::string AssociationFilterSummary(
-    const PreviewRuntimeState& runtimeState,
-    AssociationFilterMode filterMode,
-    const std::filesystem::path& filterLayerPath) {
-    switch (filterMode) {
-        case AssociationFilterMode::Any:
-            return "Any";
-        case AssociationFilterMode::Unassociated:
-            return "Unassociated";
-        case AssociationFilterMode::Layer:
-            return filterLayerPath.empty()
-                       ? std::string{"Scene"}
-                       : AssociationDisplayName(runtimeState, filterLayerPath);
-        case AssociationFilterMode::Visible:
-        default:
-            return "Visible";
-    }
-}
-
-bool DrawAssociationFilterControl(
-    const char* label,
-    const PreviewRuntimeState& runtimeState,
-    AssociationFilterMode* filterMode,
-    std::filesystem::path* filterLayerPath) {
-    if (filterMode == nullptr || filterLayerPath == nullptr) {
-        return false;
-    }
-
-    bool changed = false;
-    const auto preview = AssociationFilterSummary(runtimeState, *filterMode, *filterLayerPath);
-    if (ImGui::BeginCombo(label, preview.c_str())) {
-        const auto drawOption = [&](AssociationFilterMode mode, const char* optionLabel) {
-            const bool selected = *filterMode == mode;
-            if (ImGui::Selectable(optionLabel, selected)) {
-                *filterMode = mode;
-                if (mode != AssociationFilterMode::Layer) {
-                    filterLayerPath->clear();
-                }
-                changed = true;
-            }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        };
-
-        drawOption(AssociationFilterMode::Visible, "Visible");
-        drawOption(AssociationFilterMode::Any, "Any");
-        drawOption(AssociationFilterMode::Unassociated, "Unassociated");
-        ImGui::Separator();
-        std::vector<std::filesystem::path> listedAssociationPaths;
-        for (std::size_t index = 0; index < runtimeState.sessions.size(); ++index) {
-            const auto& session = runtimeState.sessions[index];
-            if (!IsAssociableLidarSession(session)) {
-                continue;
-            }
-            const auto associationPath = AssociationPathForSession(session);
-            if (associationPath.empty() ||
-                AssociatedLayerPathsContain(listedAssociationPaths, associationPath)) {
-                continue;
-            }
-            listedAssociationPaths.push_back(associationPath);
-            const bool selected =
-                *filterMode == AssociationFilterMode::Layer &&
-                AssociatedLayerPathsContain(
-                    runtimeState,
-                    std::vector<std::filesystem::path>{*filterLayerPath},
-                    associationPath);
-            ImGui::PushID(associationPath.generic_string().c_str());
-            const auto displayName = AssociationDisplayName(runtimeState, associationPath);
-            if (ImGui::Selectable(displayName.c_str(), selected)) {
-                *filterMode = AssociationFilterMode::Layer;
-                *filterLayerPath = associationPath.lexically_normal();
-                changed = true;
-            }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndCombo();
-    }
-    return changed;
-}
-
-bool DrawLayerAssociationControls(
-    const char* label,
-    PreviewRuntimeState* runtimeState,
-    std::vector<std::filesystem::path>* associatedLayerPaths) {
-    if (runtimeState == nullptr || associatedLayerPaths == nullptr) {
-        return false;
-    }
-
-    NormalizeAssociatedLayerPaths(associatedLayerPaths);
-    CanonicalizeAssociatedLayerPathsForSceneGroups(*runtimeState, associatedLayerPaths);
-    bool changed = false;
-    ImGui::TextDisabled("%s: %s", label, FormatAssociationSummary(*runtimeState, *associatedLayerPaths).c_str());
-    if (ImGui::Button("Make Unassociated")) {
-        if (!associatedLayerPaths->empty()) {
-            associatedLayerPaths->clear();
-            changed = true;
-        }
-    }
-
-    std::size_t lidarCount = 0;
-    std::vector<std::filesystem::path> listedAssociationPaths;
-    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
-        const auto& session = runtimeState->sessions[index];
-        if (!IsAssociableLidarSession(session)) {
-            continue;
-        }
-        const auto associationPath = AssociationPathForSession(session);
-        if (associationPath.empty() ||
-            AssociatedLayerPathsContain(listedAssociationPaths, associationPath)) {
-            continue;
-        }
-        listedAssociationPaths.push_back(associationPath);
-        ++lidarCount;
-        bool associated = AssociatedLayerPathsContain(*associatedLayerPaths, associationPath);
-        ImGui::PushID(associationPath.generic_string().c_str());
-        const auto displayName = AssociationDisplayName(*runtimeState, associationPath);
-        if (ImGui::Checkbox(displayName.c_str(), &associated)) {
-            if (associated) {
-                associatedLayerPaths->push_back(associationPath);
-            } else {
-                const auto sourceKey = NormalizePathKey(associationPath);
-                associatedLayerPaths->erase(
-                    std::remove_if(
-                        associatedLayerPaths->begin(),
-                        associatedLayerPaths->end(),
-                        [&sourceKey](const std::filesystem::path& path) {
-                            return NormalizePathKey(path) == sourceKey;
-                        }),
-                    associatedLayerPaths->end());
-            }
-            CanonicalizeAssociatedLayerPathsForSceneGroups(*runtimeState, associatedLayerPaths);
-            changed = true;
-        }
-        ImGui::PopID();
-    }
-
-    if (lidarCount == 0) {
-        ImGui::TextDisabled("No LiDAR scenes are available for association.");
-    }
-    return changed;
-}
-
 void CanonicalizeRuntimeSceneAssociations(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
@@ -6829,11 +6529,6 @@ void CanonicalizeRuntimeSceneAssociations(PreviewRuntimeState* runtimeState) {
     for (auto& shot : runtimeState->cameraShots) {
         CanonicalizeAssociatedLayerPathsForSceneGroups(*runtimeState, &shot.associatedLayerPaths);
     }
-    runtimeState->cameraPanel.associationFilterLayerPath =
-        CanonicalAssociationPathForRuntime(
-            *runtimeState,
-            runtimeState->cameraPanel.associationFilterLayerPath);
-
     EnsureAnimationAssociationStorage(&runtimeState->animationPanel);
     for (auto& associatedLayerPaths : runtimeState->animationPanel.availableFileAssociatedLayerPaths) {
         CanonicalizeAssociatedLayerPathsForSceneGroups(*runtimeState, &associatedLayerPaths);
@@ -6850,10 +6545,6 @@ void CanonicalizeRuntimeSceneAssociations(PreviewRuntimeState* runtimeState) {
             *runtimeState,
             &runtimeState->animationPanel.currentPath->associatedLayerPaths);
     }
-    runtimeState->animationPanel.associationFilterLayerPath =
-        CanonicalAssociationPathForRuntime(
-            *runtimeState,
-            runtimeState->animationPanel.associationFilterLayerPath);
 }
 
 invisible_places::io::Float3 BoundsCenter(const invisible_places::io::Bounds3f& bounds) {
@@ -22153,7 +21844,6 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     loadedPath.name = AnimationNameFromFilePath(inputPath);
 
     runtimeState->animationPanel.currentPath = std::move(loadedPath);
-    RemoveUnexportableVisualNames(&runtimeState->animationPanel.currentPath.value());
     if (runtimeState->animationPanel.currentPath->tempWaterPointVisualStyle.has_value()) {
         ImportLegacyWaterPointVisualStyle(
             runtimeState,
@@ -23053,6 +22743,64 @@ bool PointVisualExportOverrideTargetsSession(
     return SessionsShareSceneFolder(target, session);
 }
 
+struct SavedPointVisualExportSelection {
+    PointVisualExportOverride visualOverride{};
+    std::string visualName;
+};
+
+// Every export renders the SAVED named visual selected for the live display.
+// Live sessions may carry unsaved lookdev edits (scene-temporary shadows or
+// raw pointStyle tweaks made to keep preview fps up), so this resolves the
+// base entry from the project visual library and never reads session
+// pointStyle or scene shadow states.
+std::optional<SavedPointVisualExportSelection> ResolveSavedPointVisualExportSelection(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return std::nullopt;
+    }
+    const auto sessionIndex = ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+    if (!sessionIndex.has_value()) {
+        return std::nullopt;
+    }
+    auto& session = runtimeState->sessions[sessionIndex.value()];
+    SavedPointVisualExportSelection selection;
+    selection.visualOverride.sessionIndex = sessionIndex.value();
+    if (IsProjectPointVisualSession(session)) {
+        EnsureProjectPointVisuals(runtimeState);
+        auto& library = runtimeState->pointVisualLibrary;
+        const auto baseName = BaseNameFromProjectPointVisualName(
+            library,
+            session.selectedPointVisualName.empty()
+                ? library.selectedPointVisualName
+                : session.selectedPointVisualName);
+        const auto visualIndex = FindProjectPointVisualIndex(library, baseName);
+        if (!visualIndex.has_value()) {
+            return std::nullopt;
+        }
+        selection.visualName = library.pointVisuals[visualIndex.value()].name;
+        selection.visualOverride.style = library.pointVisuals[visualIndex.value()].style;
+    } else {
+        const auto baseName = BasePointVisualName(session.selectedPointVisualName);
+        const auto visualIt = std::find_if(
+            session.pointVisuals.begin(),
+            session.pointVisuals.end(),
+            [&](const SavedPointVisualState& visual) {
+                return NormalizePointVisualName(visual.name) == baseName;
+            });
+        if (visualIt == session.pointVisuals.end()) {
+            return std::nullopt;
+        }
+        selection.visualName = visualIt->name;
+        selection.visualOverride.style = visualIt->style;
+    }
+    if (!session.scalarFields.empty()) {
+        ResolveProjectVisualStyleBindingsByFieldName(
+            &selection.visualOverride.style,
+            session);
+    }
+    return selection;
+}
+
 struct AnimationExportFrustumMaskSummary {
     bool enabled = false;
     std::uint64_t effectiveDrawPoints = 0;
@@ -23483,6 +23231,11 @@ bool RenderCurrentAnimationFramePreview(
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
 
+    const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+    const auto savedVisualOverride = savedVisual.has_value()
+                                         ? std::optional<PointVisualExportOverride>{
+                                               savedVisual->visualOverride}
+                                         : std::nullopt;
     bool exportUsesPreviewDensity = false;
     if (AnimationExportWritesMp4(activeMode) || AnimationExportWritesPngStack(activeMode)) {
         const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
@@ -23492,7 +23245,7 @@ bool RenderCurrentAnimationFramePreview(
                 sampleCameras.data(),
                 sampleCameras.size()},
             settings,
-            std::nullopt,
+            savedVisualOverride,
             exportRendererMode);
         exportUsesPreviewDensity = frustumMaskSummary.enabled;
     } else if (AnimationExportWritesExr(activeMode) && panel.exportPreviewDensity) {
@@ -23503,7 +23256,7 @@ bool RenderCurrentAnimationFramePreview(
     const auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
         exportUsesPreviewDensity,
-        std::nullopt,
+        savedVisualOverride,
         exportRendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for frame preview.";
@@ -27007,6 +26760,14 @@ void StartSelectedQuickMp4Batch(
 
     auto& visualSession = runtimeState->sessions[visualSessionIndex.value()];
     EnsurePointVisuals(&visualSession);
+    const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+    if (!savedVisual.has_value()) {
+        runtimeState->errorMessage =
+            "Save the current point visual before exporting " + modeLabel +
+            "; exports always render the saved named visual.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
     if (!EnsureFullDensityExportSourcesReady(runtimeState, viewport)) {
         return;
     }
@@ -27050,19 +26811,14 @@ void StartSelectedQuickMp4Batch(
         // Batch exports load animations without the panel's load path, so
         // applied timing runs recompile here against the current library.
         RecompileWaterTimingTracks(&runtimeState->water, &animationPath);
-        RemoveUnexportableVisualNames(&animationPath);
-        if (animationPath.keys.size() < 2U || animationPath.exportVisualNames.empty()) {
+        if (animationPath.keys.size() < 2U) {
             ++panel.quickMp4QueueSkipped;
             continue;
         }
 
-        for (const auto& visualName : animationPath.exportVisualNames) {
-            const auto* visual = FindExportablePointVisual(visualSession, visualName);
-            if (visual == nullptr) {
-                ++panel.quickMp4QueueSkipped;
-                continue;
-            }
-
+        // One job per animation, always rendering the saved named visual
+        // selected for the live display.
+        {
             const auto outputAnimationName = AnimationNameWithWaterScenario(
                 animationPath.name,
                 runtimeState->water.seepageScenarios,
@@ -27074,7 +26830,7 @@ void StartSelectedQuickMp4Batch(
                     settings.outputDirectory,
                     outputAnimationName,
                     settings,
-                    visual->name,
+                    savedVisual->visualName,
                     reservedOutputPaths,
                     activeMode);
             } else if (AnimationExportWritesAlphaMatteVideoPair(activeMode, activeExternalAlphaMatte)) {
@@ -27085,7 +26841,7 @@ void StartSelectedQuickMp4Batch(
                     settings.outputDirectory,
                     outputAnimationName,
                     settings,
-                    visual->name,
+                    savedVisual->visualName,
                     reservedOutputPaths);
                 outputPath = outputPaths.colorPath;
                 alphaMatteVideoPath = outputPaths.alphaMattePath;
@@ -27098,7 +26854,7 @@ void StartSelectedQuickMp4Batch(
                     settings.outputDirectory,
                     outputAnimationName,
                     settings,
-                    visual->name,
+                    savedVisual->visualName,
                     reservedOutputPaths);
             }
             reservedOutputPaths.push_back(outputPath);
@@ -27118,9 +26874,9 @@ void StartSelectedQuickMp4Batch(
                  .externalAlphaMatte = activeExternalAlphaMatte,
                  .settings = settings,
                  .animationFilePath = animationFilePath,
-                 .visualName = visual->name,
-                 .visualSessionIndex = visualSessionIndex.value(),
-                 .visualStyle = visual->style,
+                 .visualName = savedVisual->visualName,
+                 .visualSessionIndex = savedVisual->visualOverride.sessionIndex,
+                 .visualStyle = savedVisual->visualOverride.style,
                  .videoOutputPath = AnimationExportWritesPngStack(activeMode) ? std::filesystem::path{} : outputPath,
                  .alphaMatteVideoPath = alphaMatteVideoPath,
                  .pngStackDirectory = AnimationExportWritesPngStack(activeMode) ? outputPath : std::filesystem::path{}});
@@ -27157,10 +26913,13 @@ void StartStillCameraExportCapture(
         job.worker = std::jthread{};
     }
 
+    const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
         job.previewDensity,
-        std::nullopt,
+        savedVisual.has_value()
+            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
+            : std::nullopt,
         job.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
         FinishOfflineRenderJob(runtimeState, {}, "No visible loaded LiDAR layers are available for still-camera export.");
@@ -27343,12 +27102,16 @@ void StartStillCameraExportJob(
         return;
     }
 
-    const auto mode = runtimeState->cameraPanel.stillExportMode;
-    const auto quality = NormalizeExportQualityForMode(mode, runtimeState->cameraPanel.stillExportQuality);
+    // Stills share the active export preset with animation exports so one
+    // format/quality choice drives everything in the Export tab.
+    EnsureExportPresets(runtimeState);
+    const auto activePreset = ViewedExportPreset(*runtimeState);
+    const auto mode = activePreset.mode;
+    const auto quality = NormalizeExportQualityForMode(mode, activePreset.quality);
     const bool useVideoToolbox =
-        AnimationExportUsesVideoToolbox(mode, runtimeState->cameraPanel.stillExportUseVideoToolbox);
+        AnimationExportUsesVideoToolbox(mode, activePreset.useVideoToolbox);
     const bool externalAlphaMatte =
-        AnimationExportWritesAlphaMatteVideoPair(mode, runtimeState->cameraPanel.stillExportExternalAlphaMatte);
+        AnimationExportWritesAlphaMatteVideoPair(mode, activePreset.externalAlphaMatte);
     if (!CheckVideoExportMemoryBudget(runtimeState, mode, settings, externalAlphaMatte)) {
         return;
     }
@@ -27455,12 +27218,15 @@ void StartStillCameraExportJob(
         VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
+    const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
     const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
         runtimeState,
         viewport,
         std::span<const invisible_places::camera::CameraState>{frames.data(), frames.size()},
         settings,
-        std::nullopt,
+        savedVisual.has_value()
+            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
+            : std::nullopt,
         exportRendererMode);
     const bool exportUsesPreviewDensity = frustumMaskSummary.enabled;
 
@@ -27658,10 +27424,13 @@ void StartAnimationExportJob(
         VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
+    const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
         exportUsesPreviewDensity,
-        std::nullopt,
+        savedVisual.has_value()
+            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
+            : std::nullopt,
         exportRendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
@@ -28702,32 +28471,18 @@ void DrawAnimationExportSection(
         ImGui::SetTooltip("Renders one frame at the current animation position using the active export preset.");
     }
 
-    if ((AnimationExportWritesVideo(panel.exportMode) || AnimationExportWritesPngStack(panel.exportMode)) &&
-        panel.currentPath.has_value()) {
-        ImGui::Spacing();
-        ImGui::TextUnformatted("Export Visuals");
-        const auto visualIndex = ResolveVisiblePointCloudLookdevIndex(*runtimeState);
-        if (!visualIndex.has_value()) {
-            ImGui::TextDisabled("Load and show a LiDAR layer to choose saved visuals.");
+    {
+        // Exports always render the saved named visual selected for the live
+        // display; live lookdev tweaks made for preview fps never leak into
+        // the final frames.
+        const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+        if (savedVisual.has_value()) {
+            ImGui::TextDisabled("Export visual: %s (saved)", savedVisual->visualName.c_str());
         } else {
-            auto& session = runtimeState->sessions[visualIndex.value()];
-            EnsurePointVisuals(&session);
-            ImGui::TextDisabled("Source: %s", SceneVisualDisplayName(session).c_str());
-            std::size_t exportableVisualCount = 0;
-            for (const auto& visual : session.pointVisuals) {
-                if (!IsExportablePointVisualName(visual.name)) {
-                    continue;
-                }
-                ++exportableVisualCount;
-                bool checked = AnimationPathHasExportVisual(panel.currentPath.value(), visual.name);
-                if (ImGui::Checkbox(visual.name.c_str(), &checked)) {
-                    SetAnimationPathExportVisual(&panel.currentPath.value(), visual.name, checked);
-                    panel.dirty = true;
-                }
-            }
-            if (exportableVisualCount == 0) {
-                ImGui::TextDisabled("No saved visuals are available for this export.");
-            }
+            ImGui::TextColored(
+                ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                "No saved visual is selected; save the current point visual "
+                "before exporting.");
         }
     }
 
@@ -33740,7 +33495,6 @@ void DrawStillCameraExportSection(
         return;
     }
 
-    auto& panel = runtimeState->cameraPanel;
     auto& settings = runtimeState->renderSettings;
     if (!runtimeState->animationPanel.exportSizeInitialized) {
         const auto viewportSize = CurrentUiViewportSize(viewport);
@@ -33750,116 +33504,22 @@ void DrawStillCameraExportSection(
         runtimeState->animationPanel.exportSizeInitialized = true;
     }
 
-    const char* stillExportLabels[] = {
-        "MP4",
-        "ProRes 422",
-        "ProRes 4444",
-        "PNG Stack",
-        "Fast PNG Stack",
-        "HQ EXR"};
-    int stillExportIndex = 0;
-    switch (panel.stillExportMode) {
-        case invisible_places::output::AnimationExportMode::FastPreviewMp4:
-        case invisible_places::output::AnimationExportMode::HevcAlphaMp4:
-            stillExportIndex = 0;
-            break;
-        case invisible_places::output::AnimationExportMode::ProRes422Mov:
-        case invisible_places::output::AnimationExportMode::ProRes422HqMov:
-        case invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov:
-        case invisible_places::output::AnimationExportMode::ProRes422HqAlphaMatteMov:
-        case invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov:
-        case invisible_places::output::AnimationExportMode::ProRes422HqVideoToolboxMov:
-            stillExportIndex = 1;
-            break;
-        case invisible_places::output::AnimationExportMode::ProRes4444Mov:
-        case invisible_places::output::AnimationExportMode::ProRes4444XqMov:
-        case invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov:
-        case invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov:
-            stillExportIndex = 2;
-            break;
-        case invisible_places::output::AnimationExportMode::PngStack:
-            stillExportIndex = 3;
-            break;
-        case invisible_places::output::AnimationExportMode::FastPngStack:
-            stillExportIndex = 4;
-            break;
-        case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
-            stillExportIndex = 5;
-            break;
-    }
-    if (ImGui::Combo("Format", &stillExportIndex, stillExportLabels, IM_ARRAYSIZE(stillExportLabels))) {
-        const invisible_places::output::AnimationExportMode exportModes[] = {
-            invisible_places::output::AnimationExportMode::FastPreviewMp4,
-            invisible_places::output::AnimationExportMode::ProRes422Mov,
-            invisible_places::output::AnimationExportMode::ProRes4444Mov,
-            invisible_places::output::AnimationExportMode::PngStack,
-            invisible_places::output::AnimationExportMode::FastPngStack,
-            invisible_places::output::AnimationExportMode::HqPreviewDensityExr,
-        };
-        const auto maxModeIndex = static_cast<int>(IM_ARRAYSIZE(exportModes) - 1);
-        panel.stillExportMode = exportModes[std::clamp(stillExportIndex, 0, maxModeIndex)];
-        panel.stillExportQuality =
-            NormalizeExportQualityForMode(panel.stillExportMode, panel.stillExportQuality);
-        panel.stillExportUseVideoToolbox =
-            AnimationExportWritesVideo(panel.stillExportMode) && panel.stillExportUseVideoToolbox;
-        panel.stillExportExternalAlphaMatte = AnimationExportWritesVideo(panel.stillExportMode);
-    }
-
-    if (AnimationExportWritesVideo(panel.stillExportMode)) {
-        const bool proRes4444 =
-            panel.stillExportMode == invisible_places::output::AnimationExportMode::ProRes4444Mov ||
-            panel.stillExportMode == invisible_places::output::AnimationExportMode::ProRes4444XqMov ||
-            panel.stillExportMode == invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov ||
-            panel.stillExportMode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov;
-        panel.stillExportQuality =
-            NormalizeExportQualityForMode(panel.stillExportMode, panel.stillExportQuality);
-        int qualityIndex =
-            panel.stillExportQuality == invisible_places::output::AnimationExportQuality::Normal ? 0 : 1;
-        const char* qualityLabels[] = {"Normal", proRes4444 ? "XQ" : "HQ"};
-        if (ImGui::Combo("Quality", &qualityIndex, qualityLabels, IM_ARRAYSIZE(qualityLabels))) {
-            panel.stillExportQuality = qualityIndex == 0
-                                           ? invisible_places::output::AnimationExportQuality::Normal
-                                           : (proRes4444
-                                                  ? invisible_places::output::AnimationExportQuality::Xq
-                                                  : invisible_places::output::AnimationExportQuality::Hq);
-            panel.stillExportQuality =
-                NormalizeExportQualityForMode(panel.stillExportMode, panel.stillExportQuality);
-        }
-        ImGui::Checkbox("VideoToolbox", &panel.stillExportUseVideoToolbox);
-        ImGui::Checkbox("External Alpha Matte", &panel.stillExportExternalAlphaMatte);
-    }
+    // Format, quality, size, and output folder come from the active export
+    // preset above; a still only adds how long the fixed camera holds.
+    EnsureExportPresets(runtimeState);
+    const auto stillMode = ViewedExportPreset(*runtimeState).mode;
+    ImGui::TextDisabled(
+        "Uses the active export preset (%s).",
+        AnimationExportModeLabel(stillMode));
 
     bool settingsChanged = false;
-    settingsChanged |= InputTextString("Output Folder", &settings.outputDirectory);
-
-    int width = static_cast<int>(settings.width);
-    int height = static_cast<int>(settings.height);
-    int fps = static_cast<int>(settings.framesPerSecond);
     float stillDurationSeconds = settings.stillCameraDurationSeconds;
-    if (ImGui::InputInt("Width", &width)) {
-        settings.width = static_cast<std::uint32_t>(std::max(1, width));
-        settingsChanged = true;
-    }
-    if (ImGui::InputInt("Height", &height)) {
-        settings.height = static_cast<std::uint32_t>(std::max(1, height));
-        settingsChanged = true;
-    }
-    if (ImGui::InputInt("Frame Rate", &fps)) {
-        settings.framesPerSecond = static_cast<std::uint32_t>(std::max(1, fps));
-        settingsChanged = true;
-    }
     if (ImGui::InputFloat("Duration", &stillDurationSeconds, 0.1F, 1.0F, "%.2f s")) {
         settings.stillCameraDurationSeconds = std::clamp(stillDurationSeconds, 0.001F, 3600.0F);
         settingsChanged = true;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("The camera stays fixed while animated water and visual effects advance.");
-    }
-    if (ImGui::Button("Use Viewport Size")) {
-        const auto viewportSize = CurrentUiViewportSize(viewport);
-        settings.width = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.x));
-        settings.height = static_cast<std::uint32_t>(std::max(1.0F, viewportSize.y));
-        settingsChanged = true;
     }
     if (settingsChanged) {
         NormalizeAnimationRenderSettings(&settings);
@@ -33874,21 +33534,10 @@ void DrawStillCameraExportSection(
                 static_cast<float>(std::max<std::uint32_t>(1U, settings.framesPerSecond)))));
     ImGui::TextDisabled(
         "%s: %u frames from the current view.",
-        AnimationExportWritesVideo(panel.stillExportMode) || AnimationExportWritesPngStack(panel.stillExportMode)
-            ? AnimationExportModeLabel(panel.stillExportMode)
+        AnimationExportWritesVideo(stillMode) || AnimationExportWritesPngStack(stillMode)
+            ? AnimationExportModeLabel(stillMode)
             : "EXR stack",
         stillFrameCount);
-    if (panel.stillExportMode == invisible_places::output::AnimationExportMode::HqPreviewDensityExr) {
-        ImGui::TextDisabled("EXR stack uses full-source point density to avoid preview sampling artifacts.");
-    } else if (AnimationExportWritesMp4(panel.stillExportMode)) {
-        ImGui::TextDisabled("MP4 writes HEVC color plus optional luma-matte video for Adobe compositing.");
-    } else if (AnimationExportWritesProRes(panel.stillExportMode)) {
-        ImGui::TextDisabled("ProRes writes MOV color plus optional luma matte; 4444 keeps embedded alpha.");
-    } else if (panel.stillExportMode == invisible_places::output::AnimationExportMode::PngStack) {
-        ImGui::TextDisabled("PNG Stack writes display-referred RGBA frames into a generated folder.");
-    } else if (panel.stillExportMode == invisible_places::output::AnimationExportMode::FastPngStack) {
-        ImGui::TextDisabled("Fast PNG Stack writes lossless RGBA frames through ffmpeg into a generated folder.");
-    }
 
     auto& job = runtimeState->offlineRenderJob;
     if (job.active) {
@@ -33946,7 +33595,7 @@ void DrawStillCameraExportSection(
     const bool ffmpegAvailable =
         invisible_places::output::FfmpegExecutableAvailable(invisible_places::output::DefaultFfmpegExecutablePath());
     const bool exportAvailable =
-        !AnimationExportRequiresFfmpeg(panel.stillExportMode) ||
+        !AnimationExportRequiresFfmpeg(stillMode) ||
         ffmpegAvailable;
     if (!exportAvailable) {
         ImGui::BeginDisabled();
@@ -33958,7 +33607,7 @@ void DrawStillCameraExportSection(
         ImGui::EndDisabled();
         ImGui::TextDisabled(
             "%s requires ffmpeg at %s.",
-            AnimationExportModeLabel(panel.stillExportMode),
+            AnimationExportModeLabel(stillMode),
             invisible_places::output::DefaultFfmpegExecutablePath().string().c_str());
     }
     if (ImGui::IsItemHovered()) {
@@ -34021,8 +33670,6 @@ void DrawCameraSection(
         EndPanelSection();
     }
 
-    DrawStillCameraExportSection(runtimeState, viewport);
-
     if (BeginPanelSection("Shots")) {
     EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
 
@@ -34031,11 +33678,6 @@ void DrawCameraSection(
     if (ImGui::Button("Save Camera Position")) {
         SaveCurrentCameraShot(runtimeState);
     }
-    DrawAssociationFilterControl(
-        "Show Cameras",
-        *runtimeState,
-        &runtimeState->cameraPanel.associationFilterMode,
-        &runtimeState->cameraPanel.associationFilterLayerPath);
 
     if (runtimeState->cameraShots.empty()) {
         ImGui::TextUnformatted("No camera shots saved yet.");
@@ -34045,16 +33687,7 @@ void DrawCameraSection(
 
     ImGui::Spacing();
     if (ImGui::BeginListBox("Saved Shots", ImVec2{-FLT_MIN, 128.0F})) {
-        std::size_t visibleShotCount = 0;
         for (std::size_t index = 0; index < runtimeState->cameraShots.size(); ++index) {
-            if (!AssociationMatchesFilter(
-                    *runtimeState,
-                    runtimeState->cameraShots[index].associatedLayerPaths,
-                    runtimeState->cameraPanel.associationFilterMode,
-                    runtimeState->cameraPanel.associationFilterLayerPath)) {
-                continue;
-            }
-            ++visibleShotCount;
             const bool selected = runtimeState->cameraPanel.selectedShotIndex.has_value() &&
                                   runtimeState->cameraPanel.selectedShotIndex.value() == index;
             ImGui::PushID(static_cast<int>(index));
@@ -34078,12 +33711,7 @@ void DrawCameraSection(
                     runtimeState->cameraPanel.focusShotRename = false;
                 }
             } else {
-                const auto label =
-                    runtimeState->cameraShots[index].name + "  [" +
-                    FormatAssociationSummary(
-                        *runtimeState,
-                        runtimeState->cameraShots[index].associatedLayerPaths) +
-                    "]";
+                const auto& label = runtimeState->cameraShots[index].name;
                 if (ImGui::Selectable(label.c_str(), selected)) {
                     runtimeState->cameraPanel.selectedShotIndex = index;
                 }
@@ -34095,9 +33723,6 @@ void DrawCameraSection(
                 ImGui::SetItemDefaultFocus();
             }
             ImGui::PopID();
-        }
-        if (visibleShotCount == 0) {
-            ImGui::TextDisabled("No camera shots match this filter.");
         }
         ImGui::EndListBox();
     }
@@ -34135,16 +33760,6 @@ void DrawCameraSection(
                         "This camera is linked to animations. Click Delete Shot again to unlink keys and delete it.";
                     runtimeState->errorMessage.clear();
                 }
-            }
-            if (selectedIndex < runtimeState->cameraShots.size() && DrawLayerAssociationControls(
-                    "Shot Files",
-                    runtimeState,
-                    &runtimeState->cameraShots[selectedIndex].associatedLayerPaths)) {
-                runtimeState->cameraPlayback.active = false;
-                runtimeState->statusMessage =
-                    "Updated camera shot associations for " +
-                    runtimeState->cameraShots[selectedIndex].name + ".";
-                runtimeState->errorMessage.clear();
             }
             if (selectedIndex < runtimeState->cameraShots.size()) {
                 const auto links = FindCameraAnimationLinks(*runtimeState, runtimeState->cameraShots[selectedIndex].id);
@@ -34351,34 +33966,14 @@ void DrawAnimationSection(
     }
     ImGui::SameLine();
     ImGui::Checkbox("Show Splines", &panel.showSplines);
-    DrawAssociationFilterControl(
-        "Show Animations",
-        *runtimeState,
-        &panel.associationFilterMode,
-        &panel.associationFilterLayerPath);
 
     if (panel.availableFiles.empty()) {
         ImGui::TextDisabled("No project animation paths are registered.");
     } else if (ImGui::BeginListBox("Saved Animations", ImVec2{-FLT_MIN, 128.0F})) {
         bool animationListChanged = false;
-        std::size_t visibleAnimationCount = 0;
         for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
-            const auto& associatedLayerPaths = AnimationRegistryAssociationPaths(panel, index);
-            if (!AssociationMatchesFilter(
-                    *runtimeState,
-                    associatedLayerPaths,
-                    panel.associationFilterMode,
-                    panel.associationFilterLayerPath)) {
-                continue;
-            }
-            ++visibleAnimationCount;
             const bool selected = panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() == index;
             ImGui::PushID(static_cast<int>(index));
-            bool selectedForExport = AnimationFileSelectedForExport(panel, panel.availableFiles[index]);
-            if (ImGui::Checkbox("##quickMp4Export", &selectedForExport)) {
-                SetAnimationFileSelectedForExport(&panel, panel.availableFiles[index], selectedForExport);
-            }
-            ImGui::SameLine();
             if (panel.renamingFileIndex.has_value() && panel.renamingFileIndex.value() == index) {
                 if (panel.focusFileRename) {
                     ImGui::SetKeyboardFocusHere();
@@ -34406,15 +34001,9 @@ void DrawAnimationSection(
                         ? std::string{" *"}
                         : std::string{};
                 const auto displayName =
-                    AnimationDisplayNameFromPath(panel.availableFiles[index]) + modified + "  [" +
-                    FormatAssociationSummary(*runtimeState, associatedLayerPaths) + "]";
-                const bool selectedForBatchExport = selectedForExport;
-                if (ImGui::Selectable(displayName.c_str(), selectedForBatchExport)) {
+                    AnimationDisplayNameFromPath(panel.availableFiles[index]) + modified;
+                if (ImGui::Selectable(displayName.c_str(), selected)) {
                     panel.selectedFileIndex = index;
-                    SetAnimationFileSelectedForExport(
-                        &panel,
-                        panel.availableFiles[index],
-                        !selectedForBatchExport);
                 }
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                     BeginAnimationFileRename(&panel, index);
@@ -34428,30 +34017,8 @@ void DrawAnimationSection(
                 break;
             }
         }
-        if (visibleAnimationCount == 0) {
-            ImGui::TextDisabled("No animations match this filter.");
-        }
         ImGui::EndListBox();
     }
-
-    const auto selectedQuickMp4Count = panel.selectedExportFiles.size();
-    const auto selectedBatchMode = ActiveExportMode(runtimeState);
-    const bool selectedBatchModeCanBatchExport =
-        AnimationExportWritesVideo(selectedBatchMode) || AnimationExportWritesPngStack(selectedBatchMode);
-    const std::string batchButtonLabel =
-        "Export Selected " + std::string{AnimationExportModeLabel(selectedBatchMode)};
-    const bool exportButtonDisabled = runtimeState->offlineRenderJob.active || !selectedBatchModeCanBatchExport;
-    if (exportButtonDisabled) {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Button(batchButtonLabel.c_str())) {
-        StartSelectedQuickMp4Batch(runtimeState, &viewport);
-    }
-    if (exportButtonDisabled) {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("%zu selected", selectedQuickMp4Count);
 
     if (panel.selectedFileIndex.has_value() && panel.selectedFileIndex.value() < panel.availableFiles.size()) {
         if (ImGui::Button("Load")) {
@@ -34487,15 +34054,6 @@ void DrawAnimationSection(
     if (BeginPanelSection("Current Path")) {
     ImGui::Text("File: %s", panel.currentFilePath.empty() ? "unsaved" : panel.currentFilePath.c_str());
     ImGui::Text("Keys: %zu", animationPath.keys.size());
-    if (DrawLayerAssociationControls("Animation Files", runtimeState, &animationPath.associatedLayerPaths)) {
-        if (!panel.currentFilePath.empty()) {
-            SetAnimationRegistryAssociations(
-                &panel,
-                std::filesystem::path{panel.currentFilePath},
-                animationPath.associatedLayerPaths);
-        }
-        panel.dirty = true;
-    }
 
     int durationFrames = static_cast<int>(animationPath.durationFrames);
     const auto setDurationFrames = [&](std::uint32_t requestedFrames) {
@@ -35499,8 +35057,6 @@ void DrawAnimationSection(
             "Water keys use normalized 0-1 positions; duration and camera-key edits do not move them.");
         EndPanelSection();
     }
-
-    DrawAnimationExportSection(runtimeState, &viewport);
 
     if (animationPath.keys.empty()) {
         return;
@@ -41450,6 +41006,78 @@ bool WaterTimingRunAppliedToCurrentAnimation(
     return false;
 }
 
+void DrawExportBatchSection(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    if (!BeginPanelSection("Batch Export")) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+    if (panel.availableFiles.empty()) {
+        ImGui::TextDisabled("No saved animations are registered.");
+        EndPanelSection();
+        return;
+    }
+    ImGui::TextDisabled(
+        "Each selected animation exports once with the saved display visual "
+        "and its own water scenario track.");
+    if (ImGui::BeginListBox("Export Animations", ImVec2{-FLT_MIN, 112.0F})) {
+        for (std::size_t index = 0; index < panel.availableFiles.size(); ++index) {
+            ImGui::PushID(static_cast<int>(index));
+            bool selectedForExport =
+                AnimationFileSelectedForExport(panel, panel.availableFiles[index]);
+            const auto displayName = AnimationDisplayNameFromPath(panel.availableFiles[index]);
+            if (ImGui::Checkbox(displayName.c_str(), &selectedForExport)) {
+                SetAnimationFileSelectedForExport(
+                    &panel,
+                    panel.availableFiles[index],
+                    selectedForExport);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndListBox();
+    }
+
+    const auto selectedCount = panel.selectedExportFiles.size();
+    const auto batchMode = ActiveExportMode(runtimeState);
+    const bool batchModeCanExport =
+        AnimationExportWritesVideo(batchMode) || AnimationExportWritesPngStack(batchMode);
+    const std::string batchButtonLabel =
+        "Export Selected " + std::string{AnimationExportModeLabel(batchMode)};
+    const bool exportButtonDisabled =
+        runtimeState->offlineRenderJob.active || !batchModeCanExport;
+    if (exportButtonDisabled) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button(batchButtonLabel.c_str())) {
+        StartSelectedQuickMp4Batch(runtimeState, viewport);
+    }
+    if (exportButtonDisabled) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu selected", selectedCount);
+    if (!batchModeCanExport) {
+        ImGui::TextDisabled("Batch export needs a video or PNG-stack preset.");
+    }
+    EndPanelSection();
+}
+
+void DrawExportPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    DrawAnimationExportSection(runtimeState, viewport);
+    DrawExportBatchSection(runtimeState, viewport);
+    DrawStillCameraExportSection(runtimeState, *viewport);
+}
+
 void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return;
@@ -42149,6 +41777,13 @@ void DrawControlsWindow(
         if (ImGui::BeginTabItem("Timings")) {
             if (ImGui::BeginChild("TimingsTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawTimingsPanel(runtimeState);
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Export")) {
+            if (ImGui::BeginChild("ExportTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
+                DrawExportPanel(runtimeState, viewport);
             }
             ImGui::EndChild();
             ImGui::EndTabItem();

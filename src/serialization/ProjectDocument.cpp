@@ -2162,7 +2162,6 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"aperture_f_stops", path.apertureFStops},
         {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
         {"export_settings", SerializeAnimationExportSettings(path.exportSettings)},
-        {"export_visuals", path.exportVisualNames},
         {"selected_water_scenario_id", path.selectedWaterScenarioId},
         {"water_scenario_tracks", json::array()},
         {"keys", json::array()},
@@ -2207,9 +2206,6 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
         pathJson.value("selected_water_scenario_id", std::string{});
     if (pathJson.contains("export_settings")) {
         path.exportSettings = ParseAnimationExportSettings(pathJson.at("export_settings"));
-    }
-    if (pathJson.contains("export_visuals") && pathJson.at("export_visuals").is_array()) {
-        path.exportVisualNames = pathJson.at("export_visuals").get<std::vector<std::string>>();
     }
     if (pathJson.contains("water_animation_trail_settings")) {
         path.waterAnimationTrailSettings =

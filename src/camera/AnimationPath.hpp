@@ -52,7 +52,6 @@ struct AnimationPath {
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
     AnimationExportSettings exportSettings{};
-    std::vector<std::string> exportVisualNames;
     std::string selectedWaterScenarioId;
     std::vector<invisible_places::water::WaterScenarioTrack> waterScenarioTracks;
     std::optional<invisible_places::water::WaterAnimationTrailSettings> waterAnimationTrailSettings;

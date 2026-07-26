@@ -11792,7 +11792,6 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
         .startFrame = 5,
         .endFrame = 42,
     };
-    path.exportVisualNames = {"Painty", "RGB Ghost"};
     path.waterAnimationTrailSettings = invisible_places::water::DefaultWaterAnimationTrailSettings();
     path.waterAnimationTrailSettings->particleDensity = 2.25F;
     path.waterAnimationTrailSettings->particleSpeed = 1.4F;
@@ -11894,9 +11893,6 @@ TEST_CASE("Animation path serialization round-trips standalone files", "[seriali
     CHECK(loadedPath->exportSettings.stillCameraDurationSeconds == Catch::Approx(6.25F));
     CHECK(loadedPath->exportSettings.startFrame == 5);
     CHECK(loadedPath->exportSettings.endFrame == 42);
-    REQUIRE(loadedPath->exportVisualNames.size() == 2);
-    CHECK(loadedPath->exportVisualNames[0] == "Painty");
-    CHECK(loadedPath->exportVisualNames[1] == "RGB Ghost");
     REQUIRE(loadedPath->waterAnimationTrailSettings.has_value());
     CHECK(loadedPath->waterAnimationTrailSettings->particleDensity == Catch::Approx(2.25F));
     CHECK(loadedPath->waterAnimationTrailSettings->particleSpeed == Catch::Approx(1.4F));
@@ -11996,7 +11992,6 @@ TEST_CASE("Legacy animation path files load with default export metadata", "[ser
     CHECK(loadedPath->exportSettings.framesPerSecond == 30);
     CHECK(loadedPath->exportSettings.startFrame == 0);
     CHECK(loadedPath->exportSettings.endFrame == 0);
-    CHECK(loadedPath->exportVisualNames.empty());
     CHECK(loadedPath->associatedLayerPaths.empty());
     REQUIRE(loadedPath->keys.size() == 2);
     CHECK(!loadedPath->keys[0].id.empty());
