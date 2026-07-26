@@ -396,3 +396,69 @@ TEST_CASE("Project round trip preserves the timing run library", "[water][timing
     CHECK(run.keys[1].position == Approx(0.9F));
     CHECK(run.keys[1].interpolation == WaterScenarioInterpolation::Hold);
 }
+
+TEST_CASE("Old default scenario names migrate to Past/Future and Current", "[water][timing][serialization][migration]") {
+    const std::string legacyJson = R"({
+        "schema_version": 45,
+        "project_name": "Legacy Names",
+        "water_scenarios": [
+            {
+                "id": "pre-colonisation-wet",
+                "name": "Pre-Colonisation Wet",
+                "state": {"seepage_level": 1.0}
+            },
+            {
+                "id": "contemporary-managed",
+                "name": "Contemporary Managed",
+                "state": {"seepage_level": 0.5}
+            },
+            {
+                "id": "custom-take",
+                "name": "Contemporary Managed",
+                "state": {"seepage_level": 0.25}
+            }
+        ]
+    })";
+
+    TemporaryTimingFile file{"invisible_places_scenario_rename.json"};
+    {
+        std::ofstream output{file.path};
+        REQUIRE(output.good());
+        output << legacyJson;
+    }
+
+    std::string errorMessage;
+    const auto loaded =
+        invisible_places::serialization::LoadProjectDocument(file.path, &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->waterScenarios.size() == 3U);
+    CHECK(loaded->waterScenarios[0].name == "Past/Future");
+    CHECK(loaded->waterScenarios[1].name == "Current");
+    // Custom scenarios keep their authored names even when they reuse an old
+    // default display name, because migration is keyed on the default ids.
+    CHECK(loaded->waterScenarios[2].name == "Contemporary Managed");
+}
+
+TEST_CASE("Edited scenario shadows round-trip through temp_water_scenario", "[water][timing][serialization]") {
+    invisible_places::serialization::ProjectDocument document;
+    document.projectName = "Shadow";
+    WaterScenarioDefinition edited;
+    edited.id = "pre-colonisation-wet";
+    edited.name = "Past/Future_edited";
+    edited.state.seepageLevel = 0.42F;
+    edited.state.rainLevel = 0.9F;
+    document.tempWaterScenario = edited;
+
+    TemporaryTimingFile file{"invisible_places_scenario_shadow.json"};
+    std::string errorMessage;
+    REQUIRE(invisible_places::serialization::SaveProjectDocument(document, file.path, &errorMessage));
+
+    const auto loaded =
+        invisible_places::serialization::LoadProjectDocument(file.path, &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->tempWaterScenario.has_value());
+    CHECK(loaded->tempWaterScenario->id == "pre-colonisation-wet");
+    CHECK(loaded->tempWaterScenario->name == "Past/Future_edited");
+    CHECK(loaded->tempWaterScenario->state.seepageLevel == Approx(0.42F));
+    CHECK(loaded->tempWaterScenario->state.rainLevel == Approx(0.9F));
+}

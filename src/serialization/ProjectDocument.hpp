@@ -188,6 +188,7 @@ struct ProjectDocument {
     std::string selectedWaterScenarioId;
     std::vector<invisible_places::water::WaterTimingRun> waterTimingRuns;
     std::uint32_t waterTimingRunSequence = 1U;
+    std::optional<invisible_places::water::WaterScenarioDefinition> tempWaterScenario;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;

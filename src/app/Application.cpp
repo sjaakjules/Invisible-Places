@@ -450,6 +450,7 @@ struct TimingsPanelState {
     // Scenario the armed Clear confirmation belongs to; a scenario or
     // animation switch must not let a stale confirmation clear a new track.
     std::string pendingClearScenarioId;
+    std::string newScenarioNameBuffer;
 };
 
 struct AnimationExportFramePayload {
@@ -1387,6 +1388,10 @@ struct WaterWorkflowState {
     // are never reissued to a later run — animations on disk keep referencing
     // run ids, and a reused id would silently rebind their timing.
     std::uint32_t nextTimingRunSequence = 1U;
+    // Clone-on-edit shadow for one scenario at a time (its name gains
+    // "_edited"). It never enters seepageScenarios or any embedded fallback
+    // snapshot; live preview reads it, exports opt in per job.
+    std::optional<invisible_places::water::WaterScenarioDefinition> editedScenario;
     std::string seepageLookNameBuffer = "Default";
     std::vector<WaterEffectLayer> rippleLayers;
     std::vector<WaterEffectLayer> fieldLayers;
@@ -1636,6 +1641,9 @@ struct PreviewRuntimeState {
     // them again. Both persist with the project.
     bool showLidarTab = false;
     bool showGsplatTab = false;
+    // Animation/batch exports render the saved scenario state by default; the
+    // Export tab can switch to the in-progress edited copy for test renders.
+    bool exportUsesEditedScenario = false;
     ControlsTab activeControlsTab = ControlsTab::Visuals;
     bool pauseLiveViewportDuringExport = true;
     bool previewRenderStateSignatureValid = false;
@@ -1668,6 +1676,56 @@ const invisible_places::water::WaterScenarioDefinition* FindWaterScenarioDefinit
         water.seepageScenarios.end(),
         [&](const auto& scenario) { return scenario.id == scenarioId; });
     return scenarioIt != water.seepageScenarios.end() ? &*scenarioIt : nullptr;
+}
+
+// Saved/edited resolution: live preview prefers the in-progress edited copy
+// so scrubbing shows what is being tuned, while fallback snapshots and
+// default exports keep reading the saved definition.
+const invisible_places::water::WaterScenarioDefinition* ViewedWaterScenarioDefinition(
+    const WaterWorkflowState& water,
+    std::string_view scenarioId) {
+    if (water.editedScenario.has_value() && water.editedScenario->id == scenarioId) {
+        return &water.editedScenario.value();
+    }
+    return FindWaterScenarioDefinition(water, scenarioId);
+}
+
+invisible_places::water::WaterScenarioState* EditWaterScenarioStateById(
+    WaterWorkflowState* water,
+    const std::string& scenarioId) {
+    if (water == nullptr || scenarioId.empty()) {
+        return nullptr;
+    }
+    if (water->editedScenario.has_value() && water->editedScenario->id == scenarioId) {
+        return &water->editedScenario->state;
+    }
+    const auto* definition = FindWaterScenarioDefinition(*water, scenarioId);
+    if (definition == nullptr) {
+        return nullptr;
+    }
+    // Editing a different scenario replaces the single shadow; the Timings
+    // Scenario section warns before that happens.
+    water->editedScenario = *definition;
+    water->editedScenario->name = definition->name + "_edited";
+    return &water->editedScenario->state;
+}
+
+std::vector<invisible_places::water::WaterScenarioDefinition> ExportWaterScenarioDefinitions(
+    const PreviewRuntimeState& runtimeState) {
+    auto scenarios = runtimeState.water.seepageScenarios;
+    if (runtimeState.exportUsesEditedScenario &&
+        runtimeState.water.editedScenario.has_value()) {
+        const auto replaceIt = std::find_if(
+            scenarios.begin(),
+            scenarios.end(),
+            [&](const auto& scenario) {
+                return scenario.id == runtimeState.water.editedScenario->id;
+            });
+        if (replaceIt != scenarios.end()) {
+            *replaceIt = runtimeState.water.editedScenario.value();
+        }
+    }
+    return scenarios;
 }
 
 std::string WaterScenarioDisplayName(
@@ -1706,8 +1764,15 @@ std::string AnimationNameWithWaterScenario(
     std::string animationName,
     std::span<const invisible_places::water::WaterScenarioDefinition> definitions,
     const AnimationPath& animation) {
-    const auto scenarioName = WaterScenarioDisplayName(definitions, animation);
+    auto scenarioName = WaterScenarioDisplayName(definitions, animation);
     if (!scenarioName.empty()) {
+        // The name feeds output file paths, so path separators become
+        // hyphens ("Past/Future" renders as "Past-Future.mp4").
+        for (auto& character : scenarioName) {
+            if (character == '/' || character == '\\') {
+                character = '-';
+            }
+        }
         animationName += " - " + scenarioName;
     }
     return animationName;
@@ -1726,7 +1791,7 @@ std::optional<invisible_places::water::WaterScenarioState> ResolveActiveWaterSce
         return std::nullopt;
     }
 
-    const auto* definition = FindWaterScenarioDefinition(runtimeState.water, scenarioId);
+    const auto* definition = ViewedWaterScenarioDefinition(runtimeState.water, scenarioId);
     const invisible_places::water::WaterScenarioTrack* track = nullptr;
     if (animation != nullptr) {
         const auto trackIt = std::find_if(
@@ -1802,7 +1867,7 @@ WaterFrameState ResolveWaterFrameState(
     result.nodeStates = invisible_places::water::EvaluateWaterSeepageNodeAnimationTracks(
         *trackIt,
         result.normalizedTime);
-    const auto* definition = FindWaterScenarioDefinition(
+    const auto* definition = ViewedWaterScenarioDefinition(
         runtimeState->water,
         animation.selectedWaterScenarioId);
     if (definition == nullptr && !trackIt->fallbackScenario.id.empty()) {
@@ -3874,7 +3939,8 @@ WaterOverlay WaterPathAnchorsFromCacheWithProfileSettings(
 void DrawWaterSeepageParameterTooltip(const char* text);
 bool RecompileWaterTimingTracks(
     WaterWorkflowState* water,
-    invisible_places::camera::AnimationPath* animationPath);
+    invisible_places::camera::AnimationPath* animationPath,
+    bool useEditedScenario = true);
 void RecompileWaterTimingTracksForAnimation(PreviewRuntimeState* runtimeState);
 bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
@@ -19319,6 +19385,7 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.selectedWaterScenarioId = runtimeState.water.selectedSeepageScenarioId;
     document.waterTimingRuns = runtimeState.water.timingRuns;
     document.waterTimingRunSequence = runtimeState.water.nextTimingRunSequence;
+    document.tempWaterScenario = runtimeState.water.editedScenario;
     document.waterRippleLayers = runtimeState.water.rippleLayers;
     document.waterFieldLayers = runtimeState.water.fieldLayers;
     document.waterFlowTrailSettings = runtimeState.water.flowTrailSettings;
@@ -20157,6 +20224,7 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.selectedSeepageScenarioId = document.selectedWaterScenarioId;
     runtimeState->water.timingRuns = document.waterTimingRuns;
     runtimeState->water.nextTimingRunSequence = document.waterTimingRunSequence;
+    runtimeState->water.editedScenario = document.tempWaterScenario;
     runtimeState->timingsPanel = TimingsPanelState{};
     RecompileWaterTimingTracksForAnimation(runtimeState);
     runtimeState->water.rippleLayers = document.waterRippleLayers;
@@ -23323,10 +23391,14 @@ bool RenderCurrentAnimationFramePreview(
         runtimeState->water.seepageScenarios,
         animationPath);
     job.animationPath = animationPath;
+    RecompileWaterTimingTracks(
+        &runtimeState->water,
+        &job.animationPath.value(),
+        runtimeState->exportUsesEditedScenario);
     EmbedAnimationWaterScenarioFallbacks(
         &job.animationPath.value(),
         runtimeState->water.seepageScenarios);
-    job.waterScenarios = runtimeState->water.seepageScenarios;
+    job.waterScenarios = ExportWaterScenarioDefinitions(*runtimeState);
     job.waterRainSettings = runtimeState->water.collisionRainSettings;
     job.waterRainVisual = runtimeState->water.rainVisual;
     job.frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState);
@@ -26855,8 +26927,12 @@ void StartSelectedQuickMp4Batch(
             &animationPath,
             runtimeState->water.seepageScenarios);
         // Batch exports load animations without the panel's load path, so
-        // applied timing runs recompile here against the current library.
-        RecompileWaterTimingTracks(&runtimeState->water, &animationPath);
+        // applied timing runs recompile here against the current library and
+        // the chosen saved/edited scenario state.
+        RecompileWaterTimingTracks(
+            &runtimeState->water,
+            &animationPath,
+            runtimeState->exportUsesEditedScenario);
         if (animationPath.keys.size() < 2U) {
             ++panel.quickMp4QueueSkipped;
             continue;
@@ -26909,7 +26985,7 @@ void StartSelectedQuickMp4Batch(
             }
             panel.quickMp4Queue.push_back(
                 {.animationPath = animationPath,
-                 .waterScenarios = runtimeState->water.seepageScenarios,
+                 .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
                  .waterRainSettings = runtimeState->water.collisionRainSettings,
                  .waterRainVisual = runtimeState->water.rainVisual,
                  .dynamicMeshFlowSettings =
@@ -27317,7 +27393,7 @@ void StartStillCameraExportJob(
         .pointCloudRendererMode = exportRendererMode,
         .stillCameraJob = true,
         .animationName = stillName,
-        .waterScenarios = runtimeState->water.seepageScenarios,
+        .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
         .waterRainSettings = runtimeState->water.collisionRainSettings,
         .waterRainVisual = runtimeState->water.rainVisual,
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState),
@@ -27397,6 +27473,10 @@ void StartAnimationExportJob(
     EmbedAnimationWaterScenarioFallbacks(
         &animationPathSnapshot,
         runtimeState->water.seepageScenarios);
+    RecompileWaterTimingTracks(
+        &runtimeState->water,
+        &animationPathSnapshot,
+        runtimeState->exportUsesEditedScenario);
     const auto outputRoot = std::filesystem::path{settings.outputDirectory};
     const auto animationName = AnimationNameWithWaterScenario(
         animationPathSnapshot.name,
@@ -27558,7 +27638,7 @@ void StartAnimationExportJob(
         .pointCloudRendererMode = exportRendererMode,
         .animationName = animationName,
         .animationPath = animationPathSnapshot,
-        .waterScenarios = runtimeState->water.seepageScenarios,
+        .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
         .waterRainSettings = runtimeState->water.collisionRainSettings,
         .waterRainVisual = runtimeState->water.rainVisual,
         .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState),
@@ -28530,6 +28610,25 @@ void DrawAnimationExportSection(
                 "No saved visual is selected; save the current point visual "
                 "before exporting.");
         }
+    }
+    if (runtimeState->water.editedScenario.has_value()) {
+        const char* scenarioStateLabels[] = {"Saved", "Edited"};
+        int scenarioStateIndex = runtimeState->exportUsesEditedScenario ? 1 : 0;
+        if (ImGui::Combo(
+                "Scenario State",
+                &scenarioStateIndex,
+                scenarioStateLabels,
+                IM_ARRAYSIZE(scenarioStateLabels))) {
+            runtimeState->exportUsesEditedScenario = scenarioStateIndex == 1;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Animation, batch, and frame-preview exports render either the "
+                "saved scenario or the in-progress %s copy.",
+                runtimeState->water.editedScenario->name.c_str());
+        }
+    } else if (runtimeState->exportUsesEditedScenario) {
+        runtimeState->exportUsesEditedScenario = false;
     }
 
     if (panel.currentPath.has_value()) {
@@ -37950,45 +38049,51 @@ void DrawWaterDynamicMeshFlowPanel(
                     !runtimeState->animationPanel.currentPath->selectedWaterScenarioId.empty()
                 ? runtimeState->animationPanel.currentPath->selectedWaterScenarioId
                 : water.selectedSeepageScenarioId;
-        const auto scenarioIt = std::find_if(
-            water.seepageScenarios.begin(),
-            water.seepageScenarios.end(),
-            [&](const auto& scenario) { return scenario.id == scenarioId; });
-        if (scenarioIt == water.seepageScenarios.end()) {
+        const auto* viewedScenario = ViewedWaterScenarioDefinition(water, scenarioId);
+        if (viewedScenario == nullptr) {
             ImGui::TextDisabled(
                 "Choose a Water Scenario to tune dry activity and post-Rain persistence.");
         } else {
-            ImGui::TextDisabled("%s", scenarioIt->name.c_str());
-            liveChanged |= ImGui::SliderFloat(
+            ImGui::TextDisabled("%s", viewedScenario->name.c_str());
+            auto editedState = viewedScenario->state;
+            bool scenarioChanged = false;
+            scenarioChanged |= ImGui::SliderFloat(
                 "Dry Mesh Flow",
-                &scenarioIt->state.meshFlowLevel,
+                &editedState.meshFlowLevel,
                 0.0F,
                 1.0F,
                 "%.2f");
-            liveChanged |= ImGui::SliderFloat(
+            scenarioChanged |= ImGui::SliderFloat(
                 "Rain Gain##MeshScenario",
-                &scenarioIt->state.meshFlowRainGain,
+                &editedState.meshFlowRainGain,
                 0.0F,
                 2.0F,
                 "%.2f");
-            liveChanged |= ImGui::SliderFloat(
+            scenarioChanged |= ImGui::SliderFloat(
                 "Persistence Scale",
-                &scenarioIt->state.meshFlowPersistenceScale,
+                &editedState.meshFlowPersistenceScale,
                 0.0F,
                 4.0F,
                 "%.2f x");
-            liveChanged |= ImGui::SliderFloat(
+            scenarioChanged |= ImGui::SliderFloat(
                 "Rain Rise##MeshScenario",
-                &scenarioIt->state.meshFlowRainRiseSeconds,
+                &editedState.meshFlowRainRiseSeconds,
                 0.0F,
                 120.0F,
                 "%.1f s");
-            liveChanged |= ImGui::SliderFloat(
+            scenarioChanged |= ImGui::SliderFloat(
                 "Rain Recession##MeshScenario",
-                &scenarioIt->state.meshFlowRainRecessionSeconds,
+                &editedState.meshFlowRainRecessionSeconds,
                 0.0F,
                 300.0F,
                 "%.1f s");
+            if (scenarioChanged) {
+                if (auto* state = EditWaterScenarioStateById(&water, scenarioId);
+                    state != nullptr) {
+                    *state = std::move(editedState);
+                }
+                liveChanged = true;
+            }
         }
         EndPanelSection();
     }
@@ -39026,17 +39131,15 @@ void DrawWaterSeepagePanel(
             ImGui::EndCombo();
         }
         if (!water.selectedSeepageScenarioId.empty()) {
-            const auto scenarioIt = std::find_if(
-                water.seepageScenarios.begin(),
-                water.seepageScenarios.end(),
-                [&](const auto& scenario) {
-                    return scenario.id == water.selectedSeepageScenarioId;
-                });
-            if (scenarioIt != water.seepageScenarios.end()) {
+            const auto* viewedScenario = ViewedWaterScenarioDefinition(
+                water,
+                water.selectedSeepageScenarioId);
+            if (viewedScenario != nullptr) {
+                auto editedState = viewedScenario->state;
                 bool scenarioChanged = false;
                 scenarioChanged |= ImGui::SliderFloat(
                     "Seepage Level",
-                    &scenarioIt->state.seepageLevel,
+                    &editedState.seepageLevel,
                     0.0F,
                     1.0F,
                     "%.2f");
@@ -39045,7 +39148,7 @@ void DrawWaterSeepagePanel(
                     "node's authored relative strength. Zero turns scenario Seepage off.");
                 scenarioChanged |= ImGui::SliderFloat(
                     "Spread",
-                    &scenarioIt->state.seepageSpread,
+                    &editedState.seepageSpread,
                     0.0F,
                     1.0F,
                     "%.2f");
@@ -39053,7 +39156,7 @@ void DrawWaterSeepagePanel(
                     "Expands active reach and width inside the preselected connected cells without rebuilding topology.");
                 scenarioChanged |= ImGui::SliderFloat(
                     "Rain Level",
-                    &scenarioIt->state.rainLevel,
+                    &editedState.rainLevel,
                     0.0F,
                     1.0F,
                     "%.2f");
@@ -39062,7 +39165,7 @@ void DrawWaterSeepagePanel(
                     "scales GPU particle density and drives each look's Rain Response.");
                 scenarioChanged |= ImGui::SliderFloat(
                     "Seepage Rain Delay",
-                    &scenarioIt->state.seepageRainDelaySeconds,
+                    &editedState.seepageRainDelaySeconds,
                     0.0F,
                     120.0F,
                     "%.1f s");
@@ -39071,7 +39174,7 @@ void DrawWaterSeepagePanel(
                     "remain immediate; only the compact Seepage rain-gain envelope is delayed.");
                 scenarioChanged |= ImGui::SliderFloat(
                     "Seepage Rain Rise",
-                    &scenarioIt->state.seepageRainRiseSeconds,
+                    &editedState.seepageRainRiseSeconds,
                     0.0F,
                     120.0F,
                     "%.1f s");
@@ -39080,7 +39183,7 @@ void DrawWaterSeepagePanel(
                     "representing gradual saturation and groundwater arrival.");
                 scenarioChanged |= ImGui::SliderFloat(
                     "Seepage Recession",
-                    &scenarioIt->state.seepageRainRecessionSeconds,
+                    &editedState.seepageRainRecessionSeconds,
                     0.0F,
                     300.0F,
                     "%.1f s");
@@ -39089,7 +39192,7 @@ void DrawWaterSeepagePanel(
                     "the cliff damp after the visible storm passes.");
                 scenarioChanged |= ImGui::SliderFloat(
                     "Flow Level",
-                    &scenarioIt->state.flowLevel,
+                    &editedState.flowLevel,
                     0.0F,
                     1.0F,
                     "%.2f");
@@ -39098,12 +39201,24 @@ void DrawWaterSeepagePanel(
                     "optionally gain the remaining activity from Rain Response.");
                 if (ImGui::TreeNode("Scenario Seepage Look")) {
                     scenarioChanged |= DrawWaterSeepageLookControls(
-                        &scenarioIt->state.seepageLook);
+                        &editedState.seepageLook);
                     ImGui::TreePop();
                 }
                 if (scenarioChanged) {
+                    if (auto* state = EditWaterScenarioStateById(
+                            &water,
+                            water.selectedSeepageScenarioId);
+                        state != nullptr) {
+                        *state = std::move(editedState);
+                    }
                     InvalidateWaterSeepageParams(&water);
                     runtimeState->previewRenderStateSignatureValid = false;
+                }
+                if (water.editedScenario.has_value() &&
+                    water.editedScenario->id == water.selectedSeepageScenarioId) {
+                    ImGui::TextDisabled(
+                        "Editing %s. Save or discard it in the Timings tab.",
+                        water.editedScenario->name.c_str());
                 }
             } else {
                 ImGui::TextColored(
@@ -39560,23 +39675,24 @@ void DrawWaterPanel(
                 "Animation value at %.2f s. Edit or add Flow keys in Animation.",
                 keyTimeSeconds);
         } else if (!activeScenarioId.empty()) {
-            const auto scenarioIt = std::find_if(
-                water.seepageScenarios.begin(),
-                water.seepageScenarios.end(),
-                [&](const auto& scenario) { return scenario.id == activeScenarioId; });
-            if (scenarioIt != water.seepageScenarios.end()) {
+            const auto* viewedScenario = ViewedWaterScenarioDefinition(water, activeScenarioId);
+            if (viewedScenario != nullptr) {
+                float editedFlowLevel = viewedScenario->state.flowLevel;
                 bool flowLevelChanged = ImGui::SliderFloat(
                     "Flow Level",
-                    &scenarioIt->state.flowLevel,
+                    &editedFlowLevel,
                     0.0F,
                     1.0F,
                     "%.2f");
                 if (ImGui::Button("Flow Off")) {
-                    scenarioIt->state.flowLevel = 0.0F;
+                    editedFlowLevel = 0.0F;
                     flowLevelChanged = true;
                 }
                 if (flowLevelChanged) {
-                    scenarioIt->state.flowLevel = std::clamp(scenarioIt->state.flowLevel, 0.0F, 1.0F);
+                    if (auto* state = EditWaterScenarioStateById(&water, activeScenarioId);
+                        state != nullptr) {
+                        state->flowLevel = std::clamp(editedFlowLevel, 0.0F, 1.0F);
+                    }
                     InvalidateWaterSeepageParams(&water);
                     runtimeState->previewRenderStateSignatureValid = false;
                 }
@@ -40923,7 +41039,8 @@ bool WaterTimingCompiledKeysEquivalent(
 // identically at the driven channels and intentionally do not count.
 bool RecompileWaterTimingTracks(
     WaterWorkflowState* water,
-    invisible_places::camera::AnimationPath* animationPath) {
+    invisible_places::camera::AnimationPath* animationPath,
+    bool useEditedScenario) {
     if (water == nullptr || animationPath == nullptr) {
         return false;
     }
@@ -40932,7 +41049,9 @@ bool RecompileWaterTimingTracks(
         if (track.timingAssignments.empty()) {
             continue;
         }
-        const auto* definition = FindWaterScenarioDefinition(*water, track.scenarioId);
+        const auto* definition = useEditedScenario
+                                     ? ViewedWaterScenarioDefinition(*water, track.scenarioId)
+                                     : FindWaterScenarioDefinition(*water, track.scenarioId);
         const auto& baseState = definition != nullptr
                                     ? definition->state
                                     : track.fallbackScenario.state;
@@ -40972,6 +41091,82 @@ void RecompileWaterTimingTracksForAnimation(PreviewRuntimeState* runtimeState) {
     panel.dirty = true;
     InvalidateWaterSeepageParams(&runtimeState->water);
     runtimeState->previewRenderStateSignatureValid = false;
+}
+
+std::string MakeUniqueWaterScenarioId(
+    const WaterWorkflowState& water,
+    std::string_view name) {
+    std::string slug;
+    for (const char character : name) {
+        if (std::isalnum(static_cast<unsigned char>(character)) != 0) {
+            slug += static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+        } else if (!slug.empty() && slug.back() != '-') {
+            slug += '-';
+        }
+    }
+    while (!slug.empty() && slug.back() == '-') {
+        slug.pop_back();
+    }
+    if (slug.empty()) {
+        slug = "scenario";
+    }
+    auto candidate = slug;
+    std::size_t suffix = 2U;
+    while (FindWaterScenarioDefinition(water, candidate) != nullptr) {
+        candidate = slug + "-" + std::to_string(suffix++);
+    }
+    return candidate;
+}
+
+void DiscardEditedWaterScenario(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->water.editedScenario.has_value()) {
+        return;
+    }
+    const auto editedName = runtimeState->water.editedScenario->name;
+    runtimeState->water.editedScenario.reset();
+    RecompileWaterTimingTracksForAnimation(runtimeState);
+    InvalidateWaterSeepageParams(&runtimeState->water);
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage = "Discarded " + editedName + ".";
+    runtimeState->errorMessage.clear();
+}
+
+void SaveEditedWaterScenario(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->water.editedScenario.has_value()) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    const auto scenarioId = water.editedScenario->id;
+    const auto savedIt = std::find_if(
+        water.seepageScenarios.begin(),
+        water.seepageScenarios.end(),
+        [&](const auto& scenario) { return scenario.id == scenarioId; });
+    if (savedIt == water.seepageScenarios.end()) {
+        runtimeState->errorMessage =
+            "The edited scenario no longer exists in the project; nothing was saved.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
+    savedIt->state = invisible_places::water::SanitizeWaterScenarioState(
+        water.editedScenario->state);
+    water.editedScenario.reset();
+    // Refresh the loaded animation's embedded snapshots so its file stays
+    // reproducible with the newly saved state, then recompile timing runs.
+    if (runtimeState->animationPanel.currentPath.has_value()) {
+        auto& animationPath = runtimeState->animationPanel.currentPath.value();
+        for (auto& track : animationPath.waterScenarioTracks) {
+            if (track.scenarioId == scenarioId) {
+                track.scenarioName = savedIt->name;
+                track.fallbackScenario = *savedIt;
+                runtimeState->animationPanel.dirty = true;
+            }
+        }
+        RecompileWaterTimingTracksForAnimation(runtimeState);
+    }
+    InvalidateWaterSeepageParams(&water);
+    runtimeState->previewRenderStateSignatureValid = false;
+    runtimeState->statusMessage = "Saved scenario " + savedIt->name + ".";
+    runtimeState->errorMessage.clear();
 }
 
 bool WaterTimingRunAppliedToCurrentAnimation(
@@ -41150,6 +41345,91 @@ void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
                 "Normalized 0..1 position along the animation, shared with the "
                 "Camera, Animation, and Export tabs. Timing keys use the same "
                 "normalized space, so duration edits never move them.");
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Scenario")) {
+        const std::string scenarioId =
+            animationPath != nullptr && !animationPath->selectedWaterScenarioId.empty()
+                ? animationPath->selectedWaterScenarioId
+                : water.selectedSeepageScenarioId;
+        if (scenarioId.empty()) {
+            ImGui::TextDisabled(
+                "Choose a water scenario above to tune, save, or fork its state.");
+        } else if (const auto* saved = FindWaterScenarioDefinition(water, scenarioId);
+                   saved == nullptr) {
+            ImGui::TextColored(
+                ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                "The selected scenario is missing from the project library.");
+        } else {
+            const bool editingThis = water.editedScenario.has_value() &&
+                                     water.editedScenario->id == scenarioId;
+            const bool editingOther = water.editedScenario.has_value() &&
+                                      water.editedScenario->id != scenarioId;
+            ImGui::Text("%s%s", saved->name.c_str(), editingThis ? "  [edited]" : "");
+            DrawWaterSeepageParameterTooltip(
+                "Scenario levels edited anywhere (Water tab, Seepage panel) go "
+                "into a named _edited copy. Live preview shows the edit; the "
+                "saved version stays untouched until Save Scenario.");
+            if (editingThis) {
+                ImGui::TextDisabled(
+                    "Unsaved edits live in %s. Scrubbing previews the edited state.",
+                    water.editedScenario->name.c_str());
+                if (ImGui::Button("Save Scenario")) {
+                    SaveEditedWaterScenario(runtimeState);
+                }
+                DrawWaterSeepageParameterTooltip(
+                    "Writes the edited state over the saved scenario, refreshes "
+                    "this animation's embedded snapshots, recompiles applied "
+                    "runs, and removes the edited copy.");
+                ImGui::SameLine();
+                if (ImGui::Button("Discard Edits")) {
+                    DiscardEditedWaterScenario(runtimeState);
+                }
+            } else {
+                ImGui::TextDisabled(
+                    "Showing the saved state. Adjusting scenario levels starts "
+                    "an edited copy automatically.");
+            }
+            if (editingOther) {
+                ImGui::TextColored(
+                    ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                    "Unsaved edits on %s will be discarded if you edit this "
+                    "scenario. Save or discard them first.",
+                    water.editedScenario->name.c_str());
+            }
+            InputTextString("New Scenario Name", &timings.newScenarioNameBuffer);
+            ImGui::SameLine();
+            const bool newNameEmpty = timings.newScenarioNameBuffer.empty();
+            if (newNameEmpty) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Save As New")) {
+                invisible_places::water::WaterScenarioDefinition definition;
+                definition.name = timings.newScenarioNameBuffer;
+                definition.id = MakeUniqueWaterScenarioId(water, definition.name);
+                const auto* viewed = ViewedWaterScenarioDefinition(water, scenarioId);
+                definition.state = viewed != nullptr ? viewed->state : saved->state;
+                water.seepageScenarios.push_back(definition);
+                water.selectedSeepageScenarioId = definition.id;
+                if (animationPath != nullptr) {
+                    animationPath->selectedWaterScenarioId = definition.id;
+                    panel.dirty = true;
+                }
+                timings.newScenarioNameBuffer.clear();
+                InvalidateWaterSeepageParams(&water);
+                runtimeState->previewRenderStateSignatureValid = false;
+                runtimeState->statusMessage =
+                    "Saved new scenario " + definition.name + " from the viewed state.";
+                runtimeState->errorMessage.clear();
+            }
+            if (newNameEmpty) {
+                ImGui::EndDisabled();
+            }
+            DrawWaterSeepageParameterTooltip(
+                "Creates a new named scenario from the currently viewed (saved "
+                "or edited) state and selects it for this animation.");
         }
         EndPanelSection();
     }

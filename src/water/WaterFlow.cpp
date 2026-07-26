@@ -5554,7 +5554,7 @@ WaterSeepageLookSettings DefaultWaterSeepageLookSettings() {
 std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
     WaterScenarioDefinition historical;
     historical.id = "pre-colonisation-wet";
-    historical.name = "Pre-Colonisation Wet";
+    historical.name = "Past/Future";
     historical.state.seepageLook = DefaultWaterSeepageLookSettings();
     historical.state.seepageLook.pattern = WaterSeepagePattern::ChaoticBloom;
     historical.state.seepageLook.baseWetness = 0.52F;
@@ -5578,7 +5578,7 @@ std::vector<WaterScenarioDefinition> DefaultWaterScenarioDefinitions() {
 
     WaterScenarioDefinition contemporary;
     contemporary.id = "contemporary-managed";
-    contemporary.name = "Contemporary Managed";
+    contemporary.name = "Current";
     contemporary.state.seepageLook = historical.state.seepageLook;
     contemporary.state.seepageLook.baseWetness = 0.20F;
     contemporary.state.seepageLook.density = 0.28F;

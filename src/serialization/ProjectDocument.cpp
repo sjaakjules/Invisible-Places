@@ -3173,6 +3173,20 @@ WaterScenarioState ParseWaterScenarioState(const json& stateJson) {
     return invisible_places::water::SanitizeWaterScenarioState(std::move(state));
 }
 
+// The seeded scenarios were renamed for the exhibition deliverables
+// (Past/Future was Pre-Colonisation Wet, Current was Contemporary Managed).
+// Ids are stable, so files carrying the old default display names pick up
+// the new ones on load; authored custom names pass through untouched.
+std::string MigrateWaterScenarioDisplayName(const std::string& scenarioId, std::string name) {
+    if (scenarioId == "pre-colonisation-wet" && name == "Pre-Colonisation Wet") {
+        return "Past/Future";
+    }
+    if (scenarioId == "contemporary-managed" && name == "Contemporary Managed") {
+        return "Current";
+    }
+    return name;
+}
+
 json SerializeWaterScenarioDefinition(const WaterScenarioDefinition& definition) {
     return json{
         {"id", definition.id},
@@ -3184,7 +3198,9 @@ json SerializeWaterScenarioDefinition(const WaterScenarioDefinition& definition)
 WaterScenarioDefinition ParseWaterScenarioDefinition(const json& definitionJson) {
     WaterScenarioDefinition definition;
     definition.id = definitionJson.value("id", definition.id);
-    definition.name = definitionJson.value("name", definition.name);
+    definition.name = MigrateWaterScenarioDisplayName(
+        definition.id,
+        definitionJson.value("name", definition.name));
     if (definitionJson.contains("state")) {
         definition.state = ParseWaterScenarioState(definitionJson.at("state"));
     }
@@ -3437,7 +3453,9 @@ json SerializeWaterScenarioTrack(const WaterScenarioTrack& track) {
 WaterScenarioTrack ParseWaterScenarioTrack(const json& trackJson) {
     WaterScenarioTrack track;
     track.scenarioId = trackJson.value("scenario_id", track.scenarioId);
-    track.scenarioName = trackJson.value("scenario_name", track.scenarioName);
+    track.scenarioName = MigrateWaterScenarioDisplayName(
+        track.scenarioId,
+        trackJson.value("scenario_name", track.scenarioName));
     if (trackJson.contains("fallback_scenario")) {
         track.fallbackScenario = ParseWaterScenarioDefinition(trackJson.at("fallback_scenario"));
     }
@@ -6429,6 +6447,10 @@ bool SaveProjectDocument(
     for (const auto& run : document.waterTimingRuns) {
         projectJson["water_timing_runs"].push_back(SerializeWaterTimingRun(run));
     }
+    if (document.tempWaterScenario.has_value()) {
+        projectJson["temp_water_scenario"] =
+            SerializeWaterScenarioDefinition(document.tempWaterScenario.value());
+    }
     for (const auto& visual : document.waterPointVisuals) {
         projectJson["water_point_visuals"].push_back(SerializePointCloudVisual(visual));
     }
@@ -6619,6 +6641,10 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.waterTimingRunSequence = projectJson->value(
         "water_timing_run_sequence",
         document.waterTimingRunSequence);
+    if (projectJson->contains("temp_water_scenario")) {
+        document.tempWaterScenario =
+            ParseWaterScenarioDefinition(projectJson->at("temp_water_scenario"));
+    }
     document.waterShowFlowTrails = projectJson->value(
         "water_show_flow_trails",
         document.waterShowFlowTrails);

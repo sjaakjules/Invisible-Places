@@ -614,7 +614,7 @@ TEST_CASE("Animation paths round-trip normalized Seepage scenario tracks", "[wat
     CHECK(loaded->selectedWaterScenarioId == "pre-colonisation-wet");
     REQUIRE(loaded->waterScenarioTracks.size() == 1U);
     const auto& loadedTrack = loaded->waterScenarioTracks.front();
-    CHECK(loadedTrack.scenarioName == "Pre-Colonisation Wet");
+    CHECK(loadedTrack.scenarioName == "Past/Future");
     REQUIRE(loadedTrack.keys.size() == 2U);
     CHECK(loadedTrack.keys.front().position == Catch::Approx(0.0F));
     CHECK(loadedTrack.keys.back().position == Catch::Approx(1.0F));
