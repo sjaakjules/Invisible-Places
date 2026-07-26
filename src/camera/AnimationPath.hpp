@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -147,6 +148,26 @@ AnimationPath BuildAnimationPathFromCameraShots(
 AnimationPathEvaluation EvaluateAnimationPath(
     const AnimationPath& path,
     float timeSeconds);
+
+// Surface-focus probing. CollectRayHitDistancesAlongRay appends the along-ray
+// distance of every point lying within perpendicularRadiusMeters of the ray
+// (direction must be normalized) and inside [minDistanceMeters,
+// maxDistanceMeters]. ResolveFirstRayHitCluster then picks the nearest depth
+// cluster holding at least minimumClusterSamples candidates so one stray
+// point floating in front of the terrain cannot claim focus; when no cluster
+// qualifies it falls back to the nearest candidate.
+void CollectRayHitDistancesAlongRay(
+    std::span<const invisible_places::io::Float3> points,
+    const std::array<float, 3>& origin,
+    const std::array<float, 3>& normalizedDirection,
+    float perpendicularRadiusMeters,
+    float minDistanceMeters,
+    float maxDistanceMeters,
+    std::vector<float>* distances);
+[[nodiscard]] std::optional<float> ResolveFirstRayHitCluster(
+    std::vector<float> distances,
+    float clusterDepthMeters,
+    std::size_t minimumClusterSamples);
 
 void MoveAnimationCameraKey(
     AnimationPath* path,

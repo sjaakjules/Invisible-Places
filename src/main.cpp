@@ -46,6 +46,12 @@ int main(int argc, char** argv) {
                 options.exportBenchmark.emplace();
             }
             options.exportBenchmark->outputDirectory = argv[++index];
+        } else if (argument == "--refocus-animation") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--refocus-animation requires an animation name.\n";
+                return 2;
+            }
+            options.refocusAnimation = argv[++index];
         } else if (!argument.starts_with("--") && dataRoot.empty()) {
             dataRoot = argument;
         } else {

@@ -19,6 +19,7 @@ struct ExportBenchmarkOptions {
 struct ApplicationRunOptions {
     std::optional<GuiSmokeOptions> guiSmoke;
     std::optional<ExportBenchmarkOptions> exportBenchmark;
+    std::optional<std::string> refocusAnimation;
 };
 
 class Application {

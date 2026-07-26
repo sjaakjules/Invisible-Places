@@ -49,6 +49,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+
+#include <nlohmann/json.hpp>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -7187,6 +7190,108 @@ std::optional<ResolvedPivot> ResolveSurfacePivot(
                           : 0.0F,
         .matchedSurface = true,
         .sampleCount = cluster.size()};
+}
+
+// Finds the distance of the first point-cloud surface along a world-space
+// ray: a coarse pass over every eligible session's pivot samples (<=65k
+// each, always resident) picks the nearest depth cluster, then a refine pass
+// over the full-resolution CPU clouds tightens it. Used to pull camera focus
+// points onto the surface instead of the orbit target that drifts far past
+// the terrain.
+std::optional<float> ProbeSurfaceDistanceAlongRay(
+    const PreviewRuntimeState& runtimeState,
+    const std::array<float, 3>& origin,
+    const std::array<float, 3>& normalizedDirection) {
+    constexpr float kCoarseRadiusMeters = 0.25F;
+    constexpr float kRefineRadiusMeters = 0.15F;
+    constexpr float kMinimumDistanceMeters = 0.25F;
+    constexpr float kMaximumDistanceMeters = 500.0F;
+    constexpr float kCoarseClusterDepthMeters = 0.75F;
+    constexpr float kRefineClusterDepthMeters = 0.30F;
+
+    const auto sessionUsable = [&](const PreviewLayerSession& session) {
+        if (session.kind != LayerKind::PointCloud ||
+            IsGeneratedWaterOverlaySession(session)) {
+            return false;
+        }
+        return IsSceneGroupedPointCloud(session)
+                   ? (IsCpuReadyAnalysisPointCloudSource(session) ||
+                      (IsCommittedDisplayPointCloudReady(runtimeState, session) &&
+                       session.offlinePointCloud != nullptr))
+                   : (session.loaded && session.visible);
+    };
+
+    std::vector<float> coarseDistances;
+    for (const auto& session : runtimeState.sessions) {
+        if (!sessionUsable(session) || session.pivotSamples.empty()) {
+            continue;
+        }
+        invisible_places::camera::CollectRayHitDistancesAlongRay(
+            session.pivotSamples,
+            origin,
+            normalizedDirection,
+            kCoarseRadiusMeters,
+            kMinimumDistanceMeters,
+            kMaximumDistanceMeters,
+            &coarseDistances);
+    }
+    const auto coarseHit = invisible_places::camera::ResolveFirstRayHitCluster(
+        std::move(coarseDistances),
+        kCoarseClusterDepthMeters,
+        2U);
+    if (!coarseHit.has_value()) {
+        return std::nullopt;
+    }
+
+    std::vector<float> refinedDistances;
+    for (const auto& session : runtimeState.sessions) {
+        if (!sessionUsable(session) || session.offlinePointCloud == nullptr) {
+            continue;
+        }
+        invisible_places::camera::CollectRayHitDistancesAlongRay(
+            session.offlinePointCloud->positions,
+            origin,
+            normalizedDirection,
+            kRefineRadiusMeters,
+            std::max(kMinimumDistanceMeters, coarseHit.value() - 1.0F),
+            coarseHit.value() + 1.0F,
+            &refinedDistances);
+    }
+    const auto refinedHit = invisible_places::camera::ResolveFirstRayHitCluster(
+        std::move(refinedDistances),
+        kRefineClusterDepthMeters,
+        4U);
+    return refinedHit.has_value() ? refinedHit : coarseHit;
+}
+
+// Moves a captured camera state's target onto the point-cloud surface along
+// the existing view ray. Direction is unchanged, so orientation derived from
+// the target stays identical; only the focus depth moves.
+bool SnapCameraStateFocusToSurface(
+    const PreviewRuntimeState& runtimeState,
+    invisible_places::camera::CameraState* state) {
+    if (state == nullptr) {
+        return false;
+    }
+    const glm::vec3 position{state->position[0], state->position[1], state->position[2]};
+    const glm::vec3 target{state->target[0], state->target[1], state->target[2]};
+    const glm::vec3 offset = target - position;
+    const float length = glm::length(offset);
+    if (length <= 1.0e-4F) {
+        return false;
+    }
+    const glm::vec3 direction = offset / length;
+    const auto hit = ProbeSurfaceDistanceAlongRay(
+        runtimeState,
+        {position.x, position.y, position.z},
+        {direction.x, direction.y, direction.z});
+    if (!hit.has_value() || std::abs(hit.value() - length) <= 0.01F) {
+        return false;
+    }
+    const glm::vec3 snapped = position + direction * hit.value();
+    state->target = {snapped.x, snapped.y, snapped.z};
+    state->focusDistance = hit.value();
+    return true;
 }
 
 bool SetCameraPivotFromScreenPoint(
@@ -21484,6 +21589,59 @@ void PropagateCameraShotToLinkedAnimationKeys(
     }
 }
 
+// Slides every key's focus point along its existing camera->focus ray onto
+// the first point-cloud surface hit. Orientation and framing are untouched
+// because hasOrientation stays false and the ray direction never changes;
+// depth of field lands on the surface because focus distance derives from
+// |focus - camera|. Linked camera shots are kept in step so a later shot
+// rename or propagation cannot reintroduce the stale far target.
+std::size_t RefocusAnimationPathKeysToSurface(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::camera::AnimationPath* path,
+    bool syncLinkedShots) {
+    if (runtimeState == nullptr || path == nullptr) {
+        return 0U;
+    }
+    std::size_t changedCount = 0U;
+    for (auto& key : path->keys) {
+        const glm::vec3 origin{
+            key.cameraPosition[0],
+            key.cameraPosition[1],
+            key.cameraPosition[2]};
+        const glm::vec3 focus{key.focusPoint[0], key.focusPoint[1], key.focusPoint[2]};
+        const glm::vec3 offset = focus - origin;
+        const float length = glm::length(offset);
+        if (length <= 1.0e-4F) {
+            continue;
+        }
+        const glm::vec3 direction = offset / length;
+        const auto hit = ProbeSurfaceDistanceAlongRay(
+            *runtimeState,
+            {origin.x, origin.y, origin.z},
+            {direction.x, direction.y, direction.z});
+        if (!hit.has_value() || std::abs(hit.value() - length) <= 0.01F) {
+            continue;
+        }
+        const glm::vec3 snapped = origin + direction * hit.value();
+        key.focusPoint = {snapped.x, snapped.y, snapped.z};
+        ++changedCount;
+        if (!syncLinkedShots || key.linkedCameraId.empty()) {
+            continue;
+        }
+        const auto shotIt = std::find_if(
+            runtimeState->cameraShots.begin(),
+            runtimeState->cameraShots.end(),
+            [&](const CameraShot& shot) { return shot.id == key.linkedCameraId; });
+        if (shotIt == runtimeState->cameraShots.end()) {
+            continue;
+        }
+        shotIt->state.target = key.focusPoint;
+        shotIt->state.focusDistance = hit.value();
+        PropagateCameraShotToLinkedAnimationKeys(runtimeState, *shotIt);
+    }
+    return changedCount;
+}
+
 void UnlinkCameraFromAnimations(PreviewRuntimeState* runtimeState, const std::string& cameraId) {
     if (runtimeState == nullptr || cameraId.empty()) {
         return;
@@ -22132,6 +22290,9 @@ void SaveCurrentCameraPathAsAnimation(PreviewRuntimeState* runtimeState) {
             : 8.0F);
     animationPath.associatedLayerPaths = VisibleAssociatedLidarLayerPaths(*runtimeState);
     animationPath.exportSettings = AnimationExportSettingsFromRenderSettings(runtimeState->renderSettings);
+    // Shots saved before surface-snapping existed can carry drifted orbit
+    // targets, so every fresh animation refocuses its keys onto the surface.
+    RefocusAnimationPathKeysToSurface(runtimeState, &animationPath, true);
     const auto outputPath = UniqueAnimationFilePathForName(*runtimeState, animationPath.name);
     animationPath.name = AnimationNameFromFilePath(outputPath);
     SaveAnimationPathToFile(runtimeState, animationPath, outputPath);
@@ -22268,6 +22429,7 @@ void SaveCurrentCameraShot(PreviewRuntimeState* runtimeState) {
                     ? NextCameraShotName(*runtimeState)
                     : runtimeState->cameraPanel.draftShotName;
     shot.state = runtimeState->camera.CaptureState();
+    SnapCameraStateFocusToSurface(*runtimeState, &shot.state);
     shot.associatedLayerPaths = VisibleAssociatedLidarLayerPaths(*runtimeState);
     runtimeState->cameraShots.push_back(std::move(shot));
 
@@ -22304,6 +22466,7 @@ bool UpdateCameraShotFromCurrentView(PreviewRuntimeState* runtimeState, std::siz
     }
 
     shot.state = runtimeState->camera.CaptureState();
+    SnapCameraStateFocusToSurface(*runtimeState, &shot.state);
     PropagateCameraShotToLinkedAnimationKeys(runtimeState, shot);
     runtimeState->cameraPlayback.active = false;
     runtimeState->animationPlayback.active = false;
@@ -34288,6 +34451,32 @@ void DrawAnimationSection(
         SaveAnimationPathToFile(runtimeState, pathToSave, outputPath);
     }
     ImGui::SameLine();
+    if (ImGui::Button("Refocus To Surface")) {
+        const auto changedCount =
+            RefocusAnimationPathKeysToSurface(runtimeState, &animationPath, true);
+        if (changedCount > 0U) {
+            panel.dirty = true;
+            runtimeState->previewRenderStateSignatureValid = false;
+            if (panel.liveApply) {
+                ApplyAnimationScrub(runtimeState);
+            }
+            runtimeState->statusMessage =
+                "Moved " + std::to_string(changedCount) +
+                (changedCount == 1U ? " focus point" : " focus points") +
+                " onto the point-cloud surface.";
+        } else {
+            runtimeState->statusMessage =
+                "Focus points already sit on the point-cloud surface.";
+        }
+        runtimeState->errorMessage.clear();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Slides each key's focus point along its existing view ray onto the "
+            "first point-cloud surface hit. Framing is unchanged; depth of "
+            "field lands on the surface. Linked cameras update too.");
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Export Houdini Camera")) {
         ExportCurrentAnimationCameraToHoudini(runtimeState);
     }
@@ -43786,6 +43975,155 @@ ExportBenchmarkResult RunOneExportBenchmarkVariant(
     return result;
 }
 
+// CLI utility mode: loads the default project's display scene, refocuses one
+// saved animation's keys onto the point-cloud surface, and saves both the
+// animation file and the project (linked camera shots live there). Backups of
+// both files are written next to the originals before anything is modified.
+int RunRefocusAnimationUtility(
+    const std::string& animationName,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        std::cerr << "Refocus mode requires a live Vulkan window and viewport.\n";
+        return 2;
+    }
+    if (!WaitForExportBenchmarkIdle(
+            window,
+            runtimeState,
+            viewport,
+            std::chrono::minutes{30})) {
+        std::cerr << "Timed out waiting for the display scene to finish loading.\n";
+        return 1;
+    }
+
+    const auto animationFilePath = AnimationFilePathForName(*runtimeState, animationName);
+    if (!std::filesystem::is_regular_file(animationFilePath)) {
+        std::cerr << "Animation file not found: " << animationFilePath.string() << "\n";
+        return 1;
+    }
+    if (!LoadAnimationPathFromFile(runtimeState, animationFilePath)) {
+        std::cerr << "Failed to load animation: " << runtimeState->errorMessage << "\n";
+        return 1;
+    }
+    auto& animationPath = runtimeState->animationPanel.currentPath.value();
+
+    const auto timestamp = []() {
+        const auto now = std::chrono::system_clock::now();
+        const auto time = std::chrono::system_clock::to_time_t(now);
+        std::tm utc{};
+        gmtime_r(&time, &utc);
+        char buffer[32];
+        std::strftime(buffer, sizeof(buffer), "%Y%m%dT%H%M%SZ", &utc);
+        return std::string{buffer};
+    }();
+    const auto backupFile = [&](const std::filesystem::path& original) {
+        auto backupPath = original;
+        backupPath += ".before_refocus." + timestamp + ".bak";
+        std::error_code copyError;
+        std::filesystem::copy_file(
+            original,
+            backupPath,
+            std::filesystem::copy_options::overwrite_existing,
+            copyError);
+        if (copyError) {
+            std::cerr << "Failed to back up " << original.string() << ": "
+                      << copyError.message() << "\n";
+            return false;
+        }
+        std::cout << "Backed up " << original.filename().string() << " -> "
+                  << backupPath.filename().string() << "\n";
+        return true;
+    };
+    const auto projectFilePath =
+        std::filesystem::path{runtimeState->persistence.projectFilePath};
+    if (!backupFile(animationFilePath) ||
+        (std::filesystem::is_regular_file(projectFilePath) && !backupFile(projectFilePath))) {
+        return 1;
+    }
+
+    std::cout << "Refocusing " << animationPath.keys.size() << " keys of '"
+              << animationPath.name << "'...\n";
+    std::vector<float> previousDistances;
+    previousDistances.reserve(animationPath.keys.size());
+    for (const auto& key : animationPath.keys) {
+        const glm::vec3 origin{
+            key.cameraPosition[0], key.cameraPosition[1], key.cameraPosition[2]};
+        const glm::vec3 focus{key.focusPoint[0], key.focusPoint[1], key.focusPoint[2]};
+        previousDistances.push_back(glm::length(focus - origin));
+    }
+    const auto changedCount =
+        RefocusAnimationPathKeysToSurface(runtimeState, &animationPath, true);
+    for (std::size_t index = 0U; index < animationPath.keys.size(); ++index) {
+        const auto& key = animationPath.keys[index];
+        const glm::vec3 origin{
+            key.cameraPosition[0], key.cameraPosition[1], key.cameraPosition[2]};
+        const glm::vec3 focus{key.focusPoint[0], key.focusPoint[1], key.focusPoint[2]};
+        std::cout << "  " << key.id << ": focus distance "
+                  << previousDistances[index] << " m -> "
+                  << glm::length(focus - origin) << " m (focus z "
+                  << key.focusPoint[2] << ")\n";
+    }
+    if (changedCount == 0U) {
+        std::cout << "All focus points already sit on the surface; nothing to save.\n";
+        return 0;
+    }
+
+    if (!SaveAnimationPathToFile(runtimeState, animationPath, animationFilePath)) {
+        std::cerr << "Failed to save animation: " << runtimeState->errorMessage << "\n";
+        return 1;
+    }
+    std::cout << "Saved " << animationFilePath.string() << "\n";
+
+    // Patch only the linked camera_shots entries in the project JSON instead
+    // of round-tripping the whole document: a headless run has not warmed
+    // flow caches or loaded every layer, and a full save would silently drop
+    // runtime-derived records such as the flow path cache manifest.
+    if (std::filesystem::is_regular_file(projectFilePath)) {
+        try {
+            std::ifstream projectInput{projectFilePath};
+            auto projectJson = nlohmann::json::parse(projectInput);
+            projectInput.close();
+            std::size_t patchedShots = 0U;
+            if (projectJson.contains("camera_shots") &&
+                projectJson.at("camera_shots").is_array()) {
+                for (auto& shotJson : projectJson.at("camera_shots")) {
+                    const auto shotId = shotJson.value("id", std::string{});
+                    const auto shotIt = std::find_if(
+                        runtimeState->cameraShots.begin(),
+                        runtimeState->cameraShots.end(),
+                        [&](const CameraShot& shot) { return shot.id == shotId; });
+                    if (shotIt == runtimeState->cameraShots.end() ||
+                        !shotJson.contains("camera")) {
+                        continue;
+                    }
+                    auto& cameraJson = shotJson.at("camera");
+                    cameraJson["target"] = {
+                        shotIt->state.target[0],
+                        shotIt->state.target[1],
+                        shotIt->state.target[2]};
+                    cameraJson["focus_distance"] = shotIt->state.focusDistance;
+                    ++patchedShots;
+                }
+            }
+            const auto temporaryPath =
+                std::filesystem::path{projectFilePath.string() + ".refocus.tmp"};
+            {
+                std::ofstream projectOutput{temporaryPath};
+                projectOutput << projectJson.dump(2) << "\n";
+            }
+            std::filesystem::rename(temporaryPath, projectFilePath);
+            std::cout << "Patched " << patchedShots
+                      << " linked camera shots in " << projectFilePath.string() << "\n";
+        } catch (const std::exception& error) {
+            std::cerr << "Failed to patch project camera shots: " << error.what() << "\n";
+            return 1;
+        }
+    }
+    std::cout << "Moved " << changedCount << " focus points onto the surface.\n";
+    return 0;
+}
+
 int RunExportCodecBenchmark(
     const ExportBenchmarkOptions& options,
     platform::Window* window,
@@ -49506,6 +49844,22 @@ int Application::Run(ApplicationRunOptions options) const {
         EnsureWaterSurfaceCacheReady(&runtimeState, &viewport.value());
     } else if (runtimeState.sessions.empty()) {
         runtimeState.errorMessage = "No point clouds or gSplats were discovered in the Data directory.";
+    }
+
+    if (options.refocusAnimation.has_value()) {
+        if (!viewport.has_value()) {
+            std::cerr << "Refocus mode requires a live Vulkan viewport.\n";
+            StopBackgroundWorkForShutdown(&runtimeState);
+            return 2;
+        }
+        const auto refocusExitCode = RunRefocusAnimationUtility(
+            options.refocusAnimation.value(),
+            &window,
+            &viewport.value(),
+            &runtimeState);
+        StopBackgroundWorkForShutdown(&runtimeState);
+        viewport->WaitIdle();
+        return refocusExitCode;
     }
 
     if (options.exportBenchmark.has_value()) {

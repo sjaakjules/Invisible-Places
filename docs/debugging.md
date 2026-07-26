@@ -95,3 +95,23 @@ Renderer: Apple M1 Max | 2880x1800 | Vulkan viewport
 ```
 
 That line means the Vulkan viewport shell initialized successfully; loaded layers should then render through the Lidar and gSplat panels.
+
+## Refocusing animation focus points onto the surface
+
+Camera focus points authored before surface snapping existed can sit far past
+the terrain (the orbit target drifts with dolly/pan). Saving a camera shot or
+saving a camera path as an animation now snaps the focus point onto the first
+point-cloud surface hit along the existing view ray, and the Animation tab's
+**Refocus To Surface** button does the same for the loaded animation's keys
+(framing is unchanged; only the focus depth moves, which also places depth of
+field on the surface). A headless utility applies it to a saved animation:
+
+```
+./build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places \
+    "$PWD/Data" --refocus-animation Exhibition
+```
+
+It loads the default project's display scene, backs up the animation file and
+the project file (`*.before_refocus.<timestamp>.bak` beside the originals),
+rewrites the animation keys, and patches only the linked `camera_shots`
+entries inside the project JSON.

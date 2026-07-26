@@ -233,6 +233,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
     if(Catch2_FOUND)
         add_executable(
             invisible_places_tests
+            tests/AnimationFocusTests.cpp
             tests/AssetDiscoveryTests.cpp
             tests/PointCloudDensityCompensationTests.cpp
             tests/PointCloudVariantsTests.cpp

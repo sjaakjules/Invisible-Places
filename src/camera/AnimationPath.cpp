@@ -651,4 +651,65 @@ void MoveAnimationFocusKey(
     path->keys[keyIndex].focusPoint = focusPoint;
 }
 
+void CollectRayHitDistancesAlongRay(
+    std::span<const invisible_places::io::Float3> points,
+    const std::array<float, 3>& origin,
+    const std::array<float, 3>& normalizedDirection,
+    float perpendicularRadiusMeters,
+    float minDistanceMeters,
+    float maxDistanceMeters,
+    std::vector<float>* distances) {
+    if (distances == nullptr || perpendicularRadiusMeters <= 0.0F ||
+        maxDistanceMeters <= minDistanceMeters) {
+        return;
+    }
+    const glm::vec3 rayOrigin{origin[0], origin[1], origin[2]};
+    const glm::vec3 rayDirection{
+        normalizedDirection[0],
+        normalizedDirection[1],
+        normalizedDirection[2]};
+    const float radiusSquared = perpendicularRadiusMeters * perpendicularRadiusMeters;
+    for (const auto& point : points) {
+        const glm::vec3 offset =
+            glm::vec3{point.x, point.y, point.z} - rayOrigin;
+        const float alongRay = glm::dot(offset, rayDirection);
+        if (alongRay < minDistanceMeters || alongRay > maxDistanceMeters) {
+            continue;
+        }
+        const glm::vec3 perpendicular = offset - rayDirection * alongRay;
+        if (glm::dot(perpendicular, perpendicular) > radiusSquared) {
+            continue;
+        }
+        distances->push_back(alongRay);
+    }
+}
+
+std::optional<float> ResolveFirstRayHitCluster(
+    std::vector<float> distances,
+    float clusterDepthMeters,
+    std::size_t minimumClusterSamples) {
+    if (distances.empty()) {
+        return std::nullopt;
+    }
+    std::sort(distances.begin(), distances.end());
+    const float clusterDepth = std::max(0.0F, clusterDepthMeters);
+    for (std::size_t index = 0U; index < distances.size(); ++index) {
+        const float clusterStart = distances[index];
+        std::size_t clusterEnd = index;
+        float clusterSum = 0.0F;
+        while (clusterEnd < distances.size() &&
+               distances[clusterEnd] - clusterStart <= clusterDepth) {
+            clusterSum += distances[clusterEnd];
+            ++clusterEnd;
+        }
+        const auto clusterCount = clusterEnd - index;
+        if (clusterCount >= minimumClusterSamples) {
+            return clusterSum / static_cast<float>(clusterCount);
+        }
+    }
+    // No dense cluster; a sparse surface (thin vegetation) still deserves the
+    // nearest candidate rather than no focus at all.
+    return distances.front();
+}
+
 }  // namespace invisible_places::camera
