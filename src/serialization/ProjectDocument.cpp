@@ -6015,10 +6015,33 @@ std::filesystem::path SceneCacheRootForWaterState(
                                          ? role.analysisSourcePath
                                          : role.displaySourcePath;
             if (!sourcePath.empty() && !sourcePath.parent_path().empty()) {
-                const auto resolvedSourcePath =
-                    sourcePath.is_absolute()
-                        ? sourcePath
-                        : (projectPath.parent_path() / sourcePath).lexically_normal();
+                auto resolvedSourcePath = sourcePath.lexically_normal();
+                if (!sourcePath.is_absolute()) {
+                    const auto projectRelativePath =
+                        (projectPath.parent_path() / sourcePath).lexically_normal();
+                    std::error_code projectRelativeError;
+                    if (std::filesystem::is_regular_file(
+                            projectRelativePath,
+                            projectRelativeError)) {
+                        resolvedSourcePath = projectRelativePath;
+                    } else {
+                        std::error_code currentWorkingDirectoryError;
+                        const auto currentWorkingDirectoryPath =
+                            std::filesystem::absolute(
+                                sourcePath,
+                                currentWorkingDirectoryError)
+                                .lexically_normal();
+                        std::error_code currentWorkingDirectoryFileError;
+                        if (!currentWorkingDirectoryError &&
+                            std::filesystem::is_regular_file(
+                                currentWorkingDirectoryPath,
+                                currentWorkingDirectoryFileError)) {
+                            resolvedSourcePath = currentWorkingDirectoryPath;
+                        } else {
+                            resolvedSourcePath = projectRelativePath;
+                        }
+                    }
+                }
                 return resolvedSourcePath.parent_path() /
                        ".invisible_places" / "cache" / "flow";
             }

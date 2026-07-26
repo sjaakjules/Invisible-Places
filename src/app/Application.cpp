@@ -269,6 +269,7 @@ struct ProjectSettings {
 };
 
 struct PersistenceState {
+    std::string projectName = "Invisible Places";
     std::string projectFilePath;
     std::string pointStylePresetPath;
     std::string animationDirectoryPath;
@@ -2372,8 +2373,12 @@ std::filesystem::path DefaultProjectFilePath(const std::filesystem::path& dataRo
     const auto savedDirectory = dataRoot.filename() == "ExhibitionScene"
                                     ? dataRoot.parent_path().parent_path() / "Saved"
                                     : dataRoot.parent_path() / "Saved";
-    const auto exhibitionProjectPath = savedDirectory / "exhibitionScene_project.json";
     std::error_code error;
+    const auto exhibitionFinalProjectPath = savedDirectory / "ExhibitionFinal_project.json";
+    if (std::filesystem::is_regular_file(exhibitionFinalProjectPath, error)) {
+        return exhibitionFinalProjectPath;
+    }
+    const auto exhibitionProjectPath = savedDirectory / "exhibitionScene_project.json";
     if (std::filesystem::is_regular_file(exhibitionProjectPath, error)) {
         return exhibitionProjectPath;
     }
@@ -19461,7 +19466,7 @@ void PropagateWaterEmittersToActiveLayer(PreviewRuntimeState* runtimeState) {
 
 ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     ProjectDocument document;
-    document.projectName = "Invisible Places";
+    document.projectName = runtimeState.persistence.projectName;
     document.backgroundColor = runtimeState.projectSettings.backgroundColor;
     document.eyeDomeLightingEnabled = runtimeState.projectSettings.eyeDomeLightingEnabled;
     document.proResAlphaPreviewEnabled = runtimeState.projectSettings.proResAlphaPreviewEnabled;
@@ -20802,6 +20807,7 @@ bool ApplyProjectDocumentToRuntime(
             " Restored cached Ripple membership: " + FormatPointCount(restoredRippleMemberships) +
             " points across " + FormatPointCount(restoredRippleRegions) + " params.";
     }
+    runtimeState->persistence.projectName = document.projectName;
     runtimeState->errorMessage.clear();
     return true;
 }

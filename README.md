@@ -174,7 +174,7 @@ The simplest path is `Debug Invisible Places App`, which builds first and runs a
 - Point-cloud PLY files are standard CloudCompare exports with RGB and optional `scalar_*` properties.
 - Multi-cloud scene folders may contain sibling role-named point clouds. `ROCK`, `SAND`, and `VEG` tokens define the role; `1mm`, `2mm`, and similar tokens define inferred point spacing in meters.
 - A display spacing is selectable only when exactly one ROCK, SAND, and VEG file exists at that spacing. Incomplete or duplicate density sets are rejected rather than mixed during switching.
-- `Data/ExhibitionScene` is the default full scene when `Saved/exhibitionScene_project.json` exists. Canonical analysis uses variants such as `Site3-ROCK-1mm.ply`, `Site3-SAND-2mm.ply`, and `Site3-VEG-1mm.ply`; complete same-spacing sets provide the selectable display densities.
+- `Data/Scene3` is the default combined full-site scene when `Saved/ExhibitionFinal_project.json` exists. Canonical analysis uses `Site3-ROCK-1mm.ply`, `Site3-SAND-2mm.ply`, and `Site3-VEG-1mm.ply`; its complete same-spacing sets provide the selectable display densities.
 - `Data/SampleScene` is the local validation fixture for the same multi-cloud contract. It contains complete `Site1-{ROCK,SAND,VEG}-{1,2,3,5}mm. SampleScene.ply` display bundles, `Site1-Mesh-SampleScene.ply`, and the 5 mm `Site1-MeshSampled-5mm-SampleScene.ply` Ground input; validation displays the 3 mm bundle, keeps canonical 1/2/1 mm paths available for on-demand analysis, and streams the complete 2 mm terrain bundle plus the scene-local sampled Ground cloud into the shared 10 mm water-surface cache.
 - Gaussian splat files are PLY files whose filename starts with `gSplat-` and whose header exposes Gaussian attributes such as `f_dc_0`, `opacity`, `scale_0`, and `rot_0`.
 - Each gSplat file is paired with a same-stem `.txt` file containing a 4x4 transform matrix.
@@ -212,6 +212,6 @@ The ExhibitionScene multi-cloud workflow was additionally validated locally on J
 - `Data/SampleScene` discovered as one grouped ROCK/SAND/VEG scene with complete `1mm`, `2mm`, `3mm`, and `5mm` density bundles.
 - `scripts/generate_sample_scene_validation.py` rebuilds `Saved/validation/SampleSceneValidation_project.json` from the durable `tests/fixtures/sample_scene_water_sources.json` objects (`SampleFlowPoint`, `SampleFlowPath`, and `SampleSeepage`) without embedding derived caches.
 - Native integration scenarios are `--gui-smoke water-integration-sample-scene` for the validation project and `--gui-smoke water-integration-scene1-top-view` for `Saved/exhibitionScene_project.json` and its `Top_View` animation.
-- `Saved/exhibitionScene_project.json` loads the ExhibitionScene project by default when present.
+- `Saved/ExhibitionFinal_project.json` loads the combined Scene3 project by default when present. Startup falls back to `Saved/exhibitionScene_project.json`, then `Saved/invisible_places_project.json`.
 - `RGB-Ghost`, `Roughness`, and `ghosted` are folder-level point visuals with density-compensated role rendering.
 - SAND shoreline waves compile through the point-cloud shader path and are covered by focused shoreline tests.

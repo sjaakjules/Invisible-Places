@@ -60,6 +60,20 @@ struct TemporaryProjectDirectory {
   std::filesystem::path path;
 };
 
+struct ScopedCurrentPath {
+  explicit ScopedCurrentPath(const std::filesystem::path &path)
+      : original(std::filesystem::current_path()) {
+    std::filesystem::current_path(path);
+  }
+
+  ~ScopedCurrentPath() {
+    std::error_code ignored;
+    std::filesystem::current_path(original, ignored);
+  }
+
+  std::filesystem::path original;
+};
+
 struct SettledFlowCacheFixture {
   invisible_places::water::WaterEmitter emitter;
   invisible_places::water::WaterPathCache cache;
@@ -414,6 +428,79 @@ TEST_CASE("Flow sidecars resolve relative scene sources beside the movable proje
   std::filesystem::rename(originalRoot, movedRoot);
   const auto loaded =
       LoadProjectDocument(movedRoot / projectPath.filename(), &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->waterSceneStates.size() == 1U);
+  REQUIRE(loaded->waterSceneStates.front().pathCache.has_value());
+  CHECK(loaded->waterSceneStates.front().pathCache->branches.size() == 1U);
+}
+
+TEST_CASE("Flow sidecars fall back to existing cwd-relative scene sources",
+          "[project][serialization][water][path-cache][sidecar][cwd-relative]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::serialization::WaterSceneStateDocument;
+
+  TemporaryProjectDirectory temporary{
+      "invisible_places_flow_sidecar_cwd_relative"};
+  const auto sceneRoot = temporary.path / "Data" / "Scene3";
+  const auto savedRoot = temporary.path / "Saved";
+  std::filesystem::create_directories(sceneRoot);
+  std::filesystem::create_directories(savedRoot);
+  const auto relativeSupport = std::filesystem::path{"."} / "Data" / "Scene3" /
+                               "Site3-ROCK-1mm.ply";
+  {
+    std::ofstream source{temporary.path / relativeSupport};
+    REQUIRE(source.is_open());
+    source << "ply\n";
+  }
+
+  auto flow = MakeSettledFlowCacheFixture();
+  flow.cache.supportLayerPath = relativeSupport;
+  WaterSceneStateDocument state;
+  state.sceneGroupName = "Scene3";
+  state.emitters = {flow.emitter};
+  state.pathCache = flow.cache;
+
+  ProjectDocument document;
+  document.projectName = "cwd-relative-flow-sidecar";
+  document.scenePointCloudGroups = {{
+      .sceneGroupName = "Scene3",
+      .roleSources = {{
+          .sceneRole = "ROCK",
+          .analysisSourcePath = relativeSupport,
+          .displaySourcePath =
+              std::filesystem::path{"."} / "Data" / "Scene3" /
+              "Site3-ROCK-3mm.ply",
+      }},
+  }};
+  document.waterSceneStates = {state};
+
+  ScopedCurrentPath currentPath{temporary.path};
+  const auto projectPath =
+      std::filesystem::path{"Saved"} / "ExhibitionFinal_project.json";
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, projectPath, &errorMessage));
+  std::ifstream savedInput{projectPath};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  const auto manifestPath = std::filesystem::path{
+      savedJson.at("water_scene_states")
+          .front()
+          .at("water_path_cache_manifest")
+          .at("relative_path")
+          .get<std::string>()};
+  CHECK_FALSE(manifestPath.is_absolute());
+  CHECK(manifestPath.lexically_normal().generic_string().starts_with(
+      "../Data/Scene3/"));
+  const auto sidecarPath = (savedRoot / manifestPath).lexically_normal();
+  CHECK(sidecarPath.parent_path() ==
+        sceneRoot / ".invisible_places" / "cache" / "flow");
+  REQUIRE(std::filesystem::is_regular_file(sidecarPath));
+  CHECK_FALSE(std::filesystem::exists(savedRoot / "Data"));
+
+  const auto loaded = LoadProjectDocument(projectPath, &errorMessage);
   INFO(errorMessage);
   REQUIRE(loaded.has_value());
   REQUIRE(loaded->waterSceneStates.size() == 1U);
