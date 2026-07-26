@@ -6325,6 +6325,8 @@ bool SaveProjectDocument(
         {"constant_update_view", document.constantUpdateView},
         {"live_visual_effects", document.liveVisualEffects},
         {"side_panel_pinned", document.sidePanelPinned},
+        {"show_lidar_tab", document.showLidarTab},
+        {"show_gsplat_tab", document.showGsplatTab},
         {"auto_lower_gsplat_quality_while_navigating", document.autoLowerGsplatQualityWhileNavigating},
         {"point_visuals", json::array()},
         {"selected_point_visual", document.selectedPointVisualName.empty() ? std::string{"Unnamed"}
@@ -6503,6 +6505,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.constantUpdateView = projectJson->value("constant_update_view", false);
     document.liveVisualEffects = projectJson->value("live_visual_effects", false);
     document.sidePanelPinned = projectJson->value("side_panel_pinned", false);
+    document.showLidarTab = projectJson->value("show_lidar_tab", false);
+    document.showGsplatTab = projectJson->value("show_gsplat_tab", false);
     document.autoLowerGsplatQualityWhileNavigating =
         projectJson->value("auto_lower_gsplat_quality_while_navigating", true);
     if (projectJson->contains("point_visuals") && projectJson->at("point_visuals").is_array()) {

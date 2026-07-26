@@ -256,7 +256,6 @@ struct ProjectSettings {
     bool eyeDomeLightingEnabled = false;
     bool proResAlphaPreviewEnabled = false;
     float eyeDomeLightingThickness = 1.0F;
-    bool showStatusOverlay = true;
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
@@ -274,6 +273,20 @@ struct PersistenceState {
     std::string pointStylePresetPath;
     std::string animationDirectoryPath;
     std::vector<QueuedLayerLoad> queuedLoads;
+};
+
+// Which controls-window tab is selected this frame. The debug window sorts
+// its per-tab section for the active tab to the top.
+enum class ControlsTab {
+    Visuals,
+    Water,
+    Camera,
+    Animation,
+    Timings,
+    Export,
+    Project,
+    Lidar,
+    Gsplat
 };
 
 struct CameraPanelState {
@@ -1620,6 +1633,12 @@ struct PreviewRuntimeState {
     std::filesystem::path waterSurfaceCacheRoot;
     invisible_places::platform::ScopedPowerAssertion exportPowerAssertion{};
     bool showDiagnosticsPanel = false;
+    // Lidar and gSplat tabs are hidden by default for the exhibition
+    // workflow; the "+" tab button re-adds them and the x on the tab hides
+    // them again. Both persist with the project.
+    bool showLidarTab = false;
+    bool showGsplatTab = false;
+    ControlsTab activeControlsTab = ControlsTab::Visuals;
     bool pauseLiveViewportDuringExport = true;
     bool previewRenderStateSignatureValid = false;
     std::uint64_t previewRenderStateSignature = 0;
@@ -19224,6 +19243,8 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.constantUpdateView = runtimeState.projectSettings.constantUpdateView;
     document.liveVisualEffects = runtimeState.projectSettings.liveVisualEffects;
     document.sidePanelPinned = runtimeState.sidePanel.pinned;
+    document.showLidarTab = runtimeState.showLidarTab;
+    document.showGsplatTab = runtimeState.showGsplatTab;
     document.autoLowerGsplatQualityWhileNavigating =
         runtimeState.projectSettings.autoLowerGsplatQualityWhileNavigating;
     document.pointCloudPreviewLodMode = PointCloudPreviewLodMode::FullResolution;
@@ -20076,6 +20097,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->projectSettings.constantUpdateView = document.constantUpdateView;
     runtimeState->projectSettings.liveVisualEffects = document.liveVisualEffects;
     runtimeState->sidePanel.pinned = document.sidePanelPinned;
+    runtimeState->showLidarTab = document.showLidarTab;
+    runtimeState->showGsplatTab = document.showGsplatTab;
     runtimeState->projectSettings.autoLowerGsplatQualityWhileNavigating =
         document.autoLowerGsplatQualityWhileNavigating;
     runtimeState->projectSettings.gsplatVisualStyle = document.gsplatVisualStyle;
@@ -28814,57 +28837,6 @@ void DrawOfflineRenderOverlay(PreviewRuntimeState* runtimeState) {
     ImGui::End();
 }
 
-void DrawStatusOverlay(const PreviewRuntimeState& runtimeState) {
-    if (!runtimeState.projectSettings.showStatusOverlay) {
-        return;
-    }
-
-    ImGui::SetNextWindowPos(ImVec2{20.0F, 20.0F}, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.88F);
-    constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
-                           ImGuiWindowFlags_NoInputs;
-    ImGui::Begin("PreviewStatusOverlay", nullptr, flags);
-
-    if (!runtimeState.errorMessage.empty()) {
-        ImGui::TextColored(ImVec4{0.74F, 0.18F, 0.14F, 1.0F}, "%s", runtimeState.errorMessage.c_str());
-    } else if (!runtimeState.statusMessage.empty()) {
-        ImGui::Text("%s", runtimeState.statusMessage.c_str());
-    }
-
-    ImGui::Separator();
-    ImGui::Text("Loaded layers: %s", FormatPointCount(LoadedLayerCount(runtimeState)).c_str());
-    ImGui::Text("Visible layers: %s", FormatPointCount(VisibleLayerCount(runtimeState)).c_str());
-
-    if (const auto* session = SelectedLoadedSession(runtimeState); session != nullptr) {
-        ImGui::Text("Selected: %s", session->displayName.c_str());
-        ImGui::Text("Kind: %s", LayerKindLabel(session->kind));
-        if (session->kind == LayerKind::PointCloud) {
-            ImGui::Text(
-                "Preview: %s",
-                DescribePointCloudPreviewDraw(runtimeState, *session).c_str());
-            ImGui::TextDisabled("LOD/downsample: disabled for normal preview.");
-            ImGui::Text("Mode: %s", PointCloudColorModeLabel(session->pointStyle.colorMode));
-        } else {
-            ImGui::Text("Mode: %s", GaussianSplatColorModeLabel(session->gsplatStyle.colorMode));
-            ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
-            const auto effectiveQuality = EffectiveGaussianSplatQualityMode(runtimeState, *session);
-            ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
-            if (effectiveQuality != session->gsplatStyle.qualityMode) {
-                ImGui::Text(
-                    "Rendering: %s while interacting",
-                    GaussianSplatQualityModeLabel(effectiveQuality));
-            }
-            ImGui::Text(
-                "Transform: %s",
-                GsplatTransformConventionLabel(runtimeState.projectSettings.gsplatTransformConvention));
-        }
-        ImGui::Text("LMB orbit  Double-click pivot  RMB/MMB pan  Wheel dolly  F focus  P set pivot  V marker");
-    }
-
-    ImGui::End();
-}
-
 void DrawPivotOverlay(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -33444,46 +33416,6 @@ bool DrawGaussianSplatStyleSection(PreviewLayerSession* session) {
     return changed;
 }
 
-void DrawStyleSection(PreviewRuntimeState* runtimeState) {
-    if (!BeginPanelSection("Style")) {
-        return;
-    }
-
-    auto* session = SelectedLoadedSession(runtimeState);
-    if (session == nullptr) {
-        ImGui::TextUnformatted("Select a loaded layer to edit lookdev.");
-        EndPanelSection();
-        return;
-    }
-    if (session->kind == LayerKind::PointCloud) {
-        if (const auto visualIndex = ResolveLoadedPointCloudLookdevIndex(*runtimeState);
-            visualIndex.has_value()) {
-            session = &runtimeState->sessions[visualIndex.value()];
-        }
-    }
-
-    if (session->kind == LayerKind::PointCloud) {
-        if (DrawPointCloudStyleSection(session)) {
-            MarkPointVisualEdited(runtimeState, session);
-            if (!IsProjectPointVisualSession(*session)) {
-                SyncScenePointVisualsFromOwner(runtimeState, session);
-            }
-            SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
-        }
-    } else {
-        const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
-        if (effectiveQuality != session->gsplatStyle.qualityMode) {
-            ImGui::TextDisabled(
-                "Rendering as %s while interacting.",
-                GaussianSplatQualityModeLabel(effectiveQuality));
-        }
-        if (DrawGaussianSplatStyleSection(session)) {
-            SyncProjectGsplatVisualStyleFromSession(runtimeState, *session);
-        }
-    }
-    EndPanelSection();
-}
-
 void DrawStillCameraExportSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -35265,63 +35197,6 @@ void DrawProjectSection(
     EndPanelSection();
 }
 
-void DrawPresetSection(PreviewRuntimeState* runtimeState, PreviewLayerSession* session) {
-    if (!BeginPanelSection("Presets")) {
-        return;
-    }
-
-    InputTextString("Point Style Preset", &runtimeState->persistence.pointStylePresetPath);
-
-    if (session == nullptr || session->kind != LayerKind::PointCloud) {
-        ImGui::TextUnformatted("Select a point cloud layer to save or load a point style preset.");
-        EndPanelSection();
-        return;
-    }
-
-    if (ImGui::Button("Save Point Style")) {
-        PointCloudStylePresetDocument presetDocument;
-        presetDocument.presetName = session->displayName + " Style";
-        presetDocument.style = session->pointStyle;
-
-        std::string errorMessage;
-        if (invisible_places::serialization::SavePointCloudStylePreset(
-                presetDocument,
-                runtimeState->persistence.pointStylePresetPath,
-                &errorMessage)) {
-            runtimeState->statusMessage =
-                "Saved point style preset to " + runtimeState->persistence.pointStylePresetPath + ".";
-            runtimeState->errorMessage.clear();
-        } else {
-            runtimeState->errorMessage = errorMessage;
-            runtimeState->statusMessage.clear();
-        }
-    }
-
-    ImGui::SameLine();
-    if (ImGui::Button("Load Point Style")) {
-        std::string errorMessage;
-        const auto presetDocument = invisible_places::serialization::LoadPointCloudStylePreset(
-            runtimeState->persistence.pointStylePresetPath,
-            &errorMessage);
-        if (!presetDocument.has_value()) {
-            runtimeState->errorMessage = errorMessage;
-            runtimeState->statusMessage.clear();
-        } else {
-            session->pointStyle = presetDocument->style;
-            SanitizePointCloudStyle(session);
-            MarkPointVisualEdited(runtimeState, session);
-            if (!IsProjectPointVisualSession(*session)) {
-                SyncScenePointVisualsFromOwner(runtimeState, session);
-            }
-            SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
-            runtimeState->statusMessage =
-                "Loaded point style preset from " + runtimeState->persistence.pointStylePresetPath + ".";
-            runtimeState->errorMessage.clear();
-        }
-    }
-    EndPanelSection();
-}
-
 PreviewLayerSession* DrawLoadedPointCloudLookdevSelector(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr) {
         return nullptr;
@@ -35835,7 +35710,6 @@ void DrawVisualsPanel(
         }
         SyncWaterPointVisualSelectionFromSession(runtimeState, *session);
     }
-    DrawPresetSection(runtimeState, session);
 }
 
 void DrawGsplatPanel(
@@ -40532,7 +40406,6 @@ void DrawProjectPanel(
             ImGui::SetTooltip("Expands the eye-dome depth sampling radius for thicker, cartoon-like outlines.");
         }
     }
-    ImGui::Checkbox("Show Status Overlay", &settings.showStatusOverlay);
     ImGui::Checkbox("Constant Update View", &settings.constantUpdateView);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Keeps re-rendering the 3D preview even when camera and visual settings are unchanged.");
@@ -40584,63 +40457,118 @@ ImVec2 DefaultControlsWindowPosition(ImVec2 controlsSize) {
     return position;
 }
 
-void DrawRenderInfoSection(
+void DrawDebugGeneralSection(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell& viewport) {
-    if (runtimeState == nullptr) {
-        return;
-    }
+    const auto& diagnostics = viewport.Diagnostics();
+    const auto viewportSize = CurrentUiViewportSize(viewport);
 
-    if (BeginPanelSection("Render Info")) {
-        if (!runtimeState->errorMessage.empty()) {
-            ImGui::TextColored(ImVec4{0.74F, 0.18F, 0.14F, 1.0F}, "%s", runtimeState->errorMessage.c_str());
-        } else if (!runtimeState->statusMessage.empty()) {
-            ImGui::TextWrapped("%s", runtimeState->statusMessage.c_str());
-        } else {
-            ImGui::TextDisabled("Ready.");
+    if (BeginPanelSection("Renderer")) {
+        ImGui::Text(
+            "GPU: %s",
+            diagnostics.rendererName.empty() ? "Unknown" : diagnostics.rendererName.c_str());
+        if (!diagnostics.driverName.empty()) {
+            ImGui::Text("Driver: %s", diagnostics.driverName.c_str());
         }
-
-        const auto& diagnostics = viewport.Diagnostics();
-        const auto viewportSize = CurrentUiViewportSize(viewport);
         ImGui::Text(
             "Render window: %.0f x %.0f UI, %u x %u framebuffer",
             viewportSize.x,
             viewportSize.y,
             viewport.Width(),
             viewport.Height());
-        if (!diagnostics.rendererName.empty()) {
-            ImGui::Text("GPU: %s", diagnostics.rendererName.c_str());
-        }
-        if (diagnostics.pointCount > 0) {
-            ImGui::Text("Layer draw target: %s", FormatPointCount(diagnostics.pointCount).c_str());
+        ImGui::Text(
+            "Accumulation: %u x %u",
+            diagnostics.accumulationWidth,
+            diagnostics.accumulationHeight);
+        if (diagnostics.framesInFlight > 0U) {
             ImGui::Text(
-                "Last render submitted: %s",
-                FormatPointCount(diagnostics.pointSubmittedCount).c_str());
-            if (diagnostics.pointPassSubmittedCount > diagnostics.pointSubmittedCount) {
-                ImGui::Text(
-                    "Pass submissions: %s",
-                    FormatPointCount(diagnostics.pointPassSubmittedCount).c_str());
-            }
-            ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
-            ImGui::Text("Point renderer: %s", PointCloudRendererModeLabel(runtimeState->projectSettings.pointCloudRendererMode));
-            if (!diagnostics.pointRenderModes.empty()) {
-                ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
-            }
-            ImGui::TextDisabled("Off-screen points are currently clipped by the GPU after submission.");
+                "Frames: %u in flight, %u swapchain images, current %u",
+                diagnostics.framesInFlight,
+                diagnostics.swapchainImageCount,
+                diagnostics.currentFrameIndex);
         }
-        ImGui::Separator();
-        ImGui::Checkbox("Diagnostics", &runtimeState->showDiagnosticsPanel);
         ImGui::Checkbox("Pause 3D View During Export", &runtimeState->pauseLiveViewportDuringExport);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Keeps the controls responsive while skipping live scene rendering during MP4/EXR exports.");
-        }
-        if (runtimeState->offlineRenderJob.active && runtimeState->pauseLiveViewportDuringExport) {
-            ImGui::TextDisabled("3D view paused while export renders.");
-        }
         EndPanelSection();
     }
 
-    if (BeginPanelSection("Layers")) {
+    if (BeginPanelSection("Frame Timing")) {
+        ImGui::Text(
+            "Render frame: %.3f ms (%.1f FPS)",
+            diagnostics.frameRenderMs,
+            diagnostics.frameFps);
+        ImGui::Text(
+            "%.1fs average: %.3f ms (%.1f FPS)",
+            diagnostics.frameAverageWindowSeconds,
+            diagnostics.averageFrameRenderMs,
+            diagnostics.averageFrameFps);
+        ImGui::Text(
+            "Min / max while open: %.3f / %.3f ms",
+            diagnostics.minFrameRenderMs,
+            diagnostics.maxFrameRenderMs);
+        ImGui::Separator();
+        ImGui::Text("UI render: %.3f ms", diagnostics.frameUiRenderMs);
+        ImGui::Text("Fence wait: %.3f ms", diagnostics.frameFenceWaitMs);
+        ImGui::Text("Prepare uniforms/resources: %.3f ms", diagnostics.framePrepareMs);
+        ImGui::Text("Acquire image: %.3f ms", diagnostics.frameAcquireMs);
+        ImGui::Text("Acquired image wait: %.3f ms", diagnostics.frameImageWaitMs);
+        ImGui::Text("Command buffer: %.3f ms", diagnostics.frameCommandBufferMs);
+        ImGui::Text("Queue submit: %.3f ms", diagnostics.frameSubmitMs);
+        ImGui::Text("Present: %.3f ms", diagnostics.framePresentMs);
+        ImGui::Text("Platform windows: %.3f ms", diagnostics.framePlatformWindowsMs);
+        EndPanelSection();
+    }
+}
+
+void DrawDebugVisualsSection(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (!BeginPanelSection("Visuals")) {
+        return;
+    }
+    const auto& diagnostics = viewport.Diagnostics();
+    ImGui::Text(
+        "Point renderer: %s",
+        PointCloudRendererModeLabel(runtimeState->projectSettings.pointCloudRendererMode));
+    ImGui::Text("Layer draw target: %s", FormatPointCount(diagnostics.pointCount).c_str());
+    ImGui::Text(
+        "Last render submitted: %s",
+        FormatPointCount(diagnostics.pointSubmittedCount).c_str());
+    ImGui::Text(
+        "Pass submissions: %s",
+        FormatPointCount(diagnostics.pointPassSubmittedCount).c_str());
+    ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
+    if (!diagnostics.pointRenderModes.empty()) {
+        ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
+    }
+    ImGui::Text(
+        "Point draws: %u (%u depth, %u material)",
+        diagnostics.pointDrawCalls,
+        diagnostics.pointDepthLayerCount,
+        diagnostics.pointAccumulationLayerCount);
+    ImGui::Text(
+        "Material variants: %u opaque, %u simple, %u unified",
+        diagnostics.pointOpaqueHardDiscDrawCalls,
+        diagnostics.pointConstantSimpleDrawCalls,
+        diagnostics.pointUnifiedDrawCalls);
+    if (diagnostics.pointFastBasicDrawCalls > 0) {
+        ImGui::Text(
+            "Fast Basic: %u draws, %s points",
+            diagnostics.pointFastBasicDrawCalls,
+            FormatPointCount(diagnostics.pointFastBasicDrawnPoints).c_str());
+    }
+    ImGui::Text("Style uploads: %u", diagnostics.pointStyleUploadCount);
+    ImGui::Text("Inactive bindings skipped: %u", diagnostics.pointSkippedInactiveBindings);
+    ImGui::Text("Command record: %.3f ms", diagnostics.pointCommandRecordMs);
+    ImGui::Text(
+        "Preview cache: %s",
+        diagnostics.sceneCacheActive
+            ? (diagnostics.sceneRenderedThisFrame ? "refreshing" : "cached")
+            : "off");
+    EndPanelSection();
+}
+
+void DrawDebugLidarSection(PreviewRuntimeState* runtimeState) {
+    if (BeginPanelSection("Lidar Layers")) {
         ImGui::Text("Loaded layers: %s", FormatPointCount(LoadedLayerCount(*runtimeState)).c_str());
         ImGui::Text("Visible layers: %s", FormatPointCount(VisibleLayerCount(*runtimeState)).c_str());
         if (const auto* session = SelectedLoadedSession(*runtimeState); session != nullptr) {
@@ -40650,24 +40578,15 @@ void DrawRenderInfoSection(
                 ImGui::Text(
                     "Preview: %s",
                     DescribePointCloudPreviewDraw(*runtimeState, *session).c_str());
-                ImGui::TextDisabled("LOD/downsample: disabled for normal preview.");
-            } else {
-                const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
-                ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
-                if (effectiveQuality != session->gsplatStyle.qualityMode) {
-                    ImGui::Text("Rendering: %s while interacting", GaussianSplatQualityModeLabel(effectiveQuality));
-                }
-                ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
             }
         }
         EndPanelSection();
     }
-
     if (runtimeState->pendingLoad.has_value()) {
-        const auto& pendingLoad = runtimeState->pendingLoad.value();
         if (!BeginPanelSection("Layer Load")) {
             return;
         }
+        const auto& pendingLoad = runtimeState->pendingLoad.value();
         if (pendingLoad.sessionIndex < runtimeState->sessions.size()) {
             const auto& session = runtimeState->sessions[pendingLoad.sessionIndex];
             ImGui::Text("%s", session.displayName.c_str());
@@ -40680,57 +40599,170 @@ void DrawRenderInfoSection(
             FormatElapsedTime(elapsed).c_str());
         EndPanelSection();
     }
+}
 
+void DrawDebugGsplatSection(PreviewRuntimeState* runtimeState) {
+    if (!BeginPanelSection("gSplat")) {
+        return;
+    }
+    const auto* session = SelectedLoadedSessionOfKind(runtimeState, LayerKind::GaussianSplat);
+    if (session == nullptr) {
+        ImGui::TextDisabled("No gSplat layer is loaded and selected.");
+        EndPanelSection();
+        return;
+    }
+    const auto effectiveQuality = EffectiveGaussianSplatQualityMode(*runtimeState, *session);
+    ImGui::Text("Selected: %s", session->displayName.c_str());
+    ImGui::Text("Quality: %s", GaussianSplatQualityModeLabel(session->gsplatStyle.qualityMode));
+    if (effectiveQuality != session->gsplatStyle.qualityMode) {
+        ImGui::Text("Rendering: %s while interacting", GaussianSplatQualityModeLabel(effectiveQuality));
+    }
+    ImGui::Text("Debug: %s", GaussianSplatDebugModeLabel(session->gsplatStyle.debugMode));
+    ImGui::Text(
+        "Convention: %s",
+        GsplatTransformConventionLabel(runtimeState->projectSettings.gsplatTransformConvention));
+    EndPanelSection();
+}
+
+void DrawDebugWaterSection(PreviewRuntimeState* runtimeState) {
+    if (!BeginPanelSection("Water")) {
+        return;
+    }
+    const auto& water = runtimeState->water;
+    const auto scenarioName = ActiveWaterScenarioDisplayName(*runtimeState);
+    ImGui::Text(
+        "Scenario: %s",
+        scenarioName.empty() ? "Authored Node Looks" : scenarioName.c_str());
+    ImGui::Text(
+        "Seepage nodes: %zu   Flow sources: %zu   Manual paths: %zu",
+        water.seepageNodes.size(),
+        water.emitters.size(),
+        water.manualFlowPaths.size());
+    ImGui::Text(
+        "Rain: %s (level %.2f)   Mesh Flow: %s   Flow trails: %s",
+        water.collisionRainSettings.enabled ? "on" : "off",
+        water.collisionRainSettings.rainLevel,
+        water.dynamicMeshFlowSettings.enabled ? "on" : "off",
+        water.showFlowTrails ? "shown" : "hidden");
+    ImGui::Text("Timing runs: %zu", water.timingRuns.size());
+    EndPanelSection();
+}
+
+void DrawDebugCameraSection(PreviewRuntimeState* runtimeState) {
+    if (!BeginPanelSection("Camera")) {
+        return;
+    }
+    const auto target = runtimeState->camera.Target();
+    const auto pivot = runtimeState->camera.OrbitCenter();
+    ImGui::Text("Target: %.3f  %.3f  %.3f", target.x, target.y, target.z);
+    ImGui::Text("Pivot: %.3f  %.3f  %.3f", pivot.x, pivot.y, pivot.z);
+    ImGui::Text("Distance: %.3f", runtimeState->camera.Distance());
+    ImGui::Text("FOV: %.1f", runtimeState->camera.FovDegrees());
+    ImGui::Text(
+        "Planes: %.4f near, %.1f far",
+        runtimeState->camera.NearPlane(),
+        runtimeState->camera.FarPlane());
+    ImGui::Text("Shots: %zu", runtimeState->cameraShots.size());
+    EndPanelSection();
+}
+
+void DrawDebugAnimationSection(PreviewRuntimeState* runtimeState) {
+    if (!BeginPanelSection("Animation")) {
+        return;
+    }
+    const auto& panel = runtimeState->animationPanel;
+    if (!panel.currentPath.has_value()) {
+        ImGui::TextDisabled("No animation is loaded.");
+        EndPanelSection();
+        return;
+    }
+    const auto& path = panel.currentPath.value();
+    ImGui::Text(
+        "%s: %zu keys, %u frames (%.1f s)%s",
+        path.name.c_str(),
+        path.keys.size(),
+        path.durationFrames,
+        AnimationDurationSeconds(path),
+        panel.dirty ? "  [modified]" : "");
+    ImGui::Text(
+        "Position: %.4f   Live apply: %s   Playback: %s",
+        panel.scrubAmount,
+        panel.liveApply ? "on" : "off",
+        runtimeState->animationPlayback.active ? "playing" : "stopped");
+    EndPanelSection();
+}
+
+void DrawDebugTimingsSection(PreviewRuntimeState* runtimeState) {
+    if (!BeginPanelSection("Timings")) {
+        return;
+    }
+    const auto& panel = runtimeState->animationPanel;
+    ImGui::Text("Timing runs in project: %zu", runtimeState->water.timingRuns.size());
+    if (!panel.currentPath.has_value()) {
+        ImGui::TextDisabled("No animation is loaded.");
+        EndPanelSection();
+        return;
+    }
+    for (const auto& track : panel.currentPath->waterScenarioTracks) {
+        ImGui::Text(
+            "%s: %zu keys, %zu runs, %zu node tracks",
+            track.scenarioName.empty() ? track.scenarioId.c_str() : track.scenarioName.c_str(),
+            track.keys.size(),
+            track.timingAssignments.size(),
+            track.seepageNodeTracks.size());
+    }
+    ImGui::Text(
+        "Envelopes: %zu seepage samples, %zu mesh flow samples",
+        panel.seepageRainEnvelopeCache.samples.size(),
+        panel.meshFlowRainEnvelopeCache.samples.size());
+    EndPanelSection();
+}
+
+void DrawDebugExportSection(PreviewRuntimeState* runtimeState) {
+    if (!BeginPanelSection("Export")) {
+        return;
+    }
     auto& job = runtimeState->offlineRenderJob;
-    if (job.active) {
-        RefreshAnimationExportWriterProgress(&job);
-        const char* sectionLabel = OfflineRenderJobOverlayLabel(job);
-        if (!BeginPanelSection(sectionLabel)) {
-            return;
-        }
-        if (job.preparingExport && job.preparationState != nullptr) {
-            std::size_t completedRequests = 0;
-            std::size_t totalRequests = 0;
-            std::string currentLayerName;
-            {
-                std::scoped_lock lock(job.preparationState->mutex);
-                completedRequests = job.preparationState->completedRequests;
-                totalRequests = job.preparationState->totalRequests;
-                currentLayerName = job.preparationState->currentLayerName;
-            }
-            const float prepareProgress = totalRequests == 0
-                                              ? 0.0F
-                                              : static_cast<float>(completedRequests) /
-                                                    static_cast<float>(totalRequests);
-            ImGui::ProgressBar(prepareProgress, ImVec2{-FLT_MIN, 0.0F});
-            ImGui::Text("Preparing samples %zu / %zu", completedRequests, totalRequests);
-            if (!currentLayerName.empty()) {
-                ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
-            }
-        } else {
-            const float frameProgress = ExportRenderProgressFraction(job);
-            ImGui::ProgressBar(frameProgress, ImVec2{-FLT_MIN, 0.0F});
-            ImGui::Text(
-                "Captured %u / %zu, saved %u, queued %zu",
-                std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
-                job.frames.size(),
-                std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
-                job.pendingFrameCount);
-            DrawExportTimingSummary(job);
-        }
-        ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
+    if (!job.active) {
+        ImGui::TextDisabled("No export job is running.");
         if (!job.lastOutputPath.empty()) {
             ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
         }
-        if (!job.exportLog.path.empty()) {
-            ImGui::TextWrapped("Log: %s", job.exportLog.path.string().c_str());
-        }
-        ImGui::Checkbox("Pause 3D View", &runtimeState->pauseLiveViewportDuringExport);
-        if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
-            RequestOfflineRenderCancellation(&job);
-        }
         EndPanelSection();
+        return;
     }
+    RefreshAnimationExportWriterProgress(&job);
+    if (job.preparingExport && job.preparationState != nullptr) {
+        std::size_t completedRequests = 0;
+        std::size_t totalRequests = 0;
+        std::string currentLayerName;
+        {
+            std::scoped_lock lock(job.preparationState->mutex);
+            completedRequests = job.preparationState->completedRequests;
+            totalRequests = job.preparationState->totalRequests;
+            currentLayerName = job.preparationState->currentLayerName;
+        }
+        ImGui::Text("Preparing samples %zu / %zu", completedRequests, totalRequests);
+        if (!currentLayerName.empty()) {
+            ImGui::TextWrapped("Layer: %s", currentLayerName.c_str());
+        }
+    } else {
+        ImGui::Text(
+            "Captured %u / %zu, saved %u, queued %zu",
+            std::min<std::uint32_t>(job.currentFrame, static_cast<std::uint32_t>(job.frames.size())),
+            job.frames.size(),
+            std::min<std::uint32_t>(job.writtenFrameCount, static_cast<std::uint32_t>(job.frames.size())),
+            job.pendingFrameCount);
+        DrawExportTimingSummary(job);
+    }
+    ImGui::Text("Elapsed: %s", FormatElapsedTime(std::chrono::steady_clock::now() - job.startedAt).c_str());
+    if (!job.lastOutputPath.empty()) {
+        ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
+    }
+    if (!job.exportLog.path.empty()) {
+        ImGui::TextWrapped("Log: %s", job.exportLog.path.string().c_str());
+    }
+    EndPanelSection();
 }
 
 void DrawDiagnosticsWindow(
@@ -40741,102 +40773,67 @@ void DrawDiagnosticsWindow(
     }
 
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2{460.0F, 520.0F}, ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Renderer Diagnostics", &open, ImGuiWindowFlags_NoCollapse)) {
-        const auto& diagnostics = viewport.Diagnostics();
-        const auto viewportSize = CurrentUiViewportSize(viewport);
-
-        if (BeginPanelSection("Renderer")) {
-            ImGui::Text(
-                "GPU: %s",
-                diagnostics.rendererName.empty() ? "Unknown" : diagnostics.rendererName.c_str());
-            if (!diagnostics.driverName.empty()) {
-                ImGui::Text("Driver: %s", diagnostics.driverName.c_str());
-            }
-            ImGui::Text(
-                "Render window: %.0f x %.0f UI, %u x %u framebuffer",
-                viewportSize.x,
-                viewportSize.y,
-                viewport.Width(),
-                viewport.Height());
-            ImGui::Text(
-                "Accumulation: %u x %u",
-                diagnostics.accumulationWidth,
-                diagnostics.accumulationHeight);
-            if (diagnostics.framesInFlight > 0U) {
-                ImGui::Text(
-                    "Frames: %u in flight, %u swapchain images, current %u",
-                    diagnostics.framesInFlight,
-                    diagnostics.swapchainImageCount,
-                    diagnostics.currentFrameIndex);
-            }
-            EndPanelSection();
+    ImGui::SetNextWindowSize(ImVec2{460.0F, 560.0F}, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Debug", &open, ImGuiWindowFlags_NoCollapse)) {
+        if (!runtimeState->errorMessage.empty()) {
+            ImGui::TextColored(ImVec4{0.74F, 0.18F, 0.14F, 1.0F}, "%s", runtimeState->errorMessage.c_str());
+        } else if (!runtimeState->statusMessage.empty()) {
+            ImGui::TextWrapped("%s", runtimeState->statusMessage.c_str());
+        } else {
+            ImGui::TextDisabled("Ready.");
         }
+        ImGui::Separator();
 
-        if (BeginPanelSection("Frame Timing")) {
-            ImGui::Text(
-                "Render frame: %.3f ms (%.1f FPS)",
-                diagnostics.frameRenderMs,
-                diagnostics.frameFps);
-            ImGui::Text(
-                "%.1fs average: %.3f ms (%.1f FPS)",
-                diagnostics.frameAverageWindowSeconds,
-                diagnostics.averageFrameRenderMs,
-                diagnostics.averageFrameFps);
-            ImGui::Text(
-                "Min / max while open: %.3f / %.3f ms",
-                diagnostics.minFrameRenderMs,
-                diagnostics.maxFrameRenderMs);
-            ImGui::Separator();
-            ImGui::Text("UI render: %.3f ms", diagnostics.frameUiRenderMs);
-            ImGui::Text("Fence wait: %.3f ms", diagnostics.frameFenceWaitMs);
-            ImGui::Text("Prepare uniforms/resources: %.3f ms", diagnostics.framePrepareMs);
-            ImGui::Text("Acquire image: %.3f ms", diagnostics.frameAcquireMs);
-            ImGui::Text("Acquired image wait: %.3f ms", diagnostics.frameImageWaitMs);
-            ImGui::Text("Command buffer: %.3f ms", diagnostics.frameCommandBufferMs);
-            ImGui::Text("Queue submit: %.3f ms", diagnostics.frameSubmitMs);
-            ImGui::Text("Present: %.3f ms", diagnostics.framePresentMs);
-            ImGui::Text("Platform windows: %.3f ms", diagnostics.framePlatformWindowsMs);
-            EndPanelSection();
-        }
+        const auto drawSection = [&](ControlsTab tab) {
+            switch (tab) {
+                case ControlsTab::Visuals:
+                    DrawDebugVisualsSection(runtimeState, viewport);
+                    return;
+                case ControlsTab::Water:
+                    DrawDebugWaterSection(runtimeState);
+                    return;
+                case ControlsTab::Camera:
+                    DrawDebugCameraSection(runtimeState);
+                    return;
+                case ControlsTab::Animation:
+                    DrawDebugAnimationSection(runtimeState);
+                    return;
+                case ControlsTab::Timings:
+                    DrawDebugTimingsSection(runtimeState);
+                    return;
+                case ControlsTab::Export:
+                    DrawDebugExportSection(runtimeState);
+                    return;
+                case ControlsTab::Lidar:
+                    DrawDebugLidarSection(runtimeState);
+                    return;
+                case ControlsTab::Gsplat:
+                    DrawDebugGsplatSection(runtimeState);
+                    return;
+                case ControlsTab::Project:
+                    return;
+            }
+        };
 
-        if (BeginPanelSection("Point Clouds")) {
-            ImGui::Text("Layer draw target: %s", FormatPointCount(diagnostics.pointCount).c_str());
-            ImGui::Text(
-                "Last render submitted: %s",
-                FormatPointCount(diagnostics.pointSubmittedCount).c_str());
-            ImGui::Text(
-                "Pass submissions: %s",
-                FormatPointCount(diagnostics.pointPassSubmittedCount).c_str());
-            ImGui::Text("Average point size: %.2f px", diagnostics.averagePointSizePx);
-            if (!diagnostics.pointRenderModes.empty()) {
-                ImGui::TextWrapped("Point modes: %s", diagnostics.pointRenderModes.c_str());
+        // The active controls tab reads first; everything else follows in a
+        // fixed order so the window stays scannable.
+        const auto activeTab = runtimeState->activeControlsTab;
+        drawSection(activeTab);
+        DrawDebugGeneralSection(runtimeState, viewport);
+        constexpr std::array<ControlsTab, 8> kDebugSectionOrder{{
+            ControlsTab::Visuals,
+            ControlsTab::Water,
+            ControlsTab::Camera,
+            ControlsTab::Animation,
+            ControlsTab::Timings,
+            ControlsTab::Export,
+            ControlsTab::Lidar,
+            ControlsTab::Gsplat,
+        }};
+        for (const auto tab : kDebugSectionOrder) {
+            if (tab != activeTab) {
+                drawSection(tab);
             }
-            ImGui::Text(
-                "Point draws: %u (%u depth, %u material)",
-                diagnostics.pointDrawCalls,
-                diagnostics.pointDepthLayerCount,
-                diagnostics.pointAccumulationLayerCount);
-            ImGui::Text(
-                "Material variants: %u opaque, %u simple, %u unified",
-                diagnostics.pointOpaqueHardDiscDrawCalls,
-                diagnostics.pointConstantSimpleDrawCalls,
-                diagnostics.pointUnifiedDrawCalls);
-            if (diagnostics.pointFastBasicDrawCalls > 0) {
-                ImGui::Text(
-                    "Fast Basic: %u draws, %s points",
-                    diagnostics.pointFastBasicDrawCalls,
-                    FormatPointCount(diagnostics.pointFastBasicDrawnPoints).c_str());
-            }
-            ImGui::Text("Style uploads: %u", diagnostics.pointStyleUploadCount);
-            ImGui::Text("Inactive bindings skipped: %u", diagnostics.pointSkippedInactiveBindings);
-            ImGui::Text("Command record: %.3f ms", diagnostics.pointCommandRecordMs);
-            ImGui::Text(
-                "Preview cache: %s",
-                diagnostics.sceneCacheActive
-                    ? (diagnostics.sceneRenderedThisFrame ? "refreshing" : "cached")
-                    : "off");
-            EndPanelSection();
         }
     }
     ImGui::End();
@@ -41725,35 +41722,16 @@ void DrawControlsWindow(
 
     constexpr ImGuiWindowFlags tabScrollFlags = ImGuiWindowFlags_AlwaysVerticalScrollbar;
     if (ImGui::BeginTabBar("ScenePanelTabs")) {
-        if (ImGui::BeginTabItem("Info")) {
-            if (ImGui::BeginChild("InfoTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
-                DrawRenderInfoSection(runtimeState, *viewport);
-            }
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Lidar")) {
-            if (ImGui::BeginChild("LidarTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
-                DrawLidarPanel(runtimeState, viewport);
-            }
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Visuals")) {
+            runtimeState->activeControlsTab = ControlsTab::Visuals;
             if (ImGui::BeginChild("VisualsTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawVisualsPanel(runtimeState, viewport);
             }
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("gSplat")) {
-            if (ImGui::BeginChild("GsplatTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
-                DrawGsplatPanel(runtimeState, viewport);
-            }
-            ImGui::EndChild();
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Water")) {
+            runtimeState->activeControlsTab = ControlsTab::Water;
             if (ImGui::BeginChild("WaterTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawWaterPanel(runtimeState, viewport);
             }
@@ -41761,6 +41739,7 @@ void DrawControlsWindow(
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Camera")) {
+            runtimeState->activeControlsTab = ControlsTab::Camera;
             if (ImGui::BeginChild("CameraTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawCameraSection(runtimeState, *viewport);
             }
@@ -41768,6 +41747,7 @@ void DrawControlsWindow(
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Animation")) {
+            runtimeState->activeControlsTab = ControlsTab::Animation;
             if (ImGui::BeginChild("AnimationTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawAnimationSection(runtimeState, *viewport);
             }
@@ -41775,6 +41755,7 @@ void DrawControlsWindow(
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Timings")) {
+            runtimeState->activeControlsTab = ControlsTab::Timings;
             if (ImGui::BeginChild("TimingsTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawTimingsPanel(runtimeState);
             }
@@ -41782,6 +41763,7 @@ void DrawControlsWindow(
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Export")) {
+            runtimeState->activeControlsTab = ControlsTab::Export;
             if (ImGui::BeginChild("ExportTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawExportPanel(runtimeState, viewport);
             }
@@ -41789,11 +41771,40 @@ void DrawControlsWindow(
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Project")) {
+            runtimeState->activeControlsTab = ControlsTab::Project;
             if (ImGui::BeginChild("ProjectTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawProjectPanel(runtimeState, viewport);
             }
             ImGui::EndChild();
             ImGui::EndTabItem();
+        }
+        if (runtimeState->showLidarTab &&
+            ImGui::BeginTabItem("Lidar", &runtimeState->showLidarTab)) {
+            runtimeState->activeControlsTab = ControlsTab::Lidar;
+            if (ImGui::BeginChild("LidarTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
+                DrawLidarPanel(runtimeState, viewport);
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (runtimeState->showGsplatTab &&
+            ImGui::BeginTabItem("gSplat", &runtimeState->showGsplatTab)) {
+            runtimeState->activeControlsTab = ControlsTab::Gsplat;
+            if (ImGui::BeginChild("GsplatTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
+                DrawGsplatPanel(runtimeState, viewport);
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
+            ImGui::OpenPopup("ControlsAddTabs");
+        }
+        if (ImGui::BeginPopup("ControlsAddTabs")) {
+            ImGui::MenuItem("Lidar", nullptr, &runtimeState->showLidarTab);
+            ImGui::MenuItem("gSplat", nullptr, &runtimeState->showGsplatTab);
+            ImGui::Separator();
+            ImGui::MenuItem("Debug Window", nullptr, &runtimeState->showDiagnosticsPanel);
+            ImGui::EndPopup();
         }
         ImGui::EndTabBar();
     }

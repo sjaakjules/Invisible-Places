@@ -166,6 +166,8 @@ struct ProjectDocument {
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
     bool sidePanelPinned = false;
+    bool showLidarTab = false;
+    bool showGsplatTab = false;
     bool autoLowerGsplatQualityWhileNavigating = true;
     float eyeDomeLightingThickness = 1.0F;
     invisible_places::renderer::pointcloud::PointCloudPreviewLodMode pointCloudPreviewLodMode =
