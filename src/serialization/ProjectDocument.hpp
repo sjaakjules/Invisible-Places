@@ -19,9 +19,9 @@
 namespace invisible_places::serialization {
 
 inline constexpr std::size_t kMaxSerializedWaterRippleRuntimeCacheMemberships = 250'000U;
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 45U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 46U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 19U;
-inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 12U;
+inline constexpr std::uint32_t kAnimationDocumentSchemaVersion = 13U;
 inline constexpr std::uint32_t kWaterPathCacheSidecarSchemaVersion = 1U;
 inline constexpr std::uint64_t kMaximumPersistedWaterCacheBytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -184,6 +184,8 @@ struct ProjectDocument {
     std::vector<invisible_places::water::WaterSeepageLookProfile> waterSeepageLookProfiles;
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
     std::string selectedWaterScenarioId;
+    std::vector<invisible_places::water::WaterTimingRun> waterTimingRuns;
+    std::uint32_t waterTimingRunSequence = 1U;
     std::vector<invisible_places::water::WaterEffectLayer> waterRippleLayers;
     invisible_places::water::WaterSourceSettings waterSourceSettings{};
     std::optional<invisible_places::water::WaterSourceSettings> tempWaterSourceSettings;

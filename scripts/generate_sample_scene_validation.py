@@ -322,7 +322,7 @@ def authored_state(
 
 
 def migrate_main_project(project: dict[str, Any]) -> dict[str, Any]:
-    project["schema_version"] = 45
+    project["schema_version"] = 46
     upgrade_water_contract(project, project=True)
     state = authored_state(project, required=False)
     if state is not None:
@@ -535,7 +535,7 @@ def build_validation_project(
     project: dict[str, Any], fixture: dict[str, Any]
 ) -> dict[str, Any]:
     validation = copy.deepcopy(project)
-    validation["schema_version"] = 45
+    validation["schema_version"] = 46
     upgrade_water_contract(validation, project=True)
     validation["project_name"] = "SampleScene Validation"
     validation["active_water_scene_group"] = "SampleScene"

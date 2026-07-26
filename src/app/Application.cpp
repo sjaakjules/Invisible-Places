@@ -444,6 +444,20 @@ struct AnimationPlaybackState {
     std::chrono::steady_clock::time_point startedAt{};
 };
 
+struct TimingsPanelState {
+    std::optional<std::size_t> selectedRunIndex;
+    std::optional<std::size_t> selectedKeyIndex;
+    std::optional<std::size_t> renamingRunIndex;
+    std::string runRenameBuffer;
+    bool focusRunRename = false;
+    std::optional<std::size_t> pendingRunDeleteIndex;
+    int newRunFeatureIndex = 2;  // WaterTimingFeature::Rain
+    bool pendingClearCompiledKeys = false;
+    // Scenario the armed Clear confirmation belongs to; a scenario or
+    // animation switch must not let a stale confirmation clear a new track.
+    std::string pendingClearScenarioId;
+};
+
 struct AnimationExportFramePayload {
     std::uint32_t outputFrameIndex = 0;
     invisible_places::output::HalfRgbaExrImage image{};
@@ -1374,6 +1388,11 @@ struct WaterWorkflowState {
     std::vector<invisible_places::water::WaterScenarioDefinition> seepageScenarios =
         invisible_places::water::DefaultWaterScenarioDefinitions();
     std::string selectedSeepageScenarioId;
+    std::vector<invisible_places::water::WaterTimingRun> timingRuns;
+    // Monotonic run-id source persisted with the project so deleted run ids
+    // are never reissued to a later run — animations on disk keep referencing
+    // run ids, and a reused id would silently rebind their timing.
+    std::uint32_t nextTimingRunSequence = 1U;
     std::string seepageLookNameBuffer = "Default";
     std::vector<WaterEffectLayer> rippleLayers;
     std::vector<WaterEffectLayer> fieldLayers;
@@ -1607,6 +1626,7 @@ struct PreviewRuntimeState {
     CameraPlaybackState cameraPlayback{};
     AnimationPanelState animationPanel{};
     AnimationPlaybackState animationPlayback{};
+    TimingsPanelState timingsPanel{};
     std::vector<CameraShot> cameraShots;
     RenderJobSettings renderSettings{};
     OfflineRenderJobState offlineRenderJob{};
@@ -1893,6 +1913,41 @@ void ApplyWaterFlowSourceActivityToStyle(
         water,
         session.waterFlowSourceId,
         scenarioState);
+}
+
+// Shoreline waves are authored point style, so the scenario's keyed level
+// scales the per-frame style copy only — authored layer styles are never
+// mutated and no rebuild or upload happens when the level changes.
+void ApplyWaterShorelineLevelToStyle(
+    const std::optional<invisible_places::water::WaterScenarioState>& scenarioState,
+    PointCloudStyleState* style) {
+    if (style == nullptr || !style->shorelineWaveEnabled ||
+        !scenarioState.has_value()) {
+        return;
+    }
+    const float level = std::clamp(scenarioState->shorelineLevel, 0.0F, 1.0F);
+    if (level >= 1.0F) {
+        return;
+    }
+    if (level <= 1.0e-5F) {
+        style->shorelineWaveEnabled = false;
+        return;
+    }
+    style->shorelineIntensity *= level;
+    style->shorelineEmissionAdd *= level;
+    style->shorelineOpacityAdd *= level;
+    style->shorelinePointSizeAdd *= level;
+    style->shorelineColourMix *= level;
+    style->shorelineOpacityMultiply = std::lerp(1.0F, style->shorelineOpacityMultiply, level);
+    style->shorelinePointSizeMultiply = std::lerp(1.0F, style->shorelinePointSizeMultiply, level);
+    auto& foam = style->shorelineHeightFoam;
+    foam.intensity *= level;
+    foam.emissionAdd *= level;
+    foam.opacityAdd *= level;
+    foam.pointSizeAdd *= level;
+    foam.colourMix *= level;
+    foam.opacityMultiply = std::lerp(1.0F, foam.opacityMultiply, level);
+    foam.pointSizeMultiply = std::lerp(1.0F, foam.pointSizeMultiply, level);
 }
 
 std::string ActiveWaterScenarioDisplayName(const PreviewRuntimeState& runtimeState) {
@@ -3817,6 +3872,10 @@ std::size_t ApplyWaterTrailLiveVisualProfile(
 WaterOverlay WaterPathAnchorsFromCacheWithProfileSettings(
     const PreviewRuntimeState& runtimeState);
 void DrawWaterSeepageParameterTooltip(const char* text);
+bool RecompileWaterTimingTracks(
+    WaterWorkflowState* water,
+    invisible_places::camera::AnimationPath* animationPath);
+void RecompileWaterTimingTracksForAnimation(PreviewRuntimeState* runtimeState);
 bool DrawWaterSeepageLookControls(WaterSeepageLookSettings* look);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
 std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
@@ -19548,6 +19607,8 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.waterSeepageLookProfiles = runtimeState.water.seepageLookProfiles;
     document.waterScenarios = runtimeState.water.seepageScenarios;
     document.selectedWaterScenarioId = runtimeState.water.selectedSeepageScenarioId;
+    document.waterTimingRuns = runtimeState.water.timingRuns;
+    document.waterTimingRunSequence = runtimeState.water.nextTimingRunSequence;
     document.waterRippleLayers = runtimeState.water.rippleLayers;
     document.waterFieldLayers = runtimeState.water.fieldLayers;
     document.waterFlowTrailSettings = runtimeState.water.flowTrailSettings;
@@ -20382,6 +20443,10 @@ bool ApplyProjectDocumentToRuntime(
         ? invisible_places::water::DefaultWaterScenarioDefinitions()
         : document.waterScenarios;
     runtimeState->water.selectedSeepageScenarioId = document.selectedWaterScenarioId;
+    runtimeState->water.timingRuns = document.waterTimingRuns;
+    runtimeState->water.nextTimingRunSequence = document.waterTimingRunSequence;
+    runtimeState->timingsPanel = TimingsPanelState{};
+    RecompileWaterTimingTracksForAnimation(runtimeState);
     runtimeState->water.rippleLayers = document.waterRippleLayers;
     runtimeState->water.fieldLayers = document.waterFieldLayers;
     runtimeState->water.flowTrailSettings = document.waterFlowTrailSettings;
@@ -22105,6 +22170,11 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
         runtimeState->animationPanel.currentPath->keys.empty() ? std::nullopt : std::optional<std::size_t>{0};
     runtimeState->animationPanel.scrubAmount = 0.0F;
     runtimeState->animationPanel.previewDepthOfField = false;
+    // Applied timing runs may have changed in the project library since this
+    // animation was last saved; recompiling here keeps playback in sync and
+    // the dirty flag reset below keeps a plain load unmodified.
+    RecompileWaterTimingTracksForAnimation(runtimeState);
+    runtimeState->timingsPanel = TimingsPanelState{};
     runtimeState->animationPanel.dirty = false;
     SyncWaterAnimationTrailProfileFromCurrentAnimation(runtimeState);
     ApplyWaterPointVisualStyleToGeneratedSessions(runtimeState);
@@ -22700,6 +22770,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             session,
             activeWaterScenario,
             &style);
+        ApplyWaterShorelineLevelToStyle(activeWaterScenario, &style);
         std::vector<invisible_places::water::WaterRippleRuntimeMembership> rippleMemberships;
         std::vector<invisible_places::water::WaterRippleRuntimeParams> rippleParams;
         BuildOfflineRippleRuntimeForSession(
@@ -23148,6 +23219,10 @@ BuildAnimationExportPointCloudLayerSnapshot(
             session,
             activeWaterScenario,
             &exportStyle);
+        // The keyed shoreline level is deliberately NOT baked here: this
+        // snapshot lives for the whole export job, and the level is applied
+        // per frame in BuildPointCloudExrRenderState from the frozen
+        // per-frame water state so it animates during export.
         const auto effectiveStyle =
             fastBasicRenderer
                 ? MakeEffectiveFastBasicStyle(
@@ -23254,6 +23329,13 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                 job.frozenDynamicMeshFlowSettings.showTrails
                     ? activity
                     : 0.0F;
+        }
+    }
+    if (waterFrame.rawScenarioState.has_value()) {
+        // Keyed shoreline evaluates per exported frame on the copied layer
+        // styles, matching preview; the job snapshot keeps the authored level.
+        for (auto& layer : renderState.pointCloudLayers) {
+            ApplyWaterShorelineLevelToStyle(waterFrame.rawScenarioState, &layer.style);
         }
     }
 
@@ -26965,6 +27047,9 @@ void StartSelectedQuickMp4Batch(
         EmbedAnimationWaterScenarioFallbacks(
             &animationPath,
             runtimeState->water.seepageScenarios);
+        // Batch exports load animations without the panel's load path, so
+        // applied timing runs recompile here against the current library.
+        RecompileWaterTimingTracks(&runtimeState->water, &animationPath);
         RemoveUnexportableVisualNames(&animationPath);
         if (animationPath.keys.size() < 2U || animationPath.exportVisualNames.empty()) {
             ++panel.quickMp4QueueSkipped;
@@ -34812,6 +34897,12 @@ void DrawAnimationSection(
         if (animationPath.selectedWaterScenarioId.empty()) {
             ImGui::TextDisabled("Choose a project scenario to create normalized water keys.");
         } else {
+            if (currentTrack != nullptr && !currentTrack->timingAssignments.empty()) {
+                ImGui::TextColored(
+                    ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                    "This track is compiled from Timings runs; manual key edits "
+                    "here are replaced whenever its runs recompile.");
+            }
             if (currentTrack != nullptr && !currentTrack->keys.empty() &&
                 ImGui::BeginListBox("Water Keys", ImVec2{-FLT_MIN, 92.0F})) {
                 for (std::size_t index = 0U; index < currentTrack->keys.size(); ++index) {
@@ -34969,6 +35060,15 @@ void DrawAnimationSection(
                 DrawWaterSeepageParameterTooltip(
                     "Global Flow activity captured at this key. It reveals a stable subset of "
                     "prebuilt trails and changes their appearance without rebuilding geometry.");
+                keyStateChanged |= ImGui::SliderFloat(
+                    "Key Shoreline Level",
+                    &activeSelectedKey.state.shorelineLevel,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                DrawWaterSeepageParameterTooltip(
+                    "Shoreline wave strength captured at this key. It scales the authored "
+                    "SAND boundary-wave style non-destructively; zero hides the waves.");
                 keyStateChanged |= ImGui::SliderFloat(
                     "Key Mesh Flow Level",
                     &activeSelectedKey.state.meshFlowLevel,
@@ -35385,6 +35485,9 @@ void DrawAnimationSection(
                     animationPath.waterScenarioTracks.push_back(sourceTrack);
                 }
             }
+            // Copied tracks may carry timing assignments authored against an
+            // older run library; recompile them against the current one.
+            RecompileWaterTimingTracks(&runtimeState->water, &animationPath);
             panel.selectedWaterKeyIndex.reset();
             panel.dirty = true;
             InvalidateWaterSeepageParams(&runtimeState->water);
@@ -41185,6 +41288,765 @@ void DrawDiagnosticsWindow(
     runtimeState->showDiagnosticsPanel = open;
 }
 
+constexpr std::array<invisible_places::water::WaterTimingFeature, 5U> kWaterTimingFeatureOrder{{
+    invisible_places::water::WaterTimingFeature::Shoreline,
+    invisible_places::water::WaterTimingFeature::Seepage,
+    invisible_places::water::WaterTimingFeature::Rain,
+    invisible_places::water::WaterTimingFeature::Flow,
+    invisible_places::water::WaterTimingFeature::MeshFlow,
+}};
+
+invisible_places::water::WaterTimingRun* FindWaterTimingRunById(
+    WaterWorkflowState* water,
+    const std::string& runId) {
+    if (water == nullptr || runId.empty()) {
+        return nullptr;
+    }
+    const auto found = std::find_if(
+        water->timingRuns.begin(),
+        water->timingRuns.end(),
+        [&](const invisible_places::water::WaterTimingRun& candidate) {
+            return candidate.id == runId;
+        });
+    return found != water->timingRuns.end() ? &*found : nullptr;
+}
+
+std::uint32_t WaterTimingRunIdSuffix(const std::string& runId) {
+    constexpr std::string_view kPrefix = "timing_run_";
+    if (runId.size() <= kPrefix.size() || runId.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return 0U;
+    }
+    std::uint32_t suffix = 0U;
+    for (std::size_t index = kPrefix.size(); index < runId.size(); ++index) {
+        const char character = runId[index];
+        if (character < '0' || character > '9') {
+            return 0U;
+        }
+        suffix = suffix * 10U + static_cast<std::uint32_t>(character - '0');
+    }
+    return suffix;
+}
+
+std::string MakeUniqueWaterTimingRunId(WaterWorkflowState* water) {
+    if (water == nullptr) {
+        return "timing_run_1";
+    }
+    for (const auto& run : water->timingRuns) {
+        water->nextTimingRunSequence = std::max(
+            water->nextTimingRunSequence,
+            WaterTimingRunIdSuffix(run.id) + 1U);
+    }
+    return "timing_run_" + std::to_string(water->nextTimingRunSequence++);
+}
+
+std::string MakeUniqueWaterTimingKeyId(const invisible_places::water::WaterTimingRun& run) {
+    std::size_t suffix = run.keys.size() + 1U;
+    std::string id;
+    do {
+        id = "key_" + std::to_string(suffix++);
+    } while (std::any_of(
+        run.keys.begin(),
+        run.keys.end(),
+        [&](const invisible_places::water::WaterTimingKey& candidate) {
+            return candidate.id == id;
+        }));
+    return id;
+}
+
+bool WaterTimingCompiledKeysEquivalent(
+    const std::vector<invisible_places::water::WaterScenarioKey>& left,
+    const std::vector<invisible_places::water::WaterScenarioKey>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    constexpr float kTolerance = 1.0e-5F;
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        if (a.interpolation != b.interpolation ||
+            std::abs(a.position - b.position) > kTolerance ||
+            std::abs(a.state.seepageLevel - b.state.seepageLevel) > kTolerance ||
+            std::abs(a.state.rainLevel - b.state.rainLevel) > kTolerance ||
+            std::abs(a.state.flowLevel - b.state.flowLevel) > kTolerance ||
+            std::abs(a.state.shorelineLevel - b.state.shorelineLevel) > kTolerance ||
+            std::abs(a.state.meshFlowLevel - b.state.meshFlowLevel) > kTolerance ||
+            std::abs(a.state.seepageSpread - b.state.seepageSpread) > kTolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Recompiles every timing-assigned track of one animation against the current
+// run library. Returns true when any track's compiled keys actually changed.
+// Base-state-only differences (for example an edited scenario look) evaluate
+// identically at the driven channels and intentionally do not count.
+bool RecompileWaterTimingTracks(
+    WaterWorkflowState* water,
+    invisible_places::camera::AnimationPath* animationPath) {
+    if (water == nullptr || animationPath == nullptr) {
+        return false;
+    }
+    bool changed = false;
+    for (auto& track : animationPath->waterScenarioTracks) {
+        if (track.timingAssignments.empty()) {
+            continue;
+        }
+        const auto* definition = FindWaterScenarioDefinition(*water, track.scenarioId);
+        const auto& baseState = definition != nullptr
+                                    ? definition->state
+                                    : track.fallbackScenario.state;
+        std::vector<invisible_places::water::WaterTimingRun> runs;
+        runs.reserve(track.timingAssignments.size());
+        for (auto& assignment : track.timingAssignments) {
+            const auto* libraryRun = FindWaterTimingRunById(water, assignment.runId);
+            if (libraryRun != nullptr) {
+                assignment.feature = libraryRun->feature;
+                assignment.runName = libraryRun->name;
+                assignment.fallbackRun = *libraryRun;
+                runs.push_back(*libraryRun);
+            } else {
+                runs.push_back(assignment.fallbackRun);
+            }
+        }
+        auto compiled = invisible_places::water::CompileWaterTimingScenarioKeys(
+            baseState,
+            runs);
+        if (!WaterTimingCompiledKeysEquivalent(track.keys, compiled)) {
+            changed = true;
+        }
+        track.keys = std::move(compiled);
+    }
+    return changed;
+}
+
+void RecompileWaterTimingTracksForAnimation(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || !runtimeState->animationPanel.currentPath.has_value()) {
+        return;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (!RecompileWaterTimingTracks(&runtimeState->water, &panel.currentPath.value())) {
+        return;
+    }
+    panel.selectedWaterKeyIndex.reset();
+    panel.dirty = true;
+    InvalidateWaterSeepageParams(&runtimeState->water);
+    runtimeState->previewRenderStateSignatureValid = false;
+}
+
+bool WaterTimingRunAppliedToCurrentAnimation(
+    const PreviewRuntimeState& runtimeState,
+    const std::string& runId) {
+    if (!runtimeState.animationPanel.currentPath.has_value() || runId.empty()) {
+        return false;
+    }
+    for (const auto& track : runtimeState.animationPanel.currentPath->waterScenarioTracks) {
+        for (const auto& assignment : track.timingAssignments) {
+            if (assignment.runId == runId) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& water = runtimeState->water;
+    auto& panel = runtimeState->animationPanel;
+    auto& timings = runtimeState->timingsPanel;
+
+    if (timings.selectedRunIndex.has_value() &&
+        timings.selectedRunIndex.value() >= water.timingRuns.size()) {
+        timings.selectedRunIndex.reset();
+        timings.selectedKeyIndex.reset();
+    }
+
+    AnimationPath* animationPath =
+        panel.currentPath.has_value() ? &panel.currentPath.value() : nullptr;
+
+    if (BeginPanelSection("Linked Animation")) {
+        if (animationPath == nullptr) {
+            ImGui::TextDisabled(
+                "Load an animation in the Animation tab to link timing runs. "
+                "Runs can still be authored below.");
+        } else {
+            const float durationSeconds =
+                std::max(0.0F, AnimationDurationSeconds(*animationPath));
+            ImGui::Text(
+                "%s  (%u frames, %.1f s)",
+                animationPath->name.c_str(),
+                animationPath->durationFrames,
+                durationSeconds);
+            const auto* selectedScenarioDefinition = FindWaterScenarioDefinition(
+                water,
+                animationPath->selectedWaterScenarioId);
+            const auto selectedScenarioName = WaterScenarioDisplayName(
+                water.seepageScenarios,
+                *animationPath);
+            const char* selectedScenarioLabel =
+                animationPath->selectedWaterScenarioId.empty()
+                    ? "Authored Node Looks"
+                    : selectedScenarioName.c_str();
+            const bool scenarioComboOpen = ImGui::BeginCombo(
+                "Water Scenario##Timings",
+                selectedScenarioLabel);
+            DrawWaterSeepageParameterTooltip(
+                "Timing runs compile into this animation's water track for one "
+                "project scenario, so a 'now' and a 'future' scenario can carry "
+                "different runs over the same camera move.");
+            if (scenarioComboOpen) {
+                const bool authoredSelected = animationPath->selectedWaterScenarioId.empty();
+                if (ImGui::Selectable("Authored Node Looks", authoredSelected)) {
+                    animationPath->selectedWaterScenarioId.clear();
+                    water.selectedSeepageScenarioId.clear();
+                    panel.selectedWaterKeyIndex.reset();
+                    panel.dirty = true;
+                    InvalidateWaterSeepageParams(&water);
+                }
+                for (const auto& scenario : water.seepageScenarios) {
+                    const bool selected =
+                        animationPath->selectedWaterScenarioId == scenario.id;
+                    if (ImGui::Selectable(scenario.name.c_str(), selected)) {
+                        animationPath->selectedWaterScenarioId = scenario.id;
+                        water.selectedSeepageScenarioId = scenario.id;
+                        panel.selectedWaterKeyIndex.reset();
+                        panel.dirty = true;
+                        InvalidateWaterSeepageParams(&water);
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (!animationPath->selectedWaterScenarioId.empty() &&
+                selectedScenarioDefinition == nullptr) {
+                ImGui::TextColored(
+                    ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                    "Linked project scenario is missing; timing runs compile "
+                    "against the animation's embedded snapshot.");
+            }
+            float scrub = panel.scrubAmount;
+            if (ImGui::SliderFloat("Position##Timings", &scrub, 0.0F, 1.0F, "%.4f")) {
+                panel.scrubAmount = std::clamp(scrub, 0.0F, 1.0F);
+                if (panel.liveApply) {
+                    ApplyAnimationScrub(runtimeState);
+                }
+            }
+            DrawWaterSeepageParameterTooltip(
+                "Normalized 0..1 position along the animation. Timing keys use "
+                "the same normalized space, so duration edits never move them.");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%.2f s", panel.scrubAmount * durationSeconds);
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Timing Runs")) {
+        DrawWaterSeepageParameterTooltip(
+            "A run is a reusable keyed sequence for one water feature. Keep "
+            "alternative takes side by side, apply one per feature below, and "
+            "delete the options you decide against.");
+        timings.newRunFeatureIndex = std::clamp(
+            timings.newRunFeatureIndex,
+            0,
+            static_cast<int>(kWaterTimingFeatureOrder.size()) - 1);
+        const auto featureComboLabel = invisible_places::water::WaterTimingFeatureLabel(
+            kWaterTimingFeatureOrder[static_cast<std::size_t>(timings.newRunFeatureIndex)]);
+        ImGui::SetNextItemWidth(140.0F);
+        if (ImGui::BeginCombo("##TimingRunFeature", featureComboLabel)) {
+            for (std::size_t index = 0U; index < kWaterTimingFeatureOrder.size(); ++index) {
+                const bool selected =
+                    timings.newRunFeatureIndex == static_cast<int>(index);
+                if (ImGui::Selectable(
+                        invisible_places::water::WaterTimingFeatureLabel(
+                            kWaterTimingFeatureOrder[index]),
+                        selected)) {
+                    timings.newRunFeatureIndex = static_cast<int>(index);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New Run")) {
+            invisible_places::water::WaterTimingRun run;
+            run.id = MakeUniqueWaterTimingRunId(&water);
+            run.feature = kWaterTimingFeatureOrder[
+                static_cast<std::size_t>(timings.newRunFeatureIndex)];
+            run.name = std::string{
+                invisible_places::water::WaterTimingFeatureLabel(run.feature)} +
+                " Run " + std::to_string(water.timingRuns.size() + 1U);
+            water.timingRuns.push_back(std::move(run));
+            timings.selectedRunIndex = water.timingRuns.size() - 1U;
+            timings.selectedKeyIndex.reset();
+            timings.pendingRunDeleteIndex.reset();
+        }
+
+        if (water.timingRuns.empty()) {
+            ImGui::TextDisabled("No timing runs yet. Create one to key a water feature.");
+        } else if (ImGui::BeginListBox("Runs", ImVec2{-FLT_MIN, 112.0F})) {
+            for (std::size_t index = 0U; index < water.timingRuns.size(); ++index) {
+                const auto& run = water.timingRuns[index];
+                ImGui::PushID(static_cast<int>(index));
+                const bool applied = WaterTimingRunAppliedToCurrentAnimation(
+                    *runtimeState,
+                    run.id);
+                const auto label = std::string{"["} +
+                    invisible_places::water::WaterTimingFeatureLabel(run.feature) +
+                    "] " + run.name + "  (" + std::to_string(run.keys.size()) +
+                    (run.keys.size() == 1U ? " key)" : " keys)") +
+                    (applied ? "  [applied]" : "");
+                const bool selected = timings.selectedRunIndex.has_value() &&
+                                      timings.selectedRunIndex.value() == index;
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    timings.selectedRunIndex = index;
+                    timings.selectedKeyIndex.reset();
+                    timings.pendingRunDeleteIndex.reset();
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndListBox();
+        }
+
+        if (timings.selectedRunIndex.has_value()) {
+            auto& run = water.timingRuns[timings.selectedRunIndex.value()];
+            // Duplicating grows the run vector, so anything read after that
+            // button must go through this stable copy, not the reference.
+            const std::string selectedRunId = run.id;
+            if (InputTextString("Run Name", &run.name) &&
+                WaterTimingRunAppliedToCurrentAnimation(*runtimeState, selectedRunId)) {
+                RecompileWaterTimingTracksForAnimation(runtimeState);
+            }
+            if (ImGui::Button("Duplicate Run")) {
+                auto duplicate = run;
+                duplicate.id = MakeUniqueWaterTimingRunId(&water);
+                duplicate.name += " Copy";
+                water.timingRuns.push_back(std::move(duplicate));
+                timings.selectedRunIndex = water.timingRuns.size() - 1U;
+                timings.selectedKeyIndex.reset();
+            }
+            ImGui::SameLine();
+            const bool runApplied = WaterTimingRunAppliedToCurrentAnimation(
+                *runtimeState,
+                selectedRunId);
+            const bool confirmingDelete = timings.pendingRunDeleteIndex.has_value() &&
+                                          timings.pendingRunDeleteIndex.value() ==
+                                              timings.selectedRunIndex.value();
+            if (ImGui::Button(confirmingDelete ? "Confirm Delete" : "Delete Run")) {
+                if (runApplied && !confirmingDelete) {
+                    timings.pendingRunDeleteIndex = timings.selectedRunIndex;
+                } else {
+                    water.timingRuns.erase(
+                        water.timingRuns.begin() +
+                        static_cast<std::ptrdiff_t>(timings.selectedRunIndex.value()));
+                    if (animationPath != nullptr) {
+                        bool clearedTrack = false;
+                        for (auto& track : animationPath->waterScenarioTracks) {
+                            const auto removed = std::erase_if(
+                                track.timingAssignments,
+                                [&](const auto& assignment) {
+                                    return assignment.runId == selectedRunId;
+                                });
+                            // Recompile skips assignment-free tracks, so a
+                            // track that just lost its only run sheds its
+                            // compiled keys here instead of freezing them.
+                            if (removed > 0U && track.timingAssignments.empty()) {
+                                track.keys.clear();
+                                clearedTrack = true;
+                            }
+                        }
+                        RecompileWaterTimingTracksForAnimation(runtimeState);
+                        if (clearedTrack) {
+                            panel.selectedWaterKeyIndex.reset();
+                            panel.dirty = true;
+                            InvalidateWaterSeepageParams(&water);
+                            runtimeState->previewRenderStateSignatureValid = false;
+                        }
+                    }
+                    timings.selectedRunIndex.reset();
+                    timings.selectedKeyIndex.reset();
+                    timings.pendingRunDeleteIndex.reset();
+                }
+            }
+            if (confirmingDelete) {
+                ImGui::TextColored(
+                    ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                    "Run is applied to the loaded animation. Deleting also "
+                    "removes its assignment.");
+            }
+        }
+        EndPanelSection();
+    }
+
+    if (timings.selectedRunIndex.has_value() && BeginPanelSection("Keys")) {
+        auto& run = water.timingRuns[timings.selectedRunIndex.value()];
+        const float durationSeconds = animationPath != nullptr
+                                          ? std::max(0.001F, AnimationDurationSeconds(*animationPath))
+                                          : 0.0F;
+        const bool runApplied = WaterTimingRunAppliedToCurrentAnimation(
+            *runtimeState,
+            run.id);
+        const auto touchRun = [&]() {
+            if (runApplied) {
+                RecompileWaterTimingTracksForAnimation(runtimeState);
+            }
+        };
+        const auto addKeyAtScrub = [&](float level) {
+            invisible_places::water::WaterTimingKey key;
+            key.id = MakeUniqueWaterTimingKeyId(run);
+            key.position = std::clamp(panel.scrubAmount, 0.0F, 1.0F);
+            key.level = level;
+            invisible_places::water::AddOrUpdateWaterTimingKey(&run, std::move(key));
+            const auto selectedIt = std::find_if(
+                run.keys.begin(),
+                run.keys.end(),
+                [&](const auto& candidate) {
+                    return std::abs(candidate.position - panel.scrubAmount) <= 0.0001F;
+                });
+            timings.selectedKeyIndex = selectedIt != run.keys.end()
+                                           ? std::optional<std::size_t>{static_cast<std::size_t>(
+                                                 std::distance(run.keys.begin(), selectedIt))}
+                                           : std::nullopt;
+            touchRun();
+        };
+
+        if (ImGui::Button("Key Off (0)")) {
+            addKeyAtScrub(0.0F);
+        }
+        DrawWaterSeepageParameterTooltip(
+            "Adds a key with level zero at the current animation position, "
+            "turning the feature off from here.");
+        ImGui::SameLine();
+        if (ImGui::Button("Key Half (0.5)")) {
+            addKeyAtScrub(0.5F);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Key Full (1)")) {
+            addKeyAtScrub(1.0F);
+        }
+        DrawWaterSeepageParameterTooltip(
+            "Adds a key with full level at the current animation position. "
+            "Adjust the exact level on the selected key below.");
+
+        if (timings.selectedKeyIndex.has_value() &&
+            timings.selectedKeyIndex.value() >= run.keys.size()) {
+            timings.selectedKeyIndex.reset();
+        }
+        if (!run.keys.empty() &&
+            ImGui::BeginListBox("Run Keys", ImVec2{-FLT_MIN, 92.0F})) {
+            for (std::size_t index = 0U; index < run.keys.size(); ++index) {
+                const auto& key = run.keys[index];
+                ImGui::PushID(static_cast<int>(index));
+                auto label = std::to_string(index + 1U) + "  t=" +
+                             FormatFixed(key.position, 4);
+                if (animationPath != nullptr) {
+                    label += "  (" + FormatFixed(key.position * durationSeconds, 2) + " s)";
+                }
+                label += "  level " + FormatFixed(key.level, 2);
+                const bool selected = timings.selectedKeyIndex.has_value() &&
+                                      timings.selectedKeyIndex.value() == index;
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    timings.selectedKeyIndex = index;
+                    panel.scrubAmount = key.position;
+                    if (panel.liveApply) {
+                        ApplyAnimationScrub(runtimeState);
+                    }
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndListBox();
+        }
+
+        if (timings.selectedKeyIndex.has_value()) {
+            auto& selectedKey = run.keys[timings.selectedKeyIndex.value()];
+            bool keyEdited = false;
+            float position = selectedKey.position;
+            if (ImGui::SliderFloat("Key Position", &position, 0.0F, 1.0F, "%.4f")) {
+                selectedKey.position = std::clamp(position, 0.0F, 1.0F);
+                keyEdited = true;
+            }
+            if (animationPath != nullptr) {
+                float keyTimeSeconds = selectedKey.position * durationSeconds;
+                if (ImGui::InputFloat("Key Time (s)", &keyTimeSeconds, 0.1F, 1.0F, "%.2f")) {
+                    selectedKey.position = std::clamp(
+                        keyTimeSeconds / durationSeconds,
+                        0.0F,
+                        1.0F);
+                    keyEdited = true;
+                }
+            }
+            if (ImGui::SliderFloat("Key Level", &selectedKey.level, 0.0F, 1.0F, "%.2f")) {
+                keyEdited = true;
+            }
+            DrawWaterSeepageParameterTooltip(
+                "Feature level at this key: zero is off, one is full strength. "
+                "Values interpolate toward the next key.");
+            constexpr std::array<invisible_places::water::WaterScenarioInterpolation, 3> modes{{
+                invisible_places::water::WaterScenarioInterpolation::Smooth,
+                invisible_places::water::WaterScenarioInterpolation::Linear,
+                invisible_places::water::WaterScenarioInterpolation::Hold,
+            }};
+            const auto interpolationLabel = [](auto mode) {
+                switch (mode) {
+                    case invisible_places::water::WaterScenarioInterpolation::Smooth:
+                        return "Smooth";
+                    case invisible_places::water::WaterScenarioInterpolation::Linear:
+                        return "Linear";
+                    case invisible_places::water::WaterScenarioInterpolation::Hold:
+                        return "Hold";
+                }
+                return "Smooth";
+            };
+            const bool interpolationOpen = ImGui::BeginCombo(
+                "Outgoing Interpolation##TimingKey",
+                interpolationLabel(selectedKey.interpolation));
+            DrawWaterSeepageParameterTooltip(
+                "Controls the segment from this key to the next. Smooth eases "
+                "both ends, Linear changes uniformly, and Hold retains this "
+                "level until the next key.");
+            if (interpolationOpen) {
+                for (const auto mode : modes) {
+                    const bool selected = selectedKey.interpolation == mode;
+                    if (ImGui::Selectable(interpolationLabel(mode), selected)) {
+                        selectedKey.interpolation = mode;
+                        keyEdited = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (keyEdited) {
+                const auto selectedKeyId = selectedKey.id;
+                run = invisible_places::water::SanitizeWaterTimingRun(std::move(run));
+                const auto movedIt = std::find_if(
+                    run.keys.begin(),
+                    run.keys.end(),
+                    [&](const auto& candidate) { return candidate.id == selectedKeyId; });
+                timings.selectedKeyIndex = movedIt != run.keys.end()
+                                               ? std::optional<std::size_t>{static_cast<std::size_t>(
+                                                     std::distance(run.keys.begin(), movedIt))}
+                                               : std::nullopt;
+                touchRun();
+            }
+            if (ImGui::Button("Delete Key")) {
+                run.keys.erase(
+                    run.keys.begin() +
+                    static_cast<std::ptrdiff_t>(timings.selectedKeyIndex.value()));
+                timings.selectedKeyIndex.reset();
+                touchRun();
+            }
+        }
+
+        if (!run.keys.empty()) {
+            const float levelAtScrub = invisible_places::water::EvaluateWaterTimingRun(
+                run,
+                panel.scrubAmount,
+                1.0F);
+            ImGui::TextDisabled("Level at current position: %.2f", levelAtScrub);
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Apply To Animation")) {
+        if (animationPath == nullptr) {
+            ImGui::TextDisabled("Load an animation to apply timing runs.");
+            EndPanelSection();
+            return;
+        }
+        if (animationPath->selectedWaterScenarioId.empty()) {
+            ImGui::TextDisabled(
+                "Choose a water scenario above; applied runs compile into that "
+                "scenario's normalized water track.");
+            EndPanelSection();
+            return;
+        }
+        auto findCurrentTrack = [&]() -> invisible_places::water::WaterScenarioTrack* {
+            const auto trackIt = std::find_if(
+                animationPath->waterScenarioTracks.begin(),
+                animationPath->waterScenarioTracks.end(),
+                [&](const auto& track) {
+                    return track.scenarioId == animationPath->selectedWaterScenarioId;
+                });
+            return trackIt != animationPath->waterScenarioTracks.end() ? &*trackIt : nullptr;
+        };
+        auto ensureCurrentTrack = [&]() -> invisible_places::water::WaterScenarioTrack* {
+            if (auto* existing = findCurrentTrack(); existing != nullptr) {
+                return existing;
+            }
+            invisible_places::water::WaterScenarioTrack track;
+            track.scenarioId = animationPath->selectedWaterScenarioId;
+            if (const auto* definition = FindWaterScenarioDefinition(
+                    water,
+                    animationPath->selectedWaterScenarioId);
+                definition != nullptr) {
+                track.scenarioName = definition->name;
+                track.fallbackScenario = *definition;
+            } else {
+                track.scenarioName = animationPath->selectedWaterScenarioId;
+                track.fallbackScenario.id = animationPath->selectedWaterScenarioId;
+                track.fallbackScenario.name = track.scenarioName;
+                track.fallbackScenario.state.seepageLook = water.defaultSeepageLook;
+            }
+            animationPath->waterScenarioTracks.push_back(std::move(track));
+            return &animationPath->waterScenarioTracks.back();
+        };
+
+        for (const auto feature : kWaterTimingFeatureOrder) {
+            // Value copies only: the combo handlers below mutate both the
+            // track vector and its assignment vector, so pointers into either
+            // must not survive past this block.
+            std::optional<std::string> assignedRunId;
+            std::string assignedRunName;
+            if (const auto* currentTrack = findCurrentTrack(); currentTrack != nullptr) {
+                const auto found = std::find_if(
+                    currentTrack->timingAssignments.begin(),
+                    currentTrack->timingAssignments.end(),
+                    [&](const auto& candidate) { return candidate.feature == feature; });
+                if (found != currentTrack->timingAssignments.end()) {
+                    assignedRunId = found->runId;
+                    assignedRunName = found->runName;
+                }
+            }
+            std::string preview = "None";
+            if (assignedRunId.has_value()) {
+                const auto* assignedRun = FindWaterTimingRunById(&water, assignedRunId.value());
+                preview = assignedRun != nullptr
+                              ? assignedRun->name
+                              : assignedRunName + "  (missing run)";
+            }
+            ImGui::PushID(invisible_places::water::WaterTimingFeatureLabel(feature));
+            if (ImGui::BeginCombo(
+                    invisible_places::water::WaterTimingFeatureLabel(feature),
+                    preview.c_str())) {
+                if (ImGui::Selectable("None", !assignedRunId.has_value())) {
+                    if (auto* track = findCurrentTrack(); track != nullptr) {
+                        std::erase_if(
+                            track->timingAssignments,
+                            [&](const auto& candidate) {
+                                return candidate.feature == feature;
+                            });
+                        RecompileWaterTimingTracksForAnimation(runtimeState);
+                        if (track->timingAssignments.empty()) {
+                            track->keys.clear();
+                            panel.selectedWaterKeyIndex.reset();
+                            panel.dirty = true;
+                            InvalidateWaterSeepageParams(&water);
+                            runtimeState->previewRenderStateSignatureValid = false;
+                        }
+                    }
+                }
+                for (const auto& run : water.timingRuns) {
+                    if (run.feature != feature) {
+                        continue;
+                    }
+                    const bool selected = assignedRunId.has_value() &&
+                                          assignedRunId.value() == run.id;
+                    if (ImGui::Selectable(run.name.c_str(), selected) && !selected) {
+                        auto* track = ensureCurrentTrack();
+                        std::erase_if(
+                            track->timingAssignments,
+                            [&](const auto& candidate) {
+                                return candidate.feature == feature;
+                            });
+                        invisible_places::water::WaterTimingRunAssignment newAssignment;
+                        newAssignment.feature = feature;
+                        newAssignment.runId = run.id;
+                        newAssignment.runName = run.name;
+                        newAssignment.fallbackRun = run;
+                        track->timingAssignments.push_back(std::move(newAssignment));
+                        RecompileWaterTimingTracksForAnimation(runtimeState);
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        }
+        DrawWaterSeepageParameterTooltip(
+            "One run per feature per scenario. Features without a run keep the "
+            "scenario's static level; editing an applied run recompiles the "
+            "track immediately.");
+
+        auto* currentTrack = findCurrentTrack();
+        if (currentTrack != nullptr && !currentTrack->timingAssignments.empty()) {
+            ImGui::TextDisabled(
+                "Compiled water keys: %zu",
+                currentTrack->keys.size());
+        }
+        if (timings.pendingClearCompiledKeys &&
+            timings.pendingClearScenarioId != animationPath->selectedWaterScenarioId) {
+            timings.pendingClearCompiledKeys = false;
+            timings.pendingClearScenarioId.clear();
+        }
+        if (currentTrack != nullptr &&
+            (!currentTrack->keys.empty() || !currentTrack->timingAssignments.empty())) {
+            if (ImGui::Button(
+                    timings.pendingClearCompiledKeys
+                        ? "Confirm Clear"
+                        : "Clear Runs And Keys")) {
+                if (!timings.pendingClearCompiledKeys) {
+                    timings.pendingClearCompiledKeys = true;
+                    timings.pendingClearScenarioId = animationPath->selectedWaterScenarioId;
+                } else {
+                    currentTrack->timingAssignments.clear();
+                    currentTrack->keys.clear();
+                    panel.selectedWaterKeyIndex.reset();
+                    panel.dirty = true;
+                    InvalidateWaterSeepageParams(&water);
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    timings.pendingClearCompiledKeys = false;
+                    timings.pendingClearScenarioId.clear();
+                }
+            }
+            if (timings.pendingClearCompiledKeys) {
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel##ClearTimings")) {
+                    timings.pendingClearCompiledKeys = false;
+                    timings.pendingClearScenarioId.clear();
+                }
+                ImGui::TextColored(
+                    ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                    "Removes this scenario's applied runs and all compiled "
+                    "water keys. The runs stay in the library.");
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Save Animation##Timings")) {
+            const auto outputPath = panel.currentFilePath.empty()
+                                        ? UniqueAnimationFilePathForName(
+                                              *runtimeState,
+                                              animationPath->name)
+                                        : std::filesystem::path{panel.currentFilePath};
+            auto pathToSave = *animationPath;
+            if (panel.currentFilePath.empty()) {
+                pathToSave.name = AnimationNameFromFilePath(outputPath);
+            }
+            SaveAnimationPathToFile(runtimeState, pathToSave, outputPath);
+        }
+        DrawWaterSeepageParameterTooltip(
+            "Applied runs and compiled keys live in the animation file; the "
+            "run library itself is saved with the project.");
+        if (panel.dirty) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Modified");
+        }
+        EndPanelSection();
+    }
+}
+
 void DrawControlsWindow(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -41280,6 +42142,13 @@ void DrawControlsWindow(
         if (ImGui::BeginTabItem("Animation")) {
             if (ImGui::BeginChild("AnimationTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
                 DrawAnimationSection(runtimeState, *viewport);
+            }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Timings")) {
+            if (ImGui::BeginChild("TimingsTabScroll", ImVec2{0.0F, 0.0F}, false, tabScrollFlags)) {
+                DrawTimingsPanel(runtimeState);
             }
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -42162,6 +43031,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 session,
                 activeWaterScenario,
                 &renderStyle);
+            ApplyWaterShorelineLevelToStyle(activeWaterScenario, &renderStyle);
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,
                  .style = fastBasicRenderer

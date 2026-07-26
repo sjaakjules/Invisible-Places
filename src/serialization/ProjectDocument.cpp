@@ -3128,6 +3128,7 @@ json SerializeWaterScenarioState(const WaterScenarioState& state) {
         {"seepage_spread", state.seepageSpread},
         {"rain_level", state.rainLevel},
         {"flow_level", state.flowLevel},
+        {"shoreline_level", state.shorelineLevel},
         {"mesh_flow_level", state.meshFlowLevel},
         {"mesh_flow_rain_gain", state.meshFlowRainGain},
         {"mesh_flow_persistence_scale", state.meshFlowPersistenceScale},
@@ -3148,6 +3149,7 @@ WaterScenarioState ParseWaterScenarioState(const json& stateJson) {
     state.seepageSpread = stateJson.value("seepage_spread", state.seepageSpread);
     state.rainLevel = stateJson.value("rain_level", state.rainLevel);
     state.flowLevel = stateJson.value("flow_level", state.flowLevel);
+    state.shorelineLevel = stateJson.value("shoreline_level", state.shorelineLevel);
     state.meshFlowLevel = stateJson.value(
         "mesh_flow_level",
         state.meshFlowLevel);
@@ -3304,6 +3306,115 @@ WaterSeepageNodeTrack ParseWaterSeepageNodeTrack(const json& trackJson) {
     return track;
 }
 
+const char* WaterTimingFeatureName(invisible_places::water::WaterTimingFeature feature) {
+    switch (feature) {
+        case invisible_places::water::WaterTimingFeature::Shoreline:
+            return "shoreline";
+        case invisible_places::water::WaterTimingFeature::Seepage:
+            return "seepage";
+        case invisible_places::water::WaterTimingFeature::Rain:
+            return "rain";
+        case invisible_places::water::WaterTimingFeature::Flow:
+            return "flow";
+        case invisible_places::water::WaterTimingFeature::MeshFlow:
+            return "mesh_flow";
+    }
+    return "rain";
+}
+
+invisible_places::water::WaterTimingFeature ParseWaterTimingFeature(
+    const json& featureJson) {
+    if (!featureJson.is_string()) {
+        return invisible_places::water::WaterTimingFeature::Rain;
+    }
+    const auto name = featureJson.get<std::string>();
+    if (name == "shoreline") {
+        return invisible_places::water::WaterTimingFeature::Shoreline;
+    }
+    if (name == "seepage") {
+        return invisible_places::water::WaterTimingFeature::Seepage;
+    }
+    if (name == "flow") {
+        return invisible_places::water::WaterTimingFeature::Flow;
+    }
+    if (name == "mesh_flow") {
+        return invisible_places::water::WaterTimingFeature::MeshFlow;
+    }
+    return invisible_places::water::WaterTimingFeature::Rain;
+}
+
+json SerializeWaterTimingKey(const invisible_places::water::WaterTimingKey& key) {
+    return json{
+        {"id", key.id},
+        {"position", std::clamp(key.position, 0.0F, 1.0F)},
+        {"level", std::clamp(key.level, 0.0F, 1.0F)},
+        {"interpolation", WaterScenarioInterpolationName(key.interpolation)},
+    };
+}
+
+invisible_places::water::WaterTimingKey ParseWaterTimingKey(const json& keyJson) {
+    invisible_places::water::WaterTimingKey key;
+    key.id = keyJson.value("id", key.id);
+    key.position = std::clamp(keyJson.value("position", key.position), 0.0F, 1.0F);
+    key.level = std::clamp(keyJson.value("level", key.level), 0.0F, 1.0F);
+    if (keyJson.contains("interpolation")) {
+        key.interpolation = ParseWaterScenarioInterpolation(keyJson.at("interpolation"));
+    }
+    return key;
+}
+
+json SerializeWaterTimingRun(const invisible_places::water::WaterTimingRun& run) {
+    json runJson{
+        {"id", run.id},
+        {"name", run.name},
+        {"feature", WaterTimingFeatureName(run.feature)},
+        {"keys", json::array()},
+    };
+    for (const auto& key : run.keys) {
+        runJson["keys"].push_back(SerializeWaterTimingKey(key));
+    }
+    return runJson;
+}
+
+invisible_places::water::WaterTimingRun ParseWaterTimingRun(const json& runJson) {
+    invisible_places::water::WaterTimingRun run;
+    run.id = runJson.value("id", run.id);
+    run.name = runJson.value("name", run.name);
+    if (runJson.contains("feature")) {
+        run.feature = ParseWaterTimingFeature(runJson.at("feature"));
+    }
+    if (runJson.contains("keys") && runJson.at("keys").is_array()) {
+        for (const auto& keyJson : runJson.at("keys")) {
+            run.keys.push_back(ParseWaterTimingKey(keyJson));
+        }
+    }
+    return invisible_places::water::SanitizeWaterTimingRun(std::move(run));
+}
+
+json SerializeWaterTimingRunAssignment(
+    const invisible_places::water::WaterTimingRunAssignment& assignment) {
+    return json{
+        {"feature", WaterTimingFeatureName(assignment.feature)},
+        {"run_id", assignment.runId},
+        {"run_name", assignment.runName},
+        {"fallback_run", SerializeWaterTimingRun(assignment.fallbackRun)},
+    };
+}
+
+invisible_places::water::WaterTimingRunAssignment ParseWaterTimingRunAssignment(
+    const json& assignmentJson) {
+    invisible_places::water::WaterTimingRunAssignment assignment;
+    if (assignmentJson.contains("feature")) {
+        assignment.feature = ParseWaterTimingFeature(assignmentJson.at("feature"));
+    }
+    assignment.runId = assignmentJson.value("run_id", assignment.runId);
+    assignment.runName = assignmentJson.value("run_name", assignment.runName);
+    if (assignmentJson.contains("fallback_run")) {
+        assignment.fallbackRun = ParseWaterTimingRun(assignmentJson.at("fallback_run"));
+    }
+    return assignment;
+}
+
 json SerializeWaterScenarioTrack(const WaterScenarioTrack& track) {
     json trackJson{
         {"scenario_id", track.scenarioId},
@@ -3311,6 +3422,7 @@ json SerializeWaterScenarioTrack(const WaterScenarioTrack& track) {
         {"fallback_scenario", SerializeWaterScenarioDefinition(track.fallbackScenario)},
         {"keys", json::array()},
         {"seepage_node_tracks", json::array()},
+        {"timing_assignments", json::array()},
     };
     for (const auto& key : track.keys) {
         trackJson["keys"].push_back(SerializeWaterScenarioKey(key));
@@ -3318,6 +3430,10 @@ json SerializeWaterScenarioTrack(const WaterScenarioTrack& track) {
     for (const auto& nodeTrack : track.seepageNodeTracks) {
         trackJson["seepage_node_tracks"].push_back(
             SerializeWaterSeepageNodeTrack(nodeTrack));
+    }
+    for (const auto& assignment : track.timingAssignments) {
+        trackJson["timing_assignments"].push_back(
+            SerializeWaterTimingRunAssignment(assignment));
     }
     return trackJson;
 }
@@ -3345,6 +3461,13 @@ WaterScenarioTrack ParseWaterScenarioTrack(const json& trackJson) {
         for (const auto& nodeTrackJson : trackJson.at("seepage_node_tracks")) {
             track.seepageNodeTracks.push_back(
                 ParseWaterSeepageNodeTrack(nodeTrackJson));
+        }
+    }
+    if (trackJson.contains("timing_assignments") &&
+        trackJson.at("timing_assignments").is_array()) {
+        for (const auto& assignmentJson : trackJson.at("timing_assignments")) {
+            track.timingAssignments.push_back(
+                ParseWaterTimingRunAssignment(assignmentJson));
         }
     }
     return track;
@@ -6235,6 +6358,8 @@ bool SaveProjectDocument(
         {"water_seepage_look_profiles", json::array()},
         {"water_scenarios", json::array()},
         {"selected_water_scenario", document.selectedWaterScenarioId},
+        {"water_timing_runs", json::array()},
+        {"water_timing_run_sequence", document.waterTimingRunSequence},
         {"water_flow_trail_settings", SerializeWaterFlowTrailSettings(document.waterFlowTrailSettings)},
         {"water_show_flow_trails", document.waterShowFlowTrails},
         {"water_field_settings", SerializeWaterFieldSettings(document.waterFieldSettings)},
@@ -6302,6 +6427,9 @@ bool SaveProjectDocument(
     for (const auto& scenario : document.waterScenarios) {
         projectJson["water_scenarios"].push_back(
             SerializeWaterScenarioDefinition(scenario));
+    }
+    for (const auto& run : document.waterTimingRuns) {
+        projectJson["water_timing_runs"].push_back(SerializeWaterTimingRun(run));
     }
     for (const auto& visual : document.waterPointVisuals) {
         projectJson["water_point_visuals"].push_back(SerializePointCloudVisual(visual));
@@ -6482,6 +6610,15 @@ std::optional<ProjectDocument> LoadProjectDocument(
     }
     document.selectedWaterScenarioId =
         projectJson->value("selected_water_scenario", std::string{});
+    if (projectJson->contains("water_timing_runs") &&
+        projectJson->at("water_timing_runs").is_array()) {
+        for (const auto& runJson : projectJson->at("water_timing_runs")) {
+            document.waterTimingRuns.push_back(ParseWaterTimingRun(runJson));
+        }
+    }
+    document.waterTimingRunSequence = projectJson->value(
+        "water_timing_run_sequence",
+        document.waterTimingRunSequence);
     document.waterShowFlowTrails = projectJson->value(
         "water_show_flow_trails",
         document.waterShowFlowTrails);

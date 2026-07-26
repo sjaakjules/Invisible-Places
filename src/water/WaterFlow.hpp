@@ -284,6 +284,10 @@ struct WaterScenarioState {
     float seepageSpread = 0.0F;
     float rainLevel = 0.0F;
     float flowLevel = 1.0F;
+    // Shoreline waves are a point-style shader effect, so this level scales
+    // the authored style non-destructively at render time. One preserves
+    // projects written before schema 46 / animation schema 13.
+    float shorelineLevel = 1.0F;
     // Mesh Flow has an independent dry baseline and Rain gain. Keeping the
     // legacy defaults at one/zero preserves projects written before schema 44.
     float meshFlowLevel = 1.0F;
@@ -340,12 +344,48 @@ struct WaterSeepageNodeAnimationStateEntry {
     WaterSeepageNodeAnimationState state{};
 };
 
+// Water timing runs are reusable per-feature key sequences authored in the
+// Timings panel. Positions are normalized 0..1 along an animation, so duration
+// or frame-count edits never move their timing. Applied runs compile into the
+// owning track's complete-snapshot keys; runs are never evaluated per frame.
+enum class WaterTimingFeature {
+    Shoreline,
+    Seepage,
+    Rain,
+    Flow,
+    MeshFlow
+};
+
+struct WaterTimingKey {
+    std::string id;
+    float position = 0.0F;
+    float level = 1.0F;
+    WaterScenarioInterpolation interpolation = WaterScenarioInterpolation::Smooth;
+};
+
+struct WaterTimingRun {
+    std::string id;
+    std::string name;
+    WaterTimingFeature feature = WaterTimingFeature::Rain;
+    std::vector<WaterTimingKey> keys;
+};
+
+struct WaterTimingRunAssignment {
+    WaterTimingFeature feature = WaterTimingFeature::Rain;
+    std::string runId;
+    std::string runName;
+    // Embedded snapshot so a track stays reproducible when its project run
+    // library entry is missing, mirroring fallbackScenario.
+    WaterTimingRun fallbackRun{};
+};
+
 struct WaterScenarioTrack {
     std::string scenarioId;
     std::string scenarioName;
     WaterScenarioDefinition fallbackScenario{};
     std::vector<WaterScenarioKey> keys;
     std::vector<WaterSeepageNodeTrack> seepageNodeTracks;
+    std::vector<WaterTimingRunAssignment> timingAssignments;
 };
 
 struct WaterSeepageRainEnvelope {
@@ -1247,6 +1287,26 @@ void AddOrUpdateWaterScenarioKey(
     WaterScenarioTrack* track,
     WaterScenarioKey key,
     float replacementTolerance = 0.0001F);
+[[nodiscard]] const char* WaterTimingFeatureLabel(WaterTimingFeature feature);
+[[nodiscard]] WaterTimingRun SanitizeWaterTimingRun(WaterTimingRun run);
+[[nodiscard]] float EvaluateWaterTimingRun(
+    const WaterTimingRun& run,
+    float normalizedPosition,
+    float fallbackLevel);
+void AddOrUpdateWaterTimingKey(
+    WaterTimingRun* run,
+    WaterTimingKey key,
+    float replacementTolerance = 0.0001F);
+void ApplyWaterTimingLevelToScenarioState(
+    WaterTimingFeature feature,
+    float level,
+    WaterScenarioState* state);
+[[nodiscard]] float WaterTimingLevelFromScenarioState(
+    WaterTimingFeature feature,
+    const WaterScenarioState& state);
+[[nodiscard]] std::vector<WaterScenarioKey> CompileWaterTimingScenarioKeys(
+    const WaterScenarioState& baseState,
+    std::span<const WaterTimingRun> runs);
 [[nodiscard]] WaterSeepageQuality ResolveWaterSeepageQuality(
     WaterSeepageQuality quality,
     std::uint64_t effectivePointInvocations);

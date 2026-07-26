@@ -5318,6 +5318,7 @@ WaterScenarioState SanitizeWaterScenarioStateImpl(WaterScenarioState state) {
     state.seepageSpread = Clamp01(SeepageFiniteOr(state.seepageSpread, 0.0F));
     state.rainLevel = Clamp01(SeepageFiniteOr(state.rainLevel, 0.0F));
     state.flowLevel = Clamp01(SeepageFiniteOr(state.flowLevel, 1.0F));
+    state.shorelineLevel = Clamp01(SeepageFiniteOr(state.shorelineLevel, 1.0F));
     state.meshFlowLevel = Clamp01(SeepageFiniteOr(state.meshFlowLevel, 1.0F));
     state.meshFlowRainGain = std::clamp(
         SeepageFiniteOr(state.meshFlowRainGain, 0.0F),
@@ -5645,6 +5646,10 @@ WaterScenarioState EvaluateWaterScenarioTrack(
         result.seepageSpread = std::lerp(left.state.seepageSpread, right.state.seepageSpread, amount);
         result.rainLevel = std::lerp(left.state.rainLevel, right.state.rainLevel, amount);
         result.flowLevel = std::lerp(left.state.flowLevel, right.state.flowLevel, amount);
+        result.shorelineLevel = std::lerp(
+            left.state.shorelineLevel,
+            right.state.shorelineLevel,
+            amount);
         result.meshFlowLevel = std::lerp(
             left.state.meshFlowLevel,
             right.state.meshFlowLevel,
@@ -6241,6 +6246,303 @@ void AddOrUpdateWaterScenarioKey(
         [](const WaterScenarioKey& left, const WaterScenarioKey& right) {
             return left.position < right.position;
         });
+}
+
+const char* WaterTimingFeatureLabel(WaterTimingFeature feature) {
+    switch (feature) {
+        case WaterTimingFeature::Shoreline:
+            return "Shoreline";
+        case WaterTimingFeature::Seepage:
+            return "Seepage";
+        case WaterTimingFeature::Rain:
+            return "Rain";
+        case WaterTimingFeature::Flow:
+            return "Flow";
+        case WaterTimingFeature::MeshFlow:
+            return "Mesh Flow";
+    }
+    return "Rain";
+}
+
+WaterTimingRun SanitizeWaterTimingRun(WaterTimingRun run) {
+    for (auto& key : run.keys) {
+        key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
+        key.level = Clamp01(SeepageFiniteOr(key.level, 1.0F));
+    }
+    std::stable_sort(
+        run.keys.begin(),
+        run.keys.end(),
+        [](const WaterTimingKey& left, const WaterTimingKey& right) {
+            return left.position < right.position;
+        });
+    return run;
+}
+
+float EvaluateWaterTimingRun(
+    const WaterTimingRun& run,
+    float normalizedPosition,
+    float fallbackLevel) {
+    if (run.keys.empty()) {
+        return fallbackLevel;
+    }
+    normalizedPosition = Clamp01(SeepageFiniteOr(normalizedPosition, 0.0F));
+    std::vector<const WaterTimingKey*> ordered;
+    ordered.reserve(run.keys.size());
+    for (const auto& key : run.keys) {
+        ordered.push_back(&key);
+    }
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const WaterTimingKey* left, const WaterTimingKey* right) {
+            return left->position < right->position;
+        });
+    const auto keyLevel = [](const WaterTimingKey& key) {
+        return Clamp01(SeepageFiniteOr(key.level, 1.0F));
+    };
+    if (normalizedPosition <= ordered.front()->position) {
+        return keyLevel(*ordered.front());
+    }
+    if (normalizedPosition >= ordered.back()->position) {
+        return keyLevel(*ordered.back());
+    }
+    for (std::size_t index = 0U; index + 1U < ordered.size(); ++index) {
+        const auto& left = *ordered[index];
+        const auto& right = *ordered[index + 1U];
+        // An exact interior key position belongs to the segment it starts, so
+        // sampling at a key after a Hold segment yields the post-step level and
+        // compiled tracks capture the step instead of the stale left limit.
+        if (normalizedPosition >= right.position) {
+            continue;
+        }
+        if (left.interpolation == WaterScenarioInterpolation::Hold) {
+            return keyLevel(left);
+        }
+        const float span = std::max(1.0e-6F, right.position - left.position);
+        float amount = Clamp01((normalizedPosition - left.position) / span);
+        if (left.interpolation == WaterScenarioInterpolation::Smooth) {
+            amount = amount * amount * (3.0F - 2.0F * amount);
+        }
+        return std::lerp(keyLevel(left), keyLevel(right), amount);
+    }
+    return keyLevel(*ordered.back());
+}
+
+void AddOrUpdateWaterTimingKey(
+    WaterTimingRun* run,
+    WaterTimingKey key,
+    float replacementTolerance) {
+    if (run == nullptr) {
+        return;
+    }
+    key.position = Clamp01(SeepageFiniteOr(key.position, 0.0F));
+    key.level = Clamp01(SeepageFiniteOr(key.level, 1.0F));
+    replacementTolerance = std::max(0.0F, replacementTolerance);
+    const auto existing = std::find_if(
+        run->keys.begin(),
+        run->keys.end(),
+        [&](const WaterTimingKey& candidate) {
+            return std::abs(candidate.position - key.position) <= replacementTolerance;
+        });
+    if (existing != run->keys.end()) {
+        const auto preservedId = existing->id;
+        *existing = std::move(key);
+        if (existing->id.empty()) {
+            existing->id = preservedId;
+        }
+    } else {
+        run->keys.push_back(std::move(key));
+    }
+    std::stable_sort(
+        run->keys.begin(),
+        run->keys.end(),
+        [](const WaterTimingKey& left, const WaterTimingKey& right) {
+            return left.position < right.position;
+        });
+}
+
+void ApplyWaterTimingLevelToScenarioState(
+    WaterTimingFeature feature,
+    float level,
+    WaterScenarioState* state) {
+    if (state == nullptr) {
+        return;
+    }
+    level = Clamp01(SeepageFiniteOr(level, 1.0F));
+    switch (feature) {
+        case WaterTimingFeature::Shoreline:
+            state->shorelineLevel = level;
+            return;
+        case WaterTimingFeature::Seepage:
+            state->seepageLevel = level;
+            return;
+        case WaterTimingFeature::Rain:
+            state->rainLevel = level;
+            return;
+        case WaterTimingFeature::Flow:
+            state->flowLevel = level;
+            return;
+        case WaterTimingFeature::MeshFlow:
+            state->meshFlowLevel = level;
+            return;
+    }
+}
+
+float WaterTimingLevelFromScenarioState(
+    WaterTimingFeature feature,
+    const WaterScenarioState& state) {
+    switch (feature) {
+        case WaterTimingFeature::Shoreline:
+            return Clamp01(SeepageFiniteOr(state.shorelineLevel, 1.0F));
+        case WaterTimingFeature::Seepage:
+            return Clamp01(SeepageFiniteOr(state.seepageLevel, 1.0F));
+        case WaterTimingFeature::Rain:
+            return Clamp01(SeepageFiniteOr(state.rainLevel, 0.0F));
+        case WaterTimingFeature::Flow:
+            return Clamp01(SeepageFiniteOr(state.flowLevel, 1.0F));
+        case WaterTimingFeature::MeshFlow:
+            return Clamp01(SeepageFiniteOr(state.meshFlowLevel, 1.0F));
+    }
+    return 1.0F;
+}
+
+std::vector<WaterScenarioKey> CompileWaterTimingScenarioKeys(
+    const WaterScenarioState& baseState,
+    std::span<const WaterTimingRun> runs) {
+    constexpr float kPositionTolerance = 0.0001F;
+    constexpr float kLevelTolerance = 1.0e-4F;
+    constexpr std::size_t kMixedSegmentSubdivisions = 3U;
+
+    std::vector<WaterTimingRun> activeRuns;
+    activeRuns.reserve(runs.size());
+    for (const auto& run : runs) {
+        auto sanitized = SanitizeWaterTimingRun(run);
+        if (!sanitized.keys.empty()) {
+            activeRuns.push_back(std::move(sanitized));
+        }
+    }
+    if (activeRuns.empty()) {
+        return {};
+    }
+
+    std::vector<float> positions;
+    for (const auto& run : activeRuns) {
+        for (const auto& key : run.keys) {
+            positions.push_back(key.position);
+        }
+    }
+    std::sort(positions.begin(), positions.end());
+    positions.erase(
+        std::unique(
+            positions.begin(),
+            positions.end(),
+            [&](float left, float right) {
+                return std::abs(left - right) <= kPositionTolerance;
+            }),
+        positions.end());
+
+    const auto runKeyAt = [&](const WaterTimingRun& run,
+                              float position) -> const WaterTimingKey* {
+        const auto found = std::find_if(
+            run.keys.begin(),
+            run.keys.end(),
+            [&](const WaterTimingKey& key) {
+                return std::abs(key.position - position) <= kPositionTolerance;
+            });
+        return found != run.keys.end() ? &*found : nullptr;
+    };
+    const auto stateAt = [&](float position) {
+        WaterScenarioState state = baseState;
+        for (const auto& run : activeRuns) {
+            ApplyWaterTimingLevelToScenarioState(
+                run.feature,
+                EvaluateWaterTimingRun(
+                    run,
+                    position,
+                    WaterTimingLevelFromScenarioState(run.feature, baseState)),
+                &state);
+        }
+        return SanitizeWaterScenarioState(std::move(state));
+    };
+
+    struct CompiledSample {
+        float position = 0.0F;
+        WaterScenarioInterpolation interpolation = WaterScenarioInterpolation::Hold;
+    };
+    std::vector<CompiledSample> samples;
+    samples.reserve(positions.size());
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        const float position = positions[index];
+        if (index + 1U == positions.size()) {
+            samples.push_back({position, WaterScenarioInterpolation::Hold});
+            break;
+        }
+        const float nextPosition = positions[index + 1U];
+
+        // A run "changes" over this segment when its evaluated level differs
+        // between the endpoints. Segments where nothing changes hold exactly.
+        bool anyChange = false;
+        bool exactSegment = true;
+        std::optional<WaterScenarioInterpolation> sharedMode;
+        for (const auto& run : activeRuns) {
+            const float fallback =
+                WaterTimingLevelFromScenarioState(run.feature, baseState);
+            const float leftLevel = EvaluateWaterTimingRun(run, position, fallback);
+            const float rightLevel = EvaluateWaterTimingRun(run, nextPosition, fallback);
+            if (std::abs(leftLevel - rightLevel) <= kLevelTolerance) {
+                continue;
+            }
+            anyChange = true;
+            // Exact only when this run has its own keys at both endpoints, so
+            // the compiled segment coincides with one authored run segment.
+            const auto* leftKey = runKeyAt(run, position);
+            const auto* rightKey = runKeyAt(run, nextPosition);
+            if (leftKey == nullptr || rightKey == nullptr) {
+                exactSegment = false;
+                continue;
+            }
+            if (sharedMode.has_value() && *sharedMode != leftKey->interpolation) {
+                exactSegment = false;
+            } else {
+                sharedMode = leftKey->interpolation;
+            }
+        }
+
+        if (!anyChange) {
+            samples.push_back({position, WaterScenarioInterpolation::Hold});
+            continue;
+        }
+        if (exactSegment && sharedMode.has_value()) {
+            samples.push_back({position, *sharedMode});
+            continue;
+        }
+        // Mixed curvature cannot be represented by one snapshot segment;
+        // approximate with linear subdivisions sampled exactly per feature.
+        samples.push_back({position, WaterScenarioInterpolation::Linear});
+        const float span = nextPosition - position;
+        for (std::size_t subdivision = 1U;
+             subdivision <= kMixedSegmentSubdivisions;
+             ++subdivision) {
+            const float amount = static_cast<float>(subdivision) /
+                                 static_cast<float>(kMixedSegmentSubdivisions + 1U);
+            samples.push_back({
+                position + span * amount,
+                WaterScenarioInterpolation::Linear,
+            });
+        }
+    }
+
+    std::vector<WaterScenarioKey> keys;
+    keys.reserve(samples.size());
+    for (std::size_t index = 0U; index < samples.size(); ++index) {
+        WaterScenarioKey key;
+        key.id = "timing_key_" + std::to_string(index + 1U);
+        key.position = samples[index].position;
+        key.state = stateAt(samples[index].position);
+        key.interpolation = samples[index].interpolation;
+        keys.push_back(std::move(key));
+    }
+    return keys;
 }
 
 WaterSeepageQuality ResolveWaterSeepageQuality(

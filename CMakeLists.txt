@@ -244,6 +244,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/SeepageOfflineRendererTests.cpp
             tests/SeepageSerializationTests.cpp
             tests/SeepageWaterTests.cpp
+            tests/WaterTimingTests.cpp
         )
         target_link_libraries(invisible_places_tests PRIVATE invisible_places_core Catch2::Catch2WithMain)
         include(Catch)
