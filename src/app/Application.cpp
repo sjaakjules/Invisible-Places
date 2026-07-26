@@ -296,8 +296,6 @@ struct CameraPanelState {
     std::optional<std::size_t> pendingLinkedShotDeleteIndex;
     std::string shotRenameBuffer;
     bool focusShotRename = false;
-    std::optional<std::size_t> blendFromIndex;
-    std::optional<std::size_t> blendToIndex;
     std::vector<std::size_t> pathShotIndices;
     std::optional<std::size_t> selectedPathItemIndex;
     float blendAmount = 0.0F;
@@ -20401,8 +20399,6 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->cameraPanel.multiEditAllowedCameraIds.clear();
     runtimeState->cameraPanel.shotRenameBuffer.clear();
     runtimeState->cameraPanel.focusShotRename = false;
-    runtimeState->cameraPanel.blendFromIndex.reset();
-    runtimeState->cameraPanel.blendToIndex.reset();
     runtimeState->cameraPanel.pathShotIndices = document.cameraPathShotIndices;
     runtimeState->cameraPanel.selectedPathItemIndex.reset();
     runtimeState->cameraPanel.pathDurationFrames =
@@ -20444,8 +20440,6 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->cameraPlayback.active = false;
     if (!runtimeState->cameraShots.empty()) {
         runtimeState->cameraPanel.selectedShotIndex = 0;
-        runtimeState->cameraPanel.blendFromIndex = 0;
-        runtimeState->cameraPanel.blendToIndex = runtimeState->cameraShots.size() > 1 ? 1U : 0U;
     }
     EnsureCameraShotSelections(&runtimeState->cameraPanel, runtimeState->cameraShots.size());
     runtimeState->persistence.queuedLoads.clear();
@@ -20624,13 +20618,6 @@ void EnsureCameraShotSelections(CameraPanelState* panelState, std::size_t shotCo
         panelState->renamingShotIndex.reset();
         panelState->shotRenameBuffer.clear();
         panelState->focusShotRename = false;
-    }
-    if (!validIndex(panelState->blendFromIndex)) {
-        panelState->blendFromIndex = shotCount > 0 ? std::optional<std::size_t>{0} : std::nullopt;
-    }
-    if (!validIndex(panelState->blendToIndex)) {
-        panelState->blendToIndex =
-            shotCount > 1 ? std::optional<std::size_t>{1} : panelState->blendFromIndex;
     }
 
     panelState->pathShotIndices.erase(
@@ -22114,6 +22101,47 @@ void StopAnimationPlayback(PreviewRuntimeState* runtimeState) {
     }
 }
 
+// The one shared scrub over the loaded animation. Every tab that shows it
+// reads and writes the same animationPanel.scrubAmount, so dragging it in
+// Camera, Animation, Timings, or Export moves the same normalized position
+// and (with Live Apply) updates the live camera plus every keyed water
+// setting through the per-frame water state.
+bool DrawAnimationScrubControl(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (!panel.currentPath.has_value()) {
+        ImGui::TextDisabled("Load an animation to scrub along it.");
+        return false;
+    }
+    const bool scrubChanged = DrawRangedFloatControl(
+        "Animation Position",
+        &panel.scrubAmount,
+        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+    const float durationSeconds =
+        std::max(0.0F, AnimationDurationSeconds(panel.currentPath.value()));
+    ImGui::SameLine();
+    ImGui::TextDisabled("%.2f s", panel.scrubAmount * durationSeconds);
+    ImGui::Checkbox("Live Apply", &panel.liveApply);
+    if (panel.liveApply && scrubChanged) {
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Apply Position")) {
+        ApplyAnimationScrub(runtimeState);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(runtimeState->animationPlayback.active ? "Stop Playback" : "Play")) {
+        if (runtimeState->animationPlayback.active) {
+            StopAnimationPlayback(runtimeState);
+        } else {
+            StartAnimationPlayback(runtimeState);
+        }
+    }
+    return scrubChanged;
+}
+
 void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
     if (runtimeState == nullptr || !runtimeState->animationPlayback.active) {
         return;
@@ -22163,11 +22191,6 @@ void SaveCurrentCameraShot(PreviewRuntimeState* runtimeState) {
     runtimeState->cameraPanel.selectedShotIndex = savedIndex;
     runtimeState->cameraPanel.pathShotIndices.push_back(savedIndex);
     runtimeState->cameraPanel.selectedPathItemIndex = runtimeState->cameraPanel.pathShotIndices.size() - 1U;
-    if (!runtimeState->cameraPanel.blendFromIndex.has_value()) {
-        runtimeState->cameraPanel.blendFromIndex = savedIndex;
-    } else {
-        runtimeState->cameraPanel.blendToIndex = savedIndex;
-    }
     runtimeState->cameraPanel.draftShotName = NextCameraShotName(*runtimeState);
     runtimeState->statusMessage = "Saved camera position.";
     runtimeState->errorMessage.clear();
@@ -33556,10 +33579,7 @@ void DrawCameraSection(
     SyncCurrentAnimationToRegistry(runtimeState);
     auto* session = SelectedLoadedSession(runtimeState);
     if (BeginPanelSection("Camera")) {
-        const auto target = runtimeState->camera.Target();
         const auto pivot = runtimeState->camera.OrbitCenter();
-        ImGui::Text("Target: %.3f  %.3f  %.3f", target.x, target.y, target.z);
-        ImGui::Text("Pivot: %.3f  %.3f  %.3f", pivot.x, pivot.y, pivot.z);
         bool showPivotMarker = runtimeState->pivotOverlay.visible;
         if (ImGui::Checkbox("Show Pivot Marker", &showPivotMarker)) {
             runtimeState->pivotOverlay.visible = showPivotMarker;
@@ -33567,13 +33587,6 @@ void DrawCameraSection(
             runtimeState->pivotOverlay.lastSetAt =
                 showPivotMarker ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         }
-        ImGui::Text("Distance: %.3f", runtimeState->camera.Distance());
-        ImGui::Text("FOV: %.1f", runtimeState->camera.FovDegrees());
-        ImGui::Text(
-            "Near/Far: %.4f / %.1f",
-            runtimeState->camera.NearPlane(),
-            runtimeState->camera.FarPlane());
-
         if (session == nullptr || !runtimeState->camera.HasFramedBounds()) {
             ImGui::TextUnformatted("Select a loaded layer to frame the camera.");
         } else {
@@ -33589,14 +33602,6 @@ void DrawCameraSection(
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Infer an orbit pivot from visible samples near the screen center.");
-            }
-
-            const auto effectiveFrame = ComputeSceneAggregateFrame(*runtimeState, *session, false);
-            ImGui::Text("Bounds valid: %s", effectiveFrame.bounds.valid ? "yes" : "no");
-            if (session->kind == LayerKind::GaussianSplat) {
-                ImGui::Text(
-                    "Convention: %s",
-                    GsplatTransformConventionLabel(runtimeState->projectSettings.gsplatTransformConvention));
             }
         }
         EndPanelSection();
@@ -34106,10 +34111,7 @@ void DrawAnimationSection(
         ApplyAnimationScrub(runtimeState);
     }
 
-    const bool scrubChanged = DrawRangedFloatControl(
-        "Animation Position",
-        &panel.scrubAmount,
-        {.visualMin = 0.0F, .visualMax = 1.0F, .format = "%.3f", .hardMin = 0.0F, .hardMax = 1.0F});
+    const bool scrubChanged = DrawAnimationScrubControl(runtimeState);
     if (scrubChanged) {
         motionStats = CachedAnimationPathMotionStats(&panel, animationPath, panel.scrubAmount);
     }
@@ -34117,21 +34119,6 @@ void DrawAnimationSection(
         "At position: camera %.3f/s | target %.3f/s",
         motionStats.currentCameraSpeed,
         motionStats.currentTargetSpeed);
-    ImGui::Checkbox("Live Apply", &panel.liveApply);
-    if (panel.liveApply && scrubChanged) {
-        ApplyAnimationScrub(runtimeState);
-    }
-    if (ImGui::Button("Apply Position")) {
-        ApplyAnimationScrub(runtimeState);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(runtimeState->animationPlayback.active ? "Stop Playback" : "Play")) {
-        if (runtimeState->animationPlayback.active) {
-            StopAnimationPlayback(runtimeState);
-        } else {
-            StartAnimationPlayback(runtimeState);
-        }
-    }
 
     if (ImGui::Button("Save")) {
         const auto outputPath = panel.currentFilePath.empty()
@@ -41070,6 +41057,10 @@ void DrawExportPanel(
     if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
+    if (BeginPanelSection("Animation Position")) {
+        DrawAnimationScrubControl(runtimeState);
+        EndPanelSection();
+    }
     DrawAnimationExportSection(runtimeState, viewport);
     DrawExportBatchSection(runtimeState, viewport);
     DrawStillCameraExportSection(runtimeState, *viewport);
@@ -41154,18 +41145,11 @@ void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
                     "Linked project scenario is missing; timing runs compile "
                     "against the animation's embedded snapshot.");
             }
-            float scrub = panel.scrubAmount;
-            if (ImGui::SliderFloat("Position##Timings", &scrub, 0.0F, 1.0F, "%.4f")) {
-                panel.scrubAmount = std::clamp(scrub, 0.0F, 1.0F);
-                if (panel.liveApply) {
-                    ApplyAnimationScrub(runtimeState);
-                }
-            }
+            DrawAnimationScrubControl(runtimeState);
             DrawWaterSeepageParameterTooltip(
-                "Normalized 0..1 position along the animation. Timing keys use "
-                "the same normalized space, so duration edits never move them.");
-            ImGui::SameLine();
-            ImGui::TextDisabled("%.2f s", panel.scrubAmount * durationSeconds);
+                "Normalized 0..1 position along the animation, shared with the "
+                "Camera, Animation, and Export tabs. Timing keys use the same "
+                "normalized space, so duration edits never move them.");
         }
         EndPanelSection();
     }
