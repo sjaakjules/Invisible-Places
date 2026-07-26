@@ -1779,7 +1779,8 @@ std::string AnimationNameWithWaterScenario(
 }
 
 std::optional<invisible_places::water::WaterScenarioState> ResolveActiveWaterScenarioState(
-    const PreviewRuntimeState& runtimeState) {
+    const PreviewRuntimeState& runtimeState,
+    bool useEditedScenario = true) {
     const auto* animation = runtimeState.animationPanel.currentPath.has_value()
                                 ? &runtimeState.animationPanel.currentPath.value()
                                 : nullptr;
@@ -1791,7 +1792,9 @@ std::optional<invisible_places::water::WaterScenarioState> ResolveActiveWaterSce
         return std::nullopt;
     }
 
-    const auto* definition = ViewedWaterScenarioDefinition(runtimeState.water, scenarioId);
+    const auto* definition = useEditedScenario
+                                 ? ViewedWaterScenarioDefinition(runtimeState.water, scenarioId)
+                                 : FindWaterScenarioDefinition(runtimeState.water, scenarioId);
     const invisible_places::water::WaterScenarioTrack* track = nullptr;
     if (animation != nullptr) {
         const auto trackIt = std::find_if(
@@ -20225,6 +20228,12 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.timingRuns = document.waterTimingRuns;
     runtimeState->water.nextTimingRunSequence = document.waterTimingRunSequence;
     runtimeState->water.editedScenario = document.tempWaterScenario;
+    if (runtimeState->water.editedScenario.has_value() &&
+        FindWaterScenarioDefinition(
+            runtimeState->water,
+            runtimeState->water.editedScenario->id) == nullptr) {
+        runtimeState->water.editedScenario.reset();
+    }
     runtimeState->timingsPanel = TimingsPanelState{};
     RecompileWaterTimingTracksForAnimation(runtimeState);
     runtimeState->water.rippleLayers = document.waterRippleLayers;
@@ -21941,6 +21950,13 @@ bool LoadAnimationPathFromFile(PreviewRuntimeState* runtimeState, const std::fil
     // Applied timing runs may have changed in the project library since this
     // animation was last saved; recompiling here keeps playback in sync and
     // the dirty flag reset below keeps a plain load unmodified.
+    // Keep the global scenario selection in step with the loaded animation so
+    // every panel edits the same scenario (a mismatch would let one panel
+    // silently replace another's unsaved edited shadow).
+    if (!runtimeState->animationPanel.currentPath->selectedWaterScenarioId.empty()) {
+        runtimeState->water.selectedSeepageScenarioId =
+            runtimeState->animationPanel.currentPath->selectedWaterScenarioId;
+    }
     RecompileWaterTimingTracksForAnimation(runtimeState);
     runtimeState->timingsPanel = TimingsPanelState{};
     runtimeState->animationPanel.dirty = false;
@@ -22882,11 +22898,16 @@ std::optional<SavedPointVisualExportSelection> ResolveSavedPointVisualExportSele
     if (IsProjectPointVisualSession(session)) {
         EnsureProjectPointVisuals(runtimeState);
         auto& library = runtimeState->pointVisualLibrary;
-        const auto baseName = BaseNameFromProjectPointVisualName(
-            library,
+        const auto selectedName = NormalizePointVisualName(
             session.selectedPointVisualName.empty()
                 ? library.selectedPointVisualName
                 : session.selectedPointVisualName);
+        // An exact saved-visual match wins before scene-suffix stripping so a
+        // saved name that happens to end in a scene-group name is never
+        // re-mapped onto a different base visual.
+        const auto baseName = FindProjectPointVisualIndex(library, selectedName).has_value()
+                                  ? selectedName
+                                  : BaseNameFromProjectPointVisualName(library, selectedName);
         const auto visualIndex = FindProjectPointVisualIndex(library, baseName);
         if (!visualIndex.has_value()) {
             return std::nullopt;
@@ -23346,10 +23367,15 @@ bool RenderCurrentAnimationFramePreview(
             : runtimeState->projectSettings.pointCloudRendererMode;
 
     const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
-    const auto savedVisualOverride = savedVisual.has_value()
-                                         ? std::optional<PointVisualExportOverride>{
-                                               savedVisual->visualOverride}
-                                         : std::nullopt;
+    if (!savedVisual.has_value()) {
+        runtimeState->errorMessage =
+            "Save the current point visual before rendering a frame preview; "
+            "previews always render the saved named visual.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto savedVisualOverride =
+        std::optional<PointVisualExportOverride>{savedVisual->visualOverride};
     bool exportUsesPreviewDensity = false;
     if (AnimationExportWritesMp4(activeMode) || AnimationExportWritesPngStack(activeMode)) {
         const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
@@ -23401,7 +23427,9 @@ bool RenderCurrentAnimationFramePreview(
     job.waterScenarios = ExportWaterScenarioDefinitions(*runtimeState);
     job.waterRainSettings = runtimeState->water.collisionRainSettings;
     job.waterRainVisual = runtimeState->water.rainVisual;
-    job.frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState);
+    job.frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
+        *runtimeState,
+        runtimeState->exportUsesEditedScenario);
     job.seepageRainEnvelope = BuildFrozenAnimationSeepageRainEnvelope(
         job.animationPath,
         job.waterScenarios);
@@ -26725,7 +26753,9 @@ bool StartQuickMp4ExportJob(
         .waterScenarios = request.waterScenarios,
         .waterRainSettings = request.waterRainSettings,
         .waterRainVisual = request.waterRainVisual,
-        .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState),
+        .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
+            *runtimeState,
+            runtimeState->exportUsesEditedScenario),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -27036,12 +27066,18 @@ void StartStillCameraExportCapture(
     }
 
     const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+    if (!savedVisual.has_value()) {
+        FinishOfflineRenderJob(
+            runtimeState,
+            {},
+            "The saved point visual is no longer available; still-camera export "
+            "cannot fall back to the live style.");
+        return;
+    }
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
         job.previewDensity,
-        savedVisual.has_value()
-            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
-            : std::nullopt,
+        savedVisual->visualOverride,
         job.pointCloudRendererMode);
     if (exportPointCloudLayers.empty()) {
         FinishOfflineRenderJob(runtimeState, {}, "No visible loaded LiDAR layers are available for still-camera export.");
@@ -27341,14 +27377,19 @@ void StartStillCameraExportJob(
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
     const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+    if (!savedVisual.has_value()) {
+        runtimeState->errorMessage =
+            "Save the current point visual before exporting; exports always "
+            "render the saved named visual.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
     const auto frustumMaskSummary = PrepareAnimationExportFrustumMasks(
         runtimeState,
         viewport,
         std::span<const invisible_places::camera::CameraState>{frames.data(), frames.size()},
         settings,
-        savedVisual.has_value()
-            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
-            : std::nullopt,
+        savedVisual->visualOverride,
         exportRendererMode);
     const bool exportUsesPreviewDensity = frustumMaskSummary.enabled;
 
@@ -27396,7 +27437,9 @@ void StartStillCameraExportJob(
         .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
         .waterRainSettings = runtimeState->water.collisionRainSettings,
         .waterRainVisual = runtimeState->water.rainVisual,
-        .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState),
+        .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
+            *runtimeState,
+            runtimeState->exportUsesEditedScenario),
         .exportVisualName = "Current View",
         .exportLog = MakeExportLogState(
             pngStackDirectory.empty() ? std::filesystem::path{settings.outputDirectory} : pngStackDirectory.parent_path(),
@@ -27551,12 +27594,17 @@ void StartAnimationExportJob(
             ? PointCloudRendererMode::Beauty
             : runtimeState->projectSettings.pointCloudRendererMode;
     const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+    if (!savedVisual.has_value()) {
+        runtimeState->errorMessage =
+            "Save the current point visual before exporting; exports always "
+            "render the saved named visual.";
+        runtimeState->statusMessage.clear();
+        return;
+    }
     auto exportPointCloudLayers = BuildAnimationExportPointCloudLayerSnapshot(
         *runtimeState,
         exportUsesPreviewDensity,
-        savedVisual.has_value()
-            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
-            : std::nullopt,
+        savedVisual->visualOverride,
         exportRendererMode);
     if (exportPointCloudLayers.empty()) {
         runtimeState->errorMessage = "No visible loaded LiDAR layers are available for animation export.";
@@ -27641,7 +27689,9 @@ void StartAnimationExportJob(
         .waterScenarios = ExportWaterScenarioDefinitions(*runtimeState),
         .waterRainSettings = runtimeState->water.collisionRainSettings,
         .waterRainVisual = runtimeState->water.rainVisual,
-        .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(*runtimeState),
+        .frozenPreviewWaterScenario = ResolveActiveWaterScenarioState(
+            *runtimeState,
+            runtimeState->exportUsesEditedScenario),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -28714,7 +28764,8 @@ void DrawAnimationExportSection(
         return;
     }
 
-    const bool exportAvailable = true;
+    const bool exportAvailable =
+        ResolveSavedPointVisualExportSelection(runtimeState).has_value();
     if (!exportAvailable) {
         ImGui::BeginDisabled();
     }
@@ -41195,7 +41246,9 @@ void DrawExportBatchSection(
         return;
     }
     auto& panel = runtimeState->animationPanel;
-    RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+    if (!panel.animationRegistryInitialized) {
+        RefreshAnimationFileList(&panel, AnimationDirectory(*runtimeState));
+    }
     if (panel.availableFiles.empty()) {
         ImGui::TextDisabled("No saved animations are registered.");
         EndPanelSection();
@@ -41362,6 +41415,11 @@ void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
             ImGui::TextColored(
                 ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
                 "The selected scenario is missing from the project library.");
+            if (water.editedScenario.has_value() &&
+                water.editedScenario->id == scenarioId &&
+                ImGui::Button("Discard Edits")) {
+                DiscardEditedWaterScenario(runtimeState);
+            }
         } else {
             const bool editingThis = water.editedScenario.has_value() &&
                                      water.editedScenario->id == scenarioId;
