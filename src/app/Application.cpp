@@ -320,16 +320,35 @@ enum class AnimationEditTarget {
     Focus
 };
 
+enum class ManualFlowPathGizmoDragKind {
+    None,
+    Axis,
+    Plane,
+    ViewPlane,
+};
+
+struct ManualFlowPathGizmoDragState {
+    ManualFlowPathGizmoDragKind kind = ManualFlowPathGizmoDragKind::None;
+    std::size_t nodeIndex = 0U;
+    invisible_places::io::Float3 startPoint{};
+    ImVec2 startMouse{};
+    glm::vec3 axis{1.0F, 0.0F, 0.0F};
+    glm::vec3 planeNormal{0.0F, 0.0F, 1.0F};
+    glm::vec3 startPlaneIntersection{0.0F, 0.0F, 0.0F};
+    ImVec2 axisScreenDirection{1.0F, 0.0F};
+    float pixelsPerWorldUnit = 1.0F;
+    float startAxisParameter = 0.0F;
+    bool axisUsesProjectedFallback = false;
+};
+
+// Camera and focus keys share the standard viewport translation gizmo (axis
+// handles, plane quads, and centre view-plane drag) with the other movable
+// points; the gizmo maths lives in the shared ManualFlowPathGizmoDragState.
 struct AnimationViewportDragState {
     bool active = false;
     AnimationEditTarget target = AnimationEditTarget::Camera;
     std::size_t keyIndex = 0;
-    int axis = 0;
-    glm::vec3 startWorldPoint{0.0F, 0.0F, 0.0F};
-    ImVec2 startMouse{};
-    glm::vec3 axisWorld{1.0F, 0.0F, 0.0F};
-    ImVec2 axisScreenDirection{1.0F, 0.0F};
-    float pixelsPerWorldUnit = 1.0F;
+    ManualFlowPathGizmoDragState gizmo{};
 };
 
 struct QueuedQuickMp4Export {
@@ -1244,27 +1263,6 @@ struct WaterRegionEditorState {
     bool consumedViewportInputThisFrame = false;
 };
 
-enum class ManualFlowPathGizmoDragKind {
-    None,
-    Axis,
-    Plane,
-    ViewPlane,
-};
-
-struct ManualFlowPathGizmoDragState {
-    ManualFlowPathGizmoDragKind kind = ManualFlowPathGizmoDragKind::None;
-    std::size_t nodeIndex = 0U;
-    invisible_places::io::Float3 startPoint{};
-    ImVec2 startMouse{};
-    glm::vec3 axis{1.0F, 0.0F, 0.0F};
-    glm::vec3 planeNormal{0.0F, 0.0F, 1.0F};
-    glm::vec3 startPlaneIntersection{0.0F, 0.0F, 0.0F};
-    ImVec2 axisScreenDirection{1.0F, 0.0F};
-    float pixelsPerWorldUnit = 1.0F;
-    float startAxisParameter = 0.0F;
-    bool axisUsesProjectedFallback = false;
-};
-
 struct ManualFlowPathEditorState {
     bool active = false;
     bool creating = false;
@@ -1484,6 +1482,20 @@ struct WaterWorkflowState {
     WaterDynamicMeshFlowDiagnostics dynamicMeshFlowDiagnostics{};
     WaterOverlayViewMode overlayViewMode = WaterOverlayViewMode::Trail;
     bool showFlowSourceGuides = true;
+    // Shared-gizmo interaction state for the emitter/attractor and Seepage
+    // overlays. The hovered/captured flags are read by UpdateCameraFromInput
+    // (which runs earlier in the frame) so camera navigation stays off gizmo
+    // clicks and drags.
+    ManualFlowPathGizmoDragState emitterGizmoDrag{};
+    bool emitterGizmoDragIsAttractor = false;
+    std::size_t emitterGizmoDragIndex = 0U;
+    bool emitterGizmoPointerCaptured = false;
+    bool emitterGizmoHoveredLastFrame = false;
+    bool pathAttractorSelected = false;
+    ManualFlowPathGizmoDragState seepageGizmoDrag{};
+    std::size_t seepageGizmoDragIndex = 0U;
+    bool seepageGizmoPointerCaptured = false;
+    bool seepageGizmoHoveredLastFrame = false;
     WaterOverlay pathAnchors{};
     WaterOverlay flowOverlay{};
     WaterTrailOverlay flowTrailOverlay{};
@@ -3251,6 +3263,15 @@ void HashRainRuntime(
         settings.vegetationImpact.hopSpacingMeters,
         settings.vegetationImpact.streamWidthMeters,
         settings.vegetationImpact.streamSpread,
+        settings.sandImpactBand.minZ,
+        settings.sandImpactBand.maxZ,
+        settings.sandImpactBand.fadeMeters,
+        settings.rockImpactBand.minZ,
+        settings.rockImpactBand.maxZ,
+        settings.rockImpactBand.fadeMeters,
+        settings.vegetationImpactBand.minZ,
+        settings.vegetationImpactBand.maxZ,
+        settings.vegetationImpactBand.fadeMeters,
     };
     for (const float value : runtimeValues) {
         HashFloat(seed, value);
@@ -30000,6 +30021,283 @@ bool ManualFlowPathPointInQuad(ImVec2 point, const std::array<ImVec2, 4>& quad) 
            inTriangle(point, quad[0], quad[2], quad[3]);
 }
 
+// ==== Shared viewport translation gizmo =====================================
+// The manual Flow path editor established the movement standard: three axis
+// handles (closest-ray parameter drag with a screen-projected fallback),
+// three plane quads, and a centre handle that drags in the camera view plane
+// (also entered by clicking the already-selected point again). These helpers
+// give every other movable viewport point the same interaction. The manual
+// path editor keeps its own copy of this logic; behavioural changes must be
+// mirrored there.
+
+struct ViewportGizmoHandles {
+    struct AxisHandle {
+        glm::vec3 axis{};
+        ImVec2 start{};
+        ImVec2 end{};
+        float pixelsPerWorldUnit = 1.0F;
+    };
+    struct PlaneHandle {
+        glm::vec3 normal{};
+        std::array<ImVec2, 4> quad{};
+    };
+    std::vector<AxisHandle> axes;
+    std::vector<PlaneHandle> planes;
+    std::optional<ImVec2> centerScreen;
+};
+
+ViewportGizmoHandles BuildAndDrawViewportGizmo(
+    ImDrawList* drawList,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    const glm::vec3& worldPoint) {
+    ViewportGizmoHandles handles;
+    const auto projectedCenter = ProjectWorldPoint(matrices, viewport, worldPoint);
+    if (!projectedCenter.has_value() || drawList == nullptr) {
+        return handles;
+    }
+    handles.centerScreen = projectedCenter->screen;
+    const float cameraDistance = glm::length(worldPoint - matrices.position);
+    const float axisLength = std::max(0.05F, cameraDistance * 0.12F);
+    const std::array<glm::vec3, 3> axes{
+        glm::vec3{1.0F, 0.0F, 0.0F},
+        glm::vec3{0.0F, 1.0F, 0.0F},
+        glm::vec3{0.0F, 0.0F, 1.0F},
+    };
+    const std::array<ImU32, 3> colours{
+        IM_COL32(245, 67, 84, 255),
+        IM_COL32(115, 221, 62, 255),
+        IM_COL32(57, 145, 248, 255),
+    };
+    for (std::size_t axisIndex = 0; axisIndex < axes.size(); ++axisIndex) {
+        const glm::vec3 startPoint = worldPoint + axes[axisIndex] * (axisLength * 0.18F);
+        const glm::vec3 endPoint = worldPoint + axes[axisIndex] * axisLength;
+        const auto projectedStart = ProjectWorldPoint(matrices, viewport, startPoint);
+        const auto projectedEnd = ProjectWorldPoint(matrices, viewport, endPoint);
+        if (!projectedStart.has_value() || !projectedEnd.has_value()) {
+            continue;
+        }
+        drawList->AddLine(projectedStart->screen, projectedEnd->screen, IM_COL32(0, 0, 0, 190), 6.0F);
+        drawList->AddLine(projectedStart->screen, projectedEnd->screen, colours[axisIndex], 3.2F);
+        const ImVec2 direction{
+            projectedEnd->screen.x - projectedStart->screen.x,
+            projectedEnd->screen.y - projectedStart->screen.y,
+        };
+        const float screenLength = std::max(
+            1.0F,
+            std::sqrt(direction.x * direction.x + direction.y * direction.y));
+        const ImVec2 normal{-direction.y / screenLength, direction.x / screenLength};
+        const ImVec2 backward{
+            projectedEnd->screen.x - direction.x * (9.0F / screenLength),
+            projectedEnd->screen.y - direction.y * (9.0F / screenLength),
+        };
+        drawList->AddTriangleFilled(
+            projectedEnd->screen,
+            ImVec2{backward.x + normal.x * 5.5F, backward.y + normal.y * 5.5F},
+            ImVec2{backward.x - normal.x * 5.5F, backward.y - normal.y * 5.5F},
+            colours[axisIndex]);
+        handles.axes.push_back(ViewportGizmoHandles::AxisHandle{
+            .axis = axes[axisIndex],
+            .start = projectedStart->screen,
+            .end = projectedEnd->screen,
+            .pixelsPerWorldUnit = screenLength / std::max(1.0e-5F, axisLength * 0.82F),
+        });
+    }
+
+    struct PlaneAxes {
+        glm::vec3 first{};
+        glm::vec3 second{};
+        glm::vec3 normal{};
+        ImU32 colour = 0;
+    };
+    const std::array<PlaneAxes, 3> planes{
+        PlaneAxes{axes[0], axes[1], axes[2], IM_COL32(245, 214, 70, 205)},
+        PlaneAxes{axes[0], axes[2], axes[1], IM_COL32(232, 80, 205, 205)},
+        PlaneAxes{axes[1], axes[2], axes[0], IM_COL32(71, 220, 210, 205)},
+    };
+    for (const auto& plane : planes) {
+        constexpr float kNear = 0.24F;
+        constexpr float kFar = 0.43F;
+        const std::array<glm::vec3, 4> worldCorners{
+            worldPoint + (plane.first + plane.second) * (axisLength * kNear),
+            worldPoint + plane.first * (axisLength * kFar) + plane.second * (axisLength * kNear),
+            worldPoint + (plane.first + plane.second) * (axisLength * kFar),
+            worldPoint + plane.first * (axisLength * kNear) + plane.second * (axisLength * kFar),
+        };
+        std::array<ImVec2, 4> quad{};
+        bool visible = true;
+        for (std::size_t corner = 0; corner < worldCorners.size(); ++corner) {
+            const auto projected = ProjectWorldPoint(matrices, viewport, worldCorners[corner]);
+            if (!projected.has_value()) {
+                visible = false;
+                break;
+            }
+            quad[corner] = projected->screen;
+        }
+        if (!visible) {
+            continue;
+        }
+        drawList->AddConvexPolyFilled(quad.data(), 4, plane.colour);
+        drawList->AddPolyline(quad.data(), 4, IM_COL32(255, 255, 255, 225), ImDrawFlags_Closed, 1.4F);
+        handles.planes.push_back(ViewportGizmoHandles::PlaneHandle{
+            .normal = plane.normal,
+            .quad = quad,
+        });
+    }
+    drawList->AddCircleFilled(projectedCenter->screen, 8.0F, IM_COL32(235, 235, 235, 255), 24);
+    drawList->AddCircle(projectedCenter->screen, 10.0F, IM_COL32(28, 28, 31, 255), 24, 2.0F);
+    return handles;
+}
+
+struct ViewportGizmoHit {
+    ManualFlowPathGizmoDragKind kind = ManualFlowPathGizmoDragKind::None;
+    std::size_t axisIndex = 0U;
+    glm::vec3 planeNormal{0.0F, 0.0F, 1.0F};
+};
+
+std::optional<ViewportGizmoHit> HitTestViewportGizmo(
+    const ViewportGizmoHandles& handles,
+    ImVec2 mousePosition) {
+    if (handles.centerScreen.has_value() &&
+        ScreenDistance(mousePosition, handles.centerScreen.value()) <= 10.0F) {
+        return ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane};
+    }
+    std::optional<std::size_t> hoveredAxis;
+    float closestAxisDistance = 9.0F;
+    for (std::size_t index = 0; index < handles.axes.size(); ++index) {
+        const float distance =
+            DistanceToScreenSegment(mousePosition, handles.axes[index].start, handles.axes[index].end);
+        if (distance < closestAxisDistance) {
+            closestAxisDistance = distance;
+            hoveredAxis = index;
+        }
+    }
+    if (hoveredAxis.has_value()) {
+        return ViewportGizmoHit{
+            .kind = ManualFlowPathGizmoDragKind::Axis,
+            .axisIndex = hoveredAxis.value(),
+        };
+    }
+    for (const auto& plane : handles.planes) {
+        if (ManualFlowPathPointInQuad(mousePosition, plane.quad)) {
+            return ViewportGizmoHit{
+                .kind = ManualFlowPathGizmoDragKind::Plane,
+                .planeNormal = plane.normal,
+            };
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ManualFlowPathGizmoDragState> BeginViewportGizmoDrag(
+    const ViewportGizmoHit& hit,
+    const ViewportGizmoHandles& handles,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 mousePosition,
+    const glm::vec3& worldPoint) {
+    const auto ray = MakeScreenRay(matrices, viewport, mousePosition);
+    if (hit.kind == ManualFlowPathGizmoDragKind::Axis) {
+        if (hit.axisIndex >= handles.axes.size()) {
+            return std::nullopt;
+        }
+        const auto& handle = handles.axes[hit.axisIndex];
+        const auto parameter = ray.has_value()
+                                   ? ManualFlowPathAxisParameter(ray.value(), worldPoint, handle.axis)
+                                   : std::nullopt;
+        const ImVec2 screenDirection{
+            handle.end.x - handle.start.x,
+            handle.end.y - handle.start.y,
+        };
+        const float screenLength = std::max(
+            1.0F,
+            std::sqrt(screenDirection.x * screenDirection.x + screenDirection.y * screenDirection.y));
+        return ManualFlowPathGizmoDragState{
+            .kind = ManualFlowPathGizmoDragKind::Axis,
+            .startPoint = FromGlm(worldPoint),
+            .startMouse = mousePosition,
+            .axis = handle.axis,
+            .axisScreenDirection = ImVec2{
+                screenDirection.x / screenLength,
+                screenDirection.y / screenLength,
+            },
+            .pixelsPerWorldUnit = handle.pixelsPerWorldUnit,
+            .startAxisParameter = parameter.value_or(0.0F),
+            .axisUsesProjectedFallback = !parameter.has_value(),
+        };
+    }
+    glm::vec3 planeNormal = hit.planeNormal;
+    if (hit.kind == ManualFlowPathGizmoDragKind::ViewPlane) {
+        planeNormal = matrices.position - worldPoint;
+        if (glm::length(planeNormal) <= 1.0e-5F) {
+            return std::nullopt;
+        }
+        planeNormal = glm::normalize(planeNormal);
+    }
+    if (!ray.has_value()) {
+        return std::nullopt;
+    }
+    const auto intersection =
+        IntersectManualFlowPathDragPlane(ray.value(), worldPoint, planeNormal);
+    if (!intersection.has_value()) {
+        return std::nullopt;
+    }
+    return ManualFlowPathGizmoDragState{
+        .kind = hit.kind,
+        .startPoint = FromGlm(worldPoint),
+        .startMouse = mousePosition,
+        .planeNormal = planeNormal,
+        .startPlaneIntersection = intersection.value(),
+    };
+}
+
+std::optional<glm::vec3> UpdateViewportGizmoDrag(
+    const ManualFlowPathGizmoDragState& drag,
+    const invisible_places::camera::OrbitCameraMatrices& matrices,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 mousePosition) {
+    const auto ray = MakeScreenRay(matrices, viewport, mousePosition);
+    if (!ray.has_value()) {
+        return std::nullopt;
+    }
+    glm::vec3 nextPoint = ToGlm(drag.startPoint);
+    if (drag.kind == ManualFlowPathGizmoDragKind::Axis && !drag.axisUsesProjectedFallback) {
+        if (const auto parameter = ManualFlowPathAxisParameter(
+                ray.value(),
+                ToGlm(drag.startPoint),
+                drag.axis);
+            parameter.has_value()) {
+            nextPoint += drag.axis * (parameter.value() - drag.startAxisParameter);
+        } else {
+            nextPoint = manual_flow_path::ProjectedAxisDragPoint(
+                nextPoint,
+                drag.axis,
+                glm::vec2{drag.startMouse.x, drag.startMouse.y},
+                glm::vec2{mousePosition.x, mousePosition.y},
+                glm::vec2{drag.axisScreenDirection.x, drag.axisScreenDirection.y},
+                drag.pixelsPerWorldUnit);
+        }
+    } else if (drag.kind == ManualFlowPathGizmoDragKind::Axis) {
+        nextPoint = manual_flow_path::ProjectedAxisDragPoint(
+            nextPoint,
+            drag.axis,
+            glm::vec2{drag.startMouse.x, drag.startMouse.y},
+            glm::vec2{mousePosition.x, mousePosition.y},
+            glm::vec2{drag.axisScreenDirection.x, drag.axisScreenDirection.y},
+            drag.pixelsPerWorldUnit);
+    } else if (const auto intersection = IntersectManualFlowPathDragPlane(
+                   ray.value(),
+                   ToGlm(drag.startPoint),
+                   drag.planeNormal);
+               intersection.has_value()) {
+        nextPoint += intersection.value() - drag.startPlaneIntersection;
+    }
+    if (!std::isfinite(nextPoint.x) || !std::isfinite(nextPoint.y) || !std::isfinite(nextPoint.z)) {
+        return std::nullopt;
+    }
+    return nextPoint;
+}
+
 struct ManualFlowPathCurveHit {
     float screenDistance = std::numeric_limits<float>::max();
     std::size_t controlSegmentIndex = 0U;
@@ -30597,7 +30895,11 @@ void DrawWaterEmitterOverlay(
         drawList->AddText(labelPosition, line, label.c_str());
     };
 
-    if (attractorVisible) {
+    // The attractor is an authoring guide like the source markers: hide it
+    // with the same toggle, keeping feedback while placement is armed.
+    if (attractorVisible &&
+        (runtimeState->water.showFlowSourceGuides ||
+         runtimeState->water.pathAttractorPlacementArmed)) {
         drawAttractorMarker(pathSettings.attractorPosition, false);
     }
     if (runtimeState->water.pathAttractorPlacementArmed &&
@@ -30672,13 +30974,180 @@ void DrawWaterEmitterOverlay(
         }
     }
 
-    if (canPick && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        if (nearestEmitterIndex.has_value()) {
-            SelectWaterEmitterInViewport(runtimeState, viewport, nearestEmitterIndex.value());
+    auto& water = runtimeState->water;
+    const bool attractorShown =
+        attractorVisible && water.showFlowSourceGuides;
+    std::optional<float> attractorDistance;
+    if (canPick && attractorShown) {
+        if (const auto projected =
+                ProjectWorldPoint(matrices, viewport, ToGlm(pathSettings.attractorPosition));
+            projected.has_value()) {
+            attractorDistance = ScreenDistance(io.MousePos, projected->screen);
+        }
+    }
+
+    // ---- Shared translation gizmo for the selected source / attractor ----
+    if (!io.MouseDown[0]) {
+        water.emitterGizmoPointerCaptured = false;
+    }
+    const bool gizmoDragActive =
+        water.emitterGizmoDrag.kind != ManualFlowPathGizmoDragKind::None;
+    if (gizmoDragActive) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        runtimeState->cameraInteraction.renderViewportMouseActive = false;
+        water.emitterGizmoPointerCaptured = io.MouseDown[0];
+        const bool targetValid =
+            water.emitterGizmoDragIsAttractor ||
+            water.emitterGizmoDragIndex < water.emitters.size();
+        if (!targetValid) {
+            water.emitterGizmoDrag = {};
+        } else if (io.MouseDown[0]) {
+            if (const auto nextPoint = UpdateViewportGizmoDrag(
+                    water.emitterGizmoDrag,
+                    matrices,
+                    viewport,
+                    io.MousePos);
+                nextPoint.has_value()) {
+                if (water.emitterGizmoDragIsAttractor) {
+                    auto edited = ViewedGlobalWaterPathSettings(water);
+                    edited.attractorPosition = FromGlm(nextPoint.value());
+                    water.editedPathProfileSettings = edited;
+                    water.selectedPathProfileName =
+                        EditedWaterProfileName(water.selectedPathProfileName);
+                    water.pathProfileNameBuffer =
+                        BaseWaterProfileName(water.selectedPathProfileName);
+                } else {
+                    water.emitters[water.emitterGizmoDragIndex].position =
+                        FromGlm(nextPoint.value());
+                }
+            }
         } else {
+            // Release: sources are cloud-bound, so the freely dragged point
+            // snaps back onto the analysis surface; the attractor stays free.
+            // Path re-bakes are deferred to release so drags stay cheap.
+            if (water.emitterGizmoDragIsAttractor) {
+                MarkWaterPathDirty(runtimeState);
+                runtimeState->statusMessage =
+                    "Moved water path attractor; path bake required.";
+                runtimeState->errorMessage.clear();
+            } else {
+                auto& emitter = water.emitters[water.emitterGizmoDragIndex];
+                if (const auto projected =
+                        ProjectWorldPoint(matrices, viewport, ToGlm(emitter.position));
+                    projected.has_value()) {
+                    if (const auto pivot = ResolveWaterSourcePlacementPivot(
+                            *runtimeState,
+                            viewport,
+                            projected->screen);
+                        pivot.has_value()) {
+                        emitter.position = pivot->point;
+                        emitter.confidence = std::max(
+                            emitter.confidence,
+                            pivot->matchedSurface ? 0.85F : 0.55F);
+                    }
+                }
+                MarkWaterPathDirty(runtimeState, emitter.id);
+                runtimeState->pivotOverlay.visible = true;
+                runtimeState->pivotOverlay.pivot = emitter.position;
+                runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+                runtimeState->statusMessage =
+                    "Moved water source " + emitter.name + "; path bake required.";
+                runtimeState->errorMessage.clear();
+            }
+            water.emitterGizmoDrag = {};
+        }
+    }
+
+    // Resolve which entity owns the gizmo and draw it (also while dragging).
+    std::optional<glm::vec3> gizmoPoint;
+    bool gizmoIsAttractor = false;
+    std::size_t gizmoEmitterIndex = 0U;
+    if (water.emitterGizmoDrag.kind != ManualFlowPathGizmoDragKind::None) {
+        gizmoIsAttractor = water.emitterGizmoDragIsAttractor;
+        gizmoEmitterIndex = water.emitterGizmoDragIndex;
+        gizmoPoint = gizmoIsAttractor
+                         ? ToGlm(ViewedGlobalWaterPathSettings(water).attractorPosition)
+                         : ToGlm(water.emitters[gizmoEmitterIndex].position);
+    } else if (water.pathAttractorSelected && attractorShown) {
+        gizmoIsAttractor = true;
+        gizmoPoint = ToGlm(pathSettings.attractorPosition);
+    } else if (water.selectedEmitterIndex.has_value() &&
+               water.selectedEmitterIndex.value() < water.emitters.size() &&
+               sourceNodesVisible && water.showFlowSourceGuides) {
+        gizmoEmitterIndex = water.selectedEmitterIndex.value();
+        gizmoPoint = ToGlm(water.emitters[gizmoEmitterIndex].position);
+    }
+    ViewportGizmoHandles gizmoHandles;
+    if (gizmoPoint.has_value()) {
+        gizmoHandles = BuildAndDrawViewportGizmo(drawList, matrices, viewport, gizmoPoint.value());
+    }
+
+    const auto gizmoHit =
+        (canPick && !gizmoDragActive && gizmoPoint.has_value())
+            ? HitTestViewportGizmo(gizmoHandles, io.MousePos)
+            : std::nullopt;
+    water.emitterGizmoHoveredLastFrame =
+        gizmoHit.has_value() ||
+        (attractorDistance.has_value() && attractorDistance.value() <= 12.0F);
+    if (gizmoHit.has_value()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+
+    const auto beginGizmoDrag = [&](const ViewportGizmoHit& hit) {
+        if (!gizmoPoint.has_value()) {
             return;
         }
-        runtimeState->cameraInteraction.navigationActive = false;
+        if (auto drag = BeginViewportGizmoDrag(
+                hit,
+                gizmoHandles,
+                matrices,
+                viewport,
+                io.MousePos,
+                gizmoPoint.value());
+            drag.has_value()) {
+            water.emitterGizmoDrag = drag.value();
+            water.emitterGizmoDragIsAttractor = gizmoIsAttractor;
+            water.emitterGizmoDragIndex = gizmoEmitterIndex;
+            water.emitterGizmoPointerCaptured = true;
+            runtimeState->cameraInteraction.navigationActive = false;
+            runtimeState->cameraInteraction.renderViewportMouseActive = false;
+        }
+    };
+
+    if (canPick && !gizmoDragActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (gizmoHit.has_value()) {
+            beginGizmoDrag(gizmoHit.value());
+            return;
+        }
+        if (attractorDistance.has_value() && attractorDistance.value() <= 12.0F) {
+            const bool alreadySelected = water.pathAttractorSelected;
+            water.pathAttractorSelected = true;
+            water.selectedEmitterIndex.reset();
+            runtimeState->cameraInteraction.navigationActive = false;
+            if (alreadySelected) {
+                gizmoIsAttractor = true;
+                gizmoPoint = ToGlm(pathSettings.attractorPosition);
+                beginGizmoDrag(
+                    ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane});
+            }
+            return;
+        }
+        if (nearestEmitterIndex.has_value()) {
+            const bool alreadySelected =
+                water.selectedEmitterIndex.has_value() &&
+                water.selectedEmitterIndex.value() == nearestEmitterIndex.value();
+            SelectWaterEmitterInViewport(runtimeState, viewport, nearestEmitterIndex.value());
+            water.pathAttractorSelected = false;
+            runtimeState->cameraInteraction.navigationActive = false;
+            if (alreadySelected &&
+                nearestEmitterIndex.value() < water.emitters.size()) {
+                gizmoIsAttractor = false;
+                gizmoEmitterIndex = nearestEmitterIndex.value();
+                gizmoPoint = ToGlm(water.emitters[gizmoEmitterIndex].position);
+                beginGizmoDrag(
+                    ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane});
+            }
+        }
     }
 }
 
@@ -31234,16 +31703,135 @@ void DrawWaterSeepageOverlay(
         }
     }
 
-    if (canPick && nearestIndex.has_value() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        runtimeState->water.selectedSeepageNodeIndex = nearestIndex;
-        runtimeState->water.selectedEmitterIndex.reset();
-        runtimeState->water.selectedDynamicMeshAttractorIndex.reset();
-        const auto& node = runtimeState->water.seepageNodes[nearestIndex.value()];
-        runtimeState->water.seepageLookNameBuffer = node.lookProfileName;
-        runtimeState->pivotOverlay.visible = true;
-        runtimeState->pivotOverlay.pivot = node.position;
-        runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+    // ---- Shared translation gizmo for the selected Seepage node ----
+    // Seepage nodes are strictly cloud-bound: the drag moves freely along the
+    // gizmo axes/planes, and the release snaps the node back onto the
+    // permitted authored cache surface (reverting when no surface is found).
+    auto& water = runtimeState->water;
+    if (!io.MouseDown[0]) {
+        water.seepageGizmoPointerCaptured = false;
+    }
+    const bool gizmoDragActive =
+        water.seepageGizmoDrag.kind != ManualFlowPathGizmoDragKind::None;
+    if (gizmoDragActive) {
         runtimeState->cameraInteraction.navigationActive = false;
+        runtimeState->cameraInteraction.renderViewportMouseActive = false;
+        water.seepageGizmoPointerCaptured = io.MouseDown[0];
+        if (water.seepageGizmoDragIndex >= water.seepageNodes.size()) {
+            water.seepageGizmoDrag = {};
+        } else if (io.MouseDown[0]) {
+            if (const auto nextPoint = UpdateViewportGizmoDrag(
+                    water.seepageGizmoDrag,
+                    matrices,
+                    viewport,
+                    io.MousePos);
+                nextPoint.has_value()) {
+                water.seepageNodes[water.seepageGizmoDragIndex].position =
+                    FromGlm(nextPoint.value());
+            }
+        } else {
+            auto& node = water.seepageNodes[water.seepageGizmoDragIndex];
+            std::optional<ResolvedPivot> pivot;
+            if (const auto projected =
+                    ProjectWorldPoint(matrices, viewport, ToGlm(node.position));
+                projected.has_value()) {
+                pivot = ResolveWaterSeepagePlacementPivot(
+                    *runtimeState,
+                    viewport,
+                    projected->screen,
+                    &node);
+            }
+            if (pivot.has_value()) {
+                node.position = pivot->point;
+                node.surfaceNormal =
+                    WaterSeepageSurfaceNormal(*pivot, *runtimeState, viewport);
+                node.downAxis = invisible_places::water::DeriveWaterSeepageDownAxis(
+                    node.surfaceNormal,
+                    WaterSeepageFallbackDownAxis(*runtimeState, viewport));
+                InvalidateWaterSeepageTopology(&water);
+                runtimeState->pivotOverlay.visible = true;
+                runtimeState->pivotOverlay.pivot = node.position;
+                runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+                runtimeState->statusMessage = "Moved " + node.name + ".";
+                runtimeState->errorMessage.clear();
+            } else {
+                node.position = water.seepageGizmoDrag.startPoint;
+                runtimeState->errorMessage =
+                    "No visible permitted authored cache surface under the dragged "
+                    "Seepage node; the move was reverted.";
+                runtimeState->statusMessage.clear();
+            }
+            water.seepageGizmoDrag = {};
+        }
+    }
+
+    std::optional<glm::vec3> gizmoPoint;
+    if (water.seepageGizmoDrag.kind != ManualFlowPathGizmoDragKind::None) {
+        gizmoPoint = ToGlm(water.seepageNodes[water.seepageGizmoDragIndex].position);
+    } else if (water.selectedSeepageNodeIndex.has_value() &&
+               water.selectedSeepageNodeIndex.value() < water.seepageNodes.size() &&
+               !water.movingSeepageNodeIndex.has_value()) {
+        gizmoPoint = ToGlm(
+            water.seepageNodes[water.selectedSeepageNodeIndex.value()].position);
+    }
+    ViewportGizmoHandles gizmoHandles;
+    if (gizmoPoint.has_value()) {
+        gizmoHandles = BuildAndDrawViewportGizmo(drawList, matrices, viewport, gizmoPoint.value());
+    }
+    const auto gizmoHit =
+        (canPick && !gizmoDragActive && gizmoPoint.has_value())
+            ? HitTestViewportGizmo(gizmoHandles, io.MousePos)
+            : std::nullopt;
+    water.seepageGizmoHoveredLastFrame = gizmoHit.has_value();
+    if (gizmoHit.has_value()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+
+    const auto beginGizmoDrag = [&](const ViewportGizmoHit& hit) {
+        if (!gizmoPoint.has_value() || !water.selectedSeepageNodeIndex.has_value()) {
+            return;
+        }
+        if (auto drag = BeginViewportGizmoDrag(
+                hit,
+                gizmoHandles,
+                matrices,
+                viewport,
+                io.MousePos,
+                gizmoPoint.value());
+            drag.has_value()) {
+            water.seepageGizmoDrag = drag.value();
+            water.seepageGizmoDragIndex = water.selectedSeepageNodeIndex.value();
+            water.seepageGizmoPointerCaptured = true;
+            runtimeState->cameraInteraction.navigationActive = false;
+            runtimeState->cameraInteraction.renderViewportMouseActive = false;
+        }
+    };
+
+    if (canPick && !gizmoDragActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (gizmoHit.has_value()) {
+            beginGizmoDrag(gizmoHit.value());
+            return;
+        }
+        if (nearestIndex.has_value()) {
+            const bool alreadySelected =
+                water.selectedSeepageNodeIndex.has_value() &&
+                water.selectedSeepageNodeIndex.value() == nearestIndex.value();
+            water.selectedSeepageNodeIndex = nearestIndex;
+            water.selectedEmitterIndex.reset();
+            water.selectedDynamicMeshAttractorIndex.reset();
+            water.pathAttractorSelected = false;
+            const auto& node = water.seepageNodes[nearestIndex.value()];
+            water.seepageLookNameBuffer = node.lookProfileName;
+            runtimeState->pivotOverlay.visible = true;
+            runtimeState->pivotOverlay.pivot = node.position;
+            runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+            runtimeState->cameraInteraction.navigationActive = false;
+            if (alreadySelected) {
+                gizmoPoint = ToGlm(node.position);
+                beginGizmoDrag(
+                    ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane});
+            }
+        }
     }
 }
 
@@ -32454,23 +33042,23 @@ void DrawAnimationViewportOverlay(
     if (panel.drag.active) {
         if (!io.MouseDown[0]) {
             panel.drag.active = false;
+        } else if (const auto nextPoint = UpdateViewportGizmoDrag(
+                       panel.drag.gizmo,
+                       matrices,
+                       viewport,
+                       io.MousePos);
+                   nextPoint.has_value() &&
+                   MoveLinkedAnimationKeyPoint(
+                       runtimeState,
+                       &path,
+                       panel.drag.keyIndex,
+                       panel.drag.target,
+                       nextPoint.value())) {
+            panel.selectedKeyIndex = panel.drag.keyIndex;
+            panel.editTarget = panel.drag.target;
+            panel.dirty = true;
         } else {
-            const float mouseDeltaAlongAxis =
-                ((io.MousePos.x - panel.drag.startMouse.x) * panel.drag.axisScreenDirection.x) +
-                ((io.MousePos.y - panel.drag.startMouse.y) * panel.drag.axisScreenDirection.y);
-            const float worldDelta = mouseDeltaAlongAxis / std::max(1.0F, panel.drag.pixelsPerWorldUnit);
-            if (MoveLinkedAnimationKeyPoint(
-                    runtimeState,
-                    &path,
-                    panel.drag.keyIndex,
-                    panel.drag.target,
-                    panel.drag.startWorldPoint + (panel.drag.axisWorld * worldDelta))) {
-                panel.selectedKeyIndex = panel.drag.keyIndex;
-                panel.editTarget = panel.drag.target;
-                panel.dirty = true;
-            } else {
-                panel.drag.active = false;
-            }
+            panel.drag.active = false;
         }
     }
 
@@ -32478,7 +33066,6 @@ void DrawAnimationViewportOverlay(
         panel.drag.active || (!viewport.UiWantsMouseCapture() && IsMouseOverRenderViewport(viewport));
 
     constexpr float kPickRadius = 10.0F;
-    bool selectedKeyThisFrame = false;
     float bestDistance = kPickRadius;
     std::optional<std::size_t> bestKeyIndex;
     std::optional<AnimationEditTarget> bestTarget;
@@ -32519,74 +33106,61 @@ void DrawAnimationViewportOverlay(
         }
     }
 
-    if (canInteractWithRenderViewport &&
-        !panel.drag.active &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        bestKeyIndex.has_value() &&
-        bestTarget.has_value()) {
-        panel.selectedKeyIndex = bestKeyIndex.value();
-        panel.editTarget = bestTarget.value();
-        selectedKeyThisFrame = true;
-    }
-
     if (!panel.selectedKeyIndex.has_value() || panel.selectedKeyIndex.value() >= path.keys.size()) {
+        if (canInteractWithRenderViewport &&
+            !panel.drag.active &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            bestKeyIndex.has_value() &&
+            bestTarget.has_value()) {
+            panel.selectedKeyIndex = bestKeyIndex.value();
+            panel.editTarget = bestTarget.value();
+        }
         return;
     }
 
     const auto selectedPoint = AnimationKeyPointWorld(path, panel.selectedKeyIndex.value(), panel.editTarget);
-    const auto projectedSelected = ProjectWorldPoint(matrices, viewport, selectedPoint);
-    if (!projectedSelected.has_value()) {
+    const auto gizmoHandles = BuildAndDrawViewportGizmo(drawList, matrices, viewport, selectedPoint);
+
+    if (!canInteractWithRenderViewport || panel.drag.active) {
         return;
     }
 
-    const float cameraDistance = glm::length(selectedPoint - matrices.position);
-    const float axisLength = std::max(0.25F, cameraDistance * 0.14F);
-    const std::array<glm::vec3, 3> axes{
-        glm::vec3{1.0F, 0.0F, 0.0F},
-        glm::vec3{0.0F, 1.0F, 0.0F},
-        glm::vec3{0.0F, 0.0F, 1.0F},
-    };
-    const std::array<ImU32, 3> axisColors{
-        IM_COL32(255, 88, 88, 245),
-        IM_COL32(88, 235, 120, 245),
-        IM_COL32(90, 150, 255, 245),
-    };
+    const auto gizmoHit = HitTestViewportGizmo(gizmoHandles, io.MousePos);
+    if (gizmoHit.has_value() || bestKeyIndex.has_value()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    }
+    if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        return;
+    }
 
-    for (std::size_t axisIndex = 0; axisIndex < axes.size(); ++axisIndex) {
-        const auto axisEnd = selectedPoint + (axes[axisIndex] * axisLength);
-        const auto projectedEnd = ProjectWorldPoint(matrices, viewport, axisEnd);
-        if (!projectedEnd.has_value()) {
-            continue;
-        }
-
-        drawList->AddLine(projectedSelected->screen, projectedEnd->screen, IM_COL32(0, 0, 0, 185), 5.0F);
-        drawList->AddLine(projectedSelected->screen, projectedEnd->screen, axisColors[axisIndex], 3.0F);
-        drawList->AddCircleFilled(projectedEnd->screen, 5.0F, axisColors[axisIndex], 14);
-
-        const float handleDistance = canInteractWithRenderViewport
-                                         ? DistanceToScreenSegment(io.MousePos, projectedSelected->screen, projectedEnd->screen)
-                                         : std::numeric_limits<float>::max();
-        if (canInteractWithRenderViewport &&
-            !panel.drag.active &&
-            !selectedKeyThisFrame &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-            handleDistance < 8.0F) {
-            const ImVec2 screenAxis{
-                projectedEnd->screen.x - projectedSelected->screen.x,
-                projectedEnd->screen.y - projectedSelected->screen.y,
-            };
-            const float screenAxisLength = std::max(1.0F, std::sqrt((screenAxis.x * screenAxis.x) + (screenAxis.y * screenAxis.y)));
+    const auto beginDrag = [&](const ViewportGizmoHit& hit, const glm::vec3& point) {
+        if (auto drag = BeginViewportGizmoDrag(hit, gizmoHandles, matrices, viewport, io.MousePos, point);
+            drag.has_value()) {
             panel.drag = {
                 .active = true,
                 .target = panel.editTarget,
                 .keyIndex = panel.selectedKeyIndex.value(),
-                .axis = static_cast<int>(axisIndex),
-                .startWorldPoint = selectedPoint,
-                .startMouse = io.MousePos,
-                .axisWorld = axes[axisIndex],
-                .axisScreenDirection = ImVec2{screenAxis.x / screenAxisLength, screenAxis.y / screenAxisLength},
-                .pixelsPerWorldUnit = screenAxisLength / axisLength,
+                .gizmo = drag.value(),
             };
+        }
+    };
+
+    // Gizmo handles claim the click first; otherwise a key click selects it,
+    // and clicking the already-selected key again starts a camera-plane drag
+    // (the same standard as the manual Flow path nodes).
+    if (gizmoHit.has_value()) {
+        beginDrag(gizmoHit.value(), selectedPoint);
+        return;
+    }
+    if (bestKeyIndex.has_value() && bestTarget.has_value()) {
+        const bool alreadySelected = panel.selectedKeyIndex.value() == bestKeyIndex.value() &&
+                                     panel.editTarget == bestTarget.value();
+        panel.selectedKeyIndex = bestKeyIndex.value();
+        panel.editTarget = bestTarget.value();
+        if (alreadySelected) {
+            beginDrag(
+                ViewportGizmoHit{.kind = ManualFlowPathGizmoDragKind::ViewPlane},
+                AnimationKeyPointWorld(path, bestKeyIndex.value(), bestTarget.value()));
         }
     }
 }
@@ -38733,12 +39307,60 @@ void DrawWaterGpuRainPanel(
         EndPanelSection();
     }
 
+    // Shared editor for a role's impact height band: effects run at full
+    // strength inside [Min Z, Max Z] and fade linearly to zero over the fade
+    // distance beyond each bounded edge. Unchecking a limit opens that edge.
+    const auto drawImpactHeightBand =
+        [](invisible_places::water::RainImpactHeightBand* band) {
+            constexpr float kUnbounded =
+                invisible_places::water::kRainImpactBandUnbounded;
+            bool lowerBounded = band->minZ > -kUnbounded * 0.5F;
+            if (ImGui::Checkbox("Limit Lower Z", &lowerBounded)) {
+                band->minZ = lowerBounded
+                                 ? (band->maxZ < kUnbounded * 0.5F
+                                        ? band->maxZ - 1.0F
+                                        : 0.0F)
+                                 : -kUnbounded;
+            }
+            if (lowerBounded) {
+                ImGui::SliderFloat("Band Min Z", &band->minZ, -2.0F, 12.0F, "%.2f m");
+            }
+            bool upperBounded = band->maxZ < kUnbounded * 0.5F;
+            if (ImGui::Checkbox("Limit Upper Z", &upperBounded)) {
+                band->maxZ = upperBounded
+                                 ? (band->minZ > -kUnbounded * 0.5F
+                                        ? band->minZ + 1.0F
+                                        : 2.0F)
+                                 : kUnbounded;
+            }
+            if (upperBounded) {
+                ImGui::SliderFloat("Band Max Z", &band->maxZ, -2.0F, 12.0F, "%.2f m");
+                band->maxZ = std::max(band->maxZ, std::min(band->minZ, 12.0F));
+            }
+            ImGui::SliderFloat("Band Fade", &band->fadeMeters, 0.01F, 2.0F, "%.2f m");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "The effect fades from full strength at the band edge to "
+                    "none this many metres beyond it.");
+            }
+        };
+
+    if (BeginPanelSection("SAND Impact Tuning")) {
+        ImGui::PushID("SandImpactBand");
+        drawImpactHeightBand(&settings.sandImpactBand);
+        ImGui::PopID();
+        EndPanelSection();
+    }
+
     if (BeginPanelSection("ROCK Impact Tuning")) {
         ImGui::SliderFloat("Edge Breakup", &settings.rockImpact.edgeBreakup, 0.0F, 1.0F, "%.2f");
         ImGui::SliderFloat("Spread Speed", &settings.rockImpact.spreadSpeed, 0.25F, 3.0F, "%.2f");
         ImGui::SliderFloat("Centre Falloff", &settings.rockImpact.centreFalloff, 0.0F, 1.0F, "%.2f");
         ImGui::SliderFloat("Height Bias", &settings.rockImpact.heightBias, 0.0F, 2.0F, "%.2f");
         ImGui::SliderFloat("Persistence", &settings.rockImpact.persistence, 0.25F, 3.0F, "%.2f");
+        ImGui::PushID("RockImpactBand");
+        drawImpactHeightBand(&settings.rockImpactBand);
+        ImGui::PopID();
         EndPanelSection();
     }
 
@@ -38766,6 +39388,9 @@ void DrawWaterGpuRainPanel(
             "%.3f m",
             ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("Stream Spread", &settings.vegetationImpact.streamSpread, 0.0F, 2.0F, "%.2f");
+        ImGui::PushID("VegetationImpactBand");
+        drawImpactHeightBand(&settings.vegetationImpactBand);
+        ImGui::PopID();
         EndPanelSection();
     }
 
@@ -40075,8 +40700,9 @@ void DrawWaterPanel(
         ImGui::Checkbox("Show Source Nodes / Paths", &water.showFlowSourceGuides);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Show point-source markers and authored manual-path guides. "
-                "Path editing remains visible while this is off.");
+                "Show point-source markers, authored manual-path guides, and "
+                "the path attractor marker. Path editing and armed placement "
+                "remain visible while this is off.");
         }
         if (water.overlayViewMode == WaterOverlayViewMode::Path) {
             const auto* selectedOverlayLabel =
@@ -42410,6 +43036,71 @@ void DrawControlsWindow(
     ImGui::End();
 }
 
+// Ctrl+click moves the currently selected viewport entity to the raycast
+// point-cloud position. Priority when several selections coexist: Seepage
+// node, Flow source, path attractor, then the selected animation key. Returns
+// false when nothing is selected so the click falls through to normal input;
+// a failed raycast still claims the click and surfaces the error.
+bool CtrlClickMoveSelectedViewportEntity(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    ImVec2 screenPoint) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& water = runtimeState->water;
+    if (water.selectedSeepageNodeIndex.has_value() &&
+        water.selectedSeepageNodeIndex.value() < water.seepageNodes.size()) {
+        water.movingSeepageNodeIndex = water.selectedSeepageNodeIndex;
+        MoveWaterSeepageNodeAtScreenPoint(runtimeState, viewport, screenPoint);
+        water.movingSeepageNodeIndex.reset();
+        return true;
+    }
+    if (water.selectedEmitterIndex.has_value() &&
+        water.selectedEmitterIndex.value() < water.emitters.size()) {
+        water.movingEmitterIndex = water.selectedEmitterIndex;
+        MoveWaterEmitterAtScreenPoint(runtimeState, viewport, screenPoint);
+        water.movingEmitterIndex.reset();
+        return true;
+    }
+    if (water.pathAttractorSelected) {
+        PlaceWaterPathAttractorAtScreenPoint(runtimeState, viewport, screenPoint);
+        return true;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (panel.currentPath.has_value() &&
+        panel.selectedKeyIndex.has_value() &&
+        panel.selectedKeyIndex.value() < panel.currentPath->keys.size() &&
+        panel.showSplines) {
+        const auto pivot = ResolveSurfacePivot(*runtimeState, viewport, screenPoint);
+        if (!pivot.has_value()) {
+            runtimeState->errorMessage =
+                "No visible surface was found under the pointer to move the "
+                "animation key to.";
+            runtimeState->statusMessage.clear();
+            return true;
+        }
+        if (MoveLinkedAnimationKeyPoint(
+                runtimeState,
+                &panel.currentPath.value(),
+                panel.selectedKeyIndex.value(),
+                panel.editTarget,
+                ToGlm(pivot->point))) {
+            panel.dirty = true;
+            runtimeState->pivotOverlay.visible = true;
+            runtimeState->pivotOverlay.pivot = pivot->point;
+            runtimeState->pivotOverlay.lastSetAt = std::chrono::steady_clock::now();
+            runtimeState->statusMessage =
+                panel.editTarget == AnimationEditTarget::Camera
+                    ? "Moved the camera key to the clicked surface point."
+                    : "Moved the focus key to the clicked surface point.";
+            runtimeState->errorMessage.clear();
+        }
+        return true;
+    }
+    return false;
+}
+
 void UpdateCameraFromInput(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell& viewport) {
@@ -42435,6 +43126,23 @@ void UpdateCameraFromInput(
         runtimeState->cameraInteraction.navigationActive = false;
         return;
     }
+    if (runtimeState->water.emitterGizmoDrag.kind != ManualFlowPathGizmoDragKind::None ||
+        runtimeState->water.emitterGizmoPointerCaptured ||
+        runtimeState->water.seepageGizmoDrag.kind != ManualFlowPathGizmoDragKind::None ||
+        runtimeState->water.seepageGizmoPointerCaptured) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
+    // The emitter/Seepage overlays run later in the frame, so their gizmo
+    // hover state is one frame old; treating a press over last frame's
+    // handles as consumed keeps orbit and the click dispatch below away from
+    // gizmo interactions that begin this frame.
+    if ((runtimeState->water.emitterGizmoHoveredLastFrame ||
+         runtimeState->water.seepageGizmoHoveredLastFrame) &&
+        io.MouseDown[0]) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
     const bool mouseButtonDown = io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2];
     const bool renderViewportHovered = IsMouseOverRenderViewport(viewport);
     if (!mouseButtonDown) {
@@ -42446,6 +43154,15 @@ void UpdateCameraFromInput(
     const bool mouseCanNavigate =
         !viewport.UiWantsMouseCapture() &&
         (renderViewportHovered || runtimeState->cameraInteraction.renderViewportMouseActive);
+    if (io.KeyCtrl &&
+        renderViewportHovered &&
+        !viewport.UiWantsMouseCapture() &&
+        !runtimeState->water.manualFlowPathEditor.active &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        CtrlClickMoveSelectedViewportEntity(runtimeState, viewport, io.MousePos)) {
+        runtimeState->cameraInteraction.navigationActive = false;
+        return;
+    }
     if (runtimeState->water.movingSeepageNodeIndex.has_value() &&
         renderViewportHovered &&
         !viewport.UiWantsMouseCapture() &&
