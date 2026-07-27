@@ -110,7 +110,7 @@ TEST_CASE("Seepage defaults describe a subtle damp fan", "[water][seepage][defau
 
     const WaterSeepageNode node;
     CHECK(node.reachMeters == Approx(1.25F));
-    CHECK(node.widthMeters == Approx(0.75F));
+    CHECK(node.widthMeters == Approx(0.10F));
     CHECK(node.prominence == Approx(1.0F));
     CHECK(node.selectionReachLimitMeters == Approx(2.34375F));
     CHECK(node.selectionWidthLimitMeters == Approx(1.215F));
@@ -632,10 +632,13 @@ TEST_CASE("Seepage fan widens downstream and feathers its sides and tail", "[wat
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
 
     // The band starts at the authored width at the node (half-width 0.375 m
-    // for the default node) and spreads outward with travelled distance. The
-    // default node is a vertical wall, so the run is reach 1.25 x 1.15 =
-    // ~1.44 m with a scaled end feather.
-    const auto grid = BuildGrid({MakeSeepageNode()});
+    // here) and spreads outward with travelled distance. The node is a
+    // vertical wall, so the run is reach 1.25 x 1.15 = ~1.44 m with a
+    // scaled end feather. (This exercises the cache-less guided/planar
+    // fallback; connected support uses the least-resistance flood.)
+    auto fanNode = MakeSeepageNode();
+    fanNode.widthMeters = 0.75F;
+    const auto grid = BuildGrid({fanNode});
     const auto insideHead = EvaluateWaterSeepageGridContribution(
         grid,
         {0.20F, 0.0F, -0.10F},
@@ -2288,8 +2291,76 @@ TEST_CASE("Connected Seepage support follows a turning maximum-downhill centreli
         support.selection.cells.end(),
         [](const auto& cell) { return cell.x >= 4 && cell.z <= -7; });
     REQUIRE(turnedCell != support.selection.cells.end());
-    CHECK(turnedCell->lateralDistanceMeters < 0.015F);
-    CHECK(turnedCell->downwardDistanceMeters > 0.05F);
+    // The least-resistance flood stores an accumulated cost and geodesic
+    // path: the turned end of a steep descent stays cheap (well under the
+    // contour-priced straight-line alternative) and its path length reflects
+    // the travelled route around the turn.
+    CHECK(turnedCell->downwardDistanceMeters > 0.03F);
+    CHECK(
+        turnedCell->downwardDistanceMeters <
+        turnedCell->lateralDistanceMeters *
+            invisible_places::water::kWaterSeepageContourCostFactor);
+    CHECK(turnedCell->lateralDistanceMeters > 0.06F);
+}
+
+TEST_CASE("Seepage flood splits into both downhill routes of a saddle",
+          "[water][seepage][surface-cache][connected][least-resistance]") {
+    using invisible_places::water::BuildWaterSeepageSupportSelection;
+    using invisible_places::water::BuildWaterSurfaceCacheFromSamples;
+    using invisible_places::water::WaterSurfaceRole;
+    using invisible_places::water::WaterSurfaceSample;
+
+    // A ridge point with two descending gullies (+X and -X) and a level
+    // contour shelf (+Y). Slow wetness should run down BOTH gullies and
+    // barely creep along the level shelf.
+    std::vector<WaterSurfaceSample> samples;
+    const auto addColumn = [&](float x, float y, float z) {
+        for (std::uint32_t sample = 0U; sample < 8U; ++sample) {
+            samples.push_back({
+                .position = {x, y, z},
+                .normal = {0.0F, 0.0F, 1.0F},
+                .role = WaterSurfaceRole::Rock,
+            });
+        }
+    };
+    addColumn(0.005F, 0.005F, -0.005F);
+    for (std::uint32_t station = 1U; station <= 6U; ++station) {
+        const float along = static_cast<float>(station) * 0.010F;
+        addColumn(0.005F + along, 0.005F, -0.005F - along);
+        addColumn(0.005F - along, 0.005F, -0.005F - along);
+        addColumn(0.005F, 0.005F + along, -0.005F);
+    }
+    const auto cache = BuildWaterSurfaceCacheFromSamples(samples, 0.010F);
+    auto node = MakeSeepageNode();
+    node.position = {0.005F, 0.005F, -0.005F};
+    // Generous cost limit so even the contour-priced shelf end is selected;
+    // the live budget does the real gating at render time.
+    node.selectionReachLimitMeters = 0.20F;
+    node.selectionWidthLimitMeters = 0.30F;
+    node.edgeFeatherMeters = 0.005F;
+
+    const auto support = BuildWaterSeepageSupportSelection(node, "ROCK", cache);
+    REQUIRE(support.success);
+    const auto costAt = [&](std::int32_t x, std::int32_t y) {
+        float best = std::numeric_limits<float>::max();
+        for (const auto& cell : support.selection.cells) {
+            if (cell.x == x && cell.y == y) {
+                best = std::min(best, cell.downwardDistanceMeters);
+            }
+        }
+        return best;
+    };
+    // Both gully ends were reached, at similar (cheap, descent-priced) cost.
+    const float rightGully = costAt(6, 0);
+    const float leftGully = costAt(-6, 0);
+    REQUIRE(rightGully < 1.0F);
+    REQUIRE(leftGully < 1.0F);
+    CHECK(rightGully == Catch::Approx(leftGully).margin(0.01F));
+    // The level shelf at the same travelled distance costs contour rates —
+    // markedly more than either descent.
+    const float shelf = costAt(0, 6);
+    REQUIRE(shelf < 1.0F);
+    CHECK(shelf > rightGully * 1.5F);
 }
 
 TEST_CASE("Connected Seepage support keeps live dimensions parameter-only",

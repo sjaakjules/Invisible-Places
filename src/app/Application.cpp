@@ -31600,24 +31600,52 @@ void DrawWaterSeepageOverlay(
                 }
             }
             if (selectedSupportCellCount > 0U) {
-                constexpr std::size_t kMaximumOverlayCells = 4096U;
+                // The overlay weights every drawn cell by the SAME live mask
+                // the point shaders apply, so it shows the actually affected
+                // area rather than a reconstruction of it. The runtime node
+                // carries the animation-composed budget/width; when no
+                // runtime grid holds this node yet (support rebuilding after
+                // a move), that state is reported instead of stale dots.
+                const invisible_places::water::WaterSeepageRuntimeNode* runtimeNode = nullptr;
+                for (const auto& [_, grid] : runtimeState->water.seepageRuntimeGrids) {
+                    for (const auto& candidate : grid.nodes) {
+                        if (candidate.id == node.id && candidate.usesConnectedSupport) {
+                            runtimeNode = &candidate;
+                            break;
+                        }
+                    }
+                    if (runtimeNode != nullptr) {
+                        break;
+                    }
+                }
+                // While an asynchronous support build is in flight the
+                // retained cells belong to the previous settled topology, so
+                // the overlay dims them and says so instead of presenting
+                // them as current.
+                const bool supportBuildPending =
+                    runtimeState->water.seepageSupportJob.shared != nullptr;
+                constexpr std::size_t kMaximumOverlayCells = 12288U;
                 const std::size_t stride = std::max<std::size_t>(
                     1U,
                     (selectedSupportCellCount + kMaximumOverlayCells - 1U) /
                         kMaximumOverlayCells);
                 std::size_t visitedCellIndex = 0U;
                 std::size_t drawnCellCount = 0U;
-                const float liveHalfWidth = endHalf;
                 for (const auto& [_, selections] : runtimeState->water.seepageSupportSelections) {
                     for (const auto& selection : selections) {
-                        if (selection.nodeId != node.id) {
+                        if (selection.nodeId != node.id || runtimeNode == nullptr) {
                             continue;
                         }
                         for (const auto& cell : selection.cells) {
                             const bool drawThisCell = (visitedCellIndex++ % stride) == 0U;
-                            if (!drawThisCell ||
-                                cell.downwardDistanceMeters > effectiveReach ||
-                                cell.lateralDistanceMeters > liveHalfWidth) {
+                            if (!drawThisCell) {
+                                continue;
+                            }
+                            const float cellMask =
+                                invisible_places::water::EvaluateWaterSeepageSupportCellMask(
+                                    *runtimeNode,
+                                    cell);
+                            if (cellMask <= 0.01F) {
                                 continue;
                             }
                             const glm::vec3 cellCenter{
@@ -31632,13 +31660,12 @@ void DrawWaterSeepageOverlay(
                             if (!cellProjection.has_value()) {
                                 continue;
                             }
-                            const float confidence = std::clamp(cell.confidence, 0.0F, 1.0F);
                             const int alpha = static_cast<int>(std::clamp(
-                                (selected ? 72.0F : 32.0F) *
-                                    (0.35F + 0.65F * confidence) *
-                                    std::max(0.15F, liveProminence),
+                                (selected ? 150.0F : 64.0F) * cellMask *
+                                    (supportBuildPending ? 0.35F : 1.0F) *
+                                    std::max(0.30F, liveProminence),
                                 8.0F,
-                                190.0F));
+                                220.0F));
                             drawList->AddCircleFilled(
                                 cellProjection->screen,
                                 selected ? 1.75F : 1.15F,
@@ -31648,9 +31675,12 @@ void DrawWaterSeepageOverlay(
                         }
                     }
                 }
-                if (selected && drawnCellCount == 0U) {
+                if (selected && (runtimeNode == nullptr || supportBuildPending)) {
                     runtimeState->water.seepageSurfaceGuideWarning =
-                        "Connected support is ready; current reach/width animation selects no cache cells.";
+                        "Connected support is rebuilding; dimmed dots show the previous settled footprint until it lands.";
+                } else if (selected && drawnCellCount == 0U) {
+                    runtimeState->water.seepageSurfaceGuideWarning =
+                        "Connected support is ready; the current Strength/animation budget selects no cache cells.";
                 }
                 drewSurfaceRibbon = true;
             }
@@ -39989,8 +40019,8 @@ bool DrawWaterSeepageSettingsControls(WaterSeepageLookSettings* look) {
                 0.15F,
                 "%.3f m",
                 "Sets the nominal width of each narrow wet finger; density controls how many "
-                "secondary fingers can appear. The run's overall extent comes from the node's "
-                "Reach and Node Strength, not from the pattern.",
+                "secondary fingers can appear. The run's overall extent comes from Node "
+                "Strength, not from the pattern.",
                 ImGuiSliderFlags_Logarithmic);
             slider(
                 "Front Softness",
@@ -40476,27 +40506,16 @@ void DrawWaterSeepagePanel(
         deleteSelected = ImGui::Button("Delete Node");
 
         paramsChanged |= ImGui::SliderFloat(
-            "Reach",
-            &node->reachMeters,
-            0.01F,
-            std::max(0.02F, node->selectionReachLimitMeters),
-            "%.2f m",
-            ImGuiSliderFlags_Logarithmic);
-        DrawWaterSeepageParameterTooltip(
-            "Nominal downhill travel at Node Strength one. Strength and surface steepness scale "
-            "the actual run — further on near-vertical rock, shorter across flat ground — inside "
-            "the selection limits. Parameter-only and keyable.");
-        paramsChanged |= ImGui::SliderFloat(
-            "Width",
+            "Source Width",
             &node->widthMeters,
             0.01F,
             std::max(0.02F, node->selectionWidthLimitMeters),
             "%.2f m",
             ImGuiSliderFlags_Logarithmic);
         DrawWaterSeepageParameterTooltip(
-            "Width of the wet band at the node. Below the node the area spreads outward with "
-            "travelled distance — faster on flat surfaces, slower on walls — scaled by Node "
-            "Strength. Parameter-only and keyable.");
+            "Width of the always-wet patch around the node. Everywhere beyond it the affected "
+            "area comes from Node Strength: wetness follows paths of least resistance across "
+            "the connected surface. Parameter-only and keyable.");
         paramsChanged |= ImGui::SliderFloat(
             "Prominence",
             &node->prominence,
@@ -40510,12 +40529,14 @@ void DrawWaterSeepagePanel(
             topologyChanged |= ImGui::SliderFloat(
                 "Maximum Selection Reach",
                 &node->selectionReachLimitMeters,
-                std::max(0.05F, node->reachMeters),
+                0.05F,
                 50.0F,
                 "%.2f m",
                 ImGuiSliderFlags_Logarithmic);
             DrawWaterSeepageParameterTooltip(
-                "Topology limit used by the asynchronous connected downhill flood. Increasing it rebuilds only this node's compact support.");
+                "Cost bound (in cost-metres) for the asynchronous least-resistance flood — the "
+                "hard ceiling on how far Node Strength can ever push this node. Changing it "
+                "rebuilds only this node's compact support.");
             topologyChanged |= ImGui::SliderFloat(
                 "Maximum Selection Width",
                 &node->selectionWidthLimitMeters,
@@ -40524,7 +40545,9 @@ void DrawWaterSeepagePanel(
                 "%.2f m",
                 ImGuiSliderFlags_Logarithmic);
             DrawWaterSeepageParameterTooltip(
-                "Topology limit for lateral connected support. Live Width remains responsive inside this bound.");
+                "Topology bound for the Source Width patch: cells within half this distance of "
+                "the node stay selected even where climbing cost exceeds the reach limit. Live "
+                "Source Width remains responsive inside this bound.");
             ImGui::TreePop();
         }
         topologyChanged |= ImGui::SliderFloat("Edge Feather", &node->edgeFeatherMeters, 0.0F, 5.0F, "%.2f m");
@@ -40539,11 +40562,13 @@ void DrawWaterSeepagePanel(
             "Zero ignores alignment; one applies the strongest filtering.");
         paramsChanged |= ImGui::SliderFloat("Node Strength", &node->strength, 0.0F, 3.0F, "%.2f");
         DrawWaterSeepageParameterTooltip(
-            "How much water this node carries — strength shapes the affected AREA, not the "
-            "intensity. Low keeps the run thin and short (travelling mainly down near-vertical "
-            "rock); high spreads it outward and further. Scenario Seepage Level and node "
-            "Activity keys multiply this live, so the area can grow and recede along an "
-            "animation without any rebuild.");
+            "How much water this node carries — strength is the travel budget, and wetness "
+            "follows paths of least resistance: it splits into every available downhill route "
+            "(further down steeper ones), spreads evenly but shortly across flat ground, and "
+            "wicks a short way up connected structure. Low keeps a small patch near the node; "
+            "high sends it far along each route. Scenario Seepage Level and node Activity keys "
+            "multiply this live, so the area grows and recedes along an animation without any "
+            "rebuild.");
         paramsChanged |= ImGui::InputScalar("Seed", ImGuiDataType_U32, &node->seed);
         DrawWaterSeepageParameterTooltip(
             "Selects a deterministic variation and 3D-noise rotation. The same seed remains stable across playback and export.");

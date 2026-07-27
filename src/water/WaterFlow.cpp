@@ -5414,6 +5414,14 @@ void ApplySeepageRuntimeScenarioAndAnimation(
         node->authoredProminence * nodeState.prominence,
         0.0F,
         8.0F);
+    // The connected-support travel budget comes from strength alone (which
+    // already folds in scenario level and activity); reach-scale keys and
+    // the spread/rain gains keep working by scaling the budget.
+    node->budgetMeters = std::clamp(
+        kWaterSeepageRunMetersPerStrength * node->strength *
+            nodeState.reachScale * reachScale,
+        0.0F,
+        std::max(0.0F, node->selectionReachLimitMeters));
     node->endHalfWidthMeters = node->widthMeters * 0.5F;
     node->startHalfWidthMeters = std::min(
         node->authoredStartHalfWidthMeters * nodeState.widthScale * widthScale,
@@ -7220,30 +7228,35 @@ SeepageFanSample EvaluateConnectedSeepageSupportMask(
     sample.signedLateralDistance = glm::dot(ToGlm(position) - node.position, node.lateralAxis);
     sample.surfaceNormal = SafeSeepageNormal(metadata.surfaceNormal);
     sample.downTangent = node.downAxis;
-    const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
-    // The envelope reads the cached support-cell normal, so runs lengthen on
-    // near-vertical cells and widen faster across flat ones as the water
-    // moves through changing terrain.
-    const auto envelope = EvaluateSeepageAreaEnvelope(
-        node,
-        sample.downDistance,
-        sample.surfaceNormal);
-    sample.effectiveReach = envelope.reachRun;
-    sample.effectiveHalfWidth = envelope.halfWidth;
-    if (sample.downDistance < -feather ||
-        sample.downDistance > envelope.reachRun + envelope.endFeather ||
-        sample.lateralDistance > envelope.halfWidth + envelope.lateralFeather) {
+    // Least-resistance membership: the cached per-cell flood cost is
+    // compared against the live strength-driven budget, and the geodesic
+    // path distance keeps a full-strength source patch of the authored
+    // Width around the node. Mirrored in SeepageConnectedSupportMask in
+    // shaders/pointcloud_sparse_ripple.glsl.
+    const float cost = std::max(0.0F, reference.downwardDistanceMeters);
+    const float pathDistance = std::max(0.0F, reference.lateralDistanceMeters);
+    const float budget = std::max(0.0F, node.budgetMeters);
+    sample.effectiveReach = budget;
+    sample.effectiveHalfWidth = std::max(node.widthMeters * 0.5F, budget * 0.5F);
+    if (budget <= 1.0e-5F) {
         return sample;
     }
-    const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
-    const float endMask = 1.0F - SmoothStep(
-        envelope.reachRun - envelope.endFeather,
-        envelope.reachRun + envelope.endFeather,
-        sample.downDistance);
-    const float lateralMask = 1.0F - SmoothStep(
-        envelope.halfWidth,
-        envelope.halfWidth + envelope.lateralFeather,
-        sample.lateralDistance);
+    const float feather = std::max(
+        std::max(1.0e-5F, node.edgeFeatherMeters),
+        budget * 0.15F);
+    const float sourceRadius = node.widthMeters * 0.5F;
+    const float budgetMask = 1.0F - SmoothStep(
+        std::max(0.0F, budget - feather),
+        budget,
+        cost);
+    const float sourceMask = 1.0F - SmoothStep(
+        sourceRadius,
+        sourceRadius + feather,
+        pathDistance);
+    const float coreMask = Clamp01(std::max(budgetMask, sourceMask));
+    if (coreMask <= 1.0e-6F) {
+        return sample;
+    }
     const bool normalValid = IsValidPoint(pointNormal) &&
                              glm::dot(pointNormal, pointNormal) > kNormalEpsilon;
     const glm::vec3 resolvedNormal = normalValid
@@ -7253,8 +7266,7 @@ SeepageFanSample EvaluateConnectedSeepageSupportMask(
     const float aligned = SmoothStep(0.15F, 0.85F, normalAgreement);
     const float normalMask = std::lerp(1.0F, aligned, Clamp01(node.normalAlignment));
     const float confidenceMask = std::lerp(0.65F, 1.0F, Clamp01(metadata.confidence));
-    sample.mask = Clamp01(
-        startMask * endMask * lateralMask * normalMask * confidenceMask);
+    sample.mask = Clamp01(coreMask * normalMask * confidenceMask);
     return sample;
 }
 
@@ -7398,7 +7410,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
         }
 
         std::uint64_t nodeHash = 1469598103934665603ULL;
-        SeepageFingerprintU32(&nodeHash, 2U);
+        SeepageFingerprintU32(&nodeHash, 3U);
         SeepageFingerprintU32(&nodeHash, node.id);
         SeepageFingerprintFloat(&nodeHash, node.position.x);
         SeepageFingerprintFloat(&nodeHash, node.position.y);
@@ -7418,7 +7430,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     std::sort(nodeFingerprints.begin(), nodeFingerprints.end());
 
     std::uint64_t hash = 1469598103934665603ULL;
-    SeepageFingerprintU32(&hash, 2U);
+    SeepageFingerprintU32(&hash, 3U);
     SeepageFingerprintText(&hash, normalizedTargetRole);
     SeepageFingerprintU32(
         &hash,
@@ -7426,7 +7438,7 @@ std::string WaterSeepageAuthoredTopologyFingerprint(
     for (const auto& fingerprint : nodeFingerprints) {
         SeepageFingerprintText(&hash, fingerprint);
     }
-    return "water-seepage-authored-topology-v2-" + SeepageFingerprintString(hash);
+    return "water-seepage-authored-topology-v3-" + SeepageFingerprintString(hash);
 }
 
 bool WaterSeepageGridHasActiveViewportEffect(
@@ -7593,6 +7605,7 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, node.depthToleranceMeters);
         SeepageFingerprintFloat(&hash, node.normalAlignment);
         SeepageFingerprintFloat(&hash, node.strength);
+        SeepageFingerprintFloat(&hash, node.budgetMeters);
         SeepageFingerprintFloat(&hash, node.rainVisualStrength);
         SeepageFingerprintFloat(&hash, node.scenarioSpread);
         SeepageFingerprintFloat(&hash, node.effectiveActivity);
@@ -8939,15 +8952,17 @@ std::optional<WaterSurfaceRole> SeepageSupportSourceRole(
 
 struct PendingSeepageSupportSurfel {
     const WaterSurfaceSurfel* surfel = nullptr;
-    float distanceFromNodeSquared = 0.0F;
+    // Accumulated least-resistance cost and geodesic distance from the node.
+    float costMeters = 0.0F;
+    float pathMeters = 0.0F;
 };
 
 struct PendingSeepageSupportSurfelGreater {
     bool operator()(
         const PendingSeepageSupportSurfel& left,
         const PendingSeepageSupportSurfel& right) const {
-        if (left.distanceFromNodeSquared != right.distanceFromNodeSquared) {
-            return left.distanceFromNodeSquared > right.distanceFromNodeSquared;
+        if (left.costMeters != right.costMeters) {
+            return left.costMeters > right.costMeters;
         }
         return std::tie(
                    left.surfel->cellX,
@@ -8997,7 +9012,9 @@ std::string WaterSeepageSupportSelectionFingerprint(
         SeepageFingerprintFloat(&hash, cell.surfaceNormal.z);
         SeepageFingerprintFloat(&hash, cell.confidence);
     }
-    return "water-seepage-support-v1-" + SeepageFingerprintString(hash);
+    // v2: least-resistance flood cost/path metrics replaced the
+    // centreline corridor.
+    return "water-seepage-support-v2-" + SeepageFingerprintString(hash);
 }
 
 }  // namespace
@@ -9082,70 +9099,27 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
     }
     lateralAxis = glm::normalize(lateralAxis);
 
-    // Trace the immutable maximum-downhill centreline once, then measure the
-    // connected flood against that path. This preserves turns in authored
-    // terrain instead of treating support as a straight polygonal fan. The
-    // guide is topology-only and is compacted to at most eight stations.
-    auto guideNode = node;
-    guideNode.reachMeters = result.selection.reachLimitMeters /
-                            std::max(1.0e-6F, kSeepageMaximumReachScale);
-    guideNode.targetSceneRoles = {
-        sourceRole.value() == WaterSurfaceRole::Sand ? "SAND" : "ROCK"};
-    const auto centreline = TraceWaterSeepageSurfaceCacheGuide(
-        guideNode,
-        surfaceCache);
-    const auto supportMetrics = [&](const glm::vec3& position) {
-        const glm::vec3 nodeDelta = position - nodePosition;
-        std::pair<float, float> metrics{
-            glm::dot(nodeDelta, downAxis),
-            std::abs(glm::dot(nodeDelta, lateralAxis)),
-        };
-        if (!centreline.valid || centreline.sampleCount < 2U) {
-            return metrics;
-        }
-
-        float bestDistanceSquared = std::numeric_limits<float>::infinity();
-        float bestStation = metrics.first;
-        const auto sampleCount = std::min<std::size_t>(
-            centreline.sampleCount,
-            centreline.samples.size());
-        for (std::size_t sampleIndex = 0U;
-             sampleIndex + 1U < sampleCount;
-             ++sampleIndex) {
-            const auto& left = centreline.samples[sampleIndex];
-            const auto& right = centreline.samples[sampleIndex + 1U];
-            const glm::vec3 leftPosition = ToGlm(left.position);
-            const glm::vec3 segment = ToGlm(right.position) - leftPosition;
-            const float segmentLengthSquared = glm::dot(segment, segment);
-            if (!std::isfinite(segmentLengthSquared) ||
-                segmentLengthSquared <= kNormalEpsilon) {
-                continue;
-            }
-            const float rawAmount =
-                glm::dot(position - leftPosition, segment) /
-                segmentLengthSquared;
-            // Extend the final tangent so the reach threshold still clips a
-            // centreline that ended one cache cell short of the authored
-            // limit. Earlier segments remain finite and cannot fold back.
-            const float amount = sampleIndex + 2U == sampleCount
-                                     ? std::max(0.0F, rawAmount)
-                                     : std::clamp(rawAmount, 0.0F, 1.0F);
-            const glm::vec3 closest = leftPosition + segment * amount;
-            const glm::vec3 separation = position - closest;
-            const float distanceSquared = glm::dot(separation, separation);
-            const float station = std::lerp(left.station, right.station, amount);
-            if (distanceSquared < bestDistanceSquared - 1.0e-8F ||
-                (std::abs(distanceSquared - bestDistanceSquared) <= 1.0e-8F &&
-                 station < bestStation)) {
-                bestDistanceSquared = distanceSquared;
-                bestStation = station;
-            }
-        }
-        if (std::isfinite(bestDistanceSquared)) {
-            metrics.first = bestStation;
-            metrics.second = std::sqrt(std::max(0.0F, bestDistanceSquared));
-        }
-        return metrics;
+    // Least-resistance flood: a Dijkstra expansion over connected surfels
+    // where each step costs its length scaled by how slow seeping wetness
+    // moves in that direction — steep descent is cheap, contouring is
+    // expensive, and climbing is very expensive. Water therefore splits into
+    // every available downhill path (left AND right of a saddle), runs
+    // further down steeper routes, spreads evenly but shortly across flat
+    // ground, and wicks a short way up connected structure above the node.
+    // The stored per-cell cost is compared against the live strength-driven
+    // budget at render time, so the area reshapes without rebuilding.
+    const auto stepCostFactor = [](const glm::vec3& step, float stepLength) {
+        const float drop = -step.z / std::max(stepLength, 1.0e-6F);
+        const float blend = std::clamp(drop * 2.0F, -1.0F, 1.0F);
+        return blend >= 0.0F
+                   ? std::lerp(
+                         kWaterSeepageContourCostFactor,
+                         kWaterSeepageDescentCostFactor,
+                         blend)
+                   : std::lerp(
+                         kWaterSeepageContourCostFactor,
+                         kWaterSeepageAscentCostFactor,
+                         -blend);
     };
     const float depthTolerance = std::clamp(
         SeepageFiniteOr(node.depthToleranceMeters, 0.15F),
@@ -9156,11 +9130,12 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         0.0F,
         std::max(result.selection.reachLimitMeters,
                  result.selection.widthLimitMeters));
-    const float riseTolerance = std::max(
-        sourceResolution * 0.50F,
-        std::min(depthTolerance, sourceResolution * 2.0F));
     const float reachLimit = result.selection.reachLimitMeters;
     const float halfWidthLimit = result.selection.widthLimitMeters * 0.5F;
+    // The flood stops at the cost limit: the selection reach limit expressed
+    // in cost-metres plus the feather allowance, so the live budget always
+    // has selected cells to feather across.
+    const float costLimit = reachLimit + edgeAllowance * kWaterSeepageContourCostFactor;
     const float continuityDistance = std::clamp(
         depthTolerance,
         sourceResolution * 1.75F,
@@ -9172,10 +9147,11 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         std::vector<PendingSeepageSupportSurfel>,
         PendingSeepageSupportSurfelGreater>
         pending;
-    std::set<SeepageSupportSourceKey> queued;
+    std::map<SeepageSupportSourceKey, float> queuedCost;
     std::set<SeepageSupportSourceKey> visited;
     std::map<SeepageSupportCellKey, WaterSeepageSupportCell> emitted;
     std::vector<const WaterSurfaceSurfel*> acceptedSubstrateSurfels;
+    std::vector<std::pair<float, float>> acceptedSubstrateCostPath;
     const bool targetIsVegetation =
         NormalizeSeepageRole(targetSceneRole) == "veg";
     const auto emitSourceCell = [&](std::int32_t sourceX,
@@ -9244,8 +9220,8 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         result.errorMessage = "The shared-cache Seepage seed cell was not addressable.";
         return result;
     }
-    pending.push({.surfel = startSurfel, .distanceFromNodeSquared = 0.0F});
-    queued.insert(startKey);
+    pending.push({.surfel = startSurfel, .costMeters = 0.0F, .pathMeters = 0.0F});
+    queuedCost.emplace(startKey, 0.0F);
 
     while (!pending.empty()) {
         if (options.stopToken != nullptr && options.stopToken->stop_requested()) {
@@ -9275,19 +9251,14 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         ++result.diagnostics.visitedSurfelCount;
 
         const glm::vec3 centroid = ToGlm(surfel.centroid);
-        const glm::vec3 delta = centroid - nodePosition;
-        const float axialDistance = glm::dot(delta, downAxis);
-        const auto [downwardDistance, lateralDistance] = supportMetrics(centroid);
         bool accepted = true;
-        if (centroid.z > nodePosition.z + riseTolerance) {
-            ++result.diagnostics.rejectedAboveNodeCount;
-            accepted = false;
-        } else if (axialDistance < -riseTolerance ||
-                   downwardDistance > reachLimit + edgeAllowance) {
+        // Cells are kept while the flood cost stays inside the reach limit
+        // OR the geodesic path stays inside the Source Width patch bound
+        // (the width limit), so the always-wet patch is never clipped by
+        // ascent pricing right above the node.
+        if (current.costMeters > costLimit &&
+            current.pathMeters > halfWidthLimit + edgeAllowance) {
             ++result.diagnostics.rejectedReachCount;
-            accepted = false;
-        } else if (lateralDistance > halfWidthLimit + edgeAllowance) {
-            ++result.diagnostics.rejectedWidthCount;
             accepted = false;
         } else if (surfel.confidence < 0.10F || surfel.normalCoherence < 0.10F) {
             ++result.diagnostics.rejectedContinuityCount;
@@ -9297,27 +9268,27 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         if (accepted) {
             ++result.diagnostics.acceptedSurfelCount;
             acceptedSubstrateSurfels.push_back(&surfel);
+            acceptedSubstrateCostPath.emplace_back(
+                current.costMeters,
+                current.pathMeters);
             if (!targetIsVegetation &&
                 !emitSourceCell(
                     surfel.cellX,
                     surfel.cellY,
                     surfel.cellZ,
-                    downwardDistance,
-                    lateralDistance,
+                    current.costMeters,
+                    current.pathMeters,
                     surfel.normal,
                     surfel.confidence *
                         (0.45F + 0.55F * surfel.normalCoherence))) {
                 result.diagnostics.cellLimitExceeded = true;
                 result.errorMessage =
                     "Connected Seepage support exceeded its bounded 10 mm cell budget; "
-                    "reduce Selection Reach/Width limits.";
+                    "reduce the Selection Reach limit.";
                 return result;
             }
         }
 
-        // Rejected cells terminate that branch. This prevents the traversal
-        // from crossing above-node or out-of-envelope terrain and re-entering
-        // the selected region from the far side.
         if (!accepted) {
             continue;
         }
@@ -9334,15 +9305,15 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                         surfel.cellZ + dz,
                         sourceRole.value(),
                     };
-                    if (queued.contains(key) || visited.contains(key)) {
+                    if (visited.contains(key)) {
                         continue;
                     }
                     const auto* neighbour = FindSeepageSupportSurfel(surfaceCache, key);
                     if (neighbour == nullptr) {
                         continue;
                     }
-                    const glm::vec3 neighbourDelta = ToGlm(neighbour->centroid) - centroid;
-                    const float distanceSquared = glm::dot(neighbourDelta, neighbourDelta);
+                    const glm::vec3 step = ToGlm(neighbour->centroid) - centroid;
+                    const float distanceSquared = glm::dot(step, step);
                     const glm::vec3 neighbourNormal = SafeSeepageNormal(neighbour->normal);
                     if (!std::isfinite(distanceSquared) ||
                         distanceSquared > continuityDistanceSquared ||
@@ -9350,12 +9321,21 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                         ++result.diagnostics.rejectedContinuityCount;
                         continue;
                     }
-                    const glm::vec3 fromNode = ToGlm(neighbour->centroid) - nodePosition;
+                    const float stepLength = std::sqrt(distanceSquared);
+                    const float nextCost =
+                        current.costMeters +
+                        stepLength * stepCostFactor(step, stepLength);
+                    if (const auto existing = queuedCost.find(key);
+                        existing != queuedCost.end() &&
+                        existing->second <= nextCost + 0.005F) {
+                        continue;
+                    }
                     pending.push({
                         .surfel = neighbour,
-                        .distanceFromNodeSquared = glm::dot(fromNode, fromNode),
+                        .costMeters = nextCost,
+                        .pathMeters = current.pathMeters + stepLength,
                     });
-                    queued.insert(key);
+                    queuedCost.insert_or_assign(key, nextCost);
                 }
             }
         }
@@ -9391,8 +9371,11 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
             0.30F);
         const float associationDistanceSquared =
             associationDistance * associationDistance;
+        // Descent-priced cost lets substrate reach costLimit / 0.75 metres
+        // of geometric distance, so the scan radius must cover that.
         const float selectionRadius =
-            reachLimit + halfWidthLimit + associationDistance;
+            costLimit / kWaterSeepageDescentCostFactor +
+            halfWidthLimit + associationDistance;
         const auto minimumCellX = SeepageCellCoordinate(
             nodePosition.x - selectionRadius,
             sourceResolution);
@@ -9450,8 +9433,18 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                 continue;
             }
             const auto& substrate = substrateGraph.points[*closestIndex];
-            const auto [downwardDistance, lateralDistance] =
-                supportMetrics(substrate.position);
+            // Vegetation hugging its wet substrate (moss, low growth) shares
+            // the seep; canopy hovering above it stays dry.
+            const float riseAboveSubstrate =
+                vegetationPosition.z - substrate.position.z;
+            if (riseAboveSubstrate > kWaterSeepageVegetationRiseMeters) {
+                continue;
+            }
+            const auto& [substrateCost, substratePath] =
+                acceptedSubstrateCostPath[*closestIndex];
+            const float climbPenalty =
+                std::max(0.0F, riseAboveSubstrate) *
+                kWaterSeepageAscentCostFactor;
             const float vegetationConfidence = std::clamp(
                 static_cast<float>(vegetation->sampleCount) / 8.0F,
                 0.0F,
@@ -9460,14 +9453,14 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
                     vegetation->cellX,
                     vegetation->cellY,
                     vegetation->cellZ,
-                    downwardDistance,
-                    lateralDistance,
+                    substrateCost + climbPenalty,
+                    substratePath + std::max(0.0F, riseAboveSubstrate),
                     FromGlm(substrate.normal),
                     substrate.confidence * (0.50F + 0.50F * vegetationConfidence))) {
                 result.diagnostics.cellLimitExceeded = true;
                 result.errorMessage =
                     "Connected Seepage VEG support exceeded its bounded 10 mm cell budget; "
-                    "reduce Selection Reach/Width limits.";
+                    "reduce the Selection Reach limit.";
                 return result;
             }
         }
@@ -9498,6 +9491,34 @@ WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
         node);
     result.success = true;
     return result;
+}
+
+float EvaluateWaterSeepageSupportCellMask(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageSupportCell& cell) {
+    // Same budget/source-patch math as EvaluateConnectedSeepageSupportMask
+    // (minus the per-point normal-agreement term the overlay cannot know).
+    const float cost = std::max(0.0F, cell.downwardDistanceMeters);
+    const float pathDistance = std::max(0.0F, cell.lateralDistanceMeters);
+    const float budget = std::max(0.0F, node.budgetMeters);
+    if (budget <= 1.0e-5F) {
+        return 0.0F;
+    }
+    const float feather = std::max(
+        std::max(1.0e-5F, node.edgeFeatherMeters),
+        budget * 0.15F);
+    const float sourceRadius = node.widthMeters * 0.5F;
+    const float budgetMask = 1.0F - SmoothStep(
+        std::max(0.0F, budget - feather),
+        budget,
+        cost);
+    const float sourceMask = 1.0F - SmoothStep(
+        sourceRadius,
+        sourceRadius + feather,
+        pathDistance);
+    const float coreMask = Clamp01(std::max(budgetMask, sourceMask));
+    const float confidenceMask = std::lerp(0.65F, 1.0F, Clamp01(cell.confidence));
+    return Clamp01(coreMask * confidenceMask);
 }
 
 bool CommitWaterSeepageSupportSelection(

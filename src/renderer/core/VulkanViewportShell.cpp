@@ -813,7 +813,9 @@ WaterSeepageNodeParamsGpu MakeWaterSeepageNodeParamsGpu(
         finiteClamp(node.reachMeters, 0.0F, 1000.0F, 1.25F),
         finiteClamp(node.widthMeters, 0.0F, 1000.0F, 0.75F),
         finiteClamp(node.prominence, 0.0F, 8.0F, 1.0F),
-        finiteClamp(node.startHalfWidthMeters, 0.0F, 500.0F, 0.06F),
+        // Least-resistance travel budget for connected support (replaces the
+        // unused source half-width lane).
+        finiteClamp(node.budgetMeters, 0.0F, 1000.0F, 1.5F),
     };
     for (std::size_t basisIndex = 0U; basisIndex < gpu.noiseBasis.size(); ++basisIndex) {
         glm::vec3 basis = node.noiseRotation[basisIndex];

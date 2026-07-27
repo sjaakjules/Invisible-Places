@@ -86,9 +86,8 @@ struct SeepageNodeParams {
     SeepageLook transitionLook;
     // x: scenario/local spread, y: pattern-transition amount, z: wetting progress.
     vec4 scenario;
-    // x: live reach, y: live full width, z: live prominence,
-    // w: live source half-width (unused by the area envelope; kept for
-    // layout stability).
+    // x: live reach (guided/planar fallback), y: live source width,
+    // z: live prominence, w: least-resistance travel budget (connected).
     vec4 liveGeometry;
     // Seed-derived, orientation-independent world-noise rotation.
     vec4 noiseBasis[3];
@@ -1804,6 +1803,11 @@ vec3 DecodeSeepageSupportNormal(uint packed) {
     return RippleSafeNormal(normal);
 }
 
+// Least-resistance membership: the cached per-cell flood cost is compared
+// against the live strength-driven budget (liveGeometry.w), and the geodesic
+// path distance keeps a full-strength source patch of the authored Width
+// around the node. CPU mirror: EvaluateConnectedSeepageSupportMask in
+// src/water/WaterFlow.cpp.
 float SeepageConnectedSupportMask(
     uint nodeIndex,
     SeepageNodeReference reference,
@@ -1816,35 +1820,56 @@ float SeepageConnectedSupportMask(
     out float lateralNormalised,
     out vec3 resolvedSurfaceNormal,
     out vec3 resolvedDownTangent) {
-    downstreamDistance = reference.downstreamDistance;
+    const float cost = max(0.0, reference.downstreamDistance);
+    const float pathDistance = max(0.0, reference.lateralDistance);
+    downstreamDistance = cost;
     const vec3 lateralAxis = RippleSafeNormal(
         seepageNodeData.seepageNodes[nodeIndex].lateralStart.xyz);
-    const float lateralSign = dot(
-            worldPosition - seepageNodeData.seepageNodes[nodeIndex].positionReach.xyz,
-            lateralAxis) < 0.0
-        ? -1.0
-        : 1.0;
-    lateralDistance = reference.lateralDistance * lateralSign;
+    lateralDistance = dot(
+        worldPosition - seepageNodeData.seepageNodes[nodeIndex].positionReach.xyz,
+        lateralAxis);
     resolvedSurfaceNormal = DecodeSeepageSupportNormal(
         reference.packedNormalRoleConfidenceFlags);
     resolvedDownTangent = RippleSafeNormal(
         seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz);
-    // The envelope reads the cached support-cell normal, so runs lengthen on
-    // near-vertical cells and widen faster across flat ones.
-    const float mask = SeepageResolvedFanMask(
-        nodeIndex,
-        pointNormal,
-        downstreamDistance,
-        lateralDistance,
-        0.0,
-        resolvedSurfaceNormal,
-        3.402823466e+38,
-        effectiveReach,
-        effectiveHalfWidth,
-        lateralNormalised);
+    const float budget = max(0.0, seepageParamData.seepageParams[nodeIndex].liveGeometry.w);
+    const float sourceRadius =
+        max(0.0, seepageParamData.seepageParams[nodeIndex].liveGeometry.y) * 0.5;
+    effectiveReach = budget;
+    effectiveHalfWidth = max(sourceRadius, budget * 0.5);
+    lateralNormalised = lateralDistance / max(effectiveHalfWidth, 1e-4);
+    if (budget <= 1e-5) {
+        return 0.0;
+    }
+    const float edgeFeather = max(
+        1e-4,
+        seepageNodeData.seepageNodes[nodeIndex].downEdge.w);
+    const float feather = max(edgeFeather, budget * 0.15);
+    const float budgetMask = 1.0 - smoothstep(
+        max(0.0, budget - feather),
+        budget,
+        cost);
+    const float sourceMask = 1.0 - smoothstep(
+        sourceRadius,
+        sourceRadius + feather,
+        pathDistance);
+    const float coreMask = clamp(max(budgetMask, sourceMask), 0.0, 1.0);
+    if (coreMask <= 1e-6) {
+        return 0.0;
+    }
+    const vec3 resolvedPointNormal =
+        styleData.pointMeta.z != 0u && dot(pointNormal, pointNormal) > 1e-8
+            ? normalize(pointNormal)
+            : resolvedSurfaceNormal;
+    const float normalAgreement = abs(dot(resolvedPointNormal, resolvedSurfaceNormal));
+    const float aligned = smoothstep(0.15, 0.85, normalAgreement);
+    const float normalMask = mix(
+        1.0,
+        aligned,
+        clamp(seepageParamData.seepageParams[nodeIndex].geometry.y, 0.0, 1.0));
     const float confidence =
         float((reference.packedNormalRoleConfidenceFlags >> 20u) & 0xffu) / 255.0;
-    return mask * mix(0.65, 1.0, confidence);
+    return clamp(coreMask * normalMask * mix(0.65, 1.0, confidence), 0.0, 1.0);
 }
 
 uvec4 SeepageLookControl(uint nodeIndex, bool transition) {

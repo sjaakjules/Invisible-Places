@@ -428,14 +428,15 @@ struct WaterSeepageNode {
     invisible_places::io::Float3 position{};
     invisible_places::io::Float3 surfaceNormal{0.0F, 1.0F, 0.0F};
     invisible_places::io::Float3 downAxis{0.0F, 0.0F, -1.0F};
-    // Nominal travel at strength one; strength and surface steepness scale
-    // the run inside the selection limits.
+    // Legacy nominal travel, kept for the cache-less guided/planar fallback
+    // and old documents. Connected support derives its travel budget from
+    // Node Strength alone (kWaterSeepageRunMetersPerStrength).
     float reachMeters = 1.25F;
-    // Width is the live full width at the node. Below the node the area
-    // envelope widens with travelled distance (strength- and slope-driven);
-    // the legacy start/end fields remain readable during the staged
-    // migration, but new topology and parameter fingerprints use widthMeters.
-    float widthMeters = 0.75F;
+    // Width is the live full width of the always-wet source patch around the
+    // node; everywhere beyond it the affected area comes from the
+    // least-resistance flood budget (Node Strength). The legacy start/end
+    // fields remain readable during the staged migration.
+    float widthMeters = 0.10F;
     float startWidthMeters = 0.12F;
     float endWidthMeters = 0.75F;
     // Prominence scales only how strongly the effect is applied, never where
@@ -506,6 +507,10 @@ struct WaterSeepageRuntimeNode {
     float depthToleranceMeters = 0.15F;
     float normalAlignment = 0.20F;
     float strength = 1.0F;
+    // Live least-resistance travel budget in cost-metres, derived from
+    // strength (and reach-scale animation, spread, and rain gains), clamped
+    // to the selection reach limit.
+    float budgetMeters = 1.5F;
     float rainVisualStrength = 0.0F;
     float scenarioSpread = 0.0F;
     float effectiveActivity = 1.0F;
@@ -533,6 +538,21 @@ struct WaterSeepageRuntimeNode {
 inline constexpr float kWaterSeepageSupportCellSizeMeters = 0.010F;
 inline constexpr std::size_t kWaterSeepageMaximumSupportCellsPerNode = 262'144U;
 
+// Least-resistance flood model: support is selected by a Dijkstra flood over
+// connected cache surfels where each step costs its length scaled by how the
+// water would move — steep descent is cheap, contouring is expensive, and
+// climbing is very expensive (a short wetting halo above the node). Node
+// Strength converts to a live travel budget in cost-metres, so the wet area
+// splits into every available downhill path, runs further down steeper ones,
+// and recedes or spreads per frame with zero topology work.
+inline constexpr float kWaterSeepageDescentCostFactor = 0.75F;
+inline constexpr float kWaterSeepageContourCostFactor = 2.2F;
+inline constexpr float kWaterSeepageAscentCostFactor = 5.0F;
+inline constexpr float kWaterSeepageRunMetersPerStrength = 1.5F;
+// Vegetation more than this far above its connected substrate is hovering
+// canopy and stays dry.
+inline constexpr float kWaterSeepageVegetationRiseMeters = 0.15F;
+
 // One density-independent cache cell selected beneath an authored node. The
 // metrics are evaluated against live node parameters and therefore do not
 // change while an animation is playing.
@@ -540,6 +560,9 @@ struct WaterSeepageSupportCell {
     std::int32_t x = 0;
     std::int32_t y = 0;
     std::int32_t z = 0;
+    // Accumulated least-resistance cost from the node (cost-metres) and the
+    // geodesic surface distance actually travelled. Field names predate the
+    // flood model and are kept for the shared CPU/GPU reference ABI.
     float downwardDistanceMeters = 0.0F;
     float lateralDistanceMeters = 0.0F;
     invisible_places::io::Float3 surfaceNormal{0.0F, 0.0F, 1.0F};
@@ -1373,6 +1396,12 @@ void ApplyWaterTimingLevelToScenarioState(
 [[nodiscard]] bool CommitWaterSeepageSupportSelection(
     const WaterSeepageSupportBuildResult& candidate,
     WaterSeepageSupportSelection* settledSelection);
+// The live membership weight of one selected support cell — the exact mask
+// the renderer applies (minus the per-point normal-agreement term), so the
+// Structure Overlay can show the truly affected area.
+[[nodiscard]] float EvaluateWaterSeepageSupportCellMask(
+    const WaterSeepageRuntimeNode& node,
+    const WaterSeepageSupportCell& cell);
 void ApplyWaterSeepageRuntimeParameters(
     WaterSeepageSpatialGrid* grid,
     std::span<const WaterSeepageNode> nodes,
