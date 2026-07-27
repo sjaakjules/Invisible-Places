@@ -24,6 +24,7 @@ float EvaluateRockRainImpactValue(
     uint eventSeed,
     vec4 rockImpact0,
     vec4 rockImpact1,
+    float downhillStretch,
     vec3 point,
     vec3 pointNormal,
     float age) {
@@ -85,8 +86,28 @@ float EvaluateRockRainImpactValue(
     // broad phase used by the fixed-capacity impact grid.
     const float irregularRadiusScale = 1.0 -
         0.35 * clamp(rockImpact0.x, 0.0, 1.0) * breakupNoise;
+    // Steep impacts spawn with a boosted radius (see EmitImpact in both
+    // simulators, same steepness formula). The footprint puts that extra
+    // radius into the downhill run only: lateral and uphill extents
+    // normalize back to the unboosted radius and tighten further with
+    // stretch, so wetness reads as rivulets running down walls while flat
+    // impacts keep their even spread. Every extent stays inside the boosted
+    // event radius, preserving the broad-phase grid invariant. CPU mirror:
+    // EvaluateRockRainImpactValue in src/water/RainSimulation.cpp.
+    const float steepness = clamp(1.0 - abs(eventNormal.z), 0.0, 1.0);
+    const float stretch = clamp(downhillStretch, 0.0, 2.0) * steepness;
+    const float spawnBoost = 1.0 + steepness * clamp(downhillStretch, 0.0, 1.0);
+    const float downAmount = dot(tangent, downhill);
+    const vec3 lateralOffset = tangent - downhill * downAmount;
+    const float lateralFactor = spawnBoost * (1.0 + 0.25 * stretch);
+    const float uphillFactor = spawnBoost * (1.0 + 0.80 * stretch);
+    const float shapedDown = max(downAmount, 0.0);
+    const float shapedUp = max(-downAmount, 0.0) * uphillFactor;
+    const float shapedTangentSquared =
+        shapedDown * shapedDown + shapedUp * shapedUp +
+        dot(lateralOffset, lateralOffset) * lateralFactor * lateralFactor;
     const float normalizedDistance = (
-        sqrt(dot(tangent, tangent) + normalDistance * normalDistance * 4.0) /
+        sqrt(shapedTangentSquared + normalDistance * normalDistance * 4.0) /
         effectiveRadius) / max(0.65, irregularRadiusScale);
     // Retain the original broad-phase cells: once downhill drift begins, the
     // late feather plus the 20% centre travel still fits inside eventRadius.

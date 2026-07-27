@@ -33,9 +33,10 @@ struct SparseRippleComposite {
 };
 
 struct SeepageLook {
-    // x: pattern (0 legacy, 1 wet rock, 2 chaotic bloom, 3 wetting trickle), y: blend mode.
+    // x: pattern (0 wet rock, 1 chaotic bloom, 2 wetting trickle), y: blend mode.
     uvec4 control;
-    // Legacy-only parameters.
+    // legacy0 lanes are spare (layout retained from the removed legacy-ripple
+    // pattern); legacy1 carries z: density, w: response intensity.
     vec4 legacy0;
     vec4 legacy1;
     vec4 response0;
@@ -45,7 +46,8 @@ struct SeepageLook {
     vec4 organic0;
     // x: angle response, y: micro-normal strength, z: glint density, w: curl.
     vec4 organic1;
-    // x: breakup, y: downhill drift, z: trickle length, w: trickle width.
+    // x: breakup, y: downhill drift, z: spare (was trickle length),
+    // w: finger width.
     vec4 organic2;
     // x: trickle-front softness.
     vec4 organic3;
@@ -85,7 +87,8 @@ struct SeepageNodeParams {
     // x: scenario/local spread, y: pattern-transition amount, z: wetting progress.
     vec4 scenario;
     // x: live reach, y: live full width, z: live prominence,
-    // w: live source half-width.
+    // w: live source half-width (unused by the area envelope; kept for
+    // layout stability).
     vec4 liveGeometry;
     // Seed-derived, orientation-independent world-noise rotation.
     vec4 noiseBasis[3];
@@ -1488,34 +1491,13 @@ float SeepageNoiseHash01(int x, int y, uint seed) {
     return float(hash & 0x00ffffffu) / float(0x01000000u);
 }
 
-float SeepageValueNoise(vec2 coordinate, uint seed) {
-    const ivec2 base = ivec2(floor(coordinate));
-    const vec2 f = fract(coordinate);
-    const vec2 smoothF = f * f * (3.0 - 2.0 * f);
-    const float a = SeepageNoiseHash01(base.x, base.y, seed);
-    const float b = SeepageNoiseHash01(base.x + 1, base.y, seed);
-    const float c = SeepageNoiseHash01(base.x, base.y + 1, seed);
-    const float d = SeepageNoiseHash01(base.x + 1, base.y + 1, seed);
-    return mix(mix(a, b, smoothF.x), mix(c, d, smoothF.x), smoothF.y);
-}
-
-float SeepageFractalNoise(vec2 coordinate, uint seed, uint quality) {
-    const uint octaveCount = quality == 0u ? 1u : (quality >= 2u ? 3u : 2u);
-    float value = 0.0;
-    float weight = 0.0;
-    float amplitude = 1.0;
-    for (uint octave = 0u; octave < 3u; ++octave) {
-        if (octave >= octaveCount) {
-            break;
-        }
-        value += SeepageValueNoise(coordinate, seed + octave * 1013u) * amplitude;
-        weight += amplitude;
-        coordinate = coordinate * 2.03 + vec2(17.0, 31.0);
-        amplitude *= 0.5;
-    }
-    return weight > 0.0 ? value / weight : 0.0;
-}
-
+// Area envelope shared by every membership path (CPU mirror:
+// EvaluateSeepageAreaEnvelope in src/water/WaterFlow.cpp — keep the
+// constants in sync). Node strength shapes WHERE seepage lives: the run
+// scales with strength and travels further on near-vertical surfaces, while
+// the half-width starts at the authored node width and spreads outward with
+// travelled distance — faster on flat surfaces, slower on walls. Prominence
+// only scales how strongly the effect is applied.
 float SeepageResolvedFanMask(
     uint nodeIndex,
     vec3 pointNormal,
@@ -1523,44 +1505,68 @@ float SeepageResolvedFanMask(
     float signedLateralDistance,
     float planeDistance,
     vec3 surfaceNormal,
-    float maskReach,
-    float widthProgressReach,
+    float reachBound,
+    out float effectiveReach,
+    out float effectiveHalfWidth,
     out float lateralNormalised) {
+    effectiveReach = 0.0;
+    effectiveHalfWidth = 0.0;
     lateralNormalised = 0.0;
     const float surfaceThickness = max(
         1e-4,
         seepageNodeData.seepageNodes[nodeIndex].normalSurface.w);
     const float edgeFeather = max(1e-4, seepageNodeData.seepageNodes[nodeIndex].downEdge.w);
-    maskReach = max(0.0, maskReach);
-    widthProgressReach = max(1e-4, widthProgressReach);
-    if (downstreamDistance < -edgeFeather || downstreamDistance > maskReach + edgeFeather) {
+    const float steep = clamp(1.0 - abs(surfaceNormal.z), 0.0, 1.0);
+    const float strength = clamp(
+        seepageParamData.seepageParams[nodeIndex].geometry.z,
+        0.0,
+        8.0);
+    const float liveReach = max(
+        0.0,
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
+    const float reachLimit = max(
+        0.0,
+        seepageNodeData.seepageNodes[nodeIndex].positionReach.w);
+    const float reachRun = min(
+        clamp(liveReach * strength * mix(0.45, 1.15, steep), 0.0, reachLimit),
+        reachBound);
+    const float spreadRate = 0.18 * strength * mix(1.60, 0.45, steep);
+    const float halfWidthLimit = max(
+        0.0,
+        seepageNodeData.seepageNodes[nodeIndex].geometry.x);
+    const float halfWidth = clamp(
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.y * 0.5 +
+            max(downstreamDistance, 0.0) * spreadRate,
+        0.0,
+        halfWidthLimit);
+    const float endFeather = max(edgeFeather, reachRun * 0.10);
+    const float lateralFeather = max(edgeFeather, halfWidth * 0.30);
+    effectiveReach = reachRun;
+    effectiveHalfWidth = halfWidth;
+    // A run collapsed by the guide bound or animation contributes nothing
+    // (CPU parity: the guided evaluator early-outs the same way).
+    if (reachRun <= 1e-5) {
+        return 0.0;
+    }
+    if (downstreamDistance < -edgeFeather || downstreamDistance > reachRun + endFeather) {
         return 0.0;
     }
     if (planeDistance > surfaceThickness + edgeFeather) {
         return 0.0;
     }
-
-    const float progress = clamp(downstreamDistance / widthProgressReach, 0.0, 1.0);
-    const float startHalfWidth = max(
-        1e-4,
-        seepageParamData.seepageParams[nodeIndex].liveGeometry.w);
-    const float tailHalfWidth = max(
-        1e-4,
-        seepageParamData.seepageParams[nodeIndex].liveGeometry.y * 0.5);
-    const float halfWidth = mix(startHalfWidth, tailHalfWidth, progress);
-    if (abs(signedLateralDistance) > halfWidth + edgeFeather) {
+    if (abs(signedLateralDistance) > halfWidth + lateralFeather) {
         return 0.0;
     }
     lateralNormalised = signedLateralDistance / max(halfWidth, 1e-4);
 
     const float headMask = smoothstep(-edgeFeather, 0.0, downstreamDistance);
     const float tailMask = 1.0 - smoothstep(
-        maskReach - edgeFeather,
-        maskReach + edgeFeather,
+        reachRun - endFeather,
+        reachRun + endFeather,
         downstreamDistance);
     const float sideMask = 1.0 - smoothstep(
         halfWidth,
-        halfWidth + edgeFeather,
+        halfWidth + lateralFeather,
         abs(signedLateralDistance));
     const float surfaceMask =
         1.0 - smoothstep(surfaceThickness, surfaceThickness + edgeFeather, planeDistance);
@@ -1583,6 +1589,8 @@ float SeepagePlanarFanMask(
     vec3 pointNormal,
     out float downstreamDistance,
     out float lateralDistance,
+    out float effectiveReach,
+    out float effectiveHalfWidth,
     out float lateralNormalised,
     out vec3 resolvedSurfaceNormal,
     out vec3 resolvedDownTangent) {
@@ -1606,9 +1614,6 @@ float SeepagePlanarFanMask(
     downstreamDistance = dot(relative, down);
     lateralDistance = dot(relative, lateral);
     const float planeDistance = abs(dot(relative, nodeNormal));
-    const float authoredReach = max(
-        1e-4,
-        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
     return SeepageResolvedFanMask(
         nodeIndex,
         pointNormal,
@@ -1616,8 +1621,9 @@ float SeepagePlanarFanMask(
         lateralDistance,
         planeDistance,
         nodeNormal,
-        authoredReach,
-        authoredReach,
+        3.402823466e+38,
+        effectiveReach,
+        effectiveHalfWidth,
         lateralNormalised);
 }
 
@@ -1627,11 +1633,15 @@ float SeepageFanMask(
     vec3 pointNormal,
     out float downstreamDistance,
     out float lateralDistance,
+    out float effectiveReach,
+    out float effectiveHalfWidth,
     out float lateralNormalised,
     out vec3 resolvedSurfaceNormal,
     out vec3 resolvedDownTangent) {
     downstreamDistance = 0.0;
     lateralDistance = 0.0;
+    effectiveReach = 0.0;
+    effectiveHalfWidth = 0.0;
     lateralNormalised = 0.0;
     resolvedSurfaceNormal = RippleSafeNormal(
         seepageNodeData.seepageNodes[nodeIndex].normalSurface.xyz);
@@ -1656,6 +1666,8 @@ float SeepageFanMask(
             pointNormal,
             downstreamDistance,
             lateralDistance,
+            effectiveReach,
+            effectiveHalfWidth,
             lateralNormalised,
             resolvedSurfaceNormal,
             resolvedDownTangent);
@@ -1733,6 +1745,8 @@ float SeepageFanMask(
             pointNormal,
             downstreamDistance,
             lateralDistance,
+            effectiveReach,
+            effectiveHalfWidth,
             lateralNormalised,
             resolvedSurfaceNormal,
             resolvedDownTangent);
@@ -1752,9 +1766,8 @@ float SeepageFanMask(
     resolvedSurfaceNormal = bestSurfaceNormal;
     resolvedDownTangent = RippleSafeNormal(
         stationEnd.xyz - stationStart.xyz);
-    const float authoredReach = max(
-        1e-4,
-        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
+    // The guide cannot represent stations beyond what it traced, so the
+    // envelope run is additionally bounded by the achieved guide extent.
     const float achievedReach = max(
         0.0,
         uintBitsToFloat(seepageNodeData.seepageNodes[nodeIndex].guideControl.y));
@@ -1770,8 +1783,9 @@ float SeepageFanMask(
         lateralDistance,
         bestPlaneDistance,
         bestSurfaceNormal,
-        min(authoredReach, min(achievedReach, lastStation)),
-        authoredReach,
+        min(achievedReach, lastStation),
+        effectiveReach,
+        effectiveHalfWidth,
         lateralNormalised);
 }
 
@@ -1797,6 +1811,8 @@ float SeepageConnectedSupportMask(
     vec3 pointNormal,
     out float downstreamDistance,
     out float lateralDistance,
+    out float effectiveReach,
+    out float effectiveHalfWidth,
     out float lateralNormalised,
     out vec3 resolvedSurfaceNormal,
     out vec3 resolvedDownTangent) {
@@ -1813,9 +1829,8 @@ float SeepageConnectedSupportMask(
         reference.packedNormalRoleConfidenceFlags);
     resolvedDownTangent = RippleSafeNormal(
         seepageNodeData.seepageNodes[nodeIndex].downEdge.xyz);
-    const float liveReach = max(
-        0.0,
-        seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
+    // The envelope reads the cached support-cell normal, so runs lengthen on
+    // near-vertical cells and widen faster across flat ones.
     const float mask = SeepageResolvedFanMask(
         nodeIndex,
         pointNormal,
@@ -1823,8 +1838,9 @@ float SeepageConnectedSupportMask(
         lateralDistance,
         0.0,
         resolvedSurfaceNormal,
-        liveReach,
-        max(liveReach, 1e-4),
+        3.402823466e+38,
+        effectiveReach,
+        effectiveHalfWidth,
         lateralNormalised);
     const float confidence =
         float((reference.packedNormalRoleConfidenceFlags >> 20u) & 0xffu) / 255.0;
@@ -1835,12 +1851,6 @@ uvec4 SeepageLookControl(uint nodeIndex, bool transition) {
     return transition
                ? seepageParamData.seepageParams[nodeIndex].transitionLook.control
                : seepageParamData.seepageParams[nodeIndex].look.control;
-}
-
-vec4 SeepageLookLegacy0(uint nodeIndex, bool transition) {
-    return transition
-               ? seepageParamData.seepageParams[nodeIndex].transitionLook.legacy0
-               : seepageParamData.seepageParams[nodeIndex].look.legacy0;
 }
 
 vec4 SeepageLookLegacy1(uint nodeIndex, bool transition) {
@@ -2083,9 +2093,10 @@ vec3 SeepagePatternSignals(
     float timeSeconds,
     float downstreamDistance,
     float signedLateralDistance,
+    float effectiveReach,
+    float effectiveHalfWidth,
     float fanMask) {
     const uvec4 lookControl = SeepageLookControl(nodeIndex, transition);
-    const vec4 legacy0 = SeepageLookLegacy0(nodeIndex, transition);
     const vec4 legacy1 = SeepageLookLegacy1(nodeIndex, transition);
     const vec4 response2 = SeepageLookResponse2(nodeIndex, transition);
     const vec4 organic0 = SeepageLookOrganic0(nodeIndex, transition);
@@ -2098,54 +2109,24 @@ vec3 SeepagePatternSignals(
         1.0);
     const float wetness = clamp(response2.y + rainGain * 0.30, 0.0, 1.0);
     const float density = clamp(legacy1.z + rainGain * 0.25, 0.0, 1.0);
-    const float strengthMask = fanMask * clamp(
-        seepageParamData.seepageParams[nodeIndex].geometry.z,
-        0.0,
-        8.0);
+    // Strength shapes the area envelope inside the fan mask (see
+    // SeepageResolvedFanMask); the signal amplitude is intensity territory
+    // and belongs to prominence alone.
+    const float strengthMask = fanMask;
     const uint proceduralSeed =
         seepageParamData.seepageParams[nodeIndex].control.w ^
         (seepageNodeData.seepageNodes[nodeIndex].control.x * 0x9e3779b9u);
-    if (lookControl.x == 0u) {
-        const float wavelength = max(0.002, legacy0.y);
-        const float spatialScale = clamp(legacy0.x, 0.05, 100.0) / wavelength;
-        const float warp = clamp(legacy0.w, 0.0, 8.0);
-        const float turbulence = clamp(legacy1.x, 0.0, 4.0);
-        const vec2 noiseCoordinate = vec2(
-            signedLateralDistance * spatialScale + warp * downstreamDistance,
-            downstreamDistance * spatialScale);
-        const float noise = SeepageFractalNoise(
-            noiseCoordinate * (0.42 + turbulence * 0.38),
-            proceduralSeed,
-            seepageParamData.seepageParams[nodeIndex].control.y);
-        const float coverage = smoothstep(1.0 - density - 0.12, 1.0 - density + 0.12, noise);
-        const float phase = downstreamDistance * spatialScale + legacy1.y -
-                            max(0.0, timeSeconds) * max(0.0, legacy0.z) +
-                            (noise - 0.5) * warp;
-        const float ripplePeak = pow(
-            clamp(0.5 + 0.5 * sin(kRippleTwoPi * phase), 0.0, 1.0),
-            seepageParamData.seepageParams[nodeIndex].control.y == 0u ? 2.0 : 3.5);
-        const float glintPeak = pow(
-            clamp(
-                0.5 + 0.5 * sin(kRippleTwoPi *
-                    (phase * 1.73 + signedLateralDistance * spatialScale * 0.37 + noise * 0.61)),
-                0.0,
-                1.0),
-            seepageParamData.seepageParams[nodeIndex].control.y >= 2u ? 7.0 : 5.0);
-        return vec3(
-            clamp(strengthMask * (wetness * (0.72 + noise * 0.28) + coverage * (0.10 + rainGain * 0.12)), 0.0, 1.0),
-            clamp(strengthMask * coverage * ripplePeak * (0.30 + clamp(turbulence, 0.0, 1.0) * 0.70), 0.0, 1.0),
-            clamp(strengthMask * coverage * response2.z * glintPeak, 0.0, 1.0));
-    }
-
     const float featureSize = max(0.005, organic0.x);
     const float time = max(0.0, timeSeconds);
     const mat3 noiseRotation = mat3(
         seepageParamData.seepageParams[nodeIndex].noiseBasis[0].xyz,
         seepageParamData.seepageParams[nodeIndex].noiseBasis[1].xyz,
         seepageParamData.seepageParams[nodeIndex].noiseBasis[2].xyz);
-    if (lookControl.x == 3u) {
+    if (lookControl.x == 2u) {
         const uint quality = seepageParamData.seepageParams[nodeIndex].control.y;
-        const float trickleLength = max(0.005, organic2.z);
+        // The trickle run is the strength- and slope-shaped envelope reach;
+        // the pattern no longer declares its own length.
+        const float trickleLength = max(0.005, effectiveReach);
         const float trickleWidth = max(0.002, organic2.w);
         const float frontSoftness = max(0.002, organic3.x);
         const float downstream = max(0.0, downstreamDistance);
@@ -2180,13 +2161,9 @@ vec3 SeepagePatternSignals(
             sourceDistance);
         const float sourcePatch = sourceEnvelope * mix(0.38, 1.0, patchField);
 
-        const float startHalfWidth = max(
-            1e-4,
-            seepageParamData.seepageParams[nodeIndex].liveGeometry.w);
-        const float tailHalfWidth = max(
-            startHalfWidth,
-            seepageParamData.seepageParams[nodeIndex].liveGeometry.y * 0.5);
-        const float fanHalfWidth = mix(startHalfWidth, tailHalfWidth, distanceProgress);
+        // Finger lanes spread across the envelope's local half-width so they
+        // track the widening run.
+        const float fanHalfWidth = max(1e-4, effectiveHalfWidth);
         const float lateralWander =
             (trickleNoise.value - 0.5) * featureSize * mix(0.16, 0.85, breakup);
         const float laneHash0 = SeepageNoiseHash01(0, 0, proceduralSeed + 7013u);
@@ -2238,10 +2215,8 @@ vec3 SeepagePatternSignals(
             progressFeather,
             progressFeather * 3.2,
             abs(wettingProgress - onset));
-        const float lengthMask = 1.0 - smoothstep(
-            trickleLength - frontSoftness,
-            trickleLength + frontSoftness,
-            downstream);
+        // No separate length mask: the fan mask's end feather already fades
+        // the run out at the effective reach.
         const float breakupGate = mix(
             1.0,
             smoothstep(0.20, 0.78, trickleNoise.value + patchField * 0.22),
@@ -2250,7 +2225,7 @@ vec3 SeepagePatternSignals(
         const float persistentDamp = max(
             sourcePatch,
             trickleBody * (0.50 + patchField * 0.50));
-        const float activeWet = wetReveal * lengthMask * persistentDamp;
+        const float activeWet = wetReveal * persistentDamp;
 
         const vec3 resolvedNormal =
             styleData.pointMeta.z != 0u && dot(pointNormal, pointNormal) > 1e-8
@@ -2275,7 +2250,7 @@ vec3 SeepagePatternSignals(
                 0.0,
                 1.0),
             clamp(
-                strengthMask * wetReveal * lengthMask *
+                strengthMask * wetReveal *
                     (trickleBody * (0.16 + patchField * 0.20) +
                      frontPulse * fingers * 0.52 + sourcePatch * 0.08),
                 0.0,
@@ -2290,7 +2265,7 @@ vec3 SeepagePatternSignals(
     SeepageNoise3Sample warpNoise;
     float patchOrBloom;
     float sparseGate;
-    if (lookControl.x == 1u) {
+    if (lookControl.x == 0u) {
         coordinate = noiseRotation * (worldPosition / featureSize);
         coordinate += vec3(0.071, -0.053, 0.037) * (time * organic0.z);
         bodyNoise = SeepageFractalNoise3(
@@ -2338,7 +2313,7 @@ vec3 SeepagePatternSignals(
         resolvedNormal,
         worldGradient,
         sparseGate);
-    if (lookControl.x == 1u) {
+    if (lookControl.x == 0u) {
         return vec3(
             clamp(strengthMask * wetness * (0.68 + bodyNoise.value * 0.22 + patchOrBloom * 0.20), 0.0, 1.0),
             clamp(strengthMask * patchOrBloom * (0.08 + bodyNoise.value * 0.14), 0.0, 1.0),
@@ -2361,15 +2336,22 @@ SparseRippleComposite EvaluateSeepageContribution(
     uint pointIndex,
     float timeSeconds) {
     SparseRippleComposite contribution = EmptySparseRippleComposite();
-    // Visibility and strength are animation-updated scalars. Reject inactive
-    // nodes before the surface-guide search and all procedural work, keeping a
-    // Visible toggle parameter-only.
+    // Visibility, strength, reach, width, and prominence are animation-updated
+    // scalars. Reject inactive nodes before the surface-guide search and all
+    // procedural work (matching the CPU query gates in
+    // EvaluateWaterSeepageGridContribution), keeping a Visible toggle
+    // parameter-only.
     if (seepageParamData.seepageParams[nodeIndex].geometry.x <= 1e-5 ||
-        seepageParamData.seepageParams[nodeIndex].geometry.z <= 1e-5) {
+        seepageParamData.seepageParams[nodeIndex].geometry.z <= 1e-5 ||
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.x <= 1e-5 ||
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.y <= 1e-5 ||
+        seepageParamData.seepageParams[nodeIndex].liveGeometry.z <= 1e-5) {
         return contribution;
     }
     float downstreamDistance;
     float lateralDistance;
+    float effectiveReach;
+    float effectiveHalfWidth;
     float lateralNormalised;
     vec3 surfaceNormal;
     vec3 downTangent;
@@ -2381,6 +2363,8 @@ SparseRippleComposite EvaluateSeepageContribution(
               pointNormal,
               downstreamDistance,
               lateralDistance,
+              effectiveReach,
+              effectiveHalfWidth,
               lateralNormalised,
               surfaceNormal,
               downTangent)
@@ -2390,6 +2374,8 @@ SparseRippleComposite EvaluateSeepageContribution(
               pointNormal,
               downstreamDistance,
               lateralDistance,
+              effectiveReach,
+              effectiveHalfWidth,
               lateralNormalised,
               surfaceNormal,
               downTangent);
@@ -2411,13 +2397,13 @@ SparseRippleComposite EvaluateSeepageContribution(
         return contribution;
     }
     if (wettingProgress < 1.0 - 1e-6) {
-        const float effectiveReach = max(
-            1e-4,
-            seepageParamData.seepageParams[nodeIndex].liveGeometry.x);
+        // The front travels the same strength- and slope-shaped run the fan
+        // mask used, so the reveal reaches exactly as far as the effect does.
+        const float frontReach = max(1e-4, effectiveReach);
         const float frontSoftness = max(
             seepageNodeData.seepageNodes[nodeIndex].downEdge.w,
             SeepageLookOrganic3(nodeIndex, transition).x);
-        const float frontDistance = effectiveReach * wettingProgress;
+        const float frontDistance = frontReach * wettingProgress;
         const float frontMask = 1.0 - smoothstep(
             frontDistance - frontSoftness,
             frontDistance + frontSoftness,
@@ -2437,6 +2423,8 @@ SparseRippleComposite EvaluateSeepageContribution(
         timeSeconds,
         downstreamDistance,
         lateralDistance,
+        effectiveReach,
+        effectiveHalfWidth,
         wettingFanMask);
     const float scale = clamp(
         (signals.x * 0.58 + signals.y * 0.34 + signals.z * 0.46) *

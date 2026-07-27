@@ -3074,13 +3074,25 @@ void RainSimulator::EmitImpact(
             lifetime = 0.48F + std::min(0.35F, impactSpeed * 0.018F);
             ++diagnostics->sandEvents;
             break;
-        case WaterSurfaceRole::Rock:
+        case WaterSurfaceRole::Rock: {
             enabled = frame.settings.rockEffectsEnabled;
             roleScale = frame.settings.rockEffectScale;
             radius = std::clamp(0.028F + dropWidth * 10.0F + impactSpeed * 0.0020F, 0.035F, 0.16F);
+            // Steep rock sheds water further: boost the event radius by
+            // surface steepness so the Wetness footprint can run downhill.
+            // The impact model reconstructs this boost from the event normal
+            // (GPU mirror: EmitImpact in shaders/rain_simulation.comp).
+            const auto unitNormal = Normalize(hit.normal);
+            const float steepness =
+                std::clamp(1.0F - std::abs(unitNormal.z), 0.0F, 1.0F);
+            radius *= 1.0F + steepness * std::clamp(
+                frame.settings.rockImpact.downhillStretch,
+                0.0F,
+                1.0F);
             lifetime = 3.8F + std::min(2.2F, impactSpeed * 0.12F);
             ++diagnostics->rockEvents;
             break;
+        }
         case WaterSurfaceRole::Vegetation:
             enabled = frame.settings.vegetationEffectsEnabled;
             roleScale = frame.settings.vegetationEffectScale;
@@ -3285,9 +3297,11 @@ RainImpactGrid BuildRainImpactGrid(
         // Compare physical distance, not distance relative to each event's
         // radius. Otherwise a farther large drop can displace a nearer small
         // drop even though both overlap this cell. Generated ROCK impacts are
-        // capped at 160 mm; 250 mm also covers the corner of their square
-        // broad phase while preserving sub-millimetre priority resolution.
-        constexpr float kRockReservoirDistanceRangeMeters = 0.25F;
+        // capped at 160 mm and the steepness spawn boost can double that;
+        // 500 mm covers the corner of the boosted square broad phase while
+        // preserving sub-millimetre priority resolution (GPU mirror:
+        // BinEvent in shaders/rain_simulation.comp).
+        constexpr float kRockReservoirDistanceRangeMeters = 0.50F;
         const float normalizedDistance = std::clamp(
             std::hypot(distanceX, distanceY) /
                 kRockReservoirDistanceRangeMeters,
@@ -3493,9 +3507,30 @@ float EvaluateRockRainImpactValue(
     // a conservative broad phase even at maximum configured breakup.
     const float irregularRadiusScale = 1.0F -
         0.35F * std::clamp(settings.edgeBreakup, 0.0F, 1.0F) * breakupNoise;
+    // Steep impacts spawn with a boosted radius (see EmitImpact in both
+    // simulators, same steepness formula). The footprint puts that extra
+    // radius into the downhill run only: lateral and uphill extents
+    // normalize back to the unboosted radius and tighten further with
+    // stretch, so wetness reads as rivulets running down walls while flat
+    // impacts keep their even spread. Every extent stays inside the boosted
+    // event radius, preserving the broad-phase grid invariant.
+    const float steepness = std::clamp(1.0F - std::abs(eventNormal.z), 0.0F, 1.0F);
+    const float stretch =
+        std::clamp(settings.downhillStretch, 0.0F, 2.0F) * steepness;
+    const float spawnBoost =
+        1.0F + steepness * std::clamp(settings.downhillStretch, 0.0F, 1.0F);
+    const float downAmount = Dot(tangentOffset, downhill);
+    const auto lateralOffset = Subtract(tangentOffset, Scale(downhill, downAmount));
+    const float lateralFactor = spawnBoost * (1.0F + 0.25F * stretch);
+    const float uphillFactor = spawnBoost * (1.0F + 0.80F * stretch);
+    const float shapedDown = std::max(downAmount, 0.0F);
+    const float shapedUp = std::max(-downAmount, 0.0F) * uphillFactor;
+    const float shapedTangentSquared =
+        shapedDown * shapedDown + shapedUp * shapedUp +
+        Dot(lateralOffset, lateralOffset) * lateralFactor * lateralFactor;
     const float normalizedDistance = (
         std::sqrt(
-            Dot(tangentOffset, tangentOffset) +
+            shapedTangentSquared +
             normalDistance * normalDistance * 4.0F) /
         effectiveRadius) / std::max(0.65F, irregularRadiusScale);
     // Retain the original broad-phase cells: once downhill drift begins, the

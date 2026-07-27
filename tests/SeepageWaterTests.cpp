@@ -92,15 +92,8 @@ TEST_CASE("Seepage defaults describe a subtle damp fan", "[water][seepage][defau
     CHECK(look.baseWetness == Approx(0.35F));
     CHECK(look.density == Approx(0.45F));
     CHECK(look.glisten == Approx(0.55F));
-    CHECK(look.wavelengthMeters == Approx(0.16F));
-    CHECK(look.patternScale == Approx(1.0F));
-    CHECK(look.speed == Approx(0.18F));
-    CHECK(look.warp == Approx(0.40F));
-    CHECK(look.turbulence == Approx(0.22F));
-    CHECK(look.phase == Approx(0.0F));
     CHECK(look.rainResponse == Approx(0.50F));
     CHECK(look.tricklePatchSizeMeters == Approx(0.08F));
-    CHECK(look.trickleLengthMeters == Approx(0.35F));
     CHECK(look.trickleWidthMeters == Approx(0.018F));
     CHECK(look.trickleFrontSoftness == Approx(0.10F));
     CHECK(look.response.intensity == Approx(0.85F));
@@ -256,34 +249,70 @@ TEST_CASE("Authored Seepage topology identity is role-local and excludes live pa
           sandFingerprint);
 }
 
-TEST_CASE("Seepage look resolution honors profile and local edit precedence", "[water][seepage][profiles]") {
+TEST_CASE("Seepage looks pair independent settings and response profiles", "[water][seepage][profiles]") {
     using Catch::Approx;
     using invisible_places::water::ResolveWaterSeepageLook;
+    using invisible_places::water::WaterSeepageResponseProfile;
 
-    WaterSeepageLookProfile saved;
-    saved.name = "Wet Rock";
-    saved.settings.baseWetness = 0.62F;
-    std::vector<WaterSeepageLookProfile> profiles{saved};
+    WaterSeepageLookProfile savedSettings;
+    savedSettings.name = "Wet Rock";
+    savedSettings.settings.baseWetness = 0.62F;
+    // The response stored inside a settings profile is ignored at resolve
+    // time; only response profiles (or the default look) supply it.
+    savedSettings.settings.response.emissionAdd = 9.0F;
+    std::vector<WaterSeepageLookProfile> profiles{savedSettings};
+
+    WaterSeepageResponseProfile savedResponse;
+    savedResponse.name = "Strong";
+    savedResponse.response.emissionAdd = 2.5F;
+    savedResponse.blendMode = invisible_places::water::WaterEffectBlendMode::Add;
+    std::vector<WaterSeepageResponseProfile> responseProfiles{savedResponse};
 
     auto node = MakeSeepageNode();
-    node.lookProfileName = saved.name;
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.62F));
+    node.lookProfileName = savedSettings.name;
+    node.responseProfileName = savedResponse.name;
+    const auto resolved = ResolveWaterSeepageLook(node, profiles, responseProfiles, {});
+    CHECK(resolved.baseWetness == Approx(0.62F));
+    CHECK(resolved.response.emissionAdd == Approx(2.5F));
+    CHECK(resolved.blendMode == invisible_places::water::WaterEffectBlendMode::Add);
 
-    WaterSeepageLookSettings local;
-    local.baseWetness = 0.73F;
-    node.lookOverride = local;
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.73F));
+    // Switching the settings profile keeps the chosen response and vice
+    // versa — the two halves are fully independent.
+    auto settingsOnlyNode = node;
+    settingsOnlyNode.lookProfileName = "Default";
+    const auto settingsSwitched =
+        ResolveWaterSeepageLook(settingsOnlyNode, profiles, responseProfiles, {});
+    CHECK(settingsSwitched.baseWetness == Approx(WaterSeepageLookSettings{}.baseWetness));
+    CHECK(settingsSwitched.response.emissionAdd == Approx(2.5F));
 
-    WaterSeepageLookSettings edited = local;
-    edited.baseWetness = 0.84F;
-    node.tempLookOverride = edited;
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.84F));
+    auto responseOnlyNode = node;
+    responseOnlyNode.responseProfileName = "Default";
+    WaterSeepageLookSettings fallback;
+    fallback.response.emissionAdd = 0.15F;
+    const auto responseSwitched =
+        ResolveWaterSeepageLook(responseOnlyNode, profiles, responseProfiles, fallback);
+    CHECK(responseSwitched.baseWetness == Approx(0.62F));
+    CHECK(responseSwitched.response.emissionAdd == Approx(0.15F));
+
+    // Whitespace-bearing stored names still resolve (trimmed matching).
+    auto paddedNode = node;
+    paddedNode.lookProfileName = "  Wet Rock ";
+    CHECK(ResolveWaterSeepageLook(paddedNode, profiles, responseProfiles, {}).baseWetness ==
+          Approx(0.62F));
 
     auto missingProfileNode = MakeSeepageNode(2U);
     missingProfileNode.lookProfileName = "Missing Profile";
-    WaterSeepageLookSettings fallback;
-    fallback.baseWetness = 0.61F;
-    CHECK(ResolveWaterSeepageLook(missingProfileNode, profiles, fallback).baseWetness == Approx(0.61F));
+    missingProfileNode.responseProfileName = "Missing Response";
+    WaterSeepageLookSettings missingFallback;
+    missingFallback.baseWetness = 0.61F;
+    missingFallback.response.emissionAdd = 0.35F;
+    const auto missing = ResolveWaterSeepageLook(
+        missingProfileNode,
+        profiles,
+        responseProfiles,
+        missingFallback);
+    CHECK(missing.baseWetness == Approx(0.61F));
+    CHECK(missing.response.emissionAdd == Approx(0.35F));
 }
 
 TEST_CASE("Seepage local look names are stable and padded", "[water][seepage][naming]") {
@@ -295,10 +324,9 @@ TEST_CASE("Seepage local look names are stable and padded", "[water][seepage][na
     CHECK(WaterSeepageLocalLookName("  ", 4U) == "Default_04");
 }
 
-TEST_CASE("Seepage node look edits save discard and revert without mutating profiles", "[water][seepage][profiles]") {
+TEST_CASE("Seepage edited shadow profiles leave the saved profile untouched", "[water][seepage][profiles]") {
     using Catch::Approx;
     using invisible_places::water::ResolveWaterSeepageLook;
-    using invisible_places::water::WaterSeepageLocalLookName;
 
     WaterSeepageLookProfile saved;
     saved.name = "saved_name";
@@ -307,27 +335,23 @@ TEST_CASE("Seepage node look edits save discard and revert without mutating prof
     auto node = MakeSeepageNode(2U);
     node.lookProfileName = saved.name;
 
-    auto edited = ResolveWaterSeepageLook(node, profiles, {});
+    // Editing upserts a "<base>_edited" entry and points the node at it —
+    // the saved profile is never mutated, and the user can flip between the
+    // two names freely.
+    auto edited = ResolveWaterSeepageLook(node, profiles, {}, {});
     edited.baseWetness = 0.78F;
-    node.tempLookOverride = edited;
-    CHECK(WaterSeepageLocalLookName(node.lookProfileName, node.id) == "saved_name_02");
+    profiles.push_back({.name = "saved_name_edited", .settings = edited});
+    node.lookProfileName = "saved_name_edited";
+    CHECK(ResolveWaterSeepageLook(node, profiles, {}, {}).baseWetness == Approx(0.78F));
     CHECK(profiles.front().settings.baseWetness == Approx(0.42F));
 
-    node.lookOverride = node.tempLookOverride;
-    node.tempLookOverride.reset();
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.78F));
-    CHECK(profiles.front().settings.baseWetness == Approx(0.42F));
+    node.lookProfileName = saved.name;
+    CHECK(ResolveWaterSeepageLook(node, profiles, {}, {}).baseWetness == Approx(0.42F));
 
-    auto discarded = ResolveWaterSeepageLook(node, profiles, {});
-    discarded.baseWetness = 0.91F;
-    node.tempLookOverride = discarded;
-    node.tempLookOverride.reset();
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.78F));
-
-    node.lookOverride.reset();
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.42F));
-    profiles.front().settings.baseWetness = 0.55F;
-    CHECK(ResolveWaterSeepageLook(node, profiles, {}).baseWetness == Approx(0.55F));
+    // Saving copies the edited settings over the base and removes the shadow.
+    profiles.front().settings = profiles.back().settings;
+    profiles.pop_back();
+    CHECK(ResolveWaterSeepageLook(node, profiles, {}, {}).baseWetness == Approx(0.78F));
 }
 
 TEST_CASE("Seepage derives surface-tangent gravity direction", "[water][seepage][direction]") {
@@ -371,9 +395,11 @@ TEST_CASE("Seepage guide bends the affected fan along supported surface stations
     CHECK(aroundBend.mask > 0.85F);
     CHECK(aroundBend.scale > 0.0F);
 
+    // The envelope widens with travelled distance, so the off-centreline
+    // probe sits further out than it did under the fixed-width fan.
     const auto straightBelow = EvaluateWaterSeepageGridContribution(
         guidedGrid,
-        {-0.20F, 0.0F, -0.85F},
+        {-0.45F, 0.0F, -0.85F},
         {0.0F, 1.0F, 0.0F},
         0.15F);
     CHECK(straightBelow.scale == 0.0F);
@@ -605,19 +631,29 @@ TEST_CASE("Seepage fan affects only supported points below its node", "[water][s
 TEST_CASE("Seepage fan widens downstream and feathers its sides and tail", "[water][seepage][fan]") {
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
 
+    // The band starts at the authored width at the node (half-width 0.375 m
+    // for the default node) and spreads outward with travelled distance. The
+    // default node is a vertical wall, so the run is reach 1.25 x 1.15 =
+    // ~1.44 m with a scaled end feather.
     const auto grid = BuildGrid({MakeSeepageNode()});
-    const auto outsideNarrowHead = EvaluateWaterSeepageGridContribution(
+    const auto insideHead = EvaluateWaterSeepageGridContribution(
         grid,
         {0.20F, 0.0F, -0.10F},
         {0.0F, 1.0F, 0.0F},
         0.0F);
-    const auto insideWideTail = EvaluateWaterSeepageGridContribution(
+    const auto outsideHead = EvaluateWaterSeepageGridContribution(
         grid,
-        {0.20F, 0.0F, -1.00F},
+        {0.55F, 0.0F, -0.10F},
         {0.0F, 1.0F, 0.0F},
         0.0F);
-    CHECK(outsideNarrowHead.mask == 0.0F);
-    CHECK(insideWideTail.mask > 0.90F);
+    const auto sameLateralDownstream = EvaluateWaterSeepageGridContribution(
+        grid,
+        {0.55F, 0.0F, -1.10F},
+        {0.0F, 1.0F, 0.0F},
+        0.0F);
+    CHECK(insideHead.mask > 0.90F);
+    CHECK(outsideHead.mask == 0.0F);
+    CHECK(sameLateralDownstream.mask > 0.0F);
 
     const auto center = EvaluateWaterSeepageGridContribution(
         grid,
@@ -626,12 +662,12 @@ TEST_CASE("Seepage fan widens downstream and feathers its sides and tail", "[wat
         0.0F);
     const auto featheredSide = EvaluateWaterSeepageGridContribution(
         grid,
-        {0.2675F, 0.0F, -0.625F},
+        {0.49F, 0.0F, -0.625F},
         {0.0F, 1.0F, 0.0F},
         0.0F);
     const auto featheredTail = EvaluateWaterSeepageGridContribution(
         grid,
-        {0.0F, 0.0F, -1.28F},
+        {0.0F, 0.0F, -1.45F},
         {0.0F, 1.0F, 0.0F},
         0.0F);
     CHECK(center.mask > 0.99F);
@@ -864,14 +900,16 @@ TEST_CASE("Rain presets strengthen seepage without changing topology", "[water][
     CHECK(wet.damp > dry.damp);
     CHECK(wet.scale >= dry.scale);
 
+    // The dry wall run ends near 1.44 m (+0.14 m feather); heavy rain scales
+    // reach by 1.25x, carrying the run past 1.60 m.
     const auto dryBeyondBaseReach = EvaluateWaterSeepageGridContribution(
         dryGrid,
-        {0.0F, 0.0F, -1.36F},
+        {0.0F, 0.0F, -1.60F},
         {0.0F, 1.0F, 0.0F},
         0.23F);
     const auto wetExpandedReach = EvaluateWaterSeepageGridContribution(
         wetGrid,
-        {0.0F, 0.0F, -1.36F},
+        {0.0F, 0.0F, -1.60F},
         {0.0F, 1.0F, 0.0F},
         0.23F);
     CHECK(dryBeyondBaseReach.scale == 0.0F);
@@ -966,9 +1004,13 @@ TEST_CASE("Overlapping seepage nodes follow their selected blend mode", "[water]
 
     WaterSeepageLookSettings additiveLook;
     additiveLook.blendMode = WaterEffectBlendMode::Add;
-    first.lookOverride = additiveLook;
-    second.lookOverride = additiveLook;
-    const auto addGrid = BuildGrid({first, second});
+    const auto addGrid = BuildGrid(
+        {first, second},
+        "ROCK",
+        false,
+        {},
+        12'000'000ULL,
+        additiveLook);
     REQUIRE(addGrid.nodes.size() == 2U);
     const auto firstAdd = EvaluateWaterSeepageRuntimeContribution(
         addGrid.nodes[0], position, normal, 0.17F);
@@ -997,37 +1039,6 @@ TEST_CASE("Seepage auxiliary memory stays compact for 256 nodes", "[water][seepa
     CHECK(auxiliaryBytes < 4U * 1024U * 1024U);
 }
 
-TEST_CASE("Seepage animation changes ripple and glint while topology stays stable", "[water][seepage][time]") {
-    using invisible_places::water::EvaluateWaterSeepageGridContribution;
-    using invisible_places::water::WaterSeepageParamsFingerprint;
-    using invisible_places::water::WaterSeepageTopologyFingerprint;
-
-    WaterSeepageLookSettings animated;
-    animated.quality = WaterSeepageQuality::High;
-    animated.density = 1.0F;
-    animated.glisten = 1.0F;
-    animated.speed = 1.0F;
-    animated.turbulence = 1.0F;
-    const auto firstGrid = BuildGrid({MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, animated);
-    const auto atStart = EvaluateWaterSeepageGridContribution(
-        firstGrid,
-        {0.0F, 0.0F, -0.55F},
-        {0.0F, 1.0F, 0.0F},
-        0.0F);
-    const auto later = EvaluateWaterSeepageGridContribution(
-        firstGrid,
-        {0.0F, 0.0F, -0.55F},
-        {0.0F, 1.0F, 0.0F},
-        0.137F);
-    CHECK(std::abs(atStart.ripple - later.ripple) + std::abs(atStart.glint - later.glint) > 1.0e-4F);
-
-    auto brighter = animated;
-    brighter.response.emissionAdd += 0.25F;
-    const auto secondGrid = BuildGrid({MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, brighter);
-    CHECK(WaterSeepageTopologyFingerprint(firstGrid) == WaterSeepageTopologyFingerprint(secondGrid));
-    CHECK(WaterSeepageParamsFingerprint(firstGrid) != WaterSeepageParamsFingerprint(secondGrid));
-}
-
 TEST_CASE("All Seepage patterns are deterministic and organic modes respond in world space", "[water][seepage][patterns]") {
     using invisible_places::water::EvaluateWaterSeepageGridContribution;
     using invisible_places::water::WaterSeepageViewContext;
@@ -1044,7 +1055,6 @@ TEST_CASE("All Seepage patterns are deterministic and organic modes respond in w
     };
 
     for (const auto pattern : {
-             WaterSeepagePattern::LegacyRipples,
              WaterSeepagePattern::WetRockSheen,
              WaterSeepagePattern::ChaoticBloom,
              WaterSeepagePattern::WettingTrickle}) {
@@ -1059,7 +1069,6 @@ TEST_CASE("All Seepage patterns are deterministic and organic modes respond in w
         look.microNormalStrength = 0.75F;
         look.evolution = 0.18F;
         look.downhillDriftMetersPerSecond = 0.08F;
-        look.trickleLengthMeters = 1.0F;
         const auto grid = BuildGrid(
             {MakeSeepageNode()},
             "ROCK",
@@ -1075,20 +1084,18 @@ TEST_CASE("All Seepage patterns are deterministic and organic modes respond in w
         CHECK(first.glint == Catch::Approx(repeated.glint).margin(1.0e-7F));
         CHECK(first.scale > 0.0F);
 
-        if (pattern != WaterSeepagePattern::LegacyRipples) {
-            const auto grazing = EvaluateWaterSeepageGridContribution(
-                grid, position, normal, 1.37F, grazingView);
-            CHECK(std::isfinite(grazing.scale));
-            CHECK(std::abs(first.glint - grazing.glint) > 1.0e-6F);
-            const auto missingNormal = EvaluateWaterSeepageGridContribution(
-                grid,
-                position,
-                {},
-                1.37F,
-                grazingView);
-            CHECK(std::isfinite(missingNormal.scale));
-            CHECK(missingNormal.scale > 0.0F);
-        }
+        const auto grazing = EvaluateWaterSeepageGridContribution(
+            grid, position, normal, 1.37F, grazingView);
+        CHECK(std::isfinite(grazing.scale));
+        CHECK(std::abs(first.glint - grazing.glint) > 1.0e-6F);
+        const auto missingNormal = EvaluateWaterSeepageGridContribution(
+            grid,
+            position,
+            {},
+            1.37F,
+            grazingView);
+        CHECK(std::isfinite(missingNormal.scale));
+        CHECK(missingNormal.scale > 0.0F);
     }
 }
 
@@ -1185,7 +1192,6 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     startState.seepageRainRecessionSeconds = 2.0F;
     startState.seepageLook.environmentAzimuthDegrees = 350.0F;
     startState.seepageLook.tricklePatchSizeMeters = 0.05F;
-    startState.seepageLook.trickleLengthMeters = 0.20F;
     startState.seepageLook.trickleWidthMeters = 0.01F;
     startState.seepageLook.trickleFrontSoftness = 0.02F;
     auto endState = definition.state;
@@ -1202,7 +1208,6 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     endState.seepageRainRecessionSeconds = 6.0F;
     endState.seepageLook.environmentAzimuthDegrees = 10.0F;
     endState.seepageLook.tricklePatchSizeMeters = 0.15F;
-    endState.seepageLook.trickleLengthMeters = 0.60F;
     endState.seepageLook.trickleWidthMeters = 0.03F;
     endState.seepageLook.trickleFrontSoftness = 0.10F;
     AddOrUpdateWaterScenarioKey(
@@ -1233,7 +1238,6 @@ TEST_CASE("Water scenario tracks interpolate normalized snapshots and wrap refle
     CHECK(middle.seepageRainRiseSeconds == Approx(2.0F));
     CHECK(middle.seepageRainRecessionSeconds == Approx(4.0F));
     CHECK(middle.seepageLook.tricklePatchSizeMeters == Approx(0.10F));
-    CHECK(middle.seepageLook.trickleLengthMeters == Approx(0.40F));
     CHECK(middle.seepageLook.trickleWidthMeters == Approx(0.02F));
     CHECK(middle.seepageLook.trickleFrontSoftness == Approx(0.06F));
     CHECK(EffectiveWaterFlowActivity(middle, 0.80F, 0.75F) == Approx(0.55F));
@@ -1722,7 +1726,6 @@ TEST_CASE("Wetting Trickle reveals short deterministic fingers behind a keyed fr
     look.density = 0.80F;
     look.glisten = 0.0F;
     look.tricklePatchSizeMeters = 0.08F;
-    look.trickleLengthMeters = 0.40F;
     look.trickleWidthMeters = 0.018F;
     look.trickleFrontSoftness = 0.025F;
     look.evolution = 0.04F;
@@ -1746,8 +1749,12 @@ TEST_CASE("Wetting Trickle reveals short deterministic fingers behind a keyed fr
     const auto fullGrid = BuildGrid(
         {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, look, {}, std::nullopt, fullState);
 
+    // The wetting front travels the strength- and slope-shaped envelope run.
+    // MakeSeepageNode is a vertical wall (steep = 1), so the run is
+    // reach 1.25 x strength 1 x 1.15 = ~1.44 m; a half-keyed front sits near
+    // 0.72 m. The far point lies beyond the half front but inside the run.
     const invisible_places::io::Float3 nearPoint{0.0F, 0.0F, -0.08F};
-    const invisible_places::io::Float3 farPoint{0.0F, 0.0F, -0.32F};
+    const invisible_places::io::Float3 farPoint{0.0F, 0.0F, -1.10F};
     const invisible_places::io::Float3 normal{0.0F, 1.0F, 0.0F};
     CHECK(EvaluateWaterSeepageGridContribution(dryGrid, nearPoint, normal, 2.0F).scale ==
           Catch::Approx(0.0F));
@@ -1759,6 +1766,99 @@ TEST_CASE("Wetting Trickle reveals short deterministic fingers behind a keyed fr
     CHECK(full.scale > 0.0F);
     CHECK(full.scale == Catch::Approx(repeated.scale).margin(1.0e-7F));
     CHECK(full.ripple == Catch::Approx(repeated.ripple).margin(1.0e-7F));
+}
+
+TEST_CASE("Node strength shapes the seepage area while prominence only scales intensity", "[water][seepage][envelope]") {
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+
+    WaterSeepageLookSettings look;
+    look.pattern = WaterSeepagePattern::WetRockSheen;
+    look.baseWetness = 0.75F;
+    look.density = 0.90F;
+
+    // MakeSeepageNode is a vertical wall (steep = 1): the envelope run is
+    // reach x strength x 1.15.
+    const auto contributionAt = [&](float strength,
+                                    float prominence,
+                                    const invisible_places::io::Float3& point) {
+        auto node = MakeSeepageNode();
+        node.strength = strength;
+        node.prominence = prominence;
+        const auto grid = BuildGrid({node}, "ROCK", false, {}, 1'000'000ULL, look);
+        return EvaluateWaterSeepageGridContribution(
+            grid, point, {0.0F, 1.0F, 0.0F}, 1.0F);
+    };
+
+    SECTION("strength lengthens the run") {
+        // Run at strength 0.5 ends near 0.72 m; at 1.5 it passes 2 m.
+        const invisible_places::io::Float3 probe{0.0F, 0.0F, -0.95F};
+        CHECK(contributionAt(0.5F, 1.0F, probe).mask == Catch::Approx(0.0F));
+        CHECK(contributionAt(1.5F, 1.0F, probe).mask > 0.0F);
+    }
+
+    SECTION("prominence never changes the area, only the applied intensity") {
+        const invisible_places::io::Float3 inside{0.0F, 0.0F, -0.40F};
+        const invisible_places::io::Float3 outside{0.0F, 0.0F, -1.90F};
+        const auto low = contributionAt(1.0F, 0.5F, inside);
+        const auto high = contributionAt(1.0F, 2.0F, inside);
+        CHECK(low.mask == Catch::Approx(high.mask).margin(1.0e-6F));
+        CHECK(high.scale > low.scale);
+        CHECK(contributionAt(1.0F, 0.5F, outside).mask ==
+              contributionAt(1.0F, 2.0F, outside).mask);
+    }
+
+    SECTION("the half-width spreads outward with travelled distance") {
+        auto node = MakeSeepageNode();
+        node.widthMeters = 0.10F;
+        node.edgeFeatherMeters = 0.02F;
+        const auto grid = BuildGrid({node}, "ROCK", false, {}, 1'000'000ULL, look);
+        // Lateral axis of the wall node is world X. Near the node the band is
+        // ~0.05 m half-width; 1.2 m down it has spread past 0.12 m.
+        const auto near = EvaluateWaterSeepageGridContribution(
+            grid, {0.12F, 0.0F, -0.10F}, {0.0F, 1.0F, 0.0F}, 1.0F);
+        const auto far = EvaluateWaterSeepageGridContribution(
+            grid, {0.12F, 0.0F, -1.20F}, {0.0F, 1.0F, 0.0F}, 1.0F);
+        CHECK(near.mask == Catch::Approx(0.0F));
+        CHECK(far.mask > 0.0F);
+    }
+}
+
+TEST_CASE("Seepage runs travel further on steep guide surfaces than flat ones", "[water][seepage][envelope]") {
+    using invisible_places::water::EvaluateWaterSeepageGridContribution;
+    using invisible_places::water::WaterSeepageSurfaceGuide;
+
+    WaterSeepageLookSettings look;
+    look.pattern = WaterSeepagePattern::WetRockSheen;
+    look.baseWetness = 0.75F;
+    look.density = 0.90F;
+
+    const auto makeGuide = [](const invisible_places::io::Float3& normal) {
+        WaterSeepageSurfaceGuide guide;
+        guide.nodeId = 1U;
+        guide.sampleCount = 4U;
+        guide.samples[0] = {{0.0F, 0.0F, 0.0F}, normal, 0.0F, 1.0F};
+        guide.samples[1] = {{0.0F, 0.0F, -0.40F}, normal, 0.40F, 1.0F};
+        guide.samples[2] = {{0.0F, 0.0F, -0.80F}, normal, 0.80F, 1.0F};
+        guide.samples[3] = {{0.0F, 0.0F, -1.20F}, normal, 1.20F, 1.0F};
+        guide.requestedReachMeters = 1.25F;
+        guide.achievedReachMeters = 1.20F;
+        guide.valid = true;
+        return guide;
+    };
+
+    const auto maskAt = [&](const invisible_places::io::Float3& surfaceNormal) {
+        const std::vector<WaterSeepageSurfaceGuide> guides{makeGuide(surfaceNormal)};
+        const auto grid = BuildGrid(
+            {MakeSeepageNode()}, "ROCK", false, {}, 1'000'000ULL, look, guides);
+        // Station 0.9: inside the steep run (~1.2 m, guide-bounded) but past
+        // the flat run (1.25 x 0.45 = ~0.56 m).
+        return EvaluateWaterSeepageGridContribution(
+                   grid, {0.0F, 0.0F, -0.90F}, surfaceNormal, 1.0F)
+            .mask;
+    };
+
+    CHECK(maskAt({0.0F, 1.0F, 0.0F}) > 0.0F);
+    CHECK(maskAt({0.0F, 0.0F, 1.0F}) == Catch::Approx(0.0F).margin(1.0e-6F));
 }
 
 TEST_CASE("Per-node Seepage keys compose activity spread and wetting without topology changes", "[water][seepage][scenario][node-animation]") {
@@ -1840,13 +1940,20 @@ TEST_CASE("Per-node Seepage keys compose activity spread and wetting without top
     editedNode.seed = 991U;
     editedNode.strength = 1.75F;
     editedNode.normalAlignment = 0.82F;
-    editedNode.lookOverride = WaterSeepageLookSettings{};
-    editedNode.lookOverride->pattern = WaterSeepagePattern::WettingTrickle;
-    editedNode.lookOverride->tricklePatchSizeMeters = 0.12F;
+    editedNode.lookProfileName = "Trickle";
+    const std::vector<WaterSeepageLookProfile> trickleProfiles{{
+        .name = "Trickle",
+        .settings = [] {
+            WaterSeepageLookSettings settings;
+            settings.pattern = WaterSeepagePattern::WettingTrickle;
+            settings.tricklePatchSizeMeters = 0.12F;
+            return settings;
+        }(),
+    }};
     ApplyWaterSeepageRuntimeParameters(
         &grid,
         std::span<const WaterSeepageNode>{&editedNode, 1U},
-        {},
+        trickleProfiles,
         {},
         scenario,
         {},

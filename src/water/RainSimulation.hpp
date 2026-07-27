@@ -67,6 +67,12 @@ struct RainRockImpactSettings {
     float centreFalloff = 0.65F;
     float heightBias = 0.75F;
     float persistence = 1.35F;
+    // How strongly Wetness runs downhill on steep surfaces. Steep impacts
+    // spawn with a radius boosted by up to min(downhillStretch, 1) x
+    // steepness; the footprint puts that extra radius into the downhill run
+    // only, tightening lateral/uphill extents as stretch rises. Zero restores
+    // the isotropic footprint. Flat surfaces are unaffected at any value.
+    float downhillStretch = 1.0F;
 };
 
 // Finite sentinel for an open band edge. JSON cannot round-trip IEEE

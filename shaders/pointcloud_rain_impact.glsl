@@ -349,6 +349,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                     event.control.y,
                     styleData.rainImpactRock0,
                     styleData.rainImpactRock1,
+                    styleData.rainImpactSandBand.w,
                     point,
                     pointNormal,
                     age);

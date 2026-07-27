@@ -146,8 +146,9 @@ struct alignas(16) PointCloudStyleGpu {
     glm::vec4 rainImpactVegetation0{1.80F, 0.65F, 0.070F, 0.010F};
     // x: stream spread; yzw: VEG height band [minZ, maxZ, fadeMeters].
     glm::vec4 rainImpactVegetation1{0.65F, 2.5F, 1.0e8F, 0.30F};
-    // xyz: SAND height band [minZ, maxZ, fadeMeters].
-    glm::vec4 rainImpactSandBand{-1.0e8F, 2.0F, 0.30F, 0.0F};
+    // xyz: SAND height band [minZ, maxZ, fadeMeters], w: Wetness downhill
+    // stretch.
+    glm::vec4 rainImpactSandBand{-1.0e8F, 2.0F, 0.30F, 1.0F};
 };
 
 struct alignas(16) RainUniformsGpu {
@@ -244,8 +245,10 @@ struct alignas(16) SparseWaterRippleParamsGpu {
 struct alignas(16) WaterSeepageLookGpu {
     // x: pattern, y: blend mode.
     glm::uvec4 control{0U, 1U, 0U, 0U};
-    glm::vec4 legacy0{1.0F, 0.16F, 0.18F, 0.40F};
-    glm::vec4 legacy1{0.22F, 0.0F, 0.45F, 0.85F};
+    // Layout retained from the removed legacy-ripple pattern: legacy0 lanes
+    // are spare; legacy1 carries z: density, w: response intensity.
+    glm::vec4 legacy0{0.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec4 legacy1{0.0F, 0.0F, 0.45F, 0.85F};
     glm::vec4 response0{0.35F, 0.04F, 1.12F, 0.0F};
     glm::vec4 response1{1.08F, 0.28F, 0.42F, 0.46F};
     glm::vec4 response2{0.22F, 0.35F, 0.55F, 0.50F};
@@ -318,15 +321,12 @@ WaterSeepageLookGpu MakeWaterSeepageLookGpu(
         0U,
         0U,
     };
-    gpu.legacy0 = glm::vec4{
-        finiteClamp(look.patternScale, 0.05F, 100.0F, fallback.patternScale),
-        finiteClamp(look.wavelengthMeters, 0.002F, 50.0F, fallback.wavelengthMeters),
-        finiteClamp(look.speed, 0.0F, 20.0F, fallback.speed),
-        finiteClamp(look.warp, 0.0F, 8.0F, fallback.warp),
-    };
+    // legacy0 lanes are spare since the legacy-ripple pattern was removed;
+    // they are kept to preserve the GPU struct layout.
+    gpu.legacy0 = glm::vec4{0.0F, 0.0F, 0.0F, 0.0F};
     gpu.legacy1 = glm::vec4{
-        finiteClamp(look.turbulence, 0.0F, 1.0F, fallback.turbulence),
-        finiteOr(look.phase, fallback.phase),
+        0.0F,  // Spare lane (was legacy turbulence).
+        0.0F,  // Spare lane (was legacy phase).
         finiteClamp(look.density, 0.0F, 1.0F, fallback.density),
         finiteClamp(
             look.response.intensity,
@@ -419,11 +419,9 @@ WaterSeepageLookGpu MakeWaterSeepageLookGpu(
             0.0F,
             4.0F,
             fallback.downhillDriftMetersPerSecond),
-        finiteClamp(
-            look.trickleLengthMeters,
-            0.005F,
-            1000.0F,
-            fallback.trickleLengthMeters),
+        // Spare lane (was trickle length; the wetting front now anchors to
+        // the node's effective reach).
+        0.0F,
         finiteClamp(
             look.trickleWidthMeters,
             0.001F,
@@ -13647,7 +13645,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         sandBand.minZ,
         sandBand.maxZ,
         sandBand.fadeMeters,
-        0.0F,
+        std::clamp(renderState_.rainSettings.rockImpact.downhillStretch, 0.0F, 2.0F),
     };
     styleGpu.pointSize = MakePointCloudBindingGpu(
         layer.style.pointSize,
@@ -14920,7 +14918,9 @@ void VulkanViewportShell::UploadRainUniformsToBuffer(
         std::max(0.0F, settings.sandEffectScale),
         std::max(0.0F, settings.rockEffectScale),
         std::max(0.0F, settings.vegetationEffectScale),
-        0.0F,
+        // Wetness downhill stretch: the GPU simulator boosts steep rock
+        // impact radii by steepness x min(stretch, 1) at spawn.
+        std::clamp(settings.rockImpact.downhillStretch, 0.0F, 2.0F),
     };
     uniforms.viewport = glm::vec4{
         std::max(1U, width),

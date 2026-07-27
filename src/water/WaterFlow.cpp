@@ -3902,30 +3902,17 @@ WaterEffectResponseSettings SanitizeSeepageResponse(
 WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
     const WaterSeepageLookSettings fallback{};
     switch (look.pattern) {
-        case WaterSeepagePattern::LegacyRipples:
         case WaterSeepagePattern::WetRockSheen:
         case WaterSeepagePattern::ChaoticBloom:
         case WaterSeepagePattern::WettingTrickle:
             break;
         default:
-            look.pattern = WaterSeepagePattern::LegacyRipples;
+            look.pattern = WaterSeepagePattern::ChaoticBloom;
             break;
     }
     look.baseWetness = std::clamp(SeepageFiniteOr(look.baseWetness, fallback.baseWetness), 0.0F, 1.0F);
     look.density = std::clamp(SeepageFiniteOr(look.density, fallback.density), 0.0F, 1.0F);
     look.glisten = std::clamp(SeepageFiniteOr(look.glisten, fallback.glisten), 0.0F, 1.0F);
-    look.wavelengthMeters = std::clamp(
-        SeepageFiniteOr(look.wavelengthMeters, fallback.wavelengthMeters),
-        0.002F,
-        50.0F);
-    look.patternScale = std::clamp(
-        SeepageFiniteOr(look.patternScale, fallback.patternScale),
-        0.05F,
-        100.0F);
-    look.speed = std::clamp(SeepageFiniteOr(look.speed, fallback.speed), 0.0F, 20.0F);
-    look.warp = std::clamp(SeepageFiniteOr(look.warp, fallback.warp), 0.0F, 8.0F);
-    look.turbulence = std::clamp(SeepageFiniteOr(look.turbulence, fallback.turbulence), 0.0F, 1.0F);
-    look.phase = SeepageFiniteOr(look.phase, fallback.phase);
     look.rainResponse = std::clamp(SeepageFiniteOr(look.rainResponse, fallback.rainResponse), 0.0F, 1.0F);
     look.featureSizeMeters = std::clamp(
         SeepageFiniteOr(look.featureSizeMeters, fallback.featureSizeMeters),
@@ -3959,10 +3946,6 @@ WaterSeepageLookSettings SanitizeSeepageLook(WaterSeepageLookSettings look) {
         SeepageFiniteOr(look.tricklePatchSizeMeters, fallback.tricklePatchSizeMeters),
         0.005F,
         20.0F);
-    look.trickleLengthMeters = std::clamp(
-        SeepageFiniteOr(look.trickleLengthMeters, fallback.trickleLengthMeters),
-        0.005F,
-        1000.0F);
     look.trickleWidthMeters = std::clamp(
         SeepageFiniteOr(look.trickleWidthMeters, fallback.trickleWidthMeters),
         0.001F,
@@ -4302,11 +4285,18 @@ glm::vec3 WaterSeepageGuideTangent(
 invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntimeNode& node) {
     invisible_places::io::Bounds3f bounds;
     const float feather = std::max(0.0F, node.edgeFeatherMeters);
+    // The bounds must contain the area envelope's maximum over every live
+    // parameter value, because live edits never re-rasterize hash cells. The
+    // envelope clamps its run to the selection reach limit and its half-width
+    // to half the selection width limit, and its feathers scale with those
+    // values (0.10x run, 0.30x half-width), so those maxima are covered here.
+    const float halfWidthLimit = std::max(0.0F, node.selectionWidthLimitMeters) * 0.5F;
+    const float reachLimit = std::max(0.0F, node.selectionReachLimitMeters);
     const float lateralExtent =
-        std::max(node.startHalfWidthMeters, node.selectionWidthLimitMeters * 0.5F) + feather;
+        halfWidthLimit + std::max(feather, halfWidthLimit * 0.30F);
+    const float tailExtent = std::max(feather, reachLimit * 0.10F);
     const float depthExtent = node.depthToleranceMeters + feather;
     if (node.guideValid && node.guideSampleCount >= 2U) {
-        const float maximumReach = std::max(1.0e-5F, node.selectionReachLimitMeters);
         for (std::size_t sampleIndex = 0U;
              sampleIndex < node.guideSampleCount;
              ++sampleIndex) {
@@ -4323,15 +4313,10 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
             if (glm::dot(lateral, node.lateralAxis) < 0.0F) {
                 lateral = -lateral;
             }
-            const float progress = Clamp01(sample.station / maximumReach);
-            const float halfWidth = std::lerp(
-                node.startHalfWidthMeters,
-                node.selectionWidthLimitMeters * 0.5F,
-                progress);
             const glm::vec3 extent =
-                glm::abs(lateral) * (halfWidth + feather) +
+                glm::abs(lateral) * lateralExtent +
                 glm::abs(normal) * depthExtent +
-                glm::abs(tangent) * feather;
+                glm::abs(tangent) * tailExtent;
             bounds.Expand(FromGlm(position - extent));
             bounds.Expand(FromGlm(position + extent));
         }
@@ -4339,7 +4324,7 @@ invisible_places::io::Bounds3f SeepageRuntimeNodeBounds(const WaterSeepageRuntim
     }
     const std::array<float, 2> longitudinal{
         -feather,
-        node.selectionReachLimitMeters + feather};
+        reachLimit + tailExtent};
     const std::array<float, 2> lateral{-lateralExtent, lateralExtent};
     const std::array<float, 2> depth{-depthExtent, depthExtent};
     for (const float along : longitudinal) {
@@ -4372,42 +4357,6 @@ float SeepageHash01(std::int32_t x, std::int32_t y, std::uint32_t seed) {
     hash *= 0x7feb352dU;
     hash ^= hash >> 15U;
     return static_cast<float>(hash & 0x00ffffffU) / static_cast<float>(0x01000000U);
-}
-
-float SeepageValueNoise(const glm::vec2& coordinate, std::uint32_t seed) {
-    const auto x0 = static_cast<std::int32_t>(std::floor(coordinate.x));
-    const auto y0 = static_cast<std::int32_t>(std::floor(coordinate.y));
-    const float tx = coordinate.x - static_cast<float>(x0);
-    const float ty = coordinate.y - static_cast<float>(y0);
-    const float sx = tx * tx * (3.0F - 2.0F * tx);
-    const float sy = ty * ty * (3.0F - 2.0F * ty);
-    const float a = SeepageHash01(x0, y0, seed);
-    const float b = SeepageHash01(x0 + 1, y0, seed);
-    const float c = SeepageHash01(x0, y0 + 1, seed);
-    const float d = SeepageHash01(x0 + 1, y0 + 1, seed);
-    return std::lerp(std::lerp(a, b, sx), std::lerp(c, d, sx), sy);
-}
-
-float SeepageFractalNoise(
-    glm::vec2 coordinate,
-    std::uint32_t seed,
-    WaterSeepageQuality quality) {
-    std::uint32_t octaveCount = 2U;
-    if (quality == WaterSeepageQuality::Low) {
-        octaveCount = 1U;
-    } else if (quality == WaterSeepageQuality::High) {
-        octaveCount = 3U;
-    }
-    float value = 0.0F;
-    float weight = 0.0F;
-    float amplitude = 1.0F;
-    for (std::uint32_t octave = 0U; octave < octaveCount; ++octave) {
-        value += SeepageValueNoise(coordinate, seed + octave * 1013U) * amplitude;
-        weight += amplitude;
-        coordinate = coordinate * 2.03F + glm::vec2{17.0F, 31.0F};
-        amplitude *= 0.5F;
-    }
-    return weight > 0.0F ? value / weight : 0.0F;
 }
 
 struct SeepageNoise3Sample {
@@ -4531,9 +4480,60 @@ struct SeepageFanSample {
     float downDistance = 0.0F;
     float lateralDistance = 0.0F;
     float signedLateralDistance = 0.0F;
+    // The strength- and slope-shaped run and local half-width actually used by
+    // the membership test, so pattern evaluators (e.g. the wetting front) can
+    // anchor their geometry to the same envelope.
+    float effectiveReach = 0.0F;
+    float effectiveHalfWidth = 0.0F;
     glm::vec3 surfaceNormal{0.0F, 1.0F, 0.0F};
     glm::vec3 downTangent{0.0F, 0.0F, -1.0F};
 };
+
+// Area envelope shared by every membership path (and mirrored in
+// shaders/pointcloud_sparse_ripple.glsl — keep the constants in sync).
+// Node Strength shapes WHERE seepage lives: the run scales with strength and
+// travels further on near-vertical surfaces, while the half-width starts at
+// the authored node width and spreads outward with travelled distance —
+// faster on flat surfaces, slower on walls. Prominence never enters here; it
+// only scales how strongly the effect is applied. Everything reads live
+// parameters, so animation keys reshape the area without any topology work.
+inline constexpr float kSeepageFlatReachFactor = 0.45F;
+inline constexpr float kSeepageSteepReachFactor = 1.15F;
+inline constexpr float kSeepageSpreadRateMetersPerMeter = 0.18F;
+inline constexpr float kSeepageFlatSpreadFactor = 1.60F;
+inline constexpr float kSeepageSteepSpreadFactor = 0.45F;
+
+struct SeepageAreaEnvelope {
+    float reachRun = 0.0F;
+    float halfWidth = 0.0F;
+    float endFeather = 0.0F;
+    float lateralFeather = 0.0F;
+};
+
+SeepageAreaEnvelope EvaluateSeepageAreaEnvelope(
+    const WaterSeepageRuntimeNode& node,
+    float downDistance,
+    const glm::vec3& surfaceNormal) {
+    const float steep = Clamp01(1.0F - std::abs(surfaceNormal.z));
+    const float strength = std::clamp(node.strength, 0.0F, 8.0F);
+    SeepageAreaEnvelope envelope;
+    envelope.reachRun = std::clamp(
+        node.reachMeters * strength *
+            std::lerp(kSeepageFlatReachFactor, kSeepageSteepReachFactor, steep),
+        0.0F,
+        std::max(0.0F, node.selectionReachLimitMeters));
+    const float spreadRate =
+        kSeepageSpreadRateMetersPerMeter * strength *
+        std::lerp(kSeepageFlatSpreadFactor, kSeepageSteepSpreadFactor, steep);
+    envelope.halfWidth = std::clamp(
+        node.widthMeters * 0.5F + std::max(0.0F, downDistance) * spreadRate,
+        0.0F,
+        std::max(0.0F, node.selectionWidthLimitMeters) * 0.5F);
+    const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
+    envelope.endFeather = std::max(feather, envelope.reachRun * 0.10F);
+    envelope.lateralFeather = std::max(feather, envelope.halfWidth * 0.30F);
+    return envelope;
+}
 
 SeepageFanSample EvaluatePlanarSeepageFanMask(
     const WaterSeepageRuntimeNode& node,
@@ -4548,26 +4548,31 @@ SeepageFanSample EvaluatePlanarSeepageFanMask(
     sample.lateralDistance = std::abs(sample.signedLateralDistance);
     const float depthDistance = std::abs(glm::dot(relative, node.surfaceNormal));
     const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
-    const float effectiveReach = node.reachMeters;
-    const float effectiveEndHalfWidth = node.widthMeters * 0.5F;
+    const auto envelope = EvaluateSeepageAreaEnvelope(
+        node,
+        sample.downDistance,
+        node.surfaceNormal);
+    sample.effectiveReach = envelope.reachRun;
+    sample.effectiveHalfWidth = envelope.halfWidth;
     if (sample.downDistance < -feather ||
-        sample.downDistance > effectiveReach + feather ||
+        sample.downDistance > envelope.reachRun + envelope.endFeather ||
         depthDistance > node.depthToleranceMeters + feather) {
         return sample;
     }
 
-    const float along01 = Clamp01(sample.downDistance / std::max(1.0e-5F, effectiveReach));
-    const float halfWidth = std::lerp(node.startHalfWidthMeters, effectiveEndHalfWidth, along01);
-    if (sample.lateralDistance > halfWidth + feather) {
+    if (sample.lateralDistance > envelope.halfWidth + envelope.lateralFeather) {
         return sample;
     }
 
     const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
     const float endMask = 1.0F - SmoothStep(
-        effectiveReach - feather,
-        effectiveReach + feather,
+        envelope.reachRun - envelope.endFeather,
+        envelope.reachRun + envelope.endFeather,
         sample.downDistance);
-    const float lateralMask = 1.0F - SmoothStep(halfWidth, halfWidth + feather, sample.lateralDistance);
+    const float lateralMask = 1.0F - SmoothStep(
+        envelope.halfWidth,
+        envelope.halfWidth + envelope.lateralFeather,
+        sample.lateralDistance);
     const float depthMask = 1.0F - SmoothStep(
         node.depthToleranceMeters,
         node.depthToleranceMeters + feather,
@@ -4676,38 +4681,42 @@ SeepageFanSample EvaluateGuidedSeepageFanMask(
     sample.signedLateralDistance = glm::dot(relative, lateral);
     sample.lateralDistance = std::abs(sample.signedLateralDistance);
     const float depthDistance = std::abs(glm::dot(relative, surfaceNormal));
-    const float authoredReach = std::max(1.0e-5F, node.reachMeters);
+    auto envelope = EvaluateSeepageAreaEnvelope(
+        node,
+        sample.downDistance,
+        surfaceNormal);
+    // The guide cannot represent stations beyond what it traced, so the run
+    // is additionally bounded by the achieved guide extent. The end feather
+    // must follow the bounded run (the GPU mirror applies the bound before
+    // deriving the feather).
     const float lastStation = node.guideSamples[node.guideSampleCount - 1U].station;
-    const float supportedReach = std::min({
-        authoredReach,
+    envelope.reachRun = std::min({
+        envelope.reachRun,
         std::max(0.0F, node.guideAchievedReachMeters),
         std::max(0.0F, lastStation),
     });
-    if (supportedReach <= 1.0e-5F ||
+    envelope.endFeather = std::max(feather, envelope.reachRun * 0.10F);
+    sample.effectiveReach = envelope.reachRun;
+    sample.effectiveHalfWidth = envelope.halfWidth;
+    if (envelope.reachRun <= 1.0e-5F ||
         sample.downDistance < -feather ||
-        sample.downDistance > supportedReach + feather ||
+        sample.downDistance > envelope.reachRun + envelope.endFeather ||
         depthDistance > node.depthToleranceMeters + feather) {
         return sample;
     }
 
-    const float progress = Clamp01(sample.downDistance / authoredReach);
-    const float effectiveEndHalfWidth = node.widthMeters * 0.5F;
-    const float halfWidth = std::lerp(
-        node.startHalfWidthMeters,
-        effectiveEndHalfWidth,
-        progress);
-    if (sample.lateralDistance > halfWidth + feather) {
+    if (sample.lateralDistance > envelope.halfWidth + envelope.lateralFeather) {
         return sample;
     }
 
     const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
     const float endMask = 1.0F - SmoothStep(
-        supportedReach - feather,
-        supportedReach + feather,
+        envelope.reachRun - envelope.endFeather,
+        envelope.reachRun + envelope.endFeather,
         sample.downDistance);
     const float lateralMask = 1.0F - SmoothStep(
-        halfWidth,
-        halfWidth + feather,
+        envelope.halfWidth,
+        envelope.halfWidth + envelope.lateralFeather,
         sample.lateralDistance);
     const float depthMask = 1.0F - SmoothStep(
         node.depthToleranceMeters,
@@ -4815,50 +4824,6 @@ float SeepageReflectionSignal(
         fresnel * (0.08F + angleResponse * 0.32F));
 }
 
-SeepagePatternSignals EvaluateLegacySeepageSignals(
-    const WaterSeepageRuntimeNode& node,
-    const WaterSeepageLookSettings& look,
-    const SeepageFanSample& fan,
-    float timeSeconds) {
-    const float rainGain = Clamp01(node.rainVisualStrength * look.rainResponse);
-    const float wetness = Clamp01(look.baseWetness + 0.30F * rainGain);
-    const float density = Clamp01(look.density + 0.25F * rainGain);
-    const float wavelength = std::max(0.002F, look.wavelengthMeters);
-    const float spatialScale = std::clamp(look.patternScale, 0.05F, 100.0F) / wavelength;
-    const glm::vec2 noiseCoordinate{
-        fan.signedLateralDistance * spatialScale + look.warp * fan.downDistance,
-        fan.downDistance * spatialScale,
-    };
-    const std::uint32_t proceduralSeed = node.seed ^ (node.id * 0x9e3779b9U);
-    const float noise = SeepageFractalNoise(
-        noiseCoordinate * (0.42F + look.turbulence * 0.38F),
-        proceduralSeed,
-        node.resolvedQuality);
-    const float coverage = SmoothStep(1.0F - density - 0.12F, 1.0F - density + 0.12F, noise);
-    const float phase =
-        fan.downDistance * spatialScale + look.phase - std::max(0.0F, timeSeconds) * look.speed +
-        (noise - 0.5F) * look.warp;
-    const float rippleWave = 0.5F + 0.5F * std::sin(kSeepageTwoPi * phase);
-    const float ripplePeak = std::pow(
-        Clamp01(rippleWave),
-        node.resolvedQuality == WaterSeepageQuality::Low ? 2.0F : 3.5F);
-    const float glintWave = 0.5F + 0.5F * std::sin(
-        kSeepageTwoPi *
-        (phase * 1.73F + fan.signedLateralDistance * spatialScale * 0.37F + noise * 0.61F));
-    const float glintPeak = std::pow(
-        Clamp01(glintWave),
-        node.resolvedQuality == WaterSeepageQuality::High ? 7.0F : 5.0F);
-    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
-    return {
-        .damp = Clamp01(
-            strengthMask *
-            (wetness * (0.72F + noise * 0.28F) + coverage * (0.10F + rainGain * 0.12F))),
-        .variation = Clamp01(
-            strengthMask * coverage * ripplePeak * (0.30F + Clamp01(look.turbulence) * 0.70F)),
-        .glint = Clamp01(strengthMask * coverage * look.glisten * glintPeak),
-    };
-}
-
 SeepagePatternSignals EvaluateWetRockSeepageSignals(
     const WaterSeepageRuntimeNode& node,
     const WaterSeepageLookSettings& look,
@@ -4897,7 +4862,9 @@ SeepagePatternSignals EvaluateWetRockSeepageSignals(
         environmentDirection,
         viewContext,
         sparseGate);
-    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    // Strength shapes the area envelope inside the fan mask; the signal
+    // amplitude is intensity territory and belongs to prominence alone.
+    const float strengthMask = fan.mask;
     return {
         .damp = Clamp01(strengthMask * wetness * (0.68F + noise.value * 0.22F + patch * 0.20F)),
         .variation = Clamp01(strengthMask * patch * (0.08F + noise.value * 0.14F)),
@@ -4948,7 +4915,9 @@ SeepagePatternSignals EvaluateChaoticBloomSeepageSignals(
         environmentDirection,
         viewContext,
         sparseGate);
-    const float strengthMask = fan.mask * std::clamp(node.strength, 0.0F, 8.0F);
+    // Strength shapes the area envelope inside the fan mask, not the signal
+    // amplitude (see EvaluateSeepageAreaEnvelope).
+    const float strengthMask = fan.mask;
     return {
         .damp = Clamp01(
             strengthMask *
@@ -4976,11 +4945,10 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
     const float density = Clamp01(look.density + 0.25F * rainGain);
     const float patchSize = std::max(0.005F, look.tricklePatchSizeMeters);
     const float trickleWidth = std::max(0.001F, look.trickleWidthMeters);
-    const float trickleLength = std::max(
-        0.005F,
-        look.trickleLengthMeters *
-            (1.0F + 0.50F * Clamp01(node.scenarioSpread)) *
-            (1.0F + 0.25F * rainGain));
+    // The wetting front travels the same strength- and slope-shaped run the
+    // fan mask uses, so the pattern never re-declares its own extent (the
+    // node Reach — already spread/rain scaled — is the single area source).
+    const float trickleLength = std::max(0.005F, fan.effectiveReach);
     const float frontSoftness = std::max(0.001F, look.trickleFrontSoftness);
     const float downDistance = std::max(0.0F, fan.downDistance);
     const float time = std::max(0.0F, timeSeconds);
@@ -5004,15 +4972,12 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
     const float frontVariation =
         (patchNoise.value - 0.5F) * frontSoftness * (0.35F + look.breakup * 1.15F);
     const float frontDistance = trickleLength * progress + frontVariation;
-    const float frontMask = 1.0F - SmoothStep(
+    // No separate tail mask: the fan mask's end feather already fades the run
+    // out at the effective reach.
+    const float arrivalMask = Clamp01(1.0F - SmoothStep(
         frontDistance,
         frontDistance + frontSoftness,
-        downDistance);
-    const float tailMask = 1.0F - SmoothStep(
-        trickleLength,
-        trickleLength + frontSoftness,
-        downDistance);
-    const float arrivalMask = Clamp01(frontMask * tailMask);
+        downDistance));
     if (arrivalMask <= 1.0e-6F) {
         return {};
     }
@@ -5047,8 +5012,9 @@ SeepagePatternSignals EvaluateWettingTrickleSeepageSignals(
         environmentDirection,
         viewContext,
         sparseGate);
-    const float strengthMask =
-        fan.mask * arrivalMask * std::clamp(node.strength, 0.0F, 8.0F);
+    // Strength shapes the area envelope inside the fan mask, not the signal
+    // amplitude (see EvaluateSeepageAreaEnvelope).
+    const float strengthMask = fan.mask * arrivalMask;
     return {
         .damp = Clamp01(
             strengthMask *
@@ -5235,12 +5201,6 @@ WaterSeepageLookSettings LerpSeepageLook(
     result.baseWetness = std::lerp(left.baseWetness, right.baseWetness, amount);
     result.density = std::lerp(left.density, right.density, amount);
     result.glisten = std::lerp(left.glisten, right.glisten, amount);
-    result.wavelengthMeters = std::lerp(left.wavelengthMeters, right.wavelengthMeters, amount);
-    result.patternScale = std::lerp(left.patternScale, right.patternScale, amount);
-    result.speed = std::lerp(left.speed, right.speed, amount);
-    result.warp = std::lerp(left.warp, right.warp, amount);
-    result.turbulence = std::lerp(left.turbulence, right.turbulence, amount);
-    result.phase = std::lerp(left.phase, right.phase, amount);
     result.rainResponse = std::lerp(left.rainResponse, right.rainResponse, amount);
     result.featureSizeMeters = std::lerp(left.featureSizeMeters, right.featureSizeMeters, amount);
     result.contrast = std::lerp(left.contrast, right.contrast, amount);
@@ -5269,10 +5229,6 @@ WaterSeepageLookSettings LerpSeepageLook(
     result.tricklePatchSizeMeters = std::lerp(
         left.tricklePatchSizeMeters,
         right.tricklePatchSizeMeters,
-        amount);
-    result.trickleLengthMeters = std::lerp(
-        left.trickleLengthMeters,
-        right.trickleLengthMeters,
         amount);
     result.trickleWidthMeters = std::lerp(
         left.trickleWidthMeters,
@@ -6570,27 +6526,42 @@ WaterSeepageQuality ResolveWaterSeepageQuality(
 
 WaterSeepageLookSettings ResolveWaterSeepageLook(
     std::span<const WaterSeepageLookProfile> profiles,
+    std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook,
     std::string_view profileName,
-    const std::optional<WaterSeepageLookSettings>& lookOverride,
-    const std::optional<WaterSeepageLookSettings>& tempLookOverride) {
+    std::string_view responseProfileName) {
+    // Names are trimmed on both sides so a stored name with stray whitespace
+    // still resolves to the profile the UI reports as assigned.
+    const auto trimmedProfileName = TrimSeepageName(profileName);
+    const auto trimmedResponseName = TrimSeepageName(responseProfileName);
     WaterSeepageLookSettings resolved = defaultLook;
-    if (!profileName.empty()) {
+    if (!trimmedProfileName.empty()) {
         const auto profile = std::find_if(
             profiles.begin(),
             profiles.end(),
             [&](const WaterSeepageLookProfile& candidate) {
-                return candidate.name == profileName;
+                return TrimSeepageName(candidate.name) == trimmedProfileName;
             });
         if (profile != profiles.end()) {
             resolved = profile->settings;
         }
     }
-    if (lookOverride.has_value()) {
-        resolved = lookOverride.value();
-    }
-    if (tempLookOverride.has_value()) {
-        resolved = tempLookOverride.value();
+    // The response half always comes from the response profile (falling back
+    // to the default look's response), so switching the seepage effect keeps
+    // the chosen visual response and vice versa.
+    resolved.response = defaultLook.response;
+    resolved.blendMode = defaultLook.blendMode;
+    if (!trimmedResponseName.empty()) {
+        const auto responseProfile = std::find_if(
+            responseProfiles.begin(),
+            responseProfiles.end(),
+            [&](const WaterSeepageResponseProfile& candidate) {
+                return TrimSeepageName(candidate.name) == trimmedResponseName;
+            });
+        if (responseProfile != responseProfiles.end()) {
+            resolved.response = responseProfile->response;
+            resolved.blendMode = responseProfile->blendMode;
+        }
     }
     return SanitizeSeepageLook(resolved);
 }
@@ -6598,13 +6569,14 @@ WaterSeepageLookSettings ResolveWaterSeepageLook(
 WaterSeepageLookSettings ResolveWaterSeepageLook(
     const WaterSeepageNode& node,
     std::span<const WaterSeepageLookProfile> profiles,
+    std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook) {
     return ResolveWaterSeepageLook(
         profiles,
+        responseProfiles,
         defaultLook,
         node.lookProfileName,
-        node.lookOverride,
-        node.tempLookOverride);
+        node.responseProfileName);
 }
 
 std::string WaterSeepageLocalLookName(std::string_view baseName, std::uint32_t nodeId) {
@@ -6716,7 +6688,8 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
     std::span<const WaterSeepageSurfaceGuide> guides,
     const std::optional<WaterScenarioState>& scenarioState,
     std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates,
-    std::span<const WaterSeepageSupportSelection> supportSelections) {
+    std::span<const WaterSeepageSupportSelection> supportSelections,
+    std::span<const WaterSeepageResponseProfile> responseProfiles) {
     WaterSeepageSpatialGrid grid;
     grid.diagnostics.inputNodeCount = static_cast<std::uint32_t>(std::min<std::size_t>(
         nodes.size(),
@@ -6733,7 +6706,11 @@ WaterSeepageSpatialGrid BuildWaterSeepageSpatialGrid(
             !IsValidPoint(ToGlm(node.position))) {
             continue;
         }
-        const auto authoredLook = ResolveWaterSeepageLook(node, profiles, defaultLook);
+        const auto authoredLook = ResolveWaterSeepageLook(
+            node,
+            profiles,
+            responseProfiles,
+            defaultLook);
         WaterSeepageRuntimeNode runtime;
         runtime.id = node.id;
         runtime.seed = node.seed;
@@ -7071,7 +7048,8 @@ void ApplyWaterSeepageRuntimeParameters(
     const std::optional<WaterScenarioState>& scenarioState,
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
-    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates) {
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates,
+    std::span<const WaterSeepageResponseProfile> responseProfiles) {
     if (grid == nullptr) {
         return;
     }
@@ -7114,6 +7092,7 @@ void ApplyWaterSeepageRuntimeParameters(
             runtime.authoredLook = ResolveWaterSeepageLook(
                 *authored,
                 profiles,
+                responseProfiles,
                 defaultLook);
         }
         ApplySeepageRuntimeScenarioAndAnimation(
@@ -7198,9 +7177,6 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContributionWithFan(
                 timeSeconds,
                 viewContext);
             break;
-        case WaterSeepagePattern::LegacyRipples:
-            signals = EvaluateLegacySeepageSignals(node, look, fan, timeSeconds);
-            break;
     }
     contribution.mask = fan.mask;
     contribution.damp = signals.damp;
@@ -7245,20 +7221,28 @@ SeepageFanSample EvaluateConnectedSeepageSupportMask(
     sample.surfaceNormal = SafeSeepageNormal(metadata.surfaceNormal);
     sample.downTangent = node.downAxis;
     const float feather = std::max(1.0e-5F, node.edgeFeatherMeters);
-    const float halfWidth = node.widthMeters * 0.5F;
+    // The envelope reads the cached support-cell normal, so runs lengthen on
+    // near-vertical cells and widen faster across flat ones as the water
+    // moves through changing terrain.
+    const auto envelope = EvaluateSeepageAreaEnvelope(
+        node,
+        sample.downDistance,
+        sample.surfaceNormal);
+    sample.effectiveReach = envelope.reachRun;
+    sample.effectiveHalfWidth = envelope.halfWidth;
     if (sample.downDistance < -feather ||
-        sample.downDistance > node.reachMeters + feather ||
-        sample.lateralDistance > halfWidth + feather) {
+        sample.downDistance > envelope.reachRun + envelope.endFeather ||
+        sample.lateralDistance > envelope.halfWidth + envelope.lateralFeather) {
         return sample;
     }
     const float startMask = SmoothStep(-feather, 0.0F, sample.downDistance);
     const float endMask = 1.0F - SmoothStep(
-        node.reachMeters - feather,
-        node.reachMeters + feather,
+        envelope.reachRun - envelope.endFeather,
+        envelope.reachRun + envelope.endFeather,
         sample.downDistance);
     const float lateralMask = 1.0F - SmoothStep(
-        halfWidth,
-        halfWidth + feather,
+        envelope.halfWidth,
+        envelope.halfWidth + envelope.lateralFeather,
         sample.lateralDistance);
     const bool normalValid = IsValidPoint(pointNormal) &&
                              glm::dot(pointNormal, pointNormal) > kNormalEpsilon;
@@ -7282,10 +7266,12 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageRuntimeContribution(
     const invisible_places::io::Float3& normal,
     float timeSeconds,
     const WaterSeepageViewContext& viewContext) {
-    if (!IsValidPoint(ToGlm(position)) || node.enabledFactor <= 0.0F ||
-        node.reachMeters <= 0.0F || node.widthMeters <= 0.0F ||
-        node.prominence <= 0.0F || node.strength <= 0.0F ||
-        node.effectiveActivity <= 0.0F) {
+    // Threshold matches the GPU gate in EvaluateSeepageContribution so a
+    // parameter fading through zero cuts off at the same frame on both paths.
+    if (!IsValidPoint(ToGlm(position)) || node.enabledFactor <= 1.0e-5F ||
+        node.reachMeters <= 1.0e-5F || node.widthMeters <= 1.0e-5F ||
+        node.prominence <= 1.0e-5F || node.strength <= 1.0e-5F ||
+        node.effectiveActivity <= 1.0e-5F) {
         return {};
     }
     glm::vec3 pointNormal = ToGlm(normal);
@@ -7345,9 +7331,9 @@ WaterSeepageRuntimeContribution EvaluateWaterSeepageGridContribution(
                     continue;
                 }
                 const auto& node = grid.nodes[reference.nodeIndex];
-                if (node.enabledFactor <= 0.0F || node.reachMeters <= 0.0F ||
-                    node.widthMeters <= 0.0F || node.prominence <= 0.0F ||
-                    node.strength <= 0.0F || node.effectiveActivity <= 0.0F) {
+                if (node.enabledFactor <= 1.0e-5F || node.reachMeters <= 1.0e-5F ||
+                    node.widthMeters <= 1.0e-5F || node.prominence <= 1.0e-5F ||
+                    node.strength <= 1.0e-5F || node.effectiveActivity <= 1.0e-5F) {
                     continue;
                 }
                 const auto contribution = EvaluateWaterSeepageRuntimeContributionWithFan(
@@ -7568,12 +7554,6 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, look.baseWetness);
         SeepageFingerprintFloat(&hash, look.density);
         SeepageFingerprintFloat(&hash, look.glisten);
-        SeepageFingerprintFloat(&hash, look.wavelengthMeters);
-        SeepageFingerprintFloat(&hash, look.patternScale);
-        SeepageFingerprintFloat(&hash, look.speed);
-        SeepageFingerprintFloat(&hash, look.warp);
-        SeepageFingerprintFloat(&hash, look.turbulence);
-        SeepageFingerprintFloat(&hash, look.phase);
         SeepageFingerprintFloat(&hash, look.featureSizeMeters);
         SeepageFingerprintFloat(&hash, look.contrast);
         SeepageFingerprintFloat(&hash, look.evolution);
@@ -7587,7 +7567,6 @@ std::string WaterSeepageParamsFingerprint(const WaterSeepageSpatialGrid& grid) {
         SeepageFingerprintFloat(&hash, look.breakup);
         SeepageFingerprintFloat(&hash, look.downhillDriftMetersPerSecond);
         SeepageFingerprintFloat(&hash, look.tricklePatchSizeMeters);
-        SeepageFingerprintFloat(&hash, look.trickleLengthMeters);
         SeepageFingerprintFloat(&hash, look.trickleWidthMeters);
         SeepageFingerprintFloat(&hash, look.trickleFrontSoftness);
         SeepageFingerprintFloat(&hash, look.rainResponse);

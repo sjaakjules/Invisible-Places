@@ -597,7 +597,8 @@ RockRainCase MakeCase(
         pointNormal.x,
         pointNormal.y,
         pointNormal.z,
-        0.0F};
+        // Downhill stretch travels in the point-normal spare lane on GPU.
+        settings.downhillStretch};
     result.gpu.control = {seed, 0U, 0U, 0U};
     result.gpu.rockImpact0 = {
         settings.edgeBreakup,
@@ -639,6 +640,8 @@ std::vector<RockRainCase> BuildEquivalenceCases() {
     smoothFast.centreFalloff = 0.0F;
     smoothFast.heightBias = 0.0F;
     smoothFast.persistence = 0.675F;
+    // Exercises the anisotropy-only region above the spawn-boost clamp.
+    smoothFast.downhillStretch = 1.60F;
     const std::array<invisible_places::water::RainRockImpactSettings, 2> impactSettings{{
         invisible_places::water::RainRockImpactSettings{},
         smoothFast,

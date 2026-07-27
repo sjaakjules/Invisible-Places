@@ -137,7 +137,6 @@ enum class WaterSeepageQuality {
 };
 
 enum class WaterSeepagePattern {
-    LegacyRipples,
     WetRockSheen,
     ChaoticBloom,
     WettingTrickle
@@ -233,12 +232,6 @@ struct WaterSeepageLookSettings {
     float baseWetness = 0.35F;
     float density = 0.45F;
     float glisten = 0.55F;
-    float wavelengthMeters = 0.16F;
-    float patternScale = 1.0F;
-    float speed = 0.18F;
-    float warp = 0.40F;
-    float turbulence = 0.22F;
-    float phase = 0.0F;
     float rainResponse = 0.50F;
     float featureSizeMeters = 0.20F;
     float contrast = 0.55F;
@@ -253,7 +246,6 @@ struct WaterSeepageLookSettings {
     float breakup = 0.45F;
     float downhillDriftMetersPerSecond = 0.025F;
     float tricklePatchSizeMeters = 0.08F;
-    float trickleLengthMeters = 0.35F;
     float trickleWidthMeters = 0.018F;
     float trickleFrontSoftness = 0.10F;
     WaterEffectResponseSettings response{
@@ -273,9 +265,23 @@ struct WaterSeepageLookSettings {
     WaterEffectBlendMode blendMode = WaterEffectBlendMode::Max;
 };
 
+// Named seepage settings profile (pattern, motion, reflection — everything
+// except the visual response). The response half of the stored settings is
+// ignored at resolve time; nodes pair a settings profile with an independent
+// response profile so the effect and how much it changes the underlying
+// cloud can be mixed and matched.
 struct WaterSeepageLookProfile {
     std::string name = "Default";
     WaterSeepageLookSettings settings{};
+};
+
+// Named visual-response profile: how strongly seepage changes the underlying
+// cloud (emission/opacity/size/colour response and blend), independent of
+// which pattern produces the effect.
+struct WaterSeepageResponseProfile {
+    std::string name = "Default";
+    WaterEffectResponseSettings response{};
+    WaterEffectBlendMode blendMode = WaterEffectBlendMode::Max;
 };
 
 struct WaterScenarioState {
@@ -422,13 +428,18 @@ struct WaterSeepageNode {
     invisible_places::io::Float3 position{};
     invisible_places::io::Float3 surfaceNormal{0.0F, 1.0F, 0.0F};
     invisible_places::io::Float3 downAxis{0.0F, 0.0F, -1.0F};
+    // Nominal travel at strength one; strength and surface steepness scale
+    // the run inside the selection limits.
     float reachMeters = 1.25F;
-    // Width is the live full-width threshold used by connected support. The
-    // legacy start/end fields remain readable during the staged migration,
-    // but new topology and parameter fingerprints use widthMeters.
+    // Width is the live full width at the node. Below the node the area
+    // envelope widens with travelled distance (strength- and slope-driven);
+    // the legacy start/end fields remain readable during the staged
+    // migration, but new topology and parameter fingerprints use widthMeters.
     float widthMeters = 0.75F;
     float startWidthMeters = 0.12F;
     float endWidthMeters = 0.75F;
+    // Prominence scales only how strongly the effect is applied, never where
+    // it applies; strength shapes the affected area.
     float prominence = 1.0F;
     // Cache-cell support is authored to fixed limits. Reach/width edits inside
     // these limits remain parameter-only; increasing a limit is the explicit
@@ -444,6 +455,10 @@ struct WaterSeepageNode {
     bool enabledInExport = true;
     std::vector<std::string> targetSceneRoles{"ROCK", "VEG"};
     std::string lookProfileName = "Default";
+    std::string responseProfileName = "Default";
+    // Legacy migration only: older documents stored per-node look copies.
+    // Loading materializes them as named profiles and clears these; the
+    // resolve path never reads them and they are no longer serialized.
     std::optional<WaterSeepageLookSettings> lookOverride;
     std::optional<WaterSeepageLookSettings> tempLookOverride;
 };
@@ -1319,13 +1334,14 @@ void ApplyWaterTimingLevelToScenarioState(
     std::uint64_t effectivePointInvocations);
 [[nodiscard]] WaterSeepageLookSettings ResolveWaterSeepageLook(
     std::span<const WaterSeepageLookProfile> profiles,
+    std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook,
     std::string_view profileName,
-    const std::optional<WaterSeepageLookSettings>& lookOverride,
-    const std::optional<WaterSeepageLookSettings>& tempLookOverride);
+    std::string_view responseProfileName);
 [[nodiscard]] WaterSeepageLookSettings ResolveWaterSeepageLook(
     const WaterSeepageNode& node,
     std::span<const WaterSeepageLookProfile> profiles,
+    std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook);
 [[nodiscard]] std::string WaterSeepageLocalLookName(std::string_view baseName, std::uint32_t nodeId);
 [[nodiscard]] invisible_places::io::Float3 DeriveWaterSeepageDownAxis(
@@ -1342,7 +1358,11 @@ void ApplyWaterTimingLevelToScenarioState(
     std::span<const WaterSeepageSurfaceGuide> guides = {},
     const std::optional<WaterScenarioState>& scenarioState = std::nullopt,
     std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {},
-    std::span<const WaterSeepageSupportSelection> supportSelections = {});
+    std::span<const WaterSeepageSupportSelection> supportSelections = {},
+    // Appended (rather than beside `profiles`) so existing positional
+    // callers keep compiling; empty means every node uses the default
+    // response.
+    std::span<const WaterSeepageResponseProfile> responseProfiles = {});
 [[nodiscard]] WaterSeepageSupportBuildResult BuildWaterSeepageSupportSelection(
     const WaterSeepageNode& node,
     std::string_view targetSceneRole,
@@ -1361,7 +1381,8 @@ void ApplyWaterSeepageRuntimeParameters(
     const std::optional<WaterScenarioState>& scenarioState,
     const WaterRainSettings& rainSettings,
     std::uint64_t effectivePointInvocations,
-    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {});
+    std::span<const WaterSeepageNodeAnimationStateEntry> nodeAnimationStates = {},
+    std::span<const WaterSeepageResponseProfile> responseProfiles = {});
 void ApplyWaterSeepageScenarioParameters(
     WaterSeepageSpatialGrid* grid,
     const std::optional<WaterScenarioState>& scenarioState,

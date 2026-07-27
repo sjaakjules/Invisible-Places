@@ -64,12 +64,13 @@ invisible_places::water::WaterSeepageSpatialGrid MakeSeepageGrid(bool attenuateO
         look.response.opacityAdd = 0.0F;
         look.response.opacityMultiply = 0.45F;
     }
-    node.lookOverride = look;
+    // Per-node overrides were replaced by named profiles; the custom look is
+    // supplied as the default look the node resolves to.
     const std::vector<invisible_places::water::WaterSeepageNode> nodes{node};
     return invisible_places::water::BuildWaterSeepageSpatialGrid(
         nodes,
         {},
-        invisible_places::water::DefaultWaterSeepageLookSettings(),
+        look,
         "ROCK",
         true,
         invisible_places::water::DefaultWaterRainSettings(),

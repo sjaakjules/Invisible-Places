@@ -2949,8 +2949,6 @@ WaterSeepageQuality ParseWaterSeepageQuality(const json& qualityJson) {
 
 const char* WaterSeepagePatternName(WaterSeepagePattern pattern) {
     switch (pattern) {
-        case WaterSeepagePattern::LegacyRipples:
-            return "legacy_ripples";
         case WaterSeepagePattern::WetRockSheen:
             return "wet_rock_sheen";
         case WaterSeepagePattern::ChaoticBloom:
@@ -2958,24 +2956,23 @@ const char* WaterSeepagePatternName(WaterSeepagePattern pattern) {
         case WaterSeepagePattern::WettingTrickle:
             return "wetting_trickle";
     }
-    return "legacy_ripples";
+    return "chaotic_bloom";
 }
 
 WaterSeepagePattern ParseWaterSeepagePattern(const json& patternJson) {
     if (!patternJson.is_string()) {
-        return WaterSeepagePattern::LegacyRipples;
+        return WaterSeepagePattern::ChaoticBloom;
     }
     const auto name = patternJson.get<std::string>();
     if (name == "wet_rock_sheen") {
         return WaterSeepagePattern::WetRockSheen;
     }
-    if (name == "chaotic_bloom") {
-        return WaterSeepagePattern::ChaoticBloom;
-    }
     if (name == "wetting_trickle") {
         return WaterSeepagePattern::WettingTrickle;
     }
-    return WaterSeepagePattern::LegacyRipples;
+    // "chaotic_bloom", the removed "legacy_ripples", and unknown names all
+    // resolve to the current default pattern.
+    return WaterSeepagePattern::ChaoticBloom;
 }
 
 json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings) {
@@ -2985,12 +2982,6 @@ json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings)
         {"base_wetness", settings.baseWetness},
         {"density", settings.density},
         {"glisten", settings.glisten},
-        {"pattern_scale", settings.patternScale},
-        {"wavelength_meters", settings.wavelengthMeters},
-        {"speed", settings.speed},
-        {"warp", settings.warp},
-        {"turbulence", settings.turbulence},
-        {"phase", settings.phase},
         {"rain_response", settings.rainResponse},
         {"feature_size_meters", settings.featureSizeMeters},
         {"contrast", settings.contrast},
@@ -3005,7 +2996,6 @@ json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings)
         {"breakup", settings.breakup},
         {"downhill_drift_meters_per_second", settings.downhillDriftMetersPerSecond},
         {"trickle_patch_size_meters", settings.tricklePatchSizeMeters},
-        {"trickle_length_meters", settings.trickleLengthMeters},
         {"trickle_width_meters", settings.trickleWidthMeters},
         {"trickle_front_softness", settings.trickleFrontSoftness},
         {"blend_mode", WaterEffectBlendModeName(settings.blendMode)},
@@ -3015,9 +3005,9 @@ json SerializeWaterSeepageLookSettings(const WaterSeepageLookSettings& settings)
 
 WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson) {
     WaterSeepageLookSettings settings;
-    // Documents written before pattern selection existed used the legacy
-    // projected ripple evaluator. Preserve that appearance exactly.
-    settings.pattern = WaterSeepagePattern::LegacyRipples;
+    // Documents written before pattern selection existed load as the current
+    // default pattern (Chaotic Bloom).
+    settings.pattern = WaterSeepagePattern::ChaoticBloom;
     if (settingsJson.contains("quality")) {
         settings.quality = ParseWaterSeepageQuality(settingsJson.at("quality"));
     }
@@ -3027,12 +3017,6 @@ WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson)
     settings.baseWetness = settingsJson.value("base_wetness", settings.baseWetness);
     settings.density = settingsJson.value("density", settings.density);
     settings.glisten = settingsJson.value("glisten", settings.glisten);
-    settings.patternScale = settingsJson.value("pattern_scale", settings.patternScale);
-    settings.wavelengthMeters = settingsJson.value("wavelength_meters", settings.wavelengthMeters);
-    settings.speed = settingsJson.value("speed", settings.speed);
-    settings.warp = settingsJson.value("warp", settings.warp);
-    settings.turbulence = settingsJson.value("turbulence", settings.turbulence);
-    settings.phase = settingsJson.value("phase", settings.phase);
     settings.rainResponse = settingsJson.value("rain_response", settings.rainResponse);
     settings.featureSizeMeters = settingsJson.value("feature_size_meters", settings.featureSizeMeters);
     settings.contrast = settingsJson.value("contrast", settings.contrast);
@@ -3057,9 +3041,6 @@ WaterSeepageLookSettings ParseWaterSeepageLookSettings(const json& settingsJson)
     settings.tricklePatchSizeMeters = settingsJson.value(
         "trickle_patch_size_meters",
         settings.tricklePatchSizeMeters);
-    settings.trickleLengthMeters = settingsJson.value(
-        "trickle_length_meters",
-        settings.trickleLengthMeters);
     settings.trickleWidthMeters = settingsJson.value(
         "trickle_width_meters",
         settings.trickleWidthMeters);
@@ -3087,6 +3068,29 @@ WaterSeepageLookProfile ParseWaterSeepageLookProfile(const json& profileJson) {
     profile.name = profileJson.value("name", profile.name);
     if (profileJson.contains("settings")) {
         profile.settings = ParseWaterSeepageLookSettings(profileJson.at("settings"));
+    }
+    return profile;
+}
+
+json SerializeWaterSeepageResponseProfile(
+    const invisible_places::water::WaterSeepageResponseProfile& profile) {
+    return json{
+        {"name", profile.name},
+        {"response", SerializeWaterEffectResponseSettings(profile.response)},
+        {"blend_mode", WaterEffectBlendModeName(profile.blendMode)},
+    };
+}
+
+invisible_places::water::WaterSeepageResponseProfile ParseWaterSeepageResponseProfile(
+    const json& profileJson) {
+    invisible_places::water::WaterSeepageResponseProfile profile;
+    profile.name = profileJson.value("name", profile.name);
+    if (profileJson.contains("response")) {
+        profile.response =
+            ParseWaterEffectResponseSettings(profileJson.at("response"));
+    }
+    if (profileJson.contains("blend_mode")) {
+        profile.blendMode = ParseWaterEffectBlendMode(profileJson.at("blend_mode"));
     }
     return profile;
 }
@@ -3508,14 +3512,10 @@ json SerializeWaterSeepageNode(const WaterSeepageNode& node) {
         {"enabled_in_export", node.enabledInExport},
         {"target_scene_roles", node.targetSceneRoles},
         {"look_profile_name", node.lookProfileName},
+        {"response_profile_name", node.responseProfileName},
     };
-    if (node.lookOverride.has_value()) {
-        nodeJson["look_override"] = SerializeWaterSeepageLookSettings(node.lookOverride.value());
-    }
-    if (node.tempLookOverride.has_value()) {
-        nodeJson["temp_look_override"] =
-            SerializeWaterSeepageLookSettings(node.tempLookOverride.value());
-    }
+    // The legacy per-node look overrides are no longer written: loading
+    // materializes them as named profiles (see the app-side migration).
     return nodeJson;
 }
 
@@ -3576,6 +3576,11 @@ WaterSeepageNode ParseWaterSeepageNode(const json& nodeJson) {
         node.targetSceneRoles = nodeJson.at("target_scene_roles").get<std::vector<std::string>>();
     }
     node.lookProfileName = nodeJson.value("look_profile_name", node.lookProfileName);
+    // Empty means "unset" so the app-side migration can pair nodes from
+    // pre-split documents with the response derived from their look profile.
+    node.responseProfileName = nodeJson.value("response_profile_name", std::string{});
+    // Legacy per-node overrides are parsed only so the app-side migration can
+    // materialize them as named profiles; the resolve path never reads them.
     if (nodeJson.contains("look_override")) {
         node.lookOverride = ParseWaterSeepageLookSettings(nodeJson.at("look_override"));
     }
@@ -4700,6 +4705,7 @@ json SerializeWaterRainSettings(
           {"centre_falloff", settings.rockImpact.centreFalloff},
           {"height_bias", settings.rockImpact.heightBias},
           {"persistence", settings.rockImpact.persistence},
+          {"downhill_stretch", settings.rockImpact.downhillStretch},
           {"band_min_z", settings.rockImpactBand.minZ},
           {"band_max_z", settings.rockImpactBand.maxZ},
           {"band_fade_meters", settings.rockImpactBand.fadeMeters}}},
@@ -4814,6 +4820,10 @@ RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
             tuning.value("height_bias", settings.rockImpact.heightBias), 0.0F, 2.0F);
         settings.rockImpact.persistence = std::max(
             0.05F, tuning.value("persistence", settings.rockImpact.persistence));
+        settings.rockImpact.downhillStretch = std::clamp(
+            tuning.value("downhill_stretch", settings.rockImpact.downhillStretch),
+            0.0F,
+            2.0F);
         settings.rockImpactBand = invisible_places::water::SanitizeRainImpactHeightBand({
             tuning.value("band_min_z", settings.rockImpactBand.minZ),
             tuning.value("band_max_z", settings.rockImpactBand.maxZ),
@@ -6413,6 +6423,7 @@ bool SaveProjectDocument(
         {"water_seepage_nodes", json::array()},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.waterSeepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
+        {"water_seepage_response_profiles", json::array()},
         {"water_scenarios", json::array()},
         {"selected_water_scenario", document.selectedWaterScenarioId},
         {"water_timing_runs", json::array()},
@@ -6480,6 +6491,10 @@ bool SaveProjectDocument(
     for (const auto& profile : document.waterSeepageLookProfiles) {
         projectJson["water_seepage_look_profiles"].push_back(
             SerializeWaterSeepageLookProfile(profile));
+    }
+    for (const auto& profile : document.waterSeepageResponseProfiles) {
+        projectJson["water_seepage_response_profiles"].push_back(
+            SerializeWaterSeepageResponseProfile(profile));
     }
     for (const auto& scenario : document.waterScenarios) {
         projectJson["water_scenarios"].push_back(
@@ -6655,6 +6670,14 @@ std::optional<ProjectDocument> LoadProjectDocument(
         for (const auto& profileJson : projectJson->at("water_seepage_look_profiles")) {
             document.waterSeepageLookProfiles.push_back(
                 ParseWaterSeepageLookProfile(profileJson));
+        }
+    }
+    if (projectJson->contains("water_seepage_response_profiles") &&
+        projectJson->at("water_seepage_response_profiles").is_array()) {
+        for (const auto& profileJson :
+             projectJson->at("water_seepage_response_profiles")) {
+            document.waterSeepageResponseProfiles.push_back(
+                ParseWaterSeepageResponseProfile(profileJson));
         }
     }
     if (projectJson->contains("water_seepage_nodes") &&
@@ -7067,6 +7090,7 @@ bool SaveWaterSourcesDocument(
         {"water_seepage_nodes", json::array()},
         {"water_seepage_default_look", SerializeWaterSeepageLookSettings(document.seepageDefaultLook)},
         {"water_seepage_look_profiles", json::array()},
+        {"water_seepage_response_profiles", json::array()},
         {"water_ripple_layers", json::array()},
         {"water_field_layers", json::array()},
         {"water_ripple_runtime_caches", json::array()},
@@ -7112,6 +7136,10 @@ bool SaveWaterSourcesDocument(
     for (const auto& profile : document.seepageLookProfiles) {
         sourcesJson["water_seepage_look_profiles"].push_back(
             SerializeWaterSeepageLookProfile(profile));
+    }
+    for (const auto& profile : document.seepageResponseProfiles) {
+        sourcesJson["water_seepage_response_profiles"].push_back(
+            SerializeWaterSeepageResponseProfile(profile));
     }
     for (const auto& layer : document.rippleLayers) {
         sourcesJson["water_ripple_layers"].push_back(SerializeWaterEffectLayer(layer));
@@ -7165,6 +7193,14 @@ std::optional<WaterSourcesDocument> LoadWaterSourcesDocument(
         sourcesJson->at("water_seepage_look_profiles").is_array()) {
         for (const auto& profileJson : sourcesJson->at("water_seepage_look_profiles")) {
             document.seepageLookProfiles.push_back(ParseWaterSeepageLookProfile(profileJson));
+        }
+    }
+    if (sourcesJson->contains("water_seepage_response_profiles") &&
+        sourcesJson->at("water_seepage_response_profiles").is_array()) {
+        for (const auto& profileJson :
+             sourcesJson->at("water_seepage_response_profiles")) {
+            document.seepageResponseProfiles.push_back(
+                ParseWaterSeepageResponseProfile(profileJson));
         }
     }
     if (sourcesJson->contains("water_flow_trail_settings")) {

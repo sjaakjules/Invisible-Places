@@ -184,6 +184,8 @@ struct ProjectDocument {
     std::vector<invisible_places::water::WaterSeepageNode> waterSeepageNodes;
     invisible_places::water::WaterSeepageLookSettings waterSeepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> waterSeepageLookProfiles;
+    std::vector<invisible_places::water::WaterSeepageResponseProfile>
+        waterSeepageResponseProfiles;
     std::vector<invisible_places::water::WaterScenarioDefinition> waterScenarios;
     std::string selectedWaterScenarioId;
     std::vector<invisible_places::water::WaterTimingRun> waterTimingRuns;
@@ -247,6 +249,8 @@ struct WaterSourcesDocument {
     std::vector<invisible_places::water::WaterSeepageNode> seepageNodes;
     invisible_places::water::WaterSeepageLookSettings seepageDefaultLook{};
     std::vector<invisible_places::water::WaterSeepageLookProfile> seepageLookProfiles;
+    std::vector<invisible_places::water::WaterSeepageResponseProfile>
+        seepageResponseProfiles;
     std::vector<invisible_places::water::WaterEffectLayer> rippleLayers;
     std::vector<invisible_places::water::WaterEffectLayer> fieldLayers;
     invisible_places::water::WaterSourceSettings sourceSettings{};

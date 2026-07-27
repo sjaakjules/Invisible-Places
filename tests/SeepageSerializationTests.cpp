@@ -27,19 +27,13 @@ WaterSeepageLookSettings MakeLook(
     WaterSeepageLookSettings look;
     look.quality = quality;
     look.pattern = quality == WaterSeepageQuality::Auto
-                       ? WaterSeepagePattern::LegacyRipples
+                       ? WaterSeepagePattern::ChaoticBloom
                        : (quality == WaterSeepageQuality::Balanced
                               ? WaterSeepagePattern::WetRockSheen
                               : WaterSeepagePattern::WettingTrickle);
     look.baseWetness = 0.11F + offset;
     look.density = 0.22F + offset;
     look.glisten = 0.33F + offset;
-    look.patternScale = 1.44F + offset;
-    look.wavelengthMeters = 0.055F + offset;
-    look.speed = 0.16F + offset;
-    look.warp = 0.27F + offset;
-    look.turbulence = 0.38F + offset;
-    look.phase = 0.49F + offset;
     look.rainResponse = 0.60F + offset;
     look.featureSizeMeters = 0.19F + offset;
     look.contrast = 0.41F + offset;
@@ -54,7 +48,6 @@ WaterSeepageLookSettings MakeLook(
     look.breakup = 0.53F + offset;
     look.downhillDriftMetersPerSecond = 0.026F + offset;
     look.tricklePatchSizeMeters = 0.081F + offset;
-    look.trickleLengthMeters = 0.36F + offset;
     look.trickleWidthMeters = 0.019F + offset;
     look.trickleFrontSoftness = 0.11F + offset;
     look.blendMode = blendMode;
@@ -81,12 +74,6 @@ void CheckLook(
     CHECK(actual.baseWetness == Catch::Approx(expected.baseWetness));
     CHECK(actual.density == Catch::Approx(expected.density));
     CHECK(actual.glisten == Catch::Approx(expected.glisten));
-    CHECK(actual.patternScale == Catch::Approx(expected.patternScale));
-    CHECK(actual.wavelengthMeters == Catch::Approx(expected.wavelengthMeters));
-    CHECK(actual.speed == Catch::Approx(expected.speed));
-    CHECK(actual.warp == Catch::Approx(expected.warp));
-    CHECK(actual.turbulence == Catch::Approx(expected.turbulence));
-    CHECK(actual.phase == Catch::Approx(expected.phase));
     CHECK(actual.rainResponse == Catch::Approx(expected.rainResponse));
     CHECK(actual.featureSizeMeters == Catch::Approx(expected.featureSizeMeters));
     CHECK(actual.contrast == Catch::Approx(expected.contrast));
@@ -105,9 +92,6 @@ void CheckLook(
     CHECK(
         actual.tricklePatchSizeMeters ==
         Catch::Approx(expected.tricklePatchSizeMeters));
-    CHECK(
-        actual.trickleLengthMeters ==
-        Catch::Approx(expected.trickleLengthMeters));
     CHECK(
         actual.trickleWidthMeters ==
         Catch::Approx(expected.trickleWidthMeters));
@@ -154,8 +138,7 @@ WaterSeepageNode MakeNode() {
     node.enabledInExport = true;
     node.targetSceneRoles = {"ROCK", "VEG"};
     node.lookProfileName = "Rain-darkened cliff";
-    node.lookOverride = MakeLook(WaterSeepageQuality::Low, 0.01F, WaterEffectBlendMode::Screen);
-    node.tempLookOverride = MakeLook(WaterSeepageQuality::High, 0.02F, WaterEffectBlendMode::Override);
+    node.responseProfileName = "Strong response";
     return node;
 }
 
@@ -191,12 +174,10 @@ void CheckNode(const WaterSeepageNode& actual, const WaterSeepageNode& expected)
     CHECK(actual.enabledInExport == expected.enabledInExport);
     CHECK(actual.targetSceneRoles == expected.targetSceneRoles);
     CHECK(actual.lookProfileName == expected.lookProfileName);
-    REQUIRE(actual.lookOverride.has_value());
-    REQUIRE(expected.lookOverride.has_value());
-    CheckLook(actual.lookOverride.value(), expected.lookOverride.value());
-    REQUIRE(actual.tempLookOverride.has_value());
-    REQUIRE(expected.tempLookOverride.has_value());
-    CheckLook(actual.tempLookOverride.value(), expected.tempLookOverride.value());
+    CHECK(actual.responseProfileName == expected.responseProfileName);
+    // Legacy per-node overrides are migration-only inputs and never persist.
+    CHECK_FALSE(actual.lookOverride.has_value());
+    CHECK_FALSE(actual.tempLookOverride.has_value());
 }
 
 std::string ReadTextFile(const std::filesystem::path& path) {
@@ -221,6 +202,29 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
             WaterEffectBlendMode::Multiply),
     };
     document.waterSeepageLookProfiles.push_back(profile);
+    document.waterSeepageLookProfiles.push_back({
+        .name = "Trickle low",
+        .settings = MakeLook(
+            WaterSeepageQuality::Low,
+            0.01F,
+            WaterEffectBlendMode::Screen),
+    });
+    document.waterSeepageLookProfiles.push_back({
+        .name = "Trickle high",
+        .settings = MakeLook(
+            WaterSeepageQuality::High,
+            0.02F,
+            WaterEffectBlendMode::Override),
+    });
+    const invisible_places::water::WaterSeepageResponseProfile responseProfile{
+        .name = "Strong response",
+        .response = MakeLook(
+            WaterSeepageQuality::Auto,
+            0.06F,
+            WaterEffectBlendMode::Add).response,
+        .blendMode = WaterEffectBlendMode::Add,
+    };
+    document.waterSeepageResponseProfiles.push_back(responseProfile);
     document.waterScenarios = invisible_places::water::DefaultWaterScenarioDefinitions();
     document.waterScenarios.front().state.seepageRainDelaySeconds = 8.0F;
     document.waterScenarios.front().state.seepageRainRiseSeconds = 14.0F;
@@ -242,6 +246,8 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     CHECK(savedJson.find("\"water_seepage_nodes\"") != std::string::npos);
     CHECK(savedJson.find("\"water_seepage_default_look\"") != std::string::npos);
     CHECK(savedJson.find("\"water_seepage_look_profiles\"") != std::string::npos);
+    CHECK(savedJson.find("\"water_seepage_response_profiles\"") != std::string::npos);
+    CHECK(savedJson.find("\"response_profile_name\"") != std::string::npos);
     CHECK(savedJson.find("\"water_scenarios\"") != std::string::npos);
     CHECK(savedJson.find("\"selected_water_scenario\": \"pre-colonisation-wet\"") != std::string::npos);
     CHECK(savedJson.find("\"pattern\": \"wet_rock_sheen\"") != std::string::npos);
@@ -264,9 +270,17 @@ TEST_CASE("Project documents round-trip Seepage nodes and shared looks", "[water
     REQUIRE(loaded.has_value());
     CHECK(loaded->schemaVersion == invisible_places::serialization::kProjectDocumentSchemaVersion);
     CheckLook(loaded->waterSeepageDefaultLook, document.waterSeepageDefaultLook);
-    REQUIRE(loaded->waterSeepageLookProfiles.size() == 1U);
+    REQUIRE(loaded->waterSeepageLookProfiles.size() == 3U);
     CHECK(loaded->waterSeepageLookProfiles.front().name == profile.name);
     CheckLook(loaded->waterSeepageLookProfiles.front().settings, profile.settings);
+    REQUIRE(loaded->waterSeepageResponseProfiles.size() == 1U);
+    CHECK(loaded->waterSeepageResponseProfiles.front().name == responseProfile.name);
+    CHECK(
+        loaded->waterSeepageResponseProfiles.front().response.emissionAdd ==
+        Catch::Approx(responseProfile.response.emissionAdd));
+    CHECK(
+        loaded->waterSeepageResponseProfiles.front().blendMode ==
+        WaterEffectBlendMode::Add);
     REQUIRE(loaded->waterScenarios.size() == 2U);
     CHECK(loaded->selectedWaterScenarioId == "pre-colonisation-wet");
     CHECK(
@@ -333,6 +347,49 @@ TEST_CASE("Water source documents round-trip Seepage state", "[water][seepage][s
     std::filesystem::remove(outputPath);
 }
 
+TEST_CASE("Legacy per-node look overrides still parse for migration", "[water][seepage][serialization][legacy]") {
+    // Overrides are never written any more, but old documents carry them and
+    // the app-side migration materializes them as named profiles — so the
+    // parser must keep reading them, and re-saving must drop the keys.
+    const auto sourcesPath = std::filesystem::temp_directory_path() /
+                             "invisible_places_seepage_legacy_override_sources.json";
+    {
+        std::ofstream output{sourcesPath};
+        output << R"({
+            "schema_version": 16,
+            "water_seepage_nodes": [{
+                "id": 7,
+                "name": "Legacy node",
+                "look_profile_name": "Wet",
+                "look_override": {"base_wetness": 0.71},
+                "temp_look_override": {"base_wetness": 0.83}
+            }]
+        })";
+    }
+    std::string errorMessage;
+    const auto loaded =
+        invisible_places::serialization::LoadWaterSourcesDocument(sourcesPath, &errorMessage);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->seepageNodes.size() == 1U);
+    const auto& node = loaded->seepageNodes.front();
+    CHECK(node.lookProfileName == "Wet");
+    CHECK(node.responseProfileName.empty());
+    REQUIRE(node.lookOverride.has_value());
+    CHECK(node.lookOverride->baseWetness == Catch::Approx(0.71F));
+    REQUIRE(node.tempLookOverride.has_value());
+    CHECK(node.tempLookOverride->baseWetness == Catch::Approx(0.83F));
+
+    REQUIRE(invisible_places::serialization::SaveWaterSourcesDocument(
+        loaded.value(),
+        sourcesPath,
+        &errorMessage));
+    const auto rewrittenJson = ReadTextFile(sourcesPath);
+    CHECK(rewrittenJson.find("look_override") == std::string::npos);
+    CHECK(rewrittenJson.find("temp_look_override") == std::string::npos);
+    CHECK(rewrittenJson.find("response_profile_name") != std::string::npos);
+    std::filesystem::remove(sourcesPath);
+}
+
 TEST_CASE("Legacy documents default missing Seepage state", "[water][seepage][serialization][legacy]") {
     const auto projectPath =
         std::filesystem::temp_directory_path() / "invisible_places_legacy_no_seepage_project.json";
@@ -369,7 +426,7 @@ TEST_CASE("Legacy documents default missing Seepage state", "[water][seepage][se
     std::filesystem::remove(sourcesPath);
 }
 
-TEST_CASE("Seepage looks without a pattern retain Legacy Ripples", "[water][seepage][serialization][legacy]") {
+TEST_CASE("Seepage looks without a pattern load as Chaotic Bloom", "[water][seepage][serialization][migration]") {
     const auto sourcesPath =
         std::filesystem::temp_directory_path() / "invisible_places_legacy_seepage_pattern.json";
     {
@@ -387,11 +444,10 @@ TEST_CASE("Seepage looks without a pattern retain Legacy Ripples", "[water][seep
         sourcesPath,
         &errorMessage);
     REQUIRE(loaded.has_value());
-    CHECK(loaded->seepageDefaultLook.pattern == WaterSeepagePattern::LegacyRipples);
+    CHECK(loaded->seepageDefaultLook.pattern == WaterSeepagePattern::ChaoticBloom);
     CHECK(loaded->seepageDefaultLook.baseWetness == Catch::Approx(0.41F));
     CHECK(loaded->seepageDefaultLook.density == Catch::Approx(0.52F));
     CHECK(loaded->seepageDefaultLook.tricklePatchSizeMeters == Catch::Approx(0.08F));
-    CHECK(loaded->seepageDefaultLook.trickleLengthMeters == Catch::Approx(0.35F));
     CHECK(loaded->seepageDefaultLook.trickleWidthMeters == Catch::Approx(0.018F));
     CHECK(loaded->seepageDefaultLook.trickleFrontSoftness == Catch::Approx(0.10F));
     std::filesystem::remove(sourcesPath);
@@ -460,9 +516,6 @@ TEST_CASE(
     CHECK(
         loadedSources->seepageDefaultLook.pattern ==
         WaterSeepagePattern::ChaoticBloom);
-    CHECK(
-        loadedSources->seepageDefaultLook.trickleLengthMeters ==
-        Catch::Approx(0.35F));
     CHECK(
         loadedSources->seepageDefaultLook.trickleWidthMeters ==
         Catch::Approx(0.018F));

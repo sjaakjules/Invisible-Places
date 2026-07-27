@@ -334,6 +334,17 @@ void EmitImpact(vec3 position, vec3 normal, uint role, RainParticle particle) {
         : (role == kRoleRock
             ? clamp(0.028 + dropWidth * 10.0 + impactSpeed * 0.0020, 0.035, 0.16)
             : clamp(0.016 + dropWidth * 4.0, 0.018, 0.065));
+    if (role == kRoleRock) {
+        // Steep rock sheds water further: boost the event radius by surface
+        // steepness so the Wetness footprint can run downhill. The impact
+        // model reconstructs this boost from the event normal and puts the
+        // extra radius into the downhill run only (rain.effectScales.w is
+        // the Wetness Downhill Stretch setting; CPU mirror: EmitImpact in
+        // src/water/RainSimulation.cpp).
+        const vec3 unitNormal = normalize(normal);
+        const float steepness = clamp(1.0 - abs(unitNormal.z), 0.0, 1.0);
+        radius *= 1.0 + steepness * clamp(rain.effectScales.w, 0.0, 1.0);
+    }
     float lifetime = role == kRoleSand
         ? 0.48 + min(0.35, impactSpeed * 0.018)
         : (role == kRoleRock
@@ -504,9 +515,11 @@ void BinEvent(uint eventIndex) {
                 // Use common physical scales for the lexicographic ROCK
                 // reservoir. Per-event radius/lifetime normalization can
                 // otherwise rank a farther large or older long-lived impact
-                // ahead of the physically nearer/younger event.
+                // ahead of the physically nearer/younger event. 0.5 m covers
+                // the corner of the steepness-boosted square broad phase
+                // (CPU mirror: kRockReservoirDistanceRangeMeters).
                 const float normalizedDistance = clamp(
-                    length(outsideDistance) / 0.25,
+                    length(outsideDistance) / 0.50,
                     0.0,
                     1.0);
                 const float agePriority = clamp(

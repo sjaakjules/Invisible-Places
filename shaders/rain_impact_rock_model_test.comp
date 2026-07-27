@@ -57,6 +57,8 @@ void main() {
             inputValue.control.x,
             inputValue.rockImpact0,
             inputValue.rockImpact1,
+            // Downhill stretch travels in the point-normal spare lane.
+            inputValue.pointNormal.w,
             inputValue.pointAge.xyz,
             inputValue.pointNormal.xyz,
             inputValue.pointAge.w);

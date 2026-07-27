@@ -2583,6 +2583,9 @@ TEST_CASE("rock rain impact favours lower points and settles downhill", "[water]
     auto smoothRock = invisible_places::water::RainRockImpactSettings{};
     smoothRock.edgeBreakup = 0.0F;
     smoothRock.centreFalloff = 0.0F;
+    // This test pins the height-bias asymmetry in isolation; the downhill
+    // anisotropy has its own test below.
+    smoothRock.downhillStretch = 0.0F;
     const std::vector<invisible_places::water::RainImpactEvent> verticalEvents{
         {.position = {0.0F, 0.0F, 0.0F},
          .birthTimeSeconds = 0.0F,
@@ -2710,6 +2713,77 @@ TEST_CASE("rock rain impact favours lower points and settles downhill", "[water]
     CHECK(expired.colourBlend == Catch::Approx(0.0F));
     CHECK(insideBroadPhase > 0.0F);
     CHECK(outsideBroadPhase == Catch::Approx(0.0F).margin(1.0e-6F));
+}
+
+TEST_CASE("rock wetness stretches downhill on steep surfaces", "[water][rain][effects][downhill]") {
+    using invisible_places::water::EvaluateRockRainImpactValue;
+    constexpr float radius = 0.12F;
+    constexpr float lifetime = 5.0F;
+    const float effectiveRadius = radius * std::sqrt(2.0F / 3.0F);
+    auto rock = invisible_places::water::RainRockImpactSettings{};
+    rock.edgeBreakup = 0.0F;
+    rock.centreFalloff = 0.0F;
+    rock.heightBias = 0.0F;
+    rock.downhillStretch = 1.0F;
+    // Vertical wall: normal +X, downhill is -Z. The model treats the event
+    // radius as spawn-boosted (2x at steepness one), so the downhill run
+    // keeps the full effective radius while lateral and uphill extents
+    // normalize back to the unboosted radius and tighten further.
+    const invisible_places::water::RainImpactEvent event{
+        .position = {0.0F, 0.0F, 0.0F},
+        .birthTimeSeconds = 0.0F,
+        .normal = {1.0F, 0.0F, 0.0F},
+        .radiusMeters = radius,
+        .role = WaterSurfaceRole::Rock,
+        .lifetimeSeconds = lifetime,
+        .energy = 1.0F,
+        .seed = 92U,
+    };
+    const float sampleTime = 1.80F;
+    const auto valueAt = [&](const Float3& point) {
+        return EvaluateRockRainImpactValue(
+            event,
+            point,
+            {1.0F, 0.0F, 0.0F},
+            sampleTime,
+            rock);
+    };
+    const float downFar = valueAt({0.0F, 0.0F, -effectiveRadius * 0.80F});
+    const float upSame = valueAt({0.0F, 0.0F, effectiveRadius * 0.80F});
+    const float lateralSame = valueAt({0.0F, effectiveRadius * 0.80F, 0.0F});
+    CHECK(downFar > 0.0F);
+    CHECK(upSame == Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(lateralSame == Catch::Approx(0.0F).margin(1.0e-6F));
+    const float lateralNear = valueAt({0.0F, effectiveRadius * 0.30F, 0.0F});
+    CHECK(lateralNear > 0.0F);
+
+    // Flat impacts are unaffected by the stretch: the footprint stays
+    // isotropic in the tangent plane.
+    auto flatEvent = event;
+    flatEvent.normal = {0.0F, 0.0F, 1.0F};
+    const auto flatValueAt = [&](const Float3& point) {
+        return EvaluateRockRainImpactValue(
+            flatEvent,
+            point,
+            {0.0F, 0.0F, 1.0F},
+            sampleTime,
+            rock);
+    };
+    const float flatX = flatValueAt({effectiveRadius * 0.80F, 0.0F, 0.0F});
+    const float flatY = flatValueAt({0.0F, effectiveRadius * 0.80F, 0.0F});
+    CHECK(flatX > 0.0F);
+    CHECK(flatX == Catch::Approx(flatY).margin(1.0e-5F));
+
+    // Zero stretch restores the isotropic wall footprint.
+    auto isotropicRock = rock;
+    isotropicRock.downhillStretch = 0.0F;
+    const float upIsotropic = EvaluateRockRainImpactValue(
+        event,
+        {0.0F, 0.0F, effectiveRadius * 0.80F},
+        {1.0F, 0.0F, 0.0F},
+        sampleTime,
+        isotropicRock);
+    CHECK(upIsotropic > 0.0F);
 }
 
 TEST_CASE("vegetation rain impacts form visible crown hops and downward streams", "[water][rain][effects]") {
