@@ -39269,13 +39269,18 @@ void DrawWaterGpuRainPanel(
         if (!settings.impactEffectsEnabled) {
             ImGui::BeginDisabled();
         }
-        ImGui::Checkbox("Sand Rings", &settings.sandEffectsEnabled);
+        // The effects are no longer tied to their originating cloud type:
+        // each applies to all clouds' points inside its own height band.
+        // Rings spawn from SAND impacts, Wetness from ROCK impacts, and
+        // Droplets from VEG impacts.
+        ImGui::Checkbox("Rings", &settings.sandEffectsEnabled);
         ImGui::SameLine();
-        ImGui::Checkbox("Rock Wetness", &settings.rockEffectsEnabled);
-        ImGui::Checkbox("Vegetation Twinkle", &settings.vegetationEffectsEnabled);
-        ImGui::SliderFloat("Sand Response", &settings.sandEffectScale, 0.0F, 3.0F, "%.2f");
-        ImGui::SliderFloat("Rock Response", &settings.rockEffectScale, 0.0F, 3.0F, "%.2f");
-        ImGui::SliderFloat("Vegetation Response", &settings.vegetationEffectScale, 0.0F, 3.0F, "%.2f");
+        ImGui::Checkbox("Wetness", &settings.rockEffectsEnabled);
+        ImGui::SameLine();
+        ImGui::Checkbox("Droplets", &settings.vegetationEffectsEnabled);
+        ImGui::SliderFloat("Rings Response", &settings.sandEffectScale, 0.0F, 3.0F, "%.2f");
+        ImGui::SliderFloat("Wetness Response", &settings.rockEffectScale, 0.0F, 3.0F, "%.2f");
+        ImGui::SliderFloat("Droplets Response", &settings.vegetationEffectScale, 0.0F, 3.0F, "%.2f");
         if (!settings.impactEffectsEnabled) {
             ImGui::EndDisabled();
         }
@@ -39345,14 +39350,14 @@ void DrawWaterGpuRainPanel(
             }
         };
 
-    if (BeginPanelSection("SAND Impact Tuning")) {
+    if (BeginPanelSection("Rings Tuning")) {
         ImGui::PushID("SandImpactBand");
         drawImpactHeightBand(&settings.sandImpactBand);
         ImGui::PopID();
         EndPanelSection();
     }
 
-    if (BeginPanelSection("ROCK Impact Tuning")) {
+    if (BeginPanelSection("Wetness Tuning")) {
         ImGui::SliderFloat("Edge Breakup", &settings.rockImpact.edgeBreakup, 0.0F, 1.0F, "%.2f");
         ImGui::SliderFloat("Spread Speed", &settings.rockImpact.spreadSpeed, 0.25F, 3.0F, "%.2f");
         ImGui::SliderFloat("Centre Falloff", &settings.rockImpact.centreFalloff, 0.0F, 1.0F, "%.2f");
@@ -39364,7 +39369,7 @@ void DrawWaterGpuRainPanel(
         EndPanelSection();
     }
 
-    if (BeginPanelSection("VEG Stream Tuning")) {
+    if (BeginPanelSection("Droplets Tuning")) {
         ImGui::SliderFloat("Twinkle", &settings.vegetationImpact.twinkle, 0.0F, 4.0F, "%.2f");
         ImGui::SliderFloat(
             "Propagation",

@@ -13,6 +13,9 @@ struct RainImpactComposite {
     float emissionAdd;
     float pointSizeMultiply;
     float colourMix;
+    // Colour mix contributed by the Droplets model; it tints brighter than
+    // the shared wet colour used by Rings and Wetness.
+    float dropletMix;
 };
 
 layout(set = 0, binding = 13, std430) readonly buffer RainImpactCountsBuffer {
@@ -216,12 +219,39 @@ float RainVegetationSprinkleValue(
     return path * selectedPoint * max(pulse, delayedGlint) * twinkle * leafFacing;
 }
 
+// Full strength inside [minZ, maxZ], fading linearly to zero over fadeMeters
+// beyond each bounded edge. Open edges carry a huge finite sentinel so their
+// clamp term stays 1.
+float RainImpactBandWeight(vec3 band, float pointZ) {
+    const float bandFade = max(1.0e-3, band.z);
+    return clamp((pointZ - (band.x - bandFade)) / bandFade, 0.0, 1.0) *
+           clamp(((band.y + bandFade) - pointZ) / bandFade, 0.0, 1.0);
+}
+
+// The three impact effects are decoupled from the cloud roles: every point
+// layer evaluates every enabled model, each gated only by its own world-Z
+// height band. Events still spawn from rain striking the collision surfaces
+// (Rings from SAND impacts, Wetness from ROCK impacts, Droplets from VEG
+// impacts), but they shade all clouds' points within range and band.
+// rainImpactControl.x is an effect bitmask: 1 Rings, 2 Wetness, 4 Droplets.
 RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
-    RainImpactComposite composite = RainImpactComposite(0.0, 0.0, 1.0, 0.0);
-    const uint role = styleData.rainImpactControl.y;
+    RainImpactComposite composite = RainImpactComposite(0.0, 0.0, 1.0, 0.0, 0.0);
+    const uint effectMask = styleData.rainImpactControl.x;
     const uint dimension = styleData.rainImpactControl.z;
-    if (styleData.rainImpactControl.x == 0u || role == 0u || dimension == 0u ||
+    if (effectMask == 0u || dimension == 0u ||
         styleData.rainImpactGrid.z <= 1e-6) {
+        return composite;
+    }
+    const float ringsBand = (effectMask & 1u) != 0u
+        ? RainImpactBandWeight(styleData.rainImpactSandBand.xyz, point.z)
+        : 0.0;
+    const float wetnessBand = (effectMask & 2u) != 0u
+        ? RainImpactBandWeight(styleData.rainImpactRock1.yzw, point.z)
+        : 0.0;
+    const float dropletsBand = (effectMask & 4u) != 0u
+        ? RainImpactBandWeight(styleData.rainImpactVegetation1.yzw, point.z)
+        : 0.0;
+    if (ringsBand <= 0.0 && wetnessBand <= 0.0 && dropletsBand <= 0.0) {
         return composite;
     }
     const ivec2 coordinate = ivec2(floor(
@@ -234,48 +264,10 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         return composite;
     }
     const uvec4 counts = rainImpactCounts[cellIndex];
-    uint occupiedMask = 0u;
-    uint capacity = 0u;
-    uint offset = 0u;
-    if (role == kRainRoleSand) {
-        occupiedMask = counts.x;
-        capacity = kRainSandReferenceCapacity;
-    } else if (role == kRainRoleRock) {
-        occupiedMask = counts.y;
-        capacity = kRainRockReferenceCapacity;
-        offset = kRainSandReferenceCapacity;
-    } else if (role == kRainRoleVegetation) {
-        occupiedMask = counts.z;
-        capacity = kRainVegetationReferenceCapacity;
-        offset =
-            kRainSandReferenceCapacity +
-            kRainRockReferenceCapacity;
-    } else {
-        return composite;
-    }
-
-    // Per-role world-Z band: full strength inside [minZ, maxZ], fading
-    // linearly to zero over fadeMeters beyond each bounded edge. Open edges
-    // carry a huge finite sentinel so their clamp term stays 1.
-    vec3 band = styleData.rainImpactSandBand.xyz;
-    if (role == kRainRoleRock) {
-        band = styleData.rainImpactRock1.yzw;
-    } else if (role == kRainRoleVegetation) {
-        band = styleData.rainImpactVegetation1.yzw;
-    }
-    const float bandFade = max(1.0e-3, band.z);
-    const float bandWeight =
-        clamp((point.z - (band.x - bandFade)) / bandFade, 0.0, 1.0) *
-        clamp(((band.y + bandFade) - point.z) / bandFade, 0.0, 1.0);
-    if (bandWeight <= 0.0) {
-        return composite;
-    }
-
     const float time = styleData.rainImpactGrid.w;
-    float rockPeak = 0.0;
-    float rockRemaining = 1.0;
+
     float sandWaterMask = 1.0;
-    if (role == kRainRoleSand && HasShorelineWaveEffect()) {
+    if (ringsBand > 0.0 && HasShorelineWaveEffect()) {
         const float boundaryZ = styleData.shorelineWaveParams0.x;
         const float edgeFade = max(
             0.001,
@@ -287,93 +279,126 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             edgeFade,
             boundaryZ - point.z);
     }
-    for (uint localIndex = 0u; localIndex < capacity; ++localIndex) {
-        if ((occupiedMask & (1u << localIndex)) == 0u) {
+
+    float rockPeak = 0.0;
+    float rockRemaining = 1.0;
+    for (uint modelIndex = 0u; modelIndex < 3u; ++modelIndex) {
+        uint role = kRainRoleSand;
+        uint occupiedMask = counts.x;
+        uint capacity = kRainSandReferenceCapacity;
+        uint offset = 0u;
+        float bandWeight = ringsBand;
+        if (modelIndex == 1u) {
+            role = kRainRoleRock;
+            occupiedMask = counts.y;
+            capacity = kRainRockReferenceCapacity;
+            offset = kRainSandReferenceCapacity;
+            bandWeight = wetnessBand;
+        } else if (modelIndex == 2u) {
+            role = kRainRoleVegetation;
+            occupiedMask = counts.z;
+            capacity = kRainVegetationReferenceCapacity;
+            offset = kRainSandReferenceCapacity + kRainRockReferenceCapacity;
+            bandWeight = dropletsBand;
+        }
+        if (bandWeight <= 0.0 || occupiedMask == 0u) {
             continue;
         }
-        const uint referenceIndex =
-            cellIndex * kRainReferencesPerCell + offset + localIndex;
-        if (referenceIndex >= uint(rainImpactReferences.length())) {
-            break;
+        for (uint localIndex = 0u; localIndex < capacity; ++localIndex) {
+            if ((occupiedMask & (1u << localIndex)) == 0u) {
+                continue;
+            }
+            const uint referenceIndex =
+                cellIndex * kRainReferencesPerCell + offset + localIndex;
+            if (referenceIndex >= uint(rainImpactReferences.length())) {
+                break;
+            }
+            const uint packedReference = rainImpactReferences[referenceIndex];
+            if (packedReference == 0xffffffffu) {
+                continue;
+            }
+            const uint eventIndex = packedReference & 0xffffu;
+            if (eventIndex >= styleData.rainImpactControl.w ||
+                eventIndex >= uint(rainImpactEvents.length())) {
+                continue;
+            }
+            const RainImpactEventGpu event = rainImpactEvents[eventIndex];
+            if (event.control.x != role) {
+                continue;
+            }
+            const float age = time - event.positionBirth.w;
+            const float lifetime = max(0.001, event.lifetimeEnergy.x);
+            if (age < 0.0 || age > lifetime) {
+                continue;
+            }
+            float value = 0.0;
+            if (role == kRainRoleSand) {
+                value = EvaluateSandRainImpactValue(
+                    event.positionBirth.xyz,
+                    event.normalRadius.w,
+                    event.lifetimeEnergy.x,
+                    point,
+                    age,
+                    sandWaterMask);
+            } else if (role == kRainRoleRock) {
+                value = EvaluateRockRainImpactValue(
+                    event.positionBirth.xyz,
+                    event.normalRadius.xyz,
+                    event.normalRadius.w,
+                    event.lifetimeEnergy.x,
+                    event.control.y,
+                    styleData.rainImpactRock0,
+                    styleData.rainImpactRock1,
+                    point,
+                    pointNormal,
+                    age);
+            } else {
+                value = RainVegetationSprinkleValue(event, point, pointNormal, age);
+            }
+            value *= event.lifetimeEnergy.y * bandWeight;
+            if (role == kRainRoleRock) {
+                // Preserve the strongest individual contribution while softly
+                // filling overlap. Adding another retained impact therefore
+                // cannot cut a darker boundary through an existing wet region.
+                rockPeak = max(rockPeak, value);
+                rockRemaining *= 1.0 - clamp(value, 0.0, 1.0);
+                continue;
+            }
+            const bool droplets = role == kRainRoleVegetation;
+            composite.opacityAdd = max(
+                composite.opacityAdd,
+                value * (droplets ? 0.14 : 0.18));
+            composite.emissionAdd = max(
+                composite.emissionAdd,
+                value * (droplets ? 0.48 : 0.11));
+            composite.pointSizeMultiply = max(
+                composite.pointSizeMultiply,
+                1.0 + value * (droplets ? 0.12 : 0.16));
+            if (droplets) {
+                composite.dropletMix = max(composite.dropletMix, value * 0.18);
+            } else {
+                composite.colourMix = max(composite.colourMix, value * 0.20);
+            }
         }
-        const uint packedReference = rainImpactReferences[referenceIndex];
-        if (packedReference == 0xffffffffu) {
-            continue;
-        }
-        const uint eventIndex = packedReference & 0xffffu;
-        if (eventIndex >= styleData.rainImpactControl.w ||
-            eventIndex >= uint(rainImpactEvents.length())) {
-            continue;
-        }
-        const RainImpactEventGpu event = rainImpactEvents[eventIndex];
-        if (event.control.x != role) {
-            continue;
-        }
-        const float age = time - event.positionBirth.w;
-        const float lifetime = max(0.001, event.lifetimeEnergy.x);
-        if (age < 0.0 || age > lifetime) {
-            continue;
-        }
-        float value = 0.0;
-        if (role == kRainRoleSand) {
-            value = EvaluateSandRainImpactValue(
-                event.positionBirth.xyz,
-                event.normalRadius.w,
-                event.lifetimeEnergy.x,
-                point,
-                age,
-                sandWaterMask);
-        } else if (role == kRainRoleRock) {
-            value = EvaluateRockRainImpactValue(
-                event.positionBirth.xyz,
-                event.normalRadius.xyz,
-                event.normalRadius.w,
-                event.lifetimeEnergy.x,
-                event.control.y,
-                styleData.rainImpactRock0,
-                styleData.rainImpactRock1,
-                point,
-                pointNormal,
-                age);
-        } else {
-            value = RainVegetationSprinkleValue(event, point, pointNormal, age);
-        }
-        value *= event.lifetimeEnergy.y * bandWeight;
-        if (role == kRainRoleRock) {
-            // Preserve the strongest individual contribution while softly
-            // filling overlap. Adding another retained impact therefore
-            // cannot cut a darker boundary through an existing wet region.
-            rockPeak = max(rockPeak, value);
-            rockRemaining *= 1.0 - clamp(value, 0.0, 1.0);
-            continue;
-        }
-        const bool vegetation = role == kRainRoleVegetation;
-        composite.opacityAdd = max(
-            composite.opacityAdd,
-            value * (vegetation ? 0.14 : 0.18));
-        composite.emissionAdd = max(
-            composite.emissionAdd,
-            value * (vegetation ? 0.48 : 0.11));
-        composite.pointSizeMultiply = max(
-            composite.pointSizeMultiply,
-            1.0 + value * (vegetation ? 0.12 : 0.16));
-        composite.colourMix = max(
-            composite.colourMix,
-            value * (role == kRainRoleRock ? 0.42 : (vegetation ? 0.18 : 0.20)));
     }
-    if (role == kRainRoleRock) {
-        const float value = max(rockPeak, 1.0 - rockRemaining);
-        composite.opacityAdd = value * 0.18;
-        composite.emissionAdd = value * 0.11;
-        composite.pointSizeMultiply = 1.0 + value * 0.16;
-        composite.colourMix = value * 0.42;
+    const float wetnessValue = max(rockPeak, 1.0 - rockRemaining);
+    if (wetnessValue > 0.0) {
+        composite.opacityAdd = max(composite.opacityAdd, wetnessValue * 0.18);
+        composite.emissionAdd = max(composite.emissionAdd, wetnessValue * 0.11);
+        composite.pointSizeMultiply =
+            max(composite.pointSizeMultiply, 1.0 + wetnessValue * 0.16);
+        composite.colourMix = max(composite.colourMix, wetnessValue * 0.42);
     }
     return composite;
 }
 
 vec3 ApplyRainImpactColour(vec3 colour, RainImpactComposite impact) {
-    const vec3 wetColour = styleData.rainImpactControl.y == kRainRoleVegetation
-        ? vec3(0.54, 0.80, 0.82)
-        : vec3(0.24, 0.48, 0.62);
-    return mix(colour, wetColour, clamp(impact.colourMix, 0.0, 0.72));
+    const vec3 result = mix(
+        colour,
+        vec3(0.24, 0.48, 0.62),
+        clamp(impact.colourMix, 0.0, 0.72));
+    return mix(
+        result,
+        vec3(0.54, 0.80, 0.82),
+        clamp(impact.dropletMix, 0.0, 0.72));
 }

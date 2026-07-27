@@ -13578,23 +13578,29 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         };
     }
     const auto rainRole = static_cast<std::uint32_t>(layer.rainCollisionRole);
-    bool rainRoleEnabled = false;
-    if (layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Sand) {
-        rainRoleEnabled = renderState_.rainSettings.sandEffectsEnabled;
-    } else if (layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Rock) {
-        rainRoleEnabled = renderState_.rainSettings.rockEffectsEnabled;
-    } else if (layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Vegetation) {
-        rainRoleEnabled = renderState_.rainSettings.vegetationEffectsEnabled;
-    }
-    const bool rainImpactsEnabled =
-        renderState_.rainSettings.enabled &&
+    // The impact effects are decoupled from the layer's cloud role: every
+    // scene layer receives the bitmask of enabled effects (1 Rings, 2
+    // Wetness, 4 Droplets) and the shader gates each model by its own
+    // world-Z height band instead of the layer role.
+    std::uint32_t rainEffectMask = 0U;
+    if (renderState_.rainSettings.enabled &&
         renderState_.rainSettings.impactEffectsEnabled &&
         rainResources_.collisionReady &&
-        rainRoleEnabled;
+        layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None) {
+        if (renderState_.rainSettings.sandEffectsEnabled) {
+            rainEffectMask |= 1U;
+        }
+        if (renderState_.rainSettings.rockEffectsEnabled) {
+            rainEffectMask |= 2U;
+        }
+        if (renderState_.rainSettings.vegetationEffectsEnabled) {
+            rainEffectMask |= 4U;
+        }
+    }
     const float rainGridWorldSpan = invisible_places::water::RainImpactGridWorldSpan(
         renderState_.rainSettings);
     styleGpu.rainImpactControl = glm::uvec4{
-        rainImpactsEnabled ? 1U : 0U,
+        rainEffectMask,
         rainRole,
         invisible_places::water::kRainImpactGridDimension,
         invisible_places::water::kRainImpactEventCapacity,
