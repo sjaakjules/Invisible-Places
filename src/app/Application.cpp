@@ -17550,7 +17550,12 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
     session.pointStyle = MakeDynamicMeshFlowTrailStyle(settings);
     session.pointStyle.flowAnimation = true;
     session.pointStyle.waterTrailOverlay = true;
-    session.pointStyle.waterFlowActivity = activity;
+    // The shared trail shader multiplies a per-trail activity gate and an
+    // appearance scale on top of the activity-squared population count. A
+    // square-root curve here keeps zero at zero but lets the surviving
+    // trails render clearly at the low activity levels the scenarios use.
+    session.pointStyle.waterFlowActivity =
+        std::sqrt(std::clamp(activity, 0.0F, 1.0F));
     session.selectedPointVisualName = "Subtle Ground Trickles";
     session.pointVisualNameBuffer =
         BaseWaterProfileName(session.selectedPointVisualName);
@@ -23371,9 +23376,11 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                     EffectiveWaterDynamicMeshFlowLevel(
                         scenarioState,
                         waterFrame.meshFlowMoisture);
+            // Same square-root visibility curve as the live overlay so
+            // exported trails match the preview.
             layerIt->style.waterFlowActivity =
                 job.frozenDynamicMeshFlowSettings.showTrails
-                    ? activity
+                    ? std::sqrt(std::clamp(activity, 0.0F, 1.0F))
                     : 0.0F;
         }
     }
@@ -38455,10 +38462,30 @@ void DrawWaterDynamicMeshFlowPanel(
             0.0F,
             4.0F,
             "%.2f");
+        liveChanged |= ImGui::SliderFloat(
+            "Wetness Floor",
+            &settings.trailWetnessFloor,
+            0.0F,
+            1.0F,
+            "%.2f");
+        DrawWaterSeepageParameterTooltip(
+            "Trails read at least this wet regardless of scenario moisture, "
+            "so the underground-water filaments stay visible in dry scenes. "
+            "Zero restores the old moisture-bound look.");
         EndPanelSection();
     }
 
     if (BeginPanelSection("ROCK Contact Response")) {
+        liveChanged |= ImGui::SliderFloat(
+            "Upward Reach",
+            &settings.contactUpwardReachMeters,
+            0.0F,
+            2.0F,
+            "%.2f m");
+        DrawWaterSeepageParameterTooltip(
+            "How far above a terrain contact the wetting response blends, for "
+            "both ROCK and VEG contacts. Points above the collision now fade "
+            "in smoothly instead of cutting off at the impact height.");
         auto& response = settings.rockResponse;
         liveChanged |= ImGui::SliderFloat("Radius##MeshRock", &response.radiusMeters, 0.0F, 0.75F, "%.3f m");
         liveChanged |= ImGui::SliderFloat("Opacity##MeshRock", &response.opacityAdd, 0.0F, 2.0F, "%.2f");

@@ -4177,6 +4177,8 @@ json SerializeWaterDynamicMeshFlowSettings(WaterDynamicMeshFlowSettings settings
         {"trail_emission_wet", settings.trailEmissionWet},
         {"trail_exposure", settings.trailExposure},
         {"surface_offset_meters", settings.surfaceOffsetMeters},
+        {"contact_upward_reach_meters", settings.contactUpwardReachMeters},
+        {"trail_wetness_floor", settings.trailWetnessFloor},
         {"speed_meters_per_second", settings.speedMetersPerSecond},
         {"downhill_weight", settings.downhillWeight},
         {"attractor_weight", settings.attractorWeight},
@@ -4312,6 +4314,16 @@ WaterDynamicMeshFlowSettings ParseWaterDynamicMeshFlowSettings(const json& setti
     settings.surfaceOffsetMeters = std::clamp(
         settingsJson.value("surface_offset_meters", settings.surfaceOffsetMeters),
         -1.0F,
+        1.0F);
+    settings.contactUpwardReachMeters = std::clamp(
+        settingsJson.value(
+            "contact_upward_reach_meters",
+            settings.contactUpwardReachMeters),
+        0.0F,
+        3.0F);
+    settings.trailWetnessFloor = std::clamp(
+        settingsJson.value("trail_wetness_floor", settings.trailWetnessFloor),
+        0.0F,
         1.0F);
     settings.speedMetersPerSecond = std::clamp(
         settingsJson.value("speed_meters_per_second", settings.speedMetersPerSecond),

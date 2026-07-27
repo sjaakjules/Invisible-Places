@@ -1,6 +1,7 @@
 // Mesh Flow contact events are produced by the fixed-capacity Ground-flow
-// compute pass. The hash contains four one-based event indices per 0.75 m XY
-// bucket so a displayed terrain point examines at most 36 references.
+// compute pass. Events are splatted into every 0.25 m XY bucket their
+// response radius overlaps, so a displayed terrain point examines at most 36
+// references and never sees cell-aligned activation edges.
 struct MeshFlowContactEventGpu {
     vec4 positionTime;       // xyz contact, w birth time
     vec4 normalRadius;       // xyz averaged normal, w response radius
@@ -25,7 +26,7 @@ layout(set = 0, binding = 18, std430) readonly buffer MeshFlowContactGridBuffer 
     uvec4 meshFlowContactIndicesPlusOne[];
 };
 
-const float kMeshFlowContactCellSizeMeters = 0.75;
+const float kMeshFlowContactCellSizeMeters = 0.25;
 const uint kMeshFlowContactRoleRock = 0u;
 const uint kMeshFlowContactRoleVegetation = 1u;
 const uint kMeshFlowGroundVegetationSupportedFlag = 1u << 2u;
@@ -69,10 +70,10 @@ MeshFlowContactComposite EmptyMeshFlowContactComposite() {
 bool MeshFlowContactRoleMatches(uint eventRole) {
     // The point style uses Rain's authored terrain role numbering:
     // ROCK = 1, SAND = 2, VEG = 3. Ground contacts intentionally ignore SAND.
+    // Both event roles shade ROCK and VEG points: water striking a rock edge
+    // also wets the understory hanging above it.
     const uint pointRole = styleData.rainImpactControl.y;
-    return (eventRole == kMeshFlowContactRoleRock && pointRole == 1u) ||
-           (eventRole == kMeshFlowContactRoleVegetation &&
-            (pointRole == 1u || pointRole == 3u));
+    return pointRole == 1u || pointRole == 3u;
 }
 
 void BlendMeshFlowContact(
@@ -87,7 +88,11 @@ void BlendMeshFlowContact(
 
     const float birthTime = event.positionTime.w;
     const float persistence = event.response.z;
-    const float radius = event.normalRadius.w;
+    // Radius and the tunable upward reach share one lane as half floats.
+    const vec2 radiusReach =
+        unpackHalf2x16(floatBitsToUint(event.normalRadius.w));
+    const float radius = radiusReach.x;
+    const float upwardReach = max(radiusReach.y, radius * 0.12);
     if (isnan(birthTime) || isinf(birthTime) || birthTime < -1.0e30 ||
         persistence <= 0.0 || radius <= 0.0) {
         return;
@@ -104,7 +109,8 @@ void BlendMeshFlowContact(
         (event.metadata.y & kMeshFlowGroundVegetationSupportedFlag) != 0u;
     const float streamDepth = max(radius, event.vegetationExtra.x);
     const float downwardDepth = max(0.0, -delta.z);
-    if (planarDistance > radius || delta.z > radius * 0.12 ||
+    const float upwardHeight = max(0.0, delta.z);
+    if (planarDistance > radius || upwardHeight > upwardReach ||
         downwardDepth > streamDepth) {
         return;
     }
@@ -193,11 +199,17 @@ void BlendMeshFlowContact(
         branchGate;
     const float streamMask = max(mainStream, branchStream * 0.82);
 
+    // The crown blooms symmetrically: downward it hands over to the stream
+    // filaments, upward it fades across the tunable reach so overhanging
+    // points wet smoothly instead of cutting off at the contact height.
+    const float crownVertical = delta.z > 0.0
+        ? 1.0 - smoothstep(0.0, max(upwardReach, 1.0e-4), upwardHeight)
+        : 1.0 - smoothstep(radius * 0.08, radius * 0.72, downwardDepth);
     const float crownMask =
         (1.0 - smoothstep(radius * 0.16, radius, planarDistance)) *
-        (1.0 - smoothstep(radius * 0.08, radius * 0.72, downwardDepth));
+        crownVertical;
     const float belowWeight = mix(
-        0.70,
+        0.95,
         1.18,
         smoothstep(-radius * 0.12, radius * 0.72, -delta.z));
     const float depthFade =

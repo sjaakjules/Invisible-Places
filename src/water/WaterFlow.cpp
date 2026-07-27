@@ -3548,6 +3548,14 @@ WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
         finiteOr(settings.vegetationResponse.streamDepthMeters, 0.45F),
         0.0F,
         2.0F);
+    settings.contactUpwardReachMeters = std::clamp(
+        finiteOr(settings.contactUpwardReachMeters, 0.6F),
+        0.0F,
+        3.0F);
+    settings.trailWetnessFloor = std::clamp(
+        finiteOr(settings.trailWetnessFloor, 0.75F),
+        0.0F,
+        1.0F);
     return settings;
 }
 

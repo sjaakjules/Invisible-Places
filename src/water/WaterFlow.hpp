@@ -1091,6 +1091,13 @@ struct WaterDynamicMeshFlowSettings {
     float sharedWindScaleMeters = 3.0F;
     float sharedWindSpeed = 0.025F;
     float contactFadeSeconds = 0.8F;
+    // How far above a terrain contact the wetting response blends (both ROCK
+    // and VEG contacts), so overhanging points wet instead of cutting off at
+    // the collision height.
+    float contactUpwardReachMeters = 0.6F;
+    // Trails read at least this wet regardless of scenario moisture, keeping
+    // the underground-water filaments visible in dry scenes.
+    float trailWetnessFloor = 0.75F;
     WaterDynamicMeshRockResponseSettings rockResponse{};
     WaterDynamicMeshVegetationResponseSettings vegetationResponse{};
     float animationDurationSeconds = 4.0F;

@@ -3169,8 +3169,10 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
             "Dynamic Mesh Flow fixed history exceeds the GPU point budget."};
     }
     const auto pointCount = static_cast<std::uint32_t>(pointCount64);
+    // Splat registration multiplies bucket references, so the grid is sized
+    // well past the particle count to keep hash-collision eviction rare.
     std::uint32_t contactGridCapacity = 1U;
-    while (contactGridCapacity < particleCapacity * 2U) {
+    while (contactGridCapacity < particleCapacity * 8U) {
         contactGridCapacity <<= 1U;
     }
 
@@ -3599,10 +3601,12 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
         activity,
         moisture,
     };
-    // Fixed authored maximum response radius. Consumers derive table lengths
-    // from SSBO runtime arrays and can hash contacts without another mutable
-    // control/uniform binding.
-    constexpr float kContactGridCellSizeMeters = 0.75F;
+    // Contact events splat into every bucket their radius overlaps, so the
+    // cell size sets activation granularity, not reach. Consumers derive
+    // table lengths from SSBO runtime arrays and can hash contacts without
+    // another mutable control/uniform binding. Must match
+    // kMeshFlowContactCellSizeMeters in pointcloud_mesh_flow_contact.glsl.
+    constexpr float kContactGridCellSizeMeters = 0.25F;
     const float contactGridCellSize = kContactGridCellSizeMeters;
     resources->dynamicMeshFlowContactGridCellSizeMeters =
         contactGridCellSize;
@@ -3628,7 +3632,7 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
         std::max(0.001F, request.settings.speedMetersPerSecond),
         std::max(0.0F, request.settings.downhillWeight),
         std::clamp(request.settings.inertia, 0.0F, 0.98F),
-        std::max(0.0F, request.settings.surfaceOffsetMeters),
+        std::clamp(request.settings.surfaceOffsetMeters, -0.05F, 0.10F),
     };
     uniforms.particleNoise = glm::vec4{
         std::max(0.0F, request.settings.particleNoiseStrength),
@@ -3656,7 +3660,7 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
             request.settings.contactFadeSeconds,
             request.settings.vegetationResponse.persistenceSeconds),
         contactGridCellSize,
-        0.0F,
+        std::clamp(request.settings.trailWetnessFloor, 0.0F, 1.0F),
     };
     uniforms.rockResponse = glm::vec4{
         std::max(0.0F, request.settings.rockResponse.radiusMeters),
@@ -3689,7 +3693,7 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
         std::max(
             0.0F,
             request.settings.vegetationResponse.streamDepthMeters),
-        0.0F,
+        std::clamp(request.settings.contactUpwardReachMeters, 0.0F, 3.0F),
         std::clamp(
             request.settings.rainDistributedSourceFraction,
             0.0F,
