@@ -91,6 +91,25 @@ struct RainImpactHeightBand {
 [[nodiscard]] RainImpactHeightBand SanitizeRainImpactHeightBand(
     RainImpactHeightBand band);
 
+// Impact-effect bitmask shared by the viewport shader
+// (styleData.rainImpactControl.x) and the CPU evaluator. The three effects
+// are decoupled from the cloud roles: each bit enables one shading model for
+// every rendered point, gated only by that model's world-Z height band.
+inline constexpr std::uint32_t kRainImpactEffectRingsBit = 1U;
+inline constexpr std::uint32_t kRainImpactEffectWetnessBit = 2U;
+inline constexpr std::uint32_t kRainImpactEffectDropletsBit = 4U;
+inline constexpr std::uint32_t kRainImpactEffectAllBits =
+    kRainImpactEffectRingsBit |
+    kRainImpactEffectWetnessBit |
+    kRainImpactEffectDropletsBit;
+
+// Full strength inside [minZ, maxZ], fading linearly to zero over fadeMeters
+// beyond each bounded edge. Mirrors RainImpactBandWeight in
+// shaders/pointcloud_rain_impact.glsl; expects a sanitized band.
+[[nodiscard]] float RainImpactBandWeight(
+    const RainImpactHeightBand& band,
+    float pointZ);
+
 struct RainVegetationImpactSettings {
     float twinkle = 1.80F;
     float propagationMetersPerSecond = 0.65F;
@@ -151,6 +170,14 @@ struct RainIntensityMultipliers {
 };
 
 [[nodiscard]] RainRuntimeSettings DefaultRainRuntimeSettings();
+
+// Bitmask of the enabled impact effects (kRainImpactEffect*Bit). Zero when
+// the master rain or impact-effects toggles are off. Deliberately independent
+// of any cloud's collision role: the same mask applies to every rendered
+// point-cloud layer.
+[[nodiscard]] std::uint32_t RainImpactEffectMask(
+    const RainRuntimeSettings& settings);
+
 [[nodiscard]] RainIntensityMultipliers RainIntensityValues(RainIntensityPreset preset);
 [[nodiscard]] WaterRainVisualSettings RainVisualPreset(std::string_view name);
 [[nodiscard]] std::array<std::string_view, 3> RainVisualPresetNames();
@@ -271,7 +298,11 @@ struct RainImpactEffect {
     float opacity = 0.0F;
     float emission = 0.0F;
     float sizeScale = 1.0F;
+    // Wet tint mix contributed by Rings and Wetness (0.24, 0.48, 0.62).
     float colourBlend = 0.0F;
+    // Brighter tint mix contributed by Droplets (0.54, 0.80, 0.82); applied
+    // after colourBlend, matching ApplyRainImpactColour in the shader.
+    float dropletBlend = 0.0F;
 };
 
 // Pure narrow-phase ROCK evaluator used by the offline renderer and by the
@@ -299,12 +330,24 @@ struct RainImpactEffect {
     float worldSpanMeters = 32.0F,
     const RainRockImpactSettings& rockImpact = {},
     const RainVegetationImpactSettings& vegetationImpact = {});
+// CPU twin of ResolveRainImpactComposite in
+// shaders/pointcloud_rain_impact.glsl. Every enabled model (effectMask bits:
+// 1 Rings, 2 Wetness, 4 Droplets) is evaluated for the point regardless of
+// which cloud the point belongs to; each model is gated only by its own
+// world-Z height band (sanitized internally, defaults unbounded). Rings and
+// Droplets max-combine, Wetness uses the peak-preserving soft union, and the
+// response coefficients match the shader constants exactly. sandWaterMask is
+// one on the flooded/downhill side of the shoreline and one when the layer
+// has no shoreline region.
 [[nodiscard]] RainImpactEffect EvaluateRainImpact(
     const RainImpactGrid& grid,
-    WaterSurfaceRole pointRole,
+    std::uint32_t effectMask,
     const io::Float3& point,
     const io::Float3& normal,
     float timeSeconds,
-    float sandWaterMask = 1.0F);
+    float sandWaterMask = 1.0F,
+    const RainImpactHeightBand& ringsBand = {},
+    const RainImpactHeightBand& wetnessBand = {},
+    const RainImpactHeightBand& dropletsBand = {});
 
 }  // namespace invisible_places::water

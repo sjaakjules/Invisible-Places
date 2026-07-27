@@ -265,6 +265,15 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
     }
     const uvec4 counts = rainImpactCounts[cellIndex];
     const float time = styleData.rainImpactGrid.w;
+    // Hoisted once per point so the reference loop below never re-reads
+    // styleData vectors per event.
+    const uint eventCount = min(
+        styleData.rainImpactControl.w,
+        uint(rainImpactEvents.length()));
+    const uint referenceCount = uint(rainImpactReferences.length());
+    const vec4 rockParams0 = styleData.rainImpactRock0;
+    const vec4 rockParams1 = styleData.rainImpactRock1;
+    const float rockDownhillStretch = styleData.rainImpactSandBand.w;
 
     float sandWaterMask = 1.0;
     if (ringsBand > 0.0 && HasShorelineWaveEffect()) {
@@ -310,7 +319,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
             }
             const uint referenceIndex =
                 cellIndex * kRainReferencesPerCell + offset + localIndex;
-            if (referenceIndex >= uint(rainImpactReferences.length())) {
+            if (referenceIndex >= referenceCount) {
                 break;
             }
             const uint packedReference = rainImpactReferences[referenceIndex];
@@ -318,8 +327,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                 continue;
             }
             const uint eventIndex = packedReference & 0xffffu;
-            if (eventIndex >= styleData.rainImpactControl.w ||
-                eventIndex >= uint(rainImpactEvents.length())) {
+            if (eventIndex >= eventCount) {
                 continue;
             }
             const RainImpactEventGpu event = rainImpactEvents[eventIndex];
@@ -347,9 +355,9 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
                     event.normalRadius.w,
                     event.lifetimeEnergy.x,
                     event.control.y,
-                    styleData.rainImpactRock0,
-                    styleData.rainImpactRock1,
-                    styleData.rainImpactSandBand.w,
+                    rockParams0,
+                    rockParams1,
+                    rockDownhillStretch,
                     point,
                     pointNormal,
                     age);

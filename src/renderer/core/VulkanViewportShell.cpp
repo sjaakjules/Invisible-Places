@@ -2188,10 +2188,12 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     UpdateRainRuntimeTiming(state);
     renderState_ = state;
     for (auto& layer : renderState_.pointCloudLayers) {
+        // Every layer takes the impact-capable material variant while the
+        // effects are on: the models shade all clouds' points inside their
+        // height bands, independent of the layer's collision role.
         layer.style.rainImpactEffects =
             renderState_.rainSettings.enabled &&
-            renderState_.rainSettings.impactEffectsEnabled &&
-            layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None;
+            renderState_.rainSettings.impactEffectsEnabled;
     }
     ++sceneRevision_;
 
@@ -6636,10 +6638,12 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
         UpdateRainRuntimeTiming(request.renderState);
         renderState_ = request.renderState;
         for (auto& layer : renderState_.pointCloudLayers) {
+            // Match the live viewport: the impact effects shade every
+            // layer's points inside their bands, independent of the layer's
+            // collision role.
             layer.style.rainImpactEffects =
                 renderState_.rainSettings.enabled &&
-                renderState_.rainSettings.impactEffectsEnabled &&
-                layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None;
+                renderState_.rainSettings.impactEffectsEnabled;
         }
         for (auto& resources : pointCloudResources_) {
             if (resources.exrDescriptorSet == VK_NULL_HANDLE) {
@@ -13578,25 +13582,17 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         };
     }
     const auto rainRole = static_cast<std::uint32_t>(layer.rainCollisionRole);
-    // The impact effects are decoupled from the layer's cloud role: every
-    // scene layer receives the bitmask of enabled effects (1 Rings, 2
-    // Wetness, 4 Droplets) and the shader gates each model by its own
-    // world-Z height band instead of the layer role.
-    std::uint32_t rainEffectMask = 0U;
-    if (renderState_.rainSettings.enabled &&
-        renderState_.rainSettings.impactEffectsEnabled &&
-        rainResources_.collisionReady &&
-        layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None) {
-        if (renderState_.rainSettings.sandEffectsEnabled) {
-            rainEffectMask |= 1U;
-        }
-        if (renderState_.rainSettings.rockEffectsEnabled) {
-            rainEffectMask |= 2U;
-        }
-        if (renderState_.rainSettings.vegetationEffectsEnabled) {
-            rainEffectMask |= 4U;
-        }
-    }
+    // The impact effects are decoupled from the layer's cloud role: EVERY
+    // rendered point-cloud layer receives the bitmask of enabled effects
+    // (1 Rings, 2 Wetness, 4 Droplets) regardless of its collision role, and
+    // the shader gates each model by its own world-Z height band instead.
+    // rainImpactControl.y still carries the layer role because the mesh-flow
+    // contact include (pointcloud_mesh_flow_contact.glsl) selects ROCK/VEG
+    // point styles through it.
+    const std::uint32_t rainEffectMask =
+        rainResources_.collisionReady
+            ? invisible_places::water::RainImpactEffectMask(renderState_.rainSettings)
+            : 0U;
     const float rainGridWorldSpan = invisible_places::water::RainImpactGridWorldSpan(
         renderState_.rainSettings);
     styleGpu.rainImpactControl = glm::uvec4{

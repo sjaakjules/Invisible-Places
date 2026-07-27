@@ -44,6 +44,17 @@ struct OfflinePointLayer {
     invisible_places::water::WaterSurfaceRole rainCollisionRole =
         invisible_places::water::WaterSurfaceRole::None;
     const invisible_places::water::RainImpactGrid* rainImpactGrid = nullptr;
+    // Which impact effects shade this layer's points and inside which
+    // world-Z bands. Mirrors the viewport's styleData.rainImpactControl.x
+    // plus band uniforms and is deliberately independent of
+    // rainCollisionRole; thread RainImpactEffectMask(settings) and the
+    // settings' sand/rock/vegetation bands when a grid is attached. The
+    // defaults (all effects, unbounded bands) shade every point in range.
+    std::uint32_t rainEffectMask =
+        invisible_places::water::kRainImpactEffectAllBits;
+    invisible_places::water::RainImpactHeightBand rainRingsBand{};
+    invisible_places::water::RainImpactHeightBand rainWetnessBand{};
+    invisible_places::water::RainImpactHeightBand rainDropletsBand{};
     float roughnessMotionMinimum = 0.0F;
     float roughnessMotionInvRange = 1.0F;
 };

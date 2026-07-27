@@ -1895,20 +1895,20 @@ bool BuildOfflinePointSample(
                 glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
         }
     }
+    // Decoupled from the layer's collision role: every enabled model shades
+    // this point inside its own height band, matching the viewport shader.
     const auto rainImpact =
-        layer.rainImpactGrid != nullptr && layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None
+        layer.rainImpactGrid != nullptr && layer.rainEffectMask != 0U
             ? invisible_places::water::EvaluateRainImpact(
                   *layer.rainImpactGrid,
-                  layer.rainCollisionRole,
+                  layer.rainEffectMask,
                   FromGlm(sample->worldCenter),
                   FromGlm(rainImpactNormal),
                   stylisationTimeSeconds,
-                  layer.rainCollisionRole ==
-                          invisible_places::water::WaterSurfaceRole::Sand
-                      ? SandRainWaterMask(
-                            layer.style,
-                            sample->worldCenter.z)
-                      : 1.0F)
+                  SandRainWaterMask(layer.style, sample->worldCenter.z),
+                  layer.rainRingsBand,
+                  layer.rainWetnessBand,
+                  layer.rainDropletsBand)
             : invisible_places::water::RainImpactEffect{};
     const float waterParticleSizeScale =
         waterParticles ? WaterParticleSizeScale(cloud, pointIndex, stylisationTimeSeconds) : 1.0F;
@@ -2054,14 +2054,16 @@ bool BuildOfflinePointSample(
             sample->color,
             sparseRipple.colour,
             Clamp01(sparseRipple.colourMix));
-        const glm::vec3 rainImpactColour =
-            layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Vegetation
-                ? glm::vec3{0.54F, 0.80F, 0.82F}
-                : glm::vec3{0.24F, 0.48F, 0.62F};
+        // Mirrors ApplyRainImpactColour: the shared wet tint first, then the
+        // brighter Droplets tint on top.
         sample->color = glm::mix(
             sample->color,
-            rainImpactColour,
+            glm::vec3{0.24F, 0.48F, 0.62F},
             std::clamp(rainImpact.colourBlend, 0.0F, 0.72F));
+        sample->color = glm::mix(
+            sample->color,
+            glm::vec3{0.54F, 0.80F, 0.82F},
+            std::clamp(rainImpact.dropletBlend, 0.0F, 0.72F));
     }
     sample->hasNormal = false;
     sample->hasNormal = cloud.hasNormals && pointIndex < cloud.normals.size();
@@ -2674,21 +2676,21 @@ void RenderFastBasicPointCloudTile(
                         glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) * localNormal);
                 }
             }
+            // Decoupled from the layer's collision role: every enabled
+            // model shades this point inside its own height band, matching
+            // the viewport shader.
             const auto rainImpact =
-                layer.rainImpactGrid != nullptr &&
-                        layer.rainCollisionRole != invisible_places::water::WaterSurfaceRole::None
+                layer.rainImpactGrid != nullptr && layer.rainEffectMask != 0U
                     ? invisible_places::water::EvaluateRainImpact(
                           *layer.rainImpactGrid,
-                          layer.rainCollisionRole,
+                          layer.rainEffectMask,
                           FromGlm(worldPosition),
                           FromGlm(rainNormal),
                           stylisationTimeSeconds,
-                          layer.rainCollisionRole ==
-                                  invisible_places::water::WaterSurfaceRole::Sand
-                              ? SandRainWaterMask(
-                                    layer.style,
-                                    worldPosition.z)
-                              : 1.0F)
+                          SandRainWaterMask(layer.style, worldPosition.z),
+                          layer.rainRingsBand,
+                          layer.rainWetnessBand,
+                          layer.rainDropletsBand)
                     : invisible_places::water::RainImpactEffect{};
             glm::vec3 color =
                 glm::mix(
@@ -2696,11 +2698,16 @@ void RenderFastBasicPointCloudTile(
                     sparseRipple.colour,
                     Clamp01(sparseRipple.colourMix)) *
                 (1.0F + std::max(0.0F, sparseRipple.emissionAdd));
-            const glm::vec3 rainColour =
-                layer.rainCollisionRole == invisible_places::water::WaterSurfaceRole::Vegetation
-                    ? glm::vec3{0.54F, 0.80F, 0.82F}
-                    : glm::vec3{0.24F, 0.48F, 0.62F};
-            color = glm::mix(color, rainColour, std::clamp(rainImpact.colourBlend, 0.0F, 0.72F));
+            // Mirrors ApplyRainImpactColour: the shared wet tint first, then
+            // the brighter Droplets tint on top.
+            color = glm::mix(
+                color,
+                glm::vec3{0.24F, 0.48F, 0.62F},
+                std::clamp(rainImpact.colourBlend, 0.0F, 0.72F));
+            color = glm::mix(
+                color,
+                glm::vec3{0.54F, 0.80F, 0.82F},
+                std::clamp(rainImpact.dropletBlend, 0.0F, 0.72F));
             color *= 1.0F + std::max(0.0F, rainImpact.emission);
             // Fast Basic intentionally ignores the authored material opacity,
             // while procedural water effects can still attenuate its opaque base.

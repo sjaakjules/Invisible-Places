@@ -907,7 +907,7 @@ TEST_CASE(
             settings);
         const auto cpuEffect = invisible_places::water::EvaluateRainImpact(
             grid,
-            WaterSurfaceRole::Rock,
+            invisible_places::water::kRainImpactEffectWetnessBit,
             {},
             {0.0F, 0.0F, 1.0F},
             0.8F);

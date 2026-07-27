@@ -1508,6 +1508,30 @@ RainImpactHeightBand SanitizeRainImpactHeightBand(RainImpactHeightBand band) {
     return band;
 }
 
+float RainImpactBandWeight(const RainImpactHeightBand& band, float pointZ) {
+    // Mirrors RainImpactBandWeight in shaders/pointcloud_rain_impact.glsl.
+    const float bandFade = std::max(1.0e-3F, band.fadeMeters);
+    return std::clamp((pointZ - (band.minZ - bandFade)) / bandFade, 0.0F, 1.0F) *
+           std::clamp(((band.maxZ + bandFade) - pointZ) / bandFade, 0.0F, 1.0F);
+}
+
+std::uint32_t RainImpactEffectMask(const RainRuntimeSettings& settings) {
+    if (!settings.enabled || !settings.impactEffectsEnabled) {
+        return 0U;
+    }
+    std::uint32_t mask = 0U;
+    if (settings.sandEffectsEnabled) {
+        mask |= kRainImpactEffectRingsBit;
+    }
+    if (settings.rockEffectsEnabled) {
+        mask |= kRainImpactEffectWetnessBit;
+    }
+    if (settings.vegetationEffectsEnabled) {
+        mask |= kRainImpactEffectDropletsBit;
+    }
+    return mask;
+}
+
 RainParticleVisualShape EvaluateRainParticleVisualShape(
     float authoredWidthMeters,
     float authoredLengthMeters,
@@ -3629,13 +3653,33 @@ float EvaluateSandRainImpactValue(
 
 RainImpactEffect EvaluateRainImpact(
     const RainImpactGrid& grid,
-    WaterSurfaceRole pointRole,
+    std::uint32_t effectMask,
     const io::Float3& point,
     const io::Float3& normal,
     float timeSeconds,
-    float sandWaterMask) {
+    float sandWaterMask,
+    const RainImpactHeightBand& ringsBand,
+    const RainImpactHeightBand& wetnessBand,
+    const RainImpactHeightBand& dropletsBand) {
     RainImpactEffect effect;
-    if (pointRole == WaterSurfaceRole::None || grid.cells.empty()) {
+    if (effectMask == 0U || grid.cells.empty()) {
+        return effect;
+    }
+    // Band weights first: a disabled or out-of-band model skips its entire
+    // reference walk, matching ResolveRainImpactComposite's early-outs.
+    const float ringsWeight =
+        (effectMask & kRainImpactEffectRingsBit) != 0U
+            ? RainImpactBandWeight(SanitizeRainImpactHeightBand(ringsBand), point.z)
+            : 0.0F;
+    const float wetnessWeight =
+        (effectMask & kRainImpactEffectWetnessBit) != 0U
+            ? RainImpactBandWeight(SanitizeRainImpactHeightBand(wetnessBand), point.z)
+            : 0.0F;
+    const float dropletsWeight =
+        (effectMask & kRainImpactEffectDropletsBit) != 0U
+            ? RainImpactBandWeight(SanitizeRainImpactHeightBand(dropletsBand), point.z)
+            : 0.0F;
+    if (ringsWeight <= 0.0F && wetnessWeight <= 0.0F && dropletsWeight <= 0.0F) {
         return effect;
     }
     const auto cellX = static_cast<std::int32_t>(std::floor((point.x - grid.origin.x) / grid.cellSizeMeters));
@@ -3645,78 +3689,74 @@ RainImpactEffect EvaluateRainImpact(
         return effect;
     }
     const auto& cell = grid.cells[static_cast<std::size_t>(cellY) * grid.dimension + static_cast<std::size_t>(cellX)];
-    float rockPeak = 0.0F;
-    float rockRemaining = 1.0F;
-    const auto evaluateEvent = [&](const RainImpactEvent& event) {
-        if (!EventActive(event, timeSeconds) || event.role != pointRole) {
-            return;
+
+    if (ringsWeight > 0.0F && cell.sandMask != 0U) {
+        for (std::uint32_t index = 0; index < cell.sand.size(); ++index) {
+            if ((cell.sandMask & (1U << index)) == 0U) {
+                continue;
+            }
+            const auto& event = grid.events[cell.sand[index]];
+            if (event.role != WaterSurfaceRole::Sand ||
+                !EventActive(event, timeSeconds)) {
+                continue;
+            }
+            const float value =
+                EvaluateSandRainImpactValue(event, point, timeSeconds, sandWaterMask) *
+                event.energy * ringsWeight;
+            effect.opacity = std::max(effect.opacity, value * 0.18F);
+            effect.emission = std::max(effect.emission, value * 0.11F);
+            effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * 0.16F);
+            effect.colourBlend = std::max(effect.colourBlend, value * 0.20F);
         }
-        const float age = timeSeconds - event.birthTimeSeconds;
-        float value = 0.0F;
-        if (pointRole == WaterSurfaceRole::Sand) {
-            value = EvaluateSandRainImpactValue(
-                event,
-                point,
-                timeSeconds,
-                sandWaterMask);
-        } else if (pointRole == WaterSurfaceRole::Rock) {
-            value = EvaluateRockRainImpactValue(
-                event,
-                point,
-                normal,
-                timeSeconds,
-                grid.rockImpact);
-        } else if (pointRole == WaterSurfaceRole::Vegetation) {
-            value = EvaluateVegetationSprinkle(
-                event,
-                point,
-                normal,
-                age,
-                grid.vegetationImpact);
-        }
-        value *= event.energy;
-        if (pointRole == WaterSurfaceRole::Rock) {
+    }
+    if (wetnessWeight > 0.0F && cell.rockMask != 0U) {
+        float rockPeak = 0.0F;
+        float rockRemaining = 1.0F;
+        for (std::uint32_t index = 0; index < cell.rock.size(); ++index) {
+            if ((cell.rockMask & (1U << index)) == 0U) {
+                continue;
+            }
+            const auto& event = grid.events[cell.rock[index]];
+            if (event.role != WaterSurfaceRole::Rock ||
+                !EventActive(event, timeSeconds)) {
+                continue;
+            }
+            const float value =
+                EvaluateRockRainImpactValue(event, point, normal, timeSeconds, grid.rockImpact) *
+                event.energy * wetnessWeight;
             // Peak-preserving soft union: one impact remains bit-for-bit
             // equivalent to its narrow-phase value, while every additional
             // retained impact can only strengthen the wet response.
             rockPeak = std::max(rockPeak, value);
             rockRemaining *= 1.0F - std::clamp(value, 0.0F, 1.0F);
-            return;
         }
-        const bool vegetation = pointRole == WaterSurfaceRole::Vegetation;
-        effect.opacity = std::max(effect.opacity, value * (vegetation ? 0.14F : 0.18F));
-        effect.emission = std::max(effect.emission, value * (pointRole == WaterSurfaceRole::Vegetation ? 0.48F : 0.11F));
-        effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * (vegetation ? 0.12F : 0.16F));
-        effect.colourBlend = std::max(
-            effect.colourBlend,
-            value * (pointRole == WaterSurfaceRole::Rock ? 0.42F : (vegetation ? 0.18F : 0.20F)));
-    };
-
-    if (pointRole == WaterSurfaceRole::Sand) {
-        for (std::uint32_t index = 0; index < cell.sand.size(); ++index) {
-            if ((cell.sandMask & (1U << index)) != 0U) {
-                evaluateEvent(grid.events[cell.sand[index]]);
-            }
-        }
-    } else if (pointRole == WaterSurfaceRole::Rock) {
-        for (std::uint32_t index = 0; index < cell.rock.size(); ++index) {
-            if ((cell.rockMask & (1U << index)) != 0U) {
-                evaluateEvent(grid.events[cell.rock[index]]);
-            }
-        }
-    } else if (pointRole == WaterSurfaceRole::Vegetation) {
-        for (std::uint32_t index = 0; index < cell.vegetation.size(); ++index) {
-            if ((cell.vegetationMask & (1U << index)) != 0U) {
-                evaluateEvent(grid.events[cell.vegetation[index]]);
-            }
+        const float wetnessValue = std::max(rockPeak, 1.0F - rockRemaining);
+        if (wetnessValue > 0.0F) {
+            effect.opacity = std::max(effect.opacity, wetnessValue * 0.18F);
+            effect.emission = std::max(effect.emission, wetnessValue * 0.11F);
+            effect.sizeScale = std::max(effect.sizeScale, 1.0F + wetnessValue * 0.16F);
+            effect.colourBlend = std::max(effect.colourBlend, wetnessValue * 0.42F);
         }
     }
-    if (pointRole == WaterSurfaceRole::Rock) {
-        const float value = std::max(rockPeak, 1.0F - rockRemaining);
-        effect.opacity = value * 0.18F;
-        effect.emission = value * 0.11F;
-        effect.sizeScale = 1.0F + value * 0.16F;
-        effect.colourBlend = value * 0.42F;
+    if (dropletsWeight > 0.0F && cell.vegetationMask != 0U) {
+        for (std::uint32_t index = 0; index < cell.vegetation.size(); ++index) {
+            if ((cell.vegetationMask & (1U << index)) == 0U) {
+                continue;
+            }
+            const auto& event = grid.events[cell.vegetation[index]];
+            if (event.role != WaterSurfaceRole::Vegetation ||
+                !EventActive(event, timeSeconds)) {
+                continue;
+            }
+            const float age = timeSeconds - event.birthTimeSeconds;
+            const float value =
+                EvaluateVegetationSprinkle(event, point, normal, age, grid.vegetationImpact) *
+                event.energy * dropletsWeight;
+            effect.opacity = std::max(effect.opacity, value * 0.14F);
+            effect.emission = std::max(effect.emission, value * 0.48F);
+            effect.sizeScale = std::max(effect.sizeScale, 1.0F + value * 0.12F);
+            effect.dropletBlend = std::max(effect.dropletBlend, value * 0.18F);
+        }
     }
     return effect;
 }
