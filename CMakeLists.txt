@@ -331,6 +331,21 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 TIMEOUT 600
         )
         add_test(
+            NAME animation-export-frame-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke animation-export-frame
+                --smoke-output "${CMAKE_CURRENT_BINARY_DIR}/water-region-smoke/animation-export-frame"
+        )
+        set_tests_properties(
+            animation-export-frame-gui-smoke
+            PROPERTIES
+                LABELS gui_smoke
+                RUN_SERIAL TRUE
+                TIMEOUT 1200
+        )
+        add_test(
             NAME water-integration-sample-scene
             COMMAND
                 $<TARGET_FILE:invisible_places>

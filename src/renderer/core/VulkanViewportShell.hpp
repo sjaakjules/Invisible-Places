@@ -508,6 +508,15 @@ class VulkanViewportShell {
     [[nodiscard]] PointCloudExrFrameStatus PollPointCloudExrFrame();
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage CompletePointCloudExrFrame();
     void CancelPointCloudExrFrame();
+    // Diagnostics for the most recently recorded EXR frame: how many
+    // point-cloud layers actually recorded draw commands, and their summed
+    // draw point count. Lets export paths verify the base cloud was drawn.
+    [[nodiscard]] std::uint32_t ExrLastRecordedLayerCount() const {
+        return exrLastRecordedLayerCount_;
+    }
+    [[nodiscard]] std::uint64_t ExrLastRecordedPointCount() const {
+        return exrLastRecordedPointCount_;
+    }
     [[nodiscard]] ImGuiPreviewImageTexture UploadImGuiPreviewImageTexture(
         std::uint32_t width,
         std::uint32_t height,
@@ -1038,7 +1047,8 @@ class VulkanViewportShell {
                                         VkDescriptorPool allocationPool = VK_NULL_HANDLE);
     void ReplacePointCloudDescriptorSets(ActivePointCloudResources* resources);
     [[nodiscard]] PendingPointDescriptorGeneration BuildPointDescriptorGeneration(ActivePointCloudResources* resources,
-                                                                                  VkImageView exrDepthView);
+                                                                                  VkImageView exrDepthView,
+                                                                                  VkBuffer exrFrameUniformBuffer);
     void InstallPointDescriptorGeneration(ActivePointCloudResources* resources,
                                           PendingPointDescriptorGeneration* generation);
     void DestroyPointDescriptorGeneration(PendingPointDescriptorGeneration* generation);
@@ -1080,6 +1090,7 @@ class VulkanViewportShell {
                                            std::size_t frameIndex, std::uint32_t imageIndex, VkImageView sceneDepthView,
                                            VkDescriptorPool allocationPool = VK_NULL_HANDLE);
     void UpdatePointCloudExrDescriptorSet(ActivePointCloudResources* resources, VkImageView sceneDepthView,
+                                          VkBuffer exrFrameUniformBuffer,
                                           VkDescriptorPool allocationPool = VK_NULL_HANDLE);
     void CreateOrUpdateCompositeDescriptorSet();
     void CreateOrUpdateCompositeDescriptorSet(VkDescriptorSet* descriptorSet, VkImageView accumulationView,
@@ -1110,6 +1121,7 @@ class VulkanViewportShell {
     [[nodiscard]] bool ResolvePointCloudDrawPlan(
         const SceneRenderState::PointCloudLayerState& layer,
         bool forceFullSource,
+        bool requireLiveDescriptors,
         PointCloudDrawPlan* plan);
     [[nodiscard]] bool UploadPointCloudLayerStyle(
         const SceneRenderState::PointCloudLayerState& layer,
@@ -1273,6 +1285,8 @@ class VulkanViewportShell {
     std::uint32_t lastSubmittedImageIndex_ = 0U;
     bool lastSubmittedSceneImageValid_ = false;
     bool exrExportFrameInFlight_ = false;
+    std::uint32_t exrLastRecordedLayerCount_ = 0U;
+    std::uint64_t exrLastRecordedPointCount_ = 0U;
     std::uint32_t exrExportInFlightWidth_ = 0;
     std::uint32_t exrExportInFlightHeight_ = 0;
     PointCloudExrReadbackMask exrExportInFlightReadbackMask_ = PointCloudExrReadbackMask::All;

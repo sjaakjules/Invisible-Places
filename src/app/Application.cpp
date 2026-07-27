@@ -27990,7 +27990,10 @@ void RequestOfflineRenderCancellation(OfflineRenderJobState* job) {
     }
 
     job->cancelRequested = true;
-    job->frameSampleState = {};
+    // frameSampleState must survive the cancel request: the job pump's
+    // cancel branch reads gpuSampleInFlight to know it has to call
+    // CancelPointCloudExrFrame. Wiping it here abandoned the submitted EXR
+    // frame and latched the viewport's in-flight flag forever.
     if (job->preparationState != nullptr) {
         std::scoped_lock lock(job->preparationState->mutex);
         job->preparationState->cancelRequested = true;
@@ -28029,6 +28032,14 @@ void ProcessOfflineRenderJobStep(
             writerError = job.writerState->errorMessage;
         }
         if (writerCompleted) {
+            // The writer can complete (or fail) while a GPU sample is still
+            // submitted; the frame must be drained before the job state that
+            // records it is reset, or the EXR pipeline stays in flight
+            // forever.
+            if (job.frameSampleState.gpuSampleInFlight) {
+                viewport->CancelPointCloudExrFrame();
+                job.frameSampleState.gpuSampleInFlight = false;
+            }
             const bool wasQuickMp4BatchJob = job.quickMp4BatchJob;
             const bool wasCancelled = job.cancelRequested;
             FinishOfflineRenderJob(runtimeState, writerStatus, writerError);
@@ -48060,6 +48071,309 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
     return captured;
 }
 
+// Drives the real export frame path (full-density gate, saved-visual export
+// snapshot, GPU EXR frame) on the Scene1 exhibition project and verifies the
+// base point cloud actually reaches the output pixels. Also regression-tests
+// recovery from an abandoned asynchronous EXR frame, which previously latched
+// every later frame preview shut with "already has a frame in flight".
+int RunAnimationExportFrameSmoke(
+    const GuiSmokeOptions& options,
+    const invisible_places::io::AssetCatalog& assetCatalog,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    GuiSmokeReport report;
+    report.scenario = options.scenario;
+    const auto outputDirectory = options.outputDirectory.empty()
+                                     ? std::filesystem::path{"build/macos-debug/water-region-smoke"}
+                                     : options.outputDirectory;
+    report.outputPath = outputDirectory / "animation-export-frame.json";
+
+    auto finish = [&]() {
+        if (!WriteGuiSmokeReport(report)) {
+            std::cerr << "Failed to write GUI smoke report: " << report.outputPath.string() << "\n";
+            return 1;
+        }
+        std::cout << "GUI smoke report: " << report.outputPath.string() << std::endl;
+        return report.Passed() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        report.Fail("Smoke runner did not receive a live window, viewport, and runtime state.");
+        return finish();
+    }
+
+    const auto projectPath =
+        assetCatalog.dataRoot.parent_path() / "Saved" / "exhibitionScene_project.json";
+    std::string loadError;
+    const auto project =
+        invisible_places::serialization::LoadProjectDocument(projectPath, &loadError);
+    if (!project.has_value()) {
+        report.Fail("The Scene1 exhibition project did not load: " + loadError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        report.Fail(
+            "The Scene1 exhibition project could not be applied: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+    const auto topViewPath =
+        DefaultAnimationDirectory(assetCatalog.dataRoot) / "Top_View.ipanim.json";
+    if (!LoadAnimationPathFromFile(runtimeState, topViewPath)) {
+        report.Fail("Top_View could not be loaded: " + runtimeState->errorMessage);
+        return finish();
+    }
+
+    // Hermetic water state: this smoke isolates the base cloud, so live rain
+    // and the stateful Mesh Flow simulation stay out of the frame.
+    runtimeState->water.collisionRainSettings =
+        invisible_places::water::DefaultRainRuntimeSettings();
+    runtimeState->water.collisionRainSettings.enabled = false;
+    runtimeState->water.dynamicMeshFlowSettings.enabled = false;
+
+    auto& panel = runtimeState->animationPanel;
+    panel.selectedExportPresetName =
+        std::string{invisible_places::output::kHqPreviewDensityExrPresetName};
+    EnsureExportPresets(runtimeState);
+    auto& smokePreset = EditActiveExportPreset(runtimeState);
+    smokePreset.settings.width = 960;
+    smokePreset.settings.height = 540;
+    smokePreset.settings.supersampleScale = 1;
+    smokePreset.settings.spatialAntialiasing = false;
+    smokePreset.settings.temporalSupersampling = false;
+    smokePreset.settings.motionBlur = false;
+    smokePreset.settings.outputDirectory = outputDirectory.string();
+    panel.exportPreviewDensity = false;
+    panel.scrubAmount = 0.35F;
+    runtimeState->renderSettings.outputDirectory = outputDirectory.string();
+    StartQueuedLayerLoadIfIdle(runtimeState);
+
+    const auto startupStartedAt = std::chrono::steady_clock::now();
+    const auto startupDeadline = startupStartedAt + std::chrono::seconds{300};
+    std::size_t pumpFrame = 0U;
+    auto pump = [&]() {
+        PumpWaterIntegrationSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            static_cast<float>(pumpFrame++) / 30.0F,
+            true,
+            true);
+    };
+    while (std::chrono::steady_clock::now() < startupDeadline && !window->ShouldClose()) {
+        pump();
+        const bool displayReady = std::any_of(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [](const auto& scene) { return scene.displayLoaded && scene.displayVisible; });
+        if (displayReady && !runtimeState->pendingLoad.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+
+    // Pump until the full-density export bundle is loaded; the gate queues
+    // the finest-density sessions itself the first time it runs.
+    const auto exportReadyDeadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{600};
+    bool exportSourcesReady = false;
+    while (std::chrono::steady_clock::now() < exportReadyDeadline && !window->ShouldClose()) {
+        if (EnsureFullDensityExportSourcesReady(runtimeState, viewport)) {
+            exportSourcesReady = true;
+            break;
+        }
+        pump();
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (!exportSourcesReady) {
+        report.Fail(
+            "Full-density export sources did not become ready: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+    report.Pass("Full-density export sources are loaded and GPU resident.");
+
+    const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
+    const auto exportLayers = BuildAnimationExportPointCloudLayerSnapshot(
+        *runtimeState,
+        false,
+        savedVisual.has_value()
+            ? std::optional<PointVisualExportOverride>{savedVisual->visualOverride}
+            : std::nullopt,
+        runtimeState->projectSettings.pointCloudRendererMode);
+    std::size_t fullSourceSceneLayerCount = 0U;
+    for (const auto& layer : exportLayers) {
+        if (layer.layerId >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto& session = runtimeState->sessions[layer.layerId];
+        report.Pass(
+            "Export snapshot: " + session.sourcePath.filename().string() +
+            " draws " + std::to_string(layer.drawPointCount) + " / " +
+            std::to_string(session.totalPrimitives) + " points.");
+        if (IsSceneGroupedPointCloud(session) &&
+            layer.drawPointCount == session.totalPrimitives &&
+            session.totalPrimitives > 0U) {
+            ++fullSourceSceneLayerCount;
+        }
+    }
+    if (fullSourceSceneLayerCount < 3U) {
+        report.Fail(
+            "Expected at least the three scene role layers at full source density; got " +
+            std::to_string(fullSourceSceneLayerCount) + ".");
+        return finish();
+    }
+
+    if (!RenderCurrentAnimationFramePreview(runtimeState, viewport)) {
+        report.Fail(
+            "Frame preview failed: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+    report.Pass(
+        "Frame preview rendered through the export pipeline: " +
+        std::to_string(viewport->ExrLastRecordedLayerCount()) +
+        " layers recorded totalling " +
+        std::to_string(viewport->ExrLastRecordedPointCount()) + " points.");
+
+    // The exported frame must contain the base cloud, not just effect passes:
+    // require a healthy fraction of pixels that differ from the background.
+    auto toSrgb8 = [](float linear) {
+        const float clamped = std::clamp(linear, 0.0F, 1.0F);
+        const float srgb = clamped <= 0.0031308F
+                               ? 12.92F * clamped
+                               : (1.055F * std::pow(clamped, 1.0F / 2.4F)) - 0.055F;
+        return static_cast<int>(std::clamp(std::lround(srgb * 255.0F), 0L, 255L));
+    };
+    const int backgroundR = toSrgb8(runtimeState->projectSettings.backgroundColor[0]);
+    const int backgroundG = toSrgb8(runtimeState->projectSettings.backgroundColor[1]);
+    const int backgroundB = toSrgb8(runtimeState->projectSettings.backgroundColor[2]);
+    auto measureCoverage = [&](const std::string& ppmName) -> double {
+        const auto& preview = panel.framePreview;
+        const auto width = preview.renderSettings.width;
+        const auto height = preview.renderSettings.height;
+        const std::size_t pixelCount = static_cast<std::size_t>(width) * height;
+        if (pixelCount == 0U ||
+            preview.displayRgba8.size() < pixelCount * 4U) {
+            return -1.0;
+        }
+        std::size_t coveredPixelCount = 0U;
+        std::vector<std::uint8_t> rgb;
+        rgb.reserve(pixelCount * 3U);
+        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+            const int r = preview.displayRgba8[(pixel * 4U) + 0U];
+            const int g = preview.displayRgba8[(pixel * 4U) + 1U];
+            const int b = preview.displayRgba8[(pixel * 4U) + 2U];
+            if (std::abs(r - backgroundR) > 8 || std::abs(g - backgroundG) > 8 ||
+                std::abs(b - backgroundB) > 8) {
+                ++coveredPixelCount;
+            }
+            rgb.push_back(static_cast<std::uint8_t>(r));
+            rgb.push_back(static_cast<std::uint8_t>(g));
+            rgb.push_back(static_cast<std::uint8_t>(b));
+        }
+        std::string ppmError;
+        static_cast<void>(WritePpmImage(
+            outputDirectory / ppmName,
+            width,
+            height,
+            rgb,
+            &ppmError));
+        return static_cast<double>(coveredPixelCount) /
+               static_cast<double>(pixelCount);
+    };
+    const double firstCoverage = measureCoverage("animation-export-frame-first.ppm");
+    if (firstCoverage < 0.08) {
+        report.Fail(
+            "The FIRST exported frame is missing the base point cloud (" +
+            FormatFixed(std::max(firstCoverage, 0.0) * 100.0, 2) +
+            "% coverage). Exports recreate EXR resources at their start, so "
+            "a broken first frame breaks the frame preview and, with "
+            "per-frame resource recreation, every video frame.");
+    } else {
+        report.Pass(
+            "First full-density pass coverage: " +
+            FormatFixed(firstCoverage * 100.0, 2) + "%.");
+    }
+
+    // Second full-density pass: discriminates a first-frame initialization
+    // defect from a genuinely density-keyed one.
+    if (!RenderCurrentAnimationFramePreview(runtimeState, viewport)) {
+        report.Fail(
+            "Second full-density frame preview failed: " +
+            runtimeState->errorMessage);
+        return finish();
+    }
+    const double coverage = measureCoverage("animation-export-frame.ppm");
+
+    // Diagnostic pass: the same frame at playback preview density. If this
+    // renders while the full-source pass is empty, the defect is specific to
+    // the forceFullSource draw path.
+    panel.exportPreviewDensity = true;
+    if (RenderCurrentAnimationFramePreview(runtimeState, viewport)) {
+        const double previewCoverage =
+            measureCoverage("animation-export-frame-preview-density.ppm");
+        report.Pass(
+            "Preview-density diagnostic pass: " +
+            std::to_string(viewport->ExrLastRecordedLayerCount()) +
+            " layers / " +
+            std::to_string(viewport->ExrLastRecordedPointCount()) +
+            " points, coverage " + FormatFixed(previewCoverage * 100.0, 2) +
+            "%.");
+    } else {
+        report.Pass(
+            "Preview-density diagnostic pass failed: " +
+            runtimeState->errorMessage);
+    }
+    panel.exportPreviewDensity = false;
+
+    if (coverage < 0.08) {
+        report.Fail(
+            "The exported frame is missing the base point cloud: only " +
+            FormatFixed(std::max(coverage, 0.0) * 100.0, 2) +
+            "% of pixels differ from the background.");
+        return finish();
+    }
+    report.Pass(
+        "Exported frame covers " + FormatFixed(coverage * 100.0, 2) +
+        "% of pixels with non-background content.");
+
+    // Regression: an export job that abandons a submitted asynchronous EXR
+    // frame must not latch synchronous frame previews shut.
+    {
+        auto staleRenderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            0.0F);
+        if (!staleRenderState.pointCloudLayers.empty()) {
+            const invisible_places::renderer::core::PointCloudExrFrameRequest staleRequest{
+                .renderState = staleRenderState,
+                .width = 960U,
+                .height = 540U,
+                .previewDensity = true,
+            };
+            if (!viewport->BeginPointCloudExrFrame(staleRequest)) {
+                report.Fail("Could not submit the deliberately abandoned EXR frame.");
+                return finish();
+            }
+            // Intentionally neither polled, completed, nor cancelled.
+        }
+    }
+    if (!RenderCurrentAnimationFramePreview(runtimeState, viewport)) {
+        report.Fail(
+            "Frame preview did not recover from an abandoned in-flight EXR frame: " +
+            (runtimeState->errorMessage.empty() ? runtimeState->statusMessage
+                                                : runtimeState->errorMessage));
+        return finish();
+    }
+    report.Pass("Frame preview recovered from an abandoned in-flight EXR frame.");
+
+    return finish();
+}
+
 int RunWaterIntegrationSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -49806,6 +50120,17 @@ int Application::Run(ApplicationRunOptions options) const {
             options.guiSmoke->scenario ==
                 "dynamic-mesh-flow-scene1-visual") {
             const auto smokeExitCode = RunDynamicMeshFlowGroundSmoke(
+                options.guiSmoke.value(),
+                assetCatalog,
+                &window,
+                &viewport.value(),
+                &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "animation-export-frame") {
+            const auto smokeExitCode = RunAnimationExportFrameSmoke(
                 options.guiSmoke.value(),
                 assetCatalog,
                 &window,

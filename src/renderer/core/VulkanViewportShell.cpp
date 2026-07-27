@@ -2512,6 +2512,7 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
         UpdatePointCloudDescriptorSets(&resources, resources.pointDescriptorPool);
         if (exrExportResources_.depthImage.view != VK_NULL_HANDLE) {
             UpdatePointCloudExrDescriptorSet(&resources, exrExportResources_.depthImage.view,
+                                             exrExportResources_.uniformBuffer.buffer,
                                              resources.pointDescriptorPool);
         }
     } catch (...) {
@@ -3399,7 +3400,8 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
             }
             auto stagedPointGeneration = BuildPointDescriptorGeneration(
                 &staged,
-                exrExportResources_.depthImage.view);
+                exrExportResources_.depthImage.view,
+                exrExportResources_.uniformBuffer.buffer);
             InstallPointDescriptorGeneration(
                 &staged,
                 &stagedPointGeneration);
@@ -3429,7 +3431,8 @@ DynamicMeshFlowGpuUpdateResult VulkanViewportShell::UpdateDynamicMeshFlowGpuSimu
                 pendingBase.resourceIndex = resourceIndex;
                 pendingBase.generation = BuildPointDescriptorGeneration(
                     &candidate,
-                    exrExportResources_.depthImage.view);
+                    exrExportResources_.depthImage.view,
+                    exrExportResources_.uniformBuffer.buffer);
                 pendingBaseGenerations.push_back(
                     std::move(pendingBase));
             }
@@ -3907,7 +3910,8 @@ void VulkanViewportShell::ClearDynamicMeshFlowGpuSimulation(
             pendingBase.resourceIndex = resourceIndex;
             pendingBase.generation = BuildPointDescriptorGeneration(
                 &candidate,
-                exrExportResources_.depthImage.view);
+                exrExportResources_.depthImage.view,
+                exrExportResources_.uniformBuffer.buffer);
             pendingBaseGenerations.push_back(
                 std::move(pendingBase));
         }
@@ -6279,7 +6283,8 @@ void VulkanViewportShell::PollWaterSurfacePreprocess() {
                 pendingBase.generation =
                     BuildPointDescriptorGeneration(
                         &pointResources,
-                        exrExportResources_.depthImage.view);
+                        exrExportResources_.depthImage.view,
+                        exrExportResources_.uniformBuffer.buffer);
                 pendingBaseContactGenerations.push_back(
                     std::move(pendingBase));
             }
@@ -6562,7 +6567,14 @@ bool VulkanViewportShell::HasGaussianSplats() const {
 invisible_places::output::HalfRgbaExrImage VulkanViewportShell::RenderPointCloudExrFrame(
     const PointCloudExrFrameRequest& request) {
     if (!BeginPointCloudExrFrame(request)) {
-        throw std::runtime_error{"GPU EXR export already has a frame in flight."};
+        // A cancelled or failed export job can abandon a submitted frame.
+        // Synchronous rendering only runs when no job owns the EXR pipeline,
+        // so drain the stale frame and retry once instead of latching every
+        // future preview shut.
+        CancelPointCloudExrFrame();
+        if (!BeginPointCloudExrFrame(request)) {
+            throw std::runtime_error{"GPU EXR export already has a frame in flight."};
+        }
     }
     Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr complete)");
     return CompletePointCloudExrFrame();
@@ -6591,9 +6603,17 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
     }
     const VkResult existingFenceStatus = vkGetFenceStatus(device_, exrExportResources_.fence);
     if (existingFenceStatus == VK_NOT_READY) {
-        return false;
+        if (exrExportFrameInFlight_) {
+            // A genuinely running asynchronous export frame.
+            return false;
+        }
+        // Unsignalled with no submission pending: a previous Begin threw
+        // between vkResetFences and vkQueueSubmit. The fence is inert, so
+        // treat it as idle (the wait below is skipped) instead of refusing
+        // every future export until the resources are recreated.
+    } else {
+        Check(existingFenceStatus, "vkGetFenceStatus(exr idle)");
     }
-    Check(existingFenceStatus, "vkGetFenceStatus(exr idle)");
     // EXR owns a separate parameter snapshot. The fence above guarantees a
     // previous asynchronous export is no longer reading it.
     FlushSparseWaterRippleParamsForExr();
@@ -6623,7 +6643,9 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
             }
         }
 
-        Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr)");
+        if (existingFenceStatus == VK_SUCCESS) {
+            Check(vkWaitForFences(device_, 1, &exrExportResources_.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(exr)");
+        }
         Check(vkResetFences(device_, 1, &exrExportResources_.fence), "vkResetFences(exr)");
         Check(
             vkResetCommandBuffer(exrExportResources_.commandBuffer, 0),
@@ -8748,7 +8770,10 @@ void VulkanViewportShell::CreateExrExportResources(std::uint32_t width, std::uin
         stagedPointGenerations.reserve(pointCloudResources_.size());
         for (auto& pointResources : pointCloudResources_) {
             stagedPointGenerations.push_back(
-                BuildPointDescriptorGeneration(&pointResources, resources.depthImage.view));
+                BuildPointDescriptorGeneration(
+                    &pointResources,
+                    resources.depthImage.view,
+                    resources.uniformBuffer.buffer));
         }
         for (std::size_t index = 0U; index < pointCloudResources_.size(); ++index) {
             if (stagedPointGenerations[index].descriptorPool == VK_NULL_HANDLE ||
@@ -10203,7 +10228,10 @@ void VulkanViewportShell::ReplacePointCloudDescriptorSets(ActivePointCloudResour
         return;
     }
 
-    auto pending = BuildPointDescriptorGeneration(resources, exrExportResources_.depthImage.view);
+    auto pending = BuildPointDescriptorGeneration(
+        resources,
+        exrExportResources_.depthImage.view,
+        exrExportResources_.uniformBuffer.buffer);
     try {
         SettlePointCloudMutation();
     } catch (...) {
@@ -10214,7 +10242,8 @@ void VulkanViewportShell::ReplacePointCloudDescriptorSets(ActivePointCloudResour
 }
 
 VulkanViewportShell::PendingPointDescriptorGeneration
-VulkanViewportShell::BuildPointDescriptorGeneration(ActivePointCloudResources* resources, VkImageView exrDepthView) {
+VulkanViewportShell::BuildPointDescriptorGeneration(ActivePointCloudResources* resources, VkImageView exrDepthView,
+                                                    VkBuffer exrFrameUniformBuffer) {
     if (resources == nullptr) {
         throw std::runtime_error{"Cannot build descriptors for a null point cloud."};
     }
@@ -10263,7 +10292,8 @@ VulkanViewportShell::BuildPointDescriptorGeneration(ActivePointCloudResources* r
             pending.highlightSeepageDescriptorGenerations[index] = std::move(highlight.seepageDescriptorGenerations);
         }
         if (exrDepthView != VK_NULL_HANDLE) {
-            UpdatePointCloudExrDescriptorSet(resources, exrDepthView, pending.descriptorPool);
+            UpdatePointCloudExrDescriptorSet(
+                resources, exrDepthView, exrFrameUniformBuffer, pending.descriptorPool);
             pending.exrDescriptorSet = resources->exrDescriptorSet;
             pending.seepageExrDescriptorGeneration = resources->seepageExrDescriptorGeneration;
         }
@@ -11756,9 +11786,21 @@ void VulkanViewportShell::UpdatePointHighlightDescriptorSet(
 void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
     ActivePointCloudResources* resources,
     VkImageView sceneDepthView,
+    VkBuffer exrFrameUniformBuffer,
     VkDescriptorPool allocationPool) {
     if (resources == nullptr) {
         return;
+    }
+    // The frame uniform buffer must be passed explicitly: during EXR resource
+    // recreation the settled exrExportResources_ member still holds the OLD
+    // (or empty) uniform buffer while the staged descriptor generations are
+    // built. Binding the member here silently attached every EXR descriptor
+    // set to a destroyed buffer, and the export then rendered every point
+    // layer with garbage view-projection uniforms - empty frames while rain
+    // (whose descriptor rebinds each Begin) kept rendering.
+    if (exrFrameUniformBuffer == VK_NULL_HANDLE) {
+        throw std::runtime_error{
+            "Point EXR descriptor update requires the frame uniform buffer."};
     }
 
     if (resources->exrDescriptorSet == VK_NULL_HANDLE) {
@@ -11777,7 +11819,7 @@ void VulkanViewportShell::UpdatePointCloudExrDescriptorSet(
             "vkAllocateDescriptorSets(point exr)");
     }
 
-    VkDescriptorBufferInfo uniformInfo{exrExportResources_.uniformBuffer.buffer, 0, sizeof(FrameUniforms)};
+    VkDescriptorBufferInfo uniformInfo{exrFrameUniformBuffer, 0, sizeof(FrameUniforms)};
     VkDescriptorBufferInfo scalarInfo{resources->scalarFieldBuffer.buffer, 0, resources->scalarFieldBuffer.size};
     VkDescriptorBufferInfo styleInfo{resources->exrStyleBuffer.buffer, 0, sizeof(PointCloudStyleGpu)};
     VkDescriptorBufferInfo positionStorageInfo{
@@ -13024,14 +13066,23 @@ void VulkanViewportShell::RecreateSwapchain() {
 }
 
 bool VulkanViewportShell::ResolvePointCloudDrawPlan(const SceneRenderState::PointCloudLayerState& layer,
-                                                    bool forceFullSource, PointCloudDrawPlan* plan) {
+                                                    bool forceFullSource, bool requireLiveDescriptors,
+                                                    PointCloudDrawPlan* plan) {
     if (plan == nullptr) {
         return false;
     }
     *plan = {};
 
     auto* resources = FindPointCloudResources(layer.layerId);
-    if (resources == nullptr || resources->activePointCount == 0 || resources->descriptorSets[0].empty()) {
+    if (resources == nullptr || resources->activePointCount == 0) {
+        return false;
+    }
+    // The live per-frame descriptor array tracks the swapchain, which can be
+    // empty while the window is hidden or the live view is suspended during a
+    // long export. The EXR pass binds its own exrDescriptorSet (checked at
+    // draw time), so only live recording may treat an empty array as
+    // "not drawable" — otherwise an export silently drops every layer.
+    if (requireLiveDescriptors && resources->descriptorSets[0].empty()) {
         return false;
     }
     if (resources->dynamicMeshFlowAllocationRevision != 0U &&
@@ -13625,7 +13676,7 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         *recordedDrawPointCount = 0;
     }
     PointCloudDrawPlan plan;
-    if (!ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
+    if (!ResolvePointCloudDrawPlan(layer, forceFullSource, !exrStyle, &plan)) {
         return false;
     }
     auto* resources = plan.resources;
@@ -13879,6 +13930,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         resources.framebuffer == VK_NULL_HANDLE) {
         throw std::runtime_error{"GPU EXR export resources are not initialized."};
     }
+    exrLastRecordedLayerCount_ = 0U;
+    exrLastRecordedPointCount_ = 0U;
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     Check(vkBeginCommandBuffer(resources.commandBuffer, &beginInfo), "vkBeginCommandBuffer(exr)");
@@ -13904,11 +13957,24 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         renderState_.pointCloudRendererMode ==
         renderer::pointcloud::PointCloudRendererMode::FastBasic;
     const bool forceFullSource = !request.previewDensity && !fastBasicPointRenderer;
+    std::uint32_t drawablePointLayerCount = 0U;
     for (const auto& layer : renderState_.pointCloudLayers) {
         PointCloudDrawPlan plan;
-        if (ResolvePointCloudDrawPlan(layer, forceFullSource, &plan)) {
+        if (ResolvePointCloudDrawPlan(layer, forceFullSource, false, &plan)) {
+            ++drawablePointLayerCount;
             static_cast<void>(UploadPointCloudLayerStyle(layer, plan, 0U, 0U, true));
         }
+    }
+    // A frame that would draw no point-cloud layer at all must fail loudly:
+    // rain and other overlay passes record independently, so silently
+    // dropping every layer produces effect-only frames that look like a
+    // successful export.
+    if (drawablePointLayerCount == 0U) {
+        throw std::runtime_error{
+            "GPU EXR export: none of the " +
+            std::to_string(renderState_.pointCloudLayers.size()) +
+            " point-cloud layers is drawable (GPU resources missing or "
+            "empty)."};
     }
     UploadRainUniformsToBuffer(
         rainResources_.exrUniformBuffer,
@@ -13989,16 +14055,21 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             spritePipeline = resources.pointConstantSimpleAccumulationPipeline;
             surfelPipeline = resources.surfelConstantSimpleAccumulationPipeline;
         }
-        static_cast<void>(RecordPointCloudLayerDraw(
-            resources.commandBuffer,
-            layer,
-            forceFullSource,
-            spritePipeline,
-            surfelPipeline,
-            false,
-            0U,
-            0U,
-            true));
+        std::uint32_t recordedDrawPointCount = 0U;
+        if (RecordPointCloudLayerDraw(
+                resources.commandBuffer,
+                layer,
+                forceFullSource,
+                spritePipeline,
+                surfelPipeline,
+                false,
+                0U,
+                0U,
+                true,
+                &recordedDrawPointCount)) {
+            ++exrLastRecordedLayerCount_;
+            exrLastRecordedPointCount_ += recordedDrawPointCount;
+        }
     }
     }
     RecordRainDrawWithDescriptor(
@@ -14030,16 +14101,21 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
 
     if (fastBasicPointRenderer) {
         for (const auto& layer : renderState_.pointCloudLayers) {
-            static_cast<void>(RecordPointCloudLayerDraw(
-                resources.commandBuffer,
-                layer,
-                forceFullSource,
-                resources.pointFastBasicPipeline,
-                VK_NULL_HANDLE,
-                false,
-                0U,
-                0U,
-                true));
+            std::uint32_t recordedDrawPointCount = 0U;
+            if (RecordPointCloudLayerDraw(
+                    resources.commandBuffer,
+                    layer,
+                    forceFullSource,
+                    resources.pointFastBasicPipeline,
+                    VK_NULL_HANDLE,
+                    false,
+                    0U,
+                    0U,
+                    true,
+                    &recordedDrawPointCount)) {
+                ++exrLastRecordedLayerCount_;
+                exrLastRecordedPointCount_ += recordedDrawPointCount;
+            }
         }
     }
 
@@ -14154,7 +14230,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     if (drawLiveScene) {
         for (const auto& layer : renderState_.pointCloudLayers) {
             PointCloudDrawPlan plan;
-            if (ResolvePointCloudDrawPlan(layer, false, &plan) &&
+            if (ResolvePointCloudDrawPlan(layer, false, true, &plan) &&
                 UploadPointCloudLayerStyle(layer, plan, frameIndex, imageIndex, false)) {
                 if (collectDiagnostics) {
                     ++pointStyleUploadCount;
