@@ -69,6 +69,22 @@ struct RainRockImpactSettings {
     float persistence = 1.35F;
 };
 
+// Finite sentinel for an open band edge. JSON cannot round-trip IEEE
+// infinity, so unbounded edges persist as this value instead.
+inline constexpr float kRainImpactBandUnbounded = 1.0e8F;
+
+// World-Z window inside which a role's impact effect applies at full
+// strength; the effect fades linearly to zero over fadeMeters beyond each
+// bounded edge (so maxZ = 2.0 with fade 0.3 reaches zero at Z = 2.3).
+struct RainImpactHeightBand {
+    float minZ = -kRainImpactBandUnbounded;
+    float maxZ = kRainImpactBandUnbounded;
+    float fadeMeters = 0.30F;
+};
+
+[[nodiscard]] RainImpactHeightBand SanitizeRainImpactHeightBand(
+    RainImpactHeightBand band);
+
 struct RainVegetationImpactSettings {
     float twinkle = 1.80F;
     float propagationMetersPerSecond = 0.65F;
@@ -112,6 +128,9 @@ struct RainRuntimeSettings {
     RainNearSurfaceSettings nearSurface{};
     RainRockImpactSettings rockImpact{};
     RainVegetationImpactSettings vegetationImpact{};
+    RainImpactHeightBand sandImpactBand{-kRainImpactBandUnbounded, 2.0F, 0.30F};
+    RainImpactHeightBand rockImpactBand{1.5F, 2.4F, 0.30F};
+    RainImpactHeightBand vegetationImpactBand{2.5F, kRainImpactBandUnbounded, 0.30F};
 };
 
 struct RainIntensityMultipliers {

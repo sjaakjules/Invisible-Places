@@ -10201,7 +10201,22 @@ WaterOverlayPoint InterpolatePreparedPathByArcLength(
         (distanceMeters - previousDistance) / segmentLength,
         0.0F,
         1.0F);
-    return BlendPathAnchor(path[index - 1U], path[index], t);
+    auto blended = BlendPathAnchor(path[index - 1U], path[index], t);
+    // Spline the position through the neighbouring anchors (with reflected
+    // endpoint phantoms) instead of lerping: cached emitter-path anchors are
+    // coarse enough that a lerp puts a visible corner at every anchor, and
+    // trails then run down chains of straight segments on curvy paths. Scalar
+    // fields stay linearly blended. GPU parity: FlowEvaluateAuthored in
+    // water_flow_gpu_common.glsl splines both input kinds identically.
+    const glm::vec3 p1 = ToGlm(path[index - 1U].position);
+    const glm::vec3 p2 = ToGlm(path[index].position);
+    const glm::vec3 p0 =
+        index >= 2U ? ToGlm(path[index - 2U].position) : p1 + (p1 - p2);
+    const glm::vec3 p3 = index + 1U < path.size()
+                             ? ToGlm(path[index + 1U].position)
+                             : p2 + (p2 - p1);
+    blended.position = FromGlm(InterpolateCentripetalCatmullRom(p0, p1, p2, p3, t));
+    return blended;
 }
 
 glm::vec3 TangentAtPreparedPathDistance(

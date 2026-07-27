@@ -92,6 +92,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactRock1;
     vec4 rainImpactVegetation0;
     vec4 rainImpactVegetation1;
+    vec4 rainImpactSandBand;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"

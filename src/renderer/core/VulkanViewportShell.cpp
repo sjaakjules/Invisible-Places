@@ -141,9 +141,13 @@ struct alignas(16) PointCloudStyleGpu {
     // xy: grid origin, z: cell size, w: animation time.
     glm::vec4 rainImpactGrid{0.0F, 0.0F, 0.125F, 0.0F};
     glm::vec4 rainImpactRock0{0.35F, 1.60F, 0.65F, 0.75F};
-    glm::vec4 rainImpactRock1{1.35F, 0.0F, 0.0F, 0.0F};
+    // x: persistence; yzw: ROCK height band [minZ, maxZ, fadeMeters].
+    glm::vec4 rainImpactRock1{1.35F, 1.5F, 2.4F, 0.30F};
     glm::vec4 rainImpactVegetation0{1.80F, 0.65F, 0.070F, 0.010F};
-    glm::vec4 rainImpactVegetation1{0.65F, 0.0F, 0.0F, 0.0F};
+    // x: stream spread; yzw: VEG height band [minZ, maxZ, fadeMeters].
+    glm::vec4 rainImpactVegetation1{0.65F, 2.5F, 1.0e8F, 0.30F};
+    // xyz: SAND height band [minZ, maxZ, fadeMeters].
+    glm::vec4 rainImpactSandBand{-1.0e8F, 2.0F, 0.30F, 0.0F};
 };
 
 struct alignas(16) RainUniformsGpu {
@@ -13608,11 +13612,13 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         std::clamp(rockImpact.centreFalloff, 0.0F, 1.0F),
         std::clamp(rockImpact.heightBias, 0.0F, 2.0F),
     };
+    const auto rockBand = invisible_places::water::SanitizeRainImpactHeightBand(
+        renderState_.rainSettings.rockImpactBand);
     styleGpu.rainImpactRock1 = glm::vec4{
         std::clamp(rockImpact.persistence, 0.25F, 3.0F),
-        0.0F,
-        0.0F,
-        0.0F,
+        rockBand.minZ,
+        rockBand.maxZ,
+        rockBand.fadeMeters,
     };
     const auto& vegetationImpact = renderState_.rainSettings.vegetationImpact;
     styleGpu.rainImpactVegetation0 = glm::vec4{
@@ -13621,10 +13627,20 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         std::clamp(vegetationImpact.hopSpacingMeters, 0.010F, 0.30F),
         std::max(0.001F, vegetationImpact.streamWidthMeters),
     };
+    const auto vegetationBand = invisible_places::water::SanitizeRainImpactHeightBand(
+        renderState_.rainSettings.vegetationImpactBand);
     styleGpu.rainImpactVegetation1 = glm::vec4{
         std::clamp(vegetationImpact.streamSpread, 0.0F, 2.0F),
-        0.0F,
-        0.0F,
+        vegetationBand.minZ,
+        vegetationBand.maxZ,
+        vegetationBand.fadeMeters,
+    };
+    const auto sandBand = invisible_places::water::SanitizeRainImpactHeightBand(
+        renderState_.rainSettings.sandImpactBand);
+    styleGpu.rainImpactSandBand = glm::vec4{
+        sandBand.minZ,
+        sandBand.maxZ,
+        sandBand.fadeMeters,
         0.0F,
     };
     styleGpu.pointSize = MakePointCloudBindingGpu(

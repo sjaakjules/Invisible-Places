@@ -491,7 +491,7 @@ void FlowEvaluateAuthored(
     const float local = branch.identity.w == 1u
         ? FlowManualSegmentParameter(segmentDistance, a.outgoingArcDistances)
         : clamp(segmentDistance / denominator, 0.0, 1.0);
-    if (branch.identity.w == 1u) {
+    {
         const vec3 p1 = a.positionDistance.xyz;
         const vec3 p2 = b.positionDistance.xyz;
         // Match the CPU builder's extrapolated endpoint phantoms. Duplicating
@@ -502,9 +502,10 @@ void FlowEvaluateAuthored(
         const vec3 p3 = localSegment + 2u < count
             ? flowInput.points[segment + 2u].positionDistance.xyz
             : p2 + (p2 - p1);
+        // Sampled emitter anchors spline exactly like manual control points:
+        // lerping cached anchors put a visible corner at every anchor, so
+        // trails ran down chains of straight segments on curvy paths.
         position = FlowCentripetalCatmullRom(p0, p1, p2, p3, local);
-    } else {
-        position = mix(a.positionDistance.xyz, b.positionDistance.xyz, local);
     }
     normal = FlowSafeNormalize(
         mix(a.normalConfidence.xyz, b.normalConfidence.xyz, local),

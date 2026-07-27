@@ -254,6 +254,23 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         return composite;
     }
 
+    // Per-role world-Z band: full strength inside [minZ, maxZ], fading
+    // linearly to zero over fadeMeters beyond each bounded edge. Open edges
+    // carry a huge finite sentinel so their clamp term stays 1.
+    vec3 band = styleData.rainImpactSandBand.xyz;
+    if (role == kRainRoleRock) {
+        band = styleData.rainImpactRock1.yzw;
+    } else if (role == kRainRoleVegetation) {
+        band = styleData.rainImpactVegetation1.yzw;
+    }
+    const float bandFade = max(1.0e-3, band.z);
+    const float bandWeight =
+        clamp((point.z - (band.x - bandFade)) / bandFade, 0.0, 1.0) *
+        clamp(((band.y + bandFade) - point.z) / bandFade, 0.0, 1.0);
+    if (bandWeight <= 0.0) {
+        return composite;
+    }
+
     const float time = styleData.rainImpactGrid.w;
     float rockPeak = 0.0;
     float rockRemaining = 1.0;
@@ -321,7 +338,7 @@ RainImpactComposite ResolveRainImpactComposite(vec3 point, vec3 pointNormal) {
         } else {
             value = RainVegetationSprinkleValue(event, point, pointNormal, age);
         }
-        value *= event.lifetimeEnergy.y;
+        value *= event.lifetimeEnergy.y * bandWeight;
         if (role == kRainRoleRock) {
             // Preserve the strongest individual contribution while softly
             // filling overlap. Adding another retained impact therefore

@@ -4699,13 +4699,23 @@ json SerializeWaterRainSettings(
           {"spread_speed", settings.rockImpact.spreadSpeed},
           {"centre_falloff", settings.rockImpact.centreFalloff},
           {"height_bias", settings.rockImpact.heightBias},
-          {"persistence", settings.rockImpact.persistence}}},
+          {"persistence", settings.rockImpact.persistence},
+          {"band_min_z", settings.rockImpactBand.minZ},
+          {"band_max_z", settings.rockImpactBand.maxZ},
+          {"band_fade_meters", settings.rockImpactBand.fadeMeters}}},
         {"vegetation_impact",
          {{"twinkle", settings.vegetationImpact.twinkle},
           {"propagation_meters_per_second", settings.vegetationImpact.propagationMetersPerSecond},
           {"hop_spacing_meters", settings.vegetationImpact.hopSpacingMeters},
           {"stream_width_meters", settings.vegetationImpact.streamWidthMeters},
-          {"stream_spread", settings.vegetationImpact.streamSpread}}},
+          {"stream_spread", settings.vegetationImpact.streamSpread},
+          {"band_min_z", settings.vegetationImpactBand.minZ},
+          {"band_max_z", settings.vegetationImpactBand.maxZ},
+          {"band_fade_meters", settings.vegetationImpactBand.fadeMeters}}},
+        {"sand_impact",
+         {{"band_min_z", settings.sandImpactBand.minZ},
+          {"band_max_z", settings.sandImpactBand.maxZ},
+          {"band_fade_meters", settings.sandImpactBand.fadeMeters}}},
         {"visual_profile",
          {{"colour", visual.colour},
           {"width_meters", visual.widthMeters},
@@ -4804,6 +4814,11 @@ RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
             tuning.value("height_bias", settings.rockImpact.heightBias), 0.0F, 2.0F);
         settings.rockImpact.persistence = std::max(
             0.05F, tuning.value("persistence", settings.rockImpact.persistence));
+        settings.rockImpactBand = invisible_places::water::SanitizeRainImpactHeightBand({
+            tuning.value("band_min_z", settings.rockImpactBand.minZ),
+            tuning.value("band_max_z", settings.rockImpactBand.maxZ),
+            tuning.value("band_fade_meters", settings.rockImpactBand.fadeMeters),
+        });
     }
     if (version >= 3 && settingsJson.contains("vegetation_impact") &&
         settingsJson.at("vegetation_impact").is_object()) {
@@ -4823,6 +4838,20 @@ RainRuntimeSettings ParseWaterRainSettings(const json& settingsJson) {
             tuning.value("stream_width_meters", settings.vegetationImpact.streamWidthMeters));
         settings.vegetationImpact.streamSpread = std::clamp(
             tuning.value("stream_spread", settings.vegetationImpact.streamSpread), 0.0F, 2.0F);
+        settings.vegetationImpactBand = invisible_places::water::SanitizeRainImpactHeightBand({
+            tuning.value("band_min_z", settings.vegetationImpactBand.minZ),
+            tuning.value("band_max_z", settings.vegetationImpactBand.maxZ),
+            tuning.value("band_fade_meters", settings.vegetationImpactBand.fadeMeters),
+        });
+    }
+    if (version >= 3 && settingsJson.contains("sand_impact") &&
+        settingsJson.at("sand_impact").is_object()) {
+        const auto& tuning = settingsJson.at("sand_impact");
+        settings.sandImpactBand = invisible_places::water::SanitizeRainImpactHeightBand({
+            tuning.value("band_min_z", settings.sandImpactBand.minZ),
+            tuning.value("band_max_z", settings.sandImpactBand.maxZ),
+            tuning.value("band_fade_meters", settings.sandImpactBand.fadeMeters),
+        });
     }
     return settings;
 }

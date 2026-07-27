@@ -1493,6 +1493,21 @@ RainRuntimeSettings DefaultRainRuntimeSettings() {
     return {};
 }
 
+RainImpactHeightBand SanitizeRainImpactHeightBand(RainImpactHeightBand band) {
+    if (!std::isfinite(band.minZ)) {
+        band.minZ = -kRainImpactBandUnbounded;
+    }
+    if (!std::isfinite(band.maxZ)) {
+        band.maxZ = kRainImpactBandUnbounded;
+    }
+    band.minZ = std::clamp(band.minZ, -kRainImpactBandUnbounded, kRainImpactBandUnbounded);
+    band.maxZ = std::clamp(band.maxZ, band.minZ, kRainImpactBandUnbounded);
+    band.fadeMeters = std::isfinite(band.fadeMeters)
+                          ? std::clamp(band.fadeMeters, 0.01F, 5.0F)
+                          : 0.30F;
+    return band;
+}
+
 RainParticleVisualShape EvaluateRainParticleVisualShape(
     float authoredWidthMeters,
     float authoredLengthMeters,
