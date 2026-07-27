@@ -244,9 +244,19 @@ float WaterTrailVisibility(uint pointIndex) {
     const float routeLength = max(0.001, LoadScalarFieldValueForPoint(kWaterTrailRouteLengthFieldSlot, pointIndex));
     const float trailStreakLength = WaterTrailStreakLength(pointIndex);
     const float endFeather = clamp(trailStreakLength / routeLength, 0.001, 0.10);
-    const float routeEndFade = 1.0 - smoothstep(1.0 - endFeather, 1.0, phase);
+    const bool meshTrail =
+        abs(LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex) - 5.0) < 0.5;
+    // Mesh trails are continuous streams whose anchors accumulate a start
+    // phase up to 1.0, so the raw phase spends most of each cycle above the
+    // route end and an unwrapped fade hides the tail almost permanently.
+    // The drawn position already wraps via fract; fade on the same wrapped
+    // phase, with a short fade-in so the wrap does not pop at the seed.
+    const float fadePhase = meshTrail ? fract(phase) : phase;
+    const float routeEndFade =
+        (1.0 - smoothstep(1.0 - endFeather, 1.0, fadePhase)) *
+        (meshTrail ? smoothstep(0.0, endFeather * 0.5, fadePhase) : 1.0);
     const float meshTerminalFade =
-        abs(LoadScalarFieldValueForPoint(kWaterTrailFeatureTypeFieldSlot, pointIndex) - 5.0) < 0.5
+        meshTrail
             ? clamp(
                   LoadScalarFieldValueForPoint(
                       kWaterTrailConfidenceFieldSlot,

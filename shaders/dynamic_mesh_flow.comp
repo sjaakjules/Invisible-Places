@@ -353,10 +353,13 @@ MeshFlowVisualWeights EvaluateVisualWeights(
     const float concavityAcceptance = 0.02 + 0.98 * rill;
     const float rillCoherence = rill * mix(0.68, 0.92, wet);
     // Activity and the dry appearance uniforms already provide sparsity.
-    // Preserve sub-pixel coverage on the flat +X entry band, while making
-    // dry convergent cells substantially more persistent than open Ground.
-    const float openProminence = 0.12;
-    const float rillProminence = mix(0.90, 0.70, wet);
+    // Prominence multiplies the trail's authored opacity AND emission in every
+    // point pipeline (and the Fast Basic sprite size via sqrt), so its floor
+    // decides whether trails read at all: the previous 0.12 open-Ground value
+    // rendered the authored 0.14 wet opacity at ~1.5% alpha. Keep rills
+    // emphasised, but never crush a live trail below roughly half strength.
+    const float openProminence = 0.50;
+    const float rillProminence = mix(0.95, 0.85, wet);
 
     MeshFlowVisualWeights result;
     result.spawnAcceptance =
@@ -365,7 +368,7 @@ MeshFlowVisualWeights EvaluateVisualWeights(
         mix(1.0, 0.25, rillCoherence);
     result.trailProminence =
         mix(openProminence, rillProminence, rill) *
-        (0.68 + 0.32 * confidence);
+        (0.85 + 0.15 * confidence);
     result.trailWidthScale =
         mix(0.72, 1.15, rill) * mix(0.90, 1.04, wet);
     result.trailStreakScale =
