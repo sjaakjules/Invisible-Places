@@ -423,7 +423,10 @@ struct AnimationPanelState {
     bool previewDepthOfField = false;
     bool dirty = false;
     bool showSplines = true;
-    bool exportPreviewDensity = true;
+    // Final exports must render the full-density source bundle the export
+    // gate loads; playback-density decimation is an explicit opt-in for
+    // fast test renders only.
+    bool exportPreviewDensity = false;
     bool exportSizeInitialized = false;
     std::filesystem::path lastHoudiniCameraScriptPath;
     std::filesystem::path lastHoudiniCameraExportDirectory;
@@ -24367,7 +24370,7 @@ const char* AnimationExportModeLabel(invisible_places::output::AnimationExportMo
         case invisible_places::output::AnimationExportMode::FastPngStack:
             return "Fast PNG Stack";
         case invisible_places::output::AnimationExportMode::HqPreviewDensityExr:
-            return "HQ Preview-Density EXR";
+            return "HQ EXR";
         case invisible_places::output::AnimationExportMode::ProRes422Mov:
             return "ProRes 422";
         case invisible_places::output::AnimationExportMode::ProRes422HqMov:
@@ -28795,9 +28798,19 @@ void DrawAnimationExportSection(
         ImGui::TextDisabled("Point density: full source inside the export frustum; off-camera points are skipped when useful.");
     } else {
         ImGui::SameLine();
-        ImGui::Checkbox("Preview Density", &panel.exportPreviewDensity);
+        ImGui::Checkbox("Playback Density (fast preview)", &panel.exportPreviewDensity);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Uses the same draw counts and interactive sample buffers as animation playback.");
+            ImGui::SetTooltip(
+                "DECIMATES the export to the same draw counts as live animation playback.\n"
+                "Leave off for final renders: exports then draw the full-density source\n"
+                "bundle (1mm) that the export loader prepares.");
+        }
+        if (panel.exportPreviewDensity) {
+            ImGui::TextColored(
+                ImVec4{0.86F, 0.62F, 0.16F, 1.0F},
+                "Preview: frames are decimated to playback density, not the full source cloud.");
+        } else {
+            ImGui::TextDisabled("Point density: full source bundle (finest complete density per scene).");
         }
     }
     const bool framePreviewDisabled =
@@ -41095,11 +41108,44 @@ void DrawDebugExportSection(PreviewRuntimeState* runtimeState) {
     auto& job = runtimeState->offlineRenderJob;
     if (!job.active) {
         ImGui::TextDisabled("No export job is running.");
+        ImGui::SeparatorText("Export Sources");
+        bool anyCandidate = false;
+        for (std::size_t sessionIndex = 0;
+             sessionIndex < runtimeState->sessions.size();
+             ++sessionIndex) {
+            if (!IsExportPointCloudSourceCandidate(*runtimeState, sessionIndex)) {
+                continue;
+            }
+            anyCandidate = true;
+            const auto& session = runtimeState->sessions[sessionIndex];
+            const bool ready =
+                IsGpuAnimationExportPointCloudSourceReady(*runtimeState, sessionIndex);
+            ImGui::TextWrapped(
+                "%s %s (%.1fM points)",
+                ready ? "[ready]" : "[loads on export]",
+                session.sourcePath.filename().string().c_str(),
+                static_cast<double>(session.totalPrimitives) / 1.0e6);
+        }
+        if (!anyCandidate) {
+            ImGui::TextDisabled("No export point-cloud sources are available.");
+        }
         if (!job.lastOutputPath.empty()) {
             ImGui::TextWrapped("Last: %s", job.lastOutputPath.string().c_str());
         }
         EndPanelSection();
         return;
+    }
+    ImGui::SeparatorText("Rendering Layers");
+    for (const auto& layer : job.exportPointCloudLayers) {
+        if (layer.layerId >= runtimeState->sessions.size()) {
+            continue;
+        }
+        const auto& session = runtimeState->sessions[layer.layerId];
+        ImGui::TextWrapped(
+            "%s: drawing %.1fM / %.1fM points",
+            session.sourcePath.filename().string().c_str(),
+            static_cast<double>(layer.drawPointCount) / 1.0e6,
+            static_cast<double>(session.totalPrimitives) / 1.0e6);
     }
     RefreshAnimationExportWriterProgress(&job);
     if (job.preparingExport && job.preparationState != nullptr) {
