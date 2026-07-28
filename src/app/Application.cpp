@@ -669,6 +669,7 @@ struct OfflineRenderJobState {
     };
     struct FrozenFlowSourceLayer {
         std::size_t layerId = 0U;
+        std::uint32_t sourceId = 0U;
         float maximumFlowStrength = 1.0F;
         float rainResponse = 0.0F;
         bool sourceShowTrail = true;
@@ -682,6 +683,9 @@ struct OfflineRenderJobState {
     // per-frame keyed-setting overlay is deterministic for the whole export.
     std::vector<invisible_places::water::WaterFeatureTimingRun>
         frozenFeatureTimingRuns;
+    // Scrub position at job creation: animation-less jobs (stills, frame
+    // previews) evaluate the keyed overlay here, not at zero.
+    float frozenNormalizedTime = 0.0F;
     invisible_places::water::WaterSeepageRainEnvelope seepageRainEnvelope{};
     invisible_places::water::WaterMeshFlowRainEnvelope meshFlowRainEnvelope{};
     std::uint64_t effectiveSeepageInvocations = 0U;
@@ -1929,6 +1933,25 @@ SnapshotActiveWaterFeatureTimingRuns(
     const auto* entry = FindScenarioFeatureRuns(
         runtimeState.water,
         ActiveWaterTimingScenarioId(runtimeState));
+    if (entry == nullptr) {
+        return {};
+    }
+    return entry->runs;
+}
+
+// Snapshot for a job exporting a specific animation, which may not be the
+// one loaded in the panel: the runs follow THAT animation's scenario.
+std::vector<invisible_places::water::WaterFeatureTimingRun>
+SnapshotWaterFeatureTimingRunsForAnimation(
+    const PreviewRuntimeState& runtimeState,
+    const std::optional<AnimationPath>& animationPath) {
+    const std::string scenarioId =
+        animationPath.has_value() &&
+                !animationPath->selectedWaterScenarioId.empty()
+            ? animationPath->selectedWaterScenarioId
+            : runtimeState.water.selectedSeepageScenarioId;
+    const auto* entry =
+        FindScenarioFeatureRuns(runtimeState.water, scenarioId);
     if (entry == nullptr) {
         return {};
     }
@@ -23873,10 +23896,31 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
         if (layerIt == renderState.pointCloudLayers.end()) {
             continue;
         }
+        // Keyed per-source values override the frozen authored parameters
+        // per frame so exports match the preview.
+        float frozenStrength = frozenSource.maximumFlowStrength;
+        float frozenResponse = frozenSource.rainResponse;
+        for (const auto kind :
+             {invisible_places::water::WaterKeyedFeatureKind::FlowSource,
+              invisible_places::water::WaterKeyedFeatureKind::FlowPath}) {
+            const invisible_places::water::WaterKeyedFeatureId feature{
+                .kind = kind,
+                .objectId = frozenSource.sourceId};
+            if (const auto* keyed =
+                    waterFrame.featureOverlay.Find(feature, "strength");
+                keyed != nullptr) {
+                frozenStrength = std::max(0.0F, *keyed);
+            }
+            if (const auto* keyed =
+                    waterFrame.featureOverlay.Find(feature, "rain_response");
+                keyed != nullptr) {
+                frozenResponse = std::max(0.0F, *keyed);
+            }
+        }
         layerIt->style.waterFlowActivity = invisible_places::water::EffectiveWaterFlowActivity(
             scenarioState,
-            frozenSource.maximumFlowStrength,
-            frozenSource.rainResponse,
+            frozenStrength,
+            frozenResponse,
             frozenSource.sourceShowTrail,
             frozenSource.globalShowTrails);
     }
@@ -24121,6 +24165,8 @@ bool RenderCurrentAnimationFramePreview(
         runtimeState->exportUsesEditedScenario);
     job.frozenFeatureTimingRuns =
         SnapshotActiveWaterFeatureTimingRuns(*runtimeState);
+    job.frozenNormalizedTime =
+        std::clamp(runtimeState->animationPanel.scrubAmount, 0.0F, 1.0F);
     job.seepageRainEnvelope = BuildFrozenAnimationSeepageRainEnvelope(
         job.animationPath,
         job.waterScenarios);
@@ -26890,6 +26936,7 @@ std::vector<OfflineRenderJobState::FrozenFlowSourceLayer> BuildFrozenAnimationFl
         }
         frozen.push_back({
             .layerId = exportLayer.layerId,
+            .sourceId = session.waterFlowSourceId.value_or(0U),
             .maximumFlowStrength = parameters->maximumFlowStrength,
             .rainResponse = parameters->rainResponse,
             .sourceShowTrail = parameters->showTrail,
@@ -27091,6 +27138,9 @@ WaterFrameState ResolveFrozenWaterFrameState(
             result.sampleTimeSeconds / durationSeconds,
             0.0F,
             1.0F);
+    } else {
+        result.normalizedTime =
+            std::clamp(job.frozenNormalizedTime, 0.0F, 1.0F);
     }
 
     result.rawScenarioState = EvaluateFrozenAnimationWaterScenario(
@@ -27452,7 +27502,13 @@ bool StartQuickMp4ExportJob(
             *runtimeState,
             runtimeState->exportUsesEditedScenario),
         .frozenFeatureTimingRuns =
-            SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
+            SnapshotWaterFeatureTimingRunsForAnimation(
+                *runtimeState,
+                request.animationPath),
+        .frozenNormalizedTime = std::clamp(
+            runtimeState->animationPanel.scrubAmount,
+            0.0F,
+            1.0F),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -28139,6 +28195,10 @@ void StartStillCameraExportJob(
             runtimeState->exportUsesEditedScenario),
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
+        .frozenNormalizedTime = std::clamp(
+            runtimeState->animationPanel.scrubAmount,
+            0.0F,
+            1.0F),
         .exportVisualName = "Current View",
         .exportLog = MakeExportLogState(
             pngStackDirectory.empty() ? std::filesystem::path{settings.outputDirectory} : pngStackDirectory.parent_path(),
@@ -28393,6 +28453,10 @@ void StartAnimationExportJob(
             runtimeState->exportUsesEditedScenario),
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
+        .frozenNormalizedTime = std::clamp(
+            runtimeState->animationPanel.scrubAmount,
+            0.0F,
+            1.0F),
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
         .frozenFlowSourceLayers = std::move(frozenFlowSourceLayers),
@@ -40696,7 +40760,17 @@ void DrawWaterSeepagePanel(
         SeedWaterSeepageProfilePresets(&water);
     }
     ImGui::TextDisabled(
-        "Scenario selection, levels, and run keying live in the Timings tab.");
+        "Scenario selection and base levels live in the Timings tab.");
+    {
+        const auto scenario = ResolveActiveWaterScenarioState(*runtimeState);
+        DrawKeyedGlobalLevelRow(
+            runtimeState,
+            invisible_places::water::WaterKeyedFeatureKind::SeepageGlobal,
+            "Seepage Level (Keyed)",
+            scenario.has_value()
+                ? std::clamp(scenario->seepageLevel, 0.0F, 1.0F)
+                : 1.0F);
+    }
     ImGui::Spacing();
     if (BeginPanelSection("Seepage Nodes")) {
         if (ImGui::Button(water.seepagePlacementArmed ? "Click Viewport..." : "Place Seepage Node")) {
@@ -43963,6 +44037,16 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
     }
 
     if (BeginPanelSection("Import Runs", false)) {
+        if (scenarioId.empty()) {
+            ImGui::TextDisabled(
+                "Choose a water scenario above to import runs into.");
+            EndPanelSection();
+            return;
+        }
+        // The destination entry must exist BEFORE pointers into the
+        // per-scenario vector are taken: creating it later reallocates the
+        // vector and dangles every pointer collected below.
+        auto& entry = EnsureScenarioFeatureRuns(&water, scenarioId);
         std::vector<const invisible_places::water::WaterScenarioFeatureRuns*>
             otherScenarios;
         for (const auto& candidate : water.featureTimingRunsByScenario) {
@@ -44008,7 +44092,6 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             }
             const auto* source = otherScenarios[static_cast<std::size_t>(
                 timings.importScenarioIndex)];
-            auto& entry = EnsureScenarioFeatureRuns(&water, scenarioId);
             for (std::size_t runIndex = 0U; runIndex < source->runs.size();
                  ++runIndex) {
                 const auto& run = source->runs[runIndex];
@@ -44280,6 +44363,82 @@ void DrawTimingsPanel(PreviewRuntimeState* runtimeState) {
             DrawWaterSeepageParameterTooltip(
                 "Creates a new named scenario from the currently viewed (saved "
                 "or edited) state and selects it for this animation.");
+        }
+        EndPanelSection();
+    }
+
+    if (BeginPanelSection("Scenario Levels", false)) {
+        const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+        const auto* viewedScenario = scenarioId.empty()
+            ? nullptr
+            : ViewedWaterScenarioDefinition(water, scenarioId);
+        if (viewedScenario == nullptr) {
+            ImGui::TextDisabled(
+                "Choose a water scenario above to edit its base levels.");
+        } else {
+            // Base state under the keyed overlay: these edit the scenario's
+            // clone-on-edit shadow exactly like the removed per-panel
+            // sections did.
+            auto editedState = viewedScenario->state;
+            bool scenarioChanged = false;
+            scenarioChanged |= ImGui::SliderFloat(
+                "Seepage Level",
+                &editedState.seepageLevel,
+                0.0F,
+                1.0F,
+                "%.2f");
+            scenarioChanged |= ImGui::SliderFloat(
+                "Seepage Spread",
+                &editedState.seepageSpread,
+                0.0F,
+                1.0F,
+                "%.2f");
+            scenarioChanged |= ImGui::SliderFloat(
+                "Rain Level",
+                &editedState.rainLevel,
+                0.0F,
+                1.0F,
+                "%.2f");
+            scenarioChanged |= ImGui::SliderFloat(
+                "Flow Level",
+                &editedState.flowLevel,
+                0.0F,
+                1.0F,
+                "%.2f");
+            scenarioChanged |= ImGui::SliderFloat(
+                "Seepage Rain Delay",
+                &editedState.seepageRainDelaySeconds,
+                0.0F,
+                120.0F,
+                "%.1f s");
+            scenarioChanged |= ImGui::SliderFloat(
+                "Seepage Rain Rise",
+                &editedState.seepageRainRiseSeconds,
+                0.0F,
+                120.0F,
+                "%.1f s");
+            scenarioChanged |= ImGui::SliderFloat(
+                "Seepage Recession",
+                &editedState.seepageRainRecessionSeconds,
+                0.0F,
+                300.0F,
+                "%.1f s");
+            if (ImGui::TreeNode("Scenario Seepage Look")) {
+                scenarioChanged |= DrawWaterSeepageLookControls(
+                    &editedState.seepageLook);
+                ImGui::TreePop();
+            }
+            if (scenarioChanged) {
+                if (auto* state =
+                        EditWaterScenarioStateById(&water, scenarioId);
+                    state != nullptr) {
+                    *state = std::move(editedState);
+                }
+                InvalidateWaterSeepageParams(&water);
+                runtimeState->previewRenderStateSignatureValid = false;
+            }
+            ImGui::TextDisabled(
+                "These are the base values the keyed runs blend on top of.");
         }
         EndPanelSection();
     }
