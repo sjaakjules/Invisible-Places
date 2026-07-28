@@ -80,7 +80,7 @@ The authoritative `scene_point_cloud_groups` array records committed display sta
       "water_surface_cache": {
         "relative_path": "../Data/Scene1/.invisible_places/cache/water/example.surfacecache",
         "cache_schema": 4,
-        "algorithm_id": "water-surface-10mm-normal-average-ground-v3",
+        "algorithm_id": "water-surface-10mm-normal-average-ground-v4",
         "requested_rebuild_generation": 1,
         "built_rebuild_generation": 1
       },

@@ -464,6 +464,63 @@ public:
                 .flags = flags,
             });
         }
+        // Sampled Ground floating above authored terrain is only trusted
+        // where it is locally continuous: the smooth top surface curving over
+        // a rock brow stays within a few centimetres of its neighbourhood
+        // median, while the noisy mesh duplicating the rock face spikes far
+        // off it per 10 mm cell. Comparing against the neighbour median drops
+        // each rough floater alone — a smooth cell beside a spike keeps a
+        // smooth median and survives — so the terminal contact skin becomes
+        // the only Ground representation of the rock and trickles stop there
+        // instead of wandering across unreliable duplicated surface.
+        {
+            constexpr float kUpperOutlierToleranceMeters = 0.030F;
+            std::unordered_map<Cell2, float, Cell2Hash> heightByXy;
+            heightByXy.reserve(groundCandidates.size());
+            for (const auto& candidate : groundCandidates) {
+                heightByXy[{candidate.cellX, candidate.cellY}] =
+                    candidate.height;
+            }
+            std::erase_if(
+                groundCandidates,
+                [&](const WaterGroundCell& candidate) {
+                    if ((candidate.flags & kWaterGroundUpperFlag) == 0U) {
+                        return false;
+                    }
+                    std::array<float, 8> neighbourHeights{};
+                    std::size_t neighbourCount = 0U;
+                    for (std::int32_t offsetY = -1; offsetY <= 1;
+                         ++offsetY) {
+                        for (std::int32_t offsetX = -1; offsetX <= 1;
+                             ++offsetX) {
+                            if (offsetX == 0 && offsetY == 0) {
+                                continue;
+                            }
+                            const auto neighbour = heightByXy.find({
+                                candidate.cellX + offsetX,
+                                candidate.cellY + offsetY,
+                            });
+                            if (neighbour != heightByXy.end()) {
+                                neighbourHeights[neighbourCount++] =
+                                    neighbour->second;
+                            }
+                        }
+                    }
+                    if (neighbourCount == 0U) {
+                        return false;
+                    }
+                    const auto median =
+                        neighbourHeights.begin() +
+                        static_cast<std::ptrdiff_t>(neighbourCount / 2U);
+                    std::nth_element(
+                        neighbourHeights.begin(),
+                        median,
+                        neighbourHeights.begin() +
+                            static_cast<std::ptrdiff_t>(neighbourCount));
+                    return std::abs(candidate.height - *median) >
+                           kUpperOutlierToleranceMeters;
+                });
+        }
         std::sort(
             groundCandidates.begin(),
             groundCandidates.end(),

@@ -569,6 +569,74 @@ TEST_CASE("water surface CPU queries preserve the continuous surface sheet", "[w
 }
 
 TEST_CASE(
+    "sampled Ground drops rough floaters above terrain but keeps the smooth brow",
+    "[water][cache][ground][clip]") {
+    // Rock occupies cells (0..4, 0) and (0..1, 1) at 0.100. The sampled
+    // Ground row above it is a smooth elevated surface (a brow curving over
+    // the rock), one cell is a noisy floater 58 mm off its neighbourhood
+    // median, and (4, 0) sits within the 20 mm contact skin.
+    std::vector<WaterSurfaceSample> samples;
+    for (std::int32_t x = 0; x <= 4; ++x) {
+        samples.push_back({
+            {0.001F + 0.010F * static_cast<float>(x), 0.001F, 0.100F},
+            {0.0F, 0.0F, 1.0F},
+            WaterSurfaceRole::Rock,
+        });
+    }
+    for (std::int32_t x = 0; x <= 1; ++x) {
+        samples.push_back({
+            {0.001F + 0.010F * static_cast<float>(x), 0.011F, 0.100F},
+            {0.0F, 0.0F, 1.0F},
+            WaterSurfaceRole::Rock,
+        });
+    }
+    const float smoothHeights[4] = {0.200F, 0.202F, 0.204F, 0.206F};
+    for (std::int32_t x = 0; x <= 3; ++x) {
+        samples.push_back({
+            {0.001F + 0.010F * static_cast<float>(x),
+             0.001F,
+             smoothHeights[x]},
+            {0.0F, 0.0F, 1.0F},
+            WaterSurfaceRole::Ground,
+        });
+    }
+    samples.push_back(
+        {{0.001F, 0.011F, 0.200F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Ground});
+    // The floater: 58 mm above the median of its smooth neighbours.
+    samples.push_back(
+        {{0.011F, 0.011F, 0.260F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Ground});
+    // Contact skin above the rock stays regardless of roughness.
+    samples.push_back(
+        {{0.041F, 0.001F, 0.110F}, {0.0F, 0.0F, 1.0F}, WaterSurfaceRole::Ground});
+
+    const auto cache =
+        invisible_places::water::BuildWaterSurfaceCacheFromSamples(samples);
+    const auto findCell = [&](std::int32_t x, std::int32_t y)
+        -> const invisible_places::water::WaterGroundCell* {
+        for (const auto& cell : cache.groundCells) {
+            if (cell.cellX == x && cell.cellY == y) {
+                return &cell;
+            }
+        }
+        return nullptr;
+    };
+    // The smooth brow survives — including the cells adjacent to the
+    // dropped floater — and the terminal skin cell is untouched.
+    REQUIRE(cache.groundCells.size() == 6U);
+    for (std::int32_t x = 0; x <= 3; ++x) {
+        REQUIRE(findCell(x, 0) != nullptr);
+        CHECK((findCell(x, 0)->flags &
+               invisible_places::water::kWaterGroundUpperFlag) != 0U);
+    }
+    REQUIRE(findCell(0, 1) != nullptr);
+    CHECK(findCell(1, 1) == nullptr);
+    const auto* skin = findCell(4, 0);
+    REQUIRE(skin != nullptr);
+    CHECK((skin->flags &
+           invisible_places::water::kWaterGroundTerminalContactFlag) != 0U);
+}
+
+TEST_CASE(
     "sampled Ground retains deterministic connected upper and vegetation-supported cells",
     "[water][cache][ground]") {
     std::vector<WaterSurfaceSample> samples{
@@ -1447,7 +1515,7 @@ TEST_CASE("water surface signatures invalidate for every terrain source input",
     }};
     const auto baseline = invisible_places::water::WaterSurfaceCacheSignature(sources);
     CHECK(invisible_places::water::kWaterSurfaceCacheAlgorithmId ==
-          std::string_view{"water-surface-10mm-normal-average-ground-v3"});
+          std::string_view{"water-surface-10mm-normal-average-ground-v4"});
     CHECK(invisible_places::water::WaterSurfaceCacheSignature(sources, 0.020F) != baseline);
 
     auto changedRole = sources;

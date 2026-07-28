@@ -47964,7 +47964,7 @@ int RunDynamicMeshFlowGroundSmoke(
     const bool sceneScaleReady =
         !scene1Visual ||
         (water.waterSurfaceCache->groundSourcePointCount == 6'110'899U &&
-         water.waterSurfaceCache->groundCells.size() == 1'613'855U &&
+         water.waterSurfaceCache->groundCells.size() == 1'612'446U &&
          groundView.bounds.valid &&
          groundSpanX > 15.0F &&
          groundSpanY > 25.0F &&

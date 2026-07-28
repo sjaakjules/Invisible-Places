@@ -25,7 +25,7 @@ inline constexpr float kWaterSurfaceResolutionMeters = 0.010F;
 inline constexpr std::uint32_t kWaterSurfaceNormalSourceSpacingMicrometres = 2'000U;
 inline constexpr std::uint32_t kWaterGroundSourceSpacingMicrometres = 5'000U;
 inline constexpr std::string_view kWaterSurfaceCacheAlgorithmId =
-    "water-surface-10mm-normal-average-ground-v3";
+    "water-surface-10mm-normal-average-ground-v4";
 inline constexpr std::uint32_t kWaterSurfaceCacheSchemaVersion = 4U;
 inline constexpr std::uint32_t kWaterSurfaceCachePreviousSchemaVersion = 3U;
 inline constexpr std::uint32_t kWaterSurfaceCacheLegacySchemaVersion = 2U;
